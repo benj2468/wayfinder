@@ -1,0 +1,12 @@
+[package]
+name = "radio-research"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = [
+    "libs/rylr998"
+]
+
+[dependencies]
+rylr998 = { path = "./libs/rylr998" }
