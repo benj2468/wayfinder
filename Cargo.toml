@@ -5,8 +5,14 @@ edition = "2021"
 
 [workspace]
 members = [
-    "libs/rylr998"
+    "libs/rylr998",
+    "libs/interfaces",
 ]
 
-[dependencies]
+[workspace.dependencies]
 rylr998 = { path = "./libs/rylr998" }
+interfaces = { path = "./libs/interfaces" }
+tracing = "0.1.44"
+tokio = { version = "1.0", features = ["full"] }
+thiserror = "2.0.18"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

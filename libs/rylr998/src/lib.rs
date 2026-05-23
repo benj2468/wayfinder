@@ -1,15 +1,13 @@
 use std::io;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio_serial::{SerialPortBuilderExt, SerialStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tracing::trace;
 
 #[derive(Error, Debug)]
 pub enum LoraError {
     #[error("IO or Serial Error: {0}")]
     Io(#[from] io::Error),
-    #[error("Serial configuration error: {0}")]
-    Serial(#[from] tokio_serial::Error),
     #[error("Module returned error code: {0}")]
     ModuleError(i32),
     #[error("Response format was invalid or unparseable: {0}")]
@@ -76,19 +74,22 @@ pub struct ReceivedPacket {
 }
 
 /// The core RYLR998/RYLR498 Client driver structure.
-pub struct RylrClient {
-    stream: SerialStream,
+pub struct RylrClient<S> {
+    stream: S,
     timeout: Duration,
 
     // The network ID for the client.
     network_id: u8,
 }
 
-impl RylrClient {
+impl<S> RylrClient<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    tokio::io::ReadHalf<S>: AsyncReadExt,
+    tokio::io::WriteHalf<S>: AsyncWriteExt,
+{
     /// Instantiate a new client connection over the designated serial port path.
-    pub fn new(port_path: &str, baud_rate: u32) -> Result<Self, LoraError> {
-        let stream = tokio_serial::new(port_path, baud_rate).open_native_async()?;
-
+    pub fn new(stream: S) -> Result<Self, LoraError> {
         Ok(Self {
             stream,
             timeout: Duration::from_secs(3),
@@ -103,6 +104,7 @@ impl RylrClient {
 
     /// Helper function to internally dispatch an explicit string sequence and read its immediate raw response.
     async fn send_raw(&mut self, cmd: &str) -> Result<(), LoraError> {
+        trace!("send_raw: cmd={cmd}");
         let mut raw_cmd = cmd.to_string();
         if !raw_cmd.ends_with("\r\n") {
             raw_cmd.push_str("\r\n");
@@ -123,6 +125,12 @@ impl RylrClient {
     async fn send_cmd_expect(&mut self, cmd: &str, expected: &str) -> Result<String, LoraError> {
         self.send_raw(cmd).await?;
 
+        self.expect(expected).await
+    }
+
+    /// Helper function to internally dispatch an explicit string sequence and read its immediate raw response.
+    /// And expect a series of specific responses
+    async fn expect(&mut self, expected: &str) -> Result<String, LoraError> {
         let (reader, _) = tokio::io::split(&mut self.stream);
 
         let mut buf_reader = BufReader::new(reader);
@@ -134,6 +142,8 @@ impl RylrClient {
             loop {
                 line.clear();
                 buf_reader.read_line(&mut line).await?;
+                trace!("read_line: line={line:?}");
+
                 let trimmed = line.trim();
 
                 if trimmed.is_empty() {
@@ -171,7 +181,7 @@ impl RylrClient {
     /// 2. Software Reset (AT+RESET)
     pub async fn reset(&mut self) -> Result<(), LoraError> {
         self.send_cmd_expect("AT+RESET", "+RESET").await?;
-        self.send_cmd_expect("AT+RESET", "+READY").await?;
+        self.expect("+READY").await?;
         Ok(())
     }
 

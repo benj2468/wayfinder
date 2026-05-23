@@ -1,10 +1,12 @@
 use rylr998::{Bandwidth, RylrClient};
 use std::time::Duration;
+use tokio_serial::SerialPortBuilderExt;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Establish standard connection to your platform's mapped USB interface
-    let mut client = RylrClient::new("/dev/ttyUSB0", 115200)?;
+    let stream = tokio_serial::new("/dev/ttyUSB0", 115200).open_native_async()?;
+    let mut client = RylrClient::new(stream)?;
     client.set_timeout(Duration::from_secs(2));
 
     println!("Pinging RYLR transceiver module...");

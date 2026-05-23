@@ -31,9 +31,20 @@
               rustc
               rust-analyzer
               rustfmt
+              python3
+              python312Packages.virtualenv
             ];
 
             RUST_SRC_PATH = pkgs.rustPlatform.rustLibSrc;
+
+            shellHook = ''
+              source .venv/bin/activate
+
+              pip install --upgrade pip
+              pip install -r training/requirements.txt
+
+              PYTHONPATH=training:$PYTHONPATH
+            '';
           };
 
           treefmt = {
