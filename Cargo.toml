@@ -7,12 +7,28 @@ edition = "2021"
 members = [
     "libs/rylr998",
     "libs/interfaces",
+    "libs/batman",
+    "libs/runner",
 ]
 
 [workspace.dependencies]
-rylr998 = { path = "./libs/rylr998" }
-interfaces = { path = "./libs/interfaces" }
 tracing = "0.1.44"
 tokio = { version = "1.0", features = ["full"] }
 thiserror = "2.0.18"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+interfaces = { path = "./libs/interfaces" }
+batman = { path = "./libs/batman" }
+pretty-hex = "0.4.2"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4", features = ["derive"] }
+pretty-hex.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tun-rs = { version = "2", features = ["async", "async_framed", "async_tokio", "tokio"] }
+
+[[bin]]
+name = "tun"
+path = "bins/tun.rs"

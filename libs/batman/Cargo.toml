@@ -1,0 +1,12 @@
+[package]
+name = "batman"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+zerocopy = { version = "0.8", features = ["derive"] }
+heapless = "0.8"
+
+thiserror.workspace = true
+tracing.workspace = true
+interfaces.workspace = true

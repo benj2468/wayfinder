@@ -1,0 +1,16 @@
+[package]
+name = "runner"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+interfaces.workspace = true
+zerocopy = "0.8.48"
+batman.workspace = true
+
+[dev-dependencies]
+tracing-test = "0.2.6"
+pretty-hex.workspace = true
