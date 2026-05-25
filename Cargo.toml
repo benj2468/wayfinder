@@ -9,17 +9,24 @@ members = [
     "libs/interfaces",
     "libs/batman",
     "libs/wayfinder",
+    "libs/wayfinder-test",
 ]
 
 [workspace.dependencies]
+
+# Local Dependencies
+interfaces = { path = "./libs/interfaces" }
+batman = { path = "./libs/batman" }
+wayfinder = { path = "./libs/wayfinder" }
+
+# Third Party Dependencies
 tracing = "0.1.44"
 tokio = { version = "1.0", features = ["full"] }
 thiserror = "2.0.18"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-interfaces = { path = "./libs/interfaces" }
-batman = { path = "./libs/batman" }
 pretty-hex = "0.4.2"
 anyhow = "1.0.102"
+zerocopy = "0.8.48"
 
 [dependencies]
 anyhow = "1.0.102"

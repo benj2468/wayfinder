@@ -1,48 +1,6 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    fmt::Display,
-};
+use std::collections::HashMap;
 
-use runner::CentralRouter;
-
-use interfaces::link::MeshIdentifier;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
-
-#[derive(Copy, PartialEq, Eq, Default, Clone, IntoBytes, FromBytes, Immutable, KnownLayout)]
-struct Ident(u8);
-
-impl MeshIdentifier for Ident {
-    const BROADCAST: Self = Ident(0xff);
-}
-
-#[derive(Hash, PartialEq, Eq, Clone, Copy)]
-pub struct NodeId(u32);
-
-#[derive(Hash, PartialEq, Eq, Clone, Copy)]
-pub enum Direction {
-    ToSwitch,
-    FromSwitch,
-}
-
-pub struct TapMeta<'a> {
-    pub id: NodeId,
-    pub direction: Direction,
-    pub data: &'a [u8],
-}
-
-impl Display for TapMeta<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let dir = match self.direction {
-            Direction::ToSwitch => "to switch",
-            Direction::FromSwitch => "from switch",
-        };
-        write!(
-            f,
-            "id={} direction={:?} data={:?}",
-            self.id.0, dir, self.data
-        )
-    }
-}
+use crate::{Direction, NodeId, tap::TapMeta};
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy)]
 pub struct PairedNode {
