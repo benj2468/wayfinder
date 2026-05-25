@@ -205,7 +205,7 @@ where
             version: 5,
             ttl: 50,
             tq: 255, // Max link capability score from original anchor source
-            seqno: self.sequence_number,
+            seqno: self.sequence_number.to_be(),
             orig: self.self_ident,
             prev_sender: self.self_ident,
         };

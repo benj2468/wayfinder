@@ -1,8 +1,10 @@
+use std::hash::Hash;
+
 use crate::frame::{LinkFrame, LinkFrameData};
 use async_trait::async_trait;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
-use zerocopy::{FromBytes, Immutable, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 #[derive(Error, Debug)]
 pub enum LinkError {
@@ -19,7 +21,7 @@ pub enum LinkError {
 }
 
 pub trait MeshIdentifier:
-    Copy + PartialEq + Eq + FromBytes + IntoBytes + Immutable + Default
+    Copy + PartialEq + Eq + FromBytes + IntoBytes + Immutable + Default + KnownLayout + Hash
 {
     const BROADCAST: Self;
 }

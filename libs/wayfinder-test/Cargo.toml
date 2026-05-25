@@ -4,7 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-zerocopy.workspace = true
 wayfinder.workspace = true
 interfaces.workspace = true
+
+zerocopy.workspace = true
 tokio.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+rand.workspace = true

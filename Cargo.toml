@@ -13,7 +13,6 @@ members = [
 ]
 
 [workspace.dependencies]
-
 # Local Dependencies
 interfaces = { path = "./libs/interfaces" }
 batman = { path = "./libs/batman" }
@@ -21,22 +20,12 @@ wayfinder = { path = "./libs/wayfinder" }
 
 # Third Party Dependencies
 tracing = "0.1.44"
-tokio = { version = "1.0", features = ["full"] }
-thiserror = "2.0.18"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tokio = { version = "1.0", features = ["full"] }
+tokio-util = { version = "0.7.18", features = ["codec"] }
+futures = "0.3.32"
+thiserror = "2.0.18"
 pretty-hex = "0.4.2"
 anyhow = "1.0.102"
 zerocopy = "0.8.48"
-
-[dependencies]
-anyhow = "1.0.102"
-clap = { version = "4", features = ["derive"] }
-pretty-hex.workspace = true
-tokio = { workspace = true, features = ["full"] }
-tracing.workspace = true
-tracing-subscriber.workspace = true
-tun-rs = { version = "2", features = ["async", "async_framed", "async_tokio", "tokio"] }
-
-[[bin]]
-name = "tun"
-path = "bins/tun.rs"
+rand = "0.10.1"

@@ -1,6 +1,9 @@
 mod engine;
 pub mod wire;
 
+#[cfg(test)]
+mod engine_tests;
+
 use heapless::Vec as HVec;
 
 /// Track metrics for a specific path to an originator via a specific immediate neighbor
