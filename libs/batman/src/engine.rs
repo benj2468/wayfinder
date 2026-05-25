@@ -196,7 +196,7 @@ where
         }
     }
 
-    fn produce_periodic_broadcast(&mut self, _now: std::time::Instant) -> Option<&[u8]> {
+    fn produce_periodic_broadcast(&mut self, _now: core::time::Duration) -> Option<&[u8]> {
         // Increment sequence allocation for this ticker frame
         self.sequence_number = self.sequence_number.wrapping_add(1);
 

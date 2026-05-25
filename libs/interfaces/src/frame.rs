@@ -14,7 +14,7 @@ pub struct LinkFrameOwned<Ident> {
     pub src: Ident,
     pub dst: Ident,
     pub protocol: u16, // Equivalent to EtherType (e.g., 0x4305 for BATMAN)
-    pub payload: Vec<u8>,
+    pub payload: alloc::vec::Vec<u8>,
 }
 
 /// Data that a sender must construct when sending a packet. This is the same as LinkFrame, except is

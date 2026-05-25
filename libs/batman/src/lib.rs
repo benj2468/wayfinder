@@ -1,3 +1,7 @@
+#![no_std]
+
+extern crate alloc;
+
 mod engine;
 pub mod wire;
 

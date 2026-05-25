@@ -25,5 +25,5 @@ pub trait MeshRoutingEngine<Ident> {
 
     /// Force the engine to generate its regular periodic routing messages (OGMs).
     /// Returns a closure or a slice instructing the manager what to broadcast.
-    fn produce_periodic_broadcast(&mut self, now: std::time::Instant) -> Option<&[u8]>;
+    fn produce_periodic_broadcast(&mut self, now: core::time::Duration) -> Option<&[u8]>;
 }

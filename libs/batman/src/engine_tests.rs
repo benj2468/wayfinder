@@ -1,5 +1,5 @@
-use std::time::Instant;
-
+use alloc::vec;
+use alloc::vec::Vec;
 use interfaces::{
     engine::{MeshRoutingEngine, RoutingAction},
     frame::{LinkFrame, LinkFrameDataMut},
@@ -57,13 +57,15 @@ fn make_unicast(dest: u8, ttl: u8, payload: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod ogm_generation {
+    use core::time::Duration;
+
     use super::*;
 
     #[test]
     fn test_generate_initial_ogm() {
         let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
 
-        let ogm_bytes = engine.produce_periodic_broadcast(Instant::now()).unwrap();
+        let ogm_bytes = engine.produce_periodic_broadcast(Duration::ZERO).unwrap();
         let (ogm, _) = BatmanOgmPacket::<u8>::ref_from_prefix(ogm_bytes).unwrap();
 
         assert_eq!(ogm.packet_type, BATADV_IV_OGM);
@@ -82,7 +84,7 @@ mod ogm_generation {
 
         // Generate multiple OGMs
         for i in 1..=5 {
-            let ogm_bytes = engine.produce_periodic_broadcast(Instant::now()).unwrap();
+            let ogm_bytes = engine.produce_periodic_broadcast(Duration::ZERO).unwrap();
             let (ogm, _) = BatmanOgmPacket::<u8>::ref_from_prefix(ogm_bytes).unwrap();
             let seqno = ogm.seqno;
             assert_eq!(seqno, (i as u32).to_be()); // Check in network byte order
@@ -94,8 +96,8 @@ mod ogm_generation {
         let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
         engine.sequence_number = u32::MAX - 1;
 
-        engine.produce_periodic_broadcast(Instant::now()).unwrap();
-        let ogm_bytes = engine.produce_periodic_broadcast(Instant::now()).unwrap();
+        engine.produce_periodic_broadcast(Duration::ZERO).unwrap();
+        let ogm_bytes = engine.produce_periodic_broadcast(Duration::ZERO).unwrap();
         let (ogm, _) = BatmanOgmPacket::<u8>::ref_from_prefix(ogm_bytes).unwrap();
         let seqno = ogm.seqno;
         // Should wrap to 0

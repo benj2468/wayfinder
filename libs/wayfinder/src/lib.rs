@@ -1,4 +1,9 @@
-use std::marker::PhantomData;
+#![no_std]
+
+extern crate alloc;
+
+use alloc::boxed::Box;
+use core::marker::PhantomData;
 
 use anyhow::bail;
 use batman::{
@@ -10,7 +15,7 @@ use interfaces::{
     frame::{LinkFrame, LinkFrameData, LinkFrameDataMut},
     link::{EmbeddedMeshLink, MeshIdentifier},
 };
-use tracing::{info_span, trace, trace_span};
+use tracing::{info_span, trace, trace_span, warn};
 use zerocopy::IntoBytes;
 
 pub const DEFAULT_BATMAN_ETHER_TYPE: u16 = 0x4305;
@@ -34,7 +39,7 @@ impl<Ident: MeshIdentifier, const N: usize> CentralRouter<Ident, N> {
 }
 
 impl<Ident: MeshIdentifier, const N: usize> CentralRouter<Ident, N> {
-    pub async fn poll_and_route(&mut self, now: std::time::Instant) {
+    pub async fn poll_and_route(&mut self, now: core::time::Duration) {
         let mut rx_buf = [0u8; 1500];
 
         let mut tx_buf = [0u8; 1500];
@@ -85,7 +90,7 @@ impl<Ident: MeshIdentifier, const N: usize> CentralRouter<Ident, N> {
                     0x88B5 => {
                         // Dynamically route to a completely separate experimental protocol context
                     }
-                    _ => println!("Dropped unknown protocol frame"),
+                    _ => warn!("Dropped unknown protocol frame"),
                 }
 
                 if should_go_local {
@@ -99,7 +104,7 @@ impl<Ident: MeshIdentifier, const N: usize> CentralRouter<Ident, N> {
         let broadcast = Ident::BROADCAST;
         if let Some(ogm_payload) = self.batman.produce_periodic_broadcast(now) {
             for link in self.interfaces.iter_mut() {
-                println!("transmitting OGM");
+                trace!("transmitting OGM");
                 // Flood the OGM out of every radio interface to map the surrounding topology
                 let _ = link
                     .transmit(LinkFrameData {
@@ -160,12 +165,11 @@ impl<Ident: MeshIdentifier, const N: usize> CentralRouter<Ident, N> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use alloc::boxed::Box;
+    use core::time::Duration;
 
-    use batman::wire::BatmanOgmPacket;
     use interfaces::{frame::LinkFrame, link::IdentifiableLink};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use zerocopy::FromBytes;
 
     use crate::CentralRouter;
 
@@ -203,8 +207,7 @@ mod tests {
             0,
         );
 
-        let now = std::time::Instant::now();
-        router.poll_and_route(now).await;
+        router.poll_and_route(Duration::ZERO).await;
         // We should have received a message.
         let read = tokio::time::timeout(Duration::from_secs(1), b.read(&mut buf))
             .await

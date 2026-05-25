@@ -1,7 +1,7 @@
-use std::hash::Hash;
-
 use crate::frame::{LinkFrame, LinkFrameData};
+use alloc::boxed::Box;
 use async_trait::async_trait;
+use core::hash::Hash;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -9,7 +9,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 #[derive(Error, Debug)]
 pub enum LinkError {
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(#[from] tokio::io::Error),
     #[error("transmit failed")]
     TransmitFailed,
     #[error("receive failed")]

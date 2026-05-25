@@ -1,5 +1,13 @@
-use std::io;
-use std::time::Duration;
+#![no_std]
+
+extern crate alloc;
+
+use alloc::format;
+use alloc::string::String;
+use alloc::string::ToString;
+use alloc::vec::Vec;
+
+use core::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing::trace;
@@ -7,7 +15,7 @@ use tracing::trace;
 #[derive(Error, Debug)]
 pub enum LoraError {
     #[error("IO or Serial Error: {0}")]
-    Io(#[from] io::Error),
+    Io(#[from] tokio::io::Error),
     #[error("Module returned error code: {0}")]
     ModuleError(i32),
     #[error("Response format was invalid or unparseable: {0}")]
