@@ -1,5 +1,5 @@
 mod engine;
-mod wire;
+pub mod wire;
 
 use heapless::Vec as HVec;
 

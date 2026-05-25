@@ -116,9 +116,10 @@ impl<Ident: MeshIdentifier, const N: usize> CentralRouter<Ident, N> {
 mod tests {
     use std::time::Duration;
 
-    use interfaces::link::IdentifiableLink;
-    use pretty_hex::PrettyHex;
+    use batman::wire::BatmanOgmPacket;
+    use interfaces::{frame::LinkFrame, link::IdentifiableLink};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use zerocopy::FromBytes;
 
     use crate::CentralRouter;
 
@@ -140,6 +141,21 @@ mod tests {
             })],
             0,
         );
+    }
+
+    #[tokio::test]
+    async fn test_poll_and_route() {
+        let mut buf = [0; 1500];
+        let (a, mut b) = tokio::io::duplex(3000);
+        b.write(&buf).await.unwrap();
+
+        let mut router = CentralRouter::new(
+            [Box::new(IdentifiableLink {
+                identifier: 0,
+                link: a,
+            })],
+            0,
+        );
 
         let now = std::time::Instant::now();
         router.poll_and_route(now).await;
@@ -149,6 +165,20 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(read, 14);
+        let link_packet = LinkFrame::<u8>::ref_from_bytes(&buf[..read]).unwrap();
+        let ogp = BatmanOgmPacket::<u8>::ref_from_bytes(&link_packet.payload).unwrap();
+
+        assert_eq!(
+            *ogp,
+            BatmanOgmPacket {
+                orig: 0,
+                packet_type: 1,
+                prev_sender: 0,
+                seqno: 1,
+                tq: 0xff,
+                ttl: 50,
+                version: 5,
+            }
+        );
     }
 }
