@@ -8,8 +8,20 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
     BatmanEngine, NeighborStats, OriginatorRecord,
-    wire::{BATADV_IV_OGM, BatmanOgmPacket, ETH_P_BATMAN},
+    wire::{BATADV_IV_OGM, BATADV_UNICAST, BatmanOgmPacket, BatmanUnicastPacket, ETH_P_BATMAN},
 };
+
+impl<const MAX_ORIGINATORS: usize, Ident: MeshIdentifier> BatmanEngine<MAX_ORIGINATORS, Ident> {
+    /// Actively queries the BATMAN routing table for a given destination.
+    /// Returns the immediate next-hop MAC address if a route exists.
+    pub fn lookup_route(&self, destination: Ident) -> Option<Ident> {
+        // Look up the final target node in our calculated originator records
+        self.originator_table
+            .iter()
+            .find(|record| record.neighbor_ident == destination)
+            .map(|record| record.best_next_hop)
+    }
+}
 
 impl<const MAX_ORIGINATORS: usize, Ident> MeshRoutingEngine<Ident>
     for BatmanEngine<MAX_ORIGINATORS, Ident>
@@ -120,6 +132,50 @@ where
                     }
                 }
                 RoutingAction::Consumed
+            }
+
+            BATADV_UNICAST => {
+                let parsed = BatmanUnicastPacket::read_from_prefix(&frame.payload);
+                if parsed.is_err() {
+                    return RoutingAction::Consumed;
+                }
+                let (unicast_hdr, _) = parsed.unwrap();
+                let dst = unicast_hdr.dest;
+
+                // Rule 1: Is this packet meant for US?
+                if dst == self.self_ident {
+                    // Yes! Return a modified action so the central router knows
+                    // to strip the header and deliver just the inner application data payload.
+                    return RoutingAction::DeliverLocal;
+                }
+
+                // Rule 2: Check TTL to prevent infinite routing bouncing
+                if unicast_hdr.ttl <= 1 {
+                    return RoutingAction::Consumed; // Drop packet, expired
+                }
+
+                // Rule 3: We are an intermediate relay node. Look up the next hop for the final destination.
+                if let Some(record) = self
+                    .originator_table
+                    .iter()
+                    .find(|r| r.neighbor_ident == dst)
+                {
+                    // Re-write the mutable scratchpad/response buffer with the updated header
+                    let mut updated_hdr = unicast_hdr;
+                    updated_hdr.ttl -= 1;
+
+                    let size = core::mem::size_of::<BatmanUnicastPacket<Ident>>();
+
+                    reply.dst = record.best_next_hop;
+                    reply.protocol = ETH_P_BATMAN;
+                    reply
+                        .payload
+                        .get_mut(0..size)
+                        .unwrap()
+                        .copy_from_slice(&updated_hdr.as_bytes());
+                }
+
+                RoutingAction::Consumed // Route unknown, drop packet
             }
 
             // Unicast payload frames routing paths

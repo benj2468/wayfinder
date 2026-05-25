@@ -1,12 +1,17 @@
 use std::marker::PhantomData;
 
-use batman::BatmanEngine;
+use anyhow::bail;
+use batman::{
+    BatmanEngine,
+    wire::{BATADV_UNICAST, BatmanUnicastPacket, ETH_P_BATMAN},
+};
 use interfaces::{
     engine::{MeshRoutingEngine, RoutingAction},
     frame::{LinkFrame, LinkFrameData, LinkFrameDataMut},
     link::{EmbeddedMeshLink, MeshIdentifier},
 };
 use tracing::{info_span, trace, trace_span};
+use zerocopy::IntoBytes;
 
 pub const DEFAULT_BATMAN_ETHER_TYPE: u16 = 0x4305;
 
@@ -107,6 +112,47 @@ impl<Ident: MeshIdentifier, const N: usize> CentralRouter<Ident, N> {
         }
     }
 
+    pub async fn dispatch_from_local(&mut self, dest: Ident, payload: &[u8]) -> anyhow::Result<()> {
+        // 1. Query BATMAN for the next-hop physical address
+        if let Some(next_hop) = self.batman.lookup_route(dest) {
+            // 2. Build the Unicast Header
+            let header = BatmanUnicastPacket {
+                packet_type: BATADV_UNICAST,
+                version: 5,
+                ttl: 50,
+                dest,
+            };
+
+            // 3. Allocate a deterministic transmission workspace on the stack
+            let mut tx_scratchpad = [0u8; 1500]; // Max MTU frame layout bounds
+            let header_size = core::mem::size_of::<BatmanUnicastPacket<Ident>>();
+            let total_size = header_size + payload.len();
+
+            if total_size > tx_scratchpad.len() {
+                bail!("Payload size exceeds maximum frame capacity");
+            }
+
+            // Pack the header and data sequentially into the scratchpad
+            tx_scratchpad[..header_size].copy_from_slice(header.as_bytes());
+            tx_scratchpad[header_size..total_size].copy_from_slice(payload);
+
+            // 4. Fire the encapsulated packet out to the immediate neighbor
+            if let Some(link) = self.interfaces.get_mut(0) {
+                link.transmit(LinkFrameData {
+                    dst: next_hop,
+                    protocol: ETH_P_BATMAN,
+                    payload: &tx_scratchpad[..total_size],
+                })
+                .await?;
+                Ok(())
+            } else {
+                bail!("No hardware radio links available")
+            }
+        } else {
+            bail!("No mesh route found to destination")
+        }
+    }
+
     fn dispatch_to_local_app(&self, _frame: &LinkFrame<Ident>) {
         // App logic lives here
     }
@@ -130,11 +176,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_constructor_with_duplex() {
-        let mut buf = [0; 1500];
+        let buf = [0; 1500];
         let (a, mut b) = tokio::io::duplex(3000);
         b.write(&buf).await.unwrap();
 
-        let mut router = CentralRouter::new(
+        let _ = CentralRouter::new(
             [Box::new(IdentifiableLink {
                 identifier: 0,
                 link: a,

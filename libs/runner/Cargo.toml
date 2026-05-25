@@ -10,6 +10,7 @@ tracing.workspace = true
 interfaces.workspace = true
 zerocopy = "0.8.48"
 batman.workspace = true
+anyhow.workspace = true
 
 [dev-dependencies]
 tracing-test = "0.2.6"

@@ -19,6 +19,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 interfaces = { path = "./libs/interfaces" }
 batman = { path = "./libs/batman" }
 pretty-hex = "0.4.2"
+anyhow = "1.0.102"
 
 [dependencies]
 anyhow = "1.0.102"
