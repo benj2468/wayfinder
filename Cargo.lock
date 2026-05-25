@@ -889,21 +889,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "runner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "batman",
- "interfaces",
- "pretty-hex",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-test",
- "zerocopy",
-]
-
-[[package]]
 name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1314,6 +1299,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a929b2c61f11ba3e9bc35b50c1f25cb38e0e892c0c231ae2b8cf78d5dad4437"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wayfinder"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "batman",
+ "interfaces",
+ "pretty-hex",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-test",
+ "zerocopy",
 ]
 
 [[package]]

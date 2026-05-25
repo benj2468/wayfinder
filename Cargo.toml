@@ -8,7 +8,7 @@ members = [
     "libs/rylr998",
     "libs/interfaces",
     "libs/batman",
-    "libs/runner",
+    "libs/wayfinder",
 ]
 
 [workspace.dependencies]
