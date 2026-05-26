@@ -10,6 +10,7 @@ members = [
     "libs/batman",
     "libs/wayfinder",
     "libs/wayfinder-test",
+    "bins/wayfinder-tap",
 ]
 
 [workspace.dependencies]
@@ -24,8 +25,12 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tokio = { version = "1.0", features = ["full"] }
 tokio-util = { version = "0.7.18", features = ["codec"] }
 futures = "0.3.32"
-thiserror = { version = "2.0.18", default-features = false }
+thiserror = { version = "2.0.18" }
 pretty-hex = "0.4.2"
 anyhow = "1.0.102"
 zerocopy = "0.8.48"
 rand = "0.10.1"
+clap = { version = "4", features = ["derive"] }
+etherparse = "0.20.1"
+
+[dependencies]

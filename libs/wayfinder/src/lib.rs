@@ -1,8 +1,8 @@
-#![no_std]
+// #![no_std]
 
-extern crate alloc;
+pub use batman;
+pub use interfaces;
 
-use alloc::boxed::Box;
 use core::marker::PhantomData;
 
 use anyhow::bail;
@@ -165,7 +165,6 @@ impl<Ident: MeshIdentifier, const N: usize> CentralRouter<Ident, N> {
 
 #[cfg(test)]
 mod tests {
-    use alloc::boxed::Box;
     use core::time::Duration;
 
     use interfaces::{frame::LinkFrame, link::IdentifiableLink};

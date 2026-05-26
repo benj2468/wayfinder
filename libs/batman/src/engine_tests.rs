@@ -1,5 +1,3 @@
-use alloc::vec;
-use alloc::vec::Vec;
 use interfaces::{
     engine::{MeshRoutingEngine, RoutingAction},
     frame::{LinkFrame, LinkFrameDataMut},

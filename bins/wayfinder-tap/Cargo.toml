@@ -1,0 +1,15 @@
+[package]
+name = "wayfinder-tap"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wayfinder.workspace = true
+
+tracing-subscriber.workspace = true
+tracing.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tun-rs = { version = "2", features = ["async"] }
+etherparse.workspace = true

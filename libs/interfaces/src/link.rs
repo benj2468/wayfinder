@@ -1,5 +1,4 @@
 use crate::frame::{LinkFrame, LinkFrameData};
-use alloc::boxed::Box;
 use async_trait::async_trait;
 use core::hash::Hash;
 use thiserror::Error;
@@ -28,6 +27,10 @@ pub trait MeshIdentifier:
 
 impl MeshIdentifier for u8 {
     const BROADCAST: Self = 0xff;
+}
+
+impl MeshIdentifier for [u8; 6] {
+    const BROADCAST: Self = [0xff; 6];
 }
 
 #[async_trait]
