@@ -1,4 +1,3 @@
-use core::marker::PhantomData;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub trait MeshIdentifier:
@@ -69,20 +68,6 @@ where
             dst: Ident::default(),
             protocol: 0,
             payload: value,
-        }
-    }
-}
-
-pub struct LinkCodec<Ident> {
-    pub src_identifier: Ident,
-    _phantom: PhantomData<Ident>,
-}
-
-impl<Ident> LinkCodec<Ident> {
-    pub fn new(src_identifier: Ident) -> Self {
-        Self {
-            src_identifier,
-            _phantom: PhantomData,
         }
     }
 }

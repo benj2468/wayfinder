@@ -17,13 +17,17 @@ pub enum RoutingAction<Ident> {
 pub trait MeshRoutingEngine<Ident> {
     /// Ingest an incoming frame from the central router.
     /// The engine processes it, updates metrics, and returns the next logical step.
-    fn handle_rx<'a>(
+    fn handle_rx<'rx, 'tx>(
         &mut self,
-        frame: &'a LinkFrame<Ident>,
-        reply: &mut LinkFrameDataMut<'a, Ident>,
+        frame: &'rx LinkFrame<Ident>,
+        reply: &mut LinkFrameDataMut<'tx, Ident>,
     ) -> RoutingAction<Ident>;
 
     /// Force the engine to generate its regular periodic routing messages (OGMs).
     /// Returns a closure or a slice instructing the manager what to broadcast.
-    fn produce_periodic_broadcast(&mut self, now: core::time::Duration) -> Option<&[u8]>;
+    fn produce_periodic_broadcast<'tx>(
+        &mut self,
+        now: core::time::Duration,
+        tx_buffer: &'tx mut [u8],
+    ) -> Option<&'tx [u8]>;
 }

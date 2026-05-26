@@ -3,6 +3,8 @@ use std::{net::SocketAddr, path::PathBuf};
 use clap::Parser;
 use core::net::Ipv4Addr;
 use embedded_io_adapters::tokio_1::FromTokio;
+use futures::StreamExt;
+use futures::stream::{FuturesOrdered, FuturesUnordered};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -11,7 +13,13 @@ use tokio::{
 };
 use tracing_subscriber::EnvFilter;
 use tun_rs::{DeviceBuilder, Layer};
-use wayfinder::{CentralRouter, interfaces::link::IdentifiableLink};
+use wayfinder::EgressInterface;
+use wayfinder::interfaces::frame::LinkFrame;
+use wayfinder::{
+    CentralRouter,
+    interfaces::link::{EmbeddedMeshLink, IdentifiableLink},
+};
+use zerocopy::FromBytes;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Link {
@@ -145,25 +153,51 @@ async fn main() -> anyhow::Result<()> {
 
     let start = std::time::Instant::now();
 
-    join_set.spawn(async move {
-        loop {
-            let mut interface_refs: Vec<
-                &mut IdentifiableLink<[u8; 6], FromTokio<tokio::io::DuplexStream>>,
-            > = interfaces.iter_mut().collect();
+    let mut rx_buffer = [0u8; 1500];
+    let mut tx_buffer = [0u8; 1500];
 
-            router
-                .poll_and_route(&mut interface_refs, start.elapsed())
-                .await;
-            tokio::task::yield_now().await;
+    loop {
+        let data = {
+            let mut futures = interfaces
+                .iter_mut()
+                .enumerate()
+                .map(|(i, iface)| async move { iface.receive().await.map(|frame| (i, frame)).ok() })
+                .collect::<FuturesOrdered<_>>();
+
+            // All of the TODOs here indicate places that we have a LinkFrameData and need to send it out over
+            // some part of the network. It is unclear to me how we want to do to that.
+            tokio::select! {
+                Some(Some((idx, frame))) = futures.next() => {
+                    router.handle_frame(idx, frame, &mut tx_buffer)
+                },
+                Ok(msg) = dev.recv(&mut rx_buffer) => {
+                    if let Ok(frame) = LinkFrame::mut_from_bytes(&mut rx_buffer) {
+                        router.handle_local(frame.dst, &frame.payload, &mut tx_buffer).ok()
+                    } else {
+                        None
+                    }
+                },
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    router.poll(start.elapsed(), &mut tx_buffer)
+                }
+            }
+        };
+
+        if let Some(data) = data {
+            if let Some(egress) = router.get_egress_interface(data.dst) {
+                match egress {
+                    EgressInterface::All => {
+                        for iface in interfaces.iter_mut() {
+                            iface.send(&data).await?;
+                        }
+                    }
+                    EgressInterface::Interface(iface_idx) => {
+                        let iface = interfaces.get_mut(iface_idx).unwrap();
+
+                        iface.send(&data).await?;
+                    }
+                }
+            }
         }
-    });
-
-    // Bridging TAP device to local router dispatch
-    // (This part would need more refactoring to use the new router dispatch API)
-
-    while let Some(res) = join_set.join_next().await {
-        res??;
     }
-
-    Ok(())
 }

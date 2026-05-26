@@ -9,3 +9,4 @@ zerocopy = { version = "0.8.48", features = ["derive"] }
 embedded-io-async.workspace = true
 heapless.workspace = true
 core = { version = "1.0", package = "rustc-std-workspace-core", optional = true }
+etherparse.workspace = true

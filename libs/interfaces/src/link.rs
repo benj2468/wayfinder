@@ -1,6 +1,7 @@
-use crate::frame::{LinkFrameData, MeshIdentifier};
+use crate::frame::{LinkFrame, LinkFrameData, MeshIdentifier};
 use embedded_io_async::{Read, Write};
 use thiserror::Error;
+use zerocopy::{FromBytes, IntoBytes};
 
 #[derive(Error, Debug)]
 pub enum LinkError {
@@ -33,8 +34,10 @@ pub trait EmbeddedMeshLink<Ident: MeshIdentifier> {
 }
 
 pub struct IdentifiableLink<Ident: MeshIdentifier, T> {
-    pub identifier: Ident,
-    pub stream: T,
+    identifier: Ident,
+    stream: T,
+    buffer: [u8; 1500],
+    read_offset: usize,
 }
 
 impl<Ident: MeshIdentifier, T> IdentifiableLink<Ident, T>
@@ -42,49 +45,57 @@ where
     T: Read + Write,
 {
     pub fn new(identifier: Ident, stream: T) -> Self {
-        Self { identifier, stream }
-    }
-}
-
-impl<T, Ident: MeshIdentifier> EmbeddedMeshLink<Ident> for IdentifiableLink<Ident, T>
-where
-    T: Read + Write,
-{
-    fn identifier(&self) -> Ident {
-        self.identifier
+        Self {
+            identifier,
+            stream,
+            buffer: [0u8; 1500],
+            read_offset: 0,
+        }
     }
 
-    async fn transmit(&mut self, data: LinkFrameData<'_, Ident>) -> Result<(), LinkError> {
-        self.stream
-            .write_all(self.identifier.as_bytes())
-            .await
-            .map_err(|_| LinkError::Io)?;
-        self.stream
-            .write_all(data.dst.as_bytes())
-            .await
-            .map_err(|_| LinkError::Io)?;
-        self.stream
-            .write_all(&data.protocol.to_be_bytes())
-            .await
-            .map_err(|_| LinkError::Io)?;
-        self.stream
-            .write_all(data.payload)
-            .await
-            .map_err(|_| LinkError::Io)?;
-        Ok(())
+    pub async fn receive(&mut self) -> Result<&LinkFrame<Ident>, LinkError> {
+        let buf = &mut self.buffer;
+        loop {
+            let read = self
+                .stream
+                .read(&mut buf[self.read_offset..])
+                .await
+                .map_err(|_| LinkError::Io)?;
+
+            self.read_offset += read;
+
+            if etherparse::Ethernet2Slice::from_slice_without_fcs(&buf[..self.read_offset]).is_ok()
+            {
+                return LinkFrame::ref_from_bytes(&buf[..self.read_offset])
+                    .map_err(|_| LinkError::Io);
+            }
+        }
     }
 
-    async fn receive(&mut self, buf: &mut [u8]) -> Result<usize, LinkError> {
-        // This is a naive implementation that just reads what's available.
-        // For real framing, we might need a length prefix or similar.
-        // But since the original LinkCodec just returned everything, we'll do the same for now,
-        // or try to read a full LinkFrame header + payload if possible.
+    pub async fn send(&mut self, data: &LinkFrameData<'_, Ident>) -> Result<usize, LinkError> {
+        let mut idx = 0;
+        self.buffer[0..size_of::<Ident>()].copy_from_slice(self.identifier.as_bytes());
+        idx += size_of::<Ident>();
 
-        // HOWEVER, without a length prefix, we don't know how much to read.
-        // The original used `tokio_util::codec::Framed`, which for the provided `LinkCodec`
-        // would just return whatever was in the internal buffer of `Framed`.
+        self.buffer[idx..(idx + size_of::<Ident>())].copy_from_slice(data.dst.as_bytes());
+        idx += size_of::<Ident>();
 
-        let n = self.stream.read(buf).await.map_err(|_| LinkError::Io)?;
-        Ok(n)
+        self.buffer[idx..(idx + size_of::<u16>())]
+            .copy_from_slice(data.protocol.to_be().as_bytes());
+        idx += size_of::<u16>();
+
+        self.buffer[idx..(idx + data.payload.len())].copy_from_slice(data.payload);
+        idx += data.payload.len();
+
+        self.stream
+            .write_all(&self.buffer[..idx])
+            .await
+            .map_err(|_| LinkError::Io)?;
+
+        Ok(idx)
+    }
+
+    pub fn read(&self, n: usize) -> &[u8] {
+        &self.buffer[..n]
     }
 }

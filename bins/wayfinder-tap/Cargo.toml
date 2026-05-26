@@ -17,3 +17,5 @@ embedded-io-adapters.workspace = true
 serde = { version = "1.0.228", features = ["derive"] }
 libc = "0.2.186"
 serde_yaml = "0.9.34"
+futures.workspace = true
+zerocopy.workspace = true

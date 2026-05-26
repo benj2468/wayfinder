@@ -27,10 +27,10 @@ impl<const MAX_ORIGINATORS: usize, Ident> MeshRoutingEngine<Ident>
 where
     Ident: MeshIdentifier,
 {
-    fn handle_rx<'a>(
+    fn handle_rx<'rx, 'tx>(
         &mut self,
-        frame: &'a LinkFrame<Ident>,
-        reply: &mut LinkFrameDataMut<'a, Ident>,
+        frame: &'tx LinkFrame<Ident>,
+        reply: &mut LinkFrameDataMut<'rx, Ident>,
     ) -> RoutingAction<Ident> {
         // Core protocol routing filter
         if frame.protocol != ETH_P_BATMAN || frame.payload.is_empty() {
@@ -195,7 +195,11 @@ where
         }
     }
 
-    fn produce_periodic_broadcast(&mut self, _now: core::time::Duration) -> Option<&[u8]> {
+    fn produce_periodic_broadcast<'tx>(
+        &mut self,
+        _now: core::time::Duration,
+        tx_buffer: &'tx mut [u8],
+    ) -> Option<&'tx [u8]> {
         // Increment sequence allocation for this ticker frame
         self.sequence_number = self.sequence_number.wrapping_add(1);
 
@@ -210,7 +214,7 @@ where
         };
 
         let size = core::mem::size_of::<BatmanOgmPacket<Ident>>();
-        self.tx_buffer[..size].copy_from_slice(ogm.as_bytes());
-        Some(&self.tx_buffer[..size])
+        tx_buffer[..size].copy_from_slice(ogm.as_bytes());
+        Some(&tx_buffer[..size])
     }
 }

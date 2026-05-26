@@ -31,8 +31,6 @@ pub struct BatmanEngine<const MAX_ORIGINATORS: usize, Ident> {
     pub self_ident: Ident,
     pub sequence_number: u32,
     pub originator_table: HVec<OriginatorRecord<Ident>, MAX_ORIGINATORS>,
-    // Buffer used to hold outgoing OGM payloads safely
-    pub tx_buffer: [u8; 32],
 }
 
 impl<const MAX_ORIGINATORS: usize, Ident> BatmanEngine<MAX_ORIGINATORS, Ident> {
@@ -41,7 +39,6 @@ impl<const MAX_ORIGINATORS: usize, Ident> BatmanEngine<MAX_ORIGINATORS, Ident> {
             self_ident,
             sequence_number: 0,
             originator_table: HVec::new(),
-            tx_buffer: [0u8; 32],
         }
     }
 }

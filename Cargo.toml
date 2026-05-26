@@ -37,5 +37,3 @@ embassy-sync = "0.8.0"
 embassy-futures = "0.1.2"
 heapless = "0.9.3"
 embedded-io-adapters = { version = "0.6.1", features = ["tokio-1"] }
-
-[dependencies]

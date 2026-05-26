@@ -630,6 +630,7 @@ name = "interfaces"
 version = "0.1.0"
 dependencies = [
  "embedded-io-async 0.6.1",
+ "etherparse",
  "heapless",
  "rustc-std-workspace-core",
  "thiserror",
@@ -1612,6 +1613,7 @@ dependencies = [
  "clap",
  "embedded-io-adapters",
  "etherparse",
+ "futures",
  "libc",
  "serde",
  "serde_yaml",
@@ -1620,6 +1622,7 @@ dependencies = [
  "tracing-subscriber",
  "tun-rs",
  "wayfinder",
+ "zerocopy",
 ]
 
 [[package]]

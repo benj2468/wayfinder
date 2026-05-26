@@ -60,9 +60,12 @@ mod ogm_generation {
 
     #[test]
     fn test_generate_initial_ogm() {
+        let mut tx_buf = [0u8; 1024];
         let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
 
-        let ogm_bytes = engine.produce_periodic_broadcast(Duration::ZERO).unwrap();
+        let ogm_bytes = engine
+            .produce_periodic_broadcast(Duration::ZERO, &mut tx_buf)
+            .unwrap();
         let (ogm, _) = BatmanOgmPacket::<u8>::ref_from_prefix(ogm_bytes).unwrap();
 
         assert_eq!(ogm.packet_type, BATADV_IV_OGM);
@@ -77,11 +80,14 @@ mod ogm_generation {
 
     #[test]
     fn test_sequence_number_increments() {
+        let mut tx_buf = [0u8; 1024];
         let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
 
         // Generate multiple OGMs
         for i in 1..=5 {
-            let ogm_bytes = engine.produce_periodic_broadcast(Duration::ZERO).unwrap();
+            let ogm_bytes = engine
+                .produce_periodic_broadcast(Duration::ZERO, &mut tx_buf)
+                .unwrap();
             let (ogm, _) = BatmanOgmPacket::<u8>::ref_from_prefix(ogm_bytes).unwrap();
             let seqno = ogm.seqno;
             assert_eq!(seqno, (i as u32).to_be()); // Check in network byte order
@@ -90,11 +96,16 @@ mod ogm_generation {
 
     #[test]
     fn test_sequence_number_wraps() {
+        let mut tx_buf = [0u8; 1024];
         let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
         engine.sequence_number = u32::MAX - 1;
 
-        engine.produce_periodic_broadcast(Duration::ZERO).unwrap();
-        let ogm_bytes = engine.produce_periodic_broadcast(Duration::ZERO).unwrap();
+        engine
+            .produce_periodic_broadcast(Duration::ZERO, &mut tx_buf)
+            .unwrap();
+        let ogm_bytes = engine
+            .produce_periodic_broadcast(Duration::ZERO, &mut tx_buf)
+            .unwrap();
         let (ogm, _) = BatmanOgmPacket::<u8>::ref_from_prefix(ogm_bytes).unwrap();
         let seqno = ogm.seqno;
         // Should wrap to 0
