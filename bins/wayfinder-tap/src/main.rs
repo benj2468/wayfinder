@@ -1,18 +1,20 @@
 use std::time::Instant;
 
 use clap::Parser;
+use core::net::Ipv4Addr;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
-use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
-use wayfinder::{
-    CentralRouter,
-    interfaces::{engine::MeshRoutingEngine, link::EmbeddedMeshLink},
-};
+use tun_rs::{DeviceBuilder, Layer};
+use wayfinder::CentralRouter;
 
 #[derive(clap::Parser, Debug)]
 pub struct Args {
-    #[clap(short, long, default_value = "fethwayfinder")]
+    #[clap(short, long, default_value = "wayfinder0")]
     device_name: String,
+    #[clap(short, long, default_value = "192.168.184.1")]
+    ip_address: Ipv4Addr,
+    #[clap(short, long, default_value = "255.255.255.0")]
+    netmask: Ipv4Addr,
 }
 
 #[tokio::main]
@@ -28,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
     let dev = DeviceBuilder::new()
         .layer(Layer::L2) // TAP mode for Ethernet frames
         .name(args.device_name)
+        .ipv4(args.ip_address, args.netmask, None)
         .build_async()?;
 
     let mac_addr = dev.mac_address()?;
@@ -45,10 +48,11 @@ async fn main() -> anyhow::Result<()> {
             },
             Ok(bytes) = dev.recv(&mut buffer) => {
 
-                // TOD(bjc) change this to mac addr
                 match etherparse::Ethernet2Header::from_slice(&buffer[..bytes]) {
                     Ok((ether, _)) => {
-                        wayfinder.dispatch_from_local(ether.destination, &buffer[..bytes]).await?;
+                        if let Err(e) = wayfinder.dispatch_from_local(ether.destination, &buffer[..bytes]).await {
+                            warn!("Failed to dispatch from local: {e:?}");
+                        }
                     }
                     Err(e) => {
                         warn!("Failed to parse ethernet header: {e:?}");

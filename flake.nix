@@ -28,6 +28,7 @@
               nil
               nixd
               cargo
+              clippy
               rustc
               rust-analyzer
               rustfmt

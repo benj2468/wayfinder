@@ -11,6 +11,7 @@ interfaces.workspace = true
 zerocopy.workspace = true
 batman.workspace = true
 anyhow.workspace = true
+pretty-hex.workspace = true
 
 [dev-dependencies]
 tracing-test = "0.2.6"

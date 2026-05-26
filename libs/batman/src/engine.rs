@@ -172,7 +172,7 @@ where
                         .payload
                         .get_mut(0..size)
                         .unwrap()
-                        .copy_from_slice(&updated_hdr.as_bytes());
+                        .copy_from_slice(updated_hdr.as_bytes());
                 }
 
                 RoutingAction::Consumed // Route unknown, drop packet

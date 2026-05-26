@@ -1,5 +1,6 @@
 use crate::frame::{LinkFrame, LinkFrameData};
 use async_trait::async_trait;
+use core::fmt::Debug;
 use core::hash::Hash;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
@@ -20,7 +21,7 @@ pub enum LinkError {
 }
 
 pub trait MeshIdentifier:
-    Copy + PartialEq + Eq + FromBytes + IntoBytes + Immutable + Default + KnownLayout + Hash
+    Copy + PartialEq + Eq + FromBytes + IntoBytes + Immutable + Default + KnownLayout + Hash + Debug
 {
     const BROADCAST: Self;
 }
@@ -65,10 +66,10 @@ where
     }
 
     async fn transmit(&mut self, data: LinkFrameData<'_, Ident>) -> Result<(), LinkError> {
-        self.link.write_all(&self.identifier.as_bytes()).await?;
-        self.link.write_all(&data.dst.as_bytes()).await?;
+        self.link.write_all(self.identifier.as_bytes()).await?;
+        self.link.write_all(data.dst.as_bytes()).await?;
         self.link.write_all(&data.protocol.to_be_bytes()).await?;
-        self.link.write_all(&data.payload).await?;
+        self.link.write_all(data.payload).await?;
         self.link.flush().await?;
 
         Ok(())

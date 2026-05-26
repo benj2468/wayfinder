@@ -15,7 +15,7 @@ use interfaces::{
     frame::{LinkFrame, LinkFrameData, LinkFrameDataMut},
     link::{EmbeddedMeshLink, MeshIdentifier},
 };
-use tracing::{info_span, trace, trace_span, warn};
+use tracing::{trace, trace_span, warn};
 use zerocopy::IntoBytes;
 
 pub const DEFAULT_BATMAN_ETHER_TYPE: u16 = 0x4305;
@@ -63,7 +63,7 @@ impl<Ident: MeshIdentifier, const N: usize> CentralRouter<Ident, N> {
                         let mut reply: LinkFrameDataMut<'_, Ident> = tx_buf.into();
 
                         // BATMAN-adv Protocol ID
-                        match self.batman.handle_rx(&frame, &mut reply) {
+                        match self.batman.handle_rx(frame, &mut reply) {
                             RoutingAction::Consumed => {
                                 // Handled internally by BATMAN (e.g., OGM processed)
                             }
@@ -95,7 +95,7 @@ impl<Ident: MeshIdentifier, const N: usize> CentralRouter<Ident, N> {
 
                 if should_go_local {
                     trace!("dispatching to local app");
-                    self.dispatch_to_local_app(&frame);
+                    self.dispatch_to_local_app(frame);
                 }
             }
         }
@@ -117,45 +117,48 @@ impl<Ident: MeshIdentifier, const N: usize> CentralRouter<Ident, N> {
         }
     }
 
+    #[tracing::instrument(skip(self, payload), ret)]
     pub async fn dispatch_from_local(&mut self, dest: Ident, payload: &[u8]) -> anyhow::Result<()> {
+        tracing::trace!("{}", pretty_hex::pretty_hex(&payload));
         // 1. Query BATMAN for the next-hop physical address
-        if let Some(next_hop) = self.batman.lookup_route(dest) {
-            // 2. Build the Unicast Header
-            let header = BatmanUnicastPacket {
-                packet_type: BATADV_UNICAST,
-                version: 5,
-                ttl: 50,
-                dest,
-            };
-
-            // 3. Allocate a deterministic transmission workspace on the stack
-            let mut tx_scratchpad = [0u8; 1500]; // Max MTU frame layout bounds
-            let header_size = core::mem::size_of::<BatmanUnicastPacket<Ident>>();
-            let total_size = header_size + payload.len();
-
-            if total_size > tx_scratchpad.len() {
-                bail!("Payload size exceeds maximum frame capacity");
-            }
-
-            // Pack the header and data sequentially into the scratchpad
-            tx_scratchpad[..header_size].copy_from_slice(header.as_bytes());
-            tx_scratchpad[header_size..total_size].copy_from_slice(payload);
-
-            // 4. Fire the encapsulated packet out to the immediate neighbor
-            if let Some(link) = self.interfaces.get_mut(0) {
-                link.transmit(LinkFrameData {
-                    dst: next_hop,
-                    protocol: ETH_P_BATMAN,
-                    payload: &tx_scratchpad[..total_size],
-                })
-                .await?;
-                Ok(())
-            } else {
-                bail!("No hardware radio links available")
-            }
+        let next_hop = if let Some(next_hop) = self.batman.lookup_route(dest) {
+            next_hop
         } else {
-            bail!("No mesh route found to destination")
+            dest
+        };
+        // 2. Build the Unicast Header
+        let header = BatmanUnicastPacket {
+            packet_type: BATADV_UNICAST,
+            version: 5,
+            ttl: 50,
+            dest,
+        };
+
+        // 3. Allocate a deterministic transmission workspace on the stack
+        let mut tx_scratchpad = [0u8; 1500]; // Max MTU frame layout bounds
+        let header_size = core::mem::size_of::<BatmanUnicastPacket<Ident>>();
+        let total_size = header_size + payload.len();
+
+        if total_size > tx_scratchpad.len() {
+            bail!("Payload size exceeds maximum frame capacity");
         }
+
+        // Pack the header and data sequentially into the scratchpad
+        tx_scratchpad[..header_size].copy_from_slice(header.as_bytes());
+        tx_scratchpad[header_size..total_size].copy_from_slice(payload);
+
+        // 4. Fire the encapsulated packet out to the immediate neighbor
+        // For now we will always send it over all the links, but in theory we should have an "internal"
+        // map between interface indices and their corresponding mesh links.
+        for link in self.interfaces.iter_mut() {
+            link.transmit(LinkFrameData {
+                dst: next_hop,
+                protocol: ETH_P_BATMAN,
+                payload: &tx_scratchpad[..total_size],
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     fn dispatch_to_local_app(&self, _frame: &LinkFrame<Ident>) {

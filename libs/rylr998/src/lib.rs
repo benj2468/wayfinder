@@ -156,10 +156,10 @@ where
                 }
 
                 if trimmed.starts_with("+ERR=") {
-                    if let Some(err_code_str) = trimmed.strip_prefix("+ERR=") {
-                        if let Ok(code) = err_code_str.parse::<i32>() {
-                            return Err(LoraError::ModuleError(code));
-                        }
+                    if let Some(err_code_str) = trimmed.strip_prefix("+ERR=")
+                        && let Ok(code) = err_code_str.parse::<i32>()
+                    {
+                        return Err(LoraError::ModuleError(code));
                     }
                     return Err(LoraError::InvalidResponse(trimmed.to_string()));
                 }
@@ -233,12 +233,10 @@ where
         coding_rate: CodingRate,
         programming_preamble: u8,
     ) -> Result<(), LoraError> {
-        if self.network_id != 18 {
-            if programming_preamble != 12 {
-                return Err(LoraError::InvalidResponse(
-                    "programming_preamble must be 12 for non-network_id 18".to_string(),
-                ));
-            }
+        if self.network_id != 18 && programming_preamble != 12 {
+            return Err(LoraError::InvalidResponse(
+                "programming_preamble must be 12 for non-network_id 18".to_string(),
+            ));
         }
         self.send_cmd_expect_ok(&format!(
             "AT+PARAMETER={},{},{},{}",
@@ -257,7 +255,7 @@ where
 
     /// 8. Set the network ID group function (AT+NETWORKID)
     pub async fn set_network_id(&mut self, network_id: u8) -> Result<(), LoraError> {
-        if network_id < 3 || network_id > 15 || network_id != 18 {
+        if !(3..=15).contains(&network_id) || network_id != 18 {
             return Err(LoraError::InvalidResponse(
                 "Network ID must be 3-15, or 18".to_string(),
             ));
