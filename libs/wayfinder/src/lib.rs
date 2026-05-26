@@ -20,16 +20,16 @@ use zerocopy::IntoBytes;
 
 pub const DEFAULT_BATMAN_ETHER_TYPE: u16 = 0x4305;
 
-pub struct CentralRouter<Ident: MeshIdentifier, const N: usize> {
+pub struct CentralRouter<Ident: MeshIdentifier> {
     /// The set of physical interfaces for this router
-    interfaces: [Box<dyn EmbeddedMeshLink<Ident>>; N],
+    interfaces: Vec<Box<dyn EmbeddedMeshLink<Ident>>>,
     /// The Batman routing engine for this router
     batman: BatmanEngine<100, Ident>,
     phantom: PhantomData<Ident>,
 }
 
-impl<Ident: MeshIdentifier, const N: usize> CentralRouter<Ident, N> {
-    pub fn new(interfaces: [Box<dyn EmbeddedMeshLink<Ident>>; N], self_ident: Ident) -> Self {
+impl<Ident: MeshIdentifier> CentralRouter<Ident> {
+    pub fn new(interfaces: Vec<Box<dyn EmbeddedMeshLink<Ident>>>, self_ident: Ident) -> Self {
         Self {
             interfaces,
             batman: BatmanEngine::new(self_ident),
@@ -38,7 +38,7 @@ impl<Ident: MeshIdentifier, const N: usize> CentralRouter<Ident, N> {
     }
 }
 
-impl<Ident: MeshIdentifier, const N: usize> CentralRouter<Ident, N> {
+impl<Ident: MeshIdentifier> CentralRouter<Ident> {
     pub async fn poll_and_route(&mut self, now: core::time::Duration) {
         let mut rx_buf = [0u8; 1500];
 
@@ -117,7 +117,7 @@ impl<Ident: MeshIdentifier, const N: usize> CentralRouter<Ident, N> {
         }
     }
 
-    #[tracing::instrument(skip(self, payload), ret)]
+    #[tracing::instrument(skip(self, payload))]
     pub async fn dispatch_from_local(&mut self, dest: Ident, payload: &[u8]) -> anyhow::Result<()> {
         tracing::trace!("{}", pretty_hex::pretty_hex(&payload));
         // 1. Query BATMAN for the next-hop physical address
@@ -177,7 +177,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_constructor() {
-        let _ = CentralRouter::new([], 0_u8);
+        let _ = CentralRouter::new(vec![], 0_u8);
     }
 
     #[tokio::test]
@@ -187,7 +187,7 @@ mod tests {
         b.write(&buf).await.unwrap();
 
         let _ = CentralRouter::new(
-            [Box::new(IdentifiableLink {
+            vec![Box::new(IdentifiableLink {
                 identifier: 0,
                 link: a,
             })],
@@ -202,7 +202,7 @@ mod tests {
         b.write(&buf).await.unwrap();
 
         let mut router = CentralRouter::new(
-            [Box::new(IdentifiableLink {
+            vec![Box::new(IdentifiableLink {
                 identifier: 0,
                 link: a,
             })],
