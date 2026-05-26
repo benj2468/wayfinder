@@ -1,9 +1,4 @@
-use std::{
-    io::Read,
-    net::{SocketAddr, SocketAddrV4},
-    path::PathBuf,
-    time::Instant,
-};
+use std::{net::SocketAddr, path::PathBuf, time::Instant};
 
 use anyhow::bail;
 use clap::Parser;
