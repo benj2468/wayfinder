@@ -17,7 +17,7 @@ use interfaces::{
     link::{EmbeddedMeshLink, MeshIdentifier},
 };
 use tracing::{trace, trace_span, warn};
-use zerocopy::IntoBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 pub const DEFAULT_BATMAN_ETHER_TYPE: u16 = 0x4305;
 
@@ -41,8 +41,6 @@ impl<Ident: MeshIdentifier> CentralRouter<Ident> {
 
 impl<Ident: MeshIdentifier> CentralRouter<Ident> {
     pub async fn poll_and_route(&mut self, now: core::time::Duration) {
-        let mut rx_buf = [0u8; 1500];
-
         let mut tx_buf = [0u8; 1500];
         let tx_buf = tx_buf.as_mut_slice();
 
@@ -54,8 +52,16 @@ impl<Ident: MeshIdentifier> CentralRouter<Ident> {
             let link = &mut self.interfaces[interface_idx];
 
             trace!("waiting for data");
-            if let Ok(Some(frame)) = link.receive(&mut rx_buf).await {
+            if let Ok(Some(frame_bytes)) = link.receive().await {
                 trace!("received data");
+                let frame = match LinkFrame::<Ident>::ref_from_bytes(&frame_bytes) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        warn!("Failed to parse link frame");
+                        continue;
+                    }
+                };
+
                 let mut should_go_local = false;
 
                 // 2. Demux by Protocol ID
@@ -173,7 +179,7 @@ impl<Ident: MeshIdentifier> CentralRouter<Ident> {
 mod tests {
     use core::time::Duration;
 
-    use interfaces::{frame::LinkFrame, link::IdentifiableLink};
+    use interfaces::link::IdentifiableLink;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use crate::CentralRouter;
@@ -185,36 +191,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_constructor_with_duplex() {
-        let buf = [0; 1500];
         let (a, mut b) = tokio::io::duplex(3000);
-        b.write(&buf).await.unwrap();
+        let buf = [0; 1500];
+        b.write_all(&buf).await.unwrap();
 
-        let _ = CentralRouter::new(
-            vec![Box::new(IdentifiableLink {
-                identifier: 0,
-                link: a,
-            })],
-            0,
-        );
+        let _ = CentralRouter::new(vec![Box::new(IdentifiableLink::new(0, a))], 0);
     }
 
     #[tokio::test]
     async fn test_poll_and_route() {
-        let mut buf = [0; 1500];
         let (a, mut b) = tokio::io::duplex(3000);
-        b.write(&buf).await.unwrap();
+        let buf = [0; 1500];
+        b.write_all(&buf).await.unwrap();
 
-        let mut router = CentralRouter::new(
-            vec![Box::new(IdentifiableLink {
-                identifier: 0,
-                link: a,
-            })],
-            0,
-        );
+        let mut router = CentralRouter::new(vec![Box::new(IdentifiableLink::new(0, a))], 0);
 
         router.poll_and_route(Duration::ZERO).await;
         // We should have received a message.
-        let read = tokio::time::timeout(Duration::from_secs(1), b.read(&mut buf))
+        let mut out_buf = [0; 1500];
+        let read = tokio::time::timeout(Duration::from_secs(1), b.read(&mut out_buf))
             .await
             .unwrap()
             .unwrap();

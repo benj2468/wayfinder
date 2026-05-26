@@ -1,4 +1,33 @@
+use bytes::BytesMut;
+use core::marker::PhantomData;
+use std::io;
+use tokio_util::codec::{Decoder, Encoder};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+pub trait MeshIdentifier:
+    Copy
+    + PartialEq
+    + Eq
+    + FromBytes
+    + IntoBytes
+    + Immutable
+    + Default
+    + KnownLayout
+    + core::hash::Hash
+    + core::fmt::Debug
+    + Send
+    + Sync
+{
+    const BROADCAST: Self;
+}
+
+impl MeshIdentifier for u8 {
+    const BROADCAST: Self = 0xff;
+}
+
+impl MeshIdentifier for [u8; 6] {
+    const BROADCAST: Self = [0xff; 6];
+}
 
 /// A unified link-layer frame passed around your central router
 #[derive(FromBytes, KnownLayout, Immutable, IntoBytes)]
@@ -44,5 +73,47 @@ where
             protocol: 0,
             payload: value,
         }
+    }
+}
+
+pub struct LinkCodec<Ident> {
+    pub src_identifier: Ident,
+    _phantom: PhantomData<Ident>,
+}
+
+impl<Ident> LinkCodec<Ident> {
+    pub fn new(src_identifier: Ident) -> Self {
+        Self {
+            src_identifier,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<Ident: MeshIdentifier> Decoder for LinkCodec<Ident> {
+    type Item = BytesMut;
+    type Error = io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if src.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(src.split_to(src.len())))
+    }
+}
+
+impl<Ident: MeshIdentifier> Encoder<LinkFrameData<'_, Ident>> for LinkCodec<Ident> {
+    type Error = io::Error;
+
+    fn encode(
+        &mut self,
+        item: LinkFrameData<'_, Ident>,
+        dst: &mut BytesMut,
+    ) -> Result<(), Self::Error> {
+        dst.extend_from_slice(self.src_identifier.as_bytes());
+        dst.extend_from_slice(item.dst.as_bytes());
+        dst.extend_from_slice(&item.protocol.to_be_bytes());
+        dst.extend_from_slice(item.payload);
+        Ok(())
     }
 }

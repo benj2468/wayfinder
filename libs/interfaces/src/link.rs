@@ -1,10 +1,10 @@
-use crate::frame::{LinkFrame, LinkFrameData};
+pub use crate::frame::{LinkCodec, LinkFrameData, MeshIdentifier};
 use async_trait::async_trait;
-use core::fmt::Debug;
-use core::hash::Hash;
+use bytes::BytesMut;
+use futures::{SinkExt, StreamExt};
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::codec::Framed;
 
 #[derive(Error, Debug)]
 pub enum LinkError {
@@ -20,22 +20,8 @@ pub enum LinkError {
     InvalidPacket,
 }
 
-pub trait MeshIdentifier:
-    Copy + PartialEq + Eq + FromBytes + IntoBytes + Immutable + Default + KnownLayout + Hash + Debug
-{
-    const BROADCAST: Self;
-}
-
-impl MeshIdentifier for u8 {
-    const BROADCAST: Self = 0xff;
-}
-
-impl MeshIdentifier for [u8; 6] {
-    const BROADCAST: Self = [0xff; 6];
-}
-
 #[async_trait]
-pub trait EmbeddedMeshLink<Ident: MeshIdentifier> {
+pub trait EmbeddedMeshLink<Ident: MeshIdentifier>: Send {
     /// The identifier of the destination node.
     fn identifier(&self) -> Ident;
 
@@ -44,55 +30,45 @@ pub trait EmbeddedMeshLink<Ident: MeshIdentifier> {
     async fn transmit(&mut self, data: LinkFrameData<'_, Ident>) -> Result<(), LinkError>;
 
     /// Async blocking check to receive a frame from the radio.
-    /// Returns Ok(Some((source_identifier, bytes_written_to_buf))) if a packet arrived.
-    async fn receive<'a>(
-        &mut self,
-        buffer: &'a mut [u8],
-    ) -> Result<Option<&'a LinkFrame<Ident>>, LinkError>;
+    /// Returns Ok(Some(bytes)) if a packet arrived.
+    async fn receive(&mut self) -> Result<Option<BytesMut>, LinkError>;
 }
 
 pub struct IdentifiableLink<Ident: MeshIdentifier, T> {
     pub identifier: Ident,
-    pub link: T,
+    pub framed: Framed<T, LinkCodec<Ident>>,
+}
+
+impl<Ident: MeshIdentifier, T> IdentifiableLink<Ident, T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    pub fn new(identifier: Ident, link: T) -> Self {
+        Self {
+            identifier,
+            framed: Framed::new(link, LinkCodec::new(identifier)),
+        }
+    }
 }
 
 #[async_trait]
 impl<T, Ident: MeshIdentifier + Send> EmbeddedMeshLink<Ident> for IdentifiableLink<Ident, T>
 where
-    T: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin + Send,
+    T: AsyncRead + AsyncWrite + Unpin + Send,
 {
     fn identifier(&self) -> Ident {
         self.identifier
     }
 
     async fn transmit(&mut self, data: LinkFrameData<'_, Ident>) -> Result<(), LinkError> {
-        self.link.write_all(self.identifier.as_bytes()).await?;
-        self.link.write_all(data.dst.as_bytes()).await?;
-        self.link.write_all(&data.protocol.to_be_bytes()).await?;
-        self.link.write_all(data.payload).await?;
-        self.link.flush().await?;
-
-        Ok(())
+        self.framed.send(data).await.map_err(LinkError::Io)
     }
 
-    async fn receive<'a>(
-        &mut self,
-        buffer: &'a mut [u8],
-    ) -> Result<Option<&'a LinkFrame<Ident>>, LinkError> {
-        let (mut reader, _) = tokio::io::split(&mut self.link);
-
-        let bytes_read = reader
-            .read(buffer)
-            .await
-            .map_err(|_| LinkError::ReceiveFailed)?;
-
-        if bytes_read == 0 {
-            return Ok(None);
+    async fn receive(&mut self) -> Result<Option<BytesMut>, LinkError> {
+        match self.framed.next().await {
+            Some(Ok(bytes)) => Ok(Some(bytes)),
+            Some(Err(e)) => Err(LinkError::Io(e)),
+            None => Ok(None),
         }
-
-        let frame = LinkFrame::ref_from_bytes(&buffer[..bytes_read])
-            .map_err(|_| LinkError::InvalidPacket)?;
-
-        Ok(Some(frame))
     }
 }

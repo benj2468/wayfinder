@@ -91,10 +91,9 @@ async fn main() -> anyhow::Result<()> {
                     bail!("Task should never complete");
                 });
 
-                interfaces.push(Box::new(IdentifiableLink {
-                    link: dp2,
-                    identifier: mac_addr,
-                }) as Box<dyn EmbeddedMeshLink<_>>);
+                interfaces
+                    .push(Box::new(IdentifiableLink::new(mac_addr, dp2))
+                        as Box<dyn EmbeddedMeshLink<_>>);
             }
             Link::UnixServer { path } => {
                 if std::fs::metadata(&path).is_ok() {
@@ -123,18 +122,15 @@ async fn main() -> anyhow::Result<()> {
                     bail!("Task should never complete");
                 });
 
-                interfaces.push(Box::new(IdentifiableLink {
-                    link: dp2,
-                    identifier: mac_addr,
-                }) as Box<dyn EmbeddedMeshLink<_>>);
+                interfaces
+                    .push(Box::new(IdentifiableLink::new(mac_addr, dp2))
+                        as Box<dyn EmbeddedMeshLink<_>>);
             }
             Link::UnixClient { path } => {
                 let stream = UnixStream::connect(&path).await?;
 
-                interfaces.push(Box::new(IdentifiableLink {
-                    link: stream,
-                    identifier: mac_addr,
-                }) as Box<dyn EmbeddedMeshLink<_>>);
+                interfaces.push(Box::new(IdentifiableLink::new(mac_addr, stream))
+                    as Box<dyn EmbeddedMeshLink<_>>);
             }
         }
     }
