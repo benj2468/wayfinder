@@ -22,11 +22,14 @@ pub trait EmbeddedMeshLink<Ident: MeshIdentifier> {
 
     /// Sends a raw frame out over the physical medium.
     /// If destination identifier is Broadcast, then the radio should broadcast it
-    async fn transmit(&mut self, data: LinkFrameData<'_, Ident>) -> Result<(), LinkError>;
+    fn transmit(
+        &mut self,
+        data: LinkFrameData<'_, Ident>,
+    ) -> impl Future<Output = Result<(), LinkError>>;
 
     /// Async blocking check to receive a frame from the radio.
     /// Returns Ok(size) if a packet arrived.
-    async fn receive(&mut self, buf: &mut [u8]) -> Result<usize, LinkError>;
+    fn receive(&mut self, buf: &mut [u8]) -> impl Future<Output = Result<usize, LinkError>>;
 }
 
 pub struct IdentifiableLink<Ident: MeshIdentifier, T> {

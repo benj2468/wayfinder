@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 pub use batman;
 pub use interfaces;
@@ -19,13 +19,13 @@ use zerocopy::{FromBytes, IntoBytes};
 
 pub const DEFAULT_BATMAN_ETHER_TYPE: u16 = 0x4305;
 
-pub struct CentralRouter<Ident: MeshIdentifier, const MAX_INTERFACES: usize> {
+pub struct CentralRouter<Ident: MeshIdentifier> {
     /// The Batman routing engine for this router
     batman: BatmanEngine<100, Ident>,
     phantom: PhantomData<Ident>,
 }
 
-impl<Ident: MeshIdentifier, const MAX_INTERFACES: usize> CentralRouter<Ident, MAX_INTERFACES> {
+impl<Ident: MeshIdentifier> CentralRouter<Ident> {
     pub fn new(self_ident: Ident) -> Self {
         Self {
             batman: BatmanEngine::new(self_ident),
@@ -34,11 +34,11 @@ impl<Ident: MeshIdentifier, const MAX_INTERFACES: usize> CentralRouter<Ident, MA
     }
 }
 
-impl<Ident: MeshIdentifier, const MAX_INTERFACES: usize> CentralRouter<Ident, MAX_INTERFACES> {
+impl<Ident: MeshIdentifier> CentralRouter<Ident> {
     pub async fn poll_and_route<L: EmbeddedMeshLink<Ident>>(
         &mut self,
-        interfaces: &mut [ &mut L ],
-        now: core::time::Duration
+        interfaces: &mut [&mut L],
+        now: core::time::Duration,
     ) {
         let mut tx_buf = [0u8; 1500];
         let mut rx_buf = [0u8; 1500];
@@ -52,7 +52,9 @@ impl<Ident: MeshIdentifier, const MAX_INTERFACES: usize> CentralRouter<Ident, MA
 
             trace!("waiting for data");
             if let Ok(n) = link.receive(&mut rx_buf).await {
-                if n == 0 { continue; }
+                if n == 0 {
+                    continue;
+                }
                 trace!("received data");
                 let frame_bytes = &rx_buf[..n];
                 let frame = match LinkFrame::<Ident>::ref_from_bytes(frame_bytes) {
@@ -78,11 +80,13 @@ impl<Ident: MeshIdentifier, const MAX_INTERFACES: usize> CentralRouter<Ident, MA
                             RoutingAction::ForwardTo(next_hop) => {
                                 // BATMAN told us this packet needs to keep moving.
                                 // Re-transmit it out to the designated next-hop neighbor.
-                                let _ = link.transmit(LinkFrameData {
-                                    dst: next_hop,
-                                    protocol: DEFAULT_BATMAN_ETHER_TYPE,
-                                    payload: &frame.payload,
-                                }).await;
+                                let _ = link
+                                    .transmit(LinkFrameData {
+                                        dst: next_hop,
+                                        protocol: DEFAULT_BATMAN_ETHER_TYPE,
+                                        payload: &frame.payload,
+                                    })
+                                    .await;
                             }
                             RoutingAction::DeliverLocal => {
                                 // Route up to your local embedded application layer
@@ -127,9 +131,9 @@ impl<Ident: MeshIdentifier, const MAX_INTERFACES: usize> CentralRouter<Ident, MA
 
     pub async fn dispatch_from_local<L: EmbeddedMeshLink<Ident>>(
         &mut self,
-        interfaces: &mut [ &mut L ],
+        interfaces: &mut [&mut L],
         dest: Ident,
-        payload: &[u8]
+        payload: &[u8],
     ) -> Result<(), ()> {
         // 1. Query BATMAN for the next-hop physical address
         let next_hop = if let Some(next_hop) = self.batman.lookup_route(dest) {
@@ -160,12 +164,13 @@ impl<Ident: MeshIdentifier, const MAX_INTERFACES: usize> CentralRouter<Ident, MA
 
         // 4. Fire the encapsulated packet out to the immediate neighbor
         for link in interfaces.iter_mut() {
-            let _ = link.transmit(LinkFrameData {
-                dst: next_hop,
-                protocol: ETH_P_BATMAN,
-                payload: &tx_scratchpad[..total_size],
-            })
-            .await;
+            let _ = link
+                .transmit(LinkFrameData {
+                    dst: next_hop,
+                    protocol: ETH_P_BATMAN,
+                    payload: &tx_scratchpad[..total_size],
+                })
+                .await;
         }
         Ok(())
     }

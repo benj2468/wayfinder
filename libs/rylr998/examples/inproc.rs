@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use anyhow::bail;
+use embedded_io_adapters::tokio_1::FromTokio;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
@@ -19,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (client, server) = tokio::io::duplex(1024);
 
-    let client = rylr998::RylrClient::new(client)?;
+    let client = rylr998::RylrClient::new(FromTokio::new(client))?;
 
     let mut server: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
         let (reader, mut writer) = tokio::io::split(server);

@@ -1,6 +1,5 @@
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf};
 
-use anyhow::bail;
 use clap::Parser;
 use core::net::Ipv4Addr;
 use embedded_io_adapters::tokio_1::FromTokio;
@@ -10,13 +9,9 @@ use tokio::{
     net::{UdpSocket, UnixListener, UnixStream},
     task::JoinSet,
 };
-use tracing::warn;
 use tracing_subscriber::EnvFilter;
 use tun_rs::{DeviceBuilder, Layer};
-use wayfinder::{
-    CentralRouter,
-    interfaces::link::IdentifiableLink,
-};
+use wayfinder::{CentralRouter, interfaces::link::IdentifiableLink};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Link {
@@ -146,23 +141,26 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut router = CentralRouter::<[u8; 6], 4>::new(mac_addr);
+    let mut router = CentralRouter::<[u8; 6]>::new(mac_addr);
 
     let start = std::time::Instant::now();
 
     join_set.spawn(async move {
         loop {
-            let mut interface_refs: Vec<&mut IdentifiableLink<[u8; 6], FromTokio<tokio::io::DuplexStream>>> = 
-                interfaces.iter_mut().collect();
-            
-            router.poll_and_route(&mut interface_refs, start.elapsed()).await;
+            let mut interface_refs: Vec<
+                &mut IdentifiableLink<[u8; 6], FromTokio<tokio::io::DuplexStream>>,
+            > = interfaces.iter_mut().collect();
+
+            router
+                .poll_and_route(&mut interface_refs, start.elapsed())
+                .await;
             tokio::task::yield_now().await;
         }
     });
 
     // Bridging TAP device to local router dispatch
     // (This part would need more refactoring to use the new router dispatch API)
-    
+
     while let Some(res) = join_set.join_next().await {
         res??;
     }

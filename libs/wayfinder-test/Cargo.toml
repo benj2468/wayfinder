@@ -7,8 +7,10 @@ edition = "2024"
 wayfinder.workspace = true
 interfaces.workspace = true
 
+thiserror.workspace = true
 zerocopy.workspace = true
 embassy-sync.workspace = true
 heapless.workspace = true
 embedded-io-async.workspace = true
-rand.workspace = true
+rand = { workspace = true, features = ["std"] }
+tokio.workspace = true

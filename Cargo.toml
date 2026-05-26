@@ -35,7 +35,6 @@ etherparse = "0.20.1"
 embedded-io-async = "0.6.1"
 embassy-sync = "0.8.0"
 embassy-futures = "0.1.2"
-embassy-time = "0.5.1"
 heapless = "0.9.3"
 embedded-io-adapters = { version = "0.6.1", features = ["tokio-1"] }
 

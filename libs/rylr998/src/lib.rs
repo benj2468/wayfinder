@@ -1,6 +1,6 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
-use embassy_time::{Duration, with_timeout};
+use core::time::Duration;
 use embedded_io_async::{Read, Write};
 use heapless::String;
 use thiserror::Error;
@@ -105,10 +105,16 @@ where
     /// Helper function to internally dispatch an explicit string sequence and read its immediate raw response.
     async fn send_raw(&mut self, cmd: &str) -> Result<(), LoraError> {
         trace!("send_raw: cmd={cmd}");
-        
-        self.stream.write_all(cmd.as_bytes()).await.map_err(|_| LoraError::Io)?;
+
+        self.stream
+            .write_all(cmd.as_bytes())
+            .await
+            .map_err(|_| LoraError::Io)?;
         if !cmd.ends_with("\r\n") {
-            self.stream.write_all(b"\r\n").await.map_err(|_| LoraError::Io)?;
+            self.stream
+                .write_all(b"\r\n")
+                .await
+                .map_err(|_| LoraError::Io)?;
         }
         self.stream.flush().await.map_err(|_| LoraError::Io)?;
 
@@ -117,7 +123,11 @@ where
 
     /// Helper function to internally dispatch an explicit string sequence and read its immediate raw response.
     /// And expect a series of specific responses
-    async fn send_cmd_expect(&mut self, cmd: &str, expected: &str) -> Result<String<256>, LoraError> {
+    async fn send_cmd_expect(
+        &mut self,
+        cmd: &str,
+        expected: &str,
+    ) -> Result<String<256>, LoraError> {
         self.send_raw(cmd).await?;
 
         self.expect(expected).await
@@ -126,7 +136,10 @@ where
     async fn read_line(&mut self, line: &mut String<256>) -> Result<(), LoraError> {
         let mut buf = [0u8; 1];
         loop {
-            self.stream.read_exact(&mut buf).await.map_err(|_| LoraError::Io)?;
+            self.stream
+                .read_exact(&mut buf)
+                .await
+                .map_err(|_| LoraError::Io)?;
             let c = buf[0] as char;
             if c == '\n' {
                 break;
@@ -143,30 +156,27 @@ where
     async fn expect(&mut self, expected: &str) -> Result<String<256>, LoraError> {
         let mut line = String::<256>::new();
 
-        // Wrap reading loop inside a timeout block to prevent endless waiting
-        with_timeout(self.timeout, async {
-            loop {
-                line.clear();
-                self.read_line(&mut line).await?;
-                trace!("read_line: line={line:?}");
+        // TODO(bjc) Change this client into a big state machine...
 
-                let trimmed = line.trim();
+        loop {
+            line.clear();
+            self.read_line(&mut line).await?;
+            trace!("read_line: line={line:?}");
 
-                if trimmed.is_empty() {
-                    continue;
-                }
+            let trimmed = line.trim();
 
-                if trimmed.starts_with(expected) {
-                    return Ok(line.clone());
-                }
-
-                if trimmed.starts_with("+ERR=") {
-                    return Err(LoraError::ModuleError(0)); // Simplify for now
-                }
+            if trimmed.is_empty() {
+                continue;
             }
-        })
-        .await
-        .map_err(|_| LoraError::Timeout)?
+
+            if trimmed.starts_with(expected) {
+                return Ok(line.clone());
+            }
+
+            if trimmed.starts_with("+ERR=") {
+                return Err(LoraError::ModuleError(0)); // Simplify for now
+            }
+        }
     }
 
     async fn send_cmd_expect_ok(&mut self, cmd: &str) -> Result<String<256>, LoraError> {
@@ -229,10 +239,13 @@ where
         programming_preamble: u8,
     ) -> Result<(), LoraError> {
         let mut cmd = String::<64>::new();
-        let _ = core::fmt::write(&mut cmd, format_args!(
-            "AT+PARAMETER={},{},{},{}",
-            spreading_factor as u8, bandwidth as u8, coding_rate as u8, programming_preamble
-        ));
+        let _ = core::fmt::write(
+            &mut cmd,
+            format_args!(
+                "AT+PARAMETER={},{},{},{}",
+                spreading_factor as u8, bandwidth as u8, coding_rate as u8, programming_preamble
+            ),
+        );
         self.send_cmd_expect_ok(&cmd).await?;
         Ok(())
     }
@@ -270,7 +283,10 @@ where
             return Err(LoraError::InvalidResponse);
         }
         let mut cmd = String::<512>::new();
-        let _ = core::fmt::write(&mut cmd, format_args!("AT+SEND={},{},{}", target_address, payload_length, data));
+        let _ = core::fmt::write(
+            &mut cmd,
+            format_args!("AT+SEND={},{},{}", target_address, payload_length, data),
+        );
         self.send_cmd_expect_ok(&cmd).await?;
         Ok(())
     }
@@ -280,7 +296,8 @@ where
         let resp = self.send_cmd_expect("AT+UID?", "+UID=").await?;
         let mut uid = String::<64>::new();
         if let Some(clean) = resp.strip_prefix("+UID=") {
-            uid.push_str(clean).map_err(|_| LoraError::InvalidResponse)?;
+            uid.push_str(clean)
+                .map_err(|_| LoraError::InvalidResponse)?;
         }
         Ok(uid)
     }
@@ -299,19 +316,28 @@ where
                 // Format payload: +RCV=<Address>,<Length>,<Data>,<RSSI>,<SNR>
                 // Manual parsing to avoid Vec
                 let mut parts = clean_target.split(',');
-                
+
                 let address_str = parts.next().ok_or(LoraError::InvalidResponse)?;
                 let length_str = parts.next().ok_or(LoraError::InvalidResponse)?;
                 let data_str = parts.next().ok_or(LoraError::InvalidResponse)?;
                 let rssi_str = parts.next().ok_or(LoraError::InvalidResponse)?;
                 let snr_str = parts.next().ok_or(LoraError::InvalidResponse)?;
 
-                let address = address_str.parse::<u16>().map_err(|_| LoraError::InvalidResponse)?;
-                let length = length_str.parse::<usize>().map_err(|_| LoraError::InvalidResponse)?;
+                let address = address_str
+                    .parse::<u16>()
+                    .map_err(|_| LoraError::InvalidResponse)?;
+                let length = length_str
+                    .parse::<usize>()
+                    .map_err(|_| LoraError::InvalidResponse)?;
                 let mut data = String::<240>::new();
-                data.push_str(data_str).map_err(|_| LoraError::InvalidResponse)?;
-                let rssi = rssi_str.parse::<i32>().map_err(|_| LoraError::InvalidResponse)?;
-                let snr = snr_str.parse::<i32>().map_err(|_| LoraError::InvalidResponse)?;
+                data.push_str(data_str)
+                    .map_err(|_| LoraError::InvalidResponse)?;
+                let rssi = rssi_str
+                    .parse::<i32>()
+                    .map_err(|_| LoraError::InvalidResponse)?;
+                let snr = snr_str
+                    .parse::<i32>()
+                    .map_err(|_| LoraError::InvalidResponse)?;
 
                 return Ok(ReceivedPacket {
                     address,

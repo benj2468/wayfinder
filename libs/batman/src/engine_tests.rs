@@ -1,9 +1,8 @@
 use interfaces::{
     engine::{MeshRoutingEngine, RoutingAction},
-    frame::{LinkFrame, LinkFrameDataMut},
-    link::MeshIdentifier,
+    frame::{LinkFrame, LinkFrameDataMut, MeshIdentifier},
 };
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
     BatmanEngine,

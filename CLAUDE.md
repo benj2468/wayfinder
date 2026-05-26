@@ -84,7 +84,7 @@ The project is organized into four main libraries:
 
 **Zero-copy parsing**: Uses `zerocopy` crate for efficient packet handling without allocations. All wire format structs derive `FromBytes`, `IntoBytes`, `Immutable`, `KnownLayout`.
 
-**Async I/O**: Built on `tokio` for async operations. Physical links implement `AsyncRead + AsyncWrite`.
+**Async I/O**: Built on `embedded-io-async` for async operations. Physical links implement `AsyncRead + AsyncWrite`.
 
 **Trait-based abstraction**: Routing engines and physical links are abstracted via traits, enabling protocol/hardware flexibility.
 

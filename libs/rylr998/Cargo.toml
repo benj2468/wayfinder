@@ -7,10 +7,11 @@ edition = "2024"
 thiserror.workspace = true
 embedded-io-async.workspace = true
 heapless.workspace = true
-embassy-time.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 tokio-serial = "5.4"
 anyhow = "1.0.102"
 tracing-subscriber.workspace = true
+tokio.workspace = true
+embedded-io-adapters.workspace = true
