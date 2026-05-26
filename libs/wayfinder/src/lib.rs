@@ -2,6 +2,7 @@
 
 pub use batman;
 pub use interfaces;
+use pretty_hex::pretty_hex;
 
 use core::marker::PhantomData;
 
@@ -151,6 +152,8 @@ impl<Ident: MeshIdentifier> CentralRouter<Ident> {
         // For now we will always send it over all the links, but in theory we should have an "internal"
         // map between interface indices and their corresponding mesh links.
         for link in self.interfaces.iter_mut() {
+            tracing::trace!("transmitted to {:?}", next_hop);
+            tracing::trace!("{}", pretty_hex(&&tx_scratchpad[..total_size]));
             link.transmit(LinkFrameData {
                 dst: next_hop,
                 protocol: ETH_P_BATMAN,

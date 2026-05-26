@@ -14,5 +14,5 @@ tokio.workspace = true
 tun-rs = { version = "2", features = ["async"] }
 etherparse.workspace = true
 serde = { version = "1.0.228", features = ["derive"] }
-toml = "1.1.2"
 libc = "0.2.186"
+serde_yaml = "0.9.34"

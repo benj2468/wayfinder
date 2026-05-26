@@ -12,6 +12,7 @@ zerocopy.workspace = true
 batman.workspace = true
 anyhow.workspace = true
 pretty-hex.workspace = true
+tappers = { version = "0.4.2", features = ["tokio"] }
 
 [dev-dependencies]
 tracing-test = "0.2.6"

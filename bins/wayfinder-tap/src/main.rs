@@ -4,7 +4,11 @@ use anyhow::bail;
 use clap::Parser;
 use core::net::Ipv4Addr;
 use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncWriteExt, net::UdpSocket, task::JoinSet};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{UdpSocket, UnixListener, UnixStream},
+    task::JoinSet,
+};
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 use tun_rs::{DeviceBuilder, Layer};
@@ -16,10 +20,13 @@ use wayfinder::{
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Link {
     Udp { socket_addr: SocketAddr },
+    UnixServer { path: PathBuf },
+    UnixClient { path: PathBuf },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Config {
+    #[serde(default)]
     links: Vec<Link>,
 }
 
@@ -31,7 +38,7 @@ pub struct Args {
     ip_address: Ipv4Addr,
     #[clap(short, long, default_value = "255.255.255.0")]
     netmask: Ipv4Addr,
-    #[clap(short, long, default_value = "var/conf/install.toml")]
+    #[clap(short, long, default_value = "var/conf/install.yml")]
     config: PathBuf,
 }
 
@@ -43,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let config: Config = toml::from_slice(std::fs::read_to_string(args.config)?.as_bytes())?;
+    let config: Config = serde_yaml::from_slice(std::fs::read_to_string(args.config)?.as_bytes())?;
 
     tracing::info!("Welcome to 🌊 Wayfinder");
 
@@ -68,11 +75,17 @@ async fn main() -> anyhow::Result<()> {
                 let (mut dp1, dp2) = tokio::io::duplex(1500);
 
                 join_set.spawn(async move {
-                    let mut buf = [0; 1500];
-                    while let Ok(bytes) = udp_socket.recv(&mut buf).await {
-                        let read = buf[..bytes].to_vec();
-
-                        dp1.write_all(&read).await?;
+                    let mut rx_buf = [0; 1500];
+                    let mut tx_buf = [0; 1500];
+                    tokio::select! {
+                        Ok(bytes) = udp_socket.recv(&mut rx_buf) => {
+                            let read = rx_buf[..bytes].to_vec();
+                            dp1.write_all(&read).await?;
+                        },
+                        Ok(bytes) = dp1.read(&mut tx_buf) => {
+                            let read = tx_buf[..bytes].to_vec();
+                            udp_socket.send(&read).await?;
+                        },
                     }
 
                     bail!("Task should never complete");
@@ -80,6 +93,46 @@ async fn main() -> anyhow::Result<()> {
 
                 interfaces.push(Box::new(IdentifiableLink {
                     link: dp2,
+                    identifier: mac_addr,
+                }) as Box<dyn EmbeddedMeshLink<_>>);
+            }
+            Link::UnixServer { path } => {
+                if std::fs::metadata(&path).is_ok() {
+                    std::fs::remove_file(&path)?;
+                }
+                let listener = UnixListener::bind(&path)?;
+
+                let (mut dp1, dp2) = tokio::io::duplex(1500);
+
+                join_set.spawn(async move {
+                    let mut rx_buf = [0; 1500];
+                    let mut tx_buf = [0; 1500];
+                    while let Ok((mut stream, _)) = listener.accept().await {
+                        tokio::select! {
+                            Ok(bytes) = stream.read(&mut rx_buf) => {
+                                let read = rx_buf[..bytes].to_vec();
+                                dp1.write_all(&read).await?;
+                            },
+                            Ok(read) = dp1.read(&mut tx_buf) => {
+                                let read = tx_buf[..read].to_vec();
+                                stream.write_all(&read).await?;
+                            }
+                        }
+                    }
+
+                    bail!("Task should never complete");
+                });
+
+                interfaces.push(Box::new(IdentifiableLink {
+                    link: dp2,
+                    identifier: mac_addr,
+                }) as Box<dyn EmbeddedMeshLink<_>>);
+            }
+            Link::UnixClient { path } => {
+                let stream = UnixStream::connect(&path).await?;
+
+                interfaces.push(Box::new(IdentifiableLink {
+                    link: stream,
                     identifier: mac_addr,
                 }) as Box<dyn EmbeddedMeshLink<_>>);
             }
@@ -101,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
                 wayfinder.poll_and_route(boot.elapsed()).await;
             },
             Ok(bytes) = dev.recv(&mut buffer) => {
+                tracing::trace!("received {} bytes", bytes);
 
                 match etherparse::Ethernet2Header::from_slice(&buffer[..bytes]) {
                     Ok((ether, _)) => {

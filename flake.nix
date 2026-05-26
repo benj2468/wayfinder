@@ -34,6 +34,7 @@
               rustfmt
               python3
               python312Packages.virtualenv
+              socat
             ];
 
             RUST_SRC_PATH = pkgs.rustPlatform.rustLibSrc;
