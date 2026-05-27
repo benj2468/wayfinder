@@ -8,8 +8,7 @@ wayfinder.workspace = true
 interfaces.workspace = true
 
 zerocopy.workspace = true
-tokio.workspace = true
-thiserror.workspace = true
-tokio-util.workspace = true
-futures.workspace = true
+embassy-sync.workspace = true
+heapless.workspace = true
+embedded-io-async.workspace = true
 rand.workspace = true

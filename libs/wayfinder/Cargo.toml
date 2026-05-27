@@ -4,15 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 interfaces.workspace = true
 zerocopy.workspace = true
 batman.workspace = true
-anyhow.workspace = true
 pretty-hex.workspace = true
-tappers = { version = "0.4.2", features = ["tokio"] }
+heapless.workspace = true
+embedded-io-async.workspace = true
 
 [dev-dependencies]
 tracing-test = "0.2.6"

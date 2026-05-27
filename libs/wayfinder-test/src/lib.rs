@@ -1,7 +1,3 @@
-mod switch;
+#![no_std]
 
-#[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
-pub enum Direction {
-    ToSwitch,
-    FromSwitch,
-}
+pub mod switch;

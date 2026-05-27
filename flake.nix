@@ -40,10 +40,10 @@
             RUST_SRC_PATH = pkgs.rustPlatform.rustLibSrc;
 
             shellHook = ''
-              source .venv/bin/activate
+              # source .venv/bin/activate
 
-              pip install --upgrade pip
-              pip install -r training/requirements.txt
+              # pip install --upgrade pip
+              # pip install -r training/requirements.txt
 
               PYTHONPATH=training:$PYTHONPATH
             '';

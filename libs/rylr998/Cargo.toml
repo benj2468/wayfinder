@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio.workspace = true
 thiserror.workspace = true
+embedded-io-async.workspace = true
+heapless.workspace = true
+embassy-time.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

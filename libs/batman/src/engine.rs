@@ -1,7 +1,6 @@
 use interfaces::{
     engine::{MeshRoutingEngine, RoutingAction},
-    frame::{LinkFrame, LinkFrameDataMut},
-    link::MeshIdentifier,
+    frame::{LinkFrame, LinkFrameDataMut, MeshIdentifier},
 };
 use tracing::warn;
 use zerocopy::{FromBytes, IntoBytes};

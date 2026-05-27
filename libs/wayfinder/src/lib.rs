@@ -1,60 +1,61 @@
-// #![no_std]
+#![no_std]
 
 pub use batman;
 pub use interfaces;
-use pretty_hex::pretty_hex;
 
 use core::marker::PhantomData;
 
-use anyhow::bail;
 use batman::{
     BatmanEngine,
     wire::{BATADV_UNICAST, BatmanUnicastPacket, ETH_P_BATMAN},
 };
 use interfaces::{
     engine::{MeshRoutingEngine, RoutingAction},
-    frame::{LinkFrame, LinkFrameData, LinkFrameDataMut},
-    link::{EmbeddedMeshLink, MeshIdentifier},
+    frame::{LinkFrame, LinkFrameData, LinkFrameDataMut, MeshIdentifier},
+    link::EmbeddedMeshLink,
 };
 use tracing::{trace, trace_span, warn};
 use zerocopy::{FromBytes, IntoBytes};
 
 pub const DEFAULT_BATMAN_ETHER_TYPE: u16 = 0x4305;
 
-pub struct CentralRouter<Ident: MeshIdentifier> {
-    /// The set of physical interfaces for this router
-    interfaces: Vec<Box<dyn EmbeddedMeshLink<Ident>>>,
+pub struct CentralRouter<Ident: MeshIdentifier, const MAX_INTERFACES: usize> {
     /// The Batman routing engine for this router
     batman: BatmanEngine<100, Ident>,
     phantom: PhantomData<Ident>,
 }
 
-impl<Ident: MeshIdentifier> CentralRouter<Ident> {
-    pub fn new(interfaces: Vec<Box<dyn EmbeddedMeshLink<Ident>>>, self_ident: Ident) -> Self {
+impl<Ident: MeshIdentifier, const MAX_INTERFACES: usize> CentralRouter<Ident, MAX_INTERFACES> {
+    pub fn new(self_ident: Ident) -> Self {
         Self {
-            interfaces,
             batman: BatmanEngine::new(self_ident),
             phantom: PhantomData,
         }
     }
 }
 
-impl<Ident: MeshIdentifier> CentralRouter<Ident> {
-    pub async fn poll_and_route(&mut self, now: core::time::Duration) {
+impl<Ident: MeshIdentifier, const MAX_INTERFACES: usize> CentralRouter<Ident, MAX_INTERFACES> {
+    pub async fn poll_and_route<L: EmbeddedMeshLink<Ident>>(
+        &mut self,
+        interfaces: &mut [ &mut L ],
+        now: core::time::Duration
+    ) {
         let mut tx_buf = [0u8; 1500];
-        let tx_buf = tx_buf.as_mut_slice();
+        let mut rx_buf = [0u8; 1500];
 
         // 1. Poll every physical interface for data
-        for interface_idx in 0..self.interfaces.len() {
+        for interface_idx in 0..interfaces.len() {
             let span = trace_span!("interface_poll", interface_idx = interface_idx);
             let _enter = span.enter();
 
-            let link = &mut self.interfaces[interface_idx];
+            let link = &mut interfaces[interface_idx];
 
             trace!("waiting for data");
-            if let Ok(Some(frame_bytes)) = link.receive().await {
+            if let Ok(n) = link.receive(&mut rx_buf).await {
+                if n == 0 { continue; }
                 trace!("received data");
-                let frame = match LinkFrame::<Ident>::ref_from_bytes(&frame_bytes) {
+                let frame_bytes = &rx_buf[..n];
+                let frame = match LinkFrame::<Ident>::ref_from_bytes(frame_bytes) {
                     Ok(f) => f,
                     Err(_) => {
                         warn!("Failed to parse link frame");
@@ -67,7 +68,7 @@ impl<Ident: MeshIdentifier> CentralRouter<Ident> {
                 // 2. Demux by Protocol ID
                 match frame.protocol {
                     DEFAULT_BATMAN_ETHER_TYPE => {
-                        let mut reply: LinkFrameDataMut<'_, Ident> = tx_buf.into();
+                        let mut reply: LinkFrameDataMut<'_, Ident> = tx_buf.as_mut_slice().into();
 
                         // BATMAN-adv Protocol ID
                         match self.batman.handle_rx(frame, &mut reply) {
@@ -81,7 +82,7 @@ impl<Ident: MeshIdentifier> CentralRouter<Ident> {
                                     dst: next_hop,
                                     protocol: DEFAULT_BATMAN_ETHER_TYPE,
                                     payload: &frame.payload,
-                                });
+                                }).await;
                             }
                             RoutingAction::DeliverLocal => {
                                 // Route up to your local embedded application layer
@@ -91,7 +92,7 @@ impl<Ident: MeshIdentifier> CentralRouter<Ident> {
                         }
 
                         if reply.protocol != 0 {
-                            let _ = link.transmit(reply.into());
+                            let _ = link.transmit(reply.into()).await;
                         }
                     }
                     0x88B5 => {
@@ -110,7 +111,7 @@ impl<Ident: MeshIdentifier> CentralRouter<Ident> {
         // 3. Handle BATMAN outgoing maintenance ticks
         let broadcast = Ident::BROADCAST;
         if let Some(ogm_payload) = self.batman.produce_periodic_broadcast(now) {
-            for link in self.interfaces.iter_mut() {
+            for link in interfaces.iter_mut() {
                 trace!("transmitting OGM");
                 // Flood the OGM out of every radio interface to map the surrounding topology
                 let _ = link
@@ -124,9 +125,12 @@ impl<Ident: MeshIdentifier> CentralRouter<Ident> {
         }
     }
 
-    #[tracing::instrument(skip(self, payload))]
-    pub async fn dispatch_from_local(&mut self, dest: Ident, payload: &[u8]) -> anyhow::Result<()> {
-        tracing::trace!("{}", pretty_hex::pretty_hex(&payload));
+    pub async fn dispatch_from_local<L: EmbeddedMeshLink<Ident>>(
+        &mut self,
+        interfaces: &mut [ &mut L ],
+        dest: Ident,
+        payload: &[u8]
+    ) -> Result<(), ()> {
         // 1. Query BATMAN for the next-hop physical address
         let next_hop = if let Some(next_hop) = self.batman.lookup_route(dest) {
             next_hop
@@ -147,7 +151,7 @@ impl<Ident: MeshIdentifier> CentralRouter<Ident> {
         let total_size = header_size + payload.len();
 
         if total_size > tx_scratchpad.len() {
-            bail!("Payload size exceeds maximum frame capacity");
+            return Err(());
         }
 
         // Pack the header and data sequentially into the scratchpad
@@ -155,65 +159,18 @@ impl<Ident: MeshIdentifier> CentralRouter<Ident> {
         tx_scratchpad[header_size..total_size].copy_from_slice(payload);
 
         // 4. Fire the encapsulated packet out to the immediate neighbor
-        // For now we will always send it over all the links, but in theory we should have an "internal"
-        // map between interface indices and their corresponding mesh links.
-        for link in self.interfaces.iter_mut() {
-            tracing::trace!("transmitted to {:?}", next_hop);
-            tracing::trace!("{}", pretty_hex(&&tx_scratchpad[..total_size]));
-            link.transmit(LinkFrameData {
+        for link in interfaces.iter_mut() {
+            let _ = link.transmit(LinkFrameData {
                 dst: next_hop,
                 protocol: ETH_P_BATMAN,
                 payload: &tx_scratchpad[..total_size],
             })
-            .await?;
+            .await;
         }
         Ok(())
     }
 
     fn dispatch_to_local_app(&self, _frame: &LinkFrame<Ident>) {
         // App logic lives here
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use core::time::Duration;
-
-    use interfaces::link::IdentifiableLink;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    use crate::CentralRouter;
-
-    #[tokio::test]
-    async fn test_constructor() {
-        let _ = CentralRouter::new(vec![], 0_u8);
-    }
-
-    #[tokio::test]
-    async fn test_constructor_with_duplex() {
-        let (a, mut b) = tokio::io::duplex(3000);
-        let buf = [0; 1500];
-        b.write_all(&buf).await.unwrap();
-
-        let _ = CentralRouter::new(vec![Box::new(IdentifiableLink::new(0, a))], 0);
-    }
-
-    #[tokio::test]
-    async fn test_poll_and_route() {
-        let (a, mut b) = tokio::io::duplex(3000);
-        let buf = [0; 1500];
-        b.write_all(&buf).await.unwrap();
-
-        let mut router = CentralRouter::new(vec![Box::new(IdentifiableLink::new(0, a))], 0);
-
-        router.poll_and_route(Duration::ZERO).await;
-        // We should have received a message.
-        let mut out_buf = [0; 1500];
-        let read = tokio::time::timeout(Duration::from_secs(1), b.read(&mut out_buf))
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(read, 14);
     }
 }

@@ -1,4 +1,4 @@
-use interfaces::link::MeshIdentifier;
+use interfaces::frame::MeshIdentifier;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub const ETH_P_BATMAN: u16 = 0x4305;

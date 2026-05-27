@@ -5,9 +5,7 @@ edition = "2024"
 
 [dependencies]
 thiserror.workspace = true
-zerocopy = "0.8.48"
-tokio = { version = "1", features = ["io-util"] }
-async-trait = { version = "0.1" }
-tokio-util.workspace = true
-futures.workspace = true
-bytes = "1"
+zerocopy = { version = "0.8.48", features = ["derive"] }
+embedded-io-async.workspace = true
+heapless.workspace = true
+core = { version = "1.0", package = "rustc-std-workspace-core", optional = true }

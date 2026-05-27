@@ -4,10 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-zerocopy = { version = "0.8", features = ["derive"] }
-heapless = "0.8"
-
 thiserror.workspace = true
+zerocopy = { version = "0.8", features = ["derive"] }
+heapless.workspace = true
+
 tracing.workspace = true
 interfaces.workspace = true
-tokio-util.workspace = true
