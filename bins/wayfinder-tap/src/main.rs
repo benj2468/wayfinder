@@ -4,7 +4,7 @@ use clap::Parser;
 use core::net::Ipv4Addr;
 use embedded_io_adapters::tokio_1::FromTokio;
 use futures::StreamExt;
-use futures::stream::{FuturesOrdered, FuturesUnordered};
+use futures::stream::FuturesOrdered;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -15,10 +15,7 @@ use tracing_subscriber::EnvFilter;
 use tun_rs::{DeviceBuilder, Layer};
 use wayfinder::EgressInterface;
 use wayfinder::interfaces::frame::LinkFrame;
-use wayfinder::{
-    CentralRouter,
-    interfaces::link::{EmbeddedMeshLink, Link},
-};
+use wayfinder::{CentralRouter, interfaces::link::Link};
 use zerocopy::FromBytes;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -170,8 +167,8 @@ async fn main() -> anyhow::Result<()> {
                 Some(Some((idx, frame))) = futures.next() => {
                     router.handle_frame(idx, frame, &mut tx_buffer)
                 },
-                Ok(msg) = dev.recv(&mut rx_buffer) => {
-                    if let Ok(frame) = LinkFrame::mut_from_bytes(&mut rx_buffer) {
+                Ok(len) = dev.recv(&mut rx_buffer) => {
+                    if let Ok(frame) = LinkFrame::mut_from_bytes(&mut rx_buffer[..len]) {
                         router.handle_local(frame.dst, &frame.payload, &mut tx_buffer).ok()
                     } else {
                         None
@@ -183,19 +180,19 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        if let Some(data) = data {
-            if let Some(egress) = router.get_egress_interface(data.dst) {
-                match egress {
-                    EgressInterface::All => {
-                        for iface in interfaces.iter_mut() {
-                            iface.send(mac_addr, &data).await?;
-                        }
-                    }
-                    EgressInterface::Interface(iface_idx) => {
-                        let iface = interfaces.get_mut(iface_idx).unwrap();
-
+        if let Some(data) = data
+            && let Some(egress) = router.get_egress_interface(data.dst)
+        {
+            match egress {
+                EgressInterface::All => {
+                    for iface in interfaces.iter_mut() {
                         iface.send(mac_addr, &data).await?;
                     }
+                }
+                EgressInterface::Interface(iface_idx) => {
+                    let iface = interfaces.get_mut(iface_idx).unwrap();
+
+                    iface.send(mac_addr, &data).await?;
                 }
             }
         }

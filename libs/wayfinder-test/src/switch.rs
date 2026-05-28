@@ -83,6 +83,7 @@ pub struct TapMeta<'a> {
     pub data: &'a [u8],
 }
 
+#[expect(dead_code)]
 pub struct TapId(u32);
 
 #[derive(Error, Debug)]
@@ -102,6 +103,15 @@ pub struct Switch<Ident> {
     taps: HashMap<PortId, Vec<TapConfig>>,
     // Ident address mapping of port
     ident_map: HashMap<Ident, PortId>,
+}
+
+impl<Ident> Default for Switch<Ident>
+where
+    Ident: MeshIdentifier + std::fmt::Debug,
+{
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<Ident> Switch<Ident>
@@ -279,14 +289,13 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
-    use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
     // Helper to create a simple frame with src and dst
     fn make_frame(src: u8, dst: u8) -> Vec<u8> {
         use zerocopy::IntoBytes;
         let mut data = Vec::new();
-        data.extend_from_slice(src.as_bytes()).as_bytes();
-        data.extend_from_slice(dst.as_bytes()).as_bytes();
+        data.extend_from_slice(src.as_bytes());
+        data.extend_from_slice(dst.as_bytes());
         data
     }
 
