@@ -62,8 +62,16 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
                 // BATMAN-adv Protocol ID
                 match self.batman.handle_rx(frame, &mut reply) {
                     RoutingAction::Consumed => {
+                        // Trim the payload to the incoming frame size so that
+                        // trailing zeros from the scratchpad buffer are not
+                        // forwarded on the wire.
                         if reply.protocol != 0 {
-                            Some(reply.into())
+                            let len = frame.payload.len().min(reply.payload.len());
+                            Some(LinkFrameData {
+                                dst: reply.dst,
+                                protocol: reply.protocol,
+                                payload: &reply.payload[..len],
+                            })
                         } else {
                             None
                         }
@@ -71,10 +79,13 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
                     RoutingAction::ForwardTo(next_hop) => {
                         // BATMAN told us this packet needs to keep moving.
                         // Re-transmit it out to the designated next-hop neighbor.
-                        reply.dst = next_hop;
-                        reply.protocol = DEFAULT_BATMAN_ETHER_TYPE;
-                        reply.payload.copy_from_slice(&frame.payload);
-                        Some(reply.into())
+                        let len = frame.payload.len().min(reply.payload.len());
+                        reply.payload[..len].copy_from_slice(&frame.payload[..len]);
+                        Some(LinkFrameData {
+                            dst: next_hop,
+                            protocol: DEFAULT_BATMAN_ETHER_TYPE,
+                            payload: &reply.payload[..len],
+                        })
                     }
                     RoutingAction::DeliverLocal => {
                         if reply.protocol != 0 {

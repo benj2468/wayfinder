@@ -80,7 +80,7 @@ impl TapConfig {
 pub struct TapMeta<'a> {
     pub id: PortId,
     pub direction: Direction,
-    pub data: &'a [u8],
+    pub data: &'a mut [u8],
 }
 
 #[expect(dead_code)]
@@ -178,7 +178,7 @@ where
     /// Tick the switch, multiplexing messages between ports and calling the tap handlers
     pub async fn tick(&mut self) -> Result<(), SwitchError> {
         // Flush all messages in the switch's buffer
-        let msgs = self
+        let mut msgs = self
             .ports
             .iter_mut()
             .map(|(id, port)| {
@@ -194,12 +194,12 @@ where
             .collect::<Result<Vec<_>, SwitchError>>()?;
 
         // Loop over all and register the source ident for each message
-        for (id, msgs) in &msgs {
-            if let Some(taps) = self.taps.get_mut(id) {
+        for (id, msgs) in msgs.iter_mut() {
+            if let Some(taps) = self.taps.get_mut(&id) {
                 for tap in taps.iter_mut() {
-                    for msg in msgs {
+                    for msg in msgs.iter_mut() {
                         if !(tap.clb)(TapMeta {
-                            data: msg.as_slice(),
+                            data: msg.as_mut_slice(),
                             direction: Direction::ToSwitch,
                             id: *id,
                         }) {
@@ -222,7 +222,7 @@ where
         // Loop over all and forward to destination, or all ports if destination port not specifically known
         for (port, msgs) in msgs {
             let port_config = self.ports.get(&port).unwrap();
-            for msg in msgs {
+            for mut msg in msgs {
                 if self.rng.random_bool(port_config.config.outgoing_loss) {
                     continue;
                 }
@@ -236,7 +236,7 @@ where
                     if let Some(taps) = self.taps.get_mut(dest_port) {
                         for tap in taps.iter_mut() {
                             if !(tap.clb)(TapMeta {
-                                data: msg.as_slice(),
+                                data: msg.as_mut_slice(),
                                 direction: Direction::FromSwitch,
                                 id: *dest_port,
                             }) {
@@ -264,7 +264,7 @@ where
                         if let Some(taps) = self.taps.get_mut(other_port_id) {
                             for tap in taps.iter_mut() {
                                 if !(tap.clb)(TapMeta {
-                                    data: msg.as_slice(),
+                                    data: msg.as_mut_slice(),
                                     direction: Direction::FromSwitch,
                                     id: *other_port_id,
                                 }) {

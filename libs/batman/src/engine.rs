@@ -160,10 +160,13 @@ where
                     .find(|r| r.neighbor_ident == dst)
                 {
                     // Re-write the mutable scratchpad/response buffer with the updated header
+                    // and preserve the inner application payload that follows the header.
                     let mut updated_hdr = unicast_hdr;
                     updated_hdr.ttl -= 1;
 
                     let size = core::mem::size_of::<BatmanUnicastPacket<Ident>>();
+                    let inner = frame.payload.get(size..).unwrap_or(&[]);
+                    let total = size + inner.len();
 
                     reply.dst = record.best_next_hop;
                     reply.protocol = ETH_P_BATMAN;
@@ -172,6 +175,11 @@ where
                         .get_mut(0..size)
                         .unwrap()
                         .copy_from_slice(updated_hdr.as_bytes());
+                    reply
+                        .payload
+                        .get_mut(size..total)
+                        .unwrap_or(&mut [])
+                        .copy_from_slice(inner);
                 }
 
                 RoutingAction::Consumed // Route unknown, drop packet
