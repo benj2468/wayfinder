@@ -57,7 +57,7 @@ test:
     stage: test
     image: rustlang/rust:nightly
     needs:
-        - build-
+        - build
     script:
         # install nextest
         - mkdir -p $CARGO_HOME/bin && curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C $CARGO_HOME/bin
