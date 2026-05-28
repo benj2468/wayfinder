@@ -14,6 +14,8 @@ pub enum LoraError {
     ModuleError(i32),
     #[error("Response format was invalid or unparseable")]
     InvalidResponse,
+    #[error("Request too large")]
+    RequestTooLarge,
     #[error("Operation timed out waiting for module response")]
     Timeout,
 }
@@ -280,7 +282,7 @@ where
     pub async fn send_data(&mut self, target_address: u16, data: &str) -> Result<(), LoraError> {
         let payload_length = data.len();
         if payload_length > 240 {
-            return Err(LoraError::InvalidResponse);
+            return Err(LoraError::RequestTooLarge);
         }
         let mut cmd = String::<512>::new();
         let _ = core::fmt::write(
