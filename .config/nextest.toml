@@ -1,0 +1,9 @@
+[profile.ci]
+# print out output for failing tests as soon as they fail,
+# and also at the end of the run (to make perusing easier)
+failure-output = "immediate-final"
+# do not bail out on the first failed test, run them all
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"
