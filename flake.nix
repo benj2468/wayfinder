@@ -36,7 +36,11 @@
               python3
               python312Packages.virtualenv
               socat
+              protobuf
+              buf
             ];
+
+            nativeBuildInputs = with pkgs; [ protobuf ];
 
             RUST_SRC_PATH = pkgs.rustPlatform.rustLibSrc;
 
@@ -55,6 +59,8 @@
             programs = {
               nixfmt.enable = true;
               rustfmt.enable = true;
+              buf.enable = true;
+              yamlfmt.enable = true;
             };
           };
         };

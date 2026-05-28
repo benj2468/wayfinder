@@ -162,4 +162,12 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
             .get_egress_interface(dest)
             .map(EgressInterface::Interface)
     }
+
+    pub fn self_ident(&self) -> Ident {
+        self.batman.self_ident
+    }
+
+    pub fn originator_table(&self) -> &[batman::OriginatorRecord<Ident>] {
+        &self.batman.originator_table
+    }
 }

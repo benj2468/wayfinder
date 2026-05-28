@@ -45,6 +45,16 @@ cargo test -- --nocapture
 cargo run --bin tun
 ```
 
+### Documentation Requirement
+
+Every public API **must have documentation**.  This applies to:
+
+**Rust** — every `pub` item (function, struct, trait, enum, field, associated type, constant) must have a `///` doc comment explaining what it does and any invariants or constraints.  Trait methods must be documented on the trait definition; implementations may add implementation-specific notes but do not replace trait-level docs.
+
+**Protobuf** — every message, field, `oneof`, enum, and enum value in `libs/wayfinder-protos/protos/` must have a `//` comment.  The `buf lint` rule `COMMENTS` is enabled in `buf.yaml` and enforces this; run `buf lint` from `libs/wayfinder-protos/` to check.
+
+Good doc comments explain the *why* and any non-obvious constraints (valid ranges, encoding formats, error conditions).  They do not restate the name.
+
 ### Unit Testing Requirement
 
 All non-trivial logic **must be accompanied by unit tests** in a `#[cfg(test)]` module at the bottom of the source file.  This includes — but is not limited to:

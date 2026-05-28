@@ -1,0 +1,10 @@
+[package]
+name = "wayfinder-protos"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+prost = { version = "0.13" , default-features = false, features = ["derive"] }
+
+[build-dependencies]
+prost-build = "0.13"

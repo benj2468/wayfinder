@@ -9,6 +9,7 @@ members = [
     "libs/interfaces",
     "libs/batman",
     "libs/wayfinder",
+    "libs/wayfinder-protos",
     "libs/wayfinder-test",
     "bins/wayfinder-tap",
 ]
@@ -18,6 +19,7 @@ members = [
 interfaces = { path = "./libs/interfaces" }
 batman = { path = "./libs/batman" }
 wayfinder = { path = "./libs/wayfinder" }
+wayfinder-protos = { path = "./libs/wayfinder-protos" }
 
 # Third Party Dependencies
 tracing = "0.1.44"

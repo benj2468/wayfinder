@@ -740,13 +740,24 @@ impl LoraSwitch {
                 (s.network_id, s.frequency, s.mode, s.address)
             };
 
-            if net_id != pkt.network_id { continue; }
-            if freq != pkt.frequency { continue; }
-            if mode != 0 { continue; } // sleep / smart-receiving nodes do not receive
-            if dest_addr == pkt.source_address { continue; } // no self-delivery
-            if pkt.target_address != 0 && dest_addr != pkt.target_address { continue; }
+            if net_id != pkt.network_id {
+                continue;
+            }
+            if freq != pkt.frequency {
+                continue;
+            }
+            if mode != 0 {
+                continue;
+            } // sleep / smart-receiving nodes do not receive
+            if dest_addr == pkt.source_address {
+                continue;
+            } // no self-delivery
+            if pkt.target_address != 0 && dest_addr != pkt.target_address {
+                continue;
+            }
 
-            let quality = self.link_quality
+            let quality = self
+                .link_quality
                 .get(&(pkt.source_address, dest_addr))
                 .copied()
                 .unwrap_or(self.default_quality);
@@ -840,9 +851,11 @@ async fn test_switch_different_network_id_blocked() {
     timed!(node_a.send_data(2, "hello")).expect("send failed");
     switch.tick().await;
 
-    let result =
-        tokio::time::timeout(Duration::from_millis(100), node_b.listen_for_packet()).await;
-    assert!(result.is_err(), "packet should be blocked by mismatched network_id");
+    let result = tokio::time::timeout(Duration::from_millis(100), node_b.listen_for_packet()).await;
+    assert!(
+        result.is_err(),
+        "packet should be blocked by mismatched network_id"
+    );
 }
 
 /// Nodes on different RF frequencies cannot hear each other.
@@ -855,9 +868,11 @@ async fn test_switch_different_frequency_blocked() {
     timed!(node_a.send_data(2, "hello")).expect("send failed");
     switch.tick().await;
 
-    let result =
-        tokio::time::timeout(Duration::from_millis(100), node_b.listen_for_packet()).await;
-    assert!(result.is_err(), "packet should be blocked by mismatched frequency");
+    let result = tokio::time::timeout(Duration::from_millis(100), node_b.listen_for_packet()).await;
+    assert!(
+        result.is_err(),
+        "packet should be blocked by mismatched frequency"
+    );
 }
 
 /// Address 0 is broadcast – all compatible nodes receive it.
@@ -892,7 +907,10 @@ async fn test_switch_broadcast_not_echoed_to_sender() {
     // node_a should NOT receive its own broadcast
     let self_recv =
         tokio::time::timeout(Duration::from_millis(100), node_a.listen_for_packet()).await;
-    assert!(self_recv.is_err(), "sender should not receive its own broadcast");
+    assert!(
+        self_recv.is_err(),
+        "sender should not receive its own broadcast"
+    );
 }
 
 /// A unicast to address X should not be delivered to a node with address Y.
@@ -908,7 +926,10 @@ async fn test_switch_unicast_not_delivered_to_wrong_address() {
 
     timed!(node_b.listen_for_packet()).expect("node_b should receive");
     let to_c = tokio::time::timeout(Duration::from_millis(100), node_c.listen_for_packet()).await;
-    assert!(to_c.is_err(), "node_c should not receive a unicast addressed to node_b");
+    assert!(
+        to_c.is_err(),
+        "node_c should not receive a unicast addressed to node_b"
+    );
 }
 
 /// Per-link RSSI/SNR set on the switch is what receivers observe.
@@ -918,7 +939,14 @@ async fn test_switch_link_quality_applied() {
     let (mut node_a, _ta) = make_node(&mut switch, 1, 18, 915_000_000).await;
     let (mut node_b, _tb) = make_node(&mut switch, 2, 18, 915_000_000).await;
 
-    switch.set_link_quality(1, 2, LinkQuality { rssi: -112, snr: -15 });
+    switch.set_link_quality(
+        1,
+        2,
+        LinkQuality {
+            rssi: -112,
+            snr: -15,
+        },
+    );
 
     timed!(node_a.send_data(2, "quality_test")).expect("send failed");
     switch.tick().await;
@@ -936,7 +964,14 @@ async fn test_switch_link_quality_is_directional() {
     let (mut node_b, _tb) = make_node(&mut switch, 2, 18, 915_000_000).await;
 
     switch.set_link_quality(1, 2, LinkQuality { rssi: -80, snr: 5 });
-    switch.set_link_quality(2, 1, LinkQuality { rssi: -100, snr: -8 });
+    switch.set_link_quality(
+        2,
+        1,
+        LinkQuality {
+            rssi: -100,
+            snr: -8,
+        },
+    );
 
     timed!(node_a.send_data(2, "ab")).expect("a→b send failed");
     switch.tick().await;
@@ -961,8 +996,7 @@ async fn test_switch_sleep_mode_does_not_receive() {
     timed!(node_a.send_data(2, "wake_up")).expect("send failed");
     switch.tick().await;
 
-    let result =
-        tokio::time::timeout(Duration::from_millis(100), node_b.listen_for_packet()).await;
+    let result = tokio::time::timeout(Duration::from_millis(100), node_b.listen_for_packet()).await;
     assert!(result.is_err(), "sleeping node should not receive");
 }
 

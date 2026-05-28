@@ -1,0 +1,125 @@
+// Wayfinder management API — package wayfinder.v1alpha
+//
+// Provides a request/response interface for querying the state of a running
+// Wayfinder router (CentralRouter).  The API is transport-agnostic: it can be
+// carried over TCP, Unix domain sockets, or UDP depending on the operator's
+// deployment.  Stream transports use 4-byte big-endian length-prefixed framing;
+// datagram transports (UDP) carry one message per datagram.
+//
+// Identifier encoding: all node identifiers are raw bytes whose length depends
+// on the address family in use.  For 802.11 / Ethernet MAC addresses this is
+// 6 bytes; for short LoRa mesh addresses it is 1 byte.  Consumers should treat
+// these as opaque blobs and display them in the format appropriate for the
+// deployment (e.g. colon-delimited hex for MACs).
+
+syntax = "proto3";
+
+package wayfinder.v1alpha;
+
+// ── Requests ──────────────────────────────────────────────────────────────────
+
+// Request for basic information about the local node.
+// Returns a NodeInfo response.
+message GetNodeInfoRequest {}
+
+// Request a full snapshot of the BATMAN originator table.
+// Returns a RoutingTable response containing one RoutingEntry per known
+// destination in the mesh.
+message GetRoutingTableRequest {}
+
+// Top-level request envelope.  Exactly one variant must be set; an empty
+// request (no variant) is treated as a protocol error and returns an
+// ErrorResponse.
+message WayfinderRequest {
+  // The specific query to execute against the local router.
+  oneof request {
+    // Query basic identity and capacity information for this node.
+    GetNodeInfoRequest get_node_info = 1;
+
+    // Query the full BATMAN originator (routing) table.
+    GetRoutingTableRequest get_routing_table = 2;
+  }
+}
+
+// ── Responses ─────────────────────────────────────────────────────────────────
+
+// Basic identity and capacity information for the local router node.
+message NodeInfo {
+  // Raw bytes of this node's mesh identifier.
+  // Length is address-family dependent (6 bytes for MAC, 1 byte for u8 short
+  // address).  Display as colon-delimited hex for MAC addresses.
+  bytes node_id = 1;
+
+  // Number of entries currently in the BATMAN originator table, i.e. the
+  // number of remote nodes this router has a path to.
+  uint32 num_originators = 2;
+}
+
+// Per-neighbor path metrics for a single path to an originator.
+// The BATMAN engine tracks up to 4 alternate paths per destination; each is
+// represented here.
+message NeighborPath {
+  // Raw bytes of the immediate neighbor (next-hop) through which this path
+  // was learned.  Same encoding as NodeInfo.node_id.
+  bytes neighbor_id = 1;
+
+  // Transmission Quality (TQ) observed via this neighbor.  Range 0–255;
+  // higher is better.  Decremented by 10 per hop as OGMs propagate.
+  uint32 tq = 2;
+
+  // Sequence number of the most recent OGM received via this neighbor.
+  // Monotonically increasing; wraps at u32::MAX.
+  uint32 last_seqno = 3;
+}
+
+// A single entry in the BATMAN originator table, describing how to reach one
+// remote destination node.
+message RoutingEntry {
+  // Raw bytes of the ultimate destination node identifier.
+  bytes destination = 1;
+
+  // Raw bytes of the immediate next-hop neighbor to use for the best-known
+  // path to destination.
+  bytes next_hop = 2;
+
+  // Best Transmission Quality seen across all paths to this destination.
+  // Range 0–255; higher is better.
+  uint32 tq = 3;
+
+  // Sequence number of the most recent OGM received from this originator
+  // (across all paths).
+  uint32 last_seqno = 4;
+
+  // Per-neighbor path breakdown.  Contains one entry for each neighbor
+  // through which OGMs from this originator have been received, up to the
+  // engine's path limit (currently 4).
+  repeated NeighborPath paths = 5;
+}
+
+// Snapshot of the full BATMAN originator table at the time of the request.
+message RoutingTable {
+  // All known originators.  Empty if the router has not yet received any OGMs
+  // (e.g. immediately after startup).
+  repeated RoutingEntry entries = 1;
+}
+
+// Returned when the router cannot fulfill a request.
+message ErrorResponse {
+  // Human-readable description of what went wrong.
+  string message = 1;
+}
+
+// Top-level response envelope.  Always contains exactly one variant.
+message WayfinderResponse {
+  // The result of the corresponding WayfinderRequest.
+  oneof response {
+    // Response to GetNodeInfoRequest.
+    NodeInfo node_info = 1;
+
+    // Response to GetRoutingTableRequest.
+    RoutingTable routing_table = 2;
+
+    // Returned for malformed or unrecognised requests.
+    ErrorResponse error = 3;
+  }
+}

@@ -1,0 +1,14 @@
+version: v2
+modules:
+  - path: protos
+lint:
+  use:
+    - STANDARD
+    - COMMENTS
+  except:
+    # GetNodeInfoRequest and GetRoutingTableRequest are empty marker messages
+    # whose names are already self-documenting; field-level comments would be noise.
+    - COMMENT_FIELD
+breaking:
+  use:
+    - FILE

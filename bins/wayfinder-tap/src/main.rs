@@ -1,22 +1,31 @@
 use std::{net::SocketAddr, path::PathBuf};
 
+use bytes::Bytes;
 use clap::Parser;
 use core::net::Ipv4Addr;
 use embedded_io_adapters::tokio_1::FromTokio;
-use futures::StreamExt;
-use futures::stream::FuturesOrdered;
+use futures::{SinkExt, StreamExt, stream::FuturesOrdered};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{UdpSocket, UnixListener, UnixStream},
+    net::{TcpListener, UdpSocket, UnixListener, UnixStream},
+    sync::{mpsc, oneshot},
     task::JoinSet,
 };
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing_subscriber::EnvFilter;
 use tun_rs::{DeviceBuilder, Layer};
 use wayfinder::EgressInterface;
 use wayfinder::interfaces::frame::LinkFrame;
 use wayfinder::{CentralRouter, interfaces::link::Link};
-use zerocopy::FromBytes;
+use wayfinder_protos::{
+    service::{NeighborPathData, RoutingEntryData, WayfinderDataProvider, WayfinderService},
+    wayfinder_v1alpha::{WayfinderRequest, WayfinderResponse},
+};
+use zerocopy::{FromBytes, IntoBytes};
+
+// ── Config ────────────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum LinkConfig {
@@ -25,10 +34,19 @@ pub enum LinkConfig {
     UnixClient { path: PathBuf },
 }
 
+/// Transport over which the management API is exposed.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum ServerConfig {
+    UnixSocket { path: PathBuf },
+    Tcp { addr: SocketAddr },
+    Udp { addr: SocketAddr },
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Config {
     #[serde(default)]
     links: Vec<LinkConfig>,
+    server: Option<ServerConfig>,
 }
 
 #[derive(clap::Parser, Debug)]
@@ -42,6 +60,133 @@ pub struct Args {
     #[clap(short, long, default_value = "var/conf/install.yml")]
     config: PathBuf,
 }
+
+// ── WayfinderDataProvider impl ────────────────────────────────────────────────
+//
+// Newtype so we can implement the external trait for the external CentralRouter.
+struct RouterAdapter<'a>(&'a CentralRouter<[u8; 6]>);
+
+impl WayfinderDataProvider for RouterAdapter<'_> {
+    fn node_id(&self) -> Vec<u8> {
+        self.0.self_ident().as_bytes().to_vec()
+    }
+
+    fn num_originators(&self) -> u32 {
+        self.0.originator_table().len() as u32
+    }
+
+    fn routing_table(&self) -> Vec<RoutingEntryData> {
+        self.0
+            .originator_table()
+            .iter()
+            .map(|r| RoutingEntryData {
+                destination: r.neighbor_ident.as_bytes().to_vec(),
+                next_hop: r.best_next_hop.as_bytes().to_vec(),
+                tq: r.max_tq as u32,
+                last_seqno: r.last_seqno,
+                paths: r
+                    .paths
+                    .iter()
+                    .map(|p| NeighborPathData {
+                        neighbor_id: p.neighbor_ident.as_bytes().to_vec(),
+                        tq: p.last_tq as u32,
+                        last_seqno: p.last_seqno,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+}
+
+// ── Query channel types ───────────────────────────────────────────────────────
+
+type QueryTx = mpsc::Sender<(WayfinderRequest, oneshot::Sender<WayfinderResponse>)>;
+type QueryRx = mpsc::Receiver<(WayfinderRequest, oneshot::Sender<WayfinderResponse>)>;
+
+// ── Server helpers ────────────────────────────────────────────────────────────
+
+/// Handle one stream-based connection (TCP or Unix socket) using
+/// length-delimited framing (4-byte big-endian length prefix).
+async fn serve_stream<S>(stream: S, query_tx: QueryTx) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut framed: Framed<S, LengthDelimitedCodec> =
+        LengthDelimitedCodec::builder().new_framed(stream);
+
+    while let Some(frame) = framed.next().await {
+        let frame = frame?;
+        let request = WayfinderRequest::decode(frame)?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        query_tx.send((request, resp_tx)).await?;
+        let response = resp_rx.await?;
+        let mut buf = Vec::new();
+        response.encode(&mut buf)?;
+        framed.send(Bytes::from(buf)).await?;
+    }
+    Ok(())
+}
+
+async fn run_tcp_server(addr: SocketAddr, query_tx: QueryTx) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+    tracing::info!("management API listening on TCP {addr}");
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        tracing::debug!("management connection from {peer}");
+        let tx = query_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = serve_stream(stream, tx).await {
+                tracing::warn!("management stream error: {e}");
+            }
+        });
+    }
+}
+
+async fn run_unix_server(path: PathBuf, query_tx: QueryTx) -> anyhow::Result<()> {
+    if std::fs::metadata(&path).is_ok() {
+        std::fs::remove_file(&path)?;
+    }
+    let listener = UnixListener::bind(&path)?;
+    tracing::info!("management API listening on unix socket {}", path.display());
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let tx = query_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = serve_stream(stream, tx).await {
+                tracing::warn!("management stream error: {e}");
+            }
+        });
+    }
+}
+
+async fn run_udp_server(addr: SocketAddr, query_tx: QueryTx) -> anyhow::Result<()> {
+    let socket = UdpSocket::bind(addr).await?;
+    tracing::info!("management API listening on UDP {addr}");
+    let mut buf = vec![0u8; 65535];
+    loop {
+        let (len, peer) = socket.recv_from(&mut buf).await?;
+        let request = match WayfinderRequest::decode(&buf[..len]) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("bad management request from {peer}: {e}");
+                continue;
+            }
+        };
+        let (resp_tx, resp_rx) = oneshot::channel();
+        if query_tx.send((request, resp_tx)).await.is_err() {
+            break;
+        }
+        if let Ok(response) = resp_rx.await {
+            let mut out = Vec::new();
+            if response.encode(&mut out).is_ok() {
+                let _ = socket.send_to(&out, peer).await;
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -58,13 +203,13 @@ async fn main() -> anyhow::Result<()> {
     let mut join_set: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
     let dev = DeviceBuilder::new()
-        .layer(Layer::L2) // TAP mode for Ethernet frames
+        .layer(Layer::L2)
         .name(args.device_name)
         .ipv4(args.ip_address, args.netmask, None)
         .build_async()?;
 
     let mac_addr = dev.mac_address()?;
-    tracing::info!("Starting wavefinder with MAC address: {:?}", mac_addr);
+    tracing::info!("Starting wayfinder with MAC address: {:?}", mac_addr);
 
     let mut interfaces = vec![];
 
@@ -146,6 +291,27 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Optional management API server — queries are forwarded to the main loop
+    // over a channel so the router is never shared across tasks.
+    let (query_tx, mut query_rx): (QueryTx, QueryRx) = mpsc::channel(16);
+
+    if let Some(server_cfg) = config.server {
+        match server_cfg {
+            ServerConfig::Tcp { addr } => {
+                let tx = query_tx.clone();
+                join_set.spawn(async move { run_tcp_server(addr, tx).await });
+            }
+            ServerConfig::UnixSocket { path } => {
+                let tx = query_tx.clone();
+                join_set.spawn(async move { run_unix_server(path, tx).await });
+            }
+            ServerConfig::Udp { addr } => {
+                let tx = query_tx.clone();
+                join_set.spawn(async move { run_udp_server(addr, tx).await });
+            }
+        }
+    }
+
     let mut router = CentralRouter::<[u8; 6]>::new(mac_addr);
 
     let start = std::time::Instant::now();
@@ -161,8 +327,6 @@ async fn main() -> anyhow::Result<()> {
                 .map(|(i, iface)| async move { iface.receive().await.map(|frame| (i, frame)).ok() })
                 .collect::<FuturesOrdered<_>>();
 
-            // All of the TODOs here indicate places that we have a LinkFrameData and need to send it out over
-            // some part of the network. It is unclear to me how we want to do to that.
             tokio::select! {
                 Some(Some((idx, frame))) = futures.next() => {
                     router.handle_frame(idx, frame, &mut tx_buffer)
@@ -173,6 +337,11 @@ async fn main() -> anyhow::Result<()> {
                     } else {
                         None
                     }
+                },
+                Some((request, resp_tx)) = query_rx.recv() => {
+                    let response = WayfinderService::new(RouterAdapter(&router)).handle(request);
+                    let _ = resp_tx.send(response);
+                    None
                 },
                 _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                     router.poll(start.elapsed(), &mut tx_buffer)
@@ -191,7 +360,6 @@ async fn main() -> anyhow::Result<()> {
                 }
                 EgressInterface::Interface(iface_idx) => {
                     let iface = interfaces.get_mut(iface_idx).unwrap();
-
                     iface.send(mac_addr, &data).await?;
                 }
             }
