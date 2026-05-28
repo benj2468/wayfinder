@@ -5,10 +5,17 @@
     flake-parts.url = "github:hercules-ci/flake-parts";
 
     treefmt-nix.url = "github:numtide/treefmt-nix";
+
+    fenix.url = "github:nix-community/fenix";
   };
 
   outputs =
-    inputs@{ nixpkgs, flake-parts, ... }:
+    inputs@{
+      nixpkgs,
+      flake-parts,
+      fenix,
+      ...
+    }:
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = nixpkgs.lib.systems.flakeExposed;
 
@@ -19,20 +26,37 @@
       perSystem =
         {
           pkgs,
+          system,
           ...
         }:
+        let
+          rustToolchain = (
+            pkgs.fenix.complete.withComponents [
+              "cargo"
+              "clippy"
+              "rust-src"
+              "rustc"
+              "rustfmt"
+              "llvm-tools-preview"
+            ]
+          );
+        in
         {
+          _module.args.pkgs = import inputs.nixpkgs {
+            inherit system;
+            overlays = [
+              fenix.overlays.default
+            ];
+          };
 
           devShells.default = pkgs.mkShell {
             packages = with pkgs; [
               nil
               nixd
-              cargo
-              clippy
+              rustToolchain
               cargo-nextest
-              rustc
+              cargo-llvm-cov
               rust-analyzer
-              rustfmt
               python3
               python312Packages.virtualenv
               socat
@@ -41,8 +65,6 @@
             ];
 
             nativeBuildInputs = with pkgs; [ protobuf ];
-
-            RUST_SRC_PATH = pkgs.rustPlatform.rustLibSrc;
 
             shellHook = ''
               # source .venv/bin/activate
