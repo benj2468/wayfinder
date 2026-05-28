@@ -66,7 +66,7 @@ test:
         reports:
             coverage_report:
                 path: coverage.xml
-                format: cobertura
+                coverage_format: cobertura
 deploy-dev:
     stage: deploy
     needs:
