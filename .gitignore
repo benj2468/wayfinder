@@ -21,3 +21,6 @@ rustc-ice-*.txt
 
 # Direnv
 .direnv
+
+# Pre-commit
+.pre-commit-config.yaml

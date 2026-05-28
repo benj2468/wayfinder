@@ -1,85 +1,85 @@
 variables:
-    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
 workflow:
-    rules:
-        - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_REF_PROTECTED == "true"'
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_REF_PROTECTED == "true"'
 default:
-    cache:
-        key: "$CI_COMMIT_REF_SLUG" # Use a unique key per branch for better isolation
-        paths:
-            - "$CARGO_HOME" # Cache the CARGO_HOME directory
-            - "target/" # Cache the project's target directory
+  cache:
+    key: "$CI_COMMIT_REF_SLUG" # Use a unique key per branch for better isolation
+    paths:
+      - "$CARGO_HOME" # Cache the CARGO_HOME directory
+      - "target/" # Cache the project's target directory
 stages:
-    - lint
-    - build
-    - test
-    - deploy
+  - lint
+  - build
+  - test
+  - deploy
 lint:rust:
-    stage: lint
-    image: rustlang/rust:nightly
-    script:
-        - rustup component add rustfmt
-        - cargo fmt
+  stage: lint
+  image: rustlang/rust:nightly
+  script:
+    - rustup component add rustfmt
+    - cargo fmt
 lint:nix:
-    stage: lint
-    image: nixos/nix
-    script:
-        - nix --extra-experimental-features "nix-command flakes" flake check
+  stage: lint
+  image: nixos/nix
+  script:
+    - nix --extra-experimental-features "nix-command flakes" flake check
 lint:mr-title:
-    stage: lint
-    image:
-        name: commitlint/commitlint
-        entrypoint:
-            - ""
-    rules:
-        - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-    script:
-        - echo "$CI_MERGE_REQUEST_TITLE" | commitlint
+  stage: lint
+  image:
+    name: commitlint/commitlint
+    entrypoint:
+      - ""
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    - echo "$CI_MERGE_REQUEST_TITLE" | commitlint
 lint-done:
-    stage: lint
-    needs:
-        - lint:rust
-        - lint:nix
-        - job: lint:mr-title
-          optional: true
-    script:
-        - echo "done"
+  stage: lint
+  needs:
+    - lint:rust
+    - lint:nix
+    - job: lint:mr-title
+      optional: true
+  script:
+    - echo "done"
 build:
-    stage: build
-    image: rustlang/rust:nightly
-    needs:
-        - lint-done
-    script:
-        - rustup component add clippy
-        - cargo build
-        - cargo clippy
+  stage: build
+  image: rustlang/rust:nightly
+  needs:
+    - lint-done
+  script:
+    - rustup component add clippy
+    - cargo build
+    - cargo clippy
 test:
-    stage: test
-    image: rustlang/rust:nightly
-    needs:
-        - build
-    script:
-        # install nextest
-        - mkdir -p $CARGO_HOME/bin && curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C $CARGO_HOME/bin
-        - cargo llvm-cov nextest --profile ci --workspace --cobertura --output-path coverage.xml
-    artifacts:
-        reports:
-            coverage_report:
-                path: coverage.xml
-                coverage_format: cobertura
+  stage: test
+  image: rustlang/rust:nightly
+  needs:
+    - build
+  script:
+    # install nextest
+    - mkdir -p $CARGO_HOME/bin && curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C $CARGO_HOME/bin
+    - cargo llvm-cov nextest --profile ci --workspace --cobertura --output-path coverage.xml
+  artifacts:
+    reports:
+      coverage_report:
+        path: coverage.xml
+        coverage_format: cobertura
 deploy-dev:
-    stage: deploy
-    needs:
-        - test
-    script:
-        - echo "This job deploys something from the $CI_COMMIT_BRANCH branch."
-    environment: dev
+  stage: deploy
+  needs:
+    - test
+  script:
+    - echo "This job deploys something from the $CI_COMMIT_BRANCH branch."
+  environment: dev
 deploy-prod:
-    stage: deploy
-    needs:
-        - test
-    script:
-        - echo "This job deploys something from the $CI_COMMIT_BRANCH branch."
-    environment: production
-    rules:
-        - if: '$CI_COMMIT_BRANCH == "master"'
+  stage: deploy
+  needs:
+    - test
+  script:
+    - echo "This job deploys something from the $CI_COMMIT_BRANCH branch."
+  environment: production
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'

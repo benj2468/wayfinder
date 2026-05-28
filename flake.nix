@@ -7,6 +7,8 @@
     treefmt-nix.url = "github:numtide/treefmt-nix";
 
     fenix.url = "github:nix-community/fenix";
+
+    git-hooks.url = "github:cachix/git-hooks.nix";
   };
 
   outputs =
@@ -21,10 +23,12 @@
 
       imports = [
         inputs.treefmt-nix.flakeModule
+        inputs.git-hooks.flakeModule
       ];
 
       perSystem =
         {
+          config,
           pkgs,
           system,
           ...
@@ -67,6 +71,7 @@
             nativeBuildInputs = with pkgs; [ protobuf ];
 
             shellHook = ''
+              ${config.pre-commit.installationScript}
               # source .venv/bin/activate
 
               # pip install --upgrade pip
@@ -74,6 +79,10 @@
 
               PYTHONPATH=training:$PYTHONPATH
             '';
+          };
+
+          pre-commit = {
+            check.enable = true;
           };
 
           treefmt = {
