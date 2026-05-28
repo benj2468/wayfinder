@@ -29,6 +29,7 @@
               nixd
               cargo
               clippy
+              cargo-nextest
               rustc
               rust-analyzer
               rustfmt

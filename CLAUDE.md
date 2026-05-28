@@ -45,6 +45,16 @@ cargo test -- --nocapture
 cargo run --bin tun
 ```
 
+### Unit Testing Requirement
+
+All non-trivial logic **must be accompanied by unit tests** in a `#[cfg(test)]` module at the bottom of the source file.  This includes — but is not limited to:
+
+- Data structures with internal invariants (LRU caches, routing tables, free-slot stacks)
+- Protocol state machines and routing algorithms
+- Edge cases: empty collections, single-element collections, at-capacity/eviction behavior
+
+For `IdentTable` and other wayfinder tests, use `u8` as the `Ident` type (it already implements `MeshIdentifier`).  When a data structure has non-trivial invariants, add an `assert_invariants()` helper (gated behind `#[cfg(test)]`) and call it after each operation in the relevant tests.
+
 ## Architecture
 
 ### Workspace Structure

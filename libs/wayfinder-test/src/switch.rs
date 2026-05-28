@@ -34,6 +34,8 @@ impl PortConfig {
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct PortId(u32);
 
+// TODO: Remove the PortComms and use IdentifiableLink here instead so that we can
+// be testing that functionality as well.
 pub struct PortComms {
     to_switch: tokio::sync::mpsc::Receiver<Vec<u8>>,
     from_switch: tokio::sync::mpsc::Sender<Vec<u8>>,
