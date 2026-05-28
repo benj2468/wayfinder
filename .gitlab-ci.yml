@@ -58,9 +58,11 @@ test:
   image: rustlang/rust:nightly
   needs:
     - build
+  before_script:
+    - rustup component add llvm-tools-preview
+    - cargo install cargo-llvm-cov
+    - cargo install cargo-nextest
   script:
-    # install nextest
-    - mkdir -p $CARGO_HOME/bin && curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C $CARGO_HOME/bin
     - cargo llvm-cov nextest --profile ci --workspace --cobertura --output-path coverage.xml
   artifacts:
     reports:
