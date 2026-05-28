@@ -17,12 +17,12 @@ use wayfinder::EgressInterface;
 use wayfinder::interfaces::frame::LinkFrame;
 use wayfinder::{
     CentralRouter,
-    interfaces::link::{EmbeddedMeshLink, IdentifiableLink},
+    interfaces::link::{EmbeddedMeshLink, Link},
 };
 use zerocopy::FromBytes;
 
 #[derive(Serialize, Deserialize, Debug)]
-pub enum Link {
+pub enum LinkConfig {
     Udp { socket_addr: SocketAddr },
     UnixServer { path: PathBuf },
     UnixClient { path: PathBuf },
@@ -31,7 +31,7 @@ pub enum Link {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Config {
     #[serde(default)]
-    links: Vec<Link>,
+    links: Vec<LinkConfig>,
 }
 
 #[derive(clap::Parser, Debug)]
@@ -73,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
 
     for link in config.links {
         match link {
-            Link::Udp { socket_addr } => {
+            LinkConfig::Udp { socket_addr } => {
                 let udp_socket = UdpSocket::bind(socket_addr).await?;
 
                 let (mut dp1, dp2) = tokio::io::duplex(1500);
@@ -93,9 +93,9 @@ async fn main() -> anyhow::Result<()> {
                     }
                 });
 
-                interfaces.push(IdentifiableLink::new(mac_addr, FromTokio::new(dp2)));
+                interfaces.push(Link::new(FromTokio::new(dp2)));
             }
-            Link::UnixServer { path } => {
+            LinkConfig::UnixServer { path } => {
                 if std::fs::metadata(&path).is_ok() {
                     std::fs::remove_file(&path)?;
                 }
@@ -121,9 +121,9 @@ async fn main() -> anyhow::Result<()> {
                     Ok(())
                 });
 
-                interfaces.push(IdentifiableLink::new(mac_addr, FromTokio::new(dp2)));
+                interfaces.push(Link::new(FromTokio::new(dp2)));
             }
-            Link::UnixClient { path } => {
+            LinkConfig::UnixClient { path } => {
                 let mut stream = UnixStream::connect(path).await?;
                 let (mut dp1, dp2) = tokio::io::duplex(1500);
 
@@ -144,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
                     Ok(())
                 });
 
-                interfaces.push(IdentifiableLink::new(mac_addr, FromTokio::new(dp2)));
+                interfaces.push(Link::new(FromTokio::new(dp2)));
             }
         }
     }
@@ -188,13 +188,13 @@ async fn main() -> anyhow::Result<()> {
                 match egress {
                     EgressInterface::All => {
                         for iface in interfaces.iter_mut() {
-                            iface.send(&data).await?;
+                            iface.send(mac_addr, &data).await?;
                         }
                     }
                     EgressInterface::Interface(iface_idx) => {
                         let iface = interfaces.get_mut(iface_idx).unwrap();
 
-                        iface.send(&data).await?;
+                        iface.send(mac_addr, &data).await?;
                     }
                 }
             }

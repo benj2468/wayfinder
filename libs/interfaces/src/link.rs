@@ -33,27 +33,27 @@ pub trait EmbeddedMeshLink<Ident: MeshIdentifier> {
     fn receive(&mut self, buf: &mut [u8]) -> impl Future<Output = Result<usize, LinkError>>;
 }
 
-pub struct IdentifiableLink<Ident: MeshIdentifier, T> {
-    identifier: Ident,
+pub struct Link<T> {
     stream: T,
     buffer: [u8; 1500],
     read_offset: usize,
 }
 
-impl<Ident: MeshIdentifier, T> IdentifiableLink<Ident, T>
+impl<T> Link<T>
 where
     T: Read + Write,
 {
-    pub fn new(identifier: Ident, stream: T) -> Self {
+    pub fn new(stream: T) -> Self {
         Self {
-            identifier,
             stream,
             buffer: [0u8; 1500],
             read_offset: 0,
         }
     }
 
-    pub async fn receive(&mut self) -> Result<&LinkFrame<Ident>, LinkError> {
+    pub async fn receive<Ident: MeshIdentifier + 'static>(
+        &mut self,
+    ) -> Result<&LinkFrame<Ident>, LinkError> {
         let buf = &mut self.buffer;
         loop {
             let read = self
@@ -72,9 +72,13 @@ where
         }
     }
 
-    pub async fn send(&mut self, data: &LinkFrameData<'_, Ident>) -> Result<usize, LinkError> {
+    pub async fn send<Ident: MeshIdentifier + 'static>(
+        &mut self,
+        origin_ident: Ident,
+        data: &LinkFrameData<'_, Ident>,
+    ) -> Result<usize, LinkError> {
         let mut idx = 0;
-        self.buffer[0..size_of::<Ident>()].copy_from_slice(self.identifier.as_bytes());
+        self.buffer[0..size_of::<Ident>()].copy_from_slice(origin_ident.as_bytes());
         idx += size_of::<Ident>();
 
         self.buffer[idx..(idx + size_of::<Ident>())].copy_from_slice(data.dst.as_bytes());

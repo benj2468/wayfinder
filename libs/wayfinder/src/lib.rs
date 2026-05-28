@@ -15,7 +15,7 @@ use interfaces::{
     frame::{LinkFrame, LinkFrameData, LinkFrameDataMut, MeshIdentifier},
 };
 use tracing::{trace, warn};
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::IntoBytes;
 
 pub const DEFAULT_BATMAN_ETHER_TYPE: u16 = 0x4305;
 
@@ -342,8 +342,7 @@ mod tests {
             let mut cur = self.head;
             let mut expected_prev = NONE_IDX;
             while cur != NONE_IDX {
-                let node = self.nodes[cur as usize]
-                    .expect("linked-list node slot is None");
+                let node = self.nodes[cur as usize].expect("linked-list node slot is None");
                 assert_eq!(
                     node.prev, expected_prev,
                     "node {cur}: prev should be {expected_prev} but is {}",
@@ -354,7 +353,8 @@ mod tests {
                 cur = node.next;
             }
             assert_eq!(
-                expected_prev, self.tail,
+                expected_prev,
+                self.tail,
                 "tail pointer {tail} doesn't match last forward-walk node {expected_prev}",
                 tail = self.tail
             );
@@ -375,7 +375,8 @@ mod tests {
                 cur = node.prev;
             }
             assert_eq!(
-                expected_next, self.head,
+                expected_next,
+                self.head,
                 "head pointer {head} doesn't match last backward-walk node {expected_next}",
                 head = self.head
             );
@@ -394,8 +395,7 @@ mod tests {
 
             // Every map value must point at an occupied, matching node.
             for (key, &slot) in self.map.iter() {
-                let node = self.nodes[slot as usize]
-                    .expect("map slot points to a None node");
+                let node = self.nodes[slot as usize].expect("map slot points to a None node");
                 assert_eq!(&node.key, key, "node key mismatch for slot {slot}");
             }
 
@@ -548,7 +548,11 @@ mod tests {
 
         // Key 0 was inserted first → LRU.  Adding key 100 must evict it.
         table.add_record(100, 100u8);
-        assert_eq!(table.get_egress_interface(0), None, "key 0 should be evicted");
+        assert_eq!(
+            table.get_egress_interface(0),
+            None,
+            "key 0 should be evicted"
+        );
         assert_eq!(table.get_egress_interface(100), Some(100));
         assert_eq!(table.map.len(), 100, "capacity should remain at 100");
         table.assert_invariants();
@@ -563,8 +567,16 @@ mod tests {
         // Promote key 0 to MRU — now key 1 is the LRU.
         let _ = table.get_egress_interface(0);
         table.add_record(101, 101u8); // should evict key 1
-        assert_eq!(table.get_egress_interface(0), Some(0), "key 0 was recently read, must not be evicted");
-        assert_eq!(table.get_egress_interface(1), None, "key 1 should be evicted");
+        assert_eq!(
+            table.get_egress_interface(0),
+            Some(0),
+            "key 0 was recently read, must not be evicted"
+        );
+        assert_eq!(
+            table.get_egress_interface(1),
+            None,
+            "key 1 should be evicted"
+        );
         assert_eq!(table.get_egress_interface(101), Some(101));
         table.assert_invariants();
     }
@@ -578,8 +590,16 @@ mod tests {
         // Re-inserting key 0 with a new interface makes it MRU → key 1 becomes LRU.
         table.add_record(99, 0u8);
         table.add_record(101, 101u8); // should evict key 1
-        assert_eq!(table.get_egress_interface(0), Some(99), "key 0 updated, must not be evicted");
-        assert_eq!(table.get_egress_interface(1), None, "key 1 should be evicted");
+        assert_eq!(
+            table.get_egress_interface(0),
+            Some(99),
+            "key 0 updated, must not be evicted"
+        );
+        assert_eq!(
+            table.get_egress_interface(1),
+            None,
+            "key 1 should be evicted"
+        );
         table.assert_invariants();
     }
 
@@ -597,7 +617,11 @@ mod tests {
         assert_eq!(table.get_egress_interface(0), None);
         assert_eq!(table.get_egress_interface(1), None);
         assert_eq!(table.get_egress_interface(2), None);
-        assert_eq!(table.get_egress_interface(3), Some(3), "key 3 should still be present");
+        assert_eq!(
+            table.get_egress_interface(3),
+            Some(3),
+            "key 3 should still be present"
+        );
         assert_eq!(table.map.len(), 100);
         table.assert_invariants();
     }
