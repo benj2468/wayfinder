@@ -1,5 +1,6 @@
 variables:
   CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  CI_REGISTRY_IMAGE_TAG: "$CI_REGISTRY_IMAGE/rust-ci:latest"
 workflow:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_REF_PROTECTED == "true"'
@@ -12,6 +13,7 @@ default:
 stages:
   - lint
   - build
+  - build-test-env
   - test
   - deploy
 lint:rust:
@@ -53,16 +55,37 @@ build:
     - rustup component add clippy
     - cargo build
     - cargo clippy
+build-ci-image:
+  stage: build-env
+  image: docker:24.0.5 # Standard docker CLI image
+  services:
+    - docker:24.0.5-dind # Docker-in-Docker service
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  rules:
+    # ONLY run this job if the Dockerfile changes, or if manually triggered
+    - changes:
+        - containers/testenv.Dockerfile
+    - if: $CI_PIPELINE_SOURCE == "manual"
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    # 1. Pull the existing image to use as a local cache layer source
+    - docker pull $CI_REGISTRY_IMAGE_TAG || true
+
+    # 2. Build using the pulled image as a cache reference
+    - >
+      docker build -f containers/testenv.Dockerfile
+      --cache-from $CI_REGISTRY_IMAGE_TAG
+      -t $CI_REGISTRY_IMAGE_TAG .
+
+    # 3. Push the newly evaluated/built image back to the registry
+    - docker push $CI_REGISTRY_IMAGE_TAG
 test:
   stage: test
-  image: rustlang/rust:nightly
+  image: $CI_REGISTRY_IMAGE_TAG
   needs:
     - build
-  before_script:
-    - rustup component add llvm-tools-preview
-    - cargo install cargo-llvm-cov
-    # Install cargo-nextest
-    - curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
   script:
     - cargo llvm-cov nextest --profile ci --workspace --cobertura --output-path coverage.xml
   artifacts:
