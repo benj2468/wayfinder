@@ -1,5 +1,5 @@
 # Choose your required Rust version
-FROM rust:1.82-slim
+FROM rust:1.96-slim
 
 # Install system dependencies (including protoc)
 RUN apt-get update && apt-get install -y --no-install-recommends \
