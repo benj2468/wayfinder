@@ -53,6 +53,8 @@
             ];
           };
 
+          pre-commit.settings.hooks.treefmt.enable = true;
+
           devShells.default = pkgs.mkShell {
             packages = with pkgs; [
               nil

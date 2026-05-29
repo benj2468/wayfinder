@@ -1,5 +1,6 @@
 variables:
   CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  CI_REGISTRY_IMAGE: registry.haganah.net
   CI_REGISTRY_IMAGE_TAG: "$CI_REGISTRY_IMAGE/rust-ci:latest"
 workflow:
   rules:
@@ -58,6 +59,8 @@ build:
 build-ci-image:
   stage: build-test-env
   image: docker:24.0.5 # Standard docker CLI image
+  tags:
+    - docker
   services:
     - docker:24.0.5-dind # Docker-in-Docker service
   variables:
