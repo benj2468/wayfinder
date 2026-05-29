@@ -56,7 +56,7 @@ build:
     - cargo build
     - cargo clippy
 build-ci-image:
-  stage: build-env
+  stage: build-test-env
   image: docker:24.0.5 # Standard docker CLI image
   services:
     - docker:24.0.5-dind # Docker-in-Docker service
