@@ -1,6 +1,7 @@
 variables:
   CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
   CI_REGISTRY_IMAGE: registry.haganah.net
+  # TODO: This will need to change, or else different MRs will stomp on each other
   CI_REGISTRY_IMAGE_TAG: "$CI_REGISTRY_IMAGE/rust-ci:latest"
 workflow:
   rules:
@@ -76,6 +77,7 @@ test:run:
     - build
   script:
     - cargo llvm-cov nextest --profile ci --workspace --cobertura --output-path coverage.xml
+  coverage: '/(?i)total.*?(\d+(?:\.\d+)?%)/'
   artifacts:
     reports:
       coverage_report:
