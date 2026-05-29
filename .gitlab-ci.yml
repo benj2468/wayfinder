@@ -73,7 +73,7 @@ test:run:
   stage: test
   image: $CI_REGISTRY_IMAGE_TAG
   needs:
-    - build-ci-image
+    - test:build-image
     - build
   script:
     - cargo llvm-cov nextest --profile ci --workspace --cobertura --output-path coverage.xml
