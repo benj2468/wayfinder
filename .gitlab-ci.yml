@@ -75,9 +75,16 @@ test:run:
   image: $CI_REGISTRY_IMAGE_TAG
   needs:
     - build
-  script:
-    - cargo llvm-cov nextest --profile ci --workspace --cobertura --output-path coverage.xml
+  # GitLab scrapes this regex against job stdout to populate the coverage badge.
+  # The `cargo llvm-cov report` step below prints the TOTAL summary line it matches.
   coverage: '/(?i)total.*?(\d+(?:\.\d+)?%)/'
+  script:
+    # Run the tests and collect coverage data, but don't emit a report yet.
+    - cargo llvm-cov nextest --profile ci --workspace --no-report
+    # Cobertura file for the MR diff coverage annotations.
+    - cargo llvm-cov report --cobertura --output-path coverage.xml
+    # Text summary to stdout so the `coverage:` regex above can extract the badge number.
+    - cargo llvm-cov report
   artifacts:
     reports:
       coverage_report:
