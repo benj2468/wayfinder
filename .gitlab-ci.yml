@@ -53,8 +53,8 @@ build:
     - lint-done
   script:
     - rustup component add clippy
-    - cargo build
-    - cargo clippy
+    - cargo build --workspace
+    - cargo clippy --workspace
 test:build-image:
   stage: test
   image: nixpkgs/nix-flakes # Standard docker CLI image
