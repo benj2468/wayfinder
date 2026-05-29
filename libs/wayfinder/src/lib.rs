@@ -12,18 +12,28 @@ use batman::{
 use interfaces::{
     engine::{MeshRoutingEngine, RoutingAction},
     frame::{LinkFrame, LinkFrameData, LinkFrameDataMut, MeshIdentifier},
+    link::LinkMetrics,
 };
 use tracing::{trace, warn};
 use zerocopy::IntoBytes;
 
-use crate::routing_table::IdentTable;
+use crate::{
+    link_quality::{LinkQualityTable, normalize_quality},
+    routing_table::IdentTable,
+};
 
+mod link_quality;
 mod routing_table;
 
 pub const DEFAULT_BATMAN_ETHER_TYPE: u16 = 0x4305;
 
+/// The egress decision returned by [`CentralRouter::get_egress_interface`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EgressInterface {
+    /// Send out every interface — used for broadcast destinations and for
+    /// any destination the router has not yet observed.
     All,
+    /// Send out a specific physical interface by its index.
     Interface(usize),
 }
 
@@ -31,6 +41,7 @@ pub struct CentralRouter<Ident: MeshIdentifier> {
     /// The Batman routing engine for this router
     batman: BatmanEngine<100, Ident>,
     ident_table: IdentTable<Ident>,
+    link_quality: LinkQualityTable<Ident>,
     phantom: PhantomData<Ident>,
 }
 
@@ -40,17 +51,46 @@ impl<Ident: MeshIdentifier> CentralRouter<Ident> {
             batman: BatmanEngine::new(self_ident),
             phantom: PhantomData,
             ident_table: IdentTable::new(),
+            link_quality: LinkQualityTable::new(),
         }
     }
 }
 
 impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
+    /// Process a received link-layer frame without any physical-layer
+    /// metrics — equivalent to calling [`handle_frame_with_metrics`] with
+    /// [`LinkMetrics::default`].  Useful for tests and for links that
+    /// cannot report per-frame signal information.
+    ///
+    /// [`handle_frame_with_metrics`]: CentralRouter::handle_frame_with_metrics
     pub fn handle_frame<'tx>(
         &mut self,
         iface_idx: usize,
         frame: &LinkFrame<Ident>,
         tx_buf: &'tx mut [u8],
     ) -> Option<LinkFrameData<'tx, Ident>> {
+        self.handle_frame_with_metrics(iface_idx, frame, LinkMetrics::default(), tx_buf)
+    }
+
+    /// Process a received link-layer frame, folding the radio's
+    /// physical-layer metrics for `frame.src` into the per-(neighbor,
+    /// interface) link-quality table.  The egress decision for that
+    /// neighbor will be biased toward whichever interface accumulates the
+    /// highest smoothed quality.
+    pub fn handle_frame_with_metrics<'tx>(
+        &mut self,
+        iface_idx: usize,
+        frame: &LinkFrame<Ident>,
+        metrics: LinkMetrics,
+        tx_buf: &'tx mut [u8],
+    ) -> Option<LinkFrameData<'tx, Ident>> {
+        // 0. Update the link-quality table for the sender, keyed on the
+        //    interface this frame arrived on.  Done before any further
+        //    processing so even frames that the upper layers drop still
+        //    contribute their signal information.
+        let quality = normalize_quality(&metrics);
+        self.link_quality.update(frame.src, iface_idx, quality);
+
         // 1. Add a record to the identifier table
         self.ident_table.add_record(iface_idx, frame.dst);
         // 2. Demux by Protocol ID
@@ -165,10 +205,29 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
         })
     }
 
+    /// Choose the egress interface for a frame destined to `dest`.
+    ///
+    /// Resolution order:
+    /// 1. `BROADCAST` always returns [`EgressInterface::All`].
+    /// 2. If BATMAN has chosen a next-hop neighbor for `dest`, use the
+    ///    interface with the best EWMA link quality observed for *that
+    ///    neighbor*.  This is what makes the choice metric-driven.
+    /// 3. Otherwise (no BATMAN route — `dest` is presumed to be a direct
+    ///    neighbor or unknown), fall back to the best-quality interface
+    ///    observed for `dest` itself.
+    /// 4. If no quality data exists yet, fall back to the legacy
+    ///    last-seen [`IdentTable`] entry.
     pub fn get_egress_interface(&mut self, dest: Ident) -> Option<EgressInterface> {
         if dest == Ident::BROADCAST {
             return Some(EgressInterface::All);
         }
+
+        let next_hop = self.batman.lookup_route(dest).unwrap_or(dest);
+
+        if let Some(iface) = self.link_quality.best_interface_for(next_hop) {
+            return Some(EgressInterface::Interface(iface));
+        }
+
         self.ident_table
             .get_egress_interface(dest)
             .map(EgressInterface::Interface)

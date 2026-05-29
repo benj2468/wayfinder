@@ -5,12 +5,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use interfaces::link::LinkMetrics;
     use tokio::sync::mpsc;
     use wayfinder::{
-        DEFAULT_BATMAN_ETHER_TYPE,
-        batman::wire::{BATADV_IV_OGM, BATADV_UNICAST, BatmanUnicastPacket},
+        DEFAULT_BATMAN_ETHER_TYPE, EgressInterface,
+        batman::wire::{BATADV_IV_OGM, BATADV_UNICAST, BatmanOgmPacket, BatmanUnicastPacket},
     };
-    use zerocopy::FromBytes;
+    use zerocopy::{FromBytes, IntoBytes};
 
     use crate::Direction;
     use crate::switch::{PortComms, PortConfig, Switch, TapConfig, TapMeta};
@@ -67,6 +68,28 @@ mod tests {
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
+
+    /// Build a raw OGM broadcast frame as it would appear on the wire after
+    /// being transmitted by `src` with the given TQ and sequence number.
+    ///
+    /// Wire layout (u8 ident): `[src:1][BROADCAST:1][proto:2 NE][BatmanOgmPacket]`.
+    fn build_ogm_wire_frame(src: u8, tq: u8, seqno: u32) -> Vec<u8> {
+        let ogm = BatmanOgmPacket::<u8> {
+            packet_type: BATADV_IV_OGM,
+            version: 5,
+            ttl: 50,
+            tq,
+            seqno: seqno.to_be(),
+            orig: src,
+            prev_sender: src,
+        };
+        let mut frame = Vec::new();
+        frame.push(src);
+        frame.push(0xff);
+        frame.extend_from_slice(&DEFAULT_BATMAN_ETHER_TYPE.to_ne_bytes());
+        frame.extend_from_slice(ogm.as_bytes());
+        frame
+    }
 
     fn make_port_pair(buf: usize) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>, PortComms) {
         let (tx_to_switch, rx_to_switch) = mpsc::channel(buf);
@@ -511,5 +534,83 @@ mod tests {
         // The switch_b node-1 port is port_2b_id; nothing addressed to node 1
         // should arrive there during the relay phase.
         let _ = port_2b_id; // used for logical clarity only
+    }
+
+    // ── metric-based egress selection ────────────────────────────────────────
+    //
+    // The router has two physical interfaces that can both reach the same
+    // neighbor.  After observing OGMs from that neighbor on each interface,
+    // the egress decision for unicast traffic to that neighbor must prefer
+    // the interface with the better link-quality metrics (RSSI/SNR).
+    //
+    // These tests are intentionally written against an API that does not yet
+    // exist (`LinkMetrics`, `TestRouter::receive_with_metrics`) and against
+    // a `CentralRouter` that does not yet feed link metrics into the egress
+    // decision.  They are the "red" specification for the metrics work.
+
+    /// Node A has two interfaces; iface 1 hears node B with strong RSSI/SNR
+    /// while iface 0 hears the same OGM with weak RSSI/SNR.  After both
+    /// observations the router must choose iface 1 as the egress for node B.
+    #[tokio::test]
+    async fn egress_picks_iface_with_better_metrics_for_shared_neighbor() {
+        let (tx_0, _rx_0, _port_0) = make_port_pair(64);
+        let (tx_1, _rx_1, _port_1) = make_port_pair(64);
+        let mut router_a: TestRouter<u8> = TestRouter::new(1, vec![tx_0, tx_1]);
+
+        let ogm_from_b = build_ogm_wire_frame(2, 255, 1);
+
+        let weak = LinkMetrics {
+            rssi_dbm: Some(-115),
+            snr_db: Some(-5),
+            quality: None,
+        };
+        let strong = LinkMetrics {
+            rssi_dbm: Some(-60),
+            snr_db: Some(10),
+            quality: None,
+        };
+
+        router_a.receive_with_metrics(0, &ogm_from_b, weak).await;
+        router_a.receive_with_metrics(1, &ogm_from_b, strong).await;
+
+        match router_a.router.get_egress_interface(2) {
+            Some(EgressInterface::Interface(1)) => {}
+            other => panic!(
+                "expected egress for node 2 to be Interface(1) (strong RSSI/SNR), got {other:?}"
+            ),
+        }
+    }
+
+    /// Mirror of the previous test with strong/weak swapped across the two
+    /// interfaces.  Confirms the choice is driven by the metrics themselves
+    /// and not by iface index, arrival order, or last-write-wins.
+    #[tokio::test]
+    async fn egress_swaps_iface_when_metrics_swap() {
+        let (tx_0, _rx_0, _port_0) = make_port_pair(64);
+        let (tx_1, _rx_1, _port_1) = make_port_pair(64);
+        let mut router_a: TestRouter<u8> = TestRouter::new(1, vec![tx_0, tx_1]);
+
+        let ogm_from_b = build_ogm_wire_frame(2, 255, 1);
+
+        let strong = LinkMetrics {
+            rssi_dbm: Some(-60),
+            snr_db: Some(10),
+            quality: None,
+        };
+        let weak = LinkMetrics {
+            rssi_dbm: Some(-115),
+            snr_db: Some(-5),
+            quality: None,
+        };
+
+        router_a.receive_with_metrics(0, &ogm_from_b, strong).await;
+        router_a.receive_with_metrics(1, &ogm_from_b, weak).await;
+
+        match router_a.router.get_egress_interface(2) {
+            Some(EgressInterface::Interface(0)) => {}
+            other => panic!(
+                "expected egress for node 2 to be Interface(0) (strong RSSI/SNR), got {other:?}"
+            ),
+        }
     }
 }

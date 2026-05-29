@@ -20,7 +20,10 @@
 
 use std::time::Duration;
 
-use interfaces::frame::{LinkFrame, MeshIdentifier};
+use interfaces::{
+    frame::{LinkFrame, MeshIdentifier},
+    link::LinkMetrics,
+};
 use tokio::sync::mpsc;
 use wayfinder::{CentralRouter, EgressInterface};
 use zerocopy::FromBytes;
@@ -133,16 +136,31 @@ impl<Ident: MeshIdentifier + 'static> TestRouter<Ident> {
     /// [`CentralRouter::handle_frame`], and — if a reply is produced —
     /// serialises it and dispatches it on the appropriate egress interface.
     pub async fn receive(&mut self, iface_idx: usize, raw: &[u8]) {
+        self.receive_with_metrics(iface_idx, raw, LinkMetrics::default())
+            .await;
+    }
+
+    /// Same as [`receive`], but carries explicit [`LinkMetrics`] as if the
+    /// radio had reported them.  Tests use this to inject controlled
+    /// RSSI/SNR values so that the metric-driven egress decision can be
+    /// exercised without real hardware.
+    ///
+    /// [`receive`]: TestRouter::receive
+    pub async fn receive_with_metrics(
+        &mut self,
+        iface_idx: usize,
+        raw: &[u8],
+        metrics: LinkMetrics,
+    ) {
         let my_ident = self.ident;
         let mut buf = [0u8; 512];
         let frame = parse_frame::<Ident>(raw);
-        // frame borrows raw (caller's data, not self), so handle_frame can
-        // mutably borrow self.router and the local buf simultaneously.
-        let reply = self.router.handle_frame(iface_idx, frame, &mut buf);
+        let reply = self
+            .router
+            .handle_frame_with_metrics(iface_idx, frame, metrics, &mut buf);
         if let Some(r) = reply {
             let dst = r.dst;
             let wire = build_frame(my_ident, dst, r.protocol, r.payload);
-            // r / buf borrow ends after build_frame copies the payload
             self.send_egress(dst, wire).await;
         }
     }

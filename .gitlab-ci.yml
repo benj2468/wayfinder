@@ -72,12 +72,9 @@ build-ci-image:
   script:
     # 1. Pull the existing image to use as a local cache layer source
     - docker pull $CI_REGISTRY_IMAGE_TAG || true
-
     # 2. Build using the pulled image as a cache reference
     - >
-      docker build -f containers/testenv.Dockerfile
-      --cache-from $CI_REGISTRY_IMAGE_TAG
-      -t $CI_REGISTRY_IMAGE_TAG .
+      docker build -f containers/testenv.Dockerfile --cache-from $CI_REGISTRY_IMAGE_TAG -t $CI_REGISTRY_IMAGE_TAG .
 
     # 3. Push the newly evaluated/built image back to the registry
     - docker push $CI_REGISTRY_IMAGE_TAG
