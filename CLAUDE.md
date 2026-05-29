@@ -55,6 +55,16 @@ Every public API **must have documentation**.  This applies to:
 
 Good doc comments explain the *why* and any non-obvious constraints (valid ranges, encoding formats, error conditions).  They do not restate the name.
 
+### Test-Driven Development
+
+This project is developed **test-first**.  When adding new behaviour or changing existing behaviour:
+
+1.  Write the test first, expressing the desired API and outcome.  Place it in the appropriate `#[cfg(test)]` module (or integration-test crate) and run it to confirm it fails — either at compile time (because the API doesn't exist yet) or at runtime (because the behaviour isn't implemented yet).  That "red" state is the specification.
+2.  Implement the minimum needed to turn the test green.
+3.  Refactor with the test as the safety net.
+
+Do not pair an implementation diff with the failing test in the same change unless explicitly asked.  The failing test is its own checkpoint — it captures the intent so it can be reviewed independently of the implementation.
+
 ### Unit Testing Requirement
 
 All non-trivial logic **must be accompanied by unit tests** in a `#[cfg(test)]` module at the bottom of the source file.  This includes — but is not limited to:
