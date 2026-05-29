@@ -14,7 +14,6 @@ default:
 stages:
   - lint
   - build
-  - build-test-env
   - test
   - deploy
 lint:rust:
@@ -56,8 +55,8 @@ build:
     - rustup component add clippy
     - cargo build
     - cargo clippy
-build-ci-image:
-  stage: build-test-env
+test:build-image:
+  stage: test
   image: docker:24.0.5 # Standard docker CLI image
   tags:
     - docker
@@ -70,7 +69,7 @@ build-ci-image:
     - docker build -f containers/testenv.Dockerfile --cache-from $CI_REGISTRY_IMAGE_TAG -t $CI_REGISTRY_IMAGE_TAG .
     # 3. Push the newly evaluated/built image back to the registry
     - docker push $CI_REGISTRY_IMAGE_TAG
-test:
+test:run:
   stage: test
   image: $CI_REGISTRY_IMAGE_TAG
   needs:
