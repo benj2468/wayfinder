@@ -49,11 +49,11 @@ lint-done:
     - echo "done"
 build-image:
   stage: build
-  image: nixpkgs/nix-flakes # Standard docker CLI image
+  image: docker:latest
+  services:
+    - docker:dind
   tags:
     - docker
-  before_script:
-    - nix profile install nixpkgs#docker
   script:
     # 1. Pull the existing image to use as a local cache layer source
     - docker pull $CI_REGISTRY_IMAGE_TAG || true
