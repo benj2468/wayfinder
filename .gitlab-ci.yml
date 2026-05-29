@@ -62,7 +62,7 @@ test:
     - rustup component add llvm-tools-preview
     - cargo install cargo-llvm-cov
     # Install cargo-nextest
-    - curl -LsSf https://nexte.st | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+    - curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
   script:
     - cargo llvm-cov nextest --profile ci --workspace --cobertura --output-path coverage.xml
   artifacts:
