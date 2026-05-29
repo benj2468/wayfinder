@@ -63,13 +63,6 @@ build-ci-image:
     - docker
   services:
     - docker:24.0.5-dind # Docker-in-Docker service
-  variables:
-    DOCKER_TLS_CERTDIR: "/certs"
-  rules:
-    # ONLY run this job if the Dockerfile changes, or if manually triggered
-    - changes:
-        - containers/testenv.Dockerfile
-    - if: $CI_PIPELINE_SOURCE == "manual"
   before_script:
     - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
   script:
@@ -85,6 +78,7 @@ test:
   stage: test
   image: $CI_REGISTRY_IMAGE_TAG
   needs:
+    - build-ci-image
     - build
   script:
     - cargo llvm-cov nextest --profile ci --workspace --cobertura --output-path coverage.xml
