@@ -27,6 +27,23 @@ message GetNodeInfoRequest {}
 // destination in the mesh.
 message GetRoutingTableRequest {}
 
+// Request the per-(neighbor, interface) link-quality table maintained by
+// the router.  Returns a LinkQualityTable response describing the
+// EWMA-smoothed signal quality observed for each neighbor on each
+// physical interface.
+message GetLinkQualityTableRequest {}
+
+// Request a routing decision for a hypothetical packet to `destination`,
+// mirroring what the router would compute on send.  Returns a
+// ResolveRouteResponse with the next-hop neighbor and the egress
+// interface that would be selected.  Returned as an ErrorResponse if the
+// raw bytes cannot be parsed as a valid identifier for this deployment's
+// address family.
+message ResolveRouteRequest {
+  // Raw destination identifier bytes.  Same encoding as NodeInfo.node_id.
+  bytes destination = 1;
+}
+
 // Top-level request envelope.  Exactly one variant must be set; an empty
 // request (no variant) is treated as a protocol error and returns an
 // ErrorResponse.
@@ -38,6 +55,12 @@ message WayfinderRequest {
 
     // Query the full BATMAN originator (routing) table.
     GetRoutingTableRequest get_routing_table = 2;
+
+    // Query the per-(neighbor, interface) link-quality table.
+    GetLinkQualityTableRequest get_link_quality_table = 3;
+
+    // Ask the router how it would route a packet to a given destination.
+    ResolveRouteRequest resolve_route = 4;
   }
 }
 
@@ -103,6 +126,69 @@ message RoutingTable {
   repeated RoutingEntry entries = 1;
 }
 
+// A single row in the per-(neighbor, interface) link-quality table.  The
+// router folds every received frame's physical-layer metrics into an
+// exponentially-weighted moving average keyed on (neighbor, iface_idx)
+// and uses that to bias the egress-interface decision toward the
+// strongest radio path for each neighbor.
+message LinkQualityEntry {
+  // Raw bytes of the neighbor this row describes.  Same encoding as
+  // NodeInfo.node_id.
+  bytes neighbor_id = 1;
+
+  // Index of the physical interface on which `neighbor_id` was observed.
+  // Indices are assigned in the order interfaces are registered with the
+  // CentralRouter and are stable for the lifetime of the process.
+  uint32 iface_idx = 2;
+
+  // EWMA-smoothed normalized quality on the 0–255 scale (matching
+  // BATMAN's TQ convention).  Higher is better.
+  uint32 ewma_quality = 3;
+
+  // Number of received frames folded into the EWMA so far.  Saturates at
+  // u32::MAX.  Useful for callers that want to weight or filter entries
+  // by how much evidence backs the quality estimate.
+  uint32 sample_count = 4;
+}
+
+// Snapshot of the full link-quality table at the time of the request.
+message LinkQualityTable {
+  // All known (neighbor, interface) pairs.  Empty if the router has not
+  // yet received any frames with measurable metrics.
+  repeated LinkQualityEntry entries = 1;
+}
+
+// Marker payload indicating the router would flood a packet out of every
+// interface (the egress decision used for broadcasts and for
+// destinations with no metric information).
+message AllInterfacesEgress {}
+
+// Answer to a ResolveRouteRequest: the next-hop neighbor and the egress
+// interface the router would select for the requested destination right
+// now.  The values reflect the in-memory routing and link-quality state
+// at the time of the request and may change as new OGMs and frames are
+// received.
+message ResolveRouteResponse {
+  // Immediate next-hop neighbor that would receive the packet.  Mirrors
+  // the `lookup_route(dest).unwrap_or(dest)` fallback inside
+  // CentralRouter::handle_local — when no BATMAN route is known this is
+  // the original destination, since the router will try to reach it
+  // directly.
+  bytes next_hop = 1;
+
+  // The egress interface the router would pick.  Unset when no link
+  // quality or last-seen interface data exists yet for this destination
+  // — the router would have nothing to send on in that state.
+  oneof egress {
+    // Flood out every interface — used for broadcast destinations.
+    AllInterfacesEgress all_interfaces = 2;
+
+    // Send out a specific physical interface, indexed in registration
+    // order on the CentralRouter.
+    uint32 interface_index = 3;
+  }
+}
+
 // Returned when the router cannot fulfill a request.
 message ErrorResponse {
   // Human-readable description of what went wrong.
@@ -121,5 +207,11 @@ message WayfinderResponse {
 
     // Returned for malformed or unrecognised requests.
     ErrorResponse error = 3;
+
+    // Response to GetLinkQualityTableRequest.
+    LinkQualityTable link_quality_table = 4;
+
+    // Response to ResolveRouteRequest.
+    ResolveRouteResponse resolve_route = 5;
   }
 }

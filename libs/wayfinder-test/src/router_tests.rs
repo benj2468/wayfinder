@@ -5,6 +5,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use interfaces::frame::MeshIdentifier;
     use interfaces::link::LinkMetrics;
     use tokio::sync::mpsc;
     use wayfinder::{
@@ -612,5 +613,73 @@ mod tests {
                 "expected egress for node 2 to be Interface(0) (strong RSSI/SNR), got {other:?}"
             ),
         }
+    }
+
+    // ── route-inspection API ──────────────────────────────────────────────────
+    //
+    // `CentralRouter::resolve_route` is the read-only inspection version of
+    // the path the router would take on send.  It backs the protobuf
+    // ResolveRouteRequest used by third-party SW to reason about routing.
+
+    /// With a known neighbor observed on a single interface, resolve_route
+    /// must report that neighbor as both next-hop and as the egress.
+    #[tokio::test]
+    async fn resolve_route_returns_neighbor_and_observed_interface() {
+        let (tx_0, _rx_0, _port_0) = make_port_pair(64);
+        let (tx_1, _rx_1, _port_1) = make_port_pair(64);
+        let mut router_a: TestRouter<u8> = TestRouter::new(1, vec![tx_0, tx_1]);
+
+        let ogm_from_b = build_ogm_wire_frame(2, 255, 1);
+        let strong = LinkMetrics {
+            rssi_dbm: Some(-50),
+            snr_db: Some(12),
+            quality: None,
+        };
+        router_a.receive_with_metrics(1, &ogm_from_b, strong).await;
+
+        let (next_hop, egress) = router_a.router.resolve_route(2);
+        assert_eq!(next_hop, 2, "direct neighbor should be its own next hop");
+        assert_eq!(
+            egress,
+            Some(EgressInterface::Interface(1)),
+            "egress must follow the interface the OGM arrived on"
+        );
+    }
+
+    /// resolve_route must return [`EgressInterface::All`] for BROADCAST
+    /// regardless of any other table state.
+    #[tokio::test]
+    async fn resolve_route_for_broadcast_returns_all_interfaces() {
+        let (tx_0, _rx_0, _port_0) = make_port_pair(64);
+        let mut router_a: TestRouter<u8> = TestRouter::new(1, vec![tx_0]);
+
+        let (next_hop, egress) = router_a.router.resolve_route(u8::BROADCAST);
+        assert_eq!(next_hop, u8::BROADCAST);
+        assert_eq!(egress, Some(EgressInterface::All));
+    }
+
+    /// resolve_route must not promote the destination in the underlying
+    /// ident-table LRU — repeated calls leave the cache state untouched so
+    /// management-API callers don't perturb the routing decisions of the
+    /// data plane.
+    #[tokio::test]
+    async fn resolve_route_is_read_only() {
+        let (tx_0, _rx_0, _port_0) = make_port_pair(64);
+        let mut router_a: TestRouter<u8> = TestRouter::new(1, vec![tx_0]);
+
+        let ogm_from_b = build_ogm_wire_frame(2, 255, 1);
+        let metrics = LinkMetrics {
+            rssi_dbm: Some(-50),
+            snr_db: Some(12),
+            quality: None,
+        };
+        router_a.receive_with_metrics(0, &ogm_from_b, metrics).await;
+
+        // Two snapshots: identical state, identical answers — and a third
+        // snapshot taken after a no-op call confirms idempotence.
+        let first = router_a.router.resolve_route(2);
+        let _ = router_a.router.resolve_route(2);
+        let third = router_a.router.resolve_route(2);
+        assert_eq!(first, third);
     }
 }

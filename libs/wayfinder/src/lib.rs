@@ -22,6 +22,8 @@ use crate::{
     routing_table::IdentTable,
 };
 
+pub use crate::link_quality::LinkQualityRecord;
+
 mod link_quality;
 mod routing_table;
 
@@ -239,5 +241,45 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
 
     pub fn originator_table(&self) -> &[batman::OriginatorRecord<Ident>] {
         &self.batman.originator_table
+    }
+
+    /// Borrow the link-quality table for inspection.  Read-only mirror of
+    /// the structure the data plane mutates on every received frame.
+    pub fn link_quality_records(&self) -> &[LinkQualityRecord<Ident>] {
+        self.link_quality.records()
+    }
+
+    /// Read-only equivalent of [`handle_local`] + [`get_egress_interface`]:
+    /// returns the next-hop neighbor and the egress decision that *would*
+    /// be made for a packet to `dest` right now, without mutating any
+    /// router state.  Used to back the management-API `ResolveRoute`
+    /// request.
+    ///
+    /// `next_hop` mirrors the `lookup_route(dest).unwrap_or(dest)`
+    /// fallback used inside [`handle_local`] — when no BATMAN route is
+    /// known the router will try to reach `dest` directly.
+    ///
+    /// The egress value is `None` when no link-quality or last-seen
+    /// information exists for the destination; in that state the data
+    /// plane has nothing to transmit on either.
+    ///
+    /// [`handle_local`]: CentralRouter::handle_local
+    /// [`get_egress_interface`]: CentralRouter::get_egress_interface
+    pub fn resolve_route(&self, dest: Ident) -> (Ident, Option<EgressInterface>) {
+        if dest == Ident::BROADCAST {
+            return (Ident::BROADCAST, Some(EgressInterface::All));
+        }
+
+        let next_hop = self.batman.lookup_route(dest).unwrap_or(dest);
+
+        let egress = if let Some(iface) = self.link_quality.best_interface_for(next_hop) {
+            Some(EgressInterface::Interface(iface))
+        } else {
+            self.ident_table
+                .peek_egress_interface(dest)
+                .map(EgressInterface::Interface)
+        };
+
+        (next_hop, egress)
     }
 }

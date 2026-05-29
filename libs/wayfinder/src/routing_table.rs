@@ -164,6 +164,17 @@ impl<Ident: MeshIdentifier> IdentTable<Ident> {
         self.move_to_front(idx);
         Some(self.nodes[idx as usize].unwrap().iface_idx)
     }
+
+    /// Read-only equivalent of [`get_egress_interface`] that does **not**
+    /// touch the LRU ordering.  Used by inspection APIs (e.g. the
+    /// management RPC) that must not perturb the data-plane's cache
+    /// eviction decisions.
+    ///
+    /// [`get_egress_interface`]: IdentTable::get_egress_interface
+    pub fn peek_egress_interface(&self, dest: Ident) -> Option<usize> {
+        let idx = *self.map.get(&dest)?;
+        Some(self.nodes[idx as usize].unwrap().iface_idx)
+    }
 }
 
 #[cfg(test)]

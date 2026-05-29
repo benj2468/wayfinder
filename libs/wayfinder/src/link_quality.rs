@@ -32,20 +32,20 @@ const EWMA_SHIFT: u16 = 2;
 
 /// One row in the link-quality table.
 #[derive(Debug, Clone, Copy)]
-struct Entry<Ident> {
+pub struct LinkQualityRecord<Ident> {
     /// The neighbor whose link quality this row describes.
-    neighbor: Ident,
+    pub neighbor: Ident,
     /// The physical interface this neighbor was observed on.
-    iface_idx: usize,
+    pub iface_idx: usize,
     /// EWMA-smoothed quality on the 0..=255 scale.
-    ewma_quality: u8,
+    pub ewma_quality: u8,
     /// Number of samples folded into the EWMA.  Saturates at `u32::MAX`.
-    sample_count: u32,
+    pub sample_count: u32,
 }
 
 /// Fixed-capacity table of per-(neighbor, interface) link-quality estimates.
 pub struct LinkQualityTable<Ident: MeshIdentifier> {
-    entries: HVec<Entry<Ident>, LINK_QUALITY_CAPACITY>,
+    entries: HVec<LinkQualityRecord<Ident>, LINK_QUALITY_CAPACITY>,
 }
 
 impl<Ident: MeshIdentifier> Default for LinkQualityTable<Ident> {
@@ -80,7 +80,7 @@ impl<Ident: MeshIdentifier> LinkQualityTable<Ident> {
             return;
         }
 
-        let new_entry = Entry {
+        let new_entry = LinkQualityRecord {
             neighbor,
             iface_idx,
             ewma_quality: sample,
@@ -109,6 +109,13 @@ impl<Ident: MeshIdentifier> LinkQualityTable<Ident> {
             .filter(|e| e.neighbor == neighbor)
             .max_by_key(|e| e.ewma_quality)
             .map(|e| e.iface_idx)
+    }
+
+    /// Borrow the table as a contiguous slice of records.  Used by
+    /// inspection APIs (e.g. the management RPC) that need to expose the
+    /// full link-quality snapshot to external callers.
+    pub fn records(&self) -> &[LinkQualityRecord<Ident>] {
+        &self.entries
     }
 }
 

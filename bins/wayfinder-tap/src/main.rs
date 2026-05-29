@@ -20,7 +20,10 @@ use wayfinder::EgressInterface;
 use wayfinder::interfaces::frame::LinkFrame;
 use wayfinder::{CentralRouter, interfaces::link::Link};
 use wayfinder_protos::{
-    service::{NeighborPathData, RoutingEntryData, WayfinderDataProvider, WayfinderService},
+    service::{
+        EgressDecisionData, LinkQualityEntryData, NeighborPathData, RouteResolutionData,
+        RoutingEntryData, WayfinderDataProvider, WayfinderService,
+    },
     wayfinder_v1alpha::{WayfinderRequest, WayfinderResponse},
 };
 use zerocopy::{FromBytes, IntoBytes};
@@ -95,6 +98,34 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
                     .collect(),
             })
             .collect()
+    }
+
+    fn link_quality_table(&self) -> Vec<LinkQualityEntryData> {
+        self.0
+            .link_quality_records()
+            .iter()
+            .map(|r| LinkQualityEntryData {
+                neighbor_id: r.neighbor.as_bytes().to_vec(),
+                iface_idx: r.iface_idx as u32,
+                ewma_quality: r.ewma_quality as u32,
+                sample_count: r.sample_count,
+            })
+            .collect()
+    }
+
+    fn resolve_route(&self, destination: &[u8]) -> Option<RouteResolutionData> {
+        // This deployment uses 6-byte MAC identifiers; reject anything else
+        // so the management API returns a structured error rather than
+        // silently routing to a zero-padded address.
+        let dest: [u8; 6] = destination.try_into().ok()?;
+        let (next_hop, egress) = self.0.resolve_route(dest);
+        Some(RouteResolutionData {
+            next_hop: next_hop.as_bytes().to_vec(),
+            egress: egress.map(|e| match e {
+                EgressInterface::All => EgressDecisionData::AllInterfaces,
+                EgressInterface::Interface(idx) => EgressDecisionData::Interface(idx as u32),
+            }),
+        })
     }
 }
 
