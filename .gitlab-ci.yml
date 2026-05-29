@@ -46,17 +46,8 @@ lint-done:
       optional: true
   script:
     - echo "done"
-build:
+build-image:
   stage: build
-  image: rustlang/rust:nightly
-  needs:
-    - lint-done
-  script:
-    - rustup component add clippy
-    - cargo build --workspace
-    - cargo clippy --workspace
-test:build-image:
-  stage: test
   image: nixpkgs/nix-flakes # Standard docker CLI image
   tags:
     - docker
@@ -69,11 +60,19 @@ test:build-image:
     - docker build -f containers/testenv.Dockerfile --cache-from "$CI_REGISTRY_IMAGE_TAG" -t "$CI_REGISTRY_IMAGE_TAG" .
     # 3. Push the newly evaluated/built image back to the registry
     - docker push "$CI_REGISTRY_IMAGE_TAG"
+build:
+  stage: build
+  image: $CI_REGISTRY_IMAGE_TAG
+  needs:
+    - lint-done
+    - build-image
+  script:
+    - cargo build --workspace
+    - cargo clippy --workspace
 test:run:
   stage: test
   image: $CI_REGISTRY_IMAGE_TAG
   needs:
-    - test:build-image
     - build
   script:
     - cargo llvm-cov nextest --profile ci --workspace --cobertura --output-path coverage.xml

@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install the LLVM tools preview required for coverage
 RUN rustup component add llvm-tools-preview
+RUN rustup component add clippy
 
 # Install cargo-nextest and cargo-llvm-cov binaries using pre-compiled installers
 # (Much faster than running `cargo install` inside the Dockerfile)
