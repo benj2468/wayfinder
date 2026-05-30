@@ -1,24 +1,26 @@
-use std::{future::Future, net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf};
 
 use bytes::Bytes;
 use clap::Parser;
 use core::net::Ipv4Addr;
-use embedded_io_adapters::tokio_1::FromTokio;
 use futures::{SinkExt, StreamExt, stream::FuturesOrdered};
+use pretty_hex::pretty_hex;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, UdpSocket, UnixListener, UnixStream},
+    net::{TcpListener, UdpSocket, UnixDatagram},
     sync::{mpsc, oneshot},
     task::JoinSet,
 };
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing_subscriber::EnvFilter;
 use tun_rs::{DeviceBuilder, Layer};
+use wayfinder::CentralRouter;
 use wayfinder::EgressInterface;
-use wayfinder::interfaces::frame::{LinkFrameData, MeshIdentifier};
-use wayfinder::{CentralRouter, interfaces::link::Link};
+use wayfinder::interfaces::{
+    frame::{LinkFrame, LinkFrameData, MeshIdentifier},
+    link::LinkError,
+};
 use wayfinder_protos::{
     service::{
         EgressDecisionData, LinkQualityEntryData, NeighborPathData, RouteResolutionData,
@@ -26,19 +28,22 @@ use wayfinder_protos::{
     },
     wayfinder_v1alpha::{WayfinderRequest, WayfinderResponse},
 };
-use zerocopy::IntoBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type")]
 pub enum LinkConfig {
-    Udp { socket_addr: SocketAddr },
-    UnixServer { path: PathBuf },
-    UnixClient { path: PathBuf },
+    Udp {
+        bind_addr: SocketAddr,
+        remote_addr: SocketAddr,
+    },
 }
 
 /// Transport over which the management API is exposed.
 #[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type")]
 pub enum ServerConfig {
     UnixSocket { path: PathBuf },
     Tcp { addr: SocketAddr },
@@ -46,20 +51,23 @@ pub enum ServerConfig {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+pub struct TapConfig {
+    pub device_name: String,
+    pub ip_address: Ipv4Addr,
+    pub netmask: Ipv4Addr,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Config {
+    tap: TapConfig,
     #[serde(default)]
     links: Vec<LinkConfig>,
+    #[serde(default)]
     server: Option<ServerConfig>,
 }
 
 #[derive(clap::Parser, Debug)]
 pub struct Args {
-    #[clap(short, long, default_value = "wayfinder0")]
-    device_name: String,
-    #[clap(short, long, default_value = "192.168.184.1")]
-    ip_address: Ipv4Addr,
-    #[clap(short, long, default_value = "255.255.255.0")]
-    netmask: Ipv4Addr,
     #[clap(short, long, default_value = "var/conf/install.yml")]
     config: PathBuf,
 }
@@ -141,26 +149,84 @@ type QueryRx = mpsc::Receiver<(WayfinderRequest, oneshot::Sender<WayfinderRespon
 // testable.  Only the local TAP device touches the kernel, so we hide it behind
 // a trait that a fake can implement in unit tests.
 
-/// A mesh interface: a [`Link`] over the in-process duplex end of a link
-/// transport.  Both the real binary and the tests use this exact type.
-type MeshLink = Link<FromTokio<tokio::io::DuplexStream>>;
-
 /// The local end of the host network: read/write whole link-layer frames.
 /// Abstracted so the event loop can be driven against a fake in tests instead
 /// of a real kernel TUN/TAP device.
-trait TapIo {
+trait AsyncIo {
     /// Receive one frame from the device into `buf`, returning its length.
-    fn recv(&self, buf: &mut [u8]) -> impl Future<Output = std::io::Result<usize>>;
+    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize>;
     /// Write one frame to the device.
-    fn send(&self, buf: &[u8]) -> impl Future<Output = std::io::Result<usize>>;
+    async fn send(&self, buf: &[u8]) -> std::io::Result<usize>;
 }
 
-impl TapIo for tun_rs::AsyncDevice {
+impl AsyncIo for tun_rs::AsyncDevice {
     async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         tun_rs::AsyncDevice::recv(self, buf).await
     }
     async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
         tun_rs::AsyncDevice::send(self, buf).await
+    }
+}
+
+pub struct Link {
+    socket: UnixDatagram,
+    buffer: [u8; 1500],
+}
+
+impl Link {
+    pub fn new(socket: UnixDatagram) -> Self {
+        Self {
+            socket,
+            buffer: [0u8; 1500],
+        }
+    }
+
+    pub async fn receive<Ident: MeshIdentifier + 'static>(
+        &mut self,
+    ) -> Result<&LinkFrame<Ident>, LinkError> {
+        // The socket is message-oriented (a datagram per frame), so a single
+        // recv yields exactly one whole frame — no buffering or reassembly.
+        let n = self.socket.recv(&mut self.buffer).await.map_err(|e| {
+            tracing::error!("Error reading from socket: {:?}", e);
+            LinkError::Io
+        })?;
+        LinkFrame::ref_from_bytes(&self.buffer[..n]).map_err(|_| LinkError::Io)
+    }
+
+    pub async fn send<Ident: MeshIdentifier + 'static>(
+        &mut self,
+        origin_ident: Ident,
+        data: &LinkFrameData<'_, Ident>,
+    ) -> Result<usize, LinkError> {
+        let mut idx = 0;
+        self.buffer[0..size_of::<Ident>()].copy_from_slice(origin_ident.as_bytes());
+        idx += size_of::<Ident>();
+
+        self.buffer[idx..(idx + size_of::<Ident>())].copy_from_slice(data.dst.as_bytes());
+        idx += size_of::<Ident>();
+
+        // Protocol is stored and compared native-endian throughout (matching
+        // `LinkFrame`'s zerocopy reads and the engine's EtherType constants),
+        // so write the native bytes — not big-endian.
+        self.buffer[idx..(idx + size_of::<u16>())].copy_from_slice(data.protocol.as_bytes());
+        idx += size_of::<u16>();
+
+        self.buffer[idx..(idx + data.payload.len())].copy_from_slice(data.payload);
+        idx += data.payload.len();
+
+        tracing::trace!("Publishing from {:?} to {:?}", origin_ident, data.dst);
+        tracing::trace!("{}", pretty_hex(&&self.buffer[..idx]));
+
+        self.socket.send(&self.buffer[..idx]).await.map_err(|e| {
+            tracing::error!("Error sending to socket: {:?}", e);
+            LinkError::Io
+        })?;
+
+        Ok(idx)
+    }
+
+    pub fn read(&self, n: usize) -> &[u8] {
+        &self.buffer[..n]
     }
 }
 
@@ -203,20 +269,31 @@ async fn run_tcp_server(addr: SocketAddr, query_tx: QueryTx) -> anyhow::Result<(
     }
 }
 
+async fn handle_connectionless(buf: &[u8], query_tx: QueryTx) -> anyhow::Result<Vec<u8>> {
+    let request = WayfinderRequest::decode(buf)?;
+
+    let (resp_tx, resp_rx) = oneshot::channel();
+    query_tx.send((request, resp_tx)).await?;
+
+    let response = resp_rx.await?;
+    let mut out = Vec::new();
+    response.encode(&mut out)?;
+    Ok(out)
+}
+
 async fn run_unix_server(path: PathBuf, query_tx: QueryTx) -> anyhow::Result<()> {
     if std::fs::metadata(&path).is_ok() {
         std::fs::remove_file(&path)?;
     }
-    let listener = UnixListener::bind(&path)?;
+    let listener = UnixDatagram::bind(&path)?;
     tracing::info!("management API listening on unix socket {}", path.display());
+    let mut buf = vec![0u8; 65535];
     loop {
-        let (stream, _) = listener.accept().await?;
-        let tx = query_tx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = serve_stream(stream, tx).await {
-                tracing::warn!("management stream error: {e}");
-            }
-        });
+        let (len, peer) = listener.recv_from(&mut buf).await?;
+        let response = handle_connectionless(&buf[..len], query_tx.clone()).await?;
+        let _ = listener
+            .send_to(&response, &peer.as_pathname().unwrap())
+            .await;
     }
 }
 
@@ -226,37 +303,21 @@ async fn run_udp_server(addr: SocketAddr, query_tx: QueryTx) -> anyhow::Result<(
     let mut buf = vec![0u8; 65535];
     loop {
         let (len, peer) = socket.recv_from(&mut buf).await?;
-        let request = match WayfinderRequest::decode(&buf[..len]) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("bad management request from {peer}: {e}");
-                continue;
-            }
-        };
-        let (resp_tx, resp_rx) = oneshot::channel();
-        if query_tx.send((request, resp_tx)).await.is_err() {
-            break;
-        }
-        if let Ok(response) = resp_rx.await {
-            let mut out = Vec::new();
-            if response.encode(&mut out).is_ok() {
-                let _ = socket.send_to(&out, peer).await;
-            }
-        }
+        let response = handle_connectionless(&buf[..len], query_tx.clone()).await?;
+        let _ = socket.send_to(&response, peer).await;
     }
-    Ok(())
 }
 
 // ── event loop ──────────────────────────────────────────────────────────────
 
 /// All the long-lived state the router event loop operates on, bundled so that
 /// [`EventLoop::run_once`] can be driven deterministically in tests (with a
-/// fake [`TapIo`] and in-process [`MeshLink`]s) instead of from `main`.
-struct EventLoop<Tap: TapIo> {
+/// fake [`AsyncIo`] and in-process [`MeshLink`]s) instead of from `main`.
+struct EventLoop<Tap: AsyncIo> {
     /// The local host network device.
     tap: Tap,
     /// The mesh interfaces, indexed by interface index.
-    interfaces: Vec<MeshLink>,
+    interfaces: Vec<Link>,
     /// The routing engine for this node.
     router: CentralRouter<[u8; 6]>,
     /// Management-API queries forwarded from the server tasks.
@@ -281,7 +342,7 @@ struct LoopOutput {
     local: Option<Vec<u8>>,
 }
 
-impl<Tap: TapIo> EventLoop<Tap> {
+impl<Tap: AsyncIo> EventLoop<Tap> {
     /// Run a single iteration: wait for whichever happens first — a frame from
     /// a mesh interface, a frame from the local TAP, a management query, or the
     /// periodic-broadcast timer — process it, then deliver any inner frame to
@@ -318,11 +379,13 @@ impl<Tap: TapIo> EventLoop<Tap> {
                     }
                 },
                 Ok(len) = tap.recv(rx_buffer) => {
+                    tracing::debug!("tap received frame of length {}", len);
                     // The TAP hands us a full Ethernet frame:
                     // [dst MAC:6][src MAC:6][ethertype:2][payload...].  Route by
                     // the destination MAC — which *is* the mesh Ident — and
                     // carry the whole frame across the mesh untouched.
                     let eth = &rx_buffer[..len];
+                    tracing::debug!("{}", pretty_hex::pretty_hex(&eth));
                     let mesh = if eth.len() >= 14 {
                         let mut dst_mac = [0u8; 6];
                         dst_mac.copy_from_slice(&eth[0..6]);
@@ -358,6 +421,8 @@ impl<Tap: TapIo> EventLoop<Tap> {
             }
         };
 
+        tracing::debug!("output: mesh={:?} local={:?}", output.mesh, output.local);
+
         // Hand any inner frame up to the local host by writing it to the TAP.
         if let Some(local) = output.local {
             tap.send(&local).await?;
@@ -365,12 +430,20 @@ impl<Tap: TapIo> EventLoop<Tap> {
 
         // Dispatch any outgoing frame onto the mesh.
         if let Some((dst, protocol, payload)) = output.mesh {
+            tracing::debug!(
+                "mesh output: dst={:?} protocol={:?} payload={:?}",
+                dst,
+                protocol,
+                payload
+            );
             let data = LinkFrameData {
                 dst,
                 protocol,
                 payload: &payload,
             };
+
             if let Some(egress) = router.get_egress_interface(dst) {
+                tracing::debug!("egress: {:?}", egress);
                 match egress {
                     EgressInterface::All => {
                         for iface in interfaces.iter_mut() {
@@ -402,27 +475,36 @@ async fn main() -> anyhow::Result<()> {
 
     let config: Config = serde_yaml::from_slice(std::fs::read_to_string(args.config)?.as_bytes())?;
 
-    tracing::info!("Welcome to 🌊 Wayfinder");
+    tracing::info!("Welcome to Wayfinder");
 
     let mut join_set: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
     let dev = DeviceBuilder::new()
         .layer(Layer::L2)
-        .name(args.device_name)
-        .ipv4(args.ip_address, args.netmask, None)
+        .name(&config.tap.device_name)
+        .ipv4(config.tap.ip_address, config.tap.netmask, None)
         .build_async()?;
 
     let mac_addr = dev.mac_address()?;
-    tracing::info!("Starting wayfinder with MAC address: {:?}", mac_addr);
+    tracing::info!(
+        "Starting wayfinder with MAC address: {:?}",
+        pretty_hex::simple_hex(&mac_addr)
+    );
+
+    tracing::debug!("{:#?}", config);
 
     let mut interfaces = vec![];
 
     for link in config.links {
         match link {
-            LinkConfig::Udp { socket_addr } => {
-                let udp_socket = UdpSocket::bind(socket_addr).await?;
+            LinkConfig::Udp {
+                bind_addr,
+                remote_addr,
+            } => {
+                let udp_socket = UdpSocket::bind(bind_addr).await?;
+                udp_socket.connect(remote_addr).await?;
 
-                let (mut dp1, dp2) = tokio::io::duplex(1500);
+                let (dp1, dp2) = tokio::net::UnixDatagram::pair()?;
 
                 join_set.spawn(async move {
                     let mut rx_buf = [0; 1500];
@@ -430,74 +512,29 @@ async fn main() -> anyhow::Result<()> {
                     loop {
                         tokio::select! {
                             Ok(bytes) = udp_socket.recv(&mut rx_buf) => {
-                                dp1.write_all(&rx_buf[..bytes]).await?;
+                                if let Err(e) = dp1.send(&rx_buf[..bytes]).await {
+                                    tracing::error!("Error sending to in-process socket: {:?}", e);
+                                }
                             },
-                            Ok(bytes) = dp1.read(&mut tx_buf) => {
-                                udp_socket.send(&tx_buf[..bytes]).await?;
+                            Ok(bytes) = dp1.recv(&mut tx_buf) => {
+                                // TODO: The UDP socket needs to be connected to the remote address before sending
+                                // Or we need to specify the remote address in the send call
+                                if let Err(e) = udp_socket.send(&tx_buf[..bytes]).await {
+                                    tracing::error!("Error sending to off-process socket: {:?}", e);
+                                }
                             },
                         }
                     }
                 });
 
-                interfaces.push(Link::new(FromTokio::new(dp2)));
-            }
-            LinkConfig::UnixServer { path } => {
-                if std::fs::metadata(&path).is_ok() {
-                    std::fs::remove_file(&path)?;
-                }
-                let listener = UnixListener::bind(path)?;
-                let (mut dp1, dp2) = tokio::io::duplex(1500);
-
-                join_set.spawn(async move {
-                    if let Ok((mut stream, _)) = listener.accept().await {
-                        let mut rx_buf = [0; 1500];
-                        let mut tx_buf = [0; 1500];
-                        loop {
-                            tokio::select! {
-                                Ok(bytes) = stream.read(&mut rx_buf) => {
-                                    if bytes == 0 { break; }
-                                    dp1.write_all(&rx_buf[..bytes]).await?;
-                                },
-                                Ok(bytes) = dp1.read(&mut tx_buf) => {
-                                    stream.write_all(&tx_buf[..bytes]).await?;
-                                },
-                            }
-                        }
-                    }
-                    Ok(())
-                });
-
-                interfaces.push(Link::new(FromTokio::new(dp2)));
-            }
-            LinkConfig::UnixClient { path } => {
-                let mut stream = UnixStream::connect(path).await?;
-                let (mut dp1, dp2) = tokio::io::duplex(1500);
-
-                join_set.spawn(async move {
-                    let mut rx_buf = [0; 1500];
-                    let mut tx_buf = [0; 1500];
-                    loop {
-                        tokio::select! {
-                            Ok(bytes) = stream.read(&mut rx_buf) => {
-                                if bytes == 0 { break; }
-                                dp1.write_all(&rx_buf[..bytes]).await?;
-                            },
-                            Ok(bytes) = dp1.read(&mut tx_buf) => {
-                                stream.write_all(&tx_buf[..bytes]).await?;
-                            },
-                        }
-                    }
-                    Ok(())
-                });
-
-                interfaces.push(Link::new(FromTokio::new(dp2)));
+                interfaces.push(Link::new(dp2));
             }
         }
     }
 
     // Optional management API server — queries are forwarded to the main loop
     // over a channel so the router is never shared across tasks.
-    let (query_tx, mut query_rx): (QueryTx, QueryRx) = mpsc::channel(16);
+    let (query_tx, query_rx): (QueryTx, QueryRx) = mpsc::channel(16);
 
     if let Some(server_cfg) = config.server {
         match server_cfg {
@@ -535,7 +572,6 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use wayfinder::batman::wire::{
         BATADV_BCAST, BATADV_IV_OGM, BATADV_UNICAST, BatmanOgmPacket, BatmanUnicastPacket,
         ETH_P_BATMAN,
@@ -543,7 +579,7 @@ mod tests {
 
     // ── fake TAP ───────────────────────────────────────────────────────────────
 
-    /// A [`TapIo`] backed by channels so tests can inject frames "from the host"
+    /// A [`AsyncIo`] backed by channels so tests can inject frames "from the host"
     /// and inspect frames the router writes "to the host".
     struct FakeTap {
         inbound: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
@@ -568,7 +604,7 @@ mod tests {
         }
     }
 
-    impl TapIo for FakeTap {
+    impl AsyncIo for FakeTap {
         async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
             let frame = self.inbound.lock().await.recv().await;
             match frame {
@@ -620,7 +656,7 @@ mod tests {
         /// Inject frames as if they arrived from the host on the TAP.
         tap_in: mpsc::Sender<Vec<u8>>,
         /// The far end of the single mesh interface's duplex.
-        far: tokio::io::DuplexStream,
+        far: tokio::net::UnixDatagram,
         /// Kept alive so the management-query channel stays open (its select
         /// branch must remain pending, not resolve to `None`).
         _qtx: QueryTx,
@@ -628,12 +664,12 @@ mod tests {
 
     fn harness(mac: [u8; 6]) -> Harness {
         let (tap, tap_in) = FakeTap::new();
-        let (near, far) = tokio::io::duplex(8192);
+        let (near, far) = tokio::net::UnixDatagram::pair().unwrap();
         let (qtx, qrx) = mpsc::channel(1);
         Harness {
             ev: EventLoop {
                 tap,
-                interfaces: vec![Link::new(FromTokio::new(near))],
+                interfaces: vec![Link::new(near)],
                 router: CentralRouter::<[u8; 6]>::new(mac),
                 query_rx: qrx,
                 mac_addr: mac,
@@ -670,7 +706,7 @@ mod tests {
 
         // Read the frame that landed on the (single) mesh interface.
         let mut buf = [0u8; 1500];
-        let n = h.far.read(&mut buf).await.unwrap();
+        let n = h.far.recv(&mut buf).await.unwrap();
         assert!(n >= 15);
         // wire: [src:6][dst:6][proto:2][batman payload...]
         assert_eq!(&buf[6..12], &[0xff; 6], "link dst should be broadcast");
@@ -696,13 +732,13 @@ mod tests {
             prev_sender: peer,
         };
         h.far
-            .write_all(&link_wire(peer, [0xff; 6], ogm.as_bytes()))
+            .send(&link_wire(peer, [0xff; 6], ogm.as_bytes()))
             .await
             .unwrap();
         h.step().await;
         // Drain the re-flooded OGM that run_once just put back on the wire.
         let mut scratch = [0u8; 1500];
-        let _ = h.far.read(&mut scratch).await.unwrap();
+        let _ = h.far.recv(&mut scratch).await.unwrap();
 
         // 2) Host sends a unicast frame to the peer's MAC.
         h.tap_in
@@ -712,7 +748,7 @@ mod tests {
         h.step().await;
 
         let mut buf = [0u8; 1500];
-        let n = h.far.read(&mut buf).await.unwrap();
+        let n = h.far.recv(&mut buf).await.unwrap();
         assert!(n >= 23);
         assert_eq!(&buf[6..12], &peer, "link dst should be the (direct) peer");
         assert_eq!(buf[14], BATADV_UNICAST, "should be a BATMAN unicast");
@@ -738,15 +774,45 @@ mod tests {
         };
         let mut batman = hdr.as_bytes().to_vec();
         batman.extend_from_slice(inner);
-        h.far
-            .write_all(&link_wire(peer, mac, &batman))
-            .await
-            .unwrap();
+        h.far.send(&link_wire(peer, mac, &batman)).await.unwrap();
 
         h.step().await;
 
         let sent = h.ev.tap.sent().await;
         assert_eq!(sent.len(), 1, "exactly one frame delivered to the TAP");
         assert_eq!(sent[0], inner, "inner frame delivered to the host verbatim");
+    }
+
+    /// Two datagrams arriving back-to-back on one interface must be processed
+    /// as two distinct frames. Regression test for `Link::receive` accumulating
+    /// into its buffer across calls and concatenating frames.
+    #[tokio::test]
+    async fn two_frames_on_one_interface_stay_distinct() {
+        let mac = [0xaa, 0, 0, 0, 0, 1];
+        let peer = [0xbc, 0, 0, 0, 0, 2];
+        let mut h = harness(mac);
+
+        let inners: [&[u8]; 2] = [b"first frame!!", b"second frame!"];
+        for inner in inners {
+            let hdr = BatmanUnicastPacket::<[u8; 6]> {
+                packet_type: BATADV_UNICAST,
+                version: 5,
+                ttl: 50,
+                dest: mac,
+            };
+            let mut batman = hdr.as_bytes().to_vec();
+            batman.extend_from_slice(inner);
+            h.far.send(&link_wire(peer, mac, &batman)).await.unwrap();
+        }
+
+        h.step().await;
+        h.step().await;
+
+        let sent = h.ev.tap.sent().await;
+        assert_eq!(
+            sent,
+            vec![inners[0].to_vec(), inners[1].to_vec()],
+            "each frame must be delivered intact, not concatenated"
+        );
     }
 }

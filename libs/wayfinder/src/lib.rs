@@ -222,6 +222,7 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
         }
     }
 
+    #[tracing::instrument(skip_all, level = "trace")]
     pub fn poll<'tx>(
         &mut self,
         now: core::time::Duration,
@@ -230,13 +231,14 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
         // 3. Handle BATMAN outgoing maintenance ticks
         let broadcast = Ident::BROADCAST;
         if let Some(ogm_payload) = self.batman.produce_periodic_broadcast(now, tx_buf) {
-            trace!("transmitting OGM");
-            // Flood the OGM out of every radio interface to map the surrounding topology
-            return Some(LinkFrameData {
+            let ogm = LinkFrameData {
                 dst: broadcast,
                 protocol: DEFAULT_BATMAN_ETHER_TYPE,
                 payload: ogm_payload,
-            });
+            };
+            trace!("constructed OGM: {:?}", ogm);
+            // Flood the OGM out of every radio interface to map the surrounding topology
+            return Some(ogm);
         }
         None
     }

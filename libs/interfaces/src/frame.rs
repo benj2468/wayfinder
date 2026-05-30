@@ -1,3 +1,5 @@
+use core::fmt::Debug;
+use core::hash::Hash;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub trait MeshIdentifier:
@@ -9,8 +11,8 @@ pub trait MeshIdentifier:
     + Immutable
     + Default
     + KnownLayout
-    + core::hash::Hash
-    + core::fmt::Debug
+    + Hash
+    + Debug
     + Send
     + Sync
 {
@@ -37,6 +39,7 @@ pub struct LinkFrame<Ident> {
 
 /// Data that a sender must construct when sending a packet. This is the same as LinkFrame, except is
 /// doesn't include the src, because that is applied by the link layer.
+#[derive(Debug)]
 pub struct LinkFrameData<'a, Ident> {
     pub dst: Ident,
     pub protocol: u16,

@@ -1772,6 +1772,7 @@ dependencies = [
  "etherparse",
  "futures",
  "libc",
+ "pretty-hex",
  "prost",
  "serde",
  "serde_yaml",
