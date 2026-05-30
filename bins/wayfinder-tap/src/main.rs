@@ -4,7 +4,6 @@
 mod config;
 mod executor;
 mod links;
-mod server;
 
 #[cfg(test)]
 mod tests;
@@ -18,7 +17,7 @@ use wayfinder::CentralRouter;
 use crate::config::{Args, Config, LinkConfig, ServerConfig};
 use crate::executor::EventLoop;
 use crate::links::Link;
-use crate::server::{QueryRx, QueryTx, run_tcp_server, run_udp_server, run_unix_server};
+use wayfinder_server::{QueryRx, QueryTx, run_tcp_server, run_udp_server, run_unix_server};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

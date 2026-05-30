@@ -1,0 +1,24 @@
+[package]
+name = "wayfinder-server"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["std"]
+# Enables the tokio-net transport listeners and the query channel that bridges
+# them to a single-threaded router loop. Without it the crate is `no_std` +
+# `alloc` and exposes only the `RouterAdapter` data-provider adapter.
+std = ["dep:tokio", "dep:tokio-util", "dep:futures", "dep:bytes", "dep:anyhow", "prost/std"]
+
+[dependencies]
+wayfinder.workspace = true
+wayfinder-protos.workspace = true
+zerocopy.workspace = true
+tracing.workspace = true
+prost = { version = "0.13", default-features = false }
+
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+bytes = { version = "1", optional = true }
+anyhow = { workspace = true, optional = true }

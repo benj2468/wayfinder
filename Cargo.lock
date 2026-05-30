@@ -1762,6 +1762,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "wayfinder-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures",
+ "prost",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "wayfinder",
+ "wayfinder-protos",
+ "zerocopy",
+]
+
+[[package]]
 name = "wayfinder-tap"
 version = "0.1.0"
 dependencies = [
@@ -1783,6 +1799,7 @@ dependencies = [
  "tun-rs",
  "wayfinder",
  "wayfinder-protos",
+ "wayfinder-server",
  "zerocopy",
 ]
 

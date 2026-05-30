@@ -9,8 +9,9 @@ use wayfinder::EgressInterface;
 use wayfinder::interfaces::frame::{LinkFrameData, MeshIdentifier};
 use wayfinder_protos::service::WayfinderService;
 
+use wayfinder_server::{QueryRx, RouterAdapter};
+
 use crate::links::{AsyncIo, Link};
-use crate::server::{QueryRx, RouterAdapter};
 
 /// All the long-lived state the router event loop operates on, bundled so that
 /// [`EventLoop::run_once`] can be driven deterministically in tests (with a
@@ -110,7 +111,7 @@ impl<Tap: AsyncIo> EventLoop<Tap> {
                     LoopOutput { mesh, local: None }
                 },
                 Some((request, resp_tx)) = query_rx.recv() => {
-                    let response = WayfinderService::new(RouterAdapter(&*router)).handle(request);
+                    let response = WayfinderService::new(RouterAdapter::new(&*router)).handle(request);
                     let _ = resp_tx.send(response);
                     LoopOutput { mesh: None, local: None }
                 },

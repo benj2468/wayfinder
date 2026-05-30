@@ -108,9 +108,11 @@ The workspace is organized into several libraries plus one binary:
 
 **libs/wayfinder-protos** - Management API (`prost`/protobuf, package `wayfinder.v1alpha`): request/response envelopes for querying node info, the routing table, the link-quality table, and route resolution. `buf lint` runs from this crate.
 
+**libs/wayfinder-server** - The management-API server. Two layers: `RouterAdapter` (`no_std` + `alloc`) projects a borrowed `CentralRouter` through the `WayfinderDataProvider` trait; the transport layer (gated behind the `std` feature) provides the per-transport listener loops (`run_tcp_server`/`run_unix_server`/`run_udp_server` over tokio net) and the `QueryTx`/`QueryRx` channel that forwards queries to the single-threaded router loop. The `std` feature pulls in tokio, tokio-util, futures, bytes, anyhow, and `prost/std`.
+
 **libs/wayfinder-test** - Test-only harness: a `Switch` simulator and `TestRouter` wrapper for multi-node integration tests over `tokio` mpsc channels (no hardware).
 
-**bins/wayfinder-tap** - The runnable node: bridges a TAP device (`Layer::L2`) onto the mesh, carries links over UDP/Unix sockets, and exposes the management API over TCP/Unix/UDP.
+**bins/wayfinder-tap** - The runnable node: bridges a TAP device (`Layer::L2`) onto the mesh, carries links over UDP/Unix sockets, and exposes the management API (via `wayfinder-server`) over TCP/Unix/UDP.
 
 **libs/rylr998** - REYAX RYLR998/RYLR498 LoRa module driver:
 - `RylrClient<S>`: Async AT command interface for LoRa modules

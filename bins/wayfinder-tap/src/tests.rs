@@ -8,9 +8,10 @@ use wayfinder::batman::wire::{
 };
 use zerocopy::IntoBytes;
 
+use wayfinder_server::QueryTx;
+
 use crate::executor::EventLoop;
 use crate::links::{AsyncIo, Link};
-use crate::server::QueryTx;
 
 // ── fake TAP ───────────────────────────────────────────────────────────────
 
