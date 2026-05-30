@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{future::Future, net::SocketAddr, path::PathBuf};
 
 use bytes::Bytes;
 use clap::Parser;
@@ -134,6 +134,36 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
 type QueryTx = mpsc::Sender<(WayfinderRequest, oneshot::Sender<WayfinderResponse>)>;
 type QueryRx = mpsc::Receiver<(WayfinderRequest, oneshot::Sender<WayfinderResponse>)>;
 
+// ── TAP abstraction ───────────────────────────────────────────────────────────
+//
+// Each mesh interface is a `Link` over an in-process duplex (the link-transport
+// tasks bridge the real socket to it), so interfaces need no abstraction to be
+// testable.  Only the local TAP device touches the kernel, so we hide it behind
+// a trait that a fake can implement in unit tests.
+
+/// A mesh interface: a [`Link`] over the in-process duplex end of a link
+/// transport.  Both the real binary and the tests use this exact type.
+type MeshLink = Link<FromTokio<tokio::io::DuplexStream>>;
+
+/// The local end of the host network: read/write whole link-layer frames.
+/// Abstracted so the event loop can be driven against a fake in tests instead
+/// of a real kernel TUN/TAP device.
+trait TapIo {
+    /// Receive one frame from the device into `buf`, returning its length.
+    fn recv(&self, buf: &mut [u8]) -> impl Future<Output = std::io::Result<usize>>;
+    /// Write one frame to the device.
+    fn send(&self, buf: &[u8]) -> impl Future<Output = std::io::Result<usize>>;
+}
+
+impl TapIo for tun_rs::AsyncDevice {
+    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        tun_rs::AsyncDevice::recv(self, buf).await
+    }
+    async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
+        tun_rs::AsyncDevice::send(self, buf).await
+    }
+}
+
 // ── Server helpers ────────────────────────────────────────────────────────────
 
 /// Handle one stream-based connection (TCP or Unix socket) using
@@ -215,6 +245,149 @@ async fn run_udp_server(addr: SocketAddr, query_tx: QueryTx) -> anyhow::Result<(
         }
     }
     Ok(())
+}
+
+// ── event loop ──────────────────────────────────────────────────────────────
+
+/// All the long-lived state the router event loop operates on, bundled so that
+/// [`EventLoop::run_once`] can be driven deterministically in tests (with a
+/// fake [`TapIo`] and in-process [`MeshLink`]s) instead of from `main`.
+struct EventLoop<Tap: TapIo> {
+    /// The local host network device.
+    tap: Tap,
+    /// The mesh interfaces, indexed by interface index.
+    interfaces: Vec<MeshLink>,
+    /// The routing engine for this node.
+    router: CentralRouter<[u8; 6]>,
+    /// Management-API queries forwarded from the server tasks.
+    query_rx: QueryRx,
+    /// This node's mesh identifier (its TAP MAC address).
+    mac_addr: [u8; 6],
+    /// Reference instant for periodic-broadcast timing.
+    start: std::time::Instant,
+    /// Receive scratchpad for frames read from the TAP.
+    rx_buffer: [u8; 1500],
+    /// Transmit scratchpad the router builds outgoing frames into.
+    tx_buffer: [u8; 1500],
+}
+
+/// One iteration's worth of work, fully owned so that no borrow of the rx/tx
+/// scratchpads or the interface set escapes the `select!`.
+struct LoopOutput {
+    /// `(destination ident, protocol, serialized payload)` to transmit onto
+    /// the mesh, dispatched via `get_egress_interface`.
+    mesh: Option<([u8; 6], u16, Vec<u8>)>,
+    /// Inner frame to write back to the local TAP device.
+    local: Option<Vec<u8>>,
+}
+
+impl<Tap: TapIo> EventLoop<Tap> {
+    /// Run a single iteration: wait for whichever happens first — a frame from
+    /// a mesh interface, a frame from the local TAP, a management query, or the
+    /// periodic-broadcast timer — process it, then deliver any inner frame to
+    /// the TAP and dispatch any outgoing frame onto the mesh.
+    async fn run_once(&mut self) -> anyhow::Result<()> {
+        // Destructure into disjoint field borrows so the `select!` can hold a
+        // mutable borrow of the interfaces alongside the router and buffers.
+        let EventLoop {
+            tap,
+            interfaces,
+            router,
+            query_rx,
+            mac_addr,
+            start,
+            rx_buffer,
+            tx_buffer,
+        } = self;
+        let mac_addr = *mac_addr;
+        let start = *start;
+
+        let output: LoopOutput = {
+            let mut futures = interfaces
+                .iter_mut()
+                .enumerate()
+                .map(|(i, iface)| async move { iface.receive().await.map(|frame| (i, frame)).ok() })
+                .collect::<FuturesOrdered<_>>();
+
+            tokio::select! {
+                Some(Some((idx, frame))) = futures.next() => {
+                    let rx = router.handle_frame(idx, frame, tx_buffer);
+                    LoopOutput {
+                        mesh: rx.forward.map(|f| (f.dst, f.protocol, f.payload.to_vec())),
+                        local: rx.deliver_local.map(|inner| inner.to_vec()),
+                    }
+                },
+                Ok(len) = tap.recv(rx_buffer) => {
+                    // The TAP hands us a full Ethernet frame:
+                    // [dst MAC:6][src MAC:6][ethertype:2][payload...].  Route by
+                    // the destination MAC — which *is* the mesh Ident — and
+                    // carry the whole frame across the mesh untouched.
+                    let eth = &rx_buffer[..len];
+                    let mesh = if eth.len() >= 14 {
+                        let mut dst_mac = [0u8; 6];
+                        dst_mac.copy_from_slice(&eth[0..6]);
+                        // The I/G bit (LSB of the first octet) marks multicast /
+                        // broadcast destinations, which we flood across the mesh.
+                        let dest = if dst_mac[0] & 0x01 != 0 {
+                            <[u8; 6]>::BROADCAST
+                        } else {
+                            dst_mac
+                        };
+                        router
+                            .handle_local(dest, eth, tx_buffer)
+                            .ok()
+                            .map(|f| (f.dst, f.protocol, f.payload.to_vec()))
+                    } else {
+                        None
+                    };
+                    LoopOutput { mesh, local: None }
+                },
+                Some((request, resp_tx)) = query_rx.recv() => {
+                    let response = WayfinderService::new(RouterAdapter(&*router)).handle(request);
+                    let _ = resp_tx.send(response);
+                    LoopOutput { mesh: None, local: None }
+                },
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    LoopOutput {
+                        mesh: router
+                            .poll(start.elapsed(), tx_buffer)
+                            .map(|f| (f.dst, f.protocol, f.payload.to_vec())),
+                        local: None,
+                    }
+                }
+            }
+        };
+
+        // Hand any inner frame up to the local host by writing it to the TAP.
+        if let Some(local) = output.local {
+            tap.send(&local).await?;
+        }
+
+        // Dispatch any outgoing frame onto the mesh.
+        if let Some((dst, protocol, payload)) = output.mesh {
+            let data = LinkFrameData {
+                dst,
+                protocol,
+                payload: &payload,
+            };
+            if let Some(egress) = router.get_egress_interface(dst) {
+                match egress {
+                    EgressInterface::All => {
+                        for iface in interfaces.iter_mut() {
+                            iface.send(mac_addr, &data).await?;
+                        }
+                    }
+                    EgressInterface::Interface(iface_idx) => {
+                        if let Some(iface) = interfaces.get_mut(iface_idx) {
+                            iface.send(mac_addr, &data).await?;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -343,105 +516,237 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut router = CentralRouter::<[u8; 6]>::new(mac_addr);
-
-    let start = std::time::Instant::now();
-
-    let mut rx_buffer = [0u8; 1500];
-    let mut tx_buffer = [0u8; 1500];
-
-    // One iteration's worth of work, fully owned so that no borrow of the
-    // rx/tx scratchpads or the interface set escapes the `select!`.
-    struct LoopOutput {
-        /// `(destination ident, protocol, serialized payload)` to transmit
-        /// onto the mesh, chosen via `get_egress_interface`.
-        mesh: Option<([u8; 6], u16, Vec<u8>)>,
-        /// Inner frame to write back to the local TAP device.
-        local: Option<Vec<u8>>,
-    }
+    let mut event_loop = EventLoop {
+        tap: dev,
+        interfaces,
+        router: CentralRouter::<[u8; 6]>::new(mac_addr),
+        query_rx,
+        mac_addr,
+        start: std::time::Instant::now(),
+        rx_buffer: [0u8; 1500],
+        tx_buffer: [0u8; 1500],
+    };
 
     loop {
-        let output: LoopOutput = {
-            let mut futures = interfaces
-                .iter_mut()
-                .enumerate()
-                .map(|(i, iface)| async move { iface.receive().await.map(|frame| (i, frame)).ok() })
-                .collect::<FuturesOrdered<_>>();
+        event_loop.run_once().await?;
+    }
+}
 
-            tokio::select! {
-                Some(Some((idx, frame))) = futures.next() => {
-                    let rx = router.handle_frame(idx, frame, &mut tx_buffer);
-                    LoopOutput {
-                        mesh: rx.forward.map(|f| (f.dst, f.protocol, f.payload.to_vec())),
-                        local: rx.deliver_local.map(|inner| inner.to_vec()),
-                    }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use wayfinder::batman::wire::{
+        BATADV_BCAST, BATADV_IV_OGM, BATADV_UNICAST, BatmanOgmPacket, BatmanUnicastPacket,
+        ETH_P_BATMAN,
+    };
+
+    // ── fake TAP ───────────────────────────────────────────────────────────────
+
+    /// A [`TapIo`] backed by channels so tests can inject frames "from the host"
+    /// and inspect frames the router writes "to the host".
+    struct FakeTap {
+        inbound: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+        outbound: tokio::sync::Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl FakeTap {
+        fn new() -> (Self, mpsc::Sender<Vec<u8>>) {
+            let (tx, rx) = mpsc::channel(16);
+            (
+                Self {
+                    inbound: tokio::sync::Mutex::new(rx),
+                    outbound: tokio::sync::Mutex::new(Vec::new()),
                 },
-                Ok(len) = dev.recv(&mut rx_buffer) => {
-                    // The TAP hands us a full Ethernet frame:
-                    // [dst MAC:6][src MAC:6][ethertype:2][payload...].
-                    // Route by the destination MAC, which *is* the mesh Ident,
-                    // and carry the whole frame across the mesh untouched.
-                    let eth = &rx_buffer[..len];
-                    let mesh = if eth.len() >= 14 {
-                        let mut dst_mac = [0u8; 6];
-                        dst_mac.copy_from_slice(&eth[0..6]);
-                        // The I/G bit (LSB of the first octet) marks multicast /
-                        // broadcast destinations, which we flood across the mesh.
-                        let dest = if dst_mac[0] & 0x01 != 0 {
-                            <[u8; 6]>::BROADCAST
-                        } else {
-                            dst_mac
-                        };
-                        router
-                            .handle_local(dest, eth, &mut tx_buffer)
-                            .ok()
-                            .map(|f| (f.dst, f.protocol, f.payload.to_vec()))
-                    } else {
-                        None
-                    };
-                    LoopOutput { mesh, local: None }
-                },
-                Some((request, resp_tx)) = query_rx.recv() => {
-                    let response = WayfinderService::new(RouterAdapter(&router)).handle(request);
-                    let _ = resp_tx.send(response);
-                    LoopOutput { mesh: None, local: None }
-                },
-                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                    LoopOutput {
-                        mesh: router
-                            .poll(start.elapsed(), &mut tx_buffer)
-                            .map(|f| (f.dst, f.protocol, f.payload.to_vec())),
-                        local: None,
-                    }
+                tx,
+            )
+        }
+
+        /// Frames the router has written to the TAP so far.
+        async fn sent(&self) -> Vec<Vec<u8>> {
+            self.outbound.lock().await.clone()
+        }
+    }
+
+    impl TapIo for FakeTap {
+        async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let frame = self.inbound.lock().await.recv().await;
+            match frame {
+                Some(f) => {
+                    let n = f.len().min(buf.len());
+                    buf[..n].copy_from_slice(&f[..n]);
+                    Ok(n)
                 }
+                // Channel exhausted: stay pending so this select branch never
+                // wins (the test always injects before driving run_once).
+                None => std::future::pending().await,
             }
+        }
+
+        async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
+            self.outbound.lock().await.push(buf.to_vec());
+            Ok(buf.len())
+        }
+    }
+
+    // ── wire helpers ─────────────────────────────────────────────────────────
+
+    /// Serialize a `LinkFrame<[u8;6]>`: `[src][dst][proto native][payload]`.
+    /// Protocol is written native-endian to match how the link layer (and
+    /// `build_frame` in the test harness) encodes it.
+    fn link_wire(src: [u8; 6], dst: [u8; 6], payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&src);
+        v.extend_from_slice(&dst);
+        v.extend_from_slice(&ETH_P_BATMAN.to_ne_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// Build a raw Ethernet frame: `[dst MAC][src MAC][ethertype][payload]`.
+    fn eth_frame(dst: [u8; 6], src: [u8; 6], payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&dst);
+        v.extend_from_slice(&src);
+        v.extend_from_slice(&[0x08, 0x00]); // IPv4 ethertype, arbitrary here
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// Boilerplate for a single-interface router under test: the `EventLoop`
+    /// plus the test-side handles for injecting/observing host and mesh frames.
+    struct Harness {
+        ev: EventLoop<FakeTap>,
+        /// Inject frames as if they arrived from the host on the TAP.
+        tap_in: mpsc::Sender<Vec<u8>>,
+        /// The far end of the single mesh interface's duplex.
+        far: tokio::io::DuplexStream,
+        /// Kept alive so the management-query channel stays open (its select
+        /// branch must remain pending, not resolve to `None`).
+        _qtx: QueryTx,
+    }
+
+    fn harness(mac: [u8; 6]) -> Harness {
+        let (tap, tap_in) = FakeTap::new();
+        let (near, far) = tokio::io::duplex(8192);
+        let (qtx, qrx) = mpsc::channel(1);
+        Harness {
+            ev: EventLoop {
+                tap,
+                interfaces: vec![Link::new(FromTokio::new(near))],
+                router: CentralRouter::<[u8; 6]>::new(mac),
+                query_rx: qrx,
+                mac_addr: mac,
+                start: std::time::Instant::now(),
+                rx_buffer: [0u8; 1500],
+                tx_buffer: [0u8; 1500],
+            },
+            tap_in,
+            far,
+            _qtx: qtx,
+        }
+    }
+
+    impl Harness {
+        async fn step(&mut self) {
+            self.ev.run_once().await.unwrap();
+        }
+    }
+
+    // ── tests ──────────────────────────────────────────────────────────────────
+
+    /// A broadcast/multicast Ethernet frame from the host is wrapped as a
+    /// BATMAN broadcast and flooded onto the mesh.
+    #[tokio::test]
+    async fn tap_broadcast_frame_floods_to_mesh() {
+        let mac = [0xaa, 0, 0, 0, 0, 1];
+        let mut h = harness(mac);
+
+        h.tap_in
+            .send(eth_frame([0xff; 6], mac, b"arp who-has"))
+            .await
+            .unwrap();
+        h.step().await;
+
+        // Read the frame that landed on the (single) mesh interface.
+        let mut buf = [0u8; 1500];
+        let n = h.far.read(&mut buf).await.unwrap();
+        assert!(n >= 15);
+        // wire: [src:6][dst:6][proto:2][batman payload...]
+        assert_eq!(&buf[6..12], &[0xff; 6], "link dst should be broadcast");
+        assert_eq!(buf[14], BATADV_BCAST, "should be a BATMAN broadcast");
+    }
+
+    /// After learning a peer via its OGM, a unicast Ethernet frame to that
+    /// peer's MAC is wrapped as a BATMAN unicast and routed to it.
+    #[tokio::test]
+    async fn tap_unicast_frame_routes_to_learned_peer() {
+        let mac = [0xaa, 0, 0, 0, 0, 1];
+        let peer = [0xbc, 0, 0, 0, 0, 2];
+        let mut h = harness(mac);
+
+        // 1) Peer announces itself via an OGM (delivered on the interface).
+        let ogm = BatmanOgmPacket::<[u8; 6]> {
+            packet_type: BATADV_IV_OGM,
+            version: 5,
+            ttl: 50,
+            tq: 255,
+            seqno: 1u32.to_be(),
+            orig: peer,
+            prev_sender: peer,
         };
+        h.far
+            .write_all(&link_wire(peer, [0xff; 6], ogm.as_bytes()))
+            .await
+            .unwrap();
+        h.step().await;
+        // Drain the re-flooded OGM that run_once just put back on the wire.
+        let mut scratch = [0u8; 1500];
+        let _ = h.far.read(&mut scratch).await.unwrap();
 
-        // Hand any inner frame up to the local host by writing it to the TAP.
-        if let Some(local) = output.local {
-            dev.send(&local).await?;
-        }
+        // 2) Host sends a unicast frame to the peer's MAC.
+        h.tap_in
+            .send(eth_frame(peer, mac, b"hello peer"))
+            .await
+            .unwrap();
+        h.step().await;
 
-        // Dispatch any outgoing frame onto the mesh.
-        if let Some((dst, protocol, payload)) = output.mesh {
-            let data = LinkFrameData {
-                dst,
-                protocol,
-                payload: &payload,
-            };
-            if let Some(egress) = router.get_egress_interface(dst) {
-                match egress {
-                    EgressInterface::All => {
-                        for iface in interfaces.iter_mut() {
-                            iface.send(mac_addr, &data).await?;
-                        }
-                    }
-                    EgressInterface::Interface(iface_idx) => {
-                        let iface = interfaces.get_mut(iface_idx).unwrap();
-                        iface.send(mac_addr, &data).await?;
-                    }
-                }
-            }
-        }
+        let mut buf = [0u8; 1500];
+        let n = h.far.read(&mut buf).await.unwrap();
+        assert!(n >= 23);
+        assert_eq!(&buf[6..12], &peer, "link dst should be the (direct) peer");
+        assert_eq!(buf[14], BATADV_UNICAST, "should be a BATMAN unicast");
+        // BatmanUnicastPacket = [type:1][version:1][ttl:1][dest:6]; dest follows
+        // the 14-byte link header + 3 header bytes => buf[17..23].
+        assert_eq!(&buf[17..23], &peer, "unicast dest should be the peer");
+    }
+
+    /// A BATMAN unicast addressed to us is unwrapped and the inner frame is
+    /// written to the local TAP.
+    #[tokio::test]
+    async fn mesh_unicast_for_self_is_written_to_tap() {
+        let mac = [0xaa, 0, 0, 0, 0, 1];
+        let peer = [0xbc, 0, 0, 0, 0, 2];
+        let mut h = harness(mac);
+
+        let inner = b"INNER ETHERNET FRAME FOR THE HOST";
+        let hdr = BatmanUnicastPacket::<[u8; 6]> {
+            packet_type: BATADV_UNICAST,
+            version: 5,
+            ttl: 50,
+            dest: mac,
+        };
+        let mut batman = hdr.as_bytes().to_vec();
+        batman.extend_from_slice(inner);
+        h.far
+            .write_all(&link_wire(peer, mac, &batman))
+            .await
+            .unwrap();
+
+        h.step().await;
+
+        let sent = h.ev.tap.sent().await;
+        assert_eq!(sent.len(), 1, "exactly one frame delivered to the TAP");
+        assert_eq!(sent[0], inner, "inner frame delivered to the host verbatim");
     }
 }
