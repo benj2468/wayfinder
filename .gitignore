@@ -24,3 +24,6 @@ rustc-ice-*.txt
 
 # Pre-commit
 .pre-commit-config.yaml
+
+# Coverage
+coverage.xml
