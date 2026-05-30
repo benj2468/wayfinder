@@ -12,6 +12,18 @@ pub enum RoutingAction<Ident> {
     /// The packet has reached its final destination (this node).
     /// Hand it up to the local application layer.
     DeliverLocal,
+
+    /// The packet was a mesh broadcast (e.g. a flooded ARP) that is new to
+    /// this node, so it must be acted on twice: handed up to the local
+    /// application layer *and* re-flooded to neighbours.  The engine has
+    /// already written the re-flood frame (with a decremented TTL) into the
+    /// `reply` buffer, addressed to the contained identifier — normally
+    /// [`MeshIdentifier::BROADCAST`].  The caller forwards that frame and, in
+    /// addition, delivers the inner payload locally as it would for
+    /// [`RoutingAction::DeliverLocal`].
+    ///
+    /// [`MeshIdentifier::BROADCAST`]: crate::frame::MeshIdentifier::BROADCAST
+    DeliverLocalAndForward(Ident),
 }
 
 pub trait MeshRoutingEngine<Ident> {

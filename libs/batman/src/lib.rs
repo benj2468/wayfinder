@@ -31,6 +31,13 @@ pub struct BatmanEngine<const MAX_ORIGINATORS: usize, Ident> {
     pub self_ident: Ident,
     pub sequence_number: u32,
     pub originator_table: HVec<OriginatorRecord<Ident>, MAX_ORIGINATORS>,
+    /// Highest broadcast sequence number seen per originator, used to drop
+    /// duplicate flooded broadcasts.  Broadcast and OGM sequence numbers are
+    /// independent number spaces, so this is tracked separately from
+    /// [`OriginatorRecord::last_seqno`].  An entry is created on first sight
+    /// of an originator's broadcast; the table is bounded at `MAX_ORIGINATORS`
+    /// and further originators are dropped once it is full.
+    pub broadcast_seqno: HVec<(Ident, u32), MAX_ORIGINATORS>,
 }
 
 impl<const MAX_ORIGINATORS: usize, Ident> BatmanEngine<MAX_ORIGINATORS, Ident> {
@@ -39,6 +46,7 @@ impl<const MAX_ORIGINATORS: usize, Ident> BatmanEngine<MAX_ORIGINATORS, Ident> {
             self_ident,
             sequence_number: 0,
             originator_table: HVec::new(),
+            broadcast_seqno: HVec::new(),
         }
     }
 }

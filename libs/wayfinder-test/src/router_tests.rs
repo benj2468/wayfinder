@@ -651,7 +651,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_route_for_broadcast_returns_all_interfaces() {
         let (tx_0, _rx_0, _port_0) = make_port_pair(64);
-        let mut router_a: TestRouter<u8> = TestRouter::new(1, vec![tx_0]);
+        let router_a: TestRouter<u8> = TestRouter::new(1, vec![tx_0]);
 
         let (next_hop, egress) = router_a.router.resolve_route(u8::BROADCAST);
         assert_eq!(next_hop, u8::BROADCAST);

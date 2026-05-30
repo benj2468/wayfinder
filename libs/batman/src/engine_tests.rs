@@ -6,7 +6,10 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
     BatmanEngine,
-    wire::{BATADV_IV_OGM, BATADV_UNICAST, BatmanOgmPacket, BatmanUnicastPacket, ETH_P_BATMAN},
+    wire::{
+        BATADV_BCAST, BATADV_IV_OGM, BATADV_UNICAST, BatmanBroadcastPacket, BatmanOgmPacket,
+        BatmanUnicastPacket, ETH_P_BATMAN,
+    },
 };
 
 // Helper to create a LinkFrame from raw bytes
@@ -49,6 +52,22 @@ fn make_unicast(dest: u8, ttl: u8, payload: &[u8]) -> Vec<u8> {
     };
     data.extend_from_slice(unicast.as_bytes());
     data.extend_from_slice(payload);
+    data
+}
+
+// Helper to create a broadcast packet wrapping an inner (e.g. ARP) frame.
+// Wire layout: [BatmanBroadcastPacket header][inner payload ...].
+fn make_broadcast(orig: u8, seqno: u32, ttl: u8, inner: &[u8]) -> Vec<u8> {
+    let mut data = Vec::new();
+    let bcast = BatmanBroadcastPacket {
+        packet_type: BATADV_BCAST,
+        version: 5,
+        ttl,
+        seqno: seqno.to_be(), // Network byte order, like the OGM seqno
+        orig,
+    };
+    data.extend_from_slice(bcast.as_bytes());
+    data.extend_from_slice(inner);
     data
 }
 
@@ -656,5 +675,116 @@ mod edge_cases {
         // Path metric should be updated
         assert_eq!(engine.originator_table[0].paths[0].last_tq, 240);
         assert_eq!(engine.originator_table[0].paths.len(), 1); // Still just one path
+    }
+}
+
+#[cfg(test)]
+mod broadcast_processing {
+    use super::*;
+
+    // Stand-in for an encapsulated broadcast Ethernet frame (e.g. an ARP
+    // request) that a broadcast packet floods across the mesh.
+    const INNER: &[u8] = &[0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03];
+
+    /// A fresh broadcast from a neighbour, with TTL to spare, must be BOTH
+    /// delivered to the local node (so its TAP sees the ARP) AND re-flooded
+    /// with a decremented TTL.  The re-flood is written into the `reply`
+    /// scratchpad exactly like OGM forwarding, and the inner frame is
+    /// preserved verbatim so the next hop can deliver it too.
+    #[test]
+    fn test_broadcast_deliver_and_reflood() {
+        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+
+        // Broadcast originated by node 2, relayed to us directly by node 2.
+        let payload = make_broadcast(2, 100, 50, INNER);
+        let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, payload);
+        let frame = parse_link_frame(&frame_bytes);
+
+        let mut reply_buffer = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
+
+        let action = engine.handle_rx(frame, &mut reply);
+
+        // Deliver to the local TAP *and* keep the flood going to neighbours.
+        // The forward destination is the broadcast address.
+        assert!(matches!(
+            action,
+            RoutingAction::DeliverLocalAndForward(0xff)
+        ));
+
+        // The re-flood lives in the reply scratchpad, addressed to broadcast.
+        assert_eq!(reply.dst, u8::BROADCAST);
+        assert_eq!(reply.protocol, ETH_P_BATMAN);
+
+        let (out, rest) = BatmanBroadcastPacket::<u8>::ref_from_prefix(reply.payload).unwrap();
+        assert_eq!(out.packet_type, BATADV_BCAST);
+        assert_eq!(out.orig, 2); // originator unchanged through the relay
+        let seqno = out.seqno;
+        assert_eq!(seqno, 100u32.to_be()); // seqno unchanged
+        assert_eq!(out.ttl, 49); // decremented from 50
+        // Inner frame preserved verbatim (reply buffer is over-sized, so only
+        // the leading INNER.len() bytes are meaningful).
+        assert_eq!(&rest[..INNER.len()], INNER);
+    }
+
+    /// A node must never act on its own re-flooded broadcast looping back.
+    #[test]
+    fn test_own_broadcast_dropped() {
+        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+
+        let payload = make_broadcast(1, 100, 50, INNER); // orig == self_ident
+        let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, payload);
+        let frame = parse_link_frame(&frame_bytes);
+
+        let mut reply_buffer = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
+
+        let action = engine.handle_rx(frame, &mut reply);
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.protocol, 0); // nothing re-flooded
+    }
+
+    /// Re-seeing the same (orig, seqno) must be dropped so a broadcast cannot
+    /// circulate forever around a cyclic mesh.
+    #[test]
+    fn test_duplicate_broadcast_dropped() {
+        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+
+        let payload = make_broadcast(2, 100, 50, INNER);
+        let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, payload);
+
+        // First sighting: delivered locally and re-flooded.
+        let mut reply_buffer = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
+        let first = engine.handle_rx(parse_link_frame(&frame_bytes), &mut reply);
+        assert!(matches!(first, RoutingAction::DeliverLocalAndForward(_)));
+
+        // Same (orig, seqno) seen again (e.g. arriving via a different
+        // neighbour): dropped, and crucially not re-flooded a second time.
+        let mut reply2_buffer = [0u8; 256];
+        let mut reply2 = LinkFrameDataMut::from(&mut reply2_buffer[..]);
+        let second = engine.handle_rx(parse_link_frame(&frame_bytes), &mut reply2);
+        assert!(matches!(second, RoutingAction::Consumed));
+        assert_eq!(reply2.protocol, 0);
+    }
+
+    /// When TTL has run out the broadcast is still delivered to the local node
+    /// but is NOT re-flooded — mirroring OGM TTL expiry.
+    #[test]
+    fn test_broadcast_ttl_expiry_delivers_without_reflood() {
+        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+
+        let payload = make_broadcast(2, 100, 1, INNER); // ttl == 1, cannot forward
+        let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, payload);
+        let frame = parse_link_frame(&frame_bytes);
+
+        let mut reply_buffer = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
+
+        let action = engine.handle_rx(frame, &mut reply);
+
+        assert!(matches!(action, RoutingAction::DeliverLocal));
+        assert_eq!(reply.protocol, 0); // not re-flooded
     }
 }

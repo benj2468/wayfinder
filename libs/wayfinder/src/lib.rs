@@ -136,6 +136,26 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
                             None
                         }
                     }
+                    RoutingAction::DeliverLocalAndForward(_next) => {
+                        // The engine wrote a re-flood (TTL decremented) into
+                        // `reply`, addressed to BROADCAST.  Forward it so the
+                        // flood continues to our neighbours.
+                        //
+                        // CP2: this branch must *also* hand the inner frame up
+                        // to the local TAP.  Local delivery is not yet wired
+                        // (see [`handle_frame`] callers), so for now we only
+                        // propagate the flood.
+                        if reply.protocol != 0 {
+                            let len = frame.payload.len().min(reply.payload.len());
+                            Some(LinkFrameData {
+                                dst: reply.dst,
+                                protocol: reply.protocol,
+                                payload: &reply.payload[..len],
+                            })
+                        } else {
+                            None
+                        }
+                    }
                 }
             }
             0x88B5 => {

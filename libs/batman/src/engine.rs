@@ -7,7 +7,10 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
     BatmanEngine, NeighborStats, OriginatorRecord,
-    wire::{BATADV_IV_OGM, BATADV_UNICAST, BatmanOgmPacket, BatmanUnicastPacket, ETH_P_BATMAN},
+    wire::{
+        BATADV_BCAST, BATADV_IV_OGM, BATADV_UNICAST, BatmanBroadcastPacket, BatmanOgmPacket,
+        BatmanUnicastPacket, ETH_P_BATMAN,
+    },
 };
 
 impl<const MAX_ORIGINATORS: usize, Ident: MeshIdentifier> BatmanEngine<MAX_ORIGINATORS, Ident> {
@@ -131,6 +134,71 @@ where
                     }
                 }
                 RoutingAction::Consumed
+            }
+
+            BATADV_BCAST => {
+                let parsed = BatmanBroadcastPacket::read_from_prefix(&frame.payload);
+
+                let Ok((bcast, inner)) = parsed else {
+                    warn!("Unable to parse Broadcast Packet");
+                    return RoutingAction::Consumed;
+                };
+
+                let orig_ident = bcast.orig;
+
+                // Rule 1: never act on our own broadcast looping back.
+                if orig_ident == self.self_ident {
+                    return RoutingAction::Consumed;
+                }
+
+                let incoming_seqno = u32::from_be(bcast.seqno);
+
+                // Rule 2: deduplicate on (orig, seqno).  A broadcast arriving
+                // via several paths must be flooded onward only once, or it
+                // would circulate forever on a cyclic mesh.
+                if let Some(entry) = self.broadcast_seqno.iter_mut().find(|e| e.0 == orig_ident) {
+                    if incoming_seqno <= entry.1 {
+                        return RoutingAction::Consumed; // duplicate or stale
+                    }
+                    entry.1 = incoming_seqno;
+                } else if self
+                    .broadcast_seqno
+                    .push((orig_ident, incoming_seqno))
+                    .is_err()
+                {
+                    return RoutingAction::Consumed; // table full, drop packet
+                }
+
+                // Rule 3: TTL exhausted — deliver to the local node but do not
+                // re-flood (mirrors OGM TTL expiry).
+                if bcast.ttl <= 1 {
+                    return RoutingAction::DeliverLocal;
+                }
+
+                // Rule 4: re-flood with a decremented TTL.  The inner frame is
+                // copied verbatim after the header so the next hop can deliver
+                // it too.  The local delivery of the inner frame is the
+                // caller's responsibility — it strips this header off `frame`.
+                let mut outbound = bcast;
+                outbound.ttl -= 1;
+
+                let header_size = core::mem::size_of::<BatmanBroadcastPacket<Ident>>();
+                let total = header_size + inner.len();
+
+                reply.dst = Ident::BROADCAST;
+                reply.protocol = ETH_P_BATMAN;
+                reply
+                    .payload
+                    .get_mut(0..header_size)
+                    .unwrap()
+                    .copy_from_slice(&outbound.as_bytes()[..header_size]);
+                reply
+                    .payload
+                    .get_mut(header_size..total)
+                    .unwrap_or(&mut [])
+                    .copy_from_slice(inner);
+
+                RoutingAction::DeliverLocalAndForward(Ident::BROADCAST)
             }
 
             BATADV_UNICAST => {

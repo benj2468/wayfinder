@@ -15,7 +15,7 @@ cargo build
 
 # Build a specific package
 cargo build -p batman
-cargo build -p runner
+cargo build -p wayfinder
 cargo build -p rylr998
 cargo build -p interfaces
 
@@ -29,11 +29,11 @@ cargo build --release
 cargo test
 
 # Run tests for a specific package
-cargo test -p runner
+cargo test -p wayfinder
 cargo test -p batman
 
 # Run a specific test by name
-cargo test test_poll_and_route
+cargo test test_ogm_forwarding
 
 # Run tests with output visible
 cargo test -- --nocapture
@@ -79,29 +79,38 @@ For `IdentTable` and other wayfinder tests, use `u8` as the `Ident` type (it alr
 
 ### Workspace Structure
 
-The project is organized into four main libraries:
+The workspace is organized into several libraries plus one binary:
 
 **libs/interfaces** - Core abstractions and traits for the mesh networking system:
 - `MeshRoutingEngine` trait: Defines routing protocol behavior (handle_rx, produce_periodic_broadcast)
-- `EmbeddedMeshLink` trait: Abstracts physical layer communication
-- `MeshIdentifier` trait: Type constraint for node addresses (implemented for u8 by default)
+- `EmbeddedMeshLink` trait: Abstracts physical layer communication; `receive` reports per-frame `LinkMetrics` (RSSI/SNR)
+- `MeshIdentifier` trait: Type constraint for node addresses (implemented for `u8` and `[u8; 6]`)
 - `LinkFrame`: Zero-copy link-layer frame structure with src/dst/protocol/payload
-- `RoutingAction` enum: Returned by routing engines (Consumed, ForwardTo, DeliverLocal)
+- `RoutingAction` enum: Returned by routing engines (Consumed, ForwardTo, DeliverLocal, DeliverLocalAndForward)
 
 **libs/batman** - BATMAN-adv routing protocol implementation:
-- `BatmanEngine<MAX_ORIGINATORS, Ident>`: Core routing engine with originator table
+- `BatmanEngine<MAX_ORIGINATORS, Ident>`: Core routing engine with originator table + broadcast dedup table
 - `BatmanOgmPacket`: Originator Messages (OGM) for topology discovery
 - `BatmanUnicastPacket`: Unicast data packets with TTL and destination
+- `BatmanBroadcastPacket`: TTL-limited, seqno-deduplicated flooded broadcasts (e.g. ARP)
 - Implements `MeshRoutingEngine` trait
 - Uses heapless data structures for embedded compatibility
-- Protocol constants: `ETH_P_BATMAN` (0x4305), `BATADV_IV_OGM` (0x01), `BATADV_UNICAST` (0x03)
+- Protocol constants: `ETH_P_BATMAN` (0x4305), `BATADV_IV_OGM` (0x01), `BATADV_BCAST` (0x02), `BATADV_UNICAST` (0x03)
 
-**libs/runner** - Central router orchestration:
-- `CentralRouter<Ident, N>`: Manages multiple physical interfaces and routing engine
+**libs/wayfinder** - Central router orchestration (`no_std`):
+- `CentralRouter<Ident>`: Wraps the BATMAN engine plus an ident table and a per-(neighbor, interface) link-quality table
 - `DEFAULT_BATMAN_ETHER_TYPE`: 0x4305
-- `poll_and_route()`: Main event loop - polls all interfaces, processes received frames, handles periodic OGM broadcasts
-- `dispatch_from_local()`: Sends application data to mesh destination
-- Protocol demultiplexing based on LinkFrame protocol field
+- `handle_frame` / `handle_frame_with_metrics`: Process a received `LinkFrame`, fold in metrics, return any outgoing frame
+- `poll`: Drive periodic OGM broadcasts
+- `handle_local`: Wrap application/host data destined for a mesh node in a BATMAN unicast
+- `get_egress_interface` / `resolve_route`: Choose the egress interface for a destination (metric-driven), the latter without mutating state
+- Protocol demultiplexing based on `LinkFrame` protocol field
+
+**libs/wayfinder-protos** - Management API (`prost`/protobuf, package `wayfinder.v1alpha`): request/response envelopes for querying node info, the routing table, the link-quality table, and route resolution. `buf lint` runs from this crate.
+
+**libs/wayfinder-test** - Test-only harness: a `Switch` simulator and `TestRouter` wrapper for multi-node integration tests over `tokio` mpsc channels (no hardware).
+
+**bins/wayfinder-tap** - The runnable node: bridges a TAP device (`Layer::L2`) onto the mesh, carries links over UDP/Unix sockets, and exposes the management API over TCP/Unix/UDP.
 
 **libs/rylr998** - REYAX RYLR998/RYLR498 LoRa module driver:
 - `RylrClient<S>`: Async AT command interface for LoRa modules
@@ -120,7 +129,7 @@ The project is organized into four main libraries:
 
 **No-std compatibility**: BATMAN engine uses `heapless::Vec` for fixed-capacity collections suitable for embedded systems.
 
-**Test infrastructure**: The runner tests include a `Mesh` simulator with `tokio::io::duplex` for testing multi-node scenarios without hardware.
+**Test infrastructure**: `libs/wayfinder-test` provides a `Switch` simulator and `TestRouter` wrapper (over `tokio` mpsc channels) for testing multi-node scenarios without hardware.
 
 ## Important Implementation Details
 
@@ -132,14 +141,20 @@ The BATMAN engine maintains an originator table tracking:
 - `max_tq`: Transmission Quality metric (0-255)
 - `paths`: Up to 4 alternate paths via different neighbors
 
-OGM processing (libs/batman/src/engine.rs:31-134):
+OGM processing (`handle_rx`, `BATADV_IV_OGM` arm in libs/batman/src/engine.rs):
 1. Drops own OGMs (loop prevention)
 2. Creates or updates originator record
 3. Computes path quality (TQ -= 10 per hop)
 4. Selects best path based on highest TQ
 5. Forwards OGM with decremented TTL and updated prev_sender
 
-Unicast forwarding (libs/batman/src/engine.rs:137-179):
+Broadcast flooding (`handle_rx`, `BATADV_BCAST` arm):
+1. Drops own broadcasts (loop prevention)
+2. Deduplicates on `(orig, seqno)` via the engine's `broadcast_seqno` table — duplicates/stale are dropped
+3. If TTL expired, returns `DeliverLocal` (deliver, no re-flood)
+4. Otherwise writes a re-flood (TTL-1, inner frame preserved) into the reply buffer and returns `DeliverLocalAndForward(BROADCAST)`. The caller delivers the inner frame locally *and* forwards the re-flood.
+
+Unicast forwarding (`handle_rx`, `BATADV_UNICAST` arm):
 1. Checks if packet is for local node (DeliverLocal)
 2. Validates TTL > 1
 3. Looks up next hop in originator table
@@ -155,7 +170,7 @@ All frames use `LinkFrame<Ident>` structure (libs/interfaces/src/frame.rs):
 
 ### Protocol Multiplexing
 
-The CentralRouter demuxes by protocol field (libs/runner/src/lib.rs:56-89):
+The CentralRouter demuxes by protocol field (`handle_frame_with_metrics` in libs/wayfinder/src/lib.rs):
 - `0x4305` (DEFAULT_BATMAN_ETHER_TYPE): Routes to BATMAN engine
 - `0x88B5`: Reserved for experimental protocols
 - Other values are dropped
@@ -166,7 +181,7 @@ The CentralRouter demuxes by protocol field (libs/runner/src/lib.rs:56-89):
 
 1. Implement `MeshRoutingEngine<Ident>` trait in a new library
 2. Add protocol constant (EtherType) to identify your protocol
-3. Update `CentralRouter::poll_and_route()` match statement to handle your protocol
+3. Update the `CentralRouter::handle_frame_with_metrics` match statement to handle your protocol
 4. Create wire format packet structs with zerocopy derives
 
 ### Implementing a physical radio driver
@@ -178,12 +193,17 @@ The CentralRouter demuxes by protocol field (libs/runner/src/lib.rs:56-89):
 
 ### Testing with simulated mesh
 
-Use `IdentifiableLink` wrapper with `tokio::io::duplex` for unit tests:
+Use the `TestRouter` wrapper from `libs/wayfinder-test`, which pairs a
+`CentralRouter` with one mpsc egress channel per interface and serialises
+outgoing frames automatically:
 ```rust
-let (a, b) = tokio::io::duplex(3000);
-let link = Box::new(IdentifiableLink { identifier: 0, link: a });
-let router = CentralRouter::new([link], 0);
+let (tx_a, mut rx_a) = mpsc::channel(64);
+let mut router: TestRouter<u8> = TestRouter::new(1, vec![tx_a]);
+router.poll(now).await;            // drive periodic OGMs
+router.receive(0, &raw).await;     // feed a received wire frame
+router.send_local(2, payload).await?; // inject local data toward node 2
 ```
+For multi-node scenarios, connect several `TestRouter`s through a `Switch`.
 
 ## Edition Note
 
