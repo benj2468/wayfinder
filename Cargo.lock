@@ -641,11 +641,13 @@ dependencies = [
 name = "interfaces"
 version = "0.1.0"
 dependencies = [
+ "embedded-io-adapters",
  "embedded-io-async 0.6.1",
  "etherparse",
  "heapless",
  "rustc-std-workspace-core",
  "thiserror",
+ "tokio",
  "zerocopy",
 ]
 

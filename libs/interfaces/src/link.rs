@@ -122,8 +122,10 @@ where
         self.buffer[idx..(idx + size_of::<Ident>())].copy_from_slice(data.dst.as_bytes());
         idx += size_of::<Ident>();
 
-        self.buffer[idx..(idx + size_of::<u16>())]
-            .copy_from_slice(data.protocol.to_be().as_bytes());
+        // Protocol is stored and compared native-endian throughout (matching
+        // `LinkFrame`'s zerocopy reads and the engine's EtherType constants),
+        // so write the native bytes — not big-endian.
+        self.buffer[idx..(idx + size_of::<u16>())].copy_from_slice(data.protocol.as_bytes());
         idx += size_of::<u16>();
 
         self.buffer[idx..(idx + data.payload.len())].copy_from_slice(data.payload);
@@ -139,5 +141,38 @@ where
 
     pub fn read(&self, n: usize) -> &[u8] {
         &self.buffer[..n]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Link;
+    use crate::frame::LinkFrameData;
+    use embedded_io_adapters::tokio_1::FromTokio;
+
+    /// A frame serialized by [`Link::send`] must be parsed back identically by
+    /// [`Link::receive`] on the peer — in particular the `protocol` field,
+    /// which both ends compare against native-endian EtherType constants.
+    #[tokio::test]
+    async fn send_receive_round_trips_protocol_and_payload() {
+        let (a, b) = tokio::io::duplex(4096);
+        let mut sender = Link::new(FromTokio::new(a));
+        let mut receiver = Link::new(FromTokio::new(b));
+
+        let payload = [0xde, 0xad, 0xbe, 0xef];
+        let data = LinkFrameData::<[u8; 6]> {
+            dst: [2u8; 6],
+            protocol: 0x4305,
+            payload: &payload,
+        };
+        sender.send([1u8; 6], &data).await.unwrap();
+
+        let frame = receiver.receive::<[u8; 6]>().await.unwrap();
+        assert_eq!(frame.src, [1u8; 6]);
+        assert_eq!(frame.dst, [2u8; 6]);
+        // Copy out of the packed struct before comparing.
+        let protocol = frame.protocol;
+        assert_eq!(protocol, 0x4305, "protocol must survive the round trip");
+        assert_eq!(&frame.payload, &payload);
     }
 }

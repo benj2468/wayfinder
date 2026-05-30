@@ -10,3 +10,7 @@ embedded-io-async.workspace = true
 heapless.workspace = true
 core = { version = "1.0", package = "rustc-std-workspace-core", optional = true }
 etherparse.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+embedded-io-adapters.workspace = true
