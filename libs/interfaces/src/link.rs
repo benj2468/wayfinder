@@ -1,4 +1,3 @@
-use crate::frame::{LinkFrameData, MeshIdentifier};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -36,32 +35,4 @@ pub struct LinkMetrics {
     /// TQ convention).  Set by drivers that know how to map their native
     /// metrics; leave `None` to let the engine apply a default curve.
     pub quality: Option<u8>,
-}
-
-/// The result of a single `EmbeddedMeshLink::receive` call: how many bytes
-/// were written into the caller's buffer, paired with the radio's
-/// observations of the frame.
-#[derive(Debug, Clone, Copy)]
-pub struct RxResult {
-    /// Number of bytes written into the receive buffer.
-    pub bytes: usize,
-    /// Physical-layer measurements for the received frame.
-    pub metrics: LinkMetrics,
-}
-
-pub trait EmbeddedMeshLink<Ident: MeshIdentifier> {
-    /// Sends a raw frame out over the physical medium.
-    /// If destination identifier is Broadcast, then the radio should broadcast it
-    fn transmit(
-        &mut self,
-        data: LinkFrameData<'_, Ident>,
-    ) -> impl Future<Output = Result<(), LinkError>>;
-
-    /// Async blocking check to receive a frame from the radio.
-    ///
-    /// Returns the number of bytes written into `buf` along with any
-    /// physical-layer metrics the radio observed for this frame (RSSI, SNR,
-    /// etc.).  Radios that cannot measure a given metric leave the
-    /// corresponding [`LinkMetrics`] field as `None`.
-    fn receive(&mut self, buf: &mut [u8]) -> impl Future<Output = Result<RxResult, LinkError>>;
 }
