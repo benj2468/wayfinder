@@ -178,6 +178,70 @@ mod tests {
         );
     }
 
+    /// After the OGM exchange, a unicast from A to B must be handed up to B's
+    /// local host (the TAP) with the BATMAN header stripped — exercised via
+    /// the `local_deliveries` record.
+    #[tokio::test]
+    async fn unicast_data_is_delivered_to_local_host() {
+        let (tx_a, mut rx_a, port_a) = make_port_pair(64);
+        let (tx_b, mut rx_b, port_b) = make_port_pair(64);
+
+        let mut router_a: TestRouter<u8> = TestRouter::new(1, vec![tx_a]);
+        let mut router_b: TestRouter<u8> = TestRouter::new(2, vec![tx_b]);
+
+        let mut switch = Switch::<u8>::new();
+        switch.add_port(port_a, PortConfig::no_loss()).unwrap();
+        switch.add_port(port_b, PortConfig::no_loss()).unwrap();
+
+        // OGM exchange so A learns a route to B.
+        router_a.poll(Duration::ZERO).await;
+        router_b.poll(Duration::ZERO).await;
+        switch.tick().await.unwrap();
+        router_a.drain(0, &mut rx_a).await;
+        router_b.drain(0, &mut rx_b).await;
+        switch.tick().await.unwrap();
+        while rx_a.try_recv().is_ok() {}
+        while rx_b.try_recv().is_ok() {}
+
+        // A sends application data to B; B should deliver it locally.
+        let app_payload = b"deliver me locally";
+        router_a
+            .send_local(2, app_payload)
+            .await
+            .expect("router A should have a route to router B");
+        switch.tick().await.unwrap();
+        router_b.drain(0, &mut rx_b).await;
+
+        assert_eq!(router_b.local_deliveries(), &[app_payload.to_vec()]);
+    }
+
+    /// A broadcast (e.g. an ARP) needs no route: A floods it, and B must both
+    /// deliver the inner frame to its local host and not choke.  No OGM phase
+    /// is required because broadcasts are flooded to all interfaces.
+    #[tokio::test]
+    async fn broadcast_is_delivered_locally_at_neighbor() {
+        let (tx_a, _rx_a, port_a) = make_port_pair(64);
+        let (tx_b, mut rx_b, port_b) = make_port_pair(64);
+
+        let mut router_a: TestRouter<u8> = TestRouter::new(1, vec![tx_a]);
+        let mut router_b: TestRouter<u8> = TestRouter::new(2, vec![tx_b]);
+
+        let mut switch = Switch::<u8>::new();
+        switch.add_port(port_a, PortConfig::no_loss()).unwrap();
+        switch.add_port(port_b, PortConfig::no_loss()).unwrap();
+
+        let arp = b"i am a broadcast frame";
+        router_a
+            .send_local(u8::BROADCAST, arp)
+            .await
+            .expect("broadcast packet should build");
+
+        switch.tick().await.unwrap();
+        router_b.drain(0, &mut rx_b).await;
+
+        assert_eq!(router_b.local_deliveries(), &[arp.to_vec()]);
+    }
+
     /// Three nodes all on one switch.  Each broadcasts one OGM, so every node
     /// learns direct routes to the other two.  Taps on each port confirm:
     ///   - exactly one OGM per node is put on the wire before the drain phase

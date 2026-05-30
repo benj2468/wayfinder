@@ -76,6 +76,10 @@ pub struct TestRouter<Ident: MeshIdentifier> {
     ident: Ident,
     /// Egress channel for each interface, indexed by interface index.
     interfaces: Vec<mpsc::Sender<Vec<u8>>>,
+    /// Inner frames the router handed up for local delivery (i.e. what would
+    /// be written to the TAP), in arrival order.  Lets tests assert that a
+    /// packet reached its final destination and was delivered intact.
+    local_deliveries: Vec<Vec<u8>>,
 }
 
 // `CentralRouter`'s `handle_frame`, `handle_local`, and `get_egress_interface`
@@ -89,7 +93,14 @@ impl<Ident: MeshIdentifier + 'static> TestRouter<Ident> {
             router: CentralRouter::new(ident),
             ident,
             interfaces,
+            local_deliveries: Vec::new(),
         }
+    }
+
+    /// The inner frames the router has delivered locally so far (what would
+    /// have been written to the TAP), in arrival order.
+    pub fn local_deliveries(&self) -> &[Vec<u8>] {
+        &self.local_deliveries
     }
 
     // ── outbound ─────────────────────────────────────────────────────────────
@@ -155,10 +166,14 @@ impl<Ident: MeshIdentifier + 'static> TestRouter<Ident> {
         let my_ident = self.ident;
         let mut buf = [0u8; 512];
         let frame = parse_frame::<Ident>(raw);
-        let reply = self
+        let outcome = self
             .router
             .handle_frame_with_metrics(iface_idx, frame, metrics, &mut buf);
-        if let Some(r) = reply {
+        // Record any inner frame delivered to the local host.
+        if let Some(local) = outcome.deliver_local {
+            self.local_deliveries.push(local.to_vec());
+        }
+        if let Some(r) = outcome.forward {
             let dst = r.dst;
             let wire = build_frame(my_ident, dst, r.protocol, r.payload);
             self.send_egress(dst, wire).await;

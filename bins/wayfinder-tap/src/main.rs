@@ -17,7 +17,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing_subscriber::EnvFilter;
 use tun_rs::{DeviceBuilder, Layer};
 use wayfinder::EgressInterface;
-use wayfinder::interfaces::frame::LinkFrame;
+use wayfinder::interfaces::frame::{LinkFrameData, MeshIdentifier};
 use wayfinder::{CentralRouter, interfaces::link::Link};
 use wayfinder_protos::{
     service::{
@@ -26,7 +26,7 @@ use wayfinder_protos::{
     },
     wayfinder_v1alpha::{WayfinderRequest, WayfinderResponse},
 };
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::IntoBytes;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -350,8 +350,18 @@ async fn main() -> anyhow::Result<()> {
     let mut rx_buffer = [0u8; 1500];
     let mut tx_buffer = [0u8; 1500];
 
+    // One iteration's worth of work, fully owned so that no borrow of the
+    // rx/tx scratchpads or the interface set escapes the `select!`.
+    struct LoopOutput {
+        /// `(destination ident, protocol, serialized payload)` to transmit
+        /// onto the mesh, chosen via `get_egress_interface`.
+        mesh: Option<([u8; 6], u16, Vec<u8>)>,
+        /// Inner frame to write back to the local TAP device.
+        local: Option<Vec<u8>>,
+    }
+
     loop {
-        let data = {
+        let output: LoopOutput = {
             let mut futures = interfaces
                 .iter_mut()
                 .enumerate()
@@ -360,38 +370,76 @@ async fn main() -> anyhow::Result<()> {
 
             tokio::select! {
                 Some(Some((idx, frame))) = futures.next() => {
-                    router.handle_frame(idx, frame, &mut tx_buffer)
+                    let rx = router.handle_frame(idx, frame, &mut tx_buffer);
+                    LoopOutput {
+                        mesh: rx.forward.map(|f| (f.dst, f.protocol, f.payload.to_vec())),
+                        local: rx.deliver_local.map(|inner| inner.to_vec()),
+                    }
                 },
                 Ok(len) = dev.recv(&mut rx_buffer) => {
-                    if let Ok(frame) = LinkFrame::mut_from_bytes(&mut rx_buffer[..len]) {
-                        router.handle_local(frame.dst, &frame.payload, &mut tx_buffer).ok()
+                    // The TAP hands us a full Ethernet frame:
+                    // [dst MAC:6][src MAC:6][ethertype:2][payload...].
+                    // Route by the destination MAC, which *is* the mesh Ident,
+                    // and carry the whole frame across the mesh untouched.
+                    let eth = &rx_buffer[..len];
+                    let mesh = if eth.len() >= 14 {
+                        let mut dst_mac = [0u8; 6];
+                        dst_mac.copy_from_slice(&eth[0..6]);
+                        // The I/G bit (LSB of the first octet) marks multicast /
+                        // broadcast destinations, which we flood across the mesh.
+                        let dest = if dst_mac[0] & 0x01 != 0 {
+                            <[u8; 6]>::BROADCAST
+                        } else {
+                            dst_mac
+                        };
+                        router
+                            .handle_local(dest, eth, &mut tx_buffer)
+                            .ok()
+                            .map(|f| (f.dst, f.protocol, f.payload.to_vec()))
                     } else {
                         None
-                    }
+                    };
+                    LoopOutput { mesh, local: None }
                 },
                 Some((request, resp_tx)) = query_rx.recv() => {
                     let response = WayfinderService::new(RouterAdapter(&router)).handle(request);
                     let _ = resp_tx.send(response);
-                    None
+                    LoopOutput { mesh: None, local: None }
                 },
                 _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                    router.poll(start.elapsed(), &mut tx_buffer)
+                    LoopOutput {
+                        mesh: router
+                            .poll(start.elapsed(), &mut tx_buffer)
+                            .map(|f| (f.dst, f.protocol, f.payload.to_vec())),
+                        local: None,
+                    }
                 }
             }
         };
 
-        if let Some(data) = data
-            && let Some(egress) = router.get_egress_interface(data.dst)
-        {
-            match egress {
-                EgressInterface::All => {
-                    for iface in interfaces.iter_mut() {
+        // Hand any inner frame up to the local host by writing it to the TAP.
+        if let Some(local) = output.local {
+            dev.send(&local).await?;
+        }
+
+        // Dispatch any outgoing frame onto the mesh.
+        if let Some((dst, protocol, payload)) = output.mesh {
+            let data = LinkFrameData {
+                dst,
+                protocol,
+                payload: &payload,
+            };
+            if let Some(egress) = router.get_egress_interface(dst) {
+                match egress {
+                    EgressInterface::All => {
+                        for iface in interfaces.iter_mut() {
+                            iface.send(mac_addr, &data).await?;
+                        }
+                    }
+                    EgressInterface::Interface(iface_idx) => {
+                        let iface = interfaces.get_mut(iface_idx).unwrap();
                         iface.send(mac_addr, &data).await?;
                     }
-                }
-                EgressInterface::Interface(iface_idx) => {
-                    let iface = interfaces.get_mut(iface_idx).unwrap();
-                    iface.send(mac_addr, &data).await?;
                 }
             }
         }

@@ -30,6 +30,11 @@ pub struct OriginatorRecord<Ident> {
 pub struct BatmanEngine<const MAX_ORIGINATORS: usize, Ident> {
     pub self_ident: Ident,
     pub sequence_number: u32,
+    /// Monotonic sequence number stamped on broadcasts this node originates.
+    /// Kept separate from the OGM `sequence_number` because broadcast and OGM
+    /// sequence numbers are independent number spaces (see
+    /// [`Self::broadcast_seqno`] for the receive-side dedup table).
+    pub broadcast_sequence_number: u32,
     pub originator_table: HVec<OriginatorRecord<Ident>, MAX_ORIGINATORS>,
     /// Highest broadcast sequence number seen per originator, used to drop
     /// duplicate flooded broadcasts.  Broadcast and OGM sequence numbers are
@@ -45,8 +50,16 @@ impl<const MAX_ORIGINATORS: usize, Ident> BatmanEngine<MAX_ORIGINATORS, Ident> {
         Self {
             self_ident,
             sequence_number: 0,
+            broadcast_sequence_number: 0,
             originator_table: HVec::new(),
             broadcast_seqno: HVec::new(),
         }
+    }
+
+    /// Allocate the next sequence number for a broadcast this node originates.
+    /// Wraps at `u32::MAX`, matching the OGM sequence allocation.
+    pub fn next_broadcast_seqno(&mut self) -> u32 {
+        self.broadcast_sequence_number = self.broadcast_sequence_number.wrapping_add(1);
+        self.broadcast_sequence_number
     }
 }
