@@ -46,6 +46,7 @@ pub struct LinkFrameData<'a, Ident> {
     pub payload: &'a [u8],
 }
 
+#[derive(Debug)]
 pub struct LinkFrameDataMut<'a, Ident> {
     pub dst: Ident,
     pub protocol: u16,

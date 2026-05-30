@@ -4,8 +4,5 @@ tap:
   netmask: 255.255.255.0
 links:
   - type: Udp
-    bind_addr: 100.73.51.55:9191
-    remote_addr: 100.118.41.14:9191
-server:
-  type: Tcp
-  addr: 0.0.0.0:9000
+    bind_addr: 127.0.0.1:9191
+    remote_addr: 127.0.0.1:9192

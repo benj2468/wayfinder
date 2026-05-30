@@ -2,6 +2,7 @@ use interfaces::{
     engine::{MeshRoutingEngine, RoutingAction},
     frame::{LinkFrame, LinkFrameDataMut, MeshIdentifier},
 };
+use tracing::trace;
 use tracing::warn;
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -30,18 +31,28 @@ impl<const MAX_ORIGINATORS: usize, Ident> MeshRoutingEngine<Ident>
 where
     Ident: MeshIdentifier,
 {
+    #[tracing::instrument(skip(self, frame, reply), fields(self_ident = ?self.self_ident), level = "trace", ret)]
     fn handle_rx<'rx, 'tx>(
         &mut self,
         frame: &'tx LinkFrame<Ident>,
         reply: &mut LinkFrameDataMut<'rx, Ident>,
     ) -> RoutingAction<Ident> {
+        let src = frame.src;
+        let dst = frame.dst;
+        let protocol = frame.protocol;
+
+        tracing::trace!(
+            "handling src = {:?}, dest = {:?}, proto = {:?}, payload_len = {:?}",
+            src,
+            dst,
+            protocol,
+            frame.payload.len()
+        );
+
         // Core protocol routing filter
         if frame.protocol != ETH_P_BATMAN || frame.payload.is_empty() {
             return RoutingAction::Consumed;
         }
-
-        let src = frame.src;
-        let dst = frame.dst;
 
         // Identify packet sub-type safely via zero-copy parsing
         match frame.payload[0] {
@@ -52,6 +63,8 @@ where
                     warn!("Unable to parse OGM Packet");
                     return RoutingAction::Consumed;
                 };
+
+                trace!("parsed OGM packet: {:?}", ogm);
 
                 let orig_ident = ogm.orig;
 
@@ -143,6 +156,8 @@ where
                     warn!("Unable to parse Broadcast Packet");
                     return RoutingAction::Consumed;
                 };
+
+                trace!("parsed broadcast packet: {:?}", bcast);
 
                 let orig_ident = bcast.orig;
 

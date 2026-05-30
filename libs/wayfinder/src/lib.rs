@@ -48,6 +48,7 @@ pub enum EgressInterface {
 /// caller's transmit scratchpad (`'tx`), while a locally-delivered frame is
 /// borrowed straight out of the received frame (`'rx`).  Both, either, or
 /// neither may be present for a given frame.
+#[derive(Debug)]
 pub struct RxOutcome<'rx, 'tx, Ident> {
     /// A frame to (re)transmit onto the mesh — a forwarded unicast, a
     /// re-flooded broadcast, or an OGM reply.  Dispatch it via
@@ -113,6 +114,7 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
     ///
     /// Returns an [`RxOutcome`]: any frame to (re)transmit onto the mesh and
     /// any inner payload to deliver to the local host.
+    #[tracing::instrument(skip(self, frame, tx_buf))]
     pub fn handle_frame_with_metrics<'rx, 'tx>(
         &mut self,
         iface_idx: usize,
@@ -120,6 +122,7 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
         metrics: LinkMetrics,
         tx_buf: &'tx mut [u8],
     ) -> RxOutcome<'rx, 'tx, Ident> {
+        tx_buf.fill(0);
         // 0. Update the link-quality table for the sender, keyed on the
         //    interface this frame arrived on.  Done before any further
         //    processing so even frames that the upper layers drop still
@@ -136,7 +139,13 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
                 let mut reply: LinkFrameDataMut<'_, Ident> = tx_buf.into();
 
                 // BATMAN-adv Protocol ID
-                match self.batman.handle_rx(frame, &mut reply) {
+                let action = self.batman.handle_rx(frame, &mut reply);
+                tracing::debug!(
+                    "Post-action reply: dst={:?}, protocol={:?}",
+                    reply.dst,
+                    reply.protocol
+                );
+                match action {
                     RoutingAction::Consumed => {
                         // Trim the payload to the incoming frame size so that
                         // trailing zeros from the scratchpad buffer are not
@@ -200,6 +209,7 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
                 }
             }
             0x88B5 => {
+                tracing::debug!("received experimental protocol frame");
                 // Dynamically route to a completely separate experimental protocol context
                 RxOutcome::empty()
             }

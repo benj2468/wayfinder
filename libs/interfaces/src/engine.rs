@@ -1,5 +1,6 @@
 use crate::frame::{LinkFrame, LinkFrameDataMut};
 
+#[derive(Debug)]
 pub enum RoutingAction<Ident> {
     /// The packet was a BATMAN control message (like an OGM);
     /// the engine consumed it to update its internal routing tables.
