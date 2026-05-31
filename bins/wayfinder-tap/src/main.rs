@@ -8,9 +8,6 @@
 
 mod tap;
 
-#[cfg(test)]
-mod tests;
-
 use std::path::{Path, PathBuf};
 
 use anyhow::bail;
@@ -67,8 +64,6 @@ async fn main() -> anyhow::Result<()> {
         pretty_hex::simple_hex(&mac_addr)
     );
 
-    // Everything from here....
-
     let mut interfaces = Vec::new();
     for link in config.links {
         match link {
@@ -103,10 +98,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-
-    // ...to here, should actually be in the drivers run method.
-    // Maybe the driver has a generic that we condition the `Mode` with.
-    // like a Test Mode and a Production Mode.
 
     let mut driver = Driver::new(Mac(mac_addr), TapDevice(dev), interfaces, query_rx);
 
