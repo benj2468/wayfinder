@@ -115,6 +115,7 @@ async fn main() -> anyhow::Result<()> {
         router: CentralRouter::new(Mac(mac_addr)),
         query_rx,
         mac_addr: Mac(mac_addr),
+        snooper: crate::snoop::McastSnooper::new(),
         start: std::time::Instant::now(),
         rx_buffer: [0u8; 1500],
         tx_buffer: [0u8; 1500],

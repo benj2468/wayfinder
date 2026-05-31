@@ -7,6 +7,127 @@
 //! IPv4 headers are parsed with `etherparse`; the IGMP message body is parsed
 //! by hand (etherparse does not decode IGMP).
 
+use std::collections::HashSet;
+use std::net::Ipv4Addr;
+
+use etherparse::{NetSlice, SlicedPacket};
+use wayfinder::interfaces::frame::Mac;
+
+/// IP protocol number for IGMP.
+const IP_PROTO_IGMP: u8 = 2;
+
+/// Tracks the IPv4 multicast groups the local host has joined, learned by
+/// snooping the IGMP membership messages it emits on the TAP.
+#[derive(Default)]
+pub(crate) struct McastSnooper {
+    groups: HashSet<Mac>,
+}
+
+impl McastSnooper {
+    /// A snooper that has observed nothing yet (no joined groups).
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Observe one host Ethernet frame.  If it carries an IGMP membership
+    /// report or leave, update the joined-group set accordingly and return
+    /// `true` when the set actually changed; otherwise return `false`.
+    pub(crate) fn observe(&mut self, eth: &[u8]) -> bool {
+        match igmp_payload(eth) {
+            Some(igmp) => self.apply_igmp(igmp),
+            None => false,
+        }
+    }
+
+    /// The multicast group MACs the host currently listens to.
+    pub(crate) fn groups(&self) -> Vec<Mac> {
+        self.groups.iter().copied().collect()
+    }
+
+    /// Apply one parsed IGMP message body to the group set.
+    fn apply_igmp(&mut self, igmp: &[u8]) -> bool {
+        match igmp.first().copied() {
+            // IGMPv1 / IGMPv2 membership report: a join for the named group.
+            Some(0x12) | Some(0x16) => group_at(igmp, 4).map(|g| self.join(g)).unwrap_or(false),
+            // IGMPv2 leave group.
+            Some(0x17) => group_at(igmp, 4).map(|g| self.leave(g)).unwrap_or(false),
+            // IGMPv3 membership report: a list of per-group records.
+            Some(0x22) => self.apply_igmp_v3(igmp),
+            _ => false,
+        }
+    }
+
+    /// Apply an IGMPv3 membership report's group records.  Tracking is at
+    /// group granularity (sources are ignored), so a record means "join"
+    /// unless it is an INCLUDE-mode record with no sources, which means the
+    /// host no longer wants the group.
+    fn apply_igmp_v3(&mut self, igmp: &[u8]) -> bool {
+        // Header: [type][reserved][checksum:2][reserved:2][num_records:2].
+        if igmp.len() < 8 {
+            return false;
+        }
+        let num_records = u16::from_be_bytes([igmp[6], igmp[7]]) as usize;
+
+        let mut off = 8;
+        let mut changed = false;
+        for _ in 0..num_records {
+            // Record: [rec_type][aux_len][num_sources:2][group:4][sources..][aux..].
+            if off + 8 > igmp.len() {
+                break;
+            }
+            let rec_type = igmp[off];
+            let aux_words = igmp[off + 1] as usize;
+            let num_sources = u16::from_be_bytes([igmp[off + 2], igmp[off + 3]]) as usize;
+            let Some(group) = group_at(igmp, off + 4) else {
+                break;
+            };
+
+            // MODE_IS_INCLUDE (1) / CHANGE_TO_INCLUDE_MODE (3) with no sources
+            // is a leave; every other record expresses interest in the group.
+            let is_leave = matches!(rec_type, 1 | 3) && num_sources == 0;
+            changed |= if is_leave {
+                self.leave(group)
+            } else {
+                self.join(group)
+            };
+
+            // Advance past this record's sources (4 bytes each) and aux data
+            // (counted in 32-bit words).
+            off += 8 + num_sources * 4 + aux_words * 4;
+        }
+        changed
+    }
+
+    fn join(&mut self, group: Mac) -> bool {
+        self.groups.insert(group)
+    }
+
+    fn leave(&mut self, group: Mac) -> bool {
+        self.groups.remove(&group)
+    }
+}
+
+/// Read the IPv4 group address at byte offset `off` of an IGMP message and map
+/// it to its multicast MAC.
+fn group_at(igmp: &[u8], off: usize) -> Option<Mac> {
+    let b = igmp.get(off..off + 4)?;
+    Some(Mac::from_ipv4_multicast(Ipv4Addr::new(
+        b[0], b[1], b[2], b[3],
+    )))
+}
+
+/// If `eth` is an IPv4 frame carrying IGMP, return the IGMP message bytes.
+fn igmp_payload(eth: &[u8]) -> Option<&[u8]> {
+    let sliced = SlicedPacket::from_ethernet(eth).ok()?;
+    match sliced.net? {
+        NetSlice::Ipv4(ip) => {
+            let payload = ip.payload();
+            (payload.ip_number.0 == IP_PROTO_IGMP).then_some(payload.payload)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

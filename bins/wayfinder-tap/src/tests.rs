@@ -113,6 +113,7 @@ fn harness(mac: [u8; 6]) -> Harness {
             router: CentralRouter::new(Mac(mac)),
             query_rx: qrx,
             mac_addr: Mac(mac),
+            snooper: crate::snoop::McastSnooper::new(),
             start: std::time::Instant::now(),
             rx_buffer: [0u8; 1500],
             tx_buffer: [0u8; 1500],

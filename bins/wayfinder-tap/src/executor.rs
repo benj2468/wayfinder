@@ -13,6 +13,7 @@ use wayfinder_protos::service::WayfinderService;
 use wayfinder_server::{QueryRx, RouterAdapter};
 
 use crate::links::{AsyncIo, Link};
+use crate::snoop::McastSnooper;
 
 /// All the long-lived state the router event loop operates on, bundled so that
 /// [`EventLoop::run_once`] can be driven deterministically in tests (with a
@@ -28,6 +29,9 @@ pub(crate) struct EventLoop<Tap: AsyncIo> {
     pub(crate) query_rx: QueryRx,
     /// This node's mesh identifier (its TAP MAC address).
     pub(crate) mac_addr: Mac,
+    /// Snoops IGMP on the TAP to learn which multicast groups the local host
+    /// listens to, so they can be announced to the mesh.
+    pub(crate) snooper: McastSnooper,
     /// Reference instant for periodic-broadcast timing.
     pub(crate) start: std::time::Instant,
     /// Receive scratchpad for frames read from the TAP.
@@ -61,6 +65,7 @@ impl<Tap: AsyncIo> EventLoop<Tap> {
             router,
             query_rx,
             mac_addr,
+            snooper,
             start,
             rx_buffer,
             tx_buffer,
@@ -93,6 +98,13 @@ impl<Tap: AsyncIo> EventLoop<Tap> {
                     // carry the whole frame across the mesh untouched.
                     let eth = &rx_buffer[..len];
                     tracing::debug!("{}", pretty_hex::pretty_hex(&eth));
+
+                    // Snoop IGMP so the groups the host joins/leaves are
+                    // announced to the mesh on the next OGM.
+                    if snooper.observe(eth) {
+                        router.set_local_mcast_groups(&snooper.groups());
+                    }
+
                     let mut mesh: Vec<(Mac, u16, Vec<u8>)> = Vec::new();
                     if eth.len() >= 14 {
                         let mut dst_mac = [0u8; 6];

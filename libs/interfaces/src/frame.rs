@@ -56,6 +56,16 @@ impl Mac {
     pub fn is_broadcast(&self) -> bool {
         *self == Mac::BROADCAST
     }
+
+    /// Map an IPv4 multicast group address to its Ethernet MAC per RFC 1112:
+    /// the `01:00:5e` prefix followed by the low 23 bits of the group address.
+    /// Because only 23 of the group's 28 multicast bits map, groups differing
+    /// only in the top bit of the second octet (e.g. `224.x` vs `224.128+x`)
+    /// alias onto the same MAC.
+    pub fn from_ipv4_multicast(group: core::net::Ipv4Addr) -> Mac {
+        let o = group.octets();
+        Mac([0x01, 0x00, 0x5e, o[1] & 0x7f, o[2], o[3]])
+    }
 }
 
 impl From<[u8; 6]> for Mac {

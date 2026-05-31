@@ -266,6 +266,13 @@ impl CentralRouter {
         self.batman.mcast_listeners(group)
     }
 
+    /// Set the multicast groups the local host listens to (typically from IGMP
+    /// snooping).  They are announced to the mesh in this node's OGMs so other
+    /// routers forward the corresponding multicast traffic toward us.
+    pub fn set_local_mcast_groups(&mut self, groups: &[Mac]) {
+        self.batman.set_local_mcast_groups(groups);
+    }
+
     /// Wrap host data destined for the multicast listener `dest` in a
     /// [`BATADV_MCAST`] packet routed toward its best-known next hop.  Called
     /// once per target of a [`McastPlan::Unicast`].  Returns `Err(())` if the
