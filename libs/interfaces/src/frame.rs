@@ -119,3 +119,30 @@ impl<'a> From<&'a mut [u8]> for LinkFrameDataMut<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::net::Ipv4Addr;
+
+    /// An IPv4 multicast group maps to a `01:00:5e`-prefixed MAC whose low 23
+    /// bits come from the group address (RFC 1112): the top bit of the second
+    /// octet is masked off, so `239.1.1.1` and `239.129.1.1` collide onto the
+    /// same MAC.
+    #[test]
+    fn ipv4_multicast_maps_to_01005e_mac() {
+        assert_eq!(
+            Mac::from_ipv4_multicast(Ipv4Addr::new(239, 1, 1, 1)),
+            Mac([0x01, 0x00, 0x5e, 0x01, 0x01, 0x01])
+        );
+        assert_eq!(
+            Mac::from_ipv4_multicast(Ipv4Addr::new(224, 0, 0, 22)),
+            Mac([0x01, 0x00, 0x5e, 0x00, 0x00, 0x16])
+        );
+        // The high bit of the second octet is dropped (only 23 bits map).
+        assert_eq!(
+            Mac::from_ipv4_multicast(Ipv4Addr::new(239, 129, 1, 1)),
+            Mac([0x01, 0x00, 0x5e, 0x01, 0x01, 0x01])
+        );
+    }
+}

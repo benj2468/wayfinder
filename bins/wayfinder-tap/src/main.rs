@@ -4,6 +4,7 @@
 mod config;
 mod executor;
 mod links;
+mod snoop;
 
 #[cfg(test)]
 mod tests;
