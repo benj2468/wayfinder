@@ -9,8 +9,8 @@ use zerocopy::{FromBytes, IntoBytes};
 use crate::{
     BatmanEngine, NeighborStats, OriginatorRecord,
     wire::{
-        BATADV_BCAST, BATADV_IV_OGM, BATADV_UNICAST, BatmanBroadcastPacket, BatmanOgmPacket,
-        BatmanUnicastPacket, ETH_P_BATMAN,
+        BATADV_BCAST, BATADV_IV_OGM, BATADV_TVLV_MCAST, BATADV_UNICAST, BatmanBroadcastPacket,
+        BatmanOgmPacket, BatmanTvlvHdr, BatmanUnicastPacket, ETH_P_BATMAN, find_tvlv,
     },
 };
 
@@ -23,6 +23,63 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
             .iter()
             .find(|record| record.neighbor_ident == destination)
             .map(|record| record.best_next_hop)
+    }
+
+    /// Replace the set of multicast groups the local host listens to.  These
+    /// are announced to the mesh in the multicast TVLV of every OGM this node
+    /// produces.  Groups beyond [`MAX_LOCAL_MCAST`] are dropped.
+    ///
+    /// [`MAX_LOCAL_MCAST`]: crate::MAX_LOCAL_MCAST
+    pub fn set_local_mcast_groups(&mut self, groups: &[Mac]) {
+        self.local_mcast.clear();
+        for g in groups {
+            if self.local_mcast.push(*g).is_err() {
+                break; // table full; drop the rest
+            }
+        }
+    }
+
+    /// The multicast groups the local host currently listens to.
+    pub fn local_mcast_groups(&self) -> &[Mac] {
+        &self.local_mcast
+    }
+
+    /// Iterate the originators that have announced interest in `group`.
+    /// Drives selective multicast forwarding.
+    pub fn mcast_listeners(&self, group: Mac) -> impl Iterator<Item = Mac> + '_ {
+        self.mcast_members
+            .iter()
+            .filter(move |(g, _)| *g == group)
+            .map(|(_, m)| *m)
+    }
+
+    /// Replace `orig`'s recorded multicast memberships with the groups carried
+    /// in `tail` (the TVLV region following an OGM header).  An OGM with no
+    /// multicast TVLV prunes all of `orig`'s memberships.  Called when an OGM
+    /// is accepted; keeps [`Self::mcast_members`] in sync with the latest
+    /// announcement from each originator.
+    fn update_mcast_membership(&mut self, orig: Mac, tail: &[u8]) {
+        // Drop every membership currently attributed to this originator;
+        // the incoming announcement is authoritative for it.
+        let mut i = 0;
+        while i < self.mcast_members.len() {
+            if self.mcast_members[i].1 == orig {
+                self.mcast_members.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+
+        // Re-add the groups the originator now announces (6 bytes per MAC).
+        if let Some(value) = find_tvlv(tail, BATADV_TVLV_MCAST) {
+            for chunk in value.chunks_exact(6) {
+                let mut bytes = [0u8; 6];
+                bytes.copy_from_slice(chunk);
+                if self.mcast_members.push((Mac(bytes), orig)).is_err() {
+                    break; // table full; drop the rest
+                }
+            }
+        }
     }
 }
 
@@ -119,6 +176,14 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
                         record.max_tq = computed_tq;
                         record.best_next_hop = frame.src;
                     }
+
+                    // Fold this originator's multicast memberships (carried in
+                    // the OGM's TVLV tail) into the membership table.  The
+                    // `record` borrow has ended above, so taking `&mut self`
+                    // here is fine.
+                    let header_size = core::mem::size_of::<BatmanOgmPacket>();
+                    let tail = frame.payload.get(header_size..).unwrap_or(&[]);
+                    self.update_mcast_membership(orig_ident, tail);
 
                     // --- REACTIVE STEP: Forward OGM (Flood Routing Propagation) ---
                     // Lower TTL to prevent routing infinity storms
@@ -301,6 +366,18 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
         // Increment sequence allocation for this ticker frame
         self.sequence_number = self.sequence_number.wrapping_add(1);
 
+        let header_size = core::mem::size_of::<BatmanOgmPacket>();
+        let tvlv_hdr_size = core::mem::size_of::<BatmanTvlvHdr>();
+
+        // A multicast TVLV is attached only when the local host has joined at
+        // least one group; its value is those group MACs back-to-back.
+        let mcast_value_len = self.local_mcast.len() * core::mem::size_of::<Mac>();
+        let tvlv_len = if mcast_value_len == 0 {
+            0
+        } else {
+            tvlv_hdr_size + mcast_value_len
+        };
+
         let ogm = BatmanOgmPacket {
             packet_type: BATADV_IV_OGM,
             version: 5,
@@ -310,12 +387,26 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
             orig: self.self_ident,
             prev_sender: self.self_ident,
             reserved: 0,
-            tq: 255,     // Max link capability score from original anchor source
-            tvlv_len: 0, // no TVLV tail yet (membership announcements: Phase 2)
+            tq: 255, // Max link capability score from original anchor source
+            tvlv_len: (tvlv_len as u16).to_be(),
         };
 
-        let size = core::mem::size_of::<BatmanOgmPacket>();
-        tx_buffer[..size].copy_from_slice(ogm.as_bytes());
-        Some(&tx_buffer[..size])
+        tx_buffer[..header_size].copy_from_slice(ogm.as_bytes());
+
+        if tvlv_len > 0 {
+            let hdr = BatmanTvlvHdr {
+                tvlv_type: BATADV_TVLV_MCAST,
+                version: 1,
+                len: (mcast_value_len as u16).to_be(),
+            };
+            tx_buffer[header_size..header_size + tvlv_hdr_size].copy_from_slice(hdr.as_bytes());
+            let mut off = header_size + tvlv_hdr_size;
+            for group in &self.local_mcast {
+                tx_buffer[off..off + core::mem::size_of::<Mac>()].copy_from_slice(group.as_bytes());
+                off += core::mem::size_of::<Mac>();
+            }
+        }
+
+        Some(&tx_buffer[..header_size + tvlv_len])
     }
 }

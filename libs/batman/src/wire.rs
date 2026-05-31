@@ -56,6 +56,30 @@ pub struct BatmanTvlvHdr {
 /// group MAC addresses the originating node currently listens for.
 pub const BATADV_TVLV_MCAST: u8 = 0x06;
 
+/// Scan a TVLV region (`tail`, the bytes following an OGM's fixed header) for
+/// the first record of type `tvlv_type` and return its value bytes, or `None`
+/// if absent or malformed.  Records are `[`[`BatmanTvlvHdr`]`][value]` packed
+/// back-to-back; a record whose advertised length runs past the end of `tail`
+/// terminates the scan.
+pub fn find_tvlv(tail: &[u8], tvlv_type: u8) -> Option<&[u8]> {
+    let hdr_size = core::mem::size_of::<BatmanTvlvHdr>();
+    let mut off = 0;
+    while off + hdr_size <= tail.len() {
+        let (hdr, _) = BatmanTvlvHdr::ref_from_prefix(&tail[off..]).ok()?;
+        let len = u16::from_be(hdr.len) as usize;
+        let value_start = off + hdr_size;
+        let value_end = value_start.checked_add(len)?;
+        if value_end > tail.len() {
+            return None; // record claims more bytes than the tail holds
+        }
+        if hdr.tvlv_type == tvlv_type {
+            return tail.get(value_start..value_end);
+        }
+        off = value_end;
+    }
+    None
+}
+
 /// Packet sub-type for a flooded broadcast frame.  Matches batman-adv's
 /// `BATADV_BCAST`.  Used to carry broadcast/multicast link-layer frames
 /// (e.g. ARP) across the mesh, deduplicated and TTL-limited so they reach

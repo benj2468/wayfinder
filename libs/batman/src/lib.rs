@@ -9,6 +9,12 @@ mod engine_tests;
 use heapless::Vec as HVec;
 use interfaces::frame::Mac;
 
+/// Maximum number of multicast groups this node's local host can join at once.
+pub const MAX_LOCAL_MCAST: usize = 16;
+/// Maximum number of `(group, listener-originator)` memberships tracked across
+/// the whole mesh.  Bounds the footprint for embedded targets.
+pub const MAX_MCAST_MEMBERS: usize = 64;
+
 /// Track metrics for a specific path to an originator via a specific immediate neighbor
 #[derive(Debug, Clone)]
 pub struct NeighborStats {
@@ -44,6 +50,14 @@ pub struct BatmanEngine<const MAX_ORIGINATORS: usize> {
     /// of an originator's broadcast; the table is bounded at `MAX_ORIGINATORS`
     /// and further originators are dropped once it is full.
     pub broadcast_seqno: HVec<(Mac, u32), MAX_ORIGINATORS>,
+    /// Multicast groups the local host currently listens to.  Announced to the
+    /// mesh in the OGM's multicast TVLV; set via
+    /// [`set_local_mcast_groups`](BatmanEngine::set_local_mcast_groups).
+    pub local_mcast: HVec<Mac, MAX_LOCAL_MCAST>,
+    /// `(group, listener-originator)` memberships learned from other nodes'
+    /// OGM multicast TVLVs.  Drives selective multicast forwarding: a frame to
+    /// a group is sent only toward the originators listed here for that group.
+    pub mcast_members: HVec<(Mac, Mac), MAX_MCAST_MEMBERS>,
 }
 
 impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
@@ -54,6 +68,8 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
             broadcast_sequence_number: 0,
             originator_table: HVec::new(),
             broadcast_seqno: HVec::new(),
+            local_mcast: HVec::new(),
+            mcast_members: HVec::new(),
         }
     }
 
