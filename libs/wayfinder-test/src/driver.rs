@@ -9,26 +9,26 @@ use crate::{
 };
 
 #[derive(Serialize, Deserialize, Default)]
-struct TestConfig {
-    switches: Vec<TestSwitchConfig>,
-    machines: Vec<TestMachineConfig>,
+pub struct TestConfig {
+    pub switches: Vec<TestSwitchConfig>,
+    pub machines: Vec<TestMachineConfig>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct TestSwitchConfig {
-    name: String,
+pub struct TestSwitchConfig {
+    pub name: String,
 }
 
 #[derive(Serialize, Deserialize)]
-struct TestMachineConfig {
-    name: String,
-    wayfinder: wayfinder::config::Config,
+pub struct TestMachineConfig {
+    pub name: String,
+    pub wayfinder: wayfinder::config::Config,
 }
 
 #[derive(Default)]
 pub struct TestHarness {
-    switches: HashMap<String, Switch<Mac>>,
-    machines: HashMap<String, TestRouter>,
+    pub switches: HashMap<String, Switch<Mac>>,
+    pub machines: HashMap<String, TestRouter>,
 }
 
 impl TestHarness {
@@ -38,7 +38,7 @@ impl TestHarness {
 
     pub async fn tick(&mut self, now: Duration) {
         for (_, router) in self.machines.iter_mut() {
-            router.drain_all().await;
+            router.poll(now).await;
         }
 
         for (_, switch) in self.switches.iter_mut() {
@@ -46,7 +46,7 @@ impl TestHarness {
         }
 
         for (_, router) in self.machines.iter_mut() {
-            router.poll(now).await;
+            router.drain_all().await;
         }
     }
 
@@ -74,12 +74,12 @@ impl TestHarness {
     }
 }
 
-fn mac(n: u8) -> Mac {
-    Mac([0, 0, 0, 0, 0, n + 1])
+pub fn mac(n: u8) -> Mac {
+    Mac([0, 0, 0, 0, 0, n])
 }
 
 impl TestConfig {
-    fn validate(&self) -> Result<TestHarness, String> {
+    pub fn validate(&self) -> Result<TestHarness, String> {
         let mut h = TestHarness::default();
         for switch in &self.switches {
             if h.switches
@@ -103,190 +103,5 @@ impl TestConfig {
         }
 
         Ok(h)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Once;
-
-    use tracing_subscriber::EnvFilter;
-    use wayfinder::config::{Config, LinkConfig};
-
-    use super::*;
-
-    static INIT: Once = Once::new();
-
-    fn setup() {
-        INIT.call_once(|| {
-            tracing_subscriber::fmt()
-                .with_env_filter(EnvFilter::from_default_env())
-                .with_test_writer() // Captures logs correctly within the test runner
-                .init();
-        });
-    }
-
-    fn simple_pair() -> TestHarness {
-        let mut config = TestConfig::default();
-        config.switches.push(TestSwitchConfig {
-            name: "switch1".into(),
-        });
-        config.machines.push(TestMachineConfig {
-            name: "machine1".into(),
-            wayfinder: Config {
-                links: vec![LinkConfig::Test {
-                    switch_name: "switch1".into(),
-                }],
-                ..Default::default()
-            },
-        });
-        config.machines.push(TestMachineConfig {
-            name: "machine2".into(),
-            wayfinder: Config {
-                links: vec![LinkConfig::Test {
-                    switch_name: "switch1".into(),
-                }],
-                ..Default::default()
-            },
-        });
-        config.validate().unwrap()
-    }
-
-    fn line_of_three() -> TestHarness {
-        let mut config = TestConfig::default();
-        config.switches.push(TestSwitchConfig {
-            name: "switch1".into(),
-        });
-        config.switches.push(TestSwitchConfig {
-            name: "switch2".into(),
-        });
-        config.machines.push(TestMachineConfig {
-            name: "machine1".into(),
-            wayfinder: Config {
-                links: vec![LinkConfig::Test {
-                    switch_name: "switch1".into(),
-                }],
-                ..Default::default()
-            },
-        });
-        config.machines.push(TestMachineConfig {
-            name: "machine2".into(),
-            wayfinder: Config {
-                links: vec![
-                    LinkConfig::Test {
-                        switch_name: "switch1".into(),
-                    },
-                    LinkConfig::Test {
-                        switch_name: "switch2".into(),
-                    },
-                ],
-                ..Default::default()
-            },
-        });
-        config.machines.push(TestMachineConfig {
-            name: "machine3".into(),
-            wayfinder: Config {
-                links: vec![LinkConfig::Test {
-                    switch_name: "switch2".into(),
-                }],
-                ..Default::default()
-            },
-        });
-        config.validate().unwrap()
-    }
-
-    #[tokio::test]
-    async fn test_validate() {
-        let config = TestConfig::default();
-        assert!(config.validate().is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_multi_same_switch() {
-        let mut config = TestConfig::default();
-        config.switches.push(TestSwitchConfig {
-            name: "test1".into(),
-        });
-        config.switches.push(TestSwitchConfig {
-            name: "test1".into(),
-        });
-        assert!(config.validate().is_err());
-    }
-
-    #[tokio::test]
-    #[should_panic]
-    async fn test_invalid_switch() {
-        let mut config = TestConfig::default();
-        config.machines.push(TestMachineConfig {
-            name: "foo".into(),
-            wayfinder: Config {
-                links: vec![LinkConfig::Test {
-                    switch_name: "invalid".into(),
-                }],
-                ..Default::default()
-            },
-        });
-        assert!(config.validate().is_err());
-    }
-
-    #[tokio::test]
-    async fn test_simple_pair() {
-        simple_pair();
-    }
-
-    #[tokio::test]
-    async fn test_simple_pair_send_data() {
-        setup();
-        let mut harness = simple_pair();
-
-        harness.tick(Duration::from_secs(1)).await;
-        harness.tick(Duration::from_secs(2)).await;
-
-        let ident = harness.get_machine_mut("machine2").ident;
-        harness
-            .get_machine_mut("machine1")
-            .send_local(ident, b"Hello World")
-            .await
-            .unwrap();
-
-        harness.tick(Duration::from_secs(3)).await;
-        harness.tick(Duration::from_secs(4)).await;
-
-        assert_eq!(
-            harness.get_machine("machine2").local_deliveries,
-            vec![b"Hello World"]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_line_of_three() {
-        line_of_three();
-    }
-
-    #[tokio::test]
-    async fn test_line_of_three_send_data() {
-        setup();
-        let mut harness = line_of_three();
-
-        harness.tick(Duration::from_secs(1)).await;
-        harness.tick(Duration::from_secs(2)).await;
-        harness.tick(Duration::from_secs(3)).await;
-        harness.tick(Duration::from_secs(4)).await;
-
-        let ident = harness.get_machine_mut("machine3").ident;
-        harness
-            .get_machine_mut("machine1")
-            .send_local(ident, b"Hello World")
-            .await
-            .unwrap();
-
-        harness.tick(Duration::from_secs(5)).await;
-        harness.tick(Duration::from_secs(6)).await;
-        harness.tick(Duration::from_secs(7)).await;
-
-        assert_eq!(
-            harness.get_machine("machine3").local_deliveries,
-            vec![b"Hello World"]
-        );
     }
 }

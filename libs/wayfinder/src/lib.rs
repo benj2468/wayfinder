@@ -16,7 +16,7 @@ use interfaces::{
     link::LinkMetrics,
 };
 use pretty_hex::pretty_hex;
-use tracing::{trace, warn};
+use tracing::warn;
 use zerocopy::IntoBytes;
 
 use crate::{

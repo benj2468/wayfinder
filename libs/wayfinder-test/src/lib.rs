@@ -1,7 +1,14 @@
-mod driver;
-// mod router_tests;
+pub mod driver;
 pub mod switch;
 pub mod test_router;
+
+pub mod prelude {
+    pub use super::driver::{TestConfig, TestHarness, TestMachineConfig, TestSwitchConfig, mac};
+    pub use super::test_router::{TestRouter, build_frame};
+}
+
+#[cfg(test)]
+mod integration_tests;
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Direction {
