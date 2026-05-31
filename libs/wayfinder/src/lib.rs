@@ -15,6 +15,7 @@ use interfaces::{
     frame::{LinkFrame, LinkFrameData, LinkFrameDataMut, Mac},
     link::LinkMetrics,
 };
+use pretty_hex::pretty_hex;
 use tracing::{trace, warn};
 use zerocopy::IntoBytes;
 
@@ -24,6 +25,9 @@ use crate::{
 };
 
 pub use crate::link_quality::LinkQualityRecord;
+
+#[cfg(feature = "alloc")]
+pub mod config;
 
 mod link_quality;
 mod routing_table;
@@ -129,7 +133,6 @@ impl CentralRouter {
     ///
     /// Returns an [`RxOutcome`]: any frame to (re)transmit onto the mesh and
     /// any inner payload to deliver to the local host.
-    #[tracing::instrument(skip(self, frame, tx_buf))]
     pub fn handle_frame_with_metrics<'rx, 'tx>(
         &mut self,
         iface_idx: usize,
@@ -137,6 +140,13 @@ impl CentralRouter {
         metrics: LinkMetrics,
         tx_buf: &'tx mut [u8],
     ) -> RxOutcome<'rx, 'tx> {
+        let src = frame.src;
+        let dst = frame.dst;
+        let protocol = frame.protocol;
+        let span = tracing::trace_span!("handle_frame", iface_idx, ?src, ?dst, ?protocol);
+        let _enter = span.enter();
+        tracing::trace!("{}", pretty_hex(&&frame.payload));
+
         tx_buf.fill(0);
         // 0. Update the link-quality table for the sender, keyed on the
         //    interface this frame arrived on.  Done before any further
@@ -148,7 +158,6 @@ impl CentralRouter {
         // 1. Add a record to the identifier table
         self.ident_table.add_record(iface_idx, frame.dst);
         // 2. Demux by Protocol ID
-
         match frame.protocol {
             DEFAULT_BATMAN_ETHER_TYPE => {
                 let mut reply: LinkFrameDataMut<'_> = tx_buf.into();
@@ -306,7 +315,7 @@ impl CentralRouter {
         })
     }
 
-    #[tracing::instrument(skip_all, level = "trace")]
+    #[tracing::instrument(skip_all, level = "info")]
     pub fn poll<'tx>(
         &mut self,
         now: core::time::Duration,
@@ -320,7 +329,6 @@ impl CentralRouter {
                 protocol: DEFAULT_BATMAN_ETHER_TYPE,
                 payload: ogm_payload,
             };
-            trace!("constructed OGM: {:?}", ogm);
             // Flood the OGM out of every radio interface to map the surrounding topology
             return Some(ogm);
         }

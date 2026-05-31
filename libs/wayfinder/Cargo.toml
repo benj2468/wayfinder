@@ -12,7 +12,14 @@ batman.workspace = true
 pretty-hex.workspace = true
 heapless.workspace = true
 embedded-io-async.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 tracing-test = "0.2.6"
 pretty-hex.workspace = true
+
+
+[features]
+default = ["alloc"]
+
+alloc = []

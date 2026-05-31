@@ -85,7 +85,7 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
 }
 
 impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGINATORS> {
-    #[tracing::instrument(skip(self, frame, reply), fields(self_ident = ?self.self_ident), level = "trace", ret)]
+    #[tracing::instrument(skip(self, frame, reply), fields(ident = ?self.self_ident), level = "info")]
     fn handle_rx<'rx, 'tx>(
         &mut self,
         frame: &'tx LinkFrame,
@@ -146,6 +146,7 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
                         last_seqno: 0,
                         paths: heapless::Vec::new(),
                     };
+                    tracing::info!("Discovered new originator: {:?}", new_record.neighbor_ident);
                     let _ = self.originator_table.push(new_record);
                     record_idx = Some(self.originator_table.len() - 1);
                 }
@@ -410,6 +411,7 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
         }
     }
 
+    #[tracing::instrument(skip(self, _now, tx_buffer), fields(ident = ?self.self_ident), level = "info")]
     fn produce_periodic_broadcast<'tx>(
         &mut self,
         _now: core::time::Duration,

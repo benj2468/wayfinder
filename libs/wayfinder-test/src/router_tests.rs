@@ -104,14 +104,8 @@ mod tests {
         )
     }
 
-    fn make_port_pair(buf: usize) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>, PortComms) {
-        let (tx_to_switch, rx_to_switch) = mpsc::channel(buf);
-        let (tx_from_switch, rx_from_switch) = mpsc::channel(buf);
-        (
-            tx_to_switch,
-            rx_from_switch,
-            PortComms::new(rx_to_switch, tx_from_switch),
-        )
+    fn make_port_pair(buf: usize) -> (PortComms, PortComms) {
+        PortComms::pair(buf)
     }
 
     // ── tests ─────────────────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::mem::size_of;
 
 use interfaces::frame::MeshIdentifier;
@@ -34,22 +35,23 @@ impl PortConfig {
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct PortId(u32);
 
-// TODO: Remove the PortComms and use IdentifiableLink here instead so that we can
-// be testing that functionality as well.
 pub struct PortComms {
-    to_switch: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    from_switch: tokio::sync::mpsc::Sender<Vec<u8>>,
+    pub egress: tokio::sync::mpsc::Sender<Vec<u8>>,
+    pub ingress: tokio::sync::mpsc::Receiver<Vec<u8>>,
 }
 
 impl PortComms {
     pub fn new(
-        to_switch: tokio::sync::mpsc::Receiver<Vec<u8>>,
-        from_switch: tokio::sync::mpsc::Sender<Vec<u8>>,
+        egress: tokio::sync::mpsc::Sender<Vec<u8>>,
+        ingress: tokio::sync::mpsc::Receiver<Vec<u8>>,
     ) -> Self {
-        Self {
-            to_switch,
-            from_switch,
-        }
+        Self { egress, ingress }
+    }
+
+    pub fn pair(buf: usize) -> (Self, Self) {
+        let (tx1, rx1) = tokio::sync::mpsc::channel(buf);
+        let (tx2, rx2) = tokio::sync::mpsc::channel(buf);
+        (Self::new(tx2, rx1), Self::new(tx1, rx2))
     }
 }
 
@@ -183,7 +185,7 @@ where
             .iter_mut()
             .map(|(id, port)| {
                 let mut msgs = vec![];
-                while let Ok(msg) = port.duplex.to_switch.try_recv() {
+                while let Ok(msg) = port.duplex.ingress.try_recv() {
                     if !self.rng.random_bool(port.config.incoming_loss) {
                         msgs.push(msg);
                     }
@@ -223,6 +225,7 @@ where
         for (port, msgs) in msgs {
             let port_config = self.ports.get(&port).unwrap();
             for mut msg in msgs {
+                tracing::trace!(port_id = ?port, direction = ?Direction::ToSwitch, "{:?}", msg);
                 if self.rng.random_bool(port_config.config.outgoing_loss) {
                     continue;
                 }
@@ -231,7 +234,9 @@ where
                     continue;
                 };
 
+                tracing::trace!(dest = ?dest, "forwarding message to dest");
                 if let Some(dest_port) = self.ident_map.get(dest) {
+                    tracing::trace!(port_id = ?dest_port, direction = ?Direction::FromSwitch, "{:?}", msg);
                     // Send to specific destination port
                     if let Some(taps) = self.taps.get_mut(dest_port) {
                         for tap in taps.iter_mut() {
@@ -251,7 +256,7 @@ where
                         .get(dest_port)
                         .unwrap()
                         .duplex
-                        .from_switch
+                        .egress
                         .send(msg.clone())
                         .await;
                 } else {
@@ -274,7 +279,7 @@ where
                             taps.retain(|t| !t.invalid);
                         }
 
-                        let _ = other_port.duplex.from_switch.send(msg.clone()).await;
+                        let _ = other_port.duplex.egress.send(msg.clone()).await;
                     }
                 }
             }
@@ -304,7 +309,7 @@ mod tests {
     ) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>, PortComms) {
         let (tx_to_switch, rx_to_switch) = mpsc::channel(buffer_size);
         let (tx_from_switch, rx_from_switch) = mpsc::channel(buffer_size);
-        let port_comms = PortComms::new(rx_to_switch, tx_from_switch);
+        let port_comms = PortComms::new(tx_from_switch, rx_to_switch);
         (tx_to_switch, rx_from_switch, port_comms)
     }
 

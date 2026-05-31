@@ -1758,6 +1758,7 @@ dependencies = [
  "heapless",
  "interfaces",
  "pretty-hex",
+ "serde",
  "thiserror",
  "tracing",
  "tracing-test",
@@ -1824,8 +1825,11 @@ dependencies = [
  "heapless",
  "interfaces",
  "rand",
+ "serde",
  "thiserror",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "wayfinder",
  "zerocopy",
 ]
@@ -1833,6 +1837,9 @@ dependencies = [
 [[package]]
 name = "wayfinder-workspace"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "widestring"

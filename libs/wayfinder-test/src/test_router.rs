@@ -28,6 +28,8 @@ use tokio::sync::mpsc;
 use wayfinder::{CentralRouter, EgressInterface};
 use zerocopy::{FromBytes, IntoBytes};
 
+use crate::{driver::TestHarness, switch::PortComms};
+
 // ── wire-format helpers ───────────────────────────────────────────────────────
 
 /// Serialize a `LinkFrame` into a heap-allocated byte vector.
@@ -68,19 +70,40 @@ pub struct TestRouter {
     /// The underlying router — exposed so tests can inspect routing state
     /// (e.g. originator tables) directly.
     pub router: CentralRouter,
-    ident: Mac,
-    /// Egress channel for each interface, indexed by interface index.
-    interfaces: Vec<mpsc::Sender<Vec<u8>>>,
+    pub ident: Mac,
+    /// Duplex channels for each interface, indexed by interface index.
+    pub interfaces: Vec<PortComms>,
     /// Inner frames the router handed up for local delivery (i.e. what would
     /// be written to the TAP), in arrival order.  Lets tests assert that a
     /// packet reached its final destination and was delivered intact.
-    local_deliveries: Vec<Vec<u8>>,
+    pub local_deliveries: Vec<Vec<u8>>,
 }
 
 impl TestRouter {
+    pub fn new_from_config(
+        h: &mut TestHarness,
+        mac: Mac,
+        config: &wayfinder::config::Config,
+    ) -> Self {
+        let mut interfaces = vec![];
+
+        for link in &config.links {
+            match link {
+                wayfinder::config::LinkConfig::Test { switch_name } => {
+                    let duplex = h.add_switch_port(switch_name);
+
+                    interfaces.push(duplex);
+                }
+                _ => panic!("unsupported link type in test mode"),
+            }
+        }
+
+        Self::new(mac, interfaces)
+    }
+
     /// Create a new test router with the given node identity and one egress
     /// sender per interface.
-    pub fn new(ident: Mac, interfaces: Vec<mpsc::Sender<Vec<u8>>>) -> Self {
+    pub fn new(ident: Mac, interfaces: Vec<PortComms>) -> Self {
         Self {
             router: CentralRouter::new(ident),
             ident,
@@ -188,6 +211,26 @@ impl TestRouter {
         }
     }
 
+    /// Drain all pending frames from links
+    pub async fn drain_all(&mut self) {
+        let msgs = self
+            .interfaces
+            .iter_mut()
+            .enumerate()
+            .flat_map(|(i, iface)| {
+                let mut pending = vec![];
+                while let Ok(raw) = iface.ingress.try_recv() {
+                    pending.push((i, raw));
+                }
+                pending
+            })
+            .collect::<Vec<_>>();
+
+        for (i, raw) in msgs {
+            self.receive(i, &raw).await;
+        }
+    }
+
     // ── internal ─────────────────────────────────────────────────────────────
 
     /// Route `wire` to the correct egress interface(s) for `dst`.
@@ -203,12 +246,12 @@ impl TestRouter {
         let egress = self.router.get_egress_interface(dst);
         match egress {
             Some(EgressInterface::Interface(idx)) if idx < self.interfaces.len() => {
-                let _ = self.interfaces[idx].send(wire).await;
+                let _ = self.interfaces[idx].egress.send(wire).await;
             }
             _ => {
                 // Broadcast destination or destination not yet learned — flood.
                 for tx in &self.interfaces {
-                    let _ = tx.send(wire.clone()).await;
+                    let _ = tx.egress.send(wire.clone()).await;
                 }
             }
         }

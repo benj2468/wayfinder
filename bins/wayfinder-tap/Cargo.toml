@@ -17,7 +17,7 @@ tokio-util.workspace = true
 tun-rs = { version = "2", features = ["async"] }
 etherparse.workspace = true
 embedded-io-adapters.workspace = true
-serde = { version = "1.0.228", features = ["derive"] }
+serde.workspace = true
 libc = "0.2.186"
 serde_yaml = "0.9.34"
 futures.workspace = true

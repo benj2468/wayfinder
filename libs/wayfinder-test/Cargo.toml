@@ -14,3 +14,8 @@ heapless.workspace = true
 embedded-io-async.workspace = true
 rand = { workspace = true, features = ["std"] }
 tokio.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
