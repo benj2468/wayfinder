@@ -1,6 +1,6 @@
 use interfaces::{
     engine::{MeshRoutingEngine, RoutingAction},
-    frame::{LinkFrame, LinkFrameDataMut, MeshIdentifier},
+    frame::{LinkFrame, LinkFrameDataMut, Mac},
 };
 use tracing::trace;
 use tracing::warn;
@@ -14,10 +14,10 @@ use crate::{
     },
 };
 
-impl<const MAX_ORIGINATORS: usize, Ident: MeshIdentifier> BatmanEngine<MAX_ORIGINATORS, Ident> {
+impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
     /// Actively queries the BATMAN routing table for a given destination.
     /// Returns the immediate next-hop MAC address if a route exists.
-    pub fn lookup_route(&self, destination: Ident) -> Option<Ident> {
+    pub fn lookup_route(&self, destination: Mac) -> Option<Mac> {
         // Look up the final target node in our calculated originator records
         self.originator_table
             .iter()
@@ -26,17 +26,13 @@ impl<const MAX_ORIGINATORS: usize, Ident: MeshIdentifier> BatmanEngine<MAX_ORIGI
     }
 }
 
-impl<const MAX_ORIGINATORS: usize, Ident> MeshRoutingEngine<Ident>
-    for BatmanEngine<MAX_ORIGINATORS, Ident>
-where
-    Ident: MeshIdentifier,
-{
+impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGINATORS> {
     #[tracing::instrument(skip(self, frame, reply), fields(self_ident = ?self.self_ident), level = "trace", ret)]
     fn handle_rx<'rx, 'tx>(
         &mut self,
-        frame: &'tx LinkFrame<Ident>,
-        reply: &mut LinkFrameDataMut<'rx, Ident>,
-    ) -> RoutingAction<Ident> {
+        frame: &'tx LinkFrame,
+        reply: &mut LinkFrameDataMut<'rx>,
+    ) -> RoutingAction {
         let src = frame.src;
         let dst = frame.dst;
         let protocol = frame.protocol;
@@ -133,9 +129,9 @@ where
                         outbound_ogm.prev_sender = self.self_ident;
 
                         // Write bytes into the ephemeral execution buffer provided by caller
-                        let size = core::mem::size_of::<BatmanOgmPacket<Ident>>();
+                        let size = core::mem::size_of::<BatmanOgmPacket>();
 
-                        reply.dst = Ident::BROADCAST;
+                        reply.dst = Mac::BROADCAST;
                         reply.protocol = ETH_P_BATMAN;
                         reply
                             .payload
@@ -197,10 +193,10 @@ where
                 let mut outbound = bcast;
                 outbound.ttl -= 1;
 
-                let header_size = core::mem::size_of::<BatmanBroadcastPacket<Ident>>();
+                let header_size = core::mem::size_of::<BatmanBroadcastPacket>();
                 let total = header_size + inner.len();
 
-                reply.dst = Ident::BROADCAST;
+                reply.dst = Mac::BROADCAST;
                 reply.protocol = ETH_P_BATMAN;
                 reply
                     .payload
@@ -213,7 +209,7 @@ where
                     .unwrap_or(&mut [])
                     .copy_from_slice(inner);
 
-                RoutingAction::DeliverLocalAndForward(Ident::BROADCAST)
+                RoutingAction::DeliverLocalAndForward(Mac::BROADCAST)
             }
 
             BATADV_UNICAST => {
@@ -247,7 +243,7 @@ where
                     let mut updated_hdr = unicast_hdr;
                     updated_hdr.ttl -= 1;
 
-                    let size = core::mem::size_of::<BatmanUnicastPacket<Ident>>();
+                    let size = core::mem::size_of::<BatmanUnicastPacket>();
                     let inner = frame.payload.get(size..).unwrap_or(&[]);
                     let total = size + inner.len();
 
@@ -304,7 +300,7 @@ where
             prev_sender: self.self_ident,
         };
 
-        let size = core::mem::size_of::<BatmanOgmPacket<Ident>>();
+        let size = core::mem::size_of::<BatmanOgmPacket>();
         tx_buffer[..size].copy_from_slice(ogm.as_bytes());
         Some(&tx_buffer[..size])
     }

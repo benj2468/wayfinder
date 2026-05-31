@@ -13,6 +13,7 @@ use tokio::{net::UdpSocket, sync::mpsc, task::JoinSet};
 use tracing_subscriber::EnvFilter;
 use tun_rs::{DeviceBuilder, Layer};
 use wayfinder::CentralRouter;
+use wayfinder::interfaces::frame::Mac;
 
 use crate::config::{Args, Config, LinkConfig, ServerConfig};
 use crate::executor::EventLoop;
@@ -110,9 +111,9 @@ async fn main() -> anyhow::Result<()> {
     let mut event_loop = EventLoop {
         tap: dev,
         interfaces,
-        router: CentralRouter::<[u8; 6]>::new(mac_addr),
+        router: CentralRouter::new(Mac(mac_addr)),
         query_rx,
-        mac_addr,
+        mac_addr: Mac(mac_addr),
         start: std::time::Instant::now(),
         rx_buffer: [0u8; 1500],
         tx_buffer: [0u8; 1500],

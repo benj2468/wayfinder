@@ -1,6 +1,6 @@
 use interfaces::{
     engine::{MeshRoutingEngine, RoutingAction},
-    frame::{LinkFrame, LinkFrameDataMut, MeshIdentifier},
+    frame::{LinkFrame, LinkFrameDataMut, Mac},
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -12,19 +12,26 @@ use crate::{
     },
 };
 
+// Map a compact `u8` test identifier to a full MAC address, e.g. `mac(2)` ->
+// `00:00:00:00:00:02`.  The engine is now concrete over [`Mac`], so the tests
+// build node addresses through this helper instead of bare `u8` literals.
+fn mac(n: u8) -> Mac {
+    Mac([0, 0, 0, 0, 0, n])
+}
+
 // Helper to create a LinkFrame from raw bytes
 fn make_link_frame(src: u8, dst: u8, protocol: u16, payload: Vec<u8>) -> Vec<u8> {
     let mut data = Vec::new();
-    data.extend_from_slice(src.as_bytes());
-    data.extend_from_slice(dst.as_bytes());
+    data.extend_from_slice(mac(src).as_bytes());
+    data.extend_from_slice(mac(dst).as_bytes());
     data.extend_from_slice(&protocol.to_ne_bytes());
     data.extend(payload);
     data
 }
 
 // Helper to parse a LinkFrame from bytes
-fn parse_link_frame(data: &[u8]) -> &LinkFrame<u8> {
-    LinkFrame::<u8>::ref_from_prefix(data).unwrap().0
+fn parse_link_frame(data: &[u8]) -> &LinkFrame {
+    LinkFrame::ref_from_prefix(data).unwrap().0
 }
 
 // Helper to create an OGM packet
@@ -35,8 +42,8 @@ fn make_ogm(orig: u8, prev_sender: u8, seqno: u32, tq: u8, ttl: u8) -> Vec<u8> {
         ttl,
         tq,
         seqno: seqno.to_be(), // Network byte order
-        orig,
-        prev_sender,
+        orig: mac(orig),
+        prev_sender: mac(prev_sender),
     };
     ogm.as_bytes().to_vec()
 }
@@ -48,7 +55,7 @@ fn make_unicast(dest: u8, ttl: u8, payload: &[u8]) -> Vec<u8> {
         packet_type: BATADV_UNICAST,
         version: 5,
         ttl,
-        dest: dest,
+        dest: mac(dest),
     };
     data.extend_from_slice(unicast.as_bytes());
     data.extend_from_slice(payload);
@@ -64,7 +71,7 @@ fn make_broadcast(orig: u8, seqno: u32, ttl: u8, inner: &[u8]) -> Vec<u8> {
         version: 5,
         ttl,
         seqno: seqno.to_be(), // Network byte order, like the OGM seqno
-        orig,
+        orig: mac(orig),
     };
     data.extend_from_slice(bcast.as_bytes());
     data.extend_from_slice(inner);
@@ -80,12 +87,12 @@ mod ogm_generation {
     #[test]
     fn test_generate_initial_ogm() {
         let mut tx_buf = [0u8; 1024];
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         let ogm_bytes = engine
             .produce_periodic_broadcast(Duration::ZERO, &mut tx_buf)
             .unwrap();
-        let (ogm, _) = BatmanOgmPacket::<u8>::ref_from_prefix(ogm_bytes).unwrap();
+        let (ogm, _) = BatmanOgmPacket::ref_from_prefix(ogm_bytes).unwrap();
 
         assert_eq!(ogm.packet_type, BATADV_IV_OGM);
         assert_eq!(ogm.version, 5);
@@ -93,21 +100,21 @@ mod ogm_generation {
         assert_eq!(ogm.tq, 255); // Maximum quality at origin
         let seqno = ogm.seqno;
         assert_eq!(seqno, 1u32.to_be()); // First sequence number (in network byte order)
-        assert_eq!(ogm.orig, 1);
-        assert_eq!(ogm.prev_sender, 1);
+        assert_eq!(ogm.orig, mac(1));
+        assert_eq!(ogm.prev_sender, mac(1));
     }
 
     #[test]
     fn test_sequence_number_increments() {
         let mut tx_buf = [0u8; 1024];
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Generate multiple OGMs
         for i in 1..=5 {
             let ogm_bytes = engine
                 .produce_periodic_broadcast(Duration::ZERO, &mut tx_buf)
                 .unwrap();
-            let (ogm, _) = BatmanOgmPacket::<u8>::ref_from_prefix(ogm_bytes).unwrap();
+            let (ogm, _) = BatmanOgmPacket::ref_from_prefix(ogm_bytes).unwrap();
             let seqno = ogm.seqno;
             assert_eq!(seqno, (i as u32).to_be()); // Check in network byte order
         }
@@ -116,7 +123,7 @@ mod ogm_generation {
     #[test]
     fn test_sequence_number_wraps() {
         let mut tx_buf = [0u8; 1024];
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
         engine.sequence_number = u32::MAX - 1;
 
         engine
@@ -125,7 +132,7 @@ mod ogm_generation {
         let ogm_bytes = engine
             .produce_periodic_broadcast(Duration::ZERO, &mut tx_buf)
             .unwrap();
-        let (ogm, _) = BatmanOgmPacket::<u8>::ref_from_prefix(ogm_bytes).unwrap();
+        let (ogm, _) = BatmanOgmPacket::ref_from_prefix(ogm_bytes).unwrap();
         let seqno = ogm.seqno;
         // Should wrap to 0
         assert_eq!(seqno, 0u32.to_be());
@@ -138,7 +145,7 @@ mod ogm_processing {
 
     #[test]
     fn test_self_ogm_loop_prevention() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive our own OGM
         let ogm_payload = make_ogm(1, 1, 100, 255, 50);
@@ -157,7 +164,7 @@ mod ogm_processing {
 
     #[test]
     fn test_new_originator_creation() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive OGM from node 2 via node 2 (direct neighbor)
         let ogm_payload = make_ogm(2, 2, 1, 255, 50);
@@ -173,8 +180,8 @@ mod ogm_processing {
         assert_eq!(engine.originator_table.len(), 1);
 
         let record = &engine.originator_table[0];
-        assert_eq!(record.neighbor_ident, 2);
-        assert_eq!(record.best_next_hop, 2);
+        assert_eq!(record.neighbor_ident, mac(2));
+        assert_eq!(record.best_next_hop, mac(2));
         assert_eq!(record.last_seqno, 1);
         // TQ should be 255 - 10 = 245 after attenuation
         assert_eq!(record.max_tq, 245);
@@ -182,7 +189,7 @@ mod ogm_processing {
 
     #[test]
     fn test_tq_attenuation() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive OGM with TQ 255
         let ogm_payload = make_ogm(2, 2, 1, 255, 50);
@@ -200,7 +207,7 @@ mod ogm_processing {
 
     #[test]
     fn test_tq_saturation_at_zero() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive OGM with very low TQ
         let ogm_payload = make_ogm(2, 2, 1, 5, 50);
@@ -218,7 +225,7 @@ mod ogm_processing {
 
     #[test]
     fn test_ogm_forwarding() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive OGM from node 3 via node 2
         let ogm_payload = make_ogm(3, 2, 1, 245, 50);
@@ -233,20 +240,20 @@ mod ogm_processing {
         assert!(matches!(action, RoutingAction::Consumed));
 
         // Check that reply buffer contains forwarded OGM
-        assert_eq!(reply.dst, u8::BROADCAST);
+        assert_eq!(reply.dst, Mac::BROADCAST);
         assert_eq!(reply.protocol, ETH_P_BATMAN);
 
         // Parse the forwarded OGM
-        let (forwarded_ogm, _) = BatmanOgmPacket::<u8>::ref_from_prefix(reply.payload).unwrap();
-        assert_eq!(forwarded_ogm.orig, 3); // Original source unchanged
-        assert_eq!(forwarded_ogm.prev_sender, 1); // Updated to self
+        let (forwarded_ogm, _) = BatmanOgmPacket::ref_from_prefix(reply.payload).unwrap();
+        assert_eq!(forwarded_ogm.orig, mac(3)); // Original source unchanged
+        assert_eq!(forwarded_ogm.prev_sender, mac(1)); // Updated to self
         assert_eq!(forwarded_ogm.ttl, 49); // Decremented from 50 to 49
         assert_eq!(forwarded_ogm.tq, 235); // Attenuated from 245 to 235
     }
 
     #[test]
     fn test_ogm_ttl_expiration() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive OGM with TTL = 1
         let ogm_payload = make_ogm(2, 2, 1, 255, 1);
@@ -266,7 +273,7 @@ mod ogm_processing {
 
     #[test]
     fn test_multiple_paths_to_originator() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive OGM from node 5 via node 2 (first path)
         let ogm1 = make_ogm(5, 2, 1, 240, 50);
@@ -287,13 +294,13 @@ mod ogm_processing {
         assert_eq!(record.paths.len(), 2);
 
         // Best next hop should be node 3 (higher TQ: 250-10=240 vs 240-10=230)
-        assert_eq!(record.best_next_hop, 3);
+        assert_eq!(record.best_next_hop, mac(3));
         assert_eq!(record.max_tq, 240);
     }
 
     #[test]
     fn test_path_limit_per_originator() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Add 5 different paths (limit is 4)
         for neighbor in 2..=6 {
@@ -311,7 +318,7 @@ mod ogm_processing {
 
     #[test]
     fn test_sequence_number_update() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive initial OGM
         let ogm1 = make_ogm(2, 2, 100, 255, 50);
@@ -332,7 +339,7 @@ mod ogm_processing {
 
     #[test]
     fn test_old_sequence_number_ignored() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive initial OGM with seqno 100
         let ogm1 = make_ogm(2, 2, 100, 255, 50);
@@ -355,7 +362,7 @@ mod ogm_processing {
 
     #[test]
     fn test_originator_table_capacity() {
-        let mut engine: BatmanEngine<4, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<4> = BatmanEngine::new(mac(1));
 
         // Fill table to capacity (4 originators)
         for orig in 10..14 {
@@ -386,7 +393,7 @@ mod unicast_forwarding {
 
     #[test]
     fn test_unicast_local_delivery() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive unicast packet destined for us
         let unicast_payload = make_unicast(1, 10, b"Hello");
@@ -403,7 +410,7 @@ mod unicast_forwarding {
 
     #[test]
     fn test_unicast_ttl_expiration() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Add a route to node 5 via node 2
         let ogm = make_ogm(5, 2, 1, 255, 50);
@@ -425,7 +432,7 @@ mod unicast_forwarding {
 
     #[test]
     fn test_unicast_forwarding_with_ttl_decrement() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Add a route to node 5 via node 2
         let ogm = make_ogm(5, 2, 1, 255, 50);
@@ -444,19 +451,18 @@ mod unicast_forwarding {
         assert!(matches!(action, RoutingAction::Consumed));
 
         // Check reply buffer
-        assert_eq!(reply.dst, 2); // Should forward to node 2
+        assert_eq!(reply.dst, mac(2)); // Should forward to node 2
         assert_eq!(reply.protocol, ETH_P_BATMAN);
 
         // Parse the forwarded unicast header
-        let (forwarded_unicast, _) =
-            BatmanUnicastPacket::<u8>::ref_from_prefix(reply.payload).unwrap();
-        assert_eq!(forwarded_unicast.dest, 5); // Destination unchanged
+        let (forwarded_unicast, _) = BatmanUnicastPacket::ref_from_prefix(reply.payload).unwrap();
+        assert_eq!(forwarded_unicast.dest, mac(5)); // Destination unchanged
         assert_eq!(forwarded_unicast.ttl, 9); // TTL decremented from 10 to 9
     }
 
     #[test]
     fn test_unicast_unknown_destination() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive unicast for unknown destination
         let unicast_payload = make_unicast(99, 10, b"data");
@@ -479,7 +485,7 @@ mod routing_lookup {
 
     #[test]
     fn test_lookup_route_exists() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Add a route to node 5 via node 2
         let ogm = make_ogm(5, 2, 1, 255, 50);
@@ -488,21 +494,21 @@ mod routing_lookup {
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
         engine.handle_rx(parse_link_frame(&frame), &mut reply);
 
-        let next_hop = engine.lookup_route(5);
-        assert_eq!(next_hop, Some(2));
+        let next_hop = engine.lookup_route(mac(5));
+        assert_eq!(next_hop, Some(mac(2)));
     }
 
     #[test]
     fn test_lookup_route_not_exists() {
-        let engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
-        let next_hop = engine.lookup_route(99);
+        let next_hop = engine.lookup_route(mac(99));
         assert_eq!(next_hop, None);
     }
 
     #[test]
     fn test_lookup_route_updates_with_better_path() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Add route to node 5 via node 2 (TQ=200)
         let ogm1 = make_ogm(5, 2, 1, 200, 50);
@@ -511,7 +517,7 @@ mod routing_lookup {
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
         engine.handle_rx(parse_link_frame(&frame1), &mut reply);
 
-        assert_eq!(engine.lookup_route(5), Some(2));
+        assert_eq!(engine.lookup_route(mac(5)), Some(mac(2)));
 
         // Add better route to node 5 via node 3 (TQ=250)
         let ogm2 = make_ogm(5, 3, 2, 250, 50);
@@ -519,7 +525,7 @@ mod routing_lookup {
         engine.handle_rx(parse_link_frame(&frame2), &mut reply);
 
         // Should now route via node 3
-        assert_eq!(engine.lookup_route(5), Some(3));
+        assert_eq!(engine.lookup_route(mac(5)), Some(mac(3)));
     }
 }
 
@@ -529,7 +535,7 @@ mod protocol_filtering {
 
     #[test]
     fn test_wrong_protocol_ignored() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Send packet with wrong protocol number
         let frame_bytes = make_link_frame(2, 1, 0x0800, vec![1, 2, 3, 4]);
@@ -546,7 +552,7 @@ mod protocol_filtering {
 
     #[test]
     fn test_empty_payload_ignored() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Send BATMAN packet with empty payload
         let frame_bytes = make_link_frame(2, 1, ETH_P_BATMAN, vec![]);
@@ -562,7 +568,7 @@ mod protocol_filtering {
 
     #[test]
     fn test_unknown_batman_packet_type() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Send packet with unknown BATMAN packet type destined for node 5 (not us)
         let frame_bytes = make_link_frame(2, 5, ETH_P_BATMAN, vec![0x99, 1, 2, 3]);
@@ -579,7 +585,7 @@ mod protocol_filtering {
 
     #[test]
     fn test_malformed_ogm_ignored() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Send truncated OGM packet
         let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, vec![BATADV_IV_OGM, 5, 50]);
@@ -601,7 +607,7 @@ mod edge_cases {
 
     #[test]
     fn test_rapid_sequence_number_changes() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Rapidly changing sequence numbers
         for seqno in [1, 100, 50, 200, 75, 300] {
@@ -618,7 +624,7 @@ mod edge_cases {
 
     #[test]
     fn test_same_originator_different_paths_simultaneous() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive OGMs from same originator via different neighbors in quick succession
         let neighbors = [2, 3, 4, 5];
@@ -634,12 +640,12 @@ mod edge_cases {
         assert_eq!(engine.originator_table.len(), 1);
         assert_eq!(engine.originator_table[0].paths.len(), 4);
         // Best path should be via neighbor 2 (highest TQ)
-        assert_eq!(engine.originator_table[0].best_next_hop, 2);
+        assert_eq!(engine.originator_table[0].best_next_hop, mac(2));
     }
 
     #[test]
     fn test_zero_ttl_not_forwarded() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive OGM with TTL=0 (shouldn't happen in practice, but test boundary)
         let ogm = make_ogm(2, 2, 1, 255, 0);
@@ -656,7 +662,7 @@ mod edge_cases {
 
     #[test]
     fn test_path_metric_updates_on_same_neighbor() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // First OGM from originator 5 via neighbor 2
         let ogm1 = make_ogm(5, 2, 1, 200, 50);
@@ -693,7 +699,7 @@ mod broadcast_processing {
     /// preserved verbatim so the next hop can deliver it too.
     #[test]
     fn test_broadcast_deliver_and_reflood() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Broadcast originated by node 2, relayed to us directly by node 2.
         let payload = make_broadcast(2, 100, 50, INNER);
@@ -709,16 +715,16 @@ mod broadcast_processing {
         // The forward destination is the broadcast address.
         assert!(matches!(
             action,
-            RoutingAction::DeliverLocalAndForward(0xff)
+            RoutingAction::DeliverLocalAndForward(dst) if dst == Mac::BROADCAST
         ));
 
         // The re-flood lives in the reply scratchpad, addressed to broadcast.
-        assert_eq!(reply.dst, u8::BROADCAST);
+        assert_eq!(reply.dst, Mac::BROADCAST);
         assert_eq!(reply.protocol, ETH_P_BATMAN);
 
-        let (out, rest) = BatmanBroadcastPacket::<u8>::ref_from_prefix(reply.payload).unwrap();
+        let (out, rest) = BatmanBroadcastPacket::ref_from_prefix(reply.payload).unwrap();
         assert_eq!(out.packet_type, BATADV_BCAST);
-        assert_eq!(out.orig, 2); // originator unchanged through the relay
+        assert_eq!(out.orig, mac(2)); // originator unchanged through the relay
         let seqno = out.seqno;
         assert_eq!(seqno, 100u32.to_be()); // seqno unchanged
         assert_eq!(out.ttl, 49); // decremented from 50
@@ -730,7 +736,7 @@ mod broadcast_processing {
     /// A node must never act on its own re-flooded broadcast looping back.
     #[test]
     fn test_own_broadcast_dropped() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         let payload = make_broadcast(1, 100, 50, INNER); // orig == self_ident
         let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, payload);
@@ -749,7 +755,7 @@ mod broadcast_processing {
     /// circulate forever around a cyclic mesh.
     #[test]
     fn test_duplicate_broadcast_dropped() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         let payload = make_broadcast(2, 100, 50, INNER);
         let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, payload);
@@ -773,7 +779,7 @@ mod broadcast_processing {
     /// but is NOT re-flooded — mirroring OGM TTL expiry.
     #[test]
     fn test_broadcast_ttl_expiry_delivers_without_reflood() {
-        let mut engine: BatmanEngine<8, u8> = BatmanEngine::new(1);
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         let payload = make_broadcast(2, 100, 1, INNER); // ttl == 1, cannot forward
         let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, payload);

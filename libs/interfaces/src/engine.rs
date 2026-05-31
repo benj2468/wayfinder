@@ -1,14 +1,14 @@
-use crate::frame::{LinkFrame, LinkFrameDataMut};
+use crate::frame::{LinkFrame, LinkFrameDataMut, Mac};
 
 #[derive(Debug)]
-pub enum RoutingAction<Ident> {
+pub enum RoutingAction {
     /// The packet was a BATMAN control message (like an OGM);
     /// the engine consumed it to update its internal routing tables.
     Consumed,
 
     /// The packet was data destined for another node.
     /// Forward it to this next-hop MAC address on the mesh network.
-    ForwardTo(Ident),
+    ForwardTo(Mac),
 
     /// The packet has reached its final destination (this node).
     /// Hand it up to the local application layer.
@@ -24,17 +24,17 @@ pub enum RoutingAction<Ident> {
     /// [`RoutingAction::DeliverLocal`].
     ///
     /// [`MeshIdentifier::BROADCAST`]: crate::frame::MeshIdentifier::BROADCAST
-    DeliverLocalAndForward(Ident),
+    DeliverLocalAndForward(Mac),
 }
 
-pub trait MeshRoutingEngine<Ident> {
+pub trait MeshRoutingEngine {
     /// Ingest an incoming frame from the central router.
     /// The engine processes it, updates metrics, and returns the next logical step.
     fn handle_rx<'rx, 'tx>(
         &mut self,
-        frame: &'rx LinkFrame<Ident>,
-        reply: &mut LinkFrameDataMut<'tx, Ident>,
-    ) -> RoutingAction<Ident>;
+        frame: &'rx LinkFrame,
+        reply: &mut LinkFrameDataMut<'tx>,
+    ) -> RoutingAction;
 
     /// Force the engine to generate its regular periodic routing messages (OGMs).
     /// Returns a closure or a slice instructing the manager what to broadcast.

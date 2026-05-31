@@ -1,11 +1,13 @@
 //! Integration tests for the event loop, driving [`EventLoop::run_once`] against
 //! a fake TAP and an in-process mesh interface.
 
+use async_trait::async_trait;
 use tokio::sync::mpsc;
 use wayfinder::CentralRouter;
 use wayfinder::batman::wire::{
     BATADV_BCAST, BATADV_IV_OGM, BATADV_UNICAST, BatmanOgmPacket, BatmanUnicastPacket, ETH_P_BATMAN,
 };
+use wayfinder::interfaces::frame::Mac;
 use zerocopy::IntoBytes;
 
 use wayfinder_server::QueryTx;
@@ -40,6 +42,7 @@ impl FakeTap {
     }
 }
 
+#[async_trait]
 impl AsyncIo for FakeTap {
     async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         let frame = self.inbound.lock().await.recv().await;
@@ -106,9 +109,9 @@ fn harness(mac: [u8; 6]) -> Harness {
         ev: EventLoop {
             tap,
             interfaces: vec![Link::new(near)],
-            router: CentralRouter::<[u8; 6]>::new(mac),
+            router: CentralRouter::new(Mac(mac)),
             query_rx: qrx,
-            mac_addr: mac,
+            mac_addr: Mac(mac),
             start: std::time::Instant::now(),
             rx_buffer: [0u8; 1500],
             tx_buffer: [0u8; 1500],
@@ -158,14 +161,14 @@ async fn tap_unicast_frame_routes_to_learned_peer() {
     let mut h = harness(mac);
 
     // 1) Peer announces itself via an OGM (delivered on the interface).
-    let ogm = BatmanOgmPacket::<[u8; 6]> {
+    let ogm = BatmanOgmPacket {
         packet_type: BATADV_IV_OGM,
         version: 5,
         ttl: 50,
         tq: 255,
         seqno: 1u32.to_be(),
-        orig: peer,
-        prev_sender: peer,
+        orig: Mac(peer),
+        prev_sender: Mac(peer),
     };
     h.far
         .send(&link_wire(peer, [0xff; 6], ogm.as_bytes()))
@@ -202,11 +205,11 @@ async fn mesh_unicast_for_self_is_written_to_tap() {
     let mut h = harness(mac);
 
     let inner = b"INNER ETHERNET FRAME FOR THE HOST";
-    let hdr = BatmanUnicastPacket::<[u8; 6]> {
+    let hdr = BatmanUnicastPacket {
         packet_type: BATADV_UNICAST,
         version: 5,
         ttl: 50,
-        dest: mac,
+        dest: Mac(mac),
     };
     let mut batman = hdr.as_bytes().to_vec();
     batman.extend_from_slice(inner);
@@ -230,11 +233,11 @@ async fn two_frames_on_one_interface_stay_distinct() {
 
     let inners: [&[u8]; 2] = [b"first frame!!", b"second frame!"];
     for inner in inners {
-        let hdr = BatmanUnicastPacket::<[u8; 6]> {
+        let hdr = BatmanUnicastPacket {
             packet_type: BATADV_UNICAST,
             version: 5,
             ttl: 50,
-            dest: mac,
+            dest: Mac(mac),
         };
         let mut batman = hdr.as_bytes().to_vec();
         batman.extend_from_slice(inner);

@@ -21,28 +21,23 @@
 use std::time::Duration;
 
 use interfaces::{
-    frame::{LinkFrame, MeshIdentifier},
+    frame::{LinkFrame, Mac},
     link::LinkMetrics,
 };
 use tokio::sync::mpsc;
 use wayfinder::{CentralRouter, EgressInterface};
-use zerocopy::FromBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 // ── wire-format helpers ───────────────────────────────────────────────────────
 
-/// Serialize a `LinkFrame<Ident>` into a heap-allocated byte vector.
+/// Serialize a `LinkFrame` into a heap-allocated byte vector.
 ///
-/// Wire layout (matches `#[repr(C, packed)]` of `LinkFrame<Ident>`):
+/// Wire layout (matches `#[repr(C, packed)]` of `LinkFrame`):
 /// ```text
-/// [src: Ident][dst: Ident][protocol: u16 native-endian][payload ...]
+/// [src: Mac][dst: Mac][protocol: u16 native-endian][payload ...]
 /// ```
-pub fn build_frame<Ident: MeshIdentifier>(
-    src: Ident,
-    dst: Ident,
-    protocol: u16,
-    payload: &[u8],
-) -> Vec<u8> {
-    let ident_size = core::mem::size_of::<Ident>();
+pub fn build_frame(src: Mac, dst: Mac, protocol: u16, payload: &[u8]) -> Vec<u8> {
+    let ident_size = core::mem::size_of::<Mac>();
     let mut bytes = Vec::with_capacity(ident_size * 2 + 2 + payload.len());
     bytes.extend_from_slice(src.as_bytes());
     bytes.extend_from_slice(dst.as_bytes());
@@ -51,11 +46,11 @@ pub fn build_frame<Ident: MeshIdentifier>(
     bytes
 }
 
-/// Zero-copy parse of raw bytes into a `&LinkFrame<Ident>`.
+/// Zero-copy parse of raw bytes into a `&LinkFrame`.
 ///
 /// The returned reference borrows directly from `bytes` — no allocation.
-pub fn parse_frame<Ident: MeshIdentifier>(bytes: &[u8]) -> &LinkFrame<Ident> {
-    LinkFrame::<Ident>::ref_from_bytes(bytes).expect("failed to parse LinkFrame from bytes")
+pub fn parse_frame(bytes: &[u8]) -> &LinkFrame {
+    LinkFrame::ref_from_bytes(bytes).expect("failed to parse LinkFrame from bytes")
 }
 
 // ── TestRouter ────────────────────────────────────────────────────────────────
@@ -69,11 +64,11 @@ pub fn parse_frame<Ident: MeshIdentifier>(bytes: &[u8]) -> &LinkFrame<Ident> {
 /// [`poll`]: TestRouter::poll
 /// [`receive`]: TestRouter::receive
 /// [`send_local`]: TestRouter::send_local
-pub struct TestRouter<Ident: MeshIdentifier> {
+pub struct TestRouter {
     /// The underlying router — exposed so tests can inspect routing state
     /// (e.g. originator tables) directly.
-    pub router: CentralRouter<Ident>,
-    ident: Ident,
+    pub router: CentralRouter,
+    ident: Mac,
     /// Egress channel for each interface, indexed by interface index.
     interfaces: Vec<mpsc::Sender<Vec<u8>>>,
     /// Inner frames the router handed up for local delivery (i.e. what would
@@ -82,13 +77,10 @@ pub struct TestRouter<Ident: MeshIdentifier> {
     local_deliveries: Vec<Vec<u8>>,
 }
 
-// `CentralRouter`'s `handle_frame`, `handle_local`, and `get_egress_interface`
-// are all in an `impl<Ident: MeshIdentifier + 'static>` block, so we need the
-// same bound here.
-impl<Ident: MeshIdentifier + 'static> TestRouter<Ident> {
+impl TestRouter {
     /// Create a new test router with the given node identity and one egress
     /// sender per interface.
-    pub fn new(ident: Ident, interfaces: Vec<mpsc::Sender<Vec<u8>>>) -> Self {
+    pub fn new(ident: Mac, interfaces: Vec<mpsc::Sender<Vec<u8>>>) -> Self {
         Self {
             router: CentralRouter::new(ident),
             ident,
@@ -128,7 +120,7 @@ impl<Ident: MeshIdentifier + 'static> TestRouter<Ident> {
     ///
     /// Returns `Err(())` if the router has no route to `dest` (propagated
     /// from `handle_local`).
-    pub async fn send_local(&mut self, dest: Ident, payload: &[u8]) -> Result<(), ()> {
+    pub async fn send_local(&mut self, dest: Mac, payload: &[u8]) -> Result<(), ()> {
         let my_ident = self.ident;
         let mut buf = [0u8; 512];
         let frame = self.router.handle_local(dest, payload, &mut buf)?;
@@ -165,7 +157,7 @@ impl<Ident: MeshIdentifier + 'static> TestRouter<Ident> {
     ) {
         let my_ident = self.ident;
         let mut buf = [0u8; 512];
-        let frame = parse_frame::<Ident>(raw);
+        let frame = parse_frame(raw);
         let outcome = self
             .router
             .handle_frame_with_metrics(iface_idx, frame, metrics, &mut buf);
@@ -205,7 +197,7 @@ impl<Ident: MeshIdentifier + 'static> TestRouter<Ident> {
     /// | Known unicast `dst` | Single interface via `get_egress_interface` |
     /// | Broadcast `dst` | All interfaces |
     /// | Unknown `dst` (not yet in ident table) | All interfaces (flood) |
-    async fn send_egress(&mut self, dst: Ident, wire: Vec<u8>) {
+    async fn send_egress(&mut self, dst: Mac, wire: Vec<u8>) {
         // Resolve the egress decision before accessing self.interfaces so the
         // mutable borrow of self.router does not overlap with the channel sends.
         let egress = self.router.get_egress_interface(dst);

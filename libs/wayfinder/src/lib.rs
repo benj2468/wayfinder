@@ -3,8 +3,6 @@
 pub use batman;
 pub use interfaces;
 
-use core::marker::PhantomData;
-
 use batman::{
     BatmanEngine,
     wire::{
@@ -13,7 +11,7 @@ use batman::{
 };
 use interfaces::{
     engine::{MeshRoutingEngine, RoutingAction},
-    frame::{LinkFrame, LinkFrameData, LinkFrameDataMut, MeshIdentifier},
+    frame::{LinkFrame, LinkFrameData, LinkFrameDataMut, Mac},
     link::LinkMetrics,
 };
 use tracing::{trace, warn};
@@ -49,18 +47,18 @@ pub enum EgressInterface {
 /// borrowed straight out of the received frame (`'rx`).  Both, either, or
 /// neither may be present for a given frame.
 #[derive(Debug)]
-pub struct RxOutcome<'rx, 'tx, Ident> {
+pub struct RxOutcome<'rx, 'tx> {
     /// A frame to (re)transmit onto the mesh — a forwarded unicast, a
     /// re-flooded broadcast, or an OGM reply.  Dispatch it via
     /// [`CentralRouter::get_egress_interface`].  Borrows the transmit buffer.
-    pub forward: Option<LinkFrameData<'tx, Ident>>,
+    pub forward: Option<LinkFrameData<'tx>>,
     /// The inner payload to hand up to the local host (write it to the TAP),
     /// present when a packet reached its final local destination.  Borrows
     /// the received frame.
     pub deliver_local: Option<&'rx [u8]>,
 }
 
-impl<Ident> RxOutcome<'_, '_, Ident> {
+impl RxOutcome<'_, '_> {
     /// An outcome that neither forwards nor delivers anything — the result of
     /// a consumed control packet or a dropped frame.
     fn empty() -> Self {
@@ -71,26 +69,21 @@ impl<Ident> RxOutcome<'_, '_, Ident> {
     }
 }
 
-pub struct CentralRouter<Ident: MeshIdentifier> {
+pub struct CentralRouter {
     /// The Batman routing engine for this router
-    batman: BatmanEngine<100, Ident>,
-    ident_table: IdentTable<Ident>,
-    link_quality: LinkQualityTable<Ident>,
-    phantom: PhantomData<Ident>,
+    batman: BatmanEngine<100>,
+    ident_table: IdentTable<Mac>,
+    link_quality: LinkQualityTable<Mac>,
 }
 
-impl<Ident: MeshIdentifier> CentralRouter<Ident> {
-    pub fn new(self_ident: Ident) -> Self {
+impl CentralRouter {
+    pub fn new(self_ident: Mac) -> Self {
         Self {
             batman: BatmanEngine::new(self_ident),
-            phantom: PhantomData,
             ident_table: IdentTable::new(),
             link_quality: LinkQualityTable::new(),
         }
     }
-}
-
-impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
     /// Process a received link-layer frame without any physical-layer
     /// metrics — equivalent to calling [`handle_frame_with_metrics`] with
     /// [`LinkMetrics::default`].  Useful for tests and for links that
@@ -100,9 +93,9 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
     pub fn handle_frame<'rx, 'tx>(
         &mut self,
         iface_idx: usize,
-        frame: &'rx LinkFrame<Ident>,
+        frame: &'rx LinkFrame,
         tx_buf: &'tx mut [u8],
-    ) -> RxOutcome<'rx, 'tx, Ident> {
+    ) -> RxOutcome<'rx, 'tx> {
         self.handle_frame_with_metrics(iface_idx, frame, LinkMetrics::default(), tx_buf)
     }
 
@@ -118,10 +111,10 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
     pub fn handle_frame_with_metrics<'rx, 'tx>(
         &mut self,
         iface_idx: usize,
-        frame: &'rx LinkFrame<Ident>,
+        frame: &'rx LinkFrame,
         metrics: LinkMetrics,
         tx_buf: &'tx mut [u8],
-    ) -> RxOutcome<'rx, 'tx, Ident> {
+    ) -> RxOutcome<'rx, 'tx> {
         tx_buf.fill(0);
         // 0. Update the link-quality table for the sender, keyed on the
         //    interface this frame arrived on.  Done before any further
@@ -136,7 +129,7 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
 
         match frame.protocol {
             DEFAULT_BATMAN_ETHER_TYPE => {
-                let mut reply: LinkFrameDataMut<'_, Ident> = tx_buf.into();
+                let mut reply: LinkFrameDataMut<'_> = tx_buf.into();
 
                 // BATMAN-adv Protocol ID
                 let action = self.batman.handle_rx(frame, &mut reply);
@@ -226,8 +219,8 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
     /// delivered whole (offset 0).
     fn inner_offset(payload: &[u8]) -> usize {
         match payload.first() {
-            Some(&BATADV_UNICAST) => core::mem::size_of::<BatmanUnicastPacket<Ident>>(),
-            Some(&BATADV_BCAST) => core::mem::size_of::<BatmanBroadcastPacket<Ident>>(),
+            Some(&BATADV_UNICAST) => core::mem::size_of::<BatmanUnicastPacket>(),
+            Some(&BATADV_BCAST) => core::mem::size_of::<BatmanBroadcastPacket>(),
             _ => 0,
         }
     }
@@ -237,9 +230,9 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
         &mut self,
         now: core::time::Duration,
         tx_buf: &'tx mut [u8],
-    ) -> Option<LinkFrameData<'tx, Ident>> {
+    ) -> Option<LinkFrameData<'tx>> {
         // 3. Handle BATMAN outgoing maintenance ticks
-        let broadcast = Ident::BROADCAST;
+        let broadcast = Mac::BROADCAST;
         if let Some(ogm_payload) = self.batman.produce_periodic_broadcast(now, tx_buf) {
             let ogm = LinkFrameData {
                 dst: broadcast,
@@ -263,12 +256,12 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
     /// [`MeshIdentifier::BROADCAST`]: interfaces::frame::MeshIdentifier::BROADCAST
     pub fn handle_local<'a>(
         &mut self,
-        dest: Ident,
+        dest: Mac,
         payload: &[u8],
         tx_buf: &'a mut [u8],
-    ) -> Result<LinkFrameData<'a, Ident>, ()> {
+    ) -> Result<LinkFrameData<'a>, ()> {
         // Broadcast destinations are flooded, not routed to a next hop.
-        if dest == Ident::BROADCAST {
+        if dest == Mac::BROADCAST {
             let header = BatmanBroadcastPacket {
                 packet_type: BATADV_BCAST,
                 version: 5,
@@ -276,7 +269,7 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
                 seqno: self.batman.next_broadcast_seqno().to_be(),
                 orig: self.batman.self_ident,
             };
-            let header_size = core::mem::size_of::<BatmanBroadcastPacket<Ident>>();
+            let header_size = core::mem::size_of::<BatmanBroadcastPacket>();
             let total_size = header_size + payload.len();
             if total_size > tx_buf.len() {
                 return Err(());
@@ -284,7 +277,7 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
             tx_buf[..header_size].copy_from_slice(header.as_bytes());
             tx_buf[header_size..total_size].copy_from_slice(payload);
             return Ok(LinkFrameData {
-                dst: Ident::BROADCAST,
+                dst: Mac::BROADCAST,
                 protocol: ETH_P_BATMAN,
                 payload: &tx_buf[..total_size],
             });
@@ -305,7 +298,7 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
         };
 
         // 3. Allocate a deterministic transmission workspace on the stack
-        let header_size = core::mem::size_of::<BatmanUnicastPacket<Ident>>();
+        let header_size = core::mem::size_of::<BatmanUnicastPacket>();
         let total_size = header_size + payload.len();
 
         if total_size > tx_buf.len() {
@@ -335,8 +328,8 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
     ///    observed for `dest` itself.
     /// 4. If no quality data exists yet, fall back to the legacy
     ///    last-seen [`IdentTable`] entry.
-    pub fn get_egress_interface(&mut self, dest: Ident) -> Option<EgressInterface> {
-        if dest == Ident::BROADCAST {
+    pub fn get_egress_interface(&mut self, dest: Mac) -> Option<EgressInterface> {
+        if dest == Mac::BROADCAST {
             return Some(EgressInterface::All);
         }
 
@@ -351,17 +344,17 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
             .map(EgressInterface::Interface)
     }
 
-    pub fn self_ident(&self) -> Ident {
+    pub fn self_ident(&self) -> Mac {
         self.batman.self_ident
     }
 
-    pub fn originator_table(&self) -> &[batman::OriginatorRecord<Ident>] {
+    pub fn originator_table(&self) -> &[batman::OriginatorRecord] {
         &self.batman.originator_table
     }
 
     /// Borrow the link-quality table for inspection.  Read-only mirror of
     /// the structure the data plane mutates on every received frame.
-    pub fn link_quality_records(&self) -> &[LinkQualityRecord<Ident>] {
+    pub fn link_quality_records(&self) -> &[LinkQualityRecord<Mac>] {
         self.link_quality.records()
     }
 
@@ -381,9 +374,9 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
     ///
     /// [`handle_local`]: CentralRouter::handle_local
     /// [`get_egress_interface`]: CentralRouter::get_egress_interface
-    pub fn resolve_route(&self, dest: Ident) -> (Ident, Option<EgressInterface>) {
-        if dest == Ident::BROADCAST {
-            return (Ident::BROADCAST, Some(EgressInterface::All));
+    pub fn resolve_route(&self, dest: Mac) -> (Mac, Option<EgressInterface>) {
+        if dest == Mac::BROADCAST {
+            return (Mac::BROADCAST, Some(EgressInterface::All));
         }
 
         let next_hop = self.batman.lookup_route(dest).unwrap_or(dest);
@@ -404,18 +397,23 @@ impl<Ident: MeshIdentifier + 'static> CentralRouter<Ident> {
 mod cp2_local_delivery {
     use super::*;
     use batman::wire::{BATADV_BCAST, BATADV_UNICAST, BatmanBroadcastPacket, BatmanUnicastPacket};
-    use interfaces::frame::LinkFrame;
+    use interfaces::frame::{LinkFrame, Mac};
     use zerocopy::{FromBytes, IntoBytes};
 
     // Stand-in for an inner host frame (e.g. an IP packet inside an Ethernet
     // frame) that rides across the mesh and must be delivered to the TAP.
     const INNER: &[u8] = &[0x45, 0x00, 0x00, 0x1c, 0xde, 0xad];
 
-    /// Serialise a `LinkFrame<u8>` ([src][dst][proto NE][payload]).
+    /// Map a compact `u8` test identifier to a full MAC address.
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    /// Serialise a `LinkFrame` ([src][dst][proto NE][payload]).
     fn link_frame_bytes(src: u8, dst: u8, payload: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();
-        v.push(src);
-        v.push(dst);
+        v.extend_from_slice(mac(src).as_bytes());
+        v.extend_from_slice(mac(dst).as_bytes());
         v.extend_from_slice(&ETH_P_BATMAN.to_ne_bytes());
         v.extend_from_slice(payload);
         v
@@ -425,20 +423,20 @@ mod cp2_local_delivery {
     /// local delivery (to the TAP) and produce no mesh forward.
     #[test]
     fn unicast_for_self_delivers_locally() {
-        let mut router: CentralRouter<u8> = CentralRouter::new(1);
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
 
         let mut payload = Vec::new();
         let hdr = BatmanUnicastPacket {
             packet_type: BATADV_UNICAST,
             version: 5,
             ttl: 50,
-            dest: 1u8,
+            dest: mac(1),
         };
         payload.extend_from_slice(hdr.as_bytes());
         payload.extend_from_slice(INNER);
 
         let bytes = link_frame_bytes(2, 1, &payload);
-        let frame = LinkFrame::<u8>::ref_from_bytes(&bytes).unwrap();
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
 
         let mut tx = [0u8; 256];
         let outcome = router.handle_frame(0, frame, &mut tx);
@@ -451,7 +449,7 @@ mod cp2_local_delivery {
     /// re-flooded (with a decremented TTL) onto the mesh.
     #[test]
     fn broadcast_delivers_locally_and_refloods() {
-        let mut router: CentralRouter<u8> = CentralRouter::new(1);
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
 
         let mut payload = Vec::new();
         let hdr = BatmanBroadcastPacket {
@@ -459,13 +457,13 @@ mod cp2_local_delivery {
             version: 5,
             ttl: 50,
             seqno: 7u32.to_be(),
-            orig: 2u8,
+            orig: mac(2),
         };
         payload.extend_from_slice(hdr.as_bytes());
         payload.extend_from_slice(INNER);
 
         let bytes = link_frame_bytes(2, 0xff, &payload);
-        let frame = LinkFrame::<u8>::ref_from_bytes(&bytes).unwrap();
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
 
         let mut tx = [0u8; 256];
         let outcome = router.handle_frame(0, frame, &mut tx);
@@ -474,9 +472,9 @@ mod cp2_local_delivery {
         assert_eq!(outcome.deliver_local, Some(INNER));
         // ... and re-flooded to neighbours.
         let fwd = outcome.forward.expect("expected a re-flood frame");
-        assert_eq!(fwd.dst, u8::BROADCAST);
+        assert_eq!(fwd.dst, Mac::BROADCAST);
         assert_eq!(fwd.protocol, ETH_P_BATMAN);
-        let (out, rest) = BatmanBroadcastPacket::<u8>::ref_from_prefix(fwd.payload).unwrap();
+        let (out, rest) = BatmanBroadcastPacket::ref_from_prefix(fwd.payload).unwrap();
         assert_eq!(out.ttl, 49);
         assert_eq!(&rest[..INNER.len()], INNER);
     }
@@ -485,18 +483,18 @@ mod cp2_local_delivery {
     /// wrapped in a BatmanBroadcastPacket (not a unicast) so it floods.
     #[test]
     fn local_broadcast_frame_is_wrapped_as_broadcast() {
-        let mut router: CentralRouter<u8> = CentralRouter::new(1);
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
 
         let mut tx = [0u8; 256];
         let out = router
-            .handle_local(u8::BROADCAST, INNER, &mut tx)
+            .handle_local(Mac::BROADCAST, INNER, &mut tx)
             .expect("broadcast packet should build");
 
-        assert_eq!(out.dst, u8::BROADCAST);
+        assert_eq!(out.dst, Mac::BROADCAST);
         assert_eq!(out.protocol, ETH_P_BATMAN);
-        let (hdr, rest) = BatmanBroadcastPacket::<u8>::ref_from_prefix(out.payload).unwrap();
+        let (hdr, rest) = BatmanBroadcastPacket::ref_from_prefix(out.payload).unwrap();
         assert_eq!(hdr.packet_type, BATADV_BCAST);
-        assert_eq!(hdr.orig, 1); // our own ident
+        assert_eq!(hdr.orig, mac(1)); // our own ident
         assert!(hdr.ttl > 1);
         assert_eq!(&rest[..INNER.len()], INNER);
     }

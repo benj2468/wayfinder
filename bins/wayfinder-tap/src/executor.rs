@@ -6,7 +6,7 @@ use futures::{StreamExt, stream::FuturesOrdered};
 use pretty_hex::pretty_hex;
 use wayfinder::CentralRouter;
 use wayfinder::EgressInterface;
-use wayfinder::interfaces::frame::{LinkFrameData, MeshIdentifier};
+use wayfinder::interfaces::frame::{LinkFrameData, Mac};
 use wayfinder_protos::service::WayfinderService;
 
 use wayfinder_server::{QueryRx, RouterAdapter};
@@ -22,11 +22,11 @@ pub(crate) struct EventLoop<Tap: AsyncIo> {
     /// The mesh interfaces, indexed by interface index.
     pub(crate) interfaces: Vec<Link>,
     /// The routing engine for this node.
-    pub(crate) router: CentralRouter<[u8; 6]>,
+    pub(crate) router: CentralRouter,
     /// Management-API queries forwarded from the server tasks.
     pub(crate) query_rx: QueryRx,
     /// This node's mesh identifier (its TAP MAC address).
-    pub(crate) mac_addr: [u8; 6],
+    pub(crate) mac_addr: Mac,
     /// Reference instant for periodic-broadcast timing.
     pub(crate) start: std::time::Instant,
     /// Receive scratchpad for frames read from the TAP.
@@ -40,7 +40,7 @@ pub(crate) struct EventLoop<Tap: AsyncIo> {
 struct LoopOutput {
     /// `(destination ident, protocol, serialized payload)` to transmit onto
     /// the mesh, dispatched via `get_egress_interface`.
-    mesh: Option<([u8; 6], u16, Vec<u8>)>,
+    mesh: Option<(Mac, u16, Vec<u8>)>,
     /// Inner frame to write back to the local TAP device.
     local: Option<Vec<u8>>,
 }
@@ -96,10 +96,10 @@ impl<Tap: AsyncIo> EventLoop<Tap> {
                         dst_mac.copy_from_slice(&eth[0..6]);
                         // The I/G bit (LSB of the first octet) marks multicast /
                         // broadcast destinations, which we flood across the mesh.
-                        let dest = if dst_mac[0] & 0x01 != 0 {
-                            <[u8; 6]>::BROADCAST
+                        let dest = if Mac(dst_mac).is_multicast() {
+                            Mac::BROADCAST
                         } else {
-                            dst_mac
+                            Mac(dst_mac)
                         };
                         router
                             .handle_local(dest, eth, tx_buffer)

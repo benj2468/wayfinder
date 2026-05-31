@@ -5,7 +5,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use interfaces::frame::MeshIdentifier;
+    use interfaces::frame::Mac;
     use interfaces::link::LinkMetrics;
     use tokio::sync::mpsc;
     use wayfinder::{
@@ -16,42 +16,51 @@ mod tests {
 
     use crate::Direction;
     use crate::switch::{PortComms, PortConfig, Switch, TapConfig, TapMeta};
-    use crate::test_router::{TestRouter, parse_frame};
+    use crate::test_router::{TestRouter, build_frame, parse_frame};
 
     // ── tap helpers ───────────────────────────────────────────────────────────
 
+    /// Length of the serialized `LinkFrame` header: `[src: Mac][dst: Mac][proto: u16]`
+    /// = 6 + 6 + 2 bytes.  The BATMAN payload (and its packet-type byte) follows.
+    const LINK_HDR: usize = core::mem::size_of::<Mac>() * 2 + 2;
+
+    /// Map a compact `u8` test identifier to a full MAC address.
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
     /// True if the raw wire bytes encode a BATMAN OGM broadcast.
     fn is_ogm_frame(data: &[u8]) -> bool {
-        if data.len() < 5 {
+        if data.len() <= LINK_HDR {
             return false;
         }
-        let proto = u16::from_ne_bytes([data[2], data[3]]);
-        proto == DEFAULT_BATMAN_ETHER_TYPE && data[4] == BATADV_IV_OGM
+        let proto = u16::from_ne_bytes([data[LINK_HDR - 2], data[LINK_HDR - 1]]);
+        proto == DEFAULT_BATMAN_ETHER_TYPE && data[LINK_HDR] == BATADV_IV_OGM
     }
 
     /// True if the raw wire bytes encode a BATMAN unicast packet.
     fn is_unicast_frame(data: &[u8]) -> bool {
-        if data.len() < 5 {
+        if data.len() <= LINK_HDR {
             return false;
         }
-        let proto = u16::from_ne_bytes([data[2], data[3]]);
-        proto == DEFAULT_BATMAN_ETHER_TYPE && data[4] == BATADV_UNICAST
+        let proto = u16::from_ne_bytes([data[LINK_HDR - 2], data[LINK_HDR - 1]]);
+        proto == DEFAULT_BATMAN_ETHER_TYPE && data[LINK_HDR] == BATADV_UNICAST
     }
 
     /// Extract the application payload from a unicast wire frame if `dest` matches.
     ///
-    /// Wire layout (u8 ident): `[src:1][dst:1][proto:2][BatmanUnicastPacket:4][app_payload...]`
+    /// Wire layout: `[src:6][dst:6][proto:2][BatmanUnicastPacket][app_payload...]`
     fn extract_unicast_payload(data: &[u8], expected_dest: u8) -> Option<Vec<u8>> {
         if !is_unicast_frame(data) {
             return None;
         }
-        let batman_payload = &data[4..]; // strip link-layer header
-        let hdr_size = core::mem::size_of::<BatmanUnicastPacket<u8>>();
+        let batman_payload = &data[LINK_HDR..]; // strip link-layer header
+        let hdr_size = core::mem::size_of::<BatmanUnicastPacket>();
         if batman_payload.len() <= hdr_size {
             return None;
         }
-        let (hdr, _) = BatmanUnicastPacket::<u8>::ref_from_prefix(batman_payload).ok()?;
-        if hdr.dest == expected_dest {
+        let (hdr, _) = BatmanUnicastPacket::ref_from_prefix(batman_payload).ok()?;
+        if hdr.dest == mac(expected_dest) {
             Some(batman_payload[hdr_size..].to_vec())
         } else {
             None
@@ -73,23 +82,23 @@ mod tests {
     /// Build a raw OGM broadcast frame as it would appear on the wire after
     /// being transmitted by `src` with the given TQ and sequence number.
     ///
-    /// Wire layout (u8 ident): `[src:1][BROADCAST:1][proto:2 NE][BatmanOgmPacket]`.
+    /// Wire layout: `[src:6][BROADCAST:6][proto:2 NE][BatmanOgmPacket]`.
     fn build_ogm_wire_frame(src: u8, tq: u8, seqno: u32) -> Vec<u8> {
-        let ogm = BatmanOgmPacket::<u8> {
+        let ogm = BatmanOgmPacket {
             packet_type: BATADV_IV_OGM,
             version: 5,
             ttl: 50,
             tq,
             seqno: seqno.to_be(),
-            orig: src,
-            prev_sender: src,
+            orig: mac(src),
+            prev_sender: mac(src),
         };
-        let mut frame = Vec::new();
-        frame.push(src);
-        frame.push(0xff);
-        frame.extend_from_slice(&DEFAULT_BATMAN_ETHER_TYPE.to_ne_bytes());
-        frame.extend_from_slice(ogm.as_bytes());
-        frame
+        build_frame(
+            mac(src),
+            Mac::BROADCAST,
+            DEFAULT_BATMAN_ETHER_TYPE,
+            ogm.as_bytes(),
+        )
     }
 
     fn make_port_pair(buf: usize) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>, PortComms) {
@@ -112,10 +121,10 @@ mod tests {
         let (tx_a, mut rx_a, port_a) = make_port_pair(64);
         let (tx_b, mut rx_b, port_b) = make_port_pair(64);
 
-        let mut router_a: TestRouter<u8> = TestRouter::new(1, vec![tx_a]);
-        let mut router_b: TestRouter<u8> = TestRouter::new(2, vec![tx_b]);
+        let mut router_a: TestRouter = TestRouter::new(mac(1), vec![tx_a]);
+        let mut router_b: TestRouter = TestRouter::new(mac(2), vec![tx_b]);
 
-        let mut switch = Switch::<u8>::new();
+        let mut switch = Switch::<Mac>::new();
         switch.add_port(port_a, PortConfig::no_loss()).unwrap();
         switch.add_port(port_b, PortConfig::no_loss()).unwrap();
 
@@ -143,7 +152,7 @@ mod tests {
         let app_payload = b"hello from A to B";
 
         router_a
-            .send_local(2, app_payload)
+            .send_local(mac(2), app_payload)
             .await
             .expect("router A should have a route to router B after OGM exchange");
 
@@ -151,7 +160,7 @@ mod tests {
 
         // ── Phase 3: verify router B received the exact payload ───────────
 
-        let hdr_size = std::mem::size_of::<BatmanUnicastPacket<u8>>();
+        let hdr_size = std::mem::size_of::<BatmanUnicastPacket>();
         let mut delivered: Option<Vec<u8>> = None;
 
         while let Ok(raw) = rx_b.try_recv() {
@@ -159,13 +168,13 @@ mod tests {
             router_b.receive(0, &raw).await;
 
             // Inspect the raw frame directly to extract the application payload.
-            let frame = parse_frame::<u8>(&raw);
+            let frame = parse_frame(&raw);
             if frame.protocol == DEFAULT_BATMAN_ETHER_TYPE
                 && frame.payload.first() == Some(&BATADV_UNICAST)
                 && frame.payload.len() > hdr_size
             {
-                let (hdr, _) = BatmanUnicastPacket::<u8>::ref_from_prefix(&frame.payload).unwrap();
-                if hdr.dest == 2 {
+                let (hdr, _) = BatmanUnicastPacket::ref_from_prefix(&frame.payload).unwrap();
+                if hdr.dest == mac(2) {
                     delivered = Some(frame.payload[hdr_size..].to_vec());
                 }
             }
@@ -186,10 +195,10 @@ mod tests {
         let (tx_a, mut rx_a, port_a) = make_port_pair(64);
         let (tx_b, mut rx_b, port_b) = make_port_pair(64);
 
-        let mut router_a: TestRouter<u8> = TestRouter::new(1, vec![tx_a]);
-        let mut router_b: TestRouter<u8> = TestRouter::new(2, vec![tx_b]);
+        let mut router_a: TestRouter = TestRouter::new(mac(1), vec![tx_a]);
+        let mut router_b: TestRouter = TestRouter::new(mac(2), vec![tx_b]);
 
-        let mut switch = Switch::<u8>::new();
+        let mut switch = Switch::<Mac>::new();
         switch.add_port(port_a, PortConfig::no_loss()).unwrap();
         switch.add_port(port_b, PortConfig::no_loss()).unwrap();
 
@@ -206,7 +215,7 @@ mod tests {
         // A sends application data to B; B should deliver it locally.
         let app_payload = b"deliver me locally";
         router_a
-            .send_local(2, app_payload)
+            .send_local(mac(2), app_payload)
             .await
             .expect("router A should have a route to router B");
         switch.tick().await.unwrap();
@@ -223,16 +232,16 @@ mod tests {
         let (tx_a, _rx_a, port_a) = make_port_pair(64);
         let (tx_b, mut rx_b, port_b) = make_port_pair(64);
 
-        let mut router_a: TestRouter<u8> = TestRouter::new(1, vec![tx_a]);
-        let mut router_b: TestRouter<u8> = TestRouter::new(2, vec![tx_b]);
+        let mut router_a: TestRouter = TestRouter::new(mac(1), vec![tx_a]);
+        let mut router_b: TestRouter = TestRouter::new(mac(2), vec![tx_b]);
 
-        let mut switch = Switch::<u8>::new();
+        let mut switch = Switch::<Mac>::new();
         switch.add_port(port_a, PortConfig::no_loss()).unwrap();
         switch.add_port(port_b, PortConfig::no_loss()).unwrap();
 
         let arp = b"i am a broadcast frame";
         router_a
-            .send_local(u8::BROADCAST, arp)
+            .send_local(Mac::BROADCAST, arp)
             .await
             .expect("broadcast packet should build");
 
@@ -254,11 +263,11 @@ mod tests {
         let (tx_1, mut rx_1, port_1) = make_port_pair(64);
         let (tx_2, mut rx_2, port_2) = make_port_pair(64);
 
-        let mut router_0: TestRouter<u8> = TestRouter::new(0, vec![tx_0]);
-        let mut router_1: TestRouter<u8> = TestRouter::new(1, vec![tx_1]);
-        let mut router_2: TestRouter<u8> = TestRouter::new(2, vec![tx_2]);
+        let mut router_0: TestRouter = TestRouter::new(mac(0), vec![tx_0]);
+        let mut router_1: TestRouter = TestRouter::new(mac(1), vec![tx_1]);
+        let mut router_2: TestRouter = TestRouter::new(mac(2), vec![tx_2]);
 
-        let mut switch = Switch::<u8>::new();
+        let mut switch = Switch::<Mac>::new();
         let port_0_id = switch.add_port(port_0, PortConfig::no_loss()).unwrap();
         let port_1_id = switch.add_port(port_1, PortConfig::no_loss()).unwrap();
         let port_2_id = switch.add_port(port_2, PortConfig::no_loss()).unwrap();
@@ -345,24 +354,24 @@ mod tests {
 
         let payload_0_to_2 = b"hello from 0 to 2";
         router_0
-            .send_local(2, payload_0_to_2)
+            .send_local(mac(2), payload_0_to_2)
             .await
             .expect("node 0 must have a direct route to node 2 after OGM exchange");
 
         switch.tick().await.unwrap();
 
         // Drain the frame into router 2 and confirm the exact payload.
-        let hdr_size = core::mem::size_of::<BatmanUnicastPacket<u8>>();
+        let hdr_size = core::mem::size_of::<BatmanUnicastPacket>();
         let mut delivered_2: Option<Vec<u8>> = None;
         while let Ok(raw) = rx_2.try_recv() {
             router_2.receive(0, &raw).await;
-            let frame = parse_frame::<u8>(&raw);
+            let frame = parse_frame(&raw);
             if frame.protocol == DEFAULT_BATMAN_ETHER_TYPE
                 && frame.payload.first() == Some(&BATADV_UNICAST)
                 && frame.payload.len() > hdr_size
             {
-                let (hdr, _) = BatmanUnicastPacket::<u8>::ref_from_prefix(&frame.payload).unwrap();
-                if hdr.dest == 2 {
+                let (hdr, _) = BatmanUnicastPacket::ref_from_prefix(&frame.payload).unwrap();
+                if hdr.dest == mac(2) {
                     delivered_2 = Some(frame.payload[hdr_size..].to_vec());
                 }
             }
@@ -407,7 +416,7 @@ mod tests {
 
         let payload_0_to_1 = b"hello from 0 to 1";
         router_0
-            .send_local(1, payload_0_to_1)
+            .send_local(mac(1), payload_0_to_1)
             .await
             .expect("node 0 must have a direct route to node 1 after OGM exchange");
 
@@ -455,12 +464,12 @@ mod tests {
         let (tx_2, mut rx_2, port_2b) = make_port_pair(64);
 
         // Node 1 has two interfaces: index 0 = switch A, index 1 = switch B.
-        let mut router_0: TestRouter<u8> = TestRouter::new(0, vec![tx_0]);
-        let mut router_1: TestRouter<u8> = TestRouter::new(1, vec![tx_1a, tx_1b]);
-        let mut router_2: TestRouter<u8> = TestRouter::new(2, vec![tx_2]);
+        let mut router_0: TestRouter = TestRouter::new(mac(0), vec![tx_0]);
+        let mut router_1: TestRouter = TestRouter::new(mac(1), vec![tx_1a, tx_1b]);
+        let mut router_2: TestRouter = TestRouter::new(mac(2), vec![tx_2]);
 
-        let mut switch_a = Switch::<u8>::new();
-        let mut switch_b = Switch::<u8>::new();
+        let mut switch_a = Switch::<Mac>::new();
+        let mut switch_b = Switch::<Mac>::new();
 
         switch_a.add_port(port_0a, PortConfig::no_loss()).unwrap();
         switch_a.add_port(port_1a, PortConfig::no_loss()).unwrap();
@@ -520,10 +529,11 @@ mod tests {
             .router
             .originator_table()
             .iter()
-            .find(|r| r.neighbor_ident == 2)
+            .find(|r| r.neighbor_ident == mac(2))
             .expect("node 0 must have a route to node 2 after two OGM rounds");
         assert_eq!(
-            route_to_2.best_next_hop, 1,
+            route_to_2.best_next_hop,
+            mac(1),
             "node 0 must route to node 2 via node 1 (the only path)"
         );
 
@@ -531,10 +541,11 @@ mod tests {
             .router
             .originator_table()
             .iter()
-            .find(|r| r.neighbor_ident == 0)
+            .find(|r| r.neighbor_ident == mac(0))
             .expect("node 2 must have a route to node 0 after two OGM rounds");
         assert_eq!(
-            route_to_0.best_next_hop, 1,
+            route_to_0.best_next_hop,
+            mac(1),
             "node 2 must route to node 0 via node 1 (the only path)"
         );
 
@@ -542,7 +553,7 @@ mod tests {
 
         let relay_payload = b"relayed through node 1";
         router_0
-            .send_local(2, relay_payload)
+            .send_local(mac(2), relay_payload)
             .await
             .expect("node 0 should have a route to node 2 via node 1");
 
@@ -555,17 +566,17 @@ mod tests {
 
         // ── Verify delivery at node 2 ─────────────────────────────────────────
 
-        let hdr_size = core::mem::size_of::<BatmanUnicastPacket<u8>>();
+        let hdr_size = core::mem::size_of::<BatmanUnicastPacket>();
         let mut delivered: Option<Vec<u8>> = None;
         while let Ok(raw) = rx_2.try_recv() {
             router_2.receive(0, &raw).await;
-            let frame = parse_frame::<u8>(&raw);
+            let frame = parse_frame(&raw);
             if frame.protocol == DEFAULT_BATMAN_ETHER_TYPE
                 && frame.payload.first() == Some(&BATADV_UNICAST)
                 && frame.payload.len() > hdr_size
             {
-                let (hdr, _) = BatmanUnicastPacket::<u8>::ref_from_prefix(&frame.payload).unwrap();
-                if hdr.dest == 2 {
+                let (hdr, _) = BatmanUnicastPacket::ref_from_prefix(&frame.payload).unwrap();
+                if hdr.dest == mac(2) {
                     delivered = Some(frame.payload[hdr_size..].to_vec());
                 }
             }
@@ -620,7 +631,7 @@ mod tests {
     async fn egress_picks_iface_with_better_metrics_for_shared_neighbor() {
         let (tx_0, _rx_0, _port_0) = make_port_pair(64);
         let (tx_1, _rx_1, _port_1) = make_port_pair(64);
-        let mut router_a: TestRouter<u8> = TestRouter::new(1, vec![tx_0, tx_1]);
+        let mut router_a: TestRouter = TestRouter::new(mac(1), vec![tx_0, tx_1]);
 
         let ogm_from_b = build_ogm_wire_frame(2, 255, 1);
 
@@ -638,7 +649,7 @@ mod tests {
         router_a.receive_with_metrics(0, &ogm_from_b, weak).await;
         router_a.receive_with_metrics(1, &ogm_from_b, strong).await;
 
-        match router_a.router.get_egress_interface(2) {
+        match router_a.router.get_egress_interface(mac(2)) {
             Some(EgressInterface::Interface(1)) => {}
             other => panic!(
                 "expected egress for node 2 to be Interface(1) (strong RSSI/SNR), got {other:?}"
@@ -653,7 +664,7 @@ mod tests {
     async fn egress_swaps_iface_when_metrics_swap() {
         let (tx_0, _rx_0, _port_0) = make_port_pair(64);
         let (tx_1, _rx_1, _port_1) = make_port_pair(64);
-        let mut router_a: TestRouter<u8> = TestRouter::new(1, vec![tx_0, tx_1]);
+        let mut router_a: TestRouter = TestRouter::new(mac(1), vec![tx_0, tx_1]);
 
         let ogm_from_b = build_ogm_wire_frame(2, 255, 1);
 
@@ -671,7 +682,7 @@ mod tests {
         router_a.receive_with_metrics(0, &ogm_from_b, strong).await;
         router_a.receive_with_metrics(1, &ogm_from_b, weak).await;
 
-        match router_a.router.get_egress_interface(2) {
+        match router_a.router.get_egress_interface(mac(2)) {
             Some(EgressInterface::Interface(0)) => {}
             other => panic!(
                 "expected egress for node 2 to be Interface(0) (strong RSSI/SNR), got {other:?}"
@@ -691,7 +702,7 @@ mod tests {
     async fn resolve_route_returns_neighbor_and_observed_interface() {
         let (tx_0, _rx_0, _port_0) = make_port_pair(64);
         let (tx_1, _rx_1, _port_1) = make_port_pair(64);
-        let mut router_a: TestRouter<u8> = TestRouter::new(1, vec![tx_0, tx_1]);
+        let mut router_a: TestRouter = TestRouter::new(mac(1), vec![tx_0, tx_1]);
 
         let ogm_from_b = build_ogm_wire_frame(2, 255, 1);
         let strong = LinkMetrics {
@@ -701,8 +712,12 @@ mod tests {
         };
         router_a.receive_with_metrics(1, &ogm_from_b, strong).await;
 
-        let (next_hop, egress) = router_a.router.resolve_route(2);
-        assert_eq!(next_hop, 2, "direct neighbor should be its own next hop");
+        let (next_hop, egress) = router_a.router.resolve_route(mac(2));
+        assert_eq!(
+            next_hop,
+            mac(2),
+            "direct neighbor should be its own next hop"
+        );
         assert_eq!(
             egress,
             Some(EgressInterface::Interface(1)),
@@ -715,10 +730,10 @@ mod tests {
     #[tokio::test]
     async fn resolve_route_for_broadcast_returns_all_interfaces() {
         let (tx_0, _rx_0, _port_0) = make_port_pair(64);
-        let router_a: TestRouter<u8> = TestRouter::new(1, vec![tx_0]);
+        let router_a: TestRouter = TestRouter::new(mac(1), vec![tx_0]);
 
-        let (next_hop, egress) = router_a.router.resolve_route(u8::BROADCAST);
-        assert_eq!(next_hop, u8::BROADCAST);
+        let (next_hop, egress) = router_a.router.resolve_route(Mac::BROADCAST);
+        assert_eq!(next_hop, Mac::BROADCAST);
         assert_eq!(egress, Some(EgressInterface::All));
     }
 
@@ -729,7 +744,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_route_is_read_only() {
         let (tx_0, _rx_0, _port_0) = make_port_pair(64);
-        let mut router_a: TestRouter<u8> = TestRouter::new(1, vec![tx_0]);
+        let mut router_a: TestRouter = TestRouter::new(mac(1), vec![tx_0]);
 
         let ogm_from_b = build_ogm_wire_frame(2, 255, 1);
         let metrics = LinkMetrics {
@@ -741,9 +756,9 @@ mod tests {
 
         // Two snapshots: identical state, identical answers — and a third
         // snapshot taken after a no-op call confirms idempotence.
-        let first = router_a.router.resolve_route(2);
-        let _ = router_a.router.resolve_route(2);
-        let third = router_a.router.resolve_route(2);
+        let first = router_a.router.resolve_route(mac(2));
+        let _ = router_a.router.resolve_route(mac(2));
+        let third = router_a.router.resolve_route(mac(2));
         assert_eq!(first, third);
     }
 }

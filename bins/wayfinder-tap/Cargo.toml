@@ -25,3 +25,4 @@ zerocopy.workspace = true
 prost = "0.13"
 bytes = "1"
 pretty-hex.workspace = true
+async-trait.workspace = true
