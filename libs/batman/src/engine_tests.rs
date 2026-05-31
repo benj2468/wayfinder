@@ -1039,3 +1039,72 @@ mod mcast_membership {
         );
     }
 }
+
+#[cfg(test)]
+mod mcast_packet {
+    //! The dedicated `BATADV_MCAST` packet type (batman-adv's
+    //! `batadv_mcast_packet`).  A multicast frame is delivered to each
+    //! interested originator as its own `BATADV_MCAST` packet, routed toward
+    //! that node like a unicast and delivered locally on arrival.
+
+    use super::*;
+    use crate::wire::{BATADV_MCAST, BatmanMcastPacket};
+
+    /// Build a BATADV_MCAST packet addressed to `dest`, wrapping `payload`.
+    fn make_mcast(dest: u8, ttl: u8, payload: &[u8]) -> Vec<u8> {
+        let hdr = BatmanMcastPacket {
+            packet_type: BATADV_MCAST,
+            version: 5,
+            ttl,
+            dest: mac(dest),
+        };
+        let mut data = hdr.as_bytes().to_vec();
+        data.extend_from_slice(payload);
+        data
+    }
+
+    /// A BATADV_MCAST packet addressed to us is delivered to the local host
+    /// (the inner multicast frame is handed up), like a unicast-for-self.
+    #[test]
+    fn mcast_for_self_delivers_local() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        let payload = make_mcast(1, 10, b"multicast payload");
+        let frame_bytes = make_link_frame(2, 1, ETH_P_BATMAN, payload);
+        let frame = parse_link_frame(&frame_bytes);
+
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        let action = engine.handle_rx(frame, &mut reply);
+
+        assert!(matches!(action, RoutingAction::DeliverLocal));
+    }
+
+    /// An intermediate node forwards a BATADV_MCAST packet toward the next hop
+    /// for its destination, decrementing TTL and preserving the inner payload.
+    #[test]
+    fn mcast_forwarded_to_next_hop() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        // Learn a route to node 5 via node 2.
+        let ogm = make_ogm(5, 2, 1, 255, 50);
+        let frame_ogm = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        engine.handle_rx(parse_link_frame(&frame_ogm), &mut reply);
+
+        // A BATADV_MCAST packet for node 5 arrives; forward it toward node 2.
+        let payload = make_mcast(5, 10, b"group data");
+        let frame_bytes = make_link_frame(3, 1, ETH_P_BATMAN, payload);
+        let action = engine.handle_rx(parse_link_frame(&frame_bytes), &mut reply);
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.dst, mac(2)); // next hop toward node 5
+        assert_eq!(reply.protocol, ETH_P_BATMAN);
+        let (fwd, rest) = BatmanMcastPacket::ref_from_prefix(reply.payload).unwrap();
+        assert_eq!(fwd.packet_type, BATADV_MCAST);
+        assert_eq!(fwd.dest, mac(5)); // final destination unchanged
+        assert_eq!(fwd.ttl, 9); // decremented from 10
+        assert_eq!(&rest[..b"group data".len()], b"group data");
+    }
+}

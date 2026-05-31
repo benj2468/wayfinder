@@ -499,3 +499,123 @@ mod cp2_local_delivery {
         assert_eq!(&rest[..INNER.len()], INNER);
     }
 }
+
+#[cfg(test)]
+mod mcast_forwarding {
+    //! Selective multicast forwarding: a multicast frame is sent as an
+    //! individual [`BATADV_MCAST`] packet to each interested originator when
+    //! the listener count is within [`MCAST_FANOUT`], else flooded.
+
+    use super::*;
+    use batman::wire::{
+        BATADV_IV_OGM, BATADV_MCAST, BATADV_TVLV_MCAST, BatmanMcastPacket, BatmanOgmPacket,
+        BatmanTvlvHdr,
+    };
+    use interfaces::frame::{LinkFrame, Mac};
+    use zerocopy::{FromBytes, IntoBytes};
+
+    const INNER: &[u8] = &[0x45, 0x00, 0x00, 0x10, 0x99];
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    /// A multicast group MAC (`01:00:5e:00:00:NN`).
+    fn group(n: u8) -> Mac {
+        Mac([0x01, 0x00, 0x5e, 0x00, 0x00, n])
+    }
+
+    /// Serialise a `LinkFrame` ([src][dst][proto NE][payload]).
+    fn link_frame_bytes(src: Mac, dst: Mac, payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(src.as_bytes());
+        v.extend_from_slice(dst.as_bytes());
+        v.extend_from_slice(&ETH_P_BATMAN.to_ne_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// Feed `router` an OGM from `orig` announcing interest in `groups`, so the
+    /// router learns `orig` as a listener for them.
+    fn learn_listener(router: &mut CentralRouter, orig: Mac, seqno: u32, groups: &[Mac]) {
+        let mut value = Vec::new();
+        for g in groups {
+            value.extend_from_slice(g.as_bytes());
+        }
+        let tvlv_hdr = BatmanTvlvHdr {
+            tvlv_type: BATADV_TVLV_MCAST,
+            version: 1,
+            len: (value.len() as u16).to_be(),
+        };
+        let tvlv_total = core::mem::size_of::<BatmanTvlvHdr>() + value.len();
+        let ogm = BatmanOgmPacket {
+            packet_type: BATADV_IV_OGM,
+            version: 5,
+            ttl: 50,
+            flags: 0,
+            seqno: seqno.to_be(),
+            orig,
+            prev_sender: orig,
+            reserved: 0,
+            tq: 255,
+            tvlv_len: (tvlv_total as u16).to_be(),
+        };
+        let mut payload = ogm.as_bytes().to_vec();
+        payload.extend_from_slice(tvlv_hdr.as_bytes());
+        payload.extend_from_slice(&value);
+
+        let bytes = link_frame_bytes(orig, Mac::BROADCAST, &payload);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 256];
+        router.handle_frame(0, frame, &mut tx);
+    }
+
+    /// With no known listeners for a group, the plan is to flood.
+    #[test]
+    fn no_listeners_plans_flood() {
+        let router = CentralRouter::new(mac(1));
+        assert_eq!(router.mcast_plan(group(5)), McastPlan::Flood);
+    }
+
+    /// A handful of known listeners (within fanout) plans selective unicast,
+    /// and `mcast_targets` lists exactly those originators.
+    #[test]
+    fn known_listeners_plan_unicast_and_list_targets() {
+        let mut router = CentralRouter::new(mac(1));
+        learn_listener(&mut router, mac(2), 1, &[group(5)]);
+        learn_listener(&mut router, mac(3), 1, &[group(5)]);
+
+        assert_eq!(router.mcast_plan(group(5)), McastPlan::Unicast);
+        let mut targets: Vec<Mac> = router.mcast_targets(group(5)).collect();
+        targets.sort_by_key(|m| m.0);
+        assert_eq!(targets, vec![mac(2), mac(3)]);
+    }
+
+    /// More listeners than the fanout threshold falls back to flooding.
+    #[test]
+    fn over_fanout_plans_flood() {
+        let mut router = CentralRouter::new(mac(1));
+        for n in 0..=(MCAST_FANOUT as u8) {
+            learn_listener(&mut router, mac(10 + n), 1, &[group(5)]);
+        }
+        assert_eq!(router.mcast_plan(group(5)), McastPlan::Flood);
+    }
+
+    /// `handle_local_mcast` wraps the frame in a BATADV_MCAST packet addressed
+    /// to the given listener, preserving the inner payload.
+    #[test]
+    fn handle_local_mcast_wraps_in_mcast_packet() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut tx = [0u8; 256];
+        let out = router
+            .handle_local_mcast(mac(7), INNER, &mut tx)
+            .expect("mcast packet should build");
+
+        assert_eq!(out.protocol, ETH_P_BATMAN);
+        let (hdr, rest) = BatmanMcastPacket::ref_from_prefix(out.payload).unwrap();
+        assert_eq!(hdr.packet_type, BATADV_MCAST);
+        assert_eq!(hdr.dest, mac(7));
+        assert!(hdr.ttl > 1);
+        assert_eq!(&rest[..INNER.len()], INNER);
+    }
+}
