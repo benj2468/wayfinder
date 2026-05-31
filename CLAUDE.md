@@ -73,7 +73,7 @@ All non-trivial logic **must be accompanied by unit tests** in a `#[cfg(test)]` 
 - Protocol state machines and routing algorithms
 - Edge cases: empty collections, single-element collections, at-capacity/eviction behavior
 
-For `IdentTable` and other wayfinder tests, use `u8` as the `Ident` type (it already implements `MeshIdentifier`).  When a data structure has non-trivial invariants, add an `assert_invariants()` helper (gated behind `#[cfg(test)]`) and call it after each operation in the relevant tests.
+For the generic container tests (`IdentTable`, `LinkQualityTable`, `Switch`), use `u8` as the identifier type (it implements `MeshIdentifier`).  For engine/router/wire tests, which are concrete over `Mac`, use a `fn mac(n: u8) -> Mac { Mac([0,0,0,0,0,n]) }` helper to build node addresses from compact literals.  When a data structure has non-trivial invariants, add an `assert_invariants()` helper (gated behind `#[cfg(test)]`) and call it after each operation in the relevant tests.
 
 ## Architecture
 
@@ -84,25 +84,30 @@ The workspace is organized into several libraries plus one binary:
 **libs/interfaces** - Core abstractions and traits for the mesh networking system:
 - `MeshRoutingEngine` trait: Defines routing protocol behavior (handle_rx, produce_periodic_broadcast)
 - `EmbeddedMeshLink` trait: Abstracts physical layer communication; `receive` reports per-frame `LinkMetrics` (RSSI/SNR)
-- `MeshIdentifier` trait: Type constraint for node addresses (implemented for `u8` and `[u8; 6]`)
-- `LinkFrame`: Zero-copy link-layer frame structure with src/dst/protocol/payload
+- `Mac`: the node-address type — a `#[repr(transparent)]` newtype over `[u8; 6]` (a MAC address) with `is_multicast`/`is_broadcast` (I/G bit), `from_ipv4_multicast`, `BROADCAST`, and `From<[u8;6]>`. The protocol/engine/router layers are concrete over `Mac`.
+- `MeshIdentifier` trait: retained only as the type constraint for the still-generic *container* types (`IdentTable`, `LinkQualityTable`, `Switch`); implemented for `u8` (used by their unit tests) and `Mac`.
+- `LinkFrame`: Zero-copy link-layer frame structure with src/dst (`Mac`)/protocol/payload
 - `RoutingAction` enum: Returned by routing engines (Consumed, ForwardTo, DeliverLocal, DeliverLocalAndForward)
 
 **libs/batman** - BATMAN-adv routing protocol implementation:
-- `BatmanEngine<MAX_ORIGINATORS, Ident>`: Core routing engine with originator table + broadcast dedup table
-- `BatmanOgmPacket`: Originator Messages (OGM) for topology discovery
+- `BatmanEngine<MAX_ORIGINATORS>`: Core routing engine with originator table, broadcast dedup table, and multicast membership tables (`local_mcast` / `mcast_members`)
+- `BatmanOgmPacket`: Originator Messages (OGM) for topology discovery. Matches batman-adv's `batadv_ogm_packet` layout (`flags`, `reserved`, big-endian `tvlv_len`) and can carry a variable-length TVLV tail after the fixed header.
+- `BatmanTvlvHdr` + `find_tvlv`: Type-Version-Length-Value records carried in the OGM tail; `BATADV_TVLV_MCAST` announces the originator's joined multicast groups (group MACs back-to-back).
 - `BatmanUnicastPacket`: Unicast data packets with TTL and destination
+- `BatmanMcastPacket`: Selectively-forwarded multicast copy (one per interested listener), routed toward `dest` like a unicast
 - `BatmanBroadcastPacket`: TTL-limited, seqno-deduplicated flooded broadcasts (e.g. ARP)
+- `set_local_mcast_groups` / `mcast_listeners`: manage local memberships (announced in OGMs) and query learned `(group → originators)` memberships
 - Implements `MeshRoutingEngine` trait
 - Uses heapless data structures for embedded compatibility
-- Protocol constants: `ETH_P_BATMAN` (0x4305), `BATADV_IV_OGM` (0x01), `BATADV_BCAST` (0x02), `BATADV_UNICAST` (0x03)
+- Protocol constants: `ETH_P_BATMAN` (0x4305), `BATADV_IV_OGM` (0x01), `BATADV_BCAST` (0x02), `BATADV_UNICAST` (0x03), `BATADV_MCAST` (0x04), `BATADV_TVLV_MCAST` (0x06)
 
 **libs/wayfinder** - Central router orchestration (`no_std`):
-- `CentralRouter<Ident>`: Wraps the BATMAN engine plus an ident table and a per-(neighbor, interface) link-quality table
+- `CentralRouter`: Wraps the BATMAN engine plus an ident table and a per-(neighbor, interface) link-quality table
 - `DEFAULT_BATMAN_ETHER_TYPE`: 0x4305
 - `handle_frame` / `handle_frame_with_metrics`: Process a received `LinkFrame`, fold in metrics, return any outgoing frame
 - `poll`: Drive periodic OGM broadcasts
 - `handle_local`: Wrap application/host data destined for a mesh node in a BATMAN unicast
+- `mcast_plan` / `mcast_targets` / `handle_local_mcast`: multicast egress. `mcast_plan` returns `McastPlan::Unicast` when 1..=`MCAST_FANOUT` listeners are known (else `Flood`); `mcast_targets` is a no-alloc borrowing iterator of those listeners; `handle_local_mcast` wraps a frame as a `BATADV_MCAST` packet to one listener. `set_local_mcast_groups` feeds locally-snooped memberships to the engine.
 - `get_egress_interface` / `resolve_route`: Choose the egress interface for a destination (metric-driven), the latter without mutating state
 - Protocol demultiplexing based on `LinkFrame` protocol field
 
@@ -112,7 +117,7 @@ The workspace is organized into several libraries plus one binary:
 
 **libs/wayfinder-test** - Test-only harness: a `Switch` simulator and `TestRouter` wrapper for multi-node integration tests over `tokio` mpsc channels (no hardware).
 
-**bins/wayfinder-tap** - The runnable node: bridges a TAP device (`Layer::L2`) onto the mesh, carries links over UDP/Unix sockets, and exposes the management API (via `wayfinder-server`) over TCP/Unix/UDP.
+**bins/wayfinder-tap** - The runnable node: bridges a TAP device (`Layer::L2`) onto the mesh, carries links over UDP/Unix sockets, and exposes the management API (via `wayfinder-server`) over TCP/Unix/UDP. The event loop snoops IGMP off the TAP (`McastSnooper` in `snoop.rs`, IPv4 IGMP v1/v2/v3; MLD not yet) to learn the host's joined multicast groups and announce them via `set_local_mcast_groups`; a host multicast frame is then sent as per-listener `BATADV_MCAST` copies (or flooded as fallback).
 
 **libs/rylr998** - REYAX RYLR998/RYLR498 LoRa module driver:
 - `RylrClient<S>`: Async AT command interface for LoRa modules
@@ -148,7 +153,13 @@ OGM processing (`handle_rx`, `BATADV_IV_OGM` arm in libs/batman/src/engine.rs):
 2. Creates or updates originator record
 3. Computes path quality (TQ -= 10 per hop)
 4. Selects best path based on highest TQ
-5. Forwards OGM with decremented TTL and updated prev_sender
+5. Folds the OGM's multicast TVLV into `mcast_members` (authoritative per originator, so dropped groups are pruned)
+6. Forwards OGM with decremented TTL and updated prev_sender, preserving the TVLV tail verbatim
+
+Multicast forwarding (`handle_rx`, `BATADV_MCAST` arm + `CentralRouter`):
+1. Each node announces its locally-joined groups in its OGM's `BATADV_TVLV_MCAST` tail; receivers record `(group → originator)` in `mcast_members`.
+2. To send a multicast frame, `CentralRouter::mcast_plan` chooses `Unicast` (1..=`MCAST_FANOUT` known listeners) or `Flood`. For unicast, the executor sends one `BATADV_MCAST` copy per listener via `handle_local_mcast`.
+3. A `BATADV_MCAST` packet routes like a unicast: delivered locally when `dest` is self, else forwarded toward the next hop with TTL decremented.
 
 Broadcast flooding (`handle_rx`, `BATADV_BCAST` arm):
 1. Drops own broadcasts (loop prevention)
@@ -164,9 +175,9 @@ Unicast forwarding (`handle_rx`, `BATADV_UNICAST` arm):
 
 ### Link Layer Frame Format
 
-All frames use `LinkFrame<Ident>` structure (libs/interfaces/src/frame.rs):
-- `src: Ident` - Source identifier (added by link layer)
-- `dst: Ident` - Destination identifier (or BROADCAST)
+All frames use the `LinkFrame` structure (libs/interfaces/src/frame.rs):
+- `src: Mac` - Source identifier (added by link layer)
+- `dst: Mac` - Destination identifier (or `Mac::BROADCAST`)
 - `protocol: u16` - EtherType-style protocol identifier
 - `payload: [u8]` - Variable-length payload
 
@@ -181,14 +192,14 @@ The CentralRouter demuxes by protocol field (`handle_frame_with_metrics` in libs
 
 ### Adding a new routing protocol
 
-1. Implement `MeshRoutingEngine<Ident>` trait in a new library
+1. Implement the `MeshRoutingEngine` trait in a new library
 2. Add protocol constant (EtherType) to identify your protocol
 3. Update the `CentralRouter::handle_frame_with_metrics` match statement to handle your protocol
 4. Create wire format packet structs with zerocopy derives
 
 ### Implementing a physical radio driver
 
-1. Implement `EmbeddedMeshLink<Ident>` trait
+1. Implement the `EmbeddedMeshLink` trait
 2. `transmit()`: Serialize LinkFrameData and send via hardware
 3. `receive()`: Read from hardware, parse into LinkFrame
 4. Handle broadcast addresses appropriately for your medium
@@ -200,10 +211,10 @@ Use the `TestRouter` wrapper from `libs/wayfinder-test`, which pairs a
 outgoing frames automatically:
 ```rust
 let (tx_a, mut rx_a) = mpsc::channel(64);
-let mut router: TestRouter<u8> = TestRouter::new(1, vec![tx_a]);
+let mut router = TestRouter::new(Mac([0,0,0,0,0,1]), vec![tx_a]);
 router.poll(now).await;            // drive periodic OGMs
 router.receive(0, &raw).await;     // feed a received wire frame
-router.send_local(2, payload).await?; // inject local data toward node 2
+router.send_local(Mac([0,0,0,0,0,2]), payload).await?; // inject local data toward node 2
 ```
 For multi-node scenarios, connect several `TestRouter`s through a `Switch`.
 
