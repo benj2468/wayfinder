@@ -794,3 +794,111 @@ mod broadcast_processing {
         assert_eq!(reply.protocol, 0); // not re-flooded
     }
 }
+
+#[cfg(test)]
+mod ogm_tvlv {
+    //! The OGM now matches batman-adv's `batadv_ogm_packet` layout and can
+    //! carry a variable-length TVLV (Type-Version-Length-Value) tail after the
+    //! fixed header, used to piggyback membership announcements onto OGMs.  The
+    //! header's `tvlv_len` field (big-endian) gives the tail length in bytes.
+
+    use super::*;
+    use crate::wire::BatmanTvlvHdr;
+
+    /// Build one TVLV record: `[type][version][len: be16][value ...]`.
+    fn tvlv_record(tvlv_type: u8, value: &[u8]) -> Vec<u8> {
+        let hdr = BatmanTvlvHdr {
+            tvlv_type,
+            version: 1,
+            len: (value.len() as u16).to_be(),
+        };
+        let mut v = hdr.as_bytes().to_vec();
+        v.extend_from_slice(value);
+        v
+    }
+
+    /// An OGM carrying a TVLV tail must round-trip: the fixed header parses
+    /// off the front (advertising the tail length via `tvlv_len`), and the
+    /// TVLV record parses out of the tail intact.
+    #[test]
+    fn ogm_round_trips_with_tvlv_tail() {
+        let value = [0xaa, 0xbb, 0xcc];
+        let tvlv = tvlv_record(0x05, &value);
+
+        let ogm = BatmanOgmPacket {
+            packet_type: BATADV_IV_OGM,
+            version: 5,
+            ttl: 50,
+            flags: 0,
+            seqno: 1u32.to_be(),
+            orig: mac(2),
+            prev_sender: mac(2),
+            reserved: 0,
+            tq: 255,
+            tvlv_len: (tvlv.len() as u16).to_be(),
+        };
+        let mut bytes = ogm.as_bytes().to_vec();
+        bytes.extend_from_slice(&tvlv);
+
+        let (parsed, tail) = BatmanOgmPacket::ref_from_prefix(&bytes).unwrap();
+        assert_eq!(u16::from_be(parsed.tvlv_len) as usize, tvlv.len());
+        assert_eq!(&tail[..tvlv.len()], &tvlv[..]);
+
+        let (thdr, val) = BatmanTvlvHdr::ref_from_prefix(tail).unwrap();
+        assert_eq!(thdr.tvlv_type, 0x05);
+        assert_eq!(u16::from_be(thdr.len) as usize, value.len());
+        assert_eq!(&val[..value.len()], &value);
+    }
+
+    /// When an intermediate node re-floods an OGM, it must preserve the TVLV
+    /// tail verbatim (so membership announcements propagate) while still
+    /// decrementing TTL, attenuating TQ, and stamping itself as prev_sender.
+    #[test]
+    fn forwarded_ogm_preserves_tvlv_tail() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        let value = [0x11, 0x22];
+        let tvlv = tvlv_record(0x05, &value);
+
+        // OGM originated by node 3, relayed to us by node 2, TTL to spare.
+        let ogm = BatmanOgmPacket {
+            packet_type: BATADV_IV_OGM,
+            version: 5,
+            ttl: 50,
+            flags: 0,
+            seqno: 1u32.to_be(),
+            orig: mac(3),
+            prev_sender: mac(2),
+            reserved: 0,
+            tq: 245,
+            tvlv_len: (tvlv.len() as u16).to_be(),
+        };
+        let mut payload = ogm.as_bytes().to_vec();
+        payload.extend_from_slice(&tvlv);
+
+        let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, payload);
+        let frame = parse_link_frame(&frame_bytes);
+
+        let mut reply_buffer = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
+
+        let action = engine.handle_rx(frame, &mut reply);
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.dst, Mac::BROADCAST);
+
+        let (fwd, tail) = BatmanOgmPacket::ref_from_prefix(reply.payload).unwrap();
+        assert_eq!(fwd.orig, mac(3)); // originator unchanged
+        assert_eq!(fwd.prev_sender, mac(1)); // stamped as us
+        assert_eq!(fwd.ttl, 49); // decremented
+        assert_eq!(
+            u16::from_be(fwd.tvlv_len) as usize,
+            tvlv.len(),
+            "tvlv_len must survive forwarding"
+        );
+        assert_eq!(
+            &tail[..tvlv.len()],
+            &tvlv[..],
+            "tvlv tail must be preserved"
+        );
+    }
+}
