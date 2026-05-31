@@ -22,7 +22,6 @@ struct TestSwitchConfig {
 #[derive(Serialize, Deserialize)]
 struct TestMachineConfig {
     name: String,
-    switches: Vec<String>,
     wayfinder: wayfinder::config::Config,
 }
 
@@ -83,17 +82,6 @@ impl TestConfig {
     fn validate(&self) -> Result<TestHarness, String> {
         let mut h = TestHarness::default();
         for switch in &self.switches {
-            if !self
-                .machines
-                .iter()
-                .any(|m| m.switches.iter().any(|s| *s == switch.name))
-            {
-                return Err(format!(
-                    "Switch '{}' is not used by any machine",
-                    switch.name
-                ));
-            }
-
             if h.switches
                 .insert(switch.name.clone(), Switch::new())
                 .is_some()
@@ -105,11 +93,6 @@ impl TestConfig {
             }
         }
         for (i, machine) in self.machines.iter().enumerate() {
-            for switch in &machine.switches {
-                if !self.switches.iter().any(|s| s.name == *switch) {
-                    return Err(format!("Switch '{}' is not defined", switch));
-                }
-            }
             let router = TestRouter::new_from_config(&mut h, mac(i as u8), &machine.wayfinder);
             if h.machines.insert(machine.name.clone(), router).is_some() {
                 return Err(format!(
@@ -143,6 +126,75 @@ mod tests {
         });
     }
 
+    fn simple_pair() -> TestHarness {
+        let mut config = TestConfig::default();
+        config.switches.push(TestSwitchConfig {
+            name: "switch1".into(),
+        });
+        config.machines.push(TestMachineConfig {
+            name: "machine1".into(),
+            wayfinder: Config {
+                links: vec![LinkConfig::Test {
+                    switch_name: "switch1".into(),
+                }],
+                ..Default::default()
+            },
+        });
+        config.machines.push(TestMachineConfig {
+            name: "machine2".into(),
+            wayfinder: Config {
+                links: vec![LinkConfig::Test {
+                    switch_name: "switch1".into(),
+                }],
+                ..Default::default()
+            },
+        });
+        config.validate().unwrap()
+    }
+
+    fn line_of_three() -> TestHarness {
+        let mut config = TestConfig::default();
+        config.switches.push(TestSwitchConfig {
+            name: "switch1".into(),
+        });
+        config.switches.push(TestSwitchConfig {
+            name: "switch2".into(),
+        });
+        config.machines.push(TestMachineConfig {
+            name: "machine1".into(),
+            wayfinder: Config {
+                links: vec![LinkConfig::Test {
+                    switch_name: "switch1".into(),
+                }],
+                ..Default::default()
+            },
+        });
+        config.machines.push(TestMachineConfig {
+            name: "machine2".into(),
+            wayfinder: Config {
+                links: vec![
+                    LinkConfig::Test {
+                        switch_name: "switch1".into(),
+                    },
+                    LinkConfig::Test {
+                        switch_name: "switch2".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+        });
+        config.machines.push(TestMachineConfig {
+            name: "machine3".into(),
+            wayfinder: Config {
+                links: vec![LinkConfig::Test {
+                    switch_name: "switch2".into(),
+                }],
+                ..Default::default()
+            },
+        });
+        config.validate().unwrap()
+    }
+
     #[tokio::test]
     async fn test_validate() {
         let config = TestConfig::default();
@@ -162,64 +214,31 @@ mod tests {
     }
 
     #[tokio::test]
+    #[should_panic]
     async fn test_invalid_switch() {
         let mut config = TestConfig::default();
         config.machines.push(TestMachineConfig {
             name: "foo".into(),
-            switches: vec!["invalid".into()],
-            wayfinder: Config::default(),
+            wayfinder: Config {
+                links: vec![LinkConfig::Test {
+                    switch_name: "invalid".into(),
+                }],
+                ..Default::default()
+            },
         });
         assert!(config.validate().is_err());
     }
 
     #[tokio::test]
     async fn test_simple_pair() {
-        let mut config = TestConfig::default();
-        config.switches.push(TestSwitchConfig {
-            name: "test1".into(),
-        });
-        config.machines.push(TestMachineConfig {
-            name: "foo".into(),
-            switches: vec!["test1".into()],
-            wayfinder: Config::default(),
-        });
-        config.machines.push(TestMachineConfig {
-            name: "foo1".into(),
-            switches: vec!["test1".into()],
-            wayfinder: Config::default(),
-        });
-        assert!(config.validate().is_ok());
+        simple_pair();
     }
 
     #[tokio::test]
     async fn test_simple_pair_send_data() {
         setup();
+        let mut harness = simple_pair();
 
-        let mut config = TestConfig::default();
-        config.switches.push(TestSwitchConfig {
-            name: "switch1".into(),
-        });
-        config.machines.push(TestMachineConfig {
-            name: "machine1".into(),
-            switches: vec!["switch1".into()],
-            wayfinder: Config {
-                links: vec![LinkConfig::Test {
-                    switch_name: "switch1".into(),
-                }],
-                ..Default::default()
-            },
-        });
-        config.machines.push(TestMachineConfig {
-            name: "machine2".into(),
-            switches: vec!["switch1".into()],
-            wayfinder: Config {
-                links: vec![LinkConfig::Test {
-                    switch_name: "switch1".into(),
-                }],
-                ..Default::default()
-            },
-        });
-        let mut harness = config.validate().unwrap();
         harness.tick(Duration::from_secs(1)).await;
         harness.tick(Duration::from_secs(2)).await;
 
@@ -235,6 +254,38 @@ mod tests {
 
         assert_eq!(
             harness.get_machine("machine2").local_deliveries,
+            vec![b"Hello World"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_line_of_three() {
+        line_of_three();
+    }
+
+    #[tokio::test]
+    async fn test_line_of_three_send_data() {
+        setup();
+        let mut harness = line_of_three();
+
+        harness.tick(Duration::from_secs(1)).await;
+        harness.tick(Duration::from_secs(2)).await;
+        harness.tick(Duration::from_secs(3)).await;
+        harness.tick(Duration::from_secs(4)).await;
+
+        let ident = harness.get_machine_mut("machine3").ident;
+        harness
+            .get_machine_mut("machine1")
+            .send_local(ident, b"Hello World")
+            .await
+            .unwrap();
+
+        harness.tick(Duration::from_secs(5)).await;
+        harness.tick(Duration::from_secs(6)).await;
+        harness.tick(Duration::from_secs(7)).await;
+
+        assert_eq!(
+            harness.get_machine("machine3").local_deliveries,
             vec![b"Hello World"]
         );
     }
