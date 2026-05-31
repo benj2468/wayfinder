@@ -6,7 +6,8 @@ pub use interfaces;
 use batman::{
     BatmanEngine,
     wire::{
-        BATADV_BCAST, BATADV_UNICAST, BatmanBroadcastPacket, BatmanUnicastPacket, ETH_P_BATMAN,
+        BATADV_BCAST, BATADV_MCAST, BATADV_UNICAST, BatmanBroadcastPacket, BatmanMcastPacket,
+        BatmanUnicastPacket, ETH_P_BATMAN,
     },
 };
 use interfaces::{
@@ -28,6 +29,27 @@ mod link_quality;
 mod routing_table;
 
 pub const DEFAULT_BATMAN_ETHER_TYPE: u16 = 0x4305;
+
+/// Maximum number of interested listeners for which a multicast frame is sent
+/// as individual unicasts before falling back to flooding, matching the spirit
+/// of batman-adv's multicast fanout limit.  Beyond this count, flooding is
+/// cheaper than many point-to-point copies.
+pub const MCAST_FANOUT: usize = 16;
+
+/// How the router intends to deliver a multicast frame for a given group,
+/// returned by [`CentralRouter::mcast_plan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McastPlan {
+    /// Send an individual [`BATADV_MCAST`] packet to each interested
+    /// originator — the set returned by [`CentralRouter::mcast_targets`].
+    /// Chosen when at least one and at most [`MCAST_FANOUT`] listeners are
+    /// known.
+    Unicast,
+    /// Flood the frame as a broadcast across the whole mesh.  Chosen when no
+    /// listeners are known (membership may simply be unlearned) or when more
+    /// than [`MCAST_FANOUT`] listeners make flooding cheaper than unicasting.
+    Flood,
+}
 
 /// The egress decision returned by [`CentralRouter::get_egress_interface`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,9 +242,61 @@ impl CentralRouter {
     fn inner_offset(payload: &[u8]) -> usize {
         match payload.first() {
             Some(&BATADV_UNICAST) => core::mem::size_of::<BatmanUnicastPacket>(),
+            Some(&BATADV_MCAST) => core::mem::size_of::<BatmanMcastPacket>(),
             Some(&BATADV_BCAST) => core::mem::size_of::<BatmanBroadcastPacket>(),
             _ => 0,
         }
+    }
+
+    /// Decide how to deliver a multicast frame for `group`: as individual
+    /// unicasts to each known listener (when 1..=[`MCAST_FANOUT`] are known)
+    /// or by flooding (no listeners known, or too many to be worth it).
+    pub fn mcast_plan(&self, group: Mac) -> McastPlan {
+        let count = self.batman.mcast_listeners(group).count();
+        if (1..=MCAST_FANOUT).contains(&count) {
+            McastPlan::Unicast
+        } else {
+            McastPlan::Flood
+        }
+    }
+
+    /// The originators that have announced interest in `group` — the targets
+    /// for [`McastPlan::Unicast`].  Borrows `self`; allocates nothing.
+    pub fn mcast_targets(&self, group: Mac) -> impl Iterator<Item = Mac> + '_ {
+        self.batman.mcast_listeners(group)
+    }
+
+    /// Wrap host data destined for the multicast listener `dest` in a
+    /// [`BATADV_MCAST`] packet routed toward its best-known next hop.  Called
+    /// once per target of a [`McastPlan::Unicast`].  Returns `Err(())` if the
+    /// header plus `payload` would not fit in `tx_buf`.
+    pub fn handle_local_mcast<'a>(
+        &mut self,
+        dest: Mac,
+        payload: &[u8],
+        tx_buf: &'a mut [u8],
+    ) -> Result<LinkFrameData<'a>, ()> {
+        let next_hop = self.batman.lookup_route(dest).unwrap_or(dest);
+
+        let header = BatmanMcastPacket {
+            packet_type: BATADV_MCAST,
+            version: 5,
+            ttl: 50,
+            dest,
+        };
+        let header_size = core::mem::size_of::<BatmanMcastPacket>();
+        let total_size = header_size + payload.len();
+        if total_size > tx_buf.len() {
+            return Err(());
+        }
+        tx_buf[..header_size].copy_from_slice(header.as_bytes());
+        tx_buf[header_size..total_size].copy_from_slice(payload);
+
+        Ok(LinkFrameData {
+            dst: next_hop,
+            protocol: ETH_P_BATMAN,
+            payload: &tx_buf[..total_size],
+        })
     }
 
     #[tracing::instrument(skip_all, level = "trace")]

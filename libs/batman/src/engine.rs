@@ -9,8 +9,9 @@ use zerocopy::{FromBytes, IntoBytes};
 use crate::{
     BatmanEngine, NeighborStats, OriginatorRecord,
     wire::{
-        BATADV_BCAST, BATADV_IV_OGM, BATADV_TVLV_MCAST, BATADV_UNICAST, BatmanBroadcastPacket,
-        BatmanOgmPacket, BatmanTvlvHdr, BatmanUnicastPacket, ETH_P_BATMAN, find_tvlv,
+        BATADV_BCAST, BATADV_IV_OGM, BATADV_MCAST, BATADV_TVLV_MCAST, BATADV_UNICAST,
+        BatmanBroadcastPacket, BatmanMcastPacket, BatmanOgmPacket, BatmanTvlvHdr,
+        BatmanUnicastPacket, ETH_P_BATMAN, find_tvlv,
     },
 };
 
@@ -320,6 +321,57 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
                     updated_hdr.ttl -= 1;
 
                     let size = core::mem::size_of::<BatmanUnicastPacket>();
+                    let inner = frame.payload.get(size..).unwrap_or(&[]);
+                    let total = size + inner.len();
+
+                    reply.dst = record.best_next_hop;
+                    reply.protocol = ETH_P_BATMAN;
+                    reply
+                        .payload
+                        .get_mut(0..size)
+                        .unwrap()
+                        .copy_from_slice(updated_hdr.as_bytes());
+                    reply
+                        .payload
+                        .get_mut(size..total)
+                        .unwrap_or(&mut [])
+                        .copy_from_slice(inner);
+                }
+
+                RoutingAction::Consumed // Route unknown, drop packet
+            }
+
+            BATADV_MCAST => {
+                // Structurally identical to unicast routing: each multicast
+                // copy is addressed to one listener node and travels toward it
+                // hop by hop, delivered locally on arrival.
+                let parsed = BatmanMcastPacket::read_from_prefix(&frame.payload);
+                if parsed.is_err() {
+                    return RoutingAction::Consumed;
+                }
+                let (mcast_hdr, _) = parsed.unwrap();
+                let dst = mcast_hdr.dest;
+
+                // Rule 1: this copy reached its target listener — deliver up.
+                if dst == self.self_ident {
+                    return RoutingAction::DeliverLocal;
+                }
+
+                // Rule 2: drop if TTL is exhausted.
+                if mcast_hdr.ttl <= 1 {
+                    return RoutingAction::Consumed;
+                }
+
+                // Rule 3: relay toward the next hop for the target listener.
+                if let Some(record) = self
+                    .originator_table
+                    .iter()
+                    .find(|r| r.neighbor_ident == dst)
+                {
+                    let mut updated_hdr = mcast_hdr;
+                    updated_hdr.ttl -= 1;
+
+                    let size = core::mem::size_of::<BatmanMcastPacket>();
                     let inner = frame.payload.get(size..).unwrap_or(&[]);
                     let total = size + inner.len();
 

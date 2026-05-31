@@ -6,6 +6,7 @@ use futures::{StreamExt, stream::FuturesOrdered};
 use pretty_hex::pretty_hex;
 use wayfinder::CentralRouter;
 use wayfinder::EgressInterface;
+use wayfinder::McastPlan;
 use wayfinder::interfaces::frame::{LinkFrameData, Mac};
 use wayfinder_protos::service::WayfinderService;
 
@@ -38,9 +39,10 @@ pub(crate) struct EventLoop<Tap: AsyncIo> {
 /// One iteration's worth of work, fully owned so that no borrow of the rx/tx
 /// scratchpads or the interface set escapes the `select!`.
 struct LoopOutput {
-    /// `(destination ident, protocol, serialized payload)` to transmit onto
-    /// the mesh, dispatched via `get_egress_interface`.
-    mesh: Option<(Mac, u16, Vec<u8>)>,
+    /// `(destination ident, protocol, serialized payload)` frames to transmit
+    /// onto the mesh, each dispatched via `get_egress_interface`.  Usually one,
+    /// but a selectively-forwarded multicast frame produces one per listener.
+    mesh: Vec<(Mac, u16, Vec<u8>)>,
     /// Inner frame to write back to the local TAP device.
     local: Option<Vec<u8>>,
 }
@@ -79,7 +81,7 @@ impl<Tap: AsyncIo> EventLoop<Tap> {
                     let rx = router.handle_frame(idx, frame, tx_buffer);
                     tracing::debug!("decoded as {:?}", rx);
                     LoopOutput {
-                        mesh: rx.forward.map(|f| (f.dst, f.protocol, f.payload.to_vec())),
+                        mesh: rx.forward.map(|f| (f.dst, f.protocol, f.payload.to_vec())).into_iter().collect(),
                         local: rx.deliver_local.map(|inner| inner.to_vec()),
                     }
                 },
@@ -91,35 +93,55 @@ impl<Tap: AsyncIo> EventLoop<Tap> {
                     // carry the whole frame across the mesh untouched.
                     let eth = &rx_buffer[..len];
                     tracing::debug!("{}", pretty_hex::pretty_hex(&eth));
-                    let mesh = if eth.len() >= 14 {
+                    let mut mesh: Vec<(Mac, u16, Vec<u8>)> = Vec::new();
+                    if eth.len() >= 14 {
                         let mut dst_mac = [0u8; 6];
                         dst_mac.copy_from_slice(&eth[0..6]);
-                        // The I/G bit (LSB of the first octet) marks multicast /
-                        // broadcast destinations, which we flood across the mesh.
-                        let dest = if Mac(dst_mac).is_multicast() {
-                            Mac::BROADCAST
-                        } else {
-                            Mac(dst_mac)
+                        let dst = Mac(dst_mac);
+
+                        // One mesh frame per copy: a normal unicast for a
+                        // single host; a flooded broadcast for the all-ones
+                        // address (or as multicast fallback); or — for a
+                        // multicast group with a known, bounded listener set —
+                        // an individual BATADV_MCAST copy per interested node.
+                        let flood = |router: &mut CentralRouter, mesh: &mut Vec<(Mac, u16, Vec<u8>)>, buf: &mut [u8]| {
+                            if let Ok(f) = router.handle_local(Mac::BROADCAST, eth, buf) {
+                                mesh.push((f.dst, f.protocol, f.payload.to_vec()));
+                            }
                         };
-                        router
-                            .handle_local(dest, eth, tx_buffer)
-                            .ok()
-                            .map(|f| (f.dst, f.protocol, f.payload.to_vec()))
-                    } else {
-                        None
-                    };
+
+                        if dst.is_broadcast() {
+                            flood(router, &mut mesh, tx_buffer);
+                        } else if dst.is_multicast() {
+                            match router.mcast_plan(dst) {
+                                McastPlan::Unicast => {
+                                    let targets: Vec<Mac> = router.mcast_targets(dst).collect();
+                                    for target in targets {
+                                        if let Ok(f) = router.handle_local_mcast(target, eth, tx_buffer) {
+                                            mesh.push((f.dst, f.protocol, f.payload.to_vec()));
+                                        }
+                                    }
+                                }
+                                McastPlan::Flood => flood(router, &mut mesh, tx_buffer),
+                            }
+                        } else if let Ok(f) = router.handle_local(dst, eth, tx_buffer) {
+                            mesh.push((f.dst, f.protocol, f.payload.to_vec()));
+                        }
+                    }
                     LoopOutput { mesh, local: None }
                 },
                 Some((request, resp_tx)) = query_rx.recv() => {
                     let response = WayfinderService::new(RouterAdapter::new(&*router)).handle(request);
                     let _ = resp_tx.send(response);
-                    LoopOutput { mesh: None, local: None }
+                    LoopOutput { mesh: Vec::new(), local: None }
                 },
                 _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                     LoopOutput {
                         mesh: router
                             .poll(start.elapsed(), tx_buffer)
-                            .map(|f| (f.dst, f.protocol, f.payload.to_vec())),
+                            .map(|f| (f.dst, f.protocol, f.payload.to_vec()))
+                            .into_iter()
+                            .collect(),
                         local: None,
                     }
                 }
@@ -134,8 +156,8 @@ impl<Tap: AsyncIo> EventLoop<Tap> {
             tap.send(&local).await?;
         }
 
-        // Dispatch any outgoing frame onto the mesh.
-        if let Some((dst, protocol, payload)) = output.mesh {
+        // Dispatch each outgoing frame onto the mesh.
+        for (dst, protocol, payload) in output.mesh {
             tracing::debug!(
                 "mesh output: dst={:?} protocol={:?} payload={:?}",
                 dst,

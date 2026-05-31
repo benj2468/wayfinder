@@ -117,6 +117,31 @@ pub struct BatmanBroadcastPacket {
 
 pub const BATADV_UNICAST: u8 = 0x03;
 
+/// Packet sub-type for a selectively-forwarded multicast frame, mirroring
+/// batman-adv's `batadv_mcast_packet`.  A multicast frame with a bounded set
+/// of interested listeners is delivered as one [`BatmanMcastPacket`] per
+/// listener, each addressed to that listener's node and routed toward it like
+/// a unicast.  Kept distinct from [`BATADV_UNICAST`] so multicast traffic
+/// stays identifiable on the wire.
+pub const BATADV_MCAST: u8 = 0x04;
+
+/// Header for a [`BATADV_MCAST`] packet.  Structurally a unicast header: the
+/// encapsulated multicast frame follows it, and the packet is routed hop by
+/// hop toward `dest` (the listener node this copy targets), TTL-limited to
+/// prevent loops, and delivered to the local host on arrival at `dest`.
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, Immutable, KnownLayout)]
+#[repr(C, packed)]
+pub struct BatmanMcastPacket {
+    /// Always [`BATADV_MCAST`].
+    pub packet_type: u8,
+    /// Protocol version.
+    pub version: u8,
+    /// Time-to-live, decremented per hop to bound routing loops.
+    pub ttl: u8,
+    /// The listener node this copy is addressed to (final destination).
+    pub dest: Mac,
+}
+
 #[derive(Debug, Clone, Copy, IntoBytes, FromBytes, Immutable, KnownLayout)]
 #[repr(C, packed)]
 pub struct BatmanUnicastPacket {
