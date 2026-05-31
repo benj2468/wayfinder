@@ -905,3 +905,137 @@ mod ogm_tvlv {
         );
     }
 }
+
+#[cfg(test)]
+mod mcast_membership {
+    //! Multicast group memberships are distributed across the mesh by
+    //! piggybacking them on OGMs as a [`BATADV_TVLV_MCAST`] TVLV.  A node
+    //! announces the groups its local host listens to, and learns which
+    //! originators want which groups from the OGMs it receives.
+
+    use core::time::Duration;
+
+    use super::*;
+    use crate::wire::{BATADV_TVLV_MCAST, BatmanTvlvHdr};
+
+    /// A multicast group MAC (`01:00:5e:00:00:NN`, IPv4-multicast style).
+    fn group(n: u8) -> Mac {
+        Mac([0x01, 0x00, 0x5e, 0x00, 0x00, n])
+    }
+
+    /// Build a multicast TVLV record: header + the listed group MACs as value.
+    fn mcast_tvlv(groups: &[Mac]) -> Vec<u8> {
+        let mut value = Vec::new();
+        for g in groups {
+            value.extend_from_slice(g.as_bytes());
+        }
+        let hdr = BatmanTvlvHdr {
+            tvlv_type: BATADV_TVLV_MCAST,
+            version: 1,
+            len: (value.len() as u16).to_be(),
+        };
+        let mut v = hdr.as_bytes().to_vec();
+        v.extend_from_slice(&value);
+        v
+    }
+
+    /// Build a received OGM wire frame from `orig` (relayed by `prev`) carrying
+    /// a multicast TVLV announcing `groups`.
+    fn ogm_with_groups(orig: u8, prev: u8, seqno: u32, groups: &[Mac]) -> Vec<u8> {
+        let tvlv = mcast_tvlv(groups);
+        let ogm = BatmanOgmPacket {
+            packet_type: BATADV_IV_OGM,
+            version: 5,
+            ttl: 50,
+            flags: 0,
+            seqno: seqno.to_be(),
+            orig: mac(orig),
+            prev_sender: mac(prev),
+            reserved: 0,
+            tq: 255,
+            tvlv_len: (tvlv.len() as u16).to_be(),
+        };
+        let mut payload = ogm.as_bytes().to_vec();
+        payload.extend_from_slice(&tvlv);
+        make_link_frame(orig, 0xff, ETH_P_BATMAN, payload)
+    }
+
+    /// Scan a TVLV tail and return the multicast TVLV's value bytes, if present.
+    fn mcast_value(tail: &[u8]) -> Option<Vec<u8>> {
+        let mut off = 0;
+        while off + 4 <= tail.len() {
+            let (hdr, _) = BatmanTvlvHdr::ref_from_prefix(&tail[off..]).ok()?;
+            let len = u16::from_be(hdr.len) as usize;
+            let vstart = off + 4;
+            if hdr.tvlv_type == BATADV_TVLV_MCAST {
+                return tail.get(vstart..vstart + len).map(|s| s.to_vec());
+            }
+            off = vstart + len;
+        }
+        None
+    }
+
+    /// A node's local multicast memberships are announced in the OGMs it
+    /// produces, as a multicast TVLV listing the group MACs.
+    #[test]
+    fn local_memberships_are_announced_in_ogm() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        engine.set_local_mcast_groups(&[group(0x2a), group(0x2b)]);
+
+        let mut tx = [0u8; 256];
+        let bytes = engine
+            .produce_periodic_broadcast(Duration::ZERO, &mut tx)
+            .unwrap();
+        let (_ogm, tail) = BatmanOgmPacket::ref_from_prefix(bytes).unwrap();
+
+        let value = mcast_value(tail).expect("OGM must carry a multicast TVLV");
+        assert_eq!(value.len(), 12, "two group MACs = 12 bytes");
+        assert_eq!(&value[0..6], group(0x2a).as_bytes());
+        assert_eq!(&value[6..12], group(0x2b).as_bytes());
+    }
+
+    /// An OGM with no local memberships carries no multicast TVLV.
+    #[test]
+    fn no_memberships_means_no_mcast_tvlv() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        let mut tx = [0u8; 256];
+        let bytes = engine
+            .produce_periodic_broadcast(Duration::ZERO, &mut tx)
+            .unwrap();
+        let (ogm, tail) = BatmanOgmPacket::ref_from_prefix(bytes).unwrap();
+        assert_eq!(u16::from_be(ogm.tvlv_len), 0);
+        assert!(mcast_value(tail).is_none());
+    }
+
+    /// Receiving an OGM with a multicast TVLV records the originator as a
+    /// listener for each announced group; a later OGM announcing fewer groups
+    /// prunes the memberships it dropped.
+    #[test]
+    fn received_memberships_are_tracked_and_pruned() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        let (g1, g2) = (group(1), group(2));
+
+        // Node 5 announces interest in g1 and g2.
+        let frame_bytes = ogm_with_groups(5, 5, 1, &[g1, g2]);
+        let frame = parse_link_frame(&frame_bytes);
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        engine.handle_rx(frame, &mut reply);
+
+        assert!(engine.mcast_listeners(g1).any(|m| m == mac(5)));
+        assert!(engine.mcast_listeners(g2).any(|m| m == mac(5)));
+
+        // A newer OGM from node 5 announcing only g1 must prune g2.
+        let frame_bytes = ogm_with_groups(5, 5, 2, &[g1]);
+        let frame = parse_link_frame(&frame_bytes);
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        engine.handle_rx(frame, &mut reply);
+
+        assert!(engine.mcast_listeners(g1).any(|m| m == mac(5)));
+        assert!(
+            !engine.mcast_listeners(g2).any(|m| m == mac(5)),
+            "g2 membership should have been pruned"
+        );
+    }
+}
