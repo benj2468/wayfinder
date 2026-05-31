@@ -5,24 +5,18 @@ edition = "2024"
 
 [dependencies]
 wayfinder.workspace = true
-wayfinder-protos.workspace = true
-wayfinder-server.workspace = true
+wayfinder-driver.workspace = true
 
 tracing-subscriber.workspace = true
 tracing.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
 tun-rs = { version = "2", features = ["async"] }
-etherparse.workspace = true
-embedded-io-adapters.workspace = true
 serde.workspace = true
-libc = "0.2.186"
 serde_yaml = "0.9.34"
-futures.workspace = true
-zerocopy.workspace = true
-prost = "0.13"
-bytes = "1"
 pretty-hex.workspace = true
 async-trait.workspace = true
+
+[dev-dependencies]
+zerocopy.workspace = true

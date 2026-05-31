@@ -1,34 +1,42 @@
-//! Test harness for [`CentralRouter`].
+//! Test harness for the [`Driver`].
 //!
-//! [`TestRouter`] wraps a [`CentralRouter`] and pairs it with one
-//! [`mpsc::Sender`] per physical interface.  Every outgoing frame — whether
-//! from a periodic OGM tick, a forwarded packet, or local application data —
-//! is serialised and dispatched to the right channel automatically using
-//! [`CentralRouter::get_egress_interface`].
+//! [`TestRouter`] wraps a [`wayfinder_driver::Driver`] whose transports are
+//! in-process channels: the mesh interfaces are [`PortComms`] duplexes into a
+//! [`Switch`](crate::switch::Switch), and the host device is an observable
+//! channel whose locally-delivered frames are captured for assertions.
 //!
-//! # Multiple interfaces
+//! Because it is the *same* driver that runs in production (only the carriers
+//! differ), tests exercise the real event-loop logic.  The driver is stepped
+//! deterministically: [`poll`] drives the periodic OGM at a chosen instant and
+//! [`drain_all`] processes every currently-pending frame in one non-blocking
+//! sweep.
 //!
-//! Pass one sender per interface when constructing the router:
-//!
-//! ```ignore
-//! let router = TestRouter::new(my_ident, vec![tx_iface0, tx_iface1]);
-//! ```
-//!
-//! For a broadcast destination (or any destination not yet in the ident table)
-//! the frame is flooded to **all** interfaces.  For a known unicast destination
-//! the index returned by `get_egress_interface` selects the channel.
+//! [`poll`]: TestRouter::poll
+//! [`drain_all`]: TestRouter::drain_all
 
+use std::io;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use interfaces::{
     frame::{LinkFrame, Mac},
     link::LinkMetrics,
 };
 use tokio::sync::mpsc;
-use wayfinder::{CentralRouter, EgressInterface};
+use wayfinder::CentralRouter;
+use wayfinder_driver::{Driver, FrameIo, Link, QueryRx, QueryTx};
 use zerocopy::{FromBytes, IntoBytes};
 
-use crate::{driver::TestHarness, switch::PortComms};
+use crate::driver::TestHarness;
+use crate::switch::PortComms;
+
+/// EtherType stamped on the synthetic host Ethernet frames [`send_local`]
+/// builds.  Arbitrary — the router demuxes mesh traffic by the BATMAN payload,
+/// not by this field — but a real-looking IPv4 type keeps captures legible.
+///
+/// [`send_local`]: TestRouter::send_local
+const HOST_ETHERTYPE: [u8; 2] = [0x08, 0x00];
 
 // ── wire-format helpers ───────────────────────────────────────────────────────
 
@@ -48,212 +56,228 @@ pub fn build_frame(src: Mac, dst: Mac, protocol: u16, payload: &[u8]) -> Vec<u8>
     bytes
 }
 
+/// Build the host Ethernet frame `send_local` would inject for `(dst, src,
+/// payload)`: `[dst MAC][src MAC][ethertype][payload]`.  Exposed so tests can
+/// assert against the exact frame a neighbor delivers to its host.
+pub fn host_frame(dst: Mac, src: Mac, payload: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(14 + payload.len());
+    v.extend_from_slice(dst.as_bytes());
+    v.extend_from_slice(src.as_bytes());
+    v.extend_from_slice(&HOST_ETHERTYPE);
+    v.extend_from_slice(payload);
+    v
+}
+
 /// Zero-copy parse of raw bytes into a `&LinkFrame`.
-///
-/// The returned reference borrows directly from `bytes` — no allocation.
 pub fn parse_frame(bytes: &[u8]) -> &LinkFrame {
     LinkFrame::ref_from_bytes(bytes).expect("failed to parse LinkFrame from bytes")
 }
 
+// ── in-process transports ─────────────────────────────────────────────────────
+
+/// A [`FrameIo`] mesh transport backed by a [`PortComms`] duplex into the
+/// switch fabric.
+struct ChannelTransport {
+    egress: mpsc::Sender<Vec<u8>>,
+    ingress: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+}
+
+impl From<PortComms> for ChannelTransport {
+    fn from(pc: PortComms) -> Self {
+        Self {
+            egress: pc.egress,
+            ingress: tokio::sync::Mutex::new(pc.ingress),
+        }
+    }
+}
+
+#[async_trait]
+impl FrameIo for ChannelTransport {
+    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.ingress.lock().await.recv().await {
+            Some(frame) => Ok(copy_into(&frame, buf)),
+            // The duplex outlives the test; an exhausted channel must stay
+            // pending so the deterministic non-blocking poll reports "nothing
+            // ready" rather than a spurious zero-length frame.
+            None => std::future::pending().await,
+        }
+    }
+
+    async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        self.egress
+            .send(buf.to_vec())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "switch port closed"))?;
+        Ok(buf.len())
+    }
+}
+
+/// The host-facing device for a test node: frames the router delivers locally
+/// are appended to a shared log instead of a kernel TAP, and the inbound side
+/// stays pending (host traffic is injected directly via
+/// [`Driver::inject_host_frame`]).
+struct ObservableEgress {
+    inbound: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+    deliveries: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+#[async_trait]
+impl FrameIo for ObservableEgress {
+    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.inbound.lock().await.recv().await {
+            Some(frame) => Ok(copy_into(&frame, buf)),
+            None => std::future::pending().await,
+        }
+    }
+
+    async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        self.deliveries.lock().unwrap().push(buf.to_vec());
+        Ok(buf.len())
+    }
+}
+
+/// Copy `frame` into `buf`, returning the number of bytes written.
+fn copy_into(frame: &[u8], buf: &mut [u8]) -> usize {
+    let n = frame.len().min(buf.len());
+    buf[..n].copy_from_slice(&frame[..n]);
+    n
+}
+
 // ── TestRouter ────────────────────────────────────────────────────────────────
 
-/// A [`CentralRouter`] wired up to a set of egress channels for test use.
+/// A [`Driver`] wired to in-process channels for deterministic multi-node tests.
 ///
-/// Each call to [`poll`], [`receive`], and [`send_local`] automatically
-/// serialises any outgoing frame and dispatches it to the correct interface
-/// channel, determined by [`CentralRouter::get_egress_interface`].
+/// Each [`poll`] and [`drain_all`] drives the underlying driver; locally
+/// delivered frames are captured in [`local_deliveries`].
 ///
 /// [`poll`]: TestRouter::poll
-/// [`receive`]: TestRouter::receive
-/// [`send_local`]: TestRouter::send_local
+/// [`drain_all`]: TestRouter::drain_all
+/// [`local_deliveries`]: TestRouter::local_deliveries
 pub struct TestRouter {
-    /// The underlying router — exposed so tests can inspect routing state
-    /// (e.g. originator tables) directly.
-    pub router: CentralRouter,
+    /// The underlying driver running the real event loop over channels.
+    driver: Driver<ObservableEgress>,
+    /// This node's mesh identifier.
     pub ident: Mac,
-    /// Duplex channels for each interface, indexed by interface index.
-    pub interfaces: Vec<PortComms>,
-    /// Inner frames the router handed up for local delivery (i.e. what would
-    /// be written to the TAP), in arrival order.  Lets tests assert that a
-    /// packet reached its final destination and was delivered intact.
-    pub local_deliveries: Vec<Vec<u8>>,
+    /// Inner frames the router handed up for local delivery (what would be
+    /// written to the TAP), in arrival order.
+    deliveries: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// Kept alive so the host-inbound channel never closes (the driver's
+    /// host-device select arm must stay pending, not resolve to `None`).
+    _host_in: mpsc::Sender<Vec<u8>>,
+    /// Kept alive so the management-query channel stays open.
+    _query_tx: QueryTx,
 }
 
 impl TestRouter {
+    /// Build a test router from a node's wayfinder [`Config`] by allocating a
+    /// switch port per configured test link.
+    ///
+    /// [`Config`]: wayfinder::config::Config
     pub fn new_from_config(
         h: &mut TestHarness,
         mac: Mac,
         config: &wayfinder::config::Config,
     ) -> Self {
         let mut interfaces = vec![];
-
         for link in &config.links {
             match link {
                 wayfinder::config::LinkConfig::Test { switch_name } => {
-                    let duplex = h.add_switch_port(switch_name);
-
-                    interfaces.push(duplex);
+                    interfaces.push(h.add_switch_port(switch_name));
                 }
                 _ => panic!("unsupported link type in test mode"),
             }
         }
-
         Self::new(mac, interfaces)
     }
 
-    /// Create a new test router with the given node identity and one egress
-    /// sender per interface.
+    /// Create a new test router with the given node identity and one switch-port
+    /// duplex per mesh interface.
     pub fn new(ident: Mac, interfaces: Vec<PortComms>) -> Self {
+        let links: Vec<Link> = interfaces
+            .into_iter()
+            .map(|pc| Link::new(ChannelTransport::from(pc)))
+            .collect();
+
+        let deliveries = Arc::new(Mutex::new(Vec::new()));
+        let (host_in, host_rx) = mpsc::channel(64);
+        let local = ObservableEgress {
+            inbound: tokio::sync::Mutex::new(host_rx),
+            deliveries: deliveries.clone(),
+        };
+        let (query_tx, query_rx): (QueryTx, QueryRx) = mpsc::channel(16);
+
         Self {
-            router: CentralRouter::new(ident),
+            driver: Driver::new(ident, local, links, query_rx),
             ident,
-            interfaces,
-            local_deliveries: Vec::new(),
+            deliveries,
+            _host_in: host_in,
+            _query_tx: query_tx,
         }
     }
 
-    /// The inner frames the router has delivered locally so far (what would
-    /// have been written to the TAP), in arrival order.
-    pub fn local_deliveries(&self) -> &[Vec<u8>] {
-        &self.local_deliveries
+    /// The underlying router, for inspecting routing state (originator tables,
+    /// route resolution).
+    pub fn router(&self) -> &CentralRouter {
+        self.driver.router()
+    }
+
+    /// The underlying router, mutably — for the metric-driven egress queries
+    /// (`get_egress_interface`) and crafted-frame injection.
+    pub fn router_mut(&mut self) -> &mut CentralRouter {
+        self.driver.router_mut()
+    }
+
+    /// The inner frames the router has delivered locally so far (the full host
+    /// Ethernet frames that would have been written to the TAP), in order.
+    pub fn local_deliveries(&self) -> Vec<Vec<u8>> {
+        self.deliveries.lock().unwrap().clone()
     }
 
     // ── outbound ─────────────────────────────────────────────────────────────
 
-    /// Drive one periodic-broadcast tick.
-    ///
-    /// Calls [`CentralRouter::poll`] and, if an OGM is produced, serialises
-    /// it and floods it to all interfaces (OGMs are always broadcasts).
+    /// Drive one periodic-broadcast tick, dispatching any OGM produced.
     pub async fn poll(&mut self, now: Duration) {
-        let my_ident = self.ident;
-        let mut buf = [0u8; 512];
-        if let Some(frame) = self.router.poll(now, &mut buf) {
-            let dst = frame.dst;
-            let wire = build_frame(my_ident, dst, frame.protocol, frame.payload);
-            // frame / buf borrow ends after build_frame copies the payload
-            self.send_egress(dst, wire).await;
-        }
+        self.driver.poll(now).await.expect("poll dispatch failed");
     }
 
-    /// Inject application-layer data destined for `dest` into the mesh.
+    /// Inject host application data destined for `dest` into the mesh.
     ///
-    /// Calls [`CentralRouter::handle_local`] to build the BATMAN unicast
-    /// packet, then dispatches it on the interface chosen by
-    /// [`CentralRouter::get_egress_interface`].
-    ///
-    /// Returns `Err(())` if the router has no route to `dest` (propagated
-    /// from `handle_local`).
-    pub async fn send_local(&mut self, dest: Mac, payload: &[u8]) -> Result<(), ()> {
-        let my_ident = self.ident;
-        let mut buf = [0u8; 512];
-        let frame = self.router.handle_local(dest, payload, &mut buf)?;
-        let dst = frame.dst;
-        let wire = build_frame(my_ident, dst, frame.protocol, frame.payload);
-        // frame / buf borrow ends after build_frame copies the payload
-        self.send_egress(dst, wire).await;
-        Ok(())
+    /// Wraps `payload` in a host Ethernet frame (see [`host_frame`]) addressed
+    /// to `dest` and hands it to the driver as if the host had emitted it on
+    /// the TAP, so the egress copies are dispatched immediately.
+    pub async fn send_local(&mut self, dest: Mac, payload: &[u8]) -> anyhow::Result<()> {
+        let eth = host_frame(dest, self.ident, payload);
+        self.driver.inject_host_frame(&eth).await
     }
 
     // ── inbound ───────────────────────────────────────────────────────────────
 
-    /// Process one raw wire frame received on interface `iface_idx`.
-    ///
-    /// Parses the bytes as a [`LinkFrame`], passes it to
-    /// [`CentralRouter::handle_frame`], and — if a reply is produced —
-    /// serialises it and dispatches it on the appropriate egress interface.
-    pub async fn receive(&mut self, iface_idx: usize, raw: &[u8]) {
-        self.receive_with_metrics(iface_idx, raw, LinkMetrics::default())
-            .await;
+    /// Drain every currently-pending frame across all mesh interfaces (and the
+    /// host/query channels) through the driver in one non-blocking sweep.
+    pub async fn drain_all(&mut self) {
+        self.driver
+            .process_pending()
+            .await
+            .expect("process_pending failed");
     }
 
-    /// Same as [`receive`], but carries explicit [`LinkMetrics`] as if the
-    /// radio had reported them.  Tests use this to inject controlled
-    /// RSSI/SNR values so that the metric-driven egress decision can be
-    /// exercised without real hardware.
+    /// Feed one crafted wire frame to the router with explicit [`LinkMetrics`],
+    /// as if the radio had reported that RSSI/SNR on interface `iface_idx`.
     ///
-    /// [`receive`]: TestRouter::receive
+    /// The channel transports cannot carry per-frame metrics, so this drives
+    /// the router directly; any re-flood reply is discarded (these tests assert
+    /// on routing state, not on forwarded frames).
     pub async fn receive_with_metrics(
         &mut self,
         iface_idx: usize,
         raw: &[u8],
         metrics: LinkMetrics,
     ) {
-        let my_ident = self.ident;
-        let mut buf = [0u8; 512];
+        let mut buf = [0u8; 1500];
         let frame = parse_frame(raw);
-        let outcome = self
-            .router
+        let _ = self
+            .driver
+            .router_mut()
             .handle_frame_with_metrics(iface_idx, frame, metrics, &mut buf);
-        // Record any inner frame delivered to the local host.
-        if let Some(local) = outcome.deliver_local {
-            self.local_deliveries.push(local.to_vec());
-        }
-        if let Some(r) = outcome.forward {
-            let dst = r.dst;
-            let wire = build_frame(my_ident, dst, r.protocol, r.payload);
-            self.send_egress(dst, wire).await;
-        }
-    }
-
-    /// Drain all pending frames from `rx` through [`receive`].
-    ///
-    /// Frames are collected before processing so that any replies generated
-    /// during `receive` do not feed back into the same drain loop.
-    ///
-    /// [`receive`]: TestRouter::receive
-    pub async fn drain(&mut self, iface_idx: usize, rx: &mut mpsc::Receiver<Vec<u8>>) {
-        let mut pending = Vec::new();
-        while let Ok(raw) = rx.try_recv() {
-            pending.push(raw);
-        }
-        for raw in pending {
-            self.receive(iface_idx, &raw).await;
-        }
-    }
-
-    /// Drain all pending frames from links
-    pub async fn drain_all(&mut self) {
-        let msgs = self
-            .interfaces
-            .iter_mut()
-            .enumerate()
-            .flat_map(|(i, iface)| {
-                let mut pending = vec![];
-                while let Ok(raw) = iface.ingress.try_recv() {
-                    pending.push((i, raw));
-                }
-                pending
-            })
-            .collect::<Vec<_>>();
-
-        for (i, raw) in msgs {
-            self.receive(i, &raw).await;
-        }
-    }
-
-    // ── internal ─────────────────────────────────────────────────────────────
-
-    /// Route `wire` to the correct egress interface(s) for `dst`.
-    ///
-    /// | Situation | Behaviour |
-    /// |-----------|-----------|
-    /// | Known unicast `dst` | Single interface via `get_egress_interface` |
-    /// | Broadcast `dst` | All interfaces |
-    /// | Unknown `dst` (not yet in ident table) | All interfaces (flood) |
-    async fn send_egress(&mut self, dst: Mac, wire: Vec<u8>) {
-        // Resolve the egress decision before accessing self.interfaces so the
-        // mutable borrow of self.router does not overlap with the channel sends.
-        let egress = self.router.get_egress_interface(dst);
-        match egress {
-            Some(EgressInterface::Interface(idx)) if idx < self.interfaces.len() => {
-                let _ = self.interfaces[idx].egress.send(wire).await;
-            }
-            _ => {
-                // Broadcast destination or destination not yet learned — flood.
-                for tx in &self.interfaces {
-                    let _ = tx.egress.send(wire.clone()).await;
-                }
-            }
-        }
     }
 }

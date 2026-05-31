@@ -3,6 +3,7 @@ use std::fmt::Debug;
 use std::mem::size_of;
 
 use interfaces::frame::MeshIdentifier;
+use pretty_hex::pretty_hex;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use thiserror::Error;
@@ -223,9 +224,10 @@ where
 
         // Loop over all and forward to destination, or all ports if destination port not specifically known
         for (port, msgs) in msgs {
+            tracing::trace!(port_id = ?port, "processing {:?} messages", msgs.len());
             let port_config = self.ports.get(&port).unwrap();
             for mut msg in msgs {
-                tracing::trace!(port_id = ?port, direction = ?Direction::ToSwitch, "{:?}", msg);
+                tracing::trace!(port_id = ?port, direction = ?Direction::ToSwitch, "{}", pretty_hex(&msg));
                 if self.rng.random_bool(port_config.config.outgoing_loss) {
                     continue;
                 }
@@ -236,7 +238,7 @@ where
 
                 tracing::trace!(dest = ?dest, "forwarding message to dest");
                 if let Some(dest_port) = self.ident_map.get(dest) {
-                    tracing::trace!(port_id = ?dest_port, direction = ?Direction::FromSwitch, "{:?}", msg);
+                    tracing::trace!(port_id = ?dest_port, direction = ?Direction::FromSwitch, "{}", pretty_hex(&msg));
                     // Send to specific destination port
                     if let Some(taps) = self.taps.get_mut(dest_port) {
                         for tap in taps.iter_mut() {

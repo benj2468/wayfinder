@@ -21,4 +21,7 @@ pub use adapter::RouterAdapter;
 #[cfg(feature = "std")]
 mod transport;
 #[cfg(feature = "std")]
-pub use transport::{QueryRx, QueryTx, run_tcp_server, run_udp_server, run_unix_server};
+pub use transport::{
+    ChannelRequest, ChannelServerRx, ChannelServerTx, QueryRx, QueryTx, run_channel_server,
+    run_tcp_server, run_udp_server, run_unix_server,
+};

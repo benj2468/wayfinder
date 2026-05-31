@@ -4,7 +4,7 @@ pub mod test_router;
 
 pub mod prelude {
     pub use super::driver::{TestConfig, TestHarness, TestMachineConfig, TestSwitchConfig, mac};
-    pub use super::test_router::{TestRouter, build_frame};
+    pub use super::test_router::{TestRouter, build_frame, host_frame};
 }
 
 #[cfg(test)]

@@ -211,18 +211,19 @@ async fn test_simple_pair_send_data() {
 
     harness.tick(Duration::from_secs(1)).await;
 
-    let ident = harness.get_machine_mut("machine2").ident;
+    let m1 = harness.get_machine("machine1").ident;
+    let m2 = harness.get_machine("machine2").ident;
     harness
         .get_machine_mut("machine1")
-        .send_local(ident, b"Hello World")
+        .send_local(m2, b"Hello World")
         .await
         .unwrap();
 
     harness.tick(Duration::from_secs(3)).await;
 
     assert_eq!(
-        harness.get_machine("machine2").local_deliveries,
-        vec![b"Hello World"]
+        harness.get_machine("machine2").local_deliveries(),
+        vec![host_frame(m2, m1, b"Hello World")]
     );
 }
 
@@ -240,22 +241,24 @@ async fn test_line_of_three_send_data() {
     harness.tick(Duration::from_secs(2)).await;
 
     for (_, router) in harness.machines.iter() {
-        assert_eq!(router.router.originator_table().len(), 2);
+        assert_eq!(router.router().originator_table().len(), 2);
     }
 
-    let ident = harness.get_machine_mut("machine3").ident;
+    let m1 = harness.get_machine("machine1").ident;
+    let m3 = harness.get_machine("machine3").ident;
     harness
         .get_machine_mut("machine1")
-        .send_local(ident, b"Hello World")
+        .send_local(m3, b"Hello World")
         .await
         .unwrap();
 
     harness.tick(Duration::from_secs(3)).await;
     harness.tick(Duration::from_secs(4)).await;
+    harness.tick(Duration::from_secs(5)).await;
 
     assert_eq!(
-        harness.get_machine("machine3").local_deliveries,
-        vec![b"Hello World"]
+        harness.get_machine("machine3").local_deliveries(),
+        vec![host_frame(m3, m1, b"Hello World")]
     );
 }
 
@@ -268,6 +271,7 @@ async fn broadcast_is_delivered_locally_at_neighbor() {
     let mut harness = simple_pair();
 
     let arp = b"i am a broadcast frame";
+    let m1 = harness.get_machine("machine1").ident;
     harness
         .get_machine_mut("machine1")
         .send_local(Mac::BROADCAST, arp)
@@ -277,8 +281,8 @@ async fn broadcast_is_delivered_locally_at_neighbor() {
     harness.tick(Duration::from_secs(1)).await;
 
     assert_eq!(
-        harness.get_machine("machine2").local_deliveries,
-        vec![arp.to_vec()]
+        harness.get_machine("machine2").local_deliveries(),
+        vec![host_frame(Mac::BROADCAST, m1, arp)]
     );
 }
 
@@ -297,6 +301,8 @@ async fn three_routers_all_connected_discover_and_exchange() {
     harness.tick(Duration::from_secs(1)).await;
     harness.tick(Duration::from_secs(2)).await;
 
+    let m0 = harness.get_machine("machine0").ident;
+
     // ── unicast machine0 → machine2 ──────────────────────────────────────
     let m2 = harness.get_machine("machine2").ident;
     harness
@@ -308,12 +314,15 @@ async fn three_routers_all_connected_discover_and_exchange() {
     harness.tick(Duration::from_secs(3)).await;
 
     assert_eq!(
-        harness.get_machine("machine2").local_deliveries,
-        vec![b"hello from 0 to 2".to_vec()],
+        harness.get_machine("machine2").local_deliveries(),
+        vec![host_frame(m2, m0, b"hello from 0 to 2")],
         "machine2 should receive the exact payload"
     );
     assert!(
-        harness.get_machine("machine1").local_deliveries.is_empty(),
+        harness
+            .get_machine("machine1")
+            .local_deliveries()
+            .is_empty(),
         "the unicast for machine2 must not be delivered at machine1"
     );
 
@@ -328,12 +337,12 @@ async fn three_routers_all_connected_discover_and_exchange() {
     harness.tick(Duration::from_secs(4)).await;
 
     assert_eq!(
-        harness.get_machine("machine1").local_deliveries,
-        vec![b"hello from 0 to 1".to_vec()],
+        harness.get_machine("machine1").local_deliveries(),
+        vec![host_frame(m1, m0, b"hello from 0 to 1")],
         "machine1 should receive the exact payload"
     );
     assert_eq!(
-        harness.get_machine("machine2").local_deliveries.len(),
+        harness.get_machine("machine2").local_deliveries().len(),
         1,
         "machine2 must not receive the unicast addressed to machine1"
     );
@@ -370,7 +379,7 @@ async fn egress_picks_iface_with_better_metrics_for_shared_neighbor() {
     a.receive_with_metrics(0, &ogm_from_b, weak).await;
     a.receive_with_metrics(1, &ogm_from_b, strong).await;
 
-    match a.router.get_egress_interface(mac(100)) {
+    match a.router_mut().get_egress_interface(mac(100)) {
         Some(EgressInterface::Interface(1)) => {}
         other => {
             panic!("expected egress for node B to be Interface(1) (strong RSSI/SNR), got {other:?}")
@@ -401,7 +410,7 @@ async fn egress_swaps_iface_when_metrics_swap() {
     a.receive_with_metrics(0, &ogm_from_b, strong).await;
     a.receive_with_metrics(1, &ogm_from_b, weak).await;
 
-    match a.router.get_egress_interface(mac(100)) {
+    match a.router_mut().get_egress_interface(mac(100)) {
         Some(EgressInterface::Interface(0)) => {}
         other => {
             panic!("expected egress for node B to be Interface(0) (strong RSSI/SNR), got {other:?}")
@@ -431,7 +440,7 @@ async fn resolve_route_returns_neighbor_and_observed_interface() {
         .receive_with_metrics(1, &ogm_from_b, strong)
         .await;
 
-    let (next_hop, egress) = harness.get_machine("a").router.resolve_route(mac(100));
+    let (next_hop, egress) = harness.get_machine("a").router().resolve_route(mac(100));
     assert_eq!(next_hop, mac(100), "direct neighbor is its own next hop");
     assert_eq!(
         egress,
@@ -448,7 +457,7 @@ async fn resolve_route_for_broadcast_returns_all_interfaces() {
 
     let (next_hop, egress) = harness
         .get_machine("a")
-        .router
+        .router()
         .resolve_route(Mac::BROADCAST);
     assert_eq!(next_hop, Mac::BROADCAST);
     assert_eq!(egress, Some(EgressInterface::All));
@@ -473,8 +482,8 @@ async fn resolve_route_is_read_only() {
         .await;
 
     let a = harness.get_machine("a");
-    let first = a.router.resolve_route(mac(100));
-    let _ = a.router.resolve_route(mac(100));
-    let third = a.router.resolve_route(mac(100));
+    let first = a.router().resolve_route(mac(100));
+    let _ = a.router().resolve_route(mac(100));
+    let third = a.router().resolve_route(mac(100));
     assert_eq!(first, third);
 }

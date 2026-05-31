@@ -1,50 +1,47 @@
-//! Integration tests for the event loop, driving [`EventLoop::run_once`] against
-//! a fake TAP and an in-process mesh interface.
+//! Integration tests for the driver, driving [`Driver::run_once`] against a
+//! fake TAP and an in-process mesh interface — the real production wiring with
+//! only the kernel devices swapped for channels.
+
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
-use wayfinder::CentralRouter;
 use wayfinder::batman::wire::{
     BATADV_BCAST, BATADV_IV_OGM, BATADV_MCAST, BATADV_TVLV_MCAST, BATADV_UNICAST, BatmanOgmPacket,
     BatmanTvlvHdr, BatmanUnicastPacket, ETH_P_BATMAN,
 };
 use wayfinder::interfaces::frame::Mac;
+use wayfinder_driver::{Driver, FrameIo, Link, QueryRx, QueryTx};
 use zerocopy::IntoBytes;
-
-use wayfinder_server::QueryTx;
-
-use crate::executor::EventLoop;
-use crate::links::{AsyncIo, Link};
 
 // ── fake TAP ───────────────────────────────────────────────────────────────
 
-/// A [`AsyncIo`] backed by channels so tests can inject frames "from the host"
-/// and inspect frames the router writes "to the host".
+/// A [`FrameIo`] backed by channels so tests can inject frames "from the host"
+/// and inspect frames the driver writes "to the host".  The outbound log is
+/// shared via [`Arc`] so the test can observe it after the device is moved into
+/// the [`Driver`].
 struct FakeTap {
     inbound: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
-    outbound: tokio::sync::Mutex<Vec<Vec<u8>>>,
+    outbound: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl FakeTap {
-    fn new() -> (Self, mpsc::Sender<Vec<u8>>) {
+    fn new() -> (Self, mpsc::Sender<Vec<u8>>, Arc<Mutex<Vec<Vec<u8>>>>) {
         let (tx, rx) = mpsc::channel(16);
+        let outbound = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
                 inbound: tokio::sync::Mutex::new(rx),
-                outbound: tokio::sync::Mutex::new(Vec::new()),
+                outbound: outbound.clone(),
             },
             tx,
+            outbound,
         )
-    }
-
-    /// Frames the router has written to the TAP so far.
-    async fn sent(&self) -> Vec<Vec<u8>> {
-        self.outbound.lock().await.clone()
     }
 }
 
 #[async_trait]
-impl AsyncIo for FakeTap {
+impl FrameIo for FakeTap {
     async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         let frame = self.inbound.lock().await.recv().await;
         match frame {
@@ -60,16 +57,15 @@ impl AsyncIo for FakeTap {
     }
 
     async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        self.outbound.lock().await.push(buf.to_vec());
+        self.outbound.lock().unwrap().push(buf.to_vec());
         Ok(buf.len())
     }
 }
 
 // ── wire helpers ─────────────────────────────────────────────────────────
 
-/// Serialize a `LinkFrame<[u8;6]>`: `[src][dst][proto native][payload]`.
-/// Protocol is written native-endian to match how the link layer (and
-/// `build_frame` in the test harness) encodes it.
+/// Serialize a `LinkFrame`: `[src][dst][proto native][payload]`.  Protocol is
+/// written native-endian to match how the link layer encodes it.
 fn link_wire(src: [u8; 6], dst: [u8; 6], payload: &[u8]) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(&src);
@@ -89,12 +85,14 @@ fn eth_frame(dst: [u8; 6], src: [u8; 6], payload: &[u8]) -> Vec<u8> {
     v
 }
 
-/// Boilerplate for a single-interface router under test: the `EventLoop`
-/// plus the test-side handles for injecting/observing host and mesh frames.
+/// Boilerplate for a single-interface node under test: the [`Driver`] plus the
+/// test-side handles for injecting/observing host and mesh frames.
 struct Harness {
-    ev: EventLoop<FakeTap>,
+    driver: Driver<FakeTap>,
     /// Inject frames as if they arrived from the host on the TAP.
     tap_in: mpsc::Sender<Vec<u8>>,
+    /// What the driver has written back to the host TAP.
+    tap_out: Arc<Mutex<Vec<Vec<u8>>>>,
     /// The far end of the single mesh interface's duplex.
     far: tokio::net::UnixDatagram,
     /// Kept alive so the management-query channel stays open (its select
@@ -103,22 +101,13 @@ struct Harness {
 }
 
 fn harness(mac: [u8; 6]) -> Harness {
-    let (tap, tap_in) = FakeTap::new();
+    let (tap, tap_in, tap_out) = FakeTap::new();
     let (near, far) = tokio::net::UnixDatagram::pair().unwrap();
-    let (qtx, qrx) = mpsc::channel(1);
+    let (qtx, qrx): (QueryTx, QueryRx) = mpsc::channel(1);
     Harness {
-        ev: EventLoop {
-            tap,
-            interfaces: vec![Link::new(near)],
-            router: CentralRouter::new(Mac(mac)),
-            query_rx: qrx,
-            mac_addr: Mac(mac),
-            snooper: crate::snoop::McastSnooper::new(),
-            start: std::time::Instant::now(),
-            rx_buffer: [0u8; 1500],
-            tx_buffer: [0u8; 1500],
-        },
+        driver: Driver::new(Mac(mac), tap, vec![Link::new(near)], qrx),
         tap_in,
+        tap_out,
         far,
         _qtx: qtx,
     }
@@ -126,7 +115,12 @@ fn harness(mac: [u8; 6]) -> Harness {
 
 impl Harness {
     async fn step(&mut self) {
-        self.ev.run_once().await.unwrap();
+        self.driver.run_once().await.unwrap();
+    }
+
+    /// Frames the driver has written to the host TAP so far.
+    fn tap_sent(&self) -> Vec<Vec<u8>> {
+        self.tap_out.lock().unwrap().clone()
     }
 }
 
@@ -222,7 +216,7 @@ async fn mesh_unicast_for_self_is_written_to_tap() {
 
     h.step().await;
 
-    let sent = h.ev.tap.sent().await;
+    let sent = h.tap_sent();
     assert_eq!(sent.len(), 1, "exactly one frame delivered to the TAP");
     assert_eq!(sent[0], inner, "inner frame delivered to the host verbatim");
 }
@@ -252,7 +246,7 @@ async fn two_frames_on_one_interface_stay_distinct() {
     h.step().await;
     h.step().await;
 
-    let sent = h.ev.tap.sent().await;
+    let sent = h.tap_sent();
     assert_eq!(
         sent,
         vec![inners[0].to_vec(), inners[1].to_vec()],

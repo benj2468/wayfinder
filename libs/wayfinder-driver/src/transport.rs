@@ -1,71 +1,77 @@
-//! Link-layer abstractions: the host-facing TAP device behind a testable trait,
-//! and the in-process [`Link`] each mesh interface is built on.
+//! Frame transports: the [`FrameIo`] trait every carrier is hidden behind, and
+//! the [`Link`] adapter that turns one into a mesh interface.
 //!
-//! Each mesh interface is a [`Link`] over an in-process duplex (the link-transport
-//! tasks bridge the real socket to it), so interfaces need no abstraction to be
-//! testable.  Only the local TAP device touches the kernel, so we hide it behind
-//! a trait that a fake can implement in unit tests.
+//! A transport is message-oriented: one `recv`/`send` moves exactly one whole
+//! link-layer (or host) frame.  Both the local host device (a TUN/TAP) and each
+//! mesh interface (a `UnixDatagram`, `UdpSocket`, an in-process channel, …) are
+//! the same shape, so one trait serves both roles and a single `Vec<Link>` can
+//! mix carriers of different concrete types.
 
 use async_trait::async_trait;
-use pretty_hex::pretty_hex;
-use tokio::net::UnixDatagram;
+
 use wayfinder::interfaces::{
     frame::{LinkFrame, LinkFrameData, Mac},
     link::LinkError,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
-/// A message-oriented async transport: read/write whole link-layer frames, one
-/// per call.  Implemented by every concrete carrier a [`Link`] can sit on (a
-/// kernel TUN/TAP device, a `UnixDatagram`, a `UdpSocket`, an RYLR client, …),
-/// and by test fakes, so the event loop can be driven without real hardware.
+/// A message-oriented async transport: read/write whole frames, one per call.
+///
+/// Implemented by every concrete carrier a [`Link`] (or the driver's local
+/// host device) can sit on — a kernel TUN/TAP device, a `UnixDatagram`, a
+/// `UdpSocket`, an in-process channel — and by test fakes, so the driver can be
+/// exercised without real hardware.
 #[async_trait]
-pub(crate) trait AsyncIo {
+pub trait FrameIo: Send + Sync {
     /// Receive one frame from the transport into `buf`, returning its length.
     async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize>;
-    /// Write one whole frame to the transport.
+    /// Write one whole frame to the transport, returning the number of bytes
+    /// written.
     async fn send(&self, buf: &[u8]) -> std::io::Result<usize>;
 }
 
+#[cfg(feature = "tokio")]
 #[async_trait]
-impl AsyncIo for tun_rs::AsyncDevice {
+impl FrameIo for tokio::net::UnixDatagram {
     async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        tun_rs::AsyncDevice::recv(self, buf).await
+        tokio::net::UnixDatagram::recv(self, buf).await
     }
     async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        tun_rs::AsyncDevice::send(self, buf).await
+        tokio::net::UnixDatagram::send(self, buf).await
     }
 }
 
+#[cfg(feature = "tokio")]
 #[async_trait]
-impl AsyncIo for UnixDatagram {
+impl FrameIo for tokio::net::UdpSocket {
     async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        UnixDatagram::recv(self, buf).await
+        tokio::net::UdpSocket::recv(self, buf).await
     }
     async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        UnixDatagram::send(self, buf).await
+        tokio::net::UdpSocket::send(self, buf).await
     }
 }
 
 /// One mesh interface: a message-oriented transport carrying one whole
 /// link-layer frame per datagram.  The transport is type-erased behind
-/// [`AsyncIo`], so a single `Vec<Link>` can mix carriers of different
-/// concrete types.
+/// [`FrameIo`], so a single `Vec<Link>` can mix carriers of different concrete
+/// types.
 pub struct Link {
-    socket: Box<dyn AsyncIo>,
+    socket: Box<dyn FrameIo>,
     buffer: [u8; 1500],
 }
 
 impl Link {
     /// Wrap any message-oriented async transport as a mesh interface.
-    pub fn new<Io: AsyncIo + 'static>(socket: Io) -> Self {
+    pub fn new<Io: FrameIo + 'static>(socket: Io) -> Self {
         Self {
             socket: Box::new(socket),
             buffer: [0u8; 1500],
         }
     }
 
-    /// Receive one whole link-layer frame from the interface.
+    /// Receive one whole link-layer frame from the interface, awaiting until
+    /// one arrives.
     pub async fn receive(&mut self) -> Result<&LinkFrame, LinkError> {
         // The socket is message-oriented (a datagram per frame), so a single
         // recv yields exactly one whole frame — no buffering or reassembly.
@@ -76,7 +82,29 @@ impl Link {
         LinkFrame::ref_from_bytes(&self.buffer[..n]).map_err(|_| LinkError::Io)
     }
 
+    /// Poll the interface for an already-pending frame without awaiting.
+    ///
+    /// Returns `None` when nothing is immediately available, `Some(Ok(bytes))`
+    /// with the raw frame otherwise.  The bytes are copied out (rather than
+    /// borrowed) so the caller can process them while mutating the interface
+    /// set — this is the non-blocking primitive the deterministic test stepping
+    /// is built on.  Cancel-safe transports (mpsc channels, datagram sockets)
+    /// do not lose a frame when the poll comes up empty.
+    #[cfg(feature = "tokio")]
+    pub fn try_recv_raw(&mut self) -> Option<Result<Vec<u8>, LinkError>> {
+        use futures::FutureExt;
+        match self.socket.recv(&mut self.buffer).now_or_never()? {
+            Ok(n) => Some(Ok(self.buffer[..n].to_vec())),
+            Err(e) => {
+                tracing::error!("Error reading from socket: {:?}", e);
+                Some(Err(LinkError::Io))
+            }
+        }
+    }
+
     /// Serialize and transmit a frame originating from `origin_ident`.
+    ///
+    /// Wire layout: `[src: Mac][dst: Mac][protocol: u16 native-endian][payload]`.
     pub async fn send(
         &mut self,
         origin_ident: Mac,
@@ -97,9 +125,6 @@ impl Link {
 
         self.buffer[idx..(idx + data.payload.len())].copy_from_slice(data.payload);
         idx += data.payload.len();
-
-        tracing::trace!("Publishing from {:?} to {:?}", origin_ident, data.dst);
-        tracing::trace!("{}", pretty_hex(&&self.buffer[..idx]));
 
         self.socket.send(&self.buffer[..idx]).await.map_err(|e| {
             tracing::error!("Error sending to socket: {:?}", e);

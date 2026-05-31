@@ -1,25 +1,38 @@
 //! The runnable Wayfinder node: bridges a host TAP device onto the mesh,
 //! carries mesh links over UDP, and exposes the management API.
+//!
+//! All of the routing event loop lives in `wayfinder-driver`; this binary only
+//! assembles the concrete transports (a kernel TAP, UDP links) and the
+//! management-API listeners from the YAML config, then hands them to a
+//! [`Driver`] and runs it.
 
-mod config;
-mod executor;
-mod links;
-mod snoop;
+mod tap;
 
 #[cfg(test)]
 mod tests;
 
+use std::path::{Path, PathBuf};
+
+use anyhow::bail;
 use clap::Parser;
-use tokio::{net::UdpSocket, sync::mpsc, task::JoinSet};
+use tokio::{sync::mpsc, task::JoinSet};
 use tracing_subscriber::EnvFilter;
 use tun_rs::{DeviceBuilder, Layer};
-use wayfinder::CentralRouter;
+use wayfinder::config::{Config, LinkConfig, LocalDistributionMechanism, ServerConfig};
 use wayfinder::interfaces::frame::Mac;
+use wayfinder_driver::{
+    Driver, QueryRx, QueryTx, build_udp_link, run_tcp_server, run_udp_server, run_unix_server,
+};
 
-use crate::config::{Args, Config, LinkConfig, ServerConfig};
-use crate::executor::EventLoop;
-use crate::links::Link;
-use wayfinder_server::{QueryRx, QueryTx, run_tcp_server, run_udp_server, run_unix_server};
+use crate::tap::TapDevice;
+
+/// Command-line arguments.
+#[derive(clap::Parser, Debug)]
+pub struct Args {
+    /// Path to the YAML configuration file.
+    #[clap(short, long, default_value = "var/conf/install.yml")]
+    pub(crate) config: PathBuf,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -32,13 +45,20 @@ async fn main() -> anyhow::Result<()> {
     let config: Config = serde_yaml::from_slice(std::fs::read_to_string(args.config)?.as_bytes())?;
 
     tracing::info!("Welcome to Wayfinder");
+    tracing::debug!("{:#?}", config);
 
     let mut join_set: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
+    // This binary's local egress is a kernel TAP; reject any other mechanism.
+    let LocalDistributionMechanism::Tap { tap } = match config.local_egress {
+        Some(mechanism) => mechanism,
+        None => bail!("config.local_egress must be a TAP for the wayfinder-tap node"),
+    };
+
     let dev = DeviceBuilder::new()
         .layer(Layer::L2)
-        .name(&config.tap.device_name)
-        .ipv4(config.tap.ip_address, config.tap.netmask, None)
+        .name(&tap.device_name)
+        .ipv4(tap.ip_address, tap.netmask, None)
         .build_async()?;
 
     let mac_addr = dev.mac_address()?;
@@ -47,81 +67,48 @@ async fn main() -> anyhow::Result<()> {
         pretty_hex::simple_hex(&mac_addr)
     );
 
-    tracing::debug!("{:#?}", config);
+    // Everything from here....
 
-    let mut interfaces = vec![];
-
+    let mut interfaces = Vec::new();
     for link in config.links {
         match link {
             LinkConfig::Udp {
                 bind_addr,
                 remote_addr,
             } => {
-                let udp_socket = UdpSocket::bind(bind_addr).await?;
-                udp_socket.connect(remote_addr).await?;
-
-                let (dp1, dp2) = tokio::net::UnixDatagram::pair()?;
-
-                join_set.spawn(async move {
-                    let mut rx_buf = [0; 1500];
-                    let mut tx_buf = [0; 1500];
-                    loop {
-                        tokio::select! {
-                            Ok(bytes) = udp_socket.recv(&mut rx_buf) => {
-                                if let Err(e) = dp1.send(&rx_buf[..bytes]).await {
-                                    tracing::error!("Error sending to in-process socket: {:?}", e);
-                                }
-                            },
-                            Ok(bytes) = dp1.recv(&mut tx_buf) => {
-                                // TODO: The UDP socket needs to be connected to the remote address before sending
-                                // Or we need to specify the remote address in the send call
-                                if let Err(e) = udp_socket.send(&tx_buf[..bytes]).await {
-                                    tracing::error!("Error sending to off-process socket: {:?}", e);
-                                }
-                            },
-                        }
-                    }
-                });
-
-                interfaces.push(Link::new(dp2));
+                interfaces.push(build_udp_link(bind_addr, remote_addr, &mut join_set).await?);
+            }
+            LinkConfig::Test { .. } => {
+                bail!("test links are only valid in the test harness, not the wayfinder-tap node")
             }
         }
     }
 
-    // Optional management API server — queries are forwarded to the main loop
-    // over a channel so the router is never shared across tasks.
+    // Optional management API server — queries are forwarded to the driver over
+    // a channel so the router is never shared across tasks.
     let (query_tx, query_rx): (QueryTx, QueryRx) = mpsc::channel(16);
 
     if let Some(server_cfg) = config.server {
+        let tx = query_tx.clone();
         match server_cfg {
             ServerConfig::Tcp { addr } => {
-                let tx = query_tx.clone();
                 join_set.spawn(async move { run_tcp_server(addr, tx).await });
             }
             ServerConfig::UnixSocket { path } => {
-                let tx = query_tx.clone();
+                let path = Path::new(&path).to_path_buf();
                 join_set.spawn(async move { run_unix_server(path, tx).await });
             }
             ServerConfig::Udp { addr } => {
-                let tx = query_tx.clone();
                 join_set.spawn(async move { run_udp_server(addr, tx).await });
             }
         }
     }
 
-    let mut event_loop = EventLoop {
-        tap: dev,
-        interfaces,
-        router: CentralRouter::new(Mac(mac_addr)),
-        query_rx,
-        mac_addr: Mac(mac_addr),
-        snooper: crate::snoop::McastSnooper::new(),
-        start: std::time::Instant::now(),
-        rx_buffer: [0u8; 1500],
-        tx_buffer: [0u8; 1500],
-    };
+    // ...to here, should actually be in the drivers run method.
+    // Maybe the driver has a generic that we condition the `Mode` with.
+    // like a Test Mode and a Production Mode.
 
-    loop {
-        event_loop.run_once().await?;
-    }
+    let mut driver = Driver::new(Mac(mac_addr), TapDevice(dev), interfaces, query_rx);
+
+    driver.run().await
 }

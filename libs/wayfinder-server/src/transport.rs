@@ -21,6 +21,17 @@ pub type QueryTx = mpsc::Sender<(WayfinderRequest, oneshot::Sender<WayfinderResp
 /// Receiver half, owned by the event loop.
 pub type QueryRx = mpsc::Receiver<(WayfinderRequest, oneshot::Sender<WayfinderResponse>)>;
 
+/// One in-process management request: encoded [`WayfinderRequest`] bytes paired
+/// with a one-shot channel the server replies on with encoded
+/// [`WayfinderResponse`] bytes.
+pub type ChannelRequest = (Bytes, oneshot::Sender<Bytes>);
+/// Receiver half of the in-process channel server, owned by
+/// [`run_channel_server`].
+pub type ChannelServerRx = mpsc::Receiver<ChannelRequest>;
+/// Sender half of the in-process channel server, held by a caller that wants to
+/// issue management queries without going through a real socket (e.g. tests).
+pub type ChannelServerTx = mpsc::Sender<ChannelRequest>;
+
 /// Handle one stream-based connection (TCP or Unix socket) using
 /// length-delimited framing (4-byte big-endian length prefix).
 async fn serve_stream<S>(stream: S, query_tx: QueryTx) -> anyhow::Result<()>
@@ -87,6 +98,21 @@ pub async fn run_unix_server(path: PathBuf, query_tx: QueryTx) -> anyhow::Result
             .send_to(&response, &peer.as_pathname().unwrap())
             .await;
     }
+}
+
+/// Serve the management API over an in-process mpsc channel.
+///
+/// Mirrors the socket listeners but carries already-/still-encoded protobuf
+/// bytes over a channel instead of a kernel transport, so a caller in the same
+/// process (the integration tests) can exercise the full encode → forward →
+/// decode path without binding a socket.  Each request is a `(bytes, reply)`
+/// pair; the encoded response is sent back on `reply`.
+pub async fn run_channel_server(mut rx: ChannelServerRx, query_tx: QueryTx) -> anyhow::Result<()> {
+    while let Some((request, reply)) = rx.recv().await {
+        let response = handle_connectionless(&request, query_tx.clone()).await?;
+        let _ = reply.send(Bytes::from(response));
+    }
+    Ok(())
 }
 
 /// Serve the management API over UDP.
