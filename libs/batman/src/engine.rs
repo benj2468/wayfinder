@@ -128,8 +128,13 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
                         outbound_ogm.tq = computed_tq;
                         outbound_ogm.prev_sender = self.self_ident;
 
-                        // Write bytes into the ephemeral execution buffer provided by caller
+                        // Write the fixed header into the caller's scratchpad,
+                        // then copy the TVLV tail (membership announcements)
+                        // verbatim from the incoming frame so it propagates
+                        // unchanged with the re-flooded OGM.
                         let size = core::mem::size_of::<BatmanOgmPacket>();
+                        let tvlv_len = u16::from_be(ogm.tvlv_len) as usize;
+                        let total = size + tvlv_len;
 
                         reply.dst = Mac::BROADCAST;
                         reply.protocol = ETH_P_BATMAN;
@@ -138,6 +143,12 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
                             .get_mut(0..size)
                             .unwrap()
                             .copy_from_slice(&outbound_ogm.as_bytes()[..size]);
+                        if let (Some(dst), Some(src)) = (
+                            reply.payload.get_mut(size..total),
+                            frame.payload.get(size..total),
+                        ) {
+                            dst.copy_from_slice(src);
+                        }
 
                         return RoutingAction::Consumed;
                     }
@@ -294,10 +305,13 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
             packet_type: BATADV_IV_OGM,
             version: 5,
             ttl: 50,
-            tq: 255, // Max link capability score from original anchor source
+            flags: 0,
             seqno: self.sequence_number.to_be(),
             orig: self.self_ident,
             prev_sender: self.self_ident,
+            reserved: 0,
+            tq: 255,     // Max link capability score from original anchor source
+            tvlv_len: 0, // no TVLV tail yet (membership announcements: Phase 2)
         };
 
         let size = core::mem::size_of::<BatmanOgmPacket>();

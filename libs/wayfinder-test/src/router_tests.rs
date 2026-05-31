@@ -88,10 +88,13 @@ mod tests {
             packet_type: BATADV_IV_OGM,
             version: 5,
             ttl: 50,
-            tq,
+            flags: 0,
             seqno: seqno.to_be(),
             orig: mac(src),
             prev_sender: mac(src),
+            reserved: 0,
+            tq,
+            tvlv_len: 0,
         };
         build_frame(
             mac(src),

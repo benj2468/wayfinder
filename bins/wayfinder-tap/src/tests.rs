@@ -165,10 +165,13 @@ async fn tap_unicast_frame_routes_to_learned_peer() {
         packet_type: BATADV_IV_OGM,
         version: 5,
         ttl: 50,
-        tq: 255,
+        flags: 0,
         seqno: 1u32.to_be(),
         orig: Mac(peer),
         prev_sender: Mac(peer),
+        reserved: 0,
+        tq: 255,
+        tvlv_len: 0,
     };
     h.far
         .send(&link_wire(peer, [0xff; 6], ogm.as_bytes()))

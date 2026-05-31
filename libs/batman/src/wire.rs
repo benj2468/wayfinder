@@ -6,17 +6,55 @@ pub const ETH_P_BATMAN: u16 = 0x4305;
 // Core BATMAN packet identifiers
 pub const BATADV_IV_OGM: u8 = 0x01;
 
+/// Originator Message header, laid out to match batman-adv's
+/// `batadv_ogm_packet`.  A variable-length TVLV region of `tvlv_len` bytes
+/// (a sequence of [`BatmanTvlvHdr`]-prefixed records) follows this fixed
+/// header on the wire; it carries piggybacked announcements such as
+/// multicast group memberships.
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, PartialEq, Eq)]
 #[repr(C, packed)]
 pub struct BatmanOgmPacket {
-    pub packet_type: u8,  // Always BATADV_IV_OGM for this baseline
-    pub version: u8,      // Protocol version (typically 5)
-    pub ttl: u8,          // Time-to-live to prevent infinite loops
-    pub tq: u8,           // Transmission Quality metric of the path
-    pub seqno: u32,       // Sequence number (Network Byte Order / Big Endian)
-    pub orig: Mac,        // The node that originally generated this message
-    pub prev_sender: Mac, // The immediate neighbor who relayed it to us
+    /// Always [`BATADV_IV_OGM`] for this packet type.
+    pub packet_type: u8,
+    /// Protocol version (typically 5).
+    pub version: u8,
+    /// Time-to-live, decremented at each hop to bound flood radius.
+    pub ttl: u8,
+    /// Reserved flag bits (batman-adv `BATADV_*_FLAG`); unused here, sent as 0.
+    pub flags: u8,
+    /// Sequence number (network byte order / big endian).
+    pub seqno: u32,
+    /// The node that originally generated this message.
+    pub orig: Mac,
+    /// The immediate neighbor who relayed it to us.
+    pub prev_sender: Mac,
+    /// Reserved padding byte, matching the batman-adv layout; sent as 0.
+    pub reserved: u8,
+    /// Transmission Quality metric of the path (0..=255).
+    pub tq: u8,
+    /// Length in bytes of the TVLV region that follows this header
+    /// (network byte order / big endian).  Zero when no TVLV is attached.
+    pub tvlv_len: u16,
 }
+
+/// Header prefixing one record in an OGM's TVLV (Type-Version-Length-Value)
+/// region, matching batman-adv's `batadv_tvlv_hdr`.  The `len` bytes of value
+/// follow immediately; records are packed back-to-back to fill `tvlv_len`.
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, PartialEq, Eq)]
+#[repr(C, packed)]
+pub struct BatmanTvlvHdr {
+    /// What the value encodes (e.g. [`BATADV_TVLV_MCAST`]).
+    pub tvlv_type: u8,
+    /// Version of this TVLV type's value format.
+    pub version: u8,
+    /// Length of the value following this header, in bytes (big endian).
+    pub len: u16,
+}
+
+/// TVLV type identifying a multicast-membership announcement, matching
+/// batman-adv's `BATADV_TVLV_MCAST`.  Its value is the list of multicast
+/// group MAC addresses the originating node currently listens for.
+pub const BATADV_TVLV_MCAST: u8 = 0x06;
 
 /// Packet sub-type for a flooded broadcast frame.  Matches batman-adv's
 /// `BATADV_BCAST`.  Used to carry broadcast/multicast link-layer frames

@@ -40,10 +40,13 @@ fn make_ogm(orig: u8, prev_sender: u8, seqno: u32, tq: u8, ttl: u8) -> Vec<u8> {
         packet_type: BATADV_IV_OGM,
         version: 5,
         ttl,
-        tq,
+        flags: 0,
         seqno: seqno.to_be(), // Network byte order
         orig: mac(orig),
         prev_sender: mac(prev_sender),
+        reserved: 0,
+        tq,
+        tvlv_len: 0,
     };
     ogm.as_bytes().to_vec()
 }
