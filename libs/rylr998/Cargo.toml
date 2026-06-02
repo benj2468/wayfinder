@@ -3,11 +3,25 @@ name = "rylr998"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["link"]
+# Bridge a `RylrClient` onto a Wayfinder mesh by implementing the `LinkT`
+# mesh-interface trait.  Off by default so the bare LoRa driver stays
+# dependency-light; enabling it pulls in `wayfinder` (for the `LinkT` trait and
+# the mesh frame types) and `zerocopy`.  The impl uses the native `async fn`
+# trait directly, so it works in a `no_std` executor.
+link = ["dep:wayfinder", "dep:zerocopy"]
+
 [dependencies]
 thiserror.workspace = true
 embedded-io-async.workspace = true
 heapless.workspace = true
 tracing.workspace = true
+
+# Depended on by path (not workspace inheritance) so `default-features = false`
+# keeps the bare `LinkT` trait available without pulling `alloc`/`std`.
+wayfinder = { path = "../wayfinder", default-features = false, optional = true }
+zerocopy = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio-serial = "5.4"
@@ -15,3 +29,4 @@ anyhow = "1.0.102"
 tracing-subscriber.workspace = true
 tokio.workspace = true
 embedded-io-adapters.workspace = true
+embedded-io = "0.6.1"

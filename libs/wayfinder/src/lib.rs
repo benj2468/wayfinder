@@ -1,4 +1,7 @@
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
+
+#[cfg(feature = "alloc")]
+extern crate alloc;
 
 pub use batman;
 pub use interfaces;
@@ -28,6 +31,8 @@ pub use crate::link_quality::LinkQualityRecord;
 
 #[cfg(feature = "alloc")]
 pub mod config;
+
+pub mod link;
 
 mod link_quality;
 mod routing_table;

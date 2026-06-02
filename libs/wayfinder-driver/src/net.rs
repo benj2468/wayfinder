@@ -4,19 +4,23 @@ use std::net::SocketAddr;
 
 use tokio::{net::UdpSocket, net::UnixDatagram, task::JoinSet};
 
+use wayfinder::link::DynLinkT;
+
 use crate::transport::Link;
 
-/// Build a mesh [`Link`] carried over UDP.
+/// Build a mesh link carried over UDP, type-erased as a [`LinkT`].
 ///
-/// The router speaks to an in-process [`UnixDatagram`] (so the [`Link`] is a
-/// clean message-oriented carrier); a spawned task bridges that to the real UDP
-/// socket bound to `bind_addr` and connected to `remote_addr`.  The bridge task
-/// is spawned into `join_set` so its lifetime is tied to the caller's.
+/// UDP point-to-point is a plain byte pipe, so it gets its [`LinkT`] behaviour
+/// from the [`Link`] adapter.  The router speaks to an in-process
+/// [`UnixDatagram`] (a clean message-oriented carrier); a spawned task bridges
+/// that to the real UDP socket bound to `bind_addr` and connected to
+/// `remote_addr`.  The bridge task is spawned into `join_set` so its lifetime
+/// is tied to the caller's.
 pub async fn build_udp_link(
     bind_addr: SocketAddr,
     remote_addr: SocketAddr,
     join_set: &mut JoinSet<anyhow::Result<()>>,
-) -> anyhow::Result<Link> {
+) -> anyhow::Result<Box<DynLinkT<'static>>> {
     let udp_socket = UdpSocket::bind(bind_addr).await?;
     udp_socket.connect(remote_addr).await?;
 
@@ -41,5 +45,5 @@ pub async fn build_udp_link(
         }
     });
 
-    Ok(Link::new(router_side))
+    Ok(DynLinkT::new_box(Link::new(router_side)))
 }

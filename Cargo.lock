@@ -305,6 +305,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
+name = "dynosaur"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a12303417f378f29ba12cb12fc78a9df0d8e16ccb1ad94abf04d48d96bdda532"
+dependencies = [
+ "dynosaur_derive",
+]
+
+[[package]]
+name = "dynosaur_derive"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b0713d5c1d52e774c5cd7bb8b043d7c0fc4f921abfb678556140bfbe6ab2364"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1217,6 +1237,7 @@ name = "rylr998"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "embedded-io 0.6.1",
  "embedded-io-adapters",
  "embedded-io-async 0.6.1",
  "heapless",
@@ -1225,6 +1246,8 @@ dependencies = [
  "tokio-serial",
  "tracing",
  "tracing-subscriber",
+ "wayfinder",
+ "zerocopy",
 ]
 
 [[package]]
@@ -1754,6 +1777,7 @@ name = "wayfinder"
 version = "0.1.0"
 dependencies = [
  "batman",
+ "dynosaur",
  "embedded-io-async 0.6.1",
  "heapless",
  "interfaces",

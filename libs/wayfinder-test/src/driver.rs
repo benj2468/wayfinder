@@ -3,7 +3,7 @@ use std::{collections::HashMap, time::Duration};
 
 use interfaces::frame::Mac;
 use serde::{Deserialize, Serialize};
-use tokio::time::{Instant, interval, interval_at};
+use tokio::time::interval;
 
 use crate::{
     switch::{PortComms, PortConfig, Switch},
@@ -39,7 +39,7 @@ impl TestHarness {
     }
 
     pub async fn poll(&mut self, now: Duration) {
-        let mut int = interval(Duration::MAX);
+        let mut int = interval(Duration::from_hours(1));
         // Tick it once so that we don't block waiting for the interval to elapse
         int.tick().await;
 
@@ -49,7 +49,7 @@ impl TestHarness {
     }
 
     pub async fn tick(&mut self) {
-        let mut int = interval(Duration::MAX);
+        let mut int = interval(Duration::from_hours(1));
         int.tick().await;
 
         for (_, router) in self.machines.iter_mut() {

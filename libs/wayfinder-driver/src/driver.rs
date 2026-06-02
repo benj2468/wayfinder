@@ -14,18 +14,20 @@
 
 use std::time::{Duration, Instant};
 
+use anyhow::bail;
 use futures::{FutureExt, future::select_all};
+use interfaces::link::LinkMetrics;
 use pretty_hex::pretty_hex;
 use tokio::time::{Interval, interval};
-use tracing::info;
 use wayfinder::interfaces::frame::{LinkFrame, LinkFrameData, Mac};
 use wayfinder::{CentralRouter, EgressInterface, McastPlan};
 use wayfinder_protos::service::WayfinderService;
 use wayfinder_server::{QueryRx, RouterAdapter};
-use zerocopy::FromBytes;
+
+use wayfinder::link::{DynLinkT, LinkT};
 
 use crate::snoop::McastSnooper;
-use crate::transport::{FrameIo, Link};
+use crate::transport::FrameIo;
 
 /// One unit of work's outgoing frames.
 struct LoopOutput {
@@ -50,12 +52,13 @@ impl LoopOutput {
 /// The router event loop and all the state it operates on.
 ///
 /// `Local` is the host-facing device (a TUN/TAP in production, an observable
-/// channel in tests); the mesh interfaces are type-erased [`Link`]s.
+/// channel in tests); the mesh interfaces are type-erased [`LinkT`]s, so simple
+/// point-to-point carriers and self-routing multi-access links can be mixed.
 pub struct Driver<Local: FrameIo> {
     /// The local host network device.
     local: Local,
     /// The mesh interfaces, indexed by interface index.
-    interfaces: Vec<Link>,
+    interfaces: Vec<Box<DynLinkT<'static>>>,
     /// The routing engine for this node.
     router: CentralRouter,
     /// Management-API queries forwarded from the server tasks.
@@ -76,7 +79,12 @@ pub struct Driver<Local: FrameIo> {
 impl<Local: FrameIo> Driver<Local> {
     /// Build a driver for node `mac` over the given host device, mesh
     /// interfaces, and management-query channel.
-    pub fn new(mac: Mac, local: Local, interfaces: Vec<Link>, query_rx: QueryRx) -> Self {
+    pub fn new(
+        mac: Mac,
+        local: Local,
+        interfaces: Vec<Box<DynLinkT<'static>>>,
+        query_rx: QueryRx,
+    ) -> Self {
         Self {
             local,
             interfaces,
@@ -140,13 +148,13 @@ impl<Local: FrameIo> Driver<Local> {
 
         let output: LoopOutput = {
             tokio::select! {
-                (Some((idx, frame)), _, _) = select_all(
+                (Some((idx, received)), _, _) = select_all(
                     interfaces.iter_mut().enumerate().map(|(i, iface)| {
-                        Box::pin(async move { iface.receive().await.map(|frame| (i, frame)).ok() })
+                        Box::pin(async move { iface.recv().await.map(|received| (i, received)).ok() })
                     })
                 ), if check_mesh && !interfaces.is_empty() => {
                     tracing::debug!("received frame from interface {}", idx);
-                    handle_mesh_frame(router, idx, frame, tx_buffer)
+                    handle_mesh_frame(router, idx, received.frame, received.metrics, tx_buffer)
                 },
                 Ok(len) = local.recv(rx_buffer), if check_local => {
                     tracing::debug!("host device received frame of length {}", len);
@@ -239,16 +247,21 @@ impl<Local: FrameIo> Driver<Local> {
 
             // Mesh interfaces: forwarded/delivered frames.
             for idx in 0..self.interfaces.len() {
-                if let Some(result) = self.interfaces[idx].try_recv_raw() {
-                    progressed = true;
-                    let raw = result?;
-                    let output = {
-                        let frame = LinkFrame::ref_from_bytes(&raw)
-                            .map_err(|_| anyhow::anyhow!("malformed link frame"))?;
-                        handle_mesh_frame(&mut self.router, idx, frame, &mut self.tx_buffer)
-                    };
-                    self.dispatch_output(output).await?;
-                }
+                let output = match self.interfaces[idx].try_recv() {
+                    None => continue,
+                    Some(Err(e)) => bail!("link recv failed: {e:?}"),
+                    Some(Ok(received)) => {
+                        progressed = true;
+                        handle_mesh_frame(
+                            &mut self.router,
+                            idx,
+                            received.frame,
+                            received.metrics,
+                            &mut self.tx_buffer,
+                        )
+                    }
+                };
+                self.dispatch_output(output).await?;
             }
 
             // Management queries from the in-process server.
@@ -292,14 +305,16 @@ fn poll_ogm(
         .collect()
 }
 
-/// Process one received link-layer frame into a unit of work.
+/// Process one received link-layer frame into a unit of work, folding the
+/// carrier's physical-layer `metrics` into the engine's link-quality table.
 fn handle_mesh_frame(
     router: &mut CentralRouter,
     idx: usize,
     frame: &LinkFrame,
+    metrics: LinkMetrics,
     tx_buffer: &mut [u8],
 ) -> LoopOutput {
-    let rx = router.handle_frame(idx, frame, tx_buffer);
+    let rx = router.handle_frame_with_metrics(idx, frame, metrics, tx_buffer);
     tracing::debug!("decoded as {:?}", rx);
     LoopOutput {
         mesh: rx
@@ -371,7 +386,7 @@ fn plan_host_frame(
 /// dispatch each outgoing frame onto the mesh via `get_egress_interface`.
 async fn dispatch<Local: FrameIo>(
     local: &Local,
-    interfaces: &mut [Link],
+    interfaces: &mut [Box<DynLinkT<'static>>],
     router: &mut CentralRouter,
     mac: Mac,
     output: LoopOutput,
