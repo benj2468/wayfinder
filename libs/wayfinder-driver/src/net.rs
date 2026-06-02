@@ -4,7 +4,9 @@ use std::net::SocketAddr;
 
 use tokio::{net::UdpSocket, net::UnixDatagram, task::JoinSet};
 
-use crate::transport::{Link, LinkT};
+use wayfinder::link::DynLinkT;
+
+use crate::transport::Link;
 
 /// Build a mesh link carried over UDP, type-erased as a [`LinkT`].
 ///
@@ -18,7 +20,7 @@ pub async fn build_udp_link(
     bind_addr: SocketAddr,
     remote_addr: SocketAddr,
     join_set: &mut JoinSet<anyhow::Result<()>>,
-) -> anyhow::Result<Box<dyn LinkT>> {
+) -> anyhow::Result<Box<DynLinkT<'static>>> {
     let udp_socket = UdpSocket::bind(bind_addr).await?;
     udp_socket.connect(remote_addr).await?;
 
@@ -43,5 +45,5 @@ pub async fn build_udp_link(
         }
     });
 
-    Ok(Box::new(Link::new(router_side)))
+    Ok(DynLinkT::new_box(Link::new(router_side)))
 }

@@ -24,8 +24,10 @@ use wayfinder::{CentralRouter, EgressInterface, McastPlan};
 use wayfinder_protos::service::WayfinderService;
 use wayfinder_server::{QueryRx, RouterAdapter};
 
+use wayfinder::link::{DynLinkT, LinkT};
+
 use crate::snoop::McastSnooper;
-use crate::transport::{FrameIo, LinkT};
+use crate::transport::FrameIo;
 
 /// One unit of work's outgoing frames.
 struct LoopOutput {
@@ -56,7 +58,7 @@ pub struct Driver<Local: FrameIo> {
     /// The local host network device.
     local: Local,
     /// The mesh interfaces, indexed by interface index.
-    interfaces: Vec<Box<dyn LinkT>>,
+    interfaces: Vec<Box<DynLinkT<'static>>>,
     /// The routing engine for this node.
     router: CentralRouter,
     /// Management-API queries forwarded from the server tasks.
@@ -77,7 +79,12 @@ pub struct Driver<Local: FrameIo> {
 impl<Local: FrameIo> Driver<Local> {
     /// Build a driver for node `mac` over the given host device, mesh
     /// interfaces, and management-query channel.
-    pub fn new(mac: Mac, local: Local, interfaces: Vec<Box<dyn LinkT>>, query_rx: QueryRx) -> Self {
+    pub fn new(
+        mac: Mac,
+        local: Local,
+        interfaces: Vec<Box<DynLinkT<'static>>>,
+        query_rx: QueryRx,
+    ) -> Self {
         Self {
             local,
             interfaces,
@@ -379,7 +386,7 @@ fn plan_host_frame(
 /// dispatch each outgoing frame onto the mesh via `get_egress_interface`.
 async fn dispatch<Local: FrameIo>(
     local: &Local,
-    interfaces: &mut [Box<dyn LinkT>],
+    interfaces: &mut [Box<DynLinkT<'static>>],
     router: &mut CentralRouter,
     mac: Mac,
     output: LoopOutput,

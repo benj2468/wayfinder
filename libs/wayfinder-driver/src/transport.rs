@@ -17,13 +17,11 @@
 //!   delivery decision.  The driver only ever holds `Box<dyn LinkT>`, so a
 //!   single interface set can mix both kinds.
 
-use async_trait::async_trait;
-
-use interfaces::link::LinkMetrics;
 use wayfinder::interfaces::{
     frame::{LinkFrame, LinkFrameData, Mac},
-    link::LinkError,
+    link::{LinkError, LinkMetrics},
 };
+use wayfinder::link::{LinkT, Received};
 use zerocopy::{FromBytes, IntoBytes};
 
 /// A message-oriented async byte pipe: read/write whole frames, one per call.
@@ -32,7 +30,7 @@ use zerocopy::{FromBytes, IntoBytes};
 /// driver's local host device) can sit on — a kernel TUN/TAP device, a
 /// `UnixDatagram`, a `UdpSocket`, an in-process channel — and by test fakes, so
 /// the driver can be exercised without real hardware.
-#[async_trait]
+#[cfg_attr(feature = "std", async_trait::async_trait)]
 pub trait FrameIo: Send + Sync {
     /// Receive one frame from the transport into `buf`, returning its length.
     async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize>;
@@ -42,7 +40,7 @@ pub trait FrameIo: Send + Sync {
 }
 
 #[cfg(feature = "tokio")]
-#[async_trait]
+#[cfg_attr(feature = "std", async_trait::async_trait)]
 impl FrameIo for tokio::net::UnixDatagram {
     async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         tokio::net::UnixDatagram::recv(self, buf).await
@@ -53,7 +51,7 @@ impl FrameIo for tokio::net::UnixDatagram {
 }
 
 #[cfg(feature = "tokio")]
-#[async_trait]
+#[cfg_attr(feature = "std", async_trait::async_trait)]
 impl FrameIo for tokio::net::UdpSocket {
     async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         tokio::net::UdpSocket::recv(self, buf).await
@@ -61,77 +59,6 @@ impl FrameIo for tokio::net::UdpSocket {
     async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
         tokio::net::UdpSocket::send(self, buf).await
     }
-}
-
-/// One frame received off a mesh interface, paired with the physical-layer
-/// measurements the carrier observed for it.
-///
-/// The metrics let the engine bias its egress choice toward the
-/// highest-quality interface (see `CentralRouter::handle_frame_with_metrics`).
-/// A carrier with no signal information (a wired pipe, an in-process channel)
-/// reports [`LinkMetrics::default`]; a radio fills in RSSI/SNR/quality.
-pub struct Received<'a> {
-    /// The parsed link-layer frame, borrowed from the interface's receive
-    /// buffer.  Valid until the next receive on the same interface.
-    pub frame: &'a LinkFrame,
-    /// Physical-layer measurements for this frame.
-    pub metrics: LinkMetrics,
-}
-
-/// One mesh interface: it accepts whole link-layer frames addressed to a
-/// destination MAC and yields received frames with their physical-layer
-/// metrics.
-///
-/// The driver chooses *which* interface and *which* next-hop MAC (via the
-/// routing engine); a `LinkT` decides only *how* to put that frame onto its own
-/// medium.  A point-to-point link ignores the destination; a multi-access or
-/// self-routing link uses it.
-#[async_trait]
-pub trait LinkT: Send {
-    /// Deliver one frame originating from `origin` to `data.dst` over this
-    /// medium.  `data.dst` is a next-hop (or final) node MAC, or
-    /// [`Mac::BROADCAST`].  Returns the number of bytes written.
-    async fn send(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> Result<usize, LinkError>;
-
-    /// Deliver the *same* `(protocol, payload)` to each destination in `dsts`.
-    ///
-    /// A link with a native fan-out — one UDP-multicast datagram, one radio
-    /// group transmission — overrides this to exploit it.  The default sends
-    /// one frame per destination via [`send`](LinkT::send), so simple carriers
-    /// need not implement it.
-    async fn send_all(
-        &mut self,
-        origin: Mac,
-        dsts: &[Mac],
-        protocol: u16,
-        payload: &[u8],
-    ) -> Result<(), LinkError> {
-        for &dst in dsts {
-            self.send(
-                origin,
-                &LinkFrameData {
-                    dst,
-                    protocol,
-                    payload,
-                },
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    /// Await the next frame from the interface, with its physical-layer
-    /// metrics.  The returned [`Received`] borrows the interface's receive
-    /// buffer and is invalidated by the next receive.
-    async fn recv(&mut self) -> Result<Received<'_>, LinkError>;
-
-    /// Poll for an already-pending frame without awaiting.
-    ///
-    /// Returns `None` when nothing is immediately available.  Cancel-safe
-    /// carriers (mpsc channels, datagram sockets) do not lose a frame when the
-    /// poll comes up empty.  This is the non-blocking primitive the
-    /// deterministic test stepping (`Driver::process_pending`) is built on.
-    fn try_recv(&mut self) -> Option<Result<Received<'_>, LinkError>>;
 }
 
 /// Point-to-point [`LinkT`] adapter over any [`FrameIo`] byte pipe.
@@ -181,7 +108,6 @@ impl<Io: FrameIo> Link<Io> {
     }
 }
 
-#[async_trait]
 impl<Io: FrameIo> LinkT for Link<Io> {
     async fn send(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> Result<usize, LinkError> {
         let idx = self.frame_into_buffer(origin, data);
@@ -254,7 +180,7 @@ mod tests {
         sent: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
-    #[async_trait]
+    #[cfg_attr(feature = "std", async_trait::async_trait)]
     impl FrameIo for FakeIo {
         async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
             loop {
@@ -355,7 +281,6 @@ mod tests {
         last_frame: Vec<u8>,
     }
 
-    #[async_trait]
     impl LinkT for BulkLink {
         async fn send(
             &mut self,

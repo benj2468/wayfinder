@@ -26,7 +26,7 @@ use interfaces::{
 use pretty_hex::pretty_hex;
 use tokio::sync::mpsc;
 use wayfinder::CentralRouter;
-use wayfinder_driver::{Driver, FrameIo, Link, LinkT, QueryRx, QueryTx};
+use wayfinder_driver::{Driver, DynLinkT, FrameIo, Link, QueryRx, QueryTx};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::driver::TestHarness;
@@ -199,9 +199,9 @@ impl TestRouter {
     /// Create a new test router with the given node identity and one switch-port
     /// duplex per mesh interface.
     pub fn new(ident: Mac, interfaces: Vec<PortComms>) -> Self {
-        let links: Vec<Box<dyn LinkT>> = interfaces
+        let links: Vec<Box<DynLinkT<'static>>> = interfaces
             .into_iter()
-            .map(|pc| Box::new(Link::new(ChannelTransport::from(pc))) as Box<dyn LinkT>)
+            .map(|pc| DynLinkT::new_box(Link::new(ChannelTransport::from(pc))))
             .collect();
 
         let deliveries = Arc::new(Mutex::new(Vec::new()));

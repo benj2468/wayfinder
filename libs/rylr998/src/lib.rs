@@ -77,6 +77,9 @@ pub struct ReceivedPacket {
     pub snr: i32,
 }
 
+#[cfg(feature = "link")]
+mod link;
+
 /// The core RYLR998/RYLR498 Client driver structure.
 pub struct RylrClient<S> {
     stream: S,
@@ -84,6 +87,12 @@ pub struct RylrClient<S> {
 
     // The network ID for the client.
     network_id: u8,
+
+    // Scratch buffer holding the most recently decoded mesh frame, borrowed by
+    // `LinkT::recv`.  Only present when the `link` feature wires this client
+    // onto a mesh; sized for one max-length frame (240 on-air hex chars / 2).
+    #[cfg(feature = "link")]
+    rx_frame: [u8; 128],
 }
 
 impl<S> RylrClient<S>
@@ -96,6 +105,8 @@ where
             stream,
             timeout: Duration::from_secs(3),
             network_id: 18,
+            #[cfg(feature = "link")]
+            rx_frame: [0u8; 128],
         })
     }
 

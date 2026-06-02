@@ -8,7 +8,8 @@ default = ["tokio"]
 # Enables the tokio-driven event loop, the concrete `tokio::net` frame
 # transports, and the in-process server wiring.  Without it the crate exposes
 # only the transport-agnostic [`FrameIo`] trait and the IGMP [`McastSnooper`].
-tokio = ["dep:tokio", "dep:futures"]
+tokio = ["dep:tokio", "dep:futures", "std"]
+std = ["dep:async-trait", "wayfinder/std"]
 
 [dependencies]
 wayfinder.workspace = true
@@ -16,7 +17,7 @@ interfaces.workspace = true
 wayfinder-protos.workspace = true
 wayfinder-server.workspace = true
 
-async-trait.workspace = true
+async-trait = { workspace = true, optional = true }
 anyhow.workspace = true
 tracing.workspace = true
 zerocopy.workspace = true

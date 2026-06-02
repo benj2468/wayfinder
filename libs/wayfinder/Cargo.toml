@@ -13,6 +13,7 @@ pretty-hex.workspace = true
 heapless.workspace = true
 embedded-io-async.workspace = true
 serde.workspace = true
+dynosaur.workspace = true
 
 [dev-dependencies]
 tracing-test = "0.2.6"
@@ -23,3 +24,7 @@ pretty-hex.workspace = true
 default = ["alloc"]
 
 alloc = []
+# Pulls in `std`, enabling the `dynosaur`-generated `DynLinkT` boxed wrapper for
+# dynamic dispatch (its constructors reference `std`).  The bare `LinkT` trait
+# is available without this; embedded callers leave it off.
+std = ["alloc"]

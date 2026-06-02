@@ -44,6 +44,7 @@ embassy-futures = "0.1.2"
 heapless = "0.9.3"
 embedded-io-adapters = { version = "0.6.1", features = ["tokio-1"] }
 async-trait = "0.1.89"
+dynosaur = "0.3.0"
 serde = { version = "1.0.228", features = ["derive"] }
 
 [dependencies]

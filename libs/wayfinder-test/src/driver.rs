@@ -3,7 +3,7 @@ use std::{collections::HashMap, time::Duration};
 
 use interfaces::frame::Mac;
 use serde::{Deserialize, Serialize};
-use tokio::time::{Instant, interval, interval_at};
+use tokio::time::interval;
 
 use crate::{
     switch::{PortComms, PortConfig, Switch},
