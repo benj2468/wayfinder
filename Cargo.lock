@@ -1823,7 +1823,6 @@ dependencies = [
  "tun-rs",
  "wayfinder",
  "wayfinder-driver",
- "zerocopy",
 ]
 
 [[package]]
@@ -1834,6 +1833,7 @@ dependencies = [
  "async-trait",
  "embassy-sync",
  "embedded-io-async 0.6.1",
+ "futures",
  "heapless",
  "interfaces",
  "pretty-hex",

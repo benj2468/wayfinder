@@ -23,6 +23,7 @@ use interfaces::{
     frame::{LinkFrame, Mac},
     link::LinkMetrics,
 };
+use pretty_hex::pretty_hex;
 use tokio::sync::mpsc;
 use wayfinder::CentralRouter;
 use wayfinder_driver::{Driver, FrameIo, Link, QueryRx, QueryTx};
@@ -104,6 +105,7 @@ impl FrameIo for ChannelTransport {
     }
 
     async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        tracing::trace!("Sending on the channel transport: {:?}", buf);
         self.egress
             .send(buf.to_vec())
             .await
@@ -116,7 +118,7 @@ impl FrameIo for ChannelTransport {
 /// are appended to a shared log instead of a kernel TAP, and the inbound side
 /// stays pending (host traffic is injected directly via
 /// [`Driver::inject_host_frame`]).
-struct ObservableEgress {
+pub struct ObservableEgress {
     inbound: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
     deliveries: Arc<Mutex<Vec<Vec<u8>>>>,
 }
@@ -124,8 +126,12 @@ struct ObservableEgress {
 #[async_trait]
 impl FrameIo for ObservableEgress {
     async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        tracing::trace!("recv: waiting for frame");
         match self.inbound.lock().await.recv().await {
-            Some(frame) => Ok(copy_into(&frame, buf)),
+            Some(frame) => {
+                tracing::trace!("recv: frame received: {}", pretty_hex(&frame));
+                Ok(copy_into(&frame, buf))
+            }
             None => std::future::pending().await,
         }
     }
@@ -163,7 +169,7 @@ pub struct TestRouter {
     deliveries: Arc<Mutex<Vec<Vec<u8>>>>,
     /// Kept alive so the host-inbound channel never closes (the driver's
     /// host-device select arm must stay pending, not resolve to `None`).
-    _host_in: mpsc::Sender<Vec<u8>>,
+    host_in: mpsc::Sender<Vec<u8>>,
     /// Kept alive so the management-query channel stays open.
     _query_tx: QueryTx,
 }
@@ -210,7 +216,7 @@ impl TestRouter {
             driver: Driver::new(ident, local, links, query_rx),
             ident,
             deliveries,
-            _host_in: host_in,
+            host_in,
             _query_tx: query_tx,
         }
     }
@@ -225,6 +231,11 @@ impl TestRouter {
     /// (`get_egress_interface`) and crafted-frame injection.
     pub fn router_mut(&mut self) -> &mut CentralRouter {
         self.driver.router_mut()
+    }
+
+    /// Get the underlying driver for this router.
+    pub fn driver(&mut self) -> &mut Driver<ObservableEgress> {
+        &mut self.driver
     }
 
     /// The inner frames the router has delivered locally so far (the full host
@@ -247,7 +258,8 @@ impl TestRouter {
     /// the TAP, so the egress copies are dispatched immediately.
     pub async fn send_local(&mut self, dest: Mac, payload: &[u8]) -> anyhow::Result<()> {
         let eth = host_frame(dest, self.ident, payload);
-        self.driver.inject_host_frame(&eth).await
+        self.host_in.send(eth).await?;
+        Ok(())
     }
 
     // ── inbound ───────────────────────────────────────────────────────────────

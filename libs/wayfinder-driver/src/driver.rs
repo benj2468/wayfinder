@@ -14,8 +14,10 @@
 
 use std::time::{Duration, Instant};
 
-use futures::{FutureExt, StreamExt, stream::FuturesOrdered};
+use futures::{FutureExt, future::select_all};
 use pretty_hex::pretty_hex;
+use tokio::time::{Interval, interval};
+use tracing::info;
 use wayfinder::interfaces::frame::{LinkFrame, LinkFrameData, Mac};
 use wayfinder::{CentralRouter, EgressInterface, McastPlan};
 use wayfinder_protos::service::WayfinderService;
@@ -102,8 +104,9 @@ impl<Local: FrameIo> Driver<Local> {
 
     /// Run the event loop forever.
     pub async fn run(&mut self) -> anyhow::Result<()> {
+        let mut int = interval(Duration::from_secs(10));
         loop {
-            self.run_once().await?;
+            self.run_once(&mut int, true, true, true).await?;
         }
     }
 
@@ -111,7 +114,14 @@ impl<Local: FrameIo> Driver<Local> {
     /// mesh interface, a frame from the local host device, a management query,
     /// or the periodic-broadcast timer — process it, then deliver any inner
     /// frame to the host and dispatch any outgoing frame onto the mesh.
-    pub async fn run_once(&mut self) -> anyhow::Result<()> {
+    #[tracing::instrument(skip(self, interval, check_local, check_mesh, check_server), fields(ident = ?self.mac))]
+    pub async fn run_once(
+        &mut self,
+        interval: &mut Interval,
+        check_local: bool,
+        check_mesh: bool,
+        check_server: bool,
+    ) -> anyhow::Result<()> {
         // Destructure into disjoint field borrows so the `select!` can hold a
         // mutable borrow of the interfaces alongside the router and buffers.
         let Driver {
@@ -129,18 +139,16 @@ impl<Local: FrameIo> Driver<Local> {
         let start = *start;
 
         let output: LoopOutput = {
-            let mut futures = interfaces
-                .iter_mut()
-                .enumerate()
-                .map(|(i, iface)| async move { iface.receive().await.map(|frame| (i, frame)).ok() })
-                .collect::<FuturesOrdered<_>>();
-
             tokio::select! {
-                Some(Some((idx, frame))) = futures.next() => {
+                (Some((idx, frame)), _, _) = select_all(
+                    interfaces.iter_mut().enumerate().map(|(i, iface)| {
+                        Box::pin(async move { iface.receive().await.map(|frame| (i, frame)).ok() })
+                    })
+                ), if check_mesh && !interfaces.is_empty() => {
                     tracing::debug!("received frame from interface {}", idx);
                     handle_mesh_frame(router, idx, frame, tx_buffer)
                 },
-                Ok(len) = local.recv(rx_buffer) => {
+                Ok(len) = local.recv(rx_buffer), if check_local => {
                     tracing::debug!("host device received frame of length {}", len);
                     let eth = &rx_buffer[..len];
                     tracing::debug!("{}", pretty_hex(&eth));
@@ -149,12 +157,13 @@ impl<Local: FrameIo> Driver<Local> {
                         local: None,
                     }
                 },
-                Some((request, resp_tx)) = query_rx.recv() => {
+                Some((request, resp_tx)) = query_rx.recv(), if check_server => {
                     let response = WayfinderService::new(RouterAdapter::new(&*router)).handle(request);
                     let _ = resp_tx.send(response);
                     LoopOutput::none()
                 },
-                _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                _ = interval.tick() => {
+                    tracing::info!("polling OGM");
                     LoopOutput {
                         mesh: poll_ogm(router, start.elapsed(), tx_buffer),
                         local: None,

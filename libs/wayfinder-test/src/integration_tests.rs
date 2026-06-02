@@ -209,17 +209,27 @@ async fn test_simple_pair_send_data() {
     setup();
     let mut harness = simple_pair();
 
-    harness.tick(Duration::from_secs(1)).await;
+    harness.poll(Duration::from_secs(1)).await;
+    harness.tick().await;
+    harness.tick().await;
+
+    for (_, router) in harness.machines.iter() {
+        assert_eq!(router.router().originator_table().len(), 1);
+    }
+
+    tracing::info!("OGM PHASE COMPLETE");
 
     let m1 = harness.get_machine("machine1").ident;
     let m2 = harness.get_machine("machine2").ident;
+
     harness
         .get_machine_mut("machine1")
         .send_local(m2, b"Hello World")
         .await
         .unwrap();
 
-    harness.tick(Duration::from_secs(3)).await;
+    harness.tick().await;
+    harness.tick().await;
 
     assert_eq!(
         harness.get_machine("machine2").local_deliveries(),
@@ -237,8 +247,12 @@ async fn test_line_of_three_send_data() {
     setup();
     let mut harness = line_of_three();
 
-    harness.tick(Duration::from_secs(1)).await;
-    harness.tick(Duration::from_secs(2)).await;
+    harness.poll(Duration::from_secs(1)).await;
+    harness.tick().await;
+    harness.tick().await;
+    harness.tick().await;
+    harness.tick().await;
+    harness.tick().await;
 
     for (_, router) in harness.machines.iter() {
         assert_eq!(router.router().originator_table().len(), 2);
@@ -252,9 +266,9 @@ async fn test_line_of_three_send_data() {
         .await
         .unwrap();
 
-    harness.tick(Duration::from_secs(3)).await;
-    harness.tick(Duration::from_secs(4)).await;
-    harness.tick(Duration::from_secs(5)).await;
+    harness.tick().await;
+    harness.tick().await;
+    harness.tick().await;
 
     assert_eq!(
         harness.get_machine("machine3").local_deliveries(),
@@ -278,7 +292,8 @@ async fn broadcast_is_delivered_locally_at_neighbor() {
         .await
         .expect("broadcast packet should build");
 
-    harness.tick(Duration::from_secs(1)).await;
+    harness.tick().await;
+    harness.tick().await;
 
     assert_eq!(
         harness.get_machine("machine2").local_deliveries(),
@@ -298,8 +313,14 @@ async fn three_routers_all_connected_discover_and_exchange() {
     let mut harness = one_switch_with_machines(3);
 
     // Two rounds of OGMs so every node learns direct routes to the others.
-    harness.tick(Duration::from_secs(1)).await;
-    harness.tick(Duration::from_secs(2)).await;
+    harness.poll(Duration::from_secs(1)).await;
+    harness.tick().await;
+    harness.tick().await;
+    harness.tick().await;
+
+    for (_, router) in harness.machines.iter() {
+        assert_eq!(router.router().originator_table().len(), 2);
+    }
 
     let m0 = harness.get_machine("machine0").ident;
 
@@ -311,7 +332,13 @@ async fn three_routers_all_connected_discover_and_exchange() {
         .await
         .expect("machine0 must have a direct route to machine2");
 
-    harness.tick(Duration::from_secs(3)).await;
+    harness.tick().await;
+    harness.tick().await;
+    harness.tick().await;
+    harness.tick().await;
+    harness.tick().await;
+    harness.tick().await;
+    harness.tick().await;
 
     assert_eq!(
         harness.get_machine("machine2").local_deliveries(),
@@ -334,7 +361,13 @@ async fn three_routers_all_connected_discover_and_exchange() {
         .await
         .expect("machine0 must have a direct route to machine1");
 
-    harness.tick(Duration::from_secs(4)).await;
+    harness.tick().await;
+    harness.tick().await;
+    harness.tick().await;
+    harness.tick().await;
+    harness.tick().await;
+    harness.tick().await;
+    harness.tick().await;
 
     assert_eq!(
         harness.get_machine("machine1").local_deliveries(),

@@ -1,7 +1,9 @@
+use futures::future::FutureExt;
 use std::{collections::HashMap, time::Duration};
 
 use interfaces::frame::Mac;
 use serde::{Deserialize, Serialize};
+use tokio::time::{Instant, interval, interval_at};
 
 use crate::{
     switch::{PortComms, PortConfig, Switch},
@@ -36,17 +38,35 @@ impl TestHarness {
         Self::default()
     }
 
-    pub async fn tick(&mut self, now: Duration) {
+    pub async fn poll(&mut self, now: Duration) {
+        let mut int = interval(Duration::MAX);
+        // Tick it once so that we don't block waiting for the interval to elapse
+        int.tick().await;
+
         for (_, router) in self.machines.iter_mut() {
             router.poll(now).await;
         }
+    }
 
-        for (_, switch) in self.switches.iter_mut() {
-            switch.tick().await.unwrap();
+    pub async fn tick(&mut self) {
+        let mut int = interval(Duration::MAX);
+        int.tick().await;
+
+        for (_, router) in self.machines.iter_mut() {
+            let _ = router
+                .driver()
+                .run_once(&mut int, false, true, false)
+                .now_or_never();
         }
 
         for (_, router) in self.machines.iter_mut() {
-            router.drain_all().await;
+            let _ = router
+                .driver()
+                .run_once(&mut int, true, false, false)
+                .now_or_never();
+        }
+        for (_, switch) in self.switches.iter_mut() {
+            switch.tick().await.unwrap();
         }
     }
 
@@ -83,7 +103,10 @@ impl TestConfig {
         let mut h = TestHarness::default();
         for switch in &self.switches {
             if h.switches
-                .insert(switch.name.clone(), Switch::new())
+                .insert(
+                    switch.name.clone(),
+                    Switch::new_with_name(switch.name.clone()),
+                )
                 .is_some()
             {
                 return Err(format!(
