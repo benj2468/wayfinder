@@ -27,6 +27,7 @@ pub use driver::Driver;
 pub use net::build_udp_link;
 #[cfg(feature = "tokio")]
 pub use transport::Link;
+pub use transport::{LinkT, Received};
 
 // Re-export the management-server wiring so callers configure the driver's
 // query path without depending on `wayfinder-server` directly.
