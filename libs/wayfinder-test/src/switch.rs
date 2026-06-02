@@ -3,6 +3,7 @@ use std::fmt::Debug;
 use std::mem::size_of;
 
 use interfaces::frame::MeshIdentifier;
+use pretty_hex::pretty_hex;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use thiserror::Error;
@@ -97,6 +98,8 @@ pub enum SwitchError {
 }
 
 pub struct Switch<Ident> {
+    // Name of the switch
+    name: String,
     // Random Number generator
     rng: StdRng,
     // Ports connected to the switch
@@ -122,6 +125,16 @@ where
 {
     pub fn new() -> Self {
         Self {
+            name: String::new(),
+            ports: HashMap::new(),
+            taps: HashMap::new(),
+            ident_map: HashMap::new(),
+            rng: StdRng::from_seed([0; 32]),
+        }
+    }
+    pub fn new_with_name(name: String) -> Self {
+        Self {
+            name,
             ports: HashMap::new(),
             taps: HashMap::new(),
             ident_map: HashMap::new(),
@@ -178,6 +191,7 @@ where
     }
 
     /// Tick the switch, multiplexing messages between ports and calling the tap handlers
+    #[tracing::instrument(skip(self), fields(name = self.name))]
     pub async fn tick(&mut self) -> Result<(), SwitchError> {
         // Flush all messages in the switch's buffer
         let mut msgs = self
@@ -213,9 +227,14 @@ where
                 taps.retain(|t| !t.invalid);
             }
             for msg in msgs {
-                let Ok((source, _)) = Ident::ref_from_prefix(msg.as_slice()) else {
-                    continue;
+                let source = match Ident::ref_from_prefix(msg.as_slice()) {
+                    Ok((source, _)) => source,
+                    Err(e) => {
+                        tracing::warn!("unable to parse message as ident: {:?}", e);
+                        continue;
+                    }
                 };
+                tracing::trace!("parsed message as ident: {:?}", (*source, *id));
 
                 self.ident_map.insert(*source, *id);
             }
@@ -223,9 +242,10 @@ where
 
         // Loop over all and forward to destination, or all ports if destination port not specifically known
         for (port, msgs) in msgs {
+            tracing::trace!(port_id = ?port, "processing {:?} messages", msgs.len());
             let port_config = self.ports.get(&port).unwrap();
             for mut msg in msgs {
-                tracing::trace!(port_id = ?port, direction = ?Direction::ToSwitch, "{:?}", msg);
+                tracing::trace!(port_id = ?port, direction = ?Direction::ToSwitch, "{}", pretty_hex(&msg));
                 if self.rng.random_bool(port_config.config.outgoing_loss) {
                     continue;
                 }
@@ -234,9 +254,9 @@ where
                     continue;
                 };
 
-                tracing::trace!(dest = ?dest, "forwarding message to dest");
+                tracing::trace!(dest = ?dest, "forwarding message to dests: {:?}", self.ident_map.get(dest));
                 if let Some(dest_port) = self.ident_map.get(dest) {
-                    tracing::trace!(port_id = ?dest_port, direction = ?Direction::FromSwitch, "{:?}", msg);
+                    tracing::trace!(port_id = ?dest_port, direction = ?Direction::FromSwitch, "{}", pretty_hex(&msg));
                     // Send to specific destination port
                     if let Some(taps) = self.taps.get_mut(dest_port) {
                         for tap in taps.iter_mut() {
@@ -265,6 +285,7 @@ where
                         if *other_port_id == port {
                             continue; // Don't send back to source
                         }
+                        tracing::trace!(port_id = ?other_port_id, direction = ?Direction::FromSwitch, "{}", pretty_hex(&msg));
 
                         if let Some(taps) = self.taps.get_mut(other_port_id) {
                             for tap in taps.iter_mut() {

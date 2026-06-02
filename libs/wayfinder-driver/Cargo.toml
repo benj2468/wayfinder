@@ -1,0 +1,27 @@
+[package]
+name = "wayfinder-driver"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["tokio"]
+# Enables the tokio-driven event loop, the concrete `tokio::net` frame
+# transports, and the in-process server wiring.  Without it the crate exposes
+# only the transport-agnostic [`FrameIo`] trait and the IGMP [`McastSnooper`].
+tokio = ["dep:tokio", "dep:futures"]
+
+[dependencies]
+wayfinder.workspace = true
+interfaces.workspace = true
+wayfinder-protos.workspace = true
+wayfinder-server.workspace = true
+
+async-trait.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+zerocopy.workspace = true
+pretty-hex.workspace = true
+etherparse.workspace = true
+
+tokio = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }

@@ -61,6 +61,7 @@
               nixd
               rustToolchain
               cargo-nextest
+              cargo-machete
               cargo-llvm-cov
               rust-analyzer
               python3

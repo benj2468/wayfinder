@@ -1,6 +1,6 @@
 //! IGMP snooping: learn which IPv4 multicast groups the local host listens to
-//! by observing the IGMP membership reports/leaves it emits on the TAP, so the
-//! router can announce those groups to the mesh (and receive only the
+//! by observing the IGMP membership reports/leaves it emits on the host link, so
+//! the router can announce those groups to the mesh (and receive only the
 //! multicast traffic the host actually wants).
 //!
 //! Scope: IPv4 IGMP only (v1/v2/v3); IPv6 MLD is not yet snooped.  Ethernet and
@@ -17,22 +17,22 @@ use wayfinder::interfaces::frame::Mac;
 const IP_PROTO_IGMP: u8 = 2;
 
 /// Tracks the IPv4 multicast groups the local host has joined, learned by
-/// snooping the IGMP membership messages it emits on the TAP.
+/// snooping the IGMP membership messages it emits on the host link.
 #[derive(Default)]
-pub(crate) struct McastSnooper {
+pub struct McastSnooper {
     groups: HashSet<Mac>,
 }
 
 impl McastSnooper {
     /// A snooper that has observed nothing yet (no joined groups).
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
     /// Observe one host Ethernet frame.  If it carries an IGMP membership
     /// report or leave, update the joined-group set accordingly and return
     /// `true` when the set actually changed; otherwise return `false`.
-    pub(crate) fn observe(&mut self, eth: &[u8]) -> bool {
+    pub fn observe(&mut self, eth: &[u8]) -> bool {
         match igmp_payload(eth) {
             Some(igmp) => self.apply_igmp(igmp),
             None => false,
@@ -40,7 +40,7 @@ impl McastSnooper {
     }
 
     /// The multicast group MACs the host currently listens to.
-    pub(crate) fn groups(&self) -> Vec<Mac> {
+    pub fn groups(&self) -> Vec<Mac> {
         self.groups.iter().copied().collect()
     }
 
