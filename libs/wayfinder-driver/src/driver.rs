@@ -247,7 +247,7 @@ impl<Local: FrameIo> Driver<Local> {
 
             // Mesh interfaces: forwarded/delivered frames.
             for idx in 0..self.interfaces.len() {
-                let output = match self.interfaces[idx].try_recv() {
+                let output = match self.interfaces[idx].recv().now_or_never() {
                     None => continue,
                     Some(Err(e)) => bail!("link recv failed: {e:?}"),
                     Some(Ok(received)) => {

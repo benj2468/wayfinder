@@ -132,31 +132,6 @@ impl<Io: FrameIo> LinkT for Link<Io> {
             metrics: LinkMetrics::default(),
         })
     }
-
-    #[cfg(feature = "tokio")]
-    fn try_recv(&mut self) -> Option<Result<Received<'_>, LinkError>> {
-        use futures::FutureExt;
-        let n = match self.socket.recv(&mut self.buffer).now_or_never()? {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::error!("Error reading from socket: {:?}", e);
-                return Some(Err(LinkError::Io));
-            }
-        };
-        Some(
-            LinkFrame::ref_from_bytes(&self.buffer[..n])
-                .map_err(|_| LinkError::Io)
-                .map(|frame| Received {
-                    frame,
-                    metrics: LinkMetrics::default(),
-                }),
-        )
-    }
-
-    #[cfg(not(feature = "tokio"))]
-    fn try_recv(&mut self) -> Option<Result<Received<'_>, LinkError>> {
-        None
-    }
 }
 
 #[cfg(test)]
@@ -316,10 +291,6 @@ mod tests {
                 frame,
                 metrics: self.next_metrics,
             })
-        }
-
-        fn try_recv(&mut self) -> Option<Result<Received<'_>, LinkError>> {
-            None
         }
     }
 

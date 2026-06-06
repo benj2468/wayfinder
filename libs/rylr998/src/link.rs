@@ -72,12 +72,6 @@ where
             metrics: metrics_from(packet.rssi, packet.snr),
         })
     }
-
-    fn try_recv(&mut self) -> Option<Result<Received<'_>, LinkError>> {
-        // The radio is driven over a blocking AT serial stream with no
-        // non-blocking peek, so there is no cancel-safe poll to offer.
-        None
-    }
 }
 
 /// Map a driver-level [`LoraError`] onto the link-layer [`LinkError`] the mesh

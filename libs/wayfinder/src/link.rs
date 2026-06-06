@@ -83,12 +83,4 @@ pub trait LinkT: Send {
     /// The returned [`Received`] borrows the interface's receive buffer and is
     /// invalidated by the next receive.
     async fn recv<'a>(&'a mut self) -> Result<Received<'a>, LinkError>;
-
-    /// Poll for an already-pending frame without awaiting.
-    ///
-    /// Returns `None` when nothing is immediately available.  Cancel-safe
-    /// carriers (mpsc channels, datagram sockets) do not lose a frame when the
-    /// poll comes up empty.  This is the non-blocking primitive the
-    /// deterministic test stepping (`Driver::process_pending`) is built on.
-    fn try_recv(&mut self) -> Option<Result<Received<'_>, LinkError>>;
 }
