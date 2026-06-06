@@ -58,14 +58,12 @@ where
         push_hex(&mut hex, &data.protocol.to_ne_bytes())?;
         push_hex(&mut hex, data.payload)?;
 
-        self.send_data(RYLR_BROADCAST_ADDR, &hex)
-            .await
-            .map_err(map_lora_err)?;
+        self.send_data(RYLR_BROADCAST_ADDR, &hex).await?;
         Ok(frame_len)
     }
 
     async fn recv<'a>(&'a mut self) -> Result<Received<'a>, LinkError> {
-        let packet = self.listen_for_packet().await.map_err(map_lora_err)?;
+        let packet = self.listen_for_packet().await?;
         let n = decode_hex(packet.data.as_str(), &mut self.rx_frame)?;
         let frame =
             LinkFrame::ref_from_bytes(&self.rx_frame[..n]).map_err(|_| LinkError::InvalidPacket)?;
@@ -84,13 +82,15 @@ where
 
 /// Map a driver-level [`LoraError`] onto the link-layer [`LinkError`] the mesh
 /// engine understands.
-fn map_lora_err(e: LoraError) -> LinkError {
-    match e {
-        LoraError::Io => LinkError::Io,
-        LoraError::RequestTooLarge => LinkError::BufferFull,
-        LoraError::InvalidResponse => LinkError::InvalidPacket,
-        LoraError::Timeout => LinkError::ReceiveFailed,
-        LoraError::ModuleError(_) => LinkError::TransmitFailed,
+impl From<LoraError> for LinkError {
+    fn from(e: LoraError) -> Self {
+        match e {
+            LoraError::Io => LinkError::Io,
+            LoraError::RequestTooLarge => LinkError::BufferFull,
+            LoraError::InvalidResponse => LinkError::InvalidPacket,
+            LoraError::Timeout => LinkError::ReceiveFailed,
+            LoraError::ModuleError(_) => LinkError::TransmitFailed,
+        }
     }
 }
 
