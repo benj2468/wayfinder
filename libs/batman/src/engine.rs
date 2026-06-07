@@ -153,8 +153,21 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
 
                 let record = &mut self.originator_table[record_idx.unwrap()];
 
-                // Rule 2: Evaluate if this OGM is fresh sequence metadata
-                // (Simplified sequence check for baseline demonstration)
+                // Whether this OGM carries a *strictly newer* sequence number
+                // than any we've already processed from this originator.
+                // Captured before `last_seqno` is advanced below, because it
+                // gates re-forwarding: a copy of a seqno we have already
+                // forwarded (`==`, e.g. the same OGM reaching us via a second
+                // neighbor) must update our path metrics but must NOT be
+                // re-flooded — otherwise it circulates until its TTL drains,
+                // flooding the mesh.  A new record starts at `last_seqno == 0`,
+                // below the first real seqno (1), so an originator's first OGM
+                // is always treated as new.
+                let is_new_seqno = incoming_seqno > record.last_seqno;
+
+                // Rule 2: accept this OGM for path/metric learning when it is at
+                // least as fresh as the newest seen.  Same-seqno copies via
+                // other neighbors are still recorded as alternate paths.
                 if incoming_seqno >= record.last_seqno {
                     record.last_seqno = incoming_seqno;
 
@@ -188,8 +201,10 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
                     self.update_mcast_membership(orig_ident, tail);
 
                     // --- REACTIVE STEP: Forward OGM (Flood Routing Propagation) ---
-                    // Lower TTL to prevent routing infinity storms
-                    if ogm.ttl > 1 {
+                    // Re-flood only the first time we see a sequence number, and
+                    // only while TTL remains, so each (originator, seqno) is
+                    // forwarded by this node at most once.
+                    if is_new_seqno && ogm.ttl > 1 {
                         let mut outbound_ogm = ogm;
                         outbound_ogm.ttl -= 1;
                         outbound_ogm.tq = computed_tq;

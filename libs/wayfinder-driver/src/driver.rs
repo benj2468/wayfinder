@@ -29,12 +29,29 @@ use wayfinder::link::{DynLinkT, LinkT};
 use crate::snoop::McastSnooper;
 use crate::transport::FrameIo;
 
+/// One frame to put on the mesh, plus how to fan it out.
+struct OutgoingFrame {
+    /// Destination ident (a next-hop neighbor, or `BROADCAST` for a flood).
+    dst: Mac,
+    /// EtherType-style protocol identifier stamped on the link frame.
+    protocol: u16,
+    /// Serialized payload to transmit.
+    payload: Vec<u8>,
+    /// For a frame that fans out to every interface (`EgressInterface::All`,
+    /// i.e. a broadcast/OGM re-flood), the interface index to omit — the one
+    /// the frame arrived on.  This is split-horizon flooding: never send a
+    /// re-flood back toward the neighbor it came from, which would otherwise
+    /// circulate OGMs/broadcasts until their TTL drains.  `None` for locally
+    /// originated frames, which go out every interface.
+    exclude_iface: Option<usize>,
+}
+
 /// One unit of work's outgoing frames.
 struct LoopOutput {
-    /// `(destination ident, protocol, serialized payload)` frames to transmit
-    /// onto the mesh, each dispatched via `get_egress_interface`.  Usually one,
-    /// but a selectively-forwarded multicast frame produces one per listener.
-    mesh: Vec<(Mac, u16, Vec<u8>)>,
+    /// Frames to transmit onto the mesh, each dispatched via
+    /// `get_egress_interface`.  Usually one, but a selectively-forwarded
+    /// multicast frame produces one per listener.
+    mesh: Vec<OutgoingFrame>,
     /// Inner frame to write back to the local host device.
     local: Option<Vec<u8>>,
 }
@@ -293,14 +310,16 @@ impl<Local: FrameIo> Driver<Local> {
 }
 
 /// Produce this node's periodic OGM (if one is due) as a mesh frame.
-fn poll_ogm(
-    router: &mut CentralRouter,
-    now: Duration,
-    tx_buffer: &mut [u8],
-) -> Vec<(Mac, u16, Vec<u8>)> {
+fn poll_ogm(router: &mut CentralRouter, now: Duration, tx_buffer: &mut [u8]) -> Vec<OutgoingFrame> {
     router
         .poll(now, tx_buffer)
-        .map(|f| (f.dst, f.protocol, f.payload.to_vec()))
+        .map(|f| OutgoingFrame {
+            dst: f.dst,
+            protocol: f.protocol,
+            payload: f.payload.to_vec(),
+            // Locally originated — flood out every interface.
+            exclude_iface: None,
+        })
         .into_iter()
         .collect()
 }
@@ -319,7 +338,13 @@ fn handle_mesh_frame(
     LoopOutput {
         mesh: rx
             .forward
-            .map(|f| (f.dst, f.protocol, f.payload.to_vec()))
+            .map(|f| OutgoingFrame {
+                dst: f.dst,
+                protocol: f.protocol,
+                payload: f.payload.to_vec(),
+                // A re-flood must not go back out the interface it arrived on.
+                exclude_iface: Some(idx),
+            })
             .into_iter()
             .collect(),
         local: rx.deliver_local.map(|inner| inner.to_vec()),
@@ -340,12 +365,12 @@ fn plan_host_frame(
     snooper: &mut McastSnooper,
     eth: &[u8],
     tx_buffer: &mut [u8],
-) -> Vec<(Mac, u16, Vec<u8>)> {
+) -> Vec<OutgoingFrame> {
     if snooper.observe(eth) {
         router.set_local_mcast_groups(&snooper.groups());
     }
 
-    let mut mesh: Vec<(Mac, u16, Vec<u8>)> = Vec::new();
+    let mut mesh: Vec<OutgoingFrame> = Vec::new();
     if eth.len() < 14 {
         return mesh;
     }
@@ -354,12 +379,17 @@ fn plan_host_frame(
     dst_mac.copy_from_slice(&eth[0..6]);
     let dst = Mac(dst_mac);
 
-    let flood =
-        |router: &mut CentralRouter, mesh: &mut Vec<(Mac, u16, Vec<u8>)>, buf: &mut [u8]| {
-            if let Ok(f) = router.handle_local(Mac::BROADCAST, eth, buf) {
-                mesh.push((f.dst, f.protocol, f.payload.to_vec()));
-            }
-        };
+    // Locally originated frames flood out every interface (no ingress to omit).
+    let flood = |router: &mut CentralRouter, mesh: &mut Vec<OutgoingFrame>, buf: &mut [u8]| {
+        if let Ok(f) = router.handle_local(Mac::BROADCAST, eth, buf) {
+            mesh.push(OutgoingFrame {
+                dst: f.dst,
+                protocol: f.protocol,
+                payload: f.payload.to_vec(),
+                exclude_iface: None,
+            });
+        }
+    };
 
     if dst.is_broadcast() {
         flood(router, &mut mesh, tx_buffer);
@@ -369,14 +399,24 @@ fn plan_host_frame(
                 let targets: Vec<Mac> = router.mcast_targets(dst).collect();
                 for target in targets {
                     if let Ok(f) = router.handle_local_mcast(target, eth, tx_buffer) {
-                        mesh.push((f.dst, f.protocol, f.payload.to_vec()));
+                        mesh.push(OutgoingFrame {
+                            dst: f.dst,
+                            protocol: f.protocol,
+                            payload: f.payload.to_vec(),
+                            exclude_iface: None,
+                        });
                     }
                 }
             }
             McastPlan::Flood => flood(router, &mut mesh, tx_buffer),
         }
     } else if let Ok(f) = router.handle_local(dst, eth, tx_buffer) {
-        mesh.push((f.dst, f.protocol, f.payload.to_vec()));
+        mesh.push(OutgoingFrame {
+            dst: f.dst,
+            protocol: f.protocol,
+            payload: f.payload.to_vec(),
+            exclude_iface: None,
+        });
     }
 
     mesh
@@ -396,11 +436,18 @@ async fn dispatch<Local: FrameIo>(
         local.send(&inner).await?;
     }
 
-    for (dst, protocol, payload) in output.mesh {
+    for OutgoingFrame {
+        dst,
+        protocol,
+        payload,
+        exclude_iface,
+    } in output.mesh
+    {
         tracing::debug!(
-            "mesh output: dst={:?} protocol={:?} payload={:?}",
+            "mesh output: dst={:?} protocol={:?} exclude_iface={:?} payload={:?}",
             dst,
             protocol,
+            exclude_iface,
             payload
         );
         let data = LinkFrameData {
@@ -411,7 +458,11 @@ async fn dispatch<Local: FrameIo>(
 
         match router.get_egress_interface(dst) {
             Some(EgressInterface::All) => {
-                for iface in interfaces.iter_mut() {
+                for (idx, iface) in interfaces.iter_mut().enumerate() {
+                    // Split-horizon: skip the interface a re-flood arrived on.
+                    if Some(idx) == exclude_iface {
+                        continue;
+                    }
                     iface.send(mac, &data).await?;
                 }
             }

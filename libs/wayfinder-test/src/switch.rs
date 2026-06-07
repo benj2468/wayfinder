@@ -183,6 +183,13 @@ where
         Ok(())
     }
 
+    /// The ids of every port currently attached to the switch, so callers can
+    /// install a [`TapConfig`] on each one (e.g. to observe all traffic
+    /// crossing the fabric).
+    pub fn port_ids(&self) -> Vec<PortId> {
+        self.ports.keys().copied().collect()
+    }
+
     /// Tap a port
     pub fn add_tap(&mut self, id: PortId, tap_config: TapConfig) -> Result<(), SwitchError> {
         let taps = self.taps.entry(id).or_default();

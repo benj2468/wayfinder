@@ -1,4 +1,6 @@
+use std::sync::Arc;
 use std::sync::Once;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use interfaces::frame::Mac;
@@ -6,12 +8,50 @@ use interfaces::link::LinkMetrics;
 use tracing_subscriber::EnvFilter;
 use wayfinder::config::{Config, LinkConfig};
 use wayfinder::{
-    EgressInterface,
+    DEFAULT_BATMAN_ETHER_TYPE, EgressInterface,
     batman::wire::{BATADV_IV_OGM, BatmanOgmPacket},
 };
 use zerocopy::IntoBytes;
 
+use crate::Direction;
 use crate::prelude::*;
+use crate::switch::TapConfig;
+
+/// True if `frame` is an on-the-wire BATMAN OGM: a `LinkFrame` whose protocol
+/// is the BATMAN EtherType and whose first payload byte is the OGM packet type.
+///
+/// Wire layout: `[dst:6][src:6][proto:2 BE][payload...]`, so the protocol is at
+/// offset 12 and the BATMAN sub-type tag is the first payload byte at offset 14.
+fn is_ogm_frame(frame: &[u8]) -> bool {
+    frame.len() > 14
+        && frame[12..14] == DEFAULT_BATMAN_ETHER_TYPE.to_be_bytes()
+        && frame[14] == BATADV_IV_OGM
+}
+
+/// Install a tap on every port of every switch in `harness` that counts each
+/// OGM frame entering the fabric (one count per transmission), returning the
+/// shared counter.  Counts only [`Direction::ToSwitch`] so each frame a node
+/// puts on the wire is tallied exactly once, regardless of fan-out.
+fn count_ogms(harness: &mut TestHarness) -> Arc<AtomicUsize> {
+    let counter = Arc::new(AtomicUsize::new(0));
+    for (_, switch) in harness.switches.iter_mut() {
+        for port in switch.port_ids() {
+            let counter = counter.clone();
+            switch
+                .add_tap(
+                    port,
+                    TapConfig::new(move |meta| {
+                        if meta.direction == Direction::ToSwitch && is_ogm_frame(meta.data) {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                        true
+                    }),
+                )
+                .unwrap();
+        }
+    }
+    counter
+}
 
 /// Build a raw OGM broadcast frame as it would appear on the wire after
 /// being transmitted by `src` with the given TQ and sequence number.
@@ -378,6 +418,56 @@ async fn three_routers_all_connected_discover_and_exchange() {
         harness.get_machine("machine2").local_deliveries().len(),
         1,
         "machine2 must not receive the unicast addressed to machine1"
+    );
+}
+
+/// After the mesh has converged, a single round of OGMs must propagate and
+/// then *stop*: each node forwards each `(originator, seqno)` at most once, so
+/// the fabric falls silent within a few ticks.  A forwarding loop — e.g.
+/// re-flooding an OGM back out the interface it arrived on, or re-forwarding a
+/// sequence number already seen — instead keeps OGMs circulating until their
+/// TTL drains (~50 hops), which this test catches as OGM traffic that never
+/// ceases.
+#[tokio::test]
+async fn ogms_stop_after_convergence() {
+    setup();
+    let mut harness = line_of_three();
+
+    // Converge, then drain every in-flight OGM from the initial poll so the
+    // fabric is quiet before we begin measuring.
+    harness.poll(Duration::from_secs(1)).await;
+    for _ in 0..80 {
+        harness.tick().await;
+    }
+    for (_, router) in harness.machines.iter() {
+        assert_eq!(router.router().originator_table().len(), 2);
+    }
+
+    // Watch every OGM that crosses the fabric from here on.
+    let counter = count_ogms(&mut harness);
+
+    // Emit one fresh OGM from every node.  In a loop-free mesh this single
+    // round reaches every node and then dies within the network diameter.
+    harness.poll(Duration::from_secs(2)).await;
+
+    // 4 ticks are the required number for the network to settle here
+    const SETTLE_TICKS: usize = 4;
+    for _ in 0..SETTLE_TICKS {
+        harness.tick().await;
+    }
+    let after_settle = counter.load(Ordering::Relaxed);
+
+    // ...after which the fabric must stay silent: with no new poll, a converged
+    // mesh has nothing left to forward.
+    const QUIET_TICKS: usize = 20;
+    for _ in 0..QUIET_TICKS {
+        harness.tick().await;
+    }
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        after_settle,
+        "OGMs must stop after a converged mesh floods one round; continued \
+         OGM traffic indicates a forwarding loop",
     );
 }
 
