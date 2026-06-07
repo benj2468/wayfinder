@@ -11,7 +11,7 @@
 //!   frame.  The sender address reported on receive is ignored.
 //! * **Encoding.**  A [`LinkFrame`] is arbitrary binary, but the RYLR `AT+SEND`
 //!   / `+RCV` protocol is line- and comma-delimited text.  Each frame's
-//!   `[src][dst][protocol][payload]` bytes are therefore hex-encoded on the
+//!   `[dst][src][protocol][payload]` bytes are therefore hex-encoded on the
 //!   wire (no commas or newlines), which the existing line reader parses safely.
 //!   Hex doubles the size, so a frame is at most [`MAX_FRAME_LEN`] bytes.
 //!
@@ -31,7 +31,7 @@ use crate::{LoraError, RylrClient};
 /// 6-byte destination `Mac`, never by this address.
 const RYLR_BROADCAST_ADDR: u16 = 0;
 
-/// Fixed link-frame header length: `src(6) + dst(6) + protocol(2)`.
+/// Fixed link-frame header length: `dst(6) + src(6) + protocol(2)`.
 const HEADER_LEN: usize = 14;
 
 /// Largest framed length (header + payload) we can put on air.  The module
@@ -49,13 +49,13 @@ where
             return Err(LinkError::BufferFull);
         }
 
-        // Hex-encode `[origin][dst][protocol][payload]` straight into the AT
-        // payload.  Protocol is native-endian, matching the `LinkFrame` wire
-        // convention used across the mesh.
+        // Hex-encode the Ethernet-shaped `LinkFrame` layout
+        // `[dst][src][protocol][payload]` straight into the AT payload.  Protocol
+        // is big-endian (network byte order), matching `LinkFrame`'s EtherType.
         let mut hex = heapless::String::<{ MAX_FRAME_LEN * 2 }>::new();
-        push_hex(&mut hex, origin.as_bytes())?;
         push_hex(&mut hex, data.dst.as_bytes())?;
-        push_hex(&mut hex, &data.protocol.to_ne_bytes())?;
+        push_hex(&mut hex, origin.as_bytes())?;
+        push_hex(&mut hex, &data.protocol.to_be_bytes())?;
         push_hex(&mut hex, data.payload)?;
 
         self.send_data(RYLR_BROADCAST_ADDR, &hex).await?;
@@ -189,7 +189,7 @@ mod tests {
         }
     }
 
-    /// `send` hex-encodes `[src][dst][protocol][payload]` and emits one
+    /// `send` hex-encodes `[dst][src][protocol][payload]` and emits one
     /// `AT+SEND` to the broadcast address, returning the framed byte length.
     #[tokio::test]
     async fn send_hex_encodes_frame_to_broadcast() {
@@ -209,9 +209,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(n, HEADER_LEN + payload.len());
-        // protocol 0x4305 is written native-endian (little-endian test host):
-        // bytes 05 43.
-        let hex = "0000000000010000000000020543dead";
+        // Ethernet-shaped layout `[dst][src][protocol big-endian][payload]`:
+        // dst=2, src=1, protocol 0x4305 → bytes 43 05.
+        let hex = "0000000000020000000000014305dead";
         let expected = format!("AT+SEND=0,{},{}\r\n", hex.len(), hex);
         assert_eq!(client.stream.outbound, expected.as_bytes());
     }
@@ -220,15 +220,16 @@ mod tests {
     /// radio's RSSI/SNR as link metrics.
     #[tokio::test]
     async fn recv_decodes_hex_frame_and_metrics() {
-        // src=3, dst=4, proto=0x4305 (LE bytes 05 43), payload=[0xca, 0xfe].
-        let hex = "0000000000030000000000040543cafe";
+        // Ethernet-shaped: dst=4, src=3, proto=0x4305 (BE bytes 43 05),
+        // payload=[0xca, 0xfe].
+        let hex = "0000000000040000000000034305cafe";
         let line = format!("+RCV=0,{},{},-50,7\r\n", hex.len(), hex);
         let mut client = RylrClient::new(FakeSerial::new(line.as_bytes())).unwrap();
 
         let received = client.recv().await.unwrap();
         assert_eq!(received.frame.src, mac(3));
         assert_eq!(received.frame.dst, mac(4));
-        assert_eq!({ received.frame.protocol }, 0x4305);
+        assert_eq!(received.frame.protocol.get(), 0x4305);
         assert_eq!(&received.frame.payload, &[0xca, 0xfe]);
         assert_eq!(received.metrics.rssi_dbm, Some(-50));
         assert_eq!(received.metrics.snr_db, Some(7));

@@ -46,6 +46,8 @@ embedded-io-adapters = { version = "0.6.1", features = ["tokio-1"] }
 async-trait = "0.1.89"
 dynosaur = "0.3.0"
 serde = { version = "1.0.228", features = ["derive"] }
+socket2 = { version = "0.6.3", features = ["all"] }
+libc = "0.2.186"
 
 [dependencies]
 serde.workspace = true

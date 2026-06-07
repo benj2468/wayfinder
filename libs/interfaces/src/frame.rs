@@ -1,5 +1,6 @@
 use core::fmt::Debug;
 use core::hash::Hash;
+use zerocopy::byteorder::network_endian::U16;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub trait MeshIdentifier:
@@ -84,13 +85,26 @@ impl MeshIdentifier for Mac {
     const BROADCAST: Self = Mac::BROADCAST;
 }
 
-/// A unified link-layer frame passed around your central router
+/// A unified link-layer frame passed around your central router.
+///
+/// The byte layout deliberately matches a real Ethernet frame —
+/// `[dst][src][ethertype][payload]` — so a raw L2 carrier (`AF_PACKET`) can
+/// reinterpret these bytes as an Ethernet frame with no conversion, and every
+/// other transport carries the identical shape.  Hence `dst` precedes `src` and
+/// `protocol` is stored big-endian (network byte order), exactly as an on-wire
+/// EtherType.  Use [`U16::get`]/[`U16::new`] to read or set it as a host `u16`.
 #[derive(FromBytes, KnownLayout, Immutable, IntoBytes)]
 #[repr(C, packed)]
 pub struct LinkFrame {
-    pub src: Mac,
+    /// Destination node MAC (or [`Mac::BROADCAST`]) — first on the wire, as in
+    /// Ethernet.
     pub dst: Mac,
-    pub protocol: u16, // Equivalent to EtherType (e.g., 0x4305 for BATMAN)
+    /// Source node MAC, stamped by the link layer on send.
+    pub src: Mac,
+    /// EtherType-style protocol identifier (e.g. `0x4305` for BATMAN), stored
+    /// big-endian to match a real Ethernet frame's type field.
+    pub protocol: U16,
+    /// Variable-length frame payload.
     pub payload: [u8],
 }
 

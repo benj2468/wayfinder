@@ -10,6 +10,7 @@
 //! available; the tokio event loop, the concrete `tokio::net` transports, and
 //! the link-building helpers are gated behind the (default) `tokio` feature.
 
+mod raw;
 mod snoop;
 mod transport;
 
@@ -25,6 +26,8 @@ mod net;
 pub use driver::Driver;
 #[cfg(feature = "tokio")]
 pub use net::build_udp_link;
+#[cfg(feature = "tokio")]
+pub use raw::{RawL2Link, build_raw_ip_link, build_raw_l2_link};
 #[cfg(feature = "tokio")]
 pub use transport::Link;
 // The mesh-interface trait now lives in `wayfinder`; re-export it (and the

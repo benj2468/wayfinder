@@ -18,7 +18,8 @@ use tun_rs::{DeviceBuilder, Layer};
 use wayfinder::config::{Config, LinkConfig, LocalDistributionMechanism, ServerConfig};
 use wayfinder::interfaces::frame::Mac;
 use wayfinder_driver::{
-    Driver, QueryRx, QueryTx, build_udp_link, run_tcp_server, run_udp_server, run_unix_server,
+    Driver, QueryRx, QueryTx, build_raw_ip_link, build_raw_l2_link, build_udp_link, run_tcp_server,
+    run_udp_server, run_unix_server,
 };
 
 use crate::tap::TapDevice;
@@ -72,6 +73,21 @@ async fn main() -> anyhow::Result<()> {
                 remote_addr,
             } => {
                 interfaces.push(build_udp_link(bind_addr, remote_addr, &mut join_set).await?);
+            }
+            LinkConfig::RawIp {
+                bind_addr,
+                remote_addr,
+                protocol,
+            } => {
+                interfaces.push(
+                    build_raw_ip_link(bind_addr, remote_addr, protocol, &mut join_set).await?,
+                );
+            }
+            LinkConfig::RawL2 {
+                interface,
+                ethertype,
+            } => {
+                interfaces.push(build_raw_l2_link(&interface, ethertype)?);
             }
             LinkConfig::Test { .. } => {
                 bail!("test links are only valid in the test harness, not the wayfinder-tap node")

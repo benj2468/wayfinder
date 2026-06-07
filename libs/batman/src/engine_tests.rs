@@ -19,12 +19,13 @@ fn mac(n: u8) -> Mac {
     Mac([0, 0, 0, 0, 0, n])
 }
 
-// Helper to create a LinkFrame from raw bytes
+// Helper to create a LinkFrame from raw bytes.  Ethernet-shaped layout:
+// [dst][src][protocol big-endian][payload].
 fn make_link_frame(src: u8, dst: u8, protocol: u16, payload: Vec<u8>) -> Vec<u8> {
     let mut data = Vec::new();
-    data.extend_from_slice(mac(src).as_bytes());
     data.extend_from_slice(mac(dst).as_bytes());
-    data.extend_from_slice(&protocol.to_ne_bytes());
+    data.extend_from_slice(mac(src).as_bytes());
+    data.extend_from_slice(&protocol.to_be_bytes());
     data.extend(payload);
     data
 }

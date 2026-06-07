@@ -2,6 +2,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::net::IpAddr;
 use core::net::Ipv4Addr;
 use core::net::SocketAddr;
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,28 @@ pub enum LinkConfig {
         bind_addr: SocketAddr,
         /// Remote peer the socket is connected to (send/recv target).
         remote_addr: SocketAddr,
+    },
+    /// Carry the link over a raw IP socket (`AF_INET`/`SOCK_RAW`), point-to-point
+    /// like [`Udp`](LinkConfig::Udp) but using an IP protocol number instead of
+    /// UDP ports.  Requires `CAP_NET_RAW`.
+    RawIp {
+        /// Local IP address the raw socket binds to.
+        bind_addr: IpAddr,
+        /// Remote peer the socket is connected to (send/recv target).
+        remote_addr: IpAddr,
+        /// IP protocol number carried in the IPv4 header's protocol field
+        /// (e.g. a value from the experimental/unassigned range).
+        protocol: u8,
+    },
+    /// Carry the link natively over a raw L2 packet socket (`AF_PACKET`) bound to
+    /// a NIC.  Our frames map directly onto Ethernet frames; multi-access, routed
+    /// by destination MAC.  Requires `CAP_NET_RAW`.
+    RawL2 {
+        /// Name of the network interface to bind to (e.g. `"eth0"`).
+        interface: String,
+        /// EtherType this interface filters received frames on and stamps onto
+        /// sent frames.
+        ethertype: u16,
     },
     /// Test Link, used for testing only, will fail validation in real mode
     Test { switch_name: String },

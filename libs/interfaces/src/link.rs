@@ -24,6 +24,7 @@ pub enum LinkError {
 /// `quality` directly; the engine prefers that when present and otherwise
 /// derives one from `rssi_dbm` / `snr_db`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(C)]
 pub struct LinkMetrics {
     /// Received signal strength of the frame in dBm.  Typical LoRa range is
     /// roughly `-130..=-30` and lower values indicate weaker signal.

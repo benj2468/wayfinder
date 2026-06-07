@@ -22,6 +22,7 @@ use interfaces::{
 /// highest-quality interface (see `CentralRouter::handle_frame_with_metrics`).
 /// A carrier with no signal information (a wired pipe, an in-process channel)
 /// reports [`LinkMetrics::default`]; a radio fills in RSSI/SNR/quality.
+#[repr(C)]
 pub struct Received<'a> {
     /// The parsed link-layer frame, borrowed from the interface's receive
     /// buffer.  Valid until the next receive on the same interface.

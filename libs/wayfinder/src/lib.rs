@@ -147,7 +147,7 @@ impl CentralRouter {
     ) -> RxOutcome<'rx, 'tx> {
         let src = frame.src;
         let dst = frame.dst;
-        let protocol = frame.protocol;
+        let protocol = frame.protocol.get();
         let span = tracing::trace_span!("handle_frame", iface_idx, ?src, ?dst, ?protocol);
         let _enter = span.enter();
         tracing::trace!("{}", pretty_hex(&&frame.payload));
@@ -163,7 +163,7 @@ impl CentralRouter {
         // 1. Add a record to the identifier table
         self.ident_table.add_record(iface_idx, frame.dst);
         // 2. Demux by Protocol ID
-        match frame.protocol {
+        match frame.protocol.get() {
             DEFAULT_BATMAN_ETHER_TYPE => {
                 let mut reply: LinkFrameDataMut<'_> = tx_buf.into();
 
@@ -504,12 +504,12 @@ mod cp2_local_delivery {
         Mac([0, 0, 0, 0, 0, n])
     }
 
-    /// Serialise a `LinkFrame` ([src][dst][proto NE][payload]).
+    /// Serialise a `LinkFrame`, Ethernet-shaped: `[dst][src][proto BE][payload]`.
     fn link_frame_bytes(src: u8, dst: u8, payload: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();
-        v.extend_from_slice(mac(src).as_bytes());
         v.extend_from_slice(mac(dst).as_bytes());
-        v.extend_from_slice(&ETH_P_BATMAN.to_ne_bytes());
+        v.extend_from_slice(mac(src).as_bytes());
+        v.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
         v.extend_from_slice(payload);
         v
     }
@@ -620,12 +620,12 @@ mod mcast_forwarding {
         Mac([0x01, 0x00, 0x5e, 0x00, 0x00, n])
     }
 
-    /// Serialise a `LinkFrame` ([src][dst][proto NE][payload]).
+    /// Serialise a `LinkFrame`, Ethernet-shaped: `[dst][src][proto BE][payload]`.
     fn link_frame_bytes(src: Mac, dst: Mac, payload: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();
-        v.extend_from_slice(src.as_bytes());
         v.extend_from_slice(dst.as_bytes());
-        v.extend_from_slice(&ETH_P_BATMAN.to_ne_bytes());
+        v.extend_from_slice(src.as_bytes());
+        v.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
         v.extend_from_slice(payload);
         v
     }

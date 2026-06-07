@@ -93,7 +93,7 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
     ) -> RoutingAction {
         let src = frame.src;
         let dst = frame.dst;
-        let protocol = frame.protocol;
+        let protocol = frame.protocol.get();
 
         tracing::trace!(
             "handling src = {:?}, dest = {:?}, proto = {:?}, payload_len = {:?}",
@@ -104,7 +104,7 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
         );
 
         // Core protocol routing filter
-        if frame.protocol != ETH_P_BATMAN || frame.payload.is_empty() {
+        if frame.protocol.get() != ETH_P_BATMAN || frame.payload.is_empty() {
             return RoutingAction::Consumed;
         }
 

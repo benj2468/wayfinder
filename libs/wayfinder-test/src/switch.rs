@@ -227,7 +227,7 @@ where
                 taps.retain(|t| !t.invalid);
             }
             for msg in msgs {
-                let source = match Ident::ref_from_prefix(msg.as_slice()) {
+                let source = match Ident::ref_from_prefix(&msg[size_of::<Ident>()..]) {
                     Ok((source, _)) => source,
                     Err(e) => {
                         tracing::warn!("unable to parse message as ident: {:?}", e);
@@ -250,7 +250,7 @@ where
                     continue;
                 }
 
-                let Ok((dest, _)) = Ident::ref_from_prefix(&msg[size_of::<Ident>()..]) else {
+                let Ok((dest, _)) = Ident::ref_from_prefix(&msg) else {
                     continue;
                 };
 
@@ -320,8 +320,8 @@ mod tests {
     fn make_frame(src: u8, dst: u8) -> Vec<u8> {
         use zerocopy::IntoBytes;
         let mut data = Vec::new();
-        data.extend_from_slice(src.as_bytes());
         data.extend_from_slice(dst.as_bytes());
+        data.extend_from_slice(src.as_bytes());
         data
     }
 

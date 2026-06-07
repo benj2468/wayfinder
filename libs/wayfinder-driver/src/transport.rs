@@ -86,20 +86,19 @@ impl<Io: FrameIo> Link<Io> {
     }
 
     /// Serialize `origin` + `data` into `self.buffer`, returning the framed
-    /// length.  Wire layout: `[src: Mac][dst: Mac][protocol: u16
-    /// native-endian][payload]`.
+    /// length.  Wire layout is the Ethernet-shaped [`LinkFrame`] layout:
+    /// `[dst: Mac][src: Mac][protocol: u16 big-endian][payload]`.
     fn frame_into_buffer(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> usize {
         let mut idx = 0;
-        self.buffer[0..size_of::<Mac>()].copy_from_slice(origin.as_bytes());
+        self.buffer[0..size_of::<Mac>()].copy_from_slice(data.dst.as_bytes());
         idx += size_of::<Mac>();
 
-        self.buffer[idx..(idx + size_of::<Mac>())].copy_from_slice(data.dst.as_bytes());
+        self.buffer[idx..(idx + size_of::<Mac>())].copy_from_slice(origin.as_bytes());
         idx += size_of::<Mac>();
 
-        // Protocol is stored and compared native-endian throughout (matching
-        // `LinkFrame`'s zerocopy reads and the engine's EtherType constants),
-        // so write the native bytes — not big-endian.
-        self.buffer[idx..(idx + size_of::<u16>())].copy_from_slice(data.protocol.as_bytes());
+        // `LinkFrame::protocol` is a big-endian (network byte order) EtherType,
+        // so write the protocol in network order.
+        self.buffer[idx..(idx + size_of::<u16>())].copy_from_slice(&data.protocol.to_be_bytes());
         idx += size_of::<u16>();
 
         self.buffer[idx..(idx + data.payload.len())].copy_from_slice(data.payload);
@@ -198,7 +197,7 @@ mod tests {
         let frame = LinkFrame::ref_from_bytes(&datagrams[0]).unwrap();
         assert_eq!(frame.src, mac(1));
         assert_eq!(frame.dst, mac(2));
-        assert_eq!({ frame.protocol }, 0x4305);
+        assert_eq!(frame.protocol.get(), 0x4305);
         assert_eq!(&frame.payload, &payload);
     }
 
@@ -208,10 +207,11 @@ mod tests {
     async fn link_recv_yields_frame_with_default_metrics() {
         let io = FakeIo::default();
         // Preload one frame: src=3, dst=4, proto=0x4305, payload=[1,2,3].
+        // Ethernet-shaped layout: [dst][src][protocol big-endian][payload].
         let mut raw = Vec::new();
-        raw.extend_from_slice(mac(3).as_bytes());
         raw.extend_from_slice(mac(4).as_bytes());
-        raw.extend_from_slice(&0x4305u16.to_ne_bytes());
+        raw.extend_from_slice(mac(3).as_bytes());
+        raw.extend_from_slice(&0x4305u16.to_be_bytes());
         raw.extend_from_slice(&[1, 2, 3]);
         io.inbound.lock().unwrap().push_back(raw);
 
@@ -280,10 +280,11 @@ mod tests {
 
         async fn recv(&mut self) -> Result<Received<'_>, LinkError> {
             self.last_frame = {
+                // Ethernet-shaped: [dst][src][protocol big-endian].
                 let mut raw = Vec::new();
-                raw.extend_from_slice(mac(7).as_bytes());
                 raw.extend_from_slice(mac(8).as_bytes());
-                raw.extend_from_slice(&0x4305u16.to_ne_bytes());
+                raw.extend_from_slice(mac(7).as_bytes());
+                raw.extend_from_slice(&0x4305u16.to_be_bytes());
                 raw
             };
             let frame = LinkFrame::ref_from_bytes(&self.last_frame).map_err(|_| LinkError::Io)?;

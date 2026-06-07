@@ -37,22 +37,23 @@ use crate::switch::PortComms;
 /// not by this field — but a real-looking IPv4 type keeps captures legible.
 ///
 /// [`send_local`]: TestRouter::send_local
-const HOST_ETHERTYPE: [u8; 2] = [0x08, 0x00];
+const HOST_ETHERTYPE: [u8; 2] = [0x00, 0x08];
 
 // ── wire-format helpers ───────────────────────────────────────────────────────
 
 /// Serialize a `LinkFrame` into a heap-allocated byte vector.
 ///
-/// Wire layout (matches `#[repr(C, packed)]` of `LinkFrame`):
+/// Wire layout (matches `#[repr(C, packed)]` of `LinkFrame`, which is
+/// Ethernet-shaped):
 /// ```text
-/// [src: Mac][dst: Mac][protocol: u16 native-endian][payload ...]
+/// [dst: Mac][src: Mac][protocol: u16 big-endian][payload ...]
 /// ```
 pub fn build_frame(src: Mac, dst: Mac, protocol: u16, payload: &[u8]) -> Vec<u8> {
     let ident_size = core::mem::size_of::<Mac>();
     let mut bytes = Vec::with_capacity(ident_size * 2 + 2 + payload.len());
-    bytes.extend_from_slice(src.as_bytes());
     bytes.extend_from_slice(dst.as_bytes());
-    bytes.extend_from_slice(&protocol.to_ne_bytes());
+    bytes.extend_from_slice(src.as_bytes());
+    bytes.extend_from_slice(&protocol.to_be_bytes());
     bytes.extend_from_slice(payload);
     bytes
 }
