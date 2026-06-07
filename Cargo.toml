@@ -14,6 +14,7 @@ members = [
     "libs/wayfinder-driver",
     "libs/wayfinder-test",
     "bins/wayfinder-tap",
+    "bins/wayfinder-tui",
 ]
 
 [workspace.dependencies]
