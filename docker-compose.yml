@@ -59,9 +59,51 @@ services:
       RUST_LOG: trace
     networks:
       - link_bc
+      - link_ce
+      - link_cd
+  node4:
+    !!merge <<: *node
+    container_name: wf-node4
+    hostname: node4
+    environment:
+      NODE_IP: 10.0.0.4
+      RUST_LOG: trace
+    networks:
+      - link_cd
+      - link_df
+  node5:
+    !!merge <<: *node
+    container_name: wf-node5
+    hostname: node5
+    environment:
+      NODE_IP: 10.0.0.5
+      RUST_LOG: trace
+    networks:
+      - link_ce
+      - link_ef
+  node6:
+    !!merge <<: *node
+    container_name: wf-node6
+    hostname: node6
+    environment:
+      NODE_IP: 10.0.0.6
+      RUST_LOG: trace
+    networks:
+      - link_df
+      - link_ef
 # Two separate bridge segments. node2 straddles both; 1 and 3 are isolated.
 networks:
   link_ab:
     driver: bridge
   link_bc:
+    driver: bridge
+  link_cd:
+    driver: bridge
+  link_ce:
+    driver: bridge
+  link_de:
+    driver: bridge
+  link_ef:
+    driver: bridge
+  link_df:
     driver: bridge
