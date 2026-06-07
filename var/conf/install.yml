@@ -1,8 +1,16 @@
-tap:
+local_egress:
+  type: Tap
   device_name: wayfinder0
   ip_address: 10.0.0.1
   netmask: 255.255.255.0
+server:
+  type: Tcp
+  addr: 0.0.0.0:7700
 links:
-  - type: Udp
-    bind_addr: 127.0.0.1:9191
-    remote_addr: 127.0.0.1:9192
+  - type: RawL2
+    interface: tailscale0
+    # Wire EtherType for this mesh's frames — a free-choice transport label the
+    # AF_PACKET socket binds/filters on. Decoupled from the router's mesh
+    # protocol (carried inside the frame), so any value works; pick one that
+    # isolates this mesh from other L2 traffic on the segment.
+    ethertype: 0xfafa

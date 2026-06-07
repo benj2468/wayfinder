@@ -422,7 +422,7 @@ impl CentralRouter {
     ///    observed for `dest` itself.
     /// 4. If no quality data exists yet, fall back to the legacy
     ///    last-seen [`IdentTable`] entry.
-    #[tracing::instrument(skip(self), ret)]
+    #[tracing::instrument(skip(self))]
     pub fn get_egress_interface(&mut self, dest: Mac) -> Option<EgressInterface> {
         if dest == Mac::BROADCAST {
             return Some(EgressInterface::All);

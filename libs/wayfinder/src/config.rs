@@ -78,8 +78,9 @@ pub struct TapConfig {
 
 /// Configuration for the local host facing Distribution Mechanism
 #[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type")]
 pub enum LocalDistributionMechanism {
-    Tap { tap: TapConfig },
+    Tap(TapConfig),
 }
 
 /// Top-level configuration loaded from the YAML config file.

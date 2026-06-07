@@ -10,12 +10,16 @@
 //!   send and (on Linux) *delivers* it on recv, so the bridge strips it back off
 //!   before handing the frame up.
 //! * **Raw L2** ([`RawL2Link`]) is a native multi-access interface: an
-//!   `AF_PACKET`/`SOCK_RAW` socket bound to one NIC.  Because [`LinkFrame`] is
-//!   already Ethernet-shaped (`[dst][src][ethertype][payload]`, big-endian type),
-//!   our frame *is* the Ethernet frame: send serializes a `LinkFrame` straight
-//!   onto the wire and recv reinterprets the received bytes as a `LinkFrame` with
-//!   no conversion.  It implements [`LinkT`] directly and routes each frame by
-//!   its destination MAC.
+//!   `AF_PACKET`/`SOCK_RAW` socket bound to one NIC.  The wire frame is the
+//!   Ethernet-shaped `[dst][src][ethertype][payload]`, but the **EtherType** is a
+//!   configurable *transport label* (the value the socket binds/filters on, e.g.
+//!   `0xfafa`), distinct from the **mesh protocol** the router demuxes on (e.g.
+//!   BATMAN `0x4305`).  Send stamps the configured EtherType; recv retags that
+//!   field back to the mesh protocol in place (a 2-byte rewrite, no overhead) so
+//!   the bytes reinterpret as a [`LinkFrame`].  This lets a deployment pick any
+//!   EtherType — to isolate co-located meshes, or to coexist with real batman-adv
+//!   — without being forced onto the router's protocol number.  It implements
+//!   [`LinkT`] directly and routes each frame by its destination MAC.
 //!
 //! [`transport`]: crate::transport
 //! [`Link`]: crate::transport::Link
@@ -26,23 +30,42 @@ use interfaces::{
 };
 use zerocopy::FromBytes;
 
-/// Length of the [`LinkFrame`]/Ethernet header: `[dst: 6][src: 6][ethertype: 2]`.
+/// Length of the Ethernet header preceding the payload: `[dst: 6][src: 6][ethertype: 2]`.
 const ETH_HEADER_LEN: usize = 14;
 
-/// Serialize `origin` + `data` as a [`LinkFrame`] (i.e. an Ethernet frame) into
-/// `buf`, returning its length.
+/// Byte offset of the EtherType field within the Ethernet header, i.e. just
+/// past the destination and source MACs.  This is the same offset as
+/// [`LinkFrame::protocol`], which is what lets the receive side retag the field
+/// in place (see [`retag_ethertype`]).
+const ETHERTYPE_OFFSET: usize = 12;
+
+/// Serialize `origin` + `data` as an Ethernet frame into `buf`, returning its
+/// length.
 ///
-/// Wire layout `[dst: Mac][src: Mac][ethertype: u16 big-endian][payload]`.  Since
-/// [`LinkFrame`] is defined with exactly this layout, the result is both a valid
-/// `LinkFrame` and a valid Ethernet frame — no separate conversion is needed on
-/// the receive side, which simply reinterprets the bytes via
-/// [`LinkFrame::ref_from_bytes`].
-fn frame_into_buf(origin: Mac, data: &LinkFrameData<'_>, buf: &mut [u8]) -> usize {
+/// Wire layout `[dst: Mac][src: Mac][ethertype: u16 BE][payload]` — identical to
+/// the [`LinkFrame`] layout, but the EtherType stamped is the link's configured
+/// wire `ethertype` (a transport label the `AF_PACKET` socket binds/filters on,
+/// e.g. `0xfafa`), *not* `data.protocol`.  The mesh protocol the router demuxes
+/// on (e.g. BATMAN `0x4305`) is restored on the receive side by [`retag_ethertype`],
+/// so a deployment can pick any wire EtherType with no per-frame overhead.
+fn frame_into_buf(origin: Mac, ethertype: u16, data: &LinkFrameData<'_>, buf: &mut [u8]) -> usize {
     buf[0..6].copy_from_slice(&data.dst.0);
     buf[6..12].copy_from_slice(&origin.0);
-    buf[12..14].copy_from_slice(&data.protocol.to_be_bytes());
-    buf[ETH_HEADER_LEN..ETH_HEADER_LEN + data.payload.len()].copy_from_slice(data.payload);
-    ETH_HEADER_LEN + data.payload.len()
+    buf[ETHERTYPE_OFFSET..ETH_HEADER_LEN].copy_from_slice(&ethertype.to_be_bytes());
+    let end = ETH_HEADER_LEN + data.payload.len();
+    buf[ETH_HEADER_LEN..end].copy_from_slice(data.payload);
+    end
+}
+
+/// Rewrite a received frame's EtherType field to `protocol`, in place.
+///
+/// The wire EtherType is a transport label the router does not understand; the
+/// mesh protocol it demuxes on is a fixed property of the link (BATMAN here).
+/// Because the EtherType field sits at the same offset as [`LinkFrame::protocol`],
+/// overwriting those two bytes turns the received Ethernet frame into a
+/// [`LinkFrame`] the router can demux, with no copy and no length change.
+fn retag_ethertype(buf: &mut [u8], protocol: u16) {
+    buf[ETHERTYPE_OFFSET..ETH_HEADER_LEN].copy_from_slice(&protocol.to_be_bytes());
 }
 
 /// Offset of the payload within a raw IPv4 datagram as delivered by an
@@ -83,6 +106,7 @@ mod tokio_impl {
     use tokio::task::JoinSet;
 
     use crate::transport::Link;
+    use wayfinder::DEFAULT_BATMAN_ETHER_TYPE;
     use wayfinder::link::{DynLinkT, LinkT, Received};
 
     /// `SOL_PACKET` setsockopt level (not exported by `libc` on all targets).
@@ -174,7 +198,7 @@ mod tokio_impl {
     }
 
     /// A native raw-L2 mesh interface: an `AF_PACKET`/`SOCK_RAW` socket bound to
-    /// one NIC, mapping our frames directly onto Ethernet frames.
+    /// one NIC, carrying mesh frames under a configurable wire EtherType.
     ///
     /// Multi-access: [`send`](LinkT::send) addresses each frame by its
     /// destination MAC via `sendto`, so one socket reaches every peer on the
@@ -185,11 +209,19 @@ mod tokio_impl {
         fd: AsyncFd<Socket>,
         /// Kernel index of the bound interface, used to address outbound frames.
         ifindex: u32,
-        /// EtherType this interface filters on / stamps onto sent frames.
+        /// Wire EtherType this interface binds/filters on and stamps onto sent
+        /// frames.  A transport label, kept independent of the mesh protocol the
+        /// router demuxes on (see [`frame_into_buf`]).
         ethertype: u16,
-        /// Scratch buffer holding the Ethernet/[`LinkFrame`] bytes most recently
-        /// sent or received off the wire.  Received bytes are reinterpreted in
-        /// place as a [`LinkFrame`], so no second buffer is needed.
+        /// Mesh protocol this link carries — the value written into
+        /// [`LinkFrame::protocol`] on receive so the router demuxes the frame
+        /// (BATMAN's EtherType).  This is what decouples the wire `ethertype`
+        /// from the router: the link translates between the two.
+        mesh_protocol: u16,
+        /// Scratch buffer holding the Ethernet bytes most recently sent or
+        /// received off the wire.  On receive the EtherType is retagged in place
+        /// to `mesh_protocol` (see [`retag_ethertype`]), yielding a [`LinkFrame`]
+        /// with no copy, so no second buffer is needed.
         wire_buf: [u8; 1514],
     }
 
@@ -199,7 +231,7 @@ mod tokio_impl {
             origin: Mac,
             data: &LinkFrameData<'_>,
         ) -> Result<usize, LinkError> {
-            let n = frame_into_buf(origin, data, &mut self.wire_buf);
+            let n = frame_into_buf(origin, self.ethertype, data, &mut self.wire_buf);
             let addr = link_sockaddr(self.ifindex, self.ethertype, Some(data.dst));
             async_send_to(&self.fd, &self.wire_buf[..n], &addr)
                 .await
@@ -217,8 +249,13 @@ mod tokio_impl {
                     tracing::error!("raw-l2 recv failed: {e:?}");
                     LinkError::Io
                 })?;
-            // `LinkFrame` is Ethernet-shaped, so the received bytes are already a
-            // valid frame — reinterpret them with no conversion.
+            if n < ETH_HEADER_LEN {
+                return Err(LinkError::InvalidPacket);
+            }
+            // The wire EtherType is a transport label; retag it to this link's
+            // mesh protocol so the bytes reinterpret as a `LinkFrame` the router
+            // can demux — in place, no copy.
+            retag_ethertype(&mut self.wire_buf, self.mesh_protocol);
             let frame = LinkFrame::ref_from_bytes(&self.wire_buf[..n])
                 .map_err(|_| LinkError::InvalidPacket)?;
             // AF_PACKET carries no physical-layer signal information.
@@ -231,6 +268,10 @@ mod tokio_impl {
 
     /// Build a native raw-L2 mesh link bound to `interface`, filtering and
     /// stamping `ethertype`, type-erased as a [`LinkT`].
+    ///
+    /// `ethertype` is the wire transport label only; the link carries BATMAN and
+    /// presents [`DEFAULT_BATMAN_ETHER_TYPE`] to the router on receive, so any
+    /// `ethertype` works without being forced onto the router's protocol number.
     ///
     /// Requires `CAP_NET_RAW` (or root).  The socket ignores its own outgoing
     /// frames where the kernel supports it, so a frame this node transmits is not
@@ -266,6 +307,7 @@ mod tokio_impl {
             fd: AsyncFd::new(socket)?,
             ifindex,
             ethertype,
+            mesh_protocol: DEFAULT_BATMAN_ETHER_TYPE,
             wire_buf: [0u8; 1514],
         };
         Ok(DynLinkT::new_box(link))
@@ -346,18 +388,20 @@ mod tests {
         Mac([0, 0, 0, 0, 0, n])
     }
 
-    /// `frame_into_buf` lays down a genuine Ethernet frame: destination first,
-    /// then source, then the EtherType **big-endian**, then the payload — which
-    /// is exactly the `LinkFrame` layout.
+    /// `frame_into_buf` lays down a genuine Ethernet frame: destination, source,
+    /// the configurable **wire EtherType** (big-endian), then the payload.  The
+    /// stamped EtherType is the configured transport label, *not* `data.protocol`
+    /// — there is no per-frame overhead.
     #[test]
-    fn frame_into_buf_writes_ethernet_layout() {
+    fn frame_into_buf_stamps_configured_ethertype() {
         let mut buf = [0u8; 64];
         let payload = [0xde, 0xad, 0xbe, 0xef];
         let n = frame_into_buf(
             mac(1),
+            0xfafa, // configured wire EtherType (a transport label)
             &LinkFrameData {
                 dst: mac(2),
-                protocol: 0x4305,
+                protocol: 0x4305, // mesh protocol — NOT what goes on the wire
                 payload: &payload,
             },
             &mut buf,
@@ -365,19 +409,21 @@ mod tests {
         assert_eq!(n, ETH_HEADER_LEN + payload.len());
         assert_eq!(&buf[0..6], &mac(2).0); // Ethernet destination
         assert_eq!(&buf[6..12], &mac(1).0); // Ethernet source
-        assert_eq!(&buf[12..14], &[0x43, 0x05]); // EtherType, big-endian
+        assert_eq!(&buf[12..14], &[0xfa, 0xfa]); // wire EtherType = configured label
         assert_eq!(&buf[14..n], &payload);
     }
 
-    /// The bytes `frame_into_buf` produces reinterpret directly as the same
-    /// `LinkFrame` — the zero-copy recv path the raw-L2 link relies on, with no
-    /// MAC swap or endian conversion.
+    /// A frame sent under a custom wire EtherType retags on receive into a
+    /// `LinkFrame` whose `protocol` is the *mesh* protocol (not the wire
+    /// EtherType), so the router demuxes it correctly even though the wire
+    /// carried an arbitrary EtherType — and with no length change.
     #[test]
-    fn frame_into_buf_reinterprets_as_link_frame() {
+    fn custom_ethertype_retags_to_mesh_protocol() {
         let mut wire = [0u8; 64];
         let payload = [1, 2, 3, 4, 5];
         let n = frame_into_buf(
             mac(7),
+            0xfafa,
             &LinkFrameData {
                 dst: mac(8),
                 protocol: 0x4305,
@@ -385,12 +431,40 @@ mod tests {
             },
             &mut wire,
         );
+        // On the wire the EtherType is the configured carrier, not 0x4305.
+        assert_eq!(&wire[12..14], &[0xfa, 0xfa]);
 
+        // Receive side: retag the EtherType to the mesh protocol in place.
+        retag_ethertype(&mut wire, 0x4305);
         let frame = LinkFrame::ref_from_bytes(&wire[..n]).unwrap();
         assert_eq!(frame.src, mac(7));
         assert_eq!(frame.dst, mac(8));
-        assert_eq!(frame.protocol.get(), 0x4305);
+        assert_eq!(frame.protocol.get(), 0x4305); // mesh protocol restored for demux
         assert_eq!(&frame.payload, &payload);
+    }
+
+    /// Retagging is correct for an empty payload (the minimum-length frame),
+    /// leaving just `[dst][src][protocol]`.
+    #[test]
+    fn retag_handles_empty_payload() {
+        let mut wire = [0u8; 32];
+        let n = frame_into_buf(
+            mac(3),
+            0x88b5,
+            &LinkFrameData {
+                dst: mac(4),
+                protocol: 0x4305,
+                payload: &[],
+            },
+            &mut wire,
+        );
+        assert_eq!(n, ETH_HEADER_LEN);
+        retag_ethertype(&mut wire, 0x4305);
+        let frame = LinkFrame::ref_from_bytes(&wire[..n]).unwrap();
+        assert_eq!(frame.dst, mac(4));
+        assert_eq!(frame.src, mac(3));
+        assert_eq!(frame.protocol.get(), 0x4305);
+        assert!(frame.payload.is_empty());
     }
 
     /// A minimal (no-options) IPv4 header is 20 bytes, so the payload begins at

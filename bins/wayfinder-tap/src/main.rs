@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
     let mut join_set: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
     // This binary's local egress is a kernel TAP; reject any other mechanism.
-    let LocalDistributionMechanism::Tap { tap } = match config.local_egress {
+    let LocalDistributionMechanism::Tap(tap) = match config.local_egress {
         Some(mechanism) => mechanism,
         None => bail!("config.local_egress must be a TAP for the wayfinder-tap node"),
     };
