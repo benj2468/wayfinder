@@ -1,0 +1,15 @@
+# Python tooling config for the repo's integration/component test suite.
+#
+# These are black-box tests that drive real built artifacts (e.g. the Wayfinder
+# Wireshark Lua dissector via tshark), complementing the per-crate Rust unit
+# tests. Each component keeps its tests next to its code in `libs/<crate>/tests/`;
+# pytest discovers them automatically from the `libs` tree.
+#
+# Run them from the repo root with `pytest` (the dev shell provides pytest and
+# tshark): `nix develop .#pytest --command pytest`.
+[tool.pytest.ini_options]
+# Recurse the crate tree; any libs/<crate>/tests/test_*.py is picked up.
+testpaths = ["libs"]
+# importlib mode means test modules need not have globally-unique filenames, so
+# two crates can each have e.g. tests/test_wire.py without colliding.
+addopts = "-ra --import-mode=importlib"

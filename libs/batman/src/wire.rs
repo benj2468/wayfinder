@@ -26,6 +26,7 @@ pub struct BatmanOgmPacket {
     pub seqno: u32,
     /// The node that originally generated this message.
     pub orig: Mac,
+    // TODO(bjc) Do we need this field? I would expect NO considering this will be in the Link Frame.
     /// The immediate neighbor who relayed it to us.
     pub prev_sender: Mac,
     /// Reserved padding byte, matching the batman-adv layout; sent as 0.

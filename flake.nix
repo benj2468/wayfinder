@@ -44,6 +44,11 @@
               "llvm-tools-preview"
             ]
           );
+
+          # Python interpreter with the integration-test deps (pytest). Used by
+          # both the default dev shell and the lightweight `pytest` shell that
+          # CI runs — see tests/README.md and .gitlab-ci.yml.
+          pytestEnv = pkgs.python3.withPackages (ps: with ps; [ pytest ]);
         in
         {
           _module.args.pkgs = import inputs.nixpkgs {
@@ -55,7 +60,7 @@
 
           pre-commit.settings.hooks.treefmt.enable = true;
 
-          devShells.default = pkgs.mkShell {
+          devShells.default = pkgs.mkShell.override { stdenv = pkgs.clangStdenv; } {
             packages = with pkgs; [
               nil
               nixd
@@ -64,15 +69,17 @@
               cargo-machete
               cargo-llvm-cov
               rust-analyzer
-              python3
+              pytestEnv
               python312Packages.virtualenv
               socat
               protobuf
               buf
-              wireshark
+              tshark
             ];
 
-            nativeBuildInputs = with pkgs; [ protobuf ];
+            nativeBuildInputs = with pkgs; [
+              protobuf
+            ];
 
             shellHook = ''
               ${config.pre-commit.installationScript}
@@ -83,6 +90,15 @@
 
               PYTHONPATH=training:$PYTHONPATH
             '';
+          };
+
+          # Minimal shell for running the pytest integration suite (CI uses
+          # this so it gets python + tshark without building the Rust toolchain).
+          devShells.pytest = pkgs.mkShell {
+            packages = [
+              pytestEnv
+              pkgs.tshark
+            ];
           };
 
           pre-commit = {
@@ -97,6 +113,8 @@
               buf.enable = true;
               yamlfmt.enable = true;
               dockerfmt.enable = true;
+              shellcheck.enable = true;
+              stylua.enable = true;
             };
           };
         };

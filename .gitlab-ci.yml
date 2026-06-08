@@ -70,7 +70,7 @@ build:
   script:
     - cargo build --workspace
     - cargo clippy --workspace
-test:run:
+test:run:rust:
   stage: test
   image: $CI_REGISTRY_IMAGE_TAG
   needs:
@@ -88,6 +88,20 @@ test:run:
       coverage_report:
         path: coverage.xml
         coverage_format: cobertura
+test:run:python:
+  stage: test
+  image: nixos/nix
+  needs:
+    - build
+  script:
+    - nix --extra-experimental-features "nix-command flakes" develop -c pytest
+test:run:
+  stage: test
+  needs:
+    - test:run:rust
+    - test:run:python
+  script:
+    - echo "Test Completed"
 deploy-dev:
   stage: deploy
   needs:

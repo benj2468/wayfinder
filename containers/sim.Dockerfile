@@ -45,25 +45,38 @@ RUN apt-get update \
         iproute2 \
         iputils-ping \
         procps \
+        tshark \
+        termshark \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/wayfinder-tap /usr/local/bin/wayfinder-tap
 COPY --from=builder /app/target/release/wayfinder-tui /usr/local/bin/wayfinder-tui
 
+# Wayfinder Lua dissector: lets tshark/termshark decode the BATMAN OGM frames
+# flowing over the RawL2 segments (EtherType 0x4305). Installed into tshark's
+# global Lua plugin directory — queried at build time so it stays correct
+# across Wireshark versions/arches — so every tshark/termshark run loads it.
+COPY libs/wayfinder-shark/wayfinder.lua /tmp/wayfinder.lua
+RUN dir="$(tshark -G folders | awk -F'\t' '/Global Lua Plugins/ {print $NF}')" \
+    && mkdir -p "$dir" \
+    && mv /tmp/wayfinder.lua "$dir/wayfinder.lua" \
+    && echo "wayfinder-sim: installed wayfinder.lua -> $dir"
+
 # Entrypoint: render the node config from env + discovered NICs, then exec the
 # node. Generated inline (heredoc) so nothing needs to be COPY'd from the
 # .dockerignore-excluded containers/ directory.
 #
-# The RawL2 EtherType is a free-choice wire transport label, decoupled from the
-# mesh protocol the router demuxes on (carried inside the frame). 0xfafa here
-# exercises that decoupling — a non-default value still routes correctly.
+# The RawL2 EtherType labels the wire transport; it is decoupled from the mesh
+# protocol the router demuxes on (carried inside the frame). It defaults to
+# 0x4305 (ETH_P_BATMAN) so the bundled Wireshark Lua dissector, which hooks the
+# `ethertype` table at 0x4305, decodes the OGM frames out of the box.
 RUN cat > /usr/local/bin/entrypoint.sh <<'EOF' && chmod +x /usr/local/bin/entrypoint.sh
 #!/bin/sh
 set -eu
 
 NODE_IP="${NODE_IP:-10.0.0.1}"
 NETMASK="${NETMASK:-255.255.255.0}"
-ETHERTYPE="${ETHERTYPE:-0xfafa}"
+ETHERTYPE="${ETHERTYPE:-0x4305}"
 SERVER_ADDR="${SERVER_ADDR:-0.0.0.0:7700}"
 CFG=/etc/wayfinder/config.yml
 
