@@ -18,12 +18,78 @@ use crate::{
 impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
     /// Actively queries the BATMAN routing table for a given destination.
     /// Returns the immediate next-hop MAC address if a route exists.
+    ///
+    /// This returns the cached `best_next_hop`, kept current by the periodic
+    /// [`purge_stale`](Self::purge_stale) sweep.  Forwarding decisions on the
+    /// receive hot path use the time-aware [`next_hop`](Self::next_hop) instead,
+    /// which additionally ignores paths that have gone stale since the last
+    /// sweep.
     pub fn lookup_route(&self, destination: Mac) -> Option<Mac> {
         // Look up the final target node in our calculated originator records
         self.originator_table
             .iter()
             .find(|record| record.neighbor_ident == destination)
             .map(|record| record.best_next_hop)
+    }
+
+    /// The best next hop toward `destination` *as of `now`*, ignoring any path
+    /// not refreshed within [`ORIGINATOR_TIMEOUT`].  Returns `None` when the
+    /// destination is unknown or every path to it is stale — so a caller never
+    /// forwards toward a neighbor that has gone silent, even between periodic
+    /// sweeps.
+    ///
+    /// [`ORIGINATOR_TIMEOUT`]: crate::ORIGINATOR_TIMEOUT
+    pub fn next_hop(&self, destination: Mac, now: core::time::Duration) -> Option<Mac> {
+        let record = self
+            .originator_table
+            .iter()
+            .find(|record| record.neighbor_ident == destination)?;
+        record
+            .paths
+            .iter()
+            .filter(|p| now.saturating_sub(p.rx_time) <= crate::ORIGINATOR_TIMEOUT)
+            .max_by_key(|p| p.last_tq)
+            .map(|p| p.neighbor_ident)
+    }
+
+    /// Drop routing state that has aged out as of `now`: originators heard on no
+    /// path within [`ORIGINATOR_TIMEOUT`] are removed entirely, and for the
+    /// survivors any individual stale path is pruned and `best_next_hop` /
+    /// `max_tq` recomputed from what remains.  Runs off the hot path, on the
+    /// periodic-broadcast tick, to reclaim table slots and keep the cached best
+    /// hop honest after a neighbor disappears.
+    ///
+    /// [`ORIGINATOR_TIMEOUT`]: crate::ORIGINATOR_TIMEOUT
+    pub fn purge_stale(&mut self, now: core::time::Duration) {
+        // Evict originators not heard from on any path recently.  Because
+        // `record.rx_time` is the freshest of its paths' `rx_time`s, a surviving
+        // record always keeps at least one fresh path.
+        self.originator_table
+            .retain(|r| now.saturating_sub(r.rx_time) <= crate::ORIGINATOR_TIMEOUT);
+
+        for record in self.originator_table.iter_mut() {
+            record
+                .paths
+                .retain(|p| now.saturating_sub(p.rx_time) <= crate::ORIGINATOR_TIMEOUT);
+            Self::recompute_best(record);
+        }
+    }
+
+    /// Recompute `best_next_hop` and `max_tq` from a record's current paths,
+    /// choosing the highest-TQ path.  Called after pruning so the cached best
+    /// hop reflects only live paths.  Leaves the fields unchanged when no paths
+    /// remain (such a record is evicted by [`purge_stale`](Self::purge_stale)).
+    fn recompute_best(record: &mut OriginatorRecord) {
+        let mut best: Option<&NeighborStats> = None;
+        for p in record.paths.iter() {
+            if best.is_none_or(|b| p.last_tq >= b.last_tq) {
+                best = Some(p);
+            }
+        }
+        if let Some(b) = best {
+            record.max_tq = b.last_tq;
+            record.best_next_hop = b.neighbor_ident;
+        }
     }
 
     /// Replace the set of multicast groups the local host listens to.  These
@@ -88,6 +154,7 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
     #[tracing::instrument(skip(self, frame, reply), fields(ident = ?self.self_ident), level = "info")]
     fn handle_rx<'rx, 'tx>(
         &mut self,
+        now: core::time::Duration,
         frame: &'tx LinkFrame,
         reply: &mut LinkFrameDataMut<'rx>,
     ) -> RoutingAction {
@@ -136,10 +203,12 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
                     .position(|r| r.neighbor_ident == orig_ident);
 
                 if record_idx.is_none() {
+                    // TODO(bjc) Instead of dropping, we should rotate out the oldest record
                     if self.originator_table.len() >= MAX_ORIGINATORS {
                         return RoutingAction::Consumed; // Table full, drop packet
                     }
                     let new_record = OriginatorRecord {
+                        rx_time: now,
                         neighbor_ident: ogm.orig,
                         best_next_hop: frame.src,
                         max_tq: 0,
@@ -170,19 +239,25 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
                 // other neighbors are still recorded as alternate paths.
                 if incoming_seqno >= record.last_seqno {
                     record.last_seqno = incoming_seqno;
+                    // Hearing this originator on any path keeps the whole record
+                    // alive; `rx_time` tracks the freshest path.
+                    record.rx_time = now;
 
                     // Simple path metric attenuation (echoing back path quality drop)
                     let computed_tq = ogm.tq.saturating_sub(10);
 
-                    // Track path via this specific immediate neighbor
+                    // Track path via this specific immediate neighbor, stamping
+                    // it with `now` so a neighbor that later goes quiet ages out.
                     if let Some(path) = record.paths.iter_mut().find(|p| p.neighbor_ident == src) {
                         path.last_tq = computed_tq;
                         path.last_seqno = incoming_seqno;
+                        path.rx_time = now;
                     } else if record.paths.len() < 4 {
                         let _ = record.paths.push(NeighborStats {
                             neighbor_ident: frame.src,
                             last_tq: computed_tq,
                             last_seqno: incoming_seqno,
+                            rx_time: now,
                         });
                     }
 
@@ -325,12 +400,9 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
                     return RoutingAction::Consumed; // Drop packet, expired
                 }
 
-                // Rule 3: We are an intermediate relay node. Look up the next hop for the final destination.
-                if let Some(record) = self
-                    .originator_table
-                    .iter()
-                    .find(|r| r.neighbor_ident == dst)
-                {
+                // Rule 3: We are an intermediate relay node. Look up the next
+                // live hop for the final destination (stale hops are skipped).
+                if let Some(next) = self.next_hop(dst, now) {
                     // Re-write the mutable scratchpad/response buffer with the updated header
                     // and preserve the inner application payload that follows the header.
                     let mut updated_hdr = unicast_hdr;
@@ -340,7 +412,7 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
                     let inner = frame.payload.get(size..).unwrap_or(&[]);
                     let total = size + inner.len();
 
-                    reply.dst = record.best_next_hop;
+                    reply.dst = next;
                     reply.protocol = ETH_P_BATMAN;
                     reply
                         .payload
@@ -378,12 +450,8 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
                     return RoutingAction::Consumed;
                 }
 
-                // Rule 3: relay toward the next hop for the target listener.
-                if let Some(record) = self
-                    .originator_table
-                    .iter()
-                    .find(|r| r.neighbor_ident == dst)
-                {
+                // Rule 3: relay toward the next live hop for the target listener.
+                if let Some(next) = self.next_hop(dst, now) {
                     let mut updated_hdr = mcast_hdr;
                     updated_hdr.ttl -= 1;
 
@@ -391,7 +459,7 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
                     let inner = frame.payload.get(size..).unwrap_or(&[]);
                     let total = size + inner.len();
 
-                    reply.dst = record.best_next_hop;
+                    reply.dst = next;
                     reply.protocol = ETH_P_BATMAN;
                     reply
                         .payload
@@ -412,26 +480,28 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
             _ => {
                 if dst == self.self_ident {
                     RoutingAction::DeliverLocal
-                } else if let Some(record) = self
-                    .originator_table
-                    .iter()
-                    .find(|r| r.neighbor_ident == dst)
-                {
-                    // Forwarding decision dictated dynamically by current best path lookup
-                    RoutingAction::ForwardTo(record.best_next_hop)
+                } else if let Some(next) = self.next_hop(dst, now) {
+                    // Forwarding decision dictated dynamically by the current
+                    // best *live* path (stale next hops are skipped).
+                    RoutingAction::ForwardTo(next)
                 } else {
-                    RoutingAction::Consumed // No path known, drop packet
+                    RoutingAction::Consumed // No live path known, drop packet
                 }
             }
         }
     }
 
-    #[tracing::instrument(skip(self, _now, tx_buffer), fields(ident = ?self.self_ident), level = "info")]
+    #[tracing::instrument(skip(self, now, tx_buffer), fields(ident = ?self.self_ident), level = "info")]
     fn produce_periodic_broadcast<'tx>(
         &mut self,
-        _now: core::time::Duration,
+        now: core::time::Duration,
         tx_buffer: &'tx mut [u8],
     ) -> Option<&'tx [u8]> {
+        // Age out routes to neighbors that have gone quiet.  Done on this
+        // periodic tick — off the receive hot path — so a stale next hop is
+        // never left in the table for long.
+        self.purge_stale(now);
+
         // Increment sequence allocation for this ticker frame
         self.sequence_number = self.sequence_number.wrapping_add(1);
 

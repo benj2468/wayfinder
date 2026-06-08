@@ -131,7 +131,8 @@ impl<Local: FrameIo> Driver<Local> {
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let mut int = interval(Duration::from_secs(10));
         loop {
-            self.run_once(&mut int, true, true, true).await?;
+            let now = self.start.elapsed();
+            self.run_once(now, &mut int, true, true, true).await?;
         }
     }
 
@@ -139,9 +140,15 @@ impl<Local: FrameIo> Driver<Local> {
     /// mesh interface, a frame from the local host device, a management query,
     /// or the periodic-broadcast timer — process it, then deliver any inner
     /// frame to the host and dispatch any outgoing frame onto the mesh.
+    ///
+    /// `now` is the current instant (relative to the driver's reference instant)
+    /// stamped on received originator records and on any OGM produced, so a
+    /// caller that controls time — e.g. a deterministic test — controls route
+    /// ageing.  Production passes `self.start.elapsed()`.
     #[tracing::instrument(skip(self, interval, check_local, check_mesh, check_server), fields(ident = ?self.mac))]
     pub async fn run_once(
         &mut self,
+        now: Duration,
         interval: &mut Interval,
         check_local: bool,
         check_mesh: bool,
@@ -156,12 +163,11 @@ impl<Local: FrameIo> Driver<Local> {
             query_rx,
             mac,
             snooper,
-            start,
+            start: _,
             rx_buffer,
             tx_buffer,
         } = self;
         let mac = *mac;
-        let start = *start;
 
         let output: LoopOutput = {
             tokio::select! {
@@ -171,7 +177,7 @@ impl<Local: FrameIo> Driver<Local> {
                     })
                 ), if check_mesh && !interfaces.is_empty() => {
                     tracing::debug!("received frame from interface {}", idx);
-                    handle_mesh_frame(router, idx, received.frame, received.metrics, tx_buffer)
+                    handle_mesh_frame(now, router, idx, received.frame, received.metrics, tx_buffer)
                 },
                 Ok(len) = local.recv(rx_buffer), if check_local => {
                     tracing::debug!("host device received frame of length {}", len);
@@ -190,7 +196,7 @@ impl<Local: FrameIo> Driver<Local> {
                 _ = interval.tick() => {
                     tracing::info!("polling OGM");
                     LoopOutput {
-                        mesh: poll_ogm(router, start.elapsed(), tx_buffer),
+                        mesh: poll_ogm(router, now, tx_buffer),
                         local: None,
                     }
                 }
@@ -270,6 +276,7 @@ impl<Local: FrameIo> Driver<Local> {
                     Some(Ok(received)) => {
                         progressed = true;
                         handle_mesh_frame(
+                            self.start.elapsed(),
                             &mut self.router,
                             idx,
                             received.frame,
@@ -327,13 +334,14 @@ fn poll_ogm(router: &mut CentralRouter, now: Duration, tx_buffer: &mut [u8]) -> 
 /// Process one received link-layer frame into a unit of work, folding the
 /// carrier's physical-layer `metrics` into the engine's link-quality table.
 fn handle_mesh_frame(
+    now: Duration,
     router: &mut CentralRouter,
     idx: usize,
     frame: &LinkFrame,
     metrics: LinkMetrics,
     tx_buffer: &mut [u8],
 ) -> LoopOutput {
-    let rx = router.handle_frame_with_metrics(idx, frame, metrics, tx_buffer);
+    let rx = router.handle_frame_with_metrics(now, idx, frame, metrics, tx_buffer);
     tracing::debug!("decoded as {:?}", rx);
     LoopOutput {
         mesh: rx

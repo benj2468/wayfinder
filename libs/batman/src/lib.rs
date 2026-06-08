@@ -6,6 +6,8 @@ pub mod wire;
 #[cfg(test)]
 mod engine_tests;
 
+use core::time::Duration;
+
 use heapless::Vec as HVec;
 use interfaces::frame::Mac;
 
@@ -15,17 +17,33 @@ pub const MAX_LOCAL_MCAST: usize = 16;
 /// the whole mesh.  Bounds the footprint for embedded targets.
 pub const MAX_MCAST_MEMBERS: usize = 64;
 
+/// How long a path (or a whole originator) may go without a refreshing OGM
+/// before it is treated as dead: ignored when choosing a next hop and evicted
+/// by the periodic sweep.  At the default ~10 s OGM interval this tolerates a
+/// handful of consecutive misses before a route is dropped.
+pub const ORIGINATOR_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Track metrics for a specific path to an originator via a specific immediate neighbor
 #[derive(Debug, Clone)]
 pub struct NeighborStats {
     pub neighbor_ident: Mac,
     pub last_tq: u8,
     pub last_seqno: u32,
+    /// Instant (on the engine's clock) of the most recent OGM that refreshed
+    /// this path.  A path whose `rx_time` is older than [`ORIGINATOR_TIMEOUT`]
+    /// is stale: its neighbor has gone quiet, so it is skipped when selecting a
+    /// next hop and pruned by [`BatmanEngine::purge_stale`].
+    pub rx_time: Duration,
 }
 
 /// A destination node in the mesh network
 #[derive(Debug, Clone)]
 pub struct OriginatorRecord {
+    /// Instant of the most recent OGM accepted for this originator via *any*
+    /// path (i.e. the freshest of its [`NeighborStats::rx_time`]).  When this is
+    /// older than [`ORIGINATOR_TIMEOUT`] the originator has been heard from on
+    /// no path and the whole record is evicted.
+    pub rx_time: Duration,
     pub neighbor_ident: Mac,
     pub best_next_hop: Mac,
     pub max_tq: u8,

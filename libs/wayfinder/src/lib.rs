@@ -13,6 +13,7 @@ use batman::{
         BatmanUnicastPacket, ETH_P_BATMAN,
     },
 };
+use core::time::Duration;
 use interfaces::{
     engine::{MeshRoutingEngine, RoutingAction},
     frame::{LinkFrame, LinkFrameData, LinkFrameDataMut, Mac},
@@ -123,11 +124,12 @@ impl CentralRouter {
     /// [`handle_frame_with_metrics`]: CentralRouter::handle_frame_with_metrics
     pub fn handle_frame<'rx, 'tx>(
         &mut self,
+        now: Duration,
         iface_idx: usize,
         frame: &'rx LinkFrame,
         tx_buf: &'tx mut [u8],
     ) -> RxOutcome<'rx, 'tx> {
-        self.handle_frame_with_metrics(iface_idx, frame, LinkMetrics::default(), tx_buf)
+        self.handle_frame_with_metrics(now, iface_idx, frame, LinkMetrics::default(), tx_buf)
     }
 
     /// Process a received link-layer frame, folding the radio's
@@ -140,6 +142,7 @@ impl CentralRouter {
     /// any inner payload to deliver to the local host.
     pub fn handle_frame_with_metrics<'rx, 'tx>(
         &mut self,
+        now: Duration,
         iface_idx: usize,
         frame: &'rx LinkFrame,
         metrics: LinkMetrics,
@@ -168,7 +171,7 @@ impl CentralRouter {
                 let mut reply: LinkFrameDataMut<'_> = tx_buf.into();
 
                 // BATMAN-adv Protocol ID
-                let action = self.batman.handle_rx(frame, &mut reply);
+                let action = self.batman.handle_rx(now, frame, &mut reply);
                 tracing::debug!(
                     "Post-action reply: dst={:?}, protocol={:?}",
                     reply.dst,
@@ -534,7 +537,7 @@ mod cp2_local_delivery {
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
 
         let mut tx = [0u8; 256];
-        let outcome = router.handle_frame(0, frame, &mut tx);
+        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx);
 
         assert_eq!(outcome.deliver_local, Some(INNER));
         assert!(outcome.forward.is_none());
@@ -561,7 +564,7 @@ mod cp2_local_delivery {
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
 
         let mut tx = [0u8; 256];
-        let outcome = router.handle_frame(0, frame, &mut tx);
+        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx);
 
         // Delivered to the local TAP ...
         assert_eq!(outcome.deliver_local, Some(INNER));
@@ -662,7 +665,7 @@ mod mcast_forwarding {
         let bytes = link_frame_bytes(orig, Mac::BROADCAST, &payload);
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
         let mut tx = [0u8; 256];
-        router.handle_frame(0, frame, &mut tx);
+        router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx);
     }
 
     /// With no known listeners for a group, the plan is to flood.

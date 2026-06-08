@@ -1,3 +1,5 @@
+use core::time::Duration;
+
 use crate::frame::{LinkFrame, LinkFrameDataMut, Mac};
 
 #[derive(Debug)]
@@ -32,6 +34,7 @@ pub trait MeshRoutingEngine {
     /// The engine processes it, updates metrics, and returns the next logical step.
     fn handle_rx<'rx, 'tx>(
         &mut self,
+        now: Duration,
         frame: &'rx LinkFrame,
         reply: &mut LinkFrameDataMut<'tx>,
     ) -> RoutingAction;
@@ -40,7 +43,7 @@ pub trait MeshRoutingEngine {
     /// Returns a closure or a slice instructing the manager what to broadcast.
     fn produce_periodic_broadcast<'tx>(
         &mut self,
-        now: core::time::Duration,
+        now: Duration,
         tx_buffer: &'tx mut [u8],
     ) -> Option<&'tx [u8]>;
 }

@@ -31,6 +31,11 @@ pub struct TestMachineConfig {
 pub struct TestHarness {
     pub switches: HashMap<String, Switch<Mac>>,
     pub machines: HashMap<String, TestRouter>,
+    /// Virtual clock driving the mesh.  [`poll`](Self::poll) sets it to the
+    /// instant it is given, and [`tick`](Self::tick) stamps that same instant on
+    /// every frame it processes, so received originator records age against the
+    /// time the test controls rather than wall-clock.
+    pub clock: Duration,
 }
 
 impl TestHarness {
@@ -43,6 +48,7 @@ impl TestHarness {
         // Tick it once so that we don't block waiting for the interval to elapse
         int.tick().await;
 
+        self.clock = now;
         for (_, router) in self.machines.iter_mut() {
             router.poll(now).await;
         }
@@ -52,17 +58,18 @@ impl TestHarness {
         let mut int = interval(Duration::from_hours(1));
         int.tick().await;
 
+        let now = self.clock;
         for (_, router) in self.machines.iter_mut() {
             let _ = router
                 .driver()
-                .run_once(&mut int, false, true, false)
+                .run_once(now, &mut int, false, true, false)
                 .now_or_never();
         }
 
         for (_, router) in self.machines.iter_mut() {
             let _ = router
                 .driver()
-                .run_once(&mut int, true, false, false)
+                .run_once(now, &mut int, true, false, false)
                 .now_or_never();
         }
         for (_, switch) in self.switches.iter_mut() {

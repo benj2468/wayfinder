@@ -159,7 +159,7 @@ mod ogm_processing {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         // Should be consumed (dropped) without creating route
         assert!(matches!(action, RoutingAction::Consumed));
@@ -178,7 +178,7 @@ mod ogm_processing {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         assert!(matches!(action, RoutingAction::Consumed));
         assert_eq!(engine.originator_table.len(), 1);
@@ -203,7 +203,7 @@ mod ogm_processing {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        engine.handle_rx(frame, &mut reply);
+        engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         // Should attenuate by 10
         assert_eq!(engine.originator_table[0].max_tq, 245);
@@ -221,7 +221,7 @@ mod ogm_processing {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        engine.handle_rx(frame, &mut reply);
+        engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         // 5 - 10 should saturate to 0, not underflow
         assert_eq!(engine.originator_table[0].max_tq, 0);
@@ -239,7 +239,7 @@ mod ogm_processing {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         assert!(matches!(action, RoutingAction::Consumed));
 
@@ -267,7 +267,7 @@ mod ogm_processing {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        engine.handle_rx(frame, &mut reply);
+        engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         // Should learn the route but NOT forward
         assert_eq!(engine.originator_table.len(), 1);
@@ -284,12 +284,20 @@ mod ogm_processing {
         let frame1 = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm1);
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
-        engine.handle_rx(parse_link_frame(&frame1), &mut reply);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame1),
+            &mut reply,
+        );
 
         // Receive OGM from node 5 via node 3 (second path, better quality)
         let ogm2 = make_ogm(5, 3, 2, 250, 50);
         let frame2 = make_link_frame(3, 0xff, ETH_P_BATMAN, ogm2);
-        engine.handle_rx(parse_link_frame(&frame2), &mut reply);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame2),
+            &mut reply,
+        );
 
         assert_eq!(engine.originator_table.len(), 1);
         let record = &engine.originator_table[0];
@@ -312,7 +320,11 @@ mod ogm_processing {
             let frame = make_link_frame(neighbor, 0xff, ETH_P_BATMAN, ogm);
             let mut reply_buffer = [0u8; 256];
             let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
-            engine.handle_rx(parse_link_frame(&frame), &mut reply);
+            engine.handle_rx(
+                core::time::Duration::ZERO,
+                parse_link_frame(&frame),
+                &mut reply,
+            );
         }
 
         let record = &engine.originator_table[0];
@@ -329,14 +341,22 @@ mod ogm_processing {
         let frame1 = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm1);
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
-        engine.handle_rx(parse_link_frame(&frame1), &mut reply);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame1),
+            &mut reply,
+        );
 
         assert_eq!(engine.originator_table[0].last_seqno, 100);
 
         // Receive newer OGM
         let ogm2 = make_ogm(2, 2, 105, 255, 50);
         let frame2 = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm2);
-        engine.handle_rx(parse_link_frame(&frame2), &mut reply);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame2),
+            &mut reply,
+        );
 
         assert_eq!(engine.originator_table[0].last_seqno, 105);
     }
@@ -350,14 +370,22 @@ mod ogm_processing {
         let frame1 = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm1);
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
-        engine.handle_rx(parse_link_frame(&frame1), &mut reply);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame1),
+            &mut reply,
+        );
 
         let initial_tq = engine.originator_table[0].max_tq;
 
         // Receive older OGM with seqno 95 and different TQ
         let ogm2 = make_ogm(2, 2, 95, 200, 50);
         let frame2 = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm2);
-        engine.handle_rx(parse_link_frame(&frame2), &mut reply);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame2),
+            &mut reply,
+        );
 
         // Sequence number and TQ should not change
         assert_eq!(engine.originator_table[0].last_seqno, 100);
@@ -374,7 +402,11 @@ mod ogm_processing {
             let frame = make_link_frame(orig, 0xff, ETH_P_BATMAN, ogm);
             let mut reply_buffer = [0u8; 256];
             let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
-            engine.handle_rx(parse_link_frame(&frame), &mut reply);
+            engine.handle_rx(
+                core::time::Duration::ZERO,
+                parse_link_frame(&frame),
+                &mut reply,
+            );
         }
 
         assert_eq!(engine.originator_table.len(), 4);
@@ -384,7 +416,11 @@ mod ogm_processing {
         let frame = make_link_frame(20, 0xff, ETH_P_BATMAN, ogm);
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
-        engine.handle_rx(parse_link_frame(&frame), &mut reply);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame),
+            &mut reply,
+        );
 
         // Table should still be 4 (new entry dropped)
         assert_eq!(engine.originator_table.len(), 4);
@@ -407,7 +443,7 @@ mod unicast_forwarding {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         assert!(matches!(action, RoutingAction::DeliverLocal));
     }
@@ -421,14 +457,18 @@ mod unicast_forwarding {
         let frame_ogm = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
-        engine.handle_rx(parse_link_frame(&frame_ogm), &mut reply);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_ogm),
+            &mut reply,
+        );
 
         // Receive unicast with TTL=1 (should expire)
         let unicast_payload = make_unicast(5, 1, b"data");
         let frame_bytes = make_link_frame(3, 1, ETH_P_BATMAN, unicast_payload);
         let frame = parse_link_frame(&frame_bytes);
 
-        let action = engine.handle_rx(frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         // Should be consumed (dropped) due to TTL
         assert!(matches!(action, RoutingAction::Consumed));
@@ -443,14 +483,18 @@ mod unicast_forwarding {
         let frame_ogm = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
-        engine.handle_rx(parse_link_frame(&frame_ogm), &mut reply);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_ogm),
+            &mut reply,
+        );
 
         // Receive unicast packet destined for node 5
         let unicast_payload = make_unicast(5, 10, b"payload");
         let frame_bytes = make_link_frame(3, 1, ETH_P_BATMAN, unicast_payload);
         let frame = parse_link_frame(&frame_bytes);
 
-        let action = engine.handle_rx(frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         assert!(matches!(action, RoutingAction::Consumed));
 
@@ -476,7 +520,7 @@ mod unicast_forwarding {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         // Should be consumed (dropped) - no route known
         assert!(matches!(action, RoutingAction::Consumed));
@@ -496,7 +540,11 @@ mod routing_lookup {
         let frame = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
-        engine.handle_rx(parse_link_frame(&frame), &mut reply);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame),
+            &mut reply,
+        );
 
         let next_hop = engine.lookup_route(mac(5));
         assert_eq!(next_hop, Some(mac(2)));
@@ -519,14 +567,22 @@ mod routing_lookup {
         let frame1 = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm1);
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
-        engine.handle_rx(parse_link_frame(&frame1), &mut reply);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame1),
+            &mut reply,
+        );
 
         assert_eq!(engine.lookup_route(mac(5)), Some(mac(2)));
 
         // Add better route to node 5 via node 3 (TQ=250)
         let ogm2 = make_ogm(5, 3, 2, 250, 50);
         let frame2 = make_link_frame(3, 0xff, ETH_P_BATMAN, ogm2);
-        engine.handle_rx(parse_link_frame(&frame2), &mut reply);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame2),
+            &mut reply,
+        );
 
         // Should now route via node 3
         assert_eq!(engine.lookup_route(mac(5)), Some(mac(3)));
@@ -548,7 +604,7 @@ mod protocol_filtering {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         assert!(matches!(action, RoutingAction::Consumed));
         assert_eq!(engine.originator_table.len(), 0);
@@ -565,7 +621,7 @@ mod protocol_filtering {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         assert!(matches!(action, RoutingAction::Consumed));
     }
@@ -581,7 +637,7 @@ mod protocol_filtering {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         // Unknown packet type should trigger the default match arm and be consumed (no route known)
         assert!(matches!(action, RoutingAction::Consumed));
@@ -598,7 +654,7 @@ mod protocol_filtering {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         assert!(matches!(action, RoutingAction::Consumed));
         assert_eq!(engine.originator_table.len(), 0);
@@ -619,7 +675,11 @@ mod edge_cases {
             let frame = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
             let mut reply_buffer = [0u8; 256];
             let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
-            engine.handle_rx(parse_link_frame(&frame), &mut reply);
+            engine.handle_rx(
+                core::time::Duration::ZERO,
+                parse_link_frame(&frame),
+                &mut reply,
+            );
         }
 
         // Should have the highest sequence number
@@ -638,7 +698,11 @@ mod edge_cases {
             let frame = make_link_frame(neighbor, 0xff, ETH_P_BATMAN, ogm);
             let mut reply_buffer = [0u8; 256];
             let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
-            engine.handle_rx(parse_link_frame(&frame), &mut reply);
+            engine.handle_rx(
+                core::time::Duration::ZERO,
+                parse_link_frame(&frame),
+                &mut reply,
+            );
         }
 
         assert_eq!(engine.originator_table.len(), 1);
@@ -657,7 +721,11 @@ mod edge_cases {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        engine.handle_rx(parse_link_frame(&frame), &mut reply);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame),
+            &mut reply,
+        );
 
         // Should learn but not forward
         assert_eq!(engine.originator_table.len(), 1);
@@ -673,14 +741,22 @@ mod edge_cases {
         let frame1 = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm1);
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
-        engine.handle_rx(parse_link_frame(&frame1), &mut reply);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame1),
+            &mut reply,
+        );
 
         assert_eq!(engine.originator_table[0].paths[0].last_tq, 190);
 
         // Second OGM from same originator via same neighbor with different TQ
         let ogm2 = make_ogm(5, 2, 2, 250, 50);
         let frame2 = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm2);
-        engine.handle_rx(parse_link_frame(&frame2), &mut reply);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame2),
+            &mut reply,
+        );
 
         // Path metric should be updated
         assert_eq!(engine.originator_table[0].paths[0].last_tq, 240);
@@ -713,7 +789,7 @@ mod broadcast_processing {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         // Deliver to the local TAP *and* keep the flood going to neighbours.
         // The forward destination is the broadcast address.
@@ -749,7 +825,7 @@ mod broadcast_processing {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         assert!(matches!(action, RoutingAction::Consumed));
         assert_eq!(reply.protocol, 0); // nothing re-flooded
@@ -767,14 +843,22 @@ mod broadcast_processing {
         // First sighting: delivered locally and re-flooded.
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
-        let first = engine.handle_rx(parse_link_frame(&frame_bytes), &mut reply);
+        let first = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            &mut reply,
+        );
         assert!(matches!(first, RoutingAction::DeliverLocalAndForward(_)));
 
         // Same (orig, seqno) seen again (e.g. arriving via a different
         // neighbour): dropped, and crucially not re-flooded a second time.
         let mut reply2_buffer = [0u8; 256];
         let mut reply2 = LinkFrameDataMut::from(&mut reply2_buffer[..]);
-        let second = engine.handle_rx(parse_link_frame(&frame_bytes), &mut reply2);
+        let second = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            &mut reply2,
+        );
         assert!(matches!(second, RoutingAction::Consumed));
         assert_eq!(reply2.protocol, 0);
     }
@@ -792,7 +876,7 @@ mod broadcast_processing {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         assert!(matches!(action, RoutingAction::DeliverLocal));
         assert_eq!(reply.protocol, 0); // not re-flooded
@@ -886,7 +970,7 @@ mod ogm_tvlv {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
         assert!(matches!(action, RoutingAction::Consumed));
         assert_eq!(reply.dst, Mac::BROADCAST);
 
@@ -1021,7 +1105,7 @@ mod mcast_membership {
         let frame = parse_link_frame(&frame_bytes);
         let mut buf = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut buf[..]);
-        engine.handle_rx(frame, &mut reply);
+        engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         assert!(engine.mcast_listeners(g1).any(|m| m == mac(5)));
         assert!(engine.mcast_listeners(g2).any(|m| m == mac(5)));
@@ -1031,7 +1115,7 @@ mod mcast_membership {
         let frame = parse_link_frame(&frame_bytes);
         let mut buf = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut buf[..]);
-        engine.handle_rx(frame, &mut reply);
+        engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         assert!(engine.mcast_listeners(g1).any(|m| m == mac(5)));
         assert!(
@@ -1076,7 +1160,7 @@ mod mcast_packet {
 
         let mut buf = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut buf[..]);
-        let action = engine.handle_rx(frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         assert!(matches!(action, RoutingAction::DeliverLocal));
     }
@@ -1092,12 +1176,20 @@ mod mcast_packet {
         let frame_ogm = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
         let mut buf = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut buf[..]);
-        engine.handle_rx(parse_link_frame(&frame_ogm), &mut reply);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_ogm),
+            &mut reply,
+        );
 
         // A BATADV_MCAST packet for node 5 arrives; forward it toward node 2.
         let payload = make_mcast(5, 10, b"group data");
         let frame_bytes = make_link_frame(3, 1, ETH_P_BATMAN, payload);
-        let action = engine.handle_rx(parse_link_frame(&frame_bytes), &mut reply);
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            &mut reply,
+        );
 
         assert!(matches!(action, RoutingAction::Consumed));
         assert_eq!(reply.dst, mac(2)); // next hop toward node 5
@@ -1107,5 +1199,94 @@ mod mcast_packet {
         assert_eq!(fwd.dest, mac(5)); // final destination unchanged
         assert_eq!(fwd.ttl, 9); // decremented from 10
         assert_eq!(&rest[..b"group data".len()], b"group data");
+    }
+}
+
+#[cfg(test)]
+mod route_expiry {
+    use core::time::Duration;
+
+    use super::*;
+    use crate::ORIGINATOR_TIMEOUT;
+
+    /// Feed one OGM for originator `orig` arriving via immediate neighbor `via`
+    /// at instant `now`, driving the engine's receive path.
+    fn feed_ogm(
+        engine: &mut BatmanEngine<8>,
+        orig: u8,
+        via: u8,
+        seqno: u32,
+        tq: u8,
+        now: Duration,
+    ) {
+        let ogm = make_ogm(orig, via, seqno, tq, 50);
+        let frame = make_link_frame(via, 0xff, ETH_P_BATMAN, ogm);
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        engine.handle_rx(now, parse_link_frame(&frame), &mut reply);
+    }
+
+    /// `next_hop` follows the highest-TQ path while it is fresh, but once that
+    /// path goes stale it falls back to a surviving lower-TQ path rather than
+    /// returning the silent neighbor.
+    #[test]
+    fn next_hop_skips_stale_path_for_fresher_alternate() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        // Originator 9 is reachable via neighbor 2 (high TQ) and neighbor 3
+        // (low TQ), both heard at t=0.
+        feed_ogm(&mut engine, 9, 2, 1, 255, Duration::ZERO);
+        feed_ogm(&mut engine, 9, 3, 1, 100, Duration::ZERO);
+        assert_eq!(engine.next_hop(mac(9), Duration::ZERO), Some(mac(2)));
+
+        // Only the via-3 path is refreshed past the timeout; via-2 is now stale.
+        let later = ORIGINATOR_TIMEOUT + Duration::from_secs(1);
+        feed_ogm(&mut engine, 9, 3, 2, 100, later);
+
+        // The stale higher-TQ via-2 path is skipped in favor of fresh via-3.
+        assert_eq!(engine.next_hop(mac(9), later), Some(mac(3)));
+    }
+
+    /// A destination all of whose paths have aged out has no next hop.
+    #[test]
+    fn next_hop_is_none_when_all_paths_stale() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        feed_ogm(&mut engine, 9, 2, 1, 255, Duration::ZERO);
+
+        let later = ORIGINATOR_TIMEOUT + Duration::from_secs(1);
+        assert_eq!(engine.next_hop(mac(9), later), None);
+    }
+
+    /// The periodic sweep evicts originators heard on no path within the
+    /// timeout, prunes individual stale paths from survivors, and recomputes
+    /// the cached best hop from what remains.
+    #[test]
+    fn purge_stale_evicts_dead_originator_and_recomputes_best() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        // Originator 9 via neighbor 2 (high TQ) and neighbor 3 (low TQ) at t=0;
+        // originator 8 via neighbor 4 at t=0 only.
+        feed_ogm(&mut engine, 9, 2, 1, 255, Duration::ZERO);
+        feed_ogm(&mut engine, 9, 3, 1, 100, Duration::ZERO);
+        feed_ogm(&mut engine, 8, 4, 1, 255, Duration::ZERO);
+        assert_eq!(engine.originator_table.len(), 2);
+        // Initially 9's best hop is the high-TQ via-2 path.
+        assert_eq!(engine.lookup_route(mac(9)), Some(mac(2)));
+
+        // Refresh only 9-via-3 past the timeout, then sweep: 9-via-2 and the
+        // whole originator 8 have gone stale.
+        let later = ORIGINATOR_TIMEOUT + Duration::from_secs(1);
+        feed_ogm(&mut engine, 9, 3, 2, 100, later);
+        engine.purge_stale(later);
+
+        // Originator 8 is gone; originator 9 survives on its one fresh path.
+        assert_eq!(engine.originator_table.len(), 1);
+        let r = &engine.originator_table[0];
+        assert_eq!(r.neighbor_ident, mac(9));
+        assert_eq!(r.paths.len(), 1);
+        assert_eq!(r.paths[0].neighbor_ident, mac(3));
+        // Cached best hop recomputed from the surviving (lower-TQ) path.
+        assert_eq!(r.best_next_hop, mac(3));
+        assert_eq!(r.max_tq, 90);
     }
 }

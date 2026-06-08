@@ -23,6 +23,12 @@ cargo build -p interfaces
 cargo build --release
 ```
 
+### Formatting
+
+Format all code with `nix fmt` (runs the repo's `treefmt` config across the
+tree — Rust and everything else). Do this before committing; the pre-commit
+hook also runs it. Prefer `nix fmt` over `cargo fmt`.
+
 ### Testing Commands
 ```bash
 # Run all tests in the workspace

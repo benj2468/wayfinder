@@ -282,6 +282,7 @@ impl TestRouter {
     /// on routing state, not on forwarded frames).
     pub async fn receive_with_metrics(
         &mut self,
+        now: Duration,
         iface_idx: usize,
         raw: &[u8],
         metrics: LinkMetrics,
@@ -291,6 +292,6 @@ impl TestRouter {
         let _ = self
             .driver
             .router_mut()
-            .handle_frame_with_metrics(iface_idx, frame, metrics, &mut buf);
+            .handle_frame_with_metrics(now, iface_idx, frame, metrics, &mut buf);
     }
 }

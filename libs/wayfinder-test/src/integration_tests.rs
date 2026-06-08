@@ -205,6 +205,48 @@ fn line_of_three() -> TestHarness {
     config.validate().unwrap()
 }
 
+/// Five nodes with two routes from `a` to `d` of unequal length:
+///
+/// ```text
+///        b              (a–b–d : 2 hops, preferred)
+///      /   \
+///    a       d
+///      \   /
+///        c — e          (a–c–e–d : 3 hops, alternate)
+/// ```
+///
+/// `a` neighbours `b` and `c`; `b` neighbours `d`; `c` neighbours `e`;
+/// `e` neighbours `d`.  Because the `b` route is strictly shorter it carries a
+/// higher TQ, so `a` records `b` as its best next hop to `d` and the longer
+/// `c→e` route's lower-TQ OGMs never displace it.  Killing `b` therefore
+/// requires the engine to *age out* the stale high-TQ path before traffic can
+/// fall back to the surviving `c→e` route.  Machine indices: a=0, b=1, c=2,
+/// d=3, e=4.
+fn two_paths_unequal_length() -> TestHarness {
+    let mut config = TestConfig::default();
+    for sw in ["ab", "ac", "bd", "ce", "ed"] {
+        config.switches.push(TestSwitchConfig { name: sw.into() });
+    }
+    let machine = |name: &str, links: &[&str]| TestMachineConfig {
+        name: name.into(),
+        wayfinder: Config {
+            links: links
+                .iter()
+                .map(|s| LinkConfig::Test {
+                    switch_name: (*s).into(),
+                })
+                .collect(),
+            ..Default::default()
+        },
+    };
+    config.machines.push(machine("a", &["ab", "ac"]));
+    config.machines.push(machine("b", &["ab", "bd"]));
+    config.machines.push(machine("c", &["ac", "ce"]));
+    config.machines.push(machine("d", &["bd", "ed"]));
+    config.machines.push(machine("e", &["ce", "ed"]));
+    config.validate().unwrap()
+}
+
 #[tokio::test]
 async fn test_validate() {
     let config = TestConfig::default();
@@ -471,6 +513,90 @@ async fn ogms_stop_after_convergence() {
     );
 }
 
+/// When the node that is a destination's *best* next hop goes offline, traffic
+/// must fail over to the next-best path instead of black-holing.
+///
+/// In [`two_paths_unequal_length`], `a` reaches `d` via `b` (2 hops, higher TQ)
+/// or via `c→e` (3 hops, lower TQ).  `a` picks `b`.  Because the `c→e` route's
+/// OGMs carry a strictly lower TQ, they never overwrite `a`'s recorded best hop
+/// on their own — so once `b` is gone, `a` keeps forwarding into a black hole
+/// until the stale path is aged out and the best hop recomputed from what
+/// remains.  Time is driven by the harness's virtual clock so the staleness is
+/// deterministic, not wall-clock dependent.
+#[tokio::test]
+async fn traffic_fails_over_when_best_next_hop_disconnects() {
+    setup();
+    let mut harness = two_paths_unequal_length();
+
+    let a = harness.get_machine("a").ident;
+    let b = harness.get_machine("b").ident;
+    let c = harness.get_machine("c").ident;
+    let d = harness.get_machine("d").ident;
+
+    // Converge: a few poll rounds, each fully drained.
+    for round in 1..=3 {
+        harness.poll(Duration::from_secs(round)).await;
+        for _ in 0..10 {
+            harness.tick().await;
+        }
+    }
+
+    let record = |h: &TestHarness| {
+        h.get_machine("a")
+            .router()
+            .originator_table()
+            .iter()
+            .find(|r| r.neighbor_ident == d)
+            .cloned()
+            .expect("a must have learned a route to d")
+    };
+
+    // Precondition: `a` reaches `d` via `b` (the shorter, higher-TQ path).  The
+    // longer `c→e` route carries a strictly lower TQ, so even once `a` learns it
+    // the metric alone never promotes it over the recorded `b` path.
+    assert_eq!(
+        record(&harness).best_next_hop,
+        b,
+        "a's best next hop to d should be b (the 2-hop path)"
+    );
+
+    // `b` goes offline: drop it from the simulation so it stops originating and
+    // forwarding.  Its switch ports go dead but the fabric tolerates that.
+    harness.machines.remove("b");
+
+    // Let plenty of virtual time pass while the surviving `c→e` route keeps
+    // refreshing, far beyond any reasonable neighbor timeout, so the stale `b`
+    // path ages out and `a` recomputes its best hop.
+    for secs in (100..=1000).step_by(100) {
+        harness.poll(Duration::from_secs(secs)).await;
+        for _ in 0..10 {
+            harness.tick().await;
+        }
+    }
+
+    let after = record(&harness);
+    assert_eq!(
+        after.best_next_hop, c,
+        "after b is lost, a must fail over to the c→e path"
+    );
+
+    // End-to-end: a unicast from `a` to `d` must still arrive, now routed the
+    // long way round via c→e.
+    harness
+        .get_machine_mut("a")
+        .send_local(d, b"hello via failover")
+        .await
+        .expect("a must have a route to d after failover");
+    for _ in 0..10 {
+        harness.tick().await;
+    }
+    assert_eq!(
+        harness.get_machine("d").local_deliveries(),
+        vec![host_frame(d, a, b"hello via failover")],
+        "d must receive the unicast over the surviving c→e path"
+    );
+}
+
 // ── metric-based egress selection ────────────────────────────────────────
 //
 // These tests need the *same* OGM observed on two interfaces with
@@ -499,8 +625,10 @@ async fn egress_picks_iface_with_better_metrics_for_shared_neighbor() {
     };
 
     let a = harness.get_machine_mut("a");
-    a.receive_with_metrics(0, &ogm_from_b, weak).await;
-    a.receive_with_metrics(1, &ogm_from_b, strong).await;
+    a.receive_with_metrics(Duration::from_secs(0), 0, &ogm_from_b, weak)
+        .await;
+    a.receive_with_metrics(Duration::from_secs(1), 1, &ogm_from_b, strong)
+        .await;
 
     match a.router_mut().get_egress_interface(mac(100)) {
         Some(EgressInterface::Interface(1)) => {}
@@ -530,8 +658,10 @@ async fn egress_swaps_iface_when_metrics_swap() {
     };
 
     let a = harness.get_machine_mut("a");
-    a.receive_with_metrics(0, &ogm_from_b, strong).await;
-    a.receive_with_metrics(1, &ogm_from_b, weak).await;
+    a.receive_with_metrics(Duration::from_secs(0), 0, &ogm_from_b, strong)
+        .await;
+    a.receive_with_metrics(Duration::from_secs(1), 1, &ogm_from_b, weak)
+        .await;
 
     match a.router_mut().get_egress_interface(mac(100)) {
         Some(EgressInterface::Interface(0)) => {}
@@ -560,7 +690,7 @@ async fn resolve_route_returns_neighbor_and_observed_interface() {
 
     harness
         .get_machine_mut("a")
-        .receive_with_metrics(1, &ogm_from_b, strong)
+        .receive_with_metrics(Duration::from_secs(1), 1, &ogm_from_b, strong)
         .await;
 
     let (next_hop, egress) = harness.get_machine("a").router().resolve_route(mac(100));
@@ -601,7 +731,7 @@ async fn resolve_route_is_read_only() {
 
     harness
         .get_machine_mut("a")
-        .receive_with_metrics(0, &ogm_from_b, metrics)
+        .receive_with_metrics(Duration::from_secs(0), 0, &ogm_from_b, metrics)
         .await;
 
     let a = harness.get_machine("a");
