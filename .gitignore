@@ -27,3 +27,6 @@ rustc-ice-*.txt
 
 # Coverage
 coverage.xml
+
+# Python
+__pycache__
