@@ -296,7 +296,7 @@ async fn test_simple_pair_send_data() {
     harness.tick().await;
 
     for (_, router) in harness.machines.iter() {
-        assert_eq!(router.router().originator_table().len(), 1);
+        assert_eq!(router.router().originator_table().count(), 1);
     }
 
     tracing::info!("OGM PHASE COMPLETE");
@@ -337,7 +337,7 @@ async fn test_line_of_three_send_data() {
     harness.tick().await;
 
     for (_, router) in harness.machines.iter() {
-        assert_eq!(router.router().originator_table().len(), 2);
+        assert_eq!(router.router().originator_table().count(), 2);
     }
 
     let m1 = harness.get_machine("machine1").ident;
@@ -401,7 +401,7 @@ async fn three_routers_all_connected_discover_and_exchange() {
     harness.tick().await;
 
     for (_, router) in harness.machines.iter() {
-        assert_eq!(router.router().originator_table().len(), 2);
+        assert_eq!(router.router().originator_table().count(), 2);
     }
 
     let m0 = harness.get_machine("machine0").ident;
@@ -482,7 +482,7 @@ async fn ogms_stop_after_convergence() {
         harness.tick().await;
     }
     for (_, router) in harness.machines.iter() {
-        assert_eq!(router.router().originator_table().len(), 2);
+        assert_eq!(router.router().originator_table().count(), 2);
     }
 
     // Watch every OGM that crosses the fabric from here on.
@@ -545,7 +545,6 @@ async fn traffic_fails_over_when_best_next_hop_disconnects() {
         h.get_machine("a")
             .router()
             .originator_table()
-            .iter()
             .find(|r| r.neighbor_ident == d)
             .cloned()
             .expect("a must have learned a route to d")

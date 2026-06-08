@@ -102,8 +102,10 @@ impl RxOutcome<'_, '_> {
 }
 
 pub struct CentralRouter {
-    /// The Batman routing engine for this router
-    batman: BatmanEngine<100>,
+    /// The Batman routing engine for this router.  Its originator capacity must
+    /// be a power of two (a `heapless` map requirement); 128 leaves headroom
+    /// over a typical mesh.
+    batman: BatmanEngine<128>,
     ident_table: IdentTable<Mac>,
     link_quality: LinkQualityTable<Mac>,
 }
@@ -446,8 +448,16 @@ impl CentralRouter {
         self.batman.self_ident
     }
 
-    pub fn originator_table(&self) -> &[batman::OriginatorRecord] {
-        &self.batman.originator_table
+    /// Iterate every known originator record.  The originator table is keyed by
+    /// MAC for O(1) lookup, so this yields the records in no particular order;
+    /// use [`originator_count`](Self::originator_count) for the count.
+    pub fn originator_table(&self) -> impl Iterator<Item = &batman::OriginatorRecord> + '_ {
+        self.batman.originator_table.values()
+    }
+
+    /// The number of originators currently known — O(1).
+    pub fn originator_count(&self) -> usize {
+        self.batman.originator_table.len()
     }
 
     /// Borrow the link-quality table for inspection.  Read-only mirror of

@@ -9,6 +9,7 @@ mod engine_tests;
 use core::time::Duration;
 
 use heapless::Vec as HVec;
+use heapless::index_map::FnvIndexMap;
 use interfaces::frame::Mac;
 
 /// Maximum number of multicast groups this node's local host can join at once.
@@ -60,7 +61,12 @@ pub struct BatmanEngine<const MAX_ORIGINATORS: usize> {
     /// sequence numbers are independent number spaces (see
     /// [`Self::broadcast_seqno`] for the receive-side dedup table).
     pub broadcast_sequence_number: u32,
-    pub originator_table: HVec<OriginatorRecord, MAX_ORIGINATORS>,
+    /// Routes to every known originator, keyed by the originator's MAC for
+    /// O(1) lookup on the receive and forward hot paths.  `MAX_ORIGINATORS`
+    /// **must be a power of two** (a `heapless` map requirement).  When full, a
+    /// newly heard originator evicts the least-recently-refreshed entry rather
+    /// than being dropped.
+    pub originator_table: FnvIndexMap<Mac, OriginatorRecord, MAX_ORIGINATORS>,
     /// Highest broadcast sequence number seen per originator, used to drop
     /// duplicate flooded broadcasts.  Broadcast and OGM sequence numbers are
     /// independent number spaces, so this is tracked separately from
@@ -84,7 +90,7 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
             self_ident,
             sequence_number: 0,
             broadcast_sequence_number: 0,
-            originator_table: HVec::new(),
+            originator_table: FnvIndexMap::new(),
             broadcast_seqno: HVec::new(),
             local_mcast: HVec::new(),
             mcast_members: HVec::new(),

@@ -35,13 +35,12 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
     }
 
     fn num_originators(&self) -> u32 {
-        self.0.originator_table().len() as u32
+        self.0.originator_count() as u32
     }
 
     fn routing_table(&self) -> Vec<RoutingEntryData> {
         self.0
             .originator_table()
-            .iter()
             .map(|r| RoutingEntryData {
                 destination: r.neighbor_ident.as_bytes().to_vec(),
                 next_hop: r.best_next_hop.as_bytes().to_vec(),

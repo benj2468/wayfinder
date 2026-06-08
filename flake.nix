@@ -69,6 +69,7 @@
               socat
               protobuf
               buf
+              wireshark
             ];
 
             nativeBuildInputs = with pkgs; [ protobuf ];

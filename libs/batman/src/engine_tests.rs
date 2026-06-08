@@ -183,7 +183,7 @@ mod ogm_processing {
         assert!(matches!(action, RoutingAction::Consumed));
         assert_eq!(engine.originator_table.len(), 1);
 
-        let record = &engine.originator_table[0];
+        let record = &engine.originator_table[&mac(2)];
         assert_eq!(record.neighbor_ident, mac(2));
         assert_eq!(record.best_next_hop, mac(2));
         assert_eq!(record.last_seqno, 1);
@@ -206,7 +206,7 @@ mod ogm_processing {
         engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         // Should attenuate by 10
-        assert_eq!(engine.originator_table[0].max_tq, 245);
+        assert_eq!(engine.originator_table[&mac(2)].max_tq, 245);
     }
 
     #[test]
@@ -224,7 +224,7 @@ mod ogm_processing {
         engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
 
         // 5 - 10 should saturate to 0, not underflow
-        assert_eq!(engine.originator_table[0].max_tq, 0);
+        assert_eq!(engine.originator_table[&mac(2)].max_tq, 0);
     }
 
     #[test]
@@ -300,7 +300,7 @@ mod ogm_processing {
         );
 
         assert_eq!(engine.originator_table.len(), 1);
-        let record = &engine.originator_table[0];
+        let record = &engine.originator_table[&mac(5)];
 
         // Should track both paths
         assert_eq!(record.paths.len(), 2);
@@ -327,7 +327,7 @@ mod ogm_processing {
             );
         }
 
-        let record = &engine.originator_table[0];
+        let record = &engine.originator_table[&mac(10)];
         // Should only track 4 paths (the limit)
         assert_eq!(record.paths.len(), 4);
     }
@@ -347,7 +347,7 @@ mod ogm_processing {
             &mut reply,
         );
 
-        assert_eq!(engine.originator_table[0].last_seqno, 100);
+        assert_eq!(engine.originator_table[&mac(2)].last_seqno, 100);
 
         // Receive newer OGM
         let ogm2 = make_ogm(2, 2, 105, 255, 50);
@@ -358,7 +358,7 @@ mod ogm_processing {
             &mut reply,
         );
 
-        assert_eq!(engine.originator_table[0].last_seqno, 105);
+        assert_eq!(engine.originator_table[&mac(2)].last_seqno, 105);
     }
 
     #[test]
@@ -376,7 +376,7 @@ mod ogm_processing {
             &mut reply,
         );
 
-        let initial_tq = engine.originator_table[0].max_tq;
+        let initial_tq = engine.originator_table[&mac(2)].max_tq;
 
         // Receive older OGM with seqno 95 and different TQ
         let ogm2 = make_ogm(2, 2, 95, 200, 50);
@@ -388,42 +388,55 @@ mod ogm_processing {
         );
 
         // Sequence number and TQ should not change
-        assert_eq!(engine.originator_table[0].last_seqno, 100);
-        assert_eq!(engine.originator_table[0].max_tq, initial_tq);
+        assert_eq!(engine.originator_table[&mac(2)].last_seqno, 100);
+        assert_eq!(engine.originator_table[&mac(2)].max_tq, initial_tq);
     }
 
     #[test]
-    fn test_originator_table_capacity() {
+    fn test_full_table_evicts_least_recently_heard() {
         let mut engine: BatmanEngine<4> = BatmanEngine::new(mac(1));
 
-        // Fill table to capacity (4 originators)
-        for orig in 10..14 {
+        // Fill the table to capacity (4 originators), each first heard at a
+        // distinct, increasing time so they have a clear staleness order.
+        for (i, orig) in (10..14).enumerate() {
             let ogm = make_ogm(orig, orig, 1, 255, 50);
             let frame = make_link_frame(orig, 0xff, ETH_P_BATMAN, ogm);
             let mut reply_buffer = [0u8; 256];
             let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
             engine.handle_rx(
-                core::time::Duration::ZERO,
+                core::time::Duration::from_secs(i as u64),
                 parse_link_frame(&frame),
                 &mut reply,
             );
         }
-
         assert_eq!(engine.originator_table.len(), 4);
 
-        // Try to add one more (should be dropped)
+        // A newly heard originator must be admitted, evicting the
+        // least-recently-refreshed entry (originator 10, heard at t=0) rather
+        // than being dropped.
         let ogm = make_ogm(20, 20, 1, 255, 50);
         let frame = make_link_frame(20, 0xff, ETH_P_BATMAN, ogm);
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
         engine.handle_rx(
-            core::time::Duration::ZERO,
+            core::time::Duration::from_secs(100),
             parse_link_frame(&frame),
             &mut reply,
         );
 
-        // Table should still be 4 (new entry dropped)
         assert_eq!(engine.originator_table.len(), 4);
+        assert!(
+            engine.originator_table.contains_key(&mac(20)),
+            "the newly heard originator must be admitted"
+        );
+        assert!(
+            !engine.originator_table.contains_key(&mac(10)),
+            "the least-recently-heard originator must be evicted"
+        );
+        // The other three are untouched.
+        for orig in 11..14 {
+            assert!(engine.originator_table.contains_key(&mac(orig)));
+        }
     }
 }
 
@@ -683,7 +696,7 @@ mod edge_cases {
         }
 
         // Should have the highest sequence number
-        assert_eq!(engine.originator_table[0].last_seqno, 300);
+        assert_eq!(engine.originator_table[&mac(2)].last_seqno, 300);
     }
 
     #[test]
@@ -706,9 +719,9 @@ mod edge_cases {
         }
 
         assert_eq!(engine.originator_table.len(), 1);
-        assert_eq!(engine.originator_table[0].paths.len(), 4);
+        assert_eq!(engine.originator_table[&mac(10)].paths.len(), 4);
         // Best path should be via neighbor 2 (highest TQ)
-        assert_eq!(engine.originator_table[0].best_next_hop, mac(2));
+        assert_eq!(engine.originator_table[&mac(10)].best_next_hop, mac(2));
     }
 
     #[test]
@@ -747,7 +760,7 @@ mod edge_cases {
             &mut reply,
         );
 
-        assert_eq!(engine.originator_table[0].paths[0].last_tq, 190);
+        assert_eq!(engine.originator_table[&mac(5)].paths[0].last_tq, 190);
 
         // Second OGM from same originator via same neighbor with different TQ
         let ogm2 = make_ogm(5, 2, 2, 250, 50);
@@ -759,8 +772,8 @@ mod edge_cases {
         );
 
         // Path metric should be updated
-        assert_eq!(engine.originator_table[0].paths[0].last_tq, 240);
-        assert_eq!(engine.originator_table[0].paths.len(), 1); // Still just one path
+        assert_eq!(engine.originator_table[&mac(5)].paths[0].last_tq, 240);
+        assert_eq!(engine.originator_table[&mac(5)].paths.len(), 1); // Still just one path
     }
 }
 
@@ -1281,7 +1294,7 @@ mod route_expiry {
 
         // Originator 8 is gone; originator 9 survives on its one fresh path.
         assert_eq!(engine.originator_table.len(), 1);
-        let r = &engine.originator_table[0];
+        let r = &engine.originator_table[&mac(9)];
         assert_eq!(r.neighbor_ident, mac(9));
         assert_eq!(r.paths.len(), 1);
         assert_eq!(r.paths[0].neighbor_ident, mac(3));

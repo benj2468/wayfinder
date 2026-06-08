@@ -25,10 +25,9 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
     /// which additionally ignores paths that have gone stale since the last
     /// sweep.
     pub fn lookup_route(&self, destination: Mac) -> Option<Mac> {
-        // Look up the final target node in our calculated originator records
+        // O(1) keyed lookup of the destination's record.
         self.originator_table
-            .iter()
-            .find(|record| record.neighbor_ident == destination)
+            .get(&destination)
             .map(|record| record.best_next_hop)
     }
 
@@ -40,10 +39,7 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
     ///
     /// [`ORIGINATOR_TIMEOUT`]: crate::ORIGINATOR_TIMEOUT
     pub fn next_hop(&self, destination: Mac, now: core::time::Duration) -> Option<Mac> {
-        let record = self
-            .originator_table
-            .iter()
-            .find(|record| record.neighbor_ident == destination)?;
+        let record = self.originator_table.get(&destination)?;
         record
             .paths
             .iter()
@@ -65,9 +61,9 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
         // `record.rx_time` is the freshest of its paths' `rx_time`s, a surviving
         // record always keeps at least one fresh path.
         self.originator_table
-            .retain(|r| now.saturating_sub(r.rx_time) <= crate::ORIGINATOR_TIMEOUT);
+            .retain(|_, r| now.saturating_sub(r.rx_time) <= crate::ORIGINATOR_TIMEOUT);
 
-        for record in self.originator_table.iter_mut() {
+        for record in self.originator_table.values_mut() {
             record
                 .paths
                 .retain(|p| now.saturating_sub(p.rx_time) <= crate::ORIGINATOR_TIMEOUT);
@@ -196,31 +192,32 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
 
                 let incoming_seqno = u32::from_be(ogm.seqno);
 
-                // Look for or initialize the originator destination entry
-                let mut record_idx = self
-                    .originator_table
-                    .iter()
-                    .position(|r| r.neighbor_ident == orig_ident);
-
-                if record_idx.is_none() {
-                    // TODO(bjc) Instead of dropping, we should rotate out the oldest record
-                    if self.originator_table.len() >= MAX_ORIGINATORS {
-                        return RoutingAction::Consumed; // Table full, drop packet
+                // Find or create the originator's record, keyed by its MAC.
+                if !self.originator_table.contains_key(&orig_ident) {
+                    // Table full: evict the least-recently-refreshed originator
+                    // to make room rather than dropping this newly heard one.
+                    if self.originator_table.len() >= MAX_ORIGINATORS
+                        && let Some(oldest) = self
+                            .originator_table
+                            .values()
+                            .min_by_key(|r| r.rx_time)
+                            .map(|r| r.neighbor_ident)
+                    {
+                        self.originator_table.remove(&oldest);
                     }
                     let new_record = OriginatorRecord {
                         rx_time: now,
-                        neighbor_ident: ogm.orig,
+                        neighbor_ident: orig_ident,
                         best_next_hop: frame.src,
                         max_tq: 0,
                         last_seqno: 0,
                         paths: heapless::Vec::new(),
                     };
-                    tracing::info!("Discovered new originator: {:?}", new_record.neighbor_ident);
-                    let _ = self.originator_table.push(new_record);
-                    record_idx = Some(self.originator_table.len() - 1);
+                    tracing::info!("Discovered new originator: {:?}", orig_ident);
+                    let _ = self.originator_table.insert(orig_ident, new_record);
                 }
 
-                let record = &mut self.originator_table[record_idx.unwrap()];
+                let record = self.originator_table.get_mut(&orig_ident).unwrap();
 
                 // Whether this OGM carries a *strictly newer* sequence number
                 // than any we've already processed from this originator.
