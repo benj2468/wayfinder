@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::interval;
 
 use crate::{
-    switch::{PortComms, PortConfig, Switch},
+    switch::{PortComms, PortConfig, PortId, Switch},
     test_router::TestRouter,
 };
 
@@ -27,6 +27,21 @@ pub struct TestMachineConfig {
     pub wayfinder: wayfinder::config::Config,
 }
 
+/// Everything needed to rebuild a machine after it has been taken offline: its
+/// stable mesh identity and the switches it attaches to.  Captured at build
+/// time so [`disconnect_machine`](TestHarness::disconnect_machine) /
+/// [`reconnect_machine`](TestHarness::reconnect_machine) can churn a node
+/// without the test having to remember its wiring.
+#[derive(Clone)]
+struct MachineSpec {
+    /// The node's mesh identity, preserved across reconnects so neighbors see
+    /// the *same* originator come and go (as with a rebooting device).
+    mac: Mac,
+    /// Names of the switches this node is wired to, one mesh interface each, in
+    /// the original interface order.
+    switches: Vec<String>,
+}
+
 #[derive(Default)]
 pub struct TestHarness {
     pub switches: HashMap<String, Switch<Mac>>,
@@ -36,6 +51,13 @@ pub struct TestHarness {
     /// every frame it processes, so received originator records age against the
     /// time the test controls rather than wall-clock.
     pub clock: Duration,
+    /// Per-machine wiring, keyed by machine name, retained so a node taken
+    /// offline can be brought back with its original identity and links.
+    specs: HashMap<String, MachineSpec>,
+    /// Per-machine switch-port handles, keyed by machine name and in interface
+    /// order, so a single link's loss can be tuned (up/down) without disturbing
+    /// the node.  Refreshed whenever a node is (re)wired.
+    links: HashMap<String, Vec<(String, PortId)>>,
 }
 
 impl TestHarness {
@@ -54,7 +76,11 @@ impl TestHarness {
         }
     }
 
-    pub async fn tick(&mut self) {
+    /// Advance the simulation by one step: let every node transmit then receive
+    /// at the current virtual clock, then let every switch forward what is on
+    /// the wire.  Returns the number of frames the switches pulled off the wire
+    /// this step; `0` means no node transmitted, i.e. the fabric is quiescent.
+    pub async fn tick(&mut self) -> usize {
         let mut int = interval(Duration::from_hours(1));
         int.tick().await;
 
@@ -72,9 +98,37 @@ impl TestHarness {
                 .run_once(now, &mut int, true, false, false)
                 .now_or_never();
         }
+        let mut frames = 0;
         for (_, switch) in self.switches.iter_mut() {
-            switch.tick().await.unwrap();
+            frames += switch.tick().await.unwrap();
         }
+        frames
+    }
+
+    /// Emit one OGM round at virtual instant `at`, then tick until the mesh
+    /// fully converges — that is, until a tick moves **zero** frames, meaning no
+    /// node has anything left to flood or forward.  During a convergence phase
+    /// OGMs are the only traffic, so silence means every node's routing tables
+    /// have settled.
+    ///
+    /// This loops with **no internal bound**: a mesh that never settles (for
+    /// example because of an OGM forwarding loop) makes this run forever.
+    /// Callers must wrap the call in [`tokio::time::timeout`] so non-convergence
+    /// surfaces as a test failure instead of a hang — the timeout doubles as the
+    /// "the mesh converged" assertion, and keeps large meshes (hundreds of
+    /// nodes) honest about how long settling is allowed to take.
+    pub async fn converge(&mut self, at: Duration) {
+        self.poll(at).await;
+        // Tick until a full sweep is silent: the freshly polled OGMs flood out,
+        // get forwarded hop by hop, and re-flooding dies once every node has
+        // seen each (originator, seqno).
+        while self.tick().await > 0 {}
+        // Confirm the fabric stays silent — no straggling OGM resurges.
+        assert_eq!(
+            self.tick().await,
+            0,
+            "mesh kept producing frames after it should have converged"
+        );
     }
 
     pub fn get_machine(&self, name: &str) -> &TestRouter {
@@ -85,7 +139,53 @@ impl TestHarness {
         self.machines.get_mut(name).unwrap()
     }
 
-    pub fn add_switch_port(&mut self, switch_name: &str) -> PortComms {
+    /// Take a machine offline: drop its router so it stops originating and
+    /// forwarding OGMs and no longer accepts frames — the simulation equivalent
+    /// of a node losing power or its radio.  Its former switch ports go dead
+    /// (their receiver is dropped); the fabric tolerates that and simply fails
+    /// to deliver to them.
+    ///
+    /// The node's identity and wiring are retained, so
+    /// [`reconnect_machine`](Self::reconnect_machine) can bring the *same* node
+    /// back later.  Panics if the machine is unknown or already disconnected.
+    pub fn disconnect_machine(&mut self, name: &str) {
+        assert!(
+            self.specs.contains_key(name),
+            "unknown machine '{name}' (never built)"
+        );
+        assert!(
+            self.machines.remove(name).is_some(),
+            "machine '{name}' is already disconnected"
+        );
+    }
+
+    /// Bring a previously [`disconnected`](Self::disconnect_machine) machine
+    /// back online with its original identity, freshly attached to the same
+    /// switches.  The reborn node starts with **empty** routing tables — exactly
+    /// like a rebooted device — so it must re-converge from OGMs before it can
+    /// route again.  Panics if the machine is unknown or currently connected.
+    pub fn reconnect_machine(&mut self, name: &str) {
+        assert!(
+            !self.machines.contains_key(name),
+            "machine '{name}' is already connected"
+        );
+        let spec = self
+            .specs
+            .get(name)
+            .unwrap_or_else(|| panic!("unknown machine '{name}' (never built)"))
+            .clone();
+        // Fresh ports (the old ones went dead when the node was removed); record
+        // the new handles so link tuning targets the live wiring.
+        let (interfaces, handles) = self.wire_links(&spec.switches);
+        self.links.insert(name.to_string(), handles);
+        self.machines
+            .insert(name.to_string(), TestRouter::new(spec.mac, interfaces));
+    }
+
+    /// Attach a fresh port to `switch_name`, returning the node's end of the
+    /// duplex and the [`PortId`] the switch assigned it (so the link can later
+    /// have its loss tuned to model the wire going up or down).
+    pub fn add_switch_port(&mut self, switch_name: &str) -> (PortComms, PortId) {
         let switch = self
             .switches
             .get_mut(switch_name)
@@ -93,11 +193,64 @@ impl TestHarness {
 
         let (router_comms, switch_comms) = PortComms::pair(10);
 
-        switch
+        let port = switch
             .add_port(switch_comms, PortConfig::no_loss())
             .unwrap();
 
-        router_comms
+        (router_comms, port)
+    }
+
+    /// Allocate one switch port per named switch (in interface order), returning
+    /// the node-side duplexes to build a [`TestRouter`] from and the
+    /// `(switch, port)` handles to record for link tuning.
+    fn wire_links(&mut self, switches: &[String]) -> (Vec<PortComms>, Vec<(String, PortId)>) {
+        let mut comms = Vec::with_capacity(switches.len());
+        let mut handles = Vec::with_capacity(switches.len());
+        for switch in switches {
+            let (pc, port) = self.add_switch_port(switch);
+            comms.push(pc);
+            handles.push((switch.clone(), port));
+        }
+        (comms, handles)
+    }
+
+    /// Model node `name`'s interface `iface` losing its link: the switch drops
+    /// **all** traffic in both directions on that port.  Unlike
+    /// [`disconnect_machine`](Self::disconnect_machine), the node keeps running
+    /// and **retains its routing tables** — only the wire is dead — so this is a
+    /// link/radio outage, not a reboot.  Its neighbors stop hearing it and age
+    /// it out; the node itself ages out anything it could only reach through the
+    /// downed link.  Panics if the machine or interface is unknown.
+    pub fn fail_link(&mut self, name: &str, iface: usize) {
+        self.set_link_loss(name, iface, 1.0, 1.0);
+    }
+
+    /// Restore a link previously downed with [`fail_link`](Self::fail_link):
+    /// traffic flows loss-free again.  Because the node never lost state, the
+    /// mesh re-converges simply by the two ends hearing each other once more.
+    /// Panics if the machine or interface is unknown.
+    pub fn restore_link(&mut self, name: &str, iface: usize) {
+        self.set_link_loss(name, iface, 0.0, 0.0);
+    }
+
+    /// Set the per-direction loss probabilities on node `name`'s interface
+    /// `iface` (its port on the corresponding switch).  `outgoing` is the
+    /// switch→node direction and `incoming` the node→switch direction, each in
+    /// `[0.0, 1.0]`, so tests can model fully or partially degraded links.
+    /// Panics if the machine or interface is unknown.
+    pub fn set_link_loss(&mut self, name: &str, iface: usize, outgoing: f64, incoming: f64) {
+        let (switch_name, port) = self
+            .links
+            .get(name)
+            .unwrap_or_else(|| panic!("unknown machine '{name}' (never built)"))
+            .get(iface)
+            .unwrap_or_else(|| panic!("machine '{name}' has no interface {iface}"))
+            .clone();
+        self.switches
+            .get_mut(&switch_name)
+            .expect("switch backing the link is missing")
+            .update_port(port, PortConfig::new(outgoing, incoming))
+            .expect("link port is missing from its switch");
     }
 }
 
@@ -123,7 +276,28 @@ impl TestConfig {
             }
         }
         for (i, machine) in self.machines.iter().enumerate() {
-            let router = TestRouter::new_from_config(&mut h, mac(i as u8), &machine.wayfinder);
+            let ident = mac(i as u8);
+            // Capture the wiring so the node can be churned offline/online or
+            // have individual links failed later.
+            let switches: Vec<String> = machine
+                .wayfinder
+                .links
+                .iter()
+                .map(|link| match link {
+                    wayfinder::config::LinkConfig::Test { switch_name } => switch_name.clone(),
+                    _ => panic!("test harness supports only Test links"),
+                })
+                .collect();
+            let (interfaces, handles) = h.wire_links(&switches);
+            let router = TestRouter::new(ident, interfaces);
+            h.specs.insert(
+                machine.name.clone(),
+                MachineSpec {
+                    mac: ident,
+                    switches,
+                },
+            );
+            h.links.insert(machine.name.clone(), handles);
             if h.machines.insert(machine.name.clone(), router).is_some() {
                 return Err(format!(
                     "Machine '{}' is defined multiple times",

@@ -13,11 +13,19 @@ use crate::Direction;
 
 pub struct PortConfig {
     // TODO: will support vlans
+    /// Probability `[0.0, 1.0]` of dropping a frame on the switch→node egress
+    /// toward this port (this node failing to *hear* the fabric).
     outgoing_loss: f64,
+    /// Probability `[0.0, 1.0]` of dropping a frame on the node→switch ingress
+    /// from this port (this node failing to *reach* the fabric).
     incoming_loss: f64,
 }
 
 impl PortConfig {
+    /// A port with the given drop probabilities: `outgoing_loss` on the
+    /// switch→node direction, `incoming_loss` on the node→switch direction.
+    /// Setting both to `1.0` takes the port's link fully down in both
+    /// directions; `0.0`/`0.0` is a perfect link (see [`no_loss`](Self::no_loss)).
     pub fn new(outgoing_loss: f64, incoming_loss: f64) -> Self {
         Self {
             outgoing_loss,
@@ -25,6 +33,7 @@ impl PortConfig {
         }
     }
 
+    /// A perfect, lossless port (both directions deliver every frame).
     pub fn no_loss() -> Self {
         Self {
             outgoing_loss: 0.0,
@@ -197,9 +206,12 @@ where
         Ok(())
     }
 
-    /// Tick the switch, multiplexing messages between ports and calling the tap handlers
+    /// Tick the switch, multiplexing messages between ports and calling the tap
+    /// handlers.  Returns the number of frames pulled off the wire this tick
+    /// (i.e. frames nodes transmitted into the fabric); callers use a zero count
+    /// as the signal that the fabric has fallen silent.
     #[tracing::instrument(skip(self), fields(name = self.name))]
-    pub async fn tick(&mut self) -> Result<(), SwitchError> {
+    pub async fn tick(&mut self) -> Result<usize, SwitchError> {
         // Flush all messages in the switch's buffer
         let mut msgs = self
             .ports
@@ -215,6 +227,11 @@ where
                 Ok((*id, msgs))
             })
             .collect::<Result<Vec<_>, SwitchError>>()?;
+
+        // Count of frames received from the ports this tick.  A tick that pulls
+        // nothing off the wire means no node transmitted, so the fabric is
+        // quiescent — the convergence loop's stop condition.
+        let frames_in: usize = msgs.iter().map(|(_, m)| m.len()).sum();
 
         // Loop over all and register the source ident for each message
         for (id, msgs) in msgs.iter_mut() {
@@ -247,30 +264,38 @@ where
             }
         }
 
-        // Loop over all and forward to destination, or all ports if destination port not specifically known
+        // Forward each frame toward its destination (or flood when the
+        // destination is unknown).  A port's `outgoing_loss` is the switch→node
+        // egress drop, applied here keyed on the *destination* port — so a port
+        // configured for total loss is deaf to the fabric, the complement of
+        // `incoming_loss` muting its transmissions above.  Together they let a
+        // single port's link be taken fully up or down.
         for (port, msgs) in msgs {
             tracing::trace!(port_id = ?port, "processing {:?} messages", msgs.len());
-            let port_config = self.ports.get(&port).unwrap();
             for mut msg in msgs {
                 tracing::trace!(port_id = ?port, direction = ?Direction::ToSwitch, "{}", pretty_hex(&msg));
-                if self.rng.random_bool(port_config.config.outgoing_loss) {
-                    continue;
-                }
 
                 let Ok((dest, _)) = Ident::ref_from_prefix(&msg) else {
                     continue;
                 };
 
                 tracing::trace!(dest = ?dest, "forwarding message to dests: {:?}", self.ident_map.get(dest));
-                if let Some(dest_port) = self.ident_map.get(dest) {
+                if let Some(dest_port) = self.ident_map.get(dest).copied() {
+                    // Drop on the wire toward the destination node if its link is lossy.
+                    if self
+                        .rng
+                        .random_bool(self.ports.get(&dest_port).unwrap().config.outgoing_loss)
+                    {
+                        continue;
+                    }
                     tracing::trace!(port_id = ?dest_port, direction = ?Direction::FromSwitch, "{}", pretty_hex(&msg));
                     // Send to specific destination port
-                    if let Some(taps) = self.taps.get_mut(dest_port) {
+                    if let Some(taps) = self.taps.get_mut(&dest_port) {
                         for tap in taps.iter_mut() {
                             if !(tap.clb)(TapMeta {
                                 data: msg.as_mut_slice(),
                                 direction: Direction::FromSwitch,
-                                id: *dest_port,
+                                id: dest_port,
                             }) {
                                 tap.invalid = true;
                             }
@@ -280,17 +305,21 @@ where
 
                     let _ = self
                         .ports
-                        .get(dest_port)
+                        .get(&dest_port)
                         .unwrap()
                         .duplex
                         .egress
                         .send(msg.clone())
                         .await;
                 } else {
-                    // Broadcast to all ports except source
+                    // Broadcast to all ports except source, each copy subject to
+                    // that port's own egress loss.
                     for (other_port_id, other_port) in self.ports.iter() {
                         if *other_port_id == port {
                             continue; // Don't send back to source
+                        }
+                        if self.rng.random_bool(other_port.config.outgoing_loss) {
+                            continue;
                         }
                         tracing::trace!(port_id = ?other_port_id, direction = ?Direction::FromSwitch, "{}", pretty_hex(&msg));
 
@@ -313,7 +342,7 @@ where
             }
         }
 
-        Ok(())
+        Ok(frames_in)
     }
 }
 
@@ -495,17 +524,18 @@ mod tests {
 
         // Create port with 100% outgoing loss
         let (tx1, mut rx1, port1) = create_port_pair(10);
-        let (_, _, port2) = create_port_pair(10);
+        let (_, mut rx2, port2) = create_port_pair(10);
 
         switch.add_port(port1, PortConfig::no_loss()).unwrap();
         switch.add_port(port2, PortConfig::new(1.0, 0.0)).unwrap(); // 100% outgoing loss
 
-        // Send frame from port 1 (source learns)
+        // Send frame from port 1 (source learns); dst is unknown so it floods.
         tx1.send(make_frame(1, 99)).await.unwrap();
         switch.tick().await.unwrap();
 
-        // Port 2 should have received nothing due to outgoing loss
-        // But switch learned port 1 = node 1
+        // Port 2 must receive nothing: its egress (switch→node) is 100% lossy.
+        assert!(rx2.try_recv().is_err());
+        // ...but the switch still learned port 1 = node 1 from the ingress.
 
         // Now send from a third port to node 1 - but port 1 has no outgoing loss
         let (tx3, _, port3) = create_port_pair(10);

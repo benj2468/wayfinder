@@ -136,6 +136,21 @@ fn setup() {
     });
 }
 
+/// Converge the mesh at virtual instant `at`, failing the test if it does not
+/// settle in time.
+///
+/// Delegates to [`TestHarness::converge`], which polls one OGM round and then
+/// ticks until the fabric is completely silent (no node has another frame to
+/// flood or forward).  That loop is unbounded, so this wraps it in a real-time
+/// `tokio` timeout: a mesh that never settles — e.g. an OGM forwarding loop —
+/// fails fast here instead of hanging, and the timeout serves as the
+/// "converged" assertion.
+async fn converge_at(h: &mut TestHarness, at: Duration) {
+    tokio::time::timeout(Duration::from_secs(10), h.converge(at))
+        .await
+        .expect("mesh did not converge within the timeout");
+}
+
 fn simple_pair() -> TestHarness {
     let mut config = TestConfig::default();
     config.switches.push(TestSwitchConfig {
@@ -593,6 +608,494 @@ async fn traffic_fails_over_when_best_next_hop_disconnects() {
         harness.get_machine("d").local_deliveries(),
         vec![host_frame(d, a, b"hello via failover")],
         "d must receive the unicast over the surviving c→e path"
+    );
+}
+
+/// A direct neighbor that goes offline and later returns must be re-learned,
+/// restoring end-to-end traffic.  Two nodes share a switch; once converged each
+/// knows the other directly.  When machine2 powers off, its route ages out of
+/// machine1's table (no refresh for longer than `ORIGINATOR_TIMEOUT`).  When the
+/// *same* node (same identity, empty tables) comes back, both must rediscover
+/// each other and a unicast must flow again.
+#[tokio::test]
+async fn route_restored_after_neighbor_reconnects() {
+    setup();
+    let mut harness = simple_pair();
+    let m1 = harness.get_machine("machine1").ident;
+    let m2 = harness.get_machine("machine2").ident;
+
+    // Converge: each node learns the other as a direct neighbor.
+    converge_at(&mut harness, Duration::from_secs(1)).await;
+    assert_eq!(
+        harness.get_machine("machine1").router().originator_count(),
+        1
+    );
+    assert_eq!(
+        harness.get_machine("machine2").router().originator_count(),
+        1
+    );
+
+    // machine2 powers off.  Advance well past ORIGINATOR_TIMEOUT (60s) with only
+    // machine1 polling, so machine1's now-unrefreshed route to machine2 ages out.
+    harness.disconnect_machine("machine2");
+    converge_at(&mut harness, Duration::from_secs(80)).await;
+    assert_eq!(
+        harness.get_machine("machine1").router().originator_count(),
+        0,
+        "machine1 must drop the stale route once machine2 stops refreshing it"
+    );
+
+    // machine2 returns with its original identity but empty tables.
+    harness.reconnect_machine("machine2");
+    converge_at(&mut harness, Duration::from_secs(160)).await;
+    assert_eq!(
+        harness.get_machine("machine1").router().originator_count(),
+        1,
+        "machine1 must relearn machine2 after it returns"
+    );
+    assert_eq!(
+        harness.get_machine("machine2").router().originator_count(),
+        1,
+        "the reborn machine2 must relearn machine1"
+    );
+
+    // End-to-end: a unicast flows again over the restored direct link.
+    harness
+        .get_machine_mut("machine1")
+        .send_local(m2, b"welcome back")
+        .await
+        .unwrap();
+    for _ in 0..6 {
+        harness.tick().await;
+    }
+    assert_eq!(
+        harness.get_machine("machine2").local_deliveries(),
+        vec![host_frame(m2, m1, b"welcome back")],
+        "machine2 must receive traffic again after reconnecting"
+    );
+}
+
+/// When the *only* relay on a line goes offline there is no alternate path, so
+/// traffic must black-hole rather than be misdelivered; when the relay returns
+/// the path heals.  In [`line_of_three`] machine1 reaches machine3 solely
+/// through machine2.  Dropping machine2 leaves machine1 with no route once the
+/// stale entry ages out — machine3 hears nothing more — and reconnecting it
+/// restores delivery.
+#[tokio::test]
+async fn sole_relay_disconnect_blackholes_then_recovers() {
+    setup();
+    let mut harness = line_of_three();
+    let m1 = harness.get_machine("machine1").ident;
+    let m3 = harness.get_machine("machine3").ident;
+
+    // Converge the line, then confirm the baseline machine1 → machine3 delivery
+    // over the relay.
+    converge_at(&mut harness, Duration::from_secs(1)).await;
+    for (_, r) in harness.machines.iter() {
+        assert_eq!(r.router().originator_count(), 2);
+    }
+    harness
+        .get_machine_mut("machine1")
+        .send_local(m3, b"before")
+        .await
+        .unwrap();
+    for _ in 0..8 {
+        harness.tick().await;
+    }
+    assert_eq!(
+        harness.get_machine("machine3").local_deliveries(),
+        vec![host_frame(m3, m1, b"before")],
+        "baseline: machine3 receives over the relay"
+    );
+
+    // The sole relay drops.  After the stale route ages out machine1 has nowhere
+    // to forward, so a send must not reach machine3.
+    harness.disconnect_machine("machine2");
+    converge_at(&mut harness, Duration::from_secs(80)).await;
+    assert_eq!(
+        harness.get_machine("machine1").router().originator_count(),
+        0,
+        "with the relay gone, machine1's routes to both 2 and 3 age out"
+    );
+    harness
+        .get_machine_mut("machine1")
+        .send_local(m3, b"lost")
+        .await
+        .ok();
+    for _ in 0..8 {
+        harness.tick().await;
+    }
+    assert_eq!(
+        harness.get_machine("machine3").local_deliveries(),
+        vec![host_frame(m3, m1, b"before")],
+        "no new delivery while the only relay is offline"
+    );
+
+    // The relay returns; after re-convergence the path heals end-to-end.
+    harness.reconnect_machine("machine2");
+    converge_at(&mut harness, Duration::from_secs(160)).await;
+    for name in ["machine1", "machine2", "machine3"] {
+        assert_eq!(
+            harness.get_machine(name).router().originator_count(),
+            2,
+            "{name} must re-converge after the relay returns"
+        );
+    }
+    harness
+        .get_machine_mut("machine1")
+        .send_local(m3, b"after")
+        .await
+        .unwrap();
+    for _ in 0..8 {
+        harness.tick().await;
+    }
+    assert_eq!(
+        harness.get_machine("machine3").local_deliveries(),
+        vec![host_frame(m3, m1, b"before"), host_frame(m3, m1, b"after"),],
+        "delivery resumes once the relay is back"
+    );
+}
+
+/// After failing over to a longer path, a node must *reclaim* the preferred
+/// shorter path when its best next hop comes back.  In
+/// [`two_paths_unequal_length`] `a` prefers `b` (2 hops, higher TQ).  Losing `b`
+/// forces failover to the lower-TQ `c→e` path; when `b` returns its higher-TQ
+/// OGMs must promote it back to best next hop (the engine lowers `max_tq` to the
+/// surviving path on purge, so the returning higher-TQ path wins again).
+#[tokio::test]
+async fn best_hop_reclaims_preferred_path_after_reconnect() {
+    setup();
+    let mut harness = two_paths_unequal_length();
+    let a = harness.get_machine("a").ident;
+    let b = harness.get_machine("b").ident;
+    let c = harness.get_machine("c").ident;
+    let d = harness.get_machine("d").ident;
+
+    let best_hop_to_d = |h: &TestHarness| {
+        h.get_machine("a")
+            .router()
+            .originator_table()
+            .find(|r| r.neighbor_ident == d)
+            .map(|r| r.best_next_hop)
+    };
+
+    // Converge: `a` prefers the 2-hop path via `b`.
+    for round in 1..=3 {
+        converge_at(&mut harness, Duration::from_secs(round)).await;
+    }
+    assert_eq!(
+        best_hop_to_d(&harness),
+        Some(b),
+        "a should prefer the shorter path via b"
+    );
+
+    // `b` drops; after the stale high-TQ path ages out, `a` fails over to c→e.
+    harness.disconnect_machine("b");
+    for secs in (100..=600).step_by(100) {
+        converge_at(&mut harness, Duration::from_secs(secs)).await;
+    }
+    assert_eq!(
+        best_hop_to_d(&harness),
+        Some(c),
+        "with b gone, a must fall back to the c→e path"
+    );
+
+    // `b` returns; its shorter, higher-TQ path must be reclaimed as preferred.
+    harness.reconnect_machine("b");
+    for secs in (700..=1200).step_by(100) {
+        converge_at(&mut harness, Duration::from_secs(secs)).await;
+    }
+    assert_eq!(
+        best_hop_to_d(&harness),
+        Some(b),
+        "once b is back its higher-TQ path must win again"
+    );
+
+    // And traffic flows over the restored preferred path.
+    harness
+        .get_machine_mut("a")
+        .send_local(d, b"preferred again")
+        .await
+        .unwrap();
+    for _ in 0..10 {
+        harness.tick().await;
+    }
+    assert_eq!(
+        harness.get_machine("d").local_deliveries(),
+        vec![host_frame(d, a, b"preferred again")],
+        "d must receive over the reclaimed b path"
+    );
+}
+
+/// Repeated churn on the relay must not corrupt routing: after a node flaps
+/// offline/online several times, the mesh must still converge and carry traffic.
+/// Each cycle keeps machine2 down long enough for its routes to age out, then
+/// brings it back, stressing the relearning path under repeated disruption.
+#[tokio::test]
+async fn flapping_relay_reconverges() {
+    setup();
+    let mut harness = line_of_three();
+    let m1 = harness.get_machine("machine1").ident;
+    let m3 = harness.get_machine("machine3").ident;
+
+    converge_at(&mut harness, Duration::from_secs(1)).await;
+
+    // Flap the relay three times.  Each down/up leg advances the clock by more
+    // than ORIGINATOR_TIMEOUT so routes fully age out between transitions.
+    let mut clock = 60u64;
+    for _ in 0..3 {
+        harness.disconnect_machine("machine2");
+        clock += 80;
+        converge_at(&mut harness, Duration::from_secs(clock)).await;
+
+        harness.reconnect_machine("machine2");
+        clock += 80;
+        converge_at(&mut harness, Duration::from_secs(clock)).await;
+    }
+
+    // After the churn settles the line must be fully converged again...
+    clock += 80;
+    converge_at(&mut harness, Duration::from_secs(clock)).await;
+    for name in ["machine1", "machine2", "machine3"] {
+        assert_eq!(
+            harness.get_machine(name).router().originator_count(),
+            2,
+            "{name} must re-converge after repeated relay flaps"
+        );
+    }
+
+    // ...and end-to-end traffic flows.
+    harness
+        .get_machine_mut("machine1")
+        .send_local(m3, b"still here")
+        .await
+        .unwrap();
+    for _ in 0..8 {
+        harness.tick().await;
+    }
+    assert_eq!(
+        harness.get_machine("machine3").local_deliveries(),
+        vec![host_frame(m3, m1, b"still here")],
+        "the line must carry traffic after the relay's churn settles"
+    );
+}
+
+/// Two nodes on disjoint paths can drop simultaneously and the mesh must both
+/// black-hole correctly and recover.  In [`two_paths_unequal_length`] `a`
+/// reaches `d` via `b` (2 hops) or via `c→e` (3 hops).  Dropping both `b` and
+/// `e` at once severs *every* path to `d`; once it ages out `a` has no route and
+/// traffic is dropped.  Bringing both back restores the mesh, and `a` settles on
+/// the preferred path via `b`.
+#[tokio::test]
+async fn simultaneous_disconnects_blackhole_then_recover() {
+    setup();
+    let mut harness = two_paths_unequal_length();
+    let a = harness.get_machine("a").ident;
+    let b = harness.get_machine("b").ident;
+    let d = harness.get_machine("d").ident;
+
+    let route_to_d = |h: &TestHarness| {
+        h.get_machine("a")
+            .router()
+            .originator_table()
+            .find(|r| r.neighbor_ident == d)
+            .map(|r| r.best_next_hop)
+    };
+
+    // Converge both a→d paths.
+    for round in 1..=3 {
+        converge_at(&mut harness, Duration::from_secs(round)).await;
+    }
+    assert!(
+        route_to_d(&harness).is_some(),
+        "a should know a route to d after convergence"
+    );
+
+    // Both relays — b (the 2-hop path) and e (the tail of the c→e path) — drop at
+    // once.  a→d now has no surviving path.
+    harness.disconnect_machine("b");
+    harness.disconnect_machine("e");
+    for secs in (100..=600).step_by(100) {
+        converge_at(&mut harness, Duration::from_secs(secs)).await;
+    }
+    assert_eq!(
+        route_to_d(&harness),
+        None,
+        "with both b and e gone, a must have no route to d"
+    );
+
+    let before = harness.get_machine("d").local_deliveries().len();
+    harness
+        .get_machine_mut("a")
+        .send_local(d, b"into the void")
+        .await
+        .ok();
+    for _ in 0..10 {
+        harness.tick().await;
+    }
+    assert_eq!(
+        harness.get_machine("d").local_deliveries().len(),
+        before,
+        "no delivery while both paths are down"
+    );
+
+    // Both return; `a` re-converges and prefers the restored 2-hop path via `b`.
+    harness.reconnect_machine("b");
+    harness.reconnect_machine("e");
+    for secs in (700..=1300).step_by(100) {
+        converge_at(&mut harness, Duration::from_secs(secs)).await;
+    }
+    assert_eq!(
+        route_to_d(&harness),
+        Some(b),
+        "a should reconverge onto the preferred path via b"
+    );
+    harness
+        .get_machine_mut("a")
+        .send_local(d, b"back online")
+        .await
+        .unwrap();
+    for _ in 0..10 {
+        harness.tick().await;
+    }
+    assert_eq!(
+        harness.get_machine("d").local_deliveries(),
+        vec![host_frame(d, a, b"back online")],
+        "delivery resumes once both paths are restored"
+    );
+}
+
+// ── link-down scenarios (the wire dies, the node lives) ───────────────────
+//
+// Distinct from the reboot tests above: `disconnect_machine` removes a node and
+// it returns with empty tables, whereas `fail_link` drives a single switch port
+// to 100% loss so the node keeps running and *retains its routing state* — only
+// that link is dead.  These exercise that second failure mode.
+
+/// A link going *down* (rather than a node rebooting) must also trigger
+/// failover, and restoring the link must reclaim the preferred path.  Here the
+/// wire between `a` and `b` is cut — `b` keeps running and serving the rest of
+/// the mesh — so `a` loses its 2-hop path and falls back to c→e; once the link
+/// is restored `a` re-hears `b` and promotes the shorter path again.
+#[tokio::test]
+async fn link_down_triggers_failover_then_restore_reclaims() {
+    setup();
+    let mut harness = two_paths_unequal_length();
+    let a = harness.get_machine("a").ident;
+    let b = harness.get_machine("b").ident;
+    let c = harness.get_machine("c").ident;
+    let d = harness.get_machine("d").ident;
+
+    let best_hop_to_d = |h: &TestHarness| {
+        h.get_machine("a")
+            .router()
+            .originator_table()
+            .find(|r| r.neighbor_ident == d)
+            .map(|r| r.best_next_hop)
+    };
+
+    for round in 1..=3 {
+        converge_at(&mut harness, Duration::from_secs(round)).await;
+    }
+    assert_eq!(
+        best_hop_to_d(&harness),
+        Some(b),
+        "a should prefer the 2-hop path via b"
+    );
+
+    // Cut a's link to b (interface 0 = switch "ab").  b stays alive — only the
+    // a–b wire is dead — so the path to d via b ages out at a while b itself
+    // never reboots.
+    harness.fail_link("a", 0);
+    for secs in (100..=600).step_by(100) {
+        converge_at(&mut harness, Duration::from_secs(secs)).await;
+    }
+    assert_eq!(
+        best_hop_to_d(&harness),
+        Some(c),
+        "with the a–b link down, a must fail over to c→e"
+    );
+    // The contrast with a reboot: b kept running throughout, so it still holds
+    // its own (unaffected) route to d.
+    assert!(
+        harness
+            .get_machine("b")
+            .router()
+            .originator_table()
+            .any(|r| r.neighbor_ident == d),
+        "b stayed up and must retain its route to d over the healthy b–d link"
+    );
+
+    // Restore the wire; a re-hears b's higher-TQ OGMs and reclaims the short path.
+    harness.restore_link("a", 0);
+    for secs in (700..=1200).step_by(100) {
+        converge_at(&mut harness, Duration::from_secs(secs)).await;
+    }
+    assert_eq!(
+        best_hop_to_d(&harness),
+        Some(b),
+        "restoring the a–b link must reclaim the preferred path via b"
+    );
+
+    harness
+        .get_machine_mut("a")
+        .send_local(d, b"link back up")
+        .await
+        .unwrap();
+    for _ in 0..10 {
+        harness.tick().await;
+    }
+    assert_eq!(
+        harness.get_machine("d").local_deliveries(),
+        vec![host_frame(d, a, b"link back up")],
+        "d must receive over the reclaimed b path"
+    );
+}
+
+/// A brief link outage must not cost a node its routing state.  Because a
+/// link-down (unlike a reboot) leaves the node's tables intact, a blip shorter
+/// than `ORIGINATOR_TIMEOUT` loses no routes: machine1's only link drops and is
+/// restored well within the 60s timeout, so its routes to both machine2 and
+/// machine3 survive and traffic resumes with no re-convergence.
+#[tokio::test]
+async fn brief_link_blip_preserves_routes() {
+    setup();
+    let mut harness = line_of_three();
+    let m1 = harness.get_machine("machine1").ident;
+    let m3 = harness.get_machine("machine3").ident;
+
+    converge_at(&mut harness, Duration::from_secs(1)).await;
+    // converge_at(&mut harness, Duration::from_secs(2)).await;
+    assert_eq!(
+        harness.get_machine("machine1").router().originator_count(),
+        2
+    );
+
+    // machine1's only link (interface 0) drops, then returns well inside
+    // ORIGINATOR_TIMEOUT.  No poll crosses the timeout, so nothing ages out.
+    harness.fail_link("machine1", 0);
+    converge_at(&mut harness, Duration::from_secs(30)).await;
+    assert_eq!(
+        harness.get_machine("machine1").router().originator_count(),
+        2,
+        "a sub-timeout blip must not age out machine1's routes — state survives, unlike a reboot"
+    );
+    harness.restore_link("machine1", 0);
+    converge_at(&mut harness, Duration::from_secs(35)).await;
+
+    // Traffic resumes immediately over the still-known route.
+    harness
+        .get_machine_mut("machine1")
+        .send_local(m3, b"blip survived")
+        .await
+        .unwrap();
+    for _ in 0..8 {
+        harness.tick().await;
+    }
+    assert_eq!(
+        harness.get_machine("machine3").local_deliveries(),
+        vec![host_frame(m3, m1, b"blip survived")],
+        "delivery resumes over routes that were never lost"
     );
 }
 

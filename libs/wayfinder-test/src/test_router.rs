@@ -29,7 +29,6 @@ use wayfinder::CentralRouter;
 use wayfinder_driver::{Driver, DynLinkT, FrameIo, Link, QueryRx, QueryTx};
 use zerocopy::{FromBytes, IntoBytes};
 
-use crate::driver::TestHarness;
 use crate::switch::PortComms;
 
 /// EtherType stamped on the synthetic host Ethernet frames [`send_local`]
@@ -176,27 +175,6 @@ pub struct TestRouter {
 }
 
 impl TestRouter {
-    /// Build a test router from a node's wayfinder [`Config`] by allocating a
-    /// switch port per configured test link.
-    ///
-    /// [`Config`]: wayfinder::config::Config
-    pub fn new_from_config(
-        h: &mut TestHarness,
-        mac: Mac,
-        config: &wayfinder::config::Config,
-    ) -> Self {
-        let mut interfaces = vec![];
-        for link in &config.links {
-            match link {
-                wayfinder::config::LinkConfig::Test { switch_name } => {
-                    interfaces.push(h.add_switch_port(switch_name));
-                }
-                _ => panic!("unsupported link type in test mode"),
-            }
-        }
-        Self::new(mac, interfaces)
-    }
-
     /// Create a new test router with the given node identity and one switch-port
     /// duplex per mesh interface.
     pub fn new(ident: Mac, interfaces: Vec<PortComms>) -> Self {
