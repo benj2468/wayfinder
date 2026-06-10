@@ -110,6 +110,7 @@
             programs = {
               nixfmt.enable = true;
               rustfmt.enable = true;
+              ruff.enable = true;
               buf.enable = true;
               yamlfmt.enable = true;
               dockerfmt.enable = true;
