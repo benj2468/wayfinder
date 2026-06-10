@@ -102,19 +102,30 @@ test:run:
     - test:run:python
   script:
     - echo "Test Completed"
-deploy-dev:
+deploy:
   stage: deploy
+  image: docker:latest
+  services:
+    - docker:dind
+  tags:
+    - docker
   needs:
     - test:run
+  # Build the tap and tui images and push them to the registry. A tagged
+  # commit is a release: the images are tagged with the git tag itself
+  # (e.g. wayfinder-tap:v1.2.3). Any other commit is a dev build, tagged
+  # dev-<short commit sha>. Registry auth follows the build-image job's
+  # convention (the runner is pre-authenticated to $CI_REGISTRY_IMAGE).
   script:
-    - echo "This job deploys something from the $CI_COMMIT_BRANCH branch."
-  environment: dev
-deploy-prod:
-  stage: deploy
-  needs:
-    - test:run
-  script:
-    - echo "This job deploys something from the $CI_COMMIT_BRANCH branch."
-  environment: production
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "master"'
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        IMAGE_TAG="$CI_COMMIT_TAG"
+      else
+        IMAGE_TAG="dev-$CI_COMMIT_SHORT_SHA"
+      fi
+      echo "Building wayfinder-tap and wayfinder-tui images tagged '$IMAGE_TAG'"
+      for app in tap tui; do
+        image="$CI_REGISTRY_IMAGE/wayfinder-$app:$IMAGE_TAG"
+        docker build -f containers/Dockerfile --target "$app" -t "$image" .
+        docker push "$image"
+      done
