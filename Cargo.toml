@@ -6,6 +6,8 @@ edition = "2021"
 [workspace]
 members = [
     "libs/rylr998",
+    "libs/ieee802154",
+    "libs/at86rf233",
     "libs/interfaces",
     "libs/batman",
     "libs/wayfinder",
@@ -40,6 +42,8 @@ rand = "0.10.1"
 clap = { version = "4", features = ["derive"] }
 etherparse = "0.20.1"
 embedded-io-async = "0.6.1"
+embedded-hal = "1.0.0"
+embedded-hal-async = "1.0.0"
 embassy-sync = "0.8.0"
 embassy-futures = "0.1.2"
 heapless = "0.9.3"

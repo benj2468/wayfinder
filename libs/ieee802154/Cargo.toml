@@ -1,0 +1,8 @@
+[package]
+name = "ieee802154"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+interfaces.workspace = true
+zerocopy = { version = "0.8.48", features = ["derive"] }
