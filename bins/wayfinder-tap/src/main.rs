@@ -15,7 +15,9 @@ use clap::Parser;
 use tokio::{sync::mpsc, task::JoinSet};
 use tracing_subscriber::EnvFilter;
 use tun_rs::{DeviceBuilder, Layer};
-use wayfinder::config::{Config, LinkConfig, LocalDistributionMechanism, ServerConfig};
+use wayfinder::config::{
+    Config, LinkTransport, LocalDistributionMechanism, ServerConfig, TrickleConfig,
+};
 use wayfinder::interfaces::frame::Mac;
 use wayfinder_driver::{
     Driver, QueryRx, QueryTx, build_raw_ip_link, build_raw_l2_link, build_udp_link, run_tcp_server,
@@ -66,15 +68,18 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut interfaces = Vec::new();
+    // Per-interface OGM backoff bounds, collected in interface order alongside
+    // the transports so the driver can pace each link independently.
+    let mut trickle: Vec<TrickleConfig> = Vec::new();
     for link in config.links {
-        match link {
-            LinkConfig::Udp {
+        match link.transport {
+            LinkTransport::Udp {
                 bind_addr,
                 remote_addr,
             } => {
                 interfaces.push(build_udp_link(bind_addr, remote_addr, &mut join_set).await?);
             }
-            LinkConfig::RawIp {
+            LinkTransport::RawIp {
                 bind_addr,
                 remote_addr,
                 protocol,
@@ -83,16 +88,17 @@ async fn main() -> anyhow::Result<()> {
                     build_raw_ip_link(bind_addr, remote_addr, protocol, &mut join_set).await?,
                 );
             }
-            LinkConfig::RawL2 {
+            LinkTransport::RawL2 {
                 interface,
                 ethertype,
             } => {
                 interfaces.push(build_raw_l2_link(&interface, ethertype)?);
             }
-            LinkConfig::Test { .. } => {
+            LinkTransport::Test { .. } => {
                 bail!("test links are only valid in the test harness, not the wayfinder-tap node")
             }
         }
+        trickle.push(link.ogm);
     }
 
     // Optional management API server — queries are forwarded to the driver over
@@ -115,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut driver = Driver::new(Mac(mac_addr), TapDevice(dev), interfaces, query_rx);
+    let mut driver = Driver::new(Mac(mac_addr), TapDevice(dev), interfaces, trickle, query_rx);
 
     driver.run().await
 }

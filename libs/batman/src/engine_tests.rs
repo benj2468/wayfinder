@@ -1220,10 +1220,118 @@ mod route_expiry {
     use core::time::Duration;
 
     use super::*;
-    use crate::ORIGINATOR_TIMEOUT;
+    use crate::MAX_MISSED_OGMS;
 
-    /// Feed one OGM for originator `orig` arriving via immediate neighbor `via`
-    /// at instant `now`, driving the engine's receive path.
+    /// Feed one OGM for originator `orig` arriving via immediate neighbor `via`,
+    /// driving the engine's receive path.  The path is stamped with the engine's
+    /// **current OGM round** (`sequence_number`); advance that with
+    /// [`advance_to_round`] to simulate elapsed rounds.  `now` is irrelevant to
+    /// ageing (which is round-based) and only feeds the Trickle-timer reset.
+    fn feed_ogm(engine: &mut BatmanEngine<8>, orig: u8, via: u8, seqno: u32, tq: u8) {
+        let ogm = make_ogm(orig, via, seqno, tq, 50);
+        let frame = make_link_frame(via, 0xff, ETH_P_BATMAN, ogm);
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        engine.handle_rx(Duration::ZERO, parse_link_frame(&frame), &mut reply);
+    }
+
+    /// Jump the engine's own OGM round counter to `round`, as if it had emitted
+    /// that many periodic broadcasts — the reference clock that gap-counting
+    /// ages paths against.  (`sequence_number` is `pub`, so tests drive it
+    /// directly instead of calling `produce_periodic_broadcast` repeatedly.)
+    fn advance_to_round(engine: &mut BatmanEngine<8>, round: u32) {
+        engine.sequence_number = round;
+    }
+
+    /// `next_hop` follows the highest-TQ path while it is fresh, but once that
+    /// path goes stale (no refresh within `MAX_MISSED_OGMS` rounds) it falls
+    /// back to a surviving lower-TQ path rather than returning the silent
+    /// neighbor.
+    #[test]
+    fn next_hop_skips_stale_path_for_fresher_alternate() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        // Originator 9 is reachable via neighbor 2 (high TQ) and neighbor 3
+        // (low TQ), both heard at round 0.
+        feed_ogm(&mut engine, 9, 2, 1, 255);
+        feed_ogm(&mut engine, 9, 3, 1, 100);
+        assert_eq!(engine.next_hop(mac(9)), Some(mac(2)));
+
+        // Rounds advance past the gap budget; only the via-3 path is refreshed,
+        // so via-2 is now stale (last heard at round 0, current round 7 > 6).
+        advance_to_round(&mut engine, MAX_MISSED_OGMS + 1);
+        feed_ogm(&mut engine, 9, 3, 2, 100);
+
+        // The stale higher-TQ via-2 path is skipped in favor of fresh via-3.
+        assert_eq!(engine.next_hop(mac(9)), Some(mac(3)));
+    }
+
+    /// A destination all of whose paths have aged out has no next hop.
+    #[test]
+    fn next_hop_is_none_when_all_paths_stale() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        feed_ogm(&mut engine, 9, 2, 1, 255);
+
+        advance_to_round(&mut engine, MAX_MISSED_OGMS + 1);
+        assert_eq!(engine.next_hop(mac(9)), None);
+    }
+
+    /// A path refreshed every round stays live indefinitely: gap counting must
+    /// reset on each refresh, not accumulate.
+    #[test]
+    fn next_hop_stays_live_while_refreshed_each_round() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        for round in 0..(MAX_MISSED_OGMS + 5) {
+            advance_to_round(&mut engine, round);
+            feed_ogm(&mut engine, 9, 2, round + 1, 255);
+            assert_eq!(engine.next_hop(mac(9)), Some(mac(2)), "round {round}");
+        }
+    }
+
+    /// The periodic sweep evicts originators heard on no path within the gap
+    /// budget, prunes individual stale paths from survivors, and recomputes the
+    /// cached best hop from what remains.
+    #[test]
+    fn purge_stale_evicts_dead_originator_and_recomputes_best() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        // Originator 9 via neighbor 2 (high TQ) and neighbor 3 (low TQ) at
+        // round 0; originator 8 via neighbor 4 at round 0 only.
+        feed_ogm(&mut engine, 9, 2, 1, 255);
+        feed_ogm(&mut engine, 9, 3, 1, 100);
+        feed_ogm(&mut engine, 8, 4, 1, 255);
+        assert_eq!(engine.originator_table.len(), 2);
+        // Initially 9's best hop is the high-TQ via-2 path.
+        assert_eq!(engine.lookup_route(mac(9)), Some(mac(2)));
+
+        // Refresh only 9-via-3 past the gap budget, then sweep: 9-via-2 and the
+        // whole originator 8 have gone stale.
+        advance_to_round(&mut engine, MAX_MISSED_OGMS + 1);
+        feed_ogm(&mut engine, 9, 3, 2, 100);
+        engine.purge_stale();
+
+        // Originator 8 is gone; originator 9 survives on its one fresh path.
+        assert_eq!(engine.originator_table.len(), 1);
+        let r = &engine.originator_table[&mac(9)];
+        assert_eq!(r.neighbor_ident, mac(9));
+        assert_eq!(r.paths.len(), 1);
+        assert_eq!(r.paths[0].neighbor_ident, mac(3));
+        // Cached best hop recomputed from the surviving (lower-TQ) path.
+        assert_eq!(r.best_next_hop, mac(3));
+        assert_eq!(r.max_tq, 90);
+    }
+}
+
+#[cfg(test)]
+mod adaptive_backoff {
+    use core::time::Duration;
+
+    use super::*;
+
+    const I_MIN: Duration = Duration::from_secs(1);
+    const I_MAX: Duration = Duration::from_secs(64);
+
+    /// Feed one OGM from `orig` via `via` through the receive path at `now`.
     fn feed_ogm(
         engine: &mut BatmanEngine<8>,
         orig: u8,
@@ -1239,67 +1347,64 @@ mod route_expiry {
         engine.handle_rx(now, parse_link_frame(&frame), &mut reply);
     }
 
-    /// `next_hop` follows the highest-TQ path while it is fresh, but once that
-    /// path goes stale it falls back to a surviving lower-TQ path rather than
-    /// returning the silent neighbor.
+    /// Interfaces configured with different bounds schedule on their own clocks:
+    /// the faster link is due first and is the one `due_interface` selects.
     #[test]
-    fn next_hop_skips_stale_path_for_fresher_alternate() {
+    fn interfaces_with_distinct_bounds_schedule_independently() {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        // Interface 0 is a fast link (sub-second floor); interface 1 is slow.
+        engine.configure_interface_ogm(0, I_MIN, Duration::from_secs(4), Duration::ZERO);
+        engine.configure_interface_ogm(1, Duration::from_secs(5), I_MAX, Duration::ZERO);
 
-        // Originator 9 is reachable via neighbor 2 (high TQ) and neighbor 3
-        // (low TQ), both heard at t=0.
-        feed_ogm(&mut engine, 9, 2, 1, 255, Duration::ZERO);
-        feed_ogm(&mut engine, 9, 3, 1, 100, Duration::ZERO);
-        assert_eq!(engine.next_hop(mac(9), Duration::ZERO), Some(mac(2)));
+        // The soonest due is the fast link, within its [i_min/2, i_min) window.
+        let next = engine.next_broadcast_after(Duration::ZERO);
+        assert!(
+            next < I_MIN,
+            "fast link should be due within i_min, got {next:?}"
+        );
 
-        // Only the via-3 path is refreshed past the timeout; via-2 is now stale.
-        let later = ORIGINATOR_TIMEOUT + Duration::from_secs(1);
-        feed_ogm(&mut engine, 9, 3, 2, 100, later);
-
-        // The stale higher-TQ via-2 path is skipped in favor of fresh via-3.
-        assert_eq!(engine.next_hop(mac(9), later), Some(mac(3)));
+        // Nothing is due at t=0 (both first-fires are strictly in the future).
+        assert_eq!(engine.due_interface(Duration::ZERO), None);
+        // By t=2s the fast link is overdue but the slow link (>=2.5s) is not.
+        assert_eq!(engine.due_interface(Duration::from_secs(2)), Some(0));
     }
 
-    /// A destination all of whose paths have aged out has no next hop.
+    /// Emitting on an interface backs its timer off; an inconsistent OGM (here a
+    /// newly discovered originator) snaps every interface back to `i_min`, while
+    /// a consistent re-heard OGM leaves the grown interval untouched.
     #[test]
-    fn next_hop_is_none_when_all_paths_stale() {
+    fn inconsistency_resets_backoff_consistency_does_not() {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
-        feed_ogm(&mut engine, 9, 2, 1, 255, Duration::ZERO);
+        engine.configure_interface_ogm(0, I_MIN, I_MAX, Duration::ZERO);
 
-        let later = ORIGINATOR_TIMEOUT + Duration::from_secs(1);
-        assert_eq!(engine.next_hop(mac(9), later), None);
-    }
+        // Back the interface off several rounds so its next fire is well beyond
+        // i_min (each on_emit doubles the interval).
+        for _ in 0..5 {
+            engine.on_interface_emitted(0, Duration::ZERO);
+        }
+        let grown = engine.next_broadcast_after(Duration::ZERO);
+        assert!(grown > I_MIN, "interval should have grown, got {grown:?}");
 
-    /// The periodic sweep evicts originators heard on no path within the
-    /// timeout, prunes individual stale paths from survivors, and recomputes
-    /// the cached best hop from what remains.
-    #[test]
-    fn purge_stale_evicts_dead_originator_and_recomputes_best() {
-        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        // A consistent OGM we have already converged on must not reset backoff.
+        feed_ogm(&mut engine, 9, 2, 1, 255, Duration::ZERO); // first sight => inconsistent
+        engine.reset_ogm_timers(Duration::ZERO); // re-grow deterministically below
+        for _ in 0..5 {
+            engine.on_interface_emitted(0, Duration::ZERO);
+        }
+        let grown = engine.next_broadcast_after(Duration::ZERO);
+        feed_ogm(&mut engine, 9, 2, 2, 255, Duration::ZERO); // re-heard, nothing new
+        assert_eq!(
+            engine.next_broadcast_after(Duration::ZERO),
+            grown,
+            "a consistent OGM must not disturb the backoff"
+        );
 
-        // Originator 9 via neighbor 2 (high TQ) and neighbor 3 (low TQ) at t=0;
-        // originator 8 via neighbor 4 at t=0 only.
-        feed_ogm(&mut engine, 9, 2, 1, 255, Duration::ZERO);
-        feed_ogm(&mut engine, 9, 3, 1, 100, Duration::ZERO);
-        feed_ogm(&mut engine, 8, 4, 1, 255, Duration::ZERO);
-        assert_eq!(engine.originator_table.len(), 2);
-        // Initially 9's best hop is the high-TQ via-2 path.
-        assert_eq!(engine.lookup_route(mac(9)), Some(mac(2)));
-
-        // Refresh only 9-via-3 past the timeout, then sweep: 9-via-2 and the
-        // whole originator 8 have gone stale.
-        let later = ORIGINATOR_TIMEOUT + Duration::from_secs(1);
-        feed_ogm(&mut engine, 9, 3, 2, 100, later);
-        engine.purge_stale(later);
-
-        // Originator 8 is gone; originator 9 survives on its one fresh path.
-        assert_eq!(engine.originator_table.len(), 1);
-        let r = &engine.originator_table[&mac(9)];
-        assert_eq!(r.neighbor_ident, mac(9));
-        assert_eq!(r.paths.len(), 1);
-        assert_eq!(r.paths[0].neighbor_ident, mac(3));
-        // Cached best hop recomputed from the surviving (lower-TQ) path.
-        assert_eq!(r.best_next_hop, mac(3));
-        assert_eq!(r.max_tq, 90);
+        // A brand-new originator is an inconsistency: backoff snaps to i_min.
+        feed_ogm(&mut engine, 8, 3, 1, 255, Duration::ZERO);
+        let after = engine.next_broadcast_after(Duration::ZERO);
+        assert!(
+            after < I_MIN,
+            "a new originator must reset backoff to i_min, got {after:?}"
+        );
     }
 }

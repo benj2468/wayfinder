@@ -1,9 +1,8 @@
-use futures::future::FutureExt;
 use std::{collections::HashMap, time::Duration};
 
 use interfaces::frame::Mac;
 use serde::{Deserialize, Serialize};
-use tokio::time::interval;
+use wayfinder::config::TrickleConfig;
 
 use crate::{
     switch::{PortComms, PortConfig, PortId, Switch},
@@ -40,6 +39,9 @@ struct MachineSpec {
     /// Names of the switches this node is wired to, one mesh interface each, in
     /// the original interface order.
     switches: Vec<String>,
+    /// Per-interface OGM backoff bounds, in the same interface order, so a
+    /// reconnected node comes back with its original per-link pacing.
+    trickle: Vec<TrickleConfig>,
 }
 
 #[derive(Default)]
@@ -66,10 +68,6 @@ impl TestHarness {
     }
 
     pub async fn poll(&mut self, now: Duration) {
-        let mut int = interval(Duration::from_hours(1));
-        // Tick it once so that we don't block waiting for the interval to elapse
-        int.tick().await;
-
         self.clock = now;
         for (_, router) in self.machines.iter_mut() {
             router.poll(now).await;
@@ -81,22 +79,25 @@ impl TestHarness {
     /// the wire.  Returns the number of frames the switches pulled off the wire
     /// this step; `0` means no node transmitted, i.e. the fabric is quiescent.
     pub async fn tick(&mut self) -> usize {
-        let mut int = interval(Duration::from_hours(1));
-        int.tick().await;
-
         let now = self.clock;
+        // The periodic (OGM) arm is disabled here (`check_periodic = false`):
+        // OGM rounds are driven explicitly by `poll`, so a tick only moves the
+        // frames already on the wire — first every node transmits, then every
+        // node receives.
         for (_, router) in self.machines.iter_mut() {
-            let _ = router
-                .driver()
-                .run_once(now, &mut int, false, true, false)
-                .now_or_never();
+            let _ = tokio::time::timeout(
+                tokio::time::Duration::from_nanos(1),
+                router.driver().run_once(now, false, true, false, false),
+            )
+            .await;
         }
 
         for (_, router) in self.machines.iter_mut() {
-            let _ = router
-                .driver()
-                .run_once(now, &mut int, true, false, false)
-                .now_or_never();
+            let _ = tokio::time::timeout(
+                tokio::time::Duration::from_nanos(1),
+                router.driver().run_once(now, true, false, false, false),
+            )
+            .await;
         }
         let mut frames = 0;
         for (_, switch) in self.switches.iter_mut() {
@@ -119,16 +120,30 @@ impl TestHarness {
     /// nodes) honest about how long settling is allowed to take.
     pub async fn converge(&mut self, at: Duration) {
         self.poll(at).await;
-        // Tick until a full sweep is silent: the freshly polled OGMs flood out,
-        // get forwarded hop by hop, and re-flooding dies once every node has
-        // seen each (originator, seqno).
-        while self.tick().await > 0 {}
-        // Confirm the fabric stays silent — no straggling OGM resurges.
-        assert_eq!(
-            self.tick().await,
-            0,
-            "mesh kept producing frames after it should have converged"
-        );
+        self.settle().await;
+    }
+
+    /// Drive the fabric to quiescence **without** emitting any new OGMs: keep
+    /// ticking until a sweep moves no frames, then confirm it stays quiet.
+    ///
+    /// A single zero-frame tick can be a lull while a node still holds an
+    /// unprocessed duplicate OGM (the same seqno arriving via a second path) in
+    /// its ingress, so this requires the fabric to be silent for several
+    /// *consecutive* sweeps before declaring convergence.  Use after injecting
+    /// traffic (e.g. `send_local`) to let it reach its destination.  Bounded by
+    /// the caller's `tokio::time::timeout` for the convergence case.
+    pub async fn settle(&mut self) {
+        // Enough consecutive silent sweeps to outlast any in-flight duplicate
+        // draining hop by hop across the mesh diameter.
+        const QUIET_SWEEPS: usize = 8;
+        let mut quiet = 0;
+        while quiet < QUIET_SWEEPS {
+            if self.tick().await > 0 {
+                quiet = 0;
+            } else {
+                quiet += 1;
+            }
+        }
     }
 
     pub fn get_machine(&self, name: &str) -> &TestRouter {
@@ -178,8 +193,10 @@ impl TestHarness {
         // the new handles so link tuning targets the live wiring.
         let (interfaces, handles) = self.wire_links(&spec.switches);
         self.links.insert(name.to_string(), handles);
-        self.machines
-            .insert(name.to_string(), TestRouter::new(spec.mac, interfaces));
+        self.machines.insert(
+            name.to_string(),
+            TestRouter::new(spec.mac, interfaces, spec.trickle.clone()),
+        );
     }
 
     /// Attach a fresh port to `switch_name`, returning the node's end of the
@@ -283,18 +300,26 @@ impl TestConfig {
                 .wayfinder
                 .links
                 .iter()
-                .map(|link| match link {
-                    wayfinder::config::LinkConfig::Test { switch_name } => switch_name.clone(),
+                .map(|link| match &link.transport {
+                    wayfinder::config::LinkTransport::Test { switch_name } => switch_name.clone(),
                     _ => panic!("test harness supports only Test links"),
                 })
                 .collect();
+            // Per-interface OGM backoff bounds, in interface order.
+            let trickle: Vec<TrickleConfig> = machine
+                .wayfinder
+                .links
+                .iter()
+                .map(|link| link.ogm)
+                .collect();
             let (interfaces, handles) = h.wire_links(&switches);
-            let router = TestRouter::new(ident, interfaces);
+            let router = TestRouter::new(ident, interfaces, trickle.clone());
             h.specs.insert(
                 machine.name.clone(),
                 MachineSpec {
                     mac: ident,
                     switches,
+                    trickle,
                 },
             );
             h.links.insert(machine.name.clone(), handles);

@@ -18,7 +18,8 @@ use anyhow::bail;
 use futures::{FutureExt, future::select_all};
 use interfaces::link::LinkMetrics;
 use pretty_hex::pretty_hex;
-use tokio::time::{Interval, interval};
+use tokio::time::{Instant as TokioInstant, sleep_until};
+use wayfinder::config::TrickleConfig;
 use wayfinder::interfaces::frame::{LinkFrame, LinkFrameData, Mac};
 use wayfinder::{CentralRouter, EgressInterface, McastPlan};
 use wayfinder_protos::service::WayfinderService;
@@ -29,6 +30,21 @@ use wayfinder::link::{DynLinkT, LinkT};
 use crate::snoop::McastSnooper;
 use crate::transport::FrameIo;
 
+/// How an [`OutgoingFrame`] is fanned out onto the mesh.
+enum Egress {
+    /// Let the router pick the egress (`get_egress_interface`): a metric-driven
+    /// single interface for a unicast, or every interface for a broadcast/flood.
+    /// `exclude` is the interface index a re-flood arrived on — split-horizon,
+    /// so a re-flood never goes back toward the neighbor it came from (which
+    /// would otherwise circulate OGMs/broadcasts until their TTL drains).
+    /// `None` for locally originated frames, which go out every interface.
+    Auto { exclude: Option<usize> },
+    /// Send out exactly one interface by index, bypassing the router's egress
+    /// choice.  Used for per-link OGM emission, where each interface fires on
+    /// its own adaptive (Trickle) schedule rather than flooding all at once.
+    Iface(usize),
+}
+
 /// One frame to put on the mesh, plus how to fan it out.
 struct OutgoingFrame {
     /// Destination ident (a next-hop neighbor, or `BROADCAST` for a flood).
@@ -37,13 +53,8 @@ struct OutgoingFrame {
     protocol: u16,
     /// Serialized payload to transmit.
     payload: Vec<u8>,
-    /// For a frame that fans out to every interface (`EgressInterface::All`,
-    /// i.e. a broadcast/OGM re-flood), the interface index to omit — the one
-    /// the frame arrived on.  This is split-horizon flooding: never send a
-    /// re-flood back toward the neighbor it came from, which would otherwise
-    /// circulate OGMs/broadcasts until their TTL drains.  `None` for locally
-    /// originated frames, which go out every interface.
-    exclude_iface: Option<usize>,
+    /// How to dispatch this frame onto the mesh interfaces.
+    egress: Egress,
 }
 
 /// One unit of work's outgoing frames.
@@ -95,17 +106,27 @@ pub struct Driver<Local: FrameIo> {
 
 impl<Local: FrameIo> Driver<Local> {
     /// Build a driver for node `mac` over the given host device, mesh
-    /// interfaces, and management-query channel.
+    /// interfaces, and management-query channel.  `trickle` supplies each
+    /// interface's per-link adaptive OGM bounds (`i_min`/`i_max`), in interface
+    /// order; interfaces without an entry fall back to [`TrickleConfig::default`].
     pub fn new(
         mac: Mac,
         local: Local,
         interfaces: Vec<Box<DynLinkT<'static>>>,
+        trickle: Vec<TrickleConfig>,
         query_rx: QueryRx,
     ) -> Self {
+        let mut router = CentralRouter::new(mac);
+        // Install each interface's adaptive OGM schedule up front so the
+        // periodic loop has a per-interface timer to consult from the start.
+        for idx in 0..interfaces.len() {
+            let cfg = trickle.get(idx).copied().unwrap_or_default();
+            router.configure_interface_ogm(idx, cfg.i_min(), cfg.i_max(), Duration::ZERO);
+        }
         Self {
             local,
             interfaces,
-            router: CentralRouter::new(mac),
+            router,
             query_rx,
             mac,
             snooper: McastSnooper::new(),
@@ -129,10 +150,9 @@ impl<Local: FrameIo> Driver<Local> {
 
     /// Run the event loop forever.
     pub async fn run(&mut self) -> anyhow::Result<()> {
-        let mut int = interval(Duration::from_secs(10));
         loop {
             let now = self.start.elapsed();
-            self.run_once(now, &mut int, true, true, true).await?;
+            self.run_once(now, true, true, true, true).await?;
         }
     }
 
@@ -145,15 +165,25 @@ impl<Local: FrameIo> Driver<Local> {
     /// stamped on received originator records and on any OGM produced, so a
     /// caller that controls time — e.g. a deterministic test — controls route
     /// ageing.  Production passes `self.start.elapsed()`.
-    #[tracing::instrument(skip(self, interval, check_local, check_mesh, check_server), fields(ident = ?self.mac))]
+    #[tracing::instrument(
+        skip(self, check_local, check_mesh, check_server, check_periodic),
+        fields(ident = ?self.mac)
+    )]
     pub async fn run_once(
         &mut self,
         now: Duration,
-        interval: &mut Interval,
         check_local: bool,
         check_mesh: bool,
         check_server: bool,
+        check_periodic: bool,
     ) -> anyhow::Result<()> {
+        // When the soonest interface is next due to emit an OGM, on the tokio
+        // clock.  Each interface backs off (Trickle) on its own schedule, so the
+        // periodic arm sleeps until whichever fires first.  Recomputed every
+        // iteration, so a timer reset by the frame just processed (an
+        // inconsistency) shortens the next sleep automatically.
+        let due_at = TokioInstant::from_std(self.start + self.router.next_broadcast_after(now));
+
         // Destructure into disjoint field borrows so the `select!` can hold a
         // mutable borrow of the interfaces alongside the router and buffers.
         let Driver {
@@ -193,10 +223,10 @@ impl<Local: FrameIo> Driver<Local> {
                     let _ = resp_tx.send(response);
                     LoopOutput::none()
                 },
-                _ = interval.tick() => {
+                _ = sleep_until(due_at), if check_periodic => {
                     tracing::info!("polling OGM");
                     LoopOutput {
-                        mesh: poll_ogm(router, now, tx_buffer),
+                        mesh: poll_due_ogms(router, now, tx_buffer),
                         local: None,
                     }
                 }
@@ -316,7 +346,9 @@ impl<Local: FrameIo> Driver<Local> {
     }
 }
 
-/// Produce this node's periodic OGM (if one is due) as a mesh frame.
+/// Produce one OGM and flood it out **every** interface at once.  Used by the
+/// deterministic [`Driver::poll`] test entry; production instead emits per
+/// interface on each link's own Trickle schedule via [`poll_due_ogms`].
 fn poll_ogm(router: &mut CentralRouter, now: Duration, tx_buffer: &mut [u8]) -> Vec<OutgoingFrame> {
     router
         .poll(now, tx_buffer)
@@ -325,10 +357,36 @@ fn poll_ogm(router: &mut CentralRouter, now: Duration, tx_buffer: &mut [u8]) -> 
             protocol: f.protocol,
             payload: f.payload.to_vec(),
             // Locally originated — flood out every interface.
-            exclude_iface: None,
+            egress: Egress::Auto { exclude: None },
         })
         .into_iter()
         .collect()
+}
+
+/// Produce an OGM for each interface that is due to emit as of `now`, addressed
+/// to that one interface.  Every link backs off (Trickle) independently, so on
+/// a given wake-up only the interface(s) whose timer has fired emit; each is
+/// then advanced toward its `i_max`.
+fn poll_due_ogms(
+    router: &mut CentralRouter,
+    now: Duration,
+    tx_buffer: &mut [u8],
+) -> Vec<OutgoingFrame> {
+    let mut out = Vec::new();
+    // Each emission advances exactly one interface's timer, so the set of due
+    // interfaces shrinks every pass and the loop terminates.
+    while let Some(idx) = router.due_interface(now) {
+        if let Some(f) = router.poll(now, tx_buffer) {
+            out.push(OutgoingFrame {
+                dst: f.dst,
+                protocol: f.protocol,
+                payload: f.payload.to_vec(),
+                egress: Egress::Iface(idx),
+            });
+        }
+        router.on_interface_emitted(idx, now);
+    }
+    out
 }
 
 /// Process one received link-layer frame into a unit of work, folding the
@@ -351,7 +409,7 @@ fn handle_mesh_frame(
                 protocol: f.protocol,
                 payload: f.payload.to_vec(),
                 // A re-flood must not go back out the interface it arrived on.
-                exclude_iface: Some(idx),
+                egress: Egress::Auto { exclude: Some(idx) },
             })
             .into_iter()
             .collect(),
@@ -394,7 +452,7 @@ fn plan_host_frame(
                 dst: f.dst,
                 protocol: f.protocol,
                 payload: f.payload.to_vec(),
-                exclude_iface: None,
+                egress: Egress::Auto { exclude: None },
             });
         }
     };
@@ -411,7 +469,7 @@ fn plan_host_frame(
                             dst: f.dst,
                             protocol: f.protocol,
                             payload: f.payload.to_vec(),
-                            exclude_iface: None,
+                            egress: Egress::Auto { exclude: None },
                         });
                     }
                 }
@@ -423,7 +481,7 @@ fn plan_host_frame(
             dst: f.dst,
             protocol: f.protocol,
             payload: f.payload.to_vec(),
-            exclude_iface: None,
+            egress: Egress::Auto { exclude: None },
         });
     }
 
@@ -448,14 +506,13 @@ async fn dispatch<Local: FrameIo>(
         dst,
         protocol,
         payload,
-        exclude_iface,
+        egress,
     } in output.mesh
     {
         tracing::debug!(
-            "mesh output: dst={:?} protocol={:?} exclude_iface={:?} payload={:?}",
+            "mesh output: dst={:?} protocol={:?} payload={:?}",
             dst,
             protocol,
-            exclude_iface,
             payload
         );
         let data = LinkFrameData {
@@ -464,22 +521,32 @@ async fn dispatch<Local: FrameIo>(
             payload: &payload,
         };
 
-        match router.get_egress_interface(dst) {
-            Some(EgressInterface::All) => {
-                for (idx, iface) in interfaces.iter_mut().enumerate() {
-                    // Split-horizon: skip the interface a re-flood arrived on.
-                    if Some(idx) == exclude_iface {
-                        continue;
-                    }
-                    iface.send(mac, &data).await?;
-                }
-            }
-            Some(EgressInterface::Interface(iface_idx)) => {
+        match egress {
+            // A per-link OGM goes out exactly one interface, on that link's own
+            // adaptive schedule.
+            Egress::Iface(iface_idx) => {
                 if let Some(iface) = interfaces.get_mut(iface_idx) {
                     iface.send(mac, &data).await?;
                 }
             }
-            None => {}
+            // Otherwise let the router's metric-driven egress choice decide.
+            Egress::Auto { exclude } => match router.get_egress_interface(dst) {
+                Some(EgressInterface::All) => {
+                    for (idx, iface) in interfaces.iter_mut().enumerate() {
+                        // Split-horizon: skip the interface a re-flood arrived on.
+                        if Some(idx) == exclude {
+                            continue;
+                        }
+                        iface.send(mac, &data).await?;
+                    }
+                }
+                Some(EgressInterface::Interface(iface_idx)) => {
+                    if let Some(iface) = interfaces.get_mut(iface_idx) {
+                        iface.send(mac, &data).await?;
+                    }
+                }
+                None => {}
+            },
         }
     }
 

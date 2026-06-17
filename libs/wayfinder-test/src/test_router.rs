@@ -26,6 +26,7 @@ use interfaces::{
 use pretty_hex::pretty_hex;
 use tokio::sync::mpsc;
 use wayfinder::CentralRouter;
+use wayfinder::config::TrickleConfig;
 use wayfinder_driver::{Driver, DynLinkT, FrameIo, Link, QueryRx, QueryTx};
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -127,12 +128,19 @@ pub struct ObservableEgress {
 impl FrameIo for ObservableEgress {
     async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         tracing::trace!("recv: waiting for frame");
-        match self.inbound.lock().await.recv().await {
+        let mut inbound = self.inbound.lock().await;
+        match inbound.recv().await {
             Some(frame) => {
                 tracing::trace!("recv: frame received: {}", pretty_hex(&frame));
                 Ok(copy_into(&frame, buf))
             }
-            None => std::future::pending().await,
+            None => {
+                tracing::warn!("recv: channel closed");
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "Channel Closed",
+                ));
+            }
         }
     }
 
@@ -175,9 +183,10 @@ pub struct TestRouter {
 }
 
 impl TestRouter {
-    /// Create a new test router with the given node identity and one switch-port
-    /// duplex per mesh interface.
-    pub fn new(ident: Mac, interfaces: Vec<PortComms>) -> Self {
+    /// Create a new test router with the given node identity, one switch-port
+    /// duplex per mesh interface, and that interface's per-link OGM backoff
+    /// bounds (in interface order; missing entries default).
+    pub fn new(ident: Mac, interfaces: Vec<PortComms>, trickle: Vec<TrickleConfig>) -> Self {
         let links: Vec<Box<DynLinkT<'static>>> = interfaces
             .into_iter()
             .map(|pc| DynLinkT::new_box(Link::new(ChannelTransport::from(pc))))
@@ -192,7 +201,7 @@ impl TestRouter {
         let (query_tx, query_rx): (QueryTx, QueryRx) = mpsc::channel(16);
 
         Self {
-            driver: Driver::new(ident, local, links, query_rx),
+            driver: Driver::new(ident, local, links, trickle, query_rx),
             ident,
             deliveries,
             host_in,
@@ -237,7 +246,8 @@ impl TestRouter {
     /// the TAP, so the egress copies are dispatched immediately.
     pub async fn send_local(&mut self, dest: Mac, payload: &[u8]) -> anyhow::Result<()> {
         let eth = host_frame(dest, self.ident, payload);
-        self.host_in.send(eth).await?;
+        self.host_in.send(eth.clone()).await?;
+        tracing::trace!("send_local: frame sent: {}", pretty_hex(&eth));
         Ok(())
     }
 

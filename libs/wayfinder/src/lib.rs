@@ -345,6 +345,38 @@ impl CentralRouter {
         None
     }
 
+    /// Install (or replace) the adaptive OGM schedule for mesh interface `idx`,
+    /// supplying that link's `i_min`/`i_max` at runtime.  Call once per interface
+    /// when wiring up the driver; see
+    /// [`BatmanEngine::configure_interface_ogm`](batman::BatmanEngine::configure_interface_ogm).
+    pub fn configure_interface_ogm(
+        &mut self,
+        idx: usize,
+        i_min: core::time::Duration,
+        i_max: core::time::Duration,
+        now: core::time::Duration,
+    ) {
+        self.batman.configure_interface_ogm(idx, i_min, i_max, now);
+    }
+
+    /// Time until the soonest interface is next due to emit an OGM, as of `now`.
+    /// The driver sleeps for this long before its next periodic emission.
+    pub fn next_broadcast_after(&self, now: core::time::Duration) -> core::time::Duration {
+        self.batman.next_broadcast_after(now)
+    }
+
+    /// The index of the interface most overdue to emit an OGM as of `now`, or
+    /// `None` when none is yet due.
+    pub fn due_interface(&self, now: core::time::Duration) -> Option<usize> {
+        self.batman.due_interface(now)
+    }
+
+    /// Record that interface `idx` just emitted an OGM at `now`, advancing its
+    /// Trickle schedule (doubling the interval toward `i_max`).
+    pub fn on_interface_emitted(&mut self, idx: usize, now: core::time::Duration) {
+        self.batman.on_interface_emitted(idx, now);
+    }
+
     /// Wrap host data destined for `dest` in the appropriate BATMAN packet,
     /// ready to hand to a link.  A `dest` of [`MeshIdentifier::BROADCAST`]
     /// produces a flooded [`BatmanBroadcastPacket`] (e.g. for a host ARP);
