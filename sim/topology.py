@@ -96,8 +96,8 @@ def build_links() -> list[list[str]]:
     """
     return [
         *diamond("d"),  # d1..d4: two 2-hop paths d1⇒d4
-        *complete_graph("m", 5),  # m1..m5: fully meshed (10 links)
-        ["d4", "m1"],  # the bridge joining the diamond to the mesh
+        # *complete_graph("m", 5),  # m1..m5: fully meshed (10 links)
+        # ["d4", "m1"],  # the bridge joining the diamond to the mesh
     ]
 
 
@@ -257,16 +257,24 @@ def cmd_graph() -> None:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("print", help="print the generated compose YAML to stdout")
     sub.add_parser("graph", help="print an ASCII adjacency summary of the topology")
     w = sub.add_parser("write", help="write the compose YAML to a path")
     w.add_argument("path", nargs="?", default=str(REPO_ROOT / "docker-compose.yml"))
-    up = sub.add_parser("up", help="generate the ephemeral file and `docker compose up --build -d`")
+    up = sub.add_parser(
+        "up", help="generate the ephemeral file and `docker compose up --build -d`"
+    )
     up.add_argument("extra", nargs="*", help="extra args passed to `docker compose up`")
-    sub.add_parser("down", help="`docker compose down` the ephemeral stack (removes networks)")
-    lg = sub.add_parser("logs", help="follow `docker compose logs -f` (optionally for given nodes)")
+    sub.add_parser(
+        "down", help="`docker compose down` the ephemeral stack (removes networks)"
+    )
+    lg = sub.add_parser(
+        "logs", help="follow `docker compose logs -f` (optionally for given nodes)"
+    )
     lg.add_argument("nodes", nargs="*")
 
     args = parser.parse_args(argv)
