@@ -393,13 +393,29 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
                         });
                     }
 
-                    // Update routing table selection if this path has superior quality
-                    if computed_tq >= record.max_tq {
+                    // Update routing-table selection with hysteresis.  Always
+                    // refresh the incumbent next hop's metric when we hear it
+                    // again (its quality may have risen or fallen), but only
+                    // *switch* the next hop for a path that is strictly better.
+                    // An equal-quality copy arriving via a different neighbor —
+                    // the common case in a redundant mesh, where the same
+                    // originator is heard via several equal-cost neighbors every
+                    // round — is recorded as an alternate path (above) without
+                    // displacing the incumbent.  Without this, `best_next_hop`
+                    // would flip-flop between equal-cost neighbors on every
+                    // duplicate OGM, latching a spurious topology change each
+                    // round (`best_changed` below) and pinning every node's
+                    // Trickle backoff at `i_min` via the reflexive resets that
+                    // ripple across the mesh.
+                    if frame.src == record.best_next_hop {
+                        record.max_tq = computed_tq;
+                    } else if computed_tq > record.max_tq {
                         record.max_tq = computed_tq;
                         record.best_next_hop = frame.src;
                     }
-                    // A changed best next hop is a topology change (the `record`
-                    // borrow ends here, before the `&mut self` call below).
+                    // A changed best next hop is a genuine topology change (the
+                    // `record` borrow ends here, before the `&mut self` call
+                    // below).
                     let best_changed = record.best_next_hop != old_best;
 
                     // Fold this originator's multicast memberships (carried in

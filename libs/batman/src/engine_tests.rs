@@ -1407,4 +1407,67 @@ mod adaptive_backoff {
             "a new originator must reset backoff to i_min, got {after:?}"
         );
     }
+
+    /// An equal-quality copy of an already-known route arriving via a *different*
+    /// neighbor must not be treated as a topology change.  In a redundant mesh
+    /// the same originator is heard via several equal-cost neighbors every round;
+    /// if each such copy flipped `best_next_hop` it would latch a spurious
+    /// inconsistency and pin the Trickle backoff at `i_min` forever (the
+    /// "reflexive reset" failure).  The incumbent next hop must stick, leaving
+    /// the grown backoff untouched.
+    #[test]
+    fn equal_quality_alternate_path_does_not_reset_backoff() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        engine.configure_interface_ogm(0, I_MIN, I_MAX, Duration::ZERO);
+
+        // Converge on a route to originator 9 via neighbor 2, then clear the
+        // resulting reset and back the interface off several rounds.
+        feed_ogm(&mut engine, 9, 2, 1, 255, Duration::ZERO);
+        engine.reset_ogm_timers(Duration::ZERO);
+        for _ in 0..5 {
+            engine.on_interface_emitted(0, Duration::ZERO);
+        }
+        let grown = engine.next_broadcast_after(Duration::ZERO);
+        assert!(grown > I_MIN, "interval should have grown, got {grown:?}");
+
+        // The same originator, same seqno, *equal* TQ, but heard via a different
+        // neighbor (3).  This is a redundant equal-cost path, not a change.
+        feed_ogm(&mut engine, 9, 3, 1, 255, Duration::ZERO);
+        assert_eq!(
+            engine.next_broadcast_after(Duration::ZERO),
+            grown,
+            "an equal-cost alternate path must not disturb the backoff"
+        );
+    }
+
+    /// A *strictly better* next hop is a genuine inconsistency and must reset the
+    /// backoff.  Once the incumbent next hop's quality degrades, a higher-quality
+    /// alternate is allowed to take over and snap the Trickle timers to `i_min`.
+    #[test]
+    fn strictly_better_next_hop_resets_backoff() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        engine.configure_interface_ogm(0, I_MIN, I_MAX, Duration::ZERO);
+
+        // Converge on originator 9 via neighbor 2 at full quality, then let the
+        // incumbent's quality degrade (a lower-TQ OGM via the same neighbor).
+        feed_ogm(&mut engine, 9, 2, 1, 255, Duration::ZERO);
+        feed_ogm(&mut engine, 9, 2, 2, 200, Duration::ZERO);
+
+        // Clear the resulting resets and back the interface well off.
+        engine.reset_ogm_timers(Duration::ZERO);
+        for _ in 0..5 {
+            engine.on_interface_emitted(0, Duration::ZERO);
+        }
+        let grown = engine.next_broadcast_after(Duration::ZERO);
+        assert!(grown > I_MIN, "interval should have grown, got {grown:?}");
+
+        // Neighbor 3 now offers a strictly higher quality than the degraded
+        // incumbent: a real next-hop change that must reset the backoff.
+        feed_ogm(&mut engine, 9, 3, 3, 255, Duration::ZERO);
+        let after = engine.next_broadcast_after(Duration::ZERO);
+        assert!(
+            after < I_MIN,
+            "a strictly better next hop must reset backoff to i_min, got {after:?}"
+        );
+    }
 }
