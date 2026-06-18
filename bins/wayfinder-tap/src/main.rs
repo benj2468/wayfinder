@@ -125,3 +125,52 @@ async fn main() -> anyhow::Result<()> {
 
     driver.run().await
 }
+
+#[cfg(test)]
+mod tests {
+    use wayfinder::config::{Config, LinkTransport};
+
+    /// The exact config shape the sim image's entrypoint emits must parse:
+    /// RawL2 links, with an optional per-link `ogm:` block that defaults when
+    /// omitted.  Locks the schema the docker simulation depends on.
+    #[test]
+    fn sim_generated_config_parses() {
+        let yaml = r#"
+local_egress:
+  type: Tap
+  device_name: wayfinder0
+  ip_address: 10.0.0.1
+  netmask: 255.255.255.0
+server:
+  type: Tcp
+  addr: 0.0.0.0:7700
+links:
+  - type: RawL2
+    interface: eth0
+    ethertype: 0x4305
+    ogm:
+      i_min_ms: 2000
+      i_max_ms: 120000
+  - type: RawL2
+    interface: eth1
+    ethertype: 0x4305
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).expect("sim config must parse");
+        assert_eq!(cfg.links.len(), 2);
+
+        // First link carries explicit OGM bounds.
+        assert!(matches!(
+            cfg.links[0].transport,
+            LinkTransport::RawL2 {
+                ethertype: 0x4305,
+                ..
+            }
+        ));
+        assert_eq!(cfg.links[0].ogm.i_min_ms, 2000);
+        assert_eq!(cfg.links[0].ogm.i_max_ms, 120_000);
+
+        // Second link omits `ogm:` and falls back to the defaults.
+        assert_eq!(cfg.links[1].ogm.i_min_ms, 1000);
+        assert_eq!(cfg.links[1].ogm.i_max_ms, 64_000);
+    }
+}
