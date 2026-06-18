@@ -247,6 +247,22 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
             .map(|(idx, _)| idx)
     }
 
+    /// Snapshot the adaptive OGM schedule of every configured interface: its
+    /// current emission interval (the live publish rate) and the `i_min`/`i_max`
+    /// bounds it adapts between.  Yields one [`OgmScheduleEntry`] per interface
+    /// in registration order; empty when no interface has been configured.
+    pub fn ogm_schedule(&self) -> impl Iterator<Item = crate::OgmScheduleEntry> + '_ {
+        self.ogm_timers
+            .iter()
+            .enumerate()
+            .map(|(iface_idx, t)| crate::OgmScheduleEntry {
+                iface_idx,
+                current_interval: t.interval(),
+                min_interval: t.i_min(),
+                max_interval: t.i_max(),
+            })
+    }
+
     /// Record that interface `idx` just emitted an OGM at `now`, advancing that
     /// interface's Trickle schedule (and doubling its interval toward `i_max`).
     pub fn on_interface_emitted(&mut self, idx: usize, now: core::time::Duration) {

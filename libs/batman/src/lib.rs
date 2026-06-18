@@ -69,6 +69,27 @@ pub struct OriginatorRecord {
     pub paths: HVec<NeighborStats, 4>,
 }
 
+/// A snapshot of one interface's adaptive OGM emission schedule, as paced by
+/// its [`TrickleTimer`].  Reported by [`BatmanEngine::ogm_schedule`] so the
+/// management API can surface the *current* OGM publish rate per link together
+/// with the configured backoff bounds it adapts between.
+#[derive(Debug, Clone)]
+pub struct OgmScheduleEntry {
+    /// Index of the interface this schedule belongs to, in the order interfaces
+    /// were registered via [`BatmanEngine::configure_interface_ogm`].
+    pub iface_idx: usize,
+    /// The interval `I` the link is currently emitting at: the live OGM publish
+    /// period, which doubles toward `max_interval` while the topology is stable
+    /// and snaps back to `min_interval` on any inconsistency.
+    pub current_interval: core::time::Duration,
+    /// The most aggressive interval the timer resets to on a topology change
+    /// (the Trickle `i_min`).
+    pub min_interval: core::time::Duration,
+    /// The quietest interval the doubling backoff is capped at (the Trickle
+    /// `i_max`).
+    pub max_interval: core::time::Duration,
+}
+
 pub struct BatmanEngine<const MAX_ORIGINATORS: usize> {
     pub self_ident: Mac,
     pub sequence_number: u32,

@@ -13,8 +13,8 @@ use prost::Message;
 use tokio::net::TcpStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use wayfinder_protos::wayfinder_v1alpha::{
-    GetLinkQualityTableRequest, GetNodeInfoRequest, GetRoutingTableRequest, LinkQualityTable,
-    NodeInfo, RoutingTable, WayfinderRequest, WayfinderResponse,
+    GetLinkQualityTableRequest, GetNodeInfoRequest, GetOgmScheduleRequest, GetRoutingTableRequest,
+    LinkQualityTable, NodeInfo, OgmSchedule, RoutingTable, WayfinderRequest, WayfinderResponse,
     wayfinder_request::Request as RequestKind, wayfinder_response::Response as ResponseKind,
 };
 
@@ -87,6 +87,17 @@ impl Client {
             other => Err(unexpected("LinkQualityTable", &other)),
         }
     }
+
+    /// Query the current per-interface adaptive OGM emission schedule.
+    pub async fn ogm_schedule(&mut self) -> anyhow::Result<OgmSchedule> {
+        match self
+            .request(RequestKind::GetOgmSchedule(GetOgmScheduleRequest {}))
+            .await?
+        {
+            ResponseKind::OgmSchedule(schedule) => Ok(schedule),
+            other => Err(unexpected("OgmSchedule", &other)),
+        }
+    }
 }
 
 /// Build an error for a response variant that does not match the request.
@@ -96,6 +107,7 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
         ResponseKind::RoutingTable(_) => "RoutingTable",
         ResponseKind::LinkQualityTable(_) => "LinkQualityTable",
         ResponseKind::ResolveRoute(_) => "ResolveRoute",
+        ResponseKind::OgmSchedule(_) => "OgmSchedule",
         ResponseKind::Error(_) => "Error",
     };
     anyhow!("expected {want} response, got {got}")

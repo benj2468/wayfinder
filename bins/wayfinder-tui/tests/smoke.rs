@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use wayfinder_protos::service::{
-    LinkQualityEntryData, NeighborPathData, RouteResolutionData, RoutingEntryData,
-    WayfinderDataProvider, WayfinderService,
+    LinkQualityEntryData, NeighborPathData, OgmScheduleEntryData, RouteResolutionData,
+    RoutingEntryData, WayfinderDataProvider, WayfinderService,
 };
 use wayfinder_protos::wayfinder_v1alpha::{WayfinderRequest, WayfinderResponse};
 use wayfinder_server::run_tcp_server;
@@ -49,6 +49,14 @@ impl WayfinderDataProvider for Mock {
             iface_idx: 0,
             ewma_quality: 200,
             sample_count: 9,
+        }]
+    }
+    fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData> {
+        vec![OgmScheduleEntryData {
+            iface_idx: 0,
+            current_interval_ms: 4000,
+            min_interval_ms: 1000,
+            max_interval_ms: 64000,
         }]
     }
     fn resolve_route(&self, _destination: &[u8]) -> Option<RouteResolutionData> {
@@ -114,4 +122,12 @@ async fn client_roundtrips_against_real_tcp_server() {
     assert_eq!(row.iface_idx, 0);
     assert_eq!(row.ewma_quality, 200);
     assert_eq!(row.sample_count, 9);
+
+    let schedule = client.ogm_schedule().await.unwrap();
+    assert_eq!(schedule.entries.len(), 1);
+    let sched = &schedule.entries[0];
+    assert_eq!(sched.iface_idx, 0);
+    assert_eq!(sched.current_interval_ms, 4000);
+    assert_eq!(sched.min_interval_ms, 1000);
+    assert_eq!(sched.max_interval_ms, 64000);
 }

@@ -29,6 +29,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Tab::Overview => render_overview(frame, app, chunks[1]),
         Tab::Routing => render_routing(frame, app, chunks[1]),
         Tab::LinkQuality => render_link_quality(frame, app, chunks[1]),
+        Tab::OgmSchedule => render_ogm_schedule(frame, app, chunks[1]),
     }
     render_status(frame, app, chunks[2]);
 }
@@ -266,6 +267,90 @@ fn render_link_quality(frame: &mut Frame, app: &mut App, area: Rect) {
     .highlight_symbol("▶ ");
 
     frame.render_stateful_widget(table, area, &mut app.link_state);
+}
+
+/// Draw the per-interface adaptive OGM emission schedule.  Each row shows an
+/// interface's current publish interval (the live OGM rate) alongside the
+/// `i_min`/`i_max` backoff bounds, plus a bar placing the current interval on
+/// the min→max scale so the Trickle backoff is visible at a glance.
+fn render_ogm_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
+    let header = Row::new(["Iface", "Current", "Min", "Max", "Backoff (min→max)"])
+        .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = app
+        .snapshot
+        .ogm_schedule
+        .entries
+        .iter()
+        .map(|e| {
+            Row::new(vec![
+                Cell::from(e.iface_idx.to_string()),
+                Cell::from(Span::styled(
+                    fmt_interval(e.current_interval_ms),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                )),
+                Cell::from(fmt_interval(e.min_interval_ms)),
+                Cell::from(fmt_interval(e.max_interval_ms)),
+                Cell::from(backoff_bar(
+                    e.current_interval_ms,
+                    e.min_interval_ms,
+                    e.max_interval_ms,
+                )),
+            ])
+        })
+        .collect();
+
+    let title = format!(
+        " OGM Schedule ({}) ",
+        app.snapshot.ogm_schedule.entries.len()
+    );
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(6),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Min(14),
+        ],
+    )
+    .header(header)
+    .block(Block::default().borders(Borders::ALL).title(title))
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::Blue)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(table, area, &mut app.ogm_state);
+}
+
+/// Render a millisecond interval as a compact human-readable string: sub-second
+/// values in `ms`, everything else in seconds with one decimal.
+fn fmt_interval(ms: u32) -> String {
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else {
+        format!("{:.1} s", ms as f64 / 1000.0)
+    }
+}
+
+/// A 10-cell bar placing `current` on the `[min, max]` scale: empty at the
+/// aggressive floor, full at the quiet ceiling.  Visualises how far the Trickle
+/// timer has backed off.  Degenerate (`min == max`) schedules render full.
+fn backoff_bar(current: u32, min: u32, max: u32) -> String {
+    let filled = if max <= min {
+        10
+    } else {
+        let pos = current.saturating_sub(min) as u64 * 10 / (max - min) as u64;
+        pos.min(10) as usize
+    };
+    let mut s = String::new();
+    for i in 0..10 {
+        s.push(if i < filled { '█' } else { '·' });
+    }
+    s
 }
 
 /// A small unicode bar visualising a 0–255 quality value.

@@ -116,6 +116,21 @@ impl TrickleTimer {
     pub fn interval(&self) -> Duration {
         self.interval
     }
+
+    /// The smallest (most aggressive) interval: what the timer resets to on an
+    /// inconsistency and the value it starts at.  Exposed so callers (e.g. the
+    /// management API) can report the configured backoff floor alongside the
+    /// live [`interval`](Self::interval).
+    pub fn i_min(&self) -> Duration {
+        self.i_min
+    }
+
+    /// The largest (quietest) interval the doubling backoff is capped at.
+    /// Exposed so callers can report the configured backoff ceiling alongside
+    /// the live [`interval`](Self::interval).
+    pub fn i_max(&self) -> Duration {
+        self.i_max
+    }
 }
 
 #[cfg(test)]
@@ -221,5 +236,21 @@ mod tests {
         }
         assert_eq!(slow.interval(), slow_max);
         assert_ne!(fast_max, slow_max);
+    }
+
+    /// The configured bounds are reported back verbatim (after the `new`
+    /// clamping), so the management API can surface the backoff floor/ceiling
+    /// next to the live interval.
+    #[test]
+    fn bounds_are_reported() {
+        let t = TrickleTimer::new(I_MIN, I_MAX, Duration::ZERO, 5);
+        assert_eq!(t.i_min(), I_MIN);
+        assert_eq!(t.i_max(), I_MAX);
+
+        // `new` clamps i_max up to i_min when given an inverted pair; the
+        // getters reflect the clamped values.
+        let clamped = TrickleTimer::new(I_MAX, I_MIN, Duration::ZERO, 5);
+        assert_eq!(clamped.i_min(), I_MAX);
+        assert_eq!(clamped.i_max(), I_MAX);
     }
 }

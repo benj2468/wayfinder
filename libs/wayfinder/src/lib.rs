@@ -498,6 +498,14 @@ impl CentralRouter {
         self.link_quality.records()
     }
 
+    /// Snapshot the per-interface adaptive OGM emission schedule: each
+    /// interface's current publish interval and the `i_min`/`i_max` bounds it
+    /// backs off between.  Yields one entry per configured interface in
+    /// registration order; backs the management-API `GetOgmSchedule` request.
+    pub fn ogm_schedule(&self) -> impl Iterator<Item = batman::OgmScheduleEntry> + '_ {
+        self.batman.ogm_schedule()
+    }
+
     /// Read-only equivalent of [`handle_local`] + [`get_egress_interface`]:
     /// returns the next-hop neighbor and the egress decision that *would*
     /// be made for a packet to `dest` right now, without mutating any
