@@ -94,9 +94,10 @@ test:run:python:
   needs:
     - build
   script:
-    # The image's default user is `ci` (unprivileged); tshark won't load the Lua
-    # dissector as root, so the suite must run non-root.
-    - python3 -m pytest
+    # tshark won't load the Lua dissector as root, so drop to the unprivileged
+    # `ci` user (baked into the image) for the suite. The cargo jobs still run as
+    # root over the root-owned checkout; only this job needs to be non-root.
+    - runuser -u ci -- python3 -m pytest
 test:run:
   stage: test
   needs:

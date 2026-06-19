@@ -41,7 +41,6 @@ RUN pip3 install --no-cache-dir --break-system-packages pytest
 # Unprivileged user for the dissector tests. tshark refuses to load
 # `-X lua_script:` dissectors when running as root ("Running as user root ...
 # This could be dangerous."), which leaves the wayfinder.* fields unregistered
-# and fails the suite. Making `ci` the default user means every job using this
-# image (cargo build/test and pytest) runs unprivileged.
+# and fails the suite. The image's default user stays root (cargo jobs clone and
+# build as root); only the pytest job drops to this user via `runuser`.
 RUN useradd --create-home --shell /bin/bash ci
-USER ci
