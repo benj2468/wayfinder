@@ -90,11 +90,13 @@ test:run:rust:
         coverage_format: cobertura
 test:run:python:
   stage: test
-  image: nixos/nix
+  image: $CI_REGISTRY_IMAGE_TAG
   needs:
     - build
   script:
-    - nix --extra-experimental-features "nix-command flakes" develop -c pytest
+    # The image's default user is `ci` (unprivileged); tshark won't load the Lua
+    # dissector as root, so the suite must run non-root.
+    - python3 -m pytest
 test:run:
   stage: test
   needs:

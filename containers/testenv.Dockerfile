@@ -21,3 +21,27 @@ RUN cargo binstall -y cargo-llvm-cov
 
 # Ensure protoc is globally accessible (usually /usr/bin/protoc via apt)
 ENV PROTOC=/usr/bin/protoc
+
+# Python + tshark for the wayfinder-shark Lua dissector integration tests
+# (libs/wayfinder-shark/tests). DEBIAN_FRONTEND=noninteractive keeps the
+# wireshark-common debconf prompt (setuid dumpcap for non-root capture) from
+# blocking the build; we only read pcaps, so the default (no) is fine.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        tshark \
+    && rm -rf /var/lib/apt/lists/*
+
+# pytest from pip (not the python3-pytest apt package). Installed system-wide so
+# it is on PATH for the unprivileged `ci` user; --break-system-packages is
+# required because Debian marks the base interpreter externally-managed (PEP 668).
+RUN pip3 install --no-cache-dir --break-system-packages pytest
+
+# Unprivileged user for the dissector tests. tshark refuses to load
+# `-X lua_script:` dissectors when running as root ("Running as user root ...
+# This could be dangerous."), which leaves the wayfinder.* fields unregistered
+# and fails the suite. Making `ci` the default user means every job using this
+# image (cargo build/test and pytest) runs unprivileged.
+RUN useradd --create-home --shell /bin/bash ci
+USER ci
