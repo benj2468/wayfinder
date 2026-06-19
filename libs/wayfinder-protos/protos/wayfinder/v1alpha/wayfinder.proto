@@ -33,6 +33,11 @@ message GetRoutingTableRequest {}
 // physical interface.
 message GetLinkQualityTableRequest {}
 
+// Request the current per-interface OGM emission schedule.  Returns an
+// OgmSchedule response describing, for each mesh interface, the live OGM
+// publish interval and the adaptive backoff bounds it moves between.
+message GetOgmScheduleRequest {}
+
 // Request a routing decision for a hypothetical packet to `destination`,
 // mirroring what the router would compute on send.  Returns a
 // ResolveRouteResponse with the next-hop neighbor and the egress
@@ -61,6 +66,9 @@ message WayfinderRequest {
 
     // Ask the router how it would route a packet to a given destination.
     ResolveRouteRequest resolve_route = 4;
+
+    // Query the current per-interface adaptive OGM emission schedule.
+    GetOgmScheduleRequest get_ogm_schedule = 5;
   }
 }
 
@@ -158,6 +166,40 @@ message LinkQualityTable {
   repeated LinkQualityEntry entries = 1;
 }
 
+// The adaptive OGM emission schedule for a single mesh interface.  OGM
+// emission is paced per interface by a Trickle timer: the interval doubles
+// toward max_interval_ms while the local view of the topology is stable, and
+// snaps back to min_interval_ms the instant an inconsistency is detected, so
+// the mesh is near-silent at rest yet reconverges quickly on change.
+message OgmScheduleEntry {
+  // Index of the interface this schedule describes.  Indices are assigned in
+  // the order interfaces are registered with the CentralRouter and match the
+  // iface_idx used in LinkQualityEntry.
+  uint32 iface_idx = 1;
+
+  // The interval the interface is *currently* emitting OGMs at, in
+  // milliseconds: the live publish period.  Observe it grow on successive
+  // queries while the mesh is stable, and collapse back to min_interval_ms
+  // after a topology change.
+  uint32 current_interval_ms = 2;
+
+  // The most aggressive (shortest) interval the timer resets to on a topology
+  // change, in milliseconds.  The configured backoff floor.
+  uint32 min_interval_ms = 3;
+
+  // The quietest (longest) interval the doubling backoff is capped at, in
+  // milliseconds.  The configured backoff ceiling.
+  uint32 max_interval_ms = 4;
+}
+
+// Snapshot of the per-interface adaptive OGM emission schedule at the time of
+// the request.
+message OgmSchedule {
+  // One entry per configured mesh interface, in registration order.  Empty if
+  // no interface has been configured for OGM emission yet.
+  repeated OgmScheduleEntry entries = 1;
+}
+
 // Marker payload indicating the router would flood a packet out of every
 // interface (the egress decision used for broadcasts and for
 // destinations with no metric information).
@@ -213,5 +255,8 @@ message WayfinderResponse {
 
     // Response to ResolveRouteRequest.
     ResolveRouteResponse resolve_route = 5;
+
+    // Response to GetOgmScheduleRequest.
+    OgmSchedule ogm_schedule = 6;
   }
 }

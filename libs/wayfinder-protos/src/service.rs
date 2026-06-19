@@ -1,8 +1,8 @@
 use crate::wayfinder_v1alpha::{
     AllInterfacesEgress, ErrorResponse, LinkQualityEntry, LinkQualityTable, NeighborPath, NodeInfo,
-    ResolveRouteResponse, RoutingEntry, RoutingTable, WayfinderRequest, WayfinderResponse,
-    resolve_route_response::Egress as EgressKind, wayfinder_request::Request as RequestKind,
-    wayfinder_response::Response as ResponseKind,
+    OgmSchedule, OgmScheduleEntry, ResolveRouteResponse, RoutingEntry, RoutingTable,
+    WayfinderRequest, WayfinderResponse, resolve_route_response::Egress as EgressKind,
+    wayfinder_request::Request as RequestKind, wayfinder_response::Response as ResponseKind,
 };
 use alloc::vec::Vec;
 
@@ -39,6 +39,23 @@ pub struct LinkQualityEntryData {
     pub sample_count: u32,
 }
 
+/// Intermediate representation of one interface's adaptive OGM emission
+/// schedule, returned by [`WayfinderDataProvider::ogm_schedule`].  All
+/// intervals are in milliseconds.
+#[derive(Clone)]
+pub struct OgmScheduleEntryData {
+    /// Physical-interface index this schedule describes, in registration order.
+    pub iface_idx: u32,
+    /// Current OGM emission interval — the live publish period — in ms.
+    pub current_interval_ms: u32,
+    /// Backoff floor (Trickle `i_min`): the interval reset to on a topology
+    /// change, in ms.
+    pub min_interval_ms: u32,
+    /// Backoff ceiling (Trickle `i_max`): the longest interval reached while
+    /// stable, in ms.
+    pub max_interval_ms: u32,
+}
+
 /// Egress decision a router would make for a destination.  Mirrors
 /// `wayfinder::EgressInterface` without coupling this crate to it.
 #[derive(Clone)]
@@ -72,6 +89,9 @@ pub trait WayfinderDataProvider {
     fn routing_table(&self) -> Vec<RoutingEntryData>;
     /// Snapshot of the per-(neighbor, interface) link-quality table.
     fn link_quality_table(&self) -> Vec<LinkQualityEntryData>;
+    /// Snapshot of the per-interface adaptive OGM emission schedule (the
+    /// current OGM publish rate per interface and its backoff bounds).
+    fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData>;
     /// Resolve how a packet to `destination` would be routed.  Returns
     /// `None` if the raw bytes can't be parsed as a valid identifier for
     /// this provider's address family.
@@ -90,6 +110,9 @@ impl<T: WayfinderDataProvider> WayfinderDataProvider for &T {
     }
     fn link_quality_table(&self) -> Vec<LinkQualityEntryData> {
         (**self).link_quality_table()
+    }
+    fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData> {
+        (**self).ogm_schedule()
     }
     fn resolve_route(&self, destination: &[u8]) -> Option<RouteResolutionData> {
         (**self).resolve_route(destination)
@@ -155,6 +178,21 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                 ResponseKind::LinkQualityTable(LinkQualityTable { entries })
             }
 
+            Some(RequestKind::GetOgmSchedule(_)) => {
+                let entries = self
+                    .provider
+                    .ogm_schedule()
+                    .into_iter()
+                    .map(|e| OgmScheduleEntry {
+                        iface_idx: e.iface_idx,
+                        current_interval_ms: e.current_interval_ms,
+                        min_interval_ms: e.min_interval_ms,
+                        max_interval_ms: e.max_interval_ms,
+                    })
+                    .collect();
+                ResponseKind::OgmSchedule(OgmSchedule { entries })
+            }
+
             Some(RequestKind::ResolveRoute(req)) => {
                 match self.provider.resolve_route(&req.destination) {
                     Some(resolution) => ResponseKind::ResolveRoute(ResolveRouteResponse {
@@ -186,7 +224,9 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wayfinder_v1alpha::{GetLinkQualityTableRequest, ResolveRouteRequest};
+    use crate::wayfinder_v1alpha::{
+        GetLinkQualityTableRequest, GetOgmScheduleRequest, ResolveRouteRequest,
+    };
     use alloc::vec;
 
     /// Test double that returns canned responses and records the last
@@ -194,6 +234,7 @@ mod tests {
     #[derive(Default)]
     struct MockProvider {
         link_quality: Vec<LinkQualityEntryData>,
+        ogm_schedule: Vec<OgmScheduleEntryData>,
         route_resolution: Option<RouteResolutionData>,
         // RefCell would be nicer but no_std + alloc here — a Cell of an
         // owned Vec would require Clone gymnastics, so we just leave the
@@ -212,6 +253,9 @@ mod tests {
         }
         fn link_quality_table(&self) -> Vec<LinkQualityEntryData> {
             self.link_quality.clone()
+        }
+        fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData> {
+            self.ogm_schedule.clone()
         }
         fn resolve_route(&self, _destination: &[u8]) -> Option<RouteResolutionData> {
             self.route_resolution.clone()
@@ -368,12 +412,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ogm_schedule_request_returns_per_interface_entries() {
+        let provider = MockProvider {
+            ogm_schedule: vec![
+                OgmScheduleEntryData {
+                    iface_idx: 0,
+                    current_interval_ms: 4000,
+                    min_interval_ms: 1000,
+                    max_interval_ms: 64000,
+                },
+                OgmScheduleEntryData {
+                    iface_idx: 1,
+                    current_interval_ms: 1000,
+                    min_interval_ms: 1000,
+                    max_interval_ms: 32000,
+                },
+            ],
+            ..Default::default()
+        };
+
+        match handle(
+            provider,
+            RequestKind::GetOgmSchedule(GetOgmScheduleRequest {}),
+        ) {
+            ResponseKind::OgmSchedule(schedule) => {
+                assert_eq!(schedule.entries.len(), 2);
+                let e = &schedule.entries[0];
+                assert_eq!(e.iface_idx, 0);
+                assert_eq!(e.current_interval_ms, 4000);
+                assert_eq!(e.min_interval_ms, 1000);
+                assert_eq!(e.max_interval_ms, 64000);
+                // Second interface backed off less far and has a lower ceiling.
+                assert_eq!(schedule.entries[1].current_interval_ms, 1000);
+                assert_eq!(schedule.entries[1].max_interval_ms, 32000);
+            }
+            other => panic!("expected OgmSchedule, got {:?}", proto_kind_name(&other)),
+        }
+    }
+
+    #[test]
+    fn ogm_schedule_request_with_no_interfaces_returns_empty() {
+        match handle(
+            MockProvider::default(),
+            RequestKind::GetOgmSchedule(GetOgmScheduleRequest {}),
+        ) {
+            ResponseKind::OgmSchedule(schedule) => assert!(schedule.entries.is_empty()),
+            other => panic!("expected OgmSchedule, got {:?}", proto_kind_name(&other)),
+        }
+    }
+
     fn proto_kind_name(k: &ResponseKind) -> &'static str {
         match k {
             ResponseKind::NodeInfo(_) => "NodeInfo",
             ResponseKind::RoutingTable(_) => "RoutingTable",
             ResponseKind::LinkQualityTable(_) => "LinkQualityTable",
             ResponseKind::ResolveRoute(_) => "ResolveRoute",
+            ResponseKind::OgmSchedule(_) => "OgmSchedule",
             ResponseKind::Error(_) => "Error",
         }
     }

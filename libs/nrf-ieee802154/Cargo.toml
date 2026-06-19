@@ -1,0 +1,13 @@
+[package]
+name = "nrf-ieee802154"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+interfaces.workspace = true
+ieee802154 = { path = "../ieee802154" }
+
+# Depended on by path (not workspace inheritance) so `default-features = false`
+# keeps the `LinkT` trait available without pulling `alloc`/`std`.
+wayfinder = { path = "../wayfinder", default-features = false }
+embassy-nrf = { version = "0.10.0", features = ["nrf52840"] }

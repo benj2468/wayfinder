@@ -4,9 +4,9 @@
 use std::time::Instant;
 
 use ratatui::widgets::TableState;
-use wayfinder_protos::wayfinder_v1alpha::{LinkQualityTable, NodeInfo, RoutingTable};
+use wayfinder_protos::wayfinder_v1alpha::{LinkQualityTable, NodeInfo, OgmSchedule, RoutingTable};
 
-/// The three top-level views the TUI cycles between.
+/// The top-level views the TUI cycles between.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
     /// Node identity, originator count, and connection status.
@@ -15,11 +15,18 @@ pub enum Tab {
     Routing,
     /// The per-(neighbor, interface) link-quality table.
     LinkQuality,
+    /// The per-interface adaptive OGM emission schedule (current publish rate).
+    OgmSchedule,
 }
 
 impl Tab {
     /// All tabs in display order.
-    pub const ALL: [Tab; 3] = [Tab::Overview, Tab::Routing, Tab::LinkQuality];
+    pub const ALL: [Tab; 4] = [
+        Tab::Overview,
+        Tab::Routing,
+        Tab::LinkQuality,
+        Tab::OgmSchedule,
+    ];
 
     /// Short title shown in the tab bar.
     pub fn title(self) -> &'static str {
@@ -27,6 +34,7 @@ impl Tab {
             Tab::Overview => "Overview",
             Tab::Routing => "Routing Table",
             Tab::LinkQuality => "Link Quality",
+            Tab::OgmSchedule => "OGM Schedule",
         }
     }
 
@@ -56,6 +64,8 @@ pub struct Snapshot {
     pub routing: RoutingTable,
     /// Link-quality table; empty until first fetch.
     pub link_quality: LinkQualityTable,
+    /// Per-interface adaptive OGM emission schedule; empty until first fetch.
+    pub ogm_schedule: OgmSchedule,
 }
 
 /// Whole-application state driven by the event loop and rendered each frame.
@@ -70,6 +80,8 @@ pub struct App {
     pub routing_state: TableState,
     /// Selection state for the link-quality table.
     pub link_state: TableState,
+    /// Selection state for the OGM schedule table.
+    pub ogm_state: TableState,
     /// Last error message from a failed refresh, cleared on success.
     pub last_error: Option<String>,
     /// When the snapshot was last refreshed successfully.
@@ -91,6 +103,7 @@ impl App {
             snapshot: Snapshot::default(),
             routing_state: TableState::default(),
             link_state: TableState::default(),
+            ogm_state: TableState::default(),
             last_error: None,
             last_update: None,
             connected: false,
@@ -106,6 +119,10 @@ impl App {
             Tab::LinkQuality => (
                 &mut self.link_state,
                 self.snapshot.link_quality.entries.len(),
+            ),
+            Tab::OgmSchedule => (
+                &mut self.ogm_state,
+                self.snapshot.ogm_schedule.entries.len(),
             ),
             Tab::Overview => return,
         };
@@ -158,10 +175,12 @@ mod tests {
     fn tab_cycles_both_directions_and_wraps() {
         assert_eq!(Tab::Overview.next(), Tab::Routing);
         assert_eq!(Tab::Routing.next(), Tab::LinkQuality);
-        assert_eq!(Tab::LinkQuality.next(), Tab::Overview); // wrap forward
-        assert_eq!(Tab::Overview.prev(), Tab::LinkQuality); // wrap backward
+        assert_eq!(Tab::LinkQuality.next(), Tab::OgmSchedule);
+        assert_eq!(Tab::OgmSchedule.next(), Tab::Overview); // wrap forward
+        assert_eq!(Tab::Overview.prev(), Tab::OgmSchedule); // wrap backward
         assert_eq!(Tab::Overview.index(), 0);
         assert_eq!(Tab::LinkQuality.index(), 2);
+        assert_eq!(Tab::OgmSchedule.index(), 3);
     }
 
     fn app_with_routes(n: usize) -> App {

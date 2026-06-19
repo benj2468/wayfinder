@@ -7,10 +7,55 @@ use core::net::Ipv4Addr;
 use core::net::SocketAddr;
 use serde::{Deserialize, Serialize};
 
-/// A single mesh interface's transport configuration.
+/// Per-link adaptive OGM emission bounds (Trickle backoff, RFC 6206), supplied
+/// at runtime by each link's configuration so a fast LAN link and a slow LoRa
+/// link can back off on different schedules.  The emission interval starts at
+/// `i_min_ms`, doubles toward `i_max_ms` while the topology is stable, and snaps
+/// back to `i_min_ms` whenever the routing view changes.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct TrickleConfig {
+    /// Smallest (most aggressive) OGM interval, in milliseconds — the interval
+    /// the link resets to on any topology change and the floor of the backoff.
+    #[serde(default = "TrickleConfig::default_i_min_ms")]
+    pub i_min_ms: u64,
+    /// Largest (quietest) OGM interval, in milliseconds — the ceiling the
+    /// doubling backoff saturates at while the topology stays stable.
+    #[serde(default = "TrickleConfig::default_i_max_ms")]
+    pub i_max_ms: u64,
+}
+
+impl TrickleConfig {
+    /// Default `i_min`: 1 s — quick enough to reconverge promptly after a change.
+    const fn default_i_min_ms() -> u64 {
+        1_000
+    }
+    /// Default `i_max`: 64 s — quiet in steady state versus the former fixed 10 s.
+    const fn default_i_max_ms() -> u64 {
+        64_000
+    }
+    /// The configured minimum interval as a [`core::time::Duration`].
+    pub fn i_min(&self) -> core::time::Duration {
+        core::time::Duration::from_millis(self.i_min_ms)
+    }
+    /// The configured maximum interval as a [`core::time::Duration`].
+    pub fn i_max(&self) -> core::time::Duration {
+        core::time::Duration::from_millis(self.i_max_ms)
+    }
+}
+
+impl Default for TrickleConfig {
+    fn default() -> Self {
+        Self {
+            i_min_ms: Self::default_i_min_ms(),
+            i_max_ms: Self::default_i_max_ms(),
+        }
+    }
+}
+
+/// A single mesh interface's transport carrier (how its frames cross the wire).
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
-pub enum LinkConfig {
+pub enum LinkTransport {
     /// Carry the link over UDP, bridging a local bind address to a fixed remote.
     Udp {
         /// Local address the UDP socket binds to.
@@ -19,8 +64,8 @@ pub enum LinkConfig {
         remote_addr: SocketAddr,
     },
     /// Carry the link over a raw IP socket (`AF_INET`/`SOCK_RAW`), point-to-point
-    /// like [`Udp`](LinkConfig::Udp) but using an IP protocol number instead of
-    /// UDP ports.  Requires `CAP_NET_RAW`.
+    /// like [`Udp`](LinkTransport::Udp) but using an IP protocol number instead
+    /// of UDP ports.  Requires `CAP_NET_RAW`.
     RawIp {
         /// Local IP address the raw socket binds to.
         bind_addr: IpAddr,
@@ -42,6 +87,32 @@ pub enum LinkConfig {
     },
     /// Test Link, used for testing only, will fail validation in real mode
     Test { switch_name: String },
+}
+
+/// A single mesh interface: its transport carrier plus the per-link OGM backoff
+/// bounds.  The `ogm` block is optional in the config and defaults to
+/// [`TrickleConfig::default`] when omitted.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct LinkConfig {
+    /// How this link's frames cross the wire.
+    #[serde(flatten)]
+    pub transport: LinkTransport,
+    /// This link's adaptive OGM emission bounds.
+    #[serde(default)]
+    pub ogm: TrickleConfig,
+}
+
+impl LinkConfig {
+    /// Build a test link onto the named switch with default OGM bounds.  Keeps
+    /// the test harness's link construction terse.
+    pub fn test(switch_name: impl Into<String>) -> Self {
+        Self {
+            transport: LinkTransport::Test {
+                switch_name: switch_name.into(),
+            },
+            ogm: TrickleConfig::default(),
+        }
+    }
 }
 
 /// Transport over which the management API is exposed.

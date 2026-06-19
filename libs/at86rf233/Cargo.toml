@@ -1,0 +1,17 @@
+[package]
+name = "at86rf233"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+interfaces.workspace = true
+embedded-hal.workspace = true
+embedded-hal-async.workspace = true
+ieee802154 = { path = "../ieee802154" }
+
+# Depended on by path (not workspace inheritance) so `default-features = false`
+# keeps the `LinkT` trait available without pulling `alloc`/`std`.
+wayfinder = { path = "../wayfinder", default-features = false }
+
+[dev-dependencies]
+tokio.workspace = true

@@ -90,11 +90,14 @@ test:run:rust:
         coverage_format: cobertura
 test:run:python:
   stage: test
-  image: nixos/nix
+  image: $CI_REGISTRY_IMAGE_TAG
   needs:
     - build
   script:
-    - nix --extra-experimental-features "nix-command flakes" develop -c pytest
+    # tshark won't load the Lua dissector as root, so drop to the unprivileged
+    # `ci` user (baked into the image) for the suite. The cargo jobs still run as
+    # root over the root-owned checkout; only this job needs to be non-root.
+    - runuser -u ci -- python3 -m pytest
 test:run:
   stage: test
   needs:

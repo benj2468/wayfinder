@@ -11,8 +11,8 @@ use wayfinder::CentralRouter;
 use wayfinder::EgressInterface;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder_protos::service::{
-    EgressDecisionData, LinkQualityEntryData, NeighborPathData, RouteResolutionData,
-    RoutingEntryData, WayfinderDataProvider,
+    EgressDecisionData, LinkQualityEntryData, NeighborPathData, OgmScheduleEntryData,
+    RouteResolutionData, RoutingEntryData, WayfinderDataProvider,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -68,6 +68,20 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
                 iface_idx: r.iface_idx as u32,
                 ewma_quality: r.ewma_quality as u32,
                 sample_count: r.sample_count,
+            })
+            .collect()
+    }
+
+    fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData> {
+        self.0
+            .ogm_schedule()
+            .map(|e| OgmScheduleEntryData {
+                iface_idx: e.iface_idx as u32,
+                // Intervals are sub-minute Trickle periods, so milliseconds fit
+                // comfortably in u32; saturate defensively rather than wrap.
+                current_interval_ms: e.current_interval.as_millis().min(u32::MAX as u128) as u32,
+                min_interval_ms: e.min_interval.as_millis().min(u32::MAX as u128) as u32,
+                max_interval_ms: e.max_interval.as_millis().min(u32::MAX as u128) as u32,
             })
             .collect()
     }

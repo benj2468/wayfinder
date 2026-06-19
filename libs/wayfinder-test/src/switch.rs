@@ -141,6 +141,9 @@ where
             rng: StdRng::from_seed([0; 32]),
         }
     }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
     pub fn new_with_name(name: String) -> Self {
         Self {
             name,

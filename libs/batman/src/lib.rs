@@ -1,16 +1,17 @@
 #![cfg_attr(not(test), no_std)]
 
 mod engine;
+pub mod trickle;
 pub mod wire;
 
 #[cfg(test)]
 mod engine_tests;
 
-use core::time::Duration;
-
 use heapless::Vec as HVec;
 use heapless::index_map::FnvIndexMap;
 use interfaces::frame::Mac;
+
+pub use trickle::TrickleTimer;
 
 /// Maximum number of multicast groups this node's local host can join at once.
 pub const MAX_LOCAL_MCAST: usize = 16;
@@ -18,11 +19,23 @@ pub const MAX_LOCAL_MCAST: usize = 16;
 /// the whole mesh.  Bounds the footprint for embedded targets.
 pub const MAX_MCAST_MEMBERS: usize = 64;
 
-/// How long a path (or a whole originator) may go without a refreshing OGM
-/// before it is treated as dead: ignored when choosing a next hop and evicted
-/// by the periodic sweep.  At the default ~10 s OGM interval this tolerates a
-/// handful of consecutive misses before a route is dropped.
-pub const ORIGINATOR_TIMEOUT: Duration = Duration::from_secs(60);
+/// Maximum number of mesh interfaces whose OGM emission this engine paces with
+/// an independent [`TrickleTimer`].  Bounds the per-interface timer table for
+/// embedded targets.
+pub const MAX_INTERFACES: usize = 8;
+
+/// How many of this node's **own** OGM rounds (the
+/// [`sequence_number`](BatmanEngine::sequence_number) counter) may advance
+/// without a refreshing OGM from a path before that path — or a whole
+/// originator reachable on no fresher path — is treated as dead: skipped when
+/// choosing a next hop and evicted by [`purge_stale`](BatmanEngine::purge_stale).
+///
+/// Ageing is counted in OGM *rounds*, not wall-clock seconds, so it tracks the
+/// (now adaptive, per-link) emission cadence automatically: when the mesh is
+/// chatty a missed neighbour is reclaimed quickly, and when it has quietened
+/// into long Trickle intervals the same gap simply spans more time.  Six rounds
+/// preserves the few-consecutive-misses tolerance of the former 60 s/10 s timeout.
+pub const MAX_MISSED_OGMS: u32 = 6;
 
 /// Track metrics for a specific path to an originator via a specific immediate neighbor
 #[derive(Debug, Clone)]
@@ -30,27 +43,51 @@ pub struct NeighborStats {
     pub neighbor_ident: Mac,
     pub last_tq: u8,
     pub last_seqno: u32,
-    /// Instant (on the engine's clock) of the most recent OGM that refreshed
-    /// this path.  A path whose `rx_time` is older than [`ORIGINATOR_TIMEOUT`]
-    /// is stale: its neighbor has gone quiet, so it is skipped when selecting a
-    /// next hop and pruned by [`BatmanEngine::purge_stale`].
-    pub rx_time: Duration,
+    /// This node's own OGM round counter
+    /// ([`sequence_number`](BatmanEngine::sequence_number)) at the moment the
+    /// most recent OGM refreshed this path.  A path is stale once the counter
+    /// has advanced more than [`MAX_MISSED_OGMS`] beyond this stamp: its
+    /// neighbor has gone quiet, so it is skipped when selecting a next hop and
+    /// pruned by [`BatmanEngine::purge_stale`].
+    pub last_heard_round: u32,
 }
 
 /// A destination node in the mesh network
 #[derive(Debug, Clone)]
 pub struct OriginatorRecord {
-    /// Instant of the most recent OGM accepted for this originator via *any*
-    /// path (i.e. the freshest of its [`NeighborStats::rx_time`]).  When this is
-    /// older than [`ORIGINATOR_TIMEOUT`] the originator has been heard from on
+    /// This node's OGM round counter when the most recent OGM for this
+    /// originator was accepted via *any* path (the freshest of its
+    /// [`NeighborStats::last_heard_round`]).  When the counter has advanced more
+    /// than [`MAX_MISSED_OGMS`] beyond it, the originator has been heard from on
     /// no path and the whole record is evicted.
-    pub rx_time: Duration,
+    pub last_heard_round: u32,
     pub neighbor_ident: Mac,
     pub best_next_hop: Mac,
     pub max_tq: u8,
     pub last_seqno: u32,
     // Track stats per neighbor routing path to this originator
     pub paths: HVec<NeighborStats, 4>,
+}
+
+/// A snapshot of one interface's adaptive OGM emission schedule, as paced by
+/// its [`TrickleTimer`].  Reported by [`BatmanEngine::ogm_schedule`] so the
+/// management API can surface the *current* OGM publish rate per link together
+/// with the configured backoff bounds it adapts between.
+#[derive(Debug, Clone)]
+pub struct OgmScheduleEntry {
+    /// Index of the interface this schedule belongs to, in the order interfaces
+    /// were registered via [`BatmanEngine::configure_interface_ogm`].
+    pub iface_idx: usize,
+    /// The interval `I` the link is currently emitting at: the live OGM publish
+    /// period, which doubles toward `max_interval` while the topology is stable
+    /// and snaps back to `min_interval` on any inconsistency.
+    pub current_interval: core::time::Duration,
+    /// The most aggressive interval the timer resets to on a topology change
+    /// (the Trickle `i_min`).
+    pub min_interval: core::time::Duration,
+    /// The quietest interval the doubling backoff is capped at (the Trickle
+    /// `i_max`).
+    pub max_interval: core::time::Duration,
 }
 
 pub struct BatmanEngine<const MAX_ORIGINATORS: usize> {
@@ -82,6 +119,20 @@ pub struct BatmanEngine<const MAX_ORIGINATORS: usize> {
     /// OGM multicast TVLVs.  Drives selective multicast forwarding: a frame to
     /// a group is sent only toward the originators listed here for that group.
     pub mcast_members: HVec<(Mac, Mac), MAX_MCAST_MEMBERS>,
+    /// Per-interface adaptive OGM emission schedules, indexed by interface
+    /// index.  Configured at runtime via
+    /// [`configure_interface_ogm`](Self::configure_interface_ogm) — each link
+    /// supplies its own `i_min`/`i_max`, so a fast link and a slow link back off
+    /// independently.  Empty until the owning driver configures its interfaces.
+    pub ogm_timers: HVec<TrickleTimer, MAX_INTERFACES>,
+    /// Latched whenever this engine's view of the topology changes (a new
+    /// originator, a changed best next hop, a changed multicast membership, or a
+    /// purged route).  Consumed at the end of OGM processing and of
+    /// [`produce_periodic_broadcast`] to reset every Trickle timer back to its
+    /// `i_min`, so the node re-announces promptly after any change.
+    ///
+    /// [`produce_periodic_broadcast`]: interfaces::engine::MeshRoutingEngine::produce_periodic_broadcast
+    topology_changed: bool,
 }
 
 impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
@@ -94,6 +145,8 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
             broadcast_seqno: HVec::new(),
             local_mcast: HVec::new(),
             mcast_members: HVec::new(),
+            ogm_timers: HVec::new(),
+            topology_changed: false,
         }
     }
 

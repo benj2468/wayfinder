@@ -7,7 +7,7 @@ use tracing::warn;
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
-    BatmanEngine, NeighborStats, OriginatorRecord,
+    BatmanEngine, NeighborStats, OriginatorRecord, TrickleTimer,
     wire::{
         BATADV_BCAST, BATADV_IV_OGM, BATADV_MCAST, BATADV_TVLV_MCAST, BATADV_UNICAST,
         BatmanBroadcastPacket, BatmanMcastPacket, BatmanOgmPacket, BatmanTvlvHdr,
@@ -31,43 +31,65 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
             .map(|record| record.best_next_hop)
     }
 
-    /// The best next hop toward `destination` *as of `now`*, ignoring any path
-    /// not refreshed within [`ORIGINATOR_TIMEOUT`].  Returns `None` when the
-    /// destination is unknown or every path to it is stale — so a caller never
-    /// forwards toward a neighbor that has gone silent, even between periodic
-    /// sweeps.
+    /// The best next hop toward `destination`, ignoring any path that has gone
+    /// stale — one not refreshed within the last [`MAX_MISSED_OGMS`] of this
+    /// node's own OGM rounds.  Returns `None` when the destination is unknown or
+    /// every path to it is stale, so a caller never forwards toward a neighbor
+    /// that has gone silent, even between periodic sweeps.
     ///
-    /// [`ORIGINATOR_TIMEOUT`]: crate::ORIGINATOR_TIMEOUT
-    pub fn next_hop(&self, destination: Mac, now: core::time::Duration) -> Option<Mac> {
+    /// [`MAX_MISSED_OGMS`]: crate::MAX_MISSED_OGMS
+    pub fn next_hop(&self, destination: Mac) -> Option<Mac> {
         let record = self.originator_table.get(&destination)?;
+        let round = self.sequence_number;
         record
             .paths
             .iter()
-            .filter(|p| now.saturating_sub(p.rx_time) <= crate::ORIGINATOR_TIMEOUT)
+            .filter(|p| !Self::round_stale(round, p.last_heard_round))
             .max_by_key(|p| p.last_tq)
             .map(|p| p.neighbor_ident)
     }
 
-    /// Drop routing state that has aged out as of `now`: originators heard on no
-    /// path within [`ORIGINATOR_TIMEOUT`] are removed entirely, and for the
+    /// Whether a record stamped at `stamp` has aged out as of round `now`: true
+    /// once `now` has advanced more than [`MAX_MISSED_OGMS`] rounds past
+    /// `stamp`.  Wrapping subtraction matches the wrapping OGM round counter.
+    ///
+    /// [`MAX_MISSED_OGMS`]: crate::MAX_MISSED_OGMS
+    fn round_stale(now: u32, stamp: u32) -> bool {
+        now.wrapping_sub(stamp) > crate::MAX_MISSED_OGMS
+    }
+
+    /// Drop routing state that has aged out: originators heard on no path within
+    /// the last [`MAX_MISSED_OGMS`] OGM rounds are removed entirely, and for the
     /// survivors any individual stale path is pruned and `best_next_hop` /
     /// `max_tq` recomputed from what remains.  Runs off the hot path, on the
     /// periodic-broadcast tick, to reclaim table slots and keep the cached best
-    /// hop honest after a neighbor disappears.
+    /// hop honest after a neighbor disappears.  Latches
+    /// [`topology_changed`](BatmanEngine::topology_changed) if it dropped
+    /// anything, so the Trickle timers reset and the node re-announces promptly.
     ///
-    /// [`ORIGINATOR_TIMEOUT`]: crate::ORIGINATOR_TIMEOUT
-    pub fn purge_stale(&mut self, now: core::time::Duration) {
-        // Evict originators not heard from on any path recently.  Because
-        // `record.rx_time` is the freshest of its paths' `rx_time`s, a surviving
-        // record always keeps at least one fresh path.
-        self.originator_table
-            .retain(|_, r| now.saturating_sub(r.rx_time) <= crate::ORIGINATOR_TIMEOUT);
+    /// [`MAX_MISSED_OGMS`]: crate::MAX_MISSED_OGMS
+    pub fn purge_stale(&mut self) {
+        let round = self.sequence_number;
+        let before = self.originator_table.len();
 
+        // Evict originators not heard from on any path recently.  Because
+        // `record.last_heard_round` is the freshest of its paths' stamps, a
+        // surviving record always keeps at least one fresh path.
+        self.originator_table
+            .retain(|_, r| !Self::round_stale(round, r.last_heard_round));
+
+        let mut pruned_path = false;
         for record in self.originator_table.values_mut() {
+            let paths_before = record.paths.len();
             record
                 .paths
-                .retain(|p| now.saturating_sub(p.rx_time) <= crate::ORIGINATOR_TIMEOUT);
+                .retain(|p| !Self::round_stale(round, p.last_heard_round));
+            pruned_path |= record.paths.len() != paths_before;
             Self::recompute_best(record);
+        }
+
+        if self.originator_table.len() != before || pruned_path {
+            self.topology_changed = true;
         }
     }
 
@@ -120,8 +142,12 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
     /// in `tail` (the TVLV region following an OGM header).  An OGM with no
     /// multicast TVLV prunes all of `orig`'s memberships.  Called when an OGM
     /// is accepted; keeps [`Self::mcast_members`] in sync with the latest
-    /// announcement from each originator.
-    fn update_mcast_membership(&mut self, orig: Mac, tail: &[u8]) {
+    /// announcement from each originator.  Returns whether the set of groups
+    /// attributed to `orig` actually changed.
+    fn update_mcast_membership(&mut self, orig: Mac, tail: &[u8]) -> bool {
+        // Snapshot the prior membership so we can report whether it changed.
+        let before = self.mcast_groups_for(orig);
+
         // Drop every membership currently attributed to this originator;
         // the incoming announcement is authoritative for it.
         let mut i = 0;
@@ -142,6 +168,123 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
                     break; // table full; drop the rest
                 }
             }
+        }
+
+        // Report whether the membership set for this originator actually
+        // changed, so the caller can treat a membership change as an
+        // inconsistency that resets the Trickle backoff.
+        let after = self.mcast_groups_for(orig);
+        before != after
+    }
+
+    /// The sorted set of multicast group MACs currently attributed to `orig`.
+    /// Used to detect whether an OGM's membership announcement changed anything.
+    fn mcast_groups_for(&self, orig: Mac) -> heapless::Vec<Mac, { crate::MAX_MCAST_MEMBERS }> {
+        let mut groups: heapless::Vec<Mac, { crate::MAX_MCAST_MEMBERS }> = self
+            .mcast_members
+            .iter()
+            .filter(|(_, m)| *m == orig)
+            .map(|(g, _)| *g)
+            .collect();
+        groups.sort_unstable_by_key(|g| g.0);
+        groups
+    }
+
+    // ── per-interface Trickle (adaptive OGM emission) ─────────────────────────
+
+    /// Install (or replace) the adaptive OGM schedule for interface `idx`,
+    /// supplying that link's `i_min`/`i_max` at runtime.  Slots between the
+    /// current length and `idx` are back-filled with the same bounds so the
+    /// table stays dense and index-addressable.  Interfaces at or beyond
+    /// [`MAX_INTERFACES`](crate::MAX_INTERFACES) are ignored.
+    pub fn configure_interface_ogm(
+        &mut self,
+        idx: usize,
+        i_min: core::time::Duration,
+        i_max: core::time::Duration,
+        now: core::time::Duration,
+    ) {
+        if idx >= crate::MAX_INTERFACES {
+            return;
+        }
+        // Jitter seed: fold the node identity with the interface index so each
+        // interface — and each node — fires on its own offset.
+        let seed = u32::from_le_bytes([
+            self.self_ident.0[2],
+            self.self_ident.0[3],
+            self.self_ident.0[4],
+            self.self_ident.0[5],
+        ]) ^ (idx as u32).wrapping_mul(0x0100_0193);
+        while self.ogm_timers.len() <= idx {
+            let _ = self
+                .ogm_timers
+                .push(TrickleTimer::new(i_min, i_max, now, seed));
+        }
+        self.ogm_timers[idx] = TrickleTimer::new(i_min, i_max, now, seed);
+    }
+
+    /// Time until the soonest interface is next due to emit an OGM, as of `now`.
+    /// The owning driver sleeps for this long before the next emission.  With no
+    /// interfaces configured there is nothing to emit, so this reports a long
+    /// idle interval rather than busy-looping.
+    pub fn next_broadcast_after(&self, now: core::time::Duration) -> core::time::Duration {
+        self.ogm_timers
+            .iter()
+            .map(|t| t.time_until(now))
+            .min()
+            .unwrap_or(core::time::Duration::from_secs(3600))
+    }
+
+    /// The index of the interface most overdue to emit as of `now`, or `None`
+    /// when none is yet due.  Drives the driver's per-interface OGM emission:
+    /// the soonest-scheduled due interface fires first.
+    pub fn due_interface(&self, now: core::time::Duration) -> Option<usize> {
+        self.ogm_timers
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.due(now))
+            .min_by_key(|(_, t)| t.time_until(now))
+            .map(|(idx, _)| idx)
+    }
+
+    /// Snapshot the adaptive OGM schedule of every configured interface: its
+    /// current emission interval (the live publish rate) and the `i_min`/`i_max`
+    /// bounds it adapts between.  Yields one [`OgmScheduleEntry`] per interface
+    /// in registration order; empty when no interface has been configured.
+    pub fn ogm_schedule(&self) -> impl Iterator<Item = crate::OgmScheduleEntry> + '_ {
+        self.ogm_timers
+            .iter()
+            .enumerate()
+            .map(|(iface_idx, t)| crate::OgmScheduleEntry {
+                iface_idx,
+                current_interval: t.interval(),
+                min_interval: t.i_min(),
+                max_interval: t.i_max(),
+            })
+    }
+
+    /// Record that interface `idx` just emitted an OGM at `now`, advancing that
+    /// interface's Trickle schedule (and doubling its interval toward `i_max`).
+    pub fn on_interface_emitted(&mut self, idx: usize, now: core::time::Duration) {
+        if let Some(timer) = self.ogm_timers.get_mut(idx) {
+            timer.on_emit(now);
+        }
+    }
+
+    /// Reset every interface's Trickle schedule to its `i_min`, used after an
+    /// inconsistency so the node re-announces promptly on all links.
+    pub fn reset_ogm_timers(&mut self, now: core::time::Duration) {
+        for timer in self.ogm_timers.iter_mut() {
+            timer.reset(now);
+        }
+    }
+
+    /// If a topology change was latched, clear it and reset all Trickle timers
+    /// so emission accelerates back to `i_min`.  Called at the end of OGM
+    /// processing and of the periodic broadcast.
+    fn apply_topology_change(&mut self, now: core::time::Duration) {
+        if core::mem::take(&mut self.topology_changed) {
+            self.reset_ogm_timers(now);
         }
     }
 }
@@ -191,22 +334,27 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
                 }
 
                 let incoming_seqno = u32::from_be(ogm.seqno);
+                // This node's current OGM round; paths are stamped with it so
+                // ageing is counted in rounds, not wall-clock (see `purge_stale`).
+                let round = self.sequence_number;
 
                 // Find or create the originator's record, keyed by its MAC.
-                if !self.originator_table.contains_key(&orig_ident) {
+                // A freshly discovered originator is itself a topology change.
+                let is_new_orig = !self.originator_table.contains_key(&orig_ident);
+                if is_new_orig {
                     // Table full: evict the least-recently-refreshed originator
                     // to make room rather than dropping this newly heard one.
                     if self.originator_table.len() >= MAX_ORIGINATORS
                         && let Some(oldest) = self
                             .originator_table
                             .values()
-                            .min_by_key(|r| r.rx_time)
+                            .min_by_key(|r| r.last_heard_round)
                             .map(|r| r.neighbor_ident)
                     {
                         self.originator_table.remove(&oldest);
                     }
                     let new_record = OriginatorRecord {
-                        rx_time: now,
+                        last_heard_round: round,
                         neighbor_ident: orig_ident,
                         best_next_hop: frame.src,
                         max_tq: 0,
@@ -218,6 +366,8 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
                 }
 
                 let record = self.originator_table.get_mut(&orig_ident).unwrap();
+                // Best next hop before this OGM, to detect a route change below.
+                let old_best = record.best_next_hop;
 
                 // Whether this OGM carries a *strictly newer* sequence number
                 // than any we've already processed from this originator.
@@ -237,32 +387,52 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
                 if incoming_seqno >= record.last_seqno {
                     record.last_seqno = incoming_seqno;
                     // Hearing this originator on any path keeps the whole record
-                    // alive; `rx_time` tracks the freshest path.
-                    record.rx_time = now;
+                    // alive; `last_heard_round` tracks the freshest path.
+                    record.last_heard_round = round;
 
                     // Simple path metric attenuation (echoing back path quality drop)
                     let computed_tq = ogm.tq.saturating_sub(10);
 
                     // Track path via this specific immediate neighbor, stamping
-                    // it with `now` so a neighbor that later goes quiet ages out.
+                    // it with the current round so a neighbor that later goes
+                    // quiet ages out once the round gap exceeds MAX_MISSED_OGMS.
                     if let Some(path) = record.paths.iter_mut().find(|p| p.neighbor_ident == src) {
                         path.last_tq = computed_tq;
                         path.last_seqno = incoming_seqno;
-                        path.rx_time = now;
+                        path.last_heard_round = round;
                     } else if record.paths.len() < 4 {
                         let _ = record.paths.push(NeighborStats {
                             neighbor_ident: frame.src,
                             last_tq: computed_tq,
                             last_seqno: incoming_seqno,
-                            rx_time: now,
+                            last_heard_round: round,
                         });
                     }
 
-                    // Update routing table selection if this path has superior quality
-                    if computed_tq >= record.max_tq {
+                    // Update routing-table selection with hysteresis.  Always
+                    // refresh the incumbent next hop's metric when we hear it
+                    // again (its quality may have risen or fallen), but only
+                    // *switch* the next hop for a path that is strictly better.
+                    // An equal-quality copy arriving via a different neighbor —
+                    // the common case in a redundant mesh, where the same
+                    // originator is heard via several equal-cost neighbors every
+                    // round — is recorded as an alternate path (above) without
+                    // displacing the incumbent.  Without this, `best_next_hop`
+                    // would flip-flop between equal-cost neighbors on every
+                    // duplicate OGM, latching a spurious topology change each
+                    // round (`best_changed` below) and pinning every node's
+                    // Trickle backoff at `i_min` via the reflexive resets that
+                    // ripple across the mesh.
+                    if frame.src == record.best_next_hop {
+                        record.max_tq = computed_tq;
+                    } else if computed_tq > record.max_tq {
                         record.max_tq = computed_tq;
                         record.best_next_hop = frame.src;
                     }
+                    // A changed best next hop is a genuine topology change (the
+                    // `record` borrow ends here, before the `&mut self` call
+                    // below).
+                    let best_changed = record.best_next_hop != old_best;
 
                     // Fold this originator's multicast memberships (carried in
                     // the OGM's TVLV tail) into the membership table.  The
@@ -270,7 +440,14 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
                     // here is fine.
                     let header_size = core::mem::size_of::<BatmanOgmPacket>();
                     let tail = frame.payload.get(header_size..).unwrap_or(&[]);
-                    self.update_mcast_membership(orig_ident, tail);
+                    let mcast_changed = self.update_mcast_membership(orig_ident, tail);
+
+                    // Treat any change to our routing view as a Trickle
+                    // inconsistency: latch it so the timers reset and the node
+                    // re-announces promptly (applied before we return below).
+                    if is_new_orig || best_changed || mcast_changed {
+                        self.topology_changed = true;
+                    }
 
                     // --- REACTIVE STEP: Forward OGM (Flood Routing Propagation) ---
                     // Re-flood only the first time we see a sequence number, and
@@ -304,9 +481,11 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
                             dst.copy_from_slice(src);
                         }
 
+                        self.apply_topology_change(now);
                         return RoutingAction::Consumed;
                     }
                 }
+                self.apply_topology_change(now);
                 RoutingAction::Consumed
             }
 
@@ -399,7 +578,7 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
 
                 // Rule 3: We are an intermediate relay node. Look up the next
                 // live hop for the final destination (stale hops are skipped).
-                if let Some(next) = self.next_hop(dst, now) {
+                if let Some(next) = self.next_hop(dst) {
                     // Re-write the mutable scratchpad/response buffer with the updated header
                     // and preserve the inner application payload that follows the header.
                     let mut updated_hdr = unicast_hdr;
@@ -448,7 +627,7 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
                 }
 
                 // Rule 3: relay toward the next live hop for the target listener.
-                if let Some(next) = self.next_hop(dst, now) {
+                if let Some(next) = self.next_hop(dst) {
                     let mut updated_hdr = mcast_hdr;
                     updated_hdr.ttl -= 1;
 
@@ -477,7 +656,7 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
             _ => {
                 if dst == self.self_ident {
                     RoutingAction::DeliverLocal
-                } else if let Some(next) = self.next_hop(dst, now) {
+                } else if let Some(next) = self.next_hop(dst) {
                     // Forwarding decision dictated dynamically by the current
                     // best *live* path (stale next hops are skipped).
                     RoutingAction::ForwardTo(next)
@@ -496,8 +675,10 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
     ) -> Option<&'tx [u8]> {
         // Age out routes to neighbors that have gone quiet.  Done on this
         // periodic tick — off the receive hot path — so a stale next hop is
-        // never left in the table for long.
-        self.purge_stale(now);
+        // never left in the table for long.  A route lost here is a topology
+        // change, so reset the Trickle timers to re-announce promptly.
+        self.purge_stale();
+        self.apply_topology_change(now);
 
         // Increment sequence allocation for this ticker frame
         self.sequence_number = self.sequence_number.wrapping_add(1);

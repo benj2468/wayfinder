@@ -6,6 +6,7 @@ use std::time::Duration;
 use interfaces::frame::Mac;
 use interfaces::link::LinkMetrics;
 use tracing_subscriber::EnvFilter;
+use wayfinder::batman::MAX_MISSED_OGMS;
 use wayfinder::config::{Config, LinkConfig};
 use wayfinder::{
     DEFAULT_BATMAN_ETHER_TYPE, EgressInterface,
@@ -90,7 +91,7 @@ fn single_machine_with_links(n: usize) -> TestHarness {
         config.switches.push(TestSwitchConfig {
             name: switch_name.clone(),
         });
-        links.push(LinkConfig::Test { switch_name });
+        links.push(LinkConfig::test(switch_name));
     }
     config.machines.push(TestMachineConfig {
         name: "a".into(),
@@ -115,9 +116,7 @@ fn one_switch_with_machines(n: usize) -> TestHarness {
         config.machines.push(TestMachineConfig {
             name: name.into(),
             wayfinder: Config {
-                links: vec![LinkConfig::Test {
-                    switch_name: "switch1".into(),
-                }],
+                links: vec![LinkConfig::test("switch1")],
                 ..Default::default()
             },
         });
@@ -151,6 +150,24 @@ async fn converge_at(h: &mut TestHarness, at: Duration) {
         .expect("mesh did not converge within the timeout");
 }
 
+/// Number of consecutive OGM rounds with no refresh after which an unrefreshed
+/// route is guaranteed to have aged out.  Purge is now gap-counted in the
+/// node's own OGM rounds (a path is dropped once `MAX_MISSED_OGMS` rounds pass
+/// without a refresh), so a few extra rounds give margin.
+const AGE_OUT_ROUNDS: u32 = MAX_MISSED_OGMS + 3;
+
+/// Age out routes that have stopped being refreshed: drive [`AGE_OUT_ROUNDS`]
+/// convergence rounds (one OGM emission per node per round) from the current
+/// virtual clock.  This is the round-based replacement for the old "jump the
+/// clock past `ORIGINATOR_TIMEOUT`" idiom — gap counting cares how many of *our*
+/// OGM rounds elapse without hearing a neighbor, not how much wall-clock passes.
+async fn age_out(h: &mut TestHarness) {
+    let base = h.clock;
+    for i in 1..=AGE_OUT_ROUNDS as u64 {
+        converge_at(h, base + Duration::from_secs(i)).await;
+    }
+}
+
 fn simple_pair() -> TestHarness {
     let mut config = TestConfig::default();
     config.switches.push(TestSwitchConfig {
@@ -159,18 +176,14 @@ fn simple_pair() -> TestHarness {
     config.machines.push(TestMachineConfig {
         name: "machine1".into(),
         wayfinder: Config {
-            links: vec![LinkConfig::Test {
-                switch_name: "switch1".into(),
-            }],
+            links: vec![LinkConfig::test("switch1")],
             ..Default::default()
         },
     });
     config.machines.push(TestMachineConfig {
         name: "machine2".into(),
         wayfinder: Config {
-            links: vec![LinkConfig::Test {
-                switch_name: "switch1".into(),
-            }],
+            links: vec![LinkConfig::test("switch1")],
             ..Default::default()
         },
     });
@@ -188,32 +201,21 @@ fn line_of_three() -> TestHarness {
     config.machines.push(TestMachineConfig {
         name: "machine1".into(),
         wayfinder: Config {
-            links: vec![LinkConfig::Test {
-                switch_name: "switch1".into(),
-            }],
+            links: vec![LinkConfig::test("switch1")],
             ..Default::default()
         },
     });
     config.machines.push(TestMachineConfig {
         name: "machine2".into(),
         wayfinder: Config {
-            links: vec![
-                LinkConfig::Test {
-                    switch_name: "switch1".into(),
-                },
-                LinkConfig::Test {
-                    switch_name: "switch2".into(),
-                },
-            ],
+            links: vec![LinkConfig::test("switch1"), LinkConfig::test("switch2")],
             ..Default::default()
         },
     });
     config.machines.push(TestMachineConfig {
         name: "machine3".into(),
         wayfinder: Config {
-            links: vec![LinkConfig::Test {
-                switch_name: "switch2".into(),
-            }],
+            links: vec![LinkConfig::test("switch2")],
             ..Default::default()
         },
     });
@@ -245,12 +247,7 @@ fn two_paths_unequal_length() -> TestHarness {
     let machine = |name: &str, links: &[&str]| TestMachineConfig {
         name: name.into(),
         wayfinder: Config {
-            links: links
-                .iter()
-                .map(|s| LinkConfig::Test {
-                    switch_name: (*s).into(),
-                })
-                .collect(),
+            links: links.iter().map(|s| LinkConfig::test(*s)).collect(),
             ..Default::default()
         },
     };
@@ -287,9 +284,7 @@ async fn test_invalid_switch() {
     config.machines.push(TestMachineConfig {
         name: "foo".into(),
         wayfinder: Config {
-            links: vec![LinkConfig::Test {
-                switch_name: "invalid".into(),
-            }],
+            links: vec![LinkConfig::test("invalid")],
             ..Default::default()
         },
     });
@@ -601,9 +596,7 @@ async fn traffic_fails_over_when_best_next_hop_disconnects() {
         .send_local(d, b"hello via failover")
         .await
         .expect("a must have a route to d after failover");
-    for _ in 0..10 {
-        harness.tick().await;
-    }
+    harness.settle().await;
     assert_eq!(
         harness.get_machine("d").local_deliveries(),
         vec![host_frame(d, a, b"hello via failover")],
@@ -614,9 +607,9 @@ async fn traffic_fails_over_when_best_next_hop_disconnects() {
 /// A direct neighbor that goes offline and later returns must be re-learned,
 /// restoring end-to-end traffic.  Two nodes share a switch; once converged each
 /// knows the other directly.  When machine2 powers off, its route ages out of
-/// machine1's table (no refresh for longer than `ORIGINATOR_TIMEOUT`).  When the
-/// *same* node (same identity, empty tables) comes back, both must rediscover
-/// each other and a unicast must flow again.
+/// machine1's table (no refresh for `MAX_MISSED_OGMS` of machine1's OGM rounds).
+/// When the *same* node (same identity, empty tables) comes back, both must
+/// rediscover each other and a unicast must flow again.
 #[tokio::test]
 async fn route_restored_after_neighbor_reconnects() {
     setup();
@@ -635,10 +628,10 @@ async fn route_restored_after_neighbor_reconnects() {
         1
     );
 
-    // machine2 powers off.  Advance well past ORIGINATOR_TIMEOUT (60s) with only
-    // machine1 polling, so machine1's now-unrefreshed route to machine2 ages out.
+    // machine2 powers off.  Drive enough OGM rounds with only machine1 polling
+    // that its now-unrefreshed route to machine2 ages out by round gap.
     harness.disconnect_machine("machine2");
-    converge_at(&mut harness, Duration::from_secs(80)).await;
+    age_out(&mut harness).await;
     assert_eq!(
         harness.get_machine("machine1").router().originator_count(),
         0,
@@ -665,9 +658,7 @@ async fn route_restored_after_neighbor_reconnects() {
         .send_local(m2, b"welcome back")
         .await
         .unwrap();
-    for _ in 0..6 {
-        harness.tick().await;
-    }
+    harness.settle().await;
     assert_eq!(
         harness.get_machine("machine2").local_deliveries(),
         vec![host_frame(m2, m1, b"welcome back")],
@@ -699,19 +690,17 @@ async fn sole_relay_disconnect_blackholes_then_recovers() {
         .send_local(m3, b"before")
         .await
         .unwrap();
-    for _ in 0..8 {
-        harness.tick().await;
-    }
+    harness.settle().await;
     assert_eq!(
         harness.get_machine("machine3").local_deliveries(),
         vec![host_frame(m3, m1, b"before")],
         "baseline: machine3 receives over the relay"
     );
 
-    // The sole relay drops.  After the stale route ages out machine1 has nowhere
+    // The sole relay drops.  After the stale routes age out machine1 has nowhere
     // to forward, so a send must not reach machine3.
     harness.disconnect_machine("machine2");
-    converge_at(&mut harness, Duration::from_secs(80)).await;
+    age_out(&mut harness).await;
     assert_eq!(
         harness.get_machine("machine1").router().originator_count(),
         0,
@@ -722,9 +711,7 @@ async fn sole_relay_disconnect_blackholes_then_recovers() {
         .send_local(m3, b"lost")
         .await
         .ok();
-    for _ in 0..8 {
-        harness.tick().await;
-    }
+    harness.settle().await;
     assert_eq!(
         harness.get_machine("machine3").local_deliveries(),
         vec![host_frame(m3, m1, b"before")],
@@ -746,9 +733,7 @@ async fn sole_relay_disconnect_blackholes_then_recovers() {
         .send_local(m3, b"after")
         .await
         .unwrap();
-    for _ in 0..8 {
-        harness.tick().await;
-    }
+    harness.settle().await;
     assert_eq!(
         harness.get_machine("machine3").local_deliveries(),
         vec![host_frame(m3, m1, b"before"), host_frame(m3, m1, b"after"),],
@@ -791,9 +776,7 @@ async fn best_hop_reclaims_preferred_path_after_reconnect() {
 
     // `b` drops; after the stale high-TQ path ages out, `a` fails over to c→e.
     harness.disconnect_machine("b");
-    for secs in (100..=600).step_by(100) {
-        converge_at(&mut harness, Duration::from_secs(secs)).await;
-    }
+    age_out(&mut harness).await;
     assert_eq!(
         best_hop_to_d(&harness),
         Some(c),
@@ -817,9 +800,7 @@ async fn best_hop_reclaims_preferred_path_after_reconnect() {
         .send_local(d, b"preferred again")
         .await
         .unwrap();
-    for _ in 0..10 {
-        harness.tick().await;
-    }
+    harness.settle().await;
     assert_eq!(
         harness.get_machine("d").local_deliveries(),
         vec![host_frame(d, a, b"preferred again")],
@@ -840,22 +821,20 @@ async fn flapping_relay_reconverges() {
 
     converge_at(&mut harness, Duration::from_secs(1)).await;
 
-    // Flap the relay three times.  Each down/up leg advances the clock by more
-    // than ORIGINATOR_TIMEOUT so routes fully age out between transitions.
-    let mut clock = 60u64;
+    // Flap the relay three times.  Each down leg drives enough OGM rounds for the
+    // relay's routes to fully age out before it returns on the up leg.
     for _ in 0..3 {
         harness.disconnect_machine("machine2");
-        clock += 80;
-        converge_at(&mut harness, Duration::from_secs(clock)).await;
+        age_out(&mut harness).await;
 
         harness.reconnect_machine("machine2");
-        clock += 80;
-        converge_at(&mut harness, Duration::from_secs(clock)).await;
+        let clock = harness.clock + Duration::from_secs(1);
+        converge_at(&mut harness, clock).await;
     }
 
     // After the churn settles the line must be fully converged again...
-    clock += 80;
-    converge_at(&mut harness, Duration::from_secs(clock)).await;
+    let clock = harness.clock + Duration::from_secs(1);
+    converge_at(&mut harness, clock).await;
     for name in ["machine1", "machine2", "machine3"] {
         assert_eq!(
             harness.get_machine(name).router().originator_count(),
@@ -870,9 +849,7 @@ async fn flapping_relay_reconverges() {
         .send_local(m3, b"still here")
         .await
         .unwrap();
-    for _ in 0..8 {
-        harness.tick().await;
-    }
+    harness.settle().await;
     assert_eq!(
         harness.get_machine("machine3").local_deliveries(),
         vec![host_frame(m3, m1, b"still here")],
@@ -915,9 +892,7 @@ async fn simultaneous_disconnects_blackhole_then_recover() {
     // once.  a→d now has no surviving path.
     harness.disconnect_machine("b");
     harness.disconnect_machine("e");
-    for secs in (100..=600).step_by(100) {
-        converge_at(&mut harness, Duration::from_secs(secs)).await;
-    }
+    age_out(&mut harness).await;
     assert_eq!(
         route_to_d(&harness),
         None,
@@ -930,9 +905,7 @@ async fn simultaneous_disconnects_blackhole_then_recover() {
         .send_local(d, b"into the void")
         .await
         .ok();
-    for _ in 0..10 {
-        harness.tick().await;
-    }
+    harness.settle().await;
     assert_eq!(
         harness.get_machine("d").local_deliveries().len(),
         before,
@@ -955,9 +928,7 @@ async fn simultaneous_disconnects_blackhole_then_recover() {
         .send_local(d, b"back online")
         .await
         .unwrap();
-    for _ in 0..10 {
-        harness.tick().await;
-    }
+    harness.settle().await;
     assert_eq!(
         harness.get_machine("d").local_deliveries(),
         vec![host_frame(d, a, b"back online")],
@@ -1007,9 +978,7 @@ async fn link_down_triggers_failover_then_restore_reclaims() {
     // a–b wire is dead — so the path to d via b ages out at a while b itself
     // never reboots.
     harness.fail_link("a", 0);
-    for secs in (100..=600).step_by(100) {
-        converge_at(&mut harness, Duration::from_secs(secs)).await;
-    }
+    age_out(&mut harness).await;
     assert_eq!(
         best_hop_to_d(&harness),
         Some(c),
@@ -1042,9 +1011,7 @@ async fn link_down_triggers_failover_then_restore_reclaims() {
         .send_local(d, b"link back up")
         .await
         .unwrap();
-    for _ in 0..10 {
-        harness.tick().await;
-    }
+    harness.settle().await;
     assert_eq!(
         harness.get_machine("d").local_deliveries(),
         vec![host_frame(d, a, b"link back up")],
@@ -1053,10 +1020,10 @@ async fn link_down_triggers_failover_then_restore_reclaims() {
 }
 
 /// A brief link outage must not cost a node its routing state.  Because a
-/// link-down (unlike a reboot) leaves the node's tables intact, a blip shorter
-/// than `ORIGINATOR_TIMEOUT` loses no routes: machine1's only link drops and is
-/// restored well within the 60s timeout, so its routes to both machine2 and
-/// machine3 survive and traffic resumes with no re-convergence.
+/// link-down (unlike a reboot) leaves the node's tables intact, a blip spanning
+/// fewer than `MAX_MISSED_OGMS` OGM rounds loses no routes: machine1's only link
+/// drops and is restored within the gap budget, so its routes to both machine2
+/// and machine3 survive and traffic resumes with no re-convergence.
 #[tokio::test]
 async fn brief_link_blip_preserves_routes() {
     setup();
@@ -1071,8 +1038,8 @@ async fn brief_link_blip_preserves_routes() {
         2
     );
 
-    // machine1's only link (interface 0) drops, then returns well inside
-    // ORIGINATOR_TIMEOUT.  No poll crosses the timeout, so nothing ages out.
+    // machine1's only link (interface 0) drops, then returns within a single
+    // OGM round — far inside the MAX_MISSED_OGMS gap budget — so nothing ages out.
     harness.fail_link("machine1", 0);
     converge_at(&mut harness, Duration::from_secs(30)).await;
     assert_eq!(
@@ -1089,9 +1056,7 @@ async fn brief_link_blip_preserves_routes() {
         .send_local(m3, b"blip survived")
         .await
         .unwrap();
-    for _ in 0..8 {
-        harness.tick().await;
-    }
+    harness.settle().await;
     assert_eq!(
         harness.get_machine("machine3").local_deliveries(),
         vec![host_frame(m3, m1, b"blip survived")],

@@ -96,12 +96,24 @@ YAML
 
 # One RawL2 mesh link per docker-attached ethernet NIC. Each NIC is a separate
 # mesh segment, so the compose network wiring defines the topology.
+#
+# Optionally pin this node's adaptive OGM (Trickle) backoff bounds on every link
+# via OGM_I_MIN_MS / OGM_I_MAX_MS — handy to model a slow radio that should
+# chatter less. When neither is set, the links omit the `ogm:` block and the
+# router falls back to its built-in defaults (1s / 64s).
 for ifc in $(ls /sys/class/net | grep '^eth' | sort); do
   cat >> "$CFG" <<YAML
   - type: RawL2
     interface: ${ifc}
     ethertype: ${ETHERTYPE}
 YAML
+  if [ -n "${OGM_I_MIN_MS:-}" ] || [ -n "${OGM_I_MAX_MS:-}" ]; then
+    cat >> "$CFG" <<YAML
+    ogm:
+      i_min_ms: ${OGM_I_MIN_MS:-1000}
+      i_max_ms: ${OGM_I_MAX_MS:-64000}
+YAML
+  fi
 done
 
 echo "wayfinder-sim: generated $CFG" >&2
