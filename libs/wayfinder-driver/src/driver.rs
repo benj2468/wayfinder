@@ -18,7 +18,7 @@ use anyhow::bail;
 use futures::{FutureExt, future::select_all};
 use interfaces::link::LinkMetrics;
 use pretty_hex::pretty_hex;
-use tokio::time::{Instant as TokioInstant, sleep_until};
+use tokio::time::sleep;
 use wayfinder::config::TrickleConfig;
 use wayfinder::interfaces::frame::{LinkFrame, LinkFrameData, Mac};
 use wayfinder::{CentralRouter, EgressInterface, McastPlan};
@@ -182,7 +182,7 @@ impl<Local: FrameIo> Driver<Local> {
         // periodic arm sleeps until whichever fires first.  Recomputed every
         // iteration, so a timer reset by the frame just processed (an
         // inconsistency) shortens the next sleep automatically.
-        let due_at = TokioInstant::from_std(self.start + self.router.next_broadcast_after(now));
+        let next_due = self.router.next_broadcast_after(now);
 
         // Destructure into disjoint field borrows so the `select!` can hold a
         // mutable borrow of the interfaces alongside the router and buffers.
@@ -223,7 +223,7 @@ impl<Local: FrameIo> Driver<Local> {
                     let _ = resp_tx.send(response);
                     LoopOutput::none()
                 },
-                _ = sleep_until(due_at), if check_periodic => {
+                _ = sleep(next_due), if check_periodic => {
                     tracing::info!("polling OGM");
                     LoopOutput {
                         mesh: poll_due_ogms(router, now, tx_buffer),
