@@ -88,7 +88,7 @@ test:run:rust:
       coverage_report:
         path: coverage.xml
         coverage_format: cobertura
-      junit: junit.xml
+      junit: target/nextest/ci/junit.xml
 test:run:python:
   stage: test
   image: $CI_REGISTRY_IMAGE_TAG
