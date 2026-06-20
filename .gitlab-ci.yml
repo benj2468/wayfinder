@@ -69,7 +69,9 @@ build:
     - build-image
   script:
     - cargo build --workspace
-    - cargo clippy --workspace
+    # Lint every target (libs, bins, tests, examples) and fail the build on any
+    # warning so clippy findings can't accumulate unnoticed.
+    - cargo clippy --workspace --all-targets -- -D warnings
 test:run:rust:
   stage: test
   image: $CI_REGISTRY_IMAGE_TAG

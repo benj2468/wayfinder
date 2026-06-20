@@ -238,7 +238,7 @@ where
 
         // Loop over all and register the source ident for each message
         for (id, msgs) in msgs.iter_mut() {
-            if let Some(taps) = self.taps.get_mut(&id) {
+            if let Some(taps) = self.taps.get_mut(id) {
                 for tap in taps.iter_mut() {
                     for msg in msgs.iter_mut() {
                         if !(tap.clb)(TapMeta {

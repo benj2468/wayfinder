@@ -46,6 +46,14 @@ pub const DEFAULT_BATMAN_ETHER_TYPE: u16 = 0x4305;
 /// cheaper than many point-to-point copies.
 pub const MCAST_FANOUT: usize = 16;
 
+/// Error returned by [`CentralRouter::handle_local`] and
+/// [`CentralRouter::handle_local_mcast`] when the packet header plus the
+/// caller's payload do not fit in the supplied transmit buffer.  The caller
+/// should retry with a larger `tx_buf` (or drop the frame); no bytes are
+/// written to the buffer when this is returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferTooSmall;
+
 /// Maximum number of mesh interfaces for which the router keeps independent
 /// throughput estimates.  Interfaces are addressed by their registration index
 /// (the same `iface_idx` used by the link-quality and OGM-schedule tables);
@@ -451,14 +459,15 @@ impl CentralRouter {
 
     /// Wrap host data destined for the multicast listener `dest` in a
     /// [`BATADV_MCAST`] packet routed toward its best-known next hop.  Called
-    /// once per target of a [`McastPlan::Unicast`].  Returns `Err(())` if the
-    /// header plus `payload` would not fit in `tx_buf`.
+    /// once per target of a [`McastPlan::Unicast`].  Returns
+    /// [`BufferTooSmall`] if the header plus `payload` would not fit in
+    /// `tx_buf`.
     pub fn handle_local_mcast<'a>(
         &mut self,
         dest: Mac,
         payload: &[u8],
         tx_buf: &'a mut [u8],
-    ) -> Result<LinkFrameData<'a>, ()> {
+    ) -> Result<LinkFrameData<'a>, BufferTooSmall> {
         let next_hop = self.batman.lookup_route(dest).unwrap_or(dest);
 
         let header = BatmanMcastPacket {
@@ -470,7 +479,7 @@ impl CentralRouter {
         let header_size = core::mem::size_of::<BatmanMcastPacket>();
         let total_size = header_size + payload.len();
         if total_size > tx_buf.len() {
-            return Err(());
+            return Err(BufferTooSmall);
         }
         tx_buf[..header_size].copy_from_slice(header.as_bytes());
         tx_buf[header_size..total_size].copy_from_slice(payload);
@@ -541,8 +550,8 @@ impl CentralRouter {
     /// ready to hand to a link.  A `dest` of [`MeshIdentifier::BROADCAST`]
     /// produces a flooded [`BatmanBroadcastPacket`] (e.g. for a host ARP);
     /// any other destination produces a [`BatmanUnicastPacket`] routed toward
-    /// the best-known next hop.  Returns `Err(())` if `payload` plus the
-    /// header would not fit in `tx_buf`.
+    /// the best-known next hop.  Returns [`BufferTooSmall`] if `payload` plus
+    /// the header would not fit in `tx_buf`.
     ///
     /// [`MeshIdentifier::BROADCAST`]: interfaces::frame::MeshIdentifier::BROADCAST
     pub fn handle_local<'a>(
@@ -550,7 +559,7 @@ impl CentralRouter {
         dest: Mac,
         payload: &[u8],
         tx_buf: &'a mut [u8],
-    ) -> Result<LinkFrameData<'a>, ()> {
+    ) -> Result<LinkFrameData<'a>, BufferTooSmall> {
         // Broadcast destinations are flooded, not routed to a next hop.
         if dest == Mac::BROADCAST {
             let header = BatmanBroadcastPacket {
@@ -563,7 +572,7 @@ impl CentralRouter {
             let header_size = core::mem::size_of::<BatmanBroadcastPacket>();
             let total_size = header_size + payload.len();
             if total_size > tx_buf.len() {
-                return Err(());
+                return Err(BufferTooSmall);
             }
             tx_buf[..header_size].copy_from_slice(header.as_bytes());
             tx_buf[header_size..total_size].copy_from_slice(payload);
@@ -593,7 +602,7 @@ impl CentralRouter {
         let total_size = header_size + payload.len();
 
         if total_size > tx_buf.len() {
-            return Err(());
+            return Err(BufferTooSmall);
         }
 
         // Pack the header and data sequentially into the scratchpad

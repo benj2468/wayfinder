@@ -779,16 +779,11 @@ impl LoraSwitch {
     /// Run the switch as a background task, blocking until every attached
     /// simulator has been dropped (all senders gone).
     async fn run(mut self) {
-        loop {
-            match self.outbound_rx.recv().await {
-                Some(pkt) => {
-                    self.route(pkt).await;
-                    // Drain any further packets that arrived while routing.
-                    while let Ok(pkt) = self.outbound_rx.try_recv() {
-                        self.route(pkt).await;
-                    }
-                }
-                None => break,
+        while let Some(pkt) = self.outbound_rx.recv().await {
+            self.route(pkt).await;
+            // Drain any further packets that arrived while routing.
+            while let Ok(pkt) = self.outbound_rx.try_recv() {
+                self.route(pkt).await;
             }
         }
     }

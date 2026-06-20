@@ -289,7 +289,7 @@ where
     }
 
     /// 11. Send data to the appointed address explicitly (AT+SEND).
-    /// Payload length is parsed automatically. Address 0 broadcasts.
+    ///     Payload length is parsed automatically. Address 0 broadcasts.
     pub async fn send_data(&mut self, target_address: u16, data: &str) -> Result<(), LoraError> {
         let payload_length = data.len();
         if payload_length > 240 {
