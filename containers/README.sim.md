@@ -53,6 +53,32 @@ python sim/topology.py write             # refresh the committed docker-compose.
 committed `docker-compose.yml` is a snapshot of the default topology, so plain
 `docker compose up --build -d` works too.
 
+## Stress-testing the flood path
+
+`blast` floods broadcast traffic from one node into a **running** stack, to see
+how the mesh and the application hold up under a storm of flooded frames. It
+`docker compose exec`s `ping` at the subnet broadcast address, so every frame
+goes to the all-ones MAC and the router floods it out *every* mesh interface
+(the `BATADV_BCAST` path). Egress is pinned to the host TAP with `ping -I
+wayfinder0`, so the traffic enters the mesh through the node — it never leaks
+straight onto the `eth*` segment NICs.
+
+```bash
+python sim/topology.py up                                  # stack must be up first
+python sim/topology.py blast m1 --rate 200 --size 1000 --duration 30
+python sim/topology.py blast d1 --rate 0 --size 1400       # --rate 0 = flood as fast as possible
+python sim/topology.py blast                               # first node, 100 fps × 1000 B for 10 s
+```
+
+* `--rate` is frames/second (`0` uses `ping -f` to flood as fast as the kernel
+  accepts); `--size` is the **total IP packet size** in bytes; `--duration` is
+  how long to run (`0` runs until you Ctrl-C).
+* The origin `NODE` defaults to the first node in the topology; pass any node
+  name to blast from there instead.
+* Watch the fallout in another terminal: `python sim/topology.py logs` for OGM/
+  forwarding churn, or `docker exec -it wf-<node> wayfinder-tui` to see whether
+  routing stays converged under load.
+
 A link with **2 members** is a point-to-point segment; a link with **more**
 members is a single shared LAN where everyone hears everyone (swap
 `complete_graph("m", 5)` for `shared_lan([...])` if you want the mesh on one

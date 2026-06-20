@@ -12,8 +12,9 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use wayfinder_protos::service::{
-    LinkQualityEntryData, NeighborPathData, OgmScheduleEntryData, RouteResolutionData,
-    RoutingEntryData, WayfinderDataProvider, WayfinderService,
+    InterfaceThroughputData, LinkQualityEntryData, NeighborPathData, NodeMetricsData,
+    OgmScheduleEntryData, RouteResolutionData, RoutingEntryData, TableOccupancyData,
+    WayfinderDataProvider, WayfinderService,
 };
 use wayfinder_protos::wayfinder_v1alpha::{WayfinderRequest, WayfinderResponse};
 use wayfinder_server::run_tcp_server;
@@ -58,6 +59,42 @@ impl WayfinderDataProvider for Mock {
             min_interval_ms: 1000,
             max_interval_ms: 64000,
         }]
+    }
+    fn throughput(&self) -> Vec<InterfaceThroughputData> {
+        vec![InterfaceThroughputData {
+            iface_idx: 0,
+            rx_bps: 1500.0,
+            rx_fps: 12.0,
+            tx_bps: 800.0,
+            tx_fps: 6.0,
+        }]
+    }
+    fn node_metrics(&self) -> NodeMetricsData {
+        NodeMetricsData {
+            uptime_secs: 7384,
+            neighbor_count: 1,
+            originators: TableOccupancyData {
+                used: 1,
+                capacity: 128,
+            },
+            broadcast_dedup: TableOccupancyData {
+                used: 1,
+                capacity: 128,
+            },
+            local_mcast_groups: TableOccupancyData {
+                used: 0,
+                capacity: 16,
+            },
+            mcast_memberships: TableOccupancyData {
+                used: 0,
+                capacity: 64,
+            },
+            tq_min: 240,
+            tq_max: 240,
+            tq_mean: 240.0,
+            paths_max: 1,
+            paths_mean: 1.0,
+        }
     }
     fn resolve_route(&self, _destination: &[u8]) -> Option<RouteResolutionData> {
         None
@@ -130,4 +167,21 @@ async fn client_roundtrips_against_real_tcp_server() {
     assert_eq!(sched.current_interval_ms, 4000);
     assert_eq!(sched.min_interval_ms, 1000);
     assert_eq!(sched.max_interval_ms, 64000);
+
+    let throughput = client.throughput().await.unwrap();
+    assert_eq!(throughput.interfaces.len(), 1);
+    let tp = &throughput.interfaces[0];
+    assert_eq!(tp.iface_idx, 0);
+    assert_eq!(tp.rx_bps, 1500.0);
+    assert_eq!(tp.tx_bps, 800.0);
+    // Totals are the per-interface sums.
+    assert_eq!(throughput.total_rx_bps, 1500.0);
+    assert_eq!(throughput.total_tx_fps, 6.0);
+
+    let metrics = client.node_metrics().await.unwrap();
+    assert_eq!(metrics.uptime_secs, 7384);
+    assert_eq!(metrics.neighbor_count, 1);
+    assert_eq!(metrics.originators.unwrap().capacity, 128);
+    assert_eq!(metrics.tq_mean, 240.0);
+    assert_eq!(metrics.paths_max, 1);
 }

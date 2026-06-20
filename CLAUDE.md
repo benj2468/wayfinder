@@ -194,6 +194,94 @@ The CentralRouter demuxes by protocol field (`handle_frame_with_metrics` in libs
 - `0x88B5`: Reserved for experimental protocols
 - Other values are dropped
 
+## Metrics and Observability
+
+**Metrics are a first-class part of this system, not an afterthought.** A mesh
+node sits underneath applications that cannot otherwise see the network they run
+on — link quality, topology size, route stability, congestion, capacity
+pressure. Surfacing the router's internal state through the management API is
+how an application developer *infers what the underlying mesh is doing* and
+adapts to it (e.g. backing off when throughput collapses, or preferring a
+different peer when a path is flapping). Treat "could an operator or an app on
+top of the mesh want to observe this?" as a design question for every feature,
+and expose the answer through `wayfinder-protos` / `wayfinder-server` and the
+`wayfinder-tui` Metrics tab.
+
+Principles for adding a metric:
+
+- **State lives in `CentralRouter` (the `no_std` core), never only in the
+  host-side driver.** An embedded node drives the router directly with no
+  `wayfinder-driver`/tokio loop, so any metric kept only in the driver would not
+  exist on hardware. The driver may *feed* the router (e.g. calling `record_tx`
+  after a physical send), but the counters/estimators and their accessors belong
+  to the router so every deployment serves the same data through the same API.
+- **Prefer bounded, here-and-now signals over unbounded totals.** Throughput is
+  modelled as a time-decayed EWMA *rate* (`RateEstimator`, bytes/sec and
+  frames/sec per interface/direction) rather than a cumulative counter, so a
+  long-lived node reports a stable, directly-usable value. Reach for the same
+  pattern (or a current-vs-capacity gauge like `TableOccupancy`) before adding a
+  monotonic count.
+- **Time-varying metrics are evaluated at request time.** `RouterAdapter::new`
+  takes the router's monotonic `now` so rates and uptime reflect the instant the
+  query is served, and an idle interface reads as a decaying — not stale — rate.
+- **Wire it end to end**: a `Get*Request`/response pair in
+  `protos/wayfinder/v1alpha/wayfinder.proto` (every message/field documented —
+  `buf lint` enforces it), an intermediate `*Data` type plus
+  `WayfinderDataProvider` method and handler arm in `wayfinder-protos::service`,
+  the projection in `RouterAdapter`, a client method, and a row/panel on the TUI
+  Metrics tab. The `wayfinder-tui` smoke test exercises the whole path over a
+  real TCP server — extend it.
+
+## Merge Requests
+
+This project ships through GitLab merge requests (`git.haganah.net`), not direct
+pushes to `main`.
+
+**The MR title MUST follow Conventional Commits** — `type(scope): summary`. The
+`lint:mr-title` CI job (in `.gitlab-ci.yml`) pipes the MR title through
+`commitlint` and fails the pipeline if it doesn't conform. Note it checks the
+*MR title*, not individual commit messages.
+
+- **Types**: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`,
+  `build`, `ci`, `chore`, `revert`.
+- **Scope** (optional but encouraged): the crate or area, e.g. `metrics`,
+  `batman`, `tui`, `driver`.
+- **Summary**: lowercase, imperative, no trailing period, ≤100 chars.
+- Example: `feat(metrics): add throughput and node metrics to the management API`
+- A non-compliant title like `Add throughput metrics` (no type, sentence-case)
+  will fail the lint.
+
+**Description**: use the template at
+`.gitlab/merge_request_templates/Default.md` — Summary, What's included, Key
+design decisions, Testing, Deferred/follow-ups. Explain the *why* and the
+trade-offs; a reviewer should be able to judge the design from the description
+alone. State test results honestly.
+
+**Constructing an MR**:
+
+1. Branch off `origin/main` (not whatever local `main` happens to be) so the MR
+   diff is exactly your change and unrelated local commits don't ride along.
+2. Keep the branch focused — one logical change per MR.
+3. Run the workspace checks locally first: `cargo test --workspace`, `nix fmt`,
+   `cargo clippy --workspace`, and `buf lint` (from `libs/wayfinder-protos/`) if
+   protos changed — these all run in CI and will block the MR otherwise.
+4. Create it with `glab` (authenticated to `git.haganah.net`):
+
+```bash
+glab mr create \
+  --source-branch <branch> --target-branch main \
+  --title "feat(scope): imperative lowercase summary" \
+  --description "$(cat <<'EOF'
+## Summary
+...
+EOF
+)"
+```
+
+`glab`'s API calls need a personal access token configured for
+`git.haganah.net` (in `~/.config/glab-cli/config.yml`); the SSH agent only
+authenticates `git push`/`pull`, not the MR-creation API.
+
 ## Common Development Patterns
 
 ### Adding a new routing protocol

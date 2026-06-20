@@ -46,6 +46,143 @@ pub const DEFAULT_BATMAN_ETHER_TYPE: u16 = 0x4305;
 /// cheaper than many point-to-point copies.
 pub const MCAST_FANOUT: usize = 16;
 
+/// Maximum number of mesh interfaces for which the router keeps independent
+/// throughput estimates.  Interfaces are addressed by their registration index
+/// (the same `iface_idx` used by the link-quality and OGM-schedule tables);
+/// frames on an index at or beyond this bound are still routed correctly but
+/// are not measured.  Sized generously for the small radio meshes this targets.
+pub const MAX_INTERFACES: usize = 8;
+
+/// Capacity of the BATMAN originator (routing) table.  Must be a power of two
+/// (a `heapless` map requirement) and is also the bound on the broadcast-dedup
+/// table; 128 leaves headroom over a typical mesh.  Exposed so the management
+/// API can report how close the table is to saturation.
+pub const ORIGINATOR_CAPACITY: usize = 128;
+
+/// Time constant of the throughput EWMA, in seconds.  An idle interface's
+/// estimated rate decays to ~37% of its prior value over this window, so it is
+/// the rough "memory" of the smoothed rate: long enough to ride out the gaps
+/// between bursty mesh frames, short enough to track real changes within a few
+/// seconds.
+const RATE_TAU_SECS: f64 = 5.0;
+
+/// A time-decayed (EWMA) estimate of one interface/direction's throughput,
+/// rather than a cumulative counter: a node that runs for weeks reports a
+/// bounded, here-and-now rate with no ever-growing total to age out.
+///
+/// Updates are event-driven — one [`observe`](RateEstimator::observe) per frame,
+/// stamped with the loop's monotonic `now` — and the smoothed value also decays
+/// toward zero as that `now` advances without traffic, so [`rate`](
+/// RateEstimator::rate) reads a *current* estimate even while idle.  All state
+/// lives in the `no_std` routing core so an embedded node that drives the
+/// [`CentralRouter`] directly produces the same statistics with no host-side
+/// tally to keep.
+#[derive(Debug, Clone, Copy, Default)]
+struct RateEstimator {
+    /// Smoothed rate in bytes/sec, as of `last`.
+    bps: f64,
+    /// Smoothed rate in frames/sec, as of `last`.
+    fps: f64,
+    /// Bytes observed at the `last` instant but not yet folded into the EWMA
+    /// (multiple frames can share one loop `now`); folded once time advances.
+    pending_bytes: u64,
+    /// Frames observed at the `last` instant, awaiting the same fold.
+    pending_frames: u64,
+    /// Instant of the current pending bucket, or `None` before the first frame.
+    last: Option<Duration>,
+}
+
+impl RateEstimator {
+    /// Fold `bytes` of one frame observed at `now` into the estimate.
+    ///
+    /// Frames sharing a single `now` (e.g. a flood fanned out in one loop pass)
+    /// accumulate into a pending bucket; the bucket is converted to an
+    /// instantaneous rate and blended in only once `now` advances, so a
+    /// zero-length interval never divides by zero.
+    fn observe(&mut self, now: Duration, bytes: usize) {
+        match self.last {
+            None => {
+                self.last = Some(now);
+                self.pending_bytes = bytes as u64;
+                self.pending_frames = 1;
+            }
+            // Same (or, defensively, earlier) instant: keep accumulating.
+            Some(prev) if now <= prev => {
+                self.pending_bytes = self.pending_bytes.saturating_add(bytes as u64);
+                self.pending_frames = self.pending_frames.saturating_add(1);
+            }
+            Some(prev) => {
+                let dt = (now - prev).as_secs_f64();
+                self.blend(dt);
+                self.last = Some(now);
+                self.pending_bytes = bytes as u64;
+                self.pending_frames = 1;
+            }
+        }
+    }
+
+    /// Blend the pending bucket, spread over a `dt`-second interval, into the
+    /// EWMA using the time-aware weight `alpha = dt / (tau + dt)`.
+    fn blend(&mut self, dt: f64) {
+        if dt <= 0.0 {
+            return;
+        }
+        let alpha = dt / (RATE_TAU_SECS + dt);
+        let inst_bps = self.pending_bytes as f64 / dt;
+        let inst_fps = self.pending_frames as f64 / dt;
+        self.bps = self.bps * (1.0 - alpha) + inst_bps * alpha;
+        self.fps = self.fps * (1.0 - alpha) + inst_fps * alpha;
+    }
+
+    /// The smoothed `(bytes/sec, frames/sec)` as of `now`, without mutating the
+    /// estimator: the pending bucket is folded over the elapsed interval so an
+    /// interface that has gone quiet reads as a decaying — eventually
+    /// near-zero — rate rather than a stale one.
+    fn rate(&self, now: Duration) -> (f64, f64) {
+        match self.last {
+            None => (0.0, 0.0),
+            Some(prev) => {
+                let dt = now.saturating_sub(prev).as_secs_f64();
+                if dt <= 0.0 {
+                    return (self.bps, self.fps);
+                }
+                let alpha = dt / (RATE_TAU_SECS + dt);
+                let inst_bps = self.pending_bytes as f64 / dt;
+                let inst_fps = self.pending_frames as f64 / dt;
+                (
+                    self.bps * (1.0 - alpha) + inst_bps * alpha,
+                    self.fps * (1.0 - alpha) + inst_fps * alpha,
+                )
+            }
+        }
+    }
+}
+
+/// A snapshot of one interface's smoothed throughput, evaluated at a caller-
+/// supplied instant.  Rates rather than totals: bounded for an arbitrarily
+/// long-lived node and directly displayable.  Produced by
+/// [`CentralRouter::interface_throughput`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct InterfaceThroughput {
+    /// Smoothed receive rate in bytes per second.
+    pub rx_bps: f64,
+    /// Smoothed receive rate in frames per second.
+    pub rx_fps: f64,
+    /// Smoothed transmit rate in bytes per second.
+    pub tx_bps: f64,
+    /// Smoothed transmit rate in frames per second.
+    pub tx_fps: f64,
+}
+
+/// Wire length of a link frame carrying a `payload_len`-byte payload: the
+/// Ethernet-shaped header `[dst: Mac][src: Mac][protocol: u16]` plus the
+/// payload.  The receive path measures throughput in these whole-frame bytes so
+/// it matches what the transmit side (which counts the bytes the link adapter
+/// puts on the wire) reports.
+fn link_frame_wire_len(payload_len: usize) -> usize {
+    2 * core::mem::size_of::<Mac>() + core::mem::size_of::<u16>() + payload_len
+}
+
 /// How the router intends to deliver a multicast frame for a given group,
 /// returned by [`CentralRouter::mcast_plan`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,12 +239,24 @@ impl RxOutcome<'_, '_> {
 }
 
 pub struct CentralRouter {
-    /// The Batman routing engine for this router.  Its originator capacity must
-    /// be a power of two (a `heapless` map requirement); 128 leaves headroom
-    /// over a typical mesh.
-    batman: BatmanEngine<128>,
+    /// The Batman routing engine for this router.  Its originator capacity is
+    /// [`ORIGINATOR_CAPACITY`] — a power of two, as the `heapless` map requires.
+    batman: BatmanEngine<ORIGINATOR_CAPACITY>,
     ident_table: IdentTable<Mac>,
     link_quality: LinkQualityTable<Mac>,
+    /// Per-interface receive-rate estimators, indexed by interface registration
+    /// order (`iface_idx`).  See [`RateEstimator`].
+    rx_rates: [RateEstimator; MAX_INTERFACES],
+    /// Per-interface transmit-rate estimators, indexed by interface
+    /// registration order (`iface_idx`).
+    tx_rates: [RateEstimator; MAX_INTERFACES],
+    /// Number of interfaces actually in use — the count of distinct indices the
+    /// router has seen configured or carrying traffic, capped at
+    /// [`MAX_INTERFACES`].  Bounds the slice [`interface_throughput`] reports so
+    /// consumers don't see a tail of never-touched interfaces.
+    ///
+    /// [`interface_throughput`]: CentralRouter::interface_throughput
+    iface_count: usize,
 }
 
 impl CentralRouter {
@@ -116,6 +265,9 @@ impl CentralRouter {
             batman: BatmanEngine::new(self_ident),
             ident_table: IdentTable::new(),
             link_quality: LinkQualityTable::new(),
+            rx_rates: [RateEstimator::default(); MAX_INTERFACES],
+            tx_rates: [RateEstimator::default(); MAX_INTERFACES],
+            iface_count: 0,
         }
     }
     /// Process a received link-layer frame without any physical-layer
@@ -164,6 +316,11 @@ impl CentralRouter {
         //    contribute their signal information.
         let quality = normalize_quality(&metrics);
         self.link_quality.update(frame.src, iface_idx, quality);
+
+        // 0b. Account the frame against this interface's ingress rate before any
+        //     demux, so even frames the upper layers drop still register as
+        //     received throughput on the wire.
+        self.record_rx(iface_idx, link_frame_wire_len(frame.payload.len()), now);
 
         // 1. Add a record to the identifier table
         self.ident_table.add_record(iface_idx, frame.dst);
@@ -357,6 +514,9 @@ impl CentralRouter {
         now: core::time::Duration,
     ) {
         self.batman.configure_interface_ogm(idx, i_min, i_max, now);
+        // Register the interface so its throughput is reported from startup,
+        // even before it has carried any traffic.
+        self.touch_iface(idx);
     }
 
     /// Time until the soonest interface is next due to emit an OGM, as of `now`.
@@ -492,10 +652,123 @@ impl CentralRouter {
         self.batman.originator_table.len()
     }
 
+    /// `(used, capacity)` of the originator (routing) table — how full the
+    /// fixed-capacity routing table is.  At capacity the least-recently-heard
+    /// originator is evicted to admit a new one.
+    pub fn originator_occupancy(&self) -> (usize, usize) {
+        (self.batman.originator_table.len(), ORIGINATOR_CAPACITY)
+    }
+
+    /// `(used, capacity)` of the broadcast-deduplication table (one entry per
+    /// originator whose flooded broadcasts we've seen).  Bounded by
+    /// [`ORIGINATOR_CAPACITY`]; further originators are dropped once full.
+    pub fn broadcast_dedup_occupancy(&self) -> (usize, usize) {
+        (self.batman.broadcast_seqno.len(), ORIGINATOR_CAPACITY)
+    }
+
+    /// `(used, capacity)` of the locally-joined multicast group table — groups
+    /// this node announces in its OGMs.
+    pub fn local_mcast_occupancy(&self) -> (usize, usize) {
+        (self.batman.local_mcast.len(), batman::MAX_LOCAL_MCAST)
+    }
+
+    /// `(used, capacity)` of the learned multicast-membership table —
+    /// `(group, remote listener)` pairs learned from other nodes' OGMs.
+    pub fn mcast_member_occupancy(&self) -> (usize, usize) {
+        (self.batman.mcast_members.len(), batman::MAX_MCAST_MEMBERS)
+    }
+
+    /// The number of distinct directly-reachable (one-hop) neighbours: known
+    /// originators whose best path is the originator itself (next hop equals the
+    /// destination).  A subset of [`originator_count`](Self::originator_count)
+    /// that excludes nodes only reachable through a relay.
+    pub fn neighbor_count(&self) -> usize {
+        self.batman
+            .originator_table
+            .values()
+            .filter(|r| r.best_next_hop == r.neighbor_ident)
+            .count()
+    }
+
     /// Borrow the link-quality table for inspection.  Read-only mirror of
     /// the structure the data plane mutates on every received frame.
     pub fn link_quality_records(&self) -> &[LinkQualityRecord<Mac>] {
         self.link_quality.records()
+    }
+
+    /// Fold `bytes` of one received link frame, observed at `now`, into
+    /// interface `idx`'s receive-rate estimate.
+    ///
+    /// Called automatically from [`handle_frame_with_metrics`] for every frame
+    /// that arrives, so the normal receive path needs no extra wiring.  It is
+    /// `pub` so an embedded loop that ingests frames through some other path can
+    /// still keep the ingress rate truthful.  A no-op for `idx >=
+    /// `[`MAX_INTERFACES`].
+    ///
+    /// [`handle_frame_with_metrics`]: CentralRouter::handle_frame_with_metrics
+    pub fn record_rx(&mut self, idx: usize, bytes: usize, now: Duration) {
+        if let Some(e) = self.rx_rates.get_mut(idx) {
+            e.observe(now, bytes);
+            self.touch_iface(idx);
+        }
+    }
+
+    /// Fold `bytes` of one transmitted link frame, sent at `now`, into interface
+    /// `idx`'s transmit-rate estimate.
+    ///
+    /// Unlike the receive path, the router does not perform the transmit itself
+    /// — the host or embedded I/O layer does, after the router has chosen the
+    /// egress via [`get_egress_interface`].  That layer calls this once per
+    /// physical send (a broadcast that floods N interfaces counts on each),
+    /// keeping the rate estimate inside the routing core where the management
+    /// API can read it.  A no-op for `idx >= `[`MAX_INTERFACES`].
+    ///
+    /// [`get_egress_interface`]: CentralRouter::get_egress_interface
+    pub fn record_tx(&mut self, idx: usize, bytes: usize, now: Duration) {
+        if let Some(e) = self.tx_rates.get_mut(idx) {
+            e.observe(now, bytes);
+            self.touch_iface(idx);
+        }
+    }
+
+    /// Number of interfaces the router is tracking throughput for — those
+    /// configured for OGM emission or having carried traffic.  Indices `0..`
+    /// this value are valid arguments to [`interface_throughput`].
+    ///
+    /// [`interface_throughput`]: CentralRouter::interface_throughput
+    pub fn num_interfaces(&self) -> usize {
+        self.iface_count
+    }
+
+    /// The smoothed throughput of interface `idx`, evaluated as of `now` so an
+    /// idle interface reads as a decaying rather than stale rate.  Returns
+    /// `None` for `idx >= `[`num_interfaces`].  Indices line up with the
+    /// OGM-schedule and link-quality views; sum across all interfaces for the
+    /// node-wide rate.
+    ///
+    /// [`num_interfaces`]: CentralRouter::num_interfaces
+    pub fn interface_throughput(&self, idx: usize, now: Duration) -> Option<InterfaceThroughput> {
+        if idx >= self.iface_count {
+            return None;
+        }
+        let (rx_bps, rx_fps) = self.rx_rates[idx].rate(now);
+        let (tx_bps, tx_fps) = self.tx_rates[idx].rate(now);
+        Some(InterfaceThroughput {
+            rx_bps,
+            rx_fps,
+            tx_bps,
+            tx_fps,
+        })
+    }
+
+    /// Note that interface `idx` exists, widening the range
+    /// [`interface_throughput`] reports over.  Saturates at [`MAX_INTERFACES`].
+    ///
+    /// [`interface_throughput`]: CentralRouter::interface_throughput
+    fn touch_iface(&mut self, idx: usize) {
+        if idx < MAX_INTERFACES {
+            self.iface_count = self.iface_count.max(idx + 1);
+        }
     }
 
     /// Snapshot the per-interface adaptive OGM emission schedule: each
@@ -765,5 +1038,235 @@ mod mcast_forwarding {
         assert_eq!(hdr.dest, mac(7));
         assert!(hdr.ttl > 1);
         assert_eq!(&rest[..INNER.len()], INNER);
+    }
+}
+
+#[cfg(test)]
+mod throughput {
+    use super::*;
+    use core::time::Duration;
+    use interfaces::frame::{LinkFrame, Mac};
+    use zerocopy::{FromBytes, IntoBytes};
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    /// A fresh router reports no interfaces and no throughput.
+    #[test]
+    fn no_interfaces_until_touched() {
+        let router = CentralRouter::new(mac(1));
+        assert_eq!(router.num_interfaces(), 0);
+        assert_eq!(router.interface_throughput(0, Duration::ZERO), None);
+    }
+
+    /// Configuring an interface's OGM schedule registers it for throughput
+    /// reporting at a zero rate, before any traffic.
+    #[test]
+    fn configuring_interface_registers_zero_rate() {
+        let mut router = CentralRouter::new(mac(1));
+        router.configure_interface_ogm(
+            2,
+            Duration::from_secs(1),
+            Duration::from_secs(8),
+            Duration::ZERO,
+        );
+        // iface_count widens to cover the highest configured index.
+        assert_eq!(router.num_interfaces(), 3);
+        let tp = router
+            .interface_throughput(2, Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(tp, InterfaceThroughput::default());
+    }
+
+    /// A steady stream of equal-sized frames at a fixed cadence converges on the
+    /// true byte/frame rate.
+    #[test]
+    fn steady_stream_converges_on_true_rate() {
+        let mut e = RateEstimator::default();
+        // 100 bytes every 0.1s == 1000 B/s and 10 frames/s.
+        let mut t = Duration::ZERO;
+        for _ in 0..400 {
+            e.observe(t, 100);
+            t += Duration::from_millis(100);
+        }
+        let (bps, fps) = e.rate(t);
+        assert!((bps - 1000.0).abs() < 50.0, "bps={bps}");
+        assert!((fps - 10.0).abs() < 0.5, "fps={fps}");
+    }
+
+    /// Several frames sharing one instant accumulate into the same bucket and
+    /// are folded together once time advances, rather than dividing by a zero
+    /// interval.  Three 50-byte frames at one instant must read identically to a
+    /// single 150-byte frame at that instant — the burst is not lost, and there
+    /// is no division by a zero interval.
+    #[test]
+    fn simultaneous_frames_accumulate() {
+        let mut split = RateEstimator::default();
+        split.observe(Duration::ZERO, 50);
+        split.observe(Duration::ZERO, 50);
+        split.observe(Duration::ZERO, 50);
+
+        let mut combined = RateEstimator::default();
+        combined.observe(Duration::ZERO, 150);
+
+        let (split_bps, _) = split.rate(Duration::from_secs(1));
+        let (combined_bps, _) = combined.rate(Duration::from_secs(1));
+        assert!(split_bps.is_finite());
+        assert!(
+            (split_bps - combined_bps).abs() < 1e-9,
+            "{split_bps} vs {combined_bps}"
+        );
+        // But the per-frame counts differ: the split bucket saw three frames.
+        assert_eq!(split.pending_frames, 3);
+        assert_eq!(combined.pending_frames, 1);
+    }
+
+    /// An interface that goes quiet decays toward zero as the read instant
+    /// advances, rather than reporting a stale rate forever.
+    #[test]
+    fn idle_interface_decays_toward_zero() {
+        let mut e = RateEstimator::default();
+        let mut t = Duration::ZERO;
+        for _ in 0..100 {
+            e.observe(t, 1000);
+            t += Duration::from_millis(100);
+        }
+        let (busy, _) = e.rate(t);
+        assert!(busy > 1000.0, "should be carrying traffic: {busy}");
+        // Now read far in the future with no further frames: rate collapses.
+        let (idle, _) = e.rate(t + Duration::from_secs(60));
+        assert!(
+            idle < busy / 10.0,
+            "idle rate {idle} should be far below {busy}"
+        );
+    }
+
+    /// Receiving a frame through the normal path advances the interface's
+    /// receive rate; the transmit rate stays zero until something is sent.
+    #[test]
+    fn handle_frame_drives_rx_rate_only() {
+        let mut router = CentralRouter::new(mac(1));
+        let frame_bytes = {
+            // A minimal non-BATMAN frame is fine: rx is counted before demux.
+            let mut raw = Vec::new();
+            raw.extend_from_slice(mac(1).as_bytes()); // dst = self
+            raw.extend_from_slice(mac(2).as_bytes()); // src
+            raw.extend_from_slice(&0x88B5u16.to_be_bytes()); // experimental proto, dropped
+            raw.extend_from_slice(&[0u8; 100]);
+            raw
+        };
+        let mut tx = [0u8; 1500];
+        let mut t = Duration::ZERO;
+        for _ in 0..50 {
+            let frame = LinkFrame::ref_from_bytes(&frame_bytes).unwrap();
+            router.handle_frame(t, 0, frame, &mut tx);
+            t += Duration::from_millis(100);
+        }
+        let tp = router.interface_throughput(0, t).unwrap();
+        assert!(tp.rx_bps > 0.0, "rx_bps={}", tp.rx_bps);
+        assert!(tp.rx_fps > 0.0, "rx_fps={}", tp.rx_fps);
+        assert_eq!(tp.tx_bps, 0.0);
+        assert_eq!(tp.tx_fps, 0.0);
+    }
+
+    /// `record_tx` drives the transmit rate independently per interface.
+    #[test]
+    fn record_tx_drives_tx_rate_per_interface() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut t = Duration::ZERO;
+        for _ in 0..50 {
+            router.record_tx(1, 200, t);
+            t += Duration::from_millis(100);
+        }
+        let tp = router.interface_throughput(1, t).unwrap();
+        assert!(tp.tx_bps > 0.0, "tx_bps={}", tp.tx_bps);
+        assert_eq!(tp.rx_bps, 0.0);
+        // Interface 0 was never touched by traffic but index 1 widened the count.
+        let tp0 = router.interface_throughput(0, t).unwrap();
+        assert_eq!(tp0, InterfaceThroughput::default());
+    }
+
+    /// Out-of-range indices are ignored, not panics.
+    #[test]
+    fn out_of_range_interface_is_noop() {
+        let mut router = CentralRouter::new(mac(1));
+        router.record_tx(MAX_INTERFACES + 4, 100, Duration::ZERO);
+        assert_eq!(router.num_interfaces(), 0);
+    }
+}
+
+#[cfg(test)]
+mod node_metrics {
+    use super::*;
+    use batman::wire::{BATADV_IV_OGM, BatmanOgmPacket};
+    use core::time::Duration;
+    use interfaces::frame::{LinkFrame, Mac};
+    use zerocopy::{FromBytes, IntoBytes};
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    fn link_frame_bytes(src: Mac, dst: Mac, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(dst.as_bytes());
+        out.extend_from_slice(src.as_bytes());
+        out.extend_from_slice(&DEFAULT_BATMAN_ETHER_TYPE.to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Feed one OGM so the router learns `orig` as a direct neighbour with the
+    /// given transmission quality.  `prev_sender == orig` and full TTL make it a
+    /// one-hop path.
+    fn feed_direct_ogm(router: &mut CentralRouter, orig: Mac, seqno: u32, tq: u8) {
+        let ogm = BatmanOgmPacket {
+            packet_type: BATADV_IV_OGM,
+            version: 5,
+            ttl: 50,
+            flags: 0,
+            seqno: seqno.to_be(),
+            orig,
+            prev_sender: orig,
+            reserved: 0,
+            tq,
+            tvlv_len: 0,
+        };
+        let bytes = link_frame_bytes(orig, Mac::BROADCAST, ogm.as_bytes());
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 256];
+        router.handle_frame(Duration::ZERO, 0, frame, &mut tx);
+    }
+
+    /// A fresh router reports empty, non-zero-capacity tables and no neighbours.
+    #[test]
+    fn fresh_router_reports_empty_tables() {
+        let router = CentralRouter::new(mac(1));
+        assert_eq!(router.originator_occupancy(), (0, ORIGINATOR_CAPACITY));
+        assert_eq!(router.broadcast_dedup_occupancy(), (0, ORIGINATOR_CAPACITY));
+        assert_eq!(router.local_mcast_occupancy().0, 0);
+        assert_eq!(router.mcast_member_occupancy().0, 0);
+        assert_eq!(router.neighbor_count(), 0);
+    }
+
+    /// Joining local multicast groups fills the local-mcast table.
+    #[test]
+    fn local_mcast_groups_fill_table() {
+        let mut router = CentralRouter::new(mac(1));
+        let groups = [Mac::from_ipv4_multicast("224.0.0.1".parse().unwrap())];
+        router.set_local_mcast_groups(&groups);
+        assert_eq!(router.local_mcast_occupancy().0, 1);
+    }
+
+    /// A direct OGM registers the originator as a one-hop neighbour and fills the
+    /// originator table.
+    #[test]
+    fn direct_ogm_counts_as_neighbor() {
+        let mut router = CentralRouter::new(mac(1));
+        feed_direct_ogm(&mut router, mac(2), 1, 255);
+        assert_eq!(router.originator_count(), 1);
+        assert_eq!(router.originator_occupancy().0, 1);
+        assert_eq!(router.neighbor_count(), 1);
     }
 }

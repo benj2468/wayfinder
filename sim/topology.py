@@ -22,6 +22,7 @@ Usage
     python sim/topology.py down               # tear the ephemeral stack down
     python sim/topology.py logs [NODE...]     # follow logs
     python sim/topology.py graph              # print an ASCII adjacency summary
+    python sim/topology.py blast [NODE]       # flood broadcast traffic from a node (stress test)
 
 The ``up``/``down``/``logs`` subcommands shell out to ``docker compose`` against
 an ephemeral file written to the repo root (``.sim-compose.gen.yml``, gitignored)
@@ -244,6 +245,64 @@ def write_compose(path: Path) -> None:
     print(f"wrote {path}", file=sys.stderr)
 
 
+# Bytes consumed by the IPv4 (20) + ICMP (8) headers in front of the ping
+# payload; `ping -s` sizes only the payload, so we subtract these to let the user
+# think in whole IP-packet sizes.
+IP_ICMP_OVERHEAD = 28
+
+
+def cmd_blast(
+    node: str | None,
+    rate: float,
+    size: int,
+    duration: float,
+    iface: str,
+    broadcast: str,
+) -> int:
+    """Flood broadcast frames from one node into the mesh to stress the flood path.
+
+    Runs ``ping`` inside the chosen node's container, aimed at the subnet
+    broadcast address (default ``10.0.0.255``). Every echo request goes to the
+    all-ones MAC, so the router floods it out *every* mesh interface exactly like
+    a host's ARP/DHCP would — only as fast and as large as asked. ``-I <iface>``
+    pins egress to the host TAP (``wayfinder0``), so the traffic never leaks onto
+    the ``eth*`` mesh-segment NICs directly.
+
+    ``rate`` is frames/second (``0`` floods as fast as the kernel allows, via
+    ``ping -f``); ``size`` is the total IP packet size in bytes; ``duration`` is
+    how long to run (``0`` runs until interrupted with Ctrl-C).
+    """
+    if not EPHEMERAL.exists():
+        print(
+            "warning: no ephemeral compose file — is the stack up? "
+            "run `python sim/topology.py up` first",
+            file=sys.stderr,
+        )
+
+    nodes = node_order(dedup_links(build_links()))
+    if node is None:
+        node = nodes[0]
+    elif node not in nodes:
+        print(
+            f"error: {node!r} is not a node in the topology ({', '.join(nodes)})",
+            file=sys.stderr,
+        )
+        return 1
+
+    # `ping -s` sizes the payload only; let the user pass a whole-IP-packet size.
+    payload = max(size - IP_ICMP_OVERHEAD, 0)
+    cmd = ["exec", node, "ping", "-b", "-I", iface]
+    if rate > 0:
+        # Sub-second intervals require root; the sim containers run as root.
+        cmd += ["-i", f"{1.0 / rate:.6f}"]
+    else:
+        cmd += ["-f"]  # flood: send as fast as the kernel will accept
+    if duration > 0:
+        cmd += ["-w", str(max(1, round(duration)))]
+    cmd += ["-s", str(payload), broadcast]
+    return compose(*cmd)
+
+
 def cmd_graph() -> None:
     links = dedup_links(build_links())
     adj: dict[str, set[str]] = {n: set() for n in node_order(links)}
@@ -277,6 +336,43 @@ def main(argv: list[str]) -> int:
         "logs", help="follow `docker compose logs -f` (optionally for given nodes)"
     )
     lg.add_argument("nodes", nargs="*")
+    bl = sub.add_parser(
+        "blast",
+        help="flood broadcast traffic from a node into the mesh (stress the flood path)",
+    )
+    bl.add_argument(
+        "node",
+        nargs="?",
+        help="origin node (default: the first node in the topology)",
+    )
+    bl.add_argument(
+        "--rate",
+        type=float,
+        default=100.0,
+        help="frames per second; 0 floods as fast as possible (default: 100)",
+    )
+    bl.add_argument(
+        "--size",
+        type=int,
+        default=1000,
+        help="total IP packet size in bytes (default: 1000)",
+    )
+    bl.add_argument(
+        "--duration",
+        type=float,
+        default=10.0,
+        help="seconds to blast; 0 runs until interrupted (default: 10)",
+    )
+    bl.add_argument(
+        "--iface",
+        default="wayfinder0",
+        help="host interface to send from — egress is pinned here (default: wayfinder0)",
+    )
+    bl.add_argument(
+        "--broadcast",
+        default="10.0.0.255",
+        help="broadcast destination IP (default: 10.0.0.255)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -298,6 +394,15 @@ def main(argv: list[str]) -> int:
         return compose("down")
     if args.cmd == "logs":
         return compose("logs", "-f", *args.nodes)
+    if args.cmd == "blast":
+        return cmd_blast(
+            args.node,
+            args.rate,
+            args.size,
+            args.duration,
+            args.iface,
+            args.broadcast,
+        )
     return 1
 
 

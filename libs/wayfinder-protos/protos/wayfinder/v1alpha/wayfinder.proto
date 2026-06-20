@@ -38,6 +38,19 @@ message GetLinkQualityTableRequest {}
 // publish interval and the adaptive backoff bounds it moves between.
 message GetOgmScheduleRequest {}
 
+// Request the current per-interface throughput estimates.  Returns a
+// Throughput response with one entry per mesh interface plus the node-wide
+// totals.  The values are smoothed instantaneous rates evaluated at the time
+// of the request, not cumulative counters.
+message GetThroughputRequest {}
+
+// Request the node's aggregate health and topology metrics.  Returns a
+// NodeMetrics response summarising uptime, neighbour count, bounded-table
+// occupancy, and the transmission-quality / path-diversity distribution across
+// the mesh — the signals an application developer uses to infer the state of
+// the underlying mesh from outside the router.
+message GetMetricsRequest {}
+
 // Request a routing decision for a hypothetical packet to `destination`,
 // mirroring what the router would compute on send.  Returns a
 // ResolveRouteResponse with the next-hop neighbor and the egress
@@ -69,6 +82,12 @@ message WayfinderRequest {
 
     // Query the current per-interface adaptive OGM emission schedule.
     GetOgmScheduleRequest get_ogm_schedule = 5;
+
+    // Query the current per-interface throughput estimates.
+    GetThroughputRequest get_throughput = 6;
+
+    // Query the node's aggregate health and topology metrics.
+    GetMetricsRequest get_metrics = 7;
   }
 }
 
@@ -200,6 +219,113 @@ message OgmSchedule {
   repeated OgmScheduleEntry entries = 1;
 }
 
+// Smoothed throughput for a single mesh interface, in both directions.  The
+// rates are exponentially-weighted moving averages evaluated at the instant of
+// the request — bytes and frames per second flowing in and out — rather than
+// cumulative counters, so they stay bounded for an arbitrarily long-lived node
+// and decay back toward zero when an interface goes quiet.
+message InterfaceThroughput {
+  // Index of the interface these rates describe, in registration order.
+  // Matches the iface_idx used in LinkQualityEntry and OgmScheduleEntry.
+  uint32 iface_idx = 1;
+
+  // Smoothed receive rate in bytes per second (whole link frames, header
+  // included).
+  double rx_bps = 2;
+
+  // Smoothed receive rate in link frames per second.
+  double rx_fps = 3;
+
+  // Smoothed transmit rate in bytes per second (whole link frames, header
+  // included).
+  double tx_bps = 4;
+
+  // Smoothed transmit rate in link frames per second.
+  double tx_fps = 5;
+}
+
+// Snapshot of per-interface throughput plus the node-wide totals at the time of
+// the request.  The totals are the sum of the per-interface rates and are
+// provided so a caller need not re-derive them.
+message Throughput {
+  // One entry per interface the router is tracking, in registration order.
+  // Empty if no interface has been configured or carried traffic yet.
+  repeated InterfaceThroughput interfaces = 1;
+
+  // Node-wide smoothed receive rate in bytes per second (sum across interfaces).
+  double total_rx_bps = 2;
+
+  // Node-wide smoothed receive rate in link frames per second.
+  double total_rx_fps = 3;
+
+  // Node-wide smoothed transmit rate in bytes per second (sum across
+  // interfaces).
+  double total_tx_bps = 4;
+
+  // Node-wide smoothed transmit rate in link frames per second.
+  double total_tx_fps = 5;
+}
+
+// Current-vs-maximum occupancy of one of the router's fixed-capacity tables.
+// These tables are sized at compile time for embedded targets, so an operator
+// (or an application sizing its own behaviour to the mesh) needs to see how
+// close each is to saturation: a table at capacity silently evicts or drops.
+message TableOccupancy {
+  // Number of entries currently held.
+  uint32 used = 1;
+
+  // Maximum number of entries the table can hold before eviction/drop.
+  uint32 capacity = 2;
+}
+
+// Aggregate health and topology metrics for the local node, derived from the
+// router's live state at the time of the request.  Exposed so an application
+// on top of the mesh can infer conditions it cannot otherwise observe — how
+// large and how stable the surrounding mesh is, and how close the node is to
+// its capacity limits.
+message NodeMetrics {
+  // Seconds the router has been running (its monotonic clock at request time).
+  uint64 uptime_secs = 1;
+
+  // Number of distinct directly-reachable (one-hop) neighbours: originators the
+  // node routes to via the originator itself.
+  uint32 neighbor_count = 2;
+
+  // Occupancy of the originator (routing) table.
+  TableOccupancy originators = 3;
+
+  // Occupancy of the broadcast-deduplication table (per-originator highest
+  // broadcast sequence number).
+  TableOccupancy broadcast_dedup = 4;
+
+  // Occupancy of the locally-joined multicast group table (groups announced in
+  // this node's OGMs).
+  TableOccupancy local_mcast_groups = 5;
+
+  // Occupancy of the learned multicast-membership table (group → remote
+  // listener pairs learned from other nodes' OGMs).
+  TableOccupancy mcast_memberships = 6;
+
+  // Lowest best-path transmission quality (0–255) across all originators, or 0
+  // when no originators are known.
+  uint32 tq_min = 7;
+
+  // Highest best-path transmission quality (0–255) across all originators, or 0
+  // when no originators are known.
+  uint32 tq_max = 8;
+
+  // Mean best-path transmission quality (0–255) across all originators, or 0
+  // when no originators are known.
+  double tq_mean = 9;
+
+  // Largest number of alternate paths held for any single originator (0–4).
+  uint32 paths_max = 10;
+
+  // Mean number of alternate paths per originator, a path-diversity / route-
+  // resilience gauge; 0 when no originators are known.
+  double paths_mean = 11;
+}
+
 // Marker payload indicating the router would flood a packet out of every
 // interface (the egress decision used for broadcasts and for
 // destinations with no metric information).
@@ -258,5 +384,11 @@ message WayfinderResponse {
 
     // Response to GetOgmScheduleRequest.
     OgmSchedule ogm_schedule = 6;
+
+    // Response to GetThroughputRequest.
+    Throughput throughput = 7;
+
+    // Response to GetMetricsRequest.
+    NodeMetrics metrics = 8;
   }
 }

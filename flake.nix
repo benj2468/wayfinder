@@ -75,6 +75,7 @@
               protobuf
               buf
               tshark
+              glab
             ];
 
             nativeBuildInputs = with pkgs; [

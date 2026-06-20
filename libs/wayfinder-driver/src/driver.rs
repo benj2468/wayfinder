@@ -219,7 +219,7 @@ impl<Local: FrameIo> Driver<Local> {
                     }
                 },
                 Some((request, resp_tx)) = query_rx.recv(), if check_server => {
-                    let response = WayfinderService::new(RouterAdapter::new(&*router)).handle(request);
+                    let response = WayfinderService::new(RouterAdapter::new(&*router, now)).handle(request);
                     let _ = resp_tx.send(response);
                     LoopOutput::none()
                 },
@@ -233,7 +233,7 @@ impl<Local: FrameIo> Driver<Local> {
             }
         };
 
-        dispatch(local, interfaces, router, mac, output).await
+        dispatch(local, interfaces, router, mac, now, output).await
     }
 
     /// Inject one host Ethernet frame as if it had arrived from the local
@@ -243,13 +243,15 @@ impl<Local: FrameIo> Driver<Local> {
     ///
     /// [`run_once`]: Driver::run_once
     pub async fn inject_host_frame(&mut self, eth: &[u8]) -> anyhow::Result<()> {
+        let now = self.start.elapsed();
         let mesh = plan_host_frame(
             &mut self.router,
             &mut self.snooper,
             eth,
             &mut self.tx_buffer,
         );
-        self.dispatch_output(LoopOutput { mesh, local: None }).await
+        self.dispatch_output(now, LoopOutput { mesh, local: None })
+            .await
     }
 
     /// Drive one periodic-broadcast tick at instant `now` (relative to the
@@ -263,6 +265,7 @@ impl<Local: FrameIo> Driver<Local> {
             &mut self.interfaces,
             &mut self.router,
             self.mac,
+            now,
             output,
         )
         .await
@@ -294,7 +297,7 @@ impl<Local: FrameIo> Driver<Local> {
                     &eth,
                     &mut self.tx_buffer,
                 );
-                self.dispatch_output(LoopOutput { mesh, local: None })
+                self.dispatch_output(self.start.elapsed(), LoopOutput { mesh, local: None })
                     .await?;
             }
 
@@ -315,14 +318,15 @@ impl<Local: FrameIo> Driver<Local> {
                         )
                     }
                 };
-                self.dispatch_output(output).await?;
+                self.dispatch_output(self.start.elapsed(), output).await?;
             }
 
             // Management queries from the in-process server.
             if let Ok((request, resp_tx)) = self.query_rx.try_recv() {
                 progressed = true;
+                let now = self.start.elapsed();
                 let response =
-                    WayfinderService::new(RouterAdapter::new(&self.router)).handle(request);
+                    WayfinderService::new(RouterAdapter::new(&self.router, now)).handle(request);
                 let _ = resp_tx.send(response);
             }
 
@@ -333,13 +337,15 @@ impl<Local: FrameIo> Driver<Local> {
         Ok(())
     }
 
-    /// Deliver one unit of work via the borrowed `self` fields.
-    async fn dispatch_output(&mut self, output: LoopOutput) -> anyhow::Result<()> {
+    /// Deliver one unit of work via the borrowed `self` fields, stamping any
+    /// transmit-rate accounting with `now`.
+    async fn dispatch_output(&mut self, now: Duration, output: LoopOutput) -> anyhow::Result<()> {
         dispatch(
             &self.local,
             &mut self.interfaces,
             &mut self.router,
             self.mac,
+            now,
             output,
         )
         .await
@@ -495,6 +501,7 @@ async fn dispatch<Local: FrameIo>(
     interfaces: &mut [Box<DynLinkT<'static>>],
     router: &mut CentralRouter,
     mac: Mac,
+    now: Duration,
     output: LoopOutput,
 ) -> anyhow::Result<()> {
     if let Some(inner) = output.local {
@@ -526,7 +533,8 @@ async fn dispatch<Local: FrameIo>(
             // adaptive schedule.
             Egress::Iface(iface_idx) => {
                 if let Some(iface) = interfaces.get_mut(iface_idx) {
-                    iface.send(mac, &data).await?;
+                    let sent = iface.send(mac, &data).await?;
+                    router.record_tx(iface_idx, sent, now);
                 }
             }
             // Otherwise let the router's metric-driven egress choice decide.
@@ -537,12 +545,14 @@ async fn dispatch<Local: FrameIo>(
                         if Some(idx) == exclude {
                             continue;
                         }
-                        iface.send(mac, &data).await?;
+                        let sent = iface.send(mac, &data).await?;
+                        router.record_tx(idx, sent, now);
                     }
                 }
                 Some(EgressInterface::Interface(iface_idx)) => {
                     if let Some(iface) = interfaces.get_mut(iface_idx) {
-                        iface.send(mac, &data).await?;
+                        let sent = iface.send(mac, &data).await?;
+                        router.record_tx(iface_idx, sent, now);
                     }
                 }
                 None => {}

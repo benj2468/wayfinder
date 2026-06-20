@@ -13,8 +13,9 @@ use prost::Message;
 use tokio::net::TcpStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use wayfinder_protos::wayfinder_v1alpha::{
-    GetLinkQualityTableRequest, GetNodeInfoRequest, GetOgmScheduleRequest, GetRoutingTableRequest,
-    LinkQualityTable, NodeInfo, OgmSchedule, RoutingTable, WayfinderRequest, WayfinderResponse,
+    GetLinkQualityTableRequest, GetMetricsRequest, GetNodeInfoRequest, GetOgmScheduleRequest,
+    GetRoutingTableRequest, GetThroughputRequest, LinkQualityTable, NodeInfo, NodeMetrics,
+    OgmSchedule, RoutingTable, Throughput, WayfinderRequest, WayfinderResponse,
     wayfinder_request::Request as RequestKind, wayfinder_response::Response as ResponseKind,
 };
 
@@ -98,6 +99,30 @@ impl Client {
             other => Err(unexpected("OgmSchedule", &other)),
         }
     }
+
+    /// Query the current per-interface throughput estimates (smoothed
+    /// bytes/sec and frames/sec per interface, plus node-wide totals).
+    pub async fn throughput(&mut self) -> anyhow::Result<Throughput> {
+        match self
+            .request(RequestKind::GetThroughput(GetThroughputRequest {}))
+            .await?
+        {
+            ResponseKind::Throughput(throughput) => Ok(throughput),
+            other => Err(unexpected("Throughput", &other)),
+        }
+    }
+
+    /// Query the node's aggregate health and topology metrics (uptime,
+    /// neighbour count, table occupancy, TQ / path-diversity distribution).
+    pub async fn node_metrics(&mut self) -> anyhow::Result<NodeMetrics> {
+        match self
+            .request(RequestKind::GetMetrics(GetMetricsRequest {}))
+            .await?
+        {
+            ResponseKind::Metrics(metrics) => Ok(metrics),
+            other => Err(unexpected("Metrics", &other)),
+        }
+    }
 }
 
 /// Build an error for a response variant that does not match the request.
@@ -108,6 +133,8 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
         ResponseKind::LinkQualityTable(_) => "LinkQualityTable",
         ResponseKind::ResolveRoute(_) => "ResolveRoute",
         ResponseKind::OgmSchedule(_) => "OgmSchedule",
+        ResponseKind::Throughput(_) => "Throughput",
+        ResponseKind::Metrics(_) => "Metrics",
         ResponseKind::Error(_) => "Error",
     };
     anyhow!("expected {want} response, got {got}")
