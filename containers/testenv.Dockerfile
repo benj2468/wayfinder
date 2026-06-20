@@ -18,6 +18,7 @@ RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/ca
 
 RUN cargo binstall -y cargo-nextest
 RUN cargo binstall -y cargo-llvm-cov
+RUN cargo binstall -y sccache
 
 # Ensure protoc is globally accessible (usually /usr/bin/protoc via apt)
 ENV PROTOC=/usr/bin/protoc
