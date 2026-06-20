@@ -35,7 +35,7 @@ fn is_ogm_frame(frame: &[u8]) -> bool {
 /// puts on the wire is tallied exactly once, regardless of fan-out.
 fn count_ogms(harness: &mut TestHarness) -> Arc<AtomicUsize> {
     let counter = Arc::new(AtomicUsize::new(0));
-    for (_, switch) in harness.switches.iter_mut() {
+    for switch in harness.switches.values_mut() {
         for port in switch.port_ids() {
             let counter = counter.clone();
             switch
@@ -114,7 +114,7 @@ fn one_switch_with_machines(n: usize) -> TestHarness {
     for i in 0..n {
         let name = format!("machine{i}");
         config.machines.push(TestMachineConfig {
-            name: name.into(),
+            name,
             wayfinder: Config {
                 links: vec![LinkConfig::test("switch1")],
                 ..Default::default()
@@ -305,7 +305,7 @@ async fn test_simple_pair_send_data() {
     harness.tick().await;
     harness.tick().await;
 
-    for (_, router) in harness.machines.iter() {
+    for router in harness.machines.values() {
         assert_eq!(router.router().originator_table().count(), 1);
     }
 
@@ -346,7 +346,7 @@ async fn test_line_of_three_send_data() {
     harness.tick().await;
     harness.tick().await;
 
-    for (_, router) in harness.machines.iter() {
+    for router in harness.machines.values() {
         assert_eq!(router.router().originator_table().count(), 2);
     }
 
@@ -410,7 +410,7 @@ async fn three_routers_all_connected_discover_and_exchange() {
     harness.tick().await;
     harness.tick().await;
 
-    for (_, router) in harness.machines.iter() {
+    for router in harness.machines.values() {
         assert_eq!(router.router().originator_table().count(), 2);
     }
 
@@ -491,7 +491,7 @@ async fn ogms_stop_after_convergence() {
     for _ in 0..80 {
         harness.tick().await;
     }
-    for (_, router) in harness.machines.iter() {
+    for router in harness.machines.values() {
         assert_eq!(router.router().originator_table().count(), 2);
     }
 
@@ -682,7 +682,7 @@ async fn sole_relay_disconnect_blackholes_then_recovers() {
     // Converge the line, then confirm the baseline machine1 → machine3 delivery
     // over the relay.
     converge_at(&mut harness, Duration::from_secs(1)).await;
-    for (_, r) in harness.machines.iter() {
+    for r in harness.machines.values() {
         assert_eq!(r.router().originator_count(), 2);
     }
     harness

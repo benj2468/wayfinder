@@ -116,7 +116,7 @@ fn push_hex<const N: usize>(out: &mut heapless::String<N>, bytes: &[u8]) -> Resu
 /// Errors on odd length or a non-hex digit, or if `out` is too small.
 fn decode_hex(s: &str, out: &mut [u8]) -> Result<usize, LinkError> {
     let bytes = s.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(LinkError::InvalidPacket);
     }
     let n = bytes.len() / 2;

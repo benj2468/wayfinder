@@ -55,8 +55,8 @@ pub struct IdentTable<Ident: MeshIdentifier> {
 impl<Ident: MeshIdentifier> IdentTable<Ident> {
     pub fn new() -> Self {
         let mut free_stack = [0u8; IDENT_TABLE_CAP];
-        for i in 0..IDENT_TABLE_CAP {
-            free_stack[i] = i as u8;
+        for (i, slot) in free_stack.iter_mut().enumerate() {
+            *slot = i as u8;
         }
         Self {
             nodes: core::array::from_fn(|_| None),

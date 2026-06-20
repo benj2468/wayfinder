@@ -69,7 +69,7 @@ impl TestHarness {
 
     pub async fn poll(&mut self, now: Duration) {
         self.clock = now;
-        for (_, router) in self.machines.iter_mut() {
+        for router in self.machines.values_mut() {
             router.poll(now).await;
         }
     }
@@ -84,7 +84,7 @@ impl TestHarness {
         // OGM rounds are driven explicitly by `poll`, so a tick only moves the
         // frames already on the wire — first every node transmits, then every
         // node receives.
-        for (_, router) in self.machines.iter_mut() {
+        for router in self.machines.values_mut() {
             let _ = tokio::time::timeout(
                 tokio::time::Duration::from_nanos(1),
                 router.driver().run_once(now, false, true, false, false),
@@ -92,7 +92,7 @@ impl TestHarness {
             .await;
         }
 
-        for (_, router) in self.machines.iter_mut() {
+        for router in self.machines.values_mut() {
             let _ = tokio::time::timeout(
                 tokio::time::Duration::from_nanos(1),
                 router.driver().run_once(now, true, false, false, false),
@@ -100,7 +100,7 @@ impl TestHarness {
             .await;
         }
         let mut frames = 0;
-        for (_, switch) in self.switches.iter_mut() {
+        for switch in self.switches.values_mut() {
             frames += switch.tick().await.unwrap();
         }
         frames

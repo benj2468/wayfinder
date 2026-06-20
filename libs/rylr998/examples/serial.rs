@@ -8,7 +8,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Establish standard connection to your platform's mapped USB interface
     let stream = tokio_serial::new("/dev/ttyUSB0", 115200).open_native_async()?;
     let mut client = RylrClient::new(FromTokio::new(stream))?;
-    client.set_timeout(Duration::from_secs(2).try_into()?);
+    client.set_timeout(Duration::from_secs(2));
 
     println!("Pinging RYLR transceiver module...");
     client.ping().await?;
