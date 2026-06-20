@@ -183,3 +183,94 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wayfinder::CentralRouter;
+    use wayfinder::batman::wire::{BATADV_IV_OGM, BatmanOgmPacket};
+    use wayfinder::interfaces::frame::{LinkFrame, Mac};
+    use zerocopy::{FromBytes, IntoBytes};
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    /// Serialise a link frame carrying `payload` from `src` to `dst`.
+    fn link_frame_bytes(src: Mac, dst: Mac, protocol: u16, payload: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut out = alloc::vec::Vec::new();
+        out.extend_from_slice(dst.as_bytes());
+        out.extend_from_slice(src.as_bytes());
+        out.extend_from_slice(&protocol.to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Feed one direct OGM so the router learns `orig` as a one-hop neighbour at
+    /// the engine's stored TQ of `tq - 10` (the per-hop penalty) with a single
+    /// path.  `prev_sender == orig` and a full TTL make it a direct path.
+    fn feed_direct_ogm(router: &mut CentralRouter, orig: Mac, seqno: u32, tq: u8) {
+        let ogm = BatmanOgmPacket {
+            packet_type: BATADV_IV_OGM,
+            version: 5,
+            ttl: 50,
+            flags: 0,
+            seqno: seqno.to_be(),
+            orig,
+            prev_sender: orig,
+            reserved: 0,
+            tq,
+            tvlv_len: 0,
+        };
+        let bytes = link_frame_bytes(
+            orig,
+            Mac::BROADCAST,
+            wayfinder::DEFAULT_BATMAN_ETHER_TYPE,
+            ogm.as_bytes(),
+        );
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 256];
+        router.handle_frame(Duration::ZERO, 0, frame, &mut tx);
+    }
+
+    /// An empty originator table must fold to all-zero metrics — in particular a
+    /// zero (not NaN) mean, since the fold guards the divide-by-zero — and report
+    /// the table capacities, not just the (zero) usage.
+    #[test]
+    fn node_metrics_empty_table_folds_to_zero_not_nan() {
+        let router = CentralRouter::new(mac(1));
+        let m = RouterAdapter::new(&router, Duration::from_secs(5)).node_metrics();
+
+        assert_eq!(m.neighbor_count, 0);
+        assert_eq!((m.tq_min, m.tq_max), (0, 0));
+        assert_eq!(m.tq_mean, 0.0);
+        assert_eq!(m.paths_max, 0);
+        assert_eq!(m.paths_mean, 0.0);
+        assert_eq!(m.uptime_secs, 5);
+        assert_eq!((m.originators.used, m.originators.capacity), (0, 128));
+    }
+
+    /// The TQ / path-diversity fold reports the true min / mean / max across
+    /// originators (not, say, a `tq_min` stuck at its `u32::MAX` seed or a mean
+    /// divided by the wrong count).  Direct OGMs at input TQ 255 / 205 / 155 are
+    /// stored as 245 / 195 / 145 after the engine's `-10` per-hop penalty, each a
+    /// single-path neighbour, so the mean is exactly 195 and path diversity is a
+    /// flat 1.
+    #[test]
+    fn node_metrics_fold_reports_tq_and_path_distribution() {
+        let mut router = CentralRouter::new(mac(1));
+        feed_direct_ogm(&mut router, mac(2), 1, 255);
+        feed_direct_ogm(&mut router, mac(3), 1, 205);
+        feed_direct_ogm(&mut router, mac(4), 1, 155);
+
+        let m = RouterAdapter::new(&router, Duration::from_secs(10)).node_metrics();
+
+        assert_eq!(m.neighbor_count, 3);
+        assert_eq!(m.tq_min, 145);
+        assert_eq!(m.tq_max, 245);
+        assert_eq!(m.tq_mean, 195.0);
+        assert_eq!(m.paths_max, 1);
+        assert_eq!(m.paths_mean, 1.0);
+        assert_eq!((m.originators.used, m.originators.capacity), (3, 128));
+    }
+}
