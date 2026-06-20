@@ -1,8 +1,9 @@
 use crate::wayfinder_v1alpha::{
-    AllInterfacesEgress, ErrorResponse, LinkQualityEntry, LinkQualityTable, NeighborPath, NodeInfo,
-    OgmSchedule, OgmScheduleEntry, ResolveRouteResponse, RoutingEntry, RoutingTable,
-    WayfinderRequest, WayfinderResponse, resolve_route_response::Egress as EgressKind,
-    wayfinder_request::Request as RequestKind, wayfinder_response::Response as ResponseKind,
+    AllInterfacesEgress, ErrorResponse, InterfaceThroughput, LinkQualityEntry, LinkQualityTable,
+    NeighborPath, NodeInfo, NodeMetrics, OgmSchedule, OgmScheduleEntry, ResolveRouteResponse,
+    RoutingEntry, RoutingTable, TableOccupancy, Throughput, WayfinderRequest, WayfinderResponse,
+    resolve_route_response::Egress as EgressKind, wayfinder_request::Request as RequestKind,
+    wayfinder_response::Response as ResponseKind,
 };
 use alloc::vec::Vec;
 
@@ -56,6 +57,62 @@ pub struct OgmScheduleEntryData {
     pub max_interval_ms: u32,
 }
 
+/// Intermediate representation of one interface's smoothed throughput,
+/// returned by [`WayfinderDataProvider::throughput`].  Rates are bytes/sec and
+/// frames/sec in each direction, evaluated at the moment the snapshot was
+/// taken; not cumulative counters.
+#[derive(Clone)]
+pub struct InterfaceThroughputData {
+    /// Physical-interface index this row describes, in registration order.
+    pub iface_idx: u32,
+    /// Smoothed receive rate in bytes per second.
+    pub rx_bps: f64,
+    /// Smoothed receive rate in frames per second.
+    pub rx_fps: f64,
+    /// Smoothed transmit rate in bytes per second.
+    pub tx_bps: f64,
+    /// Smoothed transmit rate in frames per second.
+    pub tx_fps: f64,
+}
+
+/// Intermediate representation of one fixed-capacity table's occupancy.
+#[derive(Clone, Copy, Default)]
+pub struct TableOccupancyData {
+    /// Entries currently held.
+    pub used: u32,
+    /// Maximum entries before eviction/drop.
+    pub capacity: u32,
+}
+
+/// Intermediate representation of the node's aggregate health and topology
+/// metrics, returned by [`WayfinderDataProvider::node_metrics`].  A flat
+/// snapshot derived from the router's live state at call time.
+#[derive(Clone, Default)]
+pub struct NodeMetricsData {
+    /// Seconds the router has been running.
+    pub uptime_secs: u64,
+    /// Distinct directly-reachable (one-hop) neighbours.
+    pub neighbor_count: u32,
+    /// Originator (routing) table occupancy.
+    pub originators: TableOccupancyData,
+    /// Broadcast-deduplication table occupancy.
+    pub broadcast_dedup: TableOccupancyData,
+    /// Locally-joined multicast group table occupancy.
+    pub local_mcast_groups: TableOccupancyData,
+    /// Learned multicast-membership table occupancy.
+    pub mcast_memberships: TableOccupancyData,
+    /// Lowest best-path TQ (0–255) across originators, 0 when none are known.
+    pub tq_min: u32,
+    /// Highest best-path TQ (0–255) across originators, 0 when none are known.
+    pub tq_max: u32,
+    /// Mean best-path TQ (0–255) across originators, 0.0 when none are known.
+    pub tq_mean: f64,
+    /// Largest alternate-path count held for any originator (0–4).
+    pub paths_max: u32,
+    /// Mean alternate-path count per originator, 0.0 when none are known.
+    pub paths_mean: f64,
+}
+
 /// Egress decision a router would make for a destination.  Mirrors
 /// `wayfinder::EgressInterface` without coupling this crate to it.
 #[derive(Clone)]
@@ -92,6 +149,12 @@ pub trait WayfinderDataProvider {
     /// Snapshot of the per-interface adaptive OGM emission schedule (the
     /// current OGM publish rate per interface and its backoff bounds).
     fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData>;
+    /// Snapshot of the per-interface smoothed throughput (bytes/sec and
+    /// frames/sec in each direction), evaluated as of the moment of the call.
+    fn throughput(&self) -> Vec<InterfaceThroughputData>;
+    /// Aggregate node health and topology metrics, derived from live router
+    /// state at the moment of the call.
+    fn node_metrics(&self) -> NodeMetricsData;
     /// Resolve how a packet to `destination` would be routed.  Returns
     /// `None` if the raw bytes can't be parsed as a valid identifier for
     /// this provider's address family.
@@ -113,6 +176,12 @@ impl<T: WayfinderDataProvider> WayfinderDataProvider for &T {
     }
     fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData> {
         (**self).ogm_schedule()
+    }
+    fn throughput(&self) -> Vec<InterfaceThroughputData> {
+        (**self).throughput()
+    }
+    fn node_metrics(&self) -> NodeMetricsData {
+        (**self).node_metrics()
     }
     fn resolve_route(&self, destination: &[u8]) -> Option<RouteResolutionData> {
         (**self).resolve_route(destination)
@@ -193,6 +262,63 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                 ResponseKind::OgmSchedule(OgmSchedule { entries })
             }
 
+            Some(RequestKind::GetThroughput(_)) => {
+                let mut total_rx_bps = 0.0;
+                let mut total_rx_fps = 0.0;
+                let mut total_tx_bps = 0.0;
+                let mut total_tx_fps = 0.0;
+                let interfaces = self
+                    .provider
+                    .throughput()
+                    .into_iter()
+                    .map(|e| {
+                        // The node-wide rate is the sum of the per-interface
+                        // rates, accumulated as we project each entry.
+                        total_rx_bps += e.rx_bps;
+                        total_rx_fps += e.rx_fps;
+                        total_tx_bps += e.tx_bps;
+                        total_tx_fps += e.tx_fps;
+                        InterfaceThroughput {
+                            iface_idx: e.iface_idx,
+                            rx_bps: e.rx_bps,
+                            rx_fps: e.rx_fps,
+                            tx_bps: e.tx_bps,
+                            tx_fps: e.tx_fps,
+                        }
+                    })
+                    .collect();
+                ResponseKind::Throughput(Throughput {
+                    interfaces,
+                    total_rx_bps,
+                    total_rx_fps,
+                    total_tx_bps,
+                    total_tx_fps,
+                })
+            }
+
+            Some(RequestKind::GetMetrics(_)) => {
+                let m = self.provider.node_metrics();
+                let occ = |o: TableOccupancyData| {
+                    Some(TableOccupancy {
+                        used: o.used,
+                        capacity: o.capacity,
+                    })
+                };
+                ResponseKind::Metrics(NodeMetrics {
+                    uptime_secs: m.uptime_secs,
+                    neighbor_count: m.neighbor_count,
+                    originators: occ(m.originators),
+                    broadcast_dedup: occ(m.broadcast_dedup),
+                    local_mcast_groups: occ(m.local_mcast_groups),
+                    mcast_memberships: occ(m.mcast_memberships),
+                    tq_min: m.tq_min,
+                    tq_max: m.tq_max,
+                    tq_mean: m.tq_mean,
+                    paths_max: m.paths_max,
+                    paths_mean: m.paths_mean,
+                })
+            }
+
             Some(RequestKind::ResolveRoute(req)) => {
                 match self.provider.resolve_route(&req.destination) {
                     Some(resolution) => ResponseKind::ResolveRoute(ResolveRouteResponse {
@@ -225,7 +351,8 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
 mod tests {
     use super::*;
     use crate::wayfinder_v1alpha::{
-        GetLinkQualityTableRequest, GetOgmScheduleRequest, ResolveRouteRequest,
+        GetLinkQualityTableRequest, GetMetricsRequest, GetOgmScheduleRequest, GetThroughputRequest,
+        ResolveRouteRequest,
     };
     use alloc::vec;
 
@@ -235,6 +362,8 @@ mod tests {
     struct MockProvider {
         link_quality: Vec<LinkQualityEntryData>,
         ogm_schedule: Vec<OgmScheduleEntryData>,
+        throughput: Vec<InterfaceThroughputData>,
+        node_metrics: NodeMetricsData,
         route_resolution: Option<RouteResolutionData>,
         // RefCell would be nicer but no_std + alloc here — a Cell of an
         // owned Vec would require Clone gymnastics, so we just leave the
@@ -256,6 +385,12 @@ mod tests {
         }
         fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData> {
             self.ogm_schedule.clone()
+        }
+        fn throughput(&self) -> Vec<InterfaceThroughputData> {
+            self.throughput.clone()
+        }
+        fn node_metrics(&self) -> NodeMetricsData {
+            self.node_metrics.clone()
         }
         fn resolve_route(&self, _destination: &[u8]) -> Option<RouteResolutionData> {
             self.route_resolution.clone()
@@ -462,6 +597,109 @@ mod tests {
         }
     }
 
+    #[test]
+    fn throughput_request_returns_entries_and_summed_totals() {
+        let provider = MockProvider {
+            throughput: vec![
+                InterfaceThroughputData {
+                    iface_idx: 0,
+                    rx_bps: 1000.0,
+                    rx_fps: 10.0,
+                    tx_bps: 500.0,
+                    tx_fps: 5.0,
+                },
+                InterfaceThroughputData {
+                    iface_idx: 1,
+                    rx_bps: 250.0,
+                    rx_fps: 2.0,
+                    tx_bps: 100.0,
+                    tx_fps: 1.0,
+                },
+            ],
+            ..Default::default()
+        };
+
+        match handle(
+            provider,
+            RequestKind::GetThroughput(GetThroughputRequest {}),
+        ) {
+            ResponseKind::Throughput(tp) => {
+                assert_eq!(tp.interfaces.len(), 2);
+                assert_eq!(tp.interfaces[0].iface_idx, 0);
+                assert_eq!(tp.interfaces[1].rx_bps, 250.0);
+                // Totals are the per-interface sums.
+                assert_eq!(tp.total_rx_bps, 1250.0);
+                assert_eq!(tp.total_rx_fps, 12.0);
+                assert_eq!(tp.total_tx_bps, 600.0);
+                assert_eq!(tp.total_tx_fps, 6.0);
+            }
+            other => panic!("expected Throughput, got {:?}", proto_kind_name(&other)),
+        }
+    }
+
+    #[test]
+    fn throughput_request_with_no_interfaces_returns_zero_totals() {
+        match handle(
+            MockProvider::default(),
+            RequestKind::GetThroughput(GetThroughputRequest {}),
+        ) {
+            ResponseKind::Throughput(tp) => {
+                assert!(tp.interfaces.is_empty());
+                assert_eq!(tp.total_rx_bps, 0.0);
+                assert_eq!(tp.total_tx_bps, 0.0);
+            }
+            other => panic!("expected Throughput, got {:?}", proto_kind_name(&other)),
+        }
+    }
+
+    #[test]
+    fn metrics_request_projects_all_fields() {
+        let provider = MockProvider {
+            node_metrics: NodeMetricsData {
+                uptime_secs: 3600,
+                neighbor_count: 3,
+                originators: TableOccupancyData {
+                    used: 12,
+                    capacity: 128,
+                },
+                broadcast_dedup: TableOccupancyData {
+                    used: 5,
+                    capacity: 128,
+                },
+                local_mcast_groups: TableOccupancyData {
+                    used: 2,
+                    capacity: 16,
+                },
+                mcast_memberships: TableOccupancyData {
+                    used: 7,
+                    capacity: 64,
+                },
+                tq_min: 180,
+                tq_max: 255,
+                tq_mean: 220.5,
+                paths_max: 4,
+                paths_mean: 1.75,
+            },
+            ..Default::default()
+        };
+
+        match handle(provider, RequestKind::GetMetrics(GetMetricsRequest {})) {
+            ResponseKind::Metrics(m) => {
+                assert_eq!(m.uptime_secs, 3600);
+                assert_eq!(m.neighbor_count, 3);
+                let orig = m.originators.expect("originators set");
+                assert_eq!((orig.used, orig.capacity), (12, 128));
+                assert_eq!(m.mcast_memberships.unwrap().capacity, 64);
+                assert_eq!(m.tq_min, 180);
+                assert_eq!(m.tq_max, 255);
+                assert_eq!(m.tq_mean, 220.5);
+                assert_eq!(m.paths_max, 4);
+                assert_eq!(m.paths_mean, 1.75);
+            }
+            other => panic!("expected Metrics, got {:?}", proto_kind_name(&other)),
+        }
+    }
+
     fn proto_kind_name(k: &ResponseKind) -> &'static str {
         match k {
             ResponseKind::NodeInfo(_) => "NodeInfo",
@@ -469,6 +707,8 @@ mod tests {
             ResponseKind::LinkQualityTable(_) => "LinkQualityTable",
             ResponseKind::ResolveRoute(_) => "ResolveRoute",
             ResponseKind::OgmSchedule(_) => "OgmSchedule",
+            ResponseKind::Throughput(_) => "Throughput",
+            ResponseKind::Metrics(_) => "Metrics",
             ResponseKind::Error(_) => "Error",
         }
     }

@@ -4,7 +4,9 @@
 use std::time::Instant;
 
 use ratatui::widgets::TableState;
-use wayfinder_protos::wayfinder_v1alpha::{LinkQualityTable, NodeInfo, OgmSchedule, RoutingTable};
+use wayfinder_protos::wayfinder_v1alpha::{
+    LinkQualityTable, NodeInfo, NodeMetrics, OgmSchedule, RoutingTable, Throughput,
+};
 
 /// The top-level views the TUI cycles between.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -17,15 +19,19 @@ pub enum Tab {
     LinkQuality,
     /// The per-interface adaptive OGM emission schedule (current publish rate).
     OgmSchedule,
+    /// Aggregate node metrics: uptime, neighbour count, table occupancy, TQ /
+    /// path-diversity distribution, and per-interface throughput.
+    Metrics,
 }
 
 impl Tab {
     /// All tabs in display order.
-    pub const ALL: [Tab; 4] = [
+    pub const ALL: [Tab; 5] = [
         Tab::Overview,
         Tab::Routing,
         Tab::LinkQuality,
         Tab::OgmSchedule,
+        Tab::Metrics,
     ];
 
     /// Short title shown in the tab bar.
@@ -35,6 +41,7 @@ impl Tab {
             Tab::Routing => "Routing Table",
             Tab::LinkQuality => "Link Quality",
             Tab::OgmSchedule => "OGM Schedule",
+            Tab::Metrics => "Metrics",
         }
     }
 
@@ -66,6 +73,11 @@ pub struct Snapshot {
     pub link_quality: LinkQualityTable,
     /// Per-interface adaptive OGM emission schedule; empty until first fetch.
     pub ogm_schedule: OgmSchedule,
+    /// Per-interface throughput rates and node-wide totals; empty until first
+    /// fetch.
+    pub throughput: Throughput,
+    /// Aggregate node health/topology metrics, or `None` until the first fetch.
+    pub metrics: Option<NodeMetrics>,
 }
 
 /// Whole-application state driven by the event loop and rendered each frame.
@@ -82,6 +94,8 @@ pub struct App {
     pub link_state: TableState,
     /// Selection state for the OGM schedule table.
     pub ogm_state: TableState,
+    /// Selection state for the per-interface throughput table on the Metrics tab.
+    pub metrics_state: TableState,
     /// Last error message from a failed refresh, cleared on success.
     pub last_error: Option<String>,
     /// When the snapshot was last refreshed successfully.
@@ -104,6 +118,7 @@ impl App {
             routing_state: TableState::default(),
             link_state: TableState::default(),
             ogm_state: TableState::default(),
+            metrics_state: TableState::default(),
             last_error: None,
             last_update: None,
             connected: false,
@@ -123,6 +138,10 @@ impl App {
             Tab::OgmSchedule => (
                 &mut self.ogm_state,
                 self.snapshot.ogm_schedule.entries.len(),
+            ),
+            Tab::Metrics => (
+                &mut self.metrics_state,
+                self.snapshot.throughput.interfaces.len(),
             ),
             Tab::Overview => return,
         };
@@ -176,11 +195,13 @@ mod tests {
         assert_eq!(Tab::Overview.next(), Tab::Routing);
         assert_eq!(Tab::Routing.next(), Tab::LinkQuality);
         assert_eq!(Tab::LinkQuality.next(), Tab::OgmSchedule);
-        assert_eq!(Tab::OgmSchedule.next(), Tab::Overview); // wrap forward
-        assert_eq!(Tab::Overview.prev(), Tab::OgmSchedule); // wrap backward
+        assert_eq!(Tab::OgmSchedule.next(), Tab::Metrics);
+        assert_eq!(Tab::Metrics.next(), Tab::Overview); // wrap forward
+        assert_eq!(Tab::Overview.prev(), Tab::Metrics); // wrap backward
         assert_eq!(Tab::Overview.index(), 0);
         assert_eq!(Tab::LinkQuality.index(), 2);
         assert_eq!(Tab::OgmSchedule.index(), 3);
+        assert_eq!(Tab::Metrics.index(), 4);
     }
 
     fn app_with_routes(n: usize) -> App {

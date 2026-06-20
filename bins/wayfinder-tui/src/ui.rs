@@ -30,6 +30,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Tab::Routing => render_routing(frame, app, chunks[1]),
         Tab::LinkQuality => render_link_quality(frame, app, chunks[1]),
         Tab::OgmSchedule => render_ogm_schedule(frame, app, chunks[1]),
+        Tab::Metrics => render_metrics(frame, app, chunks[1]),
     }
     render_status(frame, app, chunks[2]);
 }
@@ -71,6 +72,15 @@ fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
     lines.push(field(
         "Link-quality rows",
         &app.snapshot.link_quality.entries.len().to_string(),
+    ));
+    let tp = &app.snapshot.throughput;
+    lines.push(field(
+        "Throughput ↓/↑",
+        &format!(
+            "{} / {}",
+            fmt_rate(tp.total_rx_bps),
+            fmt_rate(tp.total_tx_bps)
+        ),
     ));
     lines.push(Line::from(""));
     lines.push(field("Server", &app.addr));
@@ -324,6 +334,168 @@ fn render_ogm_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
     .highlight_symbol("▶ ");
 
     frame.render_stateful_widget(table, area, &mut app.ogm_state);
+}
+
+/// Draw the Metrics view: a node-level summary panel (uptime, neighbours,
+/// table occupancy, TQ / path-diversity distribution) above the per-interface
+/// throughput table.  Together these are the signals an operator or an
+/// application on top of the mesh uses to judge the health and shape of the
+/// surrounding network.
+fn render_metrics(frame: &mut Frame, app: &mut App, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(9), // node metrics summary
+            Constraint::Min(0),    // per-interface throughput table
+        ])
+        .split(area);
+
+    render_node_metrics(frame, app, rows[0]);
+    render_throughput(frame, app, rows[1]);
+}
+
+/// Draw the node-level metrics summary panel.
+fn render_node_metrics(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Node Metrics ");
+
+    let lines: Vec<Line> = match &app.snapshot.metrics {
+        None => vec![Line::from(Span::styled(
+            "(waiting for data)",
+            Style::default().fg(Color::DarkGray),
+        ))],
+        Some(m) => {
+            let occ = |o: &Option<wayfinder_protos::wayfinder_v1alpha::TableOccupancy>| match o {
+                Some(t) => format!("{}/{}", t.used, t.capacity),
+                None => "—".to_string(),
+            };
+            vec![
+                field("Uptime", &fmt_uptime(m.uptime_secs)),
+                field("Neighbors (1-hop)", &m.neighbor_count.to_string()),
+                field("Originators (used/cap)", &occ(&m.originators)),
+                field("Broadcast dedup", &occ(&m.broadcast_dedup)),
+                field(
+                    "Mcast groups / members",
+                    &format!(
+                        "{} / {}",
+                        occ(&m.local_mcast_groups),
+                        occ(&m.mcast_memberships)
+                    ),
+                ),
+                field(
+                    "TQ min/mean/max",
+                    &format!("{} / {:.0} / {}", m.tq_min, m.tq_mean, m.tq_max),
+                ),
+                field(
+                    "Paths mean/max",
+                    &format!("{:.2} / {}", m.paths_mean, m.paths_max),
+                ),
+            ]
+        }
+    };
+
+    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    frame.render_widget(para, area);
+}
+
+/// Draw the per-interface throughput table: smoothed receive and transmit
+/// rates (bytes/sec and frames/sec) for each interface, with the node-wide
+/// totals in the block title so the whole-application throughput is visible
+/// alongside the per-interface breakdown.
+fn render_throughput(frame: &mut Frame, app: &mut App, area: Rect) {
+    let header = Row::new(["Iface", "RX rate", "RX fps", "TX rate", "TX fps"])
+        .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = app
+        .snapshot
+        .throughput
+        .interfaces
+        .iter()
+        .map(|e| {
+            Row::new(vec![
+                Cell::from(e.iface_idx.to_string()),
+                Cell::from(Span::styled(
+                    fmt_rate(e.rx_bps),
+                    Style::default().fg(Color::Green),
+                )),
+                Cell::from(fmt_fps(e.rx_fps)),
+                Cell::from(Span::styled(
+                    fmt_rate(e.tx_bps),
+                    Style::default().fg(Color::Cyan),
+                )),
+                Cell::from(fmt_fps(e.tx_fps)),
+            ])
+        })
+        .collect();
+
+    let tp = &app.snapshot.throughput;
+    let title = format!(
+        " Throughput — total ↓ {} ↑ {} ",
+        fmt_rate(tp.total_rx_bps),
+        fmt_rate(tp.total_tx_bps)
+    );
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(6),
+            Constraint::Min(12),
+            Constraint::Length(10),
+            Constraint::Min(12),
+            Constraint::Length(10),
+        ],
+    )
+    .header(header)
+    .block(Block::default().borders(Borders::ALL).title(title))
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::Blue)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(table, area, &mut app.metrics_state);
+}
+
+/// Render an uptime in seconds as a compact `d h m s` string, dropping
+/// leading zero units so a fresh node reads as `42s` and a long-lived one as
+/// `3d 4h`.
+fn fmt_uptime(secs: u64) -> String {
+    let (d, h, m, s) = (secs / 86400, secs / 3600 % 24, secs / 60 % 60, secs % 60);
+    if d > 0 {
+        format!("{d}d {h}h {m}m")
+    } else if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// Render a byte-per-second rate as a compact human-readable string, scaling
+/// through B/s, KiB/s, and MiB/s so both a near-idle LoRa link and a busy
+/// Ethernet-carried link read clearly.
+fn fmt_rate(bps: f64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bps < KIB {
+        format!("{bps:.0} B/s")
+    } else if bps < MIB {
+        format!("{:.1} KiB/s", bps / KIB)
+    } else {
+        format!("{:.2} MiB/s", bps / MIB)
+    }
+}
+
+/// Render a frames-per-second rate with adaptive precision: whole numbers once
+/// past 10 fps, one decimal below that so slow links don't read as a flat 0.
+fn fmt_fps(fps: f64) -> String {
+    if fps >= 10.0 {
+        format!("{fps:.0}/s")
+    } else {
+        format!("{fps:.1}/s")
+    }
 }
 
 /// Render a millisecond interval as a compact human-readable string: sub-second

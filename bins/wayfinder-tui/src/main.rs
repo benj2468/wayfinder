@@ -88,6 +88,7 @@ fn handle_key(app: &mut App, code: KeyCode) {
         KeyCode::Char('2') => app.tab = app::Tab::Routing,
         KeyCode::Char('3') => app.tab = app::Tab::LinkQuality,
         KeyCode::Char('4') => app.tab = app::Tab::OgmSchedule,
+        KeyCode::Char('5') => app.tab = app::Tab::Metrics,
         KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
         KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
         // 'r' just forces the next loop iteration; the timer drives refreshes,
@@ -134,6 +135,8 @@ async fn fetch(conn: &mut Client, app: &mut App) -> anyhow::Result<()> {
     app.snapshot.routing = conn.routing_table().await?;
     app.snapshot.link_quality = conn.link_quality_table().await?;
     app.snapshot.ogm_schedule = conn.ogm_schedule().await?;
+    app.snapshot.throughput = conn.throughput().await?;
+    app.snapshot.metrics = Some(conn.node_metrics().await?);
     Ok(())
 }
 
@@ -157,6 +160,13 @@ fn ensure_selection(app: &mut App) {
     match app.ogm_state.selected() {
         Some(i) if i >= scheds => app.ogm_state.select(scheds.checked_sub(1)),
         None if scheds > 0 => app.ogm_state.select(Some(0)),
+        _ => {}
+    }
+
+    let ifaces = app.snapshot.throughput.interfaces.len();
+    match app.metrics_state.selected() {
+        Some(i) if i >= ifaces => app.metrics_state.select(ifaces.checked_sub(1)),
+        None if ifaces > 0 => app.metrics_state.select(Some(0)),
         _ => {}
     }
 }
