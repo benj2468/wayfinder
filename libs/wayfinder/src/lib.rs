@@ -51,7 +51,12 @@ pub const MCAST_FANOUT: usize = 16;
 /// (the same `iface_idx` used by the link-quality and OGM-schedule tables);
 /// frames on an index at or beyond this bound are still routed correctly but
 /// are not measured.  Sized generously for the small radio meshes this targets.
-pub const MAX_INTERFACES: usize = 8;
+///
+/// Defined as [`batman::MAX_INTERFACES`] rather than a separate literal so the
+/// throughput-tracking bound cannot silently drift away from the bound the
+/// BATMAN engine uses to pace OGM emission: an interface index the engine
+/// schedules an OGM for must be one this router also measures, and vice versa.
+pub const MAX_INTERFACES: usize = batman::MAX_INTERFACES;
 
 /// Capacity of the BATMAN originator (routing) table.  Must be a power of two
 /// (a `heapless` map requirement) and is also the bound on the broadcast-dedup
