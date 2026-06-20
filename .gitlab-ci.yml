@@ -6,26 +6,35 @@ variables:
 workflow:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_REF_PROTECTED == "true"'
-default:
-  cache:
-    key: "$CI_COMMIT_REF_SLUG" # Use a unique key per branch for better isolation
-    paths:
-      - "$CARGO_HOME" # Cache the CARGO_HOME directory
-      - "target/" # Cache the project's target directory
 stages:
   - lint
   - build
   - test
   - deploy
+# Base for jobs that compile the workspace in the rust-ci image we build
+# (build-image). It wires in sccache for compilation caching: SCCACHE_DIR points
+# at the persistent cache mounted on the docker runners, and RUSTC_WRAPPER routes
+# all rustc invocations through it (replaces GitLab's branch cache).
+.base-ci-docker:
+  image: $CI_REGISTRY_IMAGE_TAG
+  tags:
+    - docker
+  variables:
+    SCCACHE_DIR: "/sccache"
+    RUSTC_WRAPPER: "sccache"
 lint:rust:
   stage: lint
   image: rustlang/rust:nightly
+  tags:
+    - docker
   script:
     - rustup component add rustfmt
     - cargo fmt
 lint:nix:
   stage: lint
   image: nixos/nix
+  tags:
+    - docker
   script:
     - nix --extra-experimental-features "nix-command flakes" flake check
 lint:mr-title:
@@ -34,12 +43,16 @@ lint:mr-title:
     name: commitlint/commitlint
     entrypoint:
       - ""
+  tags:
+    - docker
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
   script:
     - echo "$CI_MERGE_REQUEST_TITLE" | commitlint
 lint-done:
   stage: lint
+  tags:
+    - docker
   needs:
     - lint:rust
     - lint:nix
@@ -62,8 +75,8 @@ build-image:
     # 3. Push the newly evaluated/built image back to the registry
     - docker push "$CI_REGISTRY_IMAGE_TAG"
 build:
+  extends: .base-ci-docker
   stage: build
-  image: $CI_REGISTRY_IMAGE_TAG
   needs:
     - lint-done
     - build-image
@@ -72,9 +85,10 @@ build:
     # Lint every target (libs, bins, tests, examples) and fail the build on any
     # warning so clippy findings can't accumulate unnoticed.
     - cargo clippy --workspace --all-targets -- -D warnings
+    - sccache --show-stats
 test:run:rust:
+  extends: .base-ci-docker
   stage: test
-  image: $CI_REGISTRY_IMAGE_TAG
   needs:
     - build
   # GitLab scrapes this regex against job stdout to populate the coverage badge.
@@ -85,6 +99,7 @@ test:run:rust:
     - cargo llvm-cov nextest --profile ci --workspace --cobertura --output-path coverage.xml
     # Text summary to stdout so the `coverage:` regex above can extract the badge number.
     - cargo llvm-cov nextest --profile ci --workspace
+    - sccache --show-stats
   artifacts:
     reports:
       coverage_report:
@@ -94,6 +109,8 @@ test:run:rust:
 test:run:python:
   stage: test
   image: $CI_REGISTRY_IMAGE_TAG
+  tags:
+    - docker
   needs:
     - build
   script:
@@ -103,6 +120,8 @@ test:run:python:
     - runuser -u ci -- python3 -m pytest
 test:run:
   stage: test
+  tags:
+    - docker
   needs:
     - test:run:rust
     - test:run:python
