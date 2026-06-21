@@ -55,11 +55,16 @@ async fn main() -> anyhow::Result<()> {
         None => bail!("config.local_egress must be a TAP for the wayfinder-tap node"),
     };
 
-    let dev = DeviceBuilder::new()
-        .layer(Layer::L2)
-        .name(&tap.device_name)
-        .ipv4(tap.ip_address, tap.netmask, None)
-        .build_async()?;
+    let mut builder = DeviceBuilder::new().layer(Layer::L2).name(&tap.device_name);
+    // The IPv4 address/netmask are optional: when no address is configured the
+    // TAP is brought up unaddressed (the mesh routes on MAC, not IP).
+    if let Some(ip_address) = tap.ip_address {
+        let netmask = tap
+            .netmask
+            .unwrap_or(wayfinder::config::TapConfig::DEFAULT_NETMASK);
+        builder = builder.ipv4(ip_address, netmask, None);
+    }
+    let dev = builder.build_async()?;
 
     let mac_addr = dev.mac_address()?;
     tracing::info!(
