@@ -141,10 +141,27 @@ pub enum ServerConfig {
 pub struct TapConfig {
     /// Name of the kernel TAP device to create.
     pub device_name: String,
-    /// IPv4 address assigned to the device.
-    pub ip_address: Ipv4Addr,
-    /// IPv4 netmask assigned to the device.
-    pub netmask: Ipv4Addr,
+    /// Optional IPv4 address to assign to the device.
+    ///
+    /// When omitted, the TAP is brought up without an IPv4 address — the host
+    /// is left to assign one itself (e.g. via DHCP or a separate `ip addr`
+    /// call), or to operate the interface at L2 only. The mesh itself routes on
+    /// MAC addresses and does not require the TAP to be addressed.
+    #[serde(default)]
+    pub ip_address: Option<Ipv4Addr>,
+    /// Optional IPv4 netmask paired with [`ip_address`](Self::ip_address).
+    ///
+    /// Only meaningful when an `ip_address` is set. Defaults to `255.255.255.0`
+    /// (a /24) when an address is given without an explicit netmask, and is
+    /// ignored when no address is set.
+    #[serde(default)]
+    pub netmask: Option<Ipv4Addr>,
+}
+
+impl TapConfig {
+    /// Default IPv4 netmask applied when an [`ip_address`](Self::ip_address) is
+    /// configured without an explicit [`netmask`](Self::netmask): a /24.
+    pub const DEFAULT_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
 }
 
 /// Configuration for the local host facing Distribution Mechanism
@@ -168,4 +185,63 @@ pub struct Config {
     /// Optional management-API server.
     #[serde(default)]
     pub server: Option<ServerConfig>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A full TAP config (address + netmask) round-trips through YAML.
+    #[test]
+    fn tap_config_with_address_parses() {
+        let yaml = "\
+local_egress:
+  type: Tap
+  device_name: wayfinder0
+  ip_address: 10.0.0.1
+  netmask: 255.255.255.0
+";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let Some(LocalDistributionMechanism::Tap(tap)) = config.local_egress else {
+            panic!("expected a TAP egress");
+        };
+        assert_eq!(tap.ip_address, Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(tap.netmask, Some(Ipv4Addr::new(255, 255, 255, 0)));
+    }
+
+    /// The IP/netmask are optional: a TAP config may omit them entirely.
+    #[test]
+    fn tap_config_without_address_parses() {
+        let yaml = "\
+local_egress:
+  type: Tap
+  device_name: wayfinder0
+";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let Some(LocalDistributionMechanism::Tap(tap)) = config.local_egress else {
+            panic!("expected a TAP egress");
+        };
+        assert_eq!(tap.device_name, "wayfinder0");
+        assert_eq!(tap.ip_address, None);
+        assert_eq!(tap.netmask, None);
+    }
+
+    /// An address may be given without an explicit netmask; the binary falls
+    /// back to [`TapConfig::DEFAULT_NETMASK`] in that case.
+    #[test]
+    fn tap_config_address_without_netmask_parses() {
+        let yaml = "\
+local_egress:
+  type: Tap
+  device_name: wayfinder0
+  ip_address: 10.0.0.1
+";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let Some(LocalDistributionMechanism::Tap(tap)) = config.local_egress else {
+            panic!("expected a TAP egress");
+        };
+        assert_eq!(tap.ip_address, Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(tap.netmask, None);
+        assert_eq!(TapConfig::DEFAULT_NETMASK, Ipv4Addr::new(255, 255, 255, 0));
+    }
 }

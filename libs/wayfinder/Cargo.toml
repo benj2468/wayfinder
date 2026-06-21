@@ -18,6 +18,7 @@ dynosaur.workspace = true
 [dev-dependencies]
 tracing-test = "0.2.6"
 pretty-hex.workspace = true
+serde_yaml = "0.9.34"
 
 
 [features]

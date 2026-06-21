@@ -2396,6 +2396,7 @@ dependencies = [
  "interfaces",
  "pretty-hex",
  "serde",
+ "serde_yaml",
  "thiserror",
  "tracing",
  "tracing-test",
