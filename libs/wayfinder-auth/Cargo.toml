@@ -1,0 +1,22 @@
+[package]
+name = "wayfinder-auth"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+zerocopy = { version = "0.8.48", features = ["derive"] }
+ed25519-dalek = { version = "2.1", default-features = false }
+x25519-dalek = { version = "2.0", default-features = false, features = [
+    "static_secrets",
+] }
+blake2 = { version = "0.10", default-features = false }
+subtle = { version = "2.6", default-features = false }
+getrandom = { version = "0.2", optional = true }
+interfaces.workspace = true
+
+[features]
+default = ["std"]
+# Pulls in the host-only certificate authority (root-key custody, issuing,
+# revocation) and OS-RNG keypair generation.  Leave off for `no_std` embedded
+# nodes, which only verify certs and derive pairwise keys.
+std = ["ed25519-dalek/std", "dep:getrandom"]
