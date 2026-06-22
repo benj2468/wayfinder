@@ -295,6 +295,7 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
         &mut self,
         now: core::time::Duration,
         frame: &'tx LinkFrame,
+        local_quality: Option<u8>,
         reply: &mut LinkFrameDataMut<'rx>,
     ) -> RoutingAction {
         let src = frame.src;
@@ -390,8 +391,16 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
                     // alive; `last_heard_round` tracks the freshest path.
                     record.last_heard_round = round;
 
-                    // Simple path metric attenuation (echoing back path quality drop)
+                    // Attenuate the advertised path TQ by one hop, then clamp it
+                    // by our locally-measured link quality to the relaying
+                    // neighbor: a node cannot make a path look better than the
+                    // physical link we actually observe to it, which blunts an
+                    // attacker advertising an inflated TQ to attract traffic.
                     let computed_tq = ogm.tq.saturating_sub(10);
+                    let computed_tq = match local_quality {
+                        Some(local) => computed_tq.min(local),
+                        None => computed_tq,
+                    };
 
                     // Track path via this specific immediate neighbor, stamping
                     // it with the current round so a neighbor that later goes

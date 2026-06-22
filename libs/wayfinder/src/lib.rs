@@ -329,6 +329,19 @@ impl CentralRouter {
         //    contribute their signal information.
         let quality = normalize_quality(&metrics);
         self.link_quality.update(frame.src, iface_idx, quality);
+        // The smoothed link quality to this neighbor, used to clamp any OGM's
+        // advertised TQ so a node can't claim a path better than the link we
+        // measure to it.  Only meaningful when the frame carried a real
+        // physical measurement: metric-less transports (UDP/Unix/raw L2) report
+        // `LinkMetrics::default`, which normalizes to 0 — clamping by that would
+        // wrongly zero every TQ — so they apply no clamp at all.
+        let measured =
+            metrics.rssi_dbm.is_some() || metrics.snr_db.is_some() || metrics.quality.is_some();
+        let local_quality = if measured {
+            self.link_quality.quality_for(frame.src, iface_idx)
+        } else {
+            None
+        };
 
         // 0b. Account the frame against this interface's ingress rate before any
         //     demux, so even frames the upper layers drop still register as
@@ -343,7 +356,7 @@ impl CentralRouter {
                 let mut reply: LinkFrameDataMut<'_> = tx_buf.into();
 
                 // BATMAN-adv Protocol ID
-                let action = self.batman.handle_rx(now, frame, &mut reply);
+                let action = self.batman.handle_rx(now, frame, local_quality, &mut reply);
                 tracing::debug!(
                     "Post-action reply: dst={:?}, protocol={:?}",
                     reply.dst,
@@ -1282,5 +1295,75 @@ mod node_metrics {
         assert_eq!(router.originator_count(), 1);
         assert_eq!(router.originator_occupancy().0, 1);
         assert_eq!(router.neighbor_count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod tq_clamp_integration {
+    //! The local-TQ clamp wired through [`CentralRouter`]: a measured poor link
+    //! caps an OGM's advertised TQ, but metric-less transports (which report
+    //! [`LinkMetrics::default`]) must apply no clamp — otherwise their
+    //! normalized quality of 0 would wrongly zero every route.
+    use super::*;
+    use batman::wire::{BATADV_IV_OGM, BatmanOgmPacket};
+    use core::time::Duration;
+    use interfaces::frame::{LinkFrame, Mac};
+    use interfaces::link::LinkMetrics;
+    use zerocopy::{FromBytes, IntoBytes};
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    /// One direct OGM from `orig` advertising transmission quality `tq`.
+    fn ogm_frame_bytes(orig: Mac, tq: u8) -> Vec<u8> {
+        let ogm = BatmanOgmPacket {
+            packet_type: BATADV_IV_OGM,
+            version: 5,
+            ttl: 50,
+            flags: 0,
+            seqno: 1u32.to_be(),
+            orig,
+            prev_sender: orig,
+            reserved: 0,
+            tq,
+            tvlv_len: 0,
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(Mac::BROADCAST.as_bytes());
+        out.extend_from_slice(orig.as_bytes());
+        out.extend_from_slice(&DEFAULT_BATMAN_ETHER_TYPE.to_be_bytes());
+        out.extend_from_slice(ogm.as_bytes());
+        out
+    }
+
+    /// Metric-less transports report [`LinkMetrics::default`]; the router must
+    /// not clamp, so the only reduction is the normal one-hop attenuation
+    /// (255 - 10 = 245).  Guards the regression where a normalized-to-0 quality
+    /// zeroed every TQ.
+    #[test]
+    fn metricless_frame_does_not_clamp() {
+        let mut router = CentralRouter::new(mac(1));
+        let bytes = ogm_frame_bytes(mac(2), 255);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 256];
+        router.handle_frame(Duration::ZERO, 0, frame, &mut tx);
+        assert_eq!(router.batman.originator_table[&mac(2)].max_tq, 245);
+    }
+
+    /// A real, poor measured link caps the advertised TQ at that link quality.
+    #[test]
+    fn measured_poor_link_clamps_tq() {
+        let mut router = CentralRouter::new(mac(1));
+        let bytes = ogm_frame_bytes(mac(2), 255);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 256];
+        let metrics = LinkMetrics {
+            rssi_dbm: None,
+            snr_db: None,
+            quality: Some(40),
+        };
+        router.handle_frame_with_metrics(Duration::ZERO, 0, frame, metrics, &mut tx);
+        assert_eq!(router.batman.originator_table[&mac(2)].max_tq, 40);
     }
 }

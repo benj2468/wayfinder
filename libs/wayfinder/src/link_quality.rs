@@ -111,6 +111,17 @@ impl<Ident: MeshIdentifier> LinkQualityTable<Ident> {
             .map(|e| e.iface_idx)
     }
 
+    /// The current EWMA-smoothed quality (0..=255) for `(neighbor,
+    /// iface_idx)`, or `None` if the pair has not been observed.  Used to clamp
+    /// an OGM's advertised TQ by the link we actually measure to the relaying
+    /// neighbor (the `local_quality` argument to `BatmanEngine::handle_rx`).
+    pub fn quality_for(&self, neighbor: Ident, iface_idx: usize) -> Option<u8> {
+        self.entries
+            .iter()
+            .find(|e| e.neighbor == neighbor && e.iface_idx == iface_idx)
+            .map(|e| e.ewma_quality)
+    }
+
     /// Borrow the table as a contiguous slice of records.  Used by
     /// inspection APIs (e.g. the management RPC) that need to expose the
     /// full link-quality snapshot to external callers.
