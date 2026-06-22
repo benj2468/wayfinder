@@ -32,10 +32,17 @@ pub enum RoutingAction {
 pub trait MeshRoutingEngine {
     /// Ingest an incoming frame from the central router.
     /// The engine processes it, updates metrics, and returns the next logical step.
+    ///
+    /// `local_quality` is the caller's locally-measured link quality (0..=255) to
+    /// the neighbor that relayed this frame, or `None` when unmeasured.  An
+    /// engine may use it to bound a sender's advertised path metric by the link
+    /// actually observed to it (see the BATMAN OGM TQ clamp); `None` applies no
+    /// such bound.
     fn handle_rx<'rx, 'tx>(
         &mut self,
         now: Duration,
         frame: &'rx LinkFrame,
+        local_quality: Option<u8>,
         reply: &mut LinkFrameDataMut<'tx>,
     ) -> RoutingAction;
 

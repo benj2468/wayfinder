@@ -159,7 +159,7 @@ mod ogm_processing {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
 
         // Should be consumed (dropped) without creating route
         assert!(matches!(action, RoutingAction::Consumed));
@@ -178,7 +178,7 @@ mod ogm_processing {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
 
         assert!(matches!(action, RoutingAction::Consumed));
         assert_eq!(engine.originator_table.len(), 1);
@@ -203,7 +203,7 @@ mod ogm_processing {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
 
         // Should attenuate by 10
         assert_eq!(engine.originator_table[&mac(2)].max_tq, 245);
@@ -221,7 +221,7 @@ mod ogm_processing {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
 
         // 5 - 10 should saturate to 0, not underflow
         assert_eq!(engine.originator_table[&mac(2)].max_tq, 0);
@@ -239,7 +239,7 @@ mod ogm_processing {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
 
         assert!(matches!(action, RoutingAction::Consumed));
 
@@ -267,7 +267,7 @@ mod ogm_processing {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
 
         // Should learn the route but NOT forward
         assert_eq!(engine.originator_table.len(), 1);
@@ -287,6 +287,7 @@ mod ogm_processing {
         engine.handle_rx(
             core::time::Duration::ZERO,
             parse_link_frame(&frame1),
+            None,
             &mut reply,
         );
 
@@ -296,6 +297,7 @@ mod ogm_processing {
         engine.handle_rx(
             core::time::Duration::ZERO,
             parse_link_frame(&frame2),
+            None,
             &mut reply,
         );
 
@@ -323,6 +325,7 @@ mod ogm_processing {
             engine.handle_rx(
                 core::time::Duration::ZERO,
                 parse_link_frame(&frame),
+                None,
                 &mut reply,
             );
         }
@@ -344,6 +347,7 @@ mod ogm_processing {
         engine.handle_rx(
             core::time::Duration::ZERO,
             parse_link_frame(&frame1),
+            None,
             &mut reply,
         );
 
@@ -355,6 +359,7 @@ mod ogm_processing {
         engine.handle_rx(
             core::time::Duration::ZERO,
             parse_link_frame(&frame2),
+            None,
             &mut reply,
         );
 
@@ -373,6 +378,7 @@ mod ogm_processing {
         engine.handle_rx(
             core::time::Duration::ZERO,
             parse_link_frame(&frame1),
+            None,
             &mut reply,
         );
 
@@ -384,6 +390,7 @@ mod ogm_processing {
         engine.handle_rx(
             core::time::Duration::ZERO,
             parse_link_frame(&frame2),
+            None,
             &mut reply,
         );
 
@@ -406,6 +413,7 @@ mod ogm_processing {
             engine.handle_rx(
                 core::time::Duration::from_secs(i as u64),
                 parse_link_frame(&frame),
+                None,
                 &mut reply,
             );
         }
@@ -421,6 +429,7 @@ mod ogm_processing {
         engine.handle_rx(
             core::time::Duration::from_secs(100),
             parse_link_frame(&frame),
+            None,
             &mut reply,
         );
 
@@ -456,7 +465,7 @@ mod unicast_forwarding {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
 
         assert!(matches!(action, RoutingAction::DeliverLocal));
     }
@@ -473,6 +482,7 @@ mod unicast_forwarding {
         engine.handle_rx(
             core::time::Duration::ZERO,
             parse_link_frame(&frame_ogm),
+            None,
             &mut reply,
         );
 
@@ -481,7 +491,7 @@ mod unicast_forwarding {
         let frame_bytes = make_link_frame(3, 1, ETH_P_BATMAN, unicast_payload);
         let frame = parse_link_frame(&frame_bytes);
 
-        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
 
         // Should be consumed (dropped) due to TTL
         assert!(matches!(action, RoutingAction::Consumed));
@@ -499,6 +509,7 @@ mod unicast_forwarding {
         engine.handle_rx(
             core::time::Duration::ZERO,
             parse_link_frame(&frame_ogm),
+            None,
             &mut reply,
         );
 
@@ -507,7 +518,7 @@ mod unicast_forwarding {
         let frame_bytes = make_link_frame(3, 1, ETH_P_BATMAN, unicast_payload);
         let frame = parse_link_frame(&frame_bytes);
 
-        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
 
         assert!(matches!(action, RoutingAction::Consumed));
 
@@ -533,7 +544,7 @@ mod unicast_forwarding {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
 
         // Should be consumed (dropped) - no route known
         assert!(matches!(action, RoutingAction::Consumed));
@@ -556,6 +567,7 @@ mod routing_lookup {
         engine.handle_rx(
             core::time::Duration::ZERO,
             parse_link_frame(&frame),
+            None,
             &mut reply,
         );
 
@@ -583,6 +595,7 @@ mod routing_lookup {
         engine.handle_rx(
             core::time::Duration::ZERO,
             parse_link_frame(&frame1),
+            None,
             &mut reply,
         );
 
@@ -594,6 +607,7 @@ mod routing_lookup {
         engine.handle_rx(
             core::time::Duration::ZERO,
             parse_link_frame(&frame2),
+            None,
             &mut reply,
         );
 
@@ -617,7 +631,7 @@ mod protocol_filtering {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
 
         assert!(matches!(action, RoutingAction::Consumed));
         assert_eq!(engine.originator_table.len(), 0);
@@ -634,7 +648,7 @@ mod protocol_filtering {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
 
         assert!(matches!(action, RoutingAction::Consumed));
     }
@@ -650,7 +664,7 @@ mod protocol_filtering {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
 
         // Unknown packet type should trigger the default match arm and be consumed (no route known)
         assert!(matches!(action, RoutingAction::Consumed));
@@ -667,7 +681,7 @@ mod protocol_filtering {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
 
         assert!(matches!(action, RoutingAction::Consumed));
         assert_eq!(engine.originator_table.len(), 0);
@@ -691,6 +705,7 @@ mod edge_cases {
             engine.handle_rx(
                 core::time::Duration::ZERO,
                 parse_link_frame(&frame),
+                None,
                 &mut reply,
             );
         }
@@ -714,6 +729,7 @@ mod edge_cases {
             engine.handle_rx(
                 core::time::Duration::ZERO,
                 parse_link_frame(&frame),
+                None,
                 &mut reply,
             );
         }
@@ -737,6 +753,7 @@ mod edge_cases {
         engine.handle_rx(
             core::time::Duration::ZERO,
             parse_link_frame(&frame),
+            None,
             &mut reply,
         );
 
@@ -757,6 +774,7 @@ mod edge_cases {
         engine.handle_rx(
             core::time::Duration::ZERO,
             parse_link_frame(&frame1),
+            None,
             &mut reply,
         );
 
@@ -768,6 +786,7 @@ mod edge_cases {
         engine.handle_rx(
             core::time::Duration::ZERO,
             parse_link_frame(&frame2),
+            None,
             &mut reply,
         );
 
@@ -802,7 +821,7 @@ mod broadcast_processing {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
 
         // Deliver to the local TAP *and* keep the flood going to neighbours.
         // The forward destination is the broadcast address.
@@ -838,7 +857,7 @@ mod broadcast_processing {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
 
         assert!(matches!(action, RoutingAction::Consumed));
         assert_eq!(reply.protocol, 0); // nothing re-flooded
@@ -859,6 +878,7 @@ mod broadcast_processing {
         let first = engine.handle_rx(
             core::time::Duration::ZERO,
             parse_link_frame(&frame_bytes),
+            None,
             &mut reply,
         );
         assert!(matches!(first, RoutingAction::DeliverLocalAndForward(_)));
@@ -870,6 +890,7 @@ mod broadcast_processing {
         let second = engine.handle_rx(
             core::time::Duration::ZERO,
             parse_link_frame(&frame_bytes),
+            None,
             &mut reply2,
         );
         assert!(matches!(second, RoutingAction::Consumed));
@@ -889,7 +910,7 @@ mod broadcast_processing {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
 
         assert!(matches!(action, RoutingAction::DeliverLocal));
         assert_eq!(reply.protocol, 0); // not re-flooded
@@ -983,7 +1004,7 @@ mod ogm_tvlv {
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
 
-        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
         assert!(matches!(action, RoutingAction::Consumed));
         assert_eq!(reply.dst, Mac::BROADCAST);
 
@@ -1118,7 +1139,7 @@ mod mcast_membership {
         let frame = parse_link_frame(&frame_bytes);
         let mut buf = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut buf[..]);
-        engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
 
         assert!(engine.mcast_listeners(g1).any(|m| m == mac(5)));
         assert!(engine.mcast_listeners(g2).any(|m| m == mac(5)));
@@ -1128,7 +1149,7 @@ mod mcast_membership {
         let frame = parse_link_frame(&frame_bytes);
         let mut buf = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut buf[..]);
-        engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
 
         assert!(engine.mcast_listeners(g1).any(|m| m == mac(5)));
         assert!(
@@ -1173,7 +1194,7 @@ mod mcast_packet {
 
         let mut buf = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut buf[..]);
-        let action = engine.handle_rx(core::time::Duration::ZERO, frame, &mut reply);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
 
         assert!(matches!(action, RoutingAction::DeliverLocal));
     }
@@ -1192,6 +1213,7 @@ mod mcast_packet {
         engine.handle_rx(
             core::time::Duration::ZERO,
             parse_link_frame(&frame_ogm),
+            None,
             &mut reply,
         );
 
@@ -1201,6 +1223,7 @@ mod mcast_packet {
         let action = engine.handle_rx(
             core::time::Duration::ZERO,
             parse_link_frame(&frame_bytes),
+            None,
             &mut reply,
         );
 
@@ -1232,7 +1255,7 @@ mod route_expiry {
         let frame = make_link_frame(via, 0xff, ETH_P_BATMAN, ogm);
         let mut buf = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut buf[..]);
-        engine.handle_rx(Duration::ZERO, parse_link_frame(&frame), &mut reply);
+        engine.handle_rx(Duration::ZERO, parse_link_frame(&frame), None, &mut reply);
     }
 
     /// Jump the engine's own OGM round counter to `round`, as if it had emitted
@@ -1344,7 +1367,7 @@ mod adaptive_backoff {
         let frame = make_link_frame(via, 0xff, ETH_P_BATMAN, ogm);
         let mut buf = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut buf[..]);
-        engine.handle_rx(now, parse_link_frame(&frame), &mut reply);
+        engine.handle_rx(now, parse_link_frame(&frame), None, &mut reply);
     }
 
     /// Interfaces configured with different bounds schedule on their own clocks:
@@ -1469,5 +1492,73 @@ mod adaptive_backoff {
             after < I_MIN,
             "a strictly better next hop must reset backoff to i_min, got {after:?}"
         );
+    }
+}
+
+/// The local link-quality clamp on advertised OGM TQ (the `local_quality`
+/// argument to `handle_rx`): a neighbor cannot advertise a path better than the
+/// link we measure to it.
+mod tq_clamp {
+    use super::*;
+
+    /// An OGM advertising a perfect path is capped at our poor measured link to
+    /// the relaying neighbor — the inflated-TQ blackhole defense.
+    #[test]
+    fn clamp_caps_tq_at_local_link_quality() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        let ogm = make_ogm(2, 2, 1, 255, 50);
+        let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
+        let frame = parse_link_frame(&frame_bytes);
+        let mut reply_buffer = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
+
+        engine.handle_rx(core::time::Duration::ZERO, frame, Some(50), &mut reply);
+        assert_eq!(engine.originator_table[&mac(2)].max_tq, 50);
+    }
+
+    /// A strong measured link applies no extra reduction: only the normal
+    /// one-hop attenuation (255 - 10 = 245) remains.
+    #[test]
+    fn no_clamp_when_local_link_is_strong() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        let ogm = make_ogm(2, 2, 1, 255, 50);
+        let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
+        let frame = parse_link_frame(&frame_bytes);
+        let mut reply_buffer = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
+
+        engine.handle_rx(core::time::Duration::ZERO, frame, Some(255), &mut reply);
+        assert_eq!(engine.originator_table[&mac(2)].max_tq, 245);
+    }
+
+    /// The clamp is a floor, never a boost: a measured link better than the
+    /// attenuated advertised TQ leaves the TQ at the attenuated value
+    /// (100 - 10 = 90), not raised toward the link quality.
+    #[test]
+    fn clamp_never_raises_tq() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        let ogm = make_ogm(2, 2, 1, 100, 50);
+        let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
+        let frame = parse_link_frame(&frame_bytes);
+        let mut reply_buffer = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
+
+        engine.handle_rx(core::time::Duration::ZERO, frame, Some(200), &mut reply);
+        assert_eq!(engine.originator_table[&mac(2)].max_tq, 90);
+    }
+
+    /// The plain (un-metered) `handle_rx` applies no clamp, preserving the
+    /// pre-existing behavior for callers that do not measure link quality.
+    #[test]
+    fn unmetered_handle_rx_applies_no_clamp() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        let ogm = make_ogm(2, 2, 1, 255, 50);
+        let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
+        let frame = parse_link_frame(&frame_bytes);
+        let mut reply_buffer = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
+
+        engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
+        assert_eq!(engine.originator_table[&mac(2)].max_tq, 245);
     }
 }
