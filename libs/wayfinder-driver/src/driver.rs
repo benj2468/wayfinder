@@ -19,11 +19,13 @@ use futures::{FutureExt, future::select_all};
 use interfaces::link::LinkMetrics;
 use pretty_hex::pretty_hex;
 use tokio::time::sleep;
+use wayfinder::auth::DIRECTED_TRAILER_LEN;
 use wayfinder::config::TrickleConfig;
 use wayfinder::interfaces::frame::{LinkFrame, LinkFrameData, Mac};
-use wayfinder::{CentralRouter, EgressInterface, McastPlan};
+use wayfinder::{CentralRouter, DEFAULT_BATMAN_ETHER_TYPE, EgressInterface, McastPlan};
 use wayfinder_protos::service::WayfinderService;
 use wayfinder_server::{QueryRx, RouterAdapter};
+use zerocopy::{FromBytes, IntoBytes};
 
 use wayfinder::link::{DynLinkT, LinkT};
 
@@ -430,6 +432,35 @@ fn poll_due_ogms(
     out
 }
 
+/// Verify and strip the pairwise tag trailer from a directed data-plane frame
+/// when auth is enabled, returning the frame to route on: the original frame
+/// (auth off, or a broadcast/OGM), a shorter *view* over the same bytes with the
+/// trailer dropped, or `None` if the frame must be dropped (bad/missing tag from
+/// an unverified or foreign neighbor).
+fn strip_directed<'a>(router: &mut CentralRouter, frame: &'a LinkFrame) -> Option<&'a LinkFrame> {
+    // Only directed (unicast/mcast) frames carry a tag; broadcasts/OGMs (a
+    // multicast dst) are signed, and with auth off nothing is tagged.
+    let Some(auth) = router.auth_mut() else {
+        return Some(frame);
+    };
+    if frame.protocol.get() != DEFAULT_BATMAN_ETHER_TYPE || frame.dst.is_multicast() {
+        return Some(frame);
+    }
+
+    let body_len = frame.payload.len().checked_sub(DIRECTED_TRAILER_LEN)?;
+    let (inner, trailer) = frame.payload.split_at(body_len);
+    if !auth.verify_directed(frame.src, inner, trailer) {
+        return None; // unverified/foreign neighbor or replay — drop
+    }
+
+    // Reinterpret the frame's own bytes minus the trailer — a shorter view over
+    // the same buffer (no copy) — so the engine sees only the real payload and
+    // never forwards or delivers the tag bytes.
+    let full = frame.as_bytes();
+    let strip_len = full.len() - DIRECTED_TRAILER_LEN;
+    LinkFrame::ref_from_bytes(full.get(..strip_len)?).ok()
+}
+
 /// Process one received link-layer frame into a unit of work, folding the
 /// carrier's physical-layer `metrics` into the engine's link-quality table.
 fn handle_mesh_frame(
@@ -440,6 +471,9 @@ fn handle_mesh_frame(
     metrics: LinkMetrics,
     tx_buffer: &mut [u8],
 ) -> LoopOutput {
+    let Some(frame) = strip_directed(router, frame) else {
+        return LoopOutput::none(); // directed frame failed authentication
+    };
     let rx = router.handle_frame_with_metrics(now, idx, frame, metrics, tx_buffer);
     tracing::debug!("decoded as {:?}", rx);
     LoopOutput {
@@ -547,7 +581,7 @@ async fn dispatch<Local: FrameIo>(
     for OutgoingFrame {
         dst,
         protocol,
-        payload,
+        mut payload,
         egress,
     } in output.mesh
     {
@@ -557,6 +591,28 @@ async fn dispatch<Local: FrameIo>(
             protocol,
             payload
         );
+
+        // Authenticate directed data-plane frames (unicast/mcast to a specific
+        // next hop) with a pairwise tag when auth is enabled.  Broadcasts/OGMs
+        // (a multicast dst) are signed instead, so they are skipped here.
+        if protocol == DEFAULT_BATMAN_ETHER_TYPE
+            && !dst.is_multicast()
+            && let Some(auth) = router.auth_mut()
+        {
+            // Grow the payload by the trailer and let `tag_directed` write the
+            // tag straight into the appended bytes (no separate scratch buffer).
+            let body_len = payload.len();
+            payload.resize(body_len + DIRECTED_TRAILER_LEN, 0);
+            let (frame, trailer) = payload.split_at_mut(body_len);
+            if auth.tag_directed(dst, frame, trailer).is_none() {
+                // Auth on but we can't tag this directed frame (no verified key
+                // for dst yet, or counter exhausted): drop it rather than emit it
+                // in the clear.
+                tracing::debug!("auth: dropping untaggable directed frame to {dst:?}");
+                continue;
+            }
+        }
+
         let data = LinkFrameData {
             dst,
             protocol,
