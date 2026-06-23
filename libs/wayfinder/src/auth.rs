@@ -29,7 +29,9 @@
 use batman::wire::{BatmanOgmPacket, BatmanTvlvHdr, WF_TVLV_CERT, WF_TVLV_OGM_SIG, find_tvlv};
 use heapless::Vec as HVec;
 use interfaces::frame::Mac;
-use wayfinder_auth::{Keypair, MembershipCert, TrustAnchor, verify_signature};
+use wayfinder_auth::{
+    Keypair, MembershipCert, TAG_LEN, TrustAnchor, frame_tag, verify_frame_tag, verify_signature,
+};
 use zerocopy::{FromBytes, IntoBytes};
 
 /// Fixed size of the BATMAN OGM header preceding the TVLV tail.
@@ -48,6 +50,11 @@ const SIG_LEN: usize = 64;
 /// Domain-separation prefix bound into the OGM signature so a signature can
 /// never be confused with one over any other message type.
 const SIG_DOMAIN: &[u8] = b"wf-ogm-sig-v1";
+
+/// Length of the directed-frame authentication trailer appended to unicast and
+/// multicast frames when auth is enabled: an 8-byte big-endian replay counter
+/// followed by the 16-byte pairwise tag.
+pub const DIRECTED_TRAILER_LEN: usize = 8 + TAG_LEN;
 
 /// Maximum number of revoked MACs held in the local revocation set.
 const MAX_REVOKED: usize = 32;
@@ -74,6 +81,10 @@ pub struct NeighborKeys {
     pub ed_pubkey: [u8; 32],
     /// Its X25519 key (derives the pairwise data-plane key).
     pub x_pubkey: [u8; 32],
+    /// The symmetric pairwise key shared with this neighbor, derived once (from
+    /// our secret and its `x_pubkey`) when the neighbor is cached, and reused to
+    /// tag/verify directed data-plane frames.
+    pub pairwise_key: [u8; 32],
 }
 
 /// Per-node OGM authentication state, held by the router when auth is enabled.
@@ -98,6 +109,10 @@ pub struct OgmAuth {
     /// Reused scratch buffer for assembling the OGM signed message, so signing
     /// and verifying do not stack-allocate it on every call.
     sign_scratch: [u8; SIGN_SCRATCH_LEN],
+    /// Per-neighbor outgoing replay counter for directed data-plane frames.
+    send_counters: HVec<(Mac, u64), MAX_NEIGHBOR_KEYS>,
+    /// Per-neighbor highest accepted incoming counter (monotonic replay guard).
+    recv_counters: HVec<(Mac, u64), MAX_NEIGHBOR_KEYS>,
 }
 
 impl OgmAuth {
@@ -112,6 +127,8 @@ impl OgmAuth {
             revoked: HVec::new(),
             neighbors: HVec::new(),
             sign_scratch: [0u8; SIGN_SCRATCH_LEN],
+            send_counters: HVec::new(),
+            recv_counters: HVec::new(),
         }
     }
 
@@ -145,6 +162,99 @@ impl OgmAuth {
             .iter()
             .find(|n| n.mac == mac)
             .map(|n| n.x_pubkey)
+    }
+
+    /// Authenticate a directed (unicast/mcast) frame addressed to next-hop
+    /// `dst`: take the next per-neighbor counter and write the trailer
+    /// `[counter:u64 BE][tag:16]` into `trailer`, returning its length.  `frame`
+    /// is the batman payload the tag covers.  Returns `None` (and the caller must
+    /// not send the frame) if we have no verified pairwise key for `dst` (no OGM
+    /// accepted from it yet), the trailer is too small, or no counter can be
+    /// allocated — never emit an untagged or counter-reused directed frame.
+    ///
+    /// Our own MAC is bound into the tag as the sender context so the frame
+    /// cannot be reflected back to us as if it came from `dst` (the pairwise key
+    /// is symmetric — see [`frame_tag`](wayfinder_auth::frame_tag)).
+    pub fn tag_directed(&mut self, dst: Mac, frame: &[u8], trailer: &mut [u8]) -> Option<usize> {
+        if trailer.len() < DIRECTED_TRAILER_LEN {
+            return None;
+        }
+        let key = self
+            .neighbors
+            .iter()
+            .find(|n| n.mac == dst)
+            .map(|n| n.pairwise_key)?;
+        let src_mac = self.cert.node_mac;
+        let counter = self.next_send_counter(dst)?;
+        let tag = frame_tag(&key, counter, &src_mac, frame);
+        trailer[..8].copy_from_slice(&counter.to_be_bytes());
+        trailer[8..DIRECTED_TRAILER_LEN].copy_from_slice(&tag);
+        Some(DIRECTED_TRAILER_LEN)
+    }
+
+    /// Verify a directed frame's `trailer` from neighbor `src`: check the
+    /// pairwise tag over `frame` and that the counter is strictly newer than the
+    /// last accepted from `src` (replay defense), updating it on success.
+    /// Returns `false` (drop) if we have no key for `src`, the trailer is
+    /// malformed, the tag is invalid, or the counter is a replay.
+    pub fn verify_directed(&mut self, src: Mac, frame: &[u8], trailer: &[u8]) -> bool {
+        if trailer.len() != DIRECTED_TRAILER_LEN {
+            tracing::trace!("auth: dropping directed frame with malformed tag trailer");
+            return false;
+        }
+        let Some(key) = self
+            .neighbors
+            .iter()
+            .find(|n| n.mac == src)
+            .map(|n| n.pairwise_key)
+        else {
+            tracing::trace!("auth: dropping directed frame from an unverified neighbor");
+            return false;
+        };
+        let mut counter_bytes = [0u8; 8];
+        counter_bytes.copy_from_slice(&trailer[..8]);
+        let counter = u64::from_be_bytes(counter_bytes);
+        let mut tag = [0u8; TAG_LEN];
+        tag.copy_from_slice(&trailer[8..DIRECTED_TRAILER_LEN]);
+        // The sender's MAC is the bound context, so a frame this node authored
+        // cannot be reflected back to it as if from `src`.
+        if !verify_frame_tag(&key, counter, &src.0, frame, &tag) {
+            tracing::trace!("auth: dropping directed frame with an invalid tag");
+            return false;
+        }
+        if !self.accept_recv_counter(src, counter) {
+            tracing::trace!("auth: dropping directed frame with a replayed/stale counter");
+            return false;
+        }
+        true
+    }
+
+    /// Allocate the next outgoing directed-frame counter for `dst` (starting at
+    /// 1).  Fails closed — returns `None` rather than reusing a counter — if the
+    /// table is full ([`MAX_NEIGHBOR_KEYS`] neighbors) or the counter would wrap,
+    /// since a `(key, counter)` reuse with the static pairwise key would make
+    /// tags replayable.
+    fn next_send_counter(&mut self, dst: Mac) -> Option<u64> {
+        if let Some(e) = self.send_counters.iter_mut().find(|(m, _)| *m == dst) {
+            e.1 = e.1.checked_add(1)?;
+            return Some(e.1);
+        }
+        self.send_counters.push((dst, 1)).ok()?;
+        Some(1)
+    }
+
+    /// Accept `counter` from `src` only if strictly newer than the last accepted
+    /// (monotonic replay guard), recording it on success.  The first frame from
+    /// a neighbor is accepted and recorded.
+    fn accept_recv_counter(&mut self, src: Mac, counter: u64) -> bool {
+        if let Some(e) = self.recv_counters.iter_mut().find(|(m, _)| *m == src) {
+            if counter <= e.1 {
+                return false;
+            }
+            e.1 = counter;
+            return true;
+        }
+        self.recv_counters.push((src, counter)).is_ok()
     }
 
     /// Build the canonical signed message for an OGM: a domain prefix followed
@@ -310,10 +420,12 @@ impl OgmAuth {
             return false;
         }
 
+        let pairwise_key = self.keypair.pairwise_key(&verified.x_pubkey);
         self.cache_neighbor(NeighborKeys {
             mac: Mac(orig),
             ed_pubkey,
             x_pubkey: verified.x_pubkey,
+            pairwise_key,
         });
         true
     }
@@ -483,6 +595,123 @@ mod tests {
         assert_eq!(
             find_tvlv(&buf[OGM_HDR..len], batman::wire::BATADV_TVLV_MCAST),
             Some(&[1, 2, 3, 4][..])
+        );
+    }
+
+    /// Exchange OGMs both ways so `a` and `b` each cache the other's verified
+    /// pairwise key (a precondition for tagging/verifying directed frames).
+    fn mutual_verify(a: &mut OgmAuth, a_mac: Mac, b: &mut OgmAuth, b_mac: Mac) {
+        let (mut buf, len) = bare_ogm(a_mac, 1);
+        let len = a.augment_ogm(&mut buf, len).unwrap();
+        assert!(b.verify_ogm(&buf[..len]));
+        let (mut buf, len) = bare_ogm(b_mac, 1);
+        let len = b.augment_ogm(&mut buf, len).unwrap();
+        assert!(a.verify_ogm(&buf[..len]));
+    }
+
+    /// A directed frame tagged for a verified neighbor verifies on the other end
+    /// (the no-handshake pairwise key agreement carries through).
+    #[test]
+    fn directed_tag_roundtrips() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+
+        let frame = b"dst|src|proto|unicast payload";
+        let mut trailer = [0u8; DIRECTED_TRAILER_LEN];
+        let n = a.tag_directed(mac(3), frame, &mut trailer).expect("tag");
+        assert_eq!(n, DIRECTED_TRAILER_LEN);
+        assert!(b.verify_directed(mac(2), frame, &trailer));
+    }
+
+    /// A tampered directed frame fails the tag check.
+    #[test]
+    fn directed_tampered_frame_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+
+        let mut trailer = [0u8; DIRECTED_TRAILER_LEN];
+        a.tag_directed(mac(3), b"original frame", &mut trailer)
+            .unwrap();
+        assert!(!b.verify_directed(mac(2), b"tampered frame", &trailer));
+    }
+
+    /// Replaying a directed frame with the same counter is rejected.
+    #[test]
+    fn directed_replay_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+
+        let frame = b"unicast payload";
+        let mut trailer = [0u8; DIRECTED_TRAILER_LEN];
+        a.tag_directed(mac(3), frame, &mut trailer).unwrap();
+        assert!(b.verify_directed(mac(2), frame, &trailer));
+        assert!(
+            !b.verify_directed(mac(2), frame, &trailer),
+            "a replayed counter must be rejected"
+        );
+    }
+
+    /// An out-of-order (stale-counter) directed frame is rejected once a newer
+    /// counter has been accepted.
+    #[test]
+    fn directed_stale_counter_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+
+        let frame = b"payload";
+        let mut t1 = [0u8; DIRECTED_TRAILER_LEN];
+        let mut t2 = [0u8; DIRECTED_TRAILER_LEN];
+        a.tag_directed(mac(3), frame, &mut t1).unwrap(); // counter 1
+        a.tag_directed(mac(3), frame, &mut t2).unwrap(); // counter 2
+        assert!(b.verify_directed(mac(2), frame, &t2)); // accept the newer one
+        assert!(
+            !b.verify_directed(mac(2), frame, &t1),
+            "an older counter is stale once a newer one is accepted"
+        );
+    }
+
+    /// Tagging for or verifying from a node we have not verified an OGM from is
+    /// refused — no pairwise key exists.
+    #[test]
+    fn directed_unverified_neighbor_refused() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        // No OGM exchange: neither has the other's key.
+
+        let frame = b"payload";
+        let mut trailer = [0u8; DIRECTED_TRAILER_LEN];
+        assert!(a.tag_directed(mac(3), frame, &mut trailer).is_none());
+        assert!(!b.verify_directed(mac(2), frame, &trailer));
+    }
+
+    /// A frame A authored for B cannot be reflected back to A as if it came from
+    /// B, even though the pairwise key is symmetric — the sender MAC is bound
+    /// into the tag.
+    #[test]
+    fn directed_frame_cannot_be_reflected_to_sender() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+
+        let frame = b"payload";
+        let mut trailer = [0u8; DIRECTED_TRAILER_LEN];
+        // A tags a frame for B (sender context = A).
+        a.tag_directed(mac(3), frame, &mut trailer).unwrap();
+        // Reflect that exact frame back to A claiming it came from B: rejected,
+        // because A recomputes the tag with B as the sender context.
+        assert!(
+            !a.verify_directed(mac(3), frame, &trailer),
+            "an A->B frame must not verify as a B->A frame"
         );
     }
 }

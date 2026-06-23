@@ -329,6 +329,60 @@ async fn test_simple_pair_send_data() {
     );
 }
 
+/// Enable opt-in mesh authentication on `node` for `ident`, with a cert minted
+/// by `authority`, and pin the auth clock so certs are within their window.
+fn enable_auth(node: &mut TestRouter, authority: &wayfinder_auth::Authority, ident: Mac, seed: u8) {
+    let kp = wayfinder_auth::Keypair::from_seed(&[seed; 32]);
+    let cert = authority.issue_cert(ident, kp.ed_pubkey(), kp.x_pubkey(), 0, 1_000_000);
+    node.router_mut().set_auth(wayfinder::auth::OgmAuth::new(
+        kp,
+        cert,
+        authority.trust_anchor(),
+    ));
+    node.driver().set_auth_epoch_unix(1_000);
+}
+
+/// With auth enabled on both nodes, OGMs converge (signed) and a unicast is
+/// delivered with its pairwise tag verified and stripped — the host gets the
+/// clean payload, proving the directed data-plane tag wiring end to end.
+#[tokio::test]
+async fn test_authenticated_unicast_delivers_and_strips_tag() {
+    setup();
+    let mut harness = simple_pair();
+
+    let m1 = harness.get_machine("machine1").ident;
+    let m2 = harness.get_machine("machine2").ident;
+
+    let authority = wayfinder_auth::Authority::from_seed(&[1; 32], 0xABCD);
+    enable_auth(harness.get_machine_mut("machine1"), &authority, m1, 2);
+    enable_auth(harness.get_machine_mut("machine2"), &authority, m2, 3);
+
+    // Converge: signed OGMs exchange, so each node learns the other's pairwise
+    // key (required to tag/verify directed frames).
+    harness.poll(Duration::from_secs(1)).await;
+    harness.tick().await;
+    harness.tick().await;
+    for router in harness.machines.values() {
+        assert_eq!(router.router().originator_table().count(), 1);
+    }
+
+    harness
+        .get_machine_mut("machine1")
+        .send_local(m2, b"secret payload")
+        .await
+        .unwrap();
+
+    harness.tick().await;
+    harness.tick().await;
+
+    // Delivered payload is the original — the 24-byte tag trailer was verified
+    // and stripped, not handed to the host.
+    assert_eq!(
+        harness.get_machine("machine2").local_deliveries(),
+        vec![host_frame(m2, m1, b"secret payload")]
+    );
+}
+
 #[tokio::test]
 async fn test_line_of_three() {
     line_of_three();

@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 wayfinder.workspace = true
 wayfinder-driver.workspace = true
+# The std certificate authority, to mint certs for authenticated-mesh tests.
+wayfinder-auth = { workspace = true, features = ["std"] }
 interfaces.workspace = true
 
 thiserror.workspace = true
