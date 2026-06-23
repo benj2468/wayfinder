@@ -5,12 +5,13 @@ extern crate alloc;
 
 pub use batman;
 pub use interfaces;
+pub use wayfinder_auth;
 
 use batman::{
     BatmanEngine,
     wire::{
-        BATADV_BCAST, BATADV_MCAST, BATADV_UNICAST, BatmanBroadcastPacket, BatmanMcastPacket,
-        BatmanUnicastPacket, ETH_P_BATMAN,
+        BATADV_BCAST, BATADV_IV_OGM, BATADV_MCAST, BATADV_UNICAST, BatmanBroadcastPacket,
+        BatmanMcastPacket, BatmanUnicastPacket, ETH_P_BATMAN,
     },
 };
 use core::time::Duration;
@@ -24,6 +25,7 @@ use tracing::warn;
 use zerocopy::IntoBytes;
 
 use crate::{
+    auth::OgmAuth,
     link_quality::{LinkQualityTable, normalize_quality},
     routing_table::IdentTable,
 };
@@ -33,6 +35,7 @@ pub use crate::link_quality::LinkQualityRecord;
 #[cfg(feature = "alloc")]
 pub mod config;
 
+pub mod auth;
 pub mod link;
 
 mod link_quality;
@@ -270,6 +273,11 @@ pub struct CentralRouter {
     ///
     /// [`interface_throughput`]: CentralRouter::interface_throughput
     iface_count: usize,
+    /// Opt-in OGM authentication state.  `None` (the default) leaves the router
+    /// in its open, pre-auth behavior.  When `Some`, the router signs the OGMs
+    /// it emits and drops incoming OGMs that do not verify against the mesh
+    /// trust anchor — segregating this mesh from others sharing the medium.
+    auth: Option<OgmAuth>,
 }
 
 impl CentralRouter {
@@ -281,7 +289,27 @@ impl CentralRouter {
             rx_rates: [RateEstimator::default(); MAX_INTERFACES],
             tx_rates: [RateEstimator::default(); MAX_INTERFACES],
             iface_count: 0,
+            auth: None,
         }
+    }
+
+    /// Enable opt-in mesh authentication with the given [`OgmAuth`] state: the
+    /// router will sign its emitted OGMs and reject incoming OGMs that do not
+    /// verify against the mesh trust anchor.  Without this the router stays in
+    /// its open, unauthenticated mode.
+    pub fn set_auth(&mut self, auth: OgmAuth) {
+        self.auth = Some(auth);
+    }
+
+    /// Borrow the OGM authentication state, if enabled — for the security view
+    /// and for driver-side upkeep (refreshing the clock, recording revocations).
+    pub fn auth(&self) -> Option<&OgmAuth> {
+        self.auth.as_ref()
+    }
+
+    /// Mutably borrow the OGM authentication state, if enabled.
+    pub fn auth_mut(&mut self) -> Option<&mut OgmAuth> {
+        self.auth.as_mut()
     }
     /// Process a received link-layer frame without any physical-layer
     /// metrics — equivalent to calling [`handle_frame_with_metrics`] with
@@ -353,6 +381,22 @@ impl CentralRouter {
         // 2. Demux by Protocol ID
         match frame.protocol.get() {
             DEFAULT_BATMAN_ETHER_TYPE => {
+                // Opt-in control-plane segregation: when auth is enabled, an OGM
+                // that does not verify against our trust anchor is dropped before
+                // it can touch the routing table.  Only OGMs are gated here (the
+                // one-to-many control plane).  Data-plane frames (BCAST/UNICAST/
+                // MCAST) are NOT authenticated yet — an outsider can still inject
+                // them until the pairwise data-plane tag lands; see auth.rs scope.
+                if frame.payload.first() == Some(&BATADV_IV_OGM)
+                    && let Some(auth) = self.auth.as_mut()
+                    && !auth.verify_ogm(&frame.payload)
+                {
+                    return RxOutcome {
+                        forward: None,
+                        deliver_local: None,
+                    };
+                }
+
                 let mut reply: LinkFrameDataMut<'_> = tx_buf.into();
 
                 // BATMAN-adv Protocol ID
@@ -517,14 +561,25 @@ impl CentralRouter {
     ) -> Option<LinkFrameData<'tx>> {
         // 3. Handle BATMAN outgoing maintenance ticks
         let broadcast = Mac::BROADCAST;
-        if let Some(ogm_payload) = self.batman.produce_periodic_broadcast(now, tx_buf) {
-            let ogm = LinkFrameData {
-                dst: broadcast,
-                protocol: DEFAULT_BATMAN_ETHER_TYPE,
-                payload: ogm_payload,
+        // Take only the produced length so the borrow of `tx_buf` ends and we can
+        // re-borrow it mutably to append the auth TVLVs below.
+        let produced = self
+            .batman
+            .produce_periodic_broadcast(now, tx_buf)
+            .map(|p| p.len());
+        if let Some(len) = produced {
+            // When auth is enabled, append our cert + OGM signature so peers can
+            // verify this OGM; the engine already wrote the base OGM into tx_buf.
+            let final_len = match self.auth.as_mut() {
+                Some(auth) => auth.augment_ogm(tx_buf, len).unwrap_or(len),
+                None => len,
             };
             // Flood the OGM out of every radio interface to map the surrounding topology
-            return Some(ogm);
+            return Some(LinkFrameData {
+                dst: broadcast,
+                protocol: DEFAULT_BATMAN_ETHER_TYPE,
+                payload: &tx_buf[..final_len],
+            });
         }
         None
     }
@@ -1365,5 +1420,111 @@ mod tq_clamp_integration {
         };
         router.handle_frame_with_metrics(Duration::ZERO, 0, frame, metrics, &mut tx);
         assert_eq!(router.batman.originator_table[&mac(2)].max_tq, 40);
+    }
+}
+
+#[cfg(test)]
+mod ogm_auth_integration {
+    //! End-to-end opt-in OGM auth through `CentralRouter`: a signed OGM is
+    //! accepted by a same-mesh peer, an unsigned or foreign-mesh OGM is dropped
+    //! when auth is on, and the unauthenticated mode is unchanged.
+    use super::*;
+    use core::time::Duration;
+    use interfaces::frame::{LinkFrame, Mac};
+    use wayfinder_auth::{Authority, Keypair};
+    use zerocopy::FromBytes;
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    /// A router for node `m` with auth enabled against `authority`'s mesh.
+    fn router_with_auth(authority: &Authority, m: Mac, seed: u8) -> CentralRouter {
+        let kp = Keypair::from_seed(&[seed; 32]);
+        let cert = authority.issue_cert(m, kp.ed_pubkey(), kp.x_pubkey(), 0, 1000);
+        let mut r = CentralRouter::new(m);
+        let mut auth = crate::auth::OgmAuth::new(kp, cert, authority.trust_anchor());
+        auth.set_time(100);
+        r.set_auth(auth);
+        r
+    }
+
+    /// Drive one OGM out of `r` and return its serialized payload.
+    fn poll_ogm_bytes(r: &mut CentralRouter) -> Vec<u8> {
+        let mut tx = [0u8; 1500];
+        let out = r.poll(Duration::ZERO, &mut tx).expect("ogm produced");
+        out.payload.to_vec()
+    }
+
+    /// Wrap an OGM payload in a broadcast LinkFrame from `src`.
+    fn link_frame(src: Mac, ogm: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(Mac::BROADCAST.as_bytes());
+        v.extend_from_slice(src.as_bytes());
+        v.extend_from_slice(&DEFAULT_BATMAN_ETHER_TYPE.to_be_bytes());
+        v.extend_from_slice(ogm);
+        v
+    }
+
+    /// Feed `ogm` (from `src`) into `b` and report how many originators it learned.
+    fn feed(b: &mut CentralRouter, src: Mac, ogm: &[u8]) -> usize {
+        let bytes = link_frame(src, ogm);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 1500];
+        b.handle_frame(Duration::ZERO, 0, frame, &mut tx);
+        b.originator_count()
+    }
+
+    /// A signed OGM is accepted by a peer on the same mesh.
+    #[test]
+    fn signed_ogm_accepted_by_same_mesh() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = router_with_auth(&authority, mac(1), 2);
+        let ogm = poll_ogm_bytes(&mut a);
+        let mut b = router_with_auth(&authority, mac(2), 3);
+        assert_eq!(feed(&mut b, mac(1), &ogm), 1);
+    }
+
+    /// An unsigned OGM (from a node not running auth) is dropped under auth.
+    #[test]
+    fn unsigned_ogm_dropped_when_auth_enabled() {
+        let mut plain = CentralRouter::new(mac(1));
+        let ogm = poll_ogm_bytes(&mut plain);
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = router_with_auth(&authority, mac(2), 3);
+        assert_eq!(
+            feed(&mut b, mac(1), &ogm),
+            0,
+            "unsigned OGM must be dropped under auth"
+        );
+    }
+
+    /// An OGM signed for another mesh (different trust anchor) is dropped — the
+    /// segregation property end to end.
+    #[test]
+    fn foreign_mesh_ogm_dropped() {
+        let theirs = Authority::from_seed(&[9; 32], 0xABCD);
+        let mut foreign = router_with_auth(&theirs, mac(1), 2);
+        let ogm = poll_ogm_bytes(&mut foreign);
+        let ours = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = router_with_auth(&ours, mac(2), 3);
+        assert_eq!(
+            feed(&mut b, mac(1), &ogm),
+            0,
+            "foreign-mesh OGM must be dropped"
+        );
+    }
+
+    /// With auth disabled the router accepts unsigned OGMs exactly as before.
+    #[test]
+    fn auth_disabled_accepts_unsigned() {
+        let mut plain_a = CentralRouter::new(mac(1));
+        let ogm = poll_ogm_bytes(&mut plain_a);
+        let mut b = CentralRouter::new(mac(2));
+        assert_eq!(
+            feed(&mut b, mac(1), &ogm),
+            1,
+            "unauthenticated mode must be unchanged"
+        );
     }
 }

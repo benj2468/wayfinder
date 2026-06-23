@@ -54,6 +54,39 @@ def ogm_frame(**ogm_kwargs) -> bytes:
     return ethernet(BROADCAST, NODE1, ETH_P_BATMAN, batman_ogm(**ogm_kwargs))
 
 
+# TVLV record type bytes (libs/batman/src/wire.rs).
+WF_TVLV_CERT = 0x80
+WF_TVLV_OGM_SIG = 0x81
+
+
+def tvlv(tvlv_type: int, value: bytes, version: int = 1) -> bytes:
+    """Serialize one TVLV record: ``[type][version][len BE][value]``."""
+    return struct.pack(">BBH", tvlv_type, version, len(value)) + value
+
+
+def membership_cert(
+    *,
+    mesh_id: int = 0xABCD,
+    node_mac: bytes = NODE1,
+    ed_pubkey: bytes = bytes(range(32)),
+    x_pubkey: bytes = bytes(range(32, 64)),
+    not_before: int = 100,
+    not_after: int = 200,
+    signature: bytes = b"\x11" * 64,
+) -> bytes:
+    """A synthetic 156-byte ``MembershipCert`` (layout only; not a real signature)."""
+    return (
+        struct.pack(">BB", 1, 0)  # version, flags
+        + struct.pack(">I", mesh_id)
+        + node_mac
+        + ed_pubkey
+        + x_pubkey
+        + struct.pack(">Q", not_before)
+        + struct.pack(">Q", not_after)
+        + signature
+    )
+
+
 # field name -> expected decoded value for the default OGM above (with a
 # 4-byte 0xdeadbeef TVLV tail).
 EXPECTED_FIELDS = {
@@ -88,3 +121,44 @@ def test_ogm_without_tvlv_has_zero_len(dissect):
     )
     assert result["wayfinder.batman.ogm.tvlv_len"] == "0"
     assert result["wayfinder.batman.ogm.seqno"] == "7"
+
+
+# Expected decoded cert fields for the synthetic membership_cert() above.
+EXPECTED_CERT_FIELDS = {
+    "wayfinder.batman.tvlv.type": "0x80",
+    "wayfinder.batman.tvlv.cert.version": "1",
+    "wayfinder.batman.tvlv.cert.mesh_id": "0x0000abcd",
+    "wayfinder.batman.tvlv.cert.node_mac": "02:00:00:00:00:01",
+    "wayfinder.batman.tvlv.cert.not_before": "100",
+    "wayfinder.batman.tvlv.cert.not_after": "200",
+}
+
+
+@pytest.mark.parametrize("field,expected", list(EXPECTED_CERT_FIELDS.items()))
+def test_cert_tvlv_decodes(dissect, field, expected):
+    """A WF_TVLV_CERT record decodes into its membership-certificate fields."""
+    frame = ogm_frame(tvlv=tvlv(WF_TVLV_CERT, membership_cert()))
+    result = dissect(frame, [field])
+    assert result[field] == expected
+
+
+def test_ogm_signature_tvlv_decodes(dissect):
+    """A WF_TVLV_OGM_SIG record surfaces the 64-byte signature."""
+    sig = bytes(range(64))
+    frame = ogm_frame(tvlv=tvlv(WF_TVLV_OGM_SIG, sig))
+    result = dissect(frame, ["wayfinder.batman.tvlv.ogm_sig"])
+    assert result["wayfinder.batman.tvlv.ogm_sig"] == sig.hex()
+
+
+def test_walk_handles_cert_then_signature(dissect):
+    """Cert and signature records in one tail are both decoded (record walk)."""
+    tail = tvlv(WF_TVLV_CERT, membership_cert(mesh_id=0x1234)) + tvlv(
+        WF_TVLV_OGM_SIG, b"\x22" * 64
+    )
+    frame = ogm_frame(tvlv=tail)
+    result = dissect(
+        frame,
+        ["wayfinder.batman.tvlv.cert.mesh_id", "wayfinder.batman.tvlv.ogm_sig"],
+    )
+    assert result["wayfinder.batman.tvlv.cert.mesh_id"] == "0x00001234"
+    assert result["wayfinder.batman.tvlv.ogm_sig"] == ("22" * 64)

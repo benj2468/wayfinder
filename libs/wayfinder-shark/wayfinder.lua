@@ -5,8 +5,10 @@
 -- parses the dst/src/type for us. We register on the `ethertype` table for
 -- 0x4305 (ETH_P_BATMAN) and dissect the BATMAN body that `eth` hands us.
 --
--- This first cut decodes the BatmanOgmPacket fixed header (see
--- libs/batman/src/wire.rs); the TVLV tail is shown as raw bytes.
+-- Decodes the BatmanOgmPacket fixed header (see libs/batman/src/wire.rs) and
+-- walks the TVLV tail into individual records: multicast membership, the
+-- Wayfinder membership certificate (WF_TVLV_CERT), and the OGM signature
+-- (WF_TVLV_OGM_SIG).  The whole tail is also shown as a raw byte blob.
 --
 -- Install: copy (or symlink) this file into your Personal Lua Plugins folder
 --   (Help -> About -> Folders, e.g. ~/.local/lib/wireshark/plugins), or load it
@@ -21,6 +23,16 @@ local PACKET_TYPES = {
 	[0x02] = "Broadcast",
 	[0x03] = "Unicast",
 	[0x04] = "Multicast",
+}
+
+-- TVLV record type bytes carried in an OGM tail (libs/batman/src/wire.rs).
+local BATADV_TVLV_MCAST = 0x06
+local WF_TVLV_CERT = 0x80
+local WF_TVLV_OGM_SIG = 0x81
+local TVLV_TYPES = {
+	[BATADV_TVLV_MCAST] = "Multicast Membership",
+	[WF_TVLV_CERT] = "Membership Certificate",
+	[WF_TVLV_OGM_SIG] = "OGM Signature",
 }
 
 local wayfinder = Proto("wayfinder", "Wayfinder Mesh Protocol")
@@ -40,6 +52,30 @@ f.tq = ProtoField.uint8("wayfinder.batman.ogm.tq", "Transmission Quality", base.
 f.tvlv_len = ProtoField.uint16("wayfinder.batman.ogm.tvlv_len", "TVLV Length", base.DEC)
 f.tvlv = ProtoField.bytes("wayfinder.batman.ogm.tvlv", "TVLV Data")
 
+-- Per-record TVLV fields (the tail walked into individual records).
+f.tvlv_record = ProtoField.bytes("wayfinder.batman.tvlv.record", "TVLV Record")
+f.tvlv_type = ProtoField.uint8("wayfinder.batman.tvlv.type", "TVLV Type", base.HEX, TVLV_TYPES)
+f.tvlv_ver = ProtoField.uint8("wayfinder.batman.tvlv.version", "TVLV Version", base.DEC)
+f.tvlv_vlen = ProtoField.uint16("wayfinder.batman.tvlv.len", "TVLV Value Length", base.DEC)
+f.tvlv_value = ProtoField.bytes("wayfinder.batman.tvlv.value", "TVLV Value")
+
+-- Multicast membership announcement: a back-to-back list of group MACs.
+f.mcast_group = ProtoField.ether("wayfinder.batman.tvlv.mcast_group", "Multicast Group")
+
+-- Membership certificate fields (wayfinder_auth::MembershipCert; see
+-- libs/wayfinder-auth/src/cert.rs).
+f.cert_version = ProtoField.uint8("wayfinder.batman.tvlv.cert.version", "Cert Version", base.DEC)
+f.cert_mesh = ProtoField.uint32("wayfinder.batman.tvlv.cert.mesh_id", "Mesh ID", base.HEX)
+f.cert_mac = ProtoField.ether("wayfinder.batman.tvlv.cert.node_mac", "Node MAC")
+f.cert_ed = ProtoField.bytes("wayfinder.batman.tvlv.cert.ed_pubkey", "Ed25519 Public Key")
+f.cert_x = ProtoField.bytes("wayfinder.batman.tvlv.cert.x_pubkey", "X25519 Public Key")
+f.cert_nb = ProtoField.uint64("wayfinder.batman.tvlv.cert.not_before", "Not Before", base.DEC)
+f.cert_na = ProtoField.uint64("wayfinder.batman.tvlv.cert.not_after", "Not After", base.DEC)
+f.cert_sig = ProtoField.bytes("wayfinder.batman.tvlv.cert.signature", "Root Signature")
+
+-- The originator's Ed25519 signature over the OGM's immutable identity.
+f.ogm_sig = ProtoField.bytes("wayfinder.batman.tvlv.ogm_sig", "OGM Signature")
+
 -- Offsets of the fixed BatmanOgmPacket fields within the BATMAN body. Kept in
 -- sync with libs/batman/src/wire.rs.
 local OGM = {
@@ -55,6 +91,77 @@ local OGM = {
 	TVLV_LEN = 22, -- u16, big-endian
 	HEADER_LEN = 24,
 }
+
+-- Field offsets within a MembershipCert value (libs/wayfinder-auth/src/cert.rs).
+local CERT = {
+	VERSION = 0,
+	FLAGS = 1,
+	MESH_ID = 2, -- u32, big-endian
+	NODE_MAC = 6, -- 6 bytes
+	ED_PUBKEY = 12, -- 32 bytes
+	X_PUBKEY = 44, -- 32 bytes
+	NOT_BEFORE = 76, -- u64, big-endian
+	NOT_AFTER = 84, -- u64, big-endian
+	SIGNATURE = 92, -- 64 bytes
+	LEN = 156,
+}
+
+-- Decode one membership-certificate TVLV value into `rec` (the record subtree).
+local function decode_cert(rec, tvb, voff, vlen, cap_end)
+	if voff + CERT.LEN > cap_end or vlen < CERT.LEN then
+		return -- truncated capture or short value; leave as raw value below
+	end
+	rec:add(f.cert_version, tvb(voff + CERT.VERSION, 1))
+	rec:add(f.cert_mesh, tvb(voff + CERT.MESH_ID, 4))
+	rec:add(f.cert_mac, tvb(voff + CERT.NODE_MAC, 6))
+	rec:add(f.cert_ed, tvb(voff + CERT.ED_PUBKEY, 32))
+	rec:add(f.cert_x, tvb(voff + CERT.X_PUBKEY, 32))
+	rec:add(f.cert_nb, tvb(voff + CERT.NOT_BEFORE, 8))
+	rec:add(f.cert_na, tvb(voff + CERT.NOT_AFTER, 8))
+	rec:add(f.cert_sig, tvb(voff + CERT.SIGNATURE, 64))
+end
+
+-- Walk the TVLV tail into one subtree per record, decoding known types. Bounds
+-- are clamped to `cap_end` (what the capture actually holds) so a truncated or
+-- malformed tail degrades gracefully rather than erroring.
+local function walk_tvlv(tree, tvb, start, tvlv_len, cap_end)
+	local records = tree:add(tvb(start, math.min(start + tvlv_len, cap_end) - start), "TVLV Records")
+	local off = start
+	local tail_end = start + tvlv_len
+	while off + 4 <= tail_end and off + 4 <= cap_end do
+		local ttype = tvb(off, 1):uint()
+		local vlen = tvb(off + 2, 2):uint()
+		local voff = off + 4
+		local rec_end = voff + vlen
+		local shown_end = math.min(rec_end, cap_end)
+		local rec = records:add(f.tvlv_record, tvb(off, shown_end - off))
+		rec:append_text(string.format(" (%s)", TVLV_TYPES[ttype] or string.format("0x%02x", ttype)))
+		rec:add(f.tvlv_type, tvb(off, 1))
+		rec:add(f.tvlv_ver, tvb(off + 1, 1))
+		rec:add(f.tvlv_vlen, tvb(off + 2, 2))
+
+		if voff + vlen <= cap_end then
+			if ttype == WF_TVLV_CERT then
+				decode_cert(rec, tvb, voff, vlen, cap_end)
+			elseif ttype == WF_TVLV_OGM_SIG then
+				rec:add(f.ogm_sig, tvb(voff, vlen))
+			elseif ttype == BATADV_TVLV_MCAST then
+				local g = voff
+				while g + 6 <= voff + vlen do
+					rec:add(f.mcast_group, tvb(g, 6))
+					g = g + 6
+				end
+			else
+				rec:add(f.tvlv_value, tvb(voff, vlen))
+			end
+		end
+
+		if vlen == 0 and ttype == 0 then
+			break -- avoid spinning on a zero-filled tail
+		end
+		off = rec_end
+	end
+end
 
 function wayfinder.dissector(tvb, pinfo, root)
 	local len = tvb:len()
@@ -87,7 +194,8 @@ function wayfinder.dissector(tvb, pinfo, root)
 	tree:add(f.tq, tvb(OGM.TQ, 1))
 	tree:add(f.tvlv_len, tvb(OGM.TVLV_LEN, 2))
 
-	-- The TVLV tail (tvlv_len bytes) follows the fixed header; show it raw,
+	-- The TVLV tail (tvlv_len bytes) follows the fixed header. Show it raw, then
+	-- also walk it into individual records (cert / signature / multicast),
 	-- clamped to what the capture actually holds.
 	local tvlv_len = tvb(OGM.TVLV_LEN, 2):uint()
 	if tvlv_len > 0 then
@@ -95,6 +203,7 @@ function wayfinder.dissector(tvb, pinfo, root)
 		local take = math.min(tvlv_len, avail)
 		if take > 0 then
 			tree:add(f.tvlv, tvb(OGM.HEADER_LEN, take))
+			walk_tvlv(tree, tvb, OGM.HEADER_LEN, tvlv_len, len)
 		end
 	end
 

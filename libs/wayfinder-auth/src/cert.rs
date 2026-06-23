@@ -47,6 +47,13 @@ pub struct MembershipCert {
 }
 
 impl MembershipCert {
+    /// Parse an owned certificate from its raw [`as_bytes`](zerocopy::IntoBytes::as_bytes)
+    /// form (e.g. a file the portal issued), ignoring any trailing bytes.
+    /// Returns `None` if `bytes` is shorter than the fixed certificate layout.
+    pub fn from_bytes(bytes: &[u8]) -> Option<MembershipCert> {
+        MembershipCert::read_from_prefix(bytes).ok().map(|(c, _)| c)
+    }
+
     /// The byte range the signature covers: every field except the trailing
     /// 64-byte signature itself.  Both the issuer (when signing) and the
     /// verifier compute the signature over exactly these bytes.
@@ -83,6 +90,35 @@ pub struct VerifiedCert {
 }
 
 impl TrustAnchor {
+    /// On-disk / on-wire size of a serialized trust anchor: a 4-byte big-endian
+    /// mesh id followed by the 32-byte root public key.
+    pub const SERIALIZED_LEN: usize = 4 + 32;
+
+    /// Serialize to its fixed 36-byte form (`mesh_id` big-endian, then the root
+    /// public key) for distribution to nodes as a file.
+    pub fn to_bytes(&self) -> [u8; Self::SERIALIZED_LEN] {
+        let mut out = [0u8; Self::SERIALIZED_LEN];
+        out[..4].copy_from_slice(&self.mesh_id.to_be_bytes());
+        out[4..].copy_from_slice(&self.root_pubkey);
+        out
+    }
+
+    /// Parse a trust anchor from its [`to_bytes`](Self::to_bytes) form, or
+    /// `None` if `bytes` is too short.
+    pub fn from_bytes(bytes: &[u8]) -> Option<TrustAnchor> {
+        if bytes.len() < Self::SERIALIZED_LEN {
+            return None;
+        }
+        let mut mesh_id = [0u8; 4];
+        mesh_id.copy_from_slice(&bytes[..4]);
+        let mut root_pubkey = [0u8; 32];
+        root_pubkey.copy_from_slice(&bytes[4..Self::SERIALIZED_LEN]);
+        Some(TrustAnchor {
+            mesh_id: u32::from_be_bytes(mesh_id),
+            root_pubkey,
+        })
+    }
+
     /// Verify `cert` against this anchor as of `now_unix` (unix seconds).
     ///
     /// Checks, in order: the version byte, that the cert is for *this* mesh, the
@@ -128,6 +164,17 @@ mod tests {
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])
+    }
+
+    /// A trust anchor round-trips through its serialized file form.
+    #[test]
+    fn trust_anchor_roundtrips_through_bytes() {
+        let anchor = Authority::from_seed(&[1u8; 32], 0xABCD).trust_anchor();
+        let bytes = anchor.to_bytes();
+        assert_eq!(bytes.len(), TrustAnchor::SERIALIZED_LEN);
+        assert_eq!(TrustAnchor::from_bytes(&bytes), Some(anchor));
+        // Too-short input is rejected rather than panicking.
+        assert_eq!(TrustAnchor::from_bytes(&bytes[..10]), None);
     }
 
     /// A cert issued by an authority verifies against that authority's anchor
