@@ -10,7 +10,7 @@ mod tap;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use clap::Parser;
 use tokio::{sync::mpsc, task::JoinSet};
 use tracing_subscriber::EnvFilter;
@@ -127,6 +127,44 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut driver = Driver::new(Mac(mac_addr), TapDevice(dev), interfaces, trickle, query_rx);
+
+    // Opt-in mesh authentication: load this node's identity, certificate, and
+    // the mesh trust anchor, then enable OGM auth on the router.  Absent ⇒ the
+    // node runs unauthenticated.
+    if let Some(auth_cfg) = config.auth {
+        use wayfinder::auth::OgmAuth;
+        use wayfinder::wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
+
+        let seed: [u8; 32] = std::fs::read(&auth_cfg.seed_path)?
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("identity seed at {} must be 32 bytes", auth_cfg.seed_path))?;
+        let keypair = Keypair::from_seed(&seed);
+
+        let cert_bytes = std::fs::read(&auth_cfg.cert_path)?;
+        let cert = MembershipCert::from_bytes(&cert_bytes)
+            .ok_or_else(|| anyhow!("invalid membership cert at {}", auth_cfg.cert_path))?;
+
+        let anchor_bytes = std::fs::read(&auth_cfg.trust_anchor_path)?;
+        let anchor = TrustAnchor::from_bytes(&anchor_bytes)
+            .ok_or_else(|| anyhow!("invalid trust anchor at {}", auth_cfg.trust_anchor_path))?;
+
+        // The cert must bind this node's MAC, or it would sign OGMs no peer
+        // attributes to us.
+        if cert.node_mac != mac_addr {
+            bail!(
+                "membership cert is bound to MAC {:?}, but this node's MAC is {:?}",
+                cert.node_mac,
+                mac_addr
+            );
+        }
+
+        let mesh_id = anchor.mesh_id;
+        driver
+            .router_mut()
+            .set_auth(OgmAuth::new(keypair, cert, anchor));
+        tracing::info!("mesh authentication enabled (mesh_id = {:#x})", mesh_id);
+    }
 
     driver.run().await
 }

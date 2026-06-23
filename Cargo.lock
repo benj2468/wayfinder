@@ -2612,6 +2612,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "tracing-test",
+ "wayfinder-auth",
  "zerocopy",
 ]
 

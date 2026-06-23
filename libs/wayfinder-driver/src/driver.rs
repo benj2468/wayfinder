@@ -98,6 +98,13 @@ pub struct Driver<Local: FrameIo> {
     snooper: McastSnooper,
     /// Reference instant for periodic-broadcast timing.
     start: Instant,
+    /// Wall-clock unix time (seconds) corresponding to `now == 0` (the `start`
+    /// instant).  The auth clock is then `auth_epoch_unix + now`, so it advances
+    /// with the loop's `now` rather than reading the wall clock each tick — which
+    /// lets a test drive certificate-validity time forward (faster than real
+    /// time) via the `now` it already controls.  Defaults to the wall clock at
+    /// construction; override with [`set_auth_epoch_unix`](Self::set_auth_epoch_unix).
+    auth_epoch_unix: u64,
     /// Receive scratchpad for frames read from the host device.
     rx_buffer: [u8; 1500],
     /// Transmit scratchpad the router builds outgoing frames into.
@@ -131,8 +138,30 @@ impl<Local: FrameIo> Driver<Local> {
             mac,
             snooper: McastSnooper::new(),
             start: Instant::now(),
+            auth_epoch_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
             rx_buffer: [0u8; 1500],
             tx_buffer: [0u8; 1500],
+        }
+    }
+
+    /// Set the wall-clock unix time (seconds) that corresponds to the driver's
+    /// `now == 0`.  The auth clock used for certificate-validity checks is then
+    /// `epoch + now`.  Tests set this to a fixed value and drive `now` forward to
+    /// exercise expiry deterministically, faster than real time.
+    pub fn set_auth_epoch_unix(&mut self, epoch_unix: u64) {
+        self.auth_epoch_unix = epoch_unix;
+    }
+
+    /// Advance the auth state's certificate-validity clock to `auth_epoch_unix +
+    /// now`.  A no-op when auth is disabled.  Called from every entry point that
+    /// processes frames so cert expiry tracks the loop's `now` consistently.
+    fn refresh_auth_clock(&mut self, now: Duration) {
+        let epoch = self.auth_epoch_unix;
+        if let Some(auth) = self.router.auth_mut() {
+            auth.set_time(epoch.saturating_add(now.as_secs()));
         }
     }
 
@@ -177,6 +206,9 @@ impl<Local: FrameIo> Driver<Local> {
         check_server: bool,
         check_periodic: bool,
     ) -> anyhow::Result<()> {
+        // Advance the auth clock from the loop's `now` (see `refresh_auth_clock`).
+        self.refresh_auth_clock(now);
+
         // When the soonest interface is next due to emit an OGM, on the tokio
         // clock.  Each interface backs off (Trickle) on its own schedule, so the
         // periodic arm sleeps until whichever fires first.  Recomputed every
@@ -194,6 +226,7 @@ impl<Local: FrameIo> Driver<Local> {
             mac,
             snooper,
             start: _,
+            auth_epoch_unix: _,
             rx_buffer,
             tx_buffer,
         } = self;
@@ -258,6 +291,7 @@ impl<Local: FrameIo> Driver<Local> {
     /// reference instant), dispatching any OGM produced.  Deterministic
     /// counterpart to the `select!` timer arm, for tests that control time.
     pub async fn poll(&mut self, now: Duration) -> anyhow::Result<()> {
+        self.refresh_auth_clock(now);
         let mesh = poll_ogm(&mut self.router, now, &mut self.tx_buffer);
         let output = LoopOutput { mesh, local: None };
         dispatch(
@@ -282,6 +316,7 @@ impl<Local: FrameIo> Driver<Local> {
     ///
     /// [`run_once`]: Driver::run_once
     pub async fn process_pending(&mut self) -> anyhow::Result<()> {
+        self.refresh_auth_clock(self.start.elapsed());
         loop {
             let mut progressed = false;
 

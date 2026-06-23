@@ -9,6 +9,7 @@ tracing.workspace = true
 interfaces.workspace = true
 zerocopy.workspace = true
 batman.workspace = true
+wayfinder-auth.workspace = true
 pretty-hex.workspace = true
 heapless.workspace = true
 embedded-io-async.workspace = true
@@ -19,6 +20,9 @@ dynosaur.workspace = true
 tracing-test = "0.2.6"
 pretty-hex.workspace = true
 serde_yaml = "0.9.34"
+# Tests construct certs/revocations, which need the std-only certificate
+# authority; the non-test build keeps `wayfinder-auth` at its no_std core.
+wayfinder-auth = { workspace = true, features = ["std"] }
 
 
 [features]

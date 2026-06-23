@@ -57,6 +57,20 @@ pub struct BatmanTvlvHdr {
 /// group MAC addresses the originating node currently listens for.
 pub const BATADV_TVLV_MCAST: u8 = 0x06;
 
+/// TVLV type carrying the originator's Wayfinder membership certificate
+/// (`wayfinder_auth::MembershipCert` bytes).  Wayfinder-specific extension to
+/// the OGM TVLV space — present only when mesh authentication is enabled — so a
+/// receiver can verify the OGM's signature against the mesh trust anchor and
+/// learn the originator's keys.  Carried periodically (amortized) rather than on
+/// every OGM.
+pub const WF_TVLV_CERT: u8 = 0x80;
+
+/// TVLV type carrying the originator's Ed25519 signature (64 bytes) over the
+/// OGM's immutable identity fields.  Wayfinder-specific; present only when mesh
+/// authentication is enabled.  This is what lets every member reject spurious or
+/// forged OGMs — a pairwise hop tag cannot, since an OGM is flooded one-to-many.
+pub const WF_TVLV_OGM_SIG: u8 = 0x81;
+
 /// Scan a TVLV region (`tail`, the bytes following an OGM's fixed header) for
 /// the first record of type `tvlv_type` and return its value bytes, or `None`
 /// if absent or malformed.  Records are `[`[`BatmanTvlvHdr`]`][value]` packed

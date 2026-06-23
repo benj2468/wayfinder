@@ -171,6 +171,26 @@ pub enum LocalDistributionMechanism {
     Tap(TapConfig),
 }
 
+/// Opt-in mesh authentication for this node.
+///
+/// When present, the node loads its cryptographic identity and membership
+/// material from these files, signs the OGMs it emits, and drops incoming OGMs
+/// that do not verify against the mesh trust anchor — segregating this mesh from
+/// others sharing the medium.  When absent, the node runs unauthenticated (the
+/// open, pre-auth behavior).  The files are produced by the enrollment portal.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AuthConfig {
+    /// Path to the node's 32-byte Ed25519 identity seed (raw bytes).  Keep this
+    /// secret; it *is* the node's identity.
+    pub seed_path: String,
+    /// Path to the node's membership certificate (raw `MembershipCert` bytes,
+    /// signed by the mesh root).
+    pub cert_path: String,
+    /// Path to the mesh trust anchor (raw `TrustAnchor` bytes: the mesh id and
+    /// root public key the node verifies certificates against).
+    pub trust_anchor_path: String,
+}
+
 /// Top-level configuration loaded from the YAML config file.
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct Config {
@@ -185,6 +205,9 @@ pub struct Config {
     /// Optional management-API server.
     #[serde(default)]
     pub server: Option<ServerConfig>,
+    /// Optional opt-in mesh authentication.  Absent ⇒ unauthenticated.
+    #[serde(default)]
+    pub auth: Option<AuthConfig>,
 }
 
 #[cfg(test)]
@@ -243,5 +266,37 @@ local_egress:
         assert_eq!(tap.ip_address, Some(Ipv4Addr::new(10, 0, 0, 1)));
         assert_eq!(tap.netmask, None);
         assert_eq!(TapConfig::DEFAULT_NETMASK, Ipv4Addr::new(255, 255, 255, 0));
+    }
+
+    /// An `auth` block parses into the cert/seed/anchor paths.
+    #[test]
+    fn config_with_auth_parses() {
+        let yaml = "\
+local_egress:
+  type: Tap
+  device_name: wayfinder0
+auth:
+  seed_path: /etc/wayfinder/seed
+  cert_path: /etc/wayfinder/cert
+  trust_anchor_path: /etc/wayfinder/anchor
+";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let auth = config.auth.expect("auth block present");
+        assert_eq!(auth.seed_path, "/etc/wayfinder/seed");
+        assert_eq!(auth.cert_path, "/etc/wayfinder/cert");
+        assert_eq!(auth.trust_anchor_path, "/etc/wayfinder/anchor");
+    }
+
+    /// Auth is optional: a config without an `auth` block leaves it `None`
+    /// (the unauthenticated default).
+    #[test]
+    fn config_without_auth_is_none() {
+        let yaml = "\
+local_egress:
+  type: Tap
+  device_name: wayfinder0
+";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.auth.is_none());
     }
 }

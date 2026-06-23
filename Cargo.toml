@@ -25,7 +25,7 @@ members = [
 # Local Dependencies
 interfaces = { path = "./libs/interfaces" }
 batman = { path = "./libs/batman" }
-wayfinder-auth = { path = "./libs/wayfinder-auth" }
+wayfinder-auth = { path = "./libs/wayfinder-auth", default-features = false }
 wayfinder = { path = "./libs/wayfinder" }
 wayfinder-protos = { path = "./libs/wayfinder-protos" }
 wayfinder-server = { path = "./libs/wayfinder-server" }
