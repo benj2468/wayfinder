@@ -282,6 +282,13 @@ EOF
 `git.haganah.net` (in `~/.config/glab-cli/config.yml`); the SSH agent only
 authenticates `git push`/`pull`, not the MR-creation API.
 
+5. **For a sufficiently complex MR** (non-trivial logic, security-sensitive code,
+   a new wire format, multi-crate changes), once it is pushed, spawn a sub-agent
+   to give it a second-opinion review — a fresh reviewer that reads the diff
+   (`git diff origin/main...<branch>`) and reports prioritized findings. Address
+   the findings (or justify why not) before requesting human review. Trivial MRs
+   (small fixes, doc tweaks, mechanical refactors) don't need this.
+
 ## Common Development Patterns
 
 ### Adding a new routing protocol
