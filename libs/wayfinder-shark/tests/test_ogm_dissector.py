@@ -57,11 +57,31 @@ def ogm_frame(**ogm_kwargs) -> bytes:
 # TVLV record type bytes (libs/batman/src/wire.rs).
 WF_TVLV_CERT = 0x80
 WF_TVLV_OGM_SIG = 0x81
+WF_TVLV_REVOKE = 0x82
 
 
 def tvlv(tvlv_type: int, value: bytes, version: int = 1) -> bytes:
     """Serialize one TVLV record: ``[type][version][len BE][value]``."""
     return struct.pack(">BBH", tvlv_type, version, len(value)) + value
+
+
+def revocation_record(
+    *,
+    mesh_id: int = 0xABCD,
+    node_mac: bytes = NODE2,
+    not_before: int = 500,
+    not_after: int = 1000,
+    signature: bytes = b"\x33" * 64,
+) -> bytes:
+    """A synthetic 92-byte ``RevocationRecord`` (layout only; not a real signature)."""
+    return (
+        struct.pack(">BB", 1, 0)  # version, flags
+        + struct.pack(">I", mesh_id)
+        + node_mac
+        + struct.pack(">Q", not_before)
+        + struct.pack(">Q", not_after)
+        + signature
+    )
 
 
 def membership_cert(
@@ -162,3 +182,53 @@ def test_walk_handles_cert_then_signature(dissect):
     )
     assert result["wayfinder.batman.tvlv.cert.mesh_id"] == "0x00001234"
     assert result["wayfinder.batman.tvlv.ogm_sig"] == ("22" * 64)
+
+
+# Expected decoded revocation fields for the synthetic revocation_record() above.
+EXPECTED_REVOKE_FIELDS = {
+    "wayfinder.batman.tvlv.type": "0x82",
+    "wayfinder.batman.tvlv.revoke.version": "1",
+    "wayfinder.batman.tvlv.revoke.mesh_id": "0x0000abcd",
+    "wayfinder.batman.tvlv.revoke.node_mac": "02:00:00:00:00:02",
+    "wayfinder.batman.tvlv.revoke.not_before": "500",
+    "wayfinder.batman.tvlv.revoke.not_after": "1000",
+}
+
+
+@pytest.mark.parametrize("field,expected", list(EXPECTED_REVOKE_FIELDS.items()))
+def test_revoke_tvlv_decodes(dissect, field, expected):
+    """A WF_TVLV_REVOKE record decodes into its revocation-record fields."""
+    frame = ogm_frame(tvlv=tvlv(WF_TVLV_REVOKE, revocation_record()))
+    result = dissect(frame, [field])
+    assert result[field] == expected
+
+
+def test_revoke_signature_decodes(dissect):
+    """The revocation's 64-byte root signature surfaces verbatim."""
+    sig = bytes(range(64, 128))
+    frame = ogm_frame(tvlv=tvlv(WF_TVLV_REVOKE, revocation_record(signature=sig)))
+    result = dissect(frame, ["wayfinder.batman.tvlv.revoke.signature"])
+    assert result["wayfinder.batman.tvlv.revoke.signature"] == sig.hex()
+
+
+def test_walk_handles_cert_sig_then_revoke(dissect):
+    """A full auth tail — cert, OGM signature, and two revocations — all decode."""
+    tail = (
+        tvlv(WF_TVLV_CERT, membership_cert(mesh_id=0x1234))
+        + tvlv(WF_TVLV_OGM_SIG, b"\x22" * 64)
+        + tvlv(WF_TVLV_REVOKE, revocation_record(node_mac=NODE1))
+        + tvlv(WF_TVLV_REVOKE, revocation_record(node_mac=NODE2))
+    )
+    frame = ogm_frame(tvlv=tail)
+    # Both revocations decode: tshark joins a field occurring on several records
+    # with a comma, so seeing both MACs proves the walk advanced past each
+    # record rather than stalling on the first.
+    result = dissect(
+        frame,
+        ["wayfinder.batman.tvlv.cert.mesh_id", "wayfinder.batman.tvlv.revoke.node_mac"],
+    )
+    assert result["wayfinder.batman.tvlv.cert.mesh_id"] == "0x00001234"
+    assert (
+        result["wayfinder.batman.tvlv.revoke.node_mac"]
+        == "02:00:00:00:00:01,02:00:00:00:00:02"
+    )

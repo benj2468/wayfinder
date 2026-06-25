@@ -8,9 +8,9 @@ use zerocopy::{FromBytes, IntoBytes};
 use crate::{
     BatmanEngine, NeighborStats, OriginatorRecord, TrickleTimer,
     wire::{
-        BATADV_BCAST, BATADV_IV_OGM, BATADV_MCAST, BATADV_TVLV_MCAST, BATADV_UNICAST,
-        BatmanBroadcastPacket, BatmanMcastPacket, BatmanOgmPacket, BatmanTvlvHdr,
-        BatmanUnicastPacket, ETH_P_BATMAN, find_tvlv,
+        BATADV_BCAST, BATADV_IV_OGM, BATADV_MCAST, BATADV_UNICAST, BatmanBroadcastPacket,
+        BatmanMcastPacket, BatmanOgmPacket, BatmanTvlvHdr, BatmanUnicastPacket, ETH_P_BATMAN,
+        TvlvType, find_tvlv,
     },
 };
 
@@ -212,7 +212,7 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
         }
 
         // Re-add the groups the originator now announces (6 bytes per MAC).
-        if let Some(value) = find_tvlv(tail, BATADV_TVLV_MCAST) {
+        if let Some(value) = find_tvlv(tail, TvlvType::Mcast) {
             for chunk in value.chunks_exact(6) {
                 let mut bytes = [0u8; 6];
                 bytes.copy_from_slice(chunk);
@@ -816,7 +816,7 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
 
         if tvlv_len > 0 {
             let hdr = BatmanTvlvHdr {
-                tvlv_type: BATADV_TVLV_MCAST,
+                tvlv_type: TvlvType::Mcast.as_u8(),
                 version: 1,
                 len: (mcast_value_len as u16).to_be(),
             };

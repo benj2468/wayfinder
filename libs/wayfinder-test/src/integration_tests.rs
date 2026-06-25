@@ -387,6 +387,87 @@ async fn test_authenticated_unicast_delivers_and_strips_tag() {
     );
 }
 
+/// An emergency revocation injected at one node floods across the mesh on
+/// normal OGM traffic and shuns the revoked node: in [`line_of_three`]
+/// (machine1–machine2–machine3) an operator revokes machine3 at machine1, and
+/// after the purge propagates machine2 learns it *purely from machine1's OGM*
+/// (no direct API call) and machine3 ages out of both survivors' routing
+/// tables, because its own OGMs are now dropped.
+#[tokio::test]
+async fn test_revocation_floods_and_shuns_node() {
+    setup();
+    let mut harness = line_of_three();
+    let m1 = harness.get_machine("machine1").ident;
+    let m2 = harness.get_machine("machine2").ident;
+    let m3 = harness.get_machine("machine3").ident;
+
+    let authority = wayfinder_auth::Authority::from_seed(&[1; 32], 0xABCD);
+    enable_auth(harness.get_machine_mut("machine1"), &authority, m1, 2);
+    enable_auth(harness.get_machine_mut("machine2"), &authority, m2, 3);
+    enable_auth(harness.get_machine_mut("machine3"), &authority, m3, 4);
+
+    // Converge: every node learns the other two over signed OGMs.
+    converge_at(&mut harness, Duration::from_secs(1)).await;
+    for r in harness.machines.values() {
+        assert_eq!(r.router().originator_count(), 2);
+    }
+
+    // Operator revokes machine3 at machine1 — the injection point a provider's
+    // RevokeNode RPC will drive in the portal phase.
+    let record = authority.revoke(m3, 0, 1_000_000);
+    assert!(
+        harness
+            .get_machine_mut("machine1")
+            .router_mut()
+            .ingest_revocation(&record, Duration::from_secs(1)),
+        "machine1 must accept the authority-signed revocation"
+    );
+
+    // Drive an OGM round so the purge floods, then age out the shunned node.
+    converge_at(&mut harness, Duration::from_secs(2)).await;
+    age_out(&mut harness).await;
+
+    // machine2 learned the revocation purely by verifying machine1's OGM.
+    assert!(
+        harness
+            .get_machine("machine2")
+            .router()
+            .auth()
+            .expect("auth enabled")
+            .revoked_macs()
+            .any(|m| m == m3),
+        "machine2 must learn the revocation flooded in machine1's OGM tail"
+    );
+
+    // machine3 is shunned: its OGMs are dropped, so it ages out of both
+    // survivors' originator tables.
+    assert!(
+        !harness
+            .get_machine("machine2")
+            .router()
+            .originator_table()
+            .any(|r| r.neighbor_ident == m3),
+        "the relay must drop the revoked node"
+    );
+    assert!(
+        !harness
+            .get_machine("machine1")
+            .router()
+            .originator_table()
+            .any(|r| r.neighbor_ident == m3),
+        "machine1 must lose its route to the revoked node once it is no longer relayed"
+    );
+    // The honest survivors still see each other.
+    assert!(
+        harness
+            .get_machine("machine1")
+            .router()
+            .originator_table()
+            .any(|r| r.neighbor_ident == m2),
+        "the honest survivors must remain reachable"
+    );
+}
+
 #[tokio::test]
 async fn test_line_of_three() {
     line_of_three();

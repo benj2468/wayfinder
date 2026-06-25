@@ -44,7 +44,9 @@ pub struct BatmanOgmPacket {
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, PartialEq, Eq)]
 #[repr(C, packed)]
 pub struct BatmanTvlvHdr {
-    /// What the value encodes (e.g. [`BATADV_TVLV_MCAST`]).
+    /// What the value encodes — a [`TvlvType`] byte for the records this
+    /// implementation produces, though the field is a raw `u8` because the wire
+    /// may carry record types this node does not recognise.
     pub tvlv_type: u8,
     /// Version of this TVLV type's value format.
     pub version: u8,
@@ -52,31 +54,55 @@ pub struct BatmanTvlvHdr {
     pub len: u16,
 }
 
-/// TVLV type identifying a multicast-membership announcement, matching
-/// batman-adv's `BATADV_TVLV_MCAST`.  Its value is the list of multicast
-/// group MAC addresses the originating node currently listens for.
-pub const BATADV_TVLV_MCAST: u8 = 0x06;
+/// The TVLV record types this implementation produces and matches, each a
+/// distinct on-the-wire type byte.  Modelled as a `#[repr(u8)]` enum — rather
+/// than a set of free `const`s — so the compiler *guarantees* the type bytes
+/// are unique (a duplicated discriminant is a compile error) and keeps every
+/// assignment in one place.  The raw byte is [`TvlvType::as_u8`]; the
+/// [`BatmanTvlvHdr::tvlv_type`] wire field stays a `u8` because a tail can also
+/// carry types not listed here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TvlvType {
+    /// Multicast-membership announcement, matching batman-adv's
+    /// `BATADV_TVLV_MCAST`.  Its value is the list of multicast group MAC
+    /// addresses the originating node currently listens for.
+    Mcast = 0x06,
+    /// The originator's Wayfinder membership certificate
+    /// (`wayfinder_auth::MembershipCert` bytes).  Wayfinder-specific extension —
+    /// present only when mesh authentication is enabled — so a receiver can
+    /// verify the OGM's signature against the mesh trust anchor and learn the
+    /// originator's keys.  Carried periodically (amortized) rather than on every
+    /// OGM.
+    Cert = 0x80,
+    /// The originator's Ed25519 signature (64 bytes) over the OGM's immutable
+    /// identity fields.  Wayfinder-specific; present only when mesh
+    /// authentication is enabled.  This is what lets every member reject spurious
+    /// or forged OGMs — a pairwise hop tag cannot, since an OGM is flooded
+    /// one-to-many.
+    OgmSig = 0x81,
+    /// A signed revocation record (`wayfinder_auth::RevocationRecord` bytes).
+    /// Wayfinder-specific; present only when a node is actively re-flooding an
+    /// emergency purge.  A node attaches known revocations to its OGMs so they
+    /// propagate with normal control-plane traffic; each record is independently
+    /// signed by the mesh root, so its authenticity does not depend on the
+    /// carrying OGM's signature.  An OGM may carry several of these back-to-back.
+    Revoke = 0x82,
+}
 
-/// TVLV type carrying the originator's Wayfinder membership certificate
-/// (`wayfinder_auth::MembershipCert` bytes).  Wayfinder-specific extension to
-/// the OGM TVLV space — present only when mesh authentication is enabled — so a
-/// receiver can verify the OGM's signature against the mesh trust anchor and
-/// learn the originator's keys.  Carried periodically (amortized) rather than on
-/// every OGM.
-pub const WF_TVLV_CERT: u8 = 0x80;
-
-/// TVLV type carrying the originator's Ed25519 signature (64 bytes) over the
-/// OGM's immutable identity fields.  Wayfinder-specific; present only when mesh
-/// authentication is enabled.  This is what lets every member reject spurious or
-/// forged OGMs — a pairwise hop tag cannot, since an OGM is flooded one-to-many.
-pub const WF_TVLV_OGM_SIG: u8 = 0x81;
+impl TvlvType {
+    /// The on-the-wire type byte for this record type — the enum's discriminant.
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
 
 /// Scan a TVLV region (`tail`, the bytes following an OGM's fixed header) for
 /// the first record of type `tvlv_type` and return its value bytes, or `None`
 /// if absent or malformed.  Records are `[`[`BatmanTvlvHdr`]`][value]` packed
 /// back-to-back; a record whose advertised length runs past the end of `tail`
 /// terminates the scan.
-pub fn find_tvlv(tail: &[u8], tvlv_type: u8) -> Option<&[u8]> {
+pub fn find_tvlv(tail: &[u8], tvlv_type: TvlvType) -> Option<&[u8]> {
     let hdr_size = core::mem::size_of::<BatmanTvlvHdr>();
     let mut off = 0;
     while off + hdr_size <= tail.len() {
@@ -87,12 +113,60 @@ pub fn find_tvlv(tail: &[u8], tvlv_type: u8) -> Option<&[u8]> {
         if value_end > tail.len() {
             return None; // record claims more bytes than the tail holds
         }
-        if hdr.tvlv_type == tvlv_type {
+        if hdr.tvlv_type == tvlv_type.as_u8() {
             return tail.get(value_start..value_end);
         }
         off = value_end;
     }
     None
+}
+
+/// Iterate the value bytes of *every* record of type `tvlv_type` in a TVLV
+/// region (`tail`, the bytes following an OGM's fixed header), in wire order.
+/// Unlike [`find_tvlv`] (which stops at the first match) this yields each
+/// matching record, so a tail carrying several records of one type — e.g.
+/// multiple [`TvlvType::Revoke`] records — can be processed in full.  A record
+/// whose advertised length runs past the end of `tail` terminates the scan.
+pub fn iter_tvlv(tail: &[u8], tvlv_type: TvlvType) -> TvlvValues<'_> {
+    TvlvValues {
+        tail,
+        off: 0,
+        tvlv_type: tvlv_type.as_u8(),
+    }
+}
+
+/// Iterator returned by [`iter_tvlv`] yielding each matching record's value
+/// bytes.  See [`iter_tvlv`] for the scanning rules.
+pub struct TvlvValues<'a> {
+    /// The TVLV region being scanned.
+    tail: &'a [u8],
+    /// Offset of the next record header to inspect.
+    off: usize,
+    /// The on-the-wire byte of the record type to yield.
+    tvlv_type: u8,
+}
+
+impl<'a> Iterator for TvlvValues<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let hdr_size = core::mem::size_of::<BatmanTvlvHdr>();
+        while self.off + hdr_size <= self.tail.len() {
+            let (hdr, _) = BatmanTvlvHdr::ref_from_prefix(&self.tail[self.off..]).ok()?;
+            let len = u16::from_be(hdr.len) as usize;
+            let value_start = self.off + hdr_size;
+            let value_end = value_start.checked_add(len)?;
+            if value_end > self.tail.len() {
+                return None; // record claims more bytes than the tail holds
+            }
+            let matched = hdr.tvlv_type == self.tvlv_type;
+            self.off = value_end;
+            if matched {
+                return self.tail.get(value_start..value_end);
+            }
+        }
+        None
+    }
 }
 
 /// Packet sub-type for a flooded broadcast frame.  Matches batman-adv's
@@ -164,4 +238,66 @@ pub struct BatmanUnicastPacket {
     pub version: u8,     // Protocol version
     pub ttl: u8,         // Time-to-live to prevent routing loops for data
     pub dest: Mac,       // The FINAL destination node address in the mesh
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a TVLV region from `(type, value)` records packed back-to-back.
+    fn tvlv_region(records: &[(TvlvType, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (ty, value) in records {
+            let hdr = BatmanTvlvHdr {
+                tvlv_type: ty.as_u8(),
+                version: 1,
+                len: (value.len() as u16).to_be(),
+            };
+            out.extend_from_slice(hdr.as_bytes());
+            out.extend_from_slice(value);
+        }
+        out
+    }
+
+    /// `iter_tvlv` yields *every* record of the requested type in wire order,
+    /// skipping interleaved records of other types — the property `find_tvlv`
+    /// (first match only) cannot provide for multi-revocation OGM tails.
+    #[test]
+    fn iter_tvlv_yields_every_matching_record() {
+        let region = tvlv_region(&[
+            (TvlvType::Revoke, &[1, 1]),
+            (TvlvType::Mcast, &[9, 9, 9]),
+            (TvlvType::Revoke, &[2, 2]),
+            (TvlvType::Revoke, &[3, 3]),
+        ]);
+        let got: Vec<&[u8]> = iter_tvlv(&region, TvlvType::Revoke).collect();
+        assert_eq!(got, vec![&[1, 1][..], &[2, 2][..], &[3, 3][..]]);
+        // The first-match helper still agrees on the first one.
+        assert_eq!(find_tvlv(&region, TvlvType::Revoke), Some(&[1, 1][..]));
+    }
+
+    /// A record whose advertised length overruns the tail terminates the scan
+    /// rather than reading out of bounds.
+    #[test]
+    fn iter_tvlv_stops_on_overrun() {
+        let mut region = tvlv_region(&[(TvlvType::Revoke, &[1, 1])]);
+        // Corrupt the length field to claim more bytes than remain.
+        region[2..4].copy_from_slice(&255u16.to_be_bytes());
+        assert_eq!(iter_tvlv(&region, TvlvType::Revoke).count(), 0);
+    }
+
+    /// An empty tail yields nothing.
+    #[test]
+    fn iter_tvlv_empty_tail() {
+        assert_eq!(iter_tvlv(&[], TvlvType::Revoke).count(), 0);
+    }
+
+    /// The enum's discriminants are the documented on-the-wire bytes.
+    #[test]
+    fn tvlv_type_bytes_are_stable() {
+        assert_eq!(TvlvType::Mcast.as_u8(), 0x06);
+        assert_eq!(TvlvType::Cert.as_u8(), 0x80);
+        assert_eq!(TvlvType::OgmSig.as_u8(), 0x81);
+        assert_eq!(TvlvType::Revoke.as_u8(), 0x82);
+    }
 }
