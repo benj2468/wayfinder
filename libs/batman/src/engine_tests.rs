@@ -1028,14 +1028,14 @@ mod ogm_tvlv {
 #[cfg(test)]
 mod mcast_membership {
     //! Multicast group memberships are distributed across the mesh by
-    //! piggybacking them on OGMs as a [`BATADV_TVLV_MCAST`] TVLV.  A node
+    //! piggybacking them on OGMs as a [`TvlvType::Mcast`] TVLV.  A node
     //! announces the groups its local host listens to, and learns which
     //! originators want which groups from the OGMs it receives.
 
     use core::time::Duration;
 
     use super::*;
-    use crate::wire::{BATADV_TVLV_MCAST, BatmanTvlvHdr};
+    use crate::wire::{BatmanTvlvHdr, TvlvType};
 
     /// A multicast group MAC (`01:00:5e:00:00:NN`, IPv4-multicast style).
     fn group(n: u8) -> Mac {
@@ -1049,7 +1049,7 @@ mod mcast_membership {
             value.extend_from_slice(g.as_bytes());
         }
         let hdr = BatmanTvlvHdr {
-            tvlv_type: BATADV_TVLV_MCAST,
+            tvlv_type: TvlvType::Mcast.as_u8(),
             version: 1,
             len: (value.len() as u16).to_be(),
         };
@@ -1086,7 +1086,7 @@ mod mcast_membership {
             let (hdr, _) = BatmanTvlvHdr::ref_from_prefix(&tail[off..]).ok()?;
             let len = u16::from_be(hdr.len) as usize;
             let vstart = off + 4;
-            if hdr.tvlv_type == BATADV_TVLV_MCAST {
+            if hdr.tvlv_type == TvlvType::Mcast.as_u8() {
                 return tail.get(vstart..vstart + len).map(|s| s.to_vec());
             }
             off = vstart + len;

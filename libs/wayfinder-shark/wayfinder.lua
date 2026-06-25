@@ -7,8 +7,9 @@
 --
 -- Decodes the BatmanOgmPacket fixed header (see libs/batman/src/wire.rs) and
 -- walks the TVLV tail into individual records: multicast membership, the
--- Wayfinder membership certificate (WF_TVLV_CERT), and the OGM signature
--- (WF_TVLV_OGM_SIG).  The whole tail is also shown as a raw byte blob.
+-- Wayfinder membership certificate (WF_TVLV_CERT), the OGM signature
+-- (WF_TVLV_OGM_SIG), and flooded revocations (WF_TVLV_REVOKE).  The whole tail
+-- is also shown as a raw byte blob.
 --
 -- Install: copy (or symlink) this file into your Personal Lua Plugins folder
 --   (Help -> About -> Folders, e.g. ~/.local/lib/wireshark/plugins), or load it
@@ -29,10 +30,12 @@ local PACKET_TYPES = {
 local BATADV_TVLV_MCAST = 0x06
 local WF_TVLV_CERT = 0x80
 local WF_TVLV_OGM_SIG = 0x81
+local WF_TVLV_REVOKE = 0x82
 local TVLV_TYPES = {
 	[BATADV_TVLV_MCAST] = "Multicast Membership",
 	[WF_TVLV_CERT] = "Membership Certificate",
 	[WF_TVLV_OGM_SIG] = "OGM Signature",
+	[WF_TVLV_REVOKE] = "Revocation",
 }
 
 local wayfinder = Proto("wayfinder", "Wayfinder Mesh Protocol")
@@ -76,6 +79,16 @@ f.cert_sig = ProtoField.bytes("wayfinder.batman.tvlv.cert.signature", "Root Sign
 -- The originator's Ed25519 signature over the OGM's immutable identity.
 f.ogm_sig = ProtoField.bytes("wayfinder.batman.tvlv.ogm_sig", "OGM Signature")
 
+-- Revocation record fields (wayfinder_auth::RevocationRecord; see
+-- libs/wayfinder-auth/src/revoke.rs).
+f.revoke_version = ProtoField.uint8("wayfinder.batman.tvlv.revoke.version", "Revoke Version", base.DEC)
+f.revoke_flags = ProtoField.uint8("wayfinder.batman.tvlv.revoke.flags", "Flags", base.HEX)
+f.revoke_mesh = ProtoField.uint32("wayfinder.batman.tvlv.revoke.mesh_id", "Mesh ID", base.HEX)
+f.revoke_mac = ProtoField.ether("wayfinder.batman.tvlv.revoke.node_mac", "Revoked Node MAC")
+f.revoke_nb = ProtoField.uint64("wayfinder.batman.tvlv.revoke.not_before", "Not Before", base.DEC)
+f.revoke_na = ProtoField.uint64("wayfinder.batman.tvlv.revoke.not_after", "Not After", base.DEC)
+f.revoke_sig = ProtoField.bytes("wayfinder.batman.tvlv.revoke.signature", "Root Signature")
+
 -- Offsets of the fixed BatmanOgmPacket fields within the BATMAN body. Kept in
 -- sync with libs/batman/src/wire.rs.
 local OGM = {
@@ -106,6 +119,18 @@ local CERT = {
 	LEN = 156,
 }
 
+-- Field offsets within a RevocationRecord value (libs/wayfinder-auth/src/revoke.rs).
+local REVOKE = {
+	VERSION = 0,
+	FLAGS = 1,
+	MESH_ID = 2, -- u32, big-endian
+	NODE_MAC = 6, -- 6 bytes
+	NOT_BEFORE = 12, -- u64, big-endian
+	NOT_AFTER = 20, -- u64, big-endian
+	SIGNATURE = 28, -- 64 bytes
+	LEN = 92,
+}
+
 -- Decode one membership-certificate TVLV value into `rec` (the record subtree).
 local function decode_cert(rec, tvb, voff, vlen, cap_end)
 	if voff + CERT.LEN > cap_end or vlen < CERT.LEN then
@@ -119,6 +144,20 @@ local function decode_cert(rec, tvb, voff, vlen, cap_end)
 	rec:add(f.cert_nb, tvb(voff + CERT.NOT_BEFORE, 8))
 	rec:add(f.cert_na, tvb(voff + CERT.NOT_AFTER, 8))
 	rec:add(f.cert_sig, tvb(voff + CERT.SIGNATURE, 64))
+end
+
+-- Decode one revocation-record TVLV value into `rec` (the record subtree).
+local function decode_revoke(rec, tvb, voff, vlen, cap_end)
+	if voff + REVOKE.LEN > cap_end or vlen < REVOKE.LEN then
+		return -- truncated capture or short value; leave as raw value below
+	end
+	rec:add(f.revoke_version, tvb(voff + REVOKE.VERSION, 1))
+	rec:add(f.revoke_flags, tvb(voff + REVOKE.FLAGS, 1))
+	rec:add(f.revoke_mesh, tvb(voff + REVOKE.MESH_ID, 4))
+	rec:add(f.revoke_mac, tvb(voff + REVOKE.NODE_MAC, 6))
+	rec:add(f.revoke_nb, tvb(voff + REVOKE.NOT_BEFORE, 8))
+	rec:add(f.revoke_na, tvb(voff + REVOKE.NOT_AFTER, 8))
+	rec:add(f.revoke_sig, tvb(voff + REVOKE.SIGNATURE, 64))
 end
 
 -- Walk the TVLV tail into one subtree per record, decoding known types. Bounds
@@ -145,6 +184,8 @@ local function walk_tvlv(tree, tvb, start, tvlv_len, cap_end)
 				decode_cert(rec, tvb, voff, vlen, cap_end)
 			elseif ttype == WF_TVLV_OGM_SIG then
 				rec:add(f.ogm_sig, tvb(voff, vlen))
+			elseif ttype == WF_TVLV_REVOKE then
+				decode_revoke(rec, tvb, voff, vlen, cap_end)
 			elseif ttype == BATADV_TVLV_MCAST then
 				local g = voff
 				while g + 6 <= voff + vlen do

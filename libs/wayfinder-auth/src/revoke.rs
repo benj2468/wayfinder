@@ -28,6 +28,14 @@ pub struct RevocationRecord {
     pub node_mac: [u8; 6],
     /// Unix-seconds instant the revocation takes effect.  Network byte order.
     pub not_before: U64,
+    /// Unix-seconds instant the revocation expires and may be forgotten.  Set by
+    /// the issuer to (at least) the revoked certificate's own `not_after`, so a
+    /// node need only enforce the revocation until the cert it cancels would
+    /// have expired anyway — after which passive expiry takes over.  This bounds
+    /// how long a record must be retained, letting nodes garbage-collect it and
+    /// keeping the local revocation set from filling permanently.  Network byte
+    /// order.
+    pub not_after: U64,
     /// Ed25519 signature by the mesh root over the preceding fields.
     pub signature: [u8; 64],
 }
@@ -74,7 +82,7 @@ mod tests {
     #[test]
     fn issued_revocation_verifies() {
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
-        let record = authority.revoke(mac(7), 500);
+        let record = authority.revoke(mac(7), 500, 1000);
         assert_eq!(
             authority.trust_anchor().verify_revocation(&record),
             Ok(mac(7))
@@ -87,9 +95,21 @@ mod tests {
     fn forged_revocation_rejected() {
         let real = Authority::from_seed(&[1u8; 32], 0xABCD);
         let attacker = Authority::from_seed(&[8u8; 32], 0xABCD);
-        let record = attacker.revoke(mac(7), 500);
+        let record = attacker.revoke(mac(7), 500, 1000);
         assert_eq!(
             real.trust_anchor().verify_revocation(&record),
+            Err(AuthError::BadSignature)
+        );
+    }
+
+    /// Tampering with the expiry (covered by the signed body) is rejected.
+    #[test]
+    fn tampered_not_after_rejected() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let mut record = authority.revoke(mac(7), 500, 1000);
+        record.not_after = U64::new(9_999);
+        assert_eq!(
+            authority.trust_anchor().verify_revocation(&record),
             Err(AuthError::BadSignature)
         );
     }
@@ -98,7 +118,7 @@ mod tests {
     #[test]
     fn wrong_mesh_revocation_rejected() {
         let authority = Authority::from_seed(&[1u8; 32], 0x1111);
-        let record = authority.revoke(mac(7), 500);
+        let record = authority.revoke(mac(7), 500, 1000);
         let mut anchor = authority.trust_anchor();
         anchor.mesh_id = 0x2222;
         assert_eq!(anchor.verify_revocation(&record), Err(AuthError::WrongMesh));

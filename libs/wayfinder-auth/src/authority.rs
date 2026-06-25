@@ -72,15 +72,19 @@ impl Authority {
         cert
     }
 
-    /// Sign a revocation for `mac`, effective at `not_before` (unix seconds),
-    /// for flooding across the mesh as an emergency purge.
-    pub fn revoke(&self, mac: Mac, not_before: u64) -> RevocationRecord {
+    /// Sign a revocation for `mac`, effective at `not_before` and expiring at
+    /// `not_after` (unix seconds), for flooding across the mesh as an emergency
+    /// purge.  Set `not_after` to at least the revoked certificate's own
+    /// `not_after`, so members enforce the revocation until the cancelled cert
+    /// would have expired anyway and may then forget the record.
+    pub fn revoke(&self, mac: Mac, not_before: u64, not_after: u64) -> RevocationRecord {
         let mut record = RevocationRecord {
             version: REVOKE_VERSION,
             flags: 0,
             mesh_id: U32::new(self.mesh_id),
             node_mac: mac.0,
             not_before: U64::new(not_before),
+            not_after: U64::new(not_after),
             signature: [0u8; 64],
         };
         let signature = self.root.sign(record.signed_body());

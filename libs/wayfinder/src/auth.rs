@@ -1,9 +1,9 @@
 //! Opt-in OGM authentication, the control-plane half of mesh segregation.
 //!
 //! When a mesh enables authentication, every OGM carries two extra TVLV records
-//! in its tail: the originator's membership certificate ([`WF_TVLV_CERT`]) and
+//! in its tail: the originator's membership certificate ([`TvlvType::Cert`]) and
 //! an Ed25519 signature over the OGM's immutable identity fields
-//! ([`WF_TVLV_OGM_SIG`]).  A receiver verifies the cert against its mesh trust
+//! ([`TvlvType::OgmSig`]).  A receiver verifies the cert against its mesh trust
 //! anchor and the signature against the cert's key, dropping anything that fails
 //! — so an outsider (or a node from another mesh) cannot inject or forge OGMs,
 //! and its topology never enters the routing table.
@@ -26,11 +26,12 @@
 //! cannot influence routing); full data-plane segregation arrives with the
 //! pairwise tag.
 
-use batman::wire::{BatmanOgmPacket, BatmanTvlvHdr, WF_TVLV_CERT, WF_TVLV_OGM_SIG, find_tvlv};
+use batman::wire::{BatmanOgmPacket, BatmanTvlvHdr, TvlvType, find_tvlv, iter_tvlv};
 use heapless::Vec as HVec;
 use interfaces::frame::Mac;
 use wayfinder_auth::{
-    Keypair, MembershipCert, TAG_LEN, TrustAnchor, frame_tag, verify_frame_tag, verify_signature,
+    Keypair, MembershipCert, RevocationRecord, TAG_LEN, TrustAnchor, frame_tag, verify_frame_tag,
+    verify_signature,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -56,10 +57,25 @@ const SIG_DOMAIN: &[u8] = b"wf-ogm-sig-v1";
 /// followed by the 16-byte pairwise tag.
 pub const DIRECTED_TRAILER_LEN: usize = 8 + TAG_LEN;
 
-/// Maximum number of revoked MACs held in the local revocation set.
+/// Maximum number of revocation records held in the local revocation set.
 const MAX_REVOKED: usize = 32;
 /// Maximum number of verified neighbor key records cached.
 const MAX_NEIGHBOR_KEYS: usize = 64;
+
+/// Length of a [`RevocationRecord`] on the wire.
+const REVOKE_LEN: usize = core::mem::size_of::<RevocationRecord>();
+
+/// How many of this node's own OGM emissions re-advertise a freshly learned
+/// revocation before it goes quiet.  Active flooding is a bounded burst — long
+/// enough to reach the whole mesh through normal OGM propagation — after which
+/// passive cert expiry keeps the node out without perpetual OGM bloat.  The
+/// record stays in the local set (still dropping the node) once the budget is
+/// spent; only its re-advertisement stops.
+const REVOKE_FLOOD_BUDGET: u8 = 6;
+
+/// Maximum revocation records attached to a single OGM, bounding how much one
+/// OGM can grow when several purges are in flight at once.
+const MAX_REVOKE_PER_OGM: usize = 4;
 
 /// Size of the reused scratch buffer for assembling the OGM signed message
 /// (domain prefix + orig + seqno + certificate).  Generous over the ~180-byte
@@ -87,6 +103,18 @@ pub struct NeighborKeys {
     pub pairwise_key: [u8; 32],
 }
 
+/// One known revocation plus its remaining re-flood budget.  The signed record
+/// is retained so this node can both *enforce* the revocation (drop the named
+/// node's frames) and *re-advertise* it on its own OGMs until the budget is
+/// spent.
+#[derive(Debug, Clone, Copy)]
+struct KnownRevocation {
+    /// The mesh-root-signed record, verified before it was stored.
+    record: RevocationRecord,
+    /// Remaining OGM emissions that will carry this record; counts down to 0.
+    floods_left: u8,
+}
+
 /// Per-node OGM authentication state, held by the router when auth is enabled.
 pub struct OgmAuth {
     /// This node's key material, for signing its own OGMs.
@@ -100,9 +128,11 @@ pub struct OgmAuth {
     /// the unix epoch) treats every not-yet-current cert as not-yet-valid, so
     /// the driver must set a real time before auth is meaningful.
     now_unix: u64,
-    /// MACs revoked by a flooded revocation record; their OGMs are dropped even
-    /// while their cert has not yet expired.
-    revoked: HVec<Mac, MAX_REVOKED>,
+    /// Revocations known to this node, learned from the management API or
+    /// flooded in an OGM tail.  Their originators' OGMs are dropped even while
+    /// the cert has not yet expired, and each is re-advertised on this node's
+    /// own OGMs while its flood budget lasts.
+    revocations: HVec<KnownRevocation, MAX_REVOKED>,
     /// Keys of neighbors whose OGMs have verified, for pairwise-key derivation
     /// and security observability.
     neighbors: HVec<NeighborKeys, MAX_NEIGHBOR_KEYS>,
@@ -113,6 +143,12 @@ pub struct OgmAuth {
     send_counters: HVec<(Mac, u64), MAX_NEIGHBOR_KEYS>,
     /// Per-neighbor highest accepted incoming counter (monotonic replay guard).
     recv_counters: HVec<(Mac, u64), MAX_NEIGHBOR_KEYS>,
+    /// Set whenever a *new* revocation is ingested, signalling the router to
+    /// snap the engine's Trickle timers back to `i_min` so the carrying OGM (and
+    /// thus the emergency purge) floods promptly instead of waiting out the
+    /// backed-off emission interval.  Drained by
+    /// [`take_trickle_reset_hint`](Self::take_trickle_reset_hint).
+    trickle_reset_hint: bool,
 }
 
 impl OgmAuth {
@@ -124,26 +160,149 @@ impl OgmAuth {
             cert,
             anchor,
             now_unix: 0,
-            revoked: HVec::new(),
+            revocations: HVec::new(),
             neighbors: HVec::new(),
             sign_scratch: [0u8; SIGN_SCRATCH_LEN],
             send_counters: HVec::new(),
             recv_counters: HVec::new(),
+            trickle_reset_hint: false,
         }
+    }
+
+    /// Take and clear the pending Trickle-reset hint: `true` if a new revocation
+    /// was ingested since the last call, meaning the router should reset the
+    /// engine's OGM timers so the purge re-floods at `i_min` without waiting for
+    /// the backed-off emission interval.
+    pub fn take_trickle_reset_hint(&mut self) -> bool {
+        core::mem::take(&mut self.trickle_reset_hint)
     }
 
     /// Update the current wall-clock time (unix seconds) used for cert validity
-    /// checks.  Called by the driver before serving traffic.
+    /// checks.  Called by the driver before serving traffic.  Also garbage-
+    /// collects revocations whose `not_after` has passed: the cancelled cert has
+    /// expired too, so passive expiry now covers the node and the record can be
+    /// forgotten, freeing a slot in the bounded revocation set.
     pub fn set_time(&mut self, now_unix: u64) {
         self.now_unix = now_unix;
+        self.prune_expired();
     }
 
-    /// Record a revoked MAC so its OGMs are dropped immediately, not only once
-    /// its cert expires.  No-op if already present or the set is full.
-    pub fn revoke(&mut self, mac: Mac) {
-        if !self.revoked.contains(&mac) {
-            let _ = self.revoked.push(mac);
+    /// Drop revocations that have passed their `not_after`.  A no-op until the
+    /// clock has been set (`now_unix == 0`), since expiry cannot be judged
+    /// before a real time is known.
+    fn prune_expired(&mut self) {
+        if self.now_unix == 0 {
+            return;
         }
+        let now = self.now_unix;
+        let mut i = 0;
+        while i < self.revocations.len() {
+            if self.revocations[i].record.not_after.get() <= now {
+                self.revocations.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Ingest a signed revocation record — from the management API (a local
+    /// operator-initiated purge) or flooded in an OGM tail — verifying it
+    /// against this node's trust anchor before acting on it.  On a *new*, valid
+    /// record the named node's keys are evicted (so its directed frames stop
+    /// verifying and we stop tagging frames to it) and the record is queued for
+    /// re-advertisement on this node's OGMs, so the purge floods with normal
+    /// control-plane traffic.  Returns `true` only when the record was newly
+    /// recorded — `false` for an invalid record or one already known — so a
+    /// caller can flood it exactly once and avoid amplification loops.
+    pub fn ingest_revocation(&mut self, record: &RevocationRecord) -> bool {
+        let mac = match self.anchor.verify_revocation(record) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::trace!(error = ?e, "auth: dropping a revocation that failed verification");
+                return false;
+            }
+        };
+        // A revocation of *this* node is a no-op here: peers enforce it against
+        // us, and storing/flooding our own death warrant would only waste a
+        // flood slot and budget.
+        if mac.0 == self.cert.node_mac {
+            tracing::warn!("auth: received a revocation naming this node");
+            return false;
+        }
+        // Ignore a revocation that has already expired on our clock — the
+        // cancelled cert is gone too, so there is nothing left to enforce.
+        if self.now_unix != 0 && record.not_after.get() <= self.now_unix {
+            return false;
+        }
+        if self.revocations.iter().any(|r| r.record.node_mac == mac.0) {
+            // Already known (MAC granularity): do not re-arm the flood budget, or
+            // two nodes could keep re-flooding each other's records forever.  A
+            // re-issued revocation for an already-revoked MAC therefore does not
+            // re-propagate — acceptable, since the node is already being dropped.
+            return false;
+        }
+        let known = KnownRevocation {
+            record: *record,
+            floods_left: REVOKE_FLOOD_BUDGET,
+        };
+        if self.revocations.push(known).is_err() {
+            // Set full.  Prefer evicting an already-expired entry (passive expiry
+            // covers it); otherwise overwrite the most-quiescent live entry
+            // (lowest remaining flood budget).  The `min_by_key` orders expired
+            // (`not_after <= now` → `false`) before live, then by budget.  With
+            // `MAX_REVOKED` *simultaneously live* revocations this still drops a
+            // live one — a hard bound worth surfacing rather than hiding.
+            let now = self.now_unix;
+            tracing::warn!("auth: revocation set full; evicting an entry to admit a new purge");
+            if let Some(slot) = self
+                .revocations
+                .iter_mut()
+                .min_by_key(|r| (r.record.not_after.get() > now, r.floods_left))
+            {
+                *slot = known;
+            }
+        }
+        self.evict_neighbor(mac);
+        // A new purge: ask the router to accelerate OGM emission so it floods
+        // promptly (set last, so only a genuinely new record triggers it).
+        self.trickle_reset_hint = true;
+        true
+    }
+
+    /// Whether `mac` is currently revoked: a known record whose enforcement
+    /// window (`not_before ..= not_after`) contains this node's clock.  Outside
+    /// the window — not yet effective, or expired (where the cancelled cert has
+    /// also expired) — the node is not dropped on this basis.
+    fn is_revoked(&self, mac: &[u8; 6]) -> bool {
+        let now = self.now_unix;
+        self.revocations.iter().any(|r| {
+            &r.record.node_mac == mac
+                && r.record.not_before.get() <= now
+                && now < r.record.not_after.get()
+        })
+    }
+
+    /// Drop any cached neighbor state for `mac` so a revoked node can no longer
+    /// participate in the directed data plane: its pairwise key is forgotten
+    /// (directed frames from it stop verifying, and we stop tagging to it) and
+    /// its replay counters are reset.
+    fn evict_neighbor(&mut self, mac: Mac) {
+        if let Some(i) = self.neighbors.iter().position(|n| n.mac == mac) {
+            self.neighbors.swap_remove(i);
+        }
+        if let Some(i) = self.send_counters.iter().position(|(m, _)| *m == mac) {
+            self.send_counters.swap_remove(i);
+        }
+        if let Some(i) = self.recv_counters.iter().position(|(m, _)| *m == mac) {
+            self.recv_counters.swap_remove(i);
+        }
+    }
+
+    /// The MACs this node currently holds revocations for (for the security
+    /// view / observability), regardless of whether their effective instant has
+    /// been reached yet.
+    pub fn revoked_macs(&self) -> impl Iterator<Item = Mac> + '_ {
+        self.revocations.iter().map(|r| Mac(r.record.node_mac))
     }
 
     /// This node's own trust anchor (for the security view / observability).
@@ -319,29 +478,58 @@ impl OgmAuth {
         // Reject (rather than wrap) if the additions would overflow the u16
         // `tvlv_len` field — checked up front, before writing anything.
         let old_tvlv_len = u16::from_be_bytes([buf[TVLV_LEN_OFF], buf[TVLV_LEN_OFF + 1]]);
-        let updated_tvlv_len = u16::try_from(added)
+        let mut tvlv_len = u16::try_from(added)
             .ok()
             .and_then(|a| old_tvlv_len.checked_add(a))?;
 
         let mut off = len;
-        off = Self::write_tvlv(buf, off, WF_TVLV_CERT, cert_bytes);
-        off = Self::write_tvlv(buf, off, WF_TVLV_OGM_SIG, &signature);
+        off = Self::write_tvlv(buf, off, TvlvType::Cert, cert_bytes);
+        off = Self::write_tvlv(buf, off, TvlvType::OgmSig, &signature);
 
-        // Grow the header's tvlv_len to cover the two new records.
-        buf[TVLV_LEN_OFF..TVLV_LEN_OFF + 2].copy_from_slice(&updated_tvlv_len.to_be_bytes());
+        // Attach pending revocations (budgeted) so an emergency purge floods
+        // with this node's normal OGM traffic.  Bounded by both
+        // `MAX_REVOKE_PER_OGM` and the remaining buffer / `tvlv_len` headroom so
+        // an OGM cannot grow without limit; a record that does not fit this OGM
+        // keeps its budget for the next one.
+        let revoke_record = TVLV_HDR + REVOKE_LEN;
+        let mut attached = 0;
+        for kr in self.revocations.iter_mut() {
+            if attached >= MAX_REVOKE_PER_OGM {
+                break;
+            }
+            if kr.floods_left == 0 {
+                continue;
+            }
+            if off + revoke_record > buf.len() {
+                break;
+            }
+            let Some(next_tvlv_len) = u16::try_from(revoke_record)
+                .ok()
+                .and_then(|a| tvlv_len.checked_add(a))
+            else {
+                break;
+            };
+            off = Self::write_tvlv(buf, off, TvlvType::Revoke, kr.record.as_bytes());
+            tvlv_len = next_tvlv_len;
+            kr.floods_left -= 1;
+            attached += 1;
+        }
+
+        // Grow the header's tvlv_len to cover every record appended above.
+        buf[TVLV_LEN_OFF..TVLV_LEN_OFF + 2].copy_from_slice(&tvlv_len.to_be_bytes());
 
         Some(off)
     }
 
     /// Write one TVLV record (header + value) at `off`, returning the next
     /// offset.  The caller must have ensured the buffer has room.
-    fn write_tvlv(buf: &mut [u8], off: usize, tvlv_type: u8, value: &[u8]) -> usize {
+    fn write_tvlv(buf: &mut [u8], off: usize, tvlv_type: TvlvType, value: &[u8]) -> usize {
         debug_assert!(
             value.len() <= u16::MAX as usize,
             "TVLV value exceeds u16 length"
         );
         let hdr = BatmanTvlvHdr {
-            tvlv_type,
+            tvlv_type: tvlv_type.as_u8(),
             version: 1,
             len: (value.len() as u16).to_be(),
         };
@@ -363,8 +551,8 @@ impl OgmAuth {
         }
         let tail = &payload[OGM_HDR..];
         let (Some(cert_bytes), Some(sig_bytes)) = (
-            find_tvlv(tail, WF_TVLV_CERT),
-            find_tvlv(tail, WF_TVLV_OGM_SIG),
+            find_tvlv(tail, TvlvType::Cert),
+            find_tvlv(tail, TvlvType::OgmSig),
         ) else {
             // Unauthenticated OGM under an auth-enabled mesh (e.g. another mesh).
             tracing::trace!("auth: dropping OGM missing cert or signature TVLV");
@@ -393,7 +581,7 @@ impl OgmAuth {
             tracing::trace!("auth: dropping OGM whose cert MAC does not match the originator");
             return false;
         }
-        if self.revoked.iter().any(|m| m.0 == orig) {
+        if self.is_revoked(&orig) {
             tracing::trace!("auth: dropping OGM from a revoked originator");
             return false;
         }
@@ -427,7 +615,28 @@ impl OgmAuth {
             x_pubkey: verified.x_pubkey,
             pairwise_key,
         });
+
+        // Fold in any revocation records this OGM carries — each independently
+        // signed by the mesh root — so an emergency purge floods alongside
+        // normal OGM traffic.  Done only after the carrying OGM verified, so
+        // an outsider cannot drive this path, and last so a revocation of the
+        // *originator itself* (carried in a forwarded copy) still records.
+        self.ingest_revocations_from_tail(tail);
         true
+    }
+
+    /// Parse and ingest every [`TvlvType::Revoke`] record in an OGM `tail`.
+    /// Each is independently verified by
+    /// [`ingest_revocation`](Self::ingest_revocation) against the trust anchor,
+    /// so a malformed or forged record is simply ignored.
+    fn ingest_revocations_from_tail(&mut self, tail: &[u8]) {
+        // `tail` is part of the caller's payload, disjoint from `self`, so the
+        // borrow held by the iterator coexists with ingesting into `self`.
+        for value in iter_tvlv(tail, TvlvType::Revoke) {
+            if let Ok((rec, _)) = RevocationRecord::ref_from_prefix(value) {
+                self.ingest_revocation(rec);
+            }
+        }
     }
 
     /// Insert or refresh a verified neighbor's keys.
@@ -564,10 +773,203 @@ mod tests {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut a = member(&authority, 2, mac(2), 1000);
         let mut b = member(&authority, 3, mac(3), 1000);
-        b.revoke(mac(2));
+        let record = authority.revoke(mac(2), 0, 1000);
+        assert!(b.ingest_revocation(&record));
         let (mut buf, len) = bare_ogm(mac(2), 7);
         let len = a.augment_ogm(&mut buf, len).unwrap();
         assert!(!b.verify_ogm(&buf[..len]));
+    }
+
+    /// A revocation whose effective instant (`not_before`) is still in the
+    /// future does not yet drop the node — passive timing is honoured.
+    #[test]
+    fn future_revocation_not_yet_effective() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000); // now_unix = 100
+        let record = authority.revoke(mac(2), 500, 1000); // effective at 500 > 100
+        assert!(b.ingest_revocation(&record));
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).unwrap();
+        // Not yet effective, so the OGM is still accepted.
+        assert!(b.verify_ogm(&buf[..len]));
+        // Once the clock reaches the effective instant, the node is dropped.
+        b.set_time(500);
+        let (mut buf, len) = bare_ogm(mac(2), 8);
+        let len = a.augment_ogm(&mut buf, len).unwrap();
+        assert!(!b.verify_ogm(&buf[..len]));
+    }
+
+    /// An invalid (forged) revocation is ignored: `ingest_revocation` returns
+    /// false and the targeted node keeps routing.
+    #[test]
+    fn forged_revocation_ignored() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let attacker = Authority::from_seed(&[7; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        let forged = attacker.revoke(mac(2), 0, 1000);
+        assert!(!b.ingest_revocation(&forged));
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).unwrap();
+        assert!(b.verify_ogm(&buf[..len]));
+    }
+
+    /// Ingesting the same revocation twice records it once and reports the
+    /// second as already-known, so a re-flood does not amplify.
+    #[test]
+    fn duplicate_revocation_recorded_once() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        let record = authority.revoke(mac(2), 0, 1000);
+        assert!(b.ingest_revocation(&record));
+        assert!(!b.ingest_revocation(&record));
+        assert_eq!(b.revoked_macs().filter(|m| *m == mac(2)).count(), 1);
+    }
+
+    /// A revocation learned by one node floods to a peer through the OGM tail:
+    /// `a` ingests a purge of node 9, attaches it to its OGM, and `b` records it
+    /// just from verifying that OGM — no direct API call on `b`.
+    #[test]
+    fn revocation_floods_through_ogm_tail() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let record = authority.revoke(mac(9), 0, 1000);
+        assert!(a.ingest_revocation(&record));
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).unwrap();
+        // The OGM now carries the revocation TVLV; verifying it on `b` ingests it.
+        assert!(b.verify_ogm(&buf[..len]));
+        assert!(b.revoked_macs().any(|m| m == mac(9)));
+    }
+
+    /// The re-flood budget is finite: after `REVOKE_FLOOD_BUDGET` OGM emissions
+    /// the record stops being attached, but the node stays revoked locally.
+    #[test]
+    fn revoke_flood_budget_is_finite() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let record = authority.revoke(mac(9), 0, 1000);
+        assert!(a.ingest_revocation(&record));
+
+        // Drain the budget; each emission should carry the revoke TVLV.
+        for seqno in 0..REVOKE_FLOOD_BUDGET as u32 {
+            let (mut buf, len) = bare_ogm(mac(2), seqno);
+            let len = a.augment_ogm(&mut buf, len).unwrap();
+            assert!(
+                find_tvlv(&buf[OGM_HDR..len], TvlvType::Revoke).is_some(),
+                "emission {seqno} should still carry the revocation"
+            );
+        }
+        // Budget spent: the next OGM no longer carries it.
+        let (mut buf, len) = bare_ogm(mac(2), 99);
+        let len = a.augment_ogm(&mut buf, len).unwrap();
+        assert!(find_tvlv(&buf[OGM_HDR..len], TvlvType::Revoke).is_none());
+        // But the node is still locally revoked.
+        assert!(a.revoked_macs().any(|m| m == mac(9)));
+    }
+
+    /// Revoking a verified neighbor evicts its pairwise key, so directed frames
+    /// to it can no longer be tagged (the data-plane half of the purge).
+    #[test]
+    fn revocation_evicts_neighbor_pairwise_key() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+
+        // a can tag a frame for b before the revocation.
+        let mut trailer = [0u8; DIRECTED_TRAILER_LEN];
+        assert!(a.tag_directed(mac(3), b"f", &mut trailer).is_some());
+
+        // Revoke b on a; a forgets b's key and can no longer tag to it.
+        let record = authority.revoke(mac(3), 0, 1000);
+        assert!(a.ingest_revocation(&record));
+        assert!(a.tag_directed(mac(3), b"f", &mut trailer).is_none());
+    }
+
+    /// A revocation naming *this* node is a no-op: it is neither stored nor
+    /// re-flooded (peers enforce it against us; we don't carry our own).
+    #[test]
+    fn self_revocation_is_a_noop() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let record = authority.revoke(mac(2), 0, 1000); // a's own MAC
+        assert!(!a.ingest_revocation(&record));
+        assert_eq!(a.revoked_macs().count(), 0);
+    }
+
+    /// A node whose clock is unset (`now_unix == 0`) does not enforce a
+    /// revocation whose `not_before` is in the future, even though the record is
+    /// stored — timing is honoured rather than failing open.
+    #[test]
+    fn unset_clock_does_not_enforce_future_revocation() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let kp = Keypair::from_seed(&[3; 32]);
+        let cert = authority.issue_cert(mac(3), kp.ed_pubkey(), kp.x_pubkey(), 0, 1_000_000);
+        // Note: no set_time, so now_unix == 0.
+        let mut b = OgmAuth::new(kp, cert, authority.trust_anchor());
+
+        let record = authority.revoke(mac(2), 500, 1000); // effective at 500
+        assert!(b.ingest_revocation(&record));
+        // now_unix is 0, which is below not_before (500), so mac(2) is not yet
+        // revoked: the check is a window, not "stored ⇒ dropped".
+        assert!(!b.is_revoked(&mac(2).0));
+    }
+
+    /// Once a revocation's `not_after` passes, `set_time` garbage-collects it,
+    /// freeing the slot — the bound on how long a record is retained.
+    #[test]
+    fn expired_revocation_is_garbage_collected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1_000_000); // now_unix = 100
+        let record = authority.revoke(mac(2), 0, 1000);
+        assert!(b.ingest_revocation(&record));
+        assert_eq!(b.revoked_macs().count(), 1);
+        // Advance past not_after: the record is pruned on the clock update.
+        b.set_time(1001);
+        assert_eq!(b.revoked_macs().count(), 0);
+    }
+
+    /// A new revocation raises the Trickle-reset hint (so the router accelerates
+    /// OGM emission); draining clears it, and a duplicate raises nothing.
+    #[test]
+    fn new_revocation_raises_trickle_reset_hint() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1_000_000);
+        assert!(
+            !b.take_trickle_reset_hint(),
+            "no hint before any revocation"
+        );
+
+        let record = authority.revoke(mac(2), 0, 1000);
+        assert!(b.ingest_revocation(&record));
+        assert!(
+            b.take_trickle_reset_hint(),
+            "a new purge must request a reset"
+        );
+        assert!(
+            !b.take_trickle_reset_hint(),
+            "the hint is cleared once taken"
+        );
+
+        // A duplicate is not new, so it must not re-trigger a reset.
+        assert!(!b.ingest_revocation(&record));
+        assert!(!b.take_trickle_reset_hint());
+    }
+
+    /// An already-expired revocation is ignored on ingest rather than stored.
+    #[test]
+    fn already_expired_revocation_ignored() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1_000_000);
+        b.set_time(2000);
+        let record = authority.revoke(mac(2), 0, 1000); // not_after 1000 < now 2000
+        assert!(!b.ingest_revocation(&record));
+        assert_eq!(b.revoked_macs().count(), 0);
     }
 
     /// Augmentation preserves an existing TVLV tail (e.g. mcast) and the
@@ -580,12 +982,7 @@ mod tests {
 
         // Hand-build an OGM with a small pre-existing TVLV record in the tail.
         let (mut buf, mut len) = bare_ogm(mac(2), 7);
-        len = OgmAuth::write_tvlv(
-            &mut buf,
-            len,
-            batman::wire::BATADV_TVLV_MCAST,
-            &[1, 2, 3, 4],
-        );
+        len = OgmAuth::write_tvlv(&mut buf, len, batman::wire::TvlvType::Mcast, &[1, 2, 3, 4]);
         let mcast_record = TVLV_HDR + 4;
         buf[TVLV_LEN_OFF..TVLV_LEN_OFF + 2].copy_from_slice(&(mcast_record as u16).to_be_bytes());
 
@@ -593,7 +990,7 @@ mod tests {
         assert!(b.verify_ogm(&buf[..len]));
         // The mcast TVLV is still findable after the appended records.
         assert_eq!(
-            find_tvlv(&buf[OGM_HDR..len], batman::wire::BATADV_TVLV_MCAST),
+            find_tvlv(&buf[OGM_HDR..len], batman::wire::TvlvType::Mcast),
             Some(&[1, 2, 3, 4][..])
         );
     }

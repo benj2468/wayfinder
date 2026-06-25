@@ -311,6 +311,26 @@ impl CentralRouter {
     pub fn auth_mut(&mut self) -> Option<&mut OgmAuth> {
         self.auth.as_mut()
     }
+
+    /// Ingest a signed revocation (the operator/management-API entry point for
+    /// an emergency purge), returning whether it was newly recorded.  On a new
+    /// record the engine's Trickle timers are reset so the carrying OGM floods
+    /// promptly at `i_min` instead of waiting out the backed-off emission
+    /// interval.  A no-op returning `false` when auth is disabled.
+    pub fn ingest_revocation(
+        &mut self,
+        record: &wayfinder_auth::RevocationRecord,
+        now: core::time::Duration,
+    ) -> bool {
+        let Some(auth) = self.auth.as_mut() else {
+            return false;
+        };
+        let newly = auth.ingest_revocation(record);
+        if auth.take_trickle_reset_hint() {
+            self.batman.reset_ogm_timers(now);
+        }
+        newly
+    }
     /// Process a received link-layer frame without any physical-layer
     /// metrics — equivalent to calling [`handle_frame_with_metrics`] with
     /// [`LinkMetrics::default`].  Useful for tests and for links that
@@ -395,6 +415,17 @@ impl CentralRouter {
                         forward: None,
                         deliver_local: None,
                     };
+                }
+
+                // If verifying that OGM folded in a *new* revocation, snap the
+                // Trickle timers to i_min so this node re-floods the purge
+                // promptly rather than at its backed-off emission interval.
+                if self
+                    .auth
+                    .as_mut()
+                    .is_some_and(|a| a.take_trickle_reset_hint())
+                {
+                    self.batman.reset_ogm_timers(now);
                 }
 
                 let mut reply: LinkFrameDataMut<'_> = tx_buf.into();
@@ -1011,8 +1042,7 @@ mod mcast_forwarding {
 
     use super::*;
     use batman::wire::{
-        BATADV_IV_OGM, BATADV_MCAST, BATADV_TVLV_MCAST, BatmanMcastPacket, BatmanOgmPacket,
-        BatmanTvlvHdr,
+        BATADV_IV_OGM, BATADV_MCAST, BatmanMcastPacket, BatmanOgmPacket, BatmanTvlvHdr, TvlvType,
     };
     use interfaces::frame::{LinkFrame, Mac};
     use zerocopy::{FromBytes, IntoBytes};
@@ -1046,7 +1076,7 @@ mod mcast_forwarding {
             value.extend_from_slice(g.as_bytes());
         }
         let tvlv_hdr = BatmanTvlvHdr {
-            tvlv_type: BATADV_TVLV_MCAST,
+            tvlv_type: TvlvType::Mcast.as_u8(),
             version: 1,
             len: (value.len() as u16).to_be(),
         };
