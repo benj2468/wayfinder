@@ -327,7 +327,12 @@ impl CentralRouter {
         };
         let newly = auth.ingest_revocation(record);
         if auth.take_trickle_reset_hint() {
+            tracing::info!(
+                "ingested revocation, reseting timers, revoking originators, and purgins stale OGMs"
+            );
             self.batman.reset_ogm_timers(now);
+            self.batman.revoke_originators(auth.revoked_macs());
+            self.batman.purge_stale(now);
         }
         newly
     }
@@ -420,12 +425,12 @@ impl CentralRouter {
                 // If verifying that OGM folded in a *new* revocation, snap the
                 // Trickle timers to i_min so this node re-floods the purge
                 // promptly rather than at its backed-off emission interval.
-                if self
-                    .auth
-                    .as_mut()
-                    .is_some_and(|a| a.take_trickle_reset_hint())
+                if let Some(auth) = self.auth.as_mut()
+                    && auth.take_trickle_reset_hint()
                 {
                     self.batman.reset_ogm_timers(now);
+                    self.batman.revoke_originators(auth.revoked_macs());
+                    self.batman.purge_stale(now);
                 }
 
                 let mut reply: LinkFrameDataMut<'_> = tx_buf.into();

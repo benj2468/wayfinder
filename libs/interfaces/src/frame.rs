@@ -34,7 +34,19 @@ impl MeshIdentifier for u8 {
 /// [`is_broadcast`](Mac::is_broadcast) helpers below — that the routing engine
 /// and the multicast machinery rely on.
 #[derive(
-    Clone, Copy, PartialEq, Eq, Hash, Default, Debug, FromBytes, IntoBytes, Immutable, KnownLayout,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Default,
+    Debug,
+    FromBytes,
+    IntoBytes,
+    Immutable,
+    KnownLayout,
+    PartialOrd,
+    Ord,
 )]
 #[repr(transparent)]
 pub struct Mac(pub [u8; 6]);

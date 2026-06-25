@@ -232,6 +232,7 @@ impl OgmAuth {
         // Ignore a revocation that has already expired on our clock — the
         // cancelled cert is gone too, so there is nothing left to enforce.
         if self.now_unix != 0 && record.not_after.get() <= self.now_unix {
+            tracing::warn!("auth: received a revocation that has already expired");
             return false;
         }
         if self.revocations.iter().any(|r| r.record.node_mac == mac.0) {
@@ -239,12 +240,14 @@ impl OgmAuth {
             // two nodes could keep re-flooding each other's records forever.  A
             // re-issued revocation for an already-revoked MAC therefore does not
             // re-propagate — acceptable, since the node is already being dropped.
+            tracing::warn!("auth: received a revocation that is already known");
             return false;
         }
         let known = KnownRevocation {
             record: *record,
             floods_left: REVOKE_FLOOD_BUDGET,
         };
+        tracing::info!("auth: received a new recovation: {:?}", known);
         if self.revocations.push(known).is_err() {
             // Set full.  Prefer evicting an already-expired entry (passive expiry
             // covers it); otherwise overwrite the most-quiescent live entry
@@ -287,6 +290,7 @@ impl OgmAuth {
     /// (directed frames from it stop verifying, and we stop tagging to it) and
     /// its replay counters are reset.
     fn evict_neighbor(&mut self, mac: Mac) {
+        tracing::trace!("auth: evicting neighbor: {:?}", mac);
         if let Some(i) = self.neighbors.iter().position(|n| n.mac == mac) {
             self.neighbors.swap_remove(i);
         }
