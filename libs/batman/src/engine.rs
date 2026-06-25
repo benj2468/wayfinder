@@ -331,6 +331,19 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
         }
     }
 
+    /// Revoke all originators that have been marked as stale.
+    pub fn revoke_originators(&mut self, revoked: impl Iterator<Item = Mac>) {
+        for revoked_mac in revoked {
+            tracing::info!("revoking originator: {:?}", revoked_mac);
+            self.originator_table.retain(|mac, _| revoked_mac != *mac);
+            for record in self.originator_table.values_mut() {
+                record
+                    .paths
+                    .retain(|path| revoked_mac != path.neighbor_ident);
+            }
+        }
+    }
+
     /// If a topology change was latched, clear it and reset all Trickle timers
     /// so emission accelerates back to `i_min`.  Called at the end of OGM
     /// processing and of the periodic broadcast.
