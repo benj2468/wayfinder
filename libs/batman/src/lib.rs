@@ -7,6 +7,8 @@ pub mod wire;
 #[cfg(test)]
 mod engine_tests;
 
+use core::time::Duration;
+
 use heapless::Vec as HVec;
 use heapless::index_map::FnvIndexMap;
 use interfaces::frame::Mac;
@@ -24,18 +26,26 @@ pub const MAX_MCAST_MEMBERS: usize = 64;
 /// embedded targets.
 pub const MAX_INTERFACES: usize = 8;
 
-/// How many of this node's **own** OGM rounds (the
-/// [`sequence_number`](BatmanEngine::sequence_number) counter) may advance
-/// without a refreshing OGM from a path before that path — or a whole
-/// originator reachable on no fresher path — is treated as dead: skipped when
-/// choosing a next hop and evicted by [`purge_stale`](BatmanEngine::purge_stale).
+/// How many *expected* OGM intervals a path may go without a refreshing OGM
+/// before it — or a whole originator reachable on no fresher path — is treated
+/// as dead: skipped when choosing a next hop and evicted by
+/// [`purge_stale`](BatmanEngine::purge_stale).
 ///
-/// Ageing is counted in OGM *rounds*, not wall-clock seconds, so it tracks the
-/// (now adaptive, per-link) emission cadence automatically: when the mesh is
-/// chatty a missed neighbour is reclaimed quickly, and when it has quietened
-/// into long Trickle intervals the same gap simply spans more time.  Six rounds
-/// preserves the few-consecutive-misses tolerance of the former 60 s/10 s timeout.
+/// Ageing is keyed on each path's *learned* emission cadence
+/// ([`NeighborStats::interval_estimate`]), not on this node's own OGM rate, so a
+/// well-connected node that talks fast no longer ages out a neighbour that talks
+/// slow.  The purge budget is `MAX_MISSED_OGMS × interval_estimate`: a neighbour
+/// that has quietened into a long Trickle interval is given a correspondingly
+/// long grace, and a chatty one is reclaimed quickly.  Six intervals preserves
+/// the few-consecutive-misses tolerance of the former 60 s/10 s timeout.
 pub const MAX_MISSED_OGMS: u32 = 6;
+
+/// Fallback expected OGM interval used to seed a freshly discovered path's purge
+/// budget before its second OGM provides a real gap to measure, and whenever no
+/// interface has been configured to derive a cadence from.  Once an interface is
+/// configured the seed is its `i_max` (the quietest cadence a stable neighbour
+/// settles into); this constant only applies in its absence.
+pub const DEFAULT_OGM_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Track metrics for a specific path to an originator via a specific immediate neighbor
 #[derive(Debug, Clone)]
@@ -43,24 +53,38 @@ pub struct NeighborStats {
     pub neighbor_ident: Mac,
     pub last_tq: u8,
     pub last_seqno: u32,
-    /// This node's own OGM round counter
-    /// ([`sequence_number`](BatmanEngine::sequence_number)) at the moment the
-    /// most recent OGM refreshed this path.  A path is stale once the counter
-    /// has advanced more than [`MAX_MISSED_OGMS`] beyond this stamp: its
-    /// neighbor has gone quiet, so it is skipped when selecting a next hop and
-    /// pruned by [`BatmanEngine::purge_stale`].
-    pub last_heard_round: u32,
+    /// Monotonic engine clock (the `now` passed to `handle_rx`) at the moment
+    /// the most recent OGM refreshed this path.  A path is stale once `now` has
+    /// advanced more than [`MAX_MISSED_OGMS`] × [`interval_estimate`] beyond
+    /// this stamp: its neighbor has gone quiet relative to the cadence we
+    /// learned for it, so it is skipped when selecting a next hop and pruned by
+    /// [`BatmanEngine::purge_stale`].
+    ///
+    /// [`interval_estimate`]: Self::interval_estimate
+    pub last_heard: Duration,
+    /// Slow-decaying **peak hold** of the wall-clock interval between successive
+    /// OGMs accepted on this path: the *slowest* cadence at which we settle into
+    /// hearing this originator via this neighbor.  Tracking the peak (not the
+    /// average) is what keeps convergence stable — see
+    /// [`BatmanEngine::blend_interval`] — because a multi-interface node emits a
+    /// burst of distinct-seqno OGMs per round, and an average would collapse
+    /// toward the tiny intra-burst gaps and prematurely purge a live neighbor.
+    /// Zero until the second OGM gives a first gap to measure, at which point the
+    /// purge budget tracks this observed rate instead of any fixed timeout.
+    /// Keyed per path, not per node, so each relaying neighbor ages on its own
+    /// measured rate.
+    pub interval_estimate: Duration,
 }
 
 /// A destination node in the mesh network
 #[derive(Debug, Clone)]
 pub struct OriginatorRecord {
-    /// This node's OGM round counter when the most recent OGM for this
-    /// originator was accepted via *any* path (the freshest of its
-    /// [`NeighborStats::last_heard_round`]).  When the counter has advanced more
-    /// than [`MAX_MISSED_OGMS`] beyond it, the originator has been heard from on
-    /// no path and the whole record is evicted.
-    pub last_heard_round: u32,
+    /// Monotonic engine clock when the most recent OGM for this originator was
+    /// accepted via *any* path (the freshest of its
+    /// [`NeighborStats::last_heard`]).  Used to evict the least-recently-heard
+    /// originator when the table is full; per-path ageing
+    /// ([`BatmanEngine::purge_stale`]) drives the actual staleness decision.
+    pub last_heard: Duration,
     pub neighbor_ident: Mac,
     pub best_next_hop: Mac,
     pub max_tq: u8,

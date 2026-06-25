@@ -234,9 +234,23 @@ impl TestRouter {
 
     // ── outbound ─────────────────────────────────────────────────────────────
 
-    /// Drive one periodic-broadcast tick, dispatching any OGM produced.
-    pub async fn poll(&mut self, now: Duration) {
-        self.driver.poll(now).await.expect("poll dispatch failed");
+    /// Drive one periodic tick at `now`, emitting an OGM for each interface whose
+    /// Trickle timer is due — the deterministic counterpart to the production
+    /// periodic loop ([`Driver::poll_due`]).  This is the only emission path:
+    /// like production, each due interface emits its own distinct-seqno OGM, so
+    /// tests exercise the real per-interface dynamics rather than a lockstep
+    /// single-seqno flood.
+    pub async fn poll_due(&mut self, now: Duration) {
+        self.driver
+            .poll_due(now)
+            .await
+            .expect("poll_due dispatch failed");
+    }
+
+    /// Time until this node's soonest interface is next due to emit an OGM, as of
+    /// `now` — used by the harness to advance the virtual clock event-to-event.
+    pub fn next_broadcast_after(&self, now: Duration) -> Duration {
+        self.router().next_broadcast_after(now)
     }
 
     /// Inject host application data destined for `dest` into the mesh.

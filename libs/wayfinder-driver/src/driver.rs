@@ -289,12 +289,20 @@ impl<Local: FrameIo> Driver<Local> {
             .await
     }
 
-    /// Drive one periodic-broadcast tick at instant `now` (relative to the
-    /// reference instant), dispatching any OGM produced.  Deterministic
-    /// counterpart to the `select!` timer arm, for tests that control time.
-    pub async fn poll(&mut self, now: Duration) -> anyhow::Result<()> {
+    /// Drive one *per-interface* periodic tick at instant `now`: emit an OGM for
+    /// each interface whose Trickle timer is due (advancing that timer), exactly
+    /// as the production periodic arm does via [`poll_due_ogms`].  This is the
+    /// deterministic, sleep-free counterpart to the `check_periodic` arm of
+    /// [`run_once`] — where that arm `sleep`s until the soonest timer fires on the
+    /// real tokio clock, this emits whatever is already due at the caller-supplied
+    /// `now`, so a test controlling the clock exercises the true per-interface
+    /// Trickle emission path (distinct seqno per interface) rather than the
+    /// all-interface [`poll`](Self::poll) flood.
+    ///
+    /// [`run_once`]: Driver::run_once
+    pub async fn poll_due(&mut self, now: Duration) -> anyhow::Result<()> {
         self.refresh_auth_clock(now);
-        let mesh = poll_ogm(&mut self.router, now, &mut self.tx_buffer);
+        let mesh = poll_due_ogms(&mut self.router, now, &mut self.tx_buffer);
         let output = LoopOutput { mesh, local: None };
         dispatch(
             &self.local,
@@ -387,23 +395,6 @@ impl<Local: FrameIo> Driver<Local> {
         )
         .await
     }
-}
-
-/// Produce one OGM and flood it out **every** interface at once.  Used by the
-/// deterministic [`Driver::poll`] test entry; production instead emits per
-/// interface on each link's own Trickle schedule via [`poll_due_ogms`].
-fn poll_ogm(router: &mut CentralRouter, now: Duration, tx_buffer: &mut [u8]) -> Vec<OutgoingFrame> {
-    router
-        .poll(now, tx_buffer)
-        .map(|f| OutgoingFrame {
-            dst: f.dst,
-            protocol: f.protocol,
-            payload: f.payload.to_vec(),
-            // Locally originated — flood out every interface.
-            egress: Egress::Auto { exclude: None },
-        })
-        .into_iter()
-        .collect()
 }
 
 /// Produce an OGM for each interface that is due to emit as of `now`, addressed
