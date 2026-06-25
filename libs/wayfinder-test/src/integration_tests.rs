@@ -7,7 +7,7 @@ use interfaces::frame::Mac;
 use interfaces::link::LinkMetrics;
 use tracing_subscriber::EnvFilter;
 use wayfinder::batman::MAX_MISSED_OGMS;
-use wayfinder::config::{Config, LinkConfig};
+use wayfinder::config::{Config, LinkConfig, LinkTransport, TrickleConfig};
 use wayfinder::{
     DEFAULT_BATMAN_ETHER_TYPE, EgressInterface,
     batman::wire::{BATADV_IV_OGM, BatmanOgmPacket},
@@ -150,22 +150,26 @@ async fn converge_at(h: &mut TestHarness, at: Duration) {
         .expect("mesh did not converge within the timeout");
 }
 
-/// Number of consecutive OGM rounds with no refresh after which an unrefreshed
-/// route is guaranteed to have aged out.  Purge is now gap-counted in the
-/// node's own OGM rounds (a path is dropped once `MAX_MISSED_OGMS` rounds pass
-/// without a refresh), so a few extra rounds give margin.
-const AGE_OUT_ROUNDS: u32 = MAX_MISSED_OGMS + 3;
-
-/// Age out routes that have stopped being refreshed: drive [`AGE_OUT_ROUNDS`]
-/// convergence rounds (one OGM emission per node per round) from the current
-/// virtual clock.  This is the round-based replacement for the old "jump the
-/// clock past `ORIGINATOR_TIMEOUT`" idiom — gap counting cares how many of *our*
-/// OGM rounds elapse without hearing a neighbor, not how much wall-clock passes.
+/// Age out routes that have stopped being refreshed by advancing the virtual
+/// clock past the purge budget on the production Trickle drive
+/// ([`TestHarness::advance_trickle`]).  A path ages out once `MAX_MISSED_OGMS` of
+/// its learned emission interval elapse without a refresh, and the longest a
+/// live path's budget can be is `MAX_MISSED_OGMS ×` the slowest OGM interval the
+/// mesh has currently backed off to.  Advancing just past that (with margin)
+/// ages out a node that has gone silent while the survivors keep emitting and
+/// stay live — and, by keying off the *current* backoff rather than `i_max`,
+/// keeps the clock jump small after a brief convergence (so later absolute-time
+/// reconnect convergences still move forward).
 async fn age_out(h: &mut TestHarness) {
-    let base = h.clock;
-    for i in 1..=AGE_OUT_ROUNDS as u64 {
-        converge_at(h, base + Duration::from_secs(i)).await;
-    }
+    let slowest = h
+        .machines
+        .values()
+        .flat_map(|m| m.router().ogm_schedule())
+        .map(|e| e.current_interval)
+        .max()
+        .unwrap_or(Duration::from_secs(1));
+    h.advance_trickle(h.clock + slowest * (MAX_MISSED_OGMS + 2))
+        .await;
 }
 
 fn simple_pair() -> TestHarness {
@@ -301,7 +305,7 @@ async fn test_simple_pair_send_data() {
     setup();
     let mut harness = simple_pair();
 
-    harness.poll(Duration::from_secs(1)).await;
+    harness.poll_due(Duration::from_secs(1)).await;
     harness.tick().await;
     harness.tick().await;
 
@@ -359,7 +363,7 @@ async fn test_authenticated_unicast_delivers_and_strips_tag() {
 
     // Converge: signed OGMs exchange, so each node learns the other's pairwise
     // key (required to tag/verify directed frames).
-    harness.poll(Duration::from_secs(1)).await;
+    harness.poll_due(Duration::from_secs(1)).await;
     harness.tick().await;
     harness.tick().await;
     for router in harness.machines.values() {
@@ -393,7 +397,7 @@ async fn test_line_of_three_send_data() {
     setup();
     let mut harness = line_of_three();
 
-    harness.poll(Duration::from_secs(1)).await;
+    harness.poll_due(Duration::from_secs(1)).await;
     harness.tick().await;
     harness.tick().await;
     harness.tick().await;
@@ -459,7 +463,7 @@ async fn three_routers_all_connected_discover_and_exchange() {
     let mut harness = one_switch_with_machines(3);
 
     // Two rounds of OGMs so every node learns direct routes to the others.
-    harness.poll(Duration::from_secs(1)).await;
+    harness.poll_due(Duration::from_secs(1)).await;
     harness.tick().await;
     harness.tick().await;
     harness.tick().await;
@@ -541,7 +545,7 @@ async fn ogms_stop_after_convergence() {
 
     // Converge, then drain every in-flight OGM from the initial poll so the
     // fabric is quiet before we begin measuring.
-    harness.poll(Duration::from_secs(1)).await;
+    harness.poll_due(Duration::from_secs(1)).await;
     for _ in 0..80 {
         harness.tick().await;
     }
@@ -554,7 +558,7 @@ async fn ogms_stop_after_convergence() {
 
     // Emit one fresh OGM from every node.  In a loop-free mesh this single
     // round reaches every node and then dies within the network diameter.
-    harness.poll(Duration::from_secs(2)).await;
+    harness.poll_due(Duration::from_secs(2)).await;
 
     // 4 ticks are the required number for the network to settle here
     const SETTLE_TICKS: usize = 4;
@@ -599,7 +603,7 @@ async fn traffic_fails_over_when_best_next_hop_disconnects() {
 
     // Converge: a few poll rounds, each fully drained.
     for round in 1..=3 {
-        harness.poll(Duration::from_secs(round)).await;
+        harness.poll_due(Duration::from_secs(round)).await;
         for _ in 0..10 {
             harness.tick().await;
         }
@@ -631,7 +635,7 @@ async fn traffic_fails_over_when_best_next_hop_disconnects() {
     // refreshing, far beyond any reasonable neighbor timeout, so the stale `b`
     // path ages out and `a` recomputes its best hop.
     for secs in (100..=1000).step_by(100) {
-        harness.poll(Duration::from_secs(secs)).await;
+        harness.poll_due(Duration::from_secs(secs)).await;
         for _ in 0..10 {
             harness.tick().await;
         }
@@ -671,8 +675,12 @@ async fn route_restored_after_neighbor_reconnects() {
     let m1 = harness.get_machine("machine1").ident;
     let m2 = harness.get_machine("machine2").ident;
 
-    // Converge: each node learns the other as a direct neighbor.
-    converge_at(&mut harness, Duration::from_secs(1)).await;
+    // Converge over a few rounds: each node learns the other as a direct
+    // neighbor *and* its steady OGM cadence (~1 s/round), which sets the
+    // observed-rate purge budget the age-out below relies on.
+    for round in 1..=3 {
+        converge_at(&mut harness, Duration::from_secs(round)).await;
+    }
     assert_eq!(
         harness.get_machine("machine1").router().originator_count(),
         1
@@ -733,9 +741,12 @@ async fn sole_relay_disconnect_blackholes_then_recovers() {
     let m1 = harness.get_machine("machine1").ident;
     let m3 = harness.get_machine("machine3").ident;
 
-    // Converge the line, then confirm the baseline machine1 → machine3 delivery
-    // over the relay.
-    converge_at(&mut harness, Duration::from_secs(1)).await;
+    // Converge the line over a few rounds — learning each route's steady OGM
+    // cadence (~1 s/round) so the age-out below has an observed-rate budget —
+    // then confirm the baseline machine1 → machine3 delivery over the relay.
+    for round in 1..=3 {
+        converge_at(&mut harness, Duration::from_secs(round)).await;
+    }
     for r in harness.machines.values() {
         assert_eq!(r.router().originator_count(), 2);
     }
@@ -801,7 +812,7 @@ async fn sole_relay_disconnect_blackholes_then_recovers() {
 /// forces failover to the lower-TQ `c→e` path; when `b` returns its higher-TQ
 /// OGMs must promote it back to best next hop (the engine lowers `max_tq` to the
 /// surviving path on purge, so the returning higher-TQ path wins again).
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn best_hop_reclaims_preferred_path_after_reconnect() {
     setup();
     let mut harness = two_paths_unequal_length();
@@ -1002,7 +1013,7 @@ async fn simultaneous_disconnects_blackhole_then_recover() {
 /// wire between `a` and `b` is cut — `b` keeps running and serving the rest of
 /// the mesh — so `a` loses its 2-hop path and falls back to c→e; once the link
 /// is restored `a` re-hears `b` and promotes the shorter path again.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn link_down_triggers_failover_then_restore_reclaims() {
     setup();
     let mut harness = two_paths_unequal_length();
@@ -1260,4 +1271,105 @@ async fn resolve_route_is_read_only() {
     let _ = a.router().resolve_route(mac(100));
     let third = a.router().resolve_route(mac(100));
     assert_eq!(first, third);
+}
+
+/// The default `sim/topology.py` wiring as a test harness: a 4-node diamond
+/// (d1..d4) bridged at d4–m1 to a 5-node complete graph (m1..m5), every edge its
+/// own point-to-point link.  Each link's OGM backoff uses a 1 s floor and the
+/// given `i_max_ms` ceiling (a small ceiling keeps the settling test fast while
+/// preserving the per-interface Trickle dynamics).
+fn diamond_plus_k5(i_max_ms: u64) -> TestHarness {
+    const EDGES: &[(&str, &str)] = &[
+        // diamond
+        ("d1", "d2"),
+        ("d1", "d3"),
+        ("d2", "d4"),
+        ("d3", "d4"),
+        // bridge
+        ("d4", "m1"),
+        // K5 on m1..m5
+        ("m1", "m2"),
+        ("m1", "m3"),
+        ("m1", "m4"),
+        ("m1", "m5"),
+        ("m2", "m3"),
+        ("m2", "m4"),
+        ("m2", "m5"),
+        ("m3", "m4"),
+        ("m3", "m5"),
+        ("m4", "m5"),
+    ];
+    const NODES: &[&str] = &["d1", "d2", "d3", "d4", "m1", "m2", "m3", "m4", "m5"];
+
+    let mut config = TestConfig::default();
+    for (a, b) in EDGES {
+        config.switches.push(TestSwitchConfig {
+            name: format!("{a}_{b}"),
+        });
+    }
+    for node in NODES {
+        let links: Vec<LinkConfig> = EDGES
+            .iter()
+            .filter(|(a, b)| a == node || b == node)
+            .map(|(a, b)| LinkConfig {
+                transport: LinkTransport::Test {
+                    switch_name: format!("{a}_{b}"),
+                },
+                ogm: TrickleConfig {
+                    i_min_ms: 1000,
+                    i_max_ms,
+                },
+            })
+            .collect();
+        config.machines.push(TestMachineConfig {
+            name: (*node).into(),
+            wayfinder: Config {
+                links,
+                ..Default::default()
+            },
+        });
+    }
+    config.validate().unwrap()
+}
+
+/// **Whole-mesh convergence over the production per-interface Trickle path.**
+/// With a fixed topology and no loss, the `sim/topology.py` mesh must quieten:
+/// after a warmup every node continuously knows every other (no spurious
+/// purge/flap), and every interface's Trickle backoff climbs to and stays at
+/// `i_max` (steady-state calm).  Driven by [`TestHarness::run_trickle`], so it
+/// exercises the real `poll_due_ogms` emission and flooding — the dynamics the
+/// lockstep `converge` path cannot reach.  Regression for the mesh that never
+/// settled (OGMs pinned near `i_min`, routes flapping forever).
+///
+/// Runs on tokio's **paused** clock (`start_paused`): the harness advances its
+/// own virtual `clock` event-to-event, and the only real timers are the `1 ns`
+/// non-blocking poll timeouts inside `settle`/`tick`, which a paused runtime
+/// auto-advances instantly instead of waiting out tokio's ~1 ms timer
+/// granularity — so the run is bounded by work done, not by simulated seconds.
+#[tokio::test(start_paused = true)]
+async fn diamond_plus_k5_settles_to_i_max() {
+    setup();
+    let i_max = Duration::from_secs(8);
+    let mut harness = diamond_plus_k5(8_000);
+
+    // Warm up well past the time the backoff needs to climb 1→2→4→8 s, then run
+    // a further window over which the mesh must stay both complete and calm.
+    let min_full = harness
+        .run_trickle(Duration::from_secs(40), Duration::from_secs(80))
+        .await;
+
+    assert_eq!(
+        min_full, 8,
+        "a node lost originators after warmup — routes flapping, mesh never converged"
+    );
+
+    for (name, machine) in harness.machines.iter() {
+        for e in machine.router().ogm_schedule() {
+            assert_eq!(
+                e.current_interval, i_max,
+                "node {name} iface {} never backed off to i_max (stuck at {:?}) — mesh not calm",
+                e.iface_idx, e.current_interval
+            );
+        }
+    }
 }

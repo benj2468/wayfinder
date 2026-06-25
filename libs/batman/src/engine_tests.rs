@@ -1245,93 +1245,99 @@ mod route_expiry {
     use super::*;
     use crate::MAX_MISSED_OGMS;
 
-    /// Feed one OGM for originator `orig` arriving via immediate neighbor `via`,
-    /// driving the engine's receive path.  The path is stamped with the engine's
-    /// **current OGM round** (`sequence_number`); advance that with
-    /// [`advance_to_round`] to simulate elapsed rounds.  `now` is irrelevant to
-    /// ageing (which is round-based) and only feeds the Trickle-timer reset.
-    fn feed_ogm(engine: &mut BatmanEngine<8>, orig: u8, via: u8, seqno: u32, tq: u8) {
+    /// Feed one OGM for originator `orig` arriving via immediate neighbor `via`
+    /// at virtual instant `now`, driving the engine's receive path.  The path is
+    /// stamped with `now`, and successive OGMs teach the path its observed
+    /// cadence; ageing then keys on that learned interval (see
+    /// [`BatmanEngine::purge_stale`]).  With no interface configured here the
+    /// purge budget seeds from [`DEFAULT_OGM_INTERVAL`](crate::DEFAULT_OGM_INTERVAL)
+    /// (1 s) until a second OGM gives a gap to measure, so one elapsed second
+    /// behaves like the old "one round".
+    fn feed_ogm(
+        engine: &mut BatmanEngine<8>,
+        orig: u8,
+        via: u8,
+        seqno: u32,
+        tq: u8,
+        now: Duration,
+    ) {
         let ogm = make_ogm(orig, via, seqno, tq, 50);
         let frame = make_link_frame(via, 0xff, ETH_P_BATMAN, ogm);
         let mut buf = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut buf[..]);
-        engine.handle_rx(Duration::ZERO, parse_link_frame(&frame), None, &mut reply);
+        engine.handle_rx(now, parse_link_frame(&frame), None, &mut reply);
     }
 
-    /// Jump the engine's own OGM round counter to `round`, as if it had emitted
-    /// that many periodic broadcasts — the reference clock that gap-counting
-    /// ages paths against.  (`sequence_number` is `pub`, so tests drive it
-    /// directly instead of calling `produce_periodic_broadcast` repeatedly.)
-    fn advance_to_round(engine: &mut BatmanEngine<8>, round: u32) {
-        engine.sequence_number = round;
+    /// One second past the seeded purge budget (`MAX_MISSED_OGMS × 1 s`): a path
+    /// last heard at t=0 has aged out by this instant.
+    fn aged_out_at() -> Duration {
+        Duration::from_secs(MAX_MISSED_OGMS as u64 + 1)
     }
 
     /// `next_hop` follows the highest-TQ path while it is fresh, but once that
-    /// path goes stale (no refresh within `MAX_MISSED_OGMS` rounds) it falls
-    /// back to a surviving lower-TQ path rather than returning the silent
-    /// neighbor.
+    /// path goes stale (no refresh within its purge budget) it falls back to a
+    /// surviving lower-TQ path rather than returning the silent neighbor.
     #[test]
     fn next_hop_skips_stale_path_for_fresher_alternate() {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Originator 9 is reachable via neighbor 2 (high TQ) and neighbor 3
-        // (low TQ), both heard at round 0.
-        feed_ogm(&mut engine, 9, 2, 1, 255);
-        feed_ogm(&mut engine, 9, 3, 1, 100);
-        assert_eq!(engine.next_hop(mac(9)), Some(mac(2)));
+        // (low TQ), both heard at t=0.
+        feed_ogm(&mut engine, 9, 2, 1, 255, Duration::ZERO);
+        feed_ogm(&mut engine, 9, 3, 1, 100, Duration::ZERO);
+        assert_eq!(engine.next_hop(Duration::ZERO, mac(9)), Some(mac(2)));
 
-        // Rounds advance past the gap budget; only the via-3 path is refreshed,
-        // so via-2 is now stale (last heard at round 0, current round 7 > 6).
-        advance_to_round(&mut engine, MAX_MISSED_OGMS + 1);
-        feed_ogm(&mut engine, 9, 3, 2, 100);
+        // Time advances past the budget; only the via-3 path is refreshed, so
+        // via-2 (last heard at t=0) is now stale.
+        let t = aged_out_at();
+        feed_ogm(&mut engine, 9, 3, 2, 100, t);
 
         // The stale higher-TQ via-2 path is skipped in favor of fresh via-3.
-        assert_eq!(engine.next_hop(mac(9)), Some(mac(3)));
+        assert_eq!(engine.next_hop(t, mac(9)), Some(mac(3)));
     }
 
     /// A destination all of whose paths have aged out has no next hop.
     #[test]
     fn next_hop_is_none_when_all_paths_stale() {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
-        feed_ogm(&mut engine, 9, 2, 1, 255);
+        feed_ogm(&mut engine, 9, 2, 1, 255, Duration::ZERO);
 
-        advance_to_round(&mut engine, MAX_MISSED_OGMS + 1);
-        assert_eq!(engine.next_hop(mac(9)), None);
+        assert_eq!(engine.next_hop(aged_out_at(), mac(9)), None);
     }
 
-    /// A path refreshed every round stays live indefinitely: gap counting must
-    /// reset on each refresh, not accumulate.
+    /// A path refreshed every interval stays live indefinitely: gap counting
+    /// must reset on each refresh, not accumulate.
     #[test]
     fn next_hop_stays_live_while_refreshed_each_round() {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
         for round in 0..(MAX_MISSED_OGMS + 5) {
-            advance_to_round(&mut engine, round);
-            feed_ogm(&mut engine, 9, 2, round + 1, 255);
-            assert_eq!(engine.next_hop(mac(9)), Some(mac(2)), "round {round}");
+            let now = Duration::from_secs(round as u64);
+            feed_ogm(&mut engine, 9, 2, round + 1, 255, now);
+            assert_eq!(engine.next_hop(now, mac(9)), Some(mac(2)), "round {round}");
         }
     }
 
-    /// The periodic sweep evicts originators heard on no path within the gap
-    /// budget, prunes individual stale paths from survivors, and recomputes the
-    /// cached best hop from what remains.
+    /// The periodic sweep prunes individual stale paths from survivors,
+    /// recomputes the cached best hop from what remains, and evicts an originator
+    /// left with no live path.
     #[test]
     fn purge_stale_evicts_dead_originator_and_recomputes_best() {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
-        // Originator 9 via neighbor 2 (high TQ) and neighbor 3 (low TQ) at
-        // round 0; originator 8 via neighbor 4 at round 0 only.
-        feed_ogm(&mut engine, 9, 2, 1, 255);
-        feed_ogm(&mut engine, 9, 3, 1, 100);
-        feed_ogm(&mut engine, 8, 4, 1, 255);
+        // Originator 9 via neighbor 2 (high TQ) and neighbor 3 (low TQ) at t=0;
+        // originator 8 via neighbor 4 at t=0 only.
+        feed_ogm(&mut engine, 9, 2, 1, 255, Duration::ZERO);
+        feed_ogm(&mut engine, 9, 3, 1, 100, Duration::ZERO);
+        feed_ogm(&mut engine, 8, 4, 1, 255, Duration::ZERO);
         assert_eq!(engine.originator_table.len(), 2);
         // Initially 9's best hop is the high-TQ via-2 path.
         assert_eq!(engine.lookup_route(mac(9)), Some(mac(2)));
 
-        // Refresh only 9-via-3 past the gap budget, then sweep: 9-via-2 and the
+        // Refresh only 9-via-3 past the budget, then sweep: 9-via-2 and the
         // whole originator 8 have gone stale.
-        advance_to_round(&mut engine, MAX_MISSED_OGMS + 1);
-        feed_ogm(&mut engine, 9, 3, 2, 100);
-        engine.purge_stale();
+        let t = aged_out_at();
+        feed_ogm(&mut engine, 9, 3, 2, 100, t);
+        engine.purge_stale(t);
 
         // Originator 8 is gone; originator 9 survives on its one fresh path.
         assert_eq!(engine.originator_table.len(), 1);
@@ -1463,11 +1469,15 @@ mod adaptive_backoff {
         );
     }
 
-    /// A *strictly better* next hop is a genuine inconsistency and must reset the
-    /// backoff.  Once the incumbent next hop's quality degrades, a higher-quality
-    /// alternate is allowed to take over and snap the Trickle timers to `i_min`.
+    /// A next-hop change toward an *already known* originator must NOT reset the
+    /// backoff.  Our OGM advertises only ourselves, so which neighbor we forward
+    /// through tells the mesh nothing new — and in a dense mesh the per-seqno TQ
+    /// jitter from varying flood paths would otherwise flip `best_next_hop` every
+    /// round and pin the whole mesh at `i_min`.  The route still switches; only
+    /// the Trickle reset is withheld (a genuinely lost route resets via the purge
+    /// sweep instead).
     #[test]
-    fn strictly_better_next_hop_resets_backoff() {
+    fn better_next_hop_switches_route_without_resetting_backoff() {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
         engine.configure_interface_ogm(0, I_MIN, I_MAX, Duration::ZERO);
 
@@ -1484,13 +1494,147 @@ mod adaptive_backoff {
         let grown = engine.next_broadcast_after(Duration::ZERO);
         assert!(grown > I_MIN, "interval should have grown, got {grown:?}");
 
-        // Neighbor 3 now offers a strictly higher quality than the degraded
-        // incumbent: a real next-hop change that must reset the backoff.
+        // Neighbor 3 now offers strictly higher quality than the degraded
+        // incumbent: the route must switch to neighbor 3...
         feed_ogm(&mut engine, 9, 3, 3, 255, Duration::ZERO);
-        let after = engine.next_broadcast_after(Duration::ZERO);
-        assert!(
-            after < I_MIN,
-            "a strictly better next hop must reset backoff to i_min, got {after:?}"
+        assert_eq!(
+            engine.lookup_route(mac(9)),
+            Some(mac(3)),
+            "the route should switch to the strictly better next hop"
+        );
+        // ...but the backoff must be left untouched: a next-hop change is not an
+        // inconsistency in our own advertised state.
+        assert_eq!(
+            engine.next_broadcast_after(Duration::ZERO),
+            grown,
+            "a next-hop change must not disturb the Trickle backoff"
+        );
+    }
+
+    /// Drive a node's own OGM emission exactly as the production driver does
+    /// (`poll_due_ogms`): on every wake-up, emit one OGM for *each* interface
+    /// whose Trickle timer is due, advancing both the round counter
+    /// (`sequence_number`, bumped once per `produce_periodic_broadcast`) and
+    /// that interface's backoff.  The deterministic test harness used by the
+    /// integration tests does **not** do this — it floods a single OGM out all
+    /// interfaces per round and bumps the round counter exactly once — which is
+    /// why those tests cannot observe the rate-decoupling bug exercised below.
+    fn run_local_emissions(engine: &mut BatmanEngine<8>, now: Duration, buf: &mut [u8]) {
+        while let Some(idx) = engine.due_interface(now) {
+            engine.produce_periodic_broadcast(now, buf);
+            engine.on_interface_emitted(idx, now);
+        }
+    }
+
+    /// **Regression for a real convergence bug.**  Route ageing is gap-counted
+    /// in *this node's own* OGM rounds (`sequence_number`), but a multi-interface
+    /// node bumps that counter once per interface per Trickle tick — so its
+    /// round counter races far ahead of the cadence at which it hears any single
+    /// neighbour.  A neighbour that is plainly alive (emitting steadily, well
+    /// inside `i_max`) is then purged simply because *we* talk faster than *it*
+    /// does, especially right after a reset when our timers are at `i_min` while
+    /// the neighbour is still backed off near `i_max`.  Each purge re-discovers
+    /// the neighbour (a fresh "new originator" inconsistency), which resets our
+    /// timers to `i_min`, which makes us race ahead again: the route flaps
+    /// forever and the backoff never settles at `i_max`.
+    ///
+    /// This drives the production pacing path directly and asserts the route to a
+    /// steadily-emitting neighbour is never lost.
+    #[test]
+    fn live_neighbor_emitting_steadily_is_not_purged_by_faster_local_rounds() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        // A well-connected node: three interfaces, so it emits three OGMs (and
+        // bumps its round counter three times) per Trickle tick.
+        for idx in 0..3 {
+            engine.configure_interface_ogm(idx, I_MIN, I_MAX, Duration::ZERO);
+        }
+
+        let mut buf = [0u8; 256];
+        let neighbor = 2u8;
+        // The neighbour announces itself steadily, comfortably *inside* i_max,
+        // so it is unambiguously alive the whole time.
+        let neighbor_interval = Duration::from_secs(30);
+        let mut neighbor_seqno = 0u32;
+        let mut last_neighbor_emit = Duration::ZERO;
+
+        let mut now = Duration::ZERO;
+        // Seed the table with one OGM from the neighbour.
+        neighbor_seqno += 1;
+        feed_ogm(&mut engine, neighbor, neighbor, neighbor_seqno, 255, now);
+
+        let end = Duration::from_secs(600);
+        while now < end {
+            run_local_emissions(&mut engine, now, &mut buf);
+
+            if now.saturating_sub(last_neighbor_emit) >= neighbor_interval {
+                neighbor_seqno += 1;
+                feed_ogm(&mut engine, neighbor, neighbor, neighbor_seqno, 255, now);
+                last_neighbor_emit = now;
+            }
+
+            assert!(
+                engine.lookup_route(mac(neighbor)).is_some(),
+                "route to a live, steadily-emitting neighbour was purged at {now:?}"
+            );
+
+            // Advance to the next event: our soonest due interface, or the
+            // neighbour's next scheduled emission.
+            let next_local = now + engine.next_broadcast_after(now);
+            let next_neighbor = last_neighbor_emit + neighbor_interval;
+            now = next_local.min(next_neighbor);
+        }
+    }
+
+    /// **Regression for the "periodicity never settles" symptom.**  With no real
+    /// topology change after the initial discovery, the route to the (alive)
+    /// neighbour must appear exactly once and then stay put.  Under the
+    /// rate-decoupling bug it flaps continuously — each spurious purge
+    /// re-discovers the neighbour, which resets the Trickle timers, so the
+    /// backoff is pinned near `i_min` and the mesh never quiets.  Counting the
+    /// route's presence transitions is timing-independent: a converged mesh has
+    /// exactly one (absent → present, at discovery).
+    #[test]
+    fn route_to_stable_neighbor_does_not_flap() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        for idx in 0..3 {
+            engine.configure_interface_ogm(idx, I_MIN, I_MAX, Duration::ZERO);
+        }
+
+        let mut buf = [0u8; 256];
+        let neighbor = 2u8;
+        let neighbor_interval = Duration::from_secs(30);
+        let mut neighbor_seqno = 0u32;
+        let mut last_neighbor_emit = Duration::ZERO;
+
+        let mut now = Duration::ZERO;
+        let mut present = engine.lookup_route(mac(neighbor)).is_some();
+        let mut transitions = 0u32;
+
+        let end = Duration::from_secs(600);
+        while now < end {
+            run_local_emissions(&mut engine, now, &mut buf);
+            if now.saturating_sub(last_neighbor_emit) >= neighbor_interval || neighbor_seqno == 0 {
+                neighbor_seqno += 1;
+                feed_ogm(&mut engine, neighbor, neighbor, neighbor_seqno, 255, now);
+                last_neighbor_emit = now;
+            }
+
+            let now_present = engine.lookup_route(mac(neighbor)).is_some();
+            if now_present != present {
+                transitions += 1;
+                present = now_present;
+            }
+
+            let next_local = now + engine.next_broadcast_after(now);
+            let next_neighbor = last_neighbor_emit + neighbor_interval;
+            now = next_local.min(next_neighbor);
+        }
+
+        // Exactly one transition (absent → present at discovery); anything more
+        // is the route flapping because the mesh never converged.
+        assert_eq!(
+            transitions, 1,
+            "route to a stable neighbour flapped {transitions} times instead of converging once"
         );
     }
 }

@@ -67,10 +67,17 @@ impl TestHarness {
         Self::default()
     }
 
-    pub async fn poll(&mut self, now: Duration) {
+    /// Emit one periodic OGM round at virtual instant `now`: set the clock and
+    /// have every node emit on each interface whose Trickle timer is due
+    /// ([`TestRouter::poll_due`] — the production per-interface path).  Most tests
+    /// call this once with `now` past the first Trickle fire (≥ `i_min`), so every
+    /// interface emits its first OGM and the mesh converges; the explicit clock
+    /// also drives time-based route ageing.  For multi-round backoff dynamics
+    /// (settling to `i_max`) use [`run_trickle`](Self::run_trickle).
+    pub async fn poll_due(&mut self, now: Duration) {
         self.clock = now;
         for router in self.machines.values_mut() {
-            router.poll(now).await;
+            router.poll_due(now).await;
         }
     }
 
@@ -81,7 +88,7 @@ impl TestHarness {
     pub async fn tick(&mut self) -> usize {
         let now = self.clock;
         // The periodic (OGM) arm is disabled here (`check_periodic = false`):
-        // OGM rounds are driven explicitly by `poll`, so a tick only moves the
+        // OGM rounds are driven explicitly by `poll_due`, so a tick only moves the
         // frames already on the wire — first every node transmits, then every
         // node receives.
         for router in self.machines.values_mut() {
@@ -119,7 +126,7 @@ impl TestHarness {
     /// "the mesh converged" assertion, and keeps large meshes (hundreds of
     /// nodes) honest about how long settling is allowed to take.
     pub async fn converge(&mut self, at: Duration) {
-        self.poll(at).await;
+        self.poll_due(at).await;
         self.settle().await;
     }
 
@@ -130,20 +137,95 @@ impl TestHarness {
     /// unprocessed duplicate OGM (the same seqno arriving via a second path) in
     /// its ingress, so this requires the fabric to be silent for several
     /// *consecutive* sweeps before declaring convergence.  Use after injecting
-    /// traffic (e.g. `send_local`) to let it reach its destination.  Bounded by
-    /// the caller's `tokio::time::timeout` for the convergence case.
+    /// traffic (e.g. `send_local`) to let it reach its destination.
+    ///
+    /// A mesh that never quiets — e.g. an OGM forwarding loop circulating until
+    /// TTL drains — would loop here forever, so the sweep count is hard-bounded:
+    /// far more than any loop-free mesh needs (diameter × duplicate drainage),
+    /// but finite, so a forwarding loop fails the test deterministically instead
+    /// of hanging, on the paused clock as well as the real one.
     pub async fn settle(&mut self) {
         // Enough consecutive silent sweeps to outlast any in-flight duplicate
         // draining hop by hop across the mesh diameter.
         const QUIET_SWEEPS: usize = 8;
+        // A loop-free mesh settles in O(diameter) active sweeps; anything beyond
+        // this many total sweeps without quiescing is a forwarding loop.
+        const MAX_SWEEPS: usize = 100_000;
         let mut quiet = 0;
+        let mut total = 0;
         while quiet < QUIET_SWEEPS {
+            total += 1;
+            assert!(
+                total < MAX_SWEEPS,
+                "settle did not quiesce in {MAX_SWEEPS} sweeps — likely an OGM forwarding loop"
+            );
             if self.tick().await > 0 {
                 quiet = 0;
             } else {
                 quiet += 1;
             }
         }
+    }
+
+    /// One event step of the production per-interface Trickle drive: advance the
+    /// virtual clock to the soonest interface fire across the whole mesh, have
+    /// every node emit whatever interface(s) are now due (one distinct seqno
+    /// each, via [`poll_due`](Self::poll_due) / `poll_due_ogms`), then flood the
+    /// result to quiescence through the real [`Switch`].  The building block of
+    /// [`advance_trickle`](Self::advance_trickle) and
+    /// [`run_trickle`](Self::run_trickle).
+    async fn trickle_step(&mut self) {
+        let now = self.clock;
+        let dt = self
+            .machines
+            .values()
+            .map(|m| m.next_broadcast_after(now))
+            .min()
+            .unwrap_or(Duration::from_secs(1))
+            .max(Duration::from_nanos(1));
+        self.clock = now + dt;
+        for m in self.machines.values_mut() {
+            m.poll_due(self.clock).await;
+        }
+        self.settle().await;
+    }
+
+    /// Advance the virtual clock to at least `to` using the production
+    /// per-interface Trickle drive ([`trickle_step`](Self::trickle_step)): nodes
+    /// emit on their own backoff schedules, so live nodes keep refreshing each
+    /// other while a node that has gone silent ages out once `to` passes its
+    /// purge budget.  The deterministic image of the real driver's periodic loop.
+    pub async fn advance_trickle(&mut self, to: Duration) {
+        let mut guard = 0u64;
+        while self.clock < to {
+            guard += 1;
+            assert!(guard < 2_000_000, "trickle advance failed to terminate");
+            self.trickle_step().await;
+        }
+    }
+
+    /// Run the Trickle drive from the current instant to `end`, returning the
+    /// **minimum originator count observed at any node after `warmup`** —
+    /// `num_machines - 1` means every node continuously knew every other (no
+    /// spurious purge/flap); anything less means routes flapped.  Used by the
+    /// whole-mesh settling test; unlike [`converge`](Self::converge) it exercises
+    /// the multi-round backoff dynamics (settling to `i_max`).
+    pub async fn run_trickle(&mut self, warmup: Duration, end: Duration) -> usize {
+        let n = self.machines.len();
+        let mut min_full = n.saturating_sub(1);
+        let mut guard = 0u64;
+
+        while self.clock < end {
+            guard += 1;
+            assert!(guard < 2_000_000, "trickle drive failed to terminate");
+            self.trickle_step().await;
+            if self.clock >= warmup {
+                for m in self.machines.values() {
+                    min_full = min_full.min(m.router().originator_count());
+                }
+            }
+        }
+        min_full
     }
 
     pub fn get_machine(&self, name: &str) -> &TestRouter {

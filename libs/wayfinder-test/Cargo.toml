@@ -28,3 +28,7 @@ futures.workspace = true
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
+# `test-util` enables tokio's pausable clock (`#[tokio::test(start_paused)]`),
+# so the Trickle-paced convergence test advances virtual time instantly instead
+# of waiting out real timer granularity.
+tokio = { workspace = true, features = ["test-util"] }
