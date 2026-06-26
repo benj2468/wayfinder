@@ -208,6 +208,31 @@ pub struct Config {
     /// Optional opt-in mesh authentication.  Absent ⇒ unauthenticated.
     #[serde(default)]
     pub auth: Option<AuthConfig>,
+    /// Optional certificate-authority (provider) mode.  Absent ⇒ the node is a
+    /// plain member and rejects enrollment requests.
+    #[serde(default)]
+    pub provider: Option<ProviderConfig>,
+}
+
+/// Enables certificate-authority (provider) mode on a node: it holds the mesh
+/// root key and serves enrollment (`SubmitCsr`/`GetTrustAnchor`/`RevokeNode`)
+/// over the management API, so members can obtain certificates without the root
+/// key ever leaving this node.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ProviderConfig {
+    /// Path to the mesh root seed (32 raw bytes).  This is the mesh root of
+    /// trust — keep it secret and only on the provider.
+    pub root_seed_path: String,
+    /// The mesh id this authority signs for.
+    pub mesh_id: u32,
+    /// Validity window length applied to issued certificates, in seconds.  Keep
+    /// it short — passive expiry is the primary revocation mechanism.
+    pub cert_ttl_secs: u64,
+    /// Optional shared enrollment token.  When set, a CSR must present the
+    /// matching value; when absent, enrollment is open (TOFU — suitable for
+    /// closed or simulated networks).
+    #[serde(default)]
+    pub enrollment_token: Option<String>,
 }
 
 #[cfg(test)]

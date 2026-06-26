@@ -15,13 +15,18 @@ use wayfinder::auth::OgmAuth;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder::wayfinder_auth::Keypair;
 use wayfinder::wayfinder_auth::MembershipCert;
+use wayfinder::wayfinder_auth::RevocationRecord;
 use wayfinder::wayfinder_auth::TrustAnchor;
 use wayfinder_protos::service::{
-    EgressDecisionData, InterfaceThroughputData, LinkQualityEntryData, NeighborPathData,
-    NodeMetricsData, OgmScheduleEntryData, RouteResolutionData, RoutingEntryData,
+    EgressDecisionData, EnrollData, InterfaceThroughputData, LinkQualityEntryData,
+    NeighborPathData, NodeMetricsData, OgmScheduleEntryData, RouteResolutionData, RoutingEntryData,
     TableOccupancyData, WayfinderDataProvider,
 };
 use zerocopy::{FromBytes, IntoBytes};
+
+use crate::provider::MeshAuthority;
+
+use alloc::string::{String, ToString};
 
 /// Adapts a borrowed [`CentralRouter`] to the management-API data provider
 /// trait.  Node addresses are [`Mac`]; the adapter projects them as raw
@@ -35,14 +40,23 @@ use zerocopy::{FromBytes, IntoBytes};
 pub struct RouterAdapter<'a> {
     router: &'a mut CentralRouter,
     now: Duration,
+    /// The mesh certificate authority, present only when this node runs in
+    /// provider mode.  Drives the enrollment requests (`get_trust_anchor`,
+    /// `submit_csr`, `revoke_node`); absent ⇒ those return an error.
+    ca: Option<&'a mut dyn MeshAuthority>,
 }
 
 impl<'a> RouterAdapter<'a> {
     /// Wrap a borrowed router so its state can be served through the management
     /// API, evaluating time-varying metrics (throughput) as of `now` — the same
-    /// monotonic instant the driver stamps on received frames.
-    pub fn new(router: &'a mut CentralRouter, now: Duration) -> Self {
-        Self { router, now }
+    /// monotonic instant the driver stamps on received frames.  `ca` is the
+    /// optional provider-mode certificate authority.
+    pub fn new(
+        router: &'a mut CentralRouter,
+        ca: Option<&'a mut dyn MeshAuthority>,
+        now: Duration,
+    ) -> Self {
+        Self { router, now, ca }
     }
 }
 
@@ -200,6 +214,56 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
         self.router.set_auth(auth);
         Ok(())
     }
+
+    fn get_trust_anchor(&self) -> Result<Vec<u8>, String> {
+        match &self.ca {
+            Some(ca) => Ok(ca.trust_anchor_bytes()),
+            None => Err("node is not a certificate-authority provider".to_string()),
+        }
+    }
+
+    fn submit_csr(
+        &mut self,
+        node_mac: &[u8],
+        ed_pubkey: &[u8],
+        x_pubkey: &[u8],
+        enrollment_token: &str,
+    ) -> Result<EnrollData, String> {
+        let ca = self
+            .ca
+            .as_mut()
+            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?;
+        let cert = ca.issue_cert(node_mac, ed_pubkey, x_pubkey, enrollment_token)?;
+        let trust_anchor = ca.trust_anchor_bytes();
+        Ok(EnrollData { cert, trust_anchor })
+    }
+
+    fn revoke_node(&mut self, node_mac: &[u8]) -> Result<(), String> {
+        // Flooding a revocation requires the provider node to itself be an
+        // authenticated member (the revoke record rides this node's OGMs).
+        // Reject up front rather than sign a record that would silently never
+        // propagate, leaving the operator believing the node was revoked.
+        if self.router.auth().is_none() {
+            return Err(
+                "cannot revoke: this provider node has mesh authentication disabled, \
+                 so the revocation cannot be flooded"
+                    .to_string(),
+            );
+        }
+        // Sign the revocation with the CA, then fold it into our own router so it
+        // floods across the mesh (provider node is also a member).
+        let record_bytes = {
+            let ca = self
+                .ca
+                .as_mut()
+                .ok_or_else(|| "node is not a certificate-authority provider".to_string())?;
+            ca.revoke(node_mac)?
+        };
+        let (record, _) = RevocationRecord::ref_from_prefix(&record_bytes)
+            .map_err(|_| "authority produced a malformed revocation record".to_string())?;
+        self.router.ingest_revocation(record, self.now);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -257,7 +321,7 @@ mod tests {
     #[test]
     fn node_metrics_empty_table_folds_to_zero_not_nan() {
         let mut router = CentralRouter::new(mac(1));
-        let m = RouterAdapter::new(&mut router, Duration::from_secs(5)).node_metrics();
+        let m = RouterAdapter::new(&mut router, None, Duration::from_secs(5)).node_metrics();
 
         assert_eq!(m.neighbor_count, 0);
         assert_eq!((m.tq_min, m.tq_max), (0, 0));
@@ -281,7 +345,7 @@ mod tests {
         feed_direct_ogm(&mut router, mac(3), 1, 205);
         feed_direct_ogm(&mut router, mac(4), 1, 155);
 
-        let m = RouterAdapter::new(&mut router, Duration::from_secs(10)).node_metrics();
+        let m = RouterAdapter::new(&mut router, None, Duration::from_secs(10)).node_metrics();
 
         assert_eq!(m.neighbor_count, 3);
         assert_eq!(m.tq_min, 145);
@@ -290,5 +354,54 @@ mod tests {
         assert_eq!(m.paths_max, 1);
         assert_eq!(m.paths_mean, 1.0);
         assert_eq!((m.originators.used, m.originators.capacity), (3, 128));
+    }
+
+    /// `revoke_node` on a provider whose router *is* authenticated signs the
+    /// record and folds it into the router so it floods — exercising the real
+    /// adapter path (CA → parse → `ingest_revocation`), not just the CA.
+    #[test]
+    fn revoke_node_floods_when_provider_router_is_authenticated() {
+        use crate::CertAuthority;
+        use wayfinder::auth::OgmAuth;
+        use wayfinder::wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
+
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None);
+        ca.set_now_unix(100);
+
+        // The provider node is itself an authenticated member: its own CA issues
+        // its cert.
+        let kp = Keypair::from_seed(&[2; 32]);
+        let me = mac(1);
+        let cert_bytes = ca
+            .issue_cert(&me.0, &kp.ed_pubkey(), &kp.x_pubkey(), "")
+            .unwrap();
+        let cert = MembershipCert::from_bytes(&cert_bytes).unwrap();
+        let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
+
+        let mut router = CentralRouter::new(me);
+        router.set_auth(OgmAuth::new(kp, cert, anchor));
+        router.auth_mut().unwrap().set_time(100);
+
+        {
+            let mut adapter =
+                RouterAdapter::new(&mut router, Some(&mut ca), Duration::from_secs(0));
+            adapter.revoke_node(&mac(9).0).expect("revoke succeeds");
+        }
+        // The provider's own router now holds (and will flood) the revocation.
+        assert!(router.auth().unwrap().revoked_macs().any(|m| m == mac(9)));
+    }
+
+    /// `revoke_node` on a provider whose router has auth *disabled* errors rather
+    /// than signing a record that would silently never flood.
+    #[test]
+    fn revoke_node_errors_when_provider_router_has_no_auth() {
+        use crate::CertAuthority;
+
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None);
+        ca.set_now_unix(100);
+        let mut router = CentralRouter::new(mac(1)); // auth disabled
+        let mut adapter = RouterAdapter::new(&mut router, Some(&mut ca), Duration::from_secs(0));
+        let err = adapter.revoke_node(&mac(9).0).unwrap_err();
+        assert!(err.contains("authentication disabled"), "got: {err}");
     }
 }

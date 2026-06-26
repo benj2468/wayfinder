@@ -228,7 +228,7 @@ fn read_seed(path: &Path) -> anyhow::Result<[u8; 32]> {
 }
 
 /// Write secret key material with owner-only permissions where supported.
-fn write_secret(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn write_secret(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
     #[cfg(unix)]
     {

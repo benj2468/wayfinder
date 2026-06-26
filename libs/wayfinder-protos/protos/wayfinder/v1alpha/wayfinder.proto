@@ -83,6 +83,44 @@ message SetAuthRequest {
   bytes trust_anchor = 3;
 }
 
+// Fetch the mesh trust anchor a node verifies certificates against.  Served by
+// a node running in provider (certificate-authority) mode; an enrolling member
+// uses it to learn the anchor without trusting whatever it was handed
+// out-of-band.  Returns an ErrorResponse on a node that is not a provider.
+message GetTrustAnchorRequest {}
+
+// A certificate-signing request: an enrolling node asks the provider to issue a
+// membership certificate binding its MAC to its freshly generated public keys.
+// The provider (the only holder of the mesh root key) validates and signs it, so
+// the root key never leaves the provider.  Served only by a provider node.
+message SubmitCsrRequest {
+  // The enrolling node's MAC, as raw bytes (same encoding as NodeInfo.node_id).
+  // The issued certificate is bound to this MAC.
+  bytes node_mac = 1;
+
+  // The node's Ed25519 identity public key (32 bytes) — what its OGM signatures
+  // are verified against.
+  bytes ed_pubkey = 2;
+
+  // The node's X25519 public key (32 bytes) — used to derive pairwise
+  // data-plane keys.
+  bytes x_pubkey = 3;
+
+  // Optional shared enrollment token.  When the provider is configured with a
+  // token, a request must present the matching value or it is rejected; when the
+  // provider has no token configured this field is ignored (open enrollment).
+  string enrollment_token = 4;
+}
+
+// Request to revoke a node from the mesh.  The provider signs a revocation
+// record for the MAC and floods it across the mesh (the active counterpart to
+// passive certificate expiry).  Served only by a provider node; answered with an
+// Empty response on success.
+message RevokeNodeRequest {
+  // The MAC of the node to revoke, as raw bytes.
+  bytes node_mac = 1;
+}
+
 // Top-level request envelope.  Exactly one variant must be set; an empty
 // request (no variant) is treated as a protocol error and returns an
 // ErrorResponse.
@@ -112,6 +150,15 @@ message WayfinderRequest {
 
     // Set Authentication configuration
     SetAuthRequest set_auth = 8;
+
+    // Fetch the mesh trust anchor (provider mode).
+    GetTrustAnchorRequest get_trust_anchor = 9;
+
+    // Submit a certificate-signing request (provider mode).
+    SubmitCsrRequest submit_csr = 10;
+
+    // Revoke a node from the mesh (provider mode).
+    RevokeNodeRequest revoke_node = 11;
   }
 }
 
@@ -387,6 +434,25 @@ message ErrorResponse {
   string message = 1;
 }
 
+// Answer to a GetTrustAnchorRequest: the mesh trust anchor.
+message GetTrustAnchorResponse {
+  // The mesh trust anchor as raw `TrustAnchor` bytes (mesh id + root public
+  // key).  Distribute to members so they can verify certificates.
+  bytes trust_anchor = 1;
+}
+
+// Answer to a SubmitCsrRequest: the freshly issued certificate plus the anchor
+// it chains to, so the enrolling node has everything it needs to enable auth.
+message SubmitCsrResponse {
+  // The issued membership certificate as raw `MembershipCert` bytes, signed by
+  // the mesh root and bound to the requested MAC and public keys.
+  bytes cert = 1;
+
+  // The mesh trust anchor as raw `TrustAnchor` bytes, for convenience so the
+  // node need not fetch it separately.
+  bytes trust_anchor = 2;
+}
+
 // Top-level response envelope.  Always contains exactly one variant.
 message WayfinderResponse {
   // The result of the corresponding WayfinderRequest.
@@ -417,5 +483,11 @@ message WayfinderResponse {
 
     // Response to GetMetricsRequest.
     NodeMetrics metrics = 8;
+
+    // Response to GetTrustAnchorRequest.
+    GetTrustAnchorResponse trust_anchor = 10;
+
+    // Response to SubmitCsrRequest.
+    SubmitCsrResponse submit_csr = 11;
   }
 }

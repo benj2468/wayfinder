@@ -18,6 +18,14 @@ extern crate alloc;
 mod adapter;
 pub use adapter::RouterAdapter;
 
+mod provider;
+pub use provider::MeshAuthority;
+
+#[cfg(feature = "std")]
+mod authority;
+#[cfg(feature = "std")]
+pub use authority::CertAuthority;
+
 #[cfg(feature = "std")]
 mod transport;
 #[cfg(feature = "std")]
