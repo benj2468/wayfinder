@@ -131,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
     // Opt-in mesh authentication: load this node's identity, certificate, and
     // the mesh trust anchor, then enable OGM auth on the router.  Absent ⇒ the
     // node runs unauthenticated.
+    let mut auth_mesh_id: Option<u32> = None;
     if let Some(auth_cfg) = config.auth {
         use wayfinder::auth::OgmAuth;
         use wayfinder::wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
@@ -160,10 +161,54 @@ async fn main() -> anyhow::Result<()> {
         }
 
         let mesh_id = anchor.mesh_id;
+        auth_mesh_id = Some(mesh_id);
         driver
             .router_mut()
             .set_auth(OgmAuth::new(keypair, cert, anchor));
         tracing::info!("mesh authentication enabled (mesh_id = {:#x})", mesh_id);
+    }
+
+    // Opt-in provider (certificate-authority) mode: load the mesh root seed and
+    // serve enrollment over the management API.  Only the provider holds the
+    // root key.
+    if let Some(provider_cfg) = config.provider {
+        use wayfinder_server::CertAuthority;
+
+        // Provider mode requires this node to also be an authenticated member of
+        // the *same* mesh: it floods revocations over its own OGMs, and would
+        // otherwise issue certs for a mesh it cannot itself participate in.
+        match auth_mesh_id {
+            None => bail!(
+                "provider mode requires mesh authentication ([auth]) to be enabled \
+                 so revocations can be flooded"
+            ),
+            Some(id) if id != provider_cfg.mesh_id => bail!(
+                "provider mesh_id {:#x} does not match this node's auth mesh_id {:#x}",
+                provider_cfg.mesh_id,
+                id
+            ),
+            Some(_) => {}
+        }
+
+        let root_seed: [u8; 32] = std::fs::read(&provider_cfg.root_seed_path)?
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                anyhow!(
+                    "mesh root seed at {} must be 32 bytes",
+                    provider_cfg.root_seed_path
+                )
+            })?;
+        driver.set_provider(CertAuthority::new(
+            &root_seed,
+            provider_cfg.mesh_id,
+            provider_cfg.cert_ttl_secs,
+            provider_cfg.enrollment_token,
+        ));
+        tracing::info!(
+            "certificate-authority (provider) mode enabled (mesh_id = {:#x})",
+            provider_cfg.mesh_id
+        );
     }
 
     driver.run().await

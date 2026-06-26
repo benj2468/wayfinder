@@ -8,11 +8,23 @@ default = ["std"]
 # Enables the tokio-net transport listeners and the query channel that bridges
 # them to a single-threaded router loop. Without it the crate is `no_std` +
 # `alloc` and exposes only the `RouterAdapter` data-provider adapter.
-std = ["dep:tokio", "dep:tokio-util", "dep:futures", "dep:bytes", "dep:anyhow", "prost/std"]
+std = [
+    "dep:tokio",
+    "dep:tokio-util",
+    "dep:futures",
+    "dep:bytes",
+    "dep:anyhow",
+    "prost/std",
+    "wayfinder-auth/std",
+]
 
 [dependencies]
 wayfinder.workspace = true
 wayfinder-protos.workspace = true
+# Direct dep so the std `CertAuthority` (provider mode) can use the std-gated
+# `Authority`; embedded/no_std builds leave the std feature off and pull none of
+# it in.
+wayfinder-auth.workspace = true
 zerocopy.workspace = true
 tracing.workspace = true
 prost = { version = "0.13", default-features = false }

@@ -22,13 +22,13 @@ use futures::{SinkExt, StreamExt};
 use prost::Message;
 use tokio::net::{TcpStream, UnixDatagram};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use wayfinder_protos::wayfinder_v1alpha::SetAuthRequest;
 use wayfinder_protos::wayfinder_v1alpha::{
     GetLinkQualityTableRequest, GetMetricsRequest, GetNodeInfoRequest, GetOgmScheduleRequest,
-    GetRoutingTableRequest, GetThroughputRequest, LinkQualityTable, NodeInfo, NodeMetrics,
-    OgmSchedule, ResolveRouteRequest, ResolveRouteResponse, RoutingTable, Throughput,
-    WayfinderRequest, WayfinderResponse, wayfinder_request::Request as RequestKind,
-    wayfinder_response::Response as ResponseKind,
+    GetRoutingTableRequest, GetThroughputRequest, GetTrustAnchorRequest, GetTrustAnchorResponse,
+    LinkQualityTable, NodeInfo, NodeMetrics, OgmSchedule, ResolveRouteRequest,
+    ResolveRouteResponse, RevokeNodeRequest, RoutingTable, SetAuthRequest, SubmitCsrRequest,
+    SubmitCsrResponse, Throughput, WayfinderRequest, WayfinderResponse,
+    wayfinder_request::Request as RequestKind, wayfinder_response::Response as ResponseKind,
 };
 
 /// Where to reach a node's management API: a TCP `host:port` or a Unix-datagram
@@ -255,6 +255,54 @@ impl Client {
             other => Err(unexpected("SetAuth", &other)),
         }
     }
+
+    /// Provider mode: fetch the mesh trust anchor (raw `TrustAnchor` bytes).
+    pub async fn get_trust_anchor(&mut self) -> anyhow::Result<GetTrustAnchorResponse> {
+        match self
+            .request(RequestKind::GetTrustAnchor(GetTrustAnchorRequest {}))
+            .await?
+        {
+            ResponseKind::TrustAnchor(resp) => Ok(resp),
+            other => Err(unexpected("TrustAnchor", &other)),
+        }
+    }
+
+    /// Provider mode: submit a certificate-signing request for `node_mac` bound
+    /// to the given public keys, returning the issued cert and the trust anchor.
+    pub async fn submit_csr(
+        &mut self,
+        node_mac: &[u8],
+        ed_pubkey: &[u8],
+        x_pubkey: &[u8],
+        enrollment_token: &str,
+    ) -> anyhow::Result<SubmitCsrResponse> {
+        match self
+            .request(RequestKind::SubmitCsr(SubmitCsrRequest {
+                node_mac: node_mac.to_vec(),
+                ed_pubkey: ed_pubkey.to_vec(),
+                x_pubkey: x_pubkey.to_vec(),
+                enrollment_token: enrollment_token.to_string(),
+            }))
+            .await?
+        {
+            ResponseKind::SubmitCsr(resp) => Ok(resp),
+            other => Err(unexpected("SubmitCsr", &other)),
+        }
+    }
+
+    /// Provider mode: revoke `node_mac` from the mesh (the provider signs and
+    /// floods a revocation record).
+    pub async fn revoke_node(&mut self, node_mac: &[u8]) -> anyhow::Result<()> {
+        match self
+            .request(RequestKind::RevokeNode(RevokeNodeRequest {
+                node_mac: node_mac.to_vec(),
+            }))
+            .await?
+        {
+            ResponseKind::Empty(_) => Ok(()),
+            other => Err(unexpected("RevokeNode", &other)),
+        }
+    }
 }
 
 impl Drop for Client {
@@ -290,6 +338,8 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
         ResponseKind::Metrics(_) => "Metrics",
         ResponseKind::Error(_) => "Error",
         ResponseKind::Empty(_) => "Empty",
+        ResponseKind::TrustAnchor(_) => "TrustAnchor",
+        ResponseKind::SubmitCsr(_) => "SubmitCsr",
     };
     anyhow!("expected {want} response, got {got}")
 }

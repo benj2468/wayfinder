@@ -24,7 +24,7 @@ use wayfinder::config::TrickleConfig;
 use wayfinder::interfaces::frame::{LinkFrame, LinkFrameData, Mac};
 use wayfinder::{CentralRouter, DEFAULT_BATMAN_ETHER_TYPE, EgressInterface, McastPlan};
 use wayfinder_protos::service::WayfinderService;
-use wayfinder_server::{QueryRx, RouterAdapter};
+use wayfinder_server::{CertAuthority, MeshAuthority, QueryRx, RouterAdapter};
 use zerocopy::{FromBytes, IntoBytes};
 
 use wayfinder::link::{DynLinkT, LinkT};
@@ -111,6 +111,10 @@ pub struct Driver<Local: FrameIo> {
     rx_buffer: [u8; 1500],
     /// Transmit scratchpad the router builds outgoing frames into.
     tx_buffer: [u8; 1500],
+    /// The mesh certificate authority, present only when this node runs in
+    /// provider mode (set via [`set_provider`](Self::set_provider)).  Serves the
+    /// enrollment management-API requests; absent ⇒ those return an error.
+    provider: Option<CertAuthority>,
 }
 
 impl<Local: FrameIo> Driver<Local> {
@@ -146,7 +150,14 @@ impl<Local: FrameIo> Driver<Local> {
                 .unwrap_or(0),
             rx_buffer: [0u8; 1500],
             tx_buffer: [0u8; 1500],
+            provider: None,
         }
+    }
+
+    /// Enable provider (certificate-authority) mode: the node serves enrollment
+    /// requests (`GetTrustAnchor`/`SubmitCsr`/`RevokeNode`) from this `ca`.
+    pub fn set_provider(&mut self, ca: CertAuthority) {
+        self.provider = Some(ca);
     }
 
     /// Set the wall-clock unix time (seconds) that corresponds to the driver's
@@ -162,8 +173,14 @@ impl<Local: FrameIo> Driver<Local> {
     /// processes frames so cert expiry tracks the loop's `now` consistently.
     fn refresh_auth_clock(&mut self, now: Duration) {
         let epoch = self.auth_epoch_unix;
+        let unix = epoch.saturating_add(now.as_secs());
         if let Some(auth) = self.router.auth_mut() {
-            auth.set_time(epoch.saturating_add(now.as_secs()));
+            auth.set_time(unix);
+        }
+        // Keep the provider CA's issuance clock in step, so issued certificate
+        // validity windows track the same time the router verifies against.
+        if let Some(ca) = self.provider.as_mut() {
+            ca.set_now_unix(unix);
         }
     }
 
@@ -231,6 +248,7 @@ impl<Local: FrameIo> Driver<Local> {
             auth_epoch_unix: _,
             rx_buffer,
             tx_buffer,
+            provider,
         } = self;
         let mac = *mac;
 
@@ -254,7 +272,8 @@ impl<Local: FrameIo> Driver<Local> {
                     }
                 },
                 Some((request, resp_tx)) = query_rx.recv(), if check_server => {
-                    let response = WayfinderService::new(RouterAdapter::new(&mut *router, now)).handle(request);
+                    let ca = provider.as_mut().map(|c| c as &mut dyn MeshAuthority);
+                    let response = WayfinderService::new(RouterAdapter::new(&mut *router, ca, now)).handle(request);
                     let _ = resp_tx.send(response);
                     LoopOutput::none()
                 },
@@ -370,7 +389,8 @@ impl<Local: FrameIo> Driver<Local> {
             if let Ok((request, resp_tx)) = self.query_rx.try_recv() {
                 progressed = true;
                 let now = self.start.elapsed();
-                let response = WayfinderService::new(RouterAdapter::new(&mut self.router, now))
+                let ca = self.provider.as_mut().map(|c| c as &mut dyn MeshAuthority);
+                let response = WayfinderService::new(RouterAdapter::new(&mut self.router, ca, now))
                     .handle(request);
                 let _ = resp_tx.send(response);
             }

@@ -123,6 +123,10 @@ impl WayfinderDataProvider for Mock {
     fn set_auth(&mut self, _seed: &[u8], _cert: &[u8], _trust_anchor: &[u8]) -> Result<(), String> {
         Ok(())
     }
+
+    fn get_trust_anchor(&self) -> Result<Vec<u8>, String> {
+        Ok(vec![0xab; 36])
+    }
 }
 
 /// Spawn the production `WayfinderService` query loop behind a channel and
@@ -195,6 +199,11 @@ async fn assert_full_roundtrip(client: &mut Client) {
     let route = client.resolve_route(vec![0, 0, 0, 0, 0, 2]).await.unwrap();
     assert_eq!(format_mac(&route.next_hop), "00:00:00:00:00:03");
     assert_eq!(route.egress, Some(Egress::InterfaceIndex(0)));
+
+    // A provider RPC also round-trips over this transport (exercises the new
+    // GetTrustAnchor request/response framing).
+    let anchor = client.get_trust_anchor().await.unwrap();
+    assert_eq!(anchor.trust_anchor, vec![0xab; 36]);
 }
 
 #[tokio::test]

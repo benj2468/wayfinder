@@ -1,8 +1,9 @@
 use crate::wayfinder_v1alpha::Empty;
 use crate::wayfinder_v1alpha::{
-    AllInterfacesEgress, ErrorResponse, InterfaceThroughput, LinkQualityEntry, LinkQualityTable,
-    NeighborPath, NodeInfo, NodeMetrics, OgmSchedule, OgmScheduleEntry, ResolveRouteResponse,
-    RoutingEntry, RoutingTable, TableOccupancy, Throughput, WayfinderRequest, WayfinderResponse,
+    AllInterfacesEgress, ErrorResponse, GetTrustAnchorResponse, InterfaceThroughput,
+    LinkQualityEntry, LinkQualityTable, NeighborPath, NodeInfo, NodeMetrics, OgmSchedule,
+    OgmScheduleEntry, ResolveRouteResponse, RoutingEntry, RoutingTable, SubmitCsrResponse,
+    TableOccupancy, Throughput, WayfinderRequest, WayfinderResponse,
     resolve_route_response::Egress as EgressKind, wayfinder_request::Request as RequestKind,
     wayfinder_response::Response as ResponseKind,
 };
@@ -163,6 +164,42 @@ pub trait WayfinderDataProvider {
     fn resolve_route(&self, destination: &[u8]) -> Option<RouteResolutionData>;
     /// Set the auth state on the node
     fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String>;
+
+    /// Provider mode: the mesh trust anchor as raw `TrustAnchor` bytes.  The
+    /// default errors — only a node running as a certificate-authority provider
+    /// overrides these three methods.
+    fn get_trust_anchor(&self) -> Result<Vec<u8>, String> {
+        Err(String::from("node is not a certificate-authority provider"))
+    }
+
+    /// Provider mode: issue a membership certificate for a CSR, returning the
+    /// signed cert plus the trust anchor it chains to.  Default errors.
+    fn submit_csr(
+        &mut self,
+        node_mac: &[u8],
+        ed_pubkey: &[u8],
+        x_pubkey: &[u8],
+        enrollment_token: &str,
+    ) -> Result<EnrollData, String> {
+        let _ = (node_mac, ed_pubkey, x_pubkey, enrollment_token);
+        Err(String::from("node is not a certificate-authority provider"))
+    }
+
+    /// Provider mode: revoke a node, signing and flooding a revocation record.
+    /// Default errors.
+    fn revoke_node(&mut self, node_mac: &[u8]) -> Result<(), String> {
+        let _ = node_mac;
+        Err(String::from("node is not a certificate-authority provider"))
+    }
+}
+
+/// The result of a successful CSR: the issued certificate plus the trust anchor
+/// it chains to (both raw `wayfinder-auth` wire bytes).
+pub struct EnrollData {
+    /// Raw `MembershipCert` bytes, signed by the mesh root.
+    pub cert: Vec<u8>,
+    /// Raw `TrustAnchor` bytes for the enrolling node to verify against.
+    pub trust_anchor: Vec<u8>,
 }
 
 /// Stateful handler that maps [`WayfinderRequest`] → [`WayfinderResponse`].
@@ -322,6 +359,31 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                     Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
                 }
             }
+
+            Some(RequestKind::GetTrustAnchor(_)) => match self.provider.get_trust_anchor() {
+                Ok(trust_anchor) => {
+                    ResponseKind::TrustAnchor(GetTrustAnchorResponse { trust_anchor })
+                }
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            },
+
+            Some(RequestKind::SubmitCsr(req)) => match self.provider.submit_csr(
+                &req.node_mac,
+                &req.ed_pubkey,
+                &req.x_pubkey,
+                &req.enrollment_token,
+            ) {
+                Ok(data) => ResponseKind::SubmitCsr(SubmitCsrResponse {
+                    cert: data.cert,
+                    trust_anchor: data.trust_anchor,
+                }),
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            },
+
+            Some(RequestKind::RevokeNode(req)) => match self.provider.revoke_node(&req.node_mac) {
+                Ok(()) => ResponseKind::Empty(Empty {}),
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            },
 
             None => ResponseKind::Error(ErrorResponse {
                 message: "empty request".into(),
@@ -706,6 +768,8 @@ mod tests {
             ResponseKind::Metrics(_) => "Metrics",
             ResponseKind::Error(_) => "Error",
             ResponseKind::Empty(_) => "Empty",
+            ResponseKind::TrustAnchor(_) => "TrustAnchor",
+            ResponseKind::SubmitCsr(_) => "SubmitCsr",
         }
     }
 }

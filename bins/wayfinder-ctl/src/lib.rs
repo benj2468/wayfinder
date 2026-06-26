@@ -16,6 +16,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use wayfinder_auth::Keypair;
 use wayfinder_client::{Client, ConnectTarget};
 
 use crate::output::OutputFormat;
@@ -77,6 +78,31 @@ pub enum Command {
         /// Trust anchor of the CA
         trust_anchor: PathBuf,
     },
+    /// Enroll with a provider: generate a keypair, submit a CSR, and write the
+    /// returned certificate and trust anchor (online enrollment).
+    Enroll {
+        /// This node's MAC, bound into the issued certificate.
+        #[arg(long)]
+        mac: String,
+        /// Enrollment token, if the provider requires one.
+        #[arg(long, default_value = "")]
+        token: String,
+        /// Where to write the generated 32-byte identity seed (secret).
+        #[arg(long)]
+        out_seed: PathBuf,
+        /// Where to write the issued certificate.
+        #[arg(long)]
+        out_cert: PathBuf,
+        /// Where to write the mesh trust anchor.
+        #[arg(long)]
+        out_anchor: PathBuf,
+    },
+    /// Revoke a node from the mesh (talks to a provider node).
+    Revoke {
+        /// MAC of the node to revoke.
+        #[arg(long)]
+        mac: String,
+    },
     /// Offline certificate / trust-anchor tooling (no node connection).
     #[command(subcommand)]
     Cert(cert::CertCommand),
@@ -133,6 +159,35 @@ pub async fn run_query(
                 .await
                 .context("failed to set auth")?;
             "auth updated".to_string()
+        }
+        Command::Enroll {
+            mac,
+            token,
+            out_seed,
+            out_cert,
+            out_anchor,
+        } => {
+            let seed: [u8; 32] = rand::random();
+            let kp = Keypair::from_seed(&seed);
+            let mac_bytes = parse_mac6(&mac)?;
+            let resp = client
+                .submit_csr(&mac_bytes, &kp.ed_pubkey(), &kp.x_pubkey(), &token)
+                .await
+                .context("enrollment (submit_csr) failed")?;
+            cert::write_secret(&out_seed, &seed)?;
+            std::fs::write(&out_cert, &resp.cert)
+                .with_context(|| format!("writing certificate to {}", out_cert.display()))?;
+            std::fs::write(&out_anchor, &resp.trust_anchor)
+                .with_context(|| format!("writing trust anchor to {}", out_anchor.display()))?;
+            format!("enrolled {mac}: wrote seed, certificate, and trust anchor")
+        }
+        Command::Revoke { mac } => {
+            let mac_bytes = parse_mac6(&mac)?;
+            client
+                .revoke_node(&mac_bytes)
+                .await
+                .context("revocation failed")?;
+            format!("revoked {mac}")
         }
         Command::Cert(_) => unreachable!("cert is dispatched before run_query"),
     })
