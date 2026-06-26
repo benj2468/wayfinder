@@ -121,6 +121,10 @@ message RevokeNodeRequest {
   bytes node_mac = 1;
 }
 
+// List the membership certificates this provider has issued (observability for
+// the operator).  Served only by a provider node.
+message ListCertsRequest {}
+
 // Top-level request envelope.  Exactly one variant must be set; an empty
 // request (no variant) is treated as a protocol error and returns an
 // ErrorResponse.
@@ -159,6 +163,9 @@ message WayfinderRequest {
 
     // Revoke a node from the mesh (provider mode).
     RevokeNodeRequest revoke_node = 11;
+
+    // List the certificates this provider has issued (provider mode).
+    ListCertsRequest list_certs = 12;
   }
 }
 
@@ -453,6 +460,34 @@ message SubmitCsrResponse {
   bytes trust_anchor = 2;
 }
 
+// One certificate this provider has issued, summarised for the operator.
+message IssuedCert {
+  // The node MAC the certificate is bound to, as raw bytes.
+  bytes node_mac = 1;
+
+  // The node's Ed25519 identity public key (32 bytes).
+  bytes ed_pubkey = 2;
+
+  // Validity-window start (unix seconds).
+  uint64 not_before = 3;
+
+  // Validity-window end (unix seconds).
+  uint64 not_after = 4;
+
+  // Whether this provider has since revoked the node.  The entry is retained
+  // (rather than removed) so the operator can see the revocation; the node's
+  // frames are dropped mesh-wide and its cert will also passively expire.
+  bool revoked = 5;
+}
+
+// Answer to a ListCertsRequest: the certificates this provider has issued.
+message ListCertsResponse {
+  // One entry per distinct issued MAC, in first-issuance order (a re-issue
+  // updates the existing entry in place).  Empty if the provider has issued none
+  // (or was restarted — the list is in-memory).
+  repeated IssuedCert certs = 1;
+}
+
 // Top-level response envelope.  Always contains exactly one variant.
 message WayfinderResponse {
   // The result of the corresponding WayfinderRequest.
@@ -489,5 +524,8 @@ message WayfinderResponse {
 
     // Response to SubmitCsrRequest.
     SubmitCsrResponse submit_csr = 11;
+
+    // Response to ListCertsRequest.
+    ListCertsResponse list_certs = 12;
   }
 }

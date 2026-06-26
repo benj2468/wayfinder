@@ -2,10 +2,13 @@
 #
 # Simulation image for the docker-compose mesh demo.
 #
-# Unlike the production `containers/Dockerfile` (which ships only wayfinder-tap
-# on a distroless base), this image bundles BOTH wayfinder-tap and the
-# wayfinder-tui dashboard plus a shell and iproute2, so an operator can
-# `docker compose exec <node> wayfinder-tui` to inspect the live routing tree.
+# This image carries no wayfinder binaries: the repo is mounted at /workspace
+# (see sim/topology.py) and the host-built binaries under ./target are put on
+# PATH (below), so `wayfinder-tap`/`wayfinder-ctl`/`wayfinder-tui` resolve both
+# in the entrypoint and via `docker exec`. So it is just a Debian base with a
+# shell, iproute2, and tshark + the Lua dissector for poking at the live mesh.
+# Build on the host (`cargo build`) before `up`; `topology.py restart` re-execs
+# after a rebuild.
 #
 # The node's config is generated at container start by the embedded entrypoint:
 # it discovers every `eth*` NIC docker attached (one per mesh segment) and emits
@@ -13,6 +16,12 @@
 # service is wired to in docker-compose.yml — no hard-coded interface names.
 
 FROM debian:bookworm-slim
+
+# Put the host-built binaries (mounted at /workspace/target, see sim/topology.py)
+# on PATH so `wayfinder-tap`/`wayfinder-ctl`/`wayfinder-tui` are runnable by bare
+# name everywhere — the entrypoint and an interactive `docker exec`. Debug first
+# (the default `cargo build` profile), then release.
+ENV PATH="/workspace/target/debug:/workspace/target/release:${PATH}"
 
 # Network tooling for poking around inside the container while debugging the
 # mesh: tcpdump (watch RawL2 frames on the wire), net-tools (netstat/ifconfig),
@@ -54,29 +63,17 @@ NODE_IP="${NODE_IP:-10.0.0.1}"
 NETMASK="${NETMASK:-255.255.255.0}"
 ETHERTYPE="${ETHERTYPE:-0x4305}"
 SERVER_ADDR="${SERVER_ADDR:-0.0.0.0:7700}"
-
-# Resolve a wayfinder binary: prefer a host-built one from the mounted workspace
-# (./target, see sim/topology.py) so a host `cargo build` + `topology.py restart`
-# picks up code changes without rebuilding the image; fall back to the binary
-# baked into the image. WF_BIN_DIR overrides the search dir (e.g. .../release).
-resolve_bin() {
-  for d in "${WF_BIN_DIR:-}" /workspace/target/debug /workspace/target/release; do
-    if [ -n "$d" ] && [ -x "$d/$1" ]; then
-      echo "$d/$1"
-      return
-    fi
-  done
-  echo "/usr/local/bin/$1"
-}
-TAP="$(resolve_bin wayfinder-tap)"
-CTL="$(resolve_bin wayfinder-ctl)"
-TUI="$(resolve_bin wayfinder-tui)"
-echo "wayfinder-sim: using tap=$TAP ctl=$CTL tui=$TUI" >&2
-
+MESH_ID="${MESH_ID:-1}"
+# The NIC on this subnet is the out-of-band management/enrolment network, NOT a
+# mesh link, so it is excluded from the RawL2 links generated below.
+MGMT_SUBNET_PREFIX="${MGMT_SUBNET_PREFIX:-10.99.}"
 CFG=/etc/wayfinder/config.yml
 
-mkdir -p /etc/wayfinder
+# The wayfinder binaries are the host-built ones from /workspace/target, put on
+# PATH by the image (see the Dockerfile `ENV PATH`), so they are invoked by bare
+# name here and resolve identically under `docker exec`.
 
+mkdir -p /etc/wayfinder /etc/wayfinder/secrets
 
 cat > "$CFG" <<YAML
 local_egress:
@@ -87,17 +84,34 @@ local_egress:
 server:
   type: Tcp
   addr: ${SERVER_ADDR}
+YAML
+
+# Provider (certificate-authority) node: it alone holds the mesh root seed
+# (mounted at /ca) and serves enrolment over the management API.
+if [ -n "${PROVIDER:-}" ]; then
+  cat >> "$CFG" <<YAML
+provider:
+  root_seed_path: /ca/seed
+  mesh_id: ${MESH_ID}
+  cert_ttl_secs: 100000000000
+YAML
+fi
+
+cat >> "$CFG" <<YAML
 links:
 YAML
 
-# One RawL2 mesh link per docker-attached ethernet NIC. Each NIC is a separate
-# mesh segment, so the compose network wiring defines the topology.
+# One RawL2 mesh link per docker-attached ethernet NIC, EXCEPT the management
+# NIC (identified by its subnet) which carries the enrolment control plane.
 #
 # Optionally pin this node's adaptive OGM (Trickle) backoff bounds on every link
-# via OGM_I_MIN_MS / OGM_I_MAX_MS — handy to model a slow radio that should
-# chatter less. When neither is set, the links omit the `ogm:` block and the
-# router falls back to its built-in defaults (1s / 64s).
+# via OGM_I_MIN_MS / OGM_I_MAX_MS. When neither is set, the links omit the `ogm:`
+# block and the router falls back to its built-in defaults (1s / 64s).
 for ifc in $(ls /sys/class/net | grep '^eth' | sort); do
+  ip4="$(ip -4 -o addr show dev "$ifc" 2>/dev/null | awk '{print $4}' | head -1)"
+  case "$ip4" in
+    "${MGMT_SUBNET_PREFIX}"*) continue ;; # management NIC — not a mesh link
+  esac
   cat >> "$CFG" <<YAML
   - type: RawL2
     interface: ${ifc}
@@ -115,35 +129,51 @@ done
 echo "wayfinder-sim: generated $CFG" >&2
 cat "$CFG" >&2
 
-# Start the node in the background, give it a moment to bring up the TAP, then
-# enroll it: mint a node key, have the local CA (mounted at /ca) issue a cert
-# for this node's MAC, and push the bundle into the running node over its
-# management API (SetAuth).
-"$TAP" --config "$CFG" &
+# Start the node in the background and give it a moment to bring up the TAP.
+wayfinder-tap --config "$CFG" &
 WAYFINDER_PID=$!
-
 sleep 5
-
 WAYFINDER_MAC=$(ip link show dev wayfinder0 | awk '/link\/ether/ {print $2}')
 
-mkdir -p /etc/wayfinder/secrets
+if [ -n "${PROVIDER:-}" ]; then
+  # The provider self-issues its own member cert from the mounted root seed
+  # (it is both the CA and a mesh member).
+  echo "wayfinder-sim: provider node — self-issuing cert" >&2
+  wayfinder-ctl cert keygen --out-seed /etc/wayfinder/secrets/seed
+  wayfinder-ctl cert issue \
+      --ca-seed /ca/seed \
+      --mesh-id "${MESH_ID}" \
+      --mac "${WAYFINDER_MAC}" \
+      --node-seed /etc/wayfinder/secrets/seed \
+      --not-before 0 \
+      --not-after 100000000000000 \
+      --out-cert /etc/wayfinder/secrets/cert
+  cp /ca/root /etc/wayfinder/secrets/anchor
+else
+  # A member enrols online against the provider — no root seed on this node.
+  # Retry: the provider's management API may not be up yet.
+  echo "wayfinder-sim: enrolling against provider ${PROVIDER_ADDR}" >&2
+  i=0
+  until wayfinder-ctl enroll \
+      --connect "${PROVIDER_ADDR}" \
+      --mac "${WAYFINDER_MAC}" \
+      --out-seed /etc/wayfinder/secrets/seed \
+      --out-cert /etc/wayfinder/secrets/cert \
+      --out-anchor /etc/wayfinder/secrets/anchor; do
+    i=$((i + 1))
+    if [ "$i" -ge 30 ]; then
+      echo "wayfinder-sim: enrolment failed after retries" >&2
+      exit 1
+    fi
+    sleep 2
+  done
+fi
 
-"$CTL" cert keygen --out-seed /etc/wayfinder/secrets/seed
-"$CTL" cert issue \
-    --ca-seed /ca/seed \
-    --mesh-id 1 \
-    --mac "${WAYFINDER_MAC}" \
-    --node-seed /etc/wayfinder/secrets/seed \
-    --not-before 0 \
-    --not-after 100000000000000 \
-    --out-cert /etc/wayfinder/secrets/cert
-
-# set-auth takes positional <seed> <cert> <trust-anchor> and connects to the
-# node's management API (default 127.0.0.1:7700, which the Tcp server serves).
-"$CTL" set-auth \
+# Push the bundle into the running node over its local management API.
+wayfinder-ctl set-auth \
     /etc/wayfinder/secrets/seed \
     /etc/wayfinder/secrets/cert \
-    /ca/root
+    /etc/wayfinder/secrets/anchor
 
 # Hand the foreground back to the node so the container lives as long as it does.
 wait "${WAYFINDER_PID}"

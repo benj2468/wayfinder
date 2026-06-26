@@ -18,7 +18,7 @@ use wayfinder::wayfinder_auth::MembershipCert;
 use wayfinder::wayfinder_auth::RevocationRecord;
 use wayfinder::wayfinder_auth::TrustAnchor;
 use wayfinder_protos::service::{
-    EgressDecisionData, EnrollData, InterfaceThroughputData, LinkQualityEntryData,
+    EgressDecisionData, EnrollData, InterfaceThroughputData, IssuedCertData, LinkQualityEntryData,
     NeighborPathData, NodeMetricsData, OgmScheduleEntryData, RouteResolutionData, RoutingEntryData,
     TableOccupancyData, WayfinderDataProvider,
 };
@@ -263,6 +263,13 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
             .map_err(|_| "authority produced a malformed revocation record".to_string())?;
         self.router.ingest_revocation(record, self.now);
         Ok(())
+    }
+
+    fn list_certs(&self) -> Result<Vec<IssuedCertData>, String> {
+        match &self.ca {
+            Some(ca) => Ok(ca.list_certs()),
+            None => Err("node is not a certificate-authority provider".to_string()),
+        }
     }
 }
 

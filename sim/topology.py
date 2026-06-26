@@ -31,8 +31,9 @@ compose`` against an ephemeral file written to the repo root
 ``wayfinder-sim``.
 
 Fast dev loop: the repo is mounted into each node at ``/workspace`` and the
-entrypoint prefers host-built binaries under ``./target`` over the ones baked
-into the image, so::
+host-built binaries under ``./target`` are on the container's ``PATH`` (the
+image bakes in none), so ``wayfinder-tap``/``wayfinder-ctl``/``wayfinder-tui``
+run by bare name — in the entrypoint and via ``docker exec``::
 
     cargo build -p wayfinder-tap -p wayfinder-ctl   # on the host
     python sim/topology.py restart                  # re-exec the new binaries
@@ -99,8 +100,9 @@ def shared_lan(nodes: list[str]) -> list[list[str]]:
 #
 # Mint a single mesh certificate authority on the host before bringing the
 # compose project up. The directory it returns (holding the root `seed` and the
-# public trust anchor `root`) is bind-mounted read-only into every node, which
-# then self-issues its own member cert against the root seed at startup.
+# public trust anchor `root`) is bind-mounted read-only into the *provider* node
+# only; every other node enrols against the provider over the management network
+# at startup and never sees the root seed.
 
 
 def make_ca() -> Path:
@@ -227,6 +229,14 @@ def render_compose() -> str:
     e("# frames; the sim image emits one mesh link per attached NIC, so this wiring")
     e("# *is* the topology.  Bring it up with:  python sim/topology.py up")
     e("")
+    # The first node is the certificate-authority *provider*: it alone mounts the
+    # mesh root seed and serves enrollment. Every other node enrols against it
+    # over an out-of-band management network (see MGMT_NET) — so the root key
+    # lives on exactly one node, the portal model.
+    node_names = list(nodes.keys())
+    provider_name = node_names[0]
+    provider_mgmt_ip = "10.99.0.2"
+
     e("# Shared service definition, merged into each node via a YAML anchor.")
     e("x-node: &node")
     e("  build:")
@@ -234,7 +244,6 @@ def render_compose() -> str:
     e("    dockerfile: containers/sim.Dockerfile")
     e("  image: wayfinder-sim:latest")
     e("  volumes:")
-    e(f"    - {str(ca_dir)}:/ca:ro")
     # Mount the repo so the container can run *host-built* binaries from
     # ./target instead of the ones baked into the image: rebuild on the host
     # (`cargo build`) then `./sim/topology.py restart` — no image rebuild. The
@@ -255,24 +264,52 @@ def render_compose() -> str:
     e("  restart: unless-stopped")
     e("")
     e("services:")
-    for name, cfg in nodes.items():
+    for idx, (name, cfg) in enumerate(nodes.items()):
+        mgmt_ip = f"10.99.0.{idx + 2}"
+        is_provider = name == provider_name
         e(f"  {name}:")
         e("    !!merge <<: *node")
         e(f"    container_name: wf-{name}")
         e(f"    hostname: {name}")
+        # Only the provider mounts the mesh root seed.
+        if is_provider:
+            e("    volumes:")
+            e(f"      - {str(ca_dir)}:/ca:ro")
+            e(f"      - {str(REPO_ROOT)}:/workspace:ro")
+            # On a Nix host the host-built binary's ELF interpreter (and glibc) live in
+            # /nix/store; mount it read-only so a plain `cargo build` artifact is
+            # runnable in the Debian-based container without a musl/static rebuild.
+            if Path("/nix/store").is_dir():
+                e("      - /nix/store:/nix/store:ro")
         e("    environment:")
         e(f"      NODE_IP: {cfg['ip']}")
         e(f"      RUST_LOG: {cfg['rust_log']}")
+        if is_provider:
+            e('      PROVIDER: "1"')
+        else:
+            e(f"      PROVIDER_ADDR: {provider_mgmt_ip}:7700")
         for key, value in cfg["env"].items():
             e(f"      {key}: {value}")
+        # Mesh links (map form so we can pin a static IP on the mgmt net), plus
+        # the out-of-band management network with a deterministic address.
         e("    networks:")
         for net in attached[name]:
-            e(f"      - {net}")
+            e(f"      {net}: {{}}")
+        e("      wf_mgmt:")
+        e(f"        ipv4_address: {mgmt_ip}")
     e("")
     e("networks:")
     for members in links:
         e(f"  {link_name(members)}:")
         e("    driver: bridge")
+    # Out-of-band management/enrolment network. A distinct subnet (10.99.0.0/24)
+    # the entrypoint uses to tell this NIC apart from the mesh links (which it
+    # must *not* turn into a RawL2 mesh segment).
+    e("  wf_mgmt:")
+    e("    driver: bridge")
+    e("    ipam:")
+    e("      config:")
+    e("        - subnet: 10.99.0.0/24")
     e("")
     return "\n".join(lines)
 
