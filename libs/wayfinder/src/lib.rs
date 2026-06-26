@@ -298,7 +298,16 @@ impl CentralRouter {
     /// verify against the mesh trust anchor.  Without this the router stays in
     /// its open, unauthenticated mode.
     pub fn set_auth(&mut self, auth: OgmAuth) {
+        tracing::debug!("Updating auth state; resetting learned routing state");
         self.auth = Some(auth);
+        // Routes, link-quality, ident mappings, and broadcast-dedup state were
+        // all learned under the previous (or no) auth regime and are stale the
+        // instant this node's identity/anchor changes — drop them so the node
+        // re-converges cleanly under the new auth.  The engine reset also latches
+        // a topology change, so the node re-announces promptly.
+        self.batman.reset();
+        self.ident_table.clear();
+        self.link_quality.clear();
     }
 
     /// Borrow the OGM authentication state, if enabled — for the security view
@@ -437,7 +446,7 @@ impl CentralRouter {
 
                 // BATMAN-adv Protocol ID
                 let action = self.batman.handle_rx(now, frame, local_quality, &mut reply);
-                tracing::debug!(
+                tracing::trace!(
                     "Post-action reply: dst={:?}, protocol={:?}",
                     reply.dst,
                     reply.protocol
@@ -506,7 +515,7 @@ impl CentralRouter {
                 }
             }
             0x88B5 => {
-                tracing::debug!("received experimental protocol frame");
+                tracing::trace!("received experimental protocol frame");
                 // Dynamically route to a completely separate experimental protocol context
                 RxOutcome::empty()
             }
@@ -1531,6 +1540,35 @@ mod ogm_auth_integration {
             feed(&mut b, mac(1), &ogm),
             0,
             "unsigned OGM must be dropped under auth"
+        );
+    }
+
+    /// Enabling auth at runtime resets learned routing state: a route learned
+    /// while the node was open (under no auth) is dropped, so the node
+    /// re-converges cleanly under the new identity/anchor.
+    #[test]
+    fn set_auth_resets_learned_routing_state() {
+        // While open, the node learns a neighbour from an unsigned OGM.
+        let mut peer = CentralRouter::new(mac(1));
+        let ogm = poll_ogm_bytes(&mut peer);
+        let mut node = CentralRouter::new(mac(2)); // auth off
+        assert_eq!(
+            feed(&mut node, mac(1), &ogm),
+            1,
+            "learns the neighbour while open"
+        );
+
+        // Enabling auth drops the pre-auth route.
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let kp = Keypair::from_seed(&[3; 32]);
+        let cert = authority.issue_cert(mac(2), kp.ed_pubkey(), kp.x_pubkey(), 0, 1000);
+        let mut auth = crate::auth::OgmAuth::new(kp, cert, authority.trust_anchor());
+        auth.set_time(100);
+        node.set_auth(auth);
+        assert_eq!(
+            node.originator_count(),
+            0,
+            "set_auth must reset learned routing state"
         );
     }
 

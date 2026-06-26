@@ -62,6 +62,13 @@ impl<Ident: MeshIdentifier> LinkQualityTable<Ident> {
         }
     }
 
+    /// Drop every `(neighbor, interface)` quality record, restoring an empty
+    /// table.  Used when routing state is invalidated wholesale, e.g. on a
+    /// runtime authentication change.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     /// Fold a new normalized quality sample for `(neighbor, iface_idx)` into
     /// the table.  Creates a fresh entry if the pair has not been seen
     /// before, evicting the weakest existing entry when the table is at

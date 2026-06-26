@@ -19,14 +19,26 @@ Usage
     python sim/topology.py print              # print the generated compose YAML
     python sim/topology.py write [PATH]       # write it (default: docker-compose.yml)
     python sim/topology.py up [-- ARGS...]    # generate ephemeral file + compose up --build -d
+    python sim/topology.py restart [NODE...]  # re-run the entrypoint (pick up a host rebuild)
     python sim/topology.py down               # tear the ephemeral stack down
     python sim/topology.py logs [NODE...]     # follow logs
     python sim/topology.py graph              # print an ASCII adjacency summary
     python sim/topology.py blast [NODE]       # flood broadcast traffic from a node (stress test)
 
-The ``up``/``down``/``logs`` subcommands shell out to ``docker compose`` against
-an ephemeral file written to the repo root (``.sim-compose.gen.yml``, gitignored)
-under the fixed project name ``wayfinder-sim``.
+The ``up``/``restart``/``down``/``logs`` subcommands shell out to ``docker
+compose`` against an ephemeral file written to the repo root
+(``.sim-compose.gen.yml``, gitignored) under the fixed project name
+``wayfinder-sim``.
+
+Fast dev loop: the repo is mounted into each node at ``/workspace`` and the
+entrypoint prefers host-built binaries under ``./target`` over the ones baked
+into the image, so::
+
+    cargo build -p wayfinder-tap -p wayfinder-ctl   # on the host
+    python sim/topology.py restart                  # re-exec the new binaries
+
+rebuilds without ``docker compose build``. (On a Nix host ``/nix/store`` is
+mounted read-only so the host binary's interpreter resolves.)
 """
 
 from __future__ import annotations
@@ -45,7 +57,7 @@ PROJECT = "wayfinder-sim"
 
 # Default verbosity for every node's RUST_LOG. "trace" is very chatty across a
 # 9-node mesh; "info" is a sane default — bump a specific node in build_nodes().
-DEFAULT_RUST_LOG = "info"
+DEFAULT_RUST_LOG = "debug"
 
 
 # ── topology helpers ──────────────────────────────────────────────────────────
@@ -223,6 +235,16 @@ def render_compose() -> str:
     e("  image: wayfinder-sim:latest")
     e("  volumes:")
     e(f"    - {str(ca_dir)}:/ca:ro")
+    # Mount the repo so the container can run *host-built* binaries from
+    # ./target instead of the ones baked into the image: rebuild on the host
+    # (`cargo build`) then `./sim/topology.py restart` — no image rebuild. The
+    # entrypoint prefers these and falls back to the baked-in binaries.
+    e(f"    - {str(REPO_ROOT)}:/workspace:ro")
+    # On a Nix host the host-built binary's ELF interpreter (and glibc) live in
+    # /nix/store; mount it read-only so a plain `cargo build` artifact is
+    # runnable in the Debian-based container without a musl/static rebuild.
+    if Path("/nix/store").is_dir():
+        e("    - /nix/store:/nix/store:ro")
     e("  cap_add:")
     e("    - NET_ADMIN # create the kernel TAP device")
     e("    - NET_RAW # AF_PACKET raw L2 sockets")
@@ -375,6 +397,12 @@ def main(argv: list[str]) -> int:
     sub.add_parser(
         "down", help="`docker compose down` the ephemeral stack (removes networks)"
     )
+    rs = sub.add_parser(
+        "restart",
+        help="re-run the entrypoint on the running nodes (`docker compose restart`) "
+        "— picks up a host rebuild of the mounted binaries without rebuilding the image",
+    )
+    rs.add_argument("nodes", nargs="*", help="nodes to restart (default: all)")
     lg = sub.add_parser(
         "logs", help="follow `docker compose logs -f` (optionally for given nodes)"
     )
@@ -435,6 +463,10 @@ def main(argv: list[str]) -> int:
         if not EPHEMERAL.exists():
             write_compose(EPHEMERAL)
         return compose("down")
+    if args.cmd == "restart":
+        if not EPHEMERAL.exists():
+            write_compose(EPHEMERAL)
+        return compose("restart", *args.nodes)
     if args.cmd == "logs":
         return compose("logs", "-f", *args.nodes)
     if args.cmd == "blast":
