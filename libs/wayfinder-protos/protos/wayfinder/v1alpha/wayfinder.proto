@@ -16,6 +16,10 @@ syntax = "proto3";
 
 package wayfinder.v1alpha;
 
+// An empty payload, used as the response to a request that only succeeds or
+// fails (e.g. SetAuthRequest) and carries no data back.
+message Empty {}
+
 // ── Requests ──────────────────────────────────────────────────────────────────
 
 // Request for basic information about the local node.
@@ -62,6 +66,23 @@ message ResolveRouteRequest {
   bytes destination = 1;
 }
 
+// Update the authentication configuration on the node, enabling (or replacing)
+// opt-in mesh authentication at runtime.  The three fields are the raw bytes of
+// the same material wayfinder-tap otherwise loads from disk; the node builds its
+// OgmAuth from them.  Because the seed is the node's private identity, this is a
+// privileged operation — restrict who can reach the management endpoint.
+message SetAuthRequest {
+  // The node's 32-byte Ed25519 identity seed, as raw bytes.  Secret: it *is*
+  // the node's identity.
+  bytes seed = 1;
+  // The node's membership certificate, as raw `MembershipCert` bytes (signed
+  // by the mesh root).
+  bytes cert = 2;
+  // The mesh trust anchor, as raw `TrustAnchor` bytes (the mesh id and root
+  // public key the node verifies certificates against).
+  bytes trust_anchor = 3;
+}
+
 // Top-level request envelope.  Exactly one variant must be set; an empty
 // request (no variant) is treated as a protocol error and returns an
 // ErrorResponse.
@@ -88,6 +109,9 @@ message WayfinderRequest {
 
     // Query the node's aggregate health and topology metrics.
     GetMetricsRequest get_metrics = 7;
+
+    // Set Authentication configuration
+    SetAuthRequest set_auth = 8;
   }
 }
 
@@ -367,6 +391,9 @@ message ErrorResponse {
 message WayfinderResponse {
   // The result of the corresponding WayfinderRequest.
   oneof response {
+    // No response
+    Empty empty = 9;
+
     // Response to GetNodeInfoRequest.
     NodeInfo node_info = 1;
 

@@ -1,0 +1,171 @@
+//! Rendering of management-API responses as either human-readable text or JSON.
+//!
+//! Each renderer returns a `String` (rather than printing) so it is unit-
+//! testable. JSON is produced by `serde_json` over the proto types, which derive
+//! `serde::Serialize` via the `wayfinder-protos` `serde` feature.
+
+use clap::ValueEnum;
+use serde::Serialize;
+use wayfinder_protos::wayfinder_v1alpha::{
+    LinkQualityTable, NodeInfo, NodeMetrics, OgmSchedule, ResolveRouteResponse, RoutingTable,
+    Throughput, resolve_route_response::Egress,
+};
+
+/// How a command renders its result.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    /// Compact, human-readable text.
+    Human,
+    /// Pretty-printed JSON of the raw protobuf response.
+    Json,
+}
+
+/// Render `value` as JSON, or via the `human` closure, per `fmt`.
+fn render<T: Serialize>(
+    value: &T,
+    fmt: OutputFormat,
+    human: impl FnOnce(&T) -> String,
+) -> anyhow::Result<String> {
+    Ok(match fmt {
+        OutputFormat::Json => serde_json::to_string_pretty(value)?,
+        OutputFormat::Human => human(value),
+    })
+}
+
+/// Render a raw identifier as a colon-delimited MAC (6 bytes) or plain hex.
+pub fn format_mac(bytes: &[u8]) -> String {
+    if bytes.len() == 6 {
+        bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    } else {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+/// Render [`NodeInfo`].
+pub fn node_info(v: &NodeInfo, fmt: OutputFormat) -> anyhow::Result<String> {
+    render(v, fmt, |v| {
+        format!(
+            "node {}\noriginators: {}",
+            format_mac(&v.node_id),
+            v.num_originators
+        )
+    })
+}
+
+/// Render the [`RoutingTable`] as one line per originator plus its paths.
+pub fn routing_table(v: &RoutingTable, fmt: OutputFormat) -> anyhow::Result<String> {
+    render(v, fmt, |v| {
+        if v.entries.is_empty() {
+            return "no originators".to_string();
+        }
+        let mut out = String::from("DESTINATION        NEXT_HOP           TQ   SEQNO  PATHS");
+        for e in &v.entries {
+            out.push_str(&format!(
+                "\n{:<18} {:<18} {:>3} {:>6}  {}",
+                format_mac(&e.destination),
+                format_mac(&e.next_hop),
+                e.tq,
+                e.last_seqno,
+                e.paths.len(),
+            ));
+        }
+        out
+    })
+}
+
+/// Render the [`LinkQualityTable`].
+pub fn link_quality_table(v: &LinkQualityTable, fmt: OutputFormat) -> anyhow::Result<String> {
+    render(v, fmt, |v| {
+        if v.entries.is_empty() {
+            return "no link-quality samples".to_string();
+        }
+        let mut out = String::from("NEIGHBOR           IFACE  QUALITY  SAMPLES");
+        for e in &v.entries {
+            out.push_str(&format!(
+                "\n{:<18} {:>5}  {:>7}  {:>7}",
+                format_mac(&e.neighbor_id),
+                e.iface_idx,
+                e.ewma_quality,
+                e.sample_count,
+            ));
+        }
+        out
+    })
+}
+
+/// Render the [`OgmSchedule`].
+pub fn ogm_schedule(v: &OgmSchedule, fmt: OutputFormat) -> anyhow::Result<String> {
+    render(v, fmt, |v| {
+        if v.entries.is_empty() {
+            return "no interfaces configured".to_string();
+        }
+        let mut out = String::from("IFACE  CURRENT_MS  MIN_MS  MAX_MS");
+        for e in &v.entries {
+            out.push_str(&format!(
+                "\n{:>5}  {:>10}  {:>6}  {:>6}",
+                e.iface_idx, e.current_interval_ms, e.min_interval_ms, e.max_interval_ms,
+            ));
+        }
+        out
+    })
+}
+
+/// Render [`Throughput`] (per-interface rows + node totals).
+pub fn throughput(v: &Throughput, fmt: OutputFormat) -> anyhow::Result<String> {
+    render(v, fmt, |v| {
+        let mut out = String::from("IFACE   RX_BPS    RX_FPS    TX_BPS    TX_FPS");
+        for i in &v.interfaces {
+            out.push_str(&format!(
+                "\n{:>5}  {:>8.0}  {:>8.1}  {:>8.0}  {:>8.1}",
+                i.iface_idx, i.rx_bps, i.rx_fps, i.tx_bps, i.tx_fps,
+            ));
+        }
+        out.push_str(&format!(
+            "\ntotal  {:>8.0}  {:>8.1}  {:>8.0}  {:>8.1}",
+            v.total_rx_bps, v.total_rx_fps, v.total_tx_bps, v.total_tx_fps,
+        ));
+        out
+    })
+}
+
+/// Render [`NodeMetrics`].
+pub fn node_metrics(v: &NodeMetrics, fmt: OutputFormat) -> anyhow::Result<String> {
+    render(v, fmt, |v| {
+        let occ = |o: &Option<wayfinder_protos::wayfinder_v1alpha::TableOccupancy>| match o {
+            Some(o) => format!("{}/{}", o.used, o.capacity),
+            None => "-".to_string(),
+        };
+        format!(
+            "uptime: {}s\nneighbors: {}\noriginators: {}\nbroadcast_dedup: {}\n\
+             local_mcast_groups: {}\nmcast_memberships: {}\n\
+             tq (min/mean/max): {}/{:.1}/{}\npaths (mean/max): {:.2}/{}",
+            v.uptime_secs,
+            v.neighbor_count,
+            occ(&v.originators),
+            occ(&v.broadcast_dedup),
+            occ(&v.local_mcast_groups),
+            occ(&v.mcast_memberships),
+            v.tq_min,
+            v.tq_mean,
+            v.tq_max,
+            v.paths_mean,
+            v.paths_max,
+        )
+    })
+}
+
+/// Render a [`ResolveRouteResponse`].
+pub fn resolve(v: &ResolveRouteResponse, fmt: OutputFormat) -> anyhow::Result<String> {
+    render(v, fmt, |v| {
+        let egress = match &v.egress {
+            Some(Egress::AllInterfaces(_)) => "all interfaces (flood)".to_string(),
+            Some(Egress::InterfaceIndex(i)) => format!("interface {i}"),
+            None => "unknown (no link data)".to_string(),
+        };
+        format!("next_hop: {}\negress: {}", format_mac(&v.next_hop), egress)
+    })
+}

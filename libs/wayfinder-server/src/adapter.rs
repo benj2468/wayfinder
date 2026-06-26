@@ -11,7 +11,11 @@ use alloc::vec::Vec;
 
 use wayfinder::CentralRouter;
 use wayfinder::EgressInterface;
+use wayfinder::auth::OgmAuth;
 use wayfinder::interfaces::frame::Mac;
+use wayfinder::wayfinder_auth::Keypair;
+use wayfinder::wayfinder_auth::MembershipCert;
+use wayfinder::wayfinder_auth::TrustAnchor;
 use wayfinder_protos::service::{
     EgressDecisionData, InterfaceThroughputData, LinkQualityEntryData, NeighborPathData,
     NodeMetricsData, OgmScheduleEntryData, RouteResolutionData, RoutingEntryData,
@@ -29,7 +33,7 @@ use zerocopy::{FromBytes, IntoBytes};
 /// one.  Construct a fresh adapter per request so the rate reflects the time
 /// the query is served.
 pub struct RouterAdapter<'a> {
-    router: &'a CentralRouter,
+    router: &'a mut CentralRouter,
     now: Duration,
 }
 
@@ -37,7 +41,7 @@ impl<'a> RouterAdapter<'a> {
     /// Wrap a borrowed router so its state can be served through the management
     /// API, evaluating time-varying metrics (throughput) as of `now` — the same
     /// monotonic instant the driver stamps on received frames.
-    pub fn new(router: &'a CentralRouter, now: Duration) -> Self {
+    pub fn new(router: &'a mut CentralRouter, now: Duration) -> Self {
         Self { router, now }
     }
 }
@@ -182,6 +186,20 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
             }),
         })
     }
+
+    fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String> {
+        let key_pair = Keypair::from_seed(
+            seed.try_into()
+                .map_err(|_| "seed must be exactly 32 bytes".to_string())?,
+        );
+        let cert = MembershipCert::from_bytes(cert)
+            .ok_or_else(|| "unable to parse membership cert".to_string())?;
+        let anchor = TrustAnchor::from_bytes(trust_anchor)
+            .ok_or_else(|| "unable to parse trust anchor".to_string())?;
+        let auth = OgmAuth::new(key_pair, cert, anchor);
+        self.router.set_auth(auth);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -238,8 +256,8 @@ mod tests {
     /// the table capacities, not just the (zero) usage.
     #[test]
     fn node_metrics_empty_table_folds_to_zero_not_nan() {
-        let router = CentralRouter::new(mac(1));
-        let m = RouterAdapter::new(&router, Duration::from_secs(5)).node_metrics();
+        let mut router = CentralRouter::new(mac(1));
+        let m = RouterAdapter::new(&mut router, Duration::from_secs(5)).node_metrics();
 
         assert_eq!(m.neighbor_count, 0);
         assert_eq!((m.tq_min, m.tq_max), (0, 0));
@@ -263,7 +281,7 @@ mod tests {
         feed_direct_ogm(&mut router, mac(3), 1, 205);
         feed_direct_ogm(&mut router, mac(4), 1, 155);
 
-        let m = RouterAdapter::new(&router, Duration::from_secs(10)).node_metrics();
+        let m = RouterAdapter::new(&mut router, Duration::from_secs(10)).node_metrics();
 
         assert_eq!(m.neighbor_count, 3);
         assert_eq!(m.tq_min, 145);

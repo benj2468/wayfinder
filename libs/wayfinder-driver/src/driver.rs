@@ -254,7 +254,7 @@ impl<Local: FrameIo> Driver<Local> {
                     }
                 },
                 Some((request, resp_tx)) = query_rx.recv(), if check_server => {
-                    let response = WayfinderService::new(RouterAdapter::new(&*router, now)).handle(request);
+                    let response = WayfinderService::new(RouterAdapter::new(&mut *router, now)).handle(request);
                     let _ = resp_tx.send(response);
                     LoopOutput::none()
                 },
@@ -370,8 +370,8 @@ impl<Local: FrameIo> Driver<Local> {
             if let Ok((request, resp_tx)) = self.query_rx.try_recv() {
                 progressed = true;
                 let now = self.start.elapsed();
-                let response =
-                    WayfinderService::new(RouterAdapter::new(&self.router, now)).handle(request);
+                let response = WayfinderService::new(RouterAdapter::new(&mut self.router, now))
+                    .handle(request);
                 let _ = resp_tx.send(response);
             }
 

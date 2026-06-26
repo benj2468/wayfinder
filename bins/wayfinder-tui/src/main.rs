@@ -10,8 +10,8 @@ use clap::Parser;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use tokio::sync::mpsc;
 
+use wayfinder_client::{Client, ConnectTarget};
 use wayfinder_tui::app::{self, App};
-use wayfinder_tui::client::Client;
 use wayfinder_tui::ui;
 
 /// Command-line arguments.
@@ -102,7 +102,7 @@ fn handle_key(app: &mut App, code: KeyCode) {
 /// `app.last_error` and drops the connection so the next tick reconnects.
 async fn refresh(client: &mut Option<Client>, addr: SocketAddr, app: &mut App) {
     if client.is_none() {
-        match Client::connect(addr).await {
+        match Client::connect(&ConnectTarget::Tcp(addr)).await {
             Ok(c) => *client = Some(c),
             Err(e) => {
                 app.connected = false;

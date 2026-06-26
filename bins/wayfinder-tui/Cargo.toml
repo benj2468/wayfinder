@@ -13,16 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 wayfinder-protos.workspace = true
+wayfinder-client.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
-futures.workspace = true
 anyhow.workspace = true
 clap.workspace = true
-prost = { version = "0.13", features = ["std"] }
-bytes = "1"
 ratatui = "0.29"
-
-[dev-dependencies]
-wayfinder-server.workspace = true
-tokio.workspace = true
-anyhow.workspace = true

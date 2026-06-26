@@ -31,3 +31,6 @@ coverage.xml
 # Python
 __pycache__
 .sim-compose.gen.yml
+
+# Git worktrees
+.worktree

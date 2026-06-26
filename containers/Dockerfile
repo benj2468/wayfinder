@@ -72,3 +72,15 @@ FROM gcr.io/distroless/cc-debian12 AS tui
 COPY --from=builder /app/target/release/wayfinder-tui /usr/local/bin/wayfinder-tui
 
 ENTRYPOINT ["/usr/local/bin/wayfinder-tui"]
+
+# ---------------------------------------------------------------------------
+# wayfinder-ctl: management-API command-line client.
+# ---------------------------------------------------------------------------
+#
+# A non-interactive CLI: pass a subcommand, e.g.
+# `docker run --rm <image> --connect <addr> node-info`.
+FROM gcr.io/distroless/cc-debian12 AS ctl
+
+COPY --from=builder /app/target/release/wayfinder-ctl /usr/local/bin/wayfinder-ctl
+
+ENTRYPOINT ["/usr/local/bin/wayfinder-ctl"]
