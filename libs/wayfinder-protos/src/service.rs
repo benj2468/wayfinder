@@ -1,3 +1,4 @@
+use crate::wayfinder_v1alpha::Empty;
 use crate::wayfinder_v1alpha::{
     AllInterfacesEgress, ErrorResponse, InterfaceThroughput, LinkQualityEntry, LinkQualityTable,
     NeighborPath, NodeInfo, NodeMetrics, OgmSchedule, OgmScheduleEntry, ResolveRouteResponse,
@@ -5,6 +6,7 @@ use crate::wayfinder_v1alpha::{
     resolve_route_response::Egress as EgressKind, wayfinder_request::Request as RequestKind,
     wayfinder_response::Response as ResponseKind,
 };
+use alloc::string::String;
 use alloc::vec::Vec;
 
 /// Intermediate representation of a single per-hop path, returned by
@@ -159,33 +161,8 @@ pub trait WayfinderDataProvider {
     /// `None` if the raw bytes can't be parsed as a valid identifier for
     /// this provider's address family.
     fn resolve_route(&self, destination: &[u8]) -> Option<RouteResolutionData>;
-}
-
-impl<T: WayfinderDataProvider> WayfinderDataProvider for &T {
-    fn node_id(&self) -> Vec<u8> {
-        (**self).node_id()
-    }
-    fn num_originators(&self) -> u32 {
-        (**self).num_originators()
-    }
-    fn routing_table(&self) -> Vec<RoutingEntryData> {
-        (**self).routing_table()
-    }
-    fn link_quality_table(&self) -> Vec<LinkQualityEntryData> {
-        (**self).link_quality_table()
-    }
-    fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData> {
-        (**self).ogm_schedule()
-    }
-    fn throughput(&self) -> Vec<InterfaceThroughputData> {
-        (**self).throughput()
-    }
-    fn node_metrics(&self) -> NodeMetricsData {
-        (**self).node_metrics()
-    }
-    fn resolve_route(&self, destination: &[u8]) -> Option<RouteResolutionData> {
-        (**self).resolve_route(destination)
-    }
+    /// Set the auth state on the node
+    fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String>;
 }
 
 /// Stateful handler that maps [`WayfinderRequest`] → [`WayfinderResponse`].
@@ -201,7 +178,7 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
         Self { provider }
     }
 
-    pub fn handle(&self, request: WayfinderRequest) -> WayfinderResponse {
+    pub fn handle(&mut self, request: WayfinderRequest) -> WayfinderResponse {
         let response = match request.request {
             Some(RequestKind::GetNodeInfo(_)) => ResponseKind::NodeInfo(NodeInfo {
                 node_id: self.provider.node_id(),
@@ -336,6 +313,16 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                 }
             }
 
+            Some(RequestKind::SetAuth(set_auth)) => {
+                match self
+                    .provider
+                    .set_auth(&set_auth.seed, &set_auth.cert, &set_auth.trust_anchor)
+                {
+                    Ok(_) => ResponseKind::Empty(Empty {}),
+                    Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+                }
+            }
+
             None => ResponseKind::Error(ErrorResponse {
                 message: "empty request".into(),
             }),
@@ -394,6 +381,14 @@ mod tests {
         }
         fn resolve_route(&self, _destination: &[u8]) -> Option<RouteResolutionData> {
             self.route_resolution.clone()
+        }
+        fn set_auth(
+            &mut self,
+            _seed: &[u8],
+            _cert: &[u8],
+            _trust_anchor: &[u8],
+        ) -> Result<(), String> {
+            Ok(())
         }
     }
 
@@ -710,6 +705,7 @@ mod tests {
             ResponseKind::Throughput(_) => "Throughput",
             ResponseKind::Metrics(_) => "Metrics",
             ResponseKind::Error(_) => "Error",
+            ResponseKind::Empty(_) => "Empty",
         }
     }
 }

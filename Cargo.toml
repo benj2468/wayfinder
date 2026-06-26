@@ -17,8 +17,10 @@ members = [
     "libs/wayfinder-server",
     "libs/wayfinder-driver",
     "libs/wayfinder-test",
+    "libs/wayfinder-client",
     "bins/wayfinder-tap",
     "bins/wayfinder-tui",
+    "bins/wayfinder-ctl",
 ]
 
 [workspace.dependencies]
@@ -30,6 +32,7 @@ wayfinder = { path = "./libs/wayfinder" }
 wayfinder-protos = { path = "./libs/wayfinder-protos" }
 wayfinder-server = { path = "./libs/wayfinder-server" }
 wayfinder-driver = { path = "./libs/wayfinder-driver" }
+wayfinder-client = { path = "./libs/wayfinder-client" }
 
 # Third Party Dependencies
 tracing = "0.1.44"

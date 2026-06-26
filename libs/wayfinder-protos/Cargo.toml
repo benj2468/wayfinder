@@ -5,6 +5,14 @@ edition = "2024"
 
 [dependencies]
 prost = { version = "0.13" , default-features = false, features = ["derive"] }
+# Optional: derive `serde::Serialize` on the generated message types so hosts
+# (e.g. `wayfinderctl --output json`) can emit them directly.  Off by default so
+# the no_std/embedded build pulls in no extra surface.
+serde = { version = "1", optional = true, default-features = false, features = ["derive"] }
+
+[features]
+# Enable `#[derive(serde::Serialize)]` on every generated proto type.
+serde = ["dep:serde"]
 
 [build-dependencies]
 prost-build = "0.13"

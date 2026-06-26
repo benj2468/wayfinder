@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -80,6 +81,46 @@ def path(prefix: str, n: int) -> list[list[str]]:
 def shared_lan(nodes: list[str]) -> list[list[str]]:
     """One segment shared by all ``nodes`` (a single multi-access bridge)."""
     return [list(nodes)]
+
+
+# ── Certificate helpers ───────────────────────────────────────────────────────
+#
+# Mint a single mesh certificate authority on the host before bringing the
+# compose project up. The directory it returns (holding the root `seed` and the
+# public trust anchor `root`) is bind-mounted read-only into every node, which
+# then self-issues its own member cert against the root seed at startup.
+
+
+def make_ca() -> Path:
+    """Create a mesh CA in a fresh temp dir, returning that directory.
+
+    The directory is intentionally *not* auto-deleted: it is mounted into the
+    sim containers for the lifetime of the compose project.
+    """
+    ca_dir = Path(tempfile.mkdtemp(prefix="wayfinder-ca-"))
+    seed = ca_dir / "seed"
+    anchor = ca_dir / "root"
+    subprocess.run(
+        [
+            "cargo",
+            "run",
+            "-p",
+            "wayfinder-ctl",
+            "--",
+            "cert",
+            "init-ca",
+            "--mesh-id",
+            "1",
+            "--generate",
+            "--out-seed",
+            str(seed),
+            "--out-anchor",
+            str(anchor),
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+    return ca_dir
 
 
 # ── the topology (edit me) ────────────────────────────────────────────────────
@@ -153,6 +194,7 @@ def build_nodes(links: list[list[str]]) -> dict[str, dict]:
 
 def render_compose() -> str:
     """Render the full docker-compose YAML for the current topology."""
+    ca_dir = make_ca()
     links = dedup_links(build_links())
     nodes = build_nodes(links)
     # node -> the networks it is attached to, in deterministic order.
@@ -179,6 +221,8 @@ def render_compose() -> str:
     e("    context: .")
     e("    dockerfile: containers/sim.Dockerfile")
     e("  image: wayfinder-sim:latest")
+    e("  volumes:")
+    e(f"    - {str(ca_dir)}:/ca:ro")
     e("  cap_add:")
     e("    - NET_ADMIN # create the kernel TAP device")
     e("    - NET_RAW # AF_PACKET raw L2 sockets")

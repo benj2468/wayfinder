@@ -1,0 +1,18 @@
+[package]
+name = "wayfinder-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wayfinder-protos.workspace = true
+tokio = { workspace = true }
+tokio-util.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+prost = { version = "0.13", features = ["std"] }
+bytes = "1"
+
+[dev-dependencies]
+wayfinder-server.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

@@ -31,7 +31,7 @@ COPY src /app/src
 WORKDIR /app
 ENV PROTOC=/usr/bin/protoc
 
-RUN cargo build --release -p wayfinder-tap -p wayfinder-tui
+RUN cargo build --release -p wayfinder-tap -p wayfinder-tui -p wayfinder-ctl
 
 FROM debian:bookworm-slim
 
@@ -51,6 +51,7 @@ RUN apt-get update \
 
 COPY --from=builder /app/target/release/wayfinder-tap /usr/local/bin/wayfinder-tap
 COPY --from=builder /app/target/release/wayfinder-tui /usr/local/bin/wayfinder-tui
+COPY --from=builder /app/target/release/wayfinder-ctl /usr/local/bin/wayfinder-ctl
 
 # Wayfinder Lua dissector: lets tshark/termshark decode the BATMAN OGM frames
 # flowing over the RawL2 segments (EtherType 0x4305). Installed into tshark's
@@ -81,6 +82,7 @@ SERVER_ADDR="${SERVER_ADDR:-0.0.0.0:7700}"
 CFG=/etc/wayfinder/config.yml
 
 mkdir -p /etc/wayfinder
+
 
 cat > "$CFG" <<YAML
 local_egress:
@@ -119,7 +121,39 @@ done
 echo "wayfinder-sim: generated $CFG" >&2
 cat "$CFG" >&2
 
-exec wayfinder-tap --config "$CFG"
+# Start the node in the background, give it a moment to bring up the TAP, then
+# enroll it: mint a node key, have the local CA (mounted at /ca) issue a cert
+# for this node's MAC, and push the bundle into the running node over its
+# management API (SetAuth).
+wayfinder-tap --config "$CFG" &
+WAYFINDER_PID=$!
+
+sleep 5
+
+WAYFINDER_MAC=$(ip link show dev wayfinder0 | awk '/link\/ether/ {print $2}')
+
+mkdir -p /etc/wayfinder/secrets
+
+wayfinder-ctl cert keygen --out-seed /etc/wayfinder/secrets/seed
+wayfinder-ctl cert issue \
+    --ca-seed /ca/seed \
+    --mesh-id 1 \
+    --mac "${WAYFINDER_MAC}" \
+    --node-seed /etc/wayfinder/secrets/seed \
+    --not-before 0 \
+    --not-after 100000000000000 \
+    --out-cert /etc/wayfinder/secrets/cert
+
+# set-auth takes positional <seed> <cert> <trust-anchor> and connects to the
+# node's management API (default 127.0.0.1:7700, which the Tcp server serves).
+wayfinder-ctl set-auth \
+    /etc/wayfinder/secrets/seed \
+    /etc/wayfinder/secrets/cert \
+    /ca/root
+
+# Hand the foreground back to the node so the container lives as long as it does.
+wait "${WAYFINDER_PID}"
+
 EOF
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -1,0 +1,29 @@
+[package]
+name = "wayfinder-ctl"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "wayfinder-ctl"
+path = "src/main.rs"
+
+[lib]
+name = "wayfinderctl"
+path = "src/lib.rs"
+
+[dependencies]
+wayfinder-client.workspace = true
+wayfinder-protos = { workspace = true, features = ["serde"] }
+wayfinder-auth = { workspace = true, features = ["std"] }
+interfaces.workspace = true
+clap = { workspace = true, features = ["env"] }
+anyhow.workspace = true
+tokio.workspace = true
+zerocopy.workspace = true
+rand = { workspace = true, features = ["std"] }
+serde.workspace = true
+serde_json = "1"
+
+[dev-dependencies]
+wayfinder-server.workspace = true
+tempfile = "3"
