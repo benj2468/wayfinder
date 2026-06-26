@@ -25,9 +25,9 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use wayfinder_protos::wayfinder_v1alpha::{
     GetLinkQualityTableRequest, GetMetricsRequest, GetNodeInfoRequest, GetOgmScheduleRequest,
     GetRoutingTableRequest, GetThroughputRequest, GetTrustAnchorRequest, GetTrustAnchorResponse,
-    LinkQualityTable, NodeInfo, NodeMetrics, OgmSchedule, ResolveRouteRequest,
-    ResolveRouteResponse, RevokeNodeRequest, RoutingTable, SetAuthRequest, SubmitCsrRequest,
-    SubmitCsrResponse, Throughput, WayfinderRequest, WayfinderResponse,
+    LinkQualityTable, ListCertsRequest, ListCertsResponse, NodeInfo, NodeMetrics, OgmSchedule,
+    ResolveRouteRequest, ResolveRouteResponse, RevokeNodeRequest, RoutingTable, SetAuthRequest,
+    SubmitCsrRequest, SubmitCsrResponse, Throughput, WayfinderRequest, WayfinderResponse,
     wayfinder_request::Request as RequestKind, wayfinder_response::Response as ResponseKind,
 };
 
@@ -303,6 +303,17 @@ impl Client {
             other => Err(unexpected("RevokeNode", &other)),
         }
     }
+
+    /// Provider mode: list the certificates this provider has issued.
+    pub async fn list_certs(&mut self) -> anyhow::Result<ListCertsResponse> {
+        match self
+            .request(RequestKind::ListCerts(ListCertsRequest {}))
+            .await?
+        {
+            ResponseKind::ListCerts(resp) => Ok(resp),
+            other => Err(unexpected("ListCerts", &other)),
+        }
+    }
 }
 
 impl Drop for Client {
@@ -340,6 +351,7 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
         ResponseKind::Empty(_) => "Empty",
         ResponseKind::TrustAnchor(_) => "TrustAnchor",
         ResponseKind::SubmitCsr(_) => "SubmitCsr",
+        ResponseKind::ListCerts(_) => "ListCerts",
     };
     anyhow!("expected {want} response, got {got}")
 }

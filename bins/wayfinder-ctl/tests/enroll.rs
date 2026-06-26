@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use tokio::sync::{mpsc, oneshot};
 use wayfinder_auth::{MembershipCert, TrustAnchor};
 use wayfinder_protos::service::{
-    EnrollData, InterfaceThroughputData, LinkQualityEntryData, NodeMetricsData,
+    EnrollData, InterfaceThroughputData, IssuedCertData, LinkQualityEntryData, NodeMetricsData,
     OgmScheduleEntryData, RouteResolutionData, RoutingEntryData, TableOccupancyData,
     WayfinderDataProvider, WayfinderService,
 };
@@ -89,6 +89,9 @@ impl WayfinderDataProvider for ProviderMock {
     }
     fn revoke_node(&mut self, node_mac: &[u8]) -> Result<(), String> {
         self.ca.revoke(node_mac).map(|_| ())
+    }
+    fn list_certs(&self) -> Result<Vec<IssuedCertData>, String> {
+        Ok(self.ca.list_certs())
     }
 }
 
@@ -172,6 +175,44 @@ async fn enroll_rejected_without_required_token() {
     // missing enrollment token" message is visible, not just the top context.
     let err = format!("{err:#}");
     assert!(err.contains("token"), "got: {err}");
+}
+
+#[tokio::test]
+async fn list_certs_shows_an_enrolled_node() {
+    let addr = spawn_provider(None).await;
+    let dir = tempfile::tempdir().unwrap();
+    run_query(
+        Command::Enroll {
+            mac: "02:00:00:00:00:09".into(),
+            token: String::new(),
+            out_seed: dir.path().join("seed"),
+            out_cert: dir.path().join("cert"),
+            out_anchor: dir.path().join("anchor"),
+        },
+        &addr.to_string(),
+        OutputFormat::Json,
+    )
+    .await
+    .unwrap();
+
+    let out = run_query(Command::ListCerts, &addr.to_string(), OutputFormat::Json)
+        .await
+        .expect("list-certs succeeds");
+    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let certs = parsed["certs"].as_array().unwrap();
+    assert_eq!(certs.len(), 1, "the provider lists the enrolled node");
+    // node_mac is the raw bytes of 02:00:00:00:00:09.
+    assert_eq!(certs[0]["node_mac"][0], 2);
+    assert_eq!(certs[0]["node_mac"][5], 9);
+}
+
+#[tokio::test]
+async fn list_certs_is_empty_before_any_enrollment() {
+    let addr = spawn_provider(None).await;
+    let out = run_query(Command::ListCerts, &addr.to_string(), OutputFormat::Human)
+        .await
+        .unwrap();
+    assert!(out.contains("no certificates issued"), "got: {out}");
 }
 
 #[tokio::test]

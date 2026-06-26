@@ -103,6 +103,8 @@ pub enum Command {
         #[arg(long)]
         mac: String,
     },
+    /// List the certificates a provider node has issued.
+    ListCerts,
     /// Offline certificate / trust-anchor tooling (no node connection).
     #[command(subcommand)]
     Cert(cert::CertCommand),
@@ -189,6 +191,7 @@ pub async fn run_query(
                 .context("revocation failed")?;
             format!("revoked {mac}")
         }
+        Command::ListCerts => output::list_certs(&client.list_certs().await?, output)?,
         Command::Cert(_) => unreachable!("cert is dispatched before run_query"),
     })
 }

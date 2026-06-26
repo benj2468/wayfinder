@@ -1,9 +1,9 @@
 use crate::wayfinder_v1alpha::Empty;
 use crate::wayfinder_v1alpha::{
-    AllInterfacesEgress, ErrorResponse, GetTrustAnchorResponse, InterfaceThroughput,
-    LinkQualityEntry, LinkQualityTable, NeighborPath, NodeInfo, NodeMetrics, OgmSchedule,
-    OgmScheduleEntry, ResolveRouteResponse, RoutingEntry, RoutingTable, SubmitCsrResponse,
-    TableOccupancy, Throughput, WayfinderRequest, WayfinderResponse,
+    AllInterfacesEgress, ErrorResponse, GetTrustAnchorResponse, InterfaceThroughput, IssuedCert,
+    LinkQualityEntry, LinkQualityTable, ListCertsResponse, NeighborPath, NodeInfo, NodeMetrics,
+    OgmSchedule, OgmScheduleEntry, ResolveRouteResponse, RoutingEntry, RoutingTable,
+    SubmitCsrResponse, TableOccupancy, Throughput, WayfinderRequest, WayfinderResponse,
     resolve_route_response::Egress as EgressKind, wayfinder_request::Request as RequestKind,
     wayfinder_response::Response as ResponseKind,
 };
@@ -191,6 +191,27 @@ pub trait WayfinderDataProvider {
         let _ = node_mac;
         Err(String::from("node is not a certificate-authority provider"))
     }
+
+    /// Provider mode: list the certificates this provider has issued.  Default
+    /// errors.
+    fn list_certs(&self) -> Result<Vec<IssuedCertData>, String> {
+        Err(String::from("node is not a certificate-authority provider"))
+    }
+}
+
+/// One certificate a provider has issued, as the management API reports it.
+#[derive(Clone)]
+pub struct IssuedCertData {
+    /// The node MAC the certificate is bound to (raw bytes).
+    pub node_mac: Vec<u8>,
+    /// The node's Ed25519 identity public key (32 bytes).
+    pub ed_pubkey: Vec<u8>,
+    /// Validity-window start (unix seconds).
+    pub not_before: u64,
+    /// Validity-window end (unix seconds).
+    pub not_after: u64,
+    /// Whether the provider has since revoked this node.
+    pub revoked: bool,
 }
 
 /// The result of a successful CSR: the issued certificate plus the trust anchor
@@ -382,6 +403,22 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
 
             Some(RequestKind::RevokeNode(req)) => match self.provider.revoke_node(&req.node_mac) {
                 Ok(()) => ResponseKind::Empty(Empty {}),
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            },
+
+            Some(RequestKind::ListCerts(_)) => match self.provider.list_certs() {
+                Ok(certs) => ResponseKind::ListCerts(ListCertsResponse {
+                    certs: certs
+                        .into_iter()
+                        .map(|c| IssuedCert {
+                            node_mac: c.node_mac,
+                            ed_pubkey: c.ed_pubkey,
+                            not_before: c.not_before,
+                            not_after: c.not_after,
+                            revoked: c.revoked,
+                        })
+                        .collect(),
+                }),
                 Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
             },
 
@@ -768,6 +805,7 @@ mod tests {
             ResponseKind::Metrics(_) => "Metrics",
             ResponseKind::Error(_) => "Error",
             ResponseKind::Empty(_) => "Empty",
+            ResponseKind::ListCerts(_) => "ListCerts",
             ResponseKind::TrustAnchor(_) => "TrustAnchor",
             ResponseKind::SubmitCsr(_) => "SubmitCsr",
         }

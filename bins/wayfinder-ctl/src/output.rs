@@ -7,8 +7,8 @@
 use clap::ValueEnum;
 use serde::Serialize;
 use wayfinder_protos::wayfinder_v1alpha::{
-    LinkQualityTable, NodeInfo, NodeMetrics, OgmSchedule, ResolveRouteResponse, RoutingTable,
-    Throughput, resolve_route_response::Egress,
+    LinkQualityTable, ListCertsResponse, NodeInfo, NodeMetrics, OgmSchedule, ResolveRouteResponse,
+    RoutingTable, Throughput, resolve_route_response::Egress,
 };
 
 /// How a command renders its result.
@@ -168,4 +168,30 @@ pub fn resolve(v: &ResolveRouteResponse, fmt: OutputFormat) -> anyhow::Result<St
         };
         format!("next_hop: {}\negress: {}", format_mac(&v.next_hop), egress)
     })
+}
+
+/// Render the provider's [`ListCertsResponse`] (issued certificates).
+pub fn list_certs(v: &ListCertsResponse, fmt: OutputFormat) -> anyhow::Result<String> {
+    render(v, fmt, |v| {
+        if v.certs.is_empty() {
+            return "no certificates issued".to_string();
+        }
+        let mut out = String::from("NODE_MAC           NOT_BEFORE   NOT_AFTER    STATUS   ED25519");
+        for c in &v.certs {
+            out.push_str(&format!(
+                "\n{:<18} {:>10} {:>10}   {:<7}  {}",
+                format_mac(&c.node_mac),
+                c.not_before,
+                c.not_after,
+                if c.revoked { "revoked" } else { "active" },
+                fingerprint(&c.ed_pubkey),
+            ));
+        }
+        out
+    })
+}
+
+/// First 8 hex chars of a public key, for a compact fingerprint column.
+fn fingerprint(key: &[u8]) -> String {
+    key.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }

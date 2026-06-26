@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 
 use wayfinder::interfaces::frame::Mac;
 use wayfinder_auth::Authority;
+use wayfinder_protos::service::IssuedCertData;
 use zerocopy::IntoBytes;
 
 use crate::provider::MeshAuthority;
@@ -28,6 +29,10 @@ pub struct CertAuthority {
     /// Current wall-clock time in unix seconds, refreshed by the driver so issued
     /// validity windows track the node's auth clock.  Zero until first set.
     now_unix: u64,
+    /// Certificates issued so far, for operator observability (the `ListCerts`
+    /// RPC).  In-memory only — a restart clears it; deduplicated by MAC so a
+    /// re-issue updates the existing entry rather than appending.
+    issued: Vec<IssuedCertData>,
 }
 
 impl CertAuthority {
@@ -43,6 +48,7 @@ impl CertAuthority {
             cert_ttl_secs,
             enrollment_token,
             now_unix: 0,
+            issued: Vec::new(),
         }
     }
 
@@ -96,10 +102,28 @@ impl MeshAuthority for CertAuthority {
         let mac = Mac(fixed::<6>(node_mac, "node_mac")?);
         let ed = fixed::<32>(ed_pubkey, "ed_pubkey")?;
         let x = fixed::<32>(x_pubkey, "x_pubkey")?;
+        let not_before = self.now_unix;
         let not_after = self.now_unix.saturating_add(self.cert_ttl_secs);
-        let cert = self
-            .authority
-            .issue_cert(mac, ed, x, self.now_unix, not_after);
+        let cert = self.authority.issue_cert(mac, ed, x, not_before, not_after);
+
+        // Record (or refresh, by MAC) the issued cert for the ListCerts RPC.
+        // A re-issue clears any prior revoked flag (it is a fresh certificate).
+        let record = IssuedCertData {
+            node_mac: mac.0.to_vec(),
+            ed_pubkey: ed.to_vec(),
+            not_before,
+            not_after,
+            revoked: false,
+        };
+        match self
+            .issued
+            .iter_mut()
+            .find(|c| c.node_mac == record.node_mac)
+        {
+            Some(existing) => *existing = record,
+            None => self.issued.push(record),
+        }
+
         Ok(cert.as_bytes().to_vec())
     }
 
@@ -112,7 +136,17 @@ impl MeshAuthority for CertAuthority {
         // the same ttl window from now; passive expiry then takes over.
         let not_after = self.now_unix.saturating_add(self.cert_ttl_secs);
         let record = self.authority.revoke(mac, self.now_unix, not_after);
+
+        // Mark the issued entry revoked (retained for ListCerts observability).
+        if let Some(entry) = self.issued.iter_mut().find(|c| c.node_mac == mac.0) {
+            entry.revoked = true;
+        }
+
         Ok(record.as_bytes().to_vec())
+    }
+
+    fn list_certs(&self) -> Vec<IssuedCertData> {
+        self.issued.clone()
     }
 }
 
@@ -167,6 +201,40 @@ mod tests {
         let (ed, x) = node_keys(2);
         let err = ca.issue_cert(&[0; 6], &ed, &x, "").unwrap_err();
         assert!(err.contains("clock not set"), "got: {err}");
+    }
+
+    #[test]
+    fn list_certs_records_issued_and_dedups_by_mac() {
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None);
+        ca.set_now_unix(100);
+        let (ed, x) = node_keys(2);
+        assert!(ca.list_certs().is_empty());
+
+        ca.issue_cert(&[0, 0, 0, 0, 0, 9], &ed, &x, "").unwrap();
+        ca.issue_cert(&[0, 0, 0, 0, 0, 7], &ed, &x, "").unwrap();
+        assert_eq!(ca.list_certs().len(), 2);
+
+        // Re-issuing for an existing MAC updates in place (no duplicate).
+        ca.set_now_unix(200);
+        ca.issue_cert(&[0, 0, 0, 0, 0, 9], &ed, &x, "").unwrap();
+        let certs = ca.list_certs();
+        assert_eq!(certs.len(), 2);
+        let nine = certs.iter().find(|c| c.node_mac[5] == 9).unwrap();
+        assert_eq!(nine.not_before, 200, "re-issue updated the window");
+    }
+
+    #[test]
+    fn revoke_marks_the_issued_cert_revoked_but_keeps_it_listed() {
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None);
+        ca.set_now_unix(100);
+        let (ed, x) = node_keys(2);
+        ca.issue_cert(&[0, 0, 0, 0, 0, 9], &ed, &x, "").unwrap();
+        assert!(!ca.list_certs()[0].revoked);
+
+        ca.revoke(&[0, 0, 0, 0, 0, 9]).unwrap();
+        let certs = ca.list_certs();
+        assert_eq!(certs.len(), 1, "the entry is retained after revoke");
+        assert!(certs[0].revoked, "and marked revoked");
     }
 
     #[test]

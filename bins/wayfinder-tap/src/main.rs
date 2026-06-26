@@ -45,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
     let config: Config = serde_yaml::from_slice(std::fs::read_to_string(args.config)?.as_bytes())?;
 
     tracing::info!("Welcome to Wayfinder");
+    tracing::info!("{:#?}", config);
 
     let mut join_set: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
@@ -173,13 +174,15 @@ async fn main() -> anyhow::Result<()> {
     if let Some(provider_cfg) = config.provider {
         use wayfinder_server::CertAuthority;
 
-        // Provider mode requires this node to also be an authenticated member of
-        // the *same* mesh: it floods revocations over its own OGMs, and would
-        // otherwise issue certs for a mesh it cannot itself participate in.
+        // A provider should also be an authenticated member of the *same* mesh:
+        // it floods revocations over its own OGMs. Auth may be configured here
+        // (`[auth]`) or pushed at runtime via SetAuth — so a missing `[auth]` is
+        // only a warning (the adapter's revoke path still fails closed until auth
+        // is set). When `[auth]` *is* present, its mesh must match.
         match auth_mesh_id {
-            None => bail!(
-                "provider mode requires mesh authentication ([auth]) to be enabled \
-                 so revocations can be flooded"
+            None => tracing::warn!(
+                "provider mode enabled without [auth]; set authentication (config or \
+                 runtime SetAuth) before revoking, or revocations cannot be flooded"
             ),
             Some(id) if id != provider_cfg.mesh_id => bail!(
                 "provider mesh_id {:#x} does not match this node's auth mesh_id {:#x}",

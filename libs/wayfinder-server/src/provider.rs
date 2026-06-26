@@ -15,6 +15,8 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use wayfinder_protos::service::IssuedCertData;
+
 /// A mesh certificate authority, as seen by the management-API layer.
 ///
 /// All inputs and outputs are raw bytes (the same `wayfinder-auth` wire forms a
@@ -44,4 +46,8 @@ pub trait MeshAuthority {
     /// for the caller to record and flood.  Returns an error string on malformed
     /// input.
     fn revoke(&mut self, node_mac: &[u8]) -> Result<Vec<u8>, String>;
+
+    /// The certificates this authority has issued (for operator observability),
+    /// in issuance order.
+    fn list_certs(&self) -> Vec<IssuedCertData>;
 }
