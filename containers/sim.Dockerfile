@@ -12,27 +12,6 @@
 # a RawL2 link for each, so the topology is driven entirely by which networks a
 # service is wired to in docker-compose.yml — no hard-coded interface names.
 
-# Pin the builder to the SAME Debian release as the runtime stage (bookworm).
-# The unsuffixed `rust:1.96-slim` tracks the latest Debian (trixie, glibc
-# 2.39+); linking against that and running on bookworm-slim (glibc 2.36) fails
-# at startup with "GLIBC_2.39 not found".
-FROM rust:1.96-slim-bookworm AS builder
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends protobuf-compiler \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY Cargo.lock /app/Cargo.lock
-COPY Cargo.toml /app/Cargo.toml
-COPY libs /app/libs
-COPY bins /app/bins
-COPY src /app/src
-
-WORKDIR /app
-ENV PROTOC=/usr/bin/protoc
-
-RUN cargo build --release -p wayfinder-tap -p wayfinder-tui -p wayfinder-ctl
-
 FROM debian:bookworm-slim
 
 # Network tooling for poking around inside the container while debugging the
@@ -48,10 +27,6 @@ RUN apt-get update \
         tshark \
         termshark \
     && rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /app/target/release/wayfinder-tap /usr/local/bin/wayfinder-tap
-COPY --from=builder /app/target/release/wayfinder-tui /usr/local/bin/wayfinder-tui
-COPY --from=builder /app/target/release/wayfinder-ctl /usr/local/bin/wayfinder-ctl
 
 # Wayfinder Lua dissector: lets tshark/termshark decode the BATMAN OGM frames
 # flowing over the RawL2 segments (EtherType 0x4305). Installed into tshark's
@@ -79,6 +54,25 @@ NODE_IP="${NODE_IP:-10.0.0.1}"
 NETMASK="${NETMASK:-255.255.255.0}"
 ETHERTYPE="${ETHERTYPE:-0x4305}"
 SERVER_ADDR="${SERVER_ADDR:-0.0.0.0:7700}"
+
+# Resolve a wayfinder binary: prefer a host-built one from the mounted workspace
+# (./target, see sim/topology.py) so a host `cargo build` + `topology.py restart`
+# picks up code changes without rebuilding the image; fall back to the binary
+# baked into the image. WF_BIN_DIR overrides the search dir (e.g. .../release).
+resolve_bin() {
+  for d in "${WF_BIN_DIR:-}" /workspace/target/debug /workspace/target/release; do
+    if [ -n "$d" ] && [ -x "$d/$1" ]; then
+      echo "$d/$1"
+      return
+    fi
+  done
+  echo "/usr/local/bin/$1"
+}
+TAP="$(resolve_bin wayfinder-tap)"
+CTL="$(resolve_bin wayfinder-ctl)"
+TUI="$(resolve_bin wayfinder-tui)"
+echo "wayfinder-sim: using tap=$TAP ctl=$CTL tui=$TUI" >&2
+
 CFG=/etc/wayfinder/config.yml
 
 mkdir -p /etc/wayfinder
@@ -125,7 +119,7 @@ cat "$CFG" >&2
 # enroll it: mint a node key, have the local CA (mounted at /ca) issue a cert
 # for this node's MAC, and push the bundle into the running node over its
 # management API (SetAuth).
-wayfinder-tap --config "$CFG" &
+"$TAP" --config "$CFG" &
 WAYFINDER_PID=$!
 
 sleep 5
@@ -134,8 +128,8 @@ WAYFINDER_MAC=$(ip link show dev wayfinder0 | awk '/link\/ether/ {print $2}')
 
 mkdir -p /etc/wayfinder/secrets
 
-wayfinder-ctl cert keygen --out-seed /etc/wayfinder/secrets/seed
-wayfinder-ctl cert issue \
+"$CTL" cert keygen --out-seed /etc/wayfinder/secrets/seed
+"$CTL" cert issue \
     --ca-seed /ca/seed \
     --mesh-id 1 \
     --mac "${WAYFINDER_MAC}" \
@@ -146,7 +140,7 @@ wayfinder-ctl cert issue \
 
 # set-auth takes positional <seed> <cert> <trust-anchor> and connects to the
 # node's management API (default 127.0.0.1:7700, which the Tcp server serves).
-wayfinder-ctl set-auth \
+"$CTL" set-auth \
     /etc/wayfinder/secrets/seed \
     /etc/wayfinder/secrets/cert \
     /ca/root

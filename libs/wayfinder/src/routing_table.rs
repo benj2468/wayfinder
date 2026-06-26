@@ -71,6 +71,13 @@ impl<Ident: MeshIdentifier> IdentTable<Ident> {
         }
     }
 
+    /// Drop every learned `(dest → interface)` mapping, restoring an empty
+    /// table (including the LRU list and free-slot stack).  Used when routing
+    /// state is invalidated wholesale, e.g. on a runtime authentication change.
+    pub fn clear(&mut self) {
+        *self = Self::new();
+    }
+
     // ── linked-list helpers ──────────────────────────────────────────────────
 
     /// Remove node `idx` from the doubly-linked list.  O(1).

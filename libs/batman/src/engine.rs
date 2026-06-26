@@ -331,6 +331,29 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
         }
     }
 
+    /// Drop all *learned* routing state — the originator table, the
+    /// broadcast-dedup table, and learned multicast memberships.  The node's own
+    /// sequence numbers (kept monotonic so peers don't reject its next OGM as
+    /// stale), locally-joined multicast groups, and per-interface Trickle timers
+    /// are preserved, so the node keeps emitting on its normal schedule and
+    /// simply re-learns the topology from the OGMs it now receives.
+    ///
+    /// Used when the node's authentication changes at runtime
+    /// ([`CentralRouter::set_auth`](../wayfinder/struct.CentralRouter.html)), so
+    /// routes learned under the previous (or no) auth regime are not retained
+    /// under the new identity/anchor.
+    ///
+    /// Deliberately does *not* latch a topology change: that flag is consumed
+    /// part-way through a per-interface emission round and would reset the other
+    /// interfaces' timers mid-round, skipping their emission — so forcing a
+    /// re-announce here would perturb convergence.  Routes are simply dropped and
+    /// re-learned.
+    pub fn reset(&mut self) {
+        self.originator_table.clear();
+        self.broadcast_seqno.clear();
+        self.mcast_members.clear();
+    }
+
     /// Revoke all originators that have been marked as stale.
     pub fn revoke_originators(&mut self, revoked: impl Iterator<Item = Mac>) {
         for revoked_mac in revoked {
