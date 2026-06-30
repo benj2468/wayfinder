@@ -164,7 +164,12 @@ deploy:
 # stored as the masked CI/CD variable GITHUB_MIRROR_TOKEN.
 mirror:github:
   stage: deploy
-  image: alpine/git:latest
+  # alpine/git sets ENTRYPOINT ["git"], so the runner's `sh`-based setup script
+  # would be invoked as `git sh ...` ("git: 'sh' is not a git command"). Clear
+  # the entrypoint so the runner gets a real shell.
+  image:
+    name: alpine/git:latest
+    entrypoint: [""]
   tags:
     - docker
   # Run independently of the build/test/deploy graph — mirroring just replicates
