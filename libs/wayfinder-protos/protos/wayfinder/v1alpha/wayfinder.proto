@@ -55,6 +55,55 @@ message GetThroughputRequest {}
 // the underlying mesh from outside the router.
 message GetMetricsRequest {}
 
+// Query this node's mesh authentication / security posture: whether auth is
+// enabled, the mesh and this node's own certificate, the revocation count, and
+// the per-originator verification/expiry/revocation state.  An empty request.
+message GetSecurityStatusRequest {}
+
+// The security posture of one originator, as this node sees it.
+message NodeSecurity {
+  // The originator's node MAC (raw bytes).
+  bytes node_id = 1;
+
+  // Whether this node holds a verified membership certificate for the
+  // originator: its OGM signature chained to our trust anchor.  False means we
+  // have a route to it but no authenticated identity (e.g. auth disabled, or no
+  // signed OGM accepted yet).
+  bool verified = 2;
+
+  // The originator certificate's expiry (unix seconds), when `verified`.  Zero
+  // when not verified.
+  uint64 cert_not_after = 3;
+
+  // Whether this node currently holds a revocation for the originator (its
+  // frames are dropped mesh-wide).
+  bool revoked = 4;
+}
+
+// Answer to a GetSecurityStatusRequest: the mesh-level crypto header plus a
+// per-originator security row.  When `auth_enabled` is false the remaining
+// header fields are zero/empty and `nodes` carries no verification state.
+message GetSecurityStatusResponse {
+  // Whether mesh authentication is enabled on this node.
+  bool auth_enabled = 1;
+
+  // The mesh id this node authenticates for (from its trust anchor).  Zero when
+  // auth is disabled.
+  uint32 mesh_id = 2;
+
+  // This node's own certificate MAC (raw bytes); empty when auth is disabled.
+  bytes node_mac = 3;
+
+  // This node's own certificate expiry (unix seconds); zero when auth disabled.
+  uint64 cert_not_after = 4;
+
+  // The number of revocations this node currently holds.
+  uint32 revocation_count = 5;
+
+  // One entry per originator with a known security posture.
+  repeated NodeSecurity nodes = 6;
+}
+
 // Request a routing decision for a hypothetical packet to `destination`,
 // mirroring what the router would compute on send.  Returns a
 // ResolveRouteResponse with the next-hop neighbor and the egress
@@ -164,8 +213,12 @@ message WayfinderRequest {
     // Revoke a node from the mesh (provider mode).
     RevokeNodeRequest revoke_node = 11;
 
+    // Query the mesh authentication / security posture (field 12 is reserved for
+    // ListCertsRequest on the provider branch, so this takes 13).
+    GetSecurityStatusRequest get_security_status = 12;
+
     // List the certificates this provider has issued (provider mode).
-    ListCertsRequest list_certs = 12;
+    ListCertsRequest list_certs = 13;
   }
 }
 
@@ -525,7 +578,11 @@ message WayfinderResponse {
     // Response to SubmitCsrRequest.
     SubmitCsrResponse submit_csr = 11;
 
+    // Response to GetSecurityStatusRequest (field 12 is reserved for
+    // ListCertsResponse on the provider branch, so this takes 13).
+    GetSecurityStatusResponse security_status = 12;
+
     // Response to ListCertsRequest.
-    ListCertsResponse list_certs = 12;
+    ListCertsResponse list_certs = 13;
   }
 }

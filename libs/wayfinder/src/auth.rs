@@ -30,8 +30,8 @@ use batman::wire::{BatmanOgmPacket, BatmanTvlvHdr, TvlvType, find_tvlv, iter_tvl
 use heapless::Vec as HVec;
 use interfaces::frame::Mac;
 use wayfinder_auth::{
-    Keypair, MembershipCert, RevocationRecord, TAG_LEN, TrustAnchor, frame_tag, verify_frame_tag,
-    verify_signature,
+    Keypair, MembershipCert, RevocationRecord, TAG_LEN, TrustAnchor, VerifiedCert, frame_tag,
+    verify_frame_tag, verify_signature,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -91,15 +91,14 @@ const _: () =
 /// One verified neighbor's keys, learned from its authenticated OGM cert.
 #[derive(Debug, Clone, Copy)]
 pub struct NeighborKeys {
-    /// The neighbor's node MAC.
-    pub mac: Mac,
-    /// Its Ed25519 identity key (verifies its OGM signatures).
-    pub ed_pubkey: [u8; 32],
-    /// Its X25519 key (derives the pairwise data-plane key).
-    pub x_pubkey: [u8; 32],
+    /// The trusted facts from the neighbor's verified membership cert — its MAC,
+    /// identity (Ed25519) and agreement (X25519) keys, and cert expiry. Held
+    /// whole so the security view can report the expiry and the router can
+    /// attribute signatures without a second lookup.
+    pub cert: VerifiedCert,
     /// The symmetric pairwise key shared with this neighbor, derived once (from
-    /// our secret and its `x_pubkey`) when the neighbor is cached, and reused to
-    /// tag/verify directed data-plane frames.
+    /// our secret and the cert's `x_pubkey`) when the neighbor is cached, and
+    /// reused to tag/verify directed data-plane frames.
     pub pairwise_key: [u8; 32],
 }
 
@@ -291,7 +290,7 @@ impl OgmAuth {
     /// its replay counters are reset.
     fn evict_neighbor(&mut self, mac: Mac) {
         tracing::trace!("auth: evicting neighbor: {:?}", mac);
-        if let Some(i) = self.neighbors.iter().position(|n| n.mac == mac) {
+        if let Some(i) = self.neighbors.iter().position(|n| n.cert.mac == mac) {
             self.neighbors.swap_remove(i);
         }
         if let Some(i) = self.send_counters.iter().position(|(m, _)| *m == mac) {
@@ -319,12 +318,24 @@ impl OgmAuth {
         &self.neighbors
     }
 
+    /// This node's own membership certificate (for the security view: mesh id,
+    /// bound MAC, and expiry).
+    pub fn own_cert(&self) -> &MembershipCert {
+        &self.cert
+    }
+
+    /// The wall-clock instant (unix seconds) the auth clock was last set to, for
+    /// computing "expires in" in the security view.  Zero until first set.
+    pub fn now_unix(&self) -> u64 {
+        self.now_unix
+    }
+
     /// The X25519 key of a verified neighbor, for pairwise data-plane keying.
     pub fn neighbor_x_pubkey(&self, mac: Mac) -> Option<[u8; 32]> {
         self.neighbors
             .iter()
-            .find(|n| n.mac == mac)
-            .map(|n| n.x_pubkey)
+            .find(|n| n.cert.mac == mac)
+            .map(|n| n.cert.x_pubkey)
     }
 
     /// Authenticate a directed (unicast/mcast) frame addressed to next-hop
@@ -345,7 +356,7 @@ impl OgmAuth {
         let key = self
             .neighbors
             .iter()
-            .find(|n| n.mac == dst)
+            .find(|n| n.cert.mac == dst)
             .map(|n| n.pairwise_key)?;
         let src_mac = self.cert.node_mac;
         let counter = self.next_send_counter(dst)?;
@@ -368,7 +379,7 @@ impl OgmAuth {
         let Some(key) = self
             .neighbors
             .iter()
-            .find(|n| n.mac == src)
+            .find(|n| n.cert.mac == src)
             .map(|n| n.pairwise_key)
         else {
             tracing::trace!("auth: dropping directed frame from an unverified neighbor");
@@ -614,9 +625,7 @@ impl OgmAuth {
 
         let pairwise_key = self.keypair.pairwise_key(&verified.x_pubkey);
         self.cache_neighbor(NeighborKeys {
-            mac: Mac(orig),
-            ed_pubkey,
-            x_pubkey: verified.x_pubkey,
+            cert: verified,
             pairwise_key,
         });
 
@@ -645,7 +654,11 @@ impl OgmAuth {
 
     /// Insert or refresh a verified neighbor's keys.
     fn cache_neighbor(&mut self, keys: NeighborKeys) {
-        if let Some(slot) = self.neighbors.iter_mut().find(|n| n.mac == keys.mac) {
+        if let Some(slot) = self
+            .neighbors
+            .iter_mut()
+            .find(|n| n.cert.mac == keys.cert.mac)
+        {
             *slot = keys;
         } else if self.neighbors.push(keys).is_err() {
             // Table full: overwrite the first entry rather than dropping the
@@ -710,6 +723,23 @@ mod tests {
         assert!(b.verify_ogm(&buf[..len]));
         assert_eq!(b.neighbors().len(), 1);
         assert_eq!(b.neighbor_x_pubkey(mac(2)), Some(a.cert.x_pubkey));
+    }
+
+    /// A verified neighbor carries its cert's expiry, so the security view can
+    /// report when each originator's membership lapses.
+    #[test]
+    fn verified_neighbor_carries_cert_expiry() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 4242);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).expect("augment");
+
+        assert!(b.verify_ogm(&buf[..len]));
+        let n = b.neighbors().first().expect("one neighbor");
+        assert_eq!(n.cert.mac, mac(2));
+        assert_eq!(n.cert.not_after, 4242, "neighbor's cert expiry is recorded");
     }
 
     /// An unauthenticated OGM (no cert/sig TVLVs) is rejected when auth is on.

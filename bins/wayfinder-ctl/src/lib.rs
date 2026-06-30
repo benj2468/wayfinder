@@ -64,6 +64,9 @@ pub enum Command {
     Throughput,
     /// Aggregate node health and topology metrics.
     Metrics,
+    /// Mesh authentication / security posture: auth on/off, the mesh and
+    /// own-cert header, and per-originator verified / expiry / revoked state.
+    Security,
     /// Resolve the next hop and egress interface for a destination.
     Resolve {
         /// Destination identifier: a MAC like `02:00:00:00:00:09`, or raw hex.
@@ -143,6 +146,7 @@ pub async fn run_query(
         Command::OgmSchedule => output::ogm_schedule(&client.ogm_schedule().await?, output)?,
         Command::Throughput => output::throughput(&client.throughput().await?, output)?,
         Command::Metrics => output::node_metrics(&client.node_metrics().await?, output)?,
+        Command::Security => output::security(&client.security_status().await?, output)?,
         Command::Resolve { dest } => {
             let id = parse_id(&dest)?;
             output::resolve(&client.resolve_route(id).await?, output)?

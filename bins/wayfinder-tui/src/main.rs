@@ -89,6 +89,7 @@ fn handle_key(app: &mut App, code: KeyCode) {
         KeyCode::Char('3') => app.tab = app::Tab::LinkQuality,
         KeyCode::Char('4') => app.tab = app::Tab::OgmSchedule,
         KeyCode::Char('5') => app.tab = app::Tab::Metrics,
+        KeyCode::Char('6') => app.tab = app::Tab::Security,
         KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
         KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
         // 'r' just forces the next loop iteration; the timer drives refreshes,
@@ -137,6 +138,7 @@ async fn fetch(conn: &mut Client, app: &mut App) -> anyhow::Result<()> {
     app.snapshot.ogm_schedule = conn.ogm_schedule().await?;
     app.snapshot.throughput = conn.throughput().await?;
     app.snapshot.metrics = Some(conn.node_metrics().await?);
+    app.snapshot.security = Some(conn.security_status().await?);
     Ok(())
 }
 
@@ -167,6 +169,13 @@ fn ensure_selection(app: &mut App) {
     match app.metrics_state.selected() {
         Some(i) if i >= ifaces => app.metrics_state.select(ifaces.checked_sub(1)),
         None if ifaces > 0 => app.metrics_state.select(Some(0)),
+        _ => {}
+    }
+
+    let sec_nodes = app.snapshot.security.as_ref().map_or(0, |s| s.nodes.len());
+    match app.security_state.selected() {
+        Some(i) if i >= sec_nodes => app.security_state.select(sec_nodes.checked_sub(1)),
+        None if sec_nodes > 0 => app.security_state.select(Some(0)),
         _ => {}
     }
 }
