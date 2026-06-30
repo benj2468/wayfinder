@@ -2758,6 +2758,8 @@ dependencies = [
  "anyhow",
  "clap",
  "ratatui",
+ "serde",
+ "serde_json",
  "tokio",
  "wayfinder-client",
  "wayfinder-protos",

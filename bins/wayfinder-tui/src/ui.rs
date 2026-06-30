@@ -4,8 +4,11 @@ use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
+    symbols::Marker,
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs, Wrap},
+    widgets::{
+        Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table, Tabs, Wrap,
+    },
 };
 
 use crate::app::{App, Tab, format_id};
@@ -345,16 +348,111 @@ fn render_ogm_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
 /// application on top of the mesh uses to judge the health and shape of the
 /// surrounding network.
 fn render_metrics(frame: &mut Frame, app: &mut App, area: Rect) {
+    // Size the per-interface table to its rows (header + borders + one line per
+    // interface, at least one body line) so the throughput history chart gets
+    // all the remaining vertical space.
+    let iface_rows = app.snapshot.throughput.interfaces.len().max(1) as u16;
+    let table_height = iface_rows + 3;
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(9), // node metrics summary
-            Constraint::Min(0),    // per-interface throughput table
+            Constraint::Length(9),            // node metrics summary
+            Constraint::Min(8),               // throughput history chart
+            Constraint::Length(table_height), // per-interface throughput table
         ])
         .split(area);
 
     render_node_metrics(frame, app, rows[0]);
-    render_throughput(frame, app, rows[1]);
+    render_throughput_chart(frame, app, rows[1]);
+    render_throughput(frame, app, rows[2]);
+}
+
+/// Draw the node-wide throughput history as a two-line chart: one line for the
+/// receive rate and one for the transmit rate, advancing one step per refresh.
+/// This turns the instantaneous totals into a visible trend so an operator can
+/// see bursts, ramps, and collapses in mesh traffic at a glance.
+fn render_throughput_chart(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Throughput History ");
+
+    let history = &app.throughput_history;
+    // A line needs at least two points; until then show a placeholder.
+    if history.len() < 2 {
+        let para = Paragraph::new(Line::from(Span::styled(
+            "Collecting throughput history…",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .block(block);
+        frame.render_widget(para, area);
+        return;
+    }
+
+    // x is the sample index (implicitly time, one step per refresh interval);
+    // y is the rate in bytes/sec.
+    let rx: Vec<(f64, f64)> = history
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as f64, s.rx_bps))
+        .collect();
+    let tx: Vec<(f64, f64)> = history
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as f64, s.tx_bps))
+        .collect();
+
+    let x_max = (history.len() - 1) as f64;
+    // Scale the y-axis to the largest rate seen across both series, with a
+    // little headroom, and never below 1 so an idle mesh still renders a flat
+    // baseline rather than a degenerate zero-height axis.
+    let peak = history
+        .iter()
+        .map(|s| s.rx_bps.max(s.tx_bps))
+        .fold(0.0_f64, f64::max);
+    let y_max = (peak * 1.15).max(1.0);
+
+    // The x-axis spans the retained window; label its ends in seconds-ago so the
+    // chart reads as a timeline at whatever refresh interval is in effect.
+    let span_secs = x_max * app.interval_ms as f64 / 1000.0;
+
+    let datasets = vec![
+        Dataset::default()
+            .name("RX")
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Green))
+            .data(&rx),
+        Dataset::default()
+            .name("TX")
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Cyan))
+            .data(&tx),
+    ];
+
+    let chart = Chart::new(datasets)
+        .block(block)
+        .x_axis(
+            Axis::default()
+                .style(Style::default().fg(Color::DarkGray))
+                .bounds([0.0, x_max])
+                .labels(vec![
+                    Span::raw(format!("-{span_secs:.0}s")),
+                    Span::raw("now"),
+                ]),
+        )
+        .y_axis(
+            Axis::default()
+                .style(Style::default().fg(Color::DarkGray))
+                .bounds([0.0, y_max])
+                .labels(vec![
+                    Span::raw("0"),
+                    Span::raw(fmt_rate(y_max / 2.0)),
+                    Span::raw(fmt_rate(y_max)),
+                ]),
+        );
+    frame.render_widget(chart, area);
 }
 
 /// Draw the Security tab: the mesh authentication header above a per-originator
@@ -730,4 +828,40 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
 
     let para = Paragraph::new(Line::from(spans)).alignment(Alignment::Left);
     frame.render_widget(para, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::Tab;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    /// Render the Metrics tab through a real `TestBackend` so the chart's axis
+    /// bounds, label vectors, and layout split are exercised end to end — both
+    /// before any history exists (placeholder path) and once two-plus samples
+    /// make the RX/TX lines drawable.
+    #[test]
+    fn metrics_tab_renders_chart_with_and_without_history() {
+        let mut app = App::new("test".to_string(), 1000);
+        app.tab = Tab::Metrics;
+
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        // Empty history: the placeholder branch must render without panicking.
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw empty");
+
+        // Populate enough samples (including an all-idle pair) to force the
+        // line-drawing path and the y-axis peak/headroom computation.
+        for i in 0..5 {
+            app.snapshot.throughput.total_rx_bps = (i * 100) as f64;
+            app.snapshot.throughput.total_tx_bps = (i * 50) as f64;
+            app.record_throughput();
+        }
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw with history");
+    }
 }

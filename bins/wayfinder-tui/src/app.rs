@@ -1,9 +1,11 @@
 //! Application state for the Wayfinder TUI: the most recent data snapshot
 //! pulled from the management API plus the UI's navigation state.
 
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use ratatui::widgets::TableState;
+use serde::{Deserialize, Serialize};
 use wayfinder_protos::wayfinder_v1alpha::{
     GetSecurityStatusResponse, LinkQualityTable, NodeInfo, NodeMetrics, NodeSecurity, OgmSchedule,
     RoutingTable, Throughput,
@@ -88,6 +90,22 @@ pub struct Snapshot {
     pub security: Option<GetSecurityStatusResponse>,
 }
 
+/// Maximum number of throughput samples retained for the Metrics tab history
+/// chart. At the default 1 s refresh this is two minutes of history; the buffer
+/// is bounded so a long-lived TUI session cannot grow without limit.
+pub const THROUGHPUT_HISTORY: usize = 120;
+
+/// One time-ordered throughput sample: the node-wide receive and transmit rates
+/// (bytes/sec) captured at a single refresh. Samples are pushed in refresh order
+/// so the chart's x-axis is implicitly time.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ThroughputSample {
+    /// Node-wide receive rate in bytes/sec at sample time.
+    pub rx_bps: f64,
+    /// Node-wide transmit rate in bytes/sec at sample time.
+    pub tx_bps: f64,
+}
+
 impl Snapshot {
     /// The security posture recorded for originator `node_id`, if any — used to
     /// annotate the Routing tab's per-endpoint detail with its verification /
@@ -119,6 +137,9 @@ pub struct App {
     pub metrics_state: TableState,
     /// Selection state for the per-originator table on the Security tab.
     pub security_state: TableState,
+    /// Rolling history of node-wide throughput totals, oldest first, capped at
+    /// [`THROUGHPUT_HISTORY`] samples. Drives the Metrics tab RX/TX line chart.
+    pub throughput_history: VecDeque<ThroughputSample>,
     /// Last error message from a failed refresh, cleared on success.
     pub last_error: Option<String>,
     /// When the snapshot was last refreshed successfully.
@@ -143,6 +164,7 @@ impl App {
             ogm_state: TableState::default(),
             metrics_state: TableState::default(),
             security_state: TableState::default(),
+            throughput_history: VecDeque::with_capacity(THROUGHPUT_HISTORY),
             last_error: None,
             last_update: None,
             connected: false,
@@ -180,6 +202,21 @@ impl App {
         let current = state.selected().unwrap_or(0) as isize;
         let next = (current + delta).rem_euclid(len as isize) as usize;
         state.select(Some(next));
+    }
+
+    /// Append the latest node-wide throughput totals from the current snapshot
+    /// to the rolling history, evicting the oldest sample once
+    /// [`THROUGHPUT_HISTORY`] is exceeded. Call once per successful refresh so
+    /// the Metrics tab chart advances one step per refresh interval.
+    pub fn record_throughput(&mut self) {
+        let tp = &self.snapshot.throughput;
+        self.throughput_history.push_back(ThroughputSample {
+            rx_bps: tp.total_rx_bps,
+            tx_bps: tp.total_tx_bps,
+        });
+        while self.throughput_history.len() > THROUGHPUT_HISTORY {
+            self.throughput_history.pop_front();
+        }
     }
 }
 
@@ -285,6 +322,36 @@ mod tests {
         assert_eq!(app.routing_state.selected(), Some(0));
         app.move_selection(-1);
         assert_eq!(app.routing_state.selected(), Some(2));
+    }
+
+    #[test]
+    fn throughput_history_records_in_order_and_caps_at_capacity() {
+        let mut app = App::new("test".to_string(), 1000);
+        assert!(app.throughput_history.is_empty());
+
+        // Each refresh folds the current snapshot totals into the history,
+        // newest at the back, oldest at the front.
+        for i in 0..3 {
+            app.snapshot.throughput.total_rx_bps = i as f64;
+            app.snapshot.throughput.total_tx_bps = (i * 10) as f64;
+            app.record_throughput();
+        }
+        assert_eq!(app.throughput_history.len(), 3);
+        assert_eq!(app.throughput_history.front().unwrap().rx_bps, 0.0);
+        assert_eq!(app.throughput_history.back().unwrap().rx_bps, 2.0);
+        assert_eq!(app.throughput_history.back().unwrap().tx_bps, 20.0);
+
+        // Past capacity the oldest samples are evicted while the buffer stays
+        // bounded and the newest sample is retained.
+        for i in 0..THROUGHPUT_HISTORY {
+            app.snapshot.throughput.total_rx_bps = (100 + i) as f64;
+            app.record_throughput();
+        }
+        assert_eq!(app.throughput_history.len(), THROUGHPUT_HISTORY);
+        assert_eq!(
+            app.throughput_history.back().unwrap().rx_bps,
+            (100 + THROUGHPUT_HISTORY - 1) as f64
+        );
     }
 
     #[test]
