@@ -179,6 +179,7 @@ mirror:github:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "merge_request_event"'
   variables:
     GIT_STRATEGY: none
+    GIT_SSL_NO_VERIFY: false
   script:
     - git clone --mirror "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" repo.git
     - cd repo.git
