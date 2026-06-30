@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 use wayfinder_client::{Client, ConnectTarget};
 use wayfinder_tui::app::{self, App};
+use wayfinder_tui::persist;
 use wayfinder_tui::ui;
 
 /// Command-line arguments.
@@ -41,6 +42,10 @@ async fn main() -> anyhow::Result<()> {
 async fn run(terminal: &mut ratatui::DefaultTerminal, args: Args) -> anyhow::Result<()> {
     let mut app = App::new(args.addr.to_string(), args.interval);
 
+    // Restore the throughput history from a previous session so the Metrics tab
+    // chart continues its trend rather than starting blank.
+    app.throughput_history = persist::load();
+
     // Read blocking terminal events on a dedicated thread and bridge them into
     // the async loop over a channel, so input never stalls the refresh timer.
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Event>();
@@ -56,8 +61,12 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, args: Args) -> anyhow::Res
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval.max(50)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let mut loop_result = Ok(());
     while app.running {
-        terminal.draw(|frame| ui::render(frame, &mut app))?;
+        if let Err(e) = terminal.draw(|frame| ui::render(frame, &mut app)) {
+            loop_result = Err(e.into());
+            break;
+        }
 
         tokio::select! {
             _ = ticker.tick() => {
@@ -75,7 +84,12 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, args: Args) -> anyhow::Res
         }
     }
 
-    Ok(())
+    // Persist the throughput history so the next session resumes the trend.
+    // Best-effort: a failure here just means the chart starts fresh next time,
+    // so it must not mask a real run error.
+    let _ = persist::save(&app.throughput_history);
+
+    loop_result
 }
 
 /// Apply a keypress to the application state.
@@ -120,6 +134,7 @@ async fn refresh(client: &mut Option<Client>, addr: SocketAddr, app: &mut App) {
             app.connected = true;
             app.last_error = None;
             app.last_update = Some(Instant::now());
+            app.record_throughput();
             ensure_selection(app);
         }
         Err(e) => {

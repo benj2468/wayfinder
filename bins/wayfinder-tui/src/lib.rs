@@ -3,4 +3,5 @@
 //! management-API client now lives in the shared `wayfinder-client` crate.
 
 pub mod app;
+pub mod persist;
 pub mod ui;
