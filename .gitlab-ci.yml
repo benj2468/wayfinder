@@ -177,7 +177,5 @@ mirror:github:
   needs: []
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "merge_request_event"'
-  variables:
-    GIT_STRATEGY: none
   script:
     - git push --prune "https://x-access-token:${GITHUB_MIRROR_TOKEN}@github.com/benj2468/wayfinder.git" "+refs/heads/*:refs/heads/*" "+refs/tags/*:refs/tags/*"
