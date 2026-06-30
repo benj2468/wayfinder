@@ -31,6 +31,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Tab::LinkQuality => render_link_quality(frame, app, chunks[1]),
         Tab::OgmSchedule => render_ogm_schedule(frame, app, chunks[1]),
         Tab::Metrics => render_metrics(frame, app, chunks[1]),
+        Tab::Security => render_security(frame, app, chunks[1]),
     }
     render_status(frame, app, chunks[2]);
 }
@@ -223,6 +224,8 @@ fn render_path_detail(frame: &mut Frame, app: &App, area: Rect) {
                     ),
                 ]));
             }
+            out.push(Line::from(""));
+            out.extend(security_detail(app, &entry.destination));
             out
         }
     };
@@ -352,6 +355,156 @@ fn render_metrics(frame: &mut Frame, app: &mut App, area: Rect) {
 
     render_node_metrics(frame, app, rows[0]);
     render_throughput(frame, app, rows[1]);
+}
+
+/// Draw the Security tab: the mesh authentication header above a per-originator
+/// table (verified / cert expiry / revoked).
+fn render_security(frame: &mut Frame, app: &mut App, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(7), // mesh-level header
+            Constraint::Min(0),    // per-originator table
+        ])
+        .split(area);
+
+    render_security_header(frame, app, rows[0]);
+    render_security_table(frame, app, rows[1]);
+}
+
+/// The mesh-level crypto header: auth on/off, mesh id, this node's own cert and
+/// expiry, and the number of revocations held.
+fn render_security_header(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Mesh Security ");
+
+    let lines: Vec<Line> = match &app.snapshot.security {
+        None => vec![Line::from(Span::styled(
+            "(waiting for data)",
+            Style::default().fg(Color::DarkGray),
+        ))],
+        Some(s) if !s.auth_enabled => vec![field("Authentication", "disabled")],
+        Some(s) => vec![
+            field("Authentication", "enabled"),
+            field("Mesh id", &format!("{:#x}", s.mesh_id)),
+            field("This node", &format_id(&s.node_mac)),
+            field("Own cert expires", &s.cert_not_after.to_string()),
+            field("Revocations held", &s.revocation_count.to_string()),
+        ],
+    };
+
+    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    frame.render_widget(para, area);
+}
+
+/// The per-originator security table: identity, whether its OGM cert verified,
+/// the cert expiry, and revocation status.
+fn render_security_table(frame: &mut Frame, app: &mut App, area: Rect) {
+    let header = Row::new(["Node", "Verified", "Expires", "Status"])
+        .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+
+    let nodes = app
+        .snapshot
+        .security
+        .as_ref()
+        .map(|s| s.nodes.as_slice())
+        .unwrap_or(&[]);
+
+    let rows: Vec<Row> = nodes
+        .iter()
+        .map(|n| {
+            let (vtext, vstyle) = if n.verified {
+                ("yes", Style::default().fg(Color::Green))
+            } else {
+                ("no", Style::default().fg(Color::Red))
+            };
+            let (stext, sstyle) = if n.revoked {
+                (
+                    "revoked",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("active", Style::default().fg(Color::Green))
+            };
+            Row::new(vec![
+                Cell::from(format_id(&n.node_id)),
+                Cell::from(Span::styled(vtext, vstyle)),
+                Cell::from(if n.verified {
+                    n.cert_not_after.to_string()
+                } else {
+                    "—".to_string()
+                }),
+                Cell::from(Span::styled(stext, sstyle)),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(12),
+            Constraint::Length(10),
+            Constraint::Length(14),
+            Constraint::Min(8),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Originators "),
+    )
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::Blue)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(table, area, &mut app.security_state);
+}
+
+/// The security annotation for one originator, shown in the Routing tab's
+/// per-endpoint detail: verified status, cert expiry, and revocation.
+fn security_detail(app: &App, node_id: &[u8]) -> Vec<Line<'static>> {
+    let header = Line::from(Span::styled(
+        "Security:",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    ));
+    let dim = |s: &str| {
+        Line::from(Span::styled(
+            format!("  {s}"),
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+    let body = match (&app.snapshot.security, app.snapshot.security_for(node_id)) {
+        (None, _) => dim("(waiting for data)"),
+        (Some(s), _) if !s.auth_enabled => dim("authentication disabled"),
+        (Some(_), None) => dim("no certificate seen"),
+        (Some(_), Some(n)) => {
+            let mut spans = vec![
+                Span::raw("  verified: "),
+                if n.verified {
+                    Span::styled("yes", Style::default().fg(Color::Green))
+                } else {
+                    Span::styled("no", Style::default().fg(Color::Red))
+                },
+            ];
+            if n.verified {
+                spans.push(Span::raw("  expires: "));
+                spans.push(Span::raw(n.cert_not_after.to_string()));
+            }
+            if n.revoked {
+                spans.push(Span::styled(
+                    "  REVOKED",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ));
+            }
+            Line::from(spans)
+        }
+    };
+    vec![header, body]
 }
 
 /// Draw the node-level metrics summary panel.

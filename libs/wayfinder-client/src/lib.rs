@@ -24,10 +24,11 @@ use tokio::net::{TcpStream, UnixDatagram};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use wayfinder_protos::wayfinder_v1alpha::{
     GetLinkQualityTableRequest, GetMetricsRequest, GetNodeInfoRequest, GetOgmScheduleRequest,
-    GetRoutingTableRequest, GetThroughputRequest, GetTrustAnchorRequest, GetTrustAnchorResponse,
-    LinkQualityTable, ListCertsRequest, ListCertsResponse, NodeInfo, NodeMetrics, OgmSchedule,
-    ResolveRouteRequest, ResolveRouteResponse, RevokeNodeRequest, RoutingTable, SetAuthRequest,
-    SubmitCsrRequest, SubmitCsrResponse, Throughput, WayfinderRequest, WayfinderResponse,
+    GetRoutingTableRequest, GetSecurityStatusRequest, GetSecurityStatusResponse,
+    GetThroughputRequest, GetTrustAnchorRequest, GetTrustAnchorResponse, LinkQualityTable,
+    ListCertsRequest, ListCertsResponse, NodeInfo, NodeMetrics, OgmSchedule, ResolveRouteRequest,
+    ResolveRouteResponse, RevokeNodeRequest, RoutingTable, SetAuthRequest, SubmitCsrRequest,
+    SubmitCsrResponse, Throughput, WayfinderRequest, WayfinderResponse,
     wayfinder_request::Request as RequestKind, wayfinder_response::Response as ResponseKind,
 };
 
@@ -218,6 +219,19 @@ impl Client {
         }
     }
 
+    /// Query this node's mesh authentication / security posture: whether auth is
+    /// enabled, the mesh and own-cert header, and the per-originator
+    /// verified / expiry / revoked state.
+    pub async fn security_status(&mut self) -> anyhow::Result<GetSecurityStatusResponse> {
+        match self
+            .request(RequestKind::GetSecurityStatus(GetSecurityStatusRequest {}))
+            .await?
+        {
+            ResponseKind::SecurityStatus(status) => Ok(status),
+            other => Err(unexpected("SecurityStatus", &other)),
+        }
+    }
+
     /// Ask the node which next-hop neighbour and egress interface it would pick
     /// for a packet to `destination` (the raw identifier bytes, same encoding as
     /// [`NodeInfo::node_id`]).
@@ -351,6 +365,7 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
         ResponseKind::Empty(_) => "Empty",
         ResponseKind::TrustAnchor(_) => "TrustAnchor",
         ResponseKind::SubmitCsr(_) => "SubmitCsr",
+        ResponseKind::SecurityStatus(_) => "SecurityStatus",
         ResponseKind::ListCerts(_) => "ListCerts",
     };
     anyhow!("expected {want} response, got {got}")

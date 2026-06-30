@@ -1,11 +1,11 @@
 use crate::wayfinder_v1alpha::Empty;
 use crate::wayfinder_v1alpha::{
-    AllInterfacesEgress, ErrorResponse, GetTrustAnchorResponse, InterfaceThroughput, IssuedCert,
-    LinkQualityEntry, LinkQualityTable, ListCertsResponse, NeighborPath, NodeInfo, NodeMetrics,
-    OgmSchedule, OgmScheduleEntry, ResolveRouteResponse, RoutingEntry, RoutingTable,
-    SubmitCsrResponse, TableOccupancy, Throughput, WayfinderRequest, WayfinderResponse,
-    resolve_route_response::Egress as EgressKind, wayfinder_request::Request as RequestKind,
-    wayfinder_response::Response as ResponseKind,
+    AllInterfacesEgress, ErrorResponse, GetSecurityStatusResponse, GetTrustAnchorResponse,
+    InterfaceThroughput, IssuedCert, LinkQualityEntry, LinkQualityTable, ListCertsResponse,
+    NeighborPath, NodeInfo, NodeMetrics, NodeSecurity, OgmSchedule, OgmScheduleEntry,
+    ResolveRouteResponse, RoutingEntry, RoutingTable, SubmitCsrResponse, TableOccupancy,
+    Throughput, WayfinderRequest, WayfinderResponse, resolve_route_response::Egress as EgressKind,
+    wayfinder_request::Request as RequestKind, wayfinder_response::Response as ResponseKind,
 };
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -140,6 +140,40 @@ pub struct RouteResolutionData {
     pub egress: Option<EgressDecisionData>,
 }
 
+/// The security posture of one originator, as the local node sees it.  Mirrors
+/// the `NodeSecurity` proto without coupling providers to the generated types.
+#[derive(Clone)]
+pub struct NodeSecurityData {
+    /// The originator's node MAC (raw bytes).
+    pub node_id: Vec<u8>,
+    /// Whether we hold a verified membership cert for it (its OGM signature
+    /// chained to our trust anchor).
+    pub verified: bool,
+    /// Its certificate expiry (unix seconds) when `verified`, else 0.
+    pub cert_not_after: u64,
+    /// Whether we currently hold a revocation for it.
+    pub revoked: bool,
+}
+
+/// This node's mesh authentication / security posture.  Mirrors the
+/// `GetSecurityStatusResponse` proto.  The [`Default`] (all-zero / `nodes`
+/// empty) represents auth being disabled.
+#[derive(Clone, Default)]
+pub struct SecurityStatusData {
+    /// Whether mesh authentication is enabled on this node.
+    pub auth_enabled: bool,
+    /// The mesh id this node authenticates for; 0 when auth is disabled.
+    pub mesh_id: u32,
+    /// This node's own certificate MAC (raw bytes); empty when auth disabled.
+    pub node_mac: Vec<u8>,
+    /// This node's own certificate expiry (unix seconds); 0 when auth disabled.
+    pub cert_not_after: u64,
+    /// Number of revocations this node currently holds.
+    pub revocation_count: u32,
+    /// One entry per originator with a known security posture.
+    pub nodes: Vec<NodeSecurityData>,
+}
+
 /// Implemented by anything that can supply router state to [`WayfinderService`].
 /// Intentionally transport- and protocol-agnostic so callers can implement it
 /// for whatever router type they have without pulling in a dependency on this crate.
@@ -165,6 +199,13 @@ pub trait WayfinderDataProvider {
     /// Set the auth state on the node
     fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String>;
 
+    /// This node's mesh authentication / security posture, evaluated from live
+    /// auth state at the moment of the call.  The default reports auth disabled;
+    /// a provider with router-auth wired overrides it.
+    fn security_status(&self) -> SecurityStatusData {
+        SecurityStatusData::default()
+    }
+
     /// Provider mode: the mesh trust anchor as raw `TrustAnchor` bytes.  The
     /// default errors — only a node running as a certificate-authority provider
     /// overrides these three methods.
@@ -172,6 +213,8 @@ pub trait WayfinderDataProvider {
         Err(String::from("node is not a certificate-authority provider"))
     }
 
+    /// TODO: In reality, this needs to be asynchronous...
+    /// You might want the auth provider to need to approve this.
     /// Provider mode: issue a membership certificate for a CSR, returning the
     /// signed cert plus the trust anchor it chains to.  Default errors.
     fn submit_csr(
@@ -351,6 +394,27 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                     tq_mean: m.tq_mean,
                     paths_max: m.paths_max,
                     paths_mean: m.paths_mean,
+                })
+            }
+
+            Some(RequestKind::GetSecurityStatus(_)) => {
+                let s = self.provider.security_status();
+                ResponseKind::SecurityStatus(GetSecurityStatusResponse {
+                    auth_enabled: s.auth_enabled,
+                    mesh_id: s.mesh_id,
+                    node_mac: s.node_mac,
+                    cert_not_after: s.cert_not_after,
+                    revocation_count: s.revocation_count,
+                    nodes: s
+                        .nodes
+                        .into_iter()
+                        .map(|n| NodeSecurity {
+                            node_id: n.node_id,
+                            verified: n.verified,
+                            cert_not_after: n.cert_not_after,
+                            revoked: n.revoked,
+                        })
+                        .collect(),
                 })
             }
 
@@ -808,6 +872,7 @@ mod tests {
             ResponseKind::ListCerts(_) => "ListCerts",
             ResponseKind::TrustAnchor(_) => "TrustAnchor",
             ResponseKind::SubmitCsr(_) => "SubmitCsr",
+            ResponseKind::SecurityStatus(_) => "SecurityStatus",
         }
     }
 }

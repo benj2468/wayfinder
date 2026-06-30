@@ -5,7 +5,8 @@ use std::time::Instant;
 
 use ratatui::widgets::TableState;
 use wayfinder_protos::wayfinder_v1alpha::{
-    LinkQualityTable, NodeInfo, NodeMetrics, OgmSchedule, RoutingTable, Throughput,
+    GetSecurityStatusResponse, LinkQualityTable, NodeInfo, NodeMetrics, NodeSecurity, OgmSchedule,
+    RoutingTable, Throughput,
 };
 
 /// The top-level views the TUI cycles between.
@@ -22,16 +23,20 @@ pub enum Tab {
     /// Aggregate node metrics: uptime, neighbour count, table occupancy, TQ /
     /// path-diversity distribution, and per-interface throughput.
     Metrics,
+    /// Mesh authentication posture: the trust-anchor/own-cert header and a
+    /// per-originator verified / expiry / revoked table.
+    Security,
 }
 
 impl Tab {
     /// All tabs in display order.
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 6] = [
         Tab::Overview,
         Tab::Routing,
         Tab::LinkQuality,
         Tab::OgmSchedule,
         Tab::Metrics,
+        Tab::Security,
     ];
 
     /// Short title shown in the tab bar.
@@ -42,6 +47,7 @@ impl Tab {
             Tab::LinkQuality => "Link Quality",
             Tab::OgmSchedule => "OGM Schedule",
             Tab::Metrics => "Metrics",
+            Tab::Security => "Security",
         }
     }
 
@@ -78,6 +84,21 @@ pub struct Snapshot {
     pub throughput: Throughput,
     /// Aggregate node health/topology metrics, or `None` until the first fetch.
     pub metrics: Option<NodeMetrics>,
+    /// Mesh authentication / security posture, or `None` until the first fetch.
+    pub security: Option<GetSecurityStatusResponse>,
+}
+
+impl Snapshot {
+    /// The security posture recorded for originator `node_id`, if any — used to
+    /// annotate the Routing tab's per-endpoint detail with its verification /
+    /// expiry / revocation state.
+    pub fn security_for(&self, node_id: &[u8]) -> Option<&NodeSecurity> {
+        self.security
+            .as_ref()?
+            .nodes
+            .iter()
+            .find(|n| n.node_id == node_id)
+    }
 }
 
 /// Whole-application state driven by the event loop and rendered each frame.
@@ -96,6 +117,8 @@ pub struct App {
     pub ogm_state: TableState,
     /// Selection state for the per-interface throughput table on the Metrics tab.
     pub metrics_state: TableState,
+    /// Selection state for the per-originator table on the Security tab.
+    pub security_state: TableState,
     /// Last error message from a failed refresh, cleared on success.
     pub last_error: Option<String>,
     /// When the snapshot was last refreshed successfully.
@@ -119,6 +142,7 @@ impl App {
             link_state: TableState::default(),
             ogm_state: TableState::default(),
             metrics_state: TableState::default(),
+            security_state: TableState::default(),
             last_error: None,
             last_update: None,
             connected: false,
@@ -142,6 +166,10 @@ impl App {
             Tab::Metrics => (
                 &mut self.metrics_state,
                 self.snapshot.throughput.interfaces.len(),
+            ),
+            Tab::Security => (
+                &mut self.security_state,
+                self.snapshot.security.as_ref().map_or(0, |s| s.nodes.len()),
             ),
             Tab::Overview => return,
         };
@@ -196,12 +224,43 @@ mod tests {
         assert_eq!(Tab::Routing.next(), Tab::LinkQuality);
         assert_eq!(Tab::LinkQuality.next(), Tab::OgmSchedule);
         assert_eq!(Tab::OgmSchedule.next(), Tab::Metrics);
-        assert_eq!(Tab::Metrics.next(), Tab::Overview); // wrap forward
-        assert_eq!(Tab::Overview.prev(), Tab::Metrics); // wrap backward
+        assert_eq!(Tab::Metrics.next(), Tab::Security);
+        assert_eq!(Tab::Security.next(), Tab::Overview); // wrap forward
+        assert_eq!(Tab::Overview.prev(), Tab::Security); // wrap backward
         assert_eq!(Tab::Overview.index(), 0);
         assert_eq!(Tab::LinkQuality.index(), 2);
         assert_eq!(Tab::OgmSchedule.index(), 3);
         assert_eq!(Tab::Metrics.index(), 4);
+        assert_eq!(Tab::Security.index(), 5);
+    }
+
+    #[test]
+    fn security_for_looks_up_a_node_by_id() {
+        use wayfinder_protos::wayfinder_v1alpha::{GetSecurityStatusResponse, NodeSecurity};
+
+        let mut app = App::new("test".to_string(), 1000);
+        assert!(app.snapshot.security_for(&[0, 0, 0, 0, 0, 2]).is_none());
+
+        app.snapshot.security = Some(GetSecurityStatusResponse {
+            auth_enabled: true,
+            mesh_id: 0xABCD,
+            node_mac: vec![0, 0, 0, 0, 0, 1],
+            cert_not_after: 1100,
+            revocation_count: 0,
+            nodes: vec![NodeSecurity {
+                node_id: vec![0, 0, 0, 0, 0, 2],
+                verified: true,
+                cert_not_after: 1100,
+                revoked: false,
+            }],
+        });
+        let n = app
+            .snapshot
+            .security_for(&[0, 0, 0, 0, 0, 2])
+            .expect("found");
+        assert!(n.verified);
+        assert_eq!(n.cert_not_after, 1100);
+        assert!(app.snapshot.security_for(&[0, 0, 0, 0, 0, 9]).is_none());
     }
 
     fn app_with_routes(n: usize) -> App {

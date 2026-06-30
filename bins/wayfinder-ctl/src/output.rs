@@ -7,8 +7,8 @@
 use clap::ValueEnum;
 use serde::Serialize;
 use wayfinder_protos::wayfinder_v1alpha::{
-    LinkQualityTable, ListCertsResponse, NodeInfo, NodeMetrics, OgmSchedule, ResolveRouteResponse,
-    RoutingTable, Throughput, resolve_route_response::Egress,
+    GetSecurityStatusResponse, LinkQualityTable, ListCertsResponse, NodeInfo, NodeMetrics,
+    OgmSchedule, ResolveRouteResponse, RoutingTable, Throughput, resolve_route_response::Egress,
 };
 
 /// How a command renders its result.
@@ -167,6 +167,42 @@ pub fn resolve(v: &ResolveRouteResponse, fmt: OutputFormat) -> anyhow::Result<St
             None => "unknown (no link data)".to_string(),
         };
         format!("next_hop: {}\negress: {}", format_mac(&v.next_hop), egress)
+    })
+}
+
+/// Render a [`GetSecurityStatusResponse`]: the mesh header then a per-originator
+/// table (NODE / VERIFIED / EXPIRES / STATUS).
+pub fn security(v: &GetSecurityStatusResponse, fmt: OutputFormat) -> anyhow::Result<String> {
+    render(v, fmt, |v| {
+        if !v.auth_enabled {
+            return "authentication: disabled".to_string();
+        }
+        let mut out = format!(
+            "authentication: enabled\nmesh_id: {:#x}\nnode: {}\nown cert expires: {}\nrevocations: {}",
+            v.mesh_id,
+            format_mac(&v.node_mac),
+            v.cert_not_after,
+            v.revocation_count,
+        );
+        if v.nodes.is_empty() {
+            out.push_str("\n\nno originators known");
+            return out;
+        }
+        out.push_str("\n\nNODE               VERIFIED  EXPIRES       STATUS");
+        for n in &v.nodes {
+            out.push_str(&format!(
+                "\n{:<18} {:<9} {:<13} {}",
+                format_mac(&n.node_id),
+                if n.verified { "yes" } else { "no" },
+                if n.verified {
+                    n.cert_not_after.to_string()
+                } else {
+                    "-".to_string()
+                },
+                if n.revoked { "revoked" } else { "active" },
+            ));
+        }
+        out
     })
 }
 

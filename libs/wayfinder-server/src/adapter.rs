@@ -19,8 +19,8 @@ use wayfinder::wayfinder_auth::RevocationRecord;
 use wayfinder::wayfinder_auth::TrustAnchor;
 use wayfinder_protos::service::{
     EgressDecisionData, EnrollData, InterfaceThroughputData, IssuedCertData, LinkQualityEntryData,
-    NeighborPathData, NodeMetricsData, OgmScheduleEntryData, RouteResolutionData, RoutingEntryData,
-    TableOccupancyData, WayfinderDataProvider,
+    NeighborPathData, NodeMetricsData, NodeSecurityData, OgmScheduleEntryData, RouteResolutionData,
+    RoutingEntryData, SecurityStatusData, TableOccupancyData, WayfinderDataProvider,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -136,6 +136,52 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
             .collect()
     }
 
+    fn security_status(&self) -> SecurityStatusData {
+        // No auth configured ⇒ report disabled (the Default).
+        let Some(auth) = self.router.auth() else {
+            return SecurityStatusData::default();
+        };
+        let cert = auth.own_cert();
+
+        // The set of MACs we hold any security knowledge about: routable
+        // originators, verified neighbors, and revoked nodes — the last because a
+        // revocation purges the node from routing, yet the operator still wants
+        // to see that it is revoked. Deduplicate by MAC (the tables are small).
+        let mut macs: Vec<wayfinder::interfaces::frame::Mac> = Vec::new();
+        let originators = self.router.originator_table().map(|r| r.neighbor_ident);
+        let verified_macs = auth.neighbors().iter().map(|n| n.cert.mac);
+        for m in originators.chain(verified_macs).chain(auth.revoked_macs()) {
+            if !macs.contains(&m) {
+                macs.push(m);
+            }
+        }
+
+        // An originator whose signed OGM we verified is cached (keyed by its MAC)
+        // in `neighbors()`, carrying its cert expiry; anything else is reachable
+        // or revoked but not (currently) verified.
+        let nodes = macs
+            .into_iter()
+            .map(|mac| {
+                let verified = auth.neighbors().iter().find(|n| n.cert.mac == mac);
+                NodeSecurityData {
+                    node_id: mac.as_bytes().to_vec(),
+                    verified: verified.is_some(),
+                    cert_not_after: verified.map(|n| n.cert.not_after).unwrap_or(0),
+                    revoked: auth.revoked_macs().any(|m| m == mac),
+                }
+            })
+            .collect();
+
+        SecurityStatusData {
+            auth_enabled: true,
+            mesh_id: auth.anchor().mesh_id,
+            node_mac: cert.node_mac.to_vec(),
+            cert_not_after: cert.not_after.get(),
+            revocation_count: auth.revoked_macs().count() as u32,
+            nodes,
+        }
+    }
+
     fn node_metrics(&self) -> NodeMetricsData {
         let occ = |(used, capacity): (usize, usize)| TableOccupancyData {
             used: used as u32,
@@ -222,6 +268,12 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
         }
     }
 
+    /// TODO: In reality, this needs to be asynchronous...
+    /// You might want the auth provider to need to approve this.
+    ///
+    /// Instead, we should save this to some state, and allow the CTL or TUI
+    /// to read (pending CSRs). A request to this API again with an approved CSR
+    /// will return it's signed certificiate.
     fn submit_csr(
         &mut self,
         node_mac: &[u8],
@@ -396,6 +448,122 @@ mod tests {
         }
         // The provider's own router now holds (and will flood) the revocation.
         assert!(router.auth().unwrap().revoked_macs().any(|m| m == mac(9)));
+    }
+
+    /// With auth disabled, the security view reports it off and carries no
+    /// per-node state.
+    #[test]
+    fn security_status_reports_auth_disabled_by_default() {
+        let mut router = CentralRouter::new(mac(1));
+        let s = RouterAdapter::new(&mut router, None, Duration::from_secs(0)).security_status();
+        assert!(!s.auth_enabled);
+        assert_eq!(s.mesh_id, 0);
+        assert!(s.node_mac.is_empty());
+        assert!(s.nodes.is_empty());
+    }
+
+    /// With auth on, the view reports the mesh header and, per originator,
+    /// whether its signed OGM verified (with cert expiry) and whether it is
+    /// revoked — the revoked node staying visible even after routing purges it.
+    #[test]
+    fn security_status_reports_verified_expiry_and_revocation() {
+        use crate::CertAuthority;
+        use wayfinder::auth::OgmAuth;
+        use wayfinder::wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
+
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None);
+        ca.set_now_unix(100);
+        let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
+
+        // Self node mac(1), authenticated by the CA (cert not_after = 100 + 1000).
+        let me = mac(1);
+        let kp1 = Keypair::from_seed(&[2; 32]);
+        let cert1 = MembershipCert::from_bytes(
+            &ca.issue_cert(&me.0, &kp1.ed_pubkey(), &kp1.x_pubkey(), "")
+                .unwrap(),
+        )
+        .unwrap();
+        let mut router = CentralRouter::new(me);
+        router.set_auth(OgmAuth::new(kp1, cert1, anchor));
+        router.auth_mut().unwrap().set_time(100);
+
+        // Peer mac(2) emits a signed OGM; feed it so the router verifies + caches
+        // it as an originator carrying its cert expiry.
+        let peer = mac(2);
+        let kp2 = Keypair::from_seed(&[3; 32]);
+        let cert2 = MembershipCert::from_bytes(
+            &ca.issue_cert(&peer.0, &kp2.ed_pubkey(), &kp2.x_pubkey(), "")
+                .unwrap(),
+        )
+        .unwrap();
+        let mut peer_auth = OgmAuth::new(kp2, cert2, anchor);
+        peer_auth.set_time(100);
+        let ogm = BatmanOgmPacket {
+            packet_type: BATADV_IV_OGM,
+            version: 5,
+            ttl: 50,
+            flags: 0,
+            seqno: 1u32.to_be(),
+            orig: peer,
+            prev_sender: peer,
+            reserved: 0,
+            tq: 255,
+            tvlv_len: 0,
+        };
+        let mut buf = [0u8; 512];
+        let hdr = ogm.as_bytes();
+        buf[..hdr.len()].copy_from_slice(hdr);
+        let len = peer_auth.augment_ogm(&mut buf, hdr.len()).expect("augment");
+        let bytes = link_frame_bytes(
+            peer,
+            Mac::BROADCAST,
+            wayfinder::DEFAULT_BATMAN_ETHER_TYPE,
+            &buf[..len],
+        );
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 512];
+        router.handle_frame(Duration::ZERO, 0, frame, &mut tx);
+        assert!(
+            router
+                .auth()
+                .unwrap()
+                .neighbors()
+                .iter()
+                .any(|n| n.cert.mac == peer),
+            "peer became a verified originator"
+        );
+
+        let s = RouterAdapter::new(&mut router, None, Duration::from_secs(0)).security_status();
+        assert!(s.auth_enabled);
+        assert_eq!(s.mesh_id, 0xABCD);
+        assert_eq!(s.node_mac, me.0.to_vec());
+        assert_eq!(s.cert_not_after, 1100, "own cert expiry = now + ttl");
+        let row = s
+            .nodes
+            .iter()
+            .find(|n| n.node_id == peer.0.to_vec())
+            .expect("peer row present");
+        assert!(row.verified);
+        assert_eq!(row.cert_not_after, 1100);
+        assert!(!row.revoked);
+
+        // Revoke the peer through the provider path (signs + floods into our auth).
+        {
+            let mut adapter =
+                RouterAdapter::new(&mut router, Some(&mut ca), Duration::from_secs(0));
+            adapter.revoke_node(&peer.0).expect("revoke");
+        }
+        let s = RouterAdapter::new(&mut router, None, Duration::from_secs(0)).security_status();
+        assert_eq!(s.revocation_count, 1);
+        let row = s
+            .nodes
+            .iter()
+            .find(|n| n.node_id == peer.0.to_vec())
+            .expect("revoked peer still listed");
+        assert!(
+            row.revoked,
+            "revoked node stays visible in the security view"
+        );
     }
 
     /// `revoke_node` on a provider whose router has auth *disabled* errors rather
