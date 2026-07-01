@@ -3,6 +3,17 @@ use core::hash::Hash;
 use zerocopy::byteorder::network_endian::U16;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+/// Upper bound, in bytes, on a fully-encapsulated link frame anywhere in the
+/// data path — the size every receive/transmit scratch buffer is cut to.
+///
+/// It must comfortably hold a full 1500-byte host MTU carried as a directed
+/// mesh frame: the host Ethernet frame (`14 + 1500`), the [`LinkFrame`] header
+/// (`14`), the BATMAN unicast header (`9`), and the pairwise auth trailer
+/// (`24`) — ~1561 bytes worst case. `2048` leaves headroom so a full-size host
+/// frame is neither truncated on read nor silently dropped when wrapped, even
+/// if a host is (mis)configured above the recommended TAP MTU.
+pub const MAX_LINK_FRAME_LEN: usize = 2048;
+
 pub trait MeshIdentifier:
     Copy
     + PartialEq

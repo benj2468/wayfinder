@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use interfaces::{
-    frame::{LinkFrame, Mac},
+    frame::{LinkFrame, MAX_LINK_FRAME_LEN, Mac},
     link::LinkMetrics,
 };
 use tokio::sync::mpsc;
@@ -288,7 +288,7 @@ impl TestRouter {
         raw: &[u8],
         metrics: LinkMetrics,
     ) {
-        let mut buf = [0u8; 1500];
+        let mut buf = [0u8; MAX_LINK_FRAME_LEN];
         let frame = parse_frame(raw);
         let _ = self
             .driver

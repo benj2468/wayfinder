@@ -156,13 +156,47 @@ pub struct TapConfig {
     /// ignored when no address is set.
     #[serde(default)]
     pub netmask: Option<Ipv4Addr>,
+    /// Optional TAP MTU (the largest L3 payload the host stack may hand us in
+    /// one frame).
+    ///
+    /// When omitted, [`TapConfig::DEFAULT_MTU`] is used: it is deliberately
+    /// below 1500 so that a host frame at the MTU, once wrapped in mesh
+    /// encapsulation ([`TAP_ENCAP_OVERHEAD`] bytes), still fits inside a
+    /// 1500-byte carrier without IP fragmentation or a silent oversize drop.
+    /// Raise it only when the mesh links run over a lower-overhead carrier
+    /// (e.g. `RawL2`) or a jumbo-frame underlay.
+    #[serde(default)]
+    pub mtu: Option<u16>,
 }
 
 impl TapConfig {
     /// Default IPv4 netmask applied when an [`ip_address`](Self::ip_address) is
     /// configured without an explicit [`netmask`](Self::netmask): a /24.
     pub const DEFAULT_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
+
+    /// Default TAP MTU when [`mtu`](Self::mtu) is unset: `1500` minus the mesh
+    /// encapsulation and a conservative underlay allowance ([`TAP_ENCAP_OVERHEAD`]),
+    /// so a full-size host frame traverses the mesh without fragmentation.
+    pub const DEFAULT_MTU: u16 = 1500 - TAP_ENCAP_OVERHEAD as u16;
 }
+
+/// Bytes of encapsulation added to a host L3 payload before it leaves this node
+/// over a mesh link, used only to derive [`TapConfig::DEFAULT_MTU`].
+///
+/// Accounts for, on top of the host L3 payload:
+/// - the host Ethernet header carried verbatim with the frame (`14`),
+/// - the Wayfinder [`LinkFrame`] header — dst + src + protocol (`14`),
+/// - the BATMAN unicast header ([`BatmanUnicastPacket`], `9`),
+/// - the pairwise auth trailer present when auth is enabled ([`DIRECTED_TRAILER_LEN`], `24`), and
+/// - a conservative allowance for a UDP/IPv4 underlay on a 1500-byte path (`28`).
+///
+/// The literal is asserted against the real header sizes in the unit tests, so
+/// it cannot silently drift if a wire format changes.
+///
+/// [`LinkFrame`]: crate::interfaces::frame::LinkFrame
+/// [`BatmanUnicastPacket`]: batman::wire::BatmanUnicastPacket
+/// [`DIRECTED_TRAILER_LEN`]: crate::auth::DIRECTED_TRAILER_LEN
+pub const TAP_ENCAP_OVERHEAD: usize = 14 + 14 + 9 + 24 + 28;
 
 /// Configuration for the local host facing Distribution Mechanism
 #[derive(Serialize, Deserialize, Debug)]
@@ -291,6 +325,62 @@ local_egress:
         assert_eq!(tap.ip_address, Some(Ipv4Addr::new(10, 0, 0, 1)));
         assert_eq!(tap.netmask, None);
         assert_eq!(TapConfig::DEFAULT_NETMASK, Ipv4Addr::new(255, 255, 255, 0));
+    }
+
+    /// An explicit `mtu` is parsed; when omitted it is `None` so the binary
+    /// applies [`TapConfig::DEFAULT_MTU`].
+    #[test]
+    fn tap_config_mtu_parses() {
+        let with = "\
+local_egress:
+  type: Tap
+  device_name: wayfinder0
+  mtu: 1280
+";
+        let Some(LocalDistributionMechanism::Tap(tap)) =
+            serde_yaml::from_str::<Config>(with).unwrap().local_egress
+        else {
+            panic!("expected a TAP egress");
+        };
+        assert_eq!(tap.mtu, Some(1280));
+
+        let without = "\
+local_egress:
+  type: Tap
+  device_name: wayfinder0
+";
+        let Some(LocalDistributionMechanism::Tap(tap)) = serde_yaml::from_str::<Config>(without)
+            .unwrap()
+            .local_egress
+        else {
+            panic!("expected a TAP egress");
+        };
+        assert_eq!(tap.mtu, None);
+    }
+
+    /// The default TAP MTU must leave enough headroom that a full host frame,
+    /// once wrapped in mesh encapsulation, fits a 1500-byte carrier — and the
+    /// overhead literal must match the real header sizes so it can't drift.
+    #[test]
+    fn default_tap_mtu_leaves_encap_headroom() {
+        use crate::auth::DIRECTED_TRAILER_LEN;
+        use batman::wire::BatmanUnicastPacket;
+
+        // Host Ethernet header (14) + LinkFrame header (14) + BATMAN unicast
+        // header + auth trailer + a UDP/IPv4 underlay allowance (28).
+        let real_overhead =
+            14 + 14 + core::mem::size_of::<BatmanUnicastPacket>() + DIRECTED_TRAILER_LEN + 28;
+        assert_eq!(
+            TAP_ENCAP_OVERHEAD, real_overhead,
+            "TAP_ENCAP_OVERHEAD drifted from the real wire header sizes"
+        );
+
+        // A host frame at the default MTU, fully wrapped, fits a 1500 carrier.
+        const {
+            assert!(TapConfig::DEFAULT_MTU as usize + TAP_ENCAP_OVERHEAD <= 1500);
+            // And it must comfortably exceed the IPv6 minimum so the link is usable.
+            assert!(TapConfig::DEFAULT_MTU >= 1280);
+        }
     }
 
     /// An `auth` block parses into the cert/seed/anchor paths.

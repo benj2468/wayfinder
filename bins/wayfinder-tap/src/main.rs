@@ -57,7 +57,14 @@ async fn main() -> anyhow::Result<()> {
         None => bail!("config.local_egress must be a TAP for the wayfinder-tap node"),
     };
 
-    let mut builder = DeviceBuilder::new().layer(Layer::L2).name(&tap.device_name);
+    // Cap the TAP MTU so a full host frame still fits inside a mesh link's
+    // carrier once wrapped in BATMAN + link + auth encapsulation; without this,
+    // full-size frames would be silently truncated on read or dropped on wrap.
+    let mtu = tap.mtu.unwrap_or(wayfinder::config::TapConfig::DEFAULT_MTU);
+    let mut builder = DeviceBuilder::new()
+        .layer(Layer::L2)
+        .name(&tap.device_name)
+        .mtu(mtu);
     // The IPv4 address/netmask are optional: when no address is configured the
     // TAP is brought up unaddressed (the mesh routes on MAC, not IP).
     if let Some(ip_address) = tap.ip_address {

@@ -18,7 +18,7 @@
 //!   single interface set can mix both kinds.
 
 use wayfinder::interfaces::{
-    frame::{LinkFrame, LinkFrameData, Mac},
+    frame::{LinkFrame, LinkFrameData, MAX_LINK_FRAME_LEN, Mac},
     link::{LinkError, LinkMetrics},
 };
 use wayfinder::link::{LinkT, Received};
@@ -72,7 +72,7 @@ impl FrameIo for tokio::net::UdpSocket {
 /// [`send`]: LinkT::send
 pub struct Link<Io: FrameIo> {
     socket: Io,
-    buffer: [u8; 1500],
+    buffer: [u8; MAX_LINK_FRAME_LEN],
 }
 
 impl<Io: FrameIo> Link<Io> {
@@ -81,7 +81,7 @@ impl<Io: FrameIo> Link<Io> {
     pub fn new(socket: Io) -> Self {
         Self {
             socket,
-            buffer: [0u8; 1500],
+            buffer: [0u8; MAX_LINK_FRAME_LEN],
         }
     }
 

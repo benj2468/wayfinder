@@ -21,7 +21,7 @@ use tokio::time::sleep;
 use tracing::{trace, warn};
 use wayfinder::auth::DIRECTED_TRAILER_LEN;
 use wayfinder::config::TrickleConfig;
-use wayfinder::interfaces::frame::{LinkFrame, LinkFrameData, Mac};
+use wayfinder::interfaces::frame::{LinkFrame, LinkFrameData, MAX_LINK_FRAME_LEN, Mac};
 use wayfinder::{CentralRouter, DEFAULT_BATMAN_ETHER_TYPE, EgressInterface, McastPlan};
 use wayfinder_protos::service::WayfinderService;
 use wayfinder_server::{CertAuthority, MeshAuthority, QueryRx, RouterAdapter};
@@ -108,9 +108,9 @@ pub struct Driver<Local: FrameIo> {
     /// construction; override with [`set_auth_epoch_unix`](Self::set_auth_epoch_unix).
     auth_epoch_unix: u64,
     /// Receive scratchpad for frames read from the host device.
-    rx_buffer: [u8; 1500],
+    rx_buffer: [u8; MAX_LINK_FRAME_LEN],
     /// Transmit scratchpad the router builds outgoing frames into.
-    tx_buffer: [u8; 1500],
+    tx_buffer: [u8; MAX_LINK_FRAME_LEN],
     /// The mesh certificate authority, present only when this node runs in
     /// provider mode (set via [`set_provider`](Self::set_provider)).  Serves the
     /// enrollment management-API requests; absent ⇒ those return an error.
@@ -148,8 +148,8 @@ impl<Local: FrameIo> Driver<Local> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
-            rx_buffer: [0u8; 1500],
-            tx_buffer: [0u8; 1500],
+            rx_buffer: [0u8; MAX_LINK_FRAME_LEN],
+            tx_buffer: [0u8; MAX_LINK_FRAME_LEN],
             provider: None,
         }
     }

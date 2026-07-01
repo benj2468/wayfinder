@@ -20,7 +20,7 @@ use interfaces::{
     frame::{LinkFrame, LinkFrameData, LinkFrameDataMut, Mac},
     link::LinkMetrics,
 };
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 use zerocopy::IntoBytes;
 
 use crate::{
@@ -277,6 +277,12 @@ pub struct CentralRouter {
     /// it emits and drops incoming OGMs that do not verify against the mesh
     /// trust anchor — segregating this mesh from others sharing the medium.
     auth: Option<OgmAuth>,
+    /// Count of locally originated host frames dropped because they did not fit
+    /// in the transmit buffer once wrapped in mesh encapsulation — i.e. the host
+    /// sent a frame larger than the mesh can carry (a misconfigured MTU).  A
+    /// bounded, here-and-now signal an operator can query; the first such drop
+    /// also logs a single `warn!` so it is not entirely silent.
+    oversize_drops: u32,
 }
 
 impl CentralRouter {
@@ -289,7 +295,27 @@ impl CentralRouter {
             tx_rates: [RateEstimator::default(); MAX_INTERFACES],
             iface_count: 0,
             auth: None,
+            oversize_drops: 0,
         }
+    }
+
+    /// Number of locally originated host frames dropped because they exceeded
+    /// the mesh's carrying capacity once encapsulated.  A non-zero value means
+    /// the host MTU is set too high for the mesh links (see
+    /// [`TapConfig::DEFAULT_MTU`](crate::config::TapConfig::DEFAULT_MTU)).
+    pub fn oversize_drops(&self) -> u32 {
+        self.oversize_drops
+    }
+
+    /// Record one oversize-drop of a local host frame.  Emits a single `warn!`
+    /// on the first occurrence — enough for an operator to notice a bad MTU —
+    /// then only bumps the counter, so a host looping oversize frames cannot
+    /// flood the logs on this hot path.
+    fn note_oversize_drop(&mut self) {
+        if self.oversize_drops == 0 {
+            warn!("dropping host frame too large to carry over the mesh; lower the TAP MTU");
+        }
+        self.oversize_drops = self.oversize_drops.saturating_add(1);
     }
 
     /// Enable opt-in mesh authentication with the given [`OgmAuth`] state: the
@@ -591,6 +617,7 @@ impl CentralRouter {
         let header_size = core::mem::size_of::<BatmanMcastPacket>();
         let total_size = header_size + payload.len();
         if total_size > tx_buf.len() {
+            self.note_oversize_drop();
             return Err(BufferTooSmall);
         }
         tx_buf[..header_size].copy_from_slice(header.as_bytes());
@@ -695,6 +722,7 @@ impl CentralRouter {
             let header_size = core::mem::size_of::<BatmanBroadcastPacket>();
             let total_size = header_size + payload.len();
             if total_size > tx_buf.len() {
+                self.note_oversize_drop();
                 return Err(BufferTooSmall);
             }
             tx_buf[..header_size].copy_from_slice(header.as_bytes());
@@ -725,6 +753,7 @@ impl CentralRouter {
         let total_size = header_size + payload.len();
 
         if total_size > tx_buf.len() {
+            self.note_oversize_drop();
             return Err(BufferTooSmall);
         }
 
@@ -1169,6 +1198,41 @@ mod mcast_forwarding {
         assert_eq!(hdr.dest, mac(7));
         assert!(hdr.ttl > 1);
         assert_eq!(&rest[..INNER.len()], INNER);
+    }
+
+    /// A host frame that does not fit the transmit buffer once wrapped is
+    /// dropped gracefully (no panic) and counted; a frame that fits is not.
+    #[test]
+    fn oversize_local_frame_is_counted_not_panicked() {
+        let mut router = CentralRouter::new(mac(1));
+
+        // A tiny buffer that cannot hold even the unicast header + payload.
+        let mut tiny = [0u8; 4];
+        assert!(router.handle_local(mac(2), INNER, &mut tiny).is_err());
+        assert_eq!(router.oversize_drops(), 1);
+
+        // A second oversize drop bumps the counter without a second warn.
+        assert!(router.handle_local(mac(2), INNER, &mut tiny).is_err());
+        assert_eq!(router.oversize_drops(), 2);
+
+        // A frame that fits does not touch the counter.
+        let mut ok = [0u8; 256];
+        assert!(router.handle_local(mac(2), INNER, &mut ok).is_ok());
+        assert_eq!(router.oversize_drops(), 2);
+    }
+
+    /// A full 1500-byte host frame fits, fully wrapped, in a
+    /// [`MAX_LINK_FRAME_LEN`](interfaces::frame::MAX_LINK_FRAME_LEN) buffer — the
+    /// size the data path actually uses — so it is never an oversize drop.
+    #[test]
+    fn full_mtu_host_frame_fits_max_link_frame_buffer() {
+        use interfaces::frame::MAX_LINK_FRAME_LEN;
+
+        let mut router = CentralRouter::new(mac(1));
+        let host_frame = [0u8; 1514]; // 1500 MTU + 14-byte Ethernet header
+        let mut tx = [0u8; MAX_LINK_FRAME_LEN];
+        assert!(router.handle_local(mac(2), &host_frame, &mut tx).is_ok());
+        assert_eq!(router.oversize_drops(), 0);
     }
 }
 
