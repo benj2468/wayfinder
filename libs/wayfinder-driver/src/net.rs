@@ -33,12 +33,12 @@ pub async fn build_udp_link(
             tokio::select! {
                 Ok(bytes) = udp_socket.recv(&mut rx_buf) => {
                     if let Err(e) = bridge.send(&rx_buf[..bytes]).await {
-                        tracing::error!("Error bridging to in-process socket: {:?}", e);
+                        tracing::warn!(error = ?e, "udp bridge to in-process socket failed");
                     }
                 },
                 Ok(bytes) = bridge.recv(&mut tx_buf) => {
                     if let Err(e) = udp_socket.send(&tx_buf[..bytes]).await {
-                        tracing::error!("Error bridging to off-process socket: {:?}", e);
+                        tracing::warn!(error = ?e, "udp bridge to off-process socket failed");
                     }
                 },
             }

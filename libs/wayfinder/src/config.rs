@@ -29,9 +29,9 @@ impl TrickleConfig {
     const fn default_i_min_ms() -> u64 {
         1_000
     }
-    /// Default `i_max`: 64 s — quiet in steady state versus the former fixed 10 s.
+    /// Default `i_max`: 128 s — quiet in steady state versus the former fixed 10 s.
     const fn default_i_max_ms() -> u64 {
-        64_000
+        128_000
     }
     /// The configured minimum interval as a [`core::time::Duration`].
     pub fn i_min(&self) -> core::time::Duration {

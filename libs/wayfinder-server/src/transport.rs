@@ -60,11 +60,11 @@ pub async fn run_tcp_server(addr: SocketAddr, query_tx: QueryTx) -> anyhow::Resu
     tracing::info!("management API listening on TCP {addr}");
     loop {
         let (stream, peer) = listener.accept().await?;
-        tracing::debug!("management connection from {peer}");
+        tracing::debug!(%peer, "management connection accepted");
         let tx = query_tx.clone();
         tokio::spawn(async move {
             if let Err(e) = serve_stream(stream, tx).await {
-                tracing::warn!("management stream error: {e}");
+                tracing::warn!(error = ?e, "management stream error");
             }
         });
     }

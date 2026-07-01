@@ -40,7 +40,6 @@ impl MeshIdentifier for u8 {
     Eq,
     Hash,
     Default,
-    Debug,
     FromBytes,
     IntoBytes,
     Immutable,
@@ -50,6 +49,24 @@ impl MeshIdentifier for u8 {
 )]
 #[repr(transparent)]
 pub struct Mac(pub [u8; 6]);
+
+impl core::fmt::Debug for Mac {
+    /// Render as lowercase colon-separated hex (`00:11:22:33:44:55`), matching
+    /// how packet tools (wireshark/tshark) display a MAC.  Used directly by the
+    /// `?mac` field in every routing log, and transitively wherever a struct
+    /// containing a `Mac` is `Debug`-formatted.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let [a, b, c, d, e, g] = self.0;
+        write!(f, "{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{g:02x}")
+    }
+}
+
+impl core::fmt::Display for Mac {
+    /// Identical to the [`Debug`](Mac::fmt) form: lowercase colon-hex.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(self, f)
+    }
+}
 
 impl Mac {
     /// The all-ones (`ff:ff:ff:ff:ff:ff`) link-layer broadcast address.

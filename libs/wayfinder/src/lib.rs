@@ -20,8 +20,7 @@ use interfaces::{
     frame::{LinkFrame, LinkFrameData, LinkFrameDataMut, Mac},
     link::LinkMetrics,
 };
-use pretty_hex::pretty_hex;
-use tracing::warn;
+use tracing::{debug, info, trace};
 use zerocopy::IntoBytes;
 
 use crate::{
@@ -298,7 +297,7 @@ impl CentralRouter {
     /// verify against the mesh trust anchor.  Without this the router stays in
     /// its open, unauthenticated mode.
     pub fn set_auth(&mut self, auth: OgmAuth) {
-        tracing::debug!("Updating auth state; resetting learned routing state");
+        debug!("updating auth state; resetting learned routing state");
         self.auth = Some(auth);
         // Routes, link-quality, ident mappings, and broadcast-dedup state were
         // all learned under the previous (or no) auth regime and are stale the
@@ -336,8 +335,8 @@ impl CentralRouter {
         };
         let newly = auth.ingest_revocation(record);
         if auth.take_trickle_reset_hint() {
-            tracing::info!(
-                "ingested revocation, reseting timers, revoking originators, and purgins stale OGMs"
+            info!(
+                "ingested revocation; resetting timers, revoking originators, and purging stale OGMs"
             );
             self.batman.reset_ogm_timers(now);
             self.batman.revoke_originators(auth.revoked_macs());
@@ -380,9 +379,15 @@ impl CentralRouter {
         let src = frame.src;
         let dst = frame.dst;
         let protocol = frame.protocol.get();
-        let span = tracing::trace_span!("handle_frame", iface_idx, ?src, ?dst, ?protocol);
+        let span = tracing::trace_span!(
+            "handle_frame",
+            iface_idx,
+            ?src,
+            ?dst,
+            protocol = %format_args!("0x{protocol:04x}"),
+        );
         let _enter = span.enter();
-        tracing::trace!("{}", pretty_hex(&&frame.payload));
+        trace!(payload_len = frame.payload.len(), "rx frame");
 
         tx_buf.fill(0);
         // 0. Update the link-quality table for the sender, keyed on the
@@ -446,10 +451,10 @@ impl CentralRouter {
 
                 // BATMAN-adv Protocol ID
                 let action = self.batman.handle_rx(now, frame, local_quality, &mut reply);
-                tracing::trace!(
-                    "Post-action reply: dst={:?}, protocol={:?}",
-                    reply.dst,
-                    reply.protocol
+                trace!(
+                    reply_dst = ?reply.dst,
+                    reply_protocol = %format_args!("0x{:04x}", reply.protocol),
+                    "post-action reply"
                 );
                 match action {
                     RoutingAction::Consumed => {
@@ -515,12 +520,12 @@ impl CentralRouter {
                 }
             }
             0x88B5 => {
-                tracing::trace!("received experimental protocol frame");
+                trace!("rx experimental protocol frame");
                 // Dynamically route to a completely separate experimental protocol context
                 RxOutcome::empty()
             }
             _ => {
-                warn!("Dropped unknown protocol frame");
+                trace!(protocol = %format_args!("0x{protocol:04x}"), "drop: unknown protocol");
                 RxOutcome::empty()
             }
         }

@@ -3,7 +3,6 @@ use std::fmt::Debug;
 use std::mem::size_of;
 
 use interfaces::frame::MeshIdentifier;
-use pretty_hex::pretty_hex;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use thiserror::Error;
@@ -257,11 +256,11 @@ where
                 let source = match Ident::ref_from_prefix(&msg[size_of::<Ident>()..]) {
                     Ok((source, _)) => source,
                     Err(e) => {
-                        tracing::warn!("unable to parse message as ident: {:?}", e);
+                        tracing::trace!(error = ?e, "drop: message is not a valid ident");
                         continue;
                     }
                 };
-                tracing::trace!("parsed message as ident: {:?}", (*source, *id));
+                tracing::trace!(source = ?*source, port_id = ?*id, "learned ident");
 
                 self.ident_map.insert(*source, *id);
             }
@@ -274,15 +273,15 @@ where
         // `incoming_loss` muting its transmissions above.  Together they let a
         // single port's link be taken fully up or down.
         for (port, msgs) in msgs {
-            tracing::trace!(port_id = ?port, "processing {:?} messages", msgs.len());
+            tracing::trace!(port_id = ?port, count = msgs.len(), "processing messages");
             for mut msg in msgs {
-                tracing::trace!(port_id = ?port, direction = ?Direction::ToSwitch, "{}", pretty_hex(&msg));
+                tracing::trace!(port_id = ?port, direction = ?Direction::ToSwitch, len = msg.len(), "switch frame");
 
                 let Ok((dest, _)) = Ident::ref_from_prefix(&msg) else {
                     continue;
                 };
 
-                tracing::trace!(dest = ?dest, "forwarding message to dests: {:?}", self.ident_map.get(dest));
+                tracing::trace!(dest = ?dest, port = ?self.ident_map.get(dest), "forwarding message");
                 if let Some(dest_port) = self.ident_map.get(dest).copied() {
                     // Drop on the wire toward the destination node if its link is lossy.
                     if self
@@ -291,7 +290,7 @@ where
                     {
                         continue;
                     }
-                    tracing::trace!(port_id = ?dest_port, direction = ?Direction::FromSwitch, "{}", pretty_hex(&msg));
+                    tracing::trace!(port_id = ?dest_port, direction = ?Direction::FromSwitch, len = msg.len(), "switch frame");
                     // Send to specific destination port
                     if let Some(taps) = self.taps.get_mut(&dest_port) {
                         for tap in taps.iter_mut() {
@@ -324,7 +323,7 @@ where
                         if self.rng.random_bool(other_port.config.outgoing_loss) {
                             continue;
                         }
-                        tracing::trace!(port_id = ?other_port_id, direction = ?Direction::FromSwitch, "{}", pretty_hex(&msg));
+                        tracing::trace!(port_id = ?other_port_id, direction = ?Direction::FromSwitch, len = msg.len(), "switch frame");
 
                         if let Some(taps) = self.taps.get_mut(other_port_id) {
                             for tap in taps.iter_mut() {

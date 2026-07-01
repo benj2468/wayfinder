@@ -106,7 +106,7 @@ YAML
 #
 # Optionally pin this node's adaptive OGM (Trickle) backoff bounds on every link
 # via OGM_I_MIN_MS / OGM_I_MAX_MS. When neither is set, the links omit the `ogm:`
-# block and the router falls back to its built-in defaults (1s / 64s).
+# block and the router falls back to its built-in defaults (1s / 128s).
 for ifc in $(ls /sys/class/net | grep '^eth' | sort); do
   ip4="$(ip -4 -o addr show dev "$ifc" 2>/dev/null | awk '{print $4}' | head -1)"
   case "$ip4" in
@@ -121,7 +121,7 @@ YAML
     cat >> "$CFG" <<YAML
     ogm:
       i_min_ms: ${OGM_I_MIN_MS:-1000}
-      i_max_ms: ${OGM_I_MAX_MS:-64000}
+      i_max_ms: ${OGM_I_MAX_MS:-128000}
 YAML
   fi
 done

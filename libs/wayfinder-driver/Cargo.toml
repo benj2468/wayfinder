@@ -21,7 +21,6 @@ async-trait = { workspace = true, optional = true }
 anyhow.workspace = true
 tracing.workspace = true
 zerocopy.workspace = true
-pretty-hex.workspace = true
 etherparse.workspace = true
 
 tokio = { workspace = true, optional = true }
