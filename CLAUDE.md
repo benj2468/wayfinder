@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a research project implementing BATMAN-adv (Better Approach To Mobile Adhoc Networking) mesh routing for embedded systems and LoRa radio communication. The project is structured as a Cargo workspace with multiple libraries focusing on different aspects of mesh networking.
+This is a research project implementing BATMAN-adv (Better Approach To Mobile Adhoc Networking) mesh routing for embedded systems and multi-radio edge links (LoRa, IEEE 802.15.4). The project is a Cargo workspace of `no_std`-friendly core libraries, host-side driver/server/tooling crates, and a runnable node.
+
+The core routing engine is `#![no_std]` and heap-free (`heapless`), so the *same* routing code runs on a bare-metal MCU and on a Linux gateway. Host concerns (tokio event loop, sockets, TAP bridging, the management API server, TUI/CLI clients) live in separate `std` crates layered on top.
 
 ## Building and Testing
 
@@ -16,6 +18,7 @@ cargo build
 # Build a specific package
 cargo build -p batman
 cargo build -p wayfinder
+cargo build -p wayfinder-driver
 cargo build -p rylr998
 cargo build -p interfaces
 
@@ -32,11 +35,12 @@ hook also runs it. Prefer `nix fmt` over `cargo fmt`.
 ### Testing Commands
 ```bash
 # Run all tests in the workspace
-cargo test
+cargo test --workspace
 
 # Run tests for a specific package
 cargo test -p wayfinder
 cargo test -p batman
+cargo test -p wayfinder-auth
 
 # Run a specific test by name
 cargo test test_ogm_forwarding
@@ -45,10 +49,20 @@ cargo test test_ogm_forwarding
 cargo test -- --nocapture
 ```
 
+The Wireshark dissector in `libs/wayfinder-shark` is tested with pytest
+(`libs/wayfinder-shark/tests/`), which drives `tshark` against the Lua
+dissector — outside the Cargo test harness.
+
 ### Running Binaries
 ```bash
-# Run the tun binary
-cargo run --bin tun
+# Run a mesh node from a YAML config (TAP bridge + UDP links + management API)
+cargo run -p wayfinder-tap -- --config <config.yaml>
+
+# The terminal dashboard against a running node's management API
+cargo run -p wayfinder-tui -- <addr>
+
+# The command-line management client / offline cert tooling
+cargo run -p wayfinder-ctl -- <subcommand>
 ```
 
 ### Documentation Requirement
@@ -85,74 +99,100 @@ For the generic container tests (`IdentTable`, `LinkQualityTable`, `Switch`), us
 
 ### Workspace Structure
 
-The workspace is organized into several libraries plus one binary:
+The workspace splits into the `no_std` routing core, radio drivers, host-side
+crates (`std`, tokio), and runnable binaries.
 
-**libs/interfaces** - Core abstractions and traits for the mesh networking system:
-- `MeshRoutingEngine` trait: Defines routing protocol behavior (handle_rx, produce_periodic_broadcast)
-- `EmbeddedMeshLink` trait: Abstracts physical layer communication; `receive` reports per-frame `LinkMetrics` (RSSI/SNR)
+#### Core routing (`no_std`)
+
+**libs/interfaces** — Core abstractions shared by every layer:
+- `MeshRoutingEngine` trait: routing protocol behaviour (`handle_rx`, `produce_periodic_broadcast`)
 - `Mac`: the node-address type — a `#[repr(transparent)]` newtype over `[u8; 6]` (a MAC address) with `is_multicast`/`is_broadcast` (I/G bit), `from_ipv4_multicast`, `BROADCAST`, and `From<[u8;6]>`. The protocol/engine/router layers are concrete over `Mac`.
 - `MeshIdentifier` trait: retained only as the type constraint for the still-generic *container* types (`IdentTable`, `LinkQualityTable`, `Switch`); implemented for `u8` (used by their unit tests) and `Mac`.
-- `LinkFrame`: Zero-copy link-layer frame structure with src/dst (`Mac`)/protocol/payload
-- `RoutingAction` enum: Returned by routing engines (Consumed, ForwardTo, DeliverLocal, DeliverLocalAndForward)
+- `LinkFrame` / `LinkFrameData` / `LinkFrameDataMut`: zero-copy link-layer frame with src/dst (`Mac`)/protocol/payload
+- `RoutingAction` enum: returned by routing engines (`Consumed`, `ForwardTo`, `DeliverLocal`, `DeliverLocalAndForward`)
+- `LinkMetrics` (per-frame RSSI/SNR) and `LinkError`
 
-**libs/batman** - BATMAN-adv routing protocol implementation:
-- `BatmanEngine<MAX_ORIGINATORS>`: Core routing engine with originator table, broadcast dedup table, and multicast membership tables (`local_mcast` / `mcast_members`)
+**libs/batman** — BATMAN-adv routing protocol implementation:
+- `BatmanEngine<MAX_ORIGINATORS>`: core routing engine with originator table, broadcast dedup table, and multicast membership tables (`local_mcast` / `mcast_members`)
 - `BatmanOgmPacket`: Originator Messages (OGM) for topology discovery. Matches batman-adv's `batadv_ogm_packet` layout (`flags`, `reserved`, big-endian `tvlv_len`) and can carry a variable-length TVLV tail after the fixed header.
-- `BatmanTvlvHdr` + `find_tvlv`: Type-Version-Length-Value records carried in the OGM tail; `BATADV_TVLV_MCAST` announces the originator's joined multicast groups (group MACs back-to-back).
-- `BatmanUnicastPacket`: Unicast data packets with TTL and destination
-- `BatmanMcastPacket`: Selectively-forwarded multicast copy (one per interested listener), routed toward `dest` like a unicast
+- `BatmanTvlvHdr` + `find_tvlv`: Type-Version-Length-Value records carried in the OGM tail; `BATADV_TVLV_MCAST` announces the originator's joined multicast groups. The router adds `Cert` / `OgmSig` TVLVs for authentication; the engine preserves unknown TVLVs verbatim when re-flooding.
+- `BatmanUnicastPacket`: unicast data packets with TTL and destination
+- `BatmanMcastPacket`: selectively-forwarded multicast copy (one per interested listener), routed toward `dest` like a unicast
 - `BatmanBroadcastPacket`: TTL-limited, seqno-deduplicated flooded broadcasts (e.g. ARP)
+- `Trickle` (`trickle.rs`): a Trickle-style adaptive OGM emission timer (after RFC 6206). The interval doubles from `i_min` toward `i_max` while the topology is stable and snaps back to `i_min` on any inconsistency (new originator, changed next hop, lost route, membership change) — near-silence in steady state, fast reconvergence on change.
 - `set_local_mcast_groups` / `mcast_listeners`: manage local memberships (announced in OGMs) and query learned `(group → originators)` memberships
-- Implements `MeshRoutingEngine` trait
-- Uses heapless data structures for embedded compatibility
+- Implements `MeshRoutingEngine`; uses heapless data structures for embedded compatibility
 - Protocol constants: `ETH_P_BATMAN` (0x4305), `BATADV_IV_OGM` (0x01), `BATADV_BCAST` (0x02), `BATADV_UNICAST` (0x03), `BATADV_MCAST` (0x04), `BATADV_TVLV_MCAST` (0x06)
 
-**libs/wayfinder** - Central router orchestration (`no_std`):
-- `CentralRouter`: Wraps the BATMAN engine plus an ident table and a per-(neighbor, interface) link-quality table
-- `DEFAULT_BATMAN_ETHER_TYPE`: 0x4305
-- `handle_frame` / `handle_frame_with_metrics`: Process a received `LinkFrame`, fold in metrics, return any outgoing frame
-- `poll`: Drive periodic OGM broadcasts
-- `handle_local`: Wrap application/host data destined for a mesh node in a BATMAN unicast
+**libs/wayfinder** — Central router orchestration (`no_std`; `std` feature enables `DynLinkT`):
+- `CentralRouter`: wraps the BATMAN engine plus an ident table and a per-(neighbor, interface) link-quality table, and owns the observability counters/estimators
+- `LinkT` (`link.rs`): the single mesh-interface trait the router/driver speaks to — a native `async fn` trait usable in a `no_std` executor by static dispatch. The `std` driver dynamic-dispatches over `DynLinkT` (a `dynosaur`-generated `dyn`-compatible wrapper, gated behind `std`). Yields a `Received` frame-with-metrics.
+- `DEFAULT_BATMAN_ETHER_TYPE`: 0x4305; `MCAST_FANOUT`: 16
+- `handle_frame` / `handle_frame_with_metrics`: process a received `LinkFrame`, fold in metrics, return any outgoing frame
+- `poll`: drive periodic (Trickle-paced) OGM broadcasts
+- `handle_local`: wrap application/host data destined for a mesh node in a BATMAN unicast
 - `mcast_plan` / `mcast_targets` / `handle_local_mcast`: multicast egress. `mcast_plan` returns `McastPlan::Unicast` when 1..=`MCAST_FANOUT` listeners are known (else `Flood`); `mcast_targets` is a no-alloc borrowing iterator of those listeners; `handle_local_mcast` wraps a frame as a `BATADV_MCAST` packet to one listener. `set_local_mcast_groups` feeds locally-snooped memberships to the engine.
-- `get_egress_interface` / `resolve_route`: Choose the egress interface for a destination (metric-driven), the latter without mutating state
-- Protocol demultiplexing based on `LinkFrame` protocol field
+- `get_egress_interface` / `resolve_route`: choose the egress interface for a destination (metric-driven), the latter without mutating state
+- `auth.rs` (`OgmAuth`): opt-in OGM authentication, kept in the router (not the engine) so the engine stays crypto-free. `augment_ogm` appends the originator's membership cert + Ed25519 signature TVLVs; `verify_ogm` gates an incoming OGM against the mesh trust anchor *before* it reaches the engine. Also caches neighbor keys for pairwise data-plane tags.
+- `config.rs`: per-link Trickle bounds (`i_min_ms`/`i_max_ms`) so a fast LAN link and a slow LoRa link back off on different schedules
+- Observability lives here (see Metrics section): `RateEstimator` throughput EWMAs, `TableOccupancy` gauges — served identically on embedded and host deployments
 
-**libs/wayfinder-protos** - Management API (`prost`/protobuf, package `wayfinder.v1alpha`): request/response envelopes for querying node info, the routing table, the link-quality table, and route resolution. `buf lint` runs from this crate.
+#### Radio drivers (`no_std`)
 
-**libs/wayfinder-server** - The management-API server. Two layers: `RouterAdapter` (`no_std` + `alloc`) projects a borrowed `CentralRouter` through the `WayfinderDataProvider` trait; the transport layer (gated behind the `std` feature) provides the per-transport listener loops (`run_tcp_server`/`run_unix_server`/`run_udp_server` over tokio net) and the `QueryTx`/`QueryRx` channel that forwards queries to the single-threaded router loop. The `std` feature pulls in tokio, tokio-util, futures, bytes, anyhow, and `prost/std`.
+**libs/rylr998** — REYAX RYLR998/RYLR498 LoRa module driver: `RylrClient<S>` async AT-command interface (`set_mode`, `set_rf_frequency`, `set_parameters`, `send_data`, `listen_for_packet` with RSSI/SNR), plus a `LinkT` mesh-interface adapter. Treats LoRa as a shared broadcast medium (mesh filters on the embedded `Mac`).
 
-**libs/wayfinder-test** - Test-only harness: a `Switch` simulator and `TestRouter` wrapper for multi-node integration tests over `tokio` mpsc channels (no hardware).
+**libs/ieee802154** — Hardware-agnostic IEEE 802.15.4 framing: `encode`/`decode` wrap/unwrap a `LinkFrame` in a minimal 802.15.4 MAC header (broadcast PAN/address, no security/ack). No opinion about the radio chip; the mesh filters on the embedded `Mac`. `MAX_FRAME_LEN` = 125.
 
-**bins/wayfinder-tap** - The runnable node: bridges a TAP device (`Layer::L2`) onto the mesh, carries links over UDP/Unix sockets, and exposes the management API (via `wayfinder-server`) over TCP/Unix/UDP. The event loop snoops IGMP off the TAP (`McastSnooper` in `snoop.rs`, IPv4 IGMP v1/v2/v3; MLD not yet) to learn the host's joined multicast groups and announce them via `set_local_mcast_groups`; a host multicast frame is then sent as per-listener `BATADV_MCAST` copies (or flooded as fallback).
+**libs/at86rf233** — SPI driver for the Atmel/Microchip AT86RF233 802.15.4 transceiver, exposed as a `LinkT`. Generic over `embedded-hal-async` `SpiDevice`/`Wait` + `embedded-hal` `OutputPin` (interrupt + reset GPIOs). Runs the chip in basic mode (no hardware auto-ACK/CSMA-CA); on-air framing delegated to `ieee802154`.
 
-**libs/rylr998** - REYAX RYLR998/RYLR498 LoRa module driver:
-- `RylrClient<S>`: Async AT command interface for LoRa modules
-- Configuration methods: set_mode, set_rf_frequency, set_parameters (spreading factor, bandwidth, coding rate)
-- `send_data()`: Transmit up to 240 bytes to target address
-- `listen_for_packet()`: Async receive with RSSI/SNR metrics
-- Supports network IDs, encryption passwords, RF output power configuration
+**libs/nrf-ieee802154** — `LinkT` adapter for the nRF52840's built-in 802.15.4 radio (`embassy-nrf`). Adapts `ieee802154::encode`/`decode` to the radio's `Packet` buffer; the caller constructs the `Radio` from the real peripheral.
+
+#### Identity & management API
+
+**libs/wayfinder-auth** — Cryptographic identity and mesh membership. A mesh is optionally segregated by a per-mesh trust anchor (root key); a node belongs only if it holds a `MembershipCert` signed by that root, binding `Ed25519 pubkey ↔ node MAC ↔ mesh`. `no_std` core does verification + X25519 key agreement (`pairwise_tag`/`pairwise_key`, used by the router on embedded nodes); the `std`-gated `Authority` is the CA (root-key custody, issuing, revocation) run by an enrollment portal. Payloads are never encrypted — wayfinder provides authenticity and segregation only; confidentiality is left to L3.
+
+**libs/wayfinder-protos** — Management API (`prost`/protobuf, package `wayfinder.v1alpha`): request/response envelopes (`WayfinderRequest`/`WayfinderResponse`) for node info, routing table, link-quality table, OGM schedule, throughput, aggregate node metrics, security status, route resolution, and the certificate-authority flow (trust anchor, submit CSR, revoke, list certs). `service.rs` defines the `WayfinderDataProvider` trait and dispatch. `buf lint` runs from this crate; the `serde` feature is used by the CLI.
+
+**libs/wayfinder-server** — The management-API server. Two layers:
+- `RouterAdapter` (`no_std` + `alloc`): projects a borrowed `CentralRouter` through the `WayfinderDataProvider` trait; takes the router's monotonic `now` so time-varying metrics are evaluated at request time.
+- transport layer (`std` feature): per-transport listener loops (`run_tcp_server`/`run_unix_server`/`run_udp_server` over tokio net) and the `QueryTx`/`QueryRx` channel that forwards queries to the single-threaded router loop so the router is never shared across tasks.
+- `authority.rs` (`std`): the concrete CA in provider mode — holds the mesh root key and issues/revokes member certs in response to enrollment requests. Embedded nodes never link this.
+
+**libs/wayfinder-client** — Reusable client for the management API, speaking the prost envelope over TCP (4-byte big-endian length-delimited framing, matching `run_tcp_server`) or Unix datagram (one prost message per datagram). Shared by the TUI and CLI so wire framing lives in one place.
+
+#### Host driver & node
+
+**libs/wayfinder-driver** — The `std`/`tokio` driver that owns the router event loop, deliberately transport-agnostic: the host device and every mesh interface are `FrameIo` carriers (`transport.rs`), so the *same* loop runs against real sockets in production and in-process channels in tests. `Driver::run`/`run_once` is the free-running `select!` loop; `Driver::poll` + `process_pending` is deterministic stepping for tests. `snoop.rs` (`McastSnooper`) snoops IPv4 IGMP (v1/v2/v3; MLD not yet) off the host link to learn joined multicast groups. The transport-agnostic surface (`FrameIo`, `McastSnooper`) is always available; the tokio loop, `tokio::net` transports, and link builders are gated behind the default `tokio` feature.
+
+**libs/wayfinder-test** — Test-only harness: a `Switch` simulator and `TestRouter` wrapper for multi-node integration tests over `tokio` mpsc channels (no hardware).
+
+**libs/wayfinder-shark** — A Wireshark/`tshark` Lua dissector (`wayfinder.lua`) for the on-air BATMAN frames, with pytest tests (`tests/`) that drive `tshark` against it.
+
+**bins/wayfinder-tap** — The runnable node. Bridges a host TAP device onto the mesh, carries mesh links over UDP, and exposes the management API. All the routing event loop lives in `wayfinder-driver`; this binary only assembles the concrete transports (a kernel TAP via `tun-rs`, UDP links) and the management-API listeners from the YAML config, then hands them to a `Driver` and runs it.
+
+**bins/wayfinder-tui** — A `ratatui` terminal dashboard against a running node's management API (via `wayfinder-client`): tabs for routing, link quality, OGM schedule, throughput/metrics, and mesh security. `lib.rs`/`ui.rs` split out so rendering + snapshot logic is integration-tested.
+
+**bins/wayfinder-ctl** (`wayfinderctl`) — A command-line management client. Two families: **query** commands (`node-info`, `routes`, `link-quality`, `metrics`, `security`, `resolve`) open a `wayfinder-client::Client` to a node; **`cert`** commands run offline, minting the seed/certificate/trust-anchor files a node loads to join an authenticated mesh, plus an online `enroll` (generate keypair → submit CSR → write returned cert + trust anchor).
 
 ### Key Design Patterns
 
-**Zero-copy parsing**: Uses `zerocopy` crate for efficient packet handling without allocations. All wire format structs derive `FromBytes`, `IntoBytes`, `Immutable`, `KnownLayout`.
+**Zero-copy parsing**: uses `zerocopy` for packet handling without allocations. Wire-format structs derive `FromBytes`, `IntoBytes`, `Immutable`, `KnownLayout`.
 
-**Async I/O**: Built on `embedded-io-async` for async operations. Physical links implement `AsyncRead + AsyncWrite`.
+**Async I/O**: built on `embedded-io-async`. `LinkT` is a native `async fn` trait so embedded links are driven by static dispatch; the host driver dynamic-dispatches over the `dynosaur`-generated `DynLinkT`.
 
-**Trait-based abstraction**: Routing engines and physical links are abstracted via traits, enabling protocol/hardware flexibility.
+**Trait-based abstraction**: routing engines (`MeshRoutingEngine`), mesh links (`LinkT`), and driver transports (`FrameIo`) are all traits, enabling protocol/hardware/transport flexibility.
 
-**No-std compatibility**: BATMAN engine uses `heapless::Vec` for fixed-capacity collections suitable for embedded systems.
-
-**Test infrastructure**: `libs/wayfinder-test` provides a `Switch` simulator and `TestRouter` wrapper (over `tokio` mpsc channels) for testing multi-node scenarios without hardware.
+**No-std compatibility**: the routing core uses `heapless` fixed-capacity collections; host concerns live in `std`-gated crates or features.
 
 ## Important Implementation Details
 
 ### BATMAN Routing Logic
 
 The BATMAN engine maintains an originator table tracking:
-- `neighbor_ident`: The destination node
-- `best_next_hop`: Immediate neighbor to forward packets to
+- `neighbor_ident`: the destination node
+- `best_next_hop`: immediate neighbor to forward packets to
 - `max_tq`: Transmission Quality metric (0-255)
-- `paths`: Up to 4 alternate paths via different neighbors
+- `paths`: up to 4 alternate paths via different neighbors
 
 OGM processing (`handle_rx`, `BATADV_IV_OGM` arm in libs/batman/src/engine.rs):
 1. Drops own OGMs (loop prevention)
@@ -161,6 +201,8 @@ OGM processing (`handle_rx`, `BATADV_IV_OGM` arm in libs/batman/src/engine.rs):
 4. Selects best path based on highest TQ
 5. Folds the OGM's multicast TVLV into `mcast_members` (authoritative per originator, so dropped groups are pruned)
 6. Forwards OGM with decremented TTL and updated prev_sender, preserving the TVLV tail verbatim
+
+When authentication is enabled, the router's `OgmAuth::verify_ogm` runs *before* the engine sees an incoming OGM (rejecting unsigned/forged/foreign OGMs) and `augment_ogm` appends the cert + signature TVLVs *after* the engine builds one; the engine itself is unchanged.
 
 Multicast forwarding (`handle_rx`, `BATADV_MCAST` arm + `CentralRouter`):
 1. Each node announces its locally-joined groups in its OGM's `BATADV_TVLV_MCAST` tail; receivers record `(group → originator)` in `mcast_members`.
@@ -182,16 +224,16 @@ Unicast forwarding (`handle_rx`, `BATADV_UNICAST` arm):
 ### Link Layer Frame Format
 
 All frames use the `LinkFrame` structure (libs/interfaces/src/frame.rs):
-- `src: Mac` - Source identifier (added by link layer)
-- `dst: Mac` - Destination identifier (or `Mac::BROADCAST`)
-- `protocol: u16` - EtherType-style protocol identifier
-- `payload: [u8]` - Variable-length payload
+- `src: Mac` — source identifier (added by link layer)
+- `dst: Mac` — destination identifier (or `Mac::BROADCAST`)
+- `protocol: u16` — EtherType-style protocol identifier
+- `payload: [u8]` — variable-length payload
 
 ### Protocol Multiplexing
 
 The CentralRouter demuxes by protocol field (`handle_frame_with_metrics` in libs/wayfinder/src/lib.rs):
-- `0x4305` (DEFAULT_BATMAN_ETHER_TYPE): Routes to BATMAN engine
-- `0x88B5`: Reserved for experimental protocols
+- `0x4305` (DEFAULT_BATMAN_ETHER_TYPE): routes to BATMAN engine
+- `0x88B5`: reserved for experimental protocols
 - Other values are dropped
 
 ## Metrics and Observability
@@ -228,9 +270,9 @@ Principles for adding a metric:
   `protos/wayfinder/v1alpha/wayfinder.proto` (every message/field documented —
   `buf lint` enforces it), an intermediate `*Data` type plus
   `WayfinderDataProvider` method and handler arm in `wayfinder-protos::service`,
-  the projection in `RouterAdapter`, a client method, and a row/panel on the TUI
-  Metrics tab. The `wayfinder-tui` smoke test exercises the whole path over a
-  real TCP server — extend it.
+  the projection in `RouterAdapter`, a client method in `wayfinder-client`, and a
+  row/panel on the TUI Metrics tab. The `wayfinder-tui` smoke test exercises the
+  whole path over a real TCP server — extend it.
 
 ## Logging
 
@@ -283,7 +325,7 @@ pushes to `main`.
 - **Types**: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`,
   `build`, `ci`, `chore`, `revert`.
 - **Scope** (optional but encouraged): the crate or area, e.g. `metrics`,
-  `batman`, `tui`, `driver`.
+  `batman`, `tui`, `driver`, `auth`.
 - **Summary**: lowercase, imperative, no trailing period, ≤100 chars.
 - Example: `feat(metrics): add throughput and node metrics to the management API`
 - A non-compliant title like `Add throughput metrics` (no type, sentence-case)
@@ -332,18 +374,17 @@ authenticates `git push`/`pull`, not the MR-creation API.
 ### Adding a new routing protocol
 
 1. Implement the `MeshRoutingEngine` trait in a new library
-2. Add protocol constant (EtherType) to identify your protocol
+2. Add a protocol constant (EtherType) to identify your protocol
 3. Update the `CentralRouter::handle_frame_with_metrics` match statement to handle your protocol
-4. Create wire format packet structs with zerocopy derives
+4. Create wire-format packet structs with zerocopy derives
 
 ### Implementing a physical radio driver
 
-1. Implement the `EmbeddedMeshLink` trait
-2. `transmit()`: Serialize LinkFrameData and send via hardware
-3. `receive()`: Read from hardware, parse into LinkFrame
-4. Handle broadcast addresses appropriately for your medium
+1. Implement the `LinkT` trait (in `libs/wayfinder/src/link.rs`) for your device
+2. Serialize the `LinkFrame` and send via hardware; parse received bytes back into a `LinkFrame` plus `LinkMetrics`
+3. Reuse `ieee802154::encode`/`decode` for 802.15.4 radios (see `at86rf233` / `nrf-ieee802154`); handle broadcast addressing appropriately for your medium
 
-### Testing with simulated mesh
+### Testing with a simulated mesh
 
 Use the `TestRouter` wrapper from `libs/wayfinder-test`, which pairs a
 `CentralRouter` with one mpsc egress channel per interface and serialises
@@ -359,4 +400,4 @@ For multi-node scenarios, connect several `TestRouter`s through a `Switch`.
 
 ## Edition Note
 
-Some packages use `edition = "2024"` which is not yet stable as of the knowledge cutoff. When modifying Cargo.toml files, be aware of edition compatibility.
+Many crates use `edition = "2024"`, which is not yet stable as of the knowledge cutoff. When modifying Cargo.toml files, be aware of edition compatibility.
