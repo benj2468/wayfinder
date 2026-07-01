@@ -58,7 +58,7 @@ PROJECT = "wayfinder-sim"
 
 # Default verbosity for every node's RUST_LOG. "trace" is very chatty across a
 # 9-node mesh; "info" is a sane default — bump a specific node in build_nodes().
-DEFAULT_RUST_LOG = "debug"
+DEFAULT_RUST_LOG = "trace"
 
 
 # ── topology helpers ──────────────────────────────────────────────────────────

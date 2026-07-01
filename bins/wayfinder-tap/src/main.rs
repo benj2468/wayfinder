@@ -45,7 +45,9 @@ async fn main() -> anyhow::Result<()> {
     let config: Config = serde_yaml::from_slice(std::fs::read_to_string(args.config)?.as_bytes())?;
 
     tracing::info!("Welcome to Wayfinder");
-    tracing::info!("{:#?}", config);
+    // The config can carry sensitive material (enrollment tokens, seed paths),
+    // so keep the full dump at DEBUG rather than INFO.
+    tracing::debug!(?config, "loaded configuration");
 
     let mut join_set: JoinSet<anyhow::Result<()>> = JoinSet::new();
 

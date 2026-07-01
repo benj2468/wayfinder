@@ -17,9 +17,8 @@ use std::time::{Duration, Instant};
 use anyhow::bail;
 use futures::{FutureExt, future::select_all};
 use interfaces::link::LinkMetrics;
-use pretty_hex::pretty_hex;
 use tokio::time::sleep;
-use tracing::trace;
+use tracing::{trace, warn};
 use wayfinder::auth::DIRECTED_TRAILER_LEN;
 use wayfinder::config::TrickleConfig;
 use wayfinder::interfaces::frame::{LinkFrame, LinkFrameData, Mac};
@@ -260,13 +259,12 @@ impl<Local: FrameIo> Driver<Local> {
                         Box::pin(async move { iface.recv().await.map(|received| (i, received)).ok() })
                     })
                 ), if check_mesh && !interfaces.is_empty() => {
-                    tracing::trace!("received frame from interface {}", idx);
+                    trace!(iface = idx, "rx frame from interface");
                     handle_mesh_frame(now, router, idx, received.frame, received.metrics, tx_buffer)
                 },
                 Ok(len) = local.recv(rx_buffer), if check_local => {
-                    tracing::trace!("host device received frame of length {}", len);
+                    trace!(len, "host device rx frame");
                     let eth = &rx_buffer[..len];
-                    tracing::trace!("{}", pretty_hex(&eth));
                     LoopOutput {
                         mesh: plan_host_frame(router, snooper, eth, tx_buffer),
                         local: None,
@@ -279,7 +277,7 @@ impl<Local: FrameIo> Driver<Local> {
                     LoopOutput::none()
                 },
                 _ = sleep(next_due), if check_periodic => {
-                    trace!("polling OGM");
+                    trace!("polling OGMs");
                     LoopOutput {
                         mesh: poll_due_ogms(router, now, tx_buffer),
                         local: None,
@@ -487,7 +485,11 @@ fn handle_mesh_frame(
         return LoopOutput::none(); // directed frame failed authentication
     };
     let rx = router.handle_frame_with_metrics(now, idx, frame, metrics, tx_buffer);
-    tracing::trace!("decoded as {:?}", rx);
+    trace!(
+        forward = rx.forward.is_some(),
+        deliver_local = rx.deliver_local.is_some(),
+        "frame decoded"
+    );
     LoopOutput {
         mesh: rx
             .forward
@@ -586,7 +588,7 @@ async fn dispatch<Local: FrameIo>(
     output: LoopOutput,
 ) -> anyhow::Result<()> {
     if let Some(inner) = output.local {
-        tracing::trace!("local output: {}", pretty_hex(&inner));
+        trace!(len = inner.len(), "local output");
         local.send(&inner).await?;
     }
 
@@ -597,11 +599,11 @@ async fn dispatch<Local: FrameIo>(
         egress,
     } in output.mesh
     {
-        tracing::trace!(
-            "mesh output: dst={:?} protocol={:?} payload={:?}",
-            dst,
-            protocol,
-            payload
+        trace!(
+            dst = ?dst,
+            protocol = %format_args!("0x{protocol:04x}"),
+            payload_len = payload.len(),
+            "mesh output"
         );
 
         // Authenticate directed data-plane frames (unicast/mcast to a specific
@@ -620,7 +622,7 @@ async fn dispatch<Local: FrameIo>(
                 // Auth on but we can't tag this directed frame (no verified key
                 // for dst yet, or counter exhausted): drop it rather than emit it
                 // in the clear.
-                tracing::warn!("auth: dropping untaggable directed frame to {dst:?}");
+                warn!(?dst, "auth: dropping untaggable directed frame");
                 continue;
             }
         }

@@ -111,7 +111,7 @@ impl<Io: FrameIo> LinkT for Link<Io> {
     async fn send(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> Result<usize, LinkError> {
         let idx = self.frame_into_buffer(origin, data);
         self.socket.send(&self.buffer[..idx]).await.map_err(|e| {
-            tracing::error!("Error sending to socket: {:?}", e);
+            tracing::warn!(error = ?e, "link send failed");
             LinkError::Io
         })?;
         Ok(idx)
@@ -121,7 +121,7 @@ impl<Io: FrameIo> LinkT for Link<Io> {
         // The socket is message-oriented (a datagram per frame), so a single
         // recv yields exactly one whole frame — no buffering or reassembly.
         let n = self.socket.recv(&mut self.buffer).await.map_err(|e| {
-            tracing::error!("Error reading from socket: {:?}", e);
+            tracing::warn!(error = ?e, "link recv failed");
             LinkError::Io
         })?;
         let frame = LinkFrame::ref_from_bytes(&self.buffer[..n]).map_err(|_| LinkError::Io)?;

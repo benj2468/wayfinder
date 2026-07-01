@@ -232,6 +232,44 @@ Principles for adding a metric:
   Metrics tab. The `wayfinder-tui` smoke test exercises the whole path over a
   real TCP server — extend it.
 
+## Logging
+
+Logging is via [`tracing`].  Every crate uses the `tracing` facade — never
+`log`, `println!`, or `eprintln!` for diagnostics.  Pick the level by **who the
+record is for**, not by how interesting the event felt while writing it:
+
+- **`error!`** — a failure an operator must act on, originating in *this* node
+  (config invalid, an invariant violated, a resource permanently lost).  Must
+  not be reachable by arbitrary peer input and must not fire once per iteration
+  of a hot loop.  A handled-and-retried I/O error is a `warn!`, not an `error!`.
+- **`warn!`** — something unexpected but handled, worth an operator's attention
+  (capacity eviction, a security-relevant drop, a stream that errored and was
+  torn down).  Never reachable by arbitrary remote input on a hot path — a peer
+  must not be able to drive `warn!` volume.
+- **`info!`** — lifecycle and topology events an observer *wants*: startup,
+  listeners bound, auth enabled, a node discovered or revoked.  Not per-frame,
+  never a payload, never a secret (no full config/key/token dumps — those go to
+  `debug!`).  If it can repeat per packet, it is not `info!`.
+- **`debug!`** — developer-facing state transitions: config dump, connection
+  open/close, route-table or auth-state changes, capacity evictions.  Strictly
+  for debugging; off in normal operation.
+- **`trace!`** — per-frame / per-packet flow; expected to be the bulk of the
+  logs.  Two hard rules: (1) **never log payload bytes** — no `pretty_hex` of a
+  frame, no `{:?}` of a struct that embeds a payload slice (e.g. `RxOutcome`).
+  Log metadata only: src, dst, protocol, lengths, seqno, TTL.  (2) **Always use
+  structured fields** with a short, static message — `trace!(?src, ?dst,
+  payload_len = n, "rx frame")`, not `trace!("rx src={:?} ...", src)`.  Drops use
+  a `"drop: <reason>"` message.
+
+Carry shared per-frame context in a span (`trace_span!("handle_frame", ?src,
+…)`) rather than repeating it in every event.  Import the macros a module uses
+(`use tracing::{debug, info, trace};`) and call them bare; don't mix bare and
+fully-qualified `tracing::` calls within one file.  Parse failures of
+remotely-supplied frames are `trace!`, not `warn!` — a malformed packet from any
+peer must not be able to flood the logs.
+
+[`tracing`]: https://docs.rs/tracing
+
 ## Merge Requests
 
 This project ships through GitLab merge requests (`git.haganah.net`), not direct

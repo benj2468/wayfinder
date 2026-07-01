@@ -236,7 +236,7 @@ mod tokio_impl {
             async_send_to(&self.fd, &self.wire_buf[..n], &addr)
                 .await
                 .map_err(|e| {
-                    tracing::error!("raw-l2 send failed: {e:?}");
+                    tracing::warn!(error = ?e, "raw-l2 send failed");
                     LinkError::Io
                 })?;
             Ok(n)
@@ -246,7 +246,7 @@ mod tokio_impl {
             let n = async_recv(&self.fd, &mut self.wire_buf)
                 .await
                 .map_err(|e| {
-                    tracing::error!("raw-l2 recv failed: {e:?}");
+                    tracing::warn!(error = ?e, "raw-l2 recv failed");
                     LinkError::Io
                 })?;
             if n < ETH_HEADER_LEN {
@@ -358,22 +358,30 @@ mod tokio_impl {
                             if let Some(off) = ipv4_payload_offset(&rx_buf[..n])
                                 && let Err(e) = bridge.send(&rx_buf[off..n]).await
                             {
-                                tracing::error!("raw-ip bridge to in-process socket: {e:?}");
+                                tracing::warn!(error = ?e, "raw-ip bridge to in-process socket failed");
                             }
                         }
-                        Err(e) => tracing::error!("raw-ip recv: {e:?}"),
+                        // A recv error here is usually transient (e.g. an ICMP
+                        // error surfaced on a connected raw socket), so keep the
+                        // bridge up and retry rather than tearing the link down.
+                        Err(e) => tracing::warn!(error = ?e, "raw-ip recv failed"),
                     },
                     res = bridge.recv(&mut tx_buf) => match res {
                         // Send the framing verbatim; the kernel prepends the IP header.
                         Ok(n) => {
                             if let Err(e) = async_send(&raw_fd, &tx_buf[..n]).await {
-                                tracing::error!("raw-ip bridge to off-process socket: {e:?}");
+                                tracing::warn!(error = ?e, "raw-ip bridge to off-process socket failed");
                             }
                         }
-                        Err(e) => tracing::error!("raw-ip bridge recv: {e:?}"),
+                        // The router side of the bridge is gone; nothing left to do.
+                        Err(e) => {
+                            tracing::warn!(error = ?e, "raw-ip bridge recv failed; closing bridge");
+                            break;
+                        }
                     },
                 }
             }
+            Ok(())
         });
 
         Ok(DynLinkT::new_box(Link::new(router_side)))

@@ -2,7 +2,7 @@ use interfaces::{
     engine::{MeshRoutingEngine, RoutingAction},
     frame::{LinkFrame, LinkFrameDataMut, Mac},
 };
-use tracing::{trace, warn};
+use tracing::{debug, info, trace};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
@@ -357,7 +357,7 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
     /// Revoke all originators that have been marked as stale.
     pub fn revoke_originators(&mut self, revoked: impl Iterator<Item = Mac>) {
         for revoked_mac in revoked {
-            tracing::info!("revoking originator: {:?}", revoked_mac);
+            debug!(revoked = ?revoked_mac, "revoking originator");
             self.originator_table.retain(|mac, _| revoked_mac != *mac);
             for record in self.originator_table.values_mut() {
                 record
@@ -398,10 +398,10 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
         reply: &mut LinkFrameDataMut<'rx>,
     ) -> RoutingAction {
         let Ok((ogm, _)) = BatmanOgmPacket::read_from_prefix(&frame.payload) else {
-            warn!("Unable to parse OGM Packet");
+            trace!("drop: malformed OGM");
             return RoutingAction::Consumed;
         };
-        trace!("parsed OGM packet: {:?}", ogm);
+        trace!(?ogm, "rx OGM");
 
         let orig_ident = ogm.orig;
 
@@ -435,7 +435,7 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
                 last_seqno: 0,
                 paths: heapless::Vec::new(),
             };
-            tracing::info!("Discovered new originator: {:?}", orig_ident);
+            info!(orig = ?orig_ident, "discovered new originator");
             let _ = self.originator_table.insert(orig_ident, new_record);
         }
 
@@ -584,10 +584,10 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
         reply: &mut LinkFrameDataMut<'rx>,
     ) -> RoutingAction {
         let Ok((bcast, inner)) = BatmanBroadcastPacket::read_from_prefix(&frame.payload) else {
-            warn!("Unable to parse broadcast Packet");
+            trace!("drop: malformed broadcast");
             return RoutingAction::Consumed;
         };
-        trace!("parsed broadcast packet: {:?}", bcast);
+        trace!(?bcast, "rx broadcast");
 
         let orig_ident = bcast.orig;
 
@@ -657,10 +657,10 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
         reply: &mut LinkFrameDataMut<'rx>,
     ) -> RoutingAction {
         let Ok((unicast_hdr, _)) = BatmanUnicastPacket::read_from_prefix(&frame.payload) else {
-            warn!("Unable to parse unicast Packet");
+            trace!("drop: malformed unicast");
             return RoutingAction::Consumed;
         };
-        trace!("parsed unicast packet: {:?}", unicast_hdr);
+        trace!(unicast = ?unicast_hdr, "rx unicast");
         let dst = unicast_hdr.dest;
 
         // Rule 1: Is this packet meant for US?
@@ -715,10 +715,10 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
         reply: &mut LinkFrameDataMut<'rx>,
     ) -> RoutingAction {
         let Ok((mcast_hdr, _)) = BatmanMcastPacket::read_from_prefix(&frame.payload) else {
-            warn!("Unable to parse multicast Packet");
+            trace!("drop: malformed multicast");
             return RoutingAction::Consumed;
         };
-        trace!("parsed multicast packet: {:?}", mcast_hdr);
+        trace!(mcast = ?mcast_hdr, "rx multicast");
         let dst = mcast_hdr.dest;
 
         // Rule 1: this copy reached its target listener — deliver up.
@@ -783,12 +783,12 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
         local_quality: Option<u8>,
         reply: &mut LinkFrameDataMut<'rx>,
     ) -> RoutingAction {
-        tracing::trace!(
-            "handling src = {:?}, dest = {:?}, proto = {:?}, payload_len = {:?}",
-            frame.src,
-            frame.dst,
-            frame.protocol.get(),
-            frame.payload.len()
+        trace!(
+            src = ?frame.src,
+            dst = ?frame.dst,
+            protocol = %format_args!("0x{:04x}", frame.protocol.get()),
+            payload_len = frame.payload.len(),
+            "rx frame"
         );
 
         // Core protocol routing filter: only BATMAN frames with a sub-type byte.

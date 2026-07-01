@@ -23,7 +23,6 @@ use interfaces::{
     frame::{LinkFrame, Mac},
     link::LinkMetrics,
 };
-use pretty_hex::pretty_hex;
 use tokio::sync::mpsc;
 use wayfinder::CentralRouter;
 use wayfinder::config::TrickleConfig;
@@ -106,7 +105,7 @@ impl FrameIo for ChannelTransport {
     }
 
     async fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        tracing::trace!("Sending on the channel transport: {:?}", buf);
+        tracing::trace!(len = buf.len(), "channel transport tx");
         self.egress
             .send(buf.to_vec())
             .await
@@ -131,7 +130,7 @@ impl FrameIo for ObservableEgress {
         let mut inbound = self.inbound.lock().await;
         match inbound.recv().await {
             Some(frame) => {
-                tracing::trace!("recv: frame received: {}", pretty_hex(&frame));
+                tracing::trace!(len = frame.len(), "recv: frame received");
                 Ok(copy_into(&frame, buf))
             }
             None => {
@@ -261,7 +260,7 @@ impl TestRouter {
     pub async fn send_local(&mut self, dest: Mac, payload: &[u8]) -> anyhow::Result<()> {
         let eth = host_frame(dest, self.ident, payload);
         self.host_in.send(eth.clone()).await?;
-        tracing::trace!("send_local: frame sent: {}", pretty_hex(&eth));
+        tracing::trace!(len = eth.len(), "send_local: frame sent");
         Ok(())
     }
 

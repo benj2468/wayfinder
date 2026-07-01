@@ -231,7 +231,7 @@ impl OgmAuth {
         // Ignore a revocation that has already expired on our clock — the
         // cancelled cert is gone too, so there is nothing left to enforce.
         if self.now_unix != 0 && record.not_after.get() <= self.now_unix {
-            tracing::warn!("auth: received a revocation that has already expired");
+            tracing::trace!("auth: dropping a revocation that has already expired");
             return false;
         }
         if self.revocations.iter().any(|r| r.record.node_mac == mac.0) {
@@ -239,14 +239,14 @@ impl OgmAuth {
             // two nodes could keep re-flooding each other's records forever.  A
             // re-issued revocation for an already-revoked MAC therefore does not
             // re-propagate — acceptable, since the node is already being dropped.
-            tracing::warn!("auth: received a revocation that is already known");
+            tracing::trace!("auth: dropping a revocation that is already known");
             return false;
         }
         let known = KnownRevocation {
             record: *record,
             floods_left: REVOKE_FLOOD_BUDGET,
         };
-        tracing::info!("auth: received a new recovation: {:?}", known);
+        tracing::info!(?record, "auth: ingested new revocation");
         if self.revocations.push(known).is_err() {
             // Set full.  Prefer evicting an already-expired entry (passive expiry
             // covers it); otherwise overwrite the most-quiescent live entry
@@ -255,7 +255,7 @@ impl OgmAuth {
             // `MAX_REVOKED` *simultaneously live* revocations this still drops a
             // live one — a hard bound worth surfacing rather than hiding.
             let now = self.now_unix;
-            tracing::warn!("auth: revocation set full; evicting an entry to admit a new purge");
+            tracing::debug!("auth: revocation set full; evicting an entry to admit a new purge");
             if let Some(slot) = self
                 .revocations
                 .iter_mut()
