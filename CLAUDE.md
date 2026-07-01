@@ -271,8 +271,9 @@ Principles for adding a metric:
   `buf lint` enforces it), an intermediate `*Data` type plus
   `WayfinderDataProvider` method and handler arm in `wayfinder-protos::service`,
   the projection in `RouterAdapter`, a client method in `wayfinder-client`, and a
-  row/panel on the TUI Metrics tab. The `wayfinder-tui` smoke test exercises the
-  whole path over a real TCP server — extend it.
+  row/panel on the TUI Metrics tab. The end-to-end smoke test in
+  `bins/wayfinder-ctl/tests/query.rs` (`spawn_server` against a real
+  `run_tcp_server`) exercises the whole query path — extend it.
 
 ## Logging
 
