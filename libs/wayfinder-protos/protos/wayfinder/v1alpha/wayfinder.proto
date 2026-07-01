@@ -455,6 +455,12 @@ message NodeMetrics {
   // Mean number of alternate paths per originator, a path-diversity / route-
   // resilience gauge; 0 when no originators are known.
   double paths_mean = 11;
+
+  // Count of locally originated host frames dropped because they did not fit the
+  // transmit buffer once wrapped in mesh encapsulation — i.e. the host offered a
+  // frame larger than the mesh can carry (a TAP MTU set too high for the links).
+  // A non-zero, growing value signals a misconfigured MTU.
+  uint32 oversize_drops = 12;
 }
 
 // Marker payload indicating the router would flood a packet out of every

@@ -25,7 +25,7 @@
 //! [`Link`]: crate::transport::Link
 
 use interfaces::{
-    frame::{LinkFrame, LinkFrameData, Mac},
+    frame::{LinkFrame, LinkFrameData, MAX_LINK_FRAME_LEN, Mac},
     link::{LinkError, LinkMetrics},
 };
 use zerocopy::FromBytes;
@@ -40,7 +40,7 @@ const ETH_HEADER_LEN: usize = 14;
 const ETHERTYPE_OFFSET: usize = 12;
 
 /// Serialize `origin` + `data` as an Ethernet frame into `buf`, returning its
-/// length.
+/// length, or `None` when the framed frame would not fit `buf`.
 ///
 /// Wire layout `[dst: Mac][src: Mac][ethertype: u16 BE][payload]` — identical to
 /// the [`LinkFrame`] layout, but the EtherType stamped is the link's configured
@@ -48,13 +48,25 @@ const ETHERTYPE_OFFSET: usize = 12;
 /// e.g. `0xfafa`), *not* `data.protocol`.  The mesh protocol the router demuxes
 /// on (e.g. BATMAN `0x4305`) is restored on the receive side by [`retag_ethertype`],
 /// so a deployment can pick any wire EtherType with no per-frame overhead.
-fn frame_into_buf(origin: Mac, ethertype: u16, data: &LinkFrameData<'_>, buf: &mut [u8]) -> usize {
+///
+/// The length check returns `None` rather than panicking on an out-of-bounds
+/// copy: a frame larger than `buf` (only reachable with an over-large host MTU
+/// plus the auth trailer) is dropped by the caller, never crashing the link task.
+fn frame_into_buf(
+    origin: Mac,
+    ethertype: u16,
+    data: &LinkFrameData<'_>,
+    buf: &mut [u8],
+) -> Option<usize> {
+    let end = ETH_HEADER_LEN + data.payload.len();
+    if end > buf.len() {
+        return None;
+    }
     buf[0..6].copy_from_slice(&data.dst.0);
     buf[6..12].copy_from_slice(&origin.0);
     buf[ETHERTYPE_OFFSET..ETH_HEADER_LEN].copy_from_slice(&ethertype.to_be_bytes());
-    let end = ETH_HEADER_LEN + data.payload.len();
     buf[ETH_HEADER_LEN..end].copy_from_slice(data.payload);
-    end
+    Some(end)
 }
 
 /// Rewrite a received frame's EtherType field to `protocol`, in place.
@@ -221,8 +233,11 @@ mod tokio_impl {
         /// Scratch buffer holding the Ethernet bytes most recently sent or
         /// received off the wire.  On receive the EtherType is retagged in place
         /// to `mesh_protocol` (see [`retag_ethertype`]), yielding a [`LinkFrame`]
-        /// with no copy, so no second buffer is needed.
-        wire_buf: [u8; 1514],
+        /// with no copy, so no second buffer is needed.  Sized to
+        /// [`MAX_LINK_FRAME_LEN`] like every other data-path buffer so a fully
+        /// wrapped host frame is neither truncated on receive nor overruns
+        /// [`frame_into_buf`] (a panic) on send.
+        wire_buf: [u8; MAX_LINK_FRAME_LEN],
     }
 
     impl LinkT for RawL2Link {
@@ -231,7 +246,16 @@ mod tokio_impl {
             origin: Mac,
             data: &LinkFrameData<'_>,
         ) -> Result<usize, LinkError> {
-            let n = frame_into_buf(origin, self.ethertype, data, &mut self.wire_buf);
+            let Some(n) = frame_into_buf(origin, self.ethertype, data, &mut self.wire_buf) else {
+                // The wrapped frame exceeds the wire buffer — only possible with a
+                // host MTU set far above the recommended default. Drop it rather
+                // than panic; the router already counts the common oversize case.
+                tracing::trace!(
+                    payload_len = data.payload.len(),
+                    "drop: raw-l2 frame exceeds wire buffer"
+                );
+                return Ok(0);
+            };
             let addr = link_sockaddr(self.ifindex, self.ethertype, Some(data.dst));
             async_send_to(&self.fd, &self.wire_buf[..n], &addr)
                 .await
@@ -308,7 +332,7 @@ mod tokio_impl {
             ifindex,
             ethertype,
             mesh_protocol: DEFAULT_BATMAN_ETHER_TYPE,
-            wire_buf: [0u8; 1514],
+            wire_buf: [0u8; MAX_LINK_FRAME_LEN],
         };
         Ok(DynLinkT::new_box(link))
     }
@@ -347,8 +371,8 @@ mod tokio_impl {
         let (bridge, router_side) = UnixDatagram::pair()?;
 
         join_set.spawn(async move {
-            let mut rx_buf = [0u8; 1500];
-            let mut tx_buf = [0u8; 1500];
+            let mut rx_buf = [0u8; MAX_LINK_FRAME_LEN];
+            let mut tx_buf = [0u8; MAX_LINK_FRAME_LEN];
             loop {
                 tokio::select! {
                     res = async_recv(&raw_fd, &mut rx_buf) => match res {
@@ -413,7 +437,8 @@ mod tests {
                 payload: &payload,
             },
             &mut buf,
-        );
+        )
+        .expect("frame fits buffer");
         assert_eq!(n, ETH_HEADER_LEN + payload.len());
         assert_eq!(&buf[0..6], &mac(2).0); // Ethernet destination
         assert_eq!(&buf[6..12], &mac(1).0); // Ethernet source
@@ -438,7 +463,8 @@ mod tests {
                 payload: &payload,
             },
             &mut wire,
-        );
+        )
+        .expect("frame fits buffer");
         // On the wire the EtherType is the configured carrier, not 0x4305.
         assert_eq!(&wire[12..14], &[0xfa, 0xfa]);
 
@@ -465,7 +491,8 @@ mod tests {
                 payload: &[],
             },
             &mut wire,
-        );
+        )
+        .expect("frame fits buffer");
         assert_eq!(n, ETH_HEADER_LEN);
         retag_ethertype(&mut wire, 0x4305);
         let frame = LinkFrame::ref_from_bytes(&wire[..n]).unwrap();
@@ -473,6 +500,27 @@ mod tests {
         assert_eq!(frame.src, mac(3));
         assert_eq!(frame.protocol.get(), 0x4305);
         assert!(frame.payload.is_empty());
+    }
+
+    /// A payload that would overrun the buffer yields `None` (a drop) instead of
+    /// panicking on the out-of-bounds copy — the link task must survive an
+    /// over-large frame rather than aborting.
+    #[test]
+    fn frame_into_buf_rejects_oversize_payload() {
+        let mut buf = [0u8; 32];
+        // 32 - 14 header = 18 bytes fit; 19 does not.
+        let payload = [0u8; 19];
+        let out = frame_into_buf(
+            mac(1),
+            0xfafa,
+            &LinkFrameData {
+                dst: mac(2),
+                protocol: 0x4305,
+                payload: &payload,
+            },
+            &mut buf,
+        );
+        assert_eq!(out, None);
     }
 
     /// A minimal (no-options) IPv4 header is 20 bytes, so the payload begins at

@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 
 use tokio::{net::UdpSocket, net::UnixDatagram, task::JoinSet};
 
+use wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN;
 use wayfinder::link::DynLinkT;
 
 use crate::transport::Link;
@@ -27,8 +28,8 @@ pub async fn build_udp_link(
     let (bridge, router_side) = UnixDatagram::pair()?;
 
     join_set.spawn(async move {
-        let mut rx_buf = [0u8; 1500];
-        let mut tx_buf = [0u8; 1500];
+        let mut rx_buf = [0u8; MAX_LINK_FRAME_LEN];
+        let mut tx_buf = [0u8; MAX_LINK_FRAME_LEN];
         loop {
             tokio::select! {
                 Ok(bytes) = udp_socket.recv(&mut rx_buf) => {

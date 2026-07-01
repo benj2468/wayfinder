@@ -357,7 +357,7 @@ fn render_metrics(frame: &mut Frame, app: &mut App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(9),            // node metrics summary
+            Constraint::Length(10),           // node metrics summary
             Constraint::Min(8),               // throughput history chart
             Constraint::Length(table_height), // per-interface throughput table
         ])
@@ -642,6 +642,7 @@ fn render_node_metrics(frame: &mut Frame, app: &App, area: Rect) {
                     "Paths mean/max",
                     &format!("{:.2} / {}", m.paths_mean, m.paths_max),
                 ),
+                field("Oversize drops", &m.oversize_drops.to_string()),
             ]
         }
     };
@@ -863,5 +864,27 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &mut app))
             .expect("draw with history");
+
+        // Populate node metrics so the node-metrics panel — including the new
+        // oversize-drops row — renders its values, not the "no data" placeholder.
+        app.snapshot.metrics = Some(wayfinder_protos::wayfinder_v1alpha::NodeMetrics {
+            oversize_drops: 42,
+            ..Default::default()
+        });
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw with metrics");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            text.contains("Oversize drops"),
+            "oversize-drops row missing"
+        );
+        assert!(text.contains("42"), "oversize-drops value missing");
     }
 }

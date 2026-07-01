@@ -114,6 +114,9 @@ pub struct NodeMetricsData {
     pub paths_max: u32,
     /// Mean alternate-path count per originator, 0.0 when none are known.
     pub paths_mean: f64,
+    /// Locally originated host frames dropped because they exceeded the mesh's
+    /// carrying capacity once encapsulated — non-zero signals a too-high MTU.
+    pub oversize_drops: u32,
 }
 
 /// Egress decision a router would make for a destination.  Mirrors
@@ -394,6 +397,7 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                     tq_mean: m.tq_mean,
                     paths_max: m.paths_max,
                     paths_mean: m.paths_mean,
+                    oversize_drops: m.oversize_drops,
                 })
             }
 
@@ -837,6 +841,7 @@ mod tests {
                 tq_mean: 220.5,
                 paths_max: 4,
                 paths_mean: 1.75,
+                oversize_drops: 9,
             },
             ..Default::default()
         };
@@ -853,6 +858,7 @@ mod tests {
                 assert_eq!(m.tq_mean, 220.5);
                 assert_eq!(m.paths_max, 4);
                 assert_eq!(m.paths_mean, 1.75);
+                assert_eq!(m.oversize_drops, 9);
             }
             other => panic!("expected Metrics, got {:?}", proto_kind_name(&other)),
         }
