@@ -14,6 +14,14 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 /// if a host is (mis)configured above the recommended TAP MTU.
 pub const MAX_LINK_FRAME_LEN: usize = 2048;
 
+/// The type constraint for a mesh node address.
+///
+/// Retained only as the bound on the still-generic *container* types
+/// (`IdentTable`, `LinkQualityTable`, `Switch`) — the protocol, engine, and
+/// router layers are concrete over [`Mac`]. It is implemented for [`Mac`] (the
+/// real address) and for `u8` (used by the container unit tests). The
+/// super-traits give containers zero-copy wire (de)serialization, map keying,
+/// and defaulting.
 pub trait MeshIdentifier:
     Copy
     + PartialEq
@@ -28,6 +36,8 @@ pub trait MeshIdentifier:
     + Send
     + Sync
 {
+    /// The reserved all-nodes address for this identifier space, used to
+    /// address flooded broadcasts (all-ones for [`Mac`], `0xff` for `u8`).
     const BROADCAST: Self;
 }
 
@@ -152,15 +162,26 @@ pub struct LinkFrame {
 /// doesn't include the src, because that is applied by the link layer.
 #[derive(Debug)]
 pub struct LinkFrameData<'a> {
+    /// Destination node MAC (or [`Mac::BROADCAST`]).
     pub dst: Mac,
+    /// EtherType-style protocol identifier for the payload.
     pub protocol: u16,
+    /// The frame payload to send.
     pub payload: &'a [u8],
 }
 
+/// A mutable form of [`LinkFrameData`], used as the `reply` scratch buffer the
+/// routing engine writes an outgoing frame into (see
+/// [`RoutingAction`](crate::engine::RoutingAction)).
 #[derive(Debug)]
 pub struct LinkFrameDataMut<'a> {
+    /// Destination node MAC (or [`Mac::BROADCAST`]) the engine addresses the
+    /// reply to.
     pub dst: Mac,
+    /// EtherType-style protocol identifier; left `0` when the engine has
+    /// nothing to send.
     pub protocol: u16,
+    /// Mutable payload buffer the engine writes the outgoing frame into.
     pub payload: &'a mut [u8],
 }
 

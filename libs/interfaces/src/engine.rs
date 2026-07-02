@@ -2,6 +2,9 @@ use core::time::Duration;
 
 use crate::frame::{LinkFrame, LinkFrameDataMut, Mac};
 
+/// The decision a [`MeshRoutingEngine`] returns after processing a received
+/// frame, telling the central router what to do with it: consume it, forward it,
+/// deliver it locally, or both deliver and re-flood.
 #[derive(Debug)]
 pub enum RoutingAction {
     /// The packet was a BATMAN control message (like an OGM), a re-flood, or
@@ -38,6 +41,12 @@ pub enum RoutingAction {
     DeliverLocalAndForward(Mac),
 }
 
+/// A mesh routing protocol's behaviour, independent of transport and identity
+/// crypto: it ingests received frames ([`handle_rx`](Self::handle_rx)) and
+/// emits periodic topology broadcasts
+/// ([`produce_periodic_broadcast`](Self::produce_periodic_broadcast)). The
+/// central router drives one implementation (e.g. the BATMAN engine) and demuxes
+/// frames to it by protocol.
 pub trait MeshRoutingEngine {
     /// Ingest an incoming frame from the central router.
     /// The engine processes it, updates metrics, and returns the next logical step.

@@ -1,8 +1,19 @@
+//! A `no_std`, heap-free implementation of the BATMAN-adv mesh routing
+//! protocol.
+//!
+//! [`BatmanEngine`] is the core: it maintains an originator table for topology
+//! discovery via periodic OGM broadcasts ([`wire::BatmanOgmPacket`]), routes
+//! [`wire`]-format unicast/multicast/broadcast packets, and paces its own OGM
+//! emission with an adaptive [`trickle`] timer. The engine is crypto-free —
+//! authentication is layered on top by the router — and uses `heapless` fixed
+//! capacity collections so it runs unchanged on an embedded node or a host.
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod engine;
 pub mod trickle;
+/// On-wire BATMAN packet formats (OGM, unicast, broadcast, multicast, TVLV) and
+/// their protocol constants, laid out to match batman-adv.
 pub mod wire;
 
 #[cfg(test)]
@@ -51,8 +62,13 @@ pub const DEFAULT_OGM_INTERVAL: Duration = Duration::from_secs(1);
 /// Track metrics for a specific path to an originator via a specific immediate neighbor
 #[derive(Debug, Clone)]
 pub struct NeighborStats {
+    /// The immediate neighbor that relays OGMs for this path to the originator.
     pub neighbor_ident: Mac,
+    /// Transmission quality (0..=255) of the most recent OGM accepted on this
+    /// path, after per-hop penalty and any local-link clamp.
     pub last_tq: u8,
+    /// Sequence number of the most recent OGM accepted on this path, used to
+    /// reject stale/duplicate OGMs arriving out of order.
     pub last_seqno: u32,
     /// Monotonic engine clock (the `now` passed to `handle_rx`) at the moment
     /// the most recent OGM refreshed this path.  A path is stale once `now` has
@@ -86,11 +102,22 @@ pub struct OriginatorRecord {
     /// originator when the table is full; per-path ageing
     /// ([`BatmanEngine::purge_stale`]) drives the actual staleness decision.
     pub last_heard: Duration,
+    /// The immediate neighbor on the currently-selected best path to this
+    /// originator (the relay of its best-TQ OGM).
     pub neighbor_ident: Mac,
+    /// The next-hop MAC that packets for this originator are forwarded to —
+    /// the immediate neighbor of the best path.
     pub best_next_hop: Mac,
+    /// The highest transmission quality (0..=255) among all known paths to this
+    /// originator; the metric the best next hop is chosen by.
     pub max_tq: u8,
+    /// Sequence number of the most recent OGM accepted for this originator via
+    /// any path.
     pub last_seqno: u32,
     // Track stats per neighbor routing path to this originator
+    /// Up to four alternate paths to this originator via different neighbors,
+    /// each with its own [`NeighborStats`]; the best-TQ entry backs the fields
+    /// above.
     pub paths: HVec<NeighborStats, 4>,
 }
 
@@ -115,8 +142,16 @@ pub struct OgmScheduleEntry {
     pub max_interval: core::time::Duration,
 }
 
+/// The BATMAN-adv routing engine: an originator table, broadcast dedup state,
+/// multicast membership tables, and per-interface Trickle OGM timers, sized for
+/// `MAX_ORIGINATORS` known nodes with heap-free `heapless` storage so the same
+/// code runs on an MCU and a host. Implements
+/// [`MeshRoutingEngine`](interfaces::engine::MeshRoutingEngine).
 pub struct BatmanEngine<const MAX_ORIGINATORS: usize> {
+    /// This node's own MAC; OGMs and broadcasts bearing it as originator are
+    /// dropped for loop prevention.
     pub self_ident: Mac,
+    /// Monotonic sequence number stamped on OGMs this node originates.
     pub sequence_number: u32,
     /// Monotonic sequence number stamped on broadcasts this node originates.
     /// Kept separate from the OGM `sequence_number` because broadcast and OGM
@@ -173,6 +208,8 @@ pub struct BatmanEngine<const MAX_ORIGINATORS: usize> {
 }
 
 impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
+    /// Create an engine for a node with address `self_ident` and empty routing,
+    /// broadcast, multicast, and OGM-timer state.
     pub fn new(self_ident: Mac) -> Self {
         Self {
             self_ident,

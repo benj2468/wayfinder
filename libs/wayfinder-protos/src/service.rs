@@ -14,17 +14,25 @@ use alloc::vec::Vec;
 /// [`WayfinderDataProvider::routing_table`].  Decoupled from both the
 /// wire-format structs and the generated proto types.
 pub struct NeighborPathData {
+    /// Immediate neighbor this path routes through.
     pub neighbor_id: Vec<u8>,
+    /// Transmission quality (0..=255) of this path.
     pub tq: u32,
+    /// Sequence number of the most recent OGM accepted on this path.
     pub last_seqno: u32,
 }
 
 /// Intermediate representation of a routing table entry.
 pub struct RoutingEntryData {
+    /// The destination originator this entry routes to.
     pub destination: Vec<u8>,
+    /// Immediate neighbor on the currently-selected best path.
     pub next_hop: Vec<u8>,
+    /// Best-path transmission quality (0..=255) to the destination.
     pub tq: u32,
+    /// Sequence number of the most recent OGM accepted for the destination.
     pub last_seqno: u32,
+    /// All known alternate paths to the destination.
     pub paths: Vec<NeighborPathData>,
 }
 
@@ -185,8 +193,11 @@ pub struct SecurityStatusData {
 /// Intentionally transport- and protocol-agnostic so callers can implement it
 /// for whatever router type they have without pulling in a dependency on this crate.
 pub trait WayfinderDataProvider {
+    /// This node's own identifier (raw MAC bytes).
     fn node_id(&self) -> Vec<u8>;
+    /// Number of originators (reachable nodes) currently in the routing table.
     fn num_originators(&self) -> u32;
+    /// Snapshot of the routing table: one entry per known destination.
     fn routing_table(&self) -> Vec<RoutingEntryData>;
     /// Snapshot of the per-(neighbor, interface) link-quality table.
     fn link_quality_table(&self) -> Vec<LinkQualityEntryData>;
@@ -282,10 +293,13 @@ pub struct WayfinderService<P> {
 }
 
 impl<P: WayfinderDataProvider> WayfinderService<P> {
+    /// Wrap a data provider in a request handler.
     pub fn new(provider: P) -> Self {
         Self { provider }
     }
 
+    /// Dispatch one request to the provider and build the matching response,
+    /// mapping any provider error into an [`ErrorResponse`].
     pub fn handle(&mut self, request: WayfinderRequest) -> WayfinderResponse {
         let response = match request.request {
             Some(RequestKind::GetNodeInfo(_)) => ResponseKind::NodeInfo(NodeInfo {

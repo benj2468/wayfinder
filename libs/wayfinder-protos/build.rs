@@ -1,3 +1,5 @@
+//! Build script: compiles the management-API protobuf definitions with `prost`,
+//! deriving a feature-gated `serde::Serialize` on every generated type.
 #[allow(clippy::expect_used)]
 fn main() {
     let mut config = prost_build::Config::new();

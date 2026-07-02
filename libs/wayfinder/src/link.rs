@@ -46,7 +46,7 @@ pub struct Received<'a> {
 // Native `async fn` in a trait is exactly what `dynosaur` consumes; the
 // auto-trait-bound lint does not apply to this usage.
 #[allow(async_fn_in_trait)]
-#[cfg_attr(feature = "std", dynosaur::dynosaur(pub DynLinkT = dyn(box) LinkT))]
+#[cfg_attr(feature = "std", dynosaur::dynosaur(DynLinkTInner = dyn(box) LinkT))]
 pub trait LinkT: Send {
     /// Deliver one frame originating from `origin` to `data.dst` over this
     /// medium.  `data.dst` is a next-hop (or final) node MAC, or
@@ -85,3 +85,11 @@ pub trait LinkT: Send {
     /// invalidated by the next receive.
     async fn recv<'a>(&'a mut self) -> Result<Received<'a>, LinkError>;
 }
+
+/// A dynamically dispatched [`LinkT`] trait object.
+///
+/// Gated behind the `std` feature: it aliases the `dynosaur`-generated wrapper
+/// whose boxing constructors reference `std`, so it only exists when the macro
+/// above runs.  Embedded `no_std` callers use [`LinkT`] directly.
+#[cfg(feature = "std")]
+pub type DynLinkT<'a> = DynLinkTInner<'a>;

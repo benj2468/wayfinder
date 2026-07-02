@@ -14,8 +14,10 @@ prost = { version = "0.13" , default-features = false, features = ["derive"] }
 serde = { version = "1", optional = true, default-features = false, features = ["derive"] }
 
 [features]
-# Enable `#[derive(serde::Serialize)]` on every generated proto type.
-serde = ["dep:serde"]
+# Enable `#[derive(serde::Serialize)]` on every generated proto type.  Pulls in
+# `serde/alloc` for the `Serialize` impls on `Vec<u8>`/`String` fields, since
+# this crate is `no_std` + `alloc` (serde's `std`/`alloc` are off by default).
+serde = ["dep:serde", "serde/alloc"]
 
 [build-dependencies]
 prost-build = "0.13"
