@@ -229,6 +229,7 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
             paths_max,
             paths_mean,
             oversize_drops: self.router.oversize_drops(),
+            relay_oversize_drops: self.router.relay_oversize_drops(),
         }
     }
 

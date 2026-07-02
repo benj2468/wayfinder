@@ -65,6 +65,7 @@ impl WayfinderDataProvider for ProviderMock {
             paths_max: 0,
             paths_mean: 0.0,
             oversize_drops: 0,
+            relay_oversize_drops: 0,
         }
     }
     fn resolve_route(&self, _destination: &[u8]) -> Option<RouteResolutionData> {

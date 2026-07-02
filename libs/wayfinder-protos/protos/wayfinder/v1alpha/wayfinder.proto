@@ -461,6 +461,14 @@ message NodeMetrics {
   // frame larger than the mesh can carry (a TAP MTU set too high for the links).
   // A non-zero, growing value signals a misconfigured MTU.
   uint32 oversize_drops = 12;
+
+  // Count of relayed frames (OGM re-floods, or relayed unicast/multicast/
+  // broadcast traffic) dropped because they did not fit the buffer for the
+  // outbound link — i.e. this node received a frame on one link whose MTU is
+  // larger than another of its links. Distinct from oversize_drops, which
+  // only counts locally originated frames; a non-zero, growing value signals
+  // an MTU mismatch between two of this node's links.
+  uint32 relay_oversize_drops = 13;
 }
 
 // Marker payload indicating the router would flood a packet out of every

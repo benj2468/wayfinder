@@ -275,6 +275,7 @@ mod ogm_processing {
 
         assert!(matches!(action, RoutingAction::Consumed));
         assert_eq!(reply.protocol, 0); // not forwarded
+        assert_eq!(engine.relay_oversize_drops(), 1);
     }
 
     #[test]
@@ -587,6 +588,7 @@ mod unicast_forwarding {
 
         assert!(matches!(action, RoutingAction::Consumed));
         assert_eq!(reply.protocol, 0); // not forwarded
+        assert_eq!(engine.relay_oversize_drops(), 1);
     }
 
     #[test]
@@ -927,6 +929,7 @@ mod broadcast_processing {
         ));
         // Not re-flooded: the caller only forwards `reply` when protocol != 0.
         assert_eq!(reply.protocol, 0);
+        assert_eq!(engine.relay_oversize_drops(), 1);
     }
 
     /// A node must never act on its own re-flooded broadcast looping back.
@@ -1355,6 +1358,7 @@ mod mcast_packet {
 
         assert!(matches!(action, RoutingAction::Consumed));
         assert_eq!(reply.protocol, 0); // not forwarded
+        assert_eq!(engine.relay_oversize_drops(), 1);
     }
 }
 

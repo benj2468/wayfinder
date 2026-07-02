@@ -114,6 +114,7 @@ impl WayfinderDataProvider for Mock {
             paths_max: 1,
             paths_mean: 1.0,
             oversize_drops: 2,
+            relay_oversize_drops: 4,
         }
     }
     fn resolve_route(&self, _destination: &[u8]) -> Option<RouteResolutionData> {
@@ -199,6 +200,7 @@ async fn assert_full_roundtrip(client: &mut Client) {
     assert_eq!(metrics.uptime_secs, 7384);
     assert_eq!(metrics.originators.unwrap().capacity, 128);
     assert_eq!(metrics.oversize_drops, 2);
+    assert_eq!(metrics.relay_oversize_drops, 4);
 
     let route = client.resolve_route(vec![0, 0, 0, 0, 0, 2]).await.unwrap();
     assert_eq!(format_mac(&route.next_hop), "00:00:00:00:00:03");

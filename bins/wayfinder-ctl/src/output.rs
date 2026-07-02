@@ -142,7 +142,8 @@ pub fn node_metrics(v: &NodeMetrics, fmt: OutputFormat) -> anyhow::Result<String
         format!(
             "uptime: {}s\nneighbors: {}\noriginators: {}\nbroadcast_dedup: {}\n\
              local_mcast_groups: {}\nmcast_memberships: {}\n\
-             tq (min/mean/max): {}/{:.1}/{}\npaths (mean/max): {:.2}/{}",
+             tq (min/mean/max): {}/{:.1}/{}\npaths (mean/max): {:.2}/{}\n\
+             oversize_drops: {}\nrelay_oversize_drops: {}",
             v.uptime_secs,
             v.neighbor_count,
             occ(&v.originators),
@@ -154,6 +155,8 @@ pub fn node_metrics(v: &NodeMetrics, fmt: OutputFormat) -> anyhow::Result<String
             v.tq_max,
             v.paths_mean,
             v.paths_max,
+            v.oversize_drops,
+            v.relay_oversize_drops,
         )
     })
 }
