@@ -357,7 +357,7 @@ fn render_metrics(frame: &mut Frame, app: &mut App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(10),           // node metrics summary
+            Constraint::Length(11),           // node metrics summary
             Constraint::Min(8),               // throughput history chart
             Constraint::Length(table_height), // per-interface throughput table
         ])
@@ -643,6 +643,7 @@ fn render_node_metrics(frame: &mut Frame, app: &App, area: Rect) {
                     &format!("{:.2} / {}", m.paths_mean, m.paths_max),
                 ),
                 field("Oversize drops", &m.oversize_drops.to_string()),
+                field("Relay oversize drops", &m.relay_oversize_drops.to_string()),
             ]
         }
     };
@@ -869,6 +870,7 @@ mod tests {
         // oversize-drops row — renders its values, not the "no data" placeholder.
         app.snapshot.metrics = Some(wayfinder_protos::wayfinder_v1alpha::NodeMetrics {
             oversize_drops: 42,
+            relay_oversize_drops: 17,
             ..Default::default()
         });
         terminal
@@ -886,5 +888,10 @@ mod tests {
             "oversize-drops row missing"
         );
         assert!(text.contains("42"), "oversize-drops value missing");
+        assert!(
+            text.contains("Relay oversize drops"),
+            "relay-oversize-drops row missing"
+        );
+        assert!(text.contains("17"), "relay-oversize-drops value missing");
     }
 }

@@ -117,6 +117,10 @@ pub struct NodeMetricsData {
     /// Locally originated host frames dropped because they exceeded the mesh's
     /// carrying capacity once encapsulated — non-zero signals a too-high MTU.
     pub oversize_drops: u32,
+    /// Relayed frames dropped because they didn't fit an outbound link's
+    /// buffer — non-zero signals an MTU mismatch between two of this node's
+    /// links, distinct from `oversize_drops` (locally originated frames only).
+    pub relay_oversize_drops: u32,
 }
 
 /// Egress decision a router would make for a destination.  Mirrors
@@ -398,6 +402,7 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                     paths_max: m.paths_max,
                     paths_mean: m.paths_mean,
                     oversize_drops: m.oversize_drops,
+                    relay_oversize_drops: m.relay_oversize_drops,
                 })
             }
 
@@ -842,6 +847,7 @@ mod tests {
                 paths_max: 4,
                 paths_mean: 1.75,
                 oversize_drops: 9,
+                relay_oversize_drops: 6,
             },
             ..Default::default()
         };
@@ -859,6 +865,7 @@ mod tests {
                 assert_eq!(m.paths_max, 4);
                 assert_eq!(m.paths_mean, 1.75);
                 assert_eq!(m.oversize_drops, 9);
+                assert_eq!(m.relay_oversize_drops, 6);
             }
             other => panic!("expected Metrics, got {:?}", proto_kind_name(&other)),
         }

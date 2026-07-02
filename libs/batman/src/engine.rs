@@ -160,6 +160,19 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
         }
     }
 
+    /// Record one relayed frame dropped because it didn't fit the caller's
+    /// `reply` scratchpad (e.g. relaying across a smaller-MTU link).  `trace!`
+    /// only — never `warn!` — because unlike a locally originated oversize
+    /// frame, this is reachable by any neighbor relaying traffic through this
+    /// node and must not let a peer drive log volume.
+    fn note_relay_oversize_drop(&mut self, kind: &'static str, total: usize, reply_len: usize) {
+        trace!(
+            kind,
+            total, reply_len, "drop: relay too large for reply buffer"
+        );
+        self.relay_oversize_drops = self.relay_oversize_drops.saturating_add(1);
+    }
+
     /// Replace the set of multicast groups the local host listens to.  These
     /// are announced to the mesh in the multicast TVLV of every OGM this node
     /// produces.  Groups beyond [`MAX_LOCAL_MCAST`] are dropped.
@@ -572,11 +585,7 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
                         reply.payload[size..total].copy_from_slice(src);
                     }
                 } else {
-                    trace!(
-                        total,
-                        reply_len = reply.payload.len(),
-                        "drop: OGM re-flood too large for reply buffer"
-                    );
+                    self.note_relay_oversize_drop("ogm_reflood", total, reply.payload.len());
                 }
 
                 self.apply_topology_change(now);
@@ -655,11 +664,7 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
             reply.payload[..header_size].copy_from_slice(&outbound.as_bytes()[..header_size]);
             reply.payload[header_size..total].copy_from_slice(inner);
         } else {
-            trace!(
-                total,
-                reply_len = reply.payload.len(),
-                "drop: broadcast re-flood too large for reply buffer; delivering locally only"
-            );
+            self.note_relay_oversize_drop("broadcast_reflood", total, reply.payload.len());
         }
 
         RoutingAction::DeliverLocalAndForward(Mac::BROADCAST)
@@ -714,11 +719,7 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
                 reply.payload[..size].copy_from_slice(updated_hdr.as_bytes());
                 reply.payload[size..total].copy_from_slice(inner);
             } else {
-                trace!(
-                    total,
-                    reply_len = reply.payload.len(),
-                    "drop: unicast relay too large for reply buffer"
-                );
+                self.note_relay_oversize_drop("unicast_relay", total, reply.payload.len());
             }
         }
 
@@ -769,11 +770,7 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
                 reply.payload[..size].copy_from_slice(updated_hdr.as_bytes());
                 reply.payload[size..total].copy_from_slice(inner);
             } else {
-                trace!(
-                    total,
-                    reply_len = reply.payload.len(),
-                    "drop: multicast relay too large for reply buffer"
-                );
+                self.note_relay_oversize_drop("mcast_relay", total, reply.payload.len());
             }
         }
 

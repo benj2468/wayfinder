@@ -158,6 +158,18 @@ pub struct BatmanEngine<const MAX_ORIGINATORS: usize> {
     ///
     /// [`produce_periodic_broadcast`]: interfaces::engine::MeshRoutingEngine::produce_periodic_broadcast
     topology_changed: bool,
+    /// Count of relayed frames (OGM re-floods, broadcast re-floods, unicast/
+    /// multicast relays) dropped because the caller's `reply` scratchpad was
+    /// too small to hold the rebuilt packet — i.e. this frame arrived on a
+    /// link whose MTU is larger than an egress link's.  A bounded,
+    /// here-and-now signal an operator can query; see
+    /// [`relay_oversize_drops`](Self::relay_oversize_drops).  Distinct from
+    /// [`CentralRouter::oversize_drops`](../../wayfinder/struct.CentralRouter.html#method.oversize_drops),
+    /// which counts locally originated frames dropped for the analogous
+    /// reason — this one is remotely triggerable (any neighbor relaying
+    /// through this node can cause it), so unlike that counter it never
+    /// escalates to `warn!`, only `trace!`.
+    relay_oversize_drops: u32,
 }
 
 impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
@@ -172,6 +184,7 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
             mcast_members: HVec::new(),
             ogm_timers: HVec::new(),
             topology_changed: false,
+            relay_oversize_drops: 0,
         }
     }
 
@@ -180,5 +193,12 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
     pub fn next_broadcast_seqno(&mut self) -> u32 {
         self.broadcast_sequence_number = self.broadcast_sequence_number.wrapping_add(1);
         self.broadcast_sequence_number
+    }
+
+    /// Number of relayed frames dropped because they didn't fit the egress
+    /// `reply` buffer.  A non-zero, growing value signals an MTU mismatch
+    /// between two of this node's links.
+    pub fn relay_oversize_drops(&self) -> u32 {
+        self.relay_oversize_drops
     }
 }

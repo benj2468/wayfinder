@@ -59,7 +59,8 @@ impl WayfinderDataProvider for Mock {
             tq_mean: 0.0,
             paths_max: 0,
             paths_mean: 0.0,
-            oversize_drops: 0,
+            oversize_drops: 3,
+            relay_oversize_drops: 9,
         }
     }
     fn resolve_route(&self, _destination: &[u8]) -> Option<RouteResolutionData> {
@@ -136,6 +137,27 @@ async fn node_info_query_renders_human_from_server() {
         .unwrap();
     assert!(out.contains("aa:bb:cc:dd:ee:07"), "got: {out}");
     assert!(out.contains("originators: 5"), "got: {out}");
+}
+
+#[tokio::test]
+async fn metrics_query_renders_json_from_server() {
+    let addr = spawn_server().await;
+    let out = run_query(Command::Metrics, &addr.to_string(), OutputFormat::Json)
+        .await
+        .expect("query succeeds");
+    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(parsed["oversize_drops"], 3);
+    assert_eq!(parsed["relay_oversize_drops"], 9);
+}
+
+#[tokio::test]
+async fn metrics_query_renders_human_from_server() {
+    let addr = spawn_server().await;
+    let out = run_query(Command::Metrics, &addr.to_string(), OutputFormat::Human)
+        .await
+        .unwrap();
+    assert!(out.contains("oversize_drops: 3"), "got: {out}");
+    assert!(out.contains("relay_oversize_drops: 9"), "got: {out}");
 }
 
 #[tokio::test]

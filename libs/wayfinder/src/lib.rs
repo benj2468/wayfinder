@@ -308,6 +308,17 @@ impl CentralRouter {
         self.oversize_drops
     }
 
+    /// Number of relayed frames (OGM re-floods, broadcast re-floods, unicast/
+    /// multicast relays) dropped because they didn't fit an egress link's
+    /// buffer — i.e. this node received a frame on a link whose MTU is larger
+    /// than another of its links.  Distinct from [`oversize_drops`], which
+    /// only counts locally originated frames.
+    ///
+    /// [`oversize_drops`]: CentralRouter::oversize_drops
+    pub fn relay_oversize_drops(&self) -> u32 {
+        self.batman.relay_oversize_drops()
+    }
+
     /// Record one oversize-drop of a local host frame.  Emits a single `warn!`
     /// on the first occurrence — enough for an operator to notice a bad MTU —
     /// then only bumps the counter, so a host looping oversize frames cannot
@@ -1060,6 +1071,41 @@ mod cp2_local_delivery {
         let (out, rest) = BatmanBroadcastPacket::ref_from_prefix(fwd.payload).unwrap();
         assert_eq!(out.ttl, 49);
         assert_eq!(&rest[..INNER.len()], INNER);
+    }
+
+    /// A broadcast that needs re-flooding, but whose re-flood doesn't fit the
+    /// egress `tx` buffer (e.g. arrived on a large-MTU link, being relayed out
+    /// a smaller one), must still deliver locally, must not forward anything,
+    /// and must not panic — and the drop must be counted so an operator can
+    /// see the MTU mismatch, distinct from `oversize_drops` (which only counts
+    /// locally originated frames).
+    #[test]
+    fn broadcast_reflood_oversize_is_counted_not_panicked() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+
+        let mut payload = Vec::new();
+        let hdr = BatmanBroadcastPacket {
+            packet_type: BATADV_BCAST,
+            version: 5,
+            ttl: 50,
+            seqno: 7u32.to_be(),
+            orig: mac(2),
+        };
+        payload.extend_from_slice(hdr.as_bytes());
+        payload.extend_from_slice(INNER);
+
+        let bytes = link_frame_bytes(2, 0xff, &payload);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+
+        // Room for the fixed broadcast header only; no room for INNER.
+        let header_size = core::mem::size_of::<BatmanBroadcastPacket>();
+        let mut tx = vec![0u8; header_size];
+        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx);
+
+        assert_eq!(outcome.deliver_local, Some(INNER)); // still delivered locally
+        assert!(outcome.forward.is_none()); // but not re-flooded
+        assert_eq!(router.relay_oversize_drops(), 1);
+        assert_eq!(router.oversize_drops(), 0); // distinct counter, untouched
     }
 
     /// Local egress: a host frame addressed to the broadcast Ident must be
