@@ -4,8 +4,14 @@ use crate::frame::{LinkFrame, LinkFrameDataMut, Mac};
 
 #[derive(Debug)]
 pub enum RoutingAction {
-    /// The packet was a BATMAN control message (like an OGM);
-    /// the engine consumed it to update its internal routing tables.
+    /// The packet was a BATMAN control message (like an OGM), a re-flood, or
+    /// a relayed unicast/multicast; the engine consumed it and updated its
+    /// internal routing tables.  It may *also* have written a rebuilt packet
+    /// into the `reply` buffer to send onward — the caller must check
+    /// `reply.protocol != 0` to tell whether there's anything to forward,
+    /// since the engine leaves `reply` untouched (protocol `0`) when it has
+    /// nothing to send, including when the rebuilt packet didn't fit the
+    /// caller's `reply` buffer.
     Consumed,
 
     /// The packet was data destined for another node.
@@ -18,12 +24,15 @@ pub enum RoutingAction {
 
     /// The packet was a mesh broadcast (e.g. a flooded ARP) that is new to
     /// this node, so it must be acted on twice: handed up to the local
-    /// application layer *and* re-flooded to neighbours.  The engine has
-    /// already written the re-flood frame (with a decremented TTL) into the
-    /// `reply` buffer, addressed to the contained identifier — normally
-    /// [`MeshIdentifier::BROADCAST`].  The caller forwards that frame and, in
-    /// addition, delivers the inner payload locally as it would for
-    /// [`RoutingAction::DeliverLocal`].
+    /// application layer *and*, when there's room, re-flooded to neighbours.
+    /// Local delivery always happens (it reads the original frame, not
+    /// `reply`), but the re-flood itself is conditional: the engine has
+    /// written the re-flood frame (with a decremented TTL) into the `reply`
+    /// buffer, addressed to the contained identifier — normally
+    /// [`MeshIdentifier::BROADCAST`] — only when it fit; as with
+    /// [`RoutingAction::Consumed`], the caller must check `reply.protocol !=
+    /// 0` before forwarding, since a rebuilt packet too large for `reply`
+    /// (e.g. relaying across a smaller-MTU link) leaves it untouched.
     ///
     /// [`MeshIdentifier::BROADCAST`]: crate::frame::MeshIdentifier::BROADCAST
     DeliverLocalAndForward(Mac),

@@ -2,6 +2,8 @@
 //! `wayfinder-tap` loads, and the issued certificate verifies against the
 //! written trust anchor (using the same `wayfinder-auth` API the node uses).
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use wayfinder_auth::{MembershipCert, TrustAnchor};
 use wayfinderctl::cert::{self, CertCommand};
 

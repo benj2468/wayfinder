@@ -134,6 +134,10 @@ fn init_ca(
         (None, true) => {
             let s: [u8; 32] = rand::random();
             // `requires = "out_seed"` guarantees this is Some.
+            #[expect(
+                clippy::expect_used,
+                reason = "clap's `requires = \"out_seed\"` on --generate guarantees this is Some"
+            )]
             let out = out_seed.expect("--generate requires --out-seed");
             write_secret(&out, &s)?;
             println!("wrote root seed to {}", out.display());

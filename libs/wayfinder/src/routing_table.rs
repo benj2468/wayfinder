@@ -82,16 +82,34 @@ impl<Ident: MeshIdentifier> IdentTable<Ident> {
 
     /// Remove node `idx` from the doubly-linked list.  O(1).
     fn unlink(&mut self, idx: u8) {
-        // `LruNode` is `Copy`, so `.unwrap()` gives us a value, not a reference,
+        // `LruNode` is `Copy`, so `.expect()` gives us a value, not a reference,
         // keeping the borrow of `self.nodes` trivially short.
-        let node = self.nodes[idx as usize].unwrap();
+        #[expect(
+            clippy::expect_used,
+            reason = "idx must reference an occupied slot: every caller only ever passes an idx it just looked up from self.map or a linked node"
+        )]
+        let node = self.nodes[idx as usize].expect("idx must reference an occupied slot");
         if node.prev != NONE_IDX {
-            self.nodes[node.prev as usize].as_mut().unwrap().next = node.next;
+            #[expect(
+                clippy::expect_used,
+                reason = "node.prev is a live list pointer, so its slot is occupied"
+            )]
+            let prev = self.nodes[node.prev as usize]
+                .as_mut()
+                .expect("prev slot must be occupied");
+            prev.next = node.next;
         } else {
             self.head = node.next;
         }
         if node.next != NONE_IDX {
-            self.nodes[node.next as usize].as_mut().unwrap().prev = node.prev;
+            #[expect(
+                clippy::expect_used,
+                reason = "node.next is a live list pointer, so its slot is occupied"
+            )]
+            let next = self.nodes[node.next as usize]
+                .as_mut()
+                .expect("next slot must be occupied");
+            next.prev = node.prev;
         } else {
             self.tail = node.prev;
         }
@@ -104,13 +122,25 @@ impl<Ident: MeshIdentifier> IdentTable<Ident> {
         let old_head = self.head;
 
         // Update the new head's own pointers (copy-modify-store).
-        let mut node = self.nodes[idx as usize].unwrap();
+        #[expect(
+            clippy::expect_used,
+            reason = "per this fn's own doc comment, callers only pass an idx whose slot is already populated (just not yet linked)"
+        )]
+        let mut node =
+            self.nodes[idx as usize].expect("idx must already be populated before linking");
         node.prev = NONE_IDX;
         node.next = old_head;
         self.nodes[idx as usize] = Some(node);
 
         if old_head != NONE_IDX {
-            self.nodes[old_head as usize].as_mut().unwrap().prev = idx;
+            #[expect(
+                clippy::expect_used,
+                reason = "old_head is a live list pointer, so its slot is occupied"
+            )]
+            let head_node = self.nodes[old_head as usize]
+                .as_mut()
+                .expect("old_head slot must be occupied");
+            head_node.prev = idx;
         } else {
             // List was empty; this node is also the tail.
             self.tail = idx;
@@ -136,7 +166,14 @@ impl<Ident: MeshIdentifier> IdentTable<Ident> {
     pub fn add_record(&mut self, iface_idx: usize, dest: Ident) {
         if let Some(&idx) = self.map.get(&dest) {
             // Refresh existing entry.
-            self.nodes[idx as usize].as_mut().unwrap().iface_idx = iface_idx;
+            #[expect(
+                clippy::expect_used,
+                reason = "idx came from self.map, so its slot is occupied"
+            )]
+            let entry = self.nodes[idx as usize]
+                .as_mut()
+                .expect("idx came from self.map, so its slot is occupied");
+            entry.iface_idx = iface_idx;
             self.move_to_front(idx);
             return;
         }
@@ -149,7 +186,13 @@ impl<Ident: MeshIdentifier> IdentTable<Ident> {
         } else {
             // Table is full: evict the LRU tail in O(1).
             let lru_idx = self.tail;
-            let lru_key = self.nodes[lru_idx as usize].unwrap().key;
+            #[expect(
+                clippy::expect_used,
+                reason = "self.tail is only NONE_IDX when the table is empty, which can't be true here since free_len == 0 means at least one entry exists"
+            )]
+            let lru_key = self.nodes[lru_idx as usize]
+                .expect("tail slot must be occupied when the table is full")
+                .key;
             self.map.remove(&lru_key);
             self.unlink(lru_idx);
             lru_idx
@@ -169,7 +212,14 @@ impl<Ident: MeshIdentifier> IdentTable<Ident> {
     pub fn get_egress_interface(&mut self, dest: Ident) -> Option<usize> {
         let idx = *self.map.get(&dest)?;
         self.move_to_front(idx);
-        Some(self.nodes[idx as usize].unwrap().iface_idx)
+        #[expect(
+            clippy::expect_used,
+            reason = "idx came from self.map, so its slot is occupied"
+        )]
+        let iface_idx = self.nodes[idx as usize]
+            .expect("idx came from self.map, so its slot is occupied")
+            .iface_idx;
+        Some(iface_idx)
     }
 
     /// Read-only equivalent of [`get_egress_interface`] that does **not**
@@ -180,7 +230,14 @@ impl<Ident: MeshIdentifier> IdentTable<Ident> {
     /// [`get_egress_interface`]: IdentTable::get_egress_interface
     pub fn peek_egress_interface(&self, dest: Ident) -> Option<usize> {
         let idx = *self.map.get(&dest)?;
-        Some(self.nodes[idx as usize].unwrap().iface_idx)
+        #[expect(
+            clippy::expect_used,
+            reason = "idx came from self.map, so its slot is occupied"
+        )]
+        let iface_idx = self.nodes[idx as usize]
+            .expect("idx came from self.map, so its slot is occupied")
+            .iface_idx;
+        Some(iface_idx)
     }
 }
 

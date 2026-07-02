@@ -23,6 +23,20 @@ members = [
     "bins/wayfinder-ctl",
 ]
 
+[workspace.lints.rust]
+# Every public API must carry documentation (see CLAUDE.md). Deferred: not yet
+# enabled workspace-wide (existing violations need to be cleared first) —
+# tracked as a follow-up, not enforced by this line today.
+# missing_docs = "warn"
+
+[workspace.lints.clippy]
+# `.unwrap()`/`.expect()` in production code hide a panic where an error/None
+# case exists; both are fine in tests, where crate roots carry
+# `#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]` to opt
+# back out of this.
+unwrap_used = "warn"
+expect_used = "deny"
+
 [workspace.dependencies]
 # Local Dependencies
 interfaces = { path = "./libs/interfaces" }

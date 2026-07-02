@@ -1,6 +1,8 @@
 //! `run_query` glue: parse the connect target, open a client to a real
 //! in-process `wayfinder-server`, issue the RPC, and render the result.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::net::SocketAddr;
 
 use tokio::sync::{mpsc, oneshot};

@@ -3,6 +3,9 @@ name = "rylr998"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [features]
 default = ["link"]
 # Bridge a `RylrClient` onto a Wayfinder mesh by implementing the `LinkT`

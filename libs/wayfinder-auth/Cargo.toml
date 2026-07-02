@@ -3,6 +3,9 @@ name = "wayfinder-auth"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 zerocopy = { version = "0.8.48", features = ["derive"] }
 ed25519-dalek = { version = "2.1", default-features = false }

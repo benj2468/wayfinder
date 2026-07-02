@@ -3,6 +3,9 @@ name = "wayfinder-protos"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 prost = { version = "0.13" , default-features = false, features = ["derive"] }
 # Optional: derive `serde::Serialize` on the generated message types so hosts

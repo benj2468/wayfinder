@@ -3,6 +3,8 @@
 //! authority path.  Asserts the issued certificate verifies against the anchor
 //! the client wrote.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::net::SocketAddr;
 
 use tokio::sync::{mpsc, oneshot};

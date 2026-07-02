@@ -11,6 +11,8 @@
 //! Shared by `wayfinder-tui` and `wayfinderctl` so the wire framing and the
 //! typed request methods live in exactly one place.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;

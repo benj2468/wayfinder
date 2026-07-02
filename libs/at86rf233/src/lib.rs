@@ -1,4 +1,5 @@
 #![cfg_attr(not(test), no_std)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 //! Generic SPI driver for the Atmel/Microchip AT86RF233 IEEE 802.15.4 radio
 //! transceiver, exposed as a Wayfinder [`LinkT`] mesh interface.

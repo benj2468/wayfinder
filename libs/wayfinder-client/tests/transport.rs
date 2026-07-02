@@ -7,6 +7,8 @@
 //! the decoded responses match what the provider returned. This exercises the
 //! full prost-encode → frame → decode path on both sides without a TAP device.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};

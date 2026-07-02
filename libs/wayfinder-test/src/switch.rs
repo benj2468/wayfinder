@@ -284,10 +284,17 @@ where
                 tracing::trace!(dest = ?dest, port = ?self.ident_map.get(dest), "forwarding message");
                 if let Some(dest_port) = self.ident_map.get(dest).copied() {
                     // Drop on the wire toward the destination node if its link is lossy.
-                    if self
-                        .rng
-                        .random_bool(self.ports.get(&dest_port).unwrap().config.outgoing_loss)
-                    {
+                    #[expect(
+                        clippy::expect_used,
+                        reason = "dest_port came from ident_map, and ports are never removed once added"
+                    )]
+                    let outgoing_loss = self
+                        .ports
+                        .get(&dest_port)
+                        .expect("ports are never removed once added")
+                        .config
+                        .outgoing_loss;
+                    if self.rng.random_bool(outgoing_loss) {
                         continue;
                     }
                     tracing::trace!(port_id = ?dest_port, direction = ?Direction::FromSwitch, len = msg.len(), "switch frame");
@@ -305,10 +312,14 @@ where
                         taps.retain(|t| !t.invalid);
                     }
 
+                    #[expect(
+                        clippy::expect_used,
+                        reason = "dest_port came from ident_map, and ports are never removed once added"
+                    )]
                     let _ = self
                         .ports
                         .get(&dest_port)
-                        .unwrap()
+                        .expect("ports are never removed once added")
                         .duplex
                         .egress
                         .send(msg.clone())

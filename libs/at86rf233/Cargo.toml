@@ -3,6 +3,9 @@ name = "at86rf233"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 interfaces.workspace = true
 embedded-hal.workspace = true

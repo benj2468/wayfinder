@@ -3,6 +3,9 @@ name = "wayfinder-tui"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [lib]
 name = "wayfinder_tui"
 path = "src/lib.rs"
