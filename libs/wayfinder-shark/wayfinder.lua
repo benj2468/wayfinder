@@ -49,7 +49,6 @@ f.ttl = ProtoField.uint8("wayfinder.batman.ttl", "TTL", base.DEC)
 f.flags = ProtoField.uint8("wayfinder.batman.ogm.flags", "Flags", base.HEX)
 f.seqno = ProtoField.uint32("wayfinder.batman.ogm.seqno", "Sequence Number", base.DEC)
 f.orig = ProtoField.ether("wayfinder.batman.ogm.orig", "Originator")
-f.prev_sender = ProtoField.ether("wayfinder.batman.ogm.prev_sender", "Previous Sender")
 f.reserved = ProtoField.uint8("wayfinder.batman.ogm.reserved", "Reserved", base.HEX)
 f.tq = ProtoField.uint8("wayfinder.batman.ogm.tq", "Transmission Quality", base.DEC)
 f.tvlv_len = ProtoField.uint16("wayfinder.batman.ogm.tvlv_len", "TVLV Length", base.DEC)
@@ -98,11 +97,10 @@ local OGM = {
 	FLAGS = 3,
 	SEQNO = 4, -- u32, big-endian
 	ORIG = 8, -- 6 bytes
-	PREV_SENDER = 14, -- 6 bytes
-	RESERVED = 20,
-	TQ = 21,
-	TVLV_LEN = 22, -- u16, big-endian
-	HEADER_LEN = 24,
+	RESERVED = 14,
+	TQ = 15,
+	TVLV_LEN = 16, -- u16, big-endian
+	HEADER_LEN = 18,
 }
 
 -- Field offsets within a MembershipCert value (libs/wayfinder-auth/src/cert.rs).
@@ -230,7 +228,6 @@ function wayfinder.dissector(tvb, pinfo, root)
 	tree:add(f.flags, tvb(OGM.FLAGS, 1))
 	tree:add(f.seqno, tvb(OGM.SEQNO, 4))
 	tree:add(f.orig, tvb(OGM.ORIG, 6))
-	tree:add(f.prev_sender, tvb(OGM.PREV_SENDER, 6))
 	tree:add(f.reserved, tvb(OGM.RESERVED, 1))
 	tree:add(f.tq, tvb(OGM.TQ, 1))
 	tree:add(f.tvlv_len, tvb(OGM.TVLV_LEN, 2))

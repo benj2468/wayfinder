@@ -9,9 +9,8 @@ pub const ETH_P_BATMAN: u16 = 0x4305;
 /// broadcast — batman-adv's `BATADV_IV_OGM`.
 pub const BATADV_IV_OGM: u8 = 0x01;
 
-/// Originator Message header, laid out to match batman-adv's
-/// `batadv_ogm_packet`.  A variable-length TVLV region of `tvlv_len` bytes
-/// (a sequence of [`BatmanTvlvHdr`]-prefixed records) follows this fixed
+/// Originator Message header.  A variable-length TVLV region of `tvlv_len`
+/// bytes (a sequence of [`BatmanTvlvHdr`]-prefixed records) follows this fixed
 /// header on the wire; it carries piggybacked announcements such as
 /// multicast group memberships.
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, PartialEq, Eq)]
@@ -29,10 +28,7 @@ pub struct BatmanOgmPacket {
     pub seqno: u32,
     /// The node that originally generated this message.
     pub orig: Mac,
-    // TODO(bjc) Do we need this field? I would expect NO considering this will be in the Link Frame.
-    /// The immediate neighbor who relayed it to us.
-    pub prev_sender: Mac,
-    /// Reserved padding byte, matching the batman-adv layout; sent as 0.
+    /// Reserved padding byte; sent as 0.
     pub reserved: u8,
     /// Transmission Quality metric of the path (0..=255).
     pub tq: u8,
@@ -184,9 +180,7 @@ pub const BATADV_BCAST: u8 = 0x02;
 /// e.g. an ARP request) immediately follows this header on the wire.  A node
 /// floods a broadcast by re-transmitting it with `ttl` decremented, dropping
 /// it once `ttl` reaches 1 or once it has already seen this `(orig, seqno)`
-/// pair — see the broadcast handling in the engine.  Unlike the OGM there is
-/// no `prev_sender`: only the originator and sequence number are needed for
-/// duplicate suppression.
+/// pair — see the broadcast handling in the engine.
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, PartialEq, Eq)]
 #[repr(C, packed)]
 pub struct BatmanBroadcastPacket {

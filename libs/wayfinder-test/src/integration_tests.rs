@@ -66,7 +66,6 @@ fn build_ogm_wire_frame(src: u8, tq: u8, seqno: u32) -> Vec<u8> {
         flags: 0,
         seqno: seqno.to_be(),
         orig: mac(src),
-        prev_sender: mac(src),
         reserved: 0,
         tq,
         tvlv_len: 0,

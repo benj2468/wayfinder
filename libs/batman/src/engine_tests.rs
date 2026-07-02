@@ -36,7 +36,7 @@ fn parse_link_frame(data: &[u8]) -> &LinkFrame {
 }
 
 // Helper to create an OGM packet
-fn make_ogm(orig: u8, prev_sender: u8, seqno: u32, tq: u8, ttl: u8) -> Vec<u8> {
+fn make_ogm(orig: u8, seqno: u32, tq: u8, ttl: u8) -> Vec<u8> {
     let ogm = BatmanOgmPacket {
         packet_type: BATADV_IV_OGM,
         version: 5,
@@ -44,7 +44,6 @@ fn make_ogm(orig: u8, prev_sender: u8, seqno: u32, tq: u8, ttl: u8) -> Vec<u8> {
         flags: 0,
         seqno: seqno.to_be(), // Network byte order
         orig: mac(orig),
-        prev_sender: mac(prev_sender),
         reserved: 0,
         tq,
         tvlv_len: 0,
@@ -105,7 +104,6 @@ mod ogm_generation {
         let seqno = ogm.seqno;
         assert_eq!(seqno, 1u32.to_be()); // First sequence number (in network byte order)
         assert_eq!(ogm.orig, mac(1));
-        assert_eq!(ogm.prev_sender, mac(1));
     }
 
     #[test]
@@ -152,7 +150,7 @@ mod ogm_processing {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive our own OGM
-        let ogm_payload = make_ogm(1, 1, 100, 255, 50);
+        let ogm_payload = make_ogm(1, 100, 255, 50);
         let frame_bytes = make_link_frame(1, 0xff, ETH_P_BATMAN, ogm_payload);
         let frame = parse_link_frame(&frame_bytes);
 
@@ -171,7 +169,7 @@ mod ogm_processing {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive OGM from node 2 via node 2 (direct neighbor)
-        let ogm_payload = make_ogm(2, 2, 1, 255, 50);
+        let ogm_payload = make_ogm(2, 1, 255, 50);
         let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm_payload);
         let frame = parse_link_frame(&frame_bytes);
 
@@ -196,7 +194,7 @@ mod ogm_processing {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive OGM with TQ 255
-        let ogm_payload = make_ogm(2, 2, 1, 255, 50);
+        let ogm_payload = make_ogm(2, 1, 255, 50);
         let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm_payload);
         let frame = parse_link_frame(&frame_bytes);
 
@@ -214,7 +212,7 @@ mod ogm_processing {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive OGM with very low TQ
-        let ogm_payload = make_ogm(2, 2, 1, 5, 50);
+        let ogm_payload = make_ogm(2, 1, 5, 50);
         let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm_payload);
         let frame = parse_link_frame(&frame_bytes);
 
@@ -232,7 +230,7 @@ mod ogm_processing {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive OGM from node 3 via node 2
-        let ogm_payload = make_ogm(3, 2, 1, 245, 50);
+        let ogm_payload = make_ogm(3, 1, 245, 50);
         let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm_payload);
         let frame = parse_link_frame(&frame_bytes);
 
@@ -250,7 +248,6 @@ mod ogm_processing {
         // Parse the forwarded OGM
         let (forwarded_ogm, _) = BatmanOgmPacket::ref_from_prefix(reply.payload).unwrap();
         assert_eq!(forwarded_ogm.orig, mac(3)); // Original source unchanged
-        assert_eq!(forwarded_ogm.prev_sender, mac(1)); // Updated to self
         assert_eq!(forwarded_ogm.ttl, 49); // Decremented from 50 to 49
         assert_eq!(forwarded_ogm.tq, 235); // Attenuated from 245 to 235
     }
@@ -262,7 +259,7 @@ mod ogm_processing {
     fn test_ogm_reflood_skipped_when_reply_buffer_too_small() {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
-        let ogm_payload = make_ogm(3, 2, 1, 245, 50);
+        let ogm_payload = make_ogm(3, 1, 245, 50);
         let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm_payload);
         let frame = parse_link_frame(&frame_bytes);
 
@@ -283,7 +280,7 @@ mod ogm_processing {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive OGM with TTL = 1
-        let ogm_payload = make_ogm(2, 2, 1, 255, 1);
+        let ogm_payload = make_ogm(2, 1, 255, 1);
         let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm_payload);
         let frame = parse_link_frame(&frame_bytes);
 
@@ -303,7 +300,7 @@ mod ogm_processing {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive OGM from node 5 via node 2 (first path)
-        let ogm1 = make_ogm(5, 2, 1, 240, 50);
+        let ogm1 = make_ogm(5, 1, 240, 50);
         let frame1 = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm1);
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
@@ -315,7 +312,7 @@ mod ogm_processing {
         );
 
         // Receive OGM from node 5 via node 3 (second path, better quality)
-        let ogm2 = make_ogm(5, 3, 2, 250, 50);
+        let ogm2 = make_ogm(5, 2, 250, 50);
         let frame2 = make_link_frame(3, 0xff, ETH_P_BATMAN, ogm2);
         engine.handle_rx(
             core::time::Duration::ZERO,
@@ -341,7 +338,7 @@ mod ogm_processing {
 
         // Add 5 different paths (limit is 4)
         for neighbor in 2..=6 {
-            let ogm = make_ogm(10, neighbor, neighbor as u32, 200, 50);
+            let ogm = make_ogm(10, neighbor as u32, 200, 50);
             let frame = make_link_frame(neighbor, 0xff, ETH_P_BATMAN, ogm);
             let mut reply_buffer = [0u8; 256];
             let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
@@ -363,7 +360,7 @@ mod ogm_processing {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive initial OGM
-        let ogm1 = make_ogm(2, 2, 100, 255, 50);
+        let ogm1 = make_ogm(2, 100, 255, 50);
         let frame1 = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm1);
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
@@ -377,7 +374,7 @@ mod ogm_processing {
         assert_eq!(engine.originator_table[&mac(2)].last_seqno, 100);
 
         // Receive newer OGM
-        let ogm2 = make_ogm(2, 2, 105, 255, 50);
+        let ogm2 = make_ogm(2, 105, 255, 50);
         let frame2 = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm2);
         engine.handle_rx(
             core::time::Duration::ZERO,
@@ -394,7 +391,7 @@ mod ogm_processing {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive initial OGM with seqno 100
-        let ogm1 = make_ogm(2, 2, 100, 255, 50);
+        let ogm1 = make_ogm(2, 100, 255, 50);
         let frame1 = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm1);
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
@@ -408,7 +405,7 @@ mod ogm_processing {
         let initial_tq = engine.originator_table[&mac(2)].max_tq;
 
         // Receive older OGM with seqno 95 and different TQ
-        let ogm2 = make_ogm(2, 2, 95, 200, 50);
+        let ogm2 = make_ogm(2, 95, 200, 50);
         let frame2 = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm2);
         engine.handle_rx(
             core::time::Duration::ZERO,
@@ -429,7 +426,7 @@ mod ogm_processing {
         // Fill the table to capacity (4 originators), each first heard at a
         // distinct, increasing time so they have a clear staleness order.
         for (i, orig) in (10..14).enumerate() {
-            let ogm = make_ogm(orig, orig, 1, 255, 50);
+            let ogm = make_ogm(orig, 1, 255, 50);
             let frame = make_link_frame(orig, 0xff, ETH_P_BATMAN, ogm);
             let mut reply_buffer = [0u8; 256];
             let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
@@ -445,7 +442,7 @@ mod ogm_processing {
         // A newly heard originator must be admitted, evicting the
         // least-recently-refreshed entry (originator 10, heard at t=0) rather
         // than being dropped.
-        let ogm = make_ogm(20, 20, 1, 255, 50);
+        let ogm = make_ogm(20, 1, 255, 50);
         let frame = make_link_frame(20, 0xff, ETH_P_BATMAN, ogm);
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
@@ -498,7 +495,7 @@ mod unicast_forwarding {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Add a route to node 5 via node 2
-        let ogm = make_ogm(5, 2, 1, 255, 50);
+        let ogm = make_ogm(5, 1, 255, 50);
         let frame_ogm = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
@@ -525,7 +522,7 @@ mod unicast_forwarding {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Add a route to node 5 via node 2
-        let ogm = make_ogm(5, 2, 1, 255, 50);
+        let ogm = make_ogm(5, 1, 255, 50);
         let frame_ogm = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
@@ -563,7 +560,7 @@ mod unicast_forwarding {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Add a route to node 5 via node 2.
-        let ogm = make_ogm(5, 2, 1, 255, 50);
+        let ogm = make_ogm(5, 1, 255, 50);
         let frame_ogm = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
         let mut big_buf = [0u8; 256];
         let mut warmup_reply = LinkFrameDataMut::from(&mut big_buf[..]);
@@ -619,7 +616,7 @@ mod routing_lookup {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Add a route to node 5 via node 2
-        let ogm = make_ogm(5, 2, 1, 255, 50);
+        let ogm = make_ogm(5, 1, 255, 50);
         let frame = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
@@ -647,7 +644,7 @@ mod routing_lookup {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Add route to node 5 via node 2 (TQ=200)
-        let ogm1 = make_ogm(5, 2, 1, 200, 50);
+        let ogm1 = make_ogm(5, 1, 200, 50);
         let frame1 = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm1);
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
@@ -661,7 +658,7 @@ mod routing_lookup {
         assert_eq!(engine.lookup_route(mac(5)), Some(mac(2)));
 
         // Add better route to node 5 via node 3 (TQ=250)
-        let ogm2 = make_ogm(5, 3, 2, 250, 50);
+        let ogm2 = make_ogm(5, 2, 250, 50);
         let frame2 = make_link_frame(3, 0xff, ETH_P_BATMAN, ogm2);
         engine.handle_rx(
             core::time::Duration::ZERO,
@@ -757,7 +754,7 @@ mod edge_cases {
 
         // Rapidly changing sequence numbers
         for seqno in [1, 100, 50, 200, 75, 300] {
-            let ogm = make_ogm(2, 2, seqno, 255, 50);
+            let ogm = make_ogm(2, seqno, 255, 50);
             let frame = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
             let mut reply_buffer = [0u8; 256];
             let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
@@ -781,7 +778,7 @@ mod edge_cases {
         let neighbors = [2, 3, 4, 5];
         for (i, &neighbor) in neighbors.iter().enumerate() {
             let tq = 255 - (i as u8 * 10); // Different qualities
-            let ogm = make_ogm(10, neighbor, 1, tq, 50);
+            let ogm = make_ogm(10, 1, tq, 50);
             let frame = make_link_frame(neighbor, 0xff, ETH_P_BATMAN, ogm);
             let mut reply_buffer = [0u8; 256];
             let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
@@ -804,7 +801,7 @@ mod edge_cases {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Receive OGM with TTL=0 (shouldn't happen in practice, but test boundary)
-        let ogm = make_ogm(2, 2, 1, 255, 0);
+        let ogm = make_ogm(2, 1, 255, 0);
         let frame = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
@@ -826,7 +823,7 @@ mod edge_cases {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // First OGM from originator 5 via neighbor 2
-        let ogm1 = make_ogm(5, 2, 1, 200, 50);
+        let ogm1 = make_ogm(5, 1, 200, 50);
         let frame1 = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm1);
         let mut reply_buffer = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
@@ -840,7 +837,7 @@ mod edge_cases {
         assert_eq!(engine.originator_table[&mac(5)].paths[0].last_tq, 190);
 
         // Second OGM from same originator via same neighbor with different TQ
-        let ogm2 = make_ogm(5, 2, 2, 250, 50);
+        let ogm2 = make_ogm(5, 2, 250, 50);
         let frame2 = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm2);
         engine.handle_rx(
             core::time::Duration::ZERO,
@@ -1041,7 +1038,6 @@ mod ogm_tvlv {
             flags: 0,
             seqno: 1u32.to_be(),
             orig: mac(2),
-            prev_sender: mac(2),
             reserved: 0,
             tq: 255,
             tvlv_len: (tvlv.len() as u16).to_be(),
@@ -1061,7 +1057,7 @@ mod ogm_tvlv {
 
     /// When an intermediate node re-floods an OGM, it must preserve the TVLV
     /// tail verbatim (so membership announcements propagate) while still
-    /// decrementing TTL, attenuating TQ, and stamping itself as prev_sender.
+    /// decrementing TTL and attenuating TQ.
     #[test]
     fn forwarded_ogm_preserves_tvlv_tail() {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
@@ -1077,7 +1073,6 @@ mod ogm_tvlv {
             flags: 0,
             seqno: 1u32.to_be(),
             orig: mac(3),
-            prev_sender: mac(2),
             reserved: 0,
             tq: 245,
             tvlv_len: (tvlv.len() as u16).to_be(),
@@ -1097,7 +1092,6 @@ mod ogm_tvlv {
 
         let (fwd, tail) = BatmanOgmPacket::ref_from_prefix(reply.payload).unwrap();
         assert_eq!(fwd.orig, mac(3)); // originator unchanged
-        assert_eq!(fwd.prev_sender, mac(1)); // stamped as us
         assert_eq!(fwd.ttl, 49); // decremented
         assert_eq!(
             u16::from_be(fwd.tvlv_len) as usize,
@@ -1145,9 +1139,9 @@ mod mcast_membership {
         v
     }
 
-    /// Build a received OGM wire frame from `orig` (relayed by `prev`) carrying
-    /// a multicast TVLV announcing `groups`.
-    fn ogm_with_groups(orig: u8, prev: u8, seqno: u32, groups: &[Mac]) -> Vec<u8> {
+    /// Build a received OGM wire frame from `orig` carrying a multicast TVLV
+    /// announcing `groups`.
+    fn ogm_with_groups(orig: u8, seqno: u32, groups: &[Mac]) -> Vec<u8> {
         let tvlv = mcast_tvlv(groups);
         let ogm = BatmanOgmPacket {
             packet_type: BATADV_IV_OGM,
@@ -1156,7 +1150,6 @@ mod mcast_membership {
             flags: 0,
             seqno: seqno.to_be(),
             orig: mac(orig),
-            prev_sender: mac(prev),
             reserved: 0,
             tq: 255,
             tvlv_len: (tvlv.len() as u16).to_be(),
@@ -1222,7 +1215,7 @@ mod mcast_membership {
         let (g1, g2) = (group(1), group(2));
 
         // Node 5 announces interest in g1 and g2.
-        let frame_bytes = ogm_with_groups(5, 5, 1, &[g1, g2]);
+        let frame_bytes = ogm_with_groups(5, 1, &[g1, g2]);
         let frame = parse_link_frame(&frame_bytes);
         let mut buf = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut buf[..]);
@@ -1232,7 +1225,7 @@ mod mcast_membership {
         assert!(engine.mcast_listeners(g2).any(|m| m == mac(5)));
 
         // A newer OGM from node 5 announcing only g1 must prune g2.
-        let frame_bytes = ogm_with_groups(5, 5, 2, &[g1]);
+        let frame_bytes = ogm_with_groups(5, 2, &[g1]);
         let frame = parse_link_frame(&frame_bytes);
         let mut buf = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut buf[..]);
@@ -1293,7 +1286,7 @@ mod mcast_packet {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Learn a route to node 5 via node 2.
-        let ogm = make_ogm(5, 2, 1, 255, 50);
+        let ogm = make_ogm(5, 1, 255, 50);
         let frame_ogm = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
         let mut buf = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut buf[..]);
@@ -1331,7 +1324,7 @@ mod mcast_packet {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Learn a route to node 5 via node 2.
-        let ogm = make_ogm(5, 2, 1, 255, 50);
+        let ogm = make_ogm(5, 1, 255, 50);
         let frame_ogm = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
         let mut big_buf = [0u8; 256];
         let mut warmup_reply = LinkFrameDataMut::from(&mut big_buf[..]);
@@ -1385,7 +1378,7 @@ mod route_expiry {
         tq: u8,
         now: Duration,
     ) {
-        let ogm = make_ogm(orig, via, seqno, tq, 50);
+        let ogm = make_ogm(orig, seqno, tq, 50);
         let frame = make_link_frame(via, 0xff, ETH_P_BATMAN, ogm);
         let mut buf = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut buf[..]);
@@ -1493,7 +1486,7 @@ mod adaptive_backoff {
         tq: u8,
         now: Duration,
     ) {
-        let ogm = make_ogm(orig, via, seqno, tq, 50);
+        let ogm = make_ogm(orig, seqno, tq, 50);
         let frame = make_link_frame(via, 0xff, ETH_P_BATMAN, ogm);
         let mut buf = [0u8; 256];
         let mut reply = LinkFrameDataMut::from(&mut buf[..]);
@@ -1774,7 +1767,7 @@ mod tq_clamp {
     #[test]
     fn clamp_caps_tq_at_local_link_quality() {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
-        let ogm = make_ogm(2, 2, 1, 255, 50);
+        let ogm = make_ogm(2, 1, 255, 50);
         let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
         let frame = parse_link_frame(&frame_bytes);
         let mut reply_buffer = [0u8; 256];
@@ -1789,7 +1782,7 @@ mod tq_clamp {
     #[test]
     fn no_clamp_when_local_link_is_strong() {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
-        let ogm = make_ogm(2, 2, 1, 255, 50);
+        let ogm = make_ogm(2, 1, 255, 50);
         let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
         let frame = parse_link_frame(&frame_bytes);
         let mut reply_buffer = [0u8; 256];
@@ -1805,7 +1798,7 @@ mod tq_clamp {
     #[test]
     fn clamp_never_raises_tq() {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
-        let ogm = make_ogm(2, 2, 1, 100, 50);
+        let ogm = make_ogm(2, 1, 100, 50);
         let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
         let frame = parse_link_frame(&frame_bytes);
         let mut reply_buffer = [0u8; 256];
@@ -1820,7 +1813,7 @@ mod tq_clamp {
     #[test]
     fn unmetered_handle_rx_applies_no_clamp() {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
-        let ogm = make_ogm(2, 2, 1, 255, 50);
+        let ogm = make_ogm(2, 1, 255, 50);
         let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
         let frame = parse_link_frame(&frame_bytes);
         let mut reply_buffer = [0u8; 256];

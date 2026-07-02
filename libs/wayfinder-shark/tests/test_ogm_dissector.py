@@ -32,7 +32,6 @@ def batman_ogm(
     flags: int = 0,
     seqno: int = 1234,
     orig: bytes = NODE1,
-    prev_sender: bytes = NODE2,
     reserved: int = 0,
     tq: int = 255,
     tvlv: bytes = b"",
@@ -42,7 +41,6 @@ def batman_ogm(
         struct.pack(">BBBB", BATADV_IV_OGM, version, ttl, flags)
         + struct.pack(">I", seqno)  # seqno is big-endian on the wire
         + orig
-        + prev_sender
         + struct.pack(">BB", reserved, tq)
         + struct.pack(">H", len(tvlv))  # tvlv_len, big-endian
         + tvlv
@@ -113,7 +111,6 @@ EXPECTED_FIELDS = {
     "wayfinder.batman.ttl": "50",
     "wayfinder.batman.ogm.seqno": "1234",
     "wayfinder.batman.ogm.orig": "02:00:00:00:00:01",
-    "wayfinder.batman.ogm.prev_sender": "02:00:00:00:00:02",
     "wayfinder.batman.ogm.tq": "255",
     "wayfinder.batman.ogm.tvlv_len": "4",
     "wayfinder.batman.ogm.tvlv": "deadbeef",

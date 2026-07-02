@@ -434,8 +434,8 @@ impl OgmAuth {
     /// Build the canonical signed message for an OGM: a domain prefix followed
     /// by the immutable identity bytes (originator MAC and sequence number, as
     /// they appear on the wire) and the originator's certificate.  Mutable
-    /// per-hop fields (ttl, tq, prev_sender) are deliberately excluded so the
-    /// signature survives forwarding.  Returns the filled prefix of `out`.
+    /// per-hop fields (ttl, tq) are deliberately excluded so the signature
+    /// survives forwarding.  Returns the filled prefix of `out`.
     ///
     /// Excluding the mutable `tq` is only *safe* because the engine clamps an
     /// advertised TQ by the locally-measured link quality to the sender (the
@@ -690,7 +690,6 @@ mod tests {
             flags: 0,
             seqno: seqno.to_be(),
             orig,
-            prev_sender: orig,
             reserved: 0,
             tq: 255,
             tvlv_len: 0,

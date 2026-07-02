@@ -1209,7 +1209,6 @@ mod mcast_forwarding {
             flags: 0,
             seqno: seqno.to_be(),
             orig,
-            prev_sender: orig,
             reserved: 0,
             tq: 255,
             tvlv_len: (tvlv_total as u16).to_be(),
@@ -1486,8 +1485,7 @@ mod node_metrics {
     }
 
     /// Feed one OGM so the router learns `orig` as a direct neighbour with the
-    /// given transmission quality.  `prev_sender == orig` and full TTL make it a
-    /// one-hop path.
+    /// given transmission quality.  A full TTL makes it a one-hop path.
     fn feed_direct_ogm(router: &mut CentralRouter, orig: Mac, seqno: u32, tq: u8) {
         let ogm = BatmanOgmPacket {
             packet_type: BATADV_IV_OGM,
@@ -1496,7 +1494,6 @@ mod node_metrics {
             flags: 0,
             seqno: seqno.to_be(),
             orig,
-            prev_sender: orig,
             reserved: 0,
             tq,
             tvlv_len: 0,
@@ -1565,7 +1562,6 @@ mod tq_clamp_integration {
             flags: 0,
             seqno: 1u32.to_be(),
             orig,
-            prev_sender: orig,
             reserved: 0,
             tq,
             tvlv_len: 0,
