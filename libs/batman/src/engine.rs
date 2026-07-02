@@ -565,7 +565,6 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
                 let mut outbound_ogm = ogm;
                 outbound_ogm.ttl -= 1;
                 outbound_ogm.tq = computed_tq;
-                outbound_ogm.prev_sender = self.self_ident;
 
                 // Write the fixed header into the caller's scratchpad, then copy
                 // the TVLV tail (membership announcements) verbatim from the
@@ -862,7 +861,6 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
             flags: 0,
             seqno: self.sequence_number.to_be(),
             orig: self.self_ident,
-            prev_sender: self.self_ident,
             reserved: 0,
             tq: 255, // Max link capability score from original anchor source
             tvlv_len: (tvlv_len as u16).to_be(),

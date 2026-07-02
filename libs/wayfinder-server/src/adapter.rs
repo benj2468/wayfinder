@@ -351,7 +351,7 @@ mod tests {
 
     /// Feed one direct OGM so the router learns `orig` as a one-hop neighbour at
     /// the engine's stored TQ of `tq - 10` (the per-hop penalty) with a single
-    /// path.  `prev_sender == orig` and a full TTL make it a direct path.
+    /// path.  A full TTL makes it a direct path.
     fn feed_direct_ogm(router: &mut CentralRouter, orig: Mac, seqno: u32, tq: u8) {
         let ogm = BatmanOgmPacket {
             packet_type: BATADV_IV_OGM,
@@ -360,7 +360,6 @@ mod tests {
             flags: 0,
             seqno: seqno.to_be(),
             orig,
-            prev_sender: orig,
             reserved: 0,
             tq,
             tvlv_len: 0,
@@ -507,7 +506,6 @@ mod tests {
             flags: 0,
             seqno: 1u32.to_be(),
             orig: peer,
-            prev_sender: peer,
             reserved: 0,
             tq: 255,
             tvlv_len: 0,
