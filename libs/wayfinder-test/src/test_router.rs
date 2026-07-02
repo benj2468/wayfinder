@@ -71,7 +71,12 @@ pub fn host_frame(dst: Mac, src: Mac, payload: &[u8]) -> Vec<u8> {
 
 /// Zero-copy parse of raw bytes into a `&LinkFrame`.
 pub fn parse_frame(bytes: &[u8]) -> &LinkFrame {
-    LinkFrame::ref_from_bytes(bytes).expect("failed to parse LinkFrame from bytes")
+    #[expect(
+        clippy::expect_used,
+        reason = "test helper: callers only pass bytes they built as a well-formed LinkFrame"
+    )]
+    let frame = LinkFrame::ref_from_bytes(bytes).expect("failed to parse LinkFrame from bytes");
+    frame
 }
 
 // ── in-process transports ─────────────────────────────────────────────────────
@@ -144,7 +149,12 @@ impl FrameIo for ObservableEgress {
     }
 
     async fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        self.deliveries.lock().unwrap().push(buf.to_vec());
+        #[expect(
+            clippy::expect_used,
+            reason = "test harness: a poisoned mutex means another test thread already panicked, so this test is failing regardless"
+        )]
+        let mut deliveries = self.deliveries.lock().expect("deliveries mutex poisoned");
+        deliveries.push(buf.to_vec());
         Ok(buf.len())
     }
 }
@@ -228,7 +238,12 @@ impl TestRouter {
     /// The inner frames the router has delivered locally so far (the full host
     /// Ethernet frames that would have been written to the TAP), in order.
     pub fn local_deliveries(&self) -> Vec<Vec<u8>> {
-        self.deliveries.lock().unwrap().clone()
+        #[expect(
+            clippy::expect_used,
+            reason = "test harness: a poisoned mutex means another test thread already panicked, so this test is failing regardless"
+        )]
+        let deliveries = self.deliveries.lock().expect("deliveries mutex poisoned");
+        deliveries.clone()
     }
 
     // ── outbound ─────────────────────────────────────────────────────────────
@@ -240,10 +255,16 @@ impl TestRouter {
     /// tests exercise the real per-interface dynamics rather than a lockstep
     /// single-seqno flood.
     pub async fn poll_due(&mut self, now: Duration) {
-        self.driver
-            .poll_due(now)
-            .await
-            .expect("poll_due dispatch failed");
+        #[expect(
+            clippy::expect_used,
+            reason = "test harness: the in-process channel transports have no failure mode reachable from a test"
+        )]
+        {
+            self.driver
+                .poll_due(now)
+                .await
+                .expect("poll_due dispatch failed");
+        }
     }
 
     /// Time until this node's soonest interface is next due to emit an OGM, as of
@@ -269,10 +290,16 @@ impl TestRouter {
     /// Drain every currently-pending frame across all mesh interfaces (and the
     /// host/query channels) through the driver in one non-blocking sweep.
     pub async fn drain_all(&mut self) {
-        self.driver
-            .process_pending()
-            .await
-            .expect("process_pending failed");
+        #[expect(
+            clippy::expect_used,
+            reason = "test harness: the in-process channel transports have no failure mode reachable from a test"
+        )]
+        {
+            self.driver
+                .process_pending()
+                .await
+                .expect("process_pending failed");
+        }
     }
 
     /// Feed one crafted wire frame to the router with explicit [`LinkMetrics`],

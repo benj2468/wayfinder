@@ -10,6 +10,8 @@
 //! available; the tokio event loop, the concrete `tokio::net` transports, and
 //! the link-building helpers are gated behind the (default) `tokio` feature.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 mod raw;
 mod snoop;
 mod transport;

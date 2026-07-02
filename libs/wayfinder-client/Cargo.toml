@@ -3,6 +3,9 @@ name = "wayfinder-client"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [dependencies]
 wayfinder-protos.workspace = true
 tokio = { workspace = true }

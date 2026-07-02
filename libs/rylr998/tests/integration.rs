@@ -3,6 +3,8 @@
 //! Pairs the real `RylrClient` against an in-process simulator that speaks
 //! the same AT-command protocol over a `tokio::io::DuplexStream`.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use embedded_io_adapters::tokio_1::FromTokio;
 use rylr998::{Bandwidth, CodingRate, LoraError, RylrClient, SpreadingFactory, WirelessMode};
 use std::collections::HashMap;

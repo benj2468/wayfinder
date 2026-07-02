@@ -12,6 +12,7 @@
 //!   router is never shared across tasks.
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 extern crate alloc;
 

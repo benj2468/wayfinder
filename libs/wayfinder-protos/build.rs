@@ -1,3 +1,4 @@
+#[allow(clippy::expect_used)]
 fn main() {
     let mut config = prost_build::Config::new();
 

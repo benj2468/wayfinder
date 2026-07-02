@@ -439,7 +439,18 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
             let _ = self.originator_table.insert(orig_ident, new_record);
         }
 
-        let record = self.originator_table.get_mut(&orig_ident).unwrap();
+        // `orig_ident` is now guaranteed present: either it already existed
+        // (`is_new_orig` false) or the block above just inserted it (eviction,
+        // if any, only ever removes a *different* key since `orig_ident` was
+        // absent at that point).
+        #[expect(
+            clippy::expect_used,
+            reason = "orig_ident was just looked up or inserted above"
+        )]
+        let record = self
+            .originator_table
+            .get_mut(&orig_ident)
+            .expect("orig_ident was just looked up or inserted above");
 
         // Whether this OGM carries a *strictly newer* sequence number than any
         // we've already processed from this originator.  Captured before
@@ -550,18 +561,22 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
                 let tvlv_len = u16::from_be(ogm.tvlv_len) as usize;
                 let total = size + tvlv_len;
 
-                reply.dst = Mac::BROADCAST;
-                reply.protocol = ETH_P_BATMAN;
-                reply
-                    .payload
-                    .get_mut(0..size)
-                    .unwrap()
-                    .copy_from_slice(&outbound_ogm.as_bytes()[..size]);
-                if let (Some(dst), Some(src)) = (
-                    reply.payload.get_mut(size..total),
-                    frame.payload.get(size..total),
-                ) {
-                    dst.copy_from_slice(src);
+                // The reply scratchpad may be smaller than this OGM (e.g. it was
+                // received on a large-MTU link but is being re-flooded out one
+                // with a smaller one); drop the re-flood rather than panic.
+                if total <= reply.payload.len() {
+                    reply.dst = Mac::BROADCAST;
+                    reply.protocol = ETH_P_BATMAN;
+                    reply.payload[..size].copy_from_slice(&outbound_ogm.as_bytes()[..size]);
+                    if let Some(src) = frame.payload.get(size..total) {
+                        reply.payload[size..total].copy_from_slice(src);
+                    }
+                } else {
+                    trace!(
+                        total,
+                        reply_len = reply.payload.len(),
+                        "drop: OGM re-flood too large for reply buffer"
+                    );
                 }
 
                 self.apply_topology_change(now);
@@ -630,18 +645,22 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
         let header_size = core::mem::size_of::<BatmanBroadcastPacket>();
         let total = header_size + inner.len();
 
-        reply.dst = Mac::BROADCAST;
-        reply.protocol = ETH_P_BATMAN;
-        reply
-            .payload
-            .get_mut(0..header_size)
-            .unwrap()
-            .copy_from_slice(&outbound.as_bytes()[..header_size]);
-        reply
-            .payload
-            .get_mut(header_size..total)
-            .unwrap_or(&mut [])
-            .copy_from_slice(inner);
+        // As above: the reply scratchpad may not have room for a large frame
+        // relayed toward a smaller-MTU link. Skip the re-flood rather than
+        // panic; local delivery still happens from `frame`, independent of
+        // `reply`.
+        if total <= reply.payload.len() {
+            reply.dst = Mac::BROADCAST;
+            reply.protocol = ETH_P_BATMAN;
+            reply.payload[..header_size].copy_from_slice(&outbound.as_bytes()[..header_size]);
+            reply.payload[header_size..total].copy_from_slice(inner);
+        } else {
+            trace!(
+                total,
+                reply_len = reply.payload.len(),
+                "drop: broadcast re-flood too large for reply buffer; delivering locally only"
+            );
+        }
 
         RoutingAction::DeliverLocalAndForward(Mac::BROADCAST)
     }
@@ -687,18 +706,20 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
             let inner = frame.payload.get(size..).unwrap_or(&[]);
             let total = size + inner.len();
 
-            reply.dst = next;
-            reply.protocol = ETH_P_BATMAN;
-            reply
-                .payload
-                .get_mut(0..size)
-                .unwrap()
-                .copy_from_slice(updated_hdr.as_bytes());
-            reply
-                .payload
-                .get_mut(size..total)
-                .unwrap_or(&mut [])
-                .copy_from_slice(inner);
+            // As above: skip the relay rather than panic if it doesn't fit the
+            // reply scratchpad (e.g. relaying toward a smaller-MTU link).
+            if total <= reply.payload.len() {
+                reply.dst = next;
+                reply.protocol = ETH_P_BATMAN;
+                reply.payload[..size].copy_from_slice(updated_hdr.as_bytes());
+                reply.payload[size..total].copy_from_slice(inner);
+            } else {
+                trace!(
+                    total,
+                    reply_len = reply.payload.len(),
+                    "drop: unicast relay too large for reply buffer"
+                );
+            }
         }
 
         RoutingAction::Consumed // Route unknown, drop packet
@@ -740,18 +761,20 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
             let inner = frame.payload.get(size..).unwrap_or(&[]);
             let total = size + inner.len();
 
-            reply.dst = next;
-            reply.protocol = ETH_P_BATMAN;
-            reply
-                .payload
-                .get_mut(0..size)
-                .unwrap()
-                .copy_from_slice(updated_hdr.as_bytes());
-            reply
-                .payload
-                .get_mut(size..total)
-                .unwrap_or(&mut [])
-                .copy_from_slice(inner);
+            // As above: skip the relay rather than panic if it doesn't fit the
+            // reply scratchpad (e.g. relaying toward a smaller-MTU link).
+            if total <= reply.payload.len() {
+                reply.dst = next;
+                reply.protocol = ETH_P_BATMAN;
+                reply.payload[..size].copy_from_slice(updated_hdr.as_bytes());
+                reply.payload[size..total].copy_from_slice(inner);
+            } else {
+                trace!(
+                    total,
+                    reply_len = reply.payload.len(),
+                    "drop: multicast relay too large for reply buffer"
+                );
+            }
         }
 
         RoutingAction::Consumed // Route unknown, drop packet

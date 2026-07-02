@@ -6,6 +6,8 @@
 //! management-API listeners from the YAML config, then hands them to a
 //! [`Driver`] and runs it.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 mod tap;
 
 use std::path::{Path, PathBuf};

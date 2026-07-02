@@ -3,6 +3,9 @@ name = "batman"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 thiserror.workspace = true
 zerocopy = { version = "0.8", features = ["derive"] }

@@ -44,6 +44,10 @@ impl Keypair {
     /// Generate a fresh random keypair from OS entropy.  Host-only (the portal
     /// and `wayfinder-tap` enrollment); embedded nodes load a persisted seed.
     #[cfg(feature = "std")]
+    #[expect(
+        clippy::expect_used,
+        reason = "host-only keygen with no sane fallback if the OS RNG is broken; the caller (enrollment tooling) has no way to proceed without entropy anyway"
+    )]
     pub fn generate() -> Self {
         let mut seed = [0u8; 32];
         getrandom::getrandom(&mut seed).expect("OS RNG unavailable");

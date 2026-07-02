@@ -3,6 +3,9 @@ name = "wayfinder-driver"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [features]
 default = ["tokio"]
 # Enables the tokio-driven event loop, the concrete `tokio::net` frame

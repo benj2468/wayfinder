@@ -1,4 +1,5 @@
 #![cfg_attr(not(test), no_std)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 //! Hardware-agnostic framing for IEEE 802.15.4 mesh interfaces.
 //!

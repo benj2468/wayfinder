@@ -9,6 +9,8 @@
 //! The library surface exists so the renderers and the cert tooling can be unit-
 //! tested; `main.rs` is a thin `clap` front end over [`run`].
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod cert;
 pub mod output;
 

@@ -1,4 +1,5 @@
 #![cfg_attr(not(test), no_std)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use core::time::Duration;
 use embedded_io_async::{Read, Write};

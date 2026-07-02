@@ -4,6 +4,8 @@
 //! interval, presenting node info, the BATMAN routing table, and the
 //! link-quality table across three tabs.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use std::{net::SocketAddr, time::Duration, time::Instant};
 
 use clap::Parser;
@@ -127,6 +129,10 @@ async fn refresh(client: &mut Option<Client>, addr: SocketAddr, app: &mut App) {
         }
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "the branch above just set client to Some(_) whenever it was None"
+    )]
     let conn = client.as_mut().expect("client connected above");
 
     match fetch(conn, app).await {

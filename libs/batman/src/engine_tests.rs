@@ -255,6 +255,28 @@ mod ogm_processing {
         assert_eq!(forwarded_ogm.tq, 235); // Attenuated from 245 to 235
     }
 
+    /// A relay whose egress `reply` buffer is too small to hold even the fixed
+    /// OGM header must skip the re-flood, not panic — same reasoning as the
+    /// broadcast/unicast/mcast relay paths.
+    #[test]
+    fn test_ogm_reflood_skipped_when_reply_buffer_too_small() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        let ogm_payload = make_ogm(3, 2, 1, 245, 50);
+        let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm_payload);
+        let frame = parse_link_frame(&frame_bytes);
+
+        // Smaller than size_of::<BatmanOgmPacket>(), so even the fixed header
+        // doesn't fit.
+        let mut reply_buffer = [0u8; 1];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
+
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.protocol, 0); // not forwarded
+    }
+
     #[test]
     fn test_ogm_ttl_expiration() {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
@@ -530,6 +552,41 @@ mod unicast_forwarding {
         let (forwarded_unicast, _) = BatmanUnicastPacket::ref_from_prefix(reply.payload).unwrap();
         assert_eq!(forwarded_unicast.dest, mac(5)); // Destination unchanged
         assert_eq!(forwarded_unicast.ttl, 9); // TTL decremented from 10 to 9
+    }
+
+    /// A relay whose egress `reply` buffer is too small for the relayed
+    /// header + inner payload must drop the packet, not panic on the
+    /// `copy_from_slice` length mismatch.
+    #[test]
+    fn test_unicast_relay_skipped_when_reply_buffer_too_small() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        // Add a route to node 5 via node 2.
+        let ogm = make_ogm(5, 2, 1, 255, 50);
+        let frame_ogm = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
+        let mut big_buf = [0u8; 256];
+        let mut warmup_reply = LinkFrameDataMut::from(&mut big_buf[..]);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_ogm),
+            None,
+            &mut warmup_reply,
+        );
+
+        // Receive a unicast for node 5 with a non-empty inner payload, but give
+        // the relay only enough room for the header.
+        let unicast_payload = make_unicast(5, 10, b"payload");
+        let frame_bytes = make_link_frame(3, 1, ETH_P_BATMAN, unicast_payload);
+        let frame = parse_link_frame(&frame_bytes);
+
+        let header_size = core::mem::size_of::<BatmanUnicastPacket>();
+        let mut reply_buffer = vec![0u8; header_size];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
+
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.protocol, 0); // not forwarded
     }
 
     #[test]
@@ -843,6 +900,33 @@ mod broadcast_processing {
         // Inner frame preserved verbatim (reply buffer is over-sized, so only
         // the leading INNER.len() bytes are meaningful).
         assert_eq!(&rest[..INNER.len()], INNER);
+    }
+
+    /// A relay whose egress `reply` buffer is too small for the re-flooded
+    /// header + inner frame (e.g. a large frame received on a big-MTU link but
+    /// relayed toward a small-MTU one) must drop the re-flood, not panic. Local
+    /// delivery is unaffected since it reads the original `frame`, not `reply`.
+    #[test]
+    fn test_broadcast_reflood_skipped_when_reply_buffer_too_small() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        let payload = make_broadcast(2, 100, 50, INNER);
+        let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, payload);
+        let frame = parse_link_frame(&frame_bytes);
+
+        // Room for the fixed header only; no room for INNER.
+        let header_size = core::mem::size_of::<BatmanBroadcastPacket>();
+        let mut reply_buffer = vec![0u8; header_size];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
+
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
+
+        assert!(matches!(
+            action,
+            RoutingAction::DeliverLocalAndForward(dst) if dst == Mac::BROADCAST
+        ));
+        // Not re-flooded: the caller only forwards `reply` when protocol != 0.
+        assert_eq!(reply.protocol, 0);
     }
 
     /// A node must never act on its own re-flooded broadcast looping back.
@@ -1235,6 +1319,42 @@ mod mcast_packet {
         assert_eq!(fwd.dest, mac(5)); // final destination unchanged
         assert_eq!(fwd.ttl, 9); // decremented from 10
         assert_eq!(&rest[..b"group data".len()], b"group data");
+    }
+
+    /// A relay whose egress `reply` buffer is too small for the relayed
+    /// header + inner payload must drop the packet, not panic.
+    #[test]
+    fn mcast_relay_skipped_when_reply_buffer_too_small() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        // Learn a route to node 5 via node 2.
+        let ogm = make_ogm(5, 2, 1, 255, 50);
+        let frame_ogm = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
+        let mut big_buf = [0u8; 256];
+        let mut warmup_reply = LinkFrameDataMut::from(&mut big_buf[..]);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_ogm),
+            None,
+            &mut warmup_reply,
+        );
+
+        let payload = make_mcast(5, 10, b"group data");
+        let frame_bytes = make_link_frame(3, 1, ETH_P_BATMAN, payload);
+
+        let header_size = core::mem::size_of::<BatmanMcastPacket>();
+        let mut reply_buffer = vec![0u8; header_size];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
+
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            None,
+            &mut reply,
+        );
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.protocol, 0); // not forwarded
     }
 }
 

@@ -3,6 +3,9 @@ name = "wayfinder-server"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [features]
 default = ["std"]
 # Enables the tokio-net transport listeners and the query channel that bridges

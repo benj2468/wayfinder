@@ -1,6 +1,8 @@
 //! Renderers produce the expected human text and JSON (the latter via the
 //! `serde::Serialize` derived on the proto types behind the `serde` feature).
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use wayfinder_protos::wayfinder_v1alpha::{NeighborPath, NodeInfo, RoutingEntry, RoutingTable};
 use wayfinderctl::output::{self, OutputFormat};
 

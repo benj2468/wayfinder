@@ -1,4 +1,5 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 //! Cryptographic identity and mesh membership for Wayfinder.
 //!

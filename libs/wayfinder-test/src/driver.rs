@@ -108,7 +108,12 @@ impl TestHarness {
         }
         let mut frames = 0;
         for switch in self.switches.values_mut() {
-            frames += switch.tick().await.unwrap();
+            #[expect(
+                clippy::expect_used,
+                reason = "the simulated Switch::tick has no failure mode reachable from this harness"
+            )]
+            let tick_frames = switch.tick().await.expect("switch tick should not fail");
+            frames += tick_frames;
         }
         frames
     }
@@ -229,11 +234,15 @@ impl TestHarness {
     }
 
     pub fn get_machine(&self, name: &str) -> &TestRouter {
-        self.machines.get(name).unwrap()
+        self.machines
+            .get(name)
+            .unwrap_or_else(|| panic!("unknown machine '{name}' (never built or disconnected)"))
     }
 
     pub fn get_machine_mut(&mut self, name: &str) -> &mut TestRouter {
-        self.machines.get_mut(name).unwrap()
+        self.machines
+            .get_mut(name)
+            .unwrap_or_else(|| panic!("unknown machine '{name}' (never built or disconnected)"))
     }
 
     /// Take a machine offline: drop its router so it stops originating and
@@ -285,6 +294,10 @@ impl TestHarness {
     /// duplex and the [`PortId`] the switch assigned it (so the link can later
     /// have its loss tuned to model the wire going up or down).
     pub fn add_switch_port(&mut self, switch_name: &str) -> (PortComms, PortId) {
+        #[expect(
+            clippy::expect_used,
+            reason = "callers only ever pass a switch_name this harness itself created"
+        )]
         let switch = self
             .switches
             .get_mut(switch_name)
@@ -292,9 +305,13 @@ impl TestHarness {
 
         let (router_comms, switch_comms) = PortComms::pair(10);
 
+        #[expect(
+            clippy::expect_used,
+            reason = "the simulated Switch has no port-capacity limit reachable from this harness"
+        )]
         let port = switch
             .add_port(switch_comms, PortConfig::no_loss())
-            .unwrap();
+            .expect("switch has room for another port");
 
         (router_comms, port)
     }
@@ -345,11 +362,17 @@ impl TestHarness {
             .get(iface)
             .unwrap_or_else(|| panic!("machine '{name}' has no interface {iface}"))
             .clone();
-        self.switches
-            .get_mut(&switch_name)
-            .expect("switch backing the link is missing")
-            .update_port(port, PortConfig::new(outgoing, incoming))
-            .expect("link port is missing from its switch");
+        #[expect(
+            clippy::expect_used,
+            reason = "switch_name/port came from self.links, which this harness keeps in sync with the switches it created"
+        )]
+        {
+            self.switches
+                .get_mut(&switch_name)
+                .expect("switch backing the link is missing")
+                .update_port(port, PortConfig::new(outgoing, incoming))
+                .expect("link port is missing from its switch");
+        }
     }
 }
 

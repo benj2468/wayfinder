@@ -1,4 +1,5 @@
 #![cfg_attr(not(test), no_std)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 //! [`LinkT`] adapter for the nRF52840's built-in IEEE 802.15.4 radio
 //! (`embassy_nrf::radio::ieee802154::Radio`).
