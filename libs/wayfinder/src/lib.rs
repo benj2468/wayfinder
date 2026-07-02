@@ -1,3 +1,13 @@
+//! Central router orchestration for the wayfinder mesh.
+//!
+//! [`CentralRouter`] wraps the [`batman`] routing engine with an ident table, a
+//! per-(neighbor, interface) link-quality table, opt-in OGM authentication
+//! ([`auth`]), and the observability counters and estimators surfaced through
+//! the management API. It is the single object driven by both an embedded node
+//! and the host driver: it demuxes received frames by protocol, paces periodic
+//! OGM emission, and plans unicast, multicast, and broadcast egress. The mesh
+//! interface it speaks to is the [`link::LinkT`] trait. The crate is `no_std`
+//! (host-only helpers are gated behind the `std`/`alloc` features).
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -32,6 +42,8 @@ use crate::{
 
 pub use crate::link_quality::LinkQualityRecord;
 
+/// Per-link Trickle configuration ([`config::LinkConfig`]) so links with
+/// different speeds back off OGM emission on independent schedules.
 #[cfg(feature = "alloc")]
 pub mod config;
 
@@ -41,6 +53,8 @@ pub mod link;
 mod link_quality;
 mod routing_table;
 
+/// EtherType demuxed to the BATMAN engine by
+/// [`handle_frame_with_metrics`](CentralRouter::handle_frame_with_metrics).
 pub const DEFAULT_BATMAN_ETHER_TYPE: u16 = 0x4305;
 
 /// Maximum number of interested listeners for which a multicast frame is sent
@@ -254,6 +268,11 @@ impl RxOutcome<'_, '_> {
     }
 }
 
+/// The central mesh router: it wraps the [`BatmanEngine`] with an ident table,
+/// a per-(neighbor, interface) link-quality table, opt-in OGM authentication,
+/// and the observability counters/estimators. It demuxes received frames by
+/// protocol, drives periodic OGM emission, and plans unicast/multicast/broadcast
+/// egress — the single object both the embedded node and the host driver own.
 pub struct CentralRouter {
     /// The Batman routing engine for this router.  Its originator capacity is
     /// [`ORIGINATOR_CAPACITY`] — a power of two, as the `heapless` map requires.
@@ -287,6 +306,9 @@ pub struct CentralRouter {
 }
 
 impl CentralRouter {
+    /// Create a router for the node with address `self_ident`, with an empty
+    /// routing engine, link-quality table, rate estimators, and authentication
+    /// disabled.
     pub fn new(self_ident: Mac) -> Self {
         Self {
             batman: BatmanEngine::new(self_ident),
@@ -642,6 +664,9 @@ impl CentralRouter {
         })
     }
 
+    /// Drive periodic router maintenance at time `now`, returning a
+    /// Trickle-paced OGM broadcast to emit (built into `tx_buf`) when one is
+    /// due, or `None` otherwise.  Called each tick of the executor loop.
     #[tracing::instrument(skip_all, level = "info")]
     pub fn poll<'tx>(
         &mut self,
@@ -809,6 +834,7 @@ impl CentralRouter {
             .map(EgressInterface::Interface)
     }
 
+    /// This node's own mesh address.
     pub fn self_ident(&self) -> Mac {
         self.batman.self_ident
     }

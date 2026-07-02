@@ -10,6 +10,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::Direction;
 
+/// Per-port link-loss configuration for a simulated [`Switch`] port.
 pub struct PortConfig {
     // TODO: will support vlans
     /// Probability `[0.0, 1.0]` of dropping a frame on the switch→node egress
@@ -41,15 +42,21 @@ impl PortConfig {
     }
 }
 
+/// Opaque identifier for a port on a [`Switch`].
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct PortId(u32);
 
+/// The two channel endpoints a node uses to talk to a switch port: an `egress`
+/// sender (node → switch) and an `ingress` receiver (switch → node).
 pub struct PortComms {
+    /// Sender the node writes outgoing frames into (node → switch).
     pub egress: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Receiver the node reads incoming frames from (switch → node).
     pub ingress: tokio::sync::mpsc::Receiver<Vec<u8>>,
 }
 
 impl PortComms {
+    /// Pair an egress sender with an ingress receiver into one endpoint.
     pub fn new(
         egress: tokio::sync::mpsc::Sender<Vec<u8>>,
         ingress: tokio::sync::mpsc::Receiver<Vec<u8>>,
@@ -57,6 +64,8 @@ impl PortComms {
         Self { egress, ingress }
     }
 
+    /// Create a connected pair of endpoints (one for each side) backed by two
+    /// `buf`-capacity channels — the switch keeps one, the node the other.
     pub fn pair(buf: usize) -> (Self, Self) {
         let (tx1, rx1) = tokio::sync::mpsc::channel(buf);
         let (tx2, rx2) = tokio::sync::mpsc::channel(buf);
@@ -64,11 +73,15 @@ impl PortComms {
     }
 }
 
+/// A single port on a [`Switch`]: its loss configuration plus the channel
+/// endpoints connecting it to the attached node.
 pub struct Port {
     config: PortConfig,
     duplex: PortComms,
 }
 
+/// A registered monitoring tap: a callback invoked on every frame crossing a
+/// port, able to inspect (and mutate) the bytes and to unregister itself.
 pub struct TapConfig {
     /// If the tap config returns true it continues to monitor, if false, it stops monitoring
     clb: Box<dyn FnMut(TapMeta<'_>) -> bool>,
@@ -77,6 +90,8 @@ pub struct TapConfig {
 }
 
 impl TapConfig {
+    /// Register a tap driven by `clb`, called for each frame on the tapped port;
+    /// returning `false` removes the tap.
     pub fn new<F>(clb: F) -> Self
     where
         F: FnMut(TapMeta<'_>) -> bool + 'static,
@@ -88,23 +103,35 @@ impl TapConfig {
     }
 }
 
+/// The context handed to a [`TapConfig`] callback for one observed frame.
 pub struct TapMeta<'a> {
+    /// The port the frame is crossing.
     pub id: PortId,
+    /// Which direction the frame is travelling.
     pub direction: Direction,
+    /// The frame's bytes, which the tap may inspect or mutate in place.
     pub data: &'a mut [u8],
 }
 
+/// Opaque identifier for a registered tap.
 #[expect(dead_code)]
 pub struct TapId(u32);
 
+/// An error from a [`Switch`] operation.
 #[derive(Error, Debug)]
 pub enum SwitchError {
+    /// No port exists for the given [`PortId`] or identifier.
     #[error("port not found")]
     InvalidPort,
+    /// A non-blocking receive on a port's channel failed.
     #[error(transparent)]
     TryRecvError(#[from] TryRecvError),
 }
 
+/// An in-process Ethernet-like switch simulator that fans frames out between
+/// connected node ports, keyed by mesh [`Ident`](MeshIdentifier), with optional
+/// per-port loss and monitoring taps. Used to wire several routers into a
+/// topology for integration tests without any hardware.
 pub struct Switch<Ident> {
     // Name of the switch
     name: String,
@@ -131,6 +158,8 @@ impl<Ident> Switch<Ident>
 where
     Ident: MeshIdentifier + std::fmt::Debug,
 {
+    /// Create an empty, unnamed switch with no ports and a fixed-seed RNG (so
+    /// loss decisions are deterministic across test runs).
     pub fn new() -> Self {
         Self {
             name: String::new(),
@@ -140,9 +169,11 @@ where
             rng: StdRng::from_seed([0; 32]),
         }
     }
+    /// This switch's name (empty unless created via [`new_with_name`](Self::new_with_name)).
     pub fn name(&self) -> &str {
         &self.name
     }
+    /// Create an empty switch with the given `name`.
     pub fn new_with_name(name: String) -> Self {
         Self {
             name,

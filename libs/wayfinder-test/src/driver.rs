@@ -9,20 +9,29 @@ use crate::{
     test_router::TestRouter,
 };
 
+/// Declarative description of a whole test topology: the switches to create and
+/// the machines to attach to them.
 #[derive(Serialize, Deserialize, Default)]
 pub struct TestConfig {
+    /// The switches (shared media) to instantiate.
     pub switches: Vec<TestSwitchConfig>,
+    /// The mesh nodes to instantiate and wire onto the switches.
     pub machines: Vec<TestMachineConfig>,
 }
 
+/// Config for one switch in a [`TestConfig`].
 #[derive(Serialize, Deserialize)]
 pub struct TestSwitchConfig {
+    /// The switch's name, referenced by machines' link transports.
     pub name: String,
 }
 
+/// Config for one mesh node in a [`TestConfig`].
 #[derive(Serialize, Deserialize)]
 pub struct TestMachineConfig {
+    /// The machine's name, used as its handle in the [`TestHarness`].
     pub name: String,
+    /// The node's wayfinder configuration (identity, links, auth).
     pub wayfinder: wayfinder::config::Config,
 }
 
@@ -44,9 +53,14 @@ struct MachineSpec {
     trickle: Vec<TrickleConfig>,
 }
 
+/// A running multi-node mesh built from a [`TestConfig`]: the switches, the
+/// nodes wired onto them, and a virtual clock the test advances by hand. The
+/// entry point for integration tests that need more than one router.
 #[derive(Default)]
 pub struct TestHarness {
+    /// The switches (shared media) in the topology, keyed by name.
     pub switches: HashMap<String, Switch<Mac>>,
+    /// The mesh nodes in the topology, keyed by machine name.
     pub machines: HashMap<String, TestRouter>,
     /// Virtual clock driving the mesh.  [`poll`](Self::poll) sets it to the
     /// instant it is given, and [`tick`](Self::tick) stamps that same instant on
@@ -63,6 +77,7 @@ pub struct TestHarness {
 }
 
 impl TestHarness {
+    /// Create an empty harness with no switches, machines, or elapsed clock.
     pub fn new() -> Self {
         Self::default()
     }
@@ -233,12 +248,16 @@ impl TestHarness {
         min_full
     }
 
+    /// Borrow the router for machine `name`, panicking if no such machine is
+    /// currently connected.
     pub fn get_machine(&self, name: &str) -> &TestRouter {
         self.machines
             .get(name)
             .unwrap_or_else(|| panic!("unknown machine '{name}' (never built or disconnected)"))
     }
 
+    /// Mutably borrow the router for machine `name`, panicking if no such
+    /// machine is currently connected.
     pub fn get_machine_mut(&mut self, name: &str) -> &mut TestRouter {
         self.machines
             .get_mut(name)
@@ -376,11 +395,15 @@ impl TestHarness {
     }
 }
 
+/// Build a [`Mac`] from a single compact byte, `00:00:00:00:00:n` — the address
+/// helper used throughout the mesh integration tests.
 pub fn mac(n: u8) -> Mac {
     Mac([0, 0, 0, 0, 0, n])
 }
 
 impl TestConfig {
+    /// Validate this config and assemble it into a [`TestHarness`], erroring on
+    /// duplicate switch names or machines referencing an unknown switch.
     pub fn validate(&self) -> Result<TestHarness, String> {
         let mut h = TestHarness::default();
         for switch in &self.switches {

@@ -1,15 +1,21 @@
 use thiserror::Error;
 
+/// An error raised by a mesh link while transmitting or receiving a frame.
 #[derive(Error, Debug)]
 pub enum LinkError {
+    /// A lower-level I/O operation on the link failed.
     #[error("IO error")]
     Io,
+    /// The frame could not be transmitted onto the medium.
     #[error("transmit failed")]
     TransmitFailed,
+    /// A frame could not be received from the medium.
     #[error("receive failed")]
     ReceiveFailed,
+    /// The supplied buffer was too small to hold the frame.
     #[error("buffer full")]
     BufferFull,
+    /// The received bytes did not parse as a valid frame.
     #[error("invalid packet")]
     InvalidPacket,
 }

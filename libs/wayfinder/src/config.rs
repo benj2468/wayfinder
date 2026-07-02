@@ -86,7 +86,10 @@ pub enum LinkTransport {
         ethertype: u16,
     },
     /// Test Link, used for testing only, will fail validation in real mode
-    Test { switch_name: String },
+    Test {
+        /// Name of the in-process test `Switch` this link attaches to.
+        switch_name: String,
+    },
 }
 
 /// A single mesh interface: its transport carrier plus the per-link OGM backoff
@@ -202,6 +205,7 @@ pub const TAP_ENCAP_OVERHEAD: usize = 14 + 14 + 9 + 24 + 28;
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
 pub enum LocalDistributionMechanism {
+    /// Bridge the mesh onto a host TAP device (see [`TapConfig`]).
     Tap(TapConfig),
 }
 

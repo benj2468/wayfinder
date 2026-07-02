@@ -1,3 +1,10 @@
+//! A `no_std` async driver for the REYAX RYLR998/RYLR498 LoRa modules.
+//!
+//! [`RylrClient`] wraps the module's AT-command interface over any
+//! [`embedded_io_async`] serial port — configuring the radio, sending data, and
+//! receiving packets with RSSI/SNR. With the `link` feature it also exposes a
+//! `LinkT` mesh-interface adapter that treats LoRa as a shared broadcast medium
+//! (the mesh filters on the embedded [`Mac`](interfaces::frame::Mac)).
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -7,16 +14,22 @@ use heapless::String;
 use thiserror::Error;
 use tracing::trace;
 
+/// An error from the RYLR module driver.
 #[derive(Error, Debug)]
 pub enum LoraError {
+    /// A read or write on the underlying serial port failed.
     #[error("IO error")]
     Io,
+    /// The module replied with a `+ERR=<code>` response; carries the code.
     #[error("Module returned error code: {0}")]
     ModuleError(i32),
+    /// A module response could not be parsed into the expected form.
     #[error("Response format was invalid or unparseable")]
     InvalidResponse,
+    /// The payload exceeds the module's maximum transmit size.
     #[error("Request too large")]
     RequestTooLarge,
+    /// No response arrived within the command's timeout.
     #[error("Operation timed out waiting for module response")]
     Timeout,
 }
@@ -24,29 +37,43 @@ pub enum LoraError {
 /// Supported Spreading Factor configurations.
 #[derive(Debug, Clone, Copy)]
 pub enum SpreadingFactory {
+    /// Spreading factor 5 (fastest, shortest range).
     Sf5 = 5,
+    /// Spreading factor 6.
     Sf6 = 6,
+    /// Spreading factor 7.
     Sf7 = 7,
+    /// Spreading factor 8.
     Sf8 = 8,
+    /// Spreading factor 9.
     Sf9 = 9,
+    /// Spreading factor 10.
     Sf10 = 10,
+    /// Spreading factor 11 (slowest, longest range).
     Sf11 = 11,
 }
 
 /// Supported RF bandwidth configurations.
 #[derive(Debug, Clone, Copy)]
 pub enum Bandwidth {
+    /// 125 kHz channel bandwidth.
     Khz125 = 7,
+    /// 250 kHz channel bandwidth.
     Khz250 = 8,
+    /// 500 kHz channel bandwidth.
     Khz500 = 9,
 }
 
 /// Supported Coding Rate configurations.
 #[derive(Debug, Clone, Copy)]
 pub enum CodingRate {
+    /// Coding rate 4/5.
     Cr45 = 45,
+    /// Coding rate 4/6.
     Cr46 = 46,
+    /// Coding rate 4/7.
     Cr47 = 47,
+    /// Coding rate 4/8.
     Cr48 = 48,
 }
 
@@ -54,8 +81,11 @@ pub enum CodingRate {
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum WirelessMode {
+    /// Normal transmit/receive operation.
     Transceiver = 0,
+    /// Low-power sleep; the module wakes on serial activity.
     Sleep = 1,
+    /// Smart receiving power-saving mode.
     SmartReceiving = 2,
 }
 
@@ -63,18 +93,26 @@ pub enum WirelessMode {
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum EmcCertificationMode {
+    /// EMC test mode disabled (normal operation).
     Off = 0,
+    /// Emit an unmodulated carrier for EMC certification testing.
     UnModulated = 1,
+    /// Emit a modulated carrier for EMC certification testing.
     Modulated = 2,
 }
 
 /// Data structure representing asynchronously received packet data via +RCV.
 #[derive(Debug, Clone)]
 pub struct ReceivedPacket {
+    /// Source module address the packet was sent from.
     pub address: u16,
+    /// Length of the payload in bytes.
     pub length: usize,
+    /// Payload bytes as received (module delivers ASCII/UTF-8 text).
     pub data: String<240>,
+    /// Received signal strength indicator, in dBm.
     pub rssi: i32,
+    /// Signal-to-noise ratio, in dB.
     pub snr: i32,
 }
 

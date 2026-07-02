@@ -1,9 +1,12 @@
 use interfaces::frame::Mac;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+/// EtherType identifying BATMAN frames on the wire (batman-adv's `ETH_P_BATMAN`).
 pub const ETH_P_BATMAN: u16 = 0x4305;
 
 // Core BATMAN packet identifiers
+/// `packet_type` for an originator message (OGM), the topology-discovery
+/// broadcast — batman-adv's `BATADV_IV_OGM`.
 pub const BATADV_IV_OGM: u8 = 0x01;
 
 /// Originator Message header, laid out to match batman-adv's
@@ -204,6 +207,8 @@ pub struct BatmanBroadcastPacket {
     pub orig: Mac,
 }
 
+/// `packet_type` for a unicast data packet routed hop-by-hop toward a single
+/// destination node — batman-adv's `BATADV_UNICAST`.
 pub const BATADV_UNICAST: u8 = 0x03;
 
 /// Packet sub-type for a selectively-forwarded multicast frame, mirroring
@@ -231,13 +236,20 @@ pub struct BatmanMcastPacket {
     pub dest: Mac,
 }
 
+/// Header for a [`BATADV_UNICAST`] data packet.  The encapsulated payload
+/// follows it and the packet is routed hop by hop toward `dest`, TTL-limited to
+/// prevent loops, and delivered to the local host on arrival at `dest`.
 #[derive(Debug, Clone, Copy, IntoBytes, FromBytes, Immutable, KnownLayout)]
 #[repr(C, packed)]
 pub struct BatmanUnicastPacket {
-    pub packet_type: u8, // Always BATADV_UNICAST
-    pub version: u8,     // Protocol version
-    pub ttl: u8,         // Time-to-live to prevent routing loops for data
-    pub dest: Mac,       // The FINAL destination node address in the mesh
+    /// Always [`BATADV_UNICAST`].
+    pub packet_type: u8,
+    /// Protocol version.
+    pub version: u8,
+    /// Time-to-live, decremented per hop to prevent routing loops for data.
+    pub ttl: u8,
+    /// The final destination node address in the mesh.
+    pub dest: Mac,
 }
 
 #[cfg(test)]

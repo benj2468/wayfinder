@@ -1,3 +1,5 @@
+//! Example: exercise [`RylrClient`](rylr998::RylrClient) against an in-process
+//! AT-command simulator, with no hardware attached.
 use std::time::Duration;
 
 use anyhow::bail;
