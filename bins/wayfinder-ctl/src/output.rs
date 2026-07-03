@@ -50,9 +50,10 @@ pub fn format_mac(bytes: &[u8]) -> String {
 pub fn node_info(v: &NodeInfo, fmt: OutputFormat) -> anyhow::Result<String> {
     render(v, fmt, |v| {
         format!(
-            "node {}\noriginators: {}",
+            "node {}\noriginators: {}\nlocked: {}",
             format_mac(&v.node_id),
-            v.num_originators
+            v.num_originators,
+            if v.auth_locked { "yes" } else { "no" }
         )
     })
 }

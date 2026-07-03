@@ -40,6 +40,9 @@ impl WayfinderDataProvider for ProviderMock {
     fn num_originators(&self) -> u32 {
         0
     }
+    fn auth_locked(&self) -> bool {
+        false
+    }
     fn routing_table(&self) -> Vec<RoutingEntryData> {
         vec![]
     }

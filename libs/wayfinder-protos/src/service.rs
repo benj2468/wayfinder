@@ -199,6 +199,9 @@ pub trait WayfinderDataProvider {
     fn node_id(&self) -> Vec<u8>;
     /// Number of originators (reachable nodes) currently in the routing table.
     fn num_originators(&self) -> u32;
+    /// Whether this node requires authentication but has no membership cert
+    /// installed yet (inert on the mesh until provisioned).
+    fn auth_locked(&self) -> bool;
     /// Snapshot of the routing table: one entry per known destination.
     fn routing_table(&self) -> Vec<RoutingEntryData>;
     /// Snapshot of the per-(neighbor, interface) link-quality table.
@@ -362,6 +365,7 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
             Some(RequestKind::GetNodeInfo(_)) => ResponseKind::NodeInfo(NodeInfo {
                 node_id: self.provider.node_id(),
                 num_originators: self.provider.num_originators(),
+                auth_locked: self.provider.auth_locked(),
             }),
 
             Some(RequestKind::GetRoutingTable(_)) => {
@@ -642,6 +646,9 @@ mod tests {
         }
         fn num_originators(&self) -> u32 {
             0
+        }
+        fn auth_locked(&self) -> bool {
+            false
         }
         fn routing_table(&self) -> Vec<RoutingEntryData> {
             vec![]

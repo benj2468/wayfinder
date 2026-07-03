@@ -127,13 +127,22 @@ fn render_tabs(frame: &mut Frame, app: &App, area: Rect) {
 fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
-    let (node_id, num_orig) = match &app.snapshot.node_info {
-        Some(info) => (format_id(&info.node_id), info.num_originators.to_string()),
-        None => ("(waiting for data)".to_string(), "—".to_string()),
+    let (node_id, num_orig, locked) = match &app.snapshot.node_info {
+        Some(info) => (
+            format_id(&info.node_id),
+            info.num_originators.to_string(),
+            if info.auth_locked { "yes" } else { "no" }.to_string(),
+        ),
+        None => (
+            "(waiting for data)".to_string(),
+            "—".to_string(),
+            "—".to_string(),
+        ),
     };
 
     lines.push(field("Node ID", &node_id));
     lines.push(field("Originators", &num_orig));
+    lines.push(field("Locked", &locked));
     lines.push(field(
         "Routing entries",
         &app.snapshot.routing.entries.len().to_string(),
