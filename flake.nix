@@ -8,6 +8,8 @@
 
     fenix.url = "github:nix-community/fenix";
 
+    crane.url = "github:ipetkov/crane";
+
     git-hooks.url = "github:cachix/git-hooks.nix";
   };
 
@@ -18,6 +20,15 @@
       fenix,
       ...
     }:
+    let
+      overlay = final: prev: {
+        inherit (prev.callPackage ./nix { src = prev.lib.cleanSource ./.; })
+          wayfinder-tap
+          wayfinder-tui
+          wayfinder-ctl
+          ;
+      };
+    in
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = nixpkgs.lib.systems.flakeExposed;
 
@@ -25,6 +36,13 @@
         inputs.treefmt-nix.flakeModule
         inputs.git-hooks.flakeModule
       ];
+
+      flake = {
+
+        overlays.default = overlay;
+
+        nixosModules.default = ./nix/modules/wayfinder-tap.nix;
+      };
 
       perSystem =
         {
@@ -49,6 +67,18 @@
           # both the default dev shell and the lightweight `pytest` shell that
           # CI runs — see tests/README.md and .gitlab-ci.yml.
           pytestEnv = pkgs.python3.withPackages (ps: with ps; [ pytest ]);
+
+          testPkgs = import nixpkgs {
+            inherit system;
+            overlays = [
+              overlay
+              (_final: prev: {
+                craneLib = inputs.crane.mkLib prev;
+              })
+
+            ];
+          };
+
         in
         {
           _module.args.pkgs = import inputs.nixpkgs {
@@ -104,6 +134,11 @@
 
           pre-commit = {
             check.enable = true;
+          };
+
+          packages = {
+            inherit (testPkgs) wayfinder-tap wayfinder-tui wayfinder-ctl;
+            wayfinder-simple = testPkgs.callPackage ./nix/tests/simple.nix { };
           };
 
           treefmt = {

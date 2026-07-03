@@ -34,3 +34,8 @@ __pycache__
 
 # Git worktrees
 .worktree
+.claude/worktrees
+
+# nix
+result
+.nixos-test-history
