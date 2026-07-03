@@ -19,6 +19,8 @@ Usage
     python sim/topology.py print              # print the generated compose YAML
     python sim/topology.py write [PATH]       # write it (default: docker-compose.yml)
     python sim/topology.py up [-- ARGS...]    # generate ephemeral file + compose up --build -d
+        (add --require-approval so the provider parks CSRs for operator approval
+        instead of auto-signing; also accepted by `print`/`write`)
     python sim/topology.py restart [NODE...]  # re-run the entrypoint (pick up a host rebuild)
     python sim/topology.py down               # tear the ephemeral stack down
     python sim/topology.py logs [NODE...]     # follow logs
@@ -206,8 +208,14 @@ def build_nodes(links: list[list[str]]) -> dict[str, dict]:
     return nodes
 
 
-def render_compose() -> str:
-    """Render the full docker-compose YAML for the current topology."""
+def render_compose(require_approval: bool = False) -> str:
+    """Render the full docker-compose YAML for the current topology.
+
+    When ``require_approval`` is set, the provider node parks incoming CSRs as
+    pending until an operator approves them (``wayfinderctl csr approve`` / the
+    TUI Security tab) instead of auto-signing on submission — so member nodes
+    won't self-enrol in the background.
+    """
     ca_dir = make_ca()
     links = dedup_links(build_links())
     nodes = build_nodes(links)
@@ -286,6 +294,8 @@ def render_compose() -> str:
         e(f"      RUST_LOG: {cfg['rust_log']}")
         if is_provider:
             e('      PROVIDER: "1"')
+            # Gate enrolment on operator approval instead of auto-signing.
+            e(f'      REQUIRE_APPROVAL: "{str(require_approval).lower()}"')
         else:
             e(f"      PROVIDER_ADDR: {provider_mgmt_ip}:7700")
         for key, value in cfg["env"].items():
@@ -319,7 +329,7 @@ def render_compose() -> str:
 
 def compose(*args: str) -> int:
     """Run ``docker compose`` against the ephemeral file + fixed project name."""
-    cmd = ["docker", "compose", "-p", PROJECT, "-f", str(EPHEMERAL), *args]
+    cmd = ["docker", "compose", "--verbose", "-p", PROJECT, "-f", str(EPHEMERAL), *args]
     print("+ " + " ".join(cmd), file=sys.stderr)
     return subprocess.call(cmd)
 
@@ -341,8 +351,8 @@ def nix_fmt(path: Path) -> None:
         print(f"warning: `nix fmt {path.name}` skipped ({exc})", file=sys.stderr)
 
 
-def write_compose(path: Path) -> None:
-    path.write_text(render_compose())
+def write_compose(path: Path, require_approval: bool = False) -> None:
+    path.write_text(render_compose(require_approval))
     nix_fmt(path)
     print(f"wrote {path}", file=sys.stderr)
 
@@ -423,14 +433,27 @@ def main(argv: list[str]) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("print", help="print the generated compose YAML to stdout")
+
+    # Shared flag: gate enrolment on operator approval rather than auto-signing.
+    def add_require_approval(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--require-approval",
+            action="store_true",
+            help="provider parks CSRs as pending until an operator approves them "
+            "(`wayfinderctl csr approve` / TUI Security tab) instead of auto-signing",
+        )
+
+    p = sub.add_parser("print", help="print the generated compose YAML to stdout")
+    add_require_approval(p)
     sub.add_parser("graph", help="print an ASCII adjacency summary of the topology")
     w = sub.add_parser("write", help="write the compose YAML to a path")
     w.add_argument("path", nargs="?", default=str(REPO_ROOT / "docker-compose.yml"))
+    add_require_approval(w)
     up = sub.add_parser(
         "up", help="generate the ephemeral file and `docker compose up --build -d`"
     )
     up.add_argument("extra", nargs="*", help="extra args passed to `docker compose up`")
+    add_require_approval(up)
     sub.add_parser(
         "down", help="`docker compose down` the ephemeral stack (removes networks)"
     )
@@ -485,16 +508,16 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     if args.cmd == "print":
-        print(render_compose(), end="")
+        print(render_compose(args.require_approval), end="")
         return 0
     if args.cmd == "graph":
         cmd_graph()
         return 0
     if args.cmd == "write":
-        write_compose(Path(args.path))
+        write_compose(Path(args.path), args.require_approval)
         return 0
     if args.cmd == "up":
-        write_compose(EPHEMERAL)
+        write_compose(EPHEMERAL, args.require_approval)
         return compose("up", "--build", "-d", *args.extra)
     if args.cmd == "down":
         if not EPHEMERAL.exists():

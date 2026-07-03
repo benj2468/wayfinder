@@ -250,20 +250,26 @@ impl MeshAuthority for CertAuthority {
         let ed = fixed::<32>(ed_pubkey, "ed_pubkey")?;
         let x = fixed::<32>(x_pubkey, "x_pubkey")?;
 
-        // A MAC that already holds a still-valid, non-revoked certificate cannot
-        // be re-enrolled under a *different* identity: minting a second live cert
-        // for one MAC would let a new key impersonate the holder.  This guard is
-        // keyed off `issued`, not `held`, so it outlives the held-CSR entry (which
-        // is evicted at `pending_ttl`) — a previously-issued MAC stays protected
-        // until its certificate passively expires, which is the point at which
-        // re-keying it is actually safe.  The holder's own re-enrollment (same ed
-        // key) passes through.
-        if self.issued.iter().any(|c| {
-            c.node_mac == mac.0 && !c.revoked && c.ed_pubkey != ed && self.now_unix <= c.not_after
-        }) {
-            return Ok(CsrOutcome::Rejected(
-                "this MAC already has a valid certificate under a different key".to_string(),
-            ));
+        // A MAC that already holds a still-valid, non-revoked certificate is handled off
+        // `issued` (not `held`, which is evicted at pending_ttl) so protection outlives the
+        // held entry: the holder's own re-enrolment under the same ed key is re-issued
+        // immediately (never re-parked for approval again — a duplicate MAC must not create
+        // another held entry), while a *different* key claiming that MAC is rejected (a
+        // second live cert for one MAC would let a new key impersonate the holder). The MAC
+        // stays protected until its cert passively expires, the point at which re-keying is safe.
+        if let Some(same_key) = self
+            .issued
+            .iter()
+            .find(|c| c.node_mac == mac.0 && !c.revoked && self.now_unix <= c.not_after)
+            .map(|c| c.ed_pubkey == ed)
+        {
+            return Ok(if same_key {
+                CsrOutcome::Issued(self.issue(mac, ed, x))
+            } else {
+                CsrOutcome::Rejected(
+                    "this MAC already has a valid certificate under a different key".to_string(),
+                )
+            });
         }
 
         // Open enrollment (no approval gate): sign immediately.
@@ -678,6 +684,144 @@ mod tests {
             ca.submit_csr(&mac, &ed2, &x2, "").unwrap(),
             CsrOutcome::Pending
         ));
+    }
+
+    #[test]
+    fn same_key_resubmit_after_held_entry_eviction_reissues_without_reparking() {
+        // Mirrors `an_issued_mac_stays_protected_after_its_held_entry_is_evicted`
+        // but the *same* identity re-submits after its held (Approved) entry ages
+        // out.  This is the legitimate case: the holder should be handed a fresh
+        // certificate immediately, not parked as Pending a second time (which
+        // would force it through operator approval again for a MAC it already
+        // holds).
+        let cfg = ProviderConfig {
+            root_seed_path: String::new(),
+            mesh_id: 0xABCD,
+            cert_ttl_secs: 100_000,
+            enrollment_token: None,
+            require_approval: true,
+            pending_ttl_secs: 10,
+        };
+        let mut ca = CertAuthority::from_config(&[1; 32], &cfg);
+        ca.set_now_unix(100);
+        let (ed, x) = node_keys(2);
+        let mac = [0, 0, 0, 0, 0, 9];
+
+        ca.submit_csr(&mac, &ed, &x, "").unwrap();
+        ca.approve_csr(&mac).unwrap();
+
+        // Age past the pending TTL: the held Approved entry is now stale (it is
+        // physically evicted on the next call that touches the store, below).
+        ca.set_now_unix(100 + 20);
+
+        // The holder re-submits with its own (unchanged) key: it must be
+        // reissued immediately, and must NOT create a new held/Pending entry.
+        assert!(matches!(
+            ca.submit_csr(&mac, &ed, &x, "").unwrap(),
+            CsrOutcome::Issued(_)
+        ));
+        assert!(
+            ca.held.is_empty(),
+            "a same-key re-submit must not re-park a held entry"
+        );
+        assert!(ca.list_pending().is_empty());
+    }
+
+    #[test]
+    fn revoked_same_key_resubmit_is_not_reissued() {
+        // Proves the `!c.revoked` term in the same-key shortcut is load-bearing:
+        // a revoked holder must go back through approval, not be silently
+        // re-issued a fresh certificate on the same key.
+        //
+        // A short `pending_ttl_secs` (with a long `cert_ttl_secs`) is used so the
+        // held (Approved) entry ages out of `held` before we revoke — otherwise
+        // the still-live held entry would short-circuit the request on its own
+        // cached `Approved` status, without ever consulting `issued`/`revoked`
+        // at all, and the test wouldn't isolate the term under test.
+        let cfg = ProviderConfig {
+            root_seed_path: String::new(),
+            mesh_id: 0xABCD,
+            cert_ttl_secs: 100_000,
+            enrollment_token: None,
+            require_approval: true,
+            pending_ttl_secs: 10,
+        };
+        let mut ca = CertAuthority::from_config(&[1; 32], &cfg);
+        ca.set_now_unix(100);
+        let (ed, x) = node_keys(2);
+        let mac = [0, 0, 0, 0, 0, 9];
+
+        ca.submit_csr(&mac, &ed, &x, "").unwrap();
+        ca.approve_csr(&mac).unwrap();
+
+        // Age past the pending TTL: the held Approved entry ages out, leaving
+        // the still-valid `issued` record as the only thing protecting the MAC.
+        ca.set_now_unix(100 + 20);
+        ca.revoke(&mac).unwrap();
+
+        // The same identity resubmitting after revocation must be re-parked for
+        // approval, not silently re-issued.
+        assert!(matches!(
+            ca.submit_csr(&mac, &ed, &x, "").unwrap(),
+            CsrOutcome::Pending
+        ));
+    }
+
+    #[test]
+    fn expired_same_key_resubmit_is_not_reissued() {
+        // Proves the `now_unix <= c.not_after` term in the same-key shortcut is
+        // load-bearing: once the previously-issued cert has passively expired
+        // (and its held entry has aged out), a same-key resubmit must go back
+        // through approval rather than being silently re-issued.
+        let cfg = ProviderConfig {
+            root_seed_path: String::new(),
+            mesh_id: 0xABCD,
+            cert_ttl_secs: 10,
+            enrollment_token: None,
+            require_approval: true,
+            pending_ttl_secs: 10,
+        };
+        let mut ca = CertAuthority::from_config(&[1; 32], &cfg);
+        ca.set_now_unix(100);
+        let (ed, x) = node_keys(2);
+        let mac = [0, 0, 0, 0, 0, 9];
+
+        ca.submit_csr(&mac, &ed, &x, "").unwrap();
+        ca.approve_csr(&mac).unwrap();
+        assert!(matches!(
+            ca.submit_csr(&mac, &ed, &x, "").unwrap(),
+            CsrOutcome::Issued(_)
+        ));
+
+        // Advance past both the cert TTL and the pending TTL, so the issued
+        // cert has expired and the held entry has been evicted.
+        ca.set_now_unix(100 + 20);
+
+        assert!(matches!(
+            ca.submit_csr(&mac, &ed, &x, "").unwrap(),
+            CsrOutcome::Pending
+        ));
+    }
+
+    #[test]
+    fn same_key_resubmit_while_still_pending_stays_pending() {
+        // Regression guard for the shortcut above: a still-Pending held entry
+        // (not yet approved, so not yet in `issued`) must keep reporting Pending
+        // on a same-key re-poll — the issued-guard shortcut must not fire before
+        // approval.
+        let mut ca = approval_ca();
+        let (ed, x) = node_keys(2);
+        let mac = [0, 0, 0, 0, 0, 9];
+
+        assert!(matches!(
+            ca.submit_csr(&mac, &ed, &x, "").unwrap(),
+            CsrOutcome::Pending
+        ));
+        assert!(matches!(
+            ca.submit_csr(&mac, &ed, &x, "").unwrap(),
+            CsrOutcome::Pending
+        ));
+        assert_eq!(ca.held.len(), 1, "still exactly one held entry");
     }
 
     #[test]

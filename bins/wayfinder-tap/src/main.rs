@@ -139,6 +139,21 @@ async fn main() -> anyhow::Result<()> {
 
     let mut driver = Driver::new(Mac(mac_addr), TapDevice(dev), interfaces, trickle, query_rx);
 
+    // Fail-closed policy: when configured, the router stays inert (see
+    // `CentralRouter::auth_locked`) until a membership cert is installed below
+    // (from `[auth]`) or later via a runtime `set-auth`. Set unconditionally,
+    // regardless of whether `[auth]` is present below: a `require_auth: true`
+    // node with no `[auth]` block (relying entirely on a runtime `set-auth`)
+    // must still start out correctly locked.
+    driver.router_mut().set_require_auth(config.require_auth);
+    if config.require_auth && config.auth.is_none() {
+        tracing::warn!(
+            "require_auth is set but no [auth] block is configured; this node will \
+             stay locked (no routing, no OGM emission) until a certificate is \
+             installed via a runtime set-auth"
+        );
+    }
+
     // Opt-in mesh authentication: load this node's identity, certificate, and
     // the mesh trust anchor, then enable OGM auth on the router.  Absent ⇒ the
     // node runs unauthenticated.

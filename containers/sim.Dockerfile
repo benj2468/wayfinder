@@ -84,6 +84,10 @@ local_egress:
 server:
   type: Tcp
   addr: ${SERVER_ADDR}
+# Fail closed: both provider and member nodes stay inert on the mesh (no
+# routing, no OGM emission) until they install a valid membership cert via
+# \`set-auth\` below — an unauthenticated node must never act as a router.
+require_auth: true
 YAML
 
 # Provider (certificate-authority) node: it alone holds the mesh root seed
@@ -94,6 +98,7 @@ provider:
   root_seed_path: /ca/seed
   mesh_id: ${MESH_ID}
   cert_ttl_secs: 100000000000
+  require_approval: ${REQUIRE_APPROVAL:-false}
 YAML
 fi
 
@@ -132,6 +137,7 @@ cat "$CFG" >&2
 # Start the node in the background and give it a moment to bring up the TAP.
 wayfinder-tap --config "$CFG" &
 WAYFINDER_PID=$!
+trap 'kill ${WAYFINDER_PID}; wait ${WAYFINDER_PID}' TERM
 sleep 5
 WAYFINDER_MAC=$(ip link show dev wayfinder0 | awk '/link\/ether/ {print $2}')
 
@@ -150,9 +156,14 @@ if [ -n "${PROVIDER:-}" ]; then
       --out-cert /etc/wayfinder/secrets/cert
   cp /ca/root /etc/wayfinder/secrets/anchor
 else
-  # A member enrols online against the provider — no root seed on this node.
+  # A member enrolls online against the provider — no root seed on this node.
   # Retry: the provider's management API may not be up yet.
   echo "wayfinder-sim: enrolling against provider ${PROVIDER_ADDR}" >&2
+  # `enroll` generates the identity seed once and, since it is written to
+  # --out-seed immediately, reuses it on every retry below — so a retry
+  # resubmits the SAME key for this MAC rather than a new one (which a
+  # require-approval provider would otherwise reject as a duplicate MAC under a
+  # different key).
   i=0
   until wayfinder-ctl enroll \
       --connect "${PROVIDER_ADDR}" \

@@ -226,10 +226,8 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
 
         // Re-add the groups the originator now announces (6 bytes per MAC).
         if let Some(value) = find_tvlv(tail, TvlvType::Mcast) {
-            for chunk in value.chunks_exact(6) {
-                let mut bytes = [0u8; 6];
-                bytes.copy_from_slice(chunk);
-                if self.mcast_members.push((Mac(bytes), orig)).is_err() {
+            for chunk in value.as_chunks::<6>().0 {
+                if self.mcast_members.push((Mac(*chunk), orig)).is_err() {
                     break; // table full; drop the rest
                 }
             }
