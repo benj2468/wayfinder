@@ -50,6 +50,9 @@ impl WayfinderDataProvider for Mock {
     fn num_originators(&self) -> u32 {
         2
     }
+    fn auth_locked(&self) -> bool {
+        true
+    }
     fn routing_table(&self) -> Vec<RoutingEntryData> {
         vec![RoutingEntryData {
             destination: vec![0, 0, 0, 0, 0, 2],
@@ -177,6 +180,7 @@ async fn assert_full_roundtrip(client: &mut Client) {
     let info = client.node_info().await.unwrap();
     assert_eq!(format_mac(&info.node_id), "aa:bb:cc:dd:ee:01");
     assert_eq!(info.num_originators, 2);
+    assert!(info.auth_locked);
 
     let routing = client.routing_table().await.unwrap();
     assert_eq!(routing.entries.len(), 1);

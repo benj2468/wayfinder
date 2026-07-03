@@ -70,6 +70,10 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
         self.router.originator_count() as u32
     }
 
+    fn auth_locked(&self) -> bool {
+        self.router.auth_locked()
+    }
+
     fn routing_table(&self) -> Vec<RoutingEntryData> {
         self.router
             .originator_table()

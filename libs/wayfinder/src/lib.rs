@@ -419,9 +419,9 @@ impl CentralRouter {
     /// While locked, the router must not process, forward, deliver, or
     /// originate any mesh traffic (see [`handle_frame_with_metrics`],
     /// [`poll`], [`handle_local`], [`handle_local_mcast`]); provisioning still
-    /// works out-of-band over the management API. Not yet surfaced through
-    /// the management API or TUI, so an operator currently has no way to see
-    /// a node stuck in this state — tracked as a separate follow-up.
+    /// works out-of-band over the management API. Surfaced to operators as
+    /// `NodeInfo.auth_locked` over the management API and shown on the TUI
+    /// overview pane.
     ///
     /// [`set_auth`]: CentralRouter::set_auth
     /// [`handle_frame_with_metrics`]: CentralRouter::handle_frame_with_metrics

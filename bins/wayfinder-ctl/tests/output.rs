@@ -11,10 +11,12 @@ fn node_info_human_renders_mac_and_count() {
     let v = NodeInfo {
         node_id: vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01],
         num_originators: 3,
+        auth_locked: true,
     };
     let human = output::node_info(&v, OutputFormat::Human).unwrap();
     assert!(human.contains("aa:bb:cc:dd:ee:01"), "got: {human}");
     assert!(human.contains("originators: 3"), "got: {human}");
+    assert!(human.contains("locked: yes"), "got: {human}");
 }
 
 #[test]
@@ -22,12 +24,14 @@ fn node_info_json_is_valid_and_complete() {
     let v = NodeInfo {
         node_id: vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01],
         num_originators: 3,
+        auth_locked: true,
     };
     let json = output::node_info(&v, OutputFormat::Json).unwrap();
     // Parse it back to confirm it is well-formed JSON with the expected fields.
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed["num_originators"], 3);
     assert!(parsed["node_id"].is_array());
+    assert_eq!(parsed["auth_locked"], true);
 }
 
 #[test]

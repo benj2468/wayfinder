@@ -34,6 +34,9 @@ impl WayfinderDataProvider for Mock {
     fn num_originators(&self) -> u32 {
         5
     }
+    fn auth_locked(&self) -> bool {
+        true
+    }
     fn routing_table(&self) -> Vec<RoutingEntryData> {
         vec![]
     }
@@ -127,6 +130,7 @@ async fn node_info_query_renders_json_from_server() {
         .expect("query succeeds");
     let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(parsed["num_originators"], 5);
+    assert_eq!(parsed["auth_locked"], true);
 }
 
 #[tokio::test]
@@ -137,6 +141,7 @@ async fn node_info_query_renders_human_from_server() {
         .unwrap();
     assert!(out.contains("aa:bb:cc:dd:ee:07"), "got: {out}");
     assert!(out.contains("originators: 5"), "got: {out}");
+    assert!(out.contains("locked: yes"), "got: {out}");
 }
 
 #[tokio::test]

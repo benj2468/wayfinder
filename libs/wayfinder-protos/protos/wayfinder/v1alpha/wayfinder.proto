@@ -269,6 +269,12 @@ message NodeInfo {
   // Number of entries currently in the BATMAN originator table, i.e. the
   // number of remote nodes this router has a path to.
   uint32 num_originators = 2;
+
+  // Whether this node is required to authenticate but has no membership
+  // cert installed yet. While true, the node is inert on the mesh (no
+  // routing, no OGM emission) until provisioned with a cert over the
+  // management API.
+  bool auth_locked = 3;
 }
 
 // Per-neighbor path metrics for a single path to an originator.
