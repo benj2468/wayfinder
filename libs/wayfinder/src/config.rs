@@ -250,6 +250,15 @@ pub struct Config {
     /// plain member and rejects enrollment requests.
     #[serde(default)]
     pub provider: Option<ProviderConfig>,
+    /// Fail closed: when `true`, the router stays inert on the mesh (see
+    /// [`CentralRouter::auth_locked`](crate::CentralRouter::auth_locked)) —
+    /// processing, forwarding, delivering, and emitting nothing — until a
+    /// valid membership cert is installed, whether via a startup `auth:`
+    /// block or a later runtime `set-auth`. Defaults to `false`, preserving
+    /// the historical behavior where a node with no cert yet still routes in
+    /// the open, unauthenticated mode.
+    #[serde(default)]
+    pub require_auth: bool,
 }
 
 /// Enables certificate-authority (provider) mode on a node: it holds the mesh
@@ -434,5 +443,32 @@ local_egress:
 ";
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(config.auth.is_none());
+    }
+
+    /// `require_auth` defaults to `false` (open/pre-auth behavior preserved)
+    /// when omitted from the config.
+    #[test]
+    fn require_auth_defaults_to_false() {
+        let yaml = "\
+local_egress:
+  type: Tap
+  device_name: wayfinder0
+";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.require_auth);
+    }
+
+    /// An explicit `require_auth: true` parses, so an operator can opt a node
+    /// into failing closed (inert until a valid cert is installed).
+    #[test]
+    fn require_auth_true_parses() {
+        let yaml = "\
+local_egress:
+  type: Tap
+  device_name: wayfinder0
+require_auth: true
+";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.require_auth);
     }
 }

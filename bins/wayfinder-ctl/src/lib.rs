@@ -15,7 +15,6 @@ pub mod cert;
 pub mod output;
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
@@ -103,13 +102,6 @@ pub enum Command {
         /// Where to write the mesh trust anchor.
         #[arg(long)]
         out_anchor: PathBuf,
-        /// How long to keep polling while the CSR awaits operator approval, in
-        /// seconds.  0 fails immediately if the provider parks the CSR.
-        #[arg(long, default_value_t = 120)]
-        wait_secs: u64,
-        /// Interval between polls while the CSR is pending, in milliseconds.
-        #[arg(long, default_value_t = 2000)]
-        poll_interval_ms: u64,
     },
     /// Revoke a node from the mesh (talks to a provider node).
     Revoke {
@@ -205,22 +197,27 @@ pub async fn run_query(
             out_seed,
             out_cert,
             out_anchor,
-            wait_secs,
-            poll_interval_ms,
         } => {
-            let seed: [u8; 32] = rand::random();
+            // Enrollment can be retried against the same `out_seed` path (e.g. a
+            // provider that requires operator approval, polled across process
+            // restarts). Reuse whatever identity is already on disk there rather
+            // than minting a fresh keypair each time: under `--require-approval`
+            // a new key on every retry looks like a different node reclaiming the
+            // MAC and is rejected. Persist a freshly-generated seed immediately,
+            // before polling, so a later retry finds it.
+            let seed: [u8; 32] = if out_seed.exists() {
+                cert::read_seed(&out_seed)
+                    .with_context(|| format!("reading existing seed at {}", out_seed.display()))?
+            } else {
+                let seed: [u8; 32] = rand::random();
+                cert::write_secret(&out_seed, &seed)?;
+                seed
+            };
             let kp = Keypair::from_seed(&seed);
             let mac_bytes = parse_mac6(&mac)?;
-            let issued = poll_enroll(
-                &mut client,
-                &mac_bytes,
-                &kp,
-                &token,
-                Duration::from_secs(wait_secs),
-                Duration::from_millis(poll_interval_ms.max(1)),
-            )
-            .await?;
-            cert::write_secret(&out_seed, &seed)?;
+            let issued = poll_enroll(&mut client, &mac_bytes, &kp, &token).await?;
+            // The seed is already on disk (reused from `out_seed`, or written
+            // above before polling), so it needs no second write here.
             std::fs::write(&out_cert, &issued.cert)
                 .with_context(|| format!("writing certificate to {}", out_cert.display()))?;
             std::fs::write(&out_anchor, &issued.trust_anchor)
@@ -259,8 +256,7 @@ pub async fn run_query(
     })
 }
 
-/// Poll `submit_csr` until the CSR resolves to issued or rejected, or until
-/// `wait` elapses.  A provider configured to require operator approval parks the
+/// Poll `submit_csr`. A provider configured to require operator approval parks the
 /// CSR as pending; re-submitting the identical request is how the enrolling node
 /// collects the certificate once an operator approves it.
 async fn poll_enroll(
@@ -268,30 +264,21 @@ async fn poll_enroll(
     mac: &[u8],
     kp: &Keypair,
     token: &str,
-    wait: Duration,
-    interval: Duration,
 ) -> anyhow::Result<CsrIssued> {
-    let deadline = Instant::now() + wait;
-    loop {
-        let resp = client
-            .submit_csr(mac, &kp.ed_pubkey(), &kp.x_pubkey(), token)
-            .await
-            .context("enrollment (submit_csr) failed")?;
-        match resp.outcome {
-            Some(CsrOutcome::Issued(issued)) => return Ok(issued),
-            Some(CsrOutcome::Rejected(r)) => bail!("enrollment rejected: {}", r.reason),
-            // Pending (or an empty outcome, treated the same): keep polling until
-            // the deadline, since only a re-submission collects an approval.
-            Some(CsrOutcome::Pending(_)) | None => {
-                if Instant::now() >= deadline {
-                    bail!(
-                        "CSR still awaiting operator approval after {}s; approve it with \
-                         `wayfinderctl csr approve --mac <mac>` and retry",
-                        wait.as_secs()
-                    );
-                }
-                tokio::time::sleep(interval).await;
-            }
+    let resp = client
+        .submit_csr(mac, &kp.ed_pubkey(), &kp.x_pubkey(), token)
+        .await
+        .context("enrollment (submit_csr) failed")?;
+    match resp.outcome {
+        Some(CsrOutcome::Issued(issued)) => Ok(issued),
+        Some(CsrOutcome::Rejected(r)) => bail!("enrollment rejected: {}", r.reason),
+        // Pending (or an empty outcome, treated the same): the caller should keep polling until
+        // until the requset is approval.
+        Some(CsrOutcome::Pending(_)) | None => {
+            bail!(
+                "CSR still awaiting operator approval; approve it with \
+                    `wayfinderctl csr approve --mac <mac>` and retry",
+            );
         }
     }
 }

@@ -6,9 +6,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use tokio::sync::{mpsc, oneshot};
-use wayfinder_auth::{MembershipCert, TrustAnchor};
+use wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
 use wayfinder_protos::service::{
     CsrOutcome, InterfaceThroughputData, IssuedCertData, LinkQualityEntryData, NodeMetricsData,
     OgmScheduleEntryData, PendingCsrData, RouteResolutionData, RoutingEntryData,
@@ -152,8 +153,6 @@ async fn enroll_yields_a_cert_that_verifies_against_the_anchor() {
             out_seed: seed.clone(),
             out_cert: cert.clone(),
             out_anchor: anchor.clone(),
-            wait_secs: 30,
-            poll_interval_ms: 50,
         },
         &addr.to_string(),
         OutputFormat::Human,
@@ -172,6 +171,62 @@ async fn enroll_yields_a_cert_that_verifies_against_the_anchor() {
 }
 
 #[tokio::test]
+async fn enroll_reuses_an_existing_seed_file_instead_of_minting_a_new_identity() {
+    // The sim entrypoint retries `enroll` for the same MAC against a fixed
+    // `--out-seed` path until the CSR is approved.  Each retry must reuse the
+    // identity it already wrote, not mint a fresh keypair — otherwise a
+    // require-approval provider sees a "different key" on every retry and the
+    // enrollment can never converge.
+    let addr = spawn_provider(None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let seed = dir.path().join("seed");
+    let cert = dir.path().join("cert");
+    let anchor = dir.path().join("anchor");
+
+    let enroll_cmd = |seed: PathBuf, cert: PathBuf, anchor: PathBuf| Command::Enroll {
+        mac: "02:00:00:00:00:09".into(),
+        token: String::new(),
+        out_seed: seed,
+        out_cert: cert,
+        out_anchor: anchor,
+    };
+
+    run_query(
+        enroll_cmd(seed.clone(), cert.clone(), anchor.clone()),
+        &addr.to_string(),
+        OutputFormat::Human,
+    )
+    .await
+    .expect("first enroll succeeds");
+    let first_seed_bytes = std::fs::read(&seed).unwrap();
+
+    // Retry: the seed file already exists at `out_seed`, so it must be read
+    // back and reused rather than replaced with a freshly-generated one.
+    run_query(
+        enroll_cmd(seed.clone(), cert.clone(), anchor.clone()),
+        &addr.to_string(),
+        OutputFormat::Human,
+    )
+    .await
+    .expect("retry enroll succeeds");
+    let second_seed_bytes = std::fs::read(&seed).unwrap();
+
+    assert_eq!(
+        first_seed_bytes, second_seed_bytes,
+        "seed is stable across retries"
+    );
+
+    let cert_bytes = MembershipCert::from_bytes(&std::fs::read(&cert).unwrap()).unwrap();
+    let seed_array: [u8; 32] = first_seed_bytes.try_into().unwrap();
+    let kp = Keypair::from_seed(&seed_array);
+    assert_eq!(
+        cert_bytes.ed_pubkey,
+        kp.ed_pubkey(),
+        "cert is bound to the reused identity, not a new one"
+    );
+}
+
+#[tokio::test]
 async fn enroll_rejected_without_required_token() {
     let addr = spawn_provider(Some("s3cret".to_string())).await;
     let dir = tempfile::tempdir().unwrap();
@@ -182,8 +237,6 @@ async fn enroll_rejected_without_required_token() {
             out_seed: dir.path().join("seed"),
             out_cert: dir.path().join("cert"),
             out_anchor: dir.path().join("anchor"),
-            wait_secs: 30,
-            poll_interval_ms: 50,
         },
         &addr.to_string(),
         OutputFormat::Human,
@@ -207,8 +260,6 @@ async fn list_certs_shows_an_enrolled_node() {
             out_seed: dir.path().join("seed"),
             out_cert: dir.path().join("cert"),
             out_anchor: dir.path().join("anchor"),
-            wait_secs: 30,
-            poll_interval_ms: 50,
         },
         &addr.to_string(),
         OutputFormat::Json,
@@ -279,20 +330,40 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
     let anchor_path = dir.path().join("anchor");
 
     // Operator: wait for the CSR to be parked as pending, then approve it.
-    let approver = tokio::spawn(async move {
+    let _approver = tokio::spawn(async move {
         wait_for_pending(addr).await;
-        run_query(
-            Command::Csr(CsrCommand::Approve {
-                mac: "02:00:00:00:00:09".into(),
-            }),
-            &addr.to_string(),
-            OutputFormat::Human,
-        )
-        .await
-        .expect("approve succeeds");
     });
 
-    // Enrolling node: polls submit_csr while pending, collects the cert on approval.
+    // Enrolling node: fails at first, responds with pending
+    let err = run_query(
+        Command::Enroll {
+            mac: "02:00:00:00:00:09".into(),
+            token: String::new(),
+            out_seed: dir.path().join("seed"),
+            out_cert: cert_path.clone(),
+            out_anchor: anchor_path.clone(),
+        },
+        &addr.to_string(),
+        OutputFormat::Human,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("CSR still awaiting operator approval"),
+        "got: {err}"
+    );
+
+    run_query(
+        Command::Csr(CsrCommand::Approve {
+            mac: "02:00:00:00:00:09".into(),
+        }),
+        &addr.to_string(),
+        OutputFormat::Human,
+    )
+    .await
+    .expect("approve succeeds");
+
+    // Enrolling node: once approved, collects the cert
     let out = run_query(
         Command::Enroll {
             mac: "02:00:00:00:00:09".into(),
@@ -300,8 +371,6 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
             out_seed: dir.path().join("seed"),
             out_cert: cert_path.clone(),
             out_anchor: anchor_path.clone(),
-            wait_secs: 10,
-            poll_interval_ms: 20,
         },
         &addr.to_string(),
         OutputFormat::Human,
@@ -309,7 +378,6 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
     .await
     .expect("enroll eventually succeeds after approval");
     assert!(out.contains("enrolled"), "got: {out}");
-    approver.await.unwrap();
 
     // The collected cert verifies against the written anchor.
     let anchor = TrustAnchor::from_bytes(&std::fs::read(&anchor_path).unwrap()).unwrap();
@@ -325,18 +393,33 @@ async fn enroll_fails_when_operator_denies() {
     let addr = spawn_provider_with(None, true).await;
     let dir = tempfile::tempdir().unwrap();
 
-    let denier = tokio::spawn(async move {
-        wait_for_pending(addr).await;
-        run_query(
-            Command::Csr(CsrCommand::Deny {
-                mac: "02:00:00:00:00:09".into(),
-            }),
-            &addr.to_string(),
-            OutputFormat::Human,
-        )
-        .await
-        .expect("deny succeeds");
-    });
+    let err = run_query(
+        Command::Enroll {
+            mac: "02:00:00:00:00:09".into(),
+            token: String::new(),
+            out_seed: dir.path().join("seed"),
+            out_cert: dir.path().join("cert"),
+            out_anchor: dir.path().join("anchor"),
+        },
+        &addr.to_string(),
+        OutputFormat::Human,
+    )
+    .await
+    .expect_err("a denied CSR fails enrollment");
+    assert!(
+        format!("{err:#}").contains("CSR still awaiting operator approval"),
+        "got: {err}"
+    );
+
+    run_query(
+        Command::Csr(CsrCommand::Deny {
+            mac: "02:00:00:00:00:09".into(),
+        }),
+        &addr.to_string(),
+        OutputFormat::Human,
+    )
+    .await
+    .unwrap();
 
     let err = run_query(
         Command::Enroll {
@@ -345,15 +428,11 @@ async fn enroll_fails_when_operator_denies() {
             out_seed: dir.path().join("seed"),
             out_cert: dir.path().join("cert"),
             out_anchor: dir.path().join("anchor"),
-            wait_secs: 10,
-            poll_interval_ms: 20,
         },
         &addr.to_string(),
         OutputFormat::Human,
     )
     .await
     .expect_err("a denied CSR fails enrollment");
-    denier.await.unwrap();
-    let err = format!("{err:#}");
-    assert!(err.contains("rejected"), "got: {err}");
+    assert!(format!("{err:#}").contains("rejected"), "got: {err}");
 }

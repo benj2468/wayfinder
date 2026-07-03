@@ -38,7 +38,6 @@ WORKDIR /app
 # explicitly (rather than `COPY . .`) keeps unrelated files out of the build
 # context layer and improves caching.
 COPY Cargo.lock Cargo.toml ./
-COPY src ./src
 COPY libs ./libs
 COPY bins ./bins
 

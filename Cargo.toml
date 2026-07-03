@@ -1,9 +1,5 @@
-[package]
-name = "wayfinder-workspace"
-version = "0.1.0"
-edition = "2021"
-
 [workspace]
+resolver = "3"
 members = [
     "libs/rylr998",
     "libs/ieee802154",
@@ -76,6 +72,3 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 socket2 = { version = "0.6.3", features = ["all"] }
 libc = "0.2.186"
-
-[dependencies]
-serde.workspace = true

@@ -222,8 +222,9 @@ fn show(file: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Read a 32-byte seed file.
-fn read_seed(path: &Path) -> anyhow::Result<[u8; 32]> {
+/// Read a 32-byte seed file.  `pub(crate)` so `enroll` can reuse an
+/// already-written identity seed on a retry instead of minting a new one.
+pub(crate) fn read_seed(path: &Path) -> anyhow::Result<[u8; 32]> {
     let bytes = std::fs::read(path).with_context(|| format!("reading seed {}", path.display()))?;
     bytes
         .as_slice()
@@ -253,5 +254,23 @@ fn parse_u32(s: &str) -> Result<u32, std::num::ParseIntError> {
     match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         Some(hex) => u32::from_str_radix(hex, 16),
         None => s.parse::<u32>(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A truncated/corrupt seed file must surface a clean `Err`, not panic —
+    /// `read_seed` is reused on the `enroll` retry path, which reads whatever
+    /// is already on disk without knowing in advance that it's well-formed.
+    #[test]
+    fn read_seed_rejects_wrong_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seed");
+        std::fs::write(&path, [0u8; 10]).unwrap();
+
+        let err = read_seed(&path).unwrap_err();
+        assert!(err.to_string().contains("32 bytes"), "got: {err}");
     }
 }

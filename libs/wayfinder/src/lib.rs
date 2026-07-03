@@ -64,12 +64,21 @@ pub const DEFAULT_BATMAN_ETHER_TYPE: u16 = 0x4305;
 pub const MCAST_FANOUT: usize = 16;
 
 /// Error returned by [`CentralRouter::handle_local`] and
-/// [`CentralRouter::handle_local_mcast`] when the packet header plus the
-/// caller's payload do not fit in the supplied transmit buffer.  The caller
-/// should retry with a larger `tx_buf` (or drop the frame); no bytes are
-/// written to the buffer when this is returned.
+/// [`CentralRouter::handle_local_mcast`] when the frame cannot be sent onto the
+/// mesh.  No bytes are written to the caller's `tx_buf` when either variant is
+/// returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BufferTooSmall;
+pub enum LocalSendError {
+    /// The packet header plus the caller's payload do not fit in the supplied
+    /// transmit buffer. The caller should retry with a larger `tx_buf` (or
+    /// drop the frame).
+    BufferTooSmall,
+    /// The router is [`auth_locked`](CentralRouter::auth_locked): `require_auth`
+    /// is set and no valid membership cert is installed yet, so the router
+    /// must not originate any mesh traffic. The frame is dropped; install a
+    /// valid cert via [`set_auth`](CentralRouter::set_auth) to unlock.
+    AuthLocked,
+}
 
 /// Maximum number of mesh interfaces for which the router keeps independent
 /// throughput estimates.  Interfaces are addressed by their registration index
@@ -297,6 +306,13 @@ pub struct CentralRouter {
     /// it emits and drops incoming OGMs that do not verify against the mesh
     /// trust anchor — segregating this mesh from others sharing the medium.
     auth: Option<OgmAuth>,
+    /// Fail-closed policy: when `true`, this node must not act as a mesh router
+    /// (process, forward, deliver, or originate any mesh traffic) until a valid
+    /// membership cert is installed via [`set_auth`](CentralRouter::set_auth).
+    /// `false` (the default) preserves the historical behavior where a node
+    /// with no cert yet still routes in the open, unauthenticated mode. See
+    /// [`auth_locked`](CentralRouter::auth_locked).
+    require_auth: bool,
     /// Count of locally originated host frames dropped because they did not fit
     /// in the transmit buffer once wrapped in mesh encapsulation — i.e. the host
     /// sent a frame larger than the mesh can carry (a misconfigured MTU).  A
@@ -318,6 +334,7 @@ impl CentralRouter {
             tx_rates: [RateEstimator::default(); MAX_INTERFACES],
             iface_count: 0,
             auth: None,
+            require_auth: false,
             oversize_drops: 0,
         }
     }
@@ -380,6 +397,41 @@ impl CentralRouter {
         self.auth.as_mut()
     }
 
+    /// Set the fail-closed policy: when `require` is `true` and no
+    /// membership cert is installed yet, the router goes [`auth_locked`]
+    /// (inert on the mesh) until [`set_auth`] installs one. Typically set once
+    /// at startup from [`Config::require_auth`](crate::config::Config); calling
+    /// it again with `false` un-gates a node that has no cert, restoring the
+    /// open (pre-auth) behavior.
+    ///
+    /// [`auth_locked`]: CentralRouter::auth_locked
+    /// [`set_auth`]: CentralRouter::set_auth
+    pub fn set_require_auth(&mut self, require: bool) {
+        self.require_auth = require;
+    }
+
+    /// Whether this node is required to authenticate but has no membership
+    /// cert installed yet — the "inert until authorized" state. This is a
+    /// presence/bootstrap gate only: `require_auth && self.auth.is_none()`.
+    /// Once any cert is installed via [`set_auth`], the router stays unlocked
+    /// for good — even once that cert later passively expires. Re-locking on
+    /// cert expiry is a deliberate deferred follow-up, not implemented here.
+    /// While locked, the router must not process, forward, deliver, or
+    /// originate any mesh traffic (see [`handle_frame_with_metrics`],
+    /// [`poll`], [`handle_local`], [`handle_local_mcast`]); provisioning still
+    /// works out-of-band over the management API. Not yet surfaced through
+    /// the management API or TUI, so an operator currently has no way to see
+    /// a node stuck in this state — tracked as a separate follow-up.
+    ///
+    /// [`set_auth`]: CentralRouter::set_auth
+    /// [`handle_frame_with_metrics`]: CentralRouter::handle_frame_with_metrics
+    /// [`poll`]: CentralRouter::poll
+    /// [`handle_local`]: CentralRouter::handle_local
+    /// [`handle_local_mcast`]: CentralRouter::handle_local_mcast
+    pub fn auth_locked(&self) -> bool {
+        self.require_auth && self.auth.is_none()
+    }
+
     /// Ingest a signed revocation (the operator/management-API entry point for
     /// an emergency purge), returning whether it was newly recorded.  On a new
     /// record the engine's Trickle timers are reset so the carrying OGM floods
@@ -427,7 +479,11 @@ impl CentralRouter {
     /// highest smoothed quality.
     ///
     /// Returns an [`RxOutcome`]: any frame to (re)transmit onto the mesh and
-    /// any inner payload to deliver to the local host.
+    /// any inner payload to deliver to the local host. Returns an empty
+    /// `RxOutcome` immediately — before any link-quality/throughput
+    /// accounting or protocol demux — when [`auth_locked`].
+    ///
+    /// [`auth_locked`]: CentralRouter::auth_locked
     pub fn handle_frame_with_metrics<'rx, 'tx>(
         &mut self,
         now: Duration,
@@ -449,11 +505,23 @@ impl CentralRouter {
         let _enter = span.enter();
         trace!(payload_len = frame.payload.len(), "rx frame");
 
+        // Fail closed: `require_auth` is set and no valid membership cert is
+        // installed yet, so this node must be fully inert on the mesh — drop
+        // before any demux, routing-table update, or local delivery.
+        // Provisioning (enroll/set-auth) happens out-of-band over the
+        // management API and is unaffected.
+        if self.auth_locked() {
+            trace!("drop: auth locked (no membership cert)");
+            return RxOutcome::empty();
+        }
+
         tx_buf.fill(0);
         // 0. Update the link-quality table for the sender, keyed on the
         //    interface this frame arrived on.  Done before any further
         //    processing so even frames that the upper layers drop still
-        //    contribute their signal information.
+        //    contribute their signal information. (This no longer holds when
+        //    `auth_locked()`: the fail-closed gate above already returned
+        //    before this step runs.)
         let quality = normalize_quality(&metrics);
         self.link_quality.update(frame.src, iface_idx, quality);
         // The smoothed link quality to this neighbor, used to clamp any OGM's
@@ -472,7 +540,8 @@ impl CentralRouter {
 
         // 0b. Account the frame against this interface's ingress rate before any
         //     demux, so even frames the upper layers drop still register as
-        //     received throughput on the wire.
+        //     received throughput on the wire. (Again, this no longer holds
+        //     when `auth_locked()`: such frames never reach this point.)
         self.record_rx(iface_idx, link_frame_wire_len(frame.payload.len()), now);
 
         // 1. Add a record to the identifier table
@@ -632,14 +701,19 @@ impl CentralRouter {
     /// Wrap host data destined for the multicast listener `dest` in a
     /// [`BATADV_MCAST`] packet routed toward its best-known next hop.  Called
     /// once per target of a [`McastPlan::Unicast`].  Returns
-    /// [`BufferTooSmall`] if the header plus `payload` would not fit in
-    /// `tx_buf`.
+    /// [`LocalSendError::BufferTooSmall`] if the header plus `payload` would
+    /// not fit in `tx_buf`, or [`LocalSendError::AuthLocked`] while
+    /// [`auth_locked`](CentralRouter::auth_locked).
     pub fn handle_local_mcast<'a>(
         &mut self,
         dest: Mac,
         payload: &[u8],
         tx_buf: &'a mut [u8],
-    ) -> Result<LinkFrameData<'a>, BufferTooSmall> {
+    ) -> Result<LinkFrameData<'a>, LocalSendError> {
+        if self.auth_locked() {
+            trace!("drop: auth locked, suppressing local multicast egress");
+            return Err(LocalSendError::AuthLocked);
+        }
         let next_hop = self.batman.lookup_route(dest).unwrap_or(dest);
 
         let header = BatmanMcastPacket {
@@ -652,7 +726,7 @@ impl CentralRouter {
         let total_size = header_size + payload.len();
         if total_size > tx_buf.len() {
             self.note_oversize_drop();
-            return Err(BufferTooSmall);
+            return Err(LocalSendError::BufferTooSmall);
         }
         tx_buf[..header_size].copy_from_slice(header.as_bytes());
         tx_buf[header_size..total_size].copy_from_slice(payload);
@@ -673,6 +747,12 @@ impl CentralRouter {
         now: core::time::Duration,
         tx_buf: &'tx mut [u8],
     ) -> Option<LinkFrameData<'tx>> {
+        // Fail closed: locked nodes originate nothing (total mesh silence)
+        // until a valid membership cert is installed.
+        if self.auth_locked() {
+            trace!("drop: auth locked, suppressing OGM emission");
+            return None;
+        }
         // 3. Handle BATMAN outgoing maintenance ticks
         let broadcast = Mac::BROADCAST;
         // Take only the produced length so the borrow of `tx_buf` ends and we can
@@ -737,8 +817,10 @@ impl CentralRouter {
     /// ready to hand to a link.  A `dest` of [`MeshIdentifier::BROADCAST`]
     /// produces a flooded [`BatmanBroadcastPacket`] (e.g. for a host ARP);
     /// any other destination produces a [`BatmanUnicastPacket`] routed toward
-    /// the best-known next hop.  Returns [`BufferTooSmall`] if `payload` plus
-    /// the header would not fit in `tx_buf`.
+    /// the best-known next hop.  Returns [`LocalSendError::BufferTooSmall`] if
+    /// `payload` plus the header would not fit in `tx_buf`, or
+    /// [`LocalSendError::AuthLocked`] while
+    /// [`auth_locked`](CentralRouter::auth_locked).
     ///
     /// [`MeshIdentifier::BROADCAST`]: interfaces::frame::MeshIdentifier::BROADCAST
     pub fn handle_local<'a>(
@@ -746,7 +828,11 @@ impl CentralRouter {
         dest: Mac,
         payload: &[u8],
         tx_buf: &'a mut [u8],
-    ) -> Result<LinkFrameData<'a>, BufferTooSmall> {
+    ) -> Result<LinkFrameData<'a>, LocalSendError> {
+        if self.auth_locked() {
+            trace!("drop: auth locked, suppressing local egress");
+            return Err(LocalSendError::AuthLocked);
+        }
         // Broadcast destinations are flooded, not routed to a next hop.
         if dest == Mac::BROADCAST {
             let header = BatmanBroadcastPacket {
@@ -760,7 +846,7 @@ impl CentralRouter {
             let total_size = header_size + payload.len();
             if total_size > tx_buf.len() {
                 self.note_oversize_drop();
-                return Err(BufferTooSmall);
+                return Err(LocalSendError::BufferTooSmall);
             }
             tx_buf[..header_size].copy_from_slice(header.as_bytes());
             tx_buf[header_size..total_size].copy_from_slice(payload);
@@ -791,7 +877,7 @@ impl CentralRouter {
 
         if total_size > tx_buf.len() {
             self.note_oversize_drop();
-            return Err(BufferTooSmall);
+            return Err(LocalSendError::BufferTooSmall);
         }
 
         // Pack the header and data sequentially into the scratchpad
@@ -1736,6 +1822,186 @@ mod ogm_auth_integration {
             feed(&mut b, mac(1), &ogm),
             1,
             "unauthenticated mode must be unchanged"
+        );
+    }
+
+    // ── `require_auth`: fail-closed until a valid cert is installed ────────────
+
+    /// `handle_frame_with_metrics` on a `require_auth` node with no cert yet
+    /// returns an empty [`RxOutcome`] (no forward, no local delivery) — the
+    /// frame is dropped outright rather than merely failing an auth check.
+    #[test]
+    fn locked_router_returns_empty_rx_outcome() {
+        let mut peer = CentralRouter::new(mac(1));
+        let ogm = poll_ogm_bytes(&mut peer);
+        let bytes = link_frame(mac(1), &ogm);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+
+        let mut node = CentralRouter::new(mac(2));
+        node.set_require_auth(true);
+        assert!(node.auth_locked());
+
+        let mut tx = [0u8; 1500];
+        let outcome = node.handle_frame(Duration::ZERO, 0, frame, &mut tx);
+        assert!(outcome.forward.is_none(), "a locked node forwards nothing");
+        assert!(
+            outcome.deliver_local.is_none(),
+            "a locked node delivers nothing locally"
+        );
+    }
+
+    /// A `require_auth` node with no cert is inert end to end: it neither
+    /// learns from nor emits any mesh traffic, and installing a valid cert via
+    /// `set_auth` unlocks it so the same traffic is processed normally.
+    #[test]
+    fn require_auth_locks_the_router_until_a_cert_is_installed() {
+        let mut peer = CentralRouter::new(mac(1));
+        let ogm = poll_ogm_bytes(&mut peer);
+
+        let mut node = CentralRouter::new(mac(2));
+        node.set_require_auth(true);
+        assert!(node.auth_locked(), "no cert yet: node must be locked");
+
+        // Locked: an incoming OGM teaches it nothing.
+        assert_eq!(
+            feed(&mut node, mac(1), &ogm),
+            0,
+            "locked node must not process any frame"
+        );
+
+        // Locked: the router emits nothing on poll (total mesh silence).
+        let mut tx = [0u8; 1500];
+        assert!(
+            node.poll(Duration::ZERO, &mut tx).is_none(),
+            "locked node must not emit OGMs"
+        );
+
+        // Installing a valid cert unlocks the router.
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let kp = Keypair::from_seed(&[3; 32]);
+        let cert = authority.issue_cert(mac(2), kp.ed_pubkey(), kp.x_pubkey(), 0, 1000);
+        let mut auth = crate::auth::OgmAuth::new(kp, cert, authority.trust_anchor());
+        auth.set_time(100);
+        node.set_auth(auth);
+        assert!(!node.auth_locked(), "a valid cert unlocks the router");
+
+        // A signed OGM from a same-mesh peer is now processed normally.
+        let mut authed_peer = router_with_auth(&authority, mac(1), 2);
+        let signed_ogm = poll_ogm_bytes(&mut authed_peer);
+        assert_eq!(
+            feed(&mut node, mac(1), &signed_ogm),
+            1,
+            "unlocked node processes frames normally"
+        );
+    }
+
+    /// The default (`require_auth = false`) is unchanged: a node with no cert
+    /// still routes exactly as before — a regression guard ensuring the new
+    /// fail-closed gate does not affect the open, unauthenticated mode.
+    #[test]
+    fn require_auth_false_is_unchanged_open_behavior() {
+        let mut peer = CentralRouter::new(mac(1));
+        let ogm = poll_ogm_bytes(&mut peer);
+        let mut node = CentralRouter::new(mac(2)); // require_auth defaults to false
+        assert!(!node.auth_locked());
+        assert_eq!(
+            feed(&mut node, mac(1), &ogm),
+            1,
+            "open mode is unchanged by the require_auth gate"
+        );
+    }
+
+    /// A locked node must refuse to originate local unicast/broadcast traffic
+    /// (not just refuse to process received frames) — `handle_local` is the
+    /// host-egress path, exercised independently of `handle_frame`.
+    #[test]
+    fn locked_router_rejects_local_egress() {
+        let mut node = CentralRouter::new(mac(2));
+        node.set_require_auth(true);
+        assert!(node.auth_locked());
+
+        let mut tx = [0u8; 256];
+        assert!(matches!(
+            node.handle_local(mac(9), b"payload", &mut tx),
+            Err(LocalSendError::AuthLocked)
+        ));
+
+        // Installing a valid cert unlocks local egress too.
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let kp = Keypair::from_seed(&[3; 32]);
+        let cert = authority.issue_cert(mac(2), kp.ed_pubkey(), kp.x_pubkey(), 0, 1000);
+        let mut auth = crate::auth::OgmAuth::new(kp, cert, authority.trust_anchor());
+        auth.set_time(100);
+        node.set_auth(auth);
+        assert!(!node.auth_locked());
+        assert!(node.handle_local(mac(9), b"payload", &mut tx).is_ok());
+    }
+
+    /// The same fail-closed gate applies to local multicast egress
+    /// (`handle_local_mcast`), which wraps host data in a `BATADV_MCAST`
+    /// packet rather than a unicast/broadcast one.
+    #[test]
+    fn locked_router_rejects_local_mcast_egress() {
+        let mut node = CentralRouter::new(mac(2));
+        node.set_require_auth(true);
+        assert!(node.auth_locked());
+
+        let mut tx = [0u8; 256];
+        assert!(matches!(
+            node.handle_local_mcast(mac(9), b"payload", &mut tx),
+            Err(LocalSendError::AuthLocked)
+        ));
+
+        // Installing a valid cert unlocks local multicast egress too.
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let kp = Keypair::from_seed(&[3; 32]);
+        let cert = authority.issue_cert(mac(2), kp.ed_pubkey(), kp.x_pubkey(), 0, 1000);
+        let mut auth = crate::auth::OgmAuth::new(kp, cert, authority.trust_anchor());
+        auth.set_time(100);
+        node.set_auth(auth);
+        assert!(!node.auth_locked());
+        assert!(node.handle_local_mcast(mac(9), b"payload", &mut tx).is_ok());
+    }
+
+    /// The fail-closed gate must cover the data plane, not just OGMs: a
+    /// well-formed `BATADV_BCAST` frame fed to a locked router must produce a
+    /// wholly empty `RxOutcome` — no forward, no local delivery — guarding
+    /// against a future refactor that only gates the OGM demux arm.
+    #[test]
+    fn locked_router_drops_a_forwarded_data_frame() {
+        const INNER: &[u8] = &[0x45, 0x00, 0x00, 0x1c, 0xde, 0xad];
+
+        let mut payload = Vec::new();
+        let hdr = BatmanBroadcastPacket {
+            packet_type: BATADV_BCAST,
+            version: 5,
+            ttl: 50,
+            seqno: 7u32.to_be(),
+            orig: mac(1),
+        };
+        payload.extend_from_slice(hdr.as_bytes());
+        payload.extend_from_slice(INNER);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(Mac::BROADCAST.as_bytes());
+        bytes.extend_from_slice(mac(1).as_bytes());
+        bytes.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
+        bytes.extend_from_slice(&payload);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+
+        let mut node = CentralRouter::new(mac(2));
+        node.set_require_auth(true);
+        assert!(node.auth_locked());
+
+        let mut tx = [0u8; 256];
+        let outcome = node.handle_frame(Duration::ZERO, 0, frame, &mut tx);
+        assert!(
+            outcome.forward.is_none(),
+            "a locked node must not forward a data-plane frame"
+        );
+        assert!(
+            outcome.deliver_local.is_none(),
+            "a locked node must not locally deliver a data-plane frame"
         );
     }
 }
