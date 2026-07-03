@@ -25,10 +25,11 @@ use prost::Message;
 use tokio::net::{TcpStream, UnixDatagram};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use wayfinder_protos::wayfinder_v1alpha::{
-    GetLinkQualityTableRequest, GetMetricsRequest, GetNodeInfoRequest, GetOgmScheduleRequest,
-    GetRoutingTableRequest, GetSecurityStatusRequest, GetSecurityStatusResponse,
-    GetThroughputRequest, GetTrustAnchorRequest, GetTrustAnchorResponse, LinkQualityTable,
-    ListCertsRequest, ListCertsResponse, NodeInfo, NodeMetrics, OgmSchedule, ResolveRouteRequest,
+    ApproveCsrRequest, DenyCsrRequest, GetLinkQualityTableRequest, GetMetricsRequest,
+    GetNodeInfoRequest, GetOgmScheduleRequest, GetRoutingTableRequest, GetSecurityStatusRequest,
+    GetSecurityStatusResponse, GetThroughputRequest, GetTrustAnchorRequest, GetTrustAnchorResponse,
+    LinkQualityTable, ListCertsRequest, ListCertsResponse, ListPendingCsrsRequest,
+    ListPendingCsrsResponse, NodeInfo, NodeMetrics, OgmSchedule, ResolveRouteRequest,
     ResolveRouteResponse, RevokeNodeRequest, RoutingTable, SetAuthRequest, SubmitCsrRequest,
     SubmitCsrResponse, Throughput, WayfinderRequest, WayfinderResponse,
     wayfinder_request::Request as RequestKind, wayfinder_response::Response as ResponseKind,
@@ -330,6 +331,45 @@ impl Client {
             other => Err(unexpected("ListCerts", &other)),
         }
     }
+
+    /// Provider mode: list the CSRs currently awaiting operator approval.
+    pub async fn list_pending_csrs(&mut self) -> anyhow::Result<ListPendingCsrsResponse> {
+        match self
+            .request(RequestKind::ListPendingCsrs(ListPendingCsrsRequest {}))
+            .await?
+        {
+            ResponseKind::ListPendingCsrs(resp) => Ok(resp),
+            other => Err(unexpected("ListPendingCsrs", &other)),
+        }
+    }
+
+    /// Provider mode: approve the pending CSR bound to `node_mac`, so the
+    /// enrolling node collects its certificate on its next poll.
+    pub async fn approve_csr(&mut self, node_mac: &[u8]) -> anyhow::Result<()> {
+        match self
+            .request(RequestKind::ApproveCsr(ApproveCsrRequest {
+                node_mac: node_mac.to_vec(),
+            }))
+            .await?
+        {
+            ResponseKind::Empty(_) => Ok(()),
+            other => Err(unexpected("ApproveCsr", &other)),
+        }
+    }
+
+    /// Provider mode: deny the pending CSR bound to `node_mac`; the enrolling
+    /// node observes a rejection on its next poll.
+    pub async fn deny_csr(&mut self, node_mac: &[u8]) -> anyhow::Result<()> {
+        match self
+            .request(RequestKind::DenyCsr(DenyCsrRequest {
+                node_mac: node_mac.to_vec(),
+            }))
+            .await?
+        {
+            ResponseKind::Empty(_) => Ok(()),
+            other => Err(unexpected("DenyCsr", &other)),
+        }
+    }
 }
 
 impl Drop for Client {
@@ -369,6 +409,7 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
         ResponseKind::SubmitCsr(_) => "SubmitCsr",
         ResponseKind::SecurityStatus(_) => "SecurityStatus",
         ResponseKind::ListCerts(_) => "ListCerts",
+        ResponseKind::ListPendingCsrs(_) => "ListPendingCsrs",
     };
     anyhow!("expected {want} response, got {got}")
 }

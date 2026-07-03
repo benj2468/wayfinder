@@ -7,8 +7,9 @@
 use clap::ValueEnum;
 use serde::Serialize;
 use wayfinder_protos::wayfinder_v1alpha::{
-    GetSecurityStatusResponse, LinkQualityTable, ListCertsResponse, NodeInfo, NodeMetrics,
-    OgmSchedule, ResolveRouteResponse, RoutingTable, Throughput, resolve_route_response::Egress,
+    GetSecurityStatusResponse, LinkQualityTable, ListCertsResponse, ListPendingCsrsResponse,
+    NodeInfo, NodeMetrics, OgmSchedule, ResolveRouteResponse, RoutingTable, Throughput,
+    resolve_route_response::Egress,
 };
 
 /// How a command renders its result.
@@ -224,6 +225,26 @@ pub fn list_certs(v: &ListCertsResponse, fmt: OutputFormat) -> anyhow::Result<St
                 c.not_after,
                 if c.revoked { "revoked" } else { "active" },
                 fingerprint(&c.ed_pubkey),
+            ));
+        }
+        out
+    })
+}
+
+/// Render the provider's [`ListPendingCsrsResponse`] (CSRs awaiting approval).
+pub fn list_pending_csrs(v: &ListPendingCsrsResponse, fmt: OutputFormat) -> anyhow::Result<String> {
+    render(v, fmt, |v| {
+        if v.pending.is_empty() {
+            return "no pending CSRs".to_string();
+        }
+        let mut out = String::from("NODE_MAC           REQUESTED_AT   ED25519    X25519");
+        for c in &v.pending {
+            out.push_str(&format!(
+                "\n{:<18} {:>12}   {:<9}  {}",
+                format_mac(&c.node_mac),
+                c.requested_at,
+                fingerprint(&c.ed_pubkey),
+                fingerprint(&c.x_pubkey),
             ));
         }
         out

@@ -174,6 +174,32 @@ message RevokeNodeRequest {
 // the operator).  Served only by a provider node.
 message ListCertsRequest {}
 
+// List the certificate-signing requests currently awaiting operator approval.
+// A provider configured to require approval parks each incoming CSR here until
+// an operator approves or denies it; this lets the operator (via wayfinderctl or
+// the TUI) see what is waiting.  Served only by a provider node.
+message ListPendingCsrsRequest {}
+
+// Approve a pending certificate-signing request, identified by the enrolling
+// node's MAC.  The provider signs the certificate immediately; the enrolling
+// node collects it on its next SubmitCsr poll.  Served only by a provider node;
+// answered with an Empty response on success, or an error if no CSR for that MAC
+// is pending.
+message ApproveCsrRequest {
+  // The MAC of the pending CSR to approve, as raw bytes.
+  bytes node_mac = 1;
+}
+
+// Deny (drop) a pending certificate-signing request, identified by the enrolling
+// node's MAC.  The request is removed from the pending list and no certificate
+// is issued; a subsequent SubmitCsr from that node would create a fresh pending
+// entry.  Served only by a provider node; answered with an Empty response on
+// success, or an error if no CSR for that MAC is pending.
+message DenyCsrRequest {
+  // The MAC of the pending CSR to deny, as raw bytes.
+  bytes node_mac = 1;
+}
+
 // Top-level request envelope.  Exactly one variant must be set; an empty
 // request (no variant) is treated as a protocol error and returns an
 // ErrorResponse.
@@ -219,6 +245,15 @@ message WayfinderRequest {
 
     // List the certificates this provider has issued (provider mode).
     ListCertsRequest list_certs = 13;
+
+    // List the CSRs awaiting operator approval (provider mode).
+    ListPendingCsrsRequest list_pending_csrs = 14;
+
+    // Approve a pending CSR (provider mode).
+    ApproveCsrRequest approve_csr = 15;
+
+    // Deny a pending CSR (provider mode).
+    DenyCsrRequest deny_csr = 16;
   }
 }
 
@@ -515,9 +550,29 @@ message GetTrustAnchorResponse {
   bytes trust_anchor = 1;
 }
 
-// Answer to a SubmitCsrRequest: the freshly issued certificate plus the anchor
-// it chains to, so the enrolling node has everything it needs to enable auth.
+// Answer to a SubmitCsrRequest.  A CSR is in exactly one of three states, so the
+// response is a sum type: a caller can never observe a contradictory combination
+// (e.g. "pending" together with an issued certificate).
 message SubmitCsrResponse {
+  // The CSR's disposition.  Exactly one variant is set.
+  oneof outcome {
+    // The certificate was issued and is ready to use.
+    CsrIssued issued = 1;
+
+    // The CSR was accepted and is awaiting operator approval.  The client
+    // should poll SubmitCsr again (with the same request) until it resolves to
+    // issued or rejected.
+    CsrPending pending = 2;
+
+    // The CSR was rejected and will not be issued (a bad enrollment token, or an
+    // operator denied it).  The client should stop polling.
+    CsrRejected rejected = 3;
+  }
+}
+
+// A successfully issued certificate: the signed cert plus the trust anchor it
+// chains to, so the enrolling node has everything it needs to enable auth.
+message CsrIssued {
   // The issued membership certificate as raw `MembershipCert` bytes, signed by
   // the mesh root and bound to the requested MAC and public keys.
   bytes cert = 1;
@@ -525,6 +580,17 @@ message SubmitCsrResponse {
   // The mesh trust anchor as raw `TrustAnchor` bytes, for convenience so the
   // node need not fetch it separately.
   bytes trust_anchor = 2;
+}
+
+// A CSR that has been accepted and is waiting for an operator to approve or deny
+// it.  Carries no fields — its presence is the signal to keep polling.
+message CsrPending {}
+
+// A CSR that was rejected and will not be issued.
+message CsrRejected {
+  // Human-readable reason (e.g. "invalid or missing enrollment token" or
+  // "denied by operator"), for the enrolling node to surface to its operator.
+  string reason = 1;
 }
 
 // One certificate this provider has issued, summarised for the operator.
@@ -553,6 +619,30 @@ message ListCertsResponse {
   // updates the existing entry in place).  Empty if the provider has issued none
   // (or was restarted — the list is in-memory).
   repeated IssuedCert certs = 1;
+}
+
+// One CSR awaiting operator approval, summarised for the operator.
+message PendingCsr {
+  // The enrolling node's MAC the certificate would be bound to, as raw bytes.
+  bytes node_mac = 1;
+
+  // The node's Ed25519 identity public key (32 bytes) — its future OGM-signing
+  // identity, shown so the operator can vet what they are approving.
+  bytes ed_pubkey = 2;
+
+  // The node's X25519 public key (32 bytes) — used to derive pairwise
+  // data-plane keys.
+  bytes x_pubkey = 3;
+
+  // When the provider first saw this CSR (unix seconds), so an operator can age
+  // out stale requests.
+  uint64 requested_at = 4;
+}
+
+// Answer to a ListPendingCsrsRequest: the CSRs awaiting operator approval.
+message ListPendingCsrsResponse {
+  // One entry per pending CSR, in first-seen order.  Empty if none are waiting.
+  repeated PendingCsr pending = 1;
 }
 
 // Top-level response envelope.  Always contains exactly one variant.
@@ -598,5 +688,9 @@ message WayfinderResponse {
 
     // Response to ListCertsRequest.
     ListCertsResponse list_certs = 13;
+
+    // Response to ListPendingCsrsRequest.  (ApproveCsr and DenyCsr answer with
+    // the Empty response above.)
+    ListPendingCsrsResponse list_pending_csrs = 14;
   }
 }

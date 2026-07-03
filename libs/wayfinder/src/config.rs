@@ -271,6 +271,23 @@ pub struct ProviderConfig {
     /// closed or simulated networks).
     #[serde(default)]
     pub enrollment_token: Option<String>,
+    /// When `true`, an incoming CSR is parked as *pending* until an operator
+    /// approves it (`wayfinderctl csr approve`), rather than being signed on
+    /// submission.  Defaults to `false` (open/token-gated enrollment).
+    #[serde(default)]
+    pub require_approval: bool,
+    /// How long a held CSR (pending, approved-but-uncollected, or a denial
+    /// tombstone) survives before it is evicted, in seconds.  Eviction bounds
+    /// the held-CSR table and frees a MAC for a fresh request after a stale one
+    /// times out.  Defaults to one hour — long enough for a human operator to
+    /// approve, short enough to keep the table small.
+    #[serde(default = "default_pending_ttl_secs")]
+    pub pending_ttl_secs: u64,
+}
+
+/// Default [`ProviderConfig::pending_ttl_secs`]: one hour.
+fn default_pending_ttl_secs() -> u64 {
+    3600
 }
 
 #[cfg(test)]

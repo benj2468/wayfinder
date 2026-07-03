@@ -18,9 +18,10 @@ use wayfinder::wayfinder_auth::MembershipCert;
 use wayfinder::wayfinder_auth::RevocationRecord;
 use wayfinder::wayfinder_auth::TrustAnchor;
 use wayfinder_protos::service::{
-    EgressDecisionData, EnrollData, InterfaceThroughputData, IssuedCertData, LinkQualityEntryData,
-    NeighborPathData, NodeMetricsData, NodeSecurityData, OgmScheduleEntryData, RouteResolutionData,
-    RoutingEntryData, SecurityStatusData, TableOccupancyData, WayfinderDataProvider,
+    CsrOutcome, EgressDecisionData, InterfaceThroughputData, IssuedCertData, LinkQualityEntryData,
+    NeighborPathData, NodeMetricsData, NodeSecurityData, OgmScheduleEntryData, PendingCsrData,
+    RouteResolutionData, RoutingEntryData, SecurityStatusData, TableOccupancyData,
+    WayfinderDataProvider,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -270,26 +271,38 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
         }
     }
 
-    /// TODO: In reality, this needs to be asynchronous...
-    /// You might want the auth provider to need to approve this.
-    ///
-    /// Instead, we should save this to some state, and allow the CTL or TUI
-    /// to read (pending CSRs). A request to this API again with an approved CSR
-    /// will return it's signed certificiate.
     fn submit_csr(
         &mut self,
         node_mac: &[u8],
         ed_pubkey: &[u8],
         x_pubkey: &[u8],
         enrollment_token: &str,
-    ) -> Result<EnrollData, String> {
-        let ca = self
-            .ca
+    ) -> Result<CsrOutcome, String> {
+        self.ca
             .as_mut()
-            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?;
-        let cert = ca.issue_cert(node_mac, ed_pubkey, x_pubkey, enrollment_token)?;
-        let trust_anchor = ca.trust_anchor_bytes();
-        Ok(EnrollData { cert, trust_anchor })
+            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
+            .submit_csr(node_mac, ed_pubkey, x_pubkey, enrollment_token)
+    }
+
+    fn list_pending_csrs(&self) -> Result<Vec<PendingCsrData>, String> {
+        match &self.ca {
+            Some(ca) => Ok(ca.list_pending()),
+            None => Err("node is not a certificate-authority provider".to_string()),
+        }
+    }
+
+    fn approve_csr(&mut self, node_mac: &[u8]) -> Result<(), String> {
+        self.ca
+            .as_mut()
+            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
+            .approve_csr(node_mac)
+    }
+
+    fn deny_csr(&mut self, node_mac: &[u8]) -> Result<(), String> {
+        self.ca
+            .as_mut()
+            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
+            .deny_csr(node_mac)
     }
 
     fn revoke_node(&mut self, node_mac: &[u8]) -> Result<(), String> {
@@ -337,6 +350,24 @@ mod tests {
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])
+    }
+
+    /// Mint a cert directly from the CA, returning the raw cert bytes — the
+    /// setup shorthand these tests need.  Issues straight through `issue` rather
+    /// than round-tripping the client-facing `submit_csr` path (which is about
+    /// requesting a cert, not the deterministic setup these tests want).
+    fn ca_issue(
+        ca: &mut crate::CertAuthority,
+        mac: &[u8],
+        ed: &[u8],
+        x: &[u8],
+    ) -> alloc::vec::Vec<u8> {
+        ca.issue(
+            Mac::try_from(mac).unwrap(),
+            ed.try_into().unwrap(),
+            x.try_into().unwrap(),
+        )
+        .cert
     }
 
     /// Serialise a link frame carrying `payload` from `src` to `dst`.
@@ -425,16 +456,14 @@ mod tests {
         use wayfinder::auth::OgmAuth;
         use wayfinder::wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
 
-        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None);
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
         ca.set_now_unix(100);
 
         // The provider node is itself an authenticated member: its own CA issues
         // its cert.
         let kp = Keypair::from_seed(&[2; 32]);
         let me = mac(1);
-        let cert_bytes = ca
-            .issue_cert(&me.0, &kp.ed_pubkey(), &kp.x_pubkey(), "")
-            .unwrap();
+        let cert_bytes = ca_issue(&mut ca, &me.0, &kp.ed_pubkey(), &kp.x_pubkey());
         let cert = MembershipCert::from_bytes(&cert_bytes).unwrap();
         let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
 
@@ -472,17 +501,19 @@ mod tests {
         use wayfinder::auth::OgmAuth;
         use wayfinder::wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
 
-        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None);
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
         ca.set_now_unix(100);
         let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
 
         // Self node mac(1), authenticated by the CA (cert not_after = 100 + 1000).
         let me = mac(1);
         let kp1 = Keypair::from_seed(&[2; 32]);
-        let cert1 = MembershipCert::from_bytes(
-            &ca.issue_cert(&me.0, &kp1.ed_pubkey(), &kp1.x_pubkey(), "")
-                .unwrap(),
-        )
+        let cert1 = MembershipCert::from_bytes(&ca_issue(
+            &mut ca,
+            &me.0,
+            &kp1.ed_pubkey(),
+            &kp1.x_pubkey(),
+        ))
         .unwrap();
         let mut router = CentralRouter::new(me);
         router.set_auth(OgmAuth::new(kp1, cert1, anchor));
@@ -492,10 +523,12 @@ mod tests {
         // it as an originator carrying its cert expiry.
         let peer = mac(2);
         let kp2 = Keypair::from_seed(&[3; 32]);
-        let cert2 = MembershipCert::from_bytes(
-            &ca.issue_cert(&peer.0, &kp2.ed_pubkey(), &kp2.x_pubkey(), "")
-                .unwrap(),
-        )
+        let cert2 = MembershipCert::from_bytes(&ca_issue(
+            &mut ca,
+            &peer.0,
+            &kp2.ed_pubkey(),
+            &kp2.x_pubkey(),
+        ))
         .unwrap();
         let mut peer_auth = OgmAuth::new(kp2, cert2, anchor);
         peer_auth.set_time(100);
@@ -572,7 +605,7 @@ mod tests {
     fn revoke_node_errors_when_provider_router_has_no_auth() {
         use crate::CertAuthority;
 
-        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None);
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
         ca.set_now_unix(100);
         let mut router = CentralRouter::new(mac(1)); // auth disabled
         let mut adapter = RouterAdapter::new(&mut router, Some(&mut ca), Duration::from_secs(0));

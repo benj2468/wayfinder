@@ -131,6 +131,18 @@ impl From<Mac> for [u8; 6] {
     }
 }
 
+impl TryFrom<&[u8]> for Mac {
+    type Error = core::array::TryFromSliceError;
+
+    /// Build a [`Mac`] from a byte slice, failing if it is not exactly 6 bytes.
+    /// Convenience for callers that receive a MAC as a variable-length slice
+    /// (e.g. off the wire) and want the length check and array conversion in one
+    /// step rather than open-coding `TryInto` at every call site.
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        Ok(Mac(<[u8; 6]>::try_from(bytes)?))
+    }
+}
+
 impl MeshIdentifier for Mac {
     const BROADCAST: Self = Mac::BROADCAST;
 }
