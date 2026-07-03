@@ -212,12 +212,7 @@ async fn main() -> anyhow::Result<()> {
                     provider_cfg.root_seed_path
                 )
             })?;
-        driver.set_provider(CertAuthority::new(
-            &root_seed,
-            provider_cfg.mesh_id,
-            provider_cfg.cert_ttl_secs,
-            provider_cfg.enrollment_token,
-        ));
+        driver.set_provider(CertAuthority::from_config(&root_seed, &provider_cfg));
         tracing::info!(
             "certificate-authority (provider) mode enabled (mesh_id = {:#x})",
             provider_cfg.mesh_id

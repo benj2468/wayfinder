@@ -37,6 +37,71 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Tab::Security => render_security(frame, app, chunks[1]),
     }
     render_status(frame, app, chunks[2]);
+
+    // A confirmation popup (approve/deny) overlays everything else, drawn last so
+    // it sits on top.
+    if let Some(action) = app.confirm.clone() {
+        render_confirm_popup(frame, &action, frame.area());
+    }
+}
+
+/// Draw the modal approve/deny/revoke confirmation popup centred over the frame.
+fn render_confirm_popup(frame: &mut Frame, action: &crate::app::OperatorAction, area: Rect) {
+    use crate::app::OperatorAction;
+    // (verb, subject phrase, target MAC, accent colour).
+    let (verb, subject, mac, colour) = match action {
+        OperatorAction::ApproveCsr(mac) => ("Approve", " the CSR from ", mac, Color::Green),
+        OperatorAction::DenyCsr(mac) => ("Deny", " the CSR from ", mac, Color::Red),
+        OperatorAction::RevokeNode(mac) => ("Revoke", " node ", mac, Color::Red),
+    };
+
+    // Centre a small fixed-size box within `area`.
+    let popup = centered_rect(56, 7, area);
+    // Clear whatever is underneath so the popup is opaque.
+    frame.render_widget(ratatui::widgets::Clear, popup);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                verb,
+                Style::default().fg(colour).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(subject),
+            Span::styled(
+                format_id(mac),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("?"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  y / Enter: confirm      n / Esc: cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    let para = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(colour))
+            .title(" Confirm "),
+    );
+    frame.render_widget(para, popup);
+}
+
+/// A `Rect` of the given width/height centred within `area` (clamped to fit).
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
 }
 
 /// Draw the top tab bar.
@@ -458,16 +523,114 @@ fn render_throughput_chart(frame: &mut Frame, app: &App, area: Rect) {
 /// Draw the Security tab: the mesh authentication header above a per-originator
 /// table (verified / cert expiry / revoked).
 fn render_security(frame: &mut Frame, app: &mut App, area: Rect) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(7), // mesh-level header
-            Constraint::Min(0),    // per-originator table
-        ])
-        .split(area);
+    use crate::app::SecurityFocus;
+    // A certificate-authority provider gets an extra panel listing the CSRs
+    // awaiting its operator's approval, and can revoke originators; a non-provider
+    // node omits the CSR panel and cannot revoke.
+    let n_pending = app.snapshot.pending_csrs.as_ref().map(|p| p.pending.len());
+    match n_pending {
+        Some(n) => {
+            let csr_focused = app.security_focus == SecurityFocus::PendingCsrs;
+            // Size the CA panel to its rows (header + border), capped so a burst
+            // of requests can't crowd out the originator table.
+            let ca_height = (n as u16 + 3).clamp(4, 12);
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(7),         // mesh-level header
+                    Constraint::Length(ca_height), // provider: pending CSRs
+                    Constraint::Min(0),            // per-originator table
+                ])
+                .split(area);
+            render_security_header(frame, app, rows[0]);
+            render_pending_csrs(frame, app, rows[1], csr_focused);
+            render_security_table(frame, app, rows[2], !csr_focused, true);
+        }
+        None => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(7), // mesh-level header
+                    Constraint::Min(0),    // per-originator table
+                ])
+                .split(area);
+            render_security_header(frame, app, rows[0]);
+            // Non-provider: the originator table is the only (read-only) panel.
+            render_security_table(frame, app, rows[1], false, false);
+        }
+    }
+}
 
-    render_security_header(frame, app, rows[0]);
-    render_security_table(frame, app, rows[1]);
+/// Border style marking whether a Security-tab panel currently holds navigation
+/// focus (accent when focused, dim otherwise).
+fn focus_border(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+/// The certificate-authority panel: CSRs awaiting this operator's approval.
+/// Shown only when the connected node is a provider.  The selected row is
+/// approved with `a` / denied with `d` (or from the CLI, `wayfinderctl csr
+/// approve|deny --mac <mac>`).
+fn render_pending_csrs(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(focus_border(focused))
+        .title(" Certificate Authority — pending CSRs  (a: approve, d: deny) ");
+
+    let Some(pending) = app.snapshot.pending_csrs.as_ref() else {
+        return;
+    };
+    if pending.pending.is_empty() {
+        let para = Paragraph::new(Line::from(Span::styled(
+            "(no CSRs awaiting approval)",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .block(block);
+        frame.render_widget(para, area);
+        return;
+    }
+
+    let header = Row::new(["Node", "Requested", "Ed25519", "X25519"])
+        .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+    let rows: Vec<Row> = pending
+        .pending
+        .iter()
+        .map(|c| {
+            Row::new(vec![
+                Cell::from(format_id(&c.node_mac)),
+                Cell::from(c.requested_at.to_string()),
+                Cell::from(fingerprint(&c.ed_pubkey)),
+                Cell::from(fingerprint(&c.x_pubkey)),
+            ])
+        })
+        .collect();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(12),
+            Constraint::Length(12),
+            Constraint::Length(10),
+            Constraint::Length(10),
+        ],
+    )
+    .header(header)
+    .block(block)
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::Blue)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("▶ ");
+    frame.render_stateful_widget(table, area, &mut app.csr_state);
+}
+
+/// First four bytes of a public key as hex — a compact fingerprint column.
+fn fingerprint(key: &[u8]) -> String {
+    key.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
 /// The mesh-level crypto header: auth on/off, mesh id, this node's own cert and
@@ -498,7 +661,13 @@ fn render_security_header(frame: &mut Frame, app: &App, area: Rect) {
 
 /// The per-originator security table: identity, whether its OGM cert verified,
 /// the cert expiry, and revocation status.
-fn render_security_table(frame: &mut Frame, app: &mut App, area: Rect) {
+fn render_security_table(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    focused: bool,
+    can_revoke: bool,
+) {
     let header = Row::new(["Node", "Verified", "Expires", "Status"])
         .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
 
@@ -551,7 +720,14 @@ fn render_security_table(frame: &mut Frame, app: &mut App, area: Rect) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Originators "),
+            .border_style(focus_border(focused))
+            // The revoke hint appears only on a provider, which can actually
+            // sign and flood a revocation.
+            .title(if can_revoke {
+                " Originators  (x: revoke) "
+            } else {
+                " Originators "
+            }),
     )
     .row_highlight_style(
         Style::default()
@@ -805,13 +981,33 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans = vec![
         Span::styled(" q ", Style::default().fg(Color::Black).bg(ACCENT)),
         Span::raw(" quit  "),
-        Span::styled(" ←/→ Tab ", Style::default().fg(Color::Black).bg(ACCENT)),
+        Span::styled(" ←/→ ", Style::default().fg(Color::Black).bg(ACCENT)),
         Span::raw(" switch  "),
         Span::styled(" ↑/↓ ", Style::default().fg(Color::Black).bg(ACCENT)),
         Span::raw(" select  "),
         Span::styled(" r ", Style::default().fg(Color::Black).bg(ACCENT)),
         Span::raw(" refresh  "),
     ];
+
+    // Security-tab operator actions (provider node only): approve/deny CSRs,
+    // revoke originators, and Tab to switch which panel has focus.
+    if app.tab == Tab::Security && app.snapshot.pending_csrs.is_some() {
+        spans.push(Span::styled(
+            " Tab ",
+            Style::default().fg(Color::Black).bg(ACCENT),
+        ));
+        spans.push(Span::raw(" focus  "));
+        spans.push(Span::styled(
+            " a/d ",
+            Style::default().fg(Color::Black).bg(Color::Green),
+        ));
+        spans.push(Span::raw(" appr/deny  "));
+        spans.push(Span::styled(
+            " x ",
+            Style::default().fg(Color::Black).bg(Color::Red),
+        ));
+        spans.push(Span::raw(" revoke  "));
+    }
 
     let status = match &app.last_error {
         Some(err) => Span::styled(
@@ -893,5 +1089,123 @@ mod tests {
             "relay-oversize-drops row missing"
         );
         assert!(text.contains("17"), "relay-oversize-drops value missing");
+    }
+
+    /// The Security tab shows the provider CSR panel only when the connected node
+    /// is a certificate-authority provider (i.e. `pending_csrs` is `Some`), and
+    /// lists each pending request there.
+    #[test]
+    fn security_tab_shows_pending_csrs_only_for_a_provider() {
+        use wayfinder_protos::wayfinder_v1alpha::{
+            GetSecurityStatusResponse, ListPendingCsrsResponse, PendingCsr,
+        };
+
+        let mut app = App::new("test".to_string(), 1000);
+        app.tab = Tab::Security;
+        app.snapshot.security = Some(GetSecurityStatusResponse {
+            auth_enabled: true,
+            mesh_id: 0xABCD,
+            node_mac: vec![2, 0, 0, 0, 0, 1],
+            ..Default::default()
+        });
+
+        let render_to_text = |app: &mut App| -> String {
+            let backend = TestBackend::new(100, 30);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            terminal.draw(|frame| render(frame, app)).expect("draw");
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect()
+        };
+
+        // Non-provider node: no CA panel.
+        app.snapshot.pending_csrs = None;
+        assert!(!render_to_text(&mut app).contains("pending CSRs"));
+
+        // Provider node with one waiting CSR: the panel appears and lists it.
+        app.snapshot.pending_csrs = Some(ListPendingCsrsResponse {
+            pending: vec![PendingCsr {
+                node_mac: vec![2, 0, 0, 0, 0, 9],
+                ed_pubkey: vec![0xab; 32],
+                x_pubkey: vec![0xcd; 32],
+                requested_at: 1234,
+            }],
+        });
+        let text = render_to_text(&mut app);
+        assert!(text.contains("pending CSRs"), "CA panel missing");
+        assert!(text.contains("02:00:00:00:00:09"), "pending MAC missing");
+
+        // Staging an approve opens the modal confirmation popup over the tab.
+        app.tab = Tab::Security;
+        app.csr_state.select(Some(0)); // a selection is required to act
+        app.request_csr_action(true);
+        let text = render_to_text(&mut app);
+        assert!(text.contains("Confirm"), "confirmation popup missing");
+        assert!(
+            text.contains("Approve the CSR from"),
+            "popup prompt missing"
+        );
+        assert!(
+            text.contains("02:00:00:00:00:09"),
+            "popup target MAC missing"
+        );
+    }
+
+    /// On a provider the originator panel offers a revoke action, and staging one
+    /// opens the revoke confirmation popup.
+    #[test]
+    fn security_tab_offers_revoke_for_a_provider() {
+        use crate::app::SecurityFocus;
+        use wayfinder_protos::wayfinder_v1alpha::{
+            GetSecurityStatusResponse, ListPendingCsrsResponse, NodeSecurity,
+        };
+
+        let mut app = App::new("test".to_string(), 1000);
+        app.tab = Tab::Security;
+        app.snapshot.pending_csrs = Some(ListPendingCsrsResponse::default());
+        app.snapshot.security = Some(GetSecurityStatusResponse {
+            auth_enabled: true,
+            nodes: vec![NodeSecurity {
+                node_id: vec![2, 0, 0, 0, 0, 7],
+                verified: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let render_to_text = |app: &mut App| -> String {
+            let backend = TestBackend::new(100, 30);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            terminal.draw(|frame| render(frame, app)).expect("draw");
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect()
+        };
+
+        // The originator panel advertises the revoke key.
+        assert!(
+            render_to_text(&mut app).contains("x: revoke"),
+            "revoke hint missing"
+        );
+
+        // Focus the originator panel, select a node, and stage a revoke.
+        app.security_focus = SecurityFocus::Originators;
+        app.security_state.select(Some(0));
+        app.request_revoke();
+        let text = render_to_text(&mut app);
+        assert!(text.contains("Confirm"), "revoke popup missing");
+        assert!(text.contains("Revoke node"), "revoke prompt missing");
+        assert!(
+            text.contains("02:00:00:00:00:07"),
+            "revoke target MAC missing"
+        );
     }
 }

@@ -7,8 +7,8 @@ use std::time::Instant;
 use ratatui::widgets::TableState;
 use serde::{Deserialize, Serialize};
 use wayfinder_protos::wayfinder_v1alpha::{
-    GetSecurityStatusResponse, LinkQualityTable, NodeInfo, NodeMetrics, NodeSecurity, OgmSchedule,
-    RoutingTable, Throughput,
+    GetSecurityStatusResponse, LinkQualityTable, ListPendingCsrsResponse, NodeInfo, NodeMetrics,
+    NodeSecurity, OgmSchedule, RoutingTable, Throughput,
 };
 
 /// The top-level views the TUI cycles between.
@@ -70,6 +70,33 @@ impl Tab {
     }
 }
 
+/// An operator action queued by a keypress on the Security tab, to be executed
+/// against the connected provider node by the async event loop (which owns the
+/// client).  The synchronous key handler cannot do I/O itself, so it parks the
+/// intent here and the loop drains it.
+/// Every variant carries the target node MAC (raw bytes).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OperatorAction {
+    /// Approve the pending CSR bound to this node MAC.
+    ApproveCsr(Vec<u8>),
+    /// Deny the pending CSR bound to this node MAC.
+    DenyCsr(Vec<u8>),
+    /// Revoke this node from the mesh (the provider signs and floods a
+    /// revocation record).
+    RevokeNode(Vec<u8>),
+}
+
+/// Which panel on the Security tab has navigation focus.  Only meaningful on a
+/// certificate-authority provider, where the tab shows two actionable tables;
+/// a non-provider node shows only the originator table.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SecurityFocus {
+    /// The pending-CSR table (approve/deny).
+    PendingCsrs,
+    /// The originator table (revoke).
+    Originators,
+}
+
 /// The latest successful snapshot of router state.
 #[derive(Default)]
 pub struct Snapshot {
@@ -88,6 +115,10 @@ pub struct Snapshot {
     pub metrics: Option<NodeMetrics>,
     /// Mesh authentication / security posture, or `None` until the first fetch.
     pub security: Option<GetSecurityStatusResponse>,
+    /// CSRs awaiting operator approval, when the connected node is a
+    /// certificate-authority provider.  `None` when it is not a provider (the
+    /// enrollment RPCs error) or before the first fetch.
+    pub pending_csrs: Option<ListPendingCsrsResponse>,
 }
 
 /// Maximum number of throughput samples retained for the Metrics tab history
@@ -137,6 +168,22 @@ pub struct App {
     pub metrics_state: TableState,
     /// Selection state for the per-originator table on the Security tab.
     pub security_state: TableState,
+    /// Selection state for the pending-CSR table on the Security tab (provider
+    /// mode).  When the connected node is a provider, this panel takes the tab's
+    /// `j`/`k` navigation and `a`/`d` approve/deny keys while it holds focus.
+    pub csr_state: TableState,
+    /// Which Security-tab panel has navigation focus on a provider node.  `Tab`
+    /// switches focus between the pending-CSR and originator tables; ignored on a
+    /// non-provider node (which shows only the originator table).
+    pub security_focus: SecurityFocus,
+    /// A proposed action (approve/deny a CSR, or revoke a node) awaiting operator
+    /// confirmation.  While `Some`, a modal popup is shown and captures all keys
+    /// until the operator confirms (moving it to `pending_action`) or cancels.
+    pub confirm: Option<OperatorAction>,
+    /// A confirmed approve/deny action awaiting execution by the event loop
+    /// against the connected node (only this loop owns the client).  Set by
+    /// [`App::confirm_action`] and taken by the loop.
+    pub pending_action: Option<OperatorAction>,
     /// Rolling history of node-wide throughput totals, oldest first, capped at
     /// [`THROUGHPUT_HISTORY`] samples. Drives the Metrics tab RX/TX line chart.
     pub throughput_history: VecDeque<ThroughputSample>,
@@ -164,6 +211,10 @@ impl App {
             ogm_state: TableState::default(),
             metrics_state: TableState::default(),
             security_state: TableState::default(),
+            csr_state: TableState::default(),
+            security_focus: SecurityFocus::PendingCsrs,
+            confirm: None,
+            pending_action: None,
             throughput_history: VecDeque::with_capacity(THROUGHPUT_HISTORY),
             last_error: None,
             last_update: None,
@@ -189,10 +240,18 @@ impl App {
                 &mut self.metrics_state,
                 self.snapshot.throughput.interfaces.len(),
             ),
-            Tab::Security => (
-                &mut self.security_state,
-                self.snapshot.security.as_ref().map_or(0, |s| s.nodes.len()),
-            ),
+            // On a provider node navigation drives whichever panel holds focus;
+            // a non-provider node has only the originator table.
+            Tab::Security => {
+                let nodes = self.snapshot.security.as_ref().map_or(0, |s| s.nodes.len());
+                let pending = self.snapshot.pending_csrs.as_ref().map(|p| p.pending.len());
+                match (pending, self.security_focus) {
+                    (Some(n), SecurityFocus::PendingCsrs) => (&mut self.csr_state, n),
+                    (Some(_), SecurityFocus::Originators) | (None, _) => {
+                        (&mut self.security_state, nodes)
+                    }
+                }
+            }
             Tab::Overview => return,
         };
         if len == 0 {
@@ -202,6 +261,84 @@ impl App {
         let current = state.selected().unwrap_or(0) as isize;
         let next = (current + delta).rem_euclid(len as isize) as usize;
         state.select(Some(next));
+    }
+
+    /// The node MAC of the currently-selected pending CSR, if the Security tab's
+    /// provider panel has a selection.  `None` when the node is not a provider or
+    /// nothing is selected.
+    pub fn selected_pending_csr_mac(&self) -> Option<Vec<u8>> {
+        let pending = self.snapshot.pending_csrs.as_ref()?;
+        let idx = self.csr_state.selected()?;
+        pending.pending.get(idx).map(|c| c.node_mac.clone())
+    }
+
+    /// The node MAC of the currently-selected originator, if the Security tab's
+    /// originator table has a selection.  `None` otherwise.
+    pub fn selected_originator_mac(&self) -> Option<Vec<u8>> {
+        let security = self.snapshot.security.as_ref()?;
+        let idx = self.security_state.selected()?;
+        security.nodes.get(idx).map(|n| n.node_id.clone())
+    }
+
+    /// Switch navigation focus between the two Security-tab panels.  A no-op
+    /// unless the Security tab is showing both (i.e. a provider node).
+    pub fn toggle_security_focus(&mut self) {
+        if self.tab != Tab::Security || self.snapshot.pending_csrs.is_none() {
+            return;
+        }
+        self.security_focus = match self.security_focus {
+            SecurityFocus::PendingCsrs => SecurityFocus::Originators,
+            SecurityFocus::Originators => SecurityFocus::PendingCsrs,
+        };
+    }
+
+    /// Propose an approve (`approve = true`) or deny action for the selected
+    /// pending CSR, opening a confirmation popup.  A no-op unless the Security
+    /// tab's pending-CSR panel is focused and a CSR is selected, so the keys are
+    /// inert elsewhere.  The action does not execute until [`confirm_action`] is
+    /// called.
+    ///
+    /// [`confirm_action`]: App::confirm_action
+    pub fn request_csr_action(&mut self, approve: bool) {
+        if self.tab != Tab::Security || self.security_focus != SecurityFocus::PendingCsrs {
+            return;
+        }
+        if let Some(mac) = self.selected_pending_csr_mac() {
+            self.confirm = Some(if approve {
+                OperatorAction::ApproveCsr(mac)
+            } else {
+                OperatorAction::DenyCsr(mac)
+            });
+        }
+    }
+
+    /// Propose revoking the selected originator, opening a confirmation popup.  A
+    /// no-op unless the Security tab's originator panel is focused on a provider
+    /// node with an originator selected (revocation requires the CA).  Does not
+    /// execute until [`confirm_action`] is called.
+    ///
+    /// [`confirm_action`]: App::confirm_action
+    pub fn request_revoke(&mut self) {
+        if self.tab != Tab::Security
+            || self.security_focus != SecurityFocus::Originators
+            || self.snapshot.pending_csrs.is_none()
+        {
+            return;
+        }
+        if let Some(mac) = self.selected_originator_mac() {
+            self.confirm = Some(OperatorAction::RevokeNode(mac));
+        }
+    }
+
+    /// Confirm the proposed action: move it from the popup to the execution
+    /// queue, which the event loop drains.  A no-op if no popup is open.
+    pub fn confirm_action(&mut self) {
+        self.pending_action = self.confirm.take();
+    }
+
+    /// Dismiss the confirmation popup without acting.
+    pub fn cancel_action(&mut self) {
+        self.confirm = None;
     }
 
     /// Append the latest node-wide throughput totals from the current snapshot
@@ -298,6 +435,154 @@ mod tests {
         assert!(n.verified);
         assert_eq!(n.cert_not_after, 1100);
         assert!(app.snapshot.security_for(&[0, 0, 0, 0, 0, 9]).is_none());
+    }
+
+    #[test]
+    fn csr_action_is_queued_only_on_the_security_tab_of_a_provider() {
+        use wayfinder_protos::wayfinder_v1alpha::{ListPendingCsrsResponse, PendingCsr};
+
+        let mut app = App::new("test".to_string(), 1000);
+        app.snapshot.pending_csrs = Some(ListPendingCsrsResponse {
+            pending: vec![
+                PendingCsr {
+                    node_mac: vec![2, 0, 0, 0, 0, 9],
+                    ..Default::default()
+                },
+                PendingCsr {
+                    node_mac: vec![2, 0, 0, 0, 0, 10],
+                    ..Default::default()
+                },
+            ],
+        });
+
+        // Off the Security tab, the keys are inert.
+        app.tab = Tab::Routing;
+        app.request_csr_action(true);
+        assert!(app.confirm.is_none());
+
+        // On the Security tab, a pending CSR is selected and requesting an action
+        // opens a confirmation popup (it does not execute yet).
+        app.tab = Tab::Security;
+        app.csr_state.select(Some(1)); // target the second pending CSR
+        app.request_csr_action(true);
+        assert_eq!(
+            app.confirm,
+            Some(OperatorAction::ApproveCsr(vec![2, 0, 0, 0, 0, 10])),
+            "approve proposes but waits for confirmation"
+        );
+        assert!(
+            app.pending_action.is_none(),
+            "nothing executes until confirmed"
+        );
+
+        // Cancelling clears the popup without queueing anything.
+        app.cancel_action();
+        assert!(app.confirm.is_none());
+        assert!(app.pending_action.is_none());
+
+        // Confirming commits the proposed action for the loop to execute.
+        app.request_csr_action(false);
+        assert_eq!(
+            app.confirm,
+            Some(OperatorAction::DenyCsr(vec![2, 0, 0, 0, 0, 10]))
+        );
+        app.confirm_action();
+        assert!(app.confirm.is_none());
+        assert_eq!(
+            app.pending_action,
+            Some(OperatorAction::DenyCsr(vec![2, 0, 0, 0, 0, 10]))
+        );
+    }
+
+    #[test]
+    fn csr_action_is_inert_on_a_non_provider_node() {
+        let mut app = App::new("test".to_string(), 1000);
+        app.tab = Tab::Security;
+        app.snapshot.pending_csrs = None; // not a provider
+        app.request_csr_action(true);
+        assert!(app.confirm.is_none());
+        assert!(app.pending_action.is_none());
+    }
+
+    /// A small provider snapshot: one pending CSR and one known originator.
+    fn provider_app() -> App {
+        use wayfinder_protos::wayfinder_v1alpha::{
+            GetSecurityStatusResponse, ListPendingCsrsResponse, NodeSecurity, PendingCsr,
+        };
+        let mut app = App::new("test".to_string(), 1000);
+        app.tab = Tab::Security;
+        app.snapshot.pending_csrs = Some(ListPendingCsrsResponse {
+            pending: vec![PendingCsr {
+                node_mac: vec![2, 0, 0, 0, 0, 9],
+                ..Default::default()
+            }],
+        });
+        app.snapshot.security = Some(GetSecurityStatusResponse {
+            auth_enabled: true,
+            nodes: vec![NodeSecurity {
+                node_id: vec![2, 0, 0, 0, 0, 7],
+                verified: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        app
+    }
+
+    #[test]
+    fn tab_switches_security_focus_only_on_a_provider() {
+        let mut app = provider_app();
+        assert_eq!(app.security_focus, SecurityFocus::PendingCsrs);
+        app.toggle_security_focus();
+        assert_eq!(app.security_focus, SecurityFocus::Originators);
+        app.toggle_security_focus();
+        assert_eq!(app.security_focus, SecurityFocus::PendingCsrs);
+
+        // Non-provider: focus toggle is inert.
+        app.snapshot.pending_csrs = None;
+        app.toggle_security_focus();
+        assert_eq!(app.security_focus, SecurityFocus::PendingCsrs);
+    }
+
+    #[test]
+    fn revoke_is_proposed_only_with_originator_focus_on_a_provider() {
+        let mut app = provider_app();
+        app.security_state.select(Some(0));
+
+        // With CSR focus, `x` does not revoke (it belongs to the originator pane).
+        app.security_focus = SecurityFocus::PendingCsrs;
+        app.request_revoke();
+        assert!(app.confirm.is_none());
+
+        // Switching focus to the originator pane, `x` proposes revoking it.
+        app.security_focus = SecurityFocus::Originators;
+        app.request_revoke();
+        assert_eq!(
+            app.confirm,
+            Some(OperatorAction::RevokeNode(vec![2, 0, 0, 0, 0, 7]))
+        );
+        app.confirm_action();
+        assert_eq!(
+            app.pending_action,
+            Some(OperatorAction::RevokeNode(vec![2, 0, 0, 0, 0, 7]))
+        );
+
+        // A non-provider node cannot revoke.
+        let mut app = provider_app();
+        app.snapshot.pending_csrs = None;
+        app.security_focus = SecurityFocus::Originators;
+        app.security_state.select(Some(0));
+        app.request_revoke();
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn approve_is_inert_while_the_originator_pane_is_focused() {
+        let mut app = provider_app();
+        app.csr_state.select(Some(0));
+        app.security_focus = SecurityFocus::Originators;
+        app.request_csr_action(true);
+        assert!(app.confirm.is_none(), "approve belongs to the CSR pane");
     }
 
     fn app_with_routes(n: usize) -> App {

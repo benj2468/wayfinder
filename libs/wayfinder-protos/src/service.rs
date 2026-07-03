@@ -1,11 +1,13 @@
 use crate::wayfinder_v1alpha::Empty;
 use crate::wayfinder_v1alpha::{
-    AllInterfacesEgress, ErrorResponse, GetSecurityStatusResponse, GetTrustAnchorResponse,
-    InterfaceThroughput, IssuedCert, LinkQualityEntry, LinkQualityTable, ListCertsResponse,
-    NeighborPath, NodeInfo, NodeMetrics, NodeSecurity, OgmSchedule, OgmScheduleEntry,
+    AllInterfacesEgress, CsrIssued, CsrPending, CsrRejected, ErrorResponse,
+    GetSecurityStatusResponse, GetTrustAnchorResponse, InterfaceThroughput, IssuedCert,
+    LinkQualityEntry, LinkQualityTable, ListCertsResponse, ListPendingCsrsResponse, NeighborPath,
+    NodeInfo, NodeMetrics, NodeSecurity, OgmSchedule, OgmScheduleEntry, PendingCsr,
     ResolveRouteResponse, RoutingEntry, RoutingTable, SubmitCsrResponse, TableOccupancy,
     Throughput, WayfinderRequest, WayfinderResponse, resolve_route_response::Egress as EgressKind,
-    wayfinder_request::Request as RequestKind, wayfinder_response::Response as ResponseKind,
+    submit_csr_response::Outcome as CsrOutcomeKind, wayfinder_request::Request as RequestKind,
+    wayfinder_response::Response as ResponseKind,
 };
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -228,36 +230,90 @@ pub trait WayfinderDataProvider {
     /// default errors — only a node running as a certificate-authority provider
     /// overrides these three methods.
     fn get_trust_anchor(&self) -> Result<Vec<u8>, String> {
-        Err(String::from("node is not a certificate-authority provider"))
+        Err("node is not a certificate-authority provider".into())
     }
 
-    /// TODO: In reality, this needs to be asynchronous...
-    /// You might want the auth provider to need to approve this.
-    /// Provider mode: issue a membership certificate for a CSR, returning the
-    /// signed cert plus the trust anchor it chains to.  Default errors.
+    /// Provider mode: submit a certificate-signing request.  Returns the CSR's
+    /// [`CsrOutcome`] — issued (with the cert + anchor), pending operator
+    /// approval, or rejected — so a polling client can drive enrollment to a
+    /// terminal state.  The `Err` variant is reserved for the request being
+    /// unserviceable (this node is not a provider, the authority clock is unset,
+    /// or the inputs are malformed), as distinct from a `Rejected` *outcome* of
+    /// a well-formed CSR.  Default errors (not a provider).
     fn submit_csr(
         &mut self,
         node_mac: &[u8],
         ed_pubkey: &[u8],
         x_pubkey: &[u8],
         enrollment_token: &str,
-    ) -> Result<EnrollData, String> {
+    ) -> Result<CsrOutcome, String> {
         let _ = (node_mac, ed_pubkey, x_pubkey, enrollment_token);
-        Err(String::from("node is not a certificate-authority provider"))
+        Err("node is not a certificate-authority provider".into())
     }
 
     /// Provider mode: revoke a node, signing and flooding a revocation record.
     /// Default errors.
     fn revoke_node(&mut self, node_mac: &[u8]) -> Result<(), String> {
         let _ = node_mac;
-        Err(String::from("node is not a certificate-authority provider"))
+        Err("node is not a certificate-authority provider".into())
     }
 
     /// Provider mode: list the certificates this provider has issued.  Default
     /// errors.
     fn list_certs(&self) -> Result<Vec<IssuedCertData>, String> {
-        Err(String::from("node is not a certificate-authority provider"))
+        Err("node is not a certificate-authority provider".into())
     }
+
+    /// Provider mode: list the CSRs currently awaiting operator approval.
+    /// Default errors (not a provider).
+    fn list_pending_csrs(&self) -> Result<Vec<PendingCsrData>, String> {
+        Err("node is not a certificate-authority provider".into())
+    }
+
+    /// Provider mode: approve the pending CSR bound to `node_mac`, so the
+    /// enrolling node collects its certificate on the next `submit_csr` poll.
+    /// Errors if no CSR for that MAC is pending.  Default errors (not a
+    /// provider).
+    fn approve_csr(&mut self, node_mac: &[u8]) -> Result<(), String> {
+        let _ = node_mac;
+        Err("node is not a certificate-authority provider".into())
+    }
+
+    /// Provider mode: deny the pending CSR bound to `node_mac`; the enrolling
+    /// node observes a `Rejected` outcome on its next poll.  Errors if no CSR for
+    /// that MAC is pending.  Default errors (not a provider).
+    fn deny_csr(&mut self, node_mac: &[u8]) -> Result<(), String> {
+        let _ = node_mac;
+        Err("node is not a certificate-authority provider".into())
+    }
+}
+
+/// The disposition of a submitted certificate-signing request.  Models the three
+/// mutually-exclusive terminal-or-waiting states so an invalid combination (e.g.
+/// "pending" alongside an issued certificate) is unrepresentable.
+#[derive(Debug)]
+pub enum CsrOutcome {
+    /// The certificate was issued; carries the cert and the anchor it chains to.
+    Issued(EnrollData),
+    /// The CSR was accepted and is awaiting operator approval.  The client
+    /// should poll `submit_csr` again with the same request.
+    Pending,
+    /// The CSR was rejected and will not be issued.  Carries a human-readable
+    /// reason (bad enrollment token, or an operator denied it).
+    Rejected(String),
+}
+
+/// One CSR awaiting operator approval, as the management API reports it.
+#[derive(Clone)]
+pub struct PendingCsrData {
+    /// The enrolling node's MAC the certificate would be bound to (raw bytes).
+    pub node_mac: Vec<u8>,
+    /// The node's Ed25519 identity public key (32 bytes).
+    pub ed_pubkey: Vec<u8>,
+    /// The node's X25519 public key (32 bytes).
+    pub x_pubkey: Vec<u8>,
+    /// When the provider first saw this CSR (unix seconds).
+    pub requested_at: u64,
 }
 
 /// One certificate a provider has issued, as the management API reports it.
@@ -277,6 +333,7 @@ pub struct IssuedCertData {
 
 /// The result of a successful CSR: the issued certificate plus the trust anchor
 /// it chains to (both raw `wayfinder-auth` wire bytes).
+#[derive(Debug)]
 pub struct EnrollData {
     /// Raw `MembershipCert` bytes, signed by the mesh root.
     pub cert: Vec<u8>,
@@ -481,10 +538,21 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                 &req.x_pubkey,
                 &req.enrollment_token,
             ) {
-                Ok(data) => ResponseKind::SubmitCsr(SubmitCsrResponse {
-                    cert: data.cert,
-                    trust_anchor: data.trust_anchor,
-                }),
+                Ok(outcome) => {
+                    let variant = match outcome {
+                        CsrOutcome::Issued(data) => CsrOutcomeKind::Issued(CsrIssued {
+                            cert: data.cert,
+                            trust_anchor: data.trust_anchor,
+                        }),
+                        CsrOutcome::Pending => CsrOutcomeKind::Pending(CsrPending {}),
+                        CsrOutcome::Rejected(reason) => {
+                            CsrOutcomeKind::Rejected(CsrRejected { reason })
+                        }
+                    };
+                    ResponseKind::SubmitCsr(SubmitCsrResponse {
+                        outcome: Some(variant),
+                    })
+                }
                 Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
             },
 
@@ -506,6 +574,31 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                         })
                         .collect(),
                 }),
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            },
+
+            Some(RequestKind::ListPendingCsrs(_)) => match self.provider.list_pending_csrs() {
+                Ok(pending) => ResponseKind::ListPendingCsrs(ListPendingCsrsResponse {
+                    pending: pending
+                        .into_iter()
+                        .map(|p| PendingCsr {
+                            node_mac: p.node_mac,
+                            ed_pubkey: p.ed_pubkey,
+                            x_pubkey: p.x_pubkey,
+                            requested_at: p.requested_at,
+                        })
+                        .collect(),
+                }),
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            },
+
+            Some(RequestKind::ApproveCsr(req)) => match self.provider.approve_csr(&req.node_mac) {
+                Ok(()) => ResponseKind::Empty(Empty {}),
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            },
+
+            Some(RequestKind::DenyCsr(req)) => match self.provider.deny_csr(&req.node_mac) {
+                Ok(()) => ResponseKind::Empty(Empty {}),
                 Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
             },
 
@@ -897,6 +990,7 @@ mod tests {
             ResponseKind::Error(_) => "Error",
             ResponseKind::Empty(_) => "Empty",
             ResponseKind::ListCerts(_) => "ListCerts",
+            ResponseKind::ListPendingCsrs(_) => "ListPendingCsrs",
             ResponseKind::TrustAnchor(_) => "TrustAnchor",
             ResponseKind::SubmitCsr(_) => "SubmitCsr",
             ResponseKind::SecurityStatus(_) => "SecurityStatus",

@@ -15,7 +15,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use wayfinder_protos::service::IssuedCertData;
+use wayfinder_protos::service::{CsrOutcome, IssuedCertData, PendingCsrData};
 
 /// A mesh certificate authority, as seen by the management-API layer.
 ///
@@ -28,19 +28,25 @@ pub trait MeshAuthority {
     /// key), for an enrolling node to verify certificates against.
     fn trust_anchor_bytes(&self) -> Vec<u8>;
 
-    /// Issue a membership certificate binding `node_mac` to the given Ed25519
-    /// and X25519 public keys, returning raw `MembershipCert` bytes signed by
-    /// the mesh root.  `token` is the caller-supplied enrollment token (an empty
-    /// string when none was sent); an implementation configured with a token
-    /// must reject a request whose token does not match.  Returns an error
-    /// string on a bad token or malformed input.
-    fn issue_cert(
+    /// Submit a certificate-signing request binding `node_mac` to the given
+    /// Ed25519 and X25519 public keys, returning its [`CsrOutcome`].  `token` is
+    /// the caller-supplied enrollment token (an empty string when none was
+    /// sent).
+    ///
+    /// An authority that does not require operator approval issues the
+    /// certificate immediately ([`CsrOutcome::Issued`]).  One that does parks the
+    /// request until an operator approves it, returning [`CsrOutcome::Pending`]
+    /// to a polling client until then, and [`CsrOutcome::Issued`] once approved.
+    /// A bad token, or an operator denial, resolves to [`CsrOutcome::Rejected`].
+    /// The `Err` variant is reserved for the request being unserviceable (clock
+    /// unset, malformed input) rather than a policy rejection.
+    fn submit_csr(
         &mut self,
         node_mac: &[u8],
         ed_pubkey: &[u8],
         x_pubkey: &[u8],
         token: &str,
-    ) -> Result<Vec<u8>, String>;
+    ) -> Result<CsrOutcome, String>;
 
     /// Sign a revocation for `node_mac`, returning raw `RevocationRecord` bytes
     /// for the caller to record and flood.  Returns an error string on malformed
@@ -50,4 +56,18 @@ pub trait MeshAuthority {
     /// The certificates this authority has issued (for operator observability),
     /// in issuance order.
     fn list_certs(&self) -> Vec<IssuedCertData>;
+
+    /// The CSRs currently awaiting operator approval, in first-seen order.
+    /// Empty when the authority does not require approval or none are waiting.
+    fn list_pending(&self) -> Vec<PendingCsrData>;
+
+    /// Approve the pending CSR bound to `node_mac`: sign its certificate now so a
+    /// polling client collects it on its next `submit_csr`.  Returns an error if
+    /// no CSR for that MAC is pending.
+    fn approve_csr(&mut self, node_mac: &[u8]) -> Result<(), String>;
+
+    /// Deny the pending CSR bound to `node_mac`: it will not be issued and a
+    /// polling client observes a [`CsrOutcome::Rejected`].  Returns an error if
+    /// no CSR for that MAC is pending.
+    fn deny_csr(&mut self, node_mac: &[u8]) -> Result<(), String>;
 }

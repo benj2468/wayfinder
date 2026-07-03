@@ -15,11 +15,13 @@ pub mod cert;
 pub mod output;
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use wayfinder_auth::Keypair;
 use wayfinder_client::{Client, ConnectTarget};
+use wayfinder_protos::wayfinder_v1alpha::{CsrIssued, submit_csr_response::Outcome as CsrOutcome};
 
 use crate::output::OutputFormat;
 
@@ -101,6 +103,13 @@ pub enum Command {
         /// Where to write the mesh trust anchor.
         #[arg(long)]
         out_anchor: PathBuf,
+        /// How long to keep polling while the CSR awaits operator approval, in
+        /// seconds.  0 fails immediately if the provider parks the CSR.
+        #[arg(long, default_value_t = 120)]
+        wait_secs: u64,
+        /// Interval between polls while the CSR is pending, in milliseconds.
+        #[arg(long, default_value_t = 2000)]
+        poll_interval_ms: u64,
     },
     /// Revoke a node from the mesh (talks to a provider node).
     Revoke {
@@ -110,9 +119,31 @@ pub enum Command {
     },
     /// List the certificates a provider node has issued.
     ListCerts,
+    /// Inspect and act on CSRs awaiting operator approval (provider node).
+    #[command(subcommand)]
+    Csr(CsrCommand),
     /// Offline certificate / trust-anchor tooling (no node connection).
     #[command(subcommand)]
     Cert(cert::CertCommand),
+}
+
+/// Operator actions on pending certificate-signing requests (provider mode).
+#[derive(Subcommand, Debug)]
+pub enum CsrCommand {
+    /// List the CSRs currently awaiting approval.
+    List,
+    /// Approve a pending CSR, so the enrolling node collects its certificate.
+    Approve {
+        /// MAC of the pending CSR to approve.
+        #[arg(long)]
+        mac: String,
+    },
+    /// Deny a pending CSR; the enrolling node observes a rejection.
+    Deny {
+        /// MAC of the pending CSR to deny.
+        #[arg(long)]
+        mac: String,
+    },
 }
 
 /// Run the parsed CLI: dispatch offline `cert` work synchronously, else open a
@@ -174,18 +205,25 @@ pub async fn run_query(
             out_seed,
             out_cert,
             out_anchor,
+            wait_secs,
+            poll_interval_ms,
         } => {
             let seed: [u8; 32] = rand::random();
             let kp = Keypair::from_seed(&seed);
             let mac_bytes = parse_mac6(&mac)?;
-            let resp = client
-                .submit_csr(&mac_bytes, &kp.ed_pubkey(), &kp.x_pubkey(), &token)
-                .await
-                .context("enrollment (submit_csr) failed")?;
+            let issued = poll_enroll(
+                &mut client,
+                &mac_bytes,
+                &kp,
+                &token,
+                Duration::from_secs(wait_secs),
+                Duration::from_millis(poll_interval_ms.max(1)),
+            )
+            .await?;
             cert::write_secret(&out_seed, &seed)?;
-            std::fs::write(&out_cert, &resp.cert)
+            std::fs::write(&out_cert, &issued.cert)
                 .with_context(|| format!("writing certificate to {}", out_cert.display()))?;
-            std::fs::write(&out_anchor, &resp.trust_anchor)
+            std::fs::write(&out_anchor, &issued.trust_anchor)
                 .with_context(|| format!("writing trust anchor to {}", out_anchor.display()))?;
             format!("enrolled {mac}: wrote seed, certificate, and trust anchor")
         }
@@ -198,8 +236,64 @@ pub async fn run_query(
             format!("revoked {mac}")
         }
         Command::ListCerts => output::list_certs(&client.list_certs().await?, output)?,
+        Command::Csr(CsrCommand::List) => {
+            output::list_pending_csrs(&client.list_pending_csrs().await?, output)?
+        }
+        Command::Csr(CsrCommand::Approve { mac }) => {
+            let mac_bytes = parse_mac6(&mac)?;
+            client
+                .approve_csr(&mac_bytes)
+                .await
+                .context("approving CSR failed")?;
+            format!("approved CSR for {mac}")
+        }
+        Command::Csr(CsrCommand::Deny { mac }) => {
+            let mac_bytes = parse_mac6(&mac)?;
+            client
+                .deny_csr(&mac_bytes)
+                .await
+                .context("denying CSR failed")?;
+            format!("denied CSR for {mac}")
+        }
         Command::Cert(_) => unreachable!("cert is dispatched before run_query"),
     })
+}
+
+/// Poll `submit_csr` until the CSR resolves to issued or rejected, or until
+/// `wait` elapses.  A provider configured to require operator approval parks the
+/// CSR as pending; re-submitting the identical request is how the enrolling node
+/// collects the certificate once an operator approves it.
+async fn poll_enroll(
+    client: &mut Client,
+    mac: &[u8],
+    kp: &Keypair,
+    token: &str,
+    wait: Duration,
+    interval: Duration,
+) -> anyhow::Result<CsrIssued> {
+    let deadline = Instant::now() + wait;
+    loop {
+        let resp = client
+            .submit_csr(mac, &kp.ed_pubkey(), &kp.x_pubkey(), token)
+            .await
+            .context("enrollment (submit_csr) failed")?;
+        match resp.outcome {
+            Some(CsrOutcome::Issued(issued)) => return Ok(issued),
+            Some(CsrOutcome::Rejected(r)) => bail!("enrollment rejected: {}", r.reason),
+            // Pending (or an empty outcome, treated the same): keep polling until
+            // the deadline, since only a re-submission collects an approval.
+            Some(CsrOutcome::Pending(_)) | None => {
+                if Instant::now() >= deadline {
+                    bail!(
+                        "CSR still awaiting operator approval after {}s; approve it with \
+                         `wayfinderctl csr approve --mac <mac>` and retry",
+                        wait.as_secs()
+                    );
+                }
+                tokio::time::sleep(interval).await;
+            }
+        }
+    }
 }
 
 /// Parse a node identifier from `s`: a colon-delimited MAC
