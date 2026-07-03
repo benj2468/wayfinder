@@ -36,6 +36,9 @@ missing_docs = "deny"
 unwrap_used = "deny"
 expect_used = "deny"
 
+# Groups
+all = "deny"
+
 [workspace.dependencies]
 # Local Dependencies
 interfaces = { path = "./libs/interfaces" }
