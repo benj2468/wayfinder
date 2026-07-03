@@ -227,7 +227,10 @@ async fn main() -> anyhow::Result<()> {
                     provider_cfg.root_seed_path
                 )
             })?;
-        driver.set_provider(CertAuthority::from_config(&root_seed, &provider_cfg));
+        driver.set_provider(
+            CertAuthority::from_config(&root_seed, &provider_cfg)
+                .map_err(|e| anyhow!("failed to load certificate-authority state: {e}"))?,
+        );
         tracing::info!(
             "certificate-authority (provider) mode enabled (mesh_id = {:#x})",
             provider_cfg.mesh_id

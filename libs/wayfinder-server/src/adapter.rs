@@ -371,6 +371,7 @@ mod tests {
             ed.try_into().unwrap(),
             x.try_into().unwrap(),
         )
+        .unwrap()
         .cert
     }
 

@@ -292,6 +292,15 @@ pub struct ProviderConfig {
     /// approve, short enough to keep the table small.
     #[serde(default = "default_pending_ttl_secs")]
     pub pending_ttl_secs: u64,
+    /// Path to a JSON snapshot file for the authority's durable state — the
+    /// issued-certificate log (with revocation status) and the held-CSR
+    /// store — so the impersonation guard, revocations, and pending
+    /// operator approvals all survive a restart. When absent, state is
+    /// in-memory only and a restart clears it. A corrupt, foreign, or
+    /// newer-than-known snapshot at this path is refused at startup rather
+    /// than silently treated as empty.
+    #[serde(default)]
+    pub state_path: Option<String>,
 }
 
 /// Default [`ProviderConfig::pending_ttl_secs`]: one hour.

@@ -23,6 +23,9 @@ mod provider;
 pub use provider::MeshAuthority;
 
 #[cfg(feature = "std")]
+mod persistence;
+
+#[cfg(feature = "std")]
 mod authority;
 #[cfg(feature = "std")]
 pub use authority::CertAuthority;
