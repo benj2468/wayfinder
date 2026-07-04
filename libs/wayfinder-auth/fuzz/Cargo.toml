@@ -1,0 +1,33 @@
+[package]
+name = "wayfinder-auth-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zerocopy = "0.8.48"
+
+[dependencies.wayfinder-auth]
+path = ".."
+
+# Use independent workspace for fuzzers
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "verify_cert"
+path = "fuzz_targets/verify_cert.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "verify_revocation"
+path = "fuzz_targets/verify_revocation.rs"
+test = false
+doc = false
+bench = false

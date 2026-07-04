@@ -1,0 +1,35 @@
+[package]
+name = "wayfinder-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.wayfinder]
+path = ".."
+
+[dependencies.wayfinder-auth]
+path = "../../wayfinder-auth"
+# The harness builds a real CA (`Authority`) to sign a valid seed cert, which
+# needs the std-gated CA half of this crate — the same reason `wayfinder`'s
+# own dev-dependencies re-enable it for tests (see libs/wayfinder/Cargo.toml).
+features = ["std"]
+
+[dependencies.interfaces]
+path = "../../interfaces"
+
+# Use independent workspace for fuzzers
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "verify_ogm"
+path = "fuzz_targets/verify_ogm.rs"
+test = false
+doc = false
+bench = false

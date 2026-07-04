@@ -98,6 +98,7 @@
               cargo-nextest
               cargo-machete
               cargo-llvm-cov
+              cargo-fuzz
               rust-analyzer
               pytestEnv
               python312Packages.virtualenv

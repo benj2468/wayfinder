@@ -54,3 +54,36 @@ Central router orchestration. `no_std`; the `std` feature enables `DynLinkT`.
 3. Update the `CentralRouter::handle_frame_with_metrics` match statement to
    handle it.
 4. Create wire-format packet structs with `zerocopy` derives.
+
+## Fuzzing
+
+`fuzz/` is a `cargo-fuzz` project, kept as its own independent Cargo
+workspace (standard cargo-fuzz layout) rather than a member of the root
+workspace, so its `libfuzzer-sys`/nightly-only dependencies never touch the
+main build. Run from inside `libs/wayfinder/fuzz/`:
+
+```bash
+cargo fuzz run verify_ogm corpus/verify_ogm seeds/verify_ogm
+```
+
+The first directory is libFuzzer's mutable working corpus (create it once
+with `mkdir -p corpus/verify_ogm`; everything under `corpus/` is gitignored,
+ephemeral, and safe to delete). The second, `seeds/verify_ogm/`, is a
+**tracked**, read-only seed directory — libFuzzer only reads from directories
+after the first, so a curated valid input there survives forever without
+being polluted by the fuzzer's own finds. `seeds/verify_ogm/seed_valid_ogm`
+is one fully valid, real-signed OGM (built once via the existing
+`member`/`bare_ogm`/`augment_ogm` test helpers in `src/auth.rs`, then copied
+out); it roughly doubles code coverage over an empty-corpus run, since
+mutations near a structurally valid cert/signature reach much deeper into
+`verify_ogm` than random bytes ever will on their own.
+
+- `verify_ogm` — fuzzes `OgmAuth::verify_ogm`, the gate an incoming OGM must
+  clear before it reaches the routing engine (TVLV scan → cert parse → trust-
+  anchor + signature verification). The harness builds a real `Authority`
+  once (lazily, `std::sync::OnceLock`) to get a valid trust anchor, but
+  constructs a fresh `OgmAuth` per input so a crash stays reproducible from
+  the input alone, independent of fuzzing history.
+- To add another target: `cargo fuzz add <name>` from `fuzz/`, then add a
+  `seeds/<name>/` directory if a valid-structured seed would meaningfully
+  help (it isn't required to get started).

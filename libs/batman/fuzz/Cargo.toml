@@ -1,0 +1,25 @@
+[package]
+name = "batman-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.batman]
+path = ".."
+
+# Use independent workspace for fuzzers
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "find_tvlv"
+path = "fuzz_targets/find_tvlv.rs"
+test = false
+doc = false
+bench = false
