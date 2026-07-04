@@ -80,3 +80,12 @@ the engine itself is unchanged. See `libs/wayfinder` for `OgmAuth`.
 2. Validates TTL > 1.
 3. Looks up the next hop in the originator table.
 4. Returns `ForwardTo` with the immediate neighbor address.
+
+## Fuzzing
+
+`fuzz/` is an independent `cargo-fuzz` workspace (see `libs/wayfinder/CLAUDE.md`
+for the general setup/conventions). `find_tvlv` fuzzes `find_tvlv`/`iter_tvlv`
+over all four `TvlvType`s — the scanner every OGM tail (multicast, cert,
+signature, revocation records) is parsed through. No seed corpus: it's pure
+structural scanning with no crypto barrier, so libFuzzer explores it fully on
+its own (millions of exec/s locally).

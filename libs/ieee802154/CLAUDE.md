@@ -17,3 +17,10 @@ mesh filters on the embedded `Mac`. `MAX_FRAME_LEN` = 125. Used by the
 
 The link trait is deliberately minimal and fire-and-forget: no TX-side
 ACK/retry/CCA feedback in the shared trait.
+
+## Fuzzing
+
+`fuzz/` is an independent `cargo-fuzz` workspace (see `libs/wayfinder/CLAUDE.md`
+for the general setup/conventions). `decode` fuzzes `decode` — the outermost
+boundary for any 802.15.4-radio carrier. No seed corpus needed; it's pure
+structural parsing with no crypto barrier.
