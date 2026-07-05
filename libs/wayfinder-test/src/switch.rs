@@ -775,4 +775,172 @@ mod tests {
         // This might occasionally fail due to randomness, but very unlikely
         println!("Count1: {}, Count2: {}", count1, count2);
     }
+
+    // ── partial (statistical) loss ──────────────────────────────────────────
+    //
+    // The tests above only ever exercise 0.0/1.0 loss. Real links sit
+    // somewhere in between, so these drive enough frames through a fractional
+    // `PortConfig` to check the drop rate lands near the configured
+    // probability rather than being all-or-nothing, ignored, or inverted.
+    // Bounds are generous (many standard deviations either side of the mean)
+    // so they only fail on a real regression, not RNG noise, while `assert_ne`
+    // guards against a config that silently behaves like 0.0 or 1.0.
+
+    #[tokio::test]
+    async fn test_partial_outgoing_loss_statistical() {
+        const N: usize = 2000;
+        let mut switch: Switch<u8> = Switch::new();
+
+        let (tx1, _rx1, port1) = create_port_pair(N + 10);
+        let (tx2, mut rx2, port2) = create_port_pair(N + 10);
+
+        switch.add_port(port1, PortConfig::no_loss()).unwrap();
+        switch.add_port(port2, PortConfig::new(0.5, 0.0)).unwrap();
+
+        // Teach the switch node 2 lives on port2, so the frames below resolve
+        // to a direct unicast (the per-destination outgoing_loss branch)
+        // rather than the broadcast fan-out branch.
+        tx2.send(make_frame(2, 1)).await.unwrap();
+        switch.tick().await.unwrap();
+
+        for _ in 0..N {
+            tx1.send(make_frame(1, 2)).await.unwrap();
+        }
+        switch.tick().await.unwrap();
+
+        let mut received = 0;
+        while rx2.try_recv().is_ok() {
+            received += 1;
+        }
+
+        // Expected ≈ N/2 = 1000, std dev ≈ 22; ±150 is ~7 std devs.
+        assert!(
+            (850..=1150).contains(&received),
+            "expected roughly half of {N} frames to survive 50% outgoing loss, got {received}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partial_incoming_loss_statistical() {
+        const N: usize = 2000;
+        let mut switch: Switch<u8> = Switch::new();
+
+        let (tx1, _rx1, port1) = create_port_pair(N + 10);
+        let (_tx2, mut rx2, port2) = create_port_pair(N + 10);
+
+        switch.add_port(port1, PortConfig::new(0.0, 0.5)).unwrap();
+        switch.add_port(port2, PortConfig::no_loss()).unwrap();
+
+        // Unknown destination floods to port2, so every surviving frame is
+        // observable there; drops happen on ingress from port1, before
+        // forwarding decisions are even made.
+        for _ in 0..N {
+            tx1.send(make_frame(1, 99)).await.unwrap();
+        }
+        switch.tick().await.unwrap();
+
+        let mut received = 0;
+        while rx2.try_recv().is_ok() {
+            received += 1;
+        }
+
+        assert!(
+            (850..=1150).contains(&received),
+            "expected roughly half of {N} frames to survive 50% incoming loss, got {received}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_asymmetric_direction_loss_independent() {
+        // Node A is "deaf" (outgoing_loss = 1.0: it can't hear the fabric) but
+        // not "mute" (incoming_loss = 0.0: its own transmissions still reach
+        // the fabric).  The two knobs must act independently.
+        let mut switch: Switch<u8> = Switch::new();
+
+        let (tx_a, mut rx_a, port_a) = create_port_pair(2100);
+        let (tx_b, mut rx_b, port_b) = create_port_pair(2100);
+
+        switch.add_port(port_a, PortConfig::new(1.0, 0.0)).unwrap();
+        switch.add_port(port_b, PortConfig::no_loss()).unwrap();
+
+        // A's first frame teaches the switch A's port and reaches B fine — A
+        // isn't the destination here, so its outgoing_loss doesn't apply.
+        tx_a.send(make_frame(10, 20)).await.unwrap();
+        switch.tick().await.unwrap();
+        assert_eq!(rx_b.try_recv().unwrap(), make_frame(10, 20));
+
+        // B's reply teaches the switch B's port too — learning happens on
+        // ingress, independent of whether delivery to the destination
+        // succeeds — but delivery to A is dropped by A's outgoing_loss.
+        tx_b.send(make_frame(20, 10)).await.unwrap();
+        switch.tick().await.unwrap();
+        assert!(rx_a.try_recv().is_err());
+
+        // With both ports learned: B -> A must be fully blocked...
+        const N: usize = 1000;
+        for _ in 0..N {
+            tx_b.send(make_frame(20, 10)).await.unwrap();
+        }
+        switch.tick().await.unwrap();
+        assert!(
+            rx_a.try_recv().is_err(),
+            "A's outgoing_loss = 1.0 must block every frame addressed to it"
+        );
+
+        // ...while A -> B must be fully delivered: A's incoming_loss = 0.0
+        // means its own transmissions are never dropped, regardless of its
+        // (unrelated) outgoing_loss.
+        for _ in 0..N {
+            tx_a.send(make_frame(10, 20)).await.unwrap();
+        }
+        switch.tick().await.unwrap();
+        let mut received = 0;
+        while rx_b.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(
+            received, N,
+            "A's incoming_loss = 0.0 must deliver every frame A sends, unaffected by its outgoing_loss"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_fanout_independent_per_port_loss() {
+        // Three ports observe the same broadcast frame under three different
+        // outgoing_loss settings: each port's fan-out copy must be governed
+        // only by its own loss, not by the others'.
+        const N: usize = 2000;
+        let mut switch: Switch<u8> = Switch::new();
+
+        let (tx1, _rx1, port1) = create_port_pair(N + 10);
+        let (_tx2, mut rx2, port2) = create_port_pair(N + 10);
+        let (_tx3, mut rx3, port3) = create_port_pair(N + 10);
+        let (_tx4, mut rx4, port4) = create_port_pair(N + 10);
+
+        switch.add_port(port1, PortConfig::no_loss()).unwrap();
+        switch.add_port(port2, PortConfig::new(0.0, 0.0)).unwrap();
+        switch.add_port(port3, PortConfig::new(0.5, 0.0)).unwrap();
+        switch.add_port(port4, PortConfig::new(1.0, 0.0)).unwrap();
+
+        for _ in 0..N {
+            tx1.send(make_frame(1, 99)).await.unwrap(); // unknown dest -> flood
+        }
+        switch.tick().await.unwrap();
+
+        fn drain(rx: &mut mpsc::Receiver<Vec<u8>>) -> usize {
+            let mut count = 0;
+            while rx.try_recv().is_ok() {
+                count += 1;
+            }
+            count
+        }
+
+        assert_eq!(drain(&mut rx2), N, "0% loss port must receive every frame");
+        let partial = drain(&mut rx3);
+        assert!(
+            (850..=1150).contains(&partial),
+            "50% loss port should receive roughly half of {N}, got {partial}"
+        );
+        assert_eq!(drain(&mut rx4), 0, "100% loss port must receive nothing");
+    }
 }
