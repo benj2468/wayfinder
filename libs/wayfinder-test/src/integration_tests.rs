@@ -55,23 +55,38 @@ fn count_ogms(harness: &mut TestHarness) -> Arc<AtomicUsize> {
 }
 
 /// Build a raw OGM broadcast frame as it would appear on the wire after
-/// being transmitted by `src` with the given TQ and sequence number.
+/// being transmitted by `src` with the given TQ and sequence number — a
+/// direct (self-originated) OGM, i.e. `src` is both the immediate sender and
+/// the advertised originator. A thin wrapper over
+/// [`build_relayed_ogm_wire_frame`] for the common single-hop case.
 ///
 /// Wire layout: `[src:6][BROADCAST:6][proto:2 NE][BatmanOgmPacket]`.
 fn build_ogm_wire_frame(src: u8, tq: u8, seqno: u32) -> Vec<u8> {
+    build_relayed_ogm_wire_frame(src, src, tq, seqno)
+}
+
+/// Build a raw OGM broadcast frame as it would appear on the wire after being
+/// **relayed** by `relay` on behalf of a different originator `orig` — unlike
+/// [`build_ogm_wire_frame`], this decouples the immediate sender from the
+/// advertised destination, letting a test simulate a multi-hop route where
+/// `relay` is forwarding someone else's OGM (`tq` already reflects whatever
+/// hop decrements happened before it reached `relay`).
+///
+/// Wire layout: `[relay:6][BROADCAST:6][proto:2 NE][BatmanOgmPacket { orig, tq, .. }]`.
+fn build_relayed_ogm_wire_frame(relay: u8, orig: u8, tq: u8, seqno: u32) -> Vec<u8> {
     let ogm = BatmanOgmPacket {
         packet_type: BATADV_IV_OGM,
         version: 5,
         ttl: 50,
         flags: 0,
         seqno: seqno.to_be(),
-        orig: mac(src),
+        orig: mac(orig),
         reserved: 0,
         tq,
         tvlv_len: 0,
     };
     build_frame(
-        mac(src),
+        mac(relay),
         Mac::BROADCAST,
         wayfinder::DEFAULT_BATMAN_ETHER_TYPE,
         ogm.as_bytes(),
@@ -259,6 +274,43 @@ fn two_paths_unequal_length() -> TestHarness {
     config.machines.push(machine("c", &["ac", "ce"]));
     config.machines.push(machine("d", &["bd", "ed"]));
     config.machines.push(machine("e", &["ce", "ed"]));
+    config.validate().unwrap()
+}
+
+/// Four nodes wired as a diamond: `a` fans out to `b` and `c`, which both
+/// rejoin at `d` — two *equal*-length (2-hop) paths from `a` to `d`, unlike
+/// [`two_paths_unequal_length`]'s deliberately asymmetric pair. Machine
+/// indices: a=0, b=1, c=2, d=3. Every link's OGM backoff uses a 1s floor and
+/// the given `i_max_ms` ceiling (see [`diamond_plus_k5`] for why a small
+/// ceiling keeps a settling test fast while preserving the per-interface
+/// Trickle dynamics).
+fn diamond(i_max_ms: u64) -> TestHarness {
+    let mut config = TestConfig::default();
+    for sw in ["ab", "ac", "bd", "cd"] {
+        config.switches.push(TestSwitchConfig { name: sw.into() });
+    }
+    let machine = |name: &str, links: &[&str]| TestMachineConfig {
+        name: name.into(),
+        wayfinder: Config {
+            links: links
+                .iter()
+                .map(|s| LinkConfig {
+                    transport: LinkTransport::Test {
+                        switch_name: (*s).into(),
+                    },
+                    ogm: TrickleConfig {
+                        i_min_ms: 1000,
+                        i_max_ms,
+                    },
+                })
+                .collect(),
+            ..Default::default()
+        },
+    };
+    config.machines.push(machine("a", &["ab", "ac"]));
+    config.machines.push(machine("b", &["ab", "bd"]));
+    config.machines.push(machine("c", &["ac", "cd"]));
+    config.machines.push(machine("d", &["bd", "cd"]));
     config.validate().unwrap()
 }
 
@@ -1081,6 +1133,90 @@ async fn simultaneous_disconnects_blackhole_then_recover() {
     );
 }
 
+// ── equal-cost tie-break stability ─────────────────────────────────────────
+//
+// Every failover test above uses a path pair with a *strictly* unequal TQ (a
+// shorter, higher-quality path and a longer, lower-quality one), so the
+// engine's metric alone decides the winner. This exercises the other case: two
+// paths that are exactly tied. `handle_ogm` (`libs/batman/src/engine.rs`) keeps
+// the incumbent on a tie (only a *strictly* better path displaces it), but the
+// periodic purge sweep's `recompute_best` deliberately recomputes from scratch
+// and prefers the most-recently-refreshed path on a tie instead — favoring
+// freshness against the risk that the older tied path is about to be evicted
+// by loss. So `a`'s pick between `b`/`c` may legitimately swap from round to
+// round; what must never happen is that swap being mistaken for a topology
+// change, which would reset Trickle and re-flood the mesh. Neither
+// `handle_ogm` nor `purge_stale` flips `topology_changed` for a pure
+// best-hop swap (only a genuinely new/lost originator or path does), so this
+// is a regression test for that invariant, not for a fixed pick.
+
+/// With two equal-length paths (`a–b–d` and `a–c–d` in [`diamond`]), both carry
+/// the same TQ, so `a`'s best-next-hop pick between `b` and `c` may swap from
+/// round to round (the periodic purge sweep prefers the freshest tied path).
+/// That swap must not be treated as a topology change: every interface must
+/// still back all the way off to `i_max` and stay there — exactly like the
+/// loop-free settling test — and delivery must keep working over whichever
+/// tied path is currently selected.
+#[tokio::test(start_paused = true)]
+async fn equal_cost_path_swaps_do_not_trigger_reflood() {
+    setup();
+    let i_max = Duration::from_secs(8);
+    let mut harness = diamond(8_000);
+    let a = harness.get_machine("a").ident;
+    let b = harness.get_machine("b").ident;
+    let c = harness.get_machine("c").ident;
+    let d = harness.get_machine("d").ident;
+
+    // Warm up well past the time the backoff needs to climb 1→2→4→8s, and past
+    // several periodic purge sweeps that could churn the tied best-hop pick,
+    // then run a further window over which the mesh must stay both complete
+    // and calm — mirroring `diamond_plus_k5_settles_to_i_max`'s proven timing.
+    let min_full = harness
+        .run_trickle(Duration::from_secs(40), Duration::from_secs(80))
+        .await;
+    assert_eq!(
+        min_full, 3,
+        "a, b, c, and d must continuously know their other 3 peers despite any tied-path churn"
+    );
+
+    let hop = harness
+        .get_machine("a")
+        .router()
+        .originator_table()
+        .find(|r| r.neighbor_ident == d)
+        .map(|r| r.best_next_hop);
+    assert!(
+        hop == Some(b) || hop == Some(c),
+        "a's best next hop to d must be one of the two equal-cost neighbors, got {hop:?}"
+    );
+
+    // The tied pick swapping (if it did) must not have been treated as a
+    // topology change: every interface must have backed off to i_max and
+    // stayed there, not been pinned near i_min by spurious Trickle resets.
+    for (name, machine) in harness.machines.iter() {
+        for e in machine.router().ogm_schedule() {
+            assert_eq!(
+                e.current_interval, i_max,
+                "node {name} iface {} never backed off to i_max (stuck at {:?}) — a tied \
+                 best-hop swap incorrectly reset the Trickle timer",
+                e.iface_idx, e.current_interval
+            );
+        }
+    }
+
+    // End-to-end: delivery works over whichever tied path is currently in use.
+    harness
+        .get_machine_mut("a")
+        .send_local(d, b"steady over equal-cost path")
+        .await
+        .unwrap();
+    harness.settle().await;
+    assert_eq!(
+        harness.get_machine("d").local_deliveries(),
+        vec![host_frame(d, a, b"steady over equal-cost path")],
+    );
+}
+
 // ── link-down scenarios (the wire dies, the node lives) ───────────────────
 //
 // Distinct from the reboot tests above: `disconnect_machine` removes a node and
@@ -1209,6 +1345,88 @@ async fn brief_link_blip_preserves_routes() {
     );
 }
 
+/// Severing the single bridge link between the diamond (`d1..d4`) and the K5
+/// mesh (`m1..m5`) in [`diamond_plus_k5`] must **partition** the network into
+/// two independently-converged islands — each side keeps knowing every other
+/// node *within* its own island but loses every route across the former
+/// bridge — rather than either side black-holing internally or a stale
+/// cross-partition route lingering.  Restoring the bridge must reunite the
+/// whole mesh.  This is the same `fail_link`/`restore_link` mechanism as
+/// [`link_down_triggers_failover_then_restore_reclaims`], but severing the one
+/// link that joins two otherwise-independent sub-meshes rather than a single
+/// neighbor's link.
+#[tokio::test(start_paused = true)]
+async fn bridge_failure_partitions_mesh_then_restore_reunites() {
+    setup();
+    let mut harness = diamond_plus_k5(8_000);
+
+    // Converge the whole mesh first (same warmup/window the settling test
+    // uses for this topology and i_max).
+    let min_full = harness
+        .run_trickle(Duration::from_secs(40), Duration::from_secs(80))
+        .await;
+    assert_eq!(
+        min_full, 8,
+        "whole mesh must fully converge before the bridge is severed"
+    );
+
+    // Sever the single bridge link: d4's interface 2 is its "d4_m1" link (its
+    // link order, filtered from EDGES, is [d2_d4, d3_d4, d4_m1]).
+    harness.fail_link("d4", 2);
+    age_out(&mut harness).await;
+
+    const DIAMOND: [&str; 4] = ["d1", "d2", "d3", "d4"];
+    const MESH: [&str; 5] = ["m1", "m2", "m3", "m4", "m5"];
+
+    for name in DIAMOND {
+        assert_eq!(
+            harness.get_machine(name).router().originator_count(),
+            3,
+            "{name} must still know its 3 diamond-side peers after the partition"
+        );
+    }
+    for name in MESH {
+        assert_eq!(
+            harness.get_machine(name).router().originator_count(),
+            4,
+            "{name} must still know its 4 mesh-side peers after the partition"
+        );
+    }
+
+    // No cross-partition route survives on either side.
+    let m5 = harness.get_machine("m5").ident;
+    let d1 = harness.get_machine("d1").ident;
+    assert!(
+        harness
+            .get_machine("d1")
+            .router()
+            .originator_table()
+            .all(|r| r.neighbor_ident != m5),
+        "d1 must have no route across the severed bridge"
+    );
+    assert!(
+        harness
+            .get_machine("m5")
+            .router()
+            .originator_table()
+            .all(|r| r.neighbor_ident != d1),
+        "m5 must have no route across the severed bridge"
+    );
+
+    // Restore the bridge; the two islands must reunite.
+    harness.restore_link("d4", 2);
+    harness
+        .advance_trickle(harness.clock + Duration::from_secs(200))
+        .await;
+    for name in DIAMOND.iter().chain(MESH.iter()) {
+        assert_eq!(
+            harness.get_machine(name).router().originator_count(),
+            8,
+            "{name} must reconverge onto the whole mesh once the bridge is restored"
+        );
+    }
+}
+
 // ── metric-based egress selection ────────────────────────────────────────
 //
 // These tests need the *same* OGM observed on two interfaces with
@@ -1281,6 +1499,123 @@ async fn egress_swaps_iface_when_metrics_swap() {
             panic!("expected egress for node B to be Interface(0) (strong RSSI/SNR), got {other:?}")
         }
     }
+}
+
+/// A neighbor first heard strongly on interface 0 and weakly on interface 1
+/// must have its egress *switch* to interface 1 once interface 0's measured
+/// quality fades and interface 1's improves — the metrics equivalent of a link
+/// going down, but a continuous fade rather than a binary wire failure.
+/// [`egress_picks_iface_with_better_metrics_for_shared_neighbor`] only proves
+/// the *initial* pick follows the metric; this proves the choice actually
+/// changes when conditions change, not just once at first contact.
+#[tokio::test]
+async fn egress_switches_interface_as_metrics_degrade() {
+    let mut harness = single_machine_with_links(2);
+    let ogm_from_b = build_ogm_wire_frame(100, 255, 1);
+
+    let strong = LinkMetrics {
+        rssi_dbm: None,
+        snr_db: None,
+        quality: Some(250),
+    };
+    let weak = LinkMetrics {
+        rssi_dbm: None,
+        snr_db: None,
+        quality: Some(5),
+    };
+
+    let a = harness.get_machine_mut("a");
+
+    // Initial contact: interface 0 strong, interface 1 weak.
+    a.receive_with_metrics(Duration::from_secs(0), 0, &ogm_from_b, strong)
+        .await;
+    a.receive_with_metrics(Duration::from_secs(1), 1, &ogm_from_b, weak)
+        .await;
+    match a.router_mut().get_egress_interface(mac(100)) {
+        Some(EgressInterface::Interface(0)) => {}
+        other => panic!("expected initial egress to be Interface(0) (strong), got {other:?}"),
+    }
+
+    // Interface 0 fades and interface 1 improves over many further OGMs — the
+    // EWMA (alpha = 1/4) takes several samples to cross over, unlike the
+    // single-shot injection above.
+    for i in 0..10 {
+        let now = Duration::from_secs(2 + i);
+        a.receive_with_metrics(now, 0, &ogm_from_b, weak).await;
+        a.receive_with_metrics(now, 1, &ogm_from_b, strong).await;
+    }
+
+    match a.router_mut().get_egress_interface(mac(100)) {
+        Some(EgressInterface::Interface(1)) => {}
+        other => panic!(
+            "expected egress to switch to Interface(1) once its measured quality overtook \
+             the now-degraded interface 0, got {other:?}"
+        ),
+    }
+}
+
+// ── metrics-driven relay selection (BATMAN engine level) ───────────────────
+//
+// The egress tests above are about *interface* choice for a single direct
+// neighbor reached over two radios — `CentralRouter`'s own link-quality table,
+// entirely separate from the BATMAN engine (which doesn't know about
+// interfaces at all). This is the other metrics-driven path: `local_quality`
+// (looked up per (neighbor, iface) and passed into `BatmanEngine::handle_rx`)
+// clamps a relayed OGM's advertised TQ (`libs/batman/src/engine.rs`,
+// `handle_ogm`: `computed_tq.min(local)`), so two *different* relay neighbors
+// advertising an identical, tied, hop-count-based TQ for some distant
+// destination can still end up with different effective TQs — and therefore a
+// different chosen next hop — purely from the measured physical link to each
+// relay.
+
+/// Two different neighbors, `b` and `c`, both relay an identical OGM (same
+/// encoded TQ, same hop count) from a common distant originator `d`. `c`'s
+/// copy arrives first and is heard weakly; `b`'s arrives second but is heard
+/// strongly. The strictly higher *measured* quality to `b` must win —
+/// overriding both the tied encoded TQ and `c`'s first-mover incumbency —
+/// proving the next-hop choice follows the physical link, not just the OGM's
+/// advertised (hop-count) metric.
+#[tokio::test]
+async fn relay_choice_follows_measured_link_quality_on_tied_hop_count() {
+    let mut harness = single_machine_with_links(2);
+    let b = mac(10);
+    let d = mac(20);
+
+    // Both relays advertise the same tq for d — a genuine tie at the
+    // OGM/hop-count level.
+    let via_c = build_relayed_ogm_wire_frame(11, 20, 245, 1);
+    let via_b = build_relayed_ogm_wire_frame(10, 20, 245, 1);
+
+    let weak = LinkMetrics {
+        rssi_dbm: None,
+        snr_db: None,
+        quality: Some(50),
+    };
+    let strong = LinkMetrics {
+        rssi_dbm: None,
+        snr_db: None,
+        quality: Some(250),
+    };
+
+    let a = harness.get_machine_mut("a");
+    // c's weak copy arrives first and becomes the incumbent.
+    a.receive_with_metrics(Duration::from_secs(0), 1, &via_c, weak)
+        .await;
+    // b's strong copy arrives second, tied on encoded TQ, but its measured
+    // link quality is strictly better — it must still take over.
+    a.receive_with_metrics(Duration::from_secs(1), 0, &via_b, strong)
+        .await;
+
+    let record = a
+        .router()
+        .originator_table()
+        .find(|r| r.neighbor_ident == d)
+        .expect("a must have learned a route to d");
+    assert_eq!(
+        record.best_next_hop, b,
+        "the relay with strictly better measured link quality must win, even though c \
+         arrived first and both advertised the same encoded TQ"
+    );
 }
 
 // ── route-inspection API ──────────────────────────────────────────────────
