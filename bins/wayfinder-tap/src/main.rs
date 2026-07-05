@@ -12,7 +12,7 @@ mod tap;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail};
+use anyhow::{Context, anyhow, bail};
 use clap::Parser;
 use tokio::{sync::mpsc, task::JoinSet};
 use tracing_subscriber::EnvFilter;
@@ -22,8 +22,9 @@ use wayfinder::config::{
 };
 use wayfinder::interfaces::frame::Mac;
 use wayfinder_driver::{
-    Driver, QueryRx, QueryTx, build_raw_ip_link, build_raw_l2_link, build_udp_link, run_tcp_server,
-    run_udp_server, run_unix_server,
+    Driver, QueryRx, QueryTx, bind_tcp_server, bind_udp_server, bind_unix_server,
+    build_raw_ip_link, build_raw_l2_link, build_udp_link, serve_tcp_server, serve_udp_server,
+    serve_unix_server,
 };
 
 use crate::tap::TapDevice;
@@ -75,9 +76,11 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(wayfinder::config::TapConfig::DEFAULT_NETMASK);
         builder = builder.ipv4(ip_address, netmask, None);
     }
-    let dev = builder.build_async()?;
+    let dev = builder
+        .build_async()
+        .context("failed to craete TAP device")?;
 
-    let mac_addr = dev.mac_address()?;
+    let mac_addr = dev.mac_address().context("unable to get mac address")?;
     tracing::info!(
         "Starting wayfinder with MAC address: {:?}",
         pretty_hex::simple_hex(&mac_addr)
@@ -125,14 +128,17 @@ async fn main() -> anyhow::Result<()> {
         let tx = query_tx.clone();
         match server_cfg {
             ServerConfig::Tcp { addr } => {
-                join_set.spawn(async move { run_tcp_server(addr, tx).await });
+                let listener = bind_tcp_server(addr).await?;
+                join_set.spawn(async move { serve_tcp_server(listener, tx).await });
             }
             ServerConfig::UnixSocket { path } => {
                 let path = Path::new(&path).to_path_buf();
-                join_set.spawn(async move { run_unix_server(path, tx).await });
+                let socket = bind_unix_server(path).await?;
+                join_set.spawn(async move { serve_unix_server(socket, tx).await });
             }
             ServerConfig::Udp { addr } => {
-                join_set.spawn(async move { run_udp_server(addr, tx).await });
+                let socket = bind_udp_server(addr).await?;
+                join_set.spawn(async move { serve_udp_server(socket, tx).await });
             }
         }
     }
@@ -235,6 +241,10 @@ async fn main() -> anyhow::Result<()> {
             "certificate-authority (provider) mode enabled (mesh_id = {:#x})",
             provider_cfg.mesh_id
         );
+    }
+
+    if let Err(err) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
+        tracing::trace!("Failed to notify systemd: {}", err);
     }
 
     driver.run().await

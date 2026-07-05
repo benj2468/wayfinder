@@ -34,6 +34,7 @@ pub use authority::CertAuthority;
 mod transport;
 #[cfg(feature = "std")]
 pub use transport::{
-    ChannelRequest, ChannelServerRx, ChannelServerTx, QueryRx, QueryTx, run_channel_server,
-    run_tcp_server, run_udp_server, run_unix_server,
+    ChannelRequest, ChannelServerRx, ChannelServerTx, QueryRx, QueryTx, bind_tcp_server,
+    bind_udp_server, bind_unix_server, run_channel_server, run_tcp_server, run_udp_server,
+    run_unix_server, serve_tcp_server, serve_udp_server, serve_unix_server,
 };

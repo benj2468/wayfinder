@@ -2,7 +2,7 @@
 testers.nixosTest {
   name = "wayfinder-simple";
 
-  nodes.machine = { ... }: {
+  containers.machine = { ... }: {
     imports = [ ../modules/wayfinder.nix ];
 
     # Enable your module and provide test configuration
@@ -22,7 +22,7 @@ testers.nixosTest {
         links = [
           {
             type = "RawL2";
-            interface = "eth0";
+            interface = "eth1";
             ethertype = lib.trivial.fromHexString "0xcafe";
           }
         ];
@@ -33,6 +33,8 @@ testers.nixosTest {
   # Python script to orchestrate the test VM
   testScript = ''
     machine.wait_for_unit("wayfinder.service")
+    machine.wait_for_open_port(7700, timeout=10)
+
     machine.succeed("wayfinder-ctl node-info")
     machine.succeed("wayfinder-tui --help")
   '';

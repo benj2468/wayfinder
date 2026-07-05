@@ -54,10 +54,21 @@ where
     Ok(())
 }
 
-/// Accept TCP connections and service each as a length-delimited stream.
-pub async fn run_tcp_server(addr: SocketAddr, query_tx: QueryTx) -> anyhow::Result<()> {
+/// Bind the TCP management-API listener without serving it.
+///
+/// Split out from [`run_tcp_server`] so a caller can bind every configured
+/// listener up front -- surfacing a bind failure (e.g. address in use)
+/// synchronously -- before spawning the accept loops and declaring itself
+/// ready.
+pub async fn bind_tcp_server(addr: SocketAddr) -> anyhow::Result<TcpListener> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("management API listening on TCP {addr}");
+    Ok(listener)
+}
+
+/// Accept TCP connections on an already-bound listener and service each as a
+/// length-delimited stream.
+pub async fn serve_tcp_server(listener: TcpListener, query_tx: QueryTx) -> anyhow::Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
         tracing::debug!(%peer, "management connection accepted");
@@ -68,6 +79,15 @@ pub async fn run_tcp_server(addr: SocketAddr, query_tx: QueryTx) -> anyhow::Resu
             }
         });
     }
+}
+
+/// Accept TCP connections and service each as a length-delimited stream.
+///
+/// Convenience wrapper composing [`bind_tcp_server`] and [`serve_tcp_server`]
+/// for callers that don't need to bind ahead of spawning.
+pub async fn run_tcp_server(addr: SocketAddr, query_tx: QueryTx) -> anyhow::Result<()> {
+    let listener = bind_tcp_server(addr).await?;
+    serve_tcp_server(listener, query_tx).await
 }
 
 /// Why [`handle_connectionless`] failed to produce a response.
@@ -109,13 +129,22 @@ async fn handle_connectionless(
     Ok(out)
 }
 
-/// Serve the management API over a Unix datagram socket.
-pub async fn run_unix_server(path: PathBuf, query_tx: QueryTx) -> anyhow::Result<()> {
+/// Bind the Unix datagram management-API socket without serving it.
+///
+/// Split out from [`run_unix_server`] for the same reason as
+/// [`bind_tcp_server`]: let a caller bind up front and surface a failure
+/// synchronously, before spawning the serve loop.
+pub async fn bind_unix_server(path: PathBuf) -> anyhow::Result<UnixDatagram> {
     if std::fs::metadata(&path).is_ok() {
         std::fs::remove_file(&path)?;
     }
     let listener = UnixDatagram::bind(&path)?;
     tracing::info!("management API listening on unix socket {}", path.display());
+    Ok(listener)
+}
+
+/// Serve the management API over an already-bound Unix datagram socket.
+pub async fn serve_unix_server(listener: UnixDatagram, query_tx: QueryTx) -> anyhow::Result<()> {
     let mut buf = vec![0u8; 65535];
     loop {
         let (len, peer) = listener.recv_from(&mut buf).await?;
@@ -142,6 +171,16 @@ pub async fn run_unix_server(path: PathBuf, query_tx: QueryTx) -> anyhow::Result
         };
         let _ = listener.send_to(&response, peer_path).await;
     }
+}
+
+/// Serve the management API over a Unix datagram socket.
+///
+/// Convenience wrapper composing [`bind_unix_server`] and
+/// [`serve_unix_server`] for callers that don't need to bind ahead of
+/// spawning.
+pub async fn run_unix_server(path: PathBuf, query_tx: QueryTx) -> anyhow::Result<()> {
+    let listener = bind_unix_server(path).await?;
+    serve_unix_server(listener, query_tx).await
 }
 
 /// Serve the management API over an in-process mpsc channel.
@@ -171,10 +210,19 @@ pub async fn run_channel_server(mut rx: ChannelServerRx, query_tx: QueryTx) -> a
     Ok(())
 }
 
-/// Serve the management API over UDP.
-pub async fn run_udp_server(addr: SocketAddr, query_tx: QueryTx) -> anyhow::Result<()> {
+/// Bind the UDP management-API socket without serving it.
+///
+/// Split out from [`run_udp_server`] for the same reason as
+/// [`bind_tcp_server`]: let a caller bind up front and surface a failure
+/// synchronously, before spawning the serve loop.
+pub async fn bind_udp_server(addr: SocketAddr) -> anyhow::Result<UdpSocket> {
     let socket = UdpSocket::bind(addr).await?;
     tracing::info!("management API listening on UDP {addr}");
+    Ok(socket)
+}
+
+/// Serve the management API over an already-bound UDP socket.
+pub async fn serve_udp_server(socket: UdpSocket, query_tx: QueryTx) -> anyhow::Result<()> {
     let mut buf = vec![0u8; 65535];
     loop {
         let (len, peer) = socket.recv_from(&mut buf).await?;
@@ -195,6 +243,15 @@ pub async fn run_udp_server(addr: SocketAddr, query_tx: QueryTx) -> anyhow::Resu
     }
 }
 
+/// Serve the management API over UDP.
+///
+/// Convenience wrapper composing [`bind_udp_server`] and [`serve_udp_server`]
+/// for callers that don't need to bind ahead of spawning.
+pub async fn run_udp_server(addr: SocketAddr, query_tx: QueryTx) -> anyhow::Result<()> {
+    let socket = bind_udp_server(addr).await?;
+    serve_udp_server(socket, query_tx).await
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -202,7 +259,7 @@ mod tests {
         time::Duration,
     };
 
-    use tokio::net::UnixDatagram;
+    use tokio::net::{TcpStream, UnixDatagram};
     use tokio::sync::mpsc;
     use wayfinder_protos::wayfinder_v1alpha::{
         GetNodeInfoRequest, NodeInfo, WayfinderRequest, WayfinderResponse,
@@ -210,6 +267,71 @@ mod tests {
     };
 
     use super::*;
+
+    /// A free TCP port on loopback, picked by asking the OS for one and
+    /// releasing it immediately, mirroring `free_udp_addr` below.
+    fn free_tcp_addr() -> SocketAddr {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    }
+
+    // These tests specify the bind/serve split needed so a caller (e.g.
+    // `wayfinder-tap`'s `main`) can bind every listener synchronously, up
+    // front, and only afterwards spawn the accept loops and signal readiness
+    // -- rather than binding as a side effect of a spawned task, which races
+    // readiness against the socket actually being live.
+
+    #[tokio::test]
+    async fn bind_tcp_server_accepts_before_any_serve_loop_runs() {
+        let addr = free_tcp_addr();
+        let _listener = bind_tcp_server(addr)
+            .await
+            .expect("bind must succeed on a free port");
+
+        // The socket is already in LISTEN state at the OS level as soon as
+        // `bind_tcp_server` returns -- no `serve_tcp_server` has been spawned
+        // yet, and none is needed for the kernel to accept the connection
+        // into its backlog.
+        tokio::time::timeout(Duration::from_millis(200), TcpStream::connect(addr))
+            .await
+            .expect("connect must not time out")
+            .expect("connect must succeed against an already-bound listener");
+    }
+
+    #[tokio::test]
+    async fn bind_tcp_server_reports_port_conflict_synchronously() {
+        let addr = free_tcp_addr();
+        let _held = std::net::TcpListener::bind(addr).unwrap();
+
+        // The whole point of separating bind from serve: a conflict is
+        // visible to the caller as soon as `bind_tcp_server` returns, not
+        // only later when a spawned serve-loop future happens to be polled.
+        assert!(bind_tcp_server(addr).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bind_udp_server_reports_port_conflict_synchronously() {
+        let addr = free_udp_addr();
+        let _held = std::net::UdpSocket::bind(addr).unwrap();
+
+        assert!(bind_udp_server(addr).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bind_unix_server_creates_socket_before_serve_loop_runs() {
+        let path = unique_socket_path("bind-before-serve");
+
+        let _socket = bind_unix_server(path.clone())
+            .await
+            .expect("bind must succeed on a fresh path");
+
+        assert!(
+            path.exists(),
+            "socket file must exist as soon as bind returns"
+        );
+    }
 
     /// A unique per-call socket path under the OS temp dir, so parallel test
     /// runs (and repeated calls within one test) never collide on `bind`.

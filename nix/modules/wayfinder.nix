@@ -44,7 +44,7 @@ in
       description = "Wayfinder Systemd Service";
 
       serviceConfig = {
-        Type = "simple";
+        Type = "notify";
         ExecStart = "${wayfinder-tap}/bin/wayfinder-tap --config ${configFile}";
 
         Restart = "always";
@@ -67,8 +67,10 @@ in
         ];
       };
 
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+
       wantedBy = [ "multi-user.target" ];
-      after = [ "network.target" ];
     };
   };
 }
