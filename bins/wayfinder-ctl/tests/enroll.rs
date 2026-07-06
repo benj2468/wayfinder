@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 use wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
 use wayfinder_protos::service::{
     CsrOutcome, InterfaceThroughputData, IssuedCertData, LinkQualityEntryData, NodeMetricsData,
-    OgmScheduleEntryData, PendingCsrData, RouteResolutionData, RoutingEntryData,
+    OgmScheduleEntryData, PendingCsrData, RouteResolutionData, RoutingEntryData, RuntimeConfigData,
     TableOccupancyData, WayfinderDataProvider, WayfinderService,
 };
 use wayfinder_protos::wayfinder_v1alpha::{WayfinderRequest, WayfinderResponse};
@@ -77,6 +77,12 @@ impl WayfinderDataProvider for ProviderMock {
     }
     fn set_auth(&mut self, _seed: &[u8], _cert: &[u8], _trust_anchor: &[u8]) -> Result<(), String> {
         Ok(())
+    }
+    fn set_config(&mut self, _config: RuntimeConfigData) -> Result<(), String> {
+        Ok(())
+    }
+    fn runtime_config_active(&self) -> bool {
+        false
     }
 
     fn get_trust_anchor(&self) -> Result<Vec<u8>, String> {

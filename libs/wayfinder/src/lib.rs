@@ -319,6 +319,13 @@ pub struct CentralRouter {
     /// bounded, here-and-now signal an operator can query; the first such drop
     /// also logs a single `warn!` so it is not entirely silent.
     oversize_drops: u32,
+    /// Whether this node currently has a runtime configuration override
+    /// successfully applied (via [`apply_runtime_trickle_config`](CentralRouter::apply_runtime_trickle_config)
+    /// or any future method that installs one), as opposed to running purely
+    /// off its startup configuration. Only ever set on a successful
+    /// application, never on a rejected one. Sticky: once set, stays set for
+    /// the life of the process. See [`runtime_config_active`](CentralRouter::runtime_config_active).
+    runtime_config_active: bool,
 }
 
 impl CentralRouter {
@@ -336,6 +343,7 @@ impl CentralRouter {
             auth: None,
             require_auth: false,
             oversize_drops: 0,
+            runtime_config_active: false,
         }
     }
 
@@ -793,6 +801,41 @@ impl CentralRouter {
         // Register the interface so its throughput is reported from startup,
         // even before it has carried any traffic.
         self.touch_iface(idx);
+    }
+
+    /// Apply a runtime override of interface `idx`'s Trickle/OGM bounds,
+    /// received over the management API (`SetConfig`) rather than at startup
+    /// wiring. Unlike [`configure_interface_ogm`](CentralRouter::configure_interface_ogm),
+    /// which is also used to *provision* new interfaces at startup, this only
+    /// overrides an interface already registered by startup wiring: `idx` must
+    /// be below [`num_interfaces`](CentralRouter::num_interfaces), else this
+    /// returns `false` and leaves the router untouched — in particular it does
+    /// *not* mark [`runtime_config_active`](CentralRouter::runtime_config_active),
+    /// so that flag never lies about an override having taken effect. On
+    /// success, like `configure_interface_ogm`, this replaces the interface's
+    /// Trickle timer outright: any backoff already grown toward the old
+    /// `i_max` is discarded and the interface resets to firing within
+    /// `[i_min/2, i_min)` of `now` — expect a burst of OGMs shortly after
+    /// calling this on a live interface.
+    pub fn apply_runtime_trickle_config(
+        &mut self,
+        idx: usize,
+        i_min: core::time::Duration,
+        i_max: core::time::Duration,
+        now: core::time::Duration,
+    ) -> bool {
+        if idx >= self.num_interfaces() {
+            return false;
+        }
+        self.configure_interface_ogm(idx, i_min, i_max, now);
+        self.runtime_config_active = true;
+        true
+    }
+
+    /// Whether this node currently has a runtime configuration override
+    /// applied, as opposed to running purely off its startup configuration.
+    pub fn runtime_config_active(&self) -> bool {
+        self.runtime_config_active
     }
 
     /// Time until the soonest interface is next due to emit an OGM, as of `now`.
@@ -1430,6 +1473,55 @@ mod throughput {
             .interface_throughput(2, Duration::from_secs(1))
             .unwrap();
         assert_eq!(tp, InterfaceThroughput::default());
+    }
+
+    /// `apply_runtime_trickle_config` installs the new Trickle bounds (like
+    /// `configure_interface_ogm`) and additionally marks the router's runtime
+    /// config as active, distinguishing a live override from startup wiring.
+    /// Matches real deployment flow: startup wiring registers the interface via
+    /// `configure_interface_ogm` first, and only afterward could a runtime
+    /// override arrive.
+    #[test]
+    fn apply_runtime_trickle_config_marks_active_and_installs_bounds() {
+        let mut router = CentralRouter::new(mac(1));
+        router.configure_interface_ogm(
+            0,
+            Duration::from_secs(1),
+            Duration::from_secs(8),
+            Duration::ZERO,
+        );
+        assert!(!router.runtime_config_active());
+
+        let applied = router.apply_runtime_trickle_config(
+            0,
+            Duration::from_millis(500),
+            Duration::from_millis(4000),
+            Duration::ZERO,
+        );
+
+        assert!(applied);
+        assert!(router.runtime_config_active());
+        let entry = router.ogm_schedule().find(|e| e.iface_idx == 0).unwrap();
+        assert_eq!(entry.min_interval, Duration::from_millis(500));
+        assert_eq!(entry.max_interval, Duration::from_millis(4000));
+    }
+
+    /// An index that doesn't correspond to any interface registered at startup
+    /// is rejected rather than silently marking the router as having an active
+    /// runtime override that didn't actually apply anything.
+    #[test]
+    fn apply_runtime_trickle_config_rejects_unregistered_interface() {
+        let mut router = CentralRouter::new(mac(1));
+
+        let applied = router.apply_runtime_trickle_config(
+            0,
+            Duration::from_millis(500),
+            Duration::from_millis(4000),
+            Duration::ZERO,
+        );
+
+        assert!(!applied);
+        assert!(!router.runtime_config_active());
     }
 
     /// A steady stream of equal-sized frames at a fixed cadence converges on the

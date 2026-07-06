@@ -30,9 +30,10 @@ use wayfinder_protos::wayfinder_v1alpha::{
     GetSecurityStatusResponse, GetThroughputRequest, GetTrustAnchorRequest, GetTrustAnchorResponse,
     LinkQualityTable, ListCertsRequest, ListCertsResponse, ListPendingCsrsRequest,
     ListPendingCsrsResponse, NodeInfo, NodeMetrics, OgmSchedule, ResolveRouteRequest,
-    ResolveRouteResponse, RevokeNodeRequest, RoutingTable, SetAuthRequest, SubmitCsrRequest,
-    SubmitCsrResponse, Throughput, WayfinderRequest, WayfinderResponse,
-    wayfinder_request::Request as RequestKind, wayfinder_response::Response as ResponseKind,
+    ResolveRouteResponse, RevokeNodeRequest, RoutingTable, RuntimeConfig, SetAuthRequest,
+    SetConfigRequest, SubmitCsrRequest, SubmitCsrResponse, Throughput, TrickleConfig,
+    WayfinderRequest, WayfinderResponse, wayfinder_request::Request as RequestKind,
+    wayfinder_response::Response as ResponseKind,
 };
 
 /// Where to reach a node's management API: a TCP `host:port` or a Unix-datagram
@@ -270,6 +271,35 @@ impl Client {
         {
             ResponseKind::Empty(_) => Ok(()),
             other => Err(unexpected("SetAuth", &other)),
+        }
+    }
+
+    /// Set the Trickle/OGM emission bounds for one mesh interface at runtime.
+    /// Applied in memory only — it does not persist across a restart. Resets
+    /// the interface's live Trickle timer, discarding any backoff already
+    /// grown toward the old bound — expect a burst of OGMs shortly after this
+    /// call on a live interface. `iface_idx` must refer to an interface the
+    /// node already has configured; this cannot provision a new one.
+    pub async fn set_trickle_config(
+        &mut self,
+        iface_idx: u32,
+        min_interval_ms: u32,
+        max_interval_ms: u32,
+    ) -> anyhow::Result<()> {
+        match self
+            .request(RequestKind::SetConfig(SetConfigRequest {
+                config: Some(RuntimeConfig {
+                    trickle: Some(TrickleConfig {
+                        iface_idx,
+                        min_interval_ms,
+                        max_interval_ms,
+                    }),
+                }),
+            }))
+            .await?
+        {
+            ResponseKind::Empty(_) => Ok(()),
+            other => Err(unexpected("SetConfig", &other)),
         }
     }
 

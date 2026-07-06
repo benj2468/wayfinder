@@ -19,7 +19,7 @@ use wayfinder_client::{Client, ConnectTarget};
 use wayfinder_protos::service::{
     EgressDecisionData, InterfaceThroughputData, LinkQualityEntryData, NeighborPathData,
     NodeMetricsData, OgmScheduleEntryData, RouteResolutionData, RoutingEntryData,
-    TableOccupancyData, WayfinderDataProvider, WayfinderService,
+    RuntimeConfigData, TableOccupancyData, WayfinderDataProvider, WayfinderService,
 };
 use wayfinder_protos::wayfinder_v1alpha::{
     WayfinderRequest, WayfinderResponse, resolve_route_response::Egress,
@@ -131,6 +131,14 @@ impl WayfinderDataProvider for Mock {
         Ok(())
     }
 
+    fn set_config(&mut self, _config: RuntimeConfigData) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn runtime_config_active(&self) -> bool {
+        false
+    }
+
     fn get_trust_anchor(&self) -> Result<Vec<u8>, String> {
         Ok(vec![0xab; 36])
     }
@@ -181,6 +189,7 @@ async fn assert_full_roundtrip(client: &mut Client) {
     assert_eq!(format_mac(&info.node_id), "aa:bb:cc:dd:ee:01");
     assert_eq!(info.num_originators, 2);
     assert!(info.auth_locked);
+    assert!(!info.runtime_config_active);
 
     let routing = client.routing_table().await.unwrap();
     assert_eq!(routing.entries.len(), 1);
@@ -214,6 +223,9 @@ async fn assert_full_roundtrip(client: &mut Client) {
     // GetTrustAnchor request/response framing).
     let anchor = client.get_trust_anchor().await.unwrap();
     assert_eq!(anchor.trust_anchor, vec![0xab; 36]);
+
+    // SetConfig round-trips too (exercises the mutating-request framing).
+    client.set_trickle_config(0, 500, 4000).await.unwrap();
 }
 
 #[tokio::test]

@@ -363,6 +363,7 @@ mod tests {
                         node_id: vec![1, 2, 3, 4, 5, 6],
                         num_originators: 7,
                         auth_locked: false,
+                        runtime_config_active: false,
                     })),
                 };
                 let _ = resp_tx.send(response);

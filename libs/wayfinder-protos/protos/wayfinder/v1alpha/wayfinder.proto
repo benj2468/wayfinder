@@ -132,6 +132,50 @@ message SetAuthRequest {
   bytes trust_anchor = 3;
 }
 
+// A single mesh interface's Trickle/OGM emission bounds, as set via
+// SetConfig.  Mirrors OgmScheduleEntry's min_interval_ms/max_interval_ms, but
+// as a request to install them rather than a report of what's installed.
+// Replaces the interface's Trickle timer outright: any backoff already grown
+// toward the old max_interval_ms is discarded and the interface resets to
+// firing near min_interval_ms — expect a burst of OGMs shortly after this is
+// applied to a live interface.
+message TrickleConfig {
+  // Index of the interface to reconfigure, in registration order (same
+  // indexing as OgmScheduleEntry.iface_idx).  Must refer to an interface
+  // already registered by the node's startup configuration; SetConfig cannot
+  // provision a new interface that doesn't already exist.
+  uint32 iface_idx = 1;
+
+  // The new backoff floor, in milliseconds: the most aggressive interval the
+  // timer resets to on a topology change.
+  uint32 min_interval_ms = 2;
+
+  // The new backoff ceiling, in milliseconds: the quietest interval the
+  // doubling backoff is capped at.
+  uint32 max_interval_ms = 3;
+}
+
+// The node's live-editable runtime configuration.  Each field is
+// independently optional: an unset field leaves that piece of configuration
+// unchanged.  New runtime-editable knobs are added here as additional
+// fields, rather than as new RPCs.
+message RuntimeConfig {
+  // Present to update the Trickle/OGM bounds for one mesh interface.
+  TrickleConfig trickle = 1;
+}
+
+// Apply a partial update to the node's runtime configuration.  Only the
+// fields present in `config` are changed; unset fields are left as they are.
+// Applied in memory only — it does not persist across a restart, so the
+// startup configuration remains the source of truth for next boot.  Answered
+// with an Empty response on success, or an ErrorResponse if a present field
+// fails validation (e.g. an out-of-range interface index, or
+// TrickleConfig.min_interval_ms exceeding max_interval_ms).
+message SetConfigRequest {
+  // The partial configuration update to apply.
+  RuntimeConfig config = 1;
+}
+
 // Fetch the mesh trust anchor a node verifies certificates against.  Served by
 // a node running in provider (certificate-authority) mode; an enrolling member
 // uses it to learn the anchor without trusting whatever it was handed
@@ -254,6 +298,9 @@ message WayfinderRequest {
 
     // Deny a pending CSR (provider mode).
     DenyCsrRequest deny_csr = 16;
+
+    // Apply a partial update to the node's runtime configuration.
+    SetConfigRequest set_config = 17;
   }
 }
 
@@ -275,6 +322,12 @@ message NodeInfo {
   // routing, no OGM emission) until provisioned with a cert over the
   // management API.
   bool auth_locked = 3;
+
+  // Whether this node currently has a runtime configuration override applied
+  // via SetConfig, as opposed to running purely off its startup
+  // configuration. Overrides are in-memory only and do not survive a
+  // restart.
+  bool runtime_config_active = 4;
 }
 
 // Per-neighbor path metrics for a single path to an originator.

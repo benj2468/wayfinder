@@ -70,6 +70,30 @@ pub struct OgmScheduleEntryData {
     pub max_interval_ms: u32,
 }
 
+/// Intermediate representation of a request to install new Trickle/OGM bounds
+/// for one mesh interface, carried by [`RuntimeConfigData`] into
+/// [`WayfinderDataProvider::set_config`].  All intervals are in milliseconds.
+#[derive(Clone)]
+pub struct TrickleConfigData {
+    /// Physical-interface index to reconfigure, in registration order.
+    pub iface_idx: u32,
+    /// New backoff floor (Trickle `i_min`), in ms.
+    pub min_interval_ms: u32,
+    /// New backoff ceiling (Trickle `i_max`), in ms.
+    pub max_interval_ms: u32,
+}
+
+/// Intermediate representation of a partial runtime-configuration update,
+/// passed to [`WayfinderDataProvider::set_config`].  Each field is
+/// independently optional: `None` leaves that piece of configuration
+/// unchanged.  New runtime-editable knobs are added here as additional
+/// fields, rather than as new provider methods.
+#[derive(Clone, Default)]
+pub struct RuntimeConfigData {
+    /// Present to update the Trickle/OGM bounds for one mesh interface.
+    pub trickle: Option<TrickleConfigData>,
+}
+
 /// Intermediate representation of one interface's smoothed throughput,
 /// returned by [`WayfinderDataProvider::throughput`].  Rates are bytes/sec and
 /// frames/sec in each direction, evaluated at the moment the snapshot was
@@ -222,6 +246,16 @@ pub trait WayfinderDataProvider {
     /// Set the auth state on the node
     fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String>;
 
+    /// Apply a partial update to the node's runtime configuration. Only the
+    /// fields present in `config` are changed; unset fields are left as they
+    /// are. In-memory only — does not persist across a restart.
+    fn set_config(&mut self, config: RuntimeConfigData) -> Result<(), String>;
+
+    /// Whether this node currently has a runtime configuration override
+    /// applied via [`set_config`](WayfinderDataProvider::set_config), as
+    /// opposed to running purely off its startup configuration.
+    fn runtime_config_active(&self) -> bool;
+
     /// This node's mesh authentication / security posture, evaluated from live
     /// auth state at the moment of the call.  The default reports auth disabled;
     /// a provider with router-auth wired overrides it.
@@ -366,6 +400,7 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                 node_id: self.provider.node_id(),
                 num_originators: self.provider.num_originators(),
                 auth_locked: self.provider.auth_locked(),
+                runtime_config_active: self.provider.runtime_config_active(),
             }),
 
             Some(RequestKind::GetRoutingTable(_)) => {
@@ -529,6 +564,23 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                 }
             }
 
+            Some(RequestKind::SetConfig(set_config)) => {
+                let config = RuntimeConfigData {
+                    trickle: set_config
+                        .config
+                        .and_then(|c| c.trickle)
+                        .map(|t| TrickleConfigData {
+                            iface_idx: t.iface_idx,
+                            min_interval_ms: t.min_interval_ms,
+                            max_interval_ms: t.max_interval_ms,
+                        }),
+                };
+                match self.provider.set_config(config) {
+                    Ok(_) => ResponseKind::Empty(Empty {}),
+                    Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+                }
+            }
+
             Some(RequestKind::GetTrustAnchor(_)) => match self.provider.get_trust_anchor() {
                 Ok(trust_anchor) => {
                     ResponseKind::TrustAnchor(GetTrustAnchorResponse { trust_anchor })
@@ -621,8 +673,8 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
 mod tests {
     use super::*;
     use crate::wayfinder_v1alpha::{
-        GetLinkQualityTableRequest, GetMetricsRequest, GetOgmScheduleRequest, GetThroughputRequest,
-        ResolveRouteRequest,
+        GetLinkQualityTableRequest, GetMetricsRequest, GetNodeInfoRequest, GetOgmScheduleRequest,
+        GetThroughputRequest, ResolveRouteRequest, RuntimeConfig, SetConfigRequest, TrickleConfig,
     };
     use alloc::vec;
 
@@ -638,6 +690,8 @@ mod tests {
         // RefCell would be nicer but no_std + alloc here — a Cell of an
         // owned Vec would require Clone gymnastics, so we just leave the
         // resolution as a single fixed answer per test.
+        runtime_config_active: bool,
+        last_set_config: Option<RuntimeConfigData>,
     }
 
     impl WayfinderDataProvider for MockProvider {
@@ -675,6 +729,19 @@ mod tests {
             _trust_anchor: &[u8],
         ) -> Result<(), String> {
             Ok(())
+        }
+        fn set_config(&mut self, config: RuntimeConfigData) -> Result<(), String> {
+            if let Some(t) = &config.trickle
+                && t.iface_idx == u32::MAX
+            {
+                return Err("interface index out of range".into());
+            }
+            self.runtime_config_active = config.trickle.is_some();
+            self.last_set_config = Some(config);
+            Ok(())
+        }
+        fn runtime_config_active(&self) -> bool {
+            self.runtime_config_active
         }
     }
 
@@ -825,6 +892,70 @@ mod tests {
         ) {
             ResponseKind::Error(err) => assert!(!err.message.is_empty()),
             other => panic!("expected Error, got {:?}", proto_kind_name(&other)),
+        }
+    }
+
+    #[test]
+    fn set_config_with_trickle_forwards_to_provider_and_returns_empty() {
+        match handle(
+            MockProvider::default(),
+            RequestKind::SetConfig(SetConfigRequest {
+                config: Some(RuntimeConfig {
+                    trickle: Some(TrickleConfig {
+                        iface_idx: 2,
+                        min_interval_ms: 500,
+                        max_interval_ms: 4000,
+                    }),
+                }),
+            }),
+        ) {
+            ResponseKind::Empty(_) => {}
+            other => panic!("expected Empty, got {:?}", proto_kind_name(&other)),
+        }
+    }
+
+    #[test]
+    fn set_config_with_no_fields_set_is_a_no_op() {
+        match handle(
+            MockProvider::default(),
+            RequestKind::SetConfig(SetConfigRequest {
+                config: Some(RuntimeConfig { trickle: None }),
+            }),
+        ) {
+            ResponseKind::Empty(_) => {}
+            other => panic!("expected Empty, got {:?}", proto_kind_name(&other)),
+        }
+    }
+
+    #[test]
+    fn set_config_provider_error_surfaces_as_error_response() {
+        match handle(
+            MockProvider::default(),
+            RequestKind::SetConfig(SetConfigRequest {
+                config: Some(RuntimeConfig {
+                    trickle: Some(TrickleConfig {
+                        iface_idx: u32::MAX,
+                        min_interval_ms: 500,
+                        max_interval_ms: 4000,
+                    }),
+                }),
+            }),
+        ) {
+            ResponseKind::Error(err) => assert!(!err.message.is_empty()),
+            other => panic!("expected Error, got {:?}", proto_kind_name(&other)),
+        }
+    }
+
+    #[test]
+    fn node_info_reports_runtime_config_active() {
+        let provider = MockProvider {
+            runtime_config_active: true,
+            ..Default::default()
+        };
+
+        match handle(provider, RequestKind::GetNodeInfo(GetNodeInfoRequest {})) {
+            ResponseKind::NodeInfo(info) => assert!(info.runtime_config_active),
+            other => panic!("expected NodeInfo, got {:?}", proto_kind_name(&other)),
         }
     }
 

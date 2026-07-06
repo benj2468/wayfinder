@@ -1,9 +1,11 @@
 //! The [`WayfinderDataProvider`] adapter over the router.
 //!
 //! Newtype so we can implement the external trait for the external
-//! [`CentralRouter`]. This layer is `no_std` + `alloc`: it is pure projection
-//! from router state into the management-API intermediate representation and
-//! carries no transport dependencies.
+//! [`CentralRouter`]. This layer is `no_std` + `alloc` and carries no
+//! transport dependencies. Most methods are pure projections of router state
+//! into the management-API intermediate representation, but some — `set_auth`,
+//! `set_config`, `revoke_node`, `approve_csr`, `deny_csr` — mutate the borrowed
+//! router (or the provider-mode CA) in response to a request.
 
 use core::time::Duration;
 
@@ -20,8 +22,8 @@ use wayfinder::wayfinder_auth::TrustAnchor;
 use wayfinder_protos::service::{
     CsrOutcome, EgressDecisionData, InterfaceThroughputData, IssuedCertData, LinkQualityEntryData,
     NeighborPathData, NodeMetricsData, NodeSecurityData, OgmScheduleEntryData, PendingCsrData,
-    RouteResolutionData, RoutingEntryData, SecurityStatusData, TableOccupancyData,
-    WayfinderDataProvider,
+    RouteResolutionData, RoutingEntryData, RuntimeConfigData, SecurityStatusData,
+    TableOccupancyData, WayfinderDataProvider,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -268,6 +270,28 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
         Ok(())
     }
 
+    fn set_config(&mut self, config: RuntimeConfigData) -> Result<(), String> {
+        if let Some(t) = config.trickle {
+            if t.min_interval_ms > t.max_interval_ms {
+                return Err("min_interval_ms must not exceed max_interval_ms".to_string());
+            }
+            let applied = self.router.apply_runtime_trickle_config(
+                t.iface_idx as usize,
+                Duration::from_millis(t.min_interval_ms.into()),
+                Duration::from_millis(t.max_interval_ms.into()),
+                self.now,
+            );
+            if !applied {
+                return Err("interface index out of range".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn runtime_config_active(&self) -> bool {
+        self.router.runtime_config_active()
+    }
+
     fn get_trust_anchor(&self) -> Result<Vec<u8>, String> {
         match &self.ca {
             Some(ca) => Ok(ca.trust_anchor_bytes()),
@@ -350,6 +374,7 @@ mod tests {
     use wayfinder::CentralRouter;
     use wayfinder::batman::wire::{BATADV_IV_OGM, BatmanOgmPacket};
     use wayfinder::interfaces::frame::{LinkFrame, Mac};
+    use wayfinder_protos::service::TrickleConfigData;
     use zerocopy::{FromBytes, IntoBytes};
 
     fn mac(n: u8) -> Mac {
@@ -409,6 +434,123 @@ mod tests {
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
         let mut tx = [0u8; 256];
         router.handle_frame(Duration::ZERO, 0, frame, &mut tx);
+    }
+
+    /// A router with interface 0 already registered (as startup wiring would
+    /// do) has no runtime config override yet; `set_config` with the Trickle
+    /// field present installs the new bounds and flips `runtime_config_active`
+    /// to true.
+    #[test]
+    fn set_config_installs_trickle_bounds_and_marks_active() {
+        let mut router = CentralRouter::new(mac(1));
+        router.configure_interface_ogm(
+            0,
+            Duration::from_secs(1),
+            Duration::from_secs(8),
+            Duration::ZERO,
+        );
+        assert!(!RouterAdapter::new(&mut router, None, Duration::ZERO).runtime_config_active());
+
+        let result =
+            RouterAdapter::new(&mut router, None, Duration::ZERO).set_config(RuntimeConfigData {
+                trickle: Some(TrickleConfigData {
+                    iface_idx: 0,
+                    min_interval_ms: 500,
+                    max_interval_ms: 4000,
+                }),
+            });
+        assert!(result.is_ok());
+
+        let adapter = RouterAdapter::new(&mut router, None, Duration::ZERO);
+        assert!(adapter.runtime_config_active());
+        let entry = adapter
+            .ogm_schedule()
+            .into_iter()
+            .find(|e| e.iface_idx == 0)
+            .unwrap();
+        assert_eq!(entry.min_interval_ms, 500);
+        assert_eq!(entry.max_interval_ms, 4000);
+    }
+
+    /// `set_config` with no fields set is a no-op that still succeeds.
+    #[test]
+    fn set_config_with_no_fields_is_a_no_op() {
+        let mut router = CentralRouter::new(mac(1));
+        let result = RouterAdapter::new(&mut router, None, Duration::ZERO)
+            .set_config(RuntimeConfigData { trickle: None });
+        assert!(result.is_ok());
+        assert!(!RouterAdapter::new(&mut router, None, Duration::ZERO).runtime_config_active());
+    }
+
+    /// An out-of-range interface index is rejected rather than silently
+    /// ignored (which is what the underlying router primitive does).
+    #[test]
+    fn set_config_out_of_range_iface_idx_errors() {
+        let mut router = CentralRouter::new(mac(1));
+        let result =
+            RouterAdapter::new(&mut router, None, Duration::ZERO).set_config(RuntimeConfigData {
+                trickle: Some(TrickleConfigData {
+                    iface_idx: wayfinder::MAX_INTERFACES as u32,
+                    min_interval_ms: 500,
+                    max_interval_ms: 4000,
+                }),
+            });
+        let err = result.unwrap_err();
+        assert!(err.contains("out of range"), "got: {err}");
+        assert!(!RouterAdapter::new(&mut router, None, Duration::ZERO).runtime_config_active());
+    }
+
+    /// An index within `MAX_INTERFACES` capacity but not yet registered by
+    /// startup wiring is rejected too — `SetConfig` may only override an
+    /// interface that already exists, not fabricate a new one out of thin air.
+    #[test]
+    fn set_config_unregistered_iface_idx_errors() {
+        let mut router = CentralRouter::new(mac(1));
+        router.configure_interface_ogm(
+            0,
+            Duration::from_secs(1),
+            Duration::from_secs(8),
+            Duration::ZERO,
+        );
+
+        let result =
+            RouterAdapter::new(&mut router, None, Duration::ZERO).set_config(RuntimeConfigData {
+                trickle: Some(TrickleConfigData {
+                    iface_idx: 1,
+                    min_interval_ms: 500,
+                    max_interval_ms: 4000,
+                }),
+            });
+        let err = result.unwrap_err();
+        assert!(err.contains("out of range"), "got: {err}");
+        assert!(!RouterAdapter::new(&mut router, None, Duration::ZERO).runtime_config_active());
+    }
+
+    /// An inverted range (`min_interval_ms > max_interval_ms`) is rejected
+    /// rather than silently well-ordered by the underlying `TrickleTimer`, so
+    /// an operator who swaps the two arguments gets a clear error instead of a
+    /// success response that quietly installed something else.
+    #[test]
+    fn set_config_inverted_bounds_errors() {
+        let mut router = CentralRouter::new(mac(1));
+        router.configure_interface_ogm(
+            0,
+            Duration::from_secs(1),
+            Duration::from_secs(8),
+            Duration::ZERO,
+        );
+
+        let result =
+            RouterAdapter::new(&mut router, None, Duration::ZERO).set_config(RuntimeConfigData {
+                trickle: Some(TrickleConfigData {
+                    iface_idx: 0,
+                    min_interval_ms: 5000,
+                    max_interval_ms: 1000,
+                }),
+            });
+        let err = result.unwrap_err();
+        assert!(err.contains("min_interval_ms"), "got: {err}");
+        assert!(!RouterAdapter::new(&mut router, None, Duration::ZERO).runtime_config_active());
     }
 
     /// An empty originator table must fold to all-zero metrics — in particular a
