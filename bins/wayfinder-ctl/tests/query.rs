@@ -8,8 +8,8 @@ use std::net::SocketAddr;
 use tokio::sync::{mpsc, oneshot};
 use wayfinder_protos::service::{
     InterfaceThroughputData, LinkQualityEntryData, NodeMetricsData, NodeSecurityData,
-    OgmScheduleEntryData, RouteResolutionData, RoutingEntryData, SecurityStatusData,
-    TableOccupancyData, WayfinderDataProvider, WayfinderService,
+    OgmScheduleEntryData, RouteResolutionData, RoutingEntryData, RuntimeConfigData,
+    SecurityStatusData, TableOccupancyData, WayfinderDataProvider, WayfinderService,
 };
 use wayfinder_protos::wayfinder_v1alpha::{WayfinderRequest, WayfinderResponse};
 use wayfinder_server::run_tcp_server;
@@ -72,6 +72,12 @@ impl WayfinderDataProvider for Mock {
     fn set_auth(&mut self, _seed: &[u8], _cert: &[u8], _trust_anchor: &[u8]) -> Result<(), String> {
         Ok(())
     }
+    fn set_config(&mut self, _config: RuntimeConfigData) -> Result<(), String> {
+        Ok(())
+    }
+    fn runtime_config_active(&self) -> bool {
+        true
+    }
     fn security_status(&self) -> SecurityStatusData {
         SecurityStatusData {
             auth_enabled: true,
@@ -131,6 +137,7 @@ async fn node_info_query_renders_json_from_server() {
     let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(parsed["num_originators"], 5);
     assert_eq!(parsed["auth_locked"], true);
+    assert_eq!(parsed["runtime_config_active"], true);
 }
 
 #[tokio::test]
@@ -142,6 +149,24 @@ async fn node_info_query_renders_human_from_server() {
     assert!(out.contains("aa:bb:cc:dd:ee:07"), "got: {out}");
     assert!(out.contains("originators: 5"), "got: {out}");
     assert!(out.contains("locked: yes"), "got: {out}");
+    assert!(out.contains("runtime config: yes"), "got: {out}");
+}
+
+#[tokio::test]
+async fn set_trickle_config_query_succeeds_against_server() {
+    let addr = spawn_server().await;
+    let out = run_query(
+        Command::SetTrickleConfig {
+            iface: 0,
+            min_ms: 500,
+            max_ms: 4000,
+        },
+        &addr.to_string(),
+        OutputFormat::Human,
+    )
+    .await
+    .expect("query succeeds");
+    assert!(out.contains("trickle config"), "got: {out}");
 }
 
 #[tokio::test]

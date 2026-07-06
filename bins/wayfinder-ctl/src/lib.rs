@@ -75,6 +75,23 @@ pub enum Command {
         /// Destination identifier: a MAC like `02:00:00:00:00:09`, or raw hex.
         dest: String,
     },
+    /// Set the Trickle/OGM emission bounds for one mesh interface at runtime.
+    /// Applied in memory only — it does not persist across a restart. Resets
+    /// the interface's live Trickle timer, discarding any backoff already
+    /// grown toward the old bound — expect a burst of OGMs shortly after this
+    /// on a live interface. `iface` must refer to an interface the node
+    /// already has configured; this cannot provision a new one.
+    SetTrickleConfig {
+        /// Index of the interface to reconfigure, in registration order.
+        #[arg(long)]
+        iface: u32,
+        /// New backoff floor (Trickle i_min), in milliseconds.
+        #[arg(long)]
+        min_ms: u32,
+        /// New backoff ceiling (Trickle i_max), in milliseconds.
+        #[arg(long)]
+        max_ms: u32,
+    },
     /// Store authenticate data into the application
     SetAuth {
         /// Seed for the node
@@ -175,6 +192,17 @@ pub async fn run_query(
         Command::Resolve { dest } => {
             let id = parse_id(&dest)?;
             output::resolve(&client.resolve_route(id).await?, output)?
+        }
+        Command::SetTrickleConfig {
+            iface,
+            min_ms,
+            max_ms,
+        } => {
+            client
+                .set_trickle_config(iface, min_ms, max_ms)
+                .await
+                .context("failed to set trickle config")?;
+            "trickle config updated".to_string()
         }
         Command::SetAuth {
             seed,
