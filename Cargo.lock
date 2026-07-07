@@ -1904,6 +1904,7 @@ dependencies = [
  "embedded-io-adapters",
  "embedded-io-async 0.6.1",
  "heapless",
+ "rylr998-sim",
  "thiserror",
  "tokio",
  "tokio-serial",
@@ -1911,6 +1912,16 @@ dependencies = [
  "tracing-subscriber",
  "wayfinder",
  "zerocopy",
+]
+
+[[package]]
+name = "rylr998-sim"
+version = "0.1.0"
+dependencies = [
+ "embedded-io 0.6.1",
+ "embedded-io-adapters",
+ "rylr998",
+ "tokio",
 ]
 
 [[package]]
@@ -2749,6 +2760,8 @@ dependencies = [
  "heapless",
  "interfaces",
  "rand",
+ "rylr998",
+ "rylr998-sim",
  "serde",
  "thiserror",
  "tokio",

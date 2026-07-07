@@ -34,3 +34,8 @@ tracing-subscriber.workspace = true
 # so the Trickle-paced convergence test advances virtual time instantly instead
 # of waiting out real timer granularity.
 tokio = { workspace = true, features = ["test-util"] }
+# A real RYLR998 driver + its in-process LoRa-air simulator, for the
+# rylr998_integration_tests module — the one suite that drives an actual
+# LinkT implementation instead of the channel-based Switch fabric.
+rylr998 = { path = "../rylr998", features = ["link"] }
+rylr998-sim = { path = "../rylr998-sim" }

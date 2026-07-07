@@ -1,0 +1,13 @@
+[package]
+name = "rylr998-sim"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+rylr998 = { path = "../rylr998" }
+tokio = { workspace = true }
+embedded-io-adapters = { workspace = true }
+embedded-io = "0.6.1"
