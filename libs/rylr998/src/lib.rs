@@ -10,9 +10,9 @@
 
 use core::time::Duration;
 use embedded_io_async::{Read, Write};
-use heapless::String;
+use heapless::{Deque, String};
 use thiserror::Error;
-use tracing::trace;
+use tracing::{trace, warn};
 
 /// An error from the RYLR module driver.
 #[derive(Error, Debug)]
@@ -119,6 +119,68 @@ pub struct ReceivedPacket {
 #[cfg(feature = "link")]
 mod link;
 
+#[cfg(feature = "link")]
+mod frag;
+
+/// Parse a `+RCV=<Address>,<Length>,<Data>,<RSSI>,<SNR>` line (the `+RCV=`
+/// prefix must already be present) into a [`ReceivedPacket`].
+fn parse_rcv(line: &str) -> Result<ReceivedPacket, LoraError> {
+    // Format payload: +RCV=<Address>,<Length>,<Data>,<RSSI>,<SNR>
+    // Manual parsing to avoid Vec
+    let clean_target = line
+        .strip_prefix("+RCV=")
+        .ok_or(LoraError::InvalidResponse)?;
+    let mut parts = clean_target.split(',');
+
+    let address_str = parts.next().ok_or(LoraError::InvalidResponse)?;
+    let length_str = parts.next().ok_or(LoraError::InvalidResponse)?;
+    let data_str = parts.next().ok_or(LoraError::InvalidResponse)?;
+    let rssi_str = parts.next().ok_or(LoraError::InvalidResponse)?;
+    let snr_str = parts.next().ok_or(LoraError::InvalidResponse)?;
+
+    let address = address_str
+        .parse::<u16>()
+        .map_err(|_| LoraError::InvalidResponse)?;
+    let length = length_str
+        .parse::<usize>()
+        .map_err(|_| LoraError::InvalidResponse)?;
+    let mut data = String::<240>::new();
+    data.push_str(data_str)
+        .map_err(|_| LoraError::InvalidResponse)?;
+    let rssi = rssi_str
+        .parse::<i32>()
+        .map_err(|_| LoraError::InvalidResponse)?;
+    let snr = snr_str
+        .parse::<i32>()
+        .map_err(|_| LoraError::InvalidResponse)?;
+
+    Ok(ReceivedPacket {
+        address,
+        length,
+        data,
+        rssi,
+        snr,
+    })
+}
+
+/// Depth of [`RylrClient::rx_queue`]: how many unsolicited `+RCV` packets can
+/// sit buffered while a command response is awaited before the oldest is
+/// evicted to make room. Not derived from a hard protocol limit — chosen as a
+/// small multiple of a fragmented message's typical fragment count (a few) so
+/// one busy command wait can absorb an interleaved multi-fragment OGM without
+/// evicting; each queued `ReceivedPacket` costs ~250 bytes (dominated by its
+/// `String<240>`), so this is a deliberately modest bound, not an attempt at
+/// an exact worst case.
+const RX_QUEUE_DEPTH: usize = 8;
+
+/// Longest single line (a command response or an unsolicited `+RCV=...`) the
+/// module can send us. Sized for the worst case: the module's own 240-char
+/// maximum `<Data>` field, plus the largest `<Address>`/`<RSSI>`/`<SNR>`
+/// fields the AT protocol allows (`+RCV=65535,240,<240 chars>,-130,-20` is
+/// ~264 chars) — comfortably covers a maximal on-air fragment once the
+/// `link` feature is hex-encoding one into a `+RCV` line.
+const LINE_BUF_LEN: usize = 300;
+
 /// The core RYLR998/RYLR498 Client driver structure.
 pub struct RylrClient<S> {
     stream: S,
@@ -127,11 +189,27 @@ pub struct RylrClient<S> {
     // The network ID for the client.
     network_id: u8,
 
-    // Scratch buffer holding the most recently decoded mesh frame, borrowed by
-    // `LinkT::recv`.  Only present when the `link` feature wires this client
-    // onto a mesh; sized for one max-length frame (240 on-air hex chars / 2).
+    // Unsolicited `+RCV` packets read by `next_line` while some other reader
+    // (`expect`) was waiting for a command response, buffered here so
+    // `listen_for_packet` still observes them instead of them being silently
+    // dropped. Bounded: the oldest is evicted once full.
+    rx_queue: Deque<ReceivedPacket, RX_QUEUE_DEPTH>,
+
+    // Scratch buffer holding the most recently reassembled mesh frame,
+    // borrowed by `LinkT::recv`.  Only present when the `link` feature wires
+    // this client onto a mesh; sized for the largest frame `frag::Reassembler`
+    // will reassemble.
     #[cfg(feature = "link")]
-    rx_frame: [u8; 128],
+    rx_frame: [u8; frag::MAX_REASSEMBLED_LEN],
+
+    // Fragmentation message-id counter, incremented once per `LinkT::send`
+    // call; see `link::RylrClient::next_msg_id`.
+    #[cfg(feature = "link")]
+    msg_id_ctr: u8,
+
+    // Bounded table of in-flight fragment reassemblies fed by `LinkT::recv`.
+    #[cfg(feature = "link")]
+    reassembler: frag::Reassembler,
 }
 
 impl<S> RylrClient<S>
@@ -144,8 +222,13 @@ where
             stream,
             timeout: Duration::from_secs(3),
             network_id: 18,
+            rx_queue: Deque::new(),
             #[cfg(feature = "link")]
-            rx_frame: [0u8; 128],
+            rx_frame: [0u8; frag::MAX_REASSEMBLED_LEN],
+            #[cfg(feature = "link")]
+            msg_id_ctr: 0,
+            #[cfg(feature = "link")]
+            reassembler: frag::Reassembler::new(),
         })
     }
 
@@ -179,13 +262,13 @@ where
         &mut self,
         cmd: &str,
         expected: &str,
-    ) -> Result<String<256>, LoraError> {
+    ) -> Result<String<LINE_BUF_LEN>, LoraError> {
         self.send_raw(cmd).await?;
 
         self.expect(expected).await
     }
 
-    async fn read_line(&mut self, line: &mut String<256>) -> Result<(), LoraError> {
+    async fn read_line(&mut self, line: &mut String<LINE_BUF_LEN>) -> Result<(), LoraError> {
         let mut buf = [0u8; 1];
         loop {
             self.stream
@@ -203,35 +286,74 @@ where
         Ok(())
     }
 
-    /// Helper function to internally dispatch an explicit string sequence and read its immediate raw response.
-    /// And expect a series of specific responses
-    async fn expect(&mut self, expected: &str) -> Result<String<256>, LoraError> {
-        let mut line = String::<256>::new();
-
-        // TODO(bjc) Change this client into a big state machine...
-
+    /// Read and classify one line off the serial port, skipping blank lines
+    /// transparently (never meaningful to either caller below).
+    ///
+    /// An unsolicited `+RCV=` line is parsed and pushed onto [`Self::rx_queue`]
+    /// (evicting the oldest queued packet if full) rather than returned
+    /// directly — this is what lets `listen_for_packet` still observe a
+    /// packet that arrived while [`Self::expect`] was awaiting a command
+    /// response, instead of it being silently dropped. Returns `None` in that
+    /// case; `Some(line)` for any other (non-blank) line.
+    ///
+    /// TODO(bjc): this classifier plus `rx_queue` is the scoped fix for that
+    /// interleaving gap; the AT-command interaction is still not the "big
+    /// state machine" described in the original TODO here, which remains a
+    /// separate, larger refactor if still wanted.
+    async fn next_line(&mut self) -> Result<Option<String<LINE_BUF_LEN>>, LoraError> {
         loop {
-            line.clear();
+            let mut line = String::<LINE_BUF_LEN>::new();
             self.read_line(&mut line).await?;
-            trace!("read_line: line={line:?}");
+            trace!(len = line.len(), "read_line");
 
             let trimmed = line.trim();
-
             if trimmed.is_empty() {
                 continue;
             }
 
-            if trimmed.starts_with(expected) {
-                return Ok(line.clone());
+            if trimmed.starts_with("+RCV=") {
+                let packet = parse_rcv(trimmed)?;
+                if self.rx_queue.is_full()
+                    && let Some(evicted) = self.rx_queue.pop_front()
+                {
+                    warn!(
+                        evicted_addr = evicted.address,
+                        evicted_len = evicted.length,
+                        queue_depth = RX_QUEUE_DEPTH,
+                        "capacity eviction: rx_queue full, dropping oldest unsolicited packet"
+                    );
+                }
+                self.rx_queue
+                    .push_back(packet)
+                    .unwrap_or_else(|_| unreachable!("just ensured room above"));
+                return Ok(None);
             }
 
-            if trimmed.starts_with("+ERR=") {
-                return Err(LoraError::ModuleError(0)); // Simplify for now
-            }
+            return Ok(Some(line));
         }
     }
 
-    async fn send_cmd_expect_ok(&mut self, cmd: &str) -> Result<String<256>, LoraError> {
+    /// Helper function to internally dispatch an explicit string sequence and read its immediate raw response.
+    /// And expect a series of specific responses
+    async fn expect(&mut self, expected: &str) -> Result<String<LINE_BUF_LEN>, LoraError> {
+        loop {
+            // `None` means the line was an unsolicited `+RCV=`, already
+            // queued onto `rx_queue`; keep waiting for our own response.
+            let Some(line) = self.next_line().await? else {
+                continue;
+            };
+            let trimmed = line.trim();
+            if trimmed.starts_with(expected) {
+                return Ok(line.clone());
+            }
+            if trimmed.starts_with("+ERR=") {
+                return Err(LoraError::ModuleError(0)); // Simplify for now
+            }
+            // Any other unrecognized line is noise; keep waiting.
+        }
+    }
+
+    async fn send_cmd_expect_ok(&mut self, cmd: &str) -> Result<String<LINE_BUF_LEN>, LoraError> {
         self.send_cmd_expect(cmd, "+OK").await
     }
 
@@ -356,48 +478,20 @@ where
 
     /// Asynchronously read a line looking specifically for passive downstream incoming radio signals (`+RCV`).
     /// Use this loop setup when waiting passively for unexpected telemetry items.
+    ///
+    /// Checks [`Self::rx_queue`] first: a packet that arrived while a command
+    /// response was being awaited (see [`Self::next_line`]) is delivered from
+    /// there rather than being lost.
     pub async fn listen_for_packet(&mut self) -> Result<ReceivedPacket, LoraError> {
-        let mut line = String::<256>::new();
-
+        if let Some(packet) = self.rx_queue.pop_front() {
+            return Ok(packet);
+        }
         loop {
-            line.clear();
-            self.read_line(&mut line).await?;
-            let trimmed = line.trim();
-
-            if let Some(clean_target) = trimmed.strip_prefix("+RCV=") {
-                // Format payload: +RCV=<Address>,<Length>,<Data>,<RSSI>,<SNR>
-                // Manual parsing to avoid Vec
-                let mut parts = clean_target.split(',');
-
-                let address_str = parts.next().ok_or(LoraError::InvalidResponse)?;
-                let length_str = parts.next().ok_or(LoraError::InvalidResponse)?;
-                let data_str = parts.next().ok_or(LoraError::InvalidResponse)?;
-                let rssi_str = parts.next().ok_or(LoraError::InvalidResponse)?;
-                let snr_str = parts.next().ok_or(LoraError::InvalidResponse)?;
-
-                let address = address_str
-                    .parse::<u16>()
-                    .map_err(|_| LoraError::InvalidResponse)?;
-                let length = length_str
-                    .parse::<usize>()
-                    .map_err(|_| LoraError::InvalidResponse)?;
-                let mut data = String::<240>::new();
-                data.push_str(data_str)
-                    .map_err(|_| LoraError::InvalidResponse)?;
-                let rssi = rssi_str
-                    .parse::<i32>()
-                    .map_err(|_| LoraError::InvalidResponse)?;
-                let snr = snr_str
-                    .parse::<i32>()
-                    .map_err(|_| LoraError::InvalidResponse)?;
-
-                return Ok(ReceivedPacket {
-                    address,
-                    length,
-                    data,
-                    rssi,
-                    snr,
-                });
+            if self.next_line().await?.is_none() {
+                return Ok(self
+                    .rx_queue
+                    .pop_front()
+                    .unwrap_or_else(|| unreachable!("next_line just queued a packet")));
             }
         }
     }

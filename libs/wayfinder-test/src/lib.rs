@@ -24,6 +24,9 @@ pub mod prelude {
 #[cfg(test)]
 mod integration_tests;
 
+#[cfg(test)]
+mod rylr998_integration_tests;
+
 /// Which side of a switch connection a frame is travelling on, used to key the
 /// switch's per-direction channels.
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]

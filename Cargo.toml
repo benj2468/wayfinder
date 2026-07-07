@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "libs/rylr998",
+    "libs/rylr998-sim",
     "libs/ieee802154",
     "libs/at86rf233",
     "libs/nrf-ieee802154",

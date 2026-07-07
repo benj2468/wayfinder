@@ -200,7 +200,22 @@ impl TestRouter {
             .into_iter()
             .map(|pc| DynLinkT::new_box(Link::new(ChannelTransport::from(pc))))
             .collect();
+        Self::from_links(ident, links, trickle)
+    }
 
+    /// Create a new test router from already-constructed mesh links, one per
+    /// interface (in interface order), with that interface's per-link OGM
+    /// backoff bounds (missing entries default). Unlike [`new`](Self::new),
+    /// which always builds channel-based (`Switch`-backed) links, this lets a
+    /// caller mix in a non-channel `LinkT` implementation — e.g. a real
+    /// `rylr998::RylrClient` boxed as `DynLinkT` — for tests that need to
+    /// exercise an actual link driver rather than the in-process channel
+    /// fabric.
+    pub fn from_links(
+        ident: Mac,
+        links: Vec<Box<DynLinkT<'static>>>,
+        trickle: Vec<TrickleConfig>,
+    ) -> Self {
         let deliveries = Arc::new(Mutex::new(Vec::new()));
         let (host_in, host_rx) = mpsc::channel(64);
         let local = ObservableEgress {

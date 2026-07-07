@@ -33,3 +33,4 @@ tracing-subscriber.workspace = true
 tokio.workspace = true
 embedded-io-adapters.workspace = true
 embedded-io = "0.6.1"
+rylr998-sim = { path = "../rylr998-sim" }
