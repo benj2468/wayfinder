@@ -134,6 +134,15 @@ pub enum Command {
     /// Offline certificate / trust-anchor tooling (no node connection).
     #[command(subcommand)]
     Cert(cert::CertCommand),
+    /// Print this build's YAML config JSON Schema (no node connection).
+    ///
+    /// Since a link's `params` shape is opaque to the core config type (see
+    /// `wayfinder::config::LinkConfig`), a static look at that struct no
+    /// longer documents the config format — this command generates the
+    /// schema from whichever link types are actually linked into *this*
+    /// `wayfinderctl` binary, in-tree or third-party, so a custom build
+    /// documents its own config.
+    Schema,
 }
 
 /// Operator actions on pending certificate-signing requests (provider mode).
@@ -160,6 +169,11 @@ pub enum CsrCommand {
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Cert(cmd) => cert::run(cmd),
+        Command::Schema => {
+            let schema = wayfinder_driver::config_schema();
+            println!("{}", serde_json::to_string_pretty(&schema)?);
+            Ok(())
+        }
         other => {
             let rendered = run_query(other, &cli.connect, cli.output).await?;
             println!("{rendered}");
@@ -281,6 +295,7 @@ pub async fn run_query(
             format!("denied CSR for {mac}")
         }
         Command::Cert(_) => unreachable!("cert is dispatched before run_query"),
+        Command::Schema => unreachable!("schema is dispatched before run_query"),
     })
 }
 

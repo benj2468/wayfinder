@@ -410,6 +410,54 @@ mod tokio_impl {
 
         Ok(DynLinkT::new_box(Link::new(router_side)))
     }
+
+    /// Config `params` for the in-tree `"RawIp"` link type — see
+    /// [`build_raw_ip_link`].
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    struct RawIpLinkParams {
+        /// Local IP address the raw socket binds to.
+        bind_addr: IpAddr,
+        /// Remote peer the socket is connected to (send/recv target).
+        remote_addr: IpAddr,
+        /// IP protocol number carried in the IPv4 header's protocol field
+        /// (e.g. a value from the experimental/unassigned range).
+        protocol: u8,
+    }
+
+    #[linkme::distributed_slice(crate::registry::LINK_BUILDERS)]
+    static RAW_IP_BUILDER: crate::registry::LinkBuilder = crate::registry::LinkBuilder {
+        type_tag: "RawIp",
+        build: |params, join_set| {
+            Box::pin(async move {
+                let cfg: RawIpLinkParams = serde_json::from_value(params.clone())?;
+                build_raw_ip_link(cfg.bind_addr, cfg.remote_addr, cfg.protocol, join_set).await
+            })
+        },
+        schema: || schemars::schema_for!(RawIpLinkParams),
+    };
+
+    /// Config `params` for the in-tree `"RawL2"` link type — see
+    /// [`build_raw_l2_link`].
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    struct RawL2LinkParams {
+        /// Name of the network interface to bind to (e.g. `"eth0"`).
+        interface: String,
+        /// EtherType this interface filters received frames on and stamps
+        /// onto sent frames.
+        ethertype: u16,
+    }
+
+    #[linkme::distributed_slice(crate::registry::LINK_BUILDERS)]
+    static RAW_L2_BUILDER: crate::registry::LinkBuilder = crate::registry::LinkBuilder {
+        type_tag: "RawL2",
+        build: |params, _join_set| {
+            Box::pin(async move {
+                let cfg: RawL2LinkParams = serde_json::from_value(params.clone())?;
+                build_raw_l2_link(&cfg.interface, cfg.ethertype)
+            })
+        },
+        schema: || schemars::schema_for!(RawL2LinkParams),
+    };
 }
 
 #[cfg(test)]

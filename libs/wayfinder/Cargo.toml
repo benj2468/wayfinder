@@ -17,6 +17,20 @@ heapless.workspace = true
 embedded-io-async.workspace = true
 serde.workspace = true
 dynosaur.workspace = true
+# `LinkConfig::params` is a generic (type, params) bag rather than a closed
+# enum, so a third-party link crate can add a link type without editing this
+# struct (see `wayfinder-driver::registry`). `alloc`-only: no `std` feature,
+# so embedded (no_std) builds are unaffected.
+serde_json = { version = "1.0.145", default-features = false, features = [
+    "alloc",
+] }
+# Optional: derives `JsonSchema` on the config types so a host build can emit
+# its own config schema (`wayfinderctl schema`). Config types reference
+# `core::net` address types, whose `JsonSchema` impls live behind schemars'
+# `std` feature, so this pulls full `std` — fine, since `schema` is only ever
+# enabled alongside this crate's own `std` feature (host builds), never by an
+# embedded no_std target.
+schemars = { workspace = true, optional = true }
 
 [dev-dependencies]
 tracing-test = "0.2.6"
@@ -34,3 +48,7 @@ alloc = []
 # dynamic dispatch (its constructors reference `std`).  The bare `LinkT` trait
 # is available without this; embedded callers leave it off.
 std = ["alloc"]
+# Derives `JsonSchema` on the config types (see the `schemars` dependency
+# above). Host-only, in practice enabled transitively via
+# `wayfinder-driver`'s `tokio` feature.
+schema = ["dep:schemars", "std"]

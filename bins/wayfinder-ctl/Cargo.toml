@@ -16,6 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 wayfinder-client.workspace = true
+wayfinder-driver.workspace = true
 wayfinder-protos = { workspace = true, features = ["serde"] }
 wayfinder-auth = { workspace = true, features = ["std"] }
 interfaces.workspace = true

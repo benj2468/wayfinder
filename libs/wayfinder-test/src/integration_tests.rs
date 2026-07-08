@@ -7,7 +7,7 @@ use interfaces::frame::Mac;
 use interfaces::link::LinkMetrics;
 use tracing_subscriber::EnvFilter;
 use wayfinder::batman::MAX_MISSED_OGMS;
-use wayfinder::config::{Config, LinkConfig, LinkTransport, TrickleConfig};
+use wayfinder::config::{Config, LinkConfig, TrickleConfig};
 use wayfinder::{
     DEFAULT_BATMAN_ETHER_TYPE, EgressInterface,
     batman::wire::{BATADV_IV_OGM, BatmanOgmPacket},
@@ -294,14 +294,14 @@ fn diamond(i_max_ms: u64) -> TestHarness {
         wayfinder: Config {
             links: links
                 .iter()
-                .map(|s| LinkConfig {
-                    transport: LinkTransport::Test {
-                        switch_name: (*s).into(),
-                    },
-                    ogm: TrickleConfig {
-                        i_min_ms: 1000,
-                        i_max_ms,
-                    },
+                .map(|s| {
+                    LinkConfig::test_with_ogm(
+                        *s,
+                        TrickleConfig {
+                            i_min_ms: 1000,
+                            i_max_ms,
+                        },
+                    )
                 })
                 .collect(),
             ..Default::default()
@@ -1726,14 +1726,14 @@ fn diamond_plus_k5(i_max_ms: u64) -> TestHarness {
         let links: Vec<LinkConfig> = EDGES
             .iter()
             .filter(|(a, b)| a == node || b == node)
-            .map(|(a, b)| LinkConfig {
-                transport: LinkTransport::Test {
-                    switch_name: format!("{a}_{b}"),
-                },
-                ogm: TrickleConfig {
-                    i_min_ms: 1000,
-                    i_max_ms,
-                },
+            .map(|(a, b)| {
+                LinkConfig::test_with_ogm(
+                    format!("{a}_{b}"),
+                    TrickleConfig {
+                        i_min_ms: 1000,
+                        i_max_ms,
+                    },
+                )
             })
             .collect();
         config.machines.push(TestMachineConfig {

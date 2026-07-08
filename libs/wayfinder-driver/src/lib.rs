@@ -23,6 +23,10 @@ pub use transport::FrameIo;
 mod driver;
 #[cfg(feature = "tokio")]
 mod net;
+#[cfg(feature = "tokio")]
+mod registry;
+#[cfg(feature = "tokio")]
+mod schema;
 
 #[cfg(feature = "tokio")]
 pub use driver::Driver;
@@ -30,6 +34,10 @@ pub use driver::Driver;
 pub use net::build_udp_link;
 #[cfg(feature = "tokio")]
 pub use raw::{RawL2Link, build_raw_ip_link, build_raw_l2_link};
+#[cfg(feature = "tokio")]
+pub use registry::{BuildFuture, LINK_BUILDERS, LinkBuilder};
+#[cfg(feature = "tokio")]
+pub use schema::config_schema;
 #[cfg(feature = "tokio")]
 pub use transport::Link;
 // The mesh-interface trait now lives in `wayfinder`; re-export it (and the

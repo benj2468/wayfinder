@@ -17,14 +17,11 @@ use clap::Parser;
 use tokio::{sync::mpsc, task::JoinSet};
 use tracing_subscriber::EnvFilter;
 use tun_rs::{DeviceBuilder, Layer};
-use wayfinder::config::{
-    Config, LinkTransport, LocalDistributionMechanism, ServerConfig, TrickleConfig,
-};
+use wayfinder::config::{Config, LocalDistributionMechanism, ServerConfig, TrickleConfig};
 use wayfinder::interfaces::frame::Mac;
 use wayfinder_driver::{
-    Driver, QueryRx, QueryTx, bind_tcp_server, bind_udp_server, bind_unix_server,
-    build_raw_ip_link, build_raw_l2_link, build_udp_link, serve_tcp_server, serve_udp_server,
-    serve_unix_server,
+    Driver, LINK_BUILDERS, QueryRx, QueryTx, bind_tcp_server, bind_udp_server, bind_unix_server,
+    serve_tcp_server, serve_udp_server, serve_unix_server,
 };
 
 use crate::tap::TapDevice;
@@ -91,32 +88,11 @@ async fn main() -> anyhow::Result<()> {
     // the transports so the driver can pace each link independently.
     let mut trickle: Vec<TrickleConfig> = Vec::new();
     for link in config.links {
-        match link.transport {
-            LinkTransport::Udp {
-                bind_addr,
-                remote_addr,
-            } => {
-                interfaces.push(build_udp_link(bind_addr, remote_addr, &mut join_set).await?);
-            }
-            LinkTransport::RawIp {
-                bind_addr,
-                remote_addr,
-                protocol,
-            } => {
-                interfaces.push(
-                    build_raw_ip_link(bind_addr, remote_addr, protocol, &mut join_set).await?,
-                );
-            }
-            LinkTransport::RawL2 {
-                interface,
-                ethertype,
-            } => {
-                interfaces.push(build_raw_l2_link(&interface, ethertype)?);
-            }
-            LinkTransport::Test { .. } => {
-                bail!("test links are only valid in the test harness, not the wayfinder-tap node")
-            }
-        }
+        let builder = LINK_BUILDERS
+            .iter()
+            .find(|b| b.type_tag == link.link_type)
+            .ok_or_else(|| anyhow!("unknown link type: {}", link.link_type))?;
+        interfaces.push((builder.build)(&link.params, &mut join_set).await?);
         trickle.push(link.ogm);
     }
 

@@ -2,7 +2,6 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::net::IpAddr;
 use core::net::Ipv4Addr;
 use core::net::SocketAddr;
 use serde::{Deserialize, Serialize};
@@ -13,6 +12,7 @@ use serde::{Deserialize, Serialize};
 /// `i_min_ms`, doubles toward `i_max_ms` while the topology is stable, and snaps
 /// back to `i_min_ms` whenever the routing view changes.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TrickleConfig {
     /// Smallest (most aggressive) OGM interval, in milliseconds — the interval
     /// the link resets to on any topology change and the floor of the backoff.
@@ -52,74 +52,56 @@ impl Default for TrickleConfig {
     }
 }
 
-/// A single mesh interface's transport carrier (how its frames cross the wire).
+/// A single mesh interface: which link type carries its frames, plus the
+/// per-link OGM backoff bounds.  The `ogm` block is optional in the config and
+/// defaults to [`TrickleConfig::default`] when omitted.
+///
+/// `link_type` is not a closed enum: it is matched at runtime against a
+/// compile-time registry of `LinkBuilder`s (`wayfinder-driver::registry`) that
+/// in-tree transports (`Udp`, `RawIp`, `RawL2`) and third-party link crates
+/// alike register into, so a proprietary link type doesn't require editing
+/// this struct — only depending on its crate from a custom `wayfinder-tap`
+/// build. `params` carries that link type's own fields, opaque to this crate
+/// and deserialized by whichever builder claims `link_type`.
 #[derive(Serialize, Deserialize, Debug)]
-#[serde(tag = "type")]
-pub enum LinkTransport {
-    /// Carry the link over UDP, bridging a local bind address to a fixed remote.
-    Udp {
-        /// Local address the UDP socket binds to.
-        bind_addr: SocketAddr,
-        /// Remote peer the socket is connected to (send/recv target).
-        remote_addr: SocketAddr,
-    },
-    /// Carry the link over a raw IP socket (`AF_INET`/`SOCK_RAW`), point-to-point
-    /// like [`Udp`](LinkTransport::Udp) but using an IP protocol number instead
-    /// of UDP ports.  Requires `CAP_NET_RAW`.
-    RawIp {
-        /// Local IP address the raw socket binds to.
-        bind_addr: IpAddr,
-        /// Remote peer the socket is connected to (send/recv target).
-        remote_addr: IpAddr,
-        /// IP protocol number carried in the IPv4 header's protocol field
-        /// (e.g. a value from the experimental/unassigned range).
-        protocol: u8,
-    },
-    /// Carry the link natively over a raw L2 packet socket (`AF_PACKET`) bound to
-    /// a NIC.  Our frames map directly onto Ethernet frames; multi-access, routed
-    /// by destination MAC.  Requires `CAP_NET_RAW`.
-    RawL2 {
-        /// Name of the network interface to bind to (e.g. `"eth0"`).
-        interface: String,
-        /// EtherType this interface filters received frames on and stamps onto
-        /// sent frames.
-        ethertype: u16,
-    },
-    /// Test Link, used for testing only, will fail validation in real mode
-    Test {
-        /// Name of the in-process test `Switch` this link attaches to.
-        switch_name: String,
-    },
-}
-
-/// A single mesh interface: its transport carrier plus the per-link OGM backoff
-/// bounds.  The `ogm` block is optional in the config and defaults to
-/// [`TrickleConfig::default`] when omitted.
-#[derive(Serialize, Deserialize, Debug)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct LinkConfig {
-    /// How this link's frames cross the wire.
-    #[serde(flatten)]
-    pub transport: LinkTransport,
+    /// Which registered link builder handles this interface (e.g. `"Udp"`, or
+    /// a third-party crate's own tag).
+    #[serde(rename = "type")]
+    pub link_type: String,
     /// This link's adaptive OGM emission bounds.
     #[serde(default)]
     pub ogm: TrickleConfig,
+    /// This link type's own parameters. Kept as a generic value — rather than
+    /// a closed per-type struct — so this crate never needs to know the field
+    /// shape of a link type it doesn't ship; it deserializes generically from
+    /// whatever format the config was loaded from (e.g. YAML), so this is not
+    /// a commitment to JSON on the wire.
+    #[serde(flatten)]
+    pub params: serde_json::Value,
 }
 
 impl LinkConfig {
     /// Build a test link onto the named switch with default OGM bounds.  Keeps
     /// the test harness's link construction terse.
     pub fn test(switch_name: impl Into<String>) -> Self {
+        Self::test_with_ogm(switch_name, TrickleConfig::default())
+    }
+
+    /// Build a test link onto the named switch with explicit OGM bounds.
+    pub fn test_with_ogm(switch_name: impl Into<String>, ogm: TrickleConfig) -> Self {
         Self {
-            transport: LinkTransport::Test {
-                switch_name: switch_name.into(),
-            },
-            ogm: TrickleConfig::default(),
+            link_type: "Test".into(),
+            ogm,
+            params: serde_json::json!({ "switch_name": switch_name.into() }),
         }
     }
 }
 
 /// Transport over which the management API is exposed.
 #[derive(Serialize, Deserialize, Debug)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 pub enum ServerConfig {
     /// Connectionless management API over a Unix datagram socket.
@@ -141,6 +123,7 @@ pub enum ServerConfig {
 
 /// Configuration for the local host-facing TAP device.
 #[derive(Serialize, Deserialize, Debug)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TapConfig {
     /// Name of the kernel TAP device to create.
     pub device_name: String,
@@ -203,6 +186,7 @@ pub const TAP_ENCAP_OVERHEAD: usize = 14 + 14 + 9 + 24 + 28;
 
 /// Configuration for the local host facing Distribution Mechanism
 #[derive(Serialize, Deserialize, Debug)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 pub enum LocalDistributionMechanism {
     /// Bridge the mesh onto a host TAP device (see [`TapConfig`]).
@@ -217,6 +201,7 @@ pub enum LocalDistributionMechanism {
 /// others sharing the medium.  When absent, the node runs unauthenticated (the
 /// open, pre-auth behavior).  The files are produced by the enrollment portal.
 #[derive(Serialize, Deserialize, Debug)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AuthConfig {
     /// Path to the node's 32-byte Ed25519 identity seed (raw bytes).  Keep this
     /// secret; it *is* the node's identity.
@@ -231,6 +216,7 @@ pub struct AuthConfig {
 
 /// Top-level configuration loaded from the YAML config file.
 #[derive(Serialize, Deserialize, Debug, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Config {
     /// The local host-facing Distribution Mechanism.
     ///
@@ -266,6 +252,7 @@ pub struct Config {
 /// over the management API, so members can obtain certificates without the root
 /// key ever leaving this node.
 #[derive(Serialize, Deserialize, Debug)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ProviderConfig {
     /// Path to the mesh root seed (32 raw bytes).  This is the mesh root of
     /// trust — keep it secret and only on the provider.
@@ -452,6 +439,51 @@ local_egress:
 ";
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(config.auth.is_none());
+    }
+
+    /// Link configs are no longer a closed `type` enum: the core config layer
+    /// treats every link transport as an opaque `(type, params)` pair, so a
+    /// third-party link crate can add a new type without editing this struct.
+    /// This `link_type`/`params` shape is what a link builder registry (see
+    /// `wayfinder-driver::registry`) dispatches on.
+    #[test]
+    fn link_config_accepts_arbitrary_link_type() {
+        let yaml = "\
+type: Rylr998Lora
+device: /dev/ttyUSB0
+baud: 115200
+ogm:
+  i_min_ms: 2000
+";
+        let link: LinkConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(link.link_type, "Rylr998Lora");
+        assert_eq!(link.ogm.i_min_ms, 2000);
+        assert_eq!(
+            link.params.get("device").and_then(|v| v.as_str()),
+            Some("/dev/ttyUSB0")
+        );
+        assert_eq!(
+            link.params.get("baud").and_then(|v| v.as_u64()),
+            Some(115200)
+        );
+    }
+
+    /// The in-tree `Udp` transport is just another registrant now — its
+    /// fields still round-trip, but through the same opaque `params` bag
+    /// rather than a dedicated enum variant.
+    #[test]
+    fn link_config_udp_round_trips_through_params() {
+        let yaml = "\
+type: Udp
+bind_addr: 127.0.0.1:9000
+remote_addr: 127.0.0.1:9001
+";
+        let link: LinkConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(link.link_type, "Udp");
+        assert_eq!(
+            link.params.get("bind_addr").and_then(|v| v.as_str()),
+            Some("127.0.0.1:9000")
+        );
     }
 
     /// `require_auth` defaults to `false` (open/pre-auth behavior preserved)

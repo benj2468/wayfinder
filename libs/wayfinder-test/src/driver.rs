@@ -428,9 +428,14 @@ impl TestConfig {
                 .wayfinder
                 .links
                 .iter()
-                .map(|link| match &link.transport {
-                    wayfinder::config::LinkTransport::Test { switch_name } => switch_name.clone(),
-                    _ => panic!("test harness supports only Test links"),
+                .map(|link| {
+                    if link.link_type != "Test" {
+                        panic!("test harness supports only Test links");
+                    }
+                    match link.params.get("switch_name").and_then(|v| v.as_str()) {
+                        Some(switch_name) => switch_name.to_string(),
+                        None => panic!("Test link params must carry a switch_name"),
+                    }
                 })
                 .collect();
             // Per-interface OGM backoff bounds, in interface order.
