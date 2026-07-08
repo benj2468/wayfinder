@@ -83,16 +83,38 @@ async fn main() -> anyhow::Result<()> {
         pretty_hex::simple_hex(&mac_addr)
     );
 
+    tracing::info!(
+        link_types = ?LINK_BUILDERS.iter().map(|b| b.type_tag).collect::<Vec<_>>(),
+        "link types compiled into this build"
+    );
+
     let mut interfaces = Vec::new();
     // Per-interface OGM backoff bounds, collected in interface order alongside
     // the transports so the driver can pace each link independently.
     let mut trickle: Vec<TrickleConfig> = Vec::new();
-    for link in config.links {
+    for (idx, link) in config.links.into_iter().enumerate() {
+        if link.link_type == "Test" {
+            bail!(
+                "link #{idx}: test links are only valid in the test harness, \
+                 not the wayfinder-tap node"
+            );
+        }
         let builder = LINK_BUILDERS
             .iter()
             .find(|b| b.type_tag == link.link_type)
-            .ok_or_else(|| anyhow!("unknown link type: {}", link.link_type))?;
-        interfaces.push((builder.build)(&link.params, &mut join_set).await?);
+            .ok_or_else(|| {
+                let known: Vec<&str> = LINK_BUILDERS.iter().map(|b| b.type_tag).collect();
+                anyhow!(
+                    "link #{idx}: unknown link type {:?}; registered link types \
+                     in this build: {}",
+                    link.link_type,
+                    known.join(", ")
+                )
+            })?;
+        let interface = (builder.build)(&link.params, &mut join_set)
+            .await
+            .with_context(|| format!("link #{idx}: failed to build {:?} link", link.link_type))?;
+        interfaces.push(interface);
         trickle.push(link.ogm);
     }
 

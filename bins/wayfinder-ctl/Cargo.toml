@@ -27,6 +27,8 @@ zerocopy.workspace = true
 rand = { workspace = true, features = ["std"] }
 serde.workspace = true
 serde_json = "1"
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 wayfinder-server.workspace = true

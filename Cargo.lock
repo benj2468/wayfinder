@@ -2758,6 +2758,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "wayfinder-auth",
  "wayfinder-client",
  "wayfinder-driver",

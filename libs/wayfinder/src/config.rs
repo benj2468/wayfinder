@@ -57,12 +57,14 @@ impl Default for TrickleConfig {
 /// defaults to [`TrickleConfig::default`] when omitted.
 ///
 /// `link_type` is not a closed enum: it is matched at runtime against a
-/// compile-time registry of `LinkBuilder`s (`wayfinder-driver::registry`) that
-/// in-tree transports (`Udp`, `RawIp`, `RawL2`) and third-party link crates
-/// alike register into, so a proprietary link type doesn't require editing
-/// this struct — only depending on its crate from a custom `wayfinder-tap`
-/// build. `params` carries that link type's own fields, opaque to this crate
-/// and deserialized by whichever builder claims `link_type`.
+/// compile-time registry of `LinkBuilder`s (see `wayfinder-driver::registry`
+/// for the current in-tree registrants, and a linker caveat that applies when
+/// adding a third-party one) that in-tree transports and third-party link
+/// crates alike register into, so a proprietary link type doesn't require
+/// editing this struct — only depending on its crate from a custom
+/// `wayfinder-tap` build. `params` carries that link type's own fields,
+/// opaque to this crate and deserialized by whichever builder claims
+/// `link_type`.
 #[derive(Serialize, Deserialize, Debug)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct LinkConfig {

@@ -13,6 +13,7 @@ use crate::transport::Link;
 
 /// Config `params` for the in-tree `"Udp"` link type — see [`build_udp_link`].
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct UdpLinkParams {
     /// Local address the UDP socket binds to.
     bind_addr: SocketAddr,

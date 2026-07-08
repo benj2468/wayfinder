@@ -99,4 +99,22 @@ mod tests {
         let result = (builder.build)(&serde_json::Value::Null, &mut join_set).await;
         assert!(result.is_err());
     }
+
+    /// `LINK_BUILDERS` is a flat slice searched by `.find()`-on-`type_tag`
+    /// (see `wayfinder-tap::main`), so two registrants sharing a tag would
+    /// silently shadow one another — the second is unreachable and nothing
+    /// reports the collision. Guard against that regressing unnoticed as
+    /// more link types (in-tree or third-party) get registered.
+    #[test]
+    fn no_two_registered_builders_share_a_type_tag() {
+        let mut tags: Vec<&str> = LINK_BUILDERS.iter().map(|b| b.type_tag).collect();
+        let before = tags.len();
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(
+            tags.len(),
+            before,
+            "LINK_BUILDERS has a duplicate type_tag: {tags:?}"
+        );
+    }
 }

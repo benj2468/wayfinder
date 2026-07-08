@@ -414,6 +414,7 @@ mod tokio_impl {
     /// Config `params` for the in-tree `"RawIp"` link type — see
     /// [`build_raw_ip_link`].
     #[derive(serde::Deserialize, schemars::JsonSchema)]
+    #[serde(deny_unknown_fields)]
     struct RawIpLinkParams {
         /// Local IP address the raw socket binds to.
         bind_addr: IpAddr,
@@ -439,6 +440,7 @@ mod tokio_impl {
     /// Config `params` for the in-tree `"RawL2"` link type — see
     /// [`build_raw_l2_link`].
     #[derive(serde::Deserialize, schemars::JsonSchema)]
+    #[serde(deny_unknown_fields)]
     struct RawL2LinkParams {
         /// Name of the network interface to bind to (e.g. `"eth0"`).
         interface: String,
@@ -597,5 +599,57 @@ mod tests {
         assert_eq!(ipv4_payload_offset(&[0x60]), None); // IPv6
         assert_eq!(ipv4_payload_offset(&[0x44]), None); // IHL 4 words = 16 < 20
         assert_eq!(ipv4_payload_offset(&[0x45, 0, 0]), None); // header longer than datagram
+    }
+
+    /// Mirrors `net.rs`'s Udp registry round-trip test for the `RawIp`
+    /// builder, without needing `CAP_NET_RAW`: a `params` blob missing a
+    /// required field must fail cleanly in `serde_json::from_value` — before
+    /// any socket is touched — and name the missing field, proving the
+    /// registry actually parses into `RawIpLinkParams`'s real field names
+    /// rather than the builder having silently ignored `params`.
+    #[tokio::test]
+    async fn raw_ip_link_type_rejects_malformed_params_before_touching_a_socket() {
+        let builder = crate::registry::LINK_BUILDERS
+            .iter()
+            .find(|b| b.type_tag == "RawIp")
+            .expect("RawIp builder registered in raw.rs, above");
+        let params = serde_json::json!({
+            "bind_addr": "127.0.0.1",
+            "remote_addr": "127.0.0.1",
+            // `protocol` deliberately omitted
+        });
+        let mut join_set = tokio::task::JoinSet::new();
+        let err = match (builder.build)(&params, &mut join_set).await {
+            Ok(_) => panic!("missing `protocol` field must fail before any socket is opened"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("protocol"),
+            "error should name the missing field: {err}"
+        );
+    }
+
+    /// Same as above for the `RawL2` builder: a missing `ethertype` must
+    /// surface as a clean deserialization error, not a panic or a silent
+    /// default.
+    #[tokio::test]
+    async fn raw_l2_link_type_rejects_malformed_params_before_touching_a_socket() {
+        let builder = crate::registry::LINK_BUILDERS
+            .iter()
+            .find(|b| b.type_tag == "RawL2")
+            .expect("RawL2 builder registered in raw.rs, above");
+        let params = serde_json::json!({
+            "interface": "eth0",
+            // `ethertype` deliberately omitted
+        });
+        let mut join_set = tokio::task::JoinSet::new();
+        let err = match (builder.build)(&params, &mut join_set).await {
+            Ok(_) => panic!("missing `ethertype` field must fail before any socket is opened"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("ethertype"),
+            "error should name the missing field: {err}"
+        );
     }
 }
