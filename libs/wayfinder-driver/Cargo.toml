@@ -11,7 +11,17 @@ default = ["tokio"]
 # Enables the tokio-driven event loop, the concrete `tokio::net` frame
 # transports, and the in-process server wiring.  Without it the crate exposes
 # only the transport-agnostic [`FrameIo`] trait and the IGMP [`McastSnooper`].
-tokio = ["dep:tokio", "dep:futures", "dep:socket2", "dep:libc", "std"]
+tokio = [
+    "dep:tokio",
+    "dep:futures",
+    "dep:socket2",
+    "dep:libc",
+    "dep:rylr998",
+    "dep:tokio-serial",
+    "dep:embedded-io-adapters",
+    "dep:embedded-io-async",
+    "std",
+]
 std = ["dep:async-trait", "wayfinder/std"]
 
 [dependencies]
@@ -30,3 +40,14 @@ tokio = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 socket2 = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
+
+# `tokio`-only: builds the `Rylr998` link transport over a real serial port.
+rylr998 = { workspace = true, features = ["link"], optional = true }
+tokio-serial = { workspace = true, optional = true }
+embedded-io-adapters = { workspace = true, optional = true }
+embedded-io-async = { workspace = true, optional = true }
+
+[dev-dependencies]
+# In-process RYLR998 simulator, so the reconnect/reconfigure behavior in
+# `rylr998.rs` can be exercised deterministically without real hardware.
+rylr998-sim = { path = "../rylr998-sim" }

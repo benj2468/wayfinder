@@ -45,6 +45,18 @@ pub struct NodeState {
     pub frequency: u32,
     /// This node's wireless mode: 0 = Transceiver, 1 = Sleep, 2 = SmartReceiving.
     pub mode: u8,
+    /// This node's configured LoRa spreading factor (`AT+PARAMETER`'s first
+    /// field, the module's raw numeric encoding — e.g. `rylr998::SpreadingFactory as u8`).
+    pub spreading_factor: u8,
+    /// This node's configured RF bandwidth (`AT+PARAMETER`'s second field,
+    /// the module's raw code — e.g. `rylr998::Bandwidth as u8` — not kHz).
+    pub bandwidth: u8,
+    /// This node's configured LoRa coding rate (`AT+PARAMETER`'s third
+    /// field, the module's raw numeric encoding — e.g. `rylr998::CodingRate as u8`).
+    pub coding_rate: u8,
+    /// This node's configured programming preamble length (`AT+PARAMETER`'s
+    /// fourth field).
+    pub preamble: u8,
 }
 
 /// A packet emitted by one simulator node's `AT+SEND` command, carrying a
@@ -180,8 +192,30 @@ impl RylrSimulator {
             } else {
                 self.send("+ERR=-1\r\n").await;
             }
-        } else if cmd.starts_with("AT+PARAMETER=") {
-            self.send("+OK\r\n").await;
+        } else if let Some(rest) = cmd.strip_prefix("AT+PARAMETER=") {
+            // AT+PARAMETER=<spreading_factor>,<bandwidth>,<coding_rate>,<preamble>
+            let mut parts = rest.splitn(4, ',');
+            match (
+                parts.next().map(str::parse::<u8>),
+                parts.next().map(str::parse::<u8>),
+                parts.next().map(str::parse::<u8>),
+                parts.next().map(str::parse::<u8>),
+            ) {
+                (Some(Ok(sf)), Some(Ok(bw)), Some(Ok(cr)), Some(Ok(preamble))) => {
+                    // Scoped block so the write guard is dropped before the
+                    // `.await` below (a guard held across `.await` makes
+                    // this whole async fn's future non-`Send`).
+                    {
+                        let mut state = self.state.write().unwrap();
+                        state.spreading_factor = sf;
+                        state.bandwidth = bw;
+                        state.coding_rate = cr;
+                        state.preamble = preamble;
+                    }
+                    self.send("+OK\r\n").await;
+                }
+                _ => self.send("+ERR=-1\r\n").await,
+            }
         } else if let Some(rest) = cmd.strip_prefix("AT+ADDRESS=") {
             if let Ok(address) = rest.parse::<u16>() {
                 self.state.write().unwrap().address = address;

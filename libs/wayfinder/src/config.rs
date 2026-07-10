@@ -85,11 +85,44 @@ pub enum LinkTransport {
         /// sent frames.
         ethertype: u16,
     },
+    /// Carry the link over a REYAX RYLR998/RYLR498 LoRa module attached to a
+    /// local serial port (see `libs/rylr998`). LoRa is a shared broadcast
+    /// medium; the mesh filters on the embedded `Mac`, not on `address`.
+    Rylr998 {
+        /// Serial device path the module is attached to (e.g. `/dev/ttyUSB0`).
+        device: String,
+        /// UART baud rate. Defaults to the module's factory rate (115200).
+        #[serde(default = "LinkTransport::default_rylr998_baud_rate")]
+        baud_rate: u32,
+        /// This node's `AT+ADDRESS` value. Must be distinct from every other
+        /// node sharing `network_id` — the fragment reassembler keys on it
+        /// (see `libs/rylr998/CLAUDE.md`'s fragmentation deployment note).
+        address: u16,
+        /// `AT+NETWORKID` group; only modules sharing this ID exchange packets.
+        network_id: u8,
+        /// LoRa spreading factor (`AT+PARAMETER`'s first field): 5..=11.
+        spreading_factor: u8,
+        /// RF channel bandwidth in kHz (`AT+PARAMETER`'s second field): 125,
+        /// 250, or 500.
+        bandwidth_khz: u16,
+        /// LoRa coding rate, as the `4/x` denominator (`AT+PARAMETER`'s third
+        /// field): 5, 6, 7, or 8.
+        coding_rate_denominator: u8,
+        /// Programming preamble length (`AT+PARAMETER`'s fourth field).
+        preamble: u8,
+    },
     /// Test Link, used for testing only, will fail validation in real mode
     Test {
         /// Name of the in-process test `Switch` this link attaches to.
         switch_name: String,
     },
+}
+
+impl LinkTransport {
+    /// The RYLR998/RYLR498's factory-default UART baud rate.
+    fn default_rylr998_baud_rate() -> u32 {
+        115_200
+    }
 }
 
 /// A single mesh interface: its transport carrier plus the per-link OGM backoff
@@ -479,5 +512,64 @@ require_auth: true
 ";
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(config.require_auth);
+    }
+
+    /// A `Rylr998` link transport parses its serial/radio parameters, and
+    /// `baud_rate` defaults to the module's factory rate when omitted.
+    #[test]
+    fn rylr998_link_transport_parses_with_default_baud_rate() {
+        let yaml = "\
+type: Rylr998
+device: /dev/ttyUSB0
+address: 1
+network_id: 18
+spreading_factor: 7
+bandwidth_khz: 125
+coding_rate_denominator: 5
+preamble: 15
+";
+        let link: LinkConfig = serde_yaml::from_str(yaml).unwrap();
+        let LinkTransport::Rylr998 {
+            device,
+            baud_rate,
+            address,
+            network_id,
+            spreading_factor,
+            bandwidth_khz,
+            coding_rate_denominator,
+            preamble,
+        } = link.transport
+        else {
+            panic!("expected a Rylr998 link transport");
+        };
+        assert_eq!(device, "/dev/ttyUSB0");
+        assert_eq!(baud_rate, 115_200);
+        assert_eq!(address, 1);
+        assert_eq!(network_id, 18);
+        assert_eq!(spreading_factor, 7);
+        assert_eq!(bandwidth_khz, 125);
+        assert_eq!(coding_rate_denominator, 5);
+        assert_eq!(preamble, 15);
+    }
+
+    /// An explicit `baud_rate` overrides the factory-rate default.
+    #[test]
+    fn rylr998_link_transport_parses_explicit_baud_rate() {
+        let yaml = "\
+type: Rylr998
+device: /dev/ttyUSB0
+baud_rate: 57600
+address: 1
+network_id: 18
+spreading_factor: 7
+bandwidth_khz: 125
+coding_rate_denominator: 5
+preamble: 15
+";
+        let link: LinkConfig = serde_yaml::from_str(yaml).unwrap();
+        let LinkTransport::Rylr998 { baud_rate, .. } = link.transport else {
+            panic!("expected a Rylr998 link transport");
+        };
+        assert_eq!(baud_rate, 57_600);
     }
 }
