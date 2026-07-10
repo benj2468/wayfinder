@@ -46,6 +46,7 @@ wayfinder-protos = { path = "./libs/wayfinder-protos" }
 wayfinder-server = { path = "./libs/wayfinder-server" }
 wayfinder-driver = { path = "./libs/wayfinder-driver" }
 wayfinder-client = { path = "./libs/wayfinder-client" }
+rylr998 = { path = "./libs/rylr998", default-features = false }
 
 # Third Party Dependencies
 tracing = "0.1.44"
@@ -67,6 +68,7 @@ embassy-sync = "0.8.0"
 embassy-futures = "0.1.2"
 heapless = "0.9.3"
 embedded-io-adapters = { version = "0.6.1", features = ["tokio-1"] }
+tokio-serial = "5.4"
 async-trait = "0.1.89"
 dynosaur = "0.3.0"
 serde = { version = "1.0.228", features = ["derive"] }

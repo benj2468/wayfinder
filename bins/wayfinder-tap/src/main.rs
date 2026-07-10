@@ -22,9 +22,9 @@ use wayfinder::config::{
 };
 use wayfinder::interfaces::frame::Mac;
 use wayfinder_driver::{
-    Driver, QueryRx, QueryTx, bind_tcp_server, bind_udp_server, bind_unix_server,
-    build_raw_ip_link, build_raw_l2_link, build_udp_link, serve_tcp_server, serve_udp_server,
-    serve_unix_server,
+    Driver, QueryRx, QueryTx, Rylr998LinkParams, bind_tcp_server, bind_udp_server,
+    bind_unix_server, build_raw_ip_link, build_raw_l2_link, build_rylr998_link, build_udp_link,
+    serve_tcp_server, serve_udp_server, serve_unix_server,
 };
 
 use crate::tap::TapDevice;
@@ -112,6 +112,30 @@ async fn main() -> anyhow::Result<()> {
                 ethertype,
             } => {
                 interfaces.push(build_raw_l2_link(&interface, ethertype)?);
+            }
+            LinkTransport::Rylr998 {
+                device,
+                baud_rate,
+                address,
+                network_id,
+                spreading_factor,
+                bandwidth_khz,
+                coding_rate_denominator,
+                preamble,
+            } => {
+                interfaces.push(
+                    build_rylr998_link(Rylr998LinkParams {
+                        device,
+                        baud_rate,
+                        address,
+                        network_id,
+                        spreading_factor,
+                        bandwidth_khz,
+                        coding_rate_denominator,
+                        preamble,
+                    })
+                    .await?,
+                );
             }
             LinkTransport::Test { .. } => {
                 bail!("test links are only valid in the test harness, not the wayfinder-tap node")
