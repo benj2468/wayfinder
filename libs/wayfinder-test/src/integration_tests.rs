@@ -10,9 +10,12 @@ use wayfinder::batman::MAX_MISSED_OGMS;
 use wayfinder::config::{Config, LinkConfig, LinkTransport, TrickleConfig};
 use wayfinder::{
     DEFAULT_BATMAN_ETHER_TYPE, EgressInterface,
-    batman::wire::{BATADV_IV_OGM, BatmanOgmPacket},
+    batman::wire::{
+        BATADV_CERT_REPLY, BATADV_CERT_REQ, BATADV_IV_OGM, BatmanCertReplyPacket,
+        BatmanCertReqPacket, BatmanOgmPacket, BatmanTvlvHdr, TvlvType, find_tvlv,
+    },
 };
-use zerocopy::IntoBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::Direction;
 use crate::prelude::*;
@@ -555,6 +558,94 @@ async fn test_line_of_three_send_data() {
     assert_eq!(
         harness.get_machine("machine3").local_deliveries(),
         vec![host_frame(m3, m1, b"Hello World")]
+    );
+}
+
+/// A lazy-cert-distribution `CertReq` relays across a real multi-hop mesh
+/// (machine1 -> machine2 -> machine3) through each node's genuine driver/
+/// router receive path, and terminates at its destination without ever
+/// leaking to that node's host TAP.
+///
+/// Origination is hand-crafted directly onto the switch (via
+/// `add_switch_port`, standing in for the requester logic a later phase
+/// adds) rather than through any `CentralRouter` API, since this phase only
+/// implements wire types + engine/router forwarding — not origination.
+#[tokio::test]
+async fn cert_req_relays_across_the_mesh_and_does_not_reach_the_host() {
+    setup();
+    let mut harness = line_of_three();
+
+    // Bootstrap routing so machine2 has a live route to machine3.
+    harness.poll_due(Duration::from_secs(1)).await;
+    for _ in 0..5 {
+        harness.tick().await;
+    }
+    for router in harness.machines.values() {
+        assert_eq!(router.router().originator_table().count(), 2);
+    }
+
+    let m1 = harness.get_machine("machine1").ident;
+    let m2 = harness.get_machine("machine2").ident;
+    let m3 = harness.get_machine("machine3").ident;
+
+    // Tap switch2 (the machine2<->machine3 segment) to observe the relayed
+    // CertReq crossing the second hop with its TTL decremented.
+    let relayed = Arc::new(AtomicUsize::new(0));
+    {
+        let switch2 = harness.switches.get_mut("switch2").unwrap();
+        for port in switch2.port_ids() {
+            let relayed = relayed.clone();
+            switch2
+                .add_tap(
+                    port,
+                    TapConfig::new(move |meta| {
+                        if meta.direction == Direction::ToSwitch
+                            && meta.data.len() > 14
+                            && meta.data[12..14] == DEFAULT_BATMAN_ETHER_TYPE.to_be_bytes()
+                            && meta.data[14] == BATADV_CERT_REQ
+                        {
+                            let (hdr, _) =
+                                BatmanCertReqPacket::ref_from_prefix(&meta.data[14..]).unwrap();
+                            assert_eq!(hdr.ttl, 9, "TTL must be decremented across the first hop");
+                            relayed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        true
+                    }),
+                )
+                .unwrap();
+        }
+    }
+
+    // Inject a hand-crafted CertReq directly onto switch1, link-addressed to
+    // machine2 (the next hop toward machine3) — the byte-level shape a real
+    // requester would produce.
+    let (raw_port, _port_id) = harness.add_switch_port("switch1");
+    let cert_req_hdr = BatmanCertReqPacket {
+        packet_type: BATADV_CERT_REQ,
+        version: 5,
+        ttl: 10,
+        dest: m3,
+    };
+    let mut inner = cert_req_hdr.as_bytes().to_vec();
+    inner.extend_from_slice(b"requester cert + sig");
+    let wire = build_frame(m1, m2, DEFAULT_BATMAN_ETHER_TYPE, &inner);
+    raw_port.egress.send(wire).await.unwrap();
+
+    for _ in 0..3 {
+        harness.tick().await;
+    }
+
+    assert_eq!(
+        relayed.load(Ordering::Relaxed),
+        1,
+        "the CertReq must cross the second hop toward machine3"
+    );
+    assert!(
+        harness
+            .get_machine("machine3")
+            .local_deliveries()
+            .is_empty(),
+        "a CertReq terminating at its destination must not reach the host TAP"
     );
 }
 
@@ -1787,4 +1878,463 @@ async fn diamond_plus_k5_settles_to_i_max() {
             );
         }
     }
+}
+
+/// Re-encode a genuinely `OgmAuth::augment_ogm`-produced (legacy `Cert`
+/// -bearing) OGM into its lazy-cert-distribution wire form: the same
+/// `OgmSig` bytes (the signature covers the full cert regardless of which
+/// TVLV shape carries it — see `auth.rs::signed_message`) but with the
+/// `Cert` record replaced by an 8-byte `CertFp` — matching what
+/// `OgmAuth::augment_ogm_lazy` emits directly; built by post-processing
+/// genuine `augment_ogm` output (via the real `MembershipCert::fingerprint()`)
+/// so none of the actual signing logic is duplicated in this test helper.
+fn to_lazy_ogm(buf: &[u8], hdr_len: usize) -> Vec<u8> {
+    let tail = &buf[hdr_len..];
+    let cert_bytes = find_tvlv(tail, TvlvType::Cert).expect("augmented OGM carries a cert");
+    let sig_bytes = find_tvlv(tail, TvlvType::OgmSig).expect("augmented OGM carries a signature");
+    let cert = wayfinder_auth::MembershipCert::from_bytes(cert_bytes).expect("valid cert bytes");
+    let fp = cert.fingerprint();
+
+    let mut out = buf[..hdr_len].to_vec();
+    let tvlv_hdr_size = core::mem::size_of::<BatmanTvlvHdr>();
+    let mut tvlv_len = 0u16;
+
+    let fp_hdr = BatmanTvlvHdr {
+        tvlv_type: TvlvType::CertFp.as_u8(),
+        version: 1,
+        len: (fp.len() as u16).to_be(),
+    };
+    out.extend_from_slice(fp_hdr.as_bytes());
+    out.extend_from_slice(&fp);
+    tvlv_len += (tvlv_hdr_size + fp.len()) as u16;
+
+    let sig_hdr = BatmanTvlvHdr {
+        tvlv_type: TvlvType::OgmSig.as_u8(),
+        version: 1,
+        len: (sig_bytes.len() as u16).to_be(),
+    };
+    out.extend_from_slice(sig_hdr.as_bytes());
+    out.extend_from_slice(sig_bytes);
+    tvlv_len += (tvlv_hdr_size + sig_bytes.len()) as u16;
+
+    let tvlv_len_off = hdr_len - 2;
+    out[tvlv_len_off..tvlv_len_off + 2].copy_from_slice(&tvlv_len.to_be_bytes());
+    out
+}
+
+/// The requester-side round trip end to end, over a real multi-hop mesh
+/// (machine1 = A, machine2 = X the relay, machine3 = B the requester): B has
+/// no route to A (per design doc §3.2), hears a fingerprint-only OGM
+/// relayed via X, and must fetch A's cert before it can verify — seeding the
+/// `CertReq`'s first hop with X, exactly as `verify_ogm`'s `NeedCert`
+/// requires. Genuine router/engine code drives the `NeedCert` detection,
+/// `CertReq` origination + multi-hop relay through X, and `CertReply`
+/// ingestion + caching (all real requester-side logic); only *A's answer* is
+/// hand-injected here, isolating requester-side correctness from responder-
+/// side correctness — the latter is exercised for real (a genuine responder,
+/// no stand-in) by `cert_fetch_round_trip_with_real_responder` below.
+#[tokio::test]
+async fn cert_fetch_round_trip_resolves_via_seeded_first_hop() {
+    setup();
+    let mut harness = line_of_three();
+
+    // Bootstrap routing with everybody open (no auth), so machine2 has real
+    // routes to both machine1 and machine3 before any auth state exists —
+    // otherwise the CertReq/CertReply relay below would have nothing to
+    // route on.
+    harness.poll_due(Duration::from_secs(1)).await;
+    for _ in 0..5 {
+        harness.tick().await;
+    }
+    for router in harness.machines.values() {
+        assert_eq!(router.router().originator_table().count(), 2);
+    }
+
+    let m1 = harness.get_machine("machine1").ident; // A
+    let m2 = harness.get_machine("machine2").ident; // X, the relay
+    let m3 = harness.get_machine("machine3").ident; // B, the requester
+
+    let authority = wayfinder_auth::Authority::from_seed(&[1; 32], 0xABCD);
+
+    // A's identity: a real cert, but deliberately never installed on
+    // machine1's router — machine1 stays open the whole test, isolating
+    // requester-side (B's) correctness from responder-side correctness.
+    // Only A's identity/signature is needed to build the frames a real
+    // lazy-cert-distribution-enabled node would send/receive.
+    let a_kp = wayfinder_auth::Keypair::from_seed(&[2; 32]);
+    let a_cert = authority.issue_cert(m1, a_kp.ed_pubkey(), a_kp.x_pubkey(), 0, 1_000_000);
+    let mut a_auth = wayfinder::auth::OgmAuth::new(a_kp, a_cert, authority.trust_anchor());
+    a_auth.set_time(1_000);
+
+    // B is a real authenticated node: this is what actually runs the
+    // requester logic under test. `set_auth` resets machine3's own learned
+    // routing state, so it genuinely has no route to A afterward.
+    enable_auth(harness.get_machine_mut("machine3"), &authority, m3, 3);
+
+    // Tap switch1 (A<->X) to observe the real CertReq X relays onward.
+    let cert_req_seen = Arc::new(AtomicUsize::new(0));
+    {
+        let switch1 = harness.switches.get_mut("switch1").unwrap();
+        for port in switch1.port_ids() {
+            let cert_req_seen = cert_req_seen.clone();
+            switch1
+                .add_tap(
+                    port,
+                    TapConfig::new(move |meta| {
+                        if meta.direction == Direction::ToSwitch
+                            && meta.data.len() > 14
+                            && meta.data[12..14] == DEFAULT_BATMAN_ETHER_TYPE.to_be_bytes()
+                            && meta.data[14] == BATADV_CERT_REQ
+                        {
+                            cert_req_seen.fetch_add(1, Ordering::Relaxed);
+                        }
+                        true
+                    }),
+                )
+                .unwrap();
+        }
+    }
+
+    // Build a real signed OGM from A via `augment_ogm`, then re-encode it as
+    // a fingerprint-only (lazy) OGM, matching what `augment_ogm_lazy` emits.
+    let ogm_hdr_len = core::mem::size_of::<BatmanOgmPacket>();
+    let mut ogm_buf = vec![0u8; 512];
+    let ogm = BatmanOgmPacket {
+        packet_type: BATADV_IV_OGM,
+        version: 5,
+        ttl: 50,
+        flags: 0,
+        seqno: 1000u32.to_be(),
+        orig: m1,
+        reserved: 0,
+        tq: 255,
+        tvlv_len: 0,
+    };
+    ogm_buf[..ogm_hdr_len].copy_from_slice(ogm.as_bytes());
+    let ogm_len = a_auth.augment_ogm(&mut ogm_buf, ogm_hdr_len).unwrap();
+    let lazy_ogm = to_lazy_ogm(&ogm_buf[..ogm_len], ogm_hdr_len);
+
+    // Inject it as A's own transmission on switch1, spoofing A's identity —
+    // safe *only* because nothing else in this test needs the switch to
+    // route traffic to a live A afterward (A never responds for real; see
+    // below). X's genuine engine then re-floods it onward to switch2 under
+    // X's own real port, so B hears it exactly as if relayed by X, with no
+    // corruption of switch2's learned mapping for X. (A raw port spoofing an
+    // in-mesh node's identity on its *own* switch corrupts that switch's
+    // learned Ident->Port entry for the real node — discovered by an earlier
+    // version of this test that spoofed X's identity directly on switch2 and
+    // silently broke B's subsequent CertReq delivery to X.)
+    let (raw_port, _port_id) = harness.add_switch_port("switch1");
+    let wire = build_frame(m1, Mac::BROADCAST, DEFAULT_BATMAN_ETHER_TYPE, &lazy_ogm);
+    raw_port.egress.send(wire).await.unwrap();
+
+    for _ in 0..8 {
+        harness.tick().await;
+    }
+
+    assert_eq!(
+        cert_req_seen.load(Ordering::Relaxed),
+        1,
+        "B's CertReq, seeded via X as its first hop, must reach and cross switch1 toward A"
+    );
+    assert!(
+        harness
+            .get_machine("machine3")
+            .router()
+            .auth()
+            .unwrap()
+            .neighbor_cert(m1)
+            .is_none(),
+        "no reply yet: A is open in this test (no set_auth), so nothing has answered it"
+    );
+
+    // Stand in for A's real responder (deliberately not installed on A in
+    // this test, to isolate B's requester-side logic — see
+    // `cert_fetch_round_trip_with_real_responder` for the real responder
+    // exercised end to end): reply with A's cert, injected at switch1 and
+    // relayed for real through X to B.
+    let reply_hdr = BatmanCertReplyPacket {
+        packet_type: BATADV_CERT_REPLY,
+        version: 5,
+        ttl: 50,
+        dest: m3,
+    };
+    let mut reply_payload = reply_hdr.as_bytes().to_vec();
+    reply_payload.extend_from_slice(a_auth.own_cert().as_bytes());
+    let reply_wire = build_frame(m1, m2, DEFAULT_BATMAN_ETHER_TYPE, &reply_payload);
+    raw_port.egress.send(reply_wire).await.unwrap();
+
+    for _ in 0..8 {
+        harness.tick().await;
+    }
+
+    let (cached_cert, cached_fp) = harness
+        .get_machine("machine3")
+        .router()
+        .auth()
+        .unwrap()
+        .neighbor_cert(m1)
+        .expect("A's cert must be cached once the reply arrives");
+    assert_eq!(cached_cert.as_bytes(), a_auth.own_cert().as_bytes());
+    assert_eq!(cached_fp, a_auth.own_cert().fingerprint());
+
+    // A later fingerprint-only OGM from A now verifies from the cache: no
+    // second CertReq is sent.
+    let mut ogm_buf2 = vec![0u8; 512];
+    let ogm2 = BatmanOgmPacket {
+        seqno: 1001u32.to_be(),
+        ..ogm
+    };
+    ogm_buf2[..ogm_hdr_len].copy_from_slice(ogm2.as_bytes());
+    let ogm2_len = a_auth.augment_ogm(&mut ogm_buf2, ogm_hdr_len).unwrap();
+    let lazy_ogm2 = to_lazy_ogm(&ogm_buf2[..ogm2_len], ogm_hdr_len);
+    let wire2 = build_frame(m1, Mac::BROADCAST, DEFAULT_BATMAN_ETHER_TYPE, &lazy_ogm2);
+    raw_port.egress.send(wire2).await.unwrap();
+
+    for _ in 0..8 {
+        harness.tick().await;
+    }
+
+    assert_eq!(
+        cert_req_seen.load(Ordering::Relaxed),
+        1,
+        "a subsequent OGM with the same fingerprint must verify from cache, not re-fetch"
+    );
+}
+
+/// The full round trip with a *real* responder (Phase 4) on A: B's `NeedCert`
+/// detection, `CertReq` origination, and multi-hop relay through X are
+/// genuine (as in the requester-only test above), and this time so is A's
+/// answer — no hand-injected `CertReply` standing in for it. A's route to B
+/// is primed directly (bypassing Trickle timing, which is orthogonal to what
+/// this test checks) so the reply path is exercised over the real wire
+/// without fighting two independent adaptive OGM schedules.
+#[tokio::test]
+async fn cert_fetch_round_trip_with_real_responder() {
+    setup();
+    let mut harness = line_of_three();
+
+    harness.poll_due(Duration::from_secs(1)).await;
+    for _ in 0..5 {
+        harness.tick().await;
+    }
+    for router in harness.machines.values() {
+        assert_eq!(router.router().originator_table().count(), 2);
+    }
+
+    let m1 = harness.get_machine("machine1").ident; // A, the real responder
+    let m3 = harness.get_machine("machine3").ident; // B, the requester
+
+    let authority = wayfinder_auth::Authority::from_seed(&[1; 32], 0xABCD);
+    enable_auth(harness.get_machine_mut("machine1"), &authority, m1, 2);
+    enable_auth(harness.get_machine_mut("machine3"), &authority, m3, 3);
+
+    // Prime A's route + cert cache for B directly (bypassing Trickle
+    // timing): a signed OGM from B, fed straight to A's router. This node
+    // never leaves this process, so nothing about the fetch mechanism under
+    // test is bypassed — only the unrelated question of when Trickle would
+    // have delivered this on its own.
+    let b_ogm_hdr_len = core::mem::size_of::<BatmanOgmPacket>();
+    let mut b_ogm_buf = vec![0u8; 512];
+    let b_ogm = BatmanOgmPacket {
+        packet_type: BATADV_IV_OGM,
+        version: 5,
+        ttl: 50,
+        flags: 0,
+        seqno: 1u32.to_be(),
+        orig: m3,
+        reserved: 0,
+        tq: 255,
+        tvlv_len: 0,
+    };
+    b_ogm_buf[..b_ogm_hdr_len].copy_from_slice(b_ogm.as_bytes());
+    let b_ogm_len = {
+        let b_auth = harness
+            .get_machine_mut("machine3")
+            .router_mut()
+            .auth_mut()
+            .unwrap();
+        b_auth.augment_ogm(&mut b_ogm_buf, b_ogm_hdr_len).unwrap()
+    };
+    harness
+        .get_machine_mut("machine1")
+        .receive_with_metrics(
+            Duration::from_secs(1),
+            0,
+            &build_frame(
+                m3,
+                Mac::BROADCAST,
+                DEFAULT_BATMAN_ETHER_TYPE,
+                &b_ogm_buf[..b_ogm_len],
+            ),
+            LinkMetrics::default(),
+        )
+        .await;
+    assert!(
+        harness
+            .get_machine("machine1")
+            .router()
+            .auth()
+            .unwrap()
+            .neighbor_cert(m3)
+            .is_some(),
+        "A must have B's cert + a route to B primed"
+    );
+
+    // Build A's lazy (CertFp) OGM from its real installed auth state, and
+    // inject it via switch1 as if A had sent it — B has never heard A
+    // before, so this is a cold miss.
+    let ogm_hdr_len = core::mem::size_of::<BatmanOgmPacket>();
+    let mut ogm_buf = vec![0u8; 512];
+    let ogm = BatmanOgmPacket {
+        packet_type: BATADV_IV_OGM,
+        version: 5,
+        ttl: 50,
+        flags: 0,
+        seqno: 2000u32.to_be(),
+        orig: m1,
+        reserved: 0,
+        tq: 255,
+        tvlv_len: 0,
+    };
+    ogm_buf[..ogm_hdr_len].copy_from_slice(ogm.as_bytes());
+    let ogm_len = {
+        let a_auth = harness
+            .get_machine_mut("machine1")
+            .router_mut()
+            .auth_mut()
+            .unwrap();
+        a_auth.augment_ogm(&mut ogm_buf, ogm_hdr_len).unwrap()
+    };
+    let lazy_ogm = to_lazy_ogm(&ogm_buf[..ogm_len], ogm_hdr_len);
+
+    let (raw_port, _port_id) = harness.add_switch_port("switch1");
+    let wire = build_frame(m1, Mac::BROADCAST, DEFAULT_BATMAN_ETHER_TYPE, &lazy_ogm);
+    raw_port.egress.send(wire).await.unwrap();
+
+    for _ in 0..8 {
+        harness.tick().await;
+    }
+
+    let (cached_cert, cached_fp) = harness
+        .get_machine("machine3")
+        .router()
+        .auth()
+        .unwrap()
+        .neighbor_cert(m1)
+        .expect("A's cert must be cached: A answered its own CertReq for real");
+    let a_own_cert = *harness
+        .get_machine("machine1")
+        .router()
+        .auth()
+        .unwrap()
+        .own_cert();
+    assert_eq!(cached_cert.as_bytes(), a_own_cert.as_bytes());
+    assert_eq!(cached_fp, a_own_cert.fingerprint());
+}
+
+/// Phase 5 acceptance criterion: two *fresh* auth nodes, both with
+/// `lazy_cert_distribution` on from their very first OGM, reach mutual
+/// verified routing with zero full certs ever appearing on the wire — only
+/// fingerprints. Both sides start simultaneously cold (neither has the
+/// other's cert, mirroring a freshly-deployed mesh), so this also exercises
+/// the doc's cold-start argument for a direct-neighbor pair: A's reply to
+/// B's `CertReq` parks (A has no route to B yet) until A verifies B's own
+/// next OGM — resolvable specifically because verifying a `CertReq`
+/// caches the requester's cert too (§5.4), so that OGM can be checked as
+/// soon as it arrives — which requires more than one Trickle round, hence
+/// driving several here.
+#[tokio::test]
+async fn two_fresh_lazy_nodes_converge_with_zero_certs_on_the_wire() {
+    setup();
+    let mut harness = simple_pair();
+
+    let m1 = harness.get_machine("machine1").ident;
+    let m2 = harness.get_machine("machine2").ident;
+    let authority = wayfinder_auth::Authority::from_seed(&[1; 32], 0xABCD);
+    enable_auth(harness.get_machine_mut("machine1"), &authority, m1, 2);
+    enable_auth(harness.get_machine_mut("machine2"), &authority, m2, 3);
+    harness
+        .get_machine_mut("machine1")
+        .router_mut()
+        .set_lazy_cert_distribution(true);
+    harness
+        .get_machine_mut("machine2")
+        .router_mut()
+        .set_lazy_cert_distribution(true);
+
+    // Tap switch1 for every OGM crossing it, checking its TVLV tail never
+    // carries a full `Cert` record, only `CertFp`.
+    let cert_seen = Arc::new(AtomicUsize::new(0));
+    let certfp_seen = Arc::new(AtomicUsize::new(0));
+    {
+        let ogm_hdr_len = core::mem::size_of::<BatmanOgmPacket>();
+        let switch1 = harness.switches.get_mut("switch1").unwrap();
+        for port in switch1.port_ids() {
+            let cert_seen = cert_seen.clone();
+            let certfp_seen = certfp_seen.clone();
+            switch1
+                .add_tap(
+                    port,
+                    TapConfig::new(move |meta| {
+                        if meta.direction == Direction::ToSwitch && is_ogm_frame(meta.data) {
+                            let tail = &meta.data[14 + ogm_hdr_len..];
+                            if find_tvlv(tail, TvlvType::Cert).is_some() {
+                                cert_seen.fetch_add(1, Ordering::Relaxed);
+                            }
+                            if find_tvlv(tail, TvlvType::CertFp).is_some() {
+                                certfp_seen.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        true
+                    }),
+                )
+                .unwrap();
+        }
+    }
+
+    // Drive several Trickle rounds: round 1 triggers the mutual NeedCert +
+    // CertReq exchange (each side's reply parks, no route yet); a later
+    // round's OGM — now verifiable from the cert cached off the CertReq
+    // itself — installs the route and flushes the parked reply.
+    for round in 1..=6u64 {
+        converge_at(&mut harness, Duration::from_secs(round)).await;
+    }
+
+    for router in harness.machines.values() {
+        assert_eq!(
+            router.router().originator_table().count(),
+            1,
+            "both nodes must reach mutual verified routing"
+        );
+    }
+    assert_eq!(
+        cert_seen.load(Ordering::Relaxed),
+        0,
+        "zero full certs must ever appear on the wire"
+    );
+    assert!(
+        certfp_seen.load(Ordering::Relaxed) > 0,
+        "OGMs must carry fingerprints instead"
+    );
+    assert!(
+        harness
+            .get_machine("machine1")
+            .router()
+            .auth()
+            .unwrap()
+            .neighbor_cert(m2)
+            .is_some(),
+        "machine1 must have fetched machine2's cert"
+    );
+    assert!(
+        harness
+            .get_machine("machine2")
+            .router()
+            .auth()
+            .unwrap()
+            .neighbor_cert(m1)
+            .is_some(),
+        "machine2 must have fetched machine1's cert"
+    );
 }

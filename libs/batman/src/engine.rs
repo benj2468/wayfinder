@@ -8,7 +8,8 @@ use zerocopy::{FromBytes, IntoBytes};
 use crate::{
     BatmanEngine, NeighborStats, OriginatorRecord, TrickleTimer,
     wire::{
-        BATADV_BCAST, BATADV_IV_OGM, BATADV_MCAST, BATADV_UNICAST, BatmanBroadcastPacket,
+        BATADV_BCAST, BATADV_CERT_REPLY, BATADV_CERT_REQ, BATADV_IV_OGM, BATADV_MCAST,
+        BATADV_UNICAST, BatmanBroadcastPacket, BatmanCertReplyPacket, BatmanCertReqPacket,
         BatmanMcastPacket, BatmanOgmPacket, BatmanTvlvHdr, BatmanUnicastPacket, ETH_P_BATMAN,
         TvlvType, find_tvlv,
     },
@@ -774,6 +775,96 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
         RoutingAction::Consumed // Route unknown, drop packet
     }
 
+    /// Route an incoming lazy-cert-distribution fetch request
+    /// (`BATADV_CERT_REQ`): deliver locally when addressed to us (so the
+    /// router's auth state can answer it), otherwise relay toward the next
+    /// live hop for the requested originator, exactly like
+    /// [`handle_unicast`](Self::handle_unicast). Crypto-free: the engine only
+    /// moves bytes, never inspects the requester's cert/signature body.
+    fn handle_cert_req<'rx, 'tx>(
+        &mut self,
+        now: core::time::Duration,
+        frame: &'tx LinkFrame,
+        reply: &mut LinkFrameDataMut<'rx>,
+    ) -> RoutingAction {
+        let Ok((hdr, _)) = BatmanCertReqPacket::read_from_prefix(&frame.payload) else {
+            trace!("drop: malformed cert request");
+            return RoutingAction::Consumed;
+        };
+        trace!(cert_req = ?hdr, "rx cert request");
+        let dst = hdr.dest;
+
+        if dst == self.self_ident {
+            return RoutingAction::DeliverLocal;
+        }
+        if hdr.ttl <= 1 {
+            return RoutingAction::Consumed; // Drop packet, expired
+        }
+        if let Some(next) = self.next_hop(now, dst) {
+            let mut updated_hdr = hdr;
+            updated_hdr.ttl -= 1;
+
+            let size = core::mem::size_of::<BatmanCertReqPacket>();
+            let inner = frame.payload.get(size..).unwrap_or(&[]);
+            let total = size + inner.len();
+
+            if total <= reply.payload.len() {
+                reply.dst = next;
+                reply.protocol = ETH_P_BATMAN;
+                reply.payload[..size].copy_from_slice(updated_hdr.as_bytes());
+                reply.payload[size..total].copy_from_slice(inner);
+            } else {
+                self.note_relay_oversize_drop("cert_req_relay", total, reply.payload.len());
+            }
+        }
+
+        RoutingAction::Consumed // Route unknown, drop packet
+    }
+
+    /// Route an incoming lazy-cert-distribution reply (`BATADV_CERT_REPLY`):
+    /// deliver locally when addressed to us, otherwise relay toward the next
+    /// live hop for the original requester. Structurally identical to
+    /// [`handle_cert_req`](Self::handle_cert_req).
+    fn handle_cert_reply<'rx, 'tx>(
+        &mut self,
+        now: core::time::Duration,
+        frame: &'tx LinkFrame,
+        reply: &mut LinkFrameDataMut<'rx>,
+    ) -> RoutingAction {
+        let Ok((hdr, _)) = BatmanCertReplyPacket::read_from_prefix(&frame.payload) else {
+            trace!("drop: malformed cert reply");
+            return RoutingAction::Consumed;
+        };
+        trace!(cert_reply = ?hdr, "rx cert reply");
+        let dst = hdr.dest;
+
+        if dst == self.self_ident {
+            return RoutingAction::DeliverLocal;
+        }
+        if hdr.ttl <= 1 {
+            return RoutingAction::Consumed; // Drop packet, expired
+        }
+        if let Some(next) = self.next_hop(now, dst) {
+            let mut updated_hdr = hdr;
+            updated_hdr.ttl -= 1;
+
+            let size = core::mem::size_of::<BatmanCertReplyPacket>();
+            let inner = frame.payload.get(size..).unwrap_or(&[]);
+            let total = size + inner.len();
+
+            if total <= reply.payload.len() {
+                reply.dst = next;
+                reply.protocol = ETH_P_BATMAN;
+                reply.payload[..size].copy_from_slice(updated_hdr.as_bytes());
+                reply.payload[size..total].copy_from_slice(inner);
+            } else {
+                self.note_relay_oversize_drop("cert_reply_relay", total, reply.payload.len());
+            }
+        }
+
+        RoutingAction::Consumed // Route unknown, drop packet
+    }
+
     /// Route a BATMAN-protocol frame whose sub-type tag is none of the known
     /// packet types, treating it as a bare payload addressed by `frame.dst`:
     /// deliver locally when it is for us, forward toward the best live next hop
@@ -820,6 +911,8 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
             BATADV_BCAST => self.handle_broadcast(frame, reply),
             BATADV_UNICAST => self.handle_unicast(now, frame, reply),
             BATADV_MCAST => self.handle_mcast(now, frame, reply),
+            BATADV_CERT_REQ => self.handle_cert_req(now, frame, reply),
+            BATADV_CERT_REPLY => self.handle_cert_reply(now, frame, reply),
             _ => self.route_by_dest(now, frame),
         }
     }

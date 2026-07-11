@@ -1,5 +1,6 @@
 //! The membership certificate and the per-mesh trust anchor that verifies it.
 
+use blake2::{Blake2s256, Digest};
 use interfaces::frame::Mac;
 use zerocopy::byteorder::network_endian::{U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -10,6 +11,11 @@ use crate::key::verify_signature;
 /// Version byte stamped on every [`MembershipCert`] this build produces and the
 /// only version it accepts.  Bump when the signed layout changes.
 pub const CERT_VERSION: u8 = 1;
+
+/// Domain-separation label folded into the fingerprint hash, so it can never
+/// collide with another `Blake2s256` use over the same or overlapping bytes
+/// elsewhere in the crate (e.g. [`crate::key::Keypair::pairwise_key`]).
+const CERT_FINGERPRINT_LABEL: &[u8] = b"wayfinder-certfp-v1";
 
 /// A membership certificate: the mesh root's signed attestation that an Ed25519
 /// identity key (and its companion X25519 agreement key) belongs to a particular
@@ -60,6 +66,26 @@ impl MembershipCert {
     pub fn signed_body(&self) -> &[u8] {
         let body_len = core::mem::size_of::<MembershipCert>() - 64;
         &self.as_bytes()[..body_len]
+    }
+
+    /// An 8-byte fingerprint over the whole certificate (`Blake2s256`,
+    /// domain-separated, truncated), for lazy cert distribution: an OGM
+    /// carries this instead of the full cert, and a receiver holding a cert
+    /// with a matching fingerprint can verify the OGM against its cached copy
+    /// with zero cert bytes on the wire. It changes on any field change,
+    /// including key rotation, so a fingerprint mismatch signals "fetch the
+    /// new cert." It is not a trust boundary — a fetched cert is always
+    /// re-verified against the [`TrustAnchor`] — only collision-resistance
+    /// among legitimate certs is required, which 8 bytes of `Blake2s256` is
+    /// ample for.
+    pub fn fingerprint(&self) -> [u8; 8] {
+        let mut h = Blake2s256::new();
+        h.update(CERT_FINGERPRINT_LABEL);
+        h.update(self.as_bytes());
+        let digest: [u8; 32] = h.finalize().into();
+        let mut fp = [0u8; 8];
+        fp.copy_from_slice(&digest[..8]);
+        fp
     }
 }
 
@@ -253,6 +279,40 @@ mod tests {
         let bytes = cert.as_bytes().to_vec();
         let (parsed, _) = MembershipCert::ref_from_prefix(&bytes).unwrap();
         assert!(authority.trust_anchor().verify_cert(parsed, 150).is_ok());
+    }
+
+    /// The fingerprint is deterministic: hashing the same cert bytes twice
+    /// yields the same 8-byte tag.
+    #[test]
+    fn fingerprint_is_deterministic() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let node = Keypair::from_seed(&[2u8; 32]);
+        let cert = authority.issue_cert(mac(5), node.ed_pubkey(), node.x_pubkey(), 100, 200);
+        assert_eq!(cert.fingerprint(), cert.fingerprint());
+    }
+
+    /// Any change to the cert (e.g. a rotated key, here simulated by flipping
+    /// the bound MAC) changes the fingerprint, so a fingerprint mismatch on an
+    /// OGM correctly signals "the cert changed, re-fetch it."
+    #[test]
+    fn fingerprint_changes_when_cert_changes() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let node = Keypair::from_seed(&[2u8; 32]);
+        let cert_a = authority.issue_cert(mac(5), node.ed_pubkey(), node.x_pubkey(), 100, 200);
+        let mut cert_b = cert_a;
+        cert_b.node_mac = mac(6).0;
+        assert_ne!(cert_a.fingerprint(), cert_b.fingerprint());
+    }
+
+    /// Two distinct, independently-issued certs do not collide.
+    #[test]
+    fn fingerprint_differs_across_distinct_certs() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let node_a = Keypair::from_seed(&[2u8; 32]);
+        let node_b = Keypair::from_seed(&[3u8; 32]);
+        let cert_a = authority.issue_cert(mac(5), node_a.ed_pubkey(), node_a.x_pubkey(), 100, 200);
+        let cert_b = authority.issue_cert(mac(6), node_b.ed_pubkey(), node_b.x_pubkey(), 100, 200);
+        assert_ne!(cert_a.fingerprint(), cert_b.fingerprint());
     }
 
     use crate::key::Keypair;

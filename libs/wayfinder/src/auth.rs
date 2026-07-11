@@ -77,6 +77,70 @@ const REVOKE_FLOOD_BUDGET: u8 = 6;
 /// OGM can grow when several purges are in flight at once.
 const MAX_REVOKE_PER_OGM: usize = 4;
 
+/// Maximum concurrent outstanding lazy-cert-distribution fetch requests
+/// tracked at once. Bounds the state a churning mesh (many simultaneous
+/// fingerprint misses) can pin.
+const MAX_IN_FLIGHT_CERT_REQUESTS: usize = 16;
+
+/// Minimum spacing (seconds) between retransmissions of the same outstanding
+/// `CertReq` — the requester-side retry backstop for a dropped request or
+/// reply (design doc §3.5): a pending-query list at the responder is the
+/// primary optimization, but a lost packet anywhere must not wedge the fetch
+/// forever.
+const CERT_REQUEST_RETRY_SECS: u64 = 5;
+
+/// Maximum retransmission attempts for one outstanding `CertReq` before it is
+/// abandoned. A live OGM stream simply raises the miss again on its next
+/// Trickle emission if the need persists, so abandoning is not permanent.
+const MAX_CERT_REQUEST_ATTEMPTS: u8 = 6;
+
+/// Domain-separation prefix for a `CertReq`'s self-authenticating signature,
+/// over `orig ‖ requester_mac` — distinct from [`SIG_DOMAIN`] (the OGM
+/// signature) so the two can never be confused with one another.
+const CERT_REQ_SIG_DOMAIN: &[u8] = b"wf-certreq-sig-v1";
+
+/// Maximum concurrent parked pending `CertReply`s (responder side): verified
+/// requesters this node has no route to yet.
+const MAX_PENDING_REPLIES: usize = 16;
+
+/// How long a parked pending reply is kept before it is evicted as stale.
+const PENDING_REPLY_TTL_SECS: u64 = 30;
+
+/// Minimum spacing (seconds) between `CertReq`s this node will act on from
+/// the same requester — bounds the verification/airtime cost a single
+/// member (even a legitimate, self-authenticating one) can impose (design
+/// doc §8).
+const CERT_REQ_RATE_LIMIT_SECS: u64 = 2;
+
+/// One verified requester whose `CertReply` is parked because this node had
+/// no route back to them at request time.
+#[derive(Debug, Clone, Copy)]
+struct PendingReply {
+    /// The requester to reply to once a route appears.
+    requester: Mac,
+    /// `now_unix` this entry was last (re)parked, for TTL eviction.
+    parked_unix: u64,
+}
+
+/// One outstanding lazy-cert-distribution fetch: the originator whose cert is
+/// needed, the fingerprint that triggered the fetch, the first hop to
+/// (re)address the request to, and the retry bookkeeping.
+#[derive(Debug, Clone, Copy)]
+struct InFlightCertRequest {
+    /// The originator whose cert is being fetched.
+    orig: Mac,
+    /// The fingerprint that triggered this fetch (the OGM's advertised
+    /// value, not yet resolvable against the cache).
+    fp: [u8; 8],
+    /// The neighbor to (re)address the request to — the OGM's link source,
+    /// which by construction has a route to `orig` (see design doc §3.2).
+    first_hop: Mac,
+    /// Retransmissions sent so far, bounded by [`MAX_CERT_REQUEST_ATTEMPTS`].
+    attempts: u8,
+    /// Earliest `now_unix` at which another retransmission is allowed.
+    next_attempt_unix: u64,
+}
+
 /// Size of the reused scratch buffer for assembling the OGM signed message
 /// (domain prefix + orig + seqno + certificate).  Generous over the ~180-byte
 /// maximum so the buffer can be a fixed field rather than re-created per call.
@@ -100,6 +164,37 @@ pub struct NeighborKeys {
     /// our secret and the cert's `x_pubkey`) when the neighbor is cached, and
     /// reused to tag/verify directed data-plane frames.
     pub pairwise_key: [u8; 32],
+    /// The neighbor's raw certificate bytes, retained (not just the derived
+    /// [`VerifiedCert`]) so a fingerprint-only OGM can be verified against the
+    /// cached copy: [`signed_message`](OgmAuth::signed_message) needs the whole
+    /// cert to reconstruct the signed message, which `VerifiedCert` alone
+    /// cannot provide.
+    pub raw_cert: MembershipCert,
+}
+
+/// The outcome of [`OgmAuth::verify_ogm`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "an OgmVerdict must be acted on: NeedCert requires triggering a cert fetch, distinct from Rejected"]
+pub enum OgmVerdict {
+    /// The OGM's signature verified against a trust-anchored cert (carried on
+    /// the wire, or resolved from the cache via a matching fingerprint). The
+    /// caller should let the OGM proceed to routing.
+    Verified,
+    /// The OGM must be dropped: malformed, wrong mesh, revoked, cert/anchor
+    /// verification failed, or the signature did not verify.
+    Rejected,
+    /// The OGM carried a [`TvlvType::CertFp`] this node cannot resolve —
+    /// either `orig` is unknown, or its fingerprint has changed (a
+    /// rotation). This copy of the OGM is dropped (not forwarded); the
+    /// caller should fetch the cert (see [`OgmAuth::build_cert_request`]) and
+    /// let the *next* emission from `orig` verify and forward normally.
+    NeedCert {
+        /// The originator whose cert is needed.
+        orig: Mac,
+        /// The fingerprint this OGM advertised, so the fetch can be matched
+        /// back to the OGM that triggered it once resolved.
+        fp: [u8; 8],
+    },
 }
 
 /// One known revocation plus its remaining re-flood budget.  The signed record
@@ -148,6 +243,15 @@ pub struct OgmAuth {
     /// backed-off emission interval.  Drained by
     /// [`take_trickle_reset_hint`](Self::take_trickle_reset_hint).
     trickle_reset_hint: bool,
+    /// Outstanding lazy-cert-distribution fetches this node has requested but
+    /// not yet resolved, keyed by originator MAC (one entry per originator).
+    in_flight: HVec<InFlightCertRequest, MAX_IN_FLIGHT_CERT_REQUESTS>,
+    /// Verified `CertReq` requesters this node (the responder) has no route
+    /// to yet, parked for opportunistic flush once one appears.
+    pending_replies: HVec<PendingReply, MAX_PENDING_REPLIES>,
+    /// Per-requester last-accepted-`CertReq` instant (responder-side rate
+    /// limit), keyed by requester MAC.
+    cert_req_rate: HVec<(Mac, u64), MAX_NEIGHBOR_KEYS>,
 }
 
 impl OgmAuth {
@@ -165,6 +269,9 @@ impl OgmAuth {
             send_counters: HVec::new(),
             recv_counters: HVec::new(),
             trickle_reset_hint: false,
+            in_flight: HVec::new(),
+            pending_replies: HVec::new(),
+            cert_req_rate: HVec::new(),
         }
     }
 
@@ -202,6 +309,18 @@ impl OgmAuth {
                 i += 1;
             }
         }
+        self.pending_replies
+            .retain(|p| now.saturating_sub(p.parked_unix) < PENDING_REPLY_TTL_SECS);
+        // Reclaim in-flight requests whose retry budget is exhausted. Without
+        // this, a target that never answers (unreachable, or an attacker
+        // flooding NeedCert misses for fake originator MACs it never backs
+        // with a real reply) permanently pins a slot: `build_cert_request`
+        // returns `None` before incrementing `attempts` once exhausted, so
+        // the entry would otherwise sit at `MAX_CERT_REQUEST_ATTEMPTS`
+        // forever, and `MAX_IN_FLIGHT_CERT_REQUESTS` such dead entries would
+        // permanently block fetching any further originator's cert.
+        self.in_flight
+            .retain(|r| r.attempts < MAX_CERT_REQUEST_ATTEMPTS);
     }
 
     /// Ingest a signed revocation record — from the management API (a local
@@ -316,6 +435,19 @@ impl OgmAuth {
     /// The keys of neighbors whose OGMs have verified.
     pub fn neighbors(&self) -> &[NeighborKeys] {
         &self.neighbors
+    }
+
+    /// Look up a cached neighbor's raw certificate and its fingerprint by MAC.
+    /// `None` if no verified OGM from `mac` is currently cached (never seen, or
+    /// evicted under churn — see [`cache_neighbor`](Self::cache_neighbor)).
+    /// This is the store lazy cert distribution resolves an OGM's
+    /// [`TvlvType::CertFp`] against: a fingerprint match here lets the OGM
+    /// verify from the cached bytes with zero cert bytes on the wire.
+    pub fn neighbor_cert(&self, mac: Mac) -> Option<(MembershipCert, [u8; 8])> {
+        self.neighbors
+            .iter()
+            .find(|n| n.cert.mac == mac)
+            .map(|n| (n.raw_cert, n.raw_cert.fingerprint()))
     }
 
     /// This node's own membership certificate (for the security view: mesh id,
@@ -464,7 +596,45 @@ impl OgmAuth {
     /// built in `buf[..len]`, returning the new length.  Updates the header's
     /// `tvlv_len` to cover the added records.  Returns `None` if the OGM is
     /// malformed or `buf` lacks room for the additions.
+    ///
+    /// Emits the full cert ([`TvlvType::Cert`]) on every OGM. Use
+    /// [`augment_ogm_lazy`](Self::augment_ogm_lazy) instead when
+    /// `lazy_cert_distribution` is enabled, to emit an 8-byte fingerprint
+    /// instead — see that method for details; the two are otherwise
+    /// identical (same signed message, same revocation attachment).
     pub fn augment_ogm(&mut self, buf: &mut [u8], len: usize) -> Option<usize> {
+        self.augment_ogm_with_cert_record(buf, len, false)
+    }
+
+    /// The lazy-cert-distribution counterpart to
+    /// [`augment_ogm`](Self::augment_ogm): appends an 8-byte cert
+    /// fingerprint ([`TvlvType::CertFp`]) instead of the full 156-byte cert,
+    /// cutting the dominant per-OGM airtime cost on a mesh where receivers
+    /// already hold (or can fetch on demand) the sender's cert. The `OgmSig`
+    /// signature is still computed over the *full* cert bytes exactly as
+    /// [`augment_ogm`](Self::augment_ogm) does — only the on-the-wire
+    /// representation of the cert differs, not what is signed — so a
+    /// verifier reconstructs the same signed message from whichever cert its
+    /// cache holds for the fingerprint. Otherwise identical: same TVLV/
+    /// signature failure modes, same revocation attachment.
+    pub fn augment_ogm_lazy(&mut self, buf: &mut [u8], len: usize) -> Option<usize> {
+        self.augment_ogm_with_cert_record(buf, len, true)
+    }
+
+    /// Shared implementation for [`augment_ogm`](Self::augment_ogm) and
+    /// [`augment_ogm_lazy`](Self::augment_ogm_lazy): identical in every way
+    /// except which TVLV record represents the cert on the wire — the full
+    /// [`TvlvType::Cert`] or the 8-byte [`TvlvType::CertFp`] fingerprint,
+    /// selected by `lazy`. A plain `bool` rather than a `TvlvType` parameter
+    /// deliberately, since this function only ever writes one of these two
+    /// specific records — a `TvlvType` parameter would let a caller pass any
+    /// other variant and silently fall through to "full cert."
+    fn augment_ogm_with_cert_record(
+        &mut self,
+        buf: &mut [u8],
+        len: usize,
+        lazy: bool,
+    ) -> Option<usize> {
         if len < OGM_HDR {
             return None;
         }
@@ -472,6 +642,14 @@ impl OgmAuth {
         // reused `sign_scratch` field is borrowed below (MembershipCert is Copy).
         let cert = self.cert;
         let cert_bytes = cert.as_bytes();
+        let fingerprint = cert.fingerprint();
+        // The signature always covers the *full* cert, regardless of which
+        // TVLV shape carries it on the wire (see this method's doc comment).
+        let (cert_record_type, cert_record_value): (TvlvType, &[u8]) = if lazy {
+            (TvlvType::CertFp, &fingerprint)
+        } else {
+            (TvlvType::Cert, cert_bytes)
+        };
 
         // Sign over the immutable identity (orig + seqno, as on the wire) + cert.
         let mut orig = [0u8; 6];
@@ -483,7 +661,7 @@ impl OgmAuth {
             self.keypair.sign(signed)
         };
 
-        let cert_record = TVLV_HDR + cert_bytes.len();
+        let cert_record = TVLV_HDR + cert_record_value.len();
         let sig_record = TVLV_HDR + SIG_LEN;
         let added = cert_record + sig_record;
         let new_len = len.checked_add(added)?;
@@ -498,7 +676,7 @@ impl OgmAuth {
             .and_then(|a| old_tvlv_len.checked_add(a))?;
 
         let mut off = len;
-        off = Self::write_tvlv(buf, off, TvlvType::Cert, cert_bytes);
+        off = Self::write_tvlv(buf, off, cert_record_type, cert_record_value);
         off = Self::write_tvlv(buf, off, TvlvType::OgmSig, &signature);
 
         // Attach pending revocations (budgeted) so an emergency purge floods
@@ -554,51 +732,86 @@ impl OgmAuth {
         vstart + value.len()
     }
 
-    /// Verify an incoming OGM's authentication, caching the originator's keys on
-    /// success.  Returns `true` only if the OGM carries a cert that chains to
-    /// our trust anchor (correct mesh, valid window, not revoked) and a
-    /// signature that verifies against that cert's key over the OGM's immutable
-    /// identity.  A `false` return means the OGM must be dropped.
-    pub fn verify_ogm(&mut self, payload: &[u8]) -> bool {
+    /// Verify an incoming OGM's authentication, caching the originator's keys
+    /// on success.  Accepts either shape of cert TVLV: a legacy
+    /// [`TvlvType::Cert`] (the full cert, carried on the wire) or a lazy
+    /// [`TvlvType::CertFp`] (an 8-byte fingerprint, resolved against the
+    /// cached cert for `orig` — see [`OgmVerdict::NeedCert`] when it cannot
+    /// be resolved). Either way the signature is checked the same way, over
+    /// the *whole* cert bytes (wire or cached) — the fingerprint only selects
+    /// which cert to check against, it is never itself a trust boundary.
+    pub fn verify_ogm(&mut self, payload: &[u8]) -> OgmVerdict {
         if payload.len() < OGM_HDR {
             tracing::trace!("auth: dropping OGM shorter than its header");
-            return false;
+            return OgmVerdict::Rejected;
         }
         let tail = &payload[OGM_HDR..];
-        let (Some(cert_bytes), Some(sig_bytes)) = (
-            find_tvlv(tail, TvlvType::Cert),
-            find_tvlv(tail, TvlvType::OgmSig),
-        ) else {
-            // Unauthenticated OGM under an auth-enabled mesh (e.g. another mesh).
-            tracing::trace!("auth: dropping OGM missing cert or signature TVLV");
-            return false;
+
+        let Some(sig_bytes) = find_tvlv(tail, TvlvType::OgmSig) else {
+            tracing::trace!("auth: dropping OGM missing signature TVLV");
+            return OgmVerdict::Rejected;
         };
         if sig_bytes.len() != SIG_LEN {
             tracing::trace!("auth: dropping OGM with malformed signature TVLV length");
-            return false;
+            return OgmVerdict::Rejected;
         }
+
+        let mut orig = [0u8; 6];
+        orig.copy_from_slice(&payload[ORIG_OFF..ORIG_OFF + 6]);
+
+        // Resolve the cert bytes to check the signature against: carried on
+        // the wire (legacy), or looked up from the cache by fingerprint
+        // (lazy).  `cached_cert_holder` exists only to extend the lifetime of
+        // the owned copy the cache lookup returns, so `cert_bytes` can borrow
+        // it in the lazy branch exactly like it borrows `tail` in the legacy
+        // one.
+        let cached_cert_holder: MembershipCert;
+        let cert_bytes: &[u8] = if let Some(cb) = find_tvlv(tail, TvlvType::Cert) {
+            cb
+        } else if let Some(fp_bytes) = find_tvlv(tail, TvlvType::CertFp) {
+            let Ok(fp) = <[u8; 8]>::try_from(fp_bytes) else {
+                tracing::trace!("auth: dropping OGM with malformed fingerprint TVLV length");
+                return OgmVerdict::Rejected;
+            };
+            match self.neighbor_cert(Mac(orig)) {
+                Some((cached, cached_fp)) if cached_fp == fp => {
+                    cached_cert_holder = cached;
+                    cached_cert_holder.as_bytes()
+                }
+                _ => {
+                    tracing::trace!("auth: fingerprint miss/rotation; cert fetch needed");
+                    return OgmVerdict::NeedCert {
+                        orig: Mac(orig),
+                        fp,
+                    };
+                }
+            }
+        } else {
+            // Unauthenticated OGM under an auth-enabled mesh (e.g. another mesh).
+            tracing::trace!("auth: dropping OGM missing cert/fingerprint TVLV");
+            return OgmVerdict::Rejected;
+        };
+
         let Ok((cert, _)) = MembershipCert::ref_from_prefix(cert_bytes) else {
             tracing::trace!("auth: dropping OGM with malformed membership certificate");
-            return false;
+            return OgmVerdict::Rejected;
         };
         let verified = match self.anchor.verify_cert(cert, self.now_unix) {
             Ok(v) => v,
             Err(e) => {
                 tracing::trace!(error = ?e, "auth: dropping OGM whose certificate failed verification");
-                return false;
+                return OgmVerdict::Rejected;
             }
         };
 
         // The cert must be bound to the OGM's claimed originator, and not revoked.
-        let mut orig = [0u8; 6];
-        orig.copy_from_slice(&payload[ORIG_OFF..ORIG_OFF + 6]);
         if verified.mac.0 != orig {
             tracing::trace!("auth: dropping OGM whose cert MAC does not match the originator");
-            return false;
+            return OgmVerdict::Rejected;
         }
         if self.is_revoked(&orig) {
             tracing::trace!("auth: dropping OGM from a revoked originator");
-            return false;
+            return OgmVerdict::Rejected;
         }
 
         let mut seqno = [0u8; 4];
@@ -606,27 +819,30 @@ impl OgmAuth {
         let ed_pubkey = verified.ed_pubkey;
         let mut signature = [0u8; SIG_LEN];
         signature.copy_from_slice(sig_bytes);
-        // The signature is computed over the full `cert_bytes` from the TVLV, so
-        // any padding past the 156-byte cert (which `ref_from_prefix` ignores)
+        // The signature is computed over the full `cert_bytes`, so any
+        // padding past the 156-byte cert (which `ref_from_prefix` ignores)
         // changes the signed message and fails below — the cert length is
-        // implicitly pinned by the signature.
+        // implicitly pinned by the signature.  On the lazy path `cert_bytes`
+        // is always exactly 156 bytes (a `MembershipCert::as_bytes()`), so
+        // this only bites the legacy wire path, unchanged from before.
         let signature_ok =
             match Self::signed_message(&orig, &seqno, cert_bytes, &mut self.sign_scratch) {
                 Some(signed) => verify_signature(&ed_pubkey, signed, &signature),
                 None => {
                     tracing::trace!("auth: dropping OGM, signed-message buffer too small");
-                    return false;
+                    return OgmVerdict::Rejected;
                 }
             };
         if !signature_ok {
             tracing::trace!("auth: dropping OGM with an invalid signature");
-            return false;
+            return OgmVerdict::Rejected;
         }
 
         let pairwise_key = self.keypair.pairwise_key(&verified.x_pubkey);
         self.cache_neighbor(NeighborKeys {
             cert: verified,
             pairwise_key,
+            raw_cert: *cert,
         });
 
         // Fold in any revocation records this OGM carries — each independently
@@ -635,7 +851,256 @@ impl OgmAuth {
         // an outsider cannot drive this path, and last so a revocation of the
         // *originator itself* (carried in a forwarded copy) still records.
         self.ingest_revocations_from_tail(tail);
+        OgmVerdict::Verified
+    }
+
+    /// On a fingerprint miss/mismatch for `orig` (an [`OgmVerdict::NeedCert`]),
+    /// decide whether to (re)send a `CertReq` now, and if so, write its
+    /// self-authenticating body — this node's own cert followed by an
+    /// Ed25519 signature over `orig ‖ our_mac` — into `buf`, returning its
+    /// length.  Dedups against an already in-flight request for the same
+    /// `orig`: suppressed (returns `None`) while its retry backoff has not
+    /// yet elapsed, once its retry budget
+    /// ([`MAX_CERT_REQUEST_ATTEMPTS`]) is exhausted, or when the in-flight
+    /// table is full and this is a new originator. `first_hop` is the
+    /// neighbor to address the request to — the requester has no route to
+    /// `orig` yet (that is exactly why this is being called), so the caller
+    /// must seed it with the OGM's actual link source (design doc §3.2).
+    pub fn build_cert_request(
+        &mut self,
+        orig: Mac,
+        fp: [u8; 8],
+        first_hop: Mac,
+        buf: &mut [u8],
+    ) -> Option<usize> {
+        if let Some(existing) = self.in_flight.iter_mut().find(|r| r.orig == orig) {
+            if existing.fp != fp {
+                // A further rotation arrived before the previous fetch
+                // resolved: restart tracking for the new target.
+                existing.fp = fp;
+                existing.attempts = 0;
+                existing.next_attempt_unix = 0;
+            }
+            if self.now_unix < existing.next_attempt_unix {
+                return None; // still within backoff
+            }
+            if existing.attempts >= MAX_CERT_REQUEST_ATTEMPTS {
+                tracing::debug!(?orig, "auth: cert-request retry budget exhausted");
+                return None;
+            }
+            existing.attempts += 1;
+            existing.next_attempt_unix = self.now_unix.saturating_add(CERT_REQUEST_RETRY_SECS);
+            existing.first_hop = first_hop;
+        } else {
+            let entry = InFlightCertRequest {
+                orig,
+                fp,
+                first_hop,
+                attempts: 1,
+                next_attempt_unix: self.now_unix.saturating_add(CERT_REQUEST_RETRY_SECS),
+            };
+            if self.in_flight.push(entry).is_err() {
+                tracing::debug!(?orig, "auth: in-flight cert-request table full");
+                return None;
+            }
+        }
+
+        let mut msg = [0u8; CERT_REQ_SIG_DOMAIN.len() + 12];
+        msg[..CERT_REQ_SIG_DOMAIN.len()].copy_from_slice(CERT_REQ_SIG_DOMAIN);
+        msg[CERT_REQ_SIG_DOMAIN.len()..CERT_REQ_SIG_DOMAIN.len() + 6].copy_from_slice(&orig.0);
+        msg[CERT_REQ_SIG_DOMAIN.len() + 6..].copy_from_slice(&self.cert.node_mac);
+        let signature = self.keypair.sign(&msg);
+
+        let cert_bytes = self.cert.as_bytes();
+        let total = cert_bytes.len() + signature.len();
+        let out = buf.get_mut(..total)?;
+        out[..cert_bytes.len()].copy_from_slice(cert_bytes);
+        out[cert_bytes.len()..].copy_from_slice(&signature);
+        Some(total)
+    }
+
+    /// Ingest a `CertReply` body (a raw [`MembershipCert`]) delivered locally
+    /// to this node.  Verifies it against the trust anchor, confirms it
+    /// answers an outstanding in-flight request for that MAC (so an
+    /// unsolicited or spoofed reply cannot poison the cache), caches it, and
+    /// clears the in-flight entry.  Returns `true` only when the cert was
+    /// newly cached — a `false` return means the reply was dropped and, if
+    /// still needed, the requester-side retry in
+    /// [`build_cert_request`](Self::build_cert_request) is the backstop.
+    pub fn ingest_cert_reply(&mut self, body: &[u8]) -> bool {
+        let Ok((cert, _)) = MembershipCert::ref_from_prefix(body) else {
+            tracing::trace!("auth: dropping malformed cert reply");
+            return false;
+        };
+        let verified = match self.anchor.verify_cert(cert, self.now_unix) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::trace!(error = ?e, "auth: dropping cert reply that failed verification");
+                return false;
+            }
+        };
+        let Some(pos) = self
+            .in_flight
+            .iter()
+            .position(|r| r.orig.0 == verified.mac.0)
+        else {
+            tracing::trace!("auth: dropping cert reply that answers no outstanding request");
+            return false;
+        };
+        self.in_flight.swap_remove(pos);
+
+        let pairwise_key = self.keypair.pairwise_key(&verified.x_pubkey);
+        self.cache_neighbor(NeighborKeys {
+            cert: verified,
+            pairwise_key,
+            raw_cert: *cert,
+        });
         true
+    }
+
+    /// Verify an incoming `CertReq` body (the requester's own cert followed
+    /// by a signature over `our_mac ‖ requester_mac`) delivered locally to
+    /// this node — i.e. this node *is* the originator whose cert was
+    /// requested (the terminal case; an intermediate holder answering early
+    /// is a deferred optimization, design doc §3.1/open-decision #1).
+    /// Verifies the requester's cert against the trust anchor and the
+    /// self-authenticating signature against that cert's own key (proving
+    /// they hold the matching private key), rate-limits repeated requests
+    /// from the same MAC ([`CERT_REQ_RATE_LIMIT_SECS`], §8), and caches the
+    /// requester's cert (a free, verified exchange that also lets this node
+    /// verify the requester's own OGMs sooner). Returns the requester's MAC
+    /// on success, or `None` (dropped, `trace!`-logged) on any failure —
+    /// the caller must not answer or park a pending reply in that case.
+    pub fn verify_cert_request(&mut self, body: &[u8]) -> Option<Mac> {
+        let cert_len = core::mem::size_of::<MembershipCert>();
+        if body.len() != cert_len + SIG_LEN {
+            tracing::trace!("auth: dropping malformed cert request body");
+            return None;
+        }
+        let (cert_bytes, sig_bytes) = body.split_at(cert_len);
+        let Ok((cert, _)) = MembershipCert::ref_from_prefix(cert_bytes) else {
+            tracing::trace!("auth: dropping cert request with malformed requester cert");
+            return None;
+        };
+        let verified = match self.anchor.verify_cert(cert, self.now_unix) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::trace!(error = ?e, "auth: dropping cert request whose requester cert failed verification");
+                return None;
+            }
+        };
+        let requester = verified.mac;
+
+        if self.is_revoked(&requester.0) {
+            tracing::trace!("auth: dropping cert request from a revoked requester");
+            return None;
+        }
+
+        // Proof-of-possession *before* touching the rate limiter: a cert's
+        // bytes are not secret (broadcast on every OGM, or fetchable), so
+        // anyone can replay a real member's cert with a garbage signature.
+        // Checking the signature first means only someone who actually
+        // holds the requester's private key can consume their rate-limit
+        // slot — otherwise an attacker could keep a named member's slot
+        // permanently "hot" with forged requests and deny their genuine
+        // ones, inverting the rate limiter's whole purpose (§8).
+        let mut msg = [0u8; CERT_REQ_SIG_DOMAIN.len() + 12];
+        msg[..CERT_REQ_SIG_DOMAIN.len()].copy_from_slice(CERT_REQ_SIG_DOMAIN);
+        msg[CERT_REQ_SIG_DOMAIN.len()..CERT_REQ_SIG_DOMAIN.len() + 6]
+            .copy_from_slice(&self.cert.node_mac);
+        msg[CERT_REQ_SIG_DOMAIN.len() + 6..].copy_from_slice(&requester.0);
+        let mut sig = [0u8; SIG_LEN];
+        sig.copy_from_slice(sig_bytes);
+        if !verify_signature(&verified.ed_pubkey, &msg, &sig) {
+            tracing::trace!(
+                "auth: dropping cert request with an invalid self-authentication signature"
+            );
+            return None;
+        }
+
+        if !self.accept_cert_request_rate(requester) {
+            tracing::trace!(?requester, "auth: rate-limiting repeated cert request");
+            return None;
+        }
+
+        let pairwise_key = self.keypair.pairwise_key(&verified.x_pubkey);
+        self.cache_neighbor(NeighborKeys {
+            cert: verified,
+            pairwise_key,
+            raw_cert: *cert,
+        });
+        Some(requester)
+    }
+
+    /// Accept a `CertReq` from `requester` only if at least
+    /// [`CERT_REQ_RATE_LIMIT_SECS`] has passed since the last one accepted
+    /// from them, recording the acceptance on success. The first request
+    /// from a requester is always accepted.
+    fn accept_cert_request_rate(&mut self, requester: Mac) -> bool {
+        if let Some(entry) = self.cert_req_rate.iter_mut().find(|(m, _)| *m == requester) {
+            if self.now_unix.saturating_sub(entry.1) < CERT_REQ_RATE_LIMIT_SECS {
+                return false;
+            }
+            entry.1 = self.now_unix;
+            return true;
+        }
+        if self.cert_req_rate.push((requester, self.now_unix)).is_err() {
+            // Table full: overwrite the first entry rather than refusing a
+            // legitimate new requester outright (bounded, simple eviction —
+            // mirrors `cache_neighbor`'s policy).
+            tracing::debug!("auth: cert-request rate-limit table full; evicting an entry");
+            if let Some(first) = self.cert_req_rate.first_mut() {
+                *first = (requester, self.now_unix);
+            }
+        }
+        true
+    }
+
+    /// Whether a `CertReply` to `requester` is currently parked, pending a
+    /// route becoming available.
+    pub fn has_pending_reply(&self, requester: Mac) -> bool {
+        self.pending_replies
+            .iter()
+            .any(|p| p.requester == requester)
+    }
+
+    /// Park (or refresh) a verified requester's reply, to be sent once a
+    /// route to them appears. Bounded ([`MAX_PENDING_REPLIES`]) and TTL'd
+    /// ([`PENDING_REPLY_TTL_SECS`], garbage-collected by
+    /// [`set_time`](Self::set_time)); the requester's own retry
+    /// ([`build_cert_request`](Self::build_cert_request) backoff) is the
+    /// backstop if this node is never flushed or the entry is evicted.
+    pub fn park_pending_reply(&mut self, requester: Mac) {
+        if let Some(entry) = self
+            .pending_replies
+            .iter_mut()
+            .find(|p| p.requester == requester)
+        {
+            entry.parked_unix = self.now_unix;
+            return;
+        }
+        let entry = PendingReply {
+            requester,
+            parked_unix: self.now_unix,
+        };
+        if self.pending_replies.push(entry).is_err() {
+            // Table full: overwrite the first (bounded, simple eviction).
+            tracing::debug!("auth: pending-reply table full; evicting an entry");
+            if let Some(first) = self.pending_replies.first_mut() {
+                *first = entry;
+            }
+        }
+    }
+
+    /// Clear a parked pending reply, once it has been sent.
+    pub fn clear_pending_reply(&mut self, requester: Mac) {
+        if let Some(i) = self
+            .pending_replies
+            .iter()
+            .position(|p| p.requester == requester)
+        {
+            self.pending_replies.swap_remove(i);
+        }
     }
 
     /// Parse and ingest every [`TvlvType::Revoke`] record in an OGM `tail`.
@@ -719,7 +1184,7 @@ mod tests {
         let (mut buf, len) = bare_ogm(mac(2), 7);
         let len = a.augment_ogm(&mut buf, len).expect("augment");
 
-        assert!(b.verify_ogm(&buf[..len]));
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
         assert_eq!(b.neighbors().len(), 1);
         assert_eq!(b.neighbor_x_pubkey(mac(2)), Some(a.cert.x_pubkey));
     }
@@ -735,7 +1200,7 @@ mod tests {
         let (mut buf, len) = bare_ogm(mac(2), 7);
         let len = a.augment_ogm(&mut buf, len).expect("augment");
 
-        assert!(b.verify_ogm(&buf[..len]));
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
         let n = b.neighbors().first().expect("one neighbor");
         assert_eq!(n.cert.mac, mac(2));
         assert_eq!(n.cert.not_after, 4242, "neighbor's cert expiry is recorded");
@@ -747,7 +1212,7 @@ mod tests {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut b = member(&authority, 3, mac(3), 1000);
         let (buf, len) = bare_ogm(mac(2), 7);
-        assert!(!b.verify_ogm(&buf[..len]));
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
     }
 
     /// A tampered signature fails verification.
@@ -759,7 +1224,7 @@ mod tests {
         let (mut buf, len) = bare_ogm(mac(2), 7);
         let len = a.augment_ogm(&mut buf, len).unwrap();
         buf[len - 1] ^= 0xff; // flip a signature byte
-        assert!(!b.verify_ogm(&buf[..len]));
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
     }
 
     /// An OGM from a node holding a cert for a *different* MAC than the
@@ -772,7 +1237,7 @@ mod tests {
         let mut b = member(&authority, 3, mac(3), 1000);
         let (mut buf, len) = bare_ogm(mac(9), 7);
         let len = a.augment_ogm(&mut buf, len).unwrap();
-        assert!(!b.verify_ogm(&buf[..len]));
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
     }
 
     /// A node from another mesh (different trust anchor) is rejected — the
@@ -785,7 +1250,7 @@ mod tests {
         let mut b = member(&ours, 3, mac(3), 1000);
         let (mut buf, len) = bare_ogm(mac(2), 7);
         let len = foreign.augment_ogm(&mut buf, len).unwrap();
-        assert!(!b.verify_ogm(&buf[..len]));
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
     }
 
     /// An expired cert (now past not_after) is rejected.
@@ -797,7 +1262,7 @@ mod tests {
         b.set_time(2000); // past a's not_after = 1000
         let (mut buf, len) = bare_ogm(mac(2), 7);
         let len = a.augment_ogm(&mut buf, len).unwrap();
-        assert!(!b.verify_ogm(&buf[..len]));
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
     }
 
     /// A revoked originator is dropped even with a still-valid signature/cert.
@@ -810,7 +1275,7 @@ mod tests {
         assert!(b.ingest_revocation(&record));
         let (mut buf, len) = bare_ogm(mac(2), 7);
         let len = a.augment_ogm(&mut buf, len).unwrap();
-        assert!(!b.verify_ogm(&buf[..len]));
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
     }
 
     /// A revocation whose effective instant (`not_before`) is still in the
@@ -825,12 +1290,12 @@ mod tests {
         let (mut buf, len) = bare_ogm(mac(2), 7);
         let len = a.augment_ogm(&mut buf, len).unwrap();
         // Not yet effective, so the OGM is still accepted.
-        assert!(b.verify_ogm(&buf[..len]));
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
         // Once the clock reaches the effective instant, the node is dropped.
         b.set_time(500);
         let (mut buf, len) = bare_ogm(mac(2), 8);
         let len = a.augment_ogm(&mut buf, len).unwrap();
-        assert!(!b.verify_ogm(&buf[..len]));
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
     }
 
     /// An invalid (forged) revocation is ignored: `ingest_revocation` returns
@@ -845,7 +1310,7 @@ mod tests {
         assert!(!b.ingest_revocation(&forged));
         let (mut buf, len) = bare_ogm(mac(2), 7);
         let len = a.augment_ogm(&mut buf, len).unwrap();
-        assert!(b.verify_ogm(&buf[..len]));
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
     }
 
     /// Ingesting the same revocation twice records it once and reports the
@@ -875,7 +1340,7 @@ mod tests {
         let (mut buf, len) = bare_ogm(mac(2), 7);
         let len = a.augment_ogm(&mut buf, len).unwrap();
         // The OGM now carries the revocation TVLV; verifying it on `b` ingests it.
-        assert!(b.verify_ogm(&buf[..len]));
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
         assert!(b.revoked_macs().any(|m| m == mac(9)));
     }
 
@@ -1020,7 +1485,7 @@ mod tests {
         buf[TVLV_LEN_OFF..TVLV_LEN_OFF + 2].copy_from_slice(&(mcast_record as u16).to_be_bytes());
 
         let len = a.augment_ogm(&mut buf, len).unwrap();
-        assert!(b.verify_ogm(&buf[..len]));
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
         // The mcast TVLV is still findable after the appended records.
         assert_eq!(
             find_tvlv(&buf[OGM_HDR..len], batman::wire::TvlvType::Mcast),
@@ -1028,15 +1493,80 @@ mod tests {
         );
     }
 
+    /// `augment_ogm_lazy` writes a `CertFp` TVLV (not `Cert`) with no cert
+    /// bytes on the wire, yet a first-time receiver (nothing cached yet)
+    /// correctly reports `NeedCert` — it cannot verify a fingerprint it has
+    /// no cert for — with the right fingerprint for a subsequent fetch.
+    #[test]
+    fn augment_ogm_lazy_emits_fingerprint_not_cert() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm_lazy(&mut buf, len).unwrap();
+
+        // No Cert TVLV at all — only the 8-byte fingerprint.
+        assert!(find_tvlv(&buf[OGM_HDR..len], TvlvType::Cert).is_none());
+        assert_eq!(
+            find_tvlv(&buf[OGM_HDR..len], TvlvType::CertFp),
+            Some(&a.cert.fingerprint()[..])
+        );
+
+        assert_eq!(
+            b.verify_ogm(&buf[..len]),
+            OgmVerdict::NeedCert {
+                orig: mac(2),
+                fp: a.cert.fingerprint(),
+            }
+        );
+    }
+
+    /// Once the receiver has cached the sender's cert (e.g. via a prior
+    /// fetch), a lazily-augmented OGM verifies from the cache — the
+    /// steady-state, zero-cert-bytes-on-the-wire path.
+    #[test]
+    fn augment_ogm_lazy_verifies_against_cache() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        // Prime the cache with one legacy-format OGM.
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        // Every subsequent OGM can be lazy.
+        let (mut buf, len) = bare_ogm(mac(2), 8);
+        let len = a.augment_ogm_lazy(&mut buf, len).unwrap();
+        assert!(find_tvlv(&buf[OGM_HDR..len], TvlvType::Cert).is_none());
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+    }
+
+    /// `augment_ogm_lazy` still attaches pending revocations, exactly like
+    /// `augment_ogm` — the lazy cert-distribution switch does not disable
+    /// the revocation-flooding mechanism.
+    #[test]
+    fn augment_ogm_lazy_still_floods_revocations() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let record = authority.revoke(mac(9), 0, 1000);
+        assert!(a.ingest_revocation(&record));
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm_lazy(&mut buf, len).unwrap();
+        assert!(find_tvlv(&buf[OGM_HDR..len], TvlvType::Revoke).is_some());
+    }
+
     /// Exchange OGMs both ways so `a` and `b` each cache the other's verified
     /// pairwise key (a precondition for tagging/verifying directed frames).
     fn mutual_verify(a: &mut OgmAuth, a_mac: Mac, b: &mut OgmAuth, b_mac: Mac) {
         let (mut buf, len) = bare_ogm(a_mac, 1);
         let len = a.augment_ogm(&mut buf, len).unwrap();
-        assert!(b.verify_ogm(&buf[..len]));
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
         let (mut buf, len) = bare_ogm(b_mac, 1);
         let len = b.augment_ogm(&mut buf, len).unwrap();
-        assert!(a.verify_ogm(&buf[..len]));
+        assert_eq!(a.verify_ogm(&buf[..len]), OgmVerdict::Verified);
     }
 
     /// A directed frame tagged for a verified neighbor verifies on the other end
@@ -1142,6 +1672,618 @@ mod tests {
         assert!(
             !a.verify_directed(mac(3), frame, &trailer),
             "an A->B frame must not verify as a B->A frame"
+        );
+    }
+
+    /// Verifying a neighbor's OGM caches its raw certificate bytes (not just the
+    /// derived `VerifiedCert`), retrievable by MAC alongside the cert's
+    /// fingerprint — the store lazy cert distribution resolves fingerprints
+    /// against.
+    #[test]
+    fn neighbor_cert_lookup_returns_cached_bytes() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        let (cached_cert, cached_fp) = b.neighbor_cert(mac(2)).expect("cached after verify");
+        assert_eq!(cached_cert.as_bytes(), a.cert.as_bytes());
+        assert_eq!(cached_fp, a.cert.fingerprint());
+    }
+
+    /// An unknown MAC has no cached cert.
+    #[test]
+    fn neighbor_cert_lookup_none_for_unknown_mac() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let b = member(&authority, 3, mac(3), 1000);
+        assert!(b.neighbor_cert(mac(2)).is_none());
+    }
+
+    /// A rotated cert for an already-known MAC (same node, new keys) overwrites
+    /// the stored bytes and fingerprint in place, rather than leaving the old
+    /// cert cached alongside the new one.
+    #[test]
+    fn neighbor_cert_rotation_updates_stored_bytes_and_fingerprint() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let mut a1 = member(&authority, 2, mac(2), 1000);
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a1.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+        let (_, fp1) = b.neighbor_cert(mac(2)).expect("cached after first verify");
+
+        // Same MAC, freshly issued cert with different keys — a rotation.
+        let mut a2 = member(&authority, 9, mac(2), 1000);
+        let (mut buf, len) = bare_ogm(mac(2), 8);
+        let len = a2.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        let (cached_cert, fp2) = b
+            .neighbor_cert(mac(2))
+            .expect("still cached after rotation");
+        assert_ne!(fp1, fp2, "rotation must change the fingerprint");
+        assert_eq!(cached_cert.as_bytes(), a2.cert.as_bytes());
+    }
+
+    /// Once the neighbor table is at capacity, a newly verified neighbor evicts
+    /// the crude first slot (matching `cache_neighbor`'s eviction policy) —
+    /// its cached cert is gone too, not just its `VerifiedCert`.
+    #[test]
+    fn neighbor_cert_evicted_with_table_slot() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 100, mac(100), 1_000_000);
+
+        // Fill the table to capacity with distinct originators.
+        for n in 1..=MAX_NEIGHBOR_KEYS as u8 {
+            let mut a = member(&authority, n, mac(n), 1_000_000);
+            let (mut buf, len) = bare_ogm(mac(n), 1);
+            let len = a.augment_ogm(&mut buf, len).unwrap();
+            assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+        }
+        assert_eq!(b.neighbors().len(), MAX_NEIGHBOR_KEYS);
+        assert!(
+            b.neighbor_cert(mac(1)).is_some(),
+            "first entry present pre-eviction"
+        );
+
+        // One more distinct originator: the crude policy overwrites slot 0.
+        let mut over = member(&authority, 200, mac(200), 1_000_000);
+        let (mut buf, len) = bare_ogm(mac(200), 1);
+        let len = over.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        assert!(
+            b.neighbor_cert(mac(1)).is_none(),
+            "evicted neighbor's cert must be gone, not just its VerifiedCert"
+        );
+        assert!(b.neighbor_cert(mac(200)).is_some());
+    }
+
+    /// Build a "lazy" OGM: header + `CertFp` (not `Cert`) + `OgmSig`, signed
+    /// exactly as `augment_ogm` would (over the full cert bytes) — the shape
+    /// lazy cert distribution's requester side must resolve from its cache.
+    fn augment_ogm_with_certfp(auth: &mut OgmAuth, buf: &mut [u8], len: usize) -> usize {
+        let cert = auth.cert;
+        let cert_bytes = cert.as_bytes();
+        let mut orig = [0u8; 6];
+        orig.copy_from_slice(&buf[ORIG_OFF..ORIG_OFF + 6]);
+        let mut seqno = [0u8; 4];
+        seqno.copy_from_slice(&buf[SEQNO_OFF..SEQNO_OFF + 4]);
+        let signature = {
+            let signed =
+                OgmAuth::signed_message(&orig, &seqno, cert_bytes, &mut auth.sign_scratch).unwrap();
+            auth.keypair.sign(signed)
+        };
+        let fp = cert.fingerprint();
+        let mut off = len;
+        off = OgmAuth::write_tvlv(buf, off, TvlvType::CertFp, &fp);
+        off = OgmAuth::write_tvlv(buf, off, TvlvType::OgmSig, &signature);
+        let tvlv_len = (off - len) as u16;
+        buf[TVLV_LEN_OFF..TVLV_LEN_OFF + 2].copy_from_slice(&tvlv_len.to_be_bytes());
+        off
+    }
+
+    /// A fingerprint-only OGM from a never-seen originator cannot be verified
+    /// (nothing cached to check the fingerprint against) — `verify_ogm` must
+    /// ask for the cert rather than reject or (worse) accept unverified.
+    #[test]
+    fn certfp_ogm_from_unknown_originator_needs_cert() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = augment_ogm_with_certfp(&mut a, &mut buf, len);
+
+        let expected_fp = a.cert.fingerprint();
+        assert_eq!(
+            b.verify_ogm(&buf[..len]),
+            OgmVerdict::NeedCert {
+                orig: mac(2),
+                fp: expected_fp
+            }
+        );
+    }
+
+    /// Once the cert is cached (e.g. via an ordinary legacy-format OGM), a
+    /// later fingerprint-only OGM from the same originator verifies against
+    /// the cached bytes with zero cert bytes on the wire.
+    #[test]
+    fn certfp_ogm_verifies_against_cached_cert() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        // Prime the cache with a full-cert OGM first.
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        // A subsequent fingerprint-only OGM verifies from the cache.
+        let (mut buf, len) = bare_ogm(mac(2), 8);
+        let len = augment_ogm_with_certfp(&mut a, &mut buf, len);
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+    }
+
+    /// A rotated cert (new keys, same MAC) changes the fingerprint, so a
+    /// fingerprint-only OGM after rotation is a cache miss (`NeedCert`) even
+    /// though *a* cert for that MAC is still cached — a stale cert must not
+    /// silently verify a rotated identity's signature.
+    #[test]
+    fn certfp_ogm_after_rotation_needs_cert() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let mut a1 = member(&authority, 2, mac(2), 1000);
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a1.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        // Rotation: same MAC, freshly issued cert with different keys.
+        let mut a2 = member(&authority, 9, mac(2), 1000);
+        let (mut buf, len) = bare_ogm(mac(2), 8);
+        let len = augment_ogm_with_certfp(&mut a2, &mut buf, len);
+
+        let expected_fp = a2.cert.fingerprint();
+        assert_eq!(
+            b.verify_ogm(&buf[..len]),
+            OgmVerdict::NeedCert {
+                orig: mac(2),
+                fp: expected_fp
+            }
+        );
+    }
+
+    /// A tampered signature on a fingerprint-only OGM is rejected even
+    /// though the fingerprint matches a cached cert — the cache only selects
+    /// which cert to check against, it is not itself a trust boundary.
+    #[test]
+    fn certfp_ogm_tampered_signature_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        let (mut buf, len) = bare_ogm(mac(2), 8);
+        let len = augment_ogm_with_certfp(&mut a, &mut buf, len);
+        buf[len - 1] ^= 0xff; // flip a signature byte
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
+    }
+
+    /// An expired cached cert still fails a fingerprint-matched OGM: the
+    /// full anchor/expiry/revocation pipeline re-runs against the cached
+    /// bytes on every OGM, not just at cache-population time.
+    #[test]
+    fn certfp_ogm_expired_cached_cert_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        b.set_time(2000); // past a's not_after = 1000
+        let (mut buf, len) = bare_ogm(mac(2), 8);
+        let len = augment_ogm_with_certfp(&mut a, &mut buf, len);
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
+    }
+
+    /// `build_cert_request` produces a self-authenticating body (the
+    /// requester's own cert followed by a signature) that a verifier can
+    /// check with nothing more than the requester's cert and the requested
+    /// originator's MAC — the responder-side verification this sets up for.
+    #[test]
+    fn build_cert_request_produces_self_authenticating_body() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let mut buf = [0u8; 512];
+        let len = b
+            .build_cert_request(mac(2), [0xAA; 8], mac(9), &mut buf)
+            .expect("first request must be sent");
+
+        let cert_len = core::mem::size_of::<MembershipCert>();
+        assert_eq!(len, cert_len + SIG_LEN);
+        let (cert, sig_bytes) = buf[..len].split_at(cert_len);
+        let (parsed_cert, _) = MembershipCert::ref_from_prefix(cert).unwrap();
+        assert_eq!(
+            parsed_cert.node_mac,
+            mac(3).0,
+            "carries the requester's own cert"
+        );
+
+        let mut msg = [0u8; CERT_REQ_SIG_DOMAIN.len() + 12];
+        msg[..CERT_REQ_SIG_DOMAIN.len()].copy_from_slice(CERT_REQ_SIG_DOMAIN);
+        msg[CERT_REQ_SIG_DOMAIN.len()..CERT_REQ_SIG_DOMAIN.len() + 6].copy_from_slice(&mac(2).0);
+        msg[CERT_REQ_SIG_DOMAIN.len() + 6..].copy_from_slice(&mac(3).0);
+        let mut sig = [0u8; SIG_LEN];
+        sig.copy_from_slice(sig_bytes);
+        assert!(verify_signature(&parsed_cert.ed_pubkey, &msg, &sig));
+    }
+
+    /// A second request for the same originator, before the retry backoff
+    /// elapses, is suppressed (deduped) rather than re-sent — the
+    /// requester-side half of keeping cert-fetch chatter bounded.
+    #[test]
+    fn build_cert_request_dedups_within_backoff() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let mut buf = [0u8; 512];
+        assert!(
+            b.build_cert_request(mac(2), [0xAA; 8], mac(9), &mut buf)
+                .is_some()
+        );
+        assert!(
+            b.build_cert_request(mac(2), [0xAA; 8], mac(9), &mut buf)
+                .is_none(),
+            "an immediate re-request for the same originator must be suppressed"
+        );
+
+        // Once the backoff interval elapses, a retry is allowed again.
+        b.set_time(b.now_unix + CERT_REQUEST_RETRY_SECS);
+        assert!(
+            b.build_cert_request(mac(2), [0xAA; 8], mac(9), &mut buf)
+                .is_some(),
+            "a retry after the backoff window must be allowed"
+        );
+    }
+
+    /// The retry budget is finite: once exhausted, further calls are
+    /// suppressed for good rather than retrying forever.
+    #[test]
+    fn build_cert_request_retry_budget_is_finite() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        let mut buf = [0u8; 512];
+
+        for round in 0..MAX_CERT_REQUEST_ATTEMPTS {
+            assert!(
+                b.build_cert_request(mac(2), [0xAA; 8], mac(9), &mut buf)
+                    .is_some()
+            );
+            // Skip the final advance: exhaustion must block a request made
+            // in the *same* window the budget ran out, before any clock
+            // advance has had a chance to reclaim the slot (see
+            // `in_flight_table_reclaims_exhausted_entries` for that case).
+            if round + 1 < MAX_CERT_REQUEST_ATTEMPTS {
+                b.set_time(b.now_unix + CERT_REQUEST_RETRY_SECS);
+            }
+        }
+        assert!(
+            b.build_cert_request(mac(2), [0xAA; 8], mac(9), &mut buf)
+                .is_none(),
+            "retry budget exhausted"
+        );
+    }
+
+    /// Requests for distinct originators are tracked independently.
+    #[test]
+    fn build_cert_request_tracks_distinct_originators_independently() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        let mut buf = [0u8; 512];
+
+        assert!(
+            b.build_cert_request(mac(2), [0xAA; 8], mac(9), &mut buf)
+                .is_some()
+        );
+        assert!(
+            b.build_cert_request(mac(5), [0xBB; 8], mac(9), &mut buf)
+                .is_some(),
+            "a different originator must not be suppressed by the first's backoff"
+        );
+    }
+
+    /// A valid `CertReply` answering an outstanding request is cached and
+    /// clears the in-flight entry.
+    #[test]
+    fn ingest_cert_reply_caches_and_clears_in_flight() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        let mut buf = [0u8; 512];
+        b.build_cert_request(mac(2), [0xAA; 8], mac(9), &mut buf)
+            .unwrap();
+
+        let a = member(&authority, 2, mac(2), 1000);
+        assert!(b.ingest_cert_reply(a.cert.as_bytes()));
+        let (cached, fp) = b.neighbor_cert(mac(2)).expect("cached after reply");
+        assert_eq!(cached.as_bytes(), a.cert.as_bytes());
+        assert_eq!(fp, a.cert.fingerprint());
+
+        // The in-flight entry is cleared: an unsolicited second reply for the
+        // same MAC (no outstanding request now) is rejected.
+        assert!(!b.ingest_cert_reply(a.cert.as_bytes()));
+    }
+
+    /// An unsolicited reply — no outstanding request for that MAC — is
+    /// rejected, so a spoofed/unprompted `CertReply` cannot poison the cache.
+    #[test]
+    fn ingest_cert_reply_unsolicited_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        let a = member(&authority, 2, mac(2), 1000);
+        assert!(!b.ingest_cert_reply(a.cert.as_bytes()));
+        assert!(b.neighbor_cert(mac(2)).is_none());
+    }
+
+    /// A reply body too short to contain a `MembershipCert` is rejected
+    /// rather than panicking.
+    #[test]
+    fn ingest_cert_reply_malformed_body_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        let mut buf = [0u8; 512];
+        b.build_cert_request(mac(2), [0xAA; 8], mac(9), &mut buf)
+            .unwrap();
+        assert!(!b.ingest_cert_reply(&[0u8; 10]));
+        assert!(b.neighbor_cert(mac(2)).is_none());
+    }
+
+    /// A reply carrying a cert that fails anchor verification (foreign mesh)
+    /// is rejected even though a request is outstanding for that MAC.
+    #[test]
+    fn ingest_cert_reply_foreign_mesh_rejected() {
+        let ours = Authority::from_seed(&[1; 32], 0xABCD);
+        let theirs = Authority::from_seed(&[9; 32], 0xABCD);
+        let mut b = member(&ours, 3, mac(3), 1000);
+        let mut buf = [0u8; 512];
+        b.build_cert_request(mac(2), [0xAA; 8], mac(9), &mut buf)
+            .unwrap();
+
+        let foreign = member(&theirs, 2, mac(2), 1000);
+        assert!(!b.ingest_cert_reply(foreign.cert.as_bytes()));
+        assert!(b.neighbor_cert(mac(2)).is_none());
+    }
+
+    /// A well-formed `CertReq` body (built with the real requester-side
+    /// `build_cert_request`) verifies at the responder, yielding the
+    /// requester's MAC and caching their cert — a free, verified exchange.
+    #[test]
+    fn verify_cert_request_accepts_valid_request_and_caches_requester() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000); // responder ("A")
+        let mut requester = member(&authority, 3, mac(3), 1000);
+
+        let mut buf = [0u8; 512];
+        let len = requester
+            .build_cert_request(mac(2), [0; 8], mac(9), &mut buf)
+            .unwrap();
+
+        assert_eq!(a.verify_cert_request(&buf[..len]), Some(mac(3)));
+        let (cached, fp) = a.neighbor_cert(mac(3)).expect("requester cert cached");
+        assert_eq!(cached.as_bytes(), requester.cert.as_bytes());
+        assert_eq!(fp, requester.cert.fingerprint());
+    }
+
+    /// A body of the wrong length (not exactly cert+signature) is rejected.
+    #[test]
+    fn verify_cert_request_rejects_malformed_body() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        assert_eq!(a.verify_cert_request(&[0u8; 10]), None);
+    }
+
+    /// A tampered self-authentication signature is rejected even though the
+    /// requester's cert itself is valid.
+    #[test]
+    fn verify_cert_request_rejects_tampered_signature() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut requester = member(&authority, 3, mac(3), 1000);
+        let mut buf = [0u8; 512];
+        let len = requester
+            .build_cert_request(mac(2), [0; 8], mac(9), &mut buf)
+            .unwrap();
+        buf[len - 1] ^= 0xff;
+        assert_eq!(a.verify_cert_request(&buf[..len]), None);
+    }
+
+    /// A requester from a foreign mesh (different trust anchor) is rejected.
+    #[test]
+    fn verify_cert_request_rejects_foreign_mesh() {
+        let ours = Authority::from_seed(&[1; 32], 0xABCD);
+        let theirs = Authority::from_seed(&[9; 32], 0xABCD);
+        let mut a = member(&ours, 2, mac(2), 1000);
+        let mut requester = member(&theirs, 3, mac(3), 1000);
+        let mut buf = [0u8; 512];
+        let len = requester
+            .build_cert_request(mac(2), [0; 8], mac(9), &mut buf)
+            .unwrap();
+        assert_eq!(a.verify_cert_request(&buf[..len]), None);
+    }
+
+    /// A `CertReq` from a revoked requester is rejected even though its cert
+    /// still passes anchor verification — a revoked member cannot use a
+    /// still-valid cert to have the responder answer or cache it.
+    #[test]
+    fn verify_cert_request_rejects_revoked_requester() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut requester = member(&authority, 3, mac(3), 1000);
+        let record = authority.revoke(mac(3), 0, 1000);
+        assert!(a.ingest_revocation(&record));
+
+        let mut buf = [0u8; 512];
+        let len = requester
+            .build_cert_request(mac(2), [0; 8], mac(9), &mut buf)
+            .unwrap();
+        assert_eq!(a.verify_cert_request(&buf[..len]), None);
+        assert!(a.neighbor_cert(mac(3)).is_none());
+    }
+
+    /// Repeated requests from the same requester within the rate-limit
+    /// window are dropped; once the window elapses, requests are accepted
+    /// again — bounding the verification/airtime cost one member can impose.
+    #[test]
+    fn verify_cert_request_rate_limits_repeated_requests() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut requester = member(&authority, 3, mac(3), 1000);
+        let mut buf = [0u8; 512];
+        let len = requester
+            .build_cert_request(mac(2), [0; 8], mac(9), &mut buf)
+            .unwrap();
+
+        assert_eq!(a.verify_cert_request(&buf[..len]), Some(mac(3)));
+        assert_eq!(
+            a.verify_cert_request(&buf[..len]),
+            None,
+            "an immediate repeat must be rate-limited"
+        );
+
+        a.set_time(a.now_unix + CERT_REQ_RATE_LIMIT_SECS);
+        assert_eq!(
+            a.verify_cert_request(&buf[..len]),
+            Some(mac(3)),
+            "a request after the rate-limit window must be accepted"
+        );
+    }
+
+    /// A forged request replaying a real member's public cert (certs are not
+    /// secret) with a garbage signature must not consume that member's
+    /// rate-limit slot — otherwise an attacker who never held the member's
+    /// private key could keep it permanently "hot" and deny the member's own
+    /// genuine, correctly-signed request. Proof-of-possession must be
+    /// checked before the rate limiter is touched.
+    #[test]
+    fn verify_cert_request_forged_signature_does_not_consume_rate_limit_slot() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut requester = member(&authority, 3, mac(3), 1000);
+        let mut buf = [0u8; 512];
+        let len = requester
+            .build_cert_request(mac(2), [0; 8], mac(9), &mut buf)
+            .unwrap();
+
+        // Attacker replays the requester's real (public, non-secret) cert
+        // bytes but with a garbage signature — cannot prove possession.
+        let mut forged = buf;
+        forged[len - 1] ^= 0xff;
+        assert_eq!(a.verify_cert_request(&forged[..len]), None);
+
+        // The real requester's genuine, correctly-signed request — sent
+        // immediately after, well within the rate-limit window — must still
+        // succeed: the forged attempt above must not have consumed the slot.
+        assert_eq!(
+            a.verify_cert_request(&buf[..len]),
+            Some(mac(3)),
+            "a forged request must not deny the real requester's own request"
+        );
+    }
+
+    /// The in-flight request table reclaims entries whose retry budget is
+    /// exhausted, so a target that never answers (unreachable, or an
+    /// attacker flooding fake fingerprint misses) cannot permanently pin
+    /// slots and block fetching any other originator's cert.
+    #[test]
+    fn in_flight_table_reclaims_exhausted_entries() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1_000_000);
+        let mut buf = [0u8; 512];
+
+        // Fill the table with originators that never answer, advancing all
+        // of them in lockstep so every one reaches exhaustion in the same
+        // round — without an intervening `set_time` (which prunes) letting
+        // any of them get reclaimed mid-fill.
+        for round in 0..MAX_CERT_REQUEST_ATTEMPTS {
+            for n in 1..=MAX_IN_FLIGHT_CERT_REQUESTS as u8 {
+                assert!(
+                    b.build_cert_request(mac(n), [n; 8], mac(9), &mut buf)
+                        .is_some()
+                );
+            }
+            if round + 1 < MAX_CERT_REQUEST_ATTEMPTS {
+                b.set_time(b.now_unix + CERT_REQUEST_RETRY_SECS);
+            }
+        }
+        // The table is now full of exhausted entries: a new originator is
+        // refused.
+        assert!(
+            b.build_cert_request(mac(200), [0; 8], mac(9), &mut buf)
+                .is_none(),
+            "table full of exhausted entries must refuse a new originator"
+        );
+
+        // Advancing the clock (any amount, since these entries never retry
+        // again on their own) must reclaim the exhausted slots via the
+        // periodic prune.
+        b.set_time(b.now_unix + 1);
+        assert!(
+            b.build_cert_request(mac(200), [0; 8], mac(9), &mut buf)
+                .is_some(),
+            "a reclaimed slot must admit a new originator"
+        );
+    }
+
+    /// A parked pending reply is visible via `has_pending_reply` until
+    /// cleared.
+    #[test]
+    fn park_pending_reply_then_clear() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        assert!(!a.has_pending_reply(mac(3)));
+        a.park_pending_reply(mac(3));
+        assert!(a.has_pending_reply(mac(3)));
+        a.clear_pending_reply(mac(3));
+        assert!(!a.has_pending_reply(mac(3)));
+    }
+
+    /// A parked pending reply is evicted once its TTL elapses (garbage
+    /// collected on the next clock advance, mirroring revocation GC).
+    #[test]
+    fn park_pending_reply_evicted_after_ttl() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        a.park_pending_reply(mac(3));
+        assert!(a.has_pending_reply(mac(3)));
+        a.set_time(a.now_unix + PENDING_REPLY_TTL_SECS);
+        assert!(
+            !a.has_pending_reply(mac(3)),
+            "a stale pending reply must be evicted after its TTL"
+        );
+    }
+
+    /// Parking again for an already-parked requester refreshes its
+    /// timestamp rather than adding a duplicate entry.
+    #[test]
+    fn park_pending_reply_refreshes_existing_entry() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        a.park_pending_reply(mac(3));
+        a.set_time(a.now_unix + PENDING_REPLY_TTL_SECS - 1);
+        a.park_pending_reply(mac(3)); // refresh before it would expire
+        a.set_time(a.now_unix + PENDING_REPLY_TTL_SECS - 1);
+        assert!(
+            a.has_pending_reply(mac(3)),
+            "the refreshed entry must not have expired yet"
         );
     }
 }
