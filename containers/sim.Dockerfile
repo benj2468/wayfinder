@@ -88,6 +88,7 @@ server:
 # routing, no OGM emission) until they install a valid membership cert via
 # \`set-auth\` below — an unauthenticated node must never act as a router.
 require_auth: true
+lazy_cert_distribution: true
 YAML
 
 # Provider (certificate-authority) node: it alone holds the mesh root seed

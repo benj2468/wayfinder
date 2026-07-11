@@ -21,7 +21,8 @@ pub use wayfinder_auth;
 use batman::{
     BatmanEngine,
     wire::{
-        BATADV_BCAST, BATADV_IV_OGM, BATADV_MCAST, BATADV_UNICAST, BatmanBroadcastPacket,
+        BATADV_BCAST, BATADV_CERT_REPLY, BATADV_CERT_REQ, BATADV_IV_OGM, BATADV_MCAST,
+        BATADV_UNICAST, BatmanBroadcastPacket, BatmanCertReplyPacket, BatmanCertReqPacket,
         BatmanMcastPacket, BatmanUnicastPacket, ETH_P_BATMAN,
     },
 };
@@ -32,7 +33,7 @@ use interfaces::{
     link::LinkMetrics,
 };
 use tracing::{debug, info, trace, warn};
-use zerocopy::IntoBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
     auth::OgmAuth,
@@ -313,6 +314,15 @@ pub struct CentralRouter {
     /// with no cert yet still routes in the open, unauthenticated mode. See
     /// [`auth_locked`](CentralRouter::auth_locked).
     require_auth: bool,
+    /// Lazy cert distribution: when `true`, [`poll`](CentralRouter::poll)
+    /// emits an OGM cert fingerprint instead of the full cert (see
+    /// [`OgmAuth::augment_ogm_lazy`]). `false` (the default) preserves
+    /// today's behavior. Set from
+    /// [`Config::lazy_cert_distribution`](crate::config::Config::lazy_cert_distribution)
+    /// via [`set_lazy_cert_distribution`](CentralRouter::set_lazy_cert_distribution).
+    /// Receiving already tolerates both wire forms unconditionally (see
+    /// [`OgmAuth::verify_ogm`]); only what this node *emits* is gated.
+    lazy_cert_distribution: bool,
     /// Count of locally originated host frames dropped because they did not fit
     /// in the transmit buffer once wrapped in mesh encapsulation — i.e. the host
     /// sent a frame larger than the mesh can carry (a misconfigured MTU).  A
@@ -342,6 +352,7 @@ impl CentralRouter {
             iface_count: 0,
             auth: None,
             require_auth: false,
+            lazy_cert_distribution: false,
             oversize_drops: 0,
             runtime_config_active: false,
         }
@@ -416,6 +427,16 @@ impl CentralRouter {
     /// [`set_auth`]: CentralRouter::set_auth
     pub fn set_require_auth(&mut self, require: bool) {
         self.require_auth = require;
+    }
+
+    /// Set the lazy-cert-distribution policy: when `true`,
+    /// [`poll`](CentralRouter::poll) emits a cert fingerprint on this node's
+    /// OGMs instead of the full cert. Typically set once at startup from
+    /// [`Config::lazy_cert_distribution`](crate::config::Config::lazy_cert_distribution).
+    /// A flag-day cutover — every node on the mesh must be upgraded (able to
+    /// resolve fingerprints via fetch) before any node flips this to `true`.
+    pub fn set_lazy_cert_distribution(&mut self, lazy: bool) {
+        self.lazy_cert_distribution = lazy;
     }
 
     /// Whether this node is required to authenticate but has no membership
@@ -565,12 +586,53 @@ impl CentralRouter {
                 // them until the pairwise data-plane tag lands; see auth.rs scope.
                 if frame.payload.first() == Some(&BATADV_IV_OGM)
                     && let Some(auth) = self.auth.as_mut()
-                    && !auth.verify_ogm(&frame.payload)
                 {
-                    return RxOutcome {
-                        forward: None,
-                        deliver_local: None,
-                    };
+                    match auth.verify_ogm(&frame.payload) {
+                        auth::OgmVerdict::Verified => {}
+                        auth::OgmVerdict::Rejected => {
+                            return RxOutcome {
+                                forward: None,
+                                deliver_local: None,
+                            };
+                        }
+                        auth::OgmVerdict::NeedCert { orig, fp } => {
+                            // We have no route to `orig` yet — `verify_ogm`
+                            // gates before the engine sees this OGM, so
+                            // nothing installed one. Seed the first hop with
+                            // the OGM's actual link source (`frame.src`),
+                            // which by construction has a route to `orig`
+                            // (it just relayed/originated this OGM). This
+                            // copy is dropped either way; the next emission
+                            // after the fetch resolves verifies normally.
+                            let hdr_len = core::mem::size_of::<BatmanCertReqPacket>();
+                            let forward = if hdr_len <= tx_buf.len()
+                                && let Some(body_len) = auth.build_cert_request(
+                                    orig,
+                                    fp,
+                                    frame.src,
+                                    &mut tx_buf[hdr_len..],
+                                ) {
+                                let req_hdr = BatmanCertReqPacket {
+                                    packet_type: BATADV_CERT_REQ,
+                                    version: 5,
+                                    ttl: 50,
+                                    dest: orig,
+                                };
+                                tx_buf[..hdr_len].copy_from_slice(req_hdr.as_bytes());
+                                Some(LinkFrameData {
+                                    dst: frame.src,
+                                    protocol: ETH_P_BATMAN,
+                                    payload: &tx_buf[..hdr_len + body_len],
+                                })
+                            } else {
+                                None
+                            };
+                            return RxOutcome {
+                                forward,
+                                deliver_local: None,
+                            };
+                        }
+                    }
                 }
 
                 // If verifying that OGM folded in a *new* revocation, snap the
@@ -605,6 +667,33 @@ impl CentralRouter {
                                 protocol: reply.protocol,
                                 payload: &reply.payload[..len],
                             })
+                        } else if frame.payload.first() == Some(&BATADV_IV_OGM)
+                            && let Ok((ogm, _)) =
+                                batman::wire::BatmanOgmPacket::ref_from_prefix(&frame.payload)
+                            && let Some(auth) = self.auth.as_mut()
+                        {
+                            // This OGM itself needed no re-flood (the common
+                            // case), leaving the forward slot free.
+                            // Opportunistically flush a pending `CertReply`
+                            // for its originator, now that verifying it
+                            // (re)confirms a route back to them (design doc
+                            // §3.3/§5.4). A genuine re-flood always wins the
+                            // slot; a skipped flush here is not a
+                            // correctness issue — the requester's own retry
+                            // (`OgmAuth::build_cert_request`) is the
+                            // backstop.
+                            Self::try_flush_pending_cert_reply(
+                                auth,
+                                &self.batman,
+                                now,
+                                ogm.orig,
+                                &mut reply,
+                            )
+                            .map(|(next, total)| LinkFrameData {
+                                dst: next,
+                                protocol: ETH_P_BATMAN,
+                                payload: &reply.payload[..total],
+                            })
                         } else {
                             None
                         };
@@ -627,14 +716,113 @@ impl CentralRouter {
                             deliver_local: None,
                         }
                     }
-                    RoutingAction::DeliverLocal => {
-                        // Hand the inner frame up to the local host, stripping
-                        // the BATMAN header that carried it here.
-                        RxOutcome {
-                            forward: None,
-                            deliver_local: frame.payload.get(Self::inner_offset(&frame.payload)..),
+                    RoutingAction::DeliverLocal => match frame.payload.first() {
+                        Some(&BATADV_CERT_REPLY) => {
+                            // Terminates in our own auth state, never the
+                            // host TAP: verify against the trust anchor,
+                            // confirm it answers an outstanding request, and
+                            // cache it.
+                            if let Some(auth) = self.auth.as_mut() {
+                                let body = frame
+                                    .payload
+                                    .get(Self::inner_offset(&frame.payload)..)
+                                    .unwrap_or(&[]);
+                                auth.ingest_cert_reply(body);
+                            }
+                            RxOutcome::empty()
                         }
-                    }
+                        Some(&BATADV_CERT_REQ) => {
+                            // Terminates here: this node is the originator
+                            // whose cert was requested (the terminal-only
+                            // responder — an intermediate holder answering
+                            // early is a deferred optimization). Verify the
+                            // requester's self-authenticating body, then
+                            // either answer immediately (a route exists) or
+                            // park it for the opportunistic flush above.
+                            let body = frame
+                                .payload
+                                .get(Self::inner_offset(&frame.payload)..)
+                                .unwrap_or(&[]);
+                            let requester = self
+                                .auth
+                                .as_mut()
+                                .and_then(|auth| auth.verify_cert_request(body));
+                            let Some(requester) = requester else {
+                                return RxOutcome::empty();
+                            };
+
+                            let hdr_len = core::mem::size_of::<BatmanCertReplyPacket>();
+                            #[expect(
+                                clippy::expect_used,
+                                reason = "requester came from self.auth.verify_cert_request, so auth must still be Some"
+                            )]
+                            let own_cert = *self
+                                .auth
+                                .as_ref()
+                                .expect("auth present: requester was just verified through it")
+                                .own_cert();
+                            let cert_bytes = own_cert.as_bytes();
+                            let total = hdr_len + cert_bytes.len();
+
+                            match self.batman.next_hop(now, requester) {
+                                Some(next) if total <= reply.payload.len() => {
+                                    let reply_hdr = BatmanCertReplyPacket {
+                                        packet_type: BATADV_CERT_REPLY,
+                                        version: 5,
+                                        ttl: 50,
+                                        dest: requester,
+                                    };
+                                    reply.payload[..hdr_len].copy_from_slice(reply_hdr.as_bytes());
+                                    reply.payload[hdr_len..total].copy_from_slice(cert_bytes);
+                                    return RxOutcome {
+                                        forward: Some(LinkFrameData {
+                                            dst: next,
+                                            protocol: ETH_P_BATMAN,
+                                            payload: &reply.payload[..total],
+                                        }),
+                                        deliver_local: None,
+                                    };
+                                }
+                                Some(_) => {
+                                    // A route exists, but the reply doesn't
+                                    // fit the transmit buffer — a local MTU
+                                    // misconfiguration (own cert + header is
+                                    // a fixed ~165 bytes), not "no route
+                                    // yet". Parking it wouldn't help (the
+                                    // opportunistic flush hits the same
+                                    // buffer), but the requester's own retry
+                                    // is a harmless no-op backstop either
+                                    // way, so park it anyway rather than add
+                                    // a second silent-drop path.
+                                    debug!(
+                                        total,
+                                        buf_len = reply.payload.len(),
+                                        "auth: cert reply does not fit the transmit buffer"
+                                    );
+                                }
+                                None => {
+                                    trace!(?requester, "auth: no route to cert requester yet");
+                                }
+                            }
+                            // Park it for the opportunistic flush once
+                            // verifying one of the requester's OGMs confirms
+                            // a route back.
+                            if let Some(auth) = self.auth.as_mut() {
+                                auth.park_pending_reply(requester);
+                            }
+                            RxOutcome::empty()
+                        }
+                        _ => {
+                            // Hand the inner frame up to the local host, stripping
+                            // the BATMAN header that carried it here.
+                            RxOutcome {
+                                forward: None,
+                                deliver_local: frame
+                                    .payload
+                                    .get(Self::inner_offset(&frame.payload)..),
+                            }
+                        }
+                    },
                     RoutingAction::DeliverLocalAndForward(_next) => {
                         // A fresh broadcast: deliver the inner frame locally
                         // *and* propagate the re-flood the engine wrote into
@@ -677,8 +865,54 @@ impl CentralRouter {
             Some(&BATADV_UNICAST) => core::mem::size_of::<BatmanUnicastPacket>(),
             Some(&BATADV_MCAST) => core::mem::size_of::<BatmanMcastPacket>(),
             Some(&BATADV_BCAST) => core::mem::size_of::<BatmanBroadcastPacket>(),
+            Some(&BATADV_CERT_REQ) => core::mem::size_of::<BatmanCertReqPacket>(),
+            Some(&BATADV_CERT_REPLY) => core::mem::size_of::<BatmanCertReplyPacket>(),
             _ => 0,
         }
+    }
+
+    /// After an OGM that itself needed no re-flood, opportunistically flush
+    /// a parked pending `CertReply` for that OGM's originator (`orig`), now
+    /// that verifying it (re)confirms a route back to them (design doc
+    /// §3.3/§5.4). Builds the reply — this node's own cert, since a pending
+    /// reply is only ever parked for *this* node's own cert request (the
+    /// terminal-only responder; see [`OgmAuth::verify_cert_request`]) —
+    /// into `reply`'s scratch buffer and clears the pending entry only on
+    /// full success (route resolved and the buffer had room), so a failed
+    /// attempt leaves the entry parked for the next opportunity. Returns the
+    /// next hop and the written length; the caller (which owns `reply`
+    /// directly) builds the final borrowed [`LinkFrameData`] from it, since
+    /// that borrow cannot outlive this function's own `&mut` parameter.
+    fn try_flush_pending_cert_reply(
+        auth: &mut auth::OgmAuth,
+        batman: &BatmanEngine<ORIGINATOR_CAPACITY>,
+        now: Duration,
+        orig: Mac,
+        reply: &mut LinkFrameDataMut<'_>,
+    ) -> Option<(Mac, usize)> {
+        if !auth.has_pending_reply(orig) {
+            return None;
+        }
+        let next = batman.next_hop(now, orig)?;
+        let cert = *auth.own_cert();
+        let cert_bytes = cert.as_bytes();
+        let hdr_len = core::mem::size_of::<BatmanCertReplyPacket>();
+        let total = hdr_len + cert_bytes.len();
+        if total > reply.payload.len() {
+            return None;
+        }
+        let hdr = BatmanCertReplyPacket {
+            packet_type: BATADV_CERT_REPLY,
+            version: 5,
+            ttl: 50,
+            dest: orig,
+        };
+        reply.payload[..hdr_len].copy_from_slice(hdr.as_bytes());
+        reply.payload[hdr_len..total].copy_from_slice(cert_bytes);
+        reply.dst = next;
+        reply.protocol = ETH_P_BATMAN;
+        auth.clear_pending_reply(orig);
+        Some((next, total))
     }
 
     /// Decide how to deliver a multicast frame for `group`: as individual
@@ -770,11 +1004,29 @@ impl CentralRouter {
             .produce_periodic_broadcast(now, tx_buf)
             .map(|p| p.len());
         if let Some(len) = produced {
-            // When auth is enabled, append our cert + OGM signature so peers can
-            // verify this OGM; the engine already wrote the base OGM into tx_buf.
+            // When auth is enabled, append our cert (or, under lazy cert
+            // distribution, just its fingerprint) + OGM signature so peers
+            // can verify this OGM; the engine already wrote the base OGM
+            // into tx_buf.
             let final_len = match self.auth.as_mut() {
-                Some(auth) => auth.augment_ogm(tx_buf, len).unwrap_or(len),
-                None => len,
+                Some(auth) if self.lazy_cert_distribution => auth.augment_ogm_lazy(tx_buf, len),
+                Some(auth) => auth.augment_ogm(tx_buf, len),
+                None => Some(len),
+            };
+            let Some(final_len) = final_len else {
+                // Augmentation failed (buffer too small for the cert/
+                // fingerprint + signature, or `tvlv_len` would overflow).
+                // Never fall back to broadcasting the un-augmented,
+                // unsigned OGM the engine already wrote into `tx_buf`: an
+                // auth-enabled peer would reject it, but an open node on a
+                // mixed mesh would install a route to this node with zero
+                // cryptographic backing — fail-open on exactly the guarantee
+                // this feature exists to provide. Suppress this emission
+                // instead; the next Trickle round retries.
+                warn!(
+                    "auth: dropping OGM emission — augmentation failed (buffer too small for the mesh MTU?)"
+                );
+                return None;
             };
             // Flood the OGM out of every radio interface to map the surrounding topology
             return Some(LinkFrameData {
@@ -1281,6 +1533,348 @@ mod cp2_local_delivery {
         assert_eq!(hdr.orig, mac(1)); // our own ident
         assert!(hdr.ttl > 1);
         assert_eq!(&rest[..INNER.len()], INNER);
+    }
+}
+
+#[cfg(test)]
+mod cert_control_delivery {
+    //! Lazy-cert-distribution control packets (`BATADV_CERT_REQ` /
+    //! `BATADV_CERT_REPLY`) are routed like a unicast, but must never leak to
+    //! the local host/TAP the way an ordinary unicast's inner payload does —
+    //! they are consumed internally by the router's auth state
+    //! (`ingest_cert_reply`/`verify_cert_request`, exercised for real in
+    //! `mod cert_responder` below). This module only checks the routing/
+    //! non-leak contract in isolation.
+
+    use super::*;
+    use batman::wire::{
+        BATADV_CERT_REPLY, BATADV_CERT_REQ, BatmanCertReplyPacket, BatmanCertReqPacket,
+    };
+    use interfaces::frame::{LinkFrame, Mac};
+    use zerocopy::{FromBytes, IntoBytes};
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    fn link_frame_bytes(src: u8, dst: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(mac(dst).as_bytes());
+        v.extend_from_slice(mac(src).as_bytes());
+        v.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// A `CertReq` addressed to us reaches local delivery at the engine layer
+    /// (`RoutingAction::DeliverLocal`) but must not be surfaced to the host —
+    /// unlike a unicast, `deliver_local` must stay `None`.
+    #[test]
+    fn cert_req_for_self_is_not_delivered_to_host() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+
+        let mut payload = Vec::new();
+        let hdr = BatmanCertReqPacket {
+            packet_type: BATADV_CERT_REQ,
+            version: 5,
+            ttl: 50,
+            dest: mac(1),
+        };
+        payload.extend_from_slice(hdr.as_bytes());
+        payload.extend_from_slice(b"requester cert + sig");
+
+        let bytes = link_frame_bytes(2, 1, &payload);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+
+        let mut tx = [0u8; 256];
+        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx);
+
+        assert!(
+            outcome.deliver_local.is_none(),
+            "cert-control payloads must never reach the host TAP"
+        );
+        assert!(outcome.forward.is_none());
+    }
+
+    /// A `CertReply` addressed to us is likewise not surfaced to the host.
+    #[test]
+    fn cert_reply_for_self_is_not_delivered_to_host() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+
+        let mut payload = Vec::new();
+        let hdr = BatmanCertReplyPacket {
+            packet_type: BATADV_CERT_REPLY,
+            version: 5,
+            ttl: 50,
+            dest: mac(1),
+        };
+        payload.extend_from_slice(hdr.as_bytes());
+        payload.extend_from_slice(b"the requested cert");
+
+        let bytes = link_frame_bytes(2, 1, &payload);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+
+        let mut tx = [0u8; 256];
+        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx);
+
+        assert!(outcome.deliver_local.is_none());
+        assert!(outcome.forward.is_none());
+    }
+
+    /// A `CertReq` not addressed to us is still relayed toward the next hop,
+    /// exactly like an ordinary unicast — only local delivery is special-cased.
+    #[test]
+    fn cert_req_for_other_node_is_still_forwarded() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+
+        // Learn a route to node 5 via node 2 (a bare OGM is enough with auth
+        // disabled).
+        let ogm_hdr_len = core::mem::size_of::<batman::wire::BatmanOgmPacket>();
+        let mut ogm_payload = vec![0u8; ogm_hdr_len];
+        let ogm = batman::wire::BatmanOgmPacket {
+            packet_type: batman::wire::BATADV_IV_OGM,
+            version: 5,
+            ttl: 50,
+            flags: 0,
+            seqno: 1u32.to_be(),
+            orig: mac(5),
+            reserved: 0,
+            tq: 255,
+            tvlv_len: 0,
+        };
+        ogm_payload.copy_from_slice(ogm.as_bytes());
+        let ogm_bytes = link_frame_bytes(2, 0xff, &ogm_payload);
+        let ogm_frame = LinkFrame::ref_from_bytes(&ogm_bytes).unwrap();
+        let mut tx = [0u8; 256];
+        router.handle_frame(core::time::Duration::ZERO, 0, ogm_frame, &mut tx);
+
+        let mut payload = Vec::new();
+        let hdr = BatmanCertReqPacket {
+            packet_type: BATADV_CERT_REQ,
+            version: 5,
+            ttl: 10,
+            dest: mac(5),
+        };
+        payload.extend_from_slice(hdr.as_bytes());
+        payload.extend_from_slice(b"cert body");
+
+        let bytes = link_frame_bytes(3, 1, &payload);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+
+        let mut tx = [0u8; 256];
+        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx);
+
+        let fwd = outcome.forward.expect("expected a relay toward node 5");
+        assert_eq!(fwd.dst, mac(2)); // next hop toward node 5
+        let (fwd_hdr, rest) = BatmanCertReqPacket::ref_from_prefix(fwd.payload).unwrap();
+        assert_eq!(fwd_hdr.ttl, 9);
+        assert_eq!(&rest[..b"cert body".len()], b"cert body");
+        assert!(outcome.deliver_local.is_none());
+    }
+}
+
+#[cfg(test)]
+mod cert_responder {
+    //! The responder half of lazy cert distribution: a locally-delivered
+    //! `CertReq` (this node is the terminal originator whose cert was
+    //! asked for) is answered immediately when a route to the requester
+    //! exists, or parked and flushed opportunistically once one appears.
+
+    use super::*;
+    use batman::wire::{
+        BATADV_CERT_REPLY, BATADV_IV_OGM, BatmanCertReplyPacket, BatmanCertReqPacket,
+        BatmanOgmPacket,
+    };
+    use interfaces::frame::{LinkFrame, Mac};
+    use zerocopy::{FromBytes, IntoBytes};
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    fn link_frame_bytes(src: u8, dst: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(mac(dst).as_bytes());
+        v.extend_from_slice(mac(src).as_bytes());
+        v.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// A signed OGM from `orig` (via `orig_auth`), to prime the responder's
+    /// route table and cert cache — a 1-hop OGM, so the neighbor discovered
+    /// is `orig` itself.
+    fn signed_ogm(orig_auth: &mut auth::OgmAuth, orig: Mac, seqno: u32, ttl: u8) -> Vec<u8> {
+        let ogm_hdr_len = core::mem::size_of::<BatmanOgmPacket>();
+        let mut buf = vec![0u8; 512];
+        let ogm = BatmanOgmPacket {
+            packet_type: BATADV_IV_OGM,
+            version: 5,
+            ttl,
+            flags: 0,
+            seqno: seqno.to_be(),
+            orig,
+            reserved: 0,
+            tq: 255,
+            tvlv_len: 0,
+        };
+        buf[..ogm_hdr_len].copy_from_slice(ogm.as_bytes());
+        let len = orig_auth.augment_ogm(&mut buf, ogm_hdr_len).unwrap();
+        buf.truncate(len);
+        buf
+    }
+
+    /// A `CertReq` from a requester we already have a route to is answered
+    /// immediately with this node's own cert, addressed back toward the
+    /// requester's next hop.
+    #[test]
+    fn cert_req_answered_immediately_when_route_exists() {
+        let authority = wayfinder_auth::Authority::from_seed(&[1; 32], 0xABCD);
+        let responder_kp = wayfinder_auth::Keypair::from_seed(&[1; 32]);
+        let responder_cert = authority.issue_cert(
+            mac(1),
+            responder_kp.ed_pubkey(),
+            responder_kp.x_pubkey(),
+            0,
+            1000,
+        );
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        router.set_auth(auth::OgmAuth::new(
+            responder_kp,
+            responder_cert,
+            authority.trust_anchor(),
+        ));
+        router.auth_mut().unwrap().set_time(100);
+
+        let requester_kp = wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let requester_cert = authority.issue_cert(
+            mac(3),
+            requester_kp.ed_pubkey(),
+            requester_kp.x_pubkey(),
+            0,
+            1000,
+        );
+        let mut requester_auth =
+            auth::OgmAuth::new(requester_kp, requester_cert, authority.trust_anchor());
+        requester_auth.set_time(100);
+
+        // Prime a direct route + cert cache from the requester (mac(3)).
+        let ogm_bytes = signed_ogm(&mut requester_auth, mac(3), 1, 50);
+        let ogm_frame_bytes = link_frame_bytes(3, 0xff, &ogm_bytes);
+        let ogm_frame = LinkFrame::ref_from_bytes(&ogm_frame_bytes).unwrap();
+        let mut tx = [0u8; 512];
+        router.handle_frame(core::time::Duration::ZERO, 0, ogm_frame, &mut tx);
+        assert_eq!(router.originator_table().count(), 1);
+
+        // The requester asks for our (mac(1)'s) cert.
+        let mut req_buf = [0u8; 512];
+        let req_len = requester_auth
+            .build_cert_request(mac(1), [0; 8], mac(3), &mut req_buf)
+            .unwrap();
+        let mut payload = Vec::new();
+        let hdr = BatmanCertReqPacket {
+            packet_type: batman::wire::BATADV_CERT_REQ,
+            version: 5,
+            ttl: 50,
+            dest: mac(1),
+        };
+        payload.extend_from_slice(hdr.as_bytes());
+        payload.extend_from_slice(&req_buf[..req_len]);
+        let req_frame_bytes = link_frame_bytes(3, 1, &payload);
+        let req_frame = LinkFrame::ref_from_bytes(&req_frame_bytes).unwrap();
+
+        let mut tx = [0u8; 512];
+        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, req_frame, &mut tx);
+
+        let fwd = outcome
+            .forward
+            .expect("must answer immediately: a route exists");
+        assert_eq!(fwd.dst, mac(3));
+        let (reply_hdr, cert_bytes) = BatmanCertReplyPacket::ref_from_prefix(fwd.payload).unwrap();
+        assert_eq!(reply_hdr.packet_type, BATADV_CERT_REPLY);
+        assert_eq!(reply_hdr.dest, mac(3));
+        assert_eq!(
+            &cert_bytes[..core::mem::size_of::<wayfinder_auth::MembershipCert>()],
+            router.auth().unwrap().own_cert().as_bytes()
+        );
+        assert!(outcome.deliver_local.is_none());
+    }
+
+    /// A `CertReq` from a requester we have no route to yet is parked, not
+    /// answered — and later flushed once an OGM from that requester (that
+    /// itself needs no re-flood) confirms a route back.
+    #[test]
+    fn cert_req_parked_then_flushed_by_later_ogm() {
+        let authority = wayfinder_auth::Authority::from_seed(&[1; 32], 0xABCD);
+        let responder_kp = wayfinder_auth::Keypair::from_seed(&[1; 32]);
+        let responder_cert = authority.issue_cert(
+            mac(1),
+            responder_kp.ed_pubkey(),
+            responder_kp.x_pubkey(),
+            0,
+            1000,
+        );
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        router.set_auth(auth::OgmAuth::new(
+            responder_kp,
+            responder_cert,
+            authority.trust_anchor(),
+        ));
+        router.auth_mut().unwrap().set_time(100);
+
+        let requester_kp = wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let requester_cert = authority.issue_cert(
+            mac(3),
+            requester_kp.ed_pubkey(),
+            requester_kp.x_pubkey(),
+            0,
+            1000,
+        );
+        let mut requester_auth =
+            auth::OgmAuth::new(requester_kp, requester_cert, authority.trust_anchor());
+        requester_auth.set_time(100);
+
+        // No prior OGM from the requester: no route yet.
+        let mut req_buf = [0u8; 512];
+        let req_len = requester_auth
+            .build_cert_request(mac(1), [0; 8], mac(3), &mut req_buf)
+            .unwrap();
+        let mut payload = Vec::new();
+        let hdr = BatmanCertReqPacket {
+            packet_type: batman::wire::BATADV_CERT_REQ,
+            version: 5,
+            ttl: 50,
+            dest: mac(1),
+        };
+        payload.extend_from_slice(hdr.as_bytes());
+        payload.extend_from_slice(&req_buf[..req_len]);
+        let req_frame_bytes = link_frame_bytes(3, 1, &payload);
+        let req_frame = LinkFrame::ref_from_bytes(&req_frame_bytes).unwrap();
+
+        let mut tx = [0u8; 512];
+        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, req_frame, &mut tx);
+        assert!(outcome.forward.is_none(), "no route yet: must not answer");
+        assert!(
+            router.auth().unwrap().has_pending_reply(mac(3)),
+            "the request must be parked"
+        );
+
+        // An OGM from the requester arrives with ttl=1 so it needs no
+        // re-flood, leaving the forward slot free for the opportunistic
+        // flush.
+        let ogm_bytes = signed_ogm(&mut requester_auth, mac(3), 1, 1);
+        let ogm_frame_bytes = link_frame_bytes(3, 0xff, &ogm_bytes);
+        let ogm_frame = LinkFrame::ref_from_bytes(&ogm_frame_bytes).unwrap();
+        let mut tx = [0u8; 512];
+        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, ogm_frame, &mut tx);
+
+        let fwd = outcome
+            .forward
+            .expect("the parked reply must be flushed once a route appears");
+        assert_eq!(fwd.dst, mac(3));
+        let (reply_hdr, _) = BatmanCertReplyPacket::ref_from_prefix(fwd.payload).unwrap();
+        assert_eq!(reply_hdr.packet_type, BATADV_CERT_REPLY);
+        assert!(!router.auth().unwrap().has_pending_reply(mac(3)));
     }
 }
 
@@ -2095,5 +2689,80 @@ mod ogm_auth_integration {
             outcome.deliver_local.is_none(),
             "a locked node must not locally deliver a data-plane frame"
         );
+    }
+}
+
+#[cfg(test)]
+mod lazy_cert_distribution_switchover {
+    //! `Config::lazy_cert_distribution` / `CentralRouter::set_lazy_cert_distribution`
+    //! switch what a node *emits* on its OGMs (full cert vs. fingerprint);
+    //! receiving already tolerates both unconditionally (Phase 3).
+
+    use super::*;
+    use batman::wire::{TvlvType, find_tvlv};
+    use interfaces::frame::Mac;
+    use wayfinder_auth::{Authority, Keypair};
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    fn router_with_auth(authority: &Authority, m: Mac, seed: u8) -> CentralRouter {
+        let kp = Keypair::from_seed(&[seed; 32]);
+        let cert = authority.issue_cert(m, kp.ed_pubkey(), kp.x_pubkey(), 0, 1000);
+        let mut r = CentralRouter::new(m);
+        let mut auth = crate::auth::OgmAuth::new(kp, cert, authority.trust_anchor());
+        auth.set_time(100);
+        r.set_auth(auth);
+        r
+    }
+
+    /// With the flag off (the default), a router's OGMs still carry the full
+    /// cert, exactly as before this feature existed.
+    #[test]
+    fn flag_off_emits_full_cert() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = router_with_auth(&authority, mac(1), 2);
+        let mut tx = [0u8; 1500];
+        let ogm = a.poll(core::time::Duration::ZERO, &mut tx).unwrap().payload;
+        let hdr_len = core::mem::size_of::<batman::wire::BatmanOgmPacket>();
+        assert!(find_tvlv(&ogm[hdr_len..], TvlvType::Cert).is_some());
+        assert!(find_tvlv(&ogm[hdr_len..], TvlvType::CertFp).is_none());
+    }
+
+    /// With the flag on, a router's OGMs carry only the 8-byte fingerprint —
+    /// zero cert bytes on the wire.
+    #[test]
+    fn flag_on_emits_fingerprint_only() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = router_with_auth(&authority, mac(1), 2);
+        a.set_lazy_cert_distribution(true);
+        let mut tx = [0u8; 1500];
+        let ogm = a.poll(core::time::Duration::ZERO, &mut tx).unwrap().payload;
+        let hdr_len = core::mem::size_of::<batman::wire::BatmanOgmPacket>();
+        assert!(find_tvlv(&ogm[hdr_len..], TvlvType::Cert).is_none());
+        assert!(find_tvlv(&ogm[hdr_len..], TvlvType::CertFp).is_some());
+    }
+
+    /// If the transmit buffer is too small to append the cert/fingerprint +
+    /// signature, `poll` must suppress the emission entirely — never fall
+    /// back to broadcasting the un-augmented, unsigned OGM the engine wrote.
+    /// Fail closed on the exact guarantee auth exists to provide, not open.
+    #[test]
+    fn augmentation_failure_suppresses_emission_rather_than_broadcasting_unsigned() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = router_with_auth(&authority, mac(1), 2);
+        let hdr_len = core::mem::size_of::<batman::wire::BatmanOgmPacket>();
+        // Room for the bare OGM header only — nowhere near enough for a
+        // cert/fingerprint plus a 64-byte signature.
+        let mut tx = vec![0u8; hdr_len + 8];
+        assert!(
+            a.poll(core::time::Duration::ZERO, &mut tx).is_none(),
+            "must suppress emission rather than broadcast an unsigned OGM"
+        );
+
+        // Same for the lazy path.
+        a.set_lazy_cert_distribution(true);
+        assert!(a.poll(core::time::Duration::ZERO, &mut tx).is_none());
     }
 }

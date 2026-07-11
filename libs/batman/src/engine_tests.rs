@@ -1356,6 +1356,339 @@ mod mcast_packet {
 }
 
 #[cfg(test)]
+mod cert_forwarding {
+    //! The lazy-cert-distribution control packets (`BATADV_CERT_REQ` /
+    //! `BATADV_CERT_REPLY`), structurally identical to `BATADV_UNICAST` and
+    //! routed the same way: delivered locally on arrival at `dest`, relayed
+    //! toward the next live hop otherwise. Crypto-free at the engine layer —
+    //! the engine only moves bytes; verification lives in the router's auth
+    //! state.
+
+    use super::*;
+    use crate::wire::{
+        BATADV_CERT_REPLY, BATADV_CERT_REQ, BatmanCertReplyPacket, BatmanCertReqPacket,
+    };
+
+    fn make_cert_req(dest: u8, ttl: u8, payload: &[u8]) -> Vec<u8> {
+        let hdr = BatmanCertReqPacket {
+            packet_type: BATADV_CERT_REQ,
+            version: 5,
+            ttl,
+            dest: mac(dest),
+        };
+        let mut data = hdr.as_bytes().to_vec();
+        data.extend_from_slice(payload);
+        data
+    }
+
+    fn make_cert_reply(dest: u8, ttl: u8, payload: &[u8]) -> Vec<u8> {
+        let hdr = BatmanCertReplyPacket {
+            packet_type: BATADV_CERT_REPLY,
+            version: 5,
+            ttl,
+            dest: mac(dest),
+        };
+        let mut data = hdr.as_bytes().to_vec();
+        data.extend_from_slice(payload);
+        data
+    }
+
+    /// A `BATADV_CERT_REQ` addressed to us is delivered locally (to the
+    /// router's auth state), like a unicast-for-self.
+    #[test]
+    fn cert_req_for_self_delivers_local() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        let payload = make_cert_req(1, 10, b"requester cert + sig");
+        let frame_bytes = make_link_frame(2, 1, ETH_P_BATMAN, payload);
+        let frame = parse_link_frame(&frame_bytes);
+
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
+
+        assert!(matches!(action, RoutingAction::DeliverLocal));
+    }
+
+    /// An intermediate node forwards a `BATADV_CERT_REQ` toward the next hop
+    /// for the requested originator, decrementing TTL and preserving the
+    /// requester's cert+signature body.
+    #[test]
+    fn cert_req_forwarded_to_next_hop() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        // Learn a route to node 5 via node 2.
+        let ogm = make_ogm(5, 1, 255, 50);
+        let frame_ogm = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_ogm),
+            None,
+            &mut reply,
+        );
+
+        // A CertReq for node 5 arrives; forward it toward node 2.
+        let payload = make_cert_req(5, 10, b"cert body");
+        let frame_bytes = make_link_frame(3, 1, ETH_P_BATMAN, payload);
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            None,
+            &mut reply,
+        );
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.dst, mac(2)); // next hop toward node 5
+        assert_eq!(reply.protocol, ETH_P_BATMAN);
+        let (fwd, rest) = BatmanCertReqPacket::ref_from_prefix(reply.payload).unwrap();
+        assert_eq!(fwd.packet_type, BATADV_CERT_REQ);
+        assert_eq!(fwd.dest, mac(5)); // final destination unchanged
+        assert_eq!(fwd.ttl, 9); // decremented from 10
+        assert_eq!(&rest[..b"cert body".len()], b"cert body");
+    }
+
+    /// A relay whose egress `reply` buffer is too small for the relayed
+    /// header + body must drop the packet, not panic.
+    #[test]
+    fn cert_req_relay_skipped_when_reply_buffer_too_small() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        let ogm = make_ogm(5, 1, 255, 50);
+        let frame_ogm = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
+        let mut big_buf = [0u8; 256];
+        let mut warmup_reply = LinkFrameDataMut::from(&mut big_buf[..]);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_ogm),
+            None,
+            &mut warmup_reply,
+        );
+
+        let payload = make_cert_req(5, 10, b"cert body");
+        let frame_bytes = make_link_frame(3, 1, ETH_P_BATMAN, payload);
+
+        let header_size = core::mem::size_of::<BatmanCertReqPacket>();
+        let mut reply_buffer = vec![0u8; header_size];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
+
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            None,
+            &mut reply,
+        );
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.protocol, 0); // not forwarded
+        assert_eq!(engine.relay_oversize_drops(), 1);
+    }
+
+    /// A `BATADV_CERT_REPLY` addressed to us is delivered locally.
+    #[test]
+    fn cert_reply_for_self_delivers_local() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        let payload = make_cert_reply(1, 10, b"the requested cert");
+        let frame_bytes = make_link_frame(2, 1, ETH_P_BATMAN, payload);
+        let frame = parse_link_frame(&frame_bytes);
+
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
+
+        assert!(matches!(action, RoutingAction::DeliverLocal));
+    }
+
+    /// An intermediate node forwards a `BATADV_CERT_REPLY` toward the next hop
+    /// for the original requester, decrementing TTL and preserving the cert
+    /// body.
+    #[test]
+    fn cert_reply_forwarded_to_next_hop() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        // Learn a route to node 5 via node 2.
+        let ogm = make_ogm(5, 1, 255, 50);
+        let frame_ogm = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_ogm),
+            None,
+            &mut reply,
+        );
+
+        // A CertReply for node 5 arrives; forward it toward node 2.
+        let payload = make_cert_reply(5, 10, b"cert body");
+        let frame_bytes = make_link_frame(3, 1, ETH_P_BATMAN, payload);
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            None,
+            &mut reply,
+        );
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.dst, mac(2)); // next hop toward node 5
+        assert_eq!(reply.protocol, ETH_P_BATMAN);
+        let (fwd, rest) = BatmanCertReplyPacket::ref_from_prefix(reply.payload).unwrap();
+        assert_eq!(fwd.packet_type, BATADV_CERT_REPLY);
+        assert_eq!(fwd.dest, mac(5));
+        assert_eq!(fwd.ttl, 9);
+        assert_eq!(&rest[..b"cert body".len()], b"cert body");
+    }
+
+    /// A relay whose egress `reply` buffer is too small for the relayed
+    /// header + body must drop the packet, not panic.
+    #[test]
+    fn cert_reply_relay_skipped_when_reply_buffer_too_small() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        let ogm = make_ogm(5, 1, 255, 50);
+        let frame_ogm = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
+        let mut big_buf = [0u8; 256];
+        let mut warmup_reply = LinkFrameDataMut::from(&mut big_buf[..]);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_ogm),
+            None,
+            &mut warmup_reply,
+        );
+
+        let payload = make_cert_reply(5, 10, b"cert body");
+        let frame_bytes = make_link_frame(3, 1, ETH_P_BATMAN, payload);
+
+        let header_size = core::mem::size_of::<BatmanCertReplyPacket>();
+        let mut reply_buffer = vec![0u8; header_size];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
+
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            None,
+            &mut reply,
+        );
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.protocol, 0); // not forwarded
+        assert_eq!(engine.relay_oversize_drops(), 1);
+    }
+
+    /// A `BATADV_CERT_REQ` with an expired TTL is dropped rather than
+    /// relayed, mirroring `unicast_forwarding::test_unicast_ttl_expiration`.
+    #[test]
+    fn cert_req_ttl_expiration() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        let ogm = make_ogm(5, 1, 255, 50);
+        let frame_ogm = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
+        let mut reply_buffer = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_ogm),
+            None,
+            &mut reply,
+        );
+
+        // A fresh reply buffer: the warmup OGM above was itself re-flooded,
+        // so the shared buffer's `protocol` would otherwise still hold that
+        // stale value rather than reflecting this call.
+        let mut reply_buffer2 = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer2[..]);
+        let payload = make_cert_req(5, 1, b"cert body");
+        let frame_bytes = make_link_frame(3, 1, ETH_P_BATMAN, payload);
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            None,
+            &mut reply,
+        );
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.protocol, 0); // not forwarded, TTL expired
+    }
+
+    /// A `BATADV_CERT_REQ` for an unknown destination is dropped, mirroring
+    /// `unicast_forwarding::test_unicast_unknown_destination`.
+    #[test]
+    fn cert_req_unknown_destination() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        let payload = make_cert_req(99, 10, b"cert body");
+        let frame_bytes = make_link_frame(2, 1, ETH_P_BATMAN, payload);
+        let mut reply_buffer = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            None,
+            &mut reply,
+        );
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.protocol, 0); // no route known
+    }
+
+    /// A `BATADV_CERT_REPLY` with an expired TTL is dropped rather than
+    /// relayed.
+    #[test]
+    fn cert_reply_ttl_expiration() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        let ogm = make_ogm(5, 1, 255, 50);
+        let frame_ogm = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
+        let mut reply_buffer = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_ogm),
+            None,
+            &mut reply,
+        );
+
+        // A fresh reply buffer: the warmup OGM above was itself re-flooded,
+        // so the shared buffer's `protocol` would otherwise still hold that
+        // stale value rather than reflecting this call.
+        let mut reply_buffer2 = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer2[..]);
+        let payload = make_cert_reply(5, 1, b"cert body");
+        let frame_bytes = make_link_frame(3, 1, ETH_P_BATMAN, payload);
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            None,
+            &mut reply,
+        );
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.protocol, 0); // not forwarded, TTL expired
+    }
+
+    /// A `BATADV_CERT_REPLY` for an unknown destination is dropped.
+    #[test]
+    fn cert_reply_unknown_destination() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        let payload = make_cert_reply(99, 10, b"cert body");
+        let frame_bytes = make_link_frame(2, 1, ETH_P_BATMAN, payload);
+        let mut reply_buffer = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            None,
+            &mut reply,
+        );
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.protocol, 0); // no route known
+    }
+}
+
+#[cfg(test)]
 mod route_expiry {
     use core::time::Duration;
 

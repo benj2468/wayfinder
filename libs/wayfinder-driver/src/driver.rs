@@ -20,6 +20,7 @@ use interfaces::link::LinkMetrics;
 use tokio::time::sleep;
 use tracing::{trace, warn};
 use wayfinder::auth::DIRECTED_TRAILER_LEN;
+use wayfinder::batman::wire::{BATADV_CERT_REPLY, BATADV_CERT_REQ};
 use wayfinder::config::TrickleConfig;
 use wayfinder::interfaces::frame::{LinkFrame, LinkFrameData, MAX_LINK_FRAME_LEN, Mac};
 use wayfinder::{CentralRouter, DEFAULT_BATMAN_ETHER_TYPE, EgressInterface, McastPlan};
@@ -442,18 +443,35 @@ fn poll_due_ogms(
     out
 }
 
+/// Whether `payload`'s BATMAN sub-type is a lazy-cert-distribution control
+/// packet (`BATADV_CERT_REQ`/`BATADV_CERT_REPLY`). These are addressed to a
+/// specific node like a directed data-plane frame, but are *not* pairwise-
+/// tagged: they carry their own self-authenticating signature (the
+/// requester's cert + signature, or the anchor-verified reply cert), checked
+/// independently of any neighbor pairwise key — which a freshly discovered
+/// neighbor is exactly the case that has none yet.
+fn is_cert_control(payload: &[u8]) -> bool {
+    matches!(
+        payload.first(),
+        Some(&BATADV_CERT_REQ) | Some(&BATADV_CERT_REPLY)
+    )
+}
+
 /// Verify and strip the pairwise tag trailer from a directed data-plane frame
 /// when auth is enabled, returning the frame to route on: the original frame
-/// (auth off, or a broadcast/OGM), a shorter *view* over the same bytes with the
-/// trailer dropped, or `None` if the frame must be dropped (bad/missing tag from
-/// an unverified or foreign neighbor).
+/// (auth off, a broadcast/OGM, or a cert-control packet), a shorter *view*
+/// over the same bytes with the trailer dropped, or `None` if the frame must
+/// be dropped (bad/missing tag from an unverified or foreign neighbor).
 fn strip_directed<'a>(router: &mut CentralRouter, frame: &'a LinkFrame) -> Option<&'a LinkFrame> {
     // Only directed (unicast/mcast) frames carry a tag; broadcasts/OGMs (a
     // multicast dst) are signed, and with auth off nothing is tagged.
     let Some(auth) = router.auth_mut() else {
         return Some(frame);
     };
-    if frame.protocol.get() != DEFAULT_BATMAN_ETHER_TYPE || frame.dst.is_multicast() {
+    if frame.protocol.get() != DEFAULT_BATMAN_ETHER_TYPE
+        || frame.dst.is_multicast()
+        || is_cert_control(&frame.payload)
+    {
         return Some(frame);
     }
 
@@ -608,9 +626,12 @@ async fn dispatch<Local: FrameIo>(
 
         // Authenticate directed data-plane frames (unicast/mcast to a specific
         // next hop) with a pairwise tag when auth is enabled.  Broadcasts/OGMs
-        // (a multicast dst) are signed instead, so they are skipped here.
+        // (a multicast dst) are signed instead, and cert-control packets
+        // (CertReq/CertReply) carry their own self-authenticating signature
+        // instead of a neighbor pairwise tag, so both are skipped here.
         if protocol == DEFAULT_BATMAN_ETHER_TYPE
             && !dst.is_multicast()
+            && !is_cert_control(&payload)
             && let Some(auth) = router.auth_mut()
         {
             // Grow the payload by the trailer and let `tag_directed` write the

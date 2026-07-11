@@ -87,6 +87,13 @@ pub enum TvlvType {
     /// signed by the mesh root, so its authenticity does not depend on the
     /// carrying OGM's signature.  An OGM may carry several of these back-to-back.
     Revoke = 0x82,
+    /// An 8-byte `MembershipCert::fingerprint()`, replacing [`TvlvType::Cert`]
+    /// on a mesh with lazy cert distribution enabled. A receiver that already
+    /// holds a cert with a matching fingerprint verifies the OGM signature
+    /// against its cached copy with zero cert bytes on the wire; a mismatch
+    /// (unknown originator, or a changed fingerprint = rotation) triggers an
+    /// on-demand `CertReq`/`CertReply` fetch rather than re-verifying inline.
+    CertFp = 0x83,
 }
 
 impl TvlvType {
@@ -246,6 +253,53 @@ pub struct BatmanUnicastPacket {
     pub dest: Mac,
 }
 
+/// `packet_type` for a lazy-cert-distribution fetch request, routed hop-by-hop
+/// toward the originator whose cert is needed — Wayfinder-specific, no
+/// batman-adv counterpart. Kept as its own packet type (not a
+/// [`BATADV_UNICAST`] payload) for the same reason as [`BATADV_MCAST`]: so
+/// cert-control traffic stays identifiable on the wire, separate from data.
+pub const BATADV_CERT_REQ: u8 = 0x05;
+
+/// `packet_type` for the reply to a [`BATADV_CERT_REQ`], routed hop-by-hop back
+/// toward the requester. Wayfinder-specific, no batman-adv counterpart.
+pub const BATADV_CERT_REPLY: u8 = 0x06;
+
+/// Header for a [`BATADV_CERT_REQ`] packet. Structurally a unicast header: the
+/// requester's `MembershipCert` + signature (see the router's cert-request
+/// logic) follows it, and the packet is routed hop by hop toward `dest` — the
+/// originator whose cert is being requested — TTL-limited, delivered to the
+/// local auth state on arrival at `dest` (or at any intermediate holder that
+/// answers early).
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, Immutable, KnownLayout)]
+#[repr(C, packed)]
+pub struct BatmanCertReqPacket {
+    /// Always [`BATADV_CERT_REQ`].
+    pub packet_type: u8,
+    /// Protocol version.
+    pub version: u8,
+    /// Time-to-live, decremented per hop to prevent routing loops.
+    pub ttl: u8,
+    /// The originator node whose certificate is being requested.
+    pub dest: Mac,
+}
+
+/// Header for a [`BATADV_CERT_REPLY`] packet. Structurally a unicast header:
+/// the requested `MembershipCert` follows it, and the packet is routed hop by
+/// hop back toward `dest` — the original requester — TTL-limited, delivered to
+/// the local auth state on arrival at `dest`.
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, Immutable, KnownLayout)]
+#[repr(C, packed)]
+pub struct BatmanCertReplyPacket {
+    /// Always [`BATADV_CERT_REPLY`].
+    pub packet_type: u8,
+    /// Protocol version.
+    pub version: u8,
+    /// Time-to-live, decremented per hop to prevent routing loops.
+    pub ttl: u8,
+    /// The requester node this reply is addressed back to.
+    pub dest: Mac,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +359,61 @@ mod tests {
         assert_eq!(TvlvType::Cert.as_u8(), 0x80);
         assert_eq!(TvlvType::OgmSig.as_u8(), 0x81);
         assert_eq!(TvlvType::Revoke.as_u8(), 0x82);
+        assert_eq!(TvlvType::CertFp.as_u8(), 0x83);
+    }
+
+    /// A `CertFp` record round-trips through the TVLV encoding like any other
+    /// record type.
+    #[test]
+    fn certfp_tvlv_roundtrips() {
+        let fp = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let region = tvlv_region(&[(TvlvType::CertFp, &fp)]);
+        assert_eq!(find_tvlv(&region, TvlvType::CertFp), Some(&fp[..]));
+    }
+
+    /// The cert-request/reply packet-type bytes are the documented values and
+    /// distinct from every other packet type on the wire.
+    #[test]
+    fn cert_packet_types_are_stable_and_distinct() {
+        assert_eq!(BATADV_CERT_REQ, 0x05);
+        assert_eq!(BATADV_CERT_REPLY, 0x06);
+        let all = [
+            BATADV_IV_OGM,
+            BATADV_BCAST,
+            BATADV_UNICAST,
+            BATADV_MCAST,
+            BATADV_CERT_REQ,
+            BATADV_CERT_REPLY,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "packet types must be distinct");
+            }
+        }
+    }
+
+    /// `BatmanCertReqPacket`/`BatmanCertReplyPacket` are structurally identical
+    /// to `BatmanUnicastPacket` (same 4-field, same-size header), the shape the
+    /// engine's forwarding logic mirrors.
+    #[test]
+    fn cert_packets_mirror_unicast_layout() {
+        assert_eq!(
+            core::mem::size_of::<BatmanCertReqPacket>(),
+            core::mem::size_of::<BatmanUnicastPacket>()
+        );
+        assert_eq!(
+            core::mem::size_of::<BatmanCertReplyPacket>(),
+            core::mem::size_of::<BatmanUnicastPacket>()
+        );
+
+        let req = BatmanCertReqPacket {
+            packet_type: BATADV_CERT_REQ,
+            version: 5,
+            ttl: 10,
+            dest: Mac([0, 0, 0, 0, 0, 9]),
+        };
+        let (parsed, _) = BatmanCertReqPacket::ref_from_prefix(req.as_bytes()).unwrap();
+        assert_eq!(parsed.packet_type, BATADV_CERT_REQ);
+        assert_eq!(parsed.dest, Mac([0, 0, 0, 0, 0, 9]));
     }
 }

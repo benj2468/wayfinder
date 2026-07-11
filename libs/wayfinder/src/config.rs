@@ -292,6 +292,18 @@ pub struct Config {
     /// the open, unauthenticated mode.
     #[serde(default)]
     pub require_auth: bool,
+    /// Lazy cert distribution: when `true`, this node emits an 8-byte cert
+    /// fingerprint ([`TvlvType::CertFp`](batman::wire::TvlvType::CertFp)) on
+    /// its OGMs instead of the full membership cert, fetching the full cert
+    /// on demand (see
+    /// [`OgmAuth::augment_ogm_lazy`](crate::auth::OgmAuth::augment_ogm_lazy))
+    /// — the dominant control-plane airtime saving on a slow link (e.g.
+    /// LoRa). Defaults to `false` (today's behavior: a full cert on every
+    /// OGM). Wire-incompatible with an un-upgraded auth node, so this is a
+    /// flag-day cutover: upgrade every node on the mesh first, then flip
+    /// this to `true` mesh-wide.
+    #[serde(default)]
+    pub lazy_cert_distribution: bool,
 }
 
 /// Enables certificate-authority (provider) mode on a node: it holds the mesh
@@ -512,6 +524,34 @@ require_auth: true
 ";
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(config.require_auth);
+    }
+
+    /// `lazy_cert_distribution` defaults to `false` when absent, preserving
+    /// today's behavior (a full cert on every OGM) unless explicitly opted
+    /// into — the wire change is incompatible with un-upgraded auth nodes,
+    /// so it must never turn on silently.
+    #[test]
+    fn lazy_cert_distribution_defaults_to_false() {
+        let yaml = "\
+local_egress:
+  type: Tap
+  device_name: wayfinder0
+";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.lazy_cert_distribution);
+    }
+
+    /// An explicit `lazy_cert_distribution: true` parses.
+    #[test]
+    fn lazy_cert_distribution_true_parses() {
+        let yaml = "\
+local_egress:
+  type: Tap
+  device_name: wayfinder0
+lazy_cert_distribution: true
+";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.lazy_cert_distribution);
     }
 
     /// A `Rylr998` link transport parses its serial/radio parameters, and

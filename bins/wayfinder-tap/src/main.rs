@@ -184,6 +184,21 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Lazy cert distribution: set unconditionally (like `require_auth`
+    // above) so it takes effect immediately if auth is installed via a later
+    // runtime `set-auth`, not just from a startup `[auth]` block. A no-op
+    // until auth is enabled either way. Flag-day only — see
+    // `Config::lazy_cert_distribution`.
+    driver
+        .router_mut()
+        .set_lazy_cert_distribution(config.lazy_cert_distribution);
+    if config.lazy_cert_distribution && config.auth.is_none() {
+        tracing::warn!(
+            "lazy_cert_distribution is set but no [auth] block is configured; it has \
+             no effect until authentication is enabled (config or runtime set-auth)"
+        );
+    }
+
     // Opt-in mesh authentication: load this node's identity, certificate, and
     // the mesh trust anchor, then enable OGM auth on the router.  Absent ⇒ the
     // node runs unauthenticated.
