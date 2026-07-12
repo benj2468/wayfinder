@@ -64,6 +64,20 @@ impl WayfinderDataProvider for Mock {
             paths_mean: 0.0,
             oversize_drops: 3,
             relay_oversize_drops: 9,
+            cert_store: TableOccupancyData {
+                used: 2,
+                capacity: 64,
+            },
+            in_flight_cert_requests: TableOccupancyData {
+                used: 1,
+                capacity: 16,
+            },
+            pending_cert_replies: TableOccupancyData {
+                used: 0,
+                capacity: 16,
+            },
+            cert_req_rate: 0.5,
+            cert_reply_rate: 1.5,
         }
     }
     fn resolve_route(&self, _destination: &[u8]) -> Option<RouteResolutionData> {
@@ -170,6 +184,19 @@ async fn set_trickle_config_query_succeeds_against_server() {
 }
 
 #[tokio::test]
+async fn set_lazy_cert_distribution_query_succeeds_against_server() {
+    let addr = spawn_server().await;
+    let out = run_query(
+        Command::SetLazyCertDistribution { enabled: true },
+        &addr.to_string(),
+        OutputFormat::Human,
+    )
+    .await
+    .expect("query succeeds");
+    assert!(out.contains("lazy cert distribution"), "got: {out}");
+}
+
+#[tokio::test]
 async fn metrics_query_renders_json_from_server() {
     let addr = spawn_server().await;
     let out = run_query(Command::Metrics, &addr.to_string(), OutputFormat::Json)
@@ -178,6 +205,10 @@ async fn metrics_query_renders_json_from_server() {
     let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(parsed["oversize_drops"], 3);
     assert_eq!(parsed["relay_oversize_drops"], 9);
+    assert_eq!(parsed["cert_store"]["used"], 2);
+    assert_eq!(parsed["in_flight_cert_requests"]["used"], 1);
+    assert_eq!(parsed["cert_req_rate"], 0.5);
+    assert_eq!(parsed["cert_reply_rate"], 1.5);
 }
 
 #[tokio::test]
@@ -188,6 +219,11 @@ async fn metrics_query_renders_human_from_server() {
         .unwrap();
     assert!(out.contains("oversize_drops: 3"), "got: {out}");
     assert!(out.contains("relay_oversize_drops: 9"), "got: {out}");
+    assert!(out.contains("cert_store: 2/64"), "got: {out}");
+    assert!(out.contains("in_flight_cert_requests: 1/16"), "got: {out}");
+    assert!(out.contains("pending_cert_replies: 0/16"), "got: {out}");
+    assert!(out.contains("cert_req_rate: 0.50"), "got: {out}");
+    assert!(out.contains("cert_reply_rate: 1.50"), "got: {out}");
 }
 
 #[tokio::test]

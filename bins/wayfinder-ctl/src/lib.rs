@@ -92,6 +92,16 @@ pub enum Command {
         #[arg(long)]
         max_ms: u32,
     },
+    /// Switch lazy cert distribution on or off at runtime. Applied in memory
+    /// only — it does not persist across a restart. A flag-day, wire-
+    /// incompatible switch with un-upgraded auth nodes: only flip this on a
+    /// mesh where every node has already been upgraded.
+    SetLazyCertDistribution {
+        /// `true` to emit an 8-byte cert fingerprint on OGMs instead of the
+        /// full membership cert; `false` to emit the full cert as before.
+        #[arg(long)]
+        enabled: bool,
+    },
     /// Store authenticate data into the application
     SetAuth {
         /// Seed for the node
@@ -203,6 +213,16 @@ pub async fn run_query(
                 .await
                 .context("failed to set trickle config")?;
             "trickle config updated".to_string()
+        }
+        Command::SetLazyCertDistribution { enabled } => {
+            client
+                .set_lazy_cert_distribution(enabled)
+                .await
+                .context("failed to set lazy cert distribution")?;
+            format!(
+                "lazy cert distribution {}",
+                if enabled { "enabled" } else { "disabled" }
+            )
         }
         Command::SetAuth {
             seed,

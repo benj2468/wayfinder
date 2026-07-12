@@ -223,6 +223,19 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
             )
         };
 
+        let (cert_store, in_flight_cert_requests, pending_cert_replies) = match self.router.auth() {
+            Some(auth) => (
+                occ(auth.cert_store_occupancy()),
+                occ(auth.in_flight_cert_requests_occupancy()),
+                occ(auth.pending_cert_replies_occupancy()),
+            ),
+            None => (
+                TableOccupancyData::default(),
+                TableOccupancyData::default(),
+                TableOccupancyData::default(),
+            ),
+        };
+
         NodeMetricsData {
             uptime_secs: self.now.as_secs(),
             neighbor_count: self.router.neighbor_count() as u32,
@@ -237,6 +250,11 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
             paths_mean,
             oversize_drops: self.router.oversize_drops(),
             relay_oversize_drops: self.router.relay_oversize_drops(),
+            cert_store,
+            in_flight_cert_requests,
+            pending_cert_replies,
+            cert_req_rate: self.router.cert_req_tx_rate(self.now),
+            cert_reply_rate: self.router.cert_reply_tx_rate(self.now),
         }
     }
 
@@ -284,6 +302,9 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
             if !applied {
                 return Err("interface index out of range".to_string());
             }
+        }
+        if let Some(lazy) = config.lazy_cert_distribution {
+            self.router.apply_runtime_lazy_cert_distribution(lazy);
         }
         Ok(())
     }
@@ -458,6 +479,7 @@ mod tests {
                     min_interval_ms: 500,
                     max_interval_ms: 4000,
                 }),
+                ..Default::default()
             });
         assert!(result.is_ok());
 
@@ -472,12 +494,58 @@ mod tests {
         assert_eq!(entry.max_interval_ms, 4000);
     }
 
+    /// `set_config` with `lazy_cert_distribution` set flips the router's
+    /// runtime OGM-emission mode (full cert vs. fingerprint) and marks the
+    /// runtime config as active — the same `apply_*`-style contract as the
+    /// trickle path above, distinct from the startup-only
+    /// `CentralRouter::set_lazy_cert_distribution` wiring which does not
+    /// touch `runtime_config_active`.
+    #[test]
+    fn set_config_installs_lazy_cert_distribution_and_marks_active() {
+        use crate::CertAuthority;
+        use wayfinder::auth::OgmAuth;
+        use wayfinder::batman::wire::{TvlvType, find_tvlv};
+        use wayfinder::wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
+
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
+        ca.set_now_unix(100);
+        let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
+        let me = mac(1);
+        let kp = Keypair::from_seed(&[2; 32]);
+        let cert =
+            MembershipCert::from_bytes(&ca_issue(&mut ca, &me.0, &kp.ed_pubkey(), &kp.x_pubkey()))
+                .unwrap();
+
+        let mut router = CentralRouter::new(me);
+        router.set_auth(OgmAuth::new(kp, cert, anchor));
+        router.auth_mut().unwrap().set_time(100);
+
+        assert!(!RouterAdapter::new(&mut router, None, Duration::ZERO).runtime_config_active());
+
+        let result =
+            RouterAdapter::new(&mut router, None, Duration::ZERO).set_config(RuntimeConfigData {
+                lazy_cert_distribution: Some(true),
+                ..Default::default()
+            });
+        assert!(result.is_ok());
+        assert!(RouterAdapter::new(&mut router, None, Duration::ZERO).runtime_config_active());
+
+        let mut tx = [0u8; 1500];
+        let ogm = router.poll(Duration::ZERO, &mut tx).unwrap().payload;
+        let hdr_len = core::mem::size_of::<BatmanOgmPacket>();
+        assert!(
+            find_tvlv(&ogm[hdr_len..], TvlvType::Cert).is_none(),
+            "must switch to fingerprint-only emission"
+        );
+        assert!(find_tvlv(&ogm[hdr_len..], TvlvType::CertFp).is_some());
+    }
+
     /// `set_config` with no fields set is a no-op that still succeeds.
     #[test]
     fn set_config_with_no_fields_is_a_no_op() {
         let mut router = CentralRouter::new(mac(1));
         let result = RouterAdapter::new(&mut router, None, Duration::ZERO)
-            .set_config(RuntimeConfigData { trickle: None });
+            .set_config(RuntimeConfigData::default());
         assert!(result.is_ok());
         assert!(!RouterAdapter::new(&mut router, None, Duration::ZERO).runtime_config_active());
     }
@@ -494,6 +562,7 @@ mod tests {
                     min_interval_ms: 500,
                     max_interval_ms: 4000,
                 }),
+                ..Default::default()
             });
         let err = result.unwrap_err();
         assert!(err.contains("out of range"), "got: {err}");
@@ -520,6 +589,7 @@ mod tests {
                     min_interval_ms: 500,
                     max_interval_ms: 4000,
                 }),
+                ..Default::default()
             });
         let err = result.unwrap_err();
         assert!(err.contains("out of range"), "got: {err}");
@@ -547,6 +617,7 @@ mod tests {
                     min_interval_ms: 5000,
                     max_interval_ms: 1000,
                 }),
+                ..Default::default()
             });
         let err = result.unwrap_err();
         assert!(err.contains("min_interval_ms"), "got: {err}");
@@ -592,6 +663,97 @@ mod tests {
         assert_eq!(m.paths_max, 1);
         assert_eq!(m.paths_mean, 1.0);
         assert_eq!((m.originators.used, m.originators.capacity), (3, 128));
+    }
+
+    /// With auth disabled, the cert-distribution occupancy/rate metrics all
+    /// read as empty/zero rather than `None` or garbage — mirroring how the
+    /// other table-occupancy gauges default when their table is untouched.
+    #[test]
+    fn node_metrics_cert_fields_zero_without_auth() {
+        let mut router = CentralRouter::new(mac(1));
+        let m = RouterAdapter::new(&mut router, None, Duration::from_secs(5)).node_metrics();
+
+        assert_eq!((m.cert_store.used, m.cert_store.capacity), (0, 0));
+        assert_eq!(
+            (
+                m.in_flight_cert_requests.used,
+                m.in_flight_cert_requests.capacity
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            (m.pending_cert_replies.used, m.pending_cert_replies.capacity),
+            (0, 0)
+        );
+        assert_eq!(m.cert_req_rate, 0.0);
+        assert_eq!(m.cert_reply_rate, 0.0);
+    }
+
+    /// With auth enabled, a verified neighbor's cert lands in the cert-store
+    /// occupancy count reported through `node_metrics` — exercising the real
+    /// adapter projection, not just the underlying `OgmAuth` accessor.
+    #[test]
+    fn node_metrics_reports_cert_store_occupancy_when_auth_enabled() {
+        use crate::CertAuthority;
+        use wayfinder::auth::OgmAuth;
+        use wayfinder::wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
+
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
+        ca.set_now_unix(100);
+        let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
+
+        let me = mac(1);
+        let kp1 = Keypair::from_seed(&[2; 32]);
+        let cert1 = MembershipCert::from_bytes(&ca_issue(
+            &mut ca,
+            &me.0,
+            &kp1.ed_pubkey(),
+            &kp1.x_pubkey(),
+        ))
+        .unwrap();
+        let mut router = CentralRouter::new(me);
+        router.set_auth(OgmAuth::new(kp1, cert1, anchor));
+        router.auth_mut().unwrap().set_time(100);
+
+        let peer = mac(2);
+        let kp2 = Keypair::from_seed(&[3; 32]);
+        let cert2 = MembershipCert::from_bytes(&ca_issue(
+            &mut ca,
+            &peer.0,
+            &kp2.ed_pubkey(),
+            &kp2.x_pubkey(),
+        ))
+        .unwrap();
+        let mut peer_auth = OgmAuth::new(kp2, cert2, anchor);
+        peer_auth.set_time(100);
+        let ogm = BatmanOgmPacket {
+            packet_type: BATADV_IV_OGM,
+            version: 5,
+            ttl: 50,
+            flags: 0,
+            seqno: 1u32.to_be(),
+            orig: peer,
+            reserved: 0,
+            tq: 255,
+            tvlv_len: 0,
+        };
+        let mut buf = [0u8; 512];
+        let hdr = ogm.as_bytes();
+        buf[..hdr.len()].copy_from_slice(hdr);
+        let len = peer_auth.augment_ogm(&mut buf, hdr.len()).expect("augment");
+        let bytes = link_frame_bytes(
+            peer,
+            Mac::BROADCAST,
+            wayfinder::DEFAULT_BATMAN_ETHER_TYPE,
+            &buf[..len],
+        );
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 512];
+        router.handle_frame(Duration::ZERO, 0, frame, &mut tx);
+
+        let m = RouterAdapter::new(&mut router, None, Duration::from_secs(5)).node_metrics();
+        assert_eq!(m.cert_store.used, 1);
+        assert_eq!(m.cert_store.capacity, 64);
     }
 
     /// `revoke_node` on a provider whose router *is* authenticated signs the

@@ -92,6 +92,8 @@ pub struct TrickleConfigData {
 pub struct RuntimeConfigData {
     /// Present to update the Trickle/OGM bounds for one mesh interface.
     pub trickle: Option<TrickleConfigData>,
+    /// Present to switch lazy cert distribution on (`true`) or off (`false`).
+    pub lazy_cert_distribution: Option<bool>,
 }
 
 /// Intermediate representation of one interface's smoothed throughput,
@@ -155,6 +157,21 @@ pub struct NodeMetricsData {
     /// buffer — non-zero signals an MTU mismatch between two of this node's
     /// links, distinct from `oversize_drops` (locally originated frames only).
     pub relay_oversize_drops: u32,
+    /// Verified-neighbor cert cache occupancy. Zero (0/0) when auth is
+    /// disabled.
+    pub cert_store: TableOccupancyData,
+    /// Requester-side in-flight lazy-cert-fetch table occupancy. Zero (0/0)
+    /// when auth is disabled.
+    pub in_flight_cert_requests: TableOccupancyData,
+    /// Responder-side parked-reply table occupancy. Zero (0/0) when auth is
+    /// disabled.
+    pub pending_cert_replies: TableOccupancyData,
+    /// Smoothed rate (frames/sec) at which this node sends `CertReq`. Zero
+    /// when auth is disabled.
+    pub cert_req_rate: f64,
+    /// Smoothed rate (frames/sec) at which this node sends `CertReply`. Zero
+    /// when auth is disabled.
+    pub cert_reply_rate: f64,
 }
 
 /// Egress decision a router would make for a destination.  Mirrors
@@ -513,6 +530,11 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                     paths_mean: m.paths_mean,
                     oversize_drops: m.oversize_drops,
                     relay_oversize_drops: m.relay_oversize_drops,
+                    cert_store: occ(m.cert_store),
+                    in_flight_cert_requests: occ(m.in_flight_cert_requests),
+                    pending_cert_replies: occ(m.pending_cert_replies),
+                    cert_req_rate: m.cert_req_rate,
+                    cert_reply_rate: m.cert_reply_rate,
                 })
             }
 
@@ -565,15 +587,16 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
             }
 
             Some(RequestKind::SetConfig(set_config)) => {
+                let raw_config = set_config.config;
                 let config = RuntimeConfigData {
-                    trickle: set_config
-                        .config
-                        .and_then(|c| c.trickle)
-                        .map(|t| TrickleConfigData {
+                    trickle: raw_config.as_ref().and_then(|c| c.trickle).map(|t| {
+                        TrickleConfigData {
                             iface_idx: t.iface_idx,
                             min_interval_ms: t.min_interval_ms,
                             max_interval_ms: t.max_interval_ms,
-                        }),
+                        }
+                    }),
+                    lazy_cert_distribution: raw_config.and_then(|c| c.lazy_cert_distribution),
                 };
                 match self.provider.set_config(config) {
                     Ok(_) => ResponseKind::Empty(Empty {}),
@@ -736,7 +759,8 @@ mod tests {
             {
                 return Err("interface index out of range".into());
             }
-            self.runtime_config_active = config.trickle.is_some();
+            self.runtime_config_active =
+                config.trickle.is_some() || config.lazy_cert_distribution.is_some();
             self.last_set_config = Some(config);
             Ok(())
         }
@@ -906,6 +930,7 @@ mod tests {
                         min_interval_ms: 500,
                         max_interval_ms: 4000,
                     }),
+                    lazy_cert_distribution: None,
                 }),
             }),
         ) {
@@ -919,7 +944,29 @@ mod tests {
         match handle(
             MockProvider::default(),
             RequestKind::SetConfig(SetConfigRequest {
-                config: Some(RuntimeConfig { trickle: None }),
+                config: Some(RuntimeConfig {
+                    trickle: None,
+                    lazy_cert_distribution: None,
+                }),
+            }),
+        ) {
+            ResponseKind::Empty(_) => {}
+            other => panic!("expected Empty, got {:?}", proto_kind_name(&other)),
+        }
+    }
+
+    /// Setting `lazy_cert_distribution` alone (no trickle field) is forwarded
+    /// to the provider and answered with an empty response, mirroring the
+    /// trickle-only case above.
+    #[test]
+    fn set_config_with_lazy_cert_distribution_forwards_to_provider_and_returns_empty() {
+        match handle(
+            MockProvider::default(),
+            RequestKind::SetConfig(SetConfigRequest {
+                config: Some(RuntimeConfig {
+                    trickle: None,
+                    lazy_cert_distribution: Some(true),
+                }),
             }),
         ) {
             ResponseKind::Empty(_) => {}
@@ -938,6 +985,7 @@ mod tests {
                         min_interval_ms: 500,
                         max_interval_ms: 4000,
                     }),
+                    lazy_cert_distribution: None,
                 }),
             }),
         ) {
@@ -1093,6 +1141,20 @@ mod tests {
                 paths_mean: 1.75,
                 oversize_drops: 9,
                 relay_oversize_drops: 6,
+                cert_store: TableOccupancyData {
+                    used: 4,
+                    capacity: 64,
+                },
+                in_flight_cert_requests: TableOccupancyData {
+                    used: 1,
+                    capacity: 16,
+                },
+                pending_cert_replies: TableOccupancyData {
+                    used: 2,
+                    capacity: 16,
+                },
+                cert_req_rate: 0.5,
+                cert_reply_rate: 1.25,
             },
             ..Default::default()
         };
@@ -1111,6 +1173,11 @@ mod tests {
                 assert_eq!(m.paths_mean, 1.75);
                 assert_eq!(m.oversize_drops, 9);
                 assert_eq!(m.relay_oversize_drops, 6);
+                assert_eq!(m.cert_store.unwrap().used, 4);
+                assert_eq!(m.in_flight_cert_requests.unwrap().used, 1);
+                assert_eq!(m.pending_cert_replies.unwrap().used, 2);
+                assert_eq!(m.cert_req_rate, 0.5);
+                assert_eq!(m.cert_reply_rate, 1.25);
             }
             other => panic!("expected Metrics, got {:?}", proto_kind_name(&other)),
         }

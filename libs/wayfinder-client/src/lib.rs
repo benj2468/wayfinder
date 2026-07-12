@@ -294,6 +294,27 @@ impl Client {
                         min_interval_ms,
                         max_interval_ms,
                     }),
+                    ..Default::default()
+                }),
+            }))
+            .await?
+        {
+            ResponseKind::Empty(_) => Ok(()),
+            other => Err(unexpected("SetConfig", &other)),
+        }
+    }
+
+    /// Switch lazy cert distribution on or off at runtime: whether this
+    /// node's OGMs carry an 8-byte cert fingerprint instead of the full
+    /// membership cert. Applied in memory only — it does not persist across
+    /// a restart. A flag-day, wire-incompatible switch with un-upgraded auth
+    /// nodes — see the design doc before flipping it on a live mesh.
+    pub async fn set_lazy_cert_distribution(&mut self, enabled: bool) -> anyhow::Result<()> {
+        match self
+            .request(RequestKind::SetConfig(SetConfigRequest {
+                config: Some(RuntimeConfig {
+                    lazy_cert_distribution: Some(enabled),
+                    ..Default::default()
                 }),
             }))
             .await?

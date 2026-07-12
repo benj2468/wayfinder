@@ -162,6 +162,14 @@ message TrickleConfig {
 message RuntimeConfig {
   // Present to update the Trickle/OGM bounds for one mesh interface.
   TrickleConfig trickle = 1;
+
+  // Present to switch lazy cert distribution on or off: whether this node's
+  // OGMs carry an 8-byte cert fingerprint (true) instead of the full
+  // membership cert (false), fetching the full cert on demand when a peer
+  // can't resolve the fingerprint. A flag-day, wire-incompatible switch with
+  // un-upgraded auth nodes — see the design doc before flipping it on a live
+  // mesh.
+  optional bool lazy_cert_distribution = 2;
 }
 
 // Apply a partial update to the node's runtime configuration.  Only the
@@ -563,6 +571,30 @@ message NodeMetrics {
   // only counts locally originated frames; a non-zero, growing value signals
   // an MTU mismatch between two of this node's links.
   uint32 relay_oversize_drops = 13;
+
+  // Occupancy of the verified-neighbor cert cache: other members' certs this
+  // node currently holds, resolved either from a full Cert TVLV or fetched
+  // on demand under lazy cert distribution. Zero (0/0) when auth is disabled.
+  TableOccupancy cert_store = 14;
+
+  // Occupancy of the requester-side in-flight lazy-cert-fetch table:
+  // outstanding CertReq fetches this node has sent but not yet resolved.
+  // Zero (0/0) when auth is disabled.
+  TableOccupancy in_flight_cert_requests = 15;
+
+  // Occupancy of the responder-side parked-reply table: verified CertReq
+  // requesters this node has no route to yet, awaiting the opportunistic
+  // flush once one appears. Zero (0/0) when auth is disabled.
+  TableOccupancy pending_cert_replies = 16;
+
+  // Smoothed rate (frames/sec) at which this node sends CertReq — a rising
+  // rate signals growing cert-cache churn or a misresolving fingerprint.
+  // Zero when auth is disabled.
+  double cert_req_rate = 17;
+
+  // Smoothed rate (frames/sec) at which this node sends CertReply, answering
+  // CertReqs as the requested originator. Zero when auth is disabled.
+  double cert_reply_rate = 18;
 }
 
 // Marker payload indicating the router would flood a packet out of every
