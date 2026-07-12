@@ -431,7 +431,7 @@ fn render_metrics(frame: &mut Frame, app: &mut App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(11),           // node metrics summary
+            Constraint::Length(16),           // node metrics summary
             Constraint::Min(8),               // throughput history chart
             Constraint::Length(table_height), // per-interface throughput table
         ])
@@ -829,6 +829,11 @@ fn render_node_metrics(frame: &mut Frame, app: &App, area: Rect) {
                 ),
                 field("Oversize drops", &m.oversize_drops.to_string()),
                 field("Relay oversize drops", &m.relay_oversize_drops.to_string()),
+                field("Cert store", &occ(&m.cert_store)),
+                field("In-flight cert requests", &occ(&m.in_flight_cert_requests)),
+                field("Pending cert replies", &occ(&m.pending_cert_replies)),
+                field("Cert req rate", &format!("{:.2}/s", m.cert_req_rate)),
+                field("Cert reply rate", &format!("{:.2}/s", m.cert_reply_rate)),
             ]
         }
     };
@@ -1052,7 +1057,7 @@ mod tests {
         let mut app = App::new("test".to_string(), 1000);
         app.tab = Tab::Metrics;
 
-        let backend = TestBackend::new(80, 30);
+        let backend = TestBackend::new(80, 40);
         let mut terminal = Terminal::new(backend).expect("terminal");
 
         // Empty history: the placeholder branch must render without panicking.
@@ -1076,6 +1081,12 @@ mod tests {
         app.snapshot.metrics = Some(wayfinder_protos::wayfinder_v1alpha::NodeMetrics {
             oversize_drops: 42,
             relay_oversize_drops: 17,
+            cert_store: Some(wayfinder_protos::wayfinder_v1alpha::TableOccupancy {
+                used: 5,
+                capacity: 64,
+            }),
+            cert_req_rate: 0.5,
+            cert_reply_rate: 1.5,
             ..Default::default()
         });
         terminal
@@ -1098,6 +1109,13 @@ mod tests {
             "relay-oversize-drops row missing"
         );
         assert!(text.contains("17"), "relay-oversize-drops value missing");
+        assert!(text.contains("Cert store"), "cert-store row missing");
+        assert!(text.contains("5/64"), "cert-store occupancy value missing");
+        assert!(text.contains("Cert req rate"), "cert-req-rate row missing");
+        assert!(
+            text.contains("Cert reply rate"),
+            "cert-reply-rate row missing"
+        );
     }
 
     /// The Security tab shows the provider CSR panel only when the connected node

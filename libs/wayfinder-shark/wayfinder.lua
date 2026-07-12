@@ -8,8 +8,12 @@
 -- Decodes the BatmanOgmPacket fixed header (see libs/batman/src/wire.rs) and
 -- walks the TVLV tail into individual records: multicast membership, the
 -- Wayfinder membership certificate (WF_TVLV_CERT), the OGM signature
--- (WF_TVLV_OGM_SIG), and flooded revocations (WF_TVLV_REVOKE).  The whole tail
--- is also shown as a raw byte blob.
+-- (WF_TVLV_OGM_SIG), flooded revocations (WF_TVLV_REVOKE), and the lazy-cert-
+-- distribution fingerprint (WF_TVLV_CERTFP) that replaces WF_TVLV_CERT on the
+-- wire once fingerprinting is enabled.  The whole tail is also shown as a raw
+-- byte blob.  Also decodes the lazy-cert-distribution control packets
+-- (BATADV_CERT_REQ / BATADV_CERT_REPLY): their shared header plus the
+-- requester's cert + signature, or the replied cert.
 --
 -- Install: copy (or symlink) this file into your Personal Lua Plugins folder
 --   (Help -> About -> Folders, e.g. ~/.local/lib/wireshark/plugins), or load it
@@ -19,11 +23,15 @@ local ETH_P_BATMAN = 0x4305
 
 -- BATMAN packet_type byte values (libs/batman/src/wire.rs).
 local BATADV_IV_OGM = 0x01
+local BATADV_CERT_REQ = 0x05
+local BATADV_CERT_REPLY = 0x06
 local PACKET_TYPES = {
 	[0x01] = "OGM",
 	[0x02] = "Broadcast",
 	[0x03] = "Unicast",
 	[0x04] = "Multicast",
+	[BATADV_CERT_REQ] = "Cert Request",
+	[BATADV_CERT_REPLY] = "Cert Reply",
 }
 
 -- TVLV record type bytes carried in an OGM tail (libs/batman/src/wire.rs).
@@ -31,12 +39,18 @@ local BATADV_TVLV_MCAST = 0x06
 local WF_TVLV_CERT = 0x80
 local WF_TVLV_OGM_SIG = 0x81
 local WF_TVLV_REVOKE = 0x82
+local WF_TVLV_CERTFP = 0x83
 local TVLV_TYPES = {
 	[BATADV_TVLV_MCAST] = "Multicast Membership",
 	[WF_TVLV_CERT] = "Membership Certificate",
 	[WF_TVLV_OGM_SIG] = "OGM Signature",
 	[WF_TVLV_REVOKE] = "Revocation",
+	[WF_TVLV_CERTFP] = "Cert Fingerprint",
 }
+
+-- Length of the Ed25519 signature following a CertReq's requester cert (see
+-- SIG_LEN in libs/wayfinder/src/auth.rs).
+local SIG_LEN = 64
 
 local wayfinder = Proto("wayfinder", "Wayfinder Mesh Protocol")
 
@@ -78,6 +92,21 @@ f.cert_sig = ProtoField.bytes("wayfinder.batman.tvlv.cert.signature", "Root Sign
 -- The originator's Ed25519 signature over the OGM's immutable identity.
 f.ogm_sig = ProtoField.bytes("wayfinder.batman.tvlv.ogm_sig", "OGM Signature")
 
+-- Lazy-cert-distribution fingerprint: MembershipCert::fingerprint(), replacing
+-- the full WF_TVLV_CERT record on the wire (libs/batman/src/wire.rs).
+f.cert_fp = ProtoField.bytes("wayfinder.batman.tvlv.cert_fp", "Cert Fingerprint")
+
+-- Shared header fields for the cert-control packets (BATADV_CERT_REQ /
+-- BATADV_CERT_REPLY): structurally a unicast header (version/ttl/dest).
+f.cert_ctrl_version = ProtoField.uint8("wayfinder.batman.cert_ctrl.version", "Version", base.DEC)
+f.cert_ctrl_ttl = ProtoField.uint8("wayfinder.batman.cert_ctrl.ttl", "TTL", base.DEC)
+f.cert_ctrl_dest = ProtoField.ether("wayfinder.batman.cert_ctrl.dest", "Destination")
+
+-- The requester's self-authenticating Ed25519 signature following its cert in
+-- a BATADV_CERT_REQ body (see OgmAuth::build_cert_request in
+-- libs/wayfinder/src/auth.rs).
+f.cert_req_sig = ProtoField.bytes("wayfinder.batman.cert_req.signature", "Requester Signature")
+
 -- Revocation record fields (wayfinder_auth::RevocationRecord; see
 -- libs/wayfinder-auth/src/revoke.rs).
 f.revoke_version = ProtoField.uint8("wayfinder.batman.tvlv.revoke.version", "Revoke Version", base.DEC)
@@ -101,6 +130,17 @@ local OGM = {
 	TQ = 15,
 	TVLV_LEN = 16, -- u16, big-endian
 	HEADER_LEN = 18,
+}
+
+-- Field offsets within a BatmanCertReqPacket / BatmanCertReplyPacket header —
+-- structurally identical (type/version/ttl/dest). Kept in sync with
+-- libs/batman/src/wire.rs.
+local CERT_CTRL = {
+	PACKET_TYPE = 0,
+	VERSION = 1,
+	TTL = 2,
+	DEST = 3, -- 6 bytes
+	HEADER_LEN = 9,
 }
 
 -- Field offsets within a MembershipCert value (libs/wayfinder-auth/src/cert.rs).
@@ -158,6 +198,27 @@ local function decode_revoke(rec, tvb, voff, vlen, cap_end)
 	rec:add(f.revoke_sig, tvb(voff + REVOKE.SIGNATURE, 64))
 end
 
+-- Decode a BATADV_CERT_REQ / BATADV_CERT_REPLY body into `tree`: the shared
+-- header (version/ttl/dest) is already consumed by the caller, so `tvb`
+-- starts at the body — the requester's own cert + a self-authenticating
+-- signature for a request, or the requested originator's raw cert for a
+-- reply. Degrades gracefully (leaves the body undissected) on a truncated
+-- capture, matching `walk_tvlv`'s bounds handling.
+local function decode_cert_ctrl(tree, tvb, is_req, body_off, cap_end)
+	if body_off + CERT.LEN > cap_end then
+		return
+	end
+	local cert_tree = tree:add(tvb(body_off, CERT.LEN), is_req and "Requester Certificate" or "Certificate")
+	decode_cert(cert_tree, tvb, body_off, CERT.LEN, cap_end)
+
+	if is_req then
+		local sig_off = body_off + CERT.LEN
+		if sig_off + SIG_LEN <= cap_end then
+			tree:add(f.cert_req_sig, tvb(sig_off, SIG_LEN))
+		end
+	end
+end
+
 -- Walk the TVLV tail into one subtree per record, decoding known types. Bounds
 -- are clamped to `cap_end` (what the capture actually holds) so a truncated or
 -- malformed tail degrades gracefully rather than erroring.
@@ -184,6 +245,8 @@ local function walk_tvlv(tree, tvb, start, tvlv_len, cap_end)
 				rec:add(f.ogm_sig, tvb(voff, vlen))
 			elseif ttype == WF_TVLV_REVOKE then
 				decode_revoke(rec, tvb, voff, vlen, cap_end)
+			elseif ttype == WF_TVLV_CERTFP then
+				rec:add(f.cert_fp, tvb(voff, vlen))
 			elseif ttype == BATADV_TVLV_MCAST then
 				local g = voff
 				while g + 6 <= voff + vlen do
@@ -217,8 +280,20 @@ function wayfinder.dissector(tvb, pinfo, root)
 	local tree = root:add(wayfinder, tvb(), "Wayfinder Mesh Protocol")
 	tree:add(f.packet_type, tvb(OGM.PACKET_TYPE, 1))
 
-	-- Only the OGM body is decoded in this cut; other sub-types stop after the
-	-- protocol/type are labelled.
+	-- Cert-control packets (CertReq/CertReply) get their own header/body
+	-- decode; Broadcast/Unicast/Multicast stop after the protocol/type are
+	-- labelled (not decoded in this cut).
+	if ptype == BATADV_CERT_REQ or ptype == BATADV_CERT_REPLY then
+		if len < CERT_CTRL.HEADER_LEN then
+			return len
+		end
+		tree:add(f.cert_ctrl_version, tvb(CERT_CTRL.VERSION, 1))
+		tree:add(f.cert_ctrl_ttl, tvb(CERT_CTRL.TTL, 1))
+		tree:add(f.cert_ctrl_dest, tvb(CERT_CTRL.DEST, 6))
+		decode_cert_ctrl(tree, tvb, ptype == BATADV_CERT_REQ, CERT_CTRL.HEADER_LEN, len)
+		return len
+	end
+
 	if ptype ~= BATADV_IV_OGM or len < OGM.HEADER_LEN then
 		return len
 	end

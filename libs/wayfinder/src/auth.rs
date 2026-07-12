@@ -437,6 +437,30 @@ impl OgmAuth {
         &self.neighbors
     }
 
+    /// Occupancy of the verified-neighbor cert cache (`used`, `capacity`):
+    /// how many other members' certs this node currently holds, out of
+    /// [`MAX_NEIGHBOR_KEYS`]. Backs the cert-store metric — a cache
+    /// perpetually near capacity signals more distinct neighbors (or more
+    /// churn) than the node is provisioned for.
+    pub fn cert_store_occupancy(&self) -> (usize, usize) {
+        (self.neighbors.len(), MAX_NEIGHBOR_KEYS)
+    }
+
+    /// Occupancy of the requester-side in-flight lazy-cert-fetch table
+    /// (`used`, `capacity`): outstanding [`build_cert_request`](Self::build_cert_request)
+    /// fetches not yet resolved by [`ingest_cert_reply`](Self::ingest_cert_reply),
+    /// out of [`MAX_IN_FLIGHT_CERT_REQUESTS`].
+    pub fn in_flight_cert_requests_occupancy(&self) -> (usize, usize) {
+        (self.in_flight.len(), MAX_IN_FLIGHT_CERT_REQUESTS)
+    }
+
+    /// Occupancy of the responder-side parked-reply table (`used`,
+    /// `capacity`): verified `CertReq` requesters this node has no route to
+    /// yet, awaiting the opportunistic flush, out of [`MAX_PENDING_REPLIES`].
+    pub fn pending_cert_replies_occupancy(&self) -> (usize, usize) {
+        (self.pending_replies.len(), MAX_PENDING_REPLIES)
+    }
+
     /// Look up a cached neighbor's raw certificate and its fingerprint by MAC.
     /// `None` if no verified OGM from `mac` is currently cached (never seen, or
     /// evicted under churn — see [`cache_neighbor`](Self::cache_neighbor)).
@@ -2285,5 +2309,73 @@ mod tests {
             a.has_pending_reply(mac(3)),
             "the refreshed entry must not have expired yet"
         );
+    }
+
+    // ── Cert-distribution occupancy metrics (add-metric skill, Phase 6) ────
+
+    /// The cert-store occupancy reports zero used against the neighbor-cache
+    /// capacity before any neighbor cert has been cached.
+    #[test]
+    fn cert_store_occupancy_starts_empty() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let b = member(&authority, 3, mac(3), 1000);
+        assert_eq!(b.cert_store_occupancy(), (0, MAX_NEIGHBOR_KEYS));
+    }
+
+    /// Caching a verified neighbor's cert (via a verified OGM) grows the
+    /// cert-store occupancy by one.
+    #[test]
+    fn cert_store_occupancy_grows_with_cached_neighbor() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+        assert_eq!(b.cert_store_occupancy(), (1, MAX_NEIGHBOR_KEYS));
+    }
+
+    /// The in-flight cert-request occupancy reports zero before any fetch is
+    /// started.
+    #[test]
+    fn in_flight_cert_requests_occupancy_starts_empty() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let b = member(&authority, 3, mac(3), 1000);
+        assert_eq!(
+            b.in_flight_cert_requests_occupancy(),
+            (0, MAX_IN_FLIGHT_CERT_REQUESTS)
+        );
+    }
+
+    /// A successful `build_cert_request` grows the in-flight occupancy by one.
+    #[test]
+    fn in_flight_cert_requests_occupancy_grows_with_outstanding_fetch() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        let mut buf = [0u8; 512];
+        b.build_cert_request(mac(2), [0xAA; 8], mac(9), &mut buf)
+            .expect("first request must be sent");
+        assert_eq!(
+            b.in_flight_cert_requests_occupancy(),
+            (1, MAX_IN_FLIGHT_CERT_REQUESTS)
+        );
+    }
+
+    /// The pending-reply (responder-side, parked) occupancy reports zero
+    /// before any reply is parked.
+    #[test]
+    fn pending_cert_replies_occupancy_starts_empty() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let b = member(&authority, 3, mac(3), 1000);
+        assert_eq!(b.pending_cert_replies_occupancy(), (0, MAX_PENDING_REPLIES));
+    }
+
+    /// Parking a reply grows the pending-reply occupancy by one.
+    #[test]
+    fn pending_cert_replies_occupancy_grows_with_parked_reply() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        a.park_pending_reply(mac(3));
+        assert_eq!(a.pending_cert_replies_occupancy(), (1, MAX_PENDING_REPLIES));
     }
 }

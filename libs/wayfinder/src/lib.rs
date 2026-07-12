@@ -336,6 +336,15 @@ pub struct CentralRouter {
     /// application, never on a rejected one. Sticky: once set, stays set for
     /// the life of the process. See [`runtime_config_active`](CentralRouter::runtime_config_active).
     runtime_config_active: bool,
+    /// Smoothed rate at which this node sends `CertReq` (lazy-cert-
+    /// distribution fetches, as a requester with an unresolved fingerprint).
+    /// Frames-per-second only (no byte size to a control packet is tracked
+    /// here); see [`RateEstimator`].
+    cert_req_tx_rate: RateEstimator,
+    /// Smoothed rate at which this node sends `CertReply` (answering a
+    /// `CertReq`, as the originator whose cert was asked for) — either
+    /// immediately or via the opportunistic parked-reply flush.
+    cert_reply_tx_rate: RateEstimator,
 }
 
 impl CentralRouter {
@@ -355,7 +364,23 @@ impl CentralRouter {
             lazy_cert_distribution: false,
             oversize_drops: 0,
             runtime_config_active: false,
+            cert_req_tx_rate: RateEstimator::default(),
+            cert_reply_tx_rate: RateEstimator::default(),
         }
+    }
+
+    /// Smoothed frames/sec at which this node sends `CertReq` (lazy-cert-
+    /// distribution fetches), evaluated as of `now`. A rising rate signals
+    /// growing cert-cache churn or a misresolving fingerprint.
+    pub fn cert_req_tx_rate(&self, now: Duration) -> f64 {
+        self.cert_req_tx_rate.rate(now).1
+    }
+
+    /// Smoothed frames/sec at which this node sends `CertReply` (answering
+    /// `CertReq`s as the requested originator), evaluated as of `now`. A
+    /// rising rate signals this node is serving cert lookups for many peers.
+    pub fn cert_reply_tx_rate(&self, now: Duration) -> f64 {
+        self.cert_reply_tx_rate.rate(now).1
     }
 
     /// Number of locally originated host frames dropped because they exceeded
@@ -437,6 +462,19 @@ impl CentralRouter {
     /// resolve fingerprints via fetch) before any node flips this to `true`.
     pub fn set_lazy_cert_distribution(&mut self, lazy: bool) {
         self.lazy_cert_distribution = lazy;
+    }
+
+    /// The [`set_lazy_cert_distribution`](Self::set_lazy_cert_distribution)
+    /// counterpart for a *runtime* override (the management API's
+    /// `SetConfig`), rather than startup wiring: applies the new policy and
+    /// additionally marks [`runtime_config_active`](Self::runtime_config_active),
+    /// mirroring [`apply_runtime_trickle_config`](Self::apply_runtime_trickle_config).
+    /// Kept distinct from the plain setter so startup wiring (from
+    /// [`Config::lazy_cert_distribution`](crate::config::Config::lazy_cert_distribution))
+    /// never spuriously marks the node as running a runtime override.
+    pub fn apply_runtime_lazy_cert_distribution(&mut self, lazy: bool) {
+        self.lazy_cert_distribution = lazy;
+        self.runtime_config_active = true;
     }
 
     /// Whether this node is required to authenticate but has no membership
@@ -619,6 +657,7 @@ impl CentralRouter {
                                     dest: orig,
                                 };
                                 tx_buf[..hdr_len].copy_from_slice(req_hdr.as_bytes());
+                                self.cert_req_tx_rate.observe(now, 0);
                                 Some(LinkFrameData {
                                     dst: frame.src,
                                     protocol: ETH_P_BATMAN,
@@ -682,14 +721,17 @@ impl CentralRouter {
                             // correctness issue — the requester's own retry
                             // (`OgmAuth::build_cert_request`) is the
                             // backstop.
-                            Self::try_flush_pending_cert_reply(
+                            let flushed = Self::try_flush_pending_cert_reply(
                                 auth,
                                 &self.batman,
                                 now,
                                 ogm.orig,
                                 &mut reply,
-                            )
-                            .map(|(next, total)| LinkFrameData {
+                            );
+                            if flushed.is_some() {
+                                self.cert_reply_tx_rate.observe(now, 0);
+                            }
+                            flushed.map(|(next, total)| LinkFrameData {
                                 dst: next,
                                 protocol: ETH_P_BATMAN,
                                 payload: &reply.payload[..total],
@@ -774,6 +816,7 @@ impl CentralRouter {
                                     };
                                     reply.payload[..hdr_len].copy_from_slice(reply_hdr.as_bytes());
                                     reply.payload[hdr_len..total].copy_from_slice(cert_bytes);
+                                    self.cert_reply_tx_rate.observe(now, 0);
                                     return RxOutcome {
                                         forward: Some(LinkFrameData {
                                             dst: next,
@@ -1876,6 +1919,146 @@ mod cert_responder {
         assert_eq!(reply_hdr.packet_type, BATADV_CERT_REPLY);
         assert!(!router.auth().unwrap().has_pending_reply(mac(3)));
     }
+
+    /// A signed *lazy* OGM (`CertFp`, not `Cert`) from `orig_auth`, mirroring
+    /// [`signed_ogm`] but for triggering an unresolved-fingerprint fetch.
+    fn lazy_signed_ogm(orig_auth: &mut auth::OgmAuth, orig: Mac, seqno: u32, ttl: u8) -> Vec<u8> {
+        let ogm_hdr_len = core::mem::size_of::<BatmanOgmPacket>();
+        let mut buf = vec![0u8; 512];
+        let ogm = BatmanOgmPacket {
+            packet_type: BATADV_IV_OGM,
+            version: 5,
+            ttl,
+            flags: 0,
+            seqno: seqno.to_be(),
+            orig,
+            reserved: 0,
+            tq: 255,
+            tvlv_len: 0,
+        };
+        buf[..ogm_hdr_len].copy_from_slice(ogm.as_bytes());
+        let len = orig_auth.augment_ogm_lazy(&mut buf, ogm_hdr_len).unwrap();
+        buf.truncate(len);
+        buf
+    }
+
+    /// Receiving a `CertFp` OGM from a never-seen originator triggers a
+    /// `CertReq` fetch, which must register on the cert-request send-rate
+    /// metric — an operator-visible signal for how often this node is
+    /// fetching certs.
+    #[test]
+    fn fetching_an_unresolved_fingerprint_grows_the_cert_req_tx_rate() {
+        let authority = wayfinder_auth::Authority::from_seed(&[1; 32], 0xABCD);
+        let receiver_kp = wayfinder_auth::Keypair::from_seed(&[1; 32]);
+        let receiver_cert = authority.issue_cert(
+            mac(1),
+            receiver_kp.ed_pubkey(),
+            receiver_kp.x_pubkey(),
+            0,
+            1000,
+        );
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        router.set_auth(auth::OgmAuth::new(
+            receiver_kp,
+            receiver_cert,
+            authority.trust_anchor(),
+        ));
+        router.auth_mut().unwrap().set_time(100);
+        assert_eq!(
+            router.cert_req_tx_rate(core::time::Duration::from_secs(1)),
+            0.0
+        );
+
+        let sender_kp = wayfinder_auth::Keypair::from_seed(&[2; 32]);
+        let sender_cert =
+            authority.issue_cert(mac(2), sender_kp.ed_pubkey(), sender_kp.x_pubkey(), 0, 1000);
+        let mut sender_auth = auth::OgmAuth::new(sender_kp, sender_cert, authority.trust_anchor());
+        sender_auth.set_time(100);
+
+        let ogm_bytes = lazy_signed_ogm(&mut sender_auth, mac(2), 1, 50);
+        let ogm_frame_bytes = link_frame_bytes(2, 0xff, &ogm_bytes);
+        let ogm_frame = LinkFrame::ref_from_bytes(&ogm_frame_bytes).unwrap();
+        let mut tx = [0u8; 512];
+        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, ogm_frame, &mut tx);
+        assert!(
+            outcome.forward.is_some(),
+            "an unresolved fingerprint must trigger a CertReq fetch"
+        );
+
+        assert!(
+            router.cert_req_tx_rate(core::time::Duration::from_secs(1)) > 0.0,
+            "fetching an unresolved cert must register on the cert-request send-rate metric"
+        );
+    }
+
+    /// Answering a `CertReq` — immediately, since a route to the requester
+    /// already exists — must register on the cert-reply send-rate metric.
+    #[test]
+    fn answering_a_cert_req_grows_the_cert_reply_tx_rate() {
+        let authority = wayfinder_auth::Authority::from_seed(&[1; 32], 0xABCD);
+        let responder_kp = wayfinder_auth::Keypair::from_seed(&[1; 32]);
+        let responder_cert = authority.issue_cert(
+            mac(1),
+            responder_kp.ed_pubkey(),
+            responder_kp.x_pubkey(),
+            0,
+            1000,
+        );
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        router.set_auth(auth::OgmAuth::new(
+            responder_kp,
+            responder_cert,
+            authority.trust_anchor(),
+        ));
+        router.auth_mut().unwrap().set_time(100);
+        assert_eq!(
+            router.cert_reply_tx_rate(core::time::Duration::from_secs(1)),
+            0.0
+        );
+
+        let requester_kp = wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let requester_cert = authority.issue_cert(
+            mac(3),
+            requester_kp.ed_pubkey(),
+            requester_kp.x_pubkey(),
+            0,
+            1000,
+        );
+        let mut requester_auth =
+            auth::OgmAuth::new(requester_kp, requester_cert, authority.trust_anchor());
+        requester_auth.set_time(100);
+
+        // Prime a direct route back to the requester (mac(3)).
+        let ogm_bytes = signed_ogm(&mut requester_auth, mac(3), 1, 50);
+        let ogm_frame_bytes = link_frame_bytes(3, 0xff, &ogm_bytes);
+        let ogm_frame = LinkFrame::ref_from_bytes(&ogm_frame_bytes).unwrap();
+        let mut tx = [0u8; 512];
+        router.handle_frame(core::time::Duration::ZERO, 0, ogm_frame, &mut tx);
+
+        let mut req_buf = [0u8; 512];
+        let req_len = requester_auth
+            .build_cert_request(mac(1), [0; 8], mac(3), &mut req_buf)
+            .unwrap();
+        let mut payload = Vec::new();
+        let hdr = BatmanCertReqPacket {
+            packet_type: batman::wire::BATADV_CERT_REQ,
+            version: 5,
+            ttl: 50,
+            dest: mac(1),
+        };
+        payload.extend_from_slice(hdr.as_bytes());
+        payload.extend_from_slice(&req_buf[..req_len]);
+        let req_frame_bytes = link_frame_bytes(3, 1, &payload);
+        let req_frame = LinkFrame::ref_from_bytes(&req_frame_bytes).unwrap();
+        let mut tx = [0u8; 512];
+        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, req_frame, &mut tx);
+        assert!(outcome.forward.is_some(), "must answer immediately");
+
+        assert!(
+            router.cert_reply_tx_rate(core::time::Duration::from_secs(1)) > 0.0,
+            "answering a CertReq must register on the cert-reply send-rate metric"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2737,6 +2920,26 @@ mod lazy_cert_distribution_switchover {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut a = router_with_auth(&authority, mac(1), 2);
         a.set_lazy_cert_distribution(true);
+        let mut tx = [0u8; 1500];
+        let ogm = a.poll(core::time::Duration::ZERO, &mut tx).unwrap().payload;
+        let hdr_len = core::mem::size_of::<batman::wire::BatmanOgmPacket>();
+        assert!(find_tvlv(&ogm[hdr_len..], TvlvType::Cert).is_none());
+        assert!(find_tvlv(&ogm[hdr_len..], TvlvType::CertFp).is_some());
+    }
+
+    /// `apply_runtime_lazy_cert_distribution` has the same wire effect as the
+    /// startup setter, but additionally marks `runtime_config_active` —
+    /// distinguishing a live management-API override from startup wiring,
+    /// which `set_lazy_cert_distribution` alone does not.
+    #[test]
+    fn apply_runtime_lazy_cert_distribution_marks_active_and_switches_emission() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = router_with_auth(&authority, mac(1), 2);
+        assert!(!a.runtime_config_active());
+
+        a.apply_runtime_lazy_cert_distribution(true);
+        assert!(a.runtime_config_active());
+
         let mut tx = [0u8; 1500];
         let ogm = a.poll(core::time::Duration::ZERO, &mut tx).unwrap().payload;
         let hdr_len = core::mem::size_of::<batman::wire::BatmanOgmPacket>();

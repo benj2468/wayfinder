@@ -70,6 +70,11 @@ impl WayfinderDataProvider for ProviderMock {
             paths_mean: 0.0,
             oversize_drops: 0,
             relay_oversize_drops: 0,
+            cert_store: occ(),
+            in_flight_cert_requests: occ(),
+            pending_cert_replies: occ(),
+            cert_req_rate: 0.0,
+            cert_reply_rate: 0.0,
         }
     }
     fn resolve_route(&self, _destination: &[u8]) -> Option<RouteResolutionData> {

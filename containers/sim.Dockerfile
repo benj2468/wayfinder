@@ -38,14 +38,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Wayfinder Lua dissector: lets tshark/termshark decode the BATMAN OGM frames
-# flowing over the RawL2 segments (EtherType 0x4305). Installed into tshark's
-# global Lua plugin directory — queried at build time so it stays correct
-# across Wireshark versions/arches — so every tshark/termshark run loads it.
-COPY libs/wayfinder-shark/wayfinder.lua /tmp/wayfinder.lua
-RUN dir="$(tshark -G folders | awk -F'\t' '/Global Lua Plugins/ {print $NF}')" \
-    && mkdir -p "$dir" \
-    && mv /tmp/wayfinder.lua "$dir/wayfinder.lua" \
-    && echo "wayfinder-sim: installed wayfinder.lua -> $dir"
+# flowing over the RawL2 segments (EtherType 0x4305). NOT installed here at
+# build time — the entrypoint symlinks it in from the /workspace repo mount
+# (see sim/topology.py) on every container start, so an edit to
+# libs/wayfinder-shark/wayfinder.lua on the host takes effect on the next
+# `docker exec`/`topology.py restart` with no image rebuild.
 
 # Entrypoint: render the node config from env + discovered NICs, then exec the
 # node. Generated inline (heredoc) so nothing needs to be COPY'd from the
@@ -74,6 +71,16 @@ CFG=/etc/wayfinder/config.yml
 # name here and resolve identically under `docker exec`.
 
 mkdir -p /etc/wayfinder /etc/wayfinder/secrets
+
+# Wayfinder Lua dissector: symlink from the live /workspace repo mount into
+# tshark's global Lua plugin directory (queried fresh each start so it stays
+# correct across Wireshark versions/arches). A host edit to
+# libs/wayfinder-shark/wayfinder.lua takes effect on the next tshark/termshark
+# invocation with no image rebuild.
+LUA_DIR="$(tshark -G folders | awk -F'\t' '/Global Lua Plugins/ {print $NF}')"
+mkdir -p "$LUA_DIR"
+ln -sf /workspace/libs/wayfinder-shark/wayfinder.lua "$LUA_DIR/wayfinder.lua"
+echo "wayfinder-sim: symlinked wayfinder.lua -> $LUA_DIR" >&2
 
 cat > "$CFG" <<YAML
 local_egress:

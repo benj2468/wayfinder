@@ -56,6 +56,7 @@ def ogm_frame(**ogm_kwargs) -> bytes:
 WF_TVLV_CERT = 0x80
 WF_TVLV_OGM_SIG = 0x81
 WF_TVLV_REVOKE = 0x82
+WF_TVLV_CERTFP = 0x83
 
 
 def tvlv(tvlv_type: int, value: bytes, version: int = 1) -> bytes:
@@ -206,6 +207,19 @@ def test_revoke_signature_decodes(dissect):
     frame = ogm_frame(tvlv=tvlv(WF_TVLV_REVOKE, revocation_record(signature=sig)))
     result = dissect(frame, ["wayfinder.batman.tvlv.revoke.signature"])
     assert result["wayfinder.batman.tvlv.revoke.signature"] == sig.hex()
+
+
+def test_certfp_tvlv_decodes(dissect):
+    """A WF_TVLV_CERTFP record (lazy cert distribution) surfaces the 8-byte
+    fingerprint, labelled and typed distinctly from the full WF_TVLV_CERT."""
+    fp = bytes(range(8))
+    frame = ogm_frame(tvlv=tvlv(WF_TVLV_CERTFP, fp))
+    result = dissect(
+        frame,
+        ["wayfinder.batman.tvlv.type", "wayfinder.batman.tvlv.cert_fp"],
+    )
+    assert result["wayfinder.batman.tvlv.type"] == "0x83"
+    assert result["wayfinder.batman.tvlv.cert_fp"] == fp.hex()
 
 
 def test_walk_handles_cert_sig_then_revoke(dissect):
