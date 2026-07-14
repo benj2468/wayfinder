@@ -4,7 +4,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use wayfinder_auth::{MembershipCert, TrustAnchor};
+use wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
 use wayfinderctl::cert::{self, CertCommand};
 
 /// Run the full init-ca → keygen → issue flow into a temp dir and return the
@@ -31,7 +31,7 @@ fn issue_into_tmp(mesh_id: u32) -> (tempfile::TempDir, Vec<u8>, Vec<u8>) {
     cert::run(CertCommand::Issue {
         ca_seed: root.clone(),
         mesh_id,
-        mac: "02:00:00:00:00:09".into(),
+        mac: Some("02:00:00:00:00:09".into()),
         node_seed: node.clone(),
         not_before: 0,
         not_after: 1_000_000,
@@ -61,6 +61,50 @@ fn issued_cert_verifies_against_written_anchor() {
         .verify_cert(&cert, 500)
         .expect("issued cert verifies within its window against its own anchor");
     assert_eq!(verified.mac.0, [0x02, 0, 0, 0, 0, 9]);
+}
+
+/// Omitting `--mac` must derive the issued cert's MAC from `--node-seed`'s
+/// keypair, rather than requiring the operator to pick one — the same
+/// derivation `wayfinder-tap` applies at startup, so a manually-provisioned
+/// node's cert matches the MAC it will actually run under.
+#[test]
+fn issue_without_mac_derives_it_from_the_node_seed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root.seed");
+    let anchor = dir.path().join("anchor.bin");
+    let node = dir.path().join("node.seed");
+    let cert = dir.path().join("node.cert");
+
+    cert::run(CertCommand::InitCa {
+        mesh_id: 0xABCD,
+        seed: None,
+        generate: true,
+        out_seed: Some(root.clone()),
+        out_anchor: anchor.clone(),
+    })
+    .unwrap();
+    cert::run(CertCommand::Keygen {
+        out_seed: Some(node.clone()),
+    })
+    .unwrap();
+    cert::run(CertCommand::Issue {
+        ca_seed: root.clone(),
+        mesh_id: 0xABCD,
+        mac: None,
+        node_seed: node.clone(),
+        not_before: 0,
+        not_after: 1_000_000,
+        out_cert: cert.clone(),
+    })
+    .unwrap();
+
+    let node_seed: [u8; 32] = std::fs::read(&node).unwrap().try_into().unwrap();
+    let expected_mac = Keypair::from_seed(&node_seed).derived_mac();
+
+    let anchor = TrustAnchor::from_bytes(&std::fs::read(&anchor).unwrap()).unwrap();
+    let cert = MembershipCert::from_bytes(&std::fs::read(&cert).unwrap()).unwrap();
+    let verified = anchor.verify_cert(&cert, 500).expect("cert verifies");
+    assert_eq!(verified.mac, expected_mac);
 }
 
 #[test]

@@ -26,6 +26,7 @@ std = ["dep:async-trait", "wayfinder/std"]
 
 [dependencies]
 wayfinder.workspace = true
+wayfinder-driver-core.workspace = true
 interfaces.workspace = true
 wayfinder-protos.workspace = true
 wayfinder-server.workspace = true

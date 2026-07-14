@@ -21,6 +21,7 @@ use wayfinder::config::{
     Config, LinkTransport, LocalDistributionMechanism, ServerConfig, TrickleConfig,
 };
 use wayfinder::interfaces::frame::Mac;
+use wayfinder::wayfinder_auth::Keypair;
 use wayfinder_driver::{
     Driver, QueryRx, QueryTx, Rylr998LinkParams, bind_tcp_server, bind_udp_server,
     bind_unix_server, build_raw_ip_link, build_raw_l2_link, build_rylr998_link, build_udp_link,
@@ -35,6 +36,50 @@ pub struct Args {
     /// Path to the YAML configuration file.
     #[clap(short, long, default_value = "var/conf/install.yml")]
     pub(crate) config: PathBuf,
+}
+
+/// Load this node's persisted identity keypair from a 32-byte seed file.
+fn load_keypair(seed_path: &str) -> anyhow::Result<Keypair> {
+    let seed: [u8; 32] = std::fs::read(seed_path)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("identity seed at {seed_path} must be 32 bytes"))?;
+    Ok(Keypair::from_seed(&seed))
+}
+
+/// Read this node's persisted TAP MAC from `state_path`, or generate one and
+/// persist it on first boot. Used when mesh auth is not configured, so there
+/// is no identity keypair to derive a stable MAC from — without this, the
+/// kernel would hand out a fresh random MAC (and mesh identity) on every
+/// restart.
+fn load_or_generate_mac(state_path: &str) -> anyhow::Result<[u8; 6]> {
+    match std::fs::read(state_path) {
+        Ok(bytes) => bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("MAC state file at {state_path} must be 6 bytes")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Reuse `Keypair::generate`'s OS-RNG plumbing rather than taking a
+            // direct `getrandom` dependency here; the keypair itself is
+            // discarded; only its derived MAC bytes are persisted.
+            let mac = wayfinder::wayfinder_auth::Keypair::generate()
+                .derived_mac()
+                .0;
+            if let Some(parent) = Path::new(state_path).parent() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create MAC state directory {}", parent.display())
+                })?;
+            }
+            std::fs::write(state_path, mac)
+                .with_context(|| format!("failed to persist generated MAC to {state_path}"))?;
+            tracing::info!(
+                state_path,
+                "generated and persisted a new stable MAC address"
+            );
+            Ok(mac)
+        }
+        Err(e) => Err(e).with_context(|| format!("failed to read MAC state file at {state_path}")),
+    }
 }
 
 #[tokio::main]
@@ -64,10 +109,25 @@ async fn main() -> anyhow::Result<()> {
     // carrier once wrapped in BATMAN + link + auth encapsulation; without this,
     // full-size frames would be silently truncated on read or dropped on wrap.
     let mtu = tap.mtu.unwrap_or(wayfinder::config::TapConfig::DEFAULT_MTU);
+
+    // Decide this node's MAC *before* creating the TAP device, rather than
+    // trusting whatever the kernel assigns a freshly-created device — that is
+    // random on every restart and would silently change this node's mesh
+    // identity (and, with auth enabled, its cert would stop matching) each
+    // time it starts. When mesh auth is configured, derive the MAC from the
+    // persisted identity keypair, so it is stable across restarts and
+    // self-consistent with the MAC the membership cert is bound to. Otherwise
+    // fall back to a MAC generated once and persisted to `tap.mac_state_path`.
+    let mac_addr = match &config.auth {
+        Some(auth_cfg) => load_keypair(&auth_cfg.seed_path)?.derived_mac().0,
+        None => load_or_generate_mac(&tap.resolved_mac_state_path())?,
+    };
+
     let mut builder = DeviceBuilder::new()
         .layer(Layer::L2)
         .name(&tap.device_name)
-        .mtu(mtu);
+        .mtu(mtu)
+        .mac_addr(mac_addr);
     // The IPv4 address/netmask are optional: when no address is configured the
     // TAP is brought up unaddressed (the mesh routes on MAC, not IP).
     if let Some(ip_address) = tap.ip_address {
@@ -80,7 +140,6 @@ async fn main() -> anyhow::Result<()> {
         .build_async()
         .context("failed to craete TAP device")?;
 
-    let mac_addr = dev.mac_address().context("unable to get mac address")?;
     tracing::info!(
         "Starting wayfinder with MAC address: {:?}",
         pretty_hex::simple_hex(&mac_addr)
@@ -205,13 +264,9 @@ async fn main() -> anyhow::Result<()> {
     let mut auth_mesh_id: Option<u32> = None;
     if let Some(auth_cfg) = config.auth {
         use wayfinder::auth::OgmAuth;
-        use wayfinder::wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
+        use wayfinder::wayfinder_auth::{MembershipCert, TrustAnchor};
 
-        let seed: [u8; 32] = std::fs::read(&auth_cfg.seed_path)?
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("identity seed at {} must be 32 bytes", auth_cfg.seed_path))?;
-        let keypair = Keypair::from_seed(&seed);
+        let keypair = load_keypair(&auth_cfg.seed_path)?;
 
         let cert_bytes = std::fs::read(&auth_cfg.cert_path)?;
         let cert = MembershipCert::from_bytes(&cert_bytes)

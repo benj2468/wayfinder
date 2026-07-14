@@ -767,12 +767,12 @@ checksum = "9eb1aa714776b75c7e67e1da744b81a129b3ff919c8712b5e1b32252c1f07cc7"
 
 [[package]]
 name = "embedded-io-adapters"
-version = "0.6.2"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90ccf22c3feffc79593914c0b4be9a2ed6b11e44cf1f84fd6b77d2ee92de0077"
+checksum = "c900a1c087f1f7d17cdc84a1290df91521cd90933efa76d68e568385d889f2f4"
 dependencies = [
- "embedded-io 0.6.1",
- "embedded-io-async 0.6.1",
+ "embedded-io 0.7.1",
+ "embedded-io-async 0.7.0",
  "tokio",
 ]
 
@@ -1185,7 +1185,7 @@ name = "interfaces"
 version = "0.1.0"
 dependencies = [
  "embedded-io-adapters",
- "embedded-io-async 0.6.1",
+ "embedded-io-async 0.7.0",
  "etherparse",
  "heapless",
  "rustc-std-workspace-core",
@@ -1840,6 +1840,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtt-target"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10b34c9e6832388e45f3c01f1bb60a016384a0a4ad80cdd7d34913bed25037f0"
+dependencies = [
+ "critical-section",
+ "ufmt-write",
+]
+
+[[package]]
 name = "rustc-std-workspace-core"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1900,9 +1910,9 @@ name = "rylr998"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "embedded-io 0.6.1",
+ "embedded-io 0.7.1",
  "embedded-io-adapters",
- "embedded-io-async 0.6.1",
+ "embedded-io-async 0.7.0",
  "heapless",
  "rylr998-sim",
  "thiserror",
@@ -1915,10 +1925,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rylr998-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "embedded-io-adapters",
+ "embedded-io-async 0.7.0",
+ "heapless",
+ "rylr998",
+ "rylr998-sim",
+ "tokio",
+ "tokio-serial",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rylr998-sim"
 version = "0.1.0"
 dependencies = [
- "embedded-io 0.6.1",
+ "embedded-io 0.7.1",
  "embedded-io-adapters",
  "rylr998",
  "tokio",
@@ -2420,6 +2447,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
+name = "ufmt-write"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e87a2ed6b42ec5e28cc3b94c09982969e9227600b2e3dcbc1db927a84c06bd69"
+
+[[package]]
 name = "unescaper"
 version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2623,7 +2656,7 @@ version = "0.1.0"
 dependencies = [
  "batman",
  "dynosaur",
- "embedded-io-async 0.6.1",
+ "embedded-io-async 0.7.0",
  "heapless",
  "interfaces",
  "serde",
@@ -2688,7 +2721,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "embedded-io-adapters",
- "embedded-io-async 0.6.1",
+ "embedded-io-async 0.7.0",
  "etherparse",
  "futures",
  "interfaces",
@@ -2700,9 +2733,44 @@ dependencies = [
  "tokio-serial",
  "tracing",
  "wayfinder",
+ "wayfinder-driver-core",
  "wayfinder-protos",
  "wayfinder-server",
  "zerocopy",
+]
+
+[[package]]
+name = "wayfinder-driver-core"
+version = "0.1.0"
+dependencies = [
+ "interfaces",
+ "tracing",
+ "wayfinder",
+ "wayfinder-auth",
+ "zerocopy",
+]
+
+[[package]]
+name = "wayfinder-embedded-driver"
+version = "0.1.0"
+dependencies = [
+ "embassy-futures",
+ "futures",
+ "heapless",
+ "interfaces",
+ "tracing",
+ "wayfinder",
+ "wayfinder-driver-core",
+ "zerocopy",
+]
+
+[[package]]
+name = "wayfinder-embedded-log"
+version = "0.1.0"
+dependencies = [
+ "heapless",
+ "rtt-target",
+ "tracing-core",
 ]
 
 [[package]]
@@ -2760,7 +2828,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "embassy-sync",
- "embedded-io-async 0.6.1",
+ "embedded-io-async 0.7.0",
  "futures",
  "heapless",
  "interfaces",

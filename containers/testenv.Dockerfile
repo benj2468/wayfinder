@@ -12,6 +12,10 @@ RUN apt-get update \
 RUN rustup component add llvm-tools-preview
 RUN rustup component add clippy
 
+# Bare-metal target for the embedded (`no_std`) crates (see build:embedded in
+# .gitlab-ci.yml) — Tier 2 with prebuilt core/alloc, so no nightly required.
+RUN rustup target add thumbv7em-none-eabihf
+
 # Install cargo-nextest and cargo-llvm-cov binaries using pre-compiled installers
 # (Much faster than running `cargo install` inside the Dockerfile)
 RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash

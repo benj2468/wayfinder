@@ -1,0 +1,30 @@
+[package]
+name = "wayfinder-driver-core"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+# The router-orchestration logic shared by the `std`/tokio `wayfinder-driver`
+# and the `no_std` `wayfinder-embedded-driver`.  `no_std` itself: it holds no
+# event loop and owns no buffers — it plans a received frame or a due OGM into
+# `emit`/`deliver_local` callbacks on a caller-supplied [`MeshSink`], so each
+# driver keeps its own async loop and its own (Vec vs. heapless) staging.
+
+[dependencies]
+# Pinned directly (not workspace inheritance, which can't override
+# `default-features`) so the shared core stays `no_std` — no `alloc`, no `std`.
+wayfinder = { path = "../wayfinder", default-features = false }
+interfaces.workspace = true
+zerocopy.workspace = true
+# Pinned directly (not workspace inheritance, which can't override
+# `default-features`) so tracing's `std` feature stays off for the `no_std`
+# build — the same reason `libs/wayfinder` pins it.
+tracing = { version = "0.1.44", default-features = false }
+
+[dev-dependencies]
+# The CA (`Authority`) used only in tests to mint membership certs and drive the
+# auth-on paths (`strip_directed`/`tag_directed_into`); `std`-gated, so it's a
+# dev-dependency and never touches the `no_std` build.
+wayfinder-auth = { workspace = true, features = ["std"] }

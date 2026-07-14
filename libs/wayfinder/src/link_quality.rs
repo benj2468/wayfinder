@@ -69,6 +69,16 @@ impl<Ident: MeshIdentifier> LinkQualityTable<Ident> {
         self.entries.clear();
     }
 
+    /// Drop every row whose neighbor `is_live` reports `false` for, taking all
+    /// of that neighbor's `(neighbor, iface_idx)` entries with it.  Called
+    /// after the routing engine purges stale originators, so a neighbor's
+    /// link-quality rows can never outlive its presence in the routing table
+    /// (otherwise inspection APIs would keep reporting a neighbor as reachable
+    /// long after the routing table has forgotten it).
+    pub fn retain_live(&mut self, mut is_live: impl FnMut(Ident) -> bool) {
+        self.entries.retain(|e| is_live(e.neighbor));
+    }
+
     /// Fold a new normalized quality sample for `(neighbor, iface_idx)` into
     /// the table.  Creates a fresh entry if the pair has not been seen
     /// before, evicting the weakest existing entry when the table is at
@@ -285,6 +295,51 @@ mod tests {
         let mut table = LinkQualityTable::<u8>::new();
         table.update(2, 0, 200);
         assert_eq!(table.best_interface_for(99), None);
+    }
+
+    #[test]
+    fn retain_live_drops_dead_neighbor() {
+        let mut table = LinkQualityTable::<u8>::new();
+        table.update(2, 0, 200);
+        table.update(3, 0, 200);
+        table.retain_live(|neighbor| neighbor == 2);
+        assert_eq!(table.best_interface_for(2), Some(0));
+        assert_eq!(table.best_interface_for(3), None);
+        table.assert_invariants();
+    }
+
+    #[test]
+    fn retain_live_drops_all_ifaces_of_dead_neighbor() {
+        let mut table = LinkQualityTable::<u8>::new();
+        table.update(5, 0, 200);
+        table.update(5, 1, 150);
+        table.update(5, 2, 100);
+        table.retain_live(|neighbor| neighbor != 5);
+        assert_eq!(table.quality_for(5, 0), None);
+        assert_eq!(table.quality_for(5, 1), None);
+        assert_eq!(table.quality_for(5, 2), None);
+        table.assert_invariants();
+    }
+
+    #[test]
+    fn retain_live_keeps_all_ifaces_of_live_neighbor() {
+        let mut table = LinkQualityTable::<u8>::new();
+        table.update(5, 0, 200);
+        table.update(5, 1, 150);
+        table.update(5, 2, 100);
+        table.retain_live(|neighbor| neighbor == 5);
+        assert_eq!(table.quality_for(5, 0), Some(200));
+        assert_eq!(table.quality_for(5, 1), Some(150));
+        assert_eq!(table.quality_for(5, 2), Some(100));
+        table.assert_invariants();
+    }
+
+    #[test]
+    fn retain_live_on_empty_is_noop() {
+        let mut table = LinkQualityTable::<u8>::new();
+        table.retain_live(|_| false);
+        assert_eq!(table.best_interface_for(1), None);
+        table.assert_invariants();
     }
 
     #[test]

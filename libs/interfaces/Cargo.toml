@@ -7,13 +7,20 @@ edition = "2024"
 workspace = true
 
 [dependencies]
-thiserror.workspace = true
+# Pinned directly (not workspace inheritance, which can't override
+# default-features) so `default-features = false` keeps thiserror's `std`
+# feature off — it still gates `impl core::error::Error` behind `std`, and the
+# workspace default would break this crate's `no_std` build.
+thiserror = { version = "2.0.18", default-features = false }
 zerocopy = { version = "0.8.48", features = ["derive"] }
 embedded-io-async.workspace = true
 heapless.workspace = true
 core = { version = "1.0", package = "rustc-std-workspace-core", optional = true }
-etherparse.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
 embedded-io-adapters.workspace = true
+# Only used by the crate's #[cfg(test)] frame-parsing tests; kept out of
+# [dependencies] so it doesn't drag its default `std` feature into `no_std`
+# (embedded) builds of this crate.
+etherparse.workspace = true

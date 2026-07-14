@@ -1,0 +1,33 @@
+[package]
+name = "rylr998-cli"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "rylr998-cli"
+path = "src/main.rs"
+
+[lib]
+name = "rylr998_cli"
+path = "src/lib.rs"
+
+[dependencies]
+# default-features = false: this CLI only drives the bare AT-command
+# interface, not the `link` feature's `LinkT`/mesh-frame integration
+# (wayfinder, zerocopy).
+rylr998 = { path = "../../libs/rylr998", default-features = false }
+embedded-io-async.workspace = true
+embedded-io-adapters.workspace = true
+tokio-serial.workspace = true
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+rylr998-sim = { path = "../../libs/rylr998-sim" }
+heapless.workspace = true

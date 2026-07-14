@@ -1,0 +1,499 @@
+//! A `no_std`, HAL-agnostic driver that runs the wayfinder router's event loop
+//! on bare metal.
+//!
+//! This is the embedded counterpart to `wayfinder-driver` (the tokio/`std`
+//! loop).  Both share the same synchronous planning logic in
+//! [`wayfinder-driver-core`]; the difference is the loop around it.  Here the
+//! loop is a plain `async fn` — the board's executor (embassy, RTIC, …) drives
+//! [`Driver::run`] — and it races each mesh link's `recv` against a periodic
+//! OGM timer with [`embassy_futures::select`], staging outgoing frames into a
+//! fixed [`heapless`] buffer instead of a heap `Vec`.
+//!
+//! The driver depends on **no vendor HAL and no concrete time driver**: a board
+//! supplies the concrete mesh links ([`LinkT`]) and a [`Clock`], so the same
+//! code runs on the nRF52840 and on any Cortex-M.
+//!
+//! # Milestone scope
+//!
+//! Today this is a **radio relay**: it drives the mesh interfaces (OGM exchange,
+//! forwarding, per-link Trickle timers) only.  There is no local host device,
+//! management API, or IGMP snoop yet, and OGM authentication time is not wired
+//! (a board can still enable auth via [`Driver::router_mut`]).
+//!
+//! [`wayfinder-driver-core`]: https://docs.rs/wayfinder-driver-core
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+use core::time::Duration;
+
+use embassy_futures::select::{Either, select, select_array};
+use heapless::Vec as HVec;
+use tracing::{trace, warn};
+use wayfinder::auth::DIRECTED_TRAILER_LEN;
+use wayfinder::interfaces::frame::{LinkFrameData, MAX_LINK_FRAME_LEN, Mac};
+use wayfinder::link::LinkT;
+use wayfinder::{CentralRouter, EgressInterface, MAX_INTERFACES};
+use wayfinder_driver_core::{
+    Egress, MeshSink, OutgoingFrame, handle_mesh_frame, poll_due_ogms, tag_directed_into,
+};
+
+/// A monotonic clock plus an async delay — the one piece of platform the driver
+/// can't provide itself.
+///
+/// A board implements this over its executor's timer (e.g. `embassy_time`):
+/// [`now`](Self::now) reads the monotonic time since boot as a
+/// [`core::time::Duration`] (the same clock the router ages routes against), and
+/// [`sleep`](Self::sleep) completes after `duration` has elapsed.
+// A native `async fn` in a trait, driven by static dispatch on embedded — the
+// same shape (and same lint waiver) as [`LinkT`]; no `Send` bound is needed on
+// a single-core embedded executor.
+#[allow(async_fn_in_trait)]
+pub trait Clock {
+    /// The monotonic time since a fixed reference (typically boot).
+    fn now(&self) -> Duration;
+
+    /// Complete after `duration` has elapsed on this clock.
+    async fn sleep(&self, duration: Duration);
+}
+
+/// One mesh interface's adaptive (Trickle) OGM schedule: emission starts at
+/// `i_min` and backs off (doubling) toward `i_max` while the topology is stable,
+/// snapping back to `i_min` on any change.  The `no_std` counterpart to
+/// `wayfinder::config::TrickleConfig` (which is `alloc`-gated by its YAML
+/// parsing) — a board hardcodes these rather than parsing a config file.
+#[derive(Debug, Clone, Copy)]
+pub struct TrickleParams {
+    /// Minimum OGM interval — how quickly a link reconverges after a change.
+    pub i_min: Duration,
+    /// Maximum OGM interval — how quiet a stable link becomes.
+    pub i_max: Duration,
+}
+
+impl Default for TrickleParams {
+    /// `i_min = 1 s`, `i_max = 128 s` — the same defaults as
+    /// `wayfinder::config::TrickleConfig`.
+    fn default() -> Self {
+        Self {
+            i_min: Duration::from_secs(1),
+            i_max: Duration::from_secs(128),
+        }
+    }
+}
+
+/// The widest fan-out a single planning call produces today: one OGM per
+/// interface (`poll_due_ogms`), or a single re-flood/forward from a received
+/// frame.  Selective-multicast fan-out (one copy per listener) is deferred, and
+/// will need a larger bound when it lands on embedded.
+const STAGE_CAP: usize = MAX_INTERFACES;
+
+/// One outgoing frame staged between synchronous planning and async dispatch,
+/// owning its payload so the transmit scratchpad can be reused immediately.
+struct Staged {
+    dst: Mac,
+    protocol: u16,
+    payload: HVec<u8, MAX_LINK_FRAME_LEN>,
+    egress: Egress,
+}
+
+/// A [`MeshSink`] that stages planned frames into a fixed [`heapless`] buffer
+/// (no heap), to be drained by the async dispatch step.
+#[derive(Default)]
+struct StageSink {
+    frames: HVec<Staged, STAGE_CAP>,
+}
+
+impl MeshSink for StageSink {
+    fn emit(&mut self, frame: OutgoingFrame<'_>) {
+        let mut payload = HVec::new();
+        if payload.extend_from_slice(frame.payload).is_err() {
+            warn!(
+                len = frame.payload.len(),
+                "drop: staged payload exceeds frame buffer"
+            );
+            return;
+        }
+        let staged = Staged {
+            dst: frame.dst,
+            protocol: frame.protocol,
+            payload,
+            egress: frame.egress,
+        };
+        if self.frames.push(staged).is_err() {
+            warn!("drop: staging buffer full");
+        }
+    }
+    // `deliver_local` keeps its default no-op: a radio relay has no host device.
+}
+
+/// The embedded router event loop and the state it owns.
+///
+/// `L` is the mesh-link type (a single concrete link, or a board-defined `enum`
+/// dispatching across mixed media); `C` is the board's [`Clock`]; `N` is the
+/// number of mesh interfaces.  All state is fixed-capacity, so a `Driver` is a
+/// single long-lived value (typically a `static` or held in the executor task).
+pub struct Driver<L, C, const N: usize> {
+    router: CentralRouter,
+    links: [L; N],
+    clock: C,
+    mac: Mac,
+    tx_buffer: [u8; MAX_LINK_FRAME_LEN],
+    stage: StageSink,
+}
+
+impl<L: LinkT, C: Clock, const N: usize> Driver<L, C, N> {
+    /// Build a driver for node `mac` over the given mesh `links` and `clock`.
+    /// `trickle` supplies each interface's adaptive OGM bounds
+    /// ([`TrickleParams`]), in interface order; interfaces without an entry fall
+    /// back to [`TrickleParams::default`].
+    pub fn new(mac: Mac, links: [L; N], clock: C, trickle: &[TrickleParams]) -> Self {
+        // The router only tracks `MAX_INTERFACES` interfaces; a board with more
+        // links would have its extra interfaces silently never scheduled for
+        // OGMs (`configure_interface_ogm` no-ops past the cap). Catch that board
+        // misconfiguration at dev time rather than shipping a partly-mute node.
+        debug_assert!(
+            N <= MAX_INTERFACES,
+            "Driver supports at most MAX_INTERFACES mesh interfaces"
+        );
+        let mut router = CentralRouter::new(mac);
+        // Install each interface's adaptive OGM schedule up front so the
+        // periodic timer has a per-interface schedule to consult from the start.
+        for idx in 0..N {
+            let cfg = trickle.get(idx).copied().unwrap_or_default();
+            router.configure_interface_ogm(idx, cfg.i_min, cfg.i_max, Duration::ZERO);
+        }
+        Self {
+            router,
+            links,
+            clock,
+            mac,
+            tx_buffer: [0u8; MAX_LINK_FRAME_LEN],
+            stage: StageSink::default(),
+        }
+    }
+
+    /// The underlying router, for inspecting routing state (originator tables,
+    /// link quality, route resolution).
+    pub fn router(&self) -> &CentralRouter {
+        &self.router
+    }
+
+    /// The underlying router, mutably — lets a board enable OGM authentication
+    /// or inject crafted state before/while running the loop.
+    pub fn router_mut(&mut self) -> &mut CentralRouter {
+        &mut self.router
+    }
+
+    /// Run the event loop forever.  Never returns; the board spawns this on its
+    /// executor.
+    pub async fn run(&mut self) -> ! {
+        loop {
+            self.run_once().await;
+        }
+    }
+
+    /// Run a single iteration: race each mesh link's `recv` against the periodic
+    /// OGM timer, plan the winner into staged frames, then dispatch them onto
+    /// the mesh.
+    pub async fn run_once(&mut self) {
+        let now = self.clock.now();
+        // When the soonest interface is next due to emit an OGM.  Recomputed
+        // every iteration, so a timer reset by the frame just processed shortens
+        // the next sleep automatically.
+        let due = self.router.next_broadcast_after(now);
+
+        // Destructure into disjoint field borrows so the planning step can hold
+        // a borrow of `links` (via the recv futures) alongside `router`/`stage`.
+        let Driver {
+            router,
+            links,
+            clock,
+            mac,
+            tx_buffer,
+            stage,
+        } = self;
+        stage.frames.clear();
+
+        // Build one `recv` future per link and race them against the OGM timer.
+        // `select_array` reports which link fired; an empty link set (`N == 0`)
+        // is pending forever, so the timer arm still drives OGM emission.
+        let recv_futs = links.each_mut().map(|link| link.recv());
+        match select(select_array(recv_futs), clock.sleep(due)).await {
+            Either::First((result, idx)) => match result {
+                Ok(received) => {
+                    trace!(iface = idx, "rx frame from interface");
+                    handle_mesh_frame(
+                        now,
+                        router,
+                        idx,
+                        received.frame,
+                        received.metrics,
+                        tx_buffer,
+                        stage,
+                    );
+                }
+                Err(e) => {
+                    trace!(iface = idx, error = ?e, "drop: link recv error");
+                }
+            },
+            Either::Second(()) => {
+                trace!("polling OGMs");
+                poll_due_ogms(router, now, tx_buffer, stage);
+            }
+        }
+
+        // The select's futures are dropped here, freeing `links` to be borrowed
+        // mutably again for dispatch.
+        dispatch(links, router, *mac, now, stage).await;
+    }
+}
+
+/// Drain the staged frames onto the mesh: authenticate each directed frame with
+/// a pairwise tag (when auth is on), then send it out the interface(s) the
+/// egress plan selects, recording the transmit for throughput accounting.
+async fn dispatch<L: LinkT, const N: usize>(
+    links: &mut [L; N],
+    router: &mut CentralRouter,
+    mac: Mac,
+    now: Duration,
+    stage: &mut StageSink,
+) {
+    for i in 0..stage.frames.len() {
+        let dst = stage.frames[i].dst;
+        let protocol = stage.frames[i].protocol;
+        let egress = stage.frames[i].egress;
+        let body_len = stage.frames[i].payload.len();
+
+        // Reserve the trailer bytes and let the shared core write the pairwise
+        // tag into them when this directed frame needs one, returning how much
+        // to actually send (see `tag_directed_into`).
+        if stage.frames[i]
+            .payload
+            .resize(body_len + DIRECTED_TRAILER_LEN, 0)
+            .is_err()
+        {
+            warn!("drop: no room for auth trailer");
+            continue;
+        }
+        let Some(send_len) = tag_directed_into(
+            router,
+            dst,
+            protocol,
+            body_len,
+            &mut stage.frames[i].payload,
+        ) else {
+            continue; // auth on but untaggable — drop rather than emit in clear
+        };
+
+        let data = LinkFrameData {
+            dst,
+            protocol,
+            payload: &stage.frames[i].payload[..send_len],
+        };
+
+        match egress {
+            // A per-link OGM goes out exactly one interface, on its own schedule.
+            Egress::Iface(iface_idx) => {
+                send_on(links, router, iface_idx, mac, &data, now).await;
+            }
+            // Otherwise let the router's metric-driven egress choice decide.
+            Egress::Auto { exclude } => match router.get_egress_interface(dst) {
+                Some(EgressInterface::All) => {
+                    for idx in 0..N {
+                        // Split-horizon: skip the interface a re-flood arrived on.
+                        if Some(idx) == exclude {
+                            continue;
+                        }
+                        send_on(links, router, idx, mac, &data, now).await;
+                    }
+                }
+                Some(EgressInterface::Interface(iface_idx)) => {
+                    send_on(links, router, iface_idx, mac, &data, now).await;
+                }
+                None => {}
+            },
+        }
+    }
+}
+
+/// Send one framed datagram out interface `idx`, folding the byte count into the
+/// interface's transmit-rate estimator; a send error is logged and dropped
+/// (fire-and-forget, matching the tokio driver's `LinkError` handling on radios).
+async fn send_on<L: LinkT, const N: usize>(
+    links: &mut [L; N],
+    router: &mut CentralRouter,
+    idx: usize,
+    mac: Mac,
+    data: &LinkFrameData<'_>,
+    now: Duration,
+) {
+    if let Some(link) = links.get_mut(idx) {
+        match link.send(mac, data).await {
+            Ok(sent) => router.record_tx(idx, sent, now),
+            Err(e) => warn!(iface = idx, error = ?e, "drop: link send failed"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use std::vec::Vec;
+
+    use super::*;
+    use interfaces::link::{LinkError, LinkMetrics};
+    use wayfinder::batman::wire::{BATADV_IV_OGM, BatmanOgmPacket};
+    use wayfinder::interfaces::frame::LinkFrame;
+    use wayfinder::link::Received;
+    use zerocopy::{FromBytes, IntoBytes};
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    /// The raw bytes of a bare 1-hop OGM from `orig` — BATMAN header only, no
+    /// TVLVs (auth-off), enough for the engine to re-flood it.
+    fn bare_ogm_bytes(orig: Mac, seqno: u32, ttl: u8) -> Vec<u8> {
+        let ogm = BatmanOgmPacket {
+            packet_type: BATADV_IV_OGM,
+            version: 5,
+            ttl,
+            flags: 0,
+            seqno: seqno.to_be(),
+            orig,
+            reserved: 0,
+            tq: 255,
+            tvlv_len: 0,
+        };
+        ogm.as_bytes().to_vec()
+    }
+
+    /// The raw bytes of a link frame: `[dst][src][protocol be][payload]`.
+    fn link_frame_bytes(dst: Mac, src: Mac, protocol: u16, payload: &[u8]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(dst.as_bytes());
+        raw.extend_from_slice(src.as_bytes());
+        raw.extend_from_slice(&protocol.to_be_bytes());
+        raw.extend_from_slice(payload);
+        raw
+    }
+
+    /// A fake mesh link: `send` records the framed datagram. `recv` yields the
+    /// frame staged in `to_recv` (parked forever once `None`), so a test can feed
+    /// exactly one received frame and observe how it is dispatched.
+    #[derive(Default)]
+    struct FakeLink {
+        sent: Vec<(Mac, u16, Vec<u8>)>,
+        to_recv: Option<Vec<u8>>,
+    }
+
+    impl LinkT for FakeLink {
+        async fn send(
+            &mut self,
+            _origin: Mac,
+            data: &LinkFrameData<'_>,
+        ) -> Result<usize, LinkError> {
+            self.sent
+                .push((data.dst, data.protocol, data.payload.to_vec()));
+            Ok(data.payload.len())
+        }
+
+        async fn recv(&mut self) -> Result<Received<'_>, LinkError> {
+            match self.to_recv.as_deref() {
+                Some(bytes) => Ok(Received {
+                    frame: LinkFrame::ref_from_bytes(bytes).expect("valid staged frame"),
+                    metrics: LinkMetrics::default(),
+                }),
+                None => core::future::pending().await,
+            }
+        }
+    }
+
+    /// A clock frozen at a chosen instant whose `sleep` returns immediately, so
+    /// a single `run_once` deterministically takes the periodic-OGM arm.
+    struct ImmediateClock {
+        now: Duration,
+    }
+
+    impl Clock for ImmediateClock {
+        fn now(&self) -> Duration {
+            self.now
+        }
+        async fn sleep(&self, _duration: Duration) {}
+    }
+
+    /// A clock whose `sleep` never completes, so a ready `recv` always wins the
+    /// `select` — used to drive the received-frame (forwarding) arm of the loop
+    /// deterministically, rather than the periodic-OGM timer arm.
+    struct RecvClock {
+        now: Duration,
+    }
+
+    impl Clock for RecvClock {
+        fn now(&self) -> Duration {
+            self.now
+        }
+        async fn sleep(&self, _duration: Duration) {
+            core::future::pending().await
+        }
+    }
+
+    /// One `run_once` at an instant where the single interface is due emits an
+    /// OGM broadcast out that interface — the full embedded path: clock →
+    /// `poll_due_ogms` → stage → dispatch → `LinkT::send`.
+    #[test]
+    fn run_once_emits_due_ogm_out_the_interface() {
+        let trickle = [TrickleParams::default()];
+        let clock = ImmediateClock {
+            now: Duration::from_secs(30),
+        };
+        let mut driver = Driver::new(mac(1), [FakeLink::default()], clock, &trickle);
+
+        futures::executor::block_on(driver.run_once());
+
+        let sent = &driver.links[0].sent;
+        assert_eq!(sent.len(), 1, "one due interface => one OGM emission");
+        let (dst, protocol, _payload) = &sent[0];
+        assert_eq!(*dst, Mac::BROADCAST);
+        assert_eq!(*protocol, wayfinder::DEFAULT_BATMAN_ETHER_TYPE);
+    }
+
+    /// A `run_once` where a received OGM (on interface 0) is re-flooded exercises
+    /// the embedded dispatch's `Egress::Auto` fan-out: the OGM goes out the
+    /// *other* interface (1) and not back out the ingress interface (0) —
+    /// split-horizon across the full recv → handle → stage → dispatch path.
+    #[test]
+    fn run_once_reforwards_received_ogm_to_other_interface_only() {
+        let ogm = link_frame_bytes(
+            Mac::BROADCAST,
+            mac(2),
+            wayfinder::DEFAULT_BATMAN_ETHER_TYPE,
+            &bare_ogm_bytes(mac(2), 1, 50),
+        );
+        let link0 = FakeLink {
+            to_recv: Some(ogm),
+            ..Default::default()
+        };
+        let link1 = FakeLink::default();
+        // `RecvClock` keeps the OGM timer from firing, so the ready recv wins.
+        let clock = RecvClock {
+            now: Duration::from_secs(1),
+        };
+        let trickle = [TrickleParams::default(), TrickleParams::default()];
+        let mut driver = Driver::new(mac(1), [link0, link1], clock, &trickle);
+
+        futures::executor::block_on(driver.run_once());
+
+        assert!(
+            driver.links[0].sent.is_empty(),
+            "split-horizon: no re-flood back out the ingress interface"
+        );
+        assert_eq!(
+            driver.links[1].sent.len(),
+            1,
+            "the OGM is re-flooded out the other interface"
+        );
+        let (dst, protocol, _payload) = &driver.links[1].sent[0];
+        assert_eq!(*dst, Mac::BROADCAST);
+        assert_eq!(*protocol, wayfinder::DEFAULT_BATMAN_ETHER_TYPE);
+    }
+}

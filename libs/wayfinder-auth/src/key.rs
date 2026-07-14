@@ -66,6 +66,15 @@ impl Keypair {
         PublicKey::from(&self.x_secret).to_bytes()
     }
 
+    /// This node's stable mesh MAC address, deterministically derived from its
+    /// Ed25519 public key via [`crate::derive_mac`]. Stable across restarts as
+    /// long as the seed persists — unlike a MAC an OS assigns a freshly-created
+    /// TAP device — and self-consistent with the MAC a membership cert binds
+    /// this identity to.
+    pub fn derived_mac(&self) -> interfaces::frame::Mac {
+        crate::mac::derive_mac(&self.ed_pubkey())
+    }
+
     /// Sign `msg` (e.g. an OGM's immutable header) with the Ed25519 identity key.
     /// Verify with [`verify_signature`] against [`Keypair::ed_pubkey`].
     pub fn sign(&self, msg: &[u8]) -> [u8; 64] {

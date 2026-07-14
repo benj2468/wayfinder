@@ -114,9 +114,13 @@ pub enum Command {
     /// Enroll with a provider: generate a keypair, submit a CSR, and write the
     /// returned certificate and trust anchor (online enrollment).
     Enroll {
-        /// This node's MAC, bound into the issued certificate.
+        /// This node's MAC, bound into the issued certificate. Defaults to the
+        /// MAC deterministically derived from the enrolling keypair (the same
+        /// derivation `wayfinder-tap` applies at startup), so the enrolled
+        /// cert matches the MAC the node will actually run under; pass this to
+        /// override that default.
         #[arg(long)]
-        mac: String,
+        mac: Option<String>,
         /// Enrollment token, if the provider requires one.
         #[arg(long, default_value = "")]
         token: String,
@@ -262,7 +266,10 @@ pub async fn run_query(
                 seed
             };
             let kp = Keypair::from_seed(&seed);
-            let mac_bytes = parse_mac6(&mac)?;
+            let mac_bytes = match &mac {
+                Some(mac) => parse_mac6(mac)?,
+                None => kp.derived_mac().0,
+            };
             let issued = poll_enroll(&mut client, &mac_bytes, &kp, &token).await?;
             // The seed is already on disk (reused from `out_seed`, or written
             // above before polling), so it needs no second write here.
@@ -270,7 +277,10 @@ pub async fn run_query(
                 .with_context(|| format!("writing certificate to {}", out_cert.display()))?;
             std::fs::write(&out_anchor, &issued.trust_anchor)
                 .with_context(|| format!("writing trust anchor to {}", out_anchor.display()))?;
-            format!("enrolled {mac}: wrote seed, certificate, and trust anchor")
+            format!(
+                "enrolled {}: wrote seed, certificate, and trust anchor",
+                output::format_mac(&mac_bytes)
+            )
         }
         Command::Revoke { mac } => {
             let mac_bytes = parse_mac6(&mac)?;

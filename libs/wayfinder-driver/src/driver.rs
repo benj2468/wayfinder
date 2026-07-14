@@ -18,37 +18,24 @@ use anyhow::bail;
 use futures::{FutureExt, future::select_all};
 use interfaces::link::LinkMetrics;
 use tokio::time::sleep;
-use tracing::{trace, warn};
+use tracing::trace;
 use wayfinder::auth::DIRECTED_TRAILER_LEN;
-use wayfinder::batman::wire::{BATADV_CERT_REPLY, BATADV_CERT_REQ};
 use wayfinder::config::TrickleConfig;
-use wayfinder::interfaces::frame::{LinkFrame, LinkFrameData, MAX_LINK_FRAME_LEN, Mac};
-use wayfinder::{CentralRouter, DEFAULT_BATMAN_ETHER_TYPE, EgressInterface, McastPlan};
+use wayfinder::interfaces::frame::{LinkFrameData, MAX_LINK_FRAME_LEN, Mac};
+use wayfinder::{CentralRouter, EgressInterface, McastPlan};
+use wayfinder_driver_core::{Egress, MeshSink};
 use wayfinder_protos::service::WayfinderService;
 use wayfinder_server::{CertAuthority, MeshAuthority, QueryRx, RouterAdapter};
-use zerocopy::{FromBytes, IntoBytes};
 
 use wayfinder::link::{DynLinkT, LinkT};
 
 use crate::snoop::McastSnooper;
 use crate::transport::FrameIo;
 
-/// How an [`OutgoingFrame`] is fanned out onto the mesh.
-enum Egress {
-    /// Let the router pick the egress (`get_egress_interface`): a metric-driven
-    /// single interface for a unicast, or every interface for a broadcast/flood.
-    /// `exclude` is the interface index a re-flood arrived on — split-horizon,
-    /// so a re-flood never goes back toward the neighbor it came from (which
-    /// would otherwise circulate OGMs/broadcasts until their TTL drains).
-    /// `None` for locally originated frames, which go out every interface.
-    Auto { exclude: Option<usize> },
-    /// Send out exactly one interface by index, bypassing the router's egress
-    /// choice.  Used for per-link OGM emission, where each interface fires on
-    /// its own adaptive (Trickle) schedule rather than flooding all at once.
-    Iface(usize),
-}
-
-/// One frame to put on the mesh, plus how to fan it out.
+/// One frame to put on the mesh, plus how to fan it out.  The owned,
+/// `std`-side counterpart to [`wayfinder_driver_core::OutgoingFrame`] (whose
+/// payload borrows the transmit scratchpad): this driver stages frames into a
+/// [`Vec`] between planning and dispatch, so it copies the payload out.
 struct OutgoingFrame {
     /// Destination ident (a next-hop neighbor, or `BROADCAST` for a flood).
     dst: Mac,
@@ -77,6 +64,24 @@ impl LoopOutput {
             mesh: Vec::new(),
             local: None,
         }
+    }
+}
+
+/// Stage the shared core's borrowed outputs into this owned unit of work: each
+/// planned mesh frame is copied into `mesh` (its payload borrows the transmit
+/// scratchpad, reused on the next planning call), and a local delivery into
+/// `local`.
+impl MeshSink for LoopOutput {
+    fn emit(&mut self, frame: wayfinder_driver_core::OutgoingFrame<'_>) {
+        self.mesh.push(OutgoingFrame {
+            dst: frame.dst,
+            protocol: frame.protocol,
+            payload: frame.payload.to_vec(),
+            egress: frame.egress,
+        });
+    }
+    fn deliver_local(&mut self, inner: &[u8]) {
+        self.local = Some(inner.to_vec());
     }
 }
 
@@ -418,110 +423,40 @@ impl<Local: FrameIo> Driver<Local> {
 }
 
 /// Produce an OGM for each interface that is due to emit as of `now`, addressed
-/// to that one interface.  Every link backs off (Trickle) independently, so on
-/// a given wake-up only the interface(s) whose timer has fired emit; each is
-/// then advanced toward its `i_max`.
+/// to that one interface.  Thin `std`-side wrapper that stages the shared
+/// core's [`poll_due_ogms`](wayfinder_driver_core::poll_due_ogms) output into an
+/// owned [`Vec`].
 fn poll_due_ogms(
     router: &mut CentralRouter,
     now: Duration,
     tx_buffer: &mut [u8],
 ) -> Vec<OutgoingFrame> {
-    let mut out = Vec::new();
-    // Each emission advances exactly one interface's timer, so the set of due
-    // interfaces shrinks every pass and the loop terminates.
-    while let Some(idx) = router.due_interface(now) {
-        if let Some(f) = router.poll(now, tx_buffer) {
-            out.push(OutgoingFrame {
-                dst: f.dst,
-                protocol: f.protocol,
-                payload: f.payload.to_vec(),
-                egress: Egress::Iface(idx),
-            });
-        }
-        router.on_interface_emitted(idx, now);
-    }
-    out
-}
-
-/// Whether `payload`'s BATMAN sub-type is a lazy-cert-distribution control
-/// packet (`BATADV_CERT_REQ`/`BATADV_CERT_REPLY`). These are addressed to a
-/// specific node like a directed data-plane frame, but are *not* pairwise-
-/// tagged: they carry their own self-authenticating signature (the
-/// requester's cert + signature, or the anchor-verified reply cert), checked
-/// independently of any neighbor pairwise key — which a freshly discovered
-/// neighbor is exactly the case that has none yet.
-fn is_cert_control(payload: &[u8]) -> bool {
-    matches!(
-        payload.first(),
-        Some(&BATADV_CERT_REQ) | Some(&BATADV_CERT_REPLY)
-    )
-}
-
-/// Verify and strip the pairwise tag trailer from a directed data-plane frame
-/// when auth is enabled, returning the frame to route on: the original frame
-/// (auth off, a broadcast/OGM, or a cert-control packet), a shorter *view*
-/// over the same bytes with the trailer dropped, or `None` if the frame must
-/// be dropped (bad/missing tag from an unverified or foreign neighbor).
-fn strip_directed<'a>(router: &mut CentralRouter, frame: &'a LinkFrame) -> Option<&'a LinkFrame> {
-    // Only directed (unicast/mcast) frames carry a tag; broadcasts/OGMs (a
-    // multicast dst) are signed, and with auth off nothing is tagged.
-    let Some(auth) = router.auth_mut() else {
-        return Some(frame);
-    };
-    if frame.protocol.get() != DEFAULT_BATMAN_ETHER_TYPE
-        || frame.dst.is_multicast()
-        || is_cert_control(&frame.payload)
-    {
-        return Some(frame);
-    }
-
-    let body_len = frame.payload.len().checked_sub(DIRECTED_TRAILER_LEN)?;
-    let (inner, trailer) = frame.payload.split_at(body_len);
-    if !auth.verify_directed(frame.src, inner, trailer) {
-        return None; // unverified/foreign neighbor or replay — drop
-    }
-
-    // Reinterpret the frame's own bytes minus the trailer — a shorter view over
-    // the same buffer (no copy) — so the engine sees only the real payload and
-    // never forwards or delivers the tag bytes.
-    let full = frame.as_bytes();
-    let strip_len = full.len() - DIRECTED_TRAILER_LEN;
-    LinkFrame::ref_from_bytes(full.get(..strip_len)?).ok()
+    let mut out = LoopOutput::none();
+    wayfinder_driver_core::poll_due_ogms(router, now, tx_buffer, &mut out);
+    out.mesh
 }
 
 /// Process one received link-layer frame into a unit of work, folding the
 /// carrier's physical-layer `metrics` into the engine's link-quality table.
+/// Thin `std`-side wrapper that stages the shared core's
+/// [`handle_mesh_frame`](wayfinder_driver_core::handle_mesh_frame) output into
+/// an owned [`LoopOutput`].
 fn handle_mesh_frame(
     now: Duration,
     router: &mut CentralRouter,
     idx: usize,
-    frame: &LinkFrame,
+    frame: &wayfinder::interfaces::frame::LinkFrame,
     metrics: LinkMetrics,
     tx_buffer: &mut [u8],
 ) -> LoopOutput {
-    let Some(frame) = strip_directed(router, frame) else {
-        return LoopOutput::none(); // directed frame failed authentication
-    };
-    let rx = router.handle_frame_with_metrics(now, idx, frame, metrics, tx_buffer);
+    let mut out = LoopOutput::none();
+    wayfinder_driver_core::handle_mesh_frame(now, router, idx, frame, metrics, tx_buffer, &mut out);
     trace!(
-        forward = rx.forward.is_some(),
-        deliver_local = rx.deliver_local.is_some(),
+        forward = !out.mesh.is_empty(),
+        deliver_local = out.local.is_some(),
         "frame decoded"
     );
-    LoopOutput {
-        mesh: rx
-            .forward
-            .map(|f| OutgoingFrame {
-                dst: f.dst,
-                protocol: f.protocol,
-                payload: f.payload.to_vec(),
-                // A re-flood must not go back out the interface it arrived on.
-                egress: Egress::Auto { exclude: Some(idx) },
-            })
-            .into_iter()
-            .collect(),
-        local: rx.deliver_local.map(|inner| inner.to_vec()),
-    }
+    out
 }
 
 /// Turn one host Ethernet frame into the mesh frames that carry it.
@@ -629,29 +564,23 @@ async fn dispatch<Local: FrameIo>(
         // (a multicast dst) are signed instead, and cert-control packets
         // (CertReq/CertReply) carry their own self-authenticating signature
         // instead of a neighbor pairwise tag, so both are skipped here.
-        if protocol == DEFAULT_BATMAN_ETHER_TYPE
-            && !dst.is_multicast()
-            && !is_cert_control(&payload)
-            && let Some(auth) = router.auth_mut()
-        {
-            // Grow the payload by the trailer and let `tag_directed` write the
-            // tag straight into the appended bytes (no separate scratch buffer).
-            let body_len = payload.len();
-            payload.resize(body_len + DIRECTED_TRAILER_LEN, 0);
-            let (frame, trailer) = payload.split_at_mut(body_len);
-            if auth.tag_directed(dst, frame, trailer).is_none() {
-                // Auth on but we can't tag this directed frame (no verified key
-                // for dst yet, or counter exhausted): drop it rather than emit it
-                // in the clear.
-                warn!(?dst, "auth: dropping untaggable directed frame");
-                continue;
-            }
-        }
+        // Reserve the trailer bytes and let the shared core write the pairwise
+        // tag into them when this directed frame needs one, returning how much
+        // to actually send: `body_len` (untagged — auth off, or a
+        // broadcast/OGM/cert-control packet), `body_len + trailer` (tagged), or
+        // `None` (auth on but untaggable — drop it rather than emit in clear).
+        let body_len = payload.len();
+        payload.resize(body_len + DIRECTED_TRAILER_LEN, 0);
+        let Some(send_len) =
+            wayfinder_driver_core::tag_directed_into(router, dst, protocol, body_len, &mut payload)
+        else {
+            continue;
+        };
 
         let data = LinkFrameData {
             dst,
             protocol,
-            payload: &payload,
+            payload: &payload[..send_len],
         };
 
         match egress {

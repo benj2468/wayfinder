@@ -1,0 +1,51 @@
+[package]
+name = "wayfinder-stm32f411"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Independent workspace (like bins/wayfinder-nrf52840): cross-compiles to a
+# bare-metal target with its own linker script and panic handler, which must
+# not leak into the main workspace's host builds.
+[workspace]
+members = ["."]
+
+# `#[no_std]`/`#[no_main]` can't build the host `test` harness.
+[[bin]]
+name = "wayfinder-stm32f411"
+path = "src/main.rs"
+test = false
+doc = false
+bench = false
+
+[dependencies]
+wayfinder = { path = "../../libs/wayfinder", default-features = false }
+# The *same* HAL-agnostic embedded driver the nRF board uses — this binary
+# exists to prove a non-Nordic Cortex-M (ST) runs the identical router loop.
+wayfinder-embedded-driver = { path = "../../libs/wayfinder-embedded-driver" }
+# Installs the RTT `tracing` subscriber so the mesh stack's `trace!`/`warn!`
+# records are observable over the debug probe (they are otherwise dropped).
+wayfinder-embedded-log = { path = "../../libs/wayfinder-embedded-log" }
+rylr998 = { path = "../../libs/rylr998", features = ["link"] }
+# For `warn!` on a fatal bring-up error; `std` off (routed to RTT by
+# `wayfinder-embedded-log`).
+tracing = { version = "0.1.44", default-features = false }
+# NUCLEO-F411RE = STM32F411RE (Cortex-M4F, thumbv7em-none-eabihf — same target
+# triple as the nRF52840-DK, different vendor silicon + HAL).
+embassy-stm32 = { version = "0.6", features = [
+    "stm32f411re",
+    "time-driver-any",
+    "exti",
+    "unstable-pac",
+] }
+embassy-executor = { version = "0.9", features = [
+    "arch-cortex-m",
+    "executor-thread",
+] }
+embassy-time = "0.5.1"
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+# `tracing-core` does an unconditional `extern crate alloc;`, so any binary
+# linking this dependency graph needs a real allocator.
+embedded-alloc = "0.6"

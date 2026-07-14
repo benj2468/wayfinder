@@ -1,5 +1,6 @@
 extern crate alloc;
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::net::IpAddr;
@@ -203,6 +204,17 @@ pub struct TapConfig {
     /// (e.g. `RawL2`) or a jumbo-frame underlay.
     #[serde(default)]
     pub mtu: Option<u16>,
+    /// Path persisting this node's TAP MAC address across restarts when mesh
+    /// auth (and its stable, seed-derived identity — see
+    /// [`Keypair::derived_mac`](wayfinder_auth::Keypair::derived_mac)) is not
+    /// configured. On first boot a fresh MAC is generated and written here; on
+    /// every subsequent boot it is read back and reused, so this node's mesh
+    /// identity does not silently change on restart.
+    ///
+    /// Defaults to [`TapConfig::default_mac_state_path`] when unset — the
+    /// operator normally never needs to set this.
+    #[serde(default)]
+    pub mac_state_path: Option<String>,
 }
 
 impl TapConfig {
@@ -214,6 +226,23 @@ impl TapConfig {
     /// encapsulation and a conservative underlay allowance ([`TAP_ENCAP_OVERHEAD`]),
     /// so a full-size host frame traverses the mesh without fragmentation.
     pub const DEFAULT_MTU: u16 = 1500 - TAP_ENCAP_OVERHEAD as u16;
+
+    /// Where [`mac_state_path`](Self::mac_state_path) resolves to when unset:
+    /// `/var/lib/wayfinder/<device_name>.mac`, following the FHS convention of
+    /// keeping runtime-generated state under `/var/lib` (as opposed to the
+    /// operator-authored files under `/etc` that [`AuthConfig`] points to).
+    pub fn default_mac_state_path(&self) -> String {
+        format!("/var/lib/wayfinder/{}.mac", self.device_name)
+    }
+
+    /// The effective path to persist/read this node's TAP MAC at: the
+    /// configured [`mac_state_path`](Self::mac_state_path), or
+    /// [`TapConfig::default_mac_state_path`] when unset.
+    pub fn resolved_mac_state_path(&self) -> String {
+        self.mac_state_path
+            .clone()
+            .unwrap_or_else(|| self.default_mac_state_path())
+    }
 }
 
 /// Bytes of encapsulation added to a host L3 payload before it leaves this node

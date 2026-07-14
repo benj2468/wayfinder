@@ -7,16 +7,34 @@ edition = "2024"
 workspace = true
 
 [dependencies]
-thiserror.workspace = true
-tracing.workspace = true
+# Pinned directly (not workspace inheritance, which can't override
+# default-features) so `default-features = false` keeps std off for both —
+# thiserror still gates `impl core::error::Error` behind `std`, and tracing's
+# `std` feature pulls in `once_cell/std`. Needed for this crate's `no_std` build.
+thiserror = { version = "2.0.18", default-features = false }
+tracing = { version = "0.1.44", default-features = false, features = ["attributes"] }
 interfaces.workspace = true
 zerocopy.workspace = true
 batman.workspace = true
 wayfinder-auth.workspace = true
 heapless.workspace = true
 embedded-io-async.workspace = true
-serde.workspace = true
-dynosaur.workspace = true
+# Pinned directly (not workspace inheritance) so `default-features = false`
+# drops serde's `std` feature; `config.rs` only needs `alloc` (String/Vec),
+# which this crate already depends on directly via `extern crate alloc`.
+# Optional, tied to the `alloc` feature below: serde's `alloc` feature does
+# its own unconditional `extern crate alloc`, which is harmless in a `rlib`
+# but makes a *binary* linking this crate require a `#[global_allocator]`
+# even when `config.rs` (its only call site) is compiled out.
+serde = { version = "1.0.228", default-features = false, features = [
+    "derive",
+    "alloc",
+], optional = true }
+# Optional, tied to the `std` feature below: `dynosaur` doesn't declare
+# `#![no_std]` itself, so leaving it unconditional here would break the
+# `no_std` build even though its only invocation (link.rs) is already
+# `cfg_attr(feature = "std", ...)`.
+dynosaur = { workspace = true, optional = true }
 
 [dev-dependencies]
 tracing-test = "0.2.6"
@@ -29,8 +47,8 @@ wayfinder-auth = { workspace = true, features = ["std"] }
 [features]
 default = ["alloc"]
 
-alloc = []
+alloc = ["dep:serde"]
 # Pulls in `std`, enabling the `dynosaur`-generated `DynLinkT` boxed wrapper for
 # dynamic dispatch (its constructors reference `std`).  The bare `LinkT` trait
 # is available without this; embedded callers leave it off.
-std = ["alloc"]
+std = ["alloc", "dep:dynosaur"]
