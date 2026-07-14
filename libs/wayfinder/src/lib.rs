@@ -1046,6 +1046,13 @@ impl CentralRouter {
             .batman
             .produce_periodic_broadcast(now, tx_buf)
             .map(|p| p.len());
+        // The engine may just have purged neighbors that stopped refreshing
+        // their routes; drop their link-quality rows too so an inspection API
+        // (e.g. the management API's link-quality RPC) can never keep
+        // reporting a neighbor the routing table has already forgotten.
+        let batman = &self.batman;
+        self.link_quality
+            .retain_live(|neighbor| batman.originator_table.contains_key(&neighbor));
         if let Some(len) = produced {
             // When auth is enabled, append our cert (or, under lazy cert
             // distribution, just its fingerprint) + OGM signature so peers

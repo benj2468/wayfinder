@@ -41,7 +41,7 @@
 
         overlays.default = overlay;
 
-        nixosModules.default = ./nix/modules/wayfinder-tap.nix;
+        nixosModules.default = ./nix/modules/wayfinder.nix;
       };
 
       perSystem =
@@ -52,16 +52,25 @@
           ...
         }:
         let
-          rustToolchain = (
-            pkgs.fenix.complete.withComponents [
+          # Bare-metal target for the embedded (`no_std`) crates — currently
+          # the nRF52840 (Cortex-M4F) that `libs/nrf-ieee802154` builds
+          # against. Combined (not `withComponents`-ed) onto the host
+          # toolchain below so `cargo build --target thumbv7em-none-eabihf`
+          # picks up its prebuilt `core`/`alloc` without needing nightly's
+          # `-Z build-std`.
+          bareMetalTarget = "thumbv7em-none-eabihf";
+
+          rustToolchain = pkgs.fenix.combine [
+            (pkgs.fenix.complete.withComponents [
               "cargo"
               "clippy"
               "rust-src"
               "rustc"
               "rustfmt"
               "llvm-tools-preview"
-            ]
-          );
+            ])
+            pkgs.fenix.targets.${bareMetalTarget}.latest.rust-std
+          ];
 
           # Python interpreter with the integration-test deps (pytest). Used by
           # both the default dev shell and the lightweight `pytest` shell that

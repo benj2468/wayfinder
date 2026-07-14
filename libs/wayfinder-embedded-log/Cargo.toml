@@ -1,0 +1,28 @@
+[package]
+name = "wayfinder-embedded-log"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+# A `tracing` subscriber for the bare-metal boards, routing the mesh stack's
+# `trace!`/`warn!` records onto RTT (Real-Time Transfer) over the debug probe —
+# the boards' only free channel, since their one UART carries the LoRa radio.
+# `init()` is a no-op on non-bare-metal targets so the crate stays a
+# host-buildable workspace member (covered by clippy/test) while its RTT backend
+# only compiles for `target_os = "none"` (thumbv7em), where a `critical-section`
+# impl and a probe exist.
+
+# RTT + the subscriber only make sense on bare metal; gating the deps here (not
+# just the code) keeps the host build from pulling a backend it can't link.
+[target.'cfg(target_os = "none")'.dependencies]
+# `Dispatch`/`Subscriber`/`Event`/`Visit` — the no_std tracing plumbing. `std`
+# off; `alloc` (for `Dispatch`'s `Arc`) is always available via tracing-core's
+# unconditional `extern crate alloc`, backed by the board's global allocator.
+tracing-core = { version = "0.1.36", default-features = false }
+# The RTT transport + `rprintln!`; uses the `critical-section-single-core` impl
+# the boards already enable via `cortex-m`.
+rtt-target = "0.5"
+# Fixed-capacity line buffer so each event formats without touching the heap.
+heapless.workspace = true

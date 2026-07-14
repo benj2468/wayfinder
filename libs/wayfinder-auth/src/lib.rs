@@ -29,6 +29,7 @@
 mod cert;
 mod error;
 mod key;
+mod mac;
 mod pairwise;
 mod revoke;
 
@@ -38,6 +39,7 @@ mod authority;
 pub use cert::{CERT_VERSION, MembershipCert, TrustAnchor, VerifiedCert};
 pub use error::AuthError;
 pub use key::{Keypair, verify_signature};
+pub use mac::{derive_mac, force_locally_administered_unicast};
 pub use pairwise::{TAG_LEN, frame_tag, verify_frame_tag};
 pub use revoke::{REVOKE_VERSION, RevocationRecord};
 

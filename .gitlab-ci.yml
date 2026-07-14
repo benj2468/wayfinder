@@ -86,6 +86,50 @@ build:
     # warning so clippy findings can't accumulate unnoticed.
     - cargo clippy --workspace --all-targets -- -D warnings
     - sccache --show-stats
+# Cross-compiles the `no_std` embedded stack for a real bare-metal target
+# instead of just relying on `#![no_std]` type-checking under the host's
+# `std`-having target, which lets a stray `std`-only dependency (e.g. a
+# workspace default feature) slip through unnoticed. `thumbv7em-none-eabihf`
+# is Tier 2 with prebuilt `core`/`alloc`, so a plain `rustup target add` is
+# enough — no nightly `-Z build-std`.
+#
+# `bins/wayfinder-nrf52840` is a real, flashable firmware binary (linker
+# script, panic handler, entry point) whose dependency graph already covers
+# interfaces/ieee802154/batman/wayfinder(-auth)/nrf-ieee802154 — building it
+# once exercises all of those together as they'd actually ship, in place of
+# building each crate separately. It's its own independent Cargo workspace
+# (see the comment in its Cargo.toml), so it's built from its own directory
+# rather than via `-p` from the root. `rylr998`/`at86rf233` aren't part of
+# that binary's graph (they're generic drivers for external radios, not this
+# board's on-board peripheral), so they're still checked directly as libs.
+build:embedded:
+  extends: .base-ci-docker
+  stage: build
+  needs:
+    - lint-done
+    - build-image
+  variables:
+    # Kept in sync with the `rustup target add` in containers/testenv.Dockerfile.
+    BARE_METAL_TARGET: thumbv7em-none-eabihf
+  script:
+    # The generic radio drivers plus the HAL-agnostic embedded driver stack
+    # (driver-core + embedded-driver) and the RTT tracing subscriber — cross-
+    # compiling these proves the `no_std` router loop and its logging link for a
+    # real bare-metal target with no vendor HAL, the portability guarantee both
+    # board binaries below rely on.
+    - cargo build --target "$BARE_METAL_TARGET" -p rylr998 -p at86rf233 -p wayfinder-driver-core -p wayfinder-embedded-driver -p wayfinder-embedded-log
+    - cargo clippy --target "$BARE_METAL_TARGET" -p rylr998 -p at86rf233 -p wayfinder-driver-core -p wayfinder-embedded-driver -p wayfinder-embedded-log -- -D warnings
+    # Each board binary is its own independent Cargo workspace (linker script,
+    # panic handler, HAL), so built from its own directory rather than via `-p`.
+    # Both target thumbv7em-none-eabihf (Cortex-M4F) but on different vendor
+    # HALs (Nordic vs ST) — building both proves the shared driver is portable.
+    - (cd bins/wayfinder-nrf52840 && cargo build --locked)
+    - (cd bins/wayfinder-nrf52840 && cargo clippy --locked -- -D warnings)
+    # The STM32F411RE (512 KB flash) needs an optimized build to fit the crypto
+    # stack, so it's built --release rather than debug like the 1 MB nRF.
+    - (cd bins/wayfinder-stm32f411 && cargo build --release --locked)
+    - (cd bins/wayfinder-stm32f411 && cargo clippy --release --locked -- -D warnings)
+    - sccache --show-stats
 test:run:rust:
   extends: .base-ci-docker
   stage: test

@@ -951,6 +951,52 @@ async fn route_restored_after_neighbor_reconnects() {
     );
 }
 
+/// A direct neighbor's link-quality entry must not outlive the neighbor in the
+/// routing table: once machine2 goes silent and its route ages out of
+/// machine1's originator table, machine1's link-quality table must drop
+/// machine2's row too. Otherwise the management API's Link Quality view keeps
+/// showing a neighbor the Routing Table view has already forgotten.
+#[tokio::test]
+async fn link_quality_entry_pruned_when_neighbor_ages_out() {
+    setup();
+    let mut harness = simple_pair();
+    let m2 = harness.get_machine("machine2").ident;
+
+    for round in 1..=3 {
+        converge_at(&mut harness, Duration::from_secs(round)).await;
+    }
+    assert_eq!(
+        harness.get_machine("machine1").router().originator_count(),
+        1
+    );
+    assert!(
+        harness
+            .get_machine("machine1")
+            .router()
+            .link_quality_records()
+            .iter()
+            .any(|r| r.neighbor == m2),
+        "machine1 must have a link-quality entry for machine2 once converged"
+    );
+
+    harness.disconnect_machine("machine2");
+    age_out(&mut harness).await;
+    assert_eq!(
+        harness.get_machine("machine1").router().originator_count(),
+        0,
+        "machine1 must drop the stale route once machine2 stops refreshing it"
+    );
+    assert!(
+        !harness
+            .get_machine("machine1")
+            .router()
+            .link_quality_records()
+            .iter()
+            .any(|r| r.neighbor == m2),
+        "machine1's link-quality entry for machine2 must be pruned once machine2 ages out of the originator table"
+    );
+}
+
 /// When the *only* relay on a line goes offline there is no alternate path, so
 /// traffic must black-hole rather than be misdelivered; when the relay returns
 /// the path heals.  In [`line_of_three`] machine1 reaches machine3 solely

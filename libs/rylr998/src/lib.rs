@@ -68,13 +68,13 @@ pub enum Bandwidth {
 #[derive(Debug, Clone, Copy)]
 pub enum CodingRate {
     /// Coding rate 4/5.
-    Cr45 = 45,
+    Cr45 = 1,
     /// Coding rate 4/6.
-    Cr46 = 46,
+    Cr46 = 2,
     /// Coding rate 4/7.
-    Cr47 = 47,
+    Cr47 = 3,
     /// Coding rate 4/8.
-    Cr48 = 48,
+    Cr48 = 4,
 }
 
 /// Supported wireless working modes.

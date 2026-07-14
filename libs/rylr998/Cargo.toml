@@ -16,10 +16,14 @@ default = ["link"]
 link = ["dep:wayfinder", "dep:zerocopy"]
 
 [dependencies]
-thiserror.workspace = true
+# Pinned directly (not workspace inheritance, which can't override
+# default-features) so `default-features = false` keeps std off for both —
+# thiserror still gates `impl core::error::Error` behind `std`, and tracing's
+# `std` feature pulls in `once_cell/std`. Needed for this crate's `no_std` build.
+thiserror = { version = "2.0.18", default-features = false }
 embedded-io-async.workspace = true
 heapless.workspace = true
-tracing.workspace = true
+tracing = { version = "0.1.44", default-features = false }
 
 # Depended on by path (not workspace inheritance) so `default-features = false`
 # keeps the bare `LinkT` trait available without pulling `alloc`/`std`.
@@ -32,5 +36,5 @@ anyhow = "1.0.102"
 tracing-subscriber.workspace = true
 tokio.workspace = true
 embedded-io-adapters.workspace = true
-embedded-io = "0.6.1"
+embedded-io = "0.7.0"
 rylr998-sim = { path = "../rylr998-sim" }

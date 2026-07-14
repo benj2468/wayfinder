@@ -162,7 +162,7 @@ async fn enroll_yields_a_cert_that_verifies_against_the_anchor() {
 
     let out = run_query(
         Command::Enroll {
-            mac: "02:00:00:00:00:09".into(),
+            mac: Some("02:00:00:00:00:09".into()),
             token: String::new(),
             out_seed: seed.clone(),
             out_cert: cert.clone(),
@@ -184,6 +184,41 @@ async fn enroll_yields_a_cert_that_verifies_against_the_anchor() {
     assert_eq!(verified.mac.0, [0x02, 0, 0, 0, 0, 9]);
 }
 
+/// Omitting `--mac` must derive the enrolled MAC from the freshly-generated
+/// keypair, rather than requiring the operator to pick one — the same
+/// derivation `wayfinder-tap` applies at startup, so the enrolled cert matches
+/// the MAC the node will actually run under.
+#[tokio::test]
+async fn enroll_without_mac_derives_it_from_the_keypair() {
+    let addr = spawn_provider(None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let seed = dir.path().join("seed");
+    let cert = dir.path().join("cert");
+    let anchor = dir.path().join("anchor");
+
+    run_query(
+        Command::Enroll {
+            mac: None,
+            token: String::new(),
+            out_seed: seed.clone(),
+            out_cert: cert.clone(),
+            out_anchor: anchor.clone(),
+        },
+        &addr.to_string(),
+        OutputFormat::Human,
+    )
+    .await
+    .expect("enroll succeeds");
+
+    let seed_bytes: [u8; 32] = std::fs::read(&seed).unwrap().try_into().unwrap();
+    let expected_mac = Keypair::from_seed(&seed_bytes).derived_mac();
+
+    let anchor = TrustAnchor::from_bytes(&std::fs::read(&anchor).unwrap()).unwrap();
+    let cert = MembershipCert::from_bytes(&std::fs::read(&cert).unwrap()).unwrap();
+    let verified = anchor.verify_cert(&cert, 500).expect("cert verifies");
+    assert_eq!(verified.mac, expected_mac);
+}
+
 #[tokio::test]
 async fn enroll_reuses_an_existing_seed_file_instead_of_minting_a_new_identity() {
     // The sim entrypoint retries `enroll` for the same MAC against a fixed
@@ -198,7 +233,7 @@ async fn enroll_reuses_an_existing_seed_file_instead_of_minting_a_new_identity()
     let anchor = dir.path().join("anchor");
 
     let enroll_cmd = |seed: PathBuf, cert: PathBuf, anchor: PathBuf| Command::Enroll {
-        mac: "02:00:00:00:00:09".into(),
+        mac: Some("02:00:00:00:00:09".into()),
         token: String::new(),
         out_seed: seed,
         out_cert: cert,
@@ -246,7 +281,7 @@ async fn enroll_rejected_without_required_token() {
     let dir = tempfile::tempdir().unwrap();
     let err = run_query(
         Command::Enroll {
-            mac: "02:00:00:00:00:09".into(),
+            mac: Some("02:00:00:00:00:09".into()),
             token: String::new(), // missing
             out_seed: dir.path().join("seed"),
             out_cert: dir.path().join("cert"),
@@ -269,7 +304,7 @@ async fn list_certs_shows_an_enrolled_node() {
     let dir = tempfile::tempdir().unwrap();
     run_query(
         Command::Enroll {
-            mac: "02:00:00:00:00:09".into(),
+            mac: Some("02:00:00:00:00:09".into()),
             token: String::new(),
             out_seed: dir.path().join("seed"),
             out_cert: dir.path().join("cert"),
@@ -351,7 +386,7 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
     // Enrolling node: fails at first, responds with pending
     let err = run_query(
         Command::Enroll {
-            mac: "02:00:00:00:00:09".into(),
+            mac: Some("02:00:00:00:00:09".into()),
             token: String::new(),
             out_seed: dir.path().join("seed"),
             out_cert: cert_path.clone(),
@@ -380,7 +415,7 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
     // Enrolling node: once approved, collects the cert
     let out = run_query(
         Command::Enroll {
-            mac: "02:00:00:00:00:09".into(),
+            mac: Some("02:00:00:00:00:09".into()),
             token: String::new(),
             out_seed: dir.path().join("seed"),
             out_cert: cert_path.clone(),
@@ -409,7 +444,7 @@ async fn enroll_fails_when_operator_denies() {
 
     let err = run_query(
         Command::Enroll {
-            mac: "02:00:00:00:00:09".into(),
+            mac: Some("02:00:00:00:00:09".into()),
             token: String::new(),
             out_seed: dir.path().join("seed"),
             out_cert: dir.path().join("cert"),
@@ -437,7 +472,7 @@ async fn enroll_fails_when_operator_denies() {
 
     let err = run_query(
         Command::Enroll {
-            mac: "02:00:00:00:00:09".into(),
+            mac: Some("02:00:00:00:00:09".into()),
             token: String::new(),
             out_seed: dir.path().join("seed"),
             out_cert: dir.path().join("cert"),

@@ -10,4 +10,4 @@ workspace = true
 rylr998 = { path = "../rylr998" }
 tokio = { workspace = true }
 embedded-io-adapters = { workspace = true }
-embedded-io = "0.6.1"
+embedded-io = "0.7.0"

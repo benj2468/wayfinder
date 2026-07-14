@@ -39,3 +39,6 @@ __pycache__
 # nix
 result
 .nixos-test-history
+
+# Target deployment
+buildkitd.toml

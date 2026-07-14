@@ -57,9 +57,13 @@ pub enum CertCommand {
         /// Mesh id (decimal, or `0x`-prefixed hex); must match the CA's mesh.
         #[arg(long, value_parser = parse_u32)]
         mesh_id: u32,
-        /// The node's MAC, e.g. `02:00:00:00:00:09`.
+        /// The node's MAC, e.g. `02:00:00:00:00:09`. Defaults to the MAC
+        /// deterministically derived from `--node-seed` (the same derivation
+        /// `wayfinder-tap` applies at startup), so the cert matches the MAC
+        /// the node will actually run under; pass this to override that
+        /// default.
         #[arg(long)]
-        mac: String,
+        mac: Option<String>,
         /// The node's 32-byte identity seed file (its public keys are bound).
         #[arg(long)]
         node_seed: PathBuf,
@@ -161,7 +165,7 @@ fn init_ca(
 fn issue(
     ca_seed: &Path,
     mesh_id: u32,
-    mac: &str,
+    mac: &Option<String>,
     node_seed: &Path,
     not_before: u64,
     not_after: u64,
@@ -172,7 +176,10 @@ fn issue(
     }
     let authority = Authority::from_seed(&read_seed(ca_seed)?, mesh_id);
     let node = Keypair::from_seed(&read_seed(node_seed)?);
-    let mac = Mac(parse_mac6(mac)?);
+    let mac = match mac {
+        Some(mac) => Mac(parse_mac6(mac)?),
+        None => node.derived_mac(),
+    };
 
     let cert = authority.issue_cert(
         mac,

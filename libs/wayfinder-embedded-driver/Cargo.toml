@@ -1,0 +1,33 @@
+[package]
+name = "wayfinder-embedded-driver"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+# The `no_std` counterpart to `wayfinder-driver`: it runs the router's event
+# loop on bare metal.  Deliberately **HAL- and executor-agnostic** — it depends
+# on no vendor HAL and on no concrete time driver, so the same driver runs on
+# the nRF52840 (Nordic) and on any Cortex-M (e.g. STM32).  A board supplies the
+# concrete mesh links ([`LinkT`]) and a [`Clock`]; the board's async executor
+# drives [`Driver::run`].
+
+[dependencies]
+wayfinder-driver-core.workspace = true
+# Pinned directly (not workspace inheritance, which can't override
+# `default-features`) so the crate stays `no_std` — no `alloc`, no `std`.
+wayfinder = { path = "../wayfinder", default-features = false }
+interfaces.workspace = true
+heapless.workspace = true
+# Pure future combinators (`select_array`) — no time driver, builds for host.
+embassy-futures = "0.1.2"
+# Pinned directly to keep tracing's `std` feature off for the `no_std` build.
+tracing = { version = "0.1.44", default-features = false }
+
+[dev-dependencies]
+# A minimal executor to drive the async loop in host unit tests.
+futures.workspace = true
+# Test-only: build/parse raw link frames (`as_bytes`/`ref_from_bytes`) to feed a
+# received OGM into the loop.
+zerocopy.workspace = true

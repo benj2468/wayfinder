@@ -1,0 +1,59 @@
+[package]
+name = "wayfinder-nrf52840"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Independent workspace: this crate cross-compiles to a bare-metal target
+# (thumbv7em-none-eabihf, see .cargo/config.toml) with its own linker script
+# and panic handler, which must not leak into the main workspace's host
+# builds — the same reason libs/wayfinder/fuzz does this.
+[workspace]
+members = ["."]
+
+# `#[no_std]`/`#[no_main]` can't build the host `test` harness (no `std` to
+# link the harness against) — `cargo test`/`clippy --all-targets` would
+# otherwise try and fail. Same reason libs/wayfinder/fuzz sets this.
+[[bin]]
+name = "wayfinder-nrf52840"
+path = "src/main.rs"
+test = false
+doc = false
+bench = false
+
+[dependencies]
+wayfinder = { path = "../../libs/wayfinder", default-features = false }
+# The HAL-agnostic embedded driver that runs the router loop, and the RYLR998
+# LoRa driver whose `RylrClient` is this board's one mesh `LinkT`.
+wayfinder-embedded-driver = { path = "../../libs/wayfinder-embedded-driver" }
+# Installs the RTT `tracing` subscriber so the mesh stack's `trace!`/`warn!`
+# records are observable over the debug probe (they are otherwise dropped).
+wayfinder-embedded-log = { path = "../../libs/wayfinder-embedded-log" }
+rylr998 = { path = "../../libs/rylr998", features = ["link"] }
+# For `warn!` on a fatal bring-up error; `std` off (routed to RTT by
+# `wayfinder-embedded-log`).
+tracing = { version = "0.1.44", default-features = false }
+# Still linked so this one binary also fully compiles the board's on-air 802.15.4
+# radio adapter (and transitively the rest of the no_std stack) for the real
+# target, even though milestone-1 wires only the LoRa link.
+nrf-ieee802154 = { path = "../../libs/nrf-ieee802154" }
+# `time-driver-rtc1` backs `embassy-time` (the driver's `Clock`); `gpiote` +
+# `unstable-pac` are pulled in by the HAL for GPIO/UARTE.
+embassy-nrf = { version = "0.10.0", features = [
+    "nrf52840",
+    "time-driver-rtc1",
+    "gpiote",
+    "unstable-pac",
+] }
+embassy-executor = { version = "0.9", features = [
+    "arch-cortex-m",
+    "executor-thread",
+] }
+embassy-time = "0.5.1"
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+# `tracing-core` (pulled in via `tracing`, used throughout the mesh stack for
+# logging) does an unconditional `extern crate alloc;` regardless of feature
+# flags, so any binary linking this dependency graph needs a real allocator.
+embedded-alloc = "0.6"
