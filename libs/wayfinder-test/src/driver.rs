@@ -2,7 +2,7 @@ use std::{collections::HashMap, time::Duration};
 
 use interfaces::frame::Mac;
 use serde::{Deserialize, Serialize};
-use wayfinder::config::TrickleConfig;
+use wayfinder::config::{LinkFeatures, TrickleConfig};
 
 use crate::{
     switch::{PortComms, PortConfig, PortId, Switch},
@@ -51,6 +51,21 @@ struct MachineSpec {
     /// Per-interface OGM backoff bounds, in the same interface order, so a
     /// reconnected node comes back with its original per-link pacing.
     trickle: Vec<TrickleConfig>,
+    /// Per-interface participation features, in the same interface order, so a
+    /// reconnected node comes back with its original per-link gating.
+    features: Vec<LinkFeatures>,
+}
+
+impl MachineSpec {
+    /// Apply this spec's per-link participation features onto a freshly built
+    /// [`TestRouter`] (post-construction, since the router defaults its links to
+    /// full participation).  Shared by initial build and reconnect so both
+    /// honor the config's `features:` blocks.
+    fn apply_features(&self, router: &mut TestRouter) {
+        for (idx, f) in self.features.iter().enumerate() {
+            router.router_mut().set_link_features(idx, *f);
+        }
+    }
 }
 
 /// A running multi-node mesh built from a [`TestConfig`]: the switches, the
@@ -303,10 +318,9 @@ impl TestHarness {
         // the new handles so link tuning targets the live wiring.
         let (interfaces, handles) = self.wire_links(&spec.switches);
         self.links.insert(name.to_string(), handles);
-        self.machines.insert(
-            name.to_string(),
-            TestRouter::new(spec.mac, interfaces, spec.trickle.clone()),
-        );
+        let mut router = TestRouter::new(spec.mac, interfaces, spec.trickle.clone());
+        spec.apply_features(&mut router);
+        self.machines.insert(name.to_string(), router);
     }
 
     /// Attach a fresh port to `switch_name`, returning the node's end of the
@@ -440,16 +454,22 @@ impl TestConfig {
                 .iter()
                 .map(|link| link.ogm)
                 .collect();
+            let features: Vec<LinkFeatures> = machine
+                .wayfinder
+                .links
+                .iter()
+                .map(|link| link.features)
+                .collect();
             let (interfaces, handles) = h.wire_links(&switches);
-            let router = TestRouter::new(ident, interfaces, trickle.clone());
-            h.specs.insert(
-                machine.name.clone(),
-                MachineSpec {
-                    mac: ident,
-                    switches,
-                    trickle,
-                },
-            );
+            let mut router = TestRouter::new(ident, interfaces, trickle.clone());
+            let spec = MachineSpec {
+                mac: ident,
+                switches,
+                trickle,
+                features,
+            };
+            spec.apply_features(&mut router);
+            h.specs.insert(machine.name.clone(), spec);
             h.links.insert(machine.name.clone(), handles);
             if h.machines.insert(machine.name.clone(), router).is_some() {
                 return Err(format!(

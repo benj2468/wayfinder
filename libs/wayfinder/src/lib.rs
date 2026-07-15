@@ -49,6 +49,9 @@ pub use crate::link_quality::LinkQualityRecord;
 pub mod config;
 
 pub mod auth;
+/// Per-link participation features ([`features::LinkFeatures`]), in the
+/// allocation-free core so the router can gate traffic on every deployment.
+pub mod features;
 pub mod link;
 
 mod link_quality;
@@ -345,6 +348,15 @@ pub struct CentralRouter {
     /// `CertReq`, as the originator whose cert was asked for) — either
     /// immediately or via the opportunistic parked-reply flush.
     cert_reply_tx_rate: RateEstimator,
+    /// Per-interface participation features, indexed by interface registration
+    /// order (`iface_idx`).  Gates which traffic classes this node sends and
+    /// receives on each link: an OGM/broadcast/unicast is dropped on ingress or
+    /// suppressed on egress when the corresponding [`LinkFeatures`] flag is off.
+    /// Defaults to full participation ([`LinkFeatures::default`]) for every
+    /// interface, so an unconfigured link behaves exactly as before.
+    ///
+    /// [`LinkFeatures`]: crate::features::LinkFeatures
+    link_features: [crate::features::LinkFeatures; MAX_INTERFACES],
 }
 
 impl CentralRouter {
@@ -366,6 +378,47 @@ impl CentralRouter {
             runtime_config_active: false,
             cert_req_tx_rate: RateEstimator::default(),
             cert_reply_tx_rate: RateEstimator::default(),
+            link_features: [crate::features::LinkFeatures::default(); MAX_INTERFACES],
+        }
+    }
+
+    /// Set the per-link participation [`features`](crate::features::LinkFeatures)
+    /// for interface `idx` (from that link's `features:` config), and register
+    /// the interface so its throughput is reported from startup.  Out-of-range
+    /// indices (`>= `[`MAX_INTERFACES`]) are ignored.  Call once per interface
+    /// at driver wiring time; the default for an unconfigured interface is full
+    /// participation, so a link that never calls this behaves exactly as before.
+    pub fn set_link_features(&mut self, idx: usize, features: crate::features::LinkFeatures) {
+        if idx < MAX_INTERFACES {
+            self.link_features[idx] = features;
+            self.touch_iface(idx);
+        }
+    }
+
+    /// The participation features configured for interface `idx` — full
+    /// participation ([`LinkFeatures::default`](crate::features::LinkFeatures)) for
+    /// an unconfigured or out-of-range index.
+    pub fn link_features(&self, idx: usize) -> crate::features::LinkFeatures {
+        self.link_features.get(idx).copied().unwrap_or_default()
+    }
+
+    /// Whether interface `idx`'s features permit **transmitting** an outgoing
+    /// BATMAN frame whose sub-type is `packet_type` (its leading payload byte)
+    /// onto it.  OGM re-floods require [`tx_ogm`]; data-plane frames (flooded
+    /// broadcasts and directed unicast/multicast) require [`tx_data`]; any other
+    /// sub-type (notably the lazy-cert control packets, which carry their own
+    /// signature) is always permitted.  The driver's egress fan-out consults
+    /// this per candidate interface so a partially participating link never puts
+    /// a suppressed class on the wire.
+    ///
+    /// [`tx_ogm`]: crate::features::LinkFeatures::tx_ogm
+    /// [`tx_data`]: crate::features::LinkFeatures::tx_data
+    pub fn link_may_tx(&self, idx: usize, packet_type: Option<u8>) -> bool {
+        let f = self.link_features(idx);
+        match packet_type {
+            Some(BATADV_IV_OGM) => f.tx_ogm,
+            Some(BATADV_BCAST) | Some(BATADV_UNICAST) | Some(BATADV_MCAST) => f.tx_data,
+            _ => true,
         }
     }
 
@@ -616,6 +669,29 @@ impl CentralRouter {
         // 2. Demux by Protocol ID
         match frame.protocol.get() {
             DEFAULT_BATMAN_ETHER_TYPE => {
+                // Per-link receive gating: drop a traffic class this link is
+                // configured not to accept before it can touch the routing
+                // tables, be delivered, or generate a re-flood.  The rx-rate
+                // and link-quality above already counted the frame as observed
+                // on the wire, matching how other upper-layer drops behave.
+                // Cert-control packets (CertReq/CertReply) fall through the
+                // arms below and are never gated here — the auth control plane
+                // must keep flowing regardless of data/routing gates.
+                let features = self.link_features(iface_idx);
+                match frame.payload.first() {
+                    Some(&BATADV_IV_OGM) if !features.rx_ogm => {
+                        trace!("drop: rx_ogm disabled on this link");
+                        return RxOutcome::empty();
+                    }
+                    Some(&BATADV_BCAST) | Some(&BATADV_UNICAST) | Some(&BATADV_MCAST)
+                        if !features.rx_data =>
+                    {
+                        trace!("drop: rx_data disabled on this link");
+                        return RxOutcome::empty();
+                    }
+                    _ => {}
+                }
+
                 // Opt-in control-plane segregation: when auth is enabled, an OGM
                 // that does not verify against our trust anchor is dropped before
                 // it can touch the routing table.  Only OGMs are gated here (the
@@ -700,12 +776,31 @@ impl CentralRouter {
                         // trailing zeros from the scratchpad buffer are not
                         // forwarded on the wire.
                         let forward = if reply.protocol != 0 {
-                            let len = frame.payload.len().min(reply.payload.len());
-                            Some(LinkFrameData {
-                                dst: reply.dst,
-                                protocol: reply.protocol,
-                                payload: &reply.payload[..len],
-                            })
+                            // A re-flood of an OGM *is* advertising its originator
+                            // as reachable through us. Suppress it when the OGM
+                            // arrived on a link we can't send data onto
+                            // (`tx_data` off): we could never deliver to that
+                            // originator, so advertising a route to it would
+                            // black-hole any peer that then routed through us.
+                            // The engine has already learned it into our local
+                            // table (surfaced via the management API); we simply
+                            // don't propagate it. See
+                            // [`LinkFeatures::tx_data`](crate::features::LinkFeatures::tx_data).
+                            if frame.payload.first() == Some(&BATADV_IV_OGM)
+                                && !self.link_features(iface_idx).tx_data
+                            {
+                                trace!(
+                                    "drop: not re-advertising an OGM learned on a tx_data-off link"
+                                );
+                                None
+                            } else {
+                                let len = frame.payload.len().min(reply.payload.len());
+                                Some(LinkFrameData {
+                                    dst: reply.dst,
+                                    protocol: reply.protocol,
+                                    payload: &reply.payload[..len],
+                                })
+                            }
                         } else if frame.payload.first() == Some(&BATADV_IV_OGM)
                             && let Ok((ogm, _)) =
                                 batman::wire::BatmanOgmPacket::ref_from_prefix(&frame.payload)
@@ -1130,6 +1225,36 @@ impl CentralRouter {
             return false;
         }
         self.configure_interface_ogm(idx, i_min, i_max, now);
+        self.runtime_config_active = true;
+        true
+    }
+
+    /// Apply a runtime override of interface `idx`'s participation
+    /// [`features`](crate::features::LinkFeatures), received over the management
+    /// API (`SetConfig`) rather than at startup wiring.  Like
+    /// [`apply_runtime_trickle_config`](Self::apply_runtime_trickle_config),
+    /// this only overrides an interface already registered by startup wiring:
+    /// `idx` must be below [`num_interfaces`](Self::num_interfaces), else it
+    /// returns `false` and leaves the router untouched (in particular it does
+    /// *not* mark [`runtime_config_active`](Self::runtime_config_active), so
+    /// that flag never lies about an override having taken effect).  The new
+    /// features take effect on the very next frame: the receive gates are read
+    /// per-frame in [`handle_frame_with_metrics`](Self::handle_frame_with_metrics)
+    /// and the transmit gates via [`link_may_tx`](Self::link_may_tx) on each
+    /// dispatch, and OGM emission is governed by the always-armed timer plus the
+    /// live `tx_ogm` check — so no timer needs re-arming when a flag flips.
+    ///
+    /// `features` is a full replacement; a caller wanting to flip a single flag
+    /// merges its change onto [`link_features(idx)`](Self::link_features) first.
+    pub fn apply_runtime_link_features(
+        &mut self,
+        idx: usize,
+        features: crate::features::LinkFeatures,
+    ) -> bool {
+        if idx >= self.num_interfaces() {
+            return false;
+        }
+        self.set_link_features(idx, features);
         self.runtime_config_active = true;
         true
     }
@@ -2974,5 +3099,296 @@ mod lazy_cert_distribution_switchover {
         // Same for the lazy path.
         a.set_lazy_cert_distribution(true);
         assert!(a.poll(core::time::Duration::ZERO, &mut tx).is_none());
+    }
+}
+
+#[cfg(test)]
+mod link_features_tests {
+    //! Per-link participation gating (`LinkFeatures`): receive gates drop a
+    //! traffic class on ingress, and `link_may_tx` reports the transmit gates
+    //! the driver fan-out consults.
+    use super::*;
+    use crate::features::LinkFeatures;
+    use core::time::Duration;
+    use interfaces::frame::{LinkFrame, Mac};
+    use zerocopy::{FromBytes, IntoBytes};
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    /// Build the raw bytes of a link frame `[dst][src][protocol be][payload]`.
+    fn link_frame(dst: Mac, src: Mac, payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(dst.as_bytes());
+        v.extend_from_slice(src.as_bytes());
+        v.extend_from_slice(&DEFAULT_BATMAN_ETHER_TYPE.to_be_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// A bare 1-hop OGM payload from `orig` (header only, no TVLVs).
+    fn ogm_payload(orig: Mac) -> Vec<u8> {
+        batman::wire::BatmanOgmPacket {
+            packet_type: BATADV_IV_OGM,
+            version: 5,
+            ttl: 50,
+            flags: 0,
+            seqno: 1u32.to_be(),
+            orig,
+            reserved: 0,
+            tq: 255,
+            tvlv_len: 0,
+        }
+        .as_bytes()
+        .to_vec()
+    }
+
+    /// A flooded broadcast payload from `orig` carrying `inner`.
+    fn bcast_payload(orig: Mac, inner: &[u8]) -> Vec<u8> {
+        let mut v = BatmanBroadcastPacket {
+            packet_type: BATADV_BCAST,
+            version: 5,
+            ttl: 50,
+            seqno: 1u32.to_be(),
+            orig,
+        }
+        .as_bytes()
+        .to_vec();
+        v.extend_from_slice(inner);
+        v
+    }
+
+    /// A unicast payload addressed to `dest` carrying `inner`.
+    fn unicast_payload(dest: Mac, inner: &[u8]) -> Vec<u8> {
+        let mut v = BatmanUnicastPacket {
+            packet_type: BATADV_UNICAST,
+            version: 5,
+            ttl: 50,
+            dest,
+        }
+        .as_bytes()
+        .to_vec();
+        v.extend_from_slice(inner);
+        v
+    }
+
+    /// Feed a raw link frame arriving on `iface` into `r`, returning the
+    /// outcome (which borrows `raw` and `tx`).
+    fn feed<'r>(
+        r: &mut CentralRouter,
+        iface: usize,
+        raw: &'r [u8],
+        tx: &'r mut [u8],
+    ) -> RxOutcome<'r, 'r> {
+        let frame = LinkFrame::ref_from_bytes(raw).unwrap();
+        r.handle_frame(Duration::ZERO, iface, frame, tx)
+    }
+
+    /// An unconfigured interface reports full participation; every flag is set.
+    #[test]
+    fn unconfigured_interface_is_full_participation() {
+        let r = CentralRouter::new(mac(1));
+        let f = r.link_features(0);
+        assert!(f.tx_ogm && f.rx_ogm && f.tx_data && f.rx_data);
+        // Out-of-range index also defaults to full, never panics.
+        let f = r.link_features(MAX_INTERFACES + 5);
+        assert!(f.tx_ogm && f.rx_data);
+    }
+
+    /// `set_link_features` stores the features and widens the interface count so
+    /// the interface is reported from registration.
+    #[test]
+    fn set_link_features_stores_and_registers() {
+        let mut r = CentralRouter::new(mac(1));
+        assert_eq!(r.num_interfaces(), 0);
+        let f = LinkFeatures {
+            tx_ogm: false,
+            ..Default::default()
+        };
+        r.set_link_features(2, f);
+        assert!(!r.link_features(2).tx_ogm);
+        assert!(r.link_features(2).rx_ogm, "unset flags stay on");
+        assert_eq!(
+            r.num_interfaces(),
+            3,
+            "iface_count widened to cover index 2"
+        );
+    }
+
+    /// `link_may_tx` maps each BATMAN sub-type to its transmit gate; cert-control
+    /// and unknown sub-types are always permitted.
+    #[test]
+    fn link_may_tx_maps_subtype_to_gate() {
+        let mut r = CentralRouter::new(mac(1));
+        let f = LinkFeatures {
+            tx_ogm: false,
+            rx_ogm: true,
+            tx_data: false,
+            rx_data: true,
+        };
+        r.set_link_features(0, f);
+        assert!(!r.link_may_tx(0, Some(BATADV_IV_OGM)), "tx_ogm gates OGM");
+        assert!(!r.link_may_tx(0, Some(BATADV_BCAST)), "tx_data gates BCAST");
+        assert!(
+            !r.link_may_tx(0, Some(BATADV_UNICAST)),
+            "tx_data gates UNICAST"
+        );
+        assert!(!r.link_may_tx(0, Some(BATADV_MCAST)), "tx_data gates MCAST");
+        assert!(
+            r.link_may_tx(0, Some(BATADV_CERT_REQ)),
+            "cert-control always allowed"
+        );
+        assert!(r.link_may_tx(0, None), "unknown sub-type allowed");
+        // A full (unconfigured) interface permits every class.
+        assert!(r.link_may_tx(1, Some(BATADV_IV_OGM)));
+        assert!(r.link_may_tx(1, Some(BATADV_BCAST)));
+        assert!(r.link_may_tx(1, Some(BATADV_UNICAST)));
+    }
+
+    /// `apply_runtime_link_features` overrides a registered interface, marks the
+    /// router as running a runtime override, and takes effect immediately; an
+    /// out-of-range index is rejected without marking the override active.
+    #[test]
+    fn apply_runtime_link_features_gates_on_registration() {
+        let mut r = CentralRouter::new(mac(1));
+        // Register interface 0 (via its OGM schedule), like startup wiring.
+        r.configure_interface_ogm(
+            0,
+            Duration::from_secs(1),
+            Duration::from_secs(8),
+            Duration::ZERO,
+        );
+        assert_eq!(r.num_interfaces(), 1);
+        assert!(!r.runtime_config_active());
+
+        let f = LinkFeatures {
+            tx_ogm: false,
+            ..Default::default()
+        };
+        assert!(
+            r.apply_runtime_link_features(0, f),
+            "registered iface accepted"
+        );
+        assert!(!r.link_features(0).tx_ogm, "override took effect");
+        assert!(
+            r.runtime_config_active(),
+            "marked as running a runtime override"
+        );
+
+        // An unregistered index is rejected and does not further mutate state.
+        assert!(!r.apply_runtime_link_features(9, LinkFeatures::default()));
+    }
+
+    /// An OGM arriving on a link with `rx_ogm` disabled is dropped before the
+    /// engine sees it — no originator is learned, so the link can never become a
+    /// transit next hop. With `rx_ogm` on (the default), the same OGM is learned.
+    #[test]
+    fn rx_ogm_gate_drops_incoming_ogm() {
+        let payload = ogm_payload(mac(2));
+        let raw = link_frame(Mac::BROADCAST, mac(2), &payload);
+
+        // Default (rx_ogm on): the OGM is learned.
+        let mut on = CentralRouter::new(mac(1));
+        let mut tx = [0u8; 1500];
+        feed(&mut on, 0, &raw, &mut tx);
+        assert_eq!(on.originator_count(), 1, "rx_ogm on: OGM learned");
+
+        // rx_ogm off on iface 0: dropped, nothing learned.
+        let mut off = CentralRouter::new(mac(1));
+        let f = LinkFeatures {
+            rx_ogm: false,
+            ..Default::default()
+        };
+        off.set_link_features(0, f);
+        let mut tx = [0u8; 1500];
+        let out = feed(&mut off, 0, &raw, &mut tx);
+        assert_eq!(off.originator_count(), 0, "rx_ogm off: OGM dropped");
+        assert!(out.forward.is_none() && out.deliver_local.is_none());
+    }
+
+    /// Data-plane frames (broadcast and directed unicast) arriving on a link
+    /// with `rx_data` disabled are dropped — not delivered, not re-flooded. With
+    /// the default they are delivered.
+    #[test]
+    fn rx_data_gate_drops_incoming_data() {
+        let bcast = link_frame(
+            Mac::BROADCAST,
+            mac(2),
+            &bcast_payload(mac(2), &[0xDE, 0xAD, 0xBE, 0xEF]),
+        );
+        // A unicast addressed to this node (mac 1).
+        let unicast = link_frame(
+            mac(1),
+            mac(2),
+            &unicast_payload(mac(1), &[0x01, 0x02, 0x03]),
+        );
+
+        // Default (rx_data on): both are delivered locally.
+        for raw in [&bcast, &unicast] {
+            let mut on = CentralRouter::new(mac(1));
+            let mut tx = [0u8; 1500];
+            let out = feed(&mut on, 0, raw, &mut tx);
+            assert!(out.deliver_local.is_some(), "rx_data on: delivered");
+        }
+
+        // rx_data off on iface 0: both classes dropped before the engine.
+        for raw in [&bcast, &unicast] {
+            let mut off = CentralRouter::new(mac(1));
+            off.set_link_features(
+                0,
+                LinkFeatures {
+                    rx_data: false,
+                    ..Default::default()
+                },
+            );
+            let mut tx = [0u8; 1500];
+            let out = feed(&mut off, 0, raw, &mut tx);
+            assert!(
+                out.forward.is_none() && out.deliver_local.is_none(),
+                "rx_data off: data frame dropped"
+            );
+        }
+    }
+
+    /// An OGM heard on a `tx_data`-off link is *learned* (so it is visible
+    /// locally) but *not re-flooded* — the node never advertises a route to
+    /// nodes it could not deliver to. With `tx_data` on, the same OGM is
+    /// re-flooded (advertised). This is the anti-black-hole rule for a read-only
+    /// front.
+    #[test]
+    fn tx_data_off_link_learns_but_does_not_readvertise_ogm() {
+        let raw = link_frame(Mac::BROADCAST, mac(2), &ogm_payload(mac(2)));
+
+        // tx_data on (default): the OGM is learned and re-flooded (advertised).
+        let mut advertises = CentralRouter::new(mac(1));
+        let mut tx = [0u8; 1500];
+        let out = feed(&mut advertises, 0, &raw, &mut tx);
+        assert_eq!(advertises.originator_count(), 1, "originator learned");
+        assert!(
+            out.forward.is_some(),
+            "tx_data on: OGM re-flooded (advertised)"
+        );
+
+        // tx_data off: still learned (local visibility), but not re-flooded.
+        let mut readonly = CentralRouter::new(mac(1));
+        readonly.set_link_features(
+            0,
+            LinkFeatures {
+                tx_data: false,
+                ..Default::default()
+            },
+        );
+        let mut tx = [0u8; 1500];
+        let out = feed(&mut readonly, 0, &raw, &mut tx);
+        assert_eq!(
+            readonly.originator_count(),
+            1,
+            "tx_data off: originator still learned for local visibility"
+        );
+        assert!(
+            out.forward.is_none(),
+            "tx_data off: OGM not re-advertised, so no peer black-holes"
+        );
     }
 }

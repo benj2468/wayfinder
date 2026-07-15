@@ -155,6 +155,41 @@ message TrickleConfig {
   uint32 max_interval_ms = 3;
 }
 
+// A single mesh interface's participation features, as set via SetConfig: one
+// send gate and one receive gate for each of the two planes — the OGM control
+// plane (topology) and the data plane (unicast, multicast, and broadcast
+// together).  Each flag is independently optional — an unset flag leaves that
+// capability unchanged from the interface's current setting, so a caller can
+// flip one gate (e.g. silence OGM tx on a link a ground station only fronts)
+// without restating the others.  Takes effect on the next frame.
+message LinkFeatures {
+  // Index of the interface to reconfigure, in registration order (same indexing
+  // as OgmScheduleEntry.iface_idx).  Must refer to an interface already
+  // registered by the node's startup configuration; SetConfig cannot provision
+  // a new interface that doesn't already exist.
+  uint32 iface_idx = 1;
+
+  // Send OGMs (this node's own, and re-flooded ones) onto this link, announcing
+  // topology on it.  False keeps the node OGM-silent on the link.
+  optional bool tx_ogm = 2;
+
+  // Accept OGMs arriving on this link and learn routes from them (the link may
+  // become a next hop).  False drops inbound OGMs, so the node is never routed
+  // through this link.
+  optional bool rx_ogm = 3;
+
+  // Send data-plane traffic (unicast, multicast, and broadcast) onto this link.
+  // False makes the link transmit no data.  Because it is this node's ability to
+  // deliver to what is behind the link, it also governs route re-advertisement:
+  // an originator learned on a tx_data-off link is kept locally for visibility
+  // but not re-flooded, so the node never advertises a route it cannot honor.
+  optional bool tx_data = 4;
+
+  // Accept data-plane traffic (unicast, multicast, and broadcast) arriving on
+  // this link (to deliver, forward, or bridge).  False drops inbound data.
+  optional bool rx_data = 5;
+}
+
 // The node's live-editable runtime configuration.  Each field is
 // independently optional: an unset field leaves that piece of configuration
 // unchanged.  New runtime-editable knobs are added here as additional
@@ -170,6 +205,9 @@ message RuntimeConfig {
   // un-upgraded auth nodes — see the design doc before flipping it on a live
   // mesh.
   optional bool lazy_cert_distribution = 2;
+
+  // Present to update the participation features for one mesh interface.
+  LinkFeatures link_features = 3;
 }
 
 // Apply a partial update to the node's runtime configuration.  Only the

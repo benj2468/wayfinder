@@ -184,6 +184,25 @@ async fn set_trickle_config_query_succeeds_against_server() {
 }
 
 #[tokio::test]
+async fn set_link_features_query_succeeds_against_server() {
+    let addr = spawn_server().await;
+    let out = run_query(
+        Command::SetLinkFeatures {
+            iface: 0,
+            tx_ogm: Some(false),
+            rx_ogm: None,
+            tx_data: None,
+            rx_data: None,
+        },
+        &addr.to_string(),
+        OutputFormat::Human,
+    )
+    .await
+    .expect("query succeeds");
+    assert!(out.contains("link features"), "got: {out}");
+}
+
+#[tokio::test]
 async fn set_lazy_cert_distribution_query_succeeds_against_server() {
     let addr = spawn_server().await;
     let out = run_query(

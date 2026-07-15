@@ -126,28 +126,44 @@ impl LinkTransport {
     }
 }
 
-/// A single mesh interface: its transport carrier plus the per-link OGM backoff
-/// bounds.  The `ogm` block is optional in the config and defaults to
-/// [`TrickleConfig::default`] when omitted.
+// The per-link participation flags live in the allocation-free core so the
+// router can gate traffic on them on every deployment; this crate's config
+// layer re-exports the type so `wayfinder::config::LinkFeatures` keeps resolving.
+pub use crate::features::LinkFeatures;
+
+/// A single mesh interface: its transport carrier, its per-link OGM backoff
+/// bounds, and its per-link participation [`features`](LinkConfig::features).
+/// The `ogm` block is optional in the config and defaults to
+/// [`TrickleConfig::default`] when omitted; the `features` block is optional and
+/// defaults to full participation ([`LinkFeatures::default`]).
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LinkConfig {
     /// How this link's frames cross the wire.
     #[serde(flatten)]
     pub transport: LinkTransport,
-    /// This link's adaptive OGM emission bounds.
+    /// This link's adaptive OGM emission bounds.  The Trickle timer is armed
+    /// from these on every link regardless of
+    /// [`features.tx_ogm`](LinkFeatures::tx_ogm); when `tx_ogm` is `false` the
+    /// timer still runs but the emission is suppressed at poll time, so these
+    /// bounds then have no observable effect.
     #[serde(default)]
     pub ogm: TrickleConfig,
+    /// This link's participation capabilities.  Defaults to full participation
+    /// when omitted.
+    #[serde(default)]
+    pub features: LinkFeatures,
 }
 
 impl LinkConfig {
-    /// Build a test link onto the named switch with default OGM bounds.  Keeps
-    /// the test harness's link construction terse.
+    /// Build a test link onto the named switch with default OGM bounds and full
+    /// participation.  Keeps the test harness's link construction terse.
     pub fn test(switch_name: impl Into<String>) -> Self {
         Self {
             transport: LinkTransport::Test {
                 switch_name: switch_name.into(),
             },
             ogm: TrickleConfig::default(),
+            features: LinkFeatures::default(),
         }
     }
 }
@@ -581,6 +597,93 @@ lazy_cert_distribution: true
 ";
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(config.lazy_cert_distribution);
+    }
+
+    /// A link with no `features:` block is fully participating: every
+    /// capability defaults to `true`, preserving the historical behavior.
+    #[test]
+    fn link_features_default_to_full_participation() {
+        let yaml = "\
+type: Test
+switch_name: sw0
+";
+        let link: LinkConfig = serde_yaml::from_str(yaml).unwrap();
+        let f = link.features;
+        assert!(f.tx_ogm && f.rx_ogm && f.tx_data && f.rx_data);
+        // The struct's own Default matches the serde-omitted result.
+        let d = LinkFeatures::default();
+        assert!(d.tx_ogm && d.rx_ogm && d.tx_data && d.rx_data);
+    }
+
+    /// A partial `features:` block flips only the named flags; every unnamed
+    /// capability stays `true`.  This is the ground-station-fronting-LoRa case:
+    /// silence OGM *tx* on the link, keep everything else (still hears the edge
+    /// nodes via `rx_ogm`, still bridges broadcasts).
+    #[test]
+    fn link_features_partial_override_flips_only_named() {
+        let yaml = "\
+type: Test
+switch_name: sw0
+features:
+  tx_ogm: false
+";
+        let link: LinkConfig = serde_yaml::from_str(yaml).unwrap();
+        let f = link.features;
+        assert!(!f.tx_ogm, "tx_ogm was explicitly disabled");
+        assert!(f.rx_ogm, "unnamed flags stay on");
+        assert!(f.tx_data && f.rx_data);
+    }
+
+    /// A fully specified `features:` block round-trips every flag, including the
+    /// broadcast-only terminal-node and read-only-front shapes.
+    #[test]
+    fn link_features_full_specification_parses() {
+        // Broadcast-only terminal node: no OGMs, but data flows both ways.
+        let yaml = "\
+type: Test
+switch_name: sw0
+features:
+  tx_ogm: false
+  rx_ogm: false
+  tx_data: true
+  rx_data: true
+";
+        let f = serde_yaml::from_str::<LinkConfig>(yaml).unwrap().features;
+        assert!(!f.tx_ogm && !f.rx_ogm);
+        assert!(f.tx_data && f.rx_data);
+
+        // Read-only front: learns (rx_ogm) but transmits nothing (tx_data off),
+        // still receives data to observe.
+        let yaml = "\
+type: Test
+switch_name: sw0
+features:
+  tx_ogm: false
+  rx_ogm: true
+  tx_data: false
+  rx_data: true
+";
+        let f = serde_yaml::from_str::<LinkConfig>(yaml).unwrap().features;
+        assert!(!f.tx_ogm && f.rx_ogm && !f.tx_data && f.rx_data);
+    }
+
+    /// A misspelled gate key under `features:` is a hard parse error, not a
+    /// silent no-op — otherwise a typo (`tx_ogmm`) would leave the gate at its
+    /// participating default and fail open (the node keeps flooding OGMs onto a
+    /// link it was meant to silence). Guarded by `deny_unknown_fields`.
+    #[test]
+    fn link_features_rejects_unknown_key() {
+        let yaml = "\
+type: Test
+switch_name: sw0
+features:
+  tx_ogmm: false
+";
+        let err = serde_yaml::from_str::<LinkConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("tx_ogmm") || err.to_string().contains("unknown field"),
+            "expected an unknown-field error, got: {err}"
+        );
     }
 
     /// A `Rylr998` link transport parses its serial/radio parameters, and

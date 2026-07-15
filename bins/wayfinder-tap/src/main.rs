@@ -18,7 +18,7 @@ use tokio::{sync::mpsc, task::JoinSet};
 use tracing_subscriber::EnvFilter;
 use tun_rs::{DeviceBuilder, Layer};
 use wayfinder::config::{
-    Config, LinkTransport, LocalDistributionMechanism, ServerConfig, TrickleConfig,
+    Config, LinkFeatures, LinkTransport, LocalDistributionMechanism, ServerConfig, TrickleConfig,
 };
 use wayfinder::interfaces::frame::Mac;
 use wayfinder::wayfinder_auth::Keypair;
@@ -146,9 +146,11 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut interfaces = Vec::new();
-    // Per-interface OGM backoff bounds, collected in interface order alongside
-    // the transports so the driver can pace each link independently.
+    // Per-interface OGM backoff bounds and participation features, collected in
+    // interface order alongside the transports so the driver can pace and gate
+    // each link independently.
     let mut trickle: Vec<TrickleConfig> = Vec::new();
+    let mut features: Vec<LinkFeatures> = Vec::new();
     for link in config.links {
         match link.transport {
             LinkTransport::Udp {
@@ -201,6 +203,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         trickle.push(link.ogm);
+        features.push(link.features);
     }
 
     // Optional management API server — queries are forwarded to the driver over
@@ -226,7 +229,14 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut driver = Driver::new(Mac(mac_addr), TapDevice(dev), interfaces, trickle, query_rx);
+    let mut driver = Driver::new(
+        Mac(mac_addr),
+        TapDevice(dev),
+        interfaces,
+        trickle,
+        features,
+        query_rx,
+    );
 
     // Fail-closed policy: when configured, the router stays inert (see
     // `CentralRouter::auth_locked`) until a membership cert is installed below

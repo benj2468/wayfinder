@@ -306,6 +306,28 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
         if let Some(lazy) = config.lazy_cert_distribution {
             self.router.apply_runtime_lazy_cert_distribution(lazy);
         }
+        if let Some(lf) = config.link_features {
+            let idx = lf.iface_idx as usize;
+            // Merge the present flags onto the interface's current features so a
+            // partial update flips only the gates it names, leaving the rest as
+            // they are.
+            let mut features = self.router.link_features(idx);
+            if let Some(v) = lf.tx_ogm {
+                features.tx_ogm = v;
+            }
+            if let Some(v) = lf.rx_ogm {
+                features.rx_ogm = v;
+            }
+            if let Some(v) = lf.tx_data {
+                features.tx_data = v;
+            }
+            if let Some(v) = lf.rx_data {
+                features.rx_data = v;
+            }
+            if !self.router.apply_runtime_link_features(idx, features) {
+                return Err("interface index out of range".to_string());
+            }
+        }
         Ok(())
     }
 
@@ -395,7 +417,7 @@ mod tests {
     use wayfinder::CentralRouter;
     use wayfinder::batman::wire::{BATADV_IV_OGM, BatmanOgmPacket};
     use wayfinder::interfaces::frame::{LinkFrame, Mac};
-    use wayfinder_protos::service::TrickleConfigData;
+    use wayfinder_protos::service::{LinkFeaturesData, TrickleConfigData};
     use zerocopy::{FromBytes, IntoBytes};
 
     fn mac(n: u8) -> Mac {
@@ -538,6 +560,63 @@ mod tests {
             "must switch to fingerprint-only emission"
         );
         assert!(find_tvlv(&ogm[hdr_len..], TvlvType::CertFp).is_some());
+    }
+
+    /// `set_config` with a `link_features` update merges the present flags onto
+    /// the interface's current features (leaving unnamed gates untouched),
+    /// applies them live, and marks the runtime config active.
+    #[test]
+    fn set_config_updates_link_features_partially_and_marks_active() {
+        let mut router = CentralRouter::new(mac(1));
+        // Register interface 0 as startup wiring would; it starts fully
+        // participating.
+        router.configure_interface_ogm(
+            0,
+            Duration::from_secs(1),
+            Duration::from_secs(8),
+            Duration::ZERO,
+        );
+        assert!(router.link_features(0).tx_ogm);
+        assert!(router.link_features(0).rx_ogm);
+
+        // Flip only tx_ogm off — every other gate must stay as it was.
+        let result =
+            RouterAdapter::new(&mut router, None, Duration::ZERO).set_config(RuntimeConfigData {
+                link_features: Some(LinkFeaturesData {
+                    iface_idx: 0,
+                    tx_ogm: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        assert!(result.is_ok());
+
+        let f = router.link_features(0);
+        assert!(!f.tx_ogm, "named flag flipped");
+        assert!(
+            f.rx_ogm && f.tx_data && f.rx_data,
+            "unnamed flags left untouched"
+        );
+        assert!(RouterAdapter::new(&mut router, None, Duration::ZERO).runtime_config_active());
+    }
+
+    /// A `link_features` update targeting an unregistered interface index is
+    /// rejected rather than silently ignored.
+    #[test]
+    fn set_config_link_features_out_of_range_iface_idx_errors() {
+        let mut router = CentralRouter::new(mac(1));
+        let result =
+            RouterAdapter::new(&mut router, None, Duration::ZERO).set_config(RuntimeConfigData {
+                link_features: Some(LinkFeaturesData {
+                    iface_idx: 0, // nothing registered yet
+                    tx_data: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let err = result.unwrap_err();
+        assert!(err.contains("out of range"), "got: {err}");
+        assert!(!RouterAdapter::new(&mut router, None, Duration::ZERO).runtime_config_active());
     }
 
     /// `set_config` with no fields set is a no-op that still succeeds.

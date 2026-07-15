@@ -28,7 +28,7 @@ use wayfinder_protos::wayfinder_v1alpha::{
     ApproveCsrRequest, DenyCsrRequest, GetLinkQualityTableRequest, GetMetricsRequest,
     GetNodeInfoRequest, GetOgmScheduleRequest, GetRoutingTableRequest, GetSecurityStatusRequest,
     GetSecurityStatusResponse, GetThroughputRequest, GetTrustAnchorRequest, GetTrustAnchorResponse,
-    LinkQualityTable, ListCertsRequest, ListCertsResponse, ListPendingCsrsRequest,
+    LinkFeatures, LinkQualityTable, ListCertsRequest, ListCertsResponse, ListPendingCsrsRequest,
     ListPendingCsrsResponse, NodeInfo, NodeMetrics, OgmSchedule, ResolveRouteRequest,
     ResolveRouteResponse, RevokeNodeRequest, RoutingTable, RuntimeConfig, SetAuthRequest,
     SetConfigRequest, SubmitCsrRequest, SubmitCsrResponse, Throughput, TrickleConfig,
@@ -294,6 +294,28 @@ impl Client {
                         min_interval_ms,
                         max_interval_ms,
                     }),
+                    ..Default::default()
+                }),
+            }))
+            .await?
+        {
+            ResponseKind::Empty(_) => Ok(()),
+            other => Err(unexpected("SetConfig", &other)),
+        }
+    }
+
+    /// Override one interface's participation features at runtime.  Each flag on
+    /// `features` is independently optional: a `None` leaves that gate unchanged,
+    /// so the caller flips only what it names (e.g. `tx_ogm: Some(false)` to
+    /// silence OGM tx on a link this node only fronts).  Applied in memory only
+    /// — it does not persist across a restart.  `features.iface_idx` must refer
+    /// to an interface the node already has configured; this cannot provision a
+    /// new one.
+    pub async fn set_link_features(&mut self, features: LinkFeatures) -> anyhow::Result<()> {
+        match self
+            .request(RequestKind::SetConfig(SetConfigRequest {
+                config: Some(RuntimeConfig {
+                    link_features: Some(features),
                     ..Default::default()
                 }),
             }))

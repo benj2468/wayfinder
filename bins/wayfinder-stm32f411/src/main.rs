@@ -150,6 +150,6 @@ async fn main(_spawner: Spawner) {
         i_max: core::time::Duration::from_secs(128),
     }];
 
-    let mut driver = Driver::new(NODE_MAC, [client], EmbassyClock, &trickle);
+    let mut driver = Driver::new(NODE_MAC, [client], EmbassyClock, &trickle, &[]);
     driver.run().await
 }

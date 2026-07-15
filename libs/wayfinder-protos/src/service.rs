@@ -83,6 +83,28 @@ pub struct TrickleConfigData {
     pub max_interval_ms: u32,
 }
 
+/// Intermediate representation of a request to override one mesh interface's
+/// participation features, carried by [`RuntimeConfigData`] into
+/// [`WayfinderDataProvider::set_config`].  Each flag is independently optional:
+/// `None` leaves that capability unchanged from the interface's current
+/// setting, so a caller can flip one gate without restating the others.
+#[derive(Clone, Default)]
+pub struct LinkFeaturesData {
+    /// Physical-interface index to reconfigure, in registration order.
+    pub iface_idx: u32,
+    /// Send OGMs (own + re-flooded) onto this link, if present.
+    pub tx_ogm: Option<bool>,
+    /// Receive OGMs on this link and learn routes from them, if present.
+    pub rx_ogm: Option<bool>,
+    /// Send data-plane traffic (unicast/multicast/broadcast) onto this link, if
+    /// present.  Also governs route re-advertisement (see the core
+    /// `LinkFeatures::tx_data`).
+    pub tx_data: Option<bool>,
+    /// Accept data-plane traffic (unicast/multicast/broadcast) on this link, if
+    /// present.
+    pub rx_data: Option<bool>,
+}
+
 /// Intermediate representation of a partial runtime-configuration update,
 /// passed to [`WayfinderDataProvider::set_config`].  Each field is
 /// independently optional: `None` leaves that piece of configuration
@@ -94,6 +116,8 @@ pub struct RuntimeConfigData {
     pub trickle: Option<TrickleConfigData>,
     /// Present to switch lazy cert distribution on (`true`) or off (`false`).
     pub lazy_cert_distribution: Option<bool>,
+    /// Present to override the participation features for one mesh interface.
+    pub link_features: Option<LinkFeaturesData>,
 }
 
 /// Intermediate representation of one interface's smoothed throughput,
@@ -587,16 +611,21 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
             }
 
             Some(RequestKind::SetConfig(set_config)) => {
-                let raw_config = set_config.config;
+                let raw_config = set_config.config.unwrap_or_default();
                 let config = RuntimeConfigData {
-                    trickle: raw_config.as_ref().and_then(|c| c.trickle).map(|t| {
-                        TrickleConfigData {
-                            iface_idx: t.iface_idx,
-                            min_interval_ms: t.min_interval_ms,
-                            max_interval_ms: t.max_interval_ms,
-                        }
+                    trickle: raw_config.trickle.map(|t| TrickleConfigData {
+                        iface_idx: t.iface_idx,
+                        min_interval_ms: t.min_interval_ms,
+                        max_interval_ms: t.max_interval_ms,
                     }),
-                    lazy_cert_distribution: raw_config.and_then(|c| c.lazy_cert_distribution),
+                    lazy_cert_distribution: raw_config.lazy_cert_distribution,
+                    link_features: raw_config.link_features.map(|f| LinkFeaturesData {
+                        iface_idx: f.iface_idx,
+                        tx_ogm: f.tx_ogm,
+                        rx_ogm: f.rx_ogm,
+                        tx_data: f.tx_data,
+                        rx_data: f.rx_data,
+                    }),
                 };
                 match self.provider.set_config(config) {
                     Ok(_) => ResponseKind::Empty(Empty {}),
@@ -931,6 +960,7 @@ mod tests {
                         max_interval_ms: 4000,
                     }),
                     lazy_cert_distribution: None,
+                    link_features: None,
                 }),
             }),
         ) {
@@ -947,6 +977,7 @@ mod tests {
                 config: Some(RuntimeConfig {
                     trickle: None,
                     lazy_cert_distribution: None,
+                    link_features: None,
                 }),
             }),
         ) {
@@ -966,6 +997,7 @@ mod tests {
                 config: Some(RuntimeConfig {
                     trickle: None,
                     lazy_cert_distribution: Some(true),
+                    link_features: None,
                 }),
             }),
         ) {
@@ -986,6 +1018,7 @@ mod tests {
                         max_interval_ms: 4000,
                     }),
                     lazy_cert_distribution: None,
+                    link_features: None,
                 }),
             }),
         ) {

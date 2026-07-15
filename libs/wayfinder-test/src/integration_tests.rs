@@ -7,7 +7,7 @@ use interfaces::frame::Mac;
 use interfaces::link::LinkMetrics;
 use tracing_subscriber::EnvFilter;
 use wayfinder::batman::MAX_MISSED_OGMS;
-use wayfinder::config::{Config, LinkConfig, LinkTransport, TrickleConfig};
+use wayfinder::config::{Config, LinkConfig, LinkFeatures, LinkTransport, TrickleConfig};
 use wayfinder::{
     DEFAULT_BATMAN_ETHER_TYPE, EgressInterface,
     batman::wire::{
@@ -243,6 +243,49 @@ fn line_of_three() -> TestHarness {
     config.validate().unwrap()
 }
 
+/// A `machine1 — machine2 — machine3` line (as [`line_of_three`]) but with
+/// `machine2`'s link toward `machine3` (its interface 1, on `switch2`) carrying
+/// the given participation `features` instead of full participation.  Lets a
+/// test gate exactly the middle node's egress toward the far end and observe the
+/// effect through the real driver dispatch path.
+fn line_of_three_mid_gated(mid_far_link: LinkFeatures) -> TestHarness {
+    let mut config = TestConfig::default();
+    for sw in ["switch1", "switch2"] {
+        config.switches.push(TestSwitchConfig { name: sw.into() });
+    }
+    config.machines.push(TestMachineConfig {
+        name: "machine1".into(),
+        wayfinder: Config {
+            links: vec![LinkConfig::test("switch1")],
+            ..Default::default()
+        },
+    });
+    config.machines.push(TestMachineConfig {
+        name: "machine2".into(),
+        wayfinder: Config {
+            links: vec![
+                LinkConfig::test("switch1"),
+                LinkConfig {
+                    transport: LinkTransport::Test {
+                        switch_name: "switch2".into(),
+                    },
+                    ogm: TrickleConfig::default(),
+                    features: mid_far_link,
+                },
+            ],
+            ..Default::default()
+        },
+    });
+    config.machines.push(TestMachineConfig {
+        name: "machine3".into(),
+        wayfinder: Config {
+            links: vec![LinkConfig::test("switch2")],
+            ..Default::default()
+        },
+    });
+    config.validate().unwrap()
+}
+
 /// Five nodes with two routes from `a` to `d` of unequal length:
 ///
 /// ```text
@@ -305,6 +348,7 @@ fn diamond(i_max_ms: u64) -> TestHarness {
                         i_min_ms: 1000,
                         i_max_ms,
                     },
+                    features: LinkFeatures::default(),
                 })
                 .collect(),
             ..Default::default()
@@ -671,6 +715,125 @@ async fn broadcast_is_delivered_locally_at_neighbor() {
     assert_eq!(
         harness.get_machine("machine2").local_deliveries(),
         vec![host_frame(Mac::BROADCAST, m1, arp)]
+    );
+}
+
+/// The negative mirror of the previous test: with `tx_data` disabled on
+/// machine1's only link, its locally originated broadcast is suppressed at the
+/// driver's egress fan-out and never reaches machine2 — proving the per-link
+/// transmit gate (`link_may_tx`) actually keeps the flood off the wire.
+#[tokio::test]
+async fn broadcast_suppressed_on_tx_data_disabled_link() {
+    setup();
+    let mut harness = simple_pair();
+
+    // Turn data-plane tx off on machine1's link to the switch (iface 0); every
+    // other capability stays on.
+    let f = LinkFeatures {
+        tx_data: false,
+        ..Default::default()
+    };
+    harness
+        .get_machine_mut("machine1")
+        .router_mut()
+        .set_link_features(0, f);
+
+    let arp = b"i am a broadcast frame";
+    harness
+        .get_machine_mut("machine1")
+        .send_local(Mac::BROADCAST, arp)
+        .await
+        .expect("broadcast packet should build");
+
+    harness.tick().await;
+    harness.tick().await;
+
+    assert!(
+        harness
+            .get_machine("machine2")
+            .local_deliveries()
+            .is_empty(),
+        "a broadcast must not egress a tx_data-disabled link"
+    );
+}
+
+/// A transit OGM is not re-flooded out a `tx_ogm`-disabled link. On a
+/// `machine1 — machine2 — machine3` line where machine2's link toward machine3
+/// has `tx_ogm: false`, machine2 still *hears* machine1 (rx_ogm on) but never
+/// announces onto the far link, so machine3 never learns machine1 — the
+/// re-flood (transit) path, exercised through the real driver dispatch, is
+/// suppressed distinctly from own-OGM emission.
+#[tokio::test]
+async fn ogm_reflood_suppressed_on_tx_ogm_disabled_link() {
+    setup();
+    let f = LinkFeatures {
+        tx_ogm: false, // machine2 stays OGM-silent toward machine3
+        ..Default::default()
+    };
+    let mut harness = line_of_three_mid_gated(f);
+
+    let m1 = harness.get_machine("machine1").ident;
+    converge_at(&mut harness, Duration::from_secs(1)).await;
+
+    // The OGM path up to the middle node works: machine2 learned machine1.
+    assert!(
+        harness
+            .get_machine("machine2")
+            .router()
+            .originator_table()
+            .any(|r| r.neighbor_ident == m1),
+        "machine2 must hear machine1 (rx_ogm is on)"
+    );
+    // But the re-flood onto the tx_ogm-disabled far link is suppressed, so the
+    // far node never learns the origin behind the middle node.
+    assert!(
+        harness
+            .get_machine("machine3")
+            .router()
+            .originator_table()
+            .all(|r| r.neighbor_ident != m1),
+        "machine3 must not learn machine1: the transit OGM re-flood is gated"
+    );
+}
+
+/// A `tx_data`-off link is not re-advertised: the fronting node learns the
+/// nodes behind it (local visibility) but never announces a route to them, so no
+/// peer can black-hole traffic toward nodes it can't deliver to. On the
+/// `machine1 — machine2 — machine3` line, machine2's link toward machine3 is
+/// `tx_data: false`; machine2 still learns machine3 (rx_ogm on), but machine1 —
+/// the "control station" one hop further out — never learns machine3, because
+/// machine2 doesn't re-flood a route it couldn't honor. This is the anti-black-
+/// hole rule that closes the "advertise but can't deliver" gap.
+#[tokio::test]
+async fn tx_data_off_link_is_not_readvertised_to_peers() {
+    setup();
+    let f = LinkFeatures {
+        tx_data: false, // machine2 can't deliver onto the far link ⇒ won't advertise it
+        ..Default::default()
+    };
+    let mut harness = line_of_three_mid_gated(f);
+
+    let m3 = harness.get_machine("machine3").ident;
+    converge_at(&mut harness, Duration::from_secs(1)).await;
+
+    // The fronting node itself sees machine3 (learned locally for visibility).
+    assert!(
+        harness
+            .get_machine("machine2")
+            .router()
+            .originator_table()
+            .any(|r| r.neighbor_ident == m3),
+        "machine2 must learn machine3 locally (rx_ogm is on)"
+    );
+    // But it advertises no route to machine3, so the node one hop further out
+    // never learns it and thus never tries to route to it and black-hole.
+    assert!(
+        harness
+            .get_machine("machine1")
+            .router()
+            .originator_table()
+            .all(|r| r.neighbor_ident != m3),
+        "machine1 must not learn machine3: a tx_data-off link is not re-advertised"
     );
 }
 
@@ -1871,6 +2034,7 @@ fn diamond_plus_k5(i_max_ms: u64) -> TestHarness {
                     i_min_ms: 1000,
                     i_max_ms,
                 },
+                features: LinkFeatures::default(),
             })
             .collect();
         config.machines.push(TestMachineConfig {
