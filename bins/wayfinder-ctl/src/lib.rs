@@ -20,7 +20,9 @@ use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use wayfinder_auth::Keypair;
 use wayfinder_client::{Client, ConnectTarget};
-use wayfinder_protos::wayfinder_v1alpha::{CsrIssued, submit_csr_response::Outcome as CsrOutcome};
+use wayfinder_protos::wayfinder_v1alpha::{
+    CsrIssued, LinkFeatures, submit_csr_response::Outcome as CsrOutcome,
+};
 
 use crate::output::OutputFormat;
 
@@ -91,6 +93,29 @@ pub enum Command {
         /// New backoff ceiling (Trickle i_max), in milliseconds.
         #[arg(long)]
         max_ms: u32,
+    },
+    /// Override one interface's participation features at runtime. Each flag is
+    /// optional (`--tx-ogm true|false`, etc.): omit it to leave that gate
+    /// unchanged, so you can flip one capability without restating the others.
+    /// Applied in memory only — it does not persist across a restart. `--iface`
+    /// must refer to an interface the node already has configured.
+    SetLinkFeatures {
+        /// Index of the interface to reconfigure, in registration order.
+        #[arg(long)]
+        iface: u32,
+        /// Send OGMs (own + re-flooded) onto this link.
+        #[arg(long)]
+        tx_ogm: Option<bool>,
+        /// Receive OGMs on this link and learn routes from them.
+        #[arg(long)]
+        rx_ogm: Option<bool>,
+        /// Send data-plane traffic (unicast/multicast/broadcast) onto this link.
+        /// Also governs route re-advertisement.
+        #[arg(long)]
+        tx_data: Option<bool>,
+        /// Accept data-plane traffic (unicast/multicast/broadcast) on this link.
+        #[arg(long)]
+        rx_data: Option<bool>,
     },
     /// Switch lazy cert distribution on or off at runtime. Applied in memory
     /// only — it does not persist across a restart. A flag-day, wire-
@@ -217,6 +242,25 @@ pub async fn run_query(
                 .await
                 .context("failed to set trickle config")?;
             "trickle config updated".to_string()
+        }
+        Command::SetLinkFeatures {
+            iface,
+            tx_ogm,
+            rx_ogm,
+            tx_data,
+            rx_data,
+        } => {
+            client
+                .set_link_features(LinkFeatures {
+                    iface_idx: iface,
+                    tx_ogm,
+                    rx_ogm,
+                    tx_data,
+                    rx_data,
+                })
+                .await
+                .context("failed to set link features")?;
+            "link features updated".to_string()
         }
         Command::SetLazyCertDistribution { enabled } => {
             client

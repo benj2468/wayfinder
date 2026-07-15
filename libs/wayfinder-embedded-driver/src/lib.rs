@@ -30,6 +30,7 @@ use embassy_futures::select::{Either, select, select_array};
 use heapless::Vec as HVec;
 use tracing::{trace, warn};
 use wayfinder::auth::DIRECTED_TRAILER_LEN;
+use wayfinder::features::LinkFeatures;
 use wayfinder::interfaces::frame::{LinkFrameData, MAX_LINK_FRAME_LEN, Mac};
 use wayfinder::link::LinkT;
 use wayfinder::{CentralRouter, EgressInterface, MAX_INTERFACES};
@@ -143,9 +144,19 @@ pub struct Driver<L, C, const N: usize> {
 impl<L: LinkT, C: Clock, const N: usize> Driver<L, C, N> {
     /// Build a driver for node `mac` over the given mesh `links` and `clock`.
     /// `trickle` supplies each interface's adaptive OGM bounds
-    /// ([`TrickleParams`]), in interface order; interfaces without an entry fall
-    /// back to [`TrickleParams::default`].
-    pub fn new(mac: Mac, links: [L; N], clock: C, trickle: &[TrickleParams]) -> Self {
+    /// ([`TrickleParams`]) and `features` its per-link participation gates, both
+    /// in interface order; interfaces without an entry fall back to
+    /// [`TrickleParams::default`] / [`LinkFeatures::default`] (full
+    /// participation).
+    ///
+    /// [`LinkFeatures::default`]: wayfinder::features::LinkFeatures
+    pub fn new(
+        mac: Mac,
+        links: [L; N],
+        clock: C,
+        trickle: &[TrickleParams],
+        features: &[LinkFeatures],
+    ) -> Self {
         // The router only tracks `MAX_INTERFACES` interfaces; a board with more
         // links would have its extra interfaces silently never scheduled for
         // OGMs (`configure_interface_ogm` no-ops past the cap). Catch that board
@@ -155,11 +166,16 @@ impl<L: LinkT, C: Clock, const N: usize> Driver<L, C, N> {
             "Driver supports at most MAX_INTERFACES mesh interfaces"
         );
         let mut router = CentralRouter::new(mac);
-        // Install each interface's adaptive OGM schedule up front so the
-        // periodic timer has a per-interface schedule to consult from the start.
+        // Install each interface's adaptive OGM schedule and participation
+        // features up front so the periodic timer and egress gates have a
+        // per-interface entry from the start. The Trickle timer is armed on
+        // every interface regardless of `tx_ogm`; a `tx_ogm`-off link has its
+        // emission suppressed at poll time, keeping the features runtime-
+        // toggleable without arming/disarming timers.
         for idx in 0..N {
             let cfg = trickle.get(idx).copied().unwrap_or_default();
             router.configure_interface_ogm(idx, cfg.i_min, cfg.i_max, Duration::ZERO);
+            router.set_link_features(idx, features.get(idx).copied().unwrap_or_default());
         }
         Self {
             router,
@@ -290,6 +306,14 @@ async fn dispatch<L: LinkT, const N: usize>(
             payload: &stage.frames[i].payload[..send_len],
         };
 
+        // The BATMAN sub-type of this outgoing frame (its leading payload byte),
+        // used to consult each candidate interface's per-link transmit gates
+        // (`link_may_tx`).  Only meaningful for BATMAN frames; other protocols
+        // are never gated (`None` ⇒ always permitted).
+        let pkt_type = (protocol == wayfinder::DEFAULT_BATMAN_ETHER_TYPE)
+            .then(|| data.payload.first().copied())
+            .flatten();
+
         match egress {
             // A per-link OGM goes out exactly one interface, on its own schedule.
             Egress::Iface(iface_idx) => {
@@ -303,11 +327,24 @@ async fn dispatch<L: LinkT, const N: usize>(
                         if Some(idx) == exclude {
                             continue;
                         }
+                        // Per-link transmit gate: skip a link that does not send
+                        // this traffic class (OGM re-flood / broadcast / unicast).
+                        if !router.link_may_tx(idx, pkt_type) {
+                            trace!(iface_idx = idx, "drop: tx gate disabled on this link");
+                            continue;
+                        }
                         send_on(links, router, idx, mac, &data, now).await;
                     }
                 }
-                Some(EgressInterface::Interface(iface_idx)) => {
+                // Per-link transmit gate: a unicast/mcast toward a route out a
+                // `tx_data`-off link is dropped rather than forwarded.
+                Some(EgressInterface::Interface(iface_idx))
+                    if router.link_may_tx(iface_idx, pkt_type) =>
+                {
                     send_on(links, router, iface_idx, mac, &data, now).await;
+                }
+                Some(EgressInterface::Interface(iface_idx)) => {
+                    trace!(iface_idx, "drop: tx gate disabled on egress link");
                 }
                 None => {}
             },
@@ -446,7 +483,7 @@ mod tests {
         let clock = ImmediateClock {
             now: Duration::from_secs(30),
         };
-        let mut driver = Driver::new(mac(1), [FakeLink::default()], clock, &trickle);
+        let mut driver = Driver::new(mac(1), [FakeLink::default()], clock, &trickle, &[]);
 
         futures::executor::block_on(driver.run_once());
 
@@ -479,7 +516,7 @@ mod tests {
             now: Duration::from_secs(1),
         };
         let trickle = [TrickleParams::default(), TrickleParams::default()];
-        let mut driver = Driver::new(mac(1), [link0, link1], clock, &trickle);
+        let mut driver = Driver::new(mac(1), [link0, link1], clock, &trickle, &[]);
 
         futures::executor::block_on(driver.run_once());
 

@@ -18,9 +18,10 @@ use anyhow::bail;
 use futures::{FutureExt, future::select_all};
 use interfaces::link::LinkMetrics;
 use tokio::time::sleep;
-use tracing::trace;
+use tracing::{trace, warn};
 use wayfinder::auth::DIRECTED_TRAILER_LEN;
 use wayfinder::config::TrickleConfig;
+use wayfinder::features::LinkFeatures;
 use wayfinder::interfaces::frame::{LinkFrameData, MAX_LINK_FRAME_LEN, Mac};
 use wayfinder::{CentralRouter, EgressInterface, McastPlan};
 use wayfinder_driver_core::{Egress, MeshSink};
@@ -126,21 +127,43 @@ pub struct Driver<Local: FrameIo> {
 impl<Local: FrameIo> Driver<Local> {
     /// Build a driver for node `mac` over the given host device, mesh
     /// interfaces, and management-query channel.  `trickle` supplies each
-    /// interface's per-link adaptive OGM bounds (`i_min`/`i_max`), in interface
-    /// order; interfaces without an entry fall back to [`TrickleConfig::default`].
+    /// interface's per-link adaptive OGM bounds (`i_min`/`i_max`), and `features`
+    /// its per-link participation gates, both in interface order; interfaces
+    /// without an entry fall back to [`TrickleConfig::default`] /
+    /// [`LinkFeatures::default`] (full participation).
+    ///
+    /// [`LinkFeatures::default`]: wayfinder::features::LinkFeatures
     pub fn new(
         mac: Mac,
         local: Local,
         interfaces: Vec<Box<DynLinkT<'static>>>,
         trickle: Vec<TrickleConfig>,
+        features: Vec<LinkFeatures>,
         query_rx: QueryRx,
     ) -> Self {
         let mut router = CentralRouter::new(mac);
-        // Install each interface's adaptive OGM schedule up front so the
-        // periodic loop has a per-interface timer to consult from the start.
+        // Install each interface's adaptive OGM schedule and participation
+        // features up front so the periodic loop and the egress gates have a
+        // per-interface entry to consult from the start.  The Trickle timer is
+        // armed on every interface regardless of `tx_ogm`; a `tx_ogm`-off link
+        // simply has its emission suppressed at poll time, which keeps the
+        // features runtime-toggleable without arming/disarming timers.
+        // The router only tracks `MAX_INTERFACES` interfaces; links past that cap
+        // are silently never OGM-scheduled *and* silently revert to full
+        // participation (a `set_link_features` past the cap no-ops), so a link
+        // configured as a read-only tap would still transmit. Warn rather than
+        // ship that misconfiguration mutely.
+        if interfaces.len() > wayfinder::MAX_INTERFACES {
+            warn!(
+                configured = interfaces.len(),
+                max = wayfinder::MAX_INTERFACES,
+                "more mesh links than the router supports; links past the cap are unscheduled and ungated"
+            );
+        }
         for idx in 0..interfaces.len() {
             let cfg = trickle.get(idx).copied().unwrap_or_default();
             router.configure_interface_ogm(idx, cfg.i_min(), cfg.i_max(), Duration::ZERO);
+            router.set_link_features(idx, features.get(idx).copied().unwrap_or_default());
         }
         Self {
             local,
@@ -583,6 +606,14 @@ async fn dispatch<Local: FrameIo>(
             payload: &payload[..send_len],
         };
 
+        // The BATMAN sub-type of this outgoing frame (its leading payload byte),
+        // used to consult each candidate interface's per-link transmit gates
+        // (`link_may_tx`).  Only meaningful for BATMAN frames; other protocols
+        // are never gated (`None` ⇒ always permitted).
+        let pkt_type = (protocol == wayfinder::DEFAULT_BATMAN_ETHER_TYPE)
+            .then(|| data.payload.first().copied())
+            .flatten();
+
         match egress {
             // A per-link OGM goes out exactly one interface, on that link's own
             // adaptive schedule.
@@ -600,14 +631,28 @@ async fn dispatch<Local: FrameIo>(
                         if Some(idx) == exclude {
                             continue;
                         }
+                        // Per-link transmit gate: skip a link that does not send
+                        // this traffic class (e.g. an OGM re-flood onto a
+                        // `tx_ogm`-off link, or any broadcast onto a listen-only
+                        // link).
+                        if !router.link_may_tx(idx, pkt_type) {
+                            trace!(iface_idx = idx, "drop: tx gate disabled on this link");
+                            continue;
+                        }
                         let sent = iface.send(mac, &data).await?;
                         router.record_tx(idx, sent, now);
                     }
                 }
                 Some(EgressInterface::Interface(iface_idx)) => {
-                    if let Some(iface) = interfaces.get_mut(iface_idx) {
-                        let sent = iface.send(mac, &data).await?;
-                        router.record_tx(iface_idx, sent, now);
+                    // Per-link transmit gate: a unicast/mcast toward a route out
+                    // a `tx_data`-off link is dropped rather than forwarded.
+                    if router.link_may_tx(iface_idx, pkt_type) {
+                        if let Some(iface) = interfaces.get_mut(iface_idx) {
+                            let sent = iface.send(mac, &data).await?;
+                            router.record_tx(iface_idx, sent, now);
+                        }
+                    } else {
+                        trace!(iface_idx, "drop: tx gate disabled on egress link");
                     }
                 }
                 None => {}

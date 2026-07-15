@@ -228,7 +228,16 @@ pub fn poll_due_ogms(
     // Each emission advances exactly one interface's timer, so the set of due
     // interfaces shrinks every pass and the loop terminates.
     while let Some(idx) = router.due_interface(now) {
-        if let Some(f) = router.poll(now, tx_buffer) {
+        // Own-OGM transmit gate: a link with `tx_ogm` off never emits this
+        // node's OGMs.  Both drivers arm the Trickle timer on every interface
+        // regardless of `tx_ogm` (so the features stay runtime-toggleable
+        // without re-arming a timer), so this poll-time check is the actual
+        // suppression: it skips the emission while `on_interface_emitted` below
+        // still advances the timer unconditionally, so the due-set shrinks and
+        // the loop terminates.
+        if router.link_features(idx).tx_ogm
+            && let Some(f) = router.poll(now, tx_buffer)
+        {
             sink.emit(OutgoingFrame {
                 dst: f.dst,
                 protocol: f.protocol,
@@ -392,6 +401,47 @@ mod tests {
         assert_eq!(ogm.protocol, DEFAULT_BATMAN_ETHER_TYPE);
         assert_eq!(ogm.egress, Egress::Iface(0));
         assert!(sink.local.is_empty());
+    }
+
+    /// An interface whose Trickle timer is armed but whose `tx_ogm` feature is
+    /// off emits no OGM: `poll_due_ogms` skips the emission yet still advances
+    /// the timer, so the loop makes progress and terminates.
+    #[test]
+    fn poll_due_ogms_skips_tx_ogm_disabled_interface() {
+        use wayfinder::features::LinkFeatures;
+
+        let mut router = CentralRouter::new(mac(1));
+        router.configure_interface_ogm(
+            0,
+            Duration::from_secs(1),
+            Duration::from_secs(8),
+            Duration::ZERO,
+        );
+        // Arm the timer, then disable OGM tx on that same interface.
+        let f = LinkFeatures {
+            tx_ogm: false,
+            ..Default::default()
+        };
+        router.set_link_features(0, f);
+
+        let mut now = Duration::ZERO;
+        while router.due_interface(now).is_none() && now < Duration::from_secs(60) {
+            now += Duration::from_millis(100);
+        }
+        assert!(
+            router.due_interface(now).is_some(),
+            "interface never came due"
+        );
+
+        let mut tx = [0u8; wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN];
+        let mut sink = CaptureSink::default();
+        poll_due_ogms(&mut router, now, &mut tx, &mut sink);
+
+        assert!(sink.mesh.is_empty(), "tx_ogm off ⇒ no OGM emitted");
+        assert!(
+            router.due_interface(now).is_none(),
+            "timer still advanced so the poll loop terminates"
+        );
     }
 
     /// A frame with an unknown protocol is dropped by the engine, so
