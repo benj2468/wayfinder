@@ -295,11 +295,6 @@ where
     /// packet that arrived while [`Self::expect`] was awaiting a command
     /// response, instead of it being silently dropped. Returns `None` in that
     /// case; `Some(line)` for any other (non-blank) line.
-    ///
-    /// TODO(bjc): this classifier plus `rx_queue` is the scoped fix for that
-    /// interleaving gap; the AT-command interaction is still not the "big
-    /// state machine" described in the original TODO here, which remains a
-    /// separate, larger refactor if still wanted.
     async fn next_line(&mut self) -> Result<Option<String<LINE_BUF_LEN>>, LoraError> {
         loop {
             let mut line = String::<LINE_BUF_LEN>::new();

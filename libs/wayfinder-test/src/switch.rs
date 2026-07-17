@@ -12,7 +12,6 @@ use crate::Direction;
 
 /// Per-port link-loss configuration for a simulated [`Switch`] port.
 pub struct PortConfig {
-    // TODO: will support vlans
     /// Probability `[0.0, 1.0]` of dropping a frame on the switch→node egress
     /// toward this port (this node failing to *hear* the fabric).
     outgoing_loss: f64,
