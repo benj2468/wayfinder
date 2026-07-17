@@ -352,7 +352,7 @@ async fn test_set_baud_rate_all_standard_rates() {
 /// `+RCV=<addr>,<len>,<data>,<rssi>,<snr>` line: max-width address, a full
 /// 240-char `<Data>` field (the module's own maximum), and max-width RSSI/SNR
 /// — `+RCV=65535,240,<240 chars>,-130,-20` is ~264 chars. This is exactly the
-/// line shape a maximal RYLR998 on-air fragment produces once hex-encoded.
+/// line shape a maximal RYLR998 on-air fragment produces once base64-encoded.
 #[tokio::test]
 async fn test_listen_for_packet_worst_case_line_length() {
     let (mut client, handle, _t) = make_pair();

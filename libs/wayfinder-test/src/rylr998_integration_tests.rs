@@ -100,7 +100,7 @@ async fn rylr_two_node_convergence() {
 }
 
 /// A payload well past the RYLR998 link's single-fragment payload budget
-/// (104 bytes: 120-byte on-air frame minus the 2-byte frag header minus the
+/// (164 bytes: 180-byte on-air frame minus the 2-byte frag header minus the
 /// 14-byte link header) survives fragmentation on send and reassembly on
 /// receive, carried end-to-end through the real router/driver stack.
 #[tokio::test]
@@ -119,8 +119,10 @@ async fn rylr_fragmented_payload_end_to_end() {
     })
     .await;
 
-    // 300 bytes + 14-byte link header = 314 bytes -> ceil(314/118) = 3 on-air
-    // fragments (FRAG_PAYLOAD = 118 in rylr998::frag).
+    // 300 bytes, plus the 37 bytes of header overhead the mesh wraps it in
+    // (14-byte link header + 9-byte batman unicast header + 14-byte host
+    // Ethernet header) = 337 bytes -> ceil(337/178) = 2 on-air fragments
+    // (FRAG_PAYLOAD = 178 in rylr998::frag).
     let payload: Vec<u8> = (0..300u16).map(|i| i as u8).collect();
     a.send_local(mac(2), &payload).await.unwrap();
 
@@ -132,6 +134,6 @@ async fn rylr_fragmented_payload_end_to_end() {
 
     assert!(
         b.local_deliveries().contains(&expected),
-        "node B must receive the exact 300-byte payload reassembled from 3 fragments"
+        "node B must receive the exact 300-byte payload reassembled from 2 fragments"
     );
 }

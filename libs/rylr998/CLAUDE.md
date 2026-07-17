@@ -20,16 +20,22 @@ ACK/retry/CCA feedback in the shared trait.
 
 ## Fragmentation (`frag.rs`)
 
-The module's AT interface caps an on-air frame at `MAX_FRAME_LEN` (120 bytes:
-240 hex chars, since payload is hex-encoded). Real mesh frames — especially
-authenticated OGMs — routinely exceed that, so `link.rs`'s `send`/`recv` split
-and reassemble transparently; nothing above `LinkT` (the router, the engine)
-ever observes that a frame was fragmented.
+The module's AT interface caps an on-air frame at `MAX_FRAME_LEN` (180 bytes:
+240 base64 chars, since payload is base64-encoded — a URL-safe alphabet,
+`=`-padded, chosen so no comma/CR/LF can appear in the AT data field, same
+constraint hex satisfied before it, but at a 4:3 rather than 2:1 expansion).
+Real mesh frames — especially authenticated OGMs — routinely exceed that, so
+`link.rs`'s `send`/`recv` split and reassemble transparently; nothing above
+`LinkT` (the router, the engine) ever observes that a frame was fragmented.
 
 **Wire format.** Each fragment is a 2-byte header prefixed to a slice of the
-`[dst][src][protocol][payload]` bytes, before hex-encoding:
+`[dst][src][protocol][payload]` bytes, before base64-encoding (header and
+slice are concatenated *before* encoding, in one `push_base64` call — base64
+packs bits in 3-byte groups, so encoding them separately would each pad to
+its own group boundary and produce bytes a single `decode_base64` call
+couldn't reverse):
 `[msg_id: u8][index<<4 | count: u8]`. `count` is 1..=15 (a 4-bit field);
-non-final fragments always carry exactly `FRAG_PAYLOAD` (118) frame-content
+non-final fragments always carry exactly `FRAG_PAYLOAD` (178) frame-content
 bytes, so a fragment's offset is always `index * FRAG_PAYLOAD` — reassembly
 needs no per-fragment length bookkeeping, only the last fragment is short.
 `send` always fragments, even a 1-fragment message, so there is exactly one
@@ -63,7 +69,7 @@ Two related, unrelated-looking fixes shipped alongside this:
 
 - The AT-command line buffer (`LINE_BUF_LEN` in `lib.rs`) had to grow from 256
   to 300 bytes, since a maximal fragment's `+RCV=<addr>,<len>,<240-char
-  hex>,<rssi>,<snr>` line can reach ~264 characters — a pre-existing latent
+  base64>,<rssi>,<snr>` line can reach ~264 characters — a pre-existing latent
   limit that a maximal fragment now actually reaches.
 - `expect()` (in `lib.rs`) was silently discarding an unsolicited `+RCV` line
   that arrived while it was waiting on a command's response — a pre-existing

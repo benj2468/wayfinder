@@ -3,7 +3,7 @@
 //! everything above it never observes a frame was split.
 //!
 //! Each fragment is a 2-byte header prefixed to a slice of the frame's
-//! `[dst][src][protocol][payload]` bytes, before hex-encoding:
+//! `[dst][src][protocol][payload]` bytes, before base64-encoding:
 //!
 //! ```text
 //! byte 0: msg_id             (u8, wraps, one per `send()` call)
@@ -19,7 +19,7 @@ use tracing::{trace, warn};
 use wayfinder::interfaces::link::LinkMetrics;
 
 /// Bytes of fragment header prefixed to each on-air fragment's frame-content
-/// bytes, before hex-encoding.
+/// bytes, before base64-encoding.
 pub(crate) const FRAG_HDR_LEN: usize = 2;
 
 /// Frame-content bytes (the `[dst][src][protocol][payload]` blob) carried by
@@ -415,8 +415,8 @@ mod tests {
 
     /// The largest message the reassembler can actually complete: exactly
     /// `MAX_REASSEMBLED_LEN` bytes, split into the maximum number of
-    /// full-size fragments plus a short final one (5 fragments at
-    /// `FRAG_PAYLOAD` = 118 bytes here: 4 full + one 40-byte tail). Nothing
+    /// full-size fragments plus a short final one (3 fragments at
+    /// `FRAG_PAYLOAD` = 178 bytes here: 2 full + one 156-byte tail). Nothing
     /// with a higher declared `index` can ever complete regardless of `count`
     /// or body size, since a fragment's offset is always
     /// `index * FRAG_PAYLOAD` and `MAX_REASSEMBLED_LEN` bounds it — the wire

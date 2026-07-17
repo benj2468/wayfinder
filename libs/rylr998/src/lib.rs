@@ -178,7 +178,7 @@ const RX_QUEUE_DEPTH: usize = 8;
 /// maximum `<Data>` field, plus the largest `<Address>`/`<RSSI>`/`<SNR>`
 /// fields the AT protocol allows (`+RCV=65535,240,<240 chars>,-130,-20` is
 /// ~264 chars) — comfortably covers a maximal on-air fragment once the
-/// `link` feature is hex-encoding one into a `+RCV` line.
+/// `link` feature is base64-encoding one into a `+RCV` line.
 const LINE_BUF_LEN: usize = 300;
 
 /// The core RYLR998/RYLR498 Client driver structure.
