@@ -1,8 +1,8 @@
 # Design: Lazy certificate distribution (fingerprint + on-demand fetch)
 
-**Status:** Proposed — approved for implementation in a later session. This
-document is self-contained: it carries all the context and decisions from the
-design discussion so the implementing session needs nothing else.
+**Status:** Implemented. This document is retained as a historical record of
+the design; it is self-contained and carried all the context and decisions the
+implementing session needed.
 
 **Scope:** OGM authentication only (`libs/wayfinder/src/auth.rs`,
 `libs/wayfinder-auth`), plus two new routed control packets in the `batman`

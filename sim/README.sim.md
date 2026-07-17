@@ -33,7 +33,7 @@ shares a segment with; everything else is reached by BATMAN forwarding.
 
 ## Editing the topology
 
-The topology is **generated** by [`sim/topology.py`](../sim/topology.py) — the
+The topology is **generated** by [`sim/topology.py`](./topology.py) — the
 sim image derives each node's config from the NICs docker attaches, so the
 compose wiring *is* the topology. Edit `build_links()` (or the helpers
 `diamond`, `complete_graph`, `path`, `shared_lan`) and re-run; nothing else

@@ -81,7 +81,7 @@ outsiders and foreign nodes can't inject topology.
 | --- | --- |
 | `libs/interfaces` | Shared abstractions: `Mac` node address, `LinkFrame`, `MeshRoutingEngine`, `RoutingAction`, `LinkMetrics` |
 | `libs/batman` | BATMAN-adv engine — originator table, OGM topology discovery, unicast/broadcast/multicast forwarding, Trickle-paced (RFC 6206) OGM emission |
-| `libs/wayfinder` | `CentralRouter` orchestration — the `LinkT` interface trait, protocol demux, multicast egress planning, throughput/occupancy metrics, and opt-in OGM authentication |
+| `libs/wayfinder` | `CentralRouter` orchestration — the `LinkT` interface trait, protocol demux, per-link `LinkFeatures` tx/rx participation gating, multicast egress planning, throughput/occupancy metrics, and opt-in OGM authentication |
 
 ### Radio drivers (`no_std`)
 | Crate | What it does |
@@ -102,12 +102,35 @@ outsiders and foreign nodes can't inject topology.
 ### Host driver, tooling & tests
 | Crate | What it does |
 | --- | --- |
-| `libs/wayfinder-driver` | The `std`/tokio event loop — transport-agnostic `FrameIo` carriers, plus IPv4 IGMP multicast snooping |
+| `libs/wayfinder-driver-core` | `no_std`, allocation-free frame/OGM planning logic shared by `wayfinder-driver` and `wayfinder-embedded-driver` |
+| `libs/wayfinder-driver` | The `std`/tokio event loop over the shared driver-core — transport-agnostic `FrameIo` carriers, concrete TCP/UDP/serial link builders, IPv4 IGMP multicast snooping |
 | `libs/wayfinder-test` | `Switch` simulator + `TestRouter` for multi-node integration tests (no hardware) |
+| `libs/rylr998-sim` | In-process AT-command LoRa simulator (`RylrSimulator`/`LoraSwitch`) backing `rylr998`'s hardware-free integration tests |
 | `libs/wayfinder-shark` | Wireshark/`tshark` Lua dissector for on-air BATMAN frames, with pytest tests |
 | `bins/wayfinder-tap` | The runnable node — bridges a kernel TAP onto the mesh over UDP and serves the management API |
 | `bins/wayfinder-tui` | `ratatui` terminal dashboard: routing, link quality, OGM schedule, throughput, and security tabs |
 | `bins/wayfinder-ctl` | `wayfinderctl` CLI — query a live node or mint/enroll node certificates offline |
+| `bins/rylr998-cli` | CLI to drive/debug a physical RYLR998/RYLR498 module directly over its AT-command serial interface |
+
+### Bare-metal embedded targets
+
+The same routing core also runs with no host OS at all — no TAP, no
+management API, no tokio — as a pure radio relay on a microcontroller.
+
+| Crate | What it does |
+| --- | --- |
+| `libs/wayfinder-embedded-driver` | `no_std`, HAL- and executor-agnostic event loop running the router on bare metal — a board supplies `LinkT` links and a `Clock` |
+| `libs/wayfinder-embedded-log` | A `tracing` subscriber that renders board logs to RTT over the debug probe, since the boards' one UART is taken by the LoRa radio |
+| `bins/wayfinder-nrf52840` | Firmware for the Nordic nRF52840, using its built-in 802.15.4 radio or an attached RYLR998 as the mesh `LinkT` |
+| `bins/wayfinder-stm32f411` | Firmware for a non-Nordic Cortex-M (ST), proving the identical embedded driver loop is board-agnostic |
+
+Each board binary is its **own** Cargo workspace (`bins/wayfinder-nrf52840/`,
+`bins/wayfinder-stm32f411/`) — bare-metal panic handlers and linker scripts
+can't share a resolver with the host workspace, so they build independently:
+
+```bash
+cd bins/wayfinder-nrf52840 && cargo build --release   # target thumbv7em-none-eabihf
+```
 
 ---
 
@@ -130,6 +153,9 @@ cargo run -p wayfinder-tui -- <node-addr>
 cargo run -p wayfinder-ctl -- routes
 ```
 
+Want to see a multi-node mesh converge without any hardware? Spin up the
+docker-compose simulation — see [`sim/README.sim.md`](./sim/README.sim.md).
+
 ---
 
 ## Development
@@ -149,5 +175,16 @@ Contributions ship through GitLab merge requests with
 [Conventional Commits](https://www.conventionalcommits.org/) titles
 (`type(scope): summary`). See [`CLAUDE.md`](./CLAUDE.md) for the full
 architecture, conventions, and contributor guide.
+
+## Further reading
+
+- [`CLAUDE.md`](./CLAUDE.md) — full architecture map, always-on conventions
+  (logging, metrics, docs, TDD), and per-crate deep-dive pointers.
+- [`sim/README.sim.md`](./sim/README.sim.md) — a docker-compose mesh
+  simulation for watching BATMAN routing converge and testing failover, with
+  no hardware.
+- [`docs/design/README.md`](./docs/design/README.md) — how to write a design
+  doc for a non-trivial feature, and the `docs/design/` → `docs/design/implemented/`
+  lifecycle those docs follow.
 
 [`tracing`]: https://docs.rs/tracing
