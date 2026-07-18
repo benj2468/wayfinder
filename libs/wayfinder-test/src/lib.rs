@@ -25,6 +25,9 @@ pub mod prelude {
 mod integration_tests;
 
 #[cfg(test)]
+mod link_error_tests;
+
+#[cfg(test)]
 mod rylr998_integration_tests;
 
 /// Which side of a switch connection a frame is travelling on, used to key the

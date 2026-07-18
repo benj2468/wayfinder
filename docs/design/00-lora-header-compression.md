@@ -1,8 +1,10 @@
 # Design: LoRa link-layer header compression (rylr998)
 
-**Status:** Proposed — *enhancement, not a threshold requirement.* The current
-`LinkT for RylrClient` impl (full 14-byte header, hex-encoded) is correct and
-ships as-is; this document sketches an opt-in optimization for later.
+**Status:** Superseded by design 02 (`02-lora-header-compression-v2.md`), see
+there. This doc was written against the hex-encoded, unfragmented link; the
+base64 wire encoding and the fragmentation layer that have since shipped
+invalidate its savings analysis and its layering, and v2 reworks both. Kept
+for the record; do not implement from this version.
 
 **Scope:** the `rylr998` `LinkT` link only. No changes to BATMAN, to the
 `LinkT`/`Received` trait surface, or to `CentralRouter`. The compression lives

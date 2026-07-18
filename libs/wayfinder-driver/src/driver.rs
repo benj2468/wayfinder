@@ -14,7 +14,6 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::bail;
 use futures::{FutureExt, future::select_all};
 use interfaces::link::LinkMetrics;
 use tokio::time::sleep;
@@ -283,13 +282,25 @@ impl<Local: FrameIo> Driver<Local> {
 
         let output: LoopOutput = {
             tokio::select! {
-                (Some((idx, received)), _, _) = select_all(
+                ((idx, result), _, _) = select_all(
                     interfaces.iter_mut().enumerate().map(|(i, iface)| {
-                        Box::pin(async move { iface.recv().await.map(|received| (i, received)).ok() })
+                        Box::pin(async move { (i, iface.recv().await) })
                     })
                 ), if check_mesh && !interfaces.is_empty() => {
-                    trace!(iface = idx, "rx frame from interface");
-                    handle_mesh_frame(now, router, idx, received.frame, received.metrics, tx_buffer)
+                    match result {
+                        Ok(received) => {
+                            trace!(iface = idx, "rx frame from interface");
+                            handle_mesh_frame(now, router, idx, received.frame, received.metrics, tx_buffer)
+                        }
+                        // A link recv error is transient by contract (a
+                        // reconnecting transport surfaces `Io` until a later
+                        // call succeeds), so it costs this iteration nothing
+                        // but the log line — never the process.
+                        Err(e) => {
+                            warn!(iface = idx, error = ?e, "link recv failed");
+                            LoopOutput::none()
+                        }
+                    }
                 },
                 Ok(len) = local.recv(rx_buffer), if check_local => {
                     trace!(len, "host device rx frame");
@@ -397,7 +408,12 @@ impl<Local: FrameIo> Driver<Local> {
             for idx in 0..self.interfaces.len() {
                 let output = match self.interfaces[idx].recv().now_or_never() {
                     None => continue,
-                    Some(Err(e)) => bail!("link recv failed: {e:?}"),
+                    // Same posture as `run_once`: a link recv error is
+                    // logged and skipped, not propagated.
+                    Some(Err(e)) => {
+                        warn!(iface = idx, error = ?e, "link recv failed");
+                        continue;
+                    }
                     Some(Ok(received)) => {
                         progressed = true;
                         handle_mesh_frame(
@@ -619,8 +635,7 @@ async fn dispatch<Local: FrameIo>(
             // adaptive schedule.
             Egress::Iface(iface_idx) => {
                 if let Some(iface) = interfaces.get_mut(iface_idx) {
-                    let sent = iface.send(mac, &data).await?;
-                    router.record_tx(iface_idx, sent, now);
+                    send_on_link(iface, iface_idx, router, mac, &data, now).await;
                 }
             }
             // Otherwise let the router's metric-driven egress choice decide.
@@ -639,8 +654,7 @@ async fn dispatch<Local: FrameIo>(
                             trace!(iface_idx = idx, "drop: tx gate disabled on this link");
                             continue;
                         }
-                        let sent = iface.send(mac, &data).await?;
-                        router.record_tx(idx, sent, now);
+                        send_on_link(iface, idx, router, mac, &data, now).await;
                     }
                 }
                 Some(EgressInterface::Interface(iface_idx)) => {
@@ -648,8 +662,7 @@ async fn dispatch<Local: FrameIo>(
                     // a `tx_data`-off link is dropped rather than forwarded.
                     if router.link_may_tx(iface_idx, pkt_type) {
                         if let Some(iface) = interfaces.get_mut(iface_idx) {
-                            let sent = iface.send(mac, &data).await?;
-                            router.record_tx(iface_idx, sent, now);
+                            send_on_link(iface, iface_idx, router, mac, &data, now).await;
                         }
                     } else {
                         trace!(iface_idx, "drop: tx gate disabled on egress link");
@@ -661,4 +674,25 @@ async fn dispatch<Local: FrameIo>(
     }
 
     Ok(())
+}
+
+/// Transmit one frame on `iface`, recording the sent bytes on success.
+///
+/// A link send error drops this frame and logs a `warn!` — it never
+/// propagates out of the event loop. Link errors are transient by contract
+/// (a reconnecting transport returns `Io` until a later call succeeds), so
+/// crashing here would kill the node before the link's own recovery ever ran;
+/// the mesh's own redundancy (OGM cadence, retransmits) covers the lost frame.
+async fn send_on_link(
+    iface: &mut DynLinkT<'static>,
+    iface_idx: usize,
+    router: &mut CentralRouter,
+    mac: Mac,
+    data: &LinkFrameData<'_>,
+    now: Duration,
+) {
+    match iface.send(mac, data).await {
+        Ok(sent) => router.record_tx(iface_idx, sent, now),
+        Err(e) => warn!(iface_idx, error = ?e, "link send failed; frame dropped"),
+    }
 }
