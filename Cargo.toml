@@ -12,6 +12,7 @@ members = [
     "libs/wayfinder",
     "libs/wayfinder-protos",
     "libs/wayfinder-server",
+    "libs/wayfinder-storage",
     "libs/wayfinder-driver-core",
     "libs/wayfinder-driver",
     "libs/wayfinder-embedded-driver",
@@ -48,6 +49,7 @@ wayfinder-auth = { path = "./libs/wayfinder-auth", default-features = false }
 wayfinder = { path = "./libs/wayfinder" }
 wayfinder-protos = { path = "./libs/wayfinder-protos" }
 wayfinder-server = { path = "./libs/wayfinder-server" }
+wayfinder-storage = { path = "./libs/wayfinder-storage", default-features = false }
 wayfinder-driver-core = { path = "./libs/wayfinder-driver-core" }
 wayfinder-driver = { path = "./libs/wayfinder-driver" }
 wayfinder-embedded-driver = { path = "./libs/wayfinder-embedded-driver" }

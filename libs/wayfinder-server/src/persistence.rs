@@ -6,20 +6,37 @@
 //! format (which is free to evolve on its own schedule): a JSON snapshot with
 //! an explicit [`CURRENT_STATE_VERSION`], so a future format change ships with
 //! an encoded migration rather than silently reinterpreting old bytes.
+//!
+//! [`CaLog`] itself is a thin, CA-specific skin over
+//! [`wayfinder_storage::Persisted`]: the "mutate, then persist, then roll
+//! back in memory if the persist failed" orchestration lives entirely in
+//! that generic type now — this module only supplies *what's inside the
+//! blob* ([`CaLogState`]) and *how it's encoded* ([`CaStateCodec`]).
 
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use wayfinder_protos::service::IssuedCertData;
 
 use serde::{Deserialize, Serialize};
+use wayfinder_storage::{Codec, FileStore, LoadError, PersistError, PersistOutcome, Persisted};
 
 use crate::authority::HeldCsr;
 
+/// Largest encoded CA-state snapshot [`CaLog::load`] will read. `FileStore`
+/// (per `DurableStore::load`'s contract) needs a caller-supplied buffer
+/// rather than allocating to fit the file, so `CaLog::load` allocates (and
+/// zero-fills) a buffer this size up front, once, per load — 1 MiB is
+/// generous (tens-to-hundreds of times) over the "tens of KB" this snapshot
+/// is expected to occupy in practice, without being large enough for the
+/// startup allocation itself to be worth worrying about; a snapshot that
+/// somehow exceeds it fails closed (via `DurableStore`'s own oversized-blob
+/// error) rather than silently truncating.
+const MAX_STATE_BYTES: usize = 1024 * 1024;
+
 /// Current on-disk schema version. Bump this — and add an ordered migration
-/// from the prior version into [`load`] — whenever [`CaState`]'s shape
+/// from the prior version into [`parse_state`] — whenever [`CaState`]'s shape
 /// changes.
 const CURRENT_STATE_VERSION: u32 = 2;
 
@@ -47,7 +64,8 @@ impl IssuedRecord {
     /// keeps for `ListCerts`. `None` if the byte-slice fields are the wrong
     /// length, which the authority never produces itself — callers must not
     /// let that `None` vanish silently (see the call site in
-    /// [`CaLog::persist`]), since a dropped record can carry a revocation.
+    /// [`CaStateCodec::encode`]), since a dropped record can carry a
+    /// revocation.
     fn from_proto(c: &IssuedCertData) -> Option<Self> {
         Some(Self {
             node_mac: c.node_mac.as_slice().try_into().ok()?,
@@ -94,8 +112,8 @@ struct CaState {
 
 /// Version 1 of the on-disk schema: the issued-certificate log only, with no
 /// held-CSR section at all (not even an empty one) — held-CSR persistence was
-/// introduced in version 2. Kept so [`load`] can migrate a snapshot written
-/// under the older schema.
+/// introduced in version 2. Kept so [`parse_state`] can migrate a snapshot
+/// written under the older schema.
 #[derive(Deserialize)]
 struct CaStateV1 {
     issued: Vec<IssuedRecord>,
@@ -113,202 +131,96 @@ fn migrate_v1_to_v2(v1: CaStateV1) -> CaState {
 }
 
 /// Just enough of the snapshot to read `version` before committing to a full
-/// parse, so [`load`] can dispatch to the right schema/migration.
+/// parse, so [`parse_state`] can dispatch to the right schema/migration.
 #[derive(Deserialize)]
 struct VersionProbe {
     version: u32,
 }
 
-/// Load the CA state snapshot at `path`.
+/// Decode a CA state snapshot's raw bytes (as read from a [`FileStore`] via
+/// [`CaStateCodec::decode`]), dispatching to the right schema/migration by
+/// probing `version` first. `path`, when known, is used only to name the
+/// offending file in error messages — `None` when this snapshot isn't backed
+/// by a real file (in-memory-only `CaLog`s never reach this function, since
+/// their `Persisted` store starts empty rather than loading anything).
 ///
-/// Returns `Ok(None)` when no file exists at `path` — a fresh install starts
-/// with an empty authority, which is not a failure. Any other outcome that
-/// isn't a clean, known-version snapshot (after migration) — corrupt JSON, a
-/// foreign shape, a newer-than-known version, or an I/O error — is `Err`: the
-/// caller must fail closed rather than silently starting empty, since that
-/// would silently un-revoke every previously-revoked node and forget every
-/// pending approval.
-fn load(path: &Path) -> Result<Option<CaState>, String> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(format!(
-                "failed to read CA state file {}: {e}",
-                path.display()
-            ));
-        }
+/// Any outcome that isn't a clean, known-version snapshot (after migration)
+/// — corrupt JSON, a foreign shape, or a newer-than-known version — is
+/// `Err`: the caller must fail closed rather than silently starting empty,
+/// since that would silently un-revoke every previously-revoked node and
+/// forget every pending approval.
+fn parse_state(bytes: &[u8], path: Option<&Path>) -> Result<CaState, String> {
+    let name = || match path {
+        Some(p) => format!("CA state file {}", p.display()),
+        None => "CA state snapshot".to_string(),
     };
     let corrupt = |e: serde_json::Error| {
         format!(
-            "CA state file {} is corrupt or not a recognized CA state snapshot: {e}",
-            path.display()
+            "{} is corrupt or not a recognized CA state snapshot: {e}",
+            name()
         )
     };
-    let probe: VersionProbe = serde_json::from_slice(&bytes).map_err(corrupt)?;
-    let state = match probe.version {
+    let probe: VersionProbe = serde_json::from_slice(bytes).map_err(corrupt)?;
+    match probe.version {
         1 => {
-            let v1: CaStateV1 = serde_json::from_slice(&bytes).map_err(corrupt)?;
-            migrate_v1_to_v2(v1)
+            let v1: CaStateV1 = serde_json::from_slice(bytes).map_err(corrupt)?;
+            Ok(migrate_v1_to_v2(v1))
         }
-        CURRENT_STATE_VERSION => serde_json::from_slice(&bytes).map_err(corrupt)?,
-        v if v > CURRENT_STATE_VERSION => {
-            return Err(format!(
-                "CA state file {} has version {v} but this build only understands up to \
-                 version {CURRENT_STATE_VERSION}; refusing to load a newer-than-known snapshot \
-                 (upgrade the node before restarting it against this state file)",
-                path.display()
-            ));
-        }
-        v => {
-            return Err(format!(
-                "CA state file {} has version {v}, and this build has no migration path from \
-                 it to version {CURRENT_STATE_VERSION}",
-                path.display()
-            ));
-        }
-    };
-    Ok(Some(state))
-}
-
-/// Atomically write `state` to `path`: serialize to a `.tmp` sibling file in
-/// the same directory, `fsync` it, then rename over `path`. The rename is
-/// atomic on the same filesystem, so a crash mid-write can only ever leave the
-/// previous snapshot (or nothing) at `path` — never a half-written one. On any
-/// failure the `.tmp` sibling is best-effort removed so repeated failures
-/// don't leave stale partial files next to the real snapshot.
-///
-/// Deliberately not `fsync`ed: the parent directory's own metadata (that the
-/// rename landed) isn't flushed, so a *power loss* (as opposed to a process
-/// crash) immediately after a rename could in principle still lose the
-/// rename on some filesystems. Accepted for now as a lower-severity gap than
-/// the mid-write tear this function does defend against; revisit if this
-/// authority is ever deployed somewhere power loss (not just process crash)
-/// is a real threat model.
-fn save_atomic(path: &Path, state: &CaState) -> std::io::Result<()> {
-    let mut tmp_path = path.as_os_str().to_os_string();
-    tmp_path.push(".tmp");
-    let tmp_path = PathBuf::from(tmp_path);
-
-    let result = (|| {
-        let json = serde_json::to_vec_pretty(state)
-            .map_err(|e| std::io::Error::other(format!("failed to serialize CA state: {e}")))?;
-        let mut tmp = std::fs::File::create(&tmp_path)?;
-        tmp.write_all(&json)?;
-        tmp.sync_all()?;
-        std::fs::rename(&tmp_path, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp_path);
+        CURRENT_STATE_VERSION => serde_json::from_slice(bytes).map_err(corrupt),
+        v if v > CURRENT_STATE_VERSION => Err(format!(
+            "{} has version {v} but this build only understands up to version \
+             {CURRENT_STATE_VERSION}; refusing to load a newer-than-known snapshot (upgrade the \
+             node before restarting it against this state file)",
+            name()
+        )),
+        v => Err(format!(
+            "{} has version {v}, and this build has no migration path from it to version \
+             {CURRENT_STATE_VERSION}",
+            name()
+        )),
     }
-    result
 }
 
-/// The authority's durable state: the issued-certificate log and the
-/// held-CSR store, both backed by one snapshot file.
-///
-/// Storage is sealed behind [`Self::mutate_issued`]/[`Self::mutate_held`] so a
-/// mutation can never be committed without an attempted persist: the
-/// `issued`, `held`, and `state_path` fields are private to this module, so
-/// `authority.rs` has no way to reach either `Vec` except through the
-/// read-only [`Self::issued`]/[`Self::held`] views or the `mutate_*` methods.
-/// This is what makes "every mutation is followed by a
-/// persist attempt" a property of the type rather than a convention call
-/// sites must remember. Note this is a per-call, not a per-operation,
-/// guarantee: an operator action that touches both collections (e.g.
-/// `approve_csr`, which issues a certificate and then updates the held
-/// entry) performs two separate `mutate_*` calls and so two separate
-/// persists, not one atomic combined write.
-pub(crate) struct CaLog {
+/// The in-memory value a [`CaLog`] wraps in [`Persisted`]: everything
+/// `authority.rs` can mutate. Cheap to `Clone` at the scale this is meant for
+/// (see [`Persisted::mutate`]'s own doc on why that bound exists) — needed so
+/// a failed persist can roll the in-memory value back to its pre-mutation
+/// snapshot.
+#[derive(Clone)]
+struct CaLogState {
     issued: Vec<IssuedCertData>,
     held: Vec<HeldCsr>,
-    state_path: Option<PathBuf>,
 }
 
-impl CaLog {
-    /// An empty, in-memory-only log (no snapshot file). Used by
-    /// [`CertAuthority::new`](crate::CertAuthority::new), which has no
-    /// `ProviderConfig` to read a `state_path` from.
-    pub(crate) fn empty() -> Self {
+impl CaLogState {
+    /// The state a fresh CA (no snapshot loaded yet) starts from.
+    fn empty() -> Self {
         Self {
             issued: Vec::new(),
             held: Vec::new(),
-            state_path: None,
         }
     }
+}
 
-    /// Build a log for `state_path`. When `Some`, the existing snapshot (if
-    /// any) is loaded now — migrating an older schema version if needed; a
-    /// corrupt, foreign, or newer-than-known snapshot is `Err` (fail closed —
-    /// see [`load`]). `None` behaves like [`Self::empty`].
-    pub(crate) fn load(state_path: Option<PathBuf>) -> Result<Self, String> {
-        let state = match &state_path {
-            Some(path) => load(path)?,
-            None => None,
-        };
-        let (issued, held) = match state {
-            Some(state) => (
-                state.issued.iter().map(IssuedRecord::to_proto).collect(),
-                state.held,
-            ),
-            None => (Vec::new(), Vec::new()),
-        };
-        Ok(Self {
-            issued,
-            held,
-            state_path,
-        })
-    }
+/// Translates [`CaLogState`] to/from the CA's on-disk JSON snapshot
+/// ([`CaState`]) — the only caller-specific piece [`Persisted`] needs;
+/// everything about *when* to encode/decode and *what to do with the bytes*
+/// is [`Persisted`]'s own concern, not this type's.
+struct CaStateCodec {
+    /// The state file this codec's blobs are read from/written to, kept only
+    /// to name the offending file in error messages — `None` for an
+    /// in-memory-only `CaLog`, where `decode` is never reached and `encode`'s
+    /// own errors never named a path anyway.
+    path: Option<PathBuf>,
+}
 
-    /// Read-only view of the issued-certificate log.
-    pub(crate) fn issued(&self) -> &[IssuedCertData] {
-        &self.issued
-    }
+impl Codec<CaLogState> for CaStateCodec {
+    type Error = String;
+    type Encoded = Vec<u8>;
 
-    /// Read-only view of the held-CSR store.
-    pub(crate) fn held(&self) -> &[HeldCsr] {
-        &self.held
-    }
-
-    /// Run `f` against the issued-certificate log, then attempt to persist
-    /// the full state (issued + held) to `state_path` (if set), returning
-    /// both `f`'s result and the persist outcome so the caller can decide how
-    /// to react to a durability failure (see [`Self::mutate_held`] for the
-    /// shared persist behavior).
-    pub(crate) fn mutate_issued<R>(
-        &mut self,
-        f: impl FnOnce(&mut Vec<IssuedCertData>) -> R,
-    ) -> (R, Result<(), String>) {
-        let result = f(&mut self.issued);
-        let persisted = self.persist();
-        (result, persisted)
-    }
-
-    /// Run `f` against the held-CSR store, then attempt to persist the full
-    /// state (issued + held) to `state_path` (if set) — the only way
-    /// `authority.rs` can mutate either collection, so a persist attempt can
-    /// never be forgotten. Returns `f`'s result alongside the persist
-    /// outcome: a failed persist does not undo `f`'s in-memory effect (the
-    /// authority stays serviceable even if the disk is temporarily
-    /// unwritable), but the caller is expected to propagate the failure to
-    /// whoever asked for the mutation, since "durable" is exactly what a
-    /// caller of a CA-mutating RPC has a right to assume `Ok` means.
-    pub(crate) fn mutate_held<R>(
-        &mut self,
-        f: impl FnOnce(&mut Vec<HeldCsr>) -> R,
-    ) -> (R, Result<(), String>) {
-        let result = f(&mut self.held);
-        let persisted = self.persist();
-        (result, persisted)
-    }
-
-    fn persist(&self) -> Result<(), String> {
-        let Some(path) = &self.state_path else {
-            return Ok(());
-        };
-        let mut issued = Vec::with_capacity(self.issued.len());
-        for c in &self.issued {
+    fn encode(&self, value: &CaLogState) -> Result<Vec<u8>, String> {
+        let mut issued = Vec::with_capacity(value.issued.len());
+        for c in &value.issued {
             match IssuedRecord::from_proto(c) {
                 Some(record) => issued.push(record),
                 None => tracing::warn!(
@@ -322,20 +234,354 @@ impl CaLog {
         let state = CaState {
             version: CURRENT_STATE_VERSION,
             issued,
-            held: self.held.clone(),
+            held: value.held.clone(),
         };
-        save_atomic(path, &state).map_err(|e| {
+        serde_json::to_vec_pretty(&state).map_err(|e| format!("failed to serialize CA state: {e}"))
+    }
+
+    fn decode(&self, bytes: &[u8]) -> Result<CaLogState, String> {
+        let state = parse_state(bytes, self.path.as_deref())?;
+        Ok(CaLogState {
+            issued: state.issued.iter().map(IssuedRecord::to_proto).collect(),
+            held: state.held,
+        })
+    }
+}
+
+/// The authority's durable state: the issued-certificate log and the
+/// held-CSR store, both backed by one snapshot file — a thin skin over
+/// [`Persisted`], which owns the actual "mutate, persist, roll back on
+/// failure" mechanics (see [`Self::mutate_issued`]/[`Self::mutate_held`]/
+/// [`Self::mutate_issued_and_held`]).
+///
+/// `persisted`'s fields are private to [`Persisted`] itself, so
+/// `authority.rs` has no way to reach either `Vec` except through the
+/// read-only [`Self::issued`]/[`Self::held`] views or the `mutate_*` methods
+/// — this is what makes "every mutation is followed by a persist attempt" a
+/// property of the type rather than a convention call sites must remember.
+/// This is a per-*call* guarantee: an operator action that only needs to
+/// touch one collection performs one `mutate_*` call and one persist, but an
+/// action that must keep both collections in lockstep (`approve_csr`, which
+/// records a newly-issued certificate and flips the held entry to
+/// `Approved`) uses [`Self::mutate_issued_and_held`] so that one persist
+/// covers the whole action rather than durably splitting across two — see
+/// that method's own doc for the impersonation-guard gap a split write would
+/// otherwise open.
+pub(crate) struct CaLog {
+    persisted: Persisted<CaLogState, Option<FileStore>, CaStateCodec>,
+    /// Mirrors the path (if any) inside `persisted`'s own `FileStore` (and
+    /// inside `persisted`'s `CaStateCodec`, which keeps its own copy for its
+    /// decode-error messages) — three copies of one fact, purely so each
+    /// layer can name the offending file in its own error/log messages
+    /// without a way to read it back out of `Persisted`, whose `store` and
+    /// `codec` fields are both private. Safe only because none of the three
+    /// copies is ever mutated after `Self::load`/`Self::empty` builds them
+    /// all from the same `state_path` value — a future change that lets one
+    /// of them change independently (e.g. rebinding the store) would need
+    /// to keep all three in sync by hand. Used by [`Self::mutate_issued`]/
+    /// [`Self::mutate_held`]/[`Self::mutate_issued_and_held`] (via
+    /// [`Self::report_persist_outcome`]) to name the offending file when a
+    /// persist's underlying I/O fails — `DurableStore::Error` (a bare
+    /// `io::Error` for `FileStore`) carries no path of its own.
+    state_path: Option<PathBuf>,
+}
+
+impl CaLog {
+    /// An empty, in-memory-only log (no snapshot file). Used by
+    /// [`CertAuthority::new`](crate::CertAuthority::new), which has no
+    /// `ProviderConfig` to read a `state_path` from.
+    pub(crate) fn empty() -> Self {
+        Self {
+            persisted: Persisted::new(CaLogState::empty(), None, CaStateCodec { path: None }),
+            state_path: None,
+        }
+    }
+
+    /// Build a log for `state_path`. When `Some`, the existing snapshot (if
+    /// any) is loaded now via a [`FileStore`] — migrating an older schema
+    /// version if needed; a corrupt, foreign, or newer-than-known snapshot is
+    /// `Err` (fail closed — see [`parse_state`]). `None` behaves like
+    /// [`Self::empty`].
+    pub(crate) fn load(state_path: Option<PathBuf>) -> Result<Self, String> {
+        let codec = CaStateCodec {
+            path: state_path.clone(),
+        };
+        let persisted = match &state_path {
+            Some(path) => {
+                let mut buf = vec![0u8; MAX_STATE_BYTES];
+                Persisted::load(
+                    Some(FileStore::new(path)),
+                    codec,
+                    CaLogState::empty(),
+                    &mut buf,
+                )
+                .map_err(|e| match e {
+                    LoadError::Store(io_err) => {
+                        format!("failed to read CA state file {}: {io_err}", path.display())
+                    }
+                    LoadError::Decode(msg) => msg,
+                })?
+            }
+            None => Persisted::new(CaLogState::empty(), None, codec),
+        };
+        Ok(Self {
+            persisted,
+            state_path,
+        })
+    }
+
+    /// Read-only view of the issued-certificate log.
+    pub(crate) fn issued(&self) -> &[IssuedCertData] {
+        &self.persisted.get().issued
+    }
+
+    /// Read-only view of the held-CSR store.
+    pub(crate) fn held(&self) -> &[HeldCsr] {
+        &self.persisted.get().held
+    }
+
+    /// Run `f` against the issued-certificate log, then attempt to persist
+    /// the full state (issued + held) to `state_path` (if set), returning
+    /// both `f`'s result and the persist outcome so the caller can decide how
+    /// to react to a durability failure (see [`Self::mutate_held`] for the
+    /// shared persist behavior).
+    pub(crate) fn mutate_issued<R>(
+        &mut self,
+        f: impl FnOnce(&mut Vec<IssuedCertData>) -> R,
+    ) -> (R, Result<(), String>) {
+        let (result, persisted) = self.persisted.mutate(|state| f(&mut state.issued));
+        (result, self.report_persist_outcome(persisted))
+    }
+
+    /// Run `f` against the held-CSR store, then attempt to persist the full
+    /// state (issued + held) to `state_path` (if set) — the only way
+    /// `authority.rs` can mutate either collection, so a persist attempt can
+    /// never be forgotten. Returns `f`'s result alongside the persist
+    /// outcome: a failed persist **rolls the entire state (both `issued` and
+    /// `held`) back** to what it was before `f` ran, via
+    /// [`Persisted::mutate`]'s own rollback guarantee, so the in-memory log
+    /// never diverges from what's durably stored. `f`'s own return value is
+    /// still handed back regardless — it's the caller's business, not tied
+    /// to whether the mutation stuck — but the caller must treat a
+    /// persist-failure `Err` as "this did not take effect", not just "this
+    /// isn't durable yet", and is expected to propagate it to whoever asked
+    /// for the mutation, since "durable" is exactly what a caller of a
+    /// CA-mutating RPC has a right to assume `Ok` means.
+    pub(crate) fn mutate_held<R>(
+        &mut self,
+        f: impl FnOnce(&mut Vec<HeldCsr>) -> R,
+    ) -> (R, Result<(), String>) {
+        let (result, persisted) = self.persisted.mutate(|state| f(&mut state.held));
+        (result, self.report_persist_outcome(persisted))
+    }
+
+    /// Run `f` against *both* the issued-certificate log and the held-CSR
+    /// store, then attempt to persist the combined result as a single write
+    /// — for the one caller (`CertAuthority::approve_csr`) that must record a
+    /// newly-issued certificate and flip its held entry to `Approved` as one
+    /// durable unit, not two independent `mutate_issued`/`mutate_held` calls.
+    ///
+    /// That distinction matters because of [`Self::mutate_held`]'s own
+    /// rollback guarantee: two separate calls means two separate persists,
+    /// so if the *first* (recording the cert) durably succeeds but the
+    /// *second* (flipping the held entry to `Approved`) fails and rolls
+    /// back, the held entry reverts to `Pending` while the certificate stays
+    /// durably `issued` — an operator who sees "approve failed" and calls
+    /// `deny_csr` on the now-`Pending`-again entry gets a "successful"
+    /// denial that never touches `issued`, silently leaving an
+    /// already-issued, still-valid certificate un-revocable through the
+    /// normal held-CSR flow. Running both mutations inside one
+    /// [`Persisted::mutate`] call closes that gap: either both land
+    /// durably, or [`Persisted::mutate`]'s rollback undoes both together.
+    pub(crate) fn mutate_issued_and_held<R>(
+        &mut self,
+        f: impl FnOnce(&mut Vec<IssuedCertData>, &mut Vec<HeldCsr>) -> R,
+    ) -> (R, Result<(), String>) {
+        let (result, persisted) = self
+            .persisted
+            .mutate(|state| f(&mut state.issued, &mut state.held));
+        (result, self.report_persist_outcome(persisted))
+    }
+
+    /// Turn a [`Persisted::mutate`] outcome into the `Result<(), String>`
+    /// `authority.rs` expects, logging a `warn!` on the way through a
+    /// failure. `Persisted` itself never logs (it's a generic crate with no
+    /// notion of "CA state") — this is that logging's one call site, shared
+    /// by `mutate_issued`, `mutate_held`, and `mutate_issued_and_held` rather
+    /// than duplicated across all three.
+    fn report_persist_outcome(
+        &self,
+        persisted: PersistOutcome<std::io::Error, String>,
+    ) -> Result<(), String> {
+        persisted.map_err(|e| {
+            let path_display = self
+                .state_path
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            // Both arms get the same "failed to persist ... to <path>"
+            // framing and structured `path` field below, even though an
+            // `Encode` failure (unlike `Store`) never actually touched the
+            // filesystem — `CaStateCodec::encode` serializing this schema
+            // (fixed arrays, `String`, `bool`, `u64`) essentially can't
+            // fail, so keeping the two arms' shape consistent matters more
+            // here than distinguishing an outcome that shouldn't occur.
+            let msg = match e {
+                PersistError::Encode(encode_err) => {
+                    format!("failed to persist CA state to {path_display}: {encode_err}")
+                }
+                PersistError::Store(io_err) => {
+                    format!("failed to persist CA state to {path_display}: {io_err}")
+                }
+            };
             // A handled-and-retried I/O error (the caller keeps serving from
             // memory and the next successful mutation retries the write), so
             // `warn!` rather than `error!` — but still surfaced to the
             // caller as an `Err`, since the caller is best placed to decide
             // whether to retry, alert, or accept the risk.
             tracing::warn!(
-                path = %path.display(),
-                error = %e,
+                path = %path_display,
+                error = %msg,
                 "failed to persist CA state; issued-certificate/held-CSR durability is degraded until this is fixed"
             );
-            format!("failed to persist CA state to {}: {e}", path.display())
+            msg
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_dir(label: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "wayfinder-server-persistence-test-{}-{label}-{n}",
+            std::process::id()
+        ))
+    }
+
+    /// A minimal current-schema snapshot with one issued cert and one held
+    /// (`Pending`) CSR — written as raw JSON, not built via `IssuedCertData`/
+    /// `HeldCsr` field access, since those types' fields are private to
+    /// `authority.rs`, a sibling module this one has no access into (only
+    /// the type names are `pub(crate)`). This mirrors the raw-JSON seeding
+    /// `authority.rs`'s own `v1_state_file_migrates_to_v2_with_empty_held`
+    /// test already uses for the same reason.
+    fn seed_snapshot() -> serde_json::Value {
+        let key = [0u8; 32];
+        serde_json::json!({
+            "version": CURRENT_STATE_VERSION,
+            "issued": [{
+                "node_mac": [0, 0, 0, 0, 0, 1],
+                "ed_pubkey": key,
+                "not_before": 0,
+                "not_after": 1,
+                "revoked": false,
+            }],
+            "held": [{
+                "node_mac": [0, 0, 0, 0, 0, 2],
+                "ed_pubkey": key,
+                "x_pubkey": key,
+                "requested_at": 0,
+                "status": "Pending",
+            }],
+        })
+    }
+
+    /// `mutate_issued_and_held` is backed by a single [`Persisted::mutate`]
+    /// call, so a persist failure must roll back *both* collections
+    /// together — never leaving one mutation durably applied while the
+    /// other silently reverts. This is the actual mechanism
+    /// `CertAuthority::approve_csr` relies on (see this method's own doc for
+    /// the impersonation-guard gap a split write would otherwise open);
+    /// tested here directly against `CaLog`, with full control over the
+    /// failure timing, rather than through `approve_csr`'s black-box surface
+    /// — there's no way to force only the *second* of two separate
+    /// `mutate_*` calls to fail against a real filesystem without a
+    /// fault-injecting store, so this white-box level is what actually
+    /// proves the combined call is atomic.
+    #[test]
+    fn mutate_issued_and_held_rolls_back_both_collections_together_on_persist_failure() {
+        let dir = unique_dir("atomic-combined");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(&path, seed_snapshot().to_string()).unwrap();
+
+        let mut log = CaLog::load(Some(path)).unwrap();
+        assert_eq!(log.issued().len(), 1);
+        assert_eq!(log.held().len(), 1);
+        let existing_issued = log.issued()[0].clone();
+        let existing_held = log.held()[0].clone();
+
+        // Doom every subsequent write.
+        std::fs::remove_dir_all(&dir).ok();
+
+        let (_, persisted) = log.mutate_issued_and_held(|issued, held| {
+            issued.push(existing_issued);
+            held.push(existing_held);
+        });
+        assert!(
+            persisted.is_err(),
+            "the write should have failed: its directory is gone"
+        );
+
+        assert_eq!(
+            log.issued().len(),
+            1,
+            "the issued-side mutation must roll back when the combined persist fails"
+        );
+        assert_eq!(
+            log.held().len(),
+            1,
+            "the held-side mutation must roll back too — not just the issued side, which \
+             would reproduce the exact split-durability hazard this method exists to close"
+        );
+    }
+
+    /// Demonstrates *why* [`CaLog::mutate_issued_and_held`] exists, by
+    /// reproducing the split-durability hazard directly: two separate
+    /// `mutate_issued`/`mutate_held` calls (what `approve_csr` used before
+    /// this method existed) can durably split — the first succeeds and
+    /// stays committed even though a second, later call fails and rolls
+    /// back. Unlike a black-box test through `approve_csr` (where a broken
+    /// store dooms every write inside one function call uniformly, so
+    /// nothing actually discriminates "combined" from "split"), this test
+    /// controls the fault's timing directly: the directory is removed
+    /// *between* the two calls, which only a white-box test at this level
+    /// can arrange.
+    #[test]
+    fn separate_mutate_issued_and_mutate_held_calls_can_durably_split() {
+        let dir = unique_dir("split-durability");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(&path, seed_snapshot().to_string()).unwrap();
+
+        let mut log = CaLog::load(Some(path)).unwrap();
+        let existing_issued = log.issued()[0].clone();
+        let existing_held = log.held()[0].clone();
+
+        // The first write succeeds — its directory still exists.
+        let (_, first) = log.mutate_issued(|issued| issued.push(existing_issued));
+        assert!(first.is_ok());
+
+        // Now doom the second write.
+        std::fs::remove_dir_all(&dir).ok();
+        let (_, second) = log.mutate_held(|held| held.push(existing_held));
+        assert!(second.is_err());
+
+        assert_eq!(
+            log.issued().len(),
+            2,
+            "the first write's mutation stays committed — it already durably persisted \
+             before the directory was removed, and CaLog has no way to undo a write that \
+             already succeeded"
+        );
+        assert_eq!(
+            log.held().len(),
+            1,
+            "the second write's mutation rolled back, in isolation from the first"
+        );
     }
 }
