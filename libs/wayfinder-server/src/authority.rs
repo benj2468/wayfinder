@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use wayfinder::config::ProviderConfig;
 use wayfinder::interfaces::frame::Mac;
-use wayfinder_auth::Authority;
+use wayfinder_auth::{Authority, MembershipCert};
 use wayfinder_protos::service::{CsrOutcome, EnrollData, IssuedCertData, PendingCsrData};
 use zerocopy::IntoBytes;
 
@@ -82,11 +82,13 @@ pub struct CertAuthority {
     /// the impersonation guard) and the held-CSR store (for the
     /// operator-approval flow, only used when `require_approval`), both
     /// backed by one snapshot file. Every mutation goes through
-    /// [`CaLog::mutate_issued`]/[`CaLog::mutate_held`], which persist the
-    /// result to the configured `state_path` (if any) so it survives a
-    /// restart — this crate has no other way to touch either underlying
-    /// `Vec`, so a mutation can never be committed without also being
-    /// persisted.
+    /// [`CaLog::mutate_issued`]/[`CaLog::mutate_held`]/
+    /// [`CaLog::mutate_issued_and_held`], which persist the result to the
+    /// configured `state_path` (if any) so it survives a restart — this
+    /// crate has no other way to touch either underlying `Vec`, so a
+    /// mutation can never be committed without also being persisted (and,
+    /// since a failed persist rolls the mutation back, never observed as
+    /// committed without actually being durable).
     log: CaLog,
 }
 
@@ -163,7 +165,9 @@ impl CertAuthority {
     /// `pub(crate)` so in-crate tests can mint a cert directly rather than
     /// round-tripping the client-facing `submit_csr` path. `Err` if the
     /// signed cert could not be durably persisted — the cert is still valid
-    /// and recorded in memory, but a caller must not tell its own caller this
+    /// (signing is stateless local computation, not rolled back), but the
+    /// *record* of it never took effect (see `CaLog::mutate_issued`'s
+    /// rollback guarantee), so a caller must not tell its own caller this
     /// succeeded when the durability guarantee it implies did not hold.
     pub(crate) fn issue(
         &mut self,
@@ -171,19 +175,10 @@ impl CertAuthority {
         ed: [u8; 32],
         x: [u8; 32],
     ) -> Result<EnrollData, String> {
-        let not_before = self.now_unix;
-        let not_after = self.now_unix.saturating_add(self.cert_ttl_secs);
-        let cert = self.authority.issue_cert(mac, ed, x, not_before, not_after);
+        let (cert, record) = self.sign(mac, ed, x);
 
         // Record (or refresh, by MAC) the issued cert for the ListCerts RPC.
         // A re-issue clears any prior revoked flag (it is a fresh certificate).
-        let record = IssuedCertData {
-            node_mac: mac.0.to_vec(),
-            ed_pubkey: ed.to_vec(),
-            not_before,
-            not_after,
-            revoked: false,
-        };
         let (_, persisted) = self.log.mutate_issued(|issued| {
             match issued.iter_mut().find(|c| c.node_mac == record.node_mac) {
                 Some(existing) => *existing = record,
@@ -196,6 +191,30 @@ impl CertAuthority {
             cert: cert.as_bytes().to_vec(),
             trust_anchor: self.trust_anchor_bytes(),
         })
+    }
+
+    /// Sign a certificate for `(mac, ed, x)` stamped with the current clock
+    /// and build its `IssuedCertData` record, without persisting anything.
+    /// Signing is stateless local computation with nothing to roll back, so
+    /// it's split out from persistence deliberately: callers decide
+    /// separately *how* the record gets durably written — [`Self::issue`]
+    /// persists it alone (a single `mutate_issued` write), while
+    /// `approve_csr` persists it together with the held-CSR status flip as
+    /// one atomic write via `CaLog::mutate_issued_and_held`, so the two
+    /// halves of an approval can never durably split (see that method's own
+    /// doc for the impersonation-guard gap this closes).
+    fn sign(&self, mac: Mac, ed: [u8; 32], x: [u8; 32]) -> (MembershipCert, IssuedCertData) {
+        let not_before = self.now_unix;
+        let not_after = self.now_unix.saturating_add(self.cert_ttl_secs);
+        let cert = self.authority.issue_cert(mac, ed, x, not_before, not_after);
+        let record = IssuedCertData {
+            node_mac: mac.0.to_vec(),
+            ed_pubkey: ed.to_vec(),
+            not_before,
+            not_after,
+            revoked: false,
+        };
+        (cert, record)
     }
 
     /// Whether a held CSR has sat in its current state past the pending TTL.
@@ -388,10 +407,25 @@ impl MeshAuthority for CertAuthority {
         // Sign now (stamping the current clock) and stash the bytes; the node
         // collects them on its next poll.  Restart the entry's TTL clock so the
         // node gets a full pending-TTL window to collect from the approval.
-        let cert = self.issue(mac, ed, x)?.cert;
+        let (cert, record) = self.sign(mac, ed, x);
+        let cert_bytes = cert.as_bytes().to_vec();
         let now = self.now_unix;
-        let (_, persisted) = self.log.mutate_held(|held| {
-            held[idx].status = CsrStatus::Approved(cert);
+        // Record the issued cert *and* flip the held entry to Approved as one
+        // write: doing these as two separate `mutate_issued`/`mutate_held`
+        // calls (as this used to) left a real gap under `Persisted`'s
+        // rollback — if only the second write failed, the held entry would
+        // roll back to `Pending` while the cert stayed durably `issued`. An
+        // operator seeing "approve failed" who then called `deny_csr` would
+        // find a `Pending` entry and "successfully" deny it, but `deny_csr`
+        // only ever touches `held`, so the already-issued, still-valid
+        // certificate would never be revoked. Combining them means either
+        // both land durably or neither does.
+        let (_, persisted) = self.log.mutate_issued_and_held(|issued, held| {
+            match issued.iter_mut().find(|c| c.node_mac == record.node_mac) {
+                Some(existing) => *existing = record,
+                None => issued.push(record),
+            }
+            held[idx].status = CsrStatus::Approved(cert_bytes);
             held[idx].requested_at = now;
         });
         persisted?;
@@ -1218,10 +1252,10 @@ mod tests {
     }
 
     #[test]
-    fn mutation_still_applies_in_memory_when_persist_fails_but_caller_is_told() {
+    fn failed_persist_rolls_back_the_in_memory_mutation_but_caller_is_told() {
         // state_path under a directory that doesn't exist, so every write
         // attempt fails; a missing *file* is a normal fresh-install case
-        // (`Ok(None)`), but a missing *directory* dooms every `save_atomic`.
+        // (`Ok(None)`), but a missing *directory* dooms every persist.
         let path = std::env::temp_dir()
             .join(format!(
                 "wayfinder-server-test-{}-nonexistent-dir",
@@ -1243,13 +1277,154 @@ mod tests {
             "error should mention persistence, got: {err}"
         );
 
-        // But the mutation itself already landed in memory before the persist
-        // was attempted: the authority stays serviceable (and the
-        // impersonation guard active) even though the disk write failed.
+        // The in-memory mutation is rolled back to what it was before `f`
+        // ran (`CaLog`'s `Persisted`-backed rollback guarantee): in-memory
+        // state must never diverge from what's durably stored, so a
+        // mutation that couldn't be persisted did not, as far as any later
+        // caller can tell, happen at all.
         assert_eq!(
             ca.list_certs().len(),
-            1,
-            "the in-memory mutation still applied despite the persist failure"
+            0,
+            "the in-memory mutation was rolled back since it never durably persisted"
         );
+
+        // The authority itself stays serviceable (doesn't panic or corrupt
+        // its state) even though every persist against this path keeps
+        // failing — a second, independent submission still gets exactly the
+        // same fail-closed treatment as the first.
+        let (ed2, x2) = node_keys(3);
+        let mac2 = [0, 0, 0, 0, 0, 10];
+        let err2 = ca.submit_csr(&mac2, &ed2, &x2, "").unwrap_err();
+        assert!(
+            err2.contains("persist"),
+            "error should mention persistence, got: {err2}"
+        );
+        assert_eq!(
+            ca.list_certs().len(),
+            0,
+            "the second doomed mutation was rolled back too"
+        );
+    }
+
+    #[test]
+    fn approve_csr_rolls_back_issued_and_held_together_on_persist_failure() {
+        // A real directory, so the initial `submit_csr` (parking the CSR)
+        // persists successfully — unlike the other persist-failure tests,
+        // this one needs the *first* write to land so `approve_csr`'s own
+        // combined write is what's actually under test.
+        let dir = std::env::temp_dir().join(format!(
+            "wayfinder-server-test-{}-approve-atomic",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+
+        let cfg = approval_persisted_cfg(&path);
+        let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+        ca.set_now_unix(100);
+        let (ed, x) = node_keys(2);
+        let mac = [0, 0, 0, 0, 0, 9];
+
+        assert!(matches!(
+            ca.submit_csr(&mac, &ed, &x, "").unwrap(),
+            CsrOutcome::Pending
+        ));
+
+        // Now doom every subsequent write.
+        std::fs::remove_dir_all(&dir).ok();
+
+        let err = ca.approve_csr(&mac).unwrap_err();
+        assert!(
+            err.contains("persist"),
+            "error should mention persistence, got: {err}"
+        );
+
+        // End-to-end confirmation that `approve_csr` never leaves an
+        // orphaned issued cert when its persist fails. This doesn't by
+        // itself distinguish the combined write from two separate ones —
+        // deleting the whole directory before calling `approve_csr` dooms
+        // every write inside that call uniformly, so a first-write-succeeds,
+        // second-write-fails split can't be reproduced from outside a single
+        // function call. `persistence.rs`'s own
+        // `separate_mutate_issued_and_mutate_held_calls_can_durably_split`
+        // (which *can* control that timing) is what actually reproduces the
+        // split-durability hazard `mutate_issued_and_held` closes; this test
+        // is the user-visible guarantee that falls out of it.
+        assert_eq!(
+            ca.list_certs().len(),
+            0,
+            "no certificate should be left issued when the combined approve write fails"
+        );
+        assert_eq!(
+            ca.list_pending().len(),
+            1,
+            "the held entry rolls back to Pending, not silently lost or left Approved"
+        );
+
+        // No orphaned, un-revocable certificate: once storage is available
+        // again, a subsequent deny succeeds against the (correctly
+        // still-Pending) entry, and there is no already-issued certificate
+        // left behind for it to have failed to revoke.
+        std::fs::create_dir_all(&dir).unwrap();
+        ca.deny_csr(&mac)
+            .expect("deny succeeds against the rolled-back entry");
+        assert_eq!(ca.list_certs().len(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `deny_csr` goes through a standalone `mutate_held` call (unlike
+    /// `approve_csr`, which needed the combined `mutate_issued_and_held`
+    /// fix above) — this covers that call site under the same
+    /// rollback-on-persist-failure semantics, since it's the other
+    /// operator-facing security action against the held-CSR store (a
+    /// denial that silently didn't durably take effect would be just as
+    /// misleading to an operator as an approval that didn't).
+    #[test]
+    fn deny_csr_rolls_back_to_pending_when_persist_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "wayfinder-server-test-{}-deny-rollback",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+
+        let cfg = approval_persisted_cfg(&path);
+        let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+        ca.set_now_unix(100);
+        let (ed, x) = node_keys(2);
+        let mac = [0, 0, 0, 0, 0, 9];
+
+        assert!(matches!(
+            ca.submit_csr(&mac, &ed, &x, "").unwrap(),
+            CsrOutcome::Pending
+        ));
+
+        // Now doom the deny's write.
+        std::fs::remove_dir_all(&dir).ok();
+
+        let err = ca.deny_csr(&mac).unwrap_err();
+        assert!(
+            err.contains("persist"),
+            "error should mention persistence, got: {err}"
+        );
+
+        // The status flip to Denied rolled back — the entry is still
+        // Pending, not silently left Denied in memory while never durably
+        // recorded as such.
+        assert_eq!(
+            ca.list_pending().len(),
+            1,
+            "the held entry rolls back to Pending, not silently left Denied"
+        );
+
+        // Once storage is available again, denying still works normally
+        // against the rolled-back (still-Pending) entry.
+        std::fs::create_dir_all(&dir).unwrap();
+        ca.deny_csr(&mac)
+            .expect("deny succeeds once storage recovers");
+        assert!(ca.list_pending().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

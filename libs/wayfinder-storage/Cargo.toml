@@ -1,0 +1,20 @@
+[package]
+name = "wayfinder-storage"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+tracing.workspace = true
+
+[dev-dependencies]
+heapless.workspace = true
+
+[features]
+default = ["std"]
+# Pulls in the std::fs-backed FileStore. Leave off for `no_std` embedded
+# nodes, which will eventually get a flash-backed DurableStore impl instead
+# (not yet implemented — see docs/design/04-generic-durable-store.md §3.5).
+std = []

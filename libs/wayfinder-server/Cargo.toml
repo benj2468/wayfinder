@@ -21,6 +21,7 @@ std = [
     "dep:serde_json",
     "prost/std",
     "wayfinder-auth/std",
+    "wayfinder-storage/std",
 ]
 
 [dependencies]
@@ -30,6 +31,9 @@ wayfinder-protos.workspace = true
 # `Authority`; embedded/no_std builds leave the std feature off and pull none of
 # it in.
 wayfinder-auth.workspace = true
+# CA-state snapshot persistence (persistence.rs) is built atop the shared
+# DurableStore abstraction; only the std-gated FileStore is used here.
+wayfinder-storage.workspace = true
 zerocopy.workspace = true
 tracing.workspace = true
 prost = { version = "0.13", default-features = false }
