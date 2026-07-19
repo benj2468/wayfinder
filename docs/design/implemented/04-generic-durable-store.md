@@ -1,6 +1,6 @@
 # Design: A generic durable-blob-store abstraction
 
-**Status:** Proposed. Prerequisite for design 03
+**Status:** Implemented. Prerequisite for design 03
 (`03-revocation-durability.md`), raised in that document's MR review: rather
 than let `RevocationStore` become the second bespoke small-state persistence
 trait in this codebase (after `CaLog`), factor out the part that's actually
