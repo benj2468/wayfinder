@@ -158,10 +158,18 @@ test:run:python:
   needs:
     - build
   script:
+    # `uv sync` resolves+builds the whole Python side from the root
+    # pyproject.toml/uv.lock, including `libs/wayfinder-py` (a uv workspace
+    # member, built from source via its `maturin` build backend) — nothing
+    # else builds/installs it, since `cargo build --workspace` deliberately
+    # never touches that crate's own independent Cargo workspace.
+    - uv sync --locked
     # tshark won't load the Lua dissector as root, so drop to the unprivileged
     # `ci` user (baked into the image) for the suite. The cargo jobs still run as
     # root over the root-owned checkout; only this job needs to be non-root.
-    - runuser -u ci -- python3 -m pytest
+    # `uv run` (not a bare `python3 -m pytest`) so it resolves against the
+    # `.venv` `uv sync` just built rather than the system interpreter.
+    - runuser -u ci -- uv run pytest
 test:run:
   stage: test
   tags:

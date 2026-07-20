@@ -31,9 +31,7 @@ def write_pcap(path: Path, frame: bytes) -> None:
     with path.open("wb") as fh:
         # magic, version 2.4, thiszone, sigfigs, snaplen, network
         fh.write(
-            struct.pack(
-                "<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, LINKTYPE_ETHERNET
-            )
+            struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, LINKTYPE_ETHERNET)
         )
         # ts_sec, ts_usec, incl_len, orig_len
         fh.write(struct.pack("<IIII", 0, 0, len(frame), len(frame)))

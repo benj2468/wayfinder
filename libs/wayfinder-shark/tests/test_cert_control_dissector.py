@@ -27,7 +27,9 @@ def ethernet(dst: bytes, src: bytes, ethertype: int, payload: bytes) -> bytes:
     return dst + src + struct.pack(">H", ethertype) + payload
 
 
-def cert_ctrl_header(packet_type: int, *, version: int = 5, ttl: int = 50, dest: bytes) -> bytes:
+def cert_ctrl_header(
+    packet_type: int, *, version: int = 5, ttl: int = 50, dest: bytes
+) -> bytes:
     """Serialize the shared cert-control header: type/version/ttl/dest."""
     return struct.pack(">BBB", packet_type, version, ttl) + dest
 
@@ -58,7 +60,7 @@ def membership_cert(
 def cert_req_frame(
     *,
     dest: bytes = NODE1,
-    requester_cert: bytes = None,
+    requester_cert: bytes | None = None,
     signature: bytes = b"\x44" * 64,
 ) -> bytes:
     """A complete ``BATADV_CERT_REQ``-carrying Ethernet frame."""
@@ -68,7 +70,7 @@ def cert_req_frame(
     return ethernet(dest, NODE2, ETH_P_BATMAN, body)
 
 
-def cert_reply_frame(*, dest: bytes = NODE2, cert: bytes = None) -> bytes:
+def cert_reply_frame(*, dest: bytes = NODE2, cert: bytes | None = None) -> bytes:
     """A complete ``BATADV_CERT_REPLY``-carrying Ethernet frame."""
     if cert is None:
         cert = membership_cert(node_mac=dest)

@@ -3,6 +3,48 @@
 A throwaway multi-node mesh you can stand up locally to watch BATMAN routing
 converge and inspect it with the `wayfinder-tui` dashboard.
 
+For a physics-driven, single-process simulation instead of real containers
+and sockets — e.g. modeling a moving node's radio link quality as a function
+of distance and watching BATMAN's next-hop selection react — see
+[`sim/scenarios/`](./scenarios/), built on [`sim/engine/`](./engine/): a
+small SimPy-scheduled harness that drives real `wayfinder-py` `PyDriver`s
+(the PyO3 binding over the tick-based mesh driver) against Python-side
+`Mobility`/`Channel` models, so a scenario only has to describe topology,
+channel tuning, and what to record — not tick/delivery bookkeeping.
+
+```bash
+uv sync --group sim
+uv run --group sim python sim/scenarios/drone_relay.py
+```
+
+### Writing a scenario
+
+A scenario builds a `Node`/`Link` topology (via `engine.topology`'s
+`pair`/`path`/`complete_graph`/`shared_lan`/`diamond`/`star`, mirroring
+`sim/topology.py`'s docker-topology vocabulary), wires it into a
+`Simulation`, registers what to record, and runs it:
+
+```python
+from engine.channel import FreeSpacePathLoss
+from engine.node import Node
+from engine.scenario import Simulation
+from engine.topology import pair
+
+nodes = [Node("a"), Node("b")]
+links = [pair("a", "b", FreeSpacePathLoss())]
+sim = Simulation(nodes, links, seed=0)
+sim.record("route", lambda s: s.route_via("a", "b"))
+
+rec = sim.run(until_s=10.0)
+print(rec.transitions("route"))
+```
+
+See `sim/scenarios/drone_relay.py` for a full example (mobility, multiple
+channels, a switch summary, and a chart via `engine.plotting`), and
+`sim/engine/tests/` for the engine's own pure-logic + integration tests
+(`uv run pytest sim/engine/tests/`; the SimPy-touching ones need
+`--group sim`).
+
 ## Topology
 
 The default is a **4-node diamond bolted onto a 5-node complete-graph mesh**,
