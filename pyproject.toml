@@ -1,15 +1,57 @@
-# Python tooling config for the repo's integration/component test suite.
+# Python tooling for the repo: the integration/component test suite plus the
+# dev-tool versions `uv sync` installs at the root.
 #
-# These are black-box tests that drive real built artifacts (e.g. the Wayfinder
-# Wireshark Lua dissector via tshark), complementing the per-crate Rust unit
-# tests. Each component keeps its tests next to its code in `libs/<crate>/tests/`;
-# pytest discovers them automatically from the `libs` tree.
+# The tests are black-box tests that drive real built artifacts (e.g. the
+# Wayfinder Wireshark Lua dissector via tshark, or the libs/wayfinder-py PyO3
+# extension module), complementing the per-crate Rust unit tests. Each
+# component keeps its tests next to its code in `libs/<crate>/tests/`; pytest
+# discovers them automatically from the `libs` tree.
 #
-# Run them from the repo root with `pytest` (the dev shell provides pytest and
-# tshark): `nix develop .#pytest --command pytest`.
+# `uv sync` from the repo root builds/installs everything (the dev shell
+# provides `uv`; CI installs it too — see containers/testenv.Dockerfile),
+# including `wayfinder-py` itself (a uv workspace member, built from source
+# via its `maturin` build backend). Then run tests with `uv run pytest`.
+[project]
+name = "wayfinder-dev"
+version = "0.0.0"
+requires-python = ">=3.10"
+dependencies = ["wayfinder-py"]
+
+[dependency-groups]
+dev = ["pytest", "ruff", "basedpyright", "ty", "uv"]
+# Physics-driven simulation scenarios under sim/scenarios/ (see sim/README.sim.md)
+# — kept out of the default `dev` group since they're not needed to build/test
+# the library itself. Run with `uv run --group sim python sim/scenarios/<name>.py`.
+sim = ["matplotlib", "simpy"]
+
+[tool.uv]
+# This root project is just the dev-tooling/test harness for the monorepo —
+# nothing here is itself built or published.
+package = false
+
+[tool.uv.workspace]
+members = ["libs/wayfinder-py"]
+
+[tool.uv.sources]
+wayfinder-py = { workspace = true }
+
 [tool.pytest.ini_options]
-# Recurse the crate tree; any libs/<crate>/tests/test_*.py is picked up.
-testpaths = ["libs"]
+# Recurse the crate tree, plus sim/engine's own tests (see sim/engine/tests/).
+# The engine's pure-logic tests need no extra deps beyond wayfinder-py; its
+# SimPy/matplotlib-touching tests use pytest.importorskip so they cleanly skip
+# outside `--group sim` rather than failing collection.
+testpaths = ["libs", "sim"]
 # importlib mode means test modules need not have globally-unique filenames, so
 # two crates can each have e.g. tests/test_wire.py without colliding.
 addopts = "-ra --import-mode=importlib"
+# So sim/engine/tests/*.py can `import engine` (matching how sim/scenarios/*.py
+# import it) instead of the collection-derived `sim.engine`.
+pythonpath = ["sim"]
+
+[tool.pyright]
+# Mirrors [tool.pytest.ini_options].pythonpath above, so `import engine` in
+# sim/scenarios/*.py and sim/engine/tests/*.py resolves for basedpyright the
+# same way it does at runtime (sim/scenarios/*.py additionally puts `sim` on
+# sys.path itself, since a script's own directory — not `sim/` — is what
+# Python puts on sys.path[0] for it).
+extraPaths = ["sim"]

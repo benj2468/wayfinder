@@ -2856,6 +2856,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wayfinder-tick-driver"
+version = "0.1.0"
+dependencies = [
+ "interfaces",
+ "tracing",
+ "wayfinder",
+ "wayfinder-driver-core",
+ "zerocopy",
+]
+
+[[package]]
 name = "wayfinder-tui"
 version = "0.1.0"
 dependencies = [

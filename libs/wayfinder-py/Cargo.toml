@@ -1,0 +1,38 @@
+[package]
+name = "wayfinder-py"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Independent Cargo workspace — mirrors `bins/wayfinder-nrf52840` and
+# `libs/wayfinder/fuzz`: this crate needs a Python interpreter (and, outside
+# `extension-module` mode, a linkable libpython) at build time, which must
+# never leak into the main workspace's `cargo build --workspace`/`cargo
+# clippy --workspace --all-targets`. Because `--workspace` overrides
+# `default-members`, merely excluding this crate from the root workspace's
+# defaults would not be enough — only a separate `[workspace]` guarantees
+# root-workspace commands never touch it.
+[workspace]
+members = ["."]
+
+[lib]
+name = "wayfinder_py"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wayfinder-tick-driver = { path = "../wayfinder-tick-driver" }
+interfaces = { path = "../interfaces" }
+wayfinder = { path = "../wayfinder" }
+pyo3 = { version = "0.29", features = ["abi3-py310"] }
+# Bridges wayfinder's `tracing` events (otherwise silently dropped — no
+# subscriber is installed by default in a library) out to the process; see
+# `init_tracing` in src/tracing_init.rs. Same `env-filter` feature as the
+# root workspace's `tracing-subscriber` (this crate can't use
+# `.workspace = true` for it since it's its own independent workspace).
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[features]
+# Off by default so plain `cargo build`/`cargo test` in this crate link a
+# normal embeddable libpython; `maturin` passes this explicitly (see
+# pyproject.toml) to build the portable, dlopen-loaded extension module.
+extension-module = ["pyo3/extension-module"]

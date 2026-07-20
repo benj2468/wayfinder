@@ -23,6 +23,9 @@ RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/ca
 RUN cargo binstall -y cargo-nextest
 RUN cargo binstall -y cargo-llvm-cov
 RUN cargo binstall -y sccache
+# Builds/installs the libs/wayfinder-py extension module before the pytest job
+# imports it (see test:run:python in .gitlab-ci.yml).
+RUN cargo binstall -y maturin
 
 # Ensure protoc is globally accessible (usually /usr/bin/protoc via apt)
 ENV PROTOC=/usr/bin/protoc
@@ -38,10 +41,13 @@ RUN apt-get update \
         tshark \
     && rm -rf /var/lib/apt/lists/*
 
-# pytest from pip (not the python3-pytest apt package). Installed system-wide so
-# it is on PATH for the unprivileged `ci` user; --break-system-packages is
-# required because Debian marks the base interpreter externally-managed (PEP 668).
-RUN pip3 install --no-cache-dir --break-system-packages pytest
+# `uv` drives the Python side from here on (see root pyproject.toml/uv.lock):
+# `uv sync` resolves+installs pytest and every other dev tool, and builds
+# `libs/wayfinder-py` (a uv workspace member) from source via maturin.
+# Installed system-wide (not into a venv itself) so it's on PATH for the
+# unprivileged `ci` user; --break-system-packages is required because Debian
+# marks the base interpreter externally-managed (PEP 668).
+RUN pip3 install --no-cache-dir --break-system-packages uv
 
 # Unprivileged user for the dissector tests. tshark refuses to load
 # `-X lua_script:` dissectors when running as root ("Running as user root ...

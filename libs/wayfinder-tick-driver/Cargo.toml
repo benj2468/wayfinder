@@ -1,0 +1,24 @@
+[package]
+name = "wayfinder-tick-driver"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+# A third shell atop `wayfinder-driver-core`, alongside the `std`/tokio
+# `wayfinder-driver` and the `no_std`/embassy `wayfinder-embedded-driver`.
+# Where those two race a real link's `recv()` against a sleep, this one holds
+# plain queues instead of live links and exposes a non-blocking `tick(now)`
+# that drains whatever is queued — the shape an in-process, tick-based caller
+# (e.g. a Python-driven simulation) wants instead of an event loop to await.
+
+[dependencies]
+wayfinder-driver-core.workspace = true
+wayfinder.workspace = true
+interfaces.workspace = true
+zerocopy.workspace = true
+# Pinned directly (not workspace inheritance, which can't override
+# `default-features`) so tracing's `std` feature stays off for the `no_std`
+# build, matching `wayfinder-driver-core`/`wayfinder-embedded-driver`.
+tracing = { version = "0.1.44", default-features = false }

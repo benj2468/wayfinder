@@ -111,11 +111,14 @@
               rust-analyzer
               pytestEnv
               python312Packages.virtualenv
+              maturin
+              uv
               socat
               protobuf
               buf
               tshark
               glab
+              stdenv.cc.cc.lib
             ];
 
             nativeBuildInputs = with pkgs; [
@@ -124,12 +127,20 @@
 
             shellHook = ''
               ${config.pre-commit.installationScript}
-              # source .venv/bin/activate
+              PROJECT_ROOT=$(git rev-parse --show-toplevel)
 
-              # pip install --upgrade pip
-              # pip install -r training/requirements.txt
+              python3 -m venv ''${PROJECT_ROOT}/.venv
 
-              PYTHONPATH=training:$PYTHONPATH
+              source "''${PROJECT_ROOT}/.venv/bin/activate"
+
+              python3 -m pip install --upgrade pip
+              uv sync --only-dev
+
+              # Manylinux wheels (numpy, matplotlib's C extensions — see
+              # sim/scenarios/*.py's `uv sync --group sim`) expect libstdc++ on
+              # the loader path; this shell's stdenv doesn't put it there by
+              # default, so wire it up once here rather than per-invocation.
+              export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH"
             '';
           };
 
@@ -156,7 +167,8 @@
             programs = {
               nixfmt.enable = true;
               rustfmt.enable = true;
-              ruff.enable = true;
+              ruff-check.enable = true;
+              ruff-format.enable = true;
               buf.enable = true;
               yamlfmt.enable = true;
               dockerfmt.enable = true;
