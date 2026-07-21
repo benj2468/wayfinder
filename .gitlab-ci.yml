@@ -1,4 +1,7 @@
+include:
+  - template: Jobs/Secret-Detection.gitlab-ci.yml
 variables:
+  AST_ENABLE_MR_PIPELINES: true
   CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
   CI_REGISTRY_IMAGE: registry.haganah.net
   # TODO: This will need to change, or else different MRs will stomp on each other
@@ -49,6 +52,11 @@ lint:mr-title:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
   script:
     - echo "$CI_MERGE_REQUEST_TITLE" | commitlint
+secret_detection:
+  stage: lint
+  tags:
+    - docker
+  needs: []
 lint-done:
   stage: lint
   tags:
@@ -56,6 +64,7 @@ lint-done:
   needs:
     - lint:rust
     - lint:nix
+    - secret_detection
     - job: lint:mr-title
       optional: true
   script:

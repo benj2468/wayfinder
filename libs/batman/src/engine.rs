@@ -6,12 +6,12 @@ use tracing::{debug, info, trace};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
-    BatmanEngine, NeighborStats, OriginatorRecord, TrickleTimer,
+    BatmanEngine, KeepAliveStats, NeighborStats, OriginatorRecord, TrickleTimer,
     wire::{
-        BATADV_BCAST, BATADV_CERT_REPLY, BATADV_CERT_REQ, BATADV_IV_OGM, BATADV_MCAST,
-        BATADV_UNICAST, BatmanBroadcastPacket, BatmanCertReplyPacket, BatmanCertReqPacket,
-        BatmanMcastPacket, BatmanOgmPacket, BatmanTvlvHdr, BatmanUnicastPacket, ETH_P_BATMAN,
-        TvlvType, find_tvlv,
+        BATADV_BCAST, BATADV_CERT_REPLY, BATADV_CERT_REQ, BATADV_IV_OGM, BATADV_KEEPALIVE,
+        BATADV_MCAST, BATADV_UNICAST, BatmanBroadcastPacket, BatmanCertReplyPacket,
+        BatmanCertReqPacket, BatmanMcastPacket, BatmanOgmPacket, BatmanTvlvHdr,
+        BatmanUnicastPacket, ETH_P_BATMAN, TvlvType, find_tvlv,
     },
 };
 
@@ -37,6 +37,13 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
     /// unknown or every path to it is stale, so a caller never forwards toward a
     /// neighbor that has gone silent, even between periodic sweeps.
     ///
+    /// Among the surviving (non-OGM-stale) paths, selection uses
+    /// [`effective_tq`](Self::effective_tq) rather than the raw
+    /// [`NeighborStats::last_tq`] — so a path whose neighbor has missed its
+    /// keep-alive budget loses to any live alternative even if its
+    /// OGM-advertised TQ was higher, without being evicted outright the way
+    /// OGM staleness is.
+    ///
     /// [`MAX_MISSED_OGMS`]: crate::MAX_MISSED_OGMS
     pub fn next_hop(&self, now: core::time::Duration, destination: Mac) -> Option<Mac> {
         let seed = self.seed_interval();
@@ -45,8 +52,52 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
             .paths
             .iter()
             .filter(|p| !Self::path_stale(now, p, seed))
-            .max_by_key(|p| p.last_tq)
+            .max_by_key(|p| self.effective_tq(now, p))
             .map(|p| p.neighbor_ident)
+    }
+
+    /// `path.last_tq`, hard-zeroed when [`keepalive_missed`](Self::keepalive_missed)
+    /// is true for this path's relaying neighbor — guaranteeing such a path
+    /// can never outrank any live alternative with a nonzero TQ, matching the
+    /// deprioritization-not-eviction contract unconditionally. A **read-time
+    /// overlay** used only inside [`next_hop`](Self::next_hop)'s comparison —
+    /// it never mutates `path.last_tq` itself, so it is self-healing the
+    /// instant a keep-alive resumes and needs no periodic decay/reset.
+    /// Deliberately not used by
+    /// [`recompute_best`](Self::recompute_best)/[`purge_stale`](Self::purge_stale):
+    /// the cached `OriginatorRecord::max_tq`/`best_next_hop` stay driven by
+    /// OGM data alone, mirroring the same cache/hot-path asymmetry
+    /// [`path_stale`](Self::path_stale) already has.
+    fn effective_tq(&self, now: core::time::Duration, path: &NeighborStats) -> u8 {
+        if self.keepalive_missed(now, path.neighbor_ident) {
+            0
+        } else {
+            path.last_tq
+        }
+    }
+
+    /// Whether a `(last_heard, interval_estimate)` pair has aged out as of
+    /// `now`: true once `now` has advanced more than `max_missed` of the
+    /// *expected* interval past the last refresh. The expected interval is the
+    /// learned cadence (`interval_estimate`), or `seed` until a second sample
+    /// has been measured. Saturating arithmetic keeps the budget finite.
+    /// Shared by [`path_stale`](Self::path_stale) (OGM paths) and
+    /// [`keepalive_missed`](Self::keepalive_missed) (keep-alive heartbeats) —
+    /// the same ageing shape, applied to two independent signals.
+    fn is_stale(
+        now: core::time::Duration,
+        last_heard: core::time::Duration,
+        interval_estimate: core::time::Duration,
+        seed: core::time::Duration,
+        max_missed: u32,
+    ) -> bool {
+        let expected = if interval_estimate.is_zero() {
+            seed
+        } else {
+            interval_estimate
+        };
+        let budget = expected.saturating_mul(max_missed);
+        now.saturating_sub(last_heard) > budget
     }
 
     /// Whether `path` has aged out as of `now`: true once `now` has advanced
@@ -61,13 +112,54 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
         path: &NeighborStats,
         seed: core::time::Duration,
     ) -> bool {
-        let expected = if path.interval_estimate.is_zero() {
-            seed
-        } else {
-            path.interval_estimate
-        };
-        let budget = expected.saturating_mul(crate::MAX_MISSED_OGMS);
-        now.saturating_sub(path.last_heard) > budget
+        Self::is_stale(
+            now,
+            path.last_heard,
+            path.interval_estimate,
+            seed,
+            crate::MAX_MISSED_OGMS,
+        )
+    }
+
+    /// The interval to seed a freshly-heard neighbor's keep-alive miss budget
+    /// with, before a second heartbeat provides a real gap to measure: the
+    /// largest configured keep-alive `i_max` across interfaces (the quietest
+    /// cadence a stable link settles into), or
+    /// [`DEFAULT_KEEPALIVE_INTERVAL`](crate::DEFAULT_KEEPALIVE_INTERVAL) if no
+    /// interface has keep-alive configured.
+    fn keepalive_seed_interval(&self) -> core::time::Duration {
+        self.keepalive_timers
+            .iter()
+            .filter_map(|t| t.as_ref())
+            .map(|t| t.i_max())
+            .max()
+            .unwrap_or(crate::DEFAULT_KEEPALIVE_INTERVAL)
+    }
+
+    /// Whether `neighbor` has missed its keep-alive budget as of `now`.
+    /// `false` when we have never heard a keep-alive from `neighbor` at all —
+    /// the opt-in-by-observation contract: a neighbor (or link) not running
+    /// this feature is never penalized for silence it was never expected to
+    /// break. Otherwise ages the neighbor's last heartbeat against
+    /// [`MAX_MISSED_KEEPALIVES`](crate::MAX_MISSED_KEEPALIVES) of its learned
+    /// (or seeded) cadence, via the same [`is_stale`](Self::is_stale) rule
+    /// [`path_stale`](Self::path_stale) uses for OGM paths.
+    ///
+    /// `pub` (not just used internally by [`effective_tq`](Self::effective_tq)):
+    /// also the basis of `CentralRouter`'s keep-alive observability, so an
+    /// operator/app can see a link's direct liveness degrade before it shows
+    /// up as a route switching away.
+    pub fn keepalive_missed(&self, now: core::time::Duration, neighbor: Mac) -> bool {
+        match self.keepalive.get(&neighbor) {
+            None => false,
+            Some(stats) => Self::is_stale(
+                now,
+                stats.last_heard,
+                stats.interval_estimate,
+                self.keepalive_seed_interval(),
+                crate::MAX_MISSED_KEEPALIVES,
+            ),
+        }
     }
 
     /// The interval to seed a freshly discovered path's purge budget with, before
@@ -271,20 +363,36 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
         if idx >= crate::MAX_INTERFACES {
             return;
         }
-        // Jitter seed: fold the node identity with the interface index so each
-        // interface — and each node — fires on its own offset.
-        let seed = u32::from_le_bytes([
+        let seed = self.jitter_seed(idx, 0);
+        Self::backfill(
+            &mut self.ogm_timers,
+            idx,
+            TrickleTimer::new(i_min, i_max, now, seed),
+        );
+        self.ogm_timers[idx] = TrickleTimer::new(i_min, i_max, now, seed);
+    }
+
+    /// Per-node, per-interface jitter seed: folds the node identity with the
+    /// interface index so each interface — and each node — fires on its own
+    /// offset. `salt` distinguishes independent timer schedules on the same
+    /// interface (e.g. OGM vs keep-alive) so they don't jitter in lockstep;
+    /// pass `0` for a schedule with no sibling to distinguish from.
+    fn jitter_seed(&self, idx: usize, salt: u32) -> u32 {
+        u32::from_le_bytes([
             self.self_ident.0[2],
             self.self_ident.0[3],
             self.self_ident.0[4],
             self.self_ident.0[5],
-        ]) ^ (idx as u32).wrapping_mul(0x0100_0193);
-        while self.ogm_timers.len() <= idx {
-            let _ = self
-                .ogm_timers
-                .push(TrickleTimer::new(i_min, i_max, now, seed));
+        ]) ^ (idx as u32).wrapping_mul(0x0100_0193)
+            ^ salt
+    }
+
+    /// Grow `v` with clones of `fill` until it has at least `idx + 1`
+    /// elements, so `v[idx]` can be written unconditionally afterward.
+    fn backfill<T: Clone, const N: usize>(v: &mut heapless::Vec<T, N>, idx: usize, fill: T) {
+        while v.len() <= idx {
+            let _ = v.push(fill.clone());
         }
-        self.ogm_timers[idx] = TrickleTimer::new(i_min, i_max, now, seed);
     }
 
     /// Time until the soonest interface is next due to emit an OGM, as of `now`.
@@ -340,6 +448,65 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
     pub fn reset_ogm_timers(&mut self, now: core::time::Duration) {
         for timer in self.ogm_timers.iter_mut() {
             timer.reset(now);
+        }
+    }
+
+    // ── per-interface keep-alive (fixed-cadence heartbeat) ────────────────────
+
+    /// Install (or replace) interface `idx`'s keep-alive transmit schedule.
+    /// `Some(interval)` arms a fixed-cadence timer (built as a [`TrickleTimer`]
+    /// with equal `i_min`/`i_max`, so it jitters each fire but never backs
+    /// off); `None` disarms it — that interface then never appears from
+    /// [`due_keepalive_interface`](Self::due_keepalive_interface). Slots
+    /// between the current length and `idx` are back-filled with `None` so
+    /// the table stays dense and index-addressable. Interfaces at or beyond
+    /// [`MAX_INTERFACES`](crate::MAX_INTERFACES) are ignored.
+    pub fn configure_interface_keepalive(
+        &mut self,
+        idx: usize,
+        interval: Option<core::time::Duration>,
+        now: core::time::Duration,
+    ) {
+        if idx >= crate::MAX_INTERFACES {
+            return;
+        }
+        let seed = self.jitter_seed(idx, 0x9e3779b9);
+        Self::backfill(&mut self.keepalive_timers, idx, None);
+        self.keepalive_timers[idx] = interval.map(|iv| TrickleTimer::new(iv, iv, now, seed));
+    }
+
+    /// Time until the soonest interface is next due to emit a keep-alive, as
+    /// of `now`. With no interface configured for keep-alive there is nothing
+    /// to emit, so this reports a long idle interval rather than
+    /// busy-looping (mirrors [`next_broadcast_after`](Self::next_broadcast_after)).
+    pub fn next_keepalive_after(&self, now: core::time::Duration) -> core::time::Duration {
+        self.keepalive_timers
+            .iter()
+            .filter_map(|t| t.as_ref())
+            .map(|t| t.time_until(now))
+            .min()
+            .unwrap_or(core::time::Duration::from_secs(3600))
+    }
+
+    /// The index of the interface most overdue to emit a keep-alive as of
+    /// `now`, or `None` when none is configured or due. Mirrors
+    /// [`due_interface`](Self::due_interface) for the keep-alive schedule.
+    pub fn due_keepalive_interface(&self, now: core::time::Duration) -> Option<usize> {
+        self.keepalive_timers
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, t)| t.as_ref().map(|t| (idx, t)))
+            .filter(|(_, t)| t.due(now))
+            .min_by_key(|(_, t)| t.time_until(now))
+            .map(|(idx, _)| idx)
+    }
+
+    /// Record that interface `idx` just emitted a keep-alive at `now`,
+    /// advancing that interface's fixed-cadence schedule. A no-op if `idx`
+    /// has no keep-alive timer configured.
+    pub fn on_keepalive_emitted(&mut self, idx: usize, now: core::time::Duration) {
+        if let Some(Some(timer)) = self.keepalive_timers.get_mut(idx) {
+            timer.on_emit(now);
         }
     }
 
@@ -592,6 +759,56 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
         }
         self.apply_topology_change(now);
         RoutingAction::Consumed
+    }
+
+    /// Route an incoming keep-alive heartbeat (`BATADV_KEEPALIVE`): link-local
+    /// only — never forwarded, never delivered locally, no reply written.
+    /// Records that `frame.src` is alive as of `now` so
+    /// [`next_hop`](Self::next_hop) can deprioritize routes through it the
+    /// instant it goes quiet, without waiting for OGM-interval-based
+    /// staleness. Always [`Consumed`](RoutingAction::Consumed).
+    fn handle_keepalive(&mut self, now: core::time::Duration, frame: &LinkFrame) -> RoutingAction {
+        let Ok((_hdr, _)) = crate::wire::BatmanKeepAlivePacket::read_from_prefix(&frame.payload)
+        else {
+            trace!("drop: malformed keepalive");
+            return RoutingAction::Consumed;
+        };
+        if frame.src != self.self_ident {
+            self.note_keepalive(now, frame.src);
+        }
+        RoutingAction::Consumed
+    }
+
+    /// Record one keep-alive heartbeat from `neighbor` at `now`: folds the
+    /// observed gap into its learned cadence via the same peak-hold technique
+    /// as OGM paths ([`blend_interval`](Self::blend_interval)) on any second
+    /// or later heartbeat, or arms a fresh entry on first sight. Evicts the
+    /// least-recently-heard neighbor when the table is full, mirroring
+    /// [`handle_ogm`](Self::handle_ogm)'s originator-table eviction.
+    fn note_keepalive(&mut self, now: core::time::Duration, neighbor: Mac) {
+        if let Some(stats) = self.keepalive.get_mut(&neighbor) {
+            let gap = now.saturating_sub(stats.last_heard);
+            stats.interval_estimate = Self::blend_interval(stats.interval_estimate, gap);
+            stats.last_heard = now;
+            return;
+        }
+
+        if self.keepalive.len() >= MAX_ORIGINATORS
+            && let Some(oldest) = self
+                .keepalive
+                .iter()
+                .min_by_key(|(_, s)| s.last_heard)
+                .map(|(m, _)| *m)
+        {
+            self.keepalive.remove(&oldest);
+        }
+        let _ = self.keepalive.insert(
+            neighbor,
+            KeepAliveStats {
+                last_heard: now,
+                interval_estimate: core::time::Duration::ZERO,
+            },
+        );
     }
 
     /// Route an incoming flooded broadcast (`BATADV_BCAST`): drop our own and
@@ -913,6 +1130,7 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
             BATADV_MCAST => self.handle_mcast(now, frame, reply),
             BATADV_CERT_REQ => self.handle_cert_req(now, frame, reply),
             BATADV_CERT_REPLY => self.handle_cert_reply(now, frame, reply),
+            BATADV_KEEPALIVE => self.handle_keepalive(now, frame),
             _ => self.route_by_dest(now, frame),
         }
     }
@@ -974,5 +1192,237 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
         }
 
         Some(&tx_buffer[..header_size + tvlv_len])
+    }
+}
+
+impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
+    /// Write a keep-alive heartbeat into `tx_buffer`, returning the produced
+    /// slice. Stateless — no sequence number or timestamp on the wire, since
+    /// a keep-alive only needs to prove *that* this node is alive, not carry
+    /// any ordering information (it is never relayed, so there is nothing to
+    /// deduplicate). Returns `None` if `tx_buffer` is too small to hold the
+    /// (2-byte) packet.
+    pub fn produce_keepalive<'tx>(&self, tx_buffer: &'tx mut [u8]) -> Option<&'tx [u8]> {
+        let header_size = core::mem::size_of::<crate::wire::BatmanKeepAlivePacket>();
+        if header_size > tx_buffer.len() {
+            return None;
+        }
+        let pkt = crate::wire::BatmanKeepAlivePacket {
+            packet_type: BATADV_KEEPALIVE,
+            version: 5,
+        };
+        tx_buffer[..header_size].copy_from_slice(pkt.as_bytes());
+        Some(&tx_buffer[..header_size])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    /// A neighbor we have never received a keep-alive from is never treated
+    /// as having missed one — the opt-in-by-observation contract. True at
+    /// `now == 0` and stays true arbitrarily far into the future, since there
+    /// is no entry to age out.
+    #[test]
+    fn keepalive_missed_is_false_when_never_heard() {
+        let engine = BatmanEngine::<4>::new(mac(1));
+        assert!(!engine.keepalive_missed(core::time::Duration::ZERO, mac(2)));
+        assert!(!engine.keepalive_missed(core::time::Duration::from_secs(1_000_000), mac(2)));
+    }
+
+    fn keepalive_frame(src: u8, dst: u8) -> Vec<u8> {
+        let pkt = crate::wire::BatmanKeepAlivePacket {
+            packet_type: crate::wire::BATADV_KEEPALIVE,
+            version: 5,
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(mac(dst).as_bytes());
+        data.extend_from_slice(mac(src).as_bytes());
+        data.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
+        data.extend_from_slice(pkt.as_bytes());
+        data
+    }
+
+    /// One keep-alive from a neighbor arms `keepalive_missed` (no longer
+    /// unconditionally `false`); a second heartbeat folds the observed gap
+    /// into the learned `interval_estimate` via the same peak-hold technique
+    /// as OGM paths.
+    #[test]
+    fn handle_rx_keepalive_arms_and_learns_gap() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let mut tx = [0u8; 64];
+
+        let frame1 = keepalive_frame(2, 1);
+        let parsed1 = LinkFrame::ref_from_prefix(&frame1).unwrap().0;
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+        engine.handle_rx(core::time::Duration::ZERO, parsed1, None, &mut reply);
+
+        let stats = engine.keepalive.get(&mac(2)).expect("armed after 1st hb");
+        assert_eq!(stats.last_heard, core::time::Duration::ZERO);
+        assert_eq!(stats.interval_estimate, core::time::Duration::ZERO);
+
+        let frame2 = keepalive_frame(2, 1);
+        let parsed2 = LinkFrame::ref_from_prefix(&frame2).unwrap().0;
+        let mut reply2: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+        engine.handle_rx(
+            core::time::Duration::from_secs(5),
+            parsed2,
+            None,
+            &mut reply2,
+        );
+        let stats = engine.keepalive.get(&mac(2)).unwrap();
+        assert_eq!(stats.last_heard, core::time::Duration::from_secs(5));
+        assert_eq!(stats.interval_estimate, core::time::Duration::from_secs(5));
+    }
+
+    /// A keep-alive frame truncated shorter than its 2-byte header is
+    /// dropped rather than treated as a valid heartbeat — matching every
+    /// sibling handler's malformed-input handling (see e.g.
+    /// `handle_cert_req`).
+    #[test]
+    fn handle_rx_keepalive_drops_truncated_frame() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let mut tx = [0u8; 64];
+
+        // A 1-byte payload: just the type tag, no version byte.
+        let mut data = Vec::new();
+        data.extend_from_slice(mac(1).as_bytes());
+        data.extend_from_slice(mac(2).as_bytes());
+        data.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
+        data.push(BATADV_KEEPALIVE);
+        let frame = LinkFrame::ref_from_prefix(&data).unwrap().0;
+
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+        engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
+
+        assert!(
+            engine.keepalive.get(&mac(2)).is_none(),
+            "a truncated keep-alive must not arm liveness state"
+        );
+    }
+
+    /// Once armed with a learned 5s cadence, `keepalive_missed` flips true
+    /// once the budget (`MAX_MISSED_KEEPALIVES` × 5s = 15s) since the last
+    /// heartbeat is exceeded, and flips back false the instant a fresh
+    /// heartbeat arrives — no ratchet, purely self-healing.
+    #[test]
+    fn keepalive_missed_flips_past_budget_and_self_heals() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let mut tx = [0u8; 64];
+
+        // Two heartbeats 5s apart teach the engine a 5s cadence.
+        for t in [0u64, 5] {
+            let frame = keepalive_frame(2, 1);
+            let parsed = LinkFrame::ref_from_prefix(&frame).unwrap().0;
+            let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+            engine.handle_rx(core::time::Duration::from_secs(t), parsed, None, &mut reply);
+        }
+
+        // Budget is 3 * 5s = 15s past last_heard (5s), i.e. stale after t=20s.
+        assert!(!engine.keepalive_missed(core::time::Duration::from_secs(20), mac(2)));
+        assert!(engine.keepalive_missed(core::time::Duration::from_secs(21), mac(2)));
+
+        // A fresh heartbeat immediately clears the miss — self-healing, no
+        // persisted ratchet from having been missed.
+        let frame = keepalive_frame(2, 1);
+        let parsed = LinkFrame::ref_from_prefix(&frame).unwrap().0;
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+        engine.handle_rx(
+            core::time::Duration::from_secs(30),
+            parsed,
+            None,
+            &mut reply,
+        );
+        assert!(!engine.keepalive_missed(core::time::Duration::from_secs(30), mac(2)));
+    }
+
+    /// A keep-alive is never forwarded or delivered locally — always
+    /// `Consumed`, with an untouched reply buffer.
+    #[test]
+    fn handle_rx_keepalive_is_consumed_never_forwarded() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let mut tx = [0u8; 64];
+        let frame = keepalive_frame(2, 1);
+        let parsed = LinkFrame::ref_from_prefix(&frame).unwrap().0;
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+        let action = engine.handle_rx(core::time::Duration::ZERO, parsed, None, &mut reply);
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.protocol, 0);
+    }
+
+    /// Once the keep-alive table is at capacity, a heartbeat from a new
+    /// neighbor evicts the least-recently-heard entry rather than being
+    /// dropped — mirroring `test_full_table_evicts_least_recently_heard`'s
+    /// coverage of the (separate) originator table's own eviction.
+    #[test]
+    fn keepalive_table_evicts_least_recently_heard_when_full() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let mut tx = [0u8; 64];
+
+        // Fill the keep-alive table to capacity (4 neighbors), each first
+        // heard at a distinct, increasing time.
+        for (i, src) in (10..14).enumerate() {
+            let frame = keepalive_frame(src, 1);
+            let parsed = LinkFrame::ref_from_prefix(&frame).unwrap().0;
+            let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+            engine.handle_rx(
+                core::time::Duration::from_secs(i as u64),
+                parsed,
+                None,
+                &mut reply,
+            );
+        }
+        assert_eq!(engine.keepalive.len(), 4);
+        assert!(engine.keepalive.contains_key(&mac(10)));
+
+        // A new neighbor's heartbeat must be admitted, evicting the
+        // least-recently-heard entry (neighbor 10, heard at t=0).
+        let frame = keepalive_frame(20, 1);
+        let parsed = LinkFrame::ref_from_prefix(&frame).unwrap().0;
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+        engine.handle_rx(
+            core::time::Duration::from_secs(100),
+            parsed,
+            None,
+            &mut reply,
+        );
+
+        assert_eq!(engine.keepalive.len(), 4, "table stays at capacity");
+        assert!(
+            !engine.keepalive.contains_key(&mac(10)),
+            "the least-recently-heard neighbor must be evicted"
+        );
+        assert!(
+            engine.keepalive.contains_key(&mac(20)),
+            "the new neighbor must be admitted"
+        );
+    }
+
+    /// `produce_keepalive` writes the minimal 2-byte packet with the correct
+    /// type tag and version.
+    #[test]
+    fn produce_keepalive_writes_minimal_packet() {
+        let engine = BatmanEngine::<4>::new(mac(1));
+        let mut buf = [0xffu8; 64];
+        let produced = engine
+            .produce_keepalive(&mut buf)
+            .expect("buffer is plenty");
+        assert_eq!(produced.len(), 2);
+        assert_eq!(produced[0], crate::wire::BATADV_KEEPALIVE);
+        assert_eq!(produced[1], 5);
+    }
+
+    /// A buffer too small for the (2-byte) header yields `None` rather than
+    /// panicking or writing a truncated packet.
+    #[test]
+    fn produce_keepalive_none_when_buffer_too_small() {
+        let engine = BatmanEngine::<4>::new(mac(1));
+        let mut buf = [0u8; 1];
+        assert_eq!(engine.produce_keepalive(&mut buf), None);
     }
 }

@@ -227,6 +227,7 @@ async fn fetch(conn: &mut Client, app: &mut App) -> anyhow::Result<()> {
     app.snapshot.node_info = Some(conn.node_info().await?);
     app.snapshot.routing = conn.routing_table().await?;
     app.snapshot.link_quality = conn.link_quality_table().await?;
+    app.snapshot.keepalive = conn.keepalive_table().await?;
     app.snapshot.ogm_schedule = conn.ogm_schedule().await?;
     app.snapshot.throughput = conn.throughput().await?;
     app.snapshot.metrics = Some(conn.node_metrics().await?);

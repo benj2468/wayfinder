@@ -60,6 +60,16 @@ message GetMetricsRequest {}
 // the per-originator verification/expiry/revocation state.  An empty request.
 message GetSecurityStatusRequest {}
 
+// Request the current per-neighbor keep-alive heartbeat liveness table.
+// Returns a KeepAliveTable response with one entry per neighbor this node has
+// heard at least one heartbeat from — the direct-link liveness signal used to
+// deprioritize (not evict) a route relayed through a neighbor that has gone
+// quiet, faster than OGM-interval staleness alone would notice. A neighbor
+// never heard from at all has no entry (opt-in by observation), so this
+// table's emptiness does not distinguish "no keep-alive-enabled neighbors"
+// from "none have ever sent one yet".
+message GetKeepAliveTableRequest {}
+
 // The security posture of one originator, as this node sees it.
 message NodeSecurity {
   // The originator's node MAC (raw bytes).
@@ -188,6 +198,20 @@ message LinkFeatures {
   // Accept data-plane traffic (unicast, multicast, and broadcast) arriving on
   // this link (to deliver, forward, or bridge).  False drops inbound data.
   optional bool rx_data = 5;
+
+  // Send keep-alive heartbeats on this link, if present. Unlike the plain
+  // bool flags above this needs a third state alongside "leave unchanged"
+  // (the field absent) and "on" (a cadence), so it is a oneof rather than an
+  // optional scalar: absent leaves the current schedule as it is, disabled
+  // tears it down, and interval_ms arms (or re-arms) it at that cadence.
+  oneof tx_keepalive_update {
+    // Disable keep-alive transmission on this link.
+    bool tx_keepalive_disabled = 6;
+
+    // Arm (or re-arm) keep-alive transmission on this link at this cadence,
+    // in milliseconds.
+    uint64 tx_keepalive_interval_ms = 7;
+  }
 }
 
 // The node's live-editable runtime configuration.  Each field is
@@ -347,6 +371,9 @@ message WayfinderRequest {
 
     // Apply a partial update to the node's runtime configuration.
     SetConfigRequest set_config = 17;
+
+    // Query the per-neighbor keep-alive heartbeat liveness table.
+    GetKeepAliveTableRequest get_keepalive_table = 18;
   }
 }
 
@@ -454,6 +481,36 @@ message LinkQualityTable {
   // All known (neighbor, interface) pairs.  Empty if the router has not
   // yet received any frames with measurable metrics.
   repeated LinkQualityEntry entries = 1;
+}
+
+// A single row in the per-neighbor keep-alive heartbeat liveness table,
+// evaluated as of the moment of the request.
+message KeepAliveEntry {
+  // Raw bytes of the neighbor this row describes.  Same encoding as
+  // NodeInfo.node_id.
+  bytes neighbor_id = 1;
+
+  // Milliseconds elapsed since this neighbor's last heard heartbeat.
+  uint64 ms_since_last_heard = 2;
+
+  // The learned heartbeat cadence, in milliseconds.  Zero until a second
+  // heartbeat has provided a real gap to measure.
+  uint64 interval_estimate_ms = 3;
+
+  // Whether this neighbor has missed its keep-alive budget: its heartbeat
+  // has not been refreshed within the miss-budget multiple of its learned
+  // (or seeded) cadence.  This is the signal the router uses to deprioritize
+  // — not evict — a route relayed through this neighbor.
+  bool missed = 4;
+}
+
+// Snapshot of the full keep-alive liveness table at the time of the request.
+message KeepAliveTable {
+  // One entry per neighbor this node has heard at least one heartbeat from.
+  // Empty if none has (yet), which is indistinguishable here from no
+  // neighbor running keep-alives at all — the opt-in-by-observation
+  // contract described on GetKeepAliveTableRequest.
+  repeated KeepAliveEntry entries = 1;
 }
 
 // The adaptive OGM emission schedule for a single mesh interface.  OGM
@@ -821,5 +878,8 @@ message WayfinderResponse {
     // Response to ListPendingCsrsRequest.  (ApproveCsr and DenyCsr answer with
     // the Empty response above.)
     ListPendingCsrsResponse list_pending_csrs = 14;
+
+    // Response to GetKeepAliveTableRequest.
+    KeepAliveTable keepalive_table = 15;
   }
 }

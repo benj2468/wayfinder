@@ -249,6 +249,33 @@ pub fn poll_due_ogms(
     }
 }
 
+/// Emit a keep-alive heartbeat for each interface whose fixed-cadence timer
+/// is due as of `now` (advancing that timer), each addressed to its one
+/// interface via [`Egress::Iface`]. Unlike [`poll_due_ogms`] there is no
+/// poll-time feature check to make: an interface's keep-alive timer only
+/// exists (is `Some`) once `configure_interface_keepalive` armed it from that
+/// link's `tx_keepalive` config, so "due" already implies "opted in."
+pub fn poll_due_keepalives(
+    router: &mut CentralRouter,
+    now: Duration,
+    tx_buffer: &mut [u8],
+    sink: &mut impl MeshSink,
+) {
+    // Each emission advances exactly one interface's timer, so the set of due
+    // interfaces shrinks every pass and the loop terminates.
+    while let Some(idx) = router.due_keepalive_interface(now) {
+        if let Some(f) = router.poll_keepalive(tx_buffer) {
+            sink.emit(OutgoingFrame {
+                dst: f.dst,
+                protocol: f.protocol,
+                payload: f.payload,
+                egress: Egress::Iface(idx),
+            });
+        }
+        router.on_keepalive_emitted(idx, now);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -442,6 +469,55 @@ mod tests {
             router.due_interface(now).is_none(),
             "timer still advanced so the poll loop terminates"
         );
+    }
+
+    /// A due interface produces exactly one keep-alive per
+    /// `poll_due_keepalives`, addressed to that interface (`Egress::Iface`).
+    #[test]
+    fn poll_due_keepalives_emits_one_heartbeat_per_due_interface() {
+        let mut router = CentralRouter::new(mac(1));
+        router.configure_interface_keepalive(0, Some(Duration::from_secs(1)), Duration::ZERO);
+
+        let mut now = Duration::ZERO;
+        while router.due_keepalive_interface(now).is_none() && now < Duration::from_secs(60) {
+            now += Duration::from_millis(100);
+        }
+        assert!(
+            router.due_keepalive_interface(now).is_some(),
+            "interface never came due"
+        );
+
+        let mut tx = [0u8; wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN];
+        let mut sink = CaptureSink::default();
+        poll_due_keepalives(&mut router, now, &mut tx, &mut sink);
+
+        assert_eq!(sink.mesh.len(), 1, "one due interface => one heartbeat");
+        let hb = &sink.mesh[0];
+        assert_eq!(hb.dst, Mac::BROADCAST);
+        assert_eq!(hb.protocol, DEFAULT_BATMAN_ETHER_TYPE);
+        assert_eq!(hb.egress, Egress::Iface(0));
+        assert!(sink.local.is_empty());
+    }
+
+    /// An interface with no keep-alive configured never appears from
+    /// `due_keepalive_interface`, so `poll_due_keepalives` emits nothing for
+    /// it — opt-in, unlike the always-armed OGM Trickle timer.
+    #[test]
+    fn poll_due_keepalives_is_noop_when_no_interface_configured() {
+        let mut router = CentralRouter::new(mac(1));
+        // No `configure_interface_keepalive` call at all.
+
+        let mut tx = [0u8; wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN];
+        let mut sink = CaptureSink::default();
+        poll_due_keepalives(
+            &mut router,
+            Duration::from_secs(1_000_000),
+            &mut tx,
+            &mut sink,
+        );
+
+        assert!(sink.mesh.is_empty());
+        assert!(sink.local.is_empty());
     }
 
     /// A frame with an unknown protocol is dropped by the engine, so

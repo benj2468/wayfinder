@@ -5,7 +5,7 @@ use interfaces::frame::Mac;
 use interfaces::link::LinkMetrics;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use wayfinder::features::LinkFeatures;
+use wayfinder::features::{KeepAliveConfig, LinkFeatures};
 
 /// A 6-byte mesh MAC address — the identifier every wayfinder node, route,
 /// and frame destination is keyed on.
@@ -48,8 +48,11 @@ impl PyMac {
 }
 
 /// Per-link participation gates: one send/receive gate for each of the OGM
-/// (topology) and data planes. Mirrors `wayfinder::features::LinkFeatures`;
-/// every flag defaults to `True` (full participation).
+/// (topology) and data planes, plus the keep-alive heartbeat's transmit
+/// cadence. Mirrors `wayfinder::features::LinkFeatures`; every bool flag
+/// defaults to `True` (full participation), `tx_keepalive_interval_ms`
+/// defaults to `None` (keep-alive transmission off — opt-in, since it's a new
+/// traffic class rather than part of the historical baseline).
 #[pyclass(module = "wayfinder_py", from_py_object)]
 #[derive(Clone, Copy)]
 pub struct PyLinkFeatures {
@@ -65,19 +68,34 @@ pub struct PyLinkFeatures {
     /// Receive data-plane traffic on this link.
     #[pyo3(get, set)]
     pub rx_data: bool,
+    /// Send keep-alive heartbeats on this link at this cadence, in
+    /// milliseconds. `None` (the default) disables keep-alive transmission
+    /// entirely for this link — a neighbor never heard sending one is never
+    /// penalized for its silence. Reception of keep-alives is always accepted
+    /// regardless of this setting.
+    #[pyo3(get, set)]
+    pub tx_keepalive_interval_ms: Option<u64>,
 }
 
 #[pymethods]
 impl PyLinkFeatures {
-    /// Build a feature set; every flag defaults to full participation.
+    /// Build a feature set; every bool flag defaults to full participation
+    /// and `tx_keepalive_interval_ms` defaults to `None` (off).
     #[new]
-    #[pyo3(signature = (tx_ogm=true, rx_ogm=true, tx_data=true, rx_data=true))]
-    fn new(tx_ogm: bool, rx_ogm: bool, tx_data: bool, rx_data: bool) -> Self {
+    #[pyo3(signature = (tx_ogm=true, rx_ogm=true, tx_data=true, rx_data=true, tx_keepalive_interval_ms=None))]
+    fn new(
+        tx_ogm: bool,
+        rx_ogm: bool,
+        tx_data: bool,
+        rx_data: bool,
+        tx_keepalive_interval_ms: Option<u64>,
+    ) -> Self {
         Self {
             tx_ogm,
             rx_ogm,
             tx_data,
             rx_data,
+            tx_keepalive_interval_ms,
         }
     }
 }
@@ -89,6 +107,9 @@ impl From<PyLinkFeatures> for LinkFeatures {
             rx_ogm: f.rx_ogm,
             tx_data: f.tx_data,
             rx_data: f.rx_data,
+            tx_keepalive: f
+                .tx_keepalive_interval_ms
+                .map(|interval_ms| KeepAliveConfig { interval_ms }),
         }
     }
 }

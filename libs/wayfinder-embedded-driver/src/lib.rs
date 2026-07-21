@@ -35,7 +35,8 @@ use wayfinder::interfaces::frame::{LinkFrameData, MAX_LINK_FRAME_LEN, Mac};
 use wayfinder::link::LinkT;
 use wayfinder::{CentralRouter, EgressInterface, MAX_INTERFACES};
 use wayfinder_driver_core::{
-    Egress, MeshSink, OutgoingFrame, handle_mesh_frame, poll_due_ogms, tag_directed_into,
+    Egress, MeshSink, OutgoingFrame, handle_mesh_frame, poll_due_keepalives, poll_due_ogms,
+    tag_directed_into,
 };
 
 /// A monotonic clock plus an async delay — the one piece of platform the driver
@@ -175,7 +176,16 @@ impl<L: LinkT, C: Clock, const N: usize> Driver<L, C, N> {
         for idx in 0..N {
             let cfg = trickle.get(idx).copied().unwrap_or_default();
             router.configure_interface_ogm(idx, cfg.i_min, cfg.i_max, Duration::ZERO);
-            router.set_link_features(idx, features.get(idx).copied().unwrap_or_default());
+            let link_features = features.get(idx).copied().unwrap_or_default();
+            router.set_link_features(idx, link_features);
+            // Keep-alive rides on the same per-link `features` entry (no
+            // separate constructor parameter) — its `tx_keepalive` supplies
+            // the schedule, `None` leaving that interface's timer unarmed.
+            router.configure_interface_keepalive(
+                idx,
+                link_features.tx_keepalive.map(|c| c.interval()),
+                Duration::ZERO,
+            );
         }
         Self {
             router,
@@ -212,10 +222,13 @@ impl<L: LinkT, C: Clock, const N: usize> Driver<L, C, N> {
     /// the mesh.
     pub async fn run_once(&mut self) {
         let now = self.clock.now();
-        // When the soonest interface is next due to emit an OGM.  Recomputed
-        // every iteration, so a timer reset by the frame just processed shortens
-        // the next sleep automatically.
-        let due = self.router.next_broadcast_after(now);
+        // When the soonest interface is next due to emit an OGM or a
+        // keep-alive.  Recomputed every iteration, so a timer reset by the
+        // frame just processed shortens the next sleep automatically.
+        let due = self
+            .router
+            .next_broadcast_after(now)
+            .min(self.router.next_keepalive_after(now));
 
         // Destructure into disjoint field borrows so the planning step can hold
         // a borrow of `links` (via the recv futures) alongside `router`/`stage`.
@@ -252,8 +265,9 @@ impl<L: LinkT, C: Clock, const N: usize> Driver<L, C, N> {
                 }
             },
             Either::Second(()) => {
-                trace!("polling OGMs");
+                trace!("polling OGMs and keep-alives");
                 poll_due_ogms(router, now, tx_buffer, stage);
+                poll_due_keepalives(router, now, tx_buffer, stage);
             }
         }
 
@@ -320,7 +334,7 @@ async fn dispatch<L: LinkT, const N: usize>(
                 send_on(links, router, iface_idx, mac, &data, now).await;
             }
             // Otherwise let the router's metric-driven egress choice decide.
-            Egress::Auto { exclude } => match router.get_egress_interface(dst) {
+            Egress::Auto { exclude } => match router.get_egress_interface(now, dst) {
                 Some(EgressInterface::All) => {
                     for idx in 0..N {
                         // Split-horizon: skip the interface a re-flood arrived on.

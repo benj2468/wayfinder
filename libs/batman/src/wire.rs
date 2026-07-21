@@ -300,6 +300,27 @@ pub struct BatmanCertReplyPacket {
     pub dest: Mac,
 }
 
+/// `packet_type` for a link-local keep-alive heartbeat. Single-hop only —
+/// never forwarded/relayed, carries no destination or TTL (the link-layer
+/// `frame.src` already identifies the sender). Detects a gone-quiet immediate
+/// neighbor far faster than OGM-interval-based staleness, without affecting
+/// OGM-driven topology discovery at all. Wayfinder-specific, no batman-adv
+/// counterpart.
+pub const BATADV_KEEPALIVE: u8 = 0x07;
+
+/// Header for a [`BATADV_KEEPALIVE`] heartbeat. Deliberately minimal (no
+/// seqno, no origin, no TVLV tail) — it exists purely to prove a link is
+/// still alive between OGMs, so it carries nothing beyond the packet-type
+/// tag and protocol version.
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, PartialEq, Eq)]
+#[repr(C, packed)]
+pub struct BatmanKeepAlivePacket {
+    /// Always [`BATADV_KEEPALIVE`].
+    pub packet_type: u8,
+    /// Protocol version (typically 5), matching every other BATMAN packet.
+    pub version: u8,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +398,7 @@ mod tests {
     fn cert_packet_types_are_stable_and_distinct() {
         assert_eq!(BATADV_CERT_REQ, 0x05);
         assert_eq!(BATADV_CERT_REPLY, 0x06);
+        assert_eq!(BATADV_KEEPALIVE, 0x07);
         let all = [
             BATADV_IV_OGM,
             BATADV_BCAST,
@@ -384,12 +406,27 @@ mod tests {
             BATADV_MCAST,
             BATADV_CERT_REQ,
             BATADV_CERT_REPLY,
+            BATADV_KEEPALIVE,
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
                 assert_ne!(a, b, "packet types must be distinct");
             }
         }
+    }
+
+    /// `BatmanKeepAlivePacket` round-trips through `zerocopy` parsing like
+    /// every other minimal control packet.
+    #[test]
+    fn keepalive_packet_roundtrips() {
+        let pkt = BatmanKeepAlivePacket {
+            packet_type: BATADV_KEEPALIVE,
+            version: 5,
+        };
+        let (parsed, _) = BatmanKeepAlivePacket::ref_from_prefix(pkt.as_bytes()).unwrap();
+        assert_eq!(parsed.packet_type, BATADV_KEEPALIVE);
+        assert_eq!(parsed.version, 5);
+        assert_eq!(core::mem::size_of::<BatmanKeepAlivePacket>(), 2);
     }
 
     /// `BatmanCertReqPacket`/`BatmanCertReplyPacket` are structurally identical

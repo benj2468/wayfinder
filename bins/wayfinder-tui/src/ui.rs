@@ -422,11 +422,13 @@ fn render_ogm_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
 /// application on top of the mesh uses to judge the health and shape of the
 /// surrounding network.
 fn render_metrics(frame: &mut Frame, app: &mut App, area: Rect) {
-    // Size the per-interface table to its rows (header + borders + one line per
-    // interface, at least one body line) so the throughput history chart gets
-    // all the remaining vertical space.
+    // Size the per-interface and keep-alive tables to their rows (header +
+    // borders + one line per entry, at least one body line) so the
+    // throughput history chart gets all the remaining vertical space.
     let iface_rows = app.snapshot.throughput.interfaces.len().max(1) as u16;
     let table_height = iface_rows + 3;
+    let ka_rows = app.snapshot.keepalive.entries.len().max(1) as u16;
+    let ka_height = ka_rows + 3;
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -434,12 +436,70 @@ fn render_metrics(frame: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(16),           // node metrics summary
             Constraint::Min(8),               // throughput history chart
             Constraint::Length(table_height), // per-interface throughput table
+            Constraint::Length(ka_height),    // keep-alive liveness table
         ])
         .split(area);
 
     render_node_metrics(frame, app, rows[0]);
     render_throughput_chart(frame, app, rows[1]);
     render_throughput(frame, app, rows[2]);
+    render_keepalive_table(frame, app, rows[3]);
+}
+
+/// Draw the per-neighbor keep-alive heartbeat liveness table: the direct-link
+/// signal (see the root CLAUDE.md's Metrics section) that lets an operator
+/// see a link degrade — still OGM-fresh via a relayed path, but its direct
+/// heartbeat has lapsed — before it shows up only as a route switching away.
+/// Read-only (no row selection): a glanceable status table, not one an
+/// operator acts on a specific row of.
+fn render_keepalive_table(frame: &mut Frame, app: &App, area: Rect) {
+    let header = Row::new(["Neighbor", "Since heard", "Interval", "Missed"])
+        .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = app
+        .snapshot
+        .keepalive
+        .entries
+        .iter()
+        .map(|e| {
+            let missed_style = if e.missed {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            Row::new(vec![
+                Cell::from(format_id(&e.neighbor_id)),
+                Cell::from(fmt_interval(
+                    e.ms_since_last_heard.min(u32::MAX as u64) as u32
+                )),
+                Cell::from(fmt_interval(
+                    e.interval_estimate_ms.min(u32::MAX as u64) as u32
+                )),
+                Cell::from(Span::styled(
+                    if e.missed { "yes" } else { "no" },
+                    missed_style,
+                )),
+            ])
+        })
+        .collect();
+
+    let title = format!(
+        " Keep-Alive Liveness ({}) ",
+        app.snapshot.keepalive.entries.len()
+    );
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(18),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(8),
+        ],
+    )
+    .header(header)
+    .block(Block::default().borders(Borders::ALL).title(title));
+
+    frame.render_widget(table, area);
 }
 
 /// Draw the node-wide throughput history as a two-line chart: one line for the
@@ -1089,6 +1149,14 @@ mod tests {
             cert_reply_rate: 1.5,
             ..Default::default()
         });
+        app.snapshot.keepalive = wayfinder_protos::wayfinder_v1alpha::KeepAliveTable {
+            entries: vec![wayfinder_protos::wayfinder_v1alpha::KeepAliveEntry {
+                neighbor_id: vec![0, 0, 0, 0, 0, 2],
+                ms_since_last_heard: 4200,
+                interval_estimate_ms: 1000,
+                missed: true,
+            }],
+        };
         terminal
             .draw(|frame| render(frame, &mut app))
             .expect("draw with metrics");
@@ -1116,6 +1184,11 @@ mod tests {
             text.contains("Cert reply rate"),
             "cert-reply-rate row missing"
         );
+        assert!(
+            text.contains("Keep-Alive Liveness"),
+            "keep-alive panel title missing"
+        );
+        assert!(text.contains("yes"), "missed keep-alive flag not rendered");
     }
 
     /// The Security tab shows the provider CSR panel only when the connected node

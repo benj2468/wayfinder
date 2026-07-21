@@ -25,15 +25,15 @@ use prost::Message;
 use tokio::net::{TcpStream, UnixDatagram};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use wayfinder_protos::wayfinder_v1alpha::{
-    ApproveCsrRequest, DenyCsrRequest, GetLinkQualityTableRequest, GetMetricsRequest,
-    GetNodeInfoRequest, GetOgmScheduleRequest, GetRoutingTableRequest, GetSecurityStatusRequest,
-    GetSecurityStatusResponse, GetThroughputRequest, GetTrustAnchorRequest, GetTrustAnchorResponse,
-    LinkFeatures, LinkQualityTable, ListCertsRequest, ListCertsResponse, ListPendingCsrsRequest,
-    ListPendingCsrsResponse, NodeInfo, NodeMetrics, OgmSchedule, ResolveRouteRequest,
-    ResolveRouteResponse, RevokeNodeRequest, RoutingTable, RuntimeConfig, SetAuthRequest,
-    SetConfigRequest, SubmitCsrRequest, SubmitCsrResponse, Throughput, TrickleConfig,
-    WayfinderRequest, WayfinderResponse, wayfinder_request::Request as RequestKind,
-    wayfinder_response::Response as ResponseKind,
+    ApproveCsrRequest, DenyCsrRequest, GetKeepAliveTableRequest, GetLinkQualityTableRequest,
+    GetMetricsRequest, GetNodeInfoRequest, GetOgmScheduleRequest, GetRoutingTableRequest,
+    GetSecurityStatusRequest, GetSecurityStatusResponse, GetThroughputRequest,
+    GetTrustAnchorRequest, GetTrustAnchorResponse, KeepAliveTable, LinkFeatures, LinkQualityTable,
+    ListCertsRequest, ListCertsResponse, ListPendingCsrsRequest, ListPendingCsrsResponse, NodeInfo,
+    NodeMetrics, OgmSchedule, ResolveRouteRequest, ResolveRouteResponse, RevokeNodeRequest,
+    RoutingTable, RuntimeConfig, SetAuthRequest, SetConfigRequest, SubmitCsrRequest,
+    SubmitCsrResponse, Throughput, TrickleConfig, WayfinderRequest, WayfinderResponse,
+    wayfinder_request::Request as RequestKind, wayfinder_response::Response as ResponseKind,
 };
 
 /// Where to reach a node's management API: a TCP `host:port` or a Unix-datagram
@@ -185,6 +185,17 @@ impl Client {
         {
             ResponseKind::LinkQualityTable(table) => Ok(table),
             other => Err(unexpected("LinkQualityTable", &other)),
+        }
+    }
+
+    /// Query the per-neighbor keep-alive heartbeat liveness table.
+    pub async fn keepalive_table(&mut self) -> anyhow::Result<KeepAliveTable> {
+        match self
+            .request(RequestKind::GetKeepaliveTable(GetKeepAliveTableRequest {}))
+            .await?
+        {
+            ResponseKind::KeepaliveTable(table) => Ok(table),
+            other => Err(unexpected("KeepaliveTable", &other)),
         }
     }
 
@@ -472,6 +483,7 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
         ResponseKind::NodeInfo(_) => "NodeInfo",
         ResponseKind::RoutingTable(_) => "RoutingTable",
         ResponseKind::LinkQualityTable(_) => "LinkQualityTable",
+        ResponseKind::KeepaliveTable(_) => "KeepaliveTable",
         ResponseKind::ResolveRoute(_) => "ResolveRoute",
         ResponseKind::OgmSchedule(_) => "OgmSchedule",
         ResponseKind::Throughput(_) => "Throughput",

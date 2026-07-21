@@ -2,12 +2,12 @@ use crate::wayfinder_v1alpha::Empty;
 use crate::wayfinder_v1alpha::{
     AllInterfacesEgress, CsrIssued, CsrPending, CsrRejected, ErrorResponse,
     GetSecurityStatusResponse, GetTrustAnchorResponse, InterfaceThroughput, IssuedCert,
-    LinkQualityEntry, LinkQualityTable, ListCertsResponse, ListPendingCsrsResponse, NeighborPath,
-    NodeInfo, NodeMetrics, NodeSecurity, OgmSchedule, OgmScheduleEntry, PendingCsr,
-    ResolveRouteResponse, RoutingEntry, RoutingTable, SubmitCsrResponse, TableOccupancy,
-    Throughput, WayfinderRequest, WayfinderResponse, resolve_route_response::Egress as EgressKind,
-    submit_csr_response::Outcome as CsrOutcomeKind, wayfinder_request::Request as RequestKind,
-    wayfinder_response::Response as ResponseKind,
+    KeepAliveEntry, KeepAliveTable, LinkQualityEntry, LinkQualityTable, ListCertsResponse,
+    ListPendingCsrsResponse, NeighborPath, NodeInfo, NodeMetrics, NodeSecurity, OgmSchedule,
+    OgmScheduleEntry, PendingCsr, ResolveRouteResponse, RoutingEntry, RoutingTable,
+    SubmitCsrResponse, TableOccupancy, Throughput, WayfinderRequest, WayfinderResponse,
+    resolve_route_response::Egress as EgressKind, submit_csr_response::Outcome as CsrOutcomeKind,
+    wayfinder_request::Request as RequestKind, wayfinder_response::Response as ResponseKind,
 };
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -51,6 +51,21 @@ pub struct LinkQualityEntryData {
     pub ewma_quality: u32,
     /// Number of samples folded into the EWMA.
     pub sample_count: u32,
+}
+
+/// Intermediate representation of one row in the keep-alive liveness table,
+/// returned by [`WayfinderDataProvider::keepalive_table`].
+#[derive(Clone)]
+pub struct KeepAliveEntryData {
+    /// Neighbor this row describes.
+    pub neighbor_id: Vec<u8>,
+    /// Milliseconds elapsed since this neighbor's last heard heartbeat.
+    pub ms_since_last_heard: u64,
+    /// The learned heartbeat cadence, in milliseconds; zero until a second
+    /// heartbeat has provided a real gap to measure.
+    pub interval_estimate_ms: u64,
+    /// Whether this neighbor has missed its keep-alive budget.
+    pub missed: bool,
 }
 
 /// Intermediate representation of one interface's adaptive OGM emission
@@ -103,6 +118,12 @@ pub struct LinkFeaturesData {
     /// Accept data-plane traffic (unicast/multicast/broadcast) on this link, if
     /// present.
     pub rx_data: Option<bool>,
+    /// Send keep-alive heartbeats on this link, if present: the outer
+    /// `Option` is "leave unchanged" (`None`) vs. "override" (`Some`); the
+    /// inner `Option<u64>` is the override itself — `None` disables
+    /// transmission, `Some(interval_ms)` arms (or re-arms) it at that
+    /// cadence.
+    pub tx_keepalive: Option<Option<u64>>,
 }
 
 /// Intermediate representation of a partial runtime-configuration update,
@@ -271,6 +292,9 @@ pub trait WayfinderDataProvider {
     fn routing_table(&self) -> Vec<RoutingEntryData>;
     /// Snapshot of the per-(neighbor, interface) link-quality table.
     fn link_quality_table(&self) -> Vec<LinkQualityEntryData>;
+    /// Snapshot of the per-neighbor keep-alive heartbeat liveness table,
+    /// evaluated as of the moment of the call.
+    fn keepalive_table(&self) -> Vec<KeepAliveEntryData>;
     /// Snapshot of the per-interface adaptive OGM emission schedule (the
     /// current OGM publish rate per interface and its backoff bounds).
     fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData>;
@@ -625,12 +649,33 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                         rx_ogm: f.rx_ogm,
                         tx_data: f.tx_data,
                         rx_data: f.rx_data,
+                        tx_keepalive: f.tx_keepalive_update.map(|u| match u {
+                            crate::wayfinder_v1alpha::link_features::TxKeepaliveUpdate::TxKeepaliveDisabled(_) => None,
+                            crate::wayfinder_v1alpha::link_features::TxKeepaliveUpdate::TxKeepaliveIntervalMs(ms) => {
+                                Some(ms)
+                            }
+                        }),
                     }),
                 };
                 match self.provider.set_config(config) {
                     Ok(_) => ResponseKind::Empty(Empty {}),
                     Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
                 }
+            }
+
+            Some(RequestKind::GetKeepaliveTable(_)) => {
+                let entries = self
+                    .provider
+                    .keepalive_table()
+                    .into_iter()
+                    .map(|e| KeepAliveEntry {
+                        neighbor_id: e.neighbor_id,
+                        ms_since_last_heard: e.ms_since_last_heard,
+                        interval_estimate_ms: e.interval_estimate_ms,
+                        missed: e.missed,
+                    })
+                    .collect();
+                ResponseKind::KeepaliveTable(KeepAliveTable { entries })
             }
 
             Some(RequestKind::GetTrustAnchor(_)) => match self.provider.get_trust_anchor() {
@@ -735,6 +780,7 @@ mod tests {
     #[derive(Default)]
     struct MockProvider {
         link_quality: Vec<LinkQualityEntryData>,
+        keepalive: Vec<KeepAliveEntryData>,
         ogm_schedule: Vec<OgmScheduleEntryData>,
         throughput: Vec<InterfaceThroughputData>,
         node_metrics: NodeMetricsData,
@@ -761,6 +807,9 @@ mod tests {
         }
         fn link_quality_table(&self) -> Vec<LinkQualityEntryData> {
             self.link_quality.clone()
+        }
+        fn keepalive_table(&self) -> Vec<KeepAliveEntryData> {
+            self.keepalive.clone()
         }
         fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData> {
             self.ogm_schedule.clone()
@@ -1221,6 +1270,7 @@ mod tests {
             ResponseKind::NodeInfo(_) => "NodeInfo",
             ResponseKind::RoutingTable(_) => "RoutingTable",
             ResponseKind::LinkQualityTable(_) => "LinkQualityTable",
+            ResponseKind::KeepaliveTable(_) => "KeepaliveTable",
             ResponseKind::ResolveRoute(_) => "ResolveRoute",
             ResponseKind::OgmSchedule(_) => "OgmSchedule",
             ResponseKind::Throughput(_) => "Throughput",

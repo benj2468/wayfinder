@@ -87,6 +87,7 @@ class Simulation:
         self._link_iface: dict[int, dict[str, int]] = {}
         node_interfaces: dict[str, dict[int, Link]] = {name: {} for name in names}
         node_trickle: dict[str, list[tuple[int, int]]] = {name: [] for name in names}
+        node_keepalive: dict[str, list[int | None]] = {name: [] for name in names}
         for link in self._links:
             for endpoint in link.endpoints:
                 iface = len(node_trickle[endpoint])
@@ -98,6 +99,12 @@ class Simulation:
                     else node_by_name[endpoint].trickle
                 )
                 node_trickle[endpoint].append(trickle)
+                keepalive = (
+                    link.tx_keepalive_interval_ms
+                    if link.tx_keepalive_interval_ms is not None
+                    else node_by_name[endpoint].tx_keepalive_interval_ms
+                )
+                node_keepalive[endpoint].append(keepalive)
 
         # A pair of node names -> the (possibly shared-LAN) Link joining
         # them, for `sample_channel`'s probing.
@@ -113,7 +120,11 @@ class Simulation:
                 if node.mac is not None
                 else wf.PyMac(bytes((*_AUTO_MAC_OUI, idx)))
             )
-            driver = wf.PyDriver(mac, node_trickle[node.name])
+            features = [
+                wf.PyLinkFeatures(tx_keepalive_interval_ms=ka)
+                for ka in node_keepalive[node.name]
+            ]
+            driver = wf.PyDriver(mac, node_trickle[node.name], features)
             tick_interval_ms = node.tick_interval_ms
             if tick_interval_ms is None:
                 i_mins = [t[0] for t in node_trickle[node.name]] or [node.trickle[0]]

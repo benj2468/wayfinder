@@ -52,6 +52,31 @@ const SIG_LEN: usize = 64;
 /// never be confused with one over any other message type.
 const SIG_DOMAIN: &[u8] = b"wf-ogm-sig-v1";
 
+/// Domain-separation prefix bound into the keep-alive signature, distinct from
+/// [`SIG_DOMAIN`] so a keep-alive signature can never be confused with (or
+/// replayed as) an OGM signature over the same bytes.
+const KEEPALIVE_SIG_DOMAIN: &[u8] = b"wf-keepalive-sig-v1";
+
+/// Width, in seconds, of the coarse time bucket a keep-alive signs over.
+/// Keep-alives carry no sequence number ([`batman::wire::BatmanKeepAlivePacket`]
+/// is deliberately minimal), so this — together with
+/// [`KEEPALIVE_TOLERANCE_BUCKETS`] — bounds how long a captured, genuinely
+/// signed heartbeat can be replayed to fake a since-silenced neighbor's
+/// liveness, without needing per-neighbor replay counters. Checked against the
+/// same wall clock ([`OgmAuth::now_unix`]) cert-validity checks already rely
+/// on, so this adds no new cross-node clock-sync assumption.
+const KEEPALIVE_BUCKET_SECS: u64 = 30;
+
+/// How many buckets into the past a keep-alive's signed bucket remains
+/// acceptable (beyond the current one), absorbing clock skew and network
+/// jitter near a bucket boundary. Total replay window:
+/// `(KEEPALIVE_TOLERANCE_BUCKETS + 1) * KEEPALIVE_BUCKET_SECS`.
+const KEEPALIVE_TOLERANCE_BUCKETS: u64 = 1;
+
+/// Length of the trailer [`OgmAuth::augment_keepalive`] appends: an 8-byte
+/// big-endian time bucket followed by the 64-byte signature.
+const KEEPALIVE_TRAILER_LEN: usize = 8 + SIG_LEN;
+
 /// Length of the directed-frame authentication trailer appended to unicast and
 /// multicast frames when auth is enabled: an 8-byte big-endian replay counter
 /// followed by the 16-byte pairwise tag.
@@ -878,6 +903,101 @@ impl OgmAuth {
         OgmVerdict::Verified
     }
 
+    /// Build the canonical signed message for a keep-alive: a domain prefix,
+    /// this node's MAC, and the coarse time bucket ([`KEEPALIVE_BUCKET_SECS`]).
+    /// Mirrors [`signed_message`](Self::signed_message)'s shape but with its
+    /// own domain separator and no cert — the receiver checks the signature
+    /// against its neighbor cache instead of a cert carried on the wire (see
+    /// [`verify_keepalive`](Self::verify_keepalive)). Returns the filled
+    /// prefix of `out`.
+    fn keepalive_signed_message<'a>(
+        src: &[u8; 6],
+        bucket: &[u8; 8],
+        out: &'a mut [u8],
+    ) -> Option<&'a [u8]> {
+        let total = KEEPALIVE_SIG_DOMAIN.len() + src.len() + bucket.len();
+        let buf = out.get_mut(..total)?;
+        let (a, rest) = buf.split_at_mut(KEEPALIVE_SIG_DOMAIN.len());
+        a.copy_from_slice(KEEPALIVE_SIG_DOMAIN);
+        let (b, c) = rest.split_at_mut(src.len());
+        b.copy_from_slice(src);
+        c.copy_from_slice(bucket);
+        Some(&out[..total])
+    }
+
+    /// Append a signed liveness trailer to a keep-alive heartbeat the engine
+    /// has just built in `buf[..len]`: an 8-byte coarse time bucket and a
+    /// 64-byte Ed25519 signature over it and this node's own MAC. Unlike
+    /// [`augment_ogm`](Self::augment_ogm), no cert or fingerprint is attached
+    /// — a keep-alive is only ever exchanged with a neighbor whose OGM (and
+    /// thus cert) this node has already verified and cached, and
+    /// [`verify_keepalive`](Self::verify_keepalive) checks against that cache
+    /// rather than identity carried on the wire, so resending it on every
+    /// heartbeat would be pure overhead. Returns `None` if `buf` lacks room
+    /// for the trailer.
+    pub fn augment_keepalive(&mut self, buf: &mut [u8], len: usize) -> Option<usize> {
+        let src = self.cert.node_mac;
+        let bucket = (self.now_unix / KEEPALIVE_BUCKET_SECS).to_be_bytes();
+        let signature = {
+            let signed = Self::keepalive_signed_message(&src, &bucket, &mut self.sign_scratch)?;
+            self.keypair.sign(signed)
+        };
+        let new_len = len.checked_add(KEEPALIVE_TRAILER_LEN)?;
+        if new_len > buf.len() {
+            return None;
+        }
+        buf[len..len + 8].copy_from_slice(&bucket);
+        buf[len + 8..new_len].copy_from_slice(&signature);
+        Some(new_len)
+    }
+
+    /// Verify an incoming keep-alive's [`augment_keepalive`] trailer, claimed
+    /// to be from `src`. Checks, in order: the signed time bucket is within
+    /// [`KEEPALIVE_TOLERANCE_BUCKETS`] of now (bounding replay of a captured,
+    /// genuinely-signed heartbeat); `src`'s cert is cached (from a
+    /// previously-verified OGM — a neighbor never OGM-verified fails closed,
+    /// the same as an unresolvable OGM fingerprint) and has not expired on
+    /// this node's clock; `src` is not revoked; and the signature itself.
+    /// Returns `true` only if every check passes.
+    pub fn verify_keepalive(&mut self, src: Mac, payload: &[u8]) -> bool {
+        let Some(trailer_start) = payload.len().checked_sub(KEEPALIVE_TRAILER_LEN) else {
+            tracing::trace!("auth: dropping keep-alive shorter than its auth trailer");
+            return false;
+        };
+        let trailer = &payload[trailer_start..];
+        let mut bucket_bytes = [0u8; 8];
+        bucket_bytes.copy_from_slice(&trailer[..8]);
+        let bucket = u64::from_be_bytes(bucket_bytes);
+        let now_bucket = self.now_unix / KEEPALIVE_BUCKET_SECS;
+        if bucket > now_bucket || now_bucket - bucket > KEEPALIVE_TOLERANCE_BUCKETS {
+            tracing::trace!("auth: dropping keep-alive with an out-of-window time bucket");
+            return false;
+        }
+        let Some(neighbor) = self.neighbors.iter().find(|n| n.cert.mac == src).copied() else {
+            tracing::trace!("auth: dropping keep-alive from an unverified neighbor");
+            return false;
+        };
+        if self.now_unix > neighbor.cert.not_after {
+            tracing::trace!("auth: dropping keep-alive whose cached cert has expired");
+            return false;
+        }
+        if self.is_revoked(&src.0) {
+            tracing::trace!("auth: dropping keep-alive from a revoked neighbor");
+            return false;
+        }
+        let mut signature = [0u8; SIG_LEN];
+        signature.copy_from_slice(&trailer[8..KEEPALIVE_TRAILER_LEN]);
+        let signed_ok =
+            match Self::keepalive_signed_message(&src.0, &bucket_bytes, &mut self.sign_scratch) {
+                Some(signed) => verify_signature(&neighbor.cert.ed_pubkey, signed, &signature),
+                None => false,
+            };
+        if !signed_ok {
+            tracing::trace!("auth: dropping keep-alive with an invalid signature");
+        }
+        signed_ok
+    }
+
     /// On a fingerprint miss/mismatch for `orig` (an [`OgmVerdict::NeedCert`]),
     /// decide whether to (re)send a `CertReq` now, and if so, write its
     /// self-authenticating body — this node's own cert followed by an
@@ -1162,7 +1282,7 @@ impl OgmAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use batman::wire::{BATADV_IV_OGM, BatmanOgmPacket};
+    use batman::wire::{BATADV_IV_OGM, BATADV_KEEPALIVE, BatmanKeepAlivePacket, BatmanOgmPacket};
     use wayfinder_auth::Authority;
 
     fn mac(n: u8) -> Mac {
@@ -1186,6 +1306,20 @@ mod tests {
         let mut buf = [0u8; 512];
         buf[..OGM_HDR].copy_from_slice(ogm.as_bytes());
         (buf, OGM_HDR)
+    }
+
+    /// Build a bare keep-alive body (header only, no auth trailer) into a fresh
+    /// buffer, returning `(buf, len)` with generous trailing capacity for
+    /// augmentation.
+    fn bare_keepalive() -> ([u8; 128], usize) {
+        let pkt = BatmanKeepAlivePacket {
+            packet_type: BATADV_KEEPALIVE,
+            version: 5,
+        };
+        let mut buf = [0u8; 128];
+        let len = core::mem::size_of::<BatmanKeepAlivePacket>();
+        buf[..len].copy_from_slice(pkt.as_bytes());
+        (buf, len)
     }
 
     /// An authority and a member node's auth state, sharing the same anchor.
@@ -1697,6 +1831,147 @@ mod tests {
             !a.verify_directed(mac(3), frame, &trailer),
             "an A->B frame must not verify as a B->A frame"
         );
+    }
+
+    /// A keep-alive signed by a node whose OGM the receiver has already
+    /// verified (and thus cached the cert for) verifies, with no cert or
+    /// fingerprint carried on the wire.
+    #[test]
+    fn keepalive_signature_verifies_for_cached_neighbor() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+
+        let (mut buf, len) = bare_keepalive();
+        let len = a.augment_keepalive(&mut buf, len).expect("augment");
+
+        assert!(b.verify_keepalive(mac(2), &buf[..len]));
+    }
+
+    /// A tampered keep-alive signature fails verification.
+    #[test]
+    fn keepalive_tampered_signature_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+
+        let (mut buf, len) = bare_keepalive();
+        let len = a.augment_keepalive(&mut buf, len).unwrap();
+        buf[len - 1] ^= 0xff; // flip a signature byte
+        assert!(!b.verify_keepalive(mac(2), &buf[..len]));
+    }
+
+    /// A keep-alive from a neighbor whose OGM has never been verified (so no
+    /// cert is cached for it) is rejected — fails closed rather than trusting
+    /// an unverifiable claim.
+    #[test]
+    fn keepalive_from_unverified_neighbor_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        // No OGM exchange: b has not cached a's cert.
+
+        let (mut buf, len) = bare_keepalive();
+        let len = a.augment_keepalive(&mut buf, len).unwrap();
+        assert!(!b.verify_keepalive(mac(2), &buf[..len]));
+    }
+
+    /// A keep-alive from a revoked neighbor is dropped even with a valid
+    /// signature over a still-cached cert.
+    #[test]
+    fn keepalive_from_revoked_neighbor_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+        let record = authority.revoke(mac(2), 0, 1000);
+        assert!(b.ingest_revocation(&record));
+
+        let (mut buf, len) = bare_keepalive();
+        let len = a.augment_keepalive(&mut buf, len).unwrap();
+        assert!(!b.verify_keepalive(mac(2), &buf[..len]));
+    }
+
+    /// A keep-alive is rejected once the sender's cached cert has expired on
+    /// the verifier's clock, even though the signed time bucket is still
+    /// within the replay-tolerance window — cert expiry and bucket freshness
+    /// are independent checks.
+    #[test]
+    fn keepalive_with_expired_cached_cert_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 131); // cert expires shortly after signing
+        let mut b = member(&authority, 3, mac(3), 1_000_000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+
+        let (mut buf, len) = bare_keepalive(); // a signs at now_unix = 100
+        let len = a.augment_keepalive(&mut buf, len).unwrap();
+
+        b.set_time(140); // one bucket later (within tolerance), past a's not_after = 131
+        assert!(!b.verify_keepalive(mac(2), &buf[..len]));
+    }
+
+    /// A keep-alive signed one bucket in the past is still accepted — the
+    /// tolerance window absorbs normal clock skew and network jitter near a
+    /// bucket boundary.
+    #[test]
+    fn keepalive_bucket_within_tolerance_accepted() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1_000_000);
+        let mut b = member(&authority, 3, mac(3), 1_000_000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+
+        let (mut buf, len) = bare_keepalive(); // a signs at now_unix = 100
+        let len = a.augment_keepalive(&mut buf, len).unwrap();
+
+        b.set_time(100 + KEEPALIVE_BUCKET_SECS);
+        assert!(b.verify_keepalive(mac(2), &buf[..len]));
+    }
+
+    /// A keep-alive signed further in the past than the tolerance window is
+    /// rejected — this bounds how long a captured, genuinely-signed heartbeat
+    /// can be replayed to fake a since-silenced neighbor's liveness.
+    #[test]
+    fn keepalive_bucket_beyond_tolerance_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1_000_000);
+        let mut b = member(&authority, 3, mac(3), 1_000_000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+
+        let (mut buf, len) = bare_keepalive();
+        let len = a.augment_keepalive(&mut buf, len).unwrap();
+
+        b.set_time(100 + KEEPALIVE_BUCKET_SECS * 2);
+        assert!(!b.verify_keepalive(mac(2), &buf[..len]));
+    }
+
+    /// A keep-alive claiming a time bucket newer than the verifier's own
+    /// clock is rejected rather than accepted early.
+    #[test]
+    fn keepalive_future_bucket_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1_000_000);
+        let mut b = member(&authority, 3, mac(3), 1_000_000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+
+        a.set_time(1000); // a's clock is far ahead of b's
+        let (mut buf, len) = bare_keepalive();
+        let len = a.augment_keepalive(&mut buf, len).unwrap();
+        // b is still at now_unix = 100
+        assert!(!b.verify_keepalive(mac(2), &buf[..len]));
+    }
+
+    /// Augmentation fails closed (rather than truncating) when the buffer has
+    /// no room for the trailer.
+    #[test]
+    fn keepalive_augment_none_when_buffer_too_small() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut buf = [0u8; 4]; // header + far too little room for the trailer
+        buf[0] = BATADV_KEEPALIVE;
+        buf[1] = 5;
+        assert!(a.augment_keepalive(&mut buf, 2).is_none());
     }
 
     /// Verifying a neighbor's OGM caches its raw certificate bytes (not just the

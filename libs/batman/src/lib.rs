@@ -59,6 +59,41 @@ pub const MAX_MISSED_OGMS: u32 = 6;
 /// settles into); this constant only applies in its absence.
 pub const DEFAULT_OGM_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How many *expected* keep-alive intervals an immediate neighbor may go
+/// without a heartbeat before [`BatmanEngine::next_hop`] deprioritizes every
+/// path relayed through it. Smaller than [`MAX_MISSED_OGMS`] because
+/// keep-alives exist specifically to react faster than OGM-interval staleness
+/// — three tolerates two consecutive drops on a lossy link (so one missed
+/// heartbeat doesn't flap a route) while still reacting in a few seconds
+/// rather than the minutes an OGM-interval timeout can take in steady state.
+pub const MAX_MISSED_KEEPALIVES: u32 = 3;
+
+/// Fallback expected keep-alive interval used to seed a freshly-heard
+/// neighbor's miss budget before a second heartbeat provides a real gap to
+/// measure, and whenever no interface has a keep-alive schedule configured.
+/// Mirrors [`DEFAULT_OGM_INTERVAL`]'s role for the OGM path.
+pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Per-neighbor keep-alive liveness, tracked only for neighbors this engine
+/// has actually heard a heartbeat from at least once — a neighbor with no
+/// entry here is never treated as having missed anything (see
+/// [`BatmanEngine::keepalive_missed`]), so a peer/link not running this
+/// feature is never penalized for silence.
+#[derive(Debug, Clone)]
+pub struct KeepAliveStats {
+    /// Monotonic engine clock at the moment the most recent keep-alive from
+    /// this neighbor was received.
+    pub last_heard: Duration,
+    /// Slow-decaying peak hold of the wall-clock interval between successive
+    /// keep-alives from this neighbor — the same technique as
+    /// [`NeighborStats::interval_estimate`], for the same reason: it tracks
+    /// the *slowest* cadence this neighbor settles into rather than an
+    /// average, so a burst of closely-spaced heartbeats doesn't shrink the
+    /// miss budget below the neighbor's real configured rate. Zero until a
+    /// second heartbeat gives a first gap to measure.
+    pub interval_estimate: Duration,
+}
+
 /// Track metrics for a specific path to an originator via a specific immediate neighbor
 #[derive(Debug, Clone)]
 pub struct NeighborStats {
@@ -185,6 +220,20 @@ pub struct BatmanEngine<const MAX_ORIGINATORS: usize> {
     /// supplies its own `i_min`/`i_max`, so a fast link and a slow link back off
     /// independently.  Empty until the owning driver configures its interfaces.
     pub ogm_timers: HVec<TrickleTimer, MAX_INTERFACES>,
+    /// Per-neighbor keep-alive liveness, populated only once a heartbeat has
+    /// actually been heard from that neighbor (see [`KeepAliveStats`] and
+    /// [`BatmanEngine::keepalive_missed`]). Bounded like `originator_table`;
+    /// a newly-heard neighbor evicts the least-recently-heard entry when full.
+    pub keepalive: FnvIndexMap<Mac, KeepAliveStats, MAX_ORIGINATORS>,
+    /// Per-interface fixed-cadence keep-alive emission schedules, indexed by
+    /// interface index. `None` (the default for every slot) means that
+    /// interface never transmits keep-alives — opt-in per
+    /// [`configure_interface_keepalive`](Self::configure_interface_keepalive),
+    /// unlike [`ogm_timers`](Self::ogm_timers) which is always armed. Kept in
+    /// its own bank, separate from `ogm_timers`, so an OGM-driven topology
+    /// change ([`reset_ogm_timers`](Self::reset_ogm_timers)) never resets a
+    /// keep-alive schedule — the two are independent signals.
+    pub keepalive_timers: HVec<Option<TrickleTimer>, MAX_INTERFACES>,
     /// Latched whenever this engine's view of the topology changes (a new
     /// originator, a changed best next hop, a changed multicast membership, or a
     /// purged route).  Consumed at the end of OGM processing and of
@@ -220,6 +269,8 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
             local_mcast: HVec::new(),
             mcast_members: HVec::new(),
             ogm_timers: HVec::new(),
+            keepalive: FnvIndexMap::new(),
+            keepalive_timers: HVec::new(),
             topology_changed: false,
             relay_oversize_drops: 0,
         }

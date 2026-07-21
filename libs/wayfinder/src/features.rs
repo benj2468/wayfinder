@@ -11,18 +11,58 @@
 //! [`config`]: crate::config
 //! [`CentralRouter`]: crate::CentralRouter
 
+/// One link's keep-alive heartbeat cadence.  Carried on
+/// [`LinkFeatures::tx_keepalive`] rather than as a separate `Driver`
+/// constructor parameter, so it rides along on the per-link config/features
+/// plumbing that already exists instead of adding a parallel one.
+// `deny_unknown_fields` turns a misspelled key (e.g. `intervall_ms`) into a
+// hard parse error rather than a silent fall-back to the default cadence —
+// the same reasoning `LinkFeatures` documents for its own use of this
+// attribute.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "alloc", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "alloc", serde(default, deny_unknown_fields))]
+pub struct KeepAliveConfig {
+    /// The heartbeat period, in milliseconds.
+    pub interval_ms: u64,
+}
+
+impl KeepAliveConfig {
+    /// Default keep-alive cadence (5 s) used when a `tx_keepalive: {}` block
+    /// omits `interval_ms`.
+    pub const fn default_interval_ms() -> u64 {
+        5_000
+    }
+
+    /// This cadence as a [`core::time::Duration`].
+    pub fn interval(&self) -> core::time::Duration {
+        core::time::Duration::from_millis(self.interval_ms)
+    }
+}
+
+impl Default for KeepAliveConfig {
+    fn default() -> Self {
+        Self {
+            interval_ms: Self::default_interval_ms(),
+        }
+    }
+}
+
 /// Per-link participation capabilities: one **send** gate and one **receive**
 /// gate for each of the two planes — the OGM control plane (topology) and the
-/// data plane (unicast, multicast, and broadcast lumped together).  Each flag is
-/// an independent switch on how *this node* takes part in the mesh over *this one
-/// link*; the two ends of a link may be configured asymmetrically (a LoRa edge
-/// node may [`tx_ogm`](Self::tx_ogm) while a ground station fronting that same
-/// mesh does not).
+/// data plane (unicast, multicast, and broadcast lumped together) — plus the
+/// keep-alive heartbeat's transmit schedule.  Each flag is an independent
+/// switch on how *this node* takes part in the mesh over *this one link*; the
+/// two ends of a link may be configured asymmetrically (a LoRa edge node may
+/// [`tx_ogm`](Self::tx_ogm) while a ground station fronting that same mesh
+/// does not).
 ///
-/// Every flag **defaults to `true`** — a link with no `features:` block, or one
-/// that names only the flags it flips, is a fully participating link (the
-/// historical behavior).  A link that turns some off participates partially.
-/// Some illustrative shapes:
+/// Every **bool** flag defaults to `true` — a link with no `features:` block,
+/// or one that names only the flags it flips, is a fully participating link
+/// (the historical behavior). [`tx_keepalive`](Self::tx_keepalive) is the one
+/// exception: it defaults to `None` (off), since keep-alives are a new,
+/// opt-in traffic class rather than part of the historical baseline. A link
+/// that turns some off participates partially. Some illustrative shapes:
 ///
 /// - **ground station fronting a LoRa mesh (reachable)**: only `tx_ogm: false` —
 ///   hears the edge nodes' OGMs (so they stay visible *and reachable*, since
@@ -73,6 +113,14 @@ pub struct LinkFeatures {
     /// link: accept it to deliver locally, forward onward, or bridge onto other
     /// links.  `false` drops inbound data before the engine sees it.
     pub rx_data: bool,
+    /// Send keep-alive heartbeats on this link at the given cadence. `None`
+    /// (the default) disables keep-alive transmission entirely — the
+    /// graceful-degradation default, since a neighbor never heard sending one
+    /// is never penalized for its silence (see
+    /// `BatmanEngine::keepalive_missed`). Reception of keep-alives is always
+    /// accepted regardless of this setting — it costs nothing to observe one
+    /// opportunistically, so there is no matching `rx_keepalive` gate.
+    pub tx_keepalive: Option<KeepAliveConfig>,
 }
 
 impl Default for LinkFeatures {
@@ -82,6 +130,7 @@ impl Default for LinkFeatures {
             rx_ogm: true,
             tx_data: true,
             rx_data: true,
+            tx_keepalive: None,
         }
     }
 }

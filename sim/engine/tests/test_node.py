@@ -16,3 +16,13 @@ def test_node_accepts_custom_mobility_and_trickle():
     assert n.mobility is mobility
     assert n.trickle == (50, 500)
     assert n.tick_interval_ms == 10
+
+
+def test_node_keepalive_defaults_to_disabled():
+    n = Node("gcsa")
+    assert n.tx_keepalive_interval_ms is None
+
+
+def test_node_accepts_custom_keepalive_interval():
+    n = Node("drone", tx_keepalive_interval_ms=1000)
+    assert n.tx_keepalive_interval_ms == 1000

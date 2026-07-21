@@ -162,7 +162,16 @@ impl<Local: FrameIo> Driver<Local> {
         for idx in 0..interfaces.len() {
             let cfg = trickle.get(idx).copied().unwrap_or_default();
             router.configure_interface_ogm(idx, cfg.i_min(), cfg.i_max(), Duration::ZERO);
-            router.set_link_features(idx, features.get(idx).copied().unwrap_or_default());
+            let link_features = features.get(idx).copied().unwrap_or_default();
+            router.set_link_features(idx, link_features);
+            // Keep-alive rides on the same per-link `features` entry (no
+            // separate constructor vector) — its `tx_keepalive` supplies the
+            // schedule, `None` leaving that interface's timer unarmed.
+            router.configure_interface_keepalive(
+                idx,
+                link_features.tx_keepalive.map(|c| c.interval()),
+                Duration::ZERO,
+            );
         }
         Self {
             local,
@@ -256,12 +265,17 @@ impl<Local: FrameIo> Driver<Local> {
         // Advance the auth clock from the loop's `now` (see `refresh_auth_clock`).
         self.refresh_auth_clock(now);
 
-        // When the soonest interface is next due to emit an OGM, on the tokio
-        // clock.  Each interface backs off (Trickle) on its own schedule, so the
-        // periodic arm sleeps until whichever fires first.  Recomputed every
-        // iteration, so a timer reset by the frame just processed (an
-        // inconsistency) shortens the next sleep automatically.
-        let next_due = self.router.next_broadcast_after(now);
+        // When the soonest interface is next due to emit an OGM or a
+        // keep-alive, on the tokio clock.  Each interface backs off (Trickle)
+        // on its own OGM schedule and ticks its own independent fixed-cadence
+        // keep-alive schedule, so the periodic arm sleeps until whichever
+        // fires first, of either kind.  Recomputed every iteration, so a
+        // timer reset by the frame just processed (an inconsistency) shortens
+        // the next sleep automatically.
+        let next_due = self
+            .router
+            .next_broadcast_after(now)
+            .min(self.router.next_keepalive_after(now));
 
         // Destructure into disjoint field borrows so the `select!` can hold a
         // mutable borrow of the interfaces alongside the router and buffers.
@@ -306,7 +320,7 @@ impl<Local: FrameIo> Driver<Local> {
                     trace!(len, "host device rx frame");
                     let eth = &rx_buffer[..len];
                     LoopOutput {
-                        mesh: plan_host_frame(router, snooper, eth, tx_buffer),
+                        mesh: plan_host_frame(now, router, snooper, eth, tx_buffer),
                         local: None,
                     }
                 },
@@ -317,11 +331,11 @@ impl<Local: FrameIo> Driver<Local> {
                     LoopOutput::none()
                 },
                 _ = sleep(next_due), if check_periodic => {
-                    trace!("polling OGMs");
-                    LoopOutput {
-                        mesh: poll_due_ogms(router, now, tx_buffer),
-                        local: None,
-                    }
+                    trace!("polling OGMs and keep-alives");
+                    let mut out = LoopOutput::none();
+                    wayfinder_driver_core::poll_due_ogms(router, now, tx_buffer, &mut out);
+                    wayfinder_driver_core::poll_due_keepalives(router, now, tx_buffer, &mut out);
+                    out
                 }
             }
         };
@@ -338,6 +352,7 @@ impl<Local: FrameIo> Driver<Local> {
     pub async fn inject_host_frame(&mut self, eth: &[u8]) -> anyhow::Result<()> {
         let now = self.start.elapsed();
         let mesh = plan_host_frame(
+            now,
             &mut self.router,
             &mut self.snooper,
             eth,
@@ -373,6 +388,25 @@ impl<Local: FrameIo> Driver<Local> {
         .await
     }
 
+    /// Drive one *per-interface* keep-alive tick at instant `now`: emit a
+    /// heartbeat for each interface whose fixed-cadence timer is due
+    /// (advancing that timer), the keep-alive counterpart of
+    /// [`poll_due`](Self::poll_due).
+    pub async fn poll_due_keepalive(&mut self, now: Duration) -> anyhow::Result<()> {
+        self.refresh_auth_clock(now);
+        let mesh = poll_due_keepalives(&mut self.router, now, &mut self.tx_buffer);
+        let output = LoopOutput { mesh, local: None };
+        dispatch(
+            &self.local,
+            &mut self.interfaces,
+            &mut self.router,
+            self.mac,
+            now,
+            output,
+        )
+        .await
+    }
+
     /// Drain every already-pending event — host frames, mesh frames, and
     /// management queries — in non-blocking sweeps until nothing remains.
     ///
@@ -395,6 +429,7 @@ impl<Local: FrameIo> Driver<Local> {
                 progressed = true;
                 let eth = self.rx_buffer[..len].to_vec();
                 let mesh = plan_host_frame(
+                    self.start.elapsed(),
                     &mut self.router,
                     &mut self.snooper,
                     &eth,
@@ -475,6 +510,21 @@ fn poll_due_ogms(
     out.mesh
 }
 
+/// Produce a keep-alive heartbeat for each interface that is due to emit as
+/// of `now`, addressed to that one interface. Thin `std`-side wrapper that
+/// stages the shared core's
+/// [`poll_due_keepalives`](wayfinder_driver_core::poll_due_keepalives) output
+/// into an owned [`Vec`].
+fn poll_due_keepalives(
+    router: &mut CentralRouter,
+    now: Duration,
+    tx_buffer: &mut [u8],
+) -> Vec<OutgoingFrame> {
+    let mut out = LoopOutput::none();
+    wayfinder_driver_core::poll_due_keepalives(router, now, tx_buffer, &mut out);
+    out.mesh
+}
+
 /// Process one received link-layer frame into a unit of work, folding the
 /// carrier's physical-layer `metrics` into the engine's link-quality table.
 /// Thin `std`-side wrapper that stages the shared core's
@@ -508,6 +558,7 @@ fn handle_mesh_frame(
 /// `BATADV_MCAST` copy per interested node.  IGMP is snooped first so the
 /// groups the host joins/leaves are announced on the next OGM.
 fn plan_host_frame(
+    now: Duration,
     router: &mut CentralRouter,
     snooper: &mut McastSnooper,
     eth: &[u8],
@@ -528,7 +579,7 @@ fn plan_host_frame(
 
     // Locally originated frames flood out every interface (no ingress to omit).
     let flood = |router: &mut CentralRouter, mesh: &mut Vec<OutgoingFrame>, buf: &mut [u8]| {
-        if let Ok(f) = router.handle_local(Mac::BROADCAST, eth, buf) {
+        if let Ok(f) = router.handle_local(now, Mac::BROADCAST, eth, buf) {
             mesh.push(OutgoingFrame {
                 dst: f.dst,
                 protocol: f.protocol,
@@ -545,7 +596,7 @@ fn plan_host_frame(
             McastPlan::Unicast => {
                 let targets: Vec<Mac> = router.mcast_targets(dst).collect();
                 for target in targets {
-                    if let Ok(f) = router.handle_local_mcast(target, eth, tx_buffer) {
+                    if let Ok(f) = router.handle_local_mcast(now, target, eth, tx_buffer) {
                         mesh.push(OutgoingFrame {
                             dst: f.dst,
                             protocol: f.protocol,
@@ -557,7 +608,7 @@ fn plan_host_frame(
             }
             McastPlan::Flood => flood(router, &mut mesh, tx_buffer),
         }
-    } else if let Ok(f) = router.handle_local(dst, eth, tx_buffer) {
+    } else if let Ok(f) = router.handle_local(now, dst, eth, tx_buffer) {
         mesh.push(OutgoingFrame {
             dst: f.dst,
             protocol: f.protocol,
@@ -639,7 +690,7 @@ async fn dispatch<Local: FrameIo>(
                 }
             }
             // Otherwise let the router's metric-driven egress choice decide.
-            Egress::Auto { exclude } => match router.get_egress_interface(dst) {
+            Egress::Auto { exclude } => match router.get_egress_interface(now, dst) {
                 Some(EgressInterface::All) => {
                     for (idx, iface) in interfaces.iter_mut().enumerate() {
                         // Split-horizon: skip the interface a re-flood arrived on.

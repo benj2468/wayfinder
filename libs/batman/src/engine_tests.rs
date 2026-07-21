@@ -1801,6 +1801,168 @@ mod route_expiry {
     }
 }
 
+mod keepalive_deprioritization {
+    use core::time::Duration;
+
+    use super::*;
+
+    /// Feed one OGM for originator `orig` arriving via immediate neighbor
+    /// `via` at virtual instant `now` (mirrors `route_expiry::feed_ogm`).
+    fn feed_ogm(
+        engine: &mut BatmanEngine<8>,
+        orig: u8,
+        via: u8,
+        seqno: u32,
+        tq: u8,
+        now: Duration,
+    ) {
+        let ogm = make_ogm(orig, seqno, tq, 50);
+        let frame = make_link_frame(via, 0xff, ETH_P_BATMAN, ogm);
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        engine.handle_rx(now, parse_link_frame(&frame), None, &mut reply);
+    }
+
+    /// Feed one keep-alive heartbeat from immediate neighbor `via` at `now`.
+    fn feed_keepalive(engine: &mut BatmanEngine<8>, via: u8, now: Duration) {
+        let pkt = crate::wire::BatmanKeepAlivePacket {
+            packet_type: crate::wire::BATADV_KEEPALIVE,
+            version: 5,
+        };
+        use zerocopy::IntoBytes;
+        let frame = make_link_frame(via, 0xff, ETH_P_BATMAN, pkt.as_bytes().to_vec());
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        engine.handle_rx(now, parse_link_frame(&frame), None, &mut reply);
+    }
+
+    /// `next_hop` prefers a live, lower-TQ alternate path over a higher-TQ
+    /// path whose relaying neighbor has missed its keep-alive budget — the
+    /// feature's core promise. The *cached* `lookup_route`/`max_tq`/
+    /// `best_next_hop` are deliberately left untouched (the same asymmetry
+    /// `path_stale` already has versus the cache), so this test locks in
+    /// both halves of that asymmetry.
+    #[test]
+    fn next_hop_prefers_live_alternate_over_higher_tq_missed_keepalive_path() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        // Originator 9 reachable via neighbor 2 (TQ 255) and neighbor 3 (TQ 100).
+        feed_ogm(&mut engine, 9, 2, 1, 255, Duration::ZERO);
+        feed_ogm(&mut engine, 9, 3, 1, 100, Duration::ZERO);
+        // Arm keep-alive tracking for neighbor 2 with a 1s learned cadence;
+        // neighbor 3 never sends keep-alives at all (opt-in by observation).
+        feed_keepalive(&mut engine, 2, Duration::ZERO);
+        feed_keepalive(&mut engine, 2, Duration::from_secs(1));
+
+        // Before any miss, the higher-TQ via-2 path still wins.
+        assert_eq!(
+            engine.next_hop(Duration::from_secs(1), mac(9)),
+            Some(mac(2))
+        );
+
+        // Advance well past neighbor 2's keep-alive budget (3 * 1s = 3s) while
+        // its OGM path is still otherwise fresh (well within the OGM budget).
+        let t = Duration::from_secs(5);
+        assert_eq!(
+            engine.next_hop(t, mac(9)),
+            Some(mac(3)),
+            "a missed keep-alive must lose to a live alternate even with lower raw TQ"
+        );
+
+        // The cached fields are untouched by the keep-alive overlay — only
+        // the time-aware `next_hop` sees the deprioritization.
+        assert_eq!(engine.lookup_route(mac(9)), Some(mac(2)));
+        let r = &engine.originator_table[&mac(9)];
+        assert_eq!(r.best_next_hop, mac(2));
+        // 255 minus the per-hop OGM penalty (10) applied in `handle_ogm`.
+        assert_eq!(r.max_tq, 245);
+    }
+
+    /// When every path to a destination has missed its keep-alive budget (or
+    /// never had one armed), `next_hop` still returns the best of them rather
+    /// than `None` — a keep-alive miss deprioritizes, it never evicts.
+    /// Eviction remains `path_stale`/`purge_stale`'s job alone.
+    #[test]
+    fn next_hop_returns_missed_path_when_it_is_the_only_one() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        feed_ogm(&mut engine, 9, 2, 1, 255, Duration::ZERO);
+        feed_keepalive(&mut engine, 2, Duration::ZERO);
+        feed_keepalive(&mut engine, 2, Duration::from_secs(1));
+
+        // Past the keep-alive budget (3 * 1s = 3s since t=1) but within the
+        // (much longer, 6 * 1s = 6s since t=0) OGM staleness budget, so
+        // `path_stale` alone would not have evicted this path yet.
+        let t = Duration::from_secs(5);
+        assert_eq!(engine.next_hop(t, mac(9)), Some(mac(2)));
+    }
+}
+
+mod keepalive_timers {
+    use core::time::Duration;
+
+    use super::*;
+
+    /// An interface that is never configured for keep-alive never appears as
+    /// due, at any instant — opt-in per interface, unlike the always-armed
+    /// OGM Trickle timer.
+    #[test]
+    fn unconfigured_interface_never_due() {
+        let engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        assert_eq!(engine.due_keepalive_interface(Duration::ZERO), None);
+        assert_eq!(
+            engine.due_keepalive_interface(Duration::from_secs(1_000_000)),
+            None
+        );
+    }
+
+    /// Once configured with `Some(interval)`, repeated emission never grows
+    /// the schedule past the configured interval — unlike the OGM Trickle
+    /// timer's doubling backoff, a keep-alive fires at a fixed cadence.
+    #[test]
+    fn fixed_cadence_never_backs_off() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        let interval = Duration::from_secs(5);
+        engine.configure_interface_keepalive(0, Some(interval), Duration::ZERO);
+
+        for _ in 0..10 {
+            engine.on_keepalive_emitted(0, Duration::ZERO);
+        }
+        let next = engine.next_keepalive_after(Duration::ZERO);
+        assert!(
+            next <= interval,
+            "keep-alive cadence must never back off past its configured interval, got {next:?}"
+        );
+    }
+
+    /// `reset_ogm_timers` (fired on every OGM-driven topology change) must
+    /// never disturb the independent keep-alive schedule — the two timer
+    /// banks are deliberately separate.
+    #[test]
+    fn reset_ogm_timers_does_not_touch_keepalive_timers() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        engine.configure_interface_ogm(
+            0,
+            Duration::from_secs(1),
+            Duration::from_secs(64),
+            Duration::ZERO,
+        );
+        engine.configure_interface_keepalive(0, Some(Duration::from_secs(5)), Duration::ZERO);
+
+        for _ in 0..10 {
+            engine.on_keepalive_emitted(0, Duration::ZERO);
+        }
+        let before = engine.next_keepalive_after(Duration::ZERO);
+
+        engine.reset_ogm_timers(Duration::ZERO);
+
+        assert_eq!(
+            engine.next_keepalive_after(Duration::ZERO),
+            before,
+            "reset_ogm_timers must not touch the keep-alive timer bank"
+        );
+    }
+}
+
 #[cfg(test)]
 mod adaptive_backoff {
     use core::time::Duration;

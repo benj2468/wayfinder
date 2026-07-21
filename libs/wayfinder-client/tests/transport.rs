@@ -17,8 +17,8 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use wayfinder_client::{Client, ConnectTarget};
 use wayfinder_protos::service::{
-    EgressDecisionData, InterfaceThroughputData, LinkQualityEntryData, NeighborPathData,
-    NodeMetricsData, OgmScheduleEntryData, RouteResolutionData, RoutingEntryData,
+    EgressDecisionData, InterfaceThroughputData, KeepAliveEntryData, LinkQualityEntryData,
+    NeighborPathData, NodeMetricsData, OgmScheduleEntryData, RouteResolutionData, RoutingEntryData,
     RuntimeConfigData, TableOccupancyData, WayfinderDataProvider, WayfinderService,
 };
 use wayfinder_protos::wayfinder_v1alpha::{
@@ -72,6 +72,14 @@ impl WayfinderDataProvider for Mock {
             iface_idx: 0,
             ewma_quality: 200,
             sample_count: 9,
+        }]
+    }
+    fn keepalive_table(&self) -> Vec<KeepAliveEntryData> {
+        vec![KeepAliveEntryData {
+            neighbor_id: vec![0, 0, 0, 0, 0, 3],
+            ms_since_last_heard: 4200,
+            interval_estimate_ms: 1000,
+            missed: true,
         }]
     }
     fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData> {
@@ -215,6 +223,11 @@ async fn assert_full_roundtrip(client: &mut Client) {
     let links = client.link_quality_table().await.unwrap();
     assert_eq!(links.entries.len(), 1);
     assert_eq!(links.entries[0].ewma_quality, 200);
+
+    let keepalive = client.keepalive_table().await.unwrap();
+    assert_eq!(keepalive.entries.len(), 1);
+    assert_eq!(keepalive.entries[0].interval_estimate_ms, 1000);
+    assert!(keepalive.entries[0].missed);
 
     let schedule = client.ogm_schedule().await.unwrap();
     assert_eq!(schedule.entries[0].current_interval_ms, 4000);

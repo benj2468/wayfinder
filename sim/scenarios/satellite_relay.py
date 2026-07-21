@@ -82,6 +82,14 @@ ORBIT_PERIOD_S = 120.0
 
 GROUND_RADIO_MAX_RANGE_M = 700.0  # the low drone's telemetry radio's hard range limit
 TRICKLE_MS = (200, 2000)  # (i_min_ms, i_max_ms) — fast enough to track the flight
+# The ground link's keep-alive cadence: OGM-interval staleness alone gives
+# this link a MAX_MISSED_OGMS(6) x up-to-i_max(2000ms) = ~12s grace period
+# after it physically dies (the low drone flying past GROUND_RADIO_MAX_RANGE_M)
+# before the route is even eligible to fail over — at SPEED_M_S=20, that's
+# ~200m+ of flight with a dead direct link still "active". A keep-alive at
+# the Trickle floor (matching i_min) with MAX_MISSED_KEEPALIVES(3) shrinks
+# that grace to ~3 x 200ms = 600ms (~12m of flight) instead.
+GROUND_RADIO_KEEPALIVE_MS = TRICKLE_MS[0]
 DEFAULT_SAT_TX_POWER_DBM = 30.0  # shows the richest story: 3 distinct dropout windows
 SAT_TX_POWER_SWEEP_DBM = (10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0)
 
@@ -144,7 +152,16 @@ def build_simulation(
     sat_radio = FreeSpacePathLoss(tx_power_dbm=sat_tx_power_dbm)
 
     links = [
-        pair("gcsa", "low", ground_radio),
+        # Keep-alive armed on the ground link specifically: it's the one
+        # with a hard range cutoff (a real "the link just died," not just a
+        # degraded one), so it's the one that benefits from faster-than-OGM
+        # liveness detection.
+        pair(
+            "gcsa",
+            "low",
+            ground_radio,
+            tx_keepalive_interval_ms=GROUND_RADIO_KEEPALIVE_MS,
+        ),
         pair("gcsa", "sat", sat_radio),
         pair("low", "sat", sat_radio),  # the low drone's satellite uplink
     ]

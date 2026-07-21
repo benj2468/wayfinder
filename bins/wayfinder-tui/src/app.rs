@@ -7,8 +7,8 @@ use std::time::Instant;
 use ratatui::widgets::TableState;
 use serde::{Deserialize, Serialize};
 use wayfinder_protos::wayfinder_v1alpha::{
-    GetSecurityStatusResponse, LinkQualityTable, ListPendingCsrsResponse, NodeInfo, NodeMetrics,
-    NodeSecurity, OgmSchedule, RoutingTable, Throughput,
+    GetSecurityStatusResponse, KeepAliveTable, LinkQualityTable, ListPendingCsrsResponse, NodeInfo,
+    NodeMetrics, NodeSecurity, OgmSchedule, RoutingTable, Throughput,
 };
 
 /// The top-level views the TUI cycles between.
@@ -106,6 +106,9 @@ pub struct Snapshot {
     pub routing: RoutingTable,
     /// Link-quality table; empty until first fetch.
     pub link_quality: LinkQualityTable,
+    /// Per-neighbor keep-alive heartbeat liveness table; empty until first
+    /// fetch.
+    pub keepalive: KeepAliveTable,
     /// Per-interface adaptive OGM emission schedule; empty until first fetch.
     pub ogm_schedule: OgmSchedule,
     /// Per-interface throughput rates and node-wide totals; empty until first

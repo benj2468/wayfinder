@@ -41,13 +41,17 @@ class PyMac:
     def __hash__(self) -> int: ...
 
 class PyLinkFeatures:
-    """Per-link participation gates; every flag defaults to full
-    participation."""
+    """Per-link participation gates; every bool flag defaults to full
+    participation. `tx_keepalive_interval_ms` defaults to `None` (keep-alive
+    transmission off — opt-in, since it's a new traffic class rather than
+    part of the historical baseline). Reception of keep-alives is always
+    accepted regardless of this setting."""
 
     tx_ogm: bool
     rx_ogm: bool
     tx_data: bool
     rx_data: bool
+    tx_keepalive_interval_ms: int | None
 
     def __init__(
         self,
@@ -55,6 +59,7 @@ class PyLinkFeatures:
         rx_ogm: bool = True,
         tx_data: bool = True,
         rx_data: bool = True,
+        tx_keepalive_interval_ms: int | None = None,
     ) -> None: ...
 
 class PyLinkMetrics:

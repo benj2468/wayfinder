@@ -21,7 +21,8 @@ use clap::{Parser, Subcommand};
 use wayfinder_auth::Keypair;
 use wayfinder_client::{Client, ConnectTarget};
 use wayfinder_protos::wayfinder_v1alpha::{
-    CsrIssued, LinkFeatures, submit_csr_response::Outcome as CsrOutcome,
+    CsrIssued, LinkFeatures, link_features::TxKeepaliveUpdate,
+    submit_csr_response::Outcome as CsrOutcome,
 };
 
 use crate::output::OutputFormat;
@@ -63,6 +64,8 @@ pub enum Command {
     Routes,
     /// The per-(neighbor, interface) link-quality table.
     Links,
+    /// The per-neighbor keep-alive heartbeat liveness table.
+    Keepalive,
     /// The per-interface adaptive OGM emission schedule.
     OgmSchedule,
     /// Per-interface and node-wide throughput estimates.
@@ -97,8 +100,11 @@ pub enum Command {
     /// Override one interface's participation features at runtime. Each flag is
     /// optional (`--tx-ogm true|false`, etc.): omit it to leave that gate
     /// unchanged, so you can flip one capability without restating the others.
-    /// Applied in memory only — it does not persist across a restart. `--iface`
-    /// must refer to an interface the node already has configured.
+    /// `--tx-keepalive-interval-ms`/`--tx-keepalive-disable` behave the same
+    /// way but are mutually exclusive with each other (a cadence to arm, or a
+    /// bare disable). Applied in memory only — it does not persist across a
+    /// restart. `--iface` must refer to an interface the node already has
+    /// configured.
     SetLinkFeatures {
         /// Index of the interface to reconfigure, in registration order.
         #[arg(long)]
@@ -116,6 +122,16 @@ pub enum Command {
         /// Accept data-plane traffic (unicast/multicast/broadcast) on this link.
         #[arg(long)]
         rx_data: Option<bool>,
+        /// Arm (or re-arm) keep-alive heartbeat transmission on this link at
+        /// this cadence, in milliseconds. Mutually exclusive with
+        /// `--tx-keepalive-disable`; omit both to leave the schedule
+        /// unchanged.
+        #[arg(long)]
+        tx_keepalive_interval_ms: Option<u64>,
+        /// Disable keep-alive heartbeat transmission on this link. Mutually
+        /// exclusive with `--tx-keepalive-interval-ms`.
+        #[arg(long)]
+        tx_keepalive_disable: bool,
     },
     /// Switch lazy cert distribution on or off at runtime. Applied in memory
     /// only — it does not persist across a restart. A flag-day, wire-
@@ -224,6 +240,7 @@ pub async fn run_query(
         Command::NodeInfo => output::node_info(&client.node_info().await?, output)?,
         Command::Routes => output::routing_table(&client.routing_table().await?, output)?,
         Command::Links => output::link_quality_table(&client.link_quality_table().await?, output)?,
+        Command::Keepalive => output::keepalive_table(&client.keepalive_table().await?, output)?,
         Command::OgmSchedule => output::ogm_schedule(&client.ogm_schedule().await?, output)?,
         Command::Throughput => output::throughput(&client.throughput().await?, output)?,
         Command::Metrics => output::node_metrics(&client.node_metrics().await?, output)?,
@@ -249,7 +266,17 @@ pub async fn run_query(
             rx_ogm,
             tx_data,
             rx_data,
+            tx_keepalive_interval_ms,
+            tx_keepalive_disable,
         } => {
+            let tx_keepalive_update = match (tx_keepalive_disable, tx_keepalive_interval_ms) {
+                (true, Some(_)) => anyhow::bail!(
+                    "--tx-keepalive-disable and --tx-keepalive-interval-ms are mutually exclusive"
+                ),
+                (true, None) => Some(TxKeepaliveUpdate::TxKeepaliveDisabled(true)),
+                (false, Some(ms)) => Some(TxKeepaliveUpdate::TxKeepaliveIntervalMs(ms)),
+                (false, None) => None,
+            };
             client
                 .set_link_features(LinkFeatures {
                     iface_idx: iface,
@@ -257,6 +284,7 @@ pub async fn run_query(
                     rx_ogm,
                     tx_data,
                     rx_data,
+                    tx_keepalive_update,
                 })
                 .await
                 .context("failed to set link features")?;

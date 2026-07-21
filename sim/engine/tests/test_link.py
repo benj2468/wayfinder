@@ -27,3 +27,13 @@ def test_link_rejects_single_endpoint():
 def test_link_rejects_duplicate_endpoints():
     with pytest.raises(ValueError):
         Link(("gcsa", "gcsa"), PerfectWire())
+
+
+def test_link_keepalive_override_defaults_to_unset():
+    link = Link(("gcsa", "drone"), PerfectWire())
+    assert link.tx_keepalive_interval_ms is None
+
+
+def test_link_accepts_custom_keepalive_override():
+    link = Link(("gcsa", "drone"), PerfectWire(), tx_keepalive_interval_ms=1000)
+    assert link.tx_keepalive_interval_ms == 1000
