@@ -22,6 +22,11 @@ use crate::types::{PyEgressInterface, PyLinkFeatures, PyLinkMetrics, PyMac};
 #[pyclass(module = "wayfinder_py")]
 pub struct PyDriver {
     inner: Driver,
+    /// The most recent `now` passed to [`tick`](PyDriver::tick), reused by
+    /// read-only introspection methods (e.g.
+    /// [`get_egress_interface`](PyDriver::get_egress_interface)) that need a
+    /// current time but aren't themselves driven by the simulation step.
+    last_now: Duration,
 }
 
 #[pymethods]
@@ -44,6 +49,7 @@ impl PyDriver {
             .collect();
         Self {
             inner: Driver::new(mac.0, &trickle, &features),
+            last_now: Duration::ZERO,
         }
     }
 
@@ -81,7 +87,8 @@ impl PyDriver {
     /// `now_ms`, and stage the results for `poll_egress`/`poll_local`. Call
     /// once per simulation step.
     fn tick(&mut self, now_ms: u64) {
-        self.inner.tick(Duration::from_millis(now_ms));
+        self.last_now = Duration::from_millis(now_ms);
+        self.inner.tick(self.last_now);
     }
 
     /// Pop the next frame staged for transmission on interface `idx`, if any
@@ -103,7 +110,11 @@ impl PyDriver {
     /// read-only introspection; `tick` already resolves this internally on
     /// the send path.
     fn get_egress_interface(&mut self, dest: PyMac) -> Option<PyEgressInterface> {
-        match self.inner.router_mut().get_egress_interface(dest.0) {
+        match self
+            .inner
+            .router_mut()
+            .get_egress_interface(self.last_now, dest.0)
+        {
             Some(EgressInterface::All) => Some(PyEgressInterface {
                 all: true,
                 interface: None,

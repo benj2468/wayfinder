@@ -21,9 +21,9 @@ pub use wayfinder_auth;
 use batman::{
     BatmanEngine,
     wire::{
-        BATADV_BCAST, BATADV_CERT_REPLY, BATADV_CERT_REQ, BATADV_IV_OGM, BATADV_MCAST,
-        BATADV_UNICAST, BatmanBroadcastPacket, BatmanCertReplyPacket, BatmanCertReqPacket,
-        BatmanMcastPacket, BatmanUnicastPacket, ETH_P_BATMAN,
+        BATADV_BCAST, BATADV_CERT_REPLY, BATADV_CERT_REQ, BATADV_IV_OGM, BATADV_KEEPALIVE,
+        BATADV_MCAST, BATADV_UNICAST, BatmanBroadcastPacket, BatmanCertReplyPacket,
+        BatmanCertReqPacket, BatmanMcastPacket, BatmanUnicastPacket, ETH_P_BATMAN,
     },
 };
 use core::time::Duration;
@@ -95,6 +95,13 @@ pub enum LocalSendError {
 /// BATMAN engine uses to pace OGM emission: an interface index the engine
 /// schedules an OGM for must be one this router also measures, and vice versa.
 pub const MAX_INTERFACES: usize = batman::MAX_INTERFACES;
+
+/// Floor a configured keep-alive interval is clamped to
+/// ([`CentralRouter::configure_interface_keepalive`]) rather than left
+/// arbitrarily close to zero. Chosen well below any realistic operator-chosen
+/// cadence (the default is 5s) so it only bites a degenerate/typo'd config
+/// value, not a legitimately fast one.
+pub const MIN_KEEPALIVE_INTERVAL: core::time::Duration = core::time::Duration::from_millis(100);
 
 /// Capacity of the BATMAN originator (routing) table.  Must be a power of two
 /// (a `heapless` map requirement) and is also the bound on the broadcast-dedup
@@ -239,6 +246,28 @@ pub enum McastPlan {
     /// listeners are known (membership may simply be unlearned) or when more
     /// than [`MCAST_FANOUT`] listeners make flooding cheaper than unicasting.
     Flood,
+}
+
+/// One neighbor's keep-alive liveness as of a caller-supplied instant,
+/// returned by [`CentralRouter::keepalive_table`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeepAliveEntry {
+    /// The neighbor this entry describes.
+    pub neighbor: Mac,
+    /// Milliseconds elapsed since this neighbor's last heard heartbeat, as of
+    /// the instant the table was read.
+    pub ms_since_last_heard: u64,
+    /// The learned heartbeat cadence, in milliseconds — zero until a second
+    /// heartbeat has provided a real gap to measure (see
+    /// `batman::KeepAliveStats::interval_estimate`).
+    pub interval_estimate_ms: u64,
+    /// Whether this neighbor has missed its keep-alive budget
+    /// ([`BatmanEngine::keepalive_missed`](batman::BatmanEngine::keepalive_missed))
+    /// — the signal [`next_hop`](batman::BatmanEngine::next_hop) deprioritizes
+    /// a path relayed through this neighbor on, surfaced here so a degraded-
+    /// but-not-yet-OGM-stale link is directly observable rather than only
+    /// inferable from a route switching away.
+    pub missed: bool,
 }
 
 /// The egress decision returned by [`CentralRouter::get_egress_interface`].
@@ -750,6 +779,24 @@ impl CentralRouter {
                     }
                 }
 
+                // Opt-in control-plane segregation for keep-alives too: when
+                // auth is enabled, a keep-alive whose signature does not
+                // verify against the sender's cached cert (from a previously
+                // verified OGM) is dropped before it can touch the engine's
+                // liveness table. Without this, an unauthenticated keep-alive
+                // let any on-link party bias route selection away from a
+                // spoofed victim neighbor without holding a membership cert —
+                // the same segregation guarantee OGMs already get.
+                if frame.payload.first() == Some(&BATADV_KEEPALIVE)
+                    && let Some(auth) = self.auth.as_mut()
+                    && !auth.verify_keepalive(frame.src, &frame.payload)
+                {
+                    return RxOutcome {
+                        forward: None,
+                        deliver_local: None,
+                    };
+                }
+
                 // If verifying that OGM folded in a *new* revocation, snap the
                 // Trickle timers to i_min so this node re-floods the purge
                 // promptly rather than at its backed-off emission interval.
@@ -1086,6 +1133,7 @@ impl CentralRouter {
     /// [`auth_locked`](CentralRouter::auth_locked).
     pub fn handle_local_mcast<'a>(
         &mut self,
+        now: core::time::Duration,
         dest: Mac,
         payload: &[u8],
         tx_buf: &'a mut [u8],
@@ -1094,7 +1142,7 @@ impl CentralRouter {
             trace!("drop: auth locked, suppressing local multicast egress");
             return Err(LocalSendError::AuthLocked);
         }
-        let next_hop = self.batman.lookup_route(dest).unwrap_or(dest);
+        let next_hop = self.batman.next_hop(now, dest).unwrap_or(dest);
 
         let header = BatmanMcastPacket {
             packet_type: BATADV_MCAST,
@@ -1183,6 +1231,49 @@ impl CentralRouter {
         None
     }
 
+    /// Build a keep-alive heartbeat to emit into `tx_buf`, or `None` if
+    /// suppressed. No `now` needed to build the base heartbeat — a keep-alive
+    /// carries no sequence number on the wire — but when auth is enabled the
+    /// signed trailer's time bucket is drawn from the auth clock
+    /// ([`OgmAuth::set_time`](auth::OgmAuth::set_time)), refreshed
+    /// separately. Like [`poll`](Self::poll), a keep-alive is signed
+    /// ([`OgmAuth::augment_keepalive`](auth::OgmAuth::augment_keepalive))
+    /// when auth is on, verified by peers against the sender's cert cached
+    /// from a prior OGM rather than a cert/fingerprint resent on every
+    /// heartbeat.
+    pub fn poll_keepalive<'tx>(&mut self, tx_buf: &'tx mut [u8]) -> Option<LinkFrameData<'tx>> {
+        // Fail closed, same as `poll`: a locked node originates nothing.
+        if self.auth_locked() {
+            trace!("drop: auth locked, suppressing keep-alive emission");
+            return None;
+        }
+        let Some(len) = self.batman.produce_keepalive(tx_buf).map(|p| p.len()) else {
+            trace!("drop: tx buffer too small for keepalive header");
+            return None;
+        };
+        let final_len = match self.auth.as_mut() {
+            Some(auth) => {
+                let Some(final_len) = auth.augment_keepalive(tx_buf, len) else {
+                    // Never fall back to broadcasting the unsigned keep-alive:
+                    // an auth-enabled peer would reject it, but a node that
+                    // hasn't yet enabled auth would accept it as-is — the same
+                    // fail-open risk `poll` avoids for OGMs.
+                    warn!(
+                        "auth: dropping keep-alive emission — signature augmentation failed (buffer too small?)"
+                    );
+                    return None;
+                };
+                final_len
+            }
+            None => len,
+        };
+        Some(LinkFrameData {
+            dst: Mac::BROADCAST,
+            protocol: DEFAULT_BATMAN_ETHER_TYPE,
+            payload: &tx_buf[..final_len],
+        })
+    }
+
     /// Install (or replace) the adaptive OGM schedule for mesh interface `idx`,
     /// supplying that link's `i_min`/`i_max` at runtime.  Call once per interface
     /// when wiring up the driver; see
@@ -1242,7 +1333,10 @@ impl CentralRouter {
     /// per-frame in [`handle_frame_with_metrics`](Self::handle_frame_with_metrics)
     /// and the transmit gates via [`link_may_tx`](Self::link_may_tx) on each
     /// dispatch, and OGM emission is governed by the always-armed timer plus the
-    /// live `tx_ogm` check — so no timer needs re-arming when a flag flips.
+    /// live `tx_ogm` check — so no timer needs re-arming when that flag flips.
+    /// `tx_keepalive` is the one exception: it *is* re-armed/disarmed here
+    /// against `now`, since (unlike `tx_ogm`) its timer only exists at all
+    /// while a schedule is configured.
     ///
     /// `features` is a full replacement; a caller wanting to flip a single flag
     /// merges its change onto [`link_features(idx)`](Self::link_features) first.
@@ -1250,11 +1344,18 @@ impl CentralRouter {
         &mut self,
         idx: usize,
         features: crate::features::LinkFeatures,
+        now: core::time::Duration,
     ) -> bool {
         if idx >= self.num_interfaces() {
             return false;
         }
         self.set_link_features(idx, features);
+        // Keep the keep-alive timer bank in sync with the new features: a
+        // `tx_keepalive` that changed from `None` to `Some` (or vice versa,
+        // or to a different interval) must re-arm/disarm the timer here, not
+        // just update the stored flag — this is the one piece of a link's
+        // features with its own independent scheduling state to keep current.
+        self.configure_interface_keepalive(idx, features.tx_keepalive.map(|c| c.interval()), now);
         self.runtime_config_active = true;
         true
     }
@@ -1283,6 +1384,53 @@ impl CentralRouter {
         self.batman.on_interface_emitted(idx, now);
     }
 
+    /// Install (or replace) mesh interface `idx`'s keep-alive transmit
+    /// schedule. `interval` of `None` disarms it (that interface never
+    /// transmits keep-alives); `Some` arms a fixed-cadence heartbeat at that
+    /// period, floored to [`MIN_KEEPALIVE_INTERVAL`] — a degenerate
+    /// near-zero config value (e.g. an `interval_ms: 0` typo) would otherwise
+    /// arm a `TrickleTimer` that fires on effectively every tick, flooding
+    /// the link with heartbeats instead of failing loudly.
+    pub fn configure_interface_keepalive(
+        &mut self,
+        idx: usize,
+        interval: Option<core::time::Duration>,
+        now: core::time::Duration,
+    ) {
+        let interval = interval.map(|iv| {
+            if iv < MIN_KEEPALIVE_INTERVAL {
+                warn!(
+                    ?iv,
+                    floor = ?MIN_KEEPALIVE_INTERVAL,
+                    "keep-alive interval below floor, clamping"
+                );
+                MIN_KEEPALIVE_INTERVAL
+            } else {
+                iv
+            }
+        });
+        self.batman
+            .configure_interface_keepalive(idx, interval, now);
+    }
+
+    /// Time until the soonest interface is next due to emit a keep-alive, as
+    /// of `now`.
+    pub fn next_keepalive_after(&self, now: core::time::Duration) -> core::time::Duration {
+        self.batman.next_keepalive_after(now)
+    }
+
+    /// The index of the interface most overdue to emit a keep-alive as of
+    /// `now`, or `None` when none is configured or due.
+    pub fn due_keepalive_interface(&self, now: core::time::Duration) -> Option<usize> {
+        self.batman.due_keepalive_interface(now)
+    }
+
+    /// Record that interface `idx` just emitted a keep-alive at `now`,
+    /// advancing its fixed-cadence schedule.
+    pub fn on_keepalive_emitted(&mut self, idx: usize, now: core::time::Duration) {
+        self.batman.on_keepalive_emitted(idx, now);
+    }
+
     /// Wrap host data destined for `dest` in the appropriate BATMAN packet,
     /// ready to hand to a link.  A `dest` of [`MeshIdentifier::BROADCAST`]
     /// produces a flooded [`BatmanBroadcastPacket`] (e.g. for a host ARP);
@@ -1295,6 +1443,7 @@ impl CentralRouter {
     /// [`MeshIdentifier::BROADCAST`]: interfaces::frame::MeshIdentifier::BROADCAST
     pub fn handle_local<'a>(
         &mut self,
+        now: core::time::Duration,
         dest: Mac,
         payload: &[u8],
         tx_buf: &'a mut [u8],
@@ -1328,7 +1477,7 @@ impl CentralRouter {
         }
 
         // 1. Query BATMAN for the next-hop physical address
-        let next_hop = if let Some(next_hop) = self.batman.lookup_route(dest) {
+        let next_hop = if let Some(next_hop) = self.batman.next_hop(now, dest) {
             next_hop
         } else {
             dest
@@ -1374,12 +1523,16 @@ impl CentralRouter {
     /// 4. If no quality data exists yet, fall back to the legacy
     ///    last-seen [`IdentTable`] entry.
     #[tracing::instrument(skip(self))]
-    pub fn get_egress_interface(&mut self, dest: Mac) -> Option<EgressInterface> {
+    pub fn get_egress_interface(
+        &mut self,
+        now: core::time::Duration,
+        dest: Mac,
+    ) -> Option<EgressInterface> {
         if dest == Mac::BROADCAST {
             return Some(EgressInterface::All);
         }
 
-        let next_hop = self.batman.lookup_route(dest).unwrap_or(dest);
+        let next_hop = self.batman.next_hop(now, dest).unwrap_or(dest);
 
         if let Some(iface) = self.link_quality.best_interface_for(next_hop) {
             return Some(EgressInterface::Interface(iface));
@@ -1449,6 +1602,27 @@ impl CentralRouter {
     /// the structure the data plane mutates on every received frame.
     pub fn link_quality_records(&self) -> &[LinkQualityRecord<Mac>] {
         self.link_quality.records()
+    }
+
+    /// Snapshot of every neighbor this router has heard at least one
+    /// keep-alive from, evaluated as of `now`. No particular order.
+    pub fn keepalive_table(
+        &self,
+        now: core::time::Duration,
+    ) -> impl Iterator<Item = KeepAliveEntry> + '_ {
+        self.batman.keepalive.iter().map(move |(neighbor, stats)| {
+            let neighbor = *neighbor;
+            KeepAliveEntry {
+                neighbor,
+                ms_since_last_heard: now
+                    .saturating_sub(stats.last_heard)
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
+                interval_estimate_ms: stats.interval_estimate.as_millis().min(u64::MAX as u128)
+                    as u64,
+                missed: self.batman.keepalive_missed(now, neighbor),
+            }
+        })
     }
 
     /// Fold `bytes` of one received link frame, observed at `now`, into
@@ -1540,8 +1714,8 @@ impl CentralRouter {
     /// router state.  Used to back the management-API `ResolveRoute`
     /// request.
     ///
-    /// `next_hop` mirrors the `lookup_route(dest).unwrap_or(dest)`
-    /// fallback used inside [`handle_local`] — when no BATMAN route is
+    /// `next_hop` mirrors the `next_hop(now, dest).unwrap_or(dest)`
+    /// fallback used inside [`handle_local`] — when no live BATMAN route is
     /// known the router will try to reach `dest` directly.
     ///
     /// The egress value is `None` when no link-quality or last-seen
@@ -1550,12 +1724,16 @@ impl CentralRouter {
     ///
     /// [`handle_local`]: CentralRouter::handle_local
     /// [`get_egress_interface`]: CentralRouter::get_egress_interface
-    pub fn resolve_route(&self, dest: Mac) -> (Mac, Option<EgressInterface>) {
+    pub fn resolve_route(
+        &self,
+        now: core::time::Duration,
+        dest: Mac,
+    ) -> (Mac, Option<EgressInterface>) {
         if dest == Mac::BROADCAST {
             return (Mac::BROADCAST, Some(EgressInterface::All));
         }
 
-        let next_hop = self.batman.lookup_route(dest).unwrap_or(dest);
+        let next_hop = self.batman.next_hop(now, dest).unwrap_or(dest);
 
         let egress = if let Some(iface) = self.link_quality.best_interface_for(next_hop) {
             Some(EgressInterface::Interface(iface))
@@ -1698,7 +1876,7 @@ mod cp2_local_delivery {
 
         let mut tx = [0u8; 256];
         let out = router
-            .handle_local(Mac::BROADCAST, INNER, &mut tx)
+            .handle_local(Duration::ZERO, Mac::BROADCAST, INNER, &mut tx)
             .expect("broadcast packet should build");
 
         assert_eq!(out.dst, Mac::BROADCAST);
@@ -2299,7 +2477,7 @@ mod mcast_forwarding {
         let mut router = CentralRouter::new(mac(1));
         let mut tx = [0u8; 256];
         let out = router
-            .handle_local_mcast(mac(7), INNER, &mut tx)
+            .handle_local_mcast(Duration::ZERO, mac(7), INNER, &mut tx)
             .expect("mcast packet should build");
 
         assert_eq!(out.protocol, ETH_P_BATMAN);
@@ -2318,16 +2496,28 @@ mod mcast_forwarding {
 
         // A tiny buffer that cannot hold even the unicast header + payload.
         let mut tiny = [0u8; 4];
-        assert!(router.handle_local(mac(2), INNER, &mut tiny).is_err());
+        assert!(
+            router
+                .handle_local(Duration::ZERO, mac(2), INNER, &mut tiny)
+                .is_err()
+        );
         assert_eq!(router.oversize_drops(), 1);
 
         // A second oversize drop bumps the counter without a second warn.
-        assert!(router.handle_local(mac(2), INNER, &mut tiny).is_err());
+        assert!(
+            router
+                .handle_local(Duration::ZERO, mac(2), INNER, &mut tiny)
+                .is_err()
+        );
         assert_eq!(router.oversize_drops(), 2);
 
         // A frame that fits does not touch the counter.
         let mut ok = [0u8; 256];
-        assert!(router.handle_local(mac(2), INNER, &mut ok).is_ok());
+        assert!(
+            router
+                .handle_local(Duration::ZERO, mac(2), INNER, &mut ok)
+                .is_ok()
+        );
         assert_eq!(router.oversize_drops(), 2);
     }
 
@@ -2341,7 +2531,11 @@ mod mcast_forwarding {
         let mut router = CentralRouter::new(mac(1));
         let host_frame = [0u8; 1514]; // 1500 MTU + 14-byte Ethernet header
         let mut tx = [0u8; MAX_LINK_FRAME_LEN];
-        assert!(router.handle_local(mac(2), &host_frame, &mut tx).is_ok());
+        assert!(
+            router
+                .handle_local(Duration::ZERO, mac(2), &host_frame, &mut tx)
+                .is_ok()
+        );
         assert_eq!(router.oversize_drops(), 0);
     }
 }
@@ -2624,6 +2818,184 @@ mod node_metrics {
 }
 
 #[cfg(test)]
+mod keepalive_route_selection {
+    use batman::wire::{BATADV_IV_OGM, BATADV_KEEPALIVE, BatmanKeepAlivePacket, BatmanOgmPacket};
+    use core::time::Duration;
+    use interfaces::frame::{LinkFrame, Mac};
+    use zerocopy::{FromBytes, IntoBytes};
+
+    use super::*;
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    fn link_frame_bytes(src: Mac, dst: Mac, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(dst.as_bytes());
+        out.extend_from_slice(src.as_bytes());
+        out.extend_from_slice(&DEFAULT_BATMAN_ETHER_TYPE.to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Feed one OGM for `orig`, relayed by immediate neighbor `via` on
+    /// interface `iface_idx`, at instant `now`.
+    fn feed_ogm_via(
+        router: &mut CentralRouter,
+        orig: Mac,
+        via: Mac,
+        iface_idx: usize,
+        seqno: u32,
+        tq: u8,
+        now: Duration,
+    ) {
+        let ogm = BatmanOgmPacket {
+            packet_type: BATADV_IV_OGM,
+            version: 5,
+            ttl: 50,
+            flags: 0,
+            seqno: seqno.to_be(),
+            orig,
+            reserved: 0,
+            tq,
+            tvlv_len: 0,
+        };
+        let bytes = link_frame_bytes(via, Mac::BROADCAST, ogm.as_bytes());
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 256];
+        router.handle_frame(now, iface_idx, frame, &mut tx);
+    }
+
+    /// Feed one keep-alive heartbeat from immediate neighbor `via` on
+    /// interface `iface_idx`, at instant `now`.
+    fn feed_keepalive_via(router: &mut CentralRouter, via: Mac, iface_idx: usize, now: Duration) {
+        let pkt = BatmanKeepAlivePacket {
+            packet_type: BATADV_KEEPALIVE,
+            version: 5,
+        };
+        let bytes = link_frame_bytes(via, Mac::BROADCAST, pkt.as_bytes());
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 256];
+        router.handle_frame(now, iface_idx, frame, &mut tx);
+    }
+
+    /// Set up two alternate paths to `dest`: a high-TQ path via neighbor 2 on
+    /// interface 0 (keep-alive armed with a 1s learned cadence), and a
+    /// lower-TQ path via neighbor 3 on interface 1 (no keep-alives at all —
+    /// opt-in by observation). Returns the router positioned at t=1s, right
+    /// after the second keep-alive teaches the 1s cadence.
+    fn build_two_paths(router: &mut CentralRouter, dest: Mac) {
+        feed_ogm_via(router, dest, mac(2), 0, 1, 255, Duration::ZERO);
+        feed_ogm_via(router, dest, mac(3), 1, 1, 100, Duration::ZERO);
+        feed_keepalive_via(router, mac(2), 0, Duration::ZERO);
+        feed_keepalive_via(router, mac(2), 0, Duration::from_secs(1));
+    }
+
+    /// `handle_local` — the primary locally-originated-traffic path — routes
+    /// via the healthy alternate once the incumbent's keep-alive is missed,
+    /// even though its raw OGM TQ was higher. This is the fix for the
+    /// critical finding: `handle_local` used to call the cached, non-time-
+    /// aware `lookup_route`, which never saw keep-alive (or even OGM)
+    /// staleness until this node's own next OGM tick.
+    #[test]
+    fn handle_local_switches_to_live_alternate_after_keepalive_miss() {
+        let mut router = CentralRouter::new(mac(1));
+        let dest = mac(9);
+        build_two_paths(&mut router, dest);
+
+        let mut tx = [0u8; 256];
+        let before = router
+            .handle_local(Duration::from_secs(1), dest, b"hi", &mut tx)
+            .unwrap();
+        assert_eq!(before.dst, mac(2), "before any miss, higher TQ wins");
+
+        let mut tx2 = [0u8; 256];
+        let after = router
+            .handle_local(Duration::from_secs(5), dest, b"hi", &mut tx2)
+            .unwrap();
+        assert_eq!(
+            after.dst,
+            mac(3),
+            "after a missed keep-alive, the live alternate must win"
+        );
+    }
+
+    /// `get_egress_interface` follows the same switch: the interface with the
+    /// best link quality for the *chosen* next hop changes once the
+    /// incumbent's keep-alive is missed.
+    #[test]
+    fn get_egress_interface_switches_after_keepalive_miss() {
+        let mut router = CentralRouter::new(mac(1));
+        let dest = mac(9);
+        build_two_paths(&mut router, dest);
+
+        assert_eq!(
+            router.get_egress_interface(Duration::from_secs(1), dest),
+            Some(EgressInterface::Interface(0)),
+            "before any miss, neighbor 2's interface wins"
+        );
+        assert_eq!(
+            router.get_egress_interface(Duration::from_secs(5), dest),
+            Some(EgressInterface::Interface(1)),
+            "after a missed keep-alive, neighbor 3's interface must win"
+        );
+    }
+
+    /// `resolve_route` (the read-only management-API path) follows the same
+    /// switch as `handle_local`/`get_egress_interface`.
+    #[test]
+    fn resolve_route_switches_after_keepalive_miss() {
+        let mut router = CentralRouter::new(mac(1));
+        let dest = mac(9);
+        build_two_paths(&mut router, dest);
+
+        let (next_hop, _) = router.resolve_route(Duration::from_secs(1), dest);
+        assert_eq!(next_hop, mac(2));
+
+        let (next_hop, _) = router.resolve_route(Duration::from_secs(5), dest);
+        assert_eq!(next_hop, mac(3));
+    }
+
+    /// A router that has never heard a keep-alive reports an empty table.
+    #[test]
+    fn keepalive_table_empty_when_nothing_heard() {
+        let router = CentralRouter::new(mac(1));
+        assert_eq!(router.keepalive_table(Duration::ZERO).count(), 0);
+    }
+
+    /// `keepalive_table` reports the learned cadence and elapsed time
+    /// correctly, and its `missed` flag matches the same miss/no-miss
+    /// transition the route-selection tests above observe indirectly.
+    #[test]
+    fn keepalive_table_reports_entry_and_missed_flag() {
+        let mut router = CentralRouter::new(mac(1));
+        let dest = mac(9);
+        build_two_paths(&mut router, dest);
+
+        let entries: Vec<_> = router.keepalive_table(Duration::from_secs(1)).collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "only neighbor 2 has ever sent a keep-alive"
+        );
+        let e = entries[0];
+        assert_eq!(e.neighbor, mac(2));
+        assert_eq!(e.ms_since_last_heard, 0, "just heard at t=1s");
+        assert_eq!(
+            e.interval_estimate_ms, 1000,
+            "learned from the 1s gap between the two heartbeats"
+        );
+        assert!(!e.missed, "within budget just after the second heartbeat");
+
+        let entries: Vec<_> = router.keepalive_table(Duration::from_secs(5)).collect();
+        let e = entries[0];
+        assert_eq!(e.ms_since_last_heard, 4000);
+        assert!(e.missed, "past the 3 * 1s budget since last heard at t=1s");
+    }
+}
+
+#[cfg(test)]
 mod tq_clamp_integration {
     //! The local-TQ clamp wired through [`CentralRouter`]: a measured poor link
     //! caps an OGM's advertised TQ, but metric-less transports (which report
@@ -2689,6 +3061,46 @@ mod tq_clamp_integration {
         };
         router.handle_frame_with_metrics(Duration::ZERO, 0, frame, metrics, &mut tx);
         assert_eq!(router.batman.originator_table[&mac(2)].max_tq, 40);
+    }
+}
+
+#[cfg(test)]
+mod keepalive_config_validation {
+    use core::time::Duration;
+    use interfaces::frame::Mac;
+
+    use super::*;
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    /// A degenerate (zero) configured interval is floored to
+    /// [`MIN_KEEPALIVE_INTERVAL`] rather than left near-zero, which would
+    /// otherwise arm a `TrickleTimer` that fires on effectively every tick —
+    /// a config typo turning into a self-inflicted heartbeat flood.
+    #[test]
+    fn configure_interface_keepalive_clamps_a_degenerate_interval() {
+        let mut router = CentralRouter::new(mac(1));
+        router.configure_interface_keepalive(0, Some(Duration::ZERO), Duration::ZERO);
+        let armed = router.batman.keepalive_timers[0]
+            .as_ref()
+            .expect("interface armed");
+        assert!(
+            armed.i_min() >= MIN_KEEPALIVE_INTERVAL,
+            "a zero interval must be floored to a sane minimum, not left at ~0"
+        );
+    }
+
+    /// A sane, already-reasonable interval passes through unclamped.
+    #[test]
+    fn configure_interface_keepalive_leaves_a_sane_interval_unclamped() {
+        let mut router = CentralRouter::new(mac(1));
+        router.configure_interface_keepalive(0, Some(Duration::from_secs(5)), Duration::ZERO);
+        let armed = router.batman.keepalive_timers[0]
+            .as_ref()
+            .expect("interface armed");
+        assert_eq!(armed.i_min(), Duration::from_secs(5));
     }
 }
 
@@ -2851,6 +3263,18 @@ mod ogm_auth_integration {
         );
     }
 
+    /// `poll_keepalive`, like `poll`, fails closed: a `require_auth` node with
+    /// no cert yet emits no keep-alive heartbeat either.
+    #[test]
+    fn poll_keepalive_emits_nothing_while_auth_locked() {
+        let mut node = CentralRouter::new(mac(2));
+        node.set_require_auth(true);
+        assert!(node.auth_locked());
+
+        let mut tx = [0u8; 64];
+        assert!(node.poll_keepalive(&mut tx).is_none());
+    }
+
     /// A `require_auth` node with no cert is inert end to end: it neither
     /// learns from nor emits any mesh traffic, and installing a valid cert via
     /// `set_auth` unlocks it so the same traffic is processed normally.
@@ -2923,7 +3347,7 @@ mod ogm_auth_integration {
 
         let mut tx = [0u8; 256];
         assert!(matches!(
-            node.handle_local(mac(9), b"payload", &mut tx),
+            node.handle_local(Duration::ZERO, mac(9), b"payload", &mut tx),
             Err(LocalSendError::AuthLocked)
         ));
 
@@ -2935,7 +3359,10 @@ mod ogm_auth_integration {
         auth.set_time(100);
         node.set_auth(auth);
         assert!(!node.auth_locked());
-        assert!(node.handle_local(mac(9), b"payload", &mut tx).is_ok());
+        assert!(
+            node.handle_local(Duration::ZERO, mac(9), b"payload", &mut tx)
+                .is_ok()
+        );
     }
 
     /// The same fail-closed gate applies to local multicast egress
@@ -2949,7 +3376,7 @@ mod ogm_auth_integration {
 
         let mut tx = [0u8; 256];
         assert!(matches!(
-            node.handle_local_mcast(mac(9), b"payload", &mut tx),
+            node.handle_local_mcast(Duration::ZERO, mac(9), b"payload", &mut tx),
             Err(LocalSendError::AuthLocked)
         ));
 
@@ -2961,7 +3388,10 @@ mod ogm_auth_integration {
         auth.set_time(100);
         node.set_auth(auth);
         assert!(!node.auth_locked());
-        assert!(node.handle_local_mcast(mac(9), b"payload", &mut tx).is_ok());
+        assert!(
+            node.handle_local_mcast(Duration::ZERO, mac(9), b"payload", &mut tx)
+                .is_ok()
+        );
     }
 
     /// The fail-closed gate must cover the data plane, not just OGMs: a
@@ -3003,6 +3433,94 @@ mod ogm_auth_integration {
         assert!(
             outcome.deliver_local.is_none(),
             "a locked node must not locally deliver a data-plane frame"
+        );
+    }
+
+    // ── Keep-alive auth: end-to-end signing/verification through `CentralRouter` ──
+
+    /// Feed `payload` into `b` as if received directly from `src` on
+    /// `iface_idx` at `now`.
+    fn feed_at(b: &mut CentralRouter, src: Mac, iface_idx: usize, payload: &[u8], now: Duration) {
+        let bytes = link_frame(src, payload);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 512];
+        b.handle_frame(now, iface_idx, frame, &mut tx);
+    }
+
+    /// A single spoofed keep-alive can no longer resurrect a genuinely dead
+    /// neighbor's route once auth is enabled — the end-to-end regression
+    /// test for the vulnerability the auth gate closes. Two alternate paths
+    /// to `dest` exist: a high-TQ one via `neighbor_a`, which keep-alives,
+    /// and a lower-TQ one via a second relay that never does. Once
+    /// `neighbor_a`'s real keep-alives stop and its budget elapses, routing
+    /// switches to the alternate (exactly like the unauthenticated case in
+    /// `keepalive_route_selection`, proving legitimate keep-alives are still
+    /// recorded correctly under auth) — and a forged "resurrection"
+    /// keep-alive afterward, claiming to be `neighbor_a`, must not switch it
+    /// back.
+    #[test]
+    fn forged_keepalive_cannot_resurrect_a_dead_route() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut dest = router_with_auth(&authority, mac(9), 9);
+        let mut neighbor_a = router_with_auth(&authority, mac(2), 2);
+        let mut router = router_with_auth(&authority, mac(1), 1);
+
+        // `dest` originates one signed OGM; the same signed bytes are
+        // relayed to `router` via two different neighbors with different
+        // advertised TQ. `tq` is a mutable, unsigned-covered field (see
+        // `signed_message`'s doc), safe to vary post-signing — mirroring how
+        // a real relay's engine attenuates it per hop.
+        let ogm_high = poll_ogm_bytes(&mut dest);
+        let mut ogm_low = ogm_high.clone();
+        ogm_low[15] = 100; // `tq` byte offset within `BatmanOgmPacket`
+        feed_at(&mut router, mac(2), 0, &ogm_high, Duration::ZERO);
+        feed_at(&mut router, mac(3), 1, &ogm_low, Duration::ZERO);
+
+        // `neighbor_a`'s own OGM, so `router` caches its cert — a
+        // precondition for keep-alive verification.
+        let ogm_a = poll_ogm_bytes(&mut neighbor_a);
+        feed_at(&mut router, mac(2), 0, &ogm_a, Duration::ZERO);
+
+        // Two real, signed keep-alives from `neighbor_a` teach a ~1s cadence.
+        let mut tx = [0u8; 128];
+        let ka0 = neighbor_a.poll_keepalive(&mut tx).unwrap().payload.to_vec();
+        feed_at(&mut router, mac(2), 0, &ka0, Duration::ZERO);
+        let mut tx = [0u8; 128];
+        let ka1 = neighbor_a.poll_keepalive(&mut tx).unwrap().payload.to_vec();
+        feed_at(&mut router, mac(2), 0, &ka1, Duration::from_secs(1));
+
+        let mut tx = [0u8; 256];
+        let before = router
+            .handle_local(Duration::from_secs(1), mac(9), b"hi", &mut tx)
+            .unwrap();
+        assert_eq!(before.dst, mac(2), "before any miss, higher TQ wins");
+
+        let mut tx2 = [0u8; 256];
+        let after = router
+            .handle_local(Duration::from_secs(5), mac(9), b"hi", &mut tx2)
+            .unwrap();
+        assert_eq!(
+            after.dst,
+            mac(3),
+            "after a missed keep-alive, the live alternate must win"
+        );
+
+        // An attacker forges a "resurrection" keep-alive claiming to be
+        // `neighbor_a`, tampering a captured signature rather than holding
+        // its key. It must not verify, so it must not revive the dead route.
+        let mut forged = ka1.clone();
+        let last = forged.len() - 1;
+        forged[last] ^= 0xff;
+        feed_at(&mut router, mac(2), 0, &forged, Duration::from_secs(6));
+
+        let mut tx3 = [0u8; 256];
+        let still_after = router
+            .handle_local(Duration::from_secs(6), mac(9), b"hi", &mut tx3)
+            .unwrap();
+        assert_eq!(
+            still_after.dst,
+            mac(3),
+            "a forged keep-alive must not resurrect the dead route"
         );
     }
 }
@@ -3226,6 +3744,7 @@ mod link_features_tests {
             rx_ogm: true,
             tx_data: false,
             rx_data: true,
+            ..Default::default()
         };
         r.set_link_features(0, f);
         assert!(!r.link_may_tx(0, Some(BATADV_IV_OGM)), "tx_ogm gates OGM");
@@ -3267,7 +3786,7 @@ mod link_features_tests {
             ..Default::default()
         };
         assert!(
-            r.apply_runtime_link_features(0, f),
+            r.apply_runtime_link_features(0, f, Duration::ZERO),
             "registered iface accepted"
         );
         assert!(!r.link_features(0).tx_ogm, "override took effect");
@@ -3277,7 +3796,7 @@ mod link_features_tests {
         );
 
         // An unregistered index is rejected and does not further mutate state.
-        assert!(!r.apply_runtime_link_features(9, LinkFeatures::default()));
+        assert!(!r.apply_runtime_link_features(9, LinkFeatures::default(), Duration::ZERO));
     }
 
     /// An OGM arriving on a link with `rx_ogm` disabled is dropped before the

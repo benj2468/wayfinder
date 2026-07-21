@@ -7,9 +7,9 @@
 use clap::ValueEnum;
 use serde::Serialize;
 use wayfinder_protos::wayfinder_v1alpha::{
-    GetSecurityStatusResponse, LinkQualityTable, ListCertsResponse, ListPendingCsrsResponse,
-    NodeInfo, NodeMetrics, OgmSchedule, ResolveRouteResponse, RoutingTable, Throughput,
-    resolve_route_response::Egress,
+    GetSecurityStatusResponse, KeepAliveTable, LinkQualityTable, ListCertsResponse,
+    ListPendingCsrsResponse, NodeInfo, NodeMetrics, OgmSchedule, ResolveRouteResponse,
+    RoutingTable, Throughput, resolve_route_response::Egress,
 };
 
 /// How a command renders its result.
@@ -94,6 +94,26 @@ pub fn link_quality_table(v: &LinkQualityTable, fmt: OutputFormat) -> anyhow::Re
                 e.iface_idx,
                 e.ewma_quality,
                 e.sample_count,
+            ));
+        }
+        out
+    })
+}
+
+/// Render the [`KeepAliveTable`].
+pub fn keepalive_table(v: &KeepAliveTable, fmt: OutputFormat) -> anyhow::Result<String> {
+    render(v, fmt, |v| {
+        if v.entries.is_empty() {
+            return "no keep-alive heartbeats heard".to_string();
+        }
+        let mut out = String::from("NEIGHBOR           MS_SINCE_HEARD  INTERVAL_MS  MISSED");
+        for e in &v.entries {
+            out.push_str(&format!(
+                "\n{:<18} {:>14}  {:>11}  {:>6}",
+                format_mac(&e.neighbor_id),
+                e.ms_since_last_heard,
+                e.interval_estimate_ms,
+                if e.missed { "yes" } else { "no" },
             ));
         }
         out

@@ -5,6 +5,7 @@ pytest.importorskip("simpy")
 import wayfinder_py as wf  # noqa: E402
 
 from engine.channel import PerfectWire  # noqa: E402
+from engine.link import Link  # noqa: E402
 from engine.node import Node  # noqa: E402
 from engine.scenario import Simulation  # noqa: E402
 from engine.topology import diamond, pair  # noqa: E402
@@ -79,3 +80,64 @@ def test_rejects_duplicate_node_names():
     nodes = [Node("a"), Node("a")]
     with pytest.raises(ValueError):
         Simulation(nodes, [], seed=0)
+
+
+# The BATMAN sub-type tag (the first payload byte) for a keep-alive
+# heartbeat — see `libs/batman/src/wire.rs`'s `BATADV_KEEPALIVE`.
+_BATADV_KEEPALIVE = 0x07
+
+
+def _is_keepalive_frame(frame: bytes) -> bool:
+    return len(frame) > 14 and frame[14] == _BATADV_KEEPALIVE
+
+
+def _drain_until_keepalive(driver: wf.PyDriver, iface: int, until_ms: int) -> bool:
+    """Tick `driver` up to `until_ms` (in 100ms steps), draining `iface`'s
+    egress queue after each tick, until a keep-alive heartbeat appears.
+    Bypasses `Simulation`'s own tick loop (which hands egress straight to
+    channel delivery) so the test can inspect the raw frame directly."""
+    now = 0
+    while now < until_ms:
+        now += 100
+        driver.tick(now)
+        frame = driver.poll_egress(iface)
+        while frame is not None:
+            if _is_keepalive_frame(frame):
+                return True
+            frame = driver.poll_egress(iface)
+    return False
+
+
+def test_node_keepalive_config_is_threaded_into_its_driver():
+    nodes = [
+        Node("a", trickle=(50, 500)),
+        Node("b", trickle=(50, 500), tx_keepalive_interval_ms=1000),
+    ]
+    links = [pair("a", "b", PerfectWire())]
+    sim = Simulation(nodes, links, seed=0)
+
+    assert _drain_until_keepalive(sim._states["b"].driver, 0, 60_000), (
+        "node b's tx_keepalive_interval_ms must arm its interface's heartbeat"
+    )
+    assert not _drain_until_keepalive(sim._states["a"].driver, 0, 60_000), (
+        "node a has no keep-alive configured and must never emit one"
+    )
+
+
+def test_link_keepalive_override_wins_over_node_default():
+    # Node "a" has no keep-alive default at all; the link explicitly arms
+    # one for the interface it creates on "a" — same override direction
+    # `Link.trickle` already supports over `Node.trickle`.
+    nodes = [
+        Node("a", trickle=(50, 500)),
+        Node("b", trickle=(50, 500)),
+    ]
+    links = [
+        Link(("a", "b"), PerfectWire(), tx_keepalive_interval_ms=500),
+    ]
+    sim = Simulation(nodes, links, seed=0)
+
+    assert _drain_until_keepalive(sim._states["a"].driver, 0, 60_000), (
+        "the link's tx_keepalive_interval_ms must override node a's "
+        "(absent) default, same as the existing trickle override"
+    )

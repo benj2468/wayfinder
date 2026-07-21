@@ -24,10 +24,13 @@ class Node:
     left `None`. `trickle` is this node's default per-interface Trickle
     schedule, overridable per-`Link`. `tick_interval_ms` is how often
     `Simulation` calls this node's `PyDriver.tick`; when `None` it's derived
-    from `trickle`'s `i_min_ms`."""
+    from `trickle`'s `i_min_ms`. `tx_keepalive_interval_ms` is this node's
+    default per-interface keep-alive heartbeat cadence, also overridable
+    per-`Link`; `None` (the default) disables keep-alive transmission."""
 
     name: str
     mobility: Mobility = dataclasses.field(default_factory=lambda: Static(Vec3()))
     mac: wf.PyMac | None = None
     trickle: tuple[int, int] = DEFAULT_TRICKLE
     tick_interval_ms: int | None = None
+    tx_keepalive_interval_ms: int | None = None

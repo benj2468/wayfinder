@@ -7,9 +7,10 @@ use std::net::SocketAddr;
 
 use tokio::sync::{mpsc, oneshot};
 use wayfinder_protos::service::{
-    InterfaceThroughputData, LinkQualityEntryData, NodeMetricsData, NodeSecurityData,
-    OgmScheduleEntryData, RouteResolutionData, RoutingEntryData, RuntimeConfigData,
-    SecurityStatusData, TableOccupancyData, WayfinderDataProvider, WayfinderService,
+    InterfaceThroughputData, KeepAliveEntryData, LinkQualityEntryData, NodeMetricsData,
+    NodeSecurityData, OgmScheduleEntryData, RouteResolutionData, RoutingEntryData,
+    RuntimeConfigData, SecurityStatusData, TableOccupancyData, WayfinderDataProvider,
+    WayfinderService,
 };
 use wayfinder_protos::wayfinder_v1alpha::{WayfinderRequest, WayfinderResponse};
 use wayfinder_server::run_tcp_server;
@@ -42,6 +43,14 @@ impl WayfinderDataProvider for Mock {
     }
     fn link_quality_table(&self) -> Vec<LinkQualityEntryData> {
         vec![]
+    }
+    fn keepalive_table(&self) -> Vec<KeepAliveEntryData> {
+        vec![KeepAliveEntryData {
+            neighbor_id: vec![0, 0, 0, 0, 0, 2],
+            ms_since_last_heard: 4200,
+            interval_estimate_ms: 1000,
+            missed: true,
+        }]
     }
     fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData> {
         vec![]
@@ -167,6 +176,30 @@ async fn node_info_query_renders_human_from_server() {
 }
 
 #[tokio::test]
+async fn keepalive_query_renders_json_from_server() {
+    let addr = spawn_server().await;
+    let out = run_query(Command::Keepalive, &addr.to_string(), OutputFormat::Json)
+        .await
+        .expect("query succeeds");
+    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(parsed["entries"][0]["ms_since_last_heard"], 4200);
+    assert_eq!(parsed["entries"][0]["interval_estimate_ms"], 1000);
+    assert_eq!(parsed["entries"][0]["missed"], true);
+}
+
+#[tokio::test]
+async fn keepalive_query_renders_human_from_server() {
+    let addr = spawn_server().await;
+    let out = run_query(Command::Keepalive, &addr.to_string(), OutputFormat::Human)
+        .await
+        .unwrap();
+    assert!(out.contains("00:00:00:00:00:02"), "got: {out}");
+    assert!(out.contains("4200"), "got: {out}");
+    assert!(out.contains("1000"), "got: {out}");
+    assert!(out.contains("yes"), "got: {out}");
+}
+
+#[tokio::test]
 async fn set_trickle_config_query_succeeds_against_server() {
     let addr = spawn_server().await;
     let out = run_query(
@@ -193,6 +226,8 @@ async fn set_link_features_query_succeeds_against_server() {
             rx_ogm: None,
             tx_data: None,
             rx_data: None,
+            tx_keepalive_interval_ms: None,
+            tx_keepalive_disable: false,
         },
         &addr.to_string(),
         OutputFormat::Human,

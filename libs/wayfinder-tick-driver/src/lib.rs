@@ -35,7 +35,8 @@ use wayfinder::features::LinkFeatures;
 use wayfinder::interfaces::frame::{LinkFrame, MAX_LINK_FRAME_LEN, Mac};
 use wayfinder::{CentralRouter, DEFAULT_BATMAN_ETHER_TYPE, EgressInterface, MAX_INTERFACES};
 use wayfinder_driver_core::{
-    Egress, MeshSink, OutgoingFrame, handle_mesh_frame, poll_due_ogms, tag_directed_into,
+    Egress, MeshSink, OutgoingFrame, handle_mesh_frame, poll_due_keepalives, poll_due_ogms,
+    tag_directed_into,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -117,7 +118,9 @@ impl Driver {
     /// `trickle[idx]` supplies that interface's adaptive OGM schedule;
     /// `features[idx]` its participation gates, defaulting to full
     /// participation ([`LinkFeatures::default`]) for any interface `features`
-    /// doesn't cover.
+    /// doesn't cover. `features[idx].tx_keepalive` additionally arms that
+    /// interface's fixed-cadence keep-alive schedule, left unarmed (`None`)
+    /// by default.
     pub fn new(mac: Mac, trickle: &[TrickleConfig], features: &[LinkFeatures]) -> Self {
         let n = trickle.len();
         debug_assert!(
@@ -127,7 +130,16 @@ impl Driver {
         let mut router = CentralRouter::new(mac);
         for (idx, cfg) in trickle.iter().enumerate() {
             router.configure_interface_ogm(idx, cfg.i_min(), cfg.i_max(), Duration::ZERO);
-            router.set_link_features(idx, features.get(idx).copied().unwrap_or_default());
+            let link_features = features.get(idx).copied().unwrap_or_default();
+            router.set_link_features(idx, link_features);
+            // Keep-alive rides on the same per-link `features` entry (no
+            // separate constructor parameter) — its `tx_keepalive` supplies
+            // the schedule, `None` leaving that interface's timer unarmed.
+            router.configure_interface_keepalive(
+                idx,
+                link_features.tx_keepalive.map(|c| c.interval()),
+                Duration::ZERO,
+            );
         }
         Self {
             router,
@@ -184,9 +196,9 @@ impl Driver {
     }
 
     /// Non-blocking: drain every currently queued received frame and local
-    /// send, run whatever per-interface OGM maintenance is due as of `now`,
-    /// and stage the results into each interface's egress queue (or the
-    /// local-delivery queue). Call once per simulation step; never blocks and
+    /// send, run whatever per-interface OGM and keep-alive maintenance is due
+    /// as of `now`, and stage the results into each interface's egress queue
+    /// (or the local-delivery queue). Call once per simulation step; never blocks and
     /// never waits for anything to arrive.
     pub fn tick(&mut self, now: Duration) {
         let mut stage = StageSink::default();
@@ -208,7 +220,7 @@ impl Driver {
         while let Some((dest, payload)) = self.local_tx_queue.pop_front() {
             if let Ok(f) = self
                 .router
-                .handle_local(dest, &payload, &mut self.tx_buffer)
+                .handle_local(now, dest, &payload, &mut self.tx_buffer)
             {
                 stage.emit(OutgoingFrame {
                     dst: f.dst,
@@ -221,6 +233,7 @@ impl Driver {
         }
 
         poll_due_ogms(&mut self.router, now, &mut self.tx_buffer, &mut stage);
+        poll_due_keepalives(&mut self.router, now, &mut self.tx_buffer, &mut stage);
 
         for staged in stage.frames.drain(..) {
             self.dispatch_one(now, staged);
@@ -257,7 +270,7 @@ impl Driver {
             Egress::Iface(idx) => {
                 self.send_on(idx, staged.dst, staged.protocol, &staged.payload, now);
             }
-            Egress::Auto { exclude } => match self.router.get_egress_interface(staged.dst) {
+            Egress::Auto { exclude } => match self.router.get_egress_interface(now, staged.dst) {
                 Some(EgressInterface::All) => {
                     for idx in 0..self.egress.len() {
                         // Split-horizon: never re-flood back out the interface
@@ -442,6 +455,65 @@ mod tests {
         assert_eq!(parsed.src, mac(1));
     }
 
+    /// An interface configured with a keep-alive schedule (via
+    /// `LinkFeatures::tx_keepalive`) stages a heartbeat into its egress queue
+    /// once `tick` reaches its due instant — the tick-driven counterpart to
+    /// `poll_due_keepalives`, proving the schedule is actually wired into
+    /// `Driver::new`/`tick`, not just accepted and ignored.
+    #[test]
+    fn tick_emits_due_keepalive_into_its_interface_egress_queue() {
+        let trickle = [TrickleConfig::default()];
+        let features = [LinkFeatures {
+            tx_keepalive: Some(wayfinder::features::KeepAliveConfig { interval_ms: 1000 }),
+            ..Default::default()
+        }];
+        let mut driver = Driver::new(mac(1), &trickle, &features);
+
+        let mut now = Duration::ZERO;
+        while driver.router().due_keepalive_interface(now).is_none()
+            && now < Duration::from_secs(60)
+        {
+            now += Duration::from_millis(50);
+        }
+        assert!(
+            driver.router().due_keepalive_interface(now).is_some(),
+            "interface never came due"
+        );
+
+        driver.tick(now);
+
+        let frame = driver
+            .poll_egress(0)
+            .expect("one due interface stages one heartbeat");
+        let parsed = LinkFrame::ref_from_bytes(&frame).expect("valid on-wire link frame");
+        assert_eq!(parsed.dst, Mac::BROADCAST);
+        assert_eq!(parsed.protocol.get(), DEFAULT_BATMAN_ETHER_TYPE);
+        assert_eq!(
+            parsed.payload.first(),
+            Some(&wayfinder::batman::wire::BATADV_KEEPALIVE)
+        );
+    }
+
+    /// An interface with no `tx_keepalive` configured never emits a
+    /// heartbeat, no matter how far `tick` advances — opt-in, matching the
+    /// `LinkFeatures` default.
+    #[test]
+    fn tick_never_emits_keepalive_when_unconfigured() {
+        let trickle = [TrickleConfig::default()];
+        let mut driver = Driver::new(mac(1), &trickle, &[]);
+
+        driver.tick(Duration::from_secs(1_000));
+        // Drain whatever OGM(s) landed; only a keep-alive would be a bug here.
+        while let Some(frame) = driver.poll_egress(0) {
+            let parsed = LinkFrame::ref_from_bytes(&frame).unwrap();
+            assert_ne!(
+                parsed.payload.first(),
+                Some(&wayfinder::batman::wire::BATADV_KEEPALIVE),
+                "no interface has tx_keepalive configured"
+            );
+        }
+    }
+
     /// Two `Driver`s hand-copying `poll_egress` output into `push_rx` across
     /// repeated ticks converge on a route to each other — the same
     /// end-to-end shape a Python simulation loop will drive this crate with.
@@ -468,11 +540,11 @@ mod tests {
         }
 
         assert!(
-            a.router_mut().get_egress_interface(mac(2)).is_some(),
+            a.router_mut().get_egress_interface(now, mac(2)).is_some(),
             "a resolves a route to b"
         );
         assert!(
-            b.router_mut().get_egress_interface(mac(1)).is_some(),
+            b.router_mut().get_egress_interface(now, mac(1)).is_some(),
             "b resolves a route to a"
         );
     }

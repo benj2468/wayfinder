@@ -11,8 +11,9 @@ use wayfinder::config::{Config, LinkConfig, LinkFeatures, LinkTransport, Trickle
 use wayfinder::{
     DEFAULT_BATMAN_ETHER_TYPE, EgressInterface,
     batman::wire::{
-        BATADV_CERT_REPLY, BATADV_CERT_REQ, BATADV_IV_OGM, BatmanCertReplyPacket,
-        BatmanCertReqPacket, BatmanOgmPacket, BatmanTvlvHdr, TvlvType, find_tvlv,
+        BATADV_CERT_REPLY, BATADV_CERT_REQ, BATADV_IV_OGM, BATADV_KEEPALIVE, BatmanCertReplyPacket,
+        BatmanCertReqPacket, BatmanKeepAlivePacket, BatmanOgmPacket, BatmanTvlvHdr, TvlvType,
+        find_tvlv,
     },
 };
 use zerocopy::{FromBytes, IntoBytes};
@@ -93,6 +94,24 @@ fn build_relayed_ogm_wire_frame(relay: u8, orig: u8, tq: u8, seqno: u32) -> Vec<
         Mac::BROADCAST,
         wayfinder::DEFAULT_BATMAN_ETHER_TYPE,
         ogm.as_bytes(),
+    )
+}
+
+/// Build a raw keep-alive heartbeat frame as it would appear on the wire,
+/// sent by immediate neighbor `src` — link-local, never relayed, so unlike an
+/// OGM there is no separate `orig`/relay distinction.
+///
+/// Wire layout: `[src:6][BROADCAST:6][proto:2 NE][BatmanKeepAlivePacket]`.
+fn build_keepalive_wire_frame(src: u8) -> Vec<u8> {
+    let pkt = BatmanKeepAlivePacket {
+        packet_type: BATADV_KEEPALIVE,
+        version: 5,
+    };
+    build_frame(
+        mac(src),
+        Mac::BROADCAST,
+        wayfinder::DEFAULT_BATMAN_ETHER_TYPE,
+        pkt.as_bytes(),
     )
 }
 
@@ -1760,7 +1779,10 @@ async fn egress_picks_iface_with_better_metrics_for_shared_neighbor() {
     a.receive_with_metrics(Duration::from_secs(1), 1, &ogm_from_b, strong)
         .await;
 
-    match a.router_mut().get_egress_interface(mac(100)) {
+    match a
+        .router_mut()
+        .get_egress_interface(Duration::from_secs(1), mac(100))
+    {
         Some(EgressInterface::Interface(1)) => {}
         other => {
             panic!("expected egress for node B to be Interface(1) (strong RSSI/SNR), got {other:?}")
@@ -1793,7 +1815,10 @@ async fn egress_swaps_iface_when_metrics_swap() {
     a.receive_with_metrics(Duration::from_secs(1), 1, &ogm_from_b, weak)
         .await;
 
-    match a.router_mut().get_egress_interface(mac(100)) {
+    match a
+        .router_mut()
+        .get_egress_interface(Duration::from_secs(1), mac(100))
+    {
         Some(EgressInterface::Interface(0)) => {}
         other => {
             panic!("expected egress for node B to be Interface(0) (strong RSSI/SNR), got {other:?}")
@@ -1831,7 +1856,10 @@ async fn egress_switches_interface_as_metrics_degrade() {
         .await;
     a.receive_with_metrics(Duration::from_secs(1), 1, &ogm_from_b, weak)
         .await;
-    match a.router_mut().get_egress_interface(mac(100)) {
+    match a
+        .router_mut()
+        .get_egress_interface(Duration::from_secs(1), mac(100))
+    {
         Some(EgressInterface::Interface(0)) => {}
         other => panic!("expected initial egress to be Interface(0) (strong), got {other:?}"),
     }
@@ -1839,13 +1867,14 @@ async fn egress_switches_interface_as_metrics_degrade() {
     // Interface 0 fades and interface 1 improves over many further OGMs — the
     // EWMA (alpha = 1/4) takes several samples to cross over, unlike the
     // single-shot injection above.
+    let mut now = Duration::ZERO;
     for i in 0..10 {
-        let now = Duration::from_secs(2 + i);
+        now = Duration::from_secs(2 + i);
         a.receive_with_metrics(now, 0, &ogm_from_b, weak).await;
         a.receive_with_metrics(now, 1, &ogm_from_b, strong).await;
     }
 
-    match a.router_mut().get_egress_interface(mac(100)) {
+    match a.router_mut().get_egress_interface(now, mac(100)) {
         Some(EgressInterface::Interface(1)) => {}
         other => panic!(
             "expected egress to switch to Interface(1) once its measured quality overtook \
@@ -1940,7 +1969,10 @@ async fn resolve_route_returns_neighbor_and_observed_interface() {
         .receive_with_metrics(Duration::from_secs(1), 1, &ogm_from_b, strong)
         .await;
 
-    let (next_hop, egress) = harness.get_machine("a").router().resolve_route(mac(100));
+    let (next_hop, egress) = harness
+        .get_machine("a")
+        .router()
+        .resolve_route(Duration::from_secs(1), mac(100));
     assert_eq!(next_hop, mac(100), "direct neighbor is its own next hop");
     assert_eq!(
         egress,
@@ -1958,7 +1990,7 @@ async fn resolve_route_for_broadcast_returns_all_interfaces() {
     let (next_hop, egress) = harness
         .get_machine("a")
         .router()
-        .resolve_route(Mac::BROADCAST);
+        .resolve_route(Duration::from_secs(1), Mac::BROADCAST);
     assert_eq!(next_hop, Mac::BROADCAST);
     assert_eq!(egress, Some(EgressInterface::All));
 }
@@ -1982,10 +2014,215 @@ async fn resolve_route_is_read_only() {
         .await;
 
     let a = harness.get_machine("a");
-    let first = a.router().resolve_route(mac(100));
-    let _ = a.router().resolve_route(mac(100));
-    let third = a.router().resolve_route(mac(100));
+    let first = a.router().resolve_route(Duration::from_secs(1), mac(100));
+    let _ = a.router().resolve_route(Duration::from_secs(1), mac(100));
+    let third = a.router().resolve_route(Duration::from_secs(1), mac(100));
     assert_eq!(first, third);
+}
+
+// ── keep-alive link liveness ────────────────────────────────────────────────
+//
+// These exercise the full production `Driver`/`TestRouter` stack (unlike the
+// engine- and router-level unit tests, which call `BatmanEngine`/
+// `CentralRouter` methods directly) to prove the keep-alive wiring — startup
+// configuration, wire dispatch, and the widened `next_hop`-based route
+// selection — actually works end to end, on the keep-alive timescale rather
+// than the (far slower) OGM-staleness timescale.
+
+/// Node `a` has two alternate paths to destination `mac(100)`: a high-TQ path
+/// relayed by neighbor 2 (interface 0), which sends keep-alives, and a
+/// lower-TQ path relayed by neighbor 3 (interface 1), which never does. Once
+/// neighbor 2's keep-alive budget is missed — well before its OGM path would
+/// have gone OGM-stale — resolving a route to `mac(100)` must switch to the
+/// live neighbor 3, exactly as the feature promises.
+#[tokio::test]
+async fn keepalive_miss_switches_route_before_ogm_staleness_would() {
+    let mut harness = single_machine_with_links(2);
+    let ogm_via_2 = build_relayed_ogm_wire_frame(2, 100, 255, 1);
+    let ogm_via_3 = build_relayed_ogm_wire_frame(3, 100, 100, 1);
+    let keepalive_via_2 = build_keepalive_wire_frame(2);
+
+    let a = harness.get_machine_mut("a");
+    // Two alternate OGM paths to the same destination, via different
+    // neighbors on different interfaces.
+    a.receive_with_metrics(Duration::ZERO, 0, &ogm_via_2, LinkMetrics::default())
+        .await;
+    a.receive_with_metrics(Duration::ZERO, 1, &ogm_via_3, LinkMetrics::default())
+        .await;
+    // Neighbor 2 sends two keep-alives a second apart, teaching a 1s cadence.
+    a.receive_with_metrics(Duration::ZERO, 0, &keepalive_via_2, LinkMetrics::default())
+        .await;
+    a.receive_with_metrics(
+        Duration::from_secs(1),
+        0,
+        &keepalive_via_2,
+        LinkMetrics::default(),
+    )
+    .await;
+
+    // Before any miss, the higher-TQ path via neighbor 2 wins.
+    let (next_hop, _) = a.router().resolve_route(Duration::from_secs(1), mac(100));
+    assert_eq!(
+        next_hop,
+        mac(2),
+        "higher-TQ path should win before any miss"
+    );
+
+    // Advance past neighbor 2's keep-alive budget (3 * 1s = 3s since t=1) but
+    // nowhere near OGM staleness (6 * ~1s seed = ~6s since t=0 for a fresh
+    // path, and this OGM path was never refreshed again either way — the
+    // point is the keep-alive-driven switch happens first).
+    let t = Duration::from_secs(5);
+    let (next_hop, _) = a.router().resolve_route(t, mac(100));
+    assert_eq!(
+        next_hop,
+        mac(3),
+        "a missed keep-alive must switch the route to the live alternate"
+    );
+
+    // The switch is driven by the keep-alive overlay, not eviction: node 2's
+    // path is still present in the table (deprioritized, not gone).
+    assert!(
+        a.router()
+            .originator_table()
+            .find(|r| r.neighbor_ident == mac(100))
+            .is_some_and(|r| r.paths.iter().any(|p| p.neighbor_ident == mac(2))),
+        "the missed-keepalive path must still exist, just deprioritized"
+    );
+}
+
+/// A triangle topology (a-b, b-c, a-c): `a` learns `c` two ways — directly
+/// (higher TQ, one hop) and relayed through `b` (lower TQ, two hops). `c`'s
+/// direct link to `a` has a real, config-armed keep-alive schedule; `b`'s
+/// does not. Unlike [`keepalive_miss_switches_route_before_ogm_staleness_would`]
+/// (which hand-crafts wire frames and calls `resolve_route` directly), this
+/// drives `c`'s *actual* `TestRouter::poll_due_keepalive` — the production
+/// per-interface keep-alive tick — so the heartbeat is a genuine
+/// `Driver`-produced, `Switch`-delivered frame, not a fixture. Once `c`
+/// stops ticking its keep-alive (while its OGM Trickle schedule, and thus
+/// the direct path's OGM freshness, keeps running normally), `a`'s route to
+/// `c` must switch to the relayed path through `b`.
+#[tokio::test(start_paused = true)]
+async fn real_keepalive_tick_switches_route_when_it_stops() {
+    setup();
+    let i_min = Duration::from_millis(100);
+    let i_max = Duration::from_millis(200);
+
+    let mut config = TestConfig::default();
+    for name in ["ab", "bc", "ac"] {
+        config.switches.push(TestSwitchConfig { name: name.into() });
+    }
+    let link = |switch_name: &str| LinkConfig {
+        transport: LinkTransport::Test {
+            switch_name: switch_name.into(),
+        },
+        ogm: TrickleConfig {
+            i_min_ms: i_min.as_millis() as u64,
+            i_max_ms: i_max.as_millis() as u64,
+        },
+        features: LinkFeatures::default(),
+    };
+    config.machines.push(TestMachineConfig {
+        name: "a".into(),
+        wayfinder: Config {
+            links: vec![link("ab"), link("ac")],
+            ..Default::default()
+        },
+    });
+    config.machines.push(TestMachineConfig {
+        name: "b".into(),
+        wayfinder: Config {
+            links: vec![link("ab"), link("bc")],
+            ..Default::default()
+        },
+    });
+    config.machines.push(TestMachineConfig {
+        name: "c".into(),
+        wayfinder: Config {
+            links: vec![link("ac"), link("bc")],
+            ..Default::default()
+        },
+    });
+    let mut harness = config.validate().unwrap();
+
+    // Arm a real keep-alive schedule on `c`'s interface 0 (the `ac` link).
+    // The declarative `TestConfig`/`MachineSpec` wiring doesn't thread
+    // `tx_keepalive` through yet (a harness gap, not a production one — the
+    // real drivers arm it at construction, see `Driver::new`), so wire it
+    // directly onto the already-built router.
+    let keepalive_interval = Duration::from_millis(150);
+    harness
+        .get_machine_mut("c")
+        .router_mut()
+        .configure_interface_keepalive(0, Some(keepalive_interval), Duration::ZERO);
+
+    // Converge the mesh over the real Trickle schedule so `a` learns both
+    // the direct path to `c` and the relayed one through `b`.
+    harness.advance_trickle(Duration::from_secs(2)).await;
+
+    let dest = harness.get_machine("c").ident;
+    let b_ident = harness.get_machine("b").ident;
+
+    // Count genuine keep-alive frames hitting the wire, so the test proves
+    // real transmissions occurred rather than only checking the eventual
+    // routing effect.
+    let ka_counter = Arc::new(AtomicUsize::new(0));
+    for switch in harness.switches.values_mut() {
+        for port in switch.port_ids() {
+            let ka_counter = ka_counter.clone();
+            switch
+                .add_tap(
+                    port,
+                    TapConfig::new(move |meta| {
+                        if meta.direction == Direction::ToSwitch
+                            && meta.data.len() > 14
+                            && meta.data[12..14] == DEFAULT_BATMAN_ETHER_TYPE.to_be_bytes()
+                            && meta.data[14] == BATADV_KEEPALIVE
+                        {
+                            ka_counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                        true
+                    }),
+                )
+                .unwrap();
+        }
+    }
+
+    // Two real keep-alive ticks from `c`, `keepalive_interval` apart, teach
+    // `a` the learned cadence — delivered through the actual `ac` switch.
+    for _ in 0..2u32 {
+        harness.clock += keepalive_interval;
+        let t = harness.clock;
+        harness.get_machine_mut("c").poll_due_keepalive(t).await;
+        harness.tick().await;
+    }
+    assert_eq!(
+        ka_counter.load(Ordering::Relaxed),
+        2,
+        "both keep-alive ticks must have produced a real, wire-delivered frame"
+    );
+
+    let (next_hop, _) = harness
+        .get_machine("a")
+        .router()
+        .resolve_route(harness.clock, dest);
+    assert_eq!(next_hop, dest, "before any miss, the direct path wins");
+
+    // `c` stops ticking its keep-alive, but keeps converging normally over
+    // Trickle — the direct path's OGM freshness alone must not save it.
+    harness
+        .advance_trickle(harness.clock + keepalive_interval * 5)
+        .await;
+
+    let (next_hop, _) = harness
+        .get_machine("a")
+        .router()
+        .resolve_route(harness.clock, dest);
+    assert_eq!(
+        next_hop, b_ident,
+        "a missed keep-alive must switch the route to the relayed path, \
+         even though the direct link's OGM path is still fresh"
+    );
 }
 
 /// The default `sim/topology.py` wiring as a test harness: a 4-node diamond

@@ -18,12 +18,15 @@ class Link:
     distinct. `name` defaults to the endpoints joined with `-`, matching
     `sim/topology.py`'s deterministic-name convention. `trickle`, if set,
     overrides every member's `Node.trickle` for the interface this link
-    creates on that node."""
+    creates on that node. `tx_keepalive_interval_ms`, if set, likewise
+    overrides every member's `Node.tx_keepalive_interval_ms` for that
+    interface."""
 
     endpoints: tuple[str, ...]
     channel: Channel
     name: str | None = None
     trickle: tuple[int, int] | None = None
+    tx_keepalive_interval_ms: int | None = None
 
     def __post_init__(self) -> None:
         if len(set(self.endpoints)) < 2:

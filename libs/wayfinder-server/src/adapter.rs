@@ -20,10 +20,10 @@ use wayfinder::wayfinder_auth::MembershipCert;
 use wayfinder::wayfinder_auth::RevocationRecord;
 use wayfinder::wayfinder_auth::TrustAnchor;
 use wayfinder_protos::service::{
-    CsrOutcome, EgressDecisionData, InterfaceThroughputData, IssuedCertData, LinkQualityEntryData,
-    NeighborPathData, NodeMetricsData, NodeSecurityData, OgmScheduleEntryData, PendingCsrData,
-    RouteResolutionData, RoutingEntryData, RuntimeConfigData, SecurityStatusData,
-    TableOccupancyData, WayfinderDataProvider,
+    CsrOutcome, EgressDecisionData, InterfaceThroughputData, IssuedCertData, KeepAliveEntryData,
+    LinkQualityEntryData, NeighborPathData, NodeMetricsData, NodeSecurityData,
+    OgmScheduleEntryData, PendingCsrData, RouteResolutionData, RoutingEntryData, RuntimeConfigData,
+    SecurityStatusData, TableOccupancyData, WayfinderDataProvider,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -106,6 +106,18 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
                 iface_idx: r.iface_idx as u32,
                 ewma_quality: r.ewma_quality as u32,
                 sample_count: r.sample_count,
+            })
+            .collect()
+    }
+
+    fn keepalive_table(&self) -> Vec<KeepAliveEntryData> {
+        self.router
+            .keepalive_table(self.now)
+            .map(|e| KeepAliveEntryData {
+                neighbor_id: e.neighbor.as_bytes().to_vec(),
+                ms_since_last_heard: e.ms_since_last_heard,
+                interval_estimate_ms: e.interval_estimate_ms,
+                missed: e.missed,
             })
             .collect()
     }
@@ -264,7 +276,7 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
         // the management API returns a structured error rather than silently
         // routing to a truncated or zero-padded address.
         let dest = Mac::read_from_bytes(destination).ok()?;
-        let (next_hop, egress) = self.router.resolve_route(dest);
+        let (next_hop, egress) = self.router.resolve_route(self.now, dest);
         Some(RouteResolutionData {
             next_hop: next_hop.as_bytes().to_vec(),
             egress: egress.map(|e| match e {
@@ -324,7 +336,14 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
             if let Some(v) = lf.rx_data {
                 features.rx_data = v;
             }
-            if !self.router.apply_runtime_link_features(idx, features) {
+            if let Some(v) = lf.tx_keepalive {
+                features.tx_keepalive =
+                    v.map(|interval_ms| wayfinder::features::KeepAliveConfig { interval_ms });
+            }
+            if !self
+                .router
+                .apply_runtime_link_features(idx, features, self.now)
+            {
                 return Err("interface index out of range".to_string());
             }
         }
@@ -598,6 +617,82 @@ mod tests {
             "unnamed flags left untouched"
         );
         assert!(RouterAdapter::new(&mut router, None, Duration::ZERO).runtime_config_active());
+    }
+
+    /// `set_config` with a `tx_keepalive` update arms the heartbeat schedule
+    /// at the given cadence, leaving every other gate untouched — the same
+    /// partial-merge contract as the plain bool flags.
+    #[test]
+    fn set_config_tx_keepalive_arms_schedule() {
+        let mut router = CentralRouter::new(mac(1));
+        router.configure_interface_ogm(
+            0,
+            Duration::from_secs(1),
+            Duration::from_secs(8),
+            Duration::ZERO,
+        );
+        assert!(router.link_features(0).tx_keepalive.is_none());
+
+        let result =
+            RouterAdapter::new(&mut router, None, Duration::ZERO).set_config(RuntimeConfigData {
+                link_features: Some(LinkFeaturesData {
+                    iface_idx: 0,
+                    tx_keepalive: Some(Some(2_000)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        assert!(result.is_ok());
+
+        let f = router.link_features(0);
+        assert_eq!(
+            f.tx_keepalive.map(|ka| ka.interval_ms),
+            Some(2_000),
+            "keep-alive armed at the requested cadence"
+        );
+        assert!(
+            f.tx_ogm && f.rx_ogm && f.tx_data && f.rx_data,
+            "unnamed flags left untouched"
+        );
+    }
+
+    /// A `tx_keepalive` update with no interval (the "disabled" oneof
+    /// variant) tears down a previously armed schedule.
+    #[test]
+    fn set_config_tx_keepalive_disable_clears_schedule() {
+        let mut router = CentralRouter::new(mac(1));
+        router.configure_interface_ogm(
+            0,
+            Duration::from_secs(1),
+            Duration::from_secs(8),
+            Duration::ZERO,
+        );
+        RouterAdapter::new(&mut router, None, Duration::ZERO)
+            .set_config(RuntimeConfigData {
+                link_features: Some(LinkFeaturesData {
+                    iface_idx: 0,
+                    tx_keepalive: Some(Some(2_000)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(router.link_features(0).tx_keepalive.is_some());
+
+        RouterAdapter::new(&mut router, None, Duration::ZERO)
+            .set_config(RuntimeConfigData {
+                link_features: Some(LinkFeaturesData {
+                    iface_idx: 0,
+                    tx_keepalive: Some(None),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            router.link_features(0).tx_keepalive.is_none(),
+            "the disabled update must clear a previously armed schedule"
+        );
     }
 
     /// A `link_features` update targeting an unregistered interface index is

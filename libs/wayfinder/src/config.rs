@@ -129,7 +129,7 @@ impl LinkTransport {
 // The per-link participation flags live in the allocation-free core so the
 // router can gate traffic on them on every deployment; this crate's config
 // layer re-exports the type so `wayfinder::config::LinkFeatures` keeps resolving.
-pub use crate::features::LinkFeatures;
+pub use crate::features::{KeepAliveConfig, LinkFeatures};
 
 /// A single mesh interface: its transport carrier, its per-link OGM backoff
 /// bounds, and its per-link participation [`features`](LinkConfig::features).
@@ -610,9 +610,46 @@ switch_name: sw0
         let link: LinkConfig = serde_yaml::from_str(yaml).unwrap();
         let f = link.features;
         assert!(f.tx_ogm && f.rx_ogm && f.tx_data && f.rx_data);
+        assert!(
+            f.tx_keepalive.is_none(),
+            "keep-alive transmission is opt-in, off by default"
+        );
         // The struct's own Default matches the serde-omitted result.
         let d = LinkFeatures::default();
         assert!(d.tx_ogm && d.rx_ogm && d.tx_data && d.rx_data);
+        assert!(d.tx_keepalive.is_none());
+    }
+
+    /// A `features:` block naming `tx_keepalive` arms the heartbeat at the
+    /// given cadence; an empty `{}` block falls back to the default interval.
+    #[test]
+    fn keepalive_config_parses_with_default_interval() {
+        let yaml = "\
+type: Test
+switch_name: sw0
+features:
+  tx_keepalive:
+    interval_ms: 2000
+";
+        let link: LinkConfig = serde_yaml::from_str(yaml).unwrap();
+        let ka = link
+            .features
+            .tx_keepalive
+            .expect("tx_keepalive was configured");
+        assert_eq!(ka.interval_ms, 2000);
+
+        let yaml_default = "\
+type: Test
+switch_name: sw0
+features:
+  tx_keepalive: {}
+";
+        let link: LinkConfig = serde_yaml::from_str(yaml_default).unwrap();
+        let ka = link.features.tx_keepalive.expect("tx_keepalive armed");
+        assert_eq!(
+            ka.interval_ms,
+            crate::features::KeepAliveConfig::default_interval_ms()
+        );
     }
 
     /// A partial `features:` block flips only the named flags; every unnamed
@@ -682,6 +719,25 @@ features:
         let err = serde_yaml::from_str::<LinkConfig>(yaml).unwrap_err();
         assert!(
             err.to_string().contains("tx_ogmm") || err.to_string().contains("unknown field"),
+            "expected an unknown-field error, got: {err}"
+        );
+    }
+
+    /// A misspelled key under `tx_keepalive:` is a hard parse error too, not
+    /// a silent fall-back to the default interval — the same
+    /// `deny_unknown_fields` reasoning as `link_features_rejects_unknown_key`.
+    #[test]
+    fn keepalive_config_rejects_unknown_key() {
+        let yaml = "\
+type: Test
+switch_name: sw0
+features:
+  tx_keepalive:
+    intervall_ms: 2000
+";
+        let err = serde_yaml::from_str::<LinkConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("intervall_ms") || err.to_string().contains("unknown field"),
             "expected an unknown-field error, got: {err}"
         );
     }

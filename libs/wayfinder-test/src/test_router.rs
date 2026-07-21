@@ -291,6 +291,33 @@ impl TestRouter {
         self.router().next_broadcast_after(now)
     }
 
+    /// Drive one periodic keep-alive tick at `now`, emitting a heartbeat for
+    /// each interface whose fixed-cadence timer is due — the deterministic
+    /// counterpart to the production periodic loop
+    /// ([`Driver::poll_due_keepalive`]). A test wanting keep-alive active on
+    /// an interface arms it first via
+    /// `router_mut().configure_interface_keepalive(idx, Some(interval), now)`,
+    /// same pattern as `set_link_features` — this is not a `TestRouter::new`/
+    /// `from_links` constructor parameter.
+    pub async fn poll_due_keepalive(&mut self, now: Duration) {
+        #[expect(
+            clippy::expect_used,
+            reason = "test harness: the in-process channel transports have no failure mode reachable from a test"
+        )]
+        {
+            self.driver
+                .poll_due_keepalive(now)
+                .await
+                .expect("poll_due_keepalive dispatch failed");
+        }
+    }
+
+    /// Time until this node's soonest interface is next due to emit a
+    /// keep-alive, as of `now`.
+    pub fn next_keepalive_after(&self, now: Duration) -> Duration {
+        self.router().next_keepalive_after(now)
+    }
+
     /// Inject host application data destined for `dest` into the mesh.
     ///
     /// Wraps `payload` in a host Ethernet frame (see [`host_frame`]) addressed

@@ -11,9 +11,9 @@ use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
 use wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
 use wayfinder_protos::service::{
-    CsrOutcome, InterfaceThroughputData, IssuedCertData, LinkQualityEntryData, NodeMetricsData,
-    OgmScheduleEntryData, PendingCsrData, RouteResolutionData, RoutingEntryData, RuntimeConfigData,
-    TableOccupancyData, WayfinderDataProvider, WayfinderService,
+    CsrOutcome, InterfaceThroughputData, IssuedCertData, KeepAliveEntryData, LinkQualityEntryData,
+    NodeMetricsData, OgmScheduleEntryData, PendingCsrData, RouteResolutionData, RoutingEntryData,
+    RuntimeConfigData, TableOccupancyData, WayfinderDataProvider, WayfinderService,
 };
 use wayfinder_protos::wayfinder_v1alpha::{WayfinderRequest, WayfinderResponse};
 use wayfinder_server::{CertAuthority, MeshAuthority, run_tcp_server};
@@ -47,6 +47,9 @@ impl WayfinderDataProvider for ProviderMock {
         vec![]
     }
     fn link_quality_table(&self) -> Vec<LinkQualityEntryData> {
+        vec![]
+    }
+    fn keepalive_table(&self) -> Vec<KeepAliveEntryData> {
         vec![]
     }
     fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData> {

@@ -24,9 +24,21 @@ def _resolve(channel: ChannelLike, a: str, b: str) -> Channel:
     return channel(a, b)
 
 
-def pair(a: str, b: str, channel: ChannelLike) -> Link:
+def pair(
+    a: str,
+    b: str,
+    channel: ChannelLike,
+    *,
+    trickle: tuple[int, int] | None = None,
+    tx_keepalive_interval_ms: int | None = None,
+) -> Link:
     """A single point-to-point link between `a` and `b`."""
-    return Link((a, b), _resolve(channel, a, b))
+    return Link(
+        (a, b),
+        _resolve(channel, a, b),
+        trickle=trickle,
+        tx_keepalive_interval_ms=tx_keepalive_interval_ms,
+    )
 
 
 def path(names: Sequence[str], channel: ChannelLike) -> list[Link]:
