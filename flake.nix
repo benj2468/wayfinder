@@ -119,6 +119,7 @@
               tshark
               glab
               stdenv.cc.cc.lib
+              probe-rs-tools
             ];
 
             nativeBuildInputs = with pkgs; [
