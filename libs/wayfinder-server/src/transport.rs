@@ -1,20 +1,29 @@
-//! The per-transport listener loops (TCP, Unix datagram, UDP) and the query
-//! channel the event loop services.
+//! The management-API transport: the authenticated TLS listener loop, the
+//! in-process channel server, and the query channel the event loop services.
 //!
 //! Queries are forwarded to the main loop over a channel so the router is never
 //! shared across tasks. This module requires the `std` feature.
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::net::SocketAddr;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use prost::Message;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::{
-    net::{TcpListener, UdpSocket, UnixDatagram},
+    net::TcpListener,
     sync::{mpsc, oneshot},
 };
+use tokio_rustls::TlsAcceptor;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use wayfinder_protos::wayfinder_v1alpha::{WayfinderRequest, WayfinderResponse};
+use wayfinder::interfaces::frame::Mac;
+use wayfinder::wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
+use wayfinder_protos::wayfinder_v1alpha::{
+    Empty, ErrorResponse, WayfinderRequest, WayfinderResponse,
+    wayfinder_request::Request as ReqKind, wayfinder_response::Response as RespKind,
+};
+
+use crate::{MgmtAccess, decide_access};
 
 /// Sender half of the channel server tasks use to forward queries to the loop.
 pub type QueryTx = mpsc::Sender<(WayfinderRequest, oneshot::Sender<WayfinderResponse>)>;
@@ -32,18 +41,159 @@ pub type ChannelServerRx = mpsc::Receiver<ChannelRequest>;
 /// issue management queries without going through a real socket (e.g. tests).
 pub type ChannelServerTx = mpsc::Sender<ChannelRequest>;
 
-/// Handle one stream-based connection (TCP or Unix socket) using
-/// length-delimited framing (4-byte big-endian length prefix).
-async fn serve_stream<S>(stream: S, query_tx: QueryTx) -> anyhow::Result<()>
+/// The router state a management connection is authorized against, snapshotted
+/// once when the connection authenticates.
+///
+/// The serve task must not touch the router directly (it lives on another task),
+/// so the router's auth-relevant state is projected into this value and the serve
+/// task evaluates [`decide_access`] locally against it. Snapshotting at
+/// connect time means a connection's authorization reflects the mesh state when
+/// it opened.
+pub struct AuthContext {
+    /// The node's own Ed25519 identity key, for the bootstrap comparison
+    /// (un-enrolled admission requires the handshake key to equal this).
+    pub own_key: [u8; 32],
+    /// The installed trust anchor, or `None` when the node is un-enrolled
+    /// (bootstrap mode — self-key admission only).
+    pub anchor: Option<TrustAnchor>,
+    /// Node MACs with an active revocation as of the snapshot instant.
+    pub revoked: Vec<Mac>,
+    /// Current unix time (seconds), for certificate validity checks.
+    pub now_unix: u64,
+}
+
+/// Encode and send one [`WayfinderResponse`] over the framed connection.
+async fn send_response<S>(
+    framed: &mut Framed<S, LengthDelimitedCodec>,
+    response: RespKind,
+) -> anyhow::Result<()>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let envelope = WayfinderResponse {
+        response: Some(response),
+    };
+    let mut buf = Vec::new();
+    envelope.encode(&mut buf)?;
+    framed.send(Bytes::from(buf)).await?;
+    Ok(())
+}
+
+/// Serve one already-TLS-authenticated management connection.
+///
+/// `peer_key` is the client's Ed25519 raw public key that the TLS handshake
+/// proved possession of (RFC 7250). The first frame must be an
+/// [`AuthenticateRequest`](wayfinder_protos::wayfinder_v1alpha::AuthenticateRequest)
+/// carrying the client's membership cert (empty on an un-enrolled node); it is
+/// bound to `peer_key` and checked by [`decide_access`] against `ctx`. A grant
+/// is acknowledged with an [`Empty`] response (which the client waits on) before
+/// the normal request/response loop runs; a denial is answered with a generic
+/// [`ErrorResponse`] and the connection closed.
+///
+/// Transport-agnostic over `S` so it serves a real `TlsStream` in production and
+/// an in-memory duplex in tests — the TLS handshake itself is exercised
+/// separately in [`crate::tls`].
+pub async fn serve_authenticated_stream<S>(
+    stream: S,
+    peer_key: [u8; 32],
+    ctx: AuthContext,
+    query_tx: QueryTx,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut framed: Framed<S, LengthDelimitedCodec> =
         LengthDelimitedCodec::builder().new_framed(stream);
 
+    // The connection must authenticate before anything else.
+    let Some(frame) = framed.next().await else {
+        // Client disconnected before authenticating; nothing to serve.
+        return Ok(());
+    };
+    // A framing or protobuf-decode failure on the very first frame is arbitrary
+    // remote input (the peer need only complete the RPK handshake to reach
+    // here), so drop it at trace rather than escalating to the connection-error
+    // warn! — a malformed packet must not flood the logs.
+    let frame = match frame {
+        Ok(frame) => frame,
+        Err(e) => {
+            tracing::trace!(error = ?e, "drop: management framing error before auth");
+            return Ok(());
+        }
+    };
+    let request = match WayfinderRequest::decode(frame) {
+        Ok(request) => request,
+        Err(e) => {
+            tracing::trace!(error = ?e, "drop: malformed first management frame");
+            return Ok(());
+        }
+    };
+    let cert_bytes = match request.request {
+        Some(ReqKind::Authenticate(auth)) => auth.cert,
+        _ => {
+            send_response(
+                &mut framed,
+                RespKind::Error(ErrorResponse {
+                    message: "first message on a management connection must be Authenticate".into(),
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    // An empty cert means "bootstrap" (no membership cert yet); non-empty must
+    // parse, else the connection is refused rather than served.
+    let cert = if cert_bytes.is_empty() {
+        None
+    } else {
+        match MembershipCert::from_bytes(&cert_bytes) {
+            Some(cert) => Some(cert),
+            None => {
+                send_response(
+                    &mut framed,
+                    RespKind::Error(ErrorResponse {
+                        message: "malformed membership certificate".into(),
+                    }),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    };
+
+    let decision = decide_access(
+        &peer_key,
+        cert.as_ref(),
+        ctx.anchor.as_ref(),
+        &ctx.own_key,
+        ctx.now_unix,
+        |mac| ctx.revoked.contains(&mac),
+    );
+    if let MgmtAccess::Denied(reason) = decision {
+        // A rejected management login is security-relevant and worth an
+        // operator's attention, but is remotely triggerable, so cap it at warn.
+        // The precise `reason` stays in this local log only: a generic message
+        // goes over the wire so a not-yet-authenticated peer can't use the
+        // response as an oracle (wrong-key vs revoked vs expired vs not-admin)
+        // while probing with a stolen or revoked cert.
+        tracing::warn!(?reason, "drop: management authentication denied");
+        send_response(
+            &mut framed,
+            RespKind::Error(ErrorResponse {
+                message: "authentication denied".into(),
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+    tracing::debug!(?decision, "management connection authenticated");
+    // Acknowledge a successful authentication before serving requests.
+    send_response(&mut framed, RespKind::Empty(Empty {})).await?;
+
+    // Authenticated: serve requests until the peer hangs up.
     while let Some(frame) = framed.next().await {
-        let frame = frame?;
-        let request = WayfinderRequest::decode(frame)?;
+        let request = WayfinderRequest::decode(frame?)?;
         let (resp_tx, resp_rx) = oneshot::channel();
         query_tx.send((request, resp_tx)).await?;
         let response = resp_rx.await?;
@@ -54,9 +204,121 @@ where
     Ok(())
 }
 
-/// Bind the TCP management-API listener without serving it.
+/// The router-owned half of an [`AuthContext`]: the auth state the TLS accept
+/// loop must read from the router (which lives on another task) to authorize a
+/// connection. `own_key` and the clock are supplied by the accept loop itself
+/// (from the node's seed and the system clock), so only these router-derived
+/// fields travel over the channel.
+pub struct AuthSnapshot {
+    /// The installed trust anchor, or `None` when the node is un-enrolled.
+    pub anchor: Option<TrustAnchor>,
+    /// Node MACs with an active revocation.
+    pub revoked: Vec<Mac>,
+}
+
+/// Sender the TLS accept loop uses to ask the router loop for an
+/// [`AuthSnapshot`]; the router replies on the enclosed one-shot.
+pub type AuthSnapshotTx = mpsc::Sender<oneshot::Sender<AuthSnapshot>>;
+/// Receiver half, serviced by the router event loop alongside [`QueryRx`].
+pub type AuthSnapshotRx = mpsc::Receiver<oneshot::Sender<AuthSnapshot>>;
+
+/// Current unix time in seconds, for certificate validity checks on the host.
 ///
-/// Split out from [`run_tcp_server`] so a caller can bind every configured
+/// Errors (rather than defaulting) if the host clock is before the Unix epoch:
+/// `0` is the most-permissive value for a `not_after` comparison, so silently
+/// substituting it would let an *expired* admin cert pass the expiry gate on a
+/// mis-set clock. Failing here closes the connection instead — fail-closed.
+fn now_unix() -> anyhow::Result<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|e| {
+            anyhow::anyhow!("system clock is before the Unix epoch; refusing to authorize: {e}")
+        })
+}
+
+/// Accept TLS management connections on `listener`, authenticate each by its
+/// RFC 7250 raw public key, and serve authorized ones.
+///
+/// The node presents `own_seed`'s Ed25519 key as its TLS identity; each client
+/// presents its own raw key, which the handshake proves possession of. Per
+/// connection the loop reads that key, snapshots the router's auth state via
+/// `snapshot_tx`, and hands both to [`serve_authenticated_stream`], which makes
+/// the [`decide_access`] decision. `own_seed` must be the node's persistent
+/// identity seed and exists even before enrollment (bootstrap presents it).
+pub async fn serve_tls_server(
+    listener: TcpListener,
+    own_seed: [u8; 32],
+    snapshot_tx: AuthSnapshotTx,
+    query_tx: QueryTx,
+) -> anyhow::Result<()> {
+    let config = crate::server_config(&own_seed)
+        .map_err(|e| anyhow::anyhow!("building management TLS server config: {e}"))?;
+    let acceptor = TlsAcceptor::from(config);
+    let own_key = Keypair::from_seed(&own_seed).ed_pubkey();
+
+    loop {
+        let (tcp, peer) = listener.accept().await?;
+        tracing::debug!(%peer, "management TLS connection accepted");
+        let acceptor = acceptor.clone();
+        let snapshot_tx = snapshot_tx.clone();
+        let query_tx = query_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                serve_tls_connection(acceptor, tcp, own_key, snapshot_tx, query_tx).await
+            {
+                tracing::warn!(%peer, error = ?e, "management TLS connection error");
+            }
+        });
+    }
+}
+
+/// Complete the TLS handshake, recover the client's raw public key, snapshot the
+/// router's auth state, and serve the connection.
+async fn serve_tls_connection(
+    acceptor: TlsAcceptor,
+    tcp: tokio::net::TcpStream,
+    own_key: [u8; 32],
+    snapshot_tx: AuthSnapshotTx,
+    query_tx: QueryTx,
+) -> anyhow::Result<()> {
+    let tls = acceptor.accept(tcp).await?;
+
+    // Recover the client's Ed25519 identity from the raw public key it presented
+    // in the handshake (which TLS just proved it holds the private half of).
+    let peer_key = {
+        let (_io, conn) = tls.get_ref();
+        let spki = conn
+            .peer_certificates()
+            .and_then(<[_]>::first)
+            .ok_or_else(|| anyhow::anyhow!("client presented no raw public key"))?;
+        wayfinder_tls_mgmt::raw_ed25519_from_spki(spki.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("client key is not a raw Ed25519 public key"))?
+    };
+
+    // Snapshot the router's current auth state (anchor + revocations).
+    let (reply_tx, reply_rx) = oneshot::channel();
+    snapshot_tx
+        .send(reply_tx)
+        .await
+        .map_err(|_| anyhow::anyhow!("router loop unavailable for auth snapshot"))?;
+    let snapshot = reply_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("router loop dropped the auth-snapshot request"))?;
+
+    let ctx = AuthContext {
+        own_key,
+        anchor: snapshot.anchor,
+        revoked: snapshot.revoked,
+        now_unix: now_unix()?,
+    };
+    serve_authenticated_stream(tls, peer_key, ctx, query_tx).await
+}
+
+/// Bind the TCP listener the TLS management server accepts on, without serving
+/// it.
+///
+/// Split out from [`serve_tls_server`] so a caller can bind every configured
 /// listener up front -- surfacing a bind failure (e.g. address in use)
 /// synchronously -- before spawning the accept loops and declaring itself
 /// ready.
@@ -64,30 +326,6 @@ pub async fn bind_tcp_server(addr: SocketAddr) -> anyhow::Result<TcpListener> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("management API listening on TCP {addr}");
     Ok(listener)
-}
-
-/// Accept TCP connections on an already-bound listener and service each as a
-/// length-delimited stream.
-pub async fn serve_tcp_server(listener: TcpListener, query_tx: QueryTx) -> anyhow::Result<()> {
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        tracing::debug!(%peer, "management connection accepted");
-        let tx = query_tx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = serve_stream(stream, tx).await {
-                tracing::warn!(error = ?e, "management stream error");
-            }
-        });
-    }
-}
-
-/// Accept TCP connections and service each as a length-delimited stream.
-///
-/// Convenience wrapper composing [`bind_tcp_server`] and [`serve_tcp_server`]
-/// for callers that don't need to bind ahead of spawning.
-pub async fn run_tcp_server(addr: SocketAddr, query_tx: QueryTx) -> anyhow::Result<()> {
-    let listener = bind_tcp_server(addr).await?;
-    serve_tcp_server(listener, query_tx).await
 }
 
 /// Why [`handle_connectionless`] failed to produce a response.
@@ -129,60 +367,6 @@ async fn handle_connectionless(
     Ok(out)
 }
 
-/// Bind the Unix datagram management-API socket without serving it.
-///
-/// Split out from [`run_unix_server`] for the same reason as
-/// [`bind_tcp_server`]: let a caller bind up front and surface a failure
-/// synchronously, before spawning the serve loop.
-pub async fn bind_unix_server(path: PathBuf) -> anyhow::Result<UnixDatagram> {
-    if std::fs::metadata(&path).is_ok() {
-        std::fs::remove_file(&path)?;
-    }
-    let listener = UnixDatagram::bind(&path)?;
-    tracing::info!("management API listening on unix socket {}", path.display());
-    Ok(listener)
-}
-
-/// Serve the management API over an already-bound Unix datagram socket.
-pub async fn serve_unix_server(listener: UnixDatagram, query_tx: QueryTx) -> anyhow::Result<()> {
-    let mut buf = vec![0u8; 65535];
-    loop {
-        let (len, peer) = listener.recv_from(&mut buf).await?;
-        // A malformed datagram from any peer must not take down the server for
-        // everyone else — log and move on to the next datagram instead of
-        // propagating out of the loop.  A dead router, in contrast, means this
-        // listener can no longer do anything useful, so that case still ends
-        // the loop (visibly, via this function returning `Err`).
-        let response = match handle_connectionless(&buf[..len], query_tx.clone()).await {
-            Ok(response) => response,
-            Err(ConnectionlessError::Decode(e)) => {
-                tracing::trace!(error = ?e, "drop: malformed management request");
-                continue;
-            }
-            Err(ConnectionlessError::RouterGone) => {
-                anyhow::bail!("management router event loop is unreachable");
-            }
-        };
-        // An unbound sender has no path to reply to; there's nothing to send the
-        // response to, so just drop it.
-        let Some(peer_path) = peer.as_pathname() else {
-            tracing::trace!("dropping unix datagram reply: peer is unnamed");
-            continue;
-        };
-        let _ = listener.send_to(&response, peer_path).await;
-    }
-}
-
-/// Serve the management API over a Unix datagram socket.
-///
-/// Convenience wrapper composing [`bind_unix_server`] and
-/// [`serve_unix_server`] for callers that don't need to bind ahead of
-/// spawning.
-pub async fn run_unix_server(path: PathBuf, query_tx: QueryTx) -> anyhow::Result<()> {
-    let listener = bind_unix_server(path).await?;
-    serve_unix_server(listener, query_tx).await
-}
-
 /// Serve the management API over an in-process mpsc channel.
 ///
 /// Mirrors the socket listeners but carries already-/still-encoded protobuf
@@ -192,9 +376,8 @@ pub async fn run_unix_server(path: PathBuf, query_tx: QueryTx) -> anyhow::Result
 /// pair; the encoded response is sent back on `reply`.
 pub async fn run_channel_server(mut rx: ChannelServerRx, query_tx: QueryTx) -> anyhow::Result<()> {
     while let Some((request, reply)) = rx.recv().await {
-        // Same reasoning as `run_unix_server`/`run_udp_server`: a caller that
-        // sends a malformed request must not take down the loop for everyone
-        // else queued behind it.
+        // A caller that sends a malformed request must not take down the loop
+        // for everyone else queued behind it.
         let response = match handle_connectionless(&request, query_tx.clone()).await {
             Ok(response) => response,
             Err(ConnectionlessError::Decode(e)) => {
@@ -210,66 +393,21 @@ pub async fn run_channel_server(mut rx: ChannelServerRx, query_tx: QueryTx) -> a
     Ok(())
 }
 
-/// Bind the UDP management-API socket without serving it.
-///
-/// Split out from [`run_udp_server`] for the same reason as
-/// [`bind_tcp_server`]: let a caller bind up front and surface a failure
-/// synchronously, before spawning the serve loop.
-pub async fn bind_udp_server(addr: SocketAddr) -> anyhow::Result<UdpSocket> {
-    let socket = UdpSocket::bind(addr).await?;
-    tracing::info!("management API listening on UDP {addr}");
-    Ok(socket)
-}
-
-/// Serve the management API over an already-bound UDP socket.
-pub async fn serve_udp_server(socket: UdpSocket, query_tx: QueryTx) -> anyhow::Result<()> {
-    let mut buf = vec![0u8; 65535];
-    loop {
-        let (len, peer) = socket.recv_from(&mut buf).await?;
-        // Same reasoning as `run_unix_server`: a malformed datagram from any
-        // peer must not take down the server for everyone else, but a dead
-        // router still ends the loop visibly.
-        let response = match handle_connectionless(&buf[..len], query_tx.clone()).await {
-            Ok(response) => response,
-            Err(ConnectionlessError::Decode(e)) => {
-                tracing::trace!(error = ?e, "drop: malformed management request");
-                continue;
-            }
-            Err(ConnectionlessError::RouterGone) => {
-                anyhow::bail!("management router event loop is unreachable");
-            }
-        };
-        let _ = socket.send_to(&response, peer).await;
-    }
-}
-
-/// Serve the management API over UDP.
-///
-/// Convenience wrapper composing [`bind_udp_server`] and [`serve_udp_server`]
-/// for callers that don't need to bind ahead of spawning.
-pub async fn run_udp_server(addr: SocketAddr, query_tx: QueryTx) -> anyhow::Result<()> {
-    let socket = bind_udp_server(addr).await?;
-    serve_udp_server(socket, query_tx).await
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::atomic::{AtomicU64, Ordering},
-        time::Duration,
-    };
+    use std::time::Duration;
 
-    use tokio::net::{TcpStream, UnixDatagram};
+    use tokio::net::TcpStream;
     use tokio::sync::mpsc;
     use wayfinder_protos::wayfinder_v1alpha::{
-        GetNodeInfoRequest, NodeInfo, WayfinderRequest, WayfinderResponse,
+        AuthenticateRequest, GetNodeInfoRequest, NodeInfo, WayfinderRequest, WayfinderResponse,
         wayfinder_request::Request, wayfinder_response::Response,
     };
 
     use super::*;
 
     /// A free TCP port on loopback, picked by asking the OS for one and
-    /// releasing it immediately, mirroring `free_udp_addr` below.
+    /// releasing it immediately.
     fn free_tcp_addr() -> SocketAddr {
         std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -291,9 +429,9 @@ mod tests {
             .expect("bind must succeed on a free port");
 
         // The socket is already in LISTEN state at the OS level as soon as
-        // `bind_tcp_server` returns -- no `serve_tcp_server` has been spawned
-        // yet, and none is needed for the kernel to accept the connection
-        // into its backlog.
+        // `bind_tcp_server` returns -- no accept loop has been spawned yet, and
+        // none is needed for the kernel to accept the connection into its
+        // backlog.
         tokio::time::timeout(Duration::from_millis(200), TcpStream::connect(addr))
             .await
             .expect("connect must not time out")
@@ -309,48 +447,6 @@ mod tests {
         // visible to the caller as soon as `bind_tcp_server` returns, not
         // only later when a spawned serve-loop future happens to be polled.
         assert!(bind_tcp_server(addr).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn bind_udp_server_reports_port_conflict_synchronously() {
-        let addr = free_udp_addr();
-        let _held = std::net::UdpSocket::bind(addr).unwrap();
-
-        assert!(bind_udp_server(addr).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn bind_unix_server_creates_socket_before_serve_loop_runs() {
-        let path = unique_socket_path("bind-before-serve");
-
-        let _socket = bind_unix_server(path.clone())
-            .await
-            .expect("bind must succeed on a fresh path");
-
-        assert!(
-            path.exists(),
-            "socket file must exist as soon as bind returns"
-        );
-    }
-
-    /// A unique per-call socket path under the OS temp dir, so parallel test
-    /// runs (and repeated calls within one test) never collide on `bind`.
-    fn unique_socket_path(label: &str) -> std::path::PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "wayfinder-server-test-{}-{label}-{n}.sock",
-            std::process::id()
-        ))
-    }
-
-    fn node_info_request_bytes() -> Vec<u8> {
-        let request = WayfinderRequest {
-            request: Some(Request::GetNodeInfo(GetNodeInfoRequest {})),
-        };
-        let mut buf = Vec::new();
-        prost::Message::encode(&request, &mut buf).unwrap();
-        buf
     }
 
     /// Answers every forwarded query with a canned `NodeInfo`, so a well-formed
@@ -371,88 +467,320 @@ mod tests {
         });
     }
 
+    /// Encode a `WayfinderRequest` into a length-delimited frame payload.
+    fn encode_request(request: Request) -> Bytes {
+        let envelope = WayfinderRequest {
+            request: Some(request),
+        };
+        let mut buf = Vec::new();
+        envelope.encode(&mut buf).unwrap();
+        Bytes::from(buf)
+    }
+
+    /// Drive `serve_authenticated_stream` over an in-memory duplex, returning a
+    /// framed client handle and the server task's join handle.
+    fn spawn_authenticated_server(
+        peer_key: [u8; 32],
+        ctx: AuthContext,
+    ) -> (
+        Framed<tokio::io::DuplexStream, LengthDelimitedCodec>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let (query_tx, query_rx) = mpsc::channel(16);
+        spawn_echo(query_rx);
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(serve_authenticated_stream(
+            server_io, peer_key, ctx, query_tx,
+        ));
+        (
+            LengthDelimitedCodec::builder().new_framed(client_io),
+            server,
+        )
+    }
+
+    /// On an un-enrolled node, a client that proves the node's own key
+    /// (bootstrap) is granted, then its subsequent requests are served.
     #[tokio::test]
-    async fn unix_server_survives_unnamed_peer_and_malformed_datagram() {
-        let server_path = unique_socket_path("server");
+    async fn authenticated_stream_bootstrap_grants_then_serves() {
+        let key = [5u8; 32];
+        let ctx = AuthContext {
+            own_key: key, // bootstrap: handshake key equals the node's own key
+            anchor: None, // un-enrolled
+            revoked: Vec::new(),
+            now_unix: 100,
+        };
+        let (mut client, server) = spawn_authenticated_server(key, ctx);
+
+        // Authenticate with an empty cert (bootstrap).
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: Vec::new(),
+            })))
+            .await
+            .unwrap();
+        let ack = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(
+            matches!(ack.response, Some(Response::Empty(_))),
+            "bootstrap authentication is acknowledged with Empty"
+        );
+
+        // A normal request is now served.
+        client
+            .send(encode_request(Request::GetNodeInfo(GetNodeInfoRequest {})))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(resp.response, Some(Response::NodeInfo(_))));
+
+        drop(client);
+        let _ = server.await;
+    }
+
+    /// A client whose handshake key is not the node's own key (on an un-enrolled
+    /// node) is refused, and the connection is closed without serving anything.
+    #[tokio::test]
+    async fn authenticated_stream_denies_wrong_bootstrap_key() {
+        let ctx = AuthContext {
+            own_key: [1u8; 32],
+            anchor: None,
+            revoked: Vec::new(),
+            now_unix: 100,
+        };
+        let (mut client, server) = spawn_authenticated_server([2u8; 32], ctx);
+
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: Vec::new(),
+            })))
+            .await
+            .unwrap();
+
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        match resp.response {
+            Some(Response::Error(e)) => assert!(e.message.contains("denied"), "got: {}", e.message),
+            other => panic!("expected an error response, got {other:?}"),
+        }
+        // The server closed the connection after refusing.
+        assert!(
+            client.next().await.is_none(),
+            "connection is closed after a denied authentication"
+        );
+        let _ = server.await;
+    }
+
+    /// The full stack over a real loopback TLS connection: a client presenting
+    /// the node's own key (bootstrap) completes the RFC 7250 handshake, the
+    /// accept loop recovers its key and snapshots the (un-enrolled) router, and
+    /// authenticated requests are served. Exercises `serve_tls_server` end to end
+    /// with a genuine `tokio-rustls` client.
+    #[tokio::test]
+    async fn tls_server_serves_a_bootstrapping_client_end_to_end() {
+        use tokio_rustls::TlsConnector;
+
+        let server_seed = [7u8; 32];
+        let server_key = Keypair::from_seed(&server_seed).ed_pubkey();
+
+        // Stand-in router loop: un-enrolled (bootstrap), nothing revoked.
+        let (snapshot_tx, mut snapshot_rx) = mpsc::channel::<oneshot::Sender<AuthSnapshot>>(4);
+        tokio::spawn(async move {
+            while let Some(reply) = snapshot_rx.recv().await {
+                let _ = reply.send(AuthSnapshot {
+                    anchor: None,
+                    revoked: Vec::new(),
+                });
+            }
+        });
 
         let (query_tx, query_rx) = mpsc::channel(16);
         spawn_echo(query_rx);
-        tokio::spawn(run_unix_server(server_path.clone(), query_tx));
-        tokio::time::sleep(Duration::from_millis(20)).await;
 
-        // An unbound sender has no path for the server to reply to:
-        // `peer.as_pathname()` is `None` on the receiving end, which used to
-        // `unwrap()` and panic the whole server loop.
-        let unbound = UnixDatagram::unbound().unwrap();
-        unbound
-            .send_to(&node_info_request_bytes(), &server_path)
-            .await
-            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_tls_server(
+            listener,
+            server_seed,
+            snapshot_tx,
+            query_tx,
+        ));
 
-        // Garbage bytes fail to decode as a `WayfinderRequest`; that must not
-        // propagate out of the loop and kill the server for every other client
-        // either.
-        let garbage_client = UnixDatagram::bind(unique_socket_path("garbage")).unwrap();
-        garbage_client
-            .send_to(&[0xff, 0x00, 0xff], &server_path)
-            .await
-            .unwrap();
+        // Client presents the node's own key (bootstrap) and pins the node key.
+        let connector = TlsConnector::from(crate::tls::test_support::test_client_config(
+            &server_seed,
+            &server_key,
+        ));
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let tls = connector.connect(server_name, tcp).await.unwrap();
+        let mut client = LengthDelimitedCodec::builder().new_framed(tls);
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
-        // The server must still be alive: a well-formed, properly-bound request
-        // gets a real reply.
-        let client = UnixDatagram::bind(unique_socket_path("client")).unwrap();
         client
-            .send_to(&node_info_request_bytes(), &server_path)
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: Vec::new(),
+            })))
             .await
             .unwrap();
+        let ack = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(
+            matches!(ack.response, Some(Response::Empty(_))),
+            "bootstrap authentication succeeds over real TLS"
+        );
 
-        let mut buf = vec![0u8; 4096];
-        let len = tokio::time::timeout(Duration::from_secs(1), client.recv(&mut buf))
+        client
+            .send(encode_request(Request::GetNodeInfo(GetNodeInfoRequest {})))
             .await
-            .expect("server is still responding after bad input")
             .unwrap();
-        let response: WayfinderResponse = prost::Message::decode(&buf[..len]).unwrap();
-        assert!(matches!(response.response, Some(Response::NodeInfo(_))));
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(resp.response, Some(Response::NodeInfo(_))));
     }
 
-    fn free_udp_addr() -> SocketAddr {
-        std::net::UdpSocket::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-    }
-
+    /// Sending a normal request before authenticating is refused — the first
+    /// frame must be Authenticate.
     #[tokio::test]
-    async fn udp_server_survives_malformed_datagram() {
-        let addr = free_udp_addr();
+    async fn authenticated_stream_requires_authenticate_first() {
+        let key = [5u8; 32];
+        let ctx = AuthContext {
+            own_key: key,
+            anchor: None,
+            revoked: Vec::new(),
+            now_unix: 100,
+        };
+        let (mut client, server) = spawn_authenticated_server(key, ctx);
 
-        let (query_tx, query_rx) = mpsc::channel(16);
-        spawn_echo(query_rx);
-        tokio::spawn(run_udp_server(addr, query_tx));
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-
-        // Garbage bytes fail to decode as a `WayfinderRequest`; that must not
-        // propagate out of the loop and kill the server for every other client.
-        client.send_to(&[0xff, 0x00, 0xff], addr).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
-        // The server must still be alive: a well-formed request still gets a
-        // real reply.
+        // Skip authentication and send a query first.
         client
-            .send_to(&node_info_request_bytes(), addr)
+            .send(encode_request(Request::GetNodeInfo(GetNodeInfoRequest {})))
             .await
             .unwrap();
 
-        let mut buf = vec![0u8; 4096];
-        let (len, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        match resp.response {
+            Some(Response::Error(e)) => {
+                assert!(e.message.contains("Authenticate"), "got: {}", e.message)
+            }
+            other => panic!("expected an error response, got {other:?}"),
+        }
+        assert!(client.next().await.is_none());
+        let _ = server.await;
+    }
+
+    /// On an *enrolled* node, a client presenting a valid admin membership cert
+    /// bound to its handshake key is granted and then served — the production
+    /// (non-bootstrap) authorization path over the wire, which the unit tests in
+    /// `authz` exercise only in isolation.
+    #[tokio::test]
+    async fn authenticated_stream_enrolled_admin_grants_then_serves() {
+        use wayfinder::wayfinder_auth::Authority;
+        use zerocopy::IntoBytes;
+
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let admin_kp = Keypair::from_seed(&[2u8; 32]);
+        let admin_cert = authority.issue_admin_cert(
+            Mac([0, 0, 0, 0, 0, 5]),
+            admin_kp.ed_pubkey(),
+            admin_kp.x_pubkey(),
+            0,
+            200,
+        );
+        let ctx = AuthContext {
+            own_key: [9u8; 32], // not the client's key: only the cert can admit it
+            anchor: Some(authority.trust_anchor()),
+            revoked: Vec::new(),
+            now_unix: 100,
+        };
+        let (mut client, server) = spawn_authenticated_server(admin_kp.ed_pubkey(), ctx);
+
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: admin_cert.as_bytes().to_vec(),
+            })))
             .await
-            .expect("server is still responding after bad input")
             .unwrap();
-        let response: WayfinderResponse = prost::Message::decode(&buf[..len]).unwrap();
-        assert!(matches!(response.response, Some(Response::NodeInfo(_))));
+        let ack = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(
+            matches!(ack.response, Some(Response::Empty(_))),
+            "a bound admin cert is granted on an enrolled node"
+        );
+
+        client
+            .send(encode_request(Request::GetNodeInfo(GetNodeInfoRequest {})))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(resp.response, Some(Response::NodeInfo(_))));
+
+        drop(client);
+        let _ = server.await;
+    }
+
+    /// On an enrolled node, a revoked admin's cert is refused over the wire even
+    /// though it verifies and is key-bound: revocation dominates the admin bit.
+    #[tokio::test]
+    async fn authenticated_stream_denies_revoked_admin() {
+        use wayfinder::wayfinder_auth::Authority;
+        use zerocopy::IntoBytes;
+
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let admin_kp = Keypair::from_seed(&[2u8; 32]);
+        let admin_mac = Mac([0, 0, 0, 0, 0, 5]);
+        let admin_cert = authority.issue_admin_cert(
+            admin_mac,
+            admin_kp.ed_pubkey(),
+            admin_kp.x_pubkey(),
+            0,
+            200,
+        );
+        let ctx = AuthContext {
+            own_key: [9u8; 32],
+            anchor: Some(authority.trust_anchor()),
+            revoked: vec![admin_mac], // this admin's node is revoked
+            now_unix: 100,
+        };
+        let (mut client, server) = spawn_authenticated_server(admin_kp.ed_pubkey(), ctx);
+
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: admin_cert.as_bytes().to_vec(),
+            })))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        match resp.response {
+            Some(Response::Error(e)) => assert!(e.message.contains("denied"), "got: {}", e.message),
+            other => panic!("expected an error response, got {other:?}"),
+        }
+        assert!(
+            client.next().await.is_none(),
+            "connection is closed after a revoked admin is refused"
+        );
+        let _ = server.await;
+    }
+
+    /// A non-empty but unparseable membership cert is refused explicitly (not
+    /// silently treated as "no cert" / bootstrap), and the connection closed.
+    #[tokio::test]
+    async fn authenticated_stream_denies_malformed_cert() {
+        let ctx = AuthContext {
+            own_key: [9u8; 32],
+            anchor: None,
+            revoked: Vec::new(),
+            now_unix: 100,
+        };
+        let (mut client, server) = spawn_authenticated_server([2u8; 32], ctx);
+
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: vec![0xFF; 8], // not a valid MembershipCert
+            })))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        match resp.response {
+            Some(Response::Error(e)) => {
+                assert!(e.message.contains("malformed"), "got: {}", e.message)
+            }
+            other => panic!("expected an error response, got {other:?}"),
+        }
+        assert!(client.next().await.is_none());
+        let _ = server.await;
     }
 }

@@ -6,7 +6,7 @@
 use interfaces::frame::Mac;
 use zerocopy::byteorder::network_endian::{U32, U64};
 
-use crate::cert::{CERT_VERSION, MembershipCert, TrustAnchor};
+use crate::cert::{CERT_FLAG_ADMIN, CERT_VERSION, MembershipCert, TrustAnchor};
 use crate::key::Keypair;
 use crate::revoke::{REVOKE_VERSION, RevocationRecord};
 
@@ -54,9 +54,46 @@ impl Authority {
         not_before: u64,
         not_after: u64,
     ) -> MembershipCert {
+        self.issue_with_flags(mac, ed_pubkey, x_pubkey, not_before, not_after, 0)
+    }
+
+    /// Issue a membership certificate that additionally carries the
+    /// management-administration capability ([`CERT_FLAG_ADMIN`]): the holder
+    /// may invoke privileged management-API operations, not merely route.  Grant
+    /// this only to operator/"user" identities, never routine member nodes.
+    pub fn issue_admin_cert(
+        &self,
+        mac: Mac,
+        ed_pubkey: [u8; 32],
+        x_pubkey: [u8; 32],
+        not_before: u64,
+        not_after: u64,
+    ) -> MembershipCert {
+        self.issue_with_flags(
+            mac,
+            ed_pubkey,
+            x_pubkey,
+            not_before,
+            not_after,
+            CERT_FLAG_ADMIN,
+        )
+    }
+
+    /// Build and sign a membership cert with the given `flags`, the shared body
+    /// behind [`issue_cert`](Self::issue_cert) and
+    /// [`issue_admin_cert`](Self::issue_admin_cert).
+    fn issue_with_flags(
+        &self,
+        mac: Mac,
+        ed_pubkey: [u8; 32],
+        x_pubkey: [u8; 32],
+        not_before: u64,
+        not_after: u64,
+        flags: u8,
+    ) -> MembershipCert {
         let mut cert = MembershipCert {
             version: CERT_VERSION,
-            flags: 0,
+            flags,
             mesh_id: U32::new(self.mesh_id),
             node_mac: mac.0,
             ed_pubkey,

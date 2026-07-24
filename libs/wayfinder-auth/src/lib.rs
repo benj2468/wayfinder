@@ -36,7 +36,7 @@ mod revoke;
 #[cfg(feature = "std")]
 mod authority;
 
-pub use cert::{CERT_VERSION, MembershipCert, TrustAnchor, VerifiedCert};
+pub use cert::{CERT_FLAG_ADMIN, CERT_VERSION, MembershipCert, TrustAnchor, VerifiedCert};
 pub use error::AuthError;
 pub use key::{Keypair, verify_signature};
 pub use mac::{derive_mac, force_locally_administered_unicast};

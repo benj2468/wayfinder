@@ -23,9 +23,8 @@ use wayfinder::config::{
 use wayfinder::interfaces::frame::Mac;
 use wayfinder::wayfinder_auth::Keypair;
 use wayfinder_driver::{
-    Driver, QueryRx, QueryTx, Rylr998LinkParams, bind_tcp_server, bind_udp_server,
-    bind_unix_server, build_raw_ip_link, build_raw_l2_link, build_rylr998_link, build_udp_link,
-    serve_tcp_server, serve_udp_server, serve_unix_server,
+    AuthSnapshotRx, AuthSnapshotTx, Driver, QueryRx, QueryTx, Rylr998LinkParams, bind_tcp_server,
+    build_raw_ip_link, build_raw_l2_link, build_rylr998_link, build_udp_link, serve_tls_server,
 };
 
 use crate::tap::TapDevice;
@@ -79,6 +78,68 @@ fn load_or_generate_mac(state_path: &str) -> anyhow::Result<[u8; 6]> {
             Ok(mac)
         }
         Err(e) => Err(e).with_context(|| format!("failed to read MAC state file at {state_path}")),
+    }
+}
+
+/// Read a 32-byte identity seed from `path`.
+fn read_seed(path: &str) -> anyhow::Result<[u8; 32]> {
+    std::fs::read(path)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("identity seed at {path} must be 32 bytes"))
+}
+
+/// Read this node's persisted management-TLS identity seed from `path`, or
+/// generate one and persist it on first boot. The TLS server identity (which
+/// clients pin, and which is the bootstrap key before enrollment) must be stable
+/// across restarts. Used when there is no `[auth]` seed to reuse. The seed is
+/// secret, so the persisted file is created owner-read/write only.
+fn load_or_generate_seed(path: &str) -> anyhow::Result<[u8; 32]> {
+    match std::fs::read(path) {
+        Ok(bytes) => bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("identity seed at {path} must be 32 bytes")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let seed = Keypair::generate_seed();
+            if let Some(parent) = Path::new(path).parent() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "failed to create identity seed directory {}",
+                        parent.display()
+                    )
+                })?;
+            }
+            // Create the file already restricted to owner-only rather than
+            // writing it world-readable and narrowing afterwards: the seed is
+            // secret and must never be exposed, even briefly, in a window where
+            // another local process could read it.
+            #[cfg(unix)]
+            {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)
+                    .with_context(|| {
+                        format!("failed to create identity seed file {path} (owner-only)")
+                    })?;
+                f.write_all(&seed).with_context(|| {
+                    format!("failed to persist generated identity seed to {path}")
+                })?;
+            }
+            #[cfg(not(unix))]
+            std::fs::write(path, seed)
+                .with_context(|| format!("failed to persist generated identity seed to {path}"))?;
+            tracing::info!(
+                path,
+                "generated and persisted a new management-TLS identity seed"
+            );
+            Ok(seed)
+        }
+        Err(e) => Err(e).with_context(|| format!("failed to read identity seed at {path}")),
     }
 }
 
@@ -210,21 +271,45 @@ async fn main() -> anyhow::Result<()> {
     // a channel so the router is never shared across tasks.
     let (query_tx, query_rx): (QueryTx, QueryRx) = mpsc::channel(16);
 
+    // Set when a TLS management server is configured. The `CentralRouter` (and
+    // so the current trust anchor + revocation list) lives only on the driver's
+    // task, but the TLS server needs that state on its own task to decide
+    // whether to admit each incoming connection (`decide_access`). Rather than
+    // sharing the router across tasks, the server asks for a fresh `AuthSnapshot`
+    // over this channel on every new connection and the driver answers it
+    // in-line with its event loop — so authorization always reflects the
+    // router's current state (e.g. a revocation made moments earlier) without
+    // giving the server task direct access to the router. Installed on the
+    // driver below, after it's built.
+    let mut auth_snapshot_rx: Option<AuthSnapshotRx> = None;
+
     if let Some(server_cfg) = config.server {
         let tx = query_tx.clone();
         match server_cfg {
-            ServerConfig::Tcp { addr } => {
+            ServerConfig::Tls {
+                addr,
+                identity_seed_path,
+            } => {
+                // The TLS server identity: reuse the mesh membership seed when
+                // configured, otherwise a dedicated persistent identity seed
+                // (generated on first boot). It must exist even before
+                // enrollment, since the bootstrap client authenticates by
+                // proving this key.
+                let identity_seed = match &config.auth {
+                    Some(auth_cfg) => read_seed(&auth_cfg.seed_path)?,
+                    None => {
+                        let path = identity_seed_path
+                            .unwrap_or_else(ServerConfig::default_identity_seed_path);
+                        load_or_generate_seed(&path)?
+                    }
+                };
                 let listener = bind_tcp_server(addr).await?;
-                join_set.spawn(async move { serve_tcp_server(listener, tx).await });
-            }
-            ServerConfig::UnixSocket { path } => {
-                let path = Path::new(&path).to_path_buf();
-                let socket = bind_unix_server(path).await?;
-                join_set.spawn(async move { serve_unix_server(socket, tx).await });
-            }
-            ServerConfig::Udp { addr } => {
-                let socket = bind_udp_server(addr).await?;
-                join_set.spawn(async move { serve_udp_server(socket, tx).await });
+                let (snapshot_tx, snapshot_rx): (AuthSnapshotTx, AuthSnapshotRx) =
+                    mpsc::channel(16);
+                auth_snapshot_rx = Some(snapshot_rx);
+                join_set.spawn(async move {
+                    serve_tls_server(listener, identity_seed, snapshot_tx, tx).await
+                });
             }
         }
     }
@@ -237,6 +322,11 @@ async fn main() -> anyhow::Result<()> {
         features,
         query_rx,
     );
+    // Give the driver the receiver the TLS server snapshots authorization state
+    // over (no-op when no TLS server is configured).
+    if let Some(rx) = auth_snapshot_rx {
+        driver.set_auth_snapshot_rx(rx);
+    }
 
     // Fail-closed policy: when configured, the router stays inert (see
     // `CentralRouter::auth_locked`) until a membership cert is installed below

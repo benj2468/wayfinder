@@ -73,11 +73,13 @@ field off the `Snapshot`/`App` state defined in `bins/wayfinder-tui/src/app.rs`
 
 The real over-the-wire test lives in `bins/wayfinder-ctl/tests/query.rs`, not
 in `wayfinder-tui` (CLAUDE.md's wording there is imprecise about which crate
-owns it). It spins up a real `run_tcp_server` via the `spawn_server()` helper
-against a `Mock: WayfinderDataProvider`. To extend:
+owns it). It spins up a real authenticated `serve_tls_server` via the
+`spawn_server()` helper against a `Mock: WayfinderDataProvider`, and
+`spawn_server()` returns an `Endpoint` the client bootstraps against. To extend:
 1. Add the new field/method to `Mock`'s impl with a distinctive test value.
 2. Add a `#[tokio::test]` that calls `spawn_server()`, issues the new query via
-   `run_query`, and asserts on the rendered JSON and human output — mirroring
+   `run_query(cmd, &endpoint, output)`, and asserts on the rendered JSON and
+   human output — mirroring
    `node_info_query_renders_json_from_server` /
    `node_info_query_renders_human_from_server`.
 

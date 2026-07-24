@@ -5,20 +5,21 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
+use wayfinder_client::Identity;
 use wayfinder_protos::service::{
     CsrOutcome, InterfaceThroughputData, IssuedCertData, KeepAliveEntryData, LinkQualityEntryData,
     NodeMetricsData, OgmScheduleEntryData, PendingCsrData, RouteResolutionData, RoutingEntryData,
     RuntimeConfigData, TableOccupancyData, WayfinderDataProvider, WayfinderService,
 };
 use wayfinder_protos::wayfinder_v1alpha::{WayfinderRequest, WayfinderResponse};
-use wayfinder_server::{CertAuthority, MeshAuthority, run_tcp_server};
+use wayfinder_server::{AuthSnapshot, CertAuthority, MeshAuthority, serve_tls_server};
 use wayfinderctl::output::OutputFormat;
-use wayfinderctl::{Command, CsrCommand, run_query};
+use wayfinderctl::{Command, CsrCommand, Endpoint, run_query};
 
 /// A provider node: a real certificate authority behind the data-provider trait.
 /// Only the provider methods carry behaviour; the rest are trivial.
@@ -123,27 +124,42 @@ impl WayfinderDataProvider for ProviderMock {
     }
 }
 
-fn free_port() -> SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-}
-
-/// Spawn a provider node (mesh `0xABCD`, optional token) and return its address.
-async fn spawn_provider(token: Option<String>) -> SocketAddr {
+/// Spawn a provider node (mesh `0xABCD`, optional token) and return a bootstrap
+/// [`Endpoint`] for it.
+async fn spawn_provider(token: Option<String>) -> Endpoint {
     spawn_provider_with(token, false).await
 }
 
-/// Spawn a provider node, choosing whether it requires operator approval.
-async fn spawn_provider_with(token: Option<String>, require_approval: bool) -> SocketAddr {
-    let addr = free_port();
+/// Spawn a provider node, choosing whether it requires operator approval, and
+/// return an [`Endpoint`] that bootstraps against it (the node is un-enrolled at
+/// the transport layer, so proving its own key is admitted).
+async fn spawn_provider_with(token: Option<String>, require_approval: bool) -> Endpoint {
+    // The node's TLS identity seed; the bootstrap client presents this same key.
+    let seed = [9u8; 32];
+    let node_key = Keypair::from_seed(&seed).ed_pubkey();
+
     let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, token, require_approval);
     ca.set_now_unix(100);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
     let (query_tx, mut query_rx) =
         mpsc::channel::<(WayfinderRequest, oneshot::Sender<WayfinderResponse>)>(16);
+
+    // Auth snapshot responder: un-enrolled (no anchor), nothing revoked — so the
+    // client bootstrapping with the node's own key is granted.
+    let (snapshot_tx, mut snapshot_rx) = mpsc::channel::<oneshot::Sender<AuthSnapshot>>(4);
     tokio::spawn(async move {
-        let _ = run_tcp_server(addr, query_tx).await;
+        while let Some(reply) = snapshot_rx.recv().await {
+            let _ = reply.send(AuthSnapshot {
+                anchor: None,
+                revoked: Vec::new(),
+            });
+        }
+    });
+    tokio::spawn(async move {
+        let _ = serve_tls_server(listener, seed, snapshot_tx, query_tx).await;
     });
     tokio::spawn(async move {
         let mut service = WayfinderService::new(ProviderMock { ca });
@@ -152,12 +168,20 @@ async fn spawn_provider_with(token: Option<String>, require_approval: bool) -> S
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    addr
+
+    Endpoint {
+        addr,
+        node_key,
+        identity: Identity {
+            seed,
+            cert: Vec::new(),
+        },
+    }
 }
 
 #[tokio::test]
 async fn enroll_yields_a_cert_that_verifies_against_the_anchor() {
-    let addr = spawn_provider(None).await;
+    let endpoint = spawn_provider(None).await;
     let dir = tempfile::tempdir().unwrap();
     let seed = dir.path().join("seed");
     let cert = dir.path().join("cert");
@@ -171,7 +195,7 @@ async fn enroll_yields_a_cert_that_verifies_against_the_anchor() {
             out_cert: cert.clone(),
             out_anchor: anchor.clone(),
         },
-        &addr.to_string(),
+        &endpoint,
         OutputFormat::Human,
     )
     .await
@@ -193,7 +217,7 @@ async fn enroll_yields_a_cert_that_verifies_against_the_anchor() {
 /// the MAC the node will actually run under.
 #[tokio::test]
 async fn enroll_without_mac_derives_it_from_the_keypair() {
-    let addr = spawn_provider(None).await;
+    let endpoint = spawn_provider(None).await;
     let dir = tempfile::tempdir().unwrap();
     let seed = dir.path().join("seed");
     let cert = dir.path().join("cert");
@@ -207,7 +231,7 @@ async fn enroll_without_mac_derives_it_from_the_keypair() {
             out_cert: cert.clone(),
             out_anchor: anchor.clone(),
         },
-        &addr.to_string(),
+        &endpoint,
         OutputFormat::Human,
     )
     .await
@@ -229,7 +253,7 @@ async fn enroll_reuses_an_existing_seed_file_instead_of_minting_a_new_identity()
     // identity it already wrote, not mint a fresh keypair — otherwise a
     // require-approval provider sees a "different key" on every retry and the
     // enrollment can never converge.
-    let addr = spawn_provider(None).await;
+    let endpoint = spawn_provider(None).await;
     let dir = tempfile::tempdir().unwrap();
     let seed = dir.path().join("seed");
     let cert = dir.path().join("cert");
@@ -245,7 +269,7 @@ async fn enroll_reuses_an_existing_seed_file_instead_of_minting_a_new_identity()
 
     run_query(
         enroll_cmd(seed.clone(), cert.clone(), anchor.clone()),
-        &addr.to_string(),
+        &endpoint,
         OutputFormat::Human,
     )
     .await
@@ -256,7 +280,7 @@ async fn enroll_reuses_an_existing_seed_file_instead_of_minting_a_new_identity()
     // back and reused rather than replaced with a freshly-generated one.
     run_query(
         enroll_cmd(seed.clone(), cert.clone(), anchor.clone()),
-        &addr.to_string(),
+        &endpoint,
         OutputFormat::Human,
     )
     .await
@@ -280,7 +304,7 @@ async fn enroll_reuses_an_existing_seed_file_instead_of_minting_a_new_identity()
 
 #[tokio::test]
 async fn enroll_rejected_without_required_token() {
-    let addr = spawn_provider(Some("s3cret".to_string())).await;
+    let endpoint = spawn_provider(Some("s3cret".to_string())).await;
     let dir = tempfile::tempdir().unwrap();
     let err = run_query(
         Command::Enroll {
@@ -290,7 +314,7 @@ async fn enroll_rejected_without_required_token() {
             out_cert: dir.path().join("cert"),
             out_anchor: dir.path().join("anchor"),
         },
-        &addr.to_string(),
+        &endpoint,
         OutputFormat::Human,
     )
     .await
@@ -303,7 +327,7 @@ async fn enroll_rejected_without_required_token() {
 
 #[tokio::test]
 async fn list_certs_shows_an_enrolled_node() {
-    let addr = spawn_provider(None).await;
+    let endpoint = spawn_provider(None).await;
     let dir = tempfile::tempdir().unwrap();
     run_query(
         Command::Enroll {
@@ -313,13 +337,13 @@ async fn list_certs_shows_an_enrolled_node() {
             out_cert: dir.path().join("cert"),
             out_anchor: dir.path().join("anchor"),
         },
-        &addr.to_string(),
+        &endpoint,
         OutputFormat::Json,
     )
     .await
     .unwrap();
 
-    let out = run_query(Command::ListCerts, &addr.to_string(), OutputFormat::Json)
+    let out = run_query(Command::ListCerts, &endpoint, OutputFormat::Json)
         .await
         .expect("list-certs succeeds");
     let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -332,8 +356,8 @@ async fn list_certs_shows_an_enrolled_node() {
 
 #[tokio::test]
 async fn list_certs_is_empty_before_any_enrollment() {
-    let addr = spawn_provider(None).await;
-    let out = run_query(Command::ListCerts, &addr.to_string(), OutputFormat::Human)
+    let endpoint = spawn_provider(None).await;
+    let out = run_query(Command::ListCerts, &endpoint, OutputFormat::Human)
         .await
         .unwrap();
     assert!(out.contains("no certificates issued"), "got: {out}");
@@ -341,12 +365,12 @@ async fn list_certs_is_empty_before_any_enrollment() {
 
 #[tokio::test]
 async fn revoke_round_trips() {
-    let addr = spawn_provider(None).await;
+    let endpoint = spawn_provider(None).await;
     let out = run_query(
         Command::Revoke {
             mac: "02:00:00:00:00:09".into(),
         },
-        &addr.to_string(),
+        &endpoint,
         OutputFormat::Human,
     )
     .await
@@ -356,15 +380,11 @@ async fn revoke_round_trips() {
 
 /// Poll `csr list` until a CSR appears pending, then return once it does — the
 /// operator's cue to act.
-async fn wait_for_pending(addr: SocketAddr) {
+async fn wait_for_pending(endpoint: &Endpoint) {
     for _ in 0..500 {
-        let out = run_query(
-            Command::Csr(CsrCommand::List),
-            &addr.to_string(),
-            OutputFormat::Json,
-        )
-        .await
-        .unwrap();
+        let out = run_query(Command::Csr(CsrCommand::List), endpoint, OutputFormat::Json)
+            .await
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         if parsed["pending"].as_array().is_some_and(|p| !p.is_empty()) {
             return;
@@ -376,14 +396,15 @@ async fn wait_for_pending(addr: SocketAddr) {
 
 #[tokio::test]
 async fn enroll_waits_for_operator_approval_then_succeeds() {
-    let addr = spawn_provider_with(None, true).await;
+    let endpoint = spawn_provider_with(None, true).await;
     let dir = tempfile::tempdir().unwrap();
     let cert_path = dir.path().join("cert");
     let anchor_path = dir.path().join("anchor");
 
     // Operator: wait for the CSR to be parked as pending, then approve it.
+    let approver_endpoint = endpoint.clone();
     let _approver = tokio::spawn(async move {
-        wait_for_pending(addr).await;
+        wait_for_pending(&approver_endpoint).await;
     });
 
     // Enrolling node: fails at first, responds with pending
@@ -395,7 +416,7 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
             out_cert: cert_path.clone(),
             out_anchor: anchor_path.clone(),
         },
-        &addr.to_string(),
+        &endpoint,
         OutputFormat::Human,
     )
     .await
@@ -409,7 +430,7 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
         Command::Csr(CsrCommand::Approve {
             mac: "02:00:00:00:00:09".into(),
         }),
-        &addr.to_string(),
+        &endpoint,
         OutputFormat::Human,
     )
     .await
@@ -424,7 +445,7 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
             out_cert: cert_path.clone(),
             out_anchor: anchor_path.clone(),
         },
-        &addr.to_string(),
+        &endpoint,
         OutputFormat::Human,
     )
     .await
@@ -442,7 +463,7 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
 
 #[tokio::test]
 async fn enroll_fails_when_operator_denies() {
-    let addr = spawn_provider_with(None, true).await;
+    let endpoint = spawn_provider_with(None, true).await;
     let dir = tempfile::tempdir().unwrap();
 
     let err = run_query(
@@ -453,7 +474,7 @@ async fn enroll_fails_when_operator_denies() {
             out_cert: dir.path().join("cert"),
             out_anchor: dir.path().join("anchor"),
         },
-        &addr.to_string(),
+        &endpoint,
         OutputFormat::Human,
     )
     .await
@@ -467,7 +488,7 @@ async fn enroll_fails_when_operator_denies() {
         Command::Csr(CsrCommand::Deny {
             mac: "02:00:00:00:00:09".into(),
         }),
-        &addr.to_string(),
+        &endpoint,
         OutputFormat::Human,
     )
     .await
@@ -481,7 +502,7 @@ async fn enroll_fails_when_operator_denies() {
             out_cert: dir.path().join("cert"),
             out_anchor: dir.path().join("anchor"),
         },
-        &addr.to_string(),
+        &endpoint,
         OutputFormat::Human,
     )
     .await
