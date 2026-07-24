@@ -1,21 +1,18 @@
 //! End-to-end check that [`wayfinder_client::Client`] speaks the same wire
-//! protocol as the production `wayfinder-server` listeners, over **both**
-//! transports it supports.
+//! protocol as the production `wayfinder-server` TLS listener.
 //!
-//! Each test spins up the real listener (`run_tcp_server` / `run_unix_server`)
-//! backed by a canned data provider, then drives it with the client, asserting
-//! the decoded responses match what the provider returned. This exercises the
-//! full prost-encode → frame → decode path on both sides without a TAP device.
+//! The test spins up the real `serve_tls_server` backed by a canned data
+//! provider, then drives it with an authenticated client, asserting the decoded
+//! responses match what the provider returned. This exercises the full
+//! RFC 7250 handshake → prost-encode → frame → decode path on both sides without
+//! a TAP device.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
-use wayfinder_client::{Client, ConnectTarget};
+use wayfinder_client::Client;
 use wayfinder_protos::service::{
     EgressDecisionData, InterfaceThroughputData, KeepAliveEntryData, LinkQualityEntryData,
     NeighborPathData, NodeMetricsData, OgmScheduleEntryData, RouteResolutionData, RoutingEntryData,
@@ -24,7 +21,6 @@ use wayfinder_protos::service::{
 use wayfinder_protos::wayfinder_v1alpha::{
     WayfinderRequest, WayfinderResponse, resolve_route_response::Egress,
 };
-use wayfinder_server::{run_tcp_server, run_unix_server};
 
 /// Render a 6-byte identifier as a colon-delimited MAC, else as plain hex.
 fn format_mac(bytes: &[u8]) -> String {
@@ -186,26 +182,7 @@ fn free_port() -> SocketAddr {
     listener.local_addr().unwrap()
 }
 
-/// A process-unique temp path for a test server's Unix socket.
-fn unique_server_path() -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("wf-client-test-{}-{}.sock", std::process::id(), n))
-}
-
-/// Connect with a few retries to absorb the gap before the listener is up.
-async fn connect_with_retry(target: &ConnectTarget) -> Client {
-    for _ in 0..50 {
-        if let Ok(c) = Client::connect(target).await {
-            return c;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("server never became reachable");
-}
-
-/// Assert every typed query returns the provider's canned values — the shared
-/// body of the per-transport tests.
+/// Assert every typed query returns the provider's canned values.
 async fn assert_full_roundtrip(client: &mut Client) {
     let info = client.node_info().await.unwrap();
     assert_eq!(format_mac(&info.node_id), "aa:bb:cc:dd:ee:01");
@@ -261,31 +238,46 @@ async fn assert_full_roundtrip(client: &mut Client) {
 }
 
 #[tokio::test]
-async fn client_roundtrips_against_real_tcp_server() {
-    let addr = free_port();
+async fn client_roundtrips_against_real_tls_server() {
+    use wayfinder_client::Identity;
+
+    let node_seed = [7u8; 32];
+    // Derive the node's public key from its seed via the exported RPK helpers so
+    // the client can pin it; in bootstrap the client holds the node's own seed.
+    let ck = wayfinder_tls_mgmt::certified_key_from_seed(&node_seed).unwrap();
+    let node_key = wayfinder_tls_mgmt::raw_ed25519_from_spki(ck.cert[0].as_ref()).unwrap();
+
     let query_tx = spawn_service();
+
+    // Un-enrolled router snapshot responder (bootstrap mode): no anchor, nothing
+    // revoked.
+    let (snapshot_tx, mut snapshot_rx) =
+        mpsc::channel::<oneshot::Sender<wayfinder_server::AuthSnapshot>>(8);
     tokio::spawn(async move {
-        let _ = run_tcp_server(addr, query_tx).await;
+        while let Some(reply) = snapshot_rx.recv().await {
+            let _ = reply.send(wayfinder_server::AuthSnapshot {
+                anchor: None,
+                revoked: Vec::new(),
+            });
+        }
     });
 
-    let mut client = connect_with_retry(&ConnectTarget::Tcp(addr)).await;
+    let listener = wayfinder_server::bind_tcp_server(free_port())
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ =
+            wayfinder_server::serve_tls_server(listener, node_seed, snapshot_tx, query_tx).await;
+    });
+
+    // Bootstrap: present the node's own seed and an empty cert; pin the node key.
+    let identity = Identity {
+        seed: node_seed,
+        cert: Vec::new(),
+    };
+    let mut client = Client::connect_tls(addr, &node_key, &identity)
+        .await
+        .unwrap();
     assert_full_roundtrip(&mut client).await;
-}
-
-#[tokio::test]
-async fn client_roundtrips_against_real_unix_server() {
-    let path = unique_server_path();
-    let query_tx = spawn_service();
-    {
-        let path = path.clone();
-        tokio::spawn(async move {
-            let _ = run_unix_server(path, query_tx).await;
-        });
-    }
-
-    let mut client = connect_with_retry(&ConnectTarget::Unix(path.clone())).await;
-    assert_full_roundtrip(&mut client).await;
-
-    // The listener tidy-up is best-effort; remove the server socket too.
-    let _ = std::fs::remove_file(&path);
 }

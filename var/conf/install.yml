@@ -4,7 +4,12 @@ local_egress:
   ip_address: 10.0.0.1
   netmask: 255.255.255.0
 server:
-  type: Tcp
+  # Authenticated, encrypted management API. Clients authenticate by their mesh
+  # membership identity (RFC 7250 raw public key in the TLS handshake); only a
+  # non-revoked admin — or, before enrollment, a client proving the node's own
+  # key — is admitted. The node's TLS identity reuses the `[auth]` seed when
+  # configured, else a persistent seed generated on first boot.
+  type: Tls
   addr: 0.0.0.0:7700
 links:
   - type: RawL2

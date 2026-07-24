@@ -8,14 +8,25 @@ workspace = true
 
 [dependencies]
 wayfinder-protos.workspace = true
+# The Ed25519-identity <-> rustls-raw-public-key bridge shared with
+# `wayfinder-server`; neither management-TLS crate depends on the other.
+wayfinder-tls-mgmt.workspace = true
+# The identity crate: `Keypair` (to derive the pinned node key from a seed) and
+# the seed/cert types the client authenticates with.
+wayfinder-auth.workspace = true
 tokio = { workspace = true }
 tokio-util.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
 futures.workspace = true
 anyhow.workspace = true
 prost = { version = "0.13", features = ["std"] }
 bytes = "1"
 
 [dev-dependencies]
-wayfinder-server.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+# Test-only: the `tests/transport.rs` end-to-end test and this crate's own
+# handshake tests spin up a real `wayfinder-server` TLS listener to drive the
+# client against. Production code (src/) never depends on the server crate.
+wayfinder-server.workspace = true

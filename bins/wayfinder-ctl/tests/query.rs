@@ -1,11 +1,12 @@
-//! `run_query` glue: parse the connect target, open a client to a real
-//! in-process `wayfinder-server`, issue the RPC, and render the result.
+//! `run_query` glue: open an authenticated TLS client to a real in-process
+//! `wayfinder-server`, issue the RPC, and render the result.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::net::SocketAddr;
-
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
+use wayfinder_auth::Keypair;
+use wayfinder_client::Identity;
 use wayfinder_protos::service::{
     InterfaceThroughputData, KeepAliveEntryData, LinkQualityEntryData, NodeMetricsData,
     NodeSecurityData, OgmScheduleEntryData, RouteResolutionData, RoutingEntryData,
@@ -13,9 +14,9 @@ use wayfinder_protos::service::{
     WayfinderService,
 };
 use wayfinder_protos::wayfinder_v1alpha::{WayfinderRequest, WayfinderResponse};
-use wayfinder_server::run_tcp_server;
+use wayfinder_server::{AuthSnapshot, serve_tls_server};
 use wayfinderctl::output::OutputFormat;
-use wayfinderctl::{Command, run_query};
+use wayfinderctl::{Command, Endpoint, run_query};
 
 /// Minimal provider: only `node_info` carries meaningful values; the rest return
 /// empty/zero, which is all the `node-info` query exercises.
@@ -126,19 +127,33 @@ impl WayfinderDataProvider for Mock {
     }
 }
 
-fn free_port() -> SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-}
+/// Spawn a node serving the authenticated TLS management API in front of the
+/// `Mock` provider, and return an [`Endpoint`] that bootstraps against it (the
+/// node is un-enrolled, so proving its own key is admitted).
+async fn spawn_server() -> Endpoint {
+    // The node's TLS identity seed; the bootstrap client presents this same key.
+    let seed = [9u8; 32];
+    let node_key = Keypair::from_seed(&seed).ed_pubkey();
 
-async fn spawn_server() -> SocketAddr {
-    let addr = free_port();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
     let (query_tx, mut query_rx) =
         mpsc::channel::<(WayfinderRequest, oneshot::Sender<WayfinderResponse>)>(16);
+
+    // Auth snapshot responder: un-enrolled (no anchor), nothing revoked — so the
+    // client bootstrapping with the node's own key is granted.
+    let (snapshot_tx, mut snapshot_rx) = mpsc::channel::<oneshot::Sender<AuthSnapshot>>(4);
     tokio::spawn(async move {
-        let _ = run_tcp_server(addr, query_tx).await;
+        while let Some(reply) = snapshot_rx.recv().await {
+            let _ = reply.send(AuthSnapshot {
+                anchor: None,
+                revoked: Vec::new(),
+            });
+        }
+    });
+    tokio::spawn(async move {
+        let _ = serve_tls_server(listener, seed, snapshot_tx, query_tx).await;
     });
     tokio::spawn(async move {
         let mut service = WayfinderService::new(Mock);
@@ -148,13 +163,21 @@ async fn spawn_server() -> SocketAddr {
     });
     // Give the listener a moment to bind.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    addr
+
+    Endpoint {
+        addr,
+        node_key,
+        identity: Identity {
+            seed,
+            cert: Vec::new(),
+        },
+    }
 }
 
 #[tokio::test]
 async fn node_info_query_renders_json_from_server() {
-    let addr = spawn_server().await;
-    let out = run_query(Command::NodeInfo, &addr.to_string(), OutputFormat::Json)
+    let endpoint = spawn_server().await;
+    let out = run_query(Command::NodeInfo, &endpoint, OutputFormat::Json)
         .await
         .expect("query succeeds");
     let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -165,8 +188,8 @@ async fn node_info_query_renders_json_from_server() {
 
 #[tokio::test]
 async fn node_info_query_renders_human_from_server() {
-    let addr = spawn_server().await;
-    let out = run_query(Command::NodeInfo, &addr.to_string(), OutputFormat::Human)
+    let endpoint = spawn_server().await;
+    let out = run_query(Command::NodeInfo, &endpoint, OutputFormat::Human)
         .await
         .unwrap();
     assert!(out.contains("aa:bb:cc:dd:ee:07"), "got: {out}");
@@ -177,8 +200,8 @@ async fn node_info_query_renders_human_from_server() {
 
 #[tokio::test]
 async fn keepalive_query_renders_json_from_server() {
-    let addr = spawn_server().await;
-    let out = run_query(Command::Keepalive, &addr.to_string(), OutputFormat::Json)
+    let endpoint = spawn_server().await;
+    let out = run_query(Command::Keepalive, &endpoint, OutputFormat::Json)
         .await
         .expect("query succeeds");
     let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -189,8 +212,8 @@ async fn keepalive_query_renders_json_from_server() {
 
 #[tokio::test]
 async fn keepalive_query_renders_human_from_server() {
-    let addr = spawn_server().await;
-    let out = run_query(Command::Keepalive, &addr.to_string(), OutputFormat::Human)
+    let endpoint = spawn_server().await;
+    let out = run_query(Command::Keepalive, &endpoint, OutputFormat::Human)
         .await
         .unwrap();
     assert!(out.contains("00:00:00:00:00:02"), "got: {out}");
@@ -201,14 +224,14 @@ async fn keepalive_query_renders_human_from_server() {
 
 #[tokio::test]
 async fn set_trickle_config_query_succeeds_against_server() {
-    let addr = spawn_server().await;
+    let endpoint = spawn_server().await;
     let out = run_query(
         Command::SetTrickleConfig {
             iface: 0,
             min_ms: 500,
             max_ms: 4000,
         },
-        &addr.to_string(),
+        &endpoint,
         OutputFormat::Human,
     )
     .await
@@ -218,7 +241,7 @@ async fn set_trickle_config_query_succeeds_against_server() {
 
 #[tokio::test]
 async fn set_link_features_query_succeeds_against_server() {
-    let addr = spawn_server().await;
+    let endpoint = spawn_server().await;
     let out = run_query(
         Command::SetLinkFeatures {
             iface: 0,
@@ -229,7 +252,7 @@ async fn set_link_features_query_succeeds_against_server() {
             tx_keepalive_interval_ms: None,
             tx_keepalive_disable: false,
         },
-        &addr.to_string(),
+        &endpoint,
         OutputFormat::Human,
     )
     .await
@@ -239,10 +262,10 @@ async fn set_link_features_query_succeeds_against_server() {
 
 #[tokio::test]
 async fn set_lazy_cert_distribution_query_succeeds_against_server() {
-    let addr = spawn_server().await;
+    let endpoint = spawn_server().await;
     let out = run_query(
         Command::SetLazyCertDistribution { enabled: true },
-        &addr.to_string(),
+        &endpoint,
         OutputFormat::Human,
     )
     .await
@@ -252,8 +275,8 @@ async fn set_lazy_cert_distribution_query_succeeds_against_server() {
 
 #[tokio::test]
 async fn metrics_query_renders_json_from_server() {
-    let addr = spawn_server().await;
-    let out = run_query(Command::Metrics, &addr.to_string(), OutputFormat::Json)
+    let endpoint = spawn_server().await;
+    let out = run_query(Command::Metrics, &endpoint, OutputFormat::Json)
         .await
         .expect("query succeeds");
     let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -267,8 +290,8 @@ async fn metrics_query_renders_json_from_server() {
 
 #[tokio::test]
 async fn metrics_query_renders_human_from_server() {
-    let addr = spawn_server().await;
-    let out = run_query(Command::Metrics, &addr.to_string(), OutputFormat::Human)
+    let endpoint = spawn_server().await;
+    let out = run_query(Command::Metrics, &endpoint, OutputFormat::Human)
         .await
         .unwrap();
     assert!(out.contains("oversize_drops: 3"), "got: {out}");
@@ -282,8 +305,8 @@ async fn metrics_query_renders_human_from_server() {
 
 #[tokio::test]
 async fn security_query_renders_json_from_server() {
-    let addr = spawn_server().await;
-    let out = run_query(Command::Security, &addr.to_string(), OutputFormat::Json)
+    let endpoint = spawn_server().await;
+    let out = run_query(Command::Security, &endpoint, OutputFormat::Json)
         .await
         .expect("query succeeds");
     let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -294,8 +317,8 @@ async fn security_query_renders_json_from_server() {
 
 #[tokio::test]
 async fn security_query_renders_human_from_server() {
-    let addr = spawn_server().await;
-    let out = run_query(Command::Security, &addr.to_string(), OutputFormat::Human)
+    let endpoint = spawn_server().await;
+    let out = run_query(Command::Security, &endpoint, OutputFormat::Human)
         .await
         .unwrap();
     assert!(out.contains("authentication: enabled"), "got: {out}");

@@ -19,6 +19,14 @@ extern crate alloc;
 mod adapter;
 pub use adapter::RouterAdapter;
 
+mod authz;
+pub use authz::{MgmtAccess, MgmtDenied, authorize_admin, decide_access};
+
+#[cfg(feature = "std")]
+mod tls;
+#[cfg(feature = "std")]
+pub use tls::server_config;
+
 mod provider;
 pub use provider::MeshAuthority;
 
@@ -34,7 +42,7 @@ pub use authority::CertAuthority;
 mod transport;
 #[cfg(feature = "std")]
 pub use transport::{
-    ChannelRequest, ChannelServerRx, ChannelServerTx, QueryRx, QueryTx, bind_tcp_server,
-    bind_udp_server, bind_unix_server, run_channel_server, run_tcp_server, run_udp_server,
-    run_unix_server, serve_tcp_server, serve_udp_server, serve_unix_server,
+    AuthContext, AuthSnapshot, AuthSnapshotRx, AuthSnapshotTx, ChannelRequest, ChannelServerRx,
+    ChannelServerTx, QueryRx, QueryTx, bind_tcp_server, run_channel_server,
+    serve_authenticated_stream, serve_tls_server,
 };

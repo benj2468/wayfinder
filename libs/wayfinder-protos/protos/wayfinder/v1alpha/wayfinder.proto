@@ -142,6 +142,22 @@ message SetAuthRequest {
   bytes trust_anchor = 3;
 }
 
+// The first message a client sends on a management connection, presenting its
+// identity so the transport can authorize the connection.  The connection's TLS
+// handshake has already proven possession of the client's raw Ed25519 public
+// key (RFC 7250); this message supplies the membership certificate that binds
+// that key to a mesh admin identity.  The transport verifies the cert against
+// the trust anchor, confirms it matches the handshake key, and admits the
+// connection only for a non-revoked admin.  A successful authentication is
+// answered with EmptyResponse; a rejected one with ErrorResponse, after which
+// the connection is closed.
+message AuthenticateRequest {
+  // The client's membership certificate as raw `MembershipCert` bytes.  Empty on
+  // an un-enrolled node being bootstrapped: there is no cert yet, so admission
+  // rests solely on the TLS handshake key matching the node's own identity key.
+  bytes cert = 1;
+}
+
 // A single mesh interface's Trickle/OGM emission bounds, as set via
 // SetConfig.  Mirrors OgmScheduleEntry's min_interval_ms/max_interval_ms, but
 // as a request to install them rather than a report of what's installed.
@@ -374,6 +390,13 @@ message WayfinderRequest {
 
     // Query the per-neighbor keep-alive heartbeat liveness table.
     GetKeepAliveTableRequest get_keepalive_table = 18;
+
+    // Authenticate this management connection (must be the first message on a
+    // connection, before any other request). Carries the client's membership
+    // certificate; the transport binds it to the TLS-authenticated raw public
+    // key and admits the connection only if it verifies as a non-revoked admin
+    // (or, on an un-enrolled node, matches the node's own bootstrap key).
+    AuthenticateRequest authenticate = 19;
   }
 }
 

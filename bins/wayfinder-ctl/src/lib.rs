@@ -14,12 +14,16 @@
 pub mod cert;
 pub mod output;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use wayfinder_auth::Keypair;
-use wayfinder_client::{Client, ConnectTarget};
+use wayfinder_client::Client;
+// Re-exported so integration tests (and any embedder) can build the connection
+// endpoint the same way `run` does.
+pub use wayfinder_client::Endpoint;
 use wayfinder_protos::wayfinder_v1alpha::{
     CsrIssued, LinkFeatures, link_features::TxKeepaliveUpdate,
     submit_csr_response::Outcome as CsrOutcome,
@@ -35,8 +39,8 @@ use crate::output::OutputFormat;
     about = "Command-line client for the Wayfinder management API"
 )]
 pub struct Cli {
-    /// Management-API endpoint: an `IP:port` (TCP) or a `unix:`/filesystem path
-    /// (Unix datagram).  Ignored by the offline `cert` subcommands.
+    /// Management-API endpoint: the node's `IP:port` TLS listener. Ignored by
+    /// the offline `cert` subcommands.
     #[arg(
         long,
         short = 'c',
@@ -44,7 +48,28 @@ pub struct Cli {
         env = "WAYFINDERCTL_CONNECT",
         default_value = "127.0.0.1:7700"
     )]
-    pub connect: String,
+    pub connect: SocketAddr,
+
+    /// Path to this client's 32-byte Ed25519 identity seed (secret), presented
+    /// as an RFC 7250 raw public key in the TLS handshake. Required by every
+    /// query command; ignored by the offline `cert` subcommands. To bootstrap
+    /// an un-enrolled node, point this at the node's own identity seed and omit
+    /// `--cert`.
+    #[arg(long, global = true, env = "WAYFINDERCTL_IDENTITY")]
+    pub identity: Option<PathBuf>,
+
+    /// Path to this client's membership certificate, binding its identity to an
+    /// admin capability. Omit to bootstrap an un-enrolled node (the client then
+    /// authenticates by proving the node's own key via `--identity`).
+    #[arg(long, global = true, env = "WAYFINDERCTL_CERT")]
+    pub cert: Option<PathBuf>,
+
+    /// The node's Ed25519 public key (64 hex chars) to pin, so a man-in-the-
+    /// middle can't impersonate it. When omitted it defaults to the public key
+    /// of `--identity` — correct when bootstrapping a node with its own seed,
+    /// but you must pass it explicitly to reach a *different* node.
+    #[arg(long, global = true, env = "WAYFINDERCTL_NODE_KEY")]
+    pub node_key: Option<String>,
 
     /// Output format for query commands.
     #[arg(long, short = 'o', global = true, default_value = "human")]
@@ -210,31 +235,46 @@ pub enum CsrCommand {
     },
 }
 
+/// Assemble the [`Endpoint`] a query command connects over from the parsed CLI,
+/// erroring if `--identity` (required to reach a node's TLS management API) was
+/// not supplied.  The seed/cert reads and node-key resolution live in
+/// [`Endpoint::load`], shared with the TUI so both accept the same inputs.
+fn build_endpoint(cli: &Cli) -> anyhow::Result<Endpoint> {
+    let identity_path = cli
+        .identity
+        .as_ref()
+        .context("--identity <seed-path> is required to reach a node's TLS management API")?;
+    Endpoint::load(
+        cli.connect,
+        identity_path,
+        cli.cert.as_deref(),
+        cli.node_key.as_deref(),
+    )
+}
+
 /// Run the parsed CLI: dispatch offline `cert` work synchronously, else open a
 /// client, service one query, and print the rendered result.
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
-    match cli.command {
-        Command::Cert(cmd) => cert::run(cmd),
-        other => {
-            let rendered = run_query(other, &cli.connect, cli.output).await?;
-            println!("{rendered}");
-            Ok(())
-        }
+    // The offline `cert` tooling needs no node connection.
+    if let Command::Cert(cmd) = cli.command {
+        return cert::run(cmd);
     }
+    let endpoint = build_endpoint(&cli)?;
+    let rendered = run_query(cli.command, &endpoint, cli.output).await?;
+    println!("{rendered}");
+    Ok(())
 }
 
-/// Open a client to `connect`, issue one query `command`, and return the
+/// Open a client to `endpoint`, issue one query `command`, and return the
 /// rendered response (so callers/tests can print or assert it).  `command` must
 /// not be [`Command::Cert`], which is handled offline by [`run`].
 pub async fn run_query(
     command: Command,
-    connect: &str,
+    endpoint: &Endpoint,
     output: OutputFormat,
 ) -> anyhow::Result<String> {
-    let target: ConnectTarget = connect
-        .parse()
-        .with_context(|| format!("parsing --connect target '{connect}'"))?;
-    let mut client = Client::connect(&target).await?;
+    let mut client =
+        Client::connect_tls(endpoint.addr, &endpoint.node_key, &endpoint.identity).await?;
 
     Ok(match command {
         Command::NodeInfo => output::node_info(&client.node_info().await?, output)?,

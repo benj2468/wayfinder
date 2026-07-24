@@ -25,7 +25,9 @@ use wayfinder::interfaces::frame::{LinkFrameData, MAX_LINK_FRAME_LEN, Mac};
 use wayfinder::{CentralRouter, EgressInterface, McastPlan};
 use wayfinder_driver_core::{Egress, MeshSink};
 use wayfinder_protos::service::WayfinderService;
-use wayfinder_server::{CertAuthority, MeshAuthority, QueryRx, RouterAdapter};
+use wayfinder_server::{
+    AuthSnapshot, AuthSnapshotRx, CertAuthority, MeshAuthority, QueryRx, RouterAdapter,
+};
 
 use wayfinder::link::{DynLinkT, LinkT};
 
@@ -99,6 +101,12 @@ pub struct Driver<Local: FrameIo> {
     router: CentralRouter,
     /// Management-API queries forwarded from the server tasks.
     query_rx: QueryRx,
+    /// Requests from the TLS management server for a snapshot of this node's
+    /// authorization state (trust anchor + revocations), so a connection can be
+    /// authorized without sharing the router across tasks.  `None` when no TLS
+    /// management server is attached; set via
+    /// [`set_auth_snapshot_rx`](Self::set_auth_snapshot_rx).
+    auth_snapshot_rx: Option<AuthSnapshotRx>,
     /// This node's mesh identifier (its host device's MAC address).
     mac: Mac,
     /// Snoops IGMP on the host link to learn which multicast groups the local
@@ -188,6 +196,7 @@ impl<Local: FrameIo> Driver<Local> {
             rx_buffer: [0u8; MAX_LINK_FRAME_LEN],
             tx_buffer: [0u8; MAX_LINK_FRAME_LEN],
             provider: None,
+            auth_snapshot_rx: None,
         }
     }
 
@@ -195,6 +204,15 @@ impl<Local: FrameIo> Driver<Local> {
     /// requests (`GetTrustAnchor`/`SubmitCsr`/`RevokeNode`) from this `ca`.
     pub fn set_provider(&mut self, ca: CertAuthority) {
         self.provider = Some(ca);
+    }
+
+    /// Attach the receiver the TLS management server uses to request
+    /// authorization snapshots.  The driver answers each request with the
+    /// router's current trust anchor and revocation set, which the server task
+    /// evaluates a connection against.  Without this, a TLS management server has
+    /// no way to authorize connections.
+    pub fn set_auth_snapshot_rx(&mut self, rx: AuthSnapshotRx) {
+        self.auth_snapshot_rx = Some(rx);
     }
 
     /// Set the wall-clock unix time (seconds) that corresponds to the driver's
@@ -291,6 +309,7 @@ impl<Local: FrameIo> Driver<Local> {
             rx_buffer,
             tx_buffer,
             provider,
+            auth_snapshot_rx,
         } = self;
         let mac = *mac;
 
@@ -328,6 +347,10 @@ impl<Local: FrameIo> Driver<Local> {
                     let ca = provider.as_mut().map(|c| c as &mut dyn MeshAuthority);
                     let response = WayfinderService::new(RouterAdapter::new(&mut *router, ca, now)).handle(request);
                     let _ = resp_tx.send(response);
+                    LoopOutput::none()
+                },
+                Some(reply) = recv_auth_snapshot(auth_snapshot_rx), if check_server => {
+                    let _ = reply.send(build_auth_snapshot(router));
                     LoopOutput::none()
                 },
                 _ = sleep(next_due), if check_periodic => {
@@ -474,6 +497,14 @@ impl<Local: FrameIo> Driver<Local> {
                 let _ = resp_tx.send(response);
             }
 
+            // Authorization-state snapshot requests from the TLS management server.
+            if let Some(rx) = self.auth_snapshot_rx.as_mut()
+                && let Ok(reply) = rx.try_recv()
+            {
+                progressed = true;
+                let _ = reply.send(build_auth_snapshot(&self.router));
+            }
+
             if !progressed {
                 break;
             }
@@ -523,6 +554,35 @@ fn poll_due_keepalives(
     let mut out = LoopOutput::none();
     wayfinder_driver_core::poll_due_keepalives(router, now, tx_buffer, &mut out);
     out.mesh
+}
+
+/// Await the next authorization-snapshot request from the TLS management server,
+/// or never resolve when none is attached — keeping the corresponding `select!`
+/// arm dormant rather than requiring a separate enable flag.
+async fn recv_auth_snapshot(
+    rx: &mut Option<AuthSnapshotRx>,
+) -> Option<tokio::sync::oneshot::Sender<AuthSnapshot>> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Project the router's current authorization-relevant state — trust anchor and
+/// revocations — into an [`AuthSnapshot`] the management server evaluates a
+/// connection against.  Both are empty when auth is disabled (un-enrolled), which
+/// the server treats as bootstrap mode.
+fn build_auth_snapshot(router: &CentralRouter) -> AuthSnapshot {
+    match router.auth() {
+        Some(auth) => AuthSnapshot {
+            anchor: Some(*auth.anchor()),
+            revoked: auth.revoked_macs().collect(),
+        },
+        None => AuthSnapshot {
+            anchor: None,
+            revoked: Vec::new(),
+        },
+    }
 }
 
 /// Process one received link-layer frame into a unit of work, folding the

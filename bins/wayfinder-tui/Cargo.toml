@@ -17,9 +17,10 @@ path = "src/main.rs"
 [dependencies]
 wayfinder-protos.workspace = true
 wayfinder-client.workspace = true
+wayfinder-auth.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
-clap.workspace = true
+clap = { workspace = true, features = ["env"] }
 serde.workspace = true
 serde_json.workspace = true
 ratatui = "0.29"

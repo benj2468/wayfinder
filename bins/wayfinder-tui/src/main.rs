@@ -1,18 +1,18 @@
 //! A terminal dashboard for a running Wayfinder node.
 //!
-//! Connects to the node's management API over TCP and polls it on a fixed
-//! interval, presenting node info, the BATMAN routing table, and the
+//! Connects to the node's authenticated TLS management API and polls it on a
+//! fixed interval, presenting node info, the BATMAN routing table, and the
 //! link-quality table across three tabs.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-use std::{net::SocketAddr, time::Duration, time::Instant};
+use std::{net::SocketAddr, path::PathBuf, time::Duration, time::Instant};
 
 use clap::Parser;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use tokio::sync::mpsc;
 
-use wayfinder_client::{Client, ConnectTarget};
+use wayfinder_client::{Client, Endpoint};
 use wayfinder_tui::app::{self, App};
 use wayfinder_tui::persist;
 use wayfinder_tui::ui;
@@ -21,9 +21,28 @@ use wayfinder_tui::ui;
 #[derive(Parser, Debug)]
 #[command(about = "Terminal dashboard for the Wayfinder management API")]
 struct Args {
-    /// TCP address of the node's management API (ServerConfig::Tcp in the node config).
+    /// TLS address of the node's management API (`ServerConfig::Tls` in the
+    /// node config).
     #[arg(long, default_value = "127.0.0.1:7700")]
     addr: SocketAddr,
+
+    /// Path to this client's 32-byte Ed25519 identity seed (secret), presented
+    /// as an RFC 7250 raw public key in the TLS handshake. To bootstrap an
+    /// un-enrolled node, point this at the node's own identity seed and omit
+    /// `--cert`.
+    #[arg(long, env = "WAYFINDER_TUI_IDENTITY")]
+    identity: PathBuf,
+
+    /// Path to this client's membership certificate. Omit to bootstrap an
+    /// un-enrolled node (authenticate by proving the node's own key).
+    #[arg(long, env = "WAYFINDER_TUI_CERT")]
+    cert: Option<PathBuf>,
+
+    /// The node's Ed25519 public key (64 hex chars) to pin. When omitted it
+    /// defaults to the public key of `--identity` (the self-key bootstrap case);
+    /// pass it explicitly to reach a *different* node.
+    #[arg(long, env = "WAYFINDER_TUI_NODE_KEY")]
+    node_key: Option<String>,
 
     /// Refresh interval in milliseconds.
     #[arg(long, default_value_t = 1000)]
@@ -33,15 +52,25 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let endpoint = Endpoint::load(
+        args.addr,
+        &args.identity,
+        args.cert.as_deref(),
+        args.node_key.as_deref(),
+    )?;
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, args).await;
+    let result = run(&mut terminal, args, endpoint).await;
     ratatui::restore();
     result
 }
 
 /// The main draw / event / refresh loop. Returns when the user quits.
-async fn run(terminal: &mut ratatui::DefaultTerminal, args: Args) -> anyhow::Result<()> {
+async fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    args: Args,
+    endpoint: Endpoint,
+) -> anyhow::Result<()> {
     let mut app = App::new(args.addr.to_string(), args.interval);
 
     // Restore the throughput history from a previous session so the Metrics tab
@@ -72,7 +101,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, args: Args) -> anyhow::Res
 
         tokio::select! {
             _ = ticker.tick() => {
-                refresh(&mut client, args.addr, &mut app).await;
+                refresh(&mut client, &endpoint, &mut app).await;
             }
             ev = input_rx.recv() => {
                 match ev {
@@ -81,7 +110,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, args: Args) -> anyhow::Res
                         // A key may have queued an approve/deny; execute it now,
                         // since only this loop owns the client.
                         if app.pending_action.is_some() {
-                            act(&mut client, args.addr, &mut app).await;
+                            act(&mut client, &endpoint, &mut app).await;
                         }
                     }
                     Some(_) => {}
@@ -143,9 +172,9 @@ fn handle_key(app: &mut App, code: KeyCode) {
 
 /// Refresh the data snapshot, (re)connecting as needed. Records any failure in
 /// `app.last_error` and drops the connection so the next tick reconnects.
-async fn refresh(client: &mut Option<Client>, addr: SocketAddr, app: &mut App) {
+async fn refresh(client: &mut Option<Client>, endpoint: &Endpoint, app: &mut App) {
     if client.is_none() {
-        match Client::connect(&ConnectTarget::Tcp(addr)).await {
+        match Client::connect_tls(endpoint.addr, &endpoint.node_key, &endpoint.identity).await {
             Ok(c) => *client = Some(c),
             Err(e) => {
                 app.connected = false;
@@ -180,12 +209,12 @@ async fn refresh(client: &mut Option<Client>, addr: SocketAddr, app: &mut App) {
 /// Execute a queued approve/deny action against the connected provider node,
 /// then refresh so the resolved CSR leaves the pending panel.  Records any
 /// failure in `app.last_error`.
-async fn act(client: &mut Option<Client>, addr: SocketAddr, app: &mut App) {
+async fn act(client: &mut Option<Client>, endpoint: &Endpoint, app: &mut App) {
     let Some(action) = app.pending_action.take() else {
         return;
     };
     if client.is_none() {
-        match Client::connect(&ConnectTarget::Tcp(addr)).await {
+        match Client::connect_tls(endpoint.addr, &endpoint.node_key, &endpoint.identity).await {
             Ok(c) => *client = Some(c),
             Err(e) => {
                 app.connected = false;
@@ -213,7 +242,7 @@ async fn act(client: &mut Option<Client>, addr: SocketAddr, app: &mut App) {
         // rather than lingering until the next tick.
         Ok(()) => {
             app.last_error = None;
-            refresh(client, addr, app).await;
+            refresh(client, endpoint, app).await;
         }
         Err(e) => {
             app.last_error = Some(format!("CSR action failed: {e}"));

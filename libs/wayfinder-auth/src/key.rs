@@ -44,14 +44,23 @@ impl Keypair {
     /// Generate a fresh random keypair from OS entropy.  Host-only (the portal
     /// and `wayfinder-tap` enrollment); embedded nodes load a persisted seed.
     #[cfg(feature = "std")]
+    pub fn generate() -> Self {
+        Self::from_seed(&Self::generate_seed())
+    }
+
+    /// Generate a fresh random 32-byte identity seed from OS entropy, for a node
+    /// persisting a new identity on first boot.  The returned seed *is* the
+    /// identity — store it securely.  Host-only; embedded nodes load a persisted
+    /// seed rather than generate one.
+    #[cfg(feature = "std")]
     #[expect(
         clippy::expect_used,
         reason = "host-only keygen with no sane fallback if the OS RNG is broken; the caller (enrollment tooling) has no way to proceed without entropy anyway"
     )]
-    pub fn generate() -> Self {
+    pub fn generate_seed() -> [u8; 32] {
         let mut seed = [0u8; 32];
         getrandom::getrandom(&mut seed).expect("OS RNG unavailable");
-        Self::from_seed(&seed)
+        seed
     }
 
     /// This node's Ed25519 public key — the value bound to its MAC by a

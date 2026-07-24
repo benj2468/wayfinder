@@ -755,6 +755,17 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                 Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
             },
 
+            // Authentication is handled by the transport before any request
+            // reaches this dispatcher (it needs the TLS-authenticated key, which
+            // the router-facing provider has no access to). Seeing one here means
+            // the client sent it out of order — after already authenticating —
+            // which is a protocol error, not a router query.
+            Some(RequestKind::Authenticate(_)) => ResponseKind::Error(ErrorResponse {
+                message: "unexpected Authenticate request: authentication must be the first \
+                          message on a connection and may not be repeated"
+                    .into(),
+            }),
+
             None => ResponseKind::Error(ErrorResponse {
                 message: "empty request".into(),
             }),

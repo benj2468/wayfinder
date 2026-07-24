@@ -12,6 +12,15 @@ use crate::key::verify_signature;
 /// only version it accepts.  Bump when the signed layout changes.
 pub const CERT_VERSION: u8 = 1;
 
+/// [`MembershipCert::flags`] bit granting the **management-administration
+/// capability**: the holder may invoke privileged management-API operations
+/// (`SetAuth`, `SetConfig`, `RevokeNode`, CSR approve/deny), not merely
+/// participate in routing.  It is part of the signed body, so only the mesh root
+/// can grant it and tampering breaks the signature — meaning the management
+/// layer may trust it only after [`TrustAnchor::verify_cert`] succeeds (see
+/// [`VerifiedCert::admin`]).
+pub const CERT_FLAG_ADMIN: u8 = 0x01;
+
 /// Domain-separation label folded into the fingerprint hash, so it can never
 /// collide with another `Blake2s256` use over the same or overlapping bytes
 /// elsewhere in the crate (e.g. [`crate::key::Keypair::pairwise_key`]).
@@ -31,7 +40,9 @@ const CERT_FINGERPRINT_LABEL: &[u8] = b"wayfinder-certfp-v1";
 pub struct MembershipCert {
     /// Layout/version marker; must equal [`CERT_VERSION`].
     pub version: u8,
-    /// Reserved flag bits; sent as 0.
+    /// Capability bits, part of the signed body.  Currently only
+    /// [`CERT_FLAG_ADMIN`] is defined (the management-administration
+    /// capability); the remaining bits are reserved and sent as 0.
     pub flags: u8,
     /// The mesh this cert grants membership to (must match the verifier's
     /// trust anchor).  Network byte order.
@@ -113,6 +124,14 @@ pub struct VerifiedCert {
     pub x_pubkey: [u8; 32],
     /// When the cert expires (unix seconds), so the router can age it out.
     pub not_after: u64,
+    /// Whether the cert carries the management-administration capability
+    /// ([`CERT_FLAG_ADMIN`]).  The only production constructor of a
+    /// [`VerifiedCert`] is [`TrustAnchor::verify_cert`], so in normal use this
+    /// bit reflects a flag that was signed by the mesh root — not an attacker's
+    /// raw, unverified cert.  (The struct's fields are public, so tests may
+    /// build one directly; the guarantee is the construction convention, not a
+    /// type-level seal.)
+    pub admin: bool,
 }
 
 impl TrustAnchor {
@@ -179,6 +198,7 @@ impl TrustAnchor {
             ed_pubkey: cert.ed_pubkey,
             x_pubkey: cert.x_pubkey,
             not_after,
+            admin: cert.flags & CERT_FLAG_ADMIN != 0,
         })
     }
 }
@@ -216,6 +236,34 @@ mod tests {
         assert_eq!(verified.ed_pubkey, node.ed_pubkey());
         assert_eq!(verified.x_pubkey, node.x_pubkey());
         assert_eq!(verified.not_after, 200);
+    }
+
+    /// The admin capability is a signed flag in the cert, surfaced *only*
+    /// through verification: a plain member verifies as non-admin, while a cert
+    /// the CA issued with the admin capability verifies as admin.  The
+    /// management API authorizes privileged operations off this verified bit,
+    /// never a raw (unverified, hence attacker-controllable) cert — which is why
+    /// it lands on `VerifiedCert`, produced only on the `verify_cert` success
+    /// path.
+    #[test]
+    fn admin_capability_travels_through_verification() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let node = Keypair::from_seed(&[2u8; 32]);
+        let anchor = authority.trust_anchor();
+
+        // A plain membership cert carries no admin capability.
+        let member = authority.issue_cert(mac(5), node.ed_pubkey(), node.x_pubkey(), 100, 200);
+        assert!(
+            !anchor.verify_cert(&member, 150).unwrap().admin,
+            "a plain membership cert must not be an admin"
+        );
+
+        // A cert the CA issued with the admin capability verifies as admin.
+        let admin = authority.issue_admin_cert(mac(6), node.ed_pubkey(), node.x_pubkey(), 100, 200);
+        assert!(
+            anchor.verify_cert(&admin, 150).unwrap().admin,
+            "an admin-issued cert must carry the admin capability once verified"
+        );
     }
 
     /// A cert from another mesh's authority fails on the trust-anchor signature

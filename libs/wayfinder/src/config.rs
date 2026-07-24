@@ -169,24 +169,39 @@ impl LinkConfig {
 }
 
 /// Transport over which the management API is exposed.
+///
+/// Only the authenticated, encrypted TLS transport is offered: the management
+/// API carries privileged operations (revocation, runtime reconfiguration,
+/// enrollment), so it is never exposed in the clear.
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
 pub enum ServerConfig {
-    /// Connectionless management API over a Unix datagram socket.
-    UnixSocket {
-        /// Filesystem path the socket is bound to.
-        path: String,
-    },
-    /// Stream-based management API over TCP.
-    Tcp {
-        /// Address the listener binds to.
+    /// Authenticated, encrypted management API over TLS (the secure transport).
+    ///
+    /// Clients authenticate by their mesh membership identity carried as an
+    /// RFC 7250 raw public key in the TLS handshake; only a non-revoked admin (or,
+    /// on an un-enrolled node, a client proving the node's own key) is admitted.
+    Tls {
+        /// Address the TLS listener binds to.
         addr: SocketAddr,
+        /// Path to the node's persistent 32-byte identity seed used as the TLS
+        /// server identity (and, before enrollment, the bootstrap key).  When
+        /// unset, the node reuses its `[auth]` seed if configured, otherwise it
+        /// generates and persists one at
+        /// [`default_identity_seed_path`](ServerConfig::default_identity_seed_path).
+        #[serde(default)]
+        identity_seed_path: Option<String>,
     },
-    /// Connectionless management API over UDP.
-    Udp {
-        /// Address the socket binds to.
-        addr: SocketAddr,
-    },
+}
+
+impl ServerConfig {
+    /// Where a generated management-TLS identity seed is persisted when no path
+    /// is configured and no `[auth]` seed is available: alongside the other
+    /// runtime-generated identity state under `/var/lib` (cf.
+    /// [`TapConfig::default_mac_state_path`]).
+    pub fn default_identity_seed_path() -> String {
+        String::from("/var/lib/wayfinder/identity.seed")
+    }
 }
 
 /// Configuration for the local host-facing TAP device.
