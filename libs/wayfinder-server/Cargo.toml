@@ -23,9 +23,17 @@ std = [
     "dep:serde",
     "dep:serde_json",
     "prost/std",
+    "tracing/std",
     "wayfinder-auth/std",
+    "dep:wayfinder-storage",
     "wayfinder-storage/std",
 ]
+# The `no_std` + `alloc` embedded management transport: length-delimited request
+# framing over an `embedded-io-async` byte stream (`framing`) and the
+# `embassy-sync` query channel + `serve` loop that bridge that stream to the
+# router loop on bare metal. The `no_std` counterpart to `std`'s tokio
+# listeners; mutually exclusive with `std` in practice (a target picks one).
+embedded = ["dep:embedded-io-async", "dep:embassy-sync"]
 
 [dependencies]
 wayfinder.workspace = true
@@ -35,10 +43,16 @@ wayfinder-protos.workspace = true
 # it in.
 wayfinder-auth.workspace = true
 # CA-state snapshot persistence (persistence.rs) is built atop the shared
-# DurableStore abstraction; only the std-gated FileStore is used here.
-wayfinder-storage.workspace = true
+# DurableStore abstraction; only the std-gated FileStore is used here, so this
+# is optional and pulled in only by the `std` feature — the embedded build never
+# links it (and so never pulls its std `tracing`).
+wayfinder-storage = { workspace = true, optional = true }
 zerocopy.workspace = true
-tracing.workspace = true
+# Pinned directly (not workspace inheritance, which forces `default-features`
+# on) so tracing's `std` feature stays off for the `no_std` embedded build — the
+# same reason `wayfinder`/`wayfinder-driver-core` pin it.  Re-enabled via
+# `tracing/std` under the `std` feature.
+tracing = { version = "0.1.44", default-features = false }
 prost = { version = "0.13", default-features = false }
 
 tokio = { workspace = true, optional = true }
@@ -54,3 +68,9 @@ anyhow = { workspace = true, optional = true }
 # CA-state snapshot persistence (authority.rs), std-only.
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+
+# The embedded management transport (`embedded` feature): the byte-stream I/O
+# trait the framing reads/writes over, and the SPSC channel the `serve` loop
+# uses to hand a decoded request to the router loop and await its response.
+embedded-io-async = { workspace = true, optional = true }
+embassy-sync = { workspace = true, optional = true }

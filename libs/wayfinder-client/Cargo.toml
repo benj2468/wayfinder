@@ -18,6 +18,11 @@ tokio = { workspace = true }
 tokio-util.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true
+# The serial transport for reaching an embedded node's unauthenticated debug
+# management API (e.g. the nRF52840's onboard-VCOM UART at /dev/ttyACM*).
+# `SerialStream` is a tokio `AsyncRead + AsyncWrite`, so it frames identically to
+# the TLS socket.
+tokio-serial = "5.4"
 futures.workspace = true
 anyhow.workspace = true
 prost = { version = "0.13", features = ["std"] }

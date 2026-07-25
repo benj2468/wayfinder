@@ -6,6 +6,14 @@ edition = "2024"
 [lints]
 workspace = true
 
+[features]
+# Opt-in embedded management API: adds a third event-loop arm that services
+# `WayfinderRequest`s forwarded from a `wayfinder-server` `serve` loop (over an
+# `embassy-sync` channel) against a `RouterAdapter`. Off by default so a pure
+# radio relay stays heap-free — enabling it pulls in `wayfinder-server`'s
+# `alloc`-based adapter and the query channel.
+mgmt = ["dep:wayfinder-server", "dep:wayfinder-protos", "dep:embassy-sync"]
+
 # The `no_std` counterpart to `wayfinder-driver`: it runs the router's event
 # loop on bare metal.  Deliberately **HAL- and executor-agnostic** — it depends
 # on no vendor HAL and on no concrete time driver, so the same driver runs on
@@ -24,6 +32,17 @@ heapless.workspace = true
 embassy-futures = "0.1.2"
 # Pinned directly to keep tracing's `std` feature off for the `no_std` build.
 tracing = { version = "0.1.44", default-features = false }
+
+# `mgmt` feature only: the `no_std` management-API adapter + request dispatcher
+# and the query channel that carries a request in / a response out. Pinned
+# directly (not workspace inheritance, which can't override `default-features`)
+# so `wayfinder-server` is taken with only its `embedded` feature and no
+# `std`/tokio leaks in.
+wayfinder-server = { path = "../wayfinder-server", default-features = false, features = [
+    "embedded",
+], optional = true }
+wayfinder-protos = { workspace = true, optional = true }
+embassy-sync = { workspace = true, optional = true }
 
 [dev-dependencies]
 # A minimal executor to drive the async loop in host unit tests.

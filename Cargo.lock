@@ -2779,6 +2779,7 @@ dependencies = [
  "rustls",
  "tokio",
  "tokio-rustls",
+ "tokio-serial",
  "tokio-util",
  "wayfinder-auth",
  "wayfinder-protos",
@@ -2846,12 +2847,15 @@ name = "wayfinder-embedded-driver"
 version = "0.1.0"
 dependencies = [
  "embassy-futures",
+ "embassy-sync",
  "futures",
  "heapless",
  "interfaces",
  "tracing",
  "wayfinder",
  "wayfinder-driver-core",
+ "wayfinder-protos",
+ "wayfinder-server",
  "zerocopy",
 ]
 
@@ -2879,6 +2883,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "embassy-sync",
+ "embedded-io-async 0.7.0",
  "futures",
  "prost",
  "rustls",

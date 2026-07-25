@@ -1,0 +1,14 @@
+{
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "linkedProjects": [
+          "Cargo.toml",
+          "bins/wayfinder-nrf52840/Cargo.toml",
+          "bins/wayfinder-stm32f411/Cargo.toml",
+          "libs/wayfinder-py/Cargo.toml",
+        ]
+      }
+    }
+  }
+}
