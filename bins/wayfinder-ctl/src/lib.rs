@@ -71,6 +71,20 @@ pub struct Cli {
     #[arg(long, global = true, env = "WAYFINDERCTL_NODE_KEY")]
     pub node_key: Option<String>,
 
+    /// Serial port of an embedded node's *unauthenticated* management API (e.g.
+    /// `/dev/ttyACM0` for an nRF52840 over its onboard-VCOM UART), and the
+    /// connection carries no TLS or authentication. `--identity`/`--cert`/
+    /// `--node-key` cannot be combined with this (clap rejects it, since they'd
+    /// imply a TLS handshake this transport never performs); `--connect` is
+    /// simply unused. Ignored by the offline `cert` subcommands.
+    #[arg(long, global = true, conflicts_with_all = ["identity", "cert", "node_key"])]
+    pub serial: Option<String>,
+
+    /// Baud rate for `--serial` (the nRF52840 firmware's VCOM UART runs at
+    /// 115200).
+    #[arg(long, global = true, default_value_t = 115_200)]
+    pub baud: u32,
+
     /// Output format for query commands.
     #[arg(long, short = 'o', global = true, default_value = "human")]
     pub output: OutputFormat,
@@ -259,8 +273,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     if let Command::Cert(cmd) = cli.command {
         return cert::run(cmd);
     }
-    let endpoint = build_endpoint(&cli)?;
-    let rendered = run_query(cli.command, &endpoint, cli.output).await?;
+    // A serial target reaches an embedded node's unauthenticated management API
+    // directly; otherwise connect over the authenticated TLS endpoint.
+    let rendered = match cli.serial.clone() {
+        Some(path) => {
+            let mut client = Client::connect_serial(&path, cli.baud).await?;
+            dispatch_query(cli.command, &mut client, cli.output).await?
+        }
+        None => {
+            let endpoint = build_endpoint(&cli)?;
+            run_query(cli.command, &endpoint, cli.output).await?
+        }
+    };
     println!("{rendered}");
     Ok(())
 }
@@ -275,7 +299,18 @@ pub async fn run_query(
 ) -> anyhow::Result<String> {
     let mut client =
         Client::connect_tls(endpoint.addr, &endpoint.node_key, &endpoint.identity).await?;
+    dispatch_query(command, &mut client, output).await
+}
 
+/// Dispatch one query `command` against an already-connected `client`, returning
+/// the rendered response. Shared by the TLS path ([`run_query`]) and the
+/// unauthenticated serial path (`--serial`), so every command works identically
+/// over either transport.
+async fn dispatch_query(
+    command: Command,
+    client: &mut Client,
+    output: OutputFormat,
+) -> anyhow::Result<String> {
     Ok(match command {
         Command::NodeInfo => output::node_info(&client.node_info().await?, output)?,
         Command::Routes => output::routing_table(&client.routing_table().await?, output)?,
@@ -382,7 +417,7 @@ pub async fn run_query(
                 Some(mac) => parse_mac6(mac)?,
                 None => kp.derived_mac().0,
             };
-            let issued = poll_enroll(&mut client, &mac_bytes, &kp, &token).await?;
+            let issued = poll_enroll(client, &mac_bytes, &kp, &token).await?;
             // The seed is already on disk (reused from `out_seed`, or written
             // above before polling), so it needs no second write here.
             std::fs::write(&out_cert, &issued.cert)

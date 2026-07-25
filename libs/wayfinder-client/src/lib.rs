@@ -24,6 +24,7 @@ use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
+use tokio_serial::SerialStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use wayfinder_protos::wayfinder_v1alpha::{
     ApproveCsrRequest, AuthenticateRequest, DenyCsrRequest, GetKeepAliveTableRequest,
@@ -38,10 +39,47 @@ use wayfinder_protos::wayfinder_v1alpha::{
     wayfinder_response::Response as ResponseKind,
 };
 
-/// The underlying transport a [`Client`] is connected over: length-delimited
-/// prost framing over an authenticated TLS stream (the node's secure transport),
-/// established by [`Client::connect_tls`].
-struct Conn(Framed<TlsStream<TcpStream>, LengthDelimitedCodec>);
+/// The underlying transport a [`Client`] is connected over, carrying the same
+/// 4-byte length-delimited prost framing regardless of medium.
+///
+/// Either the node's authenticated TLS stream ([`Client::connect_tls`]) or an
+/// embedded node's unauthenticated serial port ([`Client::connect_serial`]); the
+/// request/response path is identical over both, differing only in whether an
+/// authentication handshake preceded it.
+// Both variants are boxed. Measured: `Framed<TlsStream<TcpStream>, _>` is
+// ~1250 bytes (rustls's connection/message-buffer state); `Framed<SerialStream,
+// _>` alone is still ~225 bytes, which on its own already exceeds clippy's
+// `large_enum_variant` threshold (200 bytes) — so `Serial` needs boxing
+// regardless of `Tls`'s size, not just for symmetry.
+enum Conn {
+    /// Length-delimited framing over the node's authenticated TLS transport.
+    Tls(Box<Framed<TlsStream<TcpStream>, LengthDelimitedCodec>>),
+    /// Length-delimited framing over a raw serial port (embedded debug link).
+    Serial(Box<Framed<SerialStream, LengthDelimitedCodec>>),
+}
+
+impl Conn {
+    /// Send one already-encoded request frame over whichever transport backs
+    /// this connection.
+    async fn send(&mut self, frame: Bytes) -> anyhow::Result<()> {
+        match self {
+            Conn::Tls(framed) => framed.send(frame).await?,
+            Conn::Serial(framed) => framed.send(frame).await?,
+        }
+        Ok(())
+    }
+
+    /// Await the next response frame, erroring if the peer closed the transport.
+    async fn recv(&mut self) -> anyhow::Result<Bytes> {
+        let frame = match self {
+            Conn::Tls(framed) => framed.next().await,
+            Conn::Serial(framed) => framed.next().await,
+        };
+        Ok(frame
+            .ok_or_else(|| anyhow!("connection closed by server"))??
+            .freeze())
+    }
+}
 
 /// The credentials a client presents to a node's TLS management API.
 ///
@@ -197,10 +235,31 @@ impl Client {
             .await
             .ok_or_else(|| anyhow!("connection closed before authentication completed"))??;
         match WayfinderResponse::decode(reply)?.response {
-            Some(ResponseKind::Empty(_)) => Ok(Self { conn: Conn(framed) }),
+            Some(ResponseKind::Empty(_)) => Ok(Self {
+                conn: Conn::Tls(Box::new(framed)),
+            }),
             Some(ResponseKind::Error(e)) => Err(anyhow!("authentication denied: {}", e.message)),
             other => Err(anyhow!("unexpected response to authentication: {other:?}")),
         }
+    }
+
+    /// Connect to an embedded node's **unauthenticated** management API over a
+    /// serial port (e.g. the nRF52840's onboard-VCOM UART at `/dev/ttyACM0`),
+    /// opened at `baud`.
+    ///
+    /// Unlike [`connect_tls`](Self::connect_tls), this transport carries no TLS
+    /// and no membership authentication: the embedded server trusts the physical
+    /// link and serves requests directly, so there is no handshake and no
+    /// [`Identity`] to present. The wire framing — a 4-byte big-endian
+    /// length-delimited prost envelope — is identical, so every typed request
+    /// method works unchanged once connected.
+    pub async fn connect_serial(path: &str, baud: u32) -> anyhow::Result<Self> {
+        let serial = SerialStream::open(&tokio_serial::new(path, baud))
+            .with_context(|| format!("opening serial port {path} at {baud} baud"))?;
+        let framed = LengthDelimitedCodec::builder().new_framed(serial);
+        Ok(Self {
+            conn: Conn::Serial(Box::new(framed)),
+        })
     }
 
     /// Encode and send one request, then await and decode the single response.
@@ -211,13 +270,8 @@ impl Client {
         let mut buf = Vec::new();
         envelope.encode(&mut buf)?;
 
-        let framed = &mut self.conn.0;
-        framed.send(Bytes::from(buf)).await?;
-        let frame: Bytes = framed
-            .next()
-            .await
-            .ok_or_else(|| anyhow!("connection closed by server"))??
-            .freeze();
+        self.conn.send(Bytes::from(buf)).await?;
+        let frame = self.conn.recv().await?;
 
         let response = WayfinderResponse::decode(frame)?;
         match response.response {

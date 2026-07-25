@@ -9,8 +9,9 @@
 //! `async` loop forever.
 //!
 //! Milestone 1 is a **radio relay**: one LoRa interface, OGM exchange +
-//! forwarding, no host device.  A second node (a Linux box with its own
-//! RYLR998) is what you inspect the mesh from.
+//! forwarding, no host device.  A second UART exposes the management API on
+//! the DK's onboard-debugger VCOM port, so the node is inspectable
+//! (`wayfinder-tui`/`wayfinderctl --serial`) without a second mesh node.
 //!
 //! [`BufferedUarte`]: embassy_nrf::buffered_uarte::BufferedUarte
 //! [`LinkT`]: wayfinder::link::LinkT
@@ -19,6 +20,7 @@
 #![no_main]
 
 use embassy_executor::Spawner;
+use embassy_futures::join::join;
 use embassy_nrf::gpio::{Level, Output, OutputDrive};
 use embassy_nrf::uarte::{Baudrate, Config as UarteConfig, Parity};
 use embassy_nrf::{bind_interrupts, buffered_uarte, peripherals};
@@ -26,17 +28,24 @@ use embassy_time::{Duration as EmbassyDuration, Instant, Timer};
 use embedded_alloc::LlffHeap as Heap;
 use panic_halt as _;
 use rylr998::{Bandwidth, CodingRate, LoraError, RylrClient, SpreadingFactory};
-use tracing::warn;
+use tracing::info;
+use tracing::{error, trace, warn};
 use wayfinder::interfaces::frame::Mac;
 use wayfinder_embedded_driver::{Clock, Driver, TrickleParams};
+use wayfinder_server::{EmbeddedQueryChannel, FrameError, serve};
 
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
 
-/// Bytes reserved for `alloc` — `tracing-core`'s own bookkeeping is the only
-/// user today, so this is deliberately tiny; grow it if a future allocation
-/// panics.
-const HEAP_SIZE_BYTES: usize = 1024;
+/// Bytes reserved for `alloc`.  Two users share it: `tracing-core`'s bookkeeping
+/// and the management server's per-request buffers.  Sized against
+/// `wayfinder_server::framing::MAX_FRAME_LEN` (4 KiB): `serve` holds one
+/// in-flight buffer per direction, so a single connection can pin up to 8 KiB
+/// in framing buffers alone; this leaves ~24 KiB of headroom for the
+/// `RouterAdapter` response `Vec`s a query itself builds plus tracing's
+/// bookkeeping — tiny against the part's 256 KiB SRAM. Grow both constants
+/// together if a real routing-table response ever gets close to the cap.
+const HEAP_SIZE_BYTES: usize = 32 * 1024;
 
 /// This node's mesh identity.  Each physical node needs a **distinct** MAC — and
 /// therefore a distinct RYLR `AT+ADDRESS` (derived below), since the RYLR
@@ -51,6 +60,7 @@ const LORA_NETWORK_ID: u8 = 18;
 // serial reads/writes are woken by hardware rather than polled.
 bind_interrupts!(struct Irqs {
     UARTE0 => buffered_uarte::InterruptHandler<peripherals::UARTE0>;
+    UARTE1 => buffered_uarte::InterruptHandler<peripherals::UARTE1>;
 });
 
 /// An `embassy-time`-backed [`Clock`] for the embedded driver: the monotonic
@@ -85,6 +95,8 @@ async fn main(_spawner: Spawner) {
     // logs are visible over the debug probe.
     wayfinder_embedded_log::init();
 
+    info!("Welcome to Wayfinder");
+
     let p = embassy_nrf::init(Default::default());
 
     // The buffered UARTE needs `'static` scratch buffers; `rx_buffer.len()` must
@@ -116,8 +128,8 @@ async fn main(_spawner: Spawner) {
         p.PPI_CH0,
         p.PPI_CH1,
         p.PPI_GROUP0,
-        p.P1_02, // RXD (module TX)
-        p.P1_01, // TXD (module RX)
+        p.P0_02, // RXD (module TX)
+        p.P0_26, // TXD (module RX)
         Irqs,
         uarte_config,
         rx_buffer,
@@ -173,5 +185,78 @@ async fn main(_spawner: Spawner) {
     }];
 
     let mut driver = Driver::new(NODE_MAC, [client], EmbassyClock, &trickle, &[]);
-    driver.run().await
+
+    // Bring up the second UART on the DK's onboard-debugger VCOM lines so the
+    // management API is reachable as a USB serial device (`/dev/ttyACM*`) with no
+    // extra wiring: on the PCA10056, P0.06 = nRF TX → host and P0.08 = nRF RX ←
+    // host.  No hardware flow control (the RYLR link runs without it too).  The
+    // scratch buffers follow the same `'static`, taken-once pattern as the RYLR
+    // UART above; `rx_buffer.len()` must be even.
+    let mgmt_rx_buffer: &'static mut [u8] = {
+        static mut RX: [u8; 256] = [0; 256];
+        // SAFETY: `main` runs once, so this is the only `&mut` ever taken to `RX`.
+        unsafe { &mut *core::ptr::addr_of_mut!(RX) }
+    };
+    let mgmt_tx_buffer: &'static mut [u8] = {
+        static mut TX: [u8; 256] = [0; 256];
+        // SAFETY: `main` runs once, so this is the only `&mut` ever taken to `TX`.
+        unsafe { &mut *core::ptr::addr_of_mut!(TX) }
+    };
+    let mut mgmt_uarte_config = UarteConfig::default();
+    mgmt_uarte_config.baudrate = Baudrate::BAUD115200;
+    mgmt_uarte_config.parity = Parity::EXCLUDED;
+    let mut mgmt_uart = buffered_uarte::BufferedUarte::new(
+        p.UARTE1,
+        p.TIMER1,
+        p.PPI_CH2,
+        p.PPI_CH3,
+        p.PPI_GROUP1,
+        p.P0_08, // RXD: host TX → nRF RX
+        p.P0_06, // TXD: nRF TX → host RX
+        Irqs,
+        mgmt_uarte_config,
+        mgmt_rx_buffer,
+        mgmt_tx_buffer,
+    );
+
+    // The query channel bridging the management serve loop to the router loop.
+    let query_channel = EmbeddedQueryChannel::new();
+    let (query_tx, query_rx) = query_channel.split();
+
+    // The serve loop owns the VCOM UART and frames management requests against
+    // the channel. It never gives up permanently: the node keeps routing
+    // regardless (only the management link is affected), and `serve` returning
+    // is retried rather than treated as a one-shot failure, since its most
+    // common cause — an operator's serial terminal disconnecting/reconnecting —
+    // is routine, not exceptional.
+    let mgmt = async {
+        loop {
+            match serve(&mut mgmt_uart, &query_tx).await {
+                // A clean disconnect, mid-frame or between frames — the ordinary
+                // shape of a serial terminal reattaching. Reopen the link.
+                Err(FrameError::UnexpectedEof) => {
+                    trace!("management link disconnected; awaiting reconnect");
+                }
+                // A peer-supplied length prefix desynchronised the stream: a
+                // protocol violation reachable by whatever's on the other end of
+                // the wire, not a node-local fault, so this stays below error!.
+                Err(e @ FrameError::Oversized(_)) => {
+                    warn!(?e, "management link reset: oversized frame");
+                }
+                // A genuine UART fault: node-local, not attacker-triggerable, and
+                // (until this loop retries) a permanently lost resource — exactly
+                // what error! is for. Back off briefly so a persistently broken
+                // UART can't turn this into a tight retry loop.
+                Err(e @ FrameError::Io(_)) => {
+                    error!(?e, "management UART I/O error; retrying");
+                    Timer::after(EmbassyDuration::from_millis(100)).await;
+                }
+                Ok(()) => unreachable!("serve only returns via an error"),
+            }
+        }
+    };
+
+    // Run the mesh loop (now also servicing management queries) and the serve
+    // loop concurrently on the one executor task; neither ever returns.
+    join(driver.run_with_mgmt(&query_rx), mgmt).await;
 }

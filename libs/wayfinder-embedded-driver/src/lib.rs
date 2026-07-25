@@ -15,10 +15,14 @@
 //!
 //! # Milestone scope
 //!
-//! Today this is a **radio relay**: it drives the mesh interfaces (OGM exchange,
-//! forwarding, per-link Trickle timers) only.  There is no local host device,
-//! management API, or IGMP snoop yet, and OGM authentication time is not wired
-//! (a board can still enable auth via [`Driver::router_mut`]).
+//! At its core this is a **radio relay**: it drives the mesh interfaces (OGM
+//! exchange, forwarding, per-link Trickle timers).  There is no local host
+//! device or IGMP snoop yet, and OGM authentication time is not wired (a board
+//! can still enable auth via [`Driver::router_mut`]).  The optional `mgmt`
+//! feature adds a management-API arm to the event loop (`run_with_mgmt`) that
+//! serves read-only/config queries forwarded from a `wayfinder-server` `serve`
+//! loop, so an embedded node is inspectable over a debug transport (e.g. a UART)
+//! exactly like a host node.
 //!
 //! [`wayfinder-driver-core`]: https://docs.rs/wayfinder-driver-core
 #![cfg_attr(not(test), no_std)]
@@ -38,6 +42,13 @@ use wayfinder_driver_core::{
     Egress, MeshSink, OutgoingFrame, handle_mesh_frame, poll_due_keepalives, poll_due_ogms,
     tag_directed_into,
 };
+
+#[cfg(feature = "mgmt")]
+use embassy_futures::select::{Either3, select3};
+#[cfg(feature = "mgmt")]
+use wayfinder_protos::service::WayfinderService;
+#[cfg(feature = "mgmt")]
+use wayfinder_server::{EmbeddedQueryRx, RouterAdapter};
 
 /// A monotonic clock plus an async delay — the one piece of platform the driver
 /// can't provide itself.
@@ -247,32 +258,118 @@ impl<L: LinkT, C: Clock, const N: usize> Driver<L, C, N> {
         // is pending forever, so the timer arm still drives OGM emission.
         let recv_futs = links.each_mut().map(|link| link.recv());
         match select(select_array(recv_futs), clock.sleep(due)).await {
-            Either::First((result, idx)) => match result {
-                Ok(received) => {
-                    trace!(iface = idx, "rx frame from interface");
-                    handle_mesh_frame(
-                        now,
-                        router,
-                        idx,
-                        received.frame,
-                        received.metrics,
-                        tx_buffer,
-                        stage,
-                    );
-                }
-                Err(e) => {
-                    trace!(iface = idx, error = ?e, "drop: link recv error");
-                }
-            },
-            Either::Second(()) => {
-                trace!("polling OGMs and keep-alives");
-                poll_due_ogms(router, now, tx_buffer, stage);
-                poll_due_keepalives(router, now, tx_buffer, stage);
+            Either::First((result, idx)) => {
+                handle_link_result(now, router, idx, result, tx_buffer, stage)
             }
+            Either::Second(()) => handle_timer_due(router, now, tx_buffer, stage),
         }
 
         // The select's futures are dropped here, freeing `links` to be borrowed
         // mutably again for dispatch.
+        dispatch(links, router, *mac, now, stage).await;
+    }
+}
+
+/// The [`Either::First`]/[`Either3::First`] arm shared by [`Driver::run_once`]
+/// and [`Driver::run_once_with_mgmt`]: plan a link's `recv` outcome (a received
+/// frame, or a drop on error) into `stage`.
+fn handle_link_result(
+    now: Duration,
+    router: &mut CentralRouter,
+    idx: usize,
+    result: Result<wayfinder::link::Received<'_>, interfaces::link::LinkError>,
+    tx_buffer: &mut [u8; MAX_LINK_FRAME_LEN],
+    stage: &mut StageSink,
+) {
+    match result {
+        Ok(received) => {
+            trace!(iface = idx, "rx frame from interface");
+            handle_mesh_frame(
+                now,
+                router,
+                idx,
+                received.frame,
+                received.metrics,
+                tx_buffer,
+                stage,
+            );
+        }
+        Err(e) => {
+            trace!(iface = idx, error = ?e, "drop: link recv error");
+        }
+    }
+}
+
+/// The [`Either::Second`]/[`Either3::Second`] arm shared by [`Driver::run_once`]
+/// and [`Driver::run_once_with_mgmt`]: the periodic OGM/keep-alive timer fired,
+/// so plan whatever is due into `stage`.
+fn handle_timer_due(
+    router: &mut CentralRouter,
+    now: Duration,
+    tx_buffer: &mut [u8; MAX_LINK_FRAME_LEN],
+    stage: &mut StageSink,
+) {
+    trace!("polling OGMs and keep-alives");
+    poll_due_ogms(router, now, tx_buffer, stage);
+    poll_due_keepalives(router, now, tx_buffer, stage);
+}
+
+#[cfg(feature = "mgmt")]
+impl<L: LinkT, C: Clock, const N: usize> Driver<L, C, N> {
+    /// Run the event loop forever, additionally serving management-API queries.
+    ///
+    /// The same mesh loop as [`run`](Self::run), plus a third `select` arm that
+    /// answers requests forwarded from a `wayfinder-server` `serve` loop over
+    /// `mgmt` (the router-loop half of an
+    /// [`EmbeddedQueryChannel`](wayfinder_server::EmbeddedQueryChannel)). The
+    /// serve loop owns the management byte stream (a UART) on its own task; this
+    /// loop owns the router, so a query is serviced synchronously here — against
+    /// a fresh [`RouterAdapter`] at the current instant — and never shares the
+    /// router across tasks. Never returns; the board spawns this on its executor.
+    pub async fn run_with_mgmt(&mut self, mgmt: &EmbeddedQueryRx<'_>) -> ! {
+        loop {
+            self.run_once_with_mgmt(mgmt).await;
+        }
+    }
+
+    /// One iteration of [`run_with_mgmt`](Self::run_with_mgmt): race each link's
+    /// `recv`, the periodic OGM/keep-alive timer, and an inbound management
+    /// query; plan the winner; then dispatch any staged frames. A served query
+    /// stages nothing, so its dispatch is a no-op.
+    async fn run_once_with_mgmt(&mut self, mgmt: &EmbeddedQueryRx<'_>) {
+        let now = self.clock.now();
+        let due = self
+            .router
+            .next_broadcast_after(now)
+            .min(self.router.next_keepalive_after(now));
+
+        let Driver {
+            router,
+            links,
+            clock,
+            mac,
+            tx_buffer,
+            stage,
+        } = self;
+        stage.frames.clear();
+
+        let recv_futs = links.each_mut().map(|link| link.recv());
+        match select3(select_array(recv_futs), clock.sleep(due), mgmt.recv()).await {
+            Either3::First((result, idx)) => {
+                handle_link_result(now, router, idx, result, tx_buffer, stage)
+            }
+            Either3::Second(()) => handle_timer_due(router, now, tx_buffer, stage),
+            Either3::Third(request) => {
+                trace!("servicing forwarded management query");
+                // Build the response against a fresh adapter at `now`, then hand
+                // it back to the waiting serve loop. `None` — an embedded node is
+                // never a provider-mode certificate authority.
+                let response = WayfinderService::new(RouterAdapter::new(&mut *router, None, now))
+                    .handle(request);
+                mgmt.reply(response).await;
+            }
+        }
+
         dispatch(links, router, *mac, now, stage).await;
     }
 }
@@ -546,5 +643,121 @@ mod tests {
         let (dst, protocol, _payload) = &driver.links[1].sent[0];
         assert_eq!(*dst, Mac::BROADCAST);
         assert_eq!(*protocol, wayfinder::DEFAULT_BATMAN_ETHER_TYPE);
+    }
+
+    /// A management query forwarded over the channel while neither the OGM timer
+    /// nor a link recv is ready is served against the router: the response is a
+    /// `NodeInfo` whose node id is this driver's own MAC — the full embedded
+    /// mgmt path: channel → `run_once_with_mgmt` → `RouterAdapter` → reply.
+    #[cfg(feature = "mgmt")]
+    #[test]
+    fn run_once_with_mgmt_serves_a_node_info_query() {
+        use wayfinder_protos::wayfinder_v1alpha::{
+            GetNodeInfoRequest, WayfinderRequest, wayfinder_request::Request as ReqKind,
+            wayfinder_response::Response as RespKind,
+        };
+        use wayfinder_server::EmbeddedQueryChannel;
+
+        let channel = EmbeddedQueryChannel::new();
+        let (tx, rx) = channel.split();
+
+        // `RecvClock` never completes its sleep and `FakeLink` never receives, so
+        // the management arm is the only one that can fire this iteration.
+        let clock = RecvClock {
+            now: Duration::from_secs(1),
+        };
+        let trickle = [TrickleParams::default()];
+        let mut driver = Driver::new(mac(1), [FakeLink::default()], clock, &trickle, &[]);
+
+        let client = async {
+            tx.query(WayfinderRequest {
+                request: Some(ReqKind::GetNodeInfo(GetNodeInfoRequest {})),
+            })
+            .await
+        };
+
+        let (_, response) = futures::executor::block_on(futures::future::join(
+            driver.run_once_with_mgmt(&rx),
+            client,
+        ));
+
+        match response.response {
+            Some(RespKind::NodeInfo(info)) => {
+                assert_eq!(
+                    info.node_id,
+                    mac(1).as_bytes().to_vec(),
+                    "the served NodeInfo carries this node's own MAC"
+                );
+            }
+            other => panic!("expected a NodeInfo response, got {other:?}"),
+        }
+        assert!(
+            driver.links[0].sent.is_empty(),
+            "a served query stages nothing to send: dispatch is a no-op"
+        );
+    }
+
+    /// When a link `recv` and a management query are both ready in the same
+    /// iteration, `select3` polls its arms left-to-right, so the link arm — not
+    /// the management arm — wins: sustained mesh traffic can starve a pending
+    /// management query indefinitely. This pins down that current behavior as a
+    /// deliberate, verified property rather than an unverified implementation
+    /// detail of `select3`'s poll order; it is not yet mitigated (no fairness /
+    /// round-robin between the two).
+    #[cfg(feature = "mgmt")]
+    #[test]
+    fn run_once_with_mgmt_prefers_ready_link_traffic_over_a_pending_query() {
+        use futures::FutureExt;
+        use wayfinder_protos::wayfinder_v1alpha::{
+            GetNodeInfoRequest, WayfinderRequest, wayfinder_request::Request as ReqKind,
+        };
+        use wayfinder_server::EmbeddedQueryChannel;
+
+        let channel = EmbeddedQueryChannel::new();
+        let (tx, rx) = channel.split();
+
+        // Enqueue a request without waiting for its reply: `query`'s send half
+        // completes synchronously (the channel has a free slot), so polling it
+        // once via `now_or_never` runs that far and leaves `mgmt.recv()` ready;
+        // the reply half then blocks forever (no router loop is running yet),
+        // which `now_or_never` correctly reports as `None`.
+        let seed = tx.query(WayfinderRequest {
+            request: Some(ReqKind::GetNodeInfo(GetNodeInfoRequest {})),
+        });
+        assert!(
+            core::pin::pin!(seed).now_or_never().is_none(),
+            "the reply half blocks forever with no router loop running yet"
+        );
+
+        // A link with a frame already staged is ready on the very first poll,
+        // same as the mgmt arm seeded above.
+        let ogm = link_frame_bytes(
+            Mac::BROADCAST,
+            mac(2),
+            wayfinder::DEFAULT_BATMAN_ETHER_TYPE,
+            &bare_ogm_bytes(mac(2), 1, 50),
+        );
+        let link0 = FakeLink {
+            to_recv: Some(ogm),
+            ..Default::default()
+        };
+        let clock = RecvClock {
+            now: Duration::from_secs(1),
+        };
+        let trickle = [TrickleParams::default()];
+        let mut driver = Driver::new(mac(1), [link0], clock, &trickle, &[]);
+
+        futures::executor::block_on(driver.run_once_with_mgmt(&rx));
+
+        // Had the mgmt arm won, `run_once_with_mgmt` would have drained the
+        // request via `mgmt.recv()`, leaving the channel empty. It's still
+        // there: the ready link arm won instead, starving the query this
+        // iteration.
+        assert!(
+            core::pin::pin!(rx.recv()).now_or_never().is_some(),
+            "the request enqueued before run_once_with_mgmt is still waiting to \
+             be received: the ready link arm won this iteration over the ready \
+             management arm"
+        );
     }
 }

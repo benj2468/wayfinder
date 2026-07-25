@@ -24,8 +24,21 @@ bench = false
 [dependencies]
 wayfinder = { path = "../../libs/wayfinder", default-features = false }
 # The HAL-agnostic embedded driver that runs the router loop, and the RYLR998
-# LoRa driver whose `RylrClient` is this board's one mesh `LinkT`.
-wayfinder-embedded-driver = { path = "../../libs/wayfinder-embedded-driver" }
+# LoRa driver whose `RylrClient` is this board's one mesh `LinkT`.  `mgmt` adds
+# the event-loop arm that serves management-API queries off the VCOM UART.
+wayfinder-embedded-driver = { path = "../../libs/wayfinder-embedded-driver", features = [
+    "mgmt",
+] }
+# The `no_std` management transport: the `EmbeddedQueryChannel` bridging the
+# serve loop to the driver, and the `serve` loop that frames requests over the
+# onboard-debugger VCOM UART.  Only its `embedded` feature — no `std`/tokio.
+wayfinder-server = { path = "../../libs/wayfinder-server", default-features = false, features = [
+    "embedded",
+] }
+# `NoopRawMutex` for the single-core query channel, and `join` to run the mesh
+# loop and the management serve loop concurrently on the one executor task.
+embassy-sync = "0.8.0"
+embassy-futures = "0.1.2"
 # Installs the RTT `tracing` subscriber so the mesh stack's `trace!`/`warn!`
 # records are observable over the debug probe (they are otherwise dropped).
 wayfinder-embedded-log = { path = "../../libs/wayfinder-embedded-log" }
