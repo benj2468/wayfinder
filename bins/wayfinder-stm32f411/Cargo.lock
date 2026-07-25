@@ -1137,6 +1137,7 @@ dependencies = [
  "tracing",
  "wayfinder",
  "wayfinder-driver-core",
+ "wayfinder-storage",
 ]
 
 [[package]]
@@ -1164,6 +1165,13 @@ dependencies = [
  "wayfinder",
  "wayfinder-embedded-driver",
  "wayfinder-embedded-log",
+]
+
+[[package]]
+name = "wayfinder-storage"
+version = "0.1.0"
+dependencies = [
+ "tracing",
 ]
 
 [[package]]

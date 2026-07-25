@@ -43,6 +43,8 @@ use wayfinder_driver_core::{
     tag_directed_into,
 };
 
+pub mod identity;
+
 #[cfg(feature = "mgmt")]
 use embassy_futures::select::{Either3, select3};
 #[cfg(feature = "mgmt")]
