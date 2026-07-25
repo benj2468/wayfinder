@@ -7,7 +7,16 @@ edition = "2024"
 workspace = true
 
 [dependencies]
-tracing.workspace = true
+# Pinned directly (not workspace inheritance, which can't override
+# `default-features`) so tracing's `std` feature stays off: this crate is
+# `no_std` under the `flash` backend, and letting `std` unify on would drag
+# tracing-core's `once_cell/std` into a bare-metal binary's build. The `warn!`
+# macro the `std` `FileStore` uses works without the feature.
+tracing = { version = "0.1.44", default-features = false }
+# `flash` feature only: the `NorFlash`/`ReadNorFlash` traits the flash-backed
+# `FlashStore` is generic over. A tiny `no_std` trait-only crate (no deps), so
+# it stays off the default/`std` path a host build takes.
+embedded-storage = { workspace = true, optional = true }
 
 [dev-dependencies]
 heapless.workspace = true
@@ -15,6 +24,10 @@ heapless.workspace = true
 [features]
 default = ["std"]
 # Pulls in the std::fs-backed FileStore. Leave off for `no_std` embedded
-# nodes, which will eventually get a flash-backed DurableStore impl instead
-# (not yet implemented — see docs/design/04-generic-durable-store.md §3.5).
+# nodes, which use the flash-backed FlashStore instead.
 std = []
+# Pulls in the `embedded-storage`-backed FlashStore: the A/B two-page flash
+# `DurableStore` for bare-metal nodes
+# (docs/design/implemented/04-generic-durable-store.md §3.5). `no_std`-clean;
+# independent of `std`.
+flash = ["dep:embedded-storage"]

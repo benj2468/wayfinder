@@ -11,6 +11,25 @@ publish = false
 [workspace]
 members = ["."]
 
+# Bare-metal `no_std` has no unwinder, so panic must abort (not unwind) or the
+# compiler rejects the landing pads it would otherwise emit at low opt-levels
+# ("unwinding panics are not supported without std" — hit under `cargo clippy`
+# and unoptimized builds). `panic-halt` supplies the handler; abort just drops
+# the unwinding machinery.
+#
+# A fully-unoptimized debug image of this firmware (mgmt server + prost + the
+# crypto stack all linked in) is also ~1 MiB and no longer fits the 1016 KiB
+# `FLASH` region once the top two pages are reserved for the durable identity
+# store (see `memory.x`). Optimizing for size in dev too — standard practice
+# for embedded targets — keeps debuginfo but shrinks the image well under the
+# limit, so `cargo build` (not just `--release`) links.
+[profile.dev]
+opt-level = "s"
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
 # `#[no_std]`/`#[no_main]` can't build the host `test` harness (no `std` to
 # link the harness against) — `cargo test`/`clippy --all-targets` would
 # otherwise try and fail. Same reason libs/wayfinder/fuzz sets this.
@@ -34,6 +53,12 @@ wayfinder-embedded-driver = { path = "../../libs/wayfinder-embedded-driver", fea
 # onboard-debugger VCOM UART.  Only its `embedded` feature — no `std`/tokio.
 wayfinder-server = { path = "../../libs/wayfinder-server", default-features = false, features = [
     "embedded",
+] }
+# The flash-backed `DurableStore` (`FlashStore`) that persists this node's
+# self-assigned mesh identity across reboots. `flash` pulls in the
+# `embedded-storage` NorFlash backend; `std`/`FileStore` stay off.
+wayfinder-storage = { path = "../../libs/wayfinder-storage", default-features = false, features = [
+    "flash",
 ] }
 # `NoopRawMutex` for the single-core query channel, and `join` to run the mesh
 # loop and the management serve loop concurrently on the one executor task.

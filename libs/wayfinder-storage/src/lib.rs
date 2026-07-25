@@ -14,14 +14,20 @@
 //! inside* the blob (encoding, versioning, migration) stays the caller's
 //! concern.
 //!
-//! See `docs/design/04-generic-durable-store.md` for the design this
-//! implements.
+//! See `docs/design/implemented/04-generic-durable-store.md` for the design
+//! this implements.
 
 #[cfg(feature = "std")]
 mod file;
 
 #[cfg(feature = "std")]
 pub use file::FileStore;
+
+#[cfg(feature = "flash")]
+mod flash;
+
+#[cfg(feature = "flash")]
+pub use flash::{FlashError, FlashStore};
 
 mod persisted;
 
@@ -40,15 +46,18 @@ pub use persisted::{Codec, LoadError, PersistError, PersistOutcome, Persisted};
 /// async — a flash erase/write cycle can take tens of milliseconds, and
 /// shouldn't block a shared executor — only pays for itself when something
 /// *else* could usefully run during that block, i.e. multiple concurrent
-/// tasks. The embedded target this trait exists for runs a single task with
-/// no executor multiplexing (no management API yet, no second task to
-/// starve), so there is nothing async would let run concurrently — it would
-/// only add `dynosaur`/dyn-compatibility ceremony for a benefit that doesn't
-/// exist on this platform today. On `std`, `FileStore` blocks the calling
-/// thread for the duration of the write, exactly as direct `std::fs` calls
-/// already do everywhere else in this workspace. Revisit if/when an
-/// embedded management API adds a second concurrent task that a blocking
-/// persist could actually starve.
+/// tasks. An embedded node using this trait may now also run a management-API
+/// serve loop concurrently on the same executor (`wayfinder-embedded-driver`'s
+/// `run_with_mgmt`), so the "nothing else to starve" premise no longer holds
+/// unconditionally — but every `DurableStore` call in this workspace today
+/// (the nRF52840 binary's identity load/mint) happens once at boot, before
+/// that concurrent loop starts, so nothing is actually starved yet. This
+/// stays sync rather than paying `dynosaur`/dyn-compatibility ceremony for a
+/// benefit no current call site needs; revisit if a `DurableStore` call is
+/// ever added on a hot path that runs *after* a second concurrent task is
+/// live. On `std`, `FileStore` blocks the calling thread for the duration of
+/// the write, exactly as direct `std::fs` calls already do everywhere else in
+/// this workspace.
 pub trait DurableStore {
     /// The error type this store's medium can produce.
     type Error;

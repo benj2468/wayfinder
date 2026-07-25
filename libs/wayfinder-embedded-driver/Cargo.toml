@@ -23,6 +23,12 @@ mgmt = ["dep:wayfinder-server", "dep:wayfinder-protos", "dep:embassy-sync"]
 
 [dependencies]
 wayfinder-driver-core.workspace = true
+# The `no_std` core of the durable-store abstraction: the `Persisted`/`Codec`/
+# `DurableStore` traits the node-identity persistence (`identity.rs`) is built
+# on. Default features off so no `std`/`FileStore` is pulled into this `no_std`
+# crate; a board supplies the concrete `DurableStore` (e.g. the `flash`-feature
+# `FlashStore`) at the binary.
+wayfinder-storage = { workspace = true, default-features = false }
 # Pinned directly (not workspace inheritance, which can't override
 # `default-features`) so the crate stays `no_std` — no `alloc`, no `std`.
 wayfinder = { path = "../wayfinder", default-features = false }

@@ -2856,6 +2856,7 @@ dependencies = [
  "wayfinder-driver-core",
  "wayfinder-protos",
  "wayfinder-server",
+ "wayfinder-storage",
  "zerocopy",
 ]
 
@@ -2906,6 +2907,7 @@ dependencies = [
 name = "wayfinder-storage"
 version = "0.1.0"
 dependencies = [
+ "embedded-storage",
  "heapless",
  "tracing",
 ]

@@ -1312,6 +1312,7 @@ dependencies = [
  "wayfinder-driver-core",
  "wayfinder-protos",
  "wayfinder-server",
+ "wayfinder-storage",
 ]
 
 [[package]]
@@ -1343,6 +1344,7 @@ dependencies = [
  "wayfinder-embedded-driver",
  "wayfinder-embedded-log",
  "wayfinder-server",
+ "wayfinder-storage",
 ]
 
 [[package]]
@@ -1365,6 +1367,14 @@ dependencies = [
  "wayfinder-auth",
  "wayfinder-protos",
  "zerocopy",
+]
+
+[[package]]
+name = "wayfinder-storage"
+version = "0.1.0"
+dependencies = [
+ "embedded-storage",
+ "tracing",
 ]
 
 [[package]]
