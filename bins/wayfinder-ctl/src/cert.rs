@@ -4,12 +4,17 @@
 //! `trust_anchor_path`): a 32-byte identity/root seed, a 156-byte
 //! [`MembershipCert`], and a 36-byte [`TrustAnchor`].
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
-use anyhow::{Context, bail};
+use anyhow::Context;
+use anyhow::bail;
 use clap::Subcommand;
 use interfaces::frame::Mac;
-use wayfinder_auth::{Authority, Keypair, MembershipCert, TrustAnchor};
+use wayfinder_auth::Authority;
+use wayfinder_auth::Keypair;
+use wayfinder_auth::MembershipCert;
+use wayfinder_auth::TrustAnchor;
 use zerocopy::IntoBytes;
 
 use crate::parse_mac6;

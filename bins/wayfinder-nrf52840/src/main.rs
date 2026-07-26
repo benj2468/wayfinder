@@ -21,22 +21,41 @@
 
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
-use embassy_nrf::gpio::{Level, Output, OutputDrive};
-use embassy_nrf::nvmc::{self, Nvmc};
-use embassy_nrf::uarte::{Baudrate, Config as UarteConfig, Parity};
-use embassy_nrf::{bind_interrupts, buffered_uarte, peripherals};
-use embassy_time::{Duration as EmbassyDuration, Instant, Timer};
+use embassy_nrf::bind_interrupts;
+use embassy_nrf::buffered_uarte;
+use embassy_nrf::gpio::Level;
+use embassy_nrf::gpio::Output;
+use embassy_nrf::gpio::OutputDrive;
+use embassy_nrf::nvmc::Nvmc;
+use embassy_nrf::nvmc::{self};
+use embassy_nrf::peripherals;
+use embassy_nrf::uarte::Baudrate;
+use embassy_nrf::uarte::Config as UarteConfig;
+use embassy_nrf::uarte::Parity;
+use embassy_time::Duration as EmbassyDuration;
+use embassy_time::Instant;
+use embassy_time::Timer;
 use embedded_alloc::LlffHeap as Heap;
 use panic_halt as _;
-use rylr998::{Bandwidth, CodingRate, LoraError, RylrClient, SpreadingFactory};
+use rylr998::Bandwidth;
+use rylr998::CodingRate;
+use rylr998::LoraError;
+use rylr998::RylrClient;
+use rylr998::SpreadingFactory;
+use tracing::error;
 use tracing::info;
-use tracing::{error, trace, warn};
+use tracing::trace;
+use tracing::warn;
 use wayfinder::interfaces::frame::Mac;
-use wayfinder_embedded_driver::identity::{
-    IDENTITY_READ_BUF_LEN, IdentityError, load_or_init_identity,
-};
-use wayfinder_embedded_driver::{Clock, Driver, TrickleParams};
-use wayfinder_server::{EmbeddedQueryChannel, FrameError, serve};
+use wayfinder_embedded_driver::Clock;
+use wayfinder_embedded_driver::Driver;
+use wayfinder_embedded_driver::TrickleParams;
+use wayfinder_embedded_driver::identity::IDENTITY_READ_BUF_LEN;
+use wayfinder_embedded_driver::identity::IdentityError;
+use wayfinder_embedded_driver::identity::load_or_init_identity;
+use wayfinder_server::EmbeddedQueryChannel;
+use wayfinder_server::FrameError;
+use wayfinder_server::serve;
 use wayfinder_storage::FlashStore;
 
 #[global_allocator]

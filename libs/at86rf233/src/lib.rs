@@ -19,11 +19,17 @@
 
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::digital::Wait;
-use embedded_hal_async::spi::{Operation, SpiDevice};
-use ieee802154::{MAX_FRAME_LEN, decode, encode};
-use interfaces::frame::{LinkFrameData, Mac};
-use interfaces::link::{LinkError, LinkMetrics};
-use wayfinder::link::{LinkT, Received};
+use embedded_hal_async::spi::Operation;
+use embedded_hal_async::spi::SpiDevice;
+use ieee802154::MAX_FRAME_LEN;
+use ieee802154::decode;
+use ieee802154::encode;
+use interfaces::frame::LinkFrameData;
+use interfaces::frame::Mac;
+use interfaces::link::LinkError;
+use interfaces::link::LinkMetrics;
+use wayfinder::link::LinkT;
+use wayfinder::link::Received;
 
 /// AT86RF233 register address: TRX_STATUS. Bits 0-4 report the radio
 /// transceiver's current state-machine state ([`STATE_TRX_OFF`],
@@ -309,7 +315,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])

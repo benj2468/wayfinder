@@ -2,8 +2,10 @@
 //! sibling + `rename`, mirroring `wayfinder-server`'s existing `CaLog`
 //! atomic-write behavior (extracted from it, not reinvented).
 
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::io::{self};
+use std::path::Path;
+use std::path::PathBuf;
 
 use crate::DurableStore;
 

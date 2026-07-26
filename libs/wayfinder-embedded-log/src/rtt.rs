@@ -1,12 +1,20 @@
 //! The RTT-backed `tracing` subscriber, compiled only for bare metal.
 
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::Ordering;
 
-use rtt_target::{rprintln, rtt_init_print};
-use tracing_core::field::{Field, Visit};
-use tracing_core::span::{Attributes, Id, Record};
-use tracing_core::{Dispatch, Event, Metadata, Subscriber};
+use rtt_target::rprintln;
+use rtt_target::rtt_init_print;
+use tracing_core::Dispatch;
+use tracing_core::Event;
+use tracing_core::Metadata;
+use tracing_core::Subscriber;
+use tracing_core::field::Field;
+use tracing_core::field::Visit;
+use tracing_core::span::Attributes;
+use tracing_core::span::Id;
+use tracing_core::span::Record;
 
 /// Longest event line rendered to RTT; anything past this is truncated. Sized
 /// for a level + target + a handful of the short structured fields the mesh

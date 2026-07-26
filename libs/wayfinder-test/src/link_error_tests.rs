@@ -10,14 +10,18 @@
 //! purpose-built failing links.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use interfaces::frame::{LinkFrameData, Mac};
+use interfaces::frame::LinkFrameData;
+use interfaces::frame::Mac;
 use interfaces::link::LinkError;
 use tokio::time::timeout;
-use wayfinder::link::{LinkT, Received};
+use wayfinder::link::LinkT;
+use wayfinder::link::Received;
 use wayfinder_driver::DynLinkT;
 
 use crate::test_router::TestRouter;

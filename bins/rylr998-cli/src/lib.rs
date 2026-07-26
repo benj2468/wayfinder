@@ -9,11 +9,18 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-use clap::{Parser, Subcommand, ValueEnum};
-use embedded_io_async::{Read, Write};
-use rylr998::{
-    Bandwidth, CodingRate, LoraError, ReceivedPacket, RylrClient, SpreadingFactory, WirelessMode,
-};
+use clap::Parser;
+use clap::Subcommand;
+use clap::ValueEnum;
+use embedded_io_async::Read;
+use embedded_io_async::Write;
+use rylr998::Bandwidth;
+use rylr998::CodingRate;
+use rylr998::LoraError;
+use rylr998::ReceivedPacket;
+use rylr998::RylrClient;
+use rylr998::SpreadingFactory;
+use rylr998::WirelessMode;
 
 /// Command-line interface for `rylr998-cli`.
 #[derive(Parser, Debug)]

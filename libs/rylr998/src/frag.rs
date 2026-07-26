@@ -15,7 +15,8 @@
 //! needs no per-fragment length bookkeeping, only the last fragment is short.
 
 use crate::link::MAX_FRAME_LEN;
-use tracing::{trace, warn};
+use tracing::trace;
+use tracing::warn;
 use wayfinder::interfaces::link::LinkMetrics;
 
 /// Bytes of fragment header prefixed to each on-air fragment's frame-content

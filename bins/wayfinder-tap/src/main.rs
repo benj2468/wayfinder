@@ -10,22 +10,38 @@
 
 mod tap;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::Context;
+use anyhow::anyhow;
+use anyhow::bail;
 use clap::Parser;
-use tokio::{sync::mpsc, task::JoinSet};
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
-use tun_rs::{DeviceBuilder, Layer};
-use wayfinder::config::{
-    Config, LinkFeatures, LinkTransport, LocalDistributionMechanism, ServerConfig, TrickleConfig,
-};
+use tun_rs::DeviceBuilder;
+use tun_rs::Layer;
+use wayfinder::config::Config;
+use wayfinder::config::LinkFeatures;
+use wayfinder::config::LinkTransport;
+use wayfinder::config::LocalDistributionMechanism;
+use wayfinder::config::ServerConfig;
+use wayfinder::config::TrickleConfig;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder::wayfinder_auth::Keypair;
-use wayfinder_driver::{
-    AuthSnapshotRx, AuthSnapshotTx, Driver, QueryRx, QueryTx, Rylr998LinkParams, bind_tcp_server,
-    build_raw_ip_link, build_raw_l2_link, build_rylr998_link, build_udp_link, serve_tls_server,
-};
+use wayfinder_driver::AuthSnapshotRx;
+use wayfinder_driver::AuthSnapshotTx;
+use wayfinder_driver::Driver;
+use wayfinder_driver::QueryRx;
+use wayfinder_driver::QueryTx;
+use wayfinder_driver::Rylr998LinkParams;
+use wayfinder_driver::bind_tcp_server;
+use wayfinder_driver::build_raw_ip_link;
+use wayfinder_driver::build_raw_l2_link;
+use wayfinder_driver::build_rylr998_link;
+use wayfinder_driver::build_udp_link;
+use wayfinder_driver::serve_tls_server;
 
 use crate::tap::TapDevice;
 
@@ -364,7 +380,8 @@ async fn main() -> anyhow::Result<()> {
     let mut auth_mesh_id: Option<u32> = None;
     if let Some(auth_cfg) = config.auth {
         use wayfinder::auth::OgmAuth;
-        use wayfinder::wayfinder_auth::{MembershipCert, TrustAnchor};
+        use wayfinder::wayfinder_auth::MembershipCert;
+        use wayfinder::wayfinder_auth::TrustAnchor;
 
         let keypair = load_keypair(&auth_cfg.seed_path)?;
 

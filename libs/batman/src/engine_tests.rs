@@ -1,16 +1,19 @@
-use interfaces::{
-    engine::{MeshRoutingEngine, RoutingAction},
-    frame::{LinkFrame, LinkFrameDataMut, Mac},
-};
-use zerocopy::{FromBytes, IntoBytes};
+use interfaces::engine::MeshRoutingEngine;
+use interfaces::engine::RoutingAction;
+use interfaces::frame::LinkFrame;
+use interfaces::frame::LinkFrameDataMut;
+use interfaces::frame::Mac;
+use zerocopy::FromBytes;
+use zerocopy::IntoBytes;
 
-use crate::{
-    BatmanEngine,
-    wire::{
-        BATADV_BCAST, BATADV_IV_OGM, BATADV_UNICAST, BatmanBroadcastPacket, BatmanOgmPacket,
-        BatmanUnicastPacket, ETH_P_BATMAN,
-    },
-};
+use crate::BatmanEngine;
+use crate::wire::BATADV_BCAST;
+use crate::wire::BATADV_IV_OGM;
+use crate::wire::BATADV_UNICAST;
+use crate::wire::BatmanBroadcastPacket;
+use crate::wire::BatmanOgmPacket;
+use crate::wire::BatmanUnicastPacket;
+use crate::wire::ETH_P_BATMAN;
 
 // Map a compact `u8` test identifier to a full MAC address, e.g. `mac(2)` ->
 // `00:00:00:00:00:02`.  The engine is now concrete over [`Mac`], so the tests
@@ -1116,7 +1119,8 @@ mod mcast_membership {
     use core::time::Duration;
 
     use super::*;
-    use crate::wire::{BatmanTvlvHdr, TvlvType};
+    use crate::wire::BatmanTvlvHdr;
+    use crate::wire::TvlvType;
 
     /// A multicast group MAC (`01:00:5e:00:00:NN`, IPv4-multicast style).
     fn group(n: u8) -> Mac {
@@ -1247,7 +1251,8 @@ mod mcast_packet {
     //! that node like a unicast and delivered locally on arrival.
 
     use super::*;
-    use crate::wire::{BATADV_MCAST, BatmanMcastPacket};
+    use crate::wire::BATADV_MCAST;
+    use crate::wire::BatmanMcastPacket;
 
     /// Build a BATADV_MCAST packet addressed to `dest`, wrapping `payload`.
     fn make_mcast(dest: u8, ttl: u8, payload: &[u8]) -> Vec<u8> {
@@ -1365,9 +1370,10 @@ mod cert_forwarding {
     //! state.
 
     use super::*;
-    use crate::wire::{
-        BATADV_CERT_REPLY, BATADV_CERT_REQ, BatmanCertReplyPacket, BatmanCertReqPacket,
-    };
+    use crate::wire::BATADV_CERT_REPLY;
+    use crate::wire::BATADV_CERT_REQ;
+    use crate::wire::BatmanCertReplyPacket;
+    use crate::wire::BatmanCertReqPacket;
 
     fn make_cert_req(dest: u8, ttl: u8, payload: &[u8]) -> Vec<u8> {
         let hdr = BatmanCertReqPacket {

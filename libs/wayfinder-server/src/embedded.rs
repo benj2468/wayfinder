@@ -19,18 +19,25 @@
 //! matters if the requester has already gone away).
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::AtomicBool;
+use core::sync::atomic::Ordering;
 
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
-use embassy_sync::channel::{Channel, Receiver, Sender};
-use embedded_io_async::{Read, Write};
+use embassy_sync::channel::Channel;
+use embassy_sync::channel::Receiver;
+use embassy_sync::channel::Sender;
+use embedded_io_async::Read;
+use embedded_io_async::Write;
 use prost::Message;
 use tracing::trace;
-use wayfinder_protos::wayfinder_v1alpha::{
-    ErrorResponse, WayfinderRequest, WayfinderResponse, wayfinder_response::Response as RespKind,
-};
+use wayfinder_protos::wayfinder_v1alpha::ErrorResponse;
+use wayfinder_protos::wayfinder_v1alpha::WayfinderRequest;
+use wayfinder_protos::wayfinder_v1alpha::WayfinderResponse;
+use wayfinder_protos::wayfinder_v1alpha::wayfinder_response::Response as RespKind;
 
-use crate::framing::{FrameError, read_frame, write_frame};
+use crate::framing::FrameError;
+use crate::framing::read_frame;
+use crate::framing::write_frame;
 
 /// The two capacity-1 channels that bridge a [`serve`] loop to the task that
 /// owns the router: one carries a decoded request toward the router, the other
@@ -202,7 +209,8 @@ mod tests {
 
     use core::convert::Infallible;
 
-    use wayfinder_protos::wayfinder_v1alpha::{NodeInfo, wayfinder_request::Request as ReqKind};
+    use wayfinder_protos::wayfinder_v1alpha::NodeInfo;
+    use wayfinder_protos::wayfinder_v1alpha::wayfinder_request::Request as ReqKind;
 
     use super::*;
     use crate::framing::MAX_FRAME_LEN;

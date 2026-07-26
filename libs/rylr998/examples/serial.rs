@@ -1,6 +1,7 @@
 //! Example: drive a real RYLR998 module over a serial port with [`RylrClient`].
 use embedded_io_adapters::tokio_1::FromTokio;
-use rylr998::{Bandwidth, RylrClient};
+use rylr998::Bandwidth;
+use rylr998::RylrClient;
 use std::time::Duration;
 use tokio_serial::SerialPortBuilderExt;
 

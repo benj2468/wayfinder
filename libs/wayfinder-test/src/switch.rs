@@ -3,8 +3,9 @@ use std::fmt::Debug;
 use std::mem::size_of;
 
 use interfaces::frame::MeshIdentifier;
+use rand::RngExt;
+use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
 use thiserror::Error;
 use tokio::sync::mpsc::error::TryRecvError;
 
@@ -392,7 +393,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::Mutex;
     use tokio::sync::mpsc;
 
     // Helper to create a simple frame with src and dst

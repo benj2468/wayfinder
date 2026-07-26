@@ -7,11 +7,14 @@
 //! or parse failure degrades to an empty history rather than disrupting the UI.
 
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
-use crate::app::{THROUGHPUT_HISTORY, ThroughputSample};
+use crate::app::THROUGHPUT_HISTORY;
+use crate::app::ThroughputSample;
 
 /// On-disk schema version. Bumped if the persisted layout changes incompatibly
 /// so a stale file from an older build is discarded rather than mis-parsed.

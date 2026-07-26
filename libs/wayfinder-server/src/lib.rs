@@ -25,17 +25,32 @@ mod adapter;
 pub use adapter::RouterAdapter;
 
 mod authz;
-pub use authz::{MgmtAccess, MgmtDenied, authorize_admin, decide_access};
+pub use authz::MgmtAccess;
+pub use authz::MgmtDenied;
+pub use authz::authorize_admin;
+pub use authz::decide_access;
 
 #[cfg(feature = "embedded")]
 mod framing;
 #[cfg(feature = "embedded")]
-pub use framing::{FrameError, MAX_FRAME_LEN, read_frame, write_frame};
+pub use framing::FrameError;
+#[cfg(feature = "embedded")]
+pub use framing::MAX_FRAME_LEN;
+#[cfg(feature = "embedded")]
+pub use framing::read_frame;
+#[cfg(feature = "embedded")]
+pub use framing::write_frame;
 
 #[cfg(feature = "embedded")]
 mod embedded;
 #[cfg(feature = "embedded")]
-pub use embedded::{EmbeddedQueryChannel, EmbeddedQueryRx, EmbeddedQueryTx, serve};
+pub use embedded::EmbeddedQueryChannel;
+#[cfg(feature = "embedded")]
+pub use embedded::EmbeddedQueryRx;
+#[cfg(feature = "embedded")]
+pub use embedded::EmbeddedQueryTx;
+#[cfg(feature = "embedded")]
+pub use embedded::serve;
 
 #[cfg(feature = "std")]
 mod tls;
@@ -56,8 +71,28 @@ pub use authority::CertAuthority;
 #[cfg(feature = "std")]
 mod transport;
 #[cfg(feature = "std")]
-pub use transport::{
-    AuthContext, AuthSnapshot, AuthSnapshotRx, AuthSnapshotTx, ChannelRequest, ChannelServerRx,
-    ChannelServerTx, QueryRx, QueryTx, bind_tcp_server, run_channel_server,
-    serve_authenticated_stream, serve_tls_server,
-};
+pub use transport::AuthContext;
+#[cfg(feature = "std")]
+pub use transport::AuthSnapshot;
+#[cfg(feature = "std")]
+pub use transport::AuthSnapshotRx;
+#[cfg(feature = "std")]
+pub use transport::AuthSnapshotTx;
+#[cfg(feature = "std")]
+pub use transport::ChannelRequest;
+#[cfg(feature = "std")]
+pub use transport::ChannelServerRx;
+#[cfg(feature = "std")]
+pub use transport::ChannelServerTx;
+#[cfg(feature = "std")]
+pub use transport::QueryRx;
+#[cfg(feature = "std")]
+pub use transport::QueryTx;
+#[cfg(feature = "std")]
+pub use transport::bind_tcp_server;
+#[cfg(feature = "std")]
+pub use transport::run_channel_server;
+#[cfg(feature = "std")]
+pub use transport::serve_authenticated_stream;
+#[cfg(feature = "std")]
+pub use transport::serve_tls_server;

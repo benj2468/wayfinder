@@ -15,9 +15,13 @@ mod tracing_init;
 mod types;
 
 pub use driver::PyDriver;
-pub use errors::{MalformedFrameError, WayfinderError};
+pub use errors::MalformedFrameError;
+pub use errors::WayfinderError;
 pub use tracing_init::init_tracing;
-pub use types::{PyEgressInterface, PyLinkFeatures, PyLinkMetrics, PyMac};
+pub use types::PyEgressInterface;
+pub use types::PyLinkFeatures;
+pub use types::PyLinkMetrics;
+pub use types::PyMac;
 
 /// `wayfinder_py` module init.
 #[pymodule]

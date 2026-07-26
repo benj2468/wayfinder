@@ -26,15 +26,22 @@
 //! The impl uses the native `async fn` [`LinkT`] trait directly (no boxing), so
 //! it is usable from a `no_std` executor driving the radio.
 
-use embedded_io_async::{Read, Write};
+use embedded_io_async::Read;
+use embedded_io_async::Write;
 use tracing::trace;
-use wayfinder::interfaces::frame::{LinkFrame, LinkFrameData, Mac};
-use wayfinder::interfaces::link::{LinkError, LinkMetrics};
-use wayfinder::link::{LinkT, Received};
-use zerocopy::{FromBytes, IntoBytes};
+use wayfinder::interfaces::frame::LinkFrame;
+use wayfinder::interfaces::frame::LinkFrameData;
+use wayfinder::interfaces::frame::Mac;
+use wayfinder::interfaces::link::LinkError;
+use wayfinder::interfaces::link::LinkMetrics;
+use wayfinder::link::LinkT;
+use wayfinder::link::Received;
+use zerocopy::FromBytes;
+use zerocopy::IntoBytes;
 
+use crate::LoraError;
+use crate::RylrClient;
 use crate::frag;
-use crate::{LoraError, RylrClient};
 
 /// RYLR broadcast address.  Every node in range receives a frame sent here,
 /// matching LoRa's physical broadcast; delivery is decided by the embedded

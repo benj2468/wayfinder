@@ -18,11 +18,17 @@
 //! hands it to [`Ieee802154Link::new`].
 
 use embassy_nrf::radio::Error as RadioError;
-use embassy_nrf::radio::ieee802154::{Packet, Radio};
-use ieee802154::{MAX_FRAME_LEN, decode, encode};
-use interfaces::frame::{LinkFrameData, Mac};
-use interfaces::link::{LinkError, LinkMetrics};
-use wayfinder::link::{LinkT, Received};
+use embassy_nrf::radio::ieee802154::Packet;
+use embassy_nrf::radio::ieee802154::Radio;
+use ieee802154::MAX_FRAME_LEN;
+use ieee802154::decode;
+use ieee802154::encode;
+use interfaces::frame::LinkFrameData;
+use interfaces::frame::Mac;
+use interfaces::link::LinkError;
+use interfaces::link::LinkMetrics;
+use wayfinder::link::LinkT;
+use wayfinder::link::Received;
 
 const _: () = assert!(Packet::CAPACITY as usize == MAX_FRAME_LEN);
 

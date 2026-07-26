@@ -4,19 +4,32 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use wayfinder_auth::Keypair;
 use wayfinder_client::Identity;
-use wayfinder_protos::service::{
-    InterfaceThroughputData, KeepAliveEntryData, LinkFeaturesEntryData, LinkQualityEntryData,
-    NodeMetricsData, NodeSecurityData, OgmScheduleEntryData, RouteResolutionData, RoutingEntryData,
-    RuntimeConfigData, SecurityStatusData, TableOccupancyData, WayfinderDataProvider,
-    WayfinderService,
-};
-use wayfinder_protos::wayfinder_v1alpha::{WayfinderRequest, WayfinderResponse};
-use wayfinder_server::{AuthSnapshot, serve_tls_server};
+use wayfinder_protos::service::InterfaceThroughputData;
+use wayfinder_protos::service::KeepAliveEntryData;
+use wayfinder_protos::service::LinkFeaturesEntryData;
+use wayfinder_protos::service::LinkQualityEntryData;
+use wayfinder_protos::service::NodeMetricsData;
+use wayfinder_protos::service::NodeSecurityData;
+use wayfinder_protos::service::OgmScheduleEntryData;
+use wayfinder_protos::service::RouteResolutionData;
+use wayfinder_protos::service::RoutingEntryData;
+use wayfinder_protos::service::RuntimeConfigData;
+use wayfinder_protos::service::SecurityStatusData;
+use wayfinder_protos::service::TableOccupancyData;
+use wayfinder_protos::service::WayfinderDataProvider;
+use wayfinder_protos::service::WayfinderService;
+use wayfinder_protos::wayfinder_v1alpha::WayfinderRequest;
+use wayfinder_protos::wayfinder_v1alpha::WayfinderResponse;
+use wayfinder_server::AuthSnapshot;
+use wayfinder_server::serve_tls_server;
+use wayfinderctl::Command;
+use wayfinderctl::Endpoint;
 use wayfinderctl::output::OutputFormat;
-use wayfinderctl::{Command, Endpoint, run_query};
+use wayfinderctl::run_query;
 
 /// Minimal provider: only `node_info` carries meaningful values; the rest return
 /// empty/zero, which is all the `node-info` query exercises.

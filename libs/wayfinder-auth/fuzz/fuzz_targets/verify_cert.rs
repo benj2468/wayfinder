@@ -5,7 +5,9 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
+use wayfinder_auth::Keypair;
+use wayfinder_auth::MembershipCert;
+use wayfinder_auth::TrustAnchor;
 use zerocopy::FromBytes;
 
 fuzz_target!(|data: &[u8]| {

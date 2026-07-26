@@ -7,7 +7,8 @@
 //! resistance.  OGMs and broadcasts are one-to-many and cannot use a pairwise
 //! tag — they are authenticated by the originator's signature instead.
 
-use blake2::{Blake2s256, Digest};
+use blake2::Blake2s256;
+use blake2::Digest;
 use subtle::ConstantTimeEq;
 
 /// Length in bytes of the on-wire authentication tag.  16 bytes (128 bits) is

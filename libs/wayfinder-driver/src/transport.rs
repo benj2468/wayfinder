@@ -17,12 +17,16 @@
 //!   delivery decision.  The driver only ever holds `Box<dyn LinkT>`, so a
 //!   single interface set can mix both kinds.
 
-use wayfinder::interfaces::{
-    frame::{LinkFrame, LinkFrameData, MAX_LINK_FRAME_LEN, Mac},
-    link::{LinkError, LinkMetrics},
-};
-use wayfinder::link::{LinkT, Received};
-use zerocopy::{FromBytes, IntoBytes};
+use wayfinder::interfaces::frame::LinkFrame;
+use wayfinder::interfaces::frame::LinkFrameData;
+use wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN;
+use wayfinder::interfaces::frame::Mac;
+use wayfinder::interfaces::link::LinkError;
+use wayfinder::interfaces::link::LinkMetrics;
+use wayfinder::link::LinkT;
+use wayfinder::link::Received;
+use zerocopy::FromBytes;
+use zerocopy::IntoBytes;
 
 /// A message-oriented async byte pipe: read/write whole frames, one per call.
 ///
@@ -137,7 +141,8 @@ impl<Io: FrameIo> LinkT for Link<Io> {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])

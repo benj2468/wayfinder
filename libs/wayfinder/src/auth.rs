@@ -26,14 +26,24 @@
 //! cannot influence routing); full data-plane segregation arrives with the
 //! pairwise tag.
 
-use batman::wire::{BatmanOgmPacket, BatmanTvlvHdr, TvlvType, find_tvlv, iter_tvlv};
+use batman::wire::BatmanOgmPacket;
+use batman::wire::BatmanTvlvHdr;
+use batman::wire::TvlvType;
+use batman::wire::find_tvlv;
+use batman::wire::iter_tvlv;
 use heapless::Vec as HVec;
 use interfaces::frame::Mac;
-use wayfinder_auth::{
-    Keypair, MembershipCert, RevocationRecord, TAG_LEN, TrustAnchor, VerifiedCert, frame_tag,
-    verify_frame_tag, verify_signature,
-};
-use zerocopy::{FromBytes, IntoBytes};
+use wayfinder_auth::Keypair;
+use wayfinder_auth::MembershipCert;
+use wayfinder_auth::RevocationRecord;
+use wayfinder_auth::TAG_LEN;
+use wayfinder_auth::TrustAnchor;
+use wayfinder_auth::VerifiedCert;
+use wayfinder_auth::frame_tag;
+use wayfinder_auth::verify_frame_tag;
+use wayfinder_auth::verify_signature;
+use zerocopy::FromBytes;
+use zerocopy::IntoBytes;
 
 /// Fixed size of the BATMAN OGM header preceding the TVLV tail.
 const OGM_HDR: usize = core::mem::size_of::<BatmanOgmPacket>();
@@ -1282,7 +1292,10 @@ impl OgmAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use batman::wire::{BATADV_IV_OGM, BATADV_KEEPALIVE, BatmanKeepAlivePacket, BatmanOgmPacket};
+    use batman::wire::BATADV_IV_OGM;
+    use batman::wire::BATADV_KEEPALIVE;
+    use batman::wire::BatmanKeepAlivePacket;
+    use batman::wire::BatmanOgmPacket;
     use wayfinder_auth::Authority;
 
     fn mac(n: u8) -> Mac {

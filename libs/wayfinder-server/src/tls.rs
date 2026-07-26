@@ -9,13 +9,20 @@
 
 use std::sync::Arc;
 
+use rustls::DigitallySignedStruct;
+use rustls::DistinguishedName;
+use rustls::SignatureScheme;
 use rustls::client::danger::HandshakeSignatureValid;
-use rustls::crypto::{WebPkiSupportedAlgorithms, ring};
-use rustls::pki_types::{CertificateDer, UnixTime};
-use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-use rustls::server::{AlwaysResolvesServerRawPublicKeys, ServerConfig};
-use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
-use wayfinder_tls_mgmt::{certified_key_from_seed, verify_raw_key_signature};
+use rustls::crypto::WebPkiSupportedAlgorithms;
+use rustls::crypto::ring;
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::UnixTime;
+use rustls::server::AlwaysResolvesServerRawPublicKeys;
+use rustls::server::ServerConfig;
+use rustls::server::danger::ClientCertVerified;
+use rustls::server::danger::ClientCertVerifier;
+use wayfinder_tls_mgmt::certified_key_from_seed;
+use wayfinder_tls_mgmt::verify_raw_key_signature;
 
 /// Server-side verifier for a client's **raw public key** (RFC 7250).
 ///
@@ -112,14 +119,21 @@ pub fn server_config(own_seed: &[u8; 32]) -> Result<Arc<ServerConfig>, rustls::E
 pub(crate) mod test_support {
     use std::sync::Arc;
 
-    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-    use rustls::client::{AlwaysResolvesClientRawPublicKeys, ClientConfig};
-    use rustls::crypto::{WebPkiSupportedAlgorithms, ring};
-    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-    use rustls::{DigitallySignedStruct, SignatureScheme};
-    use wayfinder_tls_mgmt::{
-        certified_key_from_seed, raw_ed25519_from_spki, verify_raw_key_signature,
-    };
+    use rustls::DigitallySignedStruct;
+    use rustls::SignatureScheme;
+    use rustls::client::AlwaysResolvesClientRawPublicKeys;
+    use rustls::client::ClientConfig;
+    use rustls::client::danger::HandshakeSignatureValid;
+    use rustls::client::danger::ServerCertVerified;
+    use rustls::client::danger::ServerCertVerifier;
+    use rustls::crypto::WebPkiSupportedAlgorithms;
+    use rustls::crypto::ring;
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::ServerName;
+    use rustls::pki_types::UnixTime;
+    use wayfinder_tls_mgmt::certified_key_from_seed;
+    use wayfinder_tls_mgmt::raw_ed25519_from_spki;
+    use wayfinder_tls_mgmt::verify_raw_key_signature;
 
     #[derive(Debug)]
     struct TestPinnedServerVerifier {
@@ -221,12 +235,14 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls::ClientConnection;
+    use rustls::ServerConnection;
     use rustls::pki_types::ServerName;
-    use rustls::{ClientConnection, ServerConnection};
     use wayfinder::wayfinder_auth::Keypair;
     use wayfinder_tls_mgmt::raw_ed25519_from_spki;
 
-    use super::test_support::{test_client_config, test_client_config_no_client_auth};
+    use super::test_support::test_client_config;
+    use super::test_support::test_client_config_no_client_auth;
 
     /// Pump TLS records between an in-memory client and server until both finish
     /// handshaking (or a verifier rejects, surfaced as `Err`).

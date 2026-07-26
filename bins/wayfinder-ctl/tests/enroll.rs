@@ -8,19 +8,38 @@
 use std::path::PathBuf;
 
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
-use wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use wayfinder_auth::Keypair;
+use wayfinder_auth::MembershipCert;
+use wayfinder_auth::TrustAnchor;
 use wayfinder_client::Identity;
-use wayfinder_protos::service::{
-    CsrOutcome, InterfaceThroughputData, IssuedCertData, KeepAliveEntryData, LinkFeaturesEntryData,
-    LinkQualityEntryData, NodeMetricsData, OgmScheduleEntryData, PendingCsrData,
-    RouteResolutionData, RoutingEntryData, RuntimeConfigData, TableOccupancyData,
-    WayfinderDataProvider, WayfinderService,
-};
-use wayfinder_protos::wayfinder_v1alpha::{WayfinderRequest, WayfinderResponse};
-use wayfinder_server::{AuthSnapshot, CertAuthority, MeshAuthority, serve_tls_server};
+use wayfinder_protos::service::CsrOutcome;
+use wayfinder_protos::service::InterfaceThroughputData;
+use wayfinder_protos::service::IssuedCertData;
+use wayfinder_protos::service::KeepAliveEntryData;
+use wayfinder_protos::service::LinkFeaturesEntryData;
+use wayfinder_protos::service::LinkQualityEntryData;
+use wayfinder_protos::service::NodeMetricsData;
+use wayfinder_protos::service::OgmScheduleEntryData;
+use wayfinder_protos::service::PendingCsrData;
+use wayfinder_protos::service::RouteResolutionData;
+use wayfinder_protos::service::RoutingEntryData;
+use wayfinder_protos::service::RuntimeConfigData;
+use wayfinder_protos::service::TableOccupancyData;
+use wayfinder_protos::service::WayfinderDataProvider;
+use wayfinder_protos::service::WayfinderService;
+use wayfinder_protos::wayfinder_v1alpha::WayfinderRequest;
+use wayfinder_protos::wayfinder_v1alpha::WayfinderResponse;
+use wayfinder_server::AuthSnapshot;
+use wayfinder_server::CertAuthority;
+use wayfinder_server::MeshAuthority;
+use wayfinder_server::serve_tls_server;
+use wayfinderctl::Command;
+use wayfinderctl::CsrCommand;
+use wayfinderctl::Endpoint;
 use wayfinderctl::output::OutputFormat;
-use wayfinderctl::{Command, CsrCommand, Endpoint, run_query};
+use wayfinderctl::run_query;
 
 /// A provider node: a real certificate authority behind the data-provider trait.
 /// Only the provider methods carry behaviour; the rest are trivial.

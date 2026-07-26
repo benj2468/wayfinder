@@ -29,16 +29,25 @@ use core::fmt;
 use core::time::Duration;
 
 use interfaces::link::LinkMetrics;
+use wayfinder::CentralRouter;
+use wayfinder::DEFAULT_BATMAN_ETHER_TYPE;
+use wayfinder::EgressInterface;
+use wayfinder::MAX_INTERFACES;
 use wayfinder::auth::DIRECTED_TRAILER_LEN;
 use wayfinder::config::TrickleConfig;
 use wayfinder::features::LinkFeatures;
-use wayfinder::interfaces::frame::{LinkFrame, MAX_LINK_FRAME_LEN, Mac};
-use wayfinder::{CentralRouter, DEFAULT_BATMAN_ETHER_TYPE, EgressInterface, MAX_INTERFACES};
-use wayfinder_driver_core::{
-    Egress, MeshSink, OutgoingFrame, handle_mesh_frame, poll_due_keepalives, poll_due_ogms,
-    tag_directed_into,
-};
-use zerocopy::{FromBytes, IntoBytes};
+use wayfinder::interfaces::frame::LinkFrame;
+use wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN;
+use wayfinder::interfaces::frame::Mac;
+use wayfinder_driver_core::Egress;
+use wayfinder_driver_core::MeshSink;
+use wayfinder_driver_core::OutgoingFrame;
+use wayfinder_driver_core::handle_mesh_frame;
+use wayfinder_driver_core::poll_due_keepalives;
+use wayfinder_driver_core::poll_due_ogms;
+use wayfinder_driver_core::tag_directed_into;
+use zerocopy::FromBytes;
+use zerocopy::IntoBytes;
 
 /// A received frame queued on interface `idx`, awaiting the next [`Driver::tick`].
 struct QueuedRx {
@@ -324,7 +333,8 @@ impl Driver {
 
 #[cfg(test)]
 mod tests {
-    use wayfinder::batman::wire::{BATADV_IV_OGM, BatmanOgmPacket};
+    use wayfinder::batman::wire::BATADV_IV_OGM;
+    use wayfinder::batman::wire::BatmanOgmPacket;
 
     use super::*;
 

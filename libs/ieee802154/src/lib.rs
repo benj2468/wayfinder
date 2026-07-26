@@ -14,10 +14,15 @@
 //! and the mesh layer filters on the 6-byte [`Mac`] embedded in the
 //! [`LinkFrame`] rather than on 802.15.4-level addressing.
 
-use interfaces::frame::{LinkFrame, LinkFrameData, Mac};
+use interfaces::frame::LinkFrame;
+use interfaces::frame::LinkFrameData;
+use interfaces::frame::Mac;
 use interfaces::link::LinkError;
+use zerocopy::FromBytes;
+use zerocopy::Immutable;
+use zerocopy::IntoBytes;
+use zerocopy::KnownLayout;
 use zerocopy::byteorder::little_endian::U16;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// IEEE 802.15.4 Frame Control Field, frame type sub-field (bits 0-2): a Data
 /// frame.

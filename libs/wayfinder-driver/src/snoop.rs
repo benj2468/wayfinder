@@ -10,7 +10,8 @@
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
-use etherparse::{NetSlice, SlicedPacket};
+use etherparse::NetSlice;
+use etherparse::SlicedPacket;
 use wayfinder::interfaces::frame::Mac;
 
 /// IP protocol number for IGMP.

@@ -24,10 +24,12 @@
 //! [`transport`]: crate::transport
 //! [`Link`]: crate::transport::Link
 
-use interfaces::{
-    frame::{LinkFrame, LinkFrameData, MAX_LINK_FRAME_LEN, Mac},
-    link::{LinkError, LinkMetrics},
-};
+use interfaces::frame::LinkFrame;
+use interfaces::frame::LinkFrameData;
+use interfaces::frame::MAX_LINK_FRAME_LEN;
+use interfaces::frame::Mac;
+use interfaces::link::LinkError;
+use interfaces::link::LinkMetrics;
 use zerocopy::FromBytes;
 
 /// Length of the Ethernet header preceding the payload: `[dst: 6][src: 6][ethertype: 2]`.
@@ -101,25 +103,38 @@ fn ipv4_payload_offset(datagram: &[u8]) -> Option<usize> {
 }
 
 #[cfg(feature = "tokio")]
-pub use tokio_impl::{RawL2Link, build_raw_ip_link, build_raw_l2_link};
+pub use tokio_impl::RawL2Link;
+#[cfg(feature = "tokio")]
+pub use tokio_impl::build_raw_ip_link;
+#[cfg(feature = "tokio")]
+pub use tokio_impl::build_raw_l2_link;
 
 #[cfg(feature = "tokio")]
 mod tokio_impl {
     use super::*;
 
     use std::io;
-    use std::mem::{MaybeUninit, size_of};
+    use std::mem::MaybeUninit;
+    use std::mem::size_of;
     use std::net::IpAddr;
     use std::os::fd::AsRawFd;
 
-    use socket2::{Domain, Protocol, SockAddr, SockAddrStorage, Socket, Type, socklen_t};
+    use socket2::Domain;
+    use socket2::Protocol;
+    use socket2::SockAddr;
+    use socket2::SockAddrStorage;
+    use socket2::Socket;
+    use socket2::Type;
+    use socket2::socklen_t;
     use tokio::io::unix::AsyncFd;
     use tokio::net::UnixDatagram;
     use tokio::task::JoinSet;
 
     use crate::transport::Link;
     use wayfinder::DEFAULT_BATMAN_ETHER_TYPE;
-    use wayfinder::link::{DynLinkT, LinkT, Received};
+    use wayfinder::link::DynLinkT;
+    use wayfinder::link::LinkT;
+    use wayfinder::link::Received;
 
     /// `SOL_PACKET` setsockopt level (not exported by `libc` on all targets).
     const SOL_PACKET: libc::c_int = 263;

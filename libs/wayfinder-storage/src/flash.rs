@@ -360,7 +360,10 @@ impl<F: NorFlash> DurableStore for FlashStore<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use embedded_storage::nor_flash::{ErrorType, NorFlashError, NorFlashErrorKind, ReadNorFlash};
+    use embedded_storage::nor_flash::ErrorType;
+    use embedded_storage::nor_flash::NorFlashError;
+    use embedded_storage::nor_flash::NorFlashErrorKind;
+    use embedded_storage::nor_flash::ReadNorFlash;
 
     const TEST_PAGE: usize = 128;
     const TEST_PAGES: usize = 2;

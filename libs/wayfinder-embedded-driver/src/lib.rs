@@ -30,27 +30,41 @@
 
 use core::time::Duration;
 
-use embassy_futures::select::{Either, select, select_array};
+use embassy_futures::select::Either;
+use embassy_futures::select::select;
+use embassy_futures::select::select_array;
 use heapless::Vec as HVec;
-use tracing::{trace, warn};
+use tracing::trace;
+use tracing::warn;
+use wayfinder::CentralRouter;
+use wayfinder::EgressInterface;
+use wayfinder::MAX_INTERFACES;
 use wayfinder::auth::DIRECTED_TRAILER_LEN;
 use wayfinder::features::LinkFeatures;
-use wayfinder::interfaces::frame::{LinkFrameData, MAX_LINK_FRAME_LEN, Mac};
+use wayfinder::interfaces::frame::LinkFrameData;
+use wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN;
+use wayfinder::interfaces::frame::Mac;
 use wayfinder::link::LinkT;
-use wayfinder::{CentralRouter, EgressInterface, MAX_INTERFACES};
-use wayfinder_driver_core::{
-    Egress, MeshSink, OutgoingFrame, handle_mesh_frame, poll_due_keepalives, poll_due_ogms,
-    tag_directed_into,
-};
+use wayfinder_driver_core::Egress;
+use wayfinder_driver_core::MeshSink;
+use wayfinder_driver_core::OutgoingFrame;
+use wayfinder_driver_core::handle_mesh_frame;
+use wayfinder_driver_core::poll_due_keepalives;
+use wayfinder_driver_core::poll_due_ogms;
+use wayfinder_driver_core::tag_directed_into;
 
 pub mod identity;
 
 #[cfg(feature = "mgmt")]
-use embassy_futures::select::{Either3, select3};
+use embassy_futures::select::Either3;
+#[cfg(feature = "mgmt")]
+use embassy_futures::select::select3;
 #[cfg(feature = "mgmt")]
 use wayfinder_protos::service::WayfinderService;
 #[cfg(feature = "mgmt")]
-use wayfinder_server::{EmbeddedQueryRx, RouterAdapter};
+use wayfinder_server::EmbeddedQueryRx;
+#[cfg(feature = "mgmt")]
+use wayfinder_server::RouterAdapter;
 
 /// A monotonic clock plus an async delay — the one piece of platform the driver
 /// can't provide itself.
@@ -490,11 +504,14 @@ mod tests {
     use std::vec::Vec;
 
     use super::*;
-    use interfaces::link::{LinkError, LinkMetrics};
-    use wayfinder::batman::wire::{BATADV_IV_OGM, BatmanOgmPacket};
+    use interfaces::link::LinkError;
+    use interfaces::link::LinkMetrics;
+    use wayfinder::batman::wire::BATADV_IV_OGM;
+    use wayfinder::batman::wire::BatmanOgmPacket;
     use wayfinder::interfaces::frame::LinkFrame;
     use wayfinder::link::Received;
-    use zerocopy::{FromBytes, IntoBytes};
+    use zerocopy::FromBytes;
+    use zerocopy::IntoBytes;
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])
@@ -654,10 +671,10 @@ mod tests {
     #[cfg(feature = "mgmt")]
     #[test]
     fn run_once_with_mgmt_serves_a_node_info_query() {
-        use wayfinder_protos::wayfinder_v1alpha::{
-            GetNodeInfoRequest, WayfinderRequest, wayfinder_request::Request as ReqKind,
-            wayfinder_response::Response as RespKind,
-        };
+        use wayfinder_protos::wayfinder_v1alpha::GetNodeInfoRequest;
+        use wayfinder_protos::wayfinder_v1alpha::WayfinderRequest;
+        use wayfinder_protos::wayfinder_v1alpha::wayfinder_request::Request as ReqKind;
+        use wayfinder_protos::wayfinder_v1alpha::wayfinder_response::Response as RespKind;
         use wayfinder_server::EmbeddedQueryChannel;
 
         let channel = EmbeddedQueryChannel::new();
@@ -710,9 +727,9 @@ mod tests {
     #[test]
     fn run_once_with_mgmt_prefers_ready_link_traffic_over_a_pending_query() {
         use futures::FutureExt;
-        use wayfinder_protos::wayfinder_v1alpha::{
-            GetNodeInfoRequest, WayfinderRequest, wayfinder_request::Request as ReqKind,
-        };
+        use wayfinder_protos::wayfinder_v1alpha::GetNodeInfoRequest;
+        use wayfinder_protos::wayfinder_v1alpha::WayfinderRequest;
+        use wayfinder_protos::wayfinder_v1alpha::wayfinder_request::Request as ReqKind;
         use wayfinder_server::EmbeddedQueryChannel;
 
         let channel = EmbeddedQueryChannel::new();

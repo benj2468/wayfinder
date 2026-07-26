@@ -17,8 +17,14 @@ pub mod test_router;
 
 /// The common entry points for writing a mesh integration test.
 pub mod prelude {
-    pub use super::driver::{TestConfig, TestHarness, TestMachineConfig, TestSwitchConfig, mac};
-    pub use super::test_router::{TestRouter, build_frame, host_frame};
+    pub use super::driver::TestConfig;
+    pub use super::driver::TestHarness;
+    pub use super::driver::TestMachineConfig;
+    pub use super::driver::TestSwitchConfig;
+    pub use super::driver::mac;
+    pub use super::test_router::TestRouter;
+    pub use super::test_router::build_frame;
+    pub use super::test_router::host_frame;
 }
 
 #[cfg(test)]

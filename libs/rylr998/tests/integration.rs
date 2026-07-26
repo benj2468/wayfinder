@@ -6,10 +6,21 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use embedded_io_adapters::tokio_1::FromTokio;
-use rylr998::{Bandwidth, CodingRate, LoraError, RylrClient, SpreadingFactory, WirelessMode};
-use rylr998_sim::{LinkQuality, LoraSwitch, make_error_pair, make_node, make_pair};
+use rylr998::Bandwidth;
+use rylr998::CodingRate;
+use rylr998::LoraError;
+use rylr998::RylrClient;
+use rylr998::SpreadingFactory;
+use rylr998::WirelessMode;
+use rylr998_sim::LinkQuality;
+use rylr998_sim::LoraSwitch;
+use rylr998_sim::make_error_pair;
+use rylr998_sim::make_node;
+use rylr998_sim::make_pair;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::io::BufReader;
 
 /// Wrap a future in a 2-second timeout so tests never hang silently.
 macro_rules! timed {

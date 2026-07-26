@@ -4,8 +4,11 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
-use wayfinderctl::cert::{self, CertCommand};
+use wayfinder_auth::Keypair;
+use wayfinder_auth::MembershipCert;
+use wayfinder_auth::TrustAnchor;
+use wayfinderctl::cert::CertCommand;
+use wayfinderctl::cert::{self};
 
 /// Run the full init-ca → keygen → issue flow into a temp dir and return the
 /// written (anchor, cert) paths' bytes plus the temp dir guard.

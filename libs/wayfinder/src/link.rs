@@ -10,10 +10,11 @@
 //! `std`, `DynLinkT` is gated behind the `std` feature; the bare [`LinkT`] trait
 //! is always available.
 
-use interfaces::{
-    frame::{LinkFrame, LinkFrameData, Mac},
-    link::{LinkError, LinkMetrics},
-};
+use interfaces::frame::LinkFrame;
+use interfaces::frame::LinkFrameData;
+use interfaces::frame::Mac;
+use interfaces::link::LinkError;
+use interfaces::link::LinkMetrics;
 
 /// One frame received off a mesh interface, paired with the physical-layer
 /// measurements the carrier observed for it.

@@ -1,22 +1,33 @@
 use std::sync::Arc;
 use std::sync::Once;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use interfaces::frame::Mac;
 use interfaces::link::LinkMetrics;
 use tracing_subscriber::EnvFilter;
+use wayfinder::DEFAULT_BATMAN_ETHER_TYPE;
+use wayfinder::EgressInterface;
 use wayfinder::batman::MAX_MISSED_OGMS;
-use wayfinder::config::{Config, LinkConfig, LinkFeatures, LinkTransport, TrickleConfig};
-use wayfinder::{
-    DEFAULT_BATMAN_ETHER_TYPE, EgressInterface,
-    batman::wire::{
-        BATADV_CERT_REPLY, BATADV_CERT_REQ, BATADV_IV_OGM, BATADV_KEEPALIVE, BatmanCertReplyPacket,
-        BatmanCertReqPacket, BatmanKeepAlivePacket, BatmanOgmPacket, BatmanTvlvHdr, TvlvType,
-        find_tvlv,
-    },
-};
-use zerocopy::{FromBytes, IntoBytes};
+use wayfinder::batman::wire::BATADV_CERT_REPLY;
+use wayfinder::batman::wire::BATADV_CERT_REQ;
+use wayfinder::batman::wire::BATADV_IV_OGM;
+use wayfinder::batman::wire::BATADV_KEEPALIVE;
+use wayfinder::batman::wire::BatmanCertReplyPacket;
+use wayfinder::batman::wire::BatmanCertReqPacket;
+use wayfinder::batman::wire::BatmanKeepAlivePacket;
+use wayfinder::batman::wire::BatmanOgmPacket;
+use wayfinder::batman::wire::BatmanTvlvHdr;
+use wayfinder::batman::wire::TvlvType;
+use wayfinder::batman::wire::find_tvlv;
+use wayfinder::config::Config;
+use wayfinder::config::LinkConfig;
+use wayfinder::config::LinkFeatures;
+use wayfinder::config::LinkTransport;
+use wayfinder::config::TrickleConfig;
+use zerocopy::FromBytes;
+use zerocopy::IntoBytes;
 
 use crate::Direction;
 use crate::prelude::*;

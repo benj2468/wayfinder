@@ -1,13 +1,17 @@
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
+use std::time::Duration;
 
 use interfaces::frame::Mac;
-use serde::{Deserialize, Serialize};
-use wayfinder::config::{LinkFeatures, TrickleConfig};
+use serde::Deserialize;
+use serde::Serialize;
+use wayfinder::config::LinkFeatures;
+use wayfinder::config::TrickleConfig;
 
-use crate::{
-    switch::{PortComms, PortConfig, PortId, Switch},
-    test_router::TestRouter,
-};
+use crate::switch::PortComms;
+use crate::switch::PortConfig;
+use crate::switch::PortId;
+use crate::switch::Switch;
+use crate::test_router::TestRouter;
 
 /// Declarative description of a whole test topology: the switches to create and
 /// the machines to attach to them.

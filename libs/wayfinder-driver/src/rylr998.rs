@@ -7,15 +7,23 @@
 //! `AT+ADDRESS`/`AT+NETWORKID`/`AT+PARAMETER` setup sequence, so the link
 //! recovers without a `wayfinder-tap` restart.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 use embedded_io_adapters::tokio_1::FromTokio;
-use tokio_serial::{SerialPortBuilderExt, SerialStream};
+use tokio_serial::SerialPortBuilderExt;
+use tokio_serial::SerialStream;
 
-use rylr998::{Bandwidth, CodingRate, RylrClient, SpreadingFactory};
-use wayfinder::interfaces::frame::{LinkFrameData, Mac};
+use rylr998::Bandwidth;
+use rylr998::CodingRate;
+use rylr998::RylrClient;
+use rylr998::SpreadingFactory;
+use wayfinder::interfaces::frame::LinkFrameData;
+use wayfinder::interfaces::frame::Mac;
 use wayfinder::interfaces::link::LinkError;
-use wayfinder::link::{DynLinkT, LinkT, Received};
+use wayfinder::link::DynLinkT;
+use wayfinder::link::LinkT;
+use wayfinder::link::Received;
 
 /// Map a `spreading_factor` config value onto its [`SpreadingFactory`]
 /// variant, rejecting anything outside the module's supported 5..=11 range.
@@ -364,11 +372,17 @@ pub async fn build_rylr998_link(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex, RwLock};
-    use std::time::{Duration, Instant};
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::RwLock;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use std::time::Instant;
 
-    use rylr998_sim::{NodeState, RylrSimulator};
+    use rylr998_sim::NodeState;
+    use rylr998_sim::RylrSimulator;
     use tokio::io::DuplexStream;
     use tokio::task::JoinHandle;
 
@@ -691,7 +705,8 @@ mod tests {
     /// the other reconnect tests only drive `recv`/`ensure_connected`.
     #[tokio::test]
     async fn send_reconnects_after_the_connection_breaks() {
-        use wayfinder::interfaces::frame::{LinkFrameData, Mac};
+        use wayfinder::interfaces::frame::LinkFrameData;
+        use wayfinder::interfaces::frame::Mac;
 
         let connector = SimConnector::default();
         let sessions = connector.sessions.clone();

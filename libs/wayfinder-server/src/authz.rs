@@ -13,7 +13,10 @@
 //! own and shared by every transport.
 
 use wayfinder::interfaces::frame::Mac;
-use wayfinder::wayfinder_auth::{AuthError, MembershipCert, TrustAnchor, VerifiedCert};
+use wayfinder::wayfinder_auth::AuthError;
+use wayfinder::wayfinder_auth::MembershipCert;
+use wayfinder::wayfinder_auth::TrustAnchor;
+use wayfinder::wayfinder_auth::VerifiedCert;
 
 /// The overall management access decision for a client that has completed the
 /// TLS handshake, proving possession of `handshake_key` (its raw Ed25519 public
@@ -130,7 +133,9 @@ pub fn authorize_admin(
 mod tests {
     use super::*;
     use wayfinder::interfaces::frame::Mac;
-    use wayfinder::wayfinder_auth::{Authority, Keypair, VerifiedCert};
+    use wayfinder::wayfinder_auth::Authority;
+    use wayfinder::wayfinder_auth::Keypair;
+    use wayfinder::wayfinder_auth::VerifiedCert;
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])

@@ -2,8 +2,13 @@
 //! complementing the passive purge provided by short-lived cert expiry.
 
 use interfaces::frame::Mac;
-use zerocopy::byteorder::network_endian::{U32, U64};
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
+use zerocopy::FromBytes;
+use zerocopy::Immutable;
+use zerocopy::IntoBytes;
+use zerocopy::KnownLayout;
+use zerocopy::Unaligned;
+use zerocopy::byteorder::network_endian::U32;
+use zerocopy::byteorder::network_endian::U64;
 
 use crate::error::AuthError;
 use crate::key::verify_signature;

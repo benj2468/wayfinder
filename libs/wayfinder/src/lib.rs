@@ -18,28 +18,39 @@ pub use batman;
 pub use interfaces;
 pub use wayfinder_auth;
 
-use batman::{
-    BatmanEngine,
-    wire::{
-        BATADV_BCAST, BATADV_CERT_REPLY, BATADV_CERT_REQ, BATADV_IV_OGM, BATADV_KEEPALIVE,
-        BATADV_MCAST, BATADV_UNICAST, BatmanBroadcastPacket, BatmanCertReplyPacket,
-        BatmanCertReqPacket, BatmanMcastPacket, BatmanUnicastPacket, ETH_P_BATMAN,
-    },
-};
+use batman::BatmanEngine;
+use batman::wire::BATADV_BCAST;
+use batman::wire::BATADV_CERT_REPLY;
+use batman::wire::BATADV_CERT_REQ;
+use batman::wire::BATADV_IV_OGM;
+use batman::wire::BATADV_KEEPALIVE;
+use batman::wire::BATADV_MCAST;
+use batman::wire::BATADV_UNICAST;
+use batman::wire::BatmanBroadcastPacket;
+use batman::wire::BatmanCertReplyPacket;
+use batman::wire::BatmanCertReqPacket;
+use batman::wire::BatmanMcastPacket;
+use batman::wire::BatmanUnicastPacket;
+use batman::wire::ETH_P_BATMAN;
 use core::time::Duration;
-use interfaces::{
-    engine::{MeshRoutingEngine, RoutingAction},
-    frame::{LinkFrame, LinkFrameData, LinkFrameDataMut, Mac},
-    link::LinkMetrics,
-};
-use tracing::{debug, info, trace, warn};
-use zerocopy::{FromBytes, IntoBytes};
+use interfaces::engine::MeshRoutingEngine;
+use interfaces::engine::RoutingAction;
+use interfaces::frame::LinkFrame;
+use interfaces::frame::LinkFrameData;
+use interfaces::frame::LinkFrameDataMut;
+use interfaces::frame::Mac;
+use interfaces::link::LinkMetrics;
+use tracing::debug;
+use tracing::info;
+use tracing::trace;
+use tracing::warn;
+use zerocopy::FromBytes;
+use zerocopy::IntoBytes;
 
-use crate::{
-    auth::OgmAuth,
-    link_quality::{LinkQualityTable, normalize_quality},
-    routing_table::IdentTable,
-};
+use crate::auth::OgmAuth;
+use crate::link_quality::LinkQualityTable;
+use crate::link_quality::normalize_quality;
+use crate::routing_table::IdentTable;
 
 pub use crate::link_quality::LinkQualityRecord;
 
@@ -1750,9 +1761,14 @@ impl CentralRouter {
 #[cfg(test)]
 mod cp2_local_delivery {
     use super::*;
-    use batman::wire::{BATADV_BCAST, BATADV_UNICAST, BatmanBroadcastPacket, BatmanUnicastPacket};
-    use interfaces::frame::{LinkFrame, Mac};
-    use zerocopy::{FromBytes, IntoBytes};
+    use batman::wire::BATADV_BCAST;
+    use batman::wire::BATADV_UNICAST;
+    use batman::wire::BatmanBroadcastPacket;
+    use batman::wire::BatmanUnicastPacket;
+    use interfaces::frame::LinkFrame;
+    use interfaces::frame::Mac;
+    use zerocopy::FromBytes;
+    use zerocopy::IntoBytes;
 
     // Stand-in for an inner host frame (e.g. an IP packet inside an Ethernet
     // frame) that rides across the mesh and must be delivered to the TAP.
@@ -1900,11 +1916,14 @@ mod cert_control_delivery {
     //! non-leak contract in isolation.
 
     use super::*;
-    use batman::wire::{
-        BATADV_CERT_REPLY, BATADV_CERT_REQ, BatmanCertReplyPacket, BatmanCertReqPacket,
-    };
-    use interfaces::frame::{LinkFrame, Mac};
-    use zerocopy::{FromBytes, IntoBytes};
+    use batman::wire::BATADV_CERT_REPLY;
+    use batman::wire::BATADV_CERT_REQ;
+    use batman::wire::BatmanCertReplyPacket;
+    use batman::wire::BatmanCertReqPacket;
+    use interfaces::frame::LinkFrame;
+    use interfaces::frame::Mac;
+    use zerocopy::FromBytes;
+    use zerocopy::IntoBytes;
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])
@@ -2034,12 +2053,15 @@ mod cert_responder {
     //! exists, or parked and flushed opportunistically once one appears.
 
     use super::*;
-    use batman::wire::{
-        BATADV_CERT_REPLY, BATADV_IV_OGM, BatmanCertReplyPacket, BatmanCertReqPacket,
-        BatmanOgmPacket,
-    };
-    use interfaces::frame::{LinkFrame, Mac};
-    use zerocopy::{FromBytes, IntoBytes};
+    use batman::wire::BATADV_CERT_REPLY;
+    use batman::wire::BATADV_IV_OGM;
+    use batman::wire::BatmanCertReplyPacket;
+    use batman::wire::BatmanCertReqPacket;
+    use batman::wire::BatmanOgmPacket;
+    use interfaces::frame::LinkFrame;
+    use interfaces::frame::Mac;
+    use zerocopy::FromBytes;
+    use zerocopy::IntoBytes;
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])
@@ -2378,11 +2400,16 @@ mod mcast_forwarding {
     //! the listener count is within [`MCAST_FANOUT`], else flooded.
 
     use super::*;
-    use batman::wire::{
-        BATADV_IV_OGM, BATADV_MCAST, BatmanMcastPacket, BatmanOgmPacket, BatmanTvlvHdr, TvlvType,
-    };
-    use interfaces::frame::{LinkFrame, Mac};
-    use zerocopy::{FromBytes, IntoBytes};
+    use batman::wire::BATADV_IV_OGM;
+    use batman::wire::BATADV_MCAST;
+    use batman::wire::BatmanMcastPacket;
+    use batman::wire::BatmanOgmPacket;
+    use batman::wire::BatmanTvlvHdr;
+    use batman::wire::TvlvType;
+    use interfaces::frame::LinkFrame;
+    use interfaces::frame::Mac;
+    use zerocopy::FromBytes;
+    use zerocopy::IntoBytes;
 
     const INNER: &[u8] = &[0x45, 0x00, 0x00, 0x10, 0x99];
 
@@ -2544,8 +2571,10 @@ mod mcast_forwarding {
 mod throughput {
     use super::*;
     use core::time::Duration;
-    use interfaces::frame::{LinkFrame, Mac};
-    use zerocopy::{FromBytes, IntoBytes};
+    use interfaces::frame::LinkFrame;
+    use interfaces::frame::Mac;
+    use zerocopy::FromBytes;
+    use zerocopy::IntoBytes;
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])
@@ -2747,10 +2776,13 @@ mod throughput {
 #[cfg(test)]
 mod node_metrics {
     use super::*;
-    use batman::wire::{BATADV_IV_OGM, BatmanOgmPacket};
+    use batman::wire::BATADV_IV_OGM;
+    use batman::wire::BatmanOgmPacket;
     use core::time::Duration;
-    use interfaces::frame::{LinkFrame, Mac};
-    use zerocopy::{FromBytes, IntoBytes};
+    use interfaces::frame::LinkFrame;
+    use interfaces::frame::Mac;
+    use zerocopy::FromBytes;
+    use zerocopy::IntoBytes;
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])
@@ -2819,10 +2851,15 @@ mod node_metrics {
 
 #[cfg(test)]
 mod keepalive_route_selection {
-    use batman::wire::{BATADV_IV_OGM, BATADV_KEEPALIVE, BatmanKeepAlivePacket, BatmanOgmPacket};
+    use batman::wire::BATADV_IV_OGM;
+    use batman::wire::BATADV_KEEPALIVE;
+    use batman::wire::BatmanKeepAlivePacket;
+    use batman::wire::BatmanOgmPacket;
     use core::time::Duration;
-    use interfaces::frame::{LinkFrame, Mac};
-    use zerocopy::{FromBytes, IntoBytes};
+    use interfaces::frame::LinkFrame;
+    use interfaces::frame::Mac;
+    use zerocopy::FromBytes;
+    use zerocopy::IntoBytes;
 
     use super::*;
 
@@ -3002,11 +3039,14 @@ mod tq_clamp_integration {
     //! [`LinkMetrics::default`]) must apply no clamp — otherwise their
     //! normalized quality of 0 would wrongly zero every route.
     use super::*;
-    use batman::wire::{BATADV_IV_OGM, BatmanOgmPacket};
+    use batman::wire::BATADV_IV_OGM;
+    use batman::wire::BatmanOgmPacket;
     use core::time::Duration;
-    use interfaces::frame::{LinkFrame, Mac};
+    use interfaces::frame::LinkFrame;
+    use interfaces::frame::Mac;
     use interfaces::link::LinkMetrics;
-    use zerocopy::{FromBytes, IntoBytes};
+    use zerocopy::FromBytes;
+    use zerocopy::IntoBytes;
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])
@@ -3111,8 +3151,10 @@ mod ogm_auth_integration {
     //! when auth is on, and the unauthenticated mode is unchanged.
     use super::*;
     use core::time::Duration;
-    use interfaces::frame::{LinkFrame, Mac};
-    use wayfinder_auth::{Authority, Keypair};
+    use interfaces::frame::LinkFrame;
+    use interfaces::frame::Mac;
+    use wayfinder_auth::Authority;
+    use wayfinder_auth::Keypair;
     use zerocopy::FromBytes;
 
     fn mac(n: u8) -> Mac {
@@ -3532,9 +3574,11 @@ mod lazy_cert_distribution_switchover {
     //! receiving already tolerates both unconditionally (Phase 3).
 
     use super::*;
-    use batman::wire::{TvlvType, find_tvlv};
+    use batman::wire::TvlvType;
+    use batman::wire::find_tvlv;
     use interfaces::frame::Mac;
-    use wayfinder_auth::{Authority, Keypair};
+    use wayfinder_auth::Authority;
+    use wayfinder_auth::Keypair;
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])
@@ -3628,8 +3672,10 @@ mod link_features_tests {
     use super::*;
     use crate::features::LinkFeatures;
     use core::time::Duration;
-    use interfaces::frame::{LinkFrame, Mac};
-    use zerocopy::{FromBytes, IntoBytes};
+    use interfaces::frame::LinkFrame;
+    use interfaces::frame::Mac;
+    use zerocopy::FromBytes;
+    use zerocopy::IntoBytes;
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])

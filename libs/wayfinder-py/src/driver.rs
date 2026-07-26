@@ -9,7 +9,10 @@ use wayfinder::config::TrickleConfig;
 use wayfinder_tick_driver::Driver;
 
 use crate::errors::MalformedFrameError;
-use crate::types::{PyEgressInterface, PyLinkFeatures, PyLinkMetrics, PyMac};
+use crate::types::PyEgressInterface;
+use crate::types::PyLinkFeatures;
+use crate::types::PyLinkMetrics;
+use crate::types::PyMac;
 
 /// A tick-based, queue-backed wayfinder router. Push received frames onto
 /// whichever interface index carried them

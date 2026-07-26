@@ -31,9 +31,15 @@ pub use driver::Driver;
 #[cfg(feature = "tokio")]
 pub use net::build_udp_link;
 #[cfg(feature = "tokio")]
-pub use raw::{RawL2Link, build_raw_ip_link, build_raw_l2_link};
+pub use raw::RawL2Link;
 #[cfg(feature = "tokio")]
-pub use rylr998::{Rylr998LinkParams, build_rylr998_link};
+pub use raw::build_raw_ip_link;
+#[cfg(feature = "tokio")]
+pub use raw::build_raw_l2_link;
+#[cfg(feature = "tokio")]
+pub use rylr998::Rylr998LinkParams;
+#[cfg(feature = "tokio")]
+pub use rylr998::build_rylr998_link;
 #[cfg(feature = "tokio")]
 pub use transport::Link;
 // The mesh-interface trait now lives in `wayfinder`; re-export it (and the
@@ -41,12 +47,28 @@ pub use transport::Link;
 // importing it from the driver.
 #[cfg(feature = "tokio")]
 pub use wayfinder::link::DynLinkT;
-pub use wayfinder::link::{LinkT, Received};
+pub use wayfinder::link::LinkT;
+pub use wayfinder::link::Received;
 
 // Re-export the management-server wiring so callers configure the driver's
 // query path without depending on `wayfinder-server` directly.
 #[cfg(feature = "tokio")]
-pub use wayfinder_server::{
-    AuthSnapshot, AuthSnapshotRx, AuthSnapshotTx, ChannelServerRx, ChannelServerTx, QueryRx,
-    QueryTx, bind_tcp_server, run_channel_server, serve_tls_server,
-};
+pub use wayfinder_server::AuthSnapshot;
+#[cfg(feature = "tokio")]
+pub use wayfinder_server::AuthSnapshotRx;
+#[cfg(feature = "tokio")]
+pub use wayfinder_server::AuthSnapshotTx;
+#[cfg(feature = "tokio")]
+pub use wayfinder_server::ChannelServerRx;
+#[cfg(feature = "tokio")]
+pub use wayfinder_server::ChannelServerTx;
+#[cfg(feature = "tokio")]
+pub use wayfinder_server::QueryRx;
+#[cfg(feature = "tokio")]
+pub use wayfinder_server::QueryTx;
+#[cfg(feature = "tokio")]
+pub use wayfinder_server::bind_tcp_server;
+#[cfg(feature = "tokio")]
+pub use wayfinder_server::run_channel_server;
+#[cfg(feature = "tokio")]
+pub use wayfinder_server::serve_tls_server;
