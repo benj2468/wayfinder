@@ -105,6 +105,30 @@ pub enum Command {
     Links,
     /// The per-neighbor keep-alive heartbeat liveness table.
     Keepalive,
+    /// The current per-interface participation-feature state (the tx/rx
+    /// OGM/data gates and keep-alive cadence), with a derived on/off/mixed
+    /// status per interface.
+    LinkFeatures,
+    /// Turn a link fully on: set all four participation gates (tx_ogm,
+    /// rx_ogm, tx_data, rx_data) to true. Does not re-arm keep-alive — there
+    /// is no prior cadence to restore, so a link disabled with an armed
+    /// keep-alive stays keep-alive-silent after enabling; arm it explicitly
+    /// with `set-link-features --tx-keepalive-interval-ms` if wanted.
+    LinkEnable {
+        /// Index of the interface to enable, in registration order.
+        #[arg(long)]
+        iface: u32,
+    },
+    /// Turn a link fully off: set all four participation gates to false and
+    /// disarm keep-alive transmission, so a disabled link goes fully silent
+    /// rather than continuing to send heartbeats. This is a routing-layer
+    /// silence, not a transport shutdown — the underlying socket/serial/radio
+    /// stays open and polled.
+    LinkDisable {
+        /// Index of the interface to disable, in registration order.
+        #[arg(long)]
+        iface: u32,
+    },
     /// The per-interface adaptive OGM emission schedule.
     OgmSchedule,
     /// Per-interface and node-wide throughput estimates.
@@ -316,6 +340,37 @@ async fn dispatch_query(
         Command::Routes => output::routing_table(&client.routing_table().await?, output)?,
         Command::Links => output::link_quality_table(&client.link_quality_table().await?, output)?,
         Command::Keepalive => output::keepalive_table(&client.keepalive_table().await?, output)?,
+        Command::LinkFeatures => {
+            output::link_features_table(&client.link_features_table().await?, output)?
+        }
+        Command::LinkEnable { iface } => {
+            client
+                .set_link_features(LinkFeatures {
+                    iface_idx: iface,
+                    tx_ogm: Some(true),
+                    rx_ogm: Some(true),
+                    tx_data: Some(true),
+                    rx_data: Some(true),
+                    tx_keepalive_update: None,
+                })
+                .await
+                .context("failed to enable link")?;
+            format!("link {iface} enabled")
+        }
+        Command::LinkDisable { iface } => {
+            client
+                .set_link_features(LinkFeatures {
+                    iface_idx: iface,
+                    tx_ogm: Some(false),
+                    rx_ogm: Some(false),
+                    tx_data: Some(false),
+                    rx_data: Some(false),
+                    tx_keepalive_update: Some(TxKeepaliveUpdate::TxKeepaliveDisabled(true)),
+                })
+                .await
+                .context("failed to disable link")?;
+            format!("link {iface} disabled")
+        }
         Command::OgmSchedule => output::ogm_schedule(&client.ogm_schedule().await?, output)?,
         Command::Throughput => output::throughput(&client.throughput().await?, output)?,
         Command::Metrics => output::node_metrics(&client.node_metrics().await?, output)?,

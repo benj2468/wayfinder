@@ -14,9 +14,10 @@ use std::net::SocketAddr;
 use tokio::sync::{mpsc, oneshot};
 use wayfinder_client::Client;
 use wayfinder_protos::service::{
-    EgressDecisionData, InterfaceThroughputData, KeepAliveEntryData, LinkQualityEntryData,
-    NeighborPathData, NodeMetricsData, OgmScheduleEntryData, RouteResolutionData, RoutingEntryData,
-    RuntimeConfigData, TableOccupancyData, WayfinderDataProvider, WayfinderService,
+    EgressDecisionData, InterfaceThroughputData, KeepAliveEntryData, LinkFeaturesEntryData,
+    LinkQualityEntryData, NeighborPathData, NodeMetricsData, OgmScheduleEntryData,
+    RouteResolutionData, RoutingEntryData, RuntimeConfigData, TableOccupancyData,
+    WayfinderDataProvider, WayfinderService,
 };
 use wayfinder_protos::wayfinder_v1alpha::{
     WayfinderRequest, WayfinderResponse, resolve_route_response::Egress,
@@ -69,6 +70,9 @@ impl WayfinderDataProvider for Mock {
             ewma_quality: 200,
             sample_count: 9,
         }]
+    }
+    fn link_features_table(&self) -> Vec<LinkFeaturesEntryData> {
+        vec![]
     }
     fn keepalive_table(&self) -> Vec<KeepAliveEntryData> {
         vec![KeepAliveEntryData {

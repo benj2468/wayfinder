@@ -8,6 +8,10 @@ workspace = true
 
 [dependencies]
 prost = { version = "0.13" , default-features = false, features = ["derive"] }
+# Pinned directly (not workspace inheritance, which can't override
+# default-features) so `default-features = false` keeps std off — tracing's
+# `std` feature pulls in `once_cell/std`, breaking this crate's no_std build.
+tracing = { version = "0.1.44", default-features = false }
 # Optional: derive `serde::Serialize` on the generated message types so hosts
 # (e.g. `wayfinderctl --output json`) can emit them directly.  Off by default so
 # the no_std/embedded build pulls in no extra surface.

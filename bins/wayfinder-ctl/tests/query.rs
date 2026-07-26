@@ -8,8 +8,8 @@ use tokio::sync::{mpsc, oneshot};
 use wayfinder_auth::Keypair;
 use wayfinder_client::Identity;
 use wayfinder_protos::service::{
-    InterfaceThroughputData, KeepAliveEntryData, LinkQualityEntryData, NodeMetricsData,
-    NodeSecurityData, OgmScheduleEntryData, RouteResolutionData, RoutingEntryData,
+    InterfaceThroughputData, KeepAliveEntryData, LinkFeaturesEntryData, LinkQualityEntryData,
+    NodeMetricsData, NodeSecurityData, OgmScheduleEntryData, RouteResolutionData, RoutingEntryData,
     RuntimeConfigData, SecurityStatusData, TableOccupancyData, WayfinderDataProvider,
     WayfinderService,
 };
@@ -44,6 +44,16 @@ impl WayfinderDataProvider for Mock {
     }
     fn link_quality_table(&self) -> Vec<LinkQualityEntryData> {
         vec![]
+    }
+    fn link_features_table(&self) -> Vec<LinkFeaturesEntryData> {
+        vec![LinkFeaturesEntryData {
+            iface_idx: 0,
+            tx_ogm: false,
+            rx_ogm: true,
+            tx_data: true,
+            rx_data: true,
+            tx_keepalive_interval_ms: Some(3000),
+        }]
     }
     fn keepalive_table(&self) -> Vec<KeepAliveEntryData> {
         vec![KeepAliveEntryData {
@@ -220,6 +230,55 @@ async fn keepalive_query_renders_human_from_server() {
     assert!(out.contains("4200"), "got: {out}");
     assert!(out.contains("1000"), "got: {out}");
     assert!(out.contains("yes"), "got: {out}");
+}
+
+#[tokio::test]
+async fn link_features_query_renders_json_from_server() {
+    let endpoint = spawn_server().await;
+    let out = run_query(Command::LinkFeatures, &endpoint, OutputFormat::Json)
+        .await
+        .expect("query succeeds");
+    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(parsed["entries"][0]["iface_idx"], 0);
+    assert_eq!(parsed["entries"][0]["tx_ogm"], false);
+    assert_eq!(parsed["entries"][0]["rx_ogm"], true);
+    assert_eq!(parsed["entries"][0]["tx_keepalive_interval_ms"], 3000);
+}
+
+#[tokio::test]
+async fn link_features_query_renders_human_from_server() {
+    let endpoint = spawn_server().await;
+    let out = run_query(Command::LinkFeatures, &endpoint, OutputFormat::Human)
+        .await
+        .unwrap();
+    assert!(out.contains("3000"), "got: {out}");
+    assert!(out.contains("mixed"), "got: {out}");
+}
+
+#[tokio::test]
+async fn link_enable_query_succeeds_against_server() {
+    let endpoint = spawn_server().await;
+    let out = run_query(
+        Command::LinkEnable { iface: 0 },
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .expect("query succeeds");
+    assert!(out.contains("enabled"), "got: {out}");
+}
+
+#[tokio::test]
+async fn link_disable_query_succeeds_against_server() {
+    let endpoint = spawn_server().await;
+    let out = run_query(
+        Command::LinkDisable { iface: 0 },
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .expect("query succeeds");
+    assert!(out.contains("disabled"), "got: {out}");
 }
 
 #[tokio::test]

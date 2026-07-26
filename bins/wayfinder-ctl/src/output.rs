@@ -7,9 +7,9 @@
 use clap::ValueEnum;
 use serde::Serialize;
 use wayfinder_protos::wayfinder_v1alpha::{
-    GetSecurityStatusResponse, KeepAliveTable, LinkQualityTable, ListCertsResponse,
-    ListPendingCsrsResponse, NodeInfo, NodeMetrics, OgmSchedule, ResolveRouteResponse,
-    RoutingTable, Throughput, resolve_route_response::Egress,
+    GetSecurityStatusResponse, KeepAliveTable, LinkFeaturesTable, LinkQualityTable,
+    ListCertsResponse, ListPendingCsrsResponse, NodeInfo, NodeMetrics, OgmSchedule,
+    ResolveRouteResponse, RoutingTable, Throughput, resolve_route_response::Egress,
 };
 
 /// How a command renders its result.
@@ -94,6 +94,42 @@ pub fn link_quality_table(v: &LinkQualityTable, fmt: OutputFormat) -> anyhow::Re
                 e.iface_idx,
                 e.ewma_quality,
                 e.sample_count,
+            ));
+        }
+        out
+    })
+}
+
+/// Render the [`LinkFeaturesTable`], with a derived STATUS column (on/off/
+/// mixed) so an operator can confirm a `link-enable`/`link-disable` took
+/// effect at a glance.
+pub fn link_features_table(v: &LinkFeaturesTable, fmt: OutputFormat) -> anyhow::Result<String> {
+    render(v, fmt, |v| {
+        if v.entries.is_empty() {
+            return "no interfaces configured".to_string();
+        }
+        let mut out = String::from("IFACE  TX_OGM  RX_OGM  TX_DATA  RX_DATA  KEEPALIVE_MS  STATUS");
+        for e in &v.entries {
+            let all_on = e.tx_ogm && e.rx_ogm && e.tx_data && e.rx_data;
+            let all_off = !e.tx_ogm && !e.rx_ogm && !e.tx_data && !e.rx_data;
+            let status = if all_on {
+                "on"
+            } else if all_off {
+                "off"
+            } else {
+                "mixed"
+            };
+            out.push_str(&format!(
+                "\n{:>5}  {:>6}  {:>6}  {:>7}  {:>7}  {:>12}  {:>6}",
+                e.iface_idx,
+                e.tx_ogm,
+                e.rx_ogm,
+                e.tx_data,
+                e.rx_data,
+                e.tx_keepalive_interval_ms
+                    .map(|ms| ms.to_string())
+                    .unwrap_or_else(|| "off".to_string()),
+                status,
             ));
         }
         out

@@ -28,15 +28,15 @@ use tokio_serial::SerialStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use wayfinder_protos::wayfinder_v1alpha::{
     ApproveCsrRequest, AuthenticateRequest, DenyCsrRequest, GetKeepAliveTableRequest,
-    GetLinkQualityTableRequest, GetMetricsRequest, GetNodeInfoRequest, GetOgmScheduleRequest,
-    GetRoutingTableRequest, GetSecurityStatusRequest, GetSecurityStatusResponse,
-    GetThroughputRequest, GetTrustAnchorRequest, GetTrustAnchorResponse, KeepAliveTable,
-    LinkFeatures, LinkQualityTable, ListCertsRequest, ListCertsResponse, ListPendingCsrsRequest,
-    ListPendingCsrsResponse, NodeInfo, NodeMetrics, OgmSchedule, ResolveRouteRequest,
-    ResolveRouteResponse, RevokeNodeRequest, RoutingTable, RuntimeConfig, SetAuthRequest,
-    SetConfigRequest, SubmitCsrRequest, SubmitCsrResponse, Throughput, TrickleConfig,
-    WayfinderRequest, WayfinderResponse, wayfinder_request::Request as RequestKind,
-    wayfinder_response::Response as ResponseKind,
+    GetLinkFeaturesTableRequest, GetLinkQualityTableRequest, GetMetricsRequest, GetNodeInfoRequest,
+    GetOgmScheduleRequest, GetRoutingTableRequest, GetSecurityStatusRequest,
+    GetSecurityStatusResponse, GetThroughputRequest, GetTrustAnchorRequest, GetTrustAnchorResponse,
+    KeepAliveTable, LinkFeatures, LinkFeaturesTable, LinkQualityTable, ListCertsRequest,
+    ListCertsResponse, ListPendingCsrsRequest, ListPendingCsrsResponse, NodeInfo, NodeMetrics,
+    OgmSchedule, ResolveRouteRequest, ResolveRouteResponse, RevokeNodeRequest, RoutingTable,
+    RuntimeConfig, SetAuthRequest, SetConfigRequest, SubmitCsrRequest, SubmitCsrResponse,
+    Throughput, TrickleConfig, WayfinderRequest, WayfinderResponse,
+    wayfinder_request::Request as RequestKind, wayfinder_response::Response as ResponseKind,
 };
 
 /// The underlying transport a [`Client`] is connected over, carrying the same
@@ -318,6 +318,22 @@ impl Client {
         }
     }
 
+    /// Query the current per-interface participation-feature state (the
+    /// tx/rx OGM/data gates and keep-alive cadence set via
+    /// [`set_link_features`](Client::set_link_features), or the interface's
+    /// startup default).
+    pub async fn link_features_table(&mut self) -> anyhow::Result<LinkFeaturesTable> {
+        match self
+            .request(RequestKind::GetLinkFeaturesTable(
+                GetLinkFeaturesTableRequest {},
+            ))
+            .await?
+        {
+            ResponseKind::LinkFeaturesTable(table) => Ok(table),
+            other => Err(unexpected("LinkFeaturesTable", &other)),
+        }
+    }
+
     /// Query the per-neighbor keep-alive heartbeat liveness table.
     pub async fn keepalive_table(&mut self) -> anyhow::Result<KeepAliveTable> {
         match self
@@ -592,6 +608,7 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
         ResponseKind::NodeInfo(_) => "NodeInfo",
         ResponseKind::RoutingTable(_) => "RoutingTable",
         ResponseKind::LinkQualityTable(_) => "LinkQualityTable",
+        ResponseKind::LinkFeaturesTable(_) => "LinkFeaturesTable",
         ResponseKind::KeepaliveTable(_) => "KeepaliveTable",
         ResponseKind::ResolveRoute(_) => "ResolveRoute",
         ResponseKind::OgmSchedule(_) => "OgmSchedule",

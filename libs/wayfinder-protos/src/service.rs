@@ -2,15 +2,17 @@ use crate::wayfinder_v1alpha::Empty;
 use crate::wayfinder_v1alpha::{
     AllInterfacesEgress, CsrIssued, CsrPending, CsrRejected, ErrorResponse,
     GetSecurityStatusResponse, GetTrustAnchorResponse, InterfaceThroughput, IssuedCert,
-    KeepAliveEntry, KeepAliveTable, LinkQualityEntry, LinkQualityTable, ListCertsResponse,
-    ListPendingCsrsResponse, NeighborPath, NodeInfo, NodeMetrics, NodeSecurity, OgmSchedule,
-    OgmScheduleEntry, PendingCsr, ResolveRouteResponse, RoutingEntry, RoutingTable,
-    SubmitCsrResponse, TableOccupancy, Throughput, WayfinderRequest, WayfinderResponse,
-    resolve_route_response::Egress as EgressKind, submit_csr_response::Outcome as CsrOutcomeKind,
-    wayfinder_request::Request as RequestKind, wayfinder_response::Response as ResponseKind,
+    KeepAliveEntry, KeepAliveTable, LinkFeaturesEntry, LinkFeaturesTable, LinkQualityEntry,
+    LinkQualityTable, ListCertsResponse, ListPendingCsrsResponse, NeighborPath, NodeInfo,
+    NodeMetrics, NodeSecurity, OgmSchedule, OgmScheduleEntry, PendingCsr, ResolveRouteResponse,
+    RoutingEntry, RoutingTable, SubmitCsrResponse, TableOccupancy, Throughput, WayfinderRequest,
+    WayfinderResponse, resolve_route_response::Egress as EgressKind,
+    submit_csr_response::Outcome as CsrOutcomeKind, wayfinder_request::Request as RequestKind,
+    wayfinder_response::Response as ResponseKind,
 };
 use alloc::string::String;
 use alloc::vec::Vec;
+use tracing::info;
 
 /// Intermediate representation of a single per-hop path, returned by
 /// [`WayfinderDataProvider::routing_table`].  Decoupled from both the
@@ -51,6 +53,26 @@ pub struct LinkQualityEntryData {
     pub ewma_quality: u32,
     /// Number of samples folded into the EWMA.
     pub sample_count: u32,
+}
+
+/// Intermediate representation of one interface's live participation-feature
+/// state, returned by [`WayfinderDataProvider::link_features_table`] — the
+/// read counterpart to [`LinkFeaturesData`].
+#[derive(Clone)]
+pub struct LinkFeaturesEntryData {
+    /// Physical-interface index this row describes, in registration order.
+    pub iface_idx: u32,
+    /// Whether this link currently sends OGMs (own + re-flooded).
+    pub tx_ogm: bool,
+    /// Whether this link currently accepts and learns from inbound OGMs.
+    pub rx_ogm: bool,
+    /// Whether this link currently sends data-plane traffic.
+    pub tx_data: bool,
+    /// Whether this link currently accepts inbound data-plane traffic.
+    pub rx_data: bool,
+    /// The armed keep-alive cadence in milliseconds, or `None` if keep-alive
+    /// transmission is disabled on this link.
+    pub tx_keepalive_interval_ms: Option<u64>,
 }
 
 /// Intermediate representation of one row in the keep-alive liveness table,
@@ -292,6 +314,11 @@ pub trait WayfinderDataProvider {
     fn routing_table(&self) -> Vec<RoutingEntryData>;
     /// Snapshot of the per-(neighbor, interface) link-quality table.
     fn link_quality_table(&self) -> Vec<LinkQualityEntryData>;
+    /// Snapshot of the per-interface participation-feature state (the tx/rx
+    /// OGM/data gates and keep-alive cadence set via
+    /// [`set_config`](WayfinderDataProvider::set_config), or the interface's
+    /// startup default).
+    fn link_features_table(&self) -> Vec<LinkFeaturesEntryData>;
     /// Snapshot of the per-neighbor keep-alive heartbeat liveness table,
     /// evaluated as of the moment of the call.
     fn keepalive_table(&self) -> Vec<KeepAliveEntryData>;
@@ -443,6 +470,69 @@ pub struct EnrollData {
     pub trust_anchor: Vec<u8>,
 }
 
+/// A short, stable, non-secret name for a request variant, for logging.
+/// Never derived from `Debug` on the whole variant: some request payloads
+/// (`SetAuthRequest`'s identity seed, CSR key material) are secret, so only
+/// the kind — never the fields — may be logged.
+fn request_kind_name(k: &RequestKind) -> &'static str {
+    match k {
+        RequestKind::GetNodeInfo(_) => "GetNodeInfo",
+        RequestKind::GetRoutingTable(_) => "GetRoutingTable",
+        RequestKind::GetLinkQualityTable(_) => "GetLinkQualityTable",
+        RequestKind::ResolveRoute(_) => "ResolveRoute",
+        RequestKind::GetOgmSchedule(_) => "GetOgmSchedule",
+        RequestKind::GetThroughput(_) => "GetThroughput",
+        RequestKind::GetMetrics(_) => "GetMetrics",
+        RequestKind::SetAuth(_) => "SetAuth",
+        RequestKind::GetTrustAnchor(_) => "GetTrustAnchor",
+        RequestKind::SubmitCsr(_) => "SubmitCsr",
+        RequestKind::RevokeNode(_) => "RevokeNode",
+        RequestKind::GetSecurityStatus(_) => "GetSecurityStatus",
+        RequestKind::ListCerts(_) => "ListCerts",
+        RequestKind::ListPendingCsrs(_) => "ListPendingCsrs",
+        RequestKind::ApproveCsr(_) => "ApproveCsr",
+        RequestKind::DenyCsr(_) => "DenyCsr",
+        RequestKind::SetConfig(_) => "SetConfig",
+        RequestKind::GetKeepaliveTable(_) => "GetKeepaliveTable",
+        RequestKind::Authenticate(_) => "Authenticate",
+        RequestKind::GetLinkFeaturesTable(_) => "GetLinkFeaturesTable",
+    }
+}
+
+/// Whether `k` mutates node/provider state, as opposed to a read-only query.
+/// Drives the log level in [`WayfinderService::handle`]: mutations are
+/// `info!` (infrequent, operator-relevant audit trail — new auth material,
+/// a config change, a CSR issued/approved/denied, a node revoked); queries
+/// are `debug!` (frequent — e.g. every TUI refresh tick — and off by
+/// default). Deliberately exhaustive (no wildcard arm) so a newly added
+/// `RequestKind` variant forces an explicit classification here rather than
+/// silently defaulting to one side.
+fn request_is_mutation(k: &RequestKind) -> bool {
+    match k {
+        RequestKind::SetAuth(_)
+        | RequestKind::SetConfig(_)
+        | RequestKind::SubmitCsr(_)
+        | RequestKind::RevokeNode(_)
+        | RequestKind::ApproveCsr(_)
+        | RequestKind::DenyCsr(_) => true,
+
+        RequestKind::GetNodeInfo(_)
+        | RequestKind::GetRoutingTable(_)
+        | RequestKind::GetLinkQualityTable(_)
+        | RequestKind::ResolveRoute(_)
+        | RequestKind::GetOgmSchedule(_)
+        | RequestKind::GetThroughput(_)
+        | RequestKind::GetMetrics(_)
+        | RequestKind::GetTrustAnchor(_)
+        | RequestKind::GetSecurityStatus(_)
+        | RequestKind::ListCerts(_)
+        | RequestKind::ListPendingCsrs(_)
+        | RequestKind::GetKeepaliveTable(_)
+        | RequestKind::Authenticate(_)
+        | RequestKind::GetLinkFeaturesTable(_) => false,
+    }
+}
+
 /// Stateful handler that maps [`WayfinderRequest`] → [`WayfinderResponse`].
 ///
 /// `P` is any type implementing [`WayfinderDataProvider`]; pass a reference
@@ -460,6 +550,13 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
     /// Dispatch one request to the provider and build the matching response,
     /// mapping any provider error into an [`ErrorResponse`].
     pub fn handle(&mut self, request: WayfinderRequest) -> WayfinderResponse {
+        if let Some(kind) = &request.request {
+            let name = request_kind_name(kind);
+            if request_is_mutation(kind) {
+                info!(kind = name, "management API mutation");
+            }
+        }
+
         let response = match request.request {
             Some(RequestKind::GetNodeInfo(_)) => ResponseKind::NodeInfo(NodeInfo {
                 node_id: self.provider.node_id(),
@@ -505,6 +602,23 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                     })
                     .collect();
                 ResponseKind::LinkQualityTable(LinkQualityTable { entries })
+            }
+
+            Some(RequestKind::GetLinkFeaturesTable(_)) => {
+                let entries = self
+                    .provider
+                    .link_features_table()
+                    .into_iter()
+                    .map(|e| LinkFeaturesEntry {
+                        iface_idx: e.iface_idx,
+                        tx_ogm: e.tx_ogm,
+                        rx_ogm: e.rx_ogm,
+                        tx_data: e.tx_data,
+                        rx_data: e.rx_data,
+                        tx_keepalive_interval_ms: e.tx_keepalive_interval_ms,
+                    })
+                    .collect();
+                ResponseKind::LinkFeaturesTable(LinkFeaturesTable { entries })
             }
 
             Some(RequestKind::GetOgmSchedule(_)) => {
@@ -781,8 +895,9 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
 mod tests {
     use super::*;
     use crate::wayfinder_v1alpha::{
-        GetLinkQualityTableRequest, GetMetricsRequest, GetNodeInfoRequest, GetOgmScheduleRequest,
-        GetThroughputRequest, ResolveRouteRequest, RuntimeConfig, SetConfigRequest, TrickleConfig,
+        GetLinkFeaturesTableRequest, GetLinkQualityTableRequest, GetMetricsRequest,
+        GetNodeInfoRequest, GetOgmScheduleRequest, GetThroughputRequest, ResolveRouteRequest,
+        RuntimeConfig, SetConfigRequest, TrickleConfig,
     };
     use alloc::vec;
 
@@ -791,6 +906,7 @@ mod tests {
     #[derive(Default)]
     struct MockProvider {
         link_quality: Vec<LinkQualityEntryData>,
+        link_features: Vec<LinkFeaturesEntryData>,
         keepalive: Vec<KeepAliveEntryData>,
         ogm_schedule: Vec<OgmScheduleEntryData>,
         throughput: Vec<InterfaceThroughputData>,
@@ -818,6 +934,9 @@ mod tests {
         }
         fn link_quality_table(&self) -> Vec<LinkQualityEntryData> {
             self.link_quality.clone()
+        }
+        fn link_features_table(&self) -> Vec<LinkFeaturesEntryData> {
+            self.link_features.clone()
         }
         fn keepalive_table(&self) -> Vec<KeepAliveEntryData> {
             self.keepalive.clone()
@@ -905,6 +1024,66 @@ mod tests {
             ResponseKind::LinkQualityTable(table) => assert!(table.entries.is_empty()),
             other => panic!(
                 "expected LinkQualityTable, got {:?}",
+                proto_kind_name(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn link_features_request_returns_entries() {
+        let provider = MockProvider {
+            link_features: vec![
+                LinkFeaturesEntryData {
+                    iface_idx: 0,
+                    tx_ogm: false,
+                    rx_ogm: true,
+                    tx_data: true,
+                    rx_data: true,
+                    tx_keepalive_interval_ms: Some(3000),
+                },
+                LinkFeaturesEntryData {
+                    iface_idx: 1,
+                    tx_ogm: true,
+                    rx_ogm: true,
+                    tx_data: true,
+                    rx_data: true,
+                    tx_keepalive_interval_ms: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        match handle(
+            provider,
+            RequestKind::GetLinkFeaturesTable(GetLinkFeaturesTableRequest {}),
+        ) {
+            ResponseKind::LinkFeaturesTable(table) => {
+                assert_eq!(table.entries.len(), 2);
+                let e0 = &table.entries[0];
+                assert_eq!(e0.iface_idx, 0);
+                assert!(!e0.tx_ogm);
+                assert!(e0.rx_ogm);
+                assert!(e0.tx_data);
+                assert!(e0.rx_data);
+                assert_eq!(e0.tx_keepalive_interval_ms, Some(3000));
+                assert_eq!(table.entries[1].tx_keepalive_interval_ms, None);
+            }
+            other => panic!(
+                "expected LinkFeaturesTable, got {:?}",
+                proto_kind_name(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn link_features_request_with_no_interfaces_returns_empty_entries() {
+        match handle(
+            MockProvider::default(),
+            RequestKind::GetLinkFeaturesTable(GetLinkFeaturesTableRequest {}),
+        ) {
+            ResponseKind::LinkFeaturesTable(table) => assert!(table.entries.is_empty()),
+            other => panic!(
+                "expected LinkFeaturesTable, got {:?}",
                 proto_kind_name(&other)
             ),
         }
@@ -1276,11 +1455,121 @@ mod tests {
         }
     }
 
+    #[test]
+    fn request_kind_name_covers_representative_variants() {
+        assert_eq!(
+            request_kind_name(&RequestKind::GetNodeInfo(GetNodeInfoRequest {})),
+            "GetNodeInfo"
+        );
+        assert_eq!(
+            request_kind_name(&RequestKind::SetConfig(SetConfigRequest { config: None })),
+            "SetConfig"
+        );
+        assert_eq!(
+            request_kind_name(&RequestKind::GetLinkFeaturesTable(
+                GetLinkFeaturesTableRequest {}
+            )),
+            "GetLinkFeaturesTable"
+        );
+    }
+
+    /// Mutations (writes to node/provider state) log at `info!`; queries
+    /// (reads) log at `debug!` in [`WayfinderService::handle`] — this is the
+    /// classification that decision rests on, so every variant is exercised
+    /// rather than a representative sample.
+    #[test]
+    fn request_is_mutation_classifies_writes_vs_reads() {
+        use crate::wayfinder_v1alpha::{
+            ApproveCsrRequest, AuthenticateRequest, DenyCsrRequest, GetKeepAliveTableRequest,
+            GetRoutingTableRequest, GetSecurityStatusRequest, GetTrustAnchorRequest,
+            ListCertsRequest, ListPendingCsrsRequest, ResolveRouteRequest, RevokeNodeRequest,
+            SetAuthRequest, SubmitCsrRequest,
+        };
+
+        // Mutations: change node/provider state.
+        assert!(request_is_mutation(&RequestKind::SetAuth(SetAuthRequest {
+            seed: Vec::new(),
+            cert: Vec::new(),
+            trust_anchor: Vec::new(),
+        })));
+        assert!(request_is_mutation(&RequestKind::SetConfig(
+            SetConfigRequest { config: None }
+        )));
+        assert!(request_is_mutation(&RequestKind::SubmitCsr(
+            SubmitCsrRequest {
+                node_mac: Vec::new(),
+                ed_pubkey: Vec::new(),
+                x_pubkey: Vec::new(),
+                enrollment_token: String::new(),
+            }
+        )));
+        assert!(request_is_mutation(&RequestKind::RevokeNode(
+            RevokeNodeRequest {
+                node_mac: Vec::new(),
+            }
+        )));
+        assert!(request_is_mutation(&RequestKind::ApproveCsr(
+            ApproveCsrRequest {
+                node_mac: Vec::new(),
+            }
+        )));
+        assert!(request_is_mutation(&RequestKind::DenyCsr(DenyCsrRequest {
+            node_mac: Vec::new(),
+        })));
+
+        // Queries: read-only.
+        assert!(!request_is_mutation(&RequestKind::GetNodeInfo(
+            GetNodeInfoRequest {}
+        )));
+        assert!(!request_is_mutation(&RequestKind::GetRoutingTable(
+            GetRoutingTableRequest {}
+        )));
+        assert!(!request_is_mutation(&RequestKind::GetLinkQualityTable(
+            GetLinkQualityTableRequest {}
+        )));
+        assert!(!request_is_mutation(&RequestKind::ResolveRoute(
+            ResolveRouteRequest {
+                destination: Vec::new(),
+            }
+        )));
+        assert!(!request_is_mutation(&RequestKind::GetOgmSchedule(
+            GetOgmScheduleRequest {}
+        )));
+        assert!(!request_is_mutation(&RequestKind::GetThroughput(
+            GetThroughputRequest {}
+        )));
+        assert!(!request_is_mutation(&RequestKind::GetMetrics(
+            GetMetricsRequest {}
+        )));
+        assert!(!request_is_mutation(&RequestKind::GetTrustAnchor(
+            GetTrustAnchorRequest {}
+        )));
+        assert!(!request_is_mutation(&RequestKind::GetSecurityStatus(
+            GetSecurityStatusRequest {}
+        )));
+        assert!(!request_is_mutation(&RequestKind::ListCerts(
+            ListCertsRequest {}
+        )));
+        assert!(!request_is_mutation(&RequestKind::ListPendingCsrs(
+            ListPendingCsrsRequest {}
+        )));
+        assert!(!request_is_mutation(&RequestKind::GetKeepaliveTable(
+            GetKeepAliveTableRequest {}
+        )));
+        assert!(!request_is_mutation(&RequestKind::Authenticate(
+            AuthenticateRequest { cert: Vec::new() }
+        )));
+        assert!(!request_is_mutation(&RequestKind::GetLinkFeaturesTable(
+            GetLinkFeaturesTableRequest {}
+        )));
+    }
+
     fn proto_kind_name(k: &ResponseKind) -> &'static str {
         match k {
             ResponseKind::NodeInfo(_) => "NodeInfo",
             ResponseKind::RoutingTable(_) => "RoutingTable",
             ResponseKind::LinkQualityTable(_) => "LinkQualityTable",
+            ResponseKind::LinkFeaturesTable(_) => "LinkFeaturesTable",
             ResponseKind::KeepaliveTable(_) => "KeepaliveTable",
             ResponseKind::ResolveRoute(_) => "ResolveRoute",
             ResponseKind::OgmSchedule(_) => "OgmSchedule",

@@ -37,6 +37,12 @@ message GetRoutingTableRequest {}
 // physical interface.
 message GetLinkQualityTableRequest {}
 
+// Request the current per-interface participation-feature state: the tx/rx
+// OGM and data gates and keep-alive cadence set via SetConfig's
+// LinkFeatures (or left at the interface's startup default).  Returns a
+// LinkFeaturesTable response — the read counterpart to that mutation.
+message GetLinkFeaturesTableRequest {}
+
 // Request the current per-interface OGM emission schedule.  Returns an
 // OgmSchedule response describing, for each mesh interface, the live OGM
 // publish interval and the adaptive backoff bounds it moves between.
@@ -397,6 +403,9 @@ message WayfinderRequest {
     // key and admits the connection only if it verifies as a non-revoked admin
     // (or, on an un-enrolled node, matches the node's own bootstrap key).
     AuthenticateRequest authenticate = 19;
+
+    // Query the per-interface participation-feature state.
+    GetLinkFeaturesTableRequest get_link_features_table = 20;
   }
 }
 
@@ -504,6 +513,41 @@ message LinkQualityTable {
   // All known (neighbor, interface) pairs.  Empty if the router has not
   // yet received any frames with measurable metrics.
   repeated LinkQualityEntry entries = 1;
+}
+
+// A single mesh interface's live participation-feature state — the read
+// counterpart to the LinkFeatures SetConfig message.  All four gates default
+// to true (full participation) for an interface that has never had features
+// overridden.
+message LinkFeaturesEntry {
+  // Index of the interface this row describes, in registration order (same
+  // indexing as LinkQualityEntry.iface_idx).
+  uint32 iface_idx = 1;
+
+  // Whether this link currently sends OGMs (its own, and re-flooded ones).
+  bool tx_ogm = 2;
+
+  // Whether this link currently accepts and learns from inbound OGMs.
+  bool rx_ogm = 3;
+
+  // Whether this link currently sends data-plane traffic (unicast,
+  // multicast, and broadcast).
+  bool tx_data = 4;
+
+  // Whether this link currently accepts inbound data-plane traffic.
+  bool rx_data = 5;
+
+  // The armed keep-alive cadence in milliseconds, if this link is currently
+  // sending heartbeats.  Absent when keep-alive transmission is disabled.
+  optional uint64 tx_keepalive_interval_ms = 6;
+}
+
+// Snapshot of the per-interface participation-feature state at the time of
+// the request.
+message LinkFeaturesTable {
+  // One entry per configured mesh interface, in registration order.  Empty
+  // if no interface has been configured yet.
+  repeated LinkFeaturesEntry entries = 1;
 }
 
 // A single row in the per-neighbor keep-alive heartbeat liveness table,
@@ -904,5 +948,8 @@ message WayfinderResponse {
 
     // Response to GetKeepAliveTableRequest.
     KeepAliveTable keepalive_table = 15;
+
+    // Response to GetLinkFeaturesTableRequest.
+    LinkFeaturesTable link_features_table = 16;
   }
 }
