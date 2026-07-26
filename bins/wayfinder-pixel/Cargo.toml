@@ -18,15 +18,47 @@ members = ["."]
 name = "wayfinder-pixel"
 path = "src/main.rs"
 
+# The actual artifact the Android app loads: a `cdylib` exposing `src/lib.rs`'s
+# UniFFI interface (`MeshNode`/`PixelBleAdvertiser`). `lib` is also kept so
+# the plain `[[bin]]` above and `cargo test` can link against it directly on
+# host, without going through the FFI boundary.
+[lib]
+crate-type = ["cdylib", "lib"]
+
+# Only built/run on demand (`cargo run --bin uniffi-bindgen --features
+# uniffi-bindgen -- generate ...`), never as part of a normal `cargo build`/
+# `cargo ndk build` — `uniffi/cli` pulls in `clap` and friends, which have no
+# reason to ship in the Android `.so`.
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["uniffi-bindgen"]
+
+[features]
+uniffi-bindgen = ["uniffi/cli"]
+
 [dependencies]
 # The seam this binary exists to eventually host for real — `BleLink`/
 # `BleAdvertiser`, see `libs/blue/CLAUDE.md` — imported here so this crate
 # actually proves the `android` feature links against the NDK's libc before
 # any JNI glue exists. `android` needs only `tokio`, no Android/JNI
 # dependency yet.
-blue = { path = "../../libs/blue", features = ["std"] }
+blue = { path = "../../libs/blue", default-features = false, features = ["android"] }
 # The bare `LinkT`/`interfaces` surface `blue` itself builds on;
 # `default-features = false` keeps std/alloc off, matching how `blue`
 # depends on it.
 wayfinder = { path = "../../libs/wayfinder", default-features = false }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+# UniFFI proc-macro export surface for `src/lib.rs` — no UDL file, no
+# `build.rs` scaffolding step; `#[uniffi::export]`/`uniffi::setup_scaffolding!`
+# generate the FFI glue directly. Kotlin bindings are produced separately by
+# the `uniffi-bindgen` bin above, against the built `.so`.
+uniffi = "0.28"
+# `#[uniffi::export(with_foreign)]`'s expansion for async trait methods needs
+# this in scope by name (its generated foreign-callback proxy type
+# implements the trait via `async_trait`'s boxed-future desugaring, for the
+# same dyn-compatibility reason `ForeignAdvertiser`'s own `Arc<dyn
+# PixelBleAdvertiser>` needs it below).
+async-trait = "0.1"
+thiserror = "2.0.18"
+tracing = { version = "0.1.44", default-features = false }

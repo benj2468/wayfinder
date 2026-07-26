@@ -3,9 +3,14 @@
 //! Cross-compiled for `aarch64-linux-android` via `cargo-ndk`, this exists
 //! today only to prove that the crates `blue`'s shared `BleLink` core
 //! depends on (`blue` itself with the `android` feature, and `wayfinder`)
-//! actually link against the NDK's toolchain, before any JNI glue exists —
-//! see `libs/blue/CLAUDE.md`. `NoopAdvertiser` stands in for the real
-//! Android `BluetoothLeAdvertiser` binding, which is a later phase.
+//! actually link against the NDK's toolchain — see `libs/blue/CLAUDE.md`.
+//! `NoopAdvertiser` stands in for the real Android `BluetoothLeAdvertiser`
+//! binding.
+//!
+//! This binary is *not* what the Android app will load: that's `lib.rs`,
+//! this crate's other target, a `cdylib` exposing a UniFFI interface Kotlin
+//! calls into directly. Kept alongside it as a lighter-weight NDK-linking
+//! smoke test with no UniFFI proc-macro expansion in the loop.
 
 use blue::BleAdvertiser;
 use blue::BleLink;
