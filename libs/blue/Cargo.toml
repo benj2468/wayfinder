@@ -7,15 +7,26 @@ edition = "2024"
 workspace = true
 
 [features]
-default = ["std"]
+default = ["std", "android"]
 # The host-side (Linux/BlueZ) `LinkT`. Off by default so the crate stays
-# `no_std` for the firmware build.
+# `no_std` for the firmware build. Also enables `generic_link` (`android`
+# does that on its own, more cheaply, when `bluer`/D-Bus aren't wanted).
 std = [
+    "android",
     "dep:bluer",
-    "dep:tokio",
     "dep:futures",
     "dep:anyhow",
 ]
+# Enables the shared `BleLink`/`BleAdvertiser` core (`generic_link.rs`) for a
+# future JNI/UniFFI-hosted Android node, without any of `std`'s BlueZ-only
+# weight. `generic_link.rs` itself only needs `tokio::sync::mpsc` for the
+# queue between the platform's scan callback and `recv` — it has no `bluer`/
+# `anyhow`/`futures` dependency, so `wayfinder-pixel` (cross-compiled via
+# `cargo-ndk`, where D-Bus/`bluetoothd` don't exist) enables this feature
+# alone rather than `std`. `std` enables this too (`StdBleLink` builds on the
+# same `BleLink` core for its BlueZ backend) but additionally pulls in the
+# heavier deps this feature deliberately doesn't.
+android = ["dep:tokio"]
 # Bridges this crate onto the real nRF52840 BLE radio via `nrf-softdevice`.
 # Off by default: `nrf-softdevice`'s build script links a precompiled
 # Nordic SoftDevice binary and needs a real embedded target (there is no

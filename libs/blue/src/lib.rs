@@ -11,14 +11,15 @@
 //!   radio via `nrf-softdevice`, `no_std`, for `bins/wayfinder-nrf52840`.
 //! - [`StdBleLink`] (`std` feature) — a Linux host's controller via BlueZ's
 //!   D-Bus API, for `bins/wayfinder-tap`.
-//! - a future JNI-hosted Android node (`android` feature).
+//! - a future JNI/UniFFI-hosted Android node (`android` feature), for
+//!   `bins/wayfinder-pixel`.
 //!
 //! The latter two both build on [`BleLink`], generic over a
 //! platform-supplied [`BleAdvertiser`]; see `generic_link.rs`.
 //!
 //! None is on by default: the crate's own default build is the
 //! host-testable framing logic alone.
-#![cfg_attr(all(not(test), not(feature = "std")), no_std)]
+#![cfg_attr(all(not(test), not(any(feature = "std", feature = "android"))), no_std)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod ad;
@@ -32,14 +33,14 @@ mod nrf_link;
 #[cfg(feature = "hardware")]
 pub use nrf_link::NrfBleLink;
 
-#[cfg(feature = "std")]
+#[cfg(any(feature = "std", feature = "android"))]
 mod generic_link;
 
-#[cfg(feature = "std")]
+#[cfg(any(feature = "std", feature = "android"))]
 pub use generic_link::BleAdvertiser;
-#[cfg(feature = "std")]
+#[cfg(any(feature = "std", feature = "android"))]
 pub use generic_link::BleLink;
-#[cfg(feature = "std")]
+#[cfg(any(feature = "std", feature = "android"))]
 pub use generic_link::BleReportSink;
 
 #[cfg(feature = "std")]
