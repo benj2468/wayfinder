@@ -11,6 +11,8 @@ use ratatui::{
     },
 };
 
+use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesEntry;
+
 use crate::app::{App, Tab, format_id};
 
 /// Accent colour used for headings and the active tab.
@@ -32,7 +34,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Tab::Overview => render_overview(frame, app, chunks[1]),
         Tab::Routing => render_routing(frame, app, chunks[1]),
         Tab::LinkQuality => render_link_quality(frame, app, chunks[1]),
-        Tab::OgmSchedule => render_ogm_schedule(frame, app, chunks[1]),
+        Tab::Links => render_links(frame, app, chunks[1]),
         Tab::Metrics => render_metrics(frame, app, chunks[1]),
         Tab::Security => render_security(frame, app, chunks[1]),
     }
@@ -359,49 +361,45 @@ fn render_link_quality(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(table, area, &mut app.link_state);
 }
 
-/// Draw the per-interface adaptive OGM emission schedule.  Each row shows an
-/// interface's current publish interval (the live OGM rate) alongside the
-/// `i_min`/`i_max` backoff bounds, plus a bar placing the current interval on
-/// the min→max scale so the Trickle backoff is visible at a glance.
-fn render_ogm_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
-    let header = Row::new(["Iface", "Current", "Min", "Max", "Backoff (min→max)"])
+/// Draw the Links tab: a compact per-interface table (live OGM interval plus
+/// a derived on/off/mixed gate status) on the left, and the selected
+/// interface's full OGM schedule and participation-feature breakdown on the
+/// right. The four gates are editable in place — the `o`/`p`/`t`/`u` keys
+/// shown inline queue a toggle via [`App::toggle_link_feature`].
+fn render_links(frame: &mut Frame, app: &mut App, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(area);
+
+    let header = Row::new(["Iface", "Current", "Status"])
         .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = app
         .snapshot
-        .ogm_schedule
+        .link_features
         .entries
         .iter()
         .map(|e| {
+            let current = ogm_schedule_for(app, e.iface_idx)
+                .map(|s| fmt_interval(s.current_interval_ms))
+                .unwrap_or_else(|| "-".to_string());
+            let (status, status_style) = link_feature_status(e);
             Row::new(vec![
                 Cell::from(e.iface_idx.to_string()),
-                Cell::from(Span::styled(
-                    fmt_interval(e.current_interval_ms),
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                )),
-                Cell::from(fmt_interval(e.min_interval_ms)),
-                Cell::from(fmt_interval(e.max_interval_ms)),
-                Cell::from(backoff_bar(
-                    e.current_interval_ms,
-                    e.min_interval_ms,
-                    e.max_interval_ms,
-                )),
+                Cell::from(current),
+                Cell::from(Span::styled(status, status_style)),
             ])
         })
         .collect();
 
-    let title = format!(
-        " OGM Schedule ({}) ",
-        app.snapshot.ogm_schedule.entries.len()
-    );
+    let title = format!(" Links ({}) ", app.snapshot.link_features.entries.len());
     let table = Table::new(
         rows,
         [
             Constraint::Length(6),
             Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Min(14),
+            Constraint::Min(7),
         ],
     )
     .header(header)
@@ -413,7 +411,116 @@ fn render_ogm_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
     )
     .highlight_symbol("▶ ");
 
-    frame.render_stateful_widget(table, area, &mut app.ogm_state);
+    frame.render_stateful_widget(table, cols[0], &mut app.links_state);
+    render_link_detail(frame, app, cols[1]);
+}
+
+/// The OGM schedule entry for `iface_idx`, if the snapshot has one. Zipped by
+/// index rather than assumed positional, since the two tables come from
+/// separate RPCs.
+fn ogm_schedule_for(
+    app: &App,
+    iface_idx: u32,
+) -> Option<&wayfinder_protos::wayfinder_v1alpha::OgmScheduleEntry> {
+    app.snapshot
+        .ogm_schedule
+        .entries
+        .iter()
+        .find(|s| s.iface_idx == iface_idx)
+}
+
+/// Derive the on/off/mixed status label and colour for one interface's four
+/// participation gates.
+fn link_feature_status(e: &LinkFeaturesEntry) -> (&'static str, Style) {
+    let all_on = e.tx_ogm && e.rx_ogm && e.tx_data && e.rx_data;
+    let all_off = !e.tx_ogm && !e.rx_ogm && !e.tx_data && !e.rx_data;
+    if all_on {
+        ("on", Style::default().fg(Color::Green))
+    } else if all_off {
+        ("off", Style::default().fg(Color::Red))
+    } else {
+        ("mixed", Style::default().fg(Color::Yellow))
+    }
+}
+
+/// Draw the selected interface's OGM schedule and participation-feature
+/// breakdown, with inline `[key]` hints for the gate toggles `handle_key`
+/// wires to `o`/`p`/`t`/`u`.
+fn render_link_detail(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(" Detail ");
+
+    let selected = app
+        .links_state
+        .selected()
+        .and_then(|i| app.snapshot.link_features.entries.get(i));
+
+    let lines: Vec<Line> = match selected {
+        None => vec![Line::from(Span::styled(
+            "Select an interface to inspect and edit its features.",
+            Style::default().fg(Color::DarkGray),
+        ))],
+        Some(entry) => {
+            let mut out = vec![field("Interface", &entry.iface_idx.to_string())];
+            if let Some(s) = ogm_schedule_for(app, entry.iface_idx) {
+                out.push(field(
+                    "Current interval",
+                    &fmt_interval(s.current_interval_ms),
+                ));
+                out.push(field("Min interval", &fmt_interval(s.min_interval_ms)));
+                out.push(field("Max interval", &fmt_interval(s.max_interval_ms)));
+                out.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:>18}: ", "Backoff"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::raw(backoff_bar(
+                        s.current_interval_ms,
+                        s.min_interval_ms,
+                        s.max_interval_ms,
+                    )),
+                ]));
+            }
+            out.push(Line::from(""));
+            out.push(Line::from(Span::styled(
+                "Participation features (keys toggle):",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )));
+            out.push(gate_line("o", "TX OGM", entry.tx_ogm));
+            out.push(gate_line("p", "RX OGM", entry.rx_ogm));
+            out.push(gate_line("t", "TX Data", entry.tx_data));
+            out.push(gate_line("u", "RX Data", entry.rx_data));
+            out.push(Line::from(""));
+            out.push(field(
+                "Keep-alive",
+                &entry
+                    .tx_keepalive_interval_ms
+                    .map(|ms| format!("{ms} ms (edit via wayfinderctl)"))
+                    .unwrap_or_else(|| "off".to_string()),
+            ));
+            out
+        }
+    };
+
+    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    frame.render_widget(para, area);
+}
+
+/// One `  [key] LABEL: yes/no` detail line for a participation gate,
+/// colour-coded green/red.
+fn gate_line(key: &str, label: &str, on: bool) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  [{key}] "), Style::default().fg(ACCENT)),
+        Span::styled(
+            format!("{label:<8}: "),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            if on { "yes" } else { "no" },
+            Style::default()
+                .fg(if on { Color::Green } else { Color::Red })
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
 }
 
 /// Draw the Metrics view: a node-level summary panel (uptime, neighbours,
@@ -1063,6 +1170,15 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(" refresh  "),
     ];
 
+    // Links-tab gate toggles: applied immediately on keypress, no confirm step.
+    if app.tab == Tab::Links {
+        spans.push(Span::styled(
+            " o/p/t/u ",
+            Style::default().fg(Color::Black).bg(Color::Green),
+        ));
+        spans.push(Span::raw(" toggle gate  "));
+    }
+
     // Security-tab operator actions (provider node only): approve/deny CSRs,
     // revoke originators, and Tab to switch which panel has focus.
     if app.tab == Tab::Security && app.snapshot.pending_csrs.is_some() {
@@ -1306,6 +1422,66 @@ mod tests {
         assert!(
             text.contains("02:00:00:00:00:07"),
             "revoke target MAC missing"
+        );
+    }
+
+    /// The Links tab renders the merged OGM-schedule + participation-feature
+    /// view: the list shows the derived on/off/mixed status, and the detail
+    /// panel for the selected interface shows the OGM interval, each gate's
+    /// yes/no state with its toggle-key hint, and the keep-alive cadence.
+    #[test]
+    fn links_tab_shows_schedule_and_feature_detail_for_selected_interface() {
+        use wayfinder_protos::wayfinder_v1alpha::{
+            LinkFeaturesEntry, LinkFeaturesTable, OgmSchedule, OgmScheduleEntry,
+        };
+
+        let mut app = App::new("test".to_string(), 1000);
+        app.tab = Tab::Links;
+        app.snapshot.link_features = LinkFeaturesTable {
+            entries: vec![LinkFeaturesEntry {
+                iface_idx: 3,
+                tx_ogm: true,
+                rx_ogm: false,
+                tx_data: true,
+                rx_data: true,
+                tx_keepalive_interval_ms: Some(2000),
+            }],
+        };
+        app.snapshot.ogm_schedule = OgmSchedule {
+            entries: vec![OgmScheduleEntry {
+                iface_idx: 3,
+                current_interval_ms: 4000,
+                min_interval_ms: 1000,
+                max_interval_ms: 64000,
+            }],
+        };
+        app.links_state.select(Some(0));
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(text.contains("mixed"), "derived status missing: {text}");
+        assert!(
+            text.contains("4.0 s"),
+            "current OGM interval missing: {text}"
+        );
+        assert!(text.contains("[o]"), "tx_ogm key hint missing: {text}");
+        assert!(text.contains("[p]"), "rx_ogm key hint missing: {text}");
+        assert!(text.contains("[t]"), "tx_data key hint missing: {text}");
+        assert!(text.contains("[u]"), "rx_data key hint missing: {text}");
+        assert!(
+            text.contains("2000 ms"),
+            "keep-alive cadence missing: {text}"
         );
     }
 }

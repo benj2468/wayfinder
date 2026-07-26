@@ -3,7 +3,8 @@
 //! Connects to a node's management API — over its authenticated TLS transport,
 //! or an embedded node's unauthenticated serial link (`--serial`) — and polls
 //! it on a fixed interval, presenting node info, the BATMAN routing table, and
-//! the link-quality table across three tabs.
+//! per-link state across several tabs. The Links tab additionally lets an
+//! operator toggle a selected interface's participation gates in place.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -34,7 +35,7 @@ struct Args {
     #[arg(
         long,
         env = "WAYFINDER_TUI_IDENTITY",
-        required_unless_present = "serial"
+        default_value = "/var/lib/wayfinder/identity.seed"
     )]
     identity: Option<PathBuf>,
 
@@ -178,6 +179,10 @@ async fn run(
                         if app.pending_action.is_some() {
                             act(&mut client, &target, &mut app).await;
                         }
+                        // Likewise a Links-tab gate toggle, applied immediately.
+                        if app.pending_link_feature_toggle.is_some() {
+                            act_link_feature(&mut client, &target, &mut app).await;
+                        }
                     }
                     Some(_) => {}
                     None => app.running = false, // input thread died
@@ -218,7 +223,7 @@ fn handle_key(app: &mut App, code: KeyCode) {
         KeyCode::Char('1') => app.tab = app::Tab::Overview,
         KeyCode::Char('2') => app.tab = app::Tab::Routing,
         KeyCode::Char('3') => app.tab = app::Tab::LinkQuality,
-        KeyCode::Char('4') => app.tab = app::Tab::OgmSchedule,
+        KeyCode::Char('4') => app.tab = app::Tab::Links,
         KeyCode::Char('5') => app.tab = app::Tab::Metrics,
         KeyCode::Char('6') => app.tab = app::Tab::Security,
         KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
@@ -229,6 +234,14 @@ fn handle_key(app: &mut App, code: KeyCode) {
         KeyCode::Char('a') => app.request_csr_action(true),
         KeyCode::Char('d') => app.request_csr_action(false),
         KeyCode::Char('x') => app.request_revoke(),
+        // Links tab: toggle one of the selected interface's four participation
+        // gates, applied immediately (no confirmation) — o/p pair the OGM
+        // tx/rx gates, t/u pair the data tx/rx gates. Inert off the Links tab
+        // or without a selection (checked inside `toggle_link_feature`).
+        KeyCode::Char('o') => app.toggle_link_feature(app::LinkFeatureGate::TxOgm),
+        KeyCode::Char('p') => app.toggle_link_feature(app::LinkFeatureGate::RxOgm),
+        KeyCode::Char('t') => app.toggle_link_feature(app::LinkFeatureGate::TxData),
+        KeyCode::Char('u') => app.toggle_link_feature(app::LinkFeatureGate::RxData),
         // 'r' just forces the next loop iteration; the timer drives refreshes,
         // but pressing it makes the intent explicit and wakes the select.
         KeyCode::Char('r') => {}
@@ -317,11 +330,62 @@ async fn act(client: &mut Option<Client>, target: &ConnectTarget, app: &mut App)
     }
 }
 
+/// Execute a queued Links-tab gate toggle against the connected node, then
+/// refresh so the new state shows immediately rather than waiting for the
+/// next tick.  Records any failure in `app.last_error`.
+async fn act_link_feature(client: &mut Option<Client>, target: &ConnectTarget, app: &mut App) {
+    let Some(toggle) = app.pending_link_feature_toggle.take() else {
+        return;
+    };
+    if client.is_none() {
+        match target.connect().await {
+            Ok(c) => *client = Some(c),
+            Err(e) => {
+                app.connected = false;
+                app.last_error = Some(format!("connect: {e}"));
+                return;
+            }
+        }
+    }
+
+    let mut features = wayfinder_protos::wayfinder_v1alpha::LinkFeatures {
+        iface_idx: toggle.iface_idx,
+        ..Default::default()
+    };
+    match toggle.gate {
+        app::LinkFeatureGate::TxOgm => features.tx_ogm = Some(toggle.new_value),
+        app::LinkFeatureGate::RxOgm => features.rx_ogm = Some(toggle.new_value),
+        app::LinkFeatureGate::TxData => features.tx_data = Some(toggle.new_value),
+        app::LinkFeatureGate::RxData => features.rx_data = Some(toggle.new_value),
+    }
+
+    let result = {
+        #[expect(
+            clippy::expect_used,
+            reason = "the branch above just set client to Some(_) whenever it was None"
+        )]
+        let conn = client.as_mut().expect("client connected above");
+        conn.set_link_features(features).await
+    };
+
+    match result {
+        Ok(()) => {
+            app.last_error = None;
+            refresh(client, target, app).await;
+        }
+        Err(e) => {
+            app.last_error = Some(format!("link feature toggle failed: {e}"));
+            *client = None; // force reconnect next tick
+        }
+    }
+}
+
 /// Issue all three queries and fold the results into the snapshot.
 async fn fetch(conn: &mut Client, app: &mut App) -> anyhow::Result<()> {
     app.snapshot.node_info = Some(conn.node_info().await?);
     app.snapshot.routing = conn.routing_table().await?;
     app.snapshot.link_quality = conn.link_quality_table().await?;
+    app.snapshot.link_features = conn.link_features_table().await?;
     app.snapshot.keepalive = conn.keepalive_table().await?;
     app.snapshot.ogm_schedule = conn.ogm_schedule().await?;
     app.snapshot.throughput = conn.throughput().await?;
@@ -350,10 +414,12 @@ fn ensure_selection(app: &mut App) {
         _ => {}
     }
 
-    let scheds = app.snapshot.ogm_schedule.entries.len();
-    match app.ogm_state.selected() {
-        Some(i) if i >= scheds => app.ogm_state.select(scheds.checked_sub(1)),
-        None if scheds > 0 => app.ogm_state.select(Some(0)),
+    // Bounds are driven by `link_features` (one row per registered
+    // interface); `ogm_schedule` is zipped in by iface_idx for display only.
+    let links_len = app.snapshot.link_features.entries.len();
+    match app.links_state.selected() {
+        Some(i) if i >= links_len => app.links_state.select(links_len.checked_sub(1)),
+        None if links_len > 0 => app.links_state.select(Some(0)),
         _ => {}
     }
 

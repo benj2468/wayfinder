@@ -21,9 +21,9 @@ use wayfinder::wayfinder_auth::RevocationRecord;
 use wayfinder::wayfinder_auth::TrustAnchor;
 use wayfinder_protos::service::{
     CsrOutcome, EgressDecisionData, InterfaceThroughputData, IssuedCertData, KeepAliveEntryData,
-    LinkQualityEntryData, NeighborPathData, NodeMetricsData, NodeSecurityData,
-    OgmScheduleEntryData, PendingCsrData, RouteResolutionData, RoutingEntryData, RuntimeConfigData,
-    SecurityStatusData, TableOccupancyData, WayfinderDataProvider,
+    LinkFeaturesEntryData, LinkQualityEntryData, NeighborPathData, NodeMetricsData,
+    NodeSecurityData, OgmScheduleEntryData, PendingCsrData, RouteResolutionData, RoutingEntryData,
+    RuntimeConfigData, SecurityStatusData, TableOccupancyData, WayfinderDataProvider,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -106,6 +106,22 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
                 iface_idx: r.iface_idx as u32,
                 ewma_quality: r.ewma_quality as u32,
                 sample_count: r.sample_count,
+            })
+            .collect()
+    }
+
+    fn link_features_table(&self) -> Vec<LinkFeaturesEntryData> {
+        (0..self.router.num_interfaces())
+            .map(|idx| {
+                let f = self.router.link_features(idx);
+                LinkFeaturesEntryData {
+                    iface_idx: idx as u32,
+                    tx_ogm: f.tx_ogm,
+                    rx_ogm: f.rx_ogm,
+                    tx_data: f.tx_data,
+                    rx_data: f.rx_data,
+                    tx_keepalive_interval_ms: f.tx_keepalive.map(|k| k.interval_ms),
+                }
             })
             .collect()
     }
@@ -693,6 +709,65 @@ mod tests {
             router.link_features(0).tx_keepalive.is_none(),
             "the disabled update must clear a previously armed schedule"
         );
+    }
+
+    /// `link_features_table` reflects a live `set_config` update: after
+    /// flipping `tx_ogm` off on interface 0 via `set_config`, the query
+    /// projection reports it off while the other gates stay true — proving
+    /// the read path actually consults live router state, not a static
+    /// default.
+    #[test]
+    fn link_features_table_reflects_set_config_update() {
+        let mut router = CentralRouter::new(mac(1));
+        router.configure_interface_ogm(
+            0,
+            Duration::from_secs(1),
+            Duration::from_secs(8),
+            Duration::ZERO,
+        );
+        RouterAdapter::new(&mut router, None, Duration::ZERO)
+            .set_config(RuntimeConfigData {
+                link_features: Some(LinkFeaturesData {
+                    iface_idx: 0,
+                    tx_ogm: Some(false),
+                    tx_keepalive: Some(Some(2_000)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let table = RouterAdapter::new(&mut router, None, Duration::ZERO).link_features_table();
+        assert_eq!(table.len(), 1);
+        let e = &table[0];
+        assert_eq!(e.iface_idx, 0);
+        assert!(!e.tx_ogm, "flipped flag reflected");
+        assert!(
+            e.rx_ogm && e.tx_data && e.rx_data,
+            "untouched flags stay true"
+        );
+        assert_eq!(e.tx_keepalive_interval_ms, Some(2_000));
+    }
+
+    /// An interface registered at startup but never touched by `set_config`
+    /// reports full participation (the `LinkFeatures` default) rather than
+    /// being absent from the table.
+    #[test]
+    fn link_features_table_defaults_to_full_participation() {
+        let mut router = CentralRouter::new(mac(1));
+        router.configure_interface_ogm(
+            0,
+            Duration::from_secs(1),
+            Duration::from_secs(8),
+            Duration::ZERO,
+        );
+
+        let table = RouterAdapter::new(&mut router, None, Duration::ZERO).link_features_table();
+        assert_eq!(table.len(), 1);
+        let e = &table[0];
+        assert_eq!(e.iface_idx, 0);
+        assert!(e.tx_ogm && e.rx_ogm && e.tx_data && e.rx_data);
+        assert_eq!(e.tx_keepalive_interval_ms, None);
     }
 
     /// A `link_features` update targeting an unregistered interface index is

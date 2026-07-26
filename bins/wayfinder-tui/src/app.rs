@@ -7,8 +7,9 @@ use std::time::Instant;
 use ratatui::widgets::TableState;
 use serde::{Deserialize, Serialize};
 use wayfinder_protos::wayfinder_v1alpha::{
-    GetSecurityStatusResponse, KeepAliveTable, LinkQualityTable, ListPendingCsrsResponse, NodeInfo,
-    NodeMetrics, NodeSecurity, OgmSchedule, RoutingTable, Throughput,
+    GetSecurityStatusResponse, KeepAliveTable, LinkFeaturesTable, LinkQualityTable,
+    ListPendingCsrsResponse, NodeInfo, NodeMetrics, NodeSecurity, OgmSchedule, RoutingTable,
+    Throughput,
 };
 
 /// The top-level views the TUI cycles between.
@@ -20,8 +21,10 @@ pub enum Tab {
     Routing,
     /// The per-(neighbor, interface) link-quality table.
     LinkQuality,
-    /// The per-interface adaptive OGM emission schedule (current publish rate).
-    OgmSchedule,
+    /// Per-interface OGM emission schedule and participation-feature state
+    /// (tx/rx OGM/data gates, keep-alive cadence), editable: the selected
+    /// interface's gates can be toggled directly from this tab.
+    Links,
     /// Aggregate node metrics: uptime, neighbour count, table occupancy, TQ /
     /// path-diversity distribution, and per-interface throughput.
     Metrics,
@@ -36,7 +39,7 @@ impl Tab {
         Tab::Overview,
         Tab::Routing,
         Tab::LinkQuality,
-        Tab::OgmSchedule,
+        Tab::Links,
         Tab::Metrics,
         Tab::Security,
     ];
@@ -47,7 +50,7 @@ impl Tab {
             Tab::Overview => "Overview",
             Tab::Routing => "Routing Table",
             Tab::LinkQuality => "Link Quality",
-            Tab::OgmSchedule => "OGM Schedule",
+            Tab::Links => "Links",
             Tab::Metrics => "Metrics",
             Tab::Security => "Security",
         }
@@ -86,6 +89,35 @@ pub enum OperatorAction {
     RevokeNode(Vec<u8>),
 }
 
+/// Which participation gate a keypress on the Links tab toggles.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LinkFeatureGate {
+    /// Send OGMs (own + re-flooded) onto the link.
+    TxOgm,
+    /// Accept inbound OGMs on the link and learn routes from them.
+    RxOgm,
+    /// Send data-plane traffic (unicast/multicast/broadcast) onto the link.
+    TxData,
+    /// Accept inbound data-plane traffic on the link.
+    RxData,
+}
+
+/// A single participation-gate flip queued by a keypress on the Links tab,
+/// to be executed against the connected node by the async event loop (which
+/// owns the client). Applied immediately once queued (no confirmation step)
+/// since flipping one gate is low-stakes and trivially reversible — unlike
+/// the Security tab's approve/deny/revoke actions, which stay behind
+/// [`OperatorAction`]'s confirm popup.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LinkFeatureToggle {
+    /// Interface to reconfigure, in registration order.
+    pub iface_idx: u32,
+    /// Which gate to set.
+    pub gate: LinkFeatureGate,
+    /// The value to set it to (the flip of its current displayed state).
+    pub new_value: bool,
+}
+
 /// Which panel on the Security tab has navigation focus.  Only meaningful on a
 /// certificate-authority provider, where the tab shows two actionable tables;
 /// a non-provider node shows only the originator table.
@@ -106,6 +138,8 @@ pub struct Snapshot {
     pub routing: RoutingTable,
     /// Link-quality table; empty until first fetch.
     pub link_quality: LinkQualityTable,
+    /// Per-interface participation-feature state; empty until first fetch.
+    pub link_features: LinkFeaturesTable,
     /// Per-neighbor keep-alive heartbeat liveness table; empty until first
     /// fetch.
     pub keepalive: KeepAliveTable,
@@ -165,8 +199,9 @@ pub struct App {
     pub routing_state: TableState,
     /// Selection state for the link-quality table.
     pub link_state: TableState,
-    /// Selection state for the OGM schedule table.
-    pub ogm_state: TableState,
+    /// Selection state for the Links tab's interface table (OGM schedule +
+    /// participation features, merged).
+    pub links_state: TableState,
     /// Selection state for the per-interface throughput table on the Metrics tab.
     pub metrics_state: TableState,
     /// Selection state for the per-originator table on the Security tab.
@@ -187,6 +222,11 @@ pub struct App {
     /// against the connected node (only this loop owns the client).  Set by
     /// [`App::confirm_action`] and taken by the loop.
     pub pending_action: Option<OperatorAction>,
+    /// A link-feature gate flip awaiting execution by the event loop, queued
+    /// by [`App::toggle_link_feature`] and taken by the loop. Unlike
+    /// `pending_action` this is set (and executed) directly on keypress, with
+    /// no confirmation step.
+    pub pending_link_feature_toggle: Option<LinkFeatureToggle>,
     /// Rolling history of node-wide throughput totals, oldest first, capped at
     /// [`THROUGHPUT_HISTORY`] samples. Drives the Metrics tab RX/TX line chart.
     pub throughput_history: VecDeque<ThroughputSample>,
@@ -211,13 +251,14 @@ impl App {
             snapshot: Snapshot::default(),
             routing_state: TableState::default(),
             link_state: TableState::default(),
-            ogm_state: TableState::default(),
+            links_state: TableState::default(),
             metrics_state: TableState::default(),
             security_state: TableState::default(),
             csr_state: TableState::default(),
             security_focus: SecurityFocus::PendingCsrs,
             confirm: None,
             pending_action: None,
+            pending_link_feature_toggle: None,
             throughput_history: VecDeque::with_capacity(THROUGHPUT_HISTORY),
             last_error: None,
             last_update: None,
@@ -235,9 +276,12 @@ impl App {
                 &mut self.link_state,
                 self.snapshot.link_quality.entries.len(),
             ),
-            Tab::OgmSchedule => (
-                &mut self.ogm_state,
-                self.snapshot.ogm_schedule.entries.len(),
+            // The interface list is keyed off `link_features` (one row per
+            // registered interface); `ogm_schedule` is zipped in by iface_idx
+            // for display only, so its length doesn't drive selection bounds.
+            Tab::Links => (
+                &mut self.links_state,
+                self.snapshot.link_features.entries.len(),
             ),
             Tab::Metrics => (
                 &mut self.metrics_state,
@@ -333,6 +377,33 @@ impl App {
         }
     }
 
+    /// Queue a flip of `gate` on the currently selected interface of the
+    /// Links tab, for the event loop to execute immediately (no confirmation
+    /// step — see [`LinkFeatureToggle`]). A no-op unless the Links tab is
+    /// focused and a row is selected.
+    pub fn toggle_link_feature(&mut self, gate: LinkFeatureGate) {
+        if self.tab != Tab::Links {
+            return;
+        }
+        let Some(idx) = self.links_state.selected() else {
+            return;
+        };
+        let Some(entry) = self.snapshot.link_features.entries.get(idx) else {
+            return;
+        };
+        let current = match gate {
+            LinkFeatureGate::TxOgm => entry.tx_ogm,
+            LinkFeatureGate::RxOgm => entry.rx_ogm,
+            LinkFeatureGate::TxData => entry.tx_data,
+            LinkFeatureGate::RxData => entry.rx_data,
+        };
+        self.pending_link_feature_toggle = Some(LinkFeatureToggle {
+            iface_idx: entry.iface_idx,
+            gate,
+            new_value: !current,
+        });
+    }
+
     /// Confirm the proposed action: move it from the popup to the execution
     /// queue, which the event loop drains.  A no-op if no popup is open.
     pub fn confirm_action(&mut self) {
@@ -399,14 +470,14 @@ mod tests {
     fn tab_cycles_both_directions_and_wraps() {
         assert_eq!(Tab::Overview.next(), Tab::Routing);
         assert_eq!(Tab::Routing.next(), Tab::LinkQuality);
-        assert_eq!(Tab::LinkQuality.next(), Tab::OgmSchedule);
-        assert_eq!(Tab::OgmSchedule.next(), Tab::Metrics);
+        assert_eq!(Tab::LinkQuality.next(), Tab::Links);
+        assert_eq!(Tab::Links.next(), Tab::Metrics);
         assert_eq!(Tab::Metrics.next(), Tab::Security);
         assert_eq!(Tab::Security.next(), Tab::Overview); // wrap forward
         assert_eq!(Tab::Overview.prev(), Tab::Security); // wrap backward
         assert_eq!(Tab::Overview.index(), 0);
         assert_eq!(Tab::LinkQuality.index(), 2);
-        assert_eq!(Tab::OgmSchedule.index(), 3);
+        assert_eq!(Tab::Links.index(), 3);
         assert_eq!(Tab::Metrics.index(), 4);
         assert_eq!(Tab::Security.index(), 5);
     }
@@ -586,6 +657,86 @@ mod tests {
         app.security_focus = SecurityFocus::Originators;
         app.request_csr_action(true);
         assert!(app.confirm.is_none(), "approve belongs to the CSR pane");
+    }
+
+    fn app_with_link_features(
+        entries: Vec<wayfinder_protos::wayfinder_v1alpha::LinkFeaturesEntry>,
+    ) -> App {
+        let mut app = App::new("test".to_string(), 1000);
+        app.tab = Tab::Links;
+        app.snapshot.link_features.entries = entries;
+        app
+    }
+
+    #[test]
+    fn toggle_link_feature_is_inert_off_the_links_tab() {
+        use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesEntry;
+        let mut app = app_with_link_features(vec![LinkFeaturesEntry {
+            iface_idx: 0,
+            tx_ogm: true,
+            rx_ogm: true,
+            tx_data: true,
+            rx_data: true,
+            tx_keepalive_interval_ms: None,
+        }]);
+        app.links_state.select(Some(0));
+        app.tab = Tab::Overview;
+
+        app.toggle_link_feature(LinkFeatureGate::TxOgm);
+        assert!(app.pending_link_feature_toggle.is_none());
+    }
+
+    #[test]
+    fn toggle_link_feature_is_inert_without_a_selection() {
+        use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesEntry;
+        let mut app = app_with_link_features(vec![LinkFeaturesEntry {
+            iface_idx: 0,
+            tx_ogm: true,
+            rx_ogm: true,
+            tx_data: true,
+            rx_data: true,
+            tx_keepalive_interval_ms: None,
+        }]);
+
+        app.toggle_link_feature(LinkFeatureGate::TxOgm);
+        assert!(app.pending_link_feature_toggle.is_none());
+    }
+
+    #[test]
+    fn toggle_link_feature_queues_the_flipped_value_for_the_selected_iface() {
+        use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesEntry;
+        let mut app = app_with_link_features(vec![LinkFeaturesEntry {
+            iface_idx: 2,
+            tx_ogm: true,
+            rx_ogm: false,
+            tx_data: true,
+            rx_data: false,
+            tx_keepalive_interval_ms: None,
+        }]);
+        app.links_state.select(Some(0));
+
+        app.toggle_link_feature(LinkFeatureGate::TxOgm);
+        assert_eq!(
+            app.pending_link_feature_toggle,
+            Some(LinkFeatureToggle {
+                iface_idx: 2,
+                gate: LinkFeatureGate::TxOgm,
+                new_value: false,
+            }),
+            "tx_ogm was true, so the queued flip sets it false"
+        );
+
+        app.pending_link_feature_toggle = None;
+        app.toggle_link_feature(LinkFeatureGate::RxOgm);
+        assert_eq!(
+            app.pending_link_feature_toggle,
+            Some(LinkFeatureToggle {
+                iface_idx: 2,
+                gate: LinkFeatureGate::RxOgm,
+                new_value: true,
+            }),
+            "rx_ogm was false, so the queued flip sets it true"
+        );
     }
 
     fn app_with_routes(n: usize) -> App {

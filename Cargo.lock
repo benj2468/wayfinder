@@ -2876,6 +2876,7 @@ dependencies = [
  "prost",
  "prost-build",
  "serde",
+ "tracing",
 ]
 
 [[package]]

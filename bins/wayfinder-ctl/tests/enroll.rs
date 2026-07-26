@@ -12,9 +12,10 @@ use tokio::sync::{mpsc, oneshot};
 use wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
 use wayfinder_client::Identity;
 use wayfinder_protos::service::{
-    CsrOutcome, InterfaceThroughputData, IssuedCertData, KeepAliveEntryData, LinkQualityEntryData,
-    NodeMetricsData, OgmScheduleEntryData, PendingCsrData, RouteResolutionData, RoutingEntryData,
-    RuntimeConfigData, TableOccupancyData, WayfinderDataProvider, WayfinderService,
+    CsrOutcome, InterfaceThroughputData, IssuedCertData, KeepAliveEntryData, LinkFeaturesEntryData,
+    LinkQualityEntryData, NodeMetricsData, OgmScheduleEntryData, PendingCsrData,
+    RouteResolutionData, RoutingEntryData, RuntimeConfigData, TableOccupancyData,
+    WayfinderDataProvider, WayfinderService,
 };
 use wayfinder_protos::wayfinder_v1alpha::{WayfinderRequest, WayfinderResponse};
 use wayfinder_server::{AuthSnapshot, CertAuthority, MeshAuthority, serve_tls_server};
@@ -48,6 +49,9 @@ impl WayfinderDataProvider for ProviderMock {
         vec![]
     }
     fn link_quality_table(&self) -> Vec<LinkQualityEntryData> {
+        vec![]
+    }
+    fn link_features_table(&self) -> Vec<LinkFeaturesEntryData> {
         vec![]
     }
     fn keepalive_table(&self) -> Vec<KeepAliveEntryData> {
