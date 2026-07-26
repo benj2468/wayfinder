@@ -46,5 +46,8 @@ result
 # Target deployment
 buildkitd.toml
 
+# NDK
+local.properties
+
 # Wayfinder specifics
 var/conf/wayfinder0.state
