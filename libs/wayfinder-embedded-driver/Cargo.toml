@@ -7,6 +7,7 @@ edition = "2024"
 workspace = true
 
 [features]
+default = [ "mgmt" ]
 # Opt-in embedded management API: adds a third event-loop arm that services
 # `WayfinderRequest`s forwarded from a `wayfinder-server` `serve` loop (over an
 # `embassy-sync` channel) against a `RouterAdapter`. Off by default so a pure

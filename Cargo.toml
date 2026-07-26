@@ -23,6 +23,7 @@ members = [
     "libs/wayfinder-embedded-log",
     "libs/wayfinder-test",
     "libs/wayfinder-client",
+    "libs/wayfinder-py",
     "bins/wayfinder-tap",
     "bins/wayfinder-tui",
     "bins/wayfinder-ctl",
@@ -60,7 +61,7 @@ wayfinder-driver = { path = "./libs/wayfinder-driver" }
 wayfinder-embedded-driver = { path = "./libs/wayfinder-embedded-driver" }
 wayfinder-client = { path = "./libs/wayfinder-client" }
 rylr998 = { path = "./libs/rylr998", default-features = false }
-blue = { path = "./libs/blue" }
+blue = { path = "./libs/blue", default-features = false }
 
 # Third Party Dependencies
 tracing = "0.1.44"

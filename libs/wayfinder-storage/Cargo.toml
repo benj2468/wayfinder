@@ -22,7 +22,15 @@ embedded-storage = { workspace = true, optional = true }
 heapless.workspace = true
 
 [features]
-default = ["std"]
+# Every real consumer in the workspace depends on this crate with
+# `default-features = false` and opts into `std` or `flash` explicitly (see
+# `libs/wayfinder-server` and `bins/wayfinder-nrf52840` respectively), so this
+# default set only governs building/testing the crate directly — e.g. `cargo
+# nextest run --workspace`, which resolves each member's own defaults. Both
+# are listed here so that command exercises `FlashStore` too, not just
+# `FileStore`; `flash` is a plain host-buildable trait dependency
+# (`embedded-storage`), unlike e.g. `blue`'s `hardware` feature.
+default = ["std", "flash"]
 # Pulls in the std::fs-backed FileStore. Leave off for `no_std` embedded
 # nodes, which use the flash-backed FlashStore instead.
 std = []

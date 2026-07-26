@@ -179,6 +179,13 @@ test:run:python:
     # `uv run` (not a bare `python3 -m pytest`) so it resolves against the
     # `.venv` `uv sync` just built rather than the system interpreter.
     - runuser -u ci -- uv run pytest
+    # `libs/wayfinder-py` is its own independent Cargo workspace (see the
+    # comment in its Cargo.toml), so `test:run:rust`'s `cargo ... --workspace`
+    # never touches it — run its Rust unit tests here instead, where a
+    # linkable libpython is already on PATH from the `uv sync` above.
+    # `--no-tests=warn` rather than the default `fail`: it has no tests yet,
+    # and a bare `cargo nextest run` treats an empty suite as a failure.
+    - (cd libs/wayfinder-py && cargo nextest run --no-tests=warn)
 test:run:
   stage: test
   tags:

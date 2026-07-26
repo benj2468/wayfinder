@@ -17,6 +17,7 @@ RUN rustup component add clippy
 # Bare-metal target for the embedded (`no_std`) crates (see build:embedded in
 # .gitlab-ci.yml) — Tier 2 with prebuilt core/alloc, so no nightly required.
 RUN rustup target add thumbv7em-none-eabihf
+RUN rustup target add aarch64-linux-android
 
 # Install cargo-nextest and cargo-llvm-cov binaries using pre-compiled installers
 # (Much faster than running `cargo install` inside the Dockerfile)
@@ -28,6 +29,7 @@ RUN cargo binstall -y sccache
 # Builds/installs the libs/wayfinder-py extension module before the pytest job
 # imports it (see test:run:python in .gitlab-ci.yml).
 RUN cargo binstall -y maturin
+RUN cargo binstall -y cargo-ndk
 
 # Ensure protoc is globally accessible (usually /usr/bin/protoc via apt)
 ENV PROTOC=/usr/bin/protoc
