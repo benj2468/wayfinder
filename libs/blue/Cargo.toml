@@ -7,7 +7,7 @@ edition = "2024"
 workspace = true
 
 [features]
-default = ["std", "android"]
+default = ["std"]
 # The host-side (Linux/BlueZ) `LinkT`. Off by default so the crate stays
 # `no_std` for the firmware build. Also enables `generic_link` (`android`
 # does that on its own, more cheaply, when `bluer`/D-Bus aren't wanted).

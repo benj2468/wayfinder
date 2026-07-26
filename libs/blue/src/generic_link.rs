@@ -3,9 +3,10 @@
 //! concrete BLE stack directly.
 //!
 //! Both host-side backends build on this: [`crate::StdBleLink`] wraps it with
-//! a `BleAdvertiser` that registers advertisements through BlueZ, and the
-//! future JNI-hosted Android node will wrap it with one driving
-//! `BluetoothLeAdvertiser` directly. Both platforms' own BLE APIs build/parse
+//! a `BleAdvertiser` that registers advertisements through BlueZ, and
+//! `bins/wayfinder-pixel` wraps it with one bridged across a UniFFI boundary
+//! to a Kotlin-implemented `BluetoothLeAdvertiser` binding (that Kotlin side
+//! is still a later phase). Both platforms' own BLE APIs build/parse
 //! the Manufacturer Specific Data AD structure the same way — from/to a raw
 //! byte payload — so this core hands its `BleAdvertiser` the bare
 //! `[frag_header][body]` blob via `frame::build_fragment`, no self-framing via

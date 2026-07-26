@@ -19,9 +19,11 @@ name = "wayfinder-pixel"
 path = "src/main.rs"
 
 # The actual artifact the Android app loads: a `cdylib` exposing `src/lib.rs`'s
-# UniFFI interface (`MeshNode`/`PixelBleAdvertiser`). `lib` is also kept so
-# the plain `[[bin]]` above and `cargo test` can link against it directly on
-# host, without going through the FFI boundary.
+# UniFFI interface (`MeshNode`/`PixelBleAdvertiser`). `lib` is also kept
+# (rather than `cdylib` alone) so `cargo test` can build/run this crate's own
+# unit tests as a normal rlib — a `cdylib`-only crate isn't directly
+# testable. The `[[bin]]` above doesn't use this lib today (it's a separate,
+# lighter NDK-linking smoke test — see its own doc comment).
 [lib]
 crate-type = ["cdylib", "lib"]
 
@@ -38,11 +40,11 @@ required-features = ["uniffi-bindgen"]
 uniffi-bindgen = ["uniffi/cli"]
 
 [dependencies]
-# The seam this binary exists to eventually host for real — `BleLink`/
-# `BleAdvertiser`, see `libs/blue/CLAUDE.md` — imported here so this crate
-# actually proves the `android` feature links against the NDK's libc before
-# any JNI glue exists. `android` needs only `tokio`, no Android/JNI
-# dependency yet.
+# The seam this crate hosts for real: `BleLink`/`BleAdvertiser`, see
+# `libs/blue/CLAUDE.md`. Used two ways — `main.rs`'s `NoopAdvertiser` proves
+# `blue` itself links against the NDK's libc; `src/lib.rs`'s `MeshNode`/
+# `ForeignAdvertiser` are the actual UniFFI-exported glue. `android` needs
+# only `tokio`, no Android/JNI dependency itself.
 blue = { path = "../../libs/blue", default-features = false, features = ["android"] }
 # The bare `LinkT`/`interfaces` surface `blue` itself builds on;
 # `default-features = false` keeps std/alloc off, matching how `blue`
