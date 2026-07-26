@@ -1,0 +1,32 @@
+[package]
+name = "wayfinder-pixel"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Independent workspace (like bins/wayfinder-nrf52840 and
+# bins/wayfinder-stm32f411): cross-compiles via `cargo-ndk` for
+# aarch64-linux-android, using the Android NDK's own clang/linker rather than
+# the host toolchain, which must not leak into the main workspace's host
+# builds. Built from its own directory (`cargo ndk -t arm64-v8a build`), not
+# via `-p` from the root — see .gitlab-ci.yml's build:embedded job for the
+# same pattern applied to the bare-metal boards.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "wayfinder-pixel"
+path = "src/main.rs"
+
+[dependencies]
+# The seam this binary exists to eventually host for real — `AndroidBleLink`/
+# `BleAdvertiser`, see `libs/blue/CLAUDE.md` — imported here so this crate
+# actually proves the `android` feature links against the NDK's libc before
+# any JNI glue exists. `android` needs only `tokio`, no Android/JNI
+# dependency yet.
+blue = { path = "../../libs/blue", features = ["android"] }
+# The bare `LinkT`/`interfaces` surface `blue` itself builds on;
+# `default-features = false` keeps std/alloc off, matching how `blue`
+# depends on it.
+wayfinder = { path = "../../libs/wayfinder", default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

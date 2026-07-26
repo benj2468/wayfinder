@@ -31,6 +31,11 @@ hardware = [
     "dep:embassy-sync",
     "dep:static_cell",
 ]
+# Pure-Rust `LinkT` backend generic over an injected `BleAdvertiser`, for a
+# future JNI-hosted Android node (see `android_link.rs`). Needs only `tokio`,
+# for the queue between the platform's scan callback and `recv` — the actual
+# Android BLE API glue is a later phase, not part of this crate.
+android = ["dep:tokio"]
 
 [dependencies]
 # Depended on by path (not workspace inheritance) so `default-features = false`

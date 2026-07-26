@@ -13,26 +13,37 @@ scanning. Fragmentation reuses the shared `wayfinder-link-utils` machinery
 this needs no deployment-time configuration, since BLE addresses are already
 globally distinct per physical device and reported on every scan report.
 
-## Two backends, one wire format
+## Three backends, one wire format
 
-| | `NrfBleLink` (`hardware`) | `StdBleLink` (`std`) |
-|---|---|---|
-| target | nRF52840, `no_std` | Linux host, tokio |
-| stack | `nrf-softdevice` | BlueZ over D-Bus (`bluer`) |
-| consumer | `bins/wayfinder-nrf52840` | `bins/wayfinder-tap` |
-| AD framing | built here (`ad.rs`) | built by BlueZ |
+| | `NrfBleLink` (`hardware`) | `StdBleLink` (`std`) | `AndroidBleLink` (`android`) |
+|---|---|---|---|
+| target | nRF52840, `no_std` | Linux host, tokio | Android host, tokio |
+| stack | `nrf-softdevice` | BlueZ over D-Bus (`bluer`) | injected `BleAdvertiser` (JNI glue, later phase) |
+| consumer | `bins/wayfinder-nrf52840` | `bins/wayfinder-tap` | future Android app |
+| AD framing | built here (`ad.rs`) | built by BlueZ | built by platform |
 
 They interoperate on-air, which is the point: a `wayfinder-tap` host can
 front a terminal mesh of MCUs over BLE. `frame::build_fragment` produces the
 `[frag_header][body]` blob both put on the air; the nRF path additionally
 wraps it in this crate's own Manufacturer-Specific-Data framing
 (`build_fragment_ad`), because it hands the radio a whole advertising-data
-buffer, while BlueZ builds that structure itself from
-`Advertisement::manufacturer_data`. **That asymmetry is the easiest thing to
+buffer, while BlueZ (and, later, Android) builds that structure itself from
+raw manufacturer-data bytes. **That asymmetry is the easiest thing to
 get wrong here** — passing `build_fragment_ad`'s output to BlueZ
 double-wraps the AD structure and the fragment never parses on the far side.
 `frame.rs`'s `build_fragment_and_build_fragment_ad_agree_on_the_wire` test
 pins the two paths together.
+
+### `AndroidBleLink` is generic, not JNI-hosted, yet (`src/android_link.rs`)
+
+`AndroidBleLink<A: BleAdvertiser>` doesn't drive any Android API itself — it
+takes the platform advertise call as a type parameter (`BleAdvertiser::
+advertise`), and reads scan reports off a channel fed by a cloneable
+`AndroidBleReportSink`. This is deliberate: it's the seam a later JNI/UniFFI
+phase plugs a real Android-backed `BleAdvertiser` and scan-callback wiring
+into, but until then it means this backend — unlike both existing ones — is
+fully unit-tested today, against a fake `BleAdvertiser`, with no real
+hardware/`bluetoothd`/JNI dependency at all.
 
 ## BlueZ specifics (`src/std_link.rs`)
 
