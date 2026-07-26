@@ -139,6 +139,27 @@ build:embedded:
     - (cd bins/wayfinder-stm32f411 && cargo build --release --locked)
     - (cd bins/wayfinder-stm32f411 && cargo clippy --release --locked -- -D warnings)
     - sccache --show-stats
+# Cross-compiles bins/wayfinder-pixel for a real Android target via
+# `cargo-ndk`'s NDK-provided linker, instead of relying on `cargo check
+# --target aarch64-linux-android` alone — that proves the code type-checks
+# against Android's target definition, but not that it actually links
+# against a real linker/libc, which is exactly what an NDK-hosted binary
+# needs proven. Like the embedded boards' bare-metal targets above,
+# `bins/wayfinder-pixel` is its own independent Cargo workspace (see the
+# comment in its Cargo.toml), so it's built from its own directory rather
+# than via `-p` from the root. No on-device test step: there's no emulator
+# in this image, and the binary is still a placeholder (see its own doc
+# comment) with nothing to exercise yet.
+build:android:
+  extends: .base-ci-docker
+  stage: build
+  needs:
+    - lint-done
+    - build-image
+  script:
+    - (cd bins/wayfinder-pixel && cargo ndk -t arm64-v8a build --locked)
+    - (cd bins/wayfinder-pixel && cargo ndk -t arm64-v8a clippy --locked -- -D warnings)
+    - sccache --show-stats
 test:run:rust:
   extends: .base-ci-docker
   stage: test
