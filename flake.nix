@@ -74,18 +74,6 @@
             pkgs.fenix.targets.${pixelTarget}.latest.rust-std
           ];
 
-          ndkVersion = "27.3.13750724";
-          androidComposition = pkgs.androidenv.composeAndroidPackages {
-            inherit ndkVersion;
-            includeNDK = true;
-            abiVersions = [
-              "arm64-v8a"
-            ];
-            platformVersions = [
-              "latest"
-            ];
-          };
-
           # Python interpreter with the integration-test deps (pytest). Used by
           # both the default dev shell and the lightweight `pytest` shell that
           # CI runs — see tests/README.md and .gitlab-ci.yml.
@@ -136,7 +124,6 @@
               stdenv.cc.cc.lib
               probe-rs-tools
               jdk17
-              androidComposition.androidsdk
             ];
 
             buildInputs = with pkgs; [ dbus ];
@@ -147,35 +134,21 @@
             ];
 
             shellHook = ''
-                ${config.pre-commit.installationScript}
-                PROJECT_ROOT=$(git rev-parse --show-toplevel)
+              ${config.pre-commit.installationScript}
+              PROJECT_ROOT=$(git rev-parse --show-toplevel)
 
-                python3 -m venv ''${PROJECT_ROOT}/.venv
+              python3 -m venv ''${PROJECT_ROOT}/.venv
 
-                source "''${PROJECT_ROOT}/.venv/bin/activate"
+              source "''${PROJECT_ROOT}/.venv/bin/activate"
 
-                python3 -m pip install --upgrade pip
-                uv sync --only-dev
+              python3 -m pip install --upgrade pip
+              uv sync --only-dev
 
-                # Manylinux wheels (numpy, matplotlib's C extensions — see
-                # sim/scenarios/*.py's `uv sync --group sim`) expect libstdc++ on
-                # the loader path; this shell's stdenv doesn't put it there by
-                # default, so wire it up once here rather than per-invocation.
-                export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH"
-
-                export JAVA_HOME="${pkgs.jdk17.home}"
-                export ANDROID_HOME="${androidComposition.androidsdk}/libexec/android-sdk"
-                export ANDROID_NDK_ROOT="''$ANDROID_HOME/ndk/${ndkVersion}"
-                export ANDROID_SDK_ROOT="''$ANDROID_HOME"
-
-
-              # Path updates to expose tools globally within the shell
-              export PATH="''$ANDROID_NDK_ROOT:''$PATH"
-
-              # Automatically update or generate local.properties for Gradle/Android Studio
-              echo "sdk.dir=''$ANDROID_HOME" > local.properties
-              echo "ndk.dir=''$ANDROID_NDK_ROOT" >> local.properties
-              echo "Generated local.properties with Nix store paths."
+              # Manylinux wheels (numpy, matplotlib's C extensions — see
+              # sim/scenarios/*.py's `uv sync --group sim`) expect libstdc++ on
+              # the loader path; this shell's stdenv doesn't put it there by
+              # default, so wire it up once here rather than per-invocation.
+              export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH"
             '';
           };
 
