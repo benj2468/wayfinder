@@ -1,16 +1,18 @@
-//! nRF52840-DK firmware: run the wayfinder mesh router on bare metal over a
-//! RYLR998 LoRa link attached to a UART.
+//! nRF52840-DK firmware: run the wayfinder mesh router on bare metal over
+//! connectionless BLE advertising broadcast (the chip's built-in 2.4GHz
+//! radio) and, if one happens to be wired up, a RYLR998 LoRa module on a
+//! UART.
 //!
 //! This wires the board's concrete pieces to the HAL-agnostic
-//! [`wayfinder_embedded_driver::Driver`]: a [`BufferedUarte`] on two GPIOs
-//! carries the RYLR998's AT-command protocol, [`rylr998::RylrClient`] adapts
-//! that serial into the mesh [`LinkT`], and an `embassy-time`-backed [`Clock`]
-//! paces the OGM timer.  The embassy thread-mode executor drives the driver's
-//! `async` loop forever.
-//!
-//! Milestone 1 is a **radio relay**: one LoRa interface, OGM exchange +
-//! forwarding, no host device.  A second UART exposes the management API on
-//! the DK's onboard-debugger VCOM port, so the node is inspectable
+//! [`wayfinder_embedded_driver::Driver`]: [`blue::NrfBleLink`] (see
+//! `libs/blue/CLAUDE.md`) adapts the SoftDevice-driven radio into the mesh
+//! [`LinkT`], [`rylr998::RylrClient`] does the same for the LoRa module's
+//! AT-command protocol over a [`BufferedUarte`], and an `embassy-time`-backed
+//! [`Clock`] paces the OGM timer. Both interfaces are dispatched through the
+//! board-local [`MeshLink`] enum, since [`Driver`] takes one concrete link
+//! type. The embassy thread-mode executor drives the driver's `async` loop
+//! forever. A second UART exposes the management API on the DK's
+//! onboard-debugger VCOM port, so the node is inspectable
 //! (`wayfinder-tui`/`wayfinderctl --serial`) without a second mesh node.
 //!
 //! [`BufferedUarte`]: embassy_nrf::buffered_uarte::BufferedUarte
@@ -19,6 +21,7 @@
 #![no_std]
 #![no_main]
 
+use blue::NrfBleLink;
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_nrf::bind_interrupts;
@@ -36,17 +39,23 @@ use embassy_time::Duration as EmbassyDuration;
 use embassy_time::Instant;
 use embassy_time::Timer;
 use embedded_alloc::LlffHeap as Heap;
-use panic_halt as _;
+use embedded_io_async::Read;
+use embedded_io_async::Write;
 use rylr998::Bandwidth;
 use rylr998::CodingRate;
 use rylr998::LoraError;
 use rylr998::RylrClient;
 use rylr998::SpreadingFactory;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::trace;
 use tracing::warn;
+use wayfinder::interfaces::frame::LinkFrameData;
 use wayfinder::interfaces::frame::Mac;
+use wayfinder::interfaces::link::LinkError;
+use wayfinder::link::LinkT;
+use wayfinder::link::Received;
 use wayfinder_embedded_driver::Clock;
 use wayfinder_embedded_driver::Driver;
 use wayfinder_embedded_driver::TrickleParams;
@@ -61,6 +70,23 @@ use wayfinder_storage::FlashStore;
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
 
+/// Prints the panic message over RTT before halting, so a fatal error (e.g.
+/// `nrf-softdevice`'s own `sd_ble_enable` RAM-too-small panic — see
+/// `memory.x`) is visible on the debug probe instead of a silent hang.
+/// Writes to the print channel `wayfinder_embedded_log::init()` already set
+/// up for `tracing`'s output, rather than opening a second RTT channel — the
+/// two must therefore stay on the same `rtt-target` version (see this crate's
+/// `Cargo.toml`). If a panic happens before that `init()` call, the message
+/// is silently dropped (per `rtt_target::rprintln!`'s documented behavior)
+/// and this degrades to a plain halt.
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    rtt_target::rprintln!("panic: {}", info);
+    loop {
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Bytes reserved for `alloc`.  Two users share it: `tracing-core`'s bookkeeping
 /// and the management server's per-request buffers.  Sized against
 /// `wayfinder_server::framing::MAX_FRAME_LEN` (4 KiB): `serve` holds one
@@ -73,6 +99,13 @@ const HEAP_SIZE_BYTES: usize = 32 * 1024;
 
 /// LoRa network id shared by every node in this mesh (RYLR `AT+NETWORKID`).
 const LORA_NETWORK_ID: u8 = 18;
+
+/// How many `AT` ping attempts (1s timeout each) to make before concluding no
+/// RYLR998 module is wired to this UART and continuing BLE-only, rather than
+/// blocking boot forever waiting for a reply that will never come. ~3s total:
+/// long enough to cover the module's own boot delay, short enough not to
+/// stall a BLE-only board noticeably.
+const RYLR_PING_ATTEMPTS: u32 = 3;
 
 /// Base flash offset of the durable identity store: the two 4 KiB pages at the
 /// very top of flash that `memory.x` carves out of the `FLASH` region so the
@@ -92,7 +125,8 @@ const DURABLE_STORE_BASE: u32 = (1024 * 1024) - 2 * nvmc::PAGE_SIZE as u32;
 /// locally-administered unicast value: the L/A bit (`0x02`) set, the I/G
 /// multicast bit (`0x01`) cleared. Each physical node therefore also gets a
 /// distinct RYLR `AT+ADDRESS` (derived from the low octets), keeping the RYLR
-/// reassembler from cross-contaminating fragments (see `libs/rylr998/CLAUDE.md`).
+/// reassembler from cross-contaminating fragments (see `libs/rylr998/CLAUDE.md`)
+/// on boards that have a module attached.
 fn ficr_derived_mac() -> Mac {
     let ficr = embassy_nrf::pac::FICR;
     let lo = ficr.deviceid(0).read().to_le_bytes();
@@ -102,8 +136,9 @@ fn ficr_derived_mac() -> Mac {
     Mac(octets)
 }
 
-// Bind the UARTE0 interrupt to the buffered-UARTE handler so the driver's async
-// serial reads/writes are woken by hardware rather than polled.
+// Bind the UARTE0 (RYLR998, if attached) and UARTE1 (management-API VCOM
+// link) interrupts to the buffered-UARTE handler so the driver's async serial
+// reads/writes are woken by hardware rather than polled.
 bind_interrupts!(struct Irqs {
     UARTE0 => buffered_uarte::InterruptHandler<peripherals::UARTE0>;
     UARTE1 => buffered_uarte::InterruptHandler<peripherals::UARTE1>;
@@ -124,8 +159,52 @@ impl Clock for EmbassyClock {
     }
 }
 
+/// Dispatches `LinkT` across this board's mesh interfaces. `wayfinder_embedded_driver::Driver<L, C, N>`
+/// takes a fixed `[L; N]` of one concrete link type; this is the
+/// "board-defined `enum` dispatching across mixed media" its doc comment
+/// anticipates.
+#[expect(clippy::large_enum_variant, reason = "typed instead of boxed")]
+enum MeshLink<S> {
+    /// The RYLR998 LoRa module, over the UART carrying its AT-command
+    /// protocol.
+    Rylr(RylrClient<S>),
+    /// Connectionless BLE advertising broadcast over the chip's built-in
+    /// radio.
+    Ble(NrfBleLink),
+    /// No RYLR998 module was detected at boot on this slot's UART. Unlike a
+    /// genuine link fault, an absent external module is an expected shape
+    /// (a BLE-only deployment) — this variant keeps the link array's size
+    /// fixed at compile time while contributing nothing: `send` reports
+    /// failure (so the driver's existing fire-and-forget handling logs and
+    /// drops it, same as any other radio send failure) and `recv` never
+    /// resolves, since nothing will ever arrive on a medium with nothing
+    /// attached.
+    Absent,
+}
+
+impl<S> LinkT for MeshLink<S>
+where
+    S: Read + Write + Send,
+{
+    async fn send(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> Result<usize, LinkError> {
+        match self {
+            MeshLink::Rylr(link) => link.send(origin, data).await,
+            MeshLink::Ble(link) => link.send(origin, data).await,
+            MeshLink::Absent => Err(LinkError::TransmitFailed),
+        }
+    }
+
+    async fn recv<'a>(&'a mut self) -> Result<Received<'a>, LinkError> {
+        match self {
+            MeshLink::Rylr(link) => link.recv().await,
+            MeshLink::Ble(link) => link.recv().await,
+            MeshLink::Absent => core::future::pending().await,
+        }
+    }
+}
+
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     // SAFETY: called once, before any other code can allocate, over a
     // `static mut` region sized by `HEAP_SIZE_BYTES` that nothing else
     // references.
@@ -143,7 +222,17 @@ async fn main(_spawner: Spawner) {
 
     info!("Welcome to Wayfinder");
 
-    let p = embassy_nrf::init(Default::default());
+    // The SoftDevice (brought up later, in `NrfBleLink::new`) reserves NVIC
+    // priority levels 0 and 1 for itself and rejects `sd_softdevice_enable()`
+    // outright (`SdmIncorrectInterruptConfiguration`) if any interrupt is
+    // already enabled at those levels. `embassy_nrf::config::Config::default()`
+    // enables GPIOTE and the RTC1 time driver at `Priority::P0` — the highest
+    // level — so both must be dropped to `P2`, matching `nrf-softdevice`'s own
+    // examples, before the SoftDevice is ever enabled.
+    let mut nrf_config = embassy_nrf::config::Config::default();
+    nrf_config.gpiote_interrupt_priority = embassy_nrf::interrupt::Priority::P2;
+    nrf_config.time_interrupt_priority = embassy_nrf::interrupt::Priority::P2;
+    let p = embassy_nrf::init(nrf_config);
 
     // Resolve this node's durable mesh identity before bringing up the radio:
     // load the MAC persisted in the reserved top flash pages, or — on a
@@ -237,59 +326,105 @@ async fn main(_spawner: Spawner) {
     // LED1 (P0.13, active-low) lit = firmware booted and reached the run loop.
     let mut led = Output::new(p.P0_13, Level::High, OutputDrive::Standard);
 
-    // Bring up the RYLR998 and configure the shared LoRa settings every node in
-    // this mesh must agree on.  A distinct 16-bit address per node (low bytes of
-    // the mesh MAC) keeps fragment reassembly from cross-contaminating.
-    let Ok(mut client) = RylrClient::new(uarte) else {
-        // Serial init failed: leave LED1 off and halt.
-        loop {
-            cortex_m::asm::wfe();
-        }
-    };
+    // Bring up the RYLR998 if one is actually wired to this UART, and
+    // configure the shared LoRa settings every node in this mesh must agree
+    // on. Unlike BLE (built into the chip, always present), this is an
+    // external module this board may or may not have attached — so a radio
+    // that never responds to `ping` is a normal, expected shape (a BLE-only
+    // deployment), not a fault, and degrades to `MeshLink::Absent` rather than
+    // halting boot. A module that *does* respond but then rejects
+    // configuration is a different, genuine problem: it's present and
+    // malfunctioning, not absent, so that case still halts with LED1 dark
+    // rather than run a misconfigured relay that looks healthy.
     let lora_address = u16::from_be_bytes([node_mac.0[4], node_mac.0[5]]);
-    // Apply the shared LoRa settings every node in this mesh must agree on. A
-    // failure here (the module didn't ACK a command) would leave the node on the
-    // wrong address/network — silently deaf on the mesh, or cross-contaminating
-    // another node's fragment reassembly. Halt with LED1 dark rather than run a
-    // misconfigured relay that looks healthy.
-    let configured = async {
-        // We need to wait until the module is actually awake
-        while embassy_time::with_timeout(EmbassyDuration::from_secs(1), client.ping())
-            .await
-            .is_err()
-        {
+    let rylr_link = 'rylr: {
+        let Ok(mut client) = RylrClient::new(uarte) else {
+            warn!("RYLR998 serial init failed; continuing BLE-only");
+            break 'rylr MeshLink::Absent;
+        };
+
+        let mut detected = false;
+        for _ in 0..RYLR_PING_ATTEMPTS {
+            if embassy_time::with_timeout(EmbassyDuration::from_secs(1), client.ping())
+                .await
+                .is_ok()
+            {
+                detected = true;
+                break;
+            }
             trace!("waiting for radio to boot");
         }
-        client.set_address(lora_address).await?;
-        client.set_network_id(LORA_NETWORK_ID).await?;
-        client
-            .set_parameters(
-                SpreadingFactory::Sf7,
-                Bandwidth::Khz125,
-                CodingRate::Cr48,
-                15,
-            )
-            .await?;
-        Ok::<(), LoraError>(())
-    }
-    .await;
-    if let Err(e) = configured {
-        warn!(?e, "radio configuration failed; halting");
-        loop {
-            cortex_m::asm::wfe();
+        if !detected {
+            warn!("RYLR998 not detected; continuing BLE-only");
+            break 'rylr MeshLink::Absent;
         }
-    }
+
+        let configured = async {
+            client.set_address(lora_address).await?;
+            client.set_network_id(LORA_NETWORK_ID).await?;
+            client
+                .set_parameters(
+                    SpreadingFactory::Sf7,
+                    Bandwidth::Khz125,
+                    CodingRate::Cr48,
+                    15,
+                )
+                .await?;
+            Ok::<(), LoraError>(())
+        }
+        .await;
+        if let Err(e) = configured {
+            error!(?e, "RYLR998 present but configuration failed; halting");
+            loop {
+                cortex_m::asm::wfe();
+            }
+        }
+        MeshLink::Rylr(client)
+    };
+
+    // Bring up this node's second mesh interface: BLE advertising broadcast
+    // over the chip's built-in radio. Unlike the RYLR998 above, this radio is
+    // always physically present, so a bring-up failure here is a genuine
+    // fault — halt with LED1 dark rather than run a relay with only its
+    // optional interface actually working.
+    let ble_link = match NrfBleLink::new(spawner) {
+        Ok(link) => link,
+        Err(e) => {
+            error!(?e, "BLE bring-up failed; halting");
+            loop {
+                cortex_m::asm::wfe();
+            }
+        }
+    };
+    debug!("BLE link brought up");
 
     // Reached the run loop: signal liveness on LED1.
     led.set_low();
 
-    // A relaxed per-link Trickle schedule suited to LoRa's low airtime budget.
-    let trickle = [TrickleParams {
-        i_min: core::time::Duration::from_secs(5),
-        i_max: core::time::Duration::from_secs(128),
-    }];
+    // Per-link Trickle schedules, in the same order as the `links` array
+    // below. LoRa's is a relaxed cadence suited to its low airtime budget
+    // (harmless overhead if `rylr_link` turned out `Absent` — that slot just
+    // never has anything to send); BLE's tighter bounds reflect its much
+    // higher duty-cycle budget — both provisional pending real airtime
+    // measurements on hardware (see `libs/blue/CLAUDE.md`).
+    let trickle = [
+        TrickleParams {
+            i_min: core::time::Duration::from_secs(5),
+            i_max: core::time::Duration::from_secs(128),
+        },
+        TrickleParams {
+            i_min: core::time::Duration::from_secs(1),
+            i_max: core::time::Duration::from_secs(64),
+        },
+    ];
 
-    let mut driver = Driver::new(node_mac, [client], EmbassyClock, &trickle, &[]);
+    let mut driver = Driver::new(
+        node_mac,
+        [rylr_link, MeshLink::Ble(ble_link)],
+        EmbassyClock,
+        &trickle,
+        &[],
+    );
 
     // Bring up the second UART on the DK's onboard-debugger VCOM lines so the
     // management API is reachable as a USB serial device (`/dev/ttyACM*`) with no

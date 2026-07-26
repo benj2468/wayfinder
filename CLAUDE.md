@@ -172,6 +172,14 @@ The workspace splits into the `no_std` routing core, radio drivers, host-side
 - **libs/ieee802154** — hardware-agnostic 802.15.4 framing (`encode`/`decode`).
 - **libs/at86rf233** — SPI driver for the AT86RF233 transceiver.
 - **libs/nrf-ieee802154** — `LinkT` adapter for the nRF52840 built-in radio.
+- **libs/blue** → `LinkT` adapters for connectionless BLE advertising
+  broadcast, in two interoperating backends sharing one wire format:
+  `NrfBleLink` (nRF52840 via `nrf-softdevice`, `no_std` — mutually exclusive
+  with `nrf-ieee802154` at the RADIO peripheral) and `StdBleLink` (a Linux
+  host via BlueZ/`bluer`, used by `bins/wayfinder-tap`).
+- **libs/wayfinder-link-utils** — shared small-MTU fragmentation/reassembly
+  for `LinkT` drivers whose medium caps payload well below
+  `MAX_LINK_FRAME_LEN` (used by `rylr998`, `blue`).
 
 **Identity & management API**
 - **libs/wayfinder-auth** — crypto identity/membership. A mesh is optionally

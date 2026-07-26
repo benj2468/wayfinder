@@ -48,11 +48,22 @@ FROM --platform=$BUILDPLATFORM rust:1.96-slim-bookworm AS builder
 # gcc-aarch64-linux-gnu + libc6-dev-arm64-cross give us a cross linker + glibc
 # sysroot for the aarch64 target; the amd64 target links fine with the gcc that
 # already ships in the rust:slim base.
-RUN apt-get update \
+#
+# libdbus-1-dev is needed because libs/blue links `bluer`, which needs libdbus
+# at build time (via pkg-config) even though we only cross-*compile* here (no
+# code runs). pkg-config itself only ever probes the *build host's* arch by
+# default, so building for TARGETARCH=arm64 on an amd64 host needs an arm64
+# libdbus, not just the native one — hence enabling the arm64 foreign arch and
+# installing the arch-qualified package alongside the native one.
+RUN dpkg --add-architecture arm64 \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         protobuf-compiler \
         gcc-aarch64-linux-gnu \
         libc6-dev-arm64-cross \
+        pkg-config \
+        libdbus-1-dev \
+        libdbus-1-dev:arm64 \
     && rm -rf /var/lib/apt/lists/*
 ENV PROTOC=/usr/bin/protoc
 
@@ -67,9 +78,17 @@ RUN case "$TARGETARCH" in \
         *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac
 RUN rustup target add "$(cat /rust_target)"
+#
+# pkg-config's own cross-compilation guard (the `pkg-config` crate refuses to
+# trust the host's .pc files for a foreign target unless told to) is disabled
+# per-target via the `_<target-triple>`-suffixed vars: PKG_CONFIG_ALLOW_CROSS
+# opts in, and PKG_CONFIG_LIBDIR pins the search to the arm64 pkgconfig dir
+# specifically, so the amd64-target build never picks it up and vice versa.
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
-    AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
+    AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar \
+    PKG_CONFIG_ALLOW_CROSS=1 \
+    PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig
 
 WORKDIR /app
 

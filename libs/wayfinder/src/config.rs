@@ -113,6 +113,28 @@ pub enum LinkTransport {
         /// Programming preamble length (`AT+PARAMETER`'s fourth field).
         preamble: u8,
     },
+    /// Carry the link over BLE connectionless advertising, via a Linux host's
+    /// BlueZ stack (see `libs/blue`). Like LoRa, a shared broadcast medium
+    /// the mesh filters by the embedded `Mac`; unlike it, no addressing needs
+    /// configuring, since BLE advertiser addresses are already globally
+    /// distinct per controller.
+    ///
+    /// Interoperates on-air with the bare-metal BLE link an nRF52840 node
+    /// runs, so a `wayfinder-tap` host can front a terminal mesh of MCUs.
+    Ble {
+        /// BlueZ adapter to use (e.g. `hci0`). Omit to use the system's
+        /// default adapter — the right choice on a host with one controller.
+        #[serde(default)]
+        adapter: Option<String>,
+        /// How long each fragment's advertisement is held registered with
+        /// BlueZ, in milliseconds. This is the link's airtime/latency knob:
+        /// too short and a fragment can be retired before the controller ever
+        /// puts it on the air, too long and every frame pays
+        /// `advertise_dwell_ms × fragment_count` (up to 14 fragments). See
+        /// `blue::BleLinkParams::advertise_dwell` for the full trade-off.
+        #[serde(default = "LinkTransport::default_ble_advertise_dwell_ms")]
+        advertise_dwell_ms: u64,
+    },
     /// Test Link, used for testing only, will fail validation in real mode
     Test {
         /// Name of the in-process test `Switch` this link attaches to.
@@ -124,6 +146,15 @@ impl LinkTransport {
     /// The RYLR998/RYLR498's factory-default UART baud rate.
     fn default_rylr998_baud_rate() -> u32 {
         115_200
+    }
+
+    /// Default per-fragment advertising dwell: 150 ms, comfortably past
+    /// BlueZ's own ~100 ms default advertising interval so each fragment gets
+    /// at least one advertising event out. Kept in step with
+    /// `blue::BleLinkParams::DEFAULT_ADVERTISE_DWELL`, which this crate can't
+    /// reference directly — `blue` depends on `wayfinder`, not the reverse.
+    pub fn default_ble_advertise_dwell_ms() -> u64 {
+        150
     }
 }
 
@@ -816,5 +847,46 @@ preamble: 15
             panic!("expected a Rylr998 link transport");
         };
         assert_eq!(baud_rate, 57_600);
+    }
+
+    /// A `Ble` link transport needs no keys at all: the adapter defaults to
+    /// the host's default BlueZ adapter and the per-fragment dwell to a value
+    /// that outlasts BlueZ's own advertising interval.
+    #[test]
+    fn ble_link_transport_parses_with_all_defaults() {
+        let link: LinkConfig = serde_yaml::from_str("type: Ble\n").unwrap();
+        let LinkTransport::Ble {
+            adapter,
+            advertise_dwell_ms,
+        } = link.transport
+        else {
+            panic!("expected a Ble link transport");
+        };
+        assert_eq!(adapter, None);
+        assert_eq!(
+            advertise_dwell_ms,
+            LinkTransport::default_ble_advertise_dwell_ms()
+        );
+    }
+
+    /// Both `Ble` fields are overridable, so a node with several controllers
+    /// can pin one and tune its airtime.
+    #[test]
+    fn ble_link_transport_parses_explicit_adapter_and_dwell() {
+        let yaml = "\
+type: Ble
+adapter: hci1
+advertise_dwell_ms: 250
+";
+        let link: LinkConfig = serde_yaml::from_str(yaml).unwrap();
+        let LinkTransport::Ble {
+            adapter,
+            advertise_dwell_ms,
+        } = link.transport
+        else {
+            panic!("expected a Ble link transport");
+        };
+        assert_eq!(adapter.as_deref(), Some("hci1"));
+        assert_eq!(advertise_dwell_ms, 250);
     }
 }

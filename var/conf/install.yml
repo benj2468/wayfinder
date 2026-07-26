@@ -3,6 +3,7 @@ local_egress:
   device_name: wayfinder0
   ip_address: 10.0.0.1
   netmask: 255.255.255.0
+  mac_state_path: ./var/conf/wayfinder0.state
 server:
   # Authenticated, encrypted management API. Clients authenticate by their mesh
   # membership identity (RFC 7250 raw public key in the TLS handshake); only a
@@ -12,6 +13,8 @@ server:
   type: Tls
   addr: 0.0.0.0:7700
 links:
+  - type: Ble
+    advertise_dwell_ms: 250
   - type: RawL2
     interface: tailscale0
     # Wire EtherType for this mesh's frames — a free-choice transport label the

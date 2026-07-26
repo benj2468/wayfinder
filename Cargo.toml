@@ -3,9 +3,11 @@ resolver = "3"
 members = [
     "libs/rylr998",
     "libs/rylr998-sim",
+    "libs/wayfinder-link-utils",
     "libs/ieee802154",
     "libs/at86rf233",
     "libs/nrf-ieee802154",
+    "libs/blue",
     "libs/interfaces",
     "libs/batman",
     "libs/wayfinder-auth",
@@ -58,6 +60,7 @@ wayfinder-driver = { path = "./libs/wayfinder-driver" }
 wayfinder-embedded-driver = { path = "./libs/wayfinder-embedded-driver" }
 wayfinder-client = { path = "./libs/wayfinder-client" }
 rylr998 = { path = "./libs/rylr998", default-features = false }
+blue = { path = "./libs/blue" }
 
 # Third Party Dependencies
 tracing = "0.1.44"

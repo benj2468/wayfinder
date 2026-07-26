@@ -856,6 +856,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "wayfinder",
+ "wayfinder-link-utils",
  "zerocopy",
 ]
 
@@ -1147,6 +1148,15 @@ dependencies = [
  "heapless",
  "rtt-target",
  "tracing-core",
+]
+
+[[package]]
+name = "wayfinder-link-utils"
+version = "0.1.0"
+dependencies = [
+ "heapless",
+ "tracing",
+ "wayfinder",
 ]
 
 [[package]]

@@ -17,12 +17,16 @@ tokio = [
     "dep:socket2",
     "dep:libc",
     "dep:rylr998",
+    "dep:blue",
     "dep:tokio-serial",
     "dep:embedded-io-adapters",
     "dep:embedded-io-async",
     "std",
 ]
-std = ["dep:async-trait", "wayfinder/std"]
+# `blue?/std` (not `blue/std`): enabling `std` alone must not drag in the BLE
+# link and its whole BlueZ/D-Bus dependency tree — that is `tokio`'s to pull,
+# since only the tokio event loop can build the link.
+std = ["dep:async-trait", "wayfinder/std", "blue?/std"]
 
 [dependencies]
 wayfinder.workspace = true
@@ -44,6 +48,7 @@ libc = { workspace = true, optional = true }
 
 # `tokio`-only: builds the `Rylr998` link transport over a real serial port.
 rylr998 = { workspace = true, features = ["link"], optional = true }
+blue = { workspace = true, optional = true }
 tokio-serial = { workspace = true, optional = true }
 embedded-io-adapters = { workspace = true, optional = true }
 embedded-io-async = { workspace = true, optional = true }
