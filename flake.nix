@@ -133,8 +133,8 @@
               glab
               stdenv.cc.cc.lib
               probe-rs-tools
-              jdk17
-              andoidKit.androidsdk
+              # jdk17
+              # andoidKit.androidsdk
             ];
 
             buildInputs = with pkgs; [ dbus ];

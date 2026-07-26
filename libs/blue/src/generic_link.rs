@@ -1,19 +1,24 @@
-//! `LinkT` adapter carrying the mesh over BLE connectionless advertising on
-//! Android, generic over a platform-supplied [`BleAdvertiser`] rather than
-//! driving a concrete BLE stack directly.
+//! `LinkT` core carrying the mesh over BLE connectionless advertising,
+//! generic over a platform-supplied [`BleAdvertiser`] rather than driving a
+//! concrete BLE stack directly.
 //!
-//! Android's own BLE APIs (`BluetoothLeAdvertiser`/`BluetoothLeScanner`)
-//! build/parse the Manufacturer Specific Data AD structure the same way
-//! BlueZ does — from/to a raw byte payload — so this backend follows
-//! [`crate::StdBleLink`]'s shape (bare `[frag_header][body]` fragments via
-//! `frame::build_fragment`, no self-framing via `crate::ad`), not
-//! [`crate::NrfBleLink`]'s. What's different is that the actual platform
-//! call is injected rather than hard-wired: the JNI/UniFFI glue that will
-//! drive Android's BLE APIs is a later phase, so this crate stays free of
-//! any Android/JNI dependency while still being fully testable against a
-//! fake [`BleAdvertiser`] — unlike either existing backend, which each need
-//! real hardware/`bluetoothd` to exercise their I/O (see
-//! `libs/blue/CLAUDE.md`'s "Testability" section).
+//! Both host-side backends build on this: [`crate::StdBleLink`] wraps it with
+//! a `BleAdvertiser` that registers advertisements through BlueZ, and the
+//! future JNI-hosted Android node will wrap it with one driving
+//! `BluetoothLeAdvertiser` directly. Both platforms' own BLE APIs build/parse
+//! the Manufacturer Specific Data AD structure the same way — from/to a raw
+//! byte payload — so this core hands its `BleAdvertiser` the bare
+//! `[frag_header][body]` blob via `frame::build_fragment`, no self-framing via
+//! `crate::ad`, unlike [`crate::NrfBleLink`]. Each backend still owns its own
+//! *receive* side (feeding this core's report channel from BlueZ's D-Bus scan
+//! events, or from Android's scan callback) since that plumbing is
+//! platform-specific in a way advertising a pre-built fragment isn't.
+//!
+//! Keeping the actual platform advertise call injected rather than hard-wired
+//! is what makes this fully unit-testable against a fake [`BleAdvertiser`],
+//! with no `bluetoothd`/JNI dependency in this crate at all — unlike
+//! [`crate::NrfBleLink`], which needs real SoftDevice hardware to exercise its
+//! I/O (see `libs/blue/CLAUDE.md`'s "Testability" section).
 
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -36,26 +41,25 @@ use crate::frame::RawReport;
 use crate::frame::Reassembler;
 use crate::frame::{self};
 
-/// Depth of the queue between the platform's scan callback and `recv`'s
-/// consumer. Not derived from a hard limit — a small multiple of what one
-/// `recv` call can plausibly fall behind by; capacity pressure drops the
-/// newest report rather than blocking the callback, matching
-/// `StdBleLink`'s policy (`libs/blue/src/std_link.rs`).
+/// Depth of the queue between the platform's scan callback/scan task and
+/// `recv`'s consumer. Not derived from a hard limit — a small multiple of
+/// what one `recv` call can plausibly fall behind by; capacity pressure drops
+/// the newest report rather than blocking the producer, matching every other
+/// link in this crate.
 const REPORT_QUEUE_DEPTH: usize = 32;
 
 /// Platform hook for putting one already-built fragment on the air.
 ///
-/// Implemented by the platform glue driving Android's `BluetoothLeAdvertiser`
-/// (a later phase, not part of this crate yet): advertise `fragment` as
-/// manufacturer-specific data tagged with `crate::ad::MESH_COMPANY_ID`, hold
-/// it on air for whatever dwell the platform layer decides, then stop.
-/// Unlike `StdBleLink`'s `advertise_dwell`, dwell timing is not a parameter
-/// here — Android's advertising-set lifecycle is owned by the platform side
-/// of this seam, not this crate, so it has no opinion on it.
+/// Implemented per backend: [`crate::StdBleLink`]'s registers a BlueZ
+/// advertisement and holds it for `advertise_dwell`; a future Android
+/// implementation would drive `BluetoothLeAdvertiser` the same way. Either
+/// way: advertise `fragment` as manufacturer-specific data tagged with
+/// `crate::ad::MESH_COMPANY_ID`, hold it on air for however long the
+/// implementation decides, then stop.
 ///
-/// Generic (not a trait object) so [`AndroidBleLink`] stays fully
-/// host-testable against a fake implementation, with no JNI/Android
-/// dependency in this crate.
+/// Generic (not a trait object) so [`BleLink`] stays fully host-testable
+/// against a fake implementation, with no backend-specific dependency in this
+/// module.
 #[allow(async_fn_in_trait)]
 pub trait BleAdvertiser: Send {
     /// Broadcast `fragment` — the bare `[frag_header][body]` blob from
@@ -64,39 +68,44 @@ pub trait BleAdvertiser: Send {
     async fn advertise(&self, fragment: &[u8]) -> Result<(), LinkError>;
 }
 
-/// Cloneable handle the platform's BLE scan callback feeds observed
-/// mesh-tagged advertisements into. Kept separate from [`AndroidBleLink`]
-/// itself since the scan callback and the `LinkT` consumer (the driver's
-/// link array) are expected to live on opposite sides of the eventual JNI
-/// boundary.
+/// Cloneable handle a backend's scan task/callback feeds observed
+/// mesh-tagged advertisements into. Kept separate from [`BleLink`] itself
+/// since the scan producer and the `LinkT` consumer (the driver's link
+/// array) can live on opposite sides of an async task boundary (BlueZ's
+/// background scan task) or, eventually, a JNI boundary (Android's scan
+/// callback).
 #[derive(Clone)]
-pub struct AndroidBleReportSink {
+pub struct BleReportSink {
     tx: mpsc::Sender<RawReport>,
 }
 
-impl AndroidBleReportSink {
+impl BleReportSink {
     /// Submit one observed advertisement's mesh-tagged manufacturer data.
     /// Drops the report (logging at `trace!`) rather than blocking if the
-    /// queue between the scan callback and [`LinkT::recv`] is full —
-    /// backpressure on a lossy, fire-and-forget medium, matching
-    /// `StdBleLink`'s policy.
+    /// queue between the scan producer and [`LinkT::recv`] is full —
+    /// backpressure on a lossy, fire-and-forget medium.
     pub fn submit(&self, addr: BleAddr, rssi: Option<i16>, fragment: &[u8]) {
         let report = RawReport::new(addr, rssi, fragment);
         if let Err(TrySendError::Full(dropped)) = self.tx.try_send(report) {
             trace!(addr = ?dropped.addr, "drop: report queue full");
         }
     }
+
+    /// Whether this sink's [`BleLink`] (and thus its `recv` consumer) has
+    /// been dropped, so a backend's scan producer knows to stop feeding it.
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
 }
 
-/// A [`LinkT`] carrying the mesh over BLE connectionless advertising on
-/// Android, generic over a [`BleAdvertiser`] that performs the actual
-/// platform advertise call. See the module doc comment for how this relates
-/// to [`crate::StdBleLink`].
-pub struct AndroidBleLink<A: BleAdvertiser> {
+/// A [`LinkT`] carrying the mesh over BLE connectionless advertising, generic
+/// over a [`BleAdvertiser`] that performs the actual platform advertise call.
+/// See the module doc comment for how backends build on this.
+pub struct BleLink<A: BleAdvertiser> {
     /// Platform hook this link's `send` calls once per fragment.
     advertiser: A,
     /// Mesh-tagged advertisements submitted via this link's
-    /// [`AndroidBleReportSink`].
+    /// [`BleReportSink`].
     report_rx: mpsc::Receiver<RawReport>,
     /// Fragmentation message-id counter, incremented once per `send()` call.
     msg_id_ctr: u8,
@@ -109,10 +118,10 @@ pub struct AndroidBleLink<A: BleAdvertiser> {
     rx_frame: [u8; MAX_REASSEMBLED_LEN],
 }
 
-impl<A: BleAdvertiser> AndroidBleLink<A> {
+impl<A: BleAdvertiser> BleLink<A> {
     /// Build a `LinkT`-ready handle wrapping `advertiser`, along with the
-    /// [`AndroidBleReportSink`] the platform's scan callback feeds.
-    pub fn new(advertiser: A) -> (Self, AndroidBleReportSink) {
+    /// [`BleReportSink`] a backend's scan producer feeds.
+    pub fn new(advertiser: A) -> (Self, BleReportSink) {
         let (tx, rx) = mpsc::channel(REPORT_QUEUE_DEPTH);
         (
             Self {
@@ -123,7 +132,7 @@ impl<A: BleAdvertiser> AndroidBleLink<A> {
                 tx_fragment: [0u8; MAX_FRAGMENT_BYTES],
                 rx_frame: [0u8; MAX_REASSEMBLED_LEN],
             },
-            AndroidBleReportSink { tx },
+            BleReportSink { tx },
         )
     }
 
@@ -135,7 +144,7 @@ impl<A: BleAdvertiser> AndroidBleLink<A> {
     }
 }
 
-impl<A: BleAdvertiser> LinkT for AndroidBleLink<A> {
+impl<A: BleAdvertiser> LinkT for BleLink<A> {
     async fn send(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> Result<usize, LinkError> {
         let (frame_bytes, frame_len) = frame::assemble_frame(origin, data)?;
         let count = frame::fragment_count(frame_len)?;
@@ -160,7 +169,7 @@ impl<A: BleAdvertiser> LinkT for AndroidBleLink<A> {
     async fn recv<'a>(&'a mut self) -> Result<Received<'a>, LinkError> {
         // Keep consuming physical reports, feeding each into the
         // reassembler, until *some* message completes — not necessarily the
-        // fragment just read, mirroring `StdBleLink::recv`.
+        // fragment just read.
         loop {
             let Some(report) = self.report_rx.recv().await else {
                 // The sink is gone, so no further report will ever arrive:
@@ -209,9 +218,9 @@ mod tests {
     }
 
     /// Records every fragment handed to `advertise`, optionally failing
-    /// instead — the seam Kotlin will later implement for real, stood in for
-    /// here so `AndroidBleLink`'s logic is testable without any Android/JNI
-    /// dependency.
+    /// instead — the seam a real backend (BlueZ, and later Android)
+    /// implements for real, stood in for here so `BleLink`'s logic is
+    /// testable without any `bluetoothd`/JNI dependency.
     #[derive(Clone, Default)]
     struct FakeAdvertiser {
         sent: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -244,7 +253,7 @@ mod tests {
     #[tokio::test]
     async fn send_advertises_each_fragment_in_order() {
         let advertiser = FakeAdvertiser::default();
-        let (mut link, _sink) = AndroidBleLink::new(advertiser.clone());
+        let (mut link, _sink) = BleLink::new(advertiser.clone());
 
         let payload: Vec<u8> = (0..30).collect();
         let frame_len = link
@@ -281,7 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_propagates_advertiser_failure() {
-        let (mut link, _sink) = AndroidBleLink::new(FakeAdvertiser::failing());
+        let (mut link, _sink) = BleLink::new(FakeAdvertiser::failing());
         let payload = [0xaa; 3];
 
         let err = link
@@ -300,7 +309,7 @@ mod tests {
 
     #[tokio::test]
     async fn recv_reassembles_single_fragment_report() {
-        let (mut link, sink) = AndroidBleLink::new(FakeAdvertiser::default());
+        let (mut link, sink) = BleLink::new(FakeAdvertiser::default());
 
         let payload = [0xde, 0xad];
         let (frame_bytes, frame_len) = frame::assemble_frame(
@@ -326,7 +335,7 @@ mod tests {
 
     #[tokio::test]
     async fn recv_reassembles_multi_fragment_report() {
-        let (mut link, sink) = AndroidBleLink::new(FakeAdvertiser::default());
+        let (mut link, sink) = BleLink::new(FakeAdvertiser::default());
 
         let payload: Vec<u8> = (0..30).collect();
         let (frame_bytes, frame_len) = frame::assemble_frame(
@@ -359,7 +368,7 @@ mod tests {
 
     #[tokio::test]
     async fn recv_skips_malformed_fragment() {
-        let (mut link, sink) = AndroidBleLink::new(FakeAdvertiser::default());
+        let (mut link, sink) = BleLink::new(FakeAdvertiser::default());
 
         // Malformed: count == 0 is rejected by `parse_fragment`.
         sink.submit(addr(1), None, &[0, 0]);
@@ -384,7 +393,7 @@ mod tests {
 
     #[tokio::test]
     async fn recv_returns_receive_failed_when_sink_dropped() {
-        let (mut link, sink) = AndroidBleLink::new(FakeAdvertiser::default());
+        let (mut link, sink) = BleLink::new(FakeAdvertiser::default());
         drop(sink);
 
         assert!(matches!(link.recv().await, Err(LinkError::ReceiveFailed)));

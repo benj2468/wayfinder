@@ -19,12 +19,12 @@ name = "wayfinder-pixel"
 path = "src/main.rs"
 
 [dependencies]
-# The seam this binary exists to eventually host for real — `AndroidBleLink`/
+# The seam this binary exists to eventually host for real — `BleLink`/
 # `BleAdvertiser`, see `libs/blue/CLAUDE.md` — imported here so this crate
 # actually proves the `android` feature links against the NDK's libc before
 # any JNI glue exists. `android` needs only `tokio`, no Android/JNI
 # dependency yet.
-blue = { path = "../../libs/blue", features = ["android"] }
+blue = { path = "../../libs/blue", features = ["std"] }
 # The bare `LinkT`/`interfaces` surface `blue` itself builds on;
 # `default-features = false` keeps std/alloc off, matching how `blue`
 # depends on it.
