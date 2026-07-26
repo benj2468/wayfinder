@@ -1,0 +1,15 @@
+[package]
+name = "wayfinder-link-utils"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+heapless.workspace = true
+tracing = { version = "0.1.44", default-features = false }
+
+# Depended on by path (not workspace inheritance) so `default-features = false`
+# keeps `LinkMetrics` available without pulling `alloc`/`std`.
+wayfinder = { path = "../wayfinder", default-features = false }

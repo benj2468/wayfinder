@@ -6,6 +6,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         protobuf-compiler \
         curl \
+        pkg-config \
+        libdbus-1-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the LLVM tools preview required for coverage

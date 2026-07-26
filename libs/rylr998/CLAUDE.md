@@ -24,46 +24,23 @@ The module's AT interface caps an on-air frame at `MAX_FRAME_LEN` (180 bytes:
 240 base64 chars, since payload is base64-encoded — a URL-safe alphabet,
 `=`-padded, chosen so no comma/CR/LF can appear in the AT data field, same
 constraint hex satisfied before it, but at a 4:3 rather than 2:1 expansion).
-Real mesh frames — especially authenticated OGMs — routinely exceed that, so
-`link.rs`'s `send`/`recv` split and reassemble transparently; nothing above
-`LinkT` (the router, the engine) ever observes that a frame was fragmented.
+Real mesh frames — especially authenticated OGMs — routinely exceed that,
+so `link.rs`'s `send`/`recv` split and reassemble transparently; nothing
+above `LinkT` (the router, the engine) ever observes that a frame was
+fragmented. `frag.rs` here is a thin adapter instantiating the shared wire
+format/reassembly machinery in `libs/wayfinder-link-utils` (see that crate's
+`CLAUDE.md` for the wire format, the reassembly-key genericity, and the
+eviction policy) with this driver's own constants (`FRAG_PAYLOAD` = 178,
+keyed by the RYLR module's 16-bit `AT+ADDRESS` — **meaning distinct
+physical nodes must be configured with distinct `AT+ADDRESS` values**, since
+unlike BLE this medium doesn't assign addresses itself).
 
-**Wire format.** Each fragment is a 2-byte header prefixed to a slice of the
-`[dst][src][protocol][payload]` bytes, before base64-encoding (header and
-slice are concatenated *before* encoding, in one `push_base64` call — base64
-packs bits in 3-byte groups, so encoding them separately would each pad to
-its own group boundary and produce bytes a single `decode_base64` call
-couldn't reverse):
-`[msg_id: u8][index<<4 | count: u8]`. `count` is 1..=15 (a 4-bit field);
-non-final fragments always carry exactly `FRAG_PAYLOAD` (178) frame-content
-bytes, so a fragment's offset is always `index * FRAG_PAYLOAD` — reassembly
-needs no per-fragment length bookkeeping, only the last fragment is short.
-`send` always fragments, even a 1-fragment message, so there is exactly one
-receive code path.
-
-**Reassembly key and its deployment requirement.** `frag::Reassembler` keys
-in-flight messages by `(sender's RYLR 16-bit address, msg_id)` rather than the
-mesh `Mac`, since the module already reports the sender's address on every
-`+RCV` line — this avoids duplicating the 6-byte `Mac` into every fragment.
-**This means distinct physical nodes must be configured with distinct
-`AT+ADDRESS` values** (e.g. derived from the low 16 bits of the node's mesh
-`Mac`); nodes sharing an address would have their fragments cross-contaminate
-in each others' reassembly slots. This is the same class of trust assumption
-the mesh already makes for MAC-based filtering.
-
-**Eviction, not timeout.** The reassembly table (`MAX_REASSEMBLIES` = 4
-concurrent in-flight messages) has no wall clock to expire stale partial
-state — `no_std` has none available. Instead it evicts the oldest in-flight
-message when a new key arrives and the table is full, mirroring the
-capacity-bound eviction `OgmAuth.neighbors` uses in `wayfinder::auth`. A
-message that never completes (a lost fragment) simply occupies a slot until
-capacity pressure reclaims it; acceptable on a lossy, fire-and-forget medium.
-
-**`recv`'s control flow.** `LinkT::recv` loops consuming physical `+RCV`
-packets, feeding each into the reassembler, until *some* message completes —
-not necessarily the fragment just read. This adds no new starvation risk
-versus before: every iteration still awaits real serial I/O, exactly as
-`listen_for_packet` already did.
+One RYLR998-specific wrinkle `wayfinder-link-utils` doesn't need to know
+about: base64 encoding. The frag header and frame-content slice are
+concatenated *before* encoding, in one `push_base64` call — base64 packs
+bits in 3-byte groups, so encoding them separately would each pad to its own
+group boundary and produce bytes a single `decode_base64` call couldn't
+reverse.
 
 Two related, unrelated-looking fixes shipped alongside this:
 

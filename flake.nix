@@ -122,8 +122,11 @@
               probe-rs-tools
             ];
 
+            buildInputs = with pkgs; [ dbus ];
+
             nativeBuildInputs = with pkgs; [
               protobuf
+              pkg-config
             ];
 
             shellHook = ''

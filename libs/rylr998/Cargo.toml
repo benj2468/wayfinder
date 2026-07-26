@@ -13,7 +13,7 @@ default = ["link"]
 # dependency-light; enabling it pulls in `wayfinder` (for the `LinkT` trait and
 # the mesh frame types) and `zerocopy`.  The impl uses the native `async fn`
 # trait directly, so it works in a `no_std` executor.
-link = ["dep:wayfinder", "dep:zerocopy"]
+link = ["dep:wayfinder", "dep:zerocopy", "dep:wayfinder-link-utils"]
 
 [dependencies]
 # Pinned directly (not workspace inheritance, which can't override
@@ -29,6 +29,10 @@ tracing = { version = "0.1.44", default-features = false }
 # keeps the bare `LinkT` trait available without pulling `alloc`/`std`.
 wayfinder = { path = "../wayfinder", default-features = false, optional = true }
 zerocopy = { workspace = true, optional = true }
+# Shared small-MTU fragmentation/reassembly machinery (see
+# `libs/wayfinder-link-utils`); only needed by the `link` feature's `frag`
+# adapter.
+wayfinder-link-utils = { path = "../wayfinder-link-utils", optional = true }
 
 [dev-dependencies]
 tokio-serial = "5.4"

@@ -45,3 +45,6 @@ result
 
 # Target deployment
 buildkitd.toml
+
+# Wayfinder specifics
+var/conf/wayfinder0.state

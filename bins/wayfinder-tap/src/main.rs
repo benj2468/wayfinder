@@ -32,11 +32,13 @@ use wayfinder::interfaces::frame::Mac;
 use wayfinder::wayfinder_auth::Keypair;
 use wayfinder_driver::AuthSnapshotRx;
 use wayfinder_driver::AuthSnapshotTx;
+use wayfinder_driver::BleLinkParams;
 use wayfinder_driver::Driver;
 use wayfinder_driver::QueryRx;
 use wayfinder_driver::QueryTx;
 use wayfinder_driver::Rylr998LinkParams;
 use wayfinder_driver::bind_tcp_server;
+use wayfinder_driver::build_ble_link;
 use wayfinder_driver::build_raw_ip_link;
 use wayfinder_driver::build_raw_l2_link;
 use wayfinder_driver::build_rylr998_link;
@@ -215,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let dev = builder
         .build_async()
-        .context("failed to craete TAP device")?;
+        .context("failed to create TAP device")?;
 
     tracing::info!(
         "Starting wayfinder with MAC address: {:?}",
@@ -271,6 +273,18 @@ async fn main() -> anyhow::Result<()> {
                         bandwidth_khz,
                         coding_rate_denominator,
                         preamble,
+                    })
+                    .await?,
+                );
+            }
+            LinkTransport::Ble {
+                adapter,
+                advertise_dwell_ms,
+            } => {
+                interfaces.push(
+                    build_ble_link(BleLinkParams {
+                        adapter,
+                        advertise_dwell: std::time::Duration::from_millis(advertise_dwell_ms),
                     })
                     .await?,
                 );

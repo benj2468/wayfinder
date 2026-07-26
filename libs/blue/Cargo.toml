@@ -1,0 +1,82 @@
+[package]
+name = "blue"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# The host-side (Linux/BlueZ) `LinkT`. Off by default so the crate stays
+# `no_std` for the firmware build.
+std = [
+    "dep:bluer",
+    "dep:tokio",
+    "dep:futures",
+    "dep:anyhow",
+]
+# Bridges this crate onto the real nRF52840 BLE radio via `nrf-softdevice`.
+# Off by default: `nrf-softdevice`'s build script links a precompiled
+# Nordic SoftDevice binary and needs a real embedded target (there is no
+# host-side stub) — so unlike `nrf-ieee802154` (plain register definitions,
+# builds fine on host), this crate cannot be a normal workspace member with
+# it as an unconditional dependency. Gating it keeps the pure
+# AD-marker/fragmentation glue host-buildable and testable like every other
+# radio-driver crate here; only `bins/wayfinder-nrf52840` (building for
+# `thumbv7em-none-eabihf`) enables it.
+hardware = [
+    "dep:nrf-softdevice",
+    "dep:embassy-executor",
+    "dep:embassy-sync",
+    "dep:static_cell",
+]
+
+[dependencies]
+# Depended on by path (not workspace inheritance) so `default-features = false`
+# keeps the bare `LinkT` trait available without pulling `alloc`/`std`.
+wayfinder = { path = "../wayfinder", default-features = false }
+# Shared small-MTU fragmentation/reassembly machinery (see
+# `libs/wayfinder-link-utils`), instantiated here with a BLE advertiser
+# address as the reassembly key.
+wayfinder-link-utils = { path = "../wayfinder-link-utils" }
+zerocopy.workspace = true
+tracing = { version = "0.1.44", default-features = false }
+
+# Host-only (`std` feature). `anyhow` among them: it is `std`-by-default and
+# would break the `thumbv7em-none-eabihf` firmware build if pulled in
+# unconditionally — the `no_std` path reports bring-up failures as `BleError`
+# instead.
+bluer = { version = "0.17.4", features = ["bluetoothd"], optional = true }
+tokio = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+
+
+# Nordic's closed-source SoftDevice Bluetooth stack, wrapped in an async Rust
+# API — see `libs/blue/CLAUDE.md` for why this is the only way to drive
+# BLE on this chip, and why `nrf-sdc`/`nrf-mpsl` (this crate's original
+# choice) don't work here: they only resolve against `embassy-nrf 0.7` on
+# crates.io, a major version behind the rest of this firmware, while
+# `nrf-softdevice` has no `embassy-nrf` dependency at all (it manages its own
+# peripheral/interrupt access), so it coexists with this board's
+# `embassy-nrf` version cleanly. `s140` is the softdevice variant supporting
+# both central and peripheral roles concurrently, which this crate needs
+# (broadcast via advertising, receive via scanning). Optional; see the
+# `hardware` feature above.
+nrf-softdevice = { git = "https://github.com/embassy-rs/nrf-softdevice.git", features = [
+    "nrf52840",
+    "s140",
+    "ble-peripheral",
+    "ble-central",
+], optional = true }
+# Runs the SoftDevice's background event-pump/scan-loop tasks this crate's
+# construction spawns.
+embassy-executor = { version = "0.10", optional = true }
+# Pinned to match `nrf-softdevice`'s own transitive version (0.5), avoiding a
+# second copy of the crate in the dependency graph — only used here for the
+# `Channel` bridging the SoftDevice's synchronous scan callback to `recv`.
+embassy-sync = { version = "0.8", optional = true }
+# `'static` promotion for the report queue, constructed once at
+# `NrfBleLink::new` and shared with the spawned scan task.
+static_cell = { version = "2", optional = true }
