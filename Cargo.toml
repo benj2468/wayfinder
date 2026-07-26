@@ -23,7 +23,6 @@ members = [
     "libs/wayfinder-embedded-log",
     "libs/wayfinder-test",
     "libs/wayfinder-client",
-    "libs/wayfinder-py",
     "bins/wayfinder-tap",
     "bins/wayfinder-tui",
     "bins/wayfinder-ctl",

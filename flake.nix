@@ -78,11 +78,12 @@
           androidComposition = pkgs.androidenv.composeAndroidPackages {
             inherit ndkVersion;
             includeNDK = true;
-            platformVersions = [
-              "33"
-              "34"
+            abiVersions = [
+              "arm64-v8a"
             ];
-            buildToolsVersions = [ "34.0.0" ];
+            platformVersions = [
+              "latest"
+            ];
           };
 
           # Python interpreter with the integration-test deps (pytest). Used by
