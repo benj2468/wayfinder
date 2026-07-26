@@ -1,0 +1,11 @@
+# Maximum width of each line
+max_width = 100
+
+# Format code snippets inside documentation comments
+format_code_in_doc_comments = true
+
+# Merge imports from the same crate into a single use statement
+imports_granularity = "Item"
+
+# Force standard 2024 style guidelines
+style_edition = "2024"

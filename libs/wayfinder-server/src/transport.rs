@@ -7,23 +7,30 @@
 use std::net::SocketAddr;
 
 use bytes::Bytes;
-use futures::{SinkExt, StreamExt};
+use futures::SinkExt;
+use futures::StreamExt;
 use prost::Message;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::{
-    net::TcpListener,
-    sync::{mpsc, oneshot},
-};
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
+use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio_util::codec::Framed;
+use tokio_util::codec::LengthDelimitedCodec;
 use wayfinder::interfaces::frame::Mac;
-use wayfinder::wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
-use wayfinder_protos::wayfinder_v1alpha::{
-    Empty, ErrorResponse, WayfinderRequest, WayfinderResponse,
-    wayfinder_request::Request as ReqKind, wayfinder_response::Response as RespKind,
-};
+use wayfinder::wayfinder_auth::Keypair;
+use wayfinder::wayfinder_auth::MembershipCert;
+use wayfinder::wayfinder_auth::TrustAnchor;
+use wayfinder_protos::wayfinder_v1alpha::Empty;
+use wayfinder_protos::wayfinder_v1alpha::ErrorResponse;
+use wayfinder_protos::wayfinder_v1alpha::WayfinderRequest;
+use wayfinder_protos::wayfinder_v1alpha::WayfinderResponse;
+use wayfinder_protos::wayfinder_v1alpha::wayfinder_request::Request as ReqKind;
+use wayfinder_protos::wayfinder_v1alpha::wayfinder_response::Response as RespKind;
 
-use crate::{MgmtAccess, decide_access};
+use crate::MgmtAccess;
+use crate::decide_access;
 
 /// Sender half of the channel server tasks use to forward queries to the loop.
 pub type QueryTx = mpsc::Sender<(WayfinderRequest, oneshot::Sender<WayfinderResponse>)>;
@@ -399,10 +406,13 @@ mod tests {
 
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
-    use wayfinder_protos::wayfinder_v1alpha::{
-        AuthenticateRequest, GetNodeInfoRequest, NodeInfo, WayfinderRequest, WayfinderResponse,
-        wayfinder_request::Request, wayfinder_response::Response,
-    };
+    use wayfinder_protos::wayfinder_v1alpha::AuthenticateRequest;
+    use wayfinder_protos::wayfinder_v1alpha::GetNodeInfoRequest;
+    use wayfinder_protos::wayfinder_v1alpha::NodeInfo;
+    use wayfinder_protos::wayfinder_v1alpha::WayfinderRequest;
+    use wayfinder_protos::wayfinder_v1alpha::WayfinderResponse;
+    use wayfinder_protos::wayfinder_v1alpha::wayfinder_request::Request;
+    use wayfinder_protos::wayfinder_v1alpha::wayfinder_response::Response;
 
     use super::*;
 

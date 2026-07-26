@@ -6,7 +6,8 @@ use alloc::vec::Vec;
 use core::net::IpAddr;
 use core::net::Ipv4Addr;
 use core::net::SocketAddr;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 /// Per-link adaptive OGM emission bounds (Trickle backoff, RFC 6206), supplied
 /// at runtime by each link's configuration so a fast LAN link and a slow LoRa
@@ -129,7 +130,8 @@ impl LinkTransport {
 // The per-link participation flags live in the allocation-free core so the
 // router can gate traffic on them on every deployment; this crate's config
 // layer re-exports the type so `wayfinder::config::LinkFeatures` keeps resolving.
-pub use crate::features::{KeepAliveConfig, LinkFeatures};
+pub use crate::features::KeepAliveConfig;
+pub use crate::features::LinkFeatures;
 
 /// A single mesh interface: its transport carrier, its per-link OGM backoff
 /// bounds, and its per-link participation [`features`](LinkConfig::features).

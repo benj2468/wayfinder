@@ -15,19 +15,26 @@
 //! [`drain_all`]: TestRouter::drain_all
 
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use interfaces::{
-    frame::{LinkFrame, MAX_LINK_FRAME_LEN, Mac},
-    link::LinkMetrics,
-};
+use interfaces::frame::LinkFrame;
+use interfaces::frame::MAX_LINK_FRAME_LEN;
+use interfaces::frame::Mac;
+use interfaces::link::LinkMetrics;
 use tokio::sync::mpsc;
 use wayfinder::CentralRouter;
 use wayfinder::config::TrickleConfig;
-use wayfinder_driver::{Driver, DynLinkT, FrameIo, Link, QueryRx, QueryTx};
-use zerocopy::{FromBytes, IntoBytes};
+use wayfinder_driver::Driver;
+use wayfinder_driver::DynLinkT;
+use wayfinder_driver::FrameIo;
+use wayfinder_driver::Link;
+use wayfinder_driver::QueryRx;
+use wayfinder_driver::QueryTx;
+use zerocopy::FromBytes;
+use zerocopy::IntoBytes;
 
 use crate::switch::PortComms;
 

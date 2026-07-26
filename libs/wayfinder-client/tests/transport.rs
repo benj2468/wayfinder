@@ -11,17 +11,26 @@
 
 use std::net::SocketAddr;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use wayfinder_client::Client;
-use wayfinder_protos::service::{
-    EgressDecisionData, InterfaceThroughputData, KeepAliveEntryData, LinkFeaturesEntryData,
-    LinkQualityEntryData, NeighborPathData, NodeMetricsData, OgmScheduleEntryData,
-    RouteResolutionData, RoutingEntryData, RuntimeConfigData, TableOccupancyData,
-    WayfinderDataProvider, WayfinderService,
-};
-use wayfinder_protos::wayfinder_v1alpha::{
-    WayfinderRequest, WayfinderResponse, resolve_route_response::Egress,
-};
+use wayfinder_protos::service::EgressDecisionData;
+use wayfinder_protos::service::InterfaceThroughputData;
+use wayfinder_protos::service::KeepAliveEntryData;
+use wayfinder_protos::service::LinkFeaturesEntryData;
+use wayfinder_protos::service::LinkQualityEntryData;
+use wayfinder_protos::service::NeighborPathData;
+use wayfinder_protos::service::NodeMetricsData;
+use wayfinder_protos::service::OgmScheduleEntryData;
+use wayfinder_protos::service::RouteResolutionData;
+use wayfinder_protos::service::RoutingEntryData;
+use wayfinder_protos::service::RuntimeConfigData;
+use wayfinder_protos::service::TableOccupancyData;
+use wayfinder_protos::service::WayfinderDataProvider;
+use wayfinder_protos::service::WayfinderService;
+use wayfinder_protos::wayfinder_v1alpha::WayfinderRequest;
+use wayfinder_protos::wayfinder_v1alpha::WayfinderResponse;
+use wayfinder_protos::wayfinder_v1alpha::resolve_route_response::Egress;
 
 /// Render a 6-byte identifier as a colon-delimited MAC, else as plain hex.
 fn format_mac(bytes: &[u8]) -> String {

@@ -27,11 +27,17 @@ pub use file::FileStore;
 mod flash;
 
 #[cfg(feature = "flash")]
-pub use flash::{FlashError, FlashStore};
+pub use flash::FlashError;
+#[cfg(feature = "flash")]
+pub use flash::FlashStore;
 
 mod persisted;
 
-pub use persisted::{Codec, LoadError, PersistError, PersistOutcome, Persisted};
+pub use persisted::Codec;
+pub use persisted::LoadError;
+pub use persisted::PersistError;
+pub use persisted::PersistOutcome;
+pub use persisted::Persisted;
 
 /// Durable, atomic single-blob storage.
 ///

@@ -12,16 +12,29 @@
 #![no_main]
 
 use embassy_executor::Spawner;
-use embassy_stm32::gpio::{Level, Output, Speed};
-use embassy_stm32::usart::{BufferedUart, Config as UartConfig};
-use embassy_stm32::{bind_interrupts, peripherals, usart};
-use embassy_time::{Duration as EmbassyDuration, Instant, Timer};
+use embassy_stm32::bind_interrupts;
+use embassy_stm32::gpio::Level;
+use embassy_stm32::gpio::Output;
+use embassy_stm32::gpio::Speed;
+use embassy_stm32::peripherals;
+use embassy_stm32::usart;
+use embassy_stm32::usart::BufferedUart;
+use embassy_stm32::usart::Config as UartConfig;
+use embassy_time::Duration as EmbassyDuration;
+use embassy_time::Instant;
+use embassy_time::Timer;
 use embedded_alloc::LlffHeap as Heap;
 use panic_halt as _;
-use rylr998::{Bandwidth, CodingRate, LoraError, RylrClient, SpreadingFactory};
+use rylr998::Bandwidth;
+use rylr998::CodingRate;
+use rylr998::LoraError;
+use rylr998::RylrClient;
+use rylr998::SpreadingFactory;
 use tracing::warn;
 use wayfinder::interfaces::frame::Mac;
-use wayfinder_embedded_driver::{Clock, Driver, TrickleParams};
+use wayfinder_embedded_driver::Clock;
+use wayfinder_embedded_driver::Driver;
+use wayfinder_embedded_driver::TrickleParams;
 
 #[global_allocator]
 static HEAP: Heap = Heap::empty();

@@ -25,10 +25,13 @@ use std::sync::Arc;
 
 use rustls::DigitallySignedStruct;
 use rustls::client::danger::HandshakeSignatureValid;
-use rustls::crypto::{WebPkiSupportedAlgorithms, ring, verify_tls13_signature_with_raw_key};
-use rustls::pki_types::{
-    CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, SubjectPublicKeyInfoDer,
-};
+use rustls::crypto::WebPkiSupportedAlgorithms;
+use rustls::crypto::ring;
+use rustls::crypto::verify_tls13_signature_with_raw_key;
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::PrivateKeyDer;
+use rustls::pki_types::PrivatePkcs8KeyDer;
+use rustls::pki_types::SubjectPublicKeyInfoDer;
 use rustls::sign::CertifiedKey;
 
 /// Fixed DER prefix of a PKCS#8 v1 Ed25519 private key, immediately followed by

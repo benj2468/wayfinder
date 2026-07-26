@@ -1,5 +1,8 @@
 use interfaces::frame::Mac;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::FromBytes;
+use zerocopy::Immutable;
+use zerocopy::IntoBytes;
+use zerocopy::KnownLayout;
 
 /// EtherType identifying BATMAN frames on the wire (batman-adv's `ETH_P_BATMAN`).
 pub const ETH_P_BATMAN: u16 = 0x4305;

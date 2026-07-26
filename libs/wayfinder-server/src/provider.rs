@@ -15,7 +15,9 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use wayfinder_protos::service::{CsrOutcome, IssuedCertData, PendingCsrData};
+use wayfinder_protos::service::CsrOutcome;
+use wayfinder_protos::service::IssuedCertData;
+use wayfinder_protos::service::PendingCsrData;
 
 /// A mesh certificate authority, as seen by the management-API layer.
 ///

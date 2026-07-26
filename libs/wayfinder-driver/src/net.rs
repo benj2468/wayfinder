@@ -2,7 +2,9 @@
 
 use std::net::SocketAddr;
 
-use tokio::{net::UdpSocket, net::UnixDatagram, task::JoinSet};
+use tokio::net::UdpSocket;
+use tokio::net::UnixDatagram;
+use tokio::task::JoinSet;
 
 use wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN;
 use wayfinder::link::DynLinkT;

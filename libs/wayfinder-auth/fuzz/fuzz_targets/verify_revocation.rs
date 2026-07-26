@@ -4,7 +4,9 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use wayfinder_auth::{Keypair, RevocationRecord, TrustAnchor};
+use wayfinder_auth::Keypair;
+use wayfinder_auth::RevocationRecord;
+use wayfinder_auth::TrustAnchor;
 use zerocopy::FromBytes;
 
 fuzz_target!(|data: &[u8]| {

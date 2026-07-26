@@ -4,7 +4,9 @@
 //! over an attacker-controlled OGM tail.
 #![no_main]
 
-use batman::wire::{TvlvType, find_tvlv, iter_tvlv};
+use batman::wire::TvlvType;
+use batman::wire::find_tvlv;
+use batman::wire::iter_tvlv;
 use libfuzzer_sys::fuzz_target;
 
 const TYPES: [TvlvType; 4] = [

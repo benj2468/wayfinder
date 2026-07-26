@@ -8,7 +8,8 @@ use std::time::Duration;
 use clap::Parser;
 use embedded_io_adapters::tokio_1::FromTokio;
 use rylr998::RylrClient;
-use rylr998_cli::{Cli, run_command};
+use rylr998_cli::Cli;
+use rylr998_cli::run_command;
 use tokio_serial::SerialPortBuilderExt;
 use tracing_subscriber::EnvFilter;
 

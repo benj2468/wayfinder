@@ -5,15 +5,21 @@
 //! enrollment requests.  Embedded nodes never link this — they only verify
 //! against a trust anchor.
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use wayfinder::config::ProviderConfig;
 use wayfinder::interfaces::frame::Mac;
-use wayfinder_auth::{Authority, MembershipCert};
-use wayfinder_protos::service::{CsrOutcome, EnrollData, IssuedCertData, PendingCsrData};
+use wayfinder_auth::Authority;
+use wayfinder_auth::MembershipCert;
+use wayfinder_protos::service::CsrOutcome;
+use wayfinder_protos::service::EnrollData;
+use wayfinder_protos::service::IssuedCertData;
+use wayfinder_protos::service::PendingCsrData;
 use zerocopy::IntoBytes;
 
 use crate::persistence::CaLog;
@@ -482,7 +488,10 @@ impl MeshAuthority for CertAuthority {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wayfinder_auth::{Keypair, MembershipCert, RevocationRecord, TrustAnchor};
+    use wayfinder_auth::Keypair;
+    use wayfinder_auth::MembershipCert;
+    use wayfinder_auth::RevocationRecord;
+    use wayfinder_auth::TrustAnchor;
     use zerocopy::FromBytes;
 
     fn node_keys(seed: u8) -> ([u8; 32], [u8; 32]) {

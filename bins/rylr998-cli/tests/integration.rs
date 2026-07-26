@@ -5,15 +5,22 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use embedded_io_adapters::tokio_1::FromTokio;
 use rylr998::RylrClient;
-use rylr998_cli::{
-    BandwidthArg, CodingRateArg, Command, SpreadingFactorArg, WirelessModeArg, run_command,
-};
-use rylr998_sim::{NodeState, RylrSimulator, TestClient, make_pair};
+use rylr998_cli::BandwidthArg;
+use rylr998_cli::CodingRateArg;
+use rylr998_cli::Command;
+use rylr998_cli::SpreadingFactorArg;
+use rylr998_cli::WirelessModeArg;
+use rylr998_cli::run_command;
+use rylr998_sim::NodeState;
+use rylr998_sim::RylrSimulator;
+use rylr998_sim::TestClient;
+use rylr998_sim::make_pair;
 use tokio::sync::mpsc;
 
 /// Wrap a future in a timeout so a stuck dispatch doesn't hang the suite.

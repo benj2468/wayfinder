@@ -4,11 +4,16 @@
 //! they only *verify* against a [`TrustAnchor`].
 
 use interfaces::frame::Mac;
-use zerocopy::byteorder::network_endian::{U32, U64};
+use zerocopy::byteorder::network_endian::U32;
+use zerocopy::byteorder::network_endian::U64;
 
-use crate::cert::{CERT_FLAG_ADMIN, CERT_VERSION, MembershipCert, TrustAnchor};
+use crate::cert::CERT_FLAG_ADMIN;
+use crate::cert::CERT_VERSION;
+use crate::cert::MembershipCert;
+use crate::cert::TrustAnchor;
 use crate::key::Keypair;
-use crate::revoke::{REVOKE_VERSION, RevocationRecord};
+use crate::revoke::REVOKE_VERSION;
+use crate::revoke::RevocationRecord;
 
 /// A mesh's certificate authority: custody of the root key plus the mesh id it
 /// is the root of.  Created from a persisted root seed at portal startup.

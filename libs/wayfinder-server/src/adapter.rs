@@ -19,17 +19,31 @@ use wayfinder::wayfinder_auth::Keypair;
 use wayfinder::wayfinder_auth::MembershipCert;
 use wayfinder::wayfinder_auth::RevocationRecord;
 use wayfinder::wayfinder_auth::TrustAnchor;
-use wayfinder_protos::service::{
-    CsrOutcome, EgressDecisionData, InterfaceThroughputData, IssuedCertData, KeepAliveEntryData,
-    LinkFeaturesEntryData, LinkQualityEntryData, NeighborPathData, NodeMetricsData,
-    NodeSecurityData, OgmScheduleEntryData, PendingCsrData, RouteResolutionData, RoutingEntryData,
-    RuntimeConfigData, SecurityStatusData, TableOccupancyData, WayfinderDataProvider,
-};
-use zerocopy::{FromBytes, IntoBytes};
+use wayfinder_protos::service::CsrOutcome;
+use wayfinder_protos::service::EgressDecisionData;
+use wayfinder_protos::service::InterfaceThroughputData;
+use wayfinder_protos::service::IssuedCertData;
+use wayfinder_protos::service::KeepAliveEntryData;
+use wayfinder_protos::service::LinkFeaturesEntryData;
+use wayfinder_protos::service::LinkQualityEntryData;
+use wayfinder_protos::service::NeighborPathData;
+use wayfinder_protos::service::NodeMetricsData;
+use wayfinder_protos::service::NodeSecurityData;
+use wayfinder_protos::service::OgmScheduleEntryData;
+use wayfinder_protos::service::PendingCsrData;
+use wayfinder_protos::service::RouteResolutionData;
+use wayfinder_protos::service::RoutingEntryData;
+use wayfinder_protos::service::RuntimeConfigData;
+use wayfinder_protos::service::SecurityStatusData;
+use wayfinder_protos::service::TableOccupancyData;
+use wayfinder_protos::service::WayfinderDataProvider;
+use zerocopy::FromBytes;
+use zerocopy::IntoBytes;
 
 use crate::provider::MeshAuthority;
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
+use alloc::string::ToString;
 
 /// Adapts a borrowed [`CentralRouter`] to the management-API data provider
 /// trait.  Node addresses are [`Mac`]; the adapter projects them as raw
@@ -450,10 +464,14 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
 mod tests {
     use super::*;
     use wayfinder::CentralRouter;
-    use wayfinder::batman::wire::{BATADV_IV_OGM, BatmanOgmPacket};
-    use wayfinder::interfaces::frame::{LinkFrame, Mac};
-    use wayfinder_protos::service::{LinkFeaturesData, TrickleConfigData};
-    use zerocopy::{FromBytes, IntoBytes};
+    use wayfinder::batman::wire::BATADV_IV_OGM;
+    use wayfinder::batman::wire::BatmanOgmPacket;
+    use wayfinder::interfaces::frame::LinkFrame;
+    use wayfinder::interfaces::frame::Mac;
+    use wayfinder_protos::service::LinkFeaturesData;
+    use wayfinder_protos::service::TrickleConfigData;
+    use zerocopy::FromBytes;
+    use zerocopy::IntoBytes;
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])
@@ -561,8 +579,11 @@ mod tests {
     fn set_config_installs_lazy_cert_distribution_and_marks_active() {
         use crate::CertAuthority;
         use wayfinder::auth::OgmAuth;
-        use wayfinder::batman::wire::{TvlvType, find_tvlv};
-        use wayfinder::wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
+        use wayfinder::batman::wire::TvlvType;
+        use wayfinder::batman::wire::find_tvlv;
+        use wayfinder::wayfinder_auth::Keypair;
+        use wayfinder::wayfinder_auth::MembershipCert;
+        use wayfinder::wayfinder_auth::TrustAnchor;
 
         let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
         ca.set_now_unix(100);
@@ -945,7 +966,9 @@ mod tests {
     fn node_metrics_reports_cert_store_occupancy_when_auth_enabled() {
         use crate::CertAuthority;
         use wayfinder::auth::OgmAuth;
-        use wayfinder::wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
+        use wayfinder::wayfinder_auth::Keypair;
+        use wayfinder::wayfinder_auth::MembershipCert;
+        use wayfinder::wayfinder_auth::TrustAnchor;
 
         let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
         ca.set_now_unix(100);
@@ -1012,7 +1035,9 @@ mod tests {
     fn revoke_node_floods_when_provider_router_is_authenticated() {
         use crate::CertAuthority;
         use wayfinder::auth::OgmAuth;
-        use wayfinder::wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
+        use wayfinder::wayfinder_auth::Keypair;
+        use wayfinder::wayfinder_auth::MembershipCert;
+        use wayfinder::wayfinder_auth::TrustAnchor;
 
         let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
         ca.set_now_unix(100);
@@ -1057,7 +1082,9 @@ mod tests {
     fn security_status_reports_verified_expiry_and_revocation() {
         use crate::CertAuthority;
         use wayfinder::auth::OgmAuth;
-        use wayfinder::wayfinder_auth::{Keypair, MembershipCert, TrustAnchor};
+        use wayfinder::wayfinder_auth::Keypair;
+        use wayfinder::wayfinder_auth::MembershipCert;
+        use wayfinder::wayfinder_auth::TrustAnchor;
 
         let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
         ca.set_now_unix(100);

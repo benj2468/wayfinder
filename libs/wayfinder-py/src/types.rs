@@ -5,7 +5,8 @@ use interfaces::frame::Mac;
 use interfaces::link::LinkMetrics;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use wayfinder::features::{KeepAliveConfig, LinkFeatures};
+use wayfinder::features::KeepAliveConfig;
+use wayfinder::features::LinkFeatures;
 
 /// A 6-byte mesh MAC address — the identifier every wayfinder node, route,
 /// and frame destination is keyed on.

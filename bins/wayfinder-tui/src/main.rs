@@ -8,14 +8,22 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-use std::{net::SocketAddr, path::PathBuf, time::Duration, time::Instant};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
+use std::time::Instant;
 
 use clap::Parser;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::Event;
+use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::KeyEventKind;
+use ratatui::crossterm::event::{self};
 use tokio::sync::mpsc;
 
-use wayfinder_client::{Client, Endpoint};
-use wayfinder_tui::app::{self, App};
+use wayfinder_client::Client;
+use wayfinder_client::Endpoint;
+use wayfinder_tui::app::App;
+use wayfinder_tui::app::{self};
 use wayfinder_tui::persist;
 use wayfinder_tui::ui;
 

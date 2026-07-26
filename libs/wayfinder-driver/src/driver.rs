@@ -12,24 +12,36 @@
 //!   for tests: drive the periodic broadcast at a chosen instant, then drain
 //!   every already-pending frame in one non-blocking sweep.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
-use futures::{FutureExt, future::select_all};
+use futures::FutureExt;
+use futures::future::select_all;
 use interfaces::link::LinkMetrics;
 use tokio::time::sleep;
-use tracing::{trace, warn};
+use tracing::trace;
+use tracing::warn;
+use wayfinder::CentralRouter;
+use wayfinder::EgressInterface;
+use wayfinder::McastPlan;
 use wayfinder::auth::DIRECTED_TRAILER_LEN;
 use wayfinder::config::TrickleConfig;
 use wayfinder::features::LinkFeatures;
-use wayfinder::interfaces::frame::{LinkFrameData, MAX_LINK_FRAME_LEN, Mac};
-use wayfinder::{CentralRouter, EgressInterface, McastPlan};
-use wayfinder_driver_core::{Egress, MeshSink};
+use wayfinder::interfaces::frame::LinkFrameData;
+use wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN;
+use wayfinder::interfaces::frame::Mac;
+use wayfinder_driver_core::Egress;
+use wayfinder_driver_core::MeshSink;
 use wayfinder_protos::service::WayfinderService;
-use wayfinder_server::{
-    AuthSnapshot, AuthSnapshotRx, CertAuthority, MeshAuthority, QueryRx, RouterAdapter,
-};
+use wayfinder_server::AuthSnapshot;
+use wayfinder_server::AuthSnapshotRx;
+use wayfinder_server::CertAuthority;
+use wayfinder_server::MeshAuthority;
+use wayfinder_server::QueryRx;
+use wayfinder_server::RouterAdapter;
 
-use wayfinder::link::{DynLinkT, LinkT};
+use wayfinder::link::DynLinkT;
+use wayfinder::link::LinkT;
 
 use crate::snoop::McastSnooper;
 use crate::transport::FrameIo;

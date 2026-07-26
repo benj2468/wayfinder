@@ -1,9 +1,14 @@
 //! Node key material: an Ed25519 identity keypair plus the X25519 key used for
 //! pairwise key agreement, both derived deterministically from one 32-byte seed.
 
-use blake2::{Blake2s256, Digest};
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use x25519_dalek::{PublicKey, StaticSecret};
+use blake2::Blake2s256;
+use blake2::Digest;
+use ed25519_dalek::Signature;
+use ed25519_dalek::Signer;
+use ed25519_dalek::SigningKey;
+use ed25519_dalek::VerifyingKey;
+use x25519_dalek::PublicKey;
+use x25519_dalek::StaticSecret;
 
 /// Domain-separation label folded into the seed when deriving the X25519 secret,
 /// so the agreement key is independent of the Ed25519 signing key even though

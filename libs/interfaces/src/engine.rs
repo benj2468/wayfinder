@@ -1,6 +1,8 @@
 use core::time::Duration;
 
-use crate::frame::{LinkFrame, LinkFrameDataMut, Mac};
+use crate::frame::LinkFrame;
+use crate::frame::LinkFrameDataMut;
+use crate::frame::Mac;
 
 /// The decision a [`MeshRoutingEngine`] returns after processing a received
 /// frame, telling the central router what to do with it: consume it, forward it,

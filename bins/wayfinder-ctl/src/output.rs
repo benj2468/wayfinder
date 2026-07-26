@@ -6,11 +6,19 @@
 
 use clap::ValueEnum;
 use serde::Serialize;
-use wayfinder_protos::wayfinder_v1alpha::{
-    GetSecurityStatusResponse, KeepAliveTable, LinkFeaturesTable, LinkQualityTable,
-    ListCertsResponse, ListPendingCsrsResponse, NodeInfo, NodeMetrics, OgmSchedule,
-    ResolveRouteResponse, RoutingTable, Throughput, resolve_route_response::Egress,
-};
+use wayfinder_protos::wayfinder_v1alpha::GetSecurityStatusResponse;
+use wayfinder_protos::wayfinder_v1alpha::KeepAliveTable;
+use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesTable;
+use wayfinder_protos::wayfinder_v1alpha::LinkQualityTable;
+use wayfinder_protos::wayfinder_v1alpha::ListCertsResponse;
+use wayfinder_protos::wayfinder_v1alpha::ListPendingCsrsResponse;
+use wayfinder_protos::wayfinder_v1alpha::NodeInfo;
+use wayfinder_protos::wayfinder_v1alpha::NodeMetrics;
+use wayfinder_protos::wayfinder_v1alpha::OgmSchedule;
+use wayfinder_protos::wayfinder_v1alpha::ResolveRouteResponse;
+use wayfinder_protos::wayfinder_v1alpha::RoutingTable;
+use wayfinder_protos::wayfinder_v1alpha::Throughput;
+use wayfinder_protos::wayfinder_v1alpha::resolve_route_response::Egress;
 
 /// How a command renders its result.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]

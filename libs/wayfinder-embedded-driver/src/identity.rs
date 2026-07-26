@@ -25,7 +25,9 @@
 //! assumed open here.
 
 use wayfinder::interfaces::frame::Mac;
-use wayfinder_storage::{Codec, DurableStore, Persisted};
+use wayfinder_storage::Codec;
+use wayfinder_storage::DurableStore;
+use wayfinder_storage::Persisted;
 
 /// Encoding version for a persisted identity blob. Bumped only on an
 /// incompatible layout change; [`MacCodec::decode`] rejects any other value so

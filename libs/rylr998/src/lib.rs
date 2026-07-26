@@ -9,10 +9,13 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use core::time::Duration;
-use embedded_io_async::{Read, Write};
-use heapless::{Deque, String};
+use embedded_io_async::Read;
+use embedded_io_async::Write;
+use heapless::Deque;
+use heapless::String;
 use thiserror::Error;
-use tracing::{trace, warn};
+use tracing::trace;
+use tracing::warn;
 
 /// An error from the RYLR module driver.
 #[derive(Error, Debug)]

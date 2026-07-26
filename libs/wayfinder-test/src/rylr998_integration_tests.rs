@@ -26,14 +26,17 @@
 //! drops neither; each `run_once` still returns every round regardless of
 //! traffic because its periodic Trickle-timer arm always eventually fires.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 use interfaces::frame::Mac;
-use rylr998_sim::{LoraSwitch, make_node};
+use rylr998_sim::LoraSwitch;
+use rylr998_sim::make_node;
 use wayfinder::config::TrickleConfig;
 use wayfinder_driver::DynLinkT;
 
-use crate::test_router::{TestRouter, host_frame};
+use crate::test_router::TestRouter;
+use crate::test_router::host_frame;
 
 fn mac(n: u8) -> Mac {
     Mac([0, 0, 0, 0, 0, n])

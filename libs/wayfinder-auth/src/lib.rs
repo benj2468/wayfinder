@@ -36,12 +36,21 @@ mod revoke;
 #[cfg(feature = "std")]
 mod authority;
 
-pub use cert::{CERT_FLAG_ADMIN, CERT_VERSION, MembershipCert, TrustAnchor, VerifiedCert};
+pub use cert::CERT_FLAG_ADMIN;
+pub use cert::CERT_VERSION;
+pub use cert::MembershipCert;
+pub use cert::TrustAnchor;
+pub use cert::VerifiedCert;
 pub use error::AuthError;
-pub use key::{Keypair, verify_signature};
-pub use mac::{derive_mac, force_locally_administered_unicast};
-pub use pairwise::{TAG_LEN, frame_tag, verify_frame_tag};
-pub use revoke::{REVOKE_VERSION, RevocationRecord};
+pub use key::Keypair;
+pub use key::verify_signature;
+pub use mac::derive_mac;
+pub use mac::force_locally_administered_unicast;
+pub use pairwise::TAG_LEN;
+pub use pairwise::frame_tag;
+pub use pairwise::verify_frame_tag;
+pub use revoke::REVOKE_VERSION;
+pub use revoke::RevocationRecord;
 
 #[cfg(feature = "std")]
 pub use authority::Authority;

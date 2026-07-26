@@ -3,8 +3,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use wayfinder_protos::wayfinder_v1alpha::{NeighborPath, NodeInfo, RoutingEntry, RoutingTable};
-use wayfinderctl::output::{self, OutputFormat};
+use wayfinder_protos::wayfinder_v1alpha::NeighborPath;
+use wayfinder_protos::wayfinder_v1alpha::NodeInfo;
+use wayfinder_protos::wayfinder_v1alpha::RoutingEntry;
+use wayfinder_protos::wayfinder_v1alpha::RoutingTable;
+use wayfinderctl::output::OutputFormat;
+use wayfinderctl::output::{self};
 
 #[test]
 fn node_info_human_renders_mac_and_count() {

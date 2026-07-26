@@ -2,7 +2,8 @@
 //! identity key, so the address a node routes under is stable across restarts
 //! without depending on whatever the OS assigns a freshly-created TAP device.
 
-use blake2::{Blake2s256, Digest};
+use blake2::Blake2s256;
+use blake2::Digest;
 use interfaces::frame::Mac;
 
 /// Domain-separation label folded into the pubkey when deriving the MAC, so

@@ -1,19 +1,36 @@
 //! All ratatui rendering for the TUI, driven entirely by [`App`] state.
 
-use ratatui::{
-    Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style, Stylize},
-    symbols::Marker,
-    text::{Line, Span},
-    widgets::{
-        Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table, Tabs, Wrap,
-    },
-};
+use ratatui::Frame;
+use ratatui::layout::Alignment;
+use ratatui::layout::Constraint;
+use ratatui::layout::Direction;
+use ratatui::layout::Layout;
+use ratatui::layout::Rect;
+use ratatui::style::Color;
+use ratatui::style::Modifier;
+use ratatui::style::Style;
+use ratatui::style::Stylize;
+use ratatui::symbols::Marker;
+use ratatui::text::Line;
+use ratatui::text::Span;
+use ratatui::widgets::Axis;
+use ratatui::widgets::Block;
+use ratatui::widgets::Borders;
+use ratatui::widgets::Cell;
+use ratatui::widgets::Chart;
+use ratatui::widgets::Dataset;
+use ratatui::widgets::GraphType;
+use ratatui::widgets::Paragraph;
+use ratatui::widgets::Row;
+use ratatui::widgets::Table;
+use ratatui::widgets::Tabs;
+use ratatui::widgets::Wrap;
 
 use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesEntry;
 
-use crate::app::{App, Tab, format_id};
+use crate::app::App;
+use crate::app::Tab;
+use crate::app::format_id;
 
 /// Accent colour used for headings and the active tab.
 const ACCENT: Color = Color::Cyan;
@@ -1222,7 +1239,8 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
 mod tests {
     use super::*;
     use crate::app::Tab;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     /// Render the Metrics tab through a real `TestBackend` so the chart's axis
     /// bounds, label vectors, and layout split are exercised end to end — both
@@ -1312,9 +1330,9 @@ mod tests {
     /// lists each pending request there.
     #[test]
     fn security_tab_shows_pending_csrs_only_for_a_provider() {
-        use wayfinder_protos::wayfinder_v1alpha::{
-            GetSecurityStatusResponse, ListPendingCsrsResponse, PendingCsr,
-        };
+        use wayfinder_protos::wayfinder_v1alpha::GetSecurityStatusResponse;
+        use wayfinder_protos::wayfinder_v1alpha::ListPendingCsrsResponse;
+        use wayfinder_protos::wayfinder_v1alpha::PendingCsr;
 
         let mut app = App::new("test".to_string(), 1000);
         app.tab = Tab::Security;
@@ -1376,9 +1394,9 @@ mod tests {
     #[test]
     fn security_tab_offers_revoke_for_a_provider() {
         use crate::app::SecurityFocus;
-        use wayfinder_protos::wayfinder_v1alpha::{
-            GetSecurityStatusResponse, ListPendingCsrsResponse, NodeSecurity,
-        };
+        use wayfinder_protos::wayfinder_v1alpha::GetSecurityStatusResponse;
+        use wayfinder_protos::wayfinder_v1alpha::ListPendingCsrsResponse;
+        use wayfinder_protos::wayfinder_v1alpha::NodeSecurity;
 
         let mut app = App::new("test".to_string(), 1000);
         app.tab = Tab::Security;
@@ -1431,9 +1449,10 @@ mod tests {
     /// yes/no state with its toggle-key hint, and the keep-alive cadence.
     #[test]
     fn links_tab_shows_schedule_and_feature_detail_for_selected_interface() {
-        use wayfinder_protos::wayfinder_v1alpha::{
-            LinkFeaturesEntry, LinkFeaturesTable, OgmSchedule, OgmScheduleEntry,
-        };
+        use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesEntry;
+        use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesTable;
+        use wayfinder_protos::wayfinder_v1alpha::OgmSchedule;
+        use wayfinder_protos::wayfinder_v1alpha::OgmScheduleEntry;
 
         let mut app = App::new("test".to_string(), 1000);
         app.tab = Tab::Links;

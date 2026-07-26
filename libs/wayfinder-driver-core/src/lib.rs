@@ -19,12 +19,17 @@
 use core::time::Duration;
 
 use interfaces::link::LinkMetrics;
-use tracing::{trace, warn};
+use tracing::trace;
+use tracing::warn;
+use wayfinder::CentralRouter;
+use wayfinder::DEFAULT_BATMAN_ETHER_TYPE;
 use wayfinder::auth::DIRECTED_TRAILER_LEN;
-use wayfinder::batman::wire::{BATADV_CERT_REPLY, BATADV_CERT_REQ};
-use wayfinder::interfaces::frame::{LinkFrame, Mac};
-use wayfinder::{CentralRouter, DEFAULT_BATMAN_ETHER_TYPE};
-use zerocopy::{FromBytes, IntoBytes};
+use wayfinder::batman::wire::BATADV_CERT_REPLY;
+use wayfinder::batman::wire::BATADV_CERT_REQ;
+use wayfinder::interfaces::frame::LinkFrame;
+use wayfinder::interfaces::frame::Mac;
+use zerocopy::FromBytes;
+use zerocopy::IntoBytes;
 
 /// How an [`OutgoingFrame`] is fanned out onto the mesh interfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,13 +287,18 @@ mod tests {
     use std::vec::Vec;
 
     use super::*;
-    use wayfinder::auth::{DIRECTED_TRAILER_LEN, OgmAuth, OgmVerdict};
-    use wayfinder::batman::wire::{
-        BATADV_CERT_REPLY, BATADV_CERT_REQ, BATADV_IV_OGM, BatmanOgmPacket,
-    };
+    use wayfinder::auth::DIRECTED_TRAILER_LEN;
+    use wayfinder::auth::OgmAuth;
+    use wayfinder::auth::OgmVerdict;
+    use wayfinder::batman::wire::BATADV_CERT_REPLY;
+    use wayfinder::batman::wire::BATADV_CERT_REQ;
+    use wayfinder::batman::wire::BATADV_IV_OGM;
+    use wayfinder::batman::wire::BatmanOgmPacket;
     use wayfinder::interfaces::frame::LinkFrame;
-    use wayfinder_auth::{Authority, Keypair};
-    use zerocopy::{FromBytes, IntoBytes};
+    use wayfinder_auth::Authority;
+    use wayfinder_auth::Keypair;
+    use zerocopy::FromBytes;
+    use zerocopy::IntoBytes;
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])

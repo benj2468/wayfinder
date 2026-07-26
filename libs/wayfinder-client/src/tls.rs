@@ -9,14 +9,21 @@
 
 use std::sync::Arc;
 
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::client::{AlwaysResolvesClientRawPublicKeys, ClientConfig};
-use rustls::crypto::{WebPkiSupportedAlgorithms, ring};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
-use wayfinder_tls_mgmt::{
-    certified_key_from_seed, raw_ed25519_from_spki, verify_raw_key_signature,
-};
+use rustls::DigitallySignedStruct;
+use rustls::SignatureScheme;
+use rustls::client::AlwaysResolvesClientRawPublicKeys;
+use rustls::client::ClientConfig;
+use rustls::client::danger::HandshakeSignatureValid;
+use rustls::client::danger::ServerCertVerified;
+use rustls::client::danger::ServerCertVerifier;
+use rustls::crypto::WebPkiSupportedAlgorithms;
+use rustls::crypto::ring;
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::ServerName;
+use rustls::pki_types::UnixTime;
+use wayfinder_tls_mgmt::certified_key_from_seed;
+use wayfinder_tls_mgmt::raw_ed25519_from_spki;
+use wayfinder_tls_mgmt::verify_raw_key_signature;
 
 /// Client-side verifier for the server's **raw public key** (RFC 7250).
 ///
@@ -104,7 +111,8 @@ pub(crate) fn client_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustls::{ClientConnection, ServerConnection};
+    use rustls::ClientConnection;
+    use rustls::ServerConnection;
     use wayfinder_auth::Keypair;
     use wayfinder_server::server_config;
 

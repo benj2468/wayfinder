@@ -19,12 +19,16 @@
 )]
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use embedded_io_adapters::tokio_1::FromTokio;
 use rylr998::RylrClient;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::io::BufReader;
+use tokio::io::DuplexStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 

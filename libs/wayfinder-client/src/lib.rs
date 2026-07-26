@@ -16,28 +16,60 @@ mod tls;
 
 use std::net::SocketAddr;
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
+use anyhow::anyhow;
 use bytes::Bytes;
-use futures::{SinkExt, StreamExt};
+use futures::SinkExt;
+use futures::StreamExt;
 use prost::Message;
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tokio_serial::SerialStream;
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use wayfinder_protos::wayfinder_v1alpha::{
-    ApproveCsrRequest, AuthenticateRequest, DenyCsrRequest, GetKeepAliveTableRequest,
-    GetLinkFeaturesTableRequest, GetLinkQualityTableRequest, GetMetricsRequest, GetNodeInfoRequest,
-    GetOgmScheduleRequest, GetRoutingTableRequest, GetSecurityStatusRequest,
-    GetSecurityStatusResponse, GetThroughputRequest, GetTrustAnchorRequest, GetTrustAnchorResponse,
-    KeepAliveTable, LinkFeatures, LinkFeaturesTable, LinkQualityTable, ListCertsRequest,
-    ListCertsResponse, ListPendingCsrsRequest, ListPendingCsrsResponse, NodeInfo, NodeMetrics,
-    OgmSchedule, ResolveRouteRequest, ResolveRouteResponse, RevokeNodeRequest, RoutingTable,
-    RuntimeConfig, SetAuthRequest, SetConfigRequest, SubmitCsrRequest, SubmitCsrResponse,
-    Throughput, TrickleConfig, WayfinderRequest, WayfinderResponse,
-    wayfinder_request::Request as RequestKind, wayfinder_response::Response as ResponseKind,
-};
+use tokio_util::codec::Framed;
+use tokio_util::codec::LengthDelimitedCodec;
+use wayfinder_protos::wayfinder_v1alpha::ApproveCsrRequest;
+use wayfinder_protos::wayfinder_v1alpha::AuthenticateRequest;
+use wayfinder_protos::wayfinder_v1alpha::DenyCsrRequest;
+use wayfinder_protos::wayfinder_v1alpha::GetKeepAliveTableRequest;
+use wayfinder_protos::wayfinder_v1alpha::GetLinkFeaturesTableRequest;
+use wayfinder_protos::wayfinder_v1alpha::GetLinkQualityTableRequest;
+use wayfinder_protos::wayfinder_v1alpha::GetMetricsRequest;
+use wayfinder_protos::wayfinder_v1alpha::GetNodeInfoRequest;
+use wayfinder_protos::wayfinder_v1alpha::GetOgmScheduleRequest;
+use wayfinder_protos::wayfinder_v1alpha::GetRoutingTableRequest;
+use wayfinder_protos::wayfinder_v1alpha::GetSecurityStatusRequest;
+use wayfinder_protos::wayfinder_v1alpha::GetSecurityStatusResponse;
+use wayfinder_protos::wayfinder_v1alpha::GetThroughputRequest;
+use wayfinder_protos::wayfinder_v1alpha::GetTrustAnchorRequest;
+use wayfinder_protos::wayfinder_v1alpha::GetTrustAnchorResponse;
+use wayfinder_protos::wayfinder_v1alpha::KeepAliveTable;
+use wayfinder_protos::wayfinder_v1alpha::LinkFeatures;
+use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesTable;
+use wayfinder_protos::wayfinder_v1alpha::LinkQualityTable;
+use wayfinder_protos::wayfinder_v1alpha::ListCertsRequest;
+use wayfinder_protos::wayfinder_v1alpha::ListCertsResponse;
+use wayfinder_protos::wayfinder_v1alpha::ListPendingCsrsRequest;
+use wayfinder_protos::wayfinder_v1alpha::ListPendingCsrsResponse;
+use wayfinder_protos::wayfinder_v1alpha::NodeInfo;
+use wayfinder_protos::wayfinder_v1alpha::NodeMetrics;
+use wayfinder_protos::wayfinder_v1alpha::OgmSchedule;
+use wayfinder_protos::wayfinder_v1alpha::ResolveRouteRequest;
+use wayfinder_protos::wayfinder_v1alpha::ResolveRouteResponse;
+use wayfinder_protos::wayfinder_v1alpha::RevokeNodeRequest;
+use wayfinder_protos::wayfinder_v1alpha::RoutingTable;
+use wayfinder_protos::wayfinder_v1alpha::RuntimeConfig;
+use wayfinder_protos::wayfinder_v1alpha::SetAuthRequest;
+use wayfinder_protos::wayfinder_v1alpha::SetConfigRequest;
+use wayfinder_protos::wayfinder_v1alpha::SubmitCsrRequest;
+use wayfinder_protos::wayfinder_v1alpha::SubmitCsrResponse;
+use wayfinder_protos::wayfinder_v1alpha::Throughput;
+use wayfinder_protos::wayfinder_v1alpha::TrickleConfig;
+use wayfinder_protos::wayfinder_v1alpha::WayfinderRequest;
+use wayfinder_protos::wayfinder_v1alpha::WayfinderResponse;
+use wayfinder_protos::wayfinder_v1alpha::wayfinder_request::Request as RequestKind;
+use wayfinder_protos::wayfinder_v1alpha::wayfinder_response::Response as ResponseKind;
 
 /// The underlying transport a [`Client`] is connected over, carrying the same
 /// 4-byte length-delimited prost framing regardless of medium.

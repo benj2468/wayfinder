@@ -1,7 +1,10 @@
 use core::fmt::Debug;
 use core::hash::Hash;
+use zerocopy::FromBytes;
+use zerocopy::Immutable;
+use zerocopy::IntoBytes;
+use zerocopy::KnownLayout;
 use zerocopy::byteorder::network_endian::U16;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Upper bound, in bytes, on a fully-encapsulated link frame anywhere in the
 /// data path — the size every receive/transmit scratch buffer is cut to.

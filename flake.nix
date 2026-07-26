@@ -176,6 +176,22 @@
               shellcheck.enable = true;
               stylua.enable = true;
             };
+
+            settings.formatter.rustfmt =
+              let
+                cargoFmtWrapper = pkgs.writeShellApplication {
+                  name = "treefmt-cargo-fmt";
+                  runtimeInputs = [ rustToolchain ];
+                  text = ''
+                    cargo fmt -- "''$@"
+                  '';
+                };
+              in
+              {
+                command = "${cargoFmtWrapper}/bin/treefmt-cargo-fmt";
+                options = pkgs.lib.mkForce [ ];
+                includes = [ "*.rs" ];
+              };
           };
         };
     };

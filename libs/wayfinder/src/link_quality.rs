@@ -16,7 +16,8 @@
 //! [`best_interface_for`]: LinkQualityTable::best_interface_for
 
 use heapless::Vec as HVec;
-use interfaces::{frame::MeshIdentifier, link::LinkMetrics};
+use interfaces::frame::MeshIdentifier;
+use interfaces::link::LinkMetrics;
 
 /// Maximum number of distinct `(neighbor, iface_idx)` entries tracked.
 ///

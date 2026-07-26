@@ -12,7 +12,10 @@ use std::sync::OnceLock;
 use interfaces::frame::Mac;
 use libfuzzer_sys::fuzz_target;
 use wayfinder::auth::OgmAuth;
-use wayfinder_auth::{Authority, Keypair, MembershipCert, TrustAnchor};
+use wayfinder_auth::Authority;
+use wayfinder_auth::Keypair;
+use wayfinder_auth::MembershipCert;
+use wayfinder_auth::TrustAnchor;
 
 /// The mesh trust anchor plus a fixed seed for the verifying node's own
 /// (unused-by-`verify_ogm`) identity, built once per fuzzer process.
