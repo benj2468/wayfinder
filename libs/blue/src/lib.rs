@@ -32,14 +32,14 @@ mod nrf_link;
 #[cfg(feature = "hardware")]
 pub use nrf_link::NrfBleLink;
 
-#[cfg(feature = "std")]
+#[cfg(feature = "generic")]
 mod generic_link;
 
-#[cfg(feature = "std")]
+#[cfg(feature = "generic")]
 pub use generic_link::BleAdvertiser;
-#[cfg(feature = "std")]
+#[cfg(feature = "generic")]
 pub use generic_link::BleLink;
-#[cfg(feature = "std")]
+#[cfg(feature = "generic")]
 pub use generic_link::BleReportSink;
 
 #[cfg(feature = "std")]

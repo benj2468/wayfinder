@@ -11,8 +11,8 @@ default = ["std"]
 # The host-side (Linux/BlueZ) `LinkT`. Off by default so the crate stays
 # `no_std` for the firmware build.
 std = [
+    "generic",
     "dep:bluer",
-    "dep:tokio",
     "dep:futures",
     "dep:anyhow",
 ]
@@ -31,6 +31,7 @@ hardware = [
     "dep:embassy-sync",
     "dep:static_cell",
 ]
+generic = ["dep:tokio"]
 
 [dependencies]
 # Depended on by path (not workspace inheritance) so `default-features = false`

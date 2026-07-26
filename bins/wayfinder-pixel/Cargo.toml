@@ -24,7 +24,7 @@ path = "src/main.rs"
 # actually proves the `android` feature links against the NDK's libc before
 # any JNI glue exists. `android` needs only `tokio`, no Android/JNI
 # dependency yet.
-blue = { path = "../../libs/blue", features = ["std"] }
+blue = { path = "../../libs/blue", default-features = false, features = ["generic"] }
 # The bare `LinkT`/`interfaces` surface `blue` itself builds on;
 # `default-features = false` keeps std/alloc off, matching how `blue`
 # depends on it.
