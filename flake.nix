@@ -59,6 +59,7 @@
           # picks up its prebuilt `core`/`alloc` without needing nightly's
           # `-Z build-std`.
           bareMetalTarget = "thumbv7em-none-eabihf";
+          pixelTarget = "aarch64-linux-android";
 
           rustToolchain = pkgs.fenix.combine [
             (pkgs.fenix.complete.withComponents [
@@ -70,6 +71,7 @@
               "llvm-tools-preview"
             ])
             pkgs.fenix.targets.${bareMetalTarget}.latest.rust-std
+            pkgs.fenix.targets.${pixelTarget}.latest.rust-std
           ];
 
           # Python interpreter with the integration-test deps (pytest). Used by
@@ -108,6 +110,7 @@
               cargo-machete
               cargo-llvm-cov
               cargo-fuzz
+              cargo-ndk
               rust-analyzer
               pytestEnv
               python312Packages.virtualenv
@@ -120,6 +123,8 @@
               glab
               stdenv.cc.cc.lib
               probe-rs-tools
+              jdk17
+              ktlint
             ];
 
             buildInputs = with pkgs; [ dbus ];

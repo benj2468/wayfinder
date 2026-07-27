@@ -85,7 +85,7 @@ nrf-ieee802154 = { path = "../../libs/nrf-ieee802154" }
 # pulls in `nrf-softdevice` — see `libs/blue/CLAUDE.md`). Mutually
 # exclusive with `nrf-ieee802154` ever being wired live (RADIO-peripheral
 # conflict), which is fine since 802.15.4 isn't wired live here.
-blue = { path = "../../libs/blue", features = ["hardware"] }
+blue = { path = "../../libs/blue", default-features = false, features = ["hardware"] }
 # `time-driver-rtc1` backs `embassy-time` (the driver's `Clock`); `gpiote` +
 # `unstable-pac` are pulled in by the HAL for GPIO/UARTE.
 embassy-nrf = { version = "0.10.0", features = [

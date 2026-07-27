@@ -47,6 +47,25 @@ The `libs/wayfinder-shark` Wireshark dissector is tested with pytest
 (`libs/wayfinder-shark/tests/`), which drives `tshark` against the Lua
 dissector — outside the Cargo test harness.
 
+**Crates outside the root workspace don't run under a root `cargo
+nextest run --workspace`/`cargo test --workspace`** — each needs its own
+invocation from its own directory:
+
+- `libs/wayfinder-py` — a separate `[workspace]` (needs a linkable libpython;
+  must not leak into the main host build). Host-testable: `cd libs/wayfinder-py
+  && cargo nextest run`. Wired into CI's `test:run:python` job, alongside pytest.
+- `bins/wayfinder-nrf52840`, `bins/wayfinder-stm32f411` — separate
+  `[workspace]`s, `no_std`/`no_main` firmware binaries with `test = false`; a
+  host test harness can't link against them at all. Their logic is exercised
+  indirectly through the `libs/*` crates they wire together (tested in the
+  root workspace) plus CI's `build:embedded` job (cross-compile + clippy for
+  the real target). Only real/simulated hardware-in-the-loop (e.g.
+  `defmt-test` + `probe-rs`) could add genuine test coverage here — not set up
+  in this repo.
+- `libs/*/fuzz` (`wayfinder`, `batman`, `wayfinder-auth`, `ieee802154`) —
+  `cargo-fuzz` targets, not unit tests; run explicitly with `cargo fuzz run`,
+  not part of any `nextest` invocation.
+
 ## Always-on rules
 
 ### Model selection

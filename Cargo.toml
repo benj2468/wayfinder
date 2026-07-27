@@ -60,7 +60,7 @@ wayfinder-driver = { path = "./libs/wayfinder-driver" }
 wayfinder-embedded-driver = { path = "./libs/wayfinder-embedded-driver" }
 wayfinder-client = { path = "./libs/wayfinder-client" }
 rylr998 = { path = "./libs/rylr998", default-features = false }
-blue = { path = "./libs/blue" }
+blue = { path = "./libs/blue", default-features = false }
 
 # Third Party Dependencies
 tracing = "0.1.44"

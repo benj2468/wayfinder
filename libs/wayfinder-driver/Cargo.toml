@@ -7,7 +7,7 @@ edition = "2024"
 workspace = true
 
 [features]
-default = ["tokio"]
+default = ["tokio", "std"]
 # Enables the tokio-driven event loop, the concrete `tokio::net` frame
 # transports, and the in-process server wiring.  Without it the crate exposes
 # only the transport-agnostic [`FrameIo`] trait and the IGMP [`McastSnooper`].
