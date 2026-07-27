@@ -74,16 +74,6 @@
             pkgs.fenix.targets.${pixelTarget}.latest.rust-std
           ];
 
-          andoidKit = pkgs.androidenv.composeAndroidPackages {
-            includeNDK = true;
-            ndkVersion = "27.3.13750724";
-            platformVersions = [
-              "33"
-              "34"
-            ];
-            buildToolsVersions = [ "34.0.0" ];
-          };
-
           # Python interpreter with the integration-test deps (pytest). Used by
           # both the default dev shell and the lightweight `pytest` shell that
           # CI runs — see tests/README.md and .gitlab-ci.yml.
@@ -133,8 +123,7 @@
               glab
               stdenv.cc.cc.lib
               probe-rs-tools
-              # jdk17
-              # andoidKit.androidsdk
+              jdk17
             ];
 
             buildInputs = with pkgs; [ dbus ];

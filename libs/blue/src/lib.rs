@@ -36,14 +36,14 @@ mod nrf_link;
 #[cfg(feature = "hardware")]
 pub use nrf_link::NrfBleLink;
 
-#[cfg(any(feature = "std", feature = "android"))]
+#[cfg(feature = "generic")]
 mod generic_link;
 
-#[cfg(any(feature = "std", feature = "android"))]
+#[cfg(feature = "generic")]
 pub use generic_link::BleAdvertiser;
-#[cfg(any(feature = "std", feature = "android"))]
+#[cfg(feature = "generic")]
 pub use generic_link::BleLink;
-#[cfg(any(feature = "std", feature = "android"))]
+#[cfg(feature = "generic")]
 pub use generic_link::BleReportSink;
 
 #[cfg(feature = "std")]

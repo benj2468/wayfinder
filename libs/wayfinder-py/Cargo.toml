@@ -4,6 +4,17 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+# Independent Cargo workspace — mirrors `bins/wayfinder-nrf52840` and
+# `libs/wayfinder/fuzz`: this crate needs a Python interpreter (and, outside
+# `extension-module` mode, a linkable libpython) at build time, which must
+# never leak into the main workspace's `cargo build --workspace`/`cargo
+# clippy --workspace --all-targets`. Because `--workspace` overrides
+# `default-members`, merely excluding this crate from the root workspace's
+# defaults would not be enough — only a separate `[workspace]` guarantees
+# root-workspace commands never touch it.
+[workspace]
+members = ["."]
+
 [lib]
 name = "wayfinder_py"
 crate-type = ["cdylib", "rlib"]

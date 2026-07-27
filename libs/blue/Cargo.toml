@@ -12,7 +12,7 @@ default = ["std"]
 # `no_std` for the firmware build. Also enables `generic_link` (`android`
 # does that on its own, more cheaply, when `bluer`/D-Bus aren't wanted).
 std = [
-    "android",
+    "generic",
     "dep:bluer",
     "dep:futures",
     "dep:anyhow",
@@ -42,6 +42,7 @@ hardware = [
     "dep:embassy-sync",
     "dep:static_cell",
 ]
+generic = ["dep:tokio"]
 
 [dependencies]
 # Depended on by path (not workspace inheritance) so `default-features = false`

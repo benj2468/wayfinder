@@ -40,12 +40,12 @@ required-features = ["uniffi-bindgen"]
 uniffi-bindgen = ["uniffi/cli"]
 
 [dependencies]
-# The seam this crate hosts for real: `BleLink`/`BleAdvertiser`, see
-# `libs/blue/CLAUDE.md`. Used two ways — `main.rs`'s `NoopAdvertiser` proves
-# `blue` itself links against the NDK's libc; `src/lib.rs`'s `MeshNode`/
-# `ForeignAdvertiser` are the actual UniFFI-exported glue. `android` needs
-# only `tokio`, no Android/JNI dependency itself.
-blue = { path = "../../libs/blue", default-features = false, features = ["android"] }
+# The seam this binary exists to eventually host for real — `BleLink`/
+# `BleAdvertiser`, see `libs/blue/CLAUDE.md` — imported here so this crate
+# actually proves the `android` feature links against the NDK's libc before
+# any JNI glue exists. `android` needs only `tokio`, no Android/JNI
+# dependency yet.
+blue = { path = "../../libs/blue", default-features = false, features = ["generic"] }
 # The bare `LinkT`/`interfaces` surface `blue` itself builds on;
 # `default-features = false` keeps std/alloc off, matching how `blue`
 # depends on it.
