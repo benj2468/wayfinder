@@ -19,7 +19,7 @@ mod transport;
 pub use snoop::McastSnooper;
 pub use transport::FrameIo;
 
-#[cfg(feature = "tokio")]
+#[cfg(feature = "ble")]
 mod blue;
 #[cfg(feature = "tokio")]
 mod driver;
@@ -28,7 +28,7 @@ mod net;
 #[cfg(feature = "tokio")]
 mod rylr998;
 
-#[cfg(feature = "tokio")]
+#[cfg(feature = "ble")]
 pub use blue::build_ble_link;
 #[cfg(feature = "tokio")]
 pub use driver::Driver;
@@ -36,7 +36,7 @@ pub use driver::Driver;
 pub use net::build_udp_link;
 // Re-exported so a node assembling a BLE link configures it without taking a
 // direct `blue` dependency, matching how `Rylr998LinkParams` is surfaced.
-#[cfg(feature = "tokio")]
+#[cfg(feature = "ble")]
 pub use ::blue::BleLinkParams;
 #[cfg(feature = "tokio")]
 pub use raw::RawL2Link;
