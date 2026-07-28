@@ -50,6 +50,22 @@ blue = { path = "../../libs/blue", default-features = false, features = ["generi
 # `default-features = false` keeps std/alloc off, matching how `blue`
 # depends on it.
 wayfinder = { path = "../../libs/wayfinder", default-features = false }
+# The tokio event loop that actually runs the mesh node — same crate
+# `wayfinder-tap` uses. `default-features = false, features = ["tokio"]`
+# (not the crate's default, which also turns on `ble`): `tokio` alone still
+# implies `std` (see its own feature list), but skips `wayfinder-driver`'s
+# `ble` feature — its BlueZ-backed `build_ble_link`/`BleLinkParams`, unused
+# here (this crate builds its own `blue` `generic`-feature link above) and
+# fatal to pull in anyway, since `bluer` refuses to compile at all for
+# `target_os = "android"`. Re-exports `QueryTx`/`QueryRx`-adjacent wiring so
+# this crate doesn't need a direct `wayfinder-server` dep.
+wayfinder-driver = { path = "../../libs/wayfinder-driver", default-features = false, features = [
+    "tokio",
+] }
+# `WayfinderRequest`/`WayfinderResponse`, for `query_management_api`'s
+# decode/encode of the bytes crossing the UniFFI boundary.
+wayfinder-protos = { path = "../../libs/wayfinder-protos" }
+prost = { version = "0.13", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 # UniFFI proc-macro export surface for `src/lib.rs` — no UDL file, no
 # `build.rs` scaffolding step; `#[uniffi::export]`/`uniffi::setup_scaffolding!`
@@ -64,3 +80,6 @@ uniffi = "0.28"
 async-trait = "0.1"
 thiserror = "2.0.18"
 tracing = { version = "0.1.44", default-features = false }
+# `Mac::as_bytes()` (`IntoBytes`) — for framing the synthetic Ethernet header
+# `local.rs`'s `LoopbackLocal` wraps host-originated payloads in.
+zerocopy = "0.8"

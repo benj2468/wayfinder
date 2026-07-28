@@ -7,7 +7,7 @@ edition = "2024"
 workspace = true
 
 [features]
-default = ["tokio", "std"]
+default = ["tokio", "std", "ble"]
 # Enables the tokio-driven event loop, the concrete `tokio::net` frame
 # transports, and the in-process server wiring.  Without it the crate exposes
 # only the transport-agnostic [`FrameIo`] trait and the IGMP [`McastSnooper`].
@@ -17,16 +17,27 @@ tokio = [
     "dep:socket2",
     "dep:libc",
     "dep:rylr998",
-    "dep:blue",
     "dep:tokio-serial",
     "dep:embedded-io-adapters",
     "dep:embedded-io-async",
     "std",
 ]
 # `blue?/std` (not `blue/std`): enabling `std` alone must not drag in the BLE
-# link and its whole BlueZ/D-Bus dependency tree — that is `tokio`'s to pull,
-# since only the tokio event loop can build the link.
-std = ["dep:async-trait", "wayfinder/std", "blue?/std"]
+# link and its whole BlueZ/D-Bus dependency tree — that is `ble`'s to pull.
+std = ["dep:async-trait", "wayfinder/std"]
+# This crate's own `build_ble_link`/`BleLinkParams` (BlueZ over D-Bus, via
+# `blue`'s `std` feature) — split out from `tokio`/`std` (rather than folded
+# into either) so a consumer that brings its own `blue` backend can depend on
+# this crate's `Driver`/transports without also pulling BlueZ. Concretely:
+# `bins/wayfinder-pixel` cross-compiles to `aarch64-linux-android` with its
+# own `blue` (`generic` feature, a foreign-advertiser bridge, no BlueZ) and
+# never calls `build_ble_link` — `bluer` refuses to build at all for
+# `target_os = "android"` (`compile_error!`), so unifying its `blue` dep with
+# an unconditional `blue?/std` here would break that build. In `default` (not
+# folded into `tokio`) so every other consumer (`wayfinder-tap`) keeps today's
+# zero-config behavior; `wayfinder-pixel` opts out with `default-features =
+# false, features = ["tokio"]`.
+ble = ["dep:blue", "blue?/std"]
 
 [dependencies]
 wayfinder.workspace = true
