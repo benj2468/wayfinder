@@ -11,9 +11,15 @@
 //! [`Clock`] paces the OGM timer. Both interfaces are dispatched through the
 //! board-local [`MeshLink`] enum, since [`Driver`] takes one concrete link
 //! type. The embassy thread-mode executor drives the driver's `async` loop
-//! forever. A second UART exposes the management API on the DK's
-//! onboard-debugger VCOM port, so the node is inspectable
-//! (`wayfinder-tui`/`wayfinderctl --serial`) without a second mesh node.
+//! forever.
+//!
+//! This board previously also served the management API over a second UART on
+//! the DK's onboard-debugger VCOM port. That wiring was deliberately removed
+//! during BLE bring-up and the node is currently *not* inspectable over serial
+//! — `wayfinder-embedded-driver`'s `mgmt` feature and `wayfinder-server` are
+//! still depended on but unwired, so restoring it is a matter of rebuilding
+//! the `UARTE1` + `EmbeddedQueryChannel` + `serve` path and swapping
+//! `driver.run()` back for `driver.run_with_mgmt(&query_rx)`.
 //!
 //! [`BufferedUarte`]: embassy_nrf::buffered_uarte::BufferedUarte
 //! [`LinkT`]: wayfinder::link::LinkT
@@ -23,14 +29,17 @@
 
 use blue::NrfBleLink;
 use embassy_executor::Spawner;
-use embassy_futures::join::join;
 use embassy_nrf::bind_interrupts;
 use embassy_nrf::buffered_uarte;
+use embassy_nrf::buffered_uarte::BufferedUarte;
 use embassy_nrf::gpio::Level;
 use embassy_nrf::gpio::Output;
 use embassy_nrf::gpio::OutputDrive;
+use embassy_nrf::interrupt::InterruptExt;
+use embassy_nrf::interrupt::Priority;
 use embassy_nrf::nvmc::Nvmc;
 use embassy_nrf::nvmc::{self};
+use embassy_nrf::pac::Interrupt;
 use embassy_nrf::peripherals;
 use embassy_nrf::uarte::Baudrate;
 use embassy_nrf::uarte::Config as UarteConfig;
@@ -62,9 +71,6 @@ use wayfinder_embedded_driver::TrickleParams;
 use wayfinder_embedded_driver::identity::IDENTITY_READ_BUF_LEN;
 use wayfinder_embedded_driver::identity::IdentityError;
 use wayfinder_embedded_driver::identity::load_or_init_identity;
-use wayfinder_server::EmbeddedQueryChannel;
-use wayfinder_server::FrameError;
-use wayfinder_server::serve;
 use wayfinder_storage::FlashStore;
 
 #[global_allocator]
@@ -87,14 +93,16 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     }
 }
 
-/// Bytes reserved for `alloc`.  Two users share it: `tracing-core`'s bookkeeping
-/// and the management server's per-request buffers.  Sized against
-/// `wayfinder_server::framing::MAX_FRAME_LEN` (4 KiB): `serve` holds one
-/// in-flight buffer per direction, so a single connection can pin up to 8 KiB
-/// in framing buffers alone; this leaves ~24 KiB of headroom for the
-/// `RouterAdapter` response `Vec`s a query itself builds plus tracing's
-/// bookkeeping — tiny against the part's 256 KiB SRAM. Grow both constants
-/// together if a real routing-table response ever gets close to the cap.
+/// Bytes reserved for `alloc`. Its only current user is `tracing-core`'s
+/// bookkeeping, which needs a small fraction of this.
+///
+/// Still sized for the management server that used to run here (see the module
+/// doc): `wayfinder_server::framing::MAX_FRAME_LEN` is 4 KiB and `serve` holds
+/// one in-flight buffer per direction, so a single connection could pin 8 KiB
+/// in framing buffers alone, leaving ~24 KiB for the `RouterAdapter` response
+/// `Vec`s a query builds. Left at 32 KiB rather than shrunk to fit tracing
+/// alone — it is tiny against the part's 256 KiB SRAM, and re-wiring the mgmt
+/// API would need it straight back.
 const HEAP_SIZE_BYTES: usize = 32 * 1024;
 
 /// LoRa network id shared by every node in this mesh (RYLR `AT+NETWORKID`).
@@ -136,12 +144,12 @@ fn ficr_derived_mac() -> Mac {
     Mac(octets)
 }
 
-// Bind the UARTE0 (RYLR998, if attached) and UARTE1 (management-API VCOM
-// link) interrupts to the buffered-UARTE handler so the driver's async serial
-// reads/writes are woken by hardware rather than polled.
+// Bind the UARTE0 (RYLR998, if attached) interrupt to the buffered-UARTE
+// handler so the driver's async serial reads/writes are woken by hardware
+// rather than polled. UARTE1 carried the management-API VCOM link until that
+// was removed during BLE bring-up (see the module doc) and is currently unbound.
 bind_interrupts!(struct Irqs {
     UARTE0 => buffered_uarte::InterruptHandler<peripherals::UARTE0>;
-    UARTE1 => buffered_uarte::InterruptHandler<peripherals::UARTE1>;
 });
 
 /// An `embassy-time`-backed [`Clock`] for the embedded driver: the monotonic
@@ -174,11 +182,16 @@ enum MeshLink<S> {
     /// No RYLR998 module was detected at boot on this slot's UART. Unlike a
     /// genuine link fault, an absent external module is an expected shape
     /// (a BLE-only deployment) — this variant keeps the link array's size
-    /// fixed at compile time while contributing nothing: `send` reports
-    /// failure (so the driver's existing fire-and-forget handling logs and
-    /// drops it, same as any other radio send failure) and `recv` never
-    /// resolves, since nothing will ever arrive on a medium with nothing
-    /// attached.
+    /// fixed at compile time while contributing nothing.
+    ///
+    /// `send` reports [`LinkError::NotPresent`], which the driver logs at
+    /// `trace!` and does *not* feed to the transmit-rate estimator. Both
+    /// halves matter: a `TransmitFailed` here would `warn!` once per OGM on
+    /// every BLE-only board, and an `Ok(0)` would record a transmitted frame,
+    /// publishing a non-zero `tx_fps` for hardware that isn't attached. The
+    /// one-time `warn!` at boot is the operator's signal that this slot is
+    /// empty. `recv` never resolves, since nothing will ever arrive on a
+    /// medium with nothing attached.
     Absent,
 }
 
@@ -190,7 +203,7 @@ where
         match self {
             MeshLink::Rylr(link) => link.send(origin, data).await,
             MeshLink::Ble(link) => link.send(origin, data).await,
-            MeshLink::Absent => Err(LinkError::TransmitFailed),
+            MeshLink::Absent => Err(LinkError::NotPresent),
         }
     }
 
@@ -221,6 +234,16 @@ async fn main(spawner: Spawner) {
     wayfinder_embedded_log::init();
 
     info!("Welcome to Wayfinder");
+
+    // Same SoftDevice restriction as described just below, for the UARTE0
+    // interrupt the RYLR998 link uses. `embassy_nrf::config::Config` has no
+    // field for UARTE priority — unlike GPIOTE/RTC1, it stays at the hardware
+    // reset default (highest, priority 0) until set explicitly — so it is
+    // dropped to `P2` straight on the NVIC here rather than through the
+    // `nrf_config` built below. Order only matters relative to the SoftDevice
+    // being enabled (in `NrfBleLink::new`, later); nothing between here and
+    // there resets NVIC priorities.
+    Interrupt::UARTE0.set_priority(Priority::P2);
 
     // The SoftDevice (brought up later, in `NrfBleLink::new`) reserves NVIC
     // priority levels 0 and 1 for itself and rejects `sd_softdevice_enable()`
@@ -286,6 +309,10 @@ async fn main(spawner: Spawner) {
     };
     info!(?node_mac, "resolved node identity");
 
+    // LED1 (P0.13, active-low) lit = firmware booted and reached the run loop.
+    // Moved into the mesh task below, which is what actually lights it.
+    let led = Output::new(p.P0_13, Level::High, OutputDrive::Standard);
+
     // The buffered UARTE needs `'static` scratch buffers; `rx_buffer.len()` must
     // be even.  Each `static mut` is taken by a unique `&mut` exactly once here.
     let rx_buffer: &'static mut [u8] = {
@@ -323,9 +350,33 @@ async fn main(spawner: Spawner) {
         tx_buffer,
     );
 
-    // LED1 (P0.13, active-low) lit = firmware booted and reached the run loop.
-    let mut led = Output::new(p.P0_13, Level::High, OutputDrive::Standard);
+    info!("constructing wayfinder task");
 
+    // Run the mesh loop. `led` moves into the task rather than being lit here:
+    // `Output`'s `Drop` disconnects the pin, and `main` returns as soon as the
+    // task is queued, so a local LED would be driven for a few microseconds and
+    // then float. Lighting it inside the task also makes the documented meaning
+    // ("reached the run loop") true, rather than merely "was queued".
+    let Ok(task) = wayfinder(node_mac, uarte, spawner, led) else {
+        // Halting rather than falling through: with no mesh task there is
+        // nothing to run, and continuing would leave LED1 dark while the board
+        // sits idle looking booted. Matches every other genuine fault here.
+        error!("failed to spawn wayfinder task; halting");
+        loop {
+            cortex_m::asm::wfe();
+        }
+    };
+    info!("spawning wayfinder task");
+    spawner.spawn(task);
+}
+
+#[embassy_executor::task]
+async fn wayfinder(
+    node_mac: Mac,
+    uarte: BufferedUarte<'static>,
+    spawner: Spawner,
+    led: Output<'static>,
+) {
     // Bring up the RYLR998 if one is actually wired to this UART, and
     // configure the shared LoRa settings every node in this mesh must agree
     // on. Unlike BLE (built into the chip, always present), this is an
@@ -382,6 +433,15 @@ async fn main(spawner: Spawner) {
         MeshLink::Rylr(client)
     };
 
+    // TODO: unconfirmed workaround, added during hardware bring-up ("add
+    // wait") with no recorded root cause. Suspected to paper over a
+    // SoftDevice-enable race against the RYLR998 UART bring-up just above (or
+    // against the UARTE0/UARTE1 priority calls further up), but that hasn't
+    // been verified against real hardware. Don't remove without confirming on
+    // a board that BLE bring-up is still reliable without it.
+    debug!("waiting 1s before starting Ble");
+    Timer::after_secs(1).await;
+
     // Bring up this node's second mesh interface: BLE advertising broadcast
     // over the chip's built-in radio. Unlike the RYLR998 above, this radio is
     // always physically present, so a bring-up failure here is a genuine
@@ -398,15 +458,15 @@ async fn main(spawner: Spawner) {
     };
     debug!("BLE link brought up");
 
-    // Reached the run loop: signal liveness on LED1.
-    led.set_low();
+    let links = [rylr_link, MeshLink::Ble(ble_link)];
 
-    // Per-link Trickle schedules, in the same order as the `links` array
-    // below. LoRa's is a relaxed cadence suited to its low airtime budget
-    // (harmless overhead if `rylr_link` turned out `Absent` — that slot just
-    // never has anything to send); BLE's tighter bounds reflect its much
-    // higher duty-cycle budget — both provisional pending real airtime
-    // measurements on hardware (see `libs/blue/CLAUDE.md`).
+    // Per-link Trickle schedules, in the same order as the `links` array above
+    // — the coupling is positional, so swapping these silently gives each radio
+    // the other's cadence rather than failing to compile. LoRa's is a relaxed
+    // cadence suited to its low airtime budget; BLE's tighter bounds reflect
+    // its much higher duty-cycle budget, and its `i_max` is mirrored by
+    // `ogm.i_max_ms` on the `Ble` link in `var/conf/install.yml` so a host node
+    // and this board agree on the schedule.
     let trickle = [
         TrickleParams {
             i_min: core::time::Duration::from_secs(5),
@@ -414,89 +474,18 @@ async fn main(spawner: Spawner) {
         },
         TrickleParams {
             i_min: core::time::Duration::from_secs(1),
-            i_max: core::time::Duration::from_secs(64),
+            i_max: core::time::Duration::from_secs(20),
         },
     ];
 
-    let mut driver = Driver::new(
-        node_mac,
-        [rylr_link, MeshLink::Ble(ble_link)],
-        EmbassyClock,
-        &trickle,
-        &[],
-    );
+    let mut driver = Driver::new(node_mac, links, EmbassyClock, &trickle, &[]);
 
-    // Bring up the second UART on the DK's onboard-debugger VCOM lines so the
-    // management API is reachable as a USB serial device (`/dev/ttyACM*`) with no
-    // extra wiring: on the PCA10056, P0.06 = nRF TX → host and P0.08 = nRF RX ←
-    // host.  No hardware flow control (the RYLR link runs without it too).  The
-    // scratch buffers follow the same `'static`, taken-once pattern as the RYLR
-    // UART above; `rx_buffer.len()` must be even.
-    let mgmt_rx_buffer: &'static mut [u8] = {
-        static mut RX: [u8; 256] = [0; 256];
-        // SAFETY: `main` runs once, so this is the only `&mut` ever taken to `RX`.
-        unsafe { &mut *core::ptr::addr_of_mut!(RX) }
-    };
-    let mgmt_tx_buffer: &'static mut [u8] = {
-        static mut TX: [u8; 256] = [0; 256];
-        // SAFETY: `main` runs once, so this is the only `&mut` ever taken to `TX`.
-        unsafe { &mut *core::ptr::addr_of_mut!(TX) }
-    };
-    let mut mgmt_uarte_config = UarteConfig::default();
-    mgmt_uarte_config.baudrate = Baudrate::BAUD115200;
-    mgmt_uarte_config.parity = Parity::EXCLUDED;
-    let mut mgmt_uart = buffered_uarte::BufferedUarte::new(
-        p.UARTE1,
-        p.TIMER1,
-        p.PPI_CH2,
-        p.PPI_CH3,
-        p.PPI_GROUP1,
-        p.P0_08, // RXD: host TX → nRF RX
-        p.P0_06, // TXD: nRF TX → host RX
-        Irqs,
-        mgmt_uarte_config,
-        mgmt_rx_buffer,
-        mgmt_tx_buffer,
-    );
+    // Reached the run loop: signal liveness on LED1 (active-low). Held for the
+    // lifetime of this task, so the pin stays driven — dropping it would
+    // disconnect the pin and the LED would go dark.
+    let mut led = led;
+    led.set_low();
+    info!("wayfinder started");
 
-    // The query channel bridging the management serve loop to the router loop.
-    let query_channel = EmbeddedQueryChannel::new();
-    let (query_tx, query_rx) = query_channel.split();
-
-    // The serve loop owns the VCOM UART and frames management requests against
-    // the channel. It never gives up permanently: the node keeps routing
-    // regardless (only the management link is affected), and `serve` returning
-    // is retried rather than treated as a one-shot failure, since its most
-    // common cause — an operator's serial terminal disconnecting/reconnecting —
-    // is routine, not exceptional.
-    let mgmt = async {
-        loop {
-            match serve(&mut mgmt_uart, &query_tx).await {
-                // A clean disconnect, mid-frame or between frames — the ordinary
-                // shape of a serial terminal reattaching. Reopen the link.
-                Err(FrameError::UnexpectedEof) => {
-                    trace!("management link disconnected; awaiting reconnect");
-                }
-                // A peer-supplied length prefix desynchronised the stream: a
-                // protocol violation reachable by whatever's on the other end of
-                // the wire, not a node-local fault, so this stays below error!.
-                Err(e @ FrameError::Oversized(_)) => {
-                    warn!(?e, "management link reset: oversized frame");
-                }
-                // A genuine UART fault: node-local, not attacker-triggerable, and
-                // (until this loop retries) a permanently lost resource — exactly
-                // what error! is for. Back off briefly so a persistently broken
-                // UART can't turn this into a tight retry loop.
-                Err(e @ FrameError::Io(_)) => {
-                    error!(?e, "management UART I/O error; retrying");
-                    Timer::after(EmbassyDuration::from_millis(100)).await;
-                }
-                Ok(()) => unreachable!("serve only returns via an error"),
-            }
-        }
-    };
-
-    // Run the mesh loop (now also servicing management queries) and the serve
-    // loop concurrently on the one executor task; neither ever returns.
-    join(driver.run_with_mgmt(&query_rx), mgmt).await;
+    driver.run().await
 }

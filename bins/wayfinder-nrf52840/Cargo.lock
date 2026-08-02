@@ -398,6 +398,7 @@ dependencies = [
  "document-features",
  "embassy-executor-macros",
  "embassy-executor-timer-queue",
+ "log",
 ]
 
 [[package]]
@@ -471,6 +472,7 @@ dependencies = [
  "embedded-storage",
  "embedded-storage-async",
  "fixed",
+ "log",
  "nrf-pac",
  "rand_core 0.6.4",
  "rand_core 0.9.5",
@@ -504,6 +506,7 @@ dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-async",
  "futures-core",
+ "log",
 ]
 
 [[package]]
@@ -986,6 +989,7 @@ dependencies = [
  "fixed",
  "futures",
  "heapless",
+ "log",
  "nrf-softdevice-macro",
  "nrf-softdevice-s140",
  "num_enum",
@@ -1729,6 +1733,7 @@ name = "wayfinder-embedded-log"
 version = "0.1.0"
 dependencies = [
  "heapless",
+ "log",
  "rtt-target",
  "tracing-core",
 ]

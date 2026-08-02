@@ -9,6 +9,16 @@ pub enum LinkError {
     /// The frame could not be transmitted onto the medium.
     #[error("transmit failed")]
     TransmitFailed,
+    /// There is no radio behind this link, so nothing was — or ever will be —
+    /// transmitted.
+    ///
+    /// Distinct from [`Self::TransmitFailed`], which means a real radio tried
+    /// and failed. A board keeping its link array a fixed size uses this for
+    /// slots whose hardware isn't wired: that is not a fault to warn about once
+    /// per OGM, but it must not be recorded as a transmission either, or the
+    /// absent interface publishes itself as live-and-idle.
+    #[error("link not present")]
+    NotPresent,
     /// A frame could not be received from the medium.
     #[error("receive failed")]
     ReceiveFailed,

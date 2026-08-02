@@ -46,13 +46,17 @@ wayfinder = { path = "../../libs/wayfinder", default-features = false }
 # The HAL-agnostic embedded driver that runs the router loop, and the RYLR998
 # LoRa driver whose `RylrClient` is one of this board's two mesh `LinkT`s
 # (dispatched via `main.rs`'s `MeshLink` enum, alongside `blue`).  `mgmt`
-# adds the event-loop arm that serves management-API queries off the VCOM UART.
+# adds the event-loop arm that serves management-API queries off a UART —
+# retained but currently unwired, since the VCOM management path was removed
+# during BLE bring-up (see `main.rs`'s module doc).
 wayfinder-embedded-driver = { path = "../../libs/wayfinder-embedded-driver", features = [
     "mgmt",
 ] }
 # The `no_std` management transport: the `EmbeddedQueryChannel` bridging the
-# serve loop to the driver, and the `serve` loop that frames requests over the
-# onboard-debugger VCOM UART.  Only its `embedded` feature — no `std`/tokio.
+# serve loop to the driver, and the `serve` loop that frames requests over a
+# UART.  Only its `embedded` feature — no `std`/tokio.  Also retained but
+# currently unwired; kept so restoring the management path is a `main.rs`
+# change rather than a dependency change.
 wayfinder-server = { path = "../../libs/wayfinder-server", default-features = false, features = [
     "embedded",
 ] }
@@ -85,7 +89,7 @@ nrf-ieee802154 = { path = "../../libs/nrf-ieee802154" }
 # pulls in `nrf-softdevice` — see `libs/blue/CLAUDE.md`). Mutually
 # exclusive with `nrf-ieee802154` ever being wired live (RADIO-peripheral
 # conflict), which is fine since 802.15.4 isn't wired live here.
-blue = { path = "../../libs/blue", default-features = false, features = ["hardware"] }
+blue = { path = "../../libs/blue", default-features = false, features = ["hardware", "softdevice-log"] }
 # `time-driver-rtc1` backs `embassy-time` (the driver's `Clock`); `gpiote` +
 # `unstable-pac` are pulled in by the HAL for GPIO/UARTE.
 embassy-nrf = { version = "0.10.0", features = [
@@ -93,17 +97,27 @@ embassy-nrf = { version = "0.10.0", features = [
     "time-driver-rtc1",
     "gpiote",
     "unstable-pac",
+    "log",
 ] }
 # 0.10 (bumped from 0.9): required to spawn `blue`'s SoftDevice
 # event-pump/scan-loop background tasks, which are pinned to 0.10 — see
 # `libs/blue/CLAUDE.md`. `embassy-nrf`/the rest of this board's bring-up
 # didn't need to move, since `nrf-softdevice` has no `embassy-nrf` dependency.
+# Deliberately *not* `executor-interrupt`: `blue`'s `SdHandle`/`ReportQueue`
+# carry hand-written `unsafe impl Send`/`Sync` whose soundness rests on this
+# firmware running one executor on one core, with no preemption between tasks
+# (`ReportQueue` uses a `NoopRawMutex`, which does no critical-section work at
+# all). An `InterruptExecutor` preempts thread mode at NVIC priority and would
+# silently invalidate that. Enabling the feature is the tripwire — if a future
+# change needs it, `ReportQueue` must move to `CriticalSectionRawMutex` first.
 embassy-executor = { version = "0.10", features = [
     "platform-cortex-m",
     "executor-thread",
+    "log",
 ] }
-embassy-time = "0.5.1"
+embassy-time = { version = "0.5.1", features = ["log"] }
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+# Embassy Executor requires this to be a dependency
 cortex-m-rt = "0.7"
 # `tracing-core` (pulled in via `tracing`, used throughout the mesh stack for
 # logging) does an unconditional `extern crate alloc;` regardless of feature

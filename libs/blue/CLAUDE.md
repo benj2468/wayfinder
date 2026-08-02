@@ -53,20 +53,68 @@ later phase, only the UniFFI plumbing exists so far. This generic-over-
 
 ## BlueZ specifics (`src/std_link.rs`)
 
-Three non-obvious requirements, each of which silently yields a link that
-looks alive but moves no traffic if missed:
+Non-obvious requirements, each of which silently yields a link that looks
+alive but moves no traffic — or, worse, *some* traffic — if missed:
 
 - **The advertisement handle must be held.** `bluer` unregisters an
   advertisement when its handle drops, so `send` sleeps for
   `advertise_dwell` before dropping it. Dropping it immediately (`let _ =`)
   registers and retires the advertisement without a single advertising event
   reaching the air.
-- **`duplicate_data: true` on the discovery filter.** BlueZ suppresses
-  repeated `ManufacturerData` by default, which hides every fragment after a
-  peer's first one.
-- **`discover_devices_with_changes()`, not `discover_devices()`.** The
-  latter reports each peer once, on first discovery; only the former
-  re-reports on the property change that a fresh advertisement produces.
+- **Duplicates are filtered at two independent layers, and both must be
+  disabled.** Getting one and not the other still loses every fragment after
+  a peer's first.
+  - *Controller layer* — needs the advertisement monitor (`mesh_monitor()`).
+    The kernel runs its LE scan with the HCI `filter_duplicates` parameter
+    disabled only while a monitor is active, and controllers deduplicate
+    reports keyed on advertiser address without comparing the payload. Since
+    a frame spans several fragments from one address, that costs whole frames
+    rather than stray fragments. Confirm with `btmon`: read
+    `Filter duplicates:` on the `LE Set Scan Enable` command.
+  - *BlueZ layer* — needs `duplicate_data: true` on the `DiscoveryFilter`.
+    This is still load-bearing and is **not** superseded by the monitor: it
+    disables BlueZ's own suppression of repeated `ManufacturerData`, which is
+    what makes the property change fire more than once per peer.
+    `DiscoveryFilter` derives `Default`, so omitting the field leaves
+    BlueZ-level filtering on.
+- **Fragment bytes come from the property-change event, never a read-back.**
+  `discover_devices_with_changes()` looks right and isn't: bluer discards the
+  changed value and re-emits a bare `DeviceAdded`, so servicing it means
+  asking BlueZ what the data is *now*. That samples current state instead of
+  consuming what changed — with several fragments in flight from one peer it
+  observes the latest blob repeatedly and never sees the earlier ones. Hence
+  plain `discover_devices()` for the discovery signal plus a per-device
+  `Device::events()` subscription for values, with a one-time read-back only
+  to seed state predating the subscription.
+
+Two host-side settings in `/etc/bluetooth/main.conf` (NixOS:
+`hardware.bluetooth.settings`), neither of which this crate can supply for
+itself:
+
+- **`Experimental = true`** (or `bluetoothd --experimental`), BlueZ ≥ 5.55.
+  `org.bluez.AdvertisementMonitorManager1` is gated behind it; without it
+  `RegisterMonitor` fails with `org.freedesktop.DBus.Error.UnknownMethod` and
+  the link runs degraded. `register_mesh_monitor` treats that as
+  non-fatal-but-loud rather than tearing the link down. Note bluer issues
+  `RegisterMonitor` inside `Adapter::monitor()`, *not* inside
+  `MonitorManager::register()` — guarding only the latter still propagates
+  the failure. Check with
+  `busctl introspect org.bluez /org/bluez org.bluez.AdvertisementMonitorManager1`.
+- **`Privacy = device`.** Reassembly keys on the advertiser address
+  (`FragKey`), so that address has to stay put for at least the time a frame
+  spends on the air. Non-connectable advertising asks the kernel for privacy,
+  and with no RPA configured it answers with a fresh *non-resolvable* private
+  address per advertising session — and since `BluerAdvertiser::advertise`
+  registers and tears down one advertisement per fragment, every fragment
+  would leave under a different address and nothing would ever reassemble.
+  `Privacy = device` moves it onto the RPA path, which holds one address for
+  the rotation timeout (~15 min) instead. This is a deployment dependency
+  accepted deliberately: the mesh owns every device it integrates with, so
+  pinning host config is cheaper than spending payload bytes on a sender tag
+  in the fragment header. It does not generalise — Android's
+  `BluetoothLeAdvertiser` gives an app no control over the advertising
+  address at all, so the planned pixel backend will have to revisit the
+  keying rather than inherit this.
 
 `advertise_dwell` (config: `advertise_dwell_ms`, default 150 ms) is the
 airtime knob. It must outlast the controller's advertising interval — BlueZ's
@@ -181,9 +229,14 @@ Nothing here has been validated against a real radio, on either backend —
 treat every timing constant as a first guess.
 
 **nRF (`src/nrf_link.rs`)**: exact `Softdevice::Config` role/connection-count
-tuning (currently `Config::default()`), the advertising/scan interval
-constants, and whether 40 ms per fragment is enough for a passive scanner to
-reliably catch every advertisement.
+tuning (currently `Config::default()`), the scan interval constants, and
+whether `ADV_EVENTS_PER_FRAGMENT` (4) advertising events at
+`ADV_INTERVAL_625US` (20 ms) is enough for a passive scanner to reliably catch
+every advertisement. **`ADV_INTERVAL_625US` is the value to watch first on
+hardware**: 20 ms is the SoftDevice's documented `BLE_GAP_ADV_INTERVAL_MIN`,
+but if the stack rejects it for non-connectable advertising the symptom is
+`advertise` returning an error and the link transmitting nothing — fall back to
+160 (100 ms), which is unambiguously valid for every advertising type.
 
 **BlueZ (`src/std_link.rs`)**: whether the 150 ms default dwell actually
 clears the controller's advertising interval; whether register/advertise/
@@ -192,7 +245,17 @@ round-trips dominate; and, above all, **whether the two backends really do
 interoperate on the air** — the shared wire format is pinned by unit test,
 but no nRF node and Linux node have yet exchanged a frame.
 
-A `send` occupies the driver's event loop for `dwell × fragment_count`
-(up to ~2 s for a full-size frame), the same "slow link stalls the loop"
-property the LoRa link has. If that turns out to hurt in practice, the fix
-is in the driver's scheduling, not here.
+A `send` occupies the driver's event loop for `dwell × fragment_count` on both
+backends — the same "slow link stalls the loop" property the LoRa link has —
+but the two dwells differ by an order of magnitude, so quote them separately:
+
+| backend | per-fragment dwell | full-size frame (14 fragments) |
+|---|---|---|
+| nRF | ~80 ms (4 events × 20 ms) | ~1.1 s |
+| BlueZ | 150 ms (`advertise_dwell`) | ~2.1 s |
+
+If that turns out to hurt in practice, the fix is in the driver's scheduling,
+not here. Note the nRF figure is only this small because `max_events` is set:
+leaving it unset makes the SoftDevice advertise unlimited events and the
+`timeout` backstop becomes the sole bound, which at a 1 s backstop is ~14 s
+per frame.
