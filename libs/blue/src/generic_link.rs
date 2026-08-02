@@ -97,6 +97,16 @@ impl BleReportSink {
     pub fn is_closed(&self) -> bool {
         self.tx.is_closed()
     }
+
+    /// Resolves once this sink's [`BleLink`] has been dropped.
+    ///
+    /// A scan producer selects on this rather than polling [`Self::is_closed`]
+    /// between events: a backend that only re-checks after its *next* radio
+    /// event would keep the whole scan apparatus alive indefinitely on a quiet
+    /// radio, which is exactly when nothing arrives to wake it.
+    pub async fn closed(&self) {
+        self.tx.closed().await;
+    }
 }
 
 /// A [`LinkT`] carrying the mesh over BLE connectionless advertising, generic
@@ -181,6 +191,11 @@ impl<A: BleAdvertiser> LinkT for BleLink<A> {
                 trace!(addr = ?report.addr, "drop: malformed fragment header");
                 continue;
             };
+            // Keying on the advertiser address assumes it holds still for at
+            // least as long as a frame takes to go out, which BLE does not
+            // promise — see `BluerAdvertiser`'s doc comment for the host
+            // config the BlueZ backend needs to make it true, and why that
+            // was preferred over a sender tag in the fragment header.
             let key = FragKey {
                 addr: report.addr,
                 msg_id: hdr.msg_id,

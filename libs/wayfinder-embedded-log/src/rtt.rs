@@ -1,6 +1,7 @@
-//! The RTT-backed `tracing` subscriber, compiled only for bare metal.
+//! The RTT-backed adapters for both logging facades, compiled only for bare
+//! metal. Each renders through [`crate::fmt::LineBuf`] onto the same RTT print
+//! channel, so `tracing` and `log` records interleave in one stream.
 
-use core::fmt::Write;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
@@ -16,17 +17,55 @@ use tracing_core::span::Attributes;
 use tracing_core::span::Id;
 use tracing_core::span::Record;
 
-/// Longest event line rendered to RTT; anything past this is truncated. Sized
-/// for a level + target + a handful of the short structured fields the mesh
-/// stack logs (macs, lengths, seqnos) — never payload bytes.
-const LINE_CAP: usize = 256;
+use crate::fmt::LineBuf;
 
-/// Initialize RTT and install [`RttSubscriber`] as the global tracing
-/// subscriber. A failure to set the global default (one is already installed)
-/// is ignored — logging is best-effort and must never fault the router.
+/// Initialize RTT and install both facades' global sinks: [`RttSubscriber`] for
+/// `tracing` and [`RttLogger`] for `log`. A failure to install either (one is
+/// already registered) is ignored — logging is best-effort and must never fault
+/// the router.
 pub fn init() {
     rtt_init_print!();
     let _ = tracing_core::dispatcher::set_global_default(Dispatch::new(RttSubscriber::new()));
+    let _ = log::set_logger(&RttLogger);
+    // `log`'s default max level is `Off`, which would discard every record
+    // before `RttLogger::enabled` is consulted. Filtering is left to the
+    // compile-time `max_level_*` features and the host-side RTT reader, matching
+    // `RttSubscriber::enabled`. No consumer currently sets a `max_level_*`
+    // feature on its `embassy-*` deps, so today that means unfiltered —
+    // deliberately, while this bring-up phase wants maximum SoftDevice/embassy
+    // visibility. If that chatter ever crowds out the mesh stack's own events
+    // on the shared RTT channel, cap it via those Cargo features rather than
+    // lowering this constant (which would blind every consumer at once).
+    log::set_max_level(log::LevelFilter::Trace);
+}
+
+/// The `log` sink for the third-party embedded crates (`embassy-*`,
+/// `nrf-softdevice`), which log through their own `fmt.rs` facade and so emit
+/// `log` records — never `tracing` ones — when built with their `log` feature.
+///
+/// A unit struct rather than a configured instance so it can be installed as a
+/// `&'static dyn Log`: `log::set_logger` takes a `'static` reference, and the
+/// heap-allocating `set_boxed_logger` needs `std`.
+struct RttLogger;
+
+impl log::Log for RttLogger {
+    /// Every record is enabled; see [`init`] on where filtering happens.
+    fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    /// Render one record to RTT in the same shape as a `tracing` event. `log`
+    /// formats eagerly, so the whole message arrives as one preformatted
+    /// `Arguments` rather than as separate structured fields.
+    fn log(&self, record: &log::Record<'_>) {
+        let mut line = LineBuf::new(record.level(), record.target());
+        line.push_args(record.args());
+        rprintln!("{}", line.as_str());
+    }
+
+    /// RTT writes are already pushed to the control block synchronously, so
+    /// there is nothing buffered on this side to flush.
+    fn flush(&self) {}
 }
 
 /// A `no_std`, heap-free tracing subscriber that prints each event to the RTT
@@ -37,9 +76,14 @@ pub fn init() {
 /// per-frame context in event *fields*, not span state, so flattening spans
 /// costs no information on these boards while keeping the subscriber stateless.
 struct RttSubscriber {
-    /// Source of unique, never-reused span ids (ids must be non-zero and
-    /// distinct for the lifetime of the dispatcher). 32-bit because Cortex-M4
-    /// has no 64-bit atomics; widened to the id's `u64` on issue.
+    /// Source of unique span ids (ids must be non-zero and distinct for the
+    /// lifetime of the dispatcher). 32-bit because Cortex-M4 has no 64-bit
+    /// atomics; widened to the id's `u64` on issue — that widening happens
+    /// *after* the counter itself wraps at `u32::MAX`, so it doesn't raise
+    /// the effective period. At one span per received frame
+    /// (`handle_frame_with_metrics`), sustained traffic reaches 2^32 spans
+    /// over a long-lived node's uptime, so [`RttSubscriber::new_span`] must
+    /// tolerate the wrap rather than assume it away.
     next_span: AtomicU32,
 }
 
@@ -59,11 +103,18 @@ impl Subscriber for RttSubscriber {
         true
     }
 
-    /// Issue a fresh, unique span id. `fetch_add` guarantees distinctness; the
-    /// counter starting at 1 keeps ids non-zero. Wrap-around is unreachable in
-    /// practice (2^64 spans on a mesh node).
+    /// Issue a fresh span id. `fetch_add` guarantees distinctness modulo the
+    /// counter's `u32` period; on the one call in ~4 billion where that wrap
+    /// lands on exactly 0, draw again rather than hand `Id::from_u64` the one
+    /// input it panics on. Spans aren't tracked by this subscriber (`record`/
+    /// `enter`/`exit` below are all no-ops), so the id's value is otherwise
+    /// inert — a wrapped counter must not be able to fault the router.
     fn new_span(&self, _span: &Attributes<'_>) -> Id {
-        Id::from_u64(u64::from(self.next_span.fetch_add(1, Ordering::Relaxed)))
+        let mut id = self.next_span.fetch_add(1, Ordering::Relaxed);
+        if id == 0 {
+            id = self.next_span.fetch_add(1, Ordering::Relaxed);
+        }
+        Id::from_u64(u64::from(id))
     }
 
     /// Spans are not tracked, so recorded span fields are dropped.
@@ -77,10 +128,9 @@ impl Subscriber for RttSubscriber {
     /// intentionally ignored.
     fn event(&self, event: &Event<'_>) {
         let meta = event.metadata();
-        let mut line: heapless::String<LINE_CAP> = heapless::String::new();
-        let _ = write!(line, "{:<5} {}:", meta.level(), meta.target());
+        let mut line = LineBuf::new(meta.level(), meta.target());
         event.record(&mut FieldVisitor(&mut line));
-        rprintln!("{}", line);
+        rprintln!("{}", line.as_str());
     }
 
     /// Spans are not tracked, so entering one is a no-op.
@@ -94,15 +144,14 @@ impl Subscriber for RttSubscriber {
 /// (the static event text) is written bare; every other field as ` name=value`.
 /// The typed `record_*` methods all fall through to `record_debug`'s default,
 /// so implementing it alone captures integers, bools, and strings too.
-struct FieldVisitor<'a>(&'a mut heapless::String<LINE_CAP>);
+struct FieldVisitor<'a>(&'a mut LineBuf);
 
 impl Visit for FieldVisitor<'_> {
     fn record_debug(&mut self, field: &Field, value: &dyn core::fmt::Debug) {
-        // Ignore write failures: an over-long line is simply truncated.
-        let _ = if field.name() == "message" {
-            write!(self.0, " {value:?}")
+        if field.name() == "message" {
+            self.0.push_message(value);
         } else {
-            write!(self.0, " {}={:?}", field.name(), value)
-        };
+            self.0.push_field(field.name(), value);
+        }
     }
 }

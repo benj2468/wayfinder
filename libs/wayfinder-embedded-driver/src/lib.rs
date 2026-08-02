@@ -34,6 +34,7 @@ use embassy_futures::select::Either;
 use embassy_futures::select::select;
 use embassy_futures::select::select_array;
 use heapless::Vec as HVec;
+use interfaces::link::LinkError;
 use tracing::trace;
 use tracing::warn;
 use wayfinder::CentralRouter;
@@ -256,6 +257,7 @@ impl<L: LinkT, C: Clock, const N: usize> Driver<L, C, N> {
             .router
             .next_broadcast_after(now)
             .min(self.router.next_keepalive_after(now));
+        trace!(?now, ?due, "run_once");
 
         // Destructure into disjoint field borrows so the planning step can hold
         // a borrow of `links` (via the recv futures) alongside `router`/`stage`.
@@ -493,6 +495,14 @@ async fn send_on<L: LinkT, const N: usize>(
     if let Some(link) = links.get_mut(idx) {
         match link.send(mac, data).await {
             Ok(sent) => router.record_tx(idx, sent, now),
+            // No radio in this slot: expected on a board whose link array is
+            // sized for hardware it may not have, so not a warning — and
+            // deliberately not recorded, since `record_tx` would touch the
+            // index into the interface table and publish an interface that
+            // physically isn't there.
+            Err(LinkError::NotPresent) => {
+                trace!(iface = idx, "drop: no radio on this link")
+            }
             Err(e) => warn!(iface = idx, error = ?e, "drop: link send failed"),
         }
     }
@@ -573,6 +583,54 @@ mod tests {
                 None => core::future::pending().await,
             }
         }
+    }
+
+    /// A link standing in for a radio slot that carries no hardware — the
+    /// `MeshLink::Absent` shape a board uses to keep its link array a fixed
+    /// size when a module isn't wired (see `bins/wayfinder-nrf52840`).
+    #[derive(Default)]
+    struct AbsentLink;
+
+    impl LinkT for AbsentLink {
+        async fn send(
+            &mut self,
+            _origin: Mac,
+            _data: &LinkFrameData<'_>,
+        ) -> Result<usize, LinkError> {
+            Err(LinkError::NotPresent)
+        }
+
+        async fn recv(&mut self) -> Result<Received<'_>, LinkError> {
+            core::future::pending().await
+        }
+    }
+
+    /// A slot with no radio behind it must not report transmitted frames.
+    ///
+    /// `record_tx` feeds the interface's transmit-rate estimator, and
+    /// `RateEstimator::observe` counts a *frame* regardless of its byte count —
+    /// so treating an absent link's `send` as a successful zero-byte
+    /// transmission publishes a non-zero `tx_fps` for hardware that isn't
+    /// attached. The interface still appears in `num_interfaces()` either way,
+    /// since it is configured for OGM emission; the throughput is what lies.
+    #[test]
+    fn absent_link_reports_no_transmitted_frames() {
+        let now = Duration::from_secs(30);
+        let trickle = [TrickleParams::default()];
+        let clock = ImmediateClock { now };
+        let mut driver = Driver::new(mac(1), [AbsentLink], clock, &trickle, &[]);
+
+        futures::executor::block_on(driver.run_once());
+
+        let throughput = driver
+            .router
+            .interface_throughput(0, now + Duration::from_secs(1))
+            .expect("interface is configured for OGM emission");
+        assert_eq!(
+            throughput.tx_fps, 0.0,
+            "an absent radio must not report transmitting frames"
+        );
+        assert_eq!(throughput.tx_bps, 0.0);
     }
 
     /// A clock frozen at a chosen instant whose `sleep` returns immediately, so

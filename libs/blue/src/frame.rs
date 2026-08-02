@@ -157,6 +157,21 @@ pub struct RawReport {
     pub(crate) data: [u8; MAX_FRAGMENT_BYTES],
 }
 
+/// Hand-written rather than derived, and deliberately omitting
+/// [`RawReport::data`]: that field is frame payload, and CLAUDE.md's logging
+/// rules forbid emitting payload bytes. A `#[derive(Debug)]` here would make
+/// `{:?}` of a report leak them, so the constraint lives in the type rather
+/// than in every call site's discipline.
+impl core::fmt::Debug for RawReport {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RawReport")
+            .field("addr", &self.addr)
+            .field("rssi", &self.rssi)
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
 impl RawReport {
     /// Copy `fragment` into a fixed-size `RawReport`, clamping to the
     /// buffer's capacity. A fragment recovered from a legacy, 31-byte-capped

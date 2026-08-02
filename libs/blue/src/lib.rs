@@ -45,6 +45,12 @@ pub use generic_link::BleAdvertiser;
 pub use generic_link::BleLink;
 #[cfg(feature = "generic")]
 pub use generic_link::BleReportSink;
+// `BleReportSink::submit` and `RawReport::new` both take a `BleAddr`, so
+// without this re-export it is an unnameable public type: a consumer feeding
+// the sink can pass one by inference but cannot store it, name it in a
+// signature, or put it in an error type. Exported in every configuration —
+// it is the reassembly key both backends share, not a `generic`-only concern.
+pub use addr::BleAddr;
 
 #[cfg(feature = "std")]
 mod std_link;

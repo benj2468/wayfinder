@@ -1407,6 +1407,7 @@ name = "wayfinder-embedded-log"
 version = "0.1.0"
 dependencies = [
  "heapless",
+ "log",
  "rtt-target",
  "tracing-core",
 ]

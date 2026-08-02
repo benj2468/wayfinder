@@ -14,8 +14,16 @@ workspace = true
 # only compiles for `target_os = "none"` (thumbv7em), where a `critical-section`
 # impl and a probe exist.
 
-# RTT + the subscriber only make sense on bare metal; gating the deps here (not
-# just the code) keeps the host build from pulling a backend it can't link.
+[dependencies]
+# Fixed-capacity line buffer so each event formats without touching the heap.
+# Unconditional (unlike the transport deps below) because `fmt.rs` — the shared
+# line formatter both facades render through — is host-buildable on purpose, so
+# its truncation behavior is covered by ordinary `cargo test`.
+heapless.workspace = true
+
+# RTT + the two facade adapters only make sense on bare metal; gating the deps
+# here (not just the code) keeps the host build from pulling a backend it can't
+# link.
 [target.'cfg(target_os = "none")'.dependencies]
 # `Dispatch`/`Subscriber`/`Event`/`Visit` — the no_std tracing plumbing. `std`
 # off; `alloc` (for `Dispatch`'s `Arc`) is always available via tracing-core's
@@ -24,5 +32,12 @@ tracing-core = { version = "0.1.36", default-features = false }
 # The RTT transport + `rprintln!`; uses the `critical-section-single-core` impl
 # the boards already enable via `cortex-m`.
 rtt-target = "0.5"
-# Fixed-capacity line buffer so each event formats without touching the heap.
-heapless.workspace = true
+# The *other* logging facade. The third-party embedded crates (`embassy-*`,
+# `nrf-softdevice`) log through their own `fmt.rs`, which emits either `defmt`
+# or `log` records — never `tracing`. `defmt` defers formatting to a host
+# decoder holding the ELF, so its records cannot be rendered to text on-device
+# and would need a second RTT channel (colliding with `rtt-target`'s control
+# block); `log` formats eagerly, so enabling those crates' `log` feature lets
+# `RttLogger` drop their records onto the one channel already in use.
+# `default-features = false`: no `std`.
+log = { version = "0.4", default-features = false }
