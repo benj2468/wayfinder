@@ -5,8 +5,19 @@ BATMAN-adv routing protocol implementation. `no_std`, heapless. Implements
 
 ## Types
 
-- `BatmanEngine<MAX_ORIGINATORS>` — core engine: originator table, broadcast
-  dedup table, and multicast membership tables (`local_mcast` / `mcast_members`).
+- `BatmanEngine<MAX_ORIGINATORS, MAX_INTERFACES, MAX_MCAST_MEMBERS,
+  MAX_LOCAL_MCAST>` — core engine: originator table, broadcast dedup table,
+  per-interface OGM/keep-alive timer banks, and multicast membership tables
+  (`local_mcast` / `mcast_members`). All but the first parameter default to the
+  crate constants of the same name, so `BatmanEngine<N>` keeps host sizing.
+  A constrained node picks a smaller profile instead: `BatmanEngine<16, 2, 8, 4>`
+  is 5,416 bytes against the host profile's 41,520.
+
+  **Runtime bounds must read the generic parameters, not the crate constants.**
+  `configure_interface_ogm` / `configure_interface_keepalive` reject
+  `idx >= MAX_INTERFACES` (the parameter); using `crate::MAX_INTERFACES` there
+  would let a 2-interface profile accept index 7 and overflow its timer bank.
+  `capacity_tests.rs` pins this, along with the defaults matching today's sizing.
 - `BatmanOgmPacket` — Originator Messages (OGM) for topology discovery. Matches
   batman-adv's `batadv_ogm_packet` layout (`flags`, `reserved`, big-endian
   `tvlv_len`); can carry a variable-length TVLV tail after the fixed header.

@@ -32,7 +32,13 @@ use crate::wire::ETH_P_BATMAN;
 use crate::wire::TvlvType;
 use crate::wire::find_tvlv;
 
-impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
+impl<
+    const MAX_ORIGINATORS: usize,
+    const MAX_INTERFACES: usize,
+    const MAX_MCAST_MEMBERS: usize,
+    const MAX_LOCAL_MCAST: usize,
+> BatmanEngine<MAX_ORIGINATORS, MAX_INTERFACES, MAX_MCAST_MEMBERS, MAX_LOCAL_MCAST>
+{
     /// Actively queries the BATMAN routing table for a given destination.
     /// Returns the immediate next-hop MAC address if a route exists.
     ///
@@ -285,9 +291,7 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
 
     /// Replace the set of multicast groups the local host listens to.  These
     /// are announced to the mesh in the multicast TVLV of every OGM this node
-    /// produces.  Groups beyond [`MAX_LOCAL_MCAST`] are dropped.
-    ///
-    /// [`MAX_LOCAL_MCAST`]: crate::MAX_LOCAL_MCAST
+    /// produces.  Groups beyond this engine's `MAX_LOCAL_MCAST` are dropped.
     pub fn set_local_mcast_groups(&mut self, groups: &[Mac]) {
         self.local_mcast.clear();
         for g in groups {
@@ -352,8 +356,8 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
 
     /// The sorted set of multicast group MACs currently attributed to `orig`.
     /// Used to detect whether an OGM's membership announcement changed anything.
-    fn mcast_groups_for(&self, orig: Mac) -> heapless::Vec<Mac, { crate::MAX_MCAST_MEMBERS }> {
-        let mut groups: heapless::Vec<Mac, { crate::MAX_MCAST_MEMBERS }> = self
+    fn mcast_groups_for(&self, orig: Mac) -> heapless::Vec<Mac, MAX_MCAST_MEMBERS> {
+        let mut groups: heapless::Vec<Mac, MAX_MCAST_MEMBERS> = self
             .mcast_members
             .iter()
             .filter(|(_, m)| *m == orig)
@@ -369,7 +373,8 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
     /// supplying that link's `i_min`/`i_max` at runtime.  Slots between the
     /// current length and `idx` are back-filled with the same bounds so the
     /// table stays dense and index-addressable.  Interfaces at or beyond
-    /// [`MAX_INTERFACES`](crate::MAX_INTERFACES) are ignored.
+    /// `MAX_INTERFACES` (this engine's parameter, not the crate default) are
+    /// ignored.
     pub fn configure_interface_ogm(
         &mut self,
         idx: usize,
@@ -377,7 +382,7 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
         i_max: core::time::Duration,
         now: core::time::Duration,
     ) {
-        if idx >= crate::MAX_INTERFACES {
+        if idx >= MAX_INTERFACES {
             return;
         }
         let seed = self.jitter_seed(idx, 0);
@@ -477,14 +482,15 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
     /// [`due_keepalive_interface`](Self::due_keepalive_interface). Slots
     /// between the current length and `idx` are back-filled with `None` so
     /// the table stays dense and index-addressable. Interfaces at or beyond
-    /// [`MAX_INTERFACES`](crate::MAX_INTERFACES) are ignored.
+    /// `MAX_INTERFACES` (this engine's parameter, not the crate default) are
+    /// ignored.
     pub fn configure_interface_keepalive(
         &mut self,
         idx: usize,
         interval: Option<core::time::Duration>,
         now: core::time::Duration,
     ) {
-        if idx >= crate::MAX_INTERFACES {
+        if idx >= MAX_INTERFACES {
             return;
         }
         let seed = self.jitter_seed(idx, 0x9e3779b9);
@@ -1116,7 +1122,14 @@ impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
     }
 }
 
-impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGINATORS> {
+impl<
+    const MAX_ORIGINATORS: usize,
+    const MAX_INTERFACES: usize,
+    const MAX_MCAST_MEMBERS: usize,
+    const MAX_LOCAL_MCAST: usize,
+> MeshRoutingEngine
+    for BatmanEngine<MAX_ORIGINATORS, MAX_INTERFACES, MAX_MCAST_MEMBERS, MAX_LOCAL_MCAST>
+{
     #[tracing::instrument(skip(self, frame, reply), fields(ident = ?self.self_ident), level = "info")]
     fn handle_rx<'rx, 'tx>(
         &mut self,
@@ -1212,7 +1225,13 @@ impl<const MAX_ORIGINATORS: usize> MeshRoutingEngine for BatmanEngine<MAX_ORIGIN
     }
 }
 
-impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
+impl<
+    const MAX_ORIGINATORS: usize,
+    const MAX_INTERFACES: usize,
+    const MAX_MCAST_MEMBERS: usize,
+    const MAX_LOCAL_MCAST: usize,
+> BatmanEngine<MAX_ORIGINATORS, MAX_INTERFACES, MAX_MCAST_MEMBERS, MAX_LOCAL_MCAST>
+{
     /// Write a keep-alive heartbeat into `tx_buffer`, returning the produced
     /// slice. Stateless — no sequence number or timestamp on the wire, since
     /// a keep-alive only needs to prove *that* this node is alive, not carry

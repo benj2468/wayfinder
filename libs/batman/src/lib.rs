@@ -17,6 +17,8 @@ pub mod trickle;
 pub mod wire;
 
 #[cfg(test)]
+mod capacity_tests;
+#[cfg(test)]
 mod engine_tests;
 
 use core::time::Duration;
@@ -182,7 +184,22 @@ pub struct OgmScheduleEntry {
 /// `MAX_ORIGINATORS` known nodes with heap-free `heapless` storage so the same
 /// code runs on an MCU and a host. Implements
 /// [`MeshRoutingEngine`](interfaces::engine::MeshRoutingEngine).
-pub struct BatmanEngine<const MAX_ORIGINATORS: usize> {
+/// The engine's table capacities are const-generic so one routing core serves
+/// both a Linux gateway and a RAM-constrained MCU.  The three trailing
+/// parameters default to the crate-wide [`MAX_INTERFACES`],
+/// [`MAX_MCAST_MEMBERS`], and [`MAX_LOCAL_MCAST`], so `BatmanEngine<N>` keeps
+/// exactly the sizing it had before they existed.
+///
+/// Every bound the engine enforces at runtime is read from these parameters
+/// rather than from the crate constants: a profile that shrinks
+/// `MAX_INTERFACES` must also reject the interface indices its tables can no
+/// longer hold.
+pub struct BatmanEngine<
+    const MAX_ORIGINATORS: usize,
+    const MAX_INTERFACES: usize = { crate::MAX_INTERFACES },
+    const MAX_MCAST_MEMBERS: usize = { crate::MAX_MCAST_MEMBERS },
+    const MAX_LOCAL_MCAST: usize = { crate::MAX_LOCAL_MCAST },
+> {
     /// This node's own MAC; OGMs and broadcasts bearing it as originator are
     /// dropped for loop prevention.
     pub self_ident: Mac,
@@ -256,7 +273,13 @@ pub struct BatmanEngine<const MAX_ORIGINATORS: usize> {
     relay_oversize_drops: u32,
 }
 
-impl<const MAX_ORIGINATORS: usize> BatmanEngine<MAX_ORIGINATORS> {
+impl<
+    const MAX_ORIGINATORS: usize,
+    const MAX_INTERFACES: usize,
+    const MAX_MCAST_MEMBERS: usize,
+    const MAX_LOCAL_MCAST: usize,
+> BatmanEngine<MAX_ORIGINATORS, MAX_INTERFACES, MAX_MCAST_MEMBERS, MAX_LOCAL_MCAST>
+{
     /// Create an engine for a node with address `self_ident` and empty routing,
     /// broadcast, multicast, and OGM-timer state.
     pub fn new(self_ident: Mac) -> Self {
