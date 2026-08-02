@@ -7,9 +7,9 @@ use interfaces::frame::MeshIdentifier;
 /// Valid slot indices are 0..IDENT_TABLE_MAX (at most 99), so 255 is safe.
 const NONE_IDX: u8 = u8::MAX;
 /// `heapless::FnvIndexMap` requires a power-of-two capacity.
-const IDENT_TABLE_CAP: usize = 128;
+pub(crate) const IDENT_TABLE_CAP: usize = 128;
 /// Actual maximum live entries before LRU eviction kicks in.
-const IDENT_TABLE_MAX: usize = 100;
+pub(crate) const IDENT_TABLE_MAX: usize = 100;
 
 /// A node in the doubly-linked LRU list, stored in the flat node pool.
 ///
@@ -37,24 +37,48 @@ struct LruNode<Ident> {
 /// full and a new identifier arrives, the tail (LRU entry) is evicted in O(1).
 /// The underlying heapless map is sized to `IDENT_TABLE_CAP` (128) because
 /// `FnvIndexMap` requires a power-of-two capacity.
-pub struct IdentTable<Ident: MeshIdentifier> {
+pub struct IdentTable<
+    Ident: MeshIdentifier,
+    const CAP: usize = IDENT_TABLE_CAP,
+    const MAX_LIVE: usize = IDENT_TABLE_MAX,
+> {
     /// Flat node pool; slots whose index is in `free_stack` are unoccupied.
-    nodes: [Option<LruNode<Ident>>; IDENT_TABLE_CAP],
+    nodes: [Option<LruNode<Ident>>; CAP],
     /// Key → slot index in `nodes`.
-    map: FnvIndexMap<Ident, u8, IDENT_TABLE_CAP>,
+    map: FnvIndexMap<Ident, u8, CAP>,
     /// Index of the most-recently-used node; `NONE_IDX` when the table is empty.
     head: u8,
     /// Index of the least-recently-used node; `NONE_IDX` when the table is empty.
     tail: u8,
     /// Stack of available slot indices.
-    free_stack: [u8; IDENT_TABLE_CAP],
+    free_stack: [u8; CAP],
     /// Number of entries in `free_stack`.
     free_len: u8,
 }
 
-impl<Ident: MeshIdentifier> IdentTable<Ident> {
+impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
+    IdentTable<Ident, CAP, MAX_LIVE>
+{
+    /// Slot indices are held as `u8` with 255 reserved as the null sentinel, and
+    /// the backing map is a `FnvIndexMap`, so a profile must keep `CAP` a power
+    /// of two under 255 and leave headroom above `MAX_LIVE` for the map's load
+    /// factor.
+    const _INVARIANTS: () = {
+        assert!(
+            CAP.is_power_of_two(),
+            "IdentTable CAP must be a power of two"
+        );
+        assert!(
+            CAP < NONE_IDX as usize,
+            "IdentTable CAP must fit in a u8 index"
+        );
+        assert!(MAX_LIVE <= CAP, "IdentTable MAX_LIVE cannot exceed CAP");
+    };
+
+    /// An empty table at this profile's capacities.
     pub fn new() -> Self {
-        let mut free_stack = [0u8; IDENT_TABLE_CAP];
+        let () = Self::_INVARIANTS;
+        let mut free_stack = [0u8; CAP];
         for (i, slot) in free_stack.iter_mut().enumerate() {
             *slot = i as u8;
         }
@@ -64,10 +88,10 @@ impl<Ident: MeshIdentifier> IdentTable<Ident> {
             head: NONE_IDX,
             tail: NONE_IDX,
             free_stack,
-            // Only vend the first IDENT_TABLE_MAX slots; the remaining
-            // IDENT_TABLE_CAP - IDENT_TABLE_MAX slots act as unused padding
-            // required by the power-of-two heapless capacity.
-            free_len: IDENT_TABLE_MAX as u8,
+            // Only vend the first MAX_LIVE slots; the remaining CAP - MAX_LIVE
+            // slots act as unused padding required by the power-of-two heapless
+            // capacity.
+            free_len: MAX_LIVE as u8,
         }
     }
 
@@ -249,7 +273,9 @@ mod tests {
 
     // ── invariant checker ────────────────────────────────────────────────────
 
-    impl<Ident: MeshIdentifier> IdentTable<Ident> {
+    impl<Ident: MeshIdentifier, const CAP: usize, const MAX_LIVE: usize>
+        IdentTable<Ident, CAP, MAX_LIVE>
+    {
         /// Walk the doubly-linked list in both directions and assert internal
         /// consistency.  Panics on any violation — call this liberally in tests.
         fn assert_invariants(&self) {
@@ -315,11 +341,11 @@ mod tests {
                 assert_eq!(&node.key, key, "node key mismatch for slot {slot}");
             }
 
-            // free_len + map.len() == IDENT_TABLE_MAX
+            // free_len + map.len() == MAX_LIVE
             assert_eq!(
                 self.free_len as usize + self.map.len(),
-                IDENT_TABLE_MAX,
-                "free_len + map.len() should equal IDENT_TABLE_MAX"
+                MAX_LIVE,
+                "free_len + map.len() should equal MAX_LIVE"
             );
         }
     }

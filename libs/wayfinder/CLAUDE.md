@@ -31,6 +31,22 @@ Central router orchestration. `no_std`; the `std` feature enables `DynLinkT`.
   originator's membership cert + Ed25519 signature TVLVs; `verify_ogm` gates an
   incoming OGM against the mesh trust anchor *before* it reaches the engine. Also
   caches neighbor keys for pairwise data-plane tags.
+
+  `OgmAuth<MAX_NEIGHBOR_KEYS, MAX_REVOKED, MAX_IN_FLIGHT_CERT_REQUESTS,
+  MAX_PENDING_REPLIES>` is const-generic over its table sizes; all four default
+  to the module constants of the same name. The neighbour cache dominates the
+  footprint (`NeighborKeys` is 272 B, ×64 at host capacity), so a constrained
+  node picks a smaller profile: `OgmAuth<8, 4, 2, 2>` is 3,808 bytes against the
+  host profile's 25,000.
+
+  **Capacity never reaches the wire** — a host-profile and a tiny-profile node
+  interoperate unchanged; `profiles_do_not_change_the_wire_format` pins this.
+
+  `new` lives in its own impl on the fully-defaulted type, *not* on the generic
+  impl: a struct's default const parameters do not drive inference in expression
+  position, so a generic `OgmAuth::new` would make every call site name its
+  capacities (`E0284`). A profile-specific node calls `with_capacities` instead.
+  Apply the same pattern to any future constructor here.
 - `config.rs` — per-link Trickle bounds (`i_min_ms`/`i_max_ms`) so a fast LAN
   link and a slow LoRa link back off on different schedules.
 - Observability: `RateEstimator` throughput EWMAs, `TableOccupancy` gauges —

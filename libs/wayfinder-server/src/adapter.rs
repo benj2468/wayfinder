@@ -54,8 +54,33 @@ use alloc::string::ToString;
 /// that instant — an idle interface must read as a decaying rate, not a stale
 /// one.  Construct a fresh adapter per request so the rate reflects the time
 /// the query is served.
-pub struct RouterAdapter<'a> {
-    router: &'a mut CentralRouter,
+pub struct RouterAdapter<
+    'a,
+    const ORIGINATORS: usize = { wayfinder::host::ORIGINATORS },
+    const INTERFACES: usize = { wayfinder::host::INTERFACES },
+    const MCAST_MEMBERS: usize = { wayfinder::host::MCAST_MEMBERS },
+    const LOCAL_MCAST: usize = { wayfinder::host::LOCAL_MCAST },
+    const IDENT_TABLE: usize = { wayfinder::host::IDENT_TABLE },
+    const IDENT_LIVE: usize = { wayfinder::host::IDENT_LIVE },
+    const LINK_QUALITY: usize = { wayfinder::host::LINK_QUALITY },
+    const NEIGHBOR_KEYS: usize = { wayfinder::host::NEIGHBOR_KEYS },
+    const REVOKED: usize = { wayfinder::host::REVOKED },
+    const IN_FLIGHT_CERT_REQUESTS: usize = { wayfinder::host::IN_FLIGHT_CERT_REQUESTS },
+    const PENDING_REPLIES: usize = { wayfinder::host::PENDING_REPLIES },
+> {
+    router: &'a mut CentralRouter<
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    >,
     now: Duration,
     /// The mesh certificate authority, present only when this node runs in
     /// provider mode.  Drives the enrollment requests (`get_trust_anchor`,
@@ -63,13 +88,53 @@ pub struct RouterAdapter<'a> {
     ca: Option<&'a mut dyn MeshAuthority>,
 }
 
-impl<'a> RouterAdapter<'a> {
+impl<
+    'a,
+    const ORIGINATORS: usize,
+    const INTERFACES: usize,
+    const MCAST_MEMBERS: usize,
+    const LOCAL_MCAST: usize,
+    const IDENT_TABLE: usize,
+    const IDENT_LIVE: usize,
+    const LINK_QUALITY: usize,
+    const NEIGHBOR_KEYS: usize,
+    const REVOKED: usize,
+    const IN_FLIGHT_CERT_REQUESTS: usize,
+    const PENDING_REPLIES: usize,
+>
+    RouterAdapter<
+        'a,
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    >
+{
     /// Wrap a borrowed router so its state can be served through the management
     /// API, evaluating time-varying metrics (throughput) as of `now` — the same
     /// monotonic instant the driver stamps on received frames.  `ca` is the
     /// optional provider-mode certificate authority.
     pub fn new(
-        router: &'a mut CentralRouter,
+        router: &'a mut CentralRouter<
+            ORIGINATORS,
+            INTERFACES,
+            MCAST_MEMBERS,
+            LOCAL_MCAST,
+            IDENT_TABLE,
+            IDENT_LIVE,
+            LINK_QUALITY,
+            NEIGHBOR_KEYS,
+            REVOKED,
+            IN_FLIGHT_CERT_REQUESTS,
+            PENDING_REPLIES,
+        >,
         ca: Option<&'a mut dyn MeshAuthority>,
         now: Duration,
     ) -> Self {
@@ -77,7 +142,34 @@ impl<'a> RouterAdapter<'a> {
     }
 }
 
-impl WayfinderDataProvider for RouterAdapter<'_> {
+impl<
+    const ORIGINATORS: usize,
+    const INTERFACES: usize,
+    const MCAST_MEMBERS: usize,
+    const LOCAL_MCAST: usize,
+    const IDENT_TABLE: usize,
+    const IDENT_LIVE: usize,
+    const LINK_QUALITY: usize,
+    const NEIGHBOR_KEYS: usize,
+    const REVOKED: usize,
+    const IN_FLIGHT_CERT_REQUESTS: usize,
+    const PENDING_REPLIES: usize,
+> WayfinderDataProvider
+    for RouterAdapter<
+        '_,
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    >
+{
     fn node_id(&self) -> Vec<u8> {
         self.router.self_ident().as_bytes().to_vec()
     }
@@ -325,7 +417,7 @@ impl WayfinderDataProvider for RouterAdapter<'_> {
             .ok_or_else(|| "unable to parse membership cert".to_string())?;
         let anchor = TrustAnchor::from_bytes(trust_anchor)
             .ok_or_else(|| "unable to parse trust anchor".to_string())?;
-        let auth = OgmAuth::new(key_pair, cert, anchor);
+        let auth = OgmAuth::with_capacities(key_pair, cert, anchor);
         self.router.set_auth(auth);
         Ok(())
     }
