@@ -13,8 +13,8 @@
 //!   rotate the advertising address. The nRF backend gets stability from the
 //!   SoftDevice's static identity address; the BlueZ backend needs
 //!   `Privacy = device` in the host's `main.conf` (see
-//!   `crate::std_link::BluerAdvertiser`), and Android would give no control at
-//!   all. Nothing here enforces it — see `libs/blue/CLAUDE.md`.
+//!   `crate::std_link::BluerAdvertiser`). Nothing here enforces it — see
+//!   `libs/blue/CLAUDE.md`.
 
 /// A 6-byte BLE device address (public or random; this driver doesn't
 /// distinguish the two, since it only ever compares addresses for equality

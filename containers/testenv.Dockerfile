@@ -18,7 +18,6 @@ RUN rustup component add clippy
 # Bare-metal target for the embedded (`no_std`) crates (see build:embedded in
 # .gitlab-ci.yml) — Tier 2 with prebuilt core/alloc, so no nightly required.
 RUN rustup target add thumbv7em-none-eabihf
-RUN rustup target add aarch64-linux-android
 
 # Install cargo-nextest and cargo-llvm-cov binaries using pre-compiled installers
 # (Much faster than running `cargo install` inside the Dockerfile)
@@ -31,19 +30,6 @@ RUN cargo binstall -y sccache
 # imports it (see test:run:python in .gitlab-ci.yml).
 RUN cargo binstall -y maturin
 RUN cargo binstall -y cargo-ndk
-
-# The Android NDK's own clang/linker, which `cargo-ndk` invokes to actually
-# link bins/wayfinder-pixel for aarch64-linux-android (see build:android in
-# .gitlab-ci.yml) — the rustup target above only supplies a prebuilt `std`,
-# not anything that can produce a real Android binary on its own. r27c is the
-# current LTS release.
-ENV ANDROID_NDK_HOME=/opt/android-ndk
-RUN curl -L --proto '=https' --tlsv1.2 -sSf \
-    https://dl.google.com/android/repository/android-ndk-r27c-linux.zip \
-    -o /tmp/android-ndk.zip \
-    && unzip -q /tmp/android-ndk.zip -d /opt \
-    && mv /opt/android-ndk-r27c "$ANDROID_NDK_HOME" \
-    && rm /tmp/android-ndk.zip
 
 # Ensure protoc is globally accessible (usually /usr/bin/protoc via apt)
 ENV PROTOC=/usr/bin/protoc
