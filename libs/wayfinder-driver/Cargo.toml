@@ -28,15 +28,9 @@ std = ["dep:async-trait", "wayfinder/std"]
 # This crate's own `build_ble_link`/`BleLinkParams` (BlueZ over D-Bus, via
 # `blue`'s `std` feature) — split out from `tokio`/`std` (rather than folded
 # into either) so a consumer that brings its own `blue` backend can depend on
-# this crate's `Driver`/transports without also pulling BlueZ. Concretely:
-# `bins/wayfinder-pixel` cross-compiles to `aarch64-linux-android` with its
-# own `blue` (`generic` feature, a foreign-advertiser bridge, no BlueZ) and
-# never calls `build_ble_link` — `bluer` refuses to build at all for
-# `target_os = "android"` (`compile_error!`), so unifying its `blue` dep with
-# an unconditional `blue?/std` here would break that build. In `default` (not
-# folded into `tokio`) so every other consumer (`wayfinder-tap`) keeps today's
-# zero-config behavior; `wayfinder-pixel` opts out with `default-features =
-# false, features = ["tokio"]`.
+# this crate's `Driver`/transports without also pulling BlueZ. In `default`
+# (not folded into `tokio`) so every consumer (`wayfinder-tap`) keeps today's
+# zero-config behavior.
 ble = ["dep:blue", "blue?/std"]
 
 [dependencies]

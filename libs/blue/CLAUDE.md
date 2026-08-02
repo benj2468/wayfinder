@@ -13,43 +13,37 @@ scanning. Fragmentation reuses the shared `wayfinder-link-utils` machinery
 this needs no deployment-time configuration, since BLE addresses are already
 globally distinct per physical device and reported on every scan report.
 
-## Three backends, one wire format
+## Two backends, one wire format
 
-| | `NrfBleLink` (`hardware`) | `StdBleLink` (`std`) | `BleLink` via `android` |
-|---|---|---|---|
-| target | nRF52840, `no_std` | Linux host, tokio | Android host, tokio |
-| stack | `nrf-softdevice` | BlueZ over D-Bus (`bluer`) | injected `BleAdvertiser`, UniFFI-backed |
-| consumer | `bins/wayfinder-nrf52840` | `bins/wayfinder-tap` | `bins/wayfinder-pixel` |
-| AD framing | built here (`ad.rs`) | built by BlueZ | built by platform |
+| | `NrfBleLink` (`hardware`) | `StdBleLink` (`std`) |
+|---|---|---|
+| target | nRF52840, `no_std` | Linux host, tokio |
+| stack | `nrf-softdevice` | BlueZ over D-Bus (`bluer`) |
+| consumer | `bins/wayfinder-nrf52840` | `bins/wayfinder-tap` |
+| AD framing | built here (`ad.rs`) | built by BlueZ |
 
 They interoperate on-air, which is the point: a `wayfinder-tap` host can
 front a terminal mesh of MCUs over BLE. `frame::build_fragment` produces the
 `[frag_header][body]` blob both put on the air; the nRF path additionally
 wraps it in this crate's own Manufacturer-Specific-Data framing
 (`build_fragment_ad`), because it hands the radio a whole advertising-data
-buffer, while BlueZ (and Android) build that structure themselves from raw
-manufacturer-data bytes. **That asymmetry is the easiest thing to
-get wrong here** — passing `build_fragment_ad`'s output to BlueZ
-double-wraps the AD structure and the fragment never parses on the far side.
-`frame.rs`'s `build_fragment_and_build_fragment_ad_agree_on_the_wire` test
-pins the two paths together.
+buffer, while BlueZ builds that structure itself from raw manufacturer-data
+bytes. **That asymmetry is the easiest thing to get wrong here** — passing
+`build_fragment_ad`'s output to BlueZ double-wraps the AD structure and the
+fragment never parses on the far side. `frame.rs`'s
+`build_fragment_and_build_fragment_ad_agree_on_the_wire` test pins the two
+paths together.
 
 ### `BleLink` is generic, not platform-hosted, itself (`src/generic_link.rs`)
 
 `BleLink<A: BleAdvertiser>` doesn't drive any platform BLE API itself — it
 takes the platform advertise call as a type parameter (`BleAdvertiser::
 advertise`), and reads scan reports off a channel fed by a cloneable
-`BleReportSink`. `StdBleLink` (`std` feature) is one concrete instantiation,
-wrapping it with a `BleAdvertiser` that drives BlueZ; `bins/wayfinder-pixel`
-(`android` feature, no `bluer`/D-Bus weight) is the other, wrapping it with a
-`BleAdvertiser` bridged across a UniFFI boundary to a Kotlin-implemented
-`BluetoothLeAdvertiser` binding — see that crate's `src/lib.rs`
-(`PixelBleAdvertiser`, `MeshNode`) for the FFI side; the actual Android
-`BluetoothLeAdvertiser`/scan-callback wiring on the Kotlin side is still a
-later phase, only the UniFFI plumbing exists so far. This generic-over-
-`BleAdvertiser` design is deliberate: it means both backends built on
-`BleLink` — unlike `NrfBleLink` — are fully unit-tested against a fake
-`BleAdvertiser`, with no real hardware/`bluetoothd`/JNI dependency at all.
+`BleReportSink`. `StdBleLink` (`std` feature) is the concrete instantiation,
+wrapping it with a `BleAdvertiser` that drives BlueZ. This generic-over-
+`BleAdvertiser` design is deliberate: it means `StdBleLink` — unlike
+`NrfBleLink` — is fully unit-tested against a fake `BleAdvertiser`, with no
+real hardware/`bluetoothd` dependency at all.
 
 ## BlueZ specifics (`src/std_link.rs`)
 
@@ -111,10 +105,9 @@ itself:
   the rotation timeout (~15 min) instead. This is a deployment dependency
   accepted deliberately: the mesh owns every device it integrates with, so
   pinning host config is cheaper than spending payload bytes on a sender tag
-  in the fragment header. It does not generalise — Android's
-  `BluetoothLeAdvertiser` gives an app no control over the advertising
-  address at all, so the planned pixel backend will have to revisit the
-  keying rather than inherit this.
+  in the fragment header. It does not generalise to every platform's
+  advertising API, so a future backend without this kind of address control
+  would have to revisit the keying rather than inherit this.
 
 `advertise_dwell` (config: `advertise_dwell_ms`, default 150 ms) is the
 airtime knob. It must outlast the controller's advertising interval — BlueZ's

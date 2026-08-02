@@ -11,18 +11,14 @@
 //!   radio via `nrf-softdevice`, `no_std`, for `bins/wayfinder-nrf52840`.
 //! - [`StdBleLink`] (`std` feature) — a Linux host's controller via BlueZ's
 //!   D-Bus API, for `bins/wayfinder-tap`.
-//! - a UniFFI-hosted Android node (`android` feature), for
-//!   `bins/wayfinder-pixel` — the UniFFI plumbing exists; the real hardware/
-//!   scan-callback wiring on the Kotlin side is still a later phase.
 //!
-//! The latter two both build on [`BleLink`], generic over a
-//! platform-supplied [`BleAdvertiser`]; see `generic_link.rs`.
+//! [`StdBleLink`] builds on [`BleLink`], generic over a platform-supplied
+//! [`BleAdvertiser`]; see `generic_link.rs`.
 //!
-//! `std` is on by default (needed by `wayfinder-driver`'s host build, and it
-//! pulls in `android` too); `wayfinder-pixel`'s NDK build opts into `android`
-//! alone. Only `hardware` (real SoftDevice hardware, no host-side stub) is
-//! off by default for every consumer.
-#![cfg_attr(all(not(test), not(any(feature = "std", feature = "android"))), no_std)]
+//! `std` is on by default (needed by `wayfinder-driver`'s host build). Only
+//! `hardware` (real SoftDevice hardware, no host-side stub) is off by
+//! default for every consumer.
+#![cfg_attr(all(not(test), not(feature = "std")), no_std)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod ad;

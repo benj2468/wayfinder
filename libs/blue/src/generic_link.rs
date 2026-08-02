@@ -2,22 +2,19 @@
 //! generic over a platform-supplied [`BleAdvertiser`] rather than driving a
 //! concrete BLE stack directly.
 //!
-//! Both host-side backends build on this: [`crate::StdBleLink`] wraps it with
-//! a `BleAdvertiser` that registers advertisements through BlueZ, and
-//! `bins/wayfinder-pixel` wraps it with one bridged across a UniFFI boundary
-//! to a Kotlin-implemented `BluetoothLeAdvertiser` binding (that Kotlin side
-//! is still a later phase). Both platforms' own BLE APIs build/parse
-//! the Manufacturer Specific Data AD structure the same way — from/to a raw
-//! byte payload — so this core hands its `BleAdvertiser` the bare
+//! [`crate::StdBleLink`] builds on this, wrapping it with a `BleAdvertiser`
+//! that registers advertisements through BlueZ. BlueZ's own BLE API
+//! builds/parses the Manufacturer Specific Data AD structure itself — from/to
+//! a raw byte payload — so this core hands its `BleAdvertiser` the bare
 //! `[frag_header][body]` blob via `frame::build_fragment`, no self-framing via
-//! `crate::ad`, unlike [`crate::NrfBleLink`]. Each backend still owns its own
+//! `crate::ad`, unlike [`crate::NrfBleLink`]. The backend still owns its own
 //! *receive* side (feeding this core's report channel from BlueZ's D-Bus scan
-//! events, or from Android's scan callback) since that plumbing is
-//! platform-specific in a way advertising a pre-built fragment isn't.
+//! events) since that plumbing is platform-specific in a way advertising a
+//! pre-built fragment isn't.
 //!
 //! Keeping the actual platform advertise call injected rather than hard-wired
 //! is what makes this fully unit-testable against a fake [`BleAdvertiser`],
-//! with no `bluetoothd`/JNI dependency in this crate at all — unlike
+//! with no `bluetoothd` dependency in this crate at all — unlike
 //! [`crate::NrfBleLink`], which needs real SoftDevice hardware to exercise its
 //! I/O (see `libs/blue/CLAUDE.md`'s "Testability" section).
 
@@ -51,12 +48,10 @@ const REPORT_QUEUE_DEPTH: usize = 32;
 
 /// Platform hook for putting one already-built fragment on the air.
 ///
-/// Implemented per backend: [`crate::StdBleLink`]'s registers a BlueZ
-/// advertisement and holds it for `advertise_dwell`; a future Android
-/// implementation would drive `BluetoothLeAdvertiser` the same way. Either
-/// way: advertise `fragment` as manufacturer-specific data tagged with
-/// `crate::ad::MESH_COMPANY_ID`, hold it on air for however long the
-/// implementation decides, then stop.
+/// Implemented per backend: [`crate::StdBleLink`] registers a BlueZ
+/// advertisement and holds it for `advertise_dwell`. Advertise `fragment` as
+/// manufacturer-specific data tagged with `crate::ad::MESH_COMPANY_ID`, hold
+/// it on air for however long the implementation decides, then stop.
 ///
 /// Generic (not a trait object) so [`BleLink`] stays fully host-testable
 /// against a fake implementation, with no backend-specific dependency in this
@@ -73,8 +68,7 @@ pub trait BleAdvertiser: Send {
 /// mesh-tagged advertisements into. Kept separate from [`BleLink`] itself
 /// since the scan producer and the `LinkT` consumer (the driver's link
 /// array) can live on opposite sides of an async task boundary (BlueZ's
-/// background scan task) or, eventually, a JNI boundary (Android's scan
-/// callback).
+/// background scan task).
 #[derive(Clone)]
 pub struct BleReportSink {
     tx: mpsc::Sender<RawReport>,
@@ -234,9 +228,9 @@ mod tests {
     }
 
     /// Records every fragment handed to `advertise`, optionally failing
-    /// instead — the seam a real backend (BlueZ, and later Android)
-    /// implements for real, stood in for here so `BleLink`'s logic is
-    /// testable without any `bluetoothd`/JNI dependency.
+    /// instead — the seam a real backend (BlueZ) implements for real, stood
+    /// in for here so `BleLink`'s logic is testable without any
+    /// `bluetoothd` dependency.
     #[derive(Clone, Default)]
     struct FakeAdvertiser {
         sent: Arc<Mutex<Vec<Vec<u8>>>>,
