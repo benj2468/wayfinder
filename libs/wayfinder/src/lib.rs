@@ -54,6 +54,82 @@ use crate::routing_table::IdentTable;
 
 pub use crate::link_quality::LinkQualityRecord;
 
+crate::define_profile! {
+    /// The default capacities a `CentralRouter` is built with when no profile is
+    /// named — sized for a Linux gateway. Downstream crates whose own defaults
+    /// must match the router's name this rather than repeating the literals;
+    /// `router_defaults_preserve_todays_capacities` pins the two together.
+    pub host {
+        originators: 128,
+        interfaces: 8,
+        mcast_members: 64,
+        local_mcast: 16,
+        ident_table: 128,
+        ident_live: 100,
+        link_quality: 64,
+        neighbor_keys: 64,
+        revoked: 32,
+        in_flight_cert_requests: 16,
+        pending_replies: 16,
+        max_frame_len: 2048,
+    }
+}
+
+/// Re-exported so a profile can be declared as `wayfinder::define_profile!`
+/// alongside the [`router_for!`] that consumes it.
+pub use interfaces::define_profile;
+
+/// Build the concrete [`CentralRouter`] type for a capacity profile declared
+/// with [`define_profile!`].
+///
+/// `CentralRouter` takes eleven const arguments. Writing them positionally is
+/// how a router silently ends up with a 16-entry link-quality table and a
+/// 64-entry originator table when the two were meant the other way round, so
+/// the order lives here — in the crate that defines it — and never at a call
+/// site:
+///
+/// ```
+/// wayfinder::define_profile! {
+///     pub embedded {
+///         originators: 16,
+///         interfaces: 2,
+///         mcast_members: 8,
+///         local_mcast: 4,
+///         ident_table: 16,
+///         ident_live: 12,
+///         link_quality: 16,
+///         neighbor_keys: 8,
+///         revoked: 4,
+///         in_flight_cert_requests: 2,
+///         pending_replies: 2,
+///         max_frame_len: 256,
+///     }
+/// }
+/// type EmbeddedRouter = wayfinder::router_for!(embedded);
+/// ```
+///
+/// The profile is named by an ident path (`embedded`, `crate::profiles::tiny`);
+/// a `$p:path` capture would be an opaque fragment that `::CONST` cannot be
+/// appended to.
+#[macro_export]
+macro_rules! router_for {
+    ($($p:ident)::+) => {
+        $crate::CentralRouter<
+            { $($p)::+::ORIGINATORS },
+            { $($p)::+::INTERFACES },
+            { $($p)::+::MCAST_MEMBERS },
+            { $($p)::+::LOCAL_MCAST },
+            { $($p)::+::IDENT_TABLE },
+            { $($p)::+::IDENT_LIVE },
+            { $($p)::+::LINK_QUALITY },
+            { $($p)::+::NEIGHBOR_KEYS },
+            { $($p)::+::REVOKED },
+            { $($p)::+::IN_FLIGHT_CERT_REQUESTS },
+            { $($p)::+::PENDING_REPLIES },
+        >
+    };
+}
+
 /// Per-link Trickle configuration ([`config::LinkConfig`]) so links with
 /// different speeds back off OGM emission on independent schedules.
 #[cfg(feature = "alloc")]
@@ -65,6 +141,8 @@ pub mod auth;
 pub mod features;
 pub mod link;
 
+#[cfg(test)]
+mod capacity_tests;
 mod link_quality;
 mod routing_table;
 
@@ -326,21 +404,33 @@ impl RxOutcome<'_, '_> {
 /// and the observability counters/estimators. It demuxes received frames by
 /// protocol, drives periodic OGM emission, and plans unicast/multicast/broadcast
 /// egress — the single object both the embedded node and the host driver own.
-pub struct CentralRouter {
+pub struct CentralRouter<
+    const ORIGINATORS: usize = ORIGINATOR_CAPACITY,
+    const INTERFACES: usize = MAX_INTERFACES,
+    const MCAST_MEMBERS: usize = { batman::MAX_MCAST_MEMBERS },
+    const LOCAL_MCAST: usize = { batman::MAX_LOCAL_MCAST },
+    const IDENT_TABLE: usize = { crate::routing_table::IDENT_TABLE_CAP },
+    const IDENT_LIVE: usize = { crate::routing_table::IDENT_TABLE_MAX },
+    const LINK_QUALITY: usize = { crate::link_quality::LINK_QUALITY_CAPACITY },
+    const NEIGHBOR_KEYS: usize = { crate::auth::MAX_NEIGHBOR_KEYS },
+    const REVOKED: usize = { crate::auth::MAX_REVOKED },
+    const IN_FLIGHT_CERT_REQUESTS: usize = { crate::auth::MAX_IN_FLIGHT_CERT_REQUESTS },
+    const PENDING_REPLIES: usize = { crate::auth::MAX_PENDING_REPLIES },
+> {
     /// The Batman routing engine for this router.  Its originator capacity is
     /// [`ORIGINATOR_CAPACITY`] — a power of two, as the `heapless` map requires.
-    batman: BatmanEngine<ORIGINATOR_CAPACITY>,
-    ident_table: IdentTable<Mac>,
-    link_quality: LinkQualityTable<Mac>,
+    batman: BatmanEngine<ORIGINATORS, INTERFACES, MCAST_MEMBERS, LOCAL_MCAST>,
+    ident_table: IdentTable<Mac, IDENT_TABLE, IDENT_LIVE>,
+    link_quality: LinkQualityTable<Mac, LINK_QUALITY>,
     /// Per-interface receive-rate estimators, indexed by interface registration
     /// order (`iface_idx`).  See [`RateEstimator`].
-    rx_rates: [RateEstimator; MAX_INTERFACES],
+    rx_rates: [RateEstimator; INTERFACES],
     /// Per-interface transmit-rate estimators, indexed by interface
     /// registration order (`iface_idx`).
-    tx_rates: [RateEstimator; MAX_INTERFACES],
+    tx_rates: [RateEstimator; INTERFACES],
     /// Number of interfaces actually in use — the count of distinct indices the
     /// router has seen configured or carrying traffic, capped at
-    /// [`MAX_INTERFACES`].  Bounds the slice [`interface_throughput`] reports so
+    /// `INTERFACES`.  Bounds the slice [`interface_throughput`] reports so
     /// consumers don't see a tail of never-touched interfaces.
     ///
     /// [`interface_throughput`]: CentralRouter::interface_throughput
@@ -349,7 +439,7 @@ pub struct CentralRouter {
     /// in its open, pre-auth behavior.  When `Some`, the router signs the OGMs
     /// it emits and drops incoming OGMs that do not verify against the mesh
     /// trust anchor — segregating this mesh from others sharing the medium.
-    auth: Option<OgmAuth>,
+    auth: Option<OgmAuth<NEIGHBOR_KEYS, REVOKED, IN_FLIGHT_CERT_REQUESTS, PENDING_REPLIES>>,
     /// Fail-closed policy: when `true`, this node must not act as a mesh router
     /// (process, forward, deliver, or originate any mesh traffic) until a valid
     /// membership cert is installed via [`set_auth`](CentralRouter::set_auth).
@@ -396,20 +486,60 @@ pub struct CentralRouter {
     /// interface, so an unconfigured link behaves exactly as before.
     ///
     /// [`LinkFeatures`]: crate::features::LinkFeatures
-    link_features: [crate::features::LinkFeatures; MAX_INTERFACES],
+    link_features: [crate::features::LinkFeatures; INTERFACES],
 }
 
 impl CentralRouter {
+    /// A router at the default (host) capacities.
+    ///
+    /// Kept on the fully-defaulted type rather than the generic impl below: a
+    /// struct's default const parameters do not drive inference in expression
+    /// position, so a generic `CentralRouter::new` would force every call site
+    /// to name all eleven capacities (`E0284`). A constrained node builds one
+    /// with [`with_capacities`](CentralRouter::with_capacities), usually
+    /// through [`router_for!`](crate::router_for).
+    pub fn new(self_ident: Mac) -> Self {
+        Self::with_capacities(self_ident)
+    }
+}
+
+impl<
+    const ORIGINATORS: usize,
+    const INTERFACES: usize,
+    const MCAST_MEMBERS: usize,
+    const LOCAL_MCAST: usize,
+    const IDENT_TABLE: usize,
+    const IDENT_LIVE: usize,
+    const LINK_QUALITY: usize,
+    const NEIGHBOR_KEYS: usize,
+    const REVOKED: usize,
+    const IN_FLIGHT_CERT_REQUESTS: usize,
+    const PENDING_REPLIES: usize,
+>
+    CentralRouter<
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    >
+{
     /// Create a router for the node with address `self_ident`, with an empty
     /// routing engine, link-quality table, rate estimators, and authentication
     /// disabled.
-    pub fn new(self_ident: Mac) -> Self {
+    pub fn with_capacities(self_ident: Mac) -> Self {
         Self {
             batman: BatmanEngine::new(self_ident),
             ident_table: IdentTable::new(),
             link_quality: LinkQualityTable::new(),
-            rx_rates: [RateEstimator::default(); MAX_INTERFACES],
-            tx_rates: [RateEstimator::default(); MAX_INTERFACES],
+            rx_rates: [RateEstimator::default(); INTERFACES],
+            tx_rates: [RateEstimator::default(); INTERFACES],
             iface_count: 0,
             auth: None,
             require_auth: false,
@@ -418,18 +548,18 @@ impl CentralRouter {
             runtime_config_active: false,
             cert_req_tx_rate: RateEstimator::default(),
             cert_reply_tx_rate: RateEstimator::default(),
-            link_features: [crate::features::LinkFeatures::default(); MAX_INTERFACES],
+            link_features: [crate::features::LinkFeatures::default(); INTERFACES],
         }
     }
 
     /// Set the per-link participation [`features`](crate::features::LinkFeatures)
     /// for interface `idx` (from that link's `features:` config), and register
     /// the interface so its throughput is reported from startup.  Out-of-range
-    /// indices (`>= `[`MAX_INTERFACES`]) are ignored.  Call once per interface
+    /// indices (`>= ``INTERFACES`) are ignored.  Call once per interface
     /// at driver wiring time; the default for an unconfigured interface is full
     /// participation, so a link that never calls this behaves exactly as before.
     pub fn set_link_features(&mut self, idx: usize, features: crate::features::LinkFeatures) {
-        if idx < MAX_INTERFACES {
+        if idx < INTERFACES {
             self.link_features[idx] = features;
             self.touch_iface(idx);
         }
@@ -510,7 +640,10 @@ impl CentralRouter {
     /// router will sign its emitted OGMs and reject incoming OGMs that do not
     /// verify against the mesh trust anchor.  Without this the router stays in
     /// its open, unauthenticated mode.
-    pub fn set_auth(&mut self, auth: OgmAuth) {
+    pub fn set_auth(
+        &mut self,
+        auth: OgmAuth<NEIGHBOR_KEYS, REVOKED, IN_FLIGHT_CERT_REQUESTS, PENDING_REPLIES>,
+    ) {
         debug!("updating auth state; resetting learned routing state");
         self.auth = Some(auth);
         // Routes, link-quality, ident mappings, and broadcast-dedup state were
@@ -525,12 +658,17 @@ impl CentralRouter {
 
     /// Borrow the OGM authentication state, if enabled — for the security view
     /// and for driver-side upkeep (refreshing the clock, recording revocations).
-    pub fn auth(&self) -> Option<&OgmAuth> {
+    pub fn auth(
+        &self,
+    ) -> Option<&OgmAuth<NEIGHBOR_KEYS, REVOKED, IN_FLIGHT_CERT_REQUESTS, PENDING_REPLIES>> {
         self.auth.as_ref()
     }
 
     /// Mutably borrow the OGM authentication state, if enabled.
-    pub fn auth_mut(&mut self) -> Option<&mut OgmAuth> {
+    pub fn auth_mut(
+        &mut self,
+    ) -> Option<&mut OgmAuth<NEIGHBOR_KEYS, REVOKED, IN_FLIGHT_CERT_REQUESTS, PENDING_REPLIES>>
+    {
         self.auth.as_mut()
     }
 
@@ -1080,8 +1218,8 @@ impl CentralRouter {
     /// directly) builds the final borrowed [`LinkFrameData`] from it, since
     /// that borrow cannot outlive this function's own `&mut` parameter.
     fn try_flush_pending_cert_reply(
-        auth: &mut auth::OgmAuth,
-        batman: &BatmanEngine<ORIGINATOR_CAPACITY>,
+        auth: &mut auth::OgmAuth<NEIGHBOR_KEYS, REVOKED, IN_FLIGHT_CERT_REQUESTS, PENDING_REPLIES>,
+        batman: &BatmanEngine<ORIGINATORS, INTERFACES, MCAST_MEMBERS, LOCAL_MCAST>,
         now: Duration,
         orig: Mac,
         reply: &mut LinkFrameDataMut<'_>,
@@ -1643,7 +1781,7 @@ impl CentralRouter {
     /// that arrives, so the normal receive path needs no extra wiring.  It is
     /// `pub` so an embedded loop that ingests frames through some other path can
     /// still keep the ingress rate truthful.  A no-op for `idx >=
-    /// `[`MAX_INTERFACES`].
+    /// ``INTERFACES`.
     ///
     /// [`handle_frame_with_metrics`]: CentralRouter::handle_frame_with_metrics
     pub fn record_rx(&mut self, idx: usize, bytes: usize, now: Duration) {
@@ -1661,7 +1799,7 @@ impl CentralRouter {
     /// egress via [`get_egress_interface`].  That layer calls this once per
     /// physical send (a broadcast that floods N interfaces counts on each),
     /// keeping the rate estimate inside the routing core where the management
-    /// API can read it.  A no-op for `idx >= `[`MAX_INTERFACES`].
+    /// API can read it.  A no-op for `idx >= ``INTERFACES`.
     ///
     /// [`get_egress_interface`]: CentralRouter::get_egress_interface
     pub fn record_tx(&mut self, idx: usize, bytes: usize, now: Duration) {
@@ -1702,11 +1840,11 @@ impl CentralRouter {
     }
 
     /// Note that interface `idx` exists, widening the range
-    /// [`interface_throughput`] reports over.  Saturates at [`MAX_INTERFACES`].
+    /// [`interface_throughput`] reports over.  Saturates at `INTERFACES`.
     ///
     /// [`interface_throughput`]: CentralRouter::interface_throughput
     fn touch_iface(&mut self, idx: usize) {
-        if idx < MAX_INTERFACES {
+        if idx < INTERFACES {
             self.iface_count = self.iface_count.max(idx + 1);
         }
     }

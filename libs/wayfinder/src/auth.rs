@@ -93,9 +93,9 @@ const KEEPALIVE_TRAILER_LEN: usize = 8 + SIG_LEN;
 pub const DIRECTED_TRAILER_LEN: usize = 8 + TAG_LEN;
 
 /// Maximum number of revocation records held in the local revocation set.
-const MAX_REVOKED: usize = 32;
+pub(crate) const MAX_REVOKED: usize = 32;
 /// Maximum number of verified neighbor key records cached.
-const MAX_NEIGHBOR_KEYS: usize = 64;
+pub(crate) const MAX_NEIGHBOR_KEYS: usize = 64;
 
 /// Length of a [`RevocationRecord`] on the wire.
 const REVOKE_LEN: usize = core::mem::size_of::<RevocationRecord>();
@@ -115,7 +115,7 @@ const MAX_REVOKE_PER_OGM: usize = 4;
 /// Maximum concurrent outstanding lazy-cert-distribution fetch requests
 /// tracked at once. Bounds the state a churning mesh (many simultaneous
 /// fingerprint misses) can pin.
-const MAX_IN_FLIGHT_CERT_REQUESTS: usize = 16;
+pub(crate) const MAX_IN_FLIGHT_CERT_REQUESTS: usize = 16;
 
 /// Minimum spacing (seconds) between retransmissions of the same outstanding
 /// `CertReq` — the requester-side retry backstop for a dropped request or
@@ -136,7 +136,7 @@ const CERT_REQ_SIG_DOMAIN: &[u8] = b"wf-certreq-sig-v1";
 
 /// Maximum concurrent parked pending `CertReply`s (responder side): verified
 /// requesters this node has no route to yet.
-const MAX_PENDING_REPLIES: usize = 16;
+pub(crate) const MAX_PENDING_REPLIES: usize = 16;
 
 /// How long a parked pending reply is kept before it is evicted as stale.
 const PENDING_REPLY_TTL_SECS: u64 = 30;
@@ -244,8 +244,39 @@ struct KnownRevocation {
     floods_left: u8,
 }
 
+/// Constructor for the default (host) capacities.
+///
+/// Kept in its own impl on the fully-defaulted type rather than on the generic
+/// impl below: a struct's default const parameters do **not** drive inference in
+/// expression position, so a generic `OgmAuth::new` would force every call site
+/// to name its capacities (`E0284`). With `new` pinned here, existing callers
+/// need no annotation, and a constrained node reaches for
+/// [`with_capacities`](OgmAuth::with_capacities) instead.
+impl OgmAuth {
+    /// Build auth state from this node's keypair, its membership cert, and the
+    /// mesh trust anchor, at the default capacities.
+    pub fn new(keypair: Keypair, cert: MembershipCert, anchor: TrustAnchor) -> Self {
+        Self::with_capacities(keypair, cert, anchor)
+    }
+}
+
 /// Per-node OGM authentication state, held by the router when auth is enabled.
-pub struct OgmAuth {
+///
+/// The table capacities are const-generic so a constrained node can trade mesh
+/// scale for RAM: the neighbour cache alone is 64 × 272 bytes at host
+/// capacities. All four parameters default to the module constants of the same
+/// name, so `OgmAuth::new` keeps exactly the sizing it had before they existed.
+///
+/// Capacity is a purely **local** memory decision — it never reaches the wire,
+/// so a host-profile node and a tiny-profile node interoperate unchanged.
+/// Every bound enforced at runtime, and every occupancy metric's denominator,
+/// reads these parameters rather than the module constants.
+pub struct OgmAuth<
+    const MAX_NEIGHBOR_KEYS: usize = { self::MAX_NEIGHBOR_KEYS },
+    const MAX_REVOKED: usize = { self::MAX_REVOKED },
+    const MAX_IN_FLIGHT_CERT_REQUESTS: usize = { self::MAX_IN_FLIGHT_CERT_REQUESTS },
+    const MAX_PENDING_REPLIES: usize = { self::MAX_PENDING_REPLIES },
+> {
     /// This node's key material, for signing its own OGMs.
     keypair: Keypair,
     /// This node's membership certificate, attached to its OGMs.
@@ -289,10 +320,19 @@ pub struct OgmAuth {
     cert_req_rate: HVec<(Mac, u64), MAX_NEIGHBOR_KEYS>,
 }
 
-impl OgmAuth {
-    /// Build auth state from this node's keypair, its membership cert, and the
-    /// mesh trust anchor.
-    pub fn new(keypair: Keypair, cert: MembershipCert, anchor: TrustAnchor) -> Self {
+impl<
+    const MAX_NEIGHBOR_KEYS: usize,
+    const MAX_REVOKED: usize,
+    const MAX_IN_FLIGHT_CERT_REQUESTS: usize,
+    const MAX_PENDING_REPLIES: usize,
+> OgmAuth<MAX_NEIGHBOR_KEYS, MAX_REVOKED, MAX_IN_FLIGHT_CERT_REQUESTS, MAX_PENDING_REPLIES>
+{
+    /// Build auth state at *this* profile's capacities from the node's keypair,
+    /// its membership cert, and the mesh trust anchor.
+    ///
+    /// [`new`](OgmAuth::new) is the same thing at the default capacities, and
+    /// is what a host-sized node wants.
+    pub fn with_capacities(keypair: Keypair, cert: MembershipCert, anchor: TrustAnchor) -> Self {
         Self {
             keypair,
             cert,
@@ -1651,7 +1691,7 @@ mod tests {
 
         // Hand-build an OGM with a small pre-existing TVLV record in the tail.
         let (mut buf, mut len) = bare_ogm(mac(2), 7);
-        len = OgmAuth::write_tvlv(&mut buf, len, batman::wire::TvlvType::Mcast, &[1, 2, 3, 4]);
+        len = HostAuth::write_tvlv(&mut buf, len, batman::wire::TvlvType::Mcast, &[1, 2, 3, 4]);
         let mcast_record = TVLV_HDR + 4;
         buf[TVLV_LEN_OFF..TVLV_LEN_OFF + 2].copy_from_slice(&(mcast_record as u16).to_be_bytes());
 
@@ -2086,13 +2126,14 @@ mod tests {
         seqno.copy_from_slice(&buf[SEQNO_OFF..SEQNO_OFF + 4]);
         let signature = {
             let signed =
-                OgmAuth::signed_message(&orig, &seqno, cert_bytes, &mut auth.sign_scratch).unwrap();
+                HostAuth::signed_message(&orig, &seqno, cert_bytes, &mut auth.sign_scratch)
+                    .unwrap();
             auth.keypair.sign(signed)
         };
         let fp = cert.fingerprint();
         let mut off = len;
-        off = OgmAuth::write_tvlv(buf, off, TvlvType::CertFp, &fp);
-        off = OgmAuth::write_tvlv(buf, off, TvlvType::OgmSig, &signature);
+        off = HostAuth::write_tvlv(buf, off, TvlvType::CertFp, &fp);
+        off = HostAuth::write_tvlv(buf, off, TvlvType::OgmSig, &signature);
         let tvlv_len = (off - len) as u16;
         buf[TVLV_LEN_OFF..TVLV_LEN_OFF + 2].copy_from_slice(&tvlv_len.to_be_bytes());
         off
@@ -2665,5 +2706,105 @@ mod tests {
         let mut a = member(&authority, 2, mac(2), 1000);
         a.park_pending_reply(mac(3));
         assert_eq!(a.pending_cert_replies_occupancy(), (1, MAX_PENDING_REPLIES));
+    }
+
+    // ── Capacity profiles ─────────────────────────────────────────────────
+
+    /// A deliberately tiny profile for a constrained node: 8 neighbour keys,
+    /// 4 revocations, 2 in-flight cert requests, 2 parked replies.
+    type TinyAuth = OgmAuth<8, 4, 2, 2>;
+
+    /// Today's host capacities, spelled out positionally.
+    type HostAuth =
+        OgmAuth<MAX_NEIGHBOR_KEYS, MAX_REVOKED, MAX_IN_FLIGHT_CERT_REQUESTS, MAX_PENDING_REPLIES>;
+
+    /// Build a tiny-profile member, mirroring [`member`].
+    fn tiny_member(authority: &Authority, seed: u8, m: Mac, valid_to: u64) -> TinyAuth {
+        let kp = Keypair::from_seed(&[seed; 32]);
+        let cert = authority.issue_cert(m, kp.ed_pubkey(), kp.x_pubkey(), 0, valid_to);
+        let mut auth = TinyAuth::with_capacities(kp, cert, authority.trust_anchor());
+        auth.set_time(100);
+        auth
+    }
+
+    /// The new parameters must default to today's values, so every existing
+    /// `OgmAuth::new` call site keeps its current sizing.
+    #[test]
+    fn auth_defaults_preserve_todays_capacities() {
+        assert_eq!(
+            core::mem::size_of::<OgmAuth>(),
+            core::mem::size_of::<HostAuth>()
+        );
+    }
+
+    /// The point of the exercise: a small profile must actually reclaim RAM.
+    /// `neighbors` alone is 64 x 272 bytes at host capacity.
+    #[test]
+    fn tiny_auth_profile_is_substantially_smaller() {
+        let tiny = core::mem::size_of::<TinyAuth>();
+        let host = core::mem::size_of::<HostAuth>();
+        assert!(
+            tiny * 4 < host,
+            "tiny profile ({tiny} B) should be well under a quarter of host ({host} B)"
+        );
+    }
+
+    /// Every occupancy metric must report *this* profile's capacity as its
+    /// denominator, so an embedded node's cert-store gauge reads `n/8` rather
+    /// than the host's `n/64`.
+    #[test]
+    fn auth_occupancy_denominators_follow_the_profile() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let b = tiny_member(&authority, 3, mac(3), 1000);
+
+        assert_eq!(b.cert_store_occupancy(), (0, 8));
+        assert_eq!(b.in_flight_cert_requests_occupancy(), (0, 2));
+        assert_eq!(b.pending_cert_replies_occupancy(), (0, 2));
+    }
+
+    /// The neighbour cache evicts at the profile's bound, not the crate
+    /// default of 64 — otherwise a tiny profile would overflow its own table.
+    #[test]
+    fn tiny_profile_neighbor_cache_evicts_at_its_own_bound() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = tiny_member(&authority, 100, mac(100), 1_000_000);
+
+        for n in 1..=8u8 {
+            let mut a = member(&authority, n, mac(n), 1_000_000);
+            let (mut buf, len) = bare_ogm(mac(n), 1);
+            let len = a.augment_ogm(&mut buf, len).unwrap();
+            assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+        }
+        assert_eq!(
+            b.neighbors().len(),
+            8,
+            "table saturates at the profile bound"
+        );
+        assert_eq!(b.cert_store_occupancy(), (8, 8));
+
+        // A ninth distinct originator evicts rather than overflowing.
+        let mut over = member(&authority, 200, mac(200), 1_000_000);
+        let (mut buf, len) = bare_ogm(mac(200), 1);
+        let len = over.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+        assert_eq!(b.neighbors().len(), 8);
+    }
+
+    /// Capacity is a purely local memory decision: a host-profile node's OGM
+    /// must still verify at a tiny-profile peer, and vice versa. If this ever
+    /// fails, a profile has leaked into the wire format.
+    #[test]
+    fn profiles_do_not_change_the_wire_format() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut host = member(&authority, 2, mac(2), 1000);
+        let mut tiny = tiny_member(&authority, 3, mac(3), 1000);
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = host.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(tiny.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        let (mut buf, len) = bare_ogm(mac(3), 7);
+        let len = tiny.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(host.verify_ogm(&buf[..len]), OgmVerdict::Verified);
     }
 }

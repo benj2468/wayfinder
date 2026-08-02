@@ -65,6 +65,38 @@ use wayfinder::interfaces::frame::Mac;
 use wayfinder::interfaces::link::LinkError;
 use wayfinder::link::LinkT;
 use wayfinder::link::Received;
+
+wayfinder::define_profile! {
+    /// This board's capacity profile.
+    ///
+    /// The routing core's tables are const-generic so a node sizes them to the
+    /// mesh it actually serves rather than to a Linux gateway's. Two figures
+    /// here are derived from hardware and must not be raised casually:
+    ///
+    /// - `interfaces: 2` is exactly this board's link count (LoRa + BLE).
+    /// - `max_frame_len: 512` is the largest frame either link can deliver —
+    ///   `rylr998`'s reassembly caps at 512 bytes and `blue`'s at 350, so
+    ///   nothing longer can arrive. Lowering it below 512 would silently drop
+    ///   reassembled LoRa frames.
+    ///
+    /// The rest are sized for the handful-of-nodes mesh this board joins, with
+    /// headroom: `originators` and `ident_table` must stay powers of two.
+    pub nrf52840 {
+        originators: 32,
+        interfaces: 2,
+        mcast_members: 16,
+        local_mcast: 4,
+        ident_table: 32,
+        ident_live: 24,
+        link_quality: 32,
+        neighbor_keys: 16,
+        revoked: 8,
+        in_flight_cert_requests: 4,
+        pending_replies: 4,
+        max_frame_len: 512,
+    }
+}
+
 use wayfinder_embedded_driver::Clock;
 use wayfinder_embedded_driver::Driver;
 use wayfinder_embedded_driver::TrickleParams;
@@ -478,7 +510,10 @@ async fn wayfinder(
         },
     ];
 
-    let mut driver = Driver::new(node_mac, links, EmbassyClock, &trickle, &[]);
+    // Built at this board's capacities rather than the host defaults; the link
+    // and clock types are inferred, only the profile is pinned.
+    let mut driver: wayfinder_embedded_driver::driver_for!(_, _, 2, nrf52840) =
+        Driver::with_capacities(node_mac, links, EmbassyClock, &trickle, &[]);
 
     // Reached the run loop: signal liveness on LED1 (active-low). Held for the
     // lifetime of this task, so the pin stays driven — dropping it would

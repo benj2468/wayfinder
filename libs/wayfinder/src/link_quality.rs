@@ -45,18 +45,18 @@ pub struct LinkQualityRecord<Ident> {
 }
 
 /// Fixed-capacity table of per-(neighbor, interface) link-quality estimates.
-pub struct LinkQualityTable<Ident: MeshIdentifier> {
-    entries: HVec<LinkQualityRecord<Ident>, LINK_QUALITY_CAPACITY>,
+pub struct LinkQualityTable<Ident: MeshIdentifier, const CAP: usize = LINK_QUALITY_CAPACITY> {
+    entries: HVec<LinkQualityRecord<Ident>, CAP>,
 }
 
-impl<Ident: MeshIdentifier> Default for LinkQualityTable<Ident> {
+impl<Ident: MeshIdentifier, const CAP: usize> Default for LinkQualityTable<Ident, CAP> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<Ident: MeshIdentifier> LinkQualityTable<Ident> {
-    /// Create an empty table.
+impl<Ident: MeshIdentifier, const CAP: usize> LinkQualityTable<Ident, CAP> {
+    /// Create an empty table at this profile's capacity.
     pub fn new() -> Self {
         Self {
             entries: HVec::new(),
