@@ -276,8 +276,8 @@ impl Client {
     }
 
     /// Connect to an embedded node's **unauthenticated** management API over a
-    /// serial port (e.g. the nRF52840's onboard-VCOM UART at `/dev/ttyACM0`),
-    /// opened at `baud`.
+    /// serial port (e.g. the nRF52840's USB CDC-ACM management port, typically
+    /// enumerating as `/dev/ttyACMX`), opened at `baud`.
     ///
     /// Unlike [`connect_tls`](Self::connect_tls), this transport carries no TLS
     /// and no membership authentication: the embedded server trusts the physical

@@ -13,13 +13,12 @@
 //! type. The embassy thread-mode executor drives the driver's `async` loop
 //! forever.
 //!
-//! This board previously also served the management API over a second UART on
-//! the DK's onboard-debugger VCOM port. That wiring was deliberately removed
-//! during BLE bring-up and the node is currently *not* inspectable over serial
-//! — `wayfinder-embedded-driver`'s `mgmt` feature and `wayfinder-server` are
-//! still depended on but unwired, so restoring it is a matter of rebuilding
-//! the `UARTE1` + `EmbeddedQueryChannel` + `serve` path and swapping
-//! `driver.run()` back for `driver.run_with_mgmt(&query_rx)`.
+//! The management API is served over the chip's **USB device peripheral** as a
+//! CDC-ACM port (see [`usb_mgmt`]), so the node is inspectable with
+//! `wayfinder-tui`/`wayfinderctl --serial` over the board's own USB connector.
+//! This replaces the second UART on the DK's onboard-debugger VCOM lines that
+//! used to carry it: USBD needs no GPIOs and no debug probe, which is what makes
+//! the same firmware serviceable on an nRF52840 dongle.
 //!
 //! [`BufferedUarte`]: embassy_nrf::buffered_uarte::BufferedUarte
 //! [`LinkT`]: wayfinder::link::LinkT
@@ -29,6 +28,8 @@
 
 use blue::NrfBleLink;
 use embassy_executor::Spawner;
+use embassy_futures::join::join;
+use embassy_nrf::Peri;
 use embassy_nrf::bind_interrupts;
 use embassy_nrf::buffered_uarte;
 use embassy_nrf::buffered_uarte::BufferedUarte;
@@ -44,12 +45,15 @@ use embassy_nrf::peripherals;
 use embassy_nrf::uarte::Baudrate;
 use embassy_nrf::uarte::Config as UarteConfig;
 use embassy_nrf::uarte::Parity;
+use embassy_nrf::usb;
 use embassy_time::Duration as EmbassyDuration;
 use embassy_time::Instant;
 use embassy_time::Timer;
 use embedded_alloc::LlffHeap as Heap;
 use embedded_io_async::Read;
 use embedded_io_async::Write;
+use nrf_softdevice::SocEvent;
+use nrf_softdevice::Softdevice;
 use rylr998::Bandwidth;
 use rylr998::CodingRate;
 use rylr998::LoraError;
@@ -65,6 +69,9 @@ use wayfinder::interfaces::frame::Mac;
 use wayfinder::interfaces::link::LinkError;
 use wayfinder::link::LinkT;
 use wayfinder::link::Received;
+use wayfinder_server::EmbeddedQueryChannel;
+
+mod usb_mgmt;
 
 wayfinder::define_profile! {
     /// This board's capacity profile.
@@ -105,6 +112,8 @@ use wayfinder_embedded_driver::identity::IdentityError;
 use wayfinder_embedded_driver::identity::load_or_init_identity;
 use wayfinder_storage::FlashStore;
 
+use crate::usb_mgmt::on_soc_event;
+
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
 
@@ -125,16 +134,15 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     }
 }
 
-/// Bytes reserved for `alloc`. Its only current user is `tracing-core`'s
-/// bookkeeping, which needs a small fraction of this.
+/// Bytes reserved for `alloc`. Two users share it: `tracing-core`'s bookkeeping
+/// and the USB management server's per-request buffers.
 ///
-/// Still sized for the management server that used to run here (see the module
-/// doc): `wayfinder_server::framing::MAX_FRAME_LEN` is 4 KiB and `serve` holds
-/// one in-flight buffer per direction, so a single connection could pin 8 KiB
-/// in framing buffers alone, leaving ~24 KiB for the `RouterAdapter` response
-/// `Vec`s a query builds. Left at 32 KiB rather than shrunk to fit tracing
-/// alone — it is tiny against the part's 256 KiB SRAM, and re-wiring the mgmt
-/// API would need it straight back.
+/// Sized against `wayfinder_server::framing::MAX_FRAME_LEN` (4 KiB): `serve`
+/// holds one in-flight buffer per direction, so a single management session can
+/// pin up to 8 KiB in framing buffers alone; this leaves ~24 KiB of headroom for
+/// the `RouterAdapter` response `Vec`s a query itself builds plus tracing's
+/// bookkeeping — tiny against the part's 256 KiB SRAM. Grow both constants
+/// together if a real routing-table response ever gets close to the cap.
 const HEAP_SIZE_BYTES: usize = 32 * 1024;
 
 /// LoRa network id shared by every node in this mesh (RYLR `AT+NETWORKID`).
@@ -178,10 +186,12 @@ fn ficr_derived_mac() -> Mac {
 
 // Bind the UARTE0 (RYLR998, if attached) interrupt to the buffered-UARTE
 // handler so the driver's async serial reads/writes are woken by hardware
-// rather than polled. UARTE1 carried the management-API VCOM link until that
-// was removed during BLE bring-up (see the module doc) and is currently unbound.
+// rather than polled, and USBD's to the USB device stack that carries the
+// management API (see `usb_mgmt`). UARTE1 carried the management link over the
+// DK's VCOM lines until USB replaced it, and is now unbound.
 bind_interrupts!(struct Irqs {
     UARTE0 => buffered_uarte::InterruptHandler<peripherals::UARTE0>;
+    USBD => usb::InterruptHandler<peripherals::USBD>;
 });
 
 /// An `embassy-time`-backed [`Clock`] for the embedded driver: the monotonic
@@ -268,16 +278,18 @@ async fn main(spawner: Spawner) {
     info!("Welcome to Wayfinder");
 
     // Same SoftDevice restriction as described just below, for the UARTE0
-    // interrupt the RYLR998 link uses. `embassy_nrf::config::Config` has no
-    // field for UARTE priority — unlike GPIOTE/RTC1, it stays at the hardware
-    // reset default (highest, priority 0) until set explicitly — so it is
-    // dropped to `P2` straight on the NVIC here rather than through the
-    // `nrf_config` built below. Order only matters relative to the SoftDevice
-    // being enabled (in `NrfBleLink::new`, later); nothing between here and
+    // interrupt the RYLR998 link uses and the USBD one the management port
+    // does. `embassy_nrf::config::Config` has no field for either priority —
+    // unlike GPIOTE/RTC1, they stay at the hardware reset default (highest,
+    // priority 0) until set explicitly — so they are dropped to `P2` straight
+    // on the NVIC here rather than through the `nrf_config` built below. Order
+    // only matters relative to the SoftDevice being enabled (via
+    // `Softdevice::enable`, later in `wayfinder()`); nothing between here and
     // there resets NVIC priorities.
     Interrupt::UARTE0.set_priority(Priority::P2);
+    Interrupt::USBD.set_priority(Priority::P2);
 
-    // The SoftDevice (brought up later, in `NrfBleLink::new`) reserves NVIC
+    // The SoftDevice (brought up later, via `Softdevice::enable`) reserves NVIC
     // priority levels 0 and 1 for itself and rejects `sd_softdevice_enable()`
     // outright (`SdmIncorrectInterruptConfiguration`) if any interrupt is
     // already enabled at those levels. `embassy_nrf::config::Config::default()`
@@ -389,7 +401,7 @@ async fn main(spawner: Spawner) {
     // task is queued, so a local LED would be driven for a few microseconds and
     // then float. Lighting it inside the task also makes the documented meaning
     // ("reached the run loop") true, rather than merely "was queued".
-    let Ok(task) = wayfinder(node_mac, uarte, spawner, led) else {
+    let Ok(task) = wayfinder(node_mac, uarte, p.USBD, spawner, led) else {
         // Halting rather than falling through: with no mesh task there is
         // nothing to run, and continuing would leave LED1 dark while the board
         // sits idle looking booted. Matches every other genuine fault here.
@@ -406,6 +418,7 @@ async fn main(spawner: Spawner) {
 async fn wayfinder(
     node_mac: Mac,
     uarte: BufferedUarte<'static>,
+    usbd: Peri<'static, peripherals::USBD>,
     spawner: Spawner,
     led: Output<'static>,
 ) {
@@ -474,12 +487,30 @@ async fn wayfinder(
     debug!("waiting 1s before starting Ble");
     Timer::after_secs(1).await;
 
+    // Enables the SoftDevice and starts its single event pump, the only place
+    // SoC events are ever delivered — hence the USB stack's power-event
+    // handler (`on_soc_event`) riding along here rather than being installed
+    // by `usb_mgmt` itself. See `usb_mgmt`'s module doc. A spawn failure here
+    // is treated like every other genuine boot fault below: halt with LED1
+    // dark rather than run without the event pump USB VBUS detection and BLE
+    // both depend on.
+    let sd = Softdevice::enable(&Default::default());
+    match softdevice_task(sd, on_soc_event) {
+        Ok(task) => spawner.spawn(task),
+        Err(e) => {
+            error!(?e, "softdevice event-pump task spawn failed; halting");
+            loop {
+                cortex_m::asm::wfe();
+            }
+        }
+    }
+
     // Bring up this node's second mesh interface: BLE advertising broadcast
     // over the chip's built-in radio. Unlike the RYLR998 above, this radio is
     // always physically present, so a bring-up failure here is a genuine
     // fault — halt with LED1 dark rather than run a relay with only its
     // optional interface actually working.
-    let ble_link = match NrfBleLink::new(spawner) {
+    let ble_link = match NrfBleLink::new(spawner, sd) {
         Ok(link) => link,
         Err(e) => {
             error!(?e, "BLE bring-up failed; halting");
@@ -489,6 +520,18 @@ async fn wayfinder(
         }
     };
     debug!("BLE link brought up");
+
+    // The management port, now that the SoftDevice it borrows power and clock
+    // state from is up. A failure here leaves the node routing but unobservable
+    // — degraded, not dead — so unlike the radios it does not halt: the mesh is
+    // the job, and management is how you watch it do the job.
+    let usb = match usb_mgmt::init(usbd, Irqs, node_mac).await {
+        Ok(usb) => Some(usb),
+        Err(e) => {
+            error!(?e, "USB management port unavailable; continuing without it");
+            None
+        }
+    };
 
     let links = [rylr_link, MeshLink::Ble(ble_link)];
 
@@ -522,5 +565,30 @@ async fn wayfinder(
     led.set_low();
     info!("wayfinder started");
 
-    driver.run().await
+    // The query channel bridging the USB management serve loop to the router
+    // loop. Both ends borrow it, and both futures are joined below, so it can
+    // live on this task's stack.
+    let query_channel = EmbeddedQueryChannel::new();
+    let (query_tx, query_rx) = query_channel.split();
+
+    match usb {
+        // Run the mesh loop (now also servicing management queries) and the USB
+        // device + serve loop concurrently on this one task; neither returns.
+        Some(usb) => {
+            join(driver.run_with_mgmt(&query_rx), usb.run(&query_tx))
+                .await
+                .0
+        }
+        // No management port: nothing will ever send on `query_rx`, so racing it
+        // would only cost an idle future per loop iteration.
+        None => driver.run().await,
+    }
+}
+
+/// The SoftDevice's single event pump, forwarding SoC events to the board's
+/// handler (see [`usb_mgmt::on_soc_event`]). BLE events are consumed
+/// internally by `nrf-softdevice` and never reach the handler.
+#[embassy_executor::task]
+async fn softdevice_task(sd: &'static Softdevice, on_soc_event: fn(SocEvent)) -> ! {
+    sd.run_with_callback(on_soc_event).await
 }

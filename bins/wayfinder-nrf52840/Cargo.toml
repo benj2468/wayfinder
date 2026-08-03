@@ -46,17 +46,14 @@ wayfinder = { path = "../../libs/wayfinder", default-features = false }
 # The HAL-agnostic embedded driver that runs the router loop, and the RYLR998
 # LoRa driver whose `RylrClient` is one of this board's two mesh `LinkT`s
 # (dispatched via `main.rs`'s `MeshLink` enum, alongside `blue`).  `mgmt`
-# adds the event-loop arm that serves management-API queries off a UART —
-# retained but currently unwired, since the VCOM management path was removed
-# during BLE bring-up (see `main.rs`'s module doc).
+# adds the event-loop arm that serves management-API queries, which this board
+# reaches over USB CDC-ACM (see `src/usb_mgmt.rs`).
 wayfinder-embedded-driver = { path = "../../libs/wayfinder-embedded-driver", features = [
     "mgmt",
 ] }
 # The `no_std` management transport: the `EmbeddedQueryChannel` bridging the
 # serve loop to the driver, and the `serve` loop that frames requests over a
-# UART.  Only its `embedded` feature — no `std`/tokio.  Also retained but
-# currently unwired; kept so restoring the management path is a `main.rs`
-# change rather than a dependency change.
+# byte stream.  Only its `embedded` feature — no `std`/tokio.
 wayfinder-server = { path = "../../libs/wayfinder-server", default-features = false, features = [
     "embedded",
 ] }
@@ -131,3 +128,27 @@ embedded-alloc = "0.6"
 # crate's 0.6 requirement, would pull in a second RTT control block instead of
 # writing to the one already set up).
 rtt-target = "0.5"
+# The USB device stack behind the management interface (`src/usb_mgmt.rs`):
+# `Builder`/`UsbDevice` plus the CDC-ACM class, whose `Sender`/`BufferedReceiver`
+# already implement `embedded-io-async`'s `Write`/`Read` — the same byte-stream
+# traits `wayfinder-server`'s `serve` loop frames requests over, so the class
+# drops straight in where the old VCOM UART used to sit. `default-features =
+# false` drops the crate's default `usbd-hid` class (unused here — this board
+# only speaks CDC-ACM), which otherwise pulls in a second, unrelated `heapless`
+# version alongside the workspace's.
+embassy-usb = { version = "0.6.0", default-features = false }
+# Direct dependency for the SoftDevice syscalls the USB path needs and the BLE
+# link has no reason to make: `sd_power_usb*_enable`/`sd_power_usbregstatus_get`
+# (VBUS state, since the `POWER` peripheral is reserved once the SoftDevice is
+# enabled) and `sd_clock_hfclk_request` (USBD needs the external crystal). Only
+# the two features required to name them; Cargo unifies this with `blue`'s
+# optional copy of the same git dependency, so this does not pull in a second
+# SoftDevice or change which BLE roles are compiled in.
+nrf-softdevice = { git = "https://github.com/embassy-rs/nrf-softdevice.git", features = [
+    "nrf52840",
+    "s140",
+] }
+# `'static` promotion for the USB stack's descriptor/control buffers and the
+# CDC-ACM class state, all of which `embassy-usb`'s builder borrows for the
+# lifetime of the device. Same crate `blue` already uses for its report queue.
+static_cell = "2"
