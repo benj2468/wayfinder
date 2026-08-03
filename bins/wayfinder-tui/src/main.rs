@@ -48,16 +48,18 @@ struct Args {
     identity: Option<PathBuf>,
 
     /// Serial port of an embedded node's *unauthenticated* management API (e.g.
-    /// `/dev/ttyACM0` for an nRF52840 over its onboard-VCOM UART), and the
-    /// connection carries no TLS or authentication. `--identity`/`--cert`/
+    /// `/dev/ttyACMX` for an nRF52840 over its USB CDC-ACM management port),
+    /// and the connection carries no TLS or authentication. `--identity`/`--cert`/
     /// `--node-key` cannot be combined with this (clap rejects it, since they'd
     /// imply a TLS handshake this transport never performs); `--addr` is simply
     /// unused.
     #[arg(long, conflicts_with_all = ["identity", "cert", "node_key"])]
     serial: Option<String>,
 
-    /// Baud rate for `--serial` (the nRF52840 firmware's VCOM UART runs at
-    /// 115200).
+    /// Baud rate for `--serial`. The nRF52840 firmware's management port is
+    /// USB CDC-ACM, not a real UART, so this is a formality `tokio_serial`
+    /// requires to open the port rather than a rate the device enforces —
+    /// any value opens it identically.
     #[arg(long, default_value_t = 115_200)]
     baud: u32,
 
@@ -84,7 +86,8 @@ enum ConnectTarget {
     Tls(Endpoint),
     /// A serial port opened at a fixed baud rate (no TLS, no authentication).
     Serial {
-        /// The serial device path (e.g. `/dev/ttyACM0`).
+        /// The serial device path (e.g. `/dev/ttyACMX` for an nRF52840's USB
+        /// CDC-ACM management port).
         path: String,
         /// The baud rate to open it at.
         baud: u32,

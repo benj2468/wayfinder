@@ -1,13 +1,12 @@
 /// An error bringing up the SoftDevice's background tasks. Node-local and
 /// only encountered at construction; `LinkT`'s own `send`/`recv` errors are
 /// `LinkError`, not this type. (`Softdevice::enable` itself panics rather
-/// than returning a `Result` on misuse, so the only fallible steps here are
-/// the two task spawns — distinguished so a bring-up failure log names which
-/// one failed, rather than an uninformative unit value.)
+/// than returning a `Result` on misuse, and it happens outside this crate —
+/// the caller enables the SoftDevice and hands `NrfBleLink::new` an
+/// already-`&'static` reference — so the only fallible step left here is the
+/// scan task spawn.)
 #[derive(Debug)]
 pub enum BleError {
-    /// Spawning the SoftDevice's background event-pump task failed.
-    SoftdeviceTaskSpawn,
     /// Spawning the background BLE scan loop failed.
     ScanTaskSpawn,
 }

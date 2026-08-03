@@ -126,18 +126,18 @@ pub struct NrfBleLink {
 }
 
 impl NrfBleLink {
-    /// Enable the SoftDevice and start passive scanning, returning a
-    /// `LinkT`-ready handle. Spawns the SoftDevice's event-pump loop and the
-    /// scan loop as background tasks on `spawner` — both must keep running
-    /// for the lifetime of the returned link.
+    /// Start passive scanning on the soft device, returning a
+    /// `LinkT`-ready handle. Spawns the scan loop as a background task on
+    /// `spawner` — it must keep running for the lifetime of the returned
+    /// link.
     ///
     /// Uses the SoftDevice's own default configuration (`Config::default()`)
     /// throughout — the default role/connection counts haven't been tuned
     /// against real hardware yet; see `libs/blue/CLAUDE.md`.
-    pub fn new(spawner: Spawner) -> Result<Self, BleError> {
-        let sd: &'static Softdevice = Softdevice::enable(&Default::default());
-        spawner.spawn(softdevice_task(sd).map_err(|_| BleError::SoftdeviceTaskSpawn)?);
-
+    ///
+    /// It is expected that the caller has already enabled the SoftDevice
+    /// and is ready to receive events from it.
+    pub fn new(spawner: Spawner, sd: &'static Softdevice) -> Result<Self, BleError> {
         static REPORTS: StaticCell<ReportQueue> = StaticCell::new();
         let reports = REPORTS.init(ReportQueue {
             channel: Channel::new(),
@@ -172,11 +172,6 @@ impl NrfBleLink {
         self.msg_id_ctr = self.msg_id_ctr.wrapping_add(1);
         id
     }
-}
-
-#[embassy_executor::task]
-async fn softdevice_task(sd: &'static Softdevice) -> ! {
-    sd.run().await
 }
 
 /// Drives passive scanning forever, dispatching only mesh-marker-tagged

@@ -74,7 +74,7 @@ pub struct Cli {
     pub node_key: Option<String>,
 
     /// Serial port of an embedded node's *unauthenticated* management API (e.g.
-    /// `/dev/ttyACM0` for an nRF52840 over its onboard-VCOM UART), and the
+    /// `/dev/ttyACMX` for an nRF52840 over its onboard-VCOM UART), and the
     /// connection carries no TLS or authentication. `--identity`/`--cert`/
     /// `--node-key` cannot be combined with this (clap rejects it, since they'd
     /// imply a TLS handshake this transport never performs); `--connect` is
