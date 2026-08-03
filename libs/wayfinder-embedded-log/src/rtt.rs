@@ -49,15 +49,26 @@ pub fn init() {
 struct RttLogger;
 
 impl log::Log for RttLogger {
-    /// Every record is enabled; see [`init`] on where filtering happens.
-    fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
-        true
+    /// Every record is enabled except `nrf-softdevice`'s own `trace!`/`debug!`
+    /// diagnostics, capped at `Info` — by far the noisiest `log` producer on
+    /// this shared RTT channel, easily crowding out the mesh stack's own
+    /// `tracing` events. Everything else (embassy-*) stays unfiltered; see
+    /// [`init`] on the global-level fallback this sits underneath.
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        if metadata.target().starts_with("nrf_softdevice") {
+            metadata.level() <= log::Level::Info
+        } else {
+            true
+        }
     }
 
     /// Render one record to RTT in the same shape as a `tracing` event. `log`
     /// formats eagerly, so the whole message arrives as one preformatted
     /// `Arguments` rather than as separate structured fields.
     fn log(&self, record: &log::Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
         let mut line = LineBuf::new(record.level(), record.target());
         line.push_args(record.args());
         rprintln!("{}", line.as_str());

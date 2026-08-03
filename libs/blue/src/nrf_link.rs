@@ -174,6 +174,15 @@ impl NrfBleLink {
     }
 }
 
+/// Scan interval/window, in 625µs units. Not equal: a scan window that
+/// exactly fills its interval leaves the SoftDevice's radio scheduler no
+/// gap to service any other role, and `send`'s `peripheral::advertise`
+/// starts failing with `AdvertiseError::Raw(RawError::Resources)` (SoftDevice
+/// docs: "Not enough BLE role slots available"). ~90% duty cycle trades a
+/// small amount of scan coverage for leaving the advertiser schedulable.
+const SCAN_INTERVAL_625US: u32 = 180; // 112.5ms
+const SCAN_WINDOW_625US: u32 = 160; // 100ms
+
 /// Drives passive scanning forever, dispatching only mesh-marker-tagged
 /// reports (see `crate::ad::find_mesh_fragment`) to `reports`. `central::scan`
 /// returning is not itself a hardware fault — it can happen on internal
@@ -184,6 +193,8 @@ async fn ble_scan_task(sd: &'static Softdevice, reports: &'static ReportQueue) -
     let config = ScanConfig {
         active: false,
         timeout: 0,
+        window: SCAN_WINDOW_625US,
+        interval: SCAN_INTERVAL_625US,
         ..Default::default()
     };
     loop {
