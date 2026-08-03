@@ -222,14 +222,35 @@ Nothing here has been validated against a real radio, on either backend —
 treat every timing constant as a first guess.
 
 **nRF (`src/nrf_link.rs`)**: exact `Softdevice::Config` role/connection-count
-tuning (currently `Config::default()`), the scan interval constants, and
-whether `ADV_EVENTS_PER_FRAGMENT` (4) advertising events at
-`ADV_INTERVAL_625US` (20 ms) is enough for a passive scanner to reliably catch
-every advertisement. **`ADV_INTERVAL_625US` is the value to watch first on
-hardware**: 20 ms is the SoftDevice's documented `BLE_GAP_ADV_INTERVAL_MIN`,
-but if the stack rejects it for non-connectable advertising the symptom is
-`advertise` returning an error and the link transmitting nothing — fall back to
-160 (100 ms), which is unambiguously valid for every advertising type.
+tuning (currently `Config::default()`), `SCAN_INTERVAL_625US`/
+`SCAN_WINDOW_625US`, and whether `ADV_EVENTS_PER_FRAGMENT` (4) advertising
+events at `ADV_INTERVAL_625US` (20 ms) is enough for a passive scanner to
+reliably catch every advertisement. **`ADV_INTERVAL_625US` is the value to
+watch first on hardware**: 20 ms is the SoftDevice's documented
+`BLE_GAP_ADV_INTERVAL_MIN`, but if the stack rejects it for non-connectable
+advertising the symptom is `advertise` returning an error and the link
+transmitting nothing — fall back to 160 (100 ms), which is unambiguously valid
+for every advertising type.
+
+**Scanning and advertising contend for the same radio, and it's easy to starve
+one of them entirely.** `ScanConfig::default()`'s `interval`/`window` (2732/500
+in 625µs units) duty-cycle scanning to ~18%, which reads as "we scan for a bit
+then go quiet" — not tied to `send()` at all, just the receive window closing
+on its own schedule. The fix is *not* to set `window == interval` for
+literally continuous scanning: that leaves the SoftDevice's radio scheduler no
+gap to service any other role, and `send`'s `peripheral::advertise` starts
+failing every call with `AdvertiseError::Raw(RawError::Resources)` (SoftDevice
+docs on `sd_ble_gap_adv_start`: "Not enough BLE role slots available. Stop one
+or more currently active roles ... and try again") — perfect RX, zero TX. This
+is easy to miss on a noisy build: heavy unfiltered `log`-crate output from
+`nrf-softdevice` itself (see `libs/wayfinder-embedded-log`) can slow the scan
+callback's `sd_ble_gap_scan_start` resume enough to leave the SoftDevice
+incidental gaps, masking the starvation until that logging is quieted down.
+Current values (`SCAN_INTERVAL_625US` = 180, `SCAN_WINDOW_625US` = 160, ~90%
+duty cycle) clear this on the one board tested so far, but — like every other
+constant in this section — are a first guess, not a validated tuning; if
+`send()` starts failing with `Resources` again, widen the gap (lower the
+window relative to the interval) before anything else.
 
 **BlueZ (`src/std_link.rs`)**: whether the 150 ms default dwell actually
 clears the controller's advertising interval; whether register/advertise/
