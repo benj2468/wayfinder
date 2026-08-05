@@ -47,6 +47,12 @@ wayfinder-auth.workspace = true
 # is optional and pulled in only by the `std` feature — the embedded build never
 # links it (and so never pulls its std `tracing`).
 wayfinder-storage = { workspace = true, optional = true }
+# The log ring and runtime filter `RouterAdapter` serves GetLogs/SetLogLevel
+# from. Unconditional and `default-features = false`: the ring is a `static`
+# filled by whichever logging subscriber the binary installed, so it exists on
+# both targets, and this crate needs only to read it — never the host-only
+# `subscriber` layer that writes it.
+wayfinder-log.workspace = true
 zerocopy.workspace = true
 # Pinned directly (not workspace inheritance, which forces `default-features`
 # on) so tracing's `std` feature stays off for the `no_std` embedded build — the

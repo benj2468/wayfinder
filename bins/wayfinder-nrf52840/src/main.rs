@@ -20,6 +20,40 @@
 //! used to carry it: USBD needs no GPIOs and no debug probe, which is what makes
 //! the same firmware serviceable on an nRF52840 dongle.
 //!
+//! # Detaching a debug probe crashes this board, and that is expected
+//!
+//! **Disconnecting `probe-rs` while the SoftDevice's radio is live reliably
+//! trips a SoftDevice timing assert.** It surfaces as
+//! `NRF_FAULT_ID_SD_ASSERT` through `nrf-softdevice`'s `fault_handler` — the
+//! "Softdevice assertion failed … Most common cause is disabling interrupts
+//! for too long" panic — with the faulting PC inside the SoftDevice image
+//! (below `0x27000`), not in any code in this repo. Tearing the debug session
+//! down clears `C_DEBUGEN`/`DEMCR` and drops the chip out of Debug Interface
+//! Mode, and the SoftDevice notices it missed a radio deadline.
+//!
+//! This is a property of the SoftDevice, not a bug here. What was measured on
+//! an nRF52840-DK, to save the next person the evening:
+//!
+//! * Reset and left alone with no probe at all — runs indefinitely.
+//! * Probe attached continuously — runs indefinitely; attaching is harmless.
+//! * `probe-rs attach` then Ctrl+C — asserts every time, identical faulting PC.
+//! * `--no-catch-reset --no-catch-hardfault` — makes no difference; probe-rs's
+//!   default vector catch is not the cause.
+//! * `probe-rs reset` then detach — survives, because the SoftDevice is not
+//!   enabled until ~4 s into boot and there is no live radio to disturb yet.
+//!
+//! Two consequences worth knowing. First, [`panic`] reboots rather than halting
+//! precisely so this is survivable: a node that halted here would sit dead —
+//! no mesh, no RTT, no USB management port — until power-cycled. Second, if a
+//! reattach shows *no output at all*, that is a board still spinning in a
+//! halted panic (the message was printed once and already drained), not a
+//! silent board — reset it rather than attaching to a corpse.
+//!
+//! The way to avoid the whole interaction is not to attach a probe: read the
+//! log ring over the USB management port instead, with `wayfinderctl --serial
+//! /dev/ttyACMX logs --follow`. That path works while detached, and it works
+//! *after* a fault, which the probe does not.
+//!
 //! [`BufferedUarte`]: embassy_nrf::buffered_uarte::BufferedUarte
 //! [`LinkT`]: wayfinder::link::LinkT
 
@@ -64,6 +98,8 @@ use tracing::error;
 use tracing::info;
 use tracing::trace;
 use tracing::warn;
+use wayfinder::config::KeepAliveConfig;
+use wayfinder::config::LinkFeatures;
 use wayfinder::interfaces::frame::LinkFrameData;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder::interfaces::link::LinkError;
@@ -117,21 +153,136 @@ use crate::usb_mgmt::on_soc_event;
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
 
-/// Prints the panic message over RTT before halting, so a fatal error (e.g.
-/// `nrf-softdevice`'s own `sd_ble_enable` RAM-too-small panic — see
-/// `memory.x`) is visible on the debug probe instead of a silent hang.
-/// Writes to the print channel `wayfinder_embedded_log::init()` already set
+/// Consecutive panics tolerated before the handler stops rebooting and halts
+/// instead. Three is enough for a transient fault to clear and few enough that
+/// a deterministic one settles quickly.
+const MAX_CONSECUTIVE_PANICS: u32 = 3;
+
+/// Roughly how long the panic handler holds the CPU before resetting, so a probe
+/// that is attached has time to drain the message out of the RTT buffer (which
+/// does not survive the reset). Cycles rather than a `Timer`: the executor is
+/// gone by now and `embassy-time` cannot be awaited from a panic handler.
+const PANIC_DRAIN_CYCLES: u32 = 2 * 64_000_000;
+
+/// Panic bookkeeping that survives a soft reset, so the handler can tell a
+/// one-off fault from a fault it is about to reboot into forever.
+///
+/// Layout: the high 24 bits are [`PANIC_GUARD_MAGIC`], the low 8 the count.
+///
+/// **`.uninit` is the whole mechanism, not a detail.** A `static` anywhere else
+/// — behind a lock, an atomic, anything — sits in `.bss`/`.data` and is zeroed
+/// or re-initialized by `cortex-m-rt` on *every* boot, including the reset this
+/// handler itself triggers; the count would never exceed 1 and a deterministic
+/// panic would reboot-loop forever. `.uninit` is excluded from that startup
+/// zeroing (it begins exactly at `__ebss`), and nRF52 RAM holds its contents
+/// across a `SYSRESETREQ` as long as power does. The cost is that after a
+/// power-on the bytes are genuinely garbage — hence the magic, without which
+/// garbage resembling a large count would halt on the first panic after
+/// power-up instead of recovering.
+///
+/// An `AtomicU32` keeps every access safe: the section makes the initializer
+/// below dead (`.uninit` is `NOLOAD`), and load/store are calls the compiler
+/// will not speculate, duplicate, or fold — the guarantee `read_volatile` would
+/// give, without `unsafe` or pointer casts. `Relaxed` because there is no
+/// concurrency to order against: one executor, one core, and the only writer
+/// besides [`mark_boot_healthy`] is a panic handler that never returns. A lock
+/// would be worse than useless here — `critical_section` on this board is
+/// `nrf-softdevice`'s impl, so taking one inside a panic handler is the very
+/// interrupt-starving path that produces these faults, and an already-borrowed
+/// guard would panic *inside* `#[panic_handler]`.
+///
+/// Scalar rather than a two-field struct: LLVM splits struct globals into
+/// per-field globals when every access is field-wise, which would move the magic
+/// out into `.bss`, zero it each boot, and silently degrade the guard to "always
+/// reset, never halt".
+#[unsafe(link_section = ".uninit.PANIC_GUARD")]
+static PANIC_GUARD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Marks [`PANIC_GUARD`] as ours rather than post-power-on garbage. Arbitrary,
+/// but not a value RAM is likely to hold by accident (`b"WAF"`).
+const PANIC_GUARD_MAGIC: u32 = 0x5741_4600;
+
+/// Selects the magic half of [`PANIC_GUARD`].
+const PANIC_GUARD_MAGIC_MASK: u32 = 0xFFFF_FF00;
+
+/// Selects the count half of [`PANIC_GUARD`], and is also the count's
+/// saturation point — it only ever has to distinguish "below
+/// [`MAX_CONSECUTIVE_PANICS`]" from "at or above".
+const PANIC_GUARD_COUNT_MASK: u32 = 0x0000_00FF;
+
+/// Declare this boot healthy, resetting the consecutive-panic count.
+///
+/// Called once the node is far enough along that a panic from here on is a
+/// runtime fault worth rebooting out of, rather than a bring-up failure that
+/// would recur identically on the next boot. Everything that panics
+/// deterministically on this board — `sd_ble_enable` sizing against `memory.x`,
+/// identity load, USB bring-up — happens before this point, so those still
+/// latch the counter and halt after [`MAX_CONSECUTIVE_PANICS`].
+fn mark_boot_healthy() {
+    PANIC_GUARD.store(PANIC_GUARD_MAGIC, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record one more panic and return the resulting consecutive count (1 for the
+/// first panic since the last healthy boot, or since power-on).
+fn bump_panic_count() -> u32 {
+    let stored = PANIC_GUARD.load(core::sync::atomic::Ordering::Relaxed);
+    // A mismatched magic means power-on garbage rather than a count this
+    // handler wrote, so treat it as the first panic.
+    let count = if stored & PANIC_GUARD_MAGIC_MASK == PANIC_GUARD_MAGIC {
+        ((stored & PANIC_GUARD_COUNT_MASK) + 1).min(PANIC_GUARD_COUNT_MASK)
+    } else {
+        1
+    };
+    PANIC_GUARD.store(
+        PANIC_GUARD_MAGIC | count,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    count
+}
+
+/// Prints the panic message over RTT, then reboots the node — or halts, once
+/// [`MAX_CONSECUTIVE_PANICS`] reboots in a row have failed to clear the fault.
+///
+/// Rebooting is the important half. A mesh node's faults are not all its own
+/// fault: detaching a debug probe while the SoftDevice's radio is live trips its
+/// timing assert (`NRF_FAULT_ID_SD_ASSERT`) through `nrf-softdevice`'s
+/// `fault_handler`, and a node that halted there would sit dead — no mesh, no
+/// RTT, no USB management port — until someone power-cycled it. That is the
+/// worst failure mode available to a node deployed where nobody is holding a
+/// probe. A reset costs a few seconds of downtime instead.
+///
+/// Halting after repeated panics is the other half: a fault that recurs every
+/// boot (a mis-sized SoftDevice RAM region, say) is a bug to be read off the
+/// probe, and a node reboot-looping through it is harder to observe than one
+/// sitting still with its message in the RTT buffer.
+///
+/// Writes to the print channel `wayfinder_log::init()` already set
 /// up for `tracing`'s output, rather than opening a second RTT channel — the
 /// two must therefore stay on the same `rtt-target` version (see this crate's
 /// `Cargo.toml`). If a panic happens before that `init()` call, the message
-/// is silently dropped (per `rtt_target::rprintln!`'s documented behavior)
-/// and this degrades to a plain halt.
+/// is silently dropped (per `rtt_target::rprintln!`'s documented behavior).
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    rtt_target::rprintln!("panic: {}", info);
-    loop {
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    let count = bump_panic_count();
+
+    // `rprintln!` runs its format string through `concat!`, so implicitly
+    // captured identifiers are not available — every value is positional.
+    rtt_target::rprintln!("panic ({}/{}): {}", count, MAX_CONSECUTIVE_PANICS, info);
+
+    if count >= MAX_CONSECUTIVE_PANICS {
+        rtt_target::rprintln!(
+            "panic: {} consecutive panics; halting",
+            MAX_CONSECUTIVE_PANICS
+        );
+        loop {
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        }
     }
+
+    rtt_target::rprintln!("panic: resetting");
+    // Let an attached probe drain RTT — the buffer does not survive the reset.
+    cortex_m::asm::delay(PANIC_DRAIN_CYCLES);
+    cortex_m::peripheral::SCB::sys_reset()
 }
 
 /// Bytes reserved for `alloc`. Two users share it: `tracing-core`'s bookkeeping
@@ -273,7 +424,7 @@ async fn main(spawner: Spawner) {
     // Install the RTT tracing subscriber now that the allocator is up (its
     // dispatcher allocates) and before any `tracing` event, so the mesh stack's
     // logs are visible over the debug probe.
-    wayfinder_embedded_log::init();
+    wayfinder_log::init();
 
     info!("Welcome to Wayfinder");
 
@@ -380,9 +531,17 @@ async fn main(spawner: Spawner) {
     // module): P1.01 = MCU TX → module RX, P1.02 = MCU RX ← module TX, plus the
     // DK's 3V3 and GND to the module.  Both broken out on the DK headers and
     // free of analog/QSPI conflicts.
+    // `TIMER1`, not `TIMER0`: `BufferedUarte` drives a timer over PPI to detect
+    // the RX idle gap, and `TIMER0` is one of the peripherals the S140
+    // SoftDevice claims exclusively for radio timing (it is in
+    // `nrf_softdevice`'s own `RESERVED_IRQS` list, alongside RADIO/RTC0). On a
+    // board with a RYLR998 actually attached, the `BufferedUarte` outlives
+    // `Softdevice::enable` and the two would then be reprogramming one timer
+    // against each other. `TIMER1` is otherwise unused here — `embassy-time`
+    // runs on RTC1 and the 802.15.4 adapter is never wired live.
     let uarte = buffered_uarte::BufferedUarte::new(
         p.UARTE0,
-        p.TIMER0,
+        p.TIMER1,
         p.PPI_CH0,
         p.PPI_CH1,
         p.PPI_GROUP0,
@@ -553,16 +712,27 @@ async fn wayfinder(
         },
     ];
 
+    let features = [
+        LinkFeatures::default(),
+        LinkFeatures {
+            tx_keepalive: Some(KeepAliveConfig { interval_ms: 5000 }),
+            ..Default::default()
+        },
+    ];
+
     // Built at this board's capacities rather than the host defaults; the link
     // and clock types are inferred, only the profile is pinned.
     let mut driver: wayfinder_embedded_driver::driver_for!(_, _, 2, nrf52840) =
-        Driver::with_capacities(node_mac, links, EmbassyClock, &trickle, &[]);
+        Driver::with_capacities(node_mac, links, EmbassyClock, &trickle, &features);
 
     // Reached the run loop: signal liveness on LED1 (active-low). Held for the
     // lifetime of this task, so the pin stays driven — dropping it would
     // disconnect the pin and the LED would go dark.
     let mut led = led;
     led.set_low();
+    // Every deterministic bring-up panic is behind us; from here a panic is a
+    // runtime fault the node should reboot out of rather than latch on.
+    mark_boot_healthy();
     info!("wayfinder started");
 
     // The query channel bridging the USB management serve loop to the router

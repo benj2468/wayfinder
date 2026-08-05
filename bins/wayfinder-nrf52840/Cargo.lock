@@ -169,7 +169,6 @@ checksum = "8ec610d8f49840a5b376c69663b6369e71f4b34484b9b2eb29fb918d92516cb9"
 dependencies = [
  "bare-metal",
  "bitfield",
- "critical-section",
  "embedded-hal 0.2.7",
  "volatile-register",
 ]
@@ -1015,6 +1014,7 @@ version = "0.1.0"
 source = "git+https://github.com/embassy-rs/nrf-softdevice.git#47d6121c6e823120e8b883a7ac75f44ce7daa3aa"
 dependencies = [
  "cortex-m",
+ "critical-section",
  "embassy-futures",
  "embassy-sync",
  "embedded-storage",
@@ -1762,22 +1762,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "wayfinder-embedded-log"
-version = "0.1.0"
-dependencies = [
- "heapless",
- "log",
- "rtt-target",
- "tracing-core",
-]
-
-[[package]]
 name = "wayfinder-link-utils"
 version = "0.1.0"
 dependencies = [
  "heapless",
  "tracing",
  "wayfinder",
+]
+
+[[package]]
+name = "wayfinder-log"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+ "embassy-time",
+ "heapless",
+ "log",
+ "rtt-target",
+ "tracing-core",
 ]
 
 [[package]]
@@ -1803,7 +1805,7 @@ dependencies = [
  "tracing",
  "wayfinder",
  "wayfinder-embedded-driver",
- "wayfinder-embedded-log",
+ "wayfinder-log",
  "wayfinder-server",
  "wayfinder-storage",
 ]
@@ -1827,6 +1829,7 @@ dependencies = [
  "tracing",
  "wayfinder",
  "wayfinder-auth",
+ "wayfinder-log",
  "wayfinder-protos",
  "zerocopy",
 ]

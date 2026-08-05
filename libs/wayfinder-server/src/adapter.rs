@@ -26,6 +26,9 @@ use wayfinder_protos::service::IssuedCertData;
 use wayfinder_protos::service::KeepAliveEntryData;
 use wayfinder_protos::service::LinkFeaturesEntryData;
 use wayfinder_protos::service::LinkQualityEntryData;
+use wayfinder_protos::service::LogLevelData;
+use wayfinder_protos::service::LogRecordData;
+use wayfinder_protos::service::LogsData;
 use wayfinder_protos::service::NeighborPathData;
 use wayfinder_protos::service::NodeMetricsData;
 use wayfinder_protos::service::NodeSecurityData;
@@ -139,6 +142,21 @@ impl<
         now: Duration,
     ) -> Self {
         Self { router, now, ca }
+    }
+}
+
+/// Map a log-ring level onto the management API's own.
+///
+/// Two enums with the same five variants, kept apart on purpose: the ring's is
+/// the logging crate's vocabulary and the other is the wire's, and neither crate
+/// should have to depend on the other to name a level.
+fn log_level_data(level: wayfinder_log::Level) -> LogLevelData {
+    match level {
+        wayfinder_log::Level::Error => LogLevelData::Error,
+        wayfinder_log::Level::Warn => LogLevelData::Warn,
+        wayfinder_log::Level::Info => LogLevelData::Info,
+        wayfinder_log::Level::Debug => LogLevelData::Debug,
+        wayfinder_log::Level::Trace => LogLevelData::Trace,
     }
 }
 
@@ -474,6 +492,46 @@ impl<
 
     fn runtime_config_active(&self) -> bool {
         self.router.runtime_config_active()
+    }
+
+    /// Read from the process-wide log ring.
+    ///
+    /// Takes nothing from `self`: the ring is filled by the installed logging
+    /// subscriber, which is itself process-wide with no handle to thread
+    /// anywhere. That is deliberate — it is what lets a node answer `GetLogs`
+    /// without a reference to the ring being carried through the router, the
+    /// driver, and every board's bring-up, on targets where none of those layers
+    /// even exist in the same form.
+    fn logs(&self, since_seq: u64, max_records: u32) -> LogsData {
+        let snapshot = wayfinder_log::logs_since(since_seq, max_records as usize);
+        LogsData {
+            records: snapshot
+                .records
+                .into_iter()
+                .map(|r| LogRecordData {
+                    seq: r.seq,
+                    uptime_ms: r.uptime_ms,
+                    level: log_level_data(r.level),
+                    target: r.target.as_str().into(),
+                    message: r.message.as_str().into(),
+                })
+                .collect(),
+            next_seq: snapshot.next_seq,
+            dropped: snapshot.dropped,
+            filter: wayfinder_log::current_spec().as_str().into(),
+        }
+    }
+
+    /// Install a new runtime log filter, and report the spec now in force.
+    ///
+    /// A spec that fails to parse leaves the previous filter untouched; the
+    /// error text is the parser's own, so an operator sees which part of the
+    /// grammar they missed rather than a generic refusal.
+    fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
+        match wayfinder_log::set_filter(directives) {
+            Ok(()) => Ok(wayfinder_log::current_spec().as_str().into()),
+            Err(e) => Err(alloc::format!("{e}")),
+        }
     }
 
     fn get_trust_anchor(&self) -> Result<Vec<u8>, String> {
@@ -1153,6 +1211,55 @@ mod tests {
         }
         // The provider's own router now holds (and will flood) the revocation.
         assert!(router.auth().unwrap().revoked_macs().any(|m| m == mac(9)));
+    }
+
+    /// A record written through the logging crate is readable through the
+    /// provider — the one join this whole feature rests on, since the adapter
+    /// reaches the ring through a `static` rather than through anything the
+    /// router hands it.
+    #[test]
+    fn logs_projects_records_from_the_global_ring() {
+        let mut router = CentralRouter::new(mac(1));
+        let adapter = RouterAdapter::new(&mut router, None, Duration::from_secs(0));
+
+        let start = adapter.logs(0, 0).next_seq;
+        wayfinder_log::record(
+            wayfinder_log::Level::Warn,
+            "wayfinder_server::adapter::test",
+            "drop: no route",
+        );
+
+        let batch = adapter.logs(start, 0);
+        let record = batch
+            .records
+            .iter()
+            .find(|r| r.target == "wayfinder_server::adapter::test")
+            .expect("the record written above is visible through the provider");
+        assert_eq!(record.level, LogLevelData::Warn);
+        assert_eq!(record.message, "drop: no route");
+        assert!(batch.next_seq > start);
+    }
+
+    /// Setting a filter reports back the spec now in force, and a spec that
+    /// doesn't parse is an error carrying the parser's own reason.
+    #[test]
+    fn set_log_level_installs_a_valid_spec_and_rejects_an_invalid_one() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut adapter = RouterAdapter::new(&mut router, None, Duration::from_secs(0));
+
+        assert_eq!(
+            adapter.set_log_level("info,batman=trace"),
+            Ok("info,batman=trace".to_string())
+        );
+
+        let error = adapter
+            .set_log_level("wayfinder=verbose")
+            .expect_err("an unknown level must be refused");
+        assert!(error.contains("unknown log level"), "got {error:?}");
+
+        // Restored so this test leaves the process-wide filter as it found it —
+        // it is shared with every other test in the binary.
+        let _ = adapter.set_log_level(wayfinder_log::DEFAULT_SPEC);
     }
 
     /// With auth disabled, the security view reports it off and carries no

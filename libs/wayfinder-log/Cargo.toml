@@ -1,0 +1,74 @@
+[package]
+name = "wayfinder-log"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+# The mesh stack's logging plumbing, shared by the bare-metal boards and the
+# host node.
+#
+# Three pieces, all target-independent: the line formatter (`fmt.rs`), the
+# runtime `RUST_LOG`-style filter every sink gates on (`filter.rs`), and the
+# bounded in-memory ring the management API serves `GetLogs` from (`ring.rs`).
+# On top of those sit two target-specific facades — the RTT subscriber/logger
+# for `target_os = "none"`, and the `tracing-subscriber` layer behind the
+# `subscriber` feature for the host — so both targets share one filter grammar
+# and one record shape.
+#
+# `no_std` only on bare metal: the host builds of this crate (as a dependency of
+# `wayfinder-server`/`wayfinder-tap`, and under `cargo test`) use `std` for the
+# ring/filter locks, since `critical-section` has no impl registered there.
+
+[features]
+default = []
+# The host-side `tracing-subscriber` layer stack (`subscriber.rs`): a filter
+# layer gating on this crate's runtime directives plus a layer feeding the ring,
+# so a `std` node serves the same `GetLogs` the boards do. Off by default so
+# `wayfinder-server`'s embedded build never pulls `tracing-subscriber`.
+subscriber = ["dep:tracing-subscriber", "dep:tracing"]
+
+[dependencies]
+# Fixed-capacity line buffer and ring storage, so an event formats and is
+# recorded without touching the heap on the hot path.
+heapless.workspace = true
+
+# `Dispatch`/`Subscriber`/`Event`/`Visit`/`Level` — the tracing plumbing. Needed
+# on every target now (not just bare metal): the RTT subscriber, the host layer,
+# and the `Level` conversions all speak it. `std` off; `alloc` (for `Dispatch`'s
+# `Arc`) is always available via tracing-core's unconditional `extern crate
+# alloc`, backed by the board's global allocator.
+tracing-core = { version = "0.1.36", default-features = false }
+
+# Host-only, behind `subscriber`. `tracing` for the `Level` re-export the layer
+# builds records from; `tracing-subscriber` for `Registry`/`Layer`/`fmt`.
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+# RTT and the two facade adapters only make sense on bare metal; gating the deps
+# here (not just the code) keeps the host build from pulling a backend it can't
+# link.
+[target.'cfg(target_os = "none")'.dependencies]
+# The RTT transport + `rprintln!`; uses the `critical-section-single-core` impl
+# the boards already enable via `cortex-m`.
+rtt-target = "0.5"
+# The *other* logging facade. The third-party embedded crates (`embassy-*`,
+# `nrf-softdevice`) log through their own `fmt.rs`, which emits either `defmt`
+# or `log` records — never `tracing`. `defmt` defers formatting to a host
+# decoder holding the ELF, so its records cannot be rendered to text on-device
+# and would need a second RTT channel (colliding with `rtt-target`'s control
+# block); `log` formats eagerly, so enabling those crates' `log` feature lets
+# `RttLogger` drop their records onto the one channel already in use.
+# `default-features = false`: no `std`.
+log = { version = "0.4", default-features = false }
+# The mutual exclusion behind the ring and the filter's directive list. Taken
+# only for records that already passed the lock-free level gate — i.e. records
+# about to be formatted and written anyway — so the masked-interrupt window
+# never scales with rejected trace traffic. The impl comes from the boards'
+# `cortex-m/critical-section-single-core`.
+critical-section = "1.2"
+# The record timestamp source. Every board in this repo already runs an
+# `embassy-time` driver (`time-driver-rtc1` on the nRF), so this adds no new
+# hardware requirement — it reads the clock they already keep.
+embassy-time = "0.5.1"

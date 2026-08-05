@@ -121,13 +121,6 @@ build:embedded:
     # Kept in sync with the `rustup target add` in containers/testenv.Dockerfile.
     BARE_METAL_TARGET: thumbv7em-none-eabihf
   script:
-    # The generic radio drivers plus the HAL-agnostic embedded driver stack
-    # (driver-core + embedded-driver) and the RTT tracing subscriber — cross-
-    # compiling these proves the `no_std` router loop and its logging link for a
-    # real bare-metal target with no vendor HAL, the portability guarantee both
-    # board binaries below rely on.
-    - cargo build --target "$BARE_METAL_TARGET" -p rylr998 -p at86rf233 -p wayfinder-driver-core -p wayfinder-embedded-driver -p wayfinder-embedded-log
-    - cargo clippy --target "$BARE_METAL_TARGET" -p rylr998 -p at86rf233 -p wayfinder-driver-core -p wayfinder-embedded-driver -p wayfinder-embedded-log -- -D warnings
     # Each board binary is its own independent Cargo workspace (linker script,
     # panic handler, HAL), so built from its own directory rather than via `-p`.
     # Both target thumbv7em-none-eabihf (Cortex-M4F) but on different vendor

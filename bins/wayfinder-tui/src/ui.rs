@@ -27,8 +27,10 @@ use ratatui::widgets::Tabs;
 use ratatui::widgets::Wrap;
 
 use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesEntry;
+use wayfinder_protos::wayfinder_v1alpha::LogLevel;
 
 use crate::app::App;
+use crate::app::LogEntry;
 use crate::app::Tab;
 use crate::app::format_id;
 
@@ -54,6 +56,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Tab::Links => render_links(frame, app, chunks[1]),
         Tab::Metrics => render_metrics(frame, app, chunks[1]),
         Tab::Security => render_security(frame, app, chunks[1]),
+        Tab::Logs => render_logs(frame, app, chunks[1]),
     }
     render_status(frame, app, chunks[2]);
 
@@ -62,6 +65,152 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if let Some(action) = app.confirm.clone() {
         render_confirm_popup(frame, &action, frame.area());
     }
+}
+
+/// The colour a record's level is rendered in.
+///
+/// Warm for the things that need acting on and cold for the routine, so the
+/// shape of a screenful reads before any of the words do: red and yellow pull
+/// the eye, trace recedes into the background it usually is.
+fn level_style(level: LogLevel) -> (&'static str, Style) {
+    match level {
+        LogLevel::Error => (
+            "ERROR",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        LogLevel::Warn => ("WARN ", Style::default().fg(Color::Yellow)),
+        LogLevel::Info => ("INFO ", Style::default().fg(Color::Green)),
+        LogLevel::Debug => ("DEBUG", Style::default().fg(Color::Blue)),
+        LogLevel::Trace => ("TRACE", Style::default().fg(Color::DarkGray)),
+        // Never emitted by a node — proto3 requires the zero value to exist, and
+        // an unrecognised value decodes to it. Rendered rather than hidden so a
+        // version skew shows up as odd-looking output instead of missing lines.
+        LogLevel::Unspecified => ("?????", Style::default().fg(Color::Magenta)),
+    }
+}
+
+/// Format a record's uptime as `[    12.345s]` — right-aligned so the seconds
+/// column stays put as a node's uptime grows.
+fn format_uptime(uptime_ms: u64) -> String {
+    format!("[{:>8}.{:03}s]", uptime_ms / 1000, uptime_ms % 1000)
+}
+
+/// Draw the Logs tab: the scrollable record view plus the filter line.
+fn render_logs(frame: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),    // the records
+            Constraint::Length(3), // the filter line
+        ])
+        .split(area);
+
+    render_log_records(frame, app, chunks[0]);
+    render_log_filter(frame, app, chunks[1]);
+}
+
+/// Draw the record view, honouring the app's scroll offset.
+fn render_log_records(frame: &mut Frame, app: &mut App, area: Rect) {
+    // Two border rows are not text.
+    let height = area.height.saturating_sub(2) as usize;
+    let total = app.logs.entries.len();
+
+    // `scroll` counts lines between the viewport's bottom and the buffer's
+    // bottom. Clamped here rather than at keypress time because only rendering
+    // knows the viewport height — a key handler cannot tell how far back "one
+    // screen" is.
+    let scroll = app.logs.scroll.min(total.saturating_sub(height));
+    let end = total.saturating_sub(scroll);
+    let start = end.saturating_sub(height);
+
+    let lines: Vec<Line> = app
+        .logs
+        .entries
+        .iter()
+        .skip(start)
+        .take(end - start)
+        .map(|entry| match entry {
+            LogEntry::Record(record) => {
+                let level = LogLevel::try_from(record.level).unwrap_or(LogLevel::Unspecified);
+                let (label, style) = level_style(level);
+                Line::from(vec![
+                    Span::styled(
+                        format_uptime(record.uptime_ms),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(label, style),
+                    Span::raw(" "),
+                    Span::styled(record.target.clone(), Style::default().fg(Color::DarkGray)),
+                    Span::raw(": "),
+                    Span::raw(record.message.clone()),
+                ])
+            }
+            // Drawn as a full-width rule so a discontinuity is impossible to
+            // scroll past without noticing — the alternative, a small counter
+            // somewhere else on screen, is exactly how a missing record turns
+            // into a wrong conclusion.
+            LogEntry::Gap(dropped) => Line::from(Span::styled(
+                format!("──── {dropped} records dropped ────"),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        })
+        .collect();
+
+    let title = if app.logs.follow {
+        " Logs (following) ".to_string()
+    } else {
+        // The offset tells an operator how far from live they are, which is the
+        // question that matters once the view is detached.
+        format!(" Logs (paused, {scroll} lines back — G to resume) ")
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if app.logs.follow {
+            ACCENT
+        } else {
+            Color::Yellow
+        }))
+        .title(title);
+
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Draw the runtime filter line — the spec in force, or the edit buffer.
+fn render_log_filter(frame: &mut Frame, app: &mut App, area: Rect) {
+    let (content, style, title) = match &app.logs.editing {
+        Some(buffer) => (
+            format!("{buffer}▏"),
+            Style::default().fg(Color::White),
+            " Filter (Enter: apply   Esc: cancel) ",
+        ),
+        None => (
+            if app.logs.filter.is_empty() {
+                "(unknown — no response yet)".to_string()
+            } else {
+                app.logs.filter.clone()
+            },
+            Style::default().fg(Color::DarkGray),
+            " Filter (f to edit) ",
+        ),
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if app.logs.editing.is_some() {
+            ACCENT
+        } else {
+            Color::DarkGray
+        }))
+        .title(title);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(content, style))).block(block),
+        area,
+    );
 }
 
 /// Draw the modal approve/deny/revoke confirmation popup centred over the frame.

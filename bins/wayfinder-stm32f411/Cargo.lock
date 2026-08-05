@@ -1403,22 +1403,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "wayfinder-embedded-log"
-version = "0.1.0"
-dependencies = [
- "heapless",
- "log",
- "rtt-target",
- "tracing-core",
-]
-
-[[package]]
 name = "wayfinder-link-utils"
 version = "0.1.0"
 dependencies = [
  "heapless",
  "tracing",
  "wayfinder",
+]
+
+[[package]]
+name = "wayfinder-log"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+ "embassy-time",
+ "heapless",
+ "log",
+ "rtt-target",
+ "tracing-core",
 ]
 
 [[package]]
@@ -1440,6 +1442,7 @@ dependencies = [
  "tracing",
  "wayfinder",
  "wayfinder-auth",
+ "wayfinder-log",
  "wayfinder-protos",
  "zerocopy",
 ]
@@ -1459,7 +1462,7 @@ dependencies = [
  "tracing",
  "wayfinder",
  "wayfinder-embedded-driver",
- "wayfinder-embedded-log",
+ "wayfinder-log",
 ]
 
 [[package]]

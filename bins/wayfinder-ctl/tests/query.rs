@@ -12,6 +12,9 @@ use wayfinder_protos::service::InterfaceThroughputData;
 use wayfinder_protos::service::KeepAliveEntryData;
 use wayfinder_protos::service::LinkFeaturesEntryData;
 use wayfinder_protos::service::LinkQualityEntryData;
+use wayfinder_protos::service::LogLevelData;
+use wayfinder_protos::service::LogRecordData;
+use wayfinder_protos::service::LogsData;
 use wayfinder_protos::service::NodeMetricsData;
 use wayfinder_protos::service::NodeSecurityData;
 use wayfinder_protos::service::OgmScheduleEntryData;
@@ -124,6 +127,34 @@ impl WayfinderDataProvider for Mock {
     }
     fn runtime_config_active(&self) -> bool {
         true
+    }
+
+    /// Log access is served from a process-wide ring rather than from router
+    /// state, so this stub synthesises a batch instead of consulting one — these
+    /// tests exercise the transport and the query commands, not the ring itself
+    /// (covered in `wayfinder-log` and `RouterAdapter`).
+    ///
+    /// The requested `since_seq` is echoed back through the record's `seq` and
+    /// `max_records` through `dropped`, so a test can prove the CLI's `--since`
+    /// and `--max` actually reach the wire rather than being parsed and
+    /// discarded.
+    fn logs(&self, since_seq: u64, max_records: u32) -> LogsData {
+        LogsData {
+            records: vec![LogRecordData {
+                seq: since_seq,
+                uptime_ms: 12_345,
+                level: LogLevelData::Warn,
+                target: "wayfinder::router".to_string(),
+                message: "staging buffer full".to_string(),
+            }],
+            next_seq: since_seq + 1,
+            dropped: u64::from(max_records),
+            filter: "info,batman=trace".to_string(),
+        }
+    }
+
+    fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
+        Ok(directives.to_string())
     }
     fn security_status(&self) -> SecurityStatusData {
         SecurityStatusData {
@@ -396,4 +427,48 @@ async fn security_query_renders_human_from_server() {
     assert!(out.contains("authentication: enabled"), "got: {out}");
     assert!(out.contains("revoked"), "got: {out}");
     assert!(out.contains("00:00:00:00:00:02"), "got: {out}");
+}
+
+#[tokio::test]
+async fn logs_query_renders_human_from_server() {
+    let endpoint = spawn_server().await;
+    let out = run_query(
+        Command::Logs {
+            since: 0,
+            max: 0,
+            follow: false,
+        },
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .expect("query succeeds");
+    assert!(out.contains("12.345s"), "got: {out}");
+    assert!(out.contains("WARN"), "got: {out}");
+    assert!(out.contains("wayfinder::router"), "got: {out}");
+    assert!(out.contains("staging buffer full"), "got: {out}");
+    assert!(out.contains("filter: info,batman=trace"), "got: {out}");
+}
+
+#[tokio::test]
+async fn logs_query_sends_since_and_max_to_the_node() {
+    let endpoint = spawn_server().await;
+    let out = run_query(
+        Command::Logs {
+            since: 41,
+            max: 7,
+            follow: false,
+        },
+        &endpoint,
+        OutputFormat::Json,
+    )
+    .await
+    .expect("query succeeds");
+    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+    // The mock echoes `since_seq` back as the record's seq and `max_records` as
+    // `dropped`, so these assertions fail if either flag is dropped on the way
+    // to the wire rather than merely mis-rendered.
+    assert_eq!(parsed["records"][0]["seq"], 41);
+    assert_eq!(parsed["next_seq"], 42);
+    assert_eq!(parsed["dropped"], 7);
 }

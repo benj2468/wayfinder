@@ -35,3 +35,7 @@ anyhow.workspace = true
 # handshake tests spin up a real `wayfinder-server` TLS listener to drive the
 # client against. Production code (src/) never depends on the server crate.
 wayfinder-server.workspace = true
+# Test-only: `tests/transport.rs` drives records into the real log ring so the
+# GetLogs/SetLogLevel path is exercised end to end over the wire, rather than
+# against a canned provider value.
+wayfinder-log.workspace = true

@@ -1,6 +1,11 @@
 //! The RTT-backed adapters for both logging facades, compiled only for bare
 //! metal. Each renders through [`crate::fmt::LineBuf`] onto the same RTT print
-//! channel, so `tracing` and `log` records interleave in one stream.
+//! channel, so `tracing` and `log` records interleave in one stream — and each
+//! also pushes the record into [`crate::ring`], which is how a board with no
+//! debug probe attached still has observable logs.
+//!
+//! Both facades gate on [`crate::filter`] first, so one `SetLogLevel` moves
+//! every sink at once.
 
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
@@ -9,6 +14,7 @@ use rtt_target::rprintln;
 use rtt_target::rtt_init_print;
 use tracing_core::Dispatch;
 use tracing_core::Event;
+use tracing_core::Interest;
 use tracing_core::Metadata;
 use tracing_core::Subscriber;
 use tracing_core::field::Field;
@@ -17,7 +23,24 @@ use tracing_core::span::Attributes;
 use tracing_core::span::Id;
 use tracing_core::span::Record;
 
+use crate::filter;
+use crate::filter::Level;
 use crate::fmt::LineBuf;
+use crate::ring;
+
+/// Map a `log` level onto this crate's own.
+///
+/// `log` and `tracing` each have their own level type; the ring and the filter
+/// speak one, so both facades convert on the way in.
+fn level_from_log(level: log::Level) -> Level {
+    match level {
+        log::Level::Error => Level::Error,
+        log::Level::Warn => Level::Warn,
+        log::Level::Info => Level::Info,
+        log::Level::Debug => Level::Debug,
+        log::Level::Trace => Level::Trace,
+    }
+}
 
 /// Initialize RTT and install both facades' global sinks: [`RttSubscriber`] for
 /// `tracing` and [`RttLogger`] for `log`. A failure to install either (one is
@@ -27,15 +50,15 @@ pub fn init() {
     rtt_init_print!();
     let _ = tracing_core::dispatcher::set_global_default(Dispatch::new(RttSubscriber::new()));
     let _ = log::set_logger(&RttLogger);
-    // `log`'s default max level is `Off`, which would discard every record
-    // before `RttLogger::enabled` is consulted. Filtering is left to the
-    // compile-time `max_level_*` features and the host-side RTT reader, matching
-    // `RttSubscriber::enabled`. No consumer currently sets a `max_level_*`
-    // feature on its `embassy-*` deps, so today that means unfiltered —
-    // deliberately, while this bring-up phase wants maximum SoftDevice/embassy
-    // visibility. If that chatter ever crowds out the mesh stack's own events
-    // on the shared RTT channel, cap it via those Cargo features rather than
-    // lowering this constant (which would blind every consumer at once).
+    // Deliberately left wide open: this is a *static* ceiling applied before
+    // `RttLogger` is ever consulted, so anything lower here would put records
+    // permanently out of reach of the runtime filter — `SetLogLevel trace` would
+    // silently fail to produce trace records. All filtering happens in
+    // `RttLogger::log`, against the one filter every sink shares.
+    //
+    // For the same reason, no crate in this workspace may set a `max_level_*`
+    // Cargo feature on `log` or `tracing`: those compile the records out
+    // entirely, and no runtime filter can bring them back.
     log::set_max_level(log::LevelFilter::Trace);
 }
 
@@ -49,29 +72,35 @@ pub fn init() {
 struct RttLogger;
 
 impl log::Log for RttLogger {
-    /// Every record is enabled except `nrf-softdevice`'s own `trace!`/`debug!`
-    /// diagnostics, capped at `Info` — by far the noisiest `log` producer on
-    /// this shared RTT channel, easily crowding out the mesh stack's own
-    /// `tracing` events. Everything else (embassy-*) stays unfiltered; see
-    /// [`init`] on the global-level fallback this sits underneath.
+    /// Whether a record passes the installed runtime filter.
+    ///
+    /// This used to hard-cap `nrf-softdevice`'s own diagnostics at `Info` — by
+    /// far the noisiest `log` producer on the shared RTT channel. That cap is
+    /// now the filter's job: the default `info` filter has exactly the same
+    /// effect, and an operator who deliberately asks for `trace` gets what they
+    /// asked for (and can write `trace,nrf_softdevice=info` to keep the cap).
+    /// A hardcoded ceiling here would be one no `SetLogLevel` could lift.
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        if metadata.target().starts_with("nrf_softdevice") {
-            metadata.level() <= log::Level::Info
-        } else {
-            true
-        }
+        filter::enabled(level_from_log(metadata.level()), metadata.target())
     }
 
-    /// Render one record to RTT in the same shape as a `tracing` event. `log`
-    /// formats eagerly, so the whole message arrives as one preformatted
-    /// `Arguments` rather than as separate structured fields.
+    /// Render one record to RTT and push it to the ring, in the same shape as a
+    /// `tracing` event. `log` formats eagerly, so the whole message arrives as
+    /// one preformatted `Arguments` rather than as separate structured fields.
+    ///
+    /// The filter check stays *inside* this method rather than being left to the
+    /// caller: `log`'s macros consult only the static `max_level` and then call
+    /// `Log::log` directly — they never call `Log::enabled` on the way — so a
+    /// logger that filters solely in `enabled` does no filtering at all.
     fn log(&self, record: &log::Record<'_>) {
         if !self.enabled(record.metadata()) {
             return;
         }
+        let level = level_from_log(record.level());
         let mut line = LineBuf::new(record.level(), record.target());
         line.push_args(record.args());
         rprintln!("{}", line.as_str());
+        ring::record(level, record.target(), line.body());
     }
 
     /// RTT writes are already pushed to the control block synchronously, so
@@ -108,10 +137,26 @@ impl RttSubscriber {
 }
 
 impl Subscriber for RttSubscriber {
-    /// Every event is enabled; level filtering is left to the compile-time
-    /// `tracing` max-level features and to the host-side RTT reader.
-    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
-        true
+    /// Whether an event passes the installed runtime filter.
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        filter::enabled(Level::from(*metadata.level()), metadata.target())
+    }
+
+    /// Always [`Interest::sometimes`], so [`enabled`](Self::enabled) is
+    /// consulted for every event.
+    ///
+    /// **This override is what makes the runtime filter work at all.**
+    /// `tracing-core`'s default `register_callsite` calls `enabled` once per
+    /// callsite and returns `Interest::always()`/`never()`, which the dispatcher
+    /// then caches permanently — so a `SetLogLevel` would take effect only for
+    /// callsites that had never yet been reached, and a node's busiest log lines
+    /// would be exactly the ones frozen at their boot-time verbosity.
+    ///
+    /// The cost is that `enabled` runs per event rather than per callsite, which
+    /// is why [`crate::filter::level_enabled`] screens lock-free before any
+    /// target matching happens.
+    fn register_callsite(&self, _metadata: &'static Metadata<'static>) -> Interest {
+        Interest::sometimes()
     }
 
     /// Issue a fresh span id. `fetch_add` guarantees distinctness modulo the
@@ -135,13 +180,17 @@ impl Subscriber for RttSubscriber {
     fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
 
     /// Render one event to RTT as `LEVEL target: message field=value …`, using a
-    /// fixed stack buffer (no heap). All write failures are truncations and are
-    /// intentionally ignored.
+    /// fixed stack buffer (no heap), and push the same record to the ring. All
+    /// write failures are truncations and are intentionally ignored.
+    ///
+    /// One formatting pass feeds both sinks: RTT takes the whole line, the ring
+    /// takes [`LineBuf::body`] plus the level and target as their own fields.
     fn event(&self, event: &Event<'_>) {
         let meta = event.metadata();
         let mut line = LineBuf::new(meta.level(), meta.target());
         event.record(&mut FieldVisitor(&mut line));
         rprintln!("{}", line.as_str());
+        ring::record(Level::from(*meta.level()), meta.target(), line.body());
     }
 
     /// Spans are not tracked, so entering one is a no-op.

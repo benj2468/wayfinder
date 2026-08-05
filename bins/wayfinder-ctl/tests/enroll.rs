@@ -20,6 +20,7 @@ use wayfinder_protos::service::IssuedCertData;
 use wayfinder_protos::service::KeepAliveEntryData;
 use wayfinder_protos::service::LinkFeaturesEntryData;
 use wayfinder_protos::service::LinkQualityEntryData;
+use wayfinder_protos::service::LogsData;
 use wayfinder_protos::service::NodeMetricsData;
 use wayfinder_protos::service::OgmScheduleEntryData;
 use wayfinder_protos::service::PendingCsrData;
@@ -115,6 +116,18 @@ impl WayfinderDataProvider for ProviderMock {
     }
     fn runtime_config_active(&self) -> bool {
         false
+    }
+
+    /// Log access is served from a process-wide ring rather than from router
+    /// state, so this stub reports an empty one — these tests exercise the
+    /// transport and the query commands, not the log path (covered in
+    /// `wayfinder-log` and `RouterAdapter`).
+    fn logs(&self, _since_seq: u64, _max_records: u32) -> LogsData {
+        LogsData::default()
+    }
+
+    fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
+        Ok(directives.to_string())
     }
 
     fn get_trust_anchor(&self) -> Result<Vec<u8>, String> {

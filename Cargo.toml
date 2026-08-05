@@ -20,7 +20,7 @@ members = [
     "libs/wayfinder-driver",
     "libs/wayfinder-embedded-driver",
     "libs/wayfinder-tick-driver",
-    "libs/wayfinder-embedded-log",
+    "libs/wayfinder-log",
     "libs/wayfinder-test",
     "libs/wayfinder-client",
     "bins/wayfinder-tap",
@@ -59,6 +59,7 @@ wayfinder-driver-core = { path = "./libs/wayfinder-driver-core" }
 wayfinder-driver = { path = "./libs/wayfinder-driver" }
 wayfinder-embedded-driver = { path = "./libs/wayfinder-embedded-driver" }
 wayfinder-client = { path = "./libs/wayfinder-client" }
+wayfinder-log = { path = "./libs/wayfinder-log", default-features = false }
 rylr998 = { path = "./libs/rylr998", default-features = false }
 blue = { path = "./libs/blue", default-features = false }
 

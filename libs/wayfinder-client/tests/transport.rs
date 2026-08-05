@@ -19,6 +19,9 @@ use wayfinder_protos::service::InterfaceThroughputData;
 use wayfinder_protos::service::KeepAliveEntryData;
 use wayfinder_protos::service::LinkFeaturesEntryData;
 use wayfinder_protos::service::LinkQualityEntryData;
+use wayfinder_protos::service::LogLevelData;
+use wayfinder_protos::service::LogRecordData;
+use wayfinder_protos::service::LogsData;
 use wayfinder_protos::service::NeighborPathData;
 use wayfinder_protos::service::NodeMetricsData;
 use wayfinder_protos::service::OgmScheduleEntryData;
@@ -28,6 +31,7 @@ use wayfinder_protos::service::RuntimeConfigData;
 use wayfinder_protos::service::TableOccupancyData;
 use wayfinder_protos::service::WayfinderDataProvider;
 use wayfinder_protos::service::WayfinderService;
+use wayfinder_protos::wayfinder_v1alpha::LogLevel;
 use wayfinder_protos::wayfinder_v1alpha::WayfinderRequest;
 use wayfinder_protos::wayfinder_v1alpha::WayfinderResponse;
 use wayfinder_protos::wayfinder_v1alpha::resolve_route_response::Egress;
@@ -170,6 +174,42 @@ impl WayfinderDataProvider for Mock {
         false
     }
 
+    /// Delegates to the real process-wide ring, exactly as `RouterAdapter`
+    /// does, so the end-to-end test below proves a record emitted on the server
+    /// side actually reaches a client over the wire — not just that the stub's
+    /// canned value survives encoding.
+    fn logs(&self, since_seq: u64, max_records: u32) -> LogsData {
+        let snapshot = wayfinder_log::logs_since(since_seq, max_records as usize);
+        LogsData {
+            records: snapshot
+                .records
+                .into_iter()
+                .map(|r| LogRecordData {
+                    seq: r.seq,
+                    uptime_ms: r.uptime_ms,
+                    level: match r.level {
+                        wayfinder_log::Level::Error => LogLevelData::Error,
+                        wayfinder_log::Level::Warn => LogLevelData::Warn,
+                        wayfinder_log::Level::Info => LogLevelData::Info,
+                        wayfinder_log::Level::Debug => LogLevelData::Debug,
+                        wayfinder_log::Level::Trace => LogLevelData::Trace,
+                    },
+                    target: r.target.as_str().into(),
+                    message: r.message.as_str().into(),
+                })
+                .collect(),
+            next_seq: snapshot.next_seq,
+            dropped: snapshot.dropped,
+            filter: wayfinder_log::current_spec().as_str().into(),
+        }
+    }
+
+    fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
+        wayfinder_log::set_filter(directives)
+            .map(|()| wayfinder_log::current_spec().as_str().to_string())
+            .map_err(|e| format!("{e}"))
+    }
+
     fn get_trust_anchor(&self) -> Result<Vec<u8>, String> {
         Ok(vec![0xab; 36])
     }
@@ -248,6 +288,74 @@ async fn assert_full_roundtrip(client: &mut Client) {
 
     // SetConfig round-trips too (exercises the mutating-request framing).
     client.set_trickle_config(0, 500, 4000).await.unwrap();
+
+    assert_logs_roundtrip(client).await;
+}
+
+/// A record emitted on the server side is readable by the client, and the
+/// runtime filter can be set and read back — the whole point of the feature,
+/// over the real wire rather than through a canned provider value.
+async fn assert_logs_roundtrip(client: &mut Client) {
+    // Where the stream is now, so the assertions below don't have to reason
+    // about whatever else the process has logged.
+    let start = client.logs(0, 0).await.unwrap().next_seq;
+
+    wayfinder_log::record(
+        wayfinder_log::Level::Warn,
+        "wayfinder_client::transport_test",
+        "drop: no route",
+    );
+
+    let batch = client.logs(start, 0).await.unwrap();
+    let record = batch
+        .records
+        .iter()
+        .find(|r| r.target == "wayfinder_client::transport_test")
+        .expect("the record emitted above crossed the wire");
+    assert_eq!(record.level, LogLevel::Warn as i32);
+    assert_eq!(record.message, "drop: no route");
+    // Not "> 0": the clock starts on first use, so the first record in a
+    // process legitimately stamps at ~0ms. What must hold is that the stamps
+    // never go backwards, or the log view would render out of order.
+    assert!(
+        batch
+            .records
+            .windows(2)
+            .all(|w| w[0].uptime_ms <= w[1].uptime_ms),
+        "uptime stamps must be non-decreasing across a batch"
+    );
+    assert_eq!(
+        batch.next_seq,
+        record.seq + 1,
+        "the resume point follows the last record handed over"
+    );
+
+    // The filter round-trips, and an unparsable spec is refused without
+    // disturbing what is in force.
+    let effective = client.set_log_level("info,batman=trace").await.unwrap();
+    assert_eq!(effective, "info,batman=trace");
+    assert_eq!(
+        client.logs(batch.next_seq, 0).await.unwrap().filter,
+        "info,batman=trace",
+        "every batch reports the filter actually in force"
+    );
+
+    let error = client
+        .set_log_level("wayfinder=verbose")
+        .await
+        .expect_err("an unknown level must be refused");
+    assert!(error.to_string().contains("unknown log level"), "{error}");
+    assert_eq!(
+        client.logs(batch.next_seq, 0).await.unwrap().filter,
+        "info,batman=trace",
+        "a rejected spec leaves the previous filter in force"
+    );
+
+    // Leave the process-wide filter as it was found.
+    client
+        .set_log_level(wayfinder_log::DEFAULT_SPEC)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
