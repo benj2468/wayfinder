@@ -19,7 +19,6 @@ use anyhow::bail;
 use clap::Parser;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tracing_subscriber::EnvFilter;
 use tun_rs::DeviceBuilder;
 use tun_rs::Layer;
 use wayfinder::config::Config;
@@ -163,9 +162,18 @@ fn load_or_generate_seed(path: &str) -> anyhow::Result<[u8; 32]> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    // `wayfinder-log`'s stack rather than a bare `tracing_subscriber::fmt`, so
+    // this node also fills the log ring the management API serves `GetLogs`
+    // from — and so `SetLogLevel` moves the console and the ring together, the
+    // same way it moves RTT and the ring on a board.
+    //
+    // The filter grammar is a subset of `EnvFilter`'s (no span/field
+    // directives); a `RUST_LOG` it can't parse is reported and the default is
+    // used, rather than refusing to start the node over an environment
+    // variable.
+    if let Err(e) = wayfinder_log::subscriber::init(std::env::var("RUST_LOG").ok().as_deref()) {
+        tracing::warn!(%e, "ignoring unparsable RUST_LOG; using the default filter");
+    }
 
     let args = Args::parse();
 

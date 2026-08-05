@@ -69,12 +69,12 @@ embassy-sync = "0.8.0"
 embassy-futures = "0.1.2"
 # Installs the RTT `tracing` subscriber so the mesh stack's `trace!`/`warn!`
 # records are observable over the debug probe (they are otherwise dropped).
-wayfinder-embedded-log = { path = "../../libs/wayfinder-embedded-log" }
+wayfinder-log = { path = "../../libs/wayfinder-log" }
 rylr998 = { path = "../../libs/rylr998", features = ["link"] }
 # `Read`/`Write` bound on `MeshLink<S>`'s generic serial type parameter.
 embedded-io-async = "0.7.0"
 # For `warn!` on a fatal bring-up error; `std` off (routed to RTT by
-# `wayfinder-embedded-log`).
+# `wayfinder-log`).
 tracing = { version = "0.1.44", default-features = false }
 # Still linked so this one binary also fully compiles the board's on-air 802.15.4
 # radio adapter (and transitively the rest of the no_std stack) for the real
@@ -113,7 +113,20 @@ embassy-executor = { version = "0.10", features = [
     "log",
 ] }
 embassy-time = { version = "0.5.1", features = ["log"] }
-cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+# **Deliberately without `critical-section-single-core`.** That feature registers
+# a `critical-section` impl whose `acquire` is a bare `cpsid i` — it masks *every*
+# interrupt, the SoftDevice's priority-0/1 RADIO/RTC0/TIMER0 included. This board
+# takes a critical section on paths that run constantly (every log record, via
+# `wayfinder-log`'s `Lock` and `rtt-target`'s print mutex; every heap
+# alloc/dealloc, via `embedded-alloc`), so with that impl the radio is starved for
+# the length of each one and the SoftDevice eventually trips its own timing
+# assertion — the `NRF_FAULT_ID_SD_ASSERT` panic ("disabling interrupts for too
+# long"), intermittently, once the run loop starts logging. The
+# SoftDevice-compatible impl comes from `nrf-softdevice/critical-section-impl`
+# below instead, which masks only non-reserved IRQs. The two are mutually
+# exclusive: both call `critical_section::set_impl!`, so enabling this feature
+# again would fail to link rather than silently regress.
+cortex-m = "0.7"
 # Embassy Executor requires this to be a dependency
 cortex-m-rt = "0.7"
 # `tracing-core` (pulled in via `tracing`, used throughout the mesh stack for
@@ -122,7 +135,7 @@ cortex-m-rt = "0.7"
 embedded-alloc = "0.6"
 # Backs `main.rs`'s `#[panic_handler]`: prints the panic message over RTT
 # before halting. Pinned to the same 0.5 already resolved via
-# `wayfinder-embedded-log`'s RTT transport — the panic handler reuses that
+# `wayfinder-log`'s RTT transport — the panic handler reuses that
 # crate's already-initialized print channel rather than opening a second one,
 # so the version must match (a mismatched version, e.g. the `panic-rtt-target`
 # crate's 0.6 requirement, would pull in a second RTT control block instead of
@@ -140,13 +153,22 @@ embassy-usb = { version = "0.6.0", default-features = false }
 # Direct dependency for the SoftDevice syscalls the USB path needs and the BLE
 # link has no reason to make: `sd_power_usb*_enable`/`sd_power_usbregstatus_get`
 # (VBUS state, since the `POWER` peripheral is reserved once the SoftDevice is
-# enabled) and `sd_clock_hfclk_request` (USBD needs the external crystal). Only
-# the two features required to name them; Cargo unifies this with `blue`'s
-# optional copy of the same git dependency, so this does not pull in a second
-# SoftDevice or change which BLE roles are compiled in.
+# enabled) and `sd_clock_hfclk_request` (USBD needs the external crystal). Cargo
+# unifies this with `blue`'s optional copy of the same git dependency, so this
+# does not pull in a second SoftDevice or change which BLE roles are compiled in.
+#
+# `critical-section-impl` registers the whole-binary `critical-section` provider,
+# and it must be this crate's rather than `cortex-m`'s (see the note there):
+# `acquire` saves and clears the NVIC enable bits for everything *except* the
+# nine IRQs the SoftDevice reserves (RADIO, RTC0, TIMER0, POWER_CLOCK, RNG, ECB,
+# CCM_AAR, TEMP, SWI5_EGU5), so radio timing keeps being serviced inside a
+# critical section. Every `critical_section::with` in the binary — logging, the
+# global allocator, `embassy-sync` — goes through it, which is why the choice is
+# a whole-image property and not a per-call-site one.
 nrf-softdevice = { git = "https://github.com/embassy-rs/nrf-softdevice.git", features = [
     "nrf52840",
     "s140",
+    "critical-section-impl",
 ] }
 # `'static` promotion for the USB stack's descriptor/control buffers and the
 # CDC-ACM class state, all of which `embassy-usb`'s builder borrows for the

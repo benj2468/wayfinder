@@ -16,6 +16,10 @@ use crate::wayfinder_v1alpha::LinkQualityEntry;
 use crate::wayfinder_v1alpha::LinkQualityTable;
 use crate::wayfinder_v1alpha::ListCertsResponse;
 use crate::wayfinder_v1alpha::ListPendingCsrsResponse;
+use crate::wayfinder_v1alpha::LogFilter;
+use crate::wayfinder_v1alpha::LogLevel;
+use crate::wayfinder_v1alpha::LogRecord;
+use crate::wayfinder_v1alpha::LogRecords;
 use crate::wayfinder_v1alpha::NeighborPath;
 use crate::wayfinder_v1alpha::NodeInfo;
 use crate::wayfinder_v1alpha::NodeMetrics;
@@ -324,6 +328,55 @@ pub struct SecurityStatusData {
     pub nodes: Vec<NodeSecurityData>,
 }
 
+/// The verbosity of one log record.  Mirrors the `LogLevel` proto enum, minus
+/// its proto3-mandated zero value — a record always has a real level, so
+/// "unspecified" is unrepresentable here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LogLevelData {
+    /// A failure an operator must act on, originating in this node.
+    Error,
+    /// Unexpected but handled, worth operator attention.
+    Warn,
+    /// A lifecycle or topology event an observer wants.
+    Info,
+    /// A developer-facing state transition.
+    Debug,
+    /// Per-frame/packet flow — the bulk of the records.
+    Trace,
+}
+
+/// One log record, as the management API reports it.  Mirrors the `LogRecord`
+/// proto.
+#[derive(Clone)]
+pub struct LogRecordData {
+    /// Monotonic position in the node's log stream, starting at 0 on boot.
+    pub seq: u64,
+    /// Milliseconds since boot, at the moment the record was emitted.
+    pub uptime_ms: u64,
+    /// The record's verbosity.
+    pub level: LogLevelData,
+    /// The emitting module path.
+    pub target: String,
+    /// The rendered message and its structured fields — never payload bytes.
+    pub message: String,
+}
+
+/// A batch of log records plus where the caller should resume.  Mirrors the
+/// `LogRecords` proto.
+#[derive(Clone, Default)]
+pub struct LogsData {
+    /// The matching records, oldest first.
+    pub records: Vec<LogRecordData>,
+    /// The sequence number to request on the next poll.
+    pub next_seq: u64,
+    /// How many records this caller missed between the sequence number it
+    /// asked for and the oldest the node still retains.
+    pub dropped: u64,
+    /// The filter spec currently in force, so a polling client can display what
+    /// is actually being recorded without a second query.
+    pub filter: String,
+}
+
 /// Implemented by anything that can supply router state to [`WayfinderService`].
 /// Intentionally transport- and protocol-agnostic so callers can implement it
 /// for whatever router type they have without pulling in a dependency on this crate.
@@ -372,6 +425,23 @@ pub trait WayfinderDataProvider {
     /// applied via [`set_config`](WayfinderDataProvider::set_config), as
     /// opposed to running purely off its startup configuration.
     fn runtime_config_active(&self) -> bool;
+
+    /// Recent log records from this node's bounded in-memory ring, from
+    /// `since_seq` onward and at most `max_records` of them (0 meaning the
+    /// node's default batch size).
+    ///
+    /// Not router state — the ring is filled by the installed logging
+    /// subscriber, which is process-wide — but served here so a node's logs are
+    /// reachable over the same transport as everything else, which on a board
+    /// with no debug probe attached is the only way to read them at all.
+    fn logs(&self, since_seq: u64, max_records: u32) -> LogsData;
+
+    /// Install `directives` as the node's runtime log filter, across every sink
+    /// it writes to.  Returns the spec now in force, for readback.
+    ///
+    /// The `Err` variant is a spec that failed to parse, and leaves the previous
+    /// filter untouched: an operator typo must never blind a node.
+    fn set_log_level(&mut self, directives: &str) -> Result<String, String>;
 
     /// This node's mesh authentication / security posture, evaluated from live
     /// auth state at the moment of the call.  The default reports auth disabled;
@@ -495,6 +565,20 @@ pub struct EnrollData {
     pub trust_anchor: Vec<u8>,
 }
 
+/// Map a provider's log level onto the proto enum.  Total, and deliberately
+/// never producing `LOG_LEVEL_UNSPECIFIED`: that value exists only to satisfy
+/// proto3's zero-value rule, and a node emitting it would be reporting a record
+/// with no level.
+fn proto_log_level(level: LogLevelData) -> LogLevel {
+    match level {
+        LogLevelData::Error => LogLevel::Error,
+        LogLevelData::Warn => LogLevel::Warn,
+        LogLevelData::Info => LogLevel::Info,
+        LogLevelData::Debug => LogLevel::Debug,
+        LogLevelData::Trace => LogLevel::Trace,
+    }
+}
+
 /// A short, stable, non-secret name for a request variant, for logging.
 /// Never derived from `Debug` on the whole variant: some request payloads
 /// (`SetAuthRequest`'s identity seed, CSR key material) are secret, so only
@@ -521,6 +605,8 @@ fn request_kind_name(k: &RequestKind) -> &'static str {
         RequestKind::GetKeepaliveTable(_) => "GetKeepaliveTable",
         RequestKind::Authenticate(_) => "Authenticate",
         RequestKind::GetLinkFeaturesTable(_) => "GetLinkFeaturesTable",
+        RequestKind::GetLogs(_) => "GetLogs",
+        RequestKind::SetLogLevel(_) => "SetLogLevel",
     }
 }
 
@@ -539,7 +625,10 @@ fn request_is_mutation(k: &RequestKind) -> bool {
         | RequestKind::SubmitCsr(_)
         | RequestKind::RevokeNode(_)
         | RequestKind::ApproveCsr(_)
-        | RequestKind::DenyCsr(_) => true,
+        | RequestKind::DenyCsr(_)
+        // Changing what a node records is an operator action worth an audit
+        // trail, and infrequent enough to afford one.
+        | RequestKind::SetLogLevel(_) => true,
 
         RequestKind::GetNodeInfo(_)
         | RequestKind::GetRoutingTable(_)
@@ -554,7 +643,11 @@ fn request_is_mutation(k: &RequestKind) -> bool {
         | RequestKind::ListPendingCsrs(_)
         | RequestKind::GetKeepaliveTable(_)
         | RequestKind::Authenticate(_)
-        | RequestKind::GetLinkFeaturesTable(_) => false,
+        | RequestKind::GetLinkFeaturesTable(_)
+        // Deliberately a query, and deliberately unlogged: a client polls this
+        // on every refresh tick, and a record emitted per poll would fill the
+        // very ring the poll is reading.
+        | RequestKind::GetLogs(_) => false,
     }
 }
 
@@ -644,6 +737,35 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                     })
                     .collect();
                 ResponseKind::LinkFeaturesTable(LinkFeaturesTable { entries })
+            }
+
+            Some(RequestKind::GetLogs(req)) => {
+                let batch = self.provider.logs(req.since_seq, req.max_records);
+                ResponseKind::Logs(LogRecords {
+                    records: batch
+                        .records
+                        .into_iter()
+                        .map(|r| LogRecord {
+                            seq: r.seq,
+                            uptime_ms: r.uptime_ms,
+                            level: proto_log_level(r.level) as i32,
+                            target: r.target,
+                            message: r.message,
+                        })
+                        .collect(),
+                    next_seq: batch.next_seq,
+                    dropped: batch.dropped,
+                    filter: batch.filter,
+                })
+            }
+
+            Some(RequestKind::SetLogLevel(req)) => {
+                match self.provider.set_log_level(&req.directives) {
+                    Ok(directives) => ResponseKind::LogFilter(LogFilter { directives }),
+                    // A spec that didn't parse. The previous filter is still in
+                    // force, so this is a report, not a state change.
+                    Err(message) => ResponseKind::Error(ErrorResponse { message }),
+                }
             }
 
             Some(RequestKind::GetOgmSchedule(_)) => {
@@ -947,6 +1069,15 @@ mod tests {
         // resolution as a single fixed answer per test.
         runtime_config_active: bool,
         last_set_config: Option<RuntimeConfigData>,
+        /// What `logs` reports back.
+        logs: LogsData,
+        /// The `(since_seq, max_records)` the last `logs` call was given, so a
+        /// test can prove the request's fields reach the provider rather than
+        /// being dropped on the way.  A `Cell` because `logs` takes `&self`.
+        last_logs_query: core::cell::Cell<(u64, u32)>,
+        /// When set, `set_log_level` reports this parse error instead of
+        /// accepting the spec.
+        set_log_level_error: Option<String>,
     }
 
     impl WayfinderDataProvider for MockProvider {
@@ -1004,6 +1135,135 @@ mod tests {
         }
         fn runtime_config_active(&self) -> bool {
             self.runtime_config_active
+        }
+        fn logs(&self, since_seq: u64, max_records: u32) -> LogsData {
+            self.last_logs_query.set((since_seq, max_records));
+            self.logs.clone()
+        }
+        fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
+            match &self.set_log_level_error {
+                Some(error) => Err(error.clone()),
+                // A real node's readback is the spec it just installed, so the
+                // mock echoes what it was handed.
+                None => Ok(directives.into()),
+            }
+        }
+    }
+
+    /// A `GetLogs` request reaches the provider with its fields intact, and the
+    /// batch it returns is projected onto the wire whole — records, resume
+    /// point, and the missed-record count alike.
+    #[test]
+    fn get_logs_forwards_the_query_and_projects_the_batch() {
+        let provider = MockProvider {
+            logs: LogsData {
+                records: vec![LogRecordData {
+                    seq: 7,
+                    uptime_ms: 1234,
+                    level: LogLevelData::Warn,
+                    target: "wayfinder::router".into(),
+                    message: "drop: no route".into(),
+                }],
+                next_seq: 8,
+                dropped: 3,
+                filter: "info".into(),
+            },
+            ..Default::default()
+        };
+
+        let response = handle(
+            provider,
+            RequestKind::GetLogs(crate::wayfinder_v1alpha::GetLogsRequest {
+                since_seq: 5,
+                max_records: 20,
+            }),
+        );
+
+        match response {
+            ResponseKind::Logs(logs) => {
+                assert_eq!(logs.next_seq, 8);
+                assert_eq!(logs.dropped, 3, "the gap must survive onto the wire");
+                assert_eq!(logs.records.len(), 1);
+                let r = &logs.records[0];
+                assert_eq!(r.seq, 7);
+                assert_eq!(r.uptime_ms, 1234);
+                assert_eq!(r.level, LogLevel::Warn as i32);
+                assert_eq!(r.target, "wayfinder::router");
+                assert_eq!(r.message, "drop: no route");
+            }
+            other => panic!("expected Logs, got {}", proto_kind_name(&other)),
+        }
+    }
+
+    /// The paging fields are the whole contract of a polling client; a dispatch
+    /// that dropped them would silently re-send the same batch forever.
+    #[test]
+    fn get_logs_passes_since_seq_and_max_records_through() {
+        let provider = MockProvider::default();
+        let mut service = WayfinderService::new(provider);
+        service.handle(WayfinderRequest {
+            request: Some(RequestKind::GetLogs(
+                crate::wayfinder_v1alpha::GetLogsRequest {
+                    since_seq: 42,
+                    max_records: 9,
+                },
+            )),
+        });
+        assert_eq!(service.provider.last_logs_query.get(), (42, 9));
+    }
+
+    /// An empty ring is an empty batch, not an error — a node that has logged
+    /// nothing yet is a normal node.
+    #[test]
+    fn get_logs_with_an_empty_ring_returns_an_empty_batch() {
+        let response = handle(
+            MockProvider::default(),
+            RequestKind::GetLogs(Default::default()),
+        );
+        match response {
+            ResponseKind::Logs(logs) => {
+                assert!(logs.records.is_empty());
+                assert_eq!(logs.dropped, 0);
+            }
+            other => panic!("expected Logs, got {}", proto_kind_name(&other)),
+        }
+    }
+
+    /// A successful `SetLogLevel` answers with the spec now in force, so a
+    /// client can display what it actually got rather than what it asked for.
+    #[test]
+    fn set_log_level_answers_with_the_effective_spec() {
+        let response = handle(
+            MockProvider::default(),
+            RequestKind::SetLogLevel(crate::wayfinder_v1alpha::SetLogLevelRequest {
+                directives: "info,batman=trace".into(),
+            }),
+        );
+        match response {
+            ResponseKind::LogFilter(filter) => {
+                assert_eq!(filter.directives, "info,batman=trace");
+            }
+            other => panic!("expected LogFilter, got {}", proto_kind_name(&other)),
+        }
+    }
+
+    /// A spec the node refuses comes back as an error carrying the reason —
+    /// never as a `LogFilter`, which a client would read as "applied".
+    #[test]
+    fn set_log_level_parse_failure_surfaces_as_an_error_response() {
+        let provider = MockProvider {
+            set_log_level_error: Some("unknown log level".into()),
+            ..Default::default()
+        };
+        let response = handle(
+            provider,
+            RequestKind::SetLogLevel(crate::wayfinder_v1alpha::SetLogLevelRequest {
+                directives: "wayfinder=verbose".into(),
+            }),
+        );
+        match response {
+            ResponseKind::Error(e) => assert_eq!(e.message, "unknown log level"),
+            other => panic!("expected Error, got {}", proto_kind_name(&other)),
         }
     }
 
@@ -1619,6 +1879,8 @@ mod tests {
             ResponseKind::TrustAnchor(_) => "TrustAnchor",
             ResponseKind::SubmitCsr(_) => "SubmitCsr",
             ResponseKind::SecurityStatus(_) => "SecurityStatus",
+            ResponseKind::Logs(_) => "Logs",
+            ResponseKind::LogFilter(_) => "LogFilter",
         }
     }
 }

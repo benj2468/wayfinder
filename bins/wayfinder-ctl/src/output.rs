@@ -12,6 +12,8 @@ use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesTable;
 use wayfinder_protos::wayfinder_v1alpha::LinkQualityTable;
 use wayfinder_protos::wayfinder_v1alpha::ListCertsResponse;
 use wayfinder_protos::wayfinder_v1alpha::ListPendingCsrsResponse;
+use wayfinder_protos::wayfinder_v1alpha::LogLevel;
+use wayfinder_protos::wayfinder_v1alpha::LogRecords;
 use wayfinder_protos::wayfinder_v1alpha::NodeInfo;
 use wayfinder_protos::wayfinder_v1alpha::NodeMetrics;
 use wayfinder_protos::wayfinder_v1alpha::OgmSchedule;
@@ -320,6 +322,81 @@ pub fn list_pending_csrs(v: &ListPendingCsrsResponse, fmt: OutputFormat) -> anyh
                 fingerprint(&c.x_pubkey),
             ));
         }
+        out
+    })
+}
+
+/// A record's level as a fixed-width label, so the target column stays aligned
+/// down a screenful. Padded to five characters for the same reason the TUI's
+/// `level_style` pads: the shape of a batch should read before the words do.
+fn level_label(level: LogLevel) -> &'static str {
+    match level {
+        LogLevel::Error => "ERROR",
+        LogLevel::Warn => "WARN ",
+        LogLevel::Info => "INFO ",
+        LogLevel::Debug => "DEBUG",
+        LogLevel::Trace => "TRACE",
+        // Never emitted by a node — proto3 requires the zero value to exist, and
+        // an unrecognised value decodes to it. Rendered rather than hidden so a
+        // version skew shows up as odd-looking output instead of missing lines.
+        LogLevel::Unspecified => "?????",
+    }
+}
+
+/// Format a record's uptime as `[    12.345s]` — right-aligned so the seconds
+/// column stays put as a node's uptime grows. Deliberately identical to the
+/// TUI's `format_uptime`, so the same ring read through either client lines up.
+fn format_uptime(uptime_ms: u64) -> String {
+    format!("[{:>8}.{:03}s]", uptime_ms / 1000, uptime_ms % 1000)
+}
+
+/// The human-readable body of a batch: an optional dropped-records rule
+/// followed by one line per record, each newline-terminated. Empty for an empty
+/// batch — the "nothing retained" wording belongs to [`logs`], since a `--follow`
+/// poll that finds nothing new should print nothing at all rather than a line a
+/// second saying so.
+fn human_log_lines(v: &LogRecords) -> String {
+    let mut out = String::new();
+    // Leads the batch rather than trailing it: the gap sits immediately before
+    // the oldest record that survived, which is where it happened.
+    if v.dropped > 0 {
+        out.push_str(&format!("──── {} records dropped ────\n", v.dropped));
+    }
+    for r in &v.records {
+        let level = LogLevel::try_from(r.level).unwrap_or(LogLevel::Unspecified);
+        out.push_str(&format!(
+            "{} {} {}: {}\n",
+            format_uptime(r.uptime_ms),
+            level_label(level),
+            r.target,
+            r.message,
+        ));
+    }
+    out
+}
+
+/// Render one [`LogRecords`] batch as the records alone, for the streaming
+/// `logs --follow` path where a footer per poll would bury the records it
+/// describes. JSON renders the whole batch, one document per poll (JSON Lines).
+pub fn log_lines(v: &LogRecords, fmt: OutputFormat) -> anyhow::Result<String> {
+    render(v, fmt, human_log_lines)
+}
+
+/// Render a [`LogRecords`] batch: the records, then a footer carrying the
+/// filter in force and the `next_seq` to resume from.
+///
+/// The footer is not decoration. Without the filter an operator cannot tell
+/// "nothing happened" from "nothing was being recorded" — the node's startup
+/// filter is one it never set itself, and another client may have changed it.
+/// Without `next_seq` there is no way to poll again without either re-reading
+/// records or skipping them.
+pub fn logs(v: &LogRecords, fmt: OutputFormat) -> anyhow::Result<String> {
+    render(v, fmt, |v| {
+        let mut out = human_log_lines(v);
+        if out.is_empty() {
+            out.push_str("no log records retained\n");
+        }
+        out.push_str(&format!("filter: {}  next_seq: {}", v.filter, v.next_seq));
         out
     })
 }

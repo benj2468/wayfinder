@@ -216,6 +216,42 @@ crate is ever ported to a multi-core target or driven by more than one
 executor, both `unsafe impl`s become unsound with no compiler diagnostic.
 Re-audit them specifically if that ever changes.
 
+## Detaching a debug probe trips a SoftDevice assert
+
+Measured on an nRF52840-DK running `bins/wayfinder-nrf52840`: **disconnecting
+`probe-rs` while the SoftDevice's radio is live reliably panics the board** with
+`NRF_FAULT_ID_SD_ASSERT` via `nrf-softdevice`'s `fault_handler` ("Softdevice
+assertion failed … Most common cause is disabling interrupts for too long"),
+faulting PC inside the SoftDevice image (below `0x27000`). Tearing the debug
+session down clears `C_DEBUGEN`/`DEMCR`, dropping the chip out of Debug
+Interface Mode, and the SoftDevice notices a missed radio deadline.
+
+Attaching is fine — a probe held attached indefinitely causes no trouble, and
+`probe-rs reset` followed by a detach also survives, because the SoftDevice is
+not enabled until several seconds into boot. It is specifically **detaching from
+a running radio** that faults. probe-rs's default reset/hardfault vector catch
+is not involved (`--no-catch-reset --no-catch-hardfault` changes nothing).
+
+Two traps this sets:
+
+* The symptom is identical to the *other* SD_ASSERT cause — masking the
+  SoftDevice's reserved interrupts, e.g. by registering
+  `cortex-m/critical-section-single-core` instead of
+  `nrf-softdevice/critical-section-impl` (see the note in
+  `bins/wayfinder-nrf52840/Cargo.toml`). Before debugging a fault, establish
+  whether the board also dies when *no probe is involved* — reset it, leave it
+  alone, and read the log ring afterwards. If it only dies around probe
+  detach, the code is not at fault.
+* A reattach that shows *nothing at all* is a board already halted in a panic
+  whose message was printed once and drained by the previous session — not a
+  live-but-quiet board. Reset before concluding anything from silence.
+
+`bins/wayfinder-nrf52840`'s `#[panic_handler]` reboots (with a reset-surviving
+consecutive-panic count that halts after three) rather than halting, so this is
+survivable on a deployed node. The way to sidestep it entirely is to read logs
+over the USB management port — `wayfinderctl --serial /dev/ttyACMX logs
+--follow` — which also works after a fault, unlike the probe.
+
 ## Hardware bring-up status
 
 Nothing here has been validated against a real radio, on either backend —

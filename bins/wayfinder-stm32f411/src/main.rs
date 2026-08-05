@@ -82,7 +82,7 @@ async fn main(_spawner: Spawner) {
     // Install the RTT tracing subscriber now that the allocator is up (its
     // dispatcher allocates) and before any `tracing` event, so the mesh stack's
     // logs are visible over the debug probe.
-    wayfinder_embedded_log::init();
+    wayfinder_log::init();
 
     let p = embassy_stm32::init(Default::default());
 

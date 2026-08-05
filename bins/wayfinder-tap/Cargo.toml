@@ -11,7 +11,10 @@ wayfinder.workspace = true
 wayfinder-driver.workspace = true
 wayfinder-server.workspace = true
 
-tracing-subscriber.workspace = true
+# The node's logging stack: installs the console + log-ring subscriber and owns
+# the runtime filter the management API's SetLogLevel drives. `subscriber` is
+# the host-side layer (the boards use the same crate's RTT facade instead).
+wayfinder-log = { workspace = true, features = ["subscriber"] }
 tracing.workspace = true
 clap.workspace = true
 anyhow.workspace = true

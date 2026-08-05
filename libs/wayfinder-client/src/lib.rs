@@ -35,6 +35,7 @@ use wayfinder_protos::wayfinder_v1alpha::DenyCsrRequest;
 use wayfinder_protos::wayfinder_v1alpha::GetKeepAliveTableRequest;
 use wayfinder_protos::wayfinder_v1alpha::GetLinkFeaturesTableRequest;
 use wayfinder_protos::wayfinder_v1alpha::GetLinkQualityTableRequest;
+use wayfinder_protos::wayfinder_v1alpha::GetLogsRequest;
 use wayfinder_protos::wayfinder_v1alpha::GetMetricsRequest;
 use wayfinder_protos::wayfinder_v1alpha::GetNodeInfoRequest;
 use wayfinder_protos::wayfinder_v1alpha::GetOgmScheduleRequest;
@@ -52,6 +53,7 @@ use wayfinder_protos::wayfinder_v1alpha::ListCertsRequest;
 use wayfinder_protos::wayfinder_v1alpha::ListCertsResponse;
 use wayfinder_protos::wayfinder_v1alpha::ListPendingCsrsRequest;
 use wayfinder_protos::wayfinder_v1alpha::ListPendingCsrsResponse;
+use wayfinder_protos::wayfinder_v1alpha::LogRecords;
 use wayfinder_protos::wayfinder_v1alpha::NodeInfo;
 use wayfinder_protos::wayfinder_v1alpha::NodeMetrics;
 use wayfinder_protos::wayfinder_v1alpha::OgmSchedule;
@@ -62,6 +64,7 @@ use wayfinder_protos::wayfinder_v1alpha::RoutingTable;
 use wayfinder_protos::wayfinder_v1alpha::RuntimeConfig;
 use wayfinder_protos::wayfinder_v1alpha::SetAuthRequest;
 use wayfinder_protos::wayfinder_v1alpha::SetConfigRequest;
+use wayfinder_protos::wayfinder_v1alpha::SetLogLevelRequest;
 use wayfinder_protos::wayfinder_v1alpha::SubmitCsrRequest;
 use wayfinder_protos::wayfinder_v1alpha::SubmitCsrResponse;
 use wayfinder_protos::wayfinder_v1alpha::Throughput;
@@ -412,6 +415,48 @@ impl Client {
         }
     }
 
+    /// Read recent log records from the node's in-memory ring, from `since_seq`
+    /// onward and at most `max_records` of them (0 meaning the node's default
+    /// batch size).
+    ///
+    /// Poll with the previous response's
+    /// [`next_seq`](wayfinder_protos::wayfinder_v1alpha::LogRecords::next_seq)
+    /// to see each record exactly once; pass 0 on a first poll to get whatever
+    /// the node still retains. Check
+    /// [`dropped`](wayfinder_protos::wayfinder_v1alpha::LogRecords::dropped) —
+    /// non-zero means records were evicted before this poll reached them, and
+    /// the gap should be shown rather than hidden.
+    pub async fn logs(&mut self, since_seq: u64, max_records: u32) -> anyhow::Result<LogRecords> {
+        match self
+            .request(RequestKind::GetLogs(GetLogsRequest {
+                since_seq,
+                max_records,
+            }))
+            .await?
+        {
+            ResponseKind::Logs(logs) => Ok(logs),
+            other => Err(unexpected("Logs", &other)),
+        }
+    }
+
+    /// Change which log records the node emits, across every sink it writes to.
+    /// Returns the directive spec now in force.
+    ///
+    /// `directives` is a `RUST_LOG`-style list (`info,batman=trace`); an empty
+    /// string restores the node's default. A spec the node cannot parse comes
+    /// back as an `Err` and leaves the node's filter unchanged.
+    pub async fn set_log_level(&mut self, directives: &str) -> anyhow::Result<String> {
+        match self
+            .request(RequestKind::SetLogLevel(SetLogLevelRequest {
+                directives: directives.to_string(),
+            }))
+            .await?
+        {
+            ResponseKind::LogFilter(filter) => Ok(filter.directives),
+            other => Err(unexpected("LogFilter", &other)),
+        }
+    }
+
     /// Query this node's mesh authentication / security posture: whether auth is
     /// enabled, the mesh and own-cert header, and the per-originator
     /// verified / expiry / revoked state.
@@ -653,6 +698,8 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
         ResponseKind::SecurityStatus(_) => "SecurityStatus",
         ResponseKind::ListCerts(_) => "ListCerts",
         ResponseKind::ListPendingCsrs(_) => "ListPendingCsrs",
+        ResponseKind::Logs(_) => "Logs",
+        ResponseKind::LogFilter(_) => "LogFilter",
     };
     anyhow!("expected {want} response, got {got}")
 }

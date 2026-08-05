@@ -194,6 +194,10 @@ async fn run(
                         if app.pending_link_feature_toggle.is_some() {
                             act_link_feature(&mut client, &target, &mut app).await;
                         }
+                        // Likewise a submitted log filter.
+                        if app.logs.pending_filter.is_some() {
+                            act_log_filter(&mut client, &target, &mut app).await;
+                        }
                     }
                     Some(_) => {}
                     None => app.running = false, // input thread died
@@ -210,6 +214,20 @@ async fn run(
     loop_result
 }
 
+/// Lines a PageUp/PageDown moves the log view.
+///
+/// A fixed step rather than the viewport height, which the synchronous key
+/// handler has no way to know — only rendering sees the terminal size.
+const LOG_PAGE: isize = 20;
+
+/// Records requested per log poll.
+///
+/// Comfortably above what a node emits between refresh ticks at any sane filter,
+/// so a steady stream is kept up with in one round trip; a burst that exceeds it
+/// is simply collected over the next few ticks, in order, with no loss (the
+/// node's resume point is per-client).
+const LOG_BATCH: u32 = 256;
+
 /// Apply a keypress to the application state.
 fn handle_key(app: &mut App, code: KeyCode) {
     // A confirmation popup is modal: it captures every key until the operator
@@ -222,6 +240,49 @@ fn handle_key(app: &mut App, code: KeyCode) {
         }
         return;
     }
+    // The filter editor is modal for the same reason the confirmation popup is:
+    // every printable key belongs to the buffer, so 'q' must type a 'q' rather
+    // than quit the TUI out from under someone mid-word.
+    if app.logs.editing.is_some() {
+        match code {
+            KeyCode::Enter => app.submit_filter_edit(),
+            KeyCode::Esc => app.cancel_filter_edit(),
+            KeyCode::Backspace => app.pop_filter_char(),
+            KeyCode::Char(c) => app.push_filter_char(c),
+            _ => {}
+        }
+        return;
+    }
+
+    // Logs-tab keys that would otherwise collide with global bindings: 'f'
+    // opens the filter editor, and the paging/home/end keys scroll rather than
+    // doing nothing.
+    if app.tab == app::Tab::Logs {
+        match code {
+            KeyCode::Char('f') => {
+                app.begin_filter_edit();
+                return;
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                app.scroll_logs_to_end();
+                return;
+            }
+            KeyCode::Home => {
+                app.scroll_logs_to_start();
+                return;
+            }
+            KeyCode::PageUp => {
+                app.scroll_logs(-LOG_PAGE);
+                return;
+            }
+            KeyCode::PageDown => {
+                app.scroll_logs(LOG_PAGE);
+                return;
+            }
+            _ => {}
+        }
+    }
+
     match code {
         KeyCode::Char('q') | KeyCode::Esc => app.running = false,
         // On a provider's Security tab, Tab switches focus between the two panels
@@ -237,6 +298,7 @@ fn handle_key(app: &mut App, code: KeyCode) {
         KeyCode::Char('4') => app.tab = app::Tab::Links,
         KeyCode::Char('5') => app.tab = app::Tab::Metrics,
         KeyCode::Char('6') => app.tab = app::Tab::Security,
+        KeyCode::Char('7') => app.tab = app::Tab::Logs,
         KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
         KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
         // Provider Security tab: approve/deny the selected pending CSR (CSR panel
@@ -341,6 +403,48 @@ async fn act(client: &mut Option<Client>, target: &ConnectTarget, app: &mut App)
     }
 }
 
+/// Send a submitted log filter to the connected node and record the spec it
+/// reports back as in force.
+///
+/// A node that rejects the spec answers with an error, which lands in
+/// `app.last_error` while `app.logs.filter` keeps showing what is *actually*
+/// applied — the operator sees both what they tried and what is still running,
+/// rather than a filter line that lies about a rejected edit.
+async fn act_log_filter(client: &mut Option<Client>, target: &ConnectTarget, app: &mut App) {
+    let Some(directives) = app.logs.pending_filter.take() else {
+        return;
+    };
+    if client.is_none() {
+        match target.connect().await {
+            Ok(c) => *client = Some(c),
+            Err(e) => {
+                app.connected = false;
+                app.last_error = Some(format!("connect: {e}"));
+                return;
+            }
+        }
+    }
+
+    let result = {
+        #[expect(
+            clippy::expect_used,
+            reason = "the branch above just set client to Some(_) whenever it was None"
+        )]
+        let conn = client.as_mut().expect("client connected above");
+        conn.set_log_level(&directives).await
+    };
+
+    match result {
+        Ok(effective) => {
+            app.logs.filter = effective;
+            app.last_error = None;
+        }
+        // Not a connection failure — a rejected spec is a well-formed error
+        // response — so the client is deliberately left connected.
+        Err(e) => app.last_error = Some(format!("set log level: {e}")),
+    }
+}
+
 /// Execute a queued Links-tab gate toggle against the connected node, then
 /// refresh so the new state shows immediately rather than waiting for the
 /// next tick.  Records any failure in `app.last_error`.
@@ -406,6 +510,12 @@ async fn fetch(conn: &mut Client, app: &mut App) -> anyhow::Result<()> {
     // these RPCs — treat that as "no provider data" rather than a fetch failure,
     // so the rest of the snapshot still refreshes against a non-provider node.
     app.snapshot.pending_csrs = conn.list_pending_csrs().await.ok();
+
+    // Polled every tick regardless of which tab is showing, so switching to the
+    // Logs tab presents the history that accumulated while it was hidden rather
+    // than starting from blank.
+    let batch = conn.logs(app.logs.next_seq, LOG_BATCH).await?;
+    app.ingest_logs(batch);
     Ok(())
 }
 

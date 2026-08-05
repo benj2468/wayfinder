@@ -142,6 +142,25 @@ bare and fully-qualified `tracing::` calls in one file. Parse failures of
 remotely-supplied frames are `trace!`, not `warn!` — a malformed packet must not
 flood the logs.
 
+**Logs are readable over the management API.** `libs/wayfinder-log` installs the
+subscribers on every target and feeds two things: a text sink (RTT on a board,
+the console on a host) and a bounded record ring that `GetLogs` serves. That
+ring is how a node with no debug probe attached — an nRF52840 dongle, or any
+board whose cable is out — has observable logs at all. `SetLogLevel` changes the
+runtime filter across *every* sink at once; its grammar is a `RUST_LOG` subset
+(`info,batman=trace`), with prefixes matching at module boundaries so
+`wayfinder=trace` does not sweep in every `wayfinder_*` crate.
+
+Two rules follow, and both are the kind that fail silently:
+
+- **Never set a `max_level_*` Cargo feature** on `log` or `tracing`, anywhere in
+  the workspace. Those compile records out, so no runtime filter can bring them
+  back and `SetLogLevel trace` becomes a lie.
+- **A `Subscriber`/`Layer` here must override `register_callsite` to return
+  `Interest::sometimes()`.** The default caches an always/never verdict per
+  callsite forever, which freezes every already-hit log line at its startup
+  verbosity — the busiest lines being exactly the ones that freeze first.
+
 [`tracing`]: https://docs.rs/tracing
 
 ### Metrics are first-class
@@ -215,6 +234,11 @@ The workspace splits into the `no_std` routing core, radio drivers, host-side
   in provider mode; embedded nodes never link this).
 - **libs/wayfinder-client** — reusable API client: prost envelope over TCP
   (4-byte BE length-delimited) or Unix datagram. Shared by TUI and CLI.
+- **libs/wayfinder-log** — the logging plumbing every target shares: the runtime
+  `RUST_LOG`-style filter, the bounded record ring behind `GetLogs`, and the line
+  formatter. Two facades on top — the RTT subscriber/logger for `target_os =
+  "none"`, and a `tracing-subscriber` layer stack (`subscriber` feature) for a
+  host node.
 
 **Host driver & node**
 - **libs/wayfinder-driver** — the `std`/tokio event loop, transport-agnostic:

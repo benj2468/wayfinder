@@ -36,7 +36,7 @@ hardware = [
 # errors, dropped BLE events) on the firmware's RTT log. Its embassy-style
 # `fmt.rs` emits records only when one of its `log`/`defmt` features is on and
 # discards them otherwise, so without this the SoftDevice bring-up path is
-# silent. `log` rather than `defmt`: `wayfinder-embedded-log` installs a `log`
+# silent. `log` rather than `defmt`: `wayfinder-log` installs a `log`
 # sink on the RTT channel it already owns, whereas `defmt` needs a host decoder
 # and a second, colliding RTT control block. The two are mutually exclusive
 # upstream (`fmt.rs` has a `compile_error!`), so this must never be paired with a

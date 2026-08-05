@@ -140,6 +140,28 @@ pub enum Command {
     /// Mesh authentication / security posture: auth on/off, the mesh and
     /// own-cert header, and per-originator verified / expiry / revoked state.
     Security,
+    /// Read recent log records from the node's in-memory ring.
+    ///
+    /// This is how a board's logs are read with no debug probe attached, and on
+    /// a board whose probe is unplugged it is the only way at all. It also
+    /// works *after* a fault: the ring survives whatever went wrong, so a poll
+    /// that starts once the node is already misbehaving still shows the lead-up.
+    Logs {
+        /// Return records from this sequence number onward. Defaults to 0,
+        /// meaning everything the node still retains; pass the `next_seq` from
+        /// a previous run to resume without re-reading records.
+        #[arg(long, default_value_t = 0)]
+        since: u64,
+        /// Maximum records to return per poll. 0 means the node's own default
+        /// batch size.
+        #[arg(long, default_value_t = 0)]
+        max: u32,
+        /// Keep polling and stream new records as they are recorded, like
+        /// `tail -f`, until interrupted. Each poll resumes from the previous
+        /// response's `next_seq`, so no record is shown twice or skipped.
+        #[arg(long, short = 'f')]
+        follow: bool,
+    },
     /// Resolve the next hop and egress interface for a destination.
     Resolve {
         /// Destination identifier: a MAC like `02:00:00:00:00:09`, or raw hex.
@@ -292,6 +314,14 @@ fn build_endpoint(cli: &Cli) -> anyhow::Result<Endpoint> {
     )
 }
 
+/// How often `logs --follow` re-polls the node's ring.
+///
+/// The management protocol is strictly one request to one response, so a follow
+/// is a poll rather than a subscription. Half a second is slow enough not to
+/// saturate a 115200-baud serial link to a board, and fast enough that the
+/// stream reads as live.
+const FOLLOW_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Run the parsed CLI: dispatch offline `cert` work synchronously, else open a
 /// client, service one query, and print the rendered result.
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
@@ -301,18 +331,61 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     // A serial target reaches an embedded node's unauthenticated management API
     // directly; otherwise connect over the authenticated TLS endpoint.
-    let rendered = match cli.serial.clone() {
-        Some(path) => {
-            let mut client = Client::connect_serial(&path, cli.baud).await?;
-            dispatch_query(cli.command, &mut client, cli.output).await?
-        }
+    let mut client = match cli.serial.clone() {
+        Some(path) => Client::connect_serial(&path, cli.baud).await?,
         None => {
             let endpoint = build_endpoint(&cli)?;
-            run_query(cli.command, &endpoint, cli.output).await?
+            Client::connect_tls(endpoint.addr, &endpoint.node_key, &endpoint.identity).await?
         }
     };
-    println!("{rendered}");
+    // Streaming is the one command that outlives a single response, so it is
+    // handled here rather than in `dispatch_query`.
+    if let Command::Logs {
+        since,
+        max,
+        follow: true,
+    } = cli.command
+    {
+        return follow_logs(&mut client, since, max, cli.output).await;
+    }
+    println!(
+        "{}",
+        dispatch_query(cli.command, &mut client, cli.output).await?
+    );
     Ok(())
+}
+
+/// Poll the node's log ring forever, printing each batch as it arrives.
+///
+/// Resumes from the previous response's `next_seq` every time, so a record is
+/// neither shown twice nor skipped, and a node that evicted records while we
+/// were between polls reports the gap rather than closing over it. Silent polls
+/// print nothing at all — a `tail -f` that emitted a line per empty poll would
+/// bury the records it is there to show. Returns only on error; the operator
+/// ends it with Ctrl+C.
+async fn follow_logs(
+    client: &mut Client,
+    since: u64,
+    max: u32,
+    output: OutputFormat,
+) -> anyhow::Result<()> {
+    let mut since = since;
+    let mut shown_filter: Option<String> = None;
+    loop {
+        let batch = client.logs(since, max).await?;
+        since = batch.next_seq;
+        // Announced on the first poll and again whenever it changes, so the
+        // stream always says what is actually being recorded — including a
+        // change some other client made mid-follow.
+        if shown_filter.as_deref() != Some(batch.filter.as_str()) {
+            println!("filter: {}", batch.filter);
+            shown_filter = Some(batch.filter.clone());
+        }
+        if !batch.records.is_empty() || batch.dropped > 0 {
+            print!("{}", output::log_lines(&batch, output)?);
+        }
+        tokio::time::sleep(FOLLOW_POLL_INTERVAL).await;
+    }
 }
 
 /// Open a client to `endpoint`, issue one query `command`, and return the
@@ -377,6 +450,10 @@ async fn dispatch_query(
         Command::Throughput => output::throughput(&client.throughput().await?, output)?,
         Command::Metrics => output::node_metrics(&client.node_metrics().await?, output)?,
         Command::Security => output::security(&client.security_status().await?, output)?,
+        // `--follow` never reaches here: `run` intercepts it, since a stream of
+        // batches cannot be returned as the one rendered response every other
+        // command produces.
+        Command::Logs { since, max, .. } => output::logs(&client.logs(since, max).await?, output)?,
         Command::Resolve { dest } => {
             let id = parse_id(&dest)?;
             output::resolve(&client.resolve_route(id).await?, output)?

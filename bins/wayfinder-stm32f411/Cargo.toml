@@ -25,10 +25,10 @@ wayfinder = { path = "../../libs/wayfinder", default-features = false }
 wayfinder-embedded-driver = { path = "../../libs/wayfinder-embedded-driver" }
 # Installs the RTT `tracing` subscriber so the mesh stack's `trace!`/`warn!`
 # records are observable over the debug probe (they are otherwise dropped).
-wayfinder-embedded-log = { path = "../../libs/wayfinder-embedded-log" }
+wayfinder-log = { path = "../../libs/wayfinder-log" }
 rylr998 = { path = "../../libs/rylr998", features = ["link"] }
 # For `warn!` on a fatal bring-up error; `std` off (routed to RTT by
-# `wayfinder-embedded-log`).
+# `wayfinder-log`).
 tracing = { version = "0.1.44", default-features = false }
 # NUCLEO-F411RE = STM32F411RE (Cortex-M4F, thumbv7em-none-eabihf — same target
 # triple as the nRF52840-DK, different vendor silicon + HAL).

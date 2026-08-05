@@ -12,6 +12,8 @@ use wayfinder_protos::wayfinder_v1alpha::KeepAliveTable;
 use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesTable;
 use wayfinder_protos::wayfinder_v1alpha::LinkQualityTable;
 use wayfinder_protos::wayfinder_v1alpha::ListPendingCsrsResponse;
+use wayfinder_protos::wayfinder_v1alpha::LogRecord;
+use wayfinder_protos::wayfinder_v1alpha::LogRecords;
 use wayfinder_protos::wayfinder_v1alpha::NodeInfo;
 use wayfinder_protos::wayfinder_v1alpha::NodeMetrics;
 use wayfinder_protos::wayfinder_v1alpha::NodeSecurity;
@@ -38,17 +40,21 @@ pub enum Tab {
     /// Mesh authentication posture: the trust-anchor/own-cert header and a
     /// per-originator verified / expiry / revoked table.
     Security,
+    /// Scrollable log view over the node's in-memory record ring, with an
+    /// editable runtime filter.
+    Logs,
 }
 
 impl Tab {
     /// All tabs in display order.
-    pub const ALL: [Tab; 6] = [
+    pub const ALL: [Tab; 7] = [
         Tab::Overview,
         Tab::Routing,
         Tab::LinkQuality,
         Tab::Links,
         Tab::Metrics,
         Tab::Security,
+        Tab::Logs,
     ];
 
     /// Short title shown in the tab bar.
@@ -60,6 +66,7 @@ impl Tab {
             Tab::Links => "Links",
             Tab::Metrics => "Metrics",
             Tab::Security => "Security",
+            Tab::Logs => "Logs",
         }
     }
 
@@ -165,6 +172,66 @@ pub struct Snapshot {
     pub pending_csrs: Option<ListPendingCsrsResponse>,
 }
 
+/// Lines of log scrollback the TUI retains.
+///
+/// Far deeper than any node's own ring (64 records on a board, 512 on a host),
+/// because the two bound different things: the node's ring bounds what is lost
+/// while nobody is polling, while this bounds what an operator can scroll back
+/// through in a session. Still bounded — a TUI left open for days must not grow
+/// without limit.
+pub const LOG_SCROLLBACK: usize = 5000;
+
+/// One line in the log view: either a record, or a marker for records that were
+/// evicted before this client could read them.
+///
+/// The gap is an entry in its own right, in stream position, rather than a
+/// counter in a corner — a discontinuity between two adjacent lines is exactly
+/// the thing an operator reading logs must not have to infer.
+#[derive(Clone, Debug)]
+pub enum LogEntry {
+    /// A record the node reported.
+    Record(LogRecord),
+    /// This many records were dropped at this point in the stream.
+    Gap(u64),
+}
+
+/// The Logs tab's state: accumulated scrollback, where to resume polling, the
+/// scroll position, and the filter editor.
+#[derive(Default)]
+pub struct LogView {
+    /// Scrollback, oldest first, capped at [`LOG_SCROLLBACK`].
+    pub entries: VecDeque<LogEntry>,
+    /// The `since_seq` for the next poll — the node's own resume point.
+    pub next_seq: u64,
+    /// Whether at least one batch has been ingested. Gates the dropped-record
+    /// marker: the priming poll's `dropped` counts history that predates this
+    /// session, which is not a gap the operator experienced.
+    pub primed: bool,
+    /// Lines between the bottom of the viewport and the bottom of the buffer.
+    /// Zero while following the tail.
+    pub scroll: usize,
+    /// Whether the view is pinned to the newest records.
+    pub follow: bool,
+    /// The filter spec the node last reported as in force.
+    pub filter: String,
+    /// The edit buffer, `Some` while the operator is typing a new filter. While
+    /// set, the Logs tab captures every keypress.
+    pub editing: Option<String>,
+    /// A submitted filter awaiting execution by the event loop, which owns the
+    /// client. Set by [`App::submit_filter_edit`] and taken by the loop.
+    pub pending_filter: Option<String>,
+}
+
+impl LogView {
+    /// A fresh view, following the tail with nothing in it.
+    fn new() -> Self {
+        Self {
+            follow: true,
+            ..Default::default()
+        }
+    }
+}
+
 /// Maximum number of throughput samples retained for the Metrics tab history
 /// chart. At the default 1 s refresh this is two minutes of history; the buffer
 /// is bounded so a long-lived TUI session cannot grow without limit.
@@ -247,6 +314,8 @@ pub struct App {
     pub addr: String,
     /// Refresh interval in milliseconds, for display.
     pub interval_ms: u64,
+    /// The Logs tab's scrollback, scroll position, and filter editor.
+    pub logs: LogView,
 }
 
 impl App {
@@ -272,7 +341,122 @@ impl App {
             connected: false,
             addr,
             interval_ms,
+            logs: LogView::new(),
         }
+    }
+
+    /// Fold one `GetLogs` batch into the scrollback.
+    ///
+    /// Records are appended in stream order; a reported gap becomes a
+    /// [`LogEntry::Gap`] at the position it occurred. While the view is detached
+    /// from the tail the scroll offset grows by however many lines were added,
+    /// so the records the operator is reading stay exactly where they are.
+    pub fn ingest_logs(&mut self, batch: LogRecords) {
+        let mut added = 0usize;
+
+        // Suppressed on the priming poll: a first request asks from seq 0, so
+        // everything a long-running node already evicted is reported as dropped,
+        // and banner-ing that would greet every fresh session with an alarm
+        // about history nobody was there to miss.
+        if self.logs.primed && batch.dropped > 0 {
+            self.logs.entries.push_back(LogEntry::Gap(batch.dropped));
+            added += 1;
+        }
+
+        for record in batch.records {
+            self.logs.entries.push_back(LogEntry::Record(record));
+            added += 1;
+        }
+
+        self.logs.next_seq = batch.next_seq;
+        self.logs.primed = true;
+
+        // Track what the node reports rather than what this client last asked
+        // for, so the filter line stays right across a node restart, a startup
+        // RUST_LOG this session never set, and a change made by another client.
+        // Skipped mid-edit so a poll cannot rewrite the line under the cursor.
+        if self.logs.editing.is_none() {
+            self.logs.filter = batch.filter;
+        }
+
+        while self.logs.entries.len() > LOG_SCROLLBACK {
+            self.logs.entries.pop_front();
+            // A line evicted from the top is one fewer line between a detached
+            // viewport and the bottom, so the offset has to come back down with
+            // it — otherwise the view would drift off the top of the buffer.
+            self.logs.scroll = self.logs.scroll.saturating_sub(1);
+        }
+
+        if !self.logs.follow {
+            self.logs.scroll = (self.logs.scroll + added).min(self.logs.entries.len());
+        }
+    }
+
+    /// Scroll the log view by `delta` lines: negative scrolls back into
+    /// history, positive scrolls toward the newest records.
+    ///
+    /// Reaching the bottom re-attaches the view to the tail, so an operator who
+    /// scrolls back to read something and then scrolls down again resumes
+    /// following without needing to know a separate key for it.
+    pub fn scroll_logs(&mut self, delta: isize) {
+        let max = self.logs.entries.len();
+        if delta < 0 {
+            self.logs.scroll = (self.logs.scroll + delta.unsigned_abs()).min(max);
+            self.logs.follow = false;
+        } else {
+            self.logs.scroll = self.logs.scroll.saturating_sub(delta as usize);
+        }
+        if self.logs.scroll == 0 {
+            self.logs.follow = true;
+        }
+    }
+
+    /// Jump to the newest records and resume following the tail.
+    pub fn scroll_logs_to_end(&mut self) {
+        self.logs.scroll = 0;
+        self.logs.follow = true;
+    }
+
+    /// Jump to the oldest record still in scrollback.
+    pub fn scroll_logs_to_start(&mut self) {
+        self.logs.scroll = self.logs.entries.len();
+        self.logs.follow = self.logs.scroll == 0;
+    }
+
+    /// Open the filter editor, seeded with the spec the node reports as in
+    /// force — so an edit starts from reality rather than from an empty line.
+    pub fn begin_filter_edit(&mut self) {
+        self.logs.editing = Some(self.logs.filter.clone());
+    }
+
+    /// Append one typed character to the filter being edited.
+    pub fn push_filter_char(&mut self, c: char) {
+        if let Some(buf) = self.logs.editing.as_mut() {
+            buf.push(c);
+        }
+    }
+
+    /// Delete the last character of the filter being edited.
+    pub fn pop_filter_char(&mut self) {
+        if let Some(buf) = self.logs.editing.as_mut() {
+            buf.pop();
+        }
+    }
+
+    /// Queue the edited filter for the event loop to send, and close the editor.
+    ///
+    /// `logs.filter` is deliberately *not* updated here: it holds what the node
+    /// reports, and the node is free to reject the spec. It changes only when a
+    /// `SetLogLevel` comes back successfully.
+    pub fn submit_filter_edit(&mut self) {
+        if let Some(buf) = self.logs.editing.take() {
+            self.logs.pending_filter = Some(buf);
+        }
+    }
+
+    /// Abandon the filter edit, changing nothing.
+    pub fn cancel_filter_edit(&mut self) {
+        self.logs.editing = None;
     }
 
     /// Move the selection cursor in the table belonging to the active tab.
@@ -305,6 +489,14 @@ impl App {
                         (&mut self.security_state, nodes)
                     }
                 }
+            }
+            // The log view has no selection — the same j/k/arrow keys scroll it
+            // instead, so one set of navigation keys works on every tab.
+            // Inverted because scrolling "down" (positive delta) moves toward
+            // the newest records, which is *toward* the bottom of the buffer.
+            Tab::Logs => {
+                self.scroll_logs(-delta);
+                return;
             }
             Tab::Overview => return,
         };
@@ -459,6 +651,220 @@ pub fn format_id(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+mod log_tests {
+    use super::*;
+    use wayfinder_protos::wayfinder_v1alpha::LogLevel;
+
+    /// A record at `seq`, tagged so tests can tell them apart.
+    fn rec(seq: u64) -> LogRecord {
+        LogRecord {
+            seq,
+            uptime_ms: seq * 10,
+            level: LogLevel::Info as i32,
+            target: "wayfinder::router".into(),
+            message: format!("m{seq}"),
+        }
+    }
+
+    /// A batch covering `seqs`, resuming one past the last.
+    fn batch(seqs: std::ops::Range<u64>, dropped: u64) -> LogRecords {
+        let next_seq = seqs.end;
+        LogRecords {
+            records: seqs.map(rec).collect(),
+            next_seq,
+            dropped,
+            filter: "info".into(),
+        }
+    }
+
+    #[test]
+    fn ingest_appends_records_and_advances_the_resume_point() {
+        let mut app = App::new("addr".into(), 1000);
+        app.ingest_logs(batch(0..3, 0));
+        assert_eq!(app.logs.next_seq, 3);
+        assert_eq!(app.logs.entries.len(), 3);
+
+        app.ingest_logs(batch(3..5, 0));
+        assert_eq!(app.logs.next_seq, 5);
+        assert_eq!(app.logs.entries.len(), 5);
+    }
+
+    /// A first poll asks from seq 0, so a node that has been up a while reports
+    /// every record that ever fell out of its ring as "dropped". That is not a
+    /// gap the operator experienced, and showing it would put an alarming
+    /// banner at the top of every fresh session.
+    #[test]
+    fn first_poll_does_not_report_a_gap() {
+        let mut app = App::new("addr".into(), 1000);
+        app.ingest_logs(batch(900..903, 900));
+        assert!(
+            app.logs
+                .entries
+                .iter()
+                .all(|e| matches!(e, LogEntry::Record(_))),
+            "no gap marker on the priming poll"
+        );
+    }
+
+    /// A gap that opens *during* a session is real: the operator was watching
+    /// and records were evicted before the next poll reached them.
+    #[test]
+    fn a_gap_after_the_first_poll_is_recorded_inline() {
+        let mut app = App::new("addr".into(), 1000);
+        app.ingest_logs(batch(0..2, 0));
+        app.ingest_logs(batch(40..42, 38));
+
+        let gaps: Vec<u64> = app
+            .logs
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                LogEntry::Gap(n) => Some(*n),
+                LogEntry::Record(_) => None,
+            })
+            .collect();
+        assert_eq!(gaps, vec![38]);
+        // The marker sits between the batches, not at either end.
+        assert!(matches!(app.logs.entries[2], LogEntry::Gap(38)));
+    }
+
+    /// An empty poll is the steady state once a node goes quiet; it must not
+    /// manufacture an entry or rewind the resume point.
+    #[test]
+    fn an_empty_batch_changes_nothing_visible() {
+        let mut app = App::new("addr".into(), 1000);
+        app.ingest_logs(batch(0..2, 0));
+        app.ingest_logs(LogRecords {
+            records: vec![],
+            next_seq: 2,
+            dropped: 0,
+            filter: "info".into(),
+        });
+        assert_eq!(app.logs.entries.len(), 2);
+        assert_eq!(app.logs.next_seq, 2);
+    }
+
+    /// Scrollback is the TUI's own buffer and is far deeper than any node's
+    /// ring, but it is still bounded — a session left open for days must not
+    /// grow without limit.
+    #[test]
+    fn scrollback_is_capped_at_the_limit() {
+        let mut app = App::new("addr".into(), 1000);
+        for start in (0..(LOG_SCROLLBACK as u64 + 50)).step_by(10) {
+            app.ingest_logs(batch(start..start + 10, 0));
+        }
+        assert_eq!(app.logs.entries.len(), LOG_SCROLLBACK);
+        // The newest records are the ones kept.
+        assert!(matches!(
+            app.logs.entries.back(),
+            Some(LogEntry::Record(r)) if r.seq == LOG_SCROLLBACK as u64 + 49
+        ));
+    }
+
+    #[test]
+    fn scrolling_up_detaches_follow_and_end_reattaches() {
+        let mut app = App::new("addr".into(), 1000);
+        app.ingest_logs(batch(0..50, 0));
+        assert!(app.logs.follow, "a fresh view follows the tail");
+
+        app.scroll_logs(-5);
+        assert!(!app.logs.follow);
+        assert_eq!(app.logs.scroll, 5);
+
+        app.scroll_logs_to_end();
+        assert!(app.logs.follow);
+        assert_eq!(app.logs.scroll, 0);
+    }
+
+    /// Scrolling back down to the bottom re-attaches on its own, so an operator
+    /// never has to know about a separate "follow" key.
+    #[test]
+    fn scrolling_back_to_the_bottom_reattaches() {
+        let mut app = App::new("addr".into(), 1000);
+        app.ingest_logs(batch(0..50, 0));
+        app.scroll_logs(-3);
+        app.scroll_logs(3);
+        assert!(app.logs.follow);
+        assert_eq!(app.logs.scroll, 0);
+    }
+
+    /// The whole point of detaching: records arriving while the operator is
+    /// reading scrollback must not slide the text out from under them.
+    #[test]
+    fn records_arriving_while_detached_hold_the_view_still() {
+        let mut app = App::new("addr".into(), 1000);
+        app.ingest_logs(batch(0..50, 0));
+        app.scroll_logs(-10);
+        assert_eq!(app.logs.scroll, 10);
+
+        app.ingest_logs(batch(50..55, 0));
+        assert_eq!(
+            app.logs.scroll, 15,
+            "five new lines below means five more lines between here and the bottom"
+        );
+    }
+
+    /// While following, new records simply appear — the view stays pinned.
+    #[test]
+    fn records_arriving_while_following_stay_pinned_to_the_tail() {
+        let mut app = App::new("addr".into(), 1000);
+        app.ingest_logs(batch(0..50, 0));
+        app.ingest_logs(batch(50..55, 0));
+        assert!(app.logs.follow);
+        assert_eq!(app.logs.scroll, 0);
+    }
+
+    /// Scrolling cannot run off the top of the buffer.
+    #[test]
+    fn scrolling_past_the_start_clamps() {
+        let mut app = App::new("addr".into(), 1000);
+        app.ingest_logs(batch(0..5, 0));
+        app.scroll_logs(-1000);
+        assert_eq!(app.logs.scroll, 5);
+    }
+
+    // ── The filter editor ────────────────────────────────────────────────────
+
+    #[test]
+    fn editing_the_filter_starts_from_what_the_node_reports() {
+        let mut app = App::new("addr".into(), 1000);
+        app.logs.filter = "info".into();
+        app.begin_filter_edit();
+        assert_eq!(app.logs.editing.as_deref(), Some("info"));
+    }
+
+    /// Submitting queues the spec for the event loop (the only thing holding the
+    /// client) and leaves the editor.
+    #[test]
+    fn submitting_the_filter_queues_it_and_closes_the_editor() {
+        let mut app = App::new("addr".into(), 1000);
+        app.begin_filter_edit();
+        app.push_filter_char('d');
+        app.push_filter_char('b');
+        app.push_filter_char('g');
+        app.pop_filter_char();
+        app.submit_filter_edit();
+
+        assert_eq!(app.logs.pending_filter.as_deref(), Some("db"));
+        assert!(app.logs.editing.is_none());
+    }
+
+    /// Cancelling discards the buffer and changes nothing on the node.
+    #[test]
+    fn cancelling_the_filter_edit_queues_nothing() {
+        let mut app = App::new("addr".into(), 1000);
+        app.logs.filter = "info".into();
+        app.begin_filter_edit();
+        app.push_filter_char('x');
+        app.cancel_filter_edit();
+
+        assert!(app.logs.pending_filter.is_none());
+        assert!(app.logs.editing.is_none());
+        assert_eq!(app.logs.filter, "info");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use wayfinder_protos::wayfinder_v1alpha::RoutingEntry;
@@ -480,13 +886,15 @@ mod tests {
         assert_eq!(Tab::LinkQuality.next(), Tab::Links);
         assert_eq!(Tab::Links.next(), Tab::Metrics);
         assert_eq!(Tab::Metrics.next(), Tab::Security);
-        assert_eq!(Tab::Security.next(), Tab::Overview); // wrap forward
-        assert_eq!(Tab::Overview.prev(), Tab::Security); // wrap backward
+        assert_eq!(Tab::Security.next(), Tab::Logs);
+        assert_eq!(Tab::Logs.next(), Tab::Overview); // wrap forward
+        assert_eq!(Tab::Overview.prev(), Tab::Logs); // wrap backward
         assert_eq!(Tab::Overview.index(), 0);
         assert_eq!(Tab::LinkQuality.index(), 2);
         assert_eq!(Tab::Links.index(), 3);
         assert_eq!(Tab::Metrics.index(), 4);
         assert_eq!(Tab::Security.index(), 5);
+        assert_eq!(Tab::Logs.index(), 6);
     }
 
     #[test]

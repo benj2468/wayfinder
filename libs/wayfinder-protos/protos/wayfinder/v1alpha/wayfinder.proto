@@ -120,6 +120,123 @@ message GetSecurityStatusResponse {
   repeated NodeSecurity nodes = 6;
 }
 
+// Request recent log records from the node's bounded in-memory ring.
+//
+// This is how a node's logs are read without a debug probe attached — on a
+// board with no RTT reader, the only way at all.  Polled rather than streamed:
+// the management protocol is strictly one request to one response, and a poll
+// also lets a client attach *after* something went wrong and still see it.
+//
+// Records are numbered by a monotonic `seq` starting at 0 on boot.  A client
+// passes the `next_seq` it was last handed and sees each record exactly once;
+// LogRecords.dropped reports what fell out of the ring in between.
+message GetLogsRequest {
+  // Return records from this sequence number onward.  Pass 0 on a first poll
+  // to get everything still retained, then the previous response's `next_seq`.
+  uint64 since_seq = 1;
+
+  // Maximum records to return in this batch.  0 means the node's default
+  // batch size — a client that did not specify one wants records, not an
+  // empty answer.
+  uint32 max_records = 2;
+}
+
+// Change which log records the node emits, at runtime, across every sink it
+// writes to (a board's RTT channel and its log ring; a host node's console and
+// its log ring).  Applied in memory only — it does not persist across a
+// restart.
+//
+// Answered with a LogFilter carrying the spec now in force.  A spec that fails
+// to parse is answered with an ErrorResponse and *does not* change the filter:
+// an operator typo must never blind a node.
+message SetLogLevelRequest {
+  // A RUST_LOG-style directive list: comma-separated `level`,
+  // `target=level`, or bare `target` (meaning trace for that target), where a
+  // level is one of off/error/warn/info/debug/trace.  Targets match on module
+  // path prefix at module boundaries, and the longest match wins.  An empty
+  // string restores the node's default.
+  //
+  // EnvFilter's span and field extensions (`target[span{field=value}]=level`)
+  // are not supported and are rejected rather than reinterpreted.
+  string directives = 1;
+}
+
+// The verbosity of a single log record.
+enum LogLevel {
+  // Unset — never emitted by a node; present because proto3 enums must have a
+  // zero value.
+  LOG_LEVEL_UNSPECIFIED = 0;
+
+  // A failure an operator must act on, originating in the reporting node.
+  LOG_LEVEL_ERROR = 1;
+
+  // Unexpected but handled, worth operator attention.
+  LOG_LEVEL_WARN = 2;
+
+  // A lifecycle or topology event an observer wants.
+  LOG_LEVEL_INFO = 3;
+
+  // A developer-facing state transition.
+  LOG_LEVEL_DEBUG = 4;
+
+  // Per-frame/packet flow — the bulk of the records.
+  LOG_LEVEL_TRACE = 5;
+}
+
+// One log record retained by the node.
+message LogRecord {
+  // Monotonic position in this node's log stream, starting at 0 on boot.
+  uint64 seq = 1;
+
+  // Milliseconds since the node booted, at the moment the record was emitted.
+  // Uptime rather than wall-clock time because a board has no RTC and no
+  // notion of the epoch, and because it is what correlates with the mesh's own
+  // timers.
+  uint64 uptime_ms = 2;
+
+  // The record's verbosity.
+  LogLevel level = 3;
+
+  // The emitting module path (e.g. `wayfinder::router`), truncated by the node
+  // if unusually long.
+  string target = 4;
+
+  // The rendered message and its structured fields.  Never payload bytes: this
+  // project's logging rules permit only metadata (macs, lengths, seqnos) in a
+  // record, so a log read over the management API discloses no more than a
+  // routing-table query does.
+  string message = 5;
+}
+
+// Answer to a GetLogsRequest: a batch of records plus where to resume.
+message LogRecords {
+  // The matching records, oldest first.
+  repeated LogRecord records = 1;
+
+  // The `since_seq` to pass on the next poll to resume exactly where this
+  // batch ended.
+  uint64 next_seq = 2;
+
+  // How many records the caller missed: those between the `since_seq` it asked
+  // for and the oldest the node still retains.  Zero whenever the caller kept
+  // up.  Reported so a gap in the stream is visible as a gap, rather than the
+  // record numbering quietly closing over it.
+  uint64 dropped = 3;
+
+  // The filter spec currently in force, in SetLogLevelRequest.directives
+  // format.  Carried on every batch — rather than requiring a separate query —
+  // so a client polling for records can always show what is actually being
+  // recorded, including the node's startup filter it never set itself, and
+  // including a change made by some other client.
+  string filter = 4;
+}
+
+// Answer to a SetLogLevelRequest: the filter now in force.
+message LogFilter {
+  // The directive spec currently applied, echoed as the node stored it.
+  string directives = 1;
+}
+
 // Request a routing decision for a hypothetical packet to `destination`,
 // mirroring what the router would compute on send.  Returns a
 // ResolveRouteResponse with the next-hop neighbor and the egress
@@ -406,6 +523,12 @@ message WayfinderRequest {
 
     // Query the per-interface participation-feature state.
     GetLinkFeaturesTableRequest get_link_features_table = 20;
+
+    // Read recent log records from the node's in-memory ring.
+    GetLogsRequest get_logs = 21;
+
+    // Change which log records the node emits, at runtime.
+    SetLogLevelRequest set_log_level = 22;
   }
 }
 
@@ -951,5 +1074,11 @@ message WayfinderResponse {
 
     // Response to GetLinkFeaturesTableRequest.
     LinkFeaturesTable link_features_table = 16;
+
+    // Response to GetLogsRequest.
+    LogRecords logs = 17;
+
+    // Response to SetLogLevelRequest.
+    LogFilter log_filter = 18;
   }
 }
