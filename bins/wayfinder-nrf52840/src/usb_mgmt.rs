@@ -450,6 +450,22 @@ async fn serve_forever(stream: &mut CdcAcmStream, query_tx: &EmbeddedQueryTx<'_>
             Ok(()) => unreachable!("serve only returns via an error"),
         }
 
+        // Management sessions are the deepest thing this board does — prost
+        // decode, the `RouterAdapter` projection, and response encoding all run
+        // on top of whatever the mesh loop was already holding — so the peak is
+        // worth sampling against a session boundary and not only against a
+        // timer.
+        //
+        // Note how rarely this actually runs, though: reaching it means `serve`
+        // returned, and `serve` only returns when the *stream* fails. A host
+        // merely closing `/dev/ttyACMX` does not do that — the device stays
+        // enumerated with its endpoints live, so the read below simply blocks
+        // for the next client. This fires on an unplug or a re-enumeration, not
+        // on an ordinary `wayfinderctl` invocation. `crate::stack_watch` is the
+        // reporting path that always runs; this one just times a sample to the
+        // teardown when there is one.
+        crate::stack::report();
+
         // The endpoints are disabled the instant the host goes away, so
         // `wait_connection` returning immediately after a torn-down session is
         // possible; this keeps that from becoming a tight loop.

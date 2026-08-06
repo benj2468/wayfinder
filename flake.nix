@@ -120,6 +120,12 @@
               glab
               stdenv.cc.cc.lib
               probe-rs-tools
+              # Linker for the embedded binaries: places the stack below the
+              # statics so a stack overflow faults on a guard rather than
+              # silently corrupting `.bss`/`.uninit`. Selected in
+              # `bins/wayfinder-nrf52840/.cargo/config.toml`, which fails to
+              # link without it on the PATH.
+              flip-link
             ];
 
             buildInputs = with pkgs; [ dbus ];

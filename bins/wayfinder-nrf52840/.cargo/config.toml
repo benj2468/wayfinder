@@ -2,5 +2,21 @@
 target = "thumbv7em-none-eabihf"
 
 [target.thumbv7em-none-eabihf]
+# `flip-link` moves the stack *below* the statics instead of leaving it at the
+# top of RAM growing down into them. Without it a stack overflow on this part is
+# silent: there is no MPU guard region, so the descending stack simply scribbles
+# over `.uninit`, then `.bss`, and the fault surfaces later — somewhere
+# unrelated, or not at all, depending on what happened to live in the memory it
+# overwrote and whether that memory was read before being written again. That is
+# what makes an overflow here present as an unreproducible crash rather than a
+# fault. With the stack at the bottom, an overflow runs off the end of RAM and
+# faults immediately and deterministically, at the actual culprit.
+#
+# It is also a prerequisite for the diagnostics in `src/main.rs` and
+# `src/stack.rs`: `.uninit` (which holds `PANIC_GUARD` and `FAULT_RECORD`) sits
+# directly in the path of a descending stack, so a retained fault record is only
+# trustworthy once the stack cannot reach it. `stack::paint` detects the layout
+# at runtime and disables itself if this linker is ever dropped — see its docs.
+linker = "flip-link"
 rustflags = ["-C", "link-arg=-Tlink.x"]
 runner = "probe-rs run --chip nRF52840_xxAA --allow-erase-all"

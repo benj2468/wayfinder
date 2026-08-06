@@ -30,6 +30,7 @@ RUN cargo binstall -y sccache
 # imports it (see test:run:python in .gitlab-ci.yml).
 RUN cargo binstall -y maturin
 RUN cargo binstall -y cargo-ndk
+RUN cargo binstall -y flip-link
 
 # Ensure protoc is globally accessible (usually /usr/bin/protoc via apt)
 ENV PROTOC=/usr/bin/protoc
