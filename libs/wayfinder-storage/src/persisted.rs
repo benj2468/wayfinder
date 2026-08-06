@@ -1,12 +1,9 @@
 //! [`Persisted`]: seal a value's mutations behind a callback that also
 //! durably persists the result, on top of a [`DurableStore`].
 //!
-//! `CaLog` (`wayfinder-server`) had this exact shape hand-rolled —
-//! `mutate_issued`/`mutate_held` ran a closure against its in-memory state
-//! and then always attempted a persist — before it was generalized here.
-//! Nothing about that orchestration (run `f`, then persist, return both
-//! outcomes) is specific to CA state; only *what's inside* the value and how
-//! it's encoded is caller-specific, via [`Codec`].
+//! Nothing about the orchestration — run `f`, persist, return both outcomes —
+//! is specific to any one caller's state; only *what's inside* the value and
+//! how it is encoded, via [`Codec`].
 
 use crate::DurableStore;
 
@@ -56,18 +53,14 @@ pub enum PersistError<SE, CE> {
 pub type PersistOutcome<SE, CE> = Result<(), PersistError<SE, CE>>;
 
 /// An in-memory value of `T` whose mutations are sealed behind
-/// [`Persisted::mutate`]: the only way to change the value is to hand this
-/// type a closure, which it runs and then durably persists the result,
-/// returning both outcomes. This is what makes "every mutation is followed
-/// by a persist attempt" a property of the type rather than a convention
-/// call sites must remember — the same guarantee `CaLog` documented as its
-/// own invariant before this was generalized.
+/// [`Persisted::mutate`]: the only way to change it is to hand this type a
+/// closure, which it runs and then persists, returning both outcomes. That
+/// makes "every mutation is followed by a persist attempt" a property of the
+/// type rather than a convention call sites must remember.
 ///
 /// `S` is typically `Option<ConcreteStore>` when persistence is itself
-/// optional (no configured path/flash region ⇒ in-memory only) — see the
-/// blanket `DurableStore for Option<S>` impl, which makes `None` behave as
-/// an always-empty, always-successfully-no-op store with no special-casing
-/// needed here.
+/// optional (no configured path or flash region ⇒ in-memory only) — the
+/// blanket `DurableStore for Option<S>` impl makes `None` a no-op store.
 pub struct Persisted<T, S, C> {
     value: T,
     store: S,
@@ -75,12 +68,10 @@ pub struct Persisted<T, S, C> {
 }
 
 impl<T, S, C> Persisted<T, S, C> {
-    /// Wrap an already-known `value` with `store`/`codec` directly, without
-    /// reading anything back first — for a caller that has no snapshot to
-    /// load yet (a fresh, in-memory-only instance) and so has nothing to
-    /// gain from [`Self::load`]'s round trip through the store.
-    /// Unconstrained (no `DurableStore`/`Codec` bounds): building this value
-    /// is plain field assignment, whatever `S`/`C` end up being.
+    /// Wrap an already-known `value` with `store`/`codec` without reading
+    /// anything back first — for a caller with no snapshot to load, which has
+    /// nothing to gain from [`Self::load`]'s round trip. Unconstrained, since
+    /// building this value is plain field assignment.
     pub fn new(value: T, store: S, codec: C) -> Self {
         Self {
             value,
@@ -138,32 +129,22 @@ impl<T: Clone, S: DurableStore, C: Codec<T>> Persisted<T, S, C> {
     /// result, returning both `f`'s result and the persist outcome so the
     /// caller can decide how to react to a durability failure.
     ///
-    /// A failed persist **rolls the value back** to what it was before `f`
-    /// ran: the in-memory value must never diverge from what's durably
-    /// stored, so a mutation that couldn't be persisted did not, as far as
-    /// any later [`Self::get`]/`mutate` call can tell, happen at all. `f`'s
-    /// own return value is still handed back regardless — it's the caller's
-    /// business, not tied to whether the mutation stuck — but the caller
-    /// must treat a `Err` persist outcome as "this did not take effect",
-    /// not just "this isn't durable yet".
+    /// A failed persist **rolls the value back**, so the in-memory value never
+    /// diverges from what is durably stored: a mutation that couldn't be
+    /// persisted did not, as far as any later call can tell, happen at all.
+    /// `f`'s return value comes back regardless, but an `Err` persist outcome
+    /// means "this did not take effect", not "this isn't durable yet".
     ///
-    /// Requires `T: Clone` to snapshot the pre-mutation value; cheap at the
-    /// scale this is meant for (see the design doc's own "tens of KB"
-    /// framing for `CaLog`'s state) — a value large enough for a full clone
-    /// per mutation to matter is a sign `mutate` needs a different shape for
-    /// that caller, not that this bound is wrong in general.
+    /// `T: Clone` is for the pre-mutation snapshot — cheap at the tens-of-KB
+    /// scale this is meant for. A value large enough for that to matter needs
+    /// a different shape of `mutate`, not a weaker bound.
     ///
-    /// **Caveat: the rollback guarantee assumes `f` does not panic.** The
-    /// snapshot is a local restored after `f` returns; if `f` unwinds, this
-    /// function never gets the chance to restore it, and `self.value` is
-    /// left however far `f` got before panicking — no persist is attempted
-    /// either. In practice every closure passed to `mutate` in this
-    /// workspace is a simple, infallible field mutation (a `Vec::push`, an
-    /// index assignment already guarded by a prior lookup) that isn't
-    /// expected to panic, so this is a real but low-probability gap, not a
-    /// hardened one — `no_std`'s `catch_unwind` unavailability (many
-    /// embedded targets build with `panic = "abort"`, where there's nothing
-    /// to catch) also rules out closing it portably at this layer.
+    /// **The rollback assumes `f` does not panic.** The snapshot is a local
+    /// restored after `f` returns, so an unwind leaves `self.value` however far
+    /// `f` got, with no persist attempted. Closing that portably is impossible
+    /// here — `catch_unwind` doesn't exist under `panic = "abort"` — and every
+    /// closure passed to `mutate` in this workspace is a simple infallible
+    /// field mutation, so it stays a known gap.
     pub fn mutate<R>(
         &mut self,
         f: impl FnOnce(&mut T) -> R,
@@ -178,13 +159,10 @@ impl<T: Clone, S: DurableStore, C: Codec<T>> Persisted<T, S, C> {
     }
 }
 
-/// Makes persistence itself optional: `None` behaves as an always-empty
-/// store whose writes always trivially succeed, so a caller with an optional
-/// backing store (no configured path, no flash region assigned) can use
-/// `Persisted<T, Option<ConcreteStore>, C>` and get "in-memory only, mutate
-/// still runs, persist is just always a no-op" for free — no special-casing
-/// needed in [`Persisted`] itself. Mirrors the optionality `CaLog` handled by
-/// hand before this was generalized.
+/// Makes persistence itself optional: `None` is an always-empty store whose
+/// writes trivially succeed, so a caller with no configured path or flash
+/// region uses `Persisted<T, Option<ConcreteStore>, C>` and gets in-memory-only
+/// behaviour with no special-casing inside [`Persisted`].
 impl<S: DurableStore> DurableStore for Option<S> {
     type Error = S::Error;
 

@@ -1,18 +1,9 @@
-//! The runtime `RUST_LOG`-style filter every sink in this crate gates on.
+//! The runtime `RUST_LOG`-style filter every sink in this crate gates on, on
+//! every target, so `SetLogLevel` means the same thing wherever it is sent.
 //!
-//! One filter serves every sink on every target — RTT and the ring on a board,
-//! the console and the ring on a host — so `SetLogLevel` means the same thing
-//! wherever it is sent, and one test suite covers the grammar.
-//!
-//! # Why not `EnvFilter`
-//!
-//! [`tracing_subscriber::EnvFilter`] is the obvious thing to reach for and
-//! cannot be used: it pulls in `regex`/`matchers`/`thread_local` and is `std`
-//! only, so it cannot exist on the boards — which are precisely the nodes whose
-//! logs are otherwise unreachable. Rather than run a different filter grammar on
-//! each target, both run this one.
-//!
-//! [`tracing_subscriber::EnvFilter`]: https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html
+//! `EnvFilter` is the obvious thing to reach for and cannot be used: it pulls in
+//! `regex`/`matchers`/`thread_local` and is `std` only, so it cannot exist on
+//! the boards — precisely the nodes whose logs are otherwise unreachable.
 //!
 //! # The supported grammar
 //!
@@ -22,41 +13,30 @@
 //! - `level` — the fallback for targets no other directive matches (`info`).
 //! - `target=level` — that level for `target` and everything beneath it
 //!   (`wayfinder::router=debug`).
-//! - `target` — everything from that target (`batman`, equivalent to
-//!   `batman=trace`).
+//! - `target` — everything from that target (`batman`, i.e. `batman=trace`).
 //! - `off` as a level disables matching records entirely.
 //!
-//! Targets match on module-path prefix, and the **longest** matching directive
-//! wins regardless of the order it was written in. A target no directive matches
-//! is disabled — a bare `target=level` does not imply a global default, exactly
-//! as in `EnvFilter`.
-//!
-//! Prefixes match at module boundaries, which is one deliberate divergence from
-//! those crates; see [`target_matches`] for why this workspace in particular
-//! cannot use their plain `starts_with`.
+//! The **longest** matching directive wins regardless of write order, and a
+//! target no directive matches is disabled. Prefixes match at module
+//! boundaries, one deliberate divergence from those crates — see
+//! [`target_matches`].
 //!
 //! `EnvFilter`'s span and field extensions (`target[span{field=value}]=level`)
-//! are **not** supported and are rejected outright by [`Filter::parse`]. Silently
-//! reinterpreting `wayfinder[handle_frame]=trace` as a target name would enable
-//! far more than the operator asked for, on the one path where over-logging is
-//! most expensive.
+//! are rejected outright by [`Filter::parse`] rather than reinterpreted as a
+//! target name, which would enable far more than the operator asked for.
 //!
 //! # The two-stage gate
 //!
 //! [`enabled`] runs on every callsite evaluation, sometimes from an interrupt,
-//! on a board whose radio timing does not tolerate long interrupt masking. So it
-//! is split:
+//! on a board whose radio timing does not tolerate long interrupt masking:
 //!
-//! 1. [`level_enabled`] — one relaxed load of [`MAX_LEVEL`] (the coarsest level
-//!    any directive admits) and a compare. Lock-free, and rejects the bulk of
-//!    the traffic whenever the filter is not at `trace`.
-//! 2. Only for what survives, the directive list under a [`Lock`]. That runs at
-//!    most at the rate of records that are about to be formatted and written,
-//!    which costs more than the lock does.
+//! 1. [`level_enabled`] — one relaxed load of [`MAX_LEVEL`] and a compare.
+//!    Lock-free, and rejects the bulk of the traffic below `trace`.
+//! 2. Only for survivors, the directive list under a [`Lock`].
 //!
-//! Stage 1 must therefore never be *more* restrictive than stage 2, or records
-//! would be dropped before their directive was ever consulted; that relationship
-//! is what `max_level_admits_a_superset_of_what_directives_allow` pins down.
+//! Stage 1 must never be *more* restrictive than stage 2, or records would be
+//! dropped before their directive was consulted — pinned down by
+//! `max_level_admits_a_superset_of_what_directives_allow`.
 
 use core::sync::atomic::AtomicU8;
 use core::sync::atomic::Ordering;
@@ -80,24 +60,20 @@ pub const SPEC_CAP: usize = 192;
 
 /// The filter in force before anything sets one, and what an empty spec means.
 ///
-/// Derived from [`DEFAULT_LEVEL`] rather than written out, so the two cannot
-/// disagree — this is the string an operator reads back (`Filter::spec`, and
-/// `LogRecords.filter` on every `GetLogs`), so it naming a different threshold
-/// than the one actually in force would be a lie told by the observability
-/// system about itself.
+/// Derived from [`DEFAULT_LEVEL`] rather than written out: this is the string
+/// an operator reads back (`Filter::spec`, `LogRecords.filter`), so a mismatch
+/// would be the observability system lying about itself.
 ///
-/// Never `off`: a node that has never been configured should still record the
-/// lifecycle events an operator needs to see it come up, and neither `info` nor
-/// `debug` can flood the ring on its own — this project's logging rules put
-/// everything per-frame at `trace`.
+/// Never `off` — an unconfigured node should still record the lifecycle events
+/// that show it came up, and this project's rules put everything per-frame at
+/// `trace`, so nothing below that can flood the ring.
 pub const DEFAULT_SPEC: &str = DEFAULT_LEVEL.as_spec();
 
 /// Verbosity of a single log record, ordered least to most verbose.
 ///
 /// A local type rather than `tracing_core::Level` or `log::Level` because both
-/// facades feed the same ring and the same filter, and because the host layer
-/// and the bare-metal subscriber must agree on the wire value the management API
-/// reports. Conversions from both facades live alongside their adapters.
+/// facades feed the same ring and filter, and because both sink implementations
+/// must agree on the wire value the management API reports.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[repr(u8)]
 pub enum Level {
@@ -114,9 +90,7 @@ pub enum Level {
 }
 
 impl From<tracing_core::Level> for Level {
-    /// Map a `tracing` level onto this crate's own. Total in both directions —
-    /// the two enums have the same five variants — so no record can arrive at a
-    /// level the ring cannot represent.
+    /// Map a `tracing` level onto this crate's own.
     fn from(level: tracing_core::Level) -> Self {
         match level {
             tracing_core::Level::ERROR => Self::Error,
@@ -169,13 +143,8 @@ impl LevelFilter {
     }
 
     /// This level's canonical spec name — the inverse of [`parse`](Self::parse)
-    /// for the names `parse` round-trips (the `err`/`warning` aliases parse but
-    /// are never produced).
-    ///
-    /// `const` so [`DEFAULT_SPEC`] can be *derived* from [`DEFAULT_LEVEL`]
-    /// rather than restated. The two must name the same threshold, and a pair of
-    /// hand-maintained constants relies on whoever edits one remembering the
-    /// other; deriving makes the mismatch unrepresentable.
+    /// but for the `err`/`warning` aliases, which parse but are never produced.
+    /// `const` so [`DEFAULT_SPEC`] can be derived rather than restated.
     const fn as_spec(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -246,10 +215,9 @@ impl core::fmt::Display for FilterParseError {
 /// One parsed directive: a target prefix and the threshold it grants.
 #[derive(Clone)]
 struct Directive {
-    /// The module-path prefix this applies to. Empty means "everything", which
-    /// is how a bare `level` directive is represented — and, since the empty
-    /// string is a prefix of every target and the shortest possible one, it
-    /// naturally sorts last and acts as the fallback.
+    /// The module-path prefix this applies to. Empty means "everything": how a
+    /// bare `level` directive is represented, and — being the shortest possible
+    /// prefix — it sorts last and so acts as the fallback.
     target: heapless::String<TARGET_CAP>,
     /// The threshold granted to targets this directive matches.
     level: LevelFilter,
@@ -272,9 +240,8 @@ impl Filter {
     /// The filter in force before anything sets one: [`DEFAULT_SPEC`].
     ///
     /// `const` so the global lives in a `static` with no initializer. An empty
-    /// directive list is *not* "nothing enabled" — [`Filter::enabled`] reads it
-    /// as the default level, which is what lets logging work before any `init`
-    /// has run.
+    /// directive list is *not* "nothing enabled": [`Filter::enabled`] reads it
+    /// as the default level, so logging works before any `init` runs.
     const fn default_filter() -> Self {
         Self {
             directives: heapless::Vec::new(),
@@ -392,14 +359,12 @@ impl Filter {
 /// empty prefix matches everything, which is what makes a bare level the
 /// fallback.
 ///
-/// **This is a deliberate divergence from `env_logger`/`EnvFilter`**, both of
-/// which use a plain `starts_with` and would let `wayfinder` cover
-/// `wayfinder_server` too. That difference is invisible in most workspaces and
-/// acutely wrong in this one, where nearly every crate is named `wayfinder_*`:
-/// under plain prefix matching, `wayfinder=trace` would quietly turn on trace
-/// for the auth stack, the driver, the server, and the protos as well — on the
-/// one path where over-logging costs the most. An operator who does want the
-/// broad sweep can still write it as several directives.
+/// **A deliberate divergence from `env_logger`/`EnvFilter`**, whose plain
+/// `starts_with` would let `wayfinder` cover `wayfinder_server` too. Invisible
+/// in most workspaces, acutely wrong in this one, where nearly every crate is
+/// named `wayfinder_*` and `wayfinder=trace` would sweep in the auth stack, the
+/// driver, the server and the protos. The broad sweep is still writable as
+/// several directives.
 fn target_matches(target: &str, prefix: &str) -> bool {
     if prefix.is_empty() {
         return true;
@@ -413,23 +378,16 @@ fn target_matches(target: &str, prefix: &str) -> bool {
 /// The default threshold, and the single source of truth for the startup
 /// filter — [`DEFAULT_SPEC`] is derived from it.
 ///
-/// `debug` in a development build, `info` in a release one. A node that nobody
-/// has configured should be as talkative as the build implies: on a board there
-/// is no `RUST_LOG` to consult, so this constant *is* the default (a host node
-/// reads `RUST_LOG` first and only falls back here).
+/// `debug` in a development build, `info` in a release one. On a board there is
+/// no `RUST_LOG` to consult, so this constant *is* the default; a host node
+/// reads `RUST_LOG` first and falls back here.
 ///
-/// Keyed on `debug_assertions` rather than a Cargo feature deliberately: a
-/// feature is additive and unifies across the workspace, so one crate enabling
-/// a hypothetical `verbose-default` would raise the default for every other
-/// crate in the build — a value, unlike a capability, is the wrong thing to
-/// express as a feature.
-///
-/// The coupling to `debug_assertions` is worth knowing about, though: a release
-/// profile that sets `debug-assertions = true` (a normal thing to do when
-/// chasing a fault on hardware) also gets `debug` logging, and on the nRF board
-/// that means `embassy-nrf`/`nrf-softdevice` chatter through the RTT and ring
-/// critical sections. Set the filter explicitly via `SetLogLevel` if that
-/// matters more than the default.
+/// Keyed on `debug_assertions` rather than a Cargo feature: features are
+/// additive and unify across the workspace, so one crate opting in would raise
+/// the default for the whole build. The coupling has a sharp edge — a release
+/// profile with `debug-assertions = true`, normal when chasing a hardware
+/// fault, also gets `debug` logging and the `embassy`/`nrf-softdevice` chatter
+/// that comes with it. Use `SetLogLevel` when that matters.
 const DEFAULT_LEVEL: LevelFilter = if cfg!(debug_assertions) {
     LevelFilter::Debug
 } else {
@@ -439,10 +397,9 @@ const DEFAULT_LEVEL: LevelFilter = if cfg!(debug_assertions) {
 /// The coarsest level the installed filter admits: the whole of the lock-free
 /// fast path.
 ///
-/// Separate from [`FILTER`] rather than read out of it because the point is to
-/// answer the common case without taking a lock at all. `Relaxed` throughout:
-/// this gates logging, so the only consequence of an in-flight filter change
-/// being observed late is a record or two decided under the previous filter.
+/// Separate from [`FILTER`] so the common case takes no lock at all. `Relaxed`
+/// throughout: observing a filter change late costs a record or two decided
+/// under the previous filter.
 static MAX_LEVEL: AtomicU8 = AtomicU8::new(DEFAULT_LEVEL as u8);
 
 /// The installed filter's directive list. Consulted only for records the fast
@@ -458,10 +415,9 @@ pub fn set_filter(spec: &str) -> Result<(), FilterParseError> {
     let filter = Filter::parse(spec)?;
     let max_level = filter.max_level();
     FILTER.with(|f| *f = filter);
-    // Stored after the directives, so any window between the two stores has the
-    // fast path admitting *more* than the directives allow rather than less. The
-    // slow path is authoritative, so a record in that window is still judged
-    // correctly; the reverse order could drop one outright.
+    // After the directives, so the window between the two stores has the fast
+    // path admitting *more* than they allow rather than less — the authoritative
+    // slow path still judges correctly. The reverse order could drop a record.
     MAX_LEVEL.store(max_level as u8, Ordering::Relaxed);
     Ok(())
 }

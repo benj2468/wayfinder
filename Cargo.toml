@@ -28,6 +28,11 @@ members = [
     "bins/wayfinder-ctl",
     "bins/rylr998-cli",
 ]
+# Board-support code for the nRF52840 firmware crates. Not a member: it depends
+# on `nrf-softdevice`, whose build script links a precompiled Nordic binary and
+# needs a real embedded target, so `cargo build --workspace` could not build it.
+# The `bins/wayfinder-nrf52840*` workspaces pull it in by path.
+exclude = ["libs/wayfinder-nrf"]
 
 [workspace.lints.rust]
 # Every public API must carry documentation (see CLAUDE.md). Enforced

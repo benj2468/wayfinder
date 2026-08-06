@@ -1,10 +1,11 @@
-//! nRF52840-DK (PCA10056) firmware: the wayfinder mesh router on bare metal,
-//! over connectionless BLE advertising broadcast and — if one is wired up — a
-//! RYLR998 LoRa module on UARTE0.
+//! nRF52840 dongle (PCA10059) firmware: the wayfinder mesh router on bare metal,
+//! over connectionless BLE advertising broadcast and — if one is wired to the
+//! castellated edge — a RYLR998 LoRa module on UARTE0.
 //!
-//! Everything not specific to this board lives in [`wayfinder_nrf`]; this file
-//! is the DK's pin map, flash layout and interrupt bindings. See
-//! `libs/wayfinder-nrf/CLAUDE.md` for the hardware behaviour behind it.
+//! Same silicon and the same [`wayfinder_nrf`] board support as the DK; this
+//! file is the dongle's pin map, flash layout and interrupt bindings. The board
+//! has no onboard debugger, so the USB management port is the only way into a
+//! running node — see `libs/wayfinder-nrf/CLAUDE.md`.
 
 #![no_std]
 #![no_main]
@@ -24,10 +25,12 @@ use tracing::error;
 use tracing::info;
 use wayfinder::interfaces::frame::Mac;
 
-/// Base flash offset of the durable identity store: the two 4 KiB pages at the
-/// very top of flash that `memory.x` carves out of `FLASH` so the linker leaves
-/// them free. **Must stay consistent with `memory.x`** — see the note there.
-const DURABLE_STORE_BASE: u32 = (1024 * 1024) - 2 * nvmc::PAGE_SIZE as u32;
+/// Base flash offset of the durable identity store: the two 4 KiB pages
+/// `memory.x` carves out just below the region reserved for the Open
+/// Bootloader. Unlike the DK's, this cannot sit at the very top of flash — the
+/// bootloader's own settings pages live there. **Must stay consistent with
+/// `memory.x`** — see the note there.
+const DURABLE_STORE_BASE: u32 = 0xE_0000 - 2 * nvmc::PAGE_SIZE as u32;
 
 /// `ORIGIN(RAM)` from `memory.x`, and so the address the stack bottoms out at
 /// under `flip-link`. **Must stay consistent with `memory.x`** — it cannot be
@@ -35,9 +38,8 @@ const DURABLE_STORE_BASE: u32 = (1024 * 1024) - 2 * nvmc::PAGE_SIZE as u32;
 /// block (see `wayfinder_nrf::stack::paint`).
 const RAM_ORIGIN: usize = 0x2000_0000 + 13112;
 
-// UARTE0 for the RYLR998, if attached, so the driver's async serial reads and
-// writes are woken by hardware rather than polled; USBD for the device stack
-// carrying the management API.
+// UARTE0 for the RYLR998, if attached; USBD for the device stack carrying the
+// management API — which on this board is the only interface it has.
 bind_interrupts!(struct Irqs {
     UARTE0 => buffered_uarte::InterruptHandler<peripherals::UARTE0>;
     USBD => usb::InterruptHandler<peripherals::USBD>;
@@ -48,16 +50,15 @@ async fn main(spawner: Spawner) {
     let p = wayfinder_nrf::init_platform(RAM_ORIGIN);
     let node_mac = wayfinder_nrf::identity::resolve(p.NVMC, DURABLE_STORE_BASE);
 
-    // LED1 (P0.13, active-low) lit = reached the run loop. Moved into the task
-    // that actually lights it: `Output`'s `Drop` disconnects the pin, and `main`
-    // returns as soon as the task is queued.
-    let led = Output::new(p.P0_13, Level::High, OutputDrive::Standard);
+    // LD1 (P0.06, active-low) lit = reached the run loop. The dongle does not
+    // route the DK's P0.13. Moved into the task that actually lights it, since
+    // `Output`'s `Drop` disconnects the pin.
+    let led = Output::new(p.P0_06, Level::High, OutputDrive::Standard);
 
-    // RYLR998 wiring — change these two GPIOs to match how the module is
-    // connected. Both are broken out on the DK headers and free of analog/QSPI
-    // conflicts. `TIMER1`, not `TIMER0`: `BufferedUarte` drives a timer over PPI
-    // to detect the RX idle gap, and the S140 SoftDevice claims `TIMER0`
-    // exclusively for radio timing.
+    // RYLR998 wiring on the castellated edge: P0.31 = MCU RX ← module TX,
+    // P0.29 = MCU TX → module RX, plus VDD and GND. `TIMER1`, not `TIMER0`:
+    // `BufferedUarte` drives a timer over PPI to detect the RX idle gap, and the
+    // S140 SoftDevice claims `TIMER0` exclusively for radio timing.
     let (rx_buffer, tx_buffer) = wayfinder_nrf::uarte_buffers();
     let uarte = BufferedUarte::new(
         p.UARTE0,
@@ -65,8 +66,8 @@ async fn main(spawner: Spawner) {
         p.PPI_CH0,
         p.PPI_CH1,
         p.PPI_GROUP0,
-        p.P0_02, // RXD (module TX)
-        p.P0_26, // TXD (module RX)
+        p.P0_31, // RXD (module TX)
+        p.P0_29, // TXD (module RX)
         Irqs,
         wayfinder_nrf::uarte_config(),
         rx_buffer,
@@ -74,8 +75,6 @@ async fn main(spawner: Spawner) {
     );
 
     let Ok(task) = node(node_mac, uarte, p.USBD, spawner, led) else {
-        // With no mesh task there is nothing to run, and continuing would leave
-        // LED1 dark while the board sat idle looking booted.
         error!("failed to spawn node task; halting");
         loop {
             cortex_m::asm::wfe();

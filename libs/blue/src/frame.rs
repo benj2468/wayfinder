@@ -4,10 +4,9 @@
 //! bytes (see `crate::ad`).
 //!
 //! Shared by both backends and gated behind neither's feature: unlike the
-//! radio I/O in `nrf_link.rs`/`std_link.rs` — one of which needs real
-//! silicon, the other a live `bluetoothd` — this is ordinary host-testable
-//! logic, and the `#[cfg(test)]` module below exercises it that way. It is
-//! also where the two backends' wire compatibility is pinned down.
+//! radio I/O in `nrf_link.rs`/`std_link.rs`, which needs real silicon or a live
+//! `bluetoothd`, this is ordinary host-testable logic — and where the two
+//! backends' wire compatibility is pinned down.
 
 use wayfinder::interfaces::frame::LinkFrameData;
 use wayfinder::interfaces::frame::Mac;
@@ -36,11 +35,10 @@ pub(crate) const FRAG_PAYLOAD: usize = ad::MAX_LEGACY_FRAGMENT_LEN - FRAG_HDR_LE
 /// [`build_fragment`]'s output buffer.
 pub(crate) const MAX_FRAGMENT_BYTES: usize = FRAG_HDR_LEN + FRAG_PAYLOAD;
 
-/// Largest reassembled frame this link will handle: comfortably above a
-/// ~260-byte authenticated OGM, with headroom for revocation TVLVs — smaller
-/// than RYLR998's 512-byte ceiling since each fragment here carries far less.
-/// (The `MAX_REASSEMBLED_LEN <= MAX_FRAGMENTS * FRAG_PAYLOAD` relationship
-/// this implies is checked inside `Reassembler::new()` itself.)
+/// Largest reassembled frame this link will handle: above a ~260-byte
+/// authenticated OGM with headroom for revocation TVLVs, and below RYLR998's
+/// 512 since each fragment here carries far less. `Reassembler::new()` checks
+/// the `MAX_REASSEMBLED_LEN <= MAX_FRAGMENTS * FRAG_PAYLOAD` this implies.
 pub(crate) const MAX_REASSEMBLED_LEN: usize = 350;
 
 /// Largest number of concurrent in-flight (incomplete) messages the
@@ -71,12 +69,10 @@ pub(crate) fn assemble_frame(
     Ok((frame, frame_len))
 }
 
-/// Number of fragments `frame_len` bytes split into, or `BufferFull` if it
-/// would need more than `MAX_FRAGMENTS` (the wire format's 4-bit `count`
-/// field ceiling — unreachable through `assemble_frame`'s own
-/// `MAX_REASSEMBLED_LEN` cap today, but checked here rather than assumed, so
-/// a future change to either constant fails loudly instead of corrupting
-/// `pack_header`'s packed nibble).
+/// Number of fragments `frame_len` bytes split into, or `BufferFull` past
+/// `MAX_FRAGMENTS` — the wire format's 4-bit `count` field ceiling.
+/// Unreachable under today's `MAX_REASSEMBLED_LEN`, but checked so a change to
+/// either constant fails loudly instead of corrupting the packed nibble.
 pub(crate) fn fragment_count(frame_len: usize) -> Result<usize, LinkError> {
     let count = frame_len.div_ceil(FRAG_PAYLOAD);
     if count > MAX_FRAGMENTS {
@@ -91,11 +87,9 @@ pub(crate) fn fragment_count(frame_len: usize) -> Result<usize, LinkError> {
 /// number of bytes written. `BufferFull` if `index` addresses a slice past
 /// the end of the frame.
 ///
-/// This is the payload of the Manufacturer Specific Data AD structure, not
-/// the structure itself: a host stack that builds that framing on our behalf
-/// (BlueZ, via `bluer`'s `Advertisement::manufacturer_data`) wants exactly
-/// this, while the bare-metal path wraps it itself — see
-/// [`build_fragment_ad`].
+/// This is the *payload* of the Manufacturer Specific Data AD structure, not
+/// the structure itself: what BlueZ wants, since it builds that framing on our
+/// behalf. The bare-metal path wraps it itself — see [`build_fragment_ad`].
 pub(crate) fn build_fragment(
     frame: &[u8],
     frame_len: usize,

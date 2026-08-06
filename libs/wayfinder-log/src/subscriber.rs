@@ -1,12 +1,8 @@
 //! The host-side subscriber stack: the `std` counterpart to [`crate::rtt`].
 //!
-//! A host node ([`wayfinder-tap`]) runs the same mesh stack and answers the same
-//! management API, so it serves `GetLogs` from the same ring the boards do. That
-//! also makes the TUI's log view work against a host node — useful well beyond
-//! convenience, since it is what lets the whole path be exercised without
-//! hardware.
-//!
-//! [`wayfinder-tap`]: https://git.haganah.net
+//! A host node runs the same mesh stack and answers the same management API, so
+//! it serves `GetLogs` from the same ring the boards do — which is also what
+//! lets the whole path be exercised without hardware.
 //!
 //! Two layers, both installed by [`init`]:
 //!
@@ -41,13 +37,10 @@ impl<S: tracing_core::Subscriber> Layer<S> for FilterLayer {
         filter::enabled(Level::from(*metadata.level()), metadata.target())
     }
 
-    /// Always [`Interest::sometimes`], so `enabled` is consulted per event
-    /// rather than once per callsite.
-    ///
-    /// Same trap as on the bare-metal side: the default implementation caches an
-    /// `always`/`never` verdict for the life of the process, which would freeze
-    /// every already-hit callsite at its startup verbosity and make
-    /// `SetLogLevel` look like it silently did nothing.
+    /// Always [`Interest::sometimes`], so `enabled` is consulted per event.
+    /// Same trap as on the bare-metal side: the default caches an
+    /// always/never verdict for the life of the process, freezing every
+    /// already-hit callsite at its startup verbosity.
     fn register_callsite(
         &self,
         _metadata: &'static tracing_core::Metadata<'static>,
@@ -63,11 +56,8 @@ impl<S> Layer<S> for RingLayer
 where
     S: tracing_core::Subscriber + for<'a> LookupSpan<'a>,
 {
-    /// Format the event the same way the boards do and push it to the ring.
-    ///
-    /// Deliberately the same [`LineBuf`] renderer as RTT: a record read out of a
-    /// host node and one read off a board should be the same shape, so one TUI
-    /// view can present both without knowing which it is talking to.
+    /// Format the event through the same [`LineBuf`] renderer RTT uses, so one
+    /// TUI view presents host and board records without knowing which is which.
     fn on_event(&self, event: &tracing_core::Event<'_>, _ctx: Context<'_, S>) {
         let meta = event.metadata();
         let mut line = LineBuf::new(meta.level(), meta.target());
@@ -94,14 +84,13 @@ impl tracing_core::field::Visit for FieldVisitor<'_> {
 /// Install the host subscriber: console output, the log ring, and the runtime
 /// filter gating both.
 ///
-/// The filter is seeded from `spec` — pass `RUST_LOG`'s value, or `None` to
-/// start at [`crate::DEFAULT_SPEC`]. A spec that doesn't parse is reported on
-/// the returned `Err` and the default is installed instead, since refusing to
-/// start a node over a malformed environment variable is worse than starting it
-/// noisy.
+/// The filter is seeded from `spec` — pass `RUST_LOG`'s value, or `None` for
+/// [`crate::DEFAULT_SPEC`]. A spec that doesn't parse is reported on the `Err`
+/// and the default installed instead: refusing to start a node over a
+/// malformed environment variable is worse than starting it noisy.
 ///
-/// Call once, early in `main`. A second call (or a subscriber already installed
-/// by something else, e.g. a test harness) is ignored rather than panicking.
+/// Call once, early in `main`. A second call, or one racing a subscriber some
+/// test harness already installed, is ignored rather than panicking.
 pub fn init(spec: Option<&str>) -> Result<(), crate::FilterParseError> {
     let outcome = match spec {
         Some(spec) => filter::set_filter(spec),

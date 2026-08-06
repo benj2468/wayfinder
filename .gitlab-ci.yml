@@ -123,14 +123,23 @@ build:embedded:
   script:
     # Each board binary is its own independent Cargo workspace (linker script,
     # panic handler, HAL), so built from its own directory rather than via `-p`.
-    # Both target thumbv7em-none-eabihf (Cortex-M4F) but on different vendor
-    # HALs (Nordic vs ST) — building both proves the shared driver is portable.
+    # All target thumbv7em-none-eabihf (Cortex-M4F) but on different vendor HALs
+    # (Nordic vs ST) — building all of them proves the shared driver is
+    # portable, and building both nRF boards proves `libs/wayfinder-nrf` serves
+    # both rather than having drifted onto one.
     - (cd bins/wayfinder-nrf52840 && cargo build --locked)
     - (cd bins/wayfinder-nrf52840 && cargo clippy --locked -- -D warnings)
+    - (cd bins/wayfinder-nrf52840-dongle && cargo build --locked)
+    - (cd bins/wayfinder-nrf52840-dongle && cargo clippy --locked -- -D warnings)
     # The STM32F411RE (512 KB flash) needs an optimized build to fit the crypto
     # stack, so it's built --release rather than debug like the 1 MB nRF.
     - (cd bins/wayfinder-stm32f411 && cargo build --release --locked)
     - (cd bins/wayfinder-stm32f411 && cargo clippy --release --locked -- -D warnings)
+    # No board wires 802.15.4 today (it and BLE contend for the same RADIO), so
+    # nothing above cross-compiles it. Built explicitly rather than being linked
+    # into a firmware it doesn't serve.
+    - cargo build --locked -p nrf-ieee802154 --target "$BARE_METAL_TARGET"
+    - cargo clippy --locked -p nrf-ieee802154 --target "$BARE_METAL_TARGET" -- -D warnings
     - sccache --show-stats
 test:run:rust:
   extends: .base-ci-docker

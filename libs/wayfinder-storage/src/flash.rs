@@ -2,18 +2,15 @@
 //! log over any [`embedded-storage`] [`NorFlash`], for bare-metal nodes that
 //! have raw flash rather than a filesystem.
 //!
-//! This is the embedded backend sketched in
-//! `docs/design/implemented/04-generic-durable-store.md` §3.5. Flash has
-//! neither atomic rename nor atomic byte-level overwrite, so the file
-//! backend's rename trick is unavailable; instead each [`DurableStore::save`]
-//! writes the new blob to whichever of two pages does *not* currently hold
-//! the newest valid copy, prefixed with a header carrying a monotonically
-//! incrementing generation counter and a CRC32 over the payload.
-//! [`DurableStore::load`] reads both pages, discards any whose header magic or
-//! CRC fails to validate, and returns the highest-generation survivor. A
-//! write torn by power loss leaves its half-written page failing CRC, so
-//! `load` falls back to the other (previous, intact) page — which is exactly
-//! the atomicity guarantee [`DurableStore::save`] promises.
+//! Flash has neither atomic rename nor atomic byte-level overwrite, so the
+//! file backend's rename trick is unavailable. Each [`DurableStore::save`]
+//! instead writes to whichever of two pages does *not* hold the newest valid
+//! copy, behind a header carrying a generation counter and a payload CRC32;
+//! [`DurableStore::load`] returns the highest-generation page that validates.
+//! A write torn by power loss fails CRC, so `load` falls back to the previous
+//! intact page — exactly the atomicity `save` promises.
+//!
+//! Designed in `docs/design/implemented/04-generic-durable-store.md` §3.5.
 //!
 //! [`embedded-storage`]: https://docs.rs/embedded-storage
 
@@ -151,11 +148,9 @@ impl<F: NorFlash> FlashStore<F> {
     /// A store over the two erase-pages beginning at `base_offset`.
     ///
     /// `base_offset` must be a multiple of the flash's erase size and leave
-    /// room for two full pages within the device — both checked here (not
-    /// `debug_assert!`-only), since this is a bare-metal linker-script
-    /// placement (see `memory.x`'s own reservation) that a release embedded
-    /// build — where `debug_assert!` compiles to nothing — has no other
-    /// chance to catch before it silently addresses the wrong flash region.
+    /// room for two full pages within the device. Both are real checks, not
+    /// `debug_assert!`s: this tracks a linker-script placement, and a release
+    /// embedded build would otherwise silently address the wrong region.
     pub fn new(flash: F, base_offset: u32) -> Result<Self, FlashError<F::Error>> {
         let erase_size = F::ERASE_SIZE;
         if erase_size <= HEADER_LEN {
@@ -326,10 +321,8 @@ impl<F: NorFlash> DurableStore for FlashStore<F> {
         // writes straight from `data`, and its sub-word tail is padded with
         // erased `0xFF` in a small stack scratch.
         let w = F::WRITE_SIZE;
-        // `F::WRITE_SIZE` is fixed at monomorphization time (a property of
-        // the concrete flash type, not of any runtime value), so this is
-        // checked once per `F` at compile time rather than as a
-        // release-mode-dead `debug_assert!` on every call.
+        // Fixed at monomorphization, so this costs one check per `F` rather
+        // than a release-mode-dead `debug_assert!` on every call.
         const {
             assert!(
                 F::WRITE_SIZE <= MAX_WRITE_SIZE && HEADER_LEN.is_multiple_of(F::WRITE_SIZE),

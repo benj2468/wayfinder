@@ -1,0 +1,94 @@
+[package]
+name = "wayfinder-nrf"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Excluded from the root workspace (see its `exclude`) because `nrf-softdevice`
+# only builds for a real embedded target. Consumed by path from the
+# `bins/wayfinder-nrf52840*` firmware crates; profiles and the target triple
+# come from whichever of those is building.
+[lints.rust]
+missing_docs = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+all = "deny"
+
+[lib]
+test = false
+doc = false
+bench = false
+
+[dependencies]
+wayfinder = { path = "../wayfinder", default-features = false }
+wayfinder-embedded-driver = { path = "../wayfinder-embedded-driver", features = [
+    "mgmt",
+] }
+wayfinder-server = { path = "../wayfinder-server", default-features = false, features = [
+    "embedded",
+] }
+wayfinder-storage = { path = "../wayfinder-storage", default-features = false, features = [
+    "flash",
+] }
+wayfinder-log = { path = "../wayfinder-log" }
+rylr998 = { path = "../rylr998", features = ["link"] }
+blue = { path = "../blue", default-features = false, features = [
+    "hardware",
+    "softdevice-log",
+] }
+
+embassy-sync = "0.8.0"
+embassy-futures = "0.1.2"
+embassy-nrf = { version = "0.10.0", features = [
+    "nrf52840",
+    "time-driver-rtc1",
+    "gpiote",
+    "unstable-pac",
+    "log",
+] }
+# 0.10 to match `blue`'s SoftDevice background tasks. Deliberately *not*
+# `executor-interrupt`: `blue`'s `SdHandle`/`ReportQueue` carry hand-written
+# `unsafe impl Send`/`Sync` that are sound only under one non-preempting
+# executor. Enabling the feature is the tripwire — `ReportQueue` would have to
+# move to `CriticalSectionRawMutex` first.
+embassy-executor = { version = "0.10", features = [
+    "platform-cortex-m",
+    "executor-thread",
+    "log",
+] }
+embassy-time = { version = "0.5.1", features = ["log"] }
+# `default-features = false` drops the unused `usbd-hid` class, which otherwise
+# pulls in a second `heapless` version alongside the workspace's.
+embassy-usb = { version = "0.6.0", default-features = false }
+embedded-io-async = "0.7.0"
+tracing = { version = "0.1.44", default-features = false }
+
+# **Deliberately without `critical-section-single-core`.** Its `acquire` is a
+# bare `cpsid i`, masking the SoftDevice's priority-0/1 RADIO/RTC0/TIMER0 along
+# with everything else. This firmware takes a critical section on paths that run
+# constantly (every log record, every heap allocation), so that impl starves the
+# radio until the SoftDevice trips `NRF_FAULT_ID_SD_ASSERT`. The compatible impl
+# comes from `nrf-softdevice/critical-section-impl` below, which masks only
+# non-reserved IRQs. Both call `critical_section::set_impl!`, so re-enabling
+# this feature fails to link rather than silently regressing.
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+# `tracing-core` does an unconditional `extern crate alloc;`, so anything in
+# this dependency graph needs a real allocator.
+embedded-alloc = "0.6"
+# Pinned to the 0.5 already resolved via `wayfinder-log`: `fault`'s panic
+# handler writes to that crate's initialized print channel rather than opening a
+# second RTT control block, so the versions must match.
+rtt-target = "0.5"
+# The SoftDevice syscalls the USB path needs and the BLE link does not:
+# `sd_power_usb*` (VBUS state, since `POWER` is reserved once the SoftDevice is
+# enabled) and `sd_clock_hfclk_request` (USBD needs the crystal). Cargo unifies
+# this with `blue`'s copy of the same git dependency.
+nrf-softdevice = { git = "https://github.com/embassy-rs/nrf-softdevice.git", features = [
+    "nrf52840",
+    "s140",
+    "critical-section-impl",
+] }
+static_cell = "2"

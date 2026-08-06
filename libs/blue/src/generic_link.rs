@@ -3,20 +3,16 @@
 //! concrete BLE stack directly.
 //!
 //! [`crate::StdBleLink`] builds on this, wrapping it with a `BleAdvertiser`
-//! that registers advertisements through BlueZ. BlueZ's own BLE API
-//! builds/parses the Manufacturer Specific Data AD structure itself — from/to
-//! a raw byte payload — so this core hands its `BleAdvertiser` the bare
-//! `[frag_header][body]` blob via `frame::build_fragment`, no self-framing via
-//! `crate::ad`, unlike [`crate::NrfBleLink`]. The backend still owns its own
-//! *receive* side (feeding this core's report channel from BlueZ's D-Bus scan
-//! events) since that plumbing is platform-specific in a way advertising a
-//! pre-built fragment isn't.
+//! that registers advertisements through BlueZ. Since BlueZ builds the
+//! Manufacturer Specific Data AD structure itself, this core hands the
+//! advertiser the bare `[frag_header][body]` blob rather than self-framing it
+//! via `crate::ad` as [`crate::NrfBleLink`] does. Each backend still owns its
+//! *receive* side, which is platform-specific in a way advertising a pre-built
+//! fragment is not.
 //!
-//! Keeping the actual platform advertise call injected rather than hard-wired
-//! is what makes this fully unit-testable against a fake [`BleAdvertiser`],
-//! with no `bluetoothd` dependency in this crate at all — unlike
-//! [`crate::NrfBleLink`], which needs real SoftDevice hardware to exercise its
-//! I/O (see `libs/blue/CLAUDE.md`'s "Testability" section).
+//! Injecting the advertise call rather than hard-wiring it is what makes this
+//! unit-testable against a fake [`BleAdvertiser`], with no `bluetoothd`
+//! dependency — unlike [`crate::NrfBleLink`], which needs real silicon.
 
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -39,23 +35,18 @@ use crate::frame::RawReport;
 use crate::frame::Reassembler;
 use crate::frame::{self};
 
-/// Depth of the queue between the platform's scan callback/scan task and
-/// `recv`'s consumer. Not derived from a hard limit — a small multiple of
-/// what one `recv` call can plausibly fall behind by; capacity pressure drops
-/// the newest report rather than blocking the producer, matching every other
-/// link in this crate.
+/// Depth of the queue between the platform's scan producer and `recv`'s
+/// consumer. Capacity pressure drops the newest report rather than blocking
+/// the producer, matching every other link in this crate.
 const REPORT_QUEUE_DEPTH: usize = 32;
 
-/// Platform hook for putting one already-built fragment on the air.
+/// Platform hook for putting one already-built fragment on the air, tagged
+/// with `crate::ad::MESH_COMPANY_ID` and held for however long the
+/// implementation decides. [`crate::StdBleLink`]'s registers a BlueZ
+/// advertisement and holds it for `advertise_dwell`.
 ///
-/// Implemented per backend: [`crate::StdBleLink`] registers a BlueZ
-/// advertisement and holds it for `advertise_dwell`. Advertise `fragment` as
-/// manufacturer-specific data tagged with `crate::ad::MESH_COMPANY_ID`, hold
-/// it on air for however long the implementation decides, then stop.
-///
-/// Generic (not a trait object) so [`BleLink`] stays fully host-testable
-/// against a fake implementation, with no backend-specific dependency in this
-/// module.
+/// Generic rather than a trait object so [`BleLink`] stays host-testable
+/// against a fake implementation.
 #[allow(async_fn_in_trait)]
 pub trait BleAdvertiser: Send {
     /// Broadcast `fragment` — the bare `[frag_header][body]` blob from
@@ -64,11 +55,9 @@ pub trait BleAdvertiser: Send {
     async fn advertise(&self, fragment: &[u8]) -> Result<(), LinkError>;
 }
 
-/// Cloneable handle a backend's scan task/callback feeds observed
-/// mesh-tagged advertisements into. Kept separate from [`BleLink`] itself
-/// since the scan producer and the `LinkT` consumer (the driver's link
-/// array) can live on opposite sides of an async task boundary (BlueZ's
-/// background scan task).
+/// Cloneable handle a backend's scan producer feeds observed mesh-tagged
+/// advertisements into. Separate from [`BleLink`] because that producer and
+/// the `LinkT` consumer can live on opposite sides of a task boundary.
 #[derive(Clone)]
 pub struct BleReportSink {
     tx: mpsc::Sender<RawReport>,
@@ -95,9 +84,8 @@ impl BleReportSink {
     /// Resolves once this sink's [`BleLink`] has been dropped.
     ///
     /// A scan producer selects on this rather than polling [`Self::is_closed`]
-    /// between events: a backend that only re-checks after its *next* radio
-    /// event would keep the whole scan apparatus alive indefinitely on a quiet
-    /// radio, which is exactly when nothing arrives to wake it.
+    /// between events: re-checking only after the *next* radio event keeps the
+    /// scan apparatus alive indefinitely on a quiet radio.
     pub async fn closed(&self) {
         self.tx.closed().await;
     }

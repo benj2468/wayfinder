@@ -12,11 +12,11 @@ target = "thumbv7em-none-eabihf"
 # fault. With the stack at the bottom, an overflow runs off the end of RAM and
 # faults immediately and deterministically, at the actual culprit.
 #
-# It is also a prerequisite for the diagnostics in `src/main.rs` and
-# `src/stack.rs`: `.uninit` (which holds `PANIC_GUARD` and `FAULT_RECORD`) sits
-# directly in the path of a descending stack, so a retained fault record is only
-# trustworthy once the stack cannot reach it. `stack::paint` detects the layout
-# at runtime and disables itself if this linker is ever dropped — see its docs.
+# It is also a prerequisite for `wayfinder_nrf`'s diagnostics: `.uninit`
+# (which holds `FAULT_GUARD` and `FAULT_RECORD`) sits directly in the path of
+# a descending stack, so a retained fault record is only trustworthy once the
+# stack cannot reach it. `stack::paint` detects the layout at runtime and
+# disables itself if this linker is ever dropped — see its docs.
 linker = "flip-link"
 rustflags = ["-C", "link-arg=-Tlink.x"]
 runner = "probe-rs run --chip nRF52840_xxAA --allow-erase-all"

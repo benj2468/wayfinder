@@ -1,10 +1,11 @@
-//! NUCLEO-F411RE (STM32F411RE) firmware: run the wayfinder mesh router on bare
+//! NUCLEO-F411RE (STM32F411RE) firmware: the wayfinder mesh router on bare
 //! metal over a RYLR998 LoRa link on USART1.
 //!
-//! This is the second-family proof: a non-Nordic Cortex-M running the **same**
-//! [`wayfinder_embedded_driver::Driver`] the nRF52840 board uses, differing only
-//! in the HAL that supplies the concrete UART link and the `embassy-time`
-//! [`Clock`].  Milestone 1 is a radio relay (one LoRa interface, no host device).
+//! The second-family proof: a non-Nordic Cortex-M running the *same*
+//! [`wayfinder_embedded_driver::Driver`] the nRF boards use, differing only in
+//! the HAL supplying the UART link and the [`Clock`]. Milestone 1 is a radio
+//! relay — one LoRa interface, no host device — so unlike the nRF boards there
+//! is no management port and no second link.
 //!
 //! [`Clock`]: wayfinder_embedded_driver::Clock
 
@@ -30,7 +31,7 @@ use rylr998::CodingRate;
 use rylr998::LoraError;
 use rylr998::RylrClient;
 use rylr998::SpreadingFactory;
-use tracing::warn;
+use tracing::error;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder_embedded_driver::Clock;
 use wayfinder_embedded_driver::Driver;
@@ -40,11 +41,11 @@ use wayfinder_embedded_driver::TrickleParams;
 static HEAP: Heap = Heap::empty();
 
 /// Bytes reserved for `alloc` — `tracing-core`'s bookkeeping is the only user
-/// today; grow it if a future allocation panics.
+/// today; grow it if an allocation panics.
 const HEAP_SIZE_BYTES: usize = 1024;
 
-/// This node's mesh identity.  Distinct per physical node (drives a distinct
-/// RYLR `AT+ADDRESS`, since the reassembler keys on the 16-bit module address).
+/// This node's mesh identity. Must be distinct per physical node: it drives a
+/// distinct RYLR `AT+ADDRESS`, and the reassembler keys on that address.
 const NODE_MAC: Mac = Mac([0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
 
 /// LoRa network id shared by every node in this mesh (RYLR `AT+NETWORKID`).
@@ -67,6 +68,15 @@ impl Clock for EmbassyClock {
     }
 }
 
+/// Stop the node, leaving LD2 dark. For bring-up failures that leave nothing
+/// useful to run — a misconfigured relay looks healthy but is silently deaf on
+/// the mesh, or cross-contaminates another node's fragment reassembly.
+fn halt() -> ! {
+    loop {
+        cortex_m::asm::wfe();
+    }
+}
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     // SAFETY: called once, before any other code can allocate, over a
@@ -79,30 +89,25 @@ async fn main(_spawner: Spawner) {
         HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE_BYTES);
     }
 
-    // Install the RTT tracing subscriber now that the allocator is up (its
-    // dispatcher allocates) and before any `tracing` event, so the mesh stack's
-    // logs are visible over the debug probe.
+    // After the allocator (the dispatcher allocates) and before any event.
     wayfinder_log::init();
 
     let p = embassy_stm32::init(Default::default());
 
-    // The buffered UART needs `'static` scratch buffers; each `static mut` is
-    // taken by a unique `&mut` exactly once here.
+    // The buffered UART needs `'static` scratch buffers, taken exactly once.
     let rx_buffer: &'static mut [u8] = {
         static mut RX: [u8; 256] = [0; 256];
-        // SAFETY: `main` runs once, so this is the only `&mut` ever taken to
-        // `RX`; no other reference to it exists.
+        // SAFETY: `main` runs once, so this is the only `&mut` ever taken.
         unsafe { &mut *core::ptr::addr_of_mut!(RX) }
     };
     let tx_buffer: &'static mut [u8] = {
         static mut TX: [u8; 256] = [0; 256];
-        // SAFETY: `main` runs once, so this is the only `&mut` ever taken to
-        // `TX`; no other reference to it exists.
+        // SAFETY: `main` runs once, so this is the only `&mut` ever taken.
         unsafe { &mut *core::ptr::addr_of_mut!(TX) }
     };
 
     let mut uart_config = UartConfig::default();
-    uart_config.baudrate = 115200; // RYLR998 default
+    uart_config.baudrate = 115200; // RYLR998 factory default
 
     // RYLR998 wiring on USART1: PA9 = MCU TX → module RX, PA10 = MCU RX ←
     // module TX, plus the board's 3V3 and GND to the module.
@@ -115,25 +120,18 @@ async fn main(_spawner: Spawner) {
         Irqs,
         uart_config,
     ) else {
-        loop {
-            cortex_m::asm::wfe();
-        }
+        halt();
     };
 
     // LD2 (PA5) lit = firmware booted and reached the run loop.
     let mut led = Output::new(p.PA5, Level::Low, Speed::Low);
 
     let Ok(mut client) = RylrClient::new(uart) else {
-        loop {
-            cortex_m::asm::wfe();
-        }
+        halt();
     };
+
+    // The shared LoRa settings every node in this mesh must agree on.
     let lora_address = u16::from_be_bytes([NODE_MAC.0[4], NODE_MAC.0[5]]);
-    // Apply the shared LoRa settings every node in this mesh must agree on. A
-    // failure here (the module didn't ACK a command) would leave the node on the
-    // wrong address/network — silently deaf on the mesh, or cross-contaminating
-    // another node's fragment reassembly. Halt with LD2 dark rather than run a
-    // misconfigured relay that looks healthy.
     let configured = async {
         client.set_address(lora_address).await?;
         client.set_network_id(LORA_NETWORK_ID).await?;
@@ -149,13 +147,10 @@ async fn main(_spawner: Spawner) {
     }
     .await;
     if let Err(e) = configured {
-        warn!(?e, "radio configuration failed; halting");
-        loop {
-            cortex_m::asm::wfe();
-        }
+        error!(?e, "radio configuration failed; halting");
+        halt();
     }
 
-    // Reached the run loop: signal liveness on LD2.
     led.set_high();
 
     let trickle = [TrickleParams {

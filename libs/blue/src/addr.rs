@@ -1,24 +1,17 @@
 //! The BLE advertiser address: this driver's fragment-reassembly key address
 //! type (see `wayfinder_link_utils::FragKey`).
 //!
-//! Reassembly keyed on this address needs two properties, and BLE only gives
-//! one of them for free:
-//!
-//! - **Distinctness** between senders — free. Unlike RYLR998's configured
-//!   `AT+ADDRESS`, a BLE address is globally distinct per physical device and
-//!   reported on every scan report, so no deployment-time configuration is
-//!   needed to keep keys from colliding.
-//! - **Stability** for as long as a frame is on the air — *not* free, and the
-//!   trap. A frame spans several fragments, and BLE privacy is designed to
-//!   rotate the advertising address. The nRF backend gets stability from the
-//!   SoftDevice's static identity address; the BlueZ backend needs
-//!   `Privacy = device` in the host's `main.conf` (see
-//!   `crate::std_link::BluerAdvertiser`). Nothing here enforces it — see
-//!   `libs/blue/CLAUDE.md`.
+//! Reassembly needs two properties from this key, and BLE gives only one for
+//! free. **Distinctness** between senders is free — unlike RYLR998's configured
+//! `AT+ADDRESS`, a BLE address is globally distinct and reported on every scan.
+//! **Stability** for as long as a frame is on the air is not, and is the trap:
+//! BLE privacy is designed to rotate the advertising address. The nRF backend
+//! gets it from the SoftDevice's static identity address, the BlueZ backend
+//! from `Privacy = device` in the host's `main.conf`. Nothing here enforces it
+//! — see `libs/blue/CLAUDE.md`.
 
-/// A 6-byte BLE device address (public or random; this driver doesn't
-/// distinguish the two, since it only ever compares addresses for equality
-/// as a reassembly key).
+/// A 6-byte BLE device address, public or random — this driver never
+/// distinguishes the two, only compares them for equality.
 ///
 /// The byte array is private so a reassembly key can only be minted from a
 /// real reported address via [`From`], not assembled ad hoc.
