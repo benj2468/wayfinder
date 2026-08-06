@@ -1,6 +1,6 @@
 import pytest
 
-from engine.mobility import Orbit, Static, Vec3, Waypoints
+from wayfinder_sim.mobility import Orbit, Static, Vec3, Waypoints
 
 
 def test_vec3_distance_to():

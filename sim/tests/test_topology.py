@@ -1,5 +1,5 @@
-from engine.channel import PerfectWire
-from engine.topology import complete_graph, diamond, pair, path, shared_lan, star
+from wayfinder_sim.channel import PerfectWire
+from wayfinder_sim.topology import complete_graph, diamond, pair, path, shared_lan, star
 
 
 def _members(links) -> set[frozenset[str]]:

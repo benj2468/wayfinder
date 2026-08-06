@@ -1,0 +1,43 @@
+# The learned-routing training pipeline.
+#
+# Groups:
+#
+#   [train] — training and export. Portable: reads dataset shards and needs
+#             nothing but numpy/torch, so it runs unchanged on Colab, a rented
+#             GPU box, or an Orin Nano with only the shards copied across.
+#
+#   uv sync --extra train     # then: wayfinder-ml generate ...
+#   pip install -e ".[train]"   # on whatever box has the GPU
+[project]
+name = "wayfinder-ml"
+version = "0.0.0"
+description = "Learned next-hop selection for the wayfinder mesh router"
+requires-python = ">=3.10"
+# numpy alone is the floor: it is what the shard format is expressed in, so
+# both halves of the pipeline need it and neither needs more than it to read a
+# dataset. `wayfinder-sim` is the generation half's dependency — a scenario is
+# resolved and built through it, so it is declared rather than reached for by
+# path, and it brings the SimPy clock and the PyO3 extension with it.
+dependencies = ["numpy>=1.24", "wayfinder-sim", "wayfinder-py"]
+
+[project.optional-dependencies]
+# Left unpinned as to *which* torch build: the right one is per-machine and
+# pinning it here would break the boxes this project exists for. A CUDA box
+# wants the PyPI default; a CPU dev box or CI wants the CPU index (the default
+# bundles ~3 GB of `nvidia-*` wheels it will never execute); a Jetson wants
+# JetPack's own aarch64 build. See README.md — "Installing torch".
+train = ["torch>=2.0", "onnx>=1.15"]
+
+[project.scripts]
+wayfinder-ml = "wayfinder_ml.cli:main"
+
+[tool.uv.sources]
+wayfinder-py = { workspace = true }
+wayfinder-sim = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wayfinder_ml"]

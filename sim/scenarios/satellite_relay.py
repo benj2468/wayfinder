@@ -14,14 +14,14 @@ Topology::
       | /
      Low
 
-`ground_radio` (`engine.channel.FreeSpacePathLoss` with a hard
+`ground_radio` (`wayfinder_sim.channel.FreeSpacePathLoss` with a hard
 `max_range_m` cutoff) models the low drone's small telemetry radio: past a
 fixed range there's no signal at all, not just a weak one — so as the low
 drone flies away from GCSA, it goes out of contact once it's far enough
 away. `sat_radio` (a bigger link budget than the ground radio, tuned via
 `sat_tx_power_dbm` below — "like Starlink") links the satellite to both
 GCSA and the low drone; unlike the earlier version of this scenario, the
-satellite now flies `engine.mobility.Orbit` — a real circular pass around a
+satellite now flies `wayfinder_sim.mobility.Orbit` — a real circular pass around a
 point off to the side of the flight line — so its distance to both GCSA and
 the low drone varies over the orbit period instead of staying fixed. That
 makes the relay itself intermittent: GCSA's route to the low drone can go
@@ -40,30 +40,23 @@ Run: `uv run --group sim python sim/scenarios/satellite_relay.py`
 from __future__ import annotations
 
 import dataclasses
-import sys
 from pathlib import Path
 from typing import Sequence
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-import matplotlib.pyplot as plt
-
 import wayfinder_py as wf
-from engine.channel import FreeSpacePathLoss
-from engine.mobility import Orbit, Static, Vec3, Waypoints
-from engine.node import Node
-from engine.plotting import (
-    PALETTE,
-    point_3d,
-    state_band,
-    style_axes,
-    style_axes_3d,
-    trajectory_3d,
-)
-from engine.recorder import Recorder
-from engine.scenario import Simulation
-from engine.sweep import SweepResult, run_sweep
-from engine.topology import pair
+from wayfinder_sim.channel import FreeSpacePathLoss
+from wayfinder_sim.mobility import Orbit, Static, Vec3, Waypoints
+from wayfinder_sim.node import Node
+from wayfinder_sim.recorder import Recorder
+from wayfinder_sim.scenario import Simulation
+from wayfinder_sim.sweep import SweepResult, run_sweep
+from wayfinder_sim.topology import pair
+
+# matplotlib (and `wayfinder_sim.plotting` with it) is imported inside each plotting
+# function rather than here, so importing this module costs nothing but the
+# topology. That is what lets a headless consumer — `wayfinder-ml generate`,
+# which wants only `build_simulation` — load the scenario without a plotting
+# stack installed.
 
 GCSA_POSITION = Vec3(0, 0, 0)
 FLIGHT_RANGE_M = 2000.0  # how far out the low drone flies before turning back
@@ -105,6 +98,11 @@ ROUTE_LABELS = {
 
 def flight_duration_s() -> float:
     return 2 * (FLIGHT_RANGE_M / SPEED_M_S)  # out to max range, then back
+
+
+DURATION_S = flight_duration_s()
+"""One full out-and-back leg: the scenario's natural length, and what
+`wayfinder-ml generate` runs an episode for when not told otherwise."""
 
 
 def build_simulation(
@@ -261,6 +259,10 @@ def print_sweep_summary(results: Sequence[SweepResult[float]]) -> None:
 
 
 def plot(rec: Recorder, out_path: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    from wayfinder_sim.plotting import PALETTE, state_band, style_axes
+
     t = rec.times_s
 
     fig, (ax_dist, ax_route) = plt.subplots(
@@ -326,6 +328,10 @@ def plot_3d(rec: Recorder, out_path: Path) -> None:
     """A 3D render of every entity's position over the course of the flight:
     GCSA fixed on the ground, the low drone's straight out-and-back track,
     and the satellite's orbital loop off to the side."""
+    import matplotlib.pyplot as plt
+
+    from wayfinder_sim.plotting import PALETTE, point_3d, style_axes_3d, trajectory_3d
+
     fig = plt.figure(figsize=(9, 8), facecolor=PALETTE.surface)
     ax = fig.add_subplot(projection="3d")
     style_axes_3d(ax)
@@ -357,6 +363,10 @@ def plot_3d(rec: Recorder, out_path: Path) -> None:
 def plot_sweep(results: Sequence[SweepResult[float]], out_path: Path) -> None:
     """How the handoff distance shifts as satellite `tx_power_dbm` varies —
     the visual case for "higher power fails over sooner."""
+    import matplotlib.pyplot as plt
+
+    from wayfinder_sim.plotting import PALETTE, style_axes
+
     powers = [r.param for r in results]
     handoffs = [handoff_distance_m(r.recorder) for r in results]
     # NaN (not None) so matplotlib draws a real gap rather than erroring, for

@@ -11,12 +11,16 @@ use pyo3::wrap_pyfunction;
 
 mod driver;
 mod errors;
+mod state;
 mod tracing_init;
 mod types;
 
 pub use driver::PyDriver;
 pub use errors::MalformedFrameError;
 pub use errors::WayfinderError;
+pub use state::PyLinkQualityRecord;
+pub use state::PyNeighborStats;
+pub use state::PyOriginatorRecord;
 pub use tracing_init::init_tracing;
 pub use types::PyEgressInterface;
 pub use types::PyLinkFeatures;
@@ -30,6 +34,9 @@ fn wayfinder_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyLinkFeatures>()?;
     m.add_class::<PyLinkMetrics>()?;
     m.add_class::<PyEgressInterface>()?;
+    m.add_class::<PyNeighborStats>()?;
+    m.add_class::<PyOriginatorRecord>()?;
+    m.add_class::<PyLinkQualityRecord>()?;
     m.add_class::<PyDriver>()?;
     m.add_function(wrap_pyfunction!(init_tracing, m)?)?;
     m.add("WayfinderError", m.py().get_type::<WayfinderError>())?;

@@ -6,11 +6,19 @@ converge and inspect it with the `wayfinder-tui` dashboard.
 For a physics-driven, single-process simulation instead of real containers
 and sockets — e.g. modeling a moving node's radio link quality as a function
 of distance and watching BATMAN's next-hop selection react — see
-[`sim/scenarios/`](./scenarios/), built on [`sim/engine/`](./engine/): a
-small SimPy-scheduled harness that drives real `wayfinder-py` `PyDriver`s
-(the PyO3 binding over the tick-based mesh driver) against Python-side
-`Mobility`/`Channel` models, so a scenario only has to describe topology,
-channel tuning, and what to record — not tick/delivery bookkeeping.
+[`sim/scenarios/`](./scenarios/), built on the `wayfinder-sim` package in
+[`sim/src/wayfinder_sim/`](./src/wayfinder_sim/): a small SimPy-scheduled
+harness that drives real `wayfinder-py` `PyDriver`s (the PyO3 binding over
+the tick-based mesh driver) against Python-side `Mobility`/`Channel` models,
+so a scenario only has to describe topology, channel tuning, and what to
+record — not tick/delivery bookkeeping.
+
+`wayfinder-sim` is a uv workspace member and a dependency of the root
+`wayfinder-dev` project, so a plain `uv sync` installs it (editable) and
+`import wayfinder_sim` resolves from anywhere — no `PYTHONPATH`, no
+`sys.path` insert at the top of a scenario. The `sim` dependency group adds
+only its `plot` extra (matplotlib), which the charts need and a headless
+sweep does not.
 
 ```bash
 uv sync --group sim
@@ -19,16 +27,16 @@ uv run --group sim python sim/scenarios/drone_relay.py
 
 ### Writing a scenario
 
-A scenario builds a `Node`/`Link` topology (via `engine.topology`'s
+A scenario builds a `Node`/`Link` topology (via `wayfinder_sim.topology`'s
 `pair`/`path`/`complete_graph`/`shared_lan`/`diamond`/`star`, mirroring
-`sim/topology.py`'s docker-topology vocabulary), wires it into a
+`scripts/topology.py`'s docker-topology vocabulary), wires it into a
 `Simulation`, registers what to record, and runs it:
 
 ```python
-from engine.channel import FreeSpacePathLoss
-from engine.node import Node
-from engine.scenario import Simulation
-from engine.topology import pair
+from wayfinder_sim.channel import FreeSpacePathLoss
+from wayfinder_sim.node import Node
+from wayfinder_sim.scenario import Simulation
+from wayfinder_sim.topology import pair
 
 nodes = [Node("a"), Node("b")]
 links = [pair("a", "b", FreeSpacePathLoss())]
@@ -39,11 +47,13 @@ rec = sim.run(until_s=10.0)
 print(rec.transitions("route"))
 ```
 
+Scenarios stay plain scripts rather than package modules — each is runnable
+on its own, and `wayfinder-ml generate` takes one by path.
+
 See `sim/scenarios/drone_relay.py` for a full example (mobility, multiple
-channels, a switch summary, and a chart via `engine.plotting`), and
-`sim/engine/tests/` for the engine's own pure-logic + integration tests
-(`uv run pytest sim/engine/tests/`; the SimPy-touching ones need
-`--group sim`).
+channels, a switch summary, and a chart via `wayfinder_sim.plotting`), and
+`sim/tests/` for the engine's own pure-logic + integration tests
+(`uv run pytest sim/tests/`).
 
 ## Topology
 
@@ -75,19 +85,19 @@ shares a segment with; everything else is reached by BATMAN forwarding.
 
 ## Editing the topology
 
-The topology is **generated** by [`sim/topology.py`](./topology.py) — the
+The topology is **generated** by [`scripts/topology.py`](../scripts/topology.py) — the
 sim image derives each node's config from the NICs docker attaches, so the
 compose wiring *is* the topology. Edit `build_links()` (or the helpers
 `diamond`, `complete_graph`, `path`, `shared_lan`) and re-run; nothing else
 changes.
 
 ```bash
-python sim/topology.py graph             # ASCII adjacency summary
-python sim/topology.py print             # the generated compose YAML
-python sim/topology.py up                # write ephemeral file + compose up --build -d
-python sim/topology.py logs d1 m5        # follow specific nodes
-python sim/topology.py down              # tear it down (removes networks)
-python sim/topology.py write             # refresh the committed docker-compose.yml
+python scripts/topology.py graph             # ASCII adjacency summary
+python scripts/topology.py print             # the generated compose YAML
+python scripts/topology.py up                # write ephemeral file + compose up --build -d
+python scripts/topology.py logs d1 m5        # follow specific nodes
+python scripts/topology.py down              # tear it down (removes networks)
+python scripts/topology.py write             # refresh the committed docker-compose.yml
 ```
 
 `up`/`down`/`logs` operate on an ephemeral, gitignored file
@@ -106,10 +116,10 @@ wayfinder0`, so the traffic enters the mesh through the node — it never leaks
 straight onto the `eth*` segment NICs.
 
 ```bash
-python sim/topology.py up                                  # stack must be up first
-python sim/topology.py blast m1 --rate 200 --size 1000 --duration 30
-python sim/topology.py blast d1 --rate 0 --size 1400       # --rate 0 = flood as fast as possible
-python sim/topology.py blast                               # first node, 100 fps × 1000 B for 10 s
+python scripts/topology.py up                                  # stack must be up first
+python scripts/topology.py blast m1 --rate 200 --size 1000 --duration 30
+python scripts/topology.py blast d1 --rate 0 --size 1400       # --rate 0 = flood as fast as possible
+python scripts/topology.py blast                               # first node, 100 fps × 1000 B for 10 s
 ```
 
 * `--rate` is frames/second (`0` uses `ping -f` to flood as fast as the kernel
@@ -117,7 +127,7 @@ python sim/topology.py blast                               # first node, 100 fps
   how long to run (`0` runs until you Ctrl-C).
 * The origin `NODE` defaults to the first node in the topology; pass any node
   name to blast from there instead.
-* Watch the fallout in another terminal: `python sim/topology.py logs` for OGM/
+* Watch the fallout in another terminal: `python scripts/topology.py logs` for OGM/
   forwarding churn, or `docker exec -it wf-<node> wayfinder-tui` to see whether
   routing stays converged under load.
 
@@ -150,7 +160,7 @@ started (the script uses the project name `wayfinder-sim`):
 ```bash
 docker exec -it wf-d1 wayfinder-tui       # d1's routing tree (reaches the mesh via d4→m1)
 docker exec -it wf-m3 wayfinder-tui       # a mesh node: m1,m2,m4,m5 direct; diamond multi-hop
-python sim/topology.py logs d4            # the bridge node: watch OGM/route activity
+python scripts/topology.py logs d4            # the bridge node: watch OGM/route activity
 ```
 
 In the TUI, the **Routing Table** tab is the interesting one: direct (1-hop)

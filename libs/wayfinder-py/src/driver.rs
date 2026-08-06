@@ -9,6 +9,8 @@ use wayfinder::config::TrickleConfig;
 use wayfinder_tick_driver::Driver;
 
 use crate::errors::MalformedFrameError;
+use crate::state::PyLinkQualityRecord;
+use crate::state::PyOriginatorRecord;
 use crate::types::PyEgressInterface;
 use crate::types::PyLinkFeatures;
 use crate::types::PyLinkMetrics;
@@ -107,6 +109,48 @@ impl PyDriver {
         self.inner
             .poll_local()
             .map(|bytes| PyBytes::new(py, &bytes))
+    }
+
+    /// Every known destination and its candidate paths, in no particular
+    /// order (the table is keyed by MAC for O(1) lookup).
+    ///
+    /// Read-only: building a snapshot must not perturb the run it describes,
+    /// since feature extraction happens alongside a live simulation.
+    fn originator_table(&self) -> Vec<PyOriginatorRecord> {
+        self.inner
+            .router()
+            .originator_table()
+            .map(PyOriginatorRecord::from)
+            .collect()
+    }
+
+    /// Per-`(neighbor, interface)` local link-quality estimates.
+    ///
+    /// Populated for every neighbor/interface pair a frame has been received
+    /// on, whether or not that frame carried `LinkMetrics` — a caller that
+    /// never passes `metrics` to [`push_rx`](Self::push_rx) still gets one
+    /// entry per pair, just with `ewma_quality` pinned at 0 rather than the
+    /// row being absent.
+    fn link_quality_records(&self) -> Vec<PyLinkQualityRecord> {
+        self.inner
+            .router()
+            .link_quality_records()
+            .iter()
+            .map(PyLinkQualityRecord::from)
+            .collect()
+    }
+
+    /// How many originators are reachable directly (best next hop is the
+    /// destination itself), as opposed to through a relay.
+    fn neighbor_count(&self) -> usize {
+        self.inner.router().neighbor_count()
+    }
+
+    /// `(used, capacity)` of the originator table. At capacity the
+    /// least-recently-heard originator is evicted to admit a new one, so a
+    /// saturated table changes what the candidate set means.
+    fn originator_occupancy(&self) -> (usize, usize) {
+        self.inner.router().originator_occupancy()
     }
 
     /// Resolve the current egress interface(s) for `dest`, if routable —

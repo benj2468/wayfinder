@@ -22,6 +22,7 @@ from typing import Any, Callable, Sequence
 import simpy
 import wayfinder_py as wf
 
+from . import NoLinkError
 from .link import Link
 from .mobility import Vec3
 from .node import Node
@@ -147,6 +148,35 @@ class Simulation:
 
     # --- probe-facing introspection -----------------------------------
 
+    @property
+    def node_names(self) -> tuple[str, ...]:
+        """Every node's name, in the order they were declared."""
+        return tuple(self._states)
+
+    def driver(self, node: str) -> wf.PyDriver:
+        """`node`'s underlying router.
+
+        Exposed for callers that read routing state directly rather than
+        through `route_via` — feature extraction for the learned-routing
+        pipeline needs the originator and link-quality tables, not just the
+        resolved egress. Read-only in practice: mutating the returned driver
+        would desynchronise it from the SimPy schedule driving it.
+        """
+        return self._states[node].driver
+
+    def mac(self, node: str) -> wf.PyMac:
+        """`node`'s mesh identifier, whether explicit or auto-derived."""
+        return self._states[node].mac
+
+    def node_for_mac(self, mac: wf.PyMac) -> str | None:
+        """The node owning `mac`, or `None` if no node in this simulation
+        does — the inverse of `mac`, since router state is keyed by identifier
+        while scenarios and topology are written in names."""
+        for name, state in self._states.items():
+            if state.mac == mac:
+                return name
+        return None
+
     def position(self, node: str) -> Vec3:
         """`node`'s world position at the current simulation time."""
         state = self._states[node]
@@ -177,7 +207,7 @@ class Simulation:
         probe RNG stream so recording it never perturbs simulated delivery."""
         link = self._link_for_pair.get(frozenset((a, b)))
         if link is None:
-            raise ValueError(f"no link between {a!r} and {b!r}")
+            raise NoLinkError(f"no link between {a!r} and {b!r}")
         t_s = self.env.now / 1000.0
         return link.channel.evaluate(
             self.position(a), self.position(b), t_s, self._probe_rng
