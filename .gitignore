@@ -30,7 +30,14 @@ coverage.xml
 
 # Python
 __pycache__
+.pytest_cache
 .sim-compose.gen.yml
+
+# Training datasets generated from the simulator (ml/) — regenerable, and
+# large enough that they belong in object storage rather than git.
+ml/data/
+*.npz
+*.onnx
 
 # Generated chart/output artifacts from sim/scenarios/*.py
 sim/scenarios/output/

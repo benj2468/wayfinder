@@ -2,8 +2,8 @@ from random import Random
 
 import pytest
 
-from engine.channel import FreeSpacePathLoss, PerfectWire
-from engine.mobility import Vec3
+from wayfinder_sim.channel import FreeSpacePathLoss, PerfectWire
+from wayfinder_sim.mobility import Vec3
 
 
 def test_perfect_wire_always_delivers():

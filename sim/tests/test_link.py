@@ -1,7 +1,7 @@
 import pytest
 
-from engine.channel import PerfectWire
-from engine.link import Link
+from wayfinder_sim.channel import PerfectWire
+from wayfinder_sim.link import Link
 
 
 def test_link_default_name_derived_from_endpoints():

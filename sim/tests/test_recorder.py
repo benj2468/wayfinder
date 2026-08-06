@@ -1,4 +1,4 @@
-from engine.recorder import Recorder
+from wayfinder_sim.recorder import Recorder
 
 
 def test_append_and_column():

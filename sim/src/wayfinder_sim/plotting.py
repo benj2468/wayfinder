@@ -9,7 +9,7 @@ had 2 states; a 3+-state chart (e.g. more than one alternate route) needs
 the rest, so all 8 are here up front rather than patched in per scenario.
 
 Only imported when a scenario actually plots — keeps matplotlib out of the
-import graph for pure-logic engine use (see `engine/__init__.py`).
+import graph for pure-logic engine use (see `__init__.py`).
 """
 
 from __future__ import annotations

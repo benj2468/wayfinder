@@ -144,13 +144,18 @@
               source "''${PROJECT_ROOT}/.venv/bin/activate"
 
               python3 -m pip install --upgrade pip
-              uv sync --only-dev
+              uv sync --group dev --group sim
 
               # Manylinux wheels (numpy, matplotlib's C extensions — see
               # sim/scenarios/*.py's `uv sync --group sim`) expect libstdc++ on
               # the loader path; this shell's stdenv doesn't put it there by
               # default, so wire it up once here rather than per-invocation.
-              export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH"
+              export LD_LIBRARY_PATH="${
+                pkgs.lib.makeLibraryPath [
+                  pkgs.stdenv.cc.cc.lib
+                  pkgs.zlib
+                ]
+              }"
             '';
           };
 

@@ -7,15 +7,29 @@ channel tuning, flight paths) and not the tick/delivery/bookkeeping
 machinery that makes it run.
 
 Every export is resolved lazily (`__getattr__`, PEP 562) rather than
-imported eagerly: it lets `sim/engine/tests/` build up one submodule at a
-time without every other submodule already existing, and it means importing
-`engine.mobility` alone never pulls in `scenario`'s `simpy` dependency or
-`plotting`'s `matplotlib` one.
+imported eagerly: it lets `sim/tests/` build up one submodule at a time
+without every other submodule already existing, and it means importing
+`wayfinder_sim.mobility` alone never pulls in `scenario`'s `simpy`
+dependency or `plotting`'s `matplotlib` one — the latter being the `plot`
+extra, and so absent from a headless install.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
+
+
+class NoLinkError(ValueError):
+    """No `Link` joins the two given nodes — raised by
+    `Simulation.sample_channel`.
+
+    A dedicated type (rather than a bare `ValueError`) so a caller building a
+    channel graph (e.g. `wayfinder_ml.generate.channel_graph`) can catch
+    exactly "these two nodes aren't linked" without also absorbing a real bug
+    in a `Channel.evaluate()` implementation that happens to raise
+    `ValueError` for its own reasons.
+    """
+
 
 if TYPE_CHECKING:
     from .channel import Channel, ChannelSample, FreeSpacePathLoss, PerfectWire
@@ -38,6 +52,7 @@ __all__ = [
     "Vec3",
     "Waypoints",
     "Node",
+    "NoLinkError",
     "Recorder",
     "Simulation",
     "SweepResult",

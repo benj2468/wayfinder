@@ -11,7 +11,7 @@ Topology::
             Drone
 
 Radio link quality is derived from real 3D distance via a free-space
-path-loss model (`engine.channel.FreeSpacePathLoss`), fed into wayfinder as
+path-loss model (`wayfinder_sim.channel.FreeSpacePathLoss`), fed into wayfinder as
 each frame's `quality` metric. wayfinder's BATMAN engine clamps a received
 OGM's transmission quality (TQ) by that per-hop value
 (`ogm.tq.saturating_sub(10).min(local_quality)` — see
@@ -20,38 +20,38 @@ next-hop selection: this script demonstrates GCSA's best route to the drone
 switching from "direct radio" to "via GCSB" (fiber + GCSB's own radio) as the
 drone flies past the midpoint, and back again on the return leg.
 
-This is a `sim/engine` scenario: it only describes topology, channel tuning,
+This is a `wayfinder_sim` scenario: it only describes topology, channel tuning,
 the flight path, and what to record — the tick/delivery loop that drives the
-real `wayfinder_py` router lives in `engine.scenario.Simulation`.
+real `wayfinder_py` router lives in `wayfinder_sim.scenario.Simulation`.
 
 Run: `uv run --group sim python sim/scenarios/drone_relay.py`
 """
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
-# `sim/` (not this script's own `sim/scenarios/` directory) needs to be on
-# sys.path for `import engine` to resolve, matching how `sim/engine/tests/`
-# reaches it via pytest's `pythonpath` setting.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-import matplotlib.pyplot as plt
-
 import wayfinder_py as wf
-from engine.channel import FreeSpacePathLoss, PerfectWire
-from engine.mobility import Static, Vec3, Waypoints
-from engine.node import Node
-from engine.plotting import PALETTE, state_band, style_axes
-from engine.recorder import Recorder
-from engine.scenario import Simulation
-from engine.topology import pair
+from wayfinder_sim.channel import FreeSpacePathLoss, PerfectWire
+from wayfinder_sim.mobility import Static, Vec3, Waypoints
+from wayfinder_sim.node import Node
+from wayfinder_sim.recorder import Recorder
+from wayfinder_sim.scenario import Simulation
+from wayfinder_sim.topology import pair
+
+# matplotlib (and `wayfinder_sim.plotting` with it) is imported inside `plot` rather
+# than here, so importing this module costs nothing but the topology. That is
+# what lets a headless consumer — `wayfinder-ml generate`, which wants only
+# `build_simulation` — load the scenario without a plotting stack installed.
 
 GCS_SEPARATION_M = 1000.0
 ALTITUDE_M = 50.0
 SPEED_M_S = 10.0
 TRICKLE_MS = (200, 2000)  # (i_min_ms, i_max_ms) — fast enough to track the flight
+
+DURATION_S = 2 * (GCS_SEPARATION_M / SPEED_M_S)
+"""One full out-and-back leg: the scenario's natural length, and what
+`wayfinder-ml generate` runs an episode for when not told otherwise."""
 
 # The two route names `route_via("gcsa", "drone")` can resolve to, and how
 # the switch summary/chart legend should describe each.
@@ -105,6 +105,10 @@ def print_switch_summary(rec: Recorder) -> None:
 
 
 def plot(rec: Recorder, out_path: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    from wayfinder_sim.plotting import PALETTE, state_band, style_axes
+
     t = rec.times_s
 
     fig, (ax_dist, ax_rssi, ax_route) = plt.subplots(
@@ -186,8 +190,7 @@ def main() -> None:
     wf.init_tracing()  # quiet by default; set RUST_LOG to see mesh internals
 
     sim = build_simulation()
-    duration_s = 2 * (GCS_SEPARATION_M / SPEED_M_S)  # out to GCSB, then back
-    rec = sim.run(until_s=duration_s, sample_interval_ms=50)
+    rec = sim.run(until_s=DURATION_S, sample_interval_ms=50)
 
     print_switch_summary(rec)
     plot(rec, Path(__file__).parent / "output" / "drone_relay.png")

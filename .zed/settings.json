@@ -5,6 +5,7 @@
         "linkedProjects": [
           "Cargo.toml",
           "bins/wayfinder-nrf52840/Cargo.toml",
+          "bins/wayfinder-nrf52840-dongle/Cargo.toml",
           "libs/wayfinder-py/Cargo.toml",
         ]
       }

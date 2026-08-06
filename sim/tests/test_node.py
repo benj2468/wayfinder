@@ -1,5 +1,5 @@
-from engine.mobility import Static, Vec3, Waypoints
-from engine.node import DEFAULT_TRICKLE, Node
+from wayfinder_sim.mobility import Static, Vec3, Waypoints
+from wayfinder_sim.node import DEFAULT_TRICKLE, Node
 
 
 def test_node_defaults_to_static_origin_and_default_trickle():

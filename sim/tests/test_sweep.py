@@ -2,12 +2,12 @@ import pytest
 
 pytest.importorskip("simpy")
 
-from engine.channel import PerfectWire  # noqa: E402
-from engine.mobility import Static, Vec3, Waypoints  # noqa: E402
-from engine.node import Node  # noqa: E402
-from engine.scenario import Simulation  # noqa: E402
-from engine.sweep import run_sweep  # noqa: E402
-from engine.topology import pair  # noqa: E402
+from wayfinder_sim.channel import PerfectWire  # noqa: E402
+from wayfinder_sim.mobility import Static, Vec3, Waypoints  # noqa: E402
+from wayfinder_sim.node import Node  # noqa: E402
+from wayfinder_sim.scenario import Simulation  # noqa: E402
+from wayfinder_sim.sweep import run_sweep  # noqa: E402
+from wayfinder_sim.topology import pair  # noqa: E402
 
 
 def _build(trickle_i_min_ms: int) -> Simulation:

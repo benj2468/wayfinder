@@ -4,11 +4,11 @@ pytest.importorskip("simpy")
 
 import wayfinder_py as wf  # noqa: E402
 
-from engine.channel import PerfectWire  # noqa: E402
-from engine.link import Link  # noqa: E402
-from engine.node import Node  # noqa: E402
-from engine.scenario import Simulation  # noqa: E402
-from engine.topology import diamond, pair  # noqa: E402
+from wayfinder_sim.channel import PerfectWire  # noqa: E402
+from wayfinder_sim.link import Link  # noqa: E402
+from wayfinder_sim.node import Node  # noqa: E402
+from wayfinder_sim.scenario import Simulation  # noqa: E402
+from wayfinder_sim.topology import diamond, pair  # noqa: E402
 
 
 def test_two_node_route_converges():
@@ -141,3 +141,38 @@ def test_link_keepalive_override_wins_over_node_default():
         "the link's tx_keepalive_interval_ms must override node a's "
         "(absent) default, same as the existing trickle override"
     )
+
+
+def test_node_names_lists_every_node_in_declaration_order():
+    nodes = [Node(n, trickle=(50, 500)) for n in ("a", "b")]
+    sim = Simulation(nodes, [pair("a", "b", PerfectWire())], seed=0)
+
+    assert sim.node_names == ("a", "b")
+
+
+def test_driver_exposes_the_underlying_router():
+    """Feature extraction reads router state directly, so the real `PyDriver`
+    has to be reachable rather than only its route resolution."""
+    nodes = [Node(n, trickle=(50, 500)) for n in ("a", "b")]
+    sim = Simulation(nodes, [pair("a", "b", PerfectWire())], seed=0)
+
+    sim.run(until_s=3.0, sample_interval_ms=50)
+
+    table = sim.driver("a").originator_table()
+    assert [r.originator for r in table] == [sim.mac("b")]
+
+
+def test_driver_rejects_an_unknown_node():
+    sim = Simulation([Node("a")], [], seed=0)
+    with pytest.raises(KeyError):
+        sim.driver("nope")
+
+
+def test_node_for_mac_inverts_the_mac_assignment():
+    """Router state is keyed by MAC; the oracle works in node names, so the
+    generator needs the inverse of the auto-derived MAC mapping."""
+    nodes = [Node(n, trickle=(50, 500)) for n in ("a", "b")]
+    sim = Simulation(nodes, [pair("a", "b", PerfectWire())], seed=0)
+
+    assert sim.node_for_mac(sim.mac("b")) == "b"
+    assert sim.node_for_mac(wf.PyMac(b"\xff\xff\xff\xff\xff\xfe")) is None

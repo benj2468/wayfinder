@@ -16,7 +16,7 @@ from .channel import Channel
 class Link:
     """`endpoints` names the member `Node`s (by `Node.name`), at least two
     distinct. `name` defaults to the endpoints joined with `-`, matching
-    `sim/topology.py`'s deterministic-name convention. `trickle`, if set,
+    `scripts/topology.py`'s deterministic-name convention. `trickle`, if set,
     overrides every member's `Node.trickle` for the interface this link
     creates on that node. `tx_keepalive_interval_ms`, if set, likewise
     overrides every member's `Node.tx_keepalive_interval_ms` for that

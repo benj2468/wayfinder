@@ -1,0 +1,36 @@
+# The physics-driven mesh simulation engine.
+#
+# A real distribution rather than a loose `sim/engine/` directory, so the
+# things that consume it — `sim/scenarios/*.py`, `wayfinder-ml`'s dataset
+# generation, the engine's own tests, and the type checker — all reach it the
+# same way every other package is reached: an import resolved from the
+# environment. No `sys.path` surgery, no `PYTHONPATH`, no `extraPaths`.
+#
+# `simpy` is a hard dependency (the discrete-event clock `scenario.py` runs
+# on), as is `wayfinder-py` (the engine's whole point is driving the *real*
+# Rust router rather than a Python reimplementation of it). Plotting is the
+# one genuinely optional half — see the `plot` extra.
+[project]
+name = "wayfinder-sim"
+version = "0.0.0"
+description = "Physics-driven mesh simulation engine driving real wayfinder routers"
+requires-python = ">=3.10"
+dependencies = ["simpy", "wayfinder-py"]
+
+[project.optional-dependencies]
+# `wayfinder_sim.plotting` only. Kept out of the base install because a
+# headless sweep — the shape a dataset generation run takes — records numbers
+# and never draws anything, and matplotlib is a large dependency to impose on
+# it. `__init__.py` resolves exports lazily, so importing any other submodule
+# never trips over its absence.
+plot = ["matplotlib"]
+
+[tool.uv.sources]
+wayfinder-py = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wayfinder_sim"]

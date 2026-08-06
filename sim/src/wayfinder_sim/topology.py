@@ -1,4 +1,4 @@
-"""Topology builders — wiring vocabulary mirroring `sim/topology.py`'s
+"""Topology builders — wiring vocabulary mirroring `scripts/topology.py`'s
 `diamond`/`complete_graph`/`path`/`shared_lan`, adapted to this in-process
 engine: there are no docker networks here, so a link is a Python `Link`
 object carrying a `Channel` rather than a bare list of member names.

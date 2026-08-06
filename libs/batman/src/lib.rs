@@ -139,8 +139,14 @@ pub struct OriginatorRecord {
     /// originator when the table is full; per-path ageing
     /// ([`BatmanEngine::purge_stale`]) drives the actual staleness decision.
     pub last_heard: Duration,
-    /// The immediate neighbor on the currently-selected best path to this
-    /// originator (the relay of its best-TQ OGM).
+    /// This originator's own address — the *destination* this record
+    /// describes, and the key it is stored under in the originator table.
+    ///
+    /// The name is historical and reads as though it were a relay; it is not.
+    /// The relays are in [`paths`](Self::paths), and the selected one is
+    /// [`best_next_hop`](Self::best_next_hop). `best_next_hop ==
+    /// neighbor_ident` is precisely the test for "reachable directly", which
+    /// is how `CentralRouter::neighbor_count` counts one-hop neighbors.
     pub neighbor_ident: Mac,
     /// The next-hop MAC that packets for this originator are forwarded to —
     /// the immediate neighbor of the best path.
