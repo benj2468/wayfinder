@@ -107,6 +107,7 @@ use wayfinder::link::LinkT;
 use wayfinder::link::Received;
 use wayfinder_server::EmbeddedQueryChannel;
 
+mod stack;
 mod usb_mgmt;
 
 wayfinder::define_profile! {
@@ -285,6 +286,209 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     cortex_m::peripheral::SCB::sys_reset()
 }
 
+/// Address of `SCB_CFSR`, the Configurable Fault Status Register: three packed
+/// sub-registers (`MMFSR`/`BFSR`/`UFSR`) saying *why* a fault escalated.
+const SCB_CFSR: *const u32 = 0xE000_ED28 as *const u32;
+
+/// Address of `SCB_HFSR`, the HardFault Status Register. Bit 30 (`FORCED`) means
+/// a configurable fault escalated to HardFault, which is the usual case here.
+const SCB_HFSR: *const u32 = 0xE000_ED2C as *const u32;
+
+/// Address of `SCB_MMFAR`, holding the faulting data address for a memory
+/// management fault. Valid only when `CFSR`'s `MMARVALID` (bit 7) is set.
+const SCB_MMFAR: *const u32 = 0xE000_ED34 as *const u32;
+
+/// Address of `SCB_BFAR`, holding the faulting data address for a bus fault.
+/// Valid only when `CFSR`'s `BFARVALID` (bit 15) is set.
+const SCB_BFAR: *const u32 = 0xE000_ED38 as *const u32;
+
+/// Words in [`FAULT_RECORD`]: magic, PC, LR, CFSR, HFSR, MMFAR, BFAR.
+const FAULT_RECORD_WORDS: usize = 7;
+
+/// Marks [`FAULT_RECORD`] as written by [`HardFault`] rather than being
+/// post-power-on garbage, on the same principle as [`PANIC_GUARD_MAGIC`]
+/// (`b"WAFF"`).
+const FAULT_RECORD_MAGIC: u32 = 0x5741_4646;
+
+/// A HardFault's diagnostic registers, preserved across the reset that follows
+/// it so the *next* boot can report what killed the previous one.
+///
+/// This is the whole reason a fault on this board is debuggable at all without a
+/// probe attached. A HardFault is not a panic: it never reaches
+/// `#[panic_handler]`, so none of that path's RTT printing applies, and
+/// `cortex-m-rt`'s default handler simply traps forever — a board that goes
+/// silently dark, which per this module's header is the worst outcome available
+/// to a deployed node. Worse, the one instrument that *would* observe it, an
+/// attached debug probe, is itself a documented cause of faults here, so
+/// watching for the bug perturbs it.
+///
+/// Retaining the registers instead makes the fault self-reporting: the next boot
+/// finds them, logs them, and `GetLogs` serves them over the USB management port
+/// to a `wayfinderctl --serial` that was never present when the fault happened.
+///
+/// `.uninit` for the reason spelled out at length on [`PANIC_GUARD`] — anything
+/// in `.bss`/`.data` is re-initialised by `cortex-m-rt` on the very reset whose
+/// cause this is trying to carry across. This static is therefore only as
+/// trustworthy as the guarantee that nothing else writes that region, which on
+/// this board means `flip-link`: without it the descending stack reaches
+/// `.uninit` first of all (see `stack`'s module docs).
+///
+/// An array of `AtomicU32` rather than a struct of named fields, because a
+/// struct whose fields are only ever accessed individually is a shape LLVM
+/// splits into per-field globals — which would strand some of them back in
+/// `.bss`, zeroed every boot, exactly as [`PANIC_GUARD`]'s docs describe.
+/// `build.rs`-free verification: `nm` the image and check the symbol's address
+/// falls inside `.uninit`.
+#[unsafe(link_section = ".uninit.FAULT_RECORD")]
+static FAULT_RECORD: [core::sync::atomic::AtomicU32; FAULT_RECORD_WORDS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; FAULT_RECORD_WORDS];
+
+/// A one-line guess at what a `CFSR`/`HFSR` pair means, to save decoding bits by
+/// hand at the point the log is read.
+///
+/// Ordered by how specific the answer is, not by bit position: the stacking
+/// errors come first because they are the signature of a stack overflow, the one
+/// cause whose fix is completely different from the others'. `IMPRECISERR` is
+/// called out because it is the case where the recorded PC is *not* the culprit
+/// — the write that faulted retired earlier and the address is unrecoverable.
+fn fault_cause(cfsr: u32, hfsr: u32) -> &'static str {
+    const MMFSR_MSTKERR: u32 = 1 << 4;
+    const BFSR_STKERR: u32 = 1 << 12;
+    const MMFSR_DACCVIOL: u32 = 1 << 1;
+    const MMFSR_IACCVIOL: u32 = 1 << 0;
+    const BFSR_PRECISERR: u32 = 1 << 9;
+    const BFSR_IMPRECISERR: u32 = 1 << 10;
+    const BFSR_IBUSERR: u32 = 1 << 8;
+    const UFSR_UNDEFINSTR: u32 = 1 << 16;
+    const UFSR_INVSTATE: u32 = 1 << 17;
+    const UFSR_UNALIGNED: u32 = 1 << 24;
+    const HFSR_VECTTBL: u32 = 1 << 1;
+
+    match () {
+        // Both mean the CPU could not push an exception frame: the stack
+        // pointer had already left valid memory. Under `flip-link` that is a
+        // stack overflow running off the bottom of RAM.
+        _ if cfsr & (MMFSR_MSTKERR | BFSR_STKERR) != 0 => {
+            "stack overflow (fault on exception stacking)"
+        }
+        _ if cfsr & UFSR_UNDEFINSTR != 0 => {
+            "undefined instruction (executed non-code — corrupt pointer or smashed return address)"
+        }
+        _ if cfsr & UFSR_INVSTATE != 0 => {
+            "invalid state (bad Thumb bit — corrupt function pointer or return address)"
+        }
+        _ if cfsr & UFSR_UNALIGNED != 0 => "unaligned access",
+        _ if cfsr & BFSR_IMPRECISERR != 0 => {
+            "imprecise bus fault (recorded PC is NOT the culprit; the faulting write retired earlier)"
+        }
+        _ if cfsr & BFSR_PRECISERR != 0 => "precise bus fault (bad data address; see bfar)",
+        _ if cfsr & BFSR_IBUSERR != 0 => "bus fault fetching an instruction",
+        _ if cfsr & MMFSR_DACCVIOL != 0 => "data access violation (see mmfar)",
+        _ if cfsr & MMFSR_IACCVIOL != 0 => "instruction access violation",
+        _ if hfsr & HFSR_VECTTBL != 0 => "bus fault reading the vector table",
+        _ => "unclassified",
+    }
+}
+
+/// Record a HardFault's diagnostic registers into [`FAULT_RECORD`], then reboot
+/// — or halt, once [`MAX_CONSECUTIVE_PANICS`] faults in a row have failed to
+/// clear it.
+///
+/// Overrides `cortex-m-rt`'s default handler, which traps in an infinite loop.
+/// That default is the wrong behaviour for a mesh node twice over: the node is
+/// dead until someone power-cycles it, and the evidence dies with it. Sharing
+/// [`bump_panic_count`] with [`panic`] gives both paths one consecutive-fault
+/// budget, so a fault that recurs every boot settles into a halt rather than a
+/// reboot loop — and the fault record from the *first* of them survives for
+/// whoever attaches later.
+///
+/// Deliberately minimal: volatile register reads, relaxed atomic stores, and one
+/// RTT print. No allocation, no `tracing` (its dispatcher allocates), and
+/// nothing that takes a `critical_section` beyond what `rprintln!` already does
+/// — the CPU is in a fault state with an unknown stack, and code that faults
+/// again here escalates to lockup and loses the record.
+#[cortex_m_rt::exception]
+unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
+    // SAFETY: fixed, always-mapped addresses in the Cortex-M System Control
+    // Block, read-only here, and word-aligned by construction.
+    let (cfsr, hfsr, mmfar, bfar) = unsafe {
+        (
+            SCB_CFSR.read_volatile(),
+            SCB_HFSR.read_volatile(),
+            SCB_MMFAR.read_volatile(),
+            SCB_BFAR.read_volatile(),
+        )
+    };
+
+    // Written before anything else can fault, magic last so a torn write is
+    // never mistaken for a complete record.
+    let words = [ef.pc(), ef.lr(), cfsr, hfsr, mmfar, bfar];
+    for (slot, value) in FAULT_RECORD.iter().skip(1).zip(words) {
+        slot.store(value, core::sync::atomic::Ordering::Relaxed);
+    }
+    FAULT_RECORD[0].store(FAULT_RECORD_MAGIC, core::sync::atomic::Ordering::Relaxed);
+
+    let count = bump_panic_count();
+    rtt_target::rprintln!(
+        "hardfault ({}/{}): pc={:#010x} lr={:#010x} cfsr={:#010x} hfsr={:#010x} — {}",
+        count,
+        MAX_CONSECUTIVE_PANICS,
+        ef.pc(),
+        ef.lr(),
+        cfsr,
+        hfsr,
+        fault_cause(cfsr, hfsr)
+    );
+
+    if count >= MAX_CONSECUTIVE_PANICS {
+        rtt_target::rprintln!(
+            "hardfault: {} consecutive faults; halting",
+            MAX_CONSECUTIVE_PANICS
+        );
+        loop {
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    rtt_target::rprintln!("hardfault: resetting");
+    cortex_m::asm::delay(PANIC_DRAIN_CYCLES);
+    cortex_m::peripheral::SCB::sys_reset()
+}
+
+/// Report a HardFault retained from the previous boot, if there was one, and
+/// clear it.
+///
+/// **Call after `wayfinder_log::init()`**, so the record goes into the log ring
+/// that `GetLogs` serves and not just to an RTT channel nobody is attached to —
+/// reaching a detached node is the entire point of retaining it.
+///
+/// `error!` because a HardFault is a node-local failure an operator must act on,
+/// and because it has already cost the node a reboot by the time it is read.
+///
+/// Clearing the magic afterwards keeps one fault from being re-reported on every
+/// subsequent boot, which would make a single historical crash look like an
+/// ongoing one.
+fn report_retained_fault() {
+    if FAULT_RECORD[0].load(core::sync::atomic::Ordering::Relaxed) != FAULT_RECORD_MAGIC {
+        return;
+    }
+    let read = |i: usize| FAULT_RECORD[i].load(core::sync::atomic::Ordering::Relaxed);
+    let (pc, lr, cfsr, hfsr, mmfar, bfar) = (read(1), read(2), read(3), read(4), read(5), read(6));
+
+    error!(
+        pc = %format_args!("{pc:#010x}"),
+        lr = %format_args!("{lr:#010x}"),
+        cfsr = %format_args!("{cfsr:#010x}"),
+        hfsr = %format_args!("{hfsr:#010x}"),
+        mmfar = %format_args!("{mmfar:#010x}"),
+        bfar = %format_args!("{bfar:#010x}"),
+        cause = fault_cause(cfsr, hfsr),
+        "previous boot ended in a hardfault"
+    );
+
+    FAULT_RECORD[0].store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Bytes reserved for `alloc`. Two users share it: `tracing-core`'s bookkeeping
 /// and the USB management server's per-request buffers.
 ///
@@ -411,6 +615,11 @@ where
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    // First statement in the program, before the allocator and before any
+    // peripheral is touched: painting measures only what happens after it runs,
+    // and it must see the stack at its shallowest (see `stack::paint`).
+    stack::paint();
+
     // SAFETY: called once, before any other code can allocate, over a
     // `static mut` region sized by `HEAP_SIZE_BYTES` that nothing else
     // references.
@@ -427,6 +636,11 @@ async fn main(spawner: Spawner) {
     wayfinder_log::init();
 
     info!("Welcome to Wayfinder");
+
+    // Before anything else this boot could push it out of the ring: if the
+    // previous boot ended in a HardFault, this is where its registers surface,
+    // and it is the only place they ever will on a node with no probe attached.
+    report_retained_fault();
 
     // Same SoftDevice restriction as described just below, for the UARTE0
     // interrupt the RYLR998 link uses and the USBD one the management port
@@ -571,6 +785,17 @@ async fn main(spawner: Spawner) {
     };
     info!("spawning wayfinder task");
     spawner.spawn(task);
+
+    // Best-effort: a board that cannot spawn the watcher is still a working
+    // node, and losing a diagnostic is not worth refusing to run over — unlike
+    // the mesh task above, whose absence leaves nothing to do.
+    match stack_watch() {
+        Ok(task) => spawner.spawn(task),
+        Err(e) => warn!(
+            ?e,
+            "failed to spawn stack watcher; high-water reporting disabled"
+        ),
+    }
 }
 
 #[embassy_executor::task]
@@ -752,6 +977,28 @@ async fn wayfinder(
         // No management port: nothing will ever send on `query_rx`, so racing it
         // would only cost an idle future per loop iteration.
         None => driver.run().await,
+    }
+}
+
+/// Interval between stack high-water reports.
+///
+/// The measurement is a peak-since-boot, not an instantaneous reading, so it
+/// cannot miss a burst that happens between two reports — sampling rate only
+/// changes how soon a new peak is *noticed*, never whether it is recorded. A
+/// minute keeps this far below the noise floor of the log ring while still
+/// bracketing any incident to within a minute of when the stack grew.
+const STACK_REPORT_INTERVAL_SECS: u64 = 60;
+
+/// Periodically log how close the board has come to exhausting its stack.
+///
+/// Split out as its own task rather than folded into the mesh loop so the
+/// reading keeps coming even if that loop is wedged — a stack problem is exactly
+/// the kind of fault that would wedge it.
+#[embassy_executor::task]
+async fn stack_watch() -> ! {
+    loop {
+        Timer::after(EmbassyDuration::from_secs(STACK_REPORT_INTERVAL_SECS)).await;
+        stack::report();
     }
 }
 
