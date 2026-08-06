@@ -3,16 +3,13 @@
 
 //! A generic durable-blob-store abstraction.
 //!
-//! `CaLog` (`wayfinder-server`) and the mesh's local revocation cache both
-//! need the same underlying guarantee — durably replace one blob with
-//! another such that a reader never observes a torn mix of old and new, even
-//! across a crash or power loss mid-write — on media with wildly different
-//! atomicity primitives (a POSIX file has atomic `rename`; raw flash has
-//! neither atomic rename nor atomic byte-level overwrite). [`DurableStore`]
-//! is that one shared guarantee, `no_std`-clean so it can eventually run on
-//! bare-metal flash as readily as a `std` file; everything about *what's
-//! inside* the blob (encoding, versioning, migration) stays the caller's
-//! concern.
+//! [`DurableStore`] is one guarantee — durably replace a blob such that a
+//! reader never observes a torn mix of old and new, even across a crash
+//! mid-write — over media with wildly different atomicity primitives (a POSIX
+//! file has atomic `rename`; raw flash has neither atomic rename nor atomic
+//! byte-level overwrite). It is `no_std`-clean so it runs on bare-metal flash
+//! as readily as a `std` file. What is *inside* the blob (encoding,
+//! versioning, migration) stays the caller's concern.
 //!
 //! See `docs/design/implemented/04-generic-durable-store.md` for the design
 //! this implements.
@@ -41,29 +38,17 @@ pub use persisted::Persisted;
 
 /// Durable, atomic single-blob storage.
 ///
-/// A `DurableStore` instance owns exactly one blob's worth of state — a
-/// caller with several independently-persisted things (as `CaLog` already
-/// has: an issued-certificate log and a held-CSR store, each persisted by
-/// its own call) holds one instance per thing, not one instance managing
-/// several. There is no multi-blob transaction support, deliberately (see
-/// the design doc's non-goals).
+/// One instance owns exactly one blob. A caller persisting several things
+/// independently (as `CaLog` does) holds one instance per thing; there is no
+/// multi-blob transaction support, deliberately — see the design doc's
+/// non-goals.
 ///
-/// Synchronous (blocking) by design, not async. The obvious argument for
-/// async — a flash erase/write cycle can take tens of milliseconds, and
-/// shouldn't block a shared executor — only pays for itself when something
-/// *else* could usefully run during that block, i.e. multiple concurrent
-/// tasks. An embedded node using this trait may now also run a management-API
-/// serve loop concurrently on the same executor (`wayfinder-embedded-driver`'s
-/// `run_with_mgmt`), so the "nothing else to starve" premise no longer holds
-/// unconditionally — but every `DurableStore` call in this workspace today
-/// (the nRF52840 binary's identity load/mint) happens once at boot, before
-/// that concurrent loop starts, so nothing is actually starved yet. This
-/// stays sync rather than paying `dynosaur`/dyn-compatibility ceremony for a
-/// benefit no current call site needs; revisit if a `DurableStore` call is
-/// ever added on a hot path that runs *after* a second concurrent task is
-/// live. On `std`, `FileStore` blocks the calling thread for the duration of
-/// the write, exactly as direct `std::fs` calls already do everywhere else in
-/// this workspace.
+/// Blocking by design. A flash erase/write can take tens of milliseconds, but
+/// every call site in this workspace today (the nRF's identity load/mint) runs
+/// once at boot, before any concurrent task exists to starve. Revisit if a
+/// call is ever added on a path that runs alongside a live `run_with_mgmt`
+/// loop — until then, async would buy `dynosaur` dyn-compatibility ceremony
+/// for nothing.
 pub trait DurableStore {
     /// The error type this store's medium can produce.
     type Error;

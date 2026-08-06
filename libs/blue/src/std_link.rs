@@ -1,15 +1,15 @@
 //! `LinkT` adapter carrying the mesh over BLE connectionless advertising on a
 //! Linux host, driving BlueZ through its D-Bus API (`bluer`).
 //!
-//! Built on the shared [`crate::BleLink`] core (see `generic_link.rs`): this
-//! module supplies a [`BleAdvertiser`] that registers a fragment as a BlueZ
-//! advertisement and a background task that turns BlueZ's discovery events
-//! into [`crate::BleReportSink`] submissions. Same on-air format as
-//! [`crate::NrfBleLink`] (see `crate::ad`) — BlueZ assembles the Manufacturer
-//! Specific Data AD structure from `Advertisement::manufacturer_data`, so this
-//! side hands it the bare `[frag_header][body]` blob (`frame::build_fragment`)
-//! rather than self-framing it, and on receive BlueZ hands back that same
-//! blob already parsed out of the advertisement.
+//! Built on the shared [`crate::BleLink`] core: this module supplies a
+//! [`BleAdvertiser`] that registers a fragment as a BlueZ advertisement, plus a
+//! background task turning BlueZ's discovery events into
+//! [`crate::BleReportSink`] submissions.
+//!
+//! BlueZ assembles the Manufacturer Specific Data AD structure itself, so this
+//! side passes the bare `[frag_header][body]` blob (`frame::build_fragment`)
+//! rather than self-framing it as [`crate::NrfBleLink`] does — the asymmetry
+//! `libs/blue/CLAUDE.md` warns about.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -61,16 +61,11 @@ pub struct BleLinkParams {
     pub adapter: Option<String>,
     /// How long each fragment's advertisement stays registered with BlueZ.
     ///
-    /// This is the airtime knob, and the one value here worth tuning per
-    /// deployment. BlueZ tears the advertisement down as soon as the
-    /// registration is dropped, so a dwell shorter than the controller's
-    /// advertising interval (BlueZ's own default is ~100 ms, and this crate
-    /// deliberately doesn't override it — the `MinInterval`/`MaxInterval`
-    /// advertisement properties need BlueZ ≥ 5.56 plus controller support,
-    /// and registration fails outright where they're unsupported) can retire
-    /// a fragment before a single advertising event carried it. Raising it
-    /// costs latency directly: a frame takes `dwell × fragment_count`, and a
-    /// full-size frame is 14 fragments.
+    /// The airtime knob, and the one value here worth tuning per deployment.
+    /// It must outlast the controller's advertising interval (BlueZ defaults to
+    /// ~100 ms and this crate does not override it) or a fragment is retired
+    /// before any advertising event carried it. Raising it costs latency
+    /// directly: a frame takes `dwell × fragment_count`, up to 14 fragments.
     pub advertise_dwell: Duration,
 }
 
@@ -97,21 +92,14 @@ impl Default for BleLinkParams {
 ///
 /// The hold is the whole point — `bluer` unregisters the advertisement when
 /// its handle is dropped, so a fragment advertised and immediately released
-/// would never reach a scanner.
+/// never reaches a scanner.
 ///
-/// **Depends on `Privacy = device` in the host's `main.conf`.** Reassembly
-/// keys on the advertiser address (`FragKey`, see `crate::generic_link`), and
-/// registering one advertisement per fragment is exactly the pattern that
-/// makes that address move: non-connectable advertising asks the kernel for
-/// privacy, and without an RPA configured it answers with a fresh
-/// *non-resolvable* private address per advertising session — so every
-/// fragment of a frame would go out under a different address and never
-/// reassemble. `Privacy = device` moves it onto the RPA path, which holds one
-/// address for the rotation timeout (~15 min). There is no per-advertisement
-/// or per-adapter override for this in BlueZ: `Advertisement` carries no
-/// address field and `Adapter` exposes `address_type` read-only. See
-/// `libs/blue/CLAUDE.md` for why that host dependency was accepted rather
-/// than putting a sender tag in the fragment header.
+/// **Depends on `Privacy = device` in the host's `main.conf`.** Reassembly keys
+/// on the advertiser address, and one advertisement per fragment is exactly the
+/// pattern that makes that address move: without it the kernel issues a fresh
+/// non-resolvable address per advertising session and nothing ever reassembles.
+/// BlueZ offers no per-advertisement or per-adapter override, so this stays a
+/// deployment requirement — see `libs/blue/CLAUDE.md`.
 struct BluerAdvertiser {
     adapter: Adapter,
     advertise_dwell: Duration,
@@ -120,15 +108,12 @@ struct BluerAdvertiser {
 impl BleAdvertiser for BluerAdvertiser {
     async fn advertise(&self, fragment: &[u8]) -> Result<(), LinkError> {
         let advertisement = Advertisement {
-            // Broadcast, not the `Peripheral` default: this link is
-            // connectionless, and nothing here would answer a connection
-            // attempt. BlueZ also forbids `discoverable` on a broadcast
-            // advertisement, so that stays unset.
+            // Broadcast, not the `Peripheral` default: nothing here would
+            // answer a connection attempt. BlueZ forbids `discoverable` on a
+            // broadcast advertisement, so that stays unset.
             advertisement_type: AdvertisementType::Broadcast,
             manufacturer_data: BTreeMap::from([(MESH_COMPANY_ID, fragment.to_vec())]),
-            // Belt-and-braces against a leaked registration: BlueZ retires the
-            // advertisement on its own once this elapses, even if the handle
-            // somehow outlives the dwell below.
+            // Backstop against a leaked registration outliving the dwell below.
             timeout: Some(self.advertise_dwell),
             ..Default::default()
         };
@@ -164,15 +149,11 @@ impl StdBleLink {
             None => session.default_adapter().await?,
         };
         adapter.set_powered(true).await?;
-        // The adapter's identity address is logged rather than checked. It is
-        // tempting to verify the `Privacy = device` dependency that
-        // `BluerAdvertiser` documents, but nothing here can: `address_type`
-        // describes the *identity* address, not whether advertising uses a
-        // resolvable private address, and BlueZ exposes no `Privacy` property
-        // on `org.bluez.Adapter1` at all. A check on `address_type` would pass
-        // on a misconfigured host, which is worse than no check — so the
-        // dependency stays a documented deployment requirement (see
-        // `libs/blue/CLAUDE.md`) and this is the diagnostic breadcrumb.
+        // Logged, not checked. `BluerAdvertiser`'s `Privacy = device`
+        // dependency is unverifiable from here: `address_type` describes the
+        // *identity* address, and BlueZ exposes no `Privacy` property at all,
+        // so a check would pass on a misconfigured host. This is the
+        // diagnostic breadcrumb instead.
         info!(
             adapter = adapter.name(),
             dwell_ms = params.advertise_dwell.as_millis(),
@@ -199,16 +180,13 @@ impl StdBleLink {
 /// being reset), which is not a fault this node can act on, so it is retried
 /// rather than treated as fatal, matching the bare-metal scan loop.
 async fn run_scanner(adapter: Adapter, sink: BleReportSink) {
-    // Registered once for the task's lifetime, not per session. When the
-    // monitor is unavailable `register_mesh_monitor` warns with the host-config
-    // fix, and registering inside the retry loop below would repeat that
-    // warning every second for as long as the node runs — the `warn!` flood
-    // CLAUDE.md forbids. Re-registration happens only if BlueZ releases it.
+    // Once for the task's lifetime, not per session: `register_mesh_monitor`
+    // warns when unavailable, and registering inside the retry loop would
+    // repeat that warning every second for as long as the node runs.
     let mut monitor = register_mesh_monitor(&adapter).await;
     // Consecutive sessions that ended without the link being dropped. One is
-    // routine; a run of them means the receive path is dead and nothing is
-    // arriving, which an operator needs to hear about — but at a cadence that
-    // doesn't flood, hence the power-of-two gate below.
+    // routine; a run of them means the receive path is dead. The power-of-two
+    // gate below is what keeps saying so from becoming a flood.
     let mut consecutive: u32 = 0;
 
     loop {
@@ -278,22 +256,17 @@ enum ScanEnd {
 
 /// The advertisement-monitor target describing this mesh's traffic.
 ///
-/// Registering this is what keeps fragments from being dropped below us:
-/// while a monitor is active the kernel runs its LE scan with the HCI
-/// `filter_duplicates` parameter *disabled*. Under ordinary BlueZ discovery
-/// that parameter is enabled, and controllers deduplicate reports keyed on
-/// advertiser address without comparing the payload — so after a peer's first
-/// advertisement got through, every later one from the same address was
-/// suppressed until a scan restart flushed the controller's filter cache.
-/// Since a frame spans several fragments from one address (see
-/// `crate::frame`), that cost whole frames, not stray fragments.
+/// Registering this is what keeps fragments from being dropped below us: only
+/// while a monitor is active does the kernel run its LE scan with HCI
+/// `filter_duplicates` *disabled*. Otherwise the controller deduplicates on
+/// advertiser address without comparing payloads, and since a frame spans
+/// several fragments from one address that costs whole frames.
 ///
-/// [`RssiSamplingPeriod::All`] is the property that asks for this — the other
-/// sampling modes group or suppress repeat advertisements on purpose. The
-/// pattern narrows the match to our Manufacturer Specific Data so BlueZ isn't
-/// asked to wake this process for all ambient BLE traffic; `start_position`
-/// counts from the first byte of the AD structure's *data*, which is where
-/// the little-endian company id sits (see `crate::ad`).
+/// [`RssiSamplingPeriod::All`] is the property that asks for it — every other
+/// sampling mode groups or suppresses repeats on purpose. The pattern narrows
+/// the match so BlueZ need not wake this process for ambient BLE traffic;
+/// `start_position` counts from the AD structure's *data*, where the
+/// little-endian company id sits.
 fn mesh_monitor() -> Monitor {
     Monitor {
         monitor_type: MonitorType::OrPatterns,
@@ -311,18 +284,13 @@ fn mesh_monitor() -> Monitor {
 /// that must be held for the monitor to stay active — both of them, since
 /// dropping either the manager or the handle unregisters it.
 ///
-/// `None` means this host can't offer the monitor and the link will run
-/// degraded, dropping whatever the controller's duplicate filter suppresses.
-/// That is not a fault this node can act on and not a reason to tear the link
-/// down, so it is reported and stepped over rather than propagated. The two
-/// ways it happens are worth telling apart in the log:
-///
-/// - `UnknownMethod` on `RegisterMonitor` — `bluetoothd` isn't exposing
-///   `org.bluez.AdvertisementMonitorManager1` at all. It needs BlueZ ≥ 5.55
-///   started with `--experimental` (or `Experimental = true` in
-///   `main.conf`); the interface is gated behind that flag.
-/// - `AdvertisementMonitorRejected` — BlueZ has the interface but declined
-///   this target, typically a controller without the offload support.
+/// `None` means this host can't offer the monitor and the link runs degraded,
+/// dropping whatever the controller's duplicate filter suppresses — reported
+/// and stepped over rather than torn down, since the node cannot act on it.
+/// Two distinct causes, worth telling apart in the log: `UnknownMethod` means
+/// `bluetoothd` is not exposing `AdvertisementMonitorManager1` (needs BlueZ ≥
+/// 5.55 with `Experimental = true`), while `AdvertisementMonitorRejected`
+/// means it has the interface but declined this target.
 async fn register_mesh_monitor(adapter: &Adapter) -> Option<(MonitorManager, MonitorHandle)> {
     let manager = match adapter.monitor().await {
         Ok(manager) => manager,
@@ -362,14 +330,11 @@ async fn next_monitor_event(monitor: &mut Option<&mut MonitorHandle>) -> Option<
 /// advertisement monitor, then forward every mesh-tagged fragment until the
 /// session ends.
 ///
-/// Fragments are taken from the *value carried by* each device property
-/// change, never read back to service one. The distinction matters: a
-/// read-back samples whatever BlueZ holds at the time the read completes, so
-/// with several fragments in flight from one peer the same (latest) blob is
-/// observed repeatedly and the earlier ones are never seen at all — which
-/// loses the whole frame, since reassembly needs every fragment. The single
-/// read-back here is a per-device *seed*, seeding state that predates the
-/// subscription; see [`read_mesh_report`].
+/// Fragments come from the *value carried by* each property change, never a
+/// read-back: a read samples whatever BlueZ holds when it completes, so with
+/// several fragments in flight from one peer it observes the latest blob
+/// repeatedly and loses the whole frame. The one read-back here seeds state
+/// predating the subscription; see [`read_mesh_report`].
 async fn scan_once(
     adapter: &Adapter,
     sink: &BleReportSink,
@@ -378,13 +343,12 @@ async fn scan_once(
     adapter
         .set_discovery_filter(DiscoveryFilter {
             transport: DiscoveryTransport::Le,
-            // Still required alongside the advertisement monitor, not
-            // superseded by it: the two suppress duplicates at different
-            // layers. The monitor disables the *controller*'s address-keyed
-            // filter; this disables BlueZ's own, which otherwise emits one
-            // `ManufacturerData` property change per peer and hides every
-            // fragment after the first. `DiscoveryFilter` derives `Default`,
-            // so leaving it off means BlueZ-level filtering is on.
+            // Required alongside the monitor, not superseded by it: the two
+            // filter at different layers. This one disables BlueZ's own
+            // suppression, which otherwise emits a single `ManufacturerData`
+            // change per peer and hides every fragment after the first.
+            // `DiscoveryFilter` derives `Default`, so omitting it leaves the
+            // filtering on.
             duplicate_data: true,
             ..Default::default()
         })
@@ -392,17 +356,15 @@ async fn scan_once(
     let mut discovery = adapter.discover_devices().await?;
     let mut monitor = monitor;
 
-    // Per-device property streams, multiplexed. Each ends when its device is
-    // removed, so `SelectAll` drops it on its own. Note the bound is BlueZ's
-    // cache eviction, not our discovery filter: that filter is LE-transport
-    // only (the company-id pattern narrows the *monitor*, not discovery), so
-    // one entry exists per ambient BLE device in range, not per mesh peer.
+    // Per-device property streams, multiplexed; each ends when its device is
+    // removed, so `SelectAll` drops it. Bounded by BlueZ's cache eviction, not
+    // by the discovery filter — the company-id pattern narrows the *monitor* —
+    // so there is one entry per ambient BLE device in range, not per peer.
     let mut device_events: SelectAll<BoxStream<'static, (Address, DeviceEvent)>> = SelectAll::new();
-    // Last RSSI seen per peer, bounded the same way. BlueZ delivers RSSI as
-    // its own property change, which may land either side of the
-    // `ManufacturerData` change it accompanies, so a fragment is tagged with
-    // the freshest value known rather than blocking on one — a slightly stale
-    // link-quality reading is worth far more than a dropped frame.
+    // Last RSSI seen per peer, bounded the same way. RSSI arrives as its own
+    // property change, either side of the `ManufacturerData` one it
+    // accompanies, so a fragment is tagged with the freshest value known
+    // rather than waiting — a stale reading beats a dropped frame.
     let mut rssi: HashMap<Address, i16> = HashMap::new();
 
     loop {
@@ -412,17 +374,14 @@ async fn scan_once(
             // leave the discovery session and every subscription alive.
             () = sink.closed() => return Ok(ScanEnd::SinkClosed),
 
-            // Drained purely so bluer's bounded (1024-slot) monitor event
-            // channel cannot fill: its producer *awaits* the send from inside
-            // BlueZ's D-Bus dispatch, so a full channel would back-pressure
-            // the same dispatch that carries discovery and advertisement
-            // registration. Fragment bytes come from the per-device streams
-            // below, never from here.
+            // Drained purely so bluer's bounded monitor event channel cannot
+            // fill: its producer awaits the send from inside BlueZ's D-Bus
+            // dispatch, the same dispatch carrying discovery and advertisement
+            // registration. Fragment bytes never come from here.
             event = next_monitor_event(&mut monitor) => {
                 if event.is_none() {
-                    // The stream ends when BlueZ releases the monitor — after
-                    // which the controller filters duplicates again and whole
-                    // frames vanish. Surface it rather than scanning on blind.
+                    // BlueZ released the monitor, so the controller filters
+                    // duplicates again and whole frames vanish.
                     return Ok(ScanEnd::MonitorReleased);
                 }
             }
@@ -438,14 +397,11 @@ async fn scan_once(
                     };
                     // Not a per-frame drop: this subscription is the only path
                     // carrying fragment bytes for this peer, so losing it makes
-                    // the peer invisible for the rest of the session — while
-                    // the seed below may still deliver one fragment, giving the
-                    // peer a single flicker of existence. Too costly to swallow.
+                    // the peer invisible for the rest of the session.
                     let events = match device.events().await {
                         Ok(events) => events,
                         Err(e) if matches!(e.kind, ErrorKind::DoesNotExist | ErrorKind::NotAvailable) => {
-                            // Routine: peers churn out of BlueZ's cache
-                            // continuously, so one vanishing here is expected.
+                            // Routine: peers churn out of BlueZ's cache.
                             trace!(?addr, "drop: device gone before event subscription");
                             continue;
                         }
@@ -460,14 +416,11 @@ async fn scan_once(
                     };
                     device_events.push(events.map(move |event| (addr, event)).boxed());
                     // Seed from current state: the advertisement that caused
-                    // this discovery was already recorded before the
-                    // subscription above existed, so events alone would miss
-                    // a peer's opening fragment. A device BlueZ already knew
-                    // about replays a possibly stale fragment here, which is
-                    // harmless — an incomplete message expires out of the
-                    // reassembler under capacity pressure, and a complete one
-                    // is a duplicate the router discards on OGM sequence
-                    // number.
+                    // this discovery predates the subscription above, so events
+                    // alone would miss a peer's opening fragment. Replaying a
+                    // stale fragment for an already-known device is harmless —
+                    // an incomplete message expires out of the reassembler, and
+                    // a complete one is a duplicate the router discards.
                     if let Some((ble_addr, seed_rssi, fragment)) = read_mesh_report(adapter, addr).await {
                         if let Some(value) = seed_rssi {
                             rssi.insert(addr, value);
@@ -502,25 +455,22 @@ async fn scan_once(
 }
 
 /// Read `addr`'s current advertising state, returning its BLE address, RSSI,
-/// and mesh-tagged fragment bytes if it carries this mesh's marker. `None`
-/// for ambient BLE traffic, and for any device whose properties have already
-/// gone away — peers churn out of BlueZ's cache continuously, so a device
-/// vanishing between the event and this read is routine, not an error.
+/// and fragment bytes if it carries this mesh's marker. `None` for ambient BLE
+/// traffic and for a device whose properties have already gone away, which is
+/// routine — peers churn out of BlueZ's cache continuously.
 ///
-/// Called once per newly discovered device, to seed from state that predates
-/// our property subscription. Deliberately *not* used to service property
-/// changes: a read-back samples current state rather than consuming the
-/// value that changed, which loses fragments (see [`scan_once`]).
+/// Called once per newly discovered device, to seed state predating our
+/// property subscription. Deliberately *not* used to service property changes;
+/// see [`scan_once`].
 async fn read_mesh_report(
     adapter: &Adapter,
     addr: Address,
 ) -> Option<(BleAddr, Option<i16>, Vec<u8>)> {
     let device = adapter.device(addr).ok()?;
-    // A bare `.ok()?` here would collapse "this device has no advertising
-    // data" (routine) together with a D-Bus fault such as `bluetoothd` having
-    // died or a policy denying `org.bluez.Device1` access (not routine). Those
-    // look identical from outside — peers' opening fragments simply never
-    // arrive — so the fault case has to say so itself.
+    // A bare `.ok()?` would collapse "no advertising data" (routine) into a
+    // D-Bus fault such as a dead `bluetoothd` (not routine). Both look
+    // identical from outside — opening fragments never arrive — so the fault
+    // case has to say so itself.
     let manufacturer_data = match device.manufacturer_data().await {
         Ok(Some(data)) => data,
         Ok(None) => return None,

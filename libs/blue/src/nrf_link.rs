@@ -37,43 +37,32 @@ use crate::frame::Reassembler;
 use crate::frame::{self};
 
 /// Depth of the queue between the SoftDevice's synchronous scan callback and
-/// `recv`'s async consumer. Not derived from a hard limit — a small multiple
-/// of what one `recv` call away from the queue can plausibly fall behind by;
-/// capacity pressure drops the newest report rather than blocking the scan
-/// callback (see [`ble_scan_task`]).
+/// `recv`'s async consumer. Capacity pressure drops the newest report rather
+/// than blocking the callback (see [`ble_scan_task`]).
 const REPORT_QUEUE_DEPTH: usize = 8;
 
-/// Advertising events each fragment gets on the air before `send` moves to
-/// the next one.
+/// Advertising events each fragment gets on the air before `send` moves on.
 ///
-/// `send` blocks the driver's event loop for the whole of a fragment's
-/// advertising session, and a frame costs `fragment_count` of them, so this
-/// multiplied by [`ADV_INTERVAL_625US`] is the per-fragment latency budget.
-/// Four gives a passive scanner on a duty cycle several chances to catch the
-/// fragment without pinning the executor.
+/// `send` blocks the driver's event loop for a whole advertising session, so
+/// this times [`ADV_INTERVAL_625US`] is the per-fragment latency budget. Four
+/// gives a duty-cycled scanner several chances without pinning the executor.
 const ADV_EVENTS_PER_FRAGMENT: u8 = 4;
 
 /// Advertising interval in 625µs units — 20ms, the SoftDevice's documented
-/// minimum (`BLE_GAP_ADV_INTERVAL_MIN`).
-///
-/// Deliberately not `Config::default()`'s 400 (250ms): at that interval
-/// [`ADV_EVENTS_PER_FRAGMENT`] events cost a full second per fragment, which
-/// is the event loop blocked for ~2s on an ordinary two-fragment OGM. At 20ms
-/// the same four events cost ~80ms.
+/// `BLE_GAP_ADV_INTERVAL_MIN`. Not `Config::default()`'s 400 (250ms), at which
+/// [`ADV_EVENTS_PER_FRAGMENT`] events cost a second per fragment — ~2s of
+/// blocked event loop for an ordinary two-fragment OGM, against ~80ms here.
 const ADV_INTERVAL_625US: u32 = 32;
 
-/// Backstop advertising timeout in 10ms units, for the case where the
-/// [`ADV_EVENTS_PER_FRAGMENT`] events somehow don't elapse. Well above the
-/// ~80ms those events take, so it never truncates them; both terminations
+/// Backstop advertising timeout in 10ms units, should the
+/// [`ADV_EVENTS_PER_FRAGMENT`] events somehow not elapse. Both terminations
 /// surface identically as `AdvertiseError::Timeout`.
 const ADV_TIMEOUT_BACKSTOP_10MS: u16 = 50;
 
-// The backstop is only a backstop if it outlasts the events it backs up —
-// otherwise `timeout` silently becomes the primary terminator again and
-// fragments get truncated mid-burst, which is the failure this constant set
-// exists to prevent. `nrf_link.rs` can't be host-tested (it needs real
-// SoftDevice silicon), so the invariant is checked at compile time on the
-// firmware build instead.
+// A backstop only backs up what it outlasts; below that, `timeout` silently
+// becomes the primary terminator and fragments truncate mid-burst. This file
+// needs real SoftDevice silicon to test, so the invariant is checked at
+// compile time on the firmware build instead.
 const _: () = assert!(
     (ADV_EVENTS_PER_FRAGMENT as u32) * ADV_INTERVAL_625US * 625 / 1000
         < (ADV_TIMEOUT_BACKSTOP_10MS as u32) * 10,
@@ -89,25 +78,19 @@ struct ReportQueue {
     channel: Channel<NoopRawMutex, RawReport, REPORT_QUEUE_DEPTH>,
 }
 
-// SAFETY: single-core, single-executor firmware (see `SdHandle`'s doc
-// comment below) — `NoopRawMutex` opts out of `Sync` only because it does no
-// real synchronization, which is unsound solely under concurrent access from
-// a second real thread, which never happens here.
+// SAFETY: single-core, single-executor firmware. `NoopRawMutex` opts out of
+// `Sync` because it does no real synchronization, which is unsound only under
+// concurrent access from a second real thread — never the case here.
 unsafe impl Sync for ReportQueue {}
 
-// Wraps `&'static Softdevice` to satisfy `LinkT: Send`.
-//
-// `Softdevice` deliberately opts out of `Send`/`Sync` (its C API isn't
-// documented as safe to call concurrently from independent threads), but
-// this firmware runs a single embassy executor on one Cortex-M core — there
-// is never a second real thread to race against, only cooperatively
-// scheduled async tasks, so sharing the reference across them is sound.
+/// Wraps `&'static Softdevice` to satisfy `LinkT: Send`. `Softdevice` opts out
+/// of `Send`/`Sync` because its C API isn't documented as concurrency-safe;
+/// this firmware runs one embassy executor on one core, so the only sharing is
+/// between cooperatively scheduled tasks.
 #[derive(Clone, Copy)]
 struct SdHandle(&'static Softdevice);
 
-// SAFETY: see the comment above — single-core, single-executor,
-// non-preemptive-across-tasks firmware, never actually shared across a real
-// thread boundary.
+// SAFETY: see above — never actually shared across a real thread boundary.
 unsafe impl Send for SdHandle {}
 
 /// `LinkT` adapter for the nRF52840's built-in BLE radio: connectionless
@@ -131,12 +114,9 @@ impl NrfBleLink {
     /// `spawner` — it must keep running for the lifetime of the returned
     /// link.
     ///
-    /// Uses the SoftDevice's own default configuration (`Config::default()`)
-    /// throughout — the default role/connection counts haven't been tuned
-    /// against real hardware yet; see `libs/blue/CLAUDE.md`.
-    ///
-    /// It is expected that the caller has already enabled the SoftDevice
-    /// and is ready to receive events from it.
+    /// The caller must already have enabled the SoftDevice and be pumping its
+    /// events. Role/connection counts are left at `Config::default()`, untuned
+    /// against real hardware; see `libs/blue/CLAUDE.md`.
     pub fn new(spawner: Spawner, sd: &'static Softdevice) -> Result<Self, BleError> {
         static REPORTS: StaticCell<ReportQueue> = StaticCell::new();
         let reports = REPORTS.init(ReportQueue {
@@ -147,14 +127,10 @@ impl NrfBleLink {
         Ok(Self {
             sd: SdHandle(sd),
             adv_config: AdvConfig {
-                // What normally ends a fragment's session. Without this the
-                // SoftDevice maps `max_events: None` to `max_adv_evts = 0`
-                // (unlimited), leaving `timeout` as the *only* bound — a full
-                // second of blocked event loop per fragment.
+                // What normally ends a fragment's session. `None` maps to
+                // `max_adv_evts = 0` (unlimited), leaving `timeout` as the only
+                // bound — a full second of blocked event loop per fragment.
                 max_events: Some(ADV_EVENTS_PER_FRAGMENT),
-                // Backstop only (10ms units), for the unlikely case those
-                // events don't happen. Sized above `ADV_EVENTS_PER_FRAGMENT`
-                // advertising intervals so it never truncates them.
                 timeout: Some(ADV_TIMEOUT_BACKSTOP_10MS),
                 interval: ADV_INTERVAL_625US,
                 ..Default::default()
@@ -174,20 +150,17 @@ impl NrfBleLink {
     }
 }
 
-/// Scan interval/window, in 625µs units. Not equal: a scan window that
-/// exactly fills its interval leaves the SoftDevice's radio scheduler no
-/// gap to service any other role, and `send`'s `peripheral::advertise`
-/// starts failing with `AdvertiseError::Raw(RawError::Resources)` (SoftDevice
-/// docs: "Not enough BLE role slots available"). ~90% duty cycle trades a
-/// small amount of scan coverage for leaving the advertiser schedulable.
+/// Scan interval/window, in 625µs units. Deliberately not equal: a window that
+/// fills its interval leaves the SoftDevice's radio scheduler no gap for any
+/// other role, and every `peripheral::advertise` then fails with
+/// `RawError::Resources`. ~90% duty cycle keeps the advertiser schedulable.
 const SCAN_INTERVAL_625US: u32 = 180; // 112.5ms
 const SCAN_WINDOW_625US: u32 = 160; // 100ms
 
 /// Drives passive scanning forever, dispatching only mesh-marker-tagged
-/// reports (see `crate::ad::find_mesh_fragment`) to `reports`. `central::scan`
-/// returning is not itself a hardware fault — it can happen on internal
-/// SoftDevice housekeeping — so it's retried rather than treated as fatal,
-/// matching the scan-restart pattern the BlueZ backend uses.
+/// reports to `reports`. `central::scan` returning is not a hardware fault —
+/// SoftDevice housekeeping can end a scan — so it is retried, matching the
+/// BlueZ backend's scan-restart pattern.
 #[embassy_executor::task]
 async fn ble_scan_task(sd: &'static Softdevice, reports: &'static ReportQueue) -> ! {
     let config = ScanConfig {
@@ -221,9 +194,7 @@ async fn ble_scan_task(sd: &'static Softdevice, reports: &'static ReportQueue) -
 
             // Backpressure drops the newest report rather than blocking this
             // synchronous callback — acceptable on a lossy, fire-and-forget
-            // medium, same tolerance every other link here already assumes —
-            // but still logged, matching every other capacity-driven drop in
-            // this codebase (`Reassembler`'s eviction, rylr998's `rx_queue`).
+            // medium, but logged like every other capacity-driven drop here.
             if let Err(embassy_sync::channel::TrySendError::Full(dropped)) = reports
                 .channel
                 .try_send(RawReport::new(addr, Some(i16::from(report.rssi)), fragment))
@@ -234,8 +205,6 @@ async fn ble_scan_task(sd: &'static Softdevice, reports: &'static ReportQueue) -
         })
         .await;
         if let Err(e) = result {
-            // Handled by retrying the scan loop, not fatal -- warn!, not
-            // error! (CLAUDE.md: a handled-and-retried fault is warn!).
             warn!(?e, "BLE scan error; restarting");
         }
     }
@@ -258,12 +227,8 @@ impl LinkT for NrfBleLink {
                 &mut ad_buf,
             )?;
 
-            // One advertising session per fragment: it runs until
-            // `adv_config.max_events` advertising events elapse (the expected
-            // way this ends), or the `adv_config.timeout` backstop in the
-            // unlikely case those events don't happen — both surface as
-            // `AdvertiseError::Timeout` below — giving passive scanners in
-            // range several chances to catch it before we move to the next.
+            // One advertising session per fragment, ending on `max_events` or
+            // the `timeout` backstop — both `AdvertiseError::Timeout` below.
             let advertisement = NonconnectableAdvertisement::NonscannableUndirected {
                 adv_data: &ad_buf[..n],
             };
@@ -280,9 +245,8 @@ impl LinkT for NrfBleLink {
     }
 
     async fn recv<'a>(&'a mut self) -> Result<Received<'a>, LinkError> {
-        // Keep consuming physical reports, feeding each into the
-        // reassembler, until *some* message completes — not necessarily the
-        // fragment just read, mirroring `rylr998::link::recv`.
+        // Keep consuming reports until *some* message completes — not
+        // necessarily the one the last fragment belonged to.
         loop {
             let report = self.reports.channel.receive().await;
             trace!(addr = ?report.addr, rssi = ?report.rssi, len = report.len, "rx report");

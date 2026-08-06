@@ -1,0 +1,47 @@
+[package]
+name = "wayfinder-nrf52840-dongle"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Independent workspace, for the same reason as bins/wayfinder-nrf52840: a
+# bare-metal target with its own linker script and panic handler, which must not
+# leak into the main workspace's host builds.
+[workspace]
+members = ["."]
+
+[profile.dev]
+opt-level = "s"
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[[bin]]
+name = "wayfinder-nrf52840-dongle"
+path = "src/main.rs"
+test = false
+doc = false
+bench = false
+
+[dependencies]
+# The same board-support crate the DK firmware uses; this crate is only the
+# dongle's pin map, flash layout and interrupt bindings.
+wayfinder-nrf = { path = "../../libs/wayfinder-nrf" }
+wayfinder = { path = "../../libs/wayfinder", default-features = false }
+tracing = { version = "0.1.44", default-features = false }
+embassy-executor = { version = "0.10", features = [
+    "platform-cortex-m",
+    "executor-thread",
+    "log",
+] }
+embassy-nrf = { version = "0.10.0", features = [
+    "nrf52840",
+    "time-driver-rtc1",
+    "gpiote",
+    "unstable-pac",
+    "log",
+] }
+cortex-m = "0.7"
+# Embassy's executor requires this to be a direct dependency.
+cortex-m-rt = "0.7"

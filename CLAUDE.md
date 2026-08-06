@@ -54,14 +54,19 @@ invocation from its own directory:
 - `libs/wayfinder-py` — a separate `[workspace]` (needs a linkable libpython;
   must not leak into the main host build). Host-testable: `cd libs/wayfinder-py
   && cargo nextest run`. Wired into CI's `test:run:python` job, alongside pytest.
-- `bins/wayfinder-nrf52840`, `bins/wayfinder-stm32f411` — separate
-  `[workspace]`s, `no_std`/`no_main` firmware binaries with `test = false`; a
-  host test harness can't link against them at all. Their logic is exercised
-  indirectly through the `libs/*` crates they wire together (tested in the
-  root workspace) plus CI's `build:embedded` job (cross-compile + clippy for
-  the real target). Only real/simulated hardware-in-the-loop (e.g.
-  `defmt-test` + `probe-rs`) could add genuine test coverage here — not set up
-  in this repo.
+- `bins/wayfinder-nrf52840`, `bins/wayfinder-nrf52840-dongle`,
+  `bins/wayfinder-stm32f411` — separate `[workspace]`s, `no_std`/`no_main`
+  firmware binaries with `test = false`; a host test harness can't link against
+  them at all. Their logic is exercised indirectly through the `libs/*` crates
+  they wire together (tested in the root workspace) plus CI's `build:embedded`
+  job (cross-compile + clippy for the real target). Only real/simulated
+  hardware-in-the-loop (e.g. `defmt-test` + `probe-rs`) could add genuine test
+  coverage here — not set up in this repo.
+- `libs/wayfinder-nrf` — the nRF board-support crate the two nRF firmwares
+  share. Not a workspace member (it depends on `nrf-softdevice`, which only
+  links for a real embedded target) and not its own `[workspace]` either — a
+  root-level `exclude`, pulled in by path from each board. Covered by the same
+  `build:embedded` job, through the boards that consume it.
 - `libs/*/fuzz` (`wayfinder`, `batman`, `wayfinder-auth`, `ieee802154`) —
   `cargo-fuzz` targets, not unit tests; run explicitly with `cargo fuzz run`,
   not part of any `nextest` invocation.
@@ -256,6 +261,18 @@ The workspace splits into the `no_std` routing core, radio drivers, host-side
   schedule, throughput/metrics, security tabs).
 - **bins/wayfinder-ctl** (`wayfinderctl`) — CLI mgmt client (query commands) +
   offline `cert` tooling + online `enroll`.
+
+**Bare-metal boards** (each binary its own `[workspace]`; see "Crates outside
+the root workspace" above)
+- **libs/wayfinder-nrf** → nRF52840 board support: the panic/HardFault
+  handling, stack painting, FICR identity, `MeshLink` enum, USB management
+  port, capacity profile and `node::run` bring-up sequence both nRF boards
+  share. A board binary is then only its pins, flash layout and `memory.x`.
+- **bins/wayfinder-nrf52840** — the DK (PCA10056).
+- **bins/wayfinder-nrf52840-dongle** — the dongle (PCA10059): no probe, no
+  LFXO, less flash. Logs are readable only over the USB management port.
+- **bins/wayfinder-stm32f411** — NUCLEO-F411RE, a LoRa-only relay on a
+  non-Nordic Cortex-M: the proof the driver is HAL-portable.
 
 ## Key design patterns
 

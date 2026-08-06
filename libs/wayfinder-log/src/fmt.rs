@@ -1,48 +1,38 @@
 //! The shared, transport-free line formatter behind both logging facades.
 //!
-//! Two facades reach RTT on the boards: `tracing` (the mesh stack's own
-//! records, via [`crate::rtt::RttSubscriber`]) and `log` (the third-party
-//! embedded crates — `embassy-*`, `nrf-softdevice` — whose `fmt.rs` facades
-//! emit `log` records when built with their `log` feature, via
-//! [`crate::rtt::RttLogger`]). Both render to the same one-line text shape so a
-//! single RTT reader shows one interleaved stream.
+//! The `tracing` and `log` facades both render to this one-line shape, so a
+//! single RTT reader sees one interleaved stream.
 //!
-//! Formatting lives here, apart from the `cfg(target_os = "none")` RTT
-//! transport, so it is exercised by host unit tests: building a `tracing`
-//! `Event` or a `log::Record` needs callsite machinery, but a [`LineBuf`] takes
-//! plain `Display`/`Debug` values and is directly testable.
+//! Kept apart from the `cfg(target_os = "none")` RTT transport so host unit
+//! tests exercise it: building a `tracing` `Event` or a `log::Record` needs
+//! callsite machinery, but a [`LineBuf`] takes plain `Display`/`Debug` values.
 
 use core::fmt::Arguments;
 use core::fmt::Debug;
 use core::fmt::Display;
 use core::fmt::Write;
 
-/// Longest event line rendered to RTT; anything past this is truncated. Shared
-/// by both facades this crate renders (the mesh stack's own `tracing` events
-/// and the `log` records forwarded from third-party embedded crates). Sized
-/// for a level + target + a handful of short structured fields (macs,
-/// lengths, seqnos) or a short preformatted message — never payload bytes.
+/// Longest event line rendered; anything past this is truncated. Sized for a
+/// level, a target, and a handful of short structured fields (macs, lengths,
+/// seqnos) — never payload bytes.
 pub(crate) const LINE_CAP: usize = 256;
 
 /// A fixed-capacity line under construction, rendered as
 /// `LEVEL target: message field=value …`.
 ///
-/// Every write is infallible from the caller's perspective: once the buffer
-/// fills, further output is silently discarded rather than reported. Logging is
-/// best-effort and must never fault the router, and an over-long line costs an
-/// operator a few trailing fields at worst.
+/// Every write is infallible from the caller's perspective: once full, further
+/// output is silently discarded. Logging is best-effort and must never fault
+/// the router.
 ///
-/// Truncation can land *inside* a value (a long field is cut off part-way, not
-/// dropped whole) because each `write!` issues several `write_str` calls and
-/// only the overflowing one is rejected. It never lands inside a multi-byte
-/// character, so the line is always valid UTF-8.
+/// Truncation can land *inside* a value, since each `write!` issues several
+/// `write_str` calls and only the overflowing one is rejected — but never
+/// inside a multi-byte character, so the line is always valid UTF-8.
 pub(crate) struct LineBuf {
     /// The whole rendered line, prefix included.
     line: heapless::String<LINE_CAP>,
-    /// Byte offset just past the `LEVEL target:` prefix, so the message body can
-    /// be handed to the ring without re-rendering it. The ring stores the level
-    /// and target as their own fields, so repeating them inside the message
-    /// would waste a third of every record's capacity.
+    /// Byte offset just past the `LEVEL target:` prefix, so the ring can take
+    /// the body without re-rendering it — it stores level and target as their
+    /// own fields, and repeating them would waste a third of a record.
     prefix_len: usize,
 }
 
@@ -84,13 +74,10 @@ impl LineBuf {
         &self.line
     }
 
-    /// Just the message and fields, without the `LEVEL target:` prefix — what a
-    /// structured sink (the ring) stores, since it carries the level and target
-    /// in their own fields.
-    ///
-    /// Falls back to the empty string if the prefix itself was truncated, which
-    /// takes a target longer than the whole line budget. That costs a record its
-    /// message rather than panicking on a slice outside the buffer.
+    /// Just the message and fields, without the `LEVEL target:` prefix — what
+    /// the ring stores. Falls back to the empty string when the prefix itself
+    /// was truncated (a target longer than the whole line budget), costing a
+    /// record its message rather than panicking on an out-of-range slice.
     pub(crate) fn body(&self) -> &str {
         self.line
             .get(self.prefix_len..)

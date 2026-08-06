@@ -10,12 +10,9 @@
 //! reserves for testing and never assigns to a vendor, which is why it's
 //! usable here without registering one.
 //!
-//! Only the bare-metal backend builds and parses this framing itself; the
-//! BlueZ one has the host stack do it from
-//! `Advertisement::manufacturer_data` (see `crate::std_link`) and never calls
-//! in here except for [`MESH_COMPANY_ID`]. Hence the `dead_code` allowance
-//! below — off a `hardware` build, only this module's own tests exercise the
-//! rest.
+//! Only the bare-metal backend builds and parses this framing itself; BlueZ
+//! does it for the other, which touches nothing here but [`MESH_COMPANY_ID`].
+//! Hence the `dead_code` allowance below.
 
 #![cfg_attr(not(feature = "hardware"), allow(dead_code))]
 
@@ -23,32 +20,29 @@
 /// numbers).
 const AD_TYPE_MANUFACTURER_SPECIFIC: u8 = 0xFF;
 
-/// TOOD(bjc) this should be configurable like we have for ethernet
 /// Marker tag (not a real Bluetooth SIG company id — see the module doc)
 /// distinguishing this mesh's advertisements from ambient BLE traffic.
+///
+/// TODO(bjc): make this configurable, as the ethernet side already is.
 pub const MESH_COMPANY_ID: u16 = 0xFFFF;
 
 /// Bytes of AD-structure framing prefixed to a fragment's bytes: 1 length
 /// byte + 1 type byte + 2 company-id bytes.
 const AD_HDR_LEN: usize = 4;
 
-/// Largest fragment payload (`[frag_header][body]` from
-/// `wayfinder_link_utils`) one AD structure can carry — bounded by the
-/// length byte's `u8` range, which also covers the type and company-id
-/// bytes. This is the wire format's own ceiling; the actual transport
-/// budget on legacy BLE advertising is far smaller — see
+/// The wire format's own ceiling on a fragment payload, bounded by the length
+/// byte's `u8` range. The transport budget is far smaller — see
 /// [`MAX_LEGACY_FRAGMENT_LEN`].
 pub const MAX_FRAGMENT_LEN: usize = u8::MAX as usize - (AD_HDR_LEN - 1);
 
 /// Largest total advertising-data length a legacy (non-extended) BLE
-/// advertisement can carry (Bluetooth Core Spec, Vol 6, Part B, §2.3.4.9) —
-/// the hard cap this crate stays within by fragmenting aggressively, rather
-/// than using extended advertising's much larger per-PDU budget; see
-/// `libs/blue/CLAUDE.md` for why extended advertising isn't used here.
-/// `nrf_softdevice::ble::peripheral::start_adv` doesn't itself truncate or
-/// reject an oversized buffer (it only asserts `data.len() < u16::MAX`) —
-/// the SoftDevice firmware is what would reject a legacy advertisement
-/// exceeding this, so this crate must stay under the cap on its own.
+/// advertisement carries (Core Spec, Vol 6, Part B, §2.3.4.9). This crate
+/// fragments aggressively to stay within it rather than using extended
+/// advertising; see `libs/blue/CLAUDE.md`.
+///
+/// Nothing on the way down enforces it — `peripheral::start_adv` only asserts
+/// `len < u16::MAX`, and the SoftDevice firmware is what rejects an oversized
+/// legacy advertisement — so this crate must stay under the cap itself.
 pub const MAX_LEGACY_ADV_DATA_LEN: usize = 31;
 
 /// Largest fragment payload that fits one legacy advertisement, once our AD

@@ -5,20 +5,14 @@
 //! on the nRF, a socket on a host node. On a board with no debug probe attached
 //! this is the only way its logs are observable at all.
 //!
-//! # Why a ring, polled, rather than a stream
+//! A polled ring rather than a stream: the management protocol is strictly one
+//! request to one response, and a stream would only show what happened while
+//! someone was watching — the wrong property for the case this exists to serve,
+//! plugging into a node *after* it misbehaved.
 //!
-//! The management protocol is strictly one request to one response
-//! (`wayfinder_server::serve`), and a stream would have to break that for every
-//! client. More importantly a stream only shows what happened while someone was
-//! watching, which is the wrong property for the case this exists to serve:
-//! plugging into a node *after* it misbehaved and asking what it just did. A
-//! bounded ring answers that, and bounds its own cost while doing it.
-//!
-//! Records are never dropped in favour of a slow reader: at capacity the oldest
-//! is evicted, so a client that stops polling — or was never attached — can
-//! never exert backpressure on the router. What a caller missed is reported to
-//! it explicitly rather than the gap silently closing up; see
-//! [`LogSnapshot::dropped`].
+//! At capacity the oldest record is evicted, so a client that stops polling can
+//! never exert backpressure on the router. The resulting gap is reported
+//! explicitly rather than closing over silently; see [`LogSnapshot::dropped`].
 
 use alloc::vec::Vec;
 
@@ -26,11 +20,9 @@ use crate::filter::Level;
 use crate::filter::TARGET_CAP;
 use crate::sync::Lock;
 
-/// Longest message retained per record, in bytes.
-///
-/// A record's message is the rendered event text plus its structured fields —
-/// macs, lengths, seqnos — and never payload bytes, so this is generous for
-/// what this project's logging rules actually permit on the wire.
+/// Longest message retained per record, in bytes. Generous for the rendered
+/// text plus structured fields this project's logging rules permit — macs,
+/// lengths, seqnos, never payload bytes.
 pub const MESSAGE_CAP: usize = 160;
 
 /// Records retained before the oldest is evicted.
@@ -55,12 +47,8 @@ pub struct LogRecord {
     /// A client polls with the last [`LogSnapshot::next_seq`] it was handed, so
     /// it sees each record exactly once.
     pub seq: u64,
-    /// Milliseconds since boot, at the moment the record was emitted.
-    ///
-    /// Uptime rather than wall-clock time because it is the one reading
-    /// available identically on both targets — a board has no RTC and no notion
-    /// of the epoch — and because it is what correlates with the mesh's own
-    /// timers (Trickle intervals, keep-alive cadences).
+    /// Milliseconds since boot, at the moment the record was emitted. See
+    /// [`crate::clock`] for why uptime rather than wall-clock time.
     pub uptime_ms: u64,
     /// The record's verbosity.
     pub level: Level,
@@ -85,11 +73,8 @@ pub struct LogSnapshot {
     pub dropped: u64,
 }
 
-/// Truncate `s` to at most `N` bytes on a character boundary.
-///
-/// Truncating rather than rejecting: a record with a clipped tail is still worth
-/// having, and logging must never fail. Splitting on a boundary keeps the result
-/// valid UTF-8, which the protobuf `string` field it ends up in requires.
+/// Truncate `s` to at most `N` bytes on a character boundary — logging must
+/// never fail, and the protobuf `string` this ends up in requires valid UTF-8.
 fn truncated<const N: usize>(s: &str) -> heapless::String<N> {
     let mut end = s.len().min(N);
     while !s.is_char_boundary(end) {

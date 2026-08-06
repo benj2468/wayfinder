@@ -5,25 +5,20 @@ edition = "2024"
 publish = false
 
 # Independent workspace: this crate cross-compiles to a bare-metal target
-# (thumbv7em-none-eabihf, see .cargo/config.toml) with its own linker script
-# and panic handler, which must not leak into the main workspace's host
-# builds — the same reason libs/wayfinder/fuzz does this.
+# (thumbv7em-none-eabihf, see .cargo/config.toml) with its own linker script and
+# panic handler, which must not leak into the main workspace's host builds.
 [workspace]
 members = ["."]
 
-# Bare-metal `no_std` has no unwinder, so panic must abort (not unwind) or the
-# compiler rejects the landing pads it would otherwise emit at low opt-levels
-# ("unwinding panics are not supported without std" — hit under `cargo clippy`
-# and unoptimized builds). `main.rs`'s own `#[panic_handler]` supplies the
-# handler (RTT-logging, see its doc comment); abort just drops the unwinding
+# Bare-metal `no_std` has no unwinder, so panic must abort or the compiler
+# rejects the landing pads it would emit at low opt-levels. `wayfinder-nrf`'s
+# `#[panic_handler]` supplies the handler; abort just drops the unwinding
 # machinery.
 #
-# A fully-unoptimized debug image of this firmware (mgmt server + prost + the
-# crypto stack all linked in) is also ~1 MiB and no longer fits the 1016 KiB
-# `FLASH` region once the top two pages are reserved for the durable identity
-# store (see `memory.x`). Optimizing for size in dev too — standard practice
-# for embedded targets — keeps debuginfo but shrinks the image well under the
-# limit, so `cargo build` (not just `--release`) links.
+# A fully-unoptimized debug image (mgmt server + prost + the crypto stack) is
+# ~1 MiB and no longer fits `FLASH` once the top two pages are reserved for the
+# durable identity store. Optimizing for size in dev too keeps debuginfo but
+# shrinks the image well under the limit, so `cargo build` links.
 [profile.dev]
 opt-level = "s"
 panic = "abort"
@@ -31,9 +26,7 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 
-# `#[no_std]`/`#[no_main]` can't build the host `test` harness (no `std` to
-# link the harness against) — `cargo test`/`clippy --all-targets` would
-# otherwise try and fail. Same reason libs/wayfinder/fuzz sets this.
+# `#[no_std]`/`#[no_main]` can't build the host `test` harness.
 [[bin]]
 name = "wayfinder-nrf52840"
 path = "src/main.rs"
@@ -42,53 +35,17 @@ doc = false
 bench = false
 
 [dependencies]
+# Everything not specific to this board: fault handling, stack measurement,
+# identity, the link enum, the USB management port, the capacity profile and the
+# bring-up sequence. Shared with the dongle firmware.
+wayfinder-nrf = { path = "../../libs/wayfinder-nrf" }
 wayfinder = { path = "../../libs/wayfinder", default-features = false }
-# The HAL-agnostic embedded driver that runs the router loop, and the RYLR998
-# LoRa driver whose `RylrClient` is one of this board's two mesh `LinkT`s
-# (dispatched via `main.rs`'s `MeshLink` enum, alongside `blue`).  `mgmt`
-# adds the event-loop arm that serves management-API queries, which this board
-# reaches over USB CDC-ACM (see `src/usb_mgmt.rs`).
-wayfinder-embedded-driver = { path = "../../libs/wayfinder-embedded-driver", features = [
-    "mgmt",
-] }
-# The `no_std` management transport: the `EmbeddedQueryChannel` bridging the
-# serve loop to the driver, and the `serve` loop that frames requests over a
-# byte stream.  Only its `embedded` feature — no `std`/tokio.
-wayfinder-server = { path = "../../libs/wayfinder-server", default-features = false, features = [
-    "embedded",
-] }
-# The flash-backed `DurableStore` (`FlashStore`) that persists this node's
-# self-assigned mesh identity across reboots. `flash` pulls in the
-# `embedded-storage` NorFlash backend; `std`/`FileStore` stay off.
-wayfinder-storage = { path = "../../libs/wayfinder-storage", default-features = false, features = [
-    "flash",
-] }
-# `NoopRawMutex` for the single-core query channel, and `join` to run the mesh
-# loop and the management serve loop concurrently on the one executor task.
-embassy-sync = "0.8.0"
-embassy-futures = "0.1.2"
-# Installs the RTT `tracing` subscriber so the mesh stack's `trace!`/`warn!`
-# records are observable over the debug probe (they are otherwise dropped).
-wayfinder-log = { path = "../../libs/wayfinder-log" }
-rylr998 = { path = "../../libs/rylr998", features = ["link"] }
-# `Read`/`Write` bound on `MeshLink<S>`'s generic serial type parameter.
-embedded-io-async = "0.7.0"
-# For `warn!` on a fatal bring-up error; `std` off (routed to RTT by
-# `wayfinder-log`).
 tracing = { version = "0.1.44", default-features = false }
-# Still linked so this one binary also fully compiles the board's on-air 802.15.4
-# radio adapter (and transitively the rest of the no_std stack) for the real
-# target — never wired into `Driver::new`'s link array, since it shares the
-# RADIO peripheral with `blue` and this board only ever wires up LoRa + BLE.
-nrf-ieee802154 = { path = "../../libs/nrf-ieee802154" }
-# The board's second concurrently-active mesh interface: connectionless BLE
-# advertising broadcast over the chip's built-in 2.4GHz radio (`hardware`
-# pulls in `nrf-softdevice` — see `libs/blue/CLAUDE.md`). Mutually
-# exclusive with `nrf-ieee802154` ever being wired live (RADIO-peripheral
-# conflict), which is fine since 802.15.4 isn't wired live here.
-blue = { path = "../../libs/blue", default-features = false, features = ["hardware", "softdevice-log"] }
-# `time-driver-rtc1` backs `embassy-time` (the driver's `Clock`); `gpiote` +
-# `unstable-pac` are pulled in by the HAL for GPIO/UARTE.
+embassy-executor = { version = "0.10", features = [
+    "platform-cortex-m",
+    "executor-thread",
+    "log",
+] }
 embassy-nrf = { version = "0.10.0", features = [
     "nrf52840",
     "time-driver-rtc1",
@@ -96,81 +53,6 @@ embassy-nrf = { version = "0.10.0", features = [
     "unstable-pac",
     "log",
 ] }
-# 0.10 (bumped from 0.9): required to spawn `blue`'s SoftDevice
-# event-pump/scan-loop background tasks, which are pinned to 0.10 — see
-# `libs/blue/CLAUDE.md`. `embassy-nrf`/the rest of this board's bring-up
-# didn't need to move, since `nrf-softdevice` has no `embassy-nrf` dependency.
-# Deliberately *not* `executor-interrupt`: `blue`'s `SdHandle`/`ReportQueue`
-# carry hand-written `unsafe impl Send`/`Sync` whose soundness rests on this
-# firmware running one executor on one core, with no preemption between tasks
-# (`ReportQueue` uses a `NoopRawMutex`, which does no critical-section work at
-# all). An `InterruptExecutor` preempts thread mode at NVIC priority and would
-# silently invalidate that. Enabling the feature is the tripwire — if a future
-# change needs it, `ReportQueue` must move to `CriticalSectionRawMutex` first.
-embassy-executor = { version = "0.10", features = [
-    "platform-cortex-m",
-    "executor-thread",
-    "log",
-] }
-embassy-time = { version = "0.5.1", features = ["log"] }
-# **Deliberately without `critical-section-single-core`.** That feature registers
-# a `critical-section` impl whose `acquire` is a bare `cpsid i` — it masks *every*
-# interrupt, the SoftDevice's priority-0/1 RADIO/RTC0/TIMER0 included. This board
-# takes a critical section on paths that run constantly (every log record, via
-# `wayfinder-log`'s `Lock` and `rtt-target`'s print mutex; every heap
-# alloc/dealloc, via `embedded-alloc`), so with that impl the radio is starved for
-# the length of each one and the SoftDevice eventually trips its own timing
-# assertion — the `NRF_FAULT_ID_SD_ASSERT` panic ("disabling interrupts for too
-# long"), intermittently, once the run loop starts logging. The
-# SoftDevice-compatible impl comes from `nrf-softdevice/critical-section-impl`
-# below instead, which masks only non-reserved IRQs. The two are mutually
-# exclusive: both call `critical_section::set_impl!`, so enabling this feature
-# again would fail to link rather than silently regress.
 cortex-m = "0.7"
-# Embassy Executor requires this to be a dependency
+# Embassy's executor requires this to be a direct dependency.
 cortex-m-rt = "0.7"
-# `tracing-core` (pulled in via `tracing`, used throughout the mesh stack for
-# logging) does an unconditional `extern crate alloc;` regardless of feature
-# flags, so any binary linking this dependency graph needs a real allocator.
-embedded-alloc = "0.6"
-# Backs `main.rs`'s `#[panic_handler]`: prints the panic message over RTT
-# before halting. Pinned to the same 0.5 already resolved via
-# `wayfinder-log`'s RTT transport — the panic handler reuses that
-# crate's already-initialized print channel rather than opening a second one,
-# so the version must match (a mismatched version, e.g. the `panic-rtt-target`
-# crate's 0.6 requirement, would pull in a second RTT control block instead of
-# writing to the one already set up).
-rtt-target = "0.5"
-# The USB device stack behind the management interface (`src/usb_mgmt.rs`):
-# `Builder`/`UsbDevice` plus the CDC-ACM class, whose `Sender`/`BufferedReceiver`
-# already implement `embedded-io-async`'s `Write`/`Read` — the same byte-stream
-# traits `wayfinder-server`'s `serve` loop frames requests over, so the class
-# drops straight in where the old VCOM UART used to sit. `default-features =
-# false` drops the crate's default `usbd-hid` class (unused here — this board
-# only speaks CDC-ACM), which otherwise pulls in a second, unrelated `heapless`
-# version alongside the workspace's.
-embassy-usb = { version = "0.6.0", default-features = false }
-# Direct dependency for the SoftDevice syscalls the USB path needs and the BLE
-# link has no reason to make: `sd_power_usb*_enable`/`sd_power_usbregstatus_get`
-# (VBUS state, since the `POWER` peripheral is reserved once the SoftDevice is
-# enabled) and `sd_clock_hfclk_request` (USBD needs the external crystal). Cargo
-# unifies this with `blue`'s optional copy of the same git dependency, so this
-# does not pull in a second SoftDevice or change which BLE roles are compiled in.
-#
-# `critical-section-impl` registers the whole-binary `critical-section` provider,
-# and it must be this crate's rather than `cortex-m`'s (see the note there):
-# `acquire` saves and clears the NVIC enable bits for everything *except* the
-# nine IRQs the SoftDevice reserves (RADIO, RTC0, TIMER0, POWER_CLOCK, RNG, ECB,
-# CCM_AAR, TEMP, SWI5_EGU5), so radio timing keeps being serviced inside a
-# critical section. Every `critical_section::with` in the binary — logging, the
-# global allocator, `embassy-sync` — goes through it, which is why the choice is
-# a whole-image property and not a per-call-site one.
-nrf-softdevice = { git = "https://github.com/embassy-rs/nrf-softdevice.git", features = [
-    "nrf52840",
-    "s140",
-    "critical-section-impl",
-] }
-# `'static` promotion for the USB stack's descriptor/control buffers and the
-# CDC-ACM class state, all of which `embassy-usb`'s builder borrows for the
-# lifetime of the device. Same crate `blue` already uses for its report queue.
-static_cell = "2"

@@ -1,6 +1,5 @@
 //! `std`-backed [`DurableStore`]: a file, written atomically via a `.tmp`
-//! sibling + `rename`, mirroring `wayfinder-server`'s existing `CaLog`
-//! atomic-write behavior (extracted from it, not reinvented).
+//! sibling + `rename`.
 
 use std::io::Write;
 use std::io::{self};
@@ -11,28 +10,17 @@ use crate::DurableStore;
 
 /// A [`DurableStore`] backed by a single file at a fixed path.
 ///
-/// `save` writes to a `.tmp` sibling in the same directory, flushes it, then
-/// renames it over the target — atomic on the same filesystem, so a crash
-/// mid-write can only ever leave the previous blob (or nothing, on the very
-/// first save) at the target path, never a torn one. On any failure the
-/// `.tmp` sibling is best-effort removed so repeated failures don't leave
-/// stale partial files behind — if that best-effort cleanup itself fails
-/// (e.g. the same disk-full condition that doomed the write also blocks the
-/// unlink), it's logged (`warn!`) but not escalated: the original write
-/// failure is still what's returned, and a lingering `.tmp` file costs disk
-/// space, not correctness (the next successful `save` overwrites it, and
-/// `load` never looks at `.tmp` paths).
+/// `save` writes to a `.tmp` sibling, flushes it, then renames it over the
+/// target — atomic on the same filesystem, so a crash mid-write leaves the
+/// previous blob (or nothing, on the first save), never a torn one. A failure
+/// best-effort removes the `.tmp`; if even that fails, it is logged and the
+/// original write error returned, since a lingering `.tmp` costs disk space
+/// rather than correctness.
 ///
-/// Blocking (see [`DurableStore`]'s own doc for why this trait is sync, not
-/// async): `load`/`save` block the calling thread for the duration of the
-/// I/O, exactly as any other direct `std::fs` call in this workspace does.
-///
-/// Deliberately not `fsync`ed at the parent-directory level: the directory's
-/// own metadata (that the rename landed) isn't flushed, so a *power loss*
-/// (as opposed to a process crash) immediately after a rename could in
-/// principle still lose the rename on some filesystems. Accepted, carried
-/// forward unchanged from the behavior this type was extracted from
-/// (`wayfinder-server`'s prior `save_atomic`) — not a gap introduced here.
+/// Deliberately not `fsync`ed at the parent-directory level: the rename's own
+/// metadata is not flushed, so a power loss immediately after one could still
+/// lose it on some filesystems. Accepted, and carried forward unchanged from
+/// the `save_atomic` this was extracted from.
 pub struct FileStore {
     path: PathBuf,
 }
@@ -44,9 +32,9 @@ impl FileStore {
         Self { path: path.into() }
     }
 
-    /// The path this store is backed by, for callers that want to name it in
-    /// their own error/log messages (this type's own [`DurableStore::Error`]
-    /// is a bare [`io::Error`] and so can't include it).
+    /// The path this store is backed by, for callers naming it in their own
+    /// messages — this type's [`DurableStore::Error`] is a bare [`io::Error`],
+    /// which cannot carry it.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -86,10 +74,9 @@ impl DurableStore for FileStore {
             && let Err(cleanup_err) = std::fs::remove_file(&tmp_path)
             && cleanup_err.kind() != io::ErrorKind::NotFound
         {
-            // `NotFound` just means the write failed before ever creating
-            // the `.tmp` file (e.g. the target directory doesn't exist) —
-            // nothing to clean up, not a cleanup failure. Anything else
-            // means a `.tmp` file genuinely exists and couldn't be removed.
+            // `NotFound` means the write failed before creating the `.tmp` at
+            // all — nothing to clean up. Anything else means one exists and
+            // could not be removed.
             tracing::warn!(
                 path = %tmp_path.display(),
                 write_error = %write_err,

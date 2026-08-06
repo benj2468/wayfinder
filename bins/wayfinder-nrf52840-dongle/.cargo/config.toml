@@ -1,0 +1,17 @@
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+# `flip-link` moves the stack *below* the statics instead of leaving it at the
+# top of RAM growing down into them. Without it a stack overflow on this part is
+# silent — there is no MPU guard region, so the descending stack scribbles over
+# `.uninit`, then `.bss`, and the fault surfaces somewhere unrelated or not at
+# all. It is also a prerequisite for `wayfinder_nrf`'s diagnostics: `.uninit`
+# holds the retained fault record, and `stack::paint` disables itself if this
+# linker is ever dropped.
+linker = "flip-link"
+rustflags = ["-C", "link-arg=-Tlink.x"]
+# The dongle has no onboard debugger, so this only works with an SWD probe wired
+# to its castellated pads. The probe-less path is DFU over the Open Bootloader —
+# see `libs/wayfinder-nrf/CLAUDE.md`.
+runner = "probe-rs run --chip nRF52840_xxAA --allow-erase-all"

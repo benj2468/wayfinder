@@ -9,59 +9,28 @@
 //!   serves `GetLogs` from.
 //! - `fmt` — the line formatter both facades render through.
 //!
-//! # Reading a board's logs without a probe
+//! Every record goes to both a text sink and the ring. The ring is not a
+//! convenience: RTT needs a debug probe, which an nRF52840 dongle does not have
+//! and any board lacks the moment its cable is out, so `GetLogs` over the
+//! node's own transport is what makes a deployed node observable at all.
 //!
-//! The mesh stack logs through [`tracing`] on every target, but a bare-metal
-//! board has no subscriber installed by default, so `tracing`'s dispatcher
-//! drops every record — the `trace!`/`warn!` calls in the shared router core,
-//! embedded driver, and radio drivers produce no output on hardware. [`init`]
-//! installs one that formats each event onto RTT (Real-Time Transfer), which a
-//! host reads over the debug probe (e.g. `probe-rs rtt`).
+//! Two non-obvious consequences of that split:
 //!
-//! RTT needs that probe, which is exactly what an nRF52840 **dongle** does not
-//! have — and on any board, it is unavailable the moment the debug cable is
-//! not attached. So every record also goes into the ring, which the management
-//! API serves over whatever transport the node already speaks (USB CDC-ACM on
-//! the nRF, a socket on a host). That is what makes a deployed node's logs
-//! readable at all.
-//!
-//! The subscriber is deliberately tiny and heap-free: each event renders into a
-//! fixed stack buffer (spans are ignored beyond issuing ids), so it costs no
-//! `alloc` beyond what `tracing-core`'s dispatcher already uses. It reuses the
-//! maintained [`rtt-target`] (transport) and [`tracing-core`] (subscriber trait)
-//! crates rather than reimplementing either.
-//!
-//! # Third-party crates log through `log`, not `tracing`
-//!
-//! Only wayfinder's own crates use `tracing`. The third-party embedded crates
-//! ([`embassy-nrf`] and the rest of `embassy-*`, [`nrf-softdevice`]) log through
-//! the embassy `fmt.rs` facade, which emits `defmt` or `log` records depending
-//! on which of those two features is enabled — and *nothing at all* when
-//! neither is, which is why their diagnostics are invisible by default.
-//!
-//! [`init`] therefore also installs a `log` sink on the same RTT channel, so
-//! enabling those crates' `log` feature surfaces their records alongside the
-//! mesh stack's own. Their `defmt` feature is deliberately *not* used: `defmt`
-//! defers formatting to a host decoder holding the ELF, so its records cannot be
-//! rendered to text on-device, and its `defmt-rtt` transport defines a second
-//! `_SEGGER_RTT` control block that collides with [`rtt-target`]'s — a probe
-//! finds only one of the two.
-//!
-//! [`embassy-nrf`]: https://docs.rs/embassy-nrf
-//! [`nrf-softdevice`]: https://github.com/embassy-rs/nrf-softdevice
-//!
-//! # On the host
+//! - The bare-metal subscriber renders each event into a fixed stack buffer and
+//!   ignores spans beyond issuing ids, so it costs no `alloc` of its own.
+//! - The embedded third-party crates (`embassy-*`, `nrf-softdevice`) emit
+//!   through `log`, not `tracing`, and nothing at all unless their `log`
+//!   feature is on — hence the second sink [`init`] installs. Their `defmt`
+//!   feature must stay off: it cannot render to text on-device, and
+//!   `defmt-rtt` defines a second `_SEGGER_RTT` control block that collides
+//!   with [`rtt-target`]'s, leaving a probe to find only one of the two.
 //!
 //! On non-bare-metal targets [`init`] is a no-op — the RTT backend cannot link
 //! there — but the filter and the ring are fully live, so this stays a
-//! host-buildable workspace member that `wayfinder-server` reads and
-//! `cargo test` covers. A host *node* installs the equivalent facade with
-//! [`subscriber::init`], behind the `subscriber` feature, and thereby serves the
-//! same `GetLogs` a board does.
+//! host-buildable workspace member. A host *node* installs the equivalent
+//! facade with [`subscriber::init`], behind the `subscriber` feature.
 //!
-//! [`tracing`]: https://docs.rs/tracing
 //! [`rtt-target`]: https://docs.rs/rtt-target
-//! [`tracing-core`]: https://docs.rs/tracing-core
 #![cfg_attr(target_os = "none", no_std)]
 // `unwrap`/`expect` are denied workspace-wide in production code; tests opt back
 // out, matching every other crate here.

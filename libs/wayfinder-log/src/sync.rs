@@ -1,21 +1,12 @@
 //! The one mutual-exclusion primitive this crate's global state is guarded by,
-//! in the two forms the two targets can supply.
-//!
-//! Neither implementation is exotic; what matters is that the *same* call sites
-//! work on both. A bare-metal board has no `std::sync`, and a host has no
-//! `critical-section` implementation registered (that comes from
-//! `cortex-m/critical-section-single-core` on the boards), so a single choice
-//! would break one target or the other.
-//!
-//! # Why a critical section is affordable here
+//! in the two forms the two targets can supply. A board has no `std::sync`; a
+//! host has no registered `critical-section` implementation.
 //!
 //! Masking interrupts is not free on a board running the SoftDevice, whose radio
-//! timing depends on being serviced promptly. Every [`Lock`] in this crate is
-//! therefore taken *after* the lock-free level gate in [`crate::filter`] has
-//! already passed — that is, only for records that are about to be formatted and
-//! written to RTT anyway, which costs far more than the lock does. Rejected
-//! records (the overwhelming majority when the filter is at `info` and the mesh
-//! is busy) never reach a [`Lock`] at all.
+//! timing depends on prompt servicing. Every [`Lock`] here is therefore taken
+//! *after* the lock-free level gate in [`crate::filter`] — only for records
+//! already committed to being formatted and written, which costs more than the
+//! lock does. Rejected records never reach a [`Lock`] at all.
 
 /// A mutex around global logging state, with the same API on both targets.
 ///
