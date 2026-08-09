@@ -32,44 +32,9 @@ use interfaces::link::LinkError;
 use interfaces::link::LinkMetrics;
 use zerocopy::FromBytes;
 
-/// Length of the Ethernet header preceding the payload: `[dst: 6][src: 6][ethertype: 2]`.
-const ETH_HEADER_LEN: usize = 14;
-
-/// Byte offset of the EtherType field within the Ethernet header, i.e. just
-/// past the destination and source MACs.  This is the same offset as
-/// [`LinkFrame::protocol`], which is what lets the receive side retag the field
-/// in place (see [`retag_ethertype`]).
-const ETHERTYPE_OFFSET: usize = 12;
-
-/// Serialize `origin` + `data` as an Ethernet frame into `buf`, returning its
-/// length, or `None` when the framed frame would not fit `buf`.
-///
-/// Wire layout `[dst: Mac][src: Mac][ethertype: u16 BE][payload]` — identical to
-/// the [`LinkFrame`] layout, but the EtherType stamped is the link's configured
-/// wire `ethertype` (a transport label the `AF_PACKET` socket binds/filters on,
-/// e.g. `0xfafa`), *not* `data.protocol`.  The mesh protocol the router demuxes
-/// on (e.g. BATMAN `0x4305`) is restored on the receive side by [`retag_ethertype`],
-/// so a deployment can pick any wire EtherType with no per-frame overhead.
-///
-/// The length check returns `None` rather than panicking on an out-of-bounds
-/// copy: a frame larger than `buf` (only reachable with an over-large host MTU
-/// plus the auth trailer) is dropped by the caller, never crashing the link task.
-fn frame_into_buf(
-    origin: Mac,
-    ethertype: u16,
-    data: &LinkFrameData<'_>,
-    buf: &mut [u8],
-) -> Option<usize> {
-    let end = ETH_HEADER_LEN + data.payload.len();
-    if end > buf.len() {
-        return None;
-    }
-    buf[0..6].copy_from_slice(&data.dst.0);
-    buf[6..12].copy_from_slice(&origin.0);
-    buf[ETHERTYPE_OFFSET..ETH_HEADER_LEN].copy_from_slice(&ethertype.to_be_bytes());
-    buf[ETH_HEADER_LEN..end].copy_from_slice(data.payload);
-    Some(end)
-}
+use crate::wire::ETH_HEADER_LEN;
+use crate::wire::ETHERTYPE_OFFSET;
+use crate::wire::frame_into_buf;
 
 /// Rewrite a received frame's EtherType field to `protocol`, in place.
 ///
@@ -108,6 +73,11 @@ pub use tokio_impl::RawL2Link;
 pub use tokio_impl::build_raw_ip_link;
 #[cfg(feature = "tokio")]
 pub use tokio_impl::build_raw_l2_link;
+// Shared with the multi-access UDP link (`net::build_udp_multi_link`), which
+// needs the same NIC-name -> ifindex resolution to join an IPv6 multicast
+// group on a specific interface.
+#[cfg(feature = "tokio")]
+pub(crate) use tokio_impl::interface_index;
 
 #[cfg(feature = "tokio")]
 mod tokio_impl {
@@ -213,7 +183,7 @@ mod tokio_impl {
     }
 
     /// Resolve a NIC name (e.g. `"eth0"`) to its kernel interface index.
-    fn interface_index(name: &str) -> anyhow::Result<u32> {
+    pub(crate) fn interface_index(name: &str) -> anyhow::Result<u32> {
         let cstr = std::ffi::CString::new(name)?;
         // SAFETY: `cstr` is a valid NUL-terminated C string for the duration of
         // the call.
@@ -435,32 +405,6 @@ mod tests {
         Mac([0, 0, 0, 0, 0, n])
     }
 
-    /// `frame_into_buf` lays down a genuine Ethernet frame: destination, source,
-    /// the configurable **wire EtherType** (big-endian), then the payload.  The
-    /// stamped EtherType is the configured transport label, *not* `data.protocol`
-    /// — there is no per-frame overhead.
-    #[test]
-    fn frame_into_buf_stamps_configured_ethertype() {
-        let mut buf = [0u8; 64];
-        let payload = [0xde, 0xad, 0xbe, 0xef];
-        let n = frame_into_buf(
-            mac(1),
-            0xfafa, // configured wire EtherType (a transport label)
-            &LinkFrameData {
-                dst: mac(2),
-                protocol: 0x4305, // mesh protocol — NOT what goes on the wire
-                payload: &payload,
-            },
-            &mut buf,
-        )
-        .expect("frame fits buffer");
-        assert_eq!(n, ETH_HEADER_LEN + payload.len());
-        assert_eq!(&buf[0..6], &mac(2).0); // Ethernet destination
-        assert_eq!(&buf[6..12], &mac(1).0); // Ethernet source
-        assert_eq!(&buf[12..14], &[0xfa, 0xfa]); // wire EtherType = configured label
-        assert_eq!(&buf[14..n], &payload);
-    }
-
     /// A frame sent under a custom wire EtherType retags on receive into a
     /// `LinkFrame` whose `protocol` is the *mesh* protocol (not the wire
     /// EtherType), so the router demuxes it correctly even though the wire
@@ -515,27 +459,6 @@ mod tests {
         assert_eq!(frame.src, mac(3));
         assert_eq!(frame.protocol.get(), 0x4305);
         assert!(frame.payload.is_empty());
-    }
-
-    /// A payload that would overrun the buffer yields `None` (a drop) instead of
-    /// panicking on the out-of-bounds copy — the link task must survive an
-    /// over-large frame rather than aborting.
-    #[test]
-    fn frame_into_buf_rejects_oversize_payload() {
-        let mut buf = [0u8; 32];
-        // 32 - 14 header = 18 bytes fit; 19 does not.
-        let payload = [0u8; 19];
-        let out = frame_into_buf(
-            mac(1),
-            0xfafa,
-            &LinkFrameData {
-                dst: mac(2),
-                protocol: 0x4305,
-                payload: &payload,
-            },
-            &mut buf,
-        );
-        assert_eq!(out, None);
     }
 
     /// A minimal (no-options) IPv4 header is 20 bytes, so the payload begins at

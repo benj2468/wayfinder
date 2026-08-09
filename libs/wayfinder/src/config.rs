@@ -65,6 +65,28 @@ pub enum LinkTransport {
         /// Remote peer the socket is connected to (send/recv target).
         remote_addr: SocketAddr,
     },
+    /// Carry the link over an unconnected UDP socket that reaches every peer
+    /// on a shared IP network without a static remote address: the UDP analog
+    /// of [`RawL2`](LinkTransport::RawL2), for when `CAP_NET_RAW` isn't
+    /// available or the peers aren't on the same L2 broadcast domain. Needs no
+    /// special privilege, unlike `RawL2`/`RawIp`.
+    UdpMulti {
+        /// Local address the socket binds to.
+        bind_addr: SocketAddr,
+        /// Where a [`Mac::BROADCAST`](interfaces::frame::Mac::BROADCAST)/
+        /// multicast-destined frame is sent: an IPv4 broadcast address (the
+        /// socket enables `SO_BROADCAST`), or an IPv6 multicast group (the
+        /// socket joins it on `multicast_interface`). Every other destination
+        /// is reached once its transport address has been learned from a
+        /// received frame — in practice, the periodic OGM every mesh node
+        /// broadcasts — so there is nothing else to configure per peer.
+        discovery_addr: SocketAddr,
+        /// NIC to join the IPv6 multicast group on. Required when
+        /// `discovery_addr` is an IPv6 multicast address (IPv6 multicast is
+        /// scoped to an interface, unlike IPv4 broadcast); ignored otherwise.
+        #[serde(default)]
+        multicast_interface: Option<String>,
+    },
     /// Carry the link over a raw IP socket (`AF_INET`/`SOCK_RAW`), point-to-point
     /// like [`Udp`](LinkTransport::Udp) but using an IP protocol number instead
     /// of UDP ports.  Requires `CAP_NET_RAW`.
