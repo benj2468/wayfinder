@@ -30,10 +30,10 @@ use embedded_io_async::Read;
 use embedded_io_async::Write;
 use prost::Message;
 use tracing::trace;
-use wayfinder_protos::wayfinder_v1alpha::ErrorResponse;
-use wayfinder_protos::wayfinder_v1alpha::WayfinderRequest;
-use wayfinder_protos::wayfinder_v1alpha::WayfinderResponse;
-use wayfinder_protos::wayfinder_v1alpha::wayfinder_response::Response as RespKind;
+use wayfinder_protos::wayfinder::v1alpha::ErrorResponse;
+use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
+use wayfinder_protos::wayfinder::v1alpha::WayfinderResponse;
+use wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response as RespKind;
 
 use crate::framing::FrameError;
 use crate::framing::read_frame;
@@ -209,8 +209,8 @@ mod tests {
 
     use core::convert::Infallible;
 
-    use wayfinder_protos::wayfinder_v1alpha::NodeInfo;
-    use wayfinder_protos::wayfinder_v1alpha::wayfinder_request::Request as ReqKind;
+    use wayfinder_protos::wayfinder::v1alpha::NodeInfo;
+    use wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request as ReqKind;
 
     use super::*;
     use crate::framing::MAX_FRAME_LEN;

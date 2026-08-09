@@ -3,13 +3,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use wayfinder_protos::wayfinder_v1alpha::LogLevel;
-use wayfinder_protos::wayfinder_v1alpha::LogRecord;
-use wayfinder_protos::wayfinder_v1alpha::LogRecords;
-use wayfinder_protos::wayfinder_v1alpha::NeighborPath;
-use wayfinder_protos::wayfinder_v1alpha::NodeInfo;
-use wayfinder_protos::wayfinder_v1alpha::RoutingEntry;
-use wayfinder_protos::wayfinder_v1alpha::RoutingTable;
+use wayfinder_protos::wayfinder::v1alpha::LogLevel;
+use wayfinder_protos::wayfinder::v1alpha::LogRecord;
+use wayfinder_protos::wayfinder::v1alpha::LogRecords;
+use wayfinder_protos::wayfinder::v1alpha::NeighborPath;
+use wayfinder_protos::wayfinder::v1alpha::NodeInfo;
+use wayfinder_protos::wayfinder::v1alpha::RoutingEntry;
+use wayfinder_protos::wayfinder::v1alpha::RoutingTable;
 use wayfinderctl::output::OutputFormat;
 use wayfinderctl::output::{self};
 

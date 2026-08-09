@@ -31,10 +31,10 @@ use wayfinder_protos::service::RuntimeConfigData;
 use wayfinder_protos::service::TableOccupancyData;
 use wayfinder_protos::service::WayfinderDataProvider;
 use wayfinder_protos::service::WayfinderService;
-use wayfinder_protos::wayfinder_v1alpha::LogLevel;
-use wayfinder_protos::wayfinder_v1alpha::WayfinderRequest;
-use wayfinder_protos::wayfinder_v1alpha::WayfinderResponse;
-use wayfinder_protos::wayfinder_v1alpha::resolve_route_response::Egress;
+use wayfinder_protos::wayfinder::v1alpha::LogLevel;
+use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
+use wayfinder_protos::wayfinder::v1alpha::WayfinderResponse;
+use wayfinder_protos::wayfinder::v1alpha::resolve_route_response::Egress;
 
 /// Render a 6-byte identifier as a colon-delimited MAC, else as plain hex.
 fn format_mac(bytes: &[u8]) -> String {

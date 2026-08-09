@@ -9,7 +9,7 @@ serialization for `wayfinderctl`.
 
 - `protos/wayfinder/v1alpha/wayfinder.proto` — the single source of truth.
 - `build.rs` — compiles it with `prost` into `OUT_DIR`, included by
-  `wayfinder_v1alpha`. Two non-default choices live here: `btree_map(["."])`
+  `wayfinder::v1alpha`. Two non-default choices live here: `btree_map(["."])`
   (deterministic map iteration, so responses are stable across runs) and a
   feature-gated `#[cfg_attr(feature = "serde", derive(serde::Serialize))]` on
   every generated type.

@@ -773,10 +773,10 @@ mod tests {
     #[cfg(feature = "mgmt")]
     #[test]
     fn run_once_with_mgmt_serves_a_node_info_query() {
-        use wayfinder_protos::wayfinder_v1alpha::GetNodeInfoRequest;
-        use wayfinder_protos::wayfinder_v1alpha::WayfinderRequest;
-        use wayfinder_protos::wayfinder_v1alpha::wayfinder_request::Request as ReqKind;
-        use wayfinder_protos::wayfinder_v1alpha::wayfinder_response::Response as RespKind;
+        use wayfinder_protos::wayfinder::v1alpha::GetNodeInfoRequest;
+        use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
+        use wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request as ReqKind;
+        use wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response as RespKind;
         use wayfinder_server::EmbeddedQueryChannel;
 
         let channel = EmbeddedQueryChannel::new();
@@ -829,9 +829,9 @@ mod tests {
     #[test]
     fn run_once_with_mgmt_prefers_ready_link_traffic_over_a_pending_query() {
         use futures::FutureExt;
-        use wayfinder_protos::wayfinder_v1alpha::GetNodeInfoRequest;
-        use wayfinder_protos::wayfinder_v1alpha::WayfinderRequest;
-        use wayfinder_protos::wayfinder_v1alpha::wayfinder_request::Request as ReqKind;
+        use wayfinder_protos::wayfinder::v1alpha::GetNodeInfoRequest;
+        use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
+        use wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request as ReqKind;
         use wayfinder_server::EmbeddedQueryChannel;
 
         let channel = EmbeddedQueryChannel::new();

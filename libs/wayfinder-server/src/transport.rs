@@ -22,12 +22,12 @@ use wayfinder::interfaces::frame::Mac;
 use wayfinder::wayfinder_auth::Keypair;
 use wayfinder::wayfinder_auth::MembershipCert;
 use wayfinder::wayfinder_auth::TrustAnchor;
-use wayfinder_protos::wayfinder_v1alpha::Empty;
-use wayfinder_protos::wayfinder_v1alpha::ErrorResponse;
-use wayfinder_protos::wayfinder_v1alpha::WayfinderRequest;
-use wayfinder_protos::wayfinder_v1alpha::WayfinderResponse;
-use wayfinder_protos::wayfinder_v1alpha::wayfinder_request::Request as ReqKind;
-use wayfinder_protos::wayfinder_v1alpha::wayfinder_response::Response as RespKind;
+use wayfinder_protos::wayfinder::v1alpha::Empty;
+use wayfinder_protos::wayfinder::v1alpha::ErrorResponse;
+use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
+use wayfinder_protos::wayfinder::v1alpha::WayfinderResponse;
+use wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request as ReqKind;
+use wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response as RespKind;
 
 use crate::MgmtAccess;
 use crate::decide_access;
@@ -90,7 +90,7 @@ where
 ///
 /// `peer_key` is the client's Ed25519 raw public key that the TLS handshake
 /// proved possession of (RFC 7250). The first frame must be an
-/// [`AuthenticateRequest`](wayfinder_protos::wayfinder_v1alpha::AuthenticateRequest)
+/// [`AuthenticateRequest`](wayfinder_protos::wayfinder::v1alpha::AuthenticateRequest)
 /// carrying the client's membership cert (empty on an un-enrolled node); it is
 /// bound to `peer_key` and checked by [`decide_access`] against `ctx`. A grant
 /// is acknowledged with an [`Empty`] response (which the client waits on) before
@@ -406,13 +406,13 @@ mod tests {
 
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
-    use wayfinder_protos::wayfinder_v1alpha::AuthenticateRequest;
-    use wayfinder_protos::wayfinder_v1alpha::GetNodeInfoRequest;
-    use wayfinder_protos::wayfinder_v1alpha::NodeInfo;
-    use wayfinder_protos::wayfinder_v1alpha::WayfinderRequest;
-    use wayfinder_protos::wayfinder_v1alpha::WayfinderResponse;
-    use wayfinder_protos::wayfinder_v1alpha::wayfinder_request::Request;
-    use wayfinder_protos::wayfinder_v1alpha::wayfinder_response::Response;
+    use wayfinder_protos::wayfinder::v1alpha::AuthenticateRequest;
+    use wayfinder_protos::wayfinder::v1alpha::GetNodeInfoRequest;
+    use wayfinder_protos::wayfinder::v1alpha::NodeInfo;
+    use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
+    use wayfinder_protos::wayfinder::v1alpha::WayfinderResponse;
+    use wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request;
+    use wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response;
 
     use super::*;
 

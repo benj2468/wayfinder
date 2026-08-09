@@ -29,50 +29,50 @@ use tokio_rustls::client::TlsStream;
 use tokio_serial::SerialStream;
 use tokio_util::codec::Framed;
 use tokio_util::codec::LengthDelimitedCodec;
-use wayfinder_protos::wayfinder_v1alpha::ApproveCsrRequest;
-use wayfinder_protos::wayfinder_v1alpha::AuthenticateRequest;
-use wayfinder_protos::wayfinder_v1alpha::DenyCsrRequest;
-use wayfinder_protos::wayfinder_v1alpha::GetKeepAliveTableRequest;
-use wayfinder_protos::wayfinder_v1alpha::GetLinkFeaturesTableRequest;
-use wayfinder_protos::wayfinder_v1alpha::GetLinkQualityTableRequest;
-use wayfinder_protos::wayfinder_v1alpha::GetLogsRequest;
-use wayfinder_protos::wayfinder_v1alpha::GetMetricsRequest;
-use wayfinder_protos::wayfinder_v1alpha::GetNodeInfoRequest;
-use wayfinder_protos::wayfinder_v1alpha::GetOgmScheduleRequest;
-use wayfinder_protos::wayfinder_v1alpha::GetRoutingTableRequest;
-use wayfinder_protos::wayfinder_v1alpha::GetSecurityStatusRequest;
-use wayfinder_protos::wayfinder_v1alpha::GetSecurityStatusResponse;
-use wayfinder_protos::wayfinder_v1alpha::GetThroughputRequest;
-use wayfinder_protos::wayfinder_v1alpha::GetTrustAnchorRequest;
-use wayfinder_protos::wayfinder_v1alpha::GetTrustAnchorResponse;
-use wayfinder_protos::wayfinder_v1alpha::KeepAliveTable;
-use wayfinder_protos::wayfinder_v1alpha::LinkFeatures;
-use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesTable;
-use wayfinder_protos::wayfinder_v1alpha::LinkQualityTable;
-use wayfinder_protos::wayfinder_v1alpha::ListCertsRequest;
-use wayfinder_protos::wayfinder_v1alpha::ListCertsResponse;
-use wayfinder_protos::wayfinder_v1alpha::ListPendingCsrsRequest;
-use wayfinder_protos::wayfinder_v1alpha::ListPendingCsrsResponse;
-use wayfinder_protos::wayfinder_v1alpha::LogRecords;
-use wayfinder_protos::wayfinder_v1alpha::NodeInfo;
-use wayfinder_protos::wayfinder_v1alpha::NodeMetrics;
-use wayfinder_protos::wayfinder_v1alpha::OgmSchedule;
-use wayfinder_protos::wayfinder_v1alpha::ResolveRouteRequest;
-use wayfinder_protos::wayfinder_v1alpha::ResolveRouteResponse;
-use wayfinder_protos::wayfinder_v1alpha::RevokeNodeRequest;
-use wayfinder_protos::wayfinder_v1alpha::RoutingTable;
-use wayfinder_protos::wayfinder_v1alpha::RuntimeConfig;
-use wayfinder_protos::wayfinder_v1alpha::SetAuthRequest;
-use wayfinder_protos::wayfinder_v1alpha::SetConfigRequest;
-use wayfinder_protos::wayfinder_v1alpha::SetLogLevelRequest;
-use wayfinder_protos::wayfinder_v1alpha::SubmitCsrRequest;
-use wayfinder_protos::wayfinder_v1alpha::SubmitCsrResponse;
-use wayfinder_protos::wayfinder_v1alpha::Throughput;
-use wayfinder_protos::wayfinder_v1alpha::TrickleConfig;
-use wayfinder_protos::wayfinder_v1alpha::WayfinderRequest;
-use wayfinder_protos::wayfinder_v1alpha::WayfinderResponse;
-use wayfinder_protos::wayfinder_v1alpha::wayfinder_request::Request as RequestKind;
-use wayfinder_protos::wayfinder_v1alpha::wayfinder_response::Response as ResponseKind;
+use wayfinder_protos::wayfinder::v1alpha::ApproveCsrRequest;
+use wayfinder_protos::wayfinder::v1alpha::AuthenticateRequest;
+use wayfinder_protos::wayfinder::v1alpha::DenyCsrRequest;
+use wayfinder_protos::wayfinder::v1alpha::GetKeepAliveTableRequest;
+use wayfinder_protos::wayfinder::v1alpha::GetLinkFeaturesTableRequest;
+use wayfinder_protos::wayfinder::v1alpha::GetLinkQualityTableRequest;
+use wayfinder_protos::wayfinder::v1alpha::GetLogsRequest;
+use wayfinder_protos::wayfinder::v1alpha::GetMetricsRequest;
+use wayfinder_protos::wayfinder::v1alpha::GetNodeInfoRequest;
+use wayfinder_protos::wayfinder::v1alpha::GetOgmScheduleRequest;
+use wayfinder_protos::wayfinder::v1alpha::GetRoutingTableRequest;
+use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusRequest;
+use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
+use wayfinder_protos::wayfinder::v1alpha::GetThroughputRequest;
+use wayfinder_protos::wayfinder::v1alpha::GetTrustAnchorRequest;
+use wayfinder_protos::wayfinder::v1alpha::GetTrustAnchorResponse;
+use wayfinder_protos::wayfinder::v1alpha::KeepAliveTable;
+use wayfinder_protos::wayfinder::v1alpha::LinkFeatures;
+use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesTable;
+use wayfinder_protos::wayfinder::v1alpha::LinkQualityTable;
+use wayfinder_protos::wayfinder::v1alpha::ListCertsRequest;
+use wayfinder_protos::wayfinder::v1alpha::ListCertsResponse;
+use wayfinder_protos::wayfinder::v1alpha::ListPendingCsrsRequest;
+use wayfinder_protos::wayfinder::v1alpha::ListPendingCsrsResponse;
+use wayfinder_protos::wayfinder::v1alpha::LogRecords;
+use wayfinder_protos::wayfinder::v1alpha::NodeInfo;
+use wayfinder_protos::wayfinder::v1alpha::NodeMetrics;
+use wayfinder_protos::wayfinder::v1alpha::OgmSchedule;
+use wayfinder_protos::wayfinder::v1alpha::ResolveRouteRequest;
+use wayfinder_protos::wayfinder::v1alpha::ResolveRouteResponse;
+use wayfinder_protos::wayfinder::v1alpha::RevokeNodeRequest;
+use wayfinder_protos::wayfinder::v1alpha::RoutingTable;
+use wayfinder_protos::wayfinder::v1alpha::RuntimeConfig;
+use wayfinder_protos::wayfinder::v1alpha::SetAuthRequest;
+use wayfinder_protos::wayfinder::v1alpha::SetConfigRequest;
+use wayfinder_protos::wayfinder::v1alpha::SetLogLevelRequest;
+use wayfinder_protos::wayfinder::v1alpha::SubmitCsrRequest;
+use wayfinder_protos::wayfinder::v1alpha::SubmitCsrResponse;
+use wayfinder_protos::wayfinder::v1alpha::Throughput;
+use wayfinder_protos::wayfinder::v1alpha::TrickleConfig;
+use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
+use wayfinder_protos::wayfinder::v1alpha::WayfinderResponse;
+use wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request as RequestKind;
+use wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response as ResponseKind;
 
 /// The underlying transport a [`Client`] is connected over, carrying the same
 /// 4-byte length-delimited prost framing regardless of medium.
@@ -420,10 +420,10 @@ impl Client {
     /// batch size).
     ///
     /// Poll with the previous response's
-    /// [`next_seq`](wayfinder_protos::wayfinder_v1alpha::LogRecords::next_seq)
+    /// [`next_seq`](wayfinder_protos::wayfinder::v1alpha::LogRecords::next_seq)
     /// to see each record exactly once; pass 0 on a first poll to get whatever
     /// the node still retains. Check
-    /// [`dropped`](wayfinder_protos::wayfinder_v1alpha::LogRecords::dropped) —
+    /// [`dropped`](wayfinder_protos::wayfinder::v1alpha::LogRecords::dropped) —
     /// non-zero means records were evicted before this poll reached them, and
     /// the gap should be shown rather than hidden.
     pub async fn logs(&mut self, since_seq: u64, max_records: u32) -> anyhow::Result<LogRecords> {

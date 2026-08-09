@@ -1,44 +1,44 @@
-use crate::wayfinder_v1alpha::AllInterfacesEgress;
-use crate::wayfinder_v1alpha::CsrIssued;
-use crate::wayfinder_v1alpha::CsrPending;
-use crate::wayfinder_v1alpha::CsrRejected;
-use crate::wayfinder_v1alpha::Empty;
-use crate::wayfinder_v1alpha::ErrorResponse;
-use crate::wayfinder_v1alpha::GetSecurityStatusResponse;
-use crate::wayfinder_v1alpha::GetTrustAnchorResponse;
-use crate::wayfinder_v1alpha::InterfaceThroughput;
-use crate::wayfinder_v1alpha::IssuedCert;
-use crate::wayfinder_v1alpha::KeepAliveEntry;
-use crate::wayfinder_v1alpha::KeepAliveTable;
-use crate::wayfinder_v1alpha::LinkFeaturesEntry;
-use crate::wayfinder_v1alpha::LinkFeaturesTable;
-use crate::wayfinder_v1alpha::LinkQualityEntry;
-use crate::wayfinder_v1alpha::LinkQualityTable;
-use crate::wayfinder_v1alpha::ListCertsResponse;
-use crate::wayfinder_v1alpha::ListPendingCsrsResponse;
-use crate::wayfinder_v1alpha::LogFilter;
-use crate::wayfinder_v1alpha::LogLevel;
-use crate::wayfinder_v1alpha::LogRecord;
-use crate::wayfinder_v1alpha::LogRecords;
-use crate::wayfinder_v1alpha::NeighborPath;
-use crate::wayfinder_v1alpha::NodeInfo;
-use crate::wayfinder_v1alpha::NodeMetrics;
-use crate::wayfinder_v1alpha::NodeSecurity;
-use crate::wayfinder_v1alpha::OgmSchedule;
-use crate::wayfinder_v1alpha::OgmScheduleEntry;
-use crate::wayfinder_v1alpha::PendingCsr;
-use crate::wayfinder_v1alpha::ResolveRouteResponse;
-use crate::wayfinder_v1alpha::RoutingEntry;
-use crate::wayfinder_v1alpha::RoutingTable;
-use crate::wayfinder_v1alpha::SubmitCsrResponse;
-use crate::wayfinder_v1alpha::TableOccupancy;
-use crate::wayfinder_v1alpha::Throughput;
-use crate::wayfinder_v1alpha::WayfinderRequest;
-use crate::wayfinder_v1alpha::WayfinderResponse;
-use crate::wayfinder_v1alpha::resolve_route_response::Egress as EgressKind;
-use crate::wayfinder_v1alpha::submit_csr_response::Outcome as CsrOutcomeKind;
-use crate::wayfinder_v1alpha::wayfinder_request::Request as RequestKind;
-use crate::wayfinder_v1alpha::wayfinder_response::Response as ResponseKind;
+use crate::wayfinder::v1alpha::AllInterfacesEgress;
+use crate::wayfinder::v1alpha::CsrIssued;
+use crate::wayfinder::v1alpha::CsrPending;
+use crate::wayfinder::v1alpha::CsrRejected;
+use crate::wayfinder::v1alpha::Empty;
+use crate::wayfinder::v1alpha::ErrorResponse;
+use crate::wayfinder::v1alpha::GetSecurityStatusResponse;
+use crate::wayfinder::v1alpha::GetTrustAnchorResponse;
+use crate::wayfinder::v1alpha::InterfaceThroughput;
+use crate::wayfinder::v1alpha::IssuedCert;
+use crate::wayfinder::v1alpha::KeepAliveEntry;
+use crate::wayfinder::v1alpha::KeepAliveTable;
+use crate::wayfinder::v1alpha::LinkFeaturesEntry;
+use crate::wayfinder::v1alpha::LinkFeaturesTable;
+use crate::wayfinder::v1alpha::LinkQualityEntry;
+use crate::wayfinder::v1alpha::LinkQualityTable;
+use crate::wayfinder::v1alpha::ListCertsResponse;
+use crate::wayfinder::v1alpha::ListPendingCsrsResponse;
+use crate::wayfinder::v1alpha::LogFilter;
+use crate::wayfinder::v1alpha::LogLevel;
+use crate::wayfinder::v1alpha::LogRecord;
+use crate::wayfinder::v1alpha::LogRecords;
+use crate::wayfinder::v1alpha::NeighborPath;
+use crate::wayfinder::v1alpha::NodeInfo;
+use crate::wayfinder::v1alpha::NodeMetrics;
+use crate::wayfinder::v1alpha::NodeSecurity;
+use crate::wayfinder::v1alpha::OgmSchedule;
+use crate::wayfinder::v1alpha::OgmScheduleEntry;
+use crate::wayfinder::v1alpha::PendingCsr;
+use crate::wayfinder::v1alpha::ResolveRouteResponse;
+use crate::wayfinder::v1alpha::RoutingEntry;
+use crate::wayfinder::v1alpha::RoutingTable;
+use crate::wayfinder::v1alpha::SubmitCsrResponse;
+use crate::wayfinder::v1alpha::TableOccupancy;
+use crate::wayfinder::v1alpha::Throughput;
+use crate::wayfinder::v1alpha::WayfinderRequest;
+use crate::wayfinder::v1alpha::WayfinderResponse;
+use crate::wayfinder::v1alpha::resolve_route_response::Egress as EgressKind;
+use crate::wayfinder::v1alpha::submit_csr_response::Outcome as CsrOutcomeKind;
+use crate::wayfinder::v1alpha::wayfinder_request::Request as RequestKind;
+use crate::wayfinder::v1alpha::wayfinder_response::Response as ResponseKind;
 use alloc::string::String;
 use alloc::vec::Vec;
 use tracing::info;
@@ -911,8 +911,8 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                         tx_data: f.tx_data,
                         rx_data: f.rx_data,
                         tx_keepalive: f.tx_keepalive_update.map(|u| match u {
-                            crate::wayfinder_v1alpha::link_features::TxKeepaliveUpdate::TxKeepaliveDisabled(_) => None,
-                            crate::wayfinder_v1alpha::link_features::TxKeepaliveUpdate::TxKeepaliveIntervalMs(ms) => {
+                            crate::wayfinder::v1alpha::link_features::TxKeepaliveUpdate::TxKeepaliveDisabled(_) => None,
+                            crate::wayfinder::v1alpha::link_features::TxKeepaliveUpdate::TxKeepaliveIntervalMs(ms) => {
                                 Some(ms)
                             }
                         }),
@@ -1041,16 +1041,16 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wayfinder_v1alpha::GetLinkFeaturesTableRequest;
-    use crate::wayfinder_v1alpha::GetLinkQualityTableRequest;
-    use crate::wayfinder_v1alpha::GetMetricsRequest;
-    use crate::wayfinder_v1alpha::GetNodeInfoRequest;
-    use crate::wayfinder_v1alpha::GetOgmScheduleRequest;
-    use crate::wayfinder_v1alpha::GetThroughputRequest;
-    use crate::wayfinder_v1alpha::ResolveRouteRequest;
-    use crate::wayfinder_v1alpha::RuntimeConfig;
-    use crate::wayfinder_v1alpha::SetConfigRequest;
-    use crate::wayfinder_v1alpha::TrickleConfig;
+    use crate::wayfinder::v1alpha::GetLinkFeaturesTableRequest;
+    use crate::wayfinder::v1alpha::GetLinkQualityTableRequest;
+    use crate::wayfinder::v1alpha::GetMetricsRequest;
+    use crate::wayfinder::v1alpha::GetNodeInfoRequest;
+    use crate::wayfinder::v1alpha::GetOgmScheduleRequest;
+    use crate::wayfinder::v1alpha::GetThroughputRequest;
+    use crate::wayfinder::v1alpha::ResolveRouteRequest;
+    use crate::wayfinder::v1alpha::RuntimeConfig;
+    use crate::wayfinder::v1alpha::SetConfigRequest;
+    use crate::wayfinder::v1alpha::TrickleConfig;
     use alloc::vec;
 
     /// Test double that returns canned responses and records the last
@@ -1173,7 +1173,7 @@ mod tests {
 
         let response = handle(
             provider,
-            RequestKind::GetLogs(crate::wayfinder_v1alpha::GetLogsRequest {
+            RequestKind::GetLogs(crate::wayfinder::v1alpha::GetLogsRequest {
                 since_seq: 5,
                 max_records: 20,
             }),
@@ -1203,7 +1203,7 @@ mod tests {
         let mut service = WayfinderService::new(provider);
         service.handle(WayfinderRequest {
             request: Some(RequestKind::GetLogs(
-                crate::wayfinder_v1alpha::GetLogsRequest {
+                crate::wayfinder::v1alpha::GetLogsRequest {
                     since_seq: 42,
                     max_records: 9,
                 },
@@ -1235,7 +1235,7 @@ mod tests {
     fn set_log_level_answers_with_the_effective_spec() {
         let response = handle(
             MockProvider::default(),
-            RequestKind::SetLogLevel(crate::wayfinder_v1alpha::SetLogLevelRequest {
+            RequestKind::SetLogLevel(crate::wayfinder::v1alpha::SetLogLevelRequest {
                 directives: "info,batman=trace".into(),
             }),
         );
@@ -1257,7 +1257,7 @@ mod tests {
         };
         let response = handle(
             provider,
-            RequestKind::SetLogLevel(crate::wayfinder_v1alpha::SetLogLevelRequest {
+            RequestKind::SetLogLevel(crate::wayfinder::v1alpha::SetLogLevelRequest {
                 directives: "wayfinder=verbose".into(),
             }),
         );
@@ -1769,19 +1769,19 @@ mod tests {
     /// rather than a representative sample.
     #[test]
     fn request_is_mutation_classifies_writes_vs_reads() {
-        use crate::wayfinder_v1alpha::ApproveCsrRequest;
-        use crate::wayfinder_v1alpha::AuthenticateRequest;
-        use crate::wayfinder_v1alpha::DenyCsrRequest;
-        use crate::wayfinder_v1alpha::GetKeepAliveTableRequest;
-        use crate::wayfinder_v1alpha::GetRoutingTableRequest;
-        use crate::wayfinder_v1alpha::GetSecurityStatusRequest;
-        use crate::wayfinder_v1alpha::GetTrustAnchorRequest;
-        use crate::wayfinder_v1alpha::ListCertsRequest;
-        use crate::wayfinder_v1alpha::ListPendingCsrsRequest;
-        use crate::wayfinder_v1alpha::ResolveRouteRequest;
-        use crate::wayfinder_v1alpha::RevokeNodeRequest;
-        use crate::wayfinder_v1alpha::SetAuthRequest;
-        use crate::wayfinder_v1alpha::SubmitCsrRequest;
+        use crate::wayfinder::v1alpha::ApproveCsrRequest;
+        use crate::wayfinder::v1alpha::AuthenticateRequest;
+        use crate::wayfinder::v1alpha::DenyCsrRequest;
+        use crate::wayfinder::v1alpha::GetKeepAliveTableRequest;
+        use crate::wayfinder::v1alpha::GetRoutingTableRequest;
+        use crate::wayfinder::v1alpha::GetSecurityStatusRequest;
+        use crate::wayfinder::v1alpha::GetTrustAnchorRequest;
+        use crate::wayfinder::v1alpha::ListCertsRequest;
+        use crate::wayfinder::v1alpha::ListPendingCsrsRequest;
+        use crate::wayfinder::v1alpha::ResolveRouteRequest;
+        use crate::wayfinder::v1alpha::RevokeNodeRequest;
+        use crate::wayfinder::v1alpha::SetAuthRequest;
+        use crate::wayfinder::v1alpha::SubmitCsrRequest;
 
         // Mutations: change node/provider state.
         assert!(request_is_mutation(&RequestKind::SetAuth(SetAuthRequest {

@@ -6,21 +6,21 @@
 
 use clap::ValueEnum;
 use serde::Serialize;
-use wayfinder_protos::wayfinder_v1alpha::GetSecurityStatusResponse;
-use wayfinder_protos::wayfinder_v1alpha::KeepAliveTable;
-use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesTable;
-use wayfinder_protos::wayfinder_v1alpha::LinkQualityTable;
-use wayfinder_protos::wayfinder_v1alpha::ListCertsResponse;
-use wayfinder_protos::wayfinder_v1alpha::ListPendingCsrsResponse;
-use wayfinder_protos::wayfinder_v1alpha::LogLevel;
-use wayfinder_protos::wayfinder_v1alpha::LogRecords;
-use wayfinder_protos::wayfinder_v1alpha::NodeInfo;
-use wayfinder_protos::wayfinder_v1alpha::NodeMetrics;
-use wayfinder_protos::wayfinder_v1alpha::OgmSchedule;
-use wayfinder_protos::wayfinder_v1alpha::ResolveRouteResponse;
-use wayfinder_protos::wayfinder_v1alpha::RoutingTable;
-use wayfinder_protos::wayfinder_v1alpha::Throughput;
-use wayfinder_protos::wayfinder_v1alpha::resolve_route_response::Egress;
+use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
+use wayfinder_protos::wayfinder::v1alpha::KeepAliveTable;
+use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesTable;
+use wayfinder_protos::wayfinder::v1alpha::LinkQualityTable;
+use wayfinder_protos::wayfinder::v1alpha::ListCertsResponse;
+use wayfinder_protos::wayfinder::v1alpha::ListPendingCsrsResponse;
+use wayfinder_protos::wayfinder::v1alpha::LogLevel;
+use wayfinder_protos::wayfinder::v1alpha::LogRecords;
+use wayfinder_protos::wayfinder::v1alpha::NodeInfo;
+use wayfinder_protos::wayfinder::v1alpha::NodeMetrics;
+use wayfinder_protos::wayfinder::v1alpha::OgmSchedule;
+use wayfinder_protos::wayfinder::v1alpha::ResolveRouteResponse;
+use wayfinder_protos::wayfinder::v1alpha::RoutingTable;
+use wayfinder_protos::wayfinder::v1alpha::Throughput;
+use wayfinder_protos::wayfinder::v1alpha::resolve_route_response::Egress;
 
 /// How a command renders its result.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -204,7 +204,7 @@ pub fn throughput(v: &Throughput, fmt: OutputFormat) -> anyhow::Result<String> {
 /// Render [`NodeMetrics`].
 pub fn node_metrics(v: &NodeMetrics, fmt: OutputFormat) -> anyhow::Result<String> {
     render(v, fmt, |v| {
-        let occ = |o: &Option<wayfinder_protos::wayfinder_v1alpha::TableOccupancy>| match o {
+        let occ = |o: &Option<wayfinder_protos::wayfinder::v1alpha::TableOccupancy>| match o {
             Some(o) => format!("{}/{}", o.used, o.capacity),
             None => "-".to_string(),
         };
