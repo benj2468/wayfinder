@@ -42,6 +42,7 @@ use wayfinder_driver::build_raw_ip_link;
 use wayfinder_driver::build_raw_l2_link;
 use wayfinder_driver::build_rylr998_link;
 use wayfinder_driver::build_udp_link;
+use wayfinder_driver::build_udp_multi_link;
 use wayfinder_driver::serve_tls_server;
 
 use crate::tap::TapDevice;
@@ -245,6 +246,16 @@ async fn main() -> anyhow::Result<()> {
                 remote_addr,
             } => {
                 interfaces.push(build_udp_link(bind_addr, remote_addr, &mut join_set).await?);
+            }
+            LinkTransport::UdpMulti {
+                bind_addr,
+                discovery_addr,
+                multicast_interface,
+            } => {
+                interfaces.push(
+                    build_udp_multi_link(bind_addr, discovery_addr, multicast_interface.as_deref())
+                        .await?,
+                );
             }
             LinkTransport::RawIp {
                 bind_addr,

@@ -26,7 +26,8 @@ use wayfinder::interfaces::link::LinkMetrics;
 use wayfinder::link::LinkT;
 use wayfinder::link::Received;
 use zerocopy::FromBytes;
-use zerocopy::IntoBytes;
+
+use crate::wire::frame_into_buf;
 
 /// A message-oriented async byte pipe: read/write whole frames, one per call.
 ///
@@ -88,32 +89,19 @@ impl<Io: FrameIo> Link<Io> {
             buffer: [0u8; MAX_LINK_FRAME_LEN],
         }
     }
-
-    /// Serialize `origin` + `data` into `self.buffer`, returning the framed
-    /// length.  Wire layout is the Ethernet-shaped [`LinkFrame`] layout:
-    /// `[dst: Mac][src: Mac][protocol: u16 big-endian][payload]`.
-    fn frame_into_buffer(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> usize {
-        let mut idx = 0;
-        self.buffer[0..size_of::<Mac>()].copy_from_slice(data.dst.as_bytes());
-        idx += size_of::<Mac>();
-
-        self.buffer[idx..(idx + size_of::<Mac>())].copy_from_slice(origin.as_bytes());
-        idx += size_of::<Mac>();
-
-        // `LinkFrame::protocol` is a big-endian (network byte order) EtherType,
-        // so write the protocol in network order.
-        self.buffer[idx..(idx + size_of::<u16>())].copy_from_slice(&data.protocol.to_be_bytes());
-        idx += size_of::<u16>();
-
-        self.buffer[idx..(idx + data.payload.len())].copy_from_slice(data.payload);
-        idx += data.payload.len();
-        idx
-    }
 }
 
 impl<Io: FrameIo> LinkT for Link<Io> {
     async fn send(&mut self, origin: Mac, data: &LinkFrameData<'_>) -> Result<usize, LinkError> {
-        let idx = self.frame_into_buffer(origin, data);
+        // A point-to-point pipe has no wire-vs-mesh protocol split, so the
+        // EtherType-shaped field written is `data.protocol` itself.
+        let Some(idx) = frame_into_buf(origin, data.protocol, data, &mut self.buffer) else {
+            tracing::trace!(
+                payload_len = data.payload.len(),
+                "drop: frame exceeds link buffer"
+            );
+            return Ok(0);
+        };
         self.socket.send(&self.buffer[..idx]).await.map_err(|e| {
             tracing::warn!(error = ?e, "link send failed");
             LinkError::Io
@@ -143,6 +131,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use zerocopy::IntoBytes;
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])
