@@ -225,34 +225,90 @@ The workspace splits into the `no_std` routing core, radio drivers, host-side
   `MAX_LINK_FRAME_LEN` (used by `rylr998`, `blue`).
 
 **Identity & management API**
-- **libs/wayfinder-auth** — crypto identity/membership. A mesh is optionally
+- **libs/wayfinder-auth** → crypto identity/membership. A mesh is optionally
   segregated by a per-mesh trust anchor (root key); a node belongs iff it holds a
   `MembershipCert` signed by that root (Ed25519 pubkey ↔ MAC ↔ mesh). `no_std`
   core does verification + X25519 agreement; the `std`-gated `Authority` is the
   CA. Payloads are never encrypted — authenticity + segregation only.
-- **libs/wayfinder-protos** — management API protobuf (`prost`, package
+- **libs/wayfinder-protos** → management API protobuf (`prost`, package
   `wayfinder.v1alpha`); `service.rs` defines `WayfinderDataProvider`. `buf lint`
   runs here; the `serde` feature is used by the CLI.
-- **libs/wayfinder-server** — the mgmt-API server: `RouterAdapter` (`no_std`+
-  `alloc`, projects a borrowed `CentralRouter`), the `std` transport loops
-  (`run_tcp/unix/udp_server` + `QueryTx`/`QueryRx`), and `authority.rs` (the CA
-  in provider mode; embedded nodes never link this).
-- **libs/wayfinder-client** — reusable API client: prost envelope over TCP
-  (4-byte BE length-delimited) or Unix datagram. Shared by TUI and CLI.
+- **libs/wayfinder-server** → the mgmt-API server: `RouterAdapter` (`no_std`+
+  `alloc`, projects a borrowed `CentralRouter`), the `std` authenticated
+  TLS-over-TCP transport (`bind_tcp_server`/`serve_tls_server` +
+  `QueryTx`/`QueryRx`), the `embedded` framing/`serve` loop, and `authority.rs`
+  (the CA in provider mode; embedded nodes never link this).
+- **libs/wayfinder-tls-mgmt** — the shared mgmt-TLS bridge between the mesh
+  Ed25519 identity and rustls **raw public keys** (RFC 7250, no X.509):
+  `certified_key_from_seed`, `verify_raw_key_signature`. Depended on by both
+  `wayfinder-server` and `wayfinder-client` so neither has to depend on the
+  other.
+- **libs/wayfinder-client** — reusable API client: the same prost envelope with
+  4-byte BE length-delimited framing, over authenticated TLS (`connect_tls`) or
+  a serial port (`connect_serial`, for an embedded node's mgmt port). Shared by
+  TUI and CLI.
+- **libs/wayfinder-storage** — the durable-store abstraction both the host CA
+  and the embedded node persist through. `DurableStore` is one guarantee —
+  replace a blob so a reader never sees a torn old/new mix, even across a crash
+  mid-write — over media with different atomicity primitives: a `std`
+  `FileStore` (atomic `rename`) and a `flash` `FlashStore` (A/B two-page
+  ping-pong). `Persisted` owns the mutate → persist → roll-back-on-failure
+  ordering, so callers never write ad-hoc `persist()` calls. Blob *contents*
+  (encoding, versioning, migration) stay the caller's concern.
 - **libs/wayfinder-log** — the logging plumbing every target shares: the runtime
   `RUST_LOG`-style filter, the bounded record ring behind `GetLogs`, and the line
   formatter. Two facades on top — the RTT subscriber/logger for `target_os =
   "none"`, and a `tracing-subscriber` layer stack (`subscriber` feature) for a
   host node.
 
-**Host driver & node**
-- **libs/wayfinder-driver** — the `std`/tokio event loop, transport-agnostic:
-  host device and mesh interfaces are `FrameIo` carriers, so the same loop runs
-  against real sockets and in-process test channels. `snoop.rs` (`McastSnooper`)
-  snoops IPv4 IGMP to learn joined groups. tokio loop/transports gated behind the
-  default `tokio` feature.
+**Drivers — one behavior, three loops**
+
+The planning logic (received frame → outgoing frames, due OGMs, due keepalives)
+lives once in `wayfinder-driver-core`; each shell wraps it in a different event
+loop. **A behavior change almost always belongs in the core, not a shell.**
+
+- **libs/wayfinder-driver-core** — the shared, synchronous, allocation-free
+  planning logic: `handle_mesh_frame`, `poll_due_ogms`, `poll_due_keepalives`,
+  planning each frame into an `OutgoingFrame` borrowing the caller's scratchpad
+  and handing it to a `MeshSink` the shell implements (`Vec` on host,
+  `heapless::Vec` on embedded). No async, no interfaces, no I/O.
+- **libs/wayfinder-driver** → the `std`/tokio shell: a `select!` loop, plus the
+  concrete socket carriers a Linux node runs on. Transport-agnostic — host
+  device and mesh interfaces are `FrameIo` carriers, so the same loop runs
+  against real sockets and in-process test channels. `snoop.rs`
+  (`McastSnooper`) snoops IPv4 IGMP to learn joined groups. Loop/transports
+  gated behind the default `tokio` feature.
+- **libs/wayfinder-embedded-driver** — the `no_std`, HAL-agnostic shell: a
+  plain `async fn` loop the board's executor drives, racing each link's `recv`
+  against the OGM timer with `embassy_futures::select`, staging into a fixed
+  `heapless` buffer. No vendor HAL and no concrete time driver — a board
+  supplies the `LinkT`s and a `Clock`. Optional `mgmt` feature adds the
+  management-API arm (`run_with_mgmt`). Also owns node-identity persistence
+  (`identity.rs`) over `wayfinder-storage`.
+- **libs/wayfinder-tick-driver** — a synchronous, non-blocking shell for a
+  caller that drives its own clock: no `LinkT` at all, interfaces are plain
+  queues (`push_rx` → `tick` → `poll_egress`/`poll_local`). For tick-based
+  simulation (a Python-driven physics sim) rather than a live node.
+
+**Caveat:** egress resolution + split-horizon + `link_may_tx` + auth-tagging
+(`dispatch`) is currently written out in *all three* shells rather than shared
+by the core. Split-horizon is a correctness invariant — a fix in one shell
+needs the matching fix in the other two.
+
+**Host node & tooling**
 - **libs/wayfinder-test** → `Switch` simulator + `TestRouter` harness for
-  multi-node integration tests over mpsc (no hardware).
+  multi-node integration tests over mpsc (no hardware). Wraps the *production*
+  tokio `Driver`, but drives it via the deterministic `poll_due` /
+  `process_pending` API — `run`/`run_once` and the `select!` arms have no
+  direct coverage.
+- **libs/rylr998-sim** — an in-process AT-command simulator standing in for a
+  real RYLR998/498 module, so a real `RylrClient` is drivable without
+  hardware. `RylrSimulator` speaks the AT protocol over a
+  `tokio::io::DuplexStream`; `LoraSwitch` fans `AT+SEND` between several
+  simulators the way LoRa's shared broadcast medium would (filtering by network
+  id/frequency/mode, applying per-link signal quality). Its own crate rather
+  than a `#[cfg(test)]` module or feature on `rylr998`, so the `no_std`-first
+  driver never carries tokio test scaffolding in its dependency graph.
 - **libs/wayfinder-shark** — `tshark` Lua dissector for on-air BATMAN frames +
   pytest tests.
 - **bins/wayfinder-tap** — the runnable node: assembles TAP + UDP links + mgmt-API
@@ -261,6 +317,11 @@ The workspace splits into the `no_std` routing core, radio drivers, host-side
   schedule, throughput/metrics, security tabs).
 - **bins/wayfinder-ctl** (`wayfinderctl`) — CLI mgmt client (query commands) +
   offline `cert` tooling + online `enroll`.
+- **bins/rylr998-cli** — a small host CLI for driving a RYLR998/498 module over
+  a real serial port, for bringing up and debugging a LoRa link outside a full
+  node. Split lib (`rylr998_cli::run_command`) + thin `clap` binary on purpose,
+  so the command logic is testable against `rylr998-sim` while `main.rs` owns
+  the only real-hardware bit.
 
 **Bare-metal boards** (each binary its own `[workspace]`; see "Crates outside
 the root workspace" above)

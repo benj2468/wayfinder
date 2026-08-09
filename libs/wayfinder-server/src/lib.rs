@@ -7,7 +7,8 @@
 //!   [`WayfinderDataProvider`](wayfinder_protos::service::WayfinderDataProvider)
 //!   trait. This is the part embedded callers can reuse without a runtime.
 //! * the `std` transport layer (gated behind the `std` feature) — the
-//!   per-transport listener loops (TCP, Unix datagram, UDP) and the
+//!   authenticated TLS-over-TCP listener loop ([`bind_tcp_server`] /
+//!   [`serve_tls_server`]), the in-process [`run_channel_server`], and the
 //!   [`QueryTx`]/[`QueryRx`] channel they use to forward queries to a
 //!   single-threaded router loop so the router is never shared across tasks.
 //! * the embedded transport layer (gated behind the `embedded` feature,
