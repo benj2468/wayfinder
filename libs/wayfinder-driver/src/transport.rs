@@ -10,7 +10,7 @@
 //!   in-process channel, …) are this shape.
 //! * [`LinkT`] is one *mesh interface*.  A point-to-point carrier gets a
 //!   [`LinkT`] for free via the blanket [`Link`] adapter, which ignores the
-//!   destination and frames `[src][dst][protocol][payload]` onto the pipe.  A
+//!   destination and frames `[dst][src][protocol][payload]` onto the pipe.  A
 //!   multi-access or self-routing carrier (UDP multicast, a radio whose mesh
 //!   "appears as a single switch") instead implements [`LinkT`] directly and
 //!   uses the destination MAC handed to [`send`](LinkT::send) to make its own
@@ -70,7 +70,7 @@ impl FrameIo for tokio::net::UdpSocket {
 ///
 /// The carrier has exactly one peer, so the destination MAC is irrelevant to
 /// delivery: every frame goes to the one peer.  This adapter just frames
-/// `[src][dst][protocol][payload]` onto the pipe and parses it back, and so
+/// `[dst][src][protocol][payload]` onto the pipe and parses it back, and so
 /// inherits the default [`LinkT::send_all`] (a loop over [`send`](LinkT::send))
 /// — there is no fan-out to exploit on a single peer.
 ///
@@ -167,7 +167,7 @@ mod tests {
     }
 
     /// The blanket [`Link`] adapter frames a [`LinkFrameData`] onto the pipe so
-    /// it parses back as the same `[src][dst][protocol][payload]` frame.
+    /// it parses back as the same `[dst][src][protocol][payload]` frame.
     #[tokio::test]
     async fn link_send_round_trips_a_frame() {
         let io = FakeIo::default();
