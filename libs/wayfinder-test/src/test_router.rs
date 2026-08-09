@@ -1,38 +1,36 @@
-//! Test harness for the [`Driver`].
+//! A synchronous test node, driving [`wayfinder_tick_driver`] over the
+//! [`Switch`](crate::switch::Switch) fabric.
 //!
-//! [`TestRouter`] wraps a [`wayfinder_driver::Driver`] whose transports are
-//! in-process channels: the mesh interfaces are [`PortComms`] duplexes into a
-//! [`Switch`](crate::switch::Switch), and the host device is an observable
-//! channel whose locally-delivered frames are captured for assertions.
+//! [`TestRouter`] pairs a tick driver with one [`PortComms`] duplex per mesh
+//! interface. The caller owns the clock: every step is an explicit
+//! [`step`](TestRouter::step) at a chosen instant, with no executor, no
+//! timeouts, and nothing to await.
 //!
-//! Because it is the *same* driver that runs in production (only the carriers
-//! differ), tests exercise the real event-loop logic.  The driver is stepped
-//! deterministically: [`poll`] drives the periodic OGM at a chosen instant and
-//! [`drain_all`] processes every currently-pending frame in one non-blocking
-//! sweep.
+//! # Why not the async driver
 //!
-//! [`poll`]: TestRouter::poll
-//! [`drain_all`]: TestRouter::drain_all
+//! It used to wrap `wayfinder_driver::Driver`, which meant 63 `#[tokio::test]`s
+//! that never actually tested tokio: they drove the deterministic
+//! `poll_due`/`process_pending` API and never touched the `select!` loop. Since
+//! all three driver shells now share one `wayfinder-driver-core` — the same
+//! receive handling, the same timer handling, the same transmit decision —
+//! stepping the tick driver exercises the same logic the tokio driver runs, and
+//! does it synchronously.
+//!
+//! What that does *not* cover is real [`LinkT`] plumbing, because the tick
+//! driver has no `LinkT` at all: interfaces are plain queues. That is
+//! [`LinkTestRouter`](crate::link_router::LinkTestRouter)'s job.
+//!
+//! [`LinkT`]: wayfinder::link::LinkT
 
-use std::io;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use interfaces::frame::LinkFrame;
 use interfaces::frame::MAX_LINK_FRAME_LEN;
 use interfaces::frame::Mac;
 use interfaces::link::LinkMetrics;
-use tokio::sync::mpsc;
 use wayfinder::CentralRouter;
 use wayfinder::config::TrickleConfig;
-use wayfinder_driver::Driver;
-use wayfinder_driver::DynLinkT;
-use wayfinder_driver::FrameIo;
-use wayfinder_driver::Link;
-use wayfinder_driver::QueryRx;
-use wayfinder_driver::QueryTx;
+use wayfinder_tick_driver::Driver;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
@@ -86,160 +84,46 @@ pub fn parse_frame(bytes: &[u8]) -> &LinkFrame {
     frame
 }
 
-// ── in-process transports ─────────────────────────────────────────────────────
-
-/// A [`FrameIo`] mesh transport backed by a [`PortComms`] duplex into the
-/// switch fabric.
-struct ChannelTransport {
-    egress: mpsc::Sender<Vec<u8>>,
-    ingress: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
-}
-
-impl From<PortComms> for ChannelTransport {
-    fn from(pc: PortComms) -> Self {
-        Self {
-            egress: pc.egress,
-            ingress: tokio::sync::Mutex::new(pc.ingress),
-        }
-    }
-}
-
-#[async_trait]
-impl FrameIo for ChannelTransport {
-    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.ingress.lock().await.recv().await {
-            Some(frame) => Ok(copy_into(&frame, buf)),
-            // The duplex outlives the test; an exhausted channel must stay
-            // pending so the deterministic non-blocking poll reports "nothing
-            // ready" rather than a spurious zero-length frame.
-            None => std::future::pending().await,
-        }
-    }
-
-    async fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        tracing::trace!(len = buf.len(), "channel transport tx");
-        self.egress
-            .send(buf.to_vec())
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "switch port closed"))?;
-        Ok(buf.len())
-    }
-}
-
-/// The host-facing device for a test node: frames the router delivers locally
-/// are appended to a shared log instead of a kernel TAP, and the inbound side
-/// stays pending (host traffic is injected directly via
-/// [`Driver::inject_host_frame`]).
-pub struct ObservableEgress {
-    inbound: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
-    deliveries: Arc<Mutex<Vec<Vec<u8>>>>,
-}
-
-#[async_trait]
-impl FrameIo for ObservableEgress {
-    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        tracing::trace!("recv: waiting for frame");
-        let mut inbound = self.inbound.lock().await;
-        match inbound.recv().await {
-            Some(frame) => {
-                tracing::trace!(len = frame.len(), "recv: frame received");
-                Ok(copy_into(&frame, buf))
-            }
-            None => {
-                tracing::warn!("recv: channel closed");
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionReset,
-                    "Channel Closed",
-                ));
-            }
-        }
-    }
-
-    async fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        #[expect(
-            clippy::expect_used,
-            reason = "test harness: a poisoned mutex means another test thread already panicked, so this test is failing regardless"
-        )]
-        let mut deliveries = self.deliveries.lock().expect("deliveries mutex poisoned");
-        deliveries.push(buf.to_vec());
-        Ok(buf.len())
-    }
-}
-
-/// Copy `frame` into `buf`, returning the number of bytes written.
-fn copy_into(frame: &[u8], buf: &mut [u8]) -> usize {
-    let n = frame.len().min(buf.len());
-    buf[..n].copy_from_slice(&frame[..n]);
-    n
-}
-
 // ── TestRouter ────────────────────────────────────────────────────────────────
 
-/// A [`Driver`] wired to in-process channels for deterministic multi-node tests.
+/// One node in a simulated mesh: a tick driver plus its switch-port duplexes.
 ///
-/// Each [`poll`] and [`drain_all`] drives the underlying driver; locally
-/// delivered frames are captured in [`local_deliveries`].
+/// Frames move in three explicit moves, all synchronous — [`step`] pulls
+/// whatever the switch has delivered into the driver, advances it to `now`, and
+/// pushes whatever it produced back onto the ports. Locally delivered frames
+/// accumulate in [`local_deliveries`].
 ///
-/// [`poll`]: TestRouter::poll
-/// [`drain_all`]: TestRouter::drain_all
+/// [`step`]: TestRouter::step
 /// [`local_deliveries`]: TestRouter::local_deliveries
 pub struct TestRouter {
-    /// The underlying driver running the real event loop over channels.
-    driver: Driver<ObservableEgress>,
+    /// The tick driver running the shared planning core over plain queues.
+    driver: Driver,
     /// This node's mesh identifier.
     pub ident: Mac,
+    /// One switch-port duplex per mesh interface, in interface order.
+    ports: Vec<PortComms>,
     /// Inner frames the router handed up for local delivery (what would be
     /// written to the TAP), in arrival order.
-    deliveries: Arc<Mutex<Vec<Vec<u8>>>>,
-    /// Kept alive so the host-inbound channel never closes (the driver's
-    /// host-device select arm must stay pending, not resolve to `None`).
-    host_in: mpsc::Sender<Vec<u8>>,
-    /// Kept alive so the management-query channel stays open.
-    _query_tx: QueryTx,
+    deliveries: Vec<Vec<u8>>,
 }
 
 impl TestRouter {
-    /// Create a new test router with the given node identity, one switch-port
-    /// duplex per mesh interface, and that interface's per-link OGM backoff
-    /// bounds (in interface order; missing entries default).
+    /// Create a test router with the given identity, one switch-port duplex per
+    /// mesh interface, and that interface's per-link OGM backoff bounds (in
+    /// interface order; missing entries default).
     pub fn new(ident: Mac, interfaces: Vec<PortComms>, trickle: Vec<TrickleConfig>) -> Self {
-        let links: Vec<Box<DynLinkT<'static>>> = interfaces
-            .into_iter()
-            .map(|pc| DynLinkT::new_box(Link::new(ChannelTransport::from(pc))))
-            .collect();
-        Self::from_links(ident, links, trickle)
-    }
-
-    /// Create a new test router from already-constructed mesh links, one per
-    /// interface (in interface order), with that interface's per-link OGM
-    /// backoff bounds (missing entries default). Unlike [`new`](Self::new),
-    /// which always builds channel-based (`Switch`-backed) links, this lets a
-    /// caller mix in a non-channel `LinkT` implementation — e.g. a real
-    /// `rylr998::RylrClient` boxed as `DynLinkT` — for tests that need to
-    /// exercise an actual link driver rather than the in-process channel
-    /// fabric.
-    pub fn from_links(
-        ident: Mac,
-        links: Vec<Box<DynLinkT<'static>>>,
-        trickle: Vec<TrickleConfig>,
-    ) -> Self {
-        let deliveries = Arc::new(Mutex::new(Vec::new()));
-        let (host_in, host_rx) = mpsc::channel(64);
-        let local = ObservableEgress {
-            inbound: tokio::sync::Mutex::new(host_rx),
-            deliveries: deliveries.clone(),
-        };
-        let (query_tx, query_rx): (QueryTx, QueryRx) = mpsc::channel(16);
-
+        // The driver's interface count comes from the trickle slice, so pad it
+        // to the port count when a caller supplied fewer entries than links.
+        let mut trickle = trickle;
+        trickle.resize(interfaces.len(), TrickleConfig::default());
         Self {
-            // Links default to full participation here; a test that needs a
+            // Links default to full participation; a test that needs a
             // partially participating link sets it afterward via
             // `router_mut().set_link_features(..)`.
-            driver: Driver::new(ident, local, links, trickle, Vec::new(), query_rx),
+            driver: Driver::new(ident, &trickle, &[]),
             ident,
-            deliveries,
-            host_in,
-            _query_tx: query_tx,
+            ports: interfaces,
+            deliveries: Vec::new(),
         }
     }
 
@@ -255,68 +139,71 @@ impl TestRouter {
         self.driver.router_mut()
     }
 
-    /// Get the underlying driver for this router.
-    pub fn driver(&mut self) -> &mut Driver<ObservableEgress> {
-        &mut self.driver
+    /// Pin the unix time that `now == 0` means, so certificate validity is
+    /// judged against a real clock while tests keep driving a virtual one.
+    pub fn set_auth_epoch_unix(&mut self, epoch_unix: u64) {
+        self.driver.set_auth_epoch_unix(epoch_unix);
     }
 
     /// The inner frames the router has delivered locally so far (the full host
     /// Ethernet frames that would have been written to the TAP), in order.
     pub fn local_deliveries(&self) -> Vec<Vec<u8>> {
-        #[expect(
-            clippy::expect_used,
-            reason = "test harness: a poisoned mutex means another test thread already panicked, so this test is failing regardless"
-        )]
-        let deliveries = self.deliveries.lock().expect("deliveries mutex poisoned");
-        deliveries.clone()
+        self.deliveries.clone()
     }
 
-    // ── outbound ─────────────────────────────────────────────────────────────
+    // ── stepping ─────────────────────────────────────────────────────────────
 
-    /// Drive one periodic tick at `now`, emitting an OGM for each interface whose
-    /// Trickle timer is due — the deterministic counterpart to the production
-    /// periodic loop ([`Driver::poll_due`]).  This is the only emission path:
-    /// like production, each due interface emits its own distinct-seqno OGM, so
-    /// tests exercise the real per-interface dynamics rather than a lockstep
-    /// single-seqno flood.
-    pub async fn poll_due(&mut self, now: Duration) {
-        #[expect(
-            clippy::expect_used,
-            reason = "test harness: the in-process channel transports have no failure mode reachable from a test"
-        )]
-        {
-            self.driver
-                .poll_due(now)
-                .await
-                .expect("poll_due dispatch failed");
-        }
+    /// Advance this node to `now`: take delivery of whatever the switch has
+    /// queued, run one driver tick, and hand back whatever it produced.
+    ///
+    /// The single step every other driving method is built from. One call is
+    /// one round of "receive, decide, transmit" — a frame received here is
+    /// forwarded on this same call, not the next.
+    pub fn step(&mut self, now: Duration) {
+        self.step_schedules(now, true, true);
     }
 
-    /// Time until this node's soonest interface is next due to emit an OGM, as of
-    /// `now` — used by the harness to advance the virtual clock event-to-event.
+    /// [`step`](Self::step), servicing only the selected periodic schedules.
+    ///
+    /// The split matters for fault injection: driving OGMs without keep-alives
+    /// is how a test reproduces a node whose liveness signal has stopped while
+    /// its routing chatter continues.
+    pub fn step_schedules(&mut self, now: Duration, ogms: bool, keepalives: bool) {
+        self.pump_in();
+        self.driver.tick_schedules(now, ogms, keepalives);
+        self.pump_out();
+    }
+
+    /// Drive one periodic tick at `now`, emitting an OGM for each interface
+    /// whose Trickle timer is due.  Like production, each due interface emits
+    /// its own distinct-seqno OGM, so tests exercise the real per-interface
+    /// dynamics rather than a lockstep single-seqno flood.
+    pub fn poll_due(&mut self, now: Duration) {
+        self.step_schedules(now, true, false);
+    }
+
+    /// Drive one periodic keep-alive tick at `now`. A test wanting keep-alive
+    /// active on an interface arms it first via
+    /// `router_mut().configure_interface_keepalive(idx, Some(interval), now)`.
+    ///
+    /// Deliberately *only* the keep-alive schedule, mirroring the async
+    /// driver's `poll_due_keepalive`: a test drives the two independently so it
+    /// can stop one and leave the other running.
+    pub fn poll_due_keepalive(&mut self, now: Duration) {
+        self.step_schedules(now, false, true);
+    }
+
+    /// Drain every frame the switch has delivered, through the driver, at
+    /// `now`.
+    pub fn drain_all(&mut self, now: Duration) {
+        self.step_schedules(now, false, false);
+    }
+
+    /// Time until this node's soonest interface is next due to emit an OGM, as
+    /// of `now` — used by the harness to advance the virtual clock
+    /// event-to-event.
     pub fn next_broadcast_after(&self, now: Duration) -> Duration {
         self.router().next_broadcast_after(now)
-    }
-
-    /// Drive one periodic keep-alive tick at `now`, emitting a heartbeat for
-    /// each interface whose fixed-cadence timer is due — the deterministic
-    /// counterpart to the production periodic loop
-    /// ([`Driver::poll_due_keepalive`]). A test wanting keep-alive active on
-    /// an interface arms it first via
-    /// `router_mut().configure_interface_keepalive(idx, Some(interval), now)`,
-    /// same pattern as `set_link_features` — this is not a `TestRouter::new`/
-    /// `from_links` constructor parameter.
-    pub async fn poll_due_keepalive(&mut self, now: Duration) {
-        #[expect(
-            clippy::expect_used,
-            reason = "test harness: the in-process channel transports have no failure mode reachable from a test"
-        )]
-        {
-            self.driver
-                .poll_due_keepalive(now)
-                .await
-                .expect("poll_due_keepalive dispatch failed");
-        }
     }
 
     /// Time until this node's soonest interface is next due to emit a
@@ -327,40 +214,23 @@ impl TestRouter {
 
     /// Inject host application data destined for `dest` into the mesh.
     ///
-    /// Wraps `payload` in a host Ethernet frame (see [`host_frame`]) addressed
-    /// to `dest` and hands it to the driver as if the host had emitted it on
-    /// the TAP, so the egress copies are dispatched immediately.
-    pub async fn send_local(&mut self, dest: Mac, payload: &[u8]) -> anyhow::Result<()> {
+    /// Wraps `payload` in a host Ethernet frame (see [`host_frame`]) and queues
+    /// it as if the host had emitted it on the TAP. It is dispatched on the
+    /// next [`step`](Self::step), matching how the production loop picks host
+    /// frames up on its next pass.
+    pub fn send_local(&mut self, dest: Mac, payload: &[u8]) {
         let eth = host_frame(dest, self.ident, payload);
-        self.host_in.send(eth.clone()).await?;
-        tracing::trace!(len = eth.len(), "send_local: frame sent");
-        Ok(())
-    }
-
-    // ── inbound ───────────────────────────────────────────────────────────────
-
-    /// Drain every currently-pending frame across all mesh interfaces (and the
-    /// host/query channels) through the driver in one non-blocking sweep.
-    pub async fn drain_all(&mut self) {
-        #[expect(
-            clippy::expect_used,
-            reason = "test harness: the in-process channel transports have no failure mode reachable from a test"
-        )]
-        {
-            self.driver
-                .process_pending()
-                .await
-                .expect("process_pending failed");
-        }
+        tracing::trace!(len = eth.len(), "send_local: frame queued");
+        self.driver.queue_local_send(dest, &eth);
     }
 
     /// Feed one crafted wire frame to the router with explicit [`LinkMetrics`],
     /// as if the radio had reported that RSSI/SNR on interface `iface_idx`.
     ///
-    /// The channel transports cannot carry per-frame metrics, so this drives
-    /// the router directly; any re-flood reply is discarded (these tests assert
-    /// on routing state, not on forwarded frames).
-    pub async fn receive_with_metrics(
+    /// The switch ports cannot carry per-frame metrics, so this drives the
+    /// router directly; any re-flood reply is discarded (these tests assert on
+    /// routing state, not on forwarded frames).
+    pub fn receive_with_metrics(
         &mut self,
         now: Duration,
         iface_idx: usize,
@@ -373,5 +243,36 @@ impl TestRouter {
             .driver
             .router_mut()
             .handle_frame_with_metrics(now, iface_idx, frame, metrics, &mut buf);
+    }
+
+    // ── port plumbing ────────────────────────────────────────────────────────
+
+    /// Move everything the switch has delivered on each port into the driver's
+    /// receive queue for that interface.
+    fn pump_in(&mut self) {
+        for (idx, port) in self.ports.iter_mut().enumerate() {
+            while let Ok(frame) = port.ingress.try_recv() {
+                // A malformed frame on the fabric is a harness bug, not a
+                // scenario under test — the switch only ever carries frames a
+                // driver serialized.
+                let _ = self.driver.push_rx(idx, LinkMetrics::default(), &frame);
+            }
+        }
+    }
+
+    /// Move everything the driver produced onto the switch ports, and collect
+    /// anything it delivered locally.
+    fn pump_out(&mut self) {
+        for (idx, port) in self.ports.iter_mut().enumerate() {
+            while let Some(frame) = self.driver.poll_egress(idx) {
+                tracing::trace!(len = frame.len(), iface = idx, "port tx");
+                // A full or closed port drops the frame, exactly as a lossy
+                // medium would; the switch's own loss config models that too.
+                let _ = port.egress.try_send(frame);
+            }
+        }
+        while let Some(inner) = self.driver.poll_local() {
+            self.deliveries.push(inner);
+        }
     }
 }

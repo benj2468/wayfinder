@@ -187,14 +187,13 @@ fn setup() {
 ///
 /// Delegates to [`TestHarness::converge`], which polls one OGM round and then
 /// ticks until the fabric is completely silent (no node has another frame to
-/// flood or forward).  That loop is unbounded, so this wraps it in a real-time
-/// `tokio` timeout: a mesh that never settles — e.g. an OGM forwarding loop —
-/// fails fast here instead of hanging, and the timeout serves as the
-/// "converged" assertion.
-async fn converge_at(h: &mut TestHarness, at: Duration) {
-    tokio::time::timeout(Duration::from_secs(10), h.converge(at))
-        .await
-        .expect("mesh did not converge within the timeout");
+/// flood or forward).  That loop is bounded by `settle`'s own sweep cap, so a
+/// mesh that never settles — e.g. an OGM forwarding loop — fails there with a
+/// diagnostic rather than hanging.  No wall-clock timeout is involved: the
+/// whole harness is synchronous, so "did it converge" is a property of the
+/// simulation, not of how fast the machine ran it.
+fn converge_at(h: &mut TestHarness, at: Duration) {
+    h.converge(at);
 }
 
 /// Age out routes that have stopped being refreshed by advancing the virtual
@@ -207,7 +206,7 @@ async fn converge_at(h: &mut TestHarness, at: Duration) {
 /// stay live — and, by keying off the *current* backoff rather than `i_max`,
 /// keeps the clock jump small after a brief convergence (so later absolute-time
 /// reconnect convergences still move forward).
-async fn age_out(h: &mut TestHarness) {
+fn age_out(h: &mut TestHarness) {
     let slowest = h
         .machines
         .values()
@@ -215,8 +214,7 @@ async fn age_out(h: &mut TestHarness) {
         .map(|e| e.current_interval)
         .max()
         .unwrap_or(Duration::from_secs(1));
-    h.advance_trickle(h.clock + slowest * (MAX_MISSED_OGMS + 2))
-        .await;
+    h.advance_trickle(h.clock + slowest * (MAX_MISSED_OGMS + 2));
 }
 
 fn simple_pair() -> TestHarness {
@@ -391,14 +389,14 @@ fn diamond(i_max_ms: u64) -> TestHarness {
     config.validate().unwrap()
 }
 
-#[tokio::test]
-async fn test_validate() {
+#[test]
+fn test_validate() {
     let config = TestConfig::default();
     assert!(config.validate().is_ok());
 }
 
-#[tokio::test]
-async fn test_multi_same_switch() {
+#[test]
+fn test_multi_same_switch() {
     let mut config = TestConfig::default();
     config.switches.push(TestSwitchConfig {
         name: "test1".into(),
@@ -409,9 +407,9 @@ async fn test_multi_same_switch() {
     assert!(config.validate().is_err());
 }
 
-#[tokio::test]
+#[test]
 #[should_panic]
-async fn test_invalid_switch() {
+fn test_invalid_switch() {
     let mut config = TestConfig::default();
     config.machines.push(TestMachineConfig {
         name: "foo".into(),
@@ -423,19 +421,19 @@ async fn test_invalid_switch() {
     assert!(config.validate().is_err());
 }
 
-#[tokio::test]
-async fn test_simple_pair() {
+#[test]
+fn test_simple_pair() {
     simple_pair();
 }
 
-#[tokio::test]
-async fn test_simple_pair_send_data() {
+#[test]
+fn test_simple_pair_send_data() {
     setup();
     let mut harness = simple_pair();
 
-    harness.poll_due(Duration::from_secs(1)).await;
-    harness.tick().await;
-    harness.tick().await;
+    harness.poll_due(Duration::from_secs(1));
+    harness.tick();
+    harness.tick();
 
     for router in harness.machines.values() {
         assert_eq!(router.router().originator_table().count(), 1);
@@ -448,12 +446,10 @@ async fn test_simple_pair_send_data() {
 
     harness
         .get_machine_mut("machine1")
-        .send_local(m2, b"Hello World")
-        .await
-        .unwrap();
+        .send_local(m2, b"Hello World");
 
-    harness.tick().await;
-    harness.tick().await;
+    harness.tick();
+    harness.tick();
 
     assert_eq!(
         harness.get_machine("machine2").local_deliveries(),
@@ -471,14 +467,14 @@ fn enable_auth(node: &mut TestRouter, authority: &wayfinder_auth::Authority, ide
         cert,
         authority.trust_anchor(),
     ));
-    node.driver().set_auth_epoch_unix(1_000);
+    node.set_auth_epoch_unix(1_000);
 }
 
 /// With auth enabled on both nodes, OGMs converge (signed) and a unicast is
 /// delivered with its pairwise tag verified and stripped — the host gets the
 /// clean payload, proving the directed data-plane tag wiring end to end.
-#[tokio::test]
-async fn test_authenticated_unicast_delivers_and_strips_tag() {
+#[test]
+fn test_authenticated_unicast_delivers_and_strips_tag() {
     setup();
     let mut harness = simple_pair();
 
@@ -491,21 +487,19 @@ async fn test_authenticated_unicast_delivers_and_strips_tag() {
 
     // Converge: signed OGMs exchange, so each node learns the other's pairwise
     // key (required to tag/verify directed frames).
-    harness.poll_due(Duration::from_secs(1)).await;
-    harness.tick().await;
-    harness.tick().await;
+    harness.poll_due(Duration::from_secs(1));
+    harness.tick();
+    harness.tick();
     for router in harness.machines.values() {
         assert_eq!(router.router().originator_table().count(), 1);
     }
 
     harness
         .get_machine_mut("machine1")
-        .send_local(m2, b"secret payload")
-        .await
-        .unwrap();
+        .send_local(m2, b"secret payload");
 
-    harness.tick().await;
-    harness.tick().await;
+    harness.tick();
+    harness.tick();
 
     // Delivered payload is the original — the 24-byte tag trailer was verified
     // and stripped, not handed to the host.
@@ -521,8 +515,8 @@ async fn test_authenticated_unicast_delivers_and_strips_tag() {
 /// after the purge propagates machine2 learns it *purely from machine1's OGM*
 /// (no direct API call) and machine3 ages out of both survivors' routing
 /// tables, because its own OGMs are now dropped.
-#[tokio::test]
-async fn test_revocation_floods_and_shuns_node() {
+#[test]
+fn test_revocation_floods_and_shuns_node() {
     setup();
     let mut harness = line_of_three();
     let m1 = harness.get_machine("machine1").ident;
@@ -535,7 +529,7 @@ async fn test_revocation_floods_and_shuns_node() {
     enable_auth(harness.get_machine_mut("machine3"), &authority, m3, 4);
 
     // Converge: every node learns the other two over signed OGMs.
-    converge_at(&mut harness, Duration::from_secs(1)).await;
+    converge_at(&mut harness, Duration::from_secs(1));
     for r in harness.machines.values() {
         assert_eq!(r.router().originator_count(), 2);
     }
@@ -552,8 +546,8 @@ async fn test_revocation_floods_and_shuns_node() {
     );
 
     // Drive an OGM round so the purge floods, then age out the shunned node.
-    converge_at(&mut harness, Duration::from_secs(2)).await;
-    age_out(&mut harness).await;
+    converge_at(&mut harness, Duration::from_secs(2));
+    age_out(&mut harness);
 
     // machine2 learned the revocation purely by verifying machine1's OGM.
     assert!(
@@ -596,22 +590,22 @@ async fn test_revocation_floods_and_shuns_node() {
     );
 }
 
-#[tokio::test]
-async fn test_line_of_three() {
+#[test]
+fn test_line_of_three() {
     line_of_three();
 }
 
-#[tokio::test]
-async fn test_line_of_three_send_data() {
+#[test]
+fn test_line_of_three_send_data() {
     setup();
     let mut harness = line_of_three();
 
-    harness.poll_due(Duration::from_secs(1)).await;
-    harness.tick().await;
-    harness.tick().await;
-    harness.tick().await;
-    harness.tick().await;
-    harness.tick().await;
+    harness.poll_due(Duration::from_secs(1));
+    harness.tick();
+    harness.tick();
+    harness.tick();
+    harness.tick();
+    harness.tick();
 
     for router in harness.machines.values() {
         assert_eq!(router.router().originator_table().count(), 2);
@@ -621,13 +615,11 @@ async fn test_line_of_three_send_data() {
     let m3 = harness.get_machine("machine3").ident;
     harness
         .get_machine_mut("machine1")
-        .send_local(m3, b"Hello World")
-        .await
-        .unwrap();
+        .send_local(m3, b"Hello World");
 
-    harness.tick().await;
-    harness.tick().await;
-    harness.tick().await;
+    harness.tick();
+    harness.tick();
+    harness.tick();
 
     assert_eq!(
         harness.get_machine("machine3").local_deliveries(),
@@ -644,15 +636,15 @@ async fn test_line_of_three_send_data() {
 /// `add_switch_port`, standing in for the requester logic a later phase
 /// adds) rather than through any `CentralRouter` API, since this phase only
 /// implements wire types + engine/router forwarding — not origination.
-#[tokio::test]
-async fn cert_req_relays_across_the_mesh_and_does_not_reach_the_host() {
+#[test]
+fn cert_req_relays_across_the_mesh_and_does_not_reach_the_host() {
     setup();
     let mut harness = line_of_three();
 
     // Bootstrap routing so machine2 has a live route to machine3.
-    harness.poll_due(Duration::from_secs(1)).await;
+    harness.poll_due(Duration::from_secs(1));
     for _ in 0..5 {
-        harness.tick().await;
+        harness.tick();
     }
     for router in harness.machines.values() {
         assert_eq!(router.router().originator_table().count(), 2);
@@ -703,10 +695,10 @@ async fn cert_req_relays_across_the_mesh_and_does_not_reach_the_host() {
     let mut inner = cert_req_hdr.as_bytes().to_vec();
     inner.extend_from_slice(b"requester cert + sig");
     let wire = build_frame(m1, m2, DEFAULT_BATMAN_ETHER_TYPE, &inner);
-    raw_port.egress.send(wire).await.unwrap();
+    raw_port.egress.try_send(wire).unwrap();
 
     for _ in 0..3 {
-        harness.tick().await;
+        harness.tick();
     }
 
     assert_eq!(
@@ -726,8 +718,8 @@ async fn cert_req_relays_across_the_mesh_and_does_not_reach_the_host() {
 /// A broadcast (e.g. an ARP) needs no route: machine1 floods it and
 /// machine2 must deliver the inner frame to its local host.  No OGM
 /// convergence is required because broadcasts reach every interface.
-#[tokio::test]
-async fn broadcast_is_delivered_locally_at_neighbor() {
+#[test]
+fn broadcast_is_delivered_locally_at_neighbor() {
     setup();
     let mut harness = simple_pair();
 
@@ -735,12 +727,10 @@ async fn broadcast_is_delivered_locally_at_neighbor() {
     let m1 = harness.get_machine("machine1").ident;
     harness
         .get_machine_mut("machine1")
-        .send_local(Mac::BROADCAST, arp)
-        .await
-        .expect("broadcast packet should build");
+        .send_local(Mac::BROADCAST, arp);
 
-    harness.tick().await;
-    harness.tick().await;
+    harness.tick();
+    harness.tick();
 
     assert_eq!(
         harness.get_machine("machine2").local_deliveries(),
@@ -752,8 +742,8 @@ async fn broadcast_is_delivered_locally_at_neighbor() {
 /// machine1's only link, its locally originated broadcast is suppressed at the
 /// driver's egress fan-out and never reaches machine2 — proving the per-link
 /// transmit gate (`link_may_tx`) actually keeps the flood off the wire.
-#[tokio::test]
-async fn broadcast_suppressed_on_tx_data_disabled_link() {
+#[test]
+fn broadcast_suppressed_on_tx_data_disabled_link() {
     setup();
     let mut harness = simple_pair();
 
@@ -771,12 +761,10 @@ async fn broadcast_suppressed_on_tx_data_disabled_link() {
     let arp = b"i am a broadcast frame";
     harness
         .get_machine_mut("machine1")
-        .send_local(Mac::BROADCAST, arp)
-        .await
-        .expect("broadcast packet should build");
+        .send_local(Mac::BROADCAST, arp);
 
-    harness.tick().await;
-    harness.tick().await;
+    harness.tick();
+    harness.tick();
 
     assert!(
         harness
@@ -793,8 +781,8 @@ async fn broadcast_suppressed_on_tx_data_disabled_link() {
 /// announces onto the far link, so machine3 never learns machine1 — the
 /// re-flood (transit) path, exercised through the real driver dispatch, is
 /// suppressed distinctly from own-OGM emission.
-#[tokio::test]
-async fn ogm_reflood_suppressed_on_tx_ogm_disabled_link() {
+#[test]
+fn ogm_reflood_suppressed_on_tx_ogm_disabled_link() {
     setup();
     let f = LinkFeatures {
         tx_ogm: false, // machine2 stays OGM-silent toward machine3
@@ -803,7 +791,7 @@ async fn ogm_reflood_suppressed_on_tx_ogm_disabled_link() {
     let mut harness = line_of_three_mid_gated(f);
 
     let m1 = harness.get_machine("machine1").ident;
-    converge_at(&mut harness, Duration::from_secs(1)).await;
+    converge_at(&mut harness, Duration::from_secs(1));
 
     // The OGM path up to the middle node works: machine2 learned machine1.
     assert!(
@@ -834,8 +822,8 @@ async fn ogm_reflood_suppressed_on_tx_ogm_disabled_link() {
 /// the "control station" one hop further out — never learns machine3, because
 /// machine2 doesn't re-flood a route it couldn't honor. This is the anti-black-
 /// hole rule that closes the "advertise but can't deliver" gap.
-#[tokio::test]
-async fn tx_data_off_link_is_not_readvertised_to_peers() {
+#[test]
+fn tx_data_off_link_is_not_readvertised_to_peers() {
     setup();
     let f = LinkFeatures {
         tx_data: false, // machine2 can't deliver onto the far link ⇒ won't advertise it
@@ -844,7 +832,7 @@ async fn tx_data_off_link_is_not_readvertised_to_peers() {
     let mut harness = line_of_three_mid_gated(f);
 
     let m3 = harness.get_machine("machine3").ident;
-    converge_at(&mut harness, Duration::from_secs(1)).await;
+    converge_at(&mut harness, Duration::from_secs(1));
 
     // The fronting node itself sees machine3 (learned locally for visibility).
     assert!(
@@ -873,16 +861,16 @@ async fn tx_data_off_link_is_not_readvertised_to_peers() {
 /// and likewise machine0 → machine1 lands only at machine1.  The negative
 /// deliveries stand in for the per-port tap assertions of the old test —
 /// the switch's learned forwarding is what keeps the wrong node silent.
-#[tokio::test]
-async fn three_routers_all_connected_discover_and_exchange() {
+#[test]
+fn three_routers_all_connected_discover_and_exchange() {
     setup();
     let mut harness = one_switch_with_machines(3);
 
     // Two rounds of OGMs so every node learns direct routes to the others.
-    harness.poll_due(Duration::from_secs(1)).await;
-    harness.tick().await;
-    harness.tick().await;
-    harness.tick().await;
+    harness.poll_due(Duration::from_secs(1));
+    harness.tick();
+    harness.tick();
+    harness.tick();
 
     for router in harness.machines.values() {
         assert_eq!(router.router().originator_table().count(), 2);
@@ -894,17 +882,15 @@ async fn three_routers_all_connected_discover_and_exchange() {
     let m2 = harness.get_machine("machine2").ident;
     harness
         .get_machine_mut("machine0")
-        .send_local(m2, b"hello from 0 to 2")
-        .await
-        .expect("machine0 must have a direct route to machine2");
+        .send_local(m2, b"hello from 0 to 2");
 
-    harness.tick().await;
-    harness.tick().await;
-    harness.tick().await;
-    harness.tick().await;
-    harness.tick().await;
-    harness.tick().await;
-    harness.tick().await;
+    harness.tick();
+    harness.tick();
+    harness.tick();
+    harness.tick();
+    harness.tick();
+    harness.tick();
+    harness.tick();
 
     assert_eq!(
         harness.get_machine("machine2").local_deliveries(),
@@ -923,17 +909,15 @@ async fn three_routers_all_connected_discover_and_exchange() {
     let m1 = harness.get_machine("machine1").ident;
     harness
         .get_machine_mut("machine0")
-        .send_local(m1, b"hello from 0 to 1")
-        .await
-        .expect("machine0 must have a direct route to machine1");
+        .send_local(m1, b"hello from 0 to 1");
 
-    harness.tick().await;
-    harness.tick().await;
-    harness.tick().await;
-    harness.tick().await;
-    harness.tick().await;
-    harness.tick().await;
-    harness.tick().await;
+    harness.tick();
+    harness.tick();
+    harness.tick();
+    harness.tick();
+    harness.tick();
+    harness.tick();
+    harness.tick();
 
     assert_eq!(
         harness.get_machine("machine1").local_deliveries(),
@@ -954,16 +938,16 @@ async fn three_routers_all_connected_discover_and_exchange() {
 /// sequence number already seen — instead keeps OGMs circulating until their
 /// TTL drains (~50 hops), which this test catches as OGM traffic that never
 /// ceases.
-#[tokio::test]
-async fn ogms_stop_after_convergence() {
+#[test]
+fn ogms_stop_after_convergence() {
     setup();
     let mut harness = line_of_three();
 
     // Converge, then drain every in-flight OGM from the initial poll so the
     // fabric is quiet before we begin measuring.
-    harness.poll_due(Duration::from_secs(1)).await;
+    harness.poll_due(Duration::from_secs(1));
     for _ in 0..80 {
-        harness.tick().await;
+        harness.tick();
     }
     for router in harness.machines.values() {
         assert_eq!(router.router().originator_table().count(), 2);
@@ -974,12 +958,12 @@ async fn ogms_stop_after_convergence() {
 
     // Emit one fresh OGM from every node.  In a loop-free mesh this single
     // round reaches every node and then dies within the network diameter.
-    harness.poll_due(Duration::from_secs(2)).await;
+    harness.poll_due(Duration::from_secs(2));
 
     // 4 ticks are the required number for the network to settle here
     const SETTLE_TICKS: usize = 4;
     for _ in 0..SETTLE_TICKS {
-        harness.tick().await;
+        harness.tick();
     }
     let after_settle = counter.load(Ordering::Relaxed);
 
@@ -987,7 +971,7 @@ async fn ogms_stop_after_convergence() {
     // mesh has nothing left to forward.
     const QUIET_TICKS: usize = 20;
     for _ in 0..QUIET_TICKS {
-        harness.tick().await;
+        harness.tick();
     }
     assert_eq!(
         counter.load(Ordering::Relaxed),
@@ -1007,8 +991,8 @@ async fn ogms_stop_after_convergence() {
 /// until the stale path is aged out and the best hop recomputed from what
 /// remains.  Time is driven by the harness's virtual clock so the staleness is
 /// deterministic, not wall-clock dependent.
-#[tokio::test]
-async fn traffic_fails_over_when_best_next_hop_disconnects() {
+#[test]
+fn traffic_fails_over_when_best_next_hop_disconnects() {
     setup();
     let mut harness = two_paths_unequal_length();
 
@@ -1019,9 +1003,9 @@ async fn traffic_fails_over_when_best_next_hop_disconnects() {
 
     // Converge: a few poll rounds, each fully drained.
     for round in 1..=3 {
-        harness.poll_due(Duration::from_secs(round)).await;
+        harness.poll_due(Duration::from_secs(round));
         for _ in 0..10 {
-            harness.tick().await;
+            harness.tick();
         }
     }
 
@@ -1051,9 +1035,9 @@ async fn traffic_fails_over_when_best_next_hop_disconnects() {
     // refreshing, far beyond any reasonable neighbor timeout, so the stale `b`
     // path ages out and `a` recomputes its best hop.
     for secs in (100..=1000).step_by(100) {
-        harness.poll_due(Duration::from_secs(secs)).await;
+        harness.poll_due(Duration::from_secs(secs));
         for _ in 0..10 {
-            harness.tick().await;
+            harness.tick();
         }
     }
 
@@ -1067,10 +1051,8 @@ async fn traffic_fails_over_when_best_next_hop_disconnects() {
     // long way round via c→e.
     harness
         .get_machine_mut("a")
-        .send_local(d, b"hello via failover")
-        .await
-        .expect("a must have a route to d after failover");
-    harness.settle().await;
+        .send_local(d, b"hello via failover");
+    harness.settle();
     assert_eq!(
         harness.get_machine("d").local_deliveries(),
         vec![host_frame(d, a, b"hello via failover")],
@@ -1084,8 +1066,8 @@ async fn traffic_fails_over_when_best_next_hop_disconnects() {
 /// machine1's table (no refresh for `MAX_MISSED_OGMS` of machine1's OGM rounds).
 /// When the *same* node (same identity, empty tables) comes back, both must
 /// rediscover each other and a unicast must flow again.
-#[tokio::test]
-async fn route_restored_after_neighbor_reconnects() {
+#[test]
+fn route_restored_after_neighbor_reconnects() {
     setup();
     let mut harness = simple_pair();
     let m1 = harness.get_machine("machine1").ident;
@@ -1095,7 +1077,7 @@ async fn route_restored_after_neighbor_reconnects() {
     // neighbor *and* its steady OGM cadence (~1 s/round), which sets the
     // observed-rate purge budget the age-out below relies on.
     for round in 1..=3 {
-        converge_at(&mut harness, Duration::from_secs(round)).await;
+        converge_at(&mut harness, Duration::from_secs(round));
     }
     assert_eq!(
         harness.get_machine("machine1").router().originator_count(),
@@ -1109,7 +1091,7 @@ async fn route_restored_after_neighbor_reconnects() {
     // machine2 powers off.  Drive enough OGM rounds with only machine1 polling
     // that its now-unrefreshed route to machine2 ages out by round gap.
     harness.disconnect_machine("machine2");
-    age_out(&mut harness).await;
+    age_out(&mut harness);
     assert_eq!(
         harness.get_machine("machine1").router().originator_count(),
         0,
@@ -1118,7 +1100,7 @@ async fn route_restored_after_neighbor_reconnects() {
 
     // machine2 returns with its original identity but empty tables.
     harness.reconnect_machine("machine2");
-    converge_at(&mut harness, Duration::from_secs(160)).await;
+    converge_at(&mut harness, Duration::from_secs(160));
     assert_eq!(
         harness.get_machine("machine1").router().originator_count(),
         1,
@@ -1133,10 +1115,8 @@ async fn route_restored_after_neighbor_reconnects() {
     // End-to-end: a unicast flows again over the restored direct link.
     harness
         .get_machine_mut("machine1")
-        .send_local(m2, b"welcome back")
-        .await
-        .unwrap();
-    harness.settle().await;
+        .send_local(m2, b"welcome back");
+    harness.settle();
     assert_eq!(
         harness.get_machine("machine2").local_deliveries(),
         vec![host_frame(m2, m1, b"welcome back")],
@@ -1149,14 +1129,14 @@ async fn route_restored_after_neighbor_reconnects() {
 /// machine1's originator table, machine1's link-quality table must drop
 /// machine2's row too. Otherwise the management API's Link Quality view keeps
 /// showing a neighbor the Routing Table view has already forgotten.
-#[tokio::test]
-async fn link_quality_entry_pruned_when_neighbor_ages_out() {
+#[test]
+fn link_quality_entry_pruned_when_neighbor_ages_out() {
     setup();
     let mut harness = simple_pair();
     let m2 = harness.get_machine("machine2").ident;
 
     for round in 1..=3 {
-        converge_at(&mut harness, Duration::from_secs(round)).await;
+        converge_at(&mut harness, Duration::from_secs(round));
     }
     assert_eq!(
         harness.get_machine("machine1").router().originator_count(),
@@ -1173,7 +1153,7 @@ async fn link_quality_entry_pruned_when_neighbor_ages_out() {
     );
 
     harness.disconnect_machine("machine2");
-    age_out(&mut harness).await;
+    age_out(&mut harness);
     assert_eq!(
         harness.get_machine("machine1").router().originator_count(),
         0,
@@ -1196,8 +1176,8 @@ async fn link_quality_entry_pruned_when_neighbor_ages_out() {
 /// through machine2.  Dropping machine2 leaves machine1 with no route once the
 /// stale entry ages out — machine3 hears nothing more — and reconnecting it
 /// restores delivery.
-#[tokio::test]
-async fn sole_relay_disconnect_blackholes_then_recovers() {
+#[test]
+fn sole_relay_disconnect_blackholes_then_recovers() {
     setup();
     let mut harness = line_of_three();
     let m1 = harness.get_machine("machine1").ident;
@@ -1207,17 +1187,15 @@ async fn sole_relay_disconnect_blackholes_then_recovers() {
     // cadence (~1 s/round) so the age-out below has an observed-rate budget —
     // then confirm the baseline machine1 → machine3 delivery over the relay.
     for round in 1..=3 {
-        converge_at(&mut harness, Duration::from_secs(round)).await;
+        converge_at(&mut harness, Duration::from_secs(round));
     }
     for r in harness.machines.values() {
         assert_eq!(r.router().originator_count(), 2);
     }
     harness
         .get_machine_mut("machine1")
-        .send_local(m3, b"before")
-        .await
-        .unwrap();
-    harness.settle().await;
+        .send_local(m3, b"before");
+    harness.settle();
     assert_eq!(
         harness.get_machine("machine3").local_deliveries(),
         vec![host_frame(m3, m1, b"before")],
@@ -1227,18 +1205,14 @@ async fn sole_relay_disconnect_blackholes_then_recovers() {
     // The sole relay drops.  After the stale routes age out machine1 has nowhere
     // to forward, so a send must not reach machine3.
     harness.disconnect_machine("machine2");
-    age_out(&mut harness).await;
+    age_out(&mut harness);
     assert_eq!(
         harness.get_machine("machine1").router().originator_count(),
         0,
         "with the relay gone, machine1's routes to both 2 and 3 age out"
     );
-    harness
-        .get_machine_mut("machine1")
-        .send_local(m3, b"lost")
-        .await
-        .ok();
-    harness.settle().await;
+    harness.get_machine_mut("machine1").send_local(m3, b"lost");
+    harness.settle();
     assert_eq!(
         harness.get_machine("machine3").local_deliveries(),
         vec![host_frame(m3, m1, b"before")],
@@ -1247,7 +1221,7 @@ async fn sole_relay_disconnect_blackholes_then_recovers() {
 
     // The relay returns; after re-convergence the path heals end-to-end.
     harness.reconnect_machine("machine2");
-    converge_at(&mut harness, Duration::from_secs(160)).await;
+    converge_at(&mut harness, Duration::from_secs(160));
     for name in ["machine1", "machine2", "machine3"] {
         assert_eq!(
             harness.get_machine(name).router().originator_count(),
@@ -1255,12 +1229,8 @@ async fn sole_relay_disconnect_blackholes_then_recovers() {
             "{name} must re-converge after the relay returns"
         );
     }
-    harness
-        .get_machine_mut("machine1")
-        .send_local(m3, b"after")
-        .await
-        .unwrap();
-    harness.settle().await;
+    harness.get_machine_mut("machine1").send_local(m3, b"after");
+    harness.settle();
     assert_eq!(
         harness.get_machine("machine3").local_deliveries(),
         vec![host_frame(m3, m1, b"before"), host_frame(m3, m1, b"after"),],
@@ -1274,8 +1244,8 @@ async fn sole_relay_disconnect_blackholes_then_recovers() {
 /// forces failover to the lower-TQ `c→e` path; when `b` returns its higher-TQ
 /// OGMs must promote it back to best next hop (the engine lowers `max_tq` to the
 /// surviving path on purge, so the returning higher-TQ path wins again).
-#[tokio::test(start_paused = true)]
-async fn best_hop_reclaims_preferred_path_after_reconnect() {
+#[test]
+fn best_hop_reclaims_preferred_path_after_reconnect() {
     setup();
     let mut harness = two_paths_unequal_length();
     let a = harness.get_machine("a").ident;
@@ -1293,7 +1263,7 @@ async fn best_hop_reclaims_preferred_path_after_reconnect() {
 
     // Converge: `a` prefers the 2-hop path via `b`.
     for round in 1..=3 {
-        converge_at(&mut harness, Duration::from_secs(round)).await;
+        converge_at(&mut harness, Duration::from_secs(round));
     }
     assert_eq!(
         best_hop_to_d(&harness),
@@ -1303,7 +1273,7 @@ async fn best_hop_reclaims_preferred_path_after_reconnect() {
 
     // `b` drops; after the stale high-TQ path ages out, `a` fails over to c→e.
     harness.disconnect_machine("b");
-    age_out(&mut harness).await;
+    age_out(&mut harness);
     assert_eq!(
         best_hop_to_d(&harness),
         Some(c),
@@ -1313,7 +1283,7 @@ async fn best_hop_reclaims_preferred_path_after_reconnect() {
     // `b` returns; its shorter, higher-TQ path must be reclaimed as preferred.
     harness.reconnect_machine("b");
     for secs in (700..=1200).step_by(100) {
-        converge_at(&mut harness, Duration::from_secs(secs)).await;
+        converge_at(&mut harness, Duration::from_secs(secs));
     }
     assert_eq!(
         best_hop_to_d(&harness),
@@ -1324,10 +1294,8 @@ async fn best_hop_reclaims_preferred_path_after_reconnect() {
     // And traffic flows over the restored preferred path.
     harness
         .get_machine_mut("a")
-        .send_local(d, b"preferred again")
-        .await
-        .unwrap();
-    harness.settle().await;
+        .send_local(d, b"preferred again");
+    harness.settle();
     assert_eq!(
         harness.get_machine("d").local_deliveries(),
         vec![host_frame(d, a, b"preferred again")],
@@ -1339,29 +1307,29 @@ async fn best_hop_reclaims_preferred_path_after_reconnect() {
 /// offline/online several times, the mesh must still converge and carry traffic.
 /// Each cycle keeps machine2 down long enough for its routes to age out, then
 /// brings it back, stressing the relearning path under repeated disruption.
-#[tokio::test]
-async fn flapping_relay_reconverges() {
+#[test]
+fn flapping_relay_reconverges() {
     setup();
     let mut harness = line_of_three();
     let m1 = harness.get_machine("machine1").ident;
     let m3 = harness.get_machine("machine3").ident;
 
-    converge_at(&mut harness, Duration::from_secs(1)).await;
+    converge_at(&mut harness, Duration::from_secs(1));
 
     // Flap the relay three times.  Each down leg drives enough OGM rounds for the
     // relay's routes to fully age out before it returns on the up leg.
     for _ in 0..3 {
         harness.disconnect_machine("machine2");
-        age_out(&mut harness).await;
+        age_out(&mut harness);
 
         harness.reconnect_machine("machine2");
         let clock = harness.clock + Duration::from_secs(1);
-        converge_at(&mut harness, clock).await;
+        converge_at(&mut harness, clock);
     }
 
     // After the churn settles the line must be fully converged again...
     let clock = harness.clock + Duration::from_secs(1);
-    converge_at(&mut harness, clock).await;
+    converge_at(&mut harness, clock);
     for name in ["machine1", "machine2", "machine3"] {
         assert_eq!(
             harness.get_machine(name).router().originator_count(),
@@ -1373,10 +1341,8 @@ async fn flapping_relay_reconverges() {
     // ...and end-to-end traffic flows.
     harness
         .get_machine_mut("machine1")
-        .send_local(m3, b"still here")
-        .await
-        .unwrap();
-    harness.settle().await;
+        .send_local(m3, b"still here");
+    harness.settle();
     assert_eq!(
         harness.get_machine("machine3").local_deliveries(),
         vec![host_frame(m3, m1, b"still here")],
@@ -1390,8 +1356,8 @@ async fn flapping_relay_reconverges() {
 /// `e` at once severs *every* path to `d`; once it ages out `a` has no route and
 /// traffic is dropped.  Bringing both back restores the mesh, and `a` settles on
 /// the preferred path via `b`.
-#[tokio::test]
-async fn simultaneous_disconnects_blackhole_then_recover() {
+#[test]
+fn simultaneous_disconnects_blackhole_then_recover() {
     setup();
     let mut harness = two_paths_unequal_length();
     let a = harness.get_machine("a").ident;
@@ -1408,7 +1374,7 @@ async fn simultaneous_disconnects_blackhole_then_recover() {
 
     // Converge both a→d paths.
     for round in 1..=3 {
-        converge_at(&mut harness, Duration::from_secs(round)).await;
+        converge_at(&mut harness, Duration::from_secs(round));
     }
     assert!(
         route_to_d(&harness).is_some(),
@@ -1419,7 +1385,7 @@ async fn simultaneous_disconnects_blackhole_then_recover() {
     // once.  a→d now has no surviving path.
     harness.disconnect_machine("b");
     harness.disconnect_machine("e");
-    age_out(&mut harness).await;
+    age_out(&mut harness);
     assert_eq!(
         route_to_d(&harness),
         None,
@@ -1427,12 +1393,8 @@ async fn simultaneous_disconnects_blackhole_then_recover() {
     );
 
     let before = harness.get_machine("d").local_deliveries().len();
-    harness
-        .get_machine_mut("a")
-        .send_local(d, b"into the void")
-        .await
-        .ok();
-    harness.settle().await;
+    harness.get_machine_mut("a").send_local(d, b"into the void");
+    harness.settle();
     assert_eq!(
         harness.get_machine("d").local_deliveries().len(),
         before,
@@ -1443,19 +1405,15 @@ async fn simultaneous_disconnects_blackhole_then_recover() {
     harness.reconnect_machine("b");
     harness.reconnect_machine("e");
     for secs in (700..=1300).step_by(100) {
-        converge_at(&mut harness, Duration::from_secs(secs)).await;
+        converge_at(&mut harness, Duration::from_secs(secs));
     }
     assert_eq!(
         route_to_d(&harness),
         Some(b),
         "a should reconverge onto the preferred path via b"
     );
-    harness
-        .get_machine_mut("a")
-        .send_local(d, b"back online")
-        .await
-        .unwrap();
-    harness.settle().await;
+    harness.get_machine_mut("a").send_local(d, b"back online");
+    harness.settle();
     assert_eq!(
         harness.get_machine("d").local_deliveries(),
         vec![host_frame(d, a, b"back online")],
@@ -1487,8 +1445,8 @@ async fn simultaneous_disconnects_blackhole_then_recover() {
 /// still back all the way off to `i_max` and stay there — exactly like the
 /// loop-free settling test — and delivery must keep working over whichever
 /// tied path is currently selected.
-#[tokio::test(start_paused = true)]
-async fn equal_cost_path_swaps_do_not_trigger_reflood() {
+#[test]
+fn equal_cost_path_swaps_do_not_trigger_reflood() {
     setup();
     let i_max = Duration::from_secs(8);
     let mut harness = diamond(8_000);
@@ -1501,9 +1459,7 @@ async fn equal_cost_path_swaps_do_not_trigger_reflood() {
     // several periodic purge sweeps that could churn the tied best-hop pick,
     // then run a further window over which the mesh must stay both complete
     // and calm — mirroring `diamond_plus_k5_settles_to_i_max`'s proven timing.
-    let min_full = harness
-        .run_trickle(Duration::from_secs(40), Duration::from_secs(80))
-        .await;
+    let min_full = harness.run_trickle(Duration::from_secs(40), Duration::from_secs(80));
     assert_eq!(
         min_full, 3,
         "a, b, c, and d must continuously know their other 3 peers despite any tied-path churn"
@@ -1537,10 +1493,8 @@ async fn equal_cost_path_swaps_do_not_trigger_reflood() {
     // End-to-end: delivery works over whichever tied path is currently in use.
     harness
         .get_machine_mut("a")
-        .send_local(d, b"steady over equal-cost path")
-        .await
-        .unwrap();
-    harness.settle().await;
+        .send_local(d, b"steady over equal-cost path");
+    harness.settle();
     assert_eq!(
         harness.get_machine("d").local_deliveries(),
         vec![host_frame(d, a, b"steady over equal-cost path")],
@@ -1559,8 +1513,8 @@ async fn equal_cost_path_swaps_do_not_trigger_reflood() {
 /// wire between `a` and `b` is cut — `b` keeps running and serving the rest of
 /// the mesh — so `a` loses its 2-hop path and falls back to c→e; once the link
 /// is restored `a` re-hears `b` and promotes the shorter path again.
-#[tokio::test(start_paused = true)]
-async fn link_down_triggers_failover_then_restore_reclaims() {
+#[test]
+fn link_down_triggers_failover_then_restore_reclaims() {
     setup();
     let mut harness = two_paths_unequal_length();
     let a = harness.get_machine("a").ident;
@@ -1577,7 +1531,7 @@ async fn link_down_triggers_failover_then_restore_reclaims() {
     };
 
     for round in 1..=3 {
-        converge_at(&mut harness, Duration::from_secs(round)).await;
+        converge_at(&mut harness, Duration::from_secs(round));
     }
     assert_eq!(
         best_hop_to_d(&harness),
@@ -1589,7 +1543,7 @@ async fn link_down_triggers_failover_then_restore_reclaims() {
     // a–b wire is dead — so the path to d via b ages out at a while b itself
     // never reboots.
     harness.fail_link("a", 0);
-    age_out(&mut harness).await;
+    age_out(&mut harness);
     assert_eq!(
         best_hop_to_d(&harness),
         Some(c),
@@ -1609,7 +1563,7 @@ async fn link_down_triggers_failover_then_restore_reclaims() {
     // Restore the wire; a re-hears b's higher-TQ OGMs and reclaims the short path.
     harness.restore_link("a", 0);
     for secs in (700..=1200).step_by(100) {
-        converge_at(&mut harness, Duration::from_secs(secs)).await;
+        converge_at(&mut harness, Duration::from_secs(secs));
     }
     assert_eq!(
         best_hop_to_d(&harness),
@@ -1617,12 +1571,8 @@ async fn link_down_triggers_failover_then_restore_reclaims() {
         "restoring the a–b link must reclaim the preferred path via b"
     );
 
-    harness
-        .get_machine_mut("a")
-        .send_local(d, b"link back up")
-        .await
-        .unwrap();
-    harness.settle().await;
+    harness.get_machine_mut("a").send_local(d, b"link back up");
+    harness.settle();
     assert_eq!(
         harness.get_machine("d").local_deliveries(),
         vec![host_frame(d, a, b"link back up")],
@@ -1635,15 +1585,15 @@ async fn link_down_triggers_failover_then_restore_reclaims() {
 /// fewer than `MAX_MISSED_OGMS` OGM rounds loses no routes: machine1's only link
 /// drops and is restored within the gap budget, so its routes to both machine2
 /// and machine3 survive and traffic resumes with no re-convergence.
-#[tokio::test]
-async fn brief_link_blip_preserves_routes() {
+#[test]
+fn brief_link_blip_preserves_routes() {
     setup();
     let mut harness = line_of_three();
     let m1 = harness.get_machine("machine1").ident;
     let m3 = harness.get_machine("machine3").ident;
 
-    converge_at(&mut harness, Duration::from_secs(1)).await;
-    // converge_at(&mut harness, Duration::from_secs(2)).await;
+    converge_at(&mut harness, Duration::from_secs(1));
+    // converge_at(&mut harness, Duration::from_secs(2));
     assert_eq!(
         harness.get_machine("machine1").router().originator_count(),
         2
@@ -1652,22 +1602,20 @@ async fn brief_link_blip_preserves_routes() {
     // machine1's only link (interface 0) drops, then returns within a single
     // OGM round — far inside the MAX_MISSED_OGMS gap budget — so nothing ages out.
     harness.fail_link("machine1", 0);
-    converge_at(&mut harness, Duration::from_secs(30)).await;
+    converge_at(&mut harness, Duration::from_secs(30));
     assert_eq!(
         harness.get_machine("machine1").router().originator_count(),
         2,
         "a sub-timeout blip must not age out machine1's routes — state survives, unlike a reboot"
     );
     harness.restore_link("machine1", 0);
-    converge_at(&mut harness, Duration::from_secs(35)).await;
+    converge_at(&mut harness, Duration::from_secs(35));
 
     // Traffic resumes immediately over the still-known route.
     harness
         .get_machine_mut("machine1")
-        .send_local(m3, b"blip survived")
-        .await
-        .unwrap();
-    harness.settle().await;
+        .send_local(m3, b"blip survived");
+    harness.settle();
     assert_eq!(
         harness.get_machine("machine3").local_deliveries(),
         vec![host_frame(m3, m1, b"blip survived")],
@@ -1685,16 +1633,14 @@ async fn brief_link_blip_preserves_routes() {
 /// [`link_down_triggers_failover_then_restore_reclaims`], but severing the one
 /// link that joins two otherwise-independent sub-meshes rather than a single
 /// neighbor's link.
-#[tokio::test(start_paused = true)]
-async fn bridge_failure_partitions_mesh_then_restore_reunites() {
+#[test]
+fn bridge_failure_partitions_mesh_then_restore_reunites() {
     setup();
     let mut harness = diamond_plus_k5(8_000);
 
     // Converge the whole mesh first (same warmup/window the settling test
     // uses for this topology and i_max).
-    let min_full = harness
-        .run_trickle(Duration::from_secs(40), Duration::from_secs(80))
-        .await;
+    let min_full = harness.run_trickle(Duration::from_secs(40), Duration::from_secs(80));
     assert_eq!(
         min_full, 8,
         "whole mesh must fully converge before the bridge is severed"
@@ -1703,7 +1649,7 @@ async fn bridge_failure_partitions_mesh_then_restore_reunites() {
     // Sever the single bridge link: d4's interface 2 is its "d4_m1" link (its
     // link order, filtered from EDGES, is [d2_d4, d3_d4, d4_m1]).
     harness.fail_link("d4", 2);
-    age_out(&mut harness).await;
+    age_out(&mut harness);
 
     const DIAMOND: [&str; 4] = ["d1", "d2", "d3", "d4"];
     const MESH: [&str; 5] = ["m1", "m2", "m3", "m4", "m5"];
@@ -1745,9 +1691,7 @@ async fn bridge_failure_partitions_mesh_then_restore_reunites() {
 
     // Restore the bridge; the two islands must reunite.
     harness.restore_link("d4", 2);
-    harness
-        .advance_trickle(harness.clock + Duration::from_secs(200))
-        .await;
+    harness.advance_trickle(harness.clock + Duration::from_secs(200));
     for name in DIAMOND.iter().chain(MESH.iter()) {
         assert_eq!(
             harness.get_machine(name).router().originator_count(),
@@ -1768,8 +1712,8 @@ async fn bridge_failure_partitions_mesh_then_restore_reunites() {
 
 /// Machine `a` hears node B's OGM weakly on interface 0 and strongly on
 /// interface 1.  The egress for node B must follow the stronger link.
-#[tokio::test]
-async fn egress_picks_iface_with_better_metrics_for_shared_neighbor() {
+#[test]
+fn egress_picks_iface_with_better_metrics_for_shared_neighbor() {
     let mut harness = single_machine_with_links(2);
     let ogm_from_b = build_ogm_wire_frame(100, 255, 1);
 
@@ -1785,10 +1729,8 @@ async fn egress_picks_iface_with_better_metrics_for_shared_neighbor() {
     };
 
     let a = harness.get_machine_mut("a");
-    a.receive_with_metrics(Duration::from_secs(0), 0, &ogm_from_b, weak)
-        .await;
-    a.receive_with_metrics(Duration::from_secs(1), 1, &ogm_from_b, strong)
-        .await;
+    a.receive_with_metrics(Duration::from_secs(0), 0, &ogm_from_b, weak);
+    a.receive_with_metrics(Duration::from_secs(1), 1, &ogm_from_b, strong);
 
     match a
         .router_mut()
@@ -1804,8 +1746,8 @@ async fn egress_picks_iface_with_better_metrics_for_shared_neighbor() {
 /// Mirror of the previous test with the metrics swapped across the two
 /// interfaces — confirms the choice is driven by the metrics, not by iface
 /// index or arrival order.
-#[tokio::test]
-async fn egress_swaps_iface_when_metrics_swap() {
+#[test]
+fn egress_swaps_iface_when_metrics_swap() {
     let mut harness = single_machine_with_links(2);
     let ogm_from_b = build_ogm_wire_frame(100, 255, 1);
 
@@ -1821,10 +1763,8 @@ async fn egress_swaps_iface_when_metrics_swap() {
     };
 
     let a = harness.get_machine_mut("a");
-    a.receive_with_metrics(Duration::from_secs(0), 0, &ogm_from_b, strong)
-        .await;
-    a.receive_with_metrics(Duration::from_secs(1), 1, &ogm_from_b, weak)
-        .await;
+    a.receive_with_metrics(Duration::from_secs(0), 0, &ogm_from_b, strong);
+    a.receive_with_metrics(Duration::from_secs(1), 1, &ogm_from_b, weak);
 
     match a
         .router_mut()
@@ -1844,8 +1784,8 @@ async fn egress_swaps_iface_when_metrics_swap() {
 /// [`egress_picks_iface_with_better_metrics_for_shared_neighbor`] only proves
 /// the *initial* pick follows the metric; this proves the choice actually
 /// changes when conditions change, not just once at first contact.
-#[tokio::test]
-async fn egress_switches_interface_as_metrics_degrade() {
+#[test]
+fn egress_switches_interface_as_metrics_degrade() {
     let mut harness = single_machine_with_links(2);
     let ogm_from_b = build_ogm_wire_frame(100, 255, 1);
 
@@ -1863,10 +1803,8 @@ async fn egress_switches_interface_as_metrics_degrade() {
     let a = harness.get_machine_mut("a");
 
     // Initial contact: interface 0 strong, interface 1 weak.
-    a.receive_with_metrics(Duration::from_secs(0), 0, &ogm_from_b, strong)
-        .await;
-    a.receive_with_metrics(Duration::from_secs(1), 1, &ogm_from_b, weak)
-        .await;
+    a.receive_with_metrics(Duration::from_secs(0), 0, &ogm_from_b, strong);
+    a.receive_with_metrics(Duration::from_secs(1), 1, &ogm_from_b, weak);
     match a
         .router_mut()
         .get_egress_interface(Duration::from_secs(1), mac(100))
@@ -1881,8 +1819,8 @@ async fn egress_switches_interface_as_metrics_degrade() {
     let mut now = Duration::ZERO;
     for i in 0..10 {
         now = Duration::from_secs(2 + i);
-        a.receive_with_metrics(now, 0, &ogm_from_b, weak).await;
-        a.receive_with_metrics(now, 1, &ogm_from_b, strong).await;
+        a.receive_with_metrics(now, 0, &ogm_from_b, weak);
+        a.receive_with_metrics(now, 1, &ogm_from_b, strong);
     }
 
     match a.router_mut().get_egress_interface(now, mac(100)) {
@@ -1915,8 +1853,8 @@ async fn egress_switches_interface_as_metrics_degrade() {
 /// overriding both the tied encoded TQ and `c`'s first-mover incumbency —
 /// proving the next-hop choice follows the physical link, not just the OGM's
 /// advertised (hop-count) metric.
-#[tokio::test]
-async fn relay_choice_follows_measured_link_quality_on_tied_hop_count() {
+#[test]
+fn relay_choice_follows_measured_link_quality_on_tied_hop_count() {
     let mut harness = single_machine_with_links(2);
     let b = mac(10);
     let d = mac(20);
@@ -1939,12 +1877,10 @@ async fn relay_choice_follows_measured_link_quality_on_tied_hop_count() {
 
     let a = harness.get_machine_mut("a");
     // c's weak copy arrives first and becomes the incumbent.
-    a.receive_with_metrics(Duration::from_secs(0), 1, &via_c, weak)
-        .await;
+    a.receive_with_metrics(Duration::from_secs(0), 1, &via_c, weak);
     // b's strong copy arrives second, tied on encoded TQ, but its measured
     // link quality is strictly better — it must still take over.
-    a.receive_with_metrics(Duration::from_secs(1), 0, &via_b, strong)
-        .await;
+    a.receive_with_metrics(Duration::from_secs(1), 0, &via_b, strong);
 
     let record = a
         .router()
@@ -1965,8 +1901,8 @@ async fn relay_choice_follows_measured_link_quality_on_tied_hop_count() {
 
 /// With node B observed on a single interface, `resolve_route` reports B as
 /// both the next hop and the egress (following the interface it arrived on).
-#[tokio::test]
-async fn resolve_route_returns_neighbor_and_observed_interface() {
+#[test]
+fn resolve_route_returns_neighbor_and_observed_interface() {
     let mut harness = single_machine_with_links(2);
     let ogm_from_b = build_ogm_wire_frame(100, 255, 1);
     let strong = LinkMetrics {
@@ -1975,10 +1911,12 @@ async fn resolve_route_returns_neighbor_and_observed_interface() {
         quality: None,
     };
 
-    harness
-        .get_machine_mut("a")
-        .receive_with_metrics(Duration::from_secs(1), 1, &ogm_from_b, strong)
-        .await;
+    harness.get_machine_mut("a").receive_with_metrics(
+        Duration::from_secs(1),
+        1,
+        &ogm_from_b,
+        strong,
+    );
 
     let (next_hop, egress) = harness
         .get_machine("a")
@@ -1994,8 +1932,8 @@ async fn resolve_route_returns_neighbor_and_observed_interface() {
 
 /// `resolve_route` returns [`EgressInterface::All`] for BROADCAST regardless
 /// of any other table state.
-#[tokio::test]
-async fn resolve_route_for_broadcast_returns_all_interfaces() {
+#[test]
+fn resolve_route_for_broadcast_returns_all_interfaces() {
     let harness = single_machine_with_links(1);
 
     let (next_hop, egress) = harness
@@ -2009,8 +1947,8 @@ async fn resolve_route_for_broadcast_returns_all_interfaces() {
 /// `resolve_route` must not perturb the router's state — repeated calls
 /// return identical answers so management-API callers cannot disturb the
 /// data plane's routing decisions.
-#[tokio::test]
-async fn resolve_route_is_read_only() {
+#[test]
+fn resolve_route_is_read_only() {
     let mut harness = single_machine_with_links(1);
     let ogm_from_b = build_ogm_wire_frame(100, 255, 1);
     let metrics = LinkMetrics {
@@ -2019,10 +1957,12 @@ async fn resolve_route_is_read_only() {
         quality: None,
     };
 
-    harness
-        .get_machine_mut("a")
-        .receive_with_metrics(Duration::from_secs(0), 0, &ogm_from_b, metrics)
-        .await;
+    harness.get_machine_mut("a").receive_with_metrics(
+        Duration::from_secs(0),
+        0,
+        &ogm_from_b,
+        metrics,
+    );
 
     let a = harness.get_machine("a");
     let first = a.router().resolve_route(Duration::from_secs(1), mac(100));
@@ -2046,8 +1986,8 @@ async fn resolve_route_is_read_only() {
 /// neighbor 2's keep-alive budget is missed — well before its OGM path would
 /// have gone OGM-stale — resolving a route to `mac(100)` must switch to the
 /// live neighbor 3, exactly as the feature promises.
-#[tokio::test]
-async fn keepalive_miss_switches_route_before_ogm_staleness_would() {
+#[test]
+fn keepalive_miss_switches_route_before_ogm_staleness_would() {
     let mut harness = single_machine_with_links(2);
     let ogm_via_2 = build_relayed_ogm_wire_frame(2, 100, 255, 1);
     let ogm_via_3 = build_relayed_ogm_wire_frame(3, 100, 100, 1);
@@ -2056,20 +1996,16 @@ async fn keepalive_miss_switches_route_before_ogm_staleness_would() {
     let a = harness.get_machine_mut("a");
     // Two alternate OGM paths to the same destination, via different
     // neighbors on different interfaces.
-    a.receive_with_metrics(Duration::ZERO, 0, &ogm_via_2, LinkMetrics::default())
-        .await;
-    a.receive_with_metrics(Duration::ZERO, 1, &ogm_via_3, LinkMetrics::default())
-        .await;
+    a.receive_with_metrics(Duration::ZERO, 0, &ogm_via_2, LinkMetrics::default());
+    a.receive_with_metrics(Duration::ZERO, 1, &ogm_via_3, LinkMetrics::default());
     // Neighbor 2 sends two keep-alives a second apart, teaching a 1s cadence.
-    a.receive_with_metrics(Duration::ZERO, 0, &keepalive_via_2, LinkMetrics::default())
-        .await;
+    a.receive_with_metrics(Duration::ZERO, 0, &keepalive_via_2, LinkMetrics::default());
     a.receive_with_metrics(
         Duration::from_secs(1),
         0,
         &keepalive_via_2,
         LinkMetrics::default(),
-    )
-    .await;
+    );
 
     // Before any miss, the higher-TQ path via neighbor 2 wins.
     let (next_hop, _) = a.router().resolve_route(Duration::from_secs(1), mac(100));
@@ -2113,8 +2049,8 @@ async fn keepalive_miss_switches_route_before_ogm_staleness_would() {
 /// stops ticking its keep-alive (while its OGM Trickle schedule, and thus
 /// the direct path's OGM freshness, keeps running normally), `a`'s route to
 /// `c` must switch to the relayed path through `b`.
-#[tokio::test(start_paused = true)]
-async fn real_keepalive_tick_switches_route_when_it_stops() {
+#[test]
+fn real_keepalive_tick_switches_route_when_it_stops() {
     setup();
     let i_min = Duration::from_millis(100);
     let i_max = Duration::from_millis(200);
@@ -2169,7 +2105,7 @@ async fn real_keepalive_tick_switches_route_when_it_stops() {
 
     // Converge the mesh over the real Trickle schedule so `a` learns both
     // the direct path to `c` and the relayed one through `b`.
-    harness.advance_trickle(Duration::from_secs(2)).await;
+    harness.advance_trickle(Duration::from_secs(2));
 
     let dest = harness.get_machine("c").ident;
     let b_ident = harness.get_machine("b").ident;
@@ -2204,8 +2140,8 @@ async fn real_keepalive_tick_switches_route_when_it_stops() {
     for _ in 0..2u32 {
         harness.clock += keepalive_interval;
         let t = harness.clock;
-        harness.get_machine_mut("c").poll_due_keepalive(t).await;
-        harness.tick().await;
+        harness.get_machine_mut("c").poll_due_keepalive(t);
+        harness.tick();
     }
     assert_eq!(
         ka_counter.load(Ordering::Relaxed),
@@ -2221,9 +2157,7 @@ async fn real_keepalive_tick_switches_route_when_it_stops() {
 
     // `c` stops ticking its keep-alive, but keeps converging normally over
     // Trickle — the direct path's OGM freshness alone must not save it.
-    harness
-        .advance_trickle(harness.clock + keepalive_interval * 5)
-        .await;
+    harness.advance_trickle(harness.clock + keepalive_interval * 5);
 
     let (next_hop, _) = harness
         .get_machine("a")
@@ -2310,17 +2244,15 @@ fn diamond_plus_k5(i_max_ms: u64) -> TestHarness {
 /// non-blocking poll timeouts inside `settle`/`tick`, which a paused runtime
 /// auto-advances instantly instead of waiting out tokio's ~1 ms timer
 /// granularity — so the run is bounded by work done, not by simulated seconds.
-#[tokio::test(start_paused = true)]
-async fn diamond_plus_k5_settles_to_i_max() {
+#[test]
+fn diamond_plus_k5_settles_to_i_max() {
     setup();
     let i_max = Duration::from_secs(8);
     let mut harness = diamond_plus_k5(8_000);
 
     // Warm up well past the time the backoff needs to climb 1→2→4→8 s, then run
     // a further window over which the mesh must stay both complete and calm.
-    let min_full = harness
-        .run_trickle(Duration::from_secs(40), Duration::from_secs(80))
-        .await;
+    let min_full = harness.run_trickle(Duration::from_secs(40), Duration::from_secs(80));
 
     assert_eq!(
         min_full, 8,
@@ -2391,8 +2323,8 @@ fn to_lazy_ogm(buf: &[u8], hdr_len: usize) -> Vec<u8> {
 /// hand-injected here, isolating requester-side correctness from responder-
 /// side correctness — the latter is exercised for real (a genuine responder,
 /// no stand-in) by `cert_fetch_round_trip_with_real_responder` below.
-#[tokio::test]
-async fn cert_fetch_round_trip_resolves_via_seeded_first_hop() {
+#[test]
+fn cert_fetch_round_trip_resolves_via_seeded_first_hop() {
     setup();
     let mut harness = line_of_three();
 
@@ -2400,9 +2332,9 @@ async fn cert_fetch_round_trip_resolves_via_seeded_first_hop() {
     // routes to both machine1 and machine3 before any auth state exists —
     // otherwise the CertReq/CertReply relay below would have nothing to
     // route on.
-    harness.poll_due(Duration::from_secs(1)).await;
+    harness.poll_due(Duration::from_secs(1));
     for _ in 0..5 {
-        harness.tick().await;
+        harness.tick();
     }
     for router in harness.machines.values() {
         assert_eq!(router.router().originator_table().count(), 2);
@@ -2484,10 +2416,10 @@ async fn cert_fetch_round_trip_resolves_via_seeded_first_hop() {
     // silently broke B's subsequent CertReq delivery to X.)
     let (raw_port, _port_id) = harness.add_switch_port("switch1");
     let wire = build_frame(m1, Mac::BROADCAST, DEFAULT_BATMAN_ETHER_TYPE, &lazy_ogm);
-    raw_port.egress.send(wire).await.unwrap();
+    raw_port.egress.try_send(wire).unwrap();
 
     for _ in 0..8 {
-        harness.tick().await;
+        harness.tick();
     }
 
     assert_eq!(
@@ -2520,10 +2452,10 @@ async fn cert_fetch_round_trip_resolves_via_seeded_first_hop() {
     let mut reply_payload = reply_hdr.as_bytes().to_vec();
     reply_payload.extend_from_slice(a_auth.own_cert().as_bytes());
     let reply_wire = build_frame(m1, m2, DEFAULT_BATMAN_ETHER_TYPE, &reply_payload);
-    raw_port.egress.send(reply_wire).await.unwrap();
+    raw_port.egress.try_send(reply_wire).unwrap();
 
     for _ in 0..8 {
-        harness.tick().await;
+        harness.tick();
     }
 
     let (cached_cert, cached_fp) = harness
@@ -2547,10 +2479,10 @@ async fn cert_fetch_round_trip_resolves_via_seeded_first_hop() {
     let ogm2_len = a_auth.augment_ogm(&mut ogm_buf2, ogm_hdr_len).unwrap();
     let lazy_ogm2 = to_lazy_ogm(&ogm_buf2[..ogm2_len], ogm_hdr_len);
     let wire2 = build_frame(m1, Mac::BROADCAST, DEFAULT_BATMAN_ETHER_TYPE, &lazy_ogm2);
-    raw_port.egress.send(wire2).await.unwrap();
+    raw_port.egress.try_send(wire2).unwrap();
 
     for _ in 0..8 {
-        harness.tick().await;
+        harness.tick();
     }
 
     assert_eq!(
@@ -2567,14 +2499,14 @@ async fn cert_fetch_round_trip_resolves_via_seeded_first_hop() {
 /// is primed directly (bypassing Trickle timing, which is orthogonal to what
 /// this test checks) so the reply path is exercised over the real wire
 /// without fighting two independent adaptive OGM schedules.
-#[tokio::test]
-async fn cert_fetch_round_trip_with_real_responder() {
+#[test]
+fn cert_fetch_round_trip_with_real_responder() {
     setup();
     let mut harness = line_of_three();
 
-    harness.poll_due(Duration::from_secs(1)).await;
+    harness.poll_due(Duration::from_secs(1));
     for _ in 0..5 {
-        harness.tick().await;
+        harness.tick();
     }
     for router in harness.machines.values() {
         assert_eq!(router.router().originator_table().count(), 2);
@@ -2614,20 +2546,17 @@ async fn cert_fetch_round_trip_with_real_responder() {
             .unwrap();
         b_auth.augment_ogm(&mut b_ogm_buf, b_ogm_hdr_len).unwrap()
     };
-    harness
-        .get_machine_mut("machine1")
-        .receive_with_metrics(
-            Duration::from_secs(1),
-            0,
-            &build_frame(
-                m3,
-                Mac::BROADCAST,
-                DEFAULT_BATMAN_ETHER_TYPE,
-                &b_ogm_buf[..b_ogm_len],
-            ),
-            LinkMetrics::default(),
-        )
-        .await;
+    harness.get_machine_mut("machine1").receive_with_metrics(
+        Duration::from_secs(1),
+        0,
+        &build_frame(
+            m3,
+            Mac::BROADCAST,
+            DEFAULT_BATMAN_ETHER_TYPE,
+            &b_ogm_buf[..b_ogm_len],
+        ),
+        LinkMetrics::default(),
+    );
     assert!(
         harness
             .get_machine("machine1")
@@ -2668,10 +2597,10 @@ async fn cert_fetch_round_trip_with_real_responder() {
 
     let (raw_port, _port_id) = harness.add_switch_port("switch1");
     let wire = build_frame(m1, Mac::BROADCAST, DEFAULT_BATMAN_ETHER_TYPE, &lazy_ogm);
-    raw_port.egress.send(wire).await.unwrap();
+    raw_port.egress.try_send(wire).unwrap();
 
     for _ in 0..8 {
-        harness.tick().await;
+        harness.tick();
     }
 
     let (cached_cert, cached_fp) = harness
@@ -2702,8 +2631,8 @@ async fn cert_fetch_round_trip_with_real_responder() {
 /// caches the requester's cert too (§5.4), so that OGM can be checked as
 /// soon as it arrives — which requires more than one Trickle round, hence
 /// driving several here.
-#[tokio::test]
-async fn two_fresh_lazy_nodes_converge_with_zero_certs_on_the_wire() {
+#[test]
+fn two_fresh_lazy_nodes_converge_with_zero_certs_on_the_wire() {
     setup();
     let mut harness = simple_pair();
 
@@ -2756,7 +2685,7 @@ async fn two_fresh_lazy_nodes_converge_with_zero_certs_on_the_wire() {
     // round's OGM — now verifiable from the cert cached off the CertReq
     // itself — installs the route and flushes the parked reply.
     for round in 1..=6u64 {
-        converge_at(&mut harness, Duration::from_secs(round)).await;
+        converge_at(&mut harness, Duration::from_secs(round));
     }
 
     for router in harness.machines.values() {

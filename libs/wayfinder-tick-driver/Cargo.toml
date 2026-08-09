@@ -22,3 +22,8 @@ zerocopy.workspace = true
 # `default-features`) so tracing's `std` feature stays off for the `no_std`
 # build, matching `wayfinder-driver-core`/`wayfinder-embedded-driver`.
 tracing = { version = "0.1.44", default-features = false }
+
+[dev-dependencies]
+# The host certificate authority, to mint a real membership cert for the
+# auth-clock test. `std` only, and tests only — the crate itself stays `no_std`.
+wayfinder-auth = { workspace = true, features = ["std"] }

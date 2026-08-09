@@ -1,15 +1,24 @@
-//! Test-only harness for multi-node mesh integration tests over `tokio` mpsc
-//! channels — no hardware required.
+//! Test-only harness for multi-node mesh integration tests — no hardware, no
+//! executor, no wall clock.
 //!
 //! [`switch`] provides a `Switch` simulator that fans frames out between
-//! connected nodes, [`test_router`] wraps a `CentralRouter` with per-interface
-//! egress channels, and [`driver`] assembles whole multi-node topologies from a
-//! declarative config. The [`prelude`] re-exports the common entry points.
+//! connected nodes, [`test_router`] drives one node's `wayfinder-tick-driver`
+//! over those ports **synchronously**, and [`driver`] assembles whole
+//! multi-node topologies from a declarative config. The [`prelude`] re-exports
+//! the common entry points.
+//!
+//! [`link_router`] is the exception: an async harness over the production
+//! `wayfinder-driver` for the two suites that need a real `LinkT` (link I/O
+//! error policy, and a real `RylrClient`), which the tick driver cannot host
+//! because its interfaces are plain queues.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 /// Declarative multi-node test topologies ([`TestHarness`](driver::TestHarness))
 /// built from a [`TestConfig`](driver::TestConfig).
 pub mod driver;
+/// The async [`LinkTestRouter`](link_router::LinkTestRouter), for the two
+/// suites that need a real `LinkT` rather than the tick driver's queues.
+pub mod link_router;
 /// The in-process [`Switch`](switch::Switch) frame-fanout simulator.
 pub mod switch;
 /// The [`TestRouter`](test_router::TestRouter) wrapper around a `CentralRouter`.
