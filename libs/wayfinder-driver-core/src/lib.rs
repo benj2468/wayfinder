@@ -1,16 +1,40 @@
 //! Shared, `no_std` router-orchestration logic for the wayfinder drivers.
 //!
-//! Both drivers — the `std`/tokio [`wayfinder-driver`] and the `no_std`
-//! [`wayfinder-embedded-driver`] — turn the same three inputs into the same
+//! All three driver shells — the `std`/tokio [`wayfinder-driver`], the
+//! `no_std` [`wayfinder-embedded-driver`], and the synchronous
+//! [`wayfinder-tick-driver`] — turn the same three inputs into the same
 //! outgoing frames: a received mesh frame, a due periodic OGM, and (later) a
 //! host frame.  That translation is the logic here.  It is deliberately
 //! **synchronous and allocation-free**: it plans each outgoing frame into an
 //! [`OutgoingFrame`] borrowing the caller's transmit scratchpad and hands it to
 //! a [`MeshSink`], which copies it into whatever staging the driver uses
 //! (`Vec` on the host, `heapless::Vec` on embedded) before the scratchpad is
-//! reused.  The async event loop, the interface set, and the dispatch of staged
-//! frames stay in each driver — "one behavior, two loops".
+//! reused.
 //!
+//! The transmit side is shared the same way: [`plan_dispatch`] makes the whole
+//! outgoing decision — authenticate the frame, resolve its egress, apply
+//! split-horizon and the per-link transmit gate — and returns *how much to
+//! send* and *which interfaces* to send it on.  What stays in each driver is
+//! only the async event loop, the interface set, and the actual I/O for the
+//! interfaces in that plan: "one behavior, three loops".
+//!
+//! # The whole surface
+//!
+//! Four entry points, and a shell calls all four:
+//!
+//! | | |
+//! |---|---|
+//! | [`handle_mesh_frame`] | a frame arrived on interface `idx` |
+//! | [`poll_due_ogms`] | the periodic timer fired |
+//! | [`poll_due_keepalives`] | likewise, for keep-alives |
+//! | [`plan_dispatch`] | a staged frame is ready to go out |
+//!
+//! The first three hand their results to a [`MeshSink`]; the fourth returns a
+//! [`DispatchPlan`]. Everything else — authenticating a directed frame on the
+//! way in or out, resolving egress, split-horizon — is internal to those four,
+//! deliberately: a shell that reached past them could apply half the policy.
+//!
+//! [`wayfinder-tick-driver`]: https://docs.rs/wayfinder-tick-driver
 //! [`wayfinder-driver`]: https://docs.rs/wayfinder-driver
 //! [`wayfinder-embedded-driver`]: https://docs.rs/wayfinder-embedded-driver
 #![cfg_attr(not(test), no_std)]
@@ -22,6 +46,7 @@ use interfaces::link::LinkMetrics;
 use tracing::trace;
 use tracing::warn;
 use wayfinder::DEFAULT_BATMAN_ETHER_TYPE;
+use wayfinder::EgressInterface;
 use wayfinder::auth::DIRECTED_TRAILER_LEN;
 use wayfinder::batman::wire::BATADV_CERT_REPLY;
 use wayfinder::batman::wire::BATADV_CERT_REQ;
@@ -90,7 +115,7 @@ pub trait MeshSink {
 /// packet (`BATADV_CERT_REQ`/`BATADV_CERT_REPLY`) — addressed to a specific
 /// node like a directed data-plane frame, but self-authenticating (its own
 /// signature) rather than pairwise-tagged.
-pub fn is_cert_control(payload: &[u8]) -> bool {
+fn is_cert_control(payload: &[u8]) -> bool {
     matches!(
         payload.first(),
         Some(&BATADV_CERT_REQ) | Some(&BATADV_CERT_REPLY)
@@ -102,10 +127,7 @@ pub fn is_cert_control(payload: &[u8]) -> bool {
 /// (auth off, a broadcast/OGM, or a cert-control packet), a shorter *view* over
 /// the same bytes with the trailer dropped, or `None` if the frame must be
 /// dropped (bad/missing tag from an unverified or foreign neighbor).
-pub fn strip_directed<'a, R: RouterOps>(
-    router: &mut R,
-    frame: &'a LinkFrame,
-) -> Option<&'a LinkFrame> {
+fn strip_directed<'a, R: RouterOps>(router: &mut R, frame: &'a LinkFrame) -> Option<&'a LinkFrame> {
     // Only directed (unicast/mcast) frames carry a tag; broadcasts/OGMs (a
     // multicast dst) are signed, and with auth off nothing is tagged.
     let Some(auth) = router.auth_mut() else {
@@ -156,7 +178,7 @@ pub fn strip_directed<'a, R: RouterOps>(
 ///   it rather than emit it in the clear.
 ///
 /// [`DIRECTED_TRAILER_LEN`]: wayfinder::auth::DIRECTED_TRAILER_LEN
-pub fn tag_directed_into<R: RouterOps>(
+fn tag_directed_into<R: RouterOps>(
     router: &mut R,
     dst: Mac,
     protocol: u16,
@@ -282,6 +304,204 @@ pub fn poll_due_keepalives<R: RouterOps>(
     }
 }
 
+/// A set of mesh-interface indices, as a bitmask.
+///
+/// A bitmask rather than a collection because this is `no_std` and
+/// allocation-free, and the answer must outlive the `&mut` borrow of the router
+/// that produced it — a borrowing iterator would keep the router locked exactly
+/// while the caller needs it to record the transmit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InterfaceSet(u32);
+
+impl InterfaceSet {
+    /// The number of interfaces this set can represent.
+    ///
+    /// Named `CAPACITY` rather than `MAX_INTERFACES` on purpose: `wayfinder`
+    /// already exports a `MAX_INTERFACES` (the router's default interface-table
+    /// size, 8), and two same-named constants a factor of four apart is a trap.
+    /// This one is a property of the bitmask, not of any capacity profile.
+    pub const CAPACITY: usize = u32::BITS as usize;
+
+    /// Add `idx` to the set. Indices `>= CAPACITY` are ignored rather than
+    /// aliasing onto a low bit — unreachable, per `INTERFACE_SET_FITS_ROUTER`.
+    fn insert(&mut self, idx: usize) {
+        if idx < Self::CAPACITY {
+            self.0 |= 1 << idx;
+        }
+    }
+
+    /// Whether interface `idx` is in the set.
+    pub fn contains(self, idx: usize) -> bool {
+        idx < Self::CAPACITY && self.0 & (1 << idx) != 0
+    }
+
+    /// Whether the set is empty — nothing to transmit (no route, or every
+    /// candidate link gated off).
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The interface indices in the set, ascending.
+    pub fn iter(self) -> impl Iterator<Item = usize> {
+        let mut bits = self.0;
+        core::iter::from_fn(move || {
+            if bits == 0 {
+                return None;
+            }
+            let idx = bits.trailing_zeros() as usize;
+            bits &= bits - 1; // clear the lowest set bit
+            Some(idx)
+        })
+    }
+}
+
+/// A capacity profile must never track more interfaces than an [`InterfaceSet`]
+/// can represent, or the high interfaces would be planned and then silently
+/// dropped from every fan-out — a node mute on a link it believes is up.
+///
+/// Checked at compile time against the default profile, in the same spirit as
+/// `wayfinder-embedded-driver`'s `N <= R::INTERFACES`. A profile is free to
+/// shrink; this catches a future one that grows past the bitmask.
+const INTERFACE_SET_FITS_ROUTER: () = assert!(
+    wayfinder::MAX_INTERFACES <= InterfaceSet::CAPACITY,
+    "InterfaceSet cannot represent every interface the router tracks"
+);
+
+/// One planned frame's transmit decision: the bytes to put on the wire, and the
+/// interfaces to put them on.
+///
+/// Constructed only by [`plan_dispatch`] — the fields are private because every
+/// invariant here is something that function establishes: the payload is
+/// authenticated (or legitimately needs no tag), and the targets have already
+/// been split-horizon filtered and transmit-gated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchPlan<'a> {
+    payload: &'a [u8],
+    targets: InterfaceSet,
+}
+
+impl<'a> DispatchPlan<'a> {
+    /// The exact bytes to transmit: the frame body, plus the pairwise auth
+    /// trailer when one was written into it.
+    ///
+    /// A borrowed slice rather than a length, so a caller cannot pair it with
+    /// the wrong buffer or forget to apply it.
+    pub fn payload(&self) -> &'a [u8] {
+        self.payload
+    }
+
+    /// The interfaces to transmit on. Empty means "nothing to send" (no route,
+    /// or every candidate link gated off) — as opposed to a `None` plan, which
+    /// means "drop this frame".
+    pub fn targets(&self) -> InterfaceSet {
+        self.targets
+    }
+}
+
+/// Decide how to put one planned frame on the wire: authenticate it, then
+/// resolve which interfaces carry it.
+///
+/// This is the whole transmit-side decision every driver shell shares — the
+/// tokio host loop, the embedded loop, and the synchronous tick loop. Only the
+/// I/O differs between them, so they each drive this and then transmit
+/// [`payload`](DispatchPlan::payload) on every interface in
+/// [`targets`](DispatchPlan::targets).
+///
+/// `buf` holds the frame body in `buf[..body_len]` and **must** reserve at
+/// least [`DIRECTED_TRAILER_LEN`] spare bytes after it for a tag to be written
+/// into; the caller owns the buffer, so making that room is its concern.
+/// `num_interfaces` is how many mesh interfaces the *driver* actually holds,
+/// which bounds the fan-out independently of the router's capacity.
+///
+/// Returns `None` when the frame must be **dropped**: auth is on but this
+/// directed frame cannot be tagged, and emitting it in the clear would leak an
+/// unauthenticated frame onto the mesh.
+///
+/// [`DIRECTED_TRAILER_LEN`]: wayfinder::auth::DIRECTED_TRAILER_LEN
+#[allow(clippy::too_many_arguments)]
+pub fn plan_dispatch<'a, R: RouterOps>(
+    router: &mut R,
+    now: Duration,
+    dst: Mac,
+    protocol: u16,
+    egress: Egress,
+    body_len: usize,
+    buf: &'a mut [u8],
+    num_interfaces: usize,
+) -> Option<DispatchPlan<'a>> {
+    let () = INTERFACE_SET_FITS_ROUTER;
+    let send_len = tag_directed_into(router, dst, protocol, body_len, buf)?;
+
+    // The BATMAN sub-type of this outgoing frame (its leading payload byte),
+    // used to consult each candidate interface's per-link transmit gates
+    // (`link_may_tx`). Only meaningful for BATMAN frames; other protocols are
+    // never gated (`None` ⇒ always permitted).  Read from the *body*, not the
+    // whole buffer: `buf` still carries the reserved trailer past `body_len`.
+    let pkt_type = (protocol == DEFAULT_BATMAN_ETHER_TYPE)
+        .then(|| buf.get(..body_len).and_then(<[u8]>::first).copied())
+        .flatten();
+
+    let mut targets = InterfaceSet::default();
+    match egress {
+        // A per-link OGM goes out exactly one interface, on that link's own
+        // adaptive schedule. Deliberately *not* re-gated: `poll_due_ogms`
+        // already consulted this link's `tx_ogm` before emitting.  Still bounded
+        // by the driver's link count, so a plan never names an interface the
+        // caller doesn't have.
+        Egress::Iface(idx) if idx < num_interfaces => targets.insert(idx),
+        Egress::Iface(idx) => {
+            trace!(
+                iface_idx = idx,
+                num_interfaces, "drop: egress interface beyond the driver's links"
+            );
+        }
+        // Otherwise let the router's metric-driven egress choice decide.
+        Egress::Auto { exclude } => match router.get_egress_interface(now, dst) {
+            Some(EgressInterface::All) => {
+                for idx in 0..num_interfaces {
+                    // Split-horizon: never re-flood back out the interface a
+                    // re-flood arrived on.
+                    if Some(idx) == exclude {
+                        continue;
+                    }
+                    // Per-link transmit gate: skip a link that does not send
+                    // this traffic class (an OGM re-flood onto a `tx_ogm`-off
+                    // link, or any broadcast onto a listen-only link).
+                    if !router.link_may_tx(idx, pkt_type) {
+                        trace!(iface_idx = idx, "drop: tx gate disabled on this link");
+                        continue;
+                    }
+                    targets.insert(idx);
+                }
+            }
+            Some(EgressInterface::Interface(idx)) if idx < num_interfaces => {
+                // Per-link transmit gate: a unicast/mcast toward a route out a
+                // `tx_data`-off link is dropped rather than forwarded.
+                if router.link_may_tx(idx, pkt_type) {
+                    targets.insert(idx);
+                } else {
+                    trace!(iface_idx = idx, "drop: tx gate disabled on egress link");
+                }
+            }
+            Some(EgressInterface::Interface(idx)) => {
+                trace!(
+                    iface_idx = idx,
+                    num_interfaces, "drop: egress interface beyond the driver's links"
+                );
+            }
+            // No route to `dst`. Traced because otherwise a unicast to an
+            // unknown destination vanishes with no record anywhere on the path —
+            // the frame is planned, then simply never sent.
+            None => trace!(?dst, "drop: no route to destination"),
+        },
+    }
+
+    Some(DispatchPlan {
+        payload: &buf[..send_len],
+        targets,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -297,7 +517,9 @@ mod tests {
     use wayfinder::batman::wire::BATADV_CERT_REPLY;
     use wayfinder::batman::wire::BATADV_CERT_REQ;
     use wayfinder::batman::wire::BATADV_IV_OGM;
+    use wayfinder::batman::wire::BATADV_UNICAST;
     use wayfinder::batman::wire::BatmanOgmPacket;
+    use wayfinder::features::LinkFeatures;
     use wayfinder::interfaces::frame::LinkFrame;
     use wayfinder_auth::Authority;
     use wayfinder_auth::Keypair;
@@ -693,6 +915,247 @@ mod tests {
         assert!(
             strip_directed(&mut router, frame).is_none(),
             "directed frame from an unverified neighbor is dropped"
+        );
+    }
+
+    // ---- plan_dispatch ----------------------------------------------------
+    //
+    // Egress resolution, split-horizon and the per-link transmit gate are
+    // written out in all three driver shells today. That makes split-horizon —
+    // a correctness invariant — a thing you can fix in one shell and silently
+    // leave broken in two. These pin the shared decision so the shells can be
+    // reduced to "do the I/O for each interface in the plan".
+
+    /// An empty set yields nothing and claims nothing.
+    #[test]
+    fn interface_set_empty() {
+        let set = InterfaceSet::default();
+        assert!(set.is_empty());
+        assert_eq!(set.iter().count(), 0);
+        assert!(!set.contains(0));
+    }
+
+    /// Membership round-trips, and `iter` yields ascending indices.
+    #[test]
+    fn interface_set_holds_and_orders_its_members() {
+        let mut set = InterfaceSet::default();
+        for idx in [3, 0, 7] {
+            set.insert(idx);
+        }
+        assert!(!set.is_empty());
+        assert_eq!(set.iter().collect::<Vec<_>>(), std::vec![0, 3, 7]);
+        assert!(set.contains(3));
+        assert!(!set.contains(1));
+    }
+
+    /// At capacity: the last representable index is index 31, and every index
+    /// below it is held simultaneously.
+    #[test]
+    fn interface_set_at_capacity() {
+        let mut set = InterfaceSet::default();
+        for idx in 0..InterfaceSet::CAPACITY {
+            set.insert(idx);
+        }
+        assert_eq!(set.iter().count(), InterfaceSet::CAPACITY);
+        assert!(set.contains(InterfaceSet::CAPACITY - 1));
+    }
+
+    /// Past capacity: ignored, not aliased onto a low bit — the failure mode
+    /// that would silently transmit on the wrong interface. `contains` must not
+    /// panic on a wild index either (`1 << 64` would be UB-adjacent).
+    #[test]
+    fn interface_set_ignores_indices_past_capacity() {
+        let mut set = InterfaceSet::default();
+        set.insert(InterfaceSet::CAPACITY);
+        set.insert(InterfaceSet::CAPACITY + 1);
+        set.insert(usize::MAX);
+
+        assert!(
+            set.is_empty(),
+            "an out-of-range index must not alias onto a low interface"
+        );
+        assert!(!set.contains(InterfaceSet::CAPACITY));
+        assert!(!set.contains(usize::MAX));
+    }
+
+    /// A router with `n` interfaces configured, each on a fast Trickle schedule
+    /// so egress resolution has real interfaces to choose between.
+    fn router_with_interfaces(n: usize) -> CentralRouter {
+        let mut router = CentralRouter::new(mac(1));
+        for idx in 0..n {
+            router.configure_interface_ogm(
+                idx,
+                Duration::from_secs(1),
+                Duration::from_secs(8),
+                Duration::ZERO,
+            );
+        }
+        router
+    }
+
+    /// Plan a broadcast (the flood path) of `payload` and collect the target
+    /// interface indices, or `None` if the frame is to be dropped outright.
+    ///
+    /// Collects inside the helper because a [`DispatchPlan`] borrows the buffer
+    /// it was planned against, which is local to this function.
+    fn plan_broadcast(
+        router: &mut CentralRouter,
+        payload: &[u8],
+        exclude: Option<usize>,
+        num_interfaces: usize,
+    ) -> Option<Vec<usize>> {
+        let mut buf = payload.to_vec();
+        buf.resize(payload.len() + DIRECTED_TRAILER_LEN, 0);
+        plan_dispatch(
+            router,
+            Duration::from_secs(1),
+            Mac::BROADCAST,
+            DEFAULT_BATMAN_ETHER_TYPE,
+            Egress::Auto { exclude },
+            payload.len(),
+            &mut buf,
+            num_interfaces,
+        )
+        .map(|plan| plan.targets().iter().collect())
+    }
+
+    /// A per-link OGM names its interface directly and is **not** re-gated
+    /// here: `poll_due_ogms` already consulted that link's `tx_ogm` before
+    /// emitting, so gating twice would be both redundant and wrong.
+    #[test]
+    fn explicit_interface_egress_targets_exactly_that_interface() {
+        let mut router = router_with_interfaces(4);
+        let payload = [BATADV_IV_OGM, 0x02, 0x03];
+        let mut buf = payload.to_vec();
+        buf.resize(payload.len() + DIRECTED_TRAILER_LEN, 0);
+
+        let plan = plan_dispatch(
+            &mut router,
+            Duration::from_secs(1),
+            Mac::BROADCAST,
+            DEFAULT_BATMAN_ETHER_TYPE,
+            Egress::Iface(2),
+            payload.len(),
+            &mut buf,
+            4,
+        )
+        .expect("a per-link OGM is always dispatchable");
+
+        assert_eq!(plan.targets().iter().collect::<Vec<_>>(), std::vec![2]);
+        assert_eq!(plan.payload(), payload, "auth off ⇒ body only, no trailer");
+    }
+
+    /// A broadcast with no ingress interface floods every interface.
+    #[test]
+    fn broadcast_floods_every_interface() {
+        let mut router = router_with_interfaces(4);
+        let targets = plan_broadcast(&mut router, &[BATADV_IV_OGM, 0x02], None, 4)
+            .expect("a broadcast is dispatchable");
+
+        assert_eq!(targets, std::vec![0, 1, 2, 3]);
+    }
+
+    /// **Split-horizon.** A re-flood must never go back out the interface it
+    /// arrived on, or two nodes ping-pong the same broadcast between them.
+    #[test]
+    fn reflood_never_returns_out_the_ingress_interface() {
+        let mut router = router_with_interfaces(4);
+        let targets = plan_broadcast(&mut router, &[BATADV_IV_OGM, 0x02], Some(1), 4)
+            .expect("a re-flood is dispatchable");
+
+        assert_eq!(targets, std::vec![0, 2, 3]);
+        assert!(
+            !targets.contains(&1),
+            "split-horizon: the ingress interface must be excluded"
+        );
+    }
+
+    /// The per-link transmit gate suppresses a traffic class on a link
+    /// configured not to carry it, without touching the other links.
+    #[test]
+    fn transmit_gate_removes_a_link_from_the_flood() {
+        let mut router = router_with_interfaces(4);
+        let off = LinkFeatures {
+            tx_ogm: false,
+            ..Default::default()
+        };
+        router.set_link_features(2, off);
+
+        let targets = plan_broadcast(&mut router, &[BATADV_IV_OGM, 0x02], None, 4)
+            .expect("a broadcast is dispatchable");
+
+        assert_eq!(
+            targets,
+            std::vec![0, 1, 3],
+            "the `tx_ogm`-off link is dropped from the fan-out"
+        );
+    }
+
+    /// The fan-out is bounded by the driver's actual interface count, not the
+    /// router's capacity — a shell with two links must not be told to transmit
+    /// on eight.
+    #[test]
+    fn fanout_is_bounded_by_the_drivers_interface_count() {
+        let mut router = router_with_interfaces(8);
+        let targets = plan_broadcast(&mut router, &[BATADV_IV_OGM, 0x02], None, 2)
+            .expect("a broadcast is dispatchable");
+
+        assert_eq!(targets, std::vec![0, 1]);
+    }
+
+    /// A directed frame that cannot be authenticated is **dropped**, never
+    /// emitted in the clear: no plan at all, rather than an empty target set.
+    #[test]
+    fn untaggable_directed_frame_yields_no_plan() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = router_with_interfaces(2);
+        router.set_auth(member_auth(&authority, 1, mac(1)));
+
+        // mac(9) is an unverified neighbour: no pairwise key, so no tag.
+        let payload = [BATADV_UNICAST, 0x02, 0x03];
+        let mut buf = payload.to_vec();
+        buf.resize(payload.len() + DIRECTED_TRAILER_LEN, 0);
+
+        assert!(
+            plan_dispatch(
+                &mut router,
+                Duration::from_secs(1),
+                mac(9),
+                DEFAULT_BATMAN_ETHER_TYPE,
+                Egress::Auto { exclude: None },
+                payload.len(),
+                &mut buf,
+                2,
+            )
+            .is_none(),
+            "an untaggable directed frame is dropped, not emitted untagged"
+        );
+    }
+
+    /// No known route and nothing to flood ⇒ a plan with no targets. Distinct
+    /// from `None`, which means "drop this frame".
+    #[test]
+    fn unroutable_unicast_plans_no_targets() {
+        let mut router = router_with_interfaces(2);
+        let payload = [BATADV_UNICAST, 0x02];
+        let mut buf = payload.to_vec();
+        buf.resize(payload.len() + DIRECTED_TRAILER_LEN, 0);
+
+        let plan = plan_dispatch(
+            &mut router,
+            Duration::from_secs(1),
+            mac(200),
+            DEFAULT_BATMAN_ETHER_TYPE,
+            Egress::Auto { exclude: None },
+            payload.len(),
+            &mut buf,
+            2,
+        )
+        .expect("auth off ⇒ always dispatchable");
+
+        assert!(
+            plan.targets().is_empty(),
+            "no route to an unknown destination ⇒ nothing to transmit"
         );
     }
 }

@@ -22,7 +22,6 @@ use tokio::time::sleep;
 use tracing::trace;
 use tracing::warn;
 use wayfinder::CentralRouter;
-use wayfinder::EgressInterface;
 use wayfinder::McastPlan;
 use wayfinder::auth::DIRECTED_TRAILER_LEN;
 use wayfinder::config::TrickleConfig;
@@ -721,78 +720,37 @@ async fn dispatch<Local: FrameIo>(
             "mesh output"
         );
 
-        // Authenticate directed data-plane frames (unicast/mcast to a specific
-        // next hop) with a pairwise tag when auth is enabled.  Broadcasts/OGMs
-        // (a multicast dst) are signed instead, and cert-control packets
-        // (CertReq/CertReply) carry their own self-authenticating signature
-        // instead of a neighbor pairwise tag, so both are skipped here.
-        // Reserve the trailer bytes and let the shared core write the pairwise
-        // tag into them when this directed frame needs one, returning how much
-        // to actually send: `body_len` (untagged — auth off, or a
-        // broadcast/OGM/cert-control packet), `body_len + trailer` (tagged), or
-        // `None` (auth on but untaggable — drop it rather than emit in clear).
+        // Reserve the trailer bytes so the shared planner can write a pairwise
+        // tag into them when this directed frame needs one, then resolve which
+        // interfaces carry the frame (split-horizon and per-link transmit gates
+        // included). `None` means auth is on but this directed frame cannot be
+        // tagged — drop it rather than emit it in the clear.
         let body_len = payload.len();
         payload.resize(body_len + DIRECTED_TRAILER_LEN, 0);
-        let Some(send_len) =
-            wayfinder_driver_core::tag_directed_into(router, dst, protocol, body_len, &mut payload)
-        else {
+        let num_interfaces = interfaces.len();
+        let Some(plan) = wayfinder_driver_core::plan_dispatch(
+            router,
+            now,
+            dst,
+            protocol,
+            egress,
+            body_len,
+            &mut payload,
+            num_interfaces,
+        ) else {
             continue;
         };
 
         let data = LinkFrameData {
             dst,
             protocol,
-            payload: &payload[..send_len],
+            payload: plan.payload(),
         };
 
-        // The BATMAN sub-type of this outgoing frame (its leading payload byte),
-        // used to consult each candidate interface's per-link transmit gates
-        // (`link_may_tx`).  Only meaningful for BATMAN frames; other protocols
-        // are never gated (`None` ⇒ always permitted).
-        let pkt_type = (protocol == wayfinder::DEFAULT_BATMAN_ETHER_TYPE)
-            .then(|| data.payload.first().copied())
-            .flatten();
-
-        match egress {
-            // A per-link OGM goes out exactly one interface, on that link's own
-            // adaptive schedule.
-            Egress::Iface(iface_idx) => {
-                if let Some(iface) = interfaces.get_mut(iface_idx) {
-                    send_on_link(iface, iface_idx, router, mac, &data, now).await;
-                }
+        for idx in plan.targets().iter() {
+            if let Some(iface) = interfaces.get_mut(idx) {
+                send_on_link(iface, idx, router, mac, &data, now).await;
             }
-            // Otherwise let the router's metric-driven egress choice decide.
-            Egress::Auto { exclude } => match router.get_egress_interface(now, dst) {
-                Some(EgressInterface::All) => {
-                    for (idx, iface) in interfaces.iter_mut().enumerate() {
-                        // Split-horizon: skip the interface a re-flood arrived on.
-                        if Some(idx) == exclude {
-                            continue;
-                        }
-                        // Per-link transmit gate: skip a link that does not send
-                        // this traffic class (e.g. an OGM re-flood onto a
-                        // `tx_ogm`-off link, or any broadcast onto a listen-only
-                        // link).
-                        if !router.link_may_tx(idx, pkt_type) {
-                            trace!(iface_idx = idx, "drop: tx gate disabled on this link");
-                            continue;
-                        }
-                        send_on_link(iface, idx, router, mac, &data, now).await;
-                    }
-                }
-                Some(EgressInterface::Interface(iface_idx)) => {
-                    // Per-link transmit gate: a unicast/mcast toward a route out
-                    // a `tx_data`-off link is dropped rather than forwarded.
-                    if router.link_may_tx(iface_idx, pkt_type) {
-                        if let Some(iface) = interfaces.get_mut(iface_idx) {
-                            send_on_link(iface, iface_idx, router, mac, &data, now).await;
-                        }
-                    } else {
-                        trace!(iface_idx, "drop: tx gate disabled on egress link");
-                    }
-                }
-                None => {}
-            },
         }
     }
 
