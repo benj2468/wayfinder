@@ -47,6 +47,34 @@ Central router orchestration. `no_std`; the `std` feature enables `DynLinkT`.
   position, so a generic `OgmAuth::new` would make every call site name its
   capacities (`E0284`). A profile-specific node calls `with_capacities` instead.
   Apply the same pattern to any future constructor here.
+- `router_ops.rs` (`RouterOps`, `OgmAuthOps`) — `CentralRouter`'s **driver
+  surface with the eleven capacities erased**, so code that merely *drives* a
+  router writes `R: RouterOps` instead of re-declaring eleven const arguments
+  and re-applying them to the router type. Implemented once, blanket, for every
+  profile.
+
+  Reach for it in any new generic function that takes a router. Before it,
+  `wayfinder-embedded-driver`'s `dispatch` named fifteen generic parameters to
+  express four real ones; its `Driver` struct named fourteen.
+
+  Three things worth knowing:
+
+  - **`INTERFACES` is deliberately *not* erased**, exposed as an associated
+    const. It is part of the contract with a driver — holding more links than
+    the router can schedule leaves the node silently mute on the surplus link
+    (`configure_interface_ogm` no-ops past the bound), so
+    `wayfinder-embedded-driver` asserts `N <= R::INTERFACES` at compile time.
+  - **Auth is reached through the `Auth` associated type**, bounded by
+    `OgmAuthOps`, because `OgmAuth` is itself const-generic over four more
+    capacities. `dyn` is not an option — `revoked_macs` returns an
+    `impl Iterator` and there is no allocator here to box one.
+  - **Scope is the driver surface, not everything.** The read-only
+    observability accessors the management API projects are *not* on the trait:
+    `wayfinder-server`'s `RouterAdapter` already projects those onto
+    `WayfinderDataProvider`, and duplicating ~25 of them here would create a
+    second near-copy to keep in step. `RouterAdapter` (and the one
+    `#[cfg(feature = "mgmt")]` impl in `wayfinder-embedded-driver` that feeds
+    it) therefore still spell the capacities out.
 - `config.rs` — per-link Trickle bounds (`i_min_ms`/`i_max_ms`) so a fast LAN
   link and a slow LoRa link back off on different schedules.
 - Observability: `RateEstimator` throughput EWMAs, `TableOccupancy` gauges —

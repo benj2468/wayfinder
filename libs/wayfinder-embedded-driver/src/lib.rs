@@ -44,6 +44,7 @@ use wayfinder::features::LinkFeatures;
 use wayfinder::interfaces::frame::LinkFrameData;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder::link::LinkT;
+use wayfinder::router_ops::RouterOps;
 use wayfinder_driver_core::Egress;
 use wayfinder_driver_core::MeshSink;
 use wayfinder_driver_core::OutgoingFrame;
@@ -57,8 +58,9 @@ pub mod identity;
 /// Build the concrete [`Driver`] type for a capacity profile declared with
 /// [`define_profile!`](wayfinder::define_profile).
 ///
-/// `Driver` takes fourteen const arguments once the router profile is threaded
-/// through it, so the order lives here rather than at a board's call site:
+/// A `Driver` names its link type, clock, link count, frame buffer and router
+/// type; the last two both follow from the capacity profile, so the mapping
+/// lives here rather than at a board's call site:
 ///
 /// ```ignore
 /// type NrfDriver = wayfinder_embedded_driver::driver_for!(RadioLink, BoardClock, 2, embedded);
@@ -75,17 +77,7 @@ macro_rules! driver_for {
             $clock,
             $n,
             { $($p)::+::MAX_FRAME_LEN },
-            { $($p)::+::ORIGINATORS },
-            { $($p)::+::INTERFACES },
-            { $($p)::+::MCAST_MEMBERS },
-            { $($p)::+::LOCAL_MCAST },
-            { $($p)::+::IDENT_TABLE },
-            { $($p)::+::IDENT_LIVE },
-            { $($p)::+::LINK_QUALITY },
-            { $($p)::+::NEIGHBOR_KEYS },
-            { $($p)::+::REVOKED },
-            { $($p)::+::IN_FLIGHT_CERT_REQUESTS },
-            { $($p)::+::PENDING_REPLIES },
+            ::wayfinder::router_for!($($p)::+),
         >
     };
 }
@@ -211,31 +203,9 @@ pub struct Driver<
     C,
     const N: usize,
     const FRAME_LEN: usize = { wayfinder::host::MAX_FRAME_LEN },
-    const ORIGINATORS: usize = { wayfinder::host::ORIGINATORS },
-    const INTERFACES: usize = { wayfinder::host::INTERFACES },
-    const MCAST_MEMBERS: usize = { wayfinder::host::MCAST_MEMBERS },
-    const LOCAL_MCAST: usize = { wayfinder::host::LOCAL_MCAST },
-    const IDENT_TABLE: usize = { wayfinder::host::IDENT_TABLE },
-    const IDENT_LIVE: usize = { wayfinder::host::IDENT_LIVE },
-    const LINK_QUALITY: usize = { wayfinder::host::LINK_QUALITY },
-    const NEIGHBOR_KEYS: usize = { wayfinder::host::NEIGHBOR_KEYS },
-    const REVOKED: usize = { wayfinder::host::REVOKED },
-    const IN_FLIGHT_CERT_REQUESTS: usize = { wayfinder::host::IN_FLIGHT_CERT_REQUESTS },
-    const PENDING_REPLIES: usize = { wayfinder::host::PENDING_REPLIES },
+    R = CentralRouter,
 > {
-    router: CentralRouter<
-        ORIGINATORS,
-        INTERFACES,
-        MCAST_MEMBERS,
-        LOCAL_MCAST,
-        IDENT_TABLE,
-        IDENT_LIVE,
-        LINK_QUALITY,
-        NEIGHBOR_KEYS,
-        REVOKED,
-        IN_FLIGHT_CERT_REQUESTS,
-        PENDING_REPLIES,
-    >,
+    router: R,
     links: [L; N],
     clock: C,
     mac: Mac,
@@ -266,40 +236,8 @@ impl<L: LinkT, C: Clock, const N: usize> Driver<L, C, N> {
     }
 }
 
-impl<
-    L: LinkT,
-    C: Clock,
-    const N: usize,
-    const FRAME_LEN: usize,
-    const ORIGINATORS: usize,
-    const INTERFACES: usize,
-    const MCAST_MEMBERS: usize,
-    const LOCAL_MCAST: usize,
-    const IDENT_TABLE: usize,
-    const IDENT_LIVE: usize,
-    const LINK_QUALITY: usize,
-    const NEIGHBOR_KEYS: usize,
-    const REVOKED: usize,
-    const IN_FLIGHT_CERT_REQUESTS: usize,
-    const PENDING_REPLIES: usize,
->
-    Driver<
-        L,
-        C,
-        N,
-        FRAME_LEN,
-        ORIGINATORS,
-        INTERFACES,
-        MCAST_MEMBERS,
-        LOCAL_MCAST,
-        IDENT_TABLE,
-        IDENT_LIVE,
-        LINK_QUALITY,
-        NEIGHBOR_KEYS,
-        REVOKED,
-        IN_FLIGHT_CERT_REQUESTS,
-        PENDING_REPLIES,
-    >
+impl<L: LinkT, C: Clock, const N: usize, const FRAME_LEN: usize, R: RouterOps>
+    Driver<L, C, N, FRAME_LEN, R>
 {
     /// A board must not hand the driver more mesh links than its profile's
     /// `interfaces` capacity.
@@ -312,7 +250,7 @@ impl<
     /// actually flash, and compared `N` against the crate-wide default instead
     /// of the profile, so it passed for exactly the profiles that needed it.
     const _LINKS_FIT_PROFILE: () = assert!(
-        N <= INTERFACES,
+        N <= R::INTERFACES,
         "more mesh links than the profile's `interfaces` capacity"
     );
 
@@ -332,7 +270,7 @@ impl<
         features: &[LinkFeatures],
     ) -> Self {
         let () = Self::_LINKS_FIT_PROFILE;
-        let mut router = CentralRouter::with_capacities(mac);
+        let mut router = R::with_capacities(mac);
         // Install each interface's adaptive OGM schedule and participation
         // features up front so the periodic timer and egress gates have a
         // per-interface entry from the start. The Trickle timer is armed on
@@ -365,41 +303,13 @@ impl<
 
     /// The underlying router, for inspecting routing state (originator tables,
     /// link quality, route resolution).
-    pub fn router(
-        &self,
-    ) -> &CentralRouter<
-        ORIGINATORS,
-        INTERFACES,
-        MCAST_MEMBERS,
-        LOCAL_MCAST,
-        IDENT_TABLE,
-        IDENT_LIVE,
-        LINK_QUALITY,
-        NEIGHBOR_KEYS,
-        REVOKED,
-        IN_FLIGHT_CERT_REQUESTS,
-        PENDING_REPLIES,
-    > {
+    pub fn router(&self) -> &R {
         &self.router
     }
 
     /// The underlying router, mutably — lets a board enable OGM authentication
     /// or inject crafted state before/while running the loop.
-    pub fn router_mut(
-        &mut self,
-    ) -> &mut CentralRouter<
-        ORIGINATORS,
-        INTERFACES,
-        MCAST_MEMBERS,
-        LOCAL_MCAST,
-        IDENT_TABLE,
-        IDENT_LIVE,
-        LINK_QUALITY,
-        NEIGHBOR_KEYS,
-        REVOKED,
-        IN_FLIGHT_CERT_REQUESTS,
-        PENDING_REPLIES,
-    > {
+    pub fn router_mut(&mut self) -> &mut R {
         &mut self.router
     }
 
@@ -457,35 +367,9 @@ impl<
 /// The [`Either::First`]/[`Either3::First`] arm shared by [`Driver::run_once`]
 /// and [`Driver::run_once_with_mgmt`]: plan a link's `recv` outcome (a received
 /// frame, or a drop on error) into `stage`.
-fn handle_link_result<
-    const STAGE: usize,
-    const FRAME_LEN: usize,
-    const ORIGINATORS: usize,
-    const INTERFACES: usize,
-    const MCAST_MEMBERS: usize,
-    const LOCAL_MCAST: usize,
-    const IDENT_TABLE: usize,
-    const IDENT_LIVE: usize,
-    const LINK_QUALITY: usize,
-    const NEIGHBOR_KEYS: usize,
-    const REVOKED: usize,
-    const IN_FLIGHT_CERT_REQUESTS: usize,
-    const PENDING_REPLIES: usize,
->(
+fn handle_link_result<const STAGE: usize, const FRAME_LEN: usize, R: RouterOps>(
     now: Duration,
-    router: &mut CentralRouter<
-        ORIGINATORS,
-        INTERFACES,
-        MCAST_MEMBERS,
-        LOCAL_MCAST,
-        IDENT_TABLE,
-        IDENT_LIVE,
-        LINK_QUALITY,
-        NEIGHBOR_KEYS,
-        REVOKED,
-        IN_FLIGHT_CERT_REQUESTS,
-        PENDING_REPLIES,
-    >,
+    router: &mut R,
     idx: usize,
     result: Result<wayfinder::link::Received<'_>, interfaces::link::LinkError>,
     tx_buffer: &mut [u8; FRAME_LEN],
@@ -513,34 +397,8 @@ fn handle_link_result<
 /// The [`Either::Second`]/[`Either3::Second`] arm shared by [`Driver::run_once`]
 /// and [`Driver::run_once_with_mgmt`]: the periodic OGM/keep-alive timer fired,
 /// so plan whatever is due into `stage`.
-fn handle_timer_due<
-    const STAGE: usize,
-    const FRAME_LEN: usize,
-    const ORIGINATORS: usize,
-    const INTERFACES: usize,
-    const MCAST_MEMBERS: usize,
-    const LOCAL_MCAST: usize,
-    const IDENT_TABLE: usize,
-    const IDENT_LIVE: usize,
-    const LINK_QUALITY: usize,
-    const NEIGHBOR_KEYS: usize,
-    const REVOKED: usize,
-    const IN_FLIGHT_CERT_REQUESTS: usize,
-    const PENDING_REPLIES: usize,
->(
-    router: &mut CentralRouter<
-        ORIGINATORS,
-        INTERFACES,
-        MCAST_MEMBERS,
-        LOCAL_MCAST,
-        IDENT_TABLE,
-        IDENT_LIVE,
-        LINK_QUALITY,
-        NEIGHBOR_KEYS,
-        REVOKED,
-        IN_FLIGHT_CERT_REQUESTS,
-        PENDING_REPLIES,
-    >,
+fn handle_timer_due<const STAGE: usize, const FRAME_LEN: usize, R: RouterOps>(
+    router: &mut R,
     now: Duration,
     tx_buffer: &mut [u8; FRAME_LEN],
     stage: &mut StageSink<STAGE, FRAME_LEN>,
@@ -550,6 +408,16 @@ fn handle_timer_due<
     poll_due_keepalives(router, now, tx_buffer, stage);
 }
 
+/// The management arm is the one place still spelling the capacities out.
+///
+/// `wayfinder-server`'s `RouterAdapter` is itself const-generic over all eleven
+/// (it projects the router's full observability surface onto
+/// `WayfinderDataProvider`), so it cannot accept an opaque `R: RouterOps`. This
+/// `impl` is therefore specialised to a concrete `CentralRouter` rather than
+/// growing `RouterOps` by the ~25 read-only accessors the adapter needs, which
+/// would create a second near-copy of `WayfinderDataProvider` to keep in step.
+/// No practical loss: `R` is always a `CentralRouter` today. Making
+/// `RouterAdapter` generic over `RouterOps` would retire this block.
 #[cfg(feature = "mgmt")]
 impl<
     L: LinkT,
@@ -573,17 +441,19 @@ impl<
         C,
         N,
         FRAME_LEN,
-        ORIGINATORS,
-        INTERFACES,
-        MCAST_MEMBERS,
-        LOCAL_MCAST,
-        IDENT_TABLE,
-        IDENT_LIVE,
-        LINK_QUALITY,
-        NEIGHBOR_KEYS,
-        REVOKED,
-        IN_FLIGHT_CERT_REQUESTS,
-        PENDING_REPLIES,
+        CentralRouter<
+            ORIGINATORS,
+            INTERFACES,
+            MCAST_MEMBERS,
+            LOCAL_MCAST,
+            IDENT_TABLE,
+            IDENT_LIVE,
+            LINK_QUALITY,
+            NEIGHBOR_KEYS,
+            REVOKED,
+            IN_FLIGHT_CERT_REQUESTS,
+            PENDING_REPLIES,
+        >,
     >
 {
     /// Run the event loop forever, additionally serving management-API queries.
@@ -652,32 +522,10 @@ async fn dispatch<
     const N: usize,
     const STAGE: usize,
     const FRAME_LEN: usize,
-    const ORIGINATORS: usize,
-    const INTERFACES: usize,
-    const MCAST_MEMBERS: usize,
-    const LOCAL_MCAST: usize,
-    const IDENT_TABLE: usize,
-    const IDENT_LIVE: usize,
-    const LINK_QUALITY: usize,
-    const NEIGHBOR_KEYS: usize,
-    const REVOKED: usize,
-    const IN_FLIGHT_CERT_REQUESTS: usize,
-    const PENDING_REPLIES: usize,
+    R: RouterOps,
 >(
     links: &mut [L; N],
-    router: &mut CentralRouter<
-        ORIGINATORS,
-        INTERFACES,
-        MCAST_MEMBERS,
-        LOCAL_MCAST,
-        IDENT_TABLE,
-        IDENT_LIVE,
-        LINK_QUALITY,
-        NEIGHBOR_KEYS,
-        REVOKED,
-        IN_FLIGHT_CERT_REQUESTS,
-        PENDING_REPLIES,
-    >,
+    router: &mut R,
     mac: Mac,
     now: Duration,
     stage: &mut StageSink<STAGE, FRAME_LEN>,
@@ -764,35 +612,9 @@ async fn dispatch<
 /// Send one framed datagram out interface `idx`, folding the byte count into the
 /// interface's transmit-rate estimator; a send error is logged and dropped
 /// (fire-and-forget, matching the tokio driver's `LinkError` handling on radios).
-async fn send_on<
-    L: LinkT,
-    const N: usize,
-    const ORIGINATORS: usize,
-    const INTERFACES: usize,
-    const MCAST_MEMBERS: usize,
-    const LOCAL_MCAST: usize,
-    const IDENT_TABLE: usize,
-    const IDENT_LIVE: usize,
-    const LINK_QUALITY: usize,
-    const NEIGHBOR_KEYS: usize,
-    const REVOKED: usize,
-    const IN_FLIGHT_CERT_REQUESTS: usize,
-    const PENDING_REPLIES: usize,
->(
+async fn send_on<L: LinkT, const N: usize, R: RouterOps>(
     links: &mut [L; N],
-    router: &mut CentralRouter<
-        ORIGINATORS,
-        INTERFACES,
-        MCAST_MEMBERS,
-        LOCAL_MCAST,
-        IDENT_TABLE,
-        IDENT_LIVE,
-        LINK_QUALITY,
-        NEIGHBOR_KEYS,
-        REVOKED,
-        IN_FLIGHT_CERT_REQUESTS,
-        PENDING_REPLIES,
-    >,
+    router: &mut R,
     idx: usize,
     mac: Mac,
     data: &LinkFrameData<'_>,

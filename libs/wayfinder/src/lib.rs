@@ -146,6 +146,10 @@ mod capacity_tests;
 mod link_quality;
 mod routing_table;
 
+/// Capacity-erased access to a [`CentralRouter`], so a driver generic over a
+/// router names one type parameter instead of eleven const arguments.
+pub mod router_ops;
+
 /// EtherType demuxed to the BATMAN engine by
 /// [`handle_frame_with_metrics`](CentralRouter::handle_frame_with_metrics).
 pub const DEFAULT_BATMAN_ETHER_TYPE: u16 = 0x4305;
