@@ -4,12 +4,12 @@
 //!
 //! These deliberately bypass [`TestHarness`](crate::driver::TestHarness) and
 //! its deterministic virtual-clock tick model: `TestHarness::tick` and
-//! `TestRouter::drain_all` both drive interfaces with a single non-blocking
+//! `LinkTestRouter::drain_all` both drive interfaces with a single non-blocking
 //! poll (a 1ns timeout, or `now_or_never` inside `Driver::process_pending`),
 //! which works for immediately-ready-or-empty in-process channels but would
 //! almost never observe traffic on a `RylrClient` link, whose bytes move
 //! asynchronously through a separately-scheduled background `LoraSwitch` task
-//! over a real `tokio::io::duplex`. (`TestRouter::poll_due` isn't
+//! over a real `tokio::io::duplex`. (`LinkTestRouter::poll_due` isn't
 //! non-blocking-poll-based at all — it only emits already-due OGMs via a
 //! plain `.await`, it never reads inbound traffic — but it's still the wrong
 //! primitive here since it never drives `recv`.) Instead this drives
@@ -35,7 +35,7 @@ use rylr998_sim::make_node;
 use wayfinder::config::TrickleConfig;
 use wayfinder_driver::DynLinkT;
 
-use crate::test_router::TestRouter;
+use crate::link_router::LinkTestRouter;
 use crate::test_router::host_frame;
 
 fn mac(n: u8) -> Mac {
@@ -55,9 +55,9 @@ fn fast_trickle() -> Vec<TrickleConfig> {
 /// against the other — see the module doc) until `done` reports true, or
 /// fail the test after a generous fail-fast bound.
 async fn drive_until(
-    a: &mut TestRouter,
-    b: &mut TestRouter,
-    mut done: impl FnMut(&TestRouter, &TestRouter) -> bool,
+    a: &mut LinkTestRouter,
+    b: &mut LinkTestRouter,
+    mut done: impl FnMut(&LinkTestRouter, &LinkTestRouter) -> bool,
 ) {
     let t0 = Instant::now();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -90,8 +90,8 @@ async fn rylr_two_node_convergence() {
     let (cb, _sim_b) = make_node(&mut switch, 2, 18, 915_000_000).await;
     let _switch_task = tokio::spawn(switch.run());
 
-    let mut a = TestRouter::from_links(mac(1), vec![DynLinkT::new_box(ca)], fast_trickle());
-    let mut b = TestRouter::from_links(mac(2), vec![DynLinkT::new_box(cb)], fast_trickle());
+    let mut a = LinkTestRouter::from_links(mac(1), vec![DynLinkT::new_box(ca)], fast_trickle());
+    let mut b = LinkTestRouter::from_links(mac(2), vec![DynLinkT::new_box(cb)], fast_trickle());
 
     drive_until(&mut a, &mut b, |a, b| {
         a.router().originator_count() == 1 && b.router().originator_count() == 1
@@ -113,8 +113,8 @@ async fn rylr_fragmented_payload_end_to_end() {
     let (cb, _sim_b) = make_node(&mut switch, 2, 18, 915_000_000).await;
     let _switch_task = tokio::spawn(switch.run());
 
-    let mut a = TestRouter::from_links(mac(1), vec![DynLinkT::new_box(ca)], fast_trickle());
-    let mut b = TestRouter::from_links(mac(2), vec![DynLinkT::new_box(cb)], fast_trickle());
+    let mut a = LinkTestRouter::from_links(mac(1), vec![DynLinkT::new_box(ca)], fast_trickle());
+    let mut b = LinkTestRouter::from_links(mac(2), vec![DynLinkT::new_box(cb)], fast_trickle());
 
     // A unicast needs a route first.
     drive_until(&mut a, &mut b, |a, b| {

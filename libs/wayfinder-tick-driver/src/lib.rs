@@ -118,6 +118,17 @@ pub struct Driver {
     /// One outgoing queue per interface index.
     egress: Vec<VecDeque<Vec<u8>>>,
     local_rx: VecDeque<Vec<u8>>,
+    /// Wall-clock unix time (seconds) that `now == 0` corresponds to.
+    ///
+    /// Certificate validity is judged against unix time, but a tick-driven
+    /// caller supplies a monotonic `now` starting at zero — so each [`tick`]
+    /// sets the auth clock to `auth_epoch_unix + now`. Left at 0 the auth clock
+    /// never advances, which [`OgmAuth`](wayfinder::auth::OgmAuth) reads as
+    /// "clock never set". Set it with
+    /// [`set_auth_epoch_unix`](Self::set_auth_epoch_unix).
+    ///
+    /// [`tick`]: Self::tick
+    auth_epoch_unix: u64,
 }
 
 impl Driver {
@@ -156,6 +167,7 @@ impl Driver {
             local_tx_queue: VecDeque::new(),
             egress: (0..n).map(|_| VecDeque::new()).collect(),
             local_rx: VecDeque::new(),
+            auth_epoch_unix: 0,
         }
     }
 
@@ -174,6 +186,18 @@ impl Driver {
     /// crafted state before/between ticks.
     pub fn router_mut(&mut self) -> &mut CentralRouter {
         &mut self.router
+    }
+
+    /// Pin the wall-clock unix time that `now == 0` corresponds to, so
+    /// certificate validity is judged against a real clock while the caller
+    /// keeps driving a monotonic `now` from zero.
+    ///
+    /// Each [`tick`](Self::tick) then advances the auth clock to
+    /// `epoch_unix + now`. Set this whenever OGM authentication is enabled;
+    /// without it the auth clock stays at 0, which
+    /// [`OgmAuth`](wayfinder::auth::OgmAuth) treats as never having been set.
+    pub fn set_auth_epoch_unix(&mut self, epoch_unix: u64) {
+        self.auth_epoch_unix = epoch_unix;
     }
 
     /// Enqueue a frame received on interface `idx` (with its carrier's
@@ -208,6 +232,29 @@ impl Driver {
     /// (or the local-delivery queue). Call once per simulation step; never blocks and
     /// never waits for anything to arrive.
     pub fn tick(&mut self, now: Duration) {
+        self.tick_schedules(now, true, true);
+    }
+
+    /// Advance to `now` servicing only the selected periodic schedules.
+    ///
+    /// [`tick`](Self::tick) is this with both enabled, and is what a normal
+    /// caller wants. The split exists because the two schedules are
+    /// independently observable failure modes: a node whose keep-alives have
+    /// stopped while its OGMs still flow is a real fault, and driving
+    /// `keepalives = false` is how a caller reproduces it. The async driver
+    /// exposes the same split as separate `poll_due` / `poll_due_keepalive`
+    /// methods.
+    ///
+    /// Received frames, queued host sends and the auth clock are serviced
+    /// regardless — only the two emission schedules are gated.
+    pub fn tick_schedules(&mut self, now: Duration, ogms: bool, keepalives: bool) {
+        // Advance the auth clock before anything reads it: cert validity is
+        // judged in unix seconds, and this is the only place the monotonic
+        // `now` is mapped onto that clock.
+        if let Some(auth) = self.router.auth_mut() {
+            auth.set_time(self.auth_epoch_unix.saturating_add(now.as_secs()));
+        }
+
         let mut stage = StageSink::default();
 
         while let Some(queued) = self.rx_queue.pop_front() {
@@ -239,8 +286,12 @@ impl Driver {
             }
         }
 
-        poll_due_ogms(&mut self.router, now, &mut self.tx_buffer, &mut stage);
-        poll_due_keepalives(&mut self.router, now, &mut self.tx_buffer, &mut stage);
+        if ogms {
+            poll_due_ogms(&mut self.router, now, &mut self.tx_buffer, &mut stage);
+        }
+        if keepalives {
+            poll_due_keepalives(&mut self.router, now, &mut self.tx_buffer, &mut stage);
+        }
 
         for staged in stage.frames.drain(..) {
             self.dispatch_one(now, staged);
@@ -313,6 +364,7 @@ impl Driver {
 mod tests {
     use wayfinder::DEFAULT_BATMAN_ETHER_TYPE;
     use wayfinder::batman::wire::BATADV_IV_OGM;
+    use wayfinder::batman::wire::BATADV_KEEPALIVE;
     use wayfinder::batman::wire::BatmanOgmPacket;
 
     use super::*;
@@ -535,6 +587,97 @@ mod tests {
         assert!(
             b.router_mut().get_egress_interface(now, mac(1)).is_some(),
             "b resolves a route to a"
+        );
+    }
+
+    /// The two periodic schedules must be drivable independently, the same way
+    /// the async driver exposes `poll_due` and `poll_due_keepalive` separately.
+    ///
+    /// That split is how a caller injects "this node stopped sending
+    /// keep-alives while its OGMs keep flowing" — a node whose liveness
+    /// signal has died but whose routing chatter has not. Collapsing them into
+    /// one `tick` makes that fault unrepresentable.
+    #[test]
+    fn schedules_can_be_driven_independently() {
+        let trickle = TrickleConfig::default();
+        let mut driver = Driver::new(mac(1), &[trickle], &[]);
+        driver.router_mut().configure_interface_keepalive(
+            0,
+            Some(Duration::from_millis(150)),
+            Duration::ZERO,
+        );
+
+        // Far enough ahead that both schedules are due.
+        let now = Duration::from_secs(5);
+
+        driver.tick_schedules(now, true, false);
+        let types = drain_packet_types(&mut driver);
+        assert!(
+            types.contains(&BATADV_IV_OGM),
+            "the OGM schedule ran: {types:?}"
+        );
+        assert!(
+            !types.contains(&BATADV_KEEPALIVE),
+            "the keep-alive schedule was suppressed: {types:?}"
+        );
+
+        driver.tick_schedules(now, false, true);
+        let types = drain_packet_types(&mut driver);
+        assert!(
+            types.contains(&BATADV_KEEPALIVE),
+            "the keep-alive schedule ran on its own: {types:?}"
+        );
+        assert!(
+            !types.contains(&BATADV_IV_OGM),
+            "and did not re-run the OGM schedule: {types:?}"
+        );
+    }
+
+    /// Drain interface 0's egress queue, returning each frame's BATMAN
+    /// sub-type (the first payload byte after the 14-byte link header).
+    fn drain_packet_types(driver: &mut Driver) -> Vec<u8> {
+        let mut types = Vec::new();
+        while let Some(frame) = driver.poll_egress(0) {
+            if let Some(t) = frame.get(14) {
+                types.push(*t);
+            }
+        }
+        types
+    }
+
+    /// Certificate validity is judged against wall-clock unix time, but a
+    /// tick-driven caller supplies a monotonic `now` starting at zero. The
+    /// driver bridges the two: `set_auth_epoch_unix` pins what unix time
+    /// `now == 0` means, and each `tick` advances the auth clock to
+    /// `epoch + now`.
+    ///
+    /// Without this a tick-driven node's auth clock sits at 0 forever, which
+    /// `OgmAuth` reads as "clock never set" — so every cert-validity check is
+    /// judged against the wrong time.
+    #[test]
+    fn tick_advances_the_auth_clock_from_the_configured_epoch() {
+        let authority = wayfinder_auth::Authority::from_seed(&[1; 32], 0xABCD);
+        let kp = wayfinder_auth::Keypair::from_seed(&[2; 32]);
+        let cert = authority.issue_cert(mac(1), kp.ed_pubkey(), kp.x_pubkey(), 0, 1_000_000);
+
+        let mut driver = Driver::new(mac(1), &[TrickleConfig::default()], &[]);
+        driver.router_mut().set_auth(wayfinder::auth::OgmAuth::new(
+            kp,
+            cert,
+            authority.trust_anchor(),
+        ));
+        driver.set_auth_epoch_unix(1_000);
+
+        driver.tick(Duration::from_secs(5));
+
+        let auth_now = driver
+            .router()
+            .auth()
+            .expect("auth was installed")
+            .now_unix();
+        assert_eq!(
+            auth_now, 1_005,
+            "the auth clock is the configured epoch plus the tick's monotonic `now`"
         );
     }
 }

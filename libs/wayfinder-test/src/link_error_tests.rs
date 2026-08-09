@@ -6,7 +6,7 @@
 //! treat both directions with one posture: **log and continue**, never crash
 //! the node on `send` and never swallow a `recv` error silently.
 //!
-//! These tests drive the real `Driver` (via `TestRouter::from_links`) with
+//! These tests drive the real `Driver` (via `LinkTestRouter::from_links`) with
 //! purpose-built failing links.
 
 use std::io::Write;
@@ -24,7 +24,7 @@ use wayfinder::link::LinkT;
 use wayfinder::link::Received;
 use wayfinder_driver::DynLinkT;
 
-use crate::test_router::TestRouter;
+use crate::link_router::LinkTestRouter;
 
 fn mac(n: u8) -> Mac {
     Mac([0, 0, 0, 0, 0, n])
@@ -160,7 +160,7 @@ async fn send_error_does_not_abort_the_loop() {
     let link = SendFailLink {
         attempts: attempts.clone(),
     };
-    let mut tr = TestRouter::from_links(mac(1), vec![DynLinkT::new_box(link)], Vec::new());
+    let mut tr = LinkTestRouter::from_links(mac(1), vec![DynLinkT::new_box(link)], Vec::new());
 
     let result = tr.driver().poll_due(Duration::from_secs(1)).await;
 
@@ -186,7 +186,7 @@ async fn send_error_on_one_link_does_not_block_others() {
         attempts: attempts.clone(),
     };
     let recording = RecordingLink { sent: sent.clone() };
-    let mut tr = TestRouter::from_links(
+    let mut tr = LinkTestRouter::from_links(
         mac(1),
         vec![DynLinkT::new_box(failing), DynLinkT::new_box(recording)],
         Vec::new(),
@@ -230,7 +230,7 @@ async fn recv_error_is_logged_and_survived() {
     let (capture, _guard) = capture_at(tracing::Level::TRACE);
 
     let link = RecvFailOnceLink { failed: false };
-    let mut tr = TestRouter::from_links(mac(1), vec![DynLinkT::new_box(link)], Vec::new());
+    let mut tr = LinkTestRouter::from_links(mac(1), vec![DynLinkT::new_box(link)], Vec::new());
 
     let result = timeout(
         Duration::from_secs(1),
@@ -264,7 +264,7 @@ async fn process_pending_survives_recv_error() {
     let (capture, _guard) = capture_at(tracing::Level::TRACE);
 
     let link = RecvFailOnceLink { failed: false };
-    let mut tr = TestRouter::from_links(mac(1), vec![DynLinkT::new_box(link)], Vec::new());
+    let mut tr = LinkTestRouter::from_links(mac(1), vec![DynLinkT::new_box(link)], Vec::new());
 
     let result = tr.driver().process_pending().await;
 

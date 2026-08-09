@@ -108,10 +108,10 @@ impl TestHarness {
     /// interface emits its first OGM and the mesh converges; the explicit clock
     /// also drives time-based route ageing.  For multi-round backoff dynamics
     /// (settling to `i_max`) use [`run_trickle`](Self::run_trickle).
-    pub async fn poll_due(&mut self, now: Duration) {
+    pub fn poll_due(&mut self, now: Duration) {
         self.clock = now;
         for router in self.machines.values_mut() {
-            router.poll_due(now).await;
+            router.poll_due(now);
         }
     }
 
@@ -119,26 +119,14 @@ impl TestHarness {
     /// at the current virtual clock, then let every switch forward what is on
     /// the wire.  Returns the number of frames the switches pulled off the wire
     /// this step; `0` means no node transmitted, i.e. the fabric is quiescent.
-    pub async fn tick(&mut self) -> usize {
+    pub fn tick(&mut self) -> usize {
         let now = self.clock;
-        // The periodic (OGM) arm is disabled here (`check_periodic = false`):
-        // OGM rounds are driven explicitly by `poll_due`, so a tick only moves the
-        // frames already on the wire — first every node transmits, then every
-        // node receives.
+        // Each node takes delivery of whatever the switch queued for it,
+        // advances one driver tick, and hands back whatever it produced. No
+        // periodic OGM round is forced here — `poll_due` drives those — so a
+        // tick only moves frames already in flight.
         for router in self.machines.values_mut() {
-            let _ = tokio::time::timeout(
-                tokio::time::Duration::from_nanos(1),
-                router.driver().run_once(now, false, true, false, false),
-            )
-            .await;
-        }
-
-        for router in self.machines.values_mut() {
-            let _ = tokio::time::timeout(
-                tokio::time::Duration::from_nanos(1),
-                router.driver().run_once(now, true, false, false, false),
-            )
-            .await;
+            router.step_schedules(now, false, false);
         }
         let mut frames = 0;
         for switch in self.switches.values_mut() {
@@ -146,7 +134,7 @@ impl TestHarness {
                 clippy::expect_used,
                 reason = "the simulated Switch::tick has no failure mode reachable from this harness"
             )]
-            let tick_frames = switch.tick().await.expect("switch tick should not fail");
+            let tick_frames = switch.tick().expect("switch tick should not fail");
             frames += tick_frames;
         }
         frames
@@ -164,9 +152,9 @@ impl TestHarness {
     /// surfaces as a test failure instead of a hang — the timeout doubles as the
     /// "the mesh converged" assertion, and keeps large meshes (hundreds of
     /// nodes) honest about how long settling is allowed to take.
-    pub async fn converge(&mut self, at: Duration) {
-        self.poll_due(at).await;
-        self.settle().await;
+    pub fn converge(&mut self, at: Duration) {
+        self.poll_due(at);
+        self.settle();
     }
 
     /// Drive the fabric to quiescence **without** emitting any new OGMs: keep
@@ -183,7 +171,7 @@ impl TestHarness {
     /// far more than any loop-free mesh needs (diameter × duplicate drainage),
     /// but finite, so a forwarding loop fails the test deterministically instead
     /// of hanging, on the paused clock as well as the real one.
-    pub async fn settle(&mut self) {
+    pub fn settle(&mut self) {
         // Enough consecutive silent sweeps to outlast any in-flight duplicate
         // draining hop by hop across the mesh diameter.
         const QUIET_SWEEPS: usize = 8;
@@ -198,7 +186,7 @@ impl TestHarness {
                 total < MAX_SWEEPS,
                 "settle did not quiesce in {MAX_SWEEPS} sweeps — likely an OGM forwarding loop"
             );
-            if self.tick().await > 0 {
+            if self.tick() > 0 {
                 quiet = 0;
             } else {
                 quiet += 1;
@@ -213,7 +201,7 @@ impl TestHarness {
     /// result to quiescence through the real [`Switch`].  The building block of
     /// [`advance_trickle`](Self::advance_trickle) and
     /// [`run_trickle`](Self::run_trickle).
-    async fn trickle_step(&mut self) {
+    fn trickle_step(&mut self) {
         let now = self.clock;
         let dt = self
             .machines
@@ -224,9 +212,9 @@ impl TestHarness {
             .max(Duration::from_nanos(1));
         self.clock = now + dt;
         for m in self.machines.values_mut() {
-            m.poll_due(self.clock).await;
+            m.poll_due(self.clock);
         }
-        self.settle().await;
+        self.settle();
     }
 
     /// Advance the virtual clock to at least `to` using the production
@@ -234,12 +222,12 @@ impl TestHarness {
     /// emit on their own backoff schedules, so live nodes keep refreshing each
     /// other while a node that has gone silent ages out once `to` passes its
     /// purge budget.  The deterministic image of the real driver's periodic loop.
-    pub async fn advance_trickle(&mut self, to: Duration) {
+    pub fn advance_trickle(&mut self, to: Duration) {
         let mut guard = 0u64;
         while self.clock < to {
             guard += 1;
             assert!(guard < 2_000_000, "trickle advance failed to terminate");
-            self.trickle_step().await;
+            self.trickle_step();
         }
     }
 
@@ -249,7 +237,7 @@ impl TestHarness {
     /// spurious purge/flap); anything less means routes flapped.  Used by the
     /// whole-mesh settling test; unlike [`converge`](Self::converge) it exercises
     /// the multi-round backoff dynamics (settling to `i_max`).
-    pub async fn run_trickle(&mut self, warmup: Duration, end: Duration) -> usize {
+    pub fn run_trickle(&mut self, warmup: Duration, end: Duration) -> usize {
         let n = self.machines.len();
         let mut min_full = n.saturating_sub(1);
         let mut guard = 0u64;
@@ -257,7 +245,7 @@ impl TestHarness {
         while self.clock < end {
             guard += 1;
             assert!(guard < 2_000_000, "trickle drive failed to terminate");
-            self.trickle_step().await;
+            self.trickle_step();
             if self.clock >= warmup {
                 for m in self.machines.values() {
                     min_full = min_full.min(m.router().originator_count());

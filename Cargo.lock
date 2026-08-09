@@ -3332,10 +3332,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "embassy-sync",
- "embedded-io-async 0.7.0",
- "futures",
- "heapless",
  "interfaces",
  "rand",
  "rylr998",
@@ -3348,6 +3344,7 @@ dependencies = [
  "wayfinder",
  "wayfinder-auth",
  "wayfinder-driver",
+ "wayfinder-tick-driver",
  "zerocopy",
 ]
 
@@ -3358,6 +3355,7 @@ dependencies = [
  "interfaces",
  "tracing",
  "wayfinder",
+ "wayfinder-auth",
  "wayfinder-driver-core",
  "zerocopy",
 ]

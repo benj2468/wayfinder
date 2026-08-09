@@ -301,11 +301,13 @@ does the I/O for the interfaces in that plan — a `LinkT::send` on embedded, a
 `DynLinkT` send on the host, a queue push in the tick driver.
 
 **Host node & tooling**
-- **libs/wayfinder-test** → `Switch` simulator + `TestRouter` harness for
-  multi-node integration tests over mpsc (no hardware). Wraps the *production*
-  tokio `Driver`, but drives it via the deterministic `poll_due` /
-  `process_pending` API — `run`/`run_once` and the `select!` arms have no
-  direct coverage.
+- **libs/wayfinder-test** → `Switch` simulator + per-node harness for
+  multi-node integration tests (no hardware). **Synchronous**: `TestRouter`
+  drives `wayfinder-tick-driver` over plain queues, so the 63 routing tests are
+  plain `#[test]` with a virtual clock. `LinkTestRouter` keeps the async
+  `wayfinder-driver` for the two suites that need a real `LinkT` (link I/O
+  error policy, a real `RylrClient`) — which is also what covers the tokio
+  driver's link handling.
 - **libs/rylr998-sim** — an in-process AT-command simulator standing in for a
   real RYLR998/498 module, so a real `RylrClient` is drivable without
   hardware. `RylrSimulator` speaks the AT protocol over a

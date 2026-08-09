@@ -244,7 +244,7 @@ where
     /// (i.e. frames nodes transmitted into the fabric); callers use a zero count
     /// as the signal that the fabric has fallen silent.
     #[tracing::instrument(skip(self), fields(name = self.name))]
-    pub async fn tick(&mut self) -> Result<usize, SwitchError> {
+    pub fn tick(&mut self) -> Result<usize, SwitchError> {
         // Flush all messages in the switch's buffer
         let mut msgs = self
             .ports
@@ -353,8 +353,7 @@ where
                         .expect("ports are never removed once added")
                         .duplex
                         .egress
-                        .send(msg.clone())
-                        .await;
+                        .try_send(msg.clone());
                 } else {
                     // Broadcast to all ports except source, each copy subject to
                     // that port's own egress loss.
@@ -380,7 +379,7 @@ where
                             taps.retain(|t| !t.invalid);
                         }
 
-                        let _ = other_port.duplex.egress.send(msg.clone()).await;
+                        let _ = other_port.duplex.egress.try_send(msg.clone());
                     }
                 }
             }
@@ -415,8 +414,8 @@ mod tests {
         (tx_to_switch, rx_from_switch, port_comms)
     }
 
-    #[tokio::test]
-    async fn test_add_port() {
+    #[test]
+    fn test_add_port() {
         let mut switch: Switch<u8> = Switch::new();
         let (_, _, port_comms) = create_port_pair(10);
 
@@ -428,8 +427,8 @@ mod tests {
         assert_eq!(port_id2, PortId(1));
     }
 
-    #[tokio::test]
-    async fn test_disconnect_port() {
+    #[test]
+    fn test_disconnect_port() {
         let mut switch: Switch<u8> = Switch::new();
         let (_, _, port_comms) = create_port_pair(10);
 
@@ -443,8 +442,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn test_update_port_config() {
+    #[test]
+    fn test_update_port_config() {
         let mut switch: Switch<u8> = Switch::new();
         let (_, _, port_comms) = create_port_pair(10);
 
@@ -460,8 +459,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn test_simple_unicast_learned_forwarding() {
+    #[test]
+    fn test_simple_unicast_learned_forwarding() {
         let mut switch: Switch<u8> = Switch::new();
 
         // Create two ports
@@ -472,8 +471,8 @@ mod tests {
         let _port2_id = switch.add_port(port2, PortConfig::no_loss()).unwrap();
 
         // Port 1 sends frame from node 1 to node 2
-        tx1.send(make_frame(1, 2)).await.unwrap();
-        switch.tick().await.unwrap();
+        tx1.try_send(make_frame(1, 2)).unwrap();
+        switch.tick().unwrap();
 
         // Should broadcast to port 2 (destination unknown)
         let received = rx2.try_recv().unwrap();
@@ -483,8 +482,8 @@ mod tests {
         assert!(rx1.try_recv().is_err());
 
         // Now port 2 sends reply from node 2 to node 1
-        tx2.send(make_frame(2, 1)).await.unwrap();
-        switch.tick().await.unwrap();
+        tx2.try_send(make_frame(2, 1)).unwrap();
+        switch.tick().unwrap();
 
         // Should go directly to port 1 (learned address)
         let received = rx1.try_recv().unwrap();
@@ -494,8 +493,8 @@ mod tests {
         assert!(rx2.try_recv().is_err());
     }
 
-    #[tokio::test]
-    async fn test_broadcast_to_unknown_destination() {
+    #[test]
+    fn test_broadcast_to_unknown_destination() {
         let mut switch: Switch<u8> = Switch::new();
 
         // Create three ports
@@ -508,8 +507,8 @@ mod tests {
         switch.add_port(port3, PortConfig::no_loss()).unwrap();
 
         // Port 1 sends to unknown destination
-        tx1.send(make_frame(1, 99)).await.unwrap();
-        switch.tick().await.unwrap();
+        tx1.try_send(make_frame(1, 99)).unwrap();
+        switch.tick().unwrap();
 
         // Should broadcast to port 2 and 3, but not back to port 1
         assert!(rx1.try_recv().is_err());
@@ -517,8 +516,8 @@ mod tests {
         assert_eq!(rx3.try_recv().unwrap(), make_frame(1, 99));
     }
 
-    #[tokio::test]
-    async fn test_address_learning() {
+    #[test]
+    fn test_address_learning() {
         let mut switch: Switch<u8> = Switch::new();
 
         let (tx1, _, port1) = create_port_pair(10);
@@ -528,22 +527,22 @@ mod tests {
         switch.add_port(port2, PortConfig::no_loss()).unwrap();
 
         // Send from port 1 (source = node 5)
-        tx1.send(make_frame(5, 10)).await.unwrap();
-        switch.tick().await.unwrap();
+        tx1.try_send(make_frame(5, 10)).unwrap();
+        switch.tick().unwrap();
 
         // Switch should have learned that node 5 is on port 0
         assert_eq!(switch.ident_map.get(&5), Some(&PortId(0)));
 
         // Send from port 2 (source = node 7)
-        tx2.send(make_frame(7, 5)).await.unwrap();
-        switch.tick().await.unwrap();
+        tx2.try_send(make_frame(7, 5)).unwrap();
+        switch.tick().unwrap();
 
         // Switch should have learned that node 7 is on port 1
         assert_eq!(switch.ident_map.get(&7), Some(&PortId(1)));
     }
 
-    #[tokio::test]
-    async fn test_incoming_packet_loss() {
+    #[test]
+    fn test_incoming_packet_loss() {
         let mut switch: Switch<u8> = Switch::new();
 
         // Create port with 100% incoming loss
@@ -555,16 +554,16 @@ mod tests {
 
         // Send multiple frames from port 1
         for i in 0..10 {
-            tx1.send(make_frame(1, i)).await.unwrap();
+            tx1.try_send(make_frame(1, i)).unwrap();
         }
-        switch.tick().await.unwrap();
+        switch.tick().unwrap();
 
         // Port 2 should receive nothing (100% loss on port 1 incoming)
         assert!(rx2.try_recv().is_err());
     }
 
-    #[tokio::test]
-    async fn test_outgoing_packet_loss() {
+    #[test]
+    fn test_outgoing_packet_loss() {
         let mut switch: Switch<u8> = Switch::new();
 
         // Create port with 100% outgoing loss
@@ -575,8 +574,8 @@ mod tests {
         switch.add_port(port2, PortConfig::new(1.0, 0.0)).unwrap(); // 100% outgoing loss
 
         // Send frame from port 1 (source learns); dst is unknown so it floods.
-        tx1.send(make_frame(1, 99)).await.unwrap();
-        switch.tick().await.unwrap();
+        tx1.try_send(make_frame(1, 99)).unwrap();
+        switch.tick().unwrap();
 
         // Port 2 must receive nothing: its egress (switch→node) is 100% lossy.
         assert!(rx2.try_recv().is_err());
@@ -586,15 +585,15 @@ mod tests {
         let (tx3, _, port3) = create_port_pair(10);
         switch.add_port(port3, PortConfig::no_loss()).unwrap();
 
-        tx3.send(make_frame(3, 1)).await.unwrap();
-        switch.tick().await.unwrap();
+        tx3.try_send(make_frame(3, 1)).unwrap();
+        switch.tick().unwrap();
 
         // Port 1 should receive it (no outgoing loss on port 1)
         assert_eq!(rx1.try_recv().unwrap(), make_frame(3, 1));
     }
 
-    #[tokio::test]
-    async fn test_tap_to_switch() {
+    #[test]
+    fn test_tap_to_switch() {
         let mut switch: Switch<u8> = Switch::new();
 
         let (tx1, _, port1) = create_port_pair(10);
@@ -615,8 +614,8 @@ mod tests {
         switch.add_tap(port1_id, tap).unwrap();
 
         // Send frame
-        tx1.send(make_frame(1, 2)).await.unwrap();
-        switch.tick().await.unwrap();
+        tx1.try_send(make_frame(1, 2)).unwrap();
+        switch.tick().unwrap();
 
         // Check tap captured the message with correct direction
         let tapped_msgs = tapped.lock().unwrap();
@@ -625,8 +624,8 @@ mod tests {
         assert_eq!(tapped_msgs[0].1, make_frame(1, 2));
     }
 
-    #[tokio::test]
-    async fn test_tap_from_switch() {
+    #[test]
+    fn test_tap_from_switch() {
         let mut switch: Switch<u8> = Switch::new();
 
         let (tx1, _, port1) = create_port_pair(10);
@@ -636,8 +635,8 @@ mod tests {
         let port2_id = switch.add_port(port2, PortConfig::no_loss()).unwrap();
 
         // Learn port 1 = node 1
-        tx1.send(make_frame(1, 99)).await.unwrap();
-        switch.tick().await.unwrap();
+        tx1.try_send(make_frame(1, 99)).unwrap();
+        switch.tick().unwrap();
         rx2.try_recv().ok(); // Clear broadcast
 
         // Tap port 2 for outgoing traffic
@@ -658,16 +657,16 @@ mod tests {
         let (tx3, _, port3) = create_port_pair(10);
         switch.add_port(port3, PortConfig::no_loss()).unwrap();
 
-        tx3.send(make_frame(3, 1)).await.unwrap();
-        switch.tick().await.unwrap();
+        tx3.try_send(make_frame(3, 1)).unwrap();
+        switch.tick().unwrap();
 
         // Port 2 should not have been tapped (message went to port 1)
         let tapped_msgs = tapped.lock().unwrap();
         assert_eq!(tapped_msgs.len(), 0);
     }
 
-    #[tokio::test]
-    async fn test_tap_stops_on_false_return() {
+    #[test]
+    fn test_tap_stops_on_false_return() {
         let mut switch: Switch<u8> = Switch::new();
 
         let (tx1, _, port1) = create_port_pair(10);
@@ -685,18 +684,18 @@ mod tests {
         switch.add_tap(port1_id, tap).unwrap();
 
         // Send two frames
-        tx1.send(make_frame(1, 2)).await.unwrap();
-        switch.tick().await.unwrap();
+        tx1.try_send(make_frame(1, 2)).unwrap();
+        switch.tick().unwrap();
 
-        tx1.send(make_frame(1, 3)).await.unwrap();
-        switch.tick().await.unwrap();
+        tx1.try_send(make_frame(1, 3)).unwrap();
+        switch.tick().unwrap();
 
         // Should only have been called once
         assert_eq!(*counter.lock().unwrap(), 1);
     }
 
-    #[tokio::test]
-    async fn test_multiple_ports_full_mesh() {
+    #[test]
+    fn test_multiple_ports_full_mesh() {
         let mut switch: Switch<u8> = Switch::new();
 
         // Create 4 ports
@@ -711,12 +710,12 @@ mod tests {
         switch.add_port(port4, PortConfig::no_loss()).unwrap();
 
         // Each port sends a message
-        tx1.send(make_frame(1, 99)).await.unwrap();
-        tx2.send(make_frame(2, 99)).await.unwrap();
-        tx3.send(make_frame(3, 99)).await.unwrap();
-        tx4.send(make_frame(4, 99)).await.unwrap();
+        tx1.try_send(make_frame(1, 99)).unwrap();
+        tx2.try_send(make_frame(2, 99)).unwrap();
+        tx3.try_send(make_frame(3, 99)).unwrap();
+        tx4.try_send(make_frame(4, 99)).unwrap();
 
-        switch.tick().await.unwrap();
+        switch.tick().unwrap();
 
         // Each port should receive 3 messages (from the other 3 ports)
         for _ in 0..3 {
@@ -733,8 +732,8 @@ mod tests {
         assert!(rx4.try_recv().is_err());
     }
 
-    #[tokio::test]
-    async fn test_reseed_affects_randomness() {
+    #[test]
+    fn test_reseed_affects_randomness() {
         // Test that reseeding changes RNG behavior
         let mut switch1: Switch<u8> = Switch::new().reseed([1; 32]);
         let mut switch2: Switch<u8> = Switch::new().reseed([2; 32]);
@@ -754,12 +753,12 @@ mod tests {
 
         // Send many packets
         for i in 0..50 {
-            tx1.send(make_frame(1, i)).await.unwrap();
-            tx3.send(make_frame(1, i)).await.unwrap();
+            tx1.try_send(make_frame(1, i)).unwrap();
+            tx3.try_send(make_frame(1, i)).unwrap();
         }
 
-        switch1.tick().await.unwrap();
-        switch2.tick().await.unwrap();
+        switch1.tick().unwrap();
+        switch2.tick().unwrap();
 
         // Count received (different seeds should give different results)
         let mut count1 = 0;
@@ -787,8 +786,8 @@ mod tests {
     // so they only fail on a real regression, not RNG noise, while `assert_ne`
     // guards against a config that silently behaves like 0.0 or 1.0.
 
-    #[tokio::test]
-    async fn test_partial_outgoing_loss_statistical() {
+    #[test]
+    fn test_partial_outgoing_loss_statistical() {
         const N: usize = 2000;
         let mut switch: Switch<u8> = Switch::new();
 
@@ -801,13 +800,13 @@ mod tests {
         // Teach the switch node 2 lives on port2, so the frames below resolve
         // to a direct unicast (the per-destination outgoing_loss branch)
         // rather than the broadcast fan-out branch.
-        tx2.send(make_frame(2, 1)).await.unwrap();
-        switch.tick().await.unwrap();
+        tx2.try_send(make_frame(2, 1)).unwrap();
+        switch.tick().unwrap();
 
         for _ in 0..N {
-            tx1.send(make_frame(1, 2)).await.unwrap();
+            tx1.try_send(make_frame(1, 2)).unwrap();
         }
-        switch.tick().await.unwrap();
+        switch.tick().unwrap();
 
         let mut received = 0;
         while rx2.try_recv().is_ok() {
@@ -821,8 +820,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_partial_incoming_loss_statistical() {
+    #[test]
+    fn test_partial_incoming_loss_statistical() {
         const N: usize = 2000;
         let mut switch: Switch<u8> = Switch::new();
 
@@ -836,9 +835,9 @@ mod tests {
         // observable there; drops happen on ingress from port1, before
         // forwarding decisions are even made.
         for _ in 0..N {
-            tx1.send(make_frame(1, 99)).await.unwrap();
+            tx1.try_send(make_frame(1, 99)).unwrap();
         }
-        switch.tick().await.unwrap();
+        switch.tick().unwrap();
 
         let mut received = 0;
         while rx2.try_recv().is_ok() {
@@ -851,8 +850,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_asymmetric_direction_loss_independent() {
+    #[test]
+    fn test_asymmetric_direction_loss_independent() {
         // Node A is "deaf" (outgoing_loss = 1.0: it can't hear the fabric) but
         // not "mute" (incoming_loss = 0.0: its own transmissions still reach
         // the fabric).  The two knobs must act independently.
@@ -866,23 +865,23 @@ mod tests {
 
         // A's first frame teaches the switch A's port and reaches B fine — A
         // isn't the destination here, so its outgoing_loss doesn't apply.
-        tx_a.send(make_frame(10, 20)).await.unwrap();
-        switch.tick().await.unwrap();
+        tx_a.try_send(make_frame(10, 20)).unwrap();
+        switch.tick().unwrap();
         assert_eq!(rx_b.try_recv().unwrap(), make_frame(10, 20));
 
         // B's reply teaches the switch B's port too — learning happens on
         // ingress, independent of whether delivery to the destination
         // succeeds — but delivery to A is dropped by A's outgoing_loss.
-        tx_b.send(make_frame(20, 10)).await.unwrap();
-        switch.tick().await.unwrap();
+        tx_b.try_send(make_frame(20, 10)).unwrap();
+        switch.tick().unwrap();
         assert!(rx_a.try_recv().is_err());
 
         // With both ports learned: B -> A must be fully blocked...
         const N: usize = 1000;
         for _ in 0..N {
-            tx_b.send(make_frame(20, 10)).await.unwrap();
+            tx_b.try_send(make_frame(20, 10)).unwrap();
         }
-        switch.tick().await.unwrap();
+        switch.tick().unwrap();
         assert!(
             rx_a.try_recv().is_err(),
             "A's outgoing_loss = 1.0 must block every frame addressed to it"
@@ -892,9 +891,9 @@ mod tests {
         // means its own transmissions are never dropped, regardless of its
         // (unrelated) outgoing_loss.
         for _ in 0..N {
-            tx_a.send(make_frame(10, 20)).await.unwrap();
+            tx_a.try_send(make_frame(10, 20)).unwrap();
         }
-        switch.tick().await.unwrap();
+        switch.tick().unwrap();
         let mut received = 0;
         while rx_b.try_recv().is_ok() {
             received += 1;
@@ -905,8 +904,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_broadcast_fanout_independent_per_port_loss() {
+    #[test]
+    fn test_broadcast_fanout_independent_per_port_loss() {
         // Three ports observe the same broadcast frame under three different
         // outgoing_loss settings: each port's fan-out copy must be governed
         // only by its own loss, not by the others'.
@@ -924,9 +923,9 @@ mod tests {
         switch.add_port(port4, PortConfig::new(1.0, 0.0)).unwrap();
 
         for _ in 0..N {
-            tx1.send(make_frame(1, 99)).await.unwrap(); // unknown dest -> flood
+            tx1.try_send(make_frame(1, 99)).unwrap(); // unknown dest -> flood
         }
-        switch.tick().await.unwrap();
+        switch.tick().unwrap();
 
         fn drain(rx: &mut mpsc::Receiver<Vec<u8>>) -> usize {
             let mut count = 0;
