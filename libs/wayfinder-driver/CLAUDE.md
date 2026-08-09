@@ -22,10 +22,15 @@ outgoing frames, due OGMs, due keepalives) is **not** in this crate; it is
 "One behavior, N loops." A behavior change almost always belongs in
 `driver-core`, not here.
 
-**Known duplication:** egress resolution + split-horizon + `link_may_tx` +
-auth-tagging (`dispatch`, `driver.rs`) is currently written out in all three
-shells rather than shared. Split-horizon is a correctness invariant, so a fix
-here needs the matching fix in the other two until that is unified.
+The whole transmit-side *decision* — auth-tagging, egress resolution,
+split-horizon, the per-link transmit gate — is `driver_core::plan_dispatch`.
+`dispatch` in `driver.rs` only does the I/O: reserve the auth trailer, call the
+planner, then transmit `buf[..send_len]` on each interface in `plan.targets`.
+
+**So a change to *what* goes out belongs in `plan_dispatch`, not here.** This
+logic used to be written out in all three shells, which made split-horizon — a
+correctness invariant — something you could fix in one and silently leave broken
+in two.
 
 ## Two ways to drive it
 

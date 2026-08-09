@@ -30,8 +30,6 @@ use core::time::Duration;
 
 use interfaces::link::LinkMetrics;
 use wayfinder::CentralRouter;
-use wayfinder::DEFAULT_BATMAN_ETHER_TYPE;
-use wayfinder::EgressInterface;
 use wayfinder::MAX_INTERFACES;
 use wayfinder::auth::DIRECTED_TRAILER_LEN;
 use wayfinder::config::TrickleConfig;
@@ -43,9 +41,9 @@ use wayfinder_driver_core::Egress;
 use wayfinder_driver_core::MeshSink;
 use wayfinder_driver_core::OutgoingFrame;
 use wayfinder_driver_core::handle_mesh_frame;
+use wayfinder_driver_core::plan_dispatch;
 use wayfinder_driver_core::poll_due_keepalives;
 use wayfinder_driver_core::poll_due_ogms;
-use wayfinder_driver_core::tag_directed_into;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
@@ -257,47 +255,27 @@ impl Driver {
     fn dispatch_one(&mut self, now: Duration, mut staged: StagedFrame) {
         let body_len = staged.payload.len();
         staged.payload.resize(body_len + DIRECTED_TRAILER_LEN, 0);
-        let Some(send_len) = tag_directed_into(
+        let num_interfaces = self.egress.len();
+        let Some(plan) = plan_dispatch(
             &mut self.router,
+            now,
             staged.dst,
             staged.protocol,
+            staged.egress,
             body_len,
             &mut staged.payload,
+            num_interfaces,
         ) else {
             return; // auth on but untaggable — drop rather than emit in the clear
         };
+        // Collect before sending: the plan borrows `staged.payload`, and
+        // `send_on` needs `&mut self`.
+        let targets = plan.targets();
+        let send_len = plan.payload().len();
         staged.payload.truncate(send_len);
 
-        // The BATMAN sub-type of this frame (its leading payload byte), used
-        // to consult each candidate interface's transmit gate; meaningful only
-        // for BATMAN frames (other protocols are never gated).
-        let pkt_type = (staged.protocol == DEFAULT_BATMAN_ETHER_TYPE)
-            .then(|| staged.payload.first().copied())
-            .flatten();
-
-        match staged.egress {
-            Egress::Iface(idx) => {
-                self.send_on(idx, staged.dst, staged.protocol, &staged.payload, now);
-            }
-            Egress::Auto { exclude } => match self.router.get_egress_interface(now, staged.dst) {
-                Some(EgressInterface::All) => {
-                    for idx in 0..self.egress.len() {
-                        // Split-horizon: never re-flood back out the interface
-                        // a re-flood arrived on.
-                        if Some(idx) == exclude {
-                            continue;
-                        }
-                        if !self.router.link_may_tx(idx, pkt_type) {
-                            continue;
-                        }
-                        self.send_on(idx, staged.dst, staged.protocol, &staged.payload, now);
-                    }
-                }
-                Some(EgressInterface::Interface(idx)) if self.router.link_may_tx(idx, pkt_type) => {
-                    self.send_on(idx, staged.dst, staged.protocol, &staged.payload, now);
-                }
-                Some(EgressInterface::Interface(_)) | None => {}
-            },
+        for idx in targets.iter() {
+            self.send_on(idx, staged.dst, staged.protocol, &staged.payload, now);
         }
     }
 
@@ -333,6 +311,7 @@ impl Driver {
 
 #[cfg(test)]
 mod tests {
+    use wayfinder::DEFAULT_BATMAN_ETHER_TYPE;
     use wayfinder::batman::wire::BATADV_IV_OGM;
     use wayfinder::batman::wire::BatmanOgmPacket;
 

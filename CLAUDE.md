@@ -268,10 +268,12 @@ lives once in `wayfinder-driver-core`; each shell wraps it in a different event
 loop. **A behavior change almost always belongs in the core, not a shell.**
 
 - **libs/wayfinder-driver-core** — the shared, synchronous, allocation-free
-  planning logic: `handle_mesh_frame`, `poll_due_ogms`, `poll_due_keepalives`,
-  planning each frame into an `OutgoingFrame` borrowing the caller's scratchpad
-  and handing it to a `MeshSink` the shell implements (`Vec` on host,
-  `heapless::Vec` on embedded). No async, no interfaces, no I/O.
+  planning logic, in exactly four entry points: `handle_mesh_frame`,
+  `poll_due_ogms`, `poll_due_keepalives` (each planning frames into an
+  `OutgoingFrame` borrowing the caller's scratchpad and handing it to a
+  `MeshSink` the shell implements — `Vec` on host, `heapless::Vec` on embedded)
+  and `plan_dispatch` (the transmit decision, below). No async, no interfaces,
+  no I/O.
 - **libs/wayfinder-driver** → the `std`/tokio shell: a `select!` loop, plus the
   concrete socket carriers a Linux node runs on. Transport-agnostic — host
   device and mesh interfaces are `FrameIo` carriers, so the same loop runs
@@ -290,10 +292,11 @@ loop. **A behavior change almost always belongs in the core, not a shell.**
   queues (`push_rx` → `tick` → `poll_egress`/`poll_local`). For tick-based
   simulation (a Python-driven physics sim) rather than a live node.
 
-**Caveat:** egress resolution + split-horizon + `link_may_tx` + auth-tagging
-(`dispatch`) is currently written out in *all three* shells rather than shared
-by the core. Split-horizon is a correctness invariant — a fix in one shell
-needs the matching fix in the other two.
+The transmit side is shared the same way: `plan_dispatch` makes the whole
+decision (auth-tagging, egress resolution, split-horizon, the per-link transmit
+gate) and returns *how much to send* plus *which interfaces*. Each shell only
+does the I/O for the interfaces in that plan — a `LinkT::send` on embedded, a
+`DynLinkT` send on the host, a queue push in the tick driver.
 
 **Host node & tooling**
 - **libs/wayfinder-test** → `Switch` simulator + `TestRouter` harness for
