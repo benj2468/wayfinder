@@ -134,13 +134,13 @@ impl Write for LogCapture {
     }
 }
 
-/// Install a scoped subscriber capturing WARN-and-up records for the duration
-/// of the returned guard.
-fn capture_warnings() -> (LogCapture, tracing::subscriber::DefaultGuard) {
+/// Install a scoped subscriber capturing records at `level`-and-up for the
+/// duration of the returned guard.
+fn capture_at(level: tracing::Level) -> (LogCapture, tracing::subscriber::DefaultGuard) {
     let capture = LogCapture::new();
     let writer = capture.clone();
     let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
+        .with_max_level(level)
         .with_writer(move || writer.clone())
         .with_ansi(false)
         .finish();
@@ -226,7 +226,8 @@ async fn send_error_on_one_link_does_not_block_others() {
 /// it must leave a WARN record rather than vanishing silently.
 #[tokio::test]
 async fn recv_error_is_logged_and_survived() {
-    let (capture, _guard) = capture_warnings();
+    // TRACE rather than WARN — see `process_pending_survives_recv_error`.
+    let (capture, _guard) = capture_at(tracing::Level::TRACE);
 
     let link = RecvFailOnceLink { failed: false };
     let mut tr = TestRouter::from_links(mac(1), vec![DynLinkT::new_box(link)], Vec::new());
@@ -246,8 +247,8 @@ async fn recv_error_is_logged_and_survived() {
 
     let logs = capture.contents();
     assert!(
-        logs.contains("WARN") && logs.contains("recv"),
-        "a link recv error must be logged at WARN, not swallowed; captured logs: {logs:?}"
+        logs.contains("TRACE") && logs.contains("drop: link recv error"),
+        "a link recv error must be traced, not swallowed; captured logs: {logs:?}"
     );
 }
 
@@ -256,7 +257,11 @@ async fn recv_error_is_logged_and_survived() {
 /// bailing out.
 #[tokio::test]
 async fn process_pending_survives_recv_error() {
-    let (capture, _guard) = capture_warnings();
+    // TRACE, not WARN: a link recv error is per-frame and reachable by ambient
+    // conditions (a noisy or jammed radio can fail every `recv`), so logging it
+    // at WARN would flood the bounded `GetLogs` ring that is the only
+    // observability a board without a debug probe has.
+    let (capture, _guard) = capture_at(tracing::Level::TRACE);
 
     let link = RecvFailOnceLink { failed: false };
     let mut tr = TestRouter::from_links(mac(1), vec![DynLinkT::new_box(link)], Vec::new());
@@ -269,7 +274,7 @@ async fn process_pending_survives_recv_error() {
     );
     let logs = capture.contents();
     assert!(
-        logs.contains("WARN") && logs.contains("recv"),
-        "a link recv error must be logged at WARN, not swallowed; captured logs: {logs:?}"
+        logs.contains("TRACE") && logs.contains("drop: link recv error"),
+        "a link recv error must be traced, not swallowed; captured logs: {logs:?}"
     );
 }

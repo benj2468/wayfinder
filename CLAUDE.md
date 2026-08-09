@@ -268,12 +268,14 @@ lives once in `wayfinder-driver-core`; each shell wraps it in a different event
 loop. **A behavior change almost always belongs in the core, not a shell.**
 
 - **libs/wayfinder-driver-core** — the shared, synchronous, allocation-free
-  planning logic, in exactly four entry points: `handle_mesh_frame`,
-  `poll_due_ogms`, `poll_due_keepalives` (each planning frames into an
-  `OutgoingFrame` borrowing the caller's scratchpad and handing it to a
-  `MeshSink` the shell implements — `Vec` on host, `heapless::Vec` on embedded)
-  and `plan_dispatch` (the transmit decision, below). No async, no interfaces,
-  no I/O.
+  planning logic. A shell's event loop has three arms and each maps to one
+  call: `handle_link_result` (a link produced a `recv` result),
+  `poll_due_all` (the periodic timer fired) and `plan_dispatch` (a staged
+  frame is ready to go out). The first two plan frames into an
+  `OutgoingFrame` borrowing the caller's scratchpad and hand it to a
+  `MeshSink` the shell implements (`Vec` on host, `heapless::Vec` on
+  embedded); the third returns a `DispatchPlan`. No async, no interfaces, no
+  I/O.
 - **libs/wayfinder-driver** → the `std`/tokio shell: a `select!` loop, plus the
   concrete socket carriers a Linux node runs on. Transport-agnostic — host
   device and mesh interfaces are `FrameIo` carriers, so the same loop runs
