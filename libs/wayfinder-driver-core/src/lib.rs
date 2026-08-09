@@ -20,19 +20,22 @@
 //!
 //! # The whole surface
 //!
-//! Four entry points, and a shell calls all four:
+//! A shell's event loop has three arms, and each maps to one call here:
 //!
-//! | | |
+//! | event-loop arm | call |
 //! |---|---|
-//! | [`handle_mesh_frame`] | a frame arrived on interface `idx` |
-//! | [`poll_due_ogms`] | the periodic timer fired |
-//! | [`poll_due_keepalives`] | likewise, for keep-alives |
-//! | [`plan_dispatch`] | a staged frame is ready to go out |
+//! | a link produced a `recv` result | [`handle_link_result`] |
+//! | the periodic timer fired | [`poll_due_all`] |
+//! | a staged frame is ready to go out | [`plan_dispatch`] |
 //!
-//! The first three hand their results to a [`MeshSink`]; the fourth returns a
-//! [`DispatchPlan`]. Everything else — authenticating a directed frame on the
-//! way in or out, resolving egress, split-horizon — is internal to those four,
-//! deliberately: a shell that reached past them could apply half the policy.
+//! The first two hand their results to a [`MeshSink`]; the third returns a
+//! [`DispatchPlan`]. [`handle_mesh_frame`], [`poll_due_ogms`] and
+//! [`poll_due_keepalives`] sit underneath and are exposed for callers that need
+//! one step in isolation — deterministic stepping in tests, mostly.
+//!
+//! Everything else — authenticating a directed frame on the way in or out,
+//! resolving egress, split-horizon — is internal, deliberately: a shell that
+//! reached past these could apply half the policy.
 //!
 //! [`wayfinder-tick-driver`]: https://docs.rs/wayfinder-tick-driver
 //! [`wayfinder-driver`]: https://docs.rs/wayfinder-driver
@@ -42,6 +45,7 @@
 
 use core::time::Duration;
 
+use interfaces::link::LinkError;
 use interfaces::link::LinkMetrics;
 use tracing::trace;
 use tracing::warn;
@@ -52,6 +56,7 @@ use wayfinder::batman::wire::BATADV_CERT_REPLY;
 use wayfinder::batman::wire::BATADV_CERT_REQ;
 use wayfinder::interfaces::frame::LinkFrame;
 use wayfinder::interfaces::frame::Mac;
+use wayfinder::link::Received;
 use wayfinder::router_ops::OgmAuthOps;
 use wayfinder::router_ops::RouterOps;
 use zerocopy::FromBytes;
@@ -230,6 +235,11 @@ pub fn handle_mesh_frame<R: RouterOps>(
         return; // directed frame failed authentication
     };
     let rx = router.handle_frame_with_metrics(now, idx, frame, metrics, tx_buffer);
+    trace!(
+        forward = rx.forward.is_some(),
+        deliver_local = rx.deliver_local.is_some(),
+        "frame decoded"
+    );
     if let Some(f) = rx.forward {
         sink.emit(OutgoingFrame {
             dst: f.dst,
@@ -302,6 +312,61 @@ pub fn poll_due_keepalives<R: RouterOps>(
         }
         router.on_keepalive_emitted(idx, now);
     }
+}
+
+/// Plan one mesh link's `recv` outcome into `sink`: a received frame, or a drop
+/// on error.
+///
+/// The receive arm of every shell's event loop. A link error is **transient by
+/// contract** — a reconnecting transport surfaces `Io` until a later call
+/// succeeds — so it costs this iteration nothing but a log line, never the
+/// loop.
+///
+/// That log is `trace!`, not `warn!`: a noisy or jammed radio can fail every
+/// `recv`, and this is a per-frame path reachable by ambient conditions. On a
+/// board with no debug probe the bounded `GetLogs` ring is the only way to see
+/// anything at all, and a `warn!` here would evict everything else in it.
+pub fn handle_link_result<R: RouterOps>(
+    now: Duration,
+    router: &mut R,
+    idx: usize,
+    result: Result<Received<'_>, LinkError>,
+    tx_buffer: &mut [u8],
+    sink: &mut impl MeshSink,
+) {
+    match result {
+        Ok(received) => {
+            trace!(iface = idx, "rx frame from interface");
+            handle_mesh_frame(
+                now,
+                router,
+                idx,
+                received.frame,
+                received.metrics,
+                tx_buffer,
+                sink,
+            );
+        }
+        Err(e) => trace!(iface = idx, error = ?e, "drop: link recv error"),
+    }
+}
+
+/// Plan everything the periodic timer made due into `sink` — OGMs and
+/// keep-alives, on their independent schedules.
+///
+/// The timer arm of every shell's event loop, which sleeps until whichever
+/// schedule fires first and so must service both on waking. Callers that need
+/// to drive one schedule in isolation (deterministic stepping in tests) call
+/// [`poll_due_ogms`] and [`poll_due_keepalives`] directly.
+pub fn poll_due_all<R: RouterOps>(
+    router: &mut R,
+    now: Duration,
+    tx_buffer: &mut [u8],
+    sink: &mut impl MeshSink,
+) {
+    trace!("polling OGMs and keep-alives");
+    poll_due_ogms(router, now, tx_buffer, sink);
+    poll_due_keepalives(router, now, tx_buffer, sink);
 }
 
 /// A set of mesh-interface indices, as a bitmask.
@@ -517,6 +582,7 @@ mod tests {
     use wayfinder::batman::wire::BATADV_CERT_REPLY;
     use wayfinder::batman::wire::BATADV_CERT_REQ;
     use wayfinder::batman::wire::BATADV_IV_OGM;
+    use wayfinder::batman::wire::BATADV_KEEPALIVE;
     use wayfinder::batman::wire::BATADV_UNICAST;
     use wayfinder::batman::wire::BatmanOgmPacket;
     use wayfinder::features::LinkFeatures;
@@ -925,6 +991,97 @@ mod tests {
     // a correctness invariant — a thing you can fix in one shell and silently
     // leave broken in two. These pin the shared decision so the shells can be
     // reduced to "do the I/O for each interface in the plan".
+
+    // ---- event-loop handlers ----------------------------------------------
+    //
+    // The two arms every shell's event loop drives — "a link produced a recv
+    // result" and "the periodic timer fired" — are the same logic in each, so
+    // they belong beside the rest of the planning core rather than in one
+    // shell. The `Err` arm in particular disagreed between shells (`warn!` on
+    // the host, `trace!` on embedded); these pin the settled behaviour.
+
+    /// A received OGM planned through `handle_link_result` reaches the engine
+    /// and produces the same re-flood `handle_mesh_frame` would.
+    #[test]
+    fn handle_link_result_plans_a_received_frame() {
+        let mut router = router_with_interfaces(2);
+        let ogm = bare_ogm_bytes(mac(2), 7, 50);
+        let bytes = frame_bytes(Mac::BROADCAST, mac(2), DEFAULT_BATMAN_ETHER_TYPE, &ogm);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+
+        let mut tx = [0u8; 256];
+        let mut sink = CaptureSink::default();
+        handle_link_result(
+            Duration::from_secs(1),
+            &mut router,
+            0,
+            Ok(wayfinder::link::Received {
+                frame,
+                metrics: LinkMetrics::default(),
+            }),
+            &mut tx,
+            &mut sink,
+        );
+
+        assert_eq!(router.originator_count(), 1, "the OGM reached the engine");
+        assert_eq!(sink.mesh.len(), 1, "and was planned for re-flood");
+    }
+
+    /// A link `recv` error costs the iteration nothing but a log line: no
+    /// frames planned, no panic. Transient by contract — a reconnecting
+    /// transport returns `Io` until a later call succeeds — so it must never
+    /// take down the loop.
+    #[test]
+    fn handle_link_result_drops_a_recv_error() {
+        let mut router = router_with_interfaces(2);
+        let mut tx = [0u8; 256];
+        let mut sink = CaptureSink::default();
+
+        handle_link_result(
+            Duration::from_secs(1),
+            &mut router,
+            0,
+            Err(interfaces::link::LinkError::Io),
+            &mut tx,
+            &mut sink,
+        );
+
+        assert!(sink.mesh.is_empty(), "a recv error plans nothing");
+        assert!(sink.local.is_empty());
+    }
+
+    /// The periodic arm drives both schedules in one call: an interface due an
+    /// OGM and an interface due a keep-alive both emit.
+    #[test]
+    fn poll_due_all_drives_ogms_and_keepalives_together() {
+        let mut router = router_with_interfaces(1);
+        router.configure_interface_keepalive(0, Some(Duration::from_secs(1)), Duration::ZERO);
+
+        // Advance to where both schedules have fired.
+        let mut now = Duration::ZERO;
+        while router.due_interface(now).is_none() && now < Duration::from_secs(60) {
+            now += Duration::from_millis(100);
+        }
+        now += Duration::from_secs(2);
+
+        let mut tx = [0u8; 256];
+        let mut sink = CaptureSink::default();
+        poll_due_all(&mut router, now, &mut tx, &mut sink);
+
+        let types: Vec<u8> = sink
+            .mesh
+            .iter()
+            .filter_map(|f| f.payload.first().copied())
+            .collect();
+        assert!(
+            types.contains(&BATADV_IV_OGM),
+            "the OGM schedule fired: {types:?}"
+        );
+        assert!(
+            types.contains(&BATADV_KEEPALIVE),
+            "the keep-alive schedule fired in the same call: {types:?}"
+        );
+    }
 
     /// An empty set yields nothing and claims nothing.
     #[test]

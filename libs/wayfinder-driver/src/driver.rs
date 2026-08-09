@@ -17,7 +17,6 @@ use std::time::Instant;
 
 use futures::FutureExt;
 use futures::future::select_all;
-use interfaces::link::LinkMetrics;
 use tokio::time::sleep;
 use tracing::trace;
 use tracing::warn;
@@ -331,20 +330,11 @@ impl<Local: FrameIo> Driver<Local> {
                         Box::pin(async move { (i, iface.recv().await) })
                     })
                 ), if check_mesh && !interfaces.is_empty() => {
-                    match result {
-                        Ok(received) => {
-                            trace!(iface = idx, "rx frame from interface");
-                            handle_mesh_frame(now, router, idx, received.frame, received.metrics, tx_buffer)
-                        }
-                        // A link recv error is transient by contract (a
-                        // reconnecting transport surfaces `Io` until a later
-                        // call succeeds), so it costs this iteration nothing
-                        // but the log line — never the process.
-                        Err(e) => {
-                            warn!(iface = idx, error = ?e, "link recv failed");
-                            LoopOutput::none()
-                        }
-                    }
+                    let mut out = LoopOutput::none();
+                    wayfinder_driver_core::handle_link_result(
+                        now, router, idx, result, tx_buffer, &mut out,
+                    );
+                    out
                 },
                 Ok(len) = local.recv(rx_buffer), if check_local => {
                     trace!(len, "host device rx frame");
@@ -475,26 +465,24 @@ impl<Local: FrameIo> Driver<Local> {
 
             // Mesh interfaces: forwarded/delivered frames.
             for idx in 0..self.interfaces.len() {
-                let output = match self.interfaces[idx].recv().now_or_never() {
-                    None => continue,
-                    // Same posture as `run_once`: a link recv error is
-                    // logged and skipped, not propagated.
-                    Some(Err(e)) => {
-                        warn!(iface = idx, error = ?e, "link recv failed");
-                        continue;
-                    }
-                    Some(Ok(received)) => {
-                        progressed = true;
-                        handle_mesh_frame(
-                            self.start.elapsed(),
-                            &mut self.router,
-                            idx,
-                            received.frame,
-                            received.metrics,
-                            &mut self.tx_buffer,
-                        )
-                    }
+                let Some(result) = self.interfaces[idx].recv().now_or_never() else {
+                    continue;
                 };
+                // Only a *successful* receive counts as progress. An erroring
+                // link yields immediately and forever, so counting it would spin
+                // this drain loop rather than terminate it.
+                progressed |= result.is_ok();
+                // Same posture as `run_once`, and the same shared handler: a
+                // link recv error is traced and skipped, never propagated.
+                let mut output = LoopOutput::none();
+                wayfinder_driver_core::handle_link_result(
+                    self.start.elapsed(),
+                    &mut self.router,
+                    idx,
+                    result,
+                    &mut self.tx_buffer,
+                    &mut output,
+                );
                 self.dispatch_output(self.start.elapsed(), output).await?;
             }
 
@@ -594,29 +582,6 @@ fn build_auth_snapshot(router: &CentralRouter) -> AuthSnapshot {
             revoked: Vec::new(),
         },
     }
-}
-
-/// Process one received link-layer frame into a unit of work, folding the
-/// carrier's physical-layer `metrics` into the engine's link-quality table.
-/// Thin `std`-side wrapper that stages the shared core's
-/// [`handle_mesh_frame`](wayfinder_driver_core::handle_mesh_frame) output into
-/// an owned [`LoopOutput`].
-fn handle_mesh_frame(
-    now: Duration,
-    router: &mut CentralRouter,
-    idx: usize,
-    frame: &wayfinder::interfaces::frame::LinkFrame,
-    metrics: LinkMetrics,
-    tx_buffer: &mut [u8],
-) -> LoopOutput {
-    let mut out = LoopOutput::none();
-    wayfinder_driver_core::handle_mesh_frame(now, router, idx, frame, metrics, tx_buffer, &mut out);
-    trace!(
-        forward = !out.mesh.is_empty(),
-        deliver_local = out.local.is_some(),
-        "frame decoded"
-    );
-    out
 }
 
 /// Turn one host Ethernet frame into the mesh frames that carry it.

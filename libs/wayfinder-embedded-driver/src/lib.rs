@@ -47,10 +47,9 @@ use wayfinder::router_ops::RouterOps;
 use wayfinder_driver_core::Egress;
 use wayfinder_driver_core::MeshSink;
 use wayfinder_driver_core::OutgoingFrame;
-use wayfinder_driver_core::handle_mesh_frame;
+use wayfinder_driver_core::handle_link_result;
 use wayfinder_driver_core::plan_dispatch;
-use wayfinder_driver_core::poll_due_keepalives;
-use wayfinder_driver_core::poll_due_ogms;
+use wayfinder_driver_core::poll_due_all;
 
 pub mod identity;
 
@@ -354,57 +353,13 @@ impl<L: LinkT, C: Clock, const N: usize, const FRAME_LEN: usize, R: RouterOps>
             Either::First((result, idx)) => {
                 handle_link_result(now, router, idx, result, tx_buffer, stage)
             }
-            Either::Second(()) => handle_timer_due(router, now, tx_buffer, stage),
+            Either::Second(()) => poll_due_all(router, now, tx_buffer, stage),
         }
 
         // The select's futures are dropped here, freeing `links` to be borrowed
         // mutably again for dispatch.
         dispatch(links, router, *mac, now, stage).await;
     }
-}
-
-/// The [`Either::First`]/[`Either3::First`] arm shared by [`Driver::run_once`]
-/// and [`Driver::run_once_with_mgmt`]: plan a link's `recv` outcome (a received
-/// frame, or a drop on error) into `stage`.
-fn handle_link_result<const STAGE: usize, const FRAME_LEN: usize, R: RouterOps>(
-    now: Duration,
-    router: &mut R,
-    idx: usize,
-    result: Result<wayfinder::link::Received<'_>, interfaces::link::LinkError>,
-    tx_buffer: &mut [u8; FRAME_LEN],
-    stage: &mut StageSink<STAGE, FRAME_LEN>,
-) {
-    match result {
-        Ok(received) => {
-            trace!(iface = idx, "rx frame from interface");
-            handle_mesh_frame(
-                now,
-                router,
-                idx,
-                received.frame,
-                received.metrics,
-                tx_buffer,
-                stage,
-            );
-        }
-        Err(e) => {
-            trace!(iface = idx, error = ?e, "drop: link recv error");
-        }
-    }
-}
-
-/// The [`Either::Second`]/[`Either3::Second`] arm shared by [`Driver::run_once`]
-/// and [`Driver::run_once_with_mgmt`]: the periodic OGM/keep-alive timer fired,
-/// so plan whatever is due into `stage`.
-fn handle_timer_due<const STAGE: usize, const FRAME_LEN: usize, R: RouterOps>(
-    router: &mut R,
-    now: Duration,
-    tx_buffer: &mut [u8; FRAME_LEN],
-    stage: &mut StageSink<STAGE, FRAME_LEN>,
-) {
-    trace!("polling OGMs and keep-alives");
-    poll_due_ogms(router, now, tx_buffer, stage);
-    poll_due_keepalives(router, now, tx_buffer, stage);
 }
 
 /// The management arm is the one place still spelling the capacities out.
@@ -497,7 +452,7 @@ impl<
             Either3::First((result, idx)) => {
                 handle_link_result(now, router, idx, result, tx_buffer, stage)
             }
-            Either3::Second(()) => handle_timer_due(router, now, tx_buffer, stage),
+            Either3::Second(()) => poll_due_all(router, now, tx_buffer, stage),
             Either3::Third(request) => {
                 trace!("servicing forwarded management query");
                 // Build the response against a fresh adapter at `now`, then hand
