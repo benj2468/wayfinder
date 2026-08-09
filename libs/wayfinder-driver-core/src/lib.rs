@@ -21,13 +21,14 @@ use core::time::Duration;
 use interfaces::link::LinkMetrics;
 use tracing::trace;
 use tracing::warn;
-use wayfinder::CentralRouter;
 use wayfinder::DEFAULT_BATMAN_ETHER_TYPE;
 use wayfinder::auth::DIRECTED_TRAILER_LEN;
 use wayfinder::batman::wire::BATADV_CERT_REPLY;
 use wayfinder::batman::wire::BATADV_CERT_REQ;
 use wayfinder::interfaces::frame::LinkFrame;
 use wayfinder::interfaces::frame::Mac;
+use wayfinder::router_ops::OgmAuthOps;
+use wayfinder::router_ops::RouterOps;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
@@ -101,33 +102,8 @@ pub fn is_cert_control(payload: &[u8]) -> bool {
 /// (auth off, a broadcast/OGM, or a cert-control packet), a shorter *view* over
 /// the same bytes with the trailer dropped, or `None` if the frame must be
 /// dropped (bad/missing tag from an unverified or foreign neighbor).
-pub fn strip_directed<
-    'a,
-    const ORIGINATORS: usize,
-    const INTERFACES: usize,
-    const MCAST_MEMBERS: usize,
-    const LOCAL_MCAST: usize,
-    const IDENT_TABLE: usize,
-    const IDENT_LIVE: usize,
-    const LINK_QUALITY: usize,
-    const NEIGHBOR_KEYS: usize,
-    const REVOKED: usize,
-    const IN_FLIGHT_CERT_REQUESTS: usize,
-    const PENDING_REPLIES: usize,
->(
-    router: &mut CentralRouter<
-        ORIGINATORS,
-        INTERFACES,
-        MCAST_MEMBERS,
-        LOCAL_MCAST,
-        IDENT_TABLE,
-        IDENT_LIVE,
-        LINK_QUALITY,
-        NEIGHBOR_KEYS,
-        REVOKED,
-        IN_FLIGHT_CERT_REQUESTS,
-        PENDING_REPLIES,
-    >,
+pub fn strip_directed<'a, R: RouterOps>(
+    router: &mut R,
     frame: &'a LinkFrame,
 ) -> Option<&'a LinkFrame> {
     // Only directed (unicast/mcast) frames carry a tag; broadcasts/OGMs (a
@@ -180,32 +156,8 @@ pub fn strip_directed<
 ///   it rather than emit it in the clear.
 ///
 /// [`DIRECTED_TRAILER_LEN`]: wayfinder::auth::DIRECTED_TRAILER_LEN
-pub fn tag_directed_into<
-    const ORIGINATORS: usize,
-    const INTERFACES: usize,
-    const MCAST_MEMBERS: usize,
-    const LOCAL_MCAST: usize,
-    const IDENT_TABLE: usize,
-    const IDENT_LIVE: usize,
-    const LINK_QUALITY: usize,
-    const NEIGHBOR_KEYS: usize,
-    const REVOKED: usize,
-    const IN_FLIGHT_CERT_REQUESTS: usize,
-    const PENDING_REPLIES: usize,
->(
-    router: &mut CentralRouter<
-        ORIGINATORS,
-        INTERFACES,
-        MCAST_MEMBERS,
-        LOCAL_MCAST,
-        IDENT_TABLE,
-        IDENT_LIVE,
-        LINK_QUALITY,
-        NEIGHBOR_KEYS,
-        REVOKED,
-        IN_FLIGHT_CERT_REQUESTS,
-        PENDING_REPLIES,
-    >,
+pub fn tag_directed_into<R: RouterOps>(
+    router: &mut R,
     dst: Mac,
     protocol: u16,
     body_len: usize,
@@ -243,33 +195,9 @@ pub fn tag_directed_into<
 /// `metrics` into the engine's link-quality table and planning any resulting
 /// re-flood/forward (to `sink.emit`) and local delivery (to
 /// `sink.deliver_local`).
-pub fn handle_mesh_frame<
-    const ORIGINATORS: usize,
-    const INTERFACES: usize,
-    const MCAST_MEMBERS: usize,
-    const LOCAL_MCAST: usize,
-    const IDENT_TABLE: usize,
-    const IDENT_LIVE: usize,
-    const LINK_QUALITY: usize,
-    const NEIGHBOR_KEYS: usize,
-    const REVOKED: usize,
-    const IN_FLIGHT_CERT_REQUESTS: usize,
-    const PENDING_REPLIES: usize,
->(
+pub fn handle_mesh_frame<R: RouterOps>(
     now: Duration,
-    router: &mut CentralRouter<
-        ORIGINATORS,
-        INTERFACES,
-        MCAST_MEMBERS,
-        LOCAL_MCAST,
-        IDENT_TABLE,
-        IDENT_LIVE,
-        LINK_QUALITY,
-        NEIGHBOR_KEYS,
-        REVOKED,
-        IN_FLIGHT_CERT_REQUESTS,
-        PENDING_REPLIES,
-    >,
+    router: &mut R,
     idx: usize,
     frame: &LinkFrame,
     metrics: LinkMetrics,
@@ -297,32 +225,8 @@ pub fn handle_mesh_frame<
 /// Emit an OGM for each interface whose Trickle timer is due as of `now`
 /// (advancing that timer), each addressed to its one interface via
 /// [`Egress::Iface`].
-pub fn poll_due_ogms<
-    const ORIGINATORS: usize,
-    const INTERFACES: usize,
-    const MCAST_MEMBERS: usize,
-    const LOCAL_MCAST: usize,
-    const IDENT_TABLE: usize,
-    const IDENT_LIVE: usize,
-    const LINK_QUALITY: usize,
-    const NEIGHBOR_KEYS: usize,
-    const REVOKED: usize,
-    const IN_FLIGHT_CERT_REQUESTS: usize,
-    const PENDING_REPLIES: usize,
->(
-    router: &mut CentralRouter<
-        ORIGINATORS,
-        INTERFACES,
-        MCAST_MEMBERS,
-        LOCAL_MCAST,
-        IDENT_TABLE,
-        IDENT_LIVE,
-        LINK_QUALITY,
-        NEIGHBOR_KEYS,
-        REVOKED,
-        IN_FLIGHT_CERT_REQUESTS,
-        PENDING_REPLIES,
-    >,
+pub fn poll_due_ogms<R: RouterOps>(
+    router: &mut R,
     now: Duration,
     tx_buffer: &mut [u8],
     sink: &mut impl MeshSink,
@@ -357,32 +261,8 @@ pub fn poll_due_ogms<
 /// poll-time feature check to make: an interface's keep-alive timer only
 /// exists (is `Some`) once `configure_interface_keepalive` armed it from that
 /// link's `tx_keepalive` config, so "due" already implies "opted in."
-pub fn poll_due_keepalives<
-    const ORIGINATORS: usize,
-    const INTERFACES: usize,
-    const MCAST_MEMBERS: usize,
-    const LOCAL_MCAST: usize,
-    const IDENT_TABLE: usize,
-    const IDENT_LIVE: usize,
-    const LINK_QUALITY: usize,
-    const NEIGHBOR_KEYS: usize,
-    const REVOKED: usize,
-    const IN_FLIGHT_CERT_REQUESTS: usize,
-    const PENDING_REPLIES: usize,
->(
-    router: &mut CentralRouter<
-        ORIGINATORS,
-        INTERFACES,
-        MCAST_MEMBERS,
-        LOCAL_MCAST,
-        IDENT_TABLE,
-        IDENT_LIVE,
-        LINK_QUALITY,
-        NEIGHBOR_KEYS,
-        REVOKED,
-        IN_FLIGHT_CERT_REQUESTS,
-        PENDING_REPLIES,
-    >,
+pub fn poll_due_keepalives<R: RouterOps>(
+    router: &mut R,
     now: Duration,
     tx_buffer: &mut [u8],
     sink: &mut impl MeshSink,
@@ -408,6 +288,9 @@ mod tests {
     use std::vec::Vec;
 
     use super::*;
+    // The planning functions are generic over `RouterOps` now; the tests still
+    // instantiate a concrete host-profile router to drive them.
+    use wayfinder::CentralRouter;
     use wayfinder::auth::DIRECTED_TRAILER_LEN;
     use wayfinder::auth::OgmAuth;
     use wayfinder::auth::OgmVerdict;
