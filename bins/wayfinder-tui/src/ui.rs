@@ -26,8 +26,8 @@ use ratatui::widgets::Table;
 use ratatui::widgets::Tabs;
 use ratatui::widgets::Wrap;
 
-use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesEntry;
-use wayfinder_protos::wayfinder_v1alpha::LogLevel;
+use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesEntry;
+use wayfinder_protos::wayfinder::v1alpha::LogLevel;
 
 use crate::app::App;
 use crate::app::LogEntry;
@@ -587,7 +587,7 @@ fn render_links(frame: &mut Frame, app: &mut App, area: Rect) {
 fn ogm_schedule_for(
     app: &App,
     iface_idx: u32,
-) -> Option<&wayfinder_protos::wayfinder_v1alpha::OgmScheduleEntry> {
+) -> Option<&wayfinder_protos::wayfinder::v1alpha::OgmScheduleEntry> {
     app.snapshot
         .ogm_schedule
         .entries
@@ -1135,7 +1135,7 @@ fn render_node_metrics(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         ))],
         Some(m) => {
-            let occ = |o: &Option<wayfinder_protos::wayfinder_v1alpha::TableOccupancy>| match o {
+            let occ = |o: &Option<wayfinder_protos::wayfinder::v1alpha::TableOccupancy>| match o {
                 Some(t) => format!("{}/{}", t.used, t.capacity),
                 None => "—".to_string(),
             };
@@ -1421,10 +1421,10 @@ mod tests {
 
         // Populate node metrics so the node-metrics panel — including the new
         // oversize-drops row — renders its values, not the "no data" placeholder.
-        app.snapshot.metrics = Some(wayfinder_protos::wayfinder_v1alpha::NodeMetrics {
+        app.snapshot.metrics = Some(wayfinder_protos::wayfinder::v1alpha::NodeMetrics {
             oversize_drops: 42,
             relay_oversize_drops: 17,
-            cert_store: Some(wayfinder_protos::wayfinder_v1alpha::TableOccupancy {
+            cert_store: Some(wayfinder_protos::wayfinder::v1alpha::TableOccupancy {
                 used: 5,
                 capacity: 64,
             }),
@@ -1432,8 +1432,8 @@ mod tests {
             cert_reply_rate: 1.5,
             ..Default::default()
         });
-        app.snapshot.keepalive = wayfinder_protos::wayfinder_v1alpha::KeepAliveTable {
-            entries: vec![wayfinder_protos::wayfinder_v1alpha::KeepAliveEntry {
+        app.snapshot.keepalive = wayfinder_protos::wayfinder::v1alpha::KeepAliveTable {
+            entries: vec![wayfinder_protos::wayfinder::v1alpha::KeepAliveEntry {
                 neighbor_id: vec![0, 0, 0, 0, 0, 2],
                 ms_since_last_heard: 4200,
                 interval_estimate_ms: 1000,
@@ -1479,9 +1479,9 @@ mod tests {
     /// lists each pending request there.
     #[test]
     fn security_tab_shows_pending_csrs_only_for_a_provider() {
-        use wayfinder_protos::wayfinder_v1alpha::GetSecurityStatusResponse;
-        use wayfinder_protos::wayfinder_v1alpha::ListPendingCsrsResponse;
-        use wayfinder_protos::wayfinder_v1alpha::PendingCsr;
+        use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
+        use wayfinder_protos::wayfinder::v1alpha::ListPendingCsrsResponse;
+        use wayfinder_protos::wayfinder::v1alpha::PendingCsr;
 
         let mut app = App::new("test".to_string(), 1000);
         app.tab = Tab::Security;
@@ -1543,9 +1543,9 @@ mod tests {
     #[test]
     fn security_tab_offers_revoke_for_a_provider() {
         use crate::app::SecurityFocus;
-        use wayfinder_protos::wayfinder_v1alpha::GetSecurityStatusResponse;
-        use wayfinder_protos::wayfinder_v1alpha::ListPendingCsrsResponse;
-        use wayfinder_protos::wayfinder_v1alpha::NodeSecurity;
+        use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
+        use wayfinder_protos::wayfinder::v1alpha::ListPendingCsrsResponse;
+        use wayfinder_protos::wayfinder::v1alpha::NodeSecurity;
 
         let mut app = App::new("test".to_string(), 1000);
         app.tab = Tab::Security;
@@ -1598,10 +1598,10 @@ mod tests {
     /// yes/no state with its toggle-key hint, and the keep-alive cadence.
     #[test]
     fn links_tab_shows_schedule_and_feature_detail_for_selected_interface() {
-        use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesEntry;
-        use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesTable;
-        use wayfinder_protos::wayfinder_v1alpha::OgmSchedule;
-        use wayfinder_protos::wayfinder_v1alpha::OgmScheduleEntry;
+        use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesEntry;
+        use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesTable;
+        use wayfinder_protos::wayfinder::v1alpha::OgmSchedule;
+        use wayfinder_protos::wayfinder::v1alpha::OgmScheduleEntry;
 
         let mut app = App::new("test".to_string(), 1000);
         app.tab = Tab::Links;

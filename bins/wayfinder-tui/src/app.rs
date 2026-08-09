@@ -7,19 +7,19 @@ use std::time::Instant;
 use ratatui::widgets::TableState;
 use serde::Deserialize;
 use serde::Serialize;
-use wayfinder_protos::wayfinder_v1alpha::GetSecurityStatusResponse;
-use wayfinder_protos::wayfinder_v1alpha::KeepAliveTable;
-use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesTable;
-use wayfinder_protos::wayfinder_v1alpha::LinkQualityTable;
-use wayfinder_protos::wayfinder_v1alpha::ListPendingCsrsResponse;
-use wayfinder_protos::wayfinder_v1alpha::LogRecord;
-use wayfinder_protos::wayfinder_v1alpha::LogRecords;
-use wayfinder_protos::wayfinder_v1alpha::NodeInfo;
-use wayfinder_protos::wayfinder_v1alpha::NodeMetrics;
-use wayfinder_protos::wayfinder_v1alpha::NodeSecurity;
-use wayfinder_protos::wayfinder_v1alpha::OgmSchedule;
-use wayfinder_protos::wayfinder_v1alpha::RoutingTable;
-use wayfinder_protos::wayfinder_v1alpha::Throughput;
+use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
+use wayfinder_protos::wayfinder::v1alpha::KeepAliveTable;
+use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesTable;
+use wayfinder_protos::wayfinder::v1alpha::LinkQualityTable;
+use wayfinder_protos::wayfinder::v1alpha::ListPendingCsrsResponse;
+use wayfinder_protos::wayfinder::v1alpha::LogRecord;
+use wayfinder_protos::wayfinder::v1alpha::LogRecords;
+use wayfinder_protos::wayfinder::v1alpha::NodeInfo;
+use wayfinder_protos::wayfinder::v1alpha::NodeMetrics;
+use wayfinder_protos::wayfinder::v1alpha::NodeSecurity;
+use wayfinder_protos::wayfinder::v1alpha::OgmSchedule;
+use wayfinder_protos::wayfinder::v1alpha::RoutingTable;
+use wayfinder_protos::wayfinder::v1alpha::Throughput;
 
 /// The top-level views the TUI cycles between.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -653,7 +653,7 @@ pub fn format_id(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod log_tests {
     use super::*;
-    use wayfinder_protos::wayfinder_v1alpha::LogLevel;
+    use wayfinder_protos::wayfinder::v1alpha::LogLevel;
 
     /// A record at `seq`, tagged so tests can tell them apart.
     fn rec(seq: u64) -> LogRecord {
@@ -867,7 +867,7 @@ mod log_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wayfinder_protos::wayfinder_v1alpha::RoutingEntry;
+    use wayfinder_protos::wayfinder::v1alpha::RoutingEntry;
 
     #[test]
     fn format_id_renders_mac_short_and_empty() {
@@ -899,8 +899,8 @@ mod tests {
 
     #[test]
     fn security_for_looks_up_a_node_by_id() {
-        use wayfinder_protos::wayfinder_v1alpha::GetSecurityStatusResponse;
-        use wayfinder_protos::wayfinder_v1alpha::NodeSecurity;
+        use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
+        use wayfinder_protos::wayfinder::v1alpha::NodeSecurity;
 
         let mut app = App::new("test".to_string(), 1000);
         assert!(app.snapshot.security_for(&[0, 0, 0, 0, 0, 2]).is_none());
@@ -929,8 +929,8 @@ mod tests {
 
     #[test]
     fn csr_action_is_queued_only_on_the_security_tab_of_a_provider() {
-        use wayfinder_protos::wayfinder_v1alpha::ListPendingCsrsResponse;
-        use wayfinder_protos::wayfinder_v1alpha::PendingCsr;
+        use wayfinder_protos::wayfinder::v1alpha::ListPendingCsrsResponse;
+        use wayfinder_protos::wayfinder::v1alpha::PendingCsr;
 
         let mut app = App::new("test".to_string(), 1000);
         app.snapshot.pending_csrs = Some(ListPendingCsrsResponse {
@@ -997,10 +997,10 @@ mod tests {
 
     /// A small provider snapshot: one pending CSR and one known originator.
     fn provider_app() -> App {
-        use wayfinder_protos::wayfinder_v1alpha::GetSecurityStatusResponse;
-        use wayfinder_protos::wayfinder_v1alpha::ListPendingCsrsResponse;
-        use wayfinder_protos::wayfinder_v1alpha::NodeSecurity;
-        use wayfinder_protos::wayfinder_v1alpha::PendingCsr;
+        use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
+        use wayfinder_protos::wayfinder::v1alpha::ListPendingCsrsResponse;
+        use wayfinder_protos::wayfinder::v1alpha::NodeSecurity;
+        use wayfinder_protos::wayfinder::v1alpha::PendingCsr;
         let mut app = App::new("test".to_string(), 1000);
         app.tab = Tab::Security;
         app.snapshot.pending_csrs = Some(ListPendingCsrsResponse {
@@ -1078,7 +1078,7 @@ mod tests {
     }
 
     fn app_with_link_features(
-        entries: Vec<wayfinder_protos::wayfinder_v1alpha::LinkFeaturesEntry>,
+        entries: Vec<wayfinder_protos::wayfinder::v1alpha::LinkFeaturesEntry>,
     ) -> App {
         let mut app = App::new("test".to_string(), 1000);
         app.tab = Tab::Links;
@@ -1088,7 +1088,7 @@ mod tests {
 
     #[test]
     fn toggle_link_feature_is_inert_off_the_links_tab() {
-        use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesEntry;
+        use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesEntry;
         let mut app = app_with_link_features(vec![LinkFeaturesEntry {
             iface_idx: 0,
             tx_ogm: true,
@@ -1106,7 +1106,7 @@ mod tests {
 
     #[test]
     fn toggle_link_feature_is_inert_without_a_selection() {
-        use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesEntry;
+        use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesEntry;
         let mut app = app_with_link_features(vec![LinkFeaturesEntry {
             iface_idx: 0,
             tx_ogm: true,
@@ -1122,7 +1122,7 @@ mod tests {
 
     #[test]
     fn toggle_link_feature_queues_the_flipped_value_for_the_selected_iface() {
-        use wayfinder_protos::wayfinder_v1alpha::LinkFeaturesEntry;
+        use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesEntry;
         let mut app = app_with_link_features(vec![LinkFeaturesEntry {
             iface_idx: 2,
             tx_ogm: true,

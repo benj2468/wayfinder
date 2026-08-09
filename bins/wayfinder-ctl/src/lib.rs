@@ -26,10 +26,10 @@ use wayfinder_client::Client;
 // Re-exported so integration tests (and any embedder) can build the connection
 // endpoint the same way `run` does.
 pub use wayfinder_client::Endpoint;
-use wayfinder_protos::wayfinder_v1alpha::CsrIssued;
-use wayfinder_protos::wayfinder_v1alpha::LinkFeatures;
-use wayfinder_protos::wayfinder_v1alpha::link_features::TxKeepaliveUpdate;
-use wayfinder_protos::wayfinder_v1alpha::submit_csr_response::Outcome as CsrOutcome;
+use wayfinder_protos::wayfinder::v1alpha::CsrIssued;
+use wayfinder_protos::wayfinder::v1alpha::LinkFeatures;
+use wayfinder_protos::wayfinder::v1alpha::link_features::TxKeepaliveUpdate;
+use wayfinder_protos::wayfinder::v1alpha::submit_csr_response::Outcome as CsrOutcome;
 
 use crate::output::OutputFormat;
 

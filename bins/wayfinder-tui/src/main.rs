@@ -463,7 +463,7 @@ async fn act_link_feature(client: &mut Option<Client>, target: &ConnectTarget, a
         }
     }
 
-    let mut features = wayfinder_protos::wayfinder_v1alpha::LinkFeatures {
+    let mut features = wayfinder_protos::wayfinder::v1alpha::LinkFeatures {
         iface_idx: toggle.iface_idx,
         ..Default::default()
     };

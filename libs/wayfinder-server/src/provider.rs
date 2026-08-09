@@ -8,9 +8,9 @@
 //! feature, and is injected into the [`RouterAdapter`](crate::RouterAdapter) by
 //! the host driver.
 //!
-//! [`GetTrustAnchorRequest`]: wayfinder_protos::wayfinder_v1alpha::GetTrustAnchorRequest
-//! [`SubmitCsrRequest`]: wayfinder_protos::wayfinder_v1alpha::SubmitCsrRequest
-//! [`RevokeNodeRequest`]: wayfinder_protos::wayfinder_v1alpha::RevokeNodeRequest
+//! [`GetTrustAnchorRequest`]: wayfinder_protos::wayfinder::v1alpha::GetTrustAnchorRequest
+//! [`SubmitCsrRequest`]: wayfinder_protos::wayfinder::v1alpha::SubmitCsrRequest
+//! [`RevokeNodeRequest`]: wayfinder_protos::wayfinder::v1alpha::RevokeNodeRequest
 
 use alloc::string::String;
 use alloc::vec::Vec;

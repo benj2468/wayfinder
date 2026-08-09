@@ -16,6 +16,7 @@ fn main() {
     );
 
     config
+        .include_file("_includes.rs")
         .compile_protos(&["protos/wayfinder/v1alpha/wayfinder.proto"], &["protos/"])
         .expect("failed to compile protos");
 }
