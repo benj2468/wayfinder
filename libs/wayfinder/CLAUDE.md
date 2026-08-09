@@ -90,6 +90,39 @@ Central router orchestration. `no_std`; the `std` feature enables `DynLinkT`.
 - `0x88B5` — reserved for experimental protocols.
 - Other values are dropped.
 
+## Receive path
+
+`handle_frame_with_metrics` owns only what every protocol shares — the
+fail-closed `auth_locked` gate, the unconditional ingress accounting
+(`account_ingress`: link quality + rx rate, deliberately before any demux so a
+frame the upper layers drop still counts), and the demux itself. Everything
+BATMAN-specific is in `handle_batman_frame`, in the order the wire demands:
+
+1. **Receive gate** — `LinkFeatures` `rx_ogm`/`rx_data` for this interface.
+   Cert-control packets are never gated; the auth control plane must keep
+   flowing.
+2. **`authenticate_inbound`** → `InboundVerdict` — the pre-engine control-plane
+   gate (OGM against the trust anchor, keep-alive against the sender's cached
+   cert), plus the Trickle reset a newly-folded revocation triggers.
+3. **`batman.handle_rx`** — the engine call, writing any outgoing frame into
+   the `reply` scratchpad.
+4. **Action dispatch** — `on_consumed` / `on_deliver_local` / inline
+   forward-verbatim, with `engine_reply_frame` doing the trim-to-incoming-size
+   both re-flood arms need.
+
+The one non-obvious shape here is **`InboundVerdict` carrying no borrow**. Its
+`NeedCert` arm names the originator and fingerprint to fetch and leaves
+building the request to `build_cert_request_frame`; if the verdict borrowed
+`tx_buf` to carry a ready-made `CertReq`, the accept path could no longer use
+that same buffer for the engine's reply. Keep any future gate decision-only for
+the same reason — it is the same rule `driver_core::plan_dispatch` follows.
+
+The two lazy-cert control packets terminate in the node's own auth state and
+never reach the host TAP: a `CertReply` is ingested, a `CertReq` is answered by
+`answer_cert_request` (immediately when a route back exists and it fits) or
+parked for `flush_parked_cert_reply` to flush opportunistically after a later
+OGM from the requester reconfirms the route.
+
 ## Adding a new routing protocol
 
 1. Implement the `MeshRoutingEngine` trait (from `libs/interfaces`) in a new

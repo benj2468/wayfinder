@@ -403,6 +403,32 @@ impl RxOutcome<'_, '_> {
     }
 }
 
+/// The verdict of the pre-engine authentication gate
+/// ([`CentralRouter::authenticate_inbound`]) for one received BATMAN frame.
+///
+/// Deliberately a decision that borrows nothing: keeping the transmit buffer
+/// out of it is what lets the accept path go on to use that same buffer for
+/// the engine's reply, so the `NeedCert` arm names *what* must be fetched and
+/// leaves building the request frame to
+/// [`CentralRouter::build_cert_request_frame`].
+enum InboundVerdict {
+    /// The frame verified (or needed no verification): let it reach the
+    /// routing engine.
+    Accept,
+    /// Drop the frame before the routing engine sees it.
+    Drop,
+    /// Drop this copy of the OGM and fetch the originator's cert first — it
+    /// advertised a [`TvlvType::CertFp`](wayfinder_auth::TvlvType) this node
+    /// cannot resolve.
+    NeedCert {
+        /// The originator whose cert is needed.
+        orig: Mac,
+        /// The fingerprint the OGM advertised, echoed into the request so the
+        /// fetch can be matched back to the OGM that triggered it.
+        fp: [u8; 8],
+    },
+}
+
 /// The central mesh router: it wraps the [`BatmanEngine`] with an ident table,
 /// a per-(neighbor, interface) link-quality table, opt-in OGM authentication,
 /// and the observability counters/estimators. It demuxes received frames by
@@ -785,6 +811,13 @@ impl<
     /// `RxOutcome` immediately — before any link-quality/throughput
     /// accounting or protocol demux — when [`auth_locked`].
     ///
+    /// This method owns only the three things every protocol shares: the
+    /// fail-closed gate, the unconditional ingress accounting
+    /// (`account_ingress`), and the demux itself. The BATMAN family is
+    /// handled by `handle_batman_frame`, which owns the receive gate, the
+    /// authentication gate, the engine call, and the dispatch of the
+    /// [`RoutingAction`] it returns.
+    ///
     /// [`auth_locked`]: CentralRouter::auth_locked
     pub fn handle_frame_with_metrics<'rx, 'tx>(
         &mut self,
@@ -818,369 +851,16 @@ impl<
         }
 
         tx_buf.fill(0);
-        // 0. Update the link-quality table for the sender, keyed on the
-        //    interface this frame arrived on.  Done before any further
-        //    processing so even frames that the upper layers drop still
-        //    contribute their signal information. (This no longer holds when
-        //    `auth_locked()`: the fail-closed gate above already returned
-        //    before this step runs.)
-        let quality = normalize_quality(&metrics);
-        self.link_quality.update(frame.src, iface_idx, quality);
-        // The smoothed link quality to this neighbor, used to clamp any OGM's
-        // advertised TQ so a node can't claim a path better than the link we
-        // measure to it.  Only meaningful when the frame carried a real
-        // physical measurement: metric-less transports (UDP/Unix/raw L2) report
-        // `LinkMetrics::default`, which normalizes to 0 — clamping by that would
-        // wrongly zero every TQ — so they apply no clamp at all.
-        let measured =
-            metrics.rssi_dbm.is_some() || metrics.snr_db.is_some() || metrics.quality.is_some();
-        let local_quality = if measured {
-            self.link_quality.quality_for(frame.src, iface_idx)
-        } else {
-            None
-        };
-
-        // 0b. Account the frame against this interface's ingress rate before any
-        //     demux, so even frames the upper layers drop still register as
-        //     received throughput on the wire. (Again, this no longer holds
-        //     when `auth_locked()`: such frames never reach this point.)
-        self.record_rx(iface_idx, link_frame_wire_len(frame.payload.len()), now);
+        // 0. Account the frame on the interface it arrived on, before any
+        //    further processing.
+        let local_quality = self.account_ingress(now, iface_idx, frame, &metrics);
 
         // 1. Add a record to the identifier table
         self.ident_table.add_record(iface_idx, frame.dst);
         // 2. Demux by Protocol ID
-        match frame.protocol.get() {
+        match protocol {
             DEFAULT_BATMAN_ETHER_TYPE => {
-                // Per-link receive gating: drop a traffic class this link is
-                // configured not to accept before it can touch the routing
-                // tables, be delivered, or generate a re-flood.  The rx-rate
-                // and link-quality above already counted the frame as observed
-                // on the wire, matching how other upper-layer drops behave.
-                // Cert-control packets (CertReq/CertReply) fall through the
-                // arms below and are never gated here — the auth control plane
-                // must keep flowing regardless of data/routing gates.
-                let features = self.link_features(iface_idx);
-                match frame.payload.first() {
-                    Some(&BATADV_IV_OGM) if !features.rx_ogm => {
-                        trace!("drop: rx_ogm disabled on this link");
-                        return RxOutcome::empty();
-                    }
-                    Some(&BATADV_BCAST) | Some(&BATADV_UNICAST) | Some(&BATADV_MCAST)
-                        if !features.rx_data =>
-                    {
-                        trace!("drop: rx_data disabled on this link");
-                        return RxOutcome::empty();
-                    }
-                    _ => {}
-                }
-
-                // Opt-in control-plane segregation: when auth is enabled, an OGM
-                // that does not verify against our trust anchor is dropped before
-                // it can touch the routing table.  Only OGMs are gated here (the
-                // one-to-many control plane).  Data-plane frames (BCAST/UNICAST/
-                // MCAST) are NOT authenticated yet — an outsider can still inject
-                // them until the pairwise data-plane tag lands; see auth.rs scope.
-                if frame.payload.first() == Some(&BATADV_IV_OGM)
-                    && let Some(auth) = self.auth.as_mut()
-                {
-                    match auth.verify_ogm(&frame.payload) {
-                        auth::OgmVerdict::Verified => {}
-                        auth::OgmVerdict::Rejected => {
-                            return RxOutcome {
-                                forward: None,
-                                deliver_local: None,
-                            };
-                        }
-                        auth::OgmVerdict::NeedCert { orig, fp } => {
-                            // We have no route to `orig` yet — `verify_ogm`
-                            // gates before the engine sees this OGM, so
-                            // nothing installed one. Seed the first hop with
-                            // the OGM's actual link source (`frame.src`),
-                            // which by construction has a route to `orig`
-                            // (it just relayed/originated this OGM). This
-                            // copy is dropped either way; the next emission
-                            // after the fetch resolves verifies normally.
-                            let hdr_len = core::mem::size_of::<BatmanCertReqPacket>();
-                            let forward = if hdr_len <= tx_buf.len()
-                                && let Some(body_len) = auth.build_cert_request(
-                                    orig,
-                                    fp,
-                                    frame.src,
-                                    &mut tx_buf[hdr_len..],
-                                ) {
-                                let req_hdr = BatmanCertReqPacket {
-                                    packet_type: BATADV_CERT_REQ,
-                                    version: 5,
-                                    ttl: 50,
-                                    dest: orig,
-                                };
-                                tx_buf[..hdr_len].copy_from_slice(req_hdr.as_bytes());
-                                self.cert_req_tx_rate.observe(now, 0);
-                                Some(LinkFrameData {
-                                    dst: frame.src,
-                                    protocol: ETH_P_BATMAN,
-                                    payload: &tx_buf[..hdr_len + body_len],
-                                })
-                            } else {
-                                None
-                            };
-                            return RxOutcome {
-                                forward,
-                                deliver_local: None,
-                            };
-                        }
-                    }
-                }
-
-                // Opt-in control-plane segregation for keep-alives too: when
-                // auth is enabled, a keep-alive whose signature does not
-                // verify against the sender's cached cert (from a previously
-                // verified OGM) is dropped before it can touch the engine's
-                // liveness table. Without this, an unauthenticated keep-alive
-                // let any on-link party bias route selection away from a
-                // spoofed victim neighbor without holding a membership cert —
-                // the same segregation guarantee OGMs already get.
-                if frame.payload.first() == Some(&BATADV_KEEPALIVE)
-                    && let Some(auth) = self.auth.as_mut()
-                    && !auth.verify_keepalive(frame.src, &frame.payload)
-                {
-                    return RxOutcome {
-                        forward: None,
-                        deliver_local: None,
-                    };
-                }
-
-                // If verifying that OGM folded in a *new* revocation, snap the
-                // Trickle timers to i_min so this node re-floods the purge
-                // promptly rather than at its backed-off emission interval.
-                if let Some(auth) = self.auth.as_mut()
-                    && auth.take_trickle_reset_hint()
-                {
-                    self.batman.reset_ogm_timers(now);
-                    self.batman.revoke_originators(auth.revoked_macs());
-                    self.batman.purge_stale(now);
-                }
-
-                let mut reply: LinkFrameDataMut<'_> = tx_buf.into();
-
-                // BATMAN-adv Protocol ID
-                let action = self.batman.handle_rx(now, frame, local_quality, &mut reply);
-                trace!(
-                    reply_dst = ?reply.dst,
-                    reply_protocol = %format_args!("0x{:04x}", reply.protocol),
-                    "post-action reply"
-                );
-                match action {
-                    RoutingAction::Consumed => {
-                        // Trim the payload to the incoming frame size so that
-                        // trailing zeros from the scratchpad buffer are not
-                        // forwarded on the wire.
-                        let forward = if reply.protocol != 0 {
-                            // A re-flood of an OGM *is* advertising its originator
-                            // as reachable through us. Suppress it when the OGM
-                            // arrived on a link we can't send data onto
-                            // (`tx_data` off): we could never deliver to that
-                            // originator, so advertising a route to it would
-                            // black-hole any peer that then routed through us.
-                            // The engine has already learned it into our local
-                            // table (surfaced via the management API); we simply
-                            // don't propagate it. See
-                            // [`LinkFeatures::tx_data`](crate::features::LinkFeatures::tx_data).
-                            if frame.payload.first() == Some(&BATADV_IV_OGM)
-                                && !self.link_features(iface_idx).tx_data
-                            {
-                                trace!(
-                                    "drop: not re-advertising an OGM learned on a tx_data-off link"
-                                );
-                                None
-                            } else {
-                                let len = frame.payload.len().min(reply.payload.len());
-                                Some(LinkFrameData {
-                                    dst: reply.dst,
-                                    protocol: reply.protocol,
-                                    payload: &reply.payload[..len],
-                                })
-                            }
-                        } else if frame.payload.first() == Some(&BATADV_IV_OGM)
-                            && let Ok((ogm, _)) =
-                                batman::wire::BatmanOgmPacket::ref_from_prefix(&frame.payload)
-                            && let Some(auth) = self.auth.as_mut()
-                        {
-                            // This OGM itself needed no re-flood (the common
-                            // case), leaving the forward slot free.
-                            // Opportunistically flush a pending `CertReply`
-                            // for its originator, now that verifying it
-                            // (re)confirms a route back to them (design doc
-                            // §3.3/§5.4). A genuine re-flood always wins the
-                            // slot; a skipped flush here is not a
-                            // correctness issue — the requester's own retry
-                            // (`OgmAuth::build_cert_request`) is the
-                            // backstop.
-                            let flushed = Self::try_flush_pending_cert_reply(
-                                auth,
-                                &self.batman,
-                                now,
-                                ogm.orig,
-                                &mut reply,
-                            );
-                            if flushed.is_some() {
-                                self.cert_reply_tx_rate.observe(now, 0);
-                            }
-                            flushed.map(|(next, total)| LinkFrameData {
-                                dst: next,
-                                protocol: ETH_P_BATMAN,
-                                payload: &reply.payload[..total],
-                            })
-                        } else {
-                            None
-                        };
-                        RxOutcome {
-                            forward,
-                            deliver_local: None,
-                        }
-                    }
-                    RoutingAction::ForwardTo(next_hop) => {
-                        // BATMAN told us this packet needs to keep moving.
-                        // Re-transmit it out to the designated next-hop neighbor.
-                        let len = frame.payload.len().min(reply.payload.len());
-                        reply.payload[..len].copy_from_slice(&frame.payload[..len]);
-                        RxOutcome {
-                            forward: Some(LinkFrameData {
-                                dst: next_hop,
-                                protocol: DEFAULT_BATMAN_ETHER_TYPE,
-                                payload: &reply.payload[..len],
-                            }),
-                            deliver_local: None,
-                        }
-                    }
-                    RoutingAction::DeliverLocal => match frame.payload.first() {
-                        Some(&BATADV_CERT_REPLY) => {
-                            // Terminates in our own auth state, never the
-                            // host TAP: verify against the trust anchor,
-                            // confirm it answers an outstanding request, and
-                            // cache it.
-                            if let Some(auth) = self.auth.as_mut() {
-                                let body = frame
-                                    .payload
-                                    .get(Self::inner_offset(&frame.payload)..)
-                                    .unwrap_or(&[]);
-                                auth.ingest_cert_reply(body);
-                            }
-                            RxOutcome::empty()
-                        }
-                        Some(&BATADV_CERT_REQ) => {
-                            // Terminates here: this node is the originator
-                            // whose cert was requested (the terminal-only
-                            // responder — an intermediate holder answering
-                            // early is a deferred optimization). Verify the
-                            // requester's self-authenticating body, then
-                            // either answer immediately (a route exists) or
-                            // park it for the opportunistic flush above.
-                            let body = frame
-                                .payload
-                                .get(Self::inner_offset(&frame.payload)..)
-                                .unwrap_or(&[]);
-                            let requester = self
-                                .auth
-                                .as_mut()
-                                .and_then(|auth| auth.verify_cert_request(body));
-                            let Some(requester) = requester else {
-                                return RxOutcome::empty();
-                            };
-
-                            let hdr_len = core::mem::size_of::<BatmanCertReplyPacket>();
-                            #[expect(
-                                clippy::expect_used,
-                                reason = "requester came from self.auth.verify_cert_request, so auth must still be Some"
-                            )]
-                            let own_cert = *self
-                                .auth
-                                .as_ref()
-                                .expect("auth present: requester was just verified through it")
-                                .own_cert();
-                            let cert_bytes = own_cert.as_bytes();
-                            let total = hdr_len + cert_bytes.len();
-
-                            match self.batman.next_hop(now, requester) {
-                                Some(next) if total <= reply.payload.len() => {
-                                    let reply_hdr = BatmanCertReplyPacket {
-                                        packet_type: BATADV_CERT_REPLY,
-                                        version: 5,
-                                        ttl: 50,
-                                        dest: requester,
-                                    };
-                                    reply.payload[..hdr_len].copy_from_slice(reply_hdr.as_bytes());
-                                    reply.payload[hdr_len..total].copy_from_slice(cert_bytes);
-                                    self.cert_reply_tx_rate.observe(now, 0);
-                                    return RxOutcome {
-                                        forward: Some(LinkFrameData {
-                                            dst: next,
-                                            protocol: ETH_P_BATMAN,
-                                            payload: &reply.payload[..total],
-                                        }),
-                                        deliver_local: None,
-                                    };
-                                }
-                                Some(_) => {
-                                    // A route exists, but the reply doesn't
-                                    // fit the transmit buffer — a local MTU
-                                    // misconfiguration (own cert + header is
-                                    // a fixed ~165 bytes), not "no route
-                                    // yet". Parking it wouldn't help (the
-                                    // opportunistic flush hits the same
-                                    // buffer), but the requester's own retry
-                                    // is a harmless no-op backstop either
-                                    // way, so park it anyway rather than add
-                                    // a second silent-drop path.
-                                    debug!(
-                                        total,
-                                        buf_len = reply.payload.len(),
-                                        "auth: cert reply does not fit the transmit buffer"
-                                    );
-                                }
-                                None => {
-                                    trace!(?requester, "auth: no route to cert requester yet");
-                                }
-                            }
-                            // Park it for the opportunistic flush once
-                            // verifying one of the requester's OGMs confirms
-                            // a route back.
-                            if let Some(auth) = self.auth.as_mut() {
-                                auth.park_pending_reply(requester);
-                            }
-                            RxOutcome::empty()
-                        }
-                        _ => {
-                            // Hand the inner frame up to the local host, stripping
-                            // the BATMAN header that carried it here.
-                            RxOutcome {
-                                forward: None,
-                                deliver_local: frame
-                                    .payload
-                                    .get(Self::inner_offset(&frame.payload)..),
-                            }
-                        }
-                    },
-                    RoutingAction::DeliverLocalAndForward(_next) => {
-                        // A fresh broadcast: deliver the inner frame locally
-                        // *and* propagate the re-flood the engine wrote into
-                        // `reply` (TTL decremented, addressed to BROADCAST).
-                        let forward = if reply.protocol != 0 {
-                            let len = frame.payload.len().min(reply.payload.len());
-                            Some(LinkFrameData {
-                                dst: reply.dst,
-                                protocol: reply.protocol,
-                                payload: &reply.payload[..len],
-                            })
-                        } else {
-                            None
-                        };
-                        RxOutcome {
-                            forward,
-                            deliver_local: frame.payload.get(Self::inner_offset(&frame.payload)..),
-                        }
-                    }
-                }
+                self.handle_batman_frame(now, iface_idx, frame, local_quality, tx_buf)
             }
             0x88B5 => {
                 trace!("rx experimental protocol frame");
@@ -1192,6 +872,428 @@ impl<
                 RxOutcome::empty()
             }
         }
+    }
+
+    /// Fold one received frame into the unconditional per-interface ingress
+    /// accounting, returning the smoothed link quality that clamps this
+    /// frame's advertised TQ (`None` for no clamp).
+    ///
+    /// Two records are kept, both taken *before* any demux so that even a
+    /// frame the upper layers go on to drop still contributes its signal
+    /// information and still registers as received throughput on the wire:
+    /// the per-(neighbor, interface) link-quality table, keyed on the
+    /// interface this frame arrived on, and that interface's ingress rate.
+    /// Neither holds while [`auth_locked`](Self::auth_locked) — the
+    /// fail-closed gate in
+    /// [`handle_frame_with_metrics`](Self::handle_frame_with_metrics)
+    /// returns before this runs.
+    ///
+    /// The returned quality is what stops a node claiming a path better than
+    /// the link we measure to it.  It is only meaningful when the frame
+    /// carried a real physical measurement: metric-less transports
+    /// (UDP/Unix/raw L2) report [`LinkMetrics::default`], which normalizes to
+    /// 0 — clamping by that would wrongly zero every TQ — so they apply no
+    /// clamp at all.
+    fn account_ingress(
+        &mut self,
+        now: Duration,
+        iface_idx: usize,
+        frame: &LinkFrame,
+        metrics: &LinkMetrics,
+    ) -> Option<u8> {
+        let quality = normalize_quality(metrics);
+        self.link_quality.update(frame.src, iface_idx, quality);
+        let measured =
+            metrics.rssi_dbm.is_some() || metrics.snr_db.is_some() || metrics.quality.is_some();
+        let local_quality = if measured {
+            self.link_quality.quality_for(frame.src, iface_idx)
+        } else {
+            None
+        };
+        self.record_rx(iface_idx, link_frame_wire_len(frame.payload.len()), now);
+        local_quality
+    }
+
+    /// Handle a frame of the BATMAN protocol family
+    /// ([`DEFAULT_BATMAN_ETHER_TYPE`]), in the four steps its arm of the
+    /// demux has always had: the per-link receive gate, the pre-engine
+    /// authentication gate ([`authenticate_inbound`](Self::authenticate_inbound)),
+    /// the engine call, and the dispatch of whichever [`RoutingAction`] it
+    /// returned.
+    fn handle_batman_frame<'rx, 'tx>(
+        &mut self,
+        now: Duration,
+        iface_idx: usize,
+        frame: &'rx LinkFrame,
+        local_quality: Option<u8>,
+        tx_buf: &'tx mut [u8],
+    ) -> RxOutcome<'rx, 'tx> {
+        // Per-link receive gating: drop a traffic class this link is
+        // configured not to accept before it can touch the routing tables, be
+        // delivered, or generate a re-flood.  The rx-rate and link-quality
+        // accounting already counted the frame as observed on the wire,
+        // matching how other upper-layer drops behave.  Cert-control packets
+        // (CertReq/CertReply) fall through the arms below and are never gated
+        // here — the auth control plane must keep flowing regardless of
+        // data/routing gates.
+        let features = self.link_features(iface_idx);
+        match frame.payload.first() {
+            Some(&BATADV_IV_OGM) if !features.rx_ogm => {
+                trace!("drop: rx_ogm disabled on this link");
+                return RxOutcome::empty();
+            }
+            Some(&BATADV_BCAST) | Some(&BATADV_UNICAST) | Some(&BATADV_MCAST)
+                if !features.rx_data =>
+            {
+                trace!("drop: rx_data disabled on this link");
+                return RxOutcome::empty();
+            }
+            _ => {}
+        }
+
+        match self.authenticate_inbound(now, frame) {
+            InboundVerdict::Accept => {}
+            InboundVerdict::Drop => return RxOutcome::empty(),
+            InboundVerdict::NeedCert { orig, fp } => {
+                return RxOutcome {
+                    forward: self.build_cert_request_frame(now, orig, fp, frame.src, tx_buf),
+                    deliver_local: None,
+                };
+            }
+        }
+
+        let mut reply: LinkFrameDataMut<'_> = tx_buf.into();
+        let action = self.batman.handle_rx(now, frame, local_quality, &mut reply);
+        trace!(
+            reply_dst = ?reply.dst,
+            reply_protocol = %format_args!("0x{:04x}", reply.protocol),
+            "post-action reply"
+        );
+        match action {
+            RoutingAction::Consumed => self.on_consumed(now, iface_idx, frame, reply),
+            RoutingAction::ForwardTo(next_hop) => {
+                // BATMAN told us this packet needs to keep moving.
+                // Re-transmit it out to the designated next-hop neighbor.
+                let len = frame.payload.len().min(reply.payload.len());
+                reply.payload[..len].copy_from_slice(&frame.payload[..len]);
+                RxOutcome {
+                    forward: Some(LinkFrameData {
+                        dst: next_hop,
+                        protocol: DEFAULT_BATMAN_ETHER_TYPE,
+                        payload: &reply.payload[..len],
+                    }),
+                    deliver_local: None,
+                }
+            }
+            RoutingAction::DeliverLocal => self.on_deliver_local(now, frame, reply),
+            RoutingAction::DeliverLocalAndForward(_next) => RxOutcome {
+                // A fresh broadcast: deliver the inner frame locally *and*
+                // propagate the re-flood the engine wrote into `reply` (TTL
+                // decremented, addressed to BROADCAST).
+                forward: Self::engine_reply_frame(frame, reply),
+                deliver_local: frame.payload.get(Self::inner_offset(&frame.payload)..),
+            },
+        }
+    }
+
+    /// The pre-engine authentication gate: opt-in control-plane segregation,
+    /// applied before a frame can touch the routing tables.
+    ///
+    /// Only the *control* plane is gated. An OGM that does not verify against
+    /// our trust anchor is dropped, and so is a keep-alive whose signature
+    /// does not verify against the sender's cert cached from a previously
+    /// verified OGM — without the latter, an unauthenticated keep-alive would
+    /// let any on-link party bias route selection away from a spoofed victim
+    /// neighbor without holding a membership cert, defeating the same
+    /// segregation guarantee OGMs already get. Data-plane frames
+    /// (BCAST/UNICAST/MCAST) are NOT authenticated yet — an outsider can
+    /// still inject them until the pairwise data-plane tag lands; see
+    /// [`auth`] for the scope.
+    ///
+    /// Verifying an OGM may fold in a *new* revocation, in which case this
+    /// also snaps the Trickle timers to `i_min` so the node re-floods the
+    /// purge promptly rather than at its backed-off emission interval.
+    ///
+    /// Returns a decision that borrows nothing, so the transmit buffer stays
+    /// free for the engine's reply on the accept path; the `NeedCert` arm
+    /// names what to fetch and leaves building the request to
+    /// [`build_cert_request_frame`](Self::build_cert_request_frame).
+    fn authenticate_inbound(&mut self, now: Duration, frame: &LinkFrame) -> InboundVerdict {
+        if frame.payload.first() == Some(&BATADV_IV_OGM)
+            && let Some(auth) = self.auth.as_mut()
+        {
+            match auth.verify_ogm(&frame.payload) {
+                auth::OgmVerdict::Verified => {}
+                auth::OgmVerdict::Rejected => return InboundVerdict::Drop,
+                auth::OgmVerdict::NeedCert { orig, fp } => {
+                    return InboundVerdict::NeedCert { orig, fp };
+                }
+            }
+        }
+
+        if frame.payload.first() == Some(&BATADV_KEEPALIVE)
+            && let Some(auth) = self.auth.as_mut()
+            && !auth.verify_keepalive(frame.src, &frame.payload)
+        {
+            return InboundVerdict::Drop;
+        }
+
+        if let Some(auth) = self.auth.as_mut()
+            && auth.take_trickle_reset_hint()
+        {
+            self.batman.reset_ogm_timers(now);
+            self.batman.revoke_originators(auth.revoked_macs());
+            self.batman.purge_stale(now);
+        }
+
+        InboundVerdict::Accept
+    }
+
+    /// Build the `CertReq` owed after an OGM arrived carrying a fingerprint
+    /// this node cannot resolve ([`InboundVerdict::NeedCert`]).
+    ///
+    /// Addressed to `via` — the OGM's actual link source — rather than routed
+    /// toward `orig`: `verify_ogm` gates before the engine sees the OGM, so
+    /// nothing installed a route to `orig`, whereas `via` by construction has
+    /// one (it just relayed or originated this OGM). The OGM copy that
+    /// triggered the fetch is dropped either way; the next emission after the
+    /// fetch resolves verifies normally.
+    ///
+    /// Returns `None` when auth is disabled or the request would not fit
+    /// `tx_buf`; the requester's own retry is the backstop.
+    fn build_cert_request_frame<'tx>(
+        &mut self,
+        now: Duration,
+        orig: Mac,
+        fp: [u8; 8],
+        via: Mac,
+        tx_buf: &'tx mut [u8],
+    ) -> Option<LinkFrameData<'tx>> {
+        let hdr_len = core::mem::size_of::<BatmanCertReqPacket>();
+        if hdr_len > tx_buf.len() {
+            return None;
+        }
+        let auth = self.auth.as_mut()?;
+        let body_len = auth.build_cert_request(orig, fp, via, &mut tx_buf[hdr_len..])?;
+        let req_hdr = BatmanCertReqPacket {
+            packet_type: BATADV_CERT_REQ,
+            version: 5,
+            ttl: 50,
+            dest: orig,
+        };
+        tx_buf[..hdr_len].copy_from_slice(req_hdr.as_bytes());
+        self.cert_req_tx_rate.observe(now, 0);
+        Some(LinkFrameData {
+            dst: via,
+            protocol: ETH_P_BATMAN,
+            payload: &tx_buf[..hdr_len + body_len],
+        })
+    }
+
+    /// Dispatch a [`RoutingAction::Consumed`]: the engine absorbed the frame,
+    /// so nothing is delivered locally and the only question left is whether
+    /// anything goes back out.
+    ///
+    /// Two things can claim the single transmit slot. Either the engine wrote
+    /// a re-flood into `reply`, or — the common case, where it wrote nothing
+    /// and the slot is free — the node opportunistically flushes a parked
+    /// `CertReply` ([`flush_parked_cert_reply`](Self::flush_parked_cert_reply)).
+    fn on_consumed<'rx, 'tx>(
+        &mut self,
+        now: Duration,
+        iface_idx: usize,
+        frame: &'rx LinkFrame,
+        reply: LinkFrameDataMut<'tx>,
+    ) -> RxOutcome<'rx, 'tx> {
+        if reply.protocol != 0 {
+            // A re-flood of an OGM *is* advertising its originator as
+            // reachable through us. Suppress it when the OGM arrived on a
+            // link we can't send data onto (`tx_data` off): we could never
+            // deliver to that originator, so advertising a route to it would
+            // black-hole any peer that then routed through us. The engine has
+            // already learned it into our local table (surfaced via the
+            // management API); we simply don't propagate it. See
+            // [`LinkFeatures::tx_data`](crate::features::LinkFeatures::tx_data).
+            if frame.payload.first() == Some(&BATADV_IV_OGM)
+                && !self.link_features(iface_idx).tx_data
+            {
+                trace!("drop: not re-advertising an OGM learned on a tx_data-off link");
+                return RxOutcome::empty();
+            }
+            return RxOutcome {
+                forward: Self::engine_reply_frame(frame, reply),
+                deliver_local: None,
+            };
+        }
+        RxOutcome {
+            forward: self.flush_parked_cert_reply(now, frame, reply),
+            deliver_local: None,
+        }
+    }
+
+    /// Opportunistically flush a parked `CertReply` after an OGM that itself
+    /// needed no re-flood (leaving the transmit slot free), now that
+    /// verifying that OGM (re)confirms a route back to its originator (design
+    /// doc §3.3/§5.4).
+    ///
+    /// A genuine re-flood always wins the slot, and a skipped flush here is
+    /// not a correctness issue — the requester's own retry
+    /// ([`OgmAuth::build_cert_request`](auth::OgmAuth::build_cert_request))
+    /// is the backstop.
+    fn flush_parked_cert_reply<'tx>(
+        &mut self,
+        now: Duration,
+        frame: &LinkFrame,
+        mut reply: LinkFrameDataMut<'tx>,
+    ) -> Option<LinkFrameData<'tx>> {
+        if frame.payload.first() != Some(&BATADV_IV_OGM) {
+            return None;
+        }
+        let (ogm, _) = batman::wire::BatmanOgmPacket::ref_from_prefix(&frame.payload).ok()?;
+        let auth = self.auth.as_mut()?;
+        let (next, total) =
+            Self::try_flush_pending_cert_reply(auth, &self.batman, now, ogm.orig, &mut reply)?;
+        self.cert_reply_tx_rate.observe(now, 0);
+        Some(LinkFrameData {
+            dst: next,
+            protocol: ETH_P_BATMAN,
+            payload: &reply.payload[..total],
+        })
+    }
+
+    /// Dispatch a [`RoutingAction::DeliverLocal`]: this node is the packet's
+    /// final destination.
+    ///
+    /// Most sub-types are handed up to the local host with the BATMAN header
+    /// that carried them stripped, but the two lazy-cert control packets
+    /// terminate in this node's own auth state and never reach the host TAP.
+    fn on_deliver_local<'rx, 'tx>(
+        &mut self,
+        now: Duration,
+        frame: &'rx LinkFrame,
+        reply: LinkFrameDataMut<'tx>,
+    ) -> RxOutcome<'rx, 'tx> {
+        match frame.payload.first() {
+            Some(&BATADV_CERT_REPLY) => {
+                // Verify against the trust anchor, confirm it answers an
+                // outstanding request, and cache it.
+                if let Some(auth) = self.auth.as_mut() {
+                    let body = frame
+                        .payload
+                        .get(Self::inner_offset(&frame.payload)..)
+                        .unwrap_or(&[]);
+                    auth.ingest_cert_reply(body);
+                }
+                RxOutcome::empty()
+            }
+            Some(&BATADV_CERT_REQ) => RxOutcome {
+                forward: self.answer_cert_request(now, frame, reply),
+                deliver_local: None,
+            },
+            _ => RxOutcome {
+                forward: None,
+                deliver_local: frame.payload.get(Self::inner_offset(&frame.payload)..),
+            },
+        }
+    }
+
+    /// Answer a received `CertReq`: this node is the originator whose cert
+    /// was asked for (the terminal-only responder — an intermediate holder
+    /// answering early is a deferred optimization).
+    ///
+    /// Verifies the requester's self-authenticating body, then either answers
+    /// immediately, when a route back exists and the reply fits the transmit
+    /// buffer, or parks it for the opportunistic flush in
+    /// [`flush_parked_cert_reply`](Self::flush_parked_cert_reply) once
+    /// verifying one of the requester's OGMs confirms a route back.
+    fn answer_cert_request<'tx>(
+        &mut self,
+        now: Duration,
+        frame: &LinkFrame,
+        reply: LinkFrameDataMut<'tx>,
+    ) -> Option<LinkFrameData<'tx>> {
+        let body = frame
+            .payload
+            .get(Self::inner_offset(&frame.payload)..)
+            .unwrap_or(&[]);
+        let requester = self
+            .auth
+            .as_mut()
+            .and_then(|auth| auth.verify_cert_request(body))?;
+
+        let hdr_len = core::mem::size_of::<BatmanCertReplyPacket>();
+        #[expect(
+            clippy::expect_used,
+            reason = "requester came from self.auth.verify_cert_request, so auth must still be Some"
+        )]
+        let own_cert = *self
+            .auth
+            .as_ref()
+            .expect("auth present: requester was just verified through it")
+            .own_cert();
+        let cert_bytes = own_cert.as_bytes();
+        let total = hdr_len + cert_bytes.len();
+
+        match self.batman.next_hop(now, requester) {
+            Some(next) if total <= reply.payload.len() => {
+                let reply_hdr = BatmanCertReplyPacket {
+                    packet_type: BATADV_CERT_REPLY,
+                    version: 5,
+                    ttl: 50,
+                    dest: requester,
+                };
+                reply.payload[..hdr_len].copy_from_slice(reply_hdr.as_bytes());
+                reply.payload[hdr_len..total].copy_from_slice(cert_bytes);
+                self.cert_reply_tx_rate.observe(now, 0);
+                return Some(LinkFrameData {
+                    dst: next,
+                    protocol: ETH_P_BATMAN,
+                    payload: &reply.payload[..total],
+                });
+            }
+            Some(_) => {
+                // A route exists, but the reply doesn't fit the transmit
+                // buffer — a local MTU misconfiguration (own cert + header is
+                // a fixed ~165 bytes), not "no route yet". Parking it
+                // wouldn't help (the opportunistic flush hits the same
+                // buffer), but the requester's own retry is a harmless no-op
+                // backstop either way, so park it anyway rather than add a
+                // second silent-drop path.
+                debug!(
+                    total,
+                    buf_len = reply.payload.len(),
+                    "auth: cert reply does not fit the transmit buffer"
+                );
+            }
+            None => {
+                trace!(?requester, "auth: no route to cert requester yet");
+            }
+        }
+        if let Some(auth) = self.auth.as_mut() {
+            auth.park_pending_reply(requester);
+        }
+        None
+    }
+
+    /// Wrap the outgoing frame the engine wrote into `reply` as a borrowed
+    /// [`LinkFrameData`], or `None` when it wrote nothing (`protocol == 0`).
+    ///
+    /// The payload is trimmed to the size of the frame that provoked it so
+    /// that the trailing zeros of the transmit scratchpad are never put on
+    /// the wire.
+    fn engine_reply_frame<'tx>(
+        frame: &LinkFrame,
+        reply: LinkFrameDataMut<'tx>,
+    ) -> Option<LinkFrameData<'tx>> {
+        if reply.protocol == 0 {
+            return None;
+        }
+        let len = frame.payload.len().min(reply.payload.len());
+        Some(LinkFrameData {
+            dst: reply.dst,
+            protocol: reply.protocol,
+            payload: &reply.payload[..len],
+        })
     }
 
     /// Byte offset of the inner (host) payload within a BATMAN packet payload,
