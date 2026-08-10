@@ -10,14 +10,11 @@ use tracing_subscriber::EnvFilter;
 use wayfinder::DEFAULT_BATMAN_ETHER_TYPE;
 use wayfinder::EgressInterface;
 use wayfinder::batman::MAX_MISSED_OGMS;
-use wayfinder::batman::wire::BATADV_CERT_REPLY;
-use wayfinder::batman::wire::BATADV_CERT_REQ;
-use wayfinder::batman::wire::BATADV_IV_OGM;
-use wayfinder::batman::wire::BATADV_KEEPALIVE;
 use wayfinder::batman::wire::BatmanCertReplyPacket;
 use wayfinder::batman::wire::BatmanCertReqPacket;
 use wayfinder::batman::wire::BatmanKeepAlivePacket;
 use wayfinder::batman::wire::BatmanOgmPacket;
+use wayfinder::batman::wire::BatmanPacketType;
 use wayfinder::batman::wire::BatmanTvlvHdr;
 use wayfinder::batman::wire::TvlvType;
 use wayfinder::batman::wire::find_tvlv;
@@ -41,7 +38,7 @@ use crate::switch::TapConfig;
 fn is_ogm_frame(frame: &[u8]) -> bool {
     frame.len() > 14
         && frame[12..14] == DEFAULT_BATMAN_ETHER_TYPE.to_be_bytes()
-        && frame[14] == BATADV_IV_OGM
+        && frame[14] == BatmanPacketType::Ogm.as_u8()
 }
 
 /// Install a tap on every port of every switch in `harness` that counts each
@@ -90,7 +87,7 @@ fn build_ogm_wire_frame(src: u8, tq: u8, seqno: u32) -> Vec<u8> {
 /// Wire layout: `[relay:6][BROADCAST:6][proto:2 NE][BatmanOgmPacket { orig, tq, .. }]`.
 fn build_relayed_ogm_wire_frame(relay: u8, orig: u8, tq: u8, seqno: u32) -> Vec<u8> {
     let ogm = BatmanOgmPacket {
-        packet_type: BATADV_IV_OGM,
+        packet_type: BatmanPacketType::Ogm.as_u8(),
         version: 5,
         ttl: 50,
         flags: 0,
@@ -115,7 +112,7 @@ fn build_relayed_ogm_wire_frame(relay: u8, orig: u8, tq: u8, seqno: u32) -> Vec<
 /// Wire layout: `[src:6][BROADCAST:6][proto:2 NE][BatmanKeepAlivePacket]`.
 fn build_keepalive_wire_frame(src: u8) -> Vec<u8> {
     let pkt = BatmanKeepAlivePacket {
-        packet_type: BATADV_KEEPALIVE,
+        packet_type: BatmanPacketType::Keepalive.as_u8(),
         version: 5,
     };
     build_frame(
@@ -668,7 +665,7 @@ fn cert_req_relays_across_the_mesh_and_does_not_reach_the_host() {
                         if meta.direction == Direction::ToSwitch
                             && meta.data.len() > 14
                             && meta.data[12..14] == DEFAULT_BATMAN_ETHER_TYPE.to_be_bytes()
-                            && meta.data[14] == BATADV_CERT_REQ
+                            && meta.data[14] == BatmanPacketType::CertReq.as_u8()
                         {
                             let (hdr, _) =
                                 BatmanCertReqPacket::ref_from_prefix(&meta.data[14..]).unwrap();
@@ -687,7 +684,7 @@ fn cert_req_relays_across_the_mesh_and_does_not_reach_the_host() {
     // requester would produce.
     let (raw_port, _port_id) = harness.add_switch_port("switch1");
     let cert_req_hdr = BatmanCertReqPacket {
-        packet_type: BATADV_CERT_REQ,
+        packet_type: BatmanPacketType::CertReq.as_u8(),
         version: 5,
         ttl: 10,
         dest: m3,
@@ -2124,7 +2121,7 @@ fn real_keepalive_tick_switches_route_when_it_stops() {
                         if meta.direction == Direction::ToSwitch
                             && meta.data.len() > 14
                             && meta.data[12..14] == DEFAULT_BATMAN_ETHER_TYPE.to_be_bytes()
-                            && meta.data[14] == BATADV_KEEPALIVE
+                            && meta.data[14] == BatmanPacketType::Keepalive.as_u8()
                         {
                             ka_counter.fetch_add(1, Ordering::Relaxed);
                         }
@@ -2374,7 +2371,7 @@ fn cert_fetch_round_trip_resolves_via_seeded_first_hop() {
                         if meta.direction == Direction::ToSwitch
                             && meta.data.len() > 14
                             && meta.data[12..14] == DEFAULT_BATMAN_ETHER_TYPE.to_be_bytes()
-                            && meta.data[14] == BATADV_CERT_REQ
+                            && meta.data[14] == BatmanPacketType::CertReq.as_u8()
                         {
                             cert_req_seen.fetch_add(1, Ordering::Relaxed);
                         }
@@ -2390,7 +2387,7 @@ fn cert_fetch_round_trip_resolves_via_seeded_first_hop() {
     let ogm_hdr_len = core::mem::size_of::<BatmanOgmPacket>();
     let mut ogm_buf = vec![0u8; 512];
     let ogm = BatmanOgmPacket {
-        packet_type: BATADV_IV_OGM,
+        packet_type: BatmanPacketType::Ogm.as_u8(),
         version: 5,
         ttl: 50,
         flags: 0,
@@ -2444,7 +2441,7 @@ fn cert_fetch_round_trip_resolves_via_seeded_first_hop() {
     // exercised end to end): reply with A's cert, injected at switch1 and
     // relayed for real through X to B.
     let reply_hdr = BatmanCertReplyPacket {
-        packet_type: BATADV_CERT_REPLY,
+        packet_type: BatmanPacketType::CertReply.as_u8(),
         version: 5,
         ttl: 50,
         dest: m3,
@@ -2527,7 +2524,7 @@ fn cert_fetch_round_trip_with_real_responder() {
     let b_ogm_hdr_len = core::mem::size_of::<BatmanOgmPacket>();
     let mut b_ogm_buf = vec![0u8; 512];
     let b_ogm = BatmanOgmPacket {
-        packet_type: BATADV_IV_OGM,
+        packet_type: BatmanPacketType::Ogm.as_u8(),
         version: 5,
         ttl: 50,
         flags: 0,
@@ -2574,7 +2571,7 @@ fn cert_fetch_round_trip_with_real_responder() {
     let ogm_hdr_len = core::mem::size_of::<BatmanOgmPacket>();
     let mut ogm_buf = vec![0u8; 512];
     let ogm = BatmanOgmPacket {
-        packet_type: BATADV_IV_OGM,
+        packet_type: BatmanPacketType::Ogm.as_u8(),
         version: 5,
         ttl: 50,
         flags: 0,

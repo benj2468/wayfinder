@@ -111,7 +111,7 @@ committed `docker-compose.yml` is a snapshot of the default topology, so plain
 how the mesh and the application hold up under a storm of flooded frames. It
 `docker compose exec`s `ping` at the subnet broadcast address, so every frame
 goes to the all-ones MAC and the router floods it out *every* mesh interface
-(the `BATADV_BCAST` path). Egress is pinned to the host TAP with `ping -I
+(the `BatmanPacketType::Bcast` path). Egress is pinned to the host TAP with `ping -I
 wayfinder0`, so the traffic enters the mesh through the node — it never leaks
 straight onto the `eth*` segment NICs.
 

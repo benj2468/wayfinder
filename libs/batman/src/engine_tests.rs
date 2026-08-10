@@ -7,11 +7,9 @@ use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
 use crate::BatmanEngine;
-use crate::wire::BATADV_BCAST;
-use crate::wire::BATADV_IV_OGM;
-use crate::wire::BATADV_UNICAST;
 use crate::wire::BatmanBroadcastPacket;
 use crate::wire::BatmanOgmPacket;
+use crate::wire::BatmanPacketType;
 use crate::wire::BatmanUnicastPacket;
 use crate::wire::ETH_P_BATMAN;
 
@@ -41,7 +39,7 @@ fn parse_link_frame(data: &[u8]) -> &LinkFrame {
 // Helper to create an OGM packet
 fn make_ogm(orig: u8, seqno: u32, tq: u8, ttl: u8) -> Vec<u8> {
     let ogm = BatmanOgmPacket {
-        packet_type: BATADV_IV_OGM,
+        packet_type: BatmanPacketType::Ogm.as_u8(),
         version: 5,
         ttl,
         flags: 0,
@@ -58,7 +56,7 @@ fn make_ogm(orig: u8, seqno: u32, tq: u8, ttl: u8) -> Vec<u8> {
 fn make_unicast(dest: u8, ttl: u8, payload: &[u8]) -> Vec<u8> {
     let mut data = Vec::new();
     let unicast = BatmanUnicastPacket {
-        packet_type: BATADV_UNICAST,
+        packet_type: BatmanPacketType::Unicast.as_u8(),
         version: 5,
         ttl,
         dest: mac(dest),
@@ -73,7 +71,7 @@ fn make_unicast(dest: u8, ttl: u8, payload: &[u8]) -> Vec<u8> {
 fn make_broadcast(orig: u8, seqno: u32, ttl: u8, inner: &[u8]) -> Vec<u8> {
     let mut data = Vec::new();
     let bcast = BatmanBroadcastPacket {
-        packet_type: BATADV_BCAST,
+        packet_type: BatmanPacketType::Bcast.as_u8(),
         version: 5,
         ttl,
         seqno: seqno.to_be(), // Network byte order, like the OGM seqno
@@ -100,7 +98,7 @@ mod ogm_generation {
             .unwrap();
         let (ogm, _) = BatmanOgmPacket::ref_from_prefix(ogm_bytes).unwrap();
 
-        assert_eq!(ogm.packet_type, BATADV_IV_OGM);
+        assert_eq!(ogm.packet_type, BatmanPacketType::Ogm.as_u8());
         assert_eq!(ogm.version, 5);
         assert_eq!(ogm.ttl, 50);
         assert_eq!(ogm.tq, 255); // Maximum quality at origin
@@ -734,7 +732,12 @@ mod protocol_filtering {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
 
         // Send truncated OGM packet
-        let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, vec![BATADV_IV_OGM, 5, 50]);
+        let frame_bytes = make_link_frame(
+            2,
+            0xff,
+            ETH_P_BATMAN,
+            vec![BatmanPacketType::Ogm.as_u8(), 5, 50],
+        );
         let frame = parse_link_frame(&frame_bytes);
 
         let mut reply_buffer = [0u8; 256];
@@ -894,7 +897,7 @@ mod broadcast_processing {
         assert_eq!(reply.protocol, ETH_P_BATMAN);
 
         let (out, rest) = BatmanBroadcastPacket::ref_from_prefix(reply.payload).unwrap();
-        assert_eq!(out.packet_type, BATADV_BCAST);
+        assert_eq!(out.packet_type, BatmanPacketType::Bcast.as_u8());
         assert_eq!(out.orig, mac(2)); // originator unchanged through the relay
         let seqno = out.seqno;
         assert_eq!(seqno, 100u32.to_be()); // seqno unchanged
@@ -1035,7 +1038,7 @@ mod ogm_tvlv {
         let tvlv = tvlv_record(0x05, &value);
 
         let ogm = BatmanOgmPacket {
-            packet_type: BATADV_IV_OGM,
+            packet_type: BatmanPacketType::Ogm.as_u8(),
             version: 5,
             ttl: 50,
             flags: 0,
@@ -1070,7 +1073,7 @@ mod ogm_tvlv {
 
         // OGM originated by node 3, relayed to us by node 2, TTL to spare.
         let ogm = BatmanOgmPacket {
-            packet_type: BATADV_IV_OGM,
+            packet_type: BatmanPacketType::Ogm.as_u8(),
             version: 5,
             ttl: 50,
             flags: 0,
@@ -1148,7 +1151,7 @@ mod mcast_membership {
     fn ogm_with_groups(orig: u8, seqno: u32, groups: &[Mac]) -> Vec<u8> {
         let tvlv = mcast_tvlv(groups);
         let ogm = BatmanOgmPacket {
-            packet_type: BATADV_IV_OGM,
+            packet_type: BatmanPacketType::Ogm.as_u8(),
             version: 5,
             ttl: 50,
             flags: 0,
@@ -1245,19 +1248,18 @@ mod mcast_membership {
 
 #[cfg(test)]
 mod mcast_packet {
-    //! The dedicated `BATADV_MCAST` packet type (batman-adv's
-    //! `batadv_mcast_packet`).  A multicast frame is delivered to each
-    //! interested originator as its own `BATADV_MCAST` packet, routed toward
+    //! The dedicated `BatmanPacketType::Mcast` packet type (batman-adv's
+    //! `BatmanPacketType::Mcast_packet`).  A multicast frame is delivered to each
+    //! interested originator as its own `BatmanPacketType::Mcast` packet, routed toward
     //! that node like a unicast and delivered locally on arrival.
 
     use super::*;
-    use crate::wire::BATADV_MCAST;
     use crate::wire::BatmanMcastPacket;
 
-    /// Build a BATADV_MCAST packet addressed to `dest`, wrapping `payload`.
+    /// Build a BatmanPacketType::Mcast packet addressed to `dest`, wrapping `payload`.
     fn make_mcast(dest: u8, ttl: u8, payload: &[u8]) -> Vec<u8> {
         let hdr = BatmanMcastPacket {
-            packet_type: BATADV_MCAST,
+            packet_type: BatmanPacketType::Mcast.as_u8(),
             version: 5,
             ttl,
             dest: mac(dest),
@@ -1267,7 +1269,7 @@ mod mcast_packet {
         data
     }
 
-    /// A BATADV_MCAST packet addressed to us is delivered to the local host
+    /// A BatmanPacketType::Mcast packet addressed to us is delivered to the local host
     /// (the inner multicast frame is handed up), like a unicast-for-self.
     #[test]
     fn mcast_for_self_delivers_local() {
@@ -1284,7 +1286,7 @@ mod mcast_packet {
         assert!(matches!(action, RoutingAction::DeliverLocal));
     }
 
-    /// An intermediate node forwards a BATADV_MCAST packet toward the next hop
+    /// An intermediate node forwards a BatmanPacketType::Mcast packet toward the next hop
     /// for its destination, decrementing TTL and preserving the inner payload.
     #[test]
     fn mcast_forwarded_to_next_hop() {
@@ -1302,7 +1304,7 @@ mod mcast_packet {
             &mut reply,
         );
 
-        // A BATADV_MCAST packet for node 5 arrives; forward it toward node 2.
+        // A BatmanPacketType::Mcast packet for node 5 arrives; forward it toward node 2.
         let payload = make_mcast(5, 10, b"group data");
         let frame_bytes = make_link_frame(3, 1, ETH_P_BATMAN, payload);
         let action = engine.handle_rx(
@@ -1316,7 +1318,7 @@ mod mcast_packet {
         assert_eq!(reply.dst, mac(2)); // next hop toward node 5
         assert_eq!(reply.protocol, ETH_P_BATMAN);
         let (fwd, rest) = BatmanMcastPacket::ref_from_prefix(reply.payload).unwrap();
-        assert_eq!(fwd.packet_type, BATADV_MCAST);
+        assert_eq!(fwd.packet_type, BatmanPacketType::Mcast.as_u8());
         assert_eq!(fwd.dest, mac(5)); // final destination unchanged
         assert_eq!(fwd.ttl, 9); // decremented from 10
         assert_eq!(&rest[..b"group data".len()], b"group data");
@@ -1362,22 +1364,20 @@ mod mcast_packet {
 
 #[cfg(test)]
 mod cert_forwarding {
-    //! The lazy-cert-distribution control packets (`BATADV_CERT_REQ` /
-    //! `BATADV_CERT_REPLY`), structurally identical to `BATADV_UNICAST` and
+    //! The lazy-cert-distribution control packets (`BatmanPacketType::CertReq` /
+    //! `BatmanPacketType::CertReply`), structurally identical to `BatmanPacketType::Unicast` and
     //! routed the same way: delivered locally on arrival at `dest`, relayed
     //! toward the next live hop otherwise. Crypto-free at the engine layer —
     //! the engine only moves bytes; verification lives in the router's auth
     //! state.
 
     use super::*;
-    use crate::wire::BATADV_CERT_REPLY;
-    use crate::wire::BATADV_CERT_REQ;
     use crate::wire::BatmanCertReplyPacket;
     use crate::wire::BatmanCertReqPacket;
 
     fn make_cert_req(dest: u8, ttl: u8, payload: &[u8]) -> Vec<u8> {
         let hdr = BatmanCertReqPacket {
-            packet_type: BATADV_CERT_REQ,
+            packet_type: BatmanPacketType::CertReq.as_u8(),
             version: 5,
             ttl,
             dest: mac(dest),
@@ -1389,7 +1389,7 @@ mod cert_forwarding {
 
     fn make_cert_reply(dest: u8, ttl: u8, payload: &[u8]) -> Vec<u8> {
         let hdr = BatmanCertReplyPacket {
-            packet_type: BATADV_CERT_REPLY,
+            packet_type: BatmanPacketType::CertReply.as_u8(),
             version: 5,
             ttl,
             dest: mac(dest),
@@ -1399,7 +1399,7 @@ mod cert_forwarding {
         data
     }
 
-    /// A `BATADV_CERT_REQ` addressed to us is delivered locally (to the
+    /// A `BatmanPacketType::CertReq` addressed to us is delivered locally (to the
     /// router's auth state), like a unicast-for-self.
     #[test]
     fn cert_req_for_self_delivers_local() {
@@ -1416,7 +1416,7 @@ mod cert_forwarding {
         assert!(matches!(action, RoutingAction::DeliverLocal));
     }
 
-    /// An intermediate node forwards a `BATADV_CERT_REQ` toward the next hop
+    /// An intermediate node forwards a `BatmanPacketType::CertReq` toward the next hop
     /// for the requested originator, decrementing TTL and preserving the
     /// requester's cert+signature body.
     #[test]
@@ -1449,7 +1449,7 @@ mod cert_forwarding {
         assert_eq!(reply.dst, mac(2)); // next hop toward node 5
         assert_eq!(reply.protocol, ETH_P_BATMAN);
         let (fwd, rest) = BatmanCertReqPacket::ref_from_prefix(reply.payload).unwrap();
-        assert_eq!(fwd.packet_type, BATADV_CERT_REQ);
+        assert_eq!(fwd.packet_type, BatmanPacketType::CertReq.as_u8());
         assert_eq!(fwd.dest, mac(5)); // final destination unchanged
         assert_eq!(fwd.ttl, 9); // decremented from 10
         assert_eq!(&rest[..b"cert body".len()], b"cert body");
@@ -1491,7 +1491,7 @@ mod cert_forwarding {
         assert_eq!(engine.relay_oversize_drops(), 1);
     }
 
-    /// A `BATADV_CERT_REPLY` addressed to us is delivered locally.
+    /// A `BatmanPacketType::CertReply` addressed to us is delivered locally.
     #[test]
     fn cert_reply_for_self_delivers_local() {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
@@ -1507,7 +1507,7 @@ mod cert_forwarding {
         assert!(matches!(action, RoutingAction::DeliverLocal));
     }
 
-    /// An intermediate node forwards a `BATADV_CERT_REPLY` toward the next hop
+    /// An intermediate node forwards a `BatmanPacketType::CertReply` toward the next hop
     /// for the original requester, decrementing TTL and preserving the cert
     /// body.
     #[test]
@@ -1540,7 +1540,7 @@ mod cert_forwarding {
         assert_eq!(reply.dst, mac(2)); // next hop toward node 5
         assert_eq!(reply.protocol, ETH_P_BATMAN);
         let (fwd, rest) = BatmanCertReplyPacket::ref_from_prefix(reply.payload).unwrap();
-        assert_eq!(fwd.packet_type, BATADV_CERT_REPLY);
+        assert_eq!(fwd.packet_type, BatmanPacketType::CertReply.as_u8());
         assert_eq!(fwd.dest, mac(5));
         assert_eq!(fwd.ttl, 9);
         assert_eq!(&rest[..b"cert body".len()], b"cert body");
@@ -1582,7 +1582,7 @@ mod cert_forwarding {
         assert_eq!(engine.relay_oversize_drops(), 1);
     }
 
-    /// A `BATADV_CERT_REQ` with an expired TTL is dropped rather than
+    /// A `BatmanPacketType::CertReq` with an expired TTL is dropped rather than
     /// relayed, mirroring `unicast_forwarding::test_unicast_ttl_expiration`.
     #[test]
     fn cert_req_ttl_expiration() {
@@ -1617,7 +1617,7 @@ mod cert_forwarding {
         assert_eq!(reply.protocol, 0); // not forwarded, TTL expired
     }
 
-    /// A `BATADV_CERT_REQ` for an unknown destination is dropped, mirroring
+    /// A `BatmanPacketType::CertReq` for an unknown destination is dropped, mirroring
     /// `unicast_forwarding::test_unicast_unknown_destination`.
     #[test]
     fn cert_req_unknown_destination() {
@@ -1638,7 +1638,7 @@ mod cert_forwarding {
         assert_eq!(reply.protocol, 0); // no route known
     }
 
-    /// A `BATADV_CERT_REPLY` with an expired TTL is dropped rather than
+    /// A `BatmanPacketType::CertReply` with an expired TTL is dropped rather than
     /// relayed.
     #[test]
     fn cert_reply_ttl_expiration() {
@@ -1673,7 +1673,7 @@ mod cert_forwarding {
         assert_eq!(reply.protocol, 0); // not forwarded, TTL expired
     }
 
-    /// A `BATADV_CERT_REPLY` for an unknown destination is dropped.
+    /// A `BatmanPacketType::CertReply` for an unknown destination is dropped.
     #[test]
     fn cert_reply_unknown_destination() {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
@@ -1832,7 +1832,7 @@ mod keepalive_deprioritization {
     /// Feed one keep-alive heartbeat from immediate neighbor `via` at `now`.
     fn feed_keepalive(engine: &mut BatmanEngine<8>, via: u8, now: Duration) {
         let pkt = crate::wire::BatmanKeepAlivePacket {
-            packet_type: crate::wire::BATADV_KEEPALIVE,
+            packet_type: crate::wire::BatmanPacketType::Keepalive.as_u8(),
             version: 5,
         };
         use zerocopy::IntoBytes;

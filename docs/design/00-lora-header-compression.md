@@ -223,8 +223,8 @@ explicit discovery sub-protocol is needed.
 
 ## 6. Savings analysis
 
-For a typical small BATMAN unicast (e.g. an ARP-in-`BATADV_UNICAST`, payload
-~30 bytes), header overhead drops from 14 → 1 frame bytes, i.e. **28 → 2 on-air
+For a typical small BATMAN unicast (e.g. an ARP-in-`BatmanPacketType::Unicast`,
+payload ~30 bytes), header overhead drops from 14 → 1 frame bytes, i.e. **28 → 2 on-air
 characters** — roughly a 30% airtime reduction on a 60-char frame, and larger
 for smaller payloads. OGMs (broadcast) drop 14 → 7, ~halving their header.
 

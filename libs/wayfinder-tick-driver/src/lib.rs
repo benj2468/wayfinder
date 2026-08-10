@@ -363,9 +363,8 @@ impl Driver {
 #[cfg(test)]
 mod tests {
     use wayfinder::DEFAULT_BATMAN_ETHER_TYPE;
-    use wayfinder::batman::wire::BATADV_IV_OGM;
-    use wayfinder::batman::wire::BATADV_KEEPALIVE;
     use wayfinder::batman::wire::BatmanOgmPacket;
+    use wayfinder::batman::wire::BatmanPacketType;
 
     use super::*;
 
@@ -387,7 +386,7 @@ mod tests {
     /// TVLVs (auth off) — enough for the engine to re-flood it.
     fn bare_ogm_bytes(orig: Mac, seqno: u32, ttl: u8) -> Vec<u8> {
         let ogm = BatmanOgmPacket {
-            packet_type: BATADV_IV_OGM,
+            packet_type: BatmanPacketType::Ogm.as_u8(),
             version: 5,
             ttl,
             flags: 0,
@@ -531,7 +530,7 @@ mod tests {
         assert_eq!(parsed.protocol.get(), DEFAULT_BATMAN_ETHER_TYPE);
         assert_eq!(
             parsed.payload.first(),
-            Some(&wayfinder::batman::wire::BATADV_KEEPALIVE)
+            Some(&BatmanPacketType::Keepalive.as_u8())
         );
     }
 
@@ -549,7 +548,7 @@ mod tests {
             let parsed = LinkFrame::ref_from_bytes(&frame).unwrap();
             assert_ne!(
                 parsed.payload.first(),
-                Some(&wayfinder::batman::wire::BATADV_KEEPALIVE),
+                Some(&BatmanPacketType::Keepalive.as_u8()),
                 "no interface has tx_keepalive configured"
             );
         }
@@ -613,22 +612,22 @@ mod tests {
         driver.tick_schedules(now, true, false);
         let types = drain_packet_types(&mut driver);
         assert!(
-            types.contains(&BATADV_IV_OGM),
+            types.contains(&BatmanPacketType::Ogm.as_u8()),
             "the OGM schedule ran: {types:?}"
         );
         assert!(
-            !types.contains(&BATADV_KEEPALIVE),
+            !types.contains(&BatmanPacketType::Keepalive.as_u8()),
             "the keep-alive schedule was suppressed: {types:?}"
         );
 
         driver.tick_schedules(now, false, true);
         let types = drain_packet_types(&mut driver);
         assert!(
-            types.contains(&BATADV_KEEPALIVE),
+            types.contains(&BatmanPacketType::Keepalive.as_u8()),
             "the keep-alive schedule ran on its own: {types:?}"
         );
         assert!(
-            !types.contains(&BATADV_IV_OGM),
+            !types.contains(&BatmanPacketType::Ogm.as_u8()),
             "and did not re-run the OGM schedule: {types:?}"
         );
     }

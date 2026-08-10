@@ -614,8 +614,8 @@ impl<
 mod tests {
     use super::*;
     use wayfinder::CentralRouter;
-    use wayfinder::batman::wire::BATADV_IV_OGM;
     use wayfinder::batman::wire::BatmanOgmPacket;
+    use wayfinder::batman::wire::BatmanPacketType;
     use wayfinder::interfaces::frame::LinkFrame;
     use wayfinder::interfaces::frame::Mac;
     use wayfinder_protos::service::LinkFeaturesData;
@@ -661,7 +661,7 @@ mod tests {
     /// path.  A full TTL makes it a direct path.
     fn feed_direct_ogm(router: &mut CentralRouter, orig: Mac, seqno: u32, tq: u8) {
         let ogm = BatmanOgmPacket {
-            packet_type: BATADV_IV_OGM,
+            packet_type: BatmanPacketType::Ogm.as_u8(),
             version: 5,
             ttl: 50,
             flags: 0,
@@ -1149,7 +1149,7 @@ mod tests {
         let mut peer_auth = OgmAuth::new(kp2, cert2, anchor);
         peer_auth.set_time(100);
         let ogm = BatmanOgmPacket {
-            packet_type: BATADV_IV_OGM,
+            packet_type: BatmanPacketType::Ogm.as_u8(),
             version: 5,
             ttl: 50,
             flags: 0,
@@ -1317,7 +1317,7 @@ mod tests {
         let mut peer_auth = OgmAuth::new(kp2, cert2, anchor);
         peer_auth.set_time(100);
         let ogm = BatmanOgmPacket {
-            packet_type: BATADV_IV_OGM,
+            packet_type: BatmanPacketType::Ogm.as_u8(),
             version: 5,
             ttl: 50,
             flags: 0,

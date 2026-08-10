@@ -19,8 +19,8 @@
 //! pairwise tag keyed off the neighbor keys this module caches.
 //!
 //! **Scope (read before trusting this boundary):** this authenticates *OGMs*
-//! only.  Data-plane batman frames — `BATADV_BCAST` (flooded ARP etc.),
-//! `BATADV_UNICAST`, `BATADV_MCAST` — are **not** authenticated yet, so an
+//! only.  Data-plane batman frames — `BatmanPacketType::Bcast` (flooded ARP etc.),
+//! `BatmanPacketType::Unicast`, `BatmanPacketType::Mcast` — are **not** authenticated yet, so an
 //! outsider can still inject/transit those (e.g. a broadcast flood) on an
 //! auth-enabled mesh.  Segregation here is *control-plane* (a foreign node
 //! cannot influence routing); full data-plane segregation arrives with the
@@ -1332,10 +1332,9 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use batman::wire::BATADV_IV_OGM;
-    use batman::wire::BATADV_KEEPALIVE;
     use batman::wire::BatmanKeepAlivePacket;
     use batman::wire::BatmanOgmPacket;
+    use batman::wire::BatmanPacketType;
     use wayfinder_auth::Authority;
 
     fn mac(n: u8) -> Mac {
@@ -1346,7 +1345,7 @@ mod tests {
     /// returning `(buf, len)` with generous trailing capacity for augmentation.
     fn bare_ogm(orig: Mac, seqno: u32) -> ([u8; 512], usize) {
         let ogm = BatmanOgmPacket {
-            packet_type: BATADV_IV_OGM,
+            packet_type: BatmanPacketType::Ogm.as_u8(),
             version: 5,
             ttl: 50,
             flags: 0,
@@ -1366,7 +1365,7 @@ mod tests {
     /// augmentation.
     fn bare_keepalive() -> ([u8; 128], usize) {
         let pkt = BatmanKeepAlivePacket {
-            packet_type: BATADV_KEEPALIVE,
+            packet_type: BatmanPacketType::Keepalive.as_u8(),
             version: 5,
         };
         let mut buf = [0u8; 128];
@@ -2022,7 +2021,7 @@ mod tests {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut a = member(&authority, 2, mac(2), 1000);
         let mut buf = [0u8; 4]; // header + far too little room for the trailer
-        buf[0] = BATADV_KEEPALIVE;
+        buf[0] = BatmanPacketType::Keepalive.as_u8();
         buf[1] = 5;
         assert!(a.augment_keepalive(&mut buf, 2).is_none());
     }

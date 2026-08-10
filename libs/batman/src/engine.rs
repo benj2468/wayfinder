@@ -14,18 +14,12 @@ use crate::KeepAliveStats;
 use crate::NeighborStats;
 use crate::OriginatorRecord;
 use crate::TrickleTimer;
-use crate::wire::BATADV_BCAST;
-use crate::wire::BATADV_CERT_REPLY;
-use crate::wire::BATADV_CERT_REQ;
-use crate::wire::BATADV_IV_OGM;
-use crate::wire::BATADV_KEEPALIVE;
-use crate::wire::BATADV_MCAST;
-use crate::wire::BATADV_UNICAST;
 use crate::wire::BatmanBroadcastPacket;
 use crate::wire::BatmanCertReplyPacket;
 use crate::wire::BatmanCertReqPacket;
 use crate::wire::BatmanMcastPacket;
 use crate::wire::BatmanOgmPacket;
+use crate::wire::BatmanPacketType;
 use crate::wire::BatmanTvlvHdr;
 use crate::wire::BatmanUnicastPacket;
 use crate::wire::ETH_P_BATMAN;
@@ -587,7 +581,7 @@ impl<
     // logic stays separate from the dispatch and each type can be read in
     // isolation.
 
-    /// Route an incoming OGM (`BATADV_IV_OGM`): learn/refresh the originator's
+    /// Route an incoming OGM (`BatmanPacketType::Ogm`): learn/refresh the originator's
     /// paths and their observed cadence, fold in its multicast memberships,
     /// latch any topology change, and re-flood the OGM once per fresh sequence
     /// number.  OGMs are control traffic, so this always returns
@@ -784,7 +778,7 @@ impl<
         RoutingAction::Consumed
     }
 
-    /// Route an incoming keep-alive heartbeat (`BATADV_KEEPALIVE`): link-local
+    /// Route an incoming keep-alive heartbeat (`BatmanPacketType::Keepalive`): link-local
     /// only — never forwarded, never delivered locally, no reply written.
     /// Records that `frame.src` is alive as of `now` so
     /// [`next_hop`](Self::next_hop) can deprioritize routes through it the
@@ -834,7 +828,7 @@ impl<
         );
     }
 
-    /// Route an incoming flooded broadcast (`BATADV_BCAST`): drop our own and
+    /// Route an incoming flooded broadcast (`BatmanPacketType::Bcast`): drop our own and
     /// duplicates, deliver locally, and re-flood with a decremented TTL until it
     /// expires.  Returns [`DeliverLocalAndForward`] when it both delivers and
     /// re-floods (the re-flood is written into `reply`).
@@ -908,7 +902,7 @@ impl<
         RoutingAction::DeliverLocalAndForward(Mac::BROADCAST)
     }
 
-    /// Route an incoming unicast (`BATADV_UNICAST`): deliver locally when it is
+    /// Route an incoming unicast (`BatmanPacketType::Unicast`): deliver locally when it is
     /// addressed to us, otherwise relay toward the next live hop with a
     /// decremented TTL (written into `reply`).  Dropped when the TTL is exhausted
     /// or no live route to the destination is known.
@@ -964,7 +958,7 @@ impl<
         RoutingAction::Consumed // Route unknown, drop packet
     }
 
-    /// Route an incoming multicast copy (`BATADV_MCAST`).  Structurally
+    /// Route an incoming multicast copy (`BatmanPacketType::Mcast`).  Structurally
     /// identical to [`handle_unicast`](Self::handle_unicast): each copy is
     /// addressed to one listener node and travels toward it hop by hop, delivered
     /// locally on arrival and dropped on TTL expiry or unknown route.
@@ -1016,7 +1010,7 @@ impl<
     }
 
     /// Route an incoming lazy-cert-distribution fetch request
-    /// (`BATADV_CERT_REQ`): deliver locally when addressed to us (so the
+    /// (`BatmanPacketType::CertReq`): deliver locally when addressed to us (so the
     /// router's auth state can answer it), otherwise relay toward the next
     /// live hop for the requested originator, exactly like
     /// [`handle_unicast`](Self::handle_unicast). Crypto-free: the engine only
@@ -1061,7 +1055,7 @@ impl<
         RoutingAction::Consumed // Route unknown, drop packet
     }
 
-    /// Route an incoming lazy-cert-distribution reply (`BATADV_CERT_REPLY`):
+    /// Route an incoming lazy-cert-distribution reply (`BatmanPacketType::CertReply`):
     /// deliver locally when addressed to us, otherwise relay toward the next
     /// live hop for the original requester. Structurally identical to
     /// [`handle_cert_req`](Self::handle_cert_req).
@@ -1152,16 +1146,18 @@ impl<
         }
 
         // Dispatch on the BATMAN sub-type tag (first payload byte) to the handler
-        // that owns that packet type's routing logic.
-        match frame.payload[0] {
-            BATADV_IV_OGM => self.handle_ogm(now, frame, local_quality, reply),
-            BATADV_BCAST => self.handle_broadcast(frame, reply),
-            BATADV_UNICAST => self.handle_unicast(now, frame, reply),
-            BATADV_MCAST => self.handle_mcast(now, frame, reply),
-            BATADV_CERT_REQ => self.handle_cert_req(now, frame, reply),
-            BATADV_CERT_REPLY => self.handle_cert_reply(now, frame, reply),
-            BATADV_KEEPALIVE => self.handle_keepalive(now, frame),
-            _ => self.route_by_dest(now, frame),
+        // that owns that packet type's routing logic.  A tag this build does not
+        // know (`None`) is not an error — a newer peer may speak a type we don't,
+        // so it falls back to plain destination-based routing.
+        match BatmanPacketType::from_u8(frame.payload[0]) {
+            Some(BatmanPacketType::Ogm) => self.handle_ogm(now, frame, local_quality, reply),
+            Some(BatmanPacketType::Bcast) => self.handle_broadcast(frame, reply),
+            Some(BatmanPacketType::Unicast) => self.handle_unicast(now, frame, reply),
+            Some(BatmanPacketType::Mcast) => self.handle_mcast(now, frame, reply),
+            Some(BatmanPacketType::CertReq) => self.handle_cert_req(now, frame, reply),
+            Some(BatmanPacketType::CertReply) => self.handle_cert_reply(now, frame, reply),
+            Some(BatmanPacketType::Keepalive) => self.handle_keepalive(now, frame),
+            None => self.route_by_dest(now, frame),
         }
     }
 
@@ -1194,7 +1190,7 @@ impl<
         };
 
         let ogm = BatmanOgmPacket {
-            packet_type: BATADV_IV_OGM,
+            packet_type: BatmanPacketType::Ogm.as_u8(),
             version: 5,
             ttl: 50,
             flags: 0,
@@ -1244,7 +1240,7 @@ impl<
             return None;
         }
         let pkt = crate::wire::BatmanKeepAlivePacket {
-            packet_type: BATADV_KEEPALIVE,
+            packet_type: BatmanPacketType::Keepalive.as_u8(),
             version: 5,
         };
         tx_buffer[..header_size].copy_from_slice(pkt.as_bytes());
@@ -1273,7 +1269,7 @@ mod tests {
 
     fn keepalive_frame(src: u8, dst: u8) -> Vec<u8> {
         let pkt = crate::wire::BatmanKeepAlivePacket {
-            packet_type: crate::wire::BATADV_KEEPALIVE,
+            packet_type: crate::wire::BatmanPacketType::Keepalive.as_u8(),
             version: 5,
         };
         let mut data = Vec::new();
@@ -1330,7 +1326,7 @@ mod tests {
         data.extend_from_slice(mac(1).as_bytes());
         data.extend_from_slice(mac(2).as_bytes());
         data.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
-        data.push(BATADV_KEEPALIVE);
+        data.push(BatmanPacketType::Keepalive.as_u8());
         let frame = LinkFrame::ref_from_prefix(&data).unwrap().0;
 
         let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
@@ -1449,7 +1445,10 @@ mod tests {
             .produce_keepalive(&mut buf)
             .expect("buffer is plenty");
         assert_eq!(produced.len(), 2);
-        assert_eq!(produced[0], crate::wire::BATADV_KEEPALIVE);
+        assert_eq!(
+            produced[0],
+            crate::wire::BatmanPacketType::Keepalive.as_u8()
+        );
         assert_eq!(produced[1], 5);
     }
 

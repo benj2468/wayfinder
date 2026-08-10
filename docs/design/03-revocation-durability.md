@@ -28,11 +28,11 @@ which is retained unchanged as the steady-state propagation path.
    once it exists, including retrofitting `CaLog` onto it. This also folds in
    the embedded flash story more coherently than treating it as a one-off
    non-goal (§2) — see the updated non-goal bullet.
-2. **`BATADV_*` packet-type constants need to become a proper enum** (mirroring
-   how `TvlvType` already does this with `as_u8()`) **in a small, separate MR,
-   landed before** `BATADV_REVOKE_SYNC_REQ`/`_REPLY` are added — so the
-   compiler enforces byte-value uniqueness across packet types instead of
-   relying on comments across scattered `pub const` declarations (§3.3.1).
+2. ~~**`BATADV_*` packet-type constants need to become a proper enum**~~ —
+   **done.** They are now the `BatmanPacketType` `#[repr(u8)]` enum in
+   `libs/batman/src/wire.rs`, mirroring `TvlvType` (`as_u8()`, plus a
+   `from_u8()` for dispatch). The compiler enforces byte-value uniqueness, so
+   `RevokeSyncReq`/`RevokeSyncReply` are added as variants of it (§3.3.1).
 3. **The `ca_mac` addressing approach (§3.2) needs explicit sign-off, not just
    review-in-passing** — it's a security-posture trade-off (how discoverable
    the CA's identity is), not a technical correctness question this document
@@ -246,24 +246,21 @@ best-known CA address" throughout the rest of this document.
 
 #### 3.3.1 CA-pull routed control packets
 
-**Blocked on prerequisite #2 (Scope): `BATADV_*` packet types must become a
-proper enum first.** `libs/batman/src/wire.rs` today spells these out as
-individual `pub const XXX: u8` declarations (`BATADV_IV_OGM`, `BATADV_BCAST`,
-`BATADV_UNICAST`, `BATADV_MCAST`, `BATADV_CERT_REQ`, `BATADV_CERT_REPLY`),
-unlike `TvlvType`, which already gets proper-enum treatment with an `as_u8()`
-method. Land that refactor as its own small MR first, so the compiler (not a
-comment thread) enforces that no two packet types collide — then add these two
-as new variants of that enum, not as two more raw consts:
+**Prerequisite #2 (Scope) is done.** `libs/batman/src/wire.rs` no longer spells
+the packet types out as individual `pub const XXX: u8` declarations; they are
+the `BatmanPacketType` `#[repr(u8)]` enum, with `as_u8()`/`from_u8()`, the same
+treatment `TvlvType` already had. The compiler (not a comment thread) now
+enforces that no two packet types collide, so add these two as **new variants
+of that enum**, not as two more raw consts:
 
 Two new routed control packets, structurally identical in spirit to
-`BATADV_CERT_REQ` (`0x05`) / `BATADV_CERT_REPLY` (`0x06`) in
-`libs/batman/src/wire.rs`, taking the **next free** packet-type values after
-that pair (illustrated here as consts for readability; implement as enum
-variants per the above):
+`BatmanPacketType::CertReq` (`0x05`) / `BatmanPacketType::CertReply` (`0x06`) in
+`libs/batman/src/wire.rs`, taking the **next free** packet-type values —
+note `0x07` is `BatmanPacketType::Keepalive`, so the pair starts at `0x08`:
 
 ```rust
-pub const BATADV_REVOKE_SYNC_REQ: u8 = 0x07;   // next free after CERT_REPLY = 0x06
-pub const BATADV_REVOKE_SYNC_REPLY: u8 = 0x08;
+RevokeSyncReq = 0x08,   // next free after Keepalive = 0x07
+RevokeSyncReply = 0x09,
 ```
 
 **Request** — self-authenticating, same shape as `CertReq`: carries the
@@ -277,7 +274,7 @@ Unlike a `CertReq`, this packet has **no early-answer path**: only the CA holds
 the authoritative issued log, so the request routes all the way to `ca_mac` and
 is answered only there (§3.6, §9).
 
-**Reply** (`BATADV_REVOKE_SYNC_REPLY`) — paginated, because a full reply can
+**Reply** (`RevokeSyncReply`) — paginated, because a full reply can
 exceed on-link limits (§3.5): a small header (`version`, `mesh_id`,
 `page_index: u8`, `page_count: u8`) followed by up to a capped number of raw
 `RevocationRecord`s (propose 4, matching `MAX_REVOKE_PER_OGM`'s existing
@@ -336,7 +333,7 @@ outright, so a non-member's marker is never honored — self-authentication come
 for free, without the standalone signature a routed `CertReq`/`RevokeSyncReq`
 needs.
 
-The **peer reply reuses `BATADV_REVOKE_SYNC_REPLY`** verbatim — same header,
+The **peer reply reuses `RevokeSyncReply`** verbatim — same header,
 same 4-records-per-page cap, same pagination (§3.5) — rather than inventing a
 second reply scheme. The only difference from a CA reply is provenance: a peer
 forwards the root-signed `RevocationRecord`s it already holds, unchanged (they
@@ -350,7 +347,7 @@ is authoritative, exactly as desired.)
 
 All routed packets hop-by-hop exactly like `CertReq`/`CertReply` — no new
 routing logic, just new packet types recognized in `CentralRouter`'s demux
-(`lib.rs`) the same way `BATADV_CERT_REQ`/`_REPLY` are today. The peer reply,
+(`lib.rs`) the same way `BatmanPacketType::CertReq`/`_REPLY` are today. The peer reply,
 by contrast, is **not multi-hop routed at all** (§3.7): responder and requester
 are 1-hop neighbors by construction.
 
@@ -498,7 +495,7 @@ review, correcting an earlier draft of this section that only evaluated
 redundancy against storage/dedup cost, never against airtime — the actual
 scarce resource this whole design exists to protect). Fix: each candidate
 waits a short random jittered delay before replying, and **cancels its own
-reply if it overhears another node's `BATADV_REVOKE_SYNC_REPLY` addressed to
+reply if it overhears another node's `RevokeSyncReply` addressed to
 the same requester first** — the same listen-before-transmit suppression
 idiom this codebase already relies on for Trickle's OGM backoff, applied here
 to a one-shot reply instead of a periodic schedule. This only does useful work
@@ -683,7 +680,7 @@ payload logging of reply contents beyond metadata.
   mesh-wide reply amplification.
 - **Unit — suppressed duplicate reply**: given two candidate responders that
   both overhear the same marker, the second cancels its reply after
-  overhearing the first's `BATADV_REVOKE_SYNC_REPLY` to the same requester
+  overhearing the first's `RevokeSyncReply` to the same requester
   within its jitter window.
 - **Integration (`wayfinder-test`)**:
   - *CA-pull golden-compare*: a node with a stale/empty local store boots,
@@ -704,7 +701,7 @@ payload logging of reply contents beyond metadata.
     emitted at one end never reaches a node 2+ hops away — direct evidence the
     strip-on-forward fix actually bounds visibility, not just a claim about it.
   - *Amplification bound, single-hop fan-out*: a requester with several
-    informed 1-hop neighbors receives exactly one `BATADV_REVOKE_SYNC_REPLY`
+    informed 1-hop neighbors receives exactly one `RevokeSyncReply`
     in the common case, not one per neighbor.
 
 ## 8. Migration / versioning
@@ -774,14 +771,14 @@ breakage, just no peer catch-up from those nodes.
 
 1. **Confirm the new wire values are free** at implementation time:
    `TvlvType::RevSyncReq = 0x84` (next after `CertFp = 0x83`) and
-   `BATADV_REVOKE_SYNC_REQ`/`_REPLY = 0x07`/`0x08` (next after
-   `BATADV_CERT_REPLY = 0x06`).
+   `RevokeSyncReq`/`RevokeSyncReply` = `0x08`/`0x09` (next after
+   `BatmanPacketType::Keepalive = 0x07`).
 2. **Peer-broadcast vs. CA-pull composition** (§3.7): the recommendation is
    *peer burst every fresh/stale boot, CA-pull gated on `RECONCILE_MAX_AGE_SECS`,
    both run concurrently (no head-start sequencing)*. Confirm this rather than
    letting it default silently — it's the load-bearing timing decision and was
    deliberately left explicit.
-3. **Whether the peer reply reuses `BATADV_REVOKE_SYNC_REPLY`** (recommended,
+3. **Whether the peer reply reuses `RevokeSyncReply`** (recommended,
    §3.3.2, discriminating authoritative-vs-peer by `source == ca_mac`) or gets
    its own distinct packet type. Reuse is simpler and keeps one pagination path;
    confirm the source-based discriminator is acceptable vs. an explicit
@@ -835,11 +832,11 @@ land first.
   `revsync_req_rate` limiter (mirror `accept_cert_request_rate`/
   `cert_req_rate`). The additive-only peer ingestion (ingest without touching
   `last_reconciled_unix`) is the invariant to guard here.
-- `libs/batman/src/wire.rs` — new `BATADV_REVOKE_SYNC_REQ`/`_REPLY` variants
-  added to the (now-enum, per prerequisite #2) packet-type type, header structs
+- `libs/batman/src/wire.rs` — new `RevokeSyncReq`/`RevokeSyncReply` variants
+  added to `BatmanPacketType` (the enum prerequisite #2 landed), header structs
   mirroring `BatmanCertReq/ReplyPacket`; and `TvlvType::RevSyncReq = 0x84`.
 - `libs/wayfinder/src/lib.rs` — demux the two new packet types (mirror the
-  `BATADV_CERT_REQ`/`_REPLY` arms), originate/handle the CA-pull; attach and
+  `BatmanPacketType::CertReq`/`_REPLY` arms), originate/handle the CA-pull; attach and
   overhear the `RevSyncReq` marker and emit the direct peer reply over the
   ingress link. The OGM verify/originate gate is the anchor for both.
 - `libs/wayfinder/src/config.rs` — **no new field** (superseding the original

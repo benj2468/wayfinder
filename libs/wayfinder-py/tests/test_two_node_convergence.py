@@ -34,13 +34,13 @@ def test_two_node_ogm_convergence():
 
 
 # The BATMAN sub-type tag (the first payload byte) for a keep-alive heartbeat.
-_BATADV_KEEPALIVE = 0x07
+_PKT_KEEPALIVE = 0x07
 
 
 def _is_keepalive_frame(frame: bytes) -> bool:
     """Whether a raw on-wire frame (`[dst:6][src:6][proto:2 BE][payload]`) is
     a keep-alive heartbeat, by its BATMAN sub-type tag at payload offset 14."""
-    return len(frame) > 14 and frame[14] == _BATADV_KEEPALIVE
+    return len(frame) > 14 and frame[14] == _PKT_KEEPALIVE
 
 
 def test_keepalive_heartbeat_is_transmitted_when_configured():

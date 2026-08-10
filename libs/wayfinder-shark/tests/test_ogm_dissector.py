@@ -12,8 +12,8 @@ import pytest
 
 # EtherType the dissector hooks (ETH_P_BATMAN); see libs/batman/src/wire.rs.
 ETH_P_BATMAN = 0x4305
-# packet_type for an Originator Message (BATADV_IV_OGM).
-BATADV_IV_OGM = 0x01
+# packet_type for an Originator Message (BatmanPacketType::Ogm).
+PKT_OGM = 0x01
 
 BROADCAST = b"\xff" * 6
 NODE1 = b"\x02\x00\x00\x00\x00\x01"
@@ -38,7 +38,7 @@ def batman_ogm(
 ) -> bytes:
     """Serialize a ``BatmanOgmPacket`` (fixed header + TVLV tail) to wire bytes."""
     return (
-        struct.pack(">BBBB", BATADV_IV_OGM, version, ttl, flags)
+        struct.pack(">BBBB", PKT_OGM, version, ttl, flags)
         + struct.pack(">I", seqno)  # seqno is big-endian on the wire
         + orig
         + struct.pack(">BB", reserved, tq)

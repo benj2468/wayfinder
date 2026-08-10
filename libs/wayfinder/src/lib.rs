@@ -19,17 +19,11 @@ pub use interfaces;
 pub use wayfinder_auth;
 
 use batman::BatmanEngine;
-use batman::wire::BATADV_BCAST;
-use batman::wire::BATADV_CERT_REPLY;
-use batman::wire::BATADV_CERT_REQ;
-use batman::wire::BATADV_IV_OGM;
-use batman::wire::BATADV_KEEPALIVE;
-use batman::wire::BATADV_MCAST;
-use batman::wire::BATADV_UNICAST;
 use batman::wire::BatmanBroadcastPacket;
 use batman::wire::BatmanCertReplyPacket;
 use batman::wire::BatmanCertReqPacket;
 use batman::wire::BatmanMcastPacket;
+use batman::wire::BatmanPacketType;
 use batman::wire::BatmanUnicastPacket;
 use batman::wire::ETH_P_BATMAN;
 use core::time::Duration;
@@ -330,7 +324,7 @@ fn link_frame_wire_len(payload_len: usize) -> usize {
 /// returned by [`CentralRouter::mcast_plan`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McastPlan {
-    /// Send an individual [`BATADV_MCAST`] packet to each interested
+    /// Send an individual [`BatmanPacketType::Mcast`] packet to each interested
     /// originator — the set returned by [`CentralRouter::mcast_targets`].
     /// Chosen when at least one and at most [`MCAST_FANOUT`] listeners are
     /// known.
@@ -577,21 +571,24 @@ impl<
     }
 
     /// Whether interface `idx`'s features permit **transmitting** an outgoing
-    /// BATMAN frame whose sub-type is `packet_type` (its leading payload byte)
-    /// onto it.  OGM re-floods require [`tx_ogm`]; data-plane frames (flooded
-    /// broadcasts and directed unicast/multicast) require [`tx_data`]; any other
-    /// sub-type (notably the lazy-cert control packets, which carry their own
-    /// signature) is always permitted.  The driver's egress fan-out consults
-    /// this per candidate interface so a partially participating link never puts
-    /// a suppressed class on the wire.
+    /// BATMAN frame of sub-type `packet_type` onto it.  OGM re-floods require
+    /// [`tx_ogm`]; data-plane frames (flooded broadcasts and directed
+    /// unicast/multicast) require [`tx_data`]; any other sub-type (notably the
+    /// lazy-cert control packets, which carry their own signature) is always
+    /// permitted, as is `None` — a non-BATMAN frame or a sub-type this build
+    /// does not recognise.  The driver's egress fan-out consults this per
+    /// candidate interface so a partially participating link never puts a
+    /// suppressed class on the wire.
     ///
     /// [`tx_ogm`]: crate::features::LinkFeatures::tx_ogm
     /// [`tx_data`]: crate::features::LinkFeatures::tx_data
-    pub fn link_may_tx(&self, idx: usize, packet_type: Option<u8>) -> bool {
+    pub fn link_may_tx(&self, idx: usize, packet_type: Option<BatmanPacketType>) -> bool {
         let f = self.link_features(idx);
         match packet_type {
-            Some(BATADV_IV_OGM) => f.tx_ogm,
-            Some(BATADV_BCAST) | Some(BATADV_UNICAST) | Some(BATADV_MCAST) => f.tx_data,
+            Some(BatmanPacketType::Ogm) => f.tx_ogm,
+            Some(BatmanPacketType::Bcast)
+            | Some(BatmanPacketType::Unicast)
+            | Some(BatmanPacketType::Mcast) => f.tx_data,
             _ => true,
         }
     }
@@ -851,6 +848,16 @@ impl<
         // 2. Demux by Protocol ID
         match frame.protocol.get() {
             DEFAULT_BATMAN_ETHER_TYPE => {
+                // The frame's BATMAN sub-type, decoded once for every gate and
+                // demux below.  `None` is an empty payload or a sub-type this
+                // build does not know — neither is gated nor specially handled
+                // here; the engine routes it by destination.
+                let packet_type = frame
+                    .payload
+                    .first()
+                    .copied()
+                    .and_then(BatmanPacketType::from_u8);
+
                 // Per-link receive gating: drop a traffic class this link is
                 // configured not to accept before it can touch the routing
                 // tables, be delivered, or generate a re-flood.  The rx-rate
@@ -860,12 +867,14 @@ impl<
                 // arms below and are never gated here — the auth control plane
                 // must keep flowing regardless of data/routing gates.
                 let features = self.link_features(iface_idx);
-                match frame.payload.first() {
-                    Some(&BATADV_IV_OGM) if !features.rx_ogm => {
+                match packet_type {
+                    Some(BatmanPacketType::Ogm) if !features.rx_ogm => {
                         trace!("drop: rx_ogm disabled on this link");
                         return RxOutcome::empty();
                     }
-                    Some(&BATADV_BCAST) | Some(&BATADV_UNICAST) | Some(&BATADV_MCAST)
+                    Some(BatmanPacketType::Bcast)
+                    | Some(BatmanPacketType::Unicast)
+                    | Some(BatmanPacketType::Mcast)
                         if !features.rx_data =>
                     {
                         trace!("drop: rx_data disabled on this link");
@@ -880,7 +889,7 @@ impl<
                 // one-to-many control plane).  Data-plane frames (BCAST/UNICAST/
                 // MCAST) are NOT authenticated yet — an outsider can still inject
                 // them until the pairwise data-plane tag lands; see auth.rs scope.
-                if frame.payload.first() == Some(&BATADV_IV_OGM)
+                if packet_type == Some(BatmanPacketType::Ogm)
                     && let Some(auth) = self.auth.as_mut()
                 {
                     match auth.verify_ogm(&frame.payload) {
@@ -909,7 +918,7 @@ impl<
                                     &mut tx_buf[hdr_len..],
                                 ) {
                                 let req_hdr = BatmanCertReqPacket {
-                                    packet_type: BATADV_CERT_REQ,
+                                    packet_type: BatmanPacketType::CertReq.as_u8(),
                                     version: 5,
                                     ttl: 50,
                                     dest: orig,
@@ -940,7 +949,7 @@ impl<
                 // let any on-link party bias route selection away from a
                 // spoofed victim neighbor without holding a membership cert —
                 // the same segregation guarantee OGMs already get.
-                if frame.payload.first() == Some(&BATADV_KEEPALIVE)
+                if packet_type == Some(BatmanPacketType::Keepalive)
                     && let Some(auth) = self.auth.as_mut()
                     && !auth.verify_keepalive(frame.src, &frame.payload)
                 {
@@ -986,7 +995,7 @@ impl<
                             // table (surfaced via the management API); we simply
                             // don't propagate it. See
                             // [`LinkFeatures::tx_data`](crate::features::LinkFeatures::tx_data).
-                            if frame.payload.first() == Some(&BATADV_IV_OGM)
+                            if packet_type == Some(BatmanPacketType::Ogm)
                                 && !self.link_features(iface_idx).tx_data
                             {
                                 trace!(
@@ -1001,7 +1010,7 @@ impl<
                                     payload: &reply.payload[..len],
                                 })
                             }
-                        } else if frame.payload.first() == Some(&BATADV_IV_OGM)
+                        } else if packet_type == Some(BatmanPacketType::Ogm)
                             && let Ok((ogm, _)) =
                                 batman::wire::BatmanOgmPacket::ref_from_prefix(&frame.payload)
                             && let Some(auth) = self.auth.as_mut()
@@ -1053,8 +1062,8 @@ impl<
                             deliver_local: None,
                         }
                     }
-                    RoutingAction::DeliverLocal => match frame.payload.first() {
-                        Some(&BATADV_CERT_REPLY) => {
+                    RoutingAction::DeliverLocal => match packet_type {
+                        Some(BatmanPacketType::CertReply) => {
                             // Terminates in our own auth state, never the
                             // host TAP: verify against the trust anchor,
                             // confirm it answers an outstanding request, and
@@ -1068,7 +1077,7 @@ impl<
                             }
                             RxOutcome::empty()
                         }
-                        Some(&BATADV_CERT_REQ) => {
+                        Some(BatmanPacketType::CertReq) => {
                             // Terminates here: this node is the originator
                             // whose cert was requested (the terminal-only
                             // responder — an intermediate holder answering
@@ -1104,7 +1113,7 @@ impl<
                             match self.batman.next_hop(now, requester) {
                                 Some(next) if total <= reply.payload.len() => {
                                     let reply_hdr = BatmanCertReplyPacket {
-                                        packet_type: BATADV_CERT_REPLY,
+                                        packet_type: BatmanPacketType::CertReply.as_u8(),
                                         version: 5,
                                         ttl: 50,
                                         dest: requester,
@@ -1199,12 +1208,12 @@ impl<
     /// delivery.  Determined from the packet sub-type byte; unknown types are
     /// delivered whole (offset 0).
     fn inner_offset(payload: &[u8]) -> usize {
-        match payload.first() {
-            Some(&BATADV_UNICAST) => core::mem::size_of::<BatmanUnicastPacket>(),
-            Some(&BATADV_MCAST) => core::mem::size_of::<BatmanMcastPacket>(),
-            Some(&BATADV_BCAST) => core::mem::size_of::<BatmanBroadcastPacket>(),
-            Some(&BATADV_CERT_REQ) => core::mem::size_of::<BatmanCertReqPacket>(),
-            Some(&BATADV_CERT_REPLY) => core::mem::size_of::<BatmanCertReplyPacket>(),
+        match payload.first().copied().and_then(BatmanPacketType::from_u8) {
+            Some(BatmanPacketType::Unicast) => core::mem::size_of::<BatmanUnicastPacket>(),
+            Some(BatmanPacketType::Mcast) => core::mem::size_of::<BatmanMcastPacket>(),
+            Some(BatmanPacketType::Bcast) => core::mem::size_of::<BatmanBroadcastPacket>(),
+            Some(BatmanPacketType::CertReq) => core::mem::size_of::<BatmanCertReqPacket>(),
+            Some(BatmanPacketType::CertReply) => core::mem::size_of::<BatmanCertReplyPacket>(),
             _ => 0,
         }
     }
@@ -1240,7 +1249,7 @@ impl<
             return None;
         }
         let hdr = BatmanCertReplyPacket {
-            packet_type: BATADV_CERT_REPLY,
+            packet_type: BatmanPacketType::CertReply.as_u8(),
             version: 5,
             ttl: 50,
             dest: orig,
@@ -1279,7 +1288,7 @@ impl<
     }
 
     /// Wrap host data destined for the multicast listener `dest` in a
-    /// [`BATADV_MCAST`] packet routed toward its best-known next hop.  Called
+    /// [`BatmanPacketType::Mcast`] packet routed toward its best-known next hop.  Called
     /// once per target of a [`McastPlan::Unicast`].  Returns
     /// [`LocalSendError::BufferTooSmall`] if the header plus `payload` would
     /// not fit in `tx_buf`, or [`LocalSendError::AuthLocked`] while
@@ -1298,7 +1307,7 @@ impl<
         let next_hop = self.batman.next_hop(now, dest).unwrap_or(dest);
 
         let header = BatmanMcastPacket {
-            packet_type: BATADV_MCAST,
+            packet_type: BatmanPacketType::Mcast.as_u8(),
             version: 5,
             ttl: 50,
             dest,
@@ -1608,7 +1617,7 @@ impl<
         // Broadcast destinations are flooded, not routed to a next hop.
         if dest == Mac::BROADCAST {
             let header = BatmanBroadcastPacket {
-                packet_type: BATADV_BCAST,
+                packet_type: BatmanPacketType::Bcast.as_u8(),
                 version: 5,
                 ttl: 50,
                 seqno: self.batman.next_broadcast_seqno().to_be(),
@@ -1637,7 +1646,7 @@ impl<
         };
         // 2. Build the Unicast Header
         let header = BatmanUnicastPacket {
-            packet_type: BATADV_UNICAST,
+            packet_type: BatmanPacketType::Unicast.as_u8(),
             version: 5,
             ttl: 50,
             dest,
@@ -1903,8 +1912,6 @@ impl<
 #[cfg(test)]
 mod cp2_local_delivery {
     use super::*;
-    use batman::wire::BATADV_BCAST;
-    use batman::wire::BATADV_UNICAST;
     use batman::wire::BatmanBroadcastPacket;
     use batman::wire::BatmanUnicastPacket;
     use interfaces::frame::LinkFrame;
@@ -1939,7 +1946,7 @@ mod cp2_local_delivery {
 
         let mut payload = Vec::new();
         let hdr = BatmanUnicastPacket {
-            packet_type: BATADV_UNICAST,
+            packet_type: BatmanPacketType::Unicast.as_u8(),
             version: 5,
             ttl: 50,
             dest: mac(1),
@@ -1965,7 +1972,7 @@ mod cp2_local_delivery {
 
         let mut payload = Vec::new();
         let hdr = BatmanBroadcastPacket {
-            packet_type: BATADV_BCAST,
+            packet_type: BatmanPacketType::Bcast.as_u8(),
             version: 5,
             ttl: 50,
             seqno: 7u32.to_be(),
@@ -2003,7 +2010,7 @@ mod cp2_local_delivery {
 
         let mut payload = Vec::new();
         let hdr = BatmanBroadcastPacket {
-            packet_type: BATADV_BCAST,
+            packet_type: BatmanPacketType::Bcast.as_u8(),
             version: 5,
             ttl: 50,
             seqno: 7u32.to_be(),
@@ -2040,7 +2047,7 @@ mod cp2_local_delivery {
         assert_eq!(out.dst, Mac::BROADCAST);
         assert_eq!(out.protocol, ETH_P_BATMAN);
         let (hdr, rest) = BatmanBroadcastPacket::ref_from_prefix(out.payload).unwrap();
-        assert_eq!(hdr.packet_type, BATADV_BCAST);
+        assert_eq!(hdr.packet_type, BatmanPacketType::Bcast.as_u8());
         assert_eq!(hdr.orig, mac(1)); // our own ident
         assert!(hdr.ttl > 1);
         assert_eq!(&rest[..INNER.len()], INNER);
@@ -2049,8 +2056,8 @@ mod cp2_local_delivery {
 
 #[cfg(test)]
 mod cert_control_delivery {
-    //! Lazy-cert-distribution control packets (`BATADV_CERT_REQ` /
-    //! `BATADV_CERT_REPLY`) are routed like a unicast, but must never leak to
+    //! Lazy-cert-distribution control packets (`BatmanPacketType::CertReq` /
+    //! `BatmanPacketType::CertReply`) are routed like a unicast, but must never leak to
     //! the local host/TAP the way an ordinary unicast's inner payload does —
     //! they are consumed internally by the router's auth state
     //! (`ingest_cert_reply`/`verify_cert_request`, exercised for real in
@@ -2058,8 +2065,6 @@ mod cert_control_delivery {
     //! non-leak contract in isolation.
 
     use super::*;
-    use batman::wire::BATADV_CERT_REPLY;
-    use batman::wire::BATADV_CERT_REQ;
     use batman::wire::BatmanCertReplyPacket;
     use batman::wire::BatmanCertReqPacket;
     use interfaces::frame::LinkFrame;
@@ -2089,7 +2094,7 @@ mod cert_control_delivery {
 
         let mut payload = Vec::new();
         let hdr = BatmanCertReqPacket {
-            packet_type: BATADV_CERT_REQ,
+            packet_type: BatmanPacketType::CertReq.as_u8(),
             version: 5,
             ttl: 50,
             dest: mac(1),
@@ -2117,7 +2122,7 @@ mod cert_control_delivery {
 
         let mut payload = Vec::new();
         let hdr = BatmanCertReplyPacket {
-            packet_type: BATADV_CERT_REPLY,
+            packet_type: BatmanPacketType::CertReply.as_u8(),
             version: 5,
             ttl: 50,
             dest: mac(1),
@@ -2146,7 +2151,7 @@ mod cert_control_delivery {
         let ogm_hdr_len = core::mem::size_of::<batman::wire::BatmanOgmPacket>();
         let mut ogm_payload = vec![0u8; ogm_hdr_len];
         let ogm = batman::wire::BatmanOgmPacket {
-            packet_type: batman::wire::BATADV_IV_OGM,
+            packet_type: batman::wire::BatmanPacketType::Ogm.as_u8(),
             version: 5,
             ttl: 50,
             flags: 0,
@@ -2164,7 +2169,7 @@ mod cert_control_delivery {
 
         let mut payload = Vec::new();
         let hdr = BatmanCertReqPacket {
-            packet_type: BATADV_CERT_REQ,
+            packet_type: BatmanPacketType::CertReq.as_u8(),
             version: 5,
             ttl: 10,
             dest: mac(5),
@@ -2195,8 +2200,6 @@ mod cert_responder {
     //! exists, or parked and flushed opportunistically once one appears.
 
     use super::*;
-    use batman::wire::BATADV_CERT_REPLY;
-    use batman::wire::BATADV_IV_OGM;
     use batman::wire::BatmanCertReplyPacket;
     use batman::wire::BatmanCertReqPacket;
     use batman::wire::BatmanOgmPacket;
@@ -2225,7 +2228,7 @@ mod cert_responder {
         let ogm_hdr_len = core::mem::size_of::<BatmanOgmPacket>();
         let mut buf = vec![0u8; 512];
         let ogm = BatmanOgmPacket {
-            packet_type: BATADV_IV_OGM,
+            packet_type: BatmanPacketType::Ogm.as_u8(),
             version: 5,
             ttl,
             flags: 0,
@@ -2290,7 +2293,7 @@ mod cert_responder {
             .unwrap();
         let mut payload = Vec::new();
         let hdr = BatmanCertReqPacket {
-            packet_type: batman::wire::BATADV_CERT_REQ,
+            packet_type: batman::wire::BatmanPacketType::CertReq.as_u8(),
             version: 5,
             ttl: 50,
             dest: mac(1),
@@ -2308,7 +2311,7 @@ mod cert_responder {
             .expect("must answer immediately: a route exists");
         assert_eq!(fwd.dst, mac(3));
         let (reply_hdr, cert_bytes) = BatmanCertReplyPacket::ref_from_prefix(fwd.payload).unwrap();
-        assert_eq!(reply_hdr.packet_type, BATADV_CERT_REPLY);
+        assert_eq!(reply_hdr.packet_type, BatmanPacketType::CertReply.as_u8());
         assert_eq!(reply_hdr.dest, mac(3));
         assert_eq!(
             &cert_bytes[..core::mem::size_of::<wayfinder_auth::MembershipCert>()],
@@ -2358,7 +2361,7 @@ mod cert_responder {
             .unwrap();
         let mut payload = Vec::new();
         let hdr = BatmanCertReqPacket {
-            packet_type: batman::wire::BATADV_CERT_REQ,
+            packet_type: batman::wire::BatmanPacketType::CertReq.as_u8(),
             version: 5,
             ttl: 50,
             dest: mac(1),
@@ -2390,7 +2393,7 @@ mod cert_responder {
             .expect("the parked reply must be flushed once a route appears");
         assert_eq!(fwd.dst, mac(3));
         let (reply_hdr, _) = BatmanCertReplyPacket::ref_from_prefix(fwd.payload).unwrap();
-        assert_eq!(reply_hdr.packet_type, BATADV_CERT_REPLY);
+        assert_eq!(reply_hdr.packet_type, BatmanPacketType::CertReply.as_u8());
         assert!(!router.auth().unwrap().has_pending_reply(mac(3)));
     }
 
@@ -2400,7 +2403,7 @@ mod cert_responder {
         let ogm_hdr_len = core::mem::size_of::<BatmanOgmPacket>();
         let mut buf = vec![0u8; 512];
         let ogm = BatmanOgmPacket {
-            packet_type: BATADV_IV_OGM,
+            packet_type: BatmanPacketType::Ogm.as_u8(),
             version: 5,
             ttl,
             flags: 0,
@@ -2515,7 +2518,7 @@ mod cert_responder {
             .unwrap();
         let mut payload = Vec::new();
         let hdr = BatmanCertReqPacket {
-            packet_type: batman::wire::BATADV_CERT_REQ,
+            packet_type: batman::wire::BatmanPacketType::CertReq.as_u8(),
             version: 5,
             ttl: 50,
             dest: mac(1),
@@ -2538,14 +2541,13 @@ mod cert_responder {
 #[cfg(test)]
 mod mcast_forwarding {
     //! Selective multicast forwarding: a multicast frame is sent as an
-    //! individual [`BATADV_MCAST`] packet to each interested originator when
+    //! individual [`BatmanPacketType::Mcast`] packet to each interested originator when
     //! the listener count is within [`MCAST_FANOUT`], else flooded.
 
     use super::*;
-    use batman::wire::BATADV_IV_OGM;
-    use batman::wire::BATADV_MCAST;
     use batman::wire::BatmanMcastPacket;
     use batman::wire::BatmanOgmPacket;
+    use batman::wire::BatmanPacketType;
     use batman::wire::BatmanTvlvHdr;
     use batman::wire::TvlvType;
     use interfaces::frame::LinkFrame;
@@ -2588,7 +2590,7 @@ mod mcast_forwarding {
         };
         let tvlv_total = core::mem::size_of::<BatmanTvlvHdr>() + value.len();
         let ogm = BatmanOgmPacket {
-            packet_type: BATADV_IV_OGM,
+            packet_type: BatmanPacketType::Ogm.as_u8(),
             version: 5,
             ttl: 50,
             flags: 0,
@@ -2639,7 +2641,7 @@ mod mcast_forwarding {
         assert_eq!(router.mcast_plan(group(5)), McastPlan::Flood);
     }
 
-    /// `handle_local_mcast` wraps the frame in a BATADV_MCAST packet addressed
+    /// `handle_local_mcast` wraps the frame in a BatmanPacketType::Mcast packet addressed
     /// to the given listener, preserving the inner payload.
     #[test]
     fn handle_local_mcast_wraps_in_mcast_packet() {
@@ -2651,7 +2653,7 @@ mod mcast_forwarding {
 
         assert_eq!(out.protocol, ETH_P_BATMAN);
         let (hdr, rest) = BatmanMcastPacket::ref_from_prefix(out.payload).unwrap();
-        assert_eq!(hdr.packet_type, BATADV_MCAST);
+        assert_eq!(hdr.packet_type, BatmanPacketType::Mcast.as_u8());
         assert_eq!(hdr.dest, mac(7));
         assert!(hdr.ttl > 1);
         assert_eq!(&rest[..INNER.len()], INNER);
@@ -2918,7 +2920,6 @@ mod throughput {
 #[cfg(test)]
 mod node_metrics {
     use super::*;
-    use batman::wire::BATADV_IV_OGM;
     use batman::wire::BatmanOgmPacket;
     use core::time::Duration;
     use interfaces::frame::LinkFrame;
@@ -2943,7 +2944,7 @@ mod node_metrics {
     /// given transmission quality.  A full TTL makes it a one-hop path.
     fn feed_direct_ogm(router: &mut CentralRouter, orig: Mac, seqno: u32, tq: u8) {
         let ogm = BatmanOgmPacket {
-            packet_type: BATADV_IV_OGM,
+            packet_type: BatmanPacketType::Ogm.as_u8(),
             version: 5,
             ttl: 50,
             flags: 0,
@@ -2993,8 +2994,6 @@ mod node_metrics {
 
 #[cfg(test)]
 mod keepalive_route_selection {
-    use batman::wire::BATADV_IV_OGM;
-    use batman::wire::BATADV_KEEPALIVE;
     use batman::wire::BatmanKeepAlivePacket;
     use batman::wire::BatmanOgmPacket;
     use core::time::Duration;
@@ -3030,7 +3029,7 @@ mod keepalive_route_selection {
         now: Duration,
     ) {
         let ogm = BatmanOgmPacket {
-            packet_type: BATADV_IV_OGM,
+            packet_type: BatmanPacketType::Ogm.as_u8(),
             version: 5,
             ttl: 50,
             flags: 0,
@@ -3050,7 +3049,7 @@ mod keepalive_route_selection {
     /// interface `iface_idx`, at instant `now`.
     fn feed_keepalive_via(router: &mut CentralRouter, via: Mac, iface_idx: usize, now: Duration) {
         let pkt = BatmanKeepAlivePacket {
-            packet_type: BATADV_KEEPALIVE,
+            packet_type: BatmanPacketType::Keepalive.as_u8(),
             version: 5,
         };
         let bytes = link_frame_bytes(via, Mac::BROADCAST, pkt.as_bytes());
@@ -3181,7 +3180,6 @@ mod tq_clamp_integration {
     //! [`LinkMetrics::default`]) must apply no clamp — otherwise their
     //! normalized quality of 0 would wrongly zero every route.
     use super::*;
-    use batman::wire::BATADV_IV_OGM;
     use batman::wire::BatmanOgmPacket;
     use core::time::Duration;
     use interfaces::frame::LinkFrame;
@@ -3197,7 +3195,7 @@ mod tq_clamp_integration {
     /// One direct OGM from `orig` advertising transmission quality `tq`.
     fn ogm_frame_bytes(orig: Mac, tq: u8) -> Vec<u8> {
         let ogm = BatmanOgmPacket {
-            packet_type: BATADV_IV_OGM,
+            packet_type: BatmanPacketType::Ogm.as_u8(),
             version: 5,
             ttl: 50,
             flags: 0,
@@ -3550,7 +3548,7 @@ mod ogm_auth_integration {
     }
 
     /// The same fail-closed gate applies to local multicast egress
-    /// (`handle_local_mcast`), which wraps host data in a `BATADV_MCAST`
+    /// (`handle_local_mcast`), which wraps host data in a `BatmanPacketType::Mcast`
     /// packet rather than a unicast/broadcast one.
     #[test]
     fn locked_router_rejects_local_mcast_egress() {
@@ -3579,7 +3577,7 @@ mod ogm_auth_integration {
     }
 
     /// The fail-closed gate must cover the data plane, not just OGMs: a
-    /// well-formed `BATADV_BCAST` frame fed to a locked router must produce a
+    /// well-formed `BatmanPacketType::Bcast` frame fed to a locked router must produce a
     /// wholly empty `RxOutcome` — no forward, no local delivery — guarding
     /// against a future refactor that only gates the OGM demux arm.
     #[test]
@@ -3588,7 +3586,7 @@ mod ogm_auth_integration {
 
         let mut payload = Vec::new();
         let hdr = BatmanBroadcastPacket {
-            packet_type: BATADV_BCAST,
+            packet_type: BatmanPacketType::Bcast.as_u8(),
             version: 5,
             ttl: 50,
             seqno: 7u32.to_be(),
@@ -3836,7 +3834,7 @@ mod link_features_tests {
     /// A bare 1-hop OGM payload from `orig` (header only, no TVLVs).
     fn ogm_payload(orig: Mac) -> Vec<u8> {
         batman::wire::BatmanOgmPacket {
-            packet_type: BATADV_IV_OGM,
+            packet_type: BatmanPacketType::Ogm.as_u8(),
             version: 5,
             ttl: 50,
             flags: 0,
@@ -3853,7 +3851,7 @@ mod link_features_tests {
     /// A flooded broadcast payload from `orig` carrying `inner`.
     fn bcast_payload(orig: Mac, inner: &[u8]) -> Vec<u8> {
         let mut v = BatmanBroadcastPacket {
-            packet_type: BATADV_BCAST,
+            packet_type: BatmanPacketType::Bcast.as_u8(),
             version: 5,
             ttl: 50,
             seqno: 1u32.to_be(),
@@ -3868,7 +3866,7 @@ mod link_features_tests {
     /// A unicast payload addressed to `dest` carrying `inner`.
     fn unicast_payload(dest: Mac, inner: &[u8]) -> Vec<u8> {
         let mut v = BatmanUnicastPacket {
-            packet_type: BATADV_UNICAST,
+            packet_type: BatmanPacketType::Unicast.as_u8(),
             version: 5,
             ttl: 50,
             dest,
@@ -3935,22 +3933,31 @@ mod link_features_tests {
             ..Default::default()
         };
         r.set_link_features(0, f);
-        assert!(!r.link_may_tx(0, Some(BATADV_IV_OGM)), "tx_ogm gates OGM");
-        assert!(!r.link_may_tx(0, Some(BATADV_BCAST)), "tx_data gates BCAST");
         assert!(
-            !r.link_may_tx(0, Some(BATADV_UNICAST)),
+            !r.link_may_tx(0, Some(BatmanPacketType::Ogm)),
+            "tx_ogm gates OGM"
+        );
+        assert!(
+            !r.link_may_tx(0, Some(BatmanPacketType::Bcast)),
+            "tx_data gates BCAST"
+        );
+        assert!(
+            !r.link_may_tx(0, Some(BatmanPacketType::Unicast)),
             "tx_data gates UNICAST"
         );
-        assert!(!r.link_may_tx(0, Some(BATADV_MCAST)), "tx_data gates MCAST");
         assert!(
-            r.link_may_tx(0, Some(BATADV_CERT_REQ)),
+            !r.link_may_tx(0, Some(BatmanPacketType::Mcast)),
+            "tx_data gates MCAST"
+        );
+        assert!(
+            r.link_may_tx(0, Some(BatmanPacketType::CertReq)),
             "cert-control always allowed"
         );
         assert!(r.link_may_tx(0, None), "unknown sub-type allowed");
         // A full (unconfigured) interface permits every class.
-        assert!(r.link_may_tx(1, Some(BATADV_IV_OGM)));
-        assert!(r.link_may_tx(1, Some(BATADV_BCAST)));
-        assert!(r.link_may_tx(1, Some(BATADV_UNICAST)));
+        assert!(r.link_may_tx(1, Some(BatmanPacketType::Ogm)));
+        assert!(r.link_may_tx(1, Some(BatmanPacketType::Bcast)));
+        assert!(r.link_may_tx(1, Some(BatmanPacketType::Unicast)));
     }
 
     /// `apply_runtime_link_features` overrides a registered interface, marks the

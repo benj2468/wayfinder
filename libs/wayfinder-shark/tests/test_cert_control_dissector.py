@@ -1,5 +1,5 @@
 """End-to-end tests for the lazy-cert-distribution control packets
-(`BATADV_CERT_REQ` / `BATADV_CERT_REPLY`) in wayfinder.lua.
+(`BatmanPacketType::CertReq` / `BatmanPacketType::CertReply`) in wayfinder.lua.
 
 Mirrors libs/batman/src/wire.rs's `BatmanCertReqPacket`/`BatmanCertReplyPacket`:
 a unicast-shaped header (`packet_type`, `version`, `ttl`, `dest`) followed by a
@@ -15,8 +15,8 @@ import pytest
 ETH_P_BATMAN = 0x4305
 
 # packet_type bytes for the cert-control packets (libs/batman/src/wire.rs).
-BATADV_CERT_REQ = 0x05
-BATADV_CERT_REPLY = 0x06
+PKT_CERT_REQ = 0x05
+PKT_CERT_REPLY = 0x06
 
 NODE1 = b"\x02\x00\x00\x00\x00\x01"
 NODE2 = b"\x02\x00\x00\x00\x00\x02"
@@ -63,18 +63,18 @@ def cert_req_frame(
     requester_cert: bytes | None = None,
     signature: bytes = b"\x44" * 64,
 ) -> bytes:
-    """A complete ``BATADV_CERT_REQ``-carrying Ethernet frame."""
+    """A complete ``BatmanPacketType::CertReq``-carrying Ethernet frame."""
     if requester_cert is None:
         requester_cert = membership_cert(node_mac=NODE2)
-    body = cert_ctrl_header(BATADV_CERT_REQ, dest=dest) + requester_cert + signature
+    body = cert_ctrl_header(PKT_CERT_REQ, dest=dest) + requester_cert + signature
     return ethernet(dest, NODE2, ETH_P_BATMAN, body)
 
 
 def cert_reply_frame(*, dest: bytes = NODE2, cert: bytes | None = None) -> bytes:
-    """A complete ``BATADV_CERT_REPLY``-carrying Ethernet frame."""
+    """A complete ``BatmanPacketType::CertReply``-carrying Ethernet frame."""
     if cert is None:
         cert = membership_cert(node_mac=dest)
-    body = cert_ctrl_header(BATADV_CERT_REPLY, dest=dest) + cert
+    body = cert_ctrl_header(PKT_CERT_REPLY, dest=dest) + cert
     return ethernet(dest, NODE1, ETH_P_BATMAN, body)
 
 
@@ -138,7 +138,7 @@ def test_cert_req_truncated_body_does_not_crash(dissect):
     error the dissector — it degrades to the bare header, like a truncated
     capture elsewhere in this dissector."""
     dest = NODE1
-    body = cert_ctrl_header(BATADV_CERT_REQ, dest=dest) + b"\x00" * 10
+    body = cert_ctrl_header(PKT_CERT_REQ, dest=dest) + b"\x00" * 10
     frame = ethernet(dest, NODE2, ETH_P_BATMAN, body)
     result = dissect(frame, ["wayfinder.batman.cert_ctrl.dest"])
     assert result["wayfinder.batman.cert_ctrl.dest"] == "02:00:00:00:00:01"
