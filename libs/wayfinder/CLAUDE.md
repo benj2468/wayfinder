@@ -21,9 +21,9 @@ Central router orchestration. `no_std`; the `std` feature enables `DynLinkT`.
 - `mcast_plan` / `mcast_targets` / `handle_local_mcast` — multicast egress.
   `mcast_plan` returns `McastPlan::Unicast` when 1..=`MCAST_FANOUT` listeners are
   known (else `Flood`); `mcast_targets` is a no-alloc borrowing iterator of those
-  listeners; `handle_local_mcast` wraps a frame as a `BATADV_MCAST` packet to one
-  listener. `set_local_mcast_groups` feeds locally-snooped memberships to the
-  engine.
+  listeners; `handle_local_mcast` wraps a frame as a `BatmanPacketType::Mcast`
+  packet to one listener. `set_local_mcast_groups` feeds locally-snooped
+  memberships to the engine.
 - `get_egress_interface` / `resolve_route` — choose the egress interface for a
   destination (metric-driven), the latter without mutating state.
 - `auth.rs` (`OgmAuth`) — opt-in OGM authentication, kept in the router (not the

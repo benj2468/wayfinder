@@ -52,8 +52,7 @@ use tracing::warn;
 use wayfinder::DEFAULT_BATMAN_ETHER_TYPE;
 use wayfinder::EgressInterface;
 use wayfinder::auth::DIRECTED_TRAILER_LEN;
-use wayfinder::batman::wire::BATADV_CERT_REPLY;
-use wayfinder::batman::wire::BATADV_CERT_REQ;
+use wayfinder::batman::wire::BatmanPacketType;
 use wayfinder::interfaces::frame::LinkFrame;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder::link::Received;
@@ -117,13 +116,13 @@ pub trait MeshSink {
 }
 
 /// Whether `payload`'s BATMAN sub-type is a lazy-cert-distribution control
-/// packet (`BATADV_CERT_REQ`/`BATADV_CERT_REPLY`) — addressed to a specific
-/// node like a directed data-plane frame, but self-authenticating (its own
-/// signature) rather than pairwise-tagged.
+/// packet ([`BatmanPacketType::CertReq`]/[`BatmanPacketType::CertReply`]) —
+/// addressed to a specific node like a directed data-plane frame, but
+/// self-authenticating (its own signature) rather than pairwise-tagged.
 fn is_cert_control(payload: &[u8]) -> bool {
     matches!(
-        payload.first(),
-        Some(&BATADV_CERT_REQ) | Some(&BATADV_CERT_REPLY)
+        payload.first().copied().and_then(BatmanPacketType::from_u8),
+        Some(BatmanPacketType::CertReq) | Some(BatmanPacketType::CertReply)
     )
 }
 
@@ -504,7 +503,8 @@ pub fn plan_dispatch<'a, R: RouterOps>(
     // whole buffer: `buf` still carries the reserved trailer past `body_len`.
     let pkt_type = (protocol == DEFAULT_BATMAN_ETHER_TYPE)
         .then(|| buf.get(..body_len).and_then(<[u8]>::first).copied())
-        .flatten();
+        .flatten()
+        .and_then(BatmanPacketType::from_u8);
 
     let mut targets = InterfaceSet::default();
     match egress {
@@ -579,11 +579,6 @@ mod tests {
     use wayfinder::auth::DIRECTED_TRAILER_LEN;
     use wayfinder::auth::OgmAuth;
     use wayfinder::auth::OgmVerdict;
-    use wayfinder::batman::wire::BATADV_CERT_REPLY;
-    use wayfinder::batman::wire::BATADV_CERT_REQ;
-    use wayfinder::batman::wire::BATADV_IV_OGM;
-    use wayfinder::batman::wire::BATADV_KEEPALIVE;
-    use wayfinder::batman::wire::BATADV_UNICAST;
     use wayfinder::batman::wire::BatmanOgmPacket;
     use wayfinder::features::LinkFeatures;
     use wayfinder::interfaces::frame::LinkFrame;
@@ -609,7 +604,7 @@ mod tests {
     /// The bytes of a bare 1-hop OGM from `orig` — BATMAN header only, no TVLVs.
     fn bare_ogm_bytes(orig: Mac, seqno: u32, ttl: u8) -> Vec<u8> {
         let ogm = BatmanOgmPacket {
-            packet_type: BATADV_IV_OGM,
+            packet_type: BatmanPacketType::Ogm.as_u8(),
             version: 5,
             ttl,
             flags: 0,
@@ -679,8 +674,11 @@ mod tests {
     /// their leading byte, and nothing else (including the empty payload).
     #[test]
     fn is_cert_control_flags_cert_packets() {
-        assert!(is_cert_control(&[BATADV_CERT_REQ]));
-        assert!(is_cert_control(&[BATADV_CERT_REPLY, 0xff]));
+        assert!(is_cert_control(&[BatmanPacketType::CertReq.as_u8()]));
+        assert!(is_cert_control(&[
+            BatmanPacketType::CertReply.as_u8(),
+            0xff
+        ]));
         assert!(!is_cert_control(&[0x01]));
         assert!(!is_cert_control(&[]));
     }
@@ -909,7 +907,7 @@ mod tests {
         let mut router = CentralRouter::new(mac(1));
         router.set_auth(member_auth(&authority, 1, mac(1)));
 
-        let body = [BATADV_CERT_REQ, 0x11, 0x22];
+        let body = [BatmanPacketType::CertReq.as_u8(), 0x11, 0x22];
         let mut buf = body.to_vec();
         buf.resize(body.len() + DIRECTED_TRAILER_LEN, 0);
         let out = tag_directed_into(
@@ -1074,11 +1072,11 @@ mod tests {
             .filter_map(|f| f.payload.first().copied())
             .collect();
         assert!(
-            types.contains(&BATADV_IV_OGM),
+            types.contains(&BatmanPacketType::Ogm.as_u8()),
             "the OGM schedule fired: {types:?}"
         );
         assert!(
-            types.contains(&BATADV_KEEPALIVE),
+            types.contains(&BatmanPacketType::Keepalive.as_u8()),
             "the keep-alive schedule fired in the same call: {types:?}"
         );
     }
@@ -1182,7 +1180,7 @@ mod tests {
     #[test]
     fn explicit_interface_egress_targets_exactly_that_interface() {
         let mut router = router_with_interfaces(4);
-        let payload = [BATADV_IV_OGM, 0x02, 0x03];
+        let payload = [BatmanPacketType::Ogm.as_u8(), 0x02, 0x03];
         let mut buf = payload.to_vec();
         buf.resize(payload.len() + DIRECTED_TRAILER_LEN, 0);
 
@@ -1206,7 +1204,7 @@ mod tests {
     #[test]
     fn broadcast_floods_every_interface() {
         let mut router = router_with_interfaces(4);
-        let targets = plan_broadcast(&mut router, &[BATADV_IV_OGM, 0x02], None, 4)
+        let targets = plan_broadcast(&mut router, &[BatmanPacketType::Ogm.as_u8(), 0x02], None, 4)
             .expect("a broadcast is dispatchable");
 
         assert_eq!(targets, std::vec![0, 1, 2, 3]);
@@ -1217,8 +1215,13 @@ mod tests {
     #[test]
     fn reflood_never_returns_out_the_ingress_interface() {
         let mut router = router_with_interfaces(4);
-        let targets = plan_broadcast(&mut router, &[BATADV_IV_OGM, 0x02], Some(1), 4)
-            .expect("a re-flood is dispatchable");
+        let targets = plan_broadcast(
+            &mut router,
+            &[BatmanPacketType::Ogm.as_u8(), 0x02],
+            Some(1),
+            4,
+        )
+        .expect("a re-flood is dispatchable");
 
         assert_eq!(targets, std::vec![0, 2, 3]);
         assert!(
@@ -1238,7 +1241,7 @@ mod tests {
         };
         router.set_link_features(2, off);
 
-        let targets = plan_broadcast(&mut router, &[BATADV_IV_OGM, 0x02], None, 4)
+        let targets = plan_broadcast(&mut router, &[BatmanPacketType::Ogm.as_u8(), 0x02], None, 4)
             .expect("a broadcast is dispatchable");
 
         assert_eq!(
@@ -1254,7 +1257,7 @@ mod tests {
     #[test]
     fn fanout_is_bounded_by_the_drivers_interface_count() {
         let mut router = router_with_interfaces(8);
-        let targets = plan_broadcast(&mut router, &[BATADV_IV_OGM, 0x02], None, 2)
+        let targets = plan_broadcast(&mut router, &[BatmanPacketType::Ogm.as_u8(), 0x02], None, 2)
             .expect("a broadcast is dispatchable");
 
         assert_eq!(targets, std::vec![0, 1]);
@@ -1269,7 +1272,7 @@ mod tests {
         router.set_auth(member_auth(&authority, 1, mac(1)));
 
         // mac(9) is an unverified neighbour: no pairwise key, so no tag.
-        let payload = [BATADV_UNICAST, 0x02, 0x03];
+        let payload = [BatmanPacketType::Unicast.as_u8(), 0x02, 0x03];
         let mut buf = payload.to_vec();
         buf.resize(payload.len() + DIRECTED_TRAILER_LEN, 0);
 
@@ -1294,7 +1297,7 @@ mod tests {
     #[test]
     fn unroutable_unicast_plans_no_targets() {
         let mut router = router_with_interfaces(2);
-        let payload = [BATADV_UNICAST, 0x02];
+        let payload = [BatmanPacketType::Unicast.as_u8(), 0x02];
         let mut buf = payload.to_vec();
         buf.resize(payload.len() + DIRECTED_TRAILER_LEN, 0);
 

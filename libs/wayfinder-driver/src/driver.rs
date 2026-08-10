@@ -591,7 +591,7 @@ fn build_auth_snapshot(router: &CentralRouter) -> AuthSnapshot {
 /// whole frame across the mesh untouched: a normal unicast for a single host, a
 /// flooded broadcast for the all-ones address (or as multicast fallback), or —
 /// for a multicast group with a known, bounded listener set — an individual
-/// `BATADV_MCAST` copy per interested node.  IGMP is snooped first so the
+/// `BatmanPacketType::Mcast` copy per interested node.  IGMP is snooped first so the
 /// groups the host joins/leaves are announced on the next OGM.
 fn plan_host_frame(
     now: Duration,

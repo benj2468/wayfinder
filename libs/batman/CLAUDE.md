@@ -22,7 +22,7 @@ BATMAN-adv routing protocol implementation. `no_std`, heapless. Implements
   batman-adv's `batadv_ogm_packet` layout (`flags`, `reserved`, big-endian
   `tvlv_len`); can carry a variable-length TVLV tail after the fixed header.
 - `BatmanTvlvHdr` + `find_tvlv` — Type-Version-Length-Value records in the OGM
-  tail. `BATADV_TVLV_MCAST` announces the originator's joined multicast groups.
+  tail. `TvlvType::Mcast` announces the originator's joined multicast groups.
   The router adds `Cert` / `OgmSig` TVLVs for authentication; the engine
   preserves unknown TVLVs verbatim when re-flooding.
 - `BatmanUnicastPacket` — unicast data packets with TTL and destination.
@@ -38,9 +38,14 @@ BATMAN-adv routing protocol implementation. `no_std`, heapless. Implements
 - `set_local_mcast_groups` / `mcast_listeners` — manage local memberships
   (announced in OGMs) and query learned `(group → originators)` memberships.
 
-Protocol constants: `ETH_P_BATMAN` (0x4305), `BATADV_IV_OGM` (0x01),
-`BATADV_BCAST` (0x02), `BATADV_UNICAST` (0x03), `BATADV_MCAST` (0x04),
-`BATADV_TVLV_MCAST` (0x06).
+Protocol constants: `ETH_P_BATMAN` (0x4305) and the `BatmanPacketType`
+`#[repr(u8)]` enum — `Ogm` (0x01), `Bcast` (0x02), `Unicast` (0x03), `Mcast`
+(0x04), `CertReq` (0x05), `CertReply` (0x06), `Keepalive` (0x07). Modelled as an
+enum (not free consts) so the compiler guarantees the type bytes are unique;
+`as_u8()` is the wire byte, `from_u8()` decodes a received one (`None` = a type
+this build doesn't know, routed by destination). Header structs keep
+`packet_type: u8` for exactly that reason. `TvlvType` gets the same treatment
+for OGM-tail records (`BATADV_TVLV_MCAST` is `TvlvType::Mcast`, 0x06).
 
 ## Routing logic
 
@@ -48,7 +53,7 @@ The engine maintains an originator table tracking `neighbor_ident` (destination
 node), `best_next_hop` (immediate neighbor to forward to), `max_tq` (Transmission
 Quality, 0–255), and `paths` (up to 4 alternate paths via different neighbors).
 
-**OGM processing** (`handle_rx`, `BATADV_IV_OGM` arm in `src/engine.rs`):
+**OGM processing** (`handle_rx`, `BatmanPacketType::Ogm` arm in `src/engine.rs`):
 
 1. Drops own OGMs (loop prevention).
 2. Creates or updates the originator record.
@@ -64,18 +69,19 @@ the engine sees an incoming OGM (rejecting unsigned/forged/foreign OGMs) and
 `augment_ogm` appends the cert + signature TVLVs *after* the engine builds one;
 the engine itself is unchanged. See `libs/wayfinder` for `OgmAuth`.
 
-**Multicast forwarding** (`handle_rx`, `BATADV_MCAST` arm + `CentralRouter`):
+**Multicast forwarding** (`handle_rx`, `BatmanPacketType::Mcast` arm +
+`CentralRouter`):
 
 1. Each node announces its locally-joined groups in its OGM's
-   `BATADV_TVLV_MCAST` tail; receivers record `(group → originator)` in
+   `TvlvType::Mcast` tail; receivers record `(group → originator)` in
    `mcast_members`.
 2. To send, `CentralRouter::mcast_plan` chooses `Unicast` (1..=`MCAST_FANOUT`
    known listeners) or `Flood`. For unicast, the executor sends one
-   `BATADV_MCAST` copy per listener via `handle_local_mcast`.
-3. A `BATADV_MCAST` packet routes like a unicast: delivered locally when `dest`
-   is self, else forwarded toward the next hop with TTL decremented.
+   `BatmanPacketType::Mcast` copy per listener via `handle_local_mcast`.
+3. A `BatmanPacketType::Mcast` packet routes like a unicast: delivered locally
+   when `dest` is self, else forwarded toward the next hop with TTL decremented.
 
-**Broadcast flooding** (`handle_rx`, `BATADV_BCAST` arm):
+**Broadcast flooding** (`handle_rx`, `BatmanPacketType::Bcast` arm):
 
 1. Drops own broadcasts (loop prevention).
 2. Deduplicates on `(orig, seqno)` via the engine's `broadcast_seqno` table —
@@ -85,7 +91,7 @@ the engine itself is unchanged. See `libs/wayfinder` for `OgmAuth`.
    buffer and returns `DeliverLocalAndForward(BROADCAST)`. The caller delivers
    the inner frame locally *and* forwards the re-flood.
 
-**Unicast forwarding** (`handle_rx`, `BATADV_UNICAST` arm):
+**Unicast forwarding** (`handle_rx`, `BatmanPacketType::Unicast` arm):
 
 1. Checks if the packet is for the local node (`DeliverLocal`).
 2. Validates TTL > 1.

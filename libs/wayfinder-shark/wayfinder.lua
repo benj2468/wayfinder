@@ -12,7 +12,7 @@
 -- distribution fingerprint (WF_TVLV_CERTFP) that replaces WF_TVLV_CERT on the
 -- wire once fingerprinting is enabled.  The whole tail is also shown as a raw
 -- byte blob.  Also decodes the lazy-cert-distribution control packets
--- (BATADV_CERT_REQ / BATADV_CERT_REPLY): their shared header plus the
+-- (BatmanPacketType::CertReq / CertReply): their shared header plus the
 -- requester's cert + signature, or the replied cert.
 --
 -- Install: copy (or symlink) this file into your Personal Lua Plugins folder
@@ -21,17 +21,17 @@
 
 local ETH_P_BATMAN = 0x4305
 
--- BATMAN packet_type byte values (libs/batman/src/wire.rs).
-local BATADV_IV_OGM = 0x01
-local BATADV_CERT_REQ = 0x05
-local BATADV_CERT_REPLY = 0x06
+-- BATMAN packet_type byte values (libs/batman/src/wire.rs's BatmanPacketType).
+local PKT_OGM = 0x01
+local PKT_CERT_REQ = 0x05
+local PKT_CERT_REPLY = 0x06
 local PACKET_TYPES = {
 	[0x01] = "OGM",
 	[0x02] = "Broadcast",
 	[0x03] = "Unicast",
 	[0x04] = "Multicast",
-	[BATADV_CERT_REQ] = "Cert Request",
-	[BATADV_CERT_REPLY] = "Cert Reply",
+	[PKT_CERT_REQ] = "Cert Request",
+	[PKT_CERT_REPLY] = "Cert Reply",
 }
 
 -- TVLV record type bytes carried in an OGM tail (libs/batman/src/wire.rs).
@@ -96,14 +96,14 @@ f.ogm_sig = ProtoField.bytes("wayfinder.batman.tvlv.ogm_sig", "OGM Signature")
 -- the full WF_TVLV_CERT record on the wire (libs/batman/src/wire.rs).
 f.cert_fp = ProtoField.bytes("wayfinder.batman.tvlv.cert_fp", "Cert Fingerprint")
 
--- Shared header fields for the cert-control packets (BATADV_CERT_REQ /
--- BATADV_CERT_REPLY): structurally a unicast header (version/ttl/dest).
+-- Shared header fields for the cert-control packets (BatmanPacketType::CertReq
+-- / CertReply): structurally a unicast header (version/ttl/dest).
 f.cert_ctrl_version = ProtoField.uint8("wayfinder.batman.cert_ctrl.version", "Version", base.DEC)
 f.cert_ctrl_ttl = ProtoField.uint8("wayfinder.batman.cert_ctrl.ttl", "TTL", base.DEC)
 f.cert_ctrl_dest = ProtoField.ether("wayfinder.batman.cert_ctrl.dest", "Destination")
 
 -- The requester's self-authenticating Ed25519 signature following its cert in
--- a BATADV_CERT_REQ body (see OgmAuth::build_cert_request in
+-- a BatmanPacketType::CertReq body (see OgmAuth::build_cert_request in
 -- libs/wayfinder/src/auth.rs).
 f.cert_req_sig = ProtoField.bytes("wayfinder.batman.cert_req.signature", "Requester Signature")
 
@@ -198,7 +198,7 @@ local function decode_revoke(rec, tvb, voff, vlen, cap_end)
 	rec:add(f.revoke_sig, tvb(voff + REVOKE.SIGNATURE, 64))
 end
 
--- Decode a BATADV_CERT_REQ / BATADV_CERT_REPLY body into `tree`: the shared
+-- Decode a CertReq / CertReply body into `tree`: the shared
 -- header (version/ttl/dest) is already consumed by the caller, so `tvb`
 -- starts at the body — the requester's own cert + a self-authenticating
 -- signature for a request, or the requested originator's raw cert for a
@@ -283,18 +283,18 @@ function wayfinder.dissector(tvb, pinfo, root)
 	-- Cert-control packets (CertReq/CertReply) get their own header/body
 	-- decode; Broadcast/Unicast/Multicast stop after the protocol/type are
 	-- labelled (not decoded in this cut).
-	if ptype == BATADV_CERT_REQ or ptype == BATADV_CERT_REPLY then
+	if ptype == PKT_CERT_REQ or ptype == PKT_CERT_REPLY then
 		if len < CERT_CTRL.HEADER_LEN then
 			return len
 		end
 		tree:add(f.cert_ctrl_version, tvb(CERT_CTRL.VERSION, 1))
 		tree:add(f.cert_ctrl_ttl, tvb(CERT_CTRL.TTL, 1))
 		tree:add(f.cert_ctrl_dest, tvb(CERT_CTRL.DEST, 6))
-		decode_cert_ctrl(tree, tvb, ptype == BATADV_CERT_REQ, CERT_CTRL.HEADER_LEN, len)
+		decode_cert_ctrl(tree, tvb, ptype == PKT_CERT_REQ, CERT_CTRL.HEADER_LEN, len)
 		return len
 	end
 
-	if ptype ~= BATADV_IV_OGM or len < OGM.HEADER_LEN then
+	if ptype ~= PKT_OGM or len < OGM.HEADER_LEN then
 		return len
 	end
 

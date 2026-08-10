@@ -178,14 +178,14 @@ cert** so it changes on any field change (rotation of keys or validity window).
 Mirror `BatmanUnicastPacket` / `BatmanMcastPacket` exactly (they are the
 template: `packet_type, version, ttl, dest`, routed hop-by-hop toward `dest`,
 delivered locally on arrival, TTL-limited). Keeping them as distinct packet
-types (not payloads inside `BATADV_UNICAST`) follows the repo's stated precedent
-— `BATADV_MCAST` is "kept distinct from `BATADV_UNICAST` so multicast traffic
-stays identifiable on the wire" — and lets the dissector and metrics see cert
-traffic.
+types (not payloads inside `BatmanPacketType::Unicast`) follows the repo's
+stated precedent — `BatmanPacketType::Mcast` is "kept distinct from
+`BatmanPacketType::Unicast` so multicast traffic stays identifiable on the wire"
+— and lets the dissector and metrics see cert traffic.
 
 ```
-BATADV_CERT_REQ   = 0x05   struct BatmanCertReqPacket   { packet_type, version, ttl, dest: Mac }
-BATADV_CERT_REPLY = 0x06   struct BatmanCertReplyPacket { packet_type, version, ttl, dest: Mac }
+CertReq   = 0x05   struct BatmanCertReqPacket   { packet_type, version, ttl, dest: Mac }
+CertReply = 0x06   struct BatmanCertReplyPacket { packet_type, version, ttl, dest: Mac }
 ```
 
 Payloads (follow the header):
@@ -199,16 +199,16 @@ Payloads (follow the header):
   new trust path.
 
 **Alternative considered:** carry req/reply as inner payloads of
-`BATADV_UNICAST`, reusing all existing unicast forwarding. Simpler (no new engine
-packet types) but conflates cert control with data on the wire and hides it from
+`BatmanPacketType::Unicast`, reusing all existing unicast forwarding. Simpler
+(no new engine packet types) but conflates cert control with data on the wire and hides it from
 the dissector. Rejected in favor of distinct types, but noted for the
 implementer — if engine forwarding of two new types proves heavy, this is the
 fallback.
 
 ### 4.3 Engine forwarding (`libs/batman/src/engine.rs`)
 
-Teach `handle_rx` to route `BATADV_CERT_REQ` / `BATADV_CERT_REPLY` like a
-unicast: look up `next_hop(dest)`, decrement TTL, re-emit; on arrival at `dest`
+Teach `handle_rx` to route `BatmanPacketType::CertReq` /
+`BatmanPacketType::CertReply` like a unicast: look up `next_hop(dest)`, decrement TTL, re-emit; on arrival at `dest`
 (dest == self) surface as a **local delivery** to the router (a new
 `RoutingAction` / `RxOutcome.deliver_local` variant tagging it as cert-control,
 so the router routes it to `OgmAuth` rather than the host). This stays

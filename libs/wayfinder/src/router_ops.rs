@@ -35,6 +35,7 @@
 //!
 //! [`OgmAuth::revoked_macs`]: crate::auth::OgmAuth::revoked_macs
 
+use batman::wire::BatmanPacketType;
 use core::time::Duration;
 
 use interfaces::frame::LinkFrame;
@@ -180,9 +181,9 @@ pub trait RouterOps {
     fn get_egress_interface(&mut self, now: Duration, dest: Mac) -> Option<EgressInterface>;
 
     /// Whether interface `idx` may transmit a frame of this BATMAN packet type,
-    /// per its configured [`LinkFeatures`]. `None` means "not a BATMAN frame",
-    /// which is never gated.
-    fn link_may_tx(&self, idx: usize, packet_type: Option<u8>) -> bool;
+    /// per its configured [`LinkFeatures`]. `None` means "not a BATMAN frame,
+    /// or a sub-type this build does not recognise", which is never gated.
+    fn link_may_tx(&self, idx: usize, packet_type: Option<BatmanPacketType>) -> bool;
 
     /// This interface's participation gates.
     fn link_features(&self, idx: usize) -> LinkFeatures;
@@ -308,7 +309,7 @@ impl<
         Self::get_egress_interface(self, now, dest)
     }
 
-    fn link_may_tx(&self, idx: usize, packet_type: Option<u8>) -> bool {
+    fn link_may_tx(&self, idx: usize, packet_type: Option<BatmanPacketType>) -> bool {
         Self::link_may_tx(self, idx, packet_type)
     }
 

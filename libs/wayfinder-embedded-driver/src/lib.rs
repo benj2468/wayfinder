@@ -560,8 +560,8 @@ mod tests {
     use super::*;
     use interfaces::link::LinkError;
     use interfaces::link::LinkMetrics;
-    use wayfinder::batman::wire::BATADV_IV_OGM;
     use wayfinder::batman::wire::BatmanOgmPacket;
+    use wayfinder::batman::wire::BatmanPacketType;
     use wayfinder::interfaces::frame::LinkFrame;
     use wayfinder::link::Received;
     use zerocopy::FromBytes;
@@ -575,7 +575,7 @@ mod tests {
     /// TVLVs (auth-off), enough for the engine to re-flood it.
     fn bare_ogm_bytes(orig: Mac, seqno: u32, ttl: u8) -> Vec<u8> {
         let ogm = BatmanOgmPacket {
-            packet_type: BATADV_IV_OGM,
+            packet_type: BatmanPacketType::Ogm.as_u8(),
             version: 5,
             ttl,
             flags: 0,

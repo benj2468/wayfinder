@@ -7,10 +7,81 @@ use zerocopy::KnownLayout;
 /// EtherType identifying BATMAN frames on the wire (batman-adv's `ETH_P_BATMAN`).
 pub const ETH_P_BATMAN: u16 = 0x4305;
 
-// Core BATMAN packet identifiers
-/// `packet_type` for an originator message (OGM), the topology-discovery
-/// broadcast — batman-adv's `BATADV_IV_OGM`.
-pub const BATADV_IV_OGM: u8 = 0x01;
+/// The BATMAN packet types this implementation produces and routes, each a
+/// distinct on-the-wire `packet_type` byte (the first byte of a BATMAN frame's
+/// payload).  Modelled as a `#[repr(u8)]` enum — rather than a set of free
+/// `const`s — so the compiler *guarantees* the type bytes are unique (a
+/// duplicated discriminant is a compile error) and keeps every assignment in
+/// one place, exactly as [`TvlvType`] does for TVLV records.  The raw byte is
+/// [`BatmanPacketType::as_u8`]; [`BatmanPacketType::from_u8`] recovers the
+/// variant from a received byte, returning `None` for a type this node does not
+/// recognise.  The `packet_type` field of each header struct stays a `u8`
+/// because the wire may carry those unrecognised types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BatmanPacketType {
+    /// An originator message (OGM), the topology-discovery broadcast —
+    /// batman-adv's `BATADV_IV_OGM`.  Header: [`BatmanOgmPacket`].
+    Ogm = 0x01,
+    /// A flooded broadcast frame.  Matches batman-adv's `BATADV_BCAST`.  Used
+    /// to carry broadcast/multicast link-layer frames (e.g. ARP) across the
+    /// mesh, deduplicated and TTL-limited so they reach every node exactly once
+    /// without looping.  Header: [`BatmanBroadcastPacket`].
+    Bcast = 0x02,
+    /// A unicast data packet routed hop-by-hop toward a single destination node
+    /// — batman-adv's `BATADV_UNICAST`.  Header: [`BatmanUnicastPacket`].
+    Unicast = 0x03,
+    /// A selectively-forwarded multicast frame, mirroring batman-adv's
+    /// `batadv_mcast_packet`.  A multicast frame with a bounded set of
+    /// interested listeners is delivered as one [`BatmanMcastPacket`] per
+    /// listener, each addressed to that listener's node and routed toward it
+    /// like a unicast.  Kept distinct from [`BatmanPacketType::Unicast`] so
+    /// multicast traffic stays identifiable on the wire.
+    Mcast = 0x04,
+    /// A lazy-cert-distribution fetch request, routed hop-by-hop toward the
+    /// originator whose cert is needed — Wayfinder-specific, no batman-adv
+    /// counterpart. Kept as its own packet type (not a
+    /// [`BatmanPacketType::Unicast`] payload) for the same reason as
+    /// [`BatmanPacketType::Mcast`]: so cert-control traffic stays identifiable
+    /// on the wire, separate from data.  Header: [`BatmanCertReqPacket`].
+    CertReq = 0x05,
+    /// The reply to a [`BatmanPacketType::CertReq`], routed hop-by-hop back
+    /// toward the requester. Wayfinder-specific, no batman-adv counterpart.
+    /// Header: [`BatmanCertReplyPacket`].
+    CertReply = 0x06,
+    /// A link-local keep-alive heartbeat. Single-hop only — never
+    /// forwarded/relayed, carries no destination or TTL (the link-layer
+    /// `frame.src` already identifies the sender). Detects a gone-quiet
+    /// immediate neighbor far faster than OGM-interval-based staleness, without
+    /// affecting OGM-driven topology discovery at all. Wayfinder-specific, no
+    /// batman-adv counterpart.  Header: [`BatmanKeepAlivePacket`].
+    Keepalive = 0x07,
+}
+
+impl BatmanPacketType {
+    /// The on-the-wire `packet_type` byte for this packet type — the enum's
+    /// discriminant.
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// The packet type a received `packet_type` byte denotes, or `None` when
+    /// `byte` is a type this node does not recognise (a newer peer's extension,
+    /// or garbage).  Callers treat `None` as "not a BATMAN packet type we route
+    /// by sub-type" rather than as a parse error.
+    pub const fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            0x01 => Some(Self::Ogm),
+            0x02 => Some(Self::Bcast),
+            0x03 => Some(Self::Unicast),
+            0x04 => Some(Self::Mcast),
+            0x05 => Some(Self::CertReq),
+            0x06 => Some(Self::CertReply),
+            0x07 => Some(Self::Keepalive),
+            _ => None,
+        }
+    }
+}
 
 /// Originator Message header.  A variable-length TVLV region of `tvlv_len`
 /// bytes (a sequence of [`BatmanTvlvHdr`]-prefixed records) follows this fixed
@@ -19,7 +90,7 @@ pub const BATADV_IV_OGM: u8 = 0x01;
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, PartialEq, Eq)]
 #[repr(C, packed)]
 pub struct BatmanOgmPacket {
-    /// Always [`BATADV_IV_OGM`] for this packet type.
+    /// Always [`BatmanPacketType::Ogm`] for this packet type.
     pub packet_type: u8,
     /// Protocol version (typically 5).
     pub version: u8,
@@ -178,12 +249,6 @@ impl<'a> Iterator for TvlvValues<'a> {
     }
 }
 
-/// Packet sub-type for a flooded broadcast frame.  Matches batman-adv's
-/// `BATADV_BCAST`.  Used to carry broadcast/multicast link-layer frames
-/// (e.g. ARP) across the mesh, deduplicated and TTL-limited so they reach
-/// every node exactly once without looping.
-pub const BATADV_BCAST: u8 = 0x02;
-
 /// Header for a broadcast frame flooded across the mesh.
 ///
 /// The encapsulated link-layer frame (the thing actually being broadcast,
@@ -194,7 +259,7 @@ pub const BATADV_BCAST: u8 = 0x02;
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, PartialEq, Eq)]
 #[repr(C, packed)]
 pub struct BatmanBroadcastPacket {
-    /// Always [`BATADV_BCAST`] for this packet type.
+    /// Always [`BatmanPacketType::Bcast`] for this packet type.
     pub packet_type: u8,
     /// Protocol version (typically 5), matching the OGM/unicast convention.
     pub version: u8,
@@ -211,26 +276,14 @@ pub struct BatmanBroadcastPacket {
     pub orig: Mac,
 }
 
-/// `packet_type` for a unicast data packet routed hop-by-hop toward a single
-/// destination node — batman-adv's `BATADV_UNICAST`.
-pub const BATADV_UNICAST: u8 = 0x03;
-
-/// Packet sub-type for a selectively-forwarded multicast frame, mirroring
-/// batman-adv's `batadv_mcast_packet`.  A multicast frame with a bounded set
-/// of interested listeners is delivered as one [`BatmanMcastPacket`] per
-/// listener, each addressed to that listener's node and routed toward it like
-/// a unicast.  Kept distinct from [`BATADV_UNICAST`] so multicast traffic
-/// stays identifiable on the wire.
-pub const BATADV_MCAST: u8 = 0x04;
-
-/// Header for a [`BATADV_MCAST`] packet.  Structurally a unicast header: the
-/// encapsulated multicast frame follows it, and the packet is routed hop by
+/// Header for a [`BatmanPacketType::Mcast`] packet.  Structurally a unicast
+/// header: the encapsulated multicast frame follows it, and the packet is routed hop by
 /// hop toward `dest` (the listener node this copy targets), TTL-limited to
 /// prevent loops, and delivered to the local host on arrival at `dest`.
 #[derive(Debug, Clone, Copy, IntoBytes, FromBytes, Immutable, KnownLayout)]
 #[repr(C, packed)]
 pub struct BatmanMcastPacket {
-    /// Always [`BATADV_MCAST`].
+    /// Always [`BatmanPacketType::Mcast`].
     pub packet_type: u8,
     /// Protocol version.
     pub version: u8,
@@ -240,13 +293,13 @@ pub struct BatmanMcastPacket {
     pub dest: Mac,
 }
 
-/// Header for a [`BATADV_UNICAST`] data packet.  The encapsulated payload
-/// follows it and the packet is routed hop by hop toward `dest`, TTL-limited to
-/// prevent loops, and delivered to the local host on arrival at `dest`.
+/// Header for a [`BatmanPacketType::Unicast`] data packet.  The encapsulated
+/// payload follows it and the packet is routed hop by hop toward `dest`,
+/// TTL-limited to prevent loops, and delivered to the local host on arrival at `dest`.
 #[derive(Debug, Clone, Copy, IntoBytes, FromBytes, Immutable, KnownLayout)]
 #[repr(C, packed)]
 pub struct BatmanUnicastPacket {
-    /// Always [`BATADV_UNICAST`].
+    /// Always [`BatmanPacketType::Unicast`].
     pub packet_type: u8,
     /// Protocol version.
     pub version: u8,
@@ -256,19 +309,8 @@ pub struct BatmanUnicastPacket {
     pub dest: Mac,
 }
 
-/// `packet_type` for a lazy-cert-distribution fetch request, routed hop-by-hop
-/// toward the originator whose cert is needed — Wayfinder-specific, no
-/// batman-adv counterpart. Kept as its own packet type (not a
-/// [`BATADV_UNICAST`] payload) for the same reason as [`BATADV_MCAST`]: so
-/// cert-control traffic stays identifiable on the wire, separate from data.
-pub const BATADV_CERT_REQ: u8 = 0x05;
-
-/// `packet_type` for the reply to a [`BATADV_CERT_REQ`], routed hop-by-hop back
-/// toward the requester. Wayfinder-specific, no batman-adv counterpart.
-pub const BATADV_CERT_REPLY: u8 = 0x06;
-
-/// Header for a [`BATADV_CERT_REQ`] packet. Structurally a unicast header: the
-/// requester's `MembershipCert` + signature (see the router's cert-request
+/// Header for a [`BatmanPacketType::CertReq`] packet. Structurally a unicast
+/// header: the requester's `MembershipCert` + signature (see the router's cert-request
 /// logic) follows it, and the packet is routed hop by hop toward `dest` — the
 /// originator whose cert is being requested — TTL-limited, delivered to the
 /// local auth state on arrival at `dest` (or at any intermediate holder that
@@ -276,7 +318,7 @@ pub const BATADV_CERT_REPLY: u8 = 0x06;
 #[derive(Debug, Clone, Copy, IntoBytes, FromBytes, Immutable, KnownLayout)]
 #[repr(C, packed)]
 pub struct BatmanCertReqPacket {
-    /// Always [`BATADV_CERT_REQ`].
+    /// Always [`BatmanPacketType::CertReq`].
     pub packet_type: u8,
     /// Protocol version.
     pub version: u8,
@@ -286,14 +328,14 @@ pub struct BatmanCertReqPacket {
     pub dest: Mac,
 }
 
-/// Header for a [`BATADV_CERT_REPLY`] packet. Structurally a unicast header:
+/// Header for a [`BatmanPacketType::CertReply`] packet. Structurally a unicast header:
 /// the requested `MembershipCert` follows it, and the packet is routed hop by
 /// hop back toward `dest` — the original requester — TTL-limited, delivered to
 /// the local auth state on arrival at `dest`.
 #[derive(Debug, Clone, Copy, IntoBytes, FromBytes, Immutable, KnownLayout)]
 #[repr(C, packed)]
 pub struct BatmanCertReplyPacket {
-    /// Always [`BATADV_CERT_REPLY`].
+    /// Always [`BatmanPacketType::CertReply`].
     pub packet_type: u8,
     /// Protocol version.
     pub version: u8,
@@ -303,22 +345,14 @@ pub struct BatmanCertReplyPacket {
     pub dest: Mac,
 }
 
-/// `packet_type` for a link-local keep-alive heartbeat. Single-hop only —
-/// never forwarded/relayed, carries no destination or TTL (the link-layer
-/// `frame.src` already identifies the sender). Detects a gone-quiet immediate
-/// neighbor far faster than OGM-interval-based staleness, without affecting
-/// OGM-driven topology discovery at all. Wayfinder-specific, no batman-adv
-/// counterpart.
-pub const BATADV_KEEPALIVE: u8 = 0x07;
-
-/// Header for a [`BATADV_KEEPALIVE`] heartbeat. Deliberately minimal (no
-/// seqno, no origin, no TVLV tail) — it exists purely to prove a link is
+/// Header for a [`BatmanPacketType::Keepalive`] heartbeat. Deliberately minimal
+/// (no seqno, no origin, no TVLV tail) — it exists purely to prove a link is
 /// still alive between OGMs, so it carries nothing beyond the packet-type
 /// tag and protocol version.
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, PartialEq, Eq)]
 #[repr(C, packed)]
 pub struct BatmanKeepAlivePacket {
-    /// Always [`BATADV_KEEPALIVE`].
+    /// Always [`BatmanPacketType::Keepalive`].
     pub packet_type: u8,
     /// Protocol version (typically 5), matching every other BATMAN packet.
     pub version: u8,
@@ -395,27 +429,41 @@ mod tests {
         assert_eq!(find_tvlv(&region, TvlvType::CertFp), Some(&fp[..]));
     }
 
-    /// The cert-request/reply packet-type bytes are the documented values and
-    /// distinct from every other packet type on the wire.
+    /// Every packet type's discriminant is the documented on-the-wire byte.
+    /// The enum makes collisions a compile error, so this only has to pin the
+    /// *values* — the wire contract other implementations (and the Wireshark
+    /// dissector) are written against.
     #[test]
-    fn cert_packet_types_are_stable_and_distinct() {
-        assert_eq!(BATADV_CERT_REQ, 0x05);
-        assert_eq!(BATADV_CERT_REPLY, 0x06);
-        assert_eq!(BATADV_KEEPALIVE, 0x07);
+    fn packet_type_bytes_are_stable() {
+        assert_eq!(BatmanPacketType::Ogm.as_u8(), 0x01);
+        assert_eq!(BatmanPacketType::Bcast.as_u8(), 0x02);
+        assert_eq!(BatmanPacketType::Unicast.as_u8(), 0x03);
+        assert_eq!(BatmanPacketType::Mcast.as_u8(), 0x04);
+        assert_eq!(BatmanPacketType::CertReq.as_u8(), 0x05);
+        assert_eq!(BatmanPacketType::CertReply.as_u8(), 0x06);
+        assert_eq!(BatmanPacketType::Keepalive.as_u8(), 0x07);
+    }
+
+    /// `from_u8` is the exact inverse of `as_u8` over the known types, and
+    /// rejects a byte outside them rather than inventing a variant — the
+    /// engine's dispatch relies on `None` meaning "route by destination".
+    #[test]
+    fn packet_type_roundtrips_and_rejects_unknown() {
         let all = [
-            BATADV_IV_OGM,
-            BATADV_BCAST,
-            BATADV_UNICAST,
-            BATADV_MCAST,
-            BATADV_CERT_REQ,
-            BATADV_CERT_REPLY,
-            BATADV_KEEPALIVE,
+            BatmanPacketType::Ogm,
+            BatmanPacketType::Bcast,
+            BatmanPacketType::Unicast,
+            BatmanPacketType::Mcast,
+            BatmanPacketType::CertReq,
+            BatmanPacketType::CertReply,
+            BatmanPacketType::Keepalive,
         ];
-        for (i, a) in all.iter().enumerate() {
-            for b in &all[i + 1..] {
-                assert_ne!(a, b, "packet types must be distinct");
-            }
+        for ty in all {
+            assert_eq!(BatmanPacketType::from_u8(ty.as_u8()), Some(ty));
         }
+        assert_eq!(BatmanPacketType::from_u8(0x00), None);
+        assert_eq!(BatmanPacketType::from_u8(0x08), None);
+        assert_eq!(BatmanPacketType::from_u8(0xff), None);
     }
 
     /// `BatmanKeepAlivePacket` round-trips through `zerocopy` parsing like
@@ -423,11 +471,11 @@ mod tests {
     #[test]
     fn keepalive_packet_roundtrips() {
         let pkt = BatmanKeepAlivePacket {
-            packet_type: BATADV_KEEPALIVE,
+            packet_type: BatmanPacketType::Keepalive.as_u8(),
             version: 5,
         };
         let (parsed, _) = BatmanKeepAlivePacket::ref_from_prefix(pkt.as_bytes()).unwrap();
-        assert_eq!(parsed.packet_type, BATADV_KEEPALIVE);
+        assert_eq!(parsed.packet_type, BatmanPacketType::Keepalive.as_u8());
         assert_eq!(parsed.version, 5);
         assert_eq!(core::mem::size_of::<BatmanKeepAlivePacket>(), 2);
     }
@@ -447,13 +495,13 @@ mod tests {
         );
 
         let req = BatmanCertReqPacket {
-            packet_type: BATADV_CERT_REQ,
+            packet_type: BatmanPacketType::CertReq.as_u8(),
             version: 5,
             ttl: 10,
             dest: Mac([0, 0, 0, 0, 0, 9]),
         };
         let (parsed, _) = BatmanCertReqPacket::ref_from_prefix(req.as_bytes()).unwrap();
-        assert_eq!(parsed.packet_type, BATADV_CERT_REQ);
+        assert_eq!(parsed.packet_type, BatmanPacketType::CertReq.as_u8());
         assert_eq!(parsed.dest, Mac([0, 0, 0, 0, 0, 9]));
     }
 }

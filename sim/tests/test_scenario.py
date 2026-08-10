@@ -83,12 +83,12 @@ def test_rejects_duplicate_node_names():
 
 
 # The BATMAN sub-type tag (the first payload byte) for a keep-alive
-# heartbeat — see `libs/batman/src/wire.rs`'s `BATADV_KEEPALIVE`.
-_BATADV_KEEPALIVE = 0x07
+# heartbeat — see `libs/batman/src/wire.rs`'s `BatmanPacketType::Keepalive`.
+_PKT_KEEPALIVE = 0x07
 
 
 def _is_keepalive_frame(frame: bytes) -> bool:
-    return len(frame) > 14 and frame[14] == _BATADV_KEEPALIVE
+    return len(frame) > 14 and frame[14] == _PKT_KEEPALIVE
 
 
 def _drain_until_keepalive(driver: wf.PyDriver, iface: int, until_ms: int) -> bool:
