@@ -74,13 +74,18 @@ pub struct NodeSnapshot {
 /// Every request goes over one connection, taken once (see
 /// [`NodeConnection::run`]). A failure in any of them fails the whole poll and
 /// drops the connection, because a dashboard showing eight fresh tables and two
-/// silently stale ones is worse than one that says it lost the node.
+/// silently stale ones is worse than one that says it lost the node — and
+/// because reusing a connection past a transport-level failure risks reading a
+/// stale response as the answer to the next request (see
+/// [`NodeConnection::run`]).
 ///
 /// The one deliberate exception is the enrollment RPC: a node that is not a
-/// certificate-authority provider answers it with an error, which is a fact
-/// about the node rather than a fault. That is recorded as "no provider data"
-/// and the rest of the poll stands — the Security tab is one tab, not the
-/// dashboard.
+/// certificate-authority provider answers it with a clean server-side error
+/// ([`is_missing_provider`]), which is a fact about the node rather than a
+/// fault. That is recorded as "no provider data" and the rest of the poll
+/// stands — the Security tab is one tab, not the dashboard. Any other failure
+/// on this RPC (a transport or decode error) is not recognized and fails the
+/// whole poll like every other table here.
 #[cfg(feature = "ssr")]
 pub async fn build_snapshot(conn: &NodeConnection, since_seq: u64) -> anyhow::Result<NodeSnapshot> {
     conn.run(async |client| {
@@ -94,9 +99,47 @@ pub async fn build_snapshot(conn: &NodeConnection, since_seq: u64) -> anyhow::Re
             throughput: client.throughput().await?,
             metrics: Some(client.node_metrics().await?),
             security: Some(client.security_status().await?),
-            pending_csrs: client.list_pending_csrs().await.ok(),
+            pending_csrs: match client.list_pending_csrs().await {
+                Ok(resp) => Some(resp),
+                Err(e) if is_missing_provider(&e) => None,
+                Err(e) => return Err(e),
+            },
             logs: client.logs(since_seq, LOG_BATCH).await?,
         })
     })
     .await
+}
+
+/// True for the one recognized "this node is not a certificate-authority
+/// provider" answer to the enrollment RPCs (the exact wording served by
+/// `wayfinder_server::adapter`'s `MeshAdapter`). Anything else — a transport
+/// failure, a decode failure, a different server-side error — is a real fault,
+/// not this specific, expected business answer, and must not be swallowed.
+#[cfg(feature = "ssr")]
+fn is_missing_provider(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .contains("not a certificate-authority provider")
+}
+
+#[cfg(all(test, feature = "ssr"))]
+mod tests {
+    use super::is_missing_provider;
+
+    #[test]
+    fn recognizes_the_not_a_provider_server_error() {
+        let err = anyhow::anyhow!("server error: node is not a certificate-authority provider");
+        assert!(is_missing_provider(&err));
+    }
+
+    #[test]
+    fn does_not_recognize_a_transport_failure() {
+        let err = anyhow::anyhow!("connection reset by peer");
+        assert!(!is_missing_provider(&err));
+    }
+
+    #[test]
+    fn does_not_recognize_an_unrelated_server_error() {
+        let err = anyhow::anyhow!("server error: node is not enrolled");
+        assert!(!is_missing_provider(&err));
+    }
 }
