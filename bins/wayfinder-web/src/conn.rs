@@ -1,0 +1,139 @@
+//! The dashboard's connection to a node's management API.
+//!
+//! Server-side only, and the only place in this crate that speaks the
+//! management protocol. Lives in the axum state and is reached from `#[server]`
+//! functions; the browser never touches it.
+//!
+//! # Why a single client behind a mutex
+//!
+//! [`Client`] owns one stream and takes `&mut self` per request, so it cannot be
+//! shared. Rather than a pool, this holds one connection and serialises polls
+//! through it — a dashboard polls roughly once a second, and one lock per poll
+//! costs nothing. Several concurrent viewers would queue behind each other; if
+//! that ever matters, a pool goes here and no caller changes.
+//!
+//! The reconnect policy is the TUI's (`wayfinder-tui`'s `refresh`): connect
+//! lazily, and on any failure drop the client so the next poll reconnects. A
+//! node restarting, or a cable moving, then costs one failed poll rather than a
+//! dashboard that is wedged until someone restarts it.
+
+use tokio::sync::Mutex;
+use wayfinder_client::Client;
+use wayfinder_client::Endpoint;
+
+/// How the dashboard reaches the node.
+///
+/// The same two transports the TUI offers: the authenticated TLS management API
+/// of a host node, or the unauthenticated serial port an embedded node exposes
+/// for debugging.
+pub enum Target {
+    /// The node's TLS management API, with the pinned node key and this
+    /// dashboard's client identity.
+    Tls(Endpoint),
+    /// A serial port opened at a fixed baud rate. No TLS and no authentication
+    /// — an embedded node's debug management port (e.g. the nRF52840's USB
+    /// CDC-ACM port).
+    Serial {
+        /// The serial device path.
+        path: String,
+        /// The baud rate to open it at.
+        baud: u32,
+    },
+}
+
+impl Target {
+    /// Open a fresh [`Client`] over this target.
+    pub async fn connect(&self) -> anyhow::Result<Client> {
+        match self {
+            Target::Tls(endpoint) => {
+                Client::connect_tls(endpoint.addr, &endpoint.node_key, &endpoint.identity).await
+            }
+            Target::Serial { path, baud } => Client::connect_serial(path, *baud).await,
+        }
+    }
+
+    /// A short human-readable label naming what the dashboard is pointed at,
+    /// shown in the header so it is never ambiguous which node is on screen.
+    pub fn label(&self) -> String {
+        match self {
+            Target::Tls(endpoint) => endpoint.addr.to_string(),
+            Target::Serial { path, baud } => format!("{path} @ {baud} baud"),
+        }
+    }
+}
+
+/// A lazily-established, automatically-reconnecting connection to one node.
+pub struct NodeConnection {
+    /// What to connect to, and how.
+    target: Target,
+    /// The live client, or `None` before the first poll and after a failure.
+    client: Mutex<Option<Client>>,
+}
+
+impl NodeConnection {
+    /// Build a connection to `target`. Does no I/O — the first [`run`] call
+    /// establishes the connection, so the server starts even with the node
+    /// down and recovers on its own when the node comes back.
+    ///
+    /// [`run`]: NodeConnection::run
+    pub fn new(target: Target) -> Self {
+        Self {
+            target,
+            client: Mutex::new(None),
+        }
+    }
+
+    /// The connection's display label; see [`Target::label`].
+    pub fn label(&self) -> String {
+        self.target.label()
+    }
+
+    /// Whether a connection is currently established.
+    ///
+    /// Intended for the status strip and for tests asserting the connection is
+    /// reused across polls; correctness never depends on it, since [`run`]
+    /// connects on demand anyway.
+    ///
+    /// [`run`]: NodeConnection::run
+    pub fn is_connected(&self) -> bool {
+        self.client
+            .try_lock()
+            .is_ok_and(|guard| guard.as_ref().is_some())
+    }
+
+    /// Run one exchange against the node, connecting first if needed.
+    ///
+    /// `op` gets the connected client and may issue any number of requests; it
+    /// is passed the whole client rather than one request at a time so a poll
+    /// that reads ten tables takes one lock and one connection decision instead
+    /// of ten.
+    ///
+    /// On failure — whether connecting or inside `op` — the client is dropped so
+    /// the next call reconnects. A half-consumed stream is unusable for framing
+    /// reasons anyway: a response that arrived late would be read as the answer
+    /// to the *next* request, which is worse than reconnecting.
+    pub async fn run<T, F>(&self, op: F) -> anyhow::Result<T>
+    where
+        F: AsyncFnOnce(&mut Client) -> anyhow::Result<T>,
+    {
+        let mut guard = self.client.lock().await;
+
+        if guard.is_none() {
+            *guard = Some(self.target.connect().await?);
+        }
+
+        let Some(client) = guard.as_mut() else {
+            // Unreachable: the branch above just filled it. Written as a match
+            // rather than an unwrap because this crate denies `expect_used`.
+            anyhow::bail!("connection missing after connect");
+        };
+
+        match op(client).await {
+            Ok(value) => Ok(value),
+            Err(e) => {
+                *guard = None;
+                Err(e)
+            }
+        }
+    }
+}

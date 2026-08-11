@@ -19,6 +19,10 @@ RUN rustup component add clippy
 # .gitlab-ci.yml) — Tier 2 with prebuilt core/alloc, so no nightly required.
 RUN rustup target add thumbv7em-none-eabihf
 
+# Browser target for `bins/wayfinder-web`: cargo-leptos builds that crate twice,
+# once for the host (the axum server) and once for wasm (the hydration bundle).
+RUN rustup target add wasm32-unknown-unknown
+
 # Install cargo-nextest and cargo-llvm-cov binaries using pre-compiled installers
 # (Much faster than running `cargo install` inside the Dockerfile)
 RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
@@ -31,6 +35,12 @@ RUN cargo binstall -y sccache
 RUN cargo binstall -y maturin
 RUN cargo binstall -y cargo-ndk
 RUN cargo binstall -y flip-link
+# The web dashboard's build driver. `wasm-bindgen-cli` is pinned exactly: it
+# refuses to run when its version differs from the `wasm-bindgen` crate's, so it
+# tracks the `=0.2.126` in bins/wayfinder-web/Cargo.toml and the devShell's
+# `wasm-bindgen-cli_0_2_126`. Bump all three together.
+RUN cargo binstall -y cargo-leptos
+RUN cargo binstall -y wasm-bindgen-cli@0.2.126
 
 # Ensure protoc is globally accessible (usually /usr/bin/protoc via apt)
 ENV PROTOC=/usr/bin/protoc

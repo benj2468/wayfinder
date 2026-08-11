@@ -1,0 +1,107 @@
+[package]
+name = "wayfinder-web"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+# `cargo-leptos` builds this crate twice: the `rlib` links into the axum server
+# binary, and the `cdylib` becomes the wasm hydration bundle the browser loads.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "wayfinder-web"
+path = "src/main.rs"
+
+# Gated, or a plain `cargo build --workspace` would try to build it without the
+# feature its dependencies hang off and fail — examples are built by the
+# workspace even when the crate itself compiles to a stub.
+[[example]]
+name = "mock_node"
+required-features = ["mock-node"]
+
+[dependencies]
+# Unconditional, unlike every other wayfinder dependency here: the browser half
+# deserializes the same proto types the server encodes, so `serde` is needed in
+# both the ssr and hydrate builds.
+wayfinder-protos = { workspace = true, features = ["serde"] }
+
+leptos = { workspace = true }
+leptos_router = { workspace = true }
+leptos_meta = { workspace = true }
+serde.workspace = true
+
+# --- ssr only: the axum server and everything that talks to a node ----------
+# None of these build for wasm32 (`wayfinder-client` alone pulls in tokio net,
+# tokio-rustls and tokio-serial), which is the whole reason the management API
+# is reached from the server rather than the browser.
+wayfinder-client = { workspace = true, optional = true }
+wayfinder-auth = { workspace = true, features = ["std"], optional = true }
+leptos_axum = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
+clap = { workspace = true, features = ["env"], optional = true }
+anyhow = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+# --- mock-node only: a stand-in node to develop the dashboard against -------
+wayfinder-server = { workspace = true, optional = true }
+wayfinder-tls-mgmt = { workspace = true, optional = true }
+wayfinder-log = { workspace = true, optional = true }
+
+# --- hydrate only ----------------------------------------------------------
+console_error_panic_hook = { version = "0.1", optional = true }
+# Exact, not caret: `wasm-bindgen` refuses to run when the CLI generating the JS
+# glue differs in version from the crate compiled into the wasm. The devShell
+# pins the matching `wasm-bindgen-cli_0_2_126`; bump both together or the
+# hydrate build fails with a version-mismatch error.
+wasm-bindgen = { version = "=0.2.126", optional = true }
+
+[features]
+# Deliberately empty: a bare `cargo build --workspace` then compiles a stub
+# (`main` is `#[cfg(feature = "ssr")]`-gated) rather than failing, so this crate
+# does not break the root workspace build. `cargo-leptos` always passes one of
+# the two features below explicitly.
+default = []
+ssr = [
+  "dep:wayfinder-client",
+  "dep:wayfinder-auth",
+  "dep:leptos_axum",
+  "dep:axum",
+  "dep:tokio",
+  "dep:tower-http",
+  "dep:clap",
+  "dep:anyhow",
+  "dep:tracing",
+  "dep:tracing-subscriber",
+  "leptos/ssr",
+  "leptos_meta/ssr",
+  "leptos_router/ssr",
+]
+hydrate = ["dep:console_error_panic_hook", "dep:wasm-bindgen", "leptos/hydrate"]
+# A canned stand-in node (`src/mock.rs`), so the dashboard can be developed and
+# tested without hardware or a running mesh. Off by default — a development
+# tool, in the same spirit as `libs/rylr998-sim`, with no business in a release
+# build. Implies `ssr`: it is the server half that speaks to a node at all.
+mock-node = [
+  "ssr",
+  "dep:wayfinder-server",
+  "dep:wayfinder-tls-mgmt",
+  "dep:wayfinder-log",
+]
+
+[dev-dependencies]
+# The integration tests drive a poll against the real `serve_tls_server` (see
+# the `mock-node` feature) rather than a stubbed client, so they catch a framing
+# or field-wiring mistake the way a live node would.
+wayfinder-log.workspace = true
+tokio.workspace = true
+# `tests/http.rs` drives the router in-process with `ServiceExt::oneshot`
+# instead of over a socket: same code path, no port to race on.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+serde_json.workspace = true

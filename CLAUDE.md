@@ -71,6 +71,19 @@ invocation from its own directory:
   `cargo-fuzz` targets, not unit tests; run explicitly with `cargo fuzz run`,
   not part of any `nextest` invocation.
 
+**`bins/wayfinder-web` is a workspace member but is still missed by a plain
+workspace build or test run**, for a different reason: its `default` feature set
+is empty on purpose (so `cargo build --workspace` compiles a stub instead of
+failing), and its tests sit behind the `mock-node` feature. It needs its own
+invocations, which CI's `build:web` job runs:
+
+```bash
+cargo build -p wayfinder-web --features ssr
+cargo build -p wayfinder-web --features hydrate --target wasm32-unknown-unknown
+cargo test -p wayfinder-web --features mock-node
+cargo leptos build            # both halves, the way it actually ships
+```
+
 ## Always-on rules
 
 ### Model selection
@@ -322,6 +335,12 @@ does the I/O for the interfaces in that plan — a `LinkT::send` on embedded, a
   listeners from YAML and hands them to a `wayfinder-driver::Driver`.
 - **bins/wayfinder-tui** — `ratatui` dashboard (routing, link quality, OGM
   schedule, throughput/metrics, security tabs).
+- **bins/wayfinder-web** → the same seven views in a browser, for reaching a
+  node without a terminal and for supporting non-technical users. Leptos in SSR
+  mode: one crate built twice, into an axum server that holds the node
+  connection and a wasm bundle that hydrates its markup. The browser never
+  speaks the management protocol — `wayfinder-client` is tokio/rustls and does
+  not build for wasm — so every node interaction is a `#[server]` function.
 - **bins/wayfinder-ctl** (`wayfinderctl`) — CLI mgmt client (query commands) +
   offline `cert` tooling + online `enroll`.
 - **bins/rylr998-cli** — a small host CLI for driving a RYLR998/498 module over
