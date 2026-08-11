@@ -4,13 +4,22 @@
 
     flake-parts.url = "github:hercules-ci/flake-parts";
 
-    treefmt-nix.url = "github:numtide/treefmt-nix";
+    treefmt-nix = {
+      url = "github:numtide/treefmt-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
 
-    fenix.url = "github:nix-community/fenix";
+    fenix = {
+      url = "github:nix-community/fenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
 
     crane.url = "github:ipetkov/crane";
 
-    git-hooks.url = "github:cachix/git-hooks.nix";
+    git-hooks = {
+      url = "github:cachix/git-hooks.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
