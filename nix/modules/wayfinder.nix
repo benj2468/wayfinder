@@ -5,9 +5,15 @@
 # `nix/tests/simple.nix` for a complete worked example (also runnable as a
 # smoke test: `nix build .#wayfinder-simple`).
 #
-# `wayfinder-tap`/`wayfinder-tui`/`wayfinder-ctl` come from this same flake's
-# `overlays.default`; pull them in separately if you want the packages without
-# the module.
+# `wayfinder-tap`/`wayfinder-tui`/`wayfinder-ctl`/`wayfinder-web` come from this
+# same flake's `overlays.default`; pull them in separately if you want the
+# packages without the module.
+#
+# `services.wayfinder.web` runs the browser dashboard. It is independent of
+# `services.wayfinder.enable` — it speaks to a node over the management API, so
+# it can equally be pointed at a node on another host — but the common case is
+# running it beside one, where it reuses that node's identity seed and needs no
+# key of its own.
 {
   lib,
   config,
@@ -48,57 +54,168 @@ in
         activation script gated on `wayfinder.service` being up).
       '';
     };
-  };
 
-  config = lib.mkIf wayfinderCfg.enable {
+    web = {
+      enable = mkEnableOption "the wayfinder web dashboard";
 
-    environment.systemPackages = [
-      wayfinder-tui
-      wayfinder-ctl
-    ];
+      listen = mkOption {
+        type = types.str;
+        default = "127.0.0.1:8080";
+        description = ''
+          Address to serve the dashboard on.
 
-    users.users.wayfinder = {
-      isSystemUser = true;
-      group = "wayfinder";
-    };
-    users.groups.wayfinder = { };
-
-    services.udev.extraRules = ''
-      KERNEL=="tun", GROUP="wayfinder", MODE="0660", OPTIONS+="static_node=net/tun"
-    '';
-
-    systemd.services.wayfinder = {
-      enable = true;
-      description = "Wayfinder Systemd Service";
-
-      serviceConfig = {
-        Type = "notify";
-        ExecStart = "${wayfinder-tap}/bin/wayfinder-tap --config ${configFile}";
-
-        Restart = "always";
-        RestartSec = "5s";
-
-        User = "wayfinder";
-        Group = "wayfinder";
-
-        Environment = [
-          "RUST_LOG=debug"
-        ];
-
-        CapabilityBoundingSet = [
-          "CAP_NET_RAW"
-          "CAP_NET_ADMIN"
-        ];
-        AmbientCapabilities = [
-          "CAP_NET_RAW"
-          "CAP_NET_ADMIN"
-        ];
+          Loopback by default, and deliberately so: the dashboard performs no
+          authentication of its own, so anyone who can reach this port has
+          whatever access `identityPath` carries — including revoking nodes on a
+          provider. Reach it remotely with an SSH forward
+          (`ssh -L 8080:localhost:8080 host`) rather than by widening this.
+        '';
       };
 
-      after = [ "network-online.target" ];
-      wants = [ "network-online.target" ];
+      addr = mkOption {
+        type = types.str;
+        default = "127.0.0.1:7700";
+        description = ''
+          The node's TLS management API address. The default matches a local
+          node configured with `server.tls` on its default port.
+        '';
+      };
 
-      wantedBy = [ "multi-user.target" ];
+      identityPath = mkOption {
+        type = types.str;
+        default = "/var/lib/wayfinder/identity.seed";
+        description = ''
+          The Ed25519 seed the dashboard proves possession of in the management
+          TLS handshake. Against a local, un-enrolled node this is the node's
+          own seed — which is why the service runs as the `wayfinder` user, so
+          it can read it without the file being widened.
+
+          On an enrolled mesh, point this at an admin identity and set `cert`.
+        '';
+      };
+
+      cert = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = ''
+          Path to the membership certificate binding `identityPath`'s key to an
+          admin identity. Leave null to authenticate against an un-enrolled node
+          by proving that node's own key.
+        '';
+      };
+
+      nodeKey = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = ''
+          The node's Ed25519 public key (64 hex chars) to pin, defeating
+          impersonation. Null defaults it to `identityPath`'s own public key,
+          which is correct only when reaching a node with its own seed; set it
+          explicitly to reach any other node.
+        '';
+      };
+
+      logLevel = mkOption {
+        type = types.str;
+        default = "info";
+        description = "`RUST_LOG` filter for the dashboard service.";
+      };
     };
   };
+
+  config = lib.mkMerge [
+    (lib.mkIf (wayfinderCfg.enable || wayfinderCfg.web.enable) {
+      users.users.wayfinder = {
+        isSystemUser = true;
+        group = "wayfinder";
+      };
+      users.groups.wayfinder = { };
+    })
+
+    (lib.mkIf wayfinderCfg.web.enable {
+      environment.systemPackages = [ wayfinder-web ];
+
+      systemd.services.wayfinder-web = {
+        enable = true;
+        description = "Wayfinder web dashboard";
+
+        serviceConfig = {
+          ExecStart =
+            "${wayfinder-web}/bin/wayfinder-web"
+            + " --listen ${wayfinderCfg.web.listen}"
+            + " --addr ${wayfinderCfg.web.addr}"
+            + " --identity ${wayfinderCfg.web.identityPath}"
+            + lib.optionalString (wayfinderCfg.web.cert != null) " --cert ${wayfinderCfg.web.cert}"
+            + lib.optionalString (wayfinderCfg.web.nodeKey != null) " --node-key ${wayfinderCfg.web.nodeKey}";
+
+          Restart = "always";
+          RestartSec = "5s";
+
+          # The same user as the node, so the identity seed under
+          # /var/lib/wayfinder is readable without loosening its mode.
+          User = "wayfinder";
+          Group = "wayfinder";
+
+          Environment = [ "RUST_LOG=${wayfinderCfg.web.logLevel}" ];
+        };
+
+        # Ordered after the node when one runs here, so the first poll has
+        # something to reach. Only `after`, not `requires`: the dashboard
+        # reconnects on its own, and a node restart should not take the
+        # dashboard down with it.
+        after = [
+          "network-online.target"
+        ]
+        ++ lib.optional wayfinderCfg.enable "wayfinder.service";
+        wants = [ "network-online.target" ];
+
+        wantedBy = [ "multi-user.target" ];
+      };
+    })
+
+    (lib.mkIf wayfinderCfg.enable {
+      environment.systemPackages = [
+        wayfinder-tui
+        wayfinder-ctl
+      ];
+
+      services.udev.extraRules = ''
+        KERNEL=="tun", GROUP="wayfinder", MODE="0660", OPTIONS+="static_node=net/tun"
+      '';
+
+      systemd.services.wayfinder = {
+        enable = true;
+        description = "Wayfinder Systemd Service";
+
+        serviceConfig = {
+          Type = "notify";
+          ExecStart = "${wayfinder-tap}/bin/wayfinder-tap --config ${configFile}";
+
+          Restart = "always";
+          RestartSec = "5s";
+
+          User = "wayfinder";
+          Group = "wayfinder";
+
+          Environment = [
+            "RUST_LOG=debug"
+          ];
+
+          CapabilityBoundingSet = [
+            "CAP_NET_RAW"
+            "CAP_NET_ADMIN"
+          ];
+          AmbientCapabilities = [
+            "CAP_NET_RAW"
+            "CAP_NET_ADMIN"
+          ];
+        };
+
+        after = [ "network-online.target" ];
+        wants = [ "network-online.target" ];
+
+        wantedBy = [ "multi-user.target" ];
+      };
+    })
+  ];
 }

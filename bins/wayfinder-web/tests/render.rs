@@ -1,0 +1,539 @@
+//! Checks that the tabs actually render the data they are given.
+//!
+//! The other integration tests stop at the snapshot: they prove the right
+//! values arrive. This proves they reach the screen. Without it, a tab that
+//! reads the wrong field, or silently renders an empty table because a
+//! condition is inverted, passes everything else.
+//!
+//! Each tab is rendered to a string with a seeded dashboard, rather than driven
+//! through a browser — the markup is what a reader ultimately sees, and it is
+//! assertable here without a headless browser in the loop.
+
+#![cfg(feature = "mock-node")]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use leptos::prelude::*;
+use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
+use wayfinder_protos::wayfinder::v1alpha::InterfaceThroughput;
+use wayfinder_protos::wayfinder::v1alpha::KeepAliveEntry;
+use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesEntry;
+use wayfinder_protos::wayfinder::v1alpha::LinkQualityEntry;
+use wayfinder_protos::wayfinder::v1alpha::ListPendingCsrsResponse;
+use wayfinder_protos::wayfinder::v1alpha::LogLevel;
+use wayfinder_protos::wayfinder::v1alpha::LogRecord;
+use wayfinder_protos::wayfinder::v1alpha::LogRecords;
+use wayfinder_protos::wayfinder::v1alpha::NeighborPath;
+use wayfinder_protos::wayfinder::v1alpha::NodeInfo;
+use wayfinder_protos::wayfinder::v1alpha::NodeMetrics;
+use wayfinder_protos::wayfinder::v1alpha::NodeSecurity;
+use wayfinder_protos::wayfinder::v1alpha::OgmScheduleEntry;
+use wayfinder_protos::wayfinder::v1alpha::PendingCsr;
+use wayfinder_protos::wayfinder::v1alpha::RoutingEntry;
+use wayfinder_protos::wayfinder::v1alpha::TableOccupancy;
+use wayfinder_web::components::dashboard::Dashboard;
+use wayfinder_web::components::link_quality::LinkQuality;
+use wayfinder_web::components::links::Links;
+use wayfinder_web::components::logs::Logs;
+use wayfinder_web::components::metrics::Metrics;
+use wayfinder_web::components::overview::Overview;
+use wayfinder_web::components::routing::Routing;
+use wayfinder_web::components::security::Security;
+use wayfinder_web::snapshot::NodeSnapshot;
+use wayfinder_web::state::History;
+use wayfinder_web::state::ThroughputSample;
+
+/// A snapshot with one reachable destination via one neighbour.
+fn seeded_snapshot() -> NodeSnapshot {
+    let mut snap = NodeSnapshot {
+        node_info: Some(NodeInfo {
+            node_id: vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01],
+            num_originators: 2,
+            auth_locked: false,
+            runtime_config_active: false,
+        }),
+        ..Default::default()
+    };
+    snap.routing.entries.push(RoutingEntry {
+        destination: vec![0, 0, 0, 0, 0, 2],
+        next_hop: vec![0, 0, 0, 0, 0, 3],
+        tq: 240,
+        last_seqno: 17,
+        paths: vec![NeighborPath {
+            neighbor_id: vec![0, 0, 0, 0, 0, 3],
+            tq: 240,
+            last_seqno: 17,
+        }],
+    });
+    snap.link_features.entries.push(LinkFeaturesEntry {
+        iface_idx: 0,
+        tx_ogm: true,
+        rx_ogm: true,
+        tx_data: false,
+        rx_data: true,
+        tx_keepalive_interval_ms: Some(2000),
+    });
+    snap.link_quality.entries.push(LinkQualityEntry {
+        neighbor_id: vec![0, 0, 0, 0, 0, 3],
+        iface_idx: 0,
+        ewma_quality: 200,
+        sample_count: 9,
+    });
+    snap.keepalive.entries.push(KeepAliveEntry {
+        neighbor_id: vec![0, 0, 0, 0, 0, 3],
+        ms_since_last_heard: 4200,
+        interval_estimate_ms: 1000,
+        missed: true,
+    });
+    snap.ogm_schedule.entries.push(OgmScheduleEntry {
+        iface_idx: 0,
+        current_interval_ms: 4000,
+        min_interval_ms: 1000,
+        max_interval_ms: 64000,
+    });
+    snap.throughput.interfaces.push(InterfaceThroughput {
+        iface_idx: 0,
+        rx_bps: 1500.0,
+        rx_fps: 12.0,
+        tx_bps: 800.0,
+        tx_fps: 6.0,
+    });
+    snap.throughput.total_rx_bps = 1500.0;
+    snap.throughput.total_tx_bps = 800.0;
+    snap.security = Some(GetSecurityStatusResponse {
+        auth_enabled: true,
+        mesh_id: 42,
+        node_mac: vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01],
+        cert_not_after: 1_800_000_000,
+        revocation_count: 1,
+        nodes: vec![
+            NodeSecurity {
+                node_id: vec![0, 0, 0, 0, 0, 2],
+                verified: true,
+                cert_not_after: 1_800_000_000,
+                revoked: false,
+            },
+            NodeSecurity {
+                node_id: vec![0, 0, 0, 0, 0, 3],
+                verified: false,
+                cert_not_after: 0,
+                revoked: true,
+            },
+            NodeSecurity {
+                node_id: vec![0, 0, 0, 0, 0, 4],
+                verified: false,
+                cert_not_after: 0,
+                revoked: false,
+            },
+        ],
+    });
+    snap.metrics = Some(NodeMetrics {
+        uptime_secs: 7384,
+        neighbor_count: 1,
+        originators: Some(TableOccupancy {
+            used: 1,
+            capacity: 128,
+        }),
+        tq_min: 240,
+        tq_max: 240,
+        tq_mean: 240.0,
+        paths_max: 1,
+        paths_mean: 1.0,
+        ..Default::default()
+    });
+    snap
+}
+
+/// A throughput trend with enough samples to draw.
+fn seeded_history() -> History {
+    let mut history = History::default();
+    for i in 0..20 {
+        history.throughput.push_back(ThroughputSample {
+            rx_bps: 1000.0 + f64::from(i) * 50.0,
+            tx_bps: 500.0 + f64::from(i) * 20.0,
+        });
+    }
+    history
+}
+
+/// Render a tab with both a snapshot and an accumulated history.
+fn render_with_history<V: IntoView + 'static>(
+    snapshot: NodeSnapshot,
+    history: History,
+    tab: impl Fn() -> V + Send + 'static,
+) -> String {
+    let owner = Owner::new();
+    owner
+        .with(|| {
+            let dash = Dashboard::new();
+            dash.connected.set(true);
+            dash.snapshot.set(Some(snapshot));
+            dash.history.set(history);
+            dash.label.set("127.0.0.1:7700".to_string());
+            provide_context(dash);
+            tab().to_html()
+        })
+        .to_string()
+}
+
+/// Render one tab with a dashboard holding `snapshot`, and return its markup.
+fn render_with<V: IntoView + 'static>(
+    snapshot: Option<NodeSnapshot>,
+    tab: impl Fn() -> V + Send + 'static,
+) -> String {
+    let owner = Owner::new();
+    owner
+        .with(|| {
+            let dash = Dashboard::new();
+            if let Some(snapshot) = snapshot {
+                dash.connected.set(true);
+                dash.snapshot.set(Some(snapshot));
+            }
+            dash.label.set("127.0.0.1:7700".to_string());
+            provide_context(dash);
+            tab().to_html()
+        })
+        .to_string()
+}
+
+/// The Overview leads with the things someone arrives asking about.
+#[test]
+fn overview_renders_the_node_identity_and_health() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <Overview /> });
+
+    assert!(
+        html.contains("aa:bb:cc:dd:ee:01"),
+        "the node address: {html}"
+    );
+    assert!(html.contains("Enrolled"), "membership state: {html}");
+    assert!(html.contains("127.0.0.1:7700"), "the node it is pointed at");
+    // Throughput totals, formatted rather than raw.
+    assert!(html.contains("1.5 KiB/s"), "receive rate: {html}");
+}
+
+/// Before the first poll, the tab says so rather than showing a plausible
+/// blank — "starting up" and "a node with nothing on it" look identical
+/// otherwise, and mean very different things.
+#[test]
+fn overview_says_it_is_waiting_before_the_first_poll() {
+    let html = render_with(None, || view! { <Overview /> });
+
+    assert!(html.contains("Waiting for the node"), "{html}");
+    assert!(html.contains("Connecting"), "{html}");
+}
+
+/// The Routing tab renders a row per destination, with quality as a percentage.
+#[test]
+fn routing_renders_a_row_per_destination() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <Routing /> });
+
+    assert!(
+        html.contains("00:00:00:00:00:02"),
+        "the destination: {html}"
+    );
+    assert!(html.contains("00:00:00:00:00:03"), "its next hop: {html}");
+    // TQ 240 of 255 leads as a percentage, with the raw value kept as detail.
+    assert!(html.contains("94%"), "quality as a percentage: {html}");
+    assert!(html.contains("TQ 240"), "raw TQ retained: {html}");
+    assert!(html.contains("1 node"), "the row count: {html}");
+}
+
+/// With nothing selected the detail panel prompts rather than sitting blank.
+#[test]
+fn routing_prompts_for_a_selection() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <Routing /> });
+
+    assert!(html.contains("Select a destination"), "{html}");
+}
+
+/// An empty table says why it is empty.
+#[test]
+fn routing_distinguishes_no_routes_from_no_connection() {
+    let connected = render_with(Some(NodeSnapshot::default()), || view! { <Routing /> });
+    assert!(
+        connected.contains("No other nodes reachable yet"),
+        "connected but alone: {connected}"
+    );
+
+    let waiting = render_with(None, || view! { <Routing /> });
+    assert!(
+        waiting.contains("Waiting for the node"),
+        "not yet connected: {waiting}"
+    );
+}
+
+// ------------------------------------------------------------- Link Quality --
+
+/// Link quality is per (neighbour, interface), and leads with a percentage.
+#[test]
+fn link_quality_renders_a_row_per_neighbour_and_interface() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <LinkQuality /> });
+
+    assert!(html.contains("00:00:00:00:00:03"), "the neighbour: {html}");
+    // EWMA quality 200 of 255.
+    assert!(html.contains("78%"), "quality as a percentage: {html}");
+    assert!(html.contains("9"), "the sample count: {html}");
+}
+
+/// Keep-alive liveness is the direct-link signal, so a lapsed neighbour has to
+/// read as lapsed rather than as another row.
+#[test]
+fn link_quality_flags_a_missed_keepalive() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <LinkQuality /> });
+
+    assert!(html.contains("Missed"), "the missed heartbeat: {html}");
+}
+
+// -------------------------------------------------------------------- Links --
+
+/// Each interface shows its gates, and mixed gates read as mixed rather than
+/// collapsing to on or off.
+#[test]
+fn links_renders_the_gate_status_per_interface() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <Links /> });
+
+    // The seeded interface has tx_data off and the rest on.
+    assert!(html.contains("mixed"), "the aggregate gate status: {html}");
+    assert!(html.contains("4.0 s"), "the OGM interval: {html}");
+    assert!(html.contains("2.0 s"), "the keep-alive cadence: {html}");
+}
+
+/// The four gates are individually visible and individually switchable, since
+/// the aggregate status alone cannot say *which* gate is closed.
+#[test]
+fn links_exposes_each_gate_as_a_control() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <Links /> });
+
+    for gate in ["Send OGMs", "Receive OGMs", "Send data", "Receive data"] {
+        assert!(html.contains(gate), "{gate} is listed: {html}");
+    }
+    assert!(
+        html.contains("role=\"switch\""),
+        "gates are switches: {html}"
+    );
+}
+
+// ------------------------------------------------------------------ Metrics --
+
+/// The metrics summary leads with the health numbers, not the capacity tables.
+#[test]
+fn metrics_renders_the_node_summary() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <Metrics /> });
+
+    assert!(html.contains("2h 3m 4s"), "uptime, formatted: {html}");
+    assert!(html.contains("1 / 128"), "table occupancy: {html}");
+}
+
+/// The throughput trend is a real two-series chart: both series drawn, both
+/// named, so identity never rests on colour alone.
+#[test]
+fn metrics_renders_the_throughput_chart() {
+    let html = render_with_history(seeded_snapshot(), seeded_history(), || {
+        view! { <Metrics /> }
+    });
+
+    assert!(html.contains("<svg"), "the chart is drawn: {html}");
+    assert_eq!(
+        html.matches("wf-chart-line").count(),
+        2,
+        "one line per series: {html}"
+    );
+    assert!(html.contains("Received"), "the rx series is named: {html}");
+    assert!(html.contains("Sent"), "the tx series is named: {html}");
+}
+
+/// One sample is not a trend. Rather than drawing a degenerate chart, say so.
+#[test]
+fn metrics_chart_waits_for_enough_samples() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <Metrics /> });
+
+    assert!(!html.contains("wf-chart-line"), "nothing drawn yet: {html}");
+    assert!(html.contains("Collecting"), "and it says why: {html}");
+}
+
+// ----------------------------------------------------------------- Security --
+
+/// The security header says whether the mesh is authenticated at all, since
+/// every per-node row below means something different depending on it.
+#[test]
+fn security_renders_the_mesh_posture() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <Security /> });
+
+    assert!(html.contains("aa:bb:cc:dd:ee:01"), "own identity: {html}");
+    assert!(html.contains("Enabled"), "auth is on: {html}");
+}
+
+/// A revoked node must not read as merely unverified — one is a node whose
+/// identity is unknown, the other one the mesh has actively ejected.
+#[test]
+fn security_distinguishes_revoked_from_unverified() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <Security /> });
+
+    assert!(html.contains("Revoked"), "the revoked node: {html}");
+    assert!(html.contains("Unverified"), "the unverified node: {html}");
+    assert!(html.contains("Verified"), "the verified node: {html}");
+}
+
+/// Destructive actions are offered, but only behind a confirmation.
+#[test]
+fn security_puts_destructive_actions_behind_a_confirmation() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <Security /> });
+
+    assert!(html.contains("Revoke"), "revoke is offered: {html}");
+    // The dialog is only rendered once armed, so nothing is one click from
+    // ejecting a node from the mesh.
+    assert!(!html.contains("wf-modal"), "not armed yet: {html}");
+}
+
+/// A node that is not a certificate authority has no CSR queue, and saying so
+/// beats rendering an empty table that looks like "no one is waiting".
+#[test]
+fn security_omits_the_csr_queue_on_a_non_provider() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <Security /> });
+
+    assert!(!html.contains("Approve"), "no approvals offered: {html}");
+}
+
+/// On a provider, each pending request shows the key being vouched for.
+#[test]
+fn security_lists_pending_requests_on_a_provider() {
+    let mut snap = seeded_snapshot();
+    snap.pending_csrs = Some(ListPendingCsrsResponse {
+        pending: vec![PendingCsr {
+            node_mac: vec![0, 0, 0, 0, 0, 9],
+            ed_pubkey: vec![0xab; 32],
+            x_pubkey: vec![0xcd; 32],
+            requested_at: 1_700_000_000,
+        }],
+    });
+    let html = render_with(Some(snap), || view! { <Security /> });
+
+    assert!(html.contains("00:00:00:00:00:09"), "the applicant: {html}");
+    assert!(html.contains("Approve"), "approval offered: {html}");
+    assert!(html.contains("Deny"), "denial offered: {html}");
+    // The key is what an operator is actually vouching for, so it has to be
+    // visible before they can approve it.
+    assert!(
+        html.contains("abababab"),
+        "the key being vouched for: {html}"
+    );
+}
+
+// --------------------------------------------------------------------- Logs --
+
+/// Records render newest-last with their level and source.
+#[test]
+fn logs_render_records_with_level_and_target() {
+    let mut history = History::default();
+    history.ingest_logs(LogRecords {
+        records: vec![LogRecord {
+            seq: 1,
+            uptime_ms: 12_345,
+            level: LogLevel::Warn as i32,
+            target: "wayfinder::router".into(),
+            message: "drop: no route".into(),
+        }],
+        next_seq: 2,
+        dropped: 0,
+        filter: "info,batman=trace".into(),
+    });
+
+    let html = render_with_history(seeded_snapshot(), history, || view! { <Logs /> });
+
+    assert!(html.contains("WARN"), "the level: {html}");
+    assert!(html.contains("wayfinder::router"), "the source: {html}");
+    assert!(html.contains("drop: no route"), "the message: {html}");
+    assert!(html.contains("wf-level-warn"), "coloured by level: {html}");
+}
+
+/// Newest records come first, so the interesting end of a live stream is where
+/// the reader is already looking and no scroll position has to be managed.
+#[test]
+fn logs_render_newest_first() {
+    let mut history = History::default();
+    history.ingest_logs(LogRecords {
+        records: vec![
+            LogRecord {
+                seq: 1,
+                uptime_ms: 1,
+                level: LogLevel::Info as i32,
+                target: "a".into(),
+                message: "older".into(),
+            },
+            LogRecord {
+                seq: 2,
+                uptime_ms: 2,
+                level: LogLevel::Info as i32,
+                target: "a".into(),
+                message: "newer".into(),
+            },
+        ],
+        next_seq: 3,
+        dropped: 0,
+        filter: "info".into(),
+    });
+
+    let html = render_with_history(seeded_snapshot(), history, || view! { <Logs /> });
+
+    let newer = html.find("newer").expect("the newer record");
+    let older = html.find("older").expect("the older record");
+    assert!(newer < older, "the newest record is at the top");
+}
+
+/// A gap renders in stream position, so a discontinuity is visible rather than
+/// something a reader has to infer from jumping sequence numbers.
+#[test]
+fn logs_render_a_gap_between_the_records_it_separates() {
+    let mut history = History::default();
+    history.ingest_logs(LogRecords {
+        records: vec![LogRecord {
+            seq: 1,
+            uptime_ms: 1,
+            level: LogLevel::Info as i32,
+            target: "a".into(),
+            message: "first".into(),
+        }],
+        next_seq: 2,
+        dropped: 0,
+        filter: "info".into(),
+    });
+    history.ingest_logs(LogRecords {
+        records: vec![LogRecord {
+            seq: 40,
+            uptime_ms: 2,
+            level: LogLevel::Info as i32,
+            target: "a".into(),
+            message: "second".into(),
+        }],
+        next_seq: 41,
+        dropped: 38,
+        filter: "info".into(),
+    });
+
+    let html = render_with_history(seeded_snapshot(), history, || view! { <Logs /> });
+
+    assert!(html.contains("38"), "the dropped count: {html}");
+    // Newest-first, so the later record precedes the gap and the earlier one
+    // follows it — the gap still separates exactly the two records it fell
+    // between, which is the property that matters.
+    let gap = html.find("wf-log-gap").expect("a gap marker was rendered");
+    let first = html.find("first").expect("the earlier record");
+    let second = html.find("second").expect("the later record");
+    assert!(second < gap && gap < first, "the gap sits between them");
+}
+
+/// The filter line reports what the node says is in force, which is not
+/// necessarily what this client last asked for.
+#[test]
+fn logs_show_the_filter_the_node_reports() {
+    let mut history = History::default();
+    history.ingest_logs(LogRecords {
+        records: Vec::new(),
+        next_seq: 1,
+        dropped: 0,
+        filter: "info,batman=trace".into(),
+    });
+
+    let html = render_with_history(seeded_snapshot(), history, || view! { <Logs /> });
+
+    assert!(html.contains("info,batman=trace"), "{html}");
+}
