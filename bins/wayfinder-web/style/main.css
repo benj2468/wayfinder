@@ -1,0 +1,916 @@
+/* Wayfinder web dashboard.
+ *
+ * Everything visual is driven by the custom properties in the token block
+ * below. Layout is expected to change, so the intent is that a restyle means
+ * editing tokens here rather than hunting class names through the components:
+ * no component hard-codes a colour, a radius, or a spacing step.
+ *
+ * Cyan accent to match the TUI's (`ui.rs`'s `ACCENT`), so an operator moving
+ * between the two dashboards reads the same signal the same way.
+ */
+
+/* ---------------------------------------------------------------- tokens -- */
+
+:root {
+  color-scheme: light dark;
+
+  /* Spacing scale — a 4px base, used for every gap, pad and margin. */
+  --wf-space-1: 0.25rem;
+  --wf-space-2: 0.5rem;
+  --wf-space-3: 0.75rem;
+  --wf-space-4: 1rem;
+  --wf-space-5: 1.5rem;
+  --wf-space-6: 2rem;
+
+  --wf-radius: 8px;
+  --wf-radius-sm: 4px;
+
+  --wf-font-ui:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  /* Data is monospace so columns of MACs, TQs and counters align vertically
+   * and a changed digit is visible without reading the number. */
+  --wf-font-mono:
+    ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo, Consolas,
+    monospace;
+
+  --wf-text-sm: 0.8125rem;
+  --wf-text-base: 0.9375rem;
+  --wf-text-lg: 1.125rem;
+
+  /* Dark is the default: this sits alongside a terminal. */
+  --wf-bg: #0f1115;
+  --wf-surface: #171a21;
+  --wf-surface-raised: #1e222b;
+  --wf-border: #2a2f3a;
+  --wf-text: #e6e9ef;
+  --wf-text-muted: #949bab;
+  --wf-text-faint: #6b7280;
+
+  --wf-accent: #4cc2ff;
+  --wf-accent-dim: rgb(76 194 255 / 14%);
+
+  /* Status ramp. Warm pulls the eye, cold recedes — the same reasoning as the
+   * TUI's log-level colouring, so a screenful reads before any of the words
+   * do. */
+  --wf-ok: #4ade80;
+  --wf-warn: #fbbf24;
+  --wf-error: #f87171;
+  --wf-idle: #6b7280;
+
+  --wf-shadow: 0 1px 2px rgb(0 0 0 / 30%);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --wf-bg: #f6f7f9;
+    --wf-surface: #ffffff;
+    --wf-surface-raised: #f0f2f5;
+    --wf-border: #d8dce3;
+    --wf-text: #1a1d23;
+    --wf-text-muted: #5b6472;
+    --wf-text-faint: #8b93a1;
+
+    --wf-accent: #0369a1;
+    --wf-accent-dim: rgb(3 105 161 / 10%);
+
+    --wf-ok: #15803d;
+    --wf-warn: #b45309;
+    --wf-error: #b91c1c;
+    --wf-idle: #8b93a1;
+
+    --wf-shadow: 0 1px 2px rgb(0 0 0 / 8%);
+  }
+}
+
+/* ------------------------------------------------------------------ base -- */
+
+body {
+  margin: 0;
+  background: var(--wf-bg);
+  color: var(--wf-text);
+  font-family: var(--wf-font-ui);
+  font-size: var(--wf-text-base);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wf-app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+/* ---------------------------------------------------------------- header -- */
+
+.wf-header {
+  display: flex;
+  align-items: center;
+  gap: var(--wf-space-4);
+  padding: var(--wf-space-3) var(--wf-space-5);
+  border-bottom: 1px solid var(--wf-border);
+  background: var(--wf-surface);
+}
+
+.wf-brand {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--wf-accent);
+}
+
+/* ------------------------------------------------------------------ tabs -- */
+
+.wf-tabs {
+  display: flex;
+  gap: var(--wf-space-1);
+  padding: 0 var(--wf-space-5);
+  border-bottom: 1px solid var(--wf-border);
+  background: var(--wf-surface);
+  overflow-x: auto;
+}
+
+.wf-tab {
+  padding: var(--wf-space-3) var(--wf-space-4);
+  border-bottom: 2px solid transparent;
+  color: var(--wf-text-muted);
+  font-size: var(--wf-text-sm);
+  font-weight: 500;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.wf-tab:hover {
+  color: var(--wf-text);
+}
+
+/* `leptos_router`'s `<A>` sets aria-current on the matching route, so the
+ * active tab needs no state of its own. */
+.wf-tab[aria-current="page"] {
+  border-bottom-color: var(--wf-accent);
+  color: var(--wf-accent);
+}
+
+.wf-header-node {
+  color: var(--wf-text-muted);
+  font-size: var(--wf-text-sm);
+}
+
+/* Pushed to the far end, so the liveness indicator is always in the same
+ * place regardless of how long the node label is. */
+.wf-header-status {
+  display: flex;
+  align-items: center;
+  gap: var(--wf-space-2);
+  margin-left: auto;
+  color: var(--wf-text-muted);
+  font-size: var(--wf-text-sm);
+}
+
+.wf-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--wf-idle);
+}
+
+.wf-dot-live {
+  background: var(--wf-ok);
+}
+
+.wf-dot-stale {
+  background: var(--wf-warn);
+}
+
+/* ---------------------------------------------------------------- banner -- */
+
+.wf-banner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--wf-space-1) var(--wf-space-3);
+  align-items: baseline;
+  padding: var(--wf-space-3) var(--wf-space-5);
+  border-bottom: 1px solid var(--wf-border);
+  background: color-mix(in srgb, var(--wf-warn) 12%, var(--wf-surface));
+  font-size: var(--wf-text-sm);
+}
+
+.wf-banner-title {
+  font-weight: 500;
+}
+
+.wf-banner-detail {
+  color: var(--wf-text-muted);
+  font-size: var(--wf-text-sm);
+}
+
+/* ------------------------------------------------------------------ main -- */
+
+.wf-main {
+  flex: 1;
+  padding: var(--wf-space-5);
+}
+
+/* Panels flow into as many columns as fit, so the layout adapts to the window
+ * without a breakpoint per tab. */
+.wf-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: var(--wf-space-4);
+  align-items: start;
+}
+
+/* A wide primary panel beside a narrower detail panel, collapsing to one
+ * column when there is not room for both. */
+.wf-split {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  gap: var(--wf-space-4);
+  align-items: start;
+}
+
+@media (width <= 900px) {
+  .wf-split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.wf-panel {
+  min-width: 0;
+  padding: var(--wf-space-4);
+  border: 1px solid var(--wf-border);
+  border-radius: var(--wf-radius);
+  background: var(--wf-surface);
+  box-shadow: var(--wf-shadow);
+}
+
+.wf-panel-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--wf-space-3);
+  margin-bottom: var(--wf-space-3);
+}
+
+.wf-panel-title {
+  margin: 0;
+  font-size: var(--wf-text-base);
+  font-weight: 600;
+}
+
+.wf-panel-sub {
+  color: var(--wf-text-muted);
+  font-size: var(--wf-text-sm);
+}
+
+.wf-empty {
+  margin: 0;
+  color: var(--wf-text-muted);
+  font-size: var(--wf-text-sm);
+}
+
+.wf-mono {
+  font-family: var(--wf-font-mono);
+  font-size: var(--wf-text-sm);
+}
+
+/* ---------------------------------------------------------------- fields -- */
+
+.wf-field {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--wf-space-4);
+  padding: var(--wf-space-2) 0;
+  border-bottom: 1px solid var(--wf-border);
+}
+
+.wf-field:last-child {
+  border-bottom: none;
+}
+
+.wf-field-label {
+  color: var(--wf-text-muted);
+  font-size: var(--wf-text-sm);
+}
+
+.wf-field-value {
+  text-align: right;
+}
+
+/* ----------------------------------------------------------------- stats -- */
+
+.wf-stat-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: var(--wf-space-4);
+}
+
+.wf-stat {
+  display: flex;
+  flex-direction: column;
+  gap: var(--wf-space-1);
+}
+
+.wf-stat-value {
+  font-family: var(--wf-font-mono);
+  font-size: var(--wf-text-lg);
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.wf-stat-label {
+  color: var(--wf-text-muted);
+  font-size: var(--wf-text-sm);
+}
+
+.wf-stat-detail {
+  color: var(--wf-text-faint);
+  font-size: var(--wf-text-sm);
+}
+
+/* ---------------------------------------------------------------- tables -- */
+
+/* Wide tables scroll inside their own panel; the page body must never scroll
+ * sideways. */
+.wf-table-scroll {
+  overflow-x: auto;
+}
+
+.wf-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--wf-text-sm);
+}
+
+.wf-table th {
+  padding: var(--wf-space-2) var(--wf-space-3);
+  border-bottom: 1px solid var(--wf-border);
+  color: var(--wf-text-muted);
+  font-weight: 500;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.wf-table td {
+  padding: var(--wf-space-2) var(--wf-space-3);
+  border-bottom: 1px solid var(--wf-border);
+  white-space: nowrap;
+}
+
+.wf-table tr:last-child td {
+  border-bottom: none;
+}
+
+/* Numeric columns are right-aligned and tabular, so digits line up and a
+ * changing value does not shift the ones around it. */
+.wf-num {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.wf-row {
+  cursor: pointer;
+}
+
+.wf-row:hover {
+  background: var(--wf-surface-raised);
+}
+
+.wf-row-selected {
+  background: var(--wf-accent-dim);
+}
+
+.wf-row-chosen td:first-child {
+  box-shadow: inset 2px 0 0 var(--wf-accent);
+}
+
+.wf-tag {
+  margin-left: var(--wf-space-2);
+  padding: 0 var(--wf-space-1);
+  border-radius: var(--wf-radius-sm);
+  background: var(--wf-accent-dim);
+  color: var(--wf-accent);
+  font-family: var(--wf-font-ui);
+  font-size: 0.6875rem;
+}
+
+.wf-detail-head {
+  margin: 0 0 var(--wf-space-3);
+  color: var(--wf-text-muted);
+  font-size: var(--wf-text-sm);
+}
+
+/* ------------------------------------------------------------ quality bar -- */
+
+.wf-bar-wrap {
+  display: flex;
+  align-items: center;
+  gap: var(--wf-space-2);
+  min-width: 120px;
+}
+
+.wf-bar {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--wf-surface-raised);
+  overflow: hidden;
+}
+
+.wf-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+}
+
+/* Three bands, not a gradient: the reader is deciding fine / marginal / bad,
+ * not reading an exact hue. */
+.wf-bar-good {
+  background: var(--wf-ok);
+}
+
+.wf-bar-fair {
+  background: var(--wf-warn);
+}
+
+.wf-bar-poor {
+  background: var(--wf-error);
+}
+
+.wf-bar-text {
+  min-width: 3ch;
+  color: var(--wf-text-muted);
+  font-family: var(--wf-font-mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* --------------------------------------------------------- status colours -- */
+
+.wf-status-on {
+  color: var(--wf-ok);
+}
+
+.wf-status-off {
+  color: var(--wf-error);
+}
+
+.wf-status-mixed {
+  color: var(--wf-warn);
+}
+
+/* --------------------------------------------------------------- control -- */
+
+.wf-button {
+  padding: var(--wf-space-2) var(--wf-space-3);
+  border: 1px solid var(--wf-border);
+  border-radius: var(--wf-radius-sm);
+  background: var(--wf-surface-raised);
+  color: var(--wf-text);
+  font-family: inherit;
+  font-size: var(--wf-text-sm);
+  cursor: pointer;
+}
+
+.wf-button:hover {
+  border-color: var(--wf-accent);
+  color: var(--wf-accent);
+}
+
+.wf-button:focus-visible {
+  outline: 2px solid var(--wf-accent);
+  outline-offset: 2px;
+}
+
+/* ----------------------------------------------------------------- stack -- */
+
+.wf-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--wf-space-4);
+}
+
+/* ----------------------------------------------------------------- gates -- */
+
+.wf-gates {
+  display: flex;
+  flex-direction: column;
+  gap: var(--wf-space-1);
+  margin-bottom: var(--wf-space-4);
+}
+
+/* A whole-row button rather than a bare checkbox: the hit target covers the
+ * label and its explanation, which is the difference between a control a
+ * non-expert will touch and one they will not. */
+.wf-gate {
+  display: flex;
+  gap: var(--wf-space-3);
+  align-items: flex-start;
+  padding: var(--wf-space-2);
+  border: none;
+  border-radius: var(--wf-radius-sm);
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.wf-gate:hover {
+  background: var(--wf-surface-raised);
+}
+
+.wf-gate:focus-visible {
+  outline: 2px solid var(--wf-accent);
+  outline-offset: 2px;
+}
+
+.wf-gate-track {
+  flex: none;
+  position: relative;
+  width: 34px;
+  height: 20px;
+  margin-top: 2px;
+  border-radius: 10px;
+  background: var(--wf-idle);
+  transition: background 120ms ease;
+}
+
+.wf-gate-on {
+  background: var(--wf-ok);
+}
+
+.wf-gate-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 120ms ease;
+}
+
+.wf-gate-on .wf-gate-knob {
+  transform: translateX(14px);
+}
+
+.wf-gate-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.wf-gate-name {
+  font-size: var(--wf-text-sm);
+  font-weight: 500;
+}
+
+.wf-gate-help {
+  color: var(--wf-text-muted);
+  font-size: var(--wf-text-sm);
+}
+
+.wf-detail-section {
+  padding-top: var(--wf-space-3);
+  border-top: 1px solid var(--wf-border);
+}
+
+/* ------------------------------------------------------------- occupancy -- */
+
+.wf-occupancy {
+  display: flex;
+  gap: var(--wf-space-4);
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--wf-space-2) 0;
+  border-bottom: 1px solid var(--wf-border);
+}
+
+.wf-occupancy:last-child {
+  border-bottom: none;
+}
+
+.wf-occupancy .wf-bar-wrap {
+  flex: 0 1 180px;
+}
+
+/* ----------------------------------------------------------------- chart -- */
+
+/* Categorical slots 1 and 2 of the project palette. Checked for colour-blind
+ * separation against both chart surfaces — protan/tritan ΔE ≥ 24 in each,
+ * against a target of 8 — so the two series stay distinguishable. Identity is
+ * still never left to colour alone: both are named in the legend. */
+.wf-chart {
+  --wf-series-rx: #2a78d6;
+  --wf-series-tx: #eb6834;
+}
+
+@media (prefers-color-scheme: dark) {
+  .wf-chart {
+    --wf-series-rx: #3987e5;
+    --wf-series-tx: #d95926;
+  }
+}
+
+.wf-chart-svg {
+  display: block;
+  width: 100%;
+  height: 160px;
+}
+
+/* Recessive: the grid orients, it does not compete with the data. */
+.wf-chart-grid {
+  stroke: var(--wf-border);
+  stroke-dasharray: 3 4;
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.wf-chart-axis {
+  stroke: var(--wf-border);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+/* `non-scaling-stroke` keeps lines 2px however the viewBox is stretched —
+ * without it a wide window would smear them into ribbons. */
+.wf-chart-line {
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.wf-series-rx-stroke {
+  stroke: var(--wf-series-rx);
+}
+
+.wf-series-tx-stroke {
+  stroke: var(--wf-series-tx);
+}
+
+.wf-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--wf-space-2) var(--wf-space-4);
+  align-items: center;
+  margin-bottom: var(--wf-space-3);
+  font-size: var(--wf-text-sm);
+}
+
+.wf-legend-item {
+  display: flex;
+  gap: var(--wf-space-2);
+  align-items: center;
+  color: var(--wf-text-muted);
+}
+
+.wf-legend-mark {
+  width: 12px;
+  height: 2px;
+  border-radius: 1px;
+}
+
+.wf-series-rx {
+  background: var(--wf-series-rx);
+}
+
+.wf-series-tx {
+  background: var(--wf-series-tx);
+}
+
+/* The current value is the headline; it wears text ink, not the series colour,
+ * so the coloured mark beside it is what carries identity. */
+.wf-legend-value {
+  color: var(--wf-text);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.wf-legend-peak {
+  margin-left: auto;
+  color: var(--wf-text-faint);
+}
+
+/* --------------------------------------------------------- button variants -- */
+
+/* The affirmative action in a pair. Filled, so which button commits is
+ * unambiguous without reading both. */
+.wf-button-primary {
+  border-color: transparent;
+  background: var(--wf-accent);
+  color: var(--wf-bg);
+  font-weight: 500;
+}
+
+.wf-button-primary:hover {
+  border-color: transparent;
+  background: var(--wf-accent);
+  color: var(--wf-bg);
+  filter: brightness(1.1);
+}
+
+/* Outlined rather than filled: loud enough to read as dangerous, not so loud
+ * that it attracts the click. The confirmation dialog is the real guard. */
+.wf-button-danger {
+  border-color: var(--wf-error);
+  color: var(--wf-error);
+}
+
+.wf-button-danger:hover {
+  border-color: var(--wf-error);
+  background: color-mix(in srgb, var(--wf-error) 12%, transparent);
+  color: var(--wf-error);
+}
+
+.wf-note {
+  margin: var(--wf-space-3) 0 0;
+  color: var(--wf-text-muted);
+  font-size: var(--wf-text-sm);
+}
+
+.wf-note code {
+  padding: 0 var(--wf-space-1);
+  border-radius: var(--wf-radius-sm);
+  background: var(--wf-surface-raised);
+  font-family: var(--wf-font-mono);
+}
+
+/* --------------------------------------------------------------- security -- */
+
+.wf-csr {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--wf-space-3);
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--wf-space-3) 0;
+  border-bottom: 1px solid var(--wf-border);
+}
+
+.wf-csr:last-child {
+  border-bottom: none;
+}
+
+.wf-csr-id {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--wf-space-1) var(--wf-space-3);
+  align-items: baseline;
+}
+
+.wf-csr-key {
+  color: var(--wf-text-muted);
+}
+
+.wf-csr-when {
+  color: var(--wf-text-faint);
+  font-size: var(--wf-text-sm);
+}
+
+.wf-csr-actions {
+  display: flex;
+  gap: var(--wf-space-2);
+}
+
+/* ---------------------------------------------------------------- modal -- */
+
+.wf-modal-backdrop {
+  display: flex;
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  align-items: center;
+  justify-content: center;
+  padding: var(--wf-space-4);
+  background: rgb(0 0 0 / 55%);
+}
+
+.wf-modal {
+  max-width: 30rem;
+  padding: var(--wf-space-5);
+  border: 1px solid var(--wf-border);
+  border-radius: var(--wf-radius);
+  background: var(--wf-surface);
+  box-shadow: 0 8px 32px rgb(0 0 0 / 35%);
+}
+
+.wf-modal-body {
+  margin: 0 0 var(--wf-space-4);
+}
+
+.wf-modal-actions {
+  display: flex;
+  gap: var(--wf-space-2);
+  justify-content: flex-end;
+}
+
+/* ------------------------------------------------------------------ logs -- */
+
+.wf-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--wf-space-2);
+  align-items: center;
+}
+
+.wf-filter-current {
+  flex: 1;
+  min-width: 12ch;
+  padding: var(--wf-space-2) var(--wf-space-3);
+  border-radius: var(--wf-radius-sm);
+  background: var(--wf-surface-raised);
+  font-family: var(--wf-font-mono);
+  font-size: var(--wf-text-sm);
+}
+
+.wf-input {
+  flex: 1;
+  min-width: 12ch;
+  padding: var(--wf-space-2) var(--wf-space-3);
+  border: 1px solid var(--wf-border);
+  border-radius: var(--wf-radius-sm);
+  background: var(--wf-bg);
+  color: var(--wf-text);
+  font: inherit;
+}
+
+.wf-input:focus-visible {
+  outline: 2px solid var(--wf-accent);
+  outline-offset: -1px;
+}
+
+/* The pane scrolls, not the page — so the filter above and the tab bar stay
+ * put while reading, the way they would in a terminal. */
+.wf-logs {
+  max-height: 60vh;
+  overflow: auto;
+  font-family: var(--wf-font-mono);
+  font-size: var(--wf-text-sm);
+  line-height: 1.45;
+}
+
+.wf-log-row {
+  display: grid;
+  grid-template-columns: max-content max-content minmax(6ch, max-content) 1fr;
+  gap: var(--wf-space-3);
+  padding: 1px var(--wf-space-1);
+}
+
+.wf-log-row:hover {
+  background: var(--wf-surface-raised);
+}
+
+.wf-log-time {
+  color: var(--wf-text-faint);
+  white-space: pre;
+}
+
+.wf-log-level {
+  min-width: 5ch;
+  font-weight: 600;
+}
+
+.wf-log-target {
+  color: var(--wf-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.wf-log-message {
+  overflow-wrap: anywhere;
+}
+
+/* A gap is a break in the record, so it reads as a rule across the stream
+ * rather than as another line of log. */
+.wf-log-gap {
+  margin: var(--wf-space-2) 0;
+  padding: var(--wf-space-1) var(--wf-space-2);
+  border-top: 1px dashed var(--wf-warn);
+  border-bottom: 1px dashed var(--wf-warn);
+  background: color-mix(in srgb, var(--wf-warn) 8%, transparent);
+  color: var(--wf-warn);
+  font-family: var(--wf-font-ui);
+  font-size: var(--wf-text-sm);
+  text-align: center;
+}
+
+/* Warm for what needs acting on, cold for the routine, so the shape of a
+ * screenful reads before any of the words do. */
+.wf-level-error {
+  color: var(--wf-error);
+}
+
+.wf-level-warn {
+  color: var(--wf-warn);
+}
+
+.wf-level-info {
+  color: var(--wf-accent);
+}
+
+.wf-level-debug {
+  color: var(--wf-text-muted);
+}
+
+.wf-level-trace {
+  color: var(--wf-text-faint);
+}

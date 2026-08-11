@@ -26,13 +26,41 @@ members = [
     "bins/wayfinder-tap",
     "bins/wayfinder-tui",
     "bins/wayfinder-ctl",
+    "bins/wayfinder-web",
     "bins/rylr998-cli",
 ]
+
 # Board-support code for the nRF52840 firmware crates. Not a member: it depends
 # on `nrf-softdevice`, whose build script links a precompiled Nordic binary and
 # needs a real embedded target, so `cargo build --workspace` could not build it.
 # The `bins/wayfinder-nrf52840*` workspaces pull it in by path.
 exclude = ["libs/wayfinder-nrf"]
+
+# `bins/wayfinder-web` is driven by `cargo leptos`, which needs to know how to
+# build the crate's two halves. Paths are relative to this workspace root.
+#
+# Both halves set `*-default-features = false`: the crate's `default` feature is
+# empty on purpose so a plain `cargo build --workspace` compiles a stub instead
+# of failing, and cargo-leptos selects `ssr`/`hydrate` explicitly here.
+#
+# Keep this table last in the `[workspace]` section: it is an array-of-tables,
+# so any bare key written after it is parsed as one of *its* keys rather than as
+# a `[workspace]` key.
+[[workspace.metadata.leptos]]
+name = "wayfinder-web"
+bin-package = "wayfinder-web"
+lib-package = "wayfinder-web"
+site-root = "target/site"
+site-pkg-dir = "pkg"
+style-file = "bins/wayfinder-web/style/main.css"
+# Only the default; the binary's `--listen` overrides it (see `src/main.rs`).
+site-addr = "127.0.0.1:8080"
+reload-port = 3001
+browserquery = "defaults"
+bin-features = ["ssr"]
+bin-default-features = false
+lib-features = ["hydrate"]
+lib-default-features = false
 
 [workspace.lints.rust]
 # Every public API must carry documentation (see CLAUDE.md). Enforced
@@ -101,3 +129,11 @@ libc = "0.2.186"
 # carry the mesh Ed25519 identity in the handshake — no X.509.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
+# The web dashboard (`bins/wayfinder-web`). Leptos is pinned as a family — the
+# four crates share a version and `cargo-leptos` 0.3.x expects the 0.8 line.
+leptos = "0.8"
+leptos_router = "0.8"
+leptos_meta = "0.8"
+leptos_axum = "0.8"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs"] }

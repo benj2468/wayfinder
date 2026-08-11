@@ -141,6 +141,27 @@ build:embedded:
     - cargo build --locked -p nrf-ieee802154 --target "$BARE_METAL_TARGET"
     - cargo clippy --locked -p nrf-ieee802154 --target "$BARE_METAL_TARGET" -- -D warnings
     - sccache --show-stats
+# `bins/wayfinder-web` needs its own job for two reasons. Its `default` feature
+# set is deliberately empty — so the `build` job's `cargo build --workspace`
+# compiles a stub that proves nothing — and its tests sit behind `mock-node`, so
+# the workspace nextest run never sees them either. Both halves are built here
+# (the wasm one is where a misplaced `cfg` hides, since it drops every
+# server-side dependency), then linted and tested against the canned node.
+build:web:
+  extends: .base-ci-docker
+  stage: build
+  needs:
+    - lint-done
+    - build-image
+  script:
+    - cargo build -p wayfinder-web --features ssr
+    - cargo build -p wayfinder-web --features hydrate --target wasm32-unknown-unknown
+    - cargo clippy -p wayfinder-web --features mock-node --all-targets -- -D warnings
+    - cargo nextest run -p wayfinder-web --features mock-node
+    # The real cargo-leptos path, which also runs wasm-bindgen and emits the
+    # site bundle the binary serves.
+    - cargo leptos build --release
+    - sccache --show-stats
 test:run:rust:
   extends: .base-ci-docker
   stage: test

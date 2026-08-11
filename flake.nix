@@ -26,6 +26,7 @@
           wayfinder-tap
           wayfinder-tui
           wayfinder-ctl
+          wayfinder-web
           ;
       };
     in
@@ -60,6 +61,12 @@
           # `-Z build-std`.
           bareMetalTarget = "thumbv7em-none-eabihf";
 
+          # Browser target for `bins/wayfinder-web`. `cargo-leptos` builds that
+          # crate twice — the axum server for the host and a hydration bundle
+          # for this target — so its `rust-std` is combined on for the same
+          # reason the bare-metal one is.
+          wasmTarget = "wasm32-unknown-unknown";
+
           rustToolchain = pkgs.fenix.combine [
             (pkgs.fenix.complete.withComponents [
               "cargo"
@@ -70,6 +77,7 @@
               "llvm-tools-preview"
             ])
             pkgs.fenix.targets.${bareMetalTarget}.latest.rust-std
+            pkgs.fenix.targets.${wasmTarget}.latest.rust-std
           ];
 
           # Python interpreter with the integration-test deps (pytest). Used by
@@ -80,6 +88,10 @@
           testPkgs = import nixpkgs {
             inherit system;
             overlays = [
+              # `nix/default.nix` reaches for `pkgs.fenix` to give the web
+              # package a wasm32-capable toolchain; nixpkgs' own rustc carries
+              # no wasm32 `rust-std`.
+              fenix.overlays.default
               overlay
               (_final: prev: {
                 craneLib = inputs.crane.mkLib prev;
@@ -109,6 +121,19 @@
               cargo-llvm-cov
               cargo-fuzz
               rust-analyzer
+              # Build driver for `bins/wayfinder-web`: compiles the axum server
+              # and the wasm hydration bundle together and serves them
+              # (`cargo leptos watch`). `binaryen` supplies the `wasm-opt` it
+              # shells out to for release bundles.
+              cargo-leptos
+              binaryen
+              # cargo-leptos shells out to `wasm-bindgen` to generate the JS
+              # glue, and refuses to run if the CLI's version differs from the
+              # `wasm-bindgen` crate's. Hence the exact-version attribute rather
+              # than plain `wasm-bindgen-cli`: it is pinned in lockstep with the
+              # `=0.2.126` in `bins/wayfinder-web/Cargo.toml`, and the two must
+              # be bumped together.
+              wasm-bindgen-cli_0_2_126
               pytestEnv
               python312Packages.virtualenv
               maturin
@@ -173,7 +198,12 @@
           };
 
           packages = {
-            inherit (testPkgs) wayfinder-tap wayfinder-tui wayfinder-ctl;
+            inherit (testPkgs)
+              wayfinder-tap
+              wayfinder-tui
+              wayfinder-ctl
+              wayfinder-web
+              ;
             wayfinder-simple = testPkgs.callPackage ./nix/tests/simple.nix { };
           };
 
