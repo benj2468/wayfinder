@@ -9,7 +9,6 @@ from __future__ import annotations
 import math
 
 import pytest
-
 from wayfinder_ml import oracle
 
 

@@ -209,7 +209,7 @@ def split(
         raise ValueError(f"eval_fraction must be in (0, 1), got {eval_fraction}")
 
     order = np.random.default_rng(seed).permutation(batch.rows)
-    n_eval = int(round(batch.rows * eval_fraction))
+    n_eval = round(batch.rows * eval_fraction)
     eval_idx, train_idx = order[:n_eval], order[n_eval:]
 
     def _take(idx: np.ndarray) -> FeatureBatch:

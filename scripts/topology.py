@@ -47,6 +47,7 @@ mounted read-only so the host binary's interpreter resolves.)
 from __future__ import annotations
 
 import argparse
+import itertools
 import subprocess
 import sys
 import tempfile
@@ -90,7 +91,7 @@ def diamond(prefix: str) -> list[list[str]]:
 def path(prefix: str, n: int) -> list[list[str]]:
     """A line of ``n`` nodes: ``{p}1 — {p}2 — … — {p}n``."""
     nodes = [f"{prefix}{i}" for i in range(1, n + 1)]
-    return [[a, b] for a, b in zip(nodes, nodes[1:])]
+    return [[a, b] for a, b in itertools.pairwise(nodes)]
 
 
 def shared_lan(nodes: list[str]) -> list[list[str]]:
@@ -256,7 +257,7 @@ def render_compose(require_approval: bool = False) -> str:
     # ./target instead of the ones baked into the image: rebuild on the host
     # (`cargo build`) then `./scripts/topology.py restart` — no image rebuild. The
     # entrypoint prefers these and falls back to the baked-in binaries.
-    e(f"    - {str(REPO_ROOT)}:/workspace:ro")
+    e(f"    - {REPO_ROOT!s}:/workspace:ro")
     # On a Nix host the host-built binary's ELF interpreter (and glibc) live in
     # /nix/store; mount it read-only so a plain `cargo build` artifact is
     # runnable in the Debian-based container without a musl/static rebuild.
@@ -282,8 +283,8 @@ def render_compose(require_approval: bool = False) -> str:
         # Only the provider mounts the mesh root seed.
         if is_provider:
             e("    volumes:")
-            e(f"      - {str(ca_dir)}:/ca:ro")
-            e(f"      - {str(REPO_ROOT)}:/workspace:ro")
+            e(f"      - {ca_dir!s}:/ca:ro")
+            e(f"      - {REPO_ROOT!s}:/workspace:ro")
             # On a Nix host the host-built binary's ELF interpreter (and glibc) live in
             # /nix/store; mount it read-only so a plain `cargo build` artifact is
             # runnable in the Debian-based container without a musl/static rebuild.
@@ -424,8 +425,8 @@ def cmd_graph() -> None:
                 if a != b:
                     adj[a].add(b)
     print(f"{len(adj)} nodes, {len(links)} segments")
-    for node in adj:
-        print(f"  {node}: {', '.join(sorted(adj[node]))}")
+    for node, neighbors in adj.items():
+        print(f"  {node}: {', '.join(sorted(neighbors))}")
 
 
 def main(argv: list[str]) -> int:

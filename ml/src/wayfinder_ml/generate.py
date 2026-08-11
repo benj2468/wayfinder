@@ -21,9 +21,9 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from itertools import combinations
-from typing import Any, Callable
+from typing import Any
 
 from wayfinder_sim import NoLinkError
 

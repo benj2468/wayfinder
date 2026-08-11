@@ -74,8 +74,50 @@ cd bins/wayfinder-nrf52840 && cargo run --release
 
 The dongle has no onboard debugger. With an SWD probe on the pads the flow is
 identical. Without one, it is DFU over the Open Bootloader: hold the reset
-button until LD2 pulses red, then package and flash the image with `nrfutil`.
-Note that DFU is what the reserved high flash exists for — see above.
+button until LD2 pulses red, then `cargo run --release` in
+`bins/wayfinder-nrf52840-dongle`, which drives `runner.sh`. Note that DFU is
+what the reserved high flash exists for — see above.
+
+`runner.sh` does three things: `rust-objcopy` the given ELF straight to
+`.hex` (**not** `cargo objcopy`, which reinvokes `cargo build` under its own
+default *dev* profile and objcopies that instead, silently ignoring the actual
+release binary it was handed — this was the first thing that made every early
+flash unbootable, well before the addressing bug below); `nrfutil
+nrf5sdk-tools pkg generate` to build a signed-less DFU `.zip` with
+`--sd-req 0x123` (S140 7.3.0's documented firmware ID, from `nrfutil
+nrf5sdk-tools pkg generate --help`'s well-known-values table); then `nrfutil
+device program --firmware *.zip --traits nordicDfu` to flash it. A raw `.hex`
+can't go straight to `nrfutil device program` for a USB/`nordicDfu` device —
+that path only accepts `.hex` over `jlink`/`mcuBoot` traits, neither of which
+this board has; it needs the `.zip`.
+
+**`--sd-req` is not optional.** Omitting it (as `nrfdfu-rs` does — tried and
+abandoned, see below) makes the Nordic bootloader conclude the app doesn't
+depend on a SoftDevice and **erase it** before placing the app at `0x1000`
+instead of `0x27000` — corrupting the SoftDevice and misplacing the app (which
+is linked, per `memory.x`, to run from `0x27000`) in one step. The bootloader
+computes the app's actual placement itself at flash time
+(`nrf_dfu_bank0_start_addr()` in `nRF5_SDK`), from whatever SoftDevice it
+currently finds valid — `sd_req` only has to name it correctly, not declare an
+address.
+
+`nrfutil-nrf5sdk-tools` (the package-generation extension) isn't published by
+Nordic for `aarch64-linux` — check `pkgs/by-name/nr/nrfutil/source.nix` in
+nixpkgs before assuming it's just a `withAllExtensions` wiring gap. `flake.nix`
+runs the real `x86_64-linux` build under `qemu-user` for that one step
+(`nrfutilNrf5sdkTools` in `perSystem`) — the same trick already used for
+x86_64-only Android NDK/SDK binaries on this project's `aarch64` devShell.
+Only package *generation* is emulated; `nrfutil device program` itself runs
+natively, since `nrfutil-device` is published for `aarch64-linux`.
+
+`nrfdfu-rs` (`overlay/pkgs/nrfdfu.nix`, removed) was tried first: it takes an
+ELF directly with no packaging step, but always sends `FwType::Application`
+with no `sd_req` at all — see the `--sd-req` note above for what that does.
+Patching its `sd_size` field first seemed promising but doesn't help:
+`sd_size` is only consulted for `Softdevice`/`SoftdeviceAndBootloader`
+transfers, never for a plain `Application` one — `sd_req` is the field that
+actually matters here. `nrfdfu --get-images` is still a handy read-only
+diagnostic if `nrfdfu` ever gets reinstated for that alone.
 
 ## A fault reboots; it does not halt
 

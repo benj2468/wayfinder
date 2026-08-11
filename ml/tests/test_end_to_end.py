@@ -20,12 +20,11 @@ import pytest
 pytest.importorskip("simpy")
 pytest.importorskip("wayfinder_py")
 
-from wayfinder_sim.channel import PerfectWire  # noqa: E402
-from wayfinder_sim.node import Node  # noqa: E402
-from wayfinder_sim.scenario import Simulation  # noqa: E402
-from wayfinder_sim.topology import pair, path  # noqa: E402
-
-from wayfinder_ml import generate, scenarios, schema, stats  # noqa: E402
+from wayfinder_ml import generate, scenarios, schema, stats
+from wayfinder_sim.channel import PerfectWire
+from wayfinder_sim.node import Node
+from wayfinder_sim.scenario import Simulation
+from wayfinder_sim.topology import pair, path
 
 SCENARIO_DIR = Path(__file__).resolve().parents[2] / "sim" / "scenarios"
 """The repo's own scenarios — the ones `wayfinder-ml generate` is pointed at

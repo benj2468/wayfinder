@@ -11,7 +11,8 @@ scenario-specific.
 from __future__ import annotations
 
 import dataclasses
-from typing import Callable, Generic, Sequence, TypeVar
+from collections.abc import Callable, Sequence
+from typing import Generic, TypeVar
 
 from .recorder import Recorder
 from .scenario import Simulation

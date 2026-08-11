@@ -1,5 +1,4 @@
 import pytest
-
 from wayfinder_sim.mobility import Orbit, Static, Vec3, Waypoints
 
 

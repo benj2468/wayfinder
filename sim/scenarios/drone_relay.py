@@ -106,7 +106,6 @@ def print_switch_summary(rec: Recorder) -> None:
 
 def plot(rec: Recorder, out_path: Path) -> None:
     import matplotlib.pyplot as plt
-
     from wayfinder_sim.plotting import PALETTE, state_band, style_axes
 
     t = rec.times_s

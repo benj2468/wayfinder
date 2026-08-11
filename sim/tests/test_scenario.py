@@ -2,13 +2,12 @@ import pytest
 
 pytest.importorskip("simpy")
 
-import wayfinder_py as wf  # noqa: E402
-
-from wayfinder_sim.channel import PerfectWire  # noqa: E402
-from wayfinder_sim.link import Link  # noqa: E402
-from wayfinder_sim.node import Node  # noqa: E402
-from wayfinder_sim.scenario import Simulation  # noqa: E402
-from wayfinder_sim.topology import diamond, pair  # noqa: E402
+import wayfinder_py as wf
+from wayfinder_sim.channel import PerfectWire
+from wayfinder_sim.link import Link
+from wayfinder_sim.node import Node
+from wayfinder_sim.scenario import Simulation
+from wayfinder_sim.topology import diamond, pair
 
 
 def test_two_node_route_converges():
