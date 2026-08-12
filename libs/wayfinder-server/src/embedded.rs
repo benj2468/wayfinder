@@ -30,12 +30,14 @@ use embedded_io_async::Read;
 use embedded_io_async::Write;
 use prost::Message;
 use tracing::trace;
+use tracing::warn;
 use wayfinder_protos::wayfinder::v1alpha::ErrorResponse;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderResponse;
 use wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response as RespKind;
 
 use crate::framing::FrameError;
+use crate::framing::MAX_FRAME_LEN;
 use crate::framing::read_frame;
 use crate::framing::write_frame;
 
@@ -188,6 +190,25 @@ where
                     })),
                 }
             }
+        };
+
+        // Refused before it is built, not after. `write_frame` rejects an
+        // oversized body too, but by then the cost has been paid: `encode` grows
+        // its `Vec` by doubling, so a response several times `MAX_FRAME_LEN`
+        // asks for an allocation several times again that, next to the request
+        // buffer and whatever the response already materialised. On an embedded
+        // node's small heap that allocation fails, and a failed allocation is a
+        // panic — which this crate's boards answer with a reset.
+        let encoded_len = response.encoded_len();
+        let response = if encoded_len > MAX_FRAME_LEN {
+            warn!(len = encoded_len, "management response too large to frame");
+            WayfinderResponse {
+                response: Some(RespKind::Error(ErrorResponse {
+                    message: "response too large".into(),
+                })),
+            }
+        } else {
+            response
         };
 
         out_buf.clear();
@@ -414,6 +435,57 @@ mod tests {
             seen,
             std::vec![1, 2],
             "both requests are answered, in the order they were received"
+        );
+    }
+
+    /// A response the router produced but that cannot be framed is answered
+    /// with an error, and the session carries on.
+    ///
+    /// The check has to happen *before* the encode, which is what this pins:
+    /// `write_frame` refuses an oversized body too, but only once it exists, and
+    /// building it is the expensive part. `encode` grows its `Vec` by doubling,
+    /// so a response several times `MAX_FRAME_LEN` asks for an allocation
+    /// several times again that — which on an embedded node's small heap fails,
+    /// and a failed allocation is a panic, and a panic on a board is a reset.
+    /// A `GetLogs` answer carrying a full log ring is exactly that shape.
+    #[test]
+    fn serve_refuses_an_oversized_response_before_encoding_it() {
+        let channel = EmbeddedQueryChannel::new();
+        let (tx, rx) = channel.split();
+
+        let mut stream = OneShotStream {
+            to_read: framed_request(ReqKind::GetNodeInfo(Default::default())),
+            ..Default::default()
+        };
+
+        // A well-formed response that simply cannot fit a frame.
+        let router = async {
+            let _request = rx.recv().await;
+            rx.reply(WayfinderResponse {
+                response: Some(RespKind::NodeInfo(NodeInfo {
+                    node_id: std::vec![0u8; MAX_FRAME_LEN * 2],
+                    num_originators: 0,
+                    auth_locked: false,
+                    runtime_config_active: false,
+                })),
+            })
+            .await;
+        };
+
+        let (serve_result, ()) =
+            futures::executor::block_on(futures::future::join(serve(&mut stream, &tx), router));
+        assert!(
+            matches!(serve_result, Err(FrameError::UnexpectedEof)),
+            "the session survives an unframeable response: {serve_result:?}"
+        );
+
+        let len = u32::from_be_bytes(stream.written[..4].try_into().unwrap()) as usize;
+        assert!(len <= MAX_FRAME_LEN, "what went out fits a frame: {len}");
+        let response = WayfinderResponse::decode(&stream.written[4..]).unwrap();
+        assert!(
+            matches!(response.response, Some(RespKind::Error(_))),
+            "the caller is told, never left waiting: {:?}",
+            response.response
         );
     }
 

@@ -30,22 +30,10 @@ use interfaces::frame::MAX_LINK_FRAME_LEN;
 use interfaces::frame::Mac;
 use interfaces::link::LinkError;
 use interfaces::link::LinkMetrics;
+use interfaces::wire::ETH_HEADER_LEN;
+use interfaces::wire::frame_into_buf;
+use interfaces::wire::retag_ethertype;
 use zerocopy::FromBytes;
-
-use crate::wire::ETH_HEADER_LEN;
-use crate::wire::ETHERTYPE_OFFSET;
-use crate::wire::frame_into_buf;
-
-/// Rewrite a received frame's EtherType field to `protocol`, in place.
-///
-/// The wire EtherType is a transport label the router does not understand; the
-/// mesh protocol it demuxes on is a fixed property of the link (BATMAN here).
-/// Because the EtherType field sits at the same offset as [`LinkFrame::protocol`],
-/// overwriting those two bytes turns the received Ethernet frame into a
-/// [`LinkFrame`] the router can demux, with no copy and no length change.
-fn retag_ethertype(buf: &mut [u8], protocol: u16) {
-    buf[ETHERTYPE_OFFSET..ETH_HEADER_LEN].copy_from_slice(&protocol.to_be_bytes());
-}
 
 /// Offset of the payload within a raw IPv4 datagram as delivered by an
 /// `AF_INET`/`SOCK_RAW` socket, i.e. the length of the IPv4 header (IHL × 4).

@@ -18,9 +18,8 @@ from fakesim import (
     FakeSample,
     FakeSim,
 )
-from wayfinder_sim import NoLinkError
-
 from wayfinder_ml import generate
+from wayfinder_sim import NoLinkError
 
 ROWS_PER_INSTANT = 2
 """`FakeSim` is two nodes, each knowing one originator — so one row apiece."""

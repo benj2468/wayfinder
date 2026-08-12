@@ -120,7 +120,7 @@ def test_originator_occupancy_reports_used_and_capacity():
 def test_introspection_does_not_disturb_routing():
     """These accessors feed dataset generation while a simulation runs, so
     they must not perturb the run they are describing."""
-    a, b = _converge_pair()
+    a, _ = _converge_pair()
     before = a.get_egress_interface(_MAC_B)
 
     for _ in range(5):

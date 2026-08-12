@@ -40,8 +40,8 @@ Run: `uv run --group sim python sim/scenarios/satellite_relay.py`
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 import wayfinder_py as wf
 from wayfinder_sim.channel import FreeSpacePathLoss
@@ -260,7 +260,6 @@ def print_sweep_summary(results: Sequence[SweepResult[float]]) -> None:
 
 def plot(rec: Recorder, out_path: Path) -> None:
     import matplotlib.pyplot as plt
-
     from wayfinder_sim.plotting import PALETTE, state_band, style_axes
 
     t = rec.times_s
@@ -329,7 +328,6 @@ def plot_3d(rec: Recorder, out_path: Path) -> None:
     GCSA fixed on the ground, the low drone's straight out-and-back track,
     and the satellite's orbital loop off to the side."""
     import matplotlib.pyplot as plt
-
     from wayfinder_sim.plotting import PALETTE, point_3d, style_axes_3d, trajectory_3d
 
     fig = plt.figure(figsize=(9, 8), facecolor=PALETTE.surface)
@@ -364,7 +362,6 @@ def plot_sweep(results: Sequence[SweepResult[float]], out_path: Path) -> None:
     """How the handoff distance shifts as satellite `tx_power_dbm` varies —
     the visual case for "higher power fails over sooner."""
     import matplotlib.pyplot as plt
-
     from wayfinder_sim.plotting import PALETTE, style_axes
 
     powers = [r.param for r in results]

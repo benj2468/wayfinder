@@ -61,9 +61,13 @@ embassy-executor = { version = "0.10", features = [
 embassy-time = { version = "0.5.1", features = ["log"] }
 # `default-features = false` drops the unused `usbd-hid` class, which otherwise
 # pulls in a second `heapless` version alongside the workspace's.
-embassy-usb = { version = "0.6.0", default-features = false }
+embassy-usb = { version = "0.6.0", default-features = false, features = ["max-interface-count-6"] }
 embedded-io-async = "0.7.0"
 tracing = { version = "0.1.44", default-features = false }
+# Only the `FromBytes` trait, to reinterpret a received CDC-NCM datagram as a
+# `LinkFrame` in place. No `derive` feature: this crate declares no wire structs
+# of its own.
+zerocopy = { version = "0.8.48", default-features = false }
 
 # **Deliberately without `critical-section-single-core`.** Its `acquire` is a
 # bare `cpsid i`, masking the SoftDevice's priority-0/1 RADIO/RTC0/TIMER0 along

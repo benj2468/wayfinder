@@ -13,8 +13,9 @@ A board binary owns only what is genuinely board-specific:
 | `memory.x` and the two constants tracking it (`DURABLE_STORE_BASE`, `RAM_ORIGIN`) | `fault` — panic/HardFault handling, the retained fault record |
 | LED and UART pins | `stack` — high-water painting and reporting |
 | `bind_interrupts!` | `identity` — FICR-derived MAC + flash persistence |
-| `.cargo/config.toml` runner | `link` — the `MeshLink` LoRa/BLE/absent enum |
-| | `usb_mgmt` — the CDC-ACM management port |
+| `.cargo/config.toml` runner | `link` — the `MeshLink` LoRa/BLE/USB/absent enum |
+| | `usb_mgmt` — the USB device: CDC-ACM management port + the shared `Builder` |
+| | `usb_link` — the CDC-NCM mesh interface |
 | | `node::run` — the whole bring-up sequence |
 | | `init_platform`, the capacity profile, the heap |
 
@@ -74,13 +75,115 @@ cd bins/wayfinder-nrf52840 && cargo run --release
 
 The dongle has no onboard debugger. With an SWD probe on the pads the flow is
 identical. Without one, it is DFU over the Open Bootloader: hold the reset
-button until LD2 pulses red, then package and flash the image with `nrfutil`.
-Note that DFU is what the reserved high flash exists for — see above.
+button until LD2 pulses red, then `cargo run --release` in
+`bins/wayfinder-nrf52840-dongle`, which drives `runner.sh`. Note that DFU is
+what the reserved high flash exists for — see above.
+
+`runner.sh` does three things: `rust-objcopy` the given ELF straight to
+`.hex` (**not** `cargo objcopy`, which reinvokes `cargo build` under its own
+default *dev* profile and objcopies that instead, silently ignoring the actual
+release binary it was handed — this was the first thing that made every early
+flash unbootable, well before the addressing bug below); `nrfutil
+nrf5sdk-tools pkg generate` to build a signed-less DFU `.zip` with
+`--sd-req 0x123` (S140 7.3.0's documented firmware ID, from `nrfutil
+nrf5sdk-tools pkg generate --help`'s well-known-values table); then `nrfutil
+device program --firmware *.zip --traits nordicDfu` to flash it. A raw `.hex`
+can't go straight to `nrfutil device program` for a USB/`nordicDfu` device —
+that path only accepts `.hex` over `jlink`/`mcuBoot` traits, neither of which
+this board has; it needs the `.zip`.
+
+**`--sd-req` is not optional.** Omitting it (as `nrfdfu-rs` does — tried and
+abandoned, see below) makes the Nordic bootloader conclude the app doesn't
+depend on a SoftDevice and **erase it** before placing the app at `0x1000`
+instead of `0x27000` — corrupting the SoftDevice and misplacing the app (which
+is linked, per `memory.x`, to run from `0x27000`) in one step. The bootloader
+computes the app's actual placement itself at flash time
+(`nrf_dfu_bank0_start_addr()` in `nRF5_SDK`), from whatever SoftDevice it
+currently finds valid — `sd_req` only has to name it correctly, not declare an
+address.
+
+`nrfutil-nrf5sdk-tools` (the package-generation extension) isn't published by
+Nordic for `aarch64-linux` — check `pkgs/by-name/nr/nrfutil/source.nix` in
+nixpkgs before assuming it's just a `withAllExtensions` wiring gap. `flake.nix`
+runs the real `x86_64-linux` build under `qemu-user` for that one step
+(`nrfutilNrf5sdkTools` in `perSystem`) — the same trick already used for
+x86_64-only Android NDK/SDK binaries on this project's `aarch64` devShell.
+Only package *generation* is emulated; `nrfutil device program` itself runs
+natively, since `nrfutil-device` is published for `aarch64-linux`.
+
+`nrfdfu-rs` (`overlay/pkgs/nrfdfu.nix`, removed) was tried first: it takes an
+ELF directly with no packaging step, but always sends `FwType::Application`
+with no `sd_req` at all — see the `--sd-req` note above for what that does.
+Patching its `sd_size` field first seemed promising but doesn't help:
+`sd_size` is only consulted for `Softdevice`/`SoftdeviceAndBootloader`
+transfers, never for a plain `Application` one — `sd_req` is the field that
+actually matters here. `nrfdfu --get-images` is still a handy read-only
+diagnostic if `nrfdfu` ever gets reinstated for that alone.
+
+## The USB mesh link
+
+USB carries two independent functions on **one** device: the CDC-ACM management
+port and a CDC-NCM mesh interface. That is why `usb_mgmt::init` builds both and
+returns both — there is a single `embassy_usb::Builder`, and `UsbMgmt::run`
+drives the device stack that the mesh link also depends on. **The link is dead
+whenever `UsbMgmt::run` is not being polled**, which is not obvious from the
+link's own API.
+
+The host side needs no new code. `LinkFrame` is byte-for-byte an Ethernet frame,
+so the board puts frames on the wire verbatim and `wayfinder-tap`'s existing
+raw-L2 carrier binds straight to the NIC that appears:
+
+```yaml
+- transport: !RawL2
+    interface: wf-usb0
+    ethertype: 0xfafa
+```
+
+Three things here fail silently:
+
+- **That `ethertype` must equal `usb_link::MESH_ETHERTYPE`.** It is a wire
+  transport label, deliberately not the mesh protocol (`0x4305`), so the link can
+  share a NIC with the host kernel's own IPv6 solicitations and mDNS — which do
+  arrive and are dropped. Mismatch it and both ends come up healthy while no
+  frame is ever accepted.
+- **`UsbNcmLink::rx_buf` must stay `MAX_LINK_FRAME_LEN`.** `Receiver::read_packet`
+  copies the datagram in with no length check of its own, so anything larger than
+  the buffer panics inside `embassy-usb`. The host picks that length (it brings
+  the interface up at MTU 1500); the only bound is the 2048-byte NTB, which is
+  what `MAX_LINK_FRAME_LEN` matches. Shrinking it to the profile's smaller
+  `max_frame_len` puts a full-size host frame one hop from rebooting the node.
+- **Two CDC functions is exactly `embassy-usb`'s default `MAX_INTERFACE_COUNT`
+  of 4.** A third function needs the `max-interface-count-6` feature. This one at
+  least panics in the builder rather than truncating the descriptor.
+
+The link is point-to-point and wired, so it gets the tightest Trickle schedule of
+the three interfaces (`node::TRICKLE`) — there is no airtime budget to respect.
 
 ## A fault reboots; it does not halt
 
 Both `#[panic_handler]` and the `HardFault` handler print, then reset. They halt
 only after `MAX_CONSECUTIVE_FAULTS` (3) in a row.
+
+**Both also retain what killed the board across the reset**, in `.uninit` — the
+HardFault its registers (`FAULT_RECORD`), a panic its rendered text
+(`PANIC_MSG`) — and `report_retained` re-emits either as `error!` on the next
+boot, early enough that nothing pushes it out of the log ring:
+
+```
+wayfinderctl --serial /dev/serial/by-id/usb-Wayfinder_*-if00 logs | \
+  grep 'previous boot ended in'
+```
+
+This is the only diagnostic path a dongle has. The `rprintln!` in each handler
+reaches an RTT channel that needs an attached probe, and attaching one is itself
+a documented cause of faults here (see below). Without the retained record a
+panic reset the node leaving no evidence anywhere — indistinguishable, from the
+host, from a power glitch or a USB teardown.
+
+The retained panic text is capped at `PANIC_MSG_LEN` (120 bytes), sized so it
+survives `wayfinder-log`'s 160-byte `MESSAGE_CAP` once the event's own text and
+the `detail="…"` wrapper are accounted for. A longer panic message loses its
+tail, not its location prefix.
 
 This is deliberate and the reasoning is not obvious. A node that halts is dead —
 no mesh, no RTT, no USB management port — until someone power-cycles it, which

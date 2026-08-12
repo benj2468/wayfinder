@@ -1,5 +1,4 @@
 import pytest
-
 from wayfinder_sim.channel import PerfectWire
 from wayfinder_sim.link import Link
 

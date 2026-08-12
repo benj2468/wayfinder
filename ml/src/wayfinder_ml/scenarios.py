@@ -27,9 +27,10 @@ import importlib
 import importlib.util
 import inspect
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable
+from typing import Any
 
 DEFAULT_FACTORY = "build_simulation"
 """The builder looked up when a reference names no `:factory`. Matches what

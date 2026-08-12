@@ -19,6 +19,7 @@ pub mod identity;
 pub mod link;
 pub mod node;
 pub mod stack;
+pub mod usb_link;
 pub mod usb_mgmt;
 
 use embassy_nrf::interrupt::InterruptExt;
@@ -32,14 +33,21 @@ wayfinder::define_profile! {
     /// routing core's const-generic tables to this mesh rather than a gateway's.
     ///
     /// Two figures come from hardware: `interfaces` is the board's link count
-    /// (LoRa + BLE), and `max_frame_len` is the largest frame either link can
-    /// deliver — `rylr998` reassembly caps at 512, `blue` at 350 — so lowering
-    /// it would silently drop reassembled LoRa frames. The rest carry headroom
-    /// for a handful-of-nodes mesh; `originators` and `ident_table` must stay
-    /// powers of two.
+    /// (LoRa + BLE + the CDC-NCM USB link), and `max_frame_len` is the largest
+    /// frame any link can deliver — `rylr998` reassembly caps at 512, `blue` at
+    /// 350 — so lowering it would silently drop reassembled LoRa frames. The
+    /// rest carry headroom for a handful-of-nodes mesh; `originators` and
+    /// `ident_table` must stay powers of two.
+    ///
+    /// `max_frame_len` deliberately does *not* rise for the USB link, which
+    /// could carry a full 1500-byte host MTU: it is the router's frame
+    /// capacity, so raising it would cost RAM on every board to serve frames
+    /// the radios can never relay onward anyway. The USB link's own receive
+    /// buffer is sized separately and independently — see
+    /// [`usb_link::UsbNcmLink`].
     pub nrf52840 {
         originators: 32,
-        interfaces: 2,
+        interfaces: 3,
         mcast_members: 16,
         local_mcast: 4,
         ident_table: 32,

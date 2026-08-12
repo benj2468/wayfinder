@@ -73,6 +73,32 @@ cargo run -p wayfinder-web --features mock-node --example mock_node
 The mock is the *real* `wayfinder-server` TLS listener over canned data, so the
 handshake, framing and dispatch are all genuine.
 
+## Shipping it
+
+`containers/Dockerfile`'s `web` target is the only image assembled from two
+build stages, because the two builds above have different architectures: the
+`builder` stage cross-compiles the axum server for the image's real arch, and a
+separate `site` stage runs `cargo leptos build --release --frontend-only` to
+produce the wasm/JS/CSS bundle, which is arch-independent.
+
+**Outside `cargo leptos`, the binary finds its assets only through the
+environment**, and `LEPTOS_OUTPUT_NAME` is needed twice over:
+
+- **At runtime**, `get_configuration(None)` reads `LEPTOS_OUTPUT_NAME`,
+  `LEPTOS_SITE_ROOT` and `LEPTOS_SITE_PKG_DIR` and consults nothing else — there
+  is no `Cargo.toml` to fall back on in a container.
+- **At compile time**, `leptos` reads the same variable through
+  `std::option_env!`. Unset, it bakes in the plain `wasm-bindgen` file layout and
+  asks the browser for `<name>_bg.wasm`, which cargo-leptos never emits (it
+  renames the file to `<name>.wasm`).
+
+Either mistake fails the same silent way: the server starts, serves correct
+server-rendered markup, and 404s the wasm that would have made the page
+interactive — a dashboard that looks right and never updates. `cargo leptos`
+exports both for its own builds, so only a *plain* `cargo build` of the `ssr`
+binary has to do it by hand. The container does, in `ENV` on both stages; any
+other deployment path has to as well.
+
 ## Conventions
 
 - **Formatting goes in `format.rs`, never inline in a `view!`.** Macro bodies

@@ -1,10 +1,16 @@
-//! The management API over the nRF52840's USB device peripheral, as a CDC-ACM
-//! (USB serial) port.
+//! The board's USB device: the management API as a CDC-ACM (USB serial) port,
+//! and a mesh interface as a CDC-NCM (USB Ethernet) function.
 //!
 //! A host runs `wayfinder-tui` or `wayfinderctl --serial /dev/ttyACMX` against
 //! the node, since [`serve`] frames requests over any [`embedded_io_async`] byte
 //! stream and CDC-ACM presents one. USBD is on the chip itself, so this needs no
 //! GPIOs and no debug probe — the only way into a dongle.
+//!
+//! Both functions live on **one** [`UsbDevice`], which is why [`init`] builds
+//! them together and hands the caller both halves: there is a single `Builder`,
+//! and only whatever it produces can be run. The two are otherwise independent
+//! — [`crate::usb_link`] owns the mesh side, and a host that never opens the
+//! management port does not affect it, or vice versa.
 //!
 //! The SoftDevice owns `POWER` and `CLOCK`, both of which USBD depends on, so
 //! [`init`] has to ask it for what a bare-metal USB stack would do itself:
@@ -20,6 +26,7 @@
 //! [`on_soc_event`] must be handed to the SoftDevice's single event pump, the
 //! only place SoC events are delivered — see [`crate::node`].
 
+use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_nrf::Peri;
 use embassy_nrf::interrupt::typelevel::Binding;
@@ -52,10 +59,13 @@ use wayfinder_server::EmbeddedQueryTx;
 use wayfinder_server::FrameError;
 use wayfinder_server::serve;
 
+use crate::usb_link::UsbInitError;
+use crate::usb_link::UsbNcmLink;
+
 /// The USB driver this board instantiates: the nRF USBD peripheral, with VBUS
 /// state supplied by software rather than read off the SoftDevice-reserved
 /// `POWER` peripheral.
-type UsbDriver = embassy_nrf::usb::Driver<'static, &'static SoftwareVbusDetect>;
+pub(crate) type UsbDriver = embassy_nrf::usb::Driver<'static, &'static SoftwareVbusDetect>;
 
 /// USB vendor id. `1209:0001` is pid.codes' *unallocated* test pair, never
 /// assigned to a shipping product — right for research firmware, but it must be
@@ -282,20 +292,25 @@ pub struct UsbMgmt {
     stream: CdcAcmStream,
 }
 
-/// Bring up the USB device stack and its CDC-ACM management port.
+/// Bring up the USB device stack, its CDC-ACM management port and its CDC-NCM
+/// mesh interface.
 ///
 /// **Must be called after `Softdevice::enable`**, since the power and clock
 /// state it needs is reachable only through SoftDevice syscalls, which return
 /// [`RawError::SoftdeviceNotEnabled`] otherwise. `node_mac` becomes the device's
-/// USB serial number, and `irqs` is the board's `bind_interrupts!` struct, which
-/// must bind `USBD`.
+/// USB serial number and seeds the mesh interface's host-side address, and
+/// `irqs` is the board's `bind_interrupts!` struct, which must bind `USBD`.
 ///
-/// The returned [`UsbMgmt`] does nothing until [`run`](UsbMgmt::run) is polled.
+/// Neither returned half does anything until it is polled: the [`UsbMgmt`] via
+/// [`run`](UsbMgmt::run) — which is also what drives the shared device stack,
+/// so the mesh link is dead until it is running — and the [`UsbNcmLink`] by the
+/// driver's event loop.
 pub async fn init(
     usbd: Peri<'static, USBD>,
     irqs: impl Binding<embassy_nrf::interrupt::typelevel::USBD, InterruptHandler<USBD>> + 'static,
     node_mac: Mac,
-) -> Result<UsbMgmt, RawError> {
+    spawner: Spawner,
+) -> Result<(UsbMgmt, UsbNcmLink), UsbInitError> {
     let vbus = init_vbus()?;
     request_hfclk().await?;
 
@@ -303,14 +318,26 @@ pub async fn init(
 
     let mut config = Config::new(USB_VID, USB_PID);
     config.manufacturer = Some("Wayfinder");
+    // Deliberately unchanged now that the device carries a second function: the
+    // product string is part of the host's `/dev/serial/by-id/` symlink, so
+    // editing it silently breaks every script and doc naming that path.
     config.product = Some("Wayfinder mesh node management");
     config.serial_number = Some(serial_number(node_mac));
     config.max_power = MAX_POWER_MA;
     config.self_powered = false;
+    // Left at its default `true`, with the matching 0xEF/0x02/0x01 device
+    // class `Config::new` sets: two CDC functions on one device are only
+    // separable by a host if each is introduced by an Interface Association
+    // Descriptor.
 
     // The stack borrows all of these for the device's lifetime, which outlives
     // this function.
-    static CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+    //
+    // The configuration descriptor holds every interface, endpoint and
+    // class-specific descriptor of *both* functions concatenated — around 180
+    // bytes for CDC-ACM plus CDC-NCM. 512 leaves room for a third function
+    // without this becoming the thing that breaks.
+    static CONFIG_DESCRIPTOR: StaticCell<[u8; 512]> = StaticCell::new();
     static BOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
     static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
     static STATE: StaticCell<State<'static>> = StaticCell::new();
@@ -319,10 +346,11 @@ pub async fn init(
     let mut builder = Builder::new(
         driver,
         config,
-        CONFIG_DESCRIPTOR.init([0; 256]),
+        CONFIG_DESCRIPTOR.init([0; 512]),
         BOS_DESCRIPTOR.init([0; 256]),
-        // No Microsoft OS descriptors: CDC-ACM binds to the in-box driver on
-        // every host this is used from.
+        // No Microsoft OS descriptors: CDC-ACM and CDC-NCM both bind to in-box
+        // drivers on the Linux and macOS hosts this is used from. Windows may
+        // need an MS OS 2.0 descriptor to bind NCM to a composite function.
         &mut [],
         CONTROL_BUF.init([0; 64]),
     );
@@ -330,14 +358,23 @@ pub async fn init(
     let class = CdcAcmClass::new(&mut builder, STATE.init(State::new()), MAX_PACKET_SIZE);
     let (tx, rx) = class.split();
 
-    Ok(UsbMgmt {
-        device: builder.build(),
-        stream: CdcAcmStream {
-            tx,
-            rx: rx.into_buffered(RX_BUF.init([0; MAX_PACKET_SIZE as usize])),
-            last_packet_full: false,
+    // Two interfaces each, which is exactly `embassy-usb`'s default
+    // `MAX_INTERFACE_COUNT` of 4. A third function needs the
+    // `max-interface-count-6` feature; the builder panics rather than
+    // truncating, so this fails loudly if it is ever forgotten.
+    let link = UsbNcmLink::new(&mut builder, node_mac, spawner)?;
+
+    Ok((
+        UsbMgmt {
+            device: builder.build(),
+            stream: CdcAcmStream {
+                tx,
+                rx: rx.into_buffered(RX_BUF.init([0; MAX_PACKET_SIZE as usize])),
+                last_packet_full: false,
+            },
         },
-    })
+        link,
+    ))
 }
 
 impl UsbMgmt {

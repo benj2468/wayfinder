@@ -11,7 +11,4 @@ target = "thumbv7em-none-eabihf"
 # linker is ever dropped.
 linker = "flip-link"
 rustflags = ["-C", "link-arg=-Tlink.x"]
-# The dongle has no onboard debugger, so this only works with an SWD probe wired
-# to its castellated pads. The probe-less path is DFU over the Open Bootloader —
-# see `libs/wayfinder-nrf/CLAUDE.md`.
-runner = "probe-rs run --chip nRF52840_xxAA --allow-erase-all"
+runner = "./runner.sh"

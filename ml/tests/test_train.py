@@ -9,12 +9,11 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-
 from wayfinder_ml import schema
 
 torch = pytest.importorskip("torch")
 
-from wayfinder_ml.train import NextHopScorer, evaluate, train  # noqa: E402
+from wayfinder_ml.train import NextHopScorer, evaluate, train
 
 
 def _learnable_batch(rows: int = 512) -> schema.FeatureBatch:

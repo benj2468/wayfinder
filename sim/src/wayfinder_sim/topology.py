@@ -6,12 +6,13 @@ object carrying a `Channel` rather than a bare list of member names.
 
 from __future__ import annotations
 
-from typing import Callable, Sequence, Union
+import itertools
+from collections.abc import Callable, Sequence
 
 from .channel import Channel
 from .link import Link
 
-ChannelLike = Union[Channel, Callable[[str, str], Channel]]
+ChannelLike = Channel | Callable[[str, str], Channel]
 """Either one `Channel` instance shared by every edge a builder creates
 (safe — channels are stateless, evaluated with a caller-supplied RNG), or a
 `(a, b) -> Channel` factory called per edge so each gets its own tuning
@@ -44,7 +45,7 @@ def pair(
 def path(names: Sequence[str], channel: ChannelLike) -> list[Link]:
     """A line `names[0] — names[1] — … — names[-1]`, one p2p link per
     adjacency."""
-    return [pair(a, b, channel) for a, b in zip(names, names[1:])]
+    return [pair(a, b, channel) for a, b in itertools.pairwise(names)]
 
 
 def complete_graph(names: Sequence[str], channel: ChannelLike) -> list[Link]:
