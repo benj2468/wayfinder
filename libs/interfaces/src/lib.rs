@@ -19,6 +19,10 @@ pub mod frame;
 /// Per-frame link measurements ([`LinkMetrics`](link::LinkMetrics)) and the
 /// link-layer error type ([`LinkError`](link::LinkError)).
 pub mod link;
+/// Ethernet-shaped framing shared by every carrier whose medium is real
+/// Ethernet ([`frame_into_buf`](wire::frame_into_buf),
+/// [`retag_ethertype`](wire::retag_ethertype)).
+pub mod wire;
 
 /// Declare a capacity profile: the fixed table sizes one node's routing core
 /// is built with, as a module of named constants.

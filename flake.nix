@@ -4,13 +4,22 @@
 
     flake-parts.url = "github:hercules-ci/flake-parts";
 
-    treefmt-nix.url = "github:numtide/treefmt-nix";
+    treefmt-nix = {
+      url = "github:numtide/treefmt-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
 
-    fenix.url = "github:nix-community/fenix";
+    fenix = {
+      url = "github:nix-community/fenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
 
     crane.url = "github:ipetkov/crane";
 
-    git-hooks.url = "github:cachix/git-hooks.nix";
+    git-hooks = {
+      url = "github:cachix/git-hooks.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -21,6 +30,8 @@
       ...
     }:
     let
+      localOverlay = import ./overlay/wayfinder.nix;
+
       overlay = final: prev: {
         inherit (prev.callPackage ./nix { src = prev.lib.cleanSource ./.; })
           wayfinder-tap
@@ -39,7 +50,6 @@
       ];
 
       flake = {
-
         overlays.default = overlay;
 
         nixosModules.default = ./nix/modules/wayfinder.nix;
@@ -100,11 +110,53 @@
             ];
           };
 
+          # nrfutil's package-generation extension (nrfutil-nrf5sdk-tools —
+          # needed to build a DFU package for the nRF52840 dongle's probe-less
+          # flashing flow, see `libs/wayfinder-nrf/CLAUDE.md`) isn't published
+          # by Nordic for aarch64-linux, only x86_64-linux and darwin. Rather
+          # than skip it on an aarch64 host, run the real x86_64 build under
+          # qemu-user emulation — the same trick already used for x86_64-only
+          # Android NDK/SDK binaries on this project's aarch64 devShell.
+          pkgsX86 = import nixpkgs {
+            system = "x86_64-linux";
+            config = {
+              allowUnfree = true;
+              segger-jlink.acceptLicense = true;
+              permittedInsecurePackages = [
+                "segger-jlink-qt4-952"
+              ];
+            };
+          };
+          nrfutilX86 = pkgsX86.nrfutil.withExtensions [
+            "nrfutil-device"
+            "nrfutil-nrf5sdk-tools"
+          ];
+          # `nrfutil nrf5sdk-tools` under qemu-user: the wrapper script sets up
+          # PATH/env vars a bare `qemu-x86_64 <the .nrfutil-wrapped ELF>` would
+          # miss (it looks for a bundled legacy Python executable via PATH),
+          # so run it as `bash <wrapper script>` under emulation instead of
+          # the underlying binary directly.
+          nrfutilNrf5sdkTools = pkgs.writeShellApplication {
+            name = "nrfutil-nrf5sdk-tools";
+            runtimeInputs = [ pkgs.qemu ];
+            text = ''
+              exec qemu-x86_64 "${pkgsX86.bash}/bin/bash" "${nrfutilX86}/bin/nrfutil" nrf5sdk-tools "$@"
+            '';
+          };
+
         in
         {
           _module.args.pkgs = import inputs.nixpkgs {
             inherit system;
+            config = {
+              allowUnfree = true;
+              segger-jlink.acceptLicense = true;
+              permittedInsecurePackages = [
+                "segger-jlink-qt4-952"
+              ];
+            };
             overlays = [
+              localOverlay
               fenix.overlays.default
             ];
           };
@@ -120,6 +172,7 @@
               cargo-machete
               cargo-llvm-cov
               cargo-fuzz
+              cargo-binutils
               rust-analyzer
               # Build driver for `bins/wayfinder-web`: compiles the axum server
               # and the wasm hydration bundle together and serves them
@@ -145,15 +198,16 @@
               glab
               stdenv.cc.cc.lib
               probe-rs-tools
-              # Linker for the embedded binaries: places the stack below the
-              # statics so a stack overflow faults on a guard rather than
-              # silently corrupting `.bss`/`.uninit`. Selected in
-              # `bins/wayfinder-nrf52840/.cargo/config.toml`, which fails to
-              # link without it on the PATH.
               flip-link
+              nrfutil.withAllExtensions
+              nrf5-sdk
+              nrf-command-line-tools
+              nrfutilNrf5sdkTools
             ];
 
-            buildInputs = with pkgs; [ dbus ];
+            buildInputs = with pkgs; [
+              dbus
+            ];
 
             nativeBuildInputs = with pkgs; [
               protobuf

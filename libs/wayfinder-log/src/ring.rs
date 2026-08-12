@@ -40,6 +40,50 @@ pub const RING_CAPACITY: usize = 512;
 /// Records returned when a caller does not specify a batch size.
 const DEFAULT_BATCH: usize = RING_CAPACITY;
 
+/// Bytes charged against [`BATCH_BYTE_BUDGET`] for a record's fixed parts, on
+/// top of its target and message.
+///
+/// Covers what the protobuf projection adds around the two strings: the `seq`
+/// and `uptime_ms` varints (10 bytes each at worst), the level enum, and the
+/// field tags and length prefixes of both the record and its enclosing repeated
+/// field. 40 rounds the ~33 that accounts for up, since the point is a bound
+/// rather than a prediction.
+const RECORD_OVERHEAD: usize = 40;
+
+/// Roughly how many serialized bytes one batch may total.
+///
+/// Split by target for the same reason [`RING_CAPACITY`] is, and it is the
+/// bare-metal figure that carries the reasoning. An embedded node answers over
+/// `wayfinder_server`'s 4 KiB framing with a 32 KiB heap, and the response is
+/// encoded into a `Vec` that grows by doubling — so a batch approaching the
+/// frame limit needs several times its own size live at once, alongside the
+/// request buffer and this batch's own `String`s. Exceeding the heap is a
+/// `handle_alloc_error` panic, which on a board is a reset; and it happens
+/// during the encode, before the framing layer gets to refuse the result. 2 KiB
+/// leaves that peak comfortable.
+///
+/// A byte budget rather than a record count because the spread is wide: a
+/// typical record is well under 100 bytes, while one at [`TARGET_CAP`] +
+/// [`MESSAGE_CAP`] is nearly 264. A count safe for the worst case would waste
+/// most of a batch in the common one.
+///
+/// Truncating costs a caller nothing — [`LogSnapshot::next_seq`] resumes it
+/// exactly where the batch stopped.
+#[cfg(target_os = "none")]
+pub const BATCH_BYTE_BUDGET: usize = 2 * 1024;
+/// Roughly how many serialized bytes one batch may total. See the bare-metal
+/// definition — a host has neither the framing cap nor the heap pressure that
+/// motivates it, so this is set where it never binds in practice (the whole ring
+/// at maximum record size is ~135 KiB) and exists only so both targets run the
+/// same path.
+#[cfg(not(target_os = "none"))]
+pub const BATCH_BYTE_BUDGET: usize = 256 * 1024;
+
+/// What one record is charged against [`BATCH_BYTE_BUDGET`].
+fn record_size(record: &LogRecord) -> usize {
+    record.target.len() + record.message.len() + RECORD_OVERHEAD
+}
+
 /// One retained log record.
 #[derive(Clone, Debug)]
 pub struct LogRecord {
@@ -122,8 +166,16 @@ impl Ring {
         self.next_seq = self.next_seq.wrapping_add(1);
     }
 
-    /// Records from `since_seq` onward, at most `max_records` of them.
+    /// Records from `since_seq` onward, at most `max_records` of them, within
+    /// [`BATCH_BYTE_BUDGET`].
     fn since(&self, since_seq: u64, max_records: usize) -> LogSnapshot {
+        self.since_within(since_seq, max_records, BATCH_BYTE_BUDGET)
+    }
+
+    /// Records from `since_seq` onward, bounded by both `max_records` and
+    /// `byte_budget`. Split out from [`since`](Self::since) so a test can pin a
+    /// budget rather than depending on which target it is compiled for.
+    fn since_within(&self, since_seq: u64, max_records: usize, byte_budget: usize) -> LogSnapshot {
         let max_records = if max_records == 0 {
             DEFAULT_BATCH
         } else {
@@ -131,13 +183,24 @@ impl Ring {
         };
         let oldest = self.buf.front().map_or(self.next_seq, |r| r.seq);
 
-        let records: Vec<LogRecord> = self
+        let mut records: Vec<LogRecord> = Vec::new();
+        let mut used = 0usize;
+        for record in self
             .buf
             .iter()
             .filter(|r| r.seq >= since_seq)
             .take(max_records)
-            .cloned()
-            .collect();
+        {
+            let size = record_size(record);
+            // The first record goes out whatever it costs. An empty batch would
+            // leave `next_seq` where it was, so the caller would ask for the same
+            // record forever and the stream would wedge at it.
+            if !records.is_empty() && used.saturating_add(size) > byte_budget {
+                break;
+            }
+            used = used.saturating_add(size);
+            records.push(record.clone());
+        }
 
         LogSnapshot {
             // One past the last record handed over, or — when nothing matched —
@@ -272,6 +335,91 @@ mod tests {
         assert!(snap.records.is_empty());
         assert_eq!(snap.next_seq, 4);
         assert_eq!(snap.dropped, 0);
+    }
+
+    /// Push `n` records whose messages are `len` bytes long, for exercising the
+    /// byte budget with a predictable per-record cost.
+    fn fill_sized(ring: &mut Ring, n: usize, len: usize) {
+        for i in 0..n {
+            ring.push(Level::Info, "t", &"x".repeat(len), i as u64);
+        }
+    }
+
+    /// A batch stops once it has spent its byte budget, even though the caller
+    /// asked for more records and the ring has them.
+    ///
+    /// This is what keeps an embedded node alive: the response is encoded into a
+    /// `Vec` that doubles as it grows, so a batch merely approaching the frame
+    /// limit needs several times its own size in live heap and aborts the
+    /// allocation before the framing layer can refuse it.
+    #[test]
+    fn a_batch_stops_at_the_byte_budget() {
+        let mut ring = Ring::new();
+        fill_sized(&mut ring, 8, 100);
+
+        // "t" + 100 + RECORD_OVERHEAD = 141 a record, so two fit in 300.
+        let snap = ring.since_within(0, 8, 300);
+        assert_eq!(
+            snap.records.len(),
+            2,
+            "budget bounds the batch, not the ask"
+        );
+        assert_eq!(snap.records[0].seq, 0);
+        assert_eq!(snap.records[1].seq, 1);
+    }
+
+    /// Truncating for budget is lossless: `next_seq` points at the first record
+    /// left behind, so the caller's next poll resumes exactly there.
+    #[test]
+    fn a_budgeted_batch_resumes_where_it_stopped() {
+        let mut ring = Ring::new();
+        fill_sized(&mut ring, 8, 100);
+
+        let first = ring.since_within(0, 8, 300);
+        assert_eq!(first.next_seq, 2, "one past the last record handed over");
+
+        let second = ring.since_within(first.next_seq, 8, 300);
+        assert_eq!(second.records[0].seq, 2, "no record is skipped");
+        assert_eq!(second.dropped, 0, "and none is reported lost");
+    }
+
+    /// A record too big for the whole budget still goes out on its own, rather
+    /// than being skipped forever.
+    ///
+    /// An empty batch would not advance `next_seq`, so the caller would ask for
+    /// the same record on every poll and the stream would wedge at it — worse
+    /// than the oversized response the budget exists to prevent.
+    #[test]
+    fn a_record_over_the_whole_budget_is_still_delivered() {
+        let mut ring = Ring::new();
+        fill_sized(&mut ring, 2, 100);
+
+        let snap = ring.since_within(0, 8, 1);
+        assert_eq!(snap.records.len(), 1, "the stream must advance");
+        assert_eq!(snap.next_seq, 1);
+    }
+
+    /// `max_records` of 0 means "the default batch", and that default is subject
+    /// to the budget like any other — a caller that names no batch size must not
+    /// be the one that gets the unbounded response.
+    #[test]
+    fn a_defaulted_batch_is_still_bounded_by_the_budget() {
+        let mut ring = Ring::new();
+        fill_sized(&mut ring, 8, 100);
+
+        let snap = ring.since_within(0, 0, 300);
+        assert_eq!(snap.records.len(), 2);
+    }
+
+    /// A budget with room to spare changes nothing: the record count still
+    /// bounds the batch.
+    #[test]
+    fn a_budget_with_room_to_spare_does_not_truncate() {
+        let mut ring = Ring::new();
+        fill_sized(&mut ring, 8, 100);
+
+        let snap = ring.since_within(0, 5, 100_000);
+        assert_eq!(snap.records.len(), 5);
     }
 
     /// A `since_seq` past the end (a client talking to a node that restarted and

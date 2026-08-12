@@ -27,7 +27,7 @@ use wayfinder::link::LinkT;
 use wayfinder::link::Received;
 use zerocopy::FromBytes;
 
-use crate::wire::frame_into_buf;
+use interfaces::wire::frame_into_buf;
 
 /// A message-oriented async byte pipe: read/write whole frames, one per call.
 ///

@@ -14,7 +14,6 @@ from pathlib import Path
 
 import pytest
 from fakesim import SCENARIO_MODULE
-
 from wayfinder_ml import cli, shards
 
 ROWS_PER_INSTANT = 2
@@ -251,7 +250,7 @@ def test_inspect_breaks_the_total_down_per_shard(dataset, capsys) -> None:
 
 
 def test_inspect_accepts_a_single_shard(dataset, capsys) -> None:
-    shard = sorted(dataset.glob("*.npz"))[0]
+    shard = min(dataset.glob("*.npz"))
 
     assert cli.main(["inspect", str(shard)]) == 0
     assert "rows" in capsys.readouterr().out

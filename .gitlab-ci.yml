@@ -220,7 +220,7 @@ deploy:
     - docker
   needs:
     - test:run
-  # Build the tap and tui images and push them to the registry, as
+  # Build one image per runnable binary and push them to the registry, as
   # multi-platform (linux/amd64 + linux/arm64) images. A tagged commit is a
   # release: the images are tagged with the git tag itself (e.g.
   # wayfinder-tap:v1.2.3). Any other commit is a dev build, tagged
@@ -249,8 +249,8 @@ deploy:
       else
         IMAGE_TAG="dev-$CI_COMMIT_SHORT_SHA"
       fi
-      echo "Building wayfinder-tap and wayfinder-tui and wayfinder-ctl images (linux/amd64, linux/arm64) tagged '$IMAGE_TAG'"
-      for app in tap tui ctl; do
+      echo "Building wayfinder-tap, wayfinder-tui, wayfinder-ctl and wayfinder-web images (linux/amd64, linux/arm64) tagged '$IMAGE_TAG'"
+      for app in tap tui ctl web; do
         image="$CI_REGISTRY_IMAGE/wayfinder-$app:$IMAGE_TAG"
         docker buildx build \
           --builder wayfinder-builder \

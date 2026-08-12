@@ -1,7 +1,6 @@
 from random import Random
 
 import pytest
-
 from wayfinder_sim.channel import FreeSpacePathLoss, PerfectWire
 from wayfinder_sim.mobility import Vec3
 

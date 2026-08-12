@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-
 from wayfinder_ml import stats
 from wayfinder_ml.schema import (
     CANDIDATE_FEATURES,

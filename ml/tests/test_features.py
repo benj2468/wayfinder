@@ -13,7 +13,6 @@ from __future__ import annotations
 import math
 
 import numpy as np
-
 from wayfinder_ml import features, schema
 from wayfinder_ml.features import (
     LinkObservation,

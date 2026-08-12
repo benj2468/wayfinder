@@ -15,7 +15,6 @@
 mod raw;
 mod snoop;
 mod transport;
-mod wire;
 
 pub use snoop::McastSnooper;
 pub use transport::FrameIo;

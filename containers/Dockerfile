@@ -1,12 +1,16 @@
 # syntax=docker/dockerfile:1
 #
-# Production images for the two runnable Wayfinder binaries, built as
+# Production images for the runnable Wayfinder binaries, built as
 # multi-platform (linux/amd64 + linux/arm64) images.
 #
 # A single shared `builder` stage compiles the ENTIRE workspace in release mode
-# once per target arch; the two final stages each copy out just the one binary
-# they ship onto a distroless base, so the runtime images stay slim (no Rust
-# toolchain, no apt, no shell).
+# once per target arch; each final stage copies out just the one binary it ships
+# onto a distroless base, so the runtime images stay slim (no Rust toolchain, no
+# apt, no shell).
+#
+# `web` is the exception with two build inputs: its server binary comes from
+# `builder` like the rest, but the browser half (wasm + JS glue + CSS) is
+# arch-independent and comes from the separate `site` stage below.
 #
 # The builder stage is pinned to `--platform=$BUILDPLATFORM`, so it always runs
 # natively on the build host (the GitLab runners are amd64) no matter which
@@ -22,13 +26,14 @@
 #
 #   docker buildx build -f containers/Dockerfile --target tap -t wayfinder-tap --load .
 #   docker buildx build -f containers/Dockerfile --target tui -t wayfinder-tui --load .
+#   docker buildx build -f containers/Dockerfile --target web -t wayfinder-web --load .
 #
 # Build & push a multi-platform image (what CI does):
 #
 #   docker buildx build -f containers/Dockerfile --target tap \
 #       --platform linux/amd64,linux/arm64 -t wayfinder-tap --push .
 #
-# (Building with no --target stops at `tui`, the last stage.)
+# (Building with no --target stops at `web`, the last stage.)
 
 # ---------------------------------------------------------------------------
 # Shared build stage: cross-compile the whole workspace for TARGETARCH.
@@ -90,6 +95,20 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     PKG_CONFIG_ALLOW_CROSS=1 \
     PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig
 
+# Compile-time, not runtime, and not a duplicate of the `web` stage's ENV of the
+# same name: `leptos` reads this through `std::option_env!`, so its value is
+# baked into the binary when the *leptos crate itself* is compiled. Left unset,
+# leptos assumes the plain `wasm-bindgen` layout and asks the browser for
+# `<name>_bg.wasm`, while cargo-leptos emits `<name>.wasm` — the page renders,
+# the wasm 404s, and the dashboard silently never hydrates. `cargo leptos` sets
+# it for its own builds; nothing else does, so the cross-compile below has to.
+#
+# It is set stage-wide rather than on the wayfinder-web build alone so `leptos`
+# is only ever compiled once, with the value in place: a per-command override
+# would leave the `--workspace` build below compiling it *without* the var, and
+# whether cargo then rebuilds it hinges on dep-info env tracking.
+ENV LEPTOS_OUTPUT_NAME=wayfinder-web
+
 WORKDIR /app
 
 # Copy the pieces cargo needs to resolve and build the workspace. Listing them
@@ -99,8 +118,8 @@ COPY Cargo.lock Cargo.toml ./
 COPY libs ./libs
 COPY bins ./bins
 
-# Build the entire workspace once per target arch. Both binaries (and
-# everything they depend on) come out of this single compile. `--workspace` is
+# Build the entire workspace once per target arch. Every binary (and
+# everything they depend on) comes out of this single compile. `--workspace` is
 # required because the repo root is itself a package; a plain `cargo build`
 # from here would build only the root crate, not the workspace members.
 #
@@ -113,6 +132,69 @@ RUN cargo build --release --workspace --target "$(cat /rust_target)" \
         target/"$(cat /rust_target)"/release/wayfinder-tui \
         target/"$(cat /rust_target)"/release/wayfinder-ctl \
         /out/
+
+# bins/wayfinder-web needs its own invocation: its `default` feature set is
+# deliberately empty (so a bare `--workspace` build doesn't fail on the
+# dependencies the axum server hangs off), which means the workspace build above
+# produced a stub `main` that only panics. `--features ssr` is what compiles the
+# real server. The browser half it serves is built in the `site` stage below.
+RUN cargo build --release -p wayfinder-web --features ssr \
+    --target "$(cat /rust_target)" \
+    && cp target/"$(cat /rust_target)"/release/wayfinder-web /out/
+
+# ---------------------------------------------------------------------------
+# Site stage: build the browser half of the dashboard.
+# ---------------------------------------------------------------------------
+#
+# `cargo-leptos` compiles bins/wayfinder-web a second time, to
+# wasm32-unknown-unknown with `--features hydrate`, then runs wasm-bindgen and
+# wasm-opt over the result and minifies the stylesheet — emitting the
+# `target/site` bundle the server binary serves as static files.
+#
+# WebAssembly is a single architecture, so unlike `builder` this stage carries no
+# TARGETARCH: it runs natively on the build host and its output is byte-identical
+# for every image platform. `--frontend-only` skips the server half, which
+# `builder` already cross-compiled for the real target.
+FROM --platform=$BUILDPLATFORM rust:1.96-slim-bookworm AS site
+
+# protoc for wayfinder-protos' build.rs — the browser deserializes the same
+# proto types the server encodes, so the wasm build generates them too. curl is
+# only here to fetch cargo-binstall.
+#
+# No cross toolchain and no libdbus: the hydrate feature graph reaches neither a
+# foreign target nor libs/blue.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        protobuf-compiler \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+ENV PROTOC=/usr/bin/protoc
+
+RUN rustup target add wasm32-unknown-unknown
+
+# cargo-binstall pulls prebuilt binaries instead of compiling cargo-leptos from
+# source, the same trick containers/testenv.Dockerfile uses.
+#
+# wasm-bindgen-cli is deliberately NOT installed alongside it: cargo-leptos
+# reads the `wasm-bindgen` version out of Cargo.lock and fetches exactly that
+# CLI (it refuses to run on a mismatch), so leaving it to do so keeps this file
+# out of the version-pin triple that bins/wayfinder-web/CLAUDE.md tracks. It
+# fetches its own wasm-opt from Binaryen the same way.
+RUN curl -L --proto '=https' --tlsv1.2 -sSf \
+    https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
+    | bash \
+    && cargo binstall -y cargo-leptos
+
+WORKDIR /app
+
+# `[[workspace.metadata.leptos]]` lives in the ROOT Cargo.toml, and its
+# style-file path points into bins/, so cargo-leptos needs the same context the
+# builder stage does.
+COPY Cargo.lock Cargo.toml ./
+COPY libs ./libs
+COPY bins ./bins
+
+RUN cargo leptos build --release --frontend-only
 
 # ---------------------------------------------------------------------------
 # wayfinder-tap: bridges a TAP device onto the mesh.
@@ -150,3 +232,49 @@ FROM gcr.io/distroless/cc-debian12 AS ctl
 COPY --from=builder /out/wayfinder-ctl /usr/local/bin/wayfinder-ctl
 
 ENTRYPOINT ["/usr/local/bin/wayfinder-ctl"]
+
+# ---------------------------------------------------------------------------
+# wayfinder-web: management-API dashboard in a browser.
+# ---------------------------------------------------------------------------
+#
+# The one image assembled from two build stages: the cross-compiled axum server
+# from `builder`, and the arch-independent wasm/JS/CSS bundle from `site`.
+#
+#   docker run --rm -p 8080:8080 \
+#       -v /var/lib/wayfinder:/var/lib/wayfinder:ro \
+#       <image> --addr <node-host>:7700
+#
+# The server holds the mesh identity and is the only party that speaks the
+# management API, so it needs an identity seed (and usually a membership cert)
+# mounted in — it defaults to /var/lib/wayfinder/identity.seed. Reaching an
+# embedded node over its USB management port instead takes `--serial /dev/ttyACM0`
+# and a `--device` flag on `docker run` to pass that port through.
+FROM gcr.io/distroless/cc-debian12 AS web
+
+COPY --from=builder /out/wayfinder-web /usr/local/bin/wayfinder-web
+COPY --from=site /app/target/site /usr/local/share/wayfinder-web/site
+
+# Outside `cargo leptos`, the binary learns where its own assets are only from
+# the environment (`get_configuration(None)` reads these and nothing else), so
+# the image has to restate what cargo-leptos would otherwise have exported.
+# LEPTOS_SITE_ROOT must match the COPY above; LEPTOS_OUTPUT_NAME and
+# LEPTOS_SITE_PKG_DIR must match `[[workspace.metadata.leptos]]` in the root
+# Cargo.toml, since they name the files inside the bundle.
+#
+# LEPTOS_OUTPUT_NAME is needed at *build* time as well, for a different reason —
+# see the builder stage.
+ENV LEPTOS_OUTPUT_NAME=wayfinder-web \
+    LEPTOS_SITE_ROOT=/usr/local/share/wayfinder-web/site \
+    LEPTOS_SITE_PKG_DIR=pkg \
+    LEPTOS_ENV=PROD
+
+# The binary defaults to loopback on purpose — it has no authentication of its
+# own, so whoever reaches the port has the access its node identity carries.
+# In a container, loopback is the container's own namespace and no published
+# port could ever reach it, so the image overrides the default; the process
+# still logs a warning on every non-loopback bind. Publishing that port to
+# anything wider than the host is a reverse proxy's job.
+ENV WAYFINDER_WEB_LISTEN=0.0.0.0:8080
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/wayfinder-web"]

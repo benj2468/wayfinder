@@ -11,6 +11,8 @@ use wayfinder::link::Received;
 
 pub use blue::NrfBleLink;
 
+pub use crate::usb_link::UsbNcmLink;
+
 /// Dispatches [`LinkT`] across this board's mesh interfaces.
 /// `wayfinder_embedded_driver::Driver` takes a fixed `[L; N]` of one concrete
 /// link type; this is the "board-defined `enum` dispatching across mixed media"
@@ -21,6 +23,10 @@ pub enum MeshLink<S> {
     Rylr(RylrClient<S>),
     /// Connectionless BLE advertising broadcast over the chip's built-in radio.
     Ble(NrfBleLink),
+    /// The USB host, reached as Ethernet over a CDC-NCM function. Point-to-point
+    /// and wired, so unlike the two radios it is neither lossy nor rate-limited
+    /// — see [`crate::usb_link`].
+    Usb(UsbNcmLink),
     /// No RYLR998 module was detected at boot on this slot's UART. An absent
     /// external module is an expected shape (a BLE-only deployment), not a
     /// fault, so this keeps the link array's size fixed at compile time while
@@ -42,6 +48,7 @@ where
         match self {
             MeshLink::Rylr(link) => link.send(origin, data).await,
             MeshLink::Ble(link) => link.send(origin, data).await,
+            MeshLink::Usb(link) => link.send(origin, data).await,
             MeshLink::Absent => Err(LinkError::NotPresent),
         }
     }
@@ -50,6 +57,7 @@ where
         match self {
             MeshLink::Rylr(link) => link.recv().await,
             MeshLink::Ble(link) => link.recv().await,
+            MeshLink::Usb(link) => link.recv().await,
             MeshLink::Absent => core::future::pending().await,
         }
     }

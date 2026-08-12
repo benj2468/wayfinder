@@ -22,7 +22,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use tracing::trace;
-use tracing::warn;
 use wayfinder::interfaces::link::LinkMetrics;
 
 /// Bytes of fragment header prefixed to each on-air fragment's frame-content
@@ -249,7 +248,7 @@ where
             }
             None => {
                 if self.entries.is_full() {
-                    warn!(
+                    trace!(
                         evicted_key = ?self.entries[0].key,
                         ?key,
                         "capacity eviction: dropping incomplete fragment reassembly"

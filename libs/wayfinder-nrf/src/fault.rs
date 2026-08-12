@@ -3,19 +3,27 @@
 //!
 //! See this crate's `CLAUDE.md` for why rebooting is the right default and
 //! halting after [`MAX_CONSECUTIVE_FAULTS`] the right backstop. Both handlers
-//! share one budget in [`FAULT_GUARD`]; a HardFault, which never reaches
-//! `#[panic_handler]` at all, additionally leaves its diagnostic registers in
-//! [`FAULT_RECORD`] for the next boot to log.
+//! share one budget in [`FAULT_GUARD`], and both leave behind what killed the
+//! board: a HardFault its diagnostic registers ([`FAULT_RECORD`]), a panic its
+//! rendered text ([`PANIC_MSG`]). [`report_retained`] logs either on the next
+//! boot.
 //!
-//! Both statics live in `.uninit`, which is the mechanism rather than a detail:
-//! `cortex-m-rt` re-initialises `.bss`/`.data` on the very reset whose cause
-//! they carry, so a counter kept anywhere else would never exceed 1. `.uninit`
-//! escapes that zeroing and nRF52 RAM survives `SYSRESETREQ`, at the cost of
-//! holding garbage after a power-on — hence the magic words. Both are
-//! `AtomicU32`, never structs, which LLVM splits into per-field globals that
-//! land back in `.bss`; and both are only as trustworthy as `flip-link` keeping
-//! the descending stack out of `.uninit`.
+//! Retaining the panic text is what makes a probe-less board debuggable at all.
+//! The handler's `rprintln!` reaches an RTT channel that only an attached debug
+//! probe can read, and a dongle has no probe — so before this, a panic reset the
+//! node leaving *no* evidence anywhere, indistinguishable from a power glitch or
+//! a host-side USB teardown.
+//!
+//! Every static here lives in `.uninit`, which is the mechanism rather than a
+//! detail: `cortex-m-rt` re-initialises `.bss`/`.data` on the very reset whose
+//! cause they carry, so a counter kept anywhere else would never exceed 1.
+//! `.uninit` escapes that zeroing and nRF52 RAM survives `SYSRESETREQ`, at the
+//! cost of holding garbage after a power-on — hence the magic words. Each is an
+//! atomic or an array of one atomic type, never a struct, which LLVM splits into
+//! per-field globals that land back in `.bss`; and all of them are only as
+//! trustworthy as `flip-link` keeping the descending stack out of `.uninit`.
 
+use core::sync::atomic::AtomicU8;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 use core::sync::atomic::Ordering::Relaxed;
@@ -31,7 +39,15 @@ pub const MAX_CONSECUTIVE_FAULTS: u32 = 3;
 /// Roughly how long a handler holds the CPU before resetting, so an attached
 /// probe can drain the message out of the RTT buffer (which does not survive the
 /// reset). Cycles rather than a `Timer`: the executor is gone by now.
-const DRAIN_CYCLES: u32 = 2 * 64_000_000;
+///
+/// 200 ms at 64 MHz, comfortably above `probe-rs`'s RTT poll interval and no
+/// more. It was two seconds back when RTT was the only record a panic left;
+/// now that both handlers retain their evidence across the reset, this delay
+/// only buys an attached probe the untruncated text, and everything it costs is
+/// paid by boards that have no probe to drain. On a USB-powered node that cost
+/// is real: the CPU is not servicing USBD for the whole delay, which is time the
+/// host spends deciding the device has fallen off the bus.
+const DRAIN_CYCLES: u32 = 64_000_000 / 5;
 
 /// Consecutive-fault count, high 24 bits [`GUARD_MAGIC`], low 8 the count.
 #[unsafe(link_section = ".uninit.FAULT_GUARD")]
@@ -84,15 +100,98 @@ fn reset() -> ! {
     cortex_m::peripheral::SCB::sys_reset()
 }
 
-/// Prints the panic message over RTT, then reboots — or halts, once
-/// [`MAX_CONSECUTIVE_FAULTS`] reboots in a row have failed to clear the fault.
+/// Longest retained panic text, in bytes.
+///
+/// Sized against what can actually be read back rather than against the message
+/// a panic might produce: the record surfaces as one `error!`, and the log ring
+/// caps a record's rendered message *and* its fields at
+/// [`wayfinder_log::MESSAGE_CAP`] (160). The event's own text plus the
+/// `detail="…"` wrapper accounts for 40 of those, so bytes past 120 could never
+/// be read out. `Debug` escaping of a quote or backslash in the message clips a
+/// little more.
+const PANIC_MSG_LEN: usize = 120;
+
+/// Marks [`PANIC_HEADER`] as written by [`panic`] rather than being
+/// post-power-on garbage (`b"WAP"`), in the high 24 bits.
+const PANIC_MAGIC: u32 = 0x5741_5000;
+
+/// Selects the magic half of [`PANIC_HEADER`].
+const PANIC_MAGIC_MASK: u32 = 0xFFFF_FF00;
+
+/// Selects the length half of [`PANIC_HEADER`] — the byte count written to
+/// [`PANIC_MSG`], which [`PANIC_MSG_LEN`] keeps well inside a single byte.
+const PANIC_LEN_MASK: u32 = 0x0000_00FF;
+
+/// [`PANIC_MAGIC`] plus the retained message length. Written *after*
+/// [`PANIC_MSG`], so a reset landing mid-write leaves no record rather than
+/// half of one.
+#[unsafe(link_section = ".uninit.PANIC_HEADER")]
+static PANIC_HEADER: AtomicU32 = AtomicU32::new(0);
+
+/// A panic's rendered location and message, retained across the reset that
+/// follows so the next boot can report what killed the previous one. Valid only
+/// when [`PANIC_HEADER`] carries [`PANIC_MAGIC`], and only for the length it
+/// carries.
+///
+/// `[AtomicU8; N]` for the same reason [`FAULT_RECORD`] is `[AtomicU32; N]`: an
+/// array of one scalar type stays a single global that keeps its
+/// `#[link_section]`.
+#[unsafe(link_section = ".uninit.PANIC_MSG")]
+static PANIC_MSG: [AtomicU8; PANIC_MSG_LEN] = [const { AtomicU8::new(0) }; PANIC_MSG_LEN];
+
+/// A [`core::fmt::Write`] sink landing formatted text straight in [`PANIC_MSG`].
+///
+/// Straight into the static rather than via a stack buffer, because the handler
+/// runs on whatever stack the panicking task had left. Overflow truncates
+/// silently instead of erroring: a failed `write_str` aborts the whole format
+/// run, which would cost the location prefix too — the most useful part.
+struct PanicSink {
+    /// Bytes written so far, and the index of the next slot.
+    len: usize,
+}
+
+impl core::fmt::Write for PanicSink {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &byte in s.as_bytes() {
+            let Some(slot) = PANIC_MSG.get(self.len) else {
+                return Ok(());
+            };
+            // `PanicInfo` puts a newline between the location and the message,
+            // and the ring stores one record as one line.
+            slot.store(if byte < 0x20 { b' ' } else { byte }, Relaxed);
+            self.len += 1;
+        }
+        Ok(())
+    }
+}
+
+/// Capture `info` into [`PANIC_MSG`] for the next boot to report.
+fn record_panic(info: &core::panic::PanicInfo) {
+    // Invalidate first, so the record is never readable in a partial state.
+    PANIC_HEADER.store(0, Relaxed);
+
+    let mut sink = PanicSink { len: 0 };
+    // `PanicInfo`'s own `Display` is location *and* message — the same text the
+    // RTT line below prints. Discarding the result is safe: the sink truncates
+    // rather than failing.
+    let _ = core::fmt::write(&mut sink, format_args!("{info}"));
+
+    PANIC_HEADER.store(PANIC_MAGIC | sink.len as u32, Relaxed);
+}
+
+/// Records the panic for the next boot and prints it over RTT, then reboots —
+/// or halts, once [`MAX_CONSECUTIVE_FAULTS`] reboots in a row have failed to
+/// clear the fault.
 ///
 /// Writes to the print channel `wayfinder_log::init()` already set up, rather
 /// than opening a second RTT channel — hence the `rtt-target` version pin in
-/// `Cargo.toml`. A panic before that `init()` is silently dropped.
+/// `Cargo.toml`. That channel needs an attached probe to be read at all, which
+/// is why the retained record exists: it is the only path on a board without
+/// one, and it works for a panic that happened before `init()` too.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     let count = bump_fault_count();
+    record_panic(info);
 
     // `rprintln!` runs its format string through `concat!`, so implicitly
     // captured identifiers are not available — every value is positional.
@@ -246,13 +345,50 @@ unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
     reset()
 }
 
-/// Report a HardFault retained from the previous boot, if there was one, and
-/// clear it so a single historical crash does not look like an ongoing one.
+/// Report whatever ended the previous boot — a panic, a HardFault, or neither —
+/// and clear it, so a single historical crash does not look like an ongoing one.
 ///
-/// **Call after `wayfinder_log::init()`**, so the record reaches the log ring
+/// **Call after `wayfinder_log::init()`**, so the records reach the log ring
 /// `GetLogs` serves rather than only an RTT channel nobody is attached to —
-/// reaching a detached node is the point of retaining it at all.
+/// reaching a detached node is the point of retaining them at all.
+///
+/// At most one of the two is normally set, since either handler resets the board
+/// as soon as it has written its own.
 pub fn report_retained() {
+    report_retained_panic();
+    report_retained_hardfault();
+}
+
+/// Report a panic retained from the previous boot, if there was one.
+fn report_retained_panic() {
+    let header = PANIC_HEADER.load(Relaxed);
+    if header & PANIC_MAGIC_MASK != PANIC_MAGIC {
+        return;
+    }
+    let len = (header & PANIC_LEN_MASK) as usize;
+
+    let mut buf = [0u8; PANIC_MSG_LEN];
+    for (dst, src) in buf.iter_mut().zip(PANIC_MSG.iter()).take(len) {
+        *dst = src.load(Relaxed);
+    }
+    // Falls back to the whole buffer rather than indexing past it: the magic
+    // makes a corrupt length unlikely, not impossible.
+    let bytes = buf.get(..len).unwrap_or(&buf);
+
+    let detail = match core::str::from_utf8(bytes) {
+        Ok(text) => text,
+        // Truncating at PANIC_MSG_LEN can split a multi-byte character; keep
+        // everything before it rather than losing the whole message.
+        Err(e) => core::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or(""),
+    };
+
+    error!(detail, "previous boot ended in a panic");
+
+    PANIC_HEADER.store(0, Relaxed);
+}
+
+/// Report a HardFault retained from the previous boot, if there was one.
+fn report_retained_hardfault() {
     if FAULT_RECORD[IDX_MAGIC].load(Relaxed) != RECORD_MAGIC {
         return;
     }

@@ -15,7 +15,8 @@ import graph for pure-logic engine use (see `__init__.py`).
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Iterable, Mapping, cast
+from collections.abc import Iterable, Mapping
+from typing import Any, cast
 
 from matplotlib.axes import Axes
 from mpl_toolkits.mplot3d.axes3d import Axes3D

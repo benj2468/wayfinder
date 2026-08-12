@@ -20,7 +20,7 @@ use zerocopy::FromBytes;
 
 use crate::raw::interface_index;
 use crate::transport::Link;
-use crate::wire::frame_into_buf;
+use interfaces::wire::frame_into_buf;
 
 /// Learned mapping of neighbor MAC to UDP transport address for
 /// [`UdpMultiLink`], refreshed from the sender address of every received

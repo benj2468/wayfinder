@@ -9,7 +9,6 @@ without SimPy or the PyO3 extension.
 from __future__ import annotations
 
 import pytest
-
 from wayfinder_ml import scenarios
 
 _SCENARIO = """\

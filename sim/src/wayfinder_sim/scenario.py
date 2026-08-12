@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+from collections.abc import Callable, Sequence
 from random import Random
-from typing import Any, Callable, Sequence
+from typing import Any
 
 import simpy
 import wayfinder_py as wf
