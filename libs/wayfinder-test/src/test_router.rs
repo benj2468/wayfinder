@@ -120,7 +120,10 @@ impl TestRouter {
             // Links default to full participation; a test that needs a
             // partially participating link sets it afterward via
             // `router_mut().set_link_features(..)`.
-            driver: Driver::new(ident, &trickle, &[]),
+            // Interfaces are left unnamed: the harness addresses them by
+            // index, and a test that cares names one via
+            // `router_mut().set_interface_name(..)`.
+            driver: Driver::new(ident, &trickle, &[], &[]),
             ident,
             ports: interfaces,
             deliveries: Vec::new(),

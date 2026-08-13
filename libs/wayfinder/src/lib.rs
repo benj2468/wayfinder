@@ -183,6 +183,23 @@ pub enum LocalSendError {
 /// schedules an OGM for must be one this router also measures, and vice versa.
 pub const MAX_INTERFACES: usize = batman::MAX_INTERFACES;
 
+/// Maximum length, in bytes, of a mesh interface's human-readable name.
+///
+/// Names are display metadata only — nothing routes on them, and they never
+/// reach the wire — but they are stored inside the heap-free router so an
+/// embedded node can serve them over the management API just like a host can.
+/// The bound is what keeps that storage a fixed `MAX_INTERFACE_NAME_LEN ×
+/// INTERFACES` cost rather than an unbounded one; 16 bytes comfortably holds
+/// the `wlan0`/`lora-roof` style labels an operator writes, for 192 bytes of
+/// router at the default capacities (24 bytes stored per interface, including
+/// the length, across [`MAX_INTERFACES`]).
+pub const MAX_INTERFACE_NAME_LEN: usize = 16;
+
+/// A mesh interface's human-readable name, stored heap-free at a fixed
+/// [`MAX_INTERFACE_NAME_LEN`] capacity. Empty means "unnamed": a consumer then
+/// falls back to displaying the interface's index.
+pub type InterfaceName = heapless::String<MAX_INTERFACE_NAME_LEN>;
+
 /// Floor a configured keep-alive interval is clamped to
 /// ([`CentralRouter::configure_interface_keepalive`]) rather than left
 /// arbitrarily close to zero. Chosen well below any realistic operator-chosen
@@ -485,6 +502,12 @@ pub struct CentralRouter<
     ///
     /// [`LinkFeatures`]: crate::features::LinkFeatures
     link_features: [crate::features::LinkFeatures; INTERFACES],
+    /// Per-interface human-readable names, indexed by interface registration
+    /// order (`iface_idx`).  Empty means unnamed.  Purely display metadata for
+    /// the management API — no routing decision reads them and they never reach
+    /// the wire — but they live here rather than in a driver so an embedded node
+    /// with no host-side event loop reports the same labels a host node does.
+    iface_names: [InterfaceName; INTERFACES],
 }
 
 impl CentralRouter {
@@ -547,7 +570,46 @@ impl<
             cert_req_tx_rate: RateEstimator::default(),
             cert_reply_tx_rate: RateEstimator::default(),
             link_features: [crate::features::LinkFeatures::default(); INTERFACES],
+            // `InterfaceName` isn't `Copy`, so the array-repeat shorthand the
+            // other per-interface banks use doesn't apply here.
+            iface_names: core::array::from_fn(|_| InterfaceName::new()),
         }
+    }
+
+    /// Set interface `idx`'s human-readable name (from that link's `name:`
+    /// config, or a fallback derived from its transport), and register the
+    /// interface so it is reported from startup — the same registration
+    /// contract as [`set_link_features`](Self::set_link_features).
+    ///
+    /// An empty `name` clears the interface back to unnamed. A name longer than
+    /// [`MAX_INTERFACE_NAME_LEN`] is truncated at the last character boundary
+    /// that fits rather than rejected: the name is display metadata, and a
+    /// clipped label still identifies the interface where an anonymous one
+    /// would not. Out-of-range indices (`>= ``INTERFACES`) are ignored.
+    pub fn set_interface_name(&mut self, idx: usize, name: &str) {
+        if idx >= INTERFACES {
+            return;
+        }
+        // Clip on a character boundary: the name is handed back out as `&str`,
+        // so a byte-wise cut through a multi-byte codepoint is unrepresentable.
+        let mut end = name.len().min(MAX_INTERFACE_NAME_LEN);
+        while end > 0 && !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.iface_names[idx] = InterfaceName::try_from(&name[..end])
+            .unwrap_or_else(|_| unreachable!("clipped to the string's own capacity"));
+        self.touch_iface(idx);
+    }
+
+    /// Interface `idx`'s human-readable name, or `None` when it has never been
+    /// named (or `idx` is out of range) — letting a consumer distinguish an
+    /// unnamed interface from one deliberately named, and fall back to
+    /// displaying the index itself.
+    pub fn interface_name(&self, idx: usize) -> Option<&str> {
+        self.iface_names
+            .get(idx)
+            .map(InterfaceName::as_str)
+            .filter(|n| !n.is_empty())
     }
 
     /// Set the per-link participation [`features`](crate::features::LinkFeatures)
@@ -3898,6 +3960,87 @@ mod link_features_tests {
         // Out-of-range index also defaults to full, never panics.
         let f = r.link_features(MAX_INTERFACES + 5);
         assert!(f.tx_ogm && f.rx_data);
+    }
+
+    /// An interface nobody named reports no name, so a consumer can tell an
+    /// unnamed interface from one deliberately named — rather than being handed
+    /// a fabricated default it can't distinguish from a configured one.
+    #[test]
+    fn unnamed_interface_has_no_name() {
+        let r = CentralRouter::new(mac(1));
+        assert_eq!(r.interface_name(0), None);
+        // Out-of-range index also reports no name, never panics.
+        assert_eq!(r.interface_name(MAX_INTERFACES + 5), None);
+    }
+
+    /// `set_interface_name` stores the name and widens the interface count, so a
+    /// link named at wiring time is reported from startup — the same
+    /// registration contract as `set_link_features`.
+    #[test]
+    fn set_interface_name_stores_and_registers() {
+        let mut r = CentralRouter::new(mac(1));
+        assert_eq!(r.num_interfaces(), 0);
+        r.set_interface_name(2, "lora0");
+        assert_eq!(r.interface_name(2), Some("lora0"));
+        assert_eq!(
+            r.num_interfaces(),
+            3,
+            "iface_count widened to cover index 2"
+        );
+        // Naming is replacement, not accumulation: the last name wins.
+        r.set_interface_name(2, "lora-relay");
+        assert_eq!(r.interface_name(2), Some("lora-relay"));
+    }
+
+    /// An empty name clears the interface back to unnamed rather than storing a
+    /// blank label the UI would render as an empty cell.
+    #[test]
+    fn empty_interface_name_clears_it() {
+        let mut r = CentralRouter::new(mac(1));
+        r.set_interface_name(0, "wlan0");
+        r.set_interface_name(0, "");
+        assert_eq!(r.interface_name(0), None);
+    }
+
+    /// A name longer than the router's fixed-capacity store is truncated rather
+    /// than dropped: a label is display metadata, so a too-long one should still
+    /// identify the interface instead of leaving it anonymous.
+    #[test]
+    fn set_interface_name_truncates_overlong_name() {
+        let mut r = CentralRouter::new(mac(1));
+        let long = "a".repeat(MAX_INTERFACE_NAME_LEN + 7);
+        r.set_interface_name(0, &long);
+        assert_eq!(
+            r.interface_name(0),
+            Some(&long[..MAX_INTERFACE_NAME_LEN]),
+            "kept the leading MAX_INTERFACE_NAME_LEN bytes"
+        );
+    }
+
+    /// Truncation splits on a UTF-8 character boundary, never mid-codepoint — a
+    /// name is a `&str` all the way out to the management API, so a byte-wise
+    /// cut would be unrepresentable.
+    #[test]
+    fn set_interface_name_truncates_on_char_boundary() {
+        let mut r = CentralRouter::new(mac(1));
+        // 2-byte codepoints repeated past the cap: with an odd byte remaining,
+        // one codepoint lands astride the cut.
+        let wide = "é".repeat(MAX_INTERFACE_NAME_LEN);
+        r.set_interface_name(0, &wide);
+        let stored = r.interface_name(0).unwrap();
+        assert!(stored.len() <= MAX_INTERFACE_NAME_LEN);
+        assert!(wide.starts_with(stored), "a prefix of the requested name");
+        assert!(!stored.is_empty(), "kept as much as fits");
+    }
+
+    /// Naming an interface the router can't track is a no-op rather than a
+    /// panic, matching `set_link_features`' out-of-range behavior.
+    #[test]
+    fn set_interface_name_ignores_out_of_range_index() {
+        let mut r = CentralRouter::new(mac(1));
+        r.set_interface_name(MAX_INTERFACES, "nope");
+        assert_eq!(r.num_interfaces(), 0, "no interface registered");
+        assert_eq!(r.interface_name(MAX_INTERFACES), None);
     }
 
     /// `set_link_features` stores the features and widens the interface count so

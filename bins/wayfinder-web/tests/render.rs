@@ -71,12 +71,14 @@ fn seeded_snapshot() -> NodeSnapshot {
         tx_data: false,
         rx_data: true,
         tx_keepalive_interval_ms: Some(2000),
+        iface_name: "lora0".into(),
     });
     snap.link_quality.entries.push(LinkQualityEntry {
         neighbor_id: vec![0, 0, 0, 0, 0, 3],
         iface_idx: 0,
         ewma_quality: 200,
         sample_count: 9,
+        iface_name: "lora0".into(),
     });
     snap.keepalive.entries.push(KeepAliveEntry {
         neighbor_id: vec![0, 0, 0, 0, 0, 3],
@@ -89,6 +91,7 @@ fn seeded_snapshot() -> NodeSnapshot {
         current_interval_ms: 4000,
         min_interval_ms: 1000,
         max_interval_ms: 64000,
+        iface_name: "lora0".into(),
     });
     snap.throughput.interfaces.push(InterfaceThroughput {
         iface_idx: 0,
@@ -96,6 +99,7 @@ fn seeded_snapshot() -> NodeSnapshot {
         rx_fps: 12.0,
         tx_bps: 800.0,
         tx_fps: 6.0,
+        iface_name: "lora0".into(),
     });
     snap.throughput.total_rx_bps = 1500.0;
     snap.throughput.total_tx_bps = 800.0;

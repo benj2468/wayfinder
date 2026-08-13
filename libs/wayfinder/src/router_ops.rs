@@ -191,6 +191,12 @@ pub trait RouterOps {
     /// Set this interface's participation gates.
     fn set_link_features(&mut self, idx: usize, features: LinkFeatures);
 
+    /// Name this interface, for the management API to report it under.  Part of
+    /// the driver surface because naming happens at link-wiring time, alongside
+    /// the Trickle bounds and participation gates, from the same per-link
+    /// config.
+    fn set_interface_name(&mut self, idx: usize, name: &str);
+
     // ---- observability the send path feeds --------------------------------
 
     /// Fold `bytes` transmitted on interface `idx` into its rate estimator.
@@ -319,6 +325,10 @@ impl<
 
     fn set_link_features(&mut self, idx: usize, features: LinkFeatures) {
         Self::set_link_features(self, idx, features);
+    }
+
+    fn set_interface_name(&mut self, idx: usize, name: &str) {
+        Self::set_interface_name(self, idx, name);
     }
 
     fn record_tx(&mut self, idx: usize, bytes: usize, now: Duration) {

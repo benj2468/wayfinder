@@ -62,7 +62,7 @@ pub fn Links() -> impl IntoView {
                             <table class="wf-table">
                                 <thead>
                                     <tr>
-                                        <th class="wf-num">"Interface"</th>
+                                        <th>"Interface"</th>
                                         <th>"Carrying"</th>
                                         <th class="wf-num">"Announces every"</th>
                                         <th class="wf-num">"Heartbeat"</th>
@@ -73,6 +73,7 @@ pub fn Links() -> impl IntoView {
                                         .into_iter()
                                         .map(|e| {
                                             let idx = e.iface_idx;
+                                            let label = format::iface_label(&e.iface_name, idx);
                                             let status = format::gate_status(&e);
                                             let interval = ogm_interval(&sched, idx);
                                             let keepalive = e
@@ -89,7 +90,7 @@ pub fn Links() -> impl IntoView {
                                                     }
                                                     on:click=move |_| set_selected.set(Some(idx))
                                                 >
-                                                    <td class="wf-num">{idx}</td>
+                                                    <td>{label}</td>
                                                     <td class=status.css_class()>{status.label()}</td>
                                                     <td class="wf-num">{interval}</td>
                                                     <td class="wf-num">{keepalive}</td>
@@ -141,7 +142,9 @@ fn LinkDetail(
         .cloned();
 
     view! {
-        <p class="wf-detail-head">"Interface " {idx}</p>
+        <p class="wf-detail-head">
+            "Interface " {format::iface_label(&entry.iface_name, idx)}
+        </p>
 
         <div class="wf-gates">
             <GateSwitch iface_idx=idx gate=Gate::TxOgm on=entry.tx_ogm />

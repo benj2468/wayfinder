@@ -170,6 +170,22 @@ impl LinkTransport {
         115_200
     }
 
+    /// A short, stable label for this transport kind (`"udp"`, `"lora"`, …),
+    /// used to synthesize an interface name for a link whose config gave none
+    /// (see [`LinkConfig::interface_name`]).  Kept distinct per variant so two
+    /// unnamed links of different kinds never collide on a label.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            LinkTransport::Udp { .. } => "udp",
+            LinkTransport::UdpMulti { .. } => "udpm",
+            LinkTransport::RawIp { .. } => "rawip",
+            LinkTransport::RawL2 { .. } => "rawl2",
+            LinkTransport::Rylr998 { .. } => "lora",
+            LinkTransport::Ble { .. } => "ble",
+            LinkTransport::Test { .. } => "test",
+        }
+    }
+
     /// Default per-fragment advertising dwell: 150 ms, comfortably past
     /// BlueZ's own ~100 ms default advertising interval so each fragment gets
     /// at least one advertising event out. Kept in step with
@@ -193,6 +209,15 @@ pub use crate::features::LinkFeatures;
 /// defaults to full participation ([`LinkFeatures::default`]).
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LinkConfig {
+    /// Human-readable name for this interface, shown wherever the management
+    /// API surfaces per-interface state (the TUI's link tables, the web
+    /// dashboard, `wayfinderctl`).  Purely a label — nothing routes on it.
+    /// Omit it (or leave it blank) to get the transport-derived fallback
+    /// described on [`interface_name`](LinkConfig::interface_name).  Longer than
+    /// [`MAX_INTERFACE_NAME_LEN`](crate::MAX_INTERFACE_NAME_LEN) bytes is
+    /// truncated by the router that stores it.
+    #[serde(default)]
+    pub name: Option<String>,
     /// How this link's frames cross the wire.
     #[serde(flatten)]
     pub transport: LinkTransport,
@@ -210,10 +235,28 @@ pub struct LinkConfig {
 }
 
 impl LinkConfig {
+    /// This link's display name: the configured [`name`](LinkConfig::name) when
+    /// one was given, else a fallback of the transport's
+    /// [`kind`](LinkTransport::kind) with the link's registration index
+    /// appended (`udp0`, `lora1`).
+    ///
+    /// The fallback exists so every interface has a label an operator can read,
+    /// while still distinguishing two links of the same kind — a node bridging
+    /// two UDP segments shows `udp0` and `udp1`, not one ambiguous `udp`.
+    /// `idx` is the link's position in the node's link list, the same
+    /// `iface_idx` the management API reports it under.
+    pub fn interface_name(&self, idx: usize) -> String {
+        match self.name.as_deref() {
+            Some(n) if !n.is_empty() => n.into(),
+            _ => format!("{}{idx}", self.transport.kind()),
+        }
+    }
+
     /// Build a test link onto the named switch with default OGM bounds and full
     /// participation.  Keeps the test harness's link construction terse.
     pub fn test(switch_name: impl Into<String>) -> Self {
         Self {
+            name: None,
             transport: LinkTransport::Test {
                 switch_name: switch_name.into(),
             },
@@ -910,5 +953,86 @@ advertise_dwell_ms: 250
         };
         assert_eq!(adapter.as_deref(), Some("hci1"));
         assert_eq!(advertise_dwell_ms, 250);
+    }
+
+    /// An operator-supplied `name:` is what the interface is called, verbatim.
+    #[test]
+    fn link_name_is_taken_from_config() {
+        let yaml = "\
+type: Ble
+name: rooftop-ble
+";
+        let link: LinkConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(link.name.as_deref(), Some("rooftop-ble"));
+        assert_eq!(link.interface_name(3), "rooftop-ble");
+    }
+
+    /// A link with no `name:` still gets a label, derived from its transport
+    /// kind plus its index — so an unnamed config reads as `udp0`/`lora1` in the
+    /// UI rather than as a bare number, and two links of the same kind stay
+    /// distinguishable.
+    #[test]
+    fn unnamed_link_falls_back_to_transport_kind_and_index() {
+        let link: LinkConfig = serde_yaml::from_str("type: Ble\n").unwrap();
+        assert_eq!(link.name, None);
+        assert_eq!(link.interface_name(0), "ble0");
+        assert_eq!(link.interface_name(2), "ble2");
+    }
+
+    /// Every transport kind has a distinct short label; a fallback name must not
+    /// collide between two links of different kinds at different indices.
+    #[test]
+    fn transport_kinds_are_distinct() {
+        let kinds = [
+            LinkTransport::Udp {
+                bind_addr: "127.0.0.1:1".parse().unwrap(),
+                remote_addr: "127.0.0.1:2".parse().unwrap(),
+            }
+            .kind(),
+            LinkTransport::UdpMulti {
+                bind_addr: "127.0.0.1:1".parse().unwrap(),
+                discovery_addr: "127.0.0.1:2".parse().unwrap(),
+                multicast_interface: None,
+            }
+            .kind(),
+            LinkTransport::RawIp {
+                bind_addr: Ipv4Addr::LOCALHOST.into(),
+                remote_addr: Ipv4Addr::LOCALHOST.into(),
+                protocol: 253,
+            }
+            .kind(),
+            LinkTransport::RawL2 {
+                interface: "eth0".into(),
+                ethertype: 0x4305,
+            }
+            .kind(),
+            LinkTransport::Ble {
+                adapter: None,
+                advertise_dwell_ms: 150,
+            }
+            .kind(),
+            LinkTransport::Test {
+                switch_name: "s".into(),
+            }
+            .kind(),
+        ];
+        let mut seen = Vec::new();
+        for k in kinds {
+            assert!(!k.is_empty(), "every kind has a label");
+            assert!(!seen.contains(&k), "kind label {k} is not unique");
+            seen.push(k);
+        }
+    }
+
+    /// A blank `name:` is treated as no name at all, rather than producing an
+    /// interface the UI renders as an empty cell.
+    #[test]
+    fn blank_link_name_falls_back() {
+        let yaml = "\
+type: Ble
+name: \"\"
+";
+        let link: LinkConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(link.interface_name(1), "ble1");
     }
 }

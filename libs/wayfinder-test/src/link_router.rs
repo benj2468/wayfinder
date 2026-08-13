@@ -136,7 +136,15 @@ impl LinkTestRouter {
             // Links default to full participation here; a test that needs a
             // partially participating link sets it afterward via
             // `router_mut().set_link_features(..)`.
-            driver: Driver::new(ident, local, links, trickle, Vec::new(), query_rx),
+            driver: Driver::new(
+                ident,
+                local,
+                links,
+                trickle,
+                Vec::new(),
+                Vec::new(),
+                query_rx,
+            ),
             ident,
             deliveries,
             host_in,

@@ -234,12 +234,16 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut interfaces = Vec::new();
-    // Per-interface OGM backoff bounds and participation features, collected in
-    // interface order alongside the transports so the driver can pace and gate
-    // each link independently.
+    // Per-interface OGM backoff bounds, participation features and display
+    // names, collected in interface order alongside the transports so the
+    // driver can pace, gate and label each link independently.
     let mut trickle: Vec<TrickleConfig> = Vec::new();
     let mut features: Vec<LinkFeatures> = Vec::new();
-    for link in config.links {
+    let mut names: Vec<String> = Vec::new();
+    for (idx, link) in config.links.into_iter().enumerate() {
+        // Resolve the label before the transport is moved out below; an unnamed
+        // link falls back to its transport kind plus this index.
+        names.push(link.interface_name(idx));
         match link.transport {
             LinkTransport::Udp {
                 bind_addr,
@@ -369,6 +373,7 @@ async fn main() -> anyhow::Result<()> {
         interfaces,
         trickle,
         features,
+        names,
         query_rx,
     );
     // Give the driver the receiver the TLS server snapshots authorization state

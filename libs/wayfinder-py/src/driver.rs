@@ -39,10 +39,16 @@ impl PyDriver {
     /// Build a driver for `mac` with `len(trickle)` interfaces. `trickle[idx]`
     /// is that interface's `(i_min_ms, i_max_ms)` adaptive OGM schedule;
     /// `features[idx]` its participation gates, defaulting to full
-    /// participation for any interface `features` doesn't cover.
+    /// participation for any interface `features` doesn't cover; `names[idx]`
+    /// its display name for the management API, left unnamed when absent.
     #[new]
-    #[pyo3(signature = (mac, trickle, features=None))]
-    fn new(mac: PyMac, trickle: Vec<(u64, u64)>, features: Option<Vec<PyLinkFeatures>>) -> Self {
+    #[pyo3(signature = (mac, trickle, features=None, names=None))]
+    fn new(
+        mac: PyMac,
+        trickle: Vec<(u64, u64)>,
+        features: Option<Vec<PyLinkFeatures>>,
+        names: Option<Vec<String>>,
+    ) -> Self {
         let trickle: Vec<TrickleConfig> = trickle
             .into_iter()
             .map(|(i_min_ms, i_max_ms)| TrickleConfig { i_min_ms, i_max_ms })
@@ -52,8 +58,10 @@ impl PyDriver {
             .into_iter()
             .map(Into::into)
             .collect();
+        let names = names.unwrap_or_default();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
         Self {
-            inner: Driver::new(mac.0, &trickle, &features),
+            inner: Driver::new(mac.0, &trickle, &features, &names),
             last_now: Duration::ZERO,
         }
     }

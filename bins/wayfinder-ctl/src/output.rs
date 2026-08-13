@@ -43,6 +43,15 @@ fn render<T: Serialize>(
     })
 }
 
+/// An interface's configured name, or `-` when the node reported none.
+///
+/// Unlike the TUI, `wayfinderctl` keeps the numeric `IFACE` column alongside
+/// this one: the index is what an operator types into `link-enable`/`set-ogm`,
+/// so replacing it with the name would break the copy-paste path.
+pub fn format_iface_name(name: &str) -> &str {
+    if name.is_empty() { "-" } else { name }
+}
+
 /// Render a raw identifier as a colon-delimited MAC (6 bytes) or plain hex.
 pub fn format_mac(bytes: &[u8]) -> String {
     if bytes.len() == 6 {
@@ -96,12 +105,13 @@ pub fn link_quality_table(v: &LinkQualityTable, fmt: OutputFormat) -> anyhow::Re
         if v.entries.is_empty() {
             return "no link-quality samples".to_string();
         }
-        let mut out = String::from("NEIGHBOR           IFACE  QUALITY  SAMPLES");
+        let mut out = String::from("NEIGHBOR           IFACE  NAME              QUALITY  SAMPLES");
         for e in &v.entries {
             out.push_str(&format!(
-                "\n{:<18} {:>5}  {:>7}  {:>7}",
+                "\n{:<18} {:>5}  {:<16}  {:>7}  {:>7}",
                 format_mac(&e.neighbor_id),
                 e.iface_idx,
+                format_iface_name(&e.iface_name),
                 e.ewma_quality,
                 e.sample_count,
             ));
@@ -118,7 +128,9 @@ pub fn link_features_table(v: &LinkFeaturesTable, fmt: OutputFormat) -> anyhow::
         if v.entries.is_empty() {
             return "no interfaces configured".to_string();
         }
-        let mut out = String::from("IFACE  TX_OGM  RX_OGM  TX_DATA  RX_DATA  KEEPALIVE_MS  STATUS");
+        let mut out = String::from(
+            "IFACE  NAME              TX_OGM  RX_OGM  TX_DATA  RX_DATA  KEEPALIVE_MS  STATUS",
+        );
         for e in &v.entries {
             let all_on = e.tx_ogm && e.rx_ogm && e.tx_data && e.rx_data;
             let all_off = !e.tx_ogm && !e.rx_ogm && !e.tx_data && !e.rx_data;
@@ -130,8 +142,9 @@ pub fn link_features_table(v: &LinkFeaturesTable, fmt: OutputFormat) -> anyhow::
                 "mixed"
             };
             out.push_str(&format!(
-                "\n{:>5}  {:>6}  {:>6}  {:>7}  {:>7}  {:>12}  {:>6}",
+                "\n{:>5}  {:<16}  {:>6}  {:>6}  {:>7}  {:>7}  {:>12}  {:>6}",
                 e.iface_idx,
+                format_iface_name(&e.iface_name),
                 e.tx_ogm,
                 e.rx_ogm,
                 e.tx_data,
@@ -172,11 +185,15 @@ pub fn ogm_schedule(v: &OgmSchedule, fmt: OutputFormat) -> anyhow::Result<String
         if v.entries.is_empty() {
             return "no interfaces configured".to_string();
         }
-        let mut out = String::from("IFACE  CURRENT_MS  MIN_MS  MAX_MS");
+        let mut out = String::from("IFACE  NAME              CURRENT_MS  MIN_MS  MAX_MS");
         for e in &v.entries {
             out.push_str(&format!(
-                "\n{:>5}  {:>10}  {:>6}  {:>6}",
-                e.iface_idx, e.current_interval_ms, e.min_interval_ms, e.max_interval_ms,
+                "\n{:>5}  {:<16}  {:>10}  {:>6}  {:>6}",
+                e.iface_idx,
+                format_iface_name(&e.iface_name),
+                e.current_interval_ms,
+                e.min_interval_ms,
+                e.max_interval_ms,
             ));
         }
         out
@@ -186,16 +203,22 @@ pub fn ogm_schedule(v: &OgmSchedule, fmt: OutputFormat) -> anyhow::Result<String
 /// Render [`Throughput`] (per-interface rows + node totals).
 pub fn throughput(v: &Throughput, fmt: OutputFormat) -> anyhow::Result<String> {
     render(v, fmt, |v| {
-        let mut out = String::from("IFACE   RX_BPS    RX_FPS    TX_BPS    TX_FPS");
+        let mut out =
+            String::from("IFACE  NAME                RX_BPS    RX_FPS    TX_BPS    TX_FPS");
         for i in &v.interfaces {
             out.push_str(&format!(
-                "\n{:>5}  {:>8.0}  {:>8.1}  {:>8.0}  {:>8.1}",
-                i.iface_idx, i.rx_bps, i.rx_fps, i.tx_bps, i.tx_fps,
+                "\n{:>5}  {:<16}  {:>8.0}  {:>8.1}  {:>8.0}  {:>8.1}",
+                i.iface_idx,
+                format_iface_name(&i.iface_name),
+                i.rx_bps,
+                i.rx_fps,
+                i.tx_bps,
+                i.tx_fps,
             ));
         }
         out.push_str(&format!(
-            "\ntotal  {:>8.0}  {:>8.1}  {:>8.0}  {:>8.1}",
-            v.total_rx_bps, v.total_rx_fps, v.total_tx_bps, v.total_tx_fps,
+            "\ntotal  {:<16}  {:>8.0}  {:>8.1}  {:>8.0}  {:>8.1}",
+            "", v.total_rx_bps, v.total_rx_fps, v.total_tx_bps, v.total_tx_fps,
         ));
         out
     })

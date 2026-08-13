@@ -229,8 +229,9 @@ impl<L: LinkT, C: Clock, const N: usize> Driver<L, C, N> {
         clock: C,
         trickle: &[TrickleParams],
         features: &[LinkFeatures],
+        names: &[&str],
     ) -> Self {
-        Self::with_capacities(mac, links, clock, trickle, features)
+        Self::with_capacities(mac, links, clock, trickle, features, names)
     }
 }
 
@@ -254,10 +255,10 @@ impl<L: LinkT, C: Clock, const N: usize, const FRAME_LEN: usize, R: RouterOps>
 
     /// Build a driver for node `mac` over the given mesh `links` and `clock`.
     /// `trickle` supplies each interface's adaptive OGM bounds
-    /// ([`TrickleParams`]) and `features` its per-link participation gates, both
-    /// in interface order; interfaces without an entry fall back to
-    /// [`TrickleParams::default`] / [`LinkFeatures::default`] (full
-    /// participation).
+    /// ([`TrickleParams`]), `features` its per-link participation gates, and
+    /// `names` its human-readable label, all in interface order; interfaces
+    /// without an entry fall back to [`TrickleParams::default`] /
+    /// [`LinkFeatures::default`] (full participation) / unnamed.
     ///
     /// [`LinkFeatures::default`]: wayfinder::features::LinkFeatures
     pub fn with_capacities(
@@ -266,6 +267,7 @@ impl<L: LinkT, C: Clock, const N: usize, const FRAME_LEN: usize, R: RouterOps>
         clock: C,
         trickle: &[TrickleParams],
         features: &[LinkFeatures],
+        names: &[&str],
     ) -> Self {
         let () = Self::_LINKS_FIT_PROFILE;
         let mut router = R::with_capacities(mac);
@@ -280,6 +282,9 @@ impl<L: LinkT, C: Clock, const N: usize, const FRAME_LEN: usize, R: RouterOps>
             router.configure_interface_ogm(idx, cfg.i_min, cfg.i_max, Duration::ZERO);
             let link_features = features.get(idx).copied().unwrap_or_default();
             router.set_link_features(idx, link_features);
+            if let Some(name) = names.get(idx) {
+                router.set_interface_name(idx, name);
+            }
             // Keep-alive rides on the same per-link `features` entry (no
             // separate constructor parameter) — its `tx_keepalive` supplies
             // the schedule, `None` leaving that interface's timer unarmed.
@@ -662,7 +667,7 @@ mod tests {
         let now = Duration::from_secs(30);
         let trickle = [TrickleParams::default()];
         let clock = ImmediateClock { now };
-        let mut driver = Driver::new(mac(1), [AbsentLink], clock, &trickle, &[]);
+        let mut driver = Driver::new(mac(1), [AbsentLink], clock, &trickle, &[], &[]);
 
         futures::executor::block_on(driver.run_once());
 
@@ -715,7 +720,7 @@ mod tests {
         let clock = ImmediateClock {
             now: Duration::from_secs(30),
         };
-        let mut driver = Driver::new(mac(1), [FakeLink::default()], clock, &trickle, &[]);
+        let mut driver = Driver::new(mac(1), [FakeLink::default()], clock, &trickle, &[], &[]);
 
         futures::executor::block_on(driver.run_once());
 
@@ -748,7 +753,7 @@ mod tests {
             now: Duration::from_secs(1),
         };
         let trickle = [TrickleParams::default(), TrickleParams::default()];
-        let mut driver = Driver::new(mac(1), [link0, link1], clock, &trickle, &[]);
+        let mut driver = Driver::new(mac(1), [link0, link1], clock, &trickle, &[], &[]);
 
         futures::executor::block_on(driver.run_once());
 
@@ -788,7 +793,7 @@ mod tests {
             now: Duration::from_secs(1),
         };
         let trickle = [TrickleParams::default()];
-        let mut driver = Driver::new(mac(1), [FakeLink::default()], clock, &trickle, &[]);
+        let mut driver = Driver::new(mac(1), [FakeLink::default()], clock, &trickle, &[], &[]);
 
         let client = async {
             tx.query(WayfinderRequest {
@@ -866,7 +871,7 @@ mod tests {
             now: Duration::from_secs(1),
         };
         let trickle = [TrickleParams::default()];
-        let mut driver = Driver::new(mac(1), [link0], clock, &trickle, &[]);
+        let mut driver = Driver::new(mac(1), [link0], clock, &trickle, &[], &[]);
 
         futures::executor::block_on(driver.run_once_with_mgmt(&rx));
 
@@ -951,6 +956,7 @@ mod capacity_tests {
             [FakeLink::default(), FakeLink::default()],
             clock,
             &trickle,
+            &[],
             &[],
         );
 

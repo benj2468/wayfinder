@@ -143,6 +143,14 @@ impl<
     ) -> Self {
         Self { router, now, ca }
     }
+
+    /// Interface `idx`'s configured name, or the empty string when it was never
+    /// named.  The wire carries "unnamed" as an empty `iface_name` rather than a
+    /// synthesized placeholder, so a client can tell a deliberately-named
+    /// interface from one that just fell back to its index.
+    fn interface_name(&self, idx: usize) -> String {
+        self.router.interface_name(idx).unwrap_or_default().into()
+    }
 }
 
 /// Map a log-ring level onto the management API's own.
@@ -230,6 +238,7 @@ impl<
                 iface_idx: r.iface_idx as u32,
                 ewma_quality: r.ewma_quality as u32,
                 sample_count: r.sample_count,
+                iface_name: self.interface_name(r.iface_idx),
             })
             .collect()
     }
@@ -245,6 +254,7 @@ impl<
                     tx_data: f.tx_data,
                     rx_data: f.rx_data,
                     tx_keepalive_interval_ms: f.tx_keepalive.map(|k| k.interval_ms),
+                    iface_name: self.interface_name(idx),
                 }
             })
             .collect()
@@ -272,6 +282,7 @@ impl<
                 current_interval_ms: e.current_interval.as_millis().min(u32::MAX as u128) as u32,
                 min_interval_ms: e.min_interval.as_millis().min(u32::MAX as u128) as u32,
                 max_interval_ms: e.max_interval.as_millis().min(u32::MAX as u128) as u32,
+                iface_name: self.interface_name(e.iface_idx),
             })
             .collect()
     }
@@ -290,6 +301,7 @@ impl<
                         rx_fps: t.rx_fps,
                         tx_bps: t.tx_bps,
                         tx_fps: t.tx_fps,
+                        iface_name: self.interface_name(idx),
                     })
             })
             .collect()
@@ -680,6 +692,47 @@ mod tests {
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
         let mut tx = [0u8; 256];
         router.handle_frame(Duration::ZERO, 0, frame, &mut tx);
+    }
+
+    /// Every per-interface table carries the interface's configured name
+    /// alongside its index, so a client can label a row without a second lookup
+    /// — and an interface the operator never named carries an empty name rather
+    /// than a synthesized placeholder, keeping the two cases distinguishable.
+    #[test]
+    fn per_interface_tables_carry_the_configured_name() {
+        let mut router = CentralRouter::new(mac(1));
+        for idx in 0..2 {
+            router.configure_interface_ogm(
+                idx,
+                Duration::from_secs(1),
+                Duration::from_secs(8),
+                Duration::ZERO,
+            );
+        }
+        router.set_interface_name(0, "lora-roof");
+        // Give interface 0 a link-quality sample to project.
+        feed_direct_ogm(&mut router, mac(2), 1, 255);
+
+        let adapter = RouterAdapter::new(&mut router, None, Duration::ZERO);
+
+        let lq = adapter.link_quality_table();
+        assert_eq!(lq.len(), 1);
+        assert_eq!(lq[0].iface_idx, 0);
+        assert_eq!(lq[0].iface_name, "lora-roof");
+
+        let features = adapter.link_features_table();
+        assert_eq!(features[0].iface_name, "lora-roof");
+        assert_eq!(features[1].iface_name, "", "interface 1 was never named");
+
+        let schedule = adapter.ogm_schedule();
+        let e0 = schedule.iter().find(|e| e.iface_idx == 0).unwrap();
+        assert_eq!(e0.iface_name, "lora-roof");
+        let e1 = schedule.iter().find(|e| e.iface_idx == 1).unwrap();
+        assert_eq!(e1.iface_name, "");
+
+        let tp = adapter.throughput();
+        assert_eq!(tp[0].iface_name, "lora-roof");
+        assert_eq!(tp[1].iface_name, "");
     }
 
     /// A router with interface 0 already registered (as startup wiring would

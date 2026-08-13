@@ -1096,6 +1096,7 @@ mod tests {
             tx_data: true,
             rx_data: true,
             tx_keepalive_interval_ms: None,
+            iface_name: String::new(),
         }]);
         app.links_state.select(Some(0));
         app.tab = Tab::Overview;
@@ -1114,6 +1115,7 @@ mod tests {
             tx_data: true,
             rx_data: true,
             tx_keepalive_interval_ms: None,
+            iface_name: String::new(),
         }]);
 
         app.toggle_link_feature(LinkFeatureGate::TxOgm);
@@ -1130,6 +1132,7 @@ mod tests {
             tx_data: true,
             rx_data: false,
             tx_keepalive_interval_ms: None,
+            iface_name: String::new(),
         }]);
         app.links_state.select(Some(0));
 

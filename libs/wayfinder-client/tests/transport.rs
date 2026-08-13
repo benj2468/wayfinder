@@ -82,6 +82,7 @@ impl WayfinderDataProvider for Mock {
             iface_idx: 0,
             ewma_quality: 200,
             sample_count: 9,
+            iface_name: "lora0".into(),
         }]
     }
     fn link_features_table(&self) -> Vec<LinkFeaturesEntryData> {
@@ -101,6 +102,7 @@ impl WayfinderDataProvider for Mock {
             current_interval_ms: 4000,
             min_interval_ms: 1000,
             max_interval_ms: 64000,
+            iface_name: "lora0".into(),
         }]
     }
     fn throughput(&self) -> Vec<InterfaceThroughputData> {
@@ -110,6 +112,7 @@ impl WayfinderDataProvider for Mock {
             rx_fps: 12.0,
             tx_bps: 800.0,
             tx_fps: 6.0,
+            iface_name: "lora0".into(),
         }]
     }
     fn node_metrics(&self) -> NodeMetricsData {

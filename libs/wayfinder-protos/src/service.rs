@@ -82,6 +82,9 @@ pub struct LinkQualityEntryData {
     pub ewma_quality: u32,
     /// Number of samples folded into the EWMA.
     pub sample_count: u32,
+    /// Human-readable name of the interface `iface_idx` refers to; empty when
+    /// the interface was never named.
+    pub iface_name: String,
 }
 
 /// Intermediate representation of one interface's live participation-feature
@@ -102,6 +105,8 @@ pub struct LinkFeaturesEntryData {
     /// The armed keep-alive cadence in milliseconds, or `None` if keep-alive
     /// transmission is disabled on this link.
     pub tx_keepalive_interval_ms: Option<u64>,
+    /// Human-readable name of this interface; empty when it was never named.
+    pub iface_name: String,
 }
 
 /// Intermediate representation of one row in the keep-alive liveness table,
@@ -134,6 +139,8 @@ pub struct OgmScheduleEntryData {
     /// Backoff ceiling (Trickle `i_max`): the longest interval reached while
     /// stable, in ms.
     pub max_interval_ms: u32,
+    /// Human-readable name of this interface; empty when it was never named.
+    pub iface_name: String,
 }
 
 /// Intermediate representation of a request to install new Trickle/OGM bounds
@@ -208,6 +215,8 @@ pub struct InterfaceThroughputData {
     pub tx_bps: f64,
     /// Smoothed transmit rate in frames per second.
     pub tx_fps: f64,
+    /// Human-readable name of this interface; empty when it was never named.
+    pub iface_name: String,
 }
 
 /// Intermediate representation of one fixed-capacity table's occupancy.
@@ -717,6 +726,7 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                         iface_idx: e.iface_idx,
                         ewma_quality: e.ewma_quality,
                         sample_count: e.sample_count,
+                        iface_name: e.iface_name,
                     })
                     .collect();
                 ResponseKind::LinkQualityTable(LinkQualityTable { entries })
@@ -734,6 +744,7 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                         tx_data: e.tx_data,
                         rx_data: e.rx_data,
                         tx_keepalive_interval_ms: e.tx_keepalive_interval_ms,
+                        iface_name: e.iface_name,
                     })
                     .collect();
                 ResponseKind::LinkFeaturesTable(LinkFeaturesTable { entries })
@@ -778,6 +789,7 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                         current_interval_ms: e.current_interval_ms,
                         min_interval_ms: e.min_interval_ms,
                         max_interval_ms: e.max_interval_ms,
+                        iface_name: e.iface_name,
                     })
                     .collect();
                 ResponseKind::OgmSchedule(OgmSchedule { entries })
@@ -805,6 +817,7 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                             rx_fps: e.rx_fps,
                             tx_bps: e.tx_bps,
                             tx_fps: e.tx_fps,
+                            iface_name: e.iface_name,
                         }
                     })
                     .collect();
@@ -1282,6 +1295,7 @@ mod tests {
                 iface_idx: 1,
                 ewma_quality: 200,
                 sample_count: 42,
+                iface_name: "lora0".into(),
             }],
             ..Default::default()
         };
@@ -1297,6 +1311,7 @@ mod tests {
                 assert_eq!(e.iface_idx, 1);
                 assert_eq!(e.ewma_quality, 200);
                 assert_eq!(e.sample_count, 42);
+                assert_eq!(e.iface_name, "lora0", "the interface's name is projected");
             }
             other => panic!(
                 "expected LinkQualityTable, got {:?}",
@@ -1330,6 +1345,7 @@ mod tests {
                     tx_data: true,
                     rx_data: true,
                     tx_keepalive_interval_ms: Some(3000),
+                    iface_name: "lora0".into(),
                 },
                 LinkFeaturesEntryData {
                     iface_idx: 1,
@@ -1338,6 +1354,8 @@ mod tests {
                     tx_data: true,
                     rx_data: true,
                     tx_keepalive_interval_ms: None,
+                    // An interface nobody named stays empty on the wire.
+                    iface_name: String::new(),
                 },
             ],
             ..Default::default()
@@ -1356,7 +1374,12 @@ mod tests {
                 assert!(e0.tx_data);
                 assert!(e0.rx_data);
                 assert_eq!(e0.tx_keepalive_interval_ms, Some(3000));
+                assert_eq!(e0.iface_name, "lora0");
                 assert_eq!(table.entries[1].tx_keepalive_interval_ms, None);
+                assert_eq!(
+                    table.entries[1].iface_name, "",
+                    "an unnamed interface carries an empty name, not a placeholder"
+                );
             }
             other => panic!(
                 "expected LinkFeaturesTable, got {:?}",
@@ -1578,12 +1601,14 @@ mod tests {
                     current_interval_ms: 4000,
                     min_interval_ms: 1000,
                     max_interval_ms: 64000,
+                    iface_name: "lora0".into(),
                 },
                 OgmScheduleEntryData {
                     iface_idx: 1,
                     current_interval_ms: 1000,
                     min_interval_ms: 1000,
                     max_interval_ms: 32000,
+                    iface_name: "udp1".into(),
                 },
             ],
             ..Default::default()
@@ -1600,6 +1625,7 @@ mod tests {
                 assert_eq!(e.current_interval_ms, 4000);
                 assert_eq!(e.min_interval_ms, 1000);
                 assert_eq!(e.max_interval_ms, 64000);
+                assert_eq!(e.iface_name, "lora0");
                 // Second interface backed off less far and has a lower ceiling.
                 assert_eq!(schedule.entries[1].current_interval_ms, 1000);
                 assert_eq!(schedule.entries[1].max_interval_ms, 32000);
@@ -1629,6 +1655,7 @@ mod tests {
                     rx_fps: 10.0,
                     tx_bps: 500.0,
                     tx_fps: 5.0,
+                    iface_name: "lora0".into(),
                 },
                 InterfaceThroughputData {
                     iface_idx: 1,
@@ -1636,6 +1663,7 @@ mod tests {
                     rx_fps: 2.0,
                     tx_bps: 100.0,
                     tx_fps: 1.0,
+                    iface_name: "udp1".into(),
                 },
             ],
             ..Default::default()
@@ -1648,7 +1676,9 @@ mod tests {
             ResponseKind::Throughput(tp) => {
                 assert_eq!(tp.interfaces.len(), 2);
                 assert_eq!(tp.interfaces[0].iface_idx, 0);
+                assert_eq!(tp.interfaces[0].iface_name, "lora0");
                 assert_eq!(tp.interfaces[1].rx_bps, 250.0);
+                assert_eq!(tp.interfaces[1].iface_name, "udp1");
                 // Totals are the per-interface sums.
                 assert_eq!(tp.total_rx_bps, 1250.0);
                 assert_eq!(tp.total_rx_fps, 12.0);

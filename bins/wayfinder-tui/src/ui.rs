@@ -492,7 +492,7 @@ fn render_link_quality(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|e| {
             Row::new(vec![
                 Cell::from(format_id(&e.neighbor_id)),
-                Cell::from(e.iface_idx.to_string()),
+                Cell::from(iface_label(&e.iface_name, e.iface_idx)),
                 Cell::from(Span::styled(
                     format!("{} {}", e.ewma_quality, bar(e.ewma_quality)),
                     tq_style(e.ewma_quality),
@@ -510,7 +510,9 @@ fn render_link_quality(frame: &mut Frame, app: &mut App, area: Rect) {
         rows,
         [
             Constraint::Min(18),
-            Constraint::Length(6),
+            // Wide enough for a configured name (`lora-roof`), not just the
+            // `#3` index fallback.
+            Constraint::Length(14),
             Constraint::Min(16),
             Constraint::Length(10),
         ],
@@ -552,7 +554,7 @@ fn render_links(frame: &mut Frame, app: &mut App, area: Rect) {
                 .unwrap_or_else(|| "-".to_string());
             let (status, status_style) = link_feature_status(e);
             Row::new(vec![
-                Cell::from(e.iface_idx.to_string()),
+                Cell::from(iface_label(&e.iface_name, e.iface_idx)),
                 Cell::from(current),
                 Cell::from(Span::styled(status, status_style)),
             ])
@@ -563,7 +565,7 @@ fn render_links(frame: &mut Frame, app: &mut App, area: Rect) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(6),
+            Constraint::Length(14),
             Constraint::Length(10),
             Constraint::Min(7),
         ],
@@ -579,6 +581,18 @@ fn render_links(frame: &mut Frame, app: &mut App, area: Rect) {
 
     frame.render_stateful_widget(table, cols[0], &mut app.links_state);
     render_link_detail(frame, app, cols[1]);
+}
+
+/// How an interface is labelled in the UI: its configured name when the node
+/// reported one, else `#idx`. Interfaces are still *addressed* by index over
+/// the management API — the name is display metadata — so the fallback keeps
+/// an unnamed interface identifiable rather than blank.
+fn iface_label(iface_name: &str, iface_idx: u32) -> String {
+    if iface_name.is_empty() {
+        format!("#{iface_idx}")
+    } else {
+        iface_name.to_string()
+    }
 }
 
 /// The OGM schedule entry for `iface_idx`, if the snapshot has one. Zipped by
@@ -626,7 +640,16 @@ fn render_link_detail(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         ))],
         Some(entry) => {
-            let mut out = vec![field("Interface", &entry.iface_idx.to_string())];
+            // Both the label and the raw index: the index is what an operator
+            // types into `wayfinderctl link-enable --iface N`, so a named
+            // interface must not hide it.
+            let mut out = vec![
+                field(
+                    "Interface",
+                    &iface_label(&entry.iface_name, entry.iface_idx),
+                ),
+                field("Index", &entry.iface_idx.to_string()),
+            ];
             if let Some(s) = ogm_schedule_for(app, entry.iface_idx) {
                 out.push(field(
                     "Current interval",
@@ -1190,7 +1213,7 @@ fn render_throughput(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|e| {
             Row::new(vec![
-                Cell::from(e.iface_idx.to_string()),
+                Cell::from(iface_label(&e.iface_name, e.iface_idx)),
                 Cell::from(Span::styled(
                     fmt_rate(e.rx_bps),
                     Style::default().fg(Color::Green),
@@ -1214,7 +1237,7 @@ fn render_throughput(frame: &mut Frame, app: &mut App, area: Rect) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(6),
+            Constraint::Length(14),
             Constraint::Min(12),
             Constraint::Length(10),
             Constraint::Min(12),
@@ -1613,6 +1636,7 @@ mod tests {
                 tx_data: true,
                 rx_data: true,
                 tx_keepalive_interval_ms: Some(2000),
+                iface_name: String::new(),
             }],
         };
         app.snapshot.ogm_schedule = OgmSchedule {
@@ -1621,6 +1645,7 @@ mod tests {
                 current_interval_ms: 4000,
                 min_interval_ms: 1000,
                 max_interval_ms: 64000,
+                iface_name: String::new(),
             }],
         };
         app.links_state.select(Some(0));
@@ -1651,5 +1676,54 @@ mod tests {
             text.contains("2000 ms"),
             "keep-alive cadence missing: {text}"
         );
+        // An unnamed interface still identifies itself, by index.
+        assert!(text.contains("#3"), "index fallback label missing: {text}");
+    }
+
+    /// A named interface is shown by name everywhere its index used to be — the
+    /// whole point of naming, since `0`/`1`/`2` tells an operator nothing about
+    /// which radio a row describes.
+    #[test]
+    fn named_interfaces_render_by_name() {
+        use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesEntry;
+        use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesTable;
+
+        let mut app = App::new("test".to_string(), 1000);
+        app.tab = Tab::Links;
+        app.snapshot.link_features = LinkFeaturesTable {
+            entries: vec![LinkFeaturesEntry {
+                iface_idx: 3,
+                tx_ogm: true,
+                rx_ogm: true,
+                tx_data: true,
+                rx_data: true,
+                tx_keepalive_interval_ms: None,
+                iface_name: "lora-roof".into(),
+            }],
+        };
+        app.links_state.select(Some(0));
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(text.contains("lora-roof"), "interface name missing: {text}");
+    }
+
+    /// The label falls back to a `#`-prefixed index when the node reports no
+    /// name, so an unnamed interface is never a blank cell.
+    #[test]
+    fn iface_label_falls_back_to_index() {
+        assert_eq!(iface_label("wlan0", 2), "wlan0");
+        assert_eq!(iface_label("", 2), "#2");
     }
 }

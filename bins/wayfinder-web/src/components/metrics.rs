@@ -86,7 +86,7 @@ pub fn Metrics() -> impl IntoView {
                                 <table class="wf-table">
                                     <thead>
                                         <tr>
-                                            <th class="wf-num">"Interface"</th>
+                                            <th>"Interface"</th>
                                             <th class="wf-num">"Received"</th>
                                             <th class="wf-num">"Sent"</th>
                                             <th class="wf-num">"Frames in"</th>
@@ -99,7 +99,9 @@ pub fn Metrics() -> impl IntoView {
                                             .map(|t| {
                                                 view! {
                                                     <tr>
-                                                        <td class="wf-num">{t.iface_idx}</td>
+                                                        <td>
+                                                            {format::iface_label(&t.iface_name, t.iface_idx)}
+                                                        </td>
                                                         <td class="wf-num">{format::rate(t.rx_bps)}</td>
                                                         <td class="wf-num">{format::rate(t.tx_bps)}</td>
                                                         <td class="wf-num">{format::fps(t.rx_fps)}</td>
