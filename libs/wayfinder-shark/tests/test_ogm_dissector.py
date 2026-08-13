@@ -109,12 +109,12 @@ def membership_cert(
 # field name -> expected decoded value for the default OGM above (with a
 # 4-byte 0xdeadbeef TVLV tail).
 EXPECTED_FIELDS = {
-    "wayfinder.batman.ttl": "50",
-    "wayfinder.batman.ogm.seqno": "1234",
-    "wayfinder.batman.ogm.orig": "02:00:00:00:00:01",
-    "wayfinder.batman.ogm.tq": "255",
-    "wayfinder.batman.ogm.tvlv_len": "4",
-    "wayfinder.batman.ogm.tvlv": "deadbeef",
+    "wayfinder.ttl": "50",
+    "wayfinder.originator.seqno": "1234",
+    "wayfinder.originator.addr": "02:00:00:00:00:01",
+    "wayfinder.originator.tq": "255",
+    "wayfinder.originator.tvlv_len": "4",
+    "wayfinder.originator.tvlv": "deadbeef",
 }
 
 
@@ -135,20 +135,20 @@ def test_ogm_without_tvlv_has_zero_len(dissect):
     """An OGM with no TVLV tail reports tvlv_len 0 and decodes its header."""
     result = dissect(
         ogm_frame(seqno=7, tvlv=b""),
-        ["wayfinder.batman.ogm.tvlv_len", "wayfinder.batman.ogm.seqno"],
+        ["wayfinder.originator.tvlv_len", "wayfinder.originator.seqno"],
     )
-    assert result["wayfinder.batman.ogm.tvlv_len"] == "0"
-    assert result["wayfinder.batman.ogm.seqno"] == "7"
+    assert result["wayfinder.originator.tvlv_len"] == "0"
+    assert result["wayfinder.originator.seqno"] == "7"
 
 
 # Expected decoded cert fields for the synthetic membership_cert() above.
 EXPECTED_CERT_FIELDS = {
-    "wayfinder.batman.tvlv.type": "0x80",
-    "wayfinder.batman.tvlv.cert.version": "1",
-    "wayfinder.batman.tvlv.cert.mesh_id": "0x0000abcd",
-    "wayfinder.batman.tvlv.cert.node_mac": "02:00:00:00:00:01",
-    "wayfinder.batman.tvlv.cert.not_before": "100",
-    "wayfinder.batman.tvlv.cert.not_after": "200",
+    "wayfinder.tvlv.type": "0x80",
+    "wayfinder.tvlv.cert.version": "1",
+    "wayfinder.tvlv.cert.mesh_id": "0x0000abcd",
+    "wayfinder.tvlv.cert.node_mac": "02:00:00:00:00:01",
+    "wayfinder.tvlv.cert.not_before": "100",
+    "wayfinder.tvlv.cert.not_after": "200",
 }
 
 
@@ -164,8 +164,8 @@ def test_ogm_signature_tvlv_decodes(dissect):
     """A WF_TVLV_OGM_SIG record surfaces the 64-byte signature."""
     sig = bytes(range(64))
     frame = ogm_frame(tvlv=tvlv(WF_TVLV_OGM_SIG, sig))
-    result = dissect(frame, ["wayfinder.batman.tvlv.ogm_sig"])
-    assert result["wayfinder.batman.tvlv.ogm_sig"] == sig.hex()
+    result = dissect(frame, ["wayfinder.tvlv.originator_sig"])
+    assert result["wayfinder.tvlv.originator_sig"] == sig.hex()
 
 
 def test_walk_handles_cert_then_signature(dissect):
@@ -176,20 +176,20 @@ def test_walk_handles_cert_then_signature(dissect):
     frame = ogm_frame(tvlv=tail)
     result = dissect(
         frame,
-        ["wayfinder.batman.tvlv.cert.mesh_id", "wayfinder.batman.tvlv.ogm_sig"],
+        ["wayfinder.tvlv.cert.mesh_id", "wayfinder.tvlv.originator_sig"],
     )
-    assert result["wayfinder.batman.tvlv.cert.mesh_id"] == "0x00001234"
-    assert result["wayfinder.batman.tvlv.ogm_sig"] == ("22" * 64)
+    assert result["wayfinder.tvlv.cert.mesh_id"] == "0x00001234"
+    assert result["wayfinder.tvlv.originator_sig"] == ("22" * 64)
 
 
 # Expected decoded revocation fields for the synthetic revocation_record() above.
 EXPECTED_REVOKE_FIELDS = {
-    "wayfinder.batman.tvlv.type": "0x82",
-    "wayfinder.batman.tvlv.revoke.version": "1",
-    "wayfinder.batman.tvlv.revoke.mesh_id": "0x0000abcd",
-    "wayfinder.batman.tvlv.revoke.node_mac": "02:00:00:00:00:02",
-    "wayfinder.batman.tvlv.revoke.not_before": "500",
-    "wayfinder.batman.tvlv.revoke.not_after": "1000",
+    "wayfinder.tvlv.type": "0x82",
+    "wayfinder.tvlv.revoke.version": "1",
+    "wayfinder.tvlv.revoke.mesh_id": "0x0000abcd",
+    "wayfinder.tvlv.revoke.node_mac": "02:00:00:00:00:02",
+    "wayfinder.tvlv.revoke.not_before": "500",
+    "wayfinder.tvlv.revoke.not_after": "1000",
 }
 
 
@@ -205,8 +205,8 @@ def test_revoke_signature_decodes(dissect):
     """The revocation's 64-byte root signature surfaces verbatim."""
     sig = bytes(range(64, 128))
     frame = ogm_frame(tvlv=tvlv(WF_TVLV_REVOKE, revocation_record(signature=sig)))
-    result = dissect(frame, ["wayfinder.batman.tvlv.revoke.signature"])
-    assert result["wayfinder.batman.tvlv.revoke.signature"] == sig.hex()
+    result = dissect(frame, ["wayfinder.tvlv.revoke.signature"])
+    assert result["wayfinder.tvlv.revoke.signature"] == sig.hex()
 
 
 def test_certfp_tvlv_decodes(dissect):
@@ -216,10 +216,10 @@ def test_certfp_tvlv_decodes(dissect):
     frame = ogm_frame(tvlv=tvlv(WF_TVLV_CERTFP, fp))
     result = dissect(
         frame,
-        ["wayfinder.batman.tvlv.type", "wayfinder.batman.tvlv.cert_fp"],
+        ["wayfinder.tvlv.type", "wayfinder.tvlv.cert_fp"],
     )
-    assert result["wayfinder.batman.tvlv.type"] == "0x83"
-    assert result["wayfinder.batman.tvlv.cert_fp"] == fp.hex()
+    assert result["wayfinder.tvlv.type"] == "0x83"
+    assert result["wayfinder.tvlv.cert_fp"] == fp.hex()
 
 
 def test_walk_handles_cert_sig_then_revoke(dissect):
@@ -236,10 +236,10 @@ def test_walk_handles_cert_sig_then_revoke(dissect):
     # record rather than stalling on the first.
     result = dissect(
         frame,
-        ["wayfinder.batman.tvlv.cert.mesh_id", "wayfinder.batman.tvlv.revoke.node_mac"],
+        ["wayfinder.tvlv.cert.mesh_id", "wayfinder.tvlv.revoke.node_mac"],
     )
-    assert result["wayfinder.batman.tvlv.cert.mesh_id"] == "0x00001234"
+    assert result["wayfinder.tvlv.cert.mesh_id"] == "0x00001234"
     assert (
-        result["wayfinder.batman.tvlv.revoke.node_mac"]
+        result["wayfinder.tvlv.revoke.node_mac"]
         == "02:00:00:00:00:01,02:00:00:00:00:02"
     )

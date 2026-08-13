@@ -80,23 +80,23 @@ def cert_reply_frame(*, dest: bytes = NODE2, cert: bytes | None = None) -> bytes
 
 def test_cert_req_packet_type_labelled(dissect):
     """A CertReq's packet type decodes to its known value."""
-    result = dissect(cert_req_frame(), ["wayfinder.batman.type"])
-    assert result["wayfinder.batman.type"] == "0x05"
+    result = dissect(cert_req_frame(), ["wayfinder.type"])
+    assert result["wayfinder.type"] == "0x05"
 
 
 def test_cert_reply_packet_type_labelled(dissect):
     """A CertReply's packet type decodes to its known value."""
-    result = dissect(cert_reply_frame(), ["wayfinder.batman.type"])
-    assert result["wayfinder.batman.type"] == "0x06"
+    result = dissect(cert_reply_frame(), ["wayfinder.type"])
+    assert result["wayfinder.type"] == "0x06"
 
 
 # field name -> expected decoded value for a CertReq addressed to NODE1,
 # carrying a requester cert for NODE2.
 EXPECTED_CERT_REQ_FIELDS = {
-    "wayfinder.batman.cert_ctrl.ttl": "50",
-    "wayfinder.batman.cert_ctrl.dest": "02:00:00:00:00:01",
-    "wayfinder.batman.tvlv.cert.node_mac": "02:00:00:00:00:02",
-    "wayfinder.batman.tvlv.cert.mesh_id": "0x0000abcd",
+    "wayfinder.cert_ctrl.ttl": "50",
+    "wayfinder.cert_ctrl.dest": "02:00:00:00:00:01",
+    "wayfinder.tvlv.cert.node_mac": "02:00:00:00:00:02",
+    "wayfinder.tvlv.cert.mesh_id": "0x0000abcd",
 }
 
 
@@ -112,17 +112,17 @@ def test_cert_req_signature_decodes(dissect):
     cert surfaces verbatim."""
     sig = bytes(range(64))
     frame = cert_req_frame(signature=sig)
-    result = dissect(frame, ["wayfinder.batman.cert_req.signature"])
-    assert result["wayfinder.batman.cert_req.signature"] == sig.hex()
+    result = dissect(frame, ["wayfinder.cert_req.signature"])
+    assert result["wayfinder.cert_req.signature"] == sig.hex()
 
 
 # field name -> expected decoded value for a CertReply addressed to NODE2,
 # carrying NODE2's own cert.
 EXPECTED_CERT_REPLY_FIELDS = {
-    "wayfinder.batman.cert_ctrl.ttl": "50",
-    "wayfinder.batman.cert_ctrl.dest": "02:00:00:00:00:02",
-    "wayfinder.batman.tvlv.cert.node_mac": "02:00:00:00:00:02",
-    "wayfinder.batman.tvlv.cert.mesh_id": "0x0000abcd",
+    "wayfinder.cert_ctrl.ttl": "50",
+    "wayfinder.cert_ctrl.dest": "02:00:00:00:00:02",
+    "wayfinder.tvlv.cert.node_mac": "02:00:00:00:00:02",
+    "wayfinder.tvlv.cert.mesh_id": "0x0000abcd",
 }
 
 
@@ -140,5 +140,5 @@ def test_cert_req_truncated_body_does_not_crash(dissect):
     dest = NODE1
     body = cert_ctrl_header(PKT_CERT_REQ, dest=dest) + b"\x00" * 10
     frame = ethernet(dest, NODE2, ETH_P_BATMAN, body)
-    result = dissect(frame, ["wayfinder.batman.cert_ctrl.dest"])
-    assert result["wayfinder.batman.cert_ctrl.dest"] == "02:00:00:00:00:01"
+    result = dissect(frame, ["wayfinder.cert_ctrl.dest"])
+    assert result["wayfinder.cert_ctrl.dest"] == "02:00:00:00:00:01"

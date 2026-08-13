@@ -2,31 +2,64 @@
 --
 -- A Wayfinder LinkFrame is byte-identical to an Ethernet frame
 -- ([dst][src][ethertype][payload]), so Wireshark's built-in `eth` dissector
--- parses the dst/src/type for us. We register on the `ethertype` table for
--- 0x4305 (ETH_P_BATMAN) and dissect the BATMAN body that `eth` hands us.
+-- parses the dst/src/type for us. We register on the `ethertype` table and
+-- dissect the BATMAN body that `eth` hands us.
+--
+-- Two EtherTypes reach a capture, because a raw-L2 carrier separates the wire
+-- *transport label* from the *mesh protocol* (libs/wayfinder-driver/src/raw.rs).
+-- Both are claimed, so a capture decodes whichever the deployment produced:
+--
+--   * 0x4305 (ETH_P_BATMAN) — the mesh protocol a LinkFrame's `protocol` field
+--     carries, and what a carrier with no wire/mesh split (TAP, UDP) puts on
+--     the wire. Always registered; it identifies the protocol itself.
+--   * the *carrier* EtherType — what an AF_PACKET raw-L2 socket or the nRF's
+--     CDC-NCM USB link actually stamps, so co-located meshes stay apart. The
+--     receiver retags it back to 0x4305 in place, so only a capture ever sees
+--     it. 0xfafa is this repo's default (`MESH_ETHERTYPE` in
+--     libs/wayfinder-nrf/src/usb_link.rs, `ethertype:` in containers/node.yml),
+--     but it is a per-deployment choice — override it with the
+--     `wayfinder.carrier_ethertype` preference when yours differs:
+--       tshark -o wayfinder.carrier_ethertype:0x88b5 ...
+--     Set it empty to claim only 0x4305.
 --
 -- Decodes the BatmanOgmPacket fixed header (see libs/batman/src/wire.rs) and
 -- walks the TVLV tail into individual records: multicast membership, the
--- Wayfinder membership certificate (WF_TVLV_CERT), the OGM signature
--- (WF_TVLV_OGM_SIG), flooded revocations (WF_TVLV_REVOKE), and the lazy-cert-
--- distribution fingerprint (WF_TVLV_CERTFP) that replaces WF_TVLV_CERT on the
--- wire once fingerprinting is enabled.  The whole tail is also shown as a raw
--- byte blob.  Also decodes the lazy-cert-distribution control packets
--- (BatmanPacketType::CertReq / CertReply): their shared header plus the
--- requester's cert + signature, or the replied cert.
+-- Wayfinder membership certificate (WF_TVLV_CERT), the originator signature
+-- (WF_TVLV_ORIGINATOR_SIG), flooded revocations (WF_TVLV_REVOKE), and the
+-- lazy-cert-distribution fingerprint (WF_TVLV_CERTFP) that replaces
+-- WF_TVLV_CERT on the wire once fingerprinting is enabled.  The whole tail is
+-- also shown as a raw byte blob.  Also decodes the lazy-cert-distribution
+-- control packets (BatmanPacketType::CertReq / CertReply): their shared
+-- header plus the requester's cert + signature, or the replied cert.
 --
--- Install: copy (or symlink) this file into your Personal Lua Plugins folder
---   (Help -> About -> Folders, e.g. ~/.local/lib/wireshark/plugins), or load it
---   ad hoc with:  tshark -X lua_script:wayfinder.lua ...
+-- Install one of two ways — not both, or the second load fails with "there
+-- cannot be two protocols with the same description" (non-fatal: the first copy
+-- still dissects, but the error is noise):
+--
+--   * Persistently, by symlinking this file into your Personal Lua Plugins
+--     folder — `tshark -G folders` prints its path, and Wireshark also scans a
+--     per-version subdirectory under it:
+--       ln -s "$PWD/wayfinder.lua" ~/.local/lib/wireshark/plugins/4.6/
+--   * Ad hoc, for a one-off capture:  tshark -X lua_script:wayfinder.lua ...
+--
+-- Capturing live needs CAP_NET_RAW on `dumpcap`, which a read-only Nix store
+-- can't be granted with `setcap`; on NixOS set `programs.wireshark.enable =
+-- true` (installs a setcap wrapper and a `wireshark` group to join). Reading a
+-- pcap needs no privilege at all.
 
+-- The mesh protocol itself (libs/batman/src/wire.rs's ETH_P_BATMAN).
 local ETH_P_BATMAN = 0x4305
 
+-- Default wire transport label for the raw-L2 / CDC-NCM carriers; overridable
+-- via the `wayfinder.carrier_ethertype` preference. See the module header.
+local DEFAULT_CARRIER_ETHERTYPE = 0xfafa
+
 -- BATMAN packet_type byte values (libs/batman/src/wire.rs's BatmanPacketType).
-local PKT_OGM = 0x01
+local PKT_ORIGINATOR = 0x01
 local PKT_CERT_REQ = 0x05
 local PKT_CERT_REPLY = 0x06
 local PACKET_TYPES = {
-	[0x01] = "OGM",
+	[PKT_ORIGINATOR] = "Originator",
 	[0x02] = "Broadcast",
 	[0x03] = "Unicast",
 	[0x04] = "Multicast",
@@ -34,16 +67,16 @@ local PACKET_TYPES = {
 	[PKT_CERT_REPLY] = "Cert Reply",
 }
 
--- TVLV record type bytes carried in an OGM tail (libs/batman/src/wire.rs).
+-- TVLV record type bytes carried in an Originator packet's tail (libs/batman/src/wire.rs).
 local BATADV_TVLV_MCAST = 0x06
 local WF_TVLV_CERT = 0x80
-local WF_TVLV_OGM_SIG = 0x81
+local WF_TVLV_ORIGINATOR_SIG = 0x81
 local WF_TVLV_REVOKE = 0x82
 local WF_TVLV_CERTFP = 0x83
 local TVLV_TYPES = {
 	[BATADV_TVLV_MCAST] = "Multicast Membership",
 	[WF_TVLV_CERT] = "Membership Certificate",
-	[WF_TVLV_OGM_SIG] = "OGM Signature",
+	[WF_TVLV_ORIGINATOR_SIG] = "Originator Signature",
 	[WF_TVLV_REVOKE] = "Revocation",
 	[WF_TVLV_CERTFP] = "Cert Fingerprint",
 }
@@ -54,72 +87,76 @@ local SIG_LEN = 64
 
 local wayfinder = Proto("wayfinder", "Wayfinder Mesh Protocol")
 
--- Header fields. Abbrevs mirror the Rust field names so display filters read
--- the same as the wire struct (e.g. `wayfinder.batman.ogm.seqno`).
+-- Header fields. Filter names describe what each field does rather than the
+-- BATMAN wire terminology — e.g. `wayfinder.originator.seqno`, not
+-- `wayfinder.batman.ogm.seqno` — even though the underlying Rust struct is
+-- still `BatmanOgmPacket` (libs/batman/src/wire.rs). Outward-facing BATMAN
+-- references are being phased out incrementally.
 local f = wayfinder.fields
-f.packet_type = ProtoField.uint8("wayfinder.batman.type", "Packet Type", base.HEX, PACKET_TYPES)
-f.version = ProtoField.uint8("wayfinder.batman.version", "Version", base.DEC)
-f.ttl = ProtoField.uint8("wayfinder.batman.ttl", "TTL", base.DEC)
-f.flags = ProtoField.uint8("wayfinder.batman.ogm.flags", "Flags", base.HEX)
-f.seqno = ProtoField.uint32("wayfinder.batman.ogm.seqno", "Sequence Number", base.DEC)
-f.orig = ProtoField.ether("wayfinder.batman.ogm.orig", "Originator")
-f.reserved = ProtoField.uint8("wayfinder.batman.ogm.reserved", "Reserved", base.HEX)
-f.tq = ProtoField.uint8("wayfinder.batman.ogm.tq", "Transmission Quality", base.DEC)
-f.tvlv_len = ProtoField.uint16("wayfinder.batman.ogm.tvlv_len", "TVLV Length", base.DEC)
-f.tvlv = ProtoField.bytes("wayfinder.batman.ogm.tvlv", "TVLV Data")
+f.packet_type = ProtoField.uint8("wayfinder.type", "Packet Type", base.HEX, PACKET_TYPES)
+f.version = ProtoField.uint8("wayfinder.version", "Version", base.DEC)
+f.ttl = ProtoField.uint8("wayfinder.ttl", "TTL", base.DEC)
+f.flags = ProtoField.uint8("wayfinder.originator.flags", "Flags", base.HEX)
+f.seqno = ProtoField.uint32("wayfinder.originator.seqno", "Sequence Number", base.DEC)
+f.orig = ProtoField.ether("wayfinder.originator.addr", "Originator Address")
+f.reserved = ProtoField.uint8("wayfinder.originator.reserved", "Reserved", base.HEX)
+f.tq = ProtoField.uint8("wayfinder.originator.tq", "Transmission Quality", base.DEC)
+f.tvlv_len = ProtoField.uint16("wayfinder.originator.tvlv_len", "TVLV Length", base.DEC)
+f.tvlv = ProtoField.bytes("wayfinder.originator.tvlv", "TVLV Data")
 
 -- Per-record TVLV fields (the tail walked into individual records).
-f.tvlv_record = ProtoField.bytes("wayfinder.batman.tvlv.record", "TVLV Record")
-f.tvlv_type = ProtoField.uint8("wayfinder.batman.tvlv.type", "TVLV Type", base.HEX, TVLV_TYPES)
-f.tvlv_ver = ProtoField.uint8("wayfinder.batman.tvlv.version", "TVLV Version", base.DEC)
-f.tvlv_vlen = ProtoField.uint16("wayfinder.batman.tvlv.len", "TVLV Value Length", base.DEC)
-f.tvlv_value = ProtoField.bytes("wayfinder.batman.tvlv.value", "TVLV Value")
+f.tvlv_record = ProtoField.bytes("wayfinder.tvlv.record", "TVLV Record")
+f.tvlv_type = ProtoField.uint8("wayfinder.tvlv.type", "TVLV Type", base.HEX, TVLV_TYPES)
+f.tvlv_ver = ProtoField.uint8("wayfinder.tvlv.version", "TVLV Version", base.DEC)
+f.tvlv_vlen = ProtoField.uint16("wayfinder.tvlv.len", "TVLV Value Length", base.DEC)
+f.tvlv_value = ProtoField.bytes("wayfinder.tvlv.value", "TVLV Value")
 
 -- Multicast membership announcement: a back-to-back list of group MACs.
-f.mcast_group = ProtoField.ether("wayfinder.batman.tvlv.mcast_group", "Multicast Group")
+f.mcast_group = ProtoField.ether("wayfinder.tvlv.mcast_group", "Multicast Group")
 
 -- Membership certificate fields (wayfinder_auth::MembershipCert; see
 -- libs/wayfinder-auth/src/cert.rs).
-f.cert_version = ProtoField.uint8("wayfinder.batman.tvlv.cert.version", "Cert Version", base.DEC)
-f.cert_mesh = ProtoField.uint32("wayfinder.batman.tvlv.cert.mesh_id", "Mesh ID", base.HEX)
-f.cert_mac = ProtoField.ether("wayfinder.batman.tvlv.cert.node_mac", "Node MAC")
-f.cert_ed = ProtoField.bytes("wayfinder.batman.tvlv.cert.ed_pubkey", "Ed25519 Public Key")
-f.cert_x = ProtoField.bytes("wayfinder.batman.tvlv.cert.x_pubkey", "X25519 Public Key")
-f.cert_nb = ProtoField.uint64("wayfinder.batman.tvlv.cert.not_before", "Not Before", base.DEC)
-f.cert_na = ProtoField.uint64("wayfinder.batman.tvlv.cert.not_after", "Not After", base.DEC)
-f.cert_sig = ProtoField.bytes("wayfinder.batman.tvlv.cert.signature", "Root Signature")
+f.cert_version = ProtoField.uint8("wayfinder.tvlv.cert.version", "Cert Version", base.DEC)
+f.cert_mesh = ProtoField.uint32("wayfinder.tvlv.cert.mesh_id", "Mesh ID", base.HEX)
+f.cert_mac = ProtoField.ether("wayfinder.tvlv.cert.node_mac", "Node MAC")
+f.cert_ed = ProtoField.bytes("wayfinder.tvlv.cert.ed_pubkey", "Ed25519 Public Key")
+f.cert_x = ProtoField.bytes("wayfinder.tvlv.cert.x_pubkey", "X25519 Public Key")
+f.cert_nb = ProtoField.uint64("wayfinder.tvlv.cert.not_before", "Not Before", base.DEC)
+f.cert_na = ProtoField.uint64("wayfinder.tvlv.cert.not_after", "Not After", base.DEC)
+f.cert_sig = ProtoField.bytes("wayfinder.tvlv.cert.signature", "Root Signature")
 
--- The originator's Ed25519 signature over the OGM's immutable identity.
-f.ogm_sig = ProtoField.bytes("wayfinder.batman.tvlv.ogm_sig", "OGM Signature")
+-- The originator's Ed25519 signature over the packet's immutable identity.
+f.originator_sig = ProtoField.bytes("wayfinder.tvlv.originator_sig", "Originator Signature")
 
 -- Lazy-cert-distribution fingerprint: MembershipCert::fingerprint(), replacing
--- the full WF_TVLV_CERT record on the wire (libs/batman/src/wire.rs).
-f.cert_fp = ProtoField.bytes("wayfinder.batman.tvlv.cert_fp", "Cert Fingerprint")
+-- the full WF_TVLV_CERT record on the wire once fingerprinting is enabled
+-- (libs/batman/src/wire.rs).
+f.cert_fp = ProtoField.bytes("wayfinder.tvlv.cert_fp", "Cert Fingerprint")
 
 -- Shared header fields for the cert-control packets (BatmanPacketType::CertReq
 -- / CertReply): structurally a unicast header (version/ttl/dest).
-f.cert_ctrl_version = ProtoField.uint8("wayfinder.batman.cert_ctrl.version", "Version", base.DEC)
-f.cert_ctrl_ttl = ProtoField.uint8("wayfinder.batman.cert_ctrl.ttl", "TTL", base.DEC)
-f.cert_ctrl_dest = ProtoField.ether("wayfinder.batman.cert_ctrl.dest", "Destination")
+f.cert_ctrl_version = ProtoField.uint8("wayfinder.cert_ctrl.version", "Version", base.DEC)
+f.cert_ctrl_ttl = ProtoField.uint8("wayfinder.cert_ctrl.ttl", "TTL", base.DEC)
+f.cert_ctrl_dest = ProtoField.ether("wayfinder.cert_ctrl.dest", "Destination")
 
 -- The requester's self-authenticating Ed25519 signature following its cert in
 -- a BatmanPacketType::CertReq body (see OgmAuth::build_cert_request in
 -- libs/wayfinder/src/auth.rs).
-f.cert_req_sig = ProtoField.bytes("wayfinder.batman.cert_req.signature", "Requester Signature")
+f.cert_req_sig = ProtoField.bytes("wayfinder.cert_req.signature", "Requester Signature")
 
 -- Revocation record fields (wayfinder_auth::RevocationRecord; see
 -- libs/wayfinder-auth/src/revoke.rs).
-f.revoke_version = ProtoField.uint8("wayfinder.batman.tvlv.revoke.version", "Revoke Version", base.DEC)
-f.revoke_flags = ProtoField.uint8("wayfinder.batman.tvlv.revoke.flags", "Flags", base.HEX)
-f.revoke_mesh = ProtoField.uint32("wayfinder.batman.tvlv.revoke.mesh_id", "Mesh ID", base.HEX)
-f.revoke_mac = ProtoField.ether("wayfinder.batman.tvlv.revoke.node_mac", "Revoked Node MAC")
-f.revoke_nb = ProtoField.uint64("wayfinder.batman.tvlv.revoke.not_before", "Not Before", base.DEC)
-f.revoke_na = ProtoField.uint64("wayfinder.batman.tvlv.revoke.not_after", "Not After", base.DEC)
-f.revoke_sig = ProtoField.bytes("wayfinder.batman.tvlv.revoke.signature", "Root Signature")
+f.revoke_version = ProtoField.uint8("wayfinder.tvlv.revoke.version", "Revoke Version", base.DEC)
+f.revoke_flags = ProtoField.uint8("wayfinder.tvlv.revoke.flags", "Flags", base.HEX)
+f.revoke_mesh = ProtoField.uint32("wayfinder.tvlv.revoke.mesh_id", "Mesh ID", base.HEX)
+f.revoke_mac = ProtoField.ether("wayfinder.tvlv.revoke.node_mac", "Revoked Node MAC")
+f.revoke_nb = ProtoField.uint64("wayfinder.tvlv.revoke.not_before", "Not Before", base.DEC)
+f.revoke_na = ProtoField.uint64("wayfinder.tvlv.revoke.not_after", "Not After", base.DEC)
+f.revoke_sig = ProtoField.bytes("wayfinder.tvlv.revoke.signature", "Root Signature")
 
--- Offsets of the fixed BatmanOgmPacket fields within the BATMAN body. Kept in
--- sync with libs/batman/src/wire.rs.
-local OGM = {
+-- Offsets of the fixed BatmanOgmPacket fields (the wire form of an Originator
+-- packet) within the BATMAN body. Kept in sync with libs/batman/src/wire.rs.
+local ORIGINATOR = {
 	PACKET_TYPE = 0,
 	VERSION = 1,
 	TTL = 2,
@@ -241,8 +278,8 @@ local function walk_tvlv(tree, tvb, start, tvlv_len, cap_end)
 		if voff + vlen <= cap_end then
 			if ttype == WF_TVLV_CERT then
 				decode_cert(rec, tvb, voff, vlen, cap_end)
-			elseif ttype == WF_TVLV_OGM_SIG then
-				rec:add(f.ogm_sig, tvb(voff, vlen))
+			elseif ttype == WF_TVLV_ORIGINATOR_SIG then
+				rec:add(f.originator_sig, tvb(voff, vlen))
 			elseif ttype == WF_TVLV_REVOKE then
 				decode_revoke(rec, tvb, voff, vlen, cap_end)
 			elseif ttype == WF_TVLV_CERTFP then
@@ -273,12 +310,12 @@ function wayfinder.dissector(tvb, pinfo, root)
 
 	pinfo.cols.protocol = "Wayfinder"
 
-	local ptype = tvb(OGM.PACKET_TYPE, 1):uint()
+	local ptype = tvb(ORIGINATOR.PACKET_TYPE, 1):uint()
 	local label = PACKET_TYPES[ptype]
-	pinfo.cols.info = "BATMAN " .. (label or string.format("(unknown type 0x%02x)", ptype))
+	pinfo.cols.info = label or string.format("(unknown type 0x%02x)", ptype)
 
 	local tree = root:add(wayfinder, tvb(), "Wayfinder Mesh Protocol")
-	tree:add(f.packet_type, tvb(OGM.PACKET_TYPE, 1))
+	tree:add(f.packet_type, tvb(ORIGINATOR.PACKET_TYPE, 1))
 
 	-- Cert-control packets (CertReq/CertReply) get their own header/body
 	-- decode; Broadcast/Unicast/Multicast stop after the protocol/type are
@@ -294,34 +331,88 @@ function wayfinder.dissector(tvb, pinfo, root)
 		return len
 	end
 
-	if ptype ~= PKT_OGM or len < OGM.HEADER_LEN then
+	if ptype ~= PKT_ORIGINATOR or len < ORIGINATOR.HEADER_LEN then
 		return len
 	end
 
-	tree:add(f.version, tvb(OGM.VERSION, 1))
-	tree:add(f.ttl, tvb(OGM.TTL, 1))
-	tree:add(f.flags, tvb(OGM.FLAGS, 1))
-	tree:add(f.seqno, tvb(OGM.SEQNO, 4))
-	tree:add(f.orig, tvb(OGM.ORIG, 6))
-	tree:add(f.reserved, tvb(OGM.RESERVED, 1))
-	tree:add(f.tq, tvb(OGM.TQ, 1))
-	tree:add(f.tvlv_len, tvb(OGM.TVLV_LEN, 2))
+	tree:add(f.version, tvb(ORIGINATOR.VERSION, 1))
+	tree:add(f.ttl, tvb(ORIGINATOR.TTL, 1))
+	tree:add(f.flags, tvb(ORIGINATOR.FLAGS, 1))
+	tree:add(f.seqno, tvb(ORIGINATOR.SEQNO, 4))
+	tree:add(f.orig, tvb(ORIGINATOR.ORIG, 6))
+	tree:add(f.reserved, tvb(ORIGINATOR.RESERVED, 1))
+	tree:add(f.tq, tvb(ORIGINATOR.TQ, 1))
+	tree:add(f.tvlv_len, tvb(ORIGINATOR.TVLV_LEN, 2))
 
 	-- The TVLV tail (tvlv_len bytes) follows the fixed header. Show it raw, then
 	-- also walk it into individual records (cert / signature / multicast),
 	-- clamped to what the capture actually holds.
-	local tvlv_len = tvb(OGM.TVLV_LEN, 2):uint()
+	local tvlv_len = tvb(ORIGINATOR.TVLV_LEN, 2):uint()
 	if tvlv_len > 0 then
-		local avail = len - OGM.HEADER_LEN
+		local avail = len - ORIGINATOR.HEADER_LEN
 		local take = math.min(tvlv_len, avail)
 		if take > 0 then
-			tree:add(f.tvlv, tvb(OGM.HEADER_LEN, take))
-			walk_tvlv(tree, tvb, OGM.HEADER_LEN, tvlv_len, len)
+			tree:add(f.tvlv, tvb(ORIGINATOR.HEADER_LEN, take))
+			walk_tvlv(tree, tvb, ORIGINATOR.HEADER_LEN, tvlv_len, len)
 		end
 	end
 
 	return len
 end
 
--- Frames carrying a Wayfinder LinkFrame appear as Ethernet with type 0x4305.
-DissectorTable.get("ethertype"):add(ETH_P_BATMAN, wayfinder)
+-- Registration. The mesh protocol is claimed unconditionally; the configurable
+-- carrier label is claimed on top of it, and re-claimed whenever the preference
+-- changes.
+local ethertype_table = DissectorTable.get("ethertype")
+ethertype_table:add(ETH_P_BATMAN, wayfinder)
+
+-- The carrier EtherType currently registered, so a preference change can
+-- release it. Removing the stale entry is the half that's easy to forget: the
+-- dissector table is global state, so an add-only update would keep decoding an
+-- EtherType the operator has configured away.
+local registered_carrier = nil
+
+-- Apply `wayfinder.carrier_ethertype` to the dissector table.
+--
+-- The preference is a *string* rather than a `Pref.uint` so it accepts the hex
+-- spelling every other config in this repo uses (`Pref.uint` only takes
+-- decimal via `-o`, e.g. "0xfafa" itself would reject rather than parse).
+-- `tonumber` takes both spellings.
+--
+-- An empty value registers nothing extra, by design (see the pref's own help
+-- text). Anything non-empty that doesn't parse, is out of range, or collides
+-- with the mesh protocol itself is a misconfiguration, not "disabled" — warn
+-- so it isn't mistaken for the empty case.
+local function apply_carrier_pref()
+	local raw = wayfinder.prefs.carrier_ethertype
+	local wanted = tonumber(raw)
+	if raw ~= "" and (not wanted or wanted <= 0 or wanted > 0xffff or wanted == ETH_P_BATMAN) then
+		report_failure("wayfinder: ignoring invalid carrier_ethertype '" .. raw .. "'")
+		wanted = nil
+	end
+	if wanted == registered_carrier then
+		return
+	end
+	if registered_carrier then
+		ethertype_table:remove(registered_carrier, wayfinder)
+	end
+	if wanted then
+		ethertype_table:add(wanted, wayfinder)
+	end
+	registered_carrier = wanted
+end
+
+wayfinder.prefs.carrier_ethertype = Pref.string(
+	"Carrier EtherType",
+	string.format("0x%04x", DEFAULT_CARRIER_ETHERTYPE),
+	"EtherType the raw-L2 / USB carrier stamps on the wire, decimal or 0x-hex. "
+		.. "Empty to decode only the mesh protocol (0x4305)."
+)
+
+-- Wireshark calls this after preferences are read (including `-o`), and again
+-- on every later change.
+function wayfinder.prefs_changed()
+	apply_carrier_pref()
+end
+
+apply_carrier_pref()

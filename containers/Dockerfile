@@ -20,7 +20,14 @@
 # release compile of the workspace is drastically slower than cross-compiling
 # it natively. The final stages need no emulation either, since they contain
 # no RUN steps (distroless has no shell to run one in) — just COPY from
-# `builder` and a multi-arch base image, both resolved per-platform by buildx.
+# `builder`, from `runtime-libs`, and a multi-arch base image, all resolved
+# per-platform by buildx.
+#
+# That "no RUN in a final stage" rule is not a style preference: CI's
+# `deploy` job sets up no binfmt/QEMU handler at all, so a RUN in a
+# distroless stage fails twice over — no shell to exec, and for the foreign
+# arch, no emulator to exec it under. Anything a runtime image needs beyond its
+# binary is *built* in a $BUILDPLATFORM stage and COPYed in; see `runtime-libs`.
 #
 # Build a single-platform image locally (uses your host's native arch):
 #
@@ -197,15 +204,74 @@ COPY bins ./bins
 RUN cargo leptos build --release --frontend-only
 
 # ---------------------------------------------------------------------------
+# Runtime libs stage: the shared libraries a distroless runtime image lacks.
+# ---------------------------------------------------------------------------
+#
+# `libs/blue`'s host backend (`StdBleLink`) reaches BlueZ over D-Bus through
+# `bluer`, which links `libdbus-1.so.3` dynamically — and distroless/cc ships
+# only libc/libgcc/libstdc++/libssl, so a `tap` image without this stage builds
+# fine and then dies at exec with a "libdbus-1.so.3: cannot open shared object
+# file" from the dynamic loader, before `main` ever runs.
+#
+# The libraries cannot simply be apt-installed in the `tap` stage: distroless
+# has no shell or apt, and CI enables no QEMU for the foreign arch (see the
+# header). So they are *unpacked* here instead — `dpkg-deb -x` only writes
+# files, it never executes a target-arch binary, which is what lets one
+# $BUILDPLATFORM-native stage produce a rootfs for either TARGETARCH.
+#
+# Pinned to bookworm to match both the builder and the distroless runtime base
+# (debian12 == bookworm), so these .so's link against the libc already in the
+# image rather than a newer one.
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS runtime-libs
+
+ARG TARGETARCH
+
+RUN dpkg --add-architecture "$TARGETARCH" \
+    && apt-get update \
+    && mkdir -p /debs /rootfs \
+    && cd /debs \
+    && apt-get download \
+        libdbus-1-3:"$TARGETARCH" \
+        libsystemd0:"$TARGETARCH" \
+        libcap2:"$TARGETARCH" \
+        libgcrypt20:"$TARGETARCH" \
+        libgpg-error0:"$TARGETARCH" \
+        liblz4-1:"$TARGETARCH" \
+        liblzma5:"$TARGETARCH" \
+        libzstd1:"$TARGETARCH" \
+    && for deb in *.deb; do dpkg-deb -x "$deb" /rootfs || exit 1; done \
+    && rm -rf /debs /var/lib/apt/lists/* \
+    && for lib in libdbus-1.so.3 libsystemd.so.0 libcap.so.2 libgcrypt.so.20 \
+        libgpg-error.so.0 liblz4.so.1 liblzma.so.5 libzstd.so.1; do \
+        find /rootfs -name "$lib" | grep -q . || { echo "missing $lib" >&2; exit 1; }; \
+    done
+
+# ---------------------------------------------------------------------------
 # wayfinder-tap: bridges a TAP device onto the mesh.
 # ---------------------------------------------------------------------------
 #
 # Needs NET_ADMIN (+ /dev/net/tun) to create the kernel TAP device and NET_RAW
 # for AF_PACKET RawL2 sockets at runtime — granted by the caller (compose / run
 # flags), not baked into the image.
+#
+# A `Ble` link needs one thing more, and it is a *mount*, not a capability: the
+# host's D-Bus system bus socket, bind-mounted at /run/dbus/system_bus_socket.
+# BlueZ is not a library the image could carry — it is `bluetoothd` on the host,
+# owning the adapter and reachable only as `org.bluez` on that bus. Running a
+# dbus-daemon inside the container instead would come up perfectly and serve an
+# empty bus that no BlueZ has ever connected to, so every `Session::new()` would
+# fail with a NameHasNoOwner for org.bluez. The container also has to share the
+# host's network namespace, since HCI sockets are per-netns; docker-compose.yml
+# does both.
 FROM gcr.io/distroless/cc-debian12 AS tap
 
 COPY --from=builder /out/wayfinder-tap /usr/local/bin/wayfinder-tap
+
+# The libdbus runtime closure `blue`'s BlueZ backend needs, which the distroless
+# base does not ship. Copied wholesale from `runtime-libs` (see there for why it
+# is assembled in a separate stage rather than installed here, and for what the
+# container still needs mounted in at *run* time to reach BlueZ at all).
+COPY --from=runtime-libs /rootfs/ /
 
 ENTRYPOINT ["/usr/local/bin/wayfinder-tap"]
 

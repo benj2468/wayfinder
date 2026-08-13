@@ -1,0 +1,46 @@
+# Node configuration for the docker-compose deployment (see ../docker-compose.yml).
+#
+# One unauthenticated node: a kernel TAP for local egress, one raw-L2 mesh link
+# on a host NIC, and the TLS management API the web dashboard talks to.
+local_egress:
+  type: Tap
+  device_name: wayfinder0
+server:
+  # Authenticated, encrypted management API. With no `auth:` block below, the
+  # node generates and persists a TLS identity seed at
+  # /var/lib/wayfinder/identity.seed on first boot; the dashboard container
+  # mounts that same volume and presents that key to bootstrap in (the node is
+  # un-enrolled, so proving the node's own key is what grants access).
+  #
+  # Binds to all interfaces. ../docker-compose.yml runs this under
+  # `network_mode: host` (needed for the raw-L2 link's AF_PACKET socket to see
+  # a real host NIC), so the node's own loopback is already the host's and
+  # reachable from the `web` container too — 0.0.0.0 here is belt-and-braces,
+  # not load-bearing for that specific deployment.
+  type: Tls
+  addr: 0.0.0.0:7700
+links:
+  # One raw-L2 mesh link (AF_PACKET, needs the container's NET_RAW cap — see
+  # ../docker-compose.yml). `network_mode: host` there means `interface` names
+  # a NIC on the *host*, not a compose-internal bridge, so replace
+  # `enp10s0u3u1i2` (this repo author's own USB-Ethernet adapter's
+  # predictable name — `ip link` on your host to find yours) before use.
+  # Peers are learned from the OGMs they broadcast on that NIC — nothing is
+  # configured per peer — so pointing a second node at the same physical
+  # network is all it takes to grow the mesh.
+  - type: RawL2
+    interface: enp10s0u3u1i2
+    ethertype: 0xfafa
+
+# A BLE advertising link, which is what makes this node able to front a
+# terminal mesh of nRF52840s. Commented out because it has a host
+# prerequisite the others don't: `bluetoothd` running on the host, reachable
+# over the D-Bus system bus socket that ../docker-compose.yml bind-mounts in.
+# The container speaks to *that* BlueZ — it runs no Bluetooth daemon of its
+# own — so enabling this line on a host with no bluetoothd fails the link at
+# startup, not at build time.
+#
+# `adapter` is omitted to take the default controller, the right choice on a
+# host with one; name it (`adapter: hci0`) if there are several.
+# - type: Ble
+#   advertise_dwell_ms: 150
