@@ -138,8 +138,14 @@ impl Driver {
     /// participation ([`LinkFeatures::default`]) for any interface `features`
     /// doesn't cover. `features[idx].tx_keepalive` additionally arms that
     /// interface's fixed-cadence keep-alive schedule, left unarmed (`None`)
-    /// by default.
-    pub fn new(mac: Mac, trickle: &[TrickleConfig], features: &[LinkFeatures]) -> Self {
+    /// by default. `names[idx]` labels the interface for the management API,
+    /// leaving it unnamed when absent.
+    pub fn new(
+        mac: Mac,
+        trickle: &[TrickleConfig],
+        features: &[LinkFeatures],
+        names: &[&str],
+    ) -> Self {
         let n = trickle.len();
         debug_assert!(
             n <= MAX_INTERFACES,
@@ -150,6 +156,9 @@ impl Driver {
             router.configure_interface_ogm(idx, cfg.i_min(), cfg.i_max(), Duration::ZERO);
             let link_features = features.get(idx).copied().unwrap_or_default();
             router.set_link_features(idx, link_features);
+            if let Some(name) = names.get(idx) {
+                router.set_interface_name(idx, name);
+            }
             // Keep-alive rides on the same per-link `features` entry (no
             // separate constructor parameter) — its `tx_keepalive` supplies
             // the schedule, `None` leaving that interface's timer unarmed.
@@ -404,7 +413,7 @@ mod tests {
     #[test]
     fn tick_emits_due_ogm_into_its_interface_egress_queue() {
         let trickle = [TrickleConfig::default()];
-        let mut driver = Driver::new(mac(1), &trickle, &[]);
+        let mut driver = Driver::new(mac(1), &trickle, &[], &[]);
 
         // Advance to whenever interface 0 first becomes due (Trickle jitters
         // the exact instant), so the test doesn't hard-code the schedule.
@@ -441,7 +450,7 @@ mod tests {
     #[test]
     fn tick_reforwards_received_ogm_with_split_horizon() {
         let trickle = [TrickleConfig::default(), TrickleConfig::default()];
-        let mut driver = Driver::new(mac(1), &trickle, &[]);
+        let mut driver = Driver::new(mac(1), &trickle, &[], &[]);
 
         let ogm = bare_ogm_bytes(mac(2), 1, 50);
         let wire = frame_bytes(Mac::BROADCAST, mac(2), DEFAULT_BATMAN_ETHER_TYPE, &ogm);
@@ -472,7 +481,7 @@ mod tests {
     #[test]
     fn queue_local_send_stages_a_unicast_on_its_resolved_egress_interface() {
         let trickle = [TrickleConfig::default()];
-        let mut driver = Driver::new(mac(1), &trickle, &[]);
+        let mut driver = Driver::new(mac(1), &trickle, &[], &[]);
 
         // Teach the router about a neighbor on interface 0 by feeding it a
         // real OGM, so `get_egress_interface` has a route to resolve.
@@ -507,7 +516,7 @@ mod tests {
             tx_keepalive: Some(wayfinder::features::KeepAliveConfig { interval_ms: 1000 }),
             ..Default::default()
         }];
-        let mut driver = Driver::new(mac(1), &trickle, &features);
+        let mut driver = Driver::new(mac(1), &trickle, &features, &[]);
 
         let mut now = Duration::ZERO;
         while driver.router().due_keepalive_interface(now).is_none()
@@ -540,7 +549,7 @@ mod tests {
     #[test]
     fn tick_never_emits_keepalive_when_unconfigured() {
         let trickle = [TrickleConfig::default()];
-        let mut driver = Driver::new(mac(1), &trickle, &[]);
+        let mut driver = Driver::new(mac(1), &trickle, &[], &[]);
 
         driver.tick(Duration::from_secs(1_000));
         // Drain whatever OGM(s) landed; only a keep-alive would be a bug here.
@@ -563,8 +572,8 @@ mod tests {
             i_min_ms: 50,
             i_max_ms: 500,
         }];
-        let mut a = Driver::new(mac(1), &trickle, &[]);
-        let mut b = Driver::new(mac(2), &trickle, &[]);
+        let mut a = Driver::new(mac(1), &trickle, &[], &[]);
+        let mut b = Driver::new(mac(2), &trickle, &[], &[]);
 
         let mut now = Duration::ZERO;
         for _ in 0..200 {
@@ -599,7 +608,7 @@ mod tests {
     #[test]
     fn schedules_can_be_driven_independently() {
         let trickle = TrickleConfig::default();
-        let mut driver = Driver::new(mac(1), &[trickle], &[]);
+        let mut driver = Driver::new(mac(1), &[trickle], &[], &[]);
         driver.router_mut().configure_interface_keepalive(
             0,
             Some(Duration::from_millis(150)),
@@ -659,7 +668,7 @@ mod tests {
         let kp = wayfinder_auth::Keypair::from_seed(&[2; 32]);
         let cert = authority.issue_cert(mac(1), kp.ed_pubkey(), kp.x_pubkey(), 0, 1_000_000);
 
-        let mut driver = Driver::new(mac(1), &[TrickleConfig::default()], &[]);
+        let mut driver = Driver::new(mac(1), &[TrickleConfig::default()], &[], &[]);
         driver.router_mut().set_auth(wayfinder::auth::OgmAuth::new(
             kp,
             cert,

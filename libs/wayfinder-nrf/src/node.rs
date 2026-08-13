@@ -101,6 +101,18 @@ const TRICKLE: [TrickleParams; 3] = {
     t
 };
 
+/// Per-link display names, positionally matched to [`Links`] via
+/// [`LORA`]/[`BLE`]/[`USB`]. Without these the management API reports a board's
+/// three interfaces as `0`/`1`/`2`, which tells an operator staring at the TUI
+/// nothing about which radio a row describes.
+const NAMES: [&str; 3] = {
+    let mut n = [""; 3];
+    n[LORA] = "lora";
+    n[BLE] = "ble";
+    n[USB] = "usb";
+    n
+};
+
 /// Per-link feature matrix, positionally matched to [`Links`] via
 /// [`LORA`]/[`BLE`]/[`USB`]. A function rather than a `const` because
 /// [`LinkFeatures`]'s defaults are not const.
@@ -252,7 +264,7 @@ where
     // Built at this board's capacities rather than the host defaults; the link
     // and clock types are inferred, only the profile is pinned.
     let mut driver: wayfinder_embedded_driver::driver_for!(_, _, 3, crate::nrf52840) =
-        Driver::with_capacities(node_mac, links, EmbassyClock, &TRICKLE, &features());
+        Driver::with_capacities(node_mac, links, EmbassyClock, &TRICKLE, &features(), &NAMES);
 
     led.set_low();
     // Every deterministic bring-up failure is behind us; from here a fault is a

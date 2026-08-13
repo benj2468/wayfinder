@@ -52,7 +52,7 @@ pub fn LinkQuality() -> impl IntoView {
                                 <thead>
                                     <tr>
                                         <th>"Neighbour"</th>
-                                        <th class="wf-num">"Interface"</th>
+                                        <th>"Interface"</th>
                                         <th>"Quality"</th>
                                         <th class="wf-num">"Samples"</th>
                                     </tr>
@@ -64,7 +64,7 @@ pub fn LinkQuality() -> impl IntoView {
                                             view! {
                                                 <tr>
                                                     <td class="wf-mono">{format::id(&e.neighbor_id)}</td>
-                                                    <td class="wf-num">{e.iface_idx}</td>
+                                                    <td>{format::iface_label(&e.iface_name, e.iface_idx)}</td>
                                                     <td>
                                                         <QualityBar
                                                             percent=format::tq_percent(e.ewma_quality)

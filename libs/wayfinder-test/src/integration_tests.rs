@@ -291,6 +291,7 @@ fn line_of_three_mid_gated(mid_far_link: LinkFeatures) -> TestHarness {
             links: vec![
                 LinkConfig::test("switch1"),
                 LinkConfig {
+                    name: None,
                     transport: LinkTransport::Test {
                         switch_name: "switch2".into(),
                     },
@@ -366,6 +367,7 @@ fn diamond(i_max_ms: u64) -> TestHarness {
             links: links
                 .iter()
                 .map(|s| LinkConfig {
+                    name: None,
                     transport: LinkTransport::Test {
                         switch_name: (*s).into(),
                     },
@@ -2057,6 +2059,7 @@ fn real_keepalive_tick_switches_route_when_it_stops() {
         config.switches.push(TestSwitchConfig { name: name.into() });
     }
     let link = |switch_name: &str| LinkConfig {
+        name: None,
         transport: LinkTransport::Test {
             switch_name: switch_name.into(),
         },
@@ -2206,6 +2209,7 @@ fn diamond_plus_k5(i_max_ms: u64) -> TestHarness {
             .iter()
             .filter(|(a, b)| a == node || b == node)
             .map(|(a, b)| LinkConfig {
+                name: None,
                 transport: LinkTransport::Test {
                     switch_name: format!("{a}_{b}"),
                 },

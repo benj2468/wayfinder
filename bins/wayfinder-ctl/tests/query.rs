@@ -69,6 +69,7 @@ impl WayfinderDataProvider for Mock {
             tx_data: true,
             rx_data: true,
             tx_keepalive_interval_ms: Some(3000),
+            iface_name: "lora0".into(),
         }]
     }
     fn keepalive_table(&self) -> Vec<KeepAliveEntryData> {

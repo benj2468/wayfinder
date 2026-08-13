@@ -231,6 +231,18 @@ pub fn level_class(level: i32) -> &'static str {
     }
 }
 
+/// How an interface is labelled in the dashboard: its configured name when the
+/// node reported one, else `#idx`. Interfaces are still *addressed* by index
+/// over the management API — the name is display metadata — so the fallback
+/// keeps an unnamed interface identifiable rather than blank.
+pub fn iface_label(iface_name: &str, iface_idx: u32) -> String {
+    if iface_name.is_empty() {
+        format!("#{iface_idx}")
+    } else {
+        iface_name.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,7 +256,16 @@ mod tests {
             tx_data,
             rx_data,
             tx_keepalive_interval_ms: None,
+            iface_name: String::new(),
         }
+    }
+
+    /// A named interface is labelled by its name; an unnamed one falls back to
+    /// a `#`-prefixed index so the cell is never blank.
+    #[test]
+    fn iface_label_prefers_the_name_and_falls_back_to_the_index() {
+        assert_eq!(iface_label("lora-roof", 3), "lora-roof");
+        assert_eq!(iface_label("", 3), "#3");
     }
 
     #[test]

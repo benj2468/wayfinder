@@ -13,11 +13,16 @@ server:
   type: Tls
   addr: 0.0.0.0:7700
 links:
+  # `name` is what the TUI, web dashboard and `wayfinderctl` label this
+  # interface with. Omit it and the node falls back to the transport kind plus
+  # the link's position in this list (`ble0`, `rawl21`).
   - type: Ble
+    name: ble-local
     advertise_dwell_ms: 250
     ogm:
       i_max_ms: 20000
   - type: RawL2
+    name: tailscale
     interface: tailscale0
     # Wire EtherType for this mesh's frames — a free-choice transport label the
     # AF_PACKET socket binds/filters on. Decoupled from the router's mesh

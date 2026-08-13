@@ -144,10 +144,11 @@ pub struct Driver<Local: FrameIo> {
 impl<Local: FrameIo> Driver<Local> {
     /// Build a driver for node `mac` over the given host device, mesh
     /// interfaces, and management-query channel.  `trickle` supplies each
-    /// interface's per-link adaptive OGM bounds (`i_min`/`i_max`), and `features`
-    /// its per-link participation gates, both in interface order; interfaces
-    /// without an entry fall back to [`TrickleConfig::default`] /
-    /// [`LinkFeatures::default`] (full participation).
+    /// interface's per-link adaptive OGM bounds (`i_min`/`i_max`), `features`
+    /// its per-link participation gates, and `names` its human-readable label,
+    /// all in interface order; interfaces without an entry fall back to
+    /// [`TrickleConfig::default`] / [`LinkFeatures::default`] (full
+    /// participation) / unnamed.
     ///
     /// [`LinkFeatures::default`]: wayfinder::features::LinkFeatures
     pub fn new(
@@ -156,6 +157,7 @@ impl<Local: FrameIo> Driver<Local> {
         interfaces: Vec<Box<DynLinkT<'static>>>,
         trickle: Vec<TrickleConfig>,
         features: Vec<LinkFeatures>,
+        names: Vec<String>,
         query_rx: QueryRx,
     ) -> Self {
         let mut router = CentralRouter::new(mac);
@@ -182,6 +184,9 @@ impl<Local: FrameIo> Driver<Local> {
             router.configure_interface_ogm(idx, cfg.i_min(), cfg.i_max(), Duration::ZERO);
             let link_features = features.get(idx).copied().unwrap_or_default();
             router.set_link_features(idx, link_features);
+            if let Some(name) = names.get(idx) {
+                router.set_interface_name(idx, name);
+            }
             // Keep-alive rides on the same per-link `features` entry (no
             // separate constructor vector) — its `tx_keepalive` supplies the
             // schedule, `None` leaving that interface's timer unarmed.

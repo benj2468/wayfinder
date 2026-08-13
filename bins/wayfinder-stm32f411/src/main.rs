@@ -158,6 +158,8 @@ async fn main(_spawner: Spawner) {
         i_max: core::time::Duration::from_secs(128),
     }];
 
-    let mut driver = Driver::new(NODE_MAC, [client], EmbassyClock, &trickle, &[]);
+    // This board's one interface, named so the management API reports `lora`
+    // rather than a bare `0`.
+    let mut driver = Driver::new(NODE_MAC, [client], EmbassyClock, &trickle, &[], &["lora"]);
     driver.run().await
 }

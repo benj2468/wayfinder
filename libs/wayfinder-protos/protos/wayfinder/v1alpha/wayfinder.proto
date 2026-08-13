@@ -629,6 +629,12 @@ message LinkQualityEntry {
   // u32::MAX.  Useful for callers that want to weight or filter entries
   // by how much evidence backs the quality estimate.
   uint32 sample_count = 4;
+
+  // Human-readable name of the interface `iface_idx` refers to, as configured
+  // on the node (`udp0`, `lora-roof`).  Display metadata only — nothing routes
+  // on it.  Empty when the interface was never named, in which case a consumer
+  // shows `iface_idx` instead.
+  string iface_name = 5;
 }
 
 // Snapshot of the full link-quality table at the time of the request.
@@ -663,6 +669,10 @@ message LinkFeaturesEntry {
   // The armed keep-alive cadence in milliseconds, if this link is currently
   // sending heartbeats.  Absent when keep-alive transmission is disabled.
   optional uint64 tx_keepalive_interval_ms = 6;
+
+  // Human-readable name of this interface, as configured on the node.  Same
+  // encoding and empty-means-unnamed contract as LinkQualityEntry.iface_name.
+  string iface_name = 7;
 }
 
 // Snapshot of the per-interface participation-feature state at the time of
@@ -727,6 +737,10 @@ message OgmScheduleEntry {
   // The quietest (longest) interval the doubling backoff is capped at, in
   // milliseconds.  The configured backoff ceiling.
   uint32 max_interval_ms = 4;
+
+  // Human-readable name of this interface, as configured on the node.  Same
+  // encoding and empty-means-unnamed contract as LinkQualityEntry.iface_name.
+  string iface_name = 5;
 }
 
 // Snapshot of the per-interface adaptive OGM emission schedule at the time of
@@ -760,6 +774,10 @@ message InterfaceThroughput {
 
   // Smoothed transmit rate in link frames per second.
   double tx_fps = 5;
+
+  // Human-readable name of this interface, as configured on the node.  Same
+  // encoding and empty-means-unnamed contract as LinkQualityEntry.iface_name.
+  string iface_name = 6;
 }
 
 // Snapshot of per-interface throughput plus the node-wide totals at the time of
