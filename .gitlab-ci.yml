@@ -154,13 +154,11 @@ build:web:
     - lint-done
     - build-image
   script:
-    - cargo build -p wayfinder-web --features ssr
-    - cargo build -p wayfinder-web --features hydrate --target wasm32-unknown-unknown
-    - cargo clippy -p wayfinder-web --features mock-node --all-targets -- -D warnings
-    - cargo nextest run -p wayfinder-web --features mock-node
     # The real cargo-leptos path, which also runs wasm-bindgen and emits the
     # site bundle the binary serves.
     - cargo leptos build --release
+    - cargo clippy -p wayfinder-web --features mock-node --all-targets -- -D warnings
+    - cargo nextest run -p wayfinder-web --features mock-node
     - sccache --show-stats
 test:run:rust:
   extends: .base-ci-docker

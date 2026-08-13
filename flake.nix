@@ -173,12 +173,12 @@
               cargo-llvm-cov
               cargo-fuzz
               cargo-binutils
-              rust-analyzer
               # Build driver for `bins/wayfinder-web`: compiles the axum server
               # and the wasm hydration bundle together and serves them
               # (`cargo leptos watch`). `binaryen` supplies the `wasm-opt` it
               # shells out to for release bundles.
               cargo-leptos
+              rust-analyzer
               binaryen
               # cargo-leptos shells out to `wasm-bindgen` to generate the JS
               # glue, and refuses to run if the CLI's version differs from the
@@ -196,6 +196,7 @@
               buf
               tshark
               glab
+              just
               stdenv.cc.cc.lib
               probe-rs-tools
               flip-link
@@ -235,6 +236,8 @@
                   pkgs.zlib
                 ]
               }"
+
+              export PATH=/run/wrappers/bin:$PATH
             '';
           };
 

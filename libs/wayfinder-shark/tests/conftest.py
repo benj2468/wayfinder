@@ -56,15 +56,19 @@ def _require_plugin() -> None:
 
 @pytest.fixture
 def dissect(tshark_bin, tmp_path):
-    """Return ``dissect(frame, fields) -> {field: value}``.
+    """Return ``dissect(frame, fields, extra_args=None) -> {field: value}``.
 
     Writes `frame` to a pcap, runs `tshark` with the Wayfinder Lua dissector
     loaded, and returns the requested ``-T fields`` values for the (single)
     decoded packet. `fields` are display-filter field names, e.g.
-    ``"wayfinder.batman.ogm.seqno"`` or the pseudo-field ``"_ws.col.protocol"``.
+    ``"wayfinder.originator.seqno"`` or the pseudo-field ``"_ws.col.protocol"``.
+    `extra_args` are appended verbatim, for tests that need to set a dissector
+    preference (``-o wayfinder.carrier_ethertype:0x1234``).
     """
 
-    def _dissect(frame: bytes, fields: list[str]) -> dict[str, str]:
+    def _dissect(
+        frame: bytes, fields: list[str], extra_args: list[str] | None = None
+    ) -> dict[str, str]:
         pcap = tmp_path / "frame.pcap"
         write_pcap(pcap, frame)
 
@@ -77,6 +81,7 @@ def dissect(tshark_bin, tmp_path):
             "-T",
             "fields",
         ]
+        cmd += extra_args or []
         for field in fields:
             cmd += ["-e", field]
 

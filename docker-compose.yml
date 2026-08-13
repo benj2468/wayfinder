@@ -1,0 +1,96 @@
+# Run a Wayfinder node plus the browser dashboard on this host.
+#
+#   docker compose up --build      # first run also compiles the workspace
+#   open http://127.0.0.1:8080
+#
+# Two containers, both built from containers/Dockerfile (which see for how the
+# images are assembled):
+#
+#   node  — wayfinder-tap: the mesh node. Creates a kernel TAP, carries a raw-L2
+#           mesh link on a host NIC, and serves the management API.
+#   web   — wayfinder-web: the axum/Leptos dashboard. It is the only party that
+#           speaks the management protocol (the browser never does), so it
+#           holds a mesh identity and connects out to `node`.
+#
+# The two share the `state` volume, which is how the dashboard gets an identity:
+# the node writes /var/lib/wayfinder/identity.seed on first boot, and the
+# dashboard reads that same file to bootstrap into an un-enrolled node. Once the
+# mesh has a CA, give the dashboard its own seed + membership cert instead
+# (`--identity`/`--cert`, and `--node-key` to pin the node) and drop the shared
+# volume — see the `web` service below.
+name: wayfinder
+services:
+  node:
+    build:
+      context: .
+      dockerfile: containers/Dockerfile
+      target: tap
+    image: wayfinder-tap
+    command: ["--config", "/etc/wayfinder/node.yml"]
+    network_mode: host
+    # NET_ADMIN + /dev/net/tun to create and configure the kernel TAP device;
+    # NET_RAW for the AF_PACKET/broadcast sockets the mesh links open. The image
+    # bakes in neither — granting them is the caller's decision.
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./containers/node.yml:/etc/wayfinder/node.yml:ro
+      # Runtime identity state: the TLS identity seed and the persisted TAP MAC.
+      # Named (not bind-mounted) because the seed is a secret the node creates
+      # owner-only, and because keeping it makes this node's mesh identity
+      # survive a `down`/`up`.
+      - state:/var/lib/wayfinder
+      # The host's D-Bus system bus, which is how a `Ble` link reaches BlueZ:
+      # `bluetoothd` runs on the host and owns the adapter, so the container
+      # borrows the host's bus rather than running a daemon of its own (an
+      # in-container bus would have no org.bluez on it at all). Read-write on
+      # purpose — a bus socket is bidirectional, and :ro would break the client's
+      # own writes, not just protect the host.
+      #
+      # Harmless when no `Ble` link is configured; the node never opens the bus.
+      # If the host has no bluetoothd, `docker compose up` fails on the missing
+      # path instead — drop this line for a BLE-less deployment.
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+    environment:
+      RUST_LOG: "info"
+    restart: unless-stopped
+  web:
+    build:
+      context: .
+      dockerfile: containers/Dockerfile
+      target: web
+    image: wayfinder-web
+    # Host networking, same as `node`. `--listen` (the dashboard's own bind
+    # address, distinct from `--addr` below) is left at its default,
+    # 127.0.0.1:8080 — under host networking that's the host's real loopback,
+    # so this stays host-local, matching bins/wayfinder-web/CLAUDE.md's "no
+    # auth of its own, binds loopback by default" posture. Overriding
+    # `--listen`/`WAYFINDER_WEB_LISTEN` to expose this beyond the host needs a
+    # reverse proxy in front, per that doc.
+    network_mode: host
+    # --addr must be a literal socket address, not the `node` service name:
+    # `network_mode: host` opts both containers out of Compose's embedded DNS,
+    # so 127.0.0.1 (both containers share the host's network namespace) is the
+    # only way to reach the node's mgmt API here.
+    # --identity is left at its default, /var/lib/wayfinder/identity.seed, which
+    # on the shared volume is the *node's* seed; with no --cert that proves the
+    # node's own key, the bootstrap path into a node that has not enrolled yet.
+    command: ["--addr", "127.0.0.1:7700"]
+    volumes:
+      - state:/var/lib/wayfinder:ro
+    environment:
+      RUST_LOG: "info"
+    # `depends_on` only waits for the node's *container* to start, not for it to
+    # have written its identity seed — and the dashboard reads that seed at
+    # startup. So the first boot may exit once with "No such file or directory"
+    # before the node gets there; the restart policy covers that race, and the
+    # connection itself is lazy (the dashboard comes up with the node down and
+    # reconnects on its own).
+    depends_on:
+      - node
+    restart: unless-stopped
+volumes:
+  state:
