@@ -20,6 +20,16 @@
       url = "github:cachix/git-hooks.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    jetpack = {
+      url = "github:anduril/jetpack-nixos/master";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    disko = {
+      url = "github:nix-community/disko";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -27,12 +37,15 @@
       nixpkgs,
       flake-parts,
       fenix,
+      jetpack,
       ...
     }:
     let
-      localOverlay = import ./overlay/wayfinder.nix;
-
       overlay = final: prev: {
+        craneLib = inputs.crane.mkLib prev;
+
+        cudaPackages = final.cudaPackages_13_0;
+
         inherit (prev.callPackage ./nix { src = prev.lib.cleanSource ./.; })
           wayfinder-tap
           wayfinder-tui
@@ -40,6 +53,94 @@
           wayfinder-web
           ;
       };
+
+      nixpkgsForSystem =
+        system:
+        import inputs.nixpkgs {
+          inherit system;
+          config = {
+            allowUnfree = true;
+            segger-jlink.acceptLicense = true;
+            permittedInsecurePackages = [
+              "segger-jlink-qt4-952"
+            ];
+
+            cudaSupport = true;
+            cudaCapabilities = [ "8.7" ];
+          };
+          overlays = [
+            # `nix/default.nix` reaches for `pkgs.fenix` to give the web
+            # package a wasm32-capable toolchain; nixpkgs' own rustc carries
+            # no wasm32 `rust-std`.
+            fenix.overlays.default
+            overlay
+          ];
+        };
+
+      mkWayfinderSystem =
+        name:
+        {
+          modules ? [ ],
+        }:
+        let
+          dir = ./nix/machines + "/${name}";
+
+          shared = [
+            {
+              nixpkgs = {
+                overlays = [
+                  fenix.overlays.default
+                  overlay
+                ];
+                config.allowUnfree = true;
+              };
+            }
+            (dir + "/common.nix")
+          ]
+          ++ modules;
+
+          specialArgs = { inherit inputs; };
+
+          # What actually lands on the disk. disko's module reads the same
+          # layout the installer partitions from and derives `fileSystems`
+          # from it, so the two cannot drift.
+          installed = nixpkgs.lib.nixosSystem {
+            inherit specialArgs;
+            modules = shared ++ [
+              inputs.disko.nixosModules.disko
+              (dir + "/system.nix")
+              (dir + "/disk.nix")
+            ];
+          };
+        in
+        {
+          # The live USB installer. `nix/modules/installer.nix` puts the disk
+          # layout, the built system and the `wayfinder-install` wrapper on the
+          # image, so installing copies what is already on the stick onto the
+          # NVMe — no flake checkout and no network on the board.
+          ${name} = nixpkgs.lib.nixosSystem {
+            inherit specialArgs;
+            modules = shared ++ [
+              ./nix/modules/installer.nix
+              (dir + "/installer.nix")
+              {
+                wayfinder.installer = {
+                  machine = name;
+                  layout = (dir + "/disk.nix");
+                  target = installed;
+                };
+              }
+            ];
+          };
+
+          "${name}-system" = installed;
+        };
+
+      # The whole fleet: an attrset keyed by machine name, flattened into the
+      # `<name>` / `<name>-system` pairs `nixosConfigurations` wants. Adding a
+      # board is one attribute here plus its `nix/machines/<name>/` directory.
+      mkWayfinderSystems =
+        machines: nixpkgs.lib.mergeAttrsList (nixpkgs.lib.mapAttrsToList mkWayfinderSystem machines);
     in
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = nixpkgs.lib.systems.flakeExposed;
@@ -53,6 +154,13 @@
         overlays.default = overlay;
 
         nixosModules.default = ./nix/modules/wayfinder.nix;
+
+        # Each entry yields two configurations — `<name>` (the installer ISO)
+        # and `<name>-system` (what that ISO installs). A new board is a line
+        # here and a `nix/machines/<name>/` directory beside `orin-nano`.
+        nixosConfigurations = mkWayfinderSystems {
+          orin-nano.modules = [ jetpack.nixosModules.default ];
+        };
       };
 
       perSystem =
@@ -95,20 +203,7 @@
           # CI runs — see tests/README.md and .gitlab-ci.yml.
           pytestEnv = pkgs.python3.withPackages (ps: with ps; [ pytest ]);
 
-          testPkgs = import nixpkgs {
-            inherit system;
-            overlays = [
-              # `nix/default.nix` reaches for `pkgs.fenix` to give the web
-              # package a wasm32-capable toolchain; nixpkgs' own rustc carries
-              # no wasm32 `rust-std`.
-              fenix.overlays.default
-              overlay
-              (_final: prev: {
-                craneLib = inputs.crane.mkLib prev;
-              })
-
-            ];
-          };
+          nixpkgs = nixpkgsForSystem system;
 
           # nrfutil's package-generation extension (nrfutil-nrf5sdk-tools —
           # needed to build a DFU package for the nRF52840 dongle's probe-less
@@ -117,16 +212,8 @@
           # than skip it on an aarch64 host, run the real x86_64 build under
           # qemu-user emulation — the same trick already used for x86_64-only
           # Android NDK/SDK binaries on this project's aarch64 devShell.
-          pkgsX86 = import nixpkgs {
-            system = "x86_64-linux";
-            config = {
-              allowUnfree = true;
-              segger-jlink.acceptLicense = true;
-              permittedInsecurePackages = [
-                "segger-jlink-qt4-952"
-              ];
-            };
-          };
+          pkgsX86 = nixpkgsForSystem "x86_64-linux";
+
           nrfutilX86 = pkgsX86.nrfutil.withExtensions [
             "nrfutil-device"
             "nrfutil-nrf5sdk-tools"
@@ -146,20 +233,7 @@
 
         in
         {
-          _module.args.pkgs = import inputs.nixpkgs {
-            inherit system;
-            config = {
-              allowUnfree = true;
-              segger-jlink.acceptLicense = true;
-              permittedInsecurePackages = [
-                "segger-jlink-qt4-952"
-              ];
-            };
-            overlays = [
-              localOverlay
-              fenix.overlays.default
-            ];
-          };
+          _module.args.pkgs = nixpkgs;
 
           pre-commit.settings.hooks.treefmt.enable = true;
 
@@ -255,13 +329,13 @@
           };
 
           packages = {
-            inherit (testPkgs)
+            inherit (nixpkgs)
               wayfinder-tap
               wayfinder-tui
               wayfinder-ctl
               wayfinder-web
               ;
-            wayfinder-simple = testPkgs.callPackage ./nix/tests/simple.nix { };
+            wayfinder-simple = nixpkgs.callPackage ./nix/tests/simple.nix { };
           };
 
           treefmt = {
