@@ -167,7 +167,7 @@ fn link_quality_table_caps_at_the_profile_bound() {
     let mut table: LinkQualityTable<u8, 16> = LinkQualityTable::new();
 
     for n in 0..20u8 {
-        table.update(n, 0, 200);
+        table.update(n, 0, Some(200));
     }
 
     assert_eq!(table.records().len(), 16);

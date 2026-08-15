@@ -68,7 +68,7 @@ impl WayfinderDataProvider for Mock {
         vec![LinkQualityEntryData {
             neighbor_id: vec![0, 0, 0, 0, 0, 3],
             iface_idx: 0,
-            ewma_quality: 200,
+            ewma_quality: Some(200),
             sample_count: 9,
             iface_name: "lora0".into(),
         }]

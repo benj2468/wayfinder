@@ -33,7 +33,7 @@ async fn snapshot_reads_every_table_from_a_real_node() {
     assert_eq!(snap.routing.entries[0].paths.len(), 1);
 
     assert_eq!(snap.link_quality.entries.len(), 1);
-    assert_eq!(snap.link_quality.entries[0].ewma_quality, 200);
+    assert_eq!(snap.link_quality.entries[0].ewma_quality, Some(200));
 
     // Distinct gate values, so a table transposed against `link_quality` or
     // `ogm_schedule` shows up rather than coincidentally matching.

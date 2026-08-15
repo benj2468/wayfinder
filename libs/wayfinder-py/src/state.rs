@@ -120,10 +120,10 @@ impl From<&OriginatorRecord> for PyOriginatorRecord {
 ///
 /// Distinct from a path's TQ, which is end-to-end to an originator: this is
 /// the physical-layer health of the single hop to that neighbor. A row
-/// exists for every neighbor/interface pair a frame has been received on;
-/// the *value* is only meaningful when the carrier supplied real
-/// `LinkMetrics` on receive — an unmeasured link normalizes to
-/// `ewma_quality == 0` rather than the row being absent.
+/// exists for every neighbor/interface pair a frame has been received on,
+/// but `ewma_quality` is `None` unless the carrier supplied real
+/// `LinkMetrics` on receive — a metric-less link (raw L2, UDP, Unix) has no
+/// signal to measure, which is not the same as measuring zero.
 #[pyclass(module = "wayfinder_py", get_all, frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyLinkQualityRecord {
@@ -131,9 +131,12 @@ pub struct PyLinkQualityRecord {
     pub neighbor: PyMac,
     /// The interface index the neighbor was observed on.
     pub iface_idx: usize,
-    /// EWMA-smoothed quality on the 0..=255 scale.
-    pub ewma_quality: u8,
-    /// How many samples are folded into `ewma_quality` — the confidence in it.
+    /// EWMA-smoothed quality on the 0..=255 scale, or `None` on a link that
+    /// has never carried a physical-layer measurement.  `None` is *unknown*,
+    /// not zero: treat it as missing data rather than a bad link.
+    pub ewma_quality: Option<u8>,
+    /// How many frames have been received on this pair, including unmeasured
+    /// ones — so it can be non-zero while `ewma_quality` is `None`.
     pub sample_count: u32,
 }
 

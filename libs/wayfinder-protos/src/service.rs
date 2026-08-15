@@ -78,9 +78,12 @@ pub struct LinkQualityEntryData {
     pub neighbor_id: Vec<u8>,
     /// Physical-interface index the neighbor was observed on.
     pub iface_idx: u32,
-    /// EWMA-smoothed normalized quality on the `0..=255` scale.
-    pub ewma_quality: u32,
-    /// Number of samples folded into the EWMA.
+    /// EWMA-smoothed normalized quality on the `0..=255` scale, or `None` when
+    /// the link has never carried a physical-layer measurement (a metric-less
+    /// transport: raw L2, UDP, Unix).  `None` means *unknown*, not zero.
+    pub ewma_quality: Option<u32>,
+    /// Number of frames received on this pair, including unmeasured ones — so
+    /// it can be non-zero while `ewma_quality` is `None`.
     pub sample_count: u32,
     /// Human-readable name of the interface `iface_idx` refers to; empty when
     /// the interface was never named.
@@ -1293,7 +1296,7 @@ mod tests {
             link_quality: vec![LinkQualityEntryData {
                 neighbor_id: vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
                 iface_idx: 1,
-                ewma_quality: 200,
+                ewma_quality: Some(200),
                 sample_count: 42,
                 iface_name: "lora0".into(),
             }],
@@ -1309,9 +1312,44 @@ mod tests {
                 let e = &table.entries[0];
                 assert_eq!(e.neighbor_id, vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
                 assert_eq!(e.iface_idx, 1);
-                assert_eq!(e.ewma_quality, 200);
+                assert_eq!(e.ewma_quality, Some(200));
                 assert_eq!(e.sample_count, 42);
                 assert_eq!(e.iface_name, "lora0", "the interface's name is projected");
+            }
+            other => panic!(
+                "expected LinkQualityTable, got {:?}",
+                proto_kind_name(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn link_quality_entry_projects_an_absent_measurement_as_absent() {
+        // A metric-less link (raw L2, UDP) is heard but never measured.  The
+        // row must reach the wire with `ewma_quality` unset rather than 0, or
+        // every consumer renders a healthy wired neighbor as 0% quality.
+        let provider = MockProvider {
+            link_quality: vec![LinkQualityEntryData {
+                neighbor_id: vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+                iface_idx: 0,
+                ewma_quality: None,
+                sample_count: 9,
+                iface_name: "rawl20".into(),
+            }],
+            ..Default::default()
+        };
+
+        match handle(
+            provider,
+            RequestKind::GetLinkQualityTable(GetLinkQualityTableRequest {}),
+        ) {
+            ResponseKind::LinkQualityTable(table) => {
+                let e = &table.entries[0];
+                assert_eq!(e.ewma_quality, None);
+                assert_eq!(
+                    e.sample_count, 9,
+                    "an unmeasured row still reports the frames it heard"
+                );
             }
             other => panic!(
                 "expected LinkQualityTable, got {:?}",

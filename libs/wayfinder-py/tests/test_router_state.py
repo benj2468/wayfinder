@@ -92,15 +92,22 @@ def test_link_quality_records_reflect_pushed_metrics():
     assert record.sample_count > 0
 
 
-def test_link_quality_record_exists_but_reads_zero_without_metrics():
+def test_link_quality_record_exists_but_reads_none_without_metrics():
     """A row is stamped for every neighbor/interface pair seen, even absent
-    real `LinkMetrics` — it is just uninformative (quality 0), not missing."""
+    real `LinkMetrics` — the row is present but its quality is unknown.
+
+    `None`, not 0: a carrier that reports no signal has nothing to measure,
+    whereas 0 is a real reading a radio can produce on a genuinely dead link.
+    Conflating them made every wired neighbor read as the worst possible link.
+    """
     a, _ = _converge_pair()
 
     records = a.link_quality_records()
 
     assert len(records) == 1
-    assert records[0].ewma_quality == 0
+    assert records[0].ewma_quality is None
+    # Still evidence the neighbor is there, even with no quality to report.
+    assert records[0].sample_count > 0
 
 
 def test_neighbor_count_counts_direct_neighbors():
