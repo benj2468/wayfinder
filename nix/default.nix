@@ -19,6 +19,10 @@ let
     version = "0.1.0";
     nativeBuildInputs = with pkgs; [
       protobuf
+      pkg-config
+    ];
+    buildInputs = with pkgs; [
+      dbus
     ];
   };
 

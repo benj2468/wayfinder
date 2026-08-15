@@ -183,6 +183,18 @@ in
         KERNEL=="tun", GROUP="wayfinder", MODE="0660", OPTIONS+="static_node=net/tun"
       '';
 
+      systemd.tmpfiles.settings = {
+        "10-wayfinder" = {
+          "/var/lib/wayfinder" = {
+            d = {
+              mode = "0755";
+              user = "wayfinder";
+              group = "wayfinder";
+            };
+          };
+        };
+      };
+
       systemd.services.wayfinder = {
         enable = true;
         description = "Wayfinder Systemd Service";

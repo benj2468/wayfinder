@@ -49,6 +49,13 @@ clippy: clippy-workspace clippy-web clippy-embedded clippy-py
 [doc("Run every test suite: host, web, python.")]
 test: test-workspace test-web test-py test-pytest
 
+# `cargo clean` only ever empties the target directory of the workspace it is
+# run from, so reclaiming the disk takes one invocation per workspace — the same
+# split the build recipes work around. `bins/wayfinder-web` shares the root
+# target directory (it is a member), so it needs no separate clean.
+[doc("Remove the target directory of every workspace: host, python, boards, fuzz.")]
+clean: clean-workspace clean-py clean-embedded clean-fuzz
+
 # ---------------------------------------------------------------------------
 # Root workspace
 # ---------------------------------------------------------------------------
@@ -71,6 +78,12 @@ test-workspace:
 [doc("Run the root workspace's tests with a coverage summary.")]
 coverage:
     cargo llvm-cov nextest --workspace
+
+# Also drops the `cargo leptos` site bundle, which lands under the same target
+# directory.
+[doc("Remove the root workspace's target directory.")]
+clean-workspace:
+    cargo clean
 
 # ---------------------------------------------------------------------------
 # bins/wayfinder-web
@@ -122,6 +135,10 @@ clippy-py:
 test-py:
     cd libs/wayfinder-py && cargo nextest run
 
+[doc("Remove the PyO3 extension crate's target directory.")]
+clean-py:
+    cd libs/wayfinder-py && cargo clean
+
 # ---------------------------------------------------------------------------
 # Embedded firmware
 # ---------------------------------------------------------------------------
@@ -136,6 +153,14 @@ build-embedded: build-nrf52840 build-nrf52840-dongle build-stm32f411 build-loose
 
 [doc("Lint every board, plus the drivers no board links.")]
 clippy-embedded: clippy-nrf52840 clippy-nrf52840-dongle clippy-stm32f411 clippy-loose-drivers
+
+# The loose drivers build into the root target directory, so `clean-workspace`
+# already covers them.
+[doc("Remove every board workspace's target directory.")]
+clean-embedded:
+    cd bins/wayfinder-nrf52840 && cargo clean
+    cd bins/wayfinder-nrf52840-dongle && cargo clean
+    cd bins/wayfinder-stm32f411 && cargo clean
 
 [doc("Build the nRF52840-DK (PCA10056) firmware.")]
 build-nrf52840:
@@ -219,6 +244,16 @@ lint-protos:
 [doc("Run one fuzz target for a bounded time, e.g. `just fuzz wayfinder parse_frame 60`.")]
 fuzz crate target seconds="60":
     cd libs/{{ crate }}/fuzz && cargo fuzz run {{ target }} -- -max_total_time={{ seconds }}
+
+# Each `libs/*/fuzz` is its own workspace with its own target directory, and a
+# fuzzing run leaves the largest artifacts in the repo behind there.
+[doc("Remove every fuzz workspace's target directory.")]
+clean-fuzz:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for dir in libs/*/fuzz; do
+        (cd "$dir" && cargo clean)
+    done
 
 [doc("List every available fuzz target, by crate.")]
 fuzz-list:
