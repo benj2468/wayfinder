@@ -76,7 +76,7 @@ fn seeded_snapshot() -> NodeSnapshot {
     snap.link_quality.entries.push(LinkQualityEntry {
         neighbor_id: vec![0, 0, 0, 0, 0, 3],
         iface_idx: 0,
-        ewma_quality: 200,
+        ewma_quality: Some(200),
         sample_count: 9,
         iface_name: "lora0".into(),
     });
@@ -276,6 +276,34 @@ fn link_quality_renders_a_row_per_neighbour_and_interface() {
     // EWMA quality 200 of 255.
     assert!(html.contains("78%"), "quality as a percentage: {html}");
     assert!(html.contains("9"), "the sample count: {html}");
+}
+
+/// A link with no physical-layer metrics reads as unmeasured, not as 0%.
+///
+/// Raw-L2/UDP transports report no signal on any frame. Showing that as 0%
+/// painted a healthy wired neighbour as the worst possible link — the bug this
+/// case exists to keep fixed.
+#[test]
+fn link_quality_shows_an_unmeasured_link_as_not_applicable() {
+    let mut snap = seeded_snapshot();
+    snap.link_quality.entries.push(LinkQualityEntry {
+        neighbor_id: vec![0, 0, 0, 0, 0, 4],
+        iface_idx: 1,
+        ewma_quality: None,
+        sample_count: 9,
+        iface_name: "rawl20".into(),
+    });
+
+    let html = render_with(Some(snap), || view! { <LinkQuality /> });
+
+    assert!(html.contains("00:00:00:00:00:04"), "the neighbour: {html}");
+    assert!(html.contains("n/a"), "quality reads as unmeasured: {html}");
+    assert!(
+        !html.contains("0%"),
+        "an unmeasured link must never render as a percentage: {html}"
+    );
+    // The measured row is unaffected — the two states coexist in one table.
+    assert!(html.contains("78%"), "the measured row still reads: {html}");
 }
 
 /// Keep-alive liveness is the direct-link signal, so a lapsed neighbour has to

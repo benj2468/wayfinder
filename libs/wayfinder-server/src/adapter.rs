@@ -236,7 +236,7 @@ impl<
             .map(|r| LinkQualityEntryData {
                 neighbor_id: r.neighbor.as_bytes().to_vec(),
                 iface_idx: r.iface_idx as u32,
-                ewma_quality: r.ewma_quality as u32,
+                ewma_quality: r.ewma_quality.map(u32::from),
                 sample_count: r.sample_count,
                 iface_name: self.interface_name(r.iface_idx),
             })

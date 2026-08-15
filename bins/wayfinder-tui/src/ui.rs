@@ -493,10 +493,16 @@ fn render_link_quality(frame: &mut Frame, app: &mut App, area: Rect) {
             Row::new(vec![
                 Cell::from(format_id(&e.neighbor_id)),
                 Cell::from(iface_label(&e.iface_name, e.iface_idx)),
-                Cell::from(Span::styled(
-                    format!("{} {}", e.ewma_quality, bar(e.ewma_quality)),
-                    tq_style(e.ewma_quality),
-                )),
+                Cell::from(match e.ewma_quality {
+                    Some(q) => Span::styled(format!("{} {}", q, bar(q)), tq_style(q)),
+                    // No physical-layer measurement on this link (raw L2, UDP,
+                    // Unix).  Rendering it as 0 would paint a healthy wired
+                    // neighbor red at an empty bar; say "unknown" instead.
+                    None => Span::styled(
+                        format!("{:<3} {}", "-", "·".repeat(10)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                }),
                 Cell::from(e.sample_count.to_string()),
             ])
         })

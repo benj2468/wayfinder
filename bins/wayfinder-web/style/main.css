@@ -441,6 +441,13 @@ body {
   text-align: right;
 }
 
+/* "No measurement available", not "measured as bad" — so it recedes rather
+ * than competing with the real readings in neighbouring rows. */
+.wf-bar-text-absent {
+  font-style: italic;
+  opacity: 0.7;
+}
+
 /* --------------------------------------------------------- status colours -- */
 
 .wf-status-on {

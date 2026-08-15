@@ -115,6 +115,26 @@ pub fn QualityBar(
     }
 }
 
+/// The quality column for a link that reports no physical-layer measurement.
+///
+/// Deliberately *not* a [`QualityBar`] at 0%: a metric-less transport (raw L2,
+/// UDP, Unix) has no signal to measure, and such a link is usually excellent —
+/// an empty red bar would read as a failing link and send an operator chasing a
+/// problem that isn't there. Keeps the bar's footprint so the column stays
+/// aligned against measured rows.
+#[component]
+pub fn QualityUnmeasured() -> impl IntoView {
+    view! {
+        <div
+            class="wf-bar-wrap"
+            title="This link exposes no signal metrics (wired or socket transport), so quality cannot be measured. It is not a weak link."
+        >
+            <div class="wf-bar" />
+            <span class="wf-bar-text wf-bar-text-absent">"n/a"</span>
+        </div>
+    }
+}
+
 /// Placeholder shown where a table would be, when there is nothing in it.
 ///
 /// Always says *why* it is empty rather than just showing blank space —

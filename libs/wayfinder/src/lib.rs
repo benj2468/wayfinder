@@ -887,17 +887,11 @@ impl<
         self.link_quality.update(frame.src, iface_idx, quality);
         // The smoothed link quality to this neighbor, used to clamp any OGM's
         // advertised TQ so a node can't claim a path better than the link we
-        // measure to it.  Only meaningful when the frame carried a real
-        // physical measurement: metric-less transports (UDP/Unix/raw L2) report
-        // `LinkMetrics::default`, which normalizes to 0 — clamping by that would
-        // wrongly zero every TQ — so they apply no clamp at all.
-        let measured =
-            metrics.rssi_dbm.is_some() || metrics.snr_db.is_some() || metrics.quality.is_some();
-        let local_quality = if measured {
-            self.link_quality.quality_for(frame.src, iface_idx)
-        } else {
-            None
-        };
+        // measure to it.  `quality_for` yields `None` for a link that has never
+        // carried a measurement — metric-less transports (UDP/Unix/raw L2)
+        // never do — and `None` means *no clamp*, since clamping by a link we
+        // cannot measure would wrongly zero every TQ through it.
+        let local_quality = self.link_quality.quality_for(frame.src, iface_idx);
 
         // 0b. Account the frame against this interface's ingress rate before any
         //     demux, so even frames the upper layers drop still register as

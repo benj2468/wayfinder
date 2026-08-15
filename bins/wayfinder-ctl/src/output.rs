@@ -112,7 +112,11 @@ pub fn link_quality_table(v: &LinkQualityTable, fmt: OutputFormat) -> anyhow::Re
                 format_mac(&e.neighbor_id),
                 e.iface_idx,
                 format_iface_name(&e.iface_name),
-                e.ewma_quality,
+                // An unmeasurable link (raw L2, UDP) reports no quality at
+                // all; show that rather than a 0 an operator would read as a
+                // failing link.
+                e.ewma_quality
+                    .map_or_else(|| "-".to_string(), |q| q.to_string()),
                 e.sample_count,
             ));
         }

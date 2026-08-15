@@ -5,6 +5,7 @@
 //! multi-container simulator: that drives real `wayfinder-tap` binaries over
 //! virtual networks; this drives the routing core in-process, with no
 //! containers or sockets at all.
+#![allow(clippy::clone_on_copy)]
 
 use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;

@@ -13,6 +13,7 @@ use crate::components::dashboard::use_dashboard;
 use crate::components::widgets::Empty;
 use crate::components::widgets::Panel;
 use crate::components::widgets::QualityBar;
+use crate::components::widgets::QualityUnmeasured;
 use crate::format;
 
 /// Render the Link Quality tab.
@@ -66,10 +67,18 @@ pub fn LinkQuality() -> impl IntoView {
                                                     <td class="wf-mono">{format::id(&e.neighbor_id)}</td>
                                                     <td>{format::iface_label(&e.iface_name, e.iface_idx)}</td>
                                                     <td>
-                                                        <QualityBar
-                                                            percent=format::tq_percent(e.ewma_quality)
-                                                            title=format!("EWMA {}", e.ewma_quality)
-                                                        />
+                                                        {match e.ewma_quality {
+                                                            Some(q) => {
+                                                                view! {
+                                                                    <QualityBar
+                                                                        percent=format::tq_percent(q)
+                                                                        title=format!("EWMA {q}")
+                                                                    />
+                                                                }
+                                                                    .into_any()
+                                                            }
+                                                            None => view! { <QualityUnmeasured /> }.into_any(),
+                                                        }}
                                                     </td>
                                                     <td class="wf-num">{e.sample_count}</td>
                                                 </tr>

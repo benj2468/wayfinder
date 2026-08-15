@@ -137,8 +137,9 @@ impl PyDriver {
     /// Populated for every neighbor/interface pair a frame has been received
     /// on, whether or not that frame carried `LinkMetrics` — a caller that
     /// never passes `metrics` to [`push_rx`](Self::push_rx) still gets one
-    /// entry per pair, just with `ewma_quality` pinned at 0 rather than the
-    /// row being absent.
+    /// entry per pair, with `ewma_quality` set to `None` rather than the row
+    /// being absent. `None` means the link was never measurable, which is
+    /// distinct from a radio reporting a genuine `Some(0)`.
     fn link_quality_records(&self) -> Vec<PyLinkQualityRecord> {
         self.inner
             .router()

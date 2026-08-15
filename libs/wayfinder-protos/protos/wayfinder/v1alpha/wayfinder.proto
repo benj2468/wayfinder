@@ -623,11 +623,20 @@ message LinkQualityEntry {
 
   // EWMA-smoothed normalized quality on the 0–255 scale (matching
   // BATMAN's TQ convention).  Higher is better.
-  uint32 ewma_quality = 3;
+  //
+  // Absent when this link has never carried a physical-layer measurement,
+  // which is the case for every frame on a metric-less transport (raw L2,
+  // UDP, Unix): there is no signal to measure, as opposed to a bad one.
+  // Absent is NOT zero — a wired neighbor is typically an excellent link —
+  // so a consumer must render it as unknown (`—`, `n/a`) and must never
+  // substitute 0 or display it as 0%.
+  optional uint32 ewma_quality = 3;
 
-  // Number of received frames folded into the EWMA so far.  Saturates at
-  // u32::MAX.  Useful for callers that want to weight or filter entries
-  // by how much evidence backs the quality estimate.
+  // Number of frames received on this (neighbor, interface) pair, counting
+  // those that carried no measurement.  Saturates at u32::MAX.  Useful for
+  // callers that want to weight or filter entries by how much evidence backs
+  // the row.  Note this counts received frames, not EWMA samples: it can be
+  // non-zero while `ewma_quality` is absent.
   uint32 sample_count = 4;
 
   // Human-readable name of the interface `iface_idx` refers to, as configured
@@ -639,8 +648,10 @@ message LinkQualityEntry {
 
 // Snapshot of the full link-quality table at the time of the request.
 message LinkQualityTable {
-  // All known (neighbor, interface) pairs.  Empty if the router has not
-  // yet received any frames with measurable metrics.
+  // All known (neighbor, interface) pairs.  Empty if the router has not yet
+  // received any frames.  A pair whose link exposes no physical-layer metrics
+  // still appears here, with `ewma_quality` absent — being heard on an
+  // interface is itself worth reporting.
   repeated LinkQualityEntry entries = 1;
 }
 

@@ -48,10 +48,13 @@
     powerOnBoot = true;
   };
 
-  hardware.nvidia-jetpack.enable = true;
-  hardware.nvidia-jetpack.som = "orin-nano";
-  hardware.nvidia-jetpack.carrierBoard = "devkit";
-  hardware.nvidia-jetpack.majorVersion = "7";
+  hardware.nvidia-jetpack = {
+    enable = true;
+    som = "orin-nano";
+    carrierBoard = "devkit";
+    majorVersion = "7";
+    firmware.optee.supplicant.enable = false;
+  };
 
   system.stateVersion = "26.05";
   nixpkgs = {

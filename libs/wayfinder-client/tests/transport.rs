@@ -80,7 +80,7 @@ impl WayfinderDataProvider for Mock {
         vec![LinkQualityEntryData {
             neighbor_id: vec![0, 0, 0, 0, 0, 3],
             iface_idx: 0,
-            ewma_quality: 200,
+            ewma_quality: Some(200),
             sample_count: 9,
             iface_name: "lora0".into(),
         }]
@@ -255,7 +255,7 @@ async fn assert_full_roundtrip(client: &mut Client) {
 
     let links = client.link_quality_table().await.unwrap();
     assert_eq!(links.entries.len(), 1);
-    assert_eq!(links.entries[0].ewma_quality, 200);
+    assert_eq!(links.entries[0].ewma_quality, Some(200));
 
     let keepalive = client.keepalive_table().await.unwrap();
     assert_eq!(keepalive.entries.len(), 1);

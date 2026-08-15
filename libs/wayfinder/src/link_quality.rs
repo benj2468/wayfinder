@@ -38,9 +38,25 @@ pub struct LinkQualityRecord<Ident> {
     pub neighbor: Ident,
     /// The physical interface this neighbor was observed on.
     pub iface_idx: usize,
-    /// EWMA-smoothed quality on the 0..=255 scale.
-    pub ewma_quality: u8,
-    /// Number of samples folded into the EWMA.  Saturates at `u32::MAX`.
+    /// EWMA-smoothed quality on the 0..=255 scale, or `None` when this link
+    /// has never carried a physical-layer measurement.
+    ///
+    /// `None` is not "quality zero": a metric-less transport (raw L2, UDP,
+    /// Unix) has no signal to report on any frame, and a wired neighbor is
+    /// typically excellent. Callers must render it as *unknown* and must not
+    /// substitute a number for it — the row still exists, so a neighbor heard
+    /// only over such a link is listed rather than hidden.
+    ///
+    /// Ordering does the right thing for the egress decision without extra
+    /// care at the call sites: `None < Some(0)`, so an unmeasurable link never
+    /// outranks one that reported a real value.
+    pub ewma_quality: Option<u8>,
+    /// Number of frames received on this `(neighbor, interface)` pair,
+    /// counting those that carried no measurement.  Saturates at `u32::MAX`.
+    ///
+    /// Not the number of samples in the EWMA — an unmeasured frame is evidence
+    /// the neighbor is *there*, which is worth reporting even though it moves
+    /// no average.
     pub sample_count: u32,
 }
 
@@ -84,17 +100,34 @@ impl<Ident: MeshIdentifier, const CAP: usize> LinkQualityTable<Ident, CAP> {
     /// the table.  Creates a fresh entry if the pair has not been seen
     /// before, evicting the weakest existing entry when the table is at
     /// capacity.
-    pub fn update(&mut self, neighbor: Ident, iface_idx: usize, sample: u8) {
+    ///
+    /// `sample` is `None` when the frame carried no physical-layer
+    /// measurement.  Such a frame still counts toward `sample_count` — it
+    /// proves the neighbor is reachable on this interface — but leaves the
+    /// quality estimate untouched, so a metric-less link reports *unknown*
+    /// rather than a fabricated zero, and one metric-less frame on a radio
+    /// link cannot wipe out an estimate built from real samples.
+    pub fn update(&mut self, neighbor: Ident, iface_idx: usize, sample: Option<u8>) {
         if let Some(e) = self
             .entries
             .iter_mut()
             .find(|e| e.neighbor == neighbor && e.iface_idx == iface_idx)
         {
-            // EWMA: new = (sample + (2^k - 1) * prev) / 2^k, with k = EWMA_SHIFT.
-            let prev = e.ewma_quality as u16;
-            let alpha_denom: u16 = 1 << EWMA_SHIFT;
-            e.ewma_quality = ((sample as u16 + (alpha_denom - 1) * prev) / alpha_denom) as u8;
             e.sample_count = e.sample_count.saturating_add(1);
+            if let Some(sample) = sample {
+                e.ewma_quality = Some(match e.ewma_quality {
+                    // EWMA: new = (sample + (2^k - 1) * prev) / 2^k, k = EWMA_SHIFT.
+                    Some(prev) => {
+                        let alpha_denom: u16 = 1 << EWMA_SHIFT;
+                        ((sample as u16 + (alpha_denom - 1) * prev as u16) / alpha_denom) as u8
+                    }
+                    // First real measurement on a link that had none: seed the
+                    // average verbatim.  Blending against an absent prior would
+                    // have to invent one, dragging the estimate toward a value
+                    // the radio never reported.
+                    None => sample,
+                });
+            }
             return;
         }
 
@@ -130,14 +163,19 @@ impl<Ident: MeshIdentifier, const CAP: usize> LinkQualityTable<Ident, CAP> {
     }
 
     /// The current EWMA-smoothed quality (0..=255) for `(neighbor,
-    /// iface_idx)`, or `None` if the pair has not been observed.  Used to clamp
-    /// an OGM's advertised TQ by the link we actually measure to the relaying
-    /// neighbor (the `local_quality` argument to `BatmanEngine::handle_rx`).
+    /// iface_idx)`.  Used to clamp an OGM's advertised TQ by the link we
+    /// actually measure to the relaying neighbor (the `local_quality` argument
+    /// to `BatmanEngine::handle_rx`).
+    ///
+    /// `None` covers both "the pair has not been observed" and "observed, but
+    /// never measurable" — which the caller wants to treat identically, as *no
+    /// clamp*.  Clamping by a metric-less link's fabricated 0 would zero every
+    /// TQ that passes through it.
     pub fn quality_for(&self, neighbor: Ident, iface_idx: usize) -> Option<u8> {
         self.entries
             .iter()
             .find(|e| e.neighbor == neighbor && e.iface_idx == iface_idx)
-            .map(|e| e.ewma_quality)
+            .and_then(|e| e.ewma_quality)
     }
 
     /// Borrow the table as a contiguous slice of records.  Used by
@@ -148,7 +186,8 @@ impl<Ident: MeshIdentifier, const CAP: usize> LinkQualityTable<Ident, CAP> {
     }
 }
 
-/// Map raw [`LinkMetrics`] to a 0..=255 normalized quality score.
+/// Map raw [`LinkMetrics`] to a 0..=255 normalized quality score, or `None`
+/// when the frame carried no physical-layer measurement at all.
 ///
 /// When `metrics.quality` is `Some`, it is returned verbatim — the driver
 /// has already done the mapping.  Otherwise the function applies a default
@@ -156,12 +195,23 @@ impl<Ident: MeshIdentifier, const CAP: usize> LinkQualityTable<Ident, CAP> {
 ///
 /// * RSSI is mapped linearly across `-120..=-50 dBm` into `0..=255`.
 /// * SNR adds a small bias (≈3 quality units per dB, clamped to ±60).
-/// * Missing fields default to the worst credible value (`-120 dBm` / `0
-///   dB`), so a frame with no metrics scores 0 rather than a misleading
-///   non-zero value.
-pub fn normalize_quality(metrics: &LinkMetrics) -> u8 {
+/// * One missing field (but not both) defaults to the worst credible value
+///   (`-120 dBm` / `0 dB`), so a partial measurement still scores.
+///
+/// **All three fields absent returns `None`, not `0`.** That is the case for
+/// every frame on a metric-less transport — raw L2, UDP, Unix — where there is
+/// no signal to measure rather than a bad one. Scoring it `0` made those links
+/// report 0% quality on the management API while carrying traffic perfectly,
+/// and would clamp every OGM's TQ through them to zero. `None` also keeps such
+/// a link ranked below any real measurement in the egress decision, which is
+/// what the old `-120 dBm` floor was reaching for.
+pub fn normalize_quality(metrics: &LinkMetrics) -> Option<u8> {
     if let Some(q) = metrics.quality {
-        return q;
+        return Some(q);
+    }
+
+    if metrics.rssi_dbm.is_none() && metrics.snr_db.is_none() {
+        return None;
     }
 
     let rssi = metrics.rssi_dbm.unwrap_or(-120);
@@ -172,7 +222,7 @@ pub fn normalize_quality(metrics: &LinkMetrics) -> u8 {
 
     let snr_bias = ((snr as i16) * 3).clamp(-60, 60);
 
-    (rssi_score + snr_bias).clamp(0, 255) as u8
+    Some((rssi_score + snr_bias).clamp(0, 255) as u8)
 }
 
 #[cfg(test)]
@@ -194,7 +244,9 @@ mod tests {
             }
         }
 
-        fn ewma_for(&self, neighbor: Ident, iface_idx: usize) -> Option<u8> {
+        /// The stored quality cell for a pair: the outer `Option` is "row
+        /// exists", the inner one "the row has a measurement".
+        fn ewma_for(&self, neighbor: Ident, iface_idx: usize) -> Option<Option<u8>> {
             self.entries
                 .iter()
                 .find(|e| e.neighbor == neighbor && e.iface_idx == iface_idx)
@@ -221,9 +273,9 @@ mod tests {
     #[test]
     fn single_update_then_lookup() {
         let mut table = LinkQualityTable::<u8>::new();
-        table.update(2, 0, 200);
+        table.update(2, 0, Some(200));
         assert_eq!(table.best_interface_for(2), Some(0));
-        assert_eq!(table.ewma_for(2, 0), Some(200));
+        assert_eq!(table.ewma_for(2, 0), Some(Some(200)));
         assert_eq!(table.sample_count_for(2, 0), Some(1));
         table.assert_invariants();
     }
@@ -232,9 +284,9 @@ mod tests {
     fn best_interface_picks_highest_quality_for_neighbor() {
         let mut table = LinkQualityTable::<u8>::new();
         // Three interfaces all carrying neighbor 5, varying qualities.
-        table.update(5, 0, 100);
-        table.update(5, 1, 250);
-        table.update(5, 2, 50);
+        table.update(5, 0, Some(100));
+        table.update(5, 1, Some(250));
+        table.update(5, 2, Some(50));
         assert_eq!(table.best_interface_for(5), Some(1));
         table.assert_invariants();
     }
@@ -243,25 +295,25 @@ mod tests {
     fn ewma_smooths_repeated_samples() {
         let mut table = LinkQualityTable::<u8>::new();
         // First sample inserts verbatim.
-        table.update(2, 0, 0);
-        assert_eq!(table.ewma_for(2, 0), Some(0));
+        table.update(2, 0, Some(0));
+        assert_eq!(table.ewma_for(2, 0), Some(Some(0)));
 
         // Subsequent identical-value samples don't move the average.
         for _ in 0..10 {
-            table.update(2, 0, 0);
+            table.update(2, 0, Some(0));
         }
-        assert_eq!(table.ewma_for(2, 0), Some(0));
+        assert_eq!(table.ewma_for(2, 0), Some(Some(0)));
 
         // A sudden high sample only moves the EWMA by a fraction of the
         // delta — alpha = 1/4, so 0 + (200 - 0)/4 = 50.
-        table.update(2, 0, 200);
-        assert_eq!(table.ewma_for(2, 0), Some(50));
+        table.update(2, 0, Some(200));
+        assert_eq!(table.ewma_for(2, 0), Some(Some(50)));
 
         // Several more high samples should converge toward the new level.
         for _ in 0..20 {
-            table.update(2, 0, 200);
+            table.update(2, 0, Some(200));
         }
-        let q = table.ewma_for(2, 0).unwrap();
+        let q = table.ewma_for(2, 0).flatten().unwrap();
         assert!(
             q > 195,
             "EWMA should converge toward 200 after sustained high samples, got {q}"
@@ -272,20 +324,20 @@ mod tests {
     #[test]
     fn sample_count_increments_on_each_update() {
         let mut table = LinkQualityTable::<u8>::new();
-        table.update(7, 1, 128);
-        table.update(7, 1, 128);
-        table.update(7, 1, 128);
+        table.update(7, 1, Some(128));
+        table.update(7, 1, Some(128));
+        table.update(7, 1, Some(128));
         assert_eq!(table.sample_count_for(7, 1), Some(3));
     }
 
     #[test]
     fn different_neighbors_do_not_interfere() {
         let mut table = LinkQualityTable::<u8>::new();
-        table.update(2, 0, 200);
-        table.update(3, 0, 50);
+        table.update(2, 0, Some(200));
+        table.update(3, 0, Some(50));
         // Neighbor 2 on iface 0 stays strong; neighbor 3 on iface 0 stays weak.
-        assert_eq!(table.ewma_for(2, 0), Some(200));
-        assert_eq!(table.ewma_for(3, 0), Some(50));
+        assert_eq!(table.ewma_for(2, 0), Some(Some(200)));
+        assert_eq!(table.ewma_for(3, 0), Some(Some(50)));
         assert_eq!(table.best_interface_for(2), Some(0));
         assert_eq!(table.best_interface_for(3), Some(0));
         table.assert_invariants();
@@ -294,15 +346,103 @@ mod tests {
     #[test]
     fn lookup_for_unknown_neighbor_returns_none() {
         let mut table = LinkQualityTable::<u8>::new();
-        table.update(2, 0, 200);
+        table.update(2, 0, Some(200));
         assert_eq!(table.best_interface_for(99), None);
+    }
+
+    // ── unmeasured links ──────────────────────────────────────────────────
+    //
+    // A metric-less transport (raw L2, UDP, Unix) reports no physical-layer
+    // signal at all.  That is categorically different from a radio measuring
+    // a genuinely terrible link, and the table must not conflate the two:
+    // scoring "no data" as 0 made every wired neighbor read 0% on the
+    // management API's link-quality view.
+
+    #[test]
+    fn unmeasured_sample_records_presence_without_quality() {
+        let mut table = LinkQualityTable::<u8>::new();
+        table.update(2, 0, None);
+        // The row exists — the neighbor *was* heard on this interface, and an
+        // inspection API should still list it …
+        assert_eq!(table.sample_count_for(2, 0), Some(1));
+        assert_eq!(table.best_interface_for(2), Some(0));
+        // … but it carries no quality, rather than a fabricated zero.
+        assert_eq!(table.ewma_for(2, 0), Some(None));
+        table.assert_invariants();
+    }
+
+    #[test]
+    fn unmeasured_samples_never_synthesize_a_quality() {
+        let mut table = LinkQualityTable::<u8>::new();
+        for _ in 0..20 {
+            table.update(2, 0, None);
+        }
+        assert_eq!(table.ewma_for(2, 0), Some(None));
+        assert_eq!(table.sample_count_for(2, 0), Some(20));
+        table.assert_invariants();
+    }
+
+    #[test]
+    fn measured_sample_seeds_ewma_after_unmeasured_history() {
+        let mut table = LinkQualityTable::<u8>::new();
+        table.update(2, 0, None);
+        table.update(2, 0, None);
+        // The first real measurement seeds the average verbatim; blending it
+        // against an absent prior would drag it toward a value never observed.
+        table.update(2, 0, Some(200));
+        assert_eq!(table.ewma_for(2, 0), Some(Some(200)));
+        assert_eq!(table.sample_count_for(2, 0), Some(3));
+        table.assert_invariants();
+    }
+
+    #[test]
+    fn unmeasured_sample_does_not_erase_a_measured_estimate() {
+        let mut table = LinkQualityTable::<u8>::new();
+        table.update(2, 0, Some(200));
+        // One metric-less frame on an otherwise-measured radio link must not
+        // discard the estimate built from real samples.
+        table.update(2, 0, None);
+        assert_eq!(table.ewma_for(2, 0), Some(Some(200)));
+        assert_eq!(table.sample_count_for(2, 0), Some(2));
+        table.assert_invariants();
+    }
+
+    #[test]
+    fn quality_for_is_none_on_an_unmeasured_link() {
+        let mut table = LinkQualityTable::<u8>::new();
+        table.update(2, 0, None);
+        // `quality_for` feeds the OGM TQ clamp.  An unmeasured link must yield
+        // no clamp at all — clamping by a synthesized 0 would zero every TQ.
+        assert_eq!(table.quality_for(2, 0), None);
+    }
+
+    #[test]
+    fn best_interface_prefers_a_measured_link_over_an_unmeasured_one() {
+        let mut table = LinkQualityTable::<u8>::new();
+        table.update(5, 0, None);
+        table.update(5, 1, Some(10));
+        // Even a weak *measurement* beats no measurement: an unmeasurable
+        // link must not win the egress decision on a fabricated score.
+        assert_eq!(table.best_interface_for(5), Some(1));
+        table.assert_invariants();
+    }
+
+    #[test]
+    fn best_interface_still_resolves_when_every_link_is_unmeasured() {
+        let mut table = LinkQualityTable::<u8>::new();
+        table.update(5, 0, None);
+        table.update(5, 1, None);
+        // The all-wired host case: no link is measurable, but the neighbor is
+        // still reachable and egress must resolve to *some* interface.
+        assert!(table.best_interface_for(5).is_some());
+        table.assert_invariants();
     }
 
     #[test]
     fn retain_live_drops_dead_neighbor() {
         let mut table = LinkQualityTable::<u8>::new();
-        table.update(2, 0, 200);
-        table.update(3, 0, 200);
+        table.update(2, 0, Some(200));
+        table.update(3, 0, Some(200));
         table.retain_live(|neighbor| neighbor == 2);
         assert_eq!(table.best_interface_for(2), Some(0));
         assert_eq!(table.best_interface_for(3), None);
@@ -312,9 +452,9 @@ mod tests {
     #[test]
     fn retain_live_drops_all_ifaces_of_dead_neighbor() {
         let mut table = LinkQualityTable::<u8>::new();
-        table.update(5, 0, 200);
-        table.update(5, 1, 150);
-        table.update(5, 2, 100);
+        table.update(5, 0, Some(200));
+        table.update(5, 1, Some(150));
+        table.update(5, 2, Some(100));
         table.retain_live(|neighbor| neighbor != 5);
         assert_eq!(table.quality_for(5, 0), None);
         assert_eq!(table.quality_for(5, 1), None);
@@ -325,9 +465,9 @@ mod tests {
     #[test]
     fn retain_live_keeps_all_ifaces_of_live_neighbor() {
         let mut table = LinkQualityTable::<u8>::new();
-        table.update(5, 0, 200);
-        table.update(5, 1, 150);
-        table.update(5, 2, 100);
+        table.update(5, 0, Some(200));
+        table.update(5, 1, Some(150));
+        table.update(5, 2, Some(100));
         table.retain_live(|neighbor| neighbor == 5);
         assert_eq!(table.quality_for(5, 0), Some(200));
         assert_eq!(table.quality_for(5, 1), Some(150));
@@ -350,12 +490,12 @@ mod tests {
         // except one weak entry.
         for n in 0..(LINK_QUALITY_CAPACITY as u16) {
             let q = if n == 7 { 10 } else { 200 };
-            table.update(n as u8, 0, q);
+            table.update(n as u8, 0, Some(q));
         }
         assert_eq!(table.entries.len(), LINK_QUALITY_CAPACITY);
 
         // Inserting one more entry should evict the weak (neighbor 7) row.
-        table.update(200, 0, 180);
+        table.update(200, 0, Some(180));
         assert_eq!(
             table.best_interface_for(7),
             None,
@@ -375,7 +515,7 @@ mod tests {
             snr_db: Some(20),
             quality: Some(42),
         };
-        assert_eq!(normalize_quality(&metrics), 42);
+        assert_eq!(normalize_quality(&metrics), Some(42));
     }
 
     #[test]
@@ -385,7 +525,8 @@ mod tests {
             snr_db: Some(-20),
             quality: None,
         };
-        assert_eq!(normalize_quality(&metrics), 0);
+        // A measured-but-terrible link is a real 0 — distinct from `None`.
+        assert_eq!(normalize_quality(&metrics), Some(0));
     }
 
     #[test]
@@ -395,7 +536,19 @@ mod tests {
             snr_db: Some(20),
             quality: None,
         };
-        assert_eq!(normalize_quality(&metrics), 255);
+        assert_eq!(normalize_quality(&metrics), Some(255));
+    }
+
+    #[test]
+    fn normalize_scores_a_partial_measurement() {
+        // Only SNR available: still a measurement, so the curve applies with
+        // RSSI at its worst-credible default rather than reporting "no data".
+        let metrics = LinkMetrics {
+            rssi_dbm: None,
+            snr_db: Some(10),
+            quality: None,
+        };
+        assert_eq!(normalize_quality(&metrics), Some(30));
     }
 
     #[test]
@@ -417,10 +570,12 @@ mod tests {
     }
 
     #[test]
-    fn normalize_treats_missing_fields_as_worst_credible() {
-        // No metrics at all → 0.  A driver that can't measure must not
-        // accidentally win the egress decision over one that can.
+    fn normalize_reports_no_measurement_when_every_field_is_absent() {
+        // No metrics at all → `None`, not a fabricated 0.  This is what a
+        // metric-less transport (raw L2, UDP, Unix) reports on every frame;
+        // scoring it 0 would both misreport the link as dead-quality and
+        // wrongly clamp the OGM TQ through it.
         let blank = LinkMetrics::default();
-        assert_eq!(normalize_quality(&blank), 0);
+        assert_eq!(normalize_quality(&blank), None);
     }
 }
