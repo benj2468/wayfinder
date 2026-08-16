@@ -32,39 +32,132 @@ class NoLinkError(ValueError):
 
 
 if TYPE_CHECKING:
-    from .channel import Channel, ChannelSample, FreeSpacePathLoss, PerfectWire
+    from .channel import (
+        Channel,
+        ChannelSample,
+        EarthOccluded,
+        FreeSpacePathLoss,
+        PerfectWire,
+        RadioModel,
+        TerrainMasked,
+        knife_edge_loss_db,
+    )
+    from .connectivity import (
+        ConnectivityStats,
+        Outage,
+        connectivity_stats,
+        outage_windows,
+    )
+    from .interactive import Timeline, terrain_scene, track_scene, write_html
     from .link import Link
-    from .mobility import Mobility, Orbit, Static, Vec3, Waypoints
+    from .mobility import (
+        EARTH_RADIUS_M,
+        EarthOrbit,
+        GreatCircle,
+        Mobility,
+        Orbit,
+        Static,
+        Vec3,
+        Waypoints,
+    )
     from .node import Node
     from .recorder import Recorder
+    from .report import (
+        ImagePanel,
+        RunReport,
+        ScenePanel,
+        sweep_report_html,
+        write_sweep_report,
+    )
     from .scenario import Simulation
     from .sweep import SweepResult, run_sweep
+    from .terrain import (
+        Bounds,
+        FlatGround,
+        GaussianPeak,
+        Heightmap,
+        MountainRange,
+        Terrain,
+        TerrainFollowing,
+        elevation_profile,
+        has_line_of_sight,
+        max_fresnel_parameter,
+        peak_sites,
+        valley_sites,
+    )
 
 __all__ = [
+    "EARTH_RADIUS_M",
+    "Bounds",
     "Channel",
     "ChannelSample",
+    "ConnectivityStats",
+    "EarthOccluded",
+    "EarthOrbit",
+    "FlatGround",
     "FreeSpacePathLoss",
+    "GaussianPeak",
+    "GreatCircle",
+    "Heightmap",
+    "ImagePanel",
     "Link",
     "Mobility",
+    "MountainRange",
     "NoLinkError",
     "Node",
     "Orbit",
+    "Outage",
     "PerfectWire",
+    "RadioModel",
     "Recorder",
+    "RunReport",
+    "ScenePanel",
     "Simulation",
     "Static",
     "SweepResult",
+    "Terrain",
+    "TerrainFollowing",
+    "TerrainMasked",
+    "Timeline",
     "Vec3",
     "Waypoints",
+    "connectivity_stats",
+    "elevation_profile",
+    "has_line_of_sight",
+    "knife_edge_loss_db",
+    "max_fresnel_parameter",
+    "outage_windows",
+    "peak_sites",
     "run_sweep",
+    "sweep_report_html",
+    "terrain_scene",
+    "track_scene",
+    "valley_sites",
+    "write_html",
+    "write_sweep_report",
 ]
 
 # name -> submodule it lives in.
 _EXPORTS = {
     "Channel": "channel",
     "ChannelSample": "channel",
+    "EARTH_RADIUS_M": "mobility",
+    "EarthOccluded": "channel",
+    "EarthOrbit": "mobility",
     "FreeSpacePathLoss": "channel",
+    "GreatCircle": "mobility",
     "PerfectWire": "channel",
+    "RadioModel": "channel",
+    "TerrainMasked": "channel",
+    "knife_edge_loss_db": "channel",
+    "ConnectivityStats": "connectivity",
+    "Outage": "connectivity",
+    "connectivity_stats": "connectivity",
+    "outage_windows": "connectivity",
+    "Timeline": "interactive",
+    "terrain_scene": "interactive",
+    "track_scene": "interactive",
+    "write_html": "interactive",
     "Link": "link",
     "Mobility": "mobility",
     "Orbit": "mobility",
@@ -73,9 +166,26 @@ _EXPORTS = {
     "Waypoints": "mobility",
     "Node": "node",
     "Recorder": "recorder",
+    "ImagePanel": "report",
+    "RunReport": "report",
+    "ScenePanel": "report",
+    "sweep_report_html": "report",
+    "write_sweep_report": "report",
     "Simulation": "scenario",
     "SweepResult": "sweep",
     "run_sweep": "sweep",
+    "Bounds": "terrain",
+    "FlatGround": "terrain",
+    "GaussianPeak": "terrain",
+    "Heightmap": "terrain",
+    "MountainRange": "terrain",
+    "Terrain": "terrain",
+    "TerrainFollowing": "terrain",
+    "elevation_profile": "terrain",
+    "has_line_of_sight": "terrain",
+    "max_fresnel_parameter": "terrain",
+    "peak_sites": "terrain",
+    "valley_sites": "terrain",
 }
 
 

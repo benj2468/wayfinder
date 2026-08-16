@@ -203,6 +203,80 @@ class Simulation:
             return "*"
         return self._states[src].interfaces[egress.interface].name
 
+    def link_quality(self, src: str, neighbor: str) -> float | None:
+        """`src`'s own estimate of the link it hears `neighbor` on — the EWMA
+        over frames received directly from it — or `None` if `src` has no
+        live record for it at all.
+
+        The neighbour-table question, as distinct from `route_via`'s
+        forwarding one. A link can be perfectly alive while the route ignores
+        it (a better path exists, or the end-to-end quality through it is too
+        weak to be chosen), and a study that can only ask where traffic goes
+        reads every such link as absent. `None` is the real "not in contact"
+        answer: the record is dropped once `src` stops hearing `neighbor`.
+
+        Where the two are joined by more than one link, this is the best of
+        them — the one the router would use.
+        """
+        mac = self._states[neighbor].mac
+        qualities = [
+            record.ewma_quality
+            for record in self._states[src].driver.link_quality_records()
+            if record.neighbor == mac
+        ]
+        return max(qualities) if qualities else None
+
+    def link_age_ms(self, src: str, neighbor: str) -> float | None:
+        """How long since `src` last heard `neighbor` directly, in
+        milliseconds, or `None` if it has no direct-path record for it at all.
+
+        The companion to `link_quality`, and the one that can say a link has
+        *stopped*. Quality is an EWMA over frames that arrived, so it holds
+        its last value indefinitely once they stop arriving — a hop nothing
+        has crossed for half a minute still reports the quality it had when
+        it was working. Only the timestamp moves.
+
+        Direct-path only: a destination reached through someone else has no
+        link age here, however fresh the route to it is.
+        """
+        mac = self._states[neighbor].mac
+        for record in self._states[src].driver.originator_table():
+            if record.originator != mac:
+                continue
+            # The path whose next hop *is* the destination: the frames `src`
+            # received from `neighbor` itself, not ones it relayed.
+            heard = [p.last_heard_ms for p in record.paths if p.neighbor == mac]
+            if heard:
+                return self.env.now - max(heard)
+        return None
+
+    def reachable(
+        self, src: str, targets: Sequence[str] | None = None
+    ) -> tuple[str, ...]:
+        """Which of `targets` `src` currently has *any* route to, in the order
+        given (default: every other node, in declaration order).
+
+        The set form of `route_via`, for the coverage question a mobility
+        study actually asks: not "which link does this node forward on" but
+        "is it in touch with anything at all". Pass `targets` to narrow that
+        to the nodes that count — typically the ground relays with backhaul,
+        since being routable only via another airborne node is not the same
+        as being connected.
+
+        Truthiness is the connectivity signal: an empty tuple means
+        unreachable, which is what `connectivity.connectivity_stats` reads by
+        default.
+        """
+        if src not in self._states:
+            raise KeyError(src)
+        if targets is None:
+            targets = [name for name in self._states if name != src]
+        return tuple(
+            name
+            for name in targets
+            if name != src and self.egress_interface(src, name) is not None
+        )
+
     def sample_channel(self, a: str, b: str):
         """Evaluate the link joining `a` and `b` right now, on a dedicated
         probe RNG stream so recording it never perturbs simulated delivery."""

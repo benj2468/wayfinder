@@ -23,7 +23,7 @@ dependencies = ["simpy", "wayfinder-py"]
 # and never draws anything, and matplotlib is a large dependency to impose on
 # it. `__init__.py` resolves exports lazily, so importing any other submodule
 # never trips over its absence.
-plot = ["matplotlib"]
+plot = ["matplotlib", "plotly"]
 
 [tool.uv.sources]
 wayfinder-py = { workspace = true }

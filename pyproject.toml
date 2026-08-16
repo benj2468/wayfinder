@@ -28,7 +28,7 @@ dev = ["pytest", "ruff", "basedpyright", "ty", "uv"]
 # and nothing else in the repo draws. The simulator itself is always installed;
 # this adds only its `plot` extra. Run a scenario with
 # `uv run --group sim python sim/scenarios/<name>.py`.
-sim = ["wayfinder-sim[plot]"]
+sim = ["wayfinder-sim[plot,interactive]"]
 
 [tool.uv]
 # This root project is just the dev-tooling/test harness for the monorepo —

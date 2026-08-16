@@ -1,12 +1,9 @@
-"""Shared chart chrome — palette per the dataviz skill's validated reference
-instance (`references/palette.md`): the full 8-hue categorical set (blue,
-aqua, yellow, green, violet, red, magenta, orange, in that order), light
-chart surface, muted ink for axes/gridlines. Reused verbatim (not
-re-derived), since these are the pre-validated default hues (ordered to
-maximize the minimum adjacent CVD-safe color distance), not a new brand
-palette. Only the first 2 mattered while every scenario's categorical charts
-had 2 states; a 3+-state chart (e.g. more than one alternate route) needs
-the rest, so all 8 are here up front rather than patched in per scenario.
+"""Shared chart chrome for static matplotlib figures.
+
+The palette itself lives in `palette.py` (and is re-exported here, so
+existing `from .plotting import PALETTE` imports keep working) — it is shared
+with the plotly-backed `interactive` module, and neither renderer should have
+to import the other's stack to agree on colors.
 
 Only imported when a scenario actually plots — keeps matplotlib out of the
 import graph for pure-logic engine use (see `__init__.py`).
@@ -14,48 +11,17 @@ import graph for pure-logic engine use (see `__init__.py`).
 
 from __future__ import annotations
 
-import dataclasses
-from collections.abc import Iterable, Mapping
+import math
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, cast
 
 from matplotlib.axes import Axes
 from mpl_toolkits.mplot3d.axes3d import Axes3D
 
+from .connectivity import Outage
 from .mobility import Vec3
-
-
-@dataclasses.dataclass(frozen=True)
-class Palette:
-    """A small, ordered set of categorical series hues plus the ink/surface
-    colors every panel in a chart shares."""
-
-    series: tuple[str, ...]
-    surface: str
-    ink_primary: str
-    ink_secondary: str
-    ink_muted: str
-    gridline: str
-    axis: str
-
-
-PALETTE = Palette(
-    series=(
-        "#2a78d6",  # blue
-        "#1baf7a",  # aqua
-        "#eda100",  # yellow
-        "#008300",  # green
-        "#4a3aa7",  # violet
-        "#e34948",  # red
-        "#e87ba4",  # magenta
-        "#eb6834",  # orange
-    ),
-    surface="#fcfcfb",
-    ink_primary="#0b0b0b",
-    ink_secondary="#52514e",
-    ink_muted="#898781",
-    gridline="#e1e0d9",
-    axis="#c3c2b7",
-)
+from .palette import PALETTE, TERRAIN_RAMP, Palette
+from .terrain import Bounds, Terrain
 
 
 def style_axes(axes: Iterable[Axes], palette: Palette = PALETTE) -> None:
@@ -163,3 +129,178 @@ def point_3d(
         marker=marker,
         s=size,
     )  # pyright: ignore[reportArgumentType]
+
+
+def _terrain_colormap(ramp: Sequence[str] = TERRAIN_RAMP):
+    from matplotlib.colors import LinearSegmentedColormap
+
+    return LinearSegmentedColormap.from_list("wayfinder_terrain", list(ramp))
+
+
+def terrain_surface_3d(
+    ax: Axes3D,
+    terrain: Terrain,
+    bounds: Bounds,
+    *,
+    resolution: int = 60,
+    ramp: Sequence[str] = TERRAIN_RAMP,
+    alpha: float = 0.9,
+) -> None:
+    """The ground itself, as a shaded relief surface under the trajectories.
+
+    `resolution` is the number of samples per axis — this is a picture, not
+    the model the channel evaluates against, so it can be far coarser than
+    the terrain's real detail without affecting any result.
+    """
+    if resolution < 2:
+        raise ValueError(f"resolution must be at least 2, got {resolution!r}")
+
+    xs = [
+        bounds.min_x + bounds.width_m * i / (resolution - 1) for i in range(resolution)
+    ]
+    ys = [
+        bounds.min_y + bounds.depth_m * j / (resolution - 1) for j in range(resolution)
+    ]
+    # `plot_surface` requires real ndarrays rather than nested sequences.
+    # numpy is a hard dependency of matplotlib, so it is always present
+    # wherever this module is importable at all (the `plot` extra).
+    import numpy as np
+
+    grid_x = np.array([list(xs) for _ in ys])
+    grid_y = np.array([[y for _ in xs] for y in ys])
+    grid_z = np.array([[terrain.elevation(x, y) for x in xs] for y in ys])
+
+    cast(Any, ax).plot_surface(
+        grid_x,
+        grid_y,
+        grid_z,
+        cmap=_terrain_colormap(ramp),
+        linewidth=0,
+        antialiased=True,
+        alpha=alpha,
+        rstride=1,
+        cstride=1,
+    )
+
+
+def terrain_contour(
+    ax: Axes,
+    terrain: Terrain,
+    bounds: Bounds,
+    *,
+    resolution: int = 120,
+    levels: int = 12,
+    ramp: Sequence[str] = TERRAIN_RAMP,
+):
+    """The ground as a filled contour map, seen from above — the base layer
+    for a plan-view coverage chart.
+
+    Preferred over `terrain_surface_3d` whenever the question is *where*
+    something happened along a route: a 3D surface renders a track behind the
+    peaks it passes (matplotlib composites surfaces and lines by painter's
+    order, not by depth), while a plan view never hides it. Returns the
+    contour set, so a caller can hang a colorbar off it.
+    """
+    if resolution < 2:
+        raise ValueError(f"resolution must be at least 2, got {resolution!r}")
+
+    xs = [
+        bounds.min_x + bounds.width_m * i / (resolution - 1) for i in range(resolution)
+    ]
+    ys = [
+        bounds.min_y + bounds.depth_m * j / (resolution - 1) for j in range(resolution)
+    ]
+    grid_z = [[terrain.elevation(x, y) for x in xs] for y in ys]
+
+    return ax.contourf(xs, ys, grid_z, levels=levels, cmap=_terrain_colormap(ramp))
+
+
+def terrain_profile(
+    ax: Axes,
+    terrain: Terrain,
+    a: Vec3,
+    b: Vec3,
+    *,
+    freq_hz: float | None = None,
+    samples: int = 128,
+    palette: Palette = PALETTE,
+    ramp: Sequence[str] = TERRAIN_RAMP,
+) -> None:
+    """A vertical slice through the ground between two nodes, with the line of
+    sight over it — the chart that explains *why* a link works or doesn't,
+    where a distance-vs-quality plot can only show that it doesn't.
+
+    Pass `freq_hz` to also draw the first Fresnel zone, whose intrusion (not
+    the bare line of sight) is what actually governs diffraction loss.
+    """
+    from .terrain import elevation_profile, fresnel_radius_m
+
+    profile = elevation_profile(terrain, a, b, samples=samples)
+    if not profile:
+        return
+
+    total_m = math.dist((a.x, a.y), (b.x, b.y))
+    # Endpoints are excluded from the profile by design, but the picture wants
+    # the ground and the sight line to run the full span.
+    distances = [0.0, *(p.distance_m for p in profile), total_m]
+    ground = [
+        terrain.elevation(a.x, a.y),
+        *(p.position.z for p in profile),
+        terrain.elevation(b.x, b.y),
+    ]
+    line_of_sight = [a.z, *(p.los_z_m for p in profile), b.z]
+
+    ax.fill_between(distances, 0, ground, color=ramp[-2], label="Ground")
+    ax.plot(
+        distances,
+        line_of_sight,
+        color=palette.series[0],
+        linewidth=2,
+        label="Line of sight",
+    )
+
+    if freq_hz is not None:
+        radii = [
+            0.0,
+            *(
+                fresnel_radius_m(p.distance_m, total_m - p.distance_m, freq_hz)
+                for p in profile
+            ),
+            0.0,
+        ]
+        ax.fill_between(
+            distances,
+            [z - r for z, r in zip(line_of_sight, radii)],
+            [z + r for z, r in zip(line_of_sight, radii)],
+            color=palette.series[0],
+            alpha=0.15,
+            linewidth=0,
+            label="First Fresnel zone",
+        )
+
+    ax.set_ylim(bottom=0)
+
+
+def outage_spans(
+    ax: Axes,
+    outages: Iterable[Outage],
+    *,
+    palette: Palette = PALETTE,
+    label: str | None = "No route",
+) -> None:
+    """Shade every connectivity outage across an existing panel, so the gaps
+    are read against whatever that panel plots (altitude, distance, quality)
+    rather than as a separate timeline the eye has to correlate by hand.
+
+    Only the first span carries `label`, so the legend gets one entry rather
+    than one per outage.
+    """
+    for i, outage in enumerate(outages):
+        ax.axvspan(
+            outage.start_s,
+            outage.end_s,
+            color=palette.series[5],  # red — a loss-of-service state, not a series
+            alpha=0.18,
+            linewidth=0,
+            label=label if i == 0 else None,
+        )
