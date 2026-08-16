@@ -222,7 +222,9 @@ deploy:
   # multi-platform (linux/amd64 + linux/arm64) images. A tagged commit is a
   # release: the images are tagged with the git tag itself (e.g.
   # wayfinder-tap:v1.2.3). Any other commit is a dev build, tagged
-  # dev-<short commit sha>. Registry auth follows the build-image job's
+  # dev-<short commit sha>. A dev build of the default branch additionally gets
+  # the moving `nightly` tag, so `wayfinder-tap:nightly` always resolves to the
+  # newest image built from main. Registry auth follows the build-image job's
   # convention (the runner is pre-authenticated to $CI_REGISTRY_IMAGE).
   #
   # containers/Dockerfile cross-compiles natively for each target arch (see
@@ -242,20 +244,31 @@ deploy:
       EOF
     - docker buildx create --use --name wayfinder-builder --driver-opt network=host --config buildkitd.toml
     - |
+      EXTRA_TAG=""
       if [ -n "$CI_COMMIT_TAG" ]; then
         IMAGE_TAG="$CI_COMMIT_TAG"
       else
         IMAGE_TAG="dev-$CI_COMMIT_SHORT_SHA"
+        if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+          EXTRA_TAG="nightly"
+        fi
       fi
-      echo "Building wayfinder-tap, wayfinder-tui, wayfinder-ctl and wayfinder-web images (linux/amd64, linux/arm64) tagged '$IMAGE_TAG'"
+      echo "Building wayfinder-tap, wayfinder-tui, wayfinder-ctl and wayfinder-web images (linux/amd64, linux/arm64) tagged '$IMAGE_TAG'${EXTRA_TAG:+ and '$EXTRA_TAG'}"
       for app in tap tui ctl web; do
         image="$CI_REGISTRY_IMAGE/wayfinder-$app:$IMAGE_TAG"
+        # Both tags name the same manifest, so buildx builds once and pushes it
+        # under each name — no second build for the nightly tag.
+        extra_tag_arg=""
+        if [ -n "$EXTRA_TAG" ]; then
+          extra_tag_arg="--tag $CI_REGISTRY_IMAGE/wayfinder-$app:$EXTRA_TAG"
+        fi
         docker buildx build \
           --builder wayfinder-builder \
           --platform linux/amd64,linux/arm64 \
           -f containers/Dockerfile \
           --target "$app" \
           -t "$image" \
+          $extra_tag_arg \
           --push \
           .
       done

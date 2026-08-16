@@ -175,3 +175,145 @@ def test_node_for_mac_inverts_the_mac_assignment():
 
     assert sim.node_for_mac(sim.mac("b")) == "b"
     assert sim.node_for_mac(wf.PyMac(b"\xff\xff\xff\xff\xff\xfe")) is None
+
+
+# --- reachability -----------------------------------------------------------
+
+
+def test_reachable_lists_every_node_with_a_route():
+    """A coverage study asks "is this node in touch with *anything*", not
+    "what is its route to one named peer", so the engine has to answer the
+    set question directly."""
+    nodes = [Node(n, trickle=(50, 500)) for n in ("a", "b", "c")]
+    links = [pair("a", "b", PerfectWire()), pair("b", "c", PerfectWire())]
+    sim = Simulation(nodes, links, seed=0)
+
+    sim.run(until_s=5.0, sample_interval_ms=50)
+
+    assert sim.reachable("a") == ("b", "c")
+
+
+def test_reachable_is_empty_before_anything_converges():
+    nodes = [Node(n, trickle=(50, 500)) for n in ("a", "b")]
+    sim = Simulation(nodes, [pair("a", "b", PerfectWire())], seed=0)
+
+    assert sim.reachable("a") == ()
+
+
+def test_reachable_never_includes_the_source_itself():
+    nodes = [Node(n, trickle=(50, 500)) for n in ("a", "b")]
+    sim = Simulation(nodes, [pair("a", "b", PerfectWire())], seed=0)
+
+    sim.run(until_s=3.0, sample_interval_ms=50)
+
+    assert "a" not in sim.reachable("a")
+
+
+def test_reachable_can_be_restricted_to_named_targets():
+    """The question is usually "in touch with a *gateway*", not "in touch with
+    any node at all" — a drone routable only via another drone is not
+    connected to the ground."""
+    nodes = [Node(n, trickle=(50, 500)) for n in ("a", "b", "c")]
+    links = [pair("a", "b", PerfectWire()), pair("b", "c", PerfectWire())]
+    sim = Simulation(nodes, links, seed=0)
+
+    sim.run(until_s=5.0, sample_interval_ms=50)
+
+    assert sim.reachable("a", ("c",)) == ("c",)
+
+
+def test_reachable_preserves_the_order_of_the_targets_given():
+    nodes = [Node(n, trickle=(50, 500)) for n in ("a", "b", "c")]
+    links = [pair("a", "b", PerfectWire()), pair("b", "c", PerfectWire())]
+    sim = Simulation(nodes, links, seed=0)
+
+    sim.run(until_s=5.0, sample_interval_ms=50)
+
+    assert sim.reachable("a", ("c", "b")) == ("c", "b")
+
+
+def test_reachable_rejects_an_unknown_node():
+    sim = Simulation([Node("a")], [], seed=0)
+    with pytest.raises(KeyError):
+        sim.reachable("nope")
+
+
+# --- neighbour link quality --------------------------------------------------
+
+
+def test_link_quality_reports_a_live_neighbours_estimate():
+    """ "Is this hop alive right now" is a different question from "is this
+    where traffic goes" — a link can be carrying frames while the route
+    ignores it, and a render that can only ask the second one draws a live
+    relay as absent."""
+    nodes = [Node(n, trickle=(50, 500)) for n in ("a", "b")]
+    sim = Simulation(nodes, [pair("a", "b", PerfectWire())], seed=0)
+
+    sim.run(until_s=3.0, sample_interval_ms=50)
+
+    assert sim.link_quality("a", "b") > 0
+
+
+def test_link_quality_is_none_for_a_neighbour_never_heard_from():
+    nodes = [Node(n, trickle=(50, 500)) for n in ("a", "b")]
+    sim = Simulation(nodes, [pair("a", "b", PerfectWire())], seed=0)
+
+    assert sim.link_quality("a", "b") is None
+
+
+def test_link_quality_is_none_across_a_node_that_is_not_a_neighbour():
+    """Two hops apart is not a link: `a` hears `c` only through `b`, so it has
+    no local estimate for it however well the route works."""
+    nodes = [Node(n, trickle=(50, 500)) for n in ("a", "b", "c")]
+    links = [pair("a", "b", PerfectWire()), pair("b", "c", PerfectWire())]
+    sim = Simulation(nodes, links, seed=0)
+
+    sim.run(until_s=5.0, sample_interval_ms=50)
+
+    assert sim.route_via("a", "c") is not None
+    assert sim.link_quality("a", "c") is None
+
+
+def test_link_quality_rejects_an_unknown_node():
+    sim = Simulation([Node("a")], [], seed=0)
+    with pytest.raises(KeyError):
+        sim.link_quality("nope", "a")
+
+
+def test_link_age_reports_how_long_since_the_neighbour_was_heard():
+    """Quality alone cannot say whether a link is still *there*: the estimate
+    is an EWMA over frames that arrived, so it holds its last value for as
+    long as nothing arrives at all. Only the timestamp goes stale."""
+    nodes = [Node(n, trickle=(50, 500)) for n in ("a", "b")]
+    sim = Simulation(nodes, [pair("a", "b", PerfectWire())], seed=0)
+
+    sim.run(until_s=3.0, sample_interval_ms=50)
+
+    age_ms = sim.link_age_ms("a", "b")
+    assert 0 <= age_ms <= 1000
+
+
+def test_link_age_is_none_for_a_neighbour_never_heard_from():
+    nodes = [Node(n, trickle=(50, 500)) for n in ("a", "b")]
+    sim = Simulation(nodes, [pair("a", "b", PerfectWire())], seed=0)
+
+    assert sim.link_age_ms("a", "b") is None
+
+
+def test_link_age_is_none_across_a_node_that_is_not_a_neighbour():
+    """`a` hears `c` only through `b`, so there is no direct link whose age
+    could be reported — however fresh the route through `b` is."""
+    nodes = [Node(n, trickle=(50, 500)) for n in ("a", "b", "c")]
+    links = [pair("a", "b", PerfectWire()), pair("b", "c", PerfectWire())]
+    sim = Simulation(nodes, links, seed=0)
+
+    sim.run(until_s=5.0, sample_interval_ms=50)
+
+    assert sim.route_via("a", "c") is not None
+    assert sim.link_age_ms("a", "c") is None
+
+
+def test_link_age_rejects_an_unknown_node():
+    sim = Simulation([Node("a")], [], seed=0)
+    with pytest.raises(KeyError):
+        sim.link_age_ms("nope", "a")

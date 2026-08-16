@@ -29,8 +29,8 @@ links:
   # configured per peer — so pointing a second node at the same physical
   # network is all it takes to grow the mesh.
   - type: RawL2
-    interface: enp2s0
-    ethertype: 0xcafe
+    interface: eth0
+    ethertype: 0xfafa
 
 # A BLE advertising link, which is what makes this node able to front a
 # terminal mesh of nRF52840s. Commented out because it has a host

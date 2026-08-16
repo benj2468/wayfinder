@@ -238,47 +238,54 @@
           pre-commit.settings.hooks.treefmt.enable = true;
 
           devShells.default = pkgs.mkShell.override { stdenv = pkgs.clangStdenv; } {
-            packages = with pkgs; [
-              nil
-              nixd
-              rustToolchain
-              cargo-nextest
-              cargo-machete
-              cargo-llvm-cov
-              cargo-fuzz
-              cargo-binutils
-              # Build driver for `bins/wayfinder-web`: compiles the axum server
-              # and the wasm hydration bundle together and serves them
-              # (`cargo leptos watch`). `binaryen` supplies the `wasm-opt` it
-              # shells out to for release bundles.
-              cargo-leptos
-              rust-analyzer
-              binaryen
-              # cargo-leptos shells out to `wasm-bindgen` to generate the JS
-              # glue, and refuses to run if the CLI's version differs from the
-              # `wasm-bindgen` crate's. Hence the exact-version attribute rather
-              # than plain `wasm-bindgen-cli`: it is pinned in lockstep with the
-              # `=0.2.126` in `bins/wayfinder-web/Cargo.toml`, and the two must
-              # be bumped together.
-              wasm-bindgen-cli_0_2_126
-              pytestEnv
-              python312Packages.virtualenv
-              maturin
-              uv
-              socat
-              protobuf
-              buf
-              tshark
-              glab
-              just
-              stdenv.cc.cc.lib
-              probe-rs-tools
-              flip-link
-              nrfutil.withAllExtensions
-              nrf5-sdk
-              nrf-command-line-tools
-              nrfutilNrf5sdkTools
-            ];
+            packages =
+              let
+                onlyLinuxPkgs = with pkgs; [
+                  probe-rs-tools
+                  flip-link
+                  nrfutil.withAllExtensions
+                  nrf5-sdk
+                  nrf-command-line-tools
+                  nrfutilNrf5sdkTools
+                ];
+              in
+              with pkgs;
+              [
+                nil
+                nixd
+                rustToolchain
+                cargo-nextest
+                cargo-machete
+                cargo-llvm-cov
+                cargo-fuzz
+                cargo-binutils
+                # Build driver for `bins/wayfinder-web`: compiles the axum server
+                # and the wasm hydration bundle together and serves them
+                # (`cargo leptos watch`). `binaryen` supplies the `wasm-opt` it
+                # shells out to for release bundles.
+                cargo-leptos
+                rust-analyzer
+                binaryen
+                # cargo-leptos shells out to `wasm-bindgen` to generate the JS
+                # glue, and refuses to run if the CLI's version differs from the
+                # `wasm-bindgen` crate's. Hence the exact-version attribute rather
+                # than plain `wasm-bindgen-cli`: it is pinned in lockstep with the
+                # `=0.2.126` in `bins/wayfinder-web/Cargo.toml`, and the two must
+                # be bumped together.
+                wasm-bindgen-cli_0_2_126
+                pytestEnv
+                python312Packages.virtualenv
+                maturin
+                uv
+                socat
+                protobuf
+                buf
+                tshark
+                glab
+                just
+                stdenv.cc.cc.lib
+              ]
+              ++ (pkgs.lib.optionals pkgs.stdenv.isLinux onlyLinuxPkgs);
 
             buildInputs = with pkgs; [
               dbus
