@@ -646,6 +646,64 @@ fn security_renders_the_enrollment_policy_on_a_provider() {
     );
 }
 
+/// With authentication off, the tab says so in words and renders none of the
+/// identity fields — every one of which would be empty or zero.
+///
+/// The state with the least data on the screen, and the one the other cases
+/// never reach: a node with no `OgmAuth` reports an empty MAC, a zero mesh id
+/// and no per-node rows, so anything that reads them has nothing to read.
+#[test]
+fn security_says_plainly_when_the_mesh_is_unauthenticated() {
+    let mut snap = seeded_snapshot();
+    snap.security = Some(GetSecurityStatusResponse {
+        auth_enabled: false,
+        require_auth: false,
+        ..Default::default()
+    });
+    let html = render_with(Some(snap), || view! { <Security /> });
+
+    assert!(
+        html.contains("Disabled"),
+        "authentication reads off: {html}"
+    );
+    assert!(
+        html.contains("does not authenticate its members"),
+        "and what that means is spelled out: {html}"
+    );
+    assert!(
+        !html.contains("Mesh id"),
+        "no identity fields, which would all be empty: {html}"
+    );
+    assert!(
+        html.contains("No other nodes known yet"),
+        "the node table says why it is empty: {html}"
+    );
+}
+
+/// The posture switches are still offered with authentication off — and
+/// `require_auth` most of all, since turning it on is exactly what takes such a
+/// node off the mesh, and hiding the control would hide the reason.
+#[test]
+fn security_still_offers_the_posture_switches_when_unauthenticated() {
+    let mut snap = seeded_snapshot();
+    snap.security = Some(GetSecurityStatusResponse {
+        auth_enabled: false,
+        require_auth: false,
+        ..Default::default()
+    });
+    let html = render_with(Some(snap), || view! { <Security /> });
+
+    assert!(
+        html.contains("Refuse to run unauthenticated"),
+        "the fail-closed switch: {html}"
+    );
+    assert_eq!(
+        html.matches(r#"aria-checked="true""#).count(),
+        0,
+        "both switches read off, as the node reports them: {html}"
+    );
+}
+
 /// A plain member has no enrollment policy at all, and the panel is omitted
 /// rather than rendered with defaults — "nothing to change here" and "a policy
 /// that happens to be all zeros" are different claims.

@@ -90,6 +90,31 @@ impl Default for Mock {
 }
 
 impl Mock {
+    /// A node with mesh authentication switched off.
+    ///
+    /// Mirrors exactly what `RouterAdapter::security_status` reports when the
+    /// router has no `OgmAuth`: the posture flags stand, and every field that
+    /// describes an identity is left at its default — an *empty* `node_mac`,
+    /// a zero mesh id, and no per-node rows at all. The emptiness is the point:
+    /// the Security tab's other flavors all have an identity to render, so this
+    /// is the only one that exercises the fields being absent.
+    pub fn unauthenticated() -> Self {
+        Self {
+            security: SecurityStatusData {
+                auth_enabled: false,
+                mesh_id: 0,
+                node_mac: Vec::new(),
+                cert_not_after: 0,
+                revocation_count: 0,
+                nodes: Vec::new(),
+                require_auth: false,
+                lazy_cert_distribution: false,
+                enrollment: None,
+            },
+            pending_csrs: None,
+        }
+    }
+
     /// A certificate authority: an enrollment policy with a token and hand
     /// approval, and one request waiting.
     ///

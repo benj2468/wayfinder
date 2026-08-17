@@ -21,6 +21,10 @@
 # member from its first instant and its MAC (derived from that seed) is
 # reproducible across runs.
 #
+# Unless SECURE=0, that is: an *open* node (scripts/topology.py --open N) runs
+# with mesh authentication switched off, and /secrets then holds only a bare
+# seed for its management-TLS server. See the entrypoint's SECURE branch.
+#
 # That replaced an earlier flow where each node generated a key at startup and
 # enrolled against the provider over the management API. Once that API required
 # an authenticated TLS handshake, the flow could not work: a node with no
@@ -75,6 +79,10 @@ NETMASK="${NETMASK:-255.255.255.0}"
 ETHERTYPE="${ETHERTYPE:-0x4305}"
 SERVER_ADDR="${SERVER_ADDR:-0.0.0.0:7700}"
 MESH_ID="${MESH_ID:-1}"
+# "0" runs this node with mesh authentication switched off: no membership
+# identity, no fail-closed gate. Set by scripts/topology.py for the nodes
+# `--open N` adds; every other node is secured.
+SECURE="${SECURE:-1}"
 # The NIC on this subnet is the out-of-band management/enrolment network, NOT a
 # mesh link, so it is excluded from the RawL2 links generated below.
 MGMT_SUBNET_PREFIX="${MGMT_SUBNET_PREFIX:-10.99.}"
@@ -112,6 +120,10 @@ server:
   # mesh identity below, carried as an RFC 7250 raw public key in the handshake.
   type: Tls
   addr: ${SERVER_ADDR}
+YAML
+
+if [ "$SECURE" = "1" ]; then
+  cat >> "$CFG" <<YAML
 # The identity this node runs under, pre-issued on the host by
 # scripts/topology.py and mounted read-only at /secrets. Configured here rather
 # than pushed in at runtime because the node's MAC is *derived from this seed*:
@@ -126,6 +138,29 @@ auth:
 # first instant, so this is an assertion rather than a waiting state.
 require_auth: true
 lazy_cert_distribution: true
+YAML
+else
+  # An *open* node: no membership identity at all, so there is nothing to sign
+  # OGMs with and nothing to verify a neighbour's against. It routes in the
+  # open, and the secured nodes around it (\`require_auth: true\`) hear it and
+  # drop it — which is the point of running one.
+  #
+  # With no \`auth:\` seed, the management-TLS server has no mesh identity to
+  # reuse; left to itself it would generate one on first boot, which no client
+  # could know in advance. /secrets here holds a bare seed minted on the host
+  # for exactly this, and it is also the key the node's dashboard must prove:
+  # an un-enrolled node admits only a client holding the node's own key.
+  #
+  # \`require_auth\` MUST stay false: true on a node with no certificate is
+  # precisely the state that keeps it inert.
+  cat >> "$CFG" <<YAML
+  identity_seed_path: /secrets/seed
+require_auth: false
+lazy_cert_distribution: false
+YAML
+fi
+
+cat >> "$CFG" <<YAML
 # Where a security setting changed through the dashboard is recorded, so it
 # survives \`topology.py restart\`. Under /var/lib rather than /secrets because
 # the node writes it and /secrets is mounted read-only.

@@ -41,11 +41,54 @@ fn connect((addr, node_key): (std::net::SocketAddr, [u8; 32])) -> Arc<NodeConnec
 
 /// Minimal [`LeptosOptions`] for driving the router in tests.
 ///
-/// The asset paths never resolve here — no test requests `/pkg/*` — so only
-/// `output_name` has to be right, and it only affects the URLs in the emitted
-/// markup.
+/// The asset paths do not resolve here — most tests never request `/pkg/*` —
+/// so only `output_name` has to be right, and it only affects the URLs in the
+/// emitted markup. Use [`SiteRoot`] for a test that needs a real bundle on
+/// disk to fetch.
 pub fn test_leptos_options() -> LeptosOptions {
     LeptosOptions::builder()
         .output_name("wayfinder-web")
         .build()
+}
+
+/// A throwaway `site-root` holding a stand-in wasm bundle, so a test can
+/// request `/pkg/wayfinder-web.wasm` and get a real file back.
+///
+/// Removed on drop: leaving these behind would accumulate a directory per test
+/// run in the system temp dir.
+pub struct SiteRoot {
+    /// The directory the router is pointed at.
+    path: std::path::PathBuf,
+}
+
+impl SiteRoot {
+    /// Create the directory and write a stand-in bundle into `pkg/`.
+    pub fn new() -> Self {
+        let unique = format!(
+            "wayfinder-web-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(path.join("pkg")).unwrap();
+        std::fs::write(path.join("pkg").join("wayfinder-web.wasm"), b"\0asm-stub").unwrap();
+        Self { path }
+    }
+
+    /// [`LeptosOptions`] pointed at this directory.
+    pub fn options(&self) -> LeptosOptions {
+        LeptosOptions::builder()
+            .output_name("wayfinder-web")
+            .site_root(self.path.to_string_lossy().into_owned())
+            .build()
+    }
+}
+
+impl Drop for SiteRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }

@@ -266,8 +266,74 @@ fn Placeholder() -> impl IntoView {
 #[cfg(feature = "hydrate")]
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn hydrate() {
-    // Turn a wasm panic into a readable console trace instead of the default
-    // `unreachable executed`, which says nothing about where it came from.
-    console_error_panic_hook::set_once();
+    install_panic_hook();
     leptos::mount::hydrate_body(App);
+}
+
+/// Element id of the banner [`report_panic`] paints, so a second panic does not
+/// stack a second copy of it.
+#[cfg(feature = "hydrate")]
+const PANIC_BANNER_ID: &str = "wf-panic-banner";
+
+/// Install the panic hook: a readable console trace *and* a banner on the page.
+///
+/// A wasm panic aborts, taking the whole reactive runtime with it, and the DOM
+/// it leaves behind is the fully rendered page — so the failure is invisible.
+/// The tab bar is the cruelest part: its links are hydrated before anything
+/// below them, so they still intercept a click and then navigate nowhere. The
+/// page looks perfect and answers nothing.
+///
+/// The hook is the only place that can speak, since it runs before the abort,
+/// so it says so on the page rather than only in a console nobody has open.
+#[cfg(feature = "hydrate")]
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        // The default is `unreachable executed`, which says nothing about where
+        // it came from; this keeps the real message and stack for the console.
+        console_error_panic_hook::hook(info);
+        report_panic();
+    }));
+}
+
+/// Paint the "this page is dead" banner over the top of the document.
+///
+/// Styled inline rather than from the stylesheet, and built with bare DOM calls
+/// rather than a `view!`: by the time this runs the reactive runtime may be
+/// half-torn-down, and the most likely reason to be here at all is that this
+/// page and its assets came from different builds — which is exactly when a
+/// class name is not to be relied on.
+///
+/// Every step is fallible and every failure is silently accepted: this is the
+/// last thing that runs before an abort, and a panic *inside the panic hook*
+/// would replace a legible failure with an unintelligible one.
+#[cfg(feature = "hydrate")]
+fn report_panic() {
+    let Some(document) = leptos::web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    if document.get_element_by_id(PANIC_BANNER_ID).is_some() {
+        return;
+    }
+    let (Some(body), Ok(banner)) = (document.body(), document.create_element("div")) else {
+        return;
+    };
+
+    banner.set_id(PANIC_BANNER_ID);
+    let _ = banner.set_attribute(
+        "style",
+        "position:fixed;inset:0 0 auto 0;z-index:1000;padding:12px 20px;\
+         background:#7f1d1d;color:#fff;font:14px/1.5 system-ui,sans-serif",
+    );
+    // The reload advice is not boilerplate: the failure this most often follows
+    // is a browser pairing freshly rendered markup with a cached bundle from an
+    // earlier build, and a cache-bypassing reload is the one action that fixes
+    // it from the reader's side.
+    banner.set_text_content(Some(
+        "This dashboard stopped running, so nothing on this page is updating and the tabs \
+         will not respond. Reload the page — and if it happens again, reload with the cache \
+         bypassed (Ctrl-Shift-R, or Cmd-Shift-R on a Mac), which is the usual fix when the \
+         page and the dashboard come from different builds.",
+    ));
+
+    let _ = body.insert_before(&banner, body.first_child().as_ref());
 }
