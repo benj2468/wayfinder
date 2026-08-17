@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-112.5 -235 1000 1000" role="img" aria-label="Wayfinder">
+  <title>Wayfinder</title>
+  <!-- Square artboard for favicons and app icons: the 775x530 mark centred
+       in a 1000x1000 field. Same geometry as wayfinder-mark.svg.
+
+       Unlike the other two files this one adapts to the viewer's colour
+       scheme. It is the only asset that lands somewhere whose background we
+       do not control and cannot see: a browser tab strip, an OS dock. Painted
+       a flat near-black it would vanish into a dark tab and leave nothing but
+       the dot floating there. -->
+  <style>
+    .wf-ink { fill: #0A0A0A; }
+    .wf-dot { fill: #D43735; }
+
+    @media (prefers-color-scheme: dark) {
+      .wf-ink { fill: #F2F2F2; }
+      /* Lifted off the brand red, which goes muddy on a dark strip. Matches
+         --wf-logo-dot in the dashboard's dark theme. */
+      .wf-dot { fill: #E8483F; }
+    }
+  </style>
+  <path class="wf-ink" d="
+    M 0 30
+    L 72 30
+    L 213 433
+    L 354 30
+    L 420 30
+    L 561 432
+    L 673 116
+    A 86 86 0 0 0 736 135
+    L 597 530
+    L 528 530
+    L 387 126
+    L 245 530
+    L 178 530
+    Z"/>
+  <circle class="wf-dot" cx="725.5" cy="49" r="49.5"/>
+</svg>

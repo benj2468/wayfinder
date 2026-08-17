@@ -8,6 +8,10 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::http::header::CACHE_CONTROL;
+use axum::http::header::CONTENT_TYPE;
+use axum::response::IntoResponse;
+use axum::routing::get;
 use axum::routing::post;
 use leptos::config::LeptosOptions;
 use leptos::prelude::provide_context;
@@ -16,6 +20,7 @@ use leptos_axum::generate_route_list;
 use leptos_axum::handle_server_fns_with_context;
 
 use crate::App;
+use crate::components::logo::FAVICON_SVG;
 use crate::conn::NodeConnection;
 use crate::shell;
 
@@ -29,6 +34,10 @@ pub fn build_router(options: LeptosOptions, conn: Arc<NodeConnection>) -> Router
     let provide_conn = move || provide_context(Arc::clone(&conn));
 
     Router::new()
+        // Compiled in rather than served off disk: the static-file fallback
+        // reads `site-root`, which only `cargo leptos` populates, so a plain
+        // `cargo build` of the `ssr` binary would 404 its own icon.
+        .route("/favicon.svg", get(favicon))
         .route(
             "/api/{*fn_name}",
             post({
@@ -46,4 +55,18 @@ pub fn build_router(options: LeptosOptions, conn: Arc<NodeConnection>) -> Router
         })
         .fallback(leptos_axum::file_and_error_handler(shell))
         .with_state(options)
+}
+
+/// Serve the site icon.
+///
+/// A day of caching: the mark changes about never, and the request is otherwise
+/// repeated on every cold tab.
+async fn favicon() -> impl IntoResponse {
+    (
+        [
+            (CONTENT_TYPE, "image/svg+xml"),
+            (CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        FAVICON_SVG,
+    )
 }

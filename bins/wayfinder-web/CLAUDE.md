@@ -59,7 +59,11 @@ be bumped as one:
 - `state.rs` — what accumulates across polls (log scrollback, throughput trend).
 - `format.rs` — every display conversion, so none of them live in a `view!`
   macro where they cannot be tested.
-- `components/` — the tabs. Pure functions of the dashboard state.
+- `components/` — the tabs. Pure functions of the dashboard state. The one
+  exception is `logo.rs`: the mark, drawn inline so the ink can follow the
+  theme, and the favicon `server.rs` serves from its own route. It carries a
+  second copy of the geometry in `assets/logo/`, pinned to it by unit tests —
+  see that directory's README before replacing the logo.
 - `mock.rs` (`mock-node` feature) — a canned node, for tests and for
   `examples/mock_node.rs`.
 

@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 775 530" role="img" aria-label="Wayfinder">
+  <title>Wayfinder</title>
+  <!--
+    Construction notes (viewBox units):
+      cap height  500  (glyph top y=30, baseline y=530)
+      stroke slope 0.352 run/rise, horizontal stroke width ~70
+      the W's final upstroke doubles as the stem of the "i"
+      the stem's top is cut by a circle of r=86 concentric with the dot,
+      leaving a uniform 36.5u gap around it
+  -->
+  <path fill="#0A0A0A" d="
+    M 0 30
+    L 72 30
+    L 213 433
+    L 354 30
+    L 420 30
+    L 561 432
+    L 673 116
+    A 86 86 0 0 0 736 135
+    L 597 530
+    L 528 530
+    L 387 126
+    L 245 530
+    L 178 530
+    Z"/>
+  <circle fill="#D43735" cx="725.5" cy="49" r="49.5"/>
+</svg>

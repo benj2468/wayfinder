@@ -144,3 +144,82 @@ async fn set_link_gate_server_fn_answers_over_http() {
         "the mutation is routed and reached the node"
     );
 }
+
+/// The favicon is served from the crate's own route rather than the static-file
+/// fallback, so it resolves in every deployment: a plain `cargo build` of the
+/// `ssr` binary has no populated `site-root` to serve it from.
+#[tokio::test]
+async fn favicon_is_served() {
+    let conn = common::serve_mock_node().await;
+    let app = wayfinder_web::server::build_router(common::test_leptos_options(), conn);
+
+    let response = app
+        .oneshot(Request::get("/favicon.svg").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("image/svg+xml"),
+        "served as an image, not as the fallback's text/html error page"
+    );
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        String::from_utf8_lossy(&body).contains("<svg"),
+        "the response body is the mark itself"
+    );
+}
+
+/// The page points at that favicon. Serving it and linking it are separate
+/// mistakes: either alone leaves a blank tab icon.
+#[tokio::test]
+async fn dashboard_page_links_the_favicon() {
+    let conn = common::serve_mock_node().await;
+    let app = wayfinder_web::server::build_router(common::test_leptos_options(), conn);
+
+    let response = app
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let markup = String::from_utf8_lossy(&body);
+
+    assert!(
+        markup.contains(r#"rel="icon""#),
+        "the document declares a favicon"
+    );
+    assert!(
+        markup.contains("/favicon.svg"),
+        "and points it at the route that serves one"
+    );
+}
+
+/// The header carries the mark, not just the wordmark.
+#[tokio::test]
+async fn dashboard_page_renders_the_logo() {
+    let conn = common::serve_mock_node().await;
+    let app = wayfinder_web::server::build_router(common::test_leptos_options(), conn);
+
+    let response = app
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let markup = String::from_utf8_lossy(&body);
+
+    assert!(
+        markup.contains("wf-logo"),
+        "the header renders the logo component"
+    );
+    assert!(
+        markup.contains(wayfinder_web::components::logo::MARK_PATH),
+        "and it draws the real mark geometry"
+    );
+}

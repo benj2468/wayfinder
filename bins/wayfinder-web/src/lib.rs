@@ -52,6 +52,7 @@ use crate::components::dashboard::Dashboard;
 use crate::components::dashboard::provide_dashboard;
 use crate::components::link_quality::LinkQuality;
 use crate::components::links::Links;
+use crate::components::logo::Logo;
 use crate::components::logs::Logs;
 use crate::components::metrics::Metrics;
 use crate::components::overview::Overview;
@@ -70,6 +71,9 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
             <head>
                 <meta charset="utf-8" />
                 <meta name="viewport" content="width=device-width, initial-scale=1" />
+                // Served by this crate's own route rather than the static-file
+                // fallback, so it resolves even when `site-root` is unpopulated.
+                <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
                 <AutoReload options=options.clone() />
                 <HydrationScripts options />
                 <MetaTags />
@@ -167,7 +171,10 @@ fn Header(
 ) -> impl IntoView {
     view! {
         <header class="wf-header">
-            <span class="wf-brand">"Wayfinder"</span>
+            <span class="wf-brand">
+                <Logo />
+                "Wayfinder"
+            </span>
             <span class="wf-header-node wf-mono">{move || dash.label.get()}</span>
             <span class="wf-header-status">
                 <span
