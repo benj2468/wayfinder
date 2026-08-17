@@ -15,10 +15,19 @@ use wayfinder_client::Identity;
 use wayfinder_web::conn::NodeConnection;
 use wayfinder_web::conn::Target;
 
-/// Start the stand-in node and return a connection pointed at it.
+/// Start the stand-in node (a plain member) and return a connection to it.
 pub async fn serve_mock_node() -> Arc<NodeConnection> {
-    let (addr, node_key) = wayfinder_web::mock::serve_mock_node().await;
+    connect(wayfinder_web::mock::serve_mock_node().await)
+}
 
+/// Start the stand-in node as a certificate authority — with an enrollment
+/// policy and a CSR queue — and return a connection to it.
+pub async fn serve_mock_provider_node() -> Arc<NodeConnection> {
+    connect(wayfinder_web::mock::serve_mock_provider_node().await)
+}
+
+/// Wrap a bound mock node's address and pinned key in a connection.
+fn connect((addr, node_key): (std::net::SocketAddr, [u8; 32])) -> Arc<NodeConnection> {
     Arc::new(NodeConnection::new(Target::Tls(Endpoint {
         addr,
         node_key,

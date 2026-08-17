@@ -37,6 +37,8 @@ use wayfinder_server::CertAuthority;
 use wayfinder_server::MeshAuthority;
 use wayfinder_server::QueryRx;
 use wayfinder_server::RouterAdapter;
+use wayfinder_server::SettingsFile;
+use wayfinder_server::SettingsStore;
 
 use wayfinder::link::DynLinkT;
 use wayfinder::link::LinkT;
@@ -139,6 +141,10 @@ pub struct Driver<Local: FrameIo> {
     /// provider mode (set via [`set_provider`](Self::set_provider)).  Serves the
     /// enrollment management-API requests; absent ⇒ those return an error.
     provider: Option<CertAuthority>,
+    /// Where accepted security settings are recorded so they outlive a
+    /// restart (set via [`set_settings_store`](Self::set_settings_store)).
+    /// Absent ⇒ a runtime change applies in memory only.
+    settings: Option<SettingsFile>,
 }
 
 impl<Local: FrameIo> Driver<Local> {
@@ -211,6 +217,7 @@ impl<Local: FrameIo> Driver<Local> {
             rx_buffer: [0u8; MAX_LINK_FRAME_LEN],
             tx_buffer: [0u8; MAX_LINK_FRAME_LEN],
             provider: None,
+            settings: None,
             auth_snapshot_rx: None,
         }
     }
@@ -219,6 +226,15 @@ impl<Local: FrameIo> Driver<Local> {
     /// requests (`GetTrustAnchor`/`SubmitCsr`/`RevokeNode`) from this `ca`.
     pub fn set_provider(&mut self, ca: CertAuthority) {
         self.provider = Some(ca);
+    }
+
+    /// Record accepted security settings in `settings`, so a change made
+    /// through the management API is still in force after a restart.
+    ///
+    /// Without this, the node still accepts such changes — it just applies
+    /// them in memory and forgets them on restart.
+    pub fn set_settings_store(&mut self, settings: SettingsFile) {
+        self.settings = Some(settings);
     }
 
     /// Attach the receiver the TLS management server uses to request
@@ -324,6 +340,7 @@ impl<Local: FrameIo> Driver<Local> {
             rx_buffer,
             tx_buffer,
             provider,
+            settings,
             auth_snapshot_rx,
         } = self;
         let mac = *mac;
@@ -351,7 +368,11 @@ impl<Local: FrameIo> Driver<Local> {
                 },
                 Some((request, resp_tx)) = query_rx.recv(), if check_server => {
                     let ca = provider.as_mut().map(|c| c as &mut dyn MeshAuthority);
-                    let response = WayfinderService::new(RouterAdapter::new(&mut *router, ca, now)).handle(request);
+                    let mut adapter = RouterAdapter::new(&mut *router, ca, now);
+                    if let Some(store) = settings.as_mut() {
+                        adapter = adapter.with_settings(store as &mut dyn SettingsStore);
+                    }
+                    let response = WayfinderService::new(adapter).handle(request);
                     let _ = resp_tx.send(response);
                     LoopOutput::none()
                 },
@@ -496,8 +517,11 @@ impl<Local: FrameIo> Driver<Local> {
                 progressed = true;
                 let now = self.start.elapsed();
                 let ca = self.provider.as_mut().map(|c| c as &mut dyn MeshAuthority);
-                let response = WayfinderService::new(RouterAdapter::new(&mut self.router, ca, now))
-                    .handle(request);
+                let mut adapter = RouterAdapter::new(&mut self.router, ca, now);
+                if let Some(store) = self.settings.as_mut() {
+                    adapter = adapter.with_settings(store as &mut dyn SettingsStore);
+                }
+                let response = WayfinderService::new(adapter).handle(request);
                 let _ = resp_tx.send(response);
             }
 

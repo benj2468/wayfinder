@@ -156,6 +156,33 @@ pub fn log_uptime(uptime_ms: u64) -> String {
     format!("{:>10.3}s", uptime_ms as f64 / 1000.0)
 }
 
+/// Render a duration in seconds using the largest unit it divides exactly by.
+///
+/// For a certificate lifetime, which an operator thinks of as "a day" or "an
+/// hour" rather than as 86400. Deliberately exact: a value that is not a whole
+/// number of the larger unit keeps its seconds rather than being rounded, since
+/// this is a security setting and showing 90000 back as "1 day" would misstate
+/// how long a certificate an operator is about to issue stays valid.
+pub fn duration_secs(secs: u64) -> String {
+    /// Pluralize `unit` for `n`, since every unit here is regular.
+    fn plural(n: u64, unit: &str) -> String {
+        if n == 1 {
+            format!("{n} {unit}")
+        } else {
+            format!("{n} {unit}s")
+        }
+    }
+    if secs > 0 && secs.is_multiple_of(86_400) {
+        plural(secs / 86_400, "day")
+    } else if secs > 0 && secs.is_multiple_of(3_600) {
+        plural(secs / 3_600, "hour")
+    } else if secs > 0 && secs.is_multiple_of(60) {
+        plural(secs / 60, "minute")
+    } else {
+        plural(secs, "second")
+    }
+}
+
 /// The aggregate state of one interface's four participation gates.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GateStatus {
@@ -416,5 +443,44 @@ mod tests {
             log_uptime(0).len(),
             "every stamp is the same width"
         );
+    }
+
+    /// A certificate lifetime reads in the unit an operator would have typed
+    /// it in, so a policy of "one day" is not shown back as 86400 seconds.
+    #[test]
+    fn duration_secs_uses_the_largest_whole_unit() {
+        assert_eq!(duration_secs(86_400), "1 day");
+        assert_eq!(duration_secs(7 * 86_400), "7 days");
+        assert_eq!(duration_secs(3_600), "1 hour");
+        assert_eq!(duration_secs(12 * 3_600), "12 hours");
+        assert_eq!(duration_secs(60), "1 minute");
+        assert_eq!(duration_secs(90), "90 seconds");
+    }
+
+    /// A lifetime that is not a whole number of larger units keeps its exact
+    /// value rather than being rounded into a friendlier-looking lie — this is
+    /// a security setting, and "about a day" is not a certificate lifetime.
+    #[test]
+    fn duration_secs_does_not_round_an_inexact_value() {
+        assert_eq!(duration_secs(90_061), "90061 seconds");
+        assert_eq!(duration_secs(3_661), "3661 seconds");
+    }
+
+    /// A value that divides exactly by a larger unit uses it, even when that
+    /// unit is not the one an operator would have reached for first: 90000
+    /// seconds is exactly 25 hours, and saying so is more useful than
+    /// restating the seconds.
+    #[test]
+    fn duration_secs_uses_a_larger_unit_whenever_it_divides_exactly() {
+        assert_eq!(duration_secs(90_000), "25 hours");
+        assert_eq!(duration_secs(5_400), "90 minutes");
+    }
+
+    /// Zero is a value the node rejects, but the dashboard can still be asked
+    /// to render one (an older node, a hand-edited state file), and must not
+    /// produce an empty cell.
+    #[test]
+    fn duration_secs_renders_zero() {
+        assert_eq!(duration_secs(0), "0 seconds");
     }
 }

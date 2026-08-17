@@ -472,6 +472,7 @@ body {
   color: var(--wf-text);
   font-family: inherit;
   font-size: var(--wf-text-sm);
+  line-height: 1.45;
   cursor: pointer;
 }
 
@@ -829,6 +830,10 @@ body {
   font-size: var(--wf-text-sm);
 }
 
+/* Sized to match .wf-button exactly — same padding, same font-size, same
+ * line-height — so an input and the button that submits it line up in a row.
+ * Not `font: inherit`: that shorthand pulls in the base text size and leaves an
+ * input a size taller than the button beside it. */
 .wf-input {
   flex: 1;
   min-width: 12ch;
@@ -837,12 +842,38 @@ body {
   border-radius: var(--wf-radius-sm);
   background: var(--wf-bg);
   color: var(--wf-text);
-  font: inherit;
+  font-family: inherit;
+  font-size: var(--wf-text-sm);
+  line-height: 1.45;
 }
 
 .wf-input:focus-visible {
   outline: 2px solid var(--wf-accent);
   outline-offset: -1px;
+}
+
+/* One editable security setting: its label, its field, and the buttons that
+ * submit it. Wraps rather than compressing, so a narrow screen stacks the
+ * label above the input instead of squeezing a token field to nothing. */
+.wf-setting-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--wf-space-3);
+  margin: var(--wf-space-3) 0;
+}
+
+.wf-setting-label {
+  color: var(--wf-text-muted);
+  font-size: var(--wf-text-sm);
+}
+
+/* Here the field sits between its label and its submit button, so it takes its
+ * natural width rather than stretching. Left to flex, it fills the panel and
+ * pins the label and the button to opposite edges — which reads as no space
+ * between them at all, however much gap the row sets. */
+.wf-setting-row .wf-input {
+  flex: 0 1 auto;
 }
 
 /* The pane scrolls, not the page — so the filter above and the tab bar stay

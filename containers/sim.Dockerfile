@@ -14,6 +14,20 @@
 # it discovers every `eth*` NIC docker attached (one per mesh segment) and emits
 # a RawL2 link for each, so the topology is driven entirely by which networks a
 # service is wired to in docker-compose.yml — no hard-coded interface names.
+#
+# Identity, by contrast, is *not* generated here. Each node's seed and
+# membership certificate are minted on the host by scripts/topology.py before
+# the stack comes up and mounted read-only at /secrets, so a node is a mesh
+# member from its first instant and its MAC (derived from that seed) is
+# reproducible across runs.
+#
+# That replaced an earlier flow where each node generated a key at startup and
+# enrolled against the provider over the management API. Once that API required
+# an authenticated TLS handshake, the flow could not work: a node with no
+# certificate yet is refused the connection it would have used to request one.
+# Pre-issuing sidesteps the bootstrap circularity entirely — at the cost of the
+# sim no longer exercising online enrollment, which is worth knowing when
+# reading the CSR/approval surfaces it still exposes.
 
 FROM debian:bookworm-slim
 
@@ -70,7 +84,10 @@ CFG=/etc/wayfinder/config.yml
 # PATH by the image (see the Dockerfile `ENV PATH`), so they are invoked by bare
 # name here and resolve identically under `docker exec`.
 
-mkdir -p /etc/wayfinder /etc/wayfinder/secrets
+# /var/lib/wayfinder holds what the node *writes*: the persisted runtime
+# security settings and, on the provider, the CA state snapshot. The identity
+# it reads lives at /secrets, mounted read-only from the host.
+mkdir -p /etc/wayfinder /var/lib/wayfinder
 
 # Wayfinder Lua dissector: symlink from the live /workspace repo mount into
 # tshark's global Lua plugin directory (queried fresh each start so it stays
@@ -89,17 +106,38 @@ local_egress:
   ip_address: ${NODE_IP}
   netmask: ${NETMASK}
 server:
-  type: Tcp
+  # TLS is the only management transport there is: the plain-TCP listener this
+  # sim used to configure was removed when the management API was hardened, and
+  # a config naming it no longer parses at all. Clients authenticate with the
+  # mesh identity below, carried as an RFC 7250 raw public key in the handshake.
+  type: Tls
   addr: ${SERVER_ADDR}
-# Fail closed: both provider and member nodes stay inert on the mesh (no
-# routing, no OGM emission) until they install a valid membership cert via
-# \`set-auth\` below — an unauthenticated node must never act as a router.
+# The identity this node runs under, pre-issued on the host by
+# scripts/topology.py and mounted read-only at /secrets. Configured here rather
+# than pushed in at runtime because the node's MAC is *derived from this seed*:
+# supplying it up front is what lets the host mint a certificate bound to the
+# right MAC before the container exists.
+auth:
+  seed_path: /secrets/seed
+  cert_path: /secrets/cert
+  trust_anchor_path: /secrets/anchor
+# Fail closed: stay inert on the mesh (no routing, no OGM emission) without a
+# valid membership cert. With \`auth:\` above that cert is present from the
+# first instant, so this is an assertion rather than a waiting state.
 require_auth: true
 lazy_cert_distribution: true
+# Where a security setting changed through the dashboard is recorded, so it
+# survives \`topology.py restart\`. Under /var/lib rather than /secrets because
+# the node writes it and /secrets is mounted read-only.
+runtime_state_path: /var/lib/wayfinder/runtime.json
 YAML
 
 # Provider (certificate-authority) node: it alone holds the mesh root seed
-# (mounted at /ca) and serves enrolment over the management API.
+# (mounted at /ca) and can issue or revoke certificates over the management
+# API. Every node in this sim already starts with a cert minted on the host, so
+# nothing enrolls at runtime — provider mode is here so the CA-side surfaces
+# (ListCerts, RevokeNode, the CSR queue, the dashboard's enrollment-policy
+# editor) have a live authority to act on.
 if [ -n "${PROVIDER:-}" ]; then
   cat >> "$CFG" <<YAML
 provider:
@@ -107,6 +145,7 @@ provider:
   mesh_id: ${MESH_ID}
   cert_ttl_secs: 100000000000
   require_approval: ${REQUIRE_APPROVAL:-false}
+  state_path: /var/lib/wayfinder/ca-state.json
 YAML
 fi
 
@@ -115,7 +154,7 @@ links:
 YAML
 
 # One RawL2 mesh link per docker-attached ethernet NIC, EXCEPT the management
-# NIC (identified by its subnet) which carries the enrolment control plane.
+# NIC (identified by its subnet) which carries the dashboard's control plane.
 #
 # Optionally pin this node's adaptive OGM (Trickle) backoff bounds on every link
 # via OGM_I_MIN_MS / OGM_I_MAX_MS. When neither is set, the links omit the `ogm:`
@@ -142,60 +181,11 @@ done
 echo "wayfinder-sim: generated $CFG" >&2
 cat "$CFG" >&2
 
-# Start the node in the background and give it a moment to bring up the TAP.
-wayfinder-tap --config "$CFG" &
-WAYFINDER_PID=$!
-trap 'kill ${WAYFINDER_PID}; wait ${WAYFINDER_PID}' TERM
-sleep 5
-WAYFINDER_MAC=$(ip link show dev wayfinder0 | awk '/link\/ether/ {print $2}')
-
-if [ -n "${PROVIDER:-}" ]; then
-  # The provider self-issues its own member cert from the mounted root seed
-  # (it is both the CA and a mesh member).
-  echo "wayfinder-sim: provider node — self-issuing cert" >&2
-  wayfinder-ctl cert keygen --out-seed /etc/wayfinder/secrets/seed
-  wayfinder-ctl cert issue \
-      --ca-seed /ca/seed \
-      --mesh-id "${MESH_ID}" \
-      --mac "${WAYFINDER_MAC}" \
-      --node-seed /etc/wayfinder/secrets/seed \
-      --not-before 0 \
-      --not-after 100000000000000 \
-      --out-cert /etc/wayfinder/secrets/cert
-  cp /ca/root /etc/wayfinder/secrets/anchor
-else
-  # A member enrolls online against the provider — no root seed on this node.
-  # Retry: the provider's management API may not be up yet.
-  echo "wayfinder-sim: enrolling against provider ${PROVIDER_ADDR}" >&2
-  # `enroll` generates the identity seed once and, since it is written to
-  # --out-seed immediately, reuses it on every retry below — so a retry
-  # resubmits the SAME key for this MAC rather than a new one (which a
-  # require-approval provider would otherwise reject as a duplicate MAC under a
-  # different key).
-  i=0
-  until wayfinder-ctl enroll \
-      --connect "${PROVIDER_ADDR}" \
-      --mac "${WAYFINDER_MAC}" \
-      --out-seed /etc/wayfinder/secrets/seed \
-      --out-cert /etc/wayfinder/secrets/cert \
-      --out-anchor /etc/wayfinder/secrets/anchor; do
-    i=$((i + 1))
-    if [ "$i" -ge 30 ]; then
-      echo "wayfinder-sim: enrolment failed after retries" >&2
-      exit 1
-    fi
-    sleep 2
-  done
-fi
-
-# Push the bundle into the running node over its local management API.
-wayfinder-ctl set-auth \
-    /etc/wayfinder/secrets/seed \
-    /etc/wayfinder/secrets/cert \
-    /etc/wayfinder/secrets/anchor
-
-# Hand the foreground back to the node so the container lives as long as it does.
-wait "${WAYFINDER_PID}"
+# Hand the foreground straight to the node. There is no post-start enrollment
+# dance any more: the identity is in the config, so the node comes up already a
+# member. That removed a `sleep 5` race and a 30-attempt retry loop, and it is
+# why this container has no reason to outlive the node.
+exec wayfinder-tap --config "$CFG"
 
 EOF
 

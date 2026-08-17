@@ -39,6 +39,7 @@ fn issue_into_tmp(mesh_id: u32) -> (tempfile::TempDir, Vec<u8>, Vec<u8>) {
         not_before: 0,
         not_after: 1_000_000,
         out_cert: cert.clone(),
+        admin: false,
     })
     .unwrap();
 
@@ -98,6 +99,7 @@ fn issue_without_mac_derives_it_from_the_node_seed() {
         not_before: 0,
         not_after: 1_000_000,
         out_cert: cert.clone(),
+        admin: false,
     })
     .unwrap();
 
@@ -132,4 +134,106 @@ fn tampered_cert_fails_verification() {
     cert_bytes[6] ^= 0xff;
     let cert = MembershipCert::from_bytes(&cert_bytes).unwrap();
     assert!(anchor.verify_cert(&cert, 500).is_err());
+}
+
+/// A cert issued without `--admin` carries no management-administration
+/// capability, so a routine member node cannot invoke privileged management
+/// operations just by holding a valid membership cert.
+#[test]
+fn an_ordinary_issued_cert_is_not_an_admin() {
+    let (_dir, anchor_bytes, cert_bytes) = issue_into_tmp(0xABCD);
+
+    let anchor = TrustAnchor::from_bytes(&anchor_bytes).expect("anchor reloads");
+    let cert = MembershipCert::from_bytes(&cert_bytes).expect("cert reloads");
+
+    assert!(
+        !anchor.verify_cert(&cert, 100).unwrap().admin,
+        "a plain membership cert must not carry the admin capability"
+    );
+}
+
+/// `--admin` issues a cert whose admin capability survives verification, which
+/// is what a management-API client (the dashboard, `wayfinderctl`) must present
+/// to reach an enrolled node.
+#[test]
+fn an_admin_issued_cert_verifies_as_admin() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root.seed");
+    let anchor_path = dir.path().join("anchor.bin");
+    let node = dir.path().join("node.seed");
+    let cert_path = dir.path().join("node.cert");
+
+    cert::run(CertCommand::InitCa {
+        mesh_id: 0xABCD,
+        seed: None,
+        generate: true,
+        out_seed: Some(root.clone()),
+        out_anchor: anchor_path.clone(),
+    })
+    .unwrap();
+    cert::run(CertCommand::Keygen {
+        out_seed: Some(node.clone()),
+    })
+    .unwrap();
+    cert::run(CertCommand::Issue {
+        ca_seed: root,
+        mesh_id: 0xABCD,
+        mac: None,
+        node_seed: node,
+        not_before: 0,
+        not_after: 1_000_000,
+        out_cert: cert_path.clone(),
+        admin: true,
+    })
+    .unwrap();
+
+    let anchor = TrustAnchor::from_bytes(&std::fs::read(&anchor_path).unwrap()).unwrap();
+    let cert = MembershipCert::from_bytes(&std::fs::read(&cert_path).unwrap()).unwrap();
+
+    assert!(
+        anchor.verify_cert(&cert, 100).unwrap().admin,
+        "--admin must set the capability the management API authorizes on"
+    );
+}
+
+/// Omitting `--mac` binds the cert to the MAC derived from the node seed — the
+/// same derivation `wayfinder-tap` applies at startup. The topology sim relies
+/// on this to pre-issue certs on the host for nodes that do not exist yet.
+#[test]
+fn an_omitted_mac_binds_the_seed_derived_mac() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root.seed");
+    let anchor_path = dir.path().join("anchor.bin");
+    let node = dir.path().join("node.seed");
+    let cert_path = dir.path().join("node.cert");
+
+    cert::run(CertCommand::InitCa {
+        mesh_id: 1,
+        seed: None,
+        generate: true,
+        out_seed: Some(root.clone()),
+        out_anchor: anchor_path,
+    })
+    .unwrap();
+    cert::run(CertCommand::Keygen {
+        out_seed: Some(node.clone()),
+    })
+    .unwrap();
+    cert::run(CertCommand::Issue {
+        ca_seed: root,
+        mesh_id: 1,
+        mac: None,
+        node_seed: node.clone(),
+        not_before: 0,
+        not_after: 1_000_000,
+        out_cert: cert_path.clone(),
+        admin: false,
+    })
+    .unwrap();
+
+    let seed: [u8; 32] = std::fs::read(&node).unwrap().try_into().unwrap();
+    let expected = Keypair::from_seed(&seed).derived_mac();
+    let cert = MembershipCert::from_bytes(&std::fs::read(&cert_path).unwrap()).unwrap();
+
+    assert_eq!(cert.node_mac, expected.0);
 }

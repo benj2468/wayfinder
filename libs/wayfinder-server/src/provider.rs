@@ -16,6 +16,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use wayfinder_protos::service::CsrOutcome;
+use wayfinder_protos::service::EnrollmentPolicyData;
+use wayfinder_protos::service::EnrollmentPolicyStatusData;
 use wayfinder_protos::service::IssuedCertData;
 use wayfinder_protos::service::PendingCsrData;
 
@@ -72,4 +74,17 @@ pub trait MeshAuthority {
     /// polling client observes a [`CsrOutcome::Rejected`].  Returns an error if
     /// no CSR for that MAC is pending.
     fn deny_csr(&mut self, node_mac: &[u8]) -> Result<(), String>;
+
+    /// The enrollment policy this authority is currently applying, for the
+    /// management API to report.  Carries no token, only whether one is set —
+    /// the token is a shared secret, and a client reading the policy has no
+    /// need of its value.
+    fn enrollment_policy(&self) -> EnrollmentPolicyStatusData;
+
+    /// Apply a partial enrollment-policy update; fields the update does not
+    /// name are left as they are.  `Err` when the change could not be made
+    /// durable, which the caller must surface rather than reporting success:
+    /// an operator told a security setting is in force has a right to expect
+    /// it to still be in force after a restart.
+    fn set_enrollment_policy(&mut self, update: &EnrollmentPolicyData) -> Result<(), String>;
 }

@@ -748,6 +748,25 @@ impl<
         self.require_auth = require;
     }
 
+    /// The fail-closed policy currently in force.  Distinct from
+    /// [`auth_locked`](Self::auth_locked), which is this *and* the absence of a
+    /// cert: an enrolled node reports `require_auth` without being locked.
+    pub fn require_auth(&self) -> bool {
+        self.require_auth
+    }
+
+    /// The [`set_require_auth`](Self::set_require_auth) counterpart for a
+    /// *runtime* override (the management API's `SetConfig`): applies the new
+    /// policy and marks [`runtime_config_active`](Self::runtime_config_active),
+    /// mirroring
+    /// [`apply_runtime_lazy_cert_distribution`](Self::apply_runtime_lazy_cert_distribution).
+    /// Kept distinct from the plain setter so startup wiring never spuriously
+    /// marks the node as running a runtime override.
+    pub fn apply_runtime_require_auth(&mut self, require: bool) {
+        self.require_auth = require;
+        self.runtime_config_active = true;
+    }
+
     /// Set the lazy-cert-distribution policy: when `true`,
     /// [`poll`](CentralRouter::poll) emits a cert fingerprint on this node's
     /// OGMs instead of the full cert. Typically set once at startup from
@@ -756,6 +775,12 @@ impl<
     /// resolve fingerprints via fetch) before any node flips this to `true`.
     pub fn set_lazy_cert_distribution(&mut self, lazy: bool) {
         self.lazy_cert_distribution = lazy;
+    }
+
+    /// The lazy-cert-distribution policy currently in force, for the
+    /// management API to report what an operator is about to change.
+    pub fn lazy_cert_distribution(&self) -> bool {
+        self.lazy_cert_distribution
     }
 
     /// The [`set_lazy_cert_distribution`](Self::set_lazy_cert_distribution)
@@ -3835,6 +3860,50 @@ mod lazy_cert_distribution_switchover {
         let hdr_len = core::mem::size_of::<batman::wire::BatmanOgmPacket>();
         assert!(find_tvlv(&ogm[hdr_len..], TvlvType::Cert).is_none());
         assert!(find_tvlv(&ogm[hdr_len..], TvlvType::CertFp).is_some());
+    }
+
+    /// The two posture flags read back what was set, so the management API can
+    /// report the state an operator is about to edit rather than guessing it.
+    #[test]
+    fn posture_flags_read_back_what_was_set() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = router_with_auth(&authority, mac(1), 2);
+        assert!(!a.require_auth());
+        assert!(!a.lazy_cert_distribution());
+
+        a.set_require_auth(true);
+        a.set_lazy_cert_distribution(true);
+
+        assert!(a.require_auth());
+        assert!(a.lazy_cert_distribution());
+    }
+
+    /// `apply_runtime_require_auth` mirrors the lazy-cert counterpart: same
+    /// effect as the startup setter, plus the `runtime_config_active` mark that
+    /// distinguishes a live override from startup wiring.
+    #[test]
+    fn apply_runtime_require_auth_marks_active() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = router_with_auth(&authority, mac(1), 2);
+        assert!(!a.runtime_config_active());
+
+        a.apply_runtime_require_auth(true);
+
+        assert!(a.require_auth());
+        assert!(a.runtime_config_active());
+    }
+
+    /// A node with a cert installed does not go inert when the fail-closed
+    /// gate is turned on — `auth_locked` is the *bootstrap* gate (required and
+    /// no cert), not a second switch that takes an enrolled node off the mesh.
+    #[test]
+    fn requiring_auth_does_not_lock_a_node_that_holds_a_cert() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = router_with_auth(&authority, mac(1), 2);
+
+        a.apply_runtime_require_auth(true);
+
+        assert!(!a.auth_locked(), "an enrolled node keeps routing");
     }
 
     /// If the transmit buffer is too small to append the cert/fingerprint +

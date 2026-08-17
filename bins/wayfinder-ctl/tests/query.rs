@@ -178,6 +178,7 @@ impl WayfinderDataProvider for Mock {
                     revoked: true,
                 },
             ],
+            ..Default::default()
         }
     }
 }

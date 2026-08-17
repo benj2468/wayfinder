@@ -18,11 +18,15 @@ use wayfinder_auth::Authority;
 use wayfinder_auth::MembershipCert;
 use wayfinder_protos::service::CsrOutcome;
 use wayfinder_protos::service::EnrollData;
+use wayfinder_protos::service::EnrollmentPolicyData;
+use wayfinder_protos::service::EnrollmentPolicyStatusData;
 use wayfinder_protos::service::IssuedCertData;
 use wayfinder_protos::service::PendingCsrData;
+use wayfinder_protos::service::TokenUpdate;
 use zerocopy::IntoBytes;
 
 use crate::persistence::CaLog;
+use crate::persistence::TokenOverride;
 use crate::provider::MeshAuthority;
 
 /// A certificate-signing request the authority is holding while it awaits an
@@ -140,7 +144,7 @@ impl CertAuthority {
     /// (in-memory only, as before).
     pub fn from_config(root_seed: &[u8; 32], cfg: &ProviderConfig) -> Result<Self, String> {
         let log = CaLog::load(cfg.state_path.as_ref().map(PathBuf::from))?;
-        Ok(Self {
+        let mut ca = Self {
             pending_ttl_secs: cfg.pending_ttl_secs,
             log,
             ..Self::new(
@@ -150,7 +154,90 @@ impl CertAuthority {
                 cfg.enrollment_token.clone(),
                 cfg.require_approval,
             )
-        })
+        };
+        ca.apply_policy_overrides();
+        Ok(ca)
+    }
+
+    /// Overlay the operator's persisted runtime policy overrides onto the
+    /// fields just taken from the startup config.
+    ///
+    /// The overrides win, deliberately: they are the operator's most recent
+    /// stated intent, and reverting to the YAML on every restart would make a
+    /// setting an operator changed from the dashboard quietly undo itself. A
+    /// field with no override is left following the config, so editing the
+    /// YAML still moves everything the operator has not pinned — and deleting
+    /// the state file returns the node wholly to its config.
+    fn apply_policy_overrides(&mut self) {
+        let overrides = self.log.policy().clone();
+        if let Some(require_approval) = overrides.require_approval {
+            self.require_approval = require_approval;
+        }
+        if let Some(cert_ttl_secs) = overrides.cert_ttl_secs {
+            self.cert_ttl_secs = cert_ttl_secs;
+        }
+        match &overrides.enrollment_token {
+            Some(TokenOverride::Cleared) => self.enrollment_token = None,
+            Some(TokenOverride::Set(token)) => self.enrollment_token = Some(token.clone()),
+            None => {}
+        }
+        if overrides.require_approval.is_some()
+            || overrides.cert_ttl_secs.is_some()
+            || overrides.enrollment_token.is_some()
+        {
+            tracing::info!(
+                require_approval = self.require_approval,
+                cert_ttl_secs = self.cert_ttl_secs,
+                enrollment_token_set = self.enrollment_token.is_some(),
+                "enrollment policy restored from persisted runtime overrides, taking \
+                 precedence over the startup configuration"
+            );
+        }
+    }
+
+    /// The enrollment policy currently in force, for the management API to
+    /// report. Never carries the token itself — only whether one is set.
+    pub fn enrollment_policy(&self) -> EnrollmentPolicyStatusData {
+        EnrollmentPolicyStatusData {
+            require_approval: self.require_approval,
+            cert_ttl_secs: self.cert_ttl_secs,
+            enrollment_token_set: self.enrollment_token.is_some(),
+        }
+    }
+
+    /// Apply a partial enrollment-policy update and record it durably.
+    ///
+    /// The override is persisted *before* it is applied in memory, so the two
+    /// can never disagree: a failed persist leaves the authority running its
+    /// previous policy and returns `Err`, rather than admitting nodes under a
+    /// policy that the next restart would forget. Fields the update does not
+    /// name are left alone, both in memory and on disk.
+    pub fn set_enrollment_policy(&mut self, update: &EnrollmentPolicyData) -> Result<(), String> {
+        let (_, persisted) = self.log.mutate_policy(|overrides| {
+            if let Some(require_approval) = update.require_approval {
+                overrides.require_approval = Some(require_approval);
+            }
+            if let Some(cert_ttl_secs) = update.cert_ttl_secs {
+                overrides.cert_ttl_secs = Some(cert_ttl_secs);
+            }
+            match &update.enrollment_token {
+                Some(TokenUpdate::Clear) => {
+                    overrides.enrollment_token = Some(TokenOverride::Cleared);
+                }
+                Some(TokenUpdate::Set(token)) => {
+                    overrides.enrollment_token = Some(TokenOverride::Set(token.clone()));
+                }
+                None => {}
+            }
+        });
+        persisted?;
+
+        // Only now that the override is durable does the live policy move. The
+        // overlay is the same one a restart performs, so what runs here and
+        // what runs after a restart are the same code path rather than two
+        // that have to be kept in agreement.
+        self.apply_policy_overrides();
+        Ok(())
     }
 
     /// Update the current wall-clock time (unix seconds) used to stamp issued
@@ -482,6 +569,14 @@ impl MeshAuthority for CertAuthority {
 
     fn list_certs(&self) -> Vec<IssuedCertData> {
         self.log.issued().to_vec()
+    }
+
+    fn enrollment_policy(&self) -> EnrollmentPolicyStatusData {
+        CertAuthority::enrollment_policy(self)
+    }
+
+    fn set_enrollment_policy(&mut self, update: &EnrollmentPolicyData) -> Result<(), String> {
+        CertAuthority::set_enrollment_policy(self, update)
     }
 }
 
@@ -1135,7 +1230,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_state_file_migrates_to_v2_with_empty_held() {
+    fn v1_state_file_migrates_forward_with_empty_held() {
         let path = unique_state_path("v1-migration");
         let (ed, _x) = node_keys(2);
         let mac = [0u8, 0, 0, 0, 0, 9];
@@ -1172,7 +1267,10 @@ mod tests {
         ca.submit_csr(&[0, 0, 0, 0, 0, 10], &ed2, &x2, "").unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         let on_disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(on_disk["version"], 2);
+        assert_eq!(
+            on_disk["version"],
+            crate::persistence::CURRENT_STATE_VERSION
+        );
         assert!(on_disk["held"].is_array());
 
         std::fs::remove_file(&path).ok();
@@ -1435,5 +1533,292 @@ mod tests {
         assert!(ca.list_pending().is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Runtime enrollment policy (SetConfig's EnrollmentPolicy) ────────────────
+
+    /// The policy an authority reports is the one it was configured with, so
+    /// the dashboard renders the real state before an operator edits it.
+    #[test]
+    fn enrollment_policy_reports_the_configured_policy() {
+        let ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, Some("hunter2".into()), true);
+
+        let policy = ca.enrollment_policy();
+        assert!(policy.require_approval);
+        assert_eq!(policy.cert_ttl_secs, 1000);
+        assert!(policy.enrollment_token_set);
+    }
+
+    /// The token's *value* never leaves the authority — only whether one is
+    /// set. A client that can read the policy has no need of the secret.
+    #[test]
+    fn enrollment_policy_reports_an_absent_token_as_unset() {
+        let ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
+
+        assert!(!ca.enrollment_policy().enrollment_token_set);
+    }
+
+    /// An update names only what it changes; everything else stays as it was.
+    #[test]
+    fn set_enrollment_policy_leaves_unnamed_fields_alone() {
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, Some("hunter2".into()), false);
+
+        ca.set_enrollment_policy(&EnrollmentPolicyData {
+            require_approval: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let policy = ca.enrollment_policy();
+        assert!(policy.require_approval, "the named field changed");
+        assert_eq!(policy.cert_ttl_secs, 1000, "the lifetime is untouched");
+        assert!(policy.enrollment_token_set, "the token is untouched");
+    }
+
+    /// Turning approval on parks the next CSR rather than signing it — the
+    /// policy change has to reach the issuance path, not just the report.
+    #[test]
+    fn enabling_approval_parks_the_next_csr() {
+        let mut ca = open_ca();
+        let (ed, x) = node_keys(2);
+        let mac = [0, 0, 0, 0, 0, 9];
+
+        ca.set_enrollment_policy(&EnrollmentPolicyData {
+            require_approval: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(matches!(
+            ca.submit_csr(&mac, &ed, &x, "").unwrap(),
+            CsrOutcome::Pending
+        ));
+    }
+
+    /// Setting a token starts gating enrollment on it immediately: a CSR
+    /// presenting nothing is rejected, and the same CSR presenting the token
+    /// is issued.
+    #[test]
+    fn setting_a_token_gates_the_next_csr() {
+        let mut ca = open_ca();
+        let (ed, x) = node_keys(2);
+        let mac = [0, 0, 0, 0, 0, 9];
+
+        ca.set_enrollment_policy(&EnrollmentPolicyData {
+            enrollment_token: Some(TokenUpdate::Set("hunter2".into())),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(matches!(
+            ca.submit_csr(&mac, &ed, &x, "").unwrap(),
+            CsrOutcome::Rejected(_)
+        ));
+        assert!(matches!(
+            ca.submit_csr(&mac, &ed, &x, "hunter2").unwrap(),
+            CsrOutcome::Issued(_)
+        ));
+    }
+
+    /// Clearing the token opens enrollment: the CSR that was being rejected
+    /// for presenting nothing now issues.
+    #[test]
+    fn clearing_the_token_opens_enrollment() {
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, Some("hunter2".into()), false);
+        ca.set_now_unix(100);
+        let (ed, x) = node_keys(2);
+        let mac = [0, 0, 0, 0, 0, 9];
+        assert!(matches!(
+            ca.submit_csr(&mac, &ed, &x, "").unwrap(),
+            CsrOutcome::Rejected(_)
+        ));
+
+        ca.set_enrollment_policy(&EnrollmentPolicyData {
+            enrollment_token: Some(TokenUpdate::Clear),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(matches!(
+            ca.submit_csr(&mac, &ed, &x, "").unwrap(),
+            CsrOutcome::Issued(_)
+        ));
+        assert!(!ca.enrollment_policy().enrollment_token_set);
+    }
+
+    /// A new certificate lifetime applies to certificates issued after it, so
+    /// the change is observable in the validity window rather than only in the
+    /// reported policy.
+    #[test]
+    fn a_new_cert_ttl_applies_to_the_next_issued_cert() {
+        let mut ca = open_ca();
+        let (ed, x) = node_keys(2);
+        let mac = [0, 0, 0, 0, 0, 9];
+
+        ca.set_enrollment_policy(&EnrollmentPolicyData {
+            cert_ttl_secs: Some(50_000),
+            ..Default::default()
+        })
+        .unwrap();
+        issued_cert(&mut ca, &mac, &ed, &x, "");
+
+        let certs = ca.list_certs();
+        assert_eq!(
+            certs[0].not_after - certs[0].not_before,
+            50_000,
+            "the newly issued cert carries the new lifetime"
+        );
+    }
+
+    /// The whole point of the feature: an operator's policy edit is still in
+    /// force after the node restarts, rather than reverting to the YAML the
+    /// operator has since moved past.
+    #[test]
+    fn enrollment_policy_survives_a_restart() {
+        let path = unique_state_path("policy-restart");
+
+        {
+            let cfg = persisted_cfg(&path);
+            let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+            ca.set_enrollment_policy(&EnrollmentPolicyData {
+                require_approval: Some(true),
+                cert_ttl_secs: Some(4242),
+                enrollment_token: Some(TokenUpdate::Set("hunter2".into())),
+            })
+            .unwrap();
+        } // Dropped here, simulating a process restart.
+
+        // `persisted_cfg` is open enrollment with a 100_000s lifetime, so
+        // every assertion below is a value the startup config would not have
+        // produced on its own.
+        let cfg = persisted_cfg(&path);
+        let ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+        let policy = ca.enrollment_policy();
+        assert!(policy.require_approval);
+        assert_eq!(policy.cert_ttl_secs, 4242);
+        assert!(policy.enrollment_token_set);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A cleared token has to survive a restart *as cleared*: reverting to the
+    /// configured token would silently re-close an enrollment the operator
+    /// deliberately opened.
+    #[test]
+    fn a_cleared_token_stays_cleared_across_a_restart() {
+        let path = unique_state_path("policy-cleared-restart");
+        let cfg = ProviderConfig {
+            enrollment_token: Some("from-yaml".into()),
+            ..persisted_cfg(&path)
+        };
+
+        {
+            let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+            assert!(ca.enrollment_policy().enrollment_token_set);
+            ca.set_enrollment_policy(&EnrollmentPolicyData {
+                enrollment_token: Some(TokenUpdate::Clear),
+                ..Default::default()
+            })
+            .unwrap();
+        } // Dropped here, simulating a process restart.
+
+        let ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+        assert!(
+            !ca.enrollment_policy().enrollment_token_set,
+            "the cleared token must not revert to the configured one"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A field the operator never overrode still tracks the startup config, so
+    /// editing the YAML remains meaningful for everything not pinned by a
+    /// runtime override.
+    #[test]
+    fn an_unset_policy_field_still_follows_the_startup_config() {
+        let path = unique_state_path("policy-partial-restart");
+
+        {
+            let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+            ca.set_enrollment_policy(&EnrollmentPolicyData {
+                require_approval: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        } // Dropped here, simulating a process restart.
+
+        // Same state file, but the operator has since edited the YAML lifetime.
+        let cfg = ProviderConfig {
+            cert_ttl_secs: 777,
+            ..persisted_cfg(&path)
+        };
+        let ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+        assert!(
+            ca.enrollment_policy().require_approval,
+            "the override holds"
+        );
+        assert_eq!(
+            ca.enrollment_policy().cert_ttl_secs,
+            777,
+            "the never-overridden field follows the edited config"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A policy change that cannot be made durable is reported as a failure:
+    /// answering `Ok` would tell the operator a security setting is in force
+    /// that the next restart quietly discards.
+    #[test]
+    fn a_policy_change_that_cannot_persist_is_an_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "wayfinder-server-test-{}-policy-nodir",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        let cfg = persisted_cfg(&dir.join("state.json"));
+        let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+
+        let result = ca.set_enrollment_policy(&EnrollmentPolicyData {
+            require_approval: Some(true),
+            ..Default::default()
+        });
+
+        assert!(result.is_err(), "an unpersistable policy change must fail");
+        assert!(
+            !ca.enrollment_policy().require_approval,
+            "and must not be left applied in memory"
+        );
+    }
+
+    /// A version-2 snapshot (issued + held, no policy section) migrates
+    /// forward with no overrides at all, so the authority keeps following its
+    /// startup config exactly as a version-2 node did.
+    #[test]
+    fn v2_state_file_migrates_forward_with_no_policy_overrides() {
+        let path = unique_state_path("v2-migrate");
+        let v2 = serde_json::json!({
+            "version": 2,
+            "issued": [],
+            "held": [],
+        });
+        std::fs::write(&path, v2.to_string()).unwrap();
+
+        // A config whose policy differs from every default, so "followed the
+        // config" is distinguishable from "fell back to something else".
+        let cfg = ProviderConfig {
+            cert_ttl_secs: 4321,
+            require_approval: true,
+            enrollment_token: Some("from-yaml".into()),
+            ..persisted_cfg(&path)
+        };
+        let ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+
+        let policy = ca.enrollment_policy();
+        assert!(policy.require_approval);
+        assert_eq!(policy.cert_ttl_secs, 4321);
+        assert!(policy.enrollment_token_set);
+
+        std::fs::remove_file(&path).ok();
     }
 }

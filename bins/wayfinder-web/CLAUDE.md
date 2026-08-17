@@ -147,3 +147,20 @@ other bind. The server process holds the mesh identity, so anyone who can reach
 the port has whatever access that identity carries; exposing it is a
 reverse-proxy's job. A session layer is a later, separable change — do not
 quietly widen the bind default in the meantime.
+
+**The Security tab now writes, not just reads**, and that raises the stakes of
+the paragraph above. Whoever can reach this port can turn the node's
+fail-closed gate on or off, flip lazy cert distribution (a flag-day,
+wire-incompatible change for the whole mesh), and — on a certificate authority
+— change the enrollment policy, including clearing the enrollment token so any
+node in range may join. Those changes **persist** on a node configured with a
+`runtime_state_path`, so they outlast the browser tab, the dashboard process,
+and the node's next restart.
+
+This was a deliberate call rather than an oversight: `revoke_node` was already
+exposed here with no authentication, so the port was already a full-privilege
+surface, and gating only the new controls would have implied a boundary that
+does not exist. The mitigation is the same one as before — do not expose the
+port — plus a confirmation dialog on each change that cannot be casually walked
+back. Adding the session layer would let all of this be scoped properly; until
+then, treat reachability of this port as equivalent to root on the mesh.

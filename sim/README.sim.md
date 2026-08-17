@@ -231,9 +231,55 @@ python scripts/topology.py write             # refresh the committed docker-comp
 ```
 
 `up`/`down`/`logs` operate on an ephemeral, gitignored file
-(`.sim-compose.gen.yml`) under the fixed project name `wayfinder-sim`. The
-committed `docker-compose.yml` is a snapshot of the default topology, so plain
-`docker compose up --build -d` works too.
+(`.sim-compose.gen.yml`) under the fixed project name `wayfinder-sim`.
+
+> **`write` with no path targets `docker-compose.yml`, which is no longer a
+> topology snapshot.** That file is now the *deployment* compose (release images
+> from `containers/Dockerfile`), so `topology.py write` with no argument
+> overwrites it with a simulation topology. Pass an explicit path.
+
+## Dashboards
+
+Every node gets its own `wayfinder-web` container beside it, published on
+loopback: `8080` for the first node in the topology, `8081` for the second, and
+so on. `up` prints the table, and `graph` repeats it per node.
+
+```bash
+cargo build --workspace     # the nodes
+cargo leptos build          # the dashboard — see below, a plain build is not enough
+python scripts/topology.py up
+# → dashboards:
+#     d1     http://127.0.0.1:8080
+#     d2     http://127.0.0.1:8081
+#     …
+```
+
+`wayfinder-web` is the one binary a plain `cargo build` does **not** produce
+usably: the crate's default feature set is deliberately empty, so it compiles to
+a stub, and the wasm half that makes the page interactive is not built at all.
+`cargo leptos build` produces both. Skip it and the container says so at startup
+rather than serving a dashboard that silently never updates.
+
+The dashboards authenticate with a shared **operator** identity minted alongside
+the node certificates — an enrolled node refuses any management connection that
+cannot present a certificate carrying the admin capability, so a node's own
+member cert is deliberately not enough.
+
+## Identity, and what this sim does not exercise
+
+`scripts/topology.py` mints the mesh root, one plain **member** certificate per
+node, and one **admin** operator certificate on the host *before* the stack
+starts. Each node mounts only its own at `/secrets` and is a mesh member from
+its first instant — which also makes its MAC (derived from that seed)
+reproducible across runs.
+
+Nothing enrols at runtime. An earlier version had each node generate a key at
+startup and enrol against the provider over the management API; once that API
+required an authenticated TLS handshake, that stopped being possible — a node
+with no certificate cannot open the connection it would use to request one. So
+**online enrollment and the CSR-approval flow are not exercised here**, even
+though the provider still serves those RPCs for a CSR submitted by hand
+(`--require-approval` still gates those).
 
 ## Stress-testing the flood path
 

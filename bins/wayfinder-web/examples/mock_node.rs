@@ -19,7 +19,7 @@
 )]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (addr, node_key) = wayfinder_web::mock::serve_mock_node().await;
+    let (addr, node_key) = wayfinder_web::mock::serve_mock_provider_node().await;
 
     // The dashboard authenticates by proving a key. Against an un-enrolled node
     // that is the node's own seed, so write it somewhere `--identity` can read.

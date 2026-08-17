@@ -3,6 +3,8 @@ use crate::wayfinder::v1alpha::CsrIssued;
 use crate::wayfinder::v1alpha::CsrPending;
 use crate::wayfinder::v1alpha::CsrRejected;
 use crate::wayfinder::v1alpha::Empty;
+use crate::wayfinder::v1alpha::EnrollmentPolicy;
+use crate::wayfinder::v1alpha::EnrollmentPolicyStatus;
 use crate::wayfinder::v1alpha::ErrorResponse;
 use crate::wayfinder::v1alpha::GetSecurityStatusResponse;
 use crate::wayfinder::v1alpha::GetTrustAnchorResponse;
@@ -200,6 +202,62 @@ pub struct RuntimeConfigData {
     pub lazy_cert_distribution: Option<bool>,
     /// Present to override the participation features for one mesh interface.
     pub link_features: Option<LinkFeaturesData>,
+    /// Present to switch the fail-closed gate on (`true`) or off (`false`):
+    /// whether the node stays inert on the mesh while it holds no membership
+    /// cert.
+    pub require_auth: Option<bool>,
+    /// Present to update the enrollment policy of a provider-mode node.
+    pub enrollment: Option<EnrollmentPolicyData>,
+}
+
+/// Intermediate representation of a partial enrollment-policy update, carried
+/// by [`RuntimeConfigData`] into [`WayfinderDataProvider::set_config`].  Each
+/// field is independently optional: `None` leaves that piece of the policy
+/// unchanged.
+///
+/// Already validated by the time it reaches a provider — the dispatch layer
+/// rejects a zero `cert_ttl_secs` and an empty token before constructing this,
+/// so an implementation does not have to re-check either.
+#[derive(Clone, Default)]
+pub struct EnrollmentPolicyData {
+    /// Present to park submitted CSRs pending operator approval (`true`) or to
+    /// sign them on submission (`false`).
+    pub require_approval: Option<bool>,
+    /// Present to set the validity window applied to certificates issued from
+    /// now on, in seconds.  Never zero.
+    pub cert_ttl_secs: Option<u64>,
+    /// Present to change the shared enrollment token.  The outer `Option` is
+    /// "leave unchanged" (`None`) vs. "change it" (`Some`); the inner
+    /// [`TokenUpdate`] distinguishes clearing it from setting one, which an
+    /// `Option<String>` alone would conflate with an empty token.
+    pub enrollment_token: Option<TokenUpdate>,
+}
+
+/// What a [`EnrollmentPolicyData::enrollment_token`] update does to the shared
+/// enrollment token.  A closed two-variant enum rather than an `Option<String>`
+/// so "open enrollment to everyone" and "require a token nobody can present"
+/// cannot be confused for one another at any layer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TokenUpdate {
+    /// Clear the token: enrollment becomes open (TOFU).
+    Clear,
+    /// Require this token on a submitted CSR.  Never empty.
+    Set(String),
+}
+
+/// Intermediate representation of the enrollment policy a provider-mode node
+/// is currently applying, reported inside [`SecurityStatusData`].
+///
+/// Carries no token, only whether one is set: the token is a shared secret,
+/// and a client reading the policy has no need of its value.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnrollmentPolicyStatusData {
+    /// Whether a submitted CSR is parked pending operator approval.
+    pub require_approval: bool,
+    /// The validity window applied to issued certificates, in seconds.
+    pub cert_ttl_secs: u64,
+    /// Whether a shared enrollment token is configured.
+    pub enrollment_token_set: bool,
 }
 
 /// Intermediate representation of one interface's smoothed throughput,
@@ -338,6 +396,15 @@ pub struct SecurityStatusData {
     pub revocation_count: u32,
     /// One entry per originator with a known security posture.
     pub nodes: Vec<NodeSecurityData>,
+    /// Whether this node fails closed, staying inert on the mesh while it
+    /// holds no membership cert.
+    pub require_auth: bool,
+    /// Whether this node's OGMs carry a cert fingerprint rather than the full
+    /// membership cert.
+    pub lazy_cert_distribution: bool,
+    /// The enrollment policy in force; `None` on a node that is not running in
+    /// provider mode and so has none to report.
+    pub enrollment: Option<EnrollmentPolicyStatusData>,
 }
 
 /// The verbosity of one log record.  Mirrors the `LogLevel` proto enum, minus
@@ -589,6 +656,58 @@ fn proto_log_level(level: LogLevelData) -> LogLevel {
         LogLevelData::Debug => LogLevel::Debug,
         LogLevelData::Trace => LogLevel::Trace,
     }
+}
+
+/// Convert a wire [`EnrollmentPolicy`] into its validated intermediate form,
+/// or explain why it cannot be honored.
+///
+/// The two rejections are values whose *only* possible effect is one no caller
+/// could have wanted: a zero certificate lifetime issues certificates that
+/// have already expired, and an empty token gates enrollment on a secret no
+/// client can present. Both would otherwise be applied silently and lock the
+/// mesh against every node that tries to join afterwards.
+///
+/// `enrollment_token_cleared: false` is rejected on a different ground: the
+/// field names the act of clearing the token, so `false` states nothing at
+/// all. Treating it as "leave the token alone" would answer `Empty` to a
+/// request that changed nothing, which reads to the caller as success.
+fn enrollment_policy_data(policy: EnrollmentPolicy) -> Result<EnrollmentPolicyData, String> {
+    use crate::wayfinder::v1alpha::enrollment_policy::EnrollmentTokenUpdate;
+
+    if policy.cert_ttl_secs == Some(0) {
+        return Err(
+            "cert_ttl_secs must be greater than zero: a zero-second certificate \
+                    lifetime issues certificates that are already expired"
+                .into(),
+        );
+    }
+
+    let enrollment_token = match policy.enrollment_token_update {
+        None => None,
+        Some(EnrollmentTokenUpdate::EnrollmentTokenCleared(true)) => Some(TokenUpdate::Clear),
+        Some(EnrollmentTokenUpdate::EnrollmentTokenCleared(false)) => {
+            return Err(
+                "enrollment_token_cleared must be true to clear the token; omit the \
+                        field entirely to leave it unchanged"
+                    .into(),
+            );
+        }
+        Some(EnrollmentTokenUpdate::EnrollmentToken(token)) if token.is_empty() => {
+            return Err(
+                "enrollment_token must not be empty: an empty token can never be \
+                        presented by an enrolling node. Set enrollment_token_cleared to open \
+                        enrollment instead"
+                    .into(),
+            );
+        }
+        Some(EnrollmentTokenUpdate::EnrollmentToken(token)) => Some(TokenUpdate::Set(token)),
+    };
+
+    Ok(EnrollmentPolicyData {
+        require_approval: policy.require_approval,
+        cert_ttl_secs: policy.cert_ttl_secs,
+        enrollment_token,
+    })
 }
 
 /// A short, stable, non-secret name for a request variant, for logging.
@@ -881,6 +1000,13 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                             revoked: n.revoked,
                         })
                         .collect(),
+                    require_auth: s.require_auth,
+                    lazy_cert_distribution: s.lazy_cert_distribution,
+                    enrollment: s.enrollment.map(|e| EnrollmentPolicyStatus {
+                        require_approval: e.require_approval,
+                        cert_ttl_secs: e.cert_ttl_secs,
+                        enrollment_token_set: e.enrollment_token_set,
+                    }),
                 })
             }
 
@@ -913,6 +1039,22 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
 
             Some(RequestKind::SetConfig(set_config)) => {
                 let raw_config = set_config.config.unwrap_or_default();
+                // Validated here rather than in each provider: a rejected value
+                // is one that cannot mean what any caller intended, which is a
+                // property of the *request* rather than of the node's state, so
+                // every implementation would otherwise repeat the same check.
+                let enrollment = raw_config
+                    .enrollment
+                    .map(enrollment_policy_data)
+                    .transpose();
+                let enrollment = match enrollment {
+                    Ok(enrollment) => enrollment,
+                    Err(message) => {
+                        return WayfinderResponse {
+                            response: Some(ResponseKind::Error(ErrorResponse { message })),
+                        };
+                    }
+                };
                 let config = RuntimeConfigData {
                     trickle: raw_config.trickle.map(|t| TrickleConfigData {
                         iface_idx: t.iface_idx,
@@ -933,6 +1075,8 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                             }
                         }),
                     }),
+                    require_auth: raw_config.require_auth,
+                    enrollment,
                 };
                 match self.provider.set_config(config) {
                     Ok(_) => ResponseKind::Empty(Empty {}),
@@ -1062,11 +1206,13 @@ mod tests {
     use crate::wayfinder::v1alpha::GetMetricsRequest;
     use crate::wayfinder::v1alpha::GetNodeInfoRequest;
     use crate::wayfinder::v1alpha::GetOgmScheduleRequest;
+    use crate::wayfinder::v1alpha::GetSecurityStatusRequest;
     use crate::wayfinder::v1alpha::GetThroughputRequest;
     use crate::wayfinder::v1alpha::ResolveRouteRequest;
     use crate::wayfinder::v1alpha::RuntimeConfig;
     use crate::wayfinder::v1alpha::SetConfigRequest;
     use crate::wayfinder::v1alpha::TrickleConfig;
+    use crate::wayfinder::v1alpha::enrollment_policy;
     use alloc::vec;
 
     /// Test double that returns canned responses and records the last
@@ -1094,6 +1240,9 @@ mod tests {
         /// When set, `set_log_level` reports this parse error instead of
         /// accepting the spec.
         set_log_level_error: Option<String>,
+        /// The posture this provider reports, so a test can prove the fields
+        /// reach the wire rather than being dropped in the projection.
+        security_status: SecurityStatusData,
     }
 
     impl WayfinderDataProvider for MockProvider {
@@ -1155,6 +1304,9 @@ mod tests {
         fn logs(&self, since_seq: u64, max_records: u32) -> LogsData {
             self.last_logs_query.set((since_seq, max_records));
             self.logs.clone()
+        }
+        fn security_status(&self) -> SecurityStatusData {
+            self.security_status.clone()
         }
         fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
             match &self.set_log_level_error {
@@ -1551,6 +1703,7 @@ mod tests {
                     }),
                     lazy_cert_distribution: None,
                     link_features: None,
+                    ..Default::default()
                 }),
             }),
         ) {
@@ -1568,6 +1721,8 @@ mod tests {
                     trickle: None,
                     lazy_cert_distribution: None,
                     link_features: None,
+
+                    ..Default::default()
                 }),
             }),
         ) {
@@ -1588,11 +1743,237 @@ mod tests {
                     trickle: None,
                     lazy_cert_distribution: Some(true),
                     link_features: None,
+
+                    ..Default::default()
                 }),
             }),
         ) {
             ResponseKind::Empty(_) => {}
             other => panic!("expected Empty, got {:?}", proto_kind_name(&other)),
+        }
+    }
+
+    /// The fail-closed gate reaches the provider as a present `require_auth`,
+    /// distinct from the "leave it alone" that every other request carries.
+    #[test]
+    fn set_config_with_require_auth_forwards_to_provider_and_returns_empty() {
+        let mut service = WayfinderService::new(MockProvider::default());
+        let response = service.handle(WayfinderRequest {
+            request: Some(RequestKind::SetConfig(SetConfigRequest {
+                config: Some(RuntimeConfig {
+                    require_auth: Some(true),
+                    ..Default::default()
+                }),
+            })),
+        });
+
+        match response.response.expect("service always sets response") {
+            ResponseKind::Empty(_) => {}
+            other => panic!("expected Empty, got {:?}", proto_kind_name(&other)),
+        }
+        assert_eq!(
+            service
+                .provider
+                .last_set_config
+                .as_ref()
+                .expect("set_config was called")
+                .require_auth,
+            Some(true)
+        );
+    }
+
+    /// An enrollment-policy update reaches the provider field by field, with
+    /// the token's `oneof` resolved into the closed [`TokenUpdate`].
+    #[test]
+    fn set_config_with_enrollment_policy_forwards_each_field() {
+        let mut service = WayfinderService::new(MockProvider::default());
+        service.handle(WayfinderRequest {
+            request: Some(RequestKind::SetConfig(SetConfigRequest {
+                config: Some(RuntimeConfig {
+                    enrollment: Some(EnrollmentPolicy {
+                        require_approval: Some(true),
+                        cert_ttl_secs: Some(3600),
+                        enrollment_token_update: Some(
+                            enrollment_policy::EnrollmentTokenUpdate::EnrollmentToken(
+                                "hunter2".into(),
+                            ),
+                        ),
+                    }),
+                    ..Default::default()
+                }),
+            })),
+        });
+
+        let policy = service
+            .provider
+            .last_set_config
+            .as_ref()
+            .expect("set_config was called")
+            .enrollment
+            .as_ref()
+            .expect("enrollment policy forwarded");
+        assert_eq!(policy.require_approval, Some(true));
+        assert_eq!(policy.cert_ttl_secs, Some(3600));
+        assert_eq!(
+            policy.enrollment_token,
+            Some(TokenUpdate::Set("hunter2".into()))
+        );
+    }
+
+    /// Clearing the token is the one thing a default-constructed
+    /// `EnrollmentPolicy` must never do by accident, so only an explicit
+    /// `true` clears it.
+    #[test]
+    fn set_config_enrollment_token_cleared_true_clears_the_token() {
+        let mut service = WayfinderService::new(MockProvider::default());
+        service.handle(WayfinderRequest {
+            request: Some(RequestKind::SetConfig(SetConfigRequest {
+                config: Some(RuntimeConfig {
+                    enrollment: Some(EnrollmentPolicy {
+                        enrollment_token_update: Some(
+                            enrollment_policy::EnrollmentTokenUpdate::EnrollmentTokenCleared(true),
+                        ),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            })),
+        });
+
+        assert_eq!(
+            service
+                .provider
+                .last_set_config
+                .as_ref()
+                .expect("set_config was called")
+                .enrollment
+                .as_ref()
+                .expect("enrollment policy forwarded")
+                .enrollment_token,
+            Some(TokenUpdate::Clear)
+        );
+    }
+
+    /// `enrollment_token_cleared: false` is refused rather than read as
+    /// "leave it unchanged": the field means "clear the token", and a client
+    /// that sent `false` did not mean it, so answering `Empty` would report a
+    /// change that never happened.
+    #[test]
+    fn set_config_rejects_enrollment_token_cleared_false() {
+        match handle(
+            MockProvider::default(),
+            RequestKind::SetConfig(SetConfigRequest {
+                config: Some(RuntimeConfig {
+                    enrollment: Some(EnrollmentPolicy {
+                        enrollment_token_update: Some(
+                            enrollment_policy::EnrollmentTokenUpdate::EnrollmentTokenCleared(false),
+                        ),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }),
+        ) {
+            ResponseKind::Error(err) => assert!(!err.message.is_empty()),
+            other => panic!("expected Error, got {:?}", proto_kind_name(&other)),
+        }
+    }
+
+    /// An empty token would gate enrollment on a secret no client can present,
+    /// locking the mesh against every future member.
+    #[test]
+    fn set_config_rejects_an_empty_enrollment_token() {
+        match handle(
+            MockProvider::default(),
+            RequestKind::SetConfig(SetConfigRequest {
+                config: Some(RuntimeConfig {
+                    enrollment: Some(EnrollmentPolicy {
+                        enrollment_token_update: Some(
+                            enrollment_policy::EnrollmentTokenUpdate::EnrollmentToken(String::new()),
+                        ),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }),
+        ) {
+            ResponseKind::Error(err) => assert!(!err.message.is_empty()),
+            other => panic!("expected Error, got {:?}", proto_kind_name(&other)),
+        }
+    }
+
+    /// A zero certificate lifetime issues certificates that have already
+    /// expired, so every node enrolling afterwards would be refused by the
+    /// mesh it just joined.
+    #[test]
+    fn set_config_rejects_a_zero_cert_ttl() {
+        match handle(
+            MockProvider::default(),
+            RequestKind::SetConfig(SetConfigRequest {
+                config: Some(RuntimeConfig {
+                    enrollment: Some(EnrollmentPolicy {
+                        cert_ttl_secs: Some(0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }),
+        ) {
+            ResponseKind::Error(err) => assert!(!err.message.is_empty()),
+            other => panic!("expected Error, got {:?}", proto_kind_name(&other)),
+        }
+    }
+
+    /// The posture fields and the provider's enrollment policy are projected
+    /// onto the wire, so the dashboard can show what it is about to edit.
+    #[test]
+    fn security_status_projects_posture_and_enrollment_policy() {
+        let provider = MockProvider {
+            security_status: SecurityStatusData {
+                auth_enabled: true,
+                require_auth: true,
+                lazy_cert_distribution: true,
+                enrollment: Some(EnrollmentPolicyStatusData {
+                    require_approval: true,
+                    cert_ttl_secs: 86_400,
+                    enrollment_token_set: true,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        match handle(
+            provider,
+            RequestKind::GetSecurityStatus(GetSecurityStatusRequest {}),
+        ) {
+            ResponseKind::SecurityStatus(status) => {
+                assert!(status.require_auth);
+                assert!(status.lazy_cert_distribution);
+                let enrollment = status.enrollment.expect("provider reports a policy");
+                assert!(enrollment.require_approval);
+                assert_eq!(enrollment.cert_ttl_secs, 86_400);
+                assert!(
+                    enrollment.enrollment_token_set,
+                    "the status reports that a token is set"
+                );
+            }
+            other => panic!("expected SecurityStatus, got {:?}", proto_kind_name(&other)),
+        }
+    }
+
+    /// A node that is not a provider reports no enrollment policy at all,
+    /// rather than a default-valued one: "no policy to change here" and "a
+    /// policy that happens to be all-defaults" are different claims, and the
+    /// dashboard hides the editor on the former.
+    #[test]
+    fn security_status_omits_the_enrollment_policy_on_a_non_provider() {
+        match handle(
+            MockProvider::default(),
+            RequestKind::GetSecurityStatus(GetSecurityStatusRequest {}),
+        ) {
+            ResponseKind::SecurityStatus(status) => assert!(status.enrollment.is_none()),
+            other => panic!("expected SecurityStatus, got {:?}", proto_kind_name(&other)),
         }
     }
 
@@ -1609,6 +1990,7 @@ mod tests {
                     }),
                     lazy_cert_distribution: None,
                     link_features: None,
+                    ..Default::default()
                 }),
             }),
         ) {

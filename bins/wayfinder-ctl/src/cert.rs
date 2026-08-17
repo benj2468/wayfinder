@@ -82,6 +82,17 @@ pub enum CertCommand {
         /// Where to write the certificate.
         #[arg(long)]
         out_cert: PathBuf,
+        /// Also grant the management-administration capability: the holder may
+        /// invoke privileged management-API operations (revocation, runtime
+        /// reconfiguration, CSR approval), not merely route.
+        ///
+        /// Required to reach the management API of an *enrolled* node at all —
+        /// once a node holds a trust anchor, a plain membership cert is refused
+        /// (see `decide_access` in `wayfinder-server`). Grant it to operator
+        /// identities and to tooling that manages a node, never to a routine
+        /// member whose only job is to carry traffic.
+        #[arg(long)]
+        admin: bool,
     },
 
     /// Decode and print a certificate or trust-anchor file.
@@ -110,8 +121,9 @@ pub fn run(cmd: CertCommand) -> anyhow::Result<()> {
             not_before,
             not_after,
             out_cert,
+            admin,
         } => issue(
-            &ca_seed, mesh_id, &mac, &node_seed, not_before, not_after, &out_cert,
+            &ca_seed, mesh_id, &mac, &node_seed, not_before, not_after, &out_cert, admin,
         ),
         CertCommand::Show { file } => show(&file),
     }
@@ -175,6 +187,7 @@ fn issue(
     not_before: u64,
     not_after: u64,
     out_cert: &Path,
+    admin: bool,
 ) -> anyhow::Result<()> {
     if not_after <= not_before {
         bail!("--not-after ({not_after}) must be greater than --not-before ({not_before})");
@@ -186,19 +199,37 @@ fn issue(
         None => node.derived_mac(),
     };
 
-    let cert = authority.issue_cert(
-        mac,
-        node.ed_pubkey(),
-        node.x_pubkey(),
-        not_before,
-        not_after,
-    );
+    // Two distinct calls rather than a flags argument: the admin capability is
+    // a privilege grant, and `issue_admin_cert` is the name that says so at
+    // every call site that has one.
+    let cert = if admin {
+        authority.issue_admin_cert(
+            mac,
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            not_before,
+            not_after,
+        )
+    } else {
+        authority.issue_cert(
+            mac,
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            not_before,
+            not_after,
+        )
+    };
     std::fs::write(out_cert, cert.as_bytes())
         .with_context(|| format!("writing certificate to {}", out_cert.display()))?;
     println!("wrote certificate to {}", out_cert.display());
     println!("  mesh_id:    {mesh_id:#x}");
     println!("  node_mac:   {}", crate::output::format_mac(&mac.0));
     println!("  valid:      [{not_before}, {not_after}] unix");
+    // Printed only when set: a line reading "admin: false" on every ordinary
+    // cert would train the reader to skip the one line that matters.
+    if admin {
+        println!("  capability: management-administration (admin)");
+    }
     Ok(())
 }
 

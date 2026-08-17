@@ -13,6 +13,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use leptos::prelude::*;
+use wayfinder_protos::wayfinder::v1alpha::EnrollmentPolicyStatus;
 use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
 use wayfinder_protos::wayfinder::v1alpha::InterfaceThroughput;
 use wayfinder_protos::wayfinder::v1alpha::KeepAliveEntry;
@@ -129,6 +130,12 @@ fn seeded_snapshot() -> NodeSnapshot {
                 revoked: false,
             },
         ],
+        require_auth: true,
+        lazy_cert_distribution: false,
+        // A plain member: no enrollment policy, matching its absent CSR queue.
+        // `provider_snapshot` adds both together, the way a real provider has
+        // them.
+        enrollment: None,
     });
     snap.metrics = Some(NodeMetrics {
         uptime_secs: 7384,
@@ -144,6 +151,21 @@ fn seeded_snapshot() -> NodeSnapshot {
         paths_mean: 1.0,
         ..Default::default()
     });
+    snap
+}
+
+/// The seeded snapshot as a certificate authority: an enrollment policy and a
+/// CSR queue, which a real node either has both of or neither.
+fn provider_snapshot() -> NodeSnapshot {
+    let mut snap = seeded_snapshot();
+    if let Some(sec) = snap.security.as_mut() {
+        sec.enrollment = Some(EnrollmentPolicyStatus {
+            require_approval: true,
+            cert_ttl_secs: 86_400,
+            enrollment_token_set: true,
+        });
+    }
+    snap.pending_csrs = Some(ListPendingCsrsResponse { pending: vec![] });
     snap
 }
 
@@ -568,4 +590,86 @@ fn logs_show_the_filter_the_node_reports() {
     let html = render_with_history(seeded_snapshot(), history, || view! { <Logs /> });
 
     assert!(html.contains("info,batman=trace"), "{html}");
+}
+
+/// The posture switches render against the node's reported state, so an
+/// operator sees what is actually in force before touching anything.
+#[test]
+fn security_renders_the_posture_switches_from_the_node() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <Security /> });
+
+    assert!(
+        html.contains("Refuse to run unauthenticated"),
+        "the fail-closed switch: {html}"
+    );
+    assert!(
+        html.contains("Send certificate fingerprints"),
+        "the lazy-cert switch: {html}"
+    );
+    // The seed has require_auth on and lazy cert distribution off, so exactly
+    // one of the two switches must read as on. A component that ignored the
+    // snapshot and defaulted both the same way would pass a mere presence check.
+    assert_eq!(
+        html.matches(r#"aria-checked="true""#).count(),
+        1,
+        "require_auth is on and lazy cert distribution is off: {html}"
+    );
+}
+
+/// Neither posture switch acts on click — both stage a confirmation first,
+/// because either can take this node off the mesh.
+#[test]
+fn security_settings_are_not_one_click_from_leaving_the_mesh() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <Security /> });
+
+    assert!(!html.contains("wf-modal"), "nothing armed yet: {html}");
+}
+
+/// A provider's enrollment policy is shown in the units an operator set it in,
+/// and reports whether a token is required without ever showing the token.
+#[test]
+fn security_renders_the_enrollment_policy_on_a_provider() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Security /> });
+
+    assert!(html.contains("How nodes join"), "the policy panel: {html}");
+    assert!(
+        html.contains("Approve each request by hand"),
+        "the approval switch: {html}"
+    );
+    assert!(
+        html.contains("1 day"),
+        "the 86400s lifetime reads as a day: {html}"
+    );
+    assert!(
+        html.contains("Remove token"),
+        "clearing a set token is offered: {html}"
+    );
+}
+
+/// A plain member has no enrollment policy at all, and the panel is omitted
+/// rather than rendered with defaults — "nothing to change here" and "a policy
+/// that happens to be all zeros" are different claims.
+#[test]
+fn security_omits_the_enrollment_policy_on_a_non_provider() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <Security /> });
+
+    assert!(!html.contains("How nodes join"), "no policy panel: {html}");
+}
+
+/// With no token set, the panel says enrollment is open and offers no "remove
+/// token" button — there is nothing to remove, and offering it would imply
+/// the mesh is gated when it is not.
+#[test]
+fn security_says_so_when_enrollment_is_open() {
+    let mut snap = provider_snapshot();
+    if let Some(policy) = snap.security.as_mut().and_then(|s| s.enrollment.as_mut()) {
+        policy.enrollment_token_set = false;
+    }
+    let html = render_with(Some(snap), || view! { <Security /> });
+
+    assert!(
+        html.contains("anyone in range may join"),
+        "open enrollment is stated plainly: {html}"
+    );
+    assert!(!html.contains("Remove token"), "nothing to remove: {html}");
 }

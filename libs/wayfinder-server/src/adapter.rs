@@ -44,6 +44,9 @@ use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
 use crate::provider::MeshAuthority;
+use crate::settings::NodeIdentity;
+use crate::settings::NodeSettings;
+use crate::settings::SettingsStore;
 
 use alloc::string::String;
 use alloc::string::ToString;
@@ -89,6 +92,10 @@ pub struct RouterAdapter<
     /// provider mode.  Drives the enrollment requests (`get_trust_anchor`,
     /// `submit_csr`, `revoke_node`); absent ⇒ those return an error.
     ca: Option<&'a mut dyn MeshAuthority>,
+    /// Where an accepted security setting is recorded so it outlives a
+    /// restart.  Absent on a node with no runtime state configured (and on
+    /// every embedded node), where a change applies in memory only.
+    settings: Option<&'a mut dyn SettingsStore>,
 }
 
 impl<
@@ -141,7 +148,40 @@ impl<
         ca: Option<&'a mut dyn MeshAuthority>,
         now: Duration,
     ) -> Self {
-        Self { router, now, ca }
+        Self {
+            router,
+            now,
+            ca,
+            settings: None,
+        }
+    }
+
+    /// Record accepted security settings in `settings` so they survive a
+    /// restart.
+    ///
+    /// A builder step rather than a fourth constructor argument because most
+    /// callers — every embedded node, and every test that only reads state —
+    /// have no store to offer, and threading `None` through all of them would
+    /// obscure the two call sites that actually persist.
+    pub fn with_settings(mut self, settings: &'a mut dyn SettingsStore) -> Self {
+        self.settings = Some(settings);
+        self
+    }
+
+    /// Record `update` durably before it is applied to the router.
+    ///
+    /// The ordering is the point. Persisting first means a failure leaves the
+    /// node running exactly what it was running before, so the answer the
+    /// operator gets and the state the node is in never disagree — whereas
+    /// applying first would leave a setting live that the next restart
+    /// silently discards, which is the failure this whole feature exists to
+    /// prevent. A node with no store configured skips the step entirely and
+    /// applies in memory, the documented behavior of an unconfigured node.
+    fn persist_settings(&mut self, update: NodeSettings) -> Result<(), String> {
+        match self.settings.as_mut() {
+            Some(store) => store.persist(update),
+            None => Ok(()),
+        }
     }
 
     /// Interface `idx`'s configured name, or the empty string when it was never
@@ -308,9 +348,20 @@ impl<
     }
 
     fn security_status(&self) -> SecurityStatusData {
-        // No auth configured ⇒ report disabled (the Default).
+        // The posture flags and the enrollment policy are reported whether or
+        // not auth is enabled: `require_auth` on a node with no cert is
+        // precisely the state that keeps it off the mesh, so a dashboard that
+        // hid it while auth was disabled would hide the reason.
+        let posture = SecurityStatusData {
+            require_auth: self.router.require_auth(),
+            lazy_cert_distribution: self.router.lazy_cert_distribution(),
+            enrollment: self.ca.as_ref().map(|ca| ca.enrollment_policy()),
+            ..SecurityStatusData::default()
+        };
+
+        // No auth configured ⇒ report disabled, but still with the posture.
         let Some(auth) = self.router.auth() else {
-            return SecurityStatusData::default();
+            return posture;
         };
         let cert = auth.own_cert();
 
@@ -350,6 +401,7 @@ impl<
             cert_not_after: cert.not_after.get(),
             revocation_count: auth.revoked_macs().count() as u32,
             nodes,
+            ..posture
         }
     }
 
@@ -443,11 +495,26 @@ impl<
             seed.try_into()
                 .map_err(|_| "seed must be exactly 32 bytes".to_string())?,
         );
-        let cert = MembershipCert::from_bytes(cert)
+        let parsed_cert = MembershipCert::from_bytes(cert)
             .ok_or_else(|| "unable to parse membership cert".to_string())?;
         let anchor = TrustAnchor::from_bytes(trust_anchor)
             .ok_or_else(|| "unable to parse trust anchor".to_string())?;
-        let auth = OgmAuth::with_capacities(key_pair, cert, anchor);
+
+        // Recorded only once every blob has parsed, so a malformed request
+        // cannot leave unusable identity material behind for the next boot to
+        // trip over. The bytes as received are what is stored — they are what
+        // the next boot will parse, so round-tripping them through the parsed
+        // types first would only add a way for the two to disagree.
+        self.persist_settings(NodeSettings {
+            identity: Some(NodeIdentity {
+                seed: seed.to_vec(),
+                cert: cert.to_vec(),
+                trust_anchor: trust_anchor.to_vec(),
+            }),
+            ..Default::default()
+        })?;
+
+        let auth = OgmAuth::with_capacities(key_pair, parsed_cert, anchor);
         self.router.set_auth(auth);
         Ok(())
     }
@@ -467,8 +534,30 @@ impl<
                 return Err("interface index out of range".to_string());
             }
         }
+        // The two posture flags are recorded as one write before either is
+        // applied, so a request naming both never lands half-durable.
+        if config.require_auth.is_some() || config.lazy_cert_distribution.is_some() {
+            self.persist_settings(NodeSettings {
+                require_auth: config.require_auth,
+                lazy_cert_distribution: config.lazy_cert_distribution,
+                ..Default::default()
+            })?;
+        }
+        if let Some(require_auth) = config.require_auth {
+            self.router.apply_runtime_require_auth(require_auth);
+        }
         if let Some(lazy) = config.lazy_cert_distribution {
             self.router.apply_runtime_lazy_cert_distribution(lazy);
+        }
+        if let Some(enrollment) = &config.enrollment {
+            // The authority owns its own durability (its policy rides the CA
+            // state snapshot, next to the issued certs the policy governs), so
+            // this is not routed through `persist_settings`.
+            let ca = self
+                .ca
+                .as_mut()
+                .ok_or_else(|| "node is not a certificate-authority provider".to_string())?;
+            ca.set_enrollment_policy(enrollment)?;
         }
         if let Some(lf) = config.link_features {
             let idx = lf.iface_idx as usize;
@@ -1448,5 +1537,260 @@ mod tests {
         let mut adapter = RouterAdapter::new(&mut router, Some(&mut ca), Duration::from_secs(0));
         let err = adapter.revoke_node(&mac(9).0).unwrap_err();
         assert!(err.contains("authentication disabled"), "got: {err}");
+    }
+
+    // ── Persisting security settings ───────────────────────────────────────────
+
+    /// A settings store that records what it was asked to persist, and can be
+    /// made to fail, so a test can tell "recorded then applied" from "applied
+    /// and hopefully recorded".
+    #[derive(Default)]
+    struct RecordingStore {
+        settings: NodeSettings,
+        /// Every update handed to `persist`, in order.
+        writes: alloc::vec::Vec<NodeSettings>,
+        /// When set, `persist` fails with this message and records nothing —
+        /// standing in for a full disk or an unwritable path.
+        fail_with: Option<String>,
+    }
+
+    impl SettingsStore for RecordingStore {
+        fn settings(&self) -> &NodeSettings {
+            &self.settings
+        }
+
+        fn persist(&mut self, update: NodeSettings) -> Result<(), String> {
+            if let Some(message) = &self.fail_with {
+                return Err(message.clone());
+            }
+            self.writes.push(update.clone());
+            self.settings.merge(update);
+            Ok(())
+        }
+    }
+
+    /// The fail-closed gate reaches the router *and* the store, so it is in
+    /// force now and still in force after a restart.
+    #[test]
+    fn set_config_require_auth_applies_and_persists() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut store = RecordingStore::default();
+
+        RouterAdapter::new(&mut router, None, Duration::ZERO)
+            .with_settings(&mut store)
+            .set_config(RuntimeConfigData {
+                require_auth: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(router.require_auth(), "in force now");
+        assert_eq!(
+            store.settings().require_auth,
+            Some(true),
+            "and recorded for next boot"
+        );
+    }
+
+    /// Both posture flags in one request are recorded as a single write, so a
+    /// crash between them cannot leave one durable and the other not.
+    #[test]
+    fn set_config_persists_both_posture_flags_in_one_write() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut store = RecordingStore::default();
+
+        RouterAdapter::new(&mut router, None, Duration::ZERO)
+            .with_settings(&mut store)
+            .set_config(RuntimeConfigData {
+                require_auth: Some(true),
+                lazy_cert_distribution: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(store.writes.len(), 1, "one write, not two");
+        assert_eq!(store.writes[0].require_auth, Some(true));
+        assert_eq!(store.writes[0].lazy_cert_distribution, Some(true));
+    }
+
+    /// A change that cannot be recorded is refused outright and leaves the
+    /// router alone: reporting success would tell an operator a security
+    /// setting is in force that the next restart silently discards.
+    #[test]
+    fn set_config_that_cannot_persist_leaves_the_router_untouched() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut store = RecordingStore {
+            fail_with: Some("disk full".into()),
+            ..Default::default()
+        };
+
+        let result = RouterAdapter::new(&mut router, None, Duration::ZERO)
+            .with_settings(&mut store)
+            .set_config(RuntimeConfigData {
+                require_auth: Some(true),
+                ..Default::default()
+            });
+
+        assert!(result.is_err());
+        assert!(
+            !router.require_auth(),
+            "the router must not run a setting the node could not record"
+        );
+    }
+
+    /// A node with no store configured still applies the change — it simply
+    /// cannot carry it across a restart, which is the documented behavior of a
+    /// node without a runtime state path, not an error.
+    #[test]
+    fn set_config_without_a_store_still_applies_in_memory() {
+        let mut router = CentralRouter::new(mac(1));
+
+        RouterAdapter::new(&mut router, None, Duration::ZERO)
+            .set_config(RuntimeConfigData {
+                require_auth: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(router.require_auth());
+    }
+
+    /// Per-interface knobs are deliberately *not* persisted: they are keyed by
+    /// a position in the startup config's link list, so a stored override would
+    /// re-point at a different link the moment an operator reorders one.
+    #[test]
+    fn set_config_does_not_persist_per_interface_knobs() {
+        let mut router = CentralRouter::new(mac(1));
+        router.configure_interface_ogm(
+            0,
+            Duration::from_secs(1),
+            Duration::from_secs(8),
+            Duration::ZERO,
+        );
+        let mut store = RecordingStore::default();
+
+        RouterAdapter::new(&mut router, None, Duration::ZERO)
+            .with_settings(&mut store)
+            .set_config(RuntimeConfigData {
+                trickle: Some(TrickleConfigData {
+                    iface_idx: 0,
+                    min_interval_ms: 500,
+                    max_interval_ms: 4000,
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(store.writes.is_empty());
+    }
+
+    /// An identity installed over the management API is recorded verbatim, so
+    /// a node enrolled at runtime comes back enrolled rather than reverting to
+    /// an unauthenticated one.
+    #[test]
+    fn set_auth_persists_the_installed_identity() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+        ca.set_now_unix(1_000);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let cert = ca_issue(
+            &mut ca,
+            &kp.derived_mac().0,
+            &kp.ed_pubkey(),
+            &kp.x_pubkey(),
+        );
+        let anchor = ca.trust_anchor_bytes();
+        let mut store = RecordingStore::default();
+
+        RouterAdapter::new(&mut router, None, Duration::ZERO)
+            .with_settings(&mut store)
+            .set_auth(&[3; 32], &cert, &anchor)
+            .unwrap();
+
+        let identity = store
+            .settings()
+            .identity
+            .clone()
+            .expect("the identity was recorded");
+        assert_eq!(identity.seed, [3u8; 32].to_vec());
+        assert_eq!(identity.cert, cert);
+        assert_eq!(identity.trust_anchor, anchor);
+    }
+
+    /// Malformed identity material is rejected before anything is written, so
+    /// a bad request cannot leave an unusable identity for the next boot to
+    /// trip over.
+    #[test]
+    fn set_auth_records_nothing_when_the_material_is_malformed() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut store = RecordingStore::default();
+
+        let result = RouterAdapter::new(&mut router, None, Duration::ZERO)
+            .with_settings(&mut store)
+            .set_auth(&[3; 32], b"not a cert", b"not an anchor");
+
+        assert!(result.is_err());
+        assert!(store.writes.is_empty());
+    }
+
+    /// The posture is reported even with auth disabled: `require_auth` on a
+    /// node with no cert is exactly what keeps it off the mesh, so hiding it
+    /// would hide the reason the node is inert.
+    #[test]
+    fn security_status_reports_posture_with_auth_disabled() {
+        let mut router = CentralRouter::new(mac(1));
+        router.set_require_auth(true);
+        router.set_lazy_cert_distribution(true);
+
+        let status = RouterAdapter::new(&mut router, None, Duration::ZERO).security_status();
+
+        assert!(!status.auth_enabled);
+        assert!(status.require_auth);
+        assert!(status.lazy_cert_distribution);
+    }
+
+    /// A node that is not a provider reports no enrollment policy, and refuses
+    /// to be given one — there is nothing on it that a policy would govern.
+    #[test]
+    fn enrollment_policy_is_absent_and_unsettable_without_a_provider() {
+        let mut router = CentralRouter::new(mac(1));
+
+        let status = RouterAdapter::new(&mut router, None, Duration::ZERO).security_status();
+        assert!(status.enrollment.is_none());
+
+        let result =
+            RouterAdapter::new(&mut router, None, Duration::ZERO).set_config(RuntimeConfigData {
+                enrollment: Some(wayfinder_protos::service::EnrollmentPolicyData {
+                    require_approval: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        assert!(result.is_err());
+    }
+
+    /// With a provider attached, the policy is both reported and settable
+    /// through the same request that carries the node's own posture.
+    #[test]
+    fn enrollment_policy_round_trips_through_the_provider() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+
+        RouterAdapter::new(&mut router, Some(&mut ca), Duration::ZERO)
+            .set_config(RuntimeConfigData {
+                enrollment: Some(wayfinder_protos::service::EnrollmentPolicyData {
+                    require_approval: Some(true),
+                    cert_ttl_secs: Some(4242),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let status =
+            RouterAdapter::new(&mut router, Some(&mut ca), Duration::ZERO).security_status();
+        let policy = status.enrollment.expect("a provider reports its policy");
+        assert!(policy.require_approval);
+        assert_eq!(policy.cert_ttl_secs, 4242);
     }
 }

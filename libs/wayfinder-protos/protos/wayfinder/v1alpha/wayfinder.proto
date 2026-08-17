@@ -118,6 +118,38 @@ message GetSecurityStatusResponse {
 
   // One entry per originator with a known security posture.
   repeated NodeSecurity nodes = 6;
+
+  // Whether this node fails closed: while true and no membership cert is
+  // installed, the node stays inert on the mesh (see NodeInfo.auth_locked).
+  // Settable at runtime via SetConfig's RuntimeConfig.require_auth.
+  bool require_auth = 7;
+
+  // Whether this node's OGMs carry an 8-byte cert fingerprint instead of the
+  // full membership cert.  Settable at runtime via SetConfig's
+  // RuntimeConfig.lazy_cert_distribution.
+  bool lazy_cert_distribution = 8;
+
+  // The enrollment policy in force, present only on a node running in
+  // provider (certificate-authority) mode.  Absent on a plain member, which
+  // has no enrollment policy to report or to set.
+  EnrollmentPolicyStatus enrollment = 9;
+}
+
+// The enrollment policy a provider-mode node is currently applying, as
+// reported by GetSecurityStatus.  The read counterpart to the
+// EnrollmentPolicy message SetConfig accepts.
+message EnrollmentPolicyStatus {
+  // Whether a submitted CSR is parked as pending until an operator approves
+  // it, rather than being signed on submission.
+  bool require_approval = 1;
+
+  // The validity window applied to issued certificates, in seconds.
+  uint64 cert_ttl_secs = 2;
+
+  // Whether a shared enrollment token is configured, so a CSR must present a
+  // matching value.  The token itself is deliberately never reported: it is a
+  // shared secret, and a client that can read the policy has no need of it.
+  bool enrollment_token_set = 3;
 }
 
 // Request recent log records from the node's bounded in-memory ring.
@@ -253,6 +285,12 @@ message ResolveRouteRequest {
 // the same material wayfinder-tap otherwise loads from disk; the node builds its
 // OgmAuth from them.  Because the seed is the node's private identity, this is a
 // privileged operation — restrict who can reach the management endpoint.
+//
+// Persisted on the same terms as SetConfig: a node configured with a runtime
+// state path writes the installed identity into it (restricted to the owner,
+// since it carries the seed) and re-installs it on next boot, so a node
+// enrolled at runtime does not silently revert to an unauthenticated one after
+// a restart.  A node without such a path installs the identity in memory only.
 message SetAuthRequest {
   // The node's 32-byte Ed25519 identity seed, as raw bytes.  Secret: it *is*
   // the node's identity.
@@ -371,15 +409,77 @@ message RuntimeConfig {
 
   // Present to update the participation features for one mesh interface.
   LinkFeatures link_features = 3;
+
+  // Present to switch the fail-closed gate on or off: whether this node stays
+  // inert on the mesh while it has no membership cert installed (see
+  // NodeInfo.auth_locked).  Turning it on while the node has no cert takes it
+  // off the mesh immediately, so a caller that is not certain a cert is
+  // installed should read GetSecurityStatus.auth_enabled first.
+  optional bool require_auth = 4;
+
+  // Present to update this node's enrollment policy.  Rejected with an
+  // ErrorResponse on a node that is not running in provider mode, which has
+  // no enrollment policy to change.
+  EnrollmentPolicy enrollment = 5;
+}
+
+// A provider-mode node's enrollment policy, as set via SetConfig: how a node
+// asking to join the mesh is admitted.  Each field is independently optional —
+// an unset field leaves that piece of the policy unchanged — so a caller can
+// close open enrollment without also restating the certificate lifetime.
+//
+// Applies to requests submitted after it takes effect; certificates already
+// issued keep the lifetime they were signed with, and CSRs already held keep
+// their place in the approval queue.
+message EnrollmentPolicy {
+  // Park a submitted CSR as pending until an operator approves it (true),
+  // rather than signing it on submission (false).
+  optional bool require_approval = 1;
+
+  // The validity window to apply to certificates issued from now on, in
+  // seconds.  Keep it short — passive expiry is the primary revocation
+  // mechanism.  Zero is rejected: it would issue certificates that are already
+  // expired, taking every newly enrolled node off the mesh on arrival.
+  optional uint64 cert_ttl_secs = 2;
+
+  // The shared enrollment token needs a third state alongside "leave
+  // unchanged" (the field absent) and "require this value", so it is a oneof
+  // rather than an optional string: an empty string is a legitimate-looking
+  // value that would otherwise be indistinguishable from clearing the token,
+  // and the two mean opposite things — one gates enrollment on a secret
+  // nobody can present, the other opens it to everyone.
+  oneof enrollment_token_update {
+    // Clear the token, so enrollment is open (TOFU) to any node that can
+    // reach this provider.  Only the value `true` clears it; `false` is
+    // rejected rather than silently treated as "leave unchanged", so a
+    // default-constructed message can never open enrollment by accident.
+    bool enrollment_token_cleared = 3;
+
+    // Require this value on a submitted CSR.  Rejected when empty — an empty
+    // token would gate enrollment on a secret no client can present, which is
+    // never what a caller means.
+    string enrollment_token = 4;
+  }
 }
 
 // Apply a partial update to the node's runtime configuration.  Only the
 // fields present in `config` are changed; unset fields are left as they are.
-// Applied in memory only — it does not persist across a restart, so the
-// startup configuration remains the source of truth for next boot.  Answered
-// with an Empty response on success, or an ErrorResponse if a present field
-// fails validation (e.g. an out-of-range interface index, or
+// Answered with an Empty response on success, or an ErrorResponse if a present
+// field fails validation (e.g. an out-of-range interface index, or
 // TrickleConfig.min_interval_ms exceeding max_interval_ms).
+//
+// Whether an accepted update survives a restart is the *node's* decision, not
+// the caller's: a node configured with a runtime state path persists what it
+// accepts here and re-applies it over its startup configuration on next boot,
+// and one without such a path applies the update in memory only.  A caller
+// that needs to know which happened reads NodeInfo.runtime_config_active,
+// rather than assuming either way.
+//
+// An update is persisted only once it has been accepted and applied, so a
+// rejected field is never durably remembered.  A failure to persist fails the
+// whole request — the node does not report success for a change it could not
+// make durable, since the caller would then believe a setting is in force that
+// the next restart quietly discards.
 message SetConfigRequest {
   // The partial configuration update to apply.
   RuntimeConfig config = 1;

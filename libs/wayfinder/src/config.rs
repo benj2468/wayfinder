@@ -462,6 +462,23 @@ pub struct Config {
     /// this to `true` mesh-wide.
     #[serde(default)]
     pub lazy_cert_distribution: bool,
+    /// Where this node records the security settings changed at runtime
+    /// through the management API, so they are still in force after a restart:
+    /// the fail-closed gate, lazy cert distribution, and an identity installed
+    /// by `SetAuth`.
+    ///
+    /// Absent ⇒ runtime changes apply in memory only and are lost on restart
+    /// (the historical behavior). Present ⇒ the file is read at startup and
+    /// its values *override* the corresponding fields of this config, since
+    /// they are the operator's more recent intent; a setting never changed at
+    /// runtime keeps following the config, so editing this file stays
+    /// meaningful, and deleting the state file returns the node wholly to it.
+    ///
+    /// The file carries the node's identity seed once one has been installed,
+    /// so it is written owner-only. Keep it under `/var/lib` with the node's
+    /// other generated state rather than beside the operator-authored config.
+    #[serde(default)]
+    pub runtime_state_path: Option<String>,
 }
 
 /// Enables certificate-authority (provider) mode on a node: it holds the mesh
