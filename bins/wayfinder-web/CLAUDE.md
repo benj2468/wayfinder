@@ -103,6 +103,34 @@ exports both for its own builds, so only a *plain* `cargo build` of the `ssr`
 binary has to do it by hand. The container does, in `ENV` on both stages; any
 other deployment path has to as well.
 
+### The two halves must come from one build
+
+Server-rendered markup and the wasm that hydrates it are halves of the same
+build, and hydration is a *walk* over the markup — so halves from different
+builds do not merely look wrong, the walk desynchronises and panics partway
+through. By then the tab bar has its click handlers, so every tab swallows its
+click and goes nowhere: a dashboard that looks completely normal and is entirely
+dead. `server.rs` therefore serves everything `cache-control: no-cache`
+(revalidate, not re-download) — nothing else prevents the drift, since the
+bundle URL carries no content hash and Chrome's plain reload does not
+revalidate subresources. The favicon opts out with its own header; anything else
+that wants a cache must do the same, deliberately.
+
+`/pkg` gets its own `ServeDir` rather than riding leptos's static-file fallback,
+only because that fallback ignores `If-Modified-Since` — under `no-cache` it
+would re-send the whole wasm bundle on every page view instead of a `304`.
+
+cargo-leptos's `hash-files` would make the drift *impossible* rather than merely
+detectable, by putting a content hash in the bundle filenames. It is off: the
+server then needs `LEPTOS_HASH_FILES` as well, and getting that wrong fails the
+same silent way as the two variables above — hashed files on disk, unhashed URLs
+in the markup, a page that renders and never wakes up. Revisit if the
+revalidation round trip ever costs more than that risk.
+
+`hydrate()` installs a panic hook that paints a banner saying the page is dead
+and to reload. It is the only thing that can speak — a wasm panic aborts — and
+without it this whole failure mode is invisible.
+
 ## Conventions
 
 - **Formatting goes in `format.rs`, never inline in a `view!`.** Macro bodies

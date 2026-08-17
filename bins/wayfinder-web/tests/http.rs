@@ -145,6 +145,140 @@ async fn set_link_gate_server_fn_answers_over_http() {
     );
 }
 
+/// The wasm bundle is served `no-cache`, so a browser revalidates it instead of
+/// pairing a cached copy with freshly rendered markup.
+///
+/// This is the guard on the nastiest failure this crate has: hydration is a
+/// *walk* over the markup the server wrote, so a bundle from a different build
+/// desynchronises from it and panics partway through. By then the tab bar has
+/// its click handlers, so every tab swallows its click and navigates nowhere —
+/// a dashboard that looks completely normal and is entirely dead.
+///
+/// The bundle URL never changes (`/pkg/wayfinder-web.wasm`), and the file
+/// handler sets no freshness of its own, so browsers fall back to a heuristic
+/// (a fraction of the file's age) and Chrome's plain reload does not revalidate
+/// subresources at all — which is precisely how a rebuild lands new markup
+/// against an old bundle. `no-cache` still lets the 10 MB body be cached; it
+/// only requires the conditional request that catches the swap.
+#[tokio::test]
+async fn the_wasm_bundle_is_revalidated_rather_than_reused_blind() {
+    let site = common::SiteRoot::new();
+    let conn = common::serve_mock_node().await;
+    let app = wayfinder_web::server::build_router(site.options(), conn);
+
+    let response = app
+        .oneshot(
+            Request::get("/pkg/wayfinder-web.wasm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the bundle is served from site-root"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-cache"),
+        "and must be revalidated before a cached copy is reused"
+    );
+}
+
+/// Revalidating the bundle costs a `304`, not another copy of it.
+///
+/// This is what makes the `no-cache` above affordable. Without conditional-request
+/// support, "revalidate every load" would mean re-downloading a multi-megabyte
+/// wasm file on every page view — over a mesh link, in the worst case.
+#[tokio::test]
+async fn revalidating_the_bundle_costs_a_304_not_another_copy() {
+    let site = common::SiteRoot::new();
+    let conn = common::serve_mock_node().await;
+    let app = wayfinder_web::server::build_router(site.options(), conn);
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::get("/pkg/wayfinder-web.wasm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let last_modified = first
+        .headers()
+        .get("last-modified")
+        .expect("the bundle is served with a validator to revalidate against")
+        .clone();
+
+    let second = app
+        .oneshot(
+            Request::get("/pkg/wayfinder-web.wasm")
+                .header("if-modified-since", last_modified)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        second.status(),
+        StatusCode::NOT_MODIFIED,
+        "an unchanged bundle is not sent again"
+    );
+    let body = second.into_body().collect().await.unwrap().to_bytes();
+    assert!(body.is_empty(), "and carries no body");
+}
+
+/// The page itself must not be cached either: served stale, it would hand the
+/// browser markup from one build and hydration from another just as surely.
+#[tokio::test]
+async fn the_page_is_revalidated_rather_than_reused_blind() {
+    let conn = common::serve_mock_node().await;
+    let app = wayfinder_web::server::build_router(common::test_leptos_options(), conn);
+
+    let response = app
+        .oneshot(Request::get("/security").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-cache"),
+        "the rendered page carries no blind freshness"
+    );
+}
+
+/// The favicon keeps its own long cache: it is the one asset whose content is
+/// not tied to a build, and re-fetching it on every cold tab is pure waste.
+#[tokio::test]
+async fn the_favicon_keeps_its_long_cache() {
+    let conn = common::serve_mock_node().await;
+    let app = wayfinder_web::server::build_router(common::test_leptos_options(), conn);
+
+    let response = app
+        .oneshot(Request::get("/favicon.svg").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("public, max-age=86400"),
+        "not swept up by the no-cache rule for build artifacts"
+    );
+}
+
 /// The favicon is served from the crate's own route rather than the static-file
 /// fallback, so it resolves in every deployment: a plain `cargo build` of the
 /// `ssr` binary has no populated `site-root` to serve it from.

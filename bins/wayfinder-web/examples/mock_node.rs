@@ -5,8 +5,18 @@
 //! then prints the exact command to point the dashboard at it.
 //!
 //! ```text
-//! cargo run -p wayfinder-web --features mock-node --example mock_node
+//! cargo run -p wayfinder-web --features mock-node --example mock_node [FLAVOR]
 //! ```
+//!
+//! `FLAVOR` picks which kind of node to stand in for, since the Security tab
+//! looks materially different against each:
+//!
+//! * `provider` (the default) — a certificate authority: an enrollment policy
+//!   and a request waiting to be approved.
+//! * `member` — an authenticated plain member, with neither.
+//! * `unauthenticated` — mesh authentication switched off, so every identity
+//!   field is empty. The flavor with the least on the screen, and the one whose
+//!   emptiness the other two never exercise.
 //!
 //! Leave it running and start the dashboard in another shell with the command
 //! it prints. The data is fixed — this exercises layout and wiring, not live
@@ -19,7 +29,16 @@
 )]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (addr, node_key) = wayfinder_web::mock::serve_mock_provider_node().await;
+    let flavor = std::env::args().nth(1).unwrap_or_else(|| "provider".into());
+    let mock = match flavor.as_str() {
+        "provider" => wayfinder_web::mock::Mock::provider(),
+        "member" => wayfinder_web::mock::Mock::default(),
+        "unauthenticated" => wayfinder_web::mock::Mock::unauthenticated(),
+        other => {
+            anyhow::bail!("unknown flavor {other:?}: expected provider, member or unauthenticated")
+        }
+    };
+    let (addr, node_key) = wayfinder_web::mock::serve_mock_node_with(mock).await;
 
     // The dashboard authenticates by proving a key. Against an un-enrolled node
     // that is the node's own seed, so write it somewhere `--identity` can read.

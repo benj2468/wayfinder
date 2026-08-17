@@ -22,6 +22,9 @@ Usage
         (add --require-approval so the provider parks hand-submitted CSRs for
         operator approval instead of auto-signing; also accepted by
         `print`/`write`)
+        (add --open N for N nodes with mesh authentication switched off; see
+        "Open nodes" below.  Accepted by every subcommand, since they all
+        re-derive the topology)
     python scripts/topology.py restart [NODE...]  # re-run the entrypoint (pick up a host rebuild)
     python scripts/topology.py down               # tear the ephemeral stack down
     python scripts/topology.py logs [NODE...]     # follow logs
@@ -73,6 +76,27 @@ authenticated TLS handshake, a node with no certificate could no longer open the
 connection it would have used to ask for one.  So online enrollment — and the
 CSR-approval flow — is *not* exercised by this sim, even though the provider
 still serves those RPCs for a CSR submitted by hand.
+
+Open nodes
+----------
+``--open N`` (or the ``OPEN_NODE_COUNT`` constant) adds ``N`` nodes that run
+with mesh authentication switched off entirely — no ``auth:`` block, no
+certificate, ``require_auth: false`` — named ``o1..oN`` and each hung off the
+first node by its own link.
+
+They are here because "no authentication" is a *state* every security surface
+has to render, not merely a gap in the data: an unauthenticated node reports an
+empty identity, no per-node rows, and no enrollment policy, and both the
+dashboard and the TUI have to make that as legible as a full mesh.  The routing
+behaviour is worth watching too — the secured nodes are ``require_auth: true``,
+so an open node is heard and dropped rather than routed to.
+
+An open node's dashboard authenticates the *opposite* way to a secured one: the
+node is un-enrolled, so it admits only a client proving the node's own key, and
+its dashboard is given that seed instead of the operator certificate.  Its MAC
+is the one thing that is not reproducible across ``up``, since it has no
+identity seed to derive one from — the node generates and persists a MAC on
+first boot instead.
 """
 
 from __future__ import annotations
@@ -109,6 +133,24 @@ CERT_NOT_AFTER = 100_000_000_000
 # loopback only — the dashboard has no login of its own.
 WEB_PORT_BASE = 8090
 
+# How many *open* nodes to add: nodes that run with mesh authentication switched
+# off entirely (no `auth:` block, `require_auth: false`), named ``o1``, ``o2``, …
+# and hung off the secured topology by `open_nodes` below. Override per run with
+# `--open N`.
+#
+# They exist because "no authentication" is a distinct state of every security
+# surface, not merely a missing one: an unauthenticated node reports an empty
+# identity, no per-node rows and no enrollment policy, and both the dashboard
+# and the TUI have to render *that* as intelligibly as they render a full mesh.
+# The mesh behaviour is worth watching too — the secured nodes here are
+# `require_auth: true`, so an open node is heard and dropped rather than routed
+# to, which is what segregation is supposed to look like from the outside.
+OPEN_NODE_COUNT = 0
+
+# Name prefix for the open nodes, kept distinct from any secured prefix so
+# `graph`/`logs`/`blast` name them unambiguously.
+OPEN_NODE_PREFIX = "o"
+
 
 # ── topology helpers ──────────────────────────────────────────────────────────
 #
@@ -143,6 +185,28 @@ def path(prefix: str, n: int) -> list[list[str]]:
 def shared_lan(nodes: list[str]) -> list[list[str]]:
     """One segment shared by all ``nodes`` (a single multi-access bridge)."""
     return [list(nodes)]
+
+
+def open_node_names(count: int = -1) -> list[str]:
+    """The names of the open (unauthenticated) nodes, ``o1..oN``.
+
+    Derived from the count rather than from the generated links, so it answers
+    "is this node open?" the same way whether or not the node was wired in.
+    """
+    if count < 0:
+        count = OPEN_NODE_COUNT
+    return [f"{OPEN_NODE_PREFIX}{i}" for i in range(1, count + 1)]
+
+
+def open_nodes(attach_to: str, count: int = -1) -> list[list[str]]:
+    """Each open node on its own point-to-point link to ``attach_to``.
+
+    A star rather than a chain: every open node is then one hop from the secured
+    mesh and independent of the others, so what one of them can and cannot reach
+    is a statement about authentication alone and not about a neighbour of its
+    own that might also be open.
+    """
+    return [[attach_to, name] for name in open_node_names(count)]
 
 
 # ── Certificate helpers ───────────────────────────────────────────────────────
@@ -182,11 +246,15 @@ def _ed_pubkey(ctl_output: str) -> str:
     raise RuntimeError(f"no ed25519 key in wayfinderctl output:\n{ctl_output}")
 
 
-def make_identities(node_names: list[str]) -> tuple[Path, dict[str, str]]:
+def make_identities(
+    node_names: list[str], open_names: list[str] | None = None
+) -> tuple[Path, dict[str, str]]:
     """Mint the whole mesh's cryptographic identity on the host, up front.
 
     Returns the directory holding it and a map of node name → ed25519 public
-    key (hex), which the dashboards use to pin the node they connect to.
+    key (hex), which the dashboards use to pin the node they connect to. Both
+    kinds of node appear in that map: pinning is about *which* node you reached,
+    which an open node has to answer too.
 
     Layout, all under one temp dir:
 
@@ -195,6 +263,9 @@ def make_identities(node_names: list[str]) -> tuple[Path, dict[str, str]]:
     * ``nodes/<name>/``       — one node's ``seed``/``cert``/``anchor``. A plain
       *member* certificate: enough to route, deliberately not enough to
       administer, so the sim reflects the real split.
+    * ``open/<name>/``        — an open node's ``seed`` and nothing else. It has
+      no mesh identity to certify; the seed exists only so its *management-TLS*
+      server has a stable key (see below).
     * ``operator/``           — a single *admin* identity, not tied to any radio.
       This is what the dashboards authenticate with; an enrolled node refuses a
       management connection that cannot present one.
@@ -203,6 +274,13 @@ def make_identities(node_names: list[str]) -> tuple[Path, dict[str, str]]:
     reproducible: the node derives its MAC from this seed, and ``cert issue``
     defaults to that same derivation, so a certificate minted before the
     container exists still binds the MAC the node comes up with.
+
+    An open node's seed is minted here for a different reason. With no ``auth:``
+    block the node has no membership seed for its TLS server to reuse, so it
+    would generate one on first boot — and nothing on the host could know the
+    key to pin, nor the key its dashboard has to *prove* (an un-enrolled node
+    admits exactly one client: one holding the node's own key). Minting it here
+    and mounting it as ``identity_seed_path`` closes that circle.
 
     The directory is intentionally *not* auto-deleted: it is mounted into the
     sim containers for the lifetime of the compose project.
@@ -241,9 +319,16 @@ def make_identities(node_names: list[str]) -> tuple[Path, dict[str, str]]:
         (dest / "anchor").write_bytes(anchor.read_bytes())
         return pubkey
 
+    def keygen_into(dest: Path) -> str:
+        """Mint a bare keypair into `dest`, with no certificate at all."""
+        dest.mkdir(parents=True, exist_ok=True)
+        return _ed_pubkey(_ctl("cert", "keygen", "--out-seed", str(dest / "seed")))
+
     node_keys = {
         name: issue_into(ca_dir / "nodes" / name, admin=False) for name in node_names
     }
+    for name in open_names or []:
+        node_keys[name] = keygen_into(ca_dir / "open" / name)
     # One admin identity shared by every dashboard. Separate from the node certs
     # on purpose: making each node its own administrator would hand the admin
     # capability to every router in the mesh, which is exactly what the signed
@@ -266,12 +351,17 @@ def build_links() -> list[list[str]]:
     diamond to the deep mesh (e.g. ``d1 → m5``) must cross the diamond, hop the
     bridge, then route through the dense mesh — a good stress test for OGM
     convergence and multi-path forwarding.
+
+    Any `OPEN_NODE_COUNT` unauthenticated nodes are appended last, so the
+    secured topology below stays the thing you edit and the first node — the
+    certificate authority — is always a secured one.
     """
-    return [
+    secured = [
         # *diamond("d"),  # d1..d4: two 2-hop paths d1⇒d4
         # *complete_graph("m", 5),  # m1..m5: fully meshed (10 links)
         ["d4", "m1"],  # the bridge joining the diamond to the mesh
     ]
+    return secured + open_nodes(node_order(secured)[0])
 
 
 # ── compose generation ────────────────────────────────────────────────────────
@@ -334,7 +424,12 @@ def render_compose(require_approval: bool = False) -> str:
     """
     links = dedup_links(build_links())
     nodes = build_nodes(links)
-    ca_dir, node_keys = make_identities(list(nodes))
+    # Open nodes are those `open_nodes` wired in — intersected with the nodes
+    # that actually made it into the topology, so an open node the wiring never
+    # attached is not silently given a service definition.
+    open_names = [name for name in open_node_names() if name in nodes]
+    secured_names = [name for name in nodes if name not in open_names]
+    ca_dir, node_keys = make_identities(secured_names, open_names)
     # node -> the networks it is attached to, in deterministic order.
     attached: dict[str, list[str]] = {name: [] for name in nodes}
     for members in links:
@@ -347,17 +442,20 @@ def render_compose(require_approval: bool = False) -> str:
 
     e("# GENERATED by scripts/topology.py — do not edit by hand; edit the script.")
     e("#")
-    e(f"# {len(nodes)} nodes, {len(links)} L2 segments.")
+    e(
+        f"# {len(nodes)} nodes ({len(open_names)} of them unauthenticated), "
+        f"{len(links)} L2 segments."
+    )
     e("#")
     e("# Each docker network is an isolated L2 bridge segment carrying RawL2 mesh")
     e("# frames; the sim image emits one mesh link per attached NIC, so this wiring")
     e("# *is* the topology.  Bring it up with:  python scripts/topology.py up")
     e("")
-    # The first node is the certificate-authority *provider*: it alone mounts
-    # the mesh root seed, so the root key lives on exactly one node. Every other
-    # node is a plain member holding a certificate this CA already signed.
-    node_names = list(nodes.keys())
-    provider_name = node_names[0]
+    # The first *secured* node is the certificate-authority *provider*: it alone
+    # mounts the mesh root seed, so the root key lives on exactly one node.
+    # Every other secured node is a plain member holding a certificate this CA
+    # already signed; the open nodes hold nothing.
+    provider_name = secured_names[0]
 
     e("# Shared service definition, merged into each node via a YAML anchor.")
     e("x-node: &node")
@@ -389,6 +487,11 @@ def render_compose(require_approval: bool = False) -> str:
     for idx, (name, cfg) in enumerate(nodes.items()):
         mgmt_ip = f"10.99.0.{idx + 2}"
         is_provider = name == provider_name
+        is_open = name in open_names
+        # A secured node mounts seed + cert + anchor; an open one mounts a
+        # directory holding only a seed, which the entrypoint hands to the
+        # management-TLS server rather than to the mesh.
+        secrets_dir = ca_dir / ("open" if is_open else "nodes") / name
         e(f"  {name}:")
         e("    !!merge <<: *node")
         e(f"    container_name: wf-{name}")
@@ -397,7 +500,7 @@ def render_compose(require_approval: bool = False) -> str:
         # mounts the mesh root seed, so the key that can mint certificates lives
         # on exactly one node.
         e("    volumes:")
-        e(f"      - {ca_dir / 'nodes' / name!s}:/secrets:ro")
+        e(f"      - {secrets_dir!s}:/secrets:ro")
         e(f"      - {REPO_ROOT!s}:/workspace:ro")
         # On a Nix host the host-built binary's ELF interpreter (and glibc) live in
         # /nix/store; mount it read-only so a plain `cargo build` artifact is
@@ -410,6 +513,11 @@ def render_compose(require_approval: bool = False) -> str:
         e(f"      NODE_IP: {cfg['ip']}")
         e(f"      RUST_LOG: {cfg['rust_log']}")
         e(f"      MESH_ID: {MESH_ID}")
+        if is_open:
+            # No `auth:` block, no fail-closed gate: this node routes in the
+            # open. Its neighbours here do not, so watch it be heard and
+            # dropped — that is what mesh segregation looks like from outside.
+            e('      SECURE: "0"')
         if is_provider:
             e('      PROVIDER: "1"')
             # Gate hand-submitted CSRs on operator approval instead of
@@ -431,12 +539,18 @@ def render_compose(require_approval: bool = False) -> str:
         # management client, not a mesh participant, so it gets no mesh segment
         # and no TAP.
         #
-        # It authenticates with the shared *operator* identity: an enrolled node
-        # refuses any management connection that cannot present an admin
-        # certificate, and these nodes are enrolled from their first instant.
-        # `--node-key` pins the node being connected to, which is that node's
-        # own ed25519 key — it cannot be defaulted here the way it can when a
-        # client bootstraps with a node's own seed.
+        # How it authenticates depends on what the node it is talking to will
+        # accept, and the two cases are opposites:
+        #
+        # * A secured node is *enrolled*, so it refuses any connection that
+        #   cannot present an admin certificate — the shared operator identity.
+        # * An open node is *un-enrolled*, and an un-enrolled node admits
+        #   exactly one client: one proving the node's own key. So its dashboard
+        #   presents that node's seed and no certificate at all. (Handing it the
+        #   operator cert instead would be refused: `MgmtDenied::NotOwnKey`.)
+        #
+        # `--node-key` pins the node being connected to either way — that node's
+        # own ed25519 key, which cannot be defaulted here.
         e(f"  {name}-web:")
         e("    image: wayfinder-sim:latest")
         # Same image as the nodes purely to avoid a second build; its entrypoint
@@ -456,11 +570,17 @@ def render_compose(require_approval: bool = False) -> str:
         e("        exec wayfinder-web \\")
         e("          --listen 0.0.0.0:8080 \\")
         e(f"          --addr {mgmt_ip}:7700 \\")
-        e("          --identity /operator/seed \\")
-        e("          --cert /operator/cert \\")
+        if is_open:
+            e("          --identity /node-identity/seed \\")
+        else:
+            e("          --identity /operator/seed \\")
+            e("          --cert /operator/cert \\")
         e(f"          --node-key {node_keys[name]}")
         e("    volumes:")
-        e(f"      - {ca_dir / 'operator'!s}:/operator:ro")
+        if is_open:
+            e(f"      - {secrets_dir!s}:/node-identity:ro")
+        else:
+            e(f"      - {ca_dir / 'operator'!s}:/operator:ro")
         e(f"      - {REPO_ROOT!s}:/workspace:ro")
         if Path("/nix/store").is_dir():
             e("      - /nix/store:/nix/store:ro")
@@ -623,10 +743,14 @@ def cmd_graph() -> None:
             for b in members:
                 if a != b:
                     adj[a].add(b)
+    open_names = set(open_node_names())
     print(f"{len(adj)} nodes, {len(links)} segments")
     urls = dict(web_urls())
     for node, neighbors in adj.items():
-        print(f"  {node}: {', '.join(sorted(neighbors))}")
+        # Flagged inline rather than listed separately: which of a node's
+        # neighbours are open is the thing that explains what it can reach.
+        tag = "  [open — no mesh authentication]" if node in open_names else ""
+        print(f"  {node}: {', '.join(sorted(neighbors))}{tag}")
         print(f"    dashboard: {urls[node]}")
 
 
@@ -645,34 +769,57 @@ def main(argv: list[str]) -> int:
             "(`wayfinderctl csr approve` / TUI Security tab) instead of auto-signing",
         )
 
+    # Shared flag: how many unauthenticated nodes to add. Accepted by every
+    # subcommand, not just the generating ones, because `graph`/`logs`/`restart`
+    # all re-derive the topology and would otherwise describe a different mesh
+    # from the one that is running.
+    def add_open(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--open",
+            type=int,
+            default=None,
+            metavar="N",
+            help="add N nodes running with mesh authentication switched off "
+            f"({OPEN_NODE_PREFIX}1..{OPEN_NODE_PREFIX}N), each on its own link to "
+            f"the first node (default: {OPEN_NODE_COUNT})",
+        )
+
     p = sub.add_parser("print", help="print the generated compose YAML to stdout")
     add_require_approval(p)
-    sub.add_parser("graph", help="print an ASCII adjacency summary of the topology")
+    add_open(p)
+    g = sub.add_parser("graph", help="print an ASCII adjacency summary of the topology")
+    add_open(g)
     w = sub.add_parser("write", help="write the compose YAML to a path")
     w.add_argument("path", nargs="?", default=str(REPO_ROOT / "docker-compose-sim.yml"))
     add_require_approval(w)
+    add_open(w)
     up = sub.add_parser(
         "up", help="generate the ephemeral file and `docker compose up --build -d`"
     )
     up.add_argument("extra", nargs="*", help="extra args passed to `docker compose up`")
     add_require_approval(up)
-    sub.add_parser(
+    add_open(up)
+    dn = sub.add_parser(
         "down", help="`docker compose down` the ephemeral stack (removes networks)"
     )
+    add_open(dn)
     rs = sub.add_parser(
         "restart",
         help="re-run the entrypoint on the running nodes (`docker compose restart`) "
         "— picks up a host rebuild of the mounted binaries without rebuilding the image",
     )
     rs.add_argument("nodes", nargs="*", help="nodes to restart (default: all)")
+    add_open(rs)
     lg = sub.add_parser(
         "logs", help="follow `docker compose logs -f` (optionally for given nodes)"
     )
     lg.add_argument("nodes", nargs="*")
+    add_open(lg)
     bl = sub.add_parser(
         "blast",
         help="flood broadcast traffic from a node into the mesh (stress the flood path)",
     )
+    add_open(bl)
     bl.add_argument(
         "node",
         nargs="?",
@@ -708,6 +855,16 @@ def main(argv: list[str]) -> int:
     )
 
     args = parser.parse_args(argv)
+
+    # `--open` overrides the module-level default for this whole run. Set on the
+    # global rather than threaded through every call site because the topology
+    # is module state here by design — `build_links`, `web_urls` and `cmd_graph`
+    # all read it, and a parameter would have to reach all three in step.
+    if getattr(args, "open", None) is not None:
+        if args.open < 0:
+            parser.error("--open must not be negative")
+        global OPEN_NODE_COUNT
+        OPEN_NODE_COUNT = args.open
 
     if args.cmd == "print":
         print(render_compose(args.require_approval), end="")
