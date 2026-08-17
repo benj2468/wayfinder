@@ -15,6 +15,7 @@
 mod common;
 
 use common::serve_mock_node;
+use common::serve_mock_provider_node;
 use wayfinder_web::snapshot::build_snapshot;
 
 /// Every table in one poll lands in the field the tabs read it from.
@@ -119,4 +120,92 @@ async fn snapshot_reuses_the_connection_across_polls() {
     assert!(conn.is_connected(), "the first poll left a live connection");
     build_snapshot(&conn, 0).await.unwrap();
     assert!(conn.is_connected(), "and the second reused it");
+}
+
+/// The posture and enrollment policy survive the real round trip, and an edit
+/// made through the client is visible on the next poll.
+///
+/// The end-to-end check the render tests cannot make: they seed a snapshot
+/// directly, so a field wired into the wrong place on the wire — or a
+/// `SetConfig` that reports success without changing anything — passes them
+/// and fails here.
+#[tokio::test]
+async fn a_security_setting_changed_through_the_api_shows_up_on_the_next_poll() {
+    let conn = serve_mock_provider_node().await;
+
+    let before = build_snapshot(&conn, 0)
+        .await
+        .unwrap()
+        .security
+        .expect("security posture was fetched");
+    assert!(before.require_auth, "the mock node starts fail-closed");
+    let policy = before.enrollment.expect("the mock node is a provider");
+    assert!(policy.enrollment_token_set);
+    assert_eq!(policy.cert_ttl_secs, 86_400);
+
+    conn.run(async |client| client.set_require_auth(false).await)
+        .await
+        .expect("the node accepted the change");
+
+    let after = build_snapshot(&conn, 0)
+        .await
+        .unwrap()
+        .security
+        .expect("security posture was fetched");
+    assert!(
+        !after.require_auth,
+        "the next poll reports the node's new state, not the old one"
+    );
+}
+
+/// Clearing the enrollment token opens enrollment, and the node reports that
+/// rather than continuing to claim a token is required.
+#[tokio::test]
+async fn clearing_the_enrollment_token_is_reported_back() {
+    use wayfinder_protos::wayfinder::v1alpha::EnrollmentPolicy;
+    use wayfinder_protos::wayfinder::v1alpha::enrollment_policy::EnrollmentTokenUpdate;
+
+    let conn = serve_mock_provider_node().await;
+
+    conn.run(async |client| {
+        client
+            .set_enrollment_policy(EnrollmentPolicy {
+                enrollment_token_update: Some(EnrollmentTokenUpdate::EnrollmentTokenCleared(true)),
+                ..Default::default()
+            })
+            .await
+    })
+    .await
+    .expect("the node accepted the change");
+
+    let policy = build_snapshot(&conn, 0)
+        .await
+        .unwrap()
+        .security
+        .expect("security posture was fetched")
+        .enrollment
+        .expect("the mock node is a provider");
+    assert!(!policy.enrollment_token_set);
+}
+
+/// A rejected setting is an error, not a silent no-op: a zero certificate
+/// lifetime would issue certificates that have already expired.
+#[tokio::test]
+async fn a_rejected_enrollment_policy_surfaces_as_an_error() {
+    use wayfinder_protos::wayfinder::v1alpha::EnrollmentPolicy;
+
+    let conn = serve_mock_provider_node().await;
+
+    let result = conn
+        .run(async |client| {
+            client
+                .set_enrollment_policy(EnrollmentPolicy {
+                    cert_ttl_secs: Some(0),
+                    ..Default::default()
+                })
+                .await
+        })
+        .await;
+
+    assert!(result.is_err(), "a zero certificate lifetime is refused");
 }

@@ -5,8 +5,8 @@ embedded node links only what it can run.
 
 | Layer | Feature | Files |
 |---|---|---|
-| `RouterAdapter` — projects a borrowed `CentralRouter` onto `WayfinderDataProvider` | always (`no_std` + `alloc`) | `adapter.rs`, `provider.rs`, `authz.rs` |
-| host transports — authenticated TLS over TCP, plus an in-process channel | `std` (default) | `transport.rs`, `tls.rs`, `authority.rs`, `persistence.rs` |
+| `RouterAdapter` — projects a borrowed `CentralRouter` onto `WayfinderDataProvider` | always (`no_std` + `alloc`) | `adapter.rs`, `provider.rs`, `authz.rs`, `settings.rs` (trait half) |
+| host transports — authenticated TLS over TCP, plus an in-process channel | `std` (default) | `transport.rs`, `tls.rs`, `authority.rs`, `persistence.rs`, `settings.rs` (`SettingsFile`) |
 | embedded transport — length-delimited frames over `embedded-io-async` | `embedded` | `framing.rs`, `embedded.rs` |
 
 `std` and `embedded` are mutually exclusive in practice — a target picks one.
@@ -83,3 +83,32 @@ things about it:
 - Mutation goes through `wayfinder_storage::Persisted` — mutate, persist, roll
   back in memory if the persist failed. Do not add ad-hoc `persist()` calls
   alongside a direct field write; that ordering is the whole point of the type.
+
+## Persisting a runtime security setting
+
+Two stores, split by *what owns the thing*, not by convenience:
+
+- **The enrollment policy** rides the CA snapshot (`persistence.rs`), next to
+  the certificates it governs. `CertAuthority::set_enrollment_policy` records
+  the override, then re-runs `apply_policy_overrides` — the same overlay a
+  restart performs, so the live path and the restart path cannot drift apart.
+- **Everything node-wide** (the fail-closed gate, lazy cert distribution, an
+  identity installed by `SetAuth`) goes to `settings.rs`, injected into
+  `RouterAdapter` via `.with_settings(...)` by the host driver, exactly as the
+  CA is.
+
+Both stores hold **overrides**, never values: `None` means "the operator never
+changed this", so the startup config still governs it and deleting the state
+file returns the node wholly to its YAML. A field that stored the effective
+value instead would freeze the config out permanently after one edit.
+
+Two rules for anything added here:
+
+- **Persist before applying.** A change that could not be recorded must not be
+  running: the request fails and the node keeps its previous state. Applying
+  first would leave a setting live that the next restart silently discards,
+  which is precisely the failure this exists to prevent.
+- **Per-interface knobs stay in memory.** Trickle bounds and participation
+  gates are keyed by an index into the startup config's link list, so a stored
+  override would re-point at a different link the moment an operator reorders
+  one. `set_config` deliberately does not persist them.

@@ -61,6 +61,13 @@ pub use tls::server_config;
 mod provider;
 pub use provider::MeshAuthority;
 
+mod settings;
+pub use settings::NodeIdentity;
+pub use settings::NodeSettings;
+#[cfg(feature = "std")]
+pub use settings::SettingsFile;
+pub use settings::SettingsStore;
+
 #[cfg(feature = "std")]
 mod persistence;
 

@@ -45,7 +45,15 @@ const MAX_STATE_BYTES: usize = 1024 * 1024;
 /// Current on-disk schema version. Bump this — and add an ordered migration
 /// from the prior version into [`parse_state`] — whenever [`CaState`]'s shape
 /// changes.
-const CURRENT_STATE_VERSION: u32 = 2;
+pub(crate) const CURRENT_STATE_VERSION: u32 = 3;
+
+/// Permission bits the CA state file is written with.
+///
+/// Restricted rather than left to the umask because the snapshot carries the
+/// enrollment token once an operator has set one at runtime — a shared secret
+/// that gates who may join the mesh. The file held no secrets before version 3,
+/// so this tightens the mode of an existing snapshot on its first rewrite.
+const STATE_FILE_MODE: u32 = 0o600;
 
 /// One issued-certificate record in the on-disk snapshot. Mirrors
 /// [`IssuedCertData`] but with fixed-size arrays (the snapshot's own schema,
@@ -115,6 +123,51 @@ struct CaState {
     /// The held-CSR store (pending/approved/denied, awaiting or past operator
     /// review). Added in version 2 — see [`CaStateV1`] for the prior shape.
     held: Vec<HeldCsr>,
+    /// The operator's runtime enrollment-policy overrides. Added in version 3;
+    /// a version-2 snapshot migrates forward with none, which is exactly the
+    /// behavior it had (every field following the startup config).
+    #[serde(default)]
+    policy: PolicyOverrides,
+}
+
+/// The runtime enrollment-policy overrides an operator has applied, as stored.
+///
+/// Every field is an *override*, not a value: `None` means the operator never
+/// changed it and the authority keeps following its startup `ProviderConfig`,
+/// so editing the YAML still moves anything the operator has not pinned. Only
+/// what was explicitly set at runtime is remembered — which is what makes
+/// "revert to the config" a matter of deleting the override rather than
+/// guessing which value the operator meant.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub(crate) struct PolicyOverrides {
+    /// Whether submitted CSRs are parked pending operator approval.
+    #[serde(default)]
+    pub(crate) require_approval: Option<bool>,
+    /// The validity window applied to issued certificates, in seconds.
+    #[serde(default)]
+    pub(crate) cert_ttl_secs: Option<u64>,
+    /// The shared enrollment token, when the operator has changed it.
+    ///
+    /// [`TokenOverride`] rather than the `Option<Option<String>>` this looks
+    /// like it wants to be: JSON has one `null`, so a nested option encodes
+    /// "never overridden" and "overridden to no token" identically, and a
+    /// deliberately cleared token would come back as unset and silently revert
+    /// to the configured one — re-closing an enrollment the operator opened.
+    #[serde(default)]
+    pub(crate) enrollment_token: Option<TokenOverride>,
+}
+
+/// What an operator changed the shared enrollment token to.
+///
+/// Distinct from `TokenUpdate` in the management-API layer, which is the same
+/// two cases as a *request*: this one is the on-disk schema, free to evolve on
+/// its own schedule the way the rest of this snapshot is.
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) enum TokenOverride {
+    /// The token was cleared: enrollment is open (TOFU).
+    Cleared,
+    /// The token was set to this value; a CSR must present it.
+    Set(String),
 }
 
 /// Version 1 of the on-disk schema: the issued-certificate log only, with no
@@ -126,14 +179,34 @@ struct CaStateV1 {
     issued: Vec<IssuedRecord>,
 }
 
+/// Version 2 of the on-disk schema: issued certificates and held CSRs, with no
+/// enrollment-policy section — the policy was startup-config-only until
+/// version 3. Kept so [`parse_state`] can migrate a version-2 snapshot.
+#[derive(Deserialize)]
+struct CaStateV2 {
+    issued: Vec<IssuedRecord>,
+    held: Vec<HeldCsr>,
+}
+
 /// Migrate a version-1 snapshot forward: the held-CSR store didn't exist yet,
 /// so it starts empty (the same behavior a version-1-only node had — held
 /// CSRs are simply not something that schema could have durably remembered).
-fn migrate_v1_to_v2(v1: CaStateV1) -> CaState {
-    CaState {
-        version: 2,
+fn migrate_v1_to_v2(v1: CaStateV1) -> CaStateV2 {
+    CaStateV2 {
         issued: v1.issued,
         held: Vec::new(),
+    }
+}
+
+/// Migrate a version-2 snapshot forward: no policy overrides were recorded, so
+/// the authority follows its startup `ProviderConfig` for every field —
+/// precisely the behavior a version-2 node had.
+fn migrate_v2_to_v3(v2: CaStateV2) -> CaState {
+    CaState {
+        version: 3,
+        issued: v2.issued,
+        held: v2.held,
+        policy: PolicyOverrides::default(),
     }
 }
 
@@ -171,7 +244,11 @@ fn parse_state(bytes: &[u8], path: Option<&Path>) -> Result<CaState, String> {
     match probe.version {
         1 => {
             let v1: CaStateV1 = serde_json::from_slice(bytes).map_err(corrupt)?;
-            Ok(migrate_v1_to_v2(v1))
+            Ok(migrate_v2_to_v3(migrate_v1_to_v2(v1)))
+        }
+        2 => {
+            let v2: CaStateV2 = serde_json::from_slice(bytes).map_err(corrupt)?;
+            Ok(migrate_v2_to_v3(v2))
         }
         CURRENT_STATE_VERSION => serde_json::from_slice(bytes).map_err(corrupt),
         v if v > CURRENT_STATE_VERSION => Err(format!(
@@ -197,6 +274,7 @@ fn parse_state(bytes: &[u8], path: Option<&Path>) -> Result<CaState, String> {
 struct CaLogState {
     issued: Vec<IssuedCertData>,
     held: Vec<HeldCsr>,
+    policy: PolicyOverrides,
 }
 
 impl CaLogState {
@@ -205,6 +283,7 @@ impl CaLogState {
         Self {
             issued: Vec::new(),
             held: Vec::new(),
+            policy: PolicyOverrides::default(),
         }
     }
 }
@@ -242,6 +321,7 @@ impl Codec<CaLogState> for CaStateCodec {
             version: CURRENT_STATE_VERSION,
             issued,
             held: value.held.clone(),
+            policy: value.policy.clone(),
         };
         serde_json::to_vec_pretty(&state).map_err(|e| format!("failed to serialize CA state: {e}"))
     }
@@ -251,6 +331,7 @@ impl Codec<CaLogState> for CaStateCodec {
         Ok(CaLogState {
             issued: state.issued.iter().map(IssuedRecord::to_proto).collect(),
             held: state.held,
+            policy: state.policy,
         })
     }
 }
@@ -317,7 +398,7 @@ impl CaLog {
             Some(path) => {
                 let mut buf = vec![0u8; MAX_STATE_BYTES];
                 Persisted::load(
-                    Some(FileStore::new(path)),
+                    Some(FileStore::new(path).with_mode(STATE_FILE_MODE)),
                     codec,
                     CaLogState::empty(),
                     &mut buf,
@@ -345,6 +426,24 @@ impl CaLog {
     /// Read-only view of the held-CSR store.
     pub(crate) fn held(&self) -> &[HeldCsr] {
         &self.persisted.get().held
+    }
+
+    /// Read-only view of the operator's runtime enrollment-policy overrides.
+    pub(crate) fn policy(&self) -> &PolicyOverrides {
+        &self.persisted.get().policy
+    }
+
+    /// Run `f` against the enrollment-policy overrides, then attempt to
+    /// persist the full state, with the same rollback guarantee as
+    /// [`Self::mutate_held`]: a failed persist leaves the overrides as they
+    /// were, so an operator is never told a security setting took effect when
+    /// the next restart would discard it.
+    pub(crate) fn mutate_policy<R>(
+        &mut self,
+        f: impl FnOnce(&mut PolicyOverrides) -> R,
+    ) -> (R, Result<(), String>) {
+        let (result, persisted) = self.persisted.mutate(|state| f(&mut state.policy));
+        (result, self.report_persist_outcome(persisted))
     }
 
     /// Run `f` against the issued-certificate log, then attempt to persist

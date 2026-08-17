@@ -44,6 +44,8 @@ use wayfinder_driver::build_rylr998_link;
 use wayfinder_driver::build_udp_link;
 use wayfinder_driver::build_udp_multi_link;
 use wayfinder_driver::serve_tls_server;
+use wayfinder_server::SettingsFile;
+use wayfinder_server::SettingsStore;
 
 use crate::tap::TapDevice;
 
@@ -61,6 +63,16 @@ fn load_keypair(seed_path: &str) -> anyhow::Result<Keypair> {
         .as_slice()
         .try_into()
         .map_err(|_| anyhow!("identity seed at {seed_path} must be 32 bytes"))?;
+    Ok(Keypair::from_seed(&seed))
+}
+
+/// Build a keypair from raw seed bytes, for a seed that came from somewhere
+/// other than a file — the runtime settings store, which holds the identity a
+/// `SetAuth` installed.
+fn keypair_from_seed_bytes(seed: &[u8]) -> anyhow::Result<Keypair> {
+    let seed: [u8; 32] = seed
+        .try_into()
+        .map_err(|_| anyhow!("identity seed must be 32 bytes, got {}", seed.len()))?;
     Ok(Keypair::from_seed(&seed))
 }
 
@@ -185,6 +197,31 @@ async fn main() -> anyhow::Result<()> {
     // so keep the full dump at DEBUG rather than INFO.
     tracing::debug!(?config, "loaded configuration");
 
+    // Security settings an operator changed at runtime, from the previous run.
+    // Loaded before anything reads the config, because these override it —
+    // including the identity the node's own MAC is derived from below. A
+    // corrupt or unreadable state file is fatal rather than ignored: starting
+    // with an empty one would silently drop a fail-closed gate or a runtime
+    // enrollment, putting a node the operator had secured back on the open
+    // mesh under its old identity.
+    let settings_store = SettingsFile::load(config.runtime_state_path.clone().map(PathBuf::from))
+        .map_err(|e| anyhow!("failed to load runtime settings: {e}"))?;
+    let settings = settings_store.settings().clone();
+    if !settings_store.is_durable() {
+        tracing::info!(
+            "no runtime_state_path configured; security settings changed through the \
+             management API will apply immediately but will not survive a restart"
+        );
+    } else if !settings.is_empty() {
+        tracing::info!(
+            require_auth = ?settings.require_auth,
+            lazy_cert_distribution = ?settings.lazy_cert_distribution,
+            identity_installed = settings.identity.is_some(),
+            "restored runtime security settings; these take precedence over the \
+             startup configuration"
+        );
+    }
+
     let mut join_set: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
     // This binary's local egress is a kernel TAP; reject any other mechanism.
@@ -206,9 +243,21 @@ async fn main() -> anyhow::Result<()> {
     // persisted identity keypair, so it is stable across restarts and
     // self-consistent with the MAC the membership cert is bound to. Otherwise
     // fall back to a MAC generated once and persisted to `tap.mac_state_path`.
-    let mac_addr = match &config.auth {
-        Some(auth_cfg) => load_keypair(&auth_cfg.seed_path)?.derived_mac().0,
-        None => load_or_generate_mac(&tap.resolved_mac_state_path())?,
+    //
+    // An identity installed at runtime wins over the `auth:` block, for the
+    // same reason it does everywhere else: it is the operator's more recent
+    // intent. It has to be consulted *here*, not only where auth is enabled
+    // below — the MAC is derived from the seed, so reading it later would give
+    // this node an address its own certificate is not bound to.
+    let mac_addr = match (&settings.identity, &config.auth) {
+        (Some(identity), _) => {
+            keypair_from_seed_bytes(&identity.seed)
+                .context("runtime-installed identity seed")?
+                .derived_mac()
+                .0
+        }
+        (None, Some(auth_cfg)) => load_keypair(&auth_cfg.seed_path)?.derived_mac().0,
+        (None, None) => load_or_generate_mac(&tap.resolved_mac_state_path())?,
     };
 
     let mut builder = DeviceBuilder::new()
@@ -382,14 +431,22 @@ async fn main() -> anyhow::Result<()> {
         driver.set_auth_snapshot_rx(rx);
     }
 
+    // The two posture flags, each taking the runtime override when the
+    // operator has set one and otherwise following the config.
+    let require_auth = settings.require_auth.unwrap_or(config.require_auth);
+    let lazy_cert_distribution = settings
+        .lazy_cert_distribution
+        .unwrap_or(config.lazy_cert_distribution);
+
     // Fail-closed policy: when configured, the router stays inert (see
     // `CentralRouter::auth_locked`) until a membership cert is installed below
-    // (from `[auth]`) or later via a runtime `set-auth`. Set unconditionally,
-    // regardless of whether `[auth]` is present below: a `require_auth: true`
-    // node with no `[auth]` block (relying entirely on a runtime `set-auth`)
-    // must still start out correctly locked.
-    driver.router_mut().set_require_auth(config.require_auth);
-    if config.require_auth && config.auth.is_none() {
+    // (from `[auth]`, from the runtime settings store) or later via a runtime
+    // `set-auth`. Set unconditionally, regardless of whether `[auth]` is
+    // present below: a `require_auth: true` node with no `[auth]` block
+    // (relying entirely on a runtime `set-auth`) must still start out
+    // correctly locked.
+    driver.router_mut().set_require_auth(require_auth);
+    if require_auth && config.auth.is_none() && settings.identity.is_none() {
         tracing::warn!(
             "require_auth is set but no [auth] block is configured; this node will \
              stay locked (no routing, no OGM emission) until a certificate is \
@@ -404,8 +461,8 @@ async fn main() -> anyhow::Result<()> {
     // `Config::lazy_cert_distribution`.
     driver
         .router_mut()
-        .set_lazy_cert_distribution(config.lazy_cert_distribution);
-    if config.lazy_cert_distribution && config.auth.is_none() {
+        .set_lazy_cert_distribution(lazy_cert_distribution);
+    if lazy_cert_distribution && config.auth.is_none() && settings.identity.is_none() {
         tracing::warn!(
             "lazy_cert_distribution is set but no [auth] block is configured; it has \
              no effect until authentication is enabled (config or runtime set-auth)"
@@ -415,21 +472,48 @@ async fn main() -> anyhow::Result<()> {
     // Opt-in mesh authentication: load this node's identity, certificate, and
     // the mesh trust anchor, then enable OGM auth on the router.  Absent ⇒ the
     // node runs unauthenticated.
+    //
+    // The three blobs come either from the runtime settings store (a `SetAuth`
+    // on a previous run — the operator's more recent intent, and the source
+    // the MAC above was already derived from) or from the `auth:` block's
+    // files. Whichever supplies them, everything below — the MAC binding
+    // check, the mesh id, enabling auth — is the same, so the two sources
+    // differ only in where the bytes are read from.
     let mut auth_mesh_id: Option<u32> = None;
-    if let Some(auth_cfg) = config.auth {
+    let identity_material = match (&settings.identity, &config.auth) {
+        (Some(identity), _) => {
+            if config.auth.is_some() {
+                tracing::info!(
+                    "using the identity installed at runtime; the [auth] block's files \
+                     are ignored while it is present"
+                );
+            }
+            Some((
+                keypair_from_seed_bytes(&identity.seed)?,
+                identity.cert.clone(),
+                identity.trust_anchor.clone(),
+                "the runtime settings store".to_string(),
+            ))
+        }
+        (None, Some(auth_cfg)) => Some((
+            load_keypair(&auth_cfg.seed_path)?,
+            std::fs::read(&auth_cfg.cert_path)?,
+            std::fs::read(&auth_cfg.trust_anchor_path)?,
+            auth_cfg.cert_path.clone(),
+        )),
+        (None, None) => None,
+    };
+
+    if let Some((keypair, cert_bytes, anchor_bytes, source)) = identity_material {
         use wayfinder::auth::OgmAuth;
         use wayfinder::wayfinder_auth::MembershipCert;
         use wayfinder::wayfinder_auth::TrustAnchor;
 
-        let keypair = load_keypair(&auth_cfg.seed_path)?;
-
-        let cert_bytes = std::fs::read(&auth_cfg.cert_path)?;
         let cert = MembershipCert::from_bytes(&cert_bytes)
-            .ok_or_else(|| anyhow!("invalid membership cert at {}", auth_cfg.cert_path))?;
+            .ok_or_else(|| anyhow!("invalid membership cert from {source}"))?;
 
-        let anchor_bytes = std::fs::read(&auth_cfg.trust_anchor_path)?;
         let anchor = TrustAnchor::from_bytes(&anchor_bytes)
-            .ok_or_else(|| anyhow!("invalid trust anchor at {}", auth_cfg.trust_anchor_path))?;
+            .ok_or_else(|| anyhow!("invalid trust anchor from {source}"))?;
 
         // The cert must bind this node's MAC, or it would sign OGMs no peer
         // attributes to us.
@@ -491,6 +575,10 @@ async fn main() -> anyhow::Result<()> {
             provider_cfg.mesh_id
         );
     }
+
+    // Hand the store to the driver last, so every startup-time read of the
+    // settings above is done before anything can write to it.
+    driver.set_settings_store(settings_store);
 
     if let Err(err) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
         tracing::trace!("Failed to notify systemd: {}", err);

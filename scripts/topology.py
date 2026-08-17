@@ -17,10 +17,11 @@ A "link" here is one isolated L2 bridge network shared by its member nodes:
 Usage
 -----
     python scripts/topology.py print              # print the generated compose YAML
-    python scripts/topology.py write [PATH]       # write it (default: docker-compose.yml)
+    python scripts/topology.py write [PATH]       # write it (default: docker-compose-sim.yml)
     python scripts/topology.py up [-- ARGS...]    # generate ephemeral file + compose up --build -d
-        (add --require-approval so the provider parks CSRs for operator approval
-        instead of auto-signing; also accepted by `print`/`write`)
+        (add --require-approval so the provider parks hand-submitted CSRs for
+        operator approval instead of auto-signing; also accepted by
+        `print`/`write`)
     python scripts/topology.py restart [NODE...]  # re-run the entrypoint (pick up a host rebuild)
     python scripts/topology.py down               # tear the ephemeral stack down
     python scripts/topology.py logs [NODE...]     # follow logs
@@ -42,6 +43,36 @@ run by bare name — in the entrypoint and via ``docker exec``::
 
 rebuilds without ``docker compose build``. (On a Nix host ``/nix/store`` is
 mounted read-only so the host binary's interpreter resolves.)
+
+Dashboards
+----------
+Every node gets its own ``wayfinder-web`` container beside it, published on
+loopback at ``8080`` for the first node, ``8081`` for the second, and so on in
+the order nodes appear in the topology.  ``up`` prints the table; ``graph``
+repeats it per node.  They run the host-built ``wayfinder-web`` from
+``./target`` like everything else here, but that binary is the one thing a
+plain ``cargo build`` does *not* produce usably — build it with::
+
+    cargo leptos build      # the ssr binary AND the wasm bundle it serves
+
+A dashboard authenticates with a shared *operator* identity minted alongside
+the node certificates: an enrolled node refuses any management connection that
+cannot present a certificate carrying the admin capability.
+
+Identity
+--------
+``make_identities`` mints the mesh root, one plain *member* certificate per
+node, and one *admin* operator certificate, all on the host before the stack
+starts.  Each node mounts only its own at ``/secrets`` and is a mesh member from
+its first instant, which also makes its MAC (derived from that seed)
+reproducible across runs.
+
+Nothing enrols at runtime.  An earlier version had each node generate a key and
+enrol against the provider over the management API; once that API required an
+authenticated TLS handshake, a node with no certificate could no longer open the
+connection it would have used to ask for one.  So online enrollment — and the
+CSR-approval flow — is *not* exercised by this sim, even though the provider
+still serves those RPCs for a CSR submitted by hand.
 """
 
 from __future__ import annotations
@@ -61,7 +92,22 @@ PROJECT = "wayfinder-sim"
 
 # Default verbosity for every node's RUST_LOG. "trace" is very chatty across a
 # 9-node mesh; "info" is a sane default — bump a specific node in build_nodes().
-DEFAULT_RUST_LOG = "trace"
+DEFAULT_RUST_LOG = "info"
+
+# The mesh every node in this sim belongs to. One value, used both when minting
+# certificates on the host and in the provider node's config — they must agree
+# or nothing verifies.
+MESH_ID = 1
+
+# Expiry for every certificate minted here. Far enough out that a sim left
+# running never expires out from under itself; a real deployment keeps this
+# short, since passive expiry is the primary revocation mechanism.
+CERT_NOT_AFTER = 100_000_000_000
+
+# Host port for the first node's dashboard; each subsequent node takes the next
+# port up, in the same order `node_order` assigns node IPs. Published on
+# loopback only — the dashboard has no login of its own.
+WEB_PORT_BASE = 8090
 
 
 # ── topology helpers ──────────────────────────────────────────────────────────
@@ -101,43 +147,111 @@ def shared_lan(nodes: list[str]) -> list[list[str]]:
 
 # ── Certificate helpers ───────────────────────────────────────────────────────
 #
-# Mint a single mesh certificate authority on the host before bringing the
-# compose project up. The directory it returns (holding the root `seed` and the
-# public trust anchor `root`) is bind-mounted read-only into the *provider* node
-# only; every other node enrols against the provider over the management network
-# at startup and never sees the root seed.
+# Mint the whole mesh's identity on the host before bringing the compose project
+# up: the root key (mounted into the *provider* node only), one member cert per
+# node, and one admin cert for the dashboards. See `make_identities`.
 
 
-def make_ca() -> Path:
-    """Create a mesh CA in a fresh temp dir, returning that directory.
+def _ctl(*args: str) -> str:
+    """Run `wayfinderctl` from the workspace, returning its stdout.
+
+    Via ``cargo run`` rather than a path into ``target/``, so the caller never
+    has to have built it first — the same reason ``make_identities`` can be the
+    first thing ``up`` does.
+    """
+    result = subprocess.run(
+        ["cargo", "run", "--quiet", "-p", "wayfinder-ctl", "--", *args],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout
+
+
+def _ed_pubkey(ctl_output: str) -> str:
+    """Pull the ed25519 public key out of `cert keygen`/`cert show` output.
+
+    The dashboards need it to *pin* the node they connect to, and it is
+    otherwise only recoverable by re-deriving it from the secret seed.
+    """
+    for line in ctl_output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("ed25519:"):
+            return stripped.split(":", 1)[1].strip()
+    raise RuntimeError(f"no ed25519 key in wayfinderctl output:\n{ctl_output}")
+
+
+def make_identities(node_names: list[str]) -> tuple[Path, dict[str, str]]:
+    """Mint the whole mesh's cryptographic identity on the host, up front.
+
+    Returns the directory holding it and a map of node name → ed25519 public
+    key (hex), which the dashboards use to pin the node they connect to.
+
+    Layout, all under one temp dir:
+
+    * ``seed`` / ``root``     — the mesh root seed and its public trust anchor.
+      Only the provider node mounts these.
+    * ``nodes/<name>/``       — one node's ``seed``/``cert``/``anchor``. A plain
+      *member* certificate: enough to route, deliberately not enough to
+      administer, so the sim reflects the real split.
+    * ``operator/``           — a single *admin* identity, not tied to any radio.
+      This is what the dashboards authenticate with; an enrolled node refuses a
+      management connection that cannot present one.
+
+    Pre-issuing rather than enrolling at runtime is what makes each node's MAC
+    reproducible: the node derives its MAC from this seed, and ``cert issue``
+    defaults to that same derivation, so a certificate minted before the
+    container exists still binds the MAC the node comes up with.
 
     The directory is intentionally *not* auto-deleted: it is mounted into the
     sim containers for the lifetime of the compose project.
     """
     ca_dir = Path(tempfile.mkdtemp(prefix="wayfinder-ca-"))
-    seed = ca_dir / "seed"
+    root_seed = ca_dir / "seed"
     anchor = ca_dir / "root"
-    subprocess.run(
-        [
-            "cargo",
-            "run",
-            "-p",
-            "wayfinder-ctl",
-            "--",
-            "cert",
-            "init-ca",
-            "--mesh-id",
-            "1",
-            "--generate",
-            "--out-seed",
-            str(seed),
-            "--out-anchor",
-            str(anchor),
-        ],
-        cwd=REPO_ROOT,
-        check=True,
-    )
-    return ca_dir
+
+    _ctl(
+        "cert", "init-ca",
+        "--mesh-id", str(MESH_ID),
+        "--generate",
+        "--out-seed", str(root_seed),
+        "--out-anchor", str(anchor),
+    )  # fmt: skip
+
+    def issue_into(dest: Path, admin: bool) -> str:
+        """Mint one identity into `dest`, returning its ed25519 public key."""
+        dest.mkdir(parents=True, exist_ok=True)
+        pubkey = _ed_pubkey(_ctl("cert", "keygen", "--out-seed", str(dest / "seed")))
+        _ctl(
+            "cert", "issue",
+            "--ca-seed", str(root_seed),
+            "--mesh-id", str(MESH_ID),
+            "--node-seed", str(dest / "seed"),
+            # A window wide enough that a long-running sim never expires out
+            # from under itself; a real deployment keeps this short, because
+            # expiry is the primary revocation mechanism.
+            "--not-before", "0",
+            "--not-after", str(CERT_NOT_AFTER),
+            "--out-cert", str(dest / "cert"),
+            *(["--admin"] if admin else []),
+        )  # fmt: skip
+        # Every identity verifies against the same anchor, so each directory is
+        # self-contained and can be mounted alone.
+        (dest / "anchor").write_bytes(anchor.read_bytes())
+        return pubkey
+
+    node_keys = {
+        name: issue_into(ca_dir / "nodes" / name, admin=False) for name in node_names
+    }
+    # One admin identity shared by every dashboard. Separate from the node certs
+    # on purpose: making each node its own administrator would hand the admin
+    # capability to every router in the mesh, which is exactly what the signed
+    # admin bit exists to prevent.
+    issue_into(ca_dir / "operator", admin=True)
+
+    print(f"minted mesh identities in {ca_dir}", file=sys.stderr)
+    return ca_dir, node_keys
 
 
 # ── the topology (edit me) ────────────────────────────────────────────────────
@@ -154,8 +268,8 @@ def build_links() -> list[list[str]]:
     convergence and multi-path forwarding.
     """
     return [
-        *diamond("d"),  # d1..d4: two 2-hop paths d1⇒d4
-        *complete_graph("m", 5),  # m1..m5: fully meshed (10 links)
+        # *diamond("d"),  # d1..d4: two 2-hop paths d1⇒d4
+        # *complete_graph("m", 5),  # m1..m5: fully meshed (10 links)
         ["d4", "m1"],  # the bridge joining the diamond to the mesh
     ]
 
@@ -212,14 +326,15 @@ def build_nodes(links: list[list[str]]) -> dict[str, dict]:
 def render_compose(require_approval: bool = False) -> str:
     """Render the full docker-compose YAML for the current topology.
 
-    When ``require_approval`` is set, the provider node parks incoming CSRs as
+    When ``require_approval`` is set, the provider parks incoming CSRs as
     pending until an operator approves them (``wayfinderctl csr approve`` / the
-    TUI Security tab) instead of auto-signing on submission — so member nodes
-    won't self-enrol in the background.
+    Security tab) instead of auto-signing on submission. Nothing in this sim
+    enrols at runtime — every node is minted a certificate up front — so this
+    only affects a CSR you submit yourself, by hand.
     """
-    ca_dir = make_ca()
     links = dedup_links(build_links())
     nodes = build_nodes(links)
+    ca_dir, node_keys = make_identities(list(nodes))
     # node -> the networks it is attached to, in deterministic order.
     attached: dict[str, list[str]] = {name: [] for name in nodes}
     for members in links:
@@ -238,13 +353,11 @@ def render_compose(require_approval: bool = False) -> str:
     e("# frames; the sim image emits one mesh link per attached NIC, so this wiring")
     e("# *is* the topology.  Bring it up with:  python scripts/topology.py up")
     e("")
-    # The first node is the certificate-authority *provider*: it alone mounts the
-    # mesh root seed and serves enrollment. Every other node enrols against it
-    # over an out-of-band management network (see MGMT_NET) — so the root key
-    # lives on exactly one node, the portal model.
+    # The first node is the certificate-authority *provider*: it alone mounts
+    # the mesh root seed, so the root key lives on exactly one node. Every other
+    # node is a plain member holding a certificate this CA already signed.
     node_names = list(nodes.keys())
     provider_name = node_names[0]
-    provider_mgmt_ip = "10.99.0.2"
 
     e("# Shared service definition, merged into each node via a YAML anchor.")
     e("x-node: &node")
@@ -280,25 +393,30 @@ def render_compose(require_approval: bool = False) -> str:
         e("    !!merge <<: *node")
         e(f"    container_name: wf-{name}")
         e(f"    hostname: {name}")
-        # Only the provider mounts the mesh root seed.
+        # Every node mounts its own pre-issued identity; only the provider also
+        # mounts the mesh root seed, so the key that can mint certificates lives
+        # on exactly one node.
+        e("    volumes:")
+        e(f"      - {ca_dir / 'nodes' / name!s}:/secrets:ro")
+        e(f"      - {REPO_ROOT!s}:/workspace:ro")
+        # On a Nix host the host-built binary's ELF interpreter (and glibc) live in
+        # /nix/store; mount it read-only so a plain `cargo build` artifact is
+        # runnable in the Debian-based container without a musl/static rebuild.
+        if Path("/nix/store").is_dir():
+            e("      - /nix/store:/nix/store:ro")
         if is_provider:
-            e("    volumes:")
             e(f"      - {ca_dir!s}:/ca:ro")
-            e(f"      - {REPO_ROOT!s}:/workspace:ro")
-            # On a Nix host the host-built binary's ELF interpreter (and glibc) live in
-            # /nix/store; mount it read-only so a plain `cargo build` artifact is
-            # runnable in the Debian-based container without a musl/static rebuild.
-            if Path("/nix/store").is_dir():
-                e("      - /nix/store:/nix/store:ro")
         e("    environment:")
         e(f"      NODE_IP: {cfg['ip']}")
         e(f"      RUST_LOG: {cfg['rust_log']}")
+        e(f"      MESH_ID: {MESH_ID}")
         if is_provider:
             e('      PROVIDER: "1"')
-            # Gate enrolment on operator approval instead of auto-signing.
+            # Gate hand-submitted CSRs on operator approval instead of
+            # auto-signing. Nothing enrols on its own here — every node is
+            # already certified — so this only affects a CSR you submit
+            # yourself.
             e(f'      REQUIRE_APPROVAL: "{str(require_approval).lower()}"')
-        else:
-            e(f"      PROVIDER_ADDR: {provider_mgmt_ip}:7700")
         for key, value in cfg["env"].items():
             e(f"      {key}: {value}")
         # Mesh links (map form so we can pin a static IP on the mgmt net), plus
@@ -308,6 +426,61 @@ def render_compose(require_approval: bool = False) -> str:
             e(f"      {net}: {{}}")
         e("      wf_mgmt:")
         e(f"        ipv4_address: {mgmt_ip}")
+
+        # One dashboard per node, on the management network only — it is a
+        # management client, not a mesh participant, so it gets no mesh segment
+        # and no TAP.
+        #
+        # It authenticates with the shared *operator* identity: an enrolled node
+        # refuses any management connection that cannot present an admin
+        # certificate, and these nodes are enrolled from their first instant.
+        # `--node-key` pins the node being connected to, which is that node's
+        # own ed25519 key — it cannot be defaulted here the way it can when a
+        # client bootstraps with a node's own seed.
+        e(f"  {name}-web:")
+        e("    image: wayfinder-sim:latest")
+        # Same image as the nodes purely to avoid a second build; its entrypoint
+        # is the node's, so it is replaced wholesale here.
+        e('    entrypoint: ["/bin/sh", "-c"]')
+        e("    command:")
+        e("      - |")
+        e("        test -s /workspace/target/site/pkg/wayfinder-web.wasm || {")
+        e(
+            "          echo \"dashboard assets missing: run 'cargo leptos build' on the host\" >&2"
+        )
+        e(
+            "          echo \"(a plain 'cargo build' makes a stub binary and no wasm).\" >&2"
+        )
+        e("          exit 1")
+        e("        }")
+        e("        exec wayfinder-web \\")
+        e("          --listen 0.0.0.0:8080 \\")
+        e(f"          --addr {mgmt_ip}:7700 \\")
+        e("          --identity /operator/seed \\")
+        e("          --cert /operator/cert \\")
+        e(f"          --node-key {node_keys[name]}")
+        e("    volumes:")
+        e(f"      - {ca_dir / 'operator'!s}:/operator:ro")
+        e(f"      - {REPO_ROOT!s}:/workspace:ro")
+        if Path("/nix/store").is_dir():
+            e("      - /nix/store:/nix/store:ro")
+        e("    environment:")
+        e("      RUST_LOG: info")
+        # Outside `cargo leptos`, the binary finds its assets only through
+        # these three (see bins/wayfinder-web/CLAUDE.md). Get one wrong and the
+        # dashboard serves correct markup that never becomes interactive.
+        e('      LEPTOS_OUTPUT_NAME: "wayfinder-web"')
+        e('      LEPTOS_SITE_ROOT: "/workspace/target/site"')
+        e('      LEPTOS_SITE_PKG_DIR: "pkg"')
+        e("    ports:")
+        # Loopback only: the dashboard has no authentication of its own, and it
+        # can now edit the mesh's security settings.
+        e(f'      - "127.0.0.1:{WEB_PORT_BASE + idx}:8080"')
+        e("    networks:")
+        e("      wf_mgmt: {}")
+        e("    depends_on:")
+        e(f"      - {name}")
+        e("    restart: unless-stopped")
     e("")
     e("networks:")
     for members in links:
@@ -416,6 +589,32 @@ def cmd_blast(
     return compose(*cmd)
 
 
+def web_urls() -> list[tuple[str, str]]:
+    """Each node paired with the URL its dashboard is published on.
+
+    Derived from the same ordering that assigns node IPs and host ports, so it
+    is a description of the generated compose rather than a second source of
+    truth that could drift from it.
+    """
+    nodes = node_order(dedup_links(build_links()))
+    return [
+        (name, f"http://127.0.0.1:{WEB_PORT_BASE + idx}")
+        for idx, name in enumerate(nodes)
+    ]
+
+
+def print_web_urls() -> None:
+    """Print the node → dashboard URL table.
+
+    Printed after `up` because the alternative is counting ports by hand off
+    the compose file, which is exactly the sort of thing that makes people stop
+    using the dashboards.
+    """
+    print("\ndashboards:", file=sys.stderr)
+    for name, url in web_urls():
+        print(f"  {name:<6} {url}", file=sys.stderr)
+
+
 def cmd_graph() -> None:
     links = dedup_links(build_links())
     adj: dict[str, set[str]] = {n: set() for n in node_order(links)}
@@ -425,8 +624,10 @@ def cmd_graph() -> None:
                 if a != b:
                     adj[a].add(b)
     print(f"{len(adj)} nodes, {len(links)} segments")
+    urls = dict(web_urls())
     for node, neighbors in adj.items():
         print(f"  {node}: {', '.join(sorted(neighbors))}")
+        print(f"    dashboard: {urls[node]}")
 
 
 def main(argv: list[str]) -> int:
@@ -448,7 +649,7 @@ def main(argv: list[str]) -> int:
     add_require_approval(p)
     sub.add_parser("graph", help="print an ASCII adjacency summary of the topology")
     w = sub.add_parser("write", help="write the compose YAML to a path")
-    w.add_argument("path", nargs="?", default=str(REPO_ROOT / "docker-compose.yml"))
+    w.add_argument("path", nargs="?", default=str(REPO_ROOT / "docker-compose-sim.yml"))
     add_require_approval(w)
     up = sub.add_parser(
         "up", help="generate the ephemeral file and `docker compose up --build -d`"
@@ -519,7 +720,10 @@ def main(argv: list[str]) -> int:
         return 0
     if args.cmd == "up":
         write_compose(EPHEMERAL, args.require_approval)
-        return compose("up", "--build", "-d", *args.extra)
+        rc = compose("up", "--build", "-d", *args.extra)
+        if rc == 0:
+            print_web_urls()
+        return rc
     if args.cmd == "down":
         if not EPHEMERAL.exists():
             write_compose(EPHEMERAL)

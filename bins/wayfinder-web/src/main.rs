@@ -114,7 +114,34 @@ async fn main() -> anyhow::Result<()> {
     // No I/O yet: the first poll establishes the connection, so the dashboard
     // starts even with the node down and recovers on its own.
     let conn = Arc::new(NodeConnection::new(target));
-    info!(node = %conn.label(), "node target configured");
+
+    // Log which credentials are configured, not just the address.
+    //
+    // A node that has been enrolled refuses any management client that cannot
+    // present an *admin* membership certificate, and it deliberately answers
+    // with a bare "authentication denied" — the reason stays in the node's log
+    // so an unauthenticated peer cannot use the response to probe. That is the
+    // right call there and it leaves this side with nothing to report, so the
+    // next best thing is to say up front what was presented. "cert: none"
+    // beside a denial is the whole diagnosis: bootstrap credentials against a
+    // node that has outgrown them.
+    if args.serial.is_none() {
+        info!(
+            node = %conn.label(),
+            identity = ?args.identity,
+            cert = ?args.cert,
+            pinned_node_key = args.node_key.is_some(),
+            "node target configured"
+        );
+        if args.cert.is_none() {
+            info!(
+                "no --cert given: authenticating with the identity's own key, which only an \
+                 un-enrolled node accepts. An enrolled node needs an admin certificate."
+            );
+        }
+    } else {
+        info!(node = %conn.label(), "node target configured (serial, unauthenticated)");
+    }
 
     // Everything but the address comes from the environment cargo-leptos sets
     // (site root, package dir, hash file), so the binary finds its own assets.

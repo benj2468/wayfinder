@@ -18,6 +18,7 @@ use std::net::SocketAddr;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use wayfinder_protos::service::EgressDecisionData;
+use wayfinder_protos::service::EnrollmentPolicyStatusData;
 use wayfinder_protos::service::InterfaceThroughputData;
 use wayfinder_protos::service::KeepAliveEntryData;
 use wayfinder_protos::service::LinkFeaturesEntryData;
@@ -27,11 +28,15 @@ use wayfinder_protos::service::LogRecordData;
 use wayfinder_protos::service::LogsData;
 use wayfinder_protos::service::NeighborPathData;
 use wayfinder_protos::service::NodeMetricsData;
+use wayfinder_protos::service::NodeSecurityData;
 use wayfinder_protos::service::OgmScheduleEntryData;
+use wayfinder_protos::service::PendingCsrData;
 use wayfinder_protos::service::RouteResolutionData;
 use wayfinder_protos::service::RoutingEntryData;
 use wayfinder_protos::service::RuntimeConfigData;
+use wayfinder_protos::service::SecurityStatusData;
 use wayfinder_protos::service::TableOccupancyData;
+use wayfinder_protos::service::TokenUpdate;
 use wayfinder_protos::service::WayfinderDataProvider;
 use wayfinder_protos::service::WayfinderService;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
@@ -39,7 +44,76 @@ use wayfinder_protos::wayfinder::v1alpha::WayfinderResponse;
 
 /// A provider with one originator, one link-quality row and one interface, so
 /// every field a snapshot reads has a distinguishable value to land in.
-pub struct Mock;
+///
+/// Stateful only where the dashboard *writes*: a security setting changed here
+/// is remembered and reported back, so the Security tab can be developed
+/// against the same read-your-write behavior a real node has. Everything the
+/// dashboard only reads stays canned.
+pub struct Mock {
+    /// The security posture and enrollment policy, as changed through
+    /// `SetConfig`.
+    security: SecurityStatusData,
+    /// The CSR queue, present only on the provider flavor. `None` makes the
+    /// enrollment RPCs error, the way they do on a plain member.
+    ///
+    /// Kept in step with `security.enrollment`, because on a real node the two
+    /// come from the same fact: a node either is a certificate authority — with
+    /// a policy *and* a queue — or is not, and a mock that reported a policy
+    /// while refusing to list requests would let the dashboard get the
+    /// combination wrong without any test noticing.
+    pending_csrs: Option<Vec<PendingCsrData>>,
+}
+
+impl Default for Mock {
+    /// A plain member: authenticated, but no certificate authority.
+    fn default() -> Self {
+        Self {
+            security: SecurityStatusData {
+                auth_enabled: true,
+                mesh_id: 0xABCD,
+                node_mac: vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01],
+                cert_not_after: 1_800_000_000,
+                revocation_count: 0,
+                nodes: vec![NodeSecurityData {
+                    node_id: vec![0, 0, 0, 0, 0, 2],
+                    verified: true,
+                    cert_not_after: 1_800_000_000,
+                    revoked: false,
+                }],
+                require_auth: true,
+                lazy_cert_distribution: false,
+                enrollment: None,
+            },
+            pending_csrs: None,
+        }
+    }
+}
+
+impl Mock {
+    /// A certificate authority: an enrollment policy with a token and hand
+    /// approval, and one request waiting.
+    ///
+    /// The configuration with the most for an operator to look at, so every
+    /// control on the Security tab has something real to act on.
+    pub fn provider() -> Self {
+        Self {
+            security: SecurityStatusData {
+                enrollment: Some(EnrollmentPolicyStatusData {
+                    require_approval: true,
+                    cert_ttl_secs: 86_400,
+                    enrollment_token_set: true,
+                }),
+                ..Self::default().security
+            },
+            pending_csrs: Some(vec![PendingCsrData {
+                node_mac: vec![0, 0, 0, 0, 0, 9],
+                ed_pubkey: vec![0xab; 32],
+                x_pubkey: vec![0xcd; 32],
+                requested_at: 1_700_000_000,
+            }]),
+        }
+    }
+}
 
 impl WayfinderDataProvider for Mock {
     fn node_id(&self) -> Vec<u8> {
@@ -163,7 +237,37 @@ impl WayfinderDataProvider for Mock {
     fn set_auth(&mut self, _seed: &[u8], _cert: &[u8], _trust_anchor: &[u8]) -> Result<(), String> {
         Ok(())
     }
-    fn set_config(&mut self, _config: RuntimeConfigData) -> Result<(), String> {
+    fn security_status(&self) -> SecurityStatusData {
+        self.security.clone()
+    }
+    fn set_config(&mut self, config: RuntimeConfigData) -> Result<(), String> {
+        // Applied to the reported status, so the dashboard's next poll shows
+        // the change — a mock that accepted every write and reported the same
+        // state forever would make a broken control look like a working one.
+        if let Some(require_auth) = config.require_auth {
+            self.security.require_auth = require_auth;
+        }
+        if let Some(lazy) = config.lazy_cert_distribution {
+            self.security.lazy_cert_distribution = lazy;
+        }
+        if let Some(update) = &config.enrollment {
+            let policy = self
+                .security
+                .enrollment
+                .as_mut()
+                .ok_or_else(|| "node is not a certificate-authority provider".to_string())?;
+            if let Some(require_approval) = update.require_approval {
+                policy.require_approval = require_approval;
+            }
+            if let Some(ttl) = update.cert_ttl_secs {
+                policy.cert_ttl_secs = ttl;
+            }
+            match &update.enrollment_token {
+                Some(TokenUpdate::Clear) => policy.enrollment_token_set = false,
+                Some(TokenUpdate::Set(_)) => policy.enrollment_token_set = true,
+                None => {}
+            }
+        }
         Ok(())
     }
     fn runtime_config_active(&self) -> bool {
@@ -202,6 +306,11 @@ impl WayfinderDataProvider for Mock {
     fn get_trust_anchor(&self) -> Result<Vec<u8>, String> {
         Ok(vec![0xab; 36])
     }
+    fn list_pending_csrs(&self) -> Result<Vec<PendingCsrData>, String> {
+        self.pending_csrs
+            .clone()
+            .ok_or_else(|| "node is not a certificate-authority provider".to_string())
+    }
 }
 
 /// Grab an almost-certainly-free localhost port by binding to :0 and releasing.
@@ -210,19 +319,31 @@ pub fn free_port() -> SocketAddr {
     listener.local_addr().unwrap()
 }
 
-/// Start a TLS management server backed by [`Mock`] on an ephemeral port.
+/// Start a TLS management server backed by a plain-member [`Mock`] on an
+/// ephemeral port.
 ///
 /// Returns the address it bound and the node's Ed25519 public key, which a
 /// client pins. Authentication is bootstrap-style: a client presents the node's
 /// own seed, [`NODE_SEED`].
 pub async fn serve_mock_node() -> (SocketAddr, [u8; 32]) {
+    serve_mock_node_with(Mock::default()).await
+}
+
+/// As [`serve_mock_node`], but backed by a certificate-authority [`Mock`]: the
+/// flavor with an enrollment policy and a CSR queue.
+pub async fn serve_mock_provider_node() -> (SocketAddr, [u8; 32]) {
+    serve_mock_node_with(Mock::provider()).await
+}
+
+/// Start a TLS management server backed by the given [`Mock`].
+pub async fn serve_mock_node_with(mock: Mock) -> (SocketAddr, [u8; 32]) {
     let ck = wayfinder_tls_mgmt::certified_key_from_seed(&NODE_SEED).unwrap();
     let node_key = wayfinder_tls_mgmt::raw_ed25519_from_spki(ck.cert[0].as_ref()).unwrap();
 
     let (query_tx, mut query_rx) =
         mpsc::channel::<(WayfinderRequest, oneshot::Sender<WayfinderResponse>)>(16);
     tokio::spawn(async move {
-        let mut service = WayfinderService::new(Mock);
+        let mut service = WayfinderService::new(mock);
         while let Some((req, resp_tx)) = query_rx.recv().await {
             let _ = resp_tx.send(service.handle(req));
         }

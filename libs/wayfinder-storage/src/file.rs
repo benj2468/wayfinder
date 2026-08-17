@@ -23,13 +23,33 @@ use crate::DurableStore;
 /// the `save_atomic` this was extracted from.
 pub struct FileStore {
     path: PathBuf,
+    /// Unix permission bits to stamp on the file, when the blob is sensitive
+    /// enough that the process umask is not a safe default. `None` leaves the
+    /// mode to the umask, which is right for everything that isn't a secret.
+    mode: Option<u32>,
 }
 
 impl FileStore {
     /// A store backed by `path`. The file need not exist yet — the first
     /// `load` will see it as an empty store (`Ok(None)`).
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            mode: None,
+        }
+    }
+
+    /// Restrict the stored file to `mode` (Unix permission bits, e.g.
+    /// `0o600`), for a blob that carries a secret — a node identity seed, say.
+    ///
+    /// Applied to the `.tmp` file *before* the rename, so the blob is never
+    /// briefly world-readable: the rename carries the temporary file's
+    /// permissions onto the target, and re-applies them on every save rather
+    /// than only when the file is first created. A no-op on non-Unix targets,
+    /// where the mode has no meaning.
+    pub fn with_mode(mut self, mode: u32) -> Self {
+        self.mode = Some(mode);
+        self
     }
 
     /// The path this store is backed by, for callers naming it in their own
@@ -69,7 +89,7 @@ impl DurableStore for FileStore {
 
     fn save(&mut self, data: &[u8]) -> Result<(), Self::Error> {
         let tmp_path = self.tmp_path();
-        let result = save_via_tmp(&tmp_path, &self.path, data);
+        let result = save_via_tmp(&tmp_path, &self.path, data, self.mode);
         if let Err(write_err) = &result
             && let Err(cleanup_err) = std::fs::remove_file(&tmp_path)
             && cleanup_err.kind() != io::ErrorKind::NotFound
@@ -92,9 +112,20 @@ impl DurableStore for FileStore {
 /// Write `data` to `tmp_path`, flush it, then rename it over `path`.
 /// Factored out of [`DurableStore::save`] so the `.tmp`-cleanup-on-failure
 /// step in the caller has a single fallible operation to wrap.
-fn save_via_tmp(tmp_path: &Path, path: &Path, data: &[u8]) -> io::Result<()> {
+///
+/// `mode`, when set, is applied to the temporary file before the rename, so
+/// the blob is already restricted the instant it becomes visible at `path`
+/// (see [`FileStore::with_mode`]).
+fn save_via_tmp(tmp_path: &Path, path: &Path, data: &[u8], mode: Option<u32>) -> io::Result<()> {
     let mut tmp = std::fs::File::create(tmp_path)?;
     tmp.write_all(data)?;
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
     tmp.sync_all()?;
     std::fs::rename(tmp_path, path)?;
     Ok(())
@@ -185,6 +216,51 @@ mod tests {
             !store.tmp_path().exists(),
             "a successful save must rename its .tmp file away, not leave a copy"
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A store carrying a secret must land on disk already restricted: the
+    /// mode is applied to the `.tmp` file *before* the rename, since the
+    /// rename carries the temporary file's permissions onto the target. A
+    /// mode set only after the rename would leave a window in which the
+    /// secret is readable by everyone.
+    #[cfg(unix)]
+    #[test]
+    fn save_with_a_mode_applies_it_to_the_renamed_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = unique_path("mode");
+        let mut store = FileStore::new(&path).with_mode(0o600);
+
+        store.save(b"a secret").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a store given a mode must restrict the file it renames into place"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Re-saving over an existing file keeps the restricted mode: the second
+    /// save renames a fresh `.tmp` over the target, so the mode has to be
+    /// re-applied every time rather than only on creation.
+    #[cfg(unix)]
+    #[test]
+    fn resave_with_a_mode_keeps_the_file_restricted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = unique_path("mode-resave");
+        let mut store = FileStore::new(&path).with_mode(0o600);
+
+        store.save(b"first").unwrap();
+        store.save(b"second").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
         std::fs::remove_file(&path).ok();
     }
 

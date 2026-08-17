@@ -32,6 +32,7 @@ use tokio_util::codec::LengthDelimitedCodec;
 use wayfinder_protos::wayfinder::v1alpha::ApproveCsrRequest;
 use wayfinder_protos::wayfinder::v1alpha::AuthenticateRequest;
 use wayfinder_protos::wayfinder::v1alpha::DenyCsrRequest;
+use wayfinder_protos::wayfinder::v1alpha::EnrollmentPolicy;
 use wayfinder_protos::wayfinder::v1alpha::GetKeepAliveTableRequest;
 use wayfinder_protos::wayfinder::v1alpha::GetLinkFeaturesTableRequest;
 use wayfinder_protos::wayfinder::v1alpha::GetLinkQualityTableRequest;
@@ -273,7 +274,10 @@ impl Client {
             Some(ResponseKind::Empty(_)) => Ok(Self {
                 conn: Conn::Tls(Box::new(framed)),
             }),
-            Some(ResponseKind::Error(e)) => Err(anyhow!("authentication denied: {}", e.message)),
+            Some(ResponseKind::Error(e)) => Err(anyhow!(explain_auth_denial(
+                &e.message,
+                !identity.cert.is_empty()
+            ))),
             other => Err(anyhow!("unexpected response to authentication: {other:?}")),
         }
     }
@@ -562,14 +566,69 @@ impl Client {
 
     /// Switch lazy cert distribution on or off at runtime: whether this
     /// node's OGMs carry an 8-byte cert fingerprint instead of the full
-    /// membership cert. Applied in memory only — it does not persist across
-    /// a restart. A flag-day, wire-incompatible switch with un-upgraded auth
-    /// nodes — see the design doc before flipping it on a live mesh.
+    /// membership cert. A flag-day, wire-incompatible switch with un-upgraded
+    /// auth nodes — see the design doc before flipping it on a live mesh.
+    ///
+    /// Persisted by a node configured with a runtime state path, in memory
+    /// only otherwise — the node's decision, not the caller's.
     pub async fn set_lazy_cert_distribution(&mut self, enabled: bool) -> anyhow::Result<()> {
         match self
             .request(RequestKind::SetConfig(SetConfigRequest {
                 config: Some(RuntimeConfig {
                     lazy_cert_distribution: Some(enabled),
+                    ..Default::default()
+                }),
+            }))
+            .await?
+        {
+            ResponseKind::Empty(_) => Ok(()),
+            other => Err(unexpected("SetConfig", &other)),
+        }
+    }
+
+    /// Switch the node's fail-closed gate on or off at runtime: whether it
+    /// stays inert on the mesh while it holds no membership cert.
+    ///
+    /// Turning it on for a node that has no cert takes that node off the mesh
+    /// immediately — including, if this is the node serving your management
+    /// connection, everything that reaches it *through* the mesh. Read
+    /// [`security_status`](Client::security_status) first when not certain a
+    /// cert is installed.
+    ///
+    /// Persisted by a node configured with a runtime state path, in memory
+    /// only otherwise.
+    pub async fn set_require_auth(&mut self, require: bool) -> anyhow::Result<()> {
+        match self
+            .request(RequestKind::SetConfig(SetConfigRequest {
+                config: Some(RuntimeConfig {
+                    require_auth: Some(require),
+                    ..Default::default()
+                }),
+            }))
+            .await?
+        {
+            ResponseKind::Empty(_) => Ok(()),
+            other => Err(unexpected("SetConfig", &other)),
+        }
+    }
+
+    /// Provider mode: update the node's enrollment policy — how a node asking
+    /// to join the mesh is admitted.
+    ///
+    /// Each field of `policy` is independently optional; an unset field leaves
+    /// that piece of the policy alone. Use
+    /// [`EnrollmentPolicy::enrollment_token_update`] to change the shared
+    /// token: `EnrollmentTokenCleared(true)` opens enrollment, and
+    /// `EnrollmentToken(value)` gates it on `value`. Errors on a node that is
+    /// not a provider, which has no enrollment policy to change.
+    ///
+    /// The policy is persisted by the authority alongside the certificates it
+    /// governs, so it survives a restart.
+    pub async fn set_enrollment_policy(&mut self, policy: EnrollmentPolicy) -> anyhow::Result<()> {
+        match self
+            .request(RequestKind::SetConfig(SetConfigRequest {
+                config: Some(RuntimeConfig {
+                    enrollment: Some(policy),
                     ..Default::default()
                 }),
             }))
@@ -702,4 +761,93 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
         ResponseKind::LogFilter(_) => "LogFilter",
     };
     anyhow!("expected {want} response, got {got}")
+}
+
+/// Turn a node's refusal into a message that names the likely cause.
+///
+/// The node answers every failed authentication with one deliberately generic
+/// message, so that an unauthenticated peer cannot use the response to tell
+/// wrong-key from revoked from expired from not-admin while probing with a
+/// stolen certificate. That is the right call on the server, and it leaves the
+/// bare message useless to a legitimate operator reading their own logs.
+///
+/// The gap is closed from this side instead: whether *this* client presented a
+/// certificate is a fact it already knows, so saying so leaks nothing. Without
+/// one the diagnosis is nearly certain — the bootstrap path only works on an
+/// un-enrolled node. With one, the candidates are listed rather than guessed
+/// between, because the client genuinely cannot tell which check failed.
+fn explain_auth_denial(server_message: &str, presented_cert: bool) -> String {
+    let cause = if presented_cert {
+        "the certificate presented is not an admin certificate, has expired, has been revoked, \
+         or was issued by a different mesh root"
+    } else {
+        "no membership certificate was presented, so this connected on the bootstrap path, \
+         which only an un-enrolled node accepts"
+    };
+    // The node's own wording is kept rather than replaced: a future server may
+    // return something more specific, and this client's guess must not bury it.
+    // It is dropped only when it is the generic message the prefix already says,
+    // which would otherwise render as "authentication denied: authentication
+    // denied".
+    if server_message == "authentication denied" {
+        format!("authentication denied by the node: {cause}")
+    } else {
+        format!("authentication denied by the node ({server_message}): {cause}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A client that presented no certificate is on the bootstrap path, which
+    /// only an un-enrolled node accepts. That is by far the likeliest reason a
+    /// management connection is refused, and it is a fact about *this* client,
+    /// so naming it leaks nothing the node chose to withhold.
+    #[test]
+    fn a_denial_without_a_cert_names_the_bootstrap_path() {
+        let explained = explain_auth_denial("authentication denied", false);
+
+        assert!(
+            explained.contains("no membership certificate"),
+            "got: {explained}"
+        );
+        assert!(explained.contains("un-enrolled"), "got: {explained}");
+    }
+
+    /// With a certificate presented, the client cannot tell which of the
+    /// several enrolled-path checks failed — the node deliberately answers with
+    /// one generic message so an unauthenticated peer cannot probe. So the
+    /// explanation lists the candidates rather than inventing a verdict.
+    #[test]
+    fn a_denial_with_a_cert_lists_the_candidate_causes() {
+        let explained = explain_auth_denial("authentication denied", true);
+
+        assert!(explained.contains("admin"), "got: {explained}");
+        assert!(explained.contains("expired"), "got: {explained}");
+        assert!(explained.contains("revoked"), "got: {explained}");
+    }
+
+    /// The node's own wording is preserved, so a future server that returns
+    /// something more specific is not overwritten by this client's guess.
+    #[test]
+    fn the_nodes_message_is_preserved() {
+        let explained = explain_auth_denial("mesh id mismatch", true);
+
+        assert!(explained.contains("mesh id mismatch"), "got: {explained}");
+    }
+
+    /// The node's generic message is not repeated back alongside a prefix that
+    /// says the same thing — "authentication denied: authentication denied"
+    /// spends a whole log line saying nothing twice.
+    #[test]
+    fn the_generic_message_is_not_doubled() {
+        let explained = explain_auth_denial("authentication denied", false);
+
+        assert_eq!(
+            explained.matches("authentication denied").count(),
+            1,
+            "got: {explained}"
+        );
+    }
 }

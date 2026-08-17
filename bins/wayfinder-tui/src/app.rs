@@ -917,6 +917,7 @@ mod tests {
                 cert_not_after: 1100,
                 revoked: false,
             }],
+            ..Default::default()
         });
         let n = app
             .snapshot
