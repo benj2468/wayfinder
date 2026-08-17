@@ -49,6 +49,11 @@
   --wf-accent: #4cc2ff;
   --wf-accent-dim: rgb(76 194 255 / 14%);
 
+  /* The logo's dot. Brand red is `#d43735`; on the dark surface it is lifted to
+   * hold its own against `--wf-text`, which is near-white here. Not part of the
+   * status ramp above — it is identity, and never encodes a value. */
+  --wf-logo-dot: #e8483f;
+
   /* Status ramp. Warm pulls the eye, cold recedes — the same reasoning as the
    * TUI's log-level colouring, so a screenful reads before any of the words
    * do. */
@@ -72,6 +77,8 @@
 
     --wf-accent: #0369a1;
     --wf-accent-dim: rgb(3 105 161 / 10%);
+
+    --wf-logo-dot: #d43735;
 
     --wf-ok: #15803d;
     --wf-warn: #b45309;
@@ -112,9 +119,31 @@ body {
 }
 
 .wf-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--wf-space-2);
   font-weight: 600;
   letter-spacing: 0.02em;
   color: var(--wf-accent);
+}
+
+/* The mark sizes off the text around it rather than a fixed pixel height, so it
+   stays optically matched to the wordmark if the type scale moves. */
+.wf-logo {
+  width: auto;
+  height: 1.3em;
+  flex: none;
+  overflow: visible;
+}
+
+/* Ink follows the surrounding text, not the accent the wordmark uses: the mark
+   is a letterform and reads as one only at full contrast against the surface. */
+.wf-logo-ink {
+  fill: var(--wf-text);
+}
+
+.wf-logo-dot {
+  fill: var(--wf-logo-dot);
 }
 
 /* ------------------------------------------------------------------ tabs -- */

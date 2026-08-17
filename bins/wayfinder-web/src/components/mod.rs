@@ -10,6 +10,7 @@ pub mod chart;
 pub mod dashboard;
 pub mod link_quality;
 pub mod links;
+pub mod logo;
 pub mod logs;
 pub mod metrics;
 pub mod overview;

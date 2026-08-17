@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 775 530" fill="currentColor" role="img" aria-label="Wayfinder">
+  <title>Wayfinder</title>
+  <!-- Single-colour variant: inherits `color` from the host element.
+       The dot stays legible because the stem is notched clear of it. -->
+  <path d="
+    M 0 30
+    L 72 30
+    L 213 433
+    L 354 30
+    L 420 30
+    L 561 432
+    L 673 116
+    A 86 86 0 0 0 736 135
+    L 597 530
+    L 528 530
+    L 387 126
+    L 245 530
+    L 178 530
+    Z"/>
+  <circle cx="725.5" cy="49" r="49.5"/>
+</svg>

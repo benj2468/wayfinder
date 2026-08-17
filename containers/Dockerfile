@@ -124,6 +124,7 @@ WORKDIR /app
 COPY Cargo.lock Cargo.toml ./
 COPY libs ./libs
 COPY bins ./bins
+COPY assets ./assets
 
 # Build the entire workspace once per target arch. Every binary (and
 # everything they depend on) comes out of this single compile. `--workspace` is
@@ -200,6 +201,7 @@ WORKDIR /app
 COPY Cargo.lock Cargo.toml ./
 COPY libs ./libs
 COPY bins ./bins
+COPY assets ./assets
 
 RUN cargo leptos build --release --frontend-only
 
