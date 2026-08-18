@@ -122,13 +122,13 @@ pub struct Driver {
     ///
     /// Certificate validity is judged against unix time, but a tick-driven
     /// caller supplies a monotonic `now` starting at zero — so each [`tick`]
-    /// sets the auth clock to `auth_epoch_unix + now`. Left at 0 the auth clock
+    /// sets the auth clock to `epoch_unix + now`. Left at 0 the auth clock
     /// never advances, which [`OgmAuth`](wayfinder::auth::OgmAuth) reads as
     /// "clock never set". Set it with
-    /// [`set_auth_epoch_unix`](Self::set_auth_epoch_unix).
+    /// [`set_epoch_unix`](Self::set_epoch_unix).
     ///
     /// [`tick`]: Self::tick
-    auth_epoch_unix: u64,
+    epoch_unix: u64,
 }
 
 impl Driver {
@@ -176,7 +176,7 @@ impl Driver {
             local_tx_queue: VecDeque::new(),
             egress: (0..n).map(|_| VecDeque::new()).collect(),
             local_rx: VecDeque::new(),
-            auth_epoch_unix: 0,
+            epoch_unix: 0,
         }
     }
 
@@ -205,8 +205,8 @@ impl Driver {
     /// `epoch_unix + now`. Set this whenever OGM authentication is enabled;
     /// without it the auth clock stays at 0, which
     /// [`OgmAuth`](wayfinder::auth::OgmAuth) treats as never having been set.
-    pub fn set_auth_epoch_unix(&mut self, epoch_unix: u64) {
-        self.auth_epoch_unix = epoch_unix;
+    pub fn set_epoch_unix(&mut self, epoch_unix: u64) {
+        self.epoch_unix = epoch_unix;
     }
 
     /// Enqueue a frame received on interface `idx` (with its carrier's
@@ -261,7 +261,7 @@ impl Driver {
         // judged in unix seconds, and this is the only place the monotonic
         // `now` is mapped onto that clock.
         if let Some(auth) = self.router.auth_mut() {
-            auth.set_time(self.auth_epoch_unix.saturating_add(now.as_secs()));
+            auth.set_time(self.epoch_unix.saturating_add(now.as_secs()));
         }
 
         let mut stage = StageSink::default();
@@ -655,7 +655,7 @@ mod tests {
 
     /// Certificate validity is judged against wall-clock unix time, but a
     /// tick-driven caller supplies a monotonic `now` starting at zero. The
-    /// driver bridges the two: `set_auth_epoch_unix` pins what unix time
+    /// driver bridges the two: `set_epoch_unix` pins what unix time
     /// `now == 0` means, and each `tick` advances the auth clock to
     /// `epoch + now`.
     ///
@@ -674,7 +674,7 @@ mod tests {
             cert,
             authority.trust_anchor(),
         ));
-        driver.set_auth_epoch_unix(1_000);
+        driver.set_epoch_unix(1_000);
 
         driver.tick(Duration::from_secs(5));
 

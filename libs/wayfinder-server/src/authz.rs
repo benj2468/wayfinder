@@ -83,7 +83,11 @@ pub enum MgmtDenied {
 ///   nothing while breaking the one credential a node's local operator is
 ///   guaranteed to have. This is also what carries a dashboard across the
 ///   moment of enrollment, when the node acquires an anchor it previously
-///   lacked.
+///   lacked. `own_key` is not a value this function caches or freezes: the
+///   caller (the TLS accept loop) reads it fresh from the router loop on every
+///   connection, so a seed the node has since rotated away from — via
+///   `SetAuth` installing a different one — stops earning this grant on the
+///   very next connection, not only after a restart.
 /// * **Admin** ([`MgmtAccess::GrantedAdmin`]): the node is enrolled and the
 ///   client presented a `cert` that verifies against the `anchor` as of
 ///   `now_unix`, whose key matches `handshake_key` (binding the cert to this
@@ -143,16 +147,32 @@ pub fn decide_access(
 ///   secret being handed out.
 ///
 /// Everything else — every read of routing state, every setting, every
-/// provider action including approving a CSR — needs a full grant. A
-/// `SubmitCsr` names its own subject, so an enrollment connection cannot reach
-/// past the request it came to make.
+/// provider action including approving a CSR — needs a full grant.
 ///
-/// Note what this deliberately does *not* require: that the submitted CSR's key
-/// be the connection's handshake key. A client may submit a CSR for keys it
-/// does not hold — but the certificate that comes back is bound to those keys,
-/// so it is useless to anyone but their holder. All such a client achieves is
-/// an entry in the provider's pending queue, which is what the enrollment token
-/// and operator approval are there to filter.
+/// **What actually confines an enrollment connection is this *request set***
+/// (exactly `SubmitCsr` and `GetTrustAnchor`) — not anything about a
+/// `SubmitCsr`'s *contents*. `node_mac`, `ed_pubkey` and `x_pubkey` are
+/// entirely client-supplied and bound to nothing about this connection: the
+/// handshake key is never checked against them, so a client can submit a CSR
+/// naming a MAC and keys it does not hold. That reach-past is deliberate, not
+/// an oversight — it is what lets one node enroll another on its behalf,
+/// which nothing else in this design offers a substitute for — but it is
+/// real, and it is what lets an anonymous client park a CSR under a real
+/// node's MAC and block that node's genuine enrollment (a scenario
+/// `authority.rs`'s held-CSR docs describe, though not by this name). Two
+/// things bound how much that reach can cost, without closing it:
+/// `authority.rs`'s `MAX_HELD_CSRS` caps how large the held-CSR store may
+/// grow no matter how many sources contribute to it, and
+/// `EnrollmentLimiter` in `transport.rs` caps how fast any *one* source may
+/// contribute. Neither stops a single submission from squatting a MAC; both
+/// stop it from being repeated without bound. The certificate that comes
+/// back is bound to the keys named in the CSR, so it is useless to anyone
+/// but their holder — all a squatting client achieves is one entry in the
+/// provider's pending queue, up to the cap, which the enrollment token and
+/// operator approval are there to filter.
+///
+/// SECURITY ALERT: this function holds security-critical access-control
+/// logic. Changing it requires careful consideration.
 pub fn permits(access: MgmtAccess, request: &ReqKind) -> bool {
     match access {
         MgmtAccess::GrantedAdmin | MgmtAccess::GrantedSelfKey => true,
@@ -466,5 +486,193 @@ mod tests {
             ),
             &ReqKind::GetSecurityStatus(GetSecurityStatusRequest {})
         ));
+    }
+
+    /// Every management request kind this build knows, one value each, so a
+    /// policy test can sweep the whole surface rather than the handful someone
+    /// remembered.
+    ///
+    /// Deliberately hand-written rather than derived: prost generates no
+    /// variant iterator, and the point of the list is that adding a proto
+    /// request forces a decision *here* about what the enrollment tier may do
+    /// with it. `permits` fails closed on its own (it is a positive
+    /// allowlist), so the risk this guards is the opposite one — a privileged
+    /// kind being quietly moved *into* the allowlist, which nothing else would
+    /// make a reviewer look at.
+    fn every_request_kind() -> Vec<ReqKind> {
+        use wayfinder_protos::wayfinder::v1alpha::*;
+        vec![
+            ReqKind::GetNodeInfo(GetNodeInfoRequest {}),
+            ReqKind::GetRoutingTable(GetRoutingTableRequest {}),
+            ReqKind::GetLinkQualityTable(GetLinkQualityTableRequest {}),
+            ReqKind::ResolveRoute(ResolveRouteRequest::default()),
+            ReqKind::GetOgmSchedule(GetOgmScheduleRequest {}),
+            ReqKind::GetThroughput(GetThroughputRequest {}),
+            ReqKind::GetMetrics(GetMetricsRequest {}),
+            ReqKind::SetAuth(SetAuthRequest::default()),
+            ReqKind::GetTrustAnchor(GetTrustAnchorRequest {}),
+            ReqKind::SubmitCsr(SubmitCsrRequest::default()),
+            ReqKind::RevokeNode(RevokeNodeRequest::default()),
+            ReqKind::GetSecurityStatus(GetSecurityStatusRequest {}),
+            ReqKind::ListCerts(ListCertsRequest {}),
+            ReqKind::ListPendingCsrs(ListPendingCsrsRequest {}),
+            ReqKind::ApproveCsr(ApproveCsrRequest::default()),
+            ReqKind::DenyCsr(DenyCsrRequest::default()),
+            ReqKind::SetConfig(SetConfigRequest::default()),
+            ReqKind::GetKeepaliveTable(GetKeepAliveTableRequest {}),
+            ReqKind::Authenticate(AuthenticateRequest::default()),
+            ReqKind::GetLinkFeaturesTable(GetLinkFeaturesTableRequest {}),
+            ReqKind::GetLogs(GetLogsRequest::default()),
+            ReqKind::SetLogLevel(SetLogLevelRequest::default()),
+        ]
+    }
+
+    /// The enrollment tier is a *closed* allowlist over the whole request
+    /// surface: exactly `SubmitCsr` and `GetTrustAnchor`, and every one of the
+    /// other twenty kinds refused — including the ones that would otherwise be
+    /// the prize (`ApproveCsr` on its own request, `SetAuth`, `SetConfig`,
+    /// `GetLogs`).
+    ///
+    /// The count assertion is the load-bearing half. Without it a request kind
+    /// added to the proto and forgotten here would pass by omission, and the
+    /// sweep would silently stop covering the surface it claims to.
+    #[test]
+    fn permits_confines_the_enrollment_tier_to_a_closed_allowlist() {
+        let all = every_request_kind();
+        assert_eq!(
+            all.len(),
+            22,
+            "every_request_kind must list every variant of the request oneof; \
+             add the new one (and decide what the enrollment tier may do with it)"
+        );
+
+        for request in &all {
+            let expected = matches!(request, ReqKind::SubmitCsr(_) | ReqKind::GetTrustAnchor(_));
+            assert_eq!(
+                permits(MgmtAccess::GrantedEnrollment, request),
+                expected,
+                "enrollment tier verdict for {request:?}"
+            );
+            // Both full grants may invoke anything, and every denial nothing —
+            // asserted over the same closed set so neither can drift.
+            for full in [MgmtAccess::GrantedAdmin, MgmtAccess::GrantedSelfKey] {
+                assert!(permits(full, request), "full grant refused {request:?}");
+            }
+            assert!(
+                !permits(MgmtAccess::Denied(MgmtDenied::NotAdmin), request),
+                "a denied connection was permitted {request:?}"
+            );
+        }
+    }
+
+    /// The anchor-absent column of the authorization matrix.
+    ///
+    /// A node with no trust anchor has nothing to verify a certificate
+    /// *against*, so presenting one tells it nothing: expired, foreign,
+    /// admin-flagged or bound to another key, every row lands on the same
+    /// enrollment tier a client with no cert at all gets. That is not the
+    /// "a failed claim is denied" rule being bypassed — no check ran to fail.
+    /// The property that matters, and the one asserted here, is that on an
+    /// anchorless node a certificate can never buy *more* access than
+    /// presenting nothing.
+    #[test]
+    fn without_an_anchor_no_certificate_grants_more_than_enrollment() {
+        let own = Keypair::from_seed(&[7u8; 32]);
+        let stranger = Keypair::from_seed(&[8u8; 32]);
+        let foreign = Authority::from_seed(&[1u8; 32], 0xABCD);
+
+        // An admin cert bound to the presenting key — the strongest thing a
+        // client could offer — and one already expired at `now`.
+        let admin_cert =
+            foreign.issue_admin_cert(mac(5), stranger.ed_pubkey(), stranger.x_pubkey(), 0, 200);
+        // A plain member cert, and one issued to somebody else's key entirely.
+        let member_cert =
+            foreign.issue_cert(mac(6), stranger.ed_pubkey(), stranger.x_pubkey(), 0, 200);
+        let other = Keypair::from_seed(&[9u8; 32]);
+        let other_cert =
+            foreign.issue_admin_cert(mac(7), other.ed_pubkey(), other.x_pubkey(), 0, 200);
+
+        for (label, cert, now) in [
+            ("no cert", None, 100),
+            ("admin cert", Some(&admin_cert), 100),
+            ("expired admin cert", Some(&admin_cert), 999),
+            ("member cert", Some(&member_cert), 100),
+            ("cert for another key", Some(&other_cert), 100),
+        ] {
+            assert_eq!(
+                decide_access(
+                    &stranger.ed_pubkey(),
+                    cert,
+                    None,
+                    &own.ed_pubkey(),
+                    now,
+                    |_| false
+                ),
+                MgmtAccess::GrantedEnrollment,
+                "anchorless node, {label}"
+            );
+        }
+
+        // And the node's own key still outranks all of it.
+        assert_eq!(
+            decide_access(
+                &own.ed_pubkey(),
+                Some(&admin_cert),
+                None,
+                &own.ed_pubkey(),
+                100,
+                |_| false
+            ),
+            MgmtAccess::GrantedSelfKey
+        );
+    }
+
+    /// A certificate signed by a root that is not this mesh's is refused, in
+    /// both shapes it can take: a foreign mesh id (caught by the id check) and
+    /// a foreign root reusing *our* mesh id (caught only by the signature).
+    ///
+    /// The second is the one worth having a test for — a mesh id is a public,
+    /// guessable label, so an attacker standing up their own authority would
+    /// naturally reuse it, and the signature is then the only thing between
+    /// their admin cert and this node's management API.
+    #[test]
+    fn a_certificate_from_a_foreign_root_is_denied() {
+        let ours = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let anchor = ours.trust_anchor();
+        let own = Keypair::from_seed(&[7u8; 32]);
+        let attacker = Keypair::from_seed(&[2u8; 32]);
+
+        // A different root, a different mesh: rejected on the mesh id.
+        let other_mesh = Authority::from_seed(&[42u8; 32], 0xBEEF);
+        let cert =
+            other_mesh.issue_admin_cert(mac(5), attacker.ed_pubkey(), attacker.x_pubkey(), 0, 200);
+        assert_eq!(
+            decide_access(
+                &attacker.ed_pubkey(),
+                Some(&cert),
+                Some(&anchor),
+                &own.ed_pubkey(),
+                100,
+                |_| false
+            ),
+            MgmtAccess::Denied(MgmtDenied::CertInvalid(AuthError::WrongMesh))
+        );
+
+        // A different root claiming *our* mesh id: only the signature separates
+        // this from a genuine admin cert.
+        let impostor = Authority::from_seed(&[42u8; 32], 0xABCD);
+        let cert =
+            impostor.issue_admin_cert(mac(5), attacker.ed_pubkey(), attacker.x_pubkey(), 0, 200);
+        assert_eq!(
+            decide_access(
+                &attacker.ed_pubkey(),
+                Some(&cert),
+                Some(&anchor),
+                &own.ed_pubkey(),
+                100,
+                |_| false
+            ),
+            MgmtAccess::Denied(MgmtDenied::CertInvalid(AuthError::BadSignature))
+        );
     }
 }

@@ -189,14 +189,15 @@ impl Mock {
     ///
     /// `require_approval` chooses which of the two enrollment paths it serves —
     /// signing on submission, or parking the request until an operator says
-    /// yes. Both are ordinary configurations, and the second is the one worth
-    /// exercising: it is the path with a wait in the middle.
-    pub fn authority(require_approval: bool) -> Self {
+    /// yes. `token`, when set, is the enrollment token `submit_csr` requires
+    /// before it will consider a request at all — the primary admission
+    /// control for the whole feature.
+    pub fn authority(require_approval: bool, token: Option<&str>) -> Self {
         let mut ca = wayfinder_server::CertAuthority::new(
             &MESH_ROOT_SEED,
             MOCK_MESH_ID,
             86_400,
-            None,
+            token.map(str::to_string),
             require_approval,
         );
         ca.set_now_unix(1_700_000_000);
@@ -205,8 +206,8 @@ impl Mock {
                 enrollment: Some(EnrollmentPolicyStatusData {
                     require_approval,
                     cert_ttl_secs: 86_400,
-                    enrollment_token_set: false,
-                    enrollment_token: None,
+                    enrollment_token_set: token.is_some(),
+                    enrollment_token: token.map(str::to_string),
                 }),
                 ..Self::default().security
             },
@@ -512,6 +513,7 @@ pub async fn serve_mock_node_with(mock: Mock) -> (SocketAddr, [u8; 32]) {
     tokio::spawn(async move {
         while let Some(reply) = snapshot_rx.recv().await {
             let _ = reply.send(wayfinder_server::AuthSnapshot {
+                own_key: node_key,
                 anchor: None,
                 revoked: Vec::new(),
             });

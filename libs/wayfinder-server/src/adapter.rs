@@ -87,6 +87,7 @@ pub struct RouterAdapter<
         IN_FLIGHT_CERT_REQUESTS,
         PENDING_REPLIES,
     >,
+    epoch_unix: Duration,
     now: Duration,
     /// The mesh certificate authority, present only when this node runs in
     /// provider mode.  Drives the enrollment requests (`get_trust_anchor`,
@@ -102,10 +103,25 @@ pub struct RouterAdapter<
     /// Held here rather than read from the router's auth state because the two
     /// operations that need it happen precisely when there is no auth state to
     /// read: reporting the keys an un-enrolled node wants certified, and
-    /// installing the certificate that comes back.  Absent where the host did
-    /// not supply one, which makes both of those report "no identity" rather
-    /// than guess at one.
-    identity_seed: Option<[u8; 32]>,
+    /// installing the certificate that comes back.
+    ///
+    /// A mutable reference into the caller's own storage, not an owned copy:
+    /// when [`set_auth`](Self::set_auth) installs a *different* seed, it
+    /// writes the new value straight back through this reference so the
+    /// caller's copy changes immediately rather than only after this adapter
+    /// is dropped. That is what closes the self-key staleness window — the
+    /// TLS accept loop's per-connection authorization snapshot
+    /// (`wayfinder_server::transport::AuthSnapshot::own_key`) reads the same
+    /// slot fresh on every connection, so a seed this call rotates away from
+    /// stops granting access on the very next connection, not only at the
+    /// next restart.
+    ///
+    /// The outer `Option` is builder-presence (absent where the host offered
+    /// no identity storage at all — every embedded node, and a test that only
+    /// reads router state); the inner one is whether a seed is currently
+    /// known. Absent (either way) makes both operations above report "no
+    /// identity" rather than guess at one.
+    identity_seed: Option<&'a mut Option<[u8; 32]>>,
 }
 
 impl<
@@ -162,21 +178,52 @@ impl<
             router,
             now,
             ca,
+            epoch_unix: Duration::default(),
             settings: None,
             identity_seed: None,
         }
     }
 
-    /// Tell the adapter which identity seed this node runs as, so it can report
-    /// the public half (for a client enrolling this node) and certify it when a
-    /// certificate for it arrives.
+    /// Update the unix offset for this adapter, used to convert between unix
+    /// timestamps and [`Duration`] values.
+    ///
+    /// This is what [`unix_now`](Self::unix_now) feeds `set_auth`'s
+    /// certificate-validity check: an adapter built without this defaults
+    /// `epoch_unix` to zero, so `unix_now()` collapses to just `now` — a small
+    /// monotonic duration, nowhere near a real certificate's validity window —
+    /// and every `SetAuth` will then fail as "not yet valid" no matter how
+    /// valid the certificate actually is. Every host caller must supply the
+    /// same `epoch_unix` it advances the router's auth clock with elsewhere
+    /// (see `refresh_auth_clock` in `wayfinder-driver`); an embedded node has
+    /// no wall clock to supply here at all yet, which is why `SetAuth` over
+    /// its management port is not wired up (see
+    /// `wayfinder-embedded-driver`'s `run_once_with_mgmt`).
+    pub fn with_epoch_unix(mut self, offset: Duration) -> Self {
+        self.epoch_unix = offset;
+        self
+    }
+
+    /// Tell the adapter which identity-seed slot this node runs as, so it can
+    /// report the public half (for a client enrolling this node), certify it
+    /// when a certificate for it arrives, and — when [`set_auth`](Self::set_auth)
+    /// installs a *different* seed — write the new one straight back into
+    /// `seed`, so the caller's own copy (and anything reading it afterward,
+    /// such as the TLS accept loop's per-connection authorization snapshot)
+    /// observes the change immediately rather than only after a restart.
     ///
     /// A builder step for the same reason as [`with_settings`](Self::with_settings):
     /// most callers have no seed to offer — an embedded node keeps its own, and
     /// a test that only reads router state has none at all.
-    pub fn with_identity(mut self, seed: [u8; 32]) -> Self {
+    pub fn with_identity(mut self, seed: &'a mut Option<[u8; 32]>) -> Self {
         self.identity_seed = Some(seed);
         self
+    }
+
+    /// The identity seed currently held in the caller's slot, if any — `None`
+    /// both when no slot was offered ([`with_identity`](Self::with_identity)
+    /// never called) and when one was offered but is still empty.
+    fn current_identity_seed(&self) -> Option<[u8; 32]> {
+        self.identity_seed.as_deref().copied().flatten()
     }
 
     /// Record accepted security settings in `settings` so they survive a
@@ -213,6 +260,11 @@ impl<
     /// interface from one that just fell back to its index.
     fn interface_name(&self, idx: usize) -> String {
         self.router.interface_name(idx).unwrap_or_default().into()
+    }
+
+    /// Calculate the now time with the epoch unix offset.
+    fn unix_now(&self) -> Duration {
+        self.epoch_unix + self.now
     }
 }
 
@@ -379,7 +431,9 @@ impl<
         // un-enrolled node still has one, and reporting it is what lets a
         // client ask a provider to certify *this* node rather than mint some
         // new identity the node would then have to adopt.
-        let identity = self.identity_seed.map(|seed| Keypair::from_seed(&seed));
+        let identity = self
+            .current_identity_seed()
+            .map(|seed| Keypair::from_seed(&seed));
         let posture = SecurityStatusData {
             require_auth: self.router.require_auth(),
             lazy_cert_distribution: self.router.lazy_cert_distribution(),
@@ -531,8 +585,9 @@ impl<
         // enrollment case, where the point is that the node's key (and so its
         // MAC) does not change. Anything else is a new identity being installed
         // wholesale, which the node adopts as given.
-        let seed: [u8; 32] = if seed.is_empty() {
-            self.identity_seed.ok_or_else(|| {
+        let certifying_existing_identity = seed.is_empty();
+        let seed: [u8; 32] = if certifying_existing_identity {
+            self.current_identity_seed().ok_or_else(|| {
                 "this node has no identity to certify; send the seed alongside the \
                  certificate"
                     .to_string()
@@ -546,6 +601,30 @@ impl<
             .ok_or_else(|| "unable to parse membership cert".to_string())?;
         let anchor = TrustAnchor::from_bytes(trust_anchor)
             .ok_or_else(|| "unable to parse trust anchor".to_string())?;
+
+        // Validate the certificate before we persist it.
+        anchor
+            .verify_cert(&parsed_cert, self.unix_now().as_secs())
+            .map_err(|e| e.to_string())?;
+        // The certificate must actually name the key being installed — a
+        // provider bug or an operator approving the wrong pending row must
+        // not leave this node signing OGMs under a certificate that does not
+        // name its own key (every peer would then reject them while this
+        // node reports itself enrolled). Applies in both shapes: certifying
+        // the existing identity in place, and installing a wholesale new one.
+        if parsed_cert.ed_pubkey != key_pair.ed_pubkey() {
+            return Err("certificate key does not match the identity being installed".to_string());
+        }
+        // Certifying the identity already held must also keep the MAC that
+        // identity already runs under — that is the whole promise of this
+        // path (`SetAuth` with no seed), so a certificate for a *different*
+        // MAC is a provider-side mismatch, not a legitimate answer. A
+        // wholesale identity install is exempt: naming a new MAC is exactly
+        // what it is for, and `wayfinder-tap` re-derives the router's MAC
+        // from the installed certificate on the next boot.
+        if certifying_existing_identity && Mac(parsed_cert.node_mac) != self.router.self_ident() {
+            return Err("certificate MAC does not match the MAC this node runs under".to_string());
+        }
 
         // Recorded only once every blob has parsed, so a malformed request
         // cannot leave unusable identity material behind for the next boot to
@@ -563,6 +642,16 @@ impl<
 
         let auth = OgmAuth::with_capacities(key_pair, parsed_cert, anchor);
         self.router.set_auth(auth);
+        // Recorded last, once installation has actually succeeded: write the
+        // now-current seed back into the caller's slot (a no-op when this is
+        // the same seed the request certified in place) so a seed this call
+        // *rotates away from* stops equalling `own_key` on the accept loop's
+        // very next connection, rather than only after a restart. See
+        // `with_identity` for why this is a mutable reference rather than a
+        // copy.
+        if let Some(slot) = self.identity_seed.as_deref_mut() {
+            *slot = Some(seed);
+        }
         Ok(())
     }
 
@@ -1750,6 +1839,7 @@ mod tests {
         let mut store = RecordingStore::default();
 
         RouterAdapter::new(&mut router, None, Duration::ZERO)
+            .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
             .set_auth(&[3; 32], &cert, &anchor)
             .unwrap();
@@ -1771,9 +1861,10 @@ mod tests {
     fn security_status_reports_the_identity_of_an_un_enrolled_node() {
         let mut router = CentralRouter::new(mac(1));
         let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let mut identity_seed = Some([3u8; 32]);
 
         let status = RouterAdapter::new(&mut router, None, Duration::ZERO)
-            .with_identity([3; 32])
+            .with_identity(&mut identity_seed)
             .security_status();
 
         assert!(!status.auth_enabled, "no certificate yet");
@@ -1808,9 +1899,11 @@ mod tests {
         let cert = ca_issue(&mut ca, mac(1).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
         let anchor = ca.trust_anchor_bytes();
         let mut store = RecordingStore::default();
+        let mut identity_seed = Some([3u8; 32]);
 
         RouterAdapter::new(&mut router, None, Duration::ZERO)
-            .with_identity([3; 32])
+            .with_epoch_unix(Duration::from_secs(1_000))
+            .with_identity(&mut identity_seed)
             .with_settings(&mut store)
             .set_auth(&[], &cert, &anchor)
             .unwrap();
@@ -1828,6 +1921,76 @@ mod tests {
              comes up as the same node"
         );
         assert_eq!(identity.cert, cert);
+    }
+
+    /// `set_auth` writes the seed it actually installed back into the caller's
+    /// slot, not just into persisted settings — the piece that closes the
+    /// self-key staleness window (§3.2): the TLS accept loop's per-connection
+    /// authorization snapshot reads the very same slot fresh on every
+    /// connection, so a seed this call rotates *away* from must stop being
+    /// `own_key` immediately, not only after the process restarts.
+    ///
+    /// Covers both shapes `set_auth` accepts: a non-empty seed installs a
+    /// wholesale new identity (the slot must become the *new* seed), and an
+    /// empty seed certifies the identity already in the slot in place (the
+    /// slot must still read back the *same* seed afterward — this is not
+    /// about the value changing, only about the write-back path always
+    /// running on success).
+    #[test]
+    fn set_auth_writes_the_installed_seed_back_to_the_caller() {
+        let old_seed = [3u8; 32];
+        let new_seed = [4u8; 32];
+
+        // A wholesale identity replacement: the slot must end up holding the
+        // *new* seed, not the one it started with.
+        {
+            let mut router = CentralRouter::new(mac(1));
+            let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+            ca.set_now_unix(1_000);
+            let new_kp = wayfinder::wayfinder_auth::Keypair::from_seed(&new_seed);
+            let cert = ca_issue(
+                &mut ca,
+                &new_kp.derived_mac().0,
+                &new_kp.ed_pubkey(),
+                &new_kp.x_pubkey(),
+            );
+            let anchor = ca.trust_anchor_bytes();
+            let mut identity_seed = Some(old_seed);
+
+            RouterAdapter::new(&mut router, None, Duration::ZERO)
+                .with_epoch_unix(Duration::from_secs(1_000))
+                .with_identity(&mut identity_seed)
+                .set_auth(&new_seed, &cert, &anchor)
+                .unwrap();
+
+            assert_eq!(
+                identity_seed,
+                Some(new_seed),
+                "the slot must reflect the seed just installed, not the one it \
+                 started with — this is the write-back that closes the \
+                 self-key staleness window"
+            );
+        }
+
+        // Certifying the existing identity in place (empty seed): the slot
+        // still reads back the same seed, and the write-back path still runs.
+        {
+            let mut router = CentralRouter::new(mac(1));
+            let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+            ca.set_now_unix(1_000);
+            let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&old_seed);
+            let cert = ca_issue(&mut ca, mac(1).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
+            let anchor = ca.trust_anchor_bytes();
+            let mut identity_seed = Some(old_seed);
+
+            RouterAdapter::new(&mut router, None, Duration::ZERO)
+                .with_epoch_unix(Duration::from_secs(1_000))
+                .with_identity(&mut identity_seed)
+                .set_auth(&[], &cert, &anchor)
+                .unwrap();
+
+            assert_eq!(identity_seed, Some(old_seed));
+        }
     }
 
     /// Asking a node to certify an identity it does not have is refused with a
@@ -1864,6 +2027,204 @@ mod tests {
 
         assert!(result.is_err());
         assert!(store.writes.is_empty());
+    }
+
+    /// A cert that verifies as well-formed but does not chain to the given
+    /// trust anchor (signed by a different mesh's root key) must not be
+    /// installed — that is exactly the forgery `verify_cert` exists to catch,
+    /// so `set_auth` has to consult it rather than trusting parseable bytes.
+    #[test]
+    fn set_auth_rejects_a_cert_with_a_bad_signature() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+        ca.set_now_unix(1_000);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let cert = ca_issue(&mut ca, mac(1).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
+
+        // A different root key, same mesh id: the anchor a node would hold if
+        // it belonged to a *different* mesh that happened to share an id.
+        let other_ca = crate::CertAuthority::new(&[99; 32], 0xABCD, 10_000, None, false);
+        let foreign_anchor = other_ca.trust_anchor_bytes();
+        let mut store = RecordingStore::default();
+
+        let err = RouterAdapter::new(&mut router, None, Duration::ZERO)
+            .with_epoch_unix(Duration::from_secs(1_000))
+            .with_settings(&mut store)
+            .set_auth(&[3; 32], &cert, &foreign_anchor)
+            .expect_err("cert does not chain to this anchor");
+
+        assert!(err.contains("signature"), "got: {err}");
+        assert!(router.auth().is_none(), "never installed");
+        assert!(store.writes.is_empty(), "never persisted");
+    }
+
+    /// A cert minted for one mesh must not be accepted by a node whose trust
+    /// anchor names a different mesh, even when both anchors share a root key
+    /// — mesh segregation is enforced by id, not merely by signature.
+    #[test]
+    fn set_auth_rejects_a_cert_for_the_wrong_mesh() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+        ca.set_now_unix(1_000);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let cert = ca_issue(&mut ca, mac(1).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
+
+        // Same root key, a different mesh id — a client presenting the wrong
+        // anchor for the cert it holds.
+        let mut anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
+        anchor.mesh_id = 0x1234;
+        let wrong_mesh_anchor = anchor.to_bytes().to_vec();
+        let mut store = RecordingStore::default();
+
+        let err = RouterAdapter::new(&mut router, None, Duration::ZERO)
+            .with_epoch_unix(Duration::from_secs(1_000))
+            .with_settings(&mut store)
+            .set_auth(&[3; 32], &cert, &wrong_mesh_anchor)
+            .expect_err("cert is for a different mesh");
+
+        assert!(err.contains("mesh"), "got: {err}");
+        assert!(router.auth().is_none(), "never installed");
+        assert!(store.writes.is_empty(), "never persisted");
+    }
+
+    /// A cert past its `not_after` must be refused even though every other
+    /// field checks out — an expired cert is exactly the case the validity
+    /// window exists to catch.
+    #[test]
+    fn set_auth_rejects_an_expired_cert() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10, None, false);
+        ca.set_now_unix(1_000);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        // not_before = 1_000, not_after = 1_010.
+        let cert = ca_issue(&mut ca, mac(1).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
+        let anchor = ca.trust_anchor_bytes();
+        let mut store = RecordingStore::default();
+
+        let err = RouterAdapter::new(&mut router, None, Duration::ZERO)
+            // Well past not_after.
+            .with_epoch_unix(Duration::from_secs(2_000))
+            .with_settings(&mut store)
+            .set_auth(&[3; 32], &cert, &anchor)
+            .expect_err("cert has expired");
+
+        assert!(err.contains("expired"), "got: {err}");
+        assert!(router.auth().is_none(), "never installed");
+        assert!(store.writes.is_empty(), "never persisted");
+    }
+
+    /// A cert whose `not_before` is still in the future must be refused —
+    /// installing it now would let the node authenticate before the CA meant
+    /// it to.
+    #[test]
+    fn set_auth_rejects_a_not_yet_valid_cert() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+        ca.set_now_unix(1_000);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        // not_before = 1_000.
+        let cert = ca_issue(&mut ca, mac(1).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
+        let anchor = ca.trust_anchor_bytes();
+        let mut store = RecordingStore::default();
+
+        let err = RouterAdapter::new(&mut router, None, Duration::ZERO)
+            // Adapter clock defaults to unix time 0, well before not_before.
+            .with_settings(&mut store)
+            .set_auth(&[3; 32], &cert, &anchor)
+            .expect_err("cert is not yet valid");
+
+        assert!(err.contains("not yet valid"), "got: {err}");
+        assert!(router.auth().is_none(), "never installed");
+        assert!(store.writes.is_empty(), "never persisted");
+    }
+
+    /// A certificate that verifies against the anchor but names a *different*
+    /// key than the one actually being installed must be refused — otherwise
+    /// the node ends up signing every OGM under a certificate that does not
+    /// name its own key, which every peer then rejects while the node itself
+    /// reports `auth_enabled: true`. Applies to both `set_auth` shapes: here,
+    /// a wholesale identity install (a seed is supplied) with a cert for
+    /// somebody else's key.
+    #[test]
+    fn set_auth_rejects_a_cert_for_the_wrong_key() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+        ca.set_now_unix(1_000);
+        // The cert names a key other than the one the request is installing.
+        let other_kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[4; 32]);
+        let cert = ca_issue(
+            &mut ca,
+            mac(1).as_bytes(),
+            &other_kp.ed_pubkey(),
+            &other_kp.x_pubkey(),
+        );
+        let anchor = ca.trust_anchor_bytes();
+        let mut store = RecordingStore::default();
+
+        let err = RouterAdapter::new(&mut router, None, Duration::ZERO)
+            .with_epoch_unix(Duration::from_secs(1_000))
+            .with_settings(&mut store)
+            .set_auth(&[3; 32], &cert, &anchor)
+            .expect_err("cert names a different key than the seed being installed");
+
+        assert!(err.contains("key"), "got: {err}");
+        assert!(router.auth().is_none(), "never installed");
+        assert!(store.writes.is_empty(), "never persisted");
+    }
+
+    /// Certifying the identity already held (empty seed) must be refused when
+    /// the certificate is bound to a *different* MAC than the one this node
+    /// actually runs under — the scenario the enrollment flow opens up: a
+    /// provider's operator approving the wrong pending row, or a MAC
+    /// collision in its queue, must not leave this node signing OGMs under a
+    /// certificate for somebody else's address.
+    #[test]
+    fn set_auth_rejects_a_cert_for_the_wrong_mac_when_certifying_in_place() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+        ca.set_now_unix(1_000);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        // Bound to a MAC other than the one the router actually runs under.
+        let cert = ca_issue(&mut ca, mac(2).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
+        let anchor = ca.trust_anchor_bytes();
+        let mut store = RecordingStore::default();
+        let mut identity_seed = Some([3u8; 32]);
+
+        let err = RouterAdapter::new(&mut router, None, Duration::ZERO)
+            .with_epoch_unix(Duration::from_secs(1_000))
+            .with_identity(&mut identity_seed)
+            .with_settings(&mut store)
+            .set_auth(&[], &cert, &anchor)
+            .expect_err("cert is bound to a MAC other than the one this router runs under");
+
+        assert!(err.to_lowercase().contains("mac"), "got: {err}");
+        assert!(router.auth().is_none(), "never installed");
+        assert!(store.writes.is_empty(), "never persisted");
+    }
+
+    /// A wholesale identity install (a seed is supplied) is exempt from the
+    /// MAC check above: it is exactly how a node's MAC is meant to change,
+    /// taking effect once `wayfinder-tap` re-derives it from the newly
+    /// installed certificate on the next boot.
+    #[test]
+    fn set_auth_with_a_seed_allows_a_new_mac() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+        ca.set_now_unix(1_000);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        // Bound to a MAC different from the router's current identity —
+        // exactly what a fresh re-key looks like.
+        let cert = ca_issue(&mut ca, mac(2).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
+        let anchor = ca.trust_anchor_bytes();
+        let mut store = RecordingStore::default();
+
+        RouterAdapter::new(&mut router, None, Duration::ZERO)
+            .with_epoch_unix(Duration::from_secs(1_000))
+            .with_settings(&mut store)
+            .set_auth(&[3; 32], &cert, &anchor)
+            .unwrap();
+
+        assert!(router.auth().is_some());
     }
 
     /// The posture is reported even with auth disabled: `require_auth` on a

@@ -28,6 +28,7 @@ use wayfinder::features::LinkFeatures;
 use wayfinder::interfaces::frame::LinkFrameData;
 use wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN;
 use wayfinder::interfaces::frame::Mac;
+use wayfinder::wayfinder_auth::Keypair;
 use wayfinder_driver_core::Egress;
 use wayfinder_driver_core::MeshSink;
 use wayfinder_protos::service::WayfinderService;
@@ -126,13 +127,13 @@ pub struct Driver<Local: FrameIo> {
     snooper: McastSnooper,
     /// Reference instant for periodic-broadcast timing.
     start: Instant,
-    /// Wall-clock unix time (seconds) corresponding to `now == 0` (the `start`
-    /// instant).  The auth clock is then `auth_epoch_unix + now`, so it advances
+    /// Wall-clock unix time corresponding to `now == 0` (the `start`
+    /// instant).  The auth clock is then `epoch_unix + now`, so it advances
     /// with the loop's `now` rather than reading the wall clock each tick — which
     /// lets a test drive certificate-validity time forward (faster than real
     /// time) via the `now` it already controls.  Defaults to the wall clock at
-    /// construction; override with [`set_auth_epoch_unix`](Self::set_auth_epoch_unix).
-    auth_epoch_unix: u64,
+    /// construction; override with [`set_epoch_unix`](Self::set_epoch_unix).
+    epoch_unix: Duration,
     /// Receive scratchpad for frames read from the host device.
     rx_buffer: [u8; MAX_LINK_FRAME_LEN],
     /// Transmit scratchpad the router builds outgoing frames into.
@@ -215,10 +216,9 @@ impl<Local: FrameIo> Driver<Local> {
             mac,
             snooper: McastSnooper::new(),
             start: Instant::now(),
-            auth_epoch_unix: std::time::SystemTime::now()
+            epoch_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+                .unwrap_or(Duration::ZERO),
             rx_buffer: [0u8; MAX_LINK_FRAME_LEN],
             tx_buffer: [0u8; MAX_LINK_FRAME_LEN],
             provider: None,
@@ -268,23 +268,23 @@ impl<Local: FrameIo> Driver<Local> {
     /// `now == 0`.  The auth clock used for certificate-validity checks is then
     /// `epoch + now`.  Tests set this to a fixed value and drive `now` forward to
     /// exercise expiry deterministically, faster than real time.
-    pub fn set_auth_epoch_unix(&mut self, epoch_unix: u64) {
-        self.auth_epoch_unix = epoch_unix;
+    pub fn set_epoch_unix(&mut self, epoch_unix: Duration) {
+        self.epoch_unix = epoch_unix;
     }
 
-    /// Advance the auth state's certificate-validity clock to `auth_epoch_unix +
+    /// Advance the auth state's certificate-validity clock to `epoch_unix +
     /// now`.  A no-op when auth is disabled.  Called from every entry point that
     /// processes frames so cert expiry tracks the loop's `now` consistently.
     fn refresh_auth_clock(&mut self, now: Duration) {
-        let epoch = self.auth_epoch_unix;
-        let unix = epoch.saturating_add(now.as_secs());
+        let epoch = self.epoch_unix;
+        let unix = epoch.saturating_add(now);
         if let Some(auth) = self.router.auth_mut() {
-            auth.set_time(unix);
+            auth.set_time(unix.as_secs());
         }
         // Keep the provider CA's issuance clock in step, so issued certificate
         // validity windows track the same time the router verifies against.
         if let Some(ca) = self.provider.as_mut() {
-            ca.set_now_unix(unix);
+            ca.set_now_unix(unix.as_secs());
         }
     }
 
@@ -354,7 +354,7 @@ impl<Local: FrameIo> Driver<Local> {
             mac,
             snooper,
             start: _,
-            auth_epoch_unix: _,
+            epoch_unix: _,
             rx_buffer,
             tx_buffer,
             provider,
@@ -363,7 +363,6 @@ impl<Local: FrameIo> Driver<Local> {
             auth_snapshot_rx,
         } = self;
         let mac = *mac;
-        let identity_seed = *identity_seed;
 
         let output: LoopOutput = {
             tokio::select! {
@@ -388,19 +387,18 @@ impl<Local: FrameIo> Driver<Local> {
                 },
                 Some((request, resp_tx)) = query_rx.recv(), if check_server => {
                     let ca = provider.as_mut().map(|c| c as &mut dyn MeshAuthority);
-                    let mut adapter = RouterAdapter::new(&mut *router, ca, now);
+                    let mut adapter = RouterAdapter::new(&mut *router, ca, now)
+                        .with_epoch_unix(self.epoch_unix)
+                        .with_identity(identity_seed);
                     if let Some(store) = settings.as_mut() {
                         adapter = adapter.with_settings(store as &mut dyn SettingsStore);
-                    }
-                    if let Some(seed) = identity_seed {
-                        adapter = adapter.with_identity(seed);
                     }
                     let response = WayfinderService::new(adapter).handle(request);
                     let _ = resp_tx.send(response);
                     LoopOutput::none()
                 },
                 Some(reply) = recv_auth_snapshot(auth_snapshot_rx), if check_server => {
-                    let _ = reply.send(build_auth_snapshot(router));
+                    let _ = reply.send(build_auth_snapshot(router, *identity_seed));
                     LoopOutput::none()
                 },
                 _ = sleep(next_due), if check_periodic => {
@@ -540,12 +538,11 @@ impl<Local: FrameIo> Driver<Local> {
                 progressed = true;
                 let now = self.start.elapsed();
                 let ca = self.provider.as_mut().map(|c| c as &mut dyn MeshAuthority);
-                let mut adapter = RouterAdapter::new(&mut self.router, ca, now);
+                let mut adapter = RouterAdapter::new(&mut self.router, ca, now)
+                    .with_epoch_unix(self.epoch_unix)
+                    .with_identity(&mut self.identity_seed);
                 if let Some(store) = self.settings.as_mut() {
                     adapter = adapter.with_settings(store as &mut dyn SettingsStore);
-                }
-                if let Some(seed) = self.identity_seed {
-                    adapter = adapter.with_identity(seed);
                 }
                 let response = WayfinderService::new(adapter).handle(request);
                 let _ = resp_tx.send(response);
@@ -556,7 +553,7 @@ impl<Local: FrameIo> Driver<Local> {
                 && let Ok(reply) = rx.try_recv()
             {
                 progressed = true;
-                let _ = reply.send(build_auth_snapshot(&self.router));
+                let _ = reply.send(build_auth_snapshot(&self.router, self.identity_seed));
             }
 
             if !progressed {
@@ -622,17 +619,45 @@ async fn recv_auth_snapshot(
     }
 }
 
-/// Project the router's current authorization-relevant state — trust anchor and
-/// revocations — into an [`AuthSnapshot`] the management server evaluates a
-/// connection against.  Both are empty when auth is disabled (un-enrolled), which
-/// the server treats as bootstrap mode.
-fn build_auth_snapshot(router: &CentralRouter) -> AuthSnapshot {
+/// Project the router's current authorization-relevant state — this node's own
+/// identity key, trust anchor, and revocations — into an [`AuthSnapshot`] the
+/// management server evaluates a connection against.  Anchor and revocations
+/// are both empty when auth is disabled (un-enrolled), which the server treats
+/// as bootstrap mode.
+///
+/// Called fresh for every connection (never cached), which is what makes a
+/// `SetAuth`-installed identity change take effect immediately: `identity_seed`
+/// is read from the same in-memory slot [`Driver::set_identity_seed`] and
+/// `SetAuth` both write through, so a seed the node has since rotated away
+/// from stops equalling `own_key` on the very next connection rather than only
+/// after a restart.
+///
+/// `own_key` falls back to the all-zero key — unreachable by any real Ed25519
+/// handshake key — when `identity_seed` is absent. That only happens when no
+/// TLS management listener was ever configured, which is also when nothing
+/// drives `recv_auth_snapshot` to call this at all.
+fn build_auth_snapshot(router: &CentralRouter, identity_seed: Option<[u8; 32]>) -> AuthSnapshot {
+    let own_key = identity_seed
+        .map(|seed| Keypair::from_seed(&seed).ed_pubkey())
+        .unwrap_or_else(|| {
+            // By this function's own contract this should be unreachable in
+            // production (nothing drives an auth-snapshot request without a
+            // TLS listener, and nothing configures a TLS listener without an
+            // identity seed) — so reaching it at all means that pairing was
+            // violated somewhere, silently disabling the self-key bootstrap
+            // grant for this node. Loud on purpose: the fallback itself must
+            // not be silent even though it is safe.
+            warn!("auth snapshot requested with no identity seed configured; own_key reports the unreachable all-zero key");
+            [0u8; 32]
+        });
     match router.auth() {
         Some(auth) => AuthSnapshot {
+            own_key,
             anchor: Some(*auth.anchor()),
             revoked: auth.revoked_macs().collect(),
         },
         None => AuthSnapshot {
+            own_key,
             anchor: None,
             revoked: Vec::new(),
         },
@@ -795,5 +820,156 @@ async fn send_on_link(
     match iface.send(mac, data).await {
         Ok(sent) => router.record_tx(iface_idx, sent, now),
         Err(e) => warn!(iface_idx, error = ?e, "link send failed; frame dropped"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    /// `own_key` is derived from whatever `identity_seed` this call was given
+    /// — the un-enrolled (bootstrap) case, where the router has no auth state
+    /// of its own to read an identity from at all.
+    #[test]
+    fn build_auth_snapshot_reports_own_key_from_the_current_identity_seed() {
+        let router = CentralRouter::new(mac(1));
+        let seed = [3u8; 32];
+
+        let snapshot = build_auth_snapshot(&router, Some(seed));
+
+        assert_eq!(snapshot.own_key, Keypair::from_seed(&seed).ed_pubkey());
+        assert_eq!(snapshot.anchor, None);
+        assert!(snapshot.revoked.is_empty());
+    }
+
+    /// No identity seed configured at all falls back to the all-zero key —
+    /// unreachable by any real Ed25519 handshake key — rather than reporting
+    /// some prior value or panicking.
+    #[test]
+    fn build_auth_snapshot_falls_back_to_the_zero_key_without_an_identity_seed() {
+        let router = CentralRouter::new(mac(1));
+
+        let snapshot = build_auth_snapshot(&router, None);
+
+        assert_eq!(snapshot.own_key, [0u8; 32]);
+    }
+
+    /// The core property the self-key staleness fix (§3.2) rests on: this
+    /// function caches nothing internally, so calling it again with a
+    /// *different* seed — exactly what happens on the very next connection
+    /// after `SetAuth` writes a new seed into the slot the driver's query
+    /// loop reads — reports the new key immediately, and the old seed's key
+    /// is nowhere in the result.
+    #[test]
+    fn build_auth_snapshot_tracks_a_changed_identity_seed_on_the_next_call() {
+        let router = CentralRouter::new(mac(1));
+        let old_seed = [3u8; 32];
+        let new_seed = [4u8; 32];
+        let old_key = Keypair::from_seed(&old_seed).ed_pubkey();
+        let new_key = Keypair::from_seed(&new_seed).ed_pubkey();
+
+        assert_eq!(
+            build_auth_snapshot(&router, Some(old_seed)).own_key,
+            old_key
+        );
+
+        let snapshot = build_auth_snapshot(&router, Some(new_seed));
+        assert_eq!(snapshot.own_key, new_key);
+        assert_ne!(
+            snapshot.own_key, old_key,
+            "a rotated-away-from seed's key must not still be reported as own_key"
+        );
+    }
+
+    /// A `FrameIo` that never receives anything — enough to construct a real
+    /// `Driver` for a test that only exercises the management-query arm.
+    #[derive(Clone, Default)]
+    struct NeverIo;
+
+    #[cfg_attr(feature = "std", async_trait::async_trait)]
+    impl FrameIo for NeverIo {
+        async fn recv(&self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            std::future::pending().await
+        }
+        async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+    }
+
+    /// `process_pending` — the deterministic, non-`run_once` counterpart used
+    /// by `LinkTestRouter` and any other synchronous-stepping caller — must
+    /// build its management-query adapter with the *same* `epoch_unix` as
+    /// `run_once`'s `select!` arm does. `set_auth`'s certificate-validity
+    /// check reads it via `RouterAdapter::unix_now`; a `Driver` whose two
+    /// query-handling call sites disagree would make a `SetAuth` reachable
+    /// from one arm and reject as "not yet valid" from the other despite
+    /// identical certificates and identical wall-clock time.
+    #[tokio::test]
+    async fn process_pending_threads_epoch_unix_into_set_auth_like_run_once_does() {
+        use zerocopy::IntoBytes;
+
+        let seed = [3u8; 32];
+        let kp = Keypair::from_seed(&seed);
+        let mac_addr = mac(1);
+
+        let mut ca = CertAuthority::new(&[9u8; 32], 0xABCD, 10_000, None, false);
+        ca.set_now_unix(1_700_000_000);
+        let cert = match ca
+            .submit_csr(mac_addr.as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey(), "")
+            .unwrap()
+        {
+            wayfinder_protos::service::CsrOutcome::Issued(issued) => issued.cert,
+            other => panic!("expected the CSR to be issued outright, got {other:?}"),
+        };
+        let anchor = ca.trust_anchor_bytes();
+
+        let (query_tx, query_rx) = tokio::sync::mpsc::channel(1);
+        let mut driver = Driver::new(
+            mac_addr,
+            NeverIo,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            query_rx,
+        );
+        driver.set_identity_seed(seed);
+        // The same real wall-clock epoch `run_once` would use by default —
+        // nowhere near the tiny monotonic `now` this freshly-built `Driver`
+        // reports, which is exactly the gap that goes uncaught if
+        // `process_pending` forgets to thread it through.
+        driver.set_epoch_unix(Duration::from_secs(1_700_000_000));
+
+        let request = wayfinder_protos::wayfinder::v1alpha::WayfinderRequest {
+            request: Some(
+                wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request::SetAuth(
+                    wayfinder_protos::wayfinder::v1alpha::SetAuthRequest {
+                        seed: Vec::new(),
+                        cert,
+                        trust_anchor: anchor,
+                    },
+                ),
+            ),
+        };
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        query_tx.send((request, resp_tx)).await.unwrap();
+
+        driver.process_pending().await.unwrap();
+
+        let response = resp_rx.await.unwrap();
+        match response.response {
+            Some(wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response::Empty(_)) => {}
+            other => panic!(
+                "expected SetAuth to succeed (a correctly-threaded epoch_unix), got {other:?}"
+            ),
+        }
+        assert!(
+            driver.router().auth().is_some(),
+            "the certificate was actually installed"
+        );
     }
 }

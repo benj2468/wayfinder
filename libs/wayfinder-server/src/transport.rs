@@ -19,7 +19,6 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::codec::Framed;
 use tokio_util::codec::LengthDelimitedCodec;
 use wayfinder::interfaces::frame::Mac;
-use wayfinder::wayfinder_auth::Keypair;
 use wayfinder::wayfinder_auth::MembershipCert;
 use wayfinder::wayfinder_auth::TrustAnchor;
 use wayfinder_protos::wayfinder::v1alpha::Empty;
@@ -86,10 +85,132 @@ where
     Ok(())
 }
 
+/// Burst capacity for [`EnrollmentLimiter`]: a handful of submissions before
+/// the rate limit engages, so a node's first genuine `SubmitCsr` (and a quick
+/// retry or two) is never throttled.
+const SUBMIT_CSR_BURST: f64 = 5.0;
+
+/// Steady-state refill for [`EnrollmentLimiter`]: one token every 5 seconds —
+/// matching `APPROVAL_POLL` in `bins/wayfinder-web/src/components/security.rs`,
+/// the enrollment panel's re-submission cadence while a request is held for
+/// approval, so a legitimate node polling indefinitely is never throttled at
+/// steady state.
+const SUBMIT_CSR_REFILL_PER_SEC: f64 = 1.0 / 5.0;
+
+/// Distinct source addresses [`EnrollmentLimiter`] tracks at once. Past this,
+/// the least-recently-touched bucket is evicted to make room for a new
+/// source — safe to evict (unlike the held-CSR store this sits in front of):
+/// the evicted source simply starts over with a full bucket, which is never
+/// worse for it than being tracked, so eviction here hands an attacker
+/// nothing. Bounding the map itself is still required, or an attacker with
+/// many source addresses reproduces the exact unbounded-anonymous-growth
+/// problem this limiter exists to bound.
+const MAX_TRACKED_SOURCES: usize = 1024;
+
+/// A token bucket for one source address: `tokens` refill continuously at
+/// [`SUBMIT_CSR_REFILL_PER_SEC`] up to [`SUBMIT_CSR_BURST`], and a
+/// [`SubmitCsr`](ReqKind::SubmitCsr) invocation costs one.
+struct TokenBucket {
+    tokens: f64,
+    last_refill: std::time::Instant,
+}
+
+impl TokenBucket {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            tokens: SUBMIT_CSR_BURST,
+            last_refill: now,
+        }
+    }
+
+    /// Refill for elapsed time since the last touch, then attempt to spend
+    /// one token. `true` ⇒ spent (the caller may proceed); `false` ⇒ empty
+    /// (the caller must wait).
+    fn try_consume(&mut self, now: std::time::Instant) -> bool {
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
+        self.tokens = (self.tokens + elapsed * SUBMIT_CSR_REFILL_PER_SEC).min(SUBMIT_CSR_BURST);
+        self.last_refill = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Per-source rate limit on the enrollment tier's `SubmitCsr`, layered in
+/// front of `authority.rs`'s `MAX_HELD_CSRS` count bound.
+///
+/// The two bounds are complementary, not redundant: the count cap stops the
+/// held-CSR store from growing past a fixed size no matter how many distinct
+/// sources contribute to it, but says nothing about how fast any *one*
+/// source may contribute — which is what actually protects a legitimate
+/// node's enrollment from being crowded out by a single flooding peer, and
+/// what keeps that peer from burning through the shared cap on its own.
+///
+/// Keyed by IP, not the full socket address: a legitimate client opens a
+/// fresh connection (and so a fresh ephemeral port) on every poll — see
+/// `SUBMIT_CSR_REFILL_PER_SEC` — so keying by port as well would give every
+/// poll its own untouched bucket and defeat the limiter entirely.
+pub(crate) struct EnrollmentLimiter {
+    buckets: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, TokenBucket>>,
+}
+
+impl Default for EnrollmentLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EnrollmentLimiter {
+    /// A fresh limiter with no sources tracked yet.
+    fn new() -> Self {
+        Self {
+            buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Whether a `SubmitCsr` from `addr` may proceed right now. Consumes a
+    /// token from `addr`'s bucket on success; a source with no bucket yet
+    /// starts at full burst capacity.
+    fn allow_submit_csr(&self, addr: std::net::IpAddr, now: std::time::Instant) -> bool {
+        let mut buckets = self.buckets.lock().unwrap_or_else(|e| {
+            // A poisoned lock here means an earlier call panicked while
+            // holding it — recovering rather than propagating keeps this
+            // connection's request from taking the whole listener down, but
+            // that earlier panic is a real bug and must not vanish silently.
+            tracing::error!(
+                "enrollment rate-limiter mutex poisoned; recovering with last-known state"
+            );
+            e.into_inner()
+        });
+        if !buckets.contains_key(&addr) && buckets.len() >= MAX_TRACKED_SOURCES {
+            // Evict whichever bucket was touched longest ago to make room —
+            // see the type's doc for why this is safe.
+            if let Some(&oldest) = buckets
+                .iter()
+                .min_by_key(|(_, bucket)| bucket.last_refill)
+                .map(|(addr, _)| addr)
+            {
+                buckets.remove(&oldest);
+            }
+        }
+        buckets
+            .entry(addr)
+            .or_insert_with(|| TokenBucket::new(now))
+            .try_consume(now)
+    }
+}
+
 /// Serve one already-TLS-authenticated management connection.
 ///
 /// `peer_key` is the client's Ed25519 raw public key that the TLS handshake
-/// proved possession of (RFC 7250). The first frame must be an
+/// proved possession of (RFC 7250). `peer_addr` is its IP, consulted only to
+/// rate-limit `SubmitCsr` on an enrollment-tier (anonymous) connection — see
+/// [`EnrollmentLimiter`]. The first frame must be an
 /// [`AuthenticateRequest`](wayfinder_protos::wayfinder::v1alpha::AuthenticateRequest)
 /// carrying the client's membership cert (empty on an un-enrolled node); it is
 /// bound to `peer_key` and checked by [`decide_access`] against `ctx`. A grant
@@ -100,9 +221,11 @@ where
 /// Transport-agnostic over `S` so it serves a real `TlsStream` in production and
 /// an in-memory duplex in tests — the TLS handshake itself is exercised
 /// separately in [`crate::tls`].
-pub async fn serve_authenticated_stream<S>(
+pub(crate) async fn serve_authenticated_stream<S>(
     stream: S,
     peer_key: [u8; 32],
+    peer_addr: std::net::IpAddr,
+    limiter: std::sync::Arc<EnrollmentLimiter>,
     ctx: AuthContext,
     query_tx: QueryTx,
 ) -> anyhow::Result<()>
@@ -248,6 +371,31 @@ where
             .await?;
             continue;
         }
+        // A rate limit, not an admission decision: only the enrollment tier
+        // is bounded, since a fully-granted connection already required a
+        // real credential (an admin cert or the node's own key), which is
+        // not the resource an anonymous flood is spending. See
+        // `EnrollmentLimiter`.
+        if matches!(decision, MgmtAccess::GrantedEnrollment)
+            && matches!(req, ReqKind::SubmitCsr(_))
+            && !limiter.allow_submit_csr(peer_addr, std::time::Instant::now())
+        {
+            tracing::warn!(
+                key = ?peer_key,
+                %peer_addr,
+                "drop: enrollment-tier SubmitCsr rate limit exceeded"
+            );
+            send_response(
+                &mut framed,
+                RespKind::Error(ErrorResponse {
+                    message: "too many enrollment requests from this source; wait before \
+                              retrying"
+                        .into(),
+                }),
+            )
+            .await?;
+            continue;
+        }
         let (resp_tx, resp_rx) = oneshot::channel();
         query_tx.send((request, resp_tx)).await?;
         let response = resp_rx.await?;
@@ -260,10 +408,21 @@ where
 
 /// The router-owned half of an [`AuthContext`]: the auth state the TLS accept
 /// loop must read from the router (which lives on another task) to authorize a
-/// connection. `own_key` and the clock are supplied by the accept loop itself
-/// (from the node's seed and the system clock), so only these router-derived
-/// fields travel over the channel.
+/// connection. The clock is supplied by the accept loop itself (the system
+/// clock); everything else here — including `own_key` — is read fresh from the
+/// router loop on *every* connection rather than cached once.
+///
+/// `own_key` in particular must not be cached: it can change at runtime (a
+/// `SetAuth` installing a new identity seed), and a connection presenting a
+/// seed the node has since rotated away from must not keep getting
+/// [`MgmtAccess::GrantedSelfKey`](crate::MgmtAccess::GrantedSelfKey) just
+/// because the accept loop remembered an older value. Reading it fresh here,
+/// the same way `anchor`/`revoked` already are, closes that window on the very
+/// next connection rather than only at the next restart.
 pub struct AuthSnapshot {
+    /// This node's current management identity key — the handshake key that
+    /// earns [`MgmtAccess::GrantedSelfKey`](crate::MgmtAccess::GrantedSelfKey).
+    pub own_key: [u8; 32],
     /// The installed trust anchor, or `None` when the node is un-enrolled.
     pub anchor: Option<TrustAnchor>,
     /// Node MACs with an active revocation.
@@ -300,6 +459,14 @@ fn now_unix() -> anyhow::Result<u64> {
 /// `snapshot_tx`, and hands both to [`serve_authenticated_stream`], which makes
 /// the [`decide_access`] decision. `own_seed` must be the node's persistent
 /// identity seed and exists even before enrollment (bootstrap presents it).
+///
+/// `own_seed` here only builds the TLS identity this listener presents (fixed
+/// for the listener's lifetime — rebuilding the TLS acceptor at runtime is a
+/// separate concern from this fix). The comparison value for the *self-key*
+/// grant is a different thing: it comes from the per-connection snapshot
+/// (`AuthSnapshot::own_key`), not from `own_seed`, precisely so it tracks a
+/// `SetAuth`-installed identity change without needing this listener to
+/// restart.
 pub async fn serve_tls_server(
     listener: TcpListener,
     own_seed: [u8; 32],
@@ -309,7 +476,10 @@ pub async fn serve_tls_server(
     let config = crate::server_config(&own_seed)
         .map_err(|e| anyhow::anyhow!("building management TLS server config: {e}"))?;
     let acceptor = TlsAcceptor::from(config);
-    let own_key = Keypair::from_seed(&own_seed).ed_pubkey();
+    // One limiter for the whole listener's lifetime, shared across every
+    // spawned connection — a per-connection limiter would track nothing,
+    // since the enrollment flow opens a fresh connection on every poll.
+    let limiter = std::sync::Arc::new(EnrollmentLimiter::new());
 
     loop {
         let (tcp, peer) = listener.accept().await?;
@@ -317,9 +487,10 @@ pub async fn serve_tls_server(
         let acceptor = acceptor.clone();
         let snapshot_tx = snapshot_tx.clone();
         let query_tx = query_tx.clone();
+        let limiter = std::sync::Arc::clone(&limiter);
         tokio::spawn(async move {
             if let Err(e) =
-                serve_tls_connection(acceptor, tcp, own_key, snapshot_tx, query_tx).await
+                serve_tls_connection(acceptor, tcp, peer, snapshot_tx, query_tx, limiter).await
             {
                 tracing::warn!(%peer, error = ?e, "management TLS connection error");
             }
@@ -332,9 +503,10 @@ pub async fn serve_tls_server(
 async fn serve_tls_connection(
     acceptor: TlsAcceptor,
     tcp: tokio::net::TcpStream,
-    own_key: [u8; 32],
+    peer: SocketAddr,
     snapshot_tx: AuthSnapshotTx,
     query_tx: QueryTx,
+    limiter: std::sync::Arc<EnrollmentLimiter>,
 ) -> anyhow::Result<()> {
     let tls = acceptor.accept(tcp).await?;
 
@@ -350,7 +522,7 @@ async fn serve_tls_connection(
             .ok_or_else(|| anyhow::anyhow!("client key is not a raw Ed25519 public key"))?
     };
 
-    // Snapshot the router's current auth state (anchor + revocations).
+    // Snapshot the router's current auth state (own key + anchor + revocations).
     let (reply_tx, reply_rx) = oneshot::channel();
     snapshot_tx
         .send(reply_tx)
@@ -361,12 +533,12 @@ async fn serve_tls_connection(
         .map_err(|_| anyhow::anyhow!("router loop dropped the auth-snapshot request"))?;
 
     let ctx = AuthContext {
-        own_key,
+        own_key: snapshot.own_key,
         anchor: snapshot.anchor,
         revoked: snapshot.revoked,
         now_unix: now_unix()?,
     };
-    serve_authenticated_stream(tls, peer_key, ctx, query_tx).await
+    serve_authenticated_stream(tls, peer_key, peer.ip(), limiter, ctx, query_tx).await
 }
 
 /// Bind the TCP listener the TLS management server accepts on, without serving
@@ -453,6 +625,7 @@ mod tests {
 
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
+    use wayfinder::wayfinder_auth::Keypair;
     use wayfinder_protos::wayfinder::v1alpha::AuthenticateRequest;
     use wayfinder_protos::wayfinder::v1alpha::GetNodeInfoRequest;
     use wayfinder_protos::wayfinder::v1alpha::NodeInfo;
@@ -547,8 +720,10 @@ mod tests {
         let (query_tx, query_rx) = mpsc::channel(16);
         spawn_echo(query_rx);
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let peer_addr = std::net::Ipv4Addr::LOCALHOST.into();
+        let limiter = std::sync::Arc::new(EnrollmentLimiter::new());
         let server = tokio::spawn(serve_authenticated_stream(
-            server_io, peer_key, ctx, query_tx,
+            server_io, peer_key, peer_addr, limiter, ctx, query_tx,
         ));
         (
             LengthDelimitedCodec::builder().new_framed(client_io),
@@ -699,6 +874,303 @@ mod tests {
         let _ = server.await;
     }
 
+    /// Looping `SubmitCsr` on the enrollment tier is rate-limited per source:
+    /// a legitimate node's first handful of submissions are forwarded, and
+    /// repeating past the burst capacity is refused by the gate rather than
+    /// reaching the router. This bounds *how fast* one source may contribute
+    /// to `authority.rs`'s held-CSR store; the store's own `MAX_HELD_CSRS`
+    /// bounds how large it may grow overall — the two are complementary, and
+    /// this test only exercises the rate half.
+    #[tokio::test]
+    async fn submit_csr_on_the_enrollment_tier_is_rate_limited_per_source() {
+        let ctx = AuthContext {
+            own_key: [1u8; 32], // un-enrolled ⇒ every other key is GrantedEnrollment
+            anchor: None,
+            revoked: Vec::new(),
+            now_unix: 100,
+        };
+        let (mut client, server) = spawn_authenticated_server([2u8; 32], ctx);
+
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: Vec::new(),
+            })))
+            .await
+            .unwrap();
+        let ack = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(ack.response, Some(Response::Empty(_))));
+
+        // The burst capacity's worth of submissions are all forwarded (the
+        // echo handler answers any forwarded query with a canned `NodeInfo`
+        // — what's under test is whether the gate forwards the request at
+        // all, not what comes back).
+        for n in 0..SUBMIT_CSR_BURST as u32 {
+            client
+                .send(encode_request(Request::SubmitCsr(
+                    SubmitCsrRequest::default(),
+                )))
+                .await
+                .unwrap();
+            let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+            assert!(
+                !matches!(&resp.response, Some(Response::Error(e)) if e.message.contains("too many")),
+                "submission {n} of the burst capacity was throttled early"
+            );
+        }
+
+        // One more, immediately after exhausting the burst: refused.
+        client
+            .send(encode_request(Request::SubmitCsr(
+                SubmitCsrRequest::default(),
+            )))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        match resp.response {
+            Some(Response::Error(e)) => {
+                assert!(e.message.contains("too many"), "got: {}", e.message)
+            }
+            other => panic!("expected the rate limit to refuse this request, got {other:?}"),
+        }
+
+        // Still open: a rate-limit refusal is of one request, like every
+        // other per-request refusal on this connection.
+        client
+            .send(encode_request(Request::GetTrustAnchor(
+                wayfinder_protos::wayfinder::v1alpha::GetTrustAnchorRequest {},
+            )))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(
+            !matches!(&resp.response, Some(Response::Error(_))),
+            "GetTrustAnchor is not itself rate-limited"
+        );
+
+        drop(client);
+        let _ = server.await;
+    }
+
+    /// The rate limit is genuinely per-*source*, proven through the real
+    /// listener rather than by calling `EnrollmentLimiter` directly: a source
+    /// that exhausts its burst does not throttle a second source connecting
+    /// from a different address to the same listener. Loopback carries more
+    /// than one address (`127.0.0.2` etc.), so this dials two real TCP
+    /// connections from two different local addresses rather than trusting
+    /// that isolation holds just because the data structure is keyed by
+    /// `IpAddr` — the property that matters is that `peer.ip()` at the
+    /// accept loop (`serve_tls_connection`) actually reaches the limiter
+    /// keyed correctly, not just that the bucket type can do it in theory.
+    #[tokio::test]
+    async fn submit_csr_rate_limit_is_isolated_per_source_over_real_connections() {
+        use tokio_rustls::TlsConnector;
+
+        let server_seed = [7u8; 32];
+        let server_key = Keypair::from_seed(&server_seed).ed_pubkey();
+
+        let (snapshot_tx, mut snapshot_rx) = mpsc::channel::<oneshot::Sender<AuthSnapshot>>(4);
+        tokio::spawn(async move {
+            while let Some(reply) = snapshot_rx.recv().await {
+                let _ = reply.send(AuthSnapshot {
+                    own_key: server_key,
+                    anchor: None,
+                    revoked: Vec::new(),
+                });
+            }
+        });
+        let (query_tx, query_rx) = mpsc::channel(16);
+        spawn_echo(query_rx);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_tls_server(
+            listener,
+            server_seed,
+            snapshot_tx,
+            query_tx,
+        ));
+
+        async fn connect_and_submit_csr(
+            server_addr: SocketAddr,
+            server_key: [u8; 32],
+            local_addr: std::net::IpAddr,
+            count: u32,
+        ) -> WayfinderResponse {
+            let connector = TlsConnector::from(crate::tls::test_support::test_client_config(
+                &[8u8; 32],
+                &server_key,
+            ));
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.bind((local_addr, 0).into()).unwrap();
+            let tcp = socket.connect(server_addr).await.unwrap();
+            let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            let tls = connector.connect(server_name, tcp).await.unwrap();
+            let mut client = LengthDelimitedCodec::builder().new_framed(tls);
+
+            client
+                .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                    cert: Vec::new(),
+                })))
+                .await
+                .unwrap();
+            client.next().await.unwrap().unwrap(); // the auth ack
+
+            let mut last = None;
+            for _ in 0..count {
+                client
+                    .send(encode_request(Request::SubmitCsr(
+                        SubmitCsrRequest::default(),
+                    )))
+                    .await
+                    .unwrap();
+                last =
+                    Some(WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap());
+            }
+            last.unwrap()
+        }
+
+        // Source A spends its entire burst, then one more: refused.
+        let refused = connect_and_submit_csr(
+            addr,
+            server_key,
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            SUBMIT_CSR_BURST as u32 + 1,
+        )
+        .await;
+        match refused.response {
+            Some(Response::Error(e)) => {
+                assert!(e.message.contains("too many"), "got: {}", e.message)
+            }
+            other => panic!("expected source A's burst+1 to be refused, got {other:?}"),
+        }
+
+        // Source B, a different local address, connects fresh and its first
+        // submission succeeds immediately — untouched by source A's flood.
+        let admitted = connect_and_submit_csr(
+            addr,
+            server_key,
+            std::net::Ipv4Addr::new(127, 0, 0, 2).into(),
+            1,
+        )
+        .await;
+        assert!(
+            !matches!(&admitted.response, Some(Response::Error(e)) if e.message.contains("too many")),
+            "a different source must not inherit another source's exhausted burst, got {:?}",
+            admitted.response
+        );
+    }
+
+    /// A fully-granted connection (admin or self-key) is exempt from the
+    /// enrollment-tier rate limit: `EnrollmentLimiter` gates `SubmitCsr` only
+    /// for `GrantedEnrollment`, so an admin enrolling many nodes on their
+    /// behalf in quick succession — the very capability §3.1's
+    /// proof-of-possession option was declined to preserve — is never
+    /// throttled by it.
+    #[tokio::test]
+    async fn submit_csr_is_not_rate_limited_on_a_fully_granted_connection() {
+        let ctx = AuthContext {
+            own_key: [1u8; 32],
+            anchor: None,
+            revoked: Vec::new(),
+            now_unix: 100,
+        };
+        // The connection's own key: self-key/bootstrap, a full grant.
+        let (mut client, server) = spawn_authenticated_server([1u8; 32], ctx);
+
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: Vec::new(),
+            })))
+            .await
+            .unwrap();
+        let ack = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(ack.response, Some(Response::Empty(_))));
+
+        for n in 0..(SUBMIT_CSR_BURST as u32 + 5) {
+            client
+                .send(encode_request(Request::SubmitCsr(
+                    SubmitCsrRequest::default(),
+                )))
+                .await
+                .unwrap();
+            let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+            assert!(
+                !matches!(&resp.response, Some(Response::Error(e)) if e.message.contains("too many")),
+                "submission {n}, past what an enrollment-tier connection's burst would allow, was throttled on a full grant"
+            );
+        }
+
+        drop(client);
+        let _ = server.await;
+    }
+
+    /// A token bucket bursts to capacity, throttles once spent, tracks
+    /// sources independently, and recovers after enough elapsed time for a
+    /// refill — using synthetic instants so the test runs instantly rather
+    /// than waiting on the real clock.
+    #[test]
+    fn enrollment_limiter_bursts_then_throttles_then_recovers() {
+        let limiter = EnrollmentLimiter::new();
+        let addr: std::net::IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+        let t0 = std::time::Instant::now();
+
+        for n in 0..SUBMIT_CSR_BURST as u32 {
+            assert!(limiter.allow_submit_csr(addr, t0), "burst slot {n}");
+        }
+        assert!(
+            !limiter.allow_submit_csr(addr, t0),
+            "burst capacity is exhausted"
+        );
+
+        // A different source has its own, untouched bucket.
+        let other: std::net::IpAddr = std::net::Ipv4Addr::new(127, 0, 0, 2).into();
+        assert!(limiter.allow_submit_csr(other, t0));
+
+        // Enough elapsed time for exactly one refill: one more is allowed,
+        // and only one.
+        let t1 = t0 + std::time::Duration::from_secs_f64(1.0 / SUBMIT_CSR_REFILL_PER_SEC);
+        assert!(limiter.allow_submit_csr(addr, t1));
+        assert!(!limiter.allow_submit_csr(addr, t1));
+    }
+
+    /// The map backing the limiter is itself bounded: past
+    /// `MAX_TRACKED_SOURCES` distinct addresses, tracking a new one evicts
+    /// the least-recently-touched bucket rather than growing further —
+    /// otherwise an attacker with many source addresses reproduces the exact
+    /// unbounded-anonymous-growth problem this limiter exists to bound.
+    #[test]
+    fn enrollment_limiter_bounds_the_number_of_tracked_sources() {
+        let limiter = EnrollmentLimiter::new();
+        let t0 = std::time::Instant::now();
+        let addr = |n: u32| std::net::IpAddr::from(std::net::Ipv4Addr::from(n));
+
+        for n in 0..MAX_TRACKED_SOURCES as u32 {
+            // Space each touch out in time so "least recently touched" is
+            // unambiguous, and consume the full burst so a later re-touch of
+            // the same address doesn't look like a fresh one.
+            let t = t0 + std::time::Duration::from_secs(n as u64);
+            for _ in 0..SUBMIT_CSR_BURST as u32 {
+                assert!(limiter.allow_submit_csr(addr(n), t));
+            }
+        }
+        assert_eq!(limiter.buckets.lock().unwrap().len(), MAX_TRACKED_SOURCES);
+
+        // One more, brand new, source: room is made by evicting address 0,
+        // the least-recently touched — and it is safe to do so, since that
+        // just means address 0 starts over at full burst capacity next time.
+        let t_new = t0 + std::time::Duration::from_secs(MAX_TRACKED_SOURCES as u64);
+        assert!(limiter.allow_submit_csr(addr(MAX_TRACKED_SOURCES as u32), t_new));
+        assert_eq!(
+            limiter.buckets.lock().unwrap().len(),
+            MAX_TRACKED_SOURCES,
+            "the map itself never grows past the cap"
+        );
+        assert!(
+            limiter.allow_submit_csr(addr(0), t_new),
+            "the evicted source gets a fresh full bucket, not a permanently-empty one"
+        );
+    }
+
     /// The full stack over a real loopback TLS connection: a client presenting
     /// the node's own key (bootstrap) completes the RFC 7250 handshake, the
     /// accept loop recovers its key and snapshots the (un-enrolled) router, and
@@ -711,11 +1183,14 @@ mod tests {
         let server_seed = [7u8; 32];
         let server_key = Keypair::from_seed(&server_seed).ed_pubkey();
 
-        // Stand-in router loop: un-enrolled (bootstrap), nothing revoked.
+        // Stand-in router loop: reports `server_seed`'s key as `own_key` (what
+        // the real driver loop reports before any `SetAuth`), un-enrolled
+        // (bootstrap), nothing revoked.
         let (snapshot_tx, mut snapshot_rx) = mpsc::channel::<oneshot::Sender<AuthSnapshot>>(4);
         tokio::spawn(async move {
             while let Some(reply) = snapshot_rx.recv().await {
                 let _ = reply.send(AuthSnapshot {
+                    own_key: server_key,
                     anchor: None,
                     revoked: Vec::new(),
                 });
@@ -762,6 +1237,125 @@ mod tests {
             .unwrap();
         let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
         assert!(matches!(resp.response, Some(Response::NodeInfo(_))));
+    }
+
+    /// The self-key window closes on the *next connection* after a seed
+    /// rotation, not only after a restart: `own_key` is read fresh from the
+    /// router-loop snapshot per connection (see [`AuthSnapshot::own_key`]),
+    /// so a client presenting a seed the node has since rotated away from no
+    /// longer gets bootstrap access, while the newly-installed seed does.
+    ///
+    /// The TLS listener itself keeps presenting `server_seed`'s identity
+    /// throughout (rebuilding the acceptor at runtime is a separate concern
+    /// from this fix) — only the *authorization* comparison value changes,
+    /// exactly as `SetAuth` installing a new seed would cause the real driver
+    /// loop's snapshot responder to report.
+    #[tokio::test]
+    async fn a_rotated_identity_seed_stops_granting_self_key_on_the_next_connection() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
+        use tokio_rustls::TlsConnector;
+
+        let server_seed = [7u8; 32];
+        let server_key = Keypair::from_seed(&server_seed).ed_pubkey();
+        let old_seed = [1u8; 32];
+        let new_seed = [2u8; 32];
+        let old_key = Keypair::from_seed(&old_seed).ed_pubkey();
+        let new_key = Keypair::from_seed(&new_seed).ed_pubkey();
+
+        // Stand-in router loop: reports whichever key is currently
+        // "installed", exactly as the real driver's snapshot responder does
+        // after a `SetAuth` updates the identity it tracks.
+        let current_own_key = Arc::new(Mutex::new(old_key));
+        let (snapshot_tx, mut snapshot_rx) = mpsc::channel::<oneshot::Sender<AuthSnapshot>>(4);
+        {
+            let current_own_key = current_own_key.clone();
+            tokio::spawn(async move {
+                while let Some(reply) = snapshot_rx.recv().await {
+                    let own_key = *current_own_key.lock().unwrap();
+                    let _ = reply.send(AuthSnapshot {
+                        own_key,
+                        anchor: None,
+                        revoked: Vec::new(),
+                    });
+                }
+            });
+        }
+
+        let (query_tx, query_rx) = mpsc::channel(16);
+        spawn_echo(query_rx);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_tls_server(
+            listener,
+            server_seed,
+            snapshot_tx,
+            query_tx,
+        ));
+
+        // Connect presenting `presented_seed`, authenticate with no cert
+        // (bootstrap), and report whether the connection was actually granted
+        // full access — a `GetNodeInfo` served rather than refused — which is
+        // the only thing that tells self-key access apart from the
+        // enrollment-only grant an anchorless node hands out to any stranger.
+        async fn granted_full_access(
+            addr: SocketAddr,
+            presented_seed: &[u8; 32],
+            server_key: &[u8; 32],
+        ) -> bool {
+            let connector = TlsConnector::from(crate::tls::test_support::test_client_config(
+                presented_seed,
+                server_key,
+            ));
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            let tls = connector.connect(server_name, tcp).await.unwrap();
+            let mut client = LengthDelimitedCodec::builder().new_framed(tls);
+
+            client
+                .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                    cert: Vec::new(),
+                })))
+                .await
+                .unwrap();
+            let ack = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+            assert!(
+                matches!(ack.response, Some(Response::Empty(_))),
+                "an anchorless node admits every bootstrap connection, self-key or not"
+            );
+
+            client
+                .send(encode_request(Request::GetNodeInfo(GetNodeInfoRequest {})))
+                .await
+                .unwrap();
+            let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+            matches!(resp.response, Some(Response::NodeInfo(_)))
+        }
+
+        // Before rotation: the old seed is self-key, and gets full access.
+        assert!(
+            granted_full_access(addr, &old_seed, &server_key).await,
+            "the old seed grants full access before rotation"
+        );
+
+        // Rotate: the router loop now reports the new key, as it would once
+        // `SetAuth` installs `new_seed`.
+        *current_own_key.lock().unwrap() = new_key;
+
+        // After rotation: the OLD seed no longer earns full access — it falls
+        // to the enrollment-only tier a stranger gets, same as any other key
+        // that isn't the node's own.
+        assert!(
+            !granted_full_access(addr, &old_seed, &server_key).await,
+            "the old seed must not still grant full access after rotation"
+        );
+        // ...and the NEW seed does, immediately, on the very next connection.
+        assert!(
+            granted_full_access(addr, &new_seed, &server_key).await,
+            "the new seed grants full access right after rotation"
+        );
     }
 
     /// Sending a normal request before authenticating is refused — the first

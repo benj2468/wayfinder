@@ -43,6 +43,12 @@ cargo run -p wayfinder-ctl -- <subcommand>            # CLI mgmt client / offlin
 else) before committing; the pre-commit hook also runs it. Prefer it over
 `cargo fmt`.
 
+**Disk space:** this repo spans multiple independent Cargo workspaces (root,
+`libs/wayfinder-py`, each embedded board, each `libs/*/fuzz`), each with its
+own `target/` directory that a plain `cargo clean` in the root won't touch. If
+a build fails with "No space left on device", run `just clean` — it cleans
+every workspace's `target/` in one shot, not just the root's.
+
 The `libs/wayfinder-shark` Wireshark dissector is tested with pytest
 (`libs/wayfinder-shark/tests/`), which drives `tshark` against the Lua
 dissector — outside the Cargo test harness.

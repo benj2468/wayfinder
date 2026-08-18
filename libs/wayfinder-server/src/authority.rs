@@ -102,6 +102,24 @@ pub struct CertAuthority {
     log: CaLog,
 }
 
+/// Largest number of certificate-signing requests the authority will hold at
+/// once, counted across every lifecycle state (pending, approved-but-not-yet
+/// collected, and denial tombstones).
+///
+/// `SubmitCsr` is reachable on the management API's *enrollment* tier, which
+/// by design admits a client holding no credential at all. Without a count
+/// bound, one anonymous peer looping submissions under fabricated MACs could
+/// grow this store until the node ran out of memory — and, since the store is
+/// persisted, leave the growth behind across a restart. `pending_ttl_secs`
+/// alone does not bound it: nothing stops submissions arriving faster than the
+/// TTL retires them.
+///
+/// Sized for the human on the other end rather than for the memory: a queue an
+/// operator is expected to read and decide row by row is unusable long before
+/// 128 entries, and at a few hundred bytes apiece the whole table is tens of
+/// kilobytes even when full.
+pub(crate) const MAX_HELD_CSRS: usize = 128;
+
 /// Default held-CSR lifetime when a CA is built with [`CertAuthority::new`]
 /// (the config-driven constructor takes the operator's value instead): one
 /// hour, long enough for an operator to approve and short enough to bound the
@@ -461,7 +479,32 @@ impl MeshAuthority for CertAuthority {
             ));
         }
 
-        // First time we've seen this MAC: park it for approval.
+        // First time we've seen this MAC — but only if there is room. Refusing
+        // rather than evicting to make room is the point: an eviction policy
+        // hands an attacker exactly the primitive they want, since submitting
+        // enough requests would displace a legitimate pending one. Refusing
+        // degrades instead to "the queue is full, an operator must drain it",
+        // which is visible in `list_pending` and recoverable. Only *new*
+        // entries are gated; every path above — an existing holder re-polling,
+        // or collecting an approved cert — has already returned.
+        if self.log.held().len() >= MAX_HELD_CSRS {
+            // A capacity drop that is security-relevant and reachable by a peer
+            // presenting no credential, so the operator whose enrollment queue
+            // has just stopped accepting anyone hears about it. The MAC is not
+            // a secret (every OGM carries one), and it is what an operator
+            // needs to tell a stuck node from a flood.
+            tracing::warn!(
+                held = self.log.held().len(),
+                capacity = MAX_HELD_CSRS,
+                node_mac = ?mac,
+                "drop: held-CSR store full; refusing a new enrollment request"
+            );
+            return Ok(CsrOutcome::Rejected(
+                "the provider's certificate-signing queue is full; an operator must \
+                 approve or deny the requests already held before new ones are accepted"
+                    .to_string(),
+            ));
+        }
         let requested_at = self.now_unix;
         let (_, persisted) = self.log.mutate_held(|held| {
             held.push(HeldCsr {
@@ -1031,6 +1074,70 @@ mod tests {
             CsrOutcome::Pending
         ));
         assert_eq!(ca.log.held().len(), 1, "still exactly one held entry");
+    }
+
+    /// The held-CSR store is bounded by count, not only by TTL, and a full
+    /// queue **refuses the newcomer rather than evicting an incumbent**.
+    ///
+    /// Both halves are the security property. The bound is what stops an
+    /// anonymous client — `SubmitCsr` is reachable on the enrollment tier with
+    /// no credential at all — from growing the store until the node runs out
+    /// of memory, a growth that would otherwise also be persisted and so
+    /// outlive a restart. Refusing rather than evicting is what stops the
+    /// *cure* from being the disease: an eviction policy hands an attacker
+    /// exactly the primitive they want, the ability to displace a legitimate
+    /// pending request by submitting enough of their own.
+    ///
+    /// A full queue therefore degrades to "an operator must drain this",
+    /// which is visible in `list_pending` and recoverable, and every request
+    /// already held stays held and stays collectable.
+    #[test]
+    fn a_full_held_csr_queue_refuses_new_requests_rather_than_evicting() {
+        let mut ca = approval_ca();
+        let held_mac = |n: usize| [0, 0, 0, 0, (n >> 8) as u8, n as u8];
+
+        for n in 0..MAX_HELD_CSRS {
+            let (ed, x) = node_keys(n as u8);
+            assert!(
+                matches!(
+                    ca.submit_csr(&held_mac(n), &ed, &x, "").unwrap(),
+                    CsrOutcome::Pending
+                ),
+                "parking request {n} of {MAX_HELD_CSRS}"
+            );
+        }
+        assert_eq!(ca.log.held().len(), MAX_HELD_CSRS, "the queue is full");
+
+        // One more, from a MAC and key the store has never seen: refused, with
+        // a reason that names the queue rather than blaming the requester.
+        let (ed, x) = node_keys(200);
+        let outcome = ca
+            .submit_csr(&held_mac(MAX_HELD_CSRS), &ed, &x, "")
+            .unwrap();
+        match outcome {
+            CsrOutcome::Rejected(reason) => {
+                assert!(reason.contains("full"), "got: {reason}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+
+        // Nothing was displaced to make room, and every incumbent is still
+        // awaiting the operator.
+        assert_eq!(ca.log.held().len(), MAX_HELD_CSRS, "no incumbent evicted");
+        assert_eq!(ca.list_pending().len(), MAX_HELD_CSRS);
+
+        // And an incumbent re-polling is still answered — the cap gates *new*
+        // entries, never the collection path a legitimate node is waiting on.
+        let (ed0, x0) = node_keys(0);
+        assert!(matches!(
+            ca.submit_csr(&held_mac(0), &ed0, &x0, "").unwrap(),
+            CsrOutcome::Pending
+        ));
+        ca.approve_csr(&held_mac(0)).expect("approve succeeds");
+        assert!(matches!(
+            ca.submit_csr(&held_mac(0), &ed0, &x0, "").unwrap(),
+            CsrOutcome::Issued(_)
+        ));
     }
 
     #[test]

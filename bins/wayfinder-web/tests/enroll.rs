@@ -30,7 +30,20 @@ use wayfinder_web::mock::Mock;
 /// address, a pinned key as hex, and a token.
 async fn serve_authority(require_approval: bool) -> ProviderTarget {
     let (addr, node_key) =
-        wayfinder_web::mock::serve_mock_node_with(Mock::authority(require_approval)).await;
+        wayfinder_web::mock::serve_mock_node_with(Mock::authority(require_approval, None)).await;
+    ProviderTarget {
+        address: addr.to_string(),
+        node_key: node_key.iter().map(|b| format!("{b:02x}")).collect(),
+        token: String::new(),
+    }
+}
+
+/// As [`serve_authority`], but the provider requires `token` for a request to
+/// be admitted at all. The returned target's own `token` field is left empty —
+/// each test fills in what it wants to present, which is the point.
+async fn serve_token_gated_authority(token: &str) -> ProviderTarget {
+    let (addr, node_key) =
+        wayfinder_web::mock::serve_mock_node_with(Mock::authority(false, Some(token))).await;
     ProviderTarget {
         address: addr.to_string(),
         node_key: node_key.iter().map(|b| format!("{b:02x}")).collect(),
@@ -198,4 +211,46 @@ async fn a_provider_that_does_not_match_its_pinned_key_is_refused() {
         !posture(&node).await.auth_enabled,
         "nothing is installed from a provider that could not be verified"
     );
+}
+
+/// The token is the primary admission control for the whole feature: a
+/// request presenting the wrong one is refused outright, as
+/// `EnrollmentOutcome::Rejected` rather than an error or a silent park, and
+/// nothing is installed on the node.
+#[tokio::test]
+async fn a_wrong_enrollment_token_is_rejected() {
+    let node = common::serve_unauthenticated_mock_node().await;
+    let mut provider = serve_token_gated_authority("the-real-token").await;
+    provider.token = "not-the-real-token".to_string();
+
+    match request(&node, &provider).await.unwrap() {
+        EnrollmentOutcome::Rejected { reason } => {
+            assert!(!reason.is_empty(), "the provider's reason is reported")
+        }
+        other => panic!("expected Rejected, got {other:?}"),
+    }
+    assert!(
+        !posture(&node).await.auth_enabled,
+        "a rejected request installs nothing"
+    );
+}
+
+/// The same request, with the right token, is admitted — proving the token is
+/// actually carried to the provider rather than dropped on the floor. Without
+/// this, a `request` that silently discarded `provider.token` would still
+/// pass every other test in this file, since none of the others configure a
+/// provider that checks it.
+#[tokio::test]
+async fn the_right_enrollment_token_is_admitted() {
+    let node = common::serve_unauthenticated_mock_node().await;
+    let mut provider = serve_token_gated_authority("the-real-token").await;
+    provider.token = "the-real-token".to_string();
+
+    assert_eq!(
+        request(&node, &provider).await.unwrap(),
+        EnrollmentOutcome::Enrolled {
+            mesh_id: MOCK_MESH_ID
+        }
+    );
+    assert!(posture(&node).await.auth_enabled);
 }
