@@ -101,6 +101,4 @@ pub use transport::bind_tcp_server;
 #[cfg(feature = "std")]
 pub use transport::run_channel_server;
 #[cfg(feature = "std")]
-pub use transport::serve_authenticated_stream;
-#[cfg(feature = "std")]
 pub use transport::serve_tls_server;

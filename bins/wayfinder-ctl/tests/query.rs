@@ -203,6 +203,7 @@ async fn spawn_server() -> Endpoint {
     tokio::spawn(async move {
         while let Some(reply) = snapshot_rx.recv().await {
             let _ = reply.send(AuthSnapshot {
+                own_key: node_key,
                 anchor: None,
                 revoked: Vec::new(),
             });

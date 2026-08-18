@@ -65,7 +65,11 @@ Three grant tiers:
   dashboard that reached an un-enrolled node has no other credential it could
   hold, so revoking this at the moment of enrollment would lock out the operator
   who just enrolled it. (An earlier rule did exactly that; the reversal is
-  deliberate and documented on `decide_access`.)
+  deliberate and documented on `decide_access`.) The comparison value
+  (`own_key`) is read fresh from the driver's identity-seed slot on every
+  connection (`AuthSnapshot::own_key`, `RouterAdapter::set_auth` writes through
+  it) rather than cached at listener startup, so a seed a `SetAuth` rotates
+  away from stops earning this grant on the very next connection.
 - `GrantedEnrollment` — the client presented no cert at all. Admitted, but
   `permits` confines it to `SubmitCsr` and `GetTrustAnchor`.
 

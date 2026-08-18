@@ -144,8 +144,8 @@ impl TestRouter {
 
     /// Pin the unix time that `now == 0` means, so certificate validity is
     /// judged against a real clock while tests keep driving a virtual one.
-    pub fn set_auth_epoch_unix(&mut self, epoch_unix: u64) {
-        self.driver.set_auth_epoch_unix(epoch_unix);
+    pub fn set_epoch_unix(&mut self, epoch_unix: u64) {
+        self.driver.set_epoch_unix(epoch_unix);
     }
 
     /// The inner frames the router has delivered locally so far (the full host

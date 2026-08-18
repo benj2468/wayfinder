@@ -466,7 +466,7 @@ fn enable_auth(node: &mut TestRouter, authority: &wayfinder_auth::Authority, ide
         cert,
         authority.trust_anchor(),
     ));
-    node.set_auth_epoch_unix(1_000);
+    node.set_epoch_unix(1_000);
 }
 
 /// With auth enabled on both nodes, OGMs converge (signed) and a unicast is

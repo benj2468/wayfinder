@@ -463,6 +463,14 @@ impl<
                 // Build the response against a fresh adapter at `now`, then hand
                 // it back to the waiting serve loop. `None` — an embedded node is
                 // never a provider-mode certificate authority.
+                //
+                // No `.with_epoch_unix(...)`: `Clock` (above) is monotonic only,
+                // with no wall-clock source to supply one from. `SetAuth`'s
+                // certificate-validity check needs real unix time (see
+                // `RouterAdapter::with_epoch_unix`'s doc), so it will reject
+                // every certificate as "not yet valid" if ever reached this
+                // way — consistent with `SetAuth` over this management port
+                // not being wired up yet.
                 let response = WayfinderService::new(RouterAdapter::new(&mut *router, None, now))
                     .handle(request);
                 mgmt.reply(response).await;

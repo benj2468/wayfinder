@@ -1,9 +1,14 @@
 # Design: hardening the enrollment access tier
 
-**Status:** Proposed — the findings below came out of the `mr-review` pass on
-`bjc/unauthenticated-bug-wasm` (online enrollment via the web dashboard). That
-branch's own review fixes have landed; everything in this doc was deliberately
-deferred to a follow-up. Approved for implementation in a later session.
+**Status:** §§3.1–3.5 implemented, on `bjc/harden-enrollment-tier`. The
+findings below came out of the `mr-review` pass on `bjc/unauthenticated-bug-wasm`
+(online enrollment via the web dashboard); that branch's own review fixes have
+landed, and everything in this doc was deliberately deferred to this follow-up.
+Each section's own "Implemented" note has the detail; in short — §3.1's
+proof-of-possession option (item 4) was deliberately **not** taken, a
+resolved threat-model decision (enrolling a node on another's behalf stays
+supported), not a gap; everything else in §§3.1–3.5 is done. **§4 (secondary
+items) is untouched** — out of scope for this pass.
 
 **Scope:** `libs/wayfinder-server` (`authz.rs`, `authority.rs`,
 `persistence.rs`, `adapter.rs`, `transport.rs`) and the enrollment panel in
@@ -125,6 +130,42 @@ credential.
    It does forbid enrolling a node on behalf of another, which `authz.rs:150`
    currently documents as deliberately allowed; see §6.
 
+**Implemented: items 1–3.** `MAX_HELD_CSRS = 128` bounds `held` by count
+(`libs/wayfinder-server/src/authority.rs`), and a full queue refuses the new
+entry with a `warn!` naming the offending MAC rather than evicting an
+incumbent — closing the memory-exhaustion consequence. Covered by
+`authority::tests::a_full_held_csr_queue_refuses_new_requests_rather_than_evicting`
+(fills the queue, confirms the newcomer is refused and nothing evicted, and
+that an incumbent's own re-poll/collect path still works through a full
+queue).
+
+Item 3 (the per-source limiter) is also in: `EnrollmentLimiter`
+(`libs/wayfinder-server/src/transport.rs`) is a token bucket per source IP —
+5-token burst, refilling one token per 5 seconds (matching `APPROVAL_POLL` in
+the web dashboard's enrollment panel, so a legitimate node polling
+indefinitely is never throttled at steady state), gating `SubmitCsr`
+specifically on `GrantedEnrollment` connections. The map backing it is itself
+bounded (`MAX_TRACKED_SOURCES = 1024`, evicting the least-recently-touched
+bucket past that — safe, since an evicted source just starts over at full
+burst capacity), so it does not reproduce the unbounded-growth problem it
+exists to bound. Covered by
+`submit_csr_on_the_enrollment_tier_is_rate_limited_per_source` (through the
+real `serve_authenticated_stream` gate: the burst succeeds, one more is
+refused, a non-`SubmitCsr` request on the same connection is unaffected),
+plus two synchronous unit tests for the bucket and map-eviction logic.
+
+**Item 4 (proof-of-possession) was deliberately not taken** — a resolved
+threat-model decision, not an oversight: `authz.rs`'s `permits` doc comment
+(rewritten for §3.3) now says explicitly, and honestly, that a submitted
+CSR's key need not match the handshake key, because removing that would also
+remove the ability to enroll a node on another's behalf, which nothing else
+in this design offers a substitute for (§6 item 2). **The MAC-squatting
+consequence above is therefore bounded, not closed**: an anonymous client can
+still park a CSR under a real node's MAC in a single submission, but cannot
+do so past 128 outstanding entries mesh-wide, and cannot repeat it faster
+than roughly once per 5 seconds from one source — whereas before this fix it
+could do both without bound.
+
 ### 3.2 The self-key grant now survives enrollment — **needs a threat-model decision**
 
 `decide_access` checks self-key first and unconditionally (`authz.rs:104`), so
@@ -169,6 +210,37 @@ The second is more work and closes the window properly. The first is honest and
 cheap. What must not happen is leaving the current comment standing, because it
 argues the change is a wash when it is not.
 
+**Implemented: option 1 (keep it), with the recompute.** `own_key` no longer
+lives in a variable closed over at listener startup. It travels in
+`AuthSnapshot` (`libs/wayfinder-server/src/transport.rs`) and is requested
+fresh from the driver's live identity on *every* connection, the same
+round-trip `anchor`/`revoked` already made — `serve_tls_server` no longer
+computes it at all. `RouterAdapter::set_auth` (`libs/wayfinder-server/src/adapter.rs`)
+now holds `identity_seed` as a mutable reference into the driver's own storage
+rather than an owned copy, and writes the seed it actually installs back
+through that reference the moment installation succeeds (both the wholesale
+re-key case and the certify-in-place case). `wayfinder-driver`'s
+`build_auth_snapshot` reads that same slot to compute `own_key` per
+connection. Net effect: a `SetAuth` that rotates the seed closes the window on
+the *very next connection*, not only at the next restart — which is what
+"recompute `own_key`" above was asking for, just resolved as a live read
+rather than a one-time recomputation.
+
+This does **not** revoke an already-open connection mid-flight (authorization
+is still decided once, at connect time, per the existing `AuthContext`
+contract) and it is not a substitute for narrowing (option 2) if the actual
+goal is ever "shut out a specific live self-key holder immediately" rather
+than "a rotated-away-from seed stops working going forward." The doc comments
+on `decide_access` (self-key bullet) and this crate's `CLAUDE.md` were
+rewritten to state this guarantee rather than the prior overclaim.
+
+Covered by `transport::tests::a_rotated_identity_seed_stops_granting_self_key_on_the_next_connection`
+(real TLS end to end: the old seed grants full access, is rotated out, no
+longer grants — falls to the same enrollment-only tier a stranger gets — and
+the new seed grants immediately), `adapter::tests::set_auth_writes_the_installed_seed_back_to_the_caller`,
+and three `driver::tests::build_auth_snapshot_*` unit tests (including one
+proving the function caches nothing and tracks a changed seed call to call).
+
 ### 3.3 `permits`' documentation overclaims
 
 ```rust
@@ -190,6 +262,16 @@ request *contents* — and name the residual reach honestly. If §3.1's
 proof-of-possession option is taken, the sentence becomes true and should be
 rewritten to say why (the CSR key must equal the handshake key), not left as
 an unsupported assertion.
+
+**Implemented.** The overclaiming sentence is gone. `permits`' doc comment now
+states what actually confines the tier (the request *set* `permits` allows,
+not anything about a `SubmitCsr`'s contents), names the residual reach
+honestly (a client can name a MAC and keys it does not hold — the MAC
+squatting §3.1 describes), says why that reach is deliberate rather than an
+oversight (it is what lets one node enroll another on its behalf), and points
+at the two things that now bound its cost without eliminating it
+(`MAX_HELD_CSRS` and `EnrollmentLimiter`, both landed for §3.1). The
+`SECURITY ALERT` banner an earlier commit added stays, unchanged.
 
 ### 3.4 `set_auth` installs a certificate it never verifies
 
@@ -224,6 +306,34 @@ point. Persisting only after verification also restores the property the
 existing comment there claims ("a malformed request cannot leave unusable
 identity material behind").
 
+**Implemented: all three checks, plus the ordering.** `set_auth`
+(`libs/wayfinder-server/src/adapter.rs`) now:
+
+1. Calls `anchor.verify_cert(&parsed_cert, now)` and persists only after it
+   succeeds — covered by four tests (`set_auth_rejects_a_cert_with_a_bad_signature`,
+   `_for_the_wrong_mesh`, `_an_expired_cert`, `_a_not_yet_valid_cert`), each
+   asserting both the error and that nothing was installed or persisted.
+2. Checks the cert's key against `key_pair.ed_pubkey()` — the identity being
+   installed, whether that is the existing seed (certify-in-place) or a fresh
+   one (wholesale replacement) — covered by `set_auth_rejects_a_cert_for_the_wrong_key`.
+3. Checks `node_mac` against the MAC the router runs under, **scoped to the
+   certify-in-place path only** (empty seed): that is the path's whole
+   promise — the identity, and so the MAC, does not change — so a cert for a
+   different MAC there is a provider-side mismatch. A wholesale identity
+   install is exempt on purpose: naming a new MAC is exactly what that path
+   is for, and `wayfinder-tap` re-derives the router's MAC from the installed
+   certificate on the next boot. Covered by
+   `set_auth_rejects_a_cert_for_the_wrong_mac_when_certifying_in_place` and
+   `set_auth_with_a_seed_allows_a_new_mac` (the exemption, asserted
+   positively so a future change to the scoping shows up as a failure here
+   rather than by omission).
+
+The failure mode this section opens with — a provider returns a well-formed,
+validly-signed certificate for the *wrong* key — is closed: `verify_cert`
+alone only proved the certificate was signed by the anchor's root, not that
+it was *this node's*; checks 2 and 3 are what tie it to the identity actually
+being installed.
+
 ### 3.5 Test gap: half the authorization matrix is unexercised
 
 The anchor-present column is well covered. The **anchor-absent column is not**:
@@ -252,6 +362,30 @@ Also missing:
   for the whole feature. A test should also assert that the *same* request with
   the *right* token succeeds — no current test proves the token is carried at
   all, so a `request` that dropped it on the floor would pass everything.
+
+**Implemented.** All four gaps are closed:
+
+- **Anchor-absent column:** `authz::tests::without_an_anchor_no_certificate_grants_more_than_enrollment`
+  sweeps five credential shapes against an anchorless node — no cert, an admin
+  cert, an expired admin cert, a plain member cert, and a cert issued to a
+  different key — asserting every one lands on `GrantedEnrollment` rather than
+  a demoted grant, and that the node's own key still outranks all of them.
+- **Cross-mesh certificate:** `authz::tests::a_certificate_from_a_foreign_root_is_denied`
+  covers both shapes a forged cert can take — a foreign mesh id (caught by the
+  id check) and a foreign root reusing *this* mesh's id (caught only by the
+  signature, the cell that actually matters).
+- **Closed-set `permits`:** `authz::tests::permits_confines_the_enrollment_tier_to_a_closed_allowlist`
+  enumerates all 22 request kinds this build knows (`every_request_kind`) with
+  a hard count assertion, so a request kind added to the proto and forgotten
+  here fails the test rather than passing by omission.
+- **The web rejection path:** `Mock::authority` (`bins/wayfinder-web/src/mock.rs`)
+  now takes an `Option<&str>` token, wiring it into the real `CertAuthority` it
+  wraps. `bins/wayfinder-web/tests/enroll.rs` adds
+  `a_wrong_enrollment_token_is_rejected` (asserts `EnrollmentOutcome::Rejected`
+  and that nothing installs) and `the_right_enrollment_token_is_admitted`
+  (proves the token is actually carried to the provider rather than dropped —
+  the property no prior test could see, since none of them configured a
+  provider that checked it).
 
 ---
 
@@ -288,32 +422,47 @@ Also missing:
 ## 5. Security considerations
 
 The change in §3.1 is the one with a trust-boundary effect: it converts an
-unbounded anonymous write into a bounded one. Option 4 (proof-of-possession)
-additionally removes the ability to enroll a node on another node's behalf.
-That is currently a documented feature of the design, so taking option 4 is a
-deliberate narrowing, not a bug fix — see §6.
+unbounded anonymous write into a bounded one — capped at 128 mesh-wide
+(`MAX_HELD_CSRS`) *and* rate-limited per source (`EnrollmentLimiter`, ~1
+`SubmitCsr` per 5 seconds after a small burst). Option 4
+(proof-of-possession) was deliberately not taken: it would additionally
+remove the ability to enroll a node on another node's behalf, which is a
+documented feature of the design, so taking it would be a deliberate
+narrowing, not a bug fix — see §6. The MAC-squatting consequence §3.1 opens
+with is therefore bounded, not eliminated: a single submission can still
+squat a real node's MAC, but not fast, and not past the shared cap.
 
-§3.4 tightens what a node will accept from a provider it has pinned. It does
-not change who may call `SetAuth`.
+§3.4 now tightens what a node will accept from a provider it has pinned on
+all three axes named in that section: the certificate must verify against
+the anchor, must name the key being installed, and — when certifying the
+identity already held — must name the MAC that identity already runs under.
+It does not change who may call `SetAuth`.
 
 Nothing here alters the mesh wire format, the OGM signing path, or the
 `no_std` core.
 
 ## 6. Open decisions for the implementing session
 
-1. **§3.2 — keep the broad self-key grant, or narrow it to the enrolling
-   connection?** This is the one item that needs a human threat-model call
-   before any code is written. Everything else in this doc is implementable
-   as-is.
-2. **§3.1 option 4 — require the CSR's key to be the handshake key?** It makes
-   MAC squatting structurally impossible, but forbids enrolling a node on behalf
-   of another, which `authz.rs:150` currently documents as intentionally
-   permitted. Decide whether that capability has a real use case before removing
-   it. If it does, keep it and rely on the cap + rate limit instead.
-3. **`MAX_HELD_CSRS` value**, and whether the limiter is per-IP or global. A
-   per-IP bucket is trivially evaded on an open network; a global one is a
-   self-inflicted denial of service. A hybrid (global cap + per-IP bucket) is
-   probably right.
+1. ~~**§3.2 — keep the broad self-key grant, or narrow it to the enrolling
+   connection?**~~ **Resolved: kept, with the recompute.** See §3.2's
+   "Implemented" note — `own_key` is now read live per connection, so a
+   rotated-away-from seed stops granting access on the next connection rather
+   than staying valid until a restart. Narrowing to a short-lived
+   grace-connection credential remains on the table if the actual requirement
+   ever becomes "revoke a specific live connection immediately," which this
+   fix does not do.
+2. ~~**§3.1 option 4 — require the CSR's key to be the handshake key?**~~
+   **Resolved: not taken.** Enrolling a node on another's behalf has a real
+   use case (a fleet operator provisioning nodes from one console) and
+   nothing else in this design substitutes for it, so the capability stays.
+   MAC squatting is bounded instead, by the cap + rate limit (§3.1 items 1–3).
+3. ~~**`MAX_HELD_CSRS` value, and whether the limiter is per-IP or global.**~~
+   **Resolved: 128 (global cap) + per-IP token bucket, the hybrid this item
+   suggested.** The count-based cap bounds the store no matter how many
+   sources contribute; the per-IP bucket (`EnrollmentLimiter`) bounds how
+   fast any one of them can. The bucket map itself is bounded too
+   (`MAX_TRACKED_SOURCES = 1024`, LRU-evicted), so a source-address flood
+   cannot reproduce the unbounded-growth problem at one remove.
 4. **Whether §4's `SharedSecret`/sum-type refactor lands here or separately.**
    It touches the proto and both clients, so it may deserve its own change.
 
@@ -321,17 +470,19 @@ Nothing here alters the mesh wire format, the OGM signing path, or the
 
 | File | What changes |
 |---|---|
-| `libs/wayfinder-server/src/persistence.rs:125` | Cap `held`; `MAX_HELD_CSRS` const |
-| `libs/wayfinder-server/src/authority.rs:459,467` | Refuse-on-full, `warn!` on cap, squatting note |
-| `libs/wayfinder-server/src/transport.rs` | Per-source limiter on the enrollment tier |
-| `libs/wayfinder-server/src/transport.rs:312` | Recompute `own_key` after a seed-changing `SetAuth` (if §3.2 keeps the grant) |
-| `libs/wayfinder-server/src/authz.rs:104,147,150` | §3.2 decision; rewrite the `permits` doc |
-| `libs/wayfinder-server/src/adapter.rs:529` | Verify cert against anchor + keypair before `persist_settings` |
-| `libs/wayfinder-server/src/authz.rs` (tests) | Anchor-absent column; cross-anchor cert; `permits` closed set |
-| `bins/wayfinder-web/src/mock.rs` | Token-requiring `Mock::authority` |
-| `bins/wayfinder-web/tests/enroll.rs` | Rejection path; token-is-carried test |
-| `bins/wayfinder-web/src/components/security.rs:150,726` | Retry cap/backoff, `on_cleanup`, disable during `Waiting` |
-| `bins/wayfinder-web/tests/render.rs:804` | Rename to describe masking, not confidentiality |
+| `libs/wayfinder-server/src/persistence.rs:125` | **Done.** `held: Vec<HeldCsr>` unchanged in shape; bounded via the count check in `authority.rs` below |
+| `libs/wayfinder-server/src/authority.rs` | **Done.** `MAX_HELD_CSRS = 128`, refuse-on-full, `warn!` on cap |
+| `libs/wayfinder-server/src/transport.rs` | **Done.** `EnrollmentLimiter` — per-IP token bucket gating `SubmitCsr` on the enrollment tier, bounded map, LRU eviction |
+| `libs/wayfinder-server/src/transport.rs` | **Done.** `own_key` moved into `AuthSnapshot`, read fresh per connection instead of computed once in `serve_tls_server` |
+| `libs/wayfinder-server/src/adapter.rs` | **Done.** `RouterAdapter::set_auth` holds `identity_seed` as `&mut Option<[u8;32]>` and writes the installed seed back through it |
+| `libs/wayfinder-driver/src/driver.rs` | **Done.** `build_auth_snapshot` reads the live identity slot to compute `own_key`; both call sites thread it through as a mutable reference instead of a copy |
+| `libs/wayfinder-server/src/authz.rs:104,147,150` | **Done.** `decide_access`'s self-key comment (§3.2) and `permits`' rewritten doc comment (§3.3) both state their actual guarantee |
+| `libs/wayfinder-server/src/adapter.rs:529` | **Done.** `anchor.verify_cert`, cert-key-vs-keypair, and (certify-in-place only) cert-MAC-vs-router-MAC, all before `persist_settings` |
+| `libs/wayfinder-server/src/authz.rs` (tests) | **Done.** Anchor-absent column; cross-anchor cert; `permits` closed set |
+| `bins/wayfinder-web/src/mock.rs` | **Done.** Token-requiring `Mock::authority` |
+| `bins/wayfinder-web/tests/enroll.rs` | **Done.** Rejection path; token-is-carried test |
+| `bins/wayfinder-web/src/components/security.rs:150,726` | Retry cap/backoff, `on_cleanup`, disable during `Waiting` — **not done, §4, out of scope for this pass** |
+| `bins/wayfinder-web/tests/render.rs:804` | Rename to describe masking, not confidentiality — **not done, §4, out of scope for this pass** |
 
 ## 8. Alternatives considered
 
