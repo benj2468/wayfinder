@@ -136,6 +136,8 @@ fn seeded_snapshot() -> NodeSnapshot {
         // `provider_snapshot` adds both together, the way a real provider has
         // them.
         enrollment: None,
+        own_ed_pubkey: vec![0x11; 32],
+        own_x_pubkey: vec![0x22; 32],
     });
     snap.metrics = Some(NodeMetrics {
         uptime_secs: 7384,
@@ -154,6 +156,12 @@ fn seeded_snapshot() -> NodeSnapshot {
     snap
 }
 
+/// The enrollment token `provider_snapshot` requires.
+///
+/// Distinctive so a test can assert it is *absent* from the rendered markup:
+/// the provider panel offers it for copying without ever drawing it.
+const PROVIDER_TOKEN: &str = "seeded-join-secret-4c71";
+
 /// The seeded snapshot as a certificate authority: an enrollment policy and a
 /// CSR queue, which a real node either has both of or neither.
 fn provider_snapshot() -> NodeSnapshot {
@@ -163,6 +171,7 @@ fn provider_snapshot() -> NodeSnapshot {
             require_approval: true,
             cert_ttl_secs: 86_400,
             enrollment_token_set: true,
+            enrollment_token: PROVIDER_TOKEN.to_string(),
         });
     }
     snap.pending_csrs = Some(ListPendingCsrsResponse { pending: vec![] });
@@ -704,6 +713,50 @@ fn security_still_offers_the_posture_switches_when_unauthenticated() {
     );
 }
 
+/// An un-enrolled node is offered the one thing that would change its
+/// situation: asking a provider to certify it. This is the counterpart to the
+/// provider's "Requests to join" panel, and on a node with no certificate it is
+/// the only control on the tab that can give it one.
+#[test]
+fn security_offers_an_unauthenticated_node_a_mesh_to_join() {
+    let mut snap = seeded_snapshot();
+    snap.security = Some(GetSecurityStatusResponse {
+        auth_enabled: false,
+        require_auth: false,
+        ..Default::default()
+    });
+    let html = render_with(Some(snap), || view! { <Security /> });
+
+    assert!(html.contains("Join a mesh"), "the panel: {html}");
+    assert!(
+        html.contains("Provider address") && html.contains("Provider key"),
+        "where the provider is, and what pins it: {html}"
+    );
+    assert!(
+        html.contains("keeps the identity and address it already has"),
+        "and says the node is not being replaced: {html}"
+    );
+    // Nothing has been asked yet, so no status is claimed.
+    assert!(!html.contains("Waiting for an operator"), "idle: {html}");
+}
+
+/// On a node that already holds a certificate the same panel is about *moving*
+/// mesh, and says so — asking a new provider replaces the membership it has,
+/// which is a different act from acquiring a first one.
+#[test]
+fn security_frames_joining_as_a_move_for_an_enrolled_node() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <Security /> });
+
+    assert!(html.contains("Move to another mesh"), "the panel: {html}");
+    assert!(
+        !html.contains("Join a mesh"),
+        "not framed as joining from nothing: {html}"
+    );
+    // Leaving a mesh is behind the same confirmation as everything else that
+    // cannot be casually walked back.
+    assert!(!html.contains("wf-modal"), "nothing armed yet: {html}");
+}
+
 /// A plain member has no enrollment policy at all, and the panel is omitted
 /// rather than rendered with defaults — "nothing to change here" and "a policy
 /// that happens to be all zeros" are different claims.
@@ -712,6 +765,139 @@ fn security_omits_the_enrollment_policy_on_a_non_provider() {
     let html = render_with(Some(seeded_snapshot()), || view! { <Security /> });
 
     assert!(!html.contains("How nodes join"), "no policy panel: {html}");
+}
+
+/// A provider shows what a joining node has to be told: where it is, the key
+/// that pins it, and the token it will be asked for. This is the other end of
+/// the "Join a mesh" panel, and the values have to be copyable because two of
+/// the three are not readable back off the screen.
+#[test]
+fn security_offers_a_provider_the_details_a_joining_node_needs() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Security /> });
+
+    assert!(
+        html.contains("What a node needs to join"),
+        "the panel: {html}"
+    );
+    assert!(
+        html.contains("Provider address") && html.contains("Provider key"),
+        "the two non-secret values: {html}"
+    );
+    // Every row offers a copy button, since none of them can be retyped
+    // reliably — the key least of all.
+    assert_eq!(
+        html.matches("wf-copy-button").count(),
+        3,
+        "address, key and token are each copyable: {html}"
+    );
+    // The address comes from the connection, not from the snapshot.
+    assert!(
+        html.contains("127.0.0.1:7700"),
+        "the address this dashboard reaches the node at: {html}"
+    );
+}
+
+/// The token is copyable without ever being drawn. A dashboard is read over
+/// someone's shoulder and pasted into chats as a screenshot; the mesh's shared
+/// secret must not be sitting in the markup.
+#[test]
+fn security_never_renders_the_enrollment_token() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Security /> });
+
+    assert!(
+        !html.contains(PROVIDER_TOKEN),
+        "the token is masked, not printed: {html}"
+    );
+    assert!(
+        html.contains("••••••••"),
+        "and something stands in its place, so the row is not read as empty: {html}"
+    );
+}
+
+/// The provider's own key is shown abbreviated — enough to tell two providers
+/// apart, not enough to retype — while the copy button carries all 64
+/// characters, which is what the far end actually parses.
+#[test]
+fn security_abbreviates_the_provider_key_it_shows() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Security /> });
+
+    // The seed's own key is 32 bytes of 0x11.
+    assert!(
+        html.contains("11111111…"),
+        "abbreviated for recognition: {html}"
+    );
+    assert!(
+        !html.contains(&"11".repeat(32)),
+        "the full key is not drawn on screen: {html}"
+    );
+}
+
+/// A plain member is offered none of it: it issues no certificates, so there is
+/// no key to pin *it* by and no token to hand out.
+#[test]
+fn security_omits_the_join_details_on_a_non_provider() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <Security /> });
+
+    assert!(
+        !html.contains("What a node needs to join"),
+        "no join details on a plain member: {html}"
+    );
+    assert!(!html.contains("wf-copy-button"), "nothing to copy: {html}");
+}
+
+/// With no token required the row says so rather than offering a copy button
+/// for an empty string — "copy the token" on a mesh with no token is an
+/// instruction that cannot be followed.
+#[test]
+fn security_says_when_there_is_no_token_to_hand_over() {
+    let mut snap = provider_snapshot();
+    if let Some(policy) = snap.security.as_mut().and_then(|s| s.enrollment.as_mut()) {
+        policy.enrollment_token_set = false;
+        policy.enrollment_token = String::new();
+    }
+    let html = render_with(Some(snap), || view! { <Security /> });
+
+    assert!(
+        html.contains("Not required"),
+        "the token row states there is none: {html}"
+    );
+    assert_eq!(
+        html.matches("wf-copy-button").count(),
+        2,
+        "only the address and the key are copyable: {html}"
+    );
+}
+
+/// A token that is *set* but whose value did not come back must never read as
+/// "no token required".
+///
+/// The two are opposite claims about whether the mesh is gated, and only one of
+/// them stops an operator looking for the token they need. `enrollment_token`
+/// being empty means only that this node did not report it — the `.proto` says
+/// so in as many words — so the authoritative flag is what the panel branches
+/// on. Inferring from emptiness is a bug this once had.
+#[test]
+fn security_does_not_read_a_withheld_token_as_an_open_mesh() {
+    let mut snap = provider_snapshot();
+    if let Some(policy) = snap.security.as_mut().and_then(|s| s.enrollment.as_mut()) {
+        policy.enrollment_token_set = true;
+        policy.enrollment_token = String::new();
+    }
+    let html = render_with(Some(snap), || view! { <Security /> });
+
+    assert!(
+        !html.contains("Not required"),
+        "a gated mesh must not be described as open: {html}"
+    );
+    assert!(
+        html.contains("did not report it"),
+        "it says the value is missing, not that none is needed: {html}"
+    );
+    assert_eq!(
+        html.matches("wf-copy-button").count(),
+        2,
+        "nothing to copy for a value the node withheld: {html}"
+    );
 }
 
 /// With no token set, the panel says enrollment is open and offers no "remove

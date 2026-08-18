@@ -905,6 +905,54 @@ body {
   flex: 0 1 auto;
 }
 
+/* A value an operator has to carry to another node: shown abbreviated or
+ * masked, copied in full. Laid out like a setting row so the two read as the
+ * same kind of thing, but with the value taking the slack — it is the part
+ * being looked at, and the button is a fixed-size afterthought. */
+.wf-copy-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--wf-space-3);
+  margin: var(--wf-space-3) 0;
+}
+
+.wf-copy-label {
+  min-width: 14ch;
+  color: var(--wf-text-muted);
+  font-size: var(--wf-text-sm);
+}
+
+/* Boxed like an input without being one: this is a value to be taken away, not
+ * a field to be edited, and making it look editable invites someone to try. */
+.wf-copy-value {
+  flex: 0 1 auto;
+  padding: var(--wf-space-2) var(--wf-space-3);
+  border: 1px solid var(--wf-border);
+  border-radius: var(--wf-radius-sm);
+  background: var(--wf-surface-raised);
+  color: var(--wf-text);
+  font-size: var(--wf-text-sm);
+  /* A masked value is a run of identical glyphs; without this it can be
+   * selected and its length measured, which is the one thing masking hides. */
+  user-select: none;
+}
+
+.wf-copy-button {
+  /* Tighter than a normal button: it sits beside the value it acts on, and a
+   * full-size one would read as the primary thing in the row. */
+  padding: var(--wf-space-1) var(--wf-space-2);
+  line-height: 1.6;
+}
+
+/* Reserves its line whether or not there is a message, so a copy does not
+ * reflow the panel under the pointer that just clicked it. */
+.wf-copy-flash {
+  min-height: 1.2em;
+  color: var(--wf-text-muted);
+  font-size: var(--wf-text-sm);
+}
+
 /* The pane scrolls, not the page — so the filter above and the tab bar stay
  * put while reading, the way they would in a terminal. */
 .wf-logs {

@@ -4973,6 +4973,7 @@ dependencies = [
  "wayfinder-protos",
  "wayfinder-server",
  "wayfinder-tls-mgmt",
+ "web-sys",
 ]
 
 [[package]]

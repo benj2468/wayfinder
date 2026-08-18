@@ -31,12 +31,16 @@
 //! setting is permanent; it shows what the node reports, and the next poll is
 //! what confirms an edit took.
 
+use std::time::Duration;
+
 use leptos::prelude::*;
 use wayfinder_protos::wayfinder::v1alpha::EnrollmentPolicyStatus;
+use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
 
 use crate::api::TokenChange;
 use crate::api::approve_csr;
 use crate::api::deny_csr;
+use crate::api::request_enrollment;
 use crate::api::revoke_node;
 use crate::api::set_enrollment_policy;
 use crate::api::set_lazy_cert_distribution;
@@ -45,7 +49,39 @@ use crate::components::dashboard::use_dashboard;
 use crate::components::widgets::Empty;
 use crate::components::widgets::Field;
 use crate::components::widgets::Panel;
+use crate::enroll::EnrollmentOutcome;
+use crate::enroll::ProviderTarget;
 use crate::format;
+
+/// How long to wait before asking a provider again about a request it is
+/// holding for approval.
+///
+/// The operator approving it is a human in another window, so this is paced for
+/// a person rather than a machine: long enough that a provider is not being
+/// hammered while someone reads the request, short enough that the node picks
+/// up its certificate while they are still watching this screen.
+const APPROVAL_POLL: Duration = Duration::from_secs(5);
+
+/// How long a copy button's "Copied" confirmation stays on screen.
+///
+/// Long enough to be read after the eye moves back from the button, short
+/// enough that it is gone before it could be mistaken for a statement about a
+/// *later* click.
+const COPY_FLASH_FOR: Duration = Duration::from_secs(3);
+
+/// The parts of the security status the "join a mesh" panel is built from:
+/// whether this node holds a certificate, and the mesh it belongs to.
+///
+/// Extracted, and deliberately narrow. Everything on this tab is re-read from a
+/// snapshot that is replaced once a second, and that panel holds an address and
+/// a token an operator is part-way through typing — so it is driven from a
+/// [`Memo`] over *this*, which only fires when the node's membership actually
+/// moves. Widening it to anything that changes on its own (a node list, a
+/// timestamp, a revocation count) would rebuild the panel on every poll and
+/// wipe the form mid-keystroke, which is a bug this once had.
+fn membership_of(sec: &GetSecurityStatusResponse) -> (bool, u32) {
+    (sec.auth_enabled, sec.mesh_id)
+}
 
 /// An action awaiting confirmation, held until the operator commits or cancels.
 #[derive(Clone, Debug, PartialEq)]
@@ -80,6 +116,65 @@ enum ActionKind {
     LazyCertDistribution(bool),
     /// Clear the shared enrollment token, opening enrollment.
     ClearEnrollmentToken,
+    /// Ask this provider to admit the node — confirmed only when the node is
+    /// already a member of some other mesh, which it would be leaving.
+    Join(ProviderTarget),
+}
+
+/// How far a request to join a mesh has got.
+///
+/// "Waiting for an operator" is a state of its own rather than an error,
+/// because it is the normal path on any provider that reviews requests: the
+/// node has asked, correctly, and someone elsewhere has to say yes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum JoinState {
+    /// Nothing has been asked yet.
+    Idle,
+    /// A request is in flight.
+    Asking,
+    /// The provider is holding the request until an operator approves it. The
+    /// target is kept so it can be asked again.
+    Waiting(ProviderTarget),
+    /// The node was admitted to the mesh with this id.
+    Joined(u32),
+    /// The provider refused, or the attempt could not be made at all.
+    Failed(String),
+}
+
+/// Ask `target` to admit this node, folding the answer into `state`.
+///
+/// A held request re-asks itself on a timer: re-submitting an identical request
+/// is how a certificate is collected once approved, and it costs the operator
+/// nothing to watch. Any failure ends the loop — retrying a rejection or a bad
+/// address would only bury the reason under repetition.
+fn ask_to_join(state: RwSignal<JoinState>, target: ProviderTarget) {
+    state.set(JoinState::Asking);
+    leptos::task::spawn_local(async move {
+        match request_enrollment(target.clone()).await {
+            Ok(EnrollmentOutcome::Enrolled { mesh_id }) => {
+                state.set(JoinState::Joined(mesh_id));
+            }
+            Ok(EnrollmentOutcome::AwaitingApproval) => {
+                state.set(JoinState::Waiting(target.clone()));
+                leptos::leptos_dom::helpers::set_timeout(
+                    move || {
+                        // Only re-ask if this is still what the screen is
+                        // waiting on: an operator who has since asked something
+                        // else must not have it overwritten by a stale timer.
+                        if matches!(state.get_untracked(), JoinState::Waiting(ref t) if *t == target)
+                        {
+                            ask_to_join(state, target.clone());
+                        }
+                    },
+                    APPROVAL_POLL,
+                );
+            }
+            Ok(EnrollmentOutcome::Rejected { reason }) => {
+                state.set(JoinState::Failed(format!("The provider refused: {reason}")));
+            }
+            Err(e) => state.set(JoinState::Failed(format!("{e}"))),
+        }
+    });
 }
 
 /// Render the Security tab.
@@ -87,6 +182,7 @@ enum ActionKind {
 pub fn Security() -> impl IntoView {
     let dash = use_dashboard();
     let (pending, set_pending) = signal::<Option<Pending>>(None);
+    let join = RwSignal::new(JoinState::Idle);
 
     let security = move || {
         dash.snapshot
@@ -98,9 +194,39 @@ pub fn Security() -> impl IntoView {
             .map(|p| p.pending)
     };
 
+    // The two panels below own operator input — a provider address, a token, a
+    // certificate lifetime — so neither may be rebuilt by a poll. A plain
+    // closure over the snapshot would construct a fresh component every second
+    // and reset its fields to empty; a `Memo` re-runs but only *notifies* when
+    // its own value changes, so the panels are rebuilt when the thing they are
+    // about changes and at no other time. See [`membership_of`].
+    let membership = Memo::new(move |_| security().as_ref().map(membership_of));
+    let enrollment = Memo::new(move |_| security().and_then(|s| s.enrollment));
+    // What a joining node must be told, on a provider: the key that pins this
+    // node and the token it will be asked for. Memoised on the same grounds,
+    // though this panel has no input of its own — it is rendered from the same
+    // poll and there is no reason to rebuild it either.
+    let join_details = Memo::new(move |_| {
+        security().and_then(|s| {
+            s.enrollment.map(|policy| {
+                (
+                    format::hex(&s.own_ed_pubkey),
+                    policy.enrollment_token,
+                    policy.enrollment_token_set,
+                )
+            })
+        })
+    });
+
     let confirm = move || {
         let Some(action) = pending.get() else { return };
         set_pending.set(None);
+        // Joining runs its own state machine rather than reporting a one-shot
+        // result, so it is dispatched before the uniform actions below.
+        if let ActionKind::Join(target) = action.kind {
+            ask_to_join(join, target);
+            return;
+        }
         leptos::task::spawn_local(async move {
             let result = match action.kind {
                 ActionKind::Approve(mac) => approve_csr(mac).await,
@@ -113,6 +239,7 @@ pub fn Security() -> impl IntoView {
                 ActionKind::ClearEnrollmentToken => {
                     set_enrollment_policy(None, None, TokenChange::Clear).await
                 }
+                ActionKind::Join(_) => unreachable!("joining is dispatched above"),
             };
             if let Err(e) = result {
                 dash.error.set(Some(format!("{} failed: {e}", action.verb)));
@@ -158,6 +285,21 @@ pub fn Security() -> impl IntoView {
                         .into_any()
                 }}
             </Panel>
+
+            {move || {
+                membership
+                    .get()
+                    .map(|(enrolled, mesh_id)| {
+                        view! {
+                            <JoinMesh
+                                enrolled=enrolled
+                                mesh_id=mesh_id
+                                state=join
+                                set_pending=set_pending
+                            />
+                        }
+                    })
+            }}
 
             <Panel title="Security settings">
                 {move || {
@@ -231,11 +373,27 @@ pub fn Security() -> impl IntoView {
             {move || {
                 // Absent on a node that is not a certificate authority — a plain
                 // member has no enrollment policy to show or to change.
-                security()
-                    .and_then(|sec| sec.enrollment)
+                enrollment
+                    .get()
                     .map(|policy| {
                         view! {
                             <EnrollmentSettings policy=policy set_pending=set_pending />
+                        }
+                    })
+            }}
+
+            {move || {
+                // Provider-only, for the same reason: a node that issues no
+                // certificates has nothing for a joining node to be given.
+                join_details
+                    .get()
+                    .map(|(node_key, token, token_set)| {
+                        view! {
+                            <ProviderJoinDetails
+                                node_key=node_key
+                                token=token
+                                token_set=token_set
+                            />
                         }
                     })
             }}
@@ -451,6 +609,340 @@ pub fn Security() -> impl IntoView {
     }
 }
 
+/// Ask a provider to admit this node to its mesh.
+///
+/// The counterpart to the "Requests to join" panel a provider shows: this is
+/// the end that asks, that one is the end that decides. On a node with no
+/// certificate this is the only control on the tab that changes anything about
+/// its membership, so it sits directly under the header that says it has none.
+///
+/// The node's own keys are what get certified — nothing is generated here, and
+/// no key material passes through the browser. The three fields are about the
+/// *provider*: where it is, which key proves it is the right one, and the
+/// token it asks for.
+#[component]
+fn JoinMesh(
+    /// Whether the node already holds a membership certificate. Joining then
+    /// means *leaving* the mesh it is in, which is what the confirmation is for.
+    enrolled: bool,
+    /// The mesh the node currently belongs to, named in that confirmation.
+    mesh_id: u32,
+    /// How far the current request has got.
+    state: RwSignal<JoinState>,
+    /// Where a staged confirmation is written for the dialog to pick up.
+    set_pending: WriteSignal<Option<Pending>>,
+) -> impl IntoView {
+    let (address, set_address) = signal(String::new());
+    let (key, set_key) = signal(String::new());
+    let (token, set_token) = signal(String::new());
+
+    let submit = move |_| {
+        let target = ProviderTarget {
+            address: address.get().trim().to_string(),
+            node_key: key.get().trim().to_string(),
+            token: token.get(),
+        };
+        if target.address.is_empty() || target.node_key.is_empty() {
+            state.set(JoinState::Failed(
+                "Enter the provider's address and its key.".to_string(),
+            ));
+            return;
+        }
+        // Asking to join while already a member replaces this node's
+        // certificate and trust anchor: it leaves one mesh for another, and
+        // stops being able to verify anyone it used to. Worth a question.
+        // Joining from nothing takes nothing away, so it just goes.
+        if enrolled {
+            set_pending.set(Some(Pending {
+                prompt: format!(
+                    "Ask this provider to admit the node? It currently belongs to mesh {mesh_id:#x}, \
+                     and being admitted elsewhere replaces that membership — it will no longer be \
+                     able to verify the nodes it is with now.",
+                ),
+                verb: "Ask to join",
+                destructive: true,
+                kind: ActionKind::Join(target),
+            }));
+        } else {
+            ask_to_join(state, target);
+        }
+    };
+
+    view! {
+        <Panel title=if enrolled { "Move to another mesh" } else { "Join a mesh" }>
+            <p class="wf-note">
+                {if enrolled {
+                    "Ask a different provider to certify this node. Its identity does not \
+                     change — it keeps the same address on the mesh — but its membership \
+                     moves."
+                } else {
+                    "This node has no certificate. Ask a provider to issue one: it keeps the \
+                     identity and address it already has, and simply becomes a verified member \
+                     of that provider's mesh."
+                }}
+            </p>
+
+            <div class="wf-setting-row">
+                <label class="wf-setting-label" for="wf-provider-address">
+                    "Provider address"
+                </label>
+                <input
+                    id="wf-provider-address"
+                    class="wf-input"
+                    type="text"
+                    placeholder="host:port"
+                    prop:value=move || address.get()
+                    on:input=move |ev| set_address.set(event_target_value(&ev))
+                />
+            </div>
+            <div class="wf-setting-row">
+                <label class="wf-setting-label" for="wf-provider-key">
+                    "Provider key"
+                </label>
+                <input
+                    id="wf-provider-key"
+                    class="wf-input wf-mono"
+                    type="text"
+                    placeholder="64 hex characters"
+                    prop:value=move || key.get()
+                    on:input=move |ev| set_key.set(event_target_value(&ev))
+                />
+            </div>
+            <div class="wf-setting-row">
+                <label class="wf-setting-label" for="wf-join-token">
+                    "Enrollment token"
+                </label>
+                <input
+                    id="wf-join-token"
+                    class="wf-input"
+                    type="password"
+                    autocomplete="off"
+                    placeholder="if the provider requires one"
+                    prop:value=move || token.get()
+                    on:input=move |ev| set_token.set(event_target_value(&ev))
+                />
+                <button
+                    class="wf-button wf-button-primary"
+                    disabled=move || matches!(state.get(), JoinState::Asking)
+                    on:click=submit
+                >
+                    "Ask to join"
+                </button>
+            </div>
+            <p class="wf-note">
+                "The key pins the provider, so nothing else can answer in its place and \
+                 enroll this node into the wrong mesh."
+            </p>
+
+            {move || match state.get() {
+                JoinState::Idle => ().into_any(),
+                JoinState::Asking => {
+                    view! { <p class="wf-note">"Asking…"</p> }.into_any()
+                }
+                JoinState::Waiting(_) => {
+                    view! {
+                        <p class="wf-note wf-status-mixed">
+                            "Waiting for an operator to approve this request on the provider. \
+                             Asking again every few seconds — leave this open."
+                        </p>
+                    }
+                        .into_any()
+                }
+                JoinState::Joined(mesh_id) => {
+                    view! {
+                        <p class="wf-note wf-status-on">
+                            {format!(
+                                "Admitted to mesh {mesh_id:#x}. The certificate is installed; the \
+                                 panels above show it from the node's next poll.",
+                            )}
+                        </p>
+                    }
+                        .into_any()
+                }
+                JoinState::Failed(reason) => {
+                    view! { <p class="wf-note wf-status-off">{reason}</p> }.into_any()
+                }
+            }}
+        </Panel>
+    }
+}
+
+/// What a node needs in order to ask *this* provider to admit it.
+///
+/// The other end of [`JoinMesh`]: that panel has three fields to fill in, and
+/// this one is where the values come from. Handing them over is otherwise a
+/// job of reading 64 hex characters aloud, or — for the token — of replacing a
+/// working secret just to learn what it was, which kicks out every node still
+/// holding the old one.
+///
+/// # Shown, hidden, and copied are three different things
+///
+/// Neither value is drawn in full. The key is abbreviated to its leading bytes,
+/// which is enough to tell two providers apart but not to retype; the token is
+/// masked outright. Both are copied to the clipboard in full. This is
+/// deliberate: a dashboard on a screen someone else can see, or in a
+/// screenshot pasted into a chat, must not be where the mesh's shared secret
+/// leaks — but an operator who is deliberately handing it on should not be
+/// fighting the UI to do it.
+#[component]
+fn ProviderJoinDetails(
+    /// This provider's own Ed25519 public key, as 64 hex characters — what the
+    /// joining node pins so nothing else can answer in this one's place.
+    node_key: String,
+    /// The shared enrollment token.  Empty means only "this node did not report
+    /// the value" — never "no token is required", which is `token_set`'s to say.
+    token: String,
+    /// Whether a token is required at all.  The authoritative flag: a node may
+    /// report a token as set without reporting the token itself, and inferring
+    /// "no token" from an empty value would tell the operator the mesh is open
+    /// when it is gated.
+    token_set: bool,
+) -> impl IntoView {
+    let dash = use_dashboard();
+    let key_shown = format::key(&hex_bytes(&node_key));
+    let key_value = node_key.clone();
+    let token_known = !token.is_empty();
+
+    view! {
+        <Panel title="What a node needs to join">
+            <p class="wf-note">
+                "These three go into the joining node's own \"Join a mesh\" panel, on its \
+                 Security tab. Copy them rather than reading them out — the key is 64 \
+                 characters and one wrong character reads as a provider that cannot be \
+                 reached."
+            </p>
+
+            // Where this dashboard reaches the node, which is the address a
+            // joining node needs too — subject to the one caveat in the note
+            // below, that the two are not always on the same network.
+            <CopyField
+                label="Provider address"
+                shown=Signal::derive(move || dash.label.get())
+                value=Signal::derive(move || dash.label.get())
+            />
+            <CopyField
+                label="Provider key"
+                shown=key_shown
+                value=key_value
+            />
+            {match (token_set, token_known) {
+                (true, true) => {
+                    view! {
+                        <CopyField
+                            label="Enrollment token"
+                            shown="••••••••"
+                            value=token.clone()
+                        />
+                    }
+                        .into_any()
+                }
+                // A token is in force but its value did not come back. Saying so
+                // is the whole point: the alternative reading — that the mesh is
+                // ungated — is both wrong and the one that stops an operator
+                // looking for the token they actually need.
+                (true, false) => {
+                    view! {
+                        <Field
+                            label="Enrollment token"
+                            value="Required, but this node did not report it — read it from \
+                                   the provider's own configuration."
+                        />
+                    }
+                        .into_any()
+                }
+                (false, _) => {
+                    view! {
+                        <Field
+                            label="Enrollment token"
+                            value="Not required — anyone in range may join"
+                        />
+                    }
+                        .into_any()
+                }
+            }}
+
+            <p class="wf-note">
+                "The address is the one this dashboard is pointed at. A node on a different \
+                 network may have to reach this one at a different address; the key and the \
+                 token do not change with it."
+            </p>
+        </Panel>
+    }
+}
+
+/// Decode hex back to bytes, for handing a key to [`format::key`].
+///
+/// The key arrives here already hex-encoded (it is what the copy button hands
+/// out), and abbreviating it means counting bytes rather than characters. A
+/// malformed pair yields no byte, so a garbled key abbreviates to something
+/// visibly wrong rather than to something plausible.
+fn hex_bytes(hex: &str) -> Vec<u8> {
+    hex.as_bytes()
+        .chunks(2)
+        .filter_map(|pair| {
+            let pair = core::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(pair, 16).ok()
+        })
+        .collect()
+}
+
+/// A value an operator has to carry somewhere else: shown abbreviated or
+/// masked, copied in full.
+///
+/// The copy button is the only way out of a masked field, so it reports what
+/// actually happened — [`crate::clipboard::copy`] answers `false` when the
+/// browser refused, and this says so rather than claiming a copy that did not
+/// happen and leaving someone to paste whatever was on the clipboard before.
+#[component]
+fn CopyField(
+    /// The field name.
+    label: &'static str,
+    /// What is drawn on screen. Never the full value when that is a secret.
+    #[prop(into)]
+    shown: Signal<String>,
+    /// What the copy button puts on the clipboard, in full.
+    #[prop(into)]
+    value: Signal<String>,
+) -> impl IntoView {
+    // `None` until a copy is attempted, then the outcome for a few seconds.
+    // Transient rather than sticky: it is feedback on one click, and a "Copied"
+    // still sitting there a minute later says nothing true about the clipboard.
+    let (flash, set_flash) = signal::<Option<&'static str>>(None);
+
+    let copy = move |_| {
+        let copied = crate::clipboard::copy(&value.get());
+        set_flash.set(Some(if copied {
+            "Copied"
+        } else {
+            "Could not copy — this browser refused clipboard access"
+        }));
+        leptos::leptos_dom::helpers::set_timeout(move || set_flash.set(None), COPY_FLASH_FOR);
+    };
+
+    view! {
+        <div class="wf-copy-row">
+            <span class="wf-copy-label">{label}</span>
+            <span class="wf-copy-value wf-mono">{move || shown.get()}</span>
+            <button
+                type="button"
+                class="wf-button wf-copy-button"
+                aria-label=format!("Copy the {label} to the clipboard")
+                title=format!("Copy the {label} to the clipboard")
+                on:click=copy
+            >
+                // The word, not a clipboard emoji: this dashboard ships in a
+                // container, and a minimal image has no emoji font — the glyph
+                // renders as a tofu box there, leaving three unlabelled
+                // buttons. Verified as exactly that in a headless browser.
+                "Copy"
+            </button>
+            <span class="wf-copy-flash" aria-live="polite">
+                {move || flash.get().unwrap_or_default()}
+            </span>
+        </div>
+    }
+}
+
 /// One node-wide posture flag, as a switch that asks before it acts.
 ///
 /// Unlike the Links tab's gates, which apply on click, both flags here can take
@@ -662,8 +1154,66 @@ fn EnrollmentSettings(
                     })}
             </div>
             <p class="wf-note">
-                "The token is never shown back — the node reports only whether one is set."
+                "What you type here is not echoed. The token currently in force can be \
+                 copied from the panel below, so setting a new one is not the way to find \
+                 out what the old one was."
             </p>
         </Panel>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wayfinder_protos::wayfinder::v1alpha::NodeSecurity;
+
+    use super::*;
+
+    /// The join panel is driven from `membership_of` precisely because it does
+    /// *not* move when the rest of the security status does. A poll arrives
+    /// once a second carrying a fresh node list and fresh timestamps; if any of
+    /// that reached the projection, the panel would be rebuilt on every one of
+    /// them and an operator would watch the address they were typing vanish.
+    #[test]
+    fn membership_ignores_everything_that_changes_on_its_own() {
+        let mut before = GetSecurityStatusResponse {
+            auth_enabled: true,
+            mesh_id: 0xBEEF,
+            ..Default::default()
+        };
+        let mut after = before.clone();
+        // Everything a quiet second on a live mesh changes anyway.
+        after.nodes.push(NodeSecurity {
+            node_id: vec![0, 0, 0, 0, 0, 7],
+            verified: true,
+            cert_not_after: 1_800_000_000,
+            revoked: false,
+        });
+        after.revocation_count = before.revocation_count + 1;
+        after.cert_not_after = 1_900_000_000;
+
+        assert_eq!(
+            membership_of(&before),
+            membership_of(&after),
+            "a poll that changes none of the membership must not move the projection"
+        );
+
+        // And the two things that *are* about membership do move it, or the
+        // panel would never notice the node being enrolled at all.
+        before.auth_enabled = false;
+        assert_ne!(membership_of(&before), membership_of(&after));
+        before.auth_enabled = true;
+        before.mesh_id = 0xF00D;
+        assert_ne!(membership_of(&before), membership_of(&after));
+    }
+
+    /// The abbreviation the provider panel shows is derived from the same hex
+    /// the copy button hands out, so the two cannot describe different keys.
+    #[test]
+    fn a_copied_key_and_its_abbreviation_agree() {
+        let key = vec![0xab; 32];
+        let hex = format::hex(&key);
+
+        assert_eq!(hex_bytes(&hex), key, "the hex round-trips");
+        assert_eq!(format::key(&hex_bytes(&hex)), format::key(&key));
     }
 }

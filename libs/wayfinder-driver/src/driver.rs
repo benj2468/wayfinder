@@ -145,6 +145,11 @@ pub struct Driver<Local: FrameIo> {
     /// restart (set via [`set_settings_store`](Self::set_settings_store)).
     /// Absent ⇒ a runtime change applies in memory only.
     settings: Option<SettingsFile>,
+    /// This node's own identity seed (set via
+    /// [`set_identity_seed`](Self::set_identity_seed)), which the management
+    /// API reports the public half of and certifies on enrollment.  Absent ⇒
+    /// the node reports no identity and can only be handed a whole new one.
+    identity_seed: Option<[u8; 32]>,
 }
 
 impl<Local: FrameIo> Driver<Local> {
@@ -218,8 +223,21 @@ impl<Local: FrameIo> Driver<Local> {
             tx_buffer: [0u8; MAX_LINK_FRAME_LEN],
             provider: None,
             settings: None,
+            identity_seed: None,
             auth_snapshot_rx: None,
         }
+    }
+
+    /// Tell the driver which identity seed this node runs as — the same one its
+    /// management TLS presents.
+    ///
+    /// The management API then reports its public half, so a client can ask a
+    /// provider to certify *this* node, and can install the certificate that
+    /// comes back without the node's identity (and therefore its MAC) changing
+    /// underneath it. Without this the node reports no identity, and a
+    /// `SetAuth` must carry a whole new one.
+    pub fn set_identity_seed(&mut self, seed: [u8; 32]) {
+        self.identity_seed = Some(seed);
     }
 
     /// Enable provider (certificate-authority) mode: the node serves enrollment
@@ -341,9 +359,11 @@ impl<Local: FrameIo> Driver<Local> {
             tx_buffer,
             provider,
             settings,
+            identity_seed,
             auth_snapshot_rx,
         } = self;
         let mac = *mac;
+        let identity_seed = *identity_seed;
 
         let output: LoopOutput = {
             tokio::select! {
@@ -371,6 +391,9 @@ impl<Local: FrameIo> Driver<Local> {
                     let mut adapter = RouterAdapter::new(&mut *router, ca, now);
                     if let Some(store) = settings.as_mut() {
                         adapter = adapter.with_settings(store as &mut dyn SettingsStore);
+                    }
+                    if let Some(seed) = identity_seed {
+                        adapter = adapter.with_identity(seed);
                     }
                     let response = WayfinderService::new(adapter).handle(request);
                     let _ = resp_tx.send(response);
@@ -520,6 +543,9 @@ impl<Local: FrameIo> Driver<Local> {
                 let mut adapter = RouterAdapter::new(&mut self.router, ca, now);
                 if let Some(store) = self.settings.as_mut() {
                     adapter = adapter.with_settings(store as &mut dyn SettingsStore);
+                }
+                if let Some(seed) = self.identity_seed {
+                    adapter = adapter.with_identity(seed);
                 }
                 let response = WayfinderService::new(adapter).handle(request);
                 let _ = resp_tx.send(response);

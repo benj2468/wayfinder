@@ -133,6 +133,19 @@ message GetSecurityStatusResponse {
   // provider (certificate-authority) mode.  Absent on a plain member, which
   // has no enrollment policy to report or to set.
   EnrollmentPolicyStatus enrollment = 9;
+
+  // This node's own Ed25519 identity public key (32 bytes), which its OGM
+  // signatures are verified against and which terminates its management TLS.
+  // Reported whether or not auth is enabled: an un-enrolled node still has an
+  // identity, and this is what a client enrolling it on its behalf puts in the
+  // CSR, so the certificate that comes back is one this node can actually use.
+  // Empty only on a node with no identity at all.
+  bytes own_ed_pubkey = 10;
+
+  // This node's own X25519 public key (32 bytes), used to derive the pairwise
+  // keys that tag its frames.  Reported on the same terms as own_ed_pubkey and
+  // bound into the same CSR.
+  bytes own_x_pubkey = 11;
 }
 
 // The enrollment policy a provider-mode node is currently applying, as
@@ -147,9 +160,23 @@ message EnrollmentPolicyStatus {
   uint64 cert_ttl_secs = 2;
 
   // Whether a shared enrollment token is configured, so a CSR must present a
-  // matching value.  The token itself is deliberately never reported: it is a
-  // shared secret, and a client that can read the policy has no need of it.
+  // matching value.  Remains the authoritative flag: enrollment_token below is
+  // a convenience for handing the secret on, and a client must not infer "no
+  // token" from an empty one.
   bool enrollment_token_set = 3;
+
+  // The shared enrollment token itself, empty when none is set.
+  //
+  // Reported so an operator can hand it to the node that is joining — the
+  // provider's dashboard is where the token lives, and the alternative is
+  // replacing a working token just to learn it.  This deliberately reverses an
+  // earlier rule that never reported it.  What makes it safe is who can ask:
+  // GetSecurityStatus is reachable only by a client authenticated as an admin
+  // or as this node itself, which are exactly the clients that may already
+  // replace or clear the token through SetConfig, so disclosure confers nothing
+  // they did not have.  An enrollment-tier connection cannot reach this request
+  // at all (see wayfinder-server's authz::permits).
+  string enrollment_token = 4;
 }
 
 // Request recent log records from the node's bounded in-memory ring.
@@ -294,6 +321,14 @@ message ResolveRouteRequest {
 message SetAuthRequest {
   // The node's 32-byte Ed25519 identity seed, as raw bytes.  Secret: it *is*
   // the node's identity.
+  //
+  // May be empty, which means "certify the identity I already have": the node
+  // keeps its current seed and installs only the certificate and trust anchor.
+  // That is what online enrollment sends, and it is not merely a convenience —
+  // a node's MAC is derived from its seed and read once at startup, so handing
+  // it a *new* identity while it runs leaves it signing frames under a
+  // certificate bound to a MAC its peers do not know it by, until it restarts.
+  // Certifying the existing key changes nothing about who the node is.
   bytes seed = 1;
   // The node's membership certificate, as raw `MembershipCert` bytes (signed
   // by the mesh root).

@@ -196,12 +196,21 @@ impl CertAuthority {
     }
 
     /// The enrollment policy currently in force, for the management API to
-    /// report. Never carries the token itself — only whether one is set.
+    /// report.
+    ///
+    /// Carries the token itself as well as whether one is set: the operator
+    /// running this provider is the one who has to hand that token to a node
+    /// that is joining, and the only alternative — replacing a working token
+    /// just to learn it — kicks every node still holding the old one. It
+    /// travels no further than a client already authenticated as an admin or as
+    /// this node, which is a client that could replace the token anyway; see
+    /// the `.proto` field comment.
     pub fn enrollment_policy(&self) -> EnrollmentPolicyStatusData {
         EnrollmentPolicyStatusData {
             require_approval: self.require_approval,
             cert_ttl_secs: self.cert_ttl_secs,
             enrollment_token_set: self.enrollment_token.is_some(),
+            enrollment_token: self.enrollment_token.clone(),
         }
     }
 
@@ -1549,13 +1558,51 @@ mod tests {
         assert!(policy.enrollment_token_set);
     }
 
-    /// The token's *value* never leaves the authority — only whether one is
-    /// set. A client that can read the policy has no need of the secret.
+    /// The policy carries the token itself, so the operator running a provider
+    /// can hand it to a node that is joining without replacing a working token
+    /// just to learn what it is.
+    ///
+    /// It reaches only a client already authenticated as an admin or as this
+    /// node — one that may replace or clear the token anyway — so the report
+    /// grants nothing it did not already have.
+    #[test]
+    fn enrollment_policy_carries_the_token_for_an_operator_to_hand_on() {
+        let ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, Some("hunter2".into()), true);
+
+        assert_eq!(
+            ca.enrollment_policy().enrollment_token.as_deref(),
+            Some("hunter2")
+        );
+    }
+
+    /// With no token set there is no value to report, and the flag says so —
+    /// the two must not disagree, since a client reads the flag to decide
+    /// whether the mesh is gated at all.
     #[test]
     fn enrollment_policy_reports_an_absent_token_as_unset() {
         let ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
 
-        assert!(!ca.enrollment_policy().enrollment_token_set);
+        let policy = ca.enrollment_policy();
+        assert!(!policy.enrollment_token_set);
+        assert_eq!(policy.enrollment_token, None);
+    }
+
+    /// A token installed at runtime is reported back, not just recorded: this
+    /// is the path the dashboard's "Set token" takes, and an operator who sets
+    /// one there must be able to copy it afterwards.
+    #[test]
+    fn a_runtime_token_is_reported_back() {
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
+
+        ca.set_enrollment_policy(&EnrollmentPolicyData {
+            enrollment_token: Some(TokenUpdate::Set("let-me-in".into())),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let policy = ca.enrollment_policy();
+        assert!(policy.enrollment_token_set);
+        assert_eq!(policy.enrollment_token.as_deref(), Some("let-me-in"));
     }
 
     /// An update names only what it changes; everything else stays as it was.

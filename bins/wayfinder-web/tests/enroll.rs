@@ -1,0 +1,201 @@
+//! Joining a mesh from the dashboard, against a real provider.
+//!
+//! The workflow this exists for, end to end: an open node's dashboard asks a
+//! certificate authority to admit it, an operator approves the request on the
+//! authority's own dashboard, and the node comes back holding a certificate —
+//! without ever having changed identity.
+//!
+//! Both ends are the production stack. The node and the authority each run the
+//! real `wayfinder-server` TLS listener, the authority runs the real
+//! `CertAuthority`, and the request travels the real management protocol, so
+//! what is under test is the whole path rather than a stub of it.
+
+#![cfg(feature = "mock-node")]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod common;
+
+use std::sync::Arc;
+
+use wayfinder_client::Client;
+use wayfinder_client::Identity;
+use wayfinder_web::conn::NodeConnection;
+use wayfinder_web::enroll::EnrollmentOutcome;
+use wayfinder_web::enroll::ProviderTarget;
+use wayfinder_web::enroll::request;
+use wayfinder_web::mock::MOCK_MESH_ID;
+use wayfinder_web::mock::Mock;
+
+/// Start an authority and describe it the way the dashboard's form does: an
+/// address, a pinned key as hex, and a token.
+async fn serve_authority(require_approval: bool) -> ProviderTarget {
+    let (addr, node_key) =
+        wayfinder_web::mock::serve_mock_node_with(Mock::authority(require_approval)).await;
+    ProviderTarget {
+        address: addr.to_string(),
+        node_key: node_key.iter().map(|b| format!("{b:02x}")).collect(),
+        token: String::new(),
+    }
+}
+
+/// The node's security posture as it reports it right now.
+async fn posture(
+    conn: &NodeConnection,
+) -> wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse {
+    conn.run(async |client| client.security_status().await)
+        .await
+        .unwrap()
+}
+
+/// Approve the one request an authority is holding, the way an operator does
+/// from its own dashboard.
+async fn approve_the_pending_request(target: &ProviderTarget) {
+    let mut admin = Client::connect_tls(
+        target.address.parse().unwrap(),
+        &hex(&target.node_key),
+        // The authority's own key: full management access, which is what the
+        // operator's dashboard has.
+        &Identity {
+            seed: wayfinder_web::mock::NODE_SEED,
+            cert: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let pending = admin.list_pending_csrs().await.unwrap();
+    assert_eq!(pending.pending.len(), 1, "one node is waiting to join");
+    admin
+        .approve_csr(&pending.pending[0].node_mac)
+        .await
+        .unwrap();
+}
+
+/// Decode a 64-character hex key back to bytes.
+fn hex(s: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
+    }
+    out
+}
+
+/// An authority that signs on submission admits the node in one step, and the
+/// node comes back a member of that mesh.
+#[tokio::test]
+async fn an_open_node_joins_a_mesh_and_reports_itself_a_member() {
+    let node: Arc<NodeConnection> = common::serve_unauthenticated_mock_node().await;
+    let provider = serve_authority(false).await;
+
+    let before = posture(&node).await;
+    assert!(!before.auth_enabled, "the node starts with no certificate");
+
+    let outcome = request(&node, &provider).await.unwrap();
+    assert_eq!(
+        outcome,
+        EnrollmentOutcome::Enrolled {
+            mesh_id: MOCK_MESH_ID
+        }
+    );
+
+    let after = posture(&node).await;
+    assert!(after.auth_enabled, "the certificate was installed");
+    assert_eq!(after.mesh_id, MOCK_MESH_ID);
+}
+
+/// The property the whole design turns on: enrolling certifies the identity the
+/// node already had. Its keys are untouched, and the certificate it now holds
+/// is bound to the MAC its peers already know it by — so joining a mesh does
+/// not move it, and nothing has to restart for the two to agree.
+#[tokio::test]
+async fn joining_certifies_the_identity_the_node_already_had() {
+    let node = common::serve_unauthenticated_mock_node().await;
+    let provider = serve_authority(false).await;
+
+    let before = posture(&node).await;
+    let node_mac = node
+        .run(async |client| client.node_info().await)
+        .await
+        .unwrap()
+        .node_id;
+
+    request(&node, &provider).await.unwrap();
+
+    let after = posture(&node).await;
+    assert_eq!(
+        after.own_ed_pubkey, before.own_ed_pubkey,
+        "the node kept its own identity key"
+    );
+    assert_eq!(after.own_x_pubkey, before.own_x_pubkey);
+    assert_eq!(
+        after.node_mac, node_mac,
+        "the certificate is bound to the address the node was already running under"
+    );
+}
+
+/// The path with a person in the middle, which is the one an authority is
+/// normally configured for: the request is parked, the dashboard reports that
+/// rather than a failure, and asking again after an operator approves collects
+/// the certificate.
+#[tokio::test]
+async fn a_held_request_is_collected_once_an_operator_approves_it() {
+    let node = common::serve_unauthenticated_mock_node().await;
+    let provider = serve_authority(true).await;
+
+    assert_eq!(
+        request(&node, &provider).await.unwrap(),
+        EnrollmentOutcome::AwaitingApproval,
+        "waiting for a person is an outcome, not an error"
+    );
+    assert!(
+        !posture(&node).await.auth_enabled,
+        "nothing is installed while the request is only pending"
+    );
+
+    // Asking again before anyone approves must not queue a second request, and
+    // must not start looking like progress.
+    assert_eq!(
+        request(&node, &provider).await.unwrap(),
+        EnrollmentOutcome::AwaitingApproval
+    );
+
+    approve_the_pending_request(&provider).await;
+
+    assert_eq!(
+        request(&node, &provider).await.unwrap(),
+        EnrollmentOutcome::Enrolled {
+            mesh_id: MOCK_MESH_ID
+        },
+        "the same request, re-submitted, is how the certificate is collected"
+    );
+    assert!(posture(&node).await.auth_enabled);
+}
+
+/// A mistyped provider key is named as such, before anything is opened — not
+/// surfaced later as a handshake failure against a provider that is fine.
+#[tokio::test]
+async fn a_malformed_provider_key_is_reported_as_one() {
+    let node = common::serve_unauthenticated_mock_node().await;
+    let mut provider = serve_authority(false).await;
+    provider.node_key = "not-a-key".to_string();
+
+    let err = format!("{:#}", request(&node, &provider).await.unwrap_err());
+    assert!(err.contains("64 hex characters"), "got: {err}");
+    assert!(!posture(&node).await.auth_enabled);
+}
+
+/// Pinning is what stops a stranger answering in the provider's place and
+/// enrolling the node into a mesh of its own: a key that is well-formed but
+/// wrong fails the handshake, and nothing is installed.
+#[tokio::test]
+async fn a_provider_that_does_not_match_its_pinned_key_is_refused() {
+    let node = common::serve_unauthenticated_mock_node().await;
+    let mut provider = serve_authority(false).await;
+    provider.node_key = "aa".repeat(32);
+
+    assert!(request(&node, &provider).await.is_err());
+    assert!(
+        !posture(&node).await.auth_enabled,
+        "nothing is installed from a provider that could not be verified"
+    );
+}

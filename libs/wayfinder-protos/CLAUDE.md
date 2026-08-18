@@ -56,13 +56,16 @@ fails at the adapter.
 `request_is_mutation` tags a request kind as a write, and its **only** consumer
 is the `info!` audit line in `handle`. It is not an authorization gate.
 
-Authorization is **connection-level**, decided once: `wayfinder-server`'s
-transport runs `decide_access` after the TLS handshake and either admits or
-refuses the whole connection (`transport.rs`). An admitted client may invoke
-every request kind. So adding a mutating request does not require an authz
+Authorization is **admission-level**: `wayfinder-server`'s transport runs
+`decide_access` after the TLS handshake and either admits or refuses the whole
+connection (`transport.rs`). A client admitted on either full grant may invoke
+every request kind, so adding a mutating request does not require an authz
 change — but do add it to `request_is_mutation` (and to
 `request_is_mutation_classifies_writes_vs_reads`) or the write lands with no
 audit trail.
 
-If per-request privilege ever becomes a requirement, this function is the
-natural seam — but today, do not read it as one.
+The one exception is the enrollment tier: a connection that presented no
+membership certificate is admitted solely to enroll, and `authz::permits` — not
+this function — is what confines it. A new request kind is refused there by
+default, which is the right default; widen `permits` only for something a node
+with no certificate genuinely has to be able to do.

@@ -26,6 +26,15 @@ pub async fn serve_mock_provider_node() -> Arc<NodeConnection> {
     connect(wayfinder_web::mock::serve_mock_provider_node().await)
 }
 
+/// Start the stand-in node with mesh authentication switched off — a node with
+/// an identity but no certificate, which is what asks to join a mesh.
+pub async fn serve_unauthenticated_mock_node() -> Arc<NodeConnection> {
+    connect(
+        wayfinder_web::mock::serve_mock_node_with(wayfinder_web::mock::Mock::unauthenticated())
+            .await,
+    )
+}
+
 /// Wrap a bound mock node's address and pinned key in a connection.
 fn connect((addr, node_key): (std::net::SocketAddr, [u8; 32])) -> Arc<NodeConnection> {
     Arc::new(NodeConnection::new(Target::Tls(Endpoint {

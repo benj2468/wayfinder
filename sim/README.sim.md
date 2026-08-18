@@ -274,7 +274,7 @@ its first instant — which also makes its MAC (derived from that seed)
 reproducible across runs.
 
 Nothing enrols at runtime. An earlier version had each node generate a key at
-startup and enrol against the provider over the management API; once that API
+startup and enroll against the provider over the management API; once that API
 required an authenticated TLS handshake, that stopped being possible — a node
 with no certificate cannot open the connection it would use to request one. So
 **online enrollment and the CSR-approval flow are not exercised here**, even

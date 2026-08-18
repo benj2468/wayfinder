@@ -170,12 +170,30 @@ async fn spawn_provider(token: Option<String>) -> Endpoint {
 /// return an [`Endpoint`] that bootstraps against it (the node is un-enrolled at
 /// the transport layer, so proving its own key is admitted).
 async fn spawn_provider_with(token: Option<String>, require_approval: bool) -> Endpoint {
+    spawn_provider_full(token, require_approval, false).await
+}
+
+/// Spawn a provider node, and choose whether it is *itself* enrolled — whether
+/// its transport reports a trust anchor, which is what a real certificate
+/// authority looks like (it is a member of the mesh it certifies).
+///
+/// The returned endpoint's identity differs accordingly: against an un-enrolled
+/// provider it presents the node's own key, and against an enrolled one it
+/// presents a freshly-minted key with no certificate at all — a stranger, which
+/// is exactly what a node asking to join is.
+async fn spawn_provider_full(
+    token: Option<String>,
+    require_approval: bool,
+    provider_enrolled: bool,
+) -> Endpoint {
     // The node's TLS identity seed; the bootstrap client presents this same key.
     let seed = [9u8; 32];
     let node_key = Keypair::from_seed(&seed).ed_pubkey();
 
     let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, token, require_approval);
     ca.set_now_unix(100);
+    let anchor =
+        provider_enrolled.then(|| TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap());
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -183,13 +201,13 @@ async fn spawn_provider_with(token: Option<String>, require_approval: bool) -> E
     let (query_tx, mut query_rx) =
         mpsc::channel::<(WayfinderRequest, oneshot::Sender<WayfinderResponse>)>(16);
 
-    // Auth snapshot responder: un-enrolled (no anchor), nothing revoked — so the
-    // client bootstrapping with the node's own key is granted.
+    // Auth snapshot responder: nothing revoked, and an anchor only when the
+    // provider is enrolled.
     let (snapshot_tx, mut snapshot_rx) = mpsc::channel::<oneshot::Sender<AuthSnapshot>>(4);
     tokio::spawn(async move {
         while let Some(reply) = snapshot_rx.recv().await {
             let _ = reply.send(AuthSnapshot {
-                anchor: None,
+                anchor,
                 revoked: Vec::new(),
             });
         }
@@ -209,10 +227,76 @@ async fn spawn_provider_with(token: Option<String>, require_approval: bool) -> E
         addr,
         node_key,
         identity: Identity {
-            seed,
+            // A stranger's key against an enrolled provider; the node's own key
+            // (the bootstrap path) against an un-enrolled one.
+            seed: if provider_enrolled { [4u8; 32] } else { seed },
             cert: Vec::new(),
         },
     }
+}
+
+/// The case online enrollment actually has to serve: the provider is itself an
+/// enrolled member of the mesh it certifies, and the node asking to join holds
+/// nothing — no certificate, no relationship to the provider at all. It gets to
+/// submit its CSR anyway, and comes away with a certificate that verifies.
+///
+/// This is what a self-service "join this mesh" is made of. Before the
+/// enrollment grant it could not happen: the provider's management API admitted
+/// only admins, so a node with no certificate could never open the connection
+/// that would have got it one.
+#[tokio::test]
+async fn a_node_with_no_certificate_can_enroll_with_an_enrolled_provider() {
+    let endpoint = spawn_provider_full(None, false, true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let anchor_path = dir.path().join("anchor");
+    let cert_path = dir.path().join("cert");
+
+    run_query(
+        Command::Enroll {
+            mac: Some("02:00:00:00:00:09".into()),
+            token: String::new(),
+            out_seed: dir.path().join("seed"),
+            out_cert: cert_path.clone(),
+            out_anchor: anchor_path.clone(),
+        },
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .expect("a stranger may enroll");
+
+    let anchor = TrustAnchor::from_bytes(&std::fs::read(&anchor_path).unwrap()).unwrap();
+    let cert = MembershipCert::from_bytes(&std::fs::read(&cert_path).unwrap()).unwrap();
+    anchor.verify_cert(&cert, 500).expect("cert verifies");
+}
+
+/// The other half of the enrollment grant: it enrolls and nothing more. The
+/// same stranger that just submitted a CSR cannot read the provider's state or
+/// approve its own request.
+#[tokio::test]
+async fn an_enrolling_node_cannot_do_anything_but_enroll() {
+    let endpoint = spawn_provider_full(None, true, true).await;
+
+    let err = run_query(Command::ListCerts, &endpoint, OutputFormat::Human)
+        .await
+        .unwrap_err();
+    let err = format!("{err:#}");
+    assert!(err.contains("limited to enrollment"), "got: {err}");
+
+    let err = run_query(
+        Command::Csr(CsrCommand::Approve {
+            mac: "02:00:00:00:00:09".into(),
+        }),
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .unwrap_err();
+    let err = format!("{err:#}");
+    assert!(
+        err.contains("limited to enrollment"),
+        "a node must not approve its own request: {err}"
+    );
 }
 
 #[tokio::test]

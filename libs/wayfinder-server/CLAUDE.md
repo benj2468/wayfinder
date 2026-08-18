@@ -56,15 +56,34 @@ Deliberately separated, and the boundary matters:
   (`decide_access` → `MgmtAccess`), with no transport and no crypto, so the
   policy is unit-testable standalone and identical across transports.
 
-Two grant paths: `GrantedAdmin` (a verified, non-revoked admin cert bound to the
-handshake key) and `GrantedBootstrap` (the node is un-enrolled and the client
-proved possession of the node's *own* key — how you configure a fresh node).
+Three grant tiers:
 
-**The decision is per-connection, not per-request.** Once admitted, a client may
-invoke every request kind. Denials return a deliberately generic
+- `GrantedAdmin` — a verified, non-revoked admin cert bound to the handshake key.
+- `GrantedSelfKey` — the client proved possession of the node's *own* key. How
+  you configure a fresh node, and it holds **whether or not the node is
+  enrolled**: whoever has that seed already is the node on the mesh, and a
+  dashboard that reached an un-enrolled node has no other credential it could
+  hold, so revoking this at the moment of enrollment would lock out the operator
+  who just enrolled it. (An earlier rule did exactly that; the reversal is
+  deliberate and documented on `decide_access`.)
+- `GrantedEnrollment` — the client presented no cert at all. Admitted, but
+  `permits` confines it to `SubmitCsr` and `GetTrustAnchor`.
+
+**Admission is per-connection; what an admitted client may invoke is
+per-request.** The first two tiers may invoke everything, so `permits` is really
+the definition of the third. That third tier exists because enrollment is
+otherwise impossible: a provider worth enrolling with is itself an enrolled
+member, so a node with no cert could never open the connection carrying its CSR.
+Admission control for it has not moved — it is the provider's enrollment token
+and the operator's approval.
+
+Denials (a cert that failed) return a deliberately generic
 `"authentication denied"` over the wire while the precise reason stays in a
 local `warn!` — an unauthenticated peer must not get an oracle distinguishing
-wrong-key / revoked / expired / not-admin.
+wrong-key / revoked / expired / not-admin. A *per-request* refusal on an
+enrollment connection does say why: that peer is already admitted and learns
+nothing it could not learn by trying, while a client that merely forgot its
+certificate would otherwise see every request fail with no explanation.
 
 ## Provider mode (the CA)
 

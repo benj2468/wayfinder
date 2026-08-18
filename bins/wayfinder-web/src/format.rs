@@ -147,6 +147,16 @@ pub fn key(bytes: &[u8]) -> String {
     }
 }
 
+/// Render bytes as unabbreviated lowercase hex.
+///
+/// The counterpart to [`key`], for the other job a key has: [`key`] abbreviates
+/// one for a human to *recognise*, this renders one for a human to *carry* —
+/// into another node's "provider key" field, where all 32 bytes have to arrive
+/// or the handshake fails. Never truncates, for that reason.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Render a record's uptime as a right-aligned seconds stamp.
 ///
 /// Right-aligned so the seconds column stays put as a node's uptime grows, and
@@ -431,6 +441,18 @@ mod tests {
     fn key_of_a_short_value_is_not_marked_truncated() {
         assert_eq!(key(&[0xde, 0xad]), "dead");
         assert_eq!(key(&[]), "—");
+    }
+
+    /// What a copied key must be: all 32 bytes, lowercase, no separators and no
+    /// ellipsis — the exact 64 characters `enroll::parse_node_key` accepts on
+    /// the other end. A key that arrived abbreviated would fail the handshake
+    /// and read as an unreachable provider.
+    #[test]
+    fn hex_renders_a_whole_key_for_pasting() {
+        assert_eq!(hex(&[0xab; 32]), "ab".repeat(32));
+        assert_eq!(hex(&[0xab; 32]).len(), 64);
+        assert_eq!(hex(&[0x00, 0x0f, 0xff]), "000fff", "leading zeroes kept");
+        assert_eq!(hex(&[]), "");
     }
 
     #[test]

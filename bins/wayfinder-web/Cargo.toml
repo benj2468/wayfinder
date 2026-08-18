@@ -60,6 +60,19 @@ console_error_panic_hook = { version = "0.1", optional = true }
 # pins the matching `wasm-bindgen-cli_0_2_126`; bump both together or the
 # hydrate build fails with a version-mismatch error.
 wasm-bindgen = { version = "=0.2.126", optional = true }
+# Depended on explicitly, though `leptos` already pulls it in: the features are
+# additive and `src/clipboard.rs` needs two that leptos's own set does not
+# happen to enable. Listing them here means a leptos upgrade that trims its
+# features cannot silently break the copy buttons.
+web-sys = { version = "0.3", optional = true, features = [
+  "Document",
+  "Element",
+  "HtmlDocument",
+  "HtmlElement",
+  "HtmlTextAreaElement",
+  "Node",
+  "Window",
+] }
 
 [features]
 # Deliberately empty: a bare `cargo build --workspace` then compiles a stub
@@ -82,7 +95,12 @@ ssr = [
   "leptos_meta/ssr",
   "leptos_router/ssr",
 ]
-hydrate = ["dep:console_error_panic_hook", "dep:wasm-bindgen", "leptos/hydrate"]
+hydrate = [
+  "dep:console_error_panic_hook",
+  "dep:wasm-bindgen",
+  "dep:web-sys",
+  "leptos/hydrate",
+]
 # A canned stand-in node (`src/mock.rs`), so the dashboard can be developed and
 # tested without hardware or a running mesh. Off by default — a development
 # tool, in the same spirit as `libs/rylr998-sim`, with no business in a release
