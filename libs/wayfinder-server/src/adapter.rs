@@ -96,6 +96,16 @@ pub struct RouterAdapter<
     /// restart.  Absent on a node with no runtime state configured (and on
     /// every embedded node), where a change applies in memory only.
     settings: Option<&'a mut dyn SettingsStore>,
+    /// This node's own identity seed — the one its management TLS terminates
+    /// on, which is also its mesh identity once it holds a certificate.
+    ///
+    /// Held here rather than read from the router's auth state because the two
+    /// operations that need it happen precisely when there is no auth state to
+    /// read: reporting the keys an un-enrolled node wants certified, and
+    /// installing the certificate that comes back.  Absent where the host did
+    /// not supply one, which makes both of those report "no identity" rather
+    /// than guess at one.
+    identity_seed: Option<[u8; 32]>,
 }
 
 impl<
@@ -153,7 +163,20 @@ impl<
             now,
             ca,
             settings: None,
+            identity_seed: None,
         }
+    }
+
+    /// Tell the adapter which identity seed this node runs as, so it can report
+    /// the public half (for a client enrolling this node) and certify it when a
+    /// certificate for it arrives.
+    ///
+    /// A builder step for the same reason as [`with_settings`](Self::with_settings):
+    /// most callers have no seed to offer — an embedded node keeps its own, and
+    /// a test that only reads router state has none at all.
+    pub fn with_identity(mut self, seed: [u8; 32]) -> Self {
+        self.identity_seed = Some(seed);
+        self
     }
 
     /// Record accepted security settings in `settings` so they survive a
@@ -352,10 +375,23 @@ impl<
         // not auth is enabled: `require_auth` on a node with no cert is
         // precisely the state that keeps it off the mesh, so a dashboard that
         // hid it while auth was disabled would hide the reason.
+        // The identity is likewise reported whether or not auth is enabled: an
+        // un-enrolled node still has one, and reporting it is what lets a
+        // client ask a provider to certify *this* node rather than mint some
+        // new identity the node would then have to adopt.
+        let identity = self.identity_seed.map(|seed| Keypair::from_seed(&seed));
         let posture = SecurityStatusData {
             require_auth: self.router.require_auth(),
             lazy_cert_distribution: self.router.lazy_cert_distribution(),
             enrollment: self.ca.as_ref().map(|ca| ca.enrollment_policy()),
+            own_ed_pubkey: identity
+                .as_ref()
+                .map(|kp| kp.ed_pubkey().to_vec())
+                .unwrap_or_default(),
+            own_x_pubkey: identity
+                .as_ref()
+                .map(|kp| kp.x_pubkey().to_vec())
+                .unwrap_or_default(),
             ..SecurityStatusData::default()
         };
 
@@ -491,10 +527,21 @@ impl<
     }
 
     fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String> {
-        let key_pair = Keypair::from_seed(
+        // An empty seed means "certify the identity I already have" — the
+        // enrollment case, where the point is that the node's key (and so its
+        // MAC) does not change. Anything else is a new identity being installed
+        // wholesale, which the node adopts as given.
+        let seed: [u8; 32] = if seed.is_empty() {
+            self.identity_seed.ok_or_else(|| {
+                "this node has no identity to certify; send the seed alongside the \
+                 certificate"
+                    .to_string()
+            })?
+        } else {
             seed.try_into()
-                .map_err(|_| "seed must be exactly 32 bytes".to_string())?,
-        );
+                .map_err(|_| "seed must be exactly 32 bytes".to_string())?
+        };
+        let key_pair = Keypair::from_seed(&seed);
         let parsed_cert = MembershipCert::from_bytes(cert)
             .ok_or_else(|| "unable to parse membership cert".to_string())?;
         let anchor = TrustAnchor::from_bytes(trust_anchor)
@@ -1715,6 +1762,92 @@ mod tests {
         assert_eq!(identity.seed, [3u8; 32].to_vec());
         assert_eq!(identity.cert, cert);
         assert_eq!(identity.trust_anchor, anchor);
+    }
+
+    /// Online enrollment needs to name the keys it is asking a provider to
+    /// certify, so the node reports them — and reports them *before* it is
+    /// enrolled, which is the only moment at which they are needed.
+    #[test]
+    fn security_status_reports_the_identity_of_an_un_enrolled_node() {
+        let mut router = CentralRouter::new(mac(1));
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+
+        let status = RouterAdapter::new(&mut router, None, Duration::ZERO)
+            .with_identity([3; 32])
+            .security_status();
+
+        assert!(!status.auth_enabled, "no certificate yet");
+        assert_eq!(status.own_ed_pubkey, kp.ed_pubkey().to_vec());
+        assert_eq!(status.own_x_pubkey, kp.x_pubkey().to_vec());
+    }
+
+    /// A node whose identity was never handed to the adapter reports none,
+    /// rather than an empty key that would look like a real one.
+    #[test]
+    fn security_status_reports_no_identity_when_the_node_has_none() {
+        let mut router = CentralRouter::new(mac(1));
+
+        let status = RouterAdapter::new(&mut router, None, Duration::ZERO).security_status();
+
+        assert!(status.own_ed_pubkey.is_empty());
+        assert!(status.own_x_pubkey.is_empty());
+    }
+
+    /// The install half of online enrollment: a certificate arrives for the key
+    /// the node already has, with no seed. The node keeps its identity — and so
+    /// its MAC, which is derived from it — and simply becomes authenticated.
+    #[test]
+    fn set_auth_without_a_seed_certifies_the_existing_identity() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+        ca.set_now_unix(1_000);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        // Bound to the MAC the node is *running* under, not the one its key
+        // derives to: that is what an enrolling node asks for, since its
+        // address on the mesh must not change underneath it.
+        let cert = ca_issue(&mut ca, mac(1).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
+        let anchor = ca.trust_anchor_bytes();
+        let mut store = RecordingStore::default();
+
+        RouterAdapter::new(&mut router, None, Duration::ZERO)
+            .with_identity([3; 32])
+            .with_settings(&mut store)
+            .set_auth(&[], &cert, &anchor)
+            .unwrap();
+
+        assert!(router.auth().is_some(), "the node is now authenticated");
+        let identity = store
+            .settings()
+            .identity
+            .clone()
+            .expect("the identity was recorded");
+        assert_eq!(
+            identity.seed,
+            [3u8; 32].to_vec(),
+            "the seed it already had is what gets recorded, so the next boot \
+             comes up as the same node"
+        );
+        assert_eq!(identity.cert, cert);
+    }
+
+    /// Asking a node to certify an identity it does not have is refused with a
+    /// reason, rather than silently installing a certificate for some key
+    /// nobody holds.
+    #[test]
+    fn set_auth_without_a_seed_needs_an_identity_to_certify() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+        ca.set_now_unix(1_000);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let cert = ca_issue(&mut ca, mac(1).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
+        let anchor = ca.trust_anchor_bytes();
+
+        let err = RouterAdapter::new(&mut router, None, Duration::ZERO)
+            .set_auth(&[], &cert, &anchor)
+            .expect_err("no identity to certify");
+
+        assert!(err.contains("identity"), "got: {err}");
+        assert!(router.auth().is_none());
     }
 
     /// Malformed identity material is rejected before anything is written, so

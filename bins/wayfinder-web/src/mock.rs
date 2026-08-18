@@ -41,6 +41,31 @@ use wayfinder_protos::service::WayfinderDataProvider;
 use wayfinder_protos::service::WayfinderService;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderResponse;
+use wayfinder_server::MeshAuthority;
+
+/// The mock node's own Ed25519 identity key, as reported by
+/// `GetSecurityStatus`.
+///
+/// A distinguishable constant rather than zeroes: what a client enrolling this
+/// node sends in its CSR is precisely these bytes, so a test can assert the
+/// request named the *node's* keys and not something invented along the way.
+const MOCK_ED_PUBKEY: [u8; 32] = [0x11; 32];
+
+/// The mock node's own X25519 key; see [`MOCK_ED_PUBKEY`].
+const MOCK_X_PUBKEY: [u8; 32] = [0x22; 32];
+
+/// The mesh root seed of [`Mock::authority`]. A test fixture, never a real key.
+const MESH_ROOT_SEED: [u8; 32] = [0x33; 32];
+
+/// The mesh id [`Mock::authority`] certifies for.
+pub const MOCK_MESH_ID: u32 = 0xBEEF;
+
+/// The enrollment token [`Mock::provider`] requires.
+///
+/// Distinctive on purpose: the provider panel copies this value without ever
+/// rendering it, so a test asserts on its *absence* from the markup. A token of
+/// "token" would match too much to prove anything.
+pub const MOCK_ENROLLMENT_TOKEN: &str = "mock-join-secret-9f3a";
 
 /// A provider with one originator, one link-quality row and one interface, so
 /// every field a snapshot reads has a distinguishable value to land in.
@@ -62,6 +87,15 @@ pub struct Mock {
     /// while refusing to list requests would let the dashboard get the
     /// combination wrong without any test noticing.
     pending_csrs: Option<Vec<PendingCsrData>>,
+    /// A real certificate authority, on the flavor that has one
+    /// ([`Mock::authority`]).
+    ///
+    /// The canned `pending_csrs` above are enough to *render* a provider, but
+    /// not to be one: enrollment is a conversation — submit, park, approve,
+    /// collect — and a canned answer cannot hold state across it. So the flavor
+    /// that an enrolling node talks to runs the production `CertAuthority` and
+    /// really signs.
+    ca: Option<wayfinder_server::CertAuthority>,
 }
 
 impl Default for Mock {
@@ -83,8 +117,11 @@ impl Default for Mock {
                 require_auth: true,
                 lazy_cert_distribution: false,
                 enrollment: None,
+                own_ed_pubkey: MOCK_ED_PUBKEY.to_vec(),
+                own_x_pubkey: MOCK_X_PUBKEY.to_vec(),
             },
             pending_csrs: None,
+            ca: None,
         }
     }
 }
@@ -110,8 +147,14 @@ impl Mock {
                 require_auth: false,
                 lazy_cert_distribution: false,
                 enrollment: None,
+                // An un-enrolled node still has an identity of its own — that
+                // is exactly what it asks a provider to certify — so this is
+                // populated even though every other identity field is empty.
+                own_ed_pubkey: MOCK_ED_PUBKEY.to_vec(),
+                own_x_pubkey: MOCK_X_PUBKEY.to_vec(),
             },
             pending_csrs: None,
+            ca: None,
         }
     }
 
@@ -127,6 +170,7 @@ impl Mock {
                     require_approval: true,
                     cert_ttl_secs: 86_400,
                     enrollment_token_set: true,
+                    enrollment_token: Some(MOCK_ENROLLMENT_TOKEN.to_string()),
                 }),
                 ..Self::default().security
             },
@@ -136,6 +180,38 @@ impl Mock {
                 x_pubkey: vec![0xcd; 32],
                 requested_at: 1_700_000_000,
             }]),
+            ca: None,
+        }
+    }
+
+    /// A certificate authority that really issues: the flavor an enrolling node
+    /// is pointed at.
+    ///
+    /// `require_approval` chooses which of the two enrollment paths it serves —
+    /// signing on submission, or parking the request until an operator says
+    /// yes. Both are ordinary configurations, and the second is the one worth
+    /// exercising: it is the path with a wait in the middle.
+    pub fn authority(require_approval: bool) -> Self {
+        let mut ca = wayfinder_server::CertAuthority::new(
+            &MESH_ROOT_SEED,
+            MOCK_MESH_ID,
+            86_400,
+            None,
+            require_approval,
+        );
+        ca.set_now_unix(1_700_000_000);
+        Self {
+            security: SecurityStatusData {
+                enrollment: Some(EnrollmentPolicyStatusData {
+                    require_approval,
+                    cert_ttl_secs: 86_400,
+                    enrollment_token_set: false,
+                    enrollment_token: None,
+                }),
+                ..Self::default().security
+            },
+            pending_csrs: None,
+            ca: Some(ca),
         }
     }
 }
@@ -259,9 +335,6 @@ impl WayfinderDataProvider for Mock {
             egress: Some(EgressDecisionData::Interface(0)),
         })
     }
-    fn set_auth(&mut self, _seed: &[u8], _cert: &[u8], _trust_anchor: &[u8]) -> Result<(), String> {
-        Ok(())
-    }
     fn security_status(&self) -> SecurityStatusData {
         self.security.clone()
     }
@@ -287,9 +360,19 @@ impl WayfinderDataProvider for Mock {
             if let Some(ttl) = update.cert_ttl_secs {
                 policy.cert_ttl_secs = ttl;
             }
+            // Both halves move together, as they do on a real node where they
+            // are two projections of one `Option<String>` — a mock that set the
+            // flag without storing the value would let the dashboard read a
+            // token back that a real node would never have reported.
             match &update.enrollment_token {
-                Some(TokenUpdate::Clear) => policy.enrollment_token_set = false,
-                Some(TokenUpdate::Set(_)) => policy.enrollment_token_set = true,
+                Some(TokenUpdate::Clear) => {
+                    policy.enrollment_token_set = false;
+                    policy.enrollment_token = None;
+                }
+                Some(TokenUpdate::Set(token)) => {
+                    policy.enrollment_token_set = true;
+                    policy.enrollment_token = Some(token.clone());
+                }
                 None => {}
             }
         }
@@ -329,12 +412,61 @@ impl WayfinderDataProvider for Mock {
             .map_err(|e| format!("{e}"))
     }
     fn get_trust_anchor(&self) -> Result<Vec<u8>, String> {
-        Ok(vec![0xab; 36])
+        match &self.ca {
+            Some(ca) => Ok(ca.trust_anchor_bytes()),
+            None => Ok(vec![0xab; 36]),
+        }
     }
     fn list_pending_csrs(&self) -> Result<Vec<PendingCsrData>, String> {
+        if let Some(ca) = &self.ca {
+            return Ok(ca.list_pending());
+        }
         self.pending_csrs
             .clone()
             .ok_or_else(|| "node is not a certificate-authority provider".to_string())
+    }
+    fn submit_csr(
+        &mut self,
+        node_mac: &[u8],
+        ed_pubkey: &[u8],
+        x_pubkey: &[u8],
+        enrollment_token: &str,
+    ) -> Result<wayfinder_protos::service::CsrOutcome, String> {
+        self.ca
+            .as_mut()
+            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
+            .submit_csr(node_mac, ed_pubkey, x_pubkey, enrollment_token)
+    }
+    fn approve_csr(&mut self, node_mac: &[u8]) -> Result<(), String> {
+        self.ca
+            .as_mut()
+            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
+            .approve_csr(node_mac)
+    }
+    /// Install a certificate, the way a node does when it is enrolled.
+    ///
+    /// An empty seed means the node keeps the identity it has, so the reported
+    /// keys are left alone; a seed that *is* supplied replaces them, exactly as
+    /// a real node's would be re-derived. Reporting that faithfully is the
+    /// point — it is how a test can tell which of the two happened.
+    fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String> {
+        let anchor = wayfinder_auth::TrustAnchor::from_bytes(trust_anchor)
+            .ok_or_else(|| "unable to parse trust anchor".to_string())?;
+        let cert = wayfinder_auth::MembershipCert::from_bytes(cert)
+            .ok_or_else(|| "unable to parse membership cert".to_string())?;
+        if !seed.is_empty() {
+            let seed: [u8; 32] = seed
+                .try_into()
+                .map_err(|_| "seed must be exactly 32 bytes".to_string())?;
+            let kp = wayfinder_auth::Keypair::from_seed(&seed);
+            self.security.own_ed_pubkey = kp.ed_pubkey().to_vec();
+            self.security.own_x_pubkey = kp.x_pubkey().to_vec();
+        }
+        self.security.auth_enabled = true;
+        self.security.mesh_id = anchor.mesh_id;
+        self.security.node_mac = cert.node_mac.to_vec();
+        self.security.cert_not_after = cert.not_after.get();
+        Ok(())
     }
 }
 

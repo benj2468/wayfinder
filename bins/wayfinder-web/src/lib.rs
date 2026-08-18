@@ -23,12 +23,18 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod api;
+// Browser-only in effect (the `ssr` build compiles a stub that copies nothing),
+// but not gated: the click handlers that call it are compiled into both builds.
+pub mod clipboard;
 pub mod components;
 pub mod format;
 pub mod state;
 
 #[cfg(feature = "ssr")]
 pub mod conn;
+// The outcome and target types cross the wire, so the browser needs them; the
+// request itself is server-side and gated within the module.
+pub mod enroll;
 #[cfg(feature = "mock-node")]
 pub mod mock;
 #[cfg(feature = "ssr")]

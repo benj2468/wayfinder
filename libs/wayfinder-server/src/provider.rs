@@ -76,9 +76,11 @@ pub trait MeshAuthority {
     fn deny_csr(&mut self, node_mac: &[u8]) -> Result<(), String>;
 
     /// The enrollment policy this authority is currently applying, for the
-    /// management API to report.  Carries no token, only whether one is set —
-    /// the token is a shared secret, and a client reading the policy has no
-    /// need of its value.
+    /// management API to report.  Carries both whether a token is set and, when
+    /// one is, its value — the reader is already an admin or the node itself,
+    /// and so is already able to replace the token outright, which is why
+    /// reporting it confers nothing new.  `enrollment_token_set` stays the
+    /// authoritative flag: an absent value never means "no token".
     fn enrollment_policy(&self) -> EnrollmentPolicyStatusData;
 
     /// Apply a partial enrollment-policy update; fields the update does not

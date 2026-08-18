@@ -248,8 +248,9 @@ pub enum TokenUpdate {
 /// Intermediate representation of the enrollment policy a provider-mode node
 /// is currently applying, reported inside [`SecurityStatusData`].
 ///
-/// Carries no token, only whether one is set: the token is a shared secret,
-/// and a client reading the policy has no need of its value.
+/// Carries whether a token is set and, when one is, the token itself; see
+/// [`enrollment_token`](EnrollmentPolicyStatusData::enrollment_token) for who
+/// may read it and why that is safe.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EnrollmentPolicyStatusData {
     /// Whether a submitted CSR is parked pending operator approval.
@@ -258,6 +259,12 @@ pub struct EnrollmentPolicyStatusData {
     pub cert_ttl_secs: u64,
     /// Whether a shared enrollment token is configured.
     pub enrollment_token_set: bool,
+    /// The token itself, for an operator who has to hand it to a joining node;
+    /// `None` when none is set.  See the field comment in the `.proto` for why
+    /// a secret is reported at all, and to whom.
+    /// [`enrollment_token_set`](Self::enrollment_token_set) stays the flag to
+    /// read for *whether* one is required.
+    pub enrollment_token: Option<String>,
 }
 
 /// Intermediate representation of one interface's smoothed throughput,
@@ -405,6 +412,14 @@ pub struct SecurityStatusData {
     /// The enrollment policy in force; `None` on a node that is not running in
     /// provider mode and so has none to report.
     pub enrollment: Option<EnrollmentPolicyStatusData>,
+    /// This node's own Ed25519 identity public key; empty when the node has no
+    /// identity at all.  Reported whether or not auth is enabled — an
+    /// un-enrolled node still has an identity, and this is the key a client
+    /// enrolling it on its behalf must name in the CSR.
+    pub own_ed_pubkey: Vec<u8>,
+    /// This node's own X25519 public key, on the same terms as
+    /// [`own_ed_pubkey`](Self::own_ed_pubkey).
+    pub own_x_pubkey: Vec<u8>,
 }
 
 /// The verbosity of one log record.  Mirrors the `LogLevel` proto enum, minus
@@ -1006,7 +1021,10 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                         require_approval: e.require_approval,
                         cert_ttl_secs: e.cert_ttl_secs,
                         enrollment_token_set: e.enrollment_token_set,
+                        enrollment_token: e.enrollment_token.unwrap_or_default(),
                     }),
+                    own_ed_pubkey: s.own_ed_pubkey,
+                    own_x_pubkey: s.own_x_pubkey,
                 })
             }
 
@@ -1937,6 +1955,7 @@ mod tests {
                     require_approval: true,
                     cert_ttl_secs: 86_400,
                     enrollment_token_set: true,
+                    enrollment_token: Some("join-us".into()),
                 }),
                 ..Default::default()
             },
@@ -1956,6 +1975,10 @@ mod tests {
                 assert!(
                     enrollment.enrollment_token_set,
                     "the status reports that a token is set"
+                );
+                assert_eq!(
+                    enrollment.enrollment_token, "join-us",
+                    "and carries it, so an operator can hand it to a joining node"
                 );
             }
             other => panic!("expected SecurityStatus, got {:?}", proto_kind_name(&other)),

@@ -29,6 +29,7 @@ use wayfinder::config::ServerConfig;
 use wayfinder::config::TrickleConfig;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder::wayfinder_auth::Keypair;
+use wayfinder::wayfinder_auth::MembershipCert;
 use wayfinder_driver::AuthSnapshotRx;
 use wayfinder_driver::AuthSnapshotTx;
 use wayfinder_driver::BleLinkParams;
@@ -66,14 +67,17 @@ fn load_keypair(seed_path: &str) -> anyhow::Result<Keypair> {
     Ok(Keypair::from_seed(&seed))
 }
 
-/// Build a keypair from raw seed bytes, for a seed that came from somewhere
-/// other than a file — the runtime settings store, which holds the identity a
-/// `SetAuth` installed.
+/// Narrow raw seed bytes to the fixed-size seed, for a seed that came from
+/// somewhere other than a file — the runtime settings store, which holds the
+/// identity a `SetAuth` installed.
+fn seed_bytes(seed: &[u8]) -> anyhow::Result<[u8; 32]> {
+    seed.try_into()
+        .map_err(|_| anyhow!("identity seed must be 32 bytes, got {}", seed.len()))
+}
+
+/// Build a keypair from raw seed bytes; see [`seed_bytes`].
 fn keypair_from_seed_bytes(seed: &[u8]) -> anyhow::Result<Keypair> {
-    let seed: [u8; 32] = seed
-        .try_into()
-        .map_err(|_| anyhow!("identity seed must be 32 bytes, got {}", seed.len()))?;
-    Ok(Keypair::from_seed(&seed))
+    Ok(Keypair::from_seed(&seed_bytes(seed)?))
 }
 
 /// Read this node's persisted TAP MAC from `state_path`, or generate one and
@@ -247,14 +251,22 @@ async fn main() -> anyhow::Result<()> {
     // An identity installed at runtime wins over the `auth:` block, for the
     // same reason it does everywhere else: it is the operator's more recent
     // intent. It has to be consulted *here*, not only where auth is enabled
-    // below — the MAC is derived from the seed, so reading it later would give
-    // this node an address its own certificate is not bound to.
+    // below — the MAC is what a certificate is bound to, so reading it later
+    // would give this node an address its own certificate is not.
+    //
+    // For that identity the *certificate* names the MAC, rather than the seed
+    // deriving it. The two agree when the identity was minted whole (offline
+    // `enroll` picks the MAC its keypair derives to), and they deliberately do
+    // not when a node enrolled online: there the node already had an address
+    // its peers knew it by, and the certificate was issued for that address
+    // precisely so joining a mesh does not move it. Deriving here instead would
+    // rename the node on its first restart after enrolling and orphan the
+    // certificate it just obtained.
     let mac_addr = match (&settings.identity, &config.auth) {
         (Some(identity), _) => {
-            keypair_from_seed_bytes(&identity.seed)
-                .context("runtime-installed identity seed")?
-                .derived_mac()
-                .0
+            MembershipCert::from_bytes(&identity.cert)
+                .ok_or_else(|| anyhow!("invalid membership cert in the runtime settings store"))?
+                .node_mac
         }
         (None, Some(auth_cfg)) => load_keypair(&auth_cfg.seed_path)?.derived_mac().0,
         (None, None) => load_or_generate_mac(&tap.resolved_mac_state_path())?,
@@ -384,6 +396,11 @@ async fn main() -> anyhow::Result<()> {
     // giving the server task direct access to the router. Installed on the
     // driver below, after it's built.
     let mut auth_snapshot_rx: Option<AuthSnapshotRx> = None;
+    // The identity this node runs as, once resolved below. Handed to the driver
+    // so the management API can report its public half and certify it on
+    // enrollment — the same key the TLS server presents, so a client that
+    // enrolls this node certifies the identity it was already talking to.
+    let mut node_identity_seed: Option<[u8; 32]> = None;
 
     if let Some(server_cfg) = config.server {
         let tx = query_tx.clone();
@@ -392,19 +409,25 @@ async fn main() -> anyhow::Result<()> {
                 addr,
                 identity_seed_path,
             } => {
-                // The TLS server identity: reuse the mesh membership seed when
-                // configured, otherwise a dedicated persistent identity seed
-                // (generated on first boot). It must exist even before
-                // enrollment, since the bootstrap client authenticates by
-                // proving this key.
-                let identity_seed = match &config.auth {
-                    Some(auth_cfg) => read_seed(&auth_cfg.seed_path)?,
-                    None => {
+                // The TLS server identity: an identity installed at runtime
+                // wins (the operator's more recent intent, and the same
+                // precedence the MAC above follows), else the mesh membership
+                // seed when one is configured, else a dedicated persistent
+                // identity seed generated on first boot. It must exist even
+                // before enrollment, since a client with no certificate yet
+                // authenticates by proving this key.
+                let identity_seed = match (&settings.identity, &config.auth) {
+                    (Some(identity), _) => {
+                        seed_bytes(&identity.seed).context("runtime-installed identity seed")?
+                    }
+                    (None, Some(auth_cfg)) => read_seed(&auth_cfg.seed_path)?,
+                    (None, None) => {
                         let path = identity_seed_path
                             .unwrap_or_else(ServerConfig::default_identity_seed_path);
                         load_or_generate_seed(&path)?
                     }
                 };
+                node_identity_seed = Some(identity_seed);
                 let listener = bind_tcp_server(addr).await?;
                 let (snapshot_tx, snapshot_rx): (AuthSnapshotTx, AuthSnapshotRx) =
                     mpsc::channel(16);
@@ -429,6 +452,11 @@ async fn main() -> anyhow::Result<()> {
     // over (no-op when no TLS server is configured).
     if let Some(rx) = auth_snapshot_rx {
         driver.set_auth_snapshot_rx(rx);
+    }
+    // And the identity that server presents, so the management API can report
+    // its public half for enrollment and install a certificate issued for it.
+    if let Some(seed) = node_identity_seed {
+        driver.set_identity_seed(seed);
     }
 
     // The two posture flags, each taking the runtime override when the
@@ -506,7 +534,6 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some((keypair, cert_bytes, anchor_bytes, source)) = identity_material {
         use wayfinder::auth::OgmAuth;
-        use wayfinder::wayfinder_auth::MembershipCert;
         use wayfinder::wayfinder_auth::TrustAnchor;
 
         let cert = MembershipCert::from_bytes(&cert_bytes)

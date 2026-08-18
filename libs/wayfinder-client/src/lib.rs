@@ -492,7 +492,12 @@ impl Client {
         }
     }
 
-    /// Update the authentication state of the client.
+    /// Install a whole mesh identity on the node: its seed, its membership
+    /// certificate and the mesh trust anchor.
+    ///
+    /// Pass an empty `seed` to certify the identity the node already has — see
+    /// [`install_cert`](Self::install_cert), which is that call named for what
+    /// it does.
     pub async fn set_auth(
         &mut self,
         seed: &[u8],
@@ -510,6 +515,18 @@ impl Client {
             ResponseKind::Empty(_) => Ok(()),
             other => Err(unexpected("SetAuth", &other)),
         }
+    }
+
+    /// Certify the identity the node already holds: install `cert` and
+    /// `trust_anchor` against the node's existing seed, which it keeps.
+    ///
+    /// This is how a node that enrolled online adopts the certificate it was
+    /// issued. Its key — and therefore the MAC its peers know it by — does not
+    /// change, so the node becomes a member of the mesh without moving on it.
+    /// The certificate must of course be bound to that same key, or the node
+    /// will hold a certificate it cannot sign for.
+    pub async fn install_cert(&mut self, cert: &[u8], trust_anchor: &[u8]) -> anyhow::Result<()> {
+        self.set_auth(&[], cert, trust_anchor).await
     }
 
     /// Set the Trickle/OGM emission bounds for one mesh interface at runtime.
@@ -773,16 +790,18 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
 ///
 /// The gap is closed from this side instead: whether *this* client presented a
 /// certificate is a fact it already knows, so saying so leaks nothing. Without
-/// one the diagnosis is nearly certain — the bootstrap path only works on an
-/// un-enrolled node. With one, the candidates are listed rather than guessed
-/// between, because the client genuinely cannot tell which check failed.
+/// one, the connection is not refused outright — a client presenting no
+/// certificate is admitted at the enrollment tier — so what it is short of is
+/// the credential every other request needs. With one, the candidates are
+/// listed rather than guessed between, because the client genuinely cannot tell
+/// which check failed.
 fn explain_auth_denial(server_message: &str, presented_cert: bool) -> String {
     let cause = if presented_cert {
         "the certificate presented is not an admin certificate, has expired, has been revoked, \
          or was issued by a different mesh root"
     } else {
-        "no membership certificate was presented, so this connected on the bootstrap path, \
-         which only an un-enrolled node accepts"
+        "no membership certificate was presented, so this connection is limited to \
+         enrollment; anything else needs an admin certificate or the node's own key"
     };
     // The node's own wording is kept rather than replaced: a future server may
     // return something more specific, and this client's guess must not bury it.
@@ -800,19 +819,22 @@ fn explain_auth_denial(server_message: &str, presented_cert: bool) -> String {
 mod tests {
     use super::*;
 
-    /// A client that presented no certificate is on the bootstrap path, which
-    /// only an un-enrolled node accepts. That is by far the likeliest reason a
-    /// management connection is refused, and it is a fact about *this* client,
-    /// so naming it leaks nothing the node chose to withhold.
+    /// A client that presented no certificate is admitted only for enrollment,
+    /// so what it is short of is the credential everything else needs. That is
+    /// by far the likeliest reason its requests are refused, and it is a fact
+    /// about *this* client, so naming it leaks nothing the node withheld.
     #[test]
-    fn a_denial_without_a_cert_names_the_bootstrap_path() {
+    fn a_denial_without_a_cert_names_the_enrollment_limit() {
         let explained = explain_auth_denial("authentication denied", false);
 
         assert!(
             explained.contains("no membership certificate"),
             "got: {explained}"
         );
-        assert!(explained.contains("un-enrolled"), "got: {explained}");
+        assert!(
+            explained.contains("limited to enrollment"),
+            "got: {explained}"
+        );
     }
 
     /// With a certificate presented, the client cannot tell which of the

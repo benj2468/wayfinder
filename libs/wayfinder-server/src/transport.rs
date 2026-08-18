@@ -201,6 +201,53 @@ where
     // Authenticated: serve requests until the peer hangs up.
     while let Some(frame) = framed.next().await {
         let request = WayfinderRequest::decode(frame?)?;
+        // An enrollment-only connection may invoke just the enrollment
+        // requests; anything else is refused here rather than reaching the
+        // router. Unlike the connection-level denial above, the reason *is*
+        // sent: this peer is admitted and the answer tells it nothing it could
+        // not learn by trying, while a client that is merely misconfigured (an
+        // admin identity that forgot its certificate) otherwise sees every
+        // request fail with nothing to explain why.
+        // The gate is total: a request this build cannot classify is refused,
+        // not waved through. `permits` fails closed on a request kind it does
+        // not know, and an absent oneof — what prost yields for a field number
+        // added after this build — must fail closed the same way rather than
+        // reach the router unexamined.
+        let Some(req) = request.request.as_ref() else {
+            tracing::warn!(
+                key = ?peer_key,
+                "drop: management request naming no request kind"
+            );
+            send_response(
+                &mut framed,
+                RespKind::Error(ErrorResponse {
+                    message: "empty or unrecognised request".into(),
+                }),
+            )
+            .await?;
+            continue;
+        };
+        if !crate::authz::permits(decision, req) {
+            // Security-relevant, and reachable by a party that presented no
+            // certificate, so it is the operator's business that someone is
+            // probing: `warn!`, with who and what, not `debug!`.
+            tracing::warn!(
+                key = ?peer_key,
+                ?decision,
+                "drop: request not permitted on this connection"
+            );
+            send_response(
+                &mut framed,
+                RespKind::Error(ErrorResponse {
+                    message: "this connection is limited to enrollment (no admin \
+                              certificate was verified on it); everything else needs an \
+                              admin certificate or the node's own key"
+                        .into(),
+                }),
+            )
+            .await?;
+            continue;
+        }
         let (resp_tx, resp_rx) = oneshot::channel();
         query_tx.send((request, resp_tx)).await?;
         let response = resp_rx.await?;
@@ -409,6 +456,7 @@ mod tests {
     use wayfinder_protos::wayfinder::v1alpha::AuthenticateRequest;
     use wayfinder_protos::wayfinder::v1alpha::GetNodeInfoRequest;
     use wayfinder_protos::wayfinder::v1alpha::NodeInfo;
+    use wayfinder_protos::wayfinder::v1alpha::SubmitCsrRequest;
     use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
     use wayfinder_protos::wayfinder::v1alpha::WayfinderResponse;
     use wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request;
@@ -546,10 +594,16 @@ mod tests {
         let _ = server.await;
     }
 
-    /// A client whose handshake key is not the node's own key (on an un-enrolled
-    /// node) is refused, and the connection is closed without serving anything.
+    /// A request naming no request kind is refused rather than forwarded.
+    ///
+    /// This is the gate's fail-closed edge, and it is not hypothetical: an
+    /// absent `oneof` is exactly what prost yields for a field number added
+    /// after this build, so a newer client's unknown request reaches an older
+    /// node looking like this. Forwarding it would be an authorization decision
+    /// never taken — `permits` fails closed on a request kind it does not know,
+    /// and it can only do that if it is asked.
     #[tokio::test]
-    async fn authenticated_stream_denies_wrong_bootstrap_key() {
+    async fn a_request_naming_no_kind_is_refused_not_forwarded() {
         let ctx = AuthContext {
             own_key: [1u8; 32],
             anchor: None,
@@ -564,17 +618,84 @@ mod tests {
             })))
             .await
             .unwrap();
+        let ack = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(ack.response, Some(Response::Empty(_))));
+
+        // An envelope with no request inside it.
+        let mut buf = Vec::new();
+        WayfinderRequest { request: None }.encode(&mut buf).unwrap();
+        client.send(Bytes::from(buf)).await.unwrap();
 
         let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
         match resp.response {
-            Some(Response::Error(e)) => assert!(e.message.contains("denied"), "got: {}", e.message),
+            Some(Response::Error(e)) => assert!(
+                e.message.contains("unrecognised"),
+                "refused by the gate, not answered by the router: {}",
+                e.message
+            ),
             other => panic!("expected an error response, got {other:?}"),
         }
-        // The server closed the connection after refusing.
+
+        drop(client);
+        let _ = server.await;
+    }
+
+    /// A client that presents no membership cert is admitted — that is how a
+    /// node with nothing yet submits the CSR that enrolls it — but the grant is
+    /// enforced per request: an ordinary read is refused, with a message saying
+    /// why, and the connection stays open for the enrollment it *may* do.
+    #[tokio::test]
+    async fn authenticated_stream_confines_a_stranger_to_enrollment() {
+        let ctx = AuthContext {
+            own_key: [1u8; 32],
+            anchor: None,
+            revoked: Vec::new(),
+            now_unix: 100,
+        };
+        let (mut client, server) = spawn_authenticated_server([2u8; 32], ctx);
+
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: Vec::new(),
+            })))
+            .await
+            .unwrap();
+        let ack = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
         assert!(
-            client.next().await.is_none(),
-            "connection is closed after a denied authentication"
+            matches!(ack.response, Some(Response::Empty(_))),
+            "an enrollment connection is acknowledged like any other"
         );
+
+        // Anything but enrollment is refused, and says so rather than leaving a
+        // misconfigured client to guess.
+        client
+            .send(encode_request(Request::GetNodeInfo(GetNodeInfoRequest {})))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        match resp.response {
+            Some(Response::Error(e)) => assert!(
+                e.message.contains("limited to enrollment"),
+                "got: {}",
+                e.message
+            ),
+            other => panic!("expected an error response, got {other:?}"),
+        }
+
+        // Still open: the refusal is of one request, not of the connection.
+        client
+            .send(encode_request(Request::SubmitCsr(
+                SubmitCsrRequest::default(),
+            )))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(
+            !matches!(&resp.response, Some(Response::Error(e)) if e.message.contains("limited to enrollment")),
+            "SubmitCsr is the request an enrollment connection exists to make"
+        );
+
+        drop(client);
         let _ = server.await;
     }
 

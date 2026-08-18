@@ -71,7 +71,7 @@ its first instant, which also makes its MAC (derived from that seed)
 reproducible across runs.
 
 Nothing enrols at runtime.  An earlier version had each node generate a key and
-enrol against the provider over the management API; once that API required an
+enroll against the provider over the management API; once that API required an
 authenticated TLS handshake, a node with no certificate could no longer open the
 connection it would have used to ask for one.  So online enrollment — and the
 CSR-approval flow — is *not* exercised by this sim, even though the provider
@@ -544,10 +544,11 @@ def render_compose(require_approval: bool = False) -> str:
         #
         # * A secured node is *enrolled*, so it refuses any connection that
         #   cannot present an admin certificate — the shared operator identity.
-        # * An open node is *un-enrolled*, and an un-enrolled node admits
-        #   exactly one client: one proving the node's own key. So its dashboard
-        #   presents that node's seed and no certificate at all. (Handing it the
-        #   operator cert instead would be refused: `MgmtDenied::NotOwnKey`.)
+        # * An open node is *un-enrolled*, so the only credential that grants it
+        #   full management is proof of the node's own key. So its dashboard
+        #   presents that node's seed and no certificate at all. (A client with
+        #   no cert is still admitted, but only to enroll — see `authz::permits`
+        #   — which is not enough to drive a dashboard.)
         #
         # `--node-key` pins the node being connected to either way — that node's
         # own ed25519 key, which cannot be defaulted here.

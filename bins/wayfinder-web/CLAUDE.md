@@ -64,6 +64,7 @@ be bumped as one:
   theme, and the favicon `server.rs` serves from its own route. It carries a
   second copy of the geometry in `assets/logo/`, pinned to it by unit tests —
   see that directory's README before replacing the logo.
+- `clipboard.rs` — the one copy-to-clipboard path, browser-side only.
 - `mock.rs` (`mock-node` feature) — a canned node, for tests and for
   `examples/mock_node.rs`.
 
@@ -180,7 +181,57 @@ the port has whatever access that identity carries; exposing it is a
 reverse-proxy's job. A session layer is a later, separable change — do not
 quietly widen the bind default in the meantime.
 
-**The Security tab now writes, not just reads**, and that raises the stakes of
+**The Security tab enrolls the node**, too: its "Join a mesh" panel asks a
+provider to certify the node and installs what comes back (`enroll.rs`, and
+`api::request_enrollment`). Three things about it are worth knowing before
+changing it:
+
+- **It certifies the node's existing identity, and never handles a key.** The
+  CSR names the keys and MAC the node reports, and the certificate is installed
+  against the seed the node keeps (`Client::install_cert` — a `SetAuth` with an
+  empty seed). Minting a fresh keypair here, as the offline `wayfinderctl
+  enroll` does, would change the node's MAC — read once at startup — leaving it
+  signing frames under a certificate its peers cannot attribute to it until
+  someone restarts it.
+- **The connection to the provider is anonymous by design.** A throwaway key,
+  no certificate: a node with nothing to present is exactly what is asking. The
+  provider admits it for enrollment alone (`wayfinder_server::authz`), and
+  decides on its token and its operator's approval.
+- **A held request is polled, not pushed.** Re-submitting an identical CSR is
+  how a certificate is collected after approval, so the panel simply asks again
+  on a timer while it waits.
+
+**The provider end of that exchange shows what a joining node must be told** —
+its address, the key that pins it, and the enrollment token. Two rules govern
+that panel:
+
+- **The token is reported by the node now.** `GetSecurityStatus` carries the
+  value, not just `enrollment_token_set`. This reversed an earlier rule that
+  never reported it; what makes it safe is that the request is reachable only by
+  a client authenticated as an admin or as the node itself — the same clients
+  that may replace or clear the token through `SetConfig` — so disclosure
+  confers nothing they did not already have.
+- **Shown, masked and copied are three different things.** The key is
+  abbreviated and the token masked outright, while the copy button carries each
+  in full. A dashboard gets read over a shoulder and screenshotted into chats;
+  the value that leaves it should leave through the clipboard, deliberately.
+  `clipboard.rs` explains why the copy goes through the deprecated
+  `execCommand` rather than `navigator.clipboard` (the modern API is undefined
+  over plain HTTP, which is how this dashboard is usually reached, and a
+  `wasm-bindgen` call that throws aborts the page).
+
+**A panel holding operator input must not be rebuilt by a poll.** `snapshot` is
+replaced once a second, so a `move ||` closure over it constructs a *fresh*
+component every second — and a component's `signal(String::new())` fields are
+re-created empty, wiping whatever was half-typed and taking the focus with it.
+The Security tab's "Join a mesh" and "How nodes join" panels are therefore
+driven from `Memo`s over the narrowest projection they need
+(`security::membership_of`), since a memo only notifies when its own value
+changes. Widening one of those projections to something that moves on its own —
+a node list, a timestamp — silently restores the bug, which no markup test can
+see; `membership_ignores_everything_that_changes_on_its_own` is what guards it.
+
+**The Security tab writes, not just reads**, and that raises the stakes of
 the paragraph above. Whoever can reach this port can turn the node's
 fail-closed gate on or off, flip lazy cert distribution (a flag-day,
 wire-incompatible change for the whole mesh), and — on a certificate authority
