@@ -59,7 +59,12 @@ Deliberately separated, and the boundary matters:
 Three grant tiers:
 
 - `GrantedAdmin` — a verified, non-revoked admin cert bound to the handshake key.
-- `GrantedSelfKey` — the client proved possession of the node's *own* key. How
+- `GrantedSelfKey` — the client proved possession of the node's *own* key. A
+  node with no identity seed has **no** own key (`own_key: Option<[u8; 32]>`),
+  so the tier is simply unavailable there rather than resting on a sentinel
+  value being unpresentable — the all-zero key it used to compare against is a
+  valid Ed25519 encoding of a low-order point, and `ring` verifies the TLS
+  `CertificateVerify` here, not dalek's `verify_strict`. How
   you configure a fresh node, and it holds **whether or not the node is
   enrolled**: whoever has that seed already is the node on the mesh, and a
   dashboard that reached an un-enrolled node has no other credential it could
@@ -80,6 +85,30 @@ otherwise impossible: a provider worth enrolling with is itself an enrolled
 member, so a node with no cert could never open the connection carrying its CSR.
 Admission control for it has not moved — it is the provider's enrollment token
 and the operator's approval.
+
+**Admission is decided again while the connection is open.** A connection has
+no bound, so deciding once at connect made `RevokeNode` a statement about
+*future* connections only, and an admin certificate that expired mid-session
+stayed honoured. `AuthGate` re-reads the router's auth state and re-runs the
+same `authorize` helper before serving a request, at most once every
+`REVALIDATE_AFTER` (60 s); a changed verdict closes the connection. Two things
+follow for anyone editing this: the connect-time decision and the revalidation
+must stay *one* function (they are — `authorize`), and a failure to reach the
+router loop or read the clock closes the connection rather than extending the
+last decision.
+
+**What an unauthenticated peer may consume is bounded** (`PreAuthLimits`), and
+this is not the same population as "connections". Completing the handshake
+proves possession of *a* key, not of an authorized one, so every connection
+starts uncredentialed; the cap is on that population, and a connection hands
+its slot back (`PreAuthGuard::credentialed`) the moment it earns
+`GrantedAdmin`/`GrantedSelfKey` — never on `GrantedEnrollment`, which is
+precisely the population being bounded. Alongside it: a per-source connection
+rate limit (the same `SourceLimiter` the enrollment tier's `SubmitCsr` uses), a
+handshake timeout, and `MAX_FRAME_LEN` on the **read** half only. That last
+asymmetry is deliberate — a host node's routing table or log page is routinely
+larger than any request, so capping both directions with one number would trade
+a memory bound for a dashboard that cannot load.
 
 Denials (a cert that failed) return a deliberately generic
 `"authentication denied"` over the wire while the precise reason stays in a

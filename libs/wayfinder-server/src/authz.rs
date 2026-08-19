@@ -76,7 +76,13 @@ pub enum MgmtDenied {
 /// may do, in three tiers:
 ///
 /// * **Self-key** ([`MgmtAccess::GrantedSelfKey`]): `handshake_key` is the
-///   node's `own_key`, so the client holds the node's identity seed. Full
+///   node's `own_key`, so the client holds the node's identity seed. `own_key`
+///   is an `Option` because a node with no identity seed configured has no such
+///   key at all, and this tier is then simply unavailable — rather than resting
+///   on a sentinel value being unreachable, which for the all-zero key it was
+///   not: that is a valid Ed25519 encoding of a low-order point, and the TLS
+///   `CertificateVerify` proving possession here is checked by `ring`, not by
+///   dalek's `verify_strict`. Full
 ///   management access, whether or not the node is enrolled. Whoever holds that
 ///   seed *is* this node on the mesh — it signs the node's OGMs and terminates
 ///   the node's own TLS — so withholding management from it would protect
@@ -101,11 +107,11 @@ pub fn decide_access(
     handshake_key: &[u8; 32],
     cert: Option<&MembershipCert>,
     anchor: Option<&TrustAnchor>,
-    own_key: &[u8; 32],
+    own_key: Option<&[u8; 32]>,
     now_unix: u64,
     is_revoked: impl FnOnce(Mac) -> bool,
 ) -> MgmtAccess {
-    if handshake_key == own_key {
+    if own_key == Some(handshake_key) {
         return MgmtAccess::GrantedSelfKey;
     }
     // No anchor means nothing to verify a cert against, so no client can prove
@@ -163,7 +169,7 @@ pub fn decide_access(
 /// things bound how much that reach can cost, without closing it:
 /// `authority.rs`'s `MAX_HELD_CSRS` caps how large the held-CSR store may
 /// grow no matter how many sources contribute to it, and
-/// `EnrollmentLimiter` in `transport.rs` caps how fast any *one* source may
+/// `PreAuthLimits` in `transport.rs` caps how fast any *one* source may
 /// contribute. Neither stops a single submission from squatting a MAC; both
 /// stop it from being repeated without bound. The certificate that comes
 /// back is bound to the keys named in the CSR, so it is useless to anyone
@@ -267,9 +273,14 @@ mod tests {
         let own = Keypair::from_seed(&[7u8; 32]);
 
         assert_eq!(
-            decide_access(&own.ed_pubkey(), None, None, &own.ed_pubkey(), 100, |_| {
-                false
-            }),
+            decide_access(
+                &own.ed_pubkey(),
+                None,
+                None,
+                Some(&own.ed_pubkey()),
+                100,
+                |_| { false }
+            ),
             MgmtAccess::GrantedSelfKey
         );
         assert_eq!(
@@ -277,7 +288,7 @@ mod tests {
                 &own.ed_pubkey(),
                 None,
                 Some(&anchor),
-                &own.ed_pubkey(),
+                Some(&own.ed_pubkey()),
                 100,
                 |_| false
             ),
@@ -291,6 +302,37 @@ mod tests {
     /// that would enroll it, since a provider worth enrolling with is itself an
     /// enrolled member. It holds whether or not this node has an anchor of its
     /// own — a provider being stood up has to answer the first CSR too.
+    /// A node with no identity seed configured has no own key, and nothing may
+    /// claim one.
+    ///
+    /// The sentinel this replaces was an all-zero key, defended as unreachable
+    /// by any real handshake key. All-zeros is in fact a valid Ed25519 encoding
+    /// — a low-order point — and the `CertificateVerify` that proves possession
+    /// here is checked by `ring`, not by dalek's `verify_strict`, which is the
+    /// function that rejects low-order keys. Making the absence a `None` costs
+    /// an `Option` and closes the question rather than arguing it.
+    #[test]
+    fn a_node_with_no_identity_key_grants_no_self_key_tier() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let anchor = authority.trust_anchor();
+
+        assert_eq!(
+            decide_access(&[0u8; 32], None, None, None, 100, |_| false),
+            MgmtAccess::GrantedEnrollment,
+            "an all-zero handshake key against a seedless node is a stranger, not the node"
+        );
+        assert_eq!(
+            decide_access(&[0u8; 32], None, Some(&anchor), None, 100, |_| false),
+            MgmtAccess::GrantedEnrollment,
+            "and an installed anchor does not change that"
+        );
+        assert_eq!(
+            decide_access(&[9u8; 32], None, None, None, 100, |_| false),
+            MgmtAccess::GrantedEnrollment,
+            "nor does any other key stand in for an absent one"
+        );
+    }
+
     #[test]
     fn a_stranger_with_no_cert_is_admitted_for_enrollment() {
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
@@ -303,7 +345,7 @@ mod tests {
                 &stranger.ed_pubkey(),
                 None,
                 Some(&anchor),
-                &own.ed_pubkey(),
+                Some(&own.ed_pubkey()),
                 100,
                 |_| false
             ),
@@ -314,7 +356,7 @@ mod tests {
                 &stranger.ed_pubkey(),
                 None,
                 None,
-                &own.ed_pubkey(),
+                Some(&own.ed_pubkey()),
                 100,
                 |_| false
             ),
@@ -377,7 +419,7 @@ mod tests {
                 &admin_kp.ed_pubkey(),
                 Some(&admin_cert),
                 Some(&anchor),
-                &own.ed_pubkey(),
+                Some(&own.ed_pubkey()),
                 100,
                 |_| false
             ),
@@ -394,7 +436,7 @@ mod tests {
                 &replayer.ed_pubkey(),
                 Some(&admin_cert),
                 Some(&anchor),
-                &own.ed_pubkey(),
+                Some(&own.ed_pubkey()),
                 100,
                 |_| false
             ),
@@ -410,7 +452,7 @@ mod tests {
                 &member_kp.ed_pubkey(),
                 Some(&member_cert),
                 Some(&anchor),
-                &own.ed_pubkey(),
+                Some(&own.ed_pubkey()),
                 100,
                 |_| false
             ),
@@ -423,7 +465,7 @@ mod tests {
                 &admin_kp.ed_pubkey(),
                 Some(&admin_cert),
                 Some(&anchor),
-                &own.ed_pubkey(),
+                Some(&own.ed_pubkey()),
                 100,
                 |m| m == mac(5)
             ),
@@ -437,7 +479,7 @@ mod tests {
                 &admin_kp.ed_pubkey(),
                 Some(&admin_cert),
                 Some(&anchor),
-                &own.ed_pubkey(),
+                Some(&own.ed_pubkey()),
                 999,
                 |_| false
             ),
@@ -468,7 +510,7 @@ mod tests {
                 &stranger.ed_pubkey(),
                 Some(&member_cert),
                 Some(&anchor),
-                &own.ed_pubkey(),
+                Some(&own.ed_pubkey()),
                 100,
                 |_| false
             ),
@@ -480,7 +522,7 @@ mod tests {
                 &stranger.ed_pubkey(),
                 None,
                 Some(&anchor),
-                &own.ed_pubkey(),
+                Some(&own.ed_pubkey()),
                 100,
                 |_| false
             ),
@@ -604,7 +646,7 @@ mod tests {
                     &stranger.ed_pubkey(),
                     cert,
                     None,
-                    &own.ed_pubkey(),
+                    Some(&own.ed_pubkey()),
                     now,
                     |_| false
                 ),
@@ -619,7 +661,7 @@ mod tests {
                 &own.ed_pubkey(),
                 Some(&admin_cert),
                 None,
-                &own.ed_pubkey(),
+                Some(&own.ed_pubkey()),
                 100,
                 |_| false
             ),
@@ -651,7 +693,7 @@ mod tests {
                 &attacker.ed_pubkey(),
                 Some(&cert),
                 Some(&anchor),
-                &own.ed_pubkey(),
+                Some(&own.ed_pubkey()),
                 100,
                 |_| false
             ),
@@ -668,7 +710,7 @@ mod tests {
                 &attacker.ed_pubkey(),
                 Some(&cert),
                 Some(&anchor),
-                &own.ed_pubkey(),
+                Some(&own.ed_pubkey()),
                 100,
                 |_| false
             ),

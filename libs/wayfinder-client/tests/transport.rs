@@ -380,7 +380,7 @@ async fn client_roundtrips_against_real_tls_server() {
     tokio::spawn(async move {
         while let Some(reply) = snapshot_rx.recv().await {
             let _ = reply.send(wayfinder_server::AuthSnapshot {
-                own_key: node_key,
+                own_key: Some(node_key),
                 anchor: None,
                 revoked: Vec::new(),
             });
