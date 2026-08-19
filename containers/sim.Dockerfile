@@ -178,8 +178,16 @@ if [ -n "${PROVIDER:-}" ]; then
 provider:
   root_seed_path: /ca/seed
   mesh_id: ${MESH_ID}
+  # Longer than the simulation, deliberately: nothing enrolls at runtime here
+  # and no certificate should expire mid-scenario. Both escapes below are what
+  # a real deployment must NOT copy — the node refuses either by default.
   cert_ttl_secs: 100000000000
-  require_approval: ${REQUIRE_APPROVAL:-false}
+  allow_unbounded_cert_ttl: true
+  # With no token, this CA signs for whoever asks. Right for a closed simulation
+  # on a private docker network, and stated rather than arrived at: omitting the
+  # field would give the node the closed posture, which holds every request for
+  # an operator.
+  auto_approve: ${AUTO_APPROVE:-true}
   state_path: /var/lib/wayfinder/ca-state.json
 YAML
 fi

@@ -920,7 +920,7 @@ mod tests {
         let kp = Keypair::from_seed(&seed);
         let mac_addr = mac(1);
 
-        let mut ca = CertAuthority::new(&[9u8; 32], 0xABCD, 10_000, None, false);
+        let mut ca = CertAuthority::new(&[9u8; 32], 0xABCD, 10_000, None, true);
         ca.set_now_unix(1_700_000_000);
         let cert = match ca
             .submit_csr(mac_addr.as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey(), "")

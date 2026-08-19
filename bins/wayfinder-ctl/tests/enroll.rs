@@ -160,17 +160,26 @@ impl WayfinderDataProvider for ProviderMock {
     }
 }
 
-/// Spawn a provider node (mesh `0xABCD`, optional token) and return a bootstrap
-/// [`Endpoint`] for it.
+/// Spawn an auto-approving provider node (mesh `0xABCD`, optional token) — one
+/// that signs on submission — and return a bootstrap [`Endpoint`] for it.
 async fn spawn_provider(token: Option<String>) -> Endpoint {
-    spawn_provider_with(token, false).await
+    spawn_provider_with(token, true).await
 }
 
-/// Spawn a provider node, choosing whether it requires operator approval, and
-/// return an [`Endpoint`] that bootstraps against it (the node is un-enrolled at
-/// the transport layer, so proving its own key is admitted).
-async fn spawn_provider_with(token: Option<String>, require_approval: bool) -> Endpoint {
-    spawn_provider_full(token, require_approval, false).await
+/// Spawn a provider node in the closed posture, which holds each request until
+/// an operator approves it, and return a bootstrap [`Endpoint`] for it.
+///
+/// A named helper rather than a bool at the call site: which of the two
+/// enrollment paths a test drives is the most important thing about it.
+async fn spawn_approval_gated_provider() -> Endpoint {
+    spawn_provider_with(None, false).await
+}
+
+/// Spawn a provider node, choosing its enrollment posture, and return an
+/// [`Endpoint`] that bootstraps against it (the node is un-enrolled at the
+/// transport layer, so proving its own key is admitted).
+async fn spawn_provider_with(token: Option<String>, auto_approve: bool) -> Endpoint {
+    spawn_provider_full(token, auto_approve, false).await
 }
 
 /// Spawn a provider node, and choose whether it is *itself* enrolled — whether
@@ -183,14 +192,14 @@ async fn spawn_provider_with(token: Option<String>, require_approval: bool) -> E
 /// is exactly what a node asking to join is.
 async fn spawn_provider_full(
     token: Option<String>,
-    require_approval: bool,
+    auto_approve: bool,
     provider_enrolled: bool,
 ) -> Endpoint {
     // The node's TLS identity seed; the bootstrap client presents this same key.
     let seed = [9u8; 32];
     let node_key = Keypair::from_seed(&seed).ed_pubkey();
 
-    let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, token, require_approval);
+    let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, token, auto_approve);
     ca.set_now_unix(100);
     let anchor =
         provider_enrolled.then(|| TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap());
@@ -247,7 +256,7 @@ async fn spawn_provider_full(
 /// that would have got it one.
 #[tokio::test]
 async fn a_node_with_no_certificate_can_enroll_with_an_enrolled_provider() {
-    let endpoint = spawn_provider_full(None, false, true).await;
+    let endpoint = spawn_provider_full(None, true, true).await;
     let dir = tempfile::tempdir().unwrap();
     let anchor_path = dir.path().join("anchor");
     let cert_path = dir.path().join("cert");
@@ -276,7 +285,7 @@ async fn a_node_with_no_certificate_can_enroll_with_an_enrolled_provider() {
 /// approve its own request.
 #[tokio::test]
 async fn an_enrolling_node_cannot_do_anything_but_enroll() {
-    let endpoint = spawn_provider_full(None, true, true).await;
+    let endpoint = spawn_provider_full(None, false, true).await;
 
     let err = run_query(Command::ListCerts, &endpoint, OutputFormat::Human)
         .await
@@ -517,7 +526,7 @@ async fn wait_for_pending(endpoint: &Endpoint) {
 
 #[tokio::test]
 async fn enroll_waits_for_operator_approval_then_succeeds() {
-    let endpoint = spawn_provider_with(None, true).await;
+    let endpoint = spawn_approval_gated_provider().await;
     let dir = tempfile::tempdir().unwrap();
     let cert_path = dir.path().join("cert");
     let anchor_path = dir.path().join("anchor");
@@ -584,7 +593,7 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
 
 #[tokio::test]
 async fn enroll_fails_when_operator_denies() {
-    let endpoint = spawn_provider_with(None, true).await;
+    let endpoint = spawn_approval_gated_provider().await;
     let dir = tempfile::tempdir().unwrap();
 
     let err = run_query(

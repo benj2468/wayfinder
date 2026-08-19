@@ -421,6 +421,10 @@ def render_compose(require_approval: bool = False) -> str:
     Security tab) instead of auto-signing on submission. Nothing in this sim
     enrols at runtime — every node is minted a certificate up front — so this
     only affects a CSR you submit yourself, by hand.
+
+    The flag keeps the operator's imperative ("make me approve"); the node's own
+    field says whether approval is automatic, so this renders as
+    ``AUTO_APPROVE: "false"``.
     """
     links = dedup_links(build_links())
     nodes = build_nodes(links)
@@ -523,8 +527,9 @@ def render_compose(require_approval: bool = False) -> str:
             # Gate hand-submitted CSRs on operator approval instead of
             # auto-signing. Nothing enrols on its own here — every node is
             # already certified — so this only affects a CSR you submit
-            # yourself.
-            e(f'      REQUIRE_APPROVAL: "{str(require_approval).lower()}"')
+            # yourself. The node's own field says whether approval is
+            # automatic, so requiring approval means switching that off.
+            e(f'      AUTO_APPROVE: "{str(not require_approval).lower()}"')
         for key, value in cfg["env"].items():
             e(f"      {key}: {value}")
         # Mesh links (map form so we can pin a static IP on the mgmt net), plus

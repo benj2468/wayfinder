@@ -168,10 +168,9 @@ fn provider_snapshot() -> NodeSnapshot {
     let mut snap = seeded_snapshot();
     if let Some(sec) = snap.security.as_mut() {
         sec.enrollment = Some(EnrollmentPolicyStatus {
-            require_approval: true,
+            auto_approve: false,
             cert_ttl_secs: 86_400,
             enrollment_token_set: true,
-            enrollment_token: PROVIDER_TOKEN.to_string(),
         });
     }
     snap.pending_csrs = Some(ListPendingCsrsResponse { pending: vec![] });
@@ -783,12 +782,17 @@ fn security_offers_a_provider_the_details_a_joining_node_needs() {
         html.contains("Provider address") && html.contains("Provider key"),
         "the two non-secret values: {html}"
     );
-    // Every row offers a copy button, since none of them can be retyped
-    // reliably — the key least of all.
+    // The two values that ride the poll each offer a copy button, since neither
+    // can be retyped reliably — the key least of all. The token has none yet:
+    // it is not in the snapshot at all until an operator asks for it.
     assert_eq!(
         html.matches("wf-copy-button").count(),
-        3,
-        "address, key and token are each copyable: {html}"
+        2,
+        "address and key are copyable: {html}"
+    );
+    assert!(
+        html.contains("Show token"),
+        "and the token is fetched on request: {html}"
     );
     // The address comes from the connection, not from the snapshot.
     assert!(
@@ -797,20 +801,26 @@ fn security_offers_a_provider_the_details_a_joining_node_needs() {
     );
 }
 
-/// The token is copyable without ever being drawn. A dashboard is read over
-/// someone's shoulder and pasted into chats as a screenshot; the mesh's shared
-/// secret must not be sitting in the markup.
+/// The rendered page carries no enrollment token, because the snapshot it is
+/// rendered from carries none.
+///
+/// This test used to assert that a token the snapshot *did* carry was masked in
+/// the markup — true, and a weaker property than its name claimed: the value
+/// still crossed the wire on every poll and sat in the browser's memory. The
+/// polled status now reports only that a token is required, and the value comes
+/// back from `reveal_enrollment_token` when an operator asks. What is asserted
+/// here is therefore the absence, not the masking.
 #[test]
-fn security_never_renders_the_enrollment_token() {
+fn security_renders_no_enrollment_token_because_the_poll_carries_none() {
     let html = render_with(Some(provider_snapshot()), || view! { <Security /> });
 
     assert!(
         !html.contains(PROVIDER_TOKEN),
-        "the token is masked, not printed: {html}"
+        "no token value in the markup: {html}"
     );
     assert!(
-        html.contains("••••••••"),
-        "and something stands in its place, so the row is not read as empty: {html}"
+        html.contains("Show token"),
+        "the row offers to fetch it instead: {html}"
     );
 }
 
@@ -853,13 +863,16 @@ fn security_says_when_there_is_no_token_to_hand_over() {
     let mut snap = provider_snapshot();
     if let Some(policy) = snap.security.as_mut().and_then(|s| s.enrollment.as_mut()) {
         policy.enrollment_token_set = false;
-        policy.enrollment_token = String::new();
     }
     let html = render_with(Some(snap), || view! { <Security /> });
 
     assert!(
         html.contains("Not required"),
         "the token row states there is none: {html}"
+    );
+    assert!(
+        !html.contains("Show token"),
+        "and offers nothing to fetch: {html}"
     );
     assert_eq!(
         html.matches("wf-copy-button").count(),
@@ -868,35 +881,30 @@ fn security_says_when_there_is_no_token_to_hand_over() {
     );
 }
 
-/// A token that is *set* but whose value did not come back must never read as
-/// "no token required".
+/// A required token that has not been fetched must never read as "no token
+/// required".
 ///
 /// The two are opposite claims about whether the mesh is gated, and only one of
-/// them stops an operator looking for the token they need. `enrollment_token`
-/// being empty means only that this node did not report it — the `.proto` says
-/// so in as many words — so the authoritative flag is what the panel branches
-/// on. Inferring from emptiness is a bug this once had.
+/// them stops an operator looking for the token they need. Nothing about the
+/// value's absence from the snapshot says the mesh is open — the flag says
+/// that, and the flag is what the panel branches on. Inferring from emptiness
+/// is a bug this once had.
 #[test]
-fn security_does_not_read_a_withheld_token_as_an_open_mesh() {
-    let mut snap = provider_snapshot();
-    if let Some(policy) = snap.security.as_mut().and_then(|s| s.enrollment.as_mut()) {
-        policy.enrollment_token_set = true;
-        policy.enrollment_token = String::new();
-    }
-    let html = render_with(Some(snap), || view! { <Security /> });
+fn security_does_not_read_an_unfetched_token_as_an_open_mesh() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Security /> });
 
     assert!(
         !html.contains("Not required"),
         "a gated mesh must not be described as open: {html}"
     );
     assert!(
-        html.contains("did not report it"),
-        "it says the value is missing, not that none is needed: {html}"
+        html.contains("Show token"),
+        "it offers to fetch the value instead: {html}"
     );
     assert_eq!(
         html.matches("wf-copy-button").count(),
         2,
-        "nothing to copy for a value the node withheld: {html}"
+        "nothing to copy for a value that has not been asked for: {html}"
     );
 }
 

@@ -152,31 +152,66 @@ message GetSecurityStatusResponse {
 // reported by GetSecurityStatus.  The read counterpart to the
 // EnrollmentPolicy message SetConfig accepts.
 message EnrollmentPolicyStatus {
-  // Whether a submitted CSR is parked as pending until an operator approves
-  // it, rather than being signed on submission.
-  bool require_approval = 1;
+  // Field 1 carried the same posture the other way round, as
+  // `require_approval`.  It was replaced rather than renamed in place because
+  // the meaning inverted: a peer reading the old name off this number would
+  // read every posture backwards, and reporting a provider that signs for
+  // anyone as one that holds requests for review is the worst direction for
+  // that mistake to go.  A new number makes a version mismatch read as "not
+  // reported" instead.
+  reserved 1;
+  reserved "require_approval";
+
+  // Whether a submitted CSR is signed on submission, rather than parked as
+  // pending until an operator approves it.  False is the closed posture and the
+  // default a provider gets by saying nothing.
+  bool auto_approve = 5;
 
   // The validity window applied to issued certificates, in seconds.
   uint64 cert_ttl_secs = 2;
 
   // Whether a shared enrollment token is configured, so a CSR must present a
-  // matching value.  Remains the authoritative flag: enrollment_token below is
-  // a convenience for handing the secret on, and a client must not infer "no
-  // token" from an empty one.
+  // matching value.  Whether one is required is all this message says; the
+  // value is handed out only by RevealEnrollmentToken, one request at a time.
   bool enrollment_token_set = 3;
 
-  // The shared enrollment token itself, empty when none is set.
-  //
-  // Reported so an operator can hand it to the node that is joining — the
-  // provider's dashboard is where the token lives, and the alternative is
-  // replacing a working token just to learn it.  This deliberately reverses an
-  // earlier rule that never reported it.  What makes it safe is who can ask:
-  // GetSecurityStatus is reachable only by a client authenticated as an admin
-  // or as this node itself, which are exactly the clients that may already
-  // replace or clear the token through SetConfig, so disclosure confers nothing
-  // they did not have.  An enrollment-tier connection cannot reach this request
-  // at all (see wayfinder-server's authz::permits).
-  string enrollment_token = 4;
+  // Field 4 carried the token itself.  It was removed because this message is
+  // polled: a dashboard asks for it once a second, so the secret crossed the
+  // wire, entered a browser and reached anything that formats this type
+  // continuously, for the sake of an operator reading it perhaps twice in the
+  // life of a mesh.  RevealEnrollmentToken now hands it over on request, which
+  // is also what makes each disclosure a discrete, logged act.
+  reserved 4;
+  reserved "enrollment_token";
+}
+
+// Ask a provider-mode node for the shared enrollment token it is applying.
+//
+// Split from GetSecurityStatus because that request is polled and this answer
+// is a secret: a value that only travels when someone asks for it can be
+// logged as a disclosure, while one riding a poll cannot be told apart from
+// the traffic it rides on.  Reachable only by a client authenticated as an
+// admin or as this node itself — exactly the clients that may already replace
+// or clear the token through SetConfig, so what is disclosed confers nothing
+// they did not have.  An enrollment-tier connection cannot reach it at all
+// (see wayfinder-server's authz::permits).
+message RevealEnrollmentTokenRequest {}
+
+// The admission secret a provider-mode node is applying, if any.
+//
+// A oneof rather than a string plus a flag: "no token is required" and "a
+// token is required whose value is the empty string" are different states, and
+// proto3's non-optional string cannot tell them apart.
+message RevealEnrollmentTokenResponse {
+  // Which admission rule is in force.
+  oneof admission {
+    // No token is required: a CSR is admitted on the policy's other terms
+    // (operator approval, or nothing at all).
+    Empty open = 1;
+
+    // The token a joining node must present.  Never empty.
+    string token = 2;
+  }
 }
 
 // Request recent log records from the node's bounded in-memory ring.
@@ -467,9 +502,17 @@ message RuntimeConfig {
 // issued keep the lifetime they were signed with, and CSRs already held keep
 // their place in the approval queue.
 message EnrollmentPolicy {
-  // Park a submitted CSR as pending until an operator approves it (true),
-  // rather than signing it on submission (false).
-  optional bool require_approval = 1;
+  // Field 1 carried the same posture the other way round, as
+  // `require_approval`; see EnrollmentPolicyStatus for why the inversion took
+  // a new number instead of a rename.  On this side the hazard is worse than a
+  // misread: a peer setting the old name would open a provider it meant to
+  // close.
+  reserved 1;
+  reserved "require_approval";
+
+  // Sign a submitted CSR on submission (true), rather than parking it as
+  // pending until an operator approves it (false).
+  optional bool auto_approve = 5;
 
   // The validity window to apply to certificates issued from now on, in
   // seconds.  Keep it short — passive expiry is the primary revocation
@@ -664,6 +707,9 @@ message WayfinderRequest {
 
     // Change which log records the node emits, at runtime.
     SetLogLevelRequest set_log_level = 22;
+
+    // Read the shared enrollment token in force (provider mode).
+    RevealEnrollmentTokenRequest reveal_enrollment_token = 23;
   }
 }
 
@@ -1244,5 +1290,8 @@ message WayfinderResponse {
 
     // Response to SetLogLevelRequest.
     LogFilter log_filter = 18;
+
+    // Response to RevealEnrollmentTokenRequest.
+    RevealEnrollmentTokenResponse enrollment_token = 19;
   }
 }

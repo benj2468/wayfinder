@@ -593,14 +593,22 @@ async fn main() -> anyhow::Result<()> {
                     provider_cfg.root_seed_path
                 )
             })?;
-        driver.set_provider(
-            CertAuthority::from_config(&root_seed, &provider_cfg)
-                .map_err(|e| anyhow!("failed to load certificate-authority state: {e}"))?,
-        );
+        let ca = CertAuthority::from_config(&root_seed, &provider_cfg)
+            .map_err(|e| anyhow!("failed to load certificate-authority state: {e}"))?;
+        // The posture is worth an operator's attention at startup, and it is
+        // read back off the authority rather than off the config: a persisted
+        // runtime override wins over the YAML, so the config alone can say the
+        // wrong thing. `auto_approve` means this node signs a membership
+        // certificate for whoever asks (subject to the token, if one is set);
+        // off means requests queue for approval.
+        let policy = ca.enrollment_policy();
         tracing::info!(
+            auto_approve = policy.auto_approve,
+            enrollment_token_set = policy.enrollment_token_set,
             "certificate-authority (provider) mode enabled (mesh_id = {:#x})",
             provider_cfg.mesh_id
         );
+        driver.set_provider(ca);
     }
 
     // Hand the store to the driver last, so every startup-time read of the

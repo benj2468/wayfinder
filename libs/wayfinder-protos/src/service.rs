@@ -30,6 +30,7 @@ use crate::wayfinder::v1alpha::OgmSchedule;
 use crate::wayfinder::v1alpha::OgmScheduleEntry;
 use crate::wayfinder::v1alpha::PendingCsr;
 use crate::wayfinder::v1alpha::ResolveRouteResponse;
+use crate::wayfinder::v1alpha::RevealEnrollmentTokenResponse;
 use crate::wayfinder::v1alpha::RoutingEntry;
 use crate::wayfinder::v1alpha::RoutingTable;
 use crate::wayfinder::v1alpha::SubmitCsrResponse;
@@ -38,6 +39,7 @@ use crate::wayfinder::v1alpha::Throughput;
 use crate::wayfinder::v1alpha::WayfinderRequest;
 use crate::wayfinder::v1alpha::WayfinderResponse;
 use crate::wayfinder::v1alpha::resolve_route_response::Egress as EgressKind;
+use crate::wayfinder::v1alpha::reveal_enrollment_token_response::Admission;
 use crate::wayfinder::v1alpha::submit_csr_response::Outcome as CsrOutcomeKind;
 use crate::wayfinder::v1alpha::wayfinder_request::Request as RequestKind;
 use crate::wayfinder::v1alpha::wayfinder_response::Response as ResponseKind;
@@ -220,9 +222,9 @@ pub struct RuntimeConfigData {
 /// so an implementation does not have to re-check either.
 #[derive(Clone, Default)]
 pub struct EnrollmentPolicyData {
-    /// Present to park submitted CSRs pending operator approval (`true`) or to
-    /// sign them on submission (`false`).
-    pub require_approval: Option<bool>,
+    /// Present to sign submitted CSRs on submission (`true`) or to park them
+    /// pending operator approval (`false`).
+    pub auto_approve: Option<bool>,
     /// Present to set the validity window applied to certificates issued from
     /// now on, in seconds.  Never zero.
     pub cert_ttl_secs: Option<u64>,
@@ -242,29 +244,70 @@ pub enum TokenUpdate {
     /// Clear the token: enrollment becomes open (TOFU).
     Clear,
     /// Require this token on a submitted CSR.  Never empty.
-    Set(String),
+    Set(SharedSecret),
+}
+
+/// A secret that several parties hold in common — today, the shared enrollment
+/// token.
+///
+/// A newtype for one reason: its [`Debug`] prints a placeholder. The derived
+/// `Debug` on a `String` field prints the value, and this crate's types are
+/// formatted with `{:?}` in error paths and `tracing` fields — one of which
+/// feeds the bounded log ring that `GetLogs` serves to a browser. Reading the
+/// value takes [`expose`](Self::expose), which is a word the reader of a diff
+/// can search for.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SharedSecret(String);
+
+impl SharedSecret {
+    /// Wrap a secret value.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Read the secret. Deliberately not `Display`/`AsRef`: every place the
+    /// value escapes should be one a search for this name finds.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for SharedSecret {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("SharedSecret(<redacted>)")
+    }
+}
+
+/// How a provider decides who may enroll, as answered by
+/// [`WayfinderDataProvider::reveal_enrollment_token`].
+///
+/// A sum type rather than a flag beside an optional string: "no token is
+/// required" and "the required token is the empty string" are different
+/// states, and a `(bool, Option<String>)` pair admits two more that mean
+/// nothing at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EnrollmentAdmission {
+    /// No token is required; a CSR is admitted on the policy's other terms.
+    Open,
+    /// A CSR must present this token.
+    Token(SharedSecret),
 }
 
 /// Intermediate representation of the enrollment policy a provider-mode node
 /// is currently applying, reported inside [`SecurityStatusData`].
 ///
-/// Carries whether a token is set and, when one is, the token itself; see
-/// [`enrollment_token`](EnrollmentPolicyStatusData::enrollment_token) for who
-/// may read it and why that is safe.
+/// Says whether a token is required and never what it is: this travels on a
+/// polled response, and the value is handed over one request at a time by
+/// [`WayfinderDataProvider::reveal_enrollment_token`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EnrollmentPolicyStatusData {
-    /// Whether a submitted CSR is parked pending operator approval.
-    pub require_approval: bool,
+    /// Whether a submitted CSR is signed on submission, rather than parked
+    /// pending operator approval.
+    pub auto_approve: bool,
     /// The validity window applied to issued certificates, in seconds.
     pub cert_ttl_secs: u64,
     /// Whether a shared enrollment token is configured.
     pub enrollment_token_set: bool,
-    /// The token itself, for an operator who has to hand it to a joining node;
-    /// `None` when none is set.  See the field comment in the `.proto` for why
-    /// a secret is reported at all, and to whom.
-    /// [`enrollment_token_set`](Self::enrollment_token_set) stays the flag to
-    /// read for *whether* one is required.
-    pub enrollment_token: Option<String>,
 }
 
 /// Intermediate representation of one interface's smoothed throughput,
@@ -569,6 +612,19 @@ pub trait WayfinderDataProvider {
         Err("node is not a certificate-authority provider".into())
     }
 
+    /// Provider mode: the admission rule this node applies to a submitted CSR
+    /// — open, or a shared token whose value this returns.  Default errors
+    /// (not a provider).
+    ///
+    /// Split from [`security_status`](Self::security_status) because that one
+    /// is polled: a secret riding a poll is disclosed continuously and cannot
+    /// be told apart from the traffic it rides on, while one that only travels
+    /// when asked for can be logged as a disclosure. An implementation should
+    /// treat every call as an audited read.
+    fn reveal_enrollment_token(&self) -> Result<EnrollmentAdmission, String> {
+        Err("node is not a certificate-authority provider".into())
+    }
+
     /// Provider mode: revoke a node, signing and flooding a revocation record.
     /// Default errors.
     fn revoke_node(&mut self, node_mac: &[u8]) -> Result<(), String> {
@@ -715,11 +771,13 @@ fn enrollment_policy_data(policy: EnrollmentPolicy) -> Result<EnrollmentPolicyDa
                     .into(),
             );
         }
-        Some(EnrollmentTokenUpdate::EnrollmentToken(token)) => Some(TokenUpdate::Set(token)),
+        Some(EnrollmentTokenUpdate::EnrollmentToken(token)) => {
+            Some(TokenUpdate::Set(SharedSecret::new(token)))
+        }
     };
 
     Ok(EnrollmentPolicyData {
-        require_approval: policy.require_approval,
+        auto_approve: policy.auto_approve,
         cert_ttl_secs: policy.cert_ttl_secs,
         enrollment_token,
     })
@@ -753,19 +811,36 @@ fn request_kind_name(k: &RequestKind) -> &'static str {
         RequestKind::GetLinkFeaturesTable(_) => "GetLinkFeaturesTable",
         RequestKind::GetLogs(_) => "GetLogs",
         RequestKind::SetLogLevel(_) => "SetLogLevel",
+        RequestKind::RevealEnrollmentToken(_) => "RevealEnrollmentToken",
     }
 }
 
-/// Whether `k` mutates node/provider state, as opposed to a read-only query.
-/// Drives the log level in [`WayfinderService::handle`]: mutations are
-/// `info!` (infrequent, operator-relevant audit trail — new auth material,
-/// a config change, a CSR issued/approved/denied, a node revoked); queries
-/// are `debug!` (frequent — e.g. every TUI refresh tick — and off by
-/// default). Deliberately exhaustive (no wildcard arm) so a newly added
-/// `RequestKind` variant forces an explicit classification here rather than
-/// silently defaulting to one side.
-fn request_is_mutation(k: &RequestKind) -> bool {
+/// What kind of record a request deserves in the node's log.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Audited {
+    /// Changes node or provider state: new auth material, a config change, a
+    /// CSR issued/approved/denied, a node revoked.
+    Mutation,
+    /// Changes nothing but hands out a secret. Worth the same record as a
+    /// mutation and for the same reason — an operator asking "who learned the
+    /// enrollment token, and when?" has nowhere else to look — but it is not a
+    /// mutation, and a log line calling it one would be a lie about what
+    /// happened.
+    Disclosure,
+    /// Reads public state. Frequent (a dashboard polls several per second), so
+    /// logged at `debug!` and off by default.
+    Query,
+}
+
+/// Classify `k` for [`WayfinderService::handle`]'s audit record.
+///
+/// Deliberately exhaustive (no wildcard arm) so a newly added `RequestKind`
+/// variant forces an explicit classification here rather than silently
+/// defaulting to the quietest one.
+fn audited(k: &RequestKind) -> Audited {
     match k {
+        RequestKind::RevealEnrollmentToken(_) => Audited::Disclosure,
+
         RequestKind::SetAuth(_)
         | RequestKind::SetConfig(_)
         | RequestKind::SubmitCsr(_)
@@ -774,7 +849,7 @@ fn request_is_mutation(k: &RequestKind) -> bool {
         | RequestKind::DenyCsr(_)
         // Changing what a node records is an operator action worth an audit
         // trail, and infrequent enough to afford one.
-        | RequestKind::SetLogLevel(_) => true,
+        | RequestKind::SetLogLevel(_) => Audited::Mutation,
 
         RequestKind::GetNodeInfo(_)
         | RequestKind::GetRoutingTable(_)
@@ -793,7 +868,7 @@ fn request_is_mutation(k: &RequestKind) -> bool {
         // Deliberately a query, and deliberately unlogged: a client polls this
         // on every refresh tick, and a record emitted per poll would fill the
         // very ring the poll is reading.
-        | RequestKind::GetLogs(_) => false,
+        | RequestKind::GetLogs(_) => Audited::Query,
     }
 }
 
@@ -816,8 +891,10 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
     pub fn handle(&mut self, request: WayfinderRequest) -> WayfinderResponse {
         if let Some(kind) = &request.request {
             let name = request_kind_name(kind);
-            if request_is_mutation(kind) {
-                info!(kind = name, "management API mutation");
+            match audited(kind) {
+                Audited::Mutation => info!(kind = name, "management API mutation"),
+                Audited::Disclosure => info!(kind = name, "management API secret disclosed"),
+                Audited::Query => {}
             }
         }
 
@@ -1018,14 +1095,27 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                     require_auth: s.require_auth,
                     lazy_cert_distribution: s.lazy_cert_distribution,
                     enrollment: s.enrollment.map(|e| EnrollmentPolicyStatus {
-                        require_approval: e.require_approval,
+                        auto_approve: e.auto_approve,
                         cert_ttl_secs: e.cert_ttl_secs,
                         enrollment_token_set: e.enrollment_token_set,
-                        enrollment_token: e.enrollment_token.unwrap_or_default(),
                     }),
                     own_ed_pubkey: s.own_ed_pubkey,
                     own_x_pubkey: s.own_x_pubkey,
                 })
+            }
+
+            Some(RequestKind::RevealEnrollmentToken(_)) => {
+                match self.provider.reveal_enrollment_token() {
+                    Ok(admission) => ResponseKind::EnrollmentToken(RevealEnrollmentTokenResponse {
+                        admission: Some(match admission {
+                            EnrollmentAdmission::Open => Admission::Open(Empty {}),
+                            EnrollmentAdmission::Token(token) => {
+                                Admission::Token(token.expose().into())
+                            }
+                        }),
+                    }),
+                    Err(message) => ResponseKind::Error(ErrorResponse { message }),
+                }
             }
 
             Some(RequestKind::ResolveRoute(req)) => {
@@ -1227,6 +1317,7 @@ mod tests {
     use crate::wayfinder::v1alpha::GetSecurityStatusRequest;
     use crate::wayfinder::v1alpha::GetThroughputRequest;
     use crate::wayfinder::v1alpha::ResolveRouteRequest;
+    use crate::wayfinder::v1alpha::RevealEnrollmentTokenRequest;
     use crate::wayfinder::v1alpha::RuntimeConfig;
     use crate::wayfinder::v1alpha::SetConfigRequest;
     use crate::wayfinder::v1alpha::TrickleConfig;
@@ -1261,6 +1352,9 @@ mod tests {
         /// The posture this provider reports, so a test can prove the fields
         /// reach the wire rather than being dropped in the projection.
         security_status: SecurityStatusData,
+        /// The admission rule this provider reveals, or `None` for a node that
+        /// is not a provider at all.
+        enrollment_admission: Option<EnrollmentAdmission>,
     }
 
     impl WayfinderDataProvider for MockProvider {
@@ -1325,6 +1419,11 @@ mod tests {
         }
         fn security_status(&self) -> SecurityStatusData {
             self.security_status.clone()
+        }
+        fn reveal_enrollment_token(&self) -> Result<EnrollmentAdmission, String> {
+            self.enrollment_admission
+                .clone()
+                .ok_or_else(|| "node is not a certificate-authority provider".into())
         }
         fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
             match &self.set_log_level_error {
@@ -1809,7 +1908,7 @@ mod tests {
             request: Some(RequestKind::SetConfig(SetConfigRequest {
                 config: Some(RuntimeConfig {
                     enrollment: Some(EnrollmentPolicy {
-                        require_approval: Some(true),
+                        auto_approve: Some(false),
                         cert_ttl_secs: Some(3600),
                         enrollment_token_update: Some(
                             enrollment_policy::EnrollmentTokenUpdate::EnrollmentToken(
@@ -1830,11 +1929,11 @@ mod tests {
             .enrollment
             .as_ref()
             .expect("enrollment policy forwarded");
-        assert_eq!(policy.require_approval, Some(true));
+        assert_eq!(policy.auto_approve, Some(false));
         assert_eq!(policy.cert_ttl_secs, Some(3600));
         assert_eq!(
             policy.enrollment_token,
-            Some(TokenUpdate::Set("hunter2".into()))
+            Some(TokenUpdate::Set(SharedSecret::new("hunter2")))
         );
     }
 
@@ -1952,10 +2051,9 @@ mod tests {
                 require_auth: true,
                 lazy_cert_distribution: true,
                 enrollment: Some(EnrollmentPolicyStatusData {
-                    require_approval: true,
+                    auto_approve: false,
                     cert_ttl_secs: 86_400,
                     enrollment_token_set: true,
-                    enrollment_token: Some("join-us".into()),
                 }),
                 ..Default::default()
             },
@@ -1970,19 +2068,127 @@ mod tests {
                 assert!(status.require_auth);
                 assert!(status.lazy_cert_distribution);
                 let enrollment = status.enrollment.expect("provider reports a policy");
-                assert!(enrollment.require_approval);
+                assert!(!enrollment.auto_approve);
                 assert_eq!(enrollment.cert_ttl_secs, 86_400);
                 assert!(
                     enrollment.enrollment_token_set,
                     "the status reports that a token is set"
                 );
-                assert_eq!(
-                    enrollment.enrollment_token, "join-us",
-                    "and carries it, so an operator can hand it to a joining node"
-                );
             }
             other => panic!("expected SecurityStatus, got {:?}", proto_kind_name(&other)),
         }
+    }
+
+    /// The polled status says a token is required and never what it is.
+    ///
+    /// This response rides a once-a-second poll into a browser; a secret on it
+    /// is disclosed continuously to everything that touches the snapshot, for
+    /// the sake of an operator who reads it perhaps twice in the life of a
+    /// mesh.
+    #[test]
+    fn the_polled_security_status_carries_no_secret() {
+        let provider = MockProvider {
+            security_status: SecurityStatusData {
+                enrollment: Some(EnrollmentPolicyStatusData {
+                    auto_approve: true,
+                    cert_ttl_secs: 86_400,
+                    enrollment_token_set: true,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let ResponseKind::SecurityStatus(status) = handle(
+            provider,
+            RequestKind::GetSecurityStatus(GetSecurityStatusRequest {}),
+        ) else {
+            panic!("expected SecurityStatus");
+        };
+        let mut buf = Vec::new();
+        prost::Message::encode(&status, &mut buf).unwrap();
+        assert!(
+            !buf.windows(7).any(|w| w == b"join-us"),
+            "no token value appears anywhere in the encoded status"
+        );
+    }
+
+    /// The token is handed over by its own request, and a provider with none
+    /// says so as a distinct answer rather than as an empty string.
+    #[test]
+    fn revealing_the_token_is_its_own_request() {
+        let provider = MockProvider {
+            enrollment_admission: Some(EnrollmentAdmission::Token(SharedSecret::new("join-us"))),
+            ..Default::default()
+        };
+        match handle(
+            provider,
+            RequestKind::RevealEnrollmentToken(RevealEnrollmentTokenRequest {}),
+        ) {
+            ResponseKind::EnrollmentToken(response) => assert_eq!(
+                response.admission,
+                Some(
+                    crate::wayfinder::v1alpha::reveal_enrollment_token_response::Admission::Token(
+                        "join-us".into()
+                    )
+                )
+            ),
+            other => panic!(
+                "expected EnrollmentToken, got {:?}",
+                proto_kind_name(&other)
+            ),
+        }
+
+        let open = MockProvider {
+            enrollment_admission: Some(EnrollmentAdmission::Open),
+            ..Default::default()
+        };
+        match handle(
+            open,
+            RequestKind::RevealEnrollmentToken(RevealEnrollmentTokenRequest {}),
+        ) {
+            ResponseKind::EnrollmentToken(response) => assert!(
+                matches!(
+                    response.admission,
+                    Some(crate::wayfinder::v1alpha::reveal_enrollment_token_response::Admission::Open(_))
+                ),
+                "an open provider answers Open, not an empty token"
+            ),
+            other => panic!("expected EnrollmentToken, got {:?}", proto_kind_name(&other)),
+        }
+    }
+
+    /// A node that is not a provider has no token to reveal, and says so as an
+    /// error rather than as "open" — which would read as "anyone may join".
+    #[test]
+    fn revealing_the_token_on_a_non_provider_is_an_error() {
+        match handle(
+            MockProvider::default(),
+            RequestKind::RevealEnrollmentToken(RevealEnrollmentTokenRequest {}),
+        ) {
+            ResponseKind::Error(_) => {}
+            other => panic!("expected Error, got {:?}", proto_kind_name(&other)),
+        }
+    }
+
+    /// A secret does not print itself.
+    ///
+    /// The derived `Debug` on the prost type printed the token in full through
+    /// any `{:?}`, which is one `tracing` call away from the log ring that
+    /// `GetLogs` serves to a browser.
+    #[test]
+    fn a_shared_secret_redacts_itself_in_debug() {
+        let secret = SharedSecret::new("join-us");
+
+        assert!(
+            !alloc::format!("{secret:?}").contains("join-us"),
+            "the secret must not print itself: {secret:?}"
+        );
+        assert_eq!(
+            secret.expose(),
+            "join-us",
+            "and is still readable on purpose"
+        );
     }
 
     /// A node that is not a provider reports no enrollment policy at all,
@@ -2237,11 +2443,12 @@ mod tests {
     }
 
     /// Mutations (writes to node/provider state) log at `info!`; queries
-    /// (reads) log at `debug!` in [`WayfinderService::handle`] — this is the
-    /// classification that decision rests on, so every variant is exercised
-    /// rather than a representative sample.
+    /// (reads) log at `debug!` in [`WayfinderService::handle`], and a
+    /// disclosure earns a record of its own — this is the classification those
+    /// decisions rest on, so every variant is exercised rather than a
+    /// representative sample.
     #[test]
-    fn request_is_mutation_classifies_writes_vs_reads() {
+    fn audited_classifies_writes_disclosures_and_reads() {
         use crate::wayfinder::v1alpha::ApproveCsrRequest;
         use crate::wayfinder::v1alpha::AuthenticateRequest;
         use crate::wayfinder::v1alpha::DenyCsrRequest;
@@ -2257,81 +2464,111 @@ mod tests {
         use crate::wayfinder::v1alpha::SubmitCsrRequest;
 
         // Mutations: change node/provider state.
-        assert!(request_is_mutation(&RequestKind::SetAuth(SetAuthRequest {
-            seed: Vec::new(),
-            cert: Vec::new(),
-            trust_anchor: Vec::new(),
-        })));
-        assert!(request_is_mutation(&RequestKind::SetConfig(
-            SetConfigRequest { config: None }
-        )));
-        assert!(request_is_mutation(&RequestKind::SubmitCsr(
-            SubmitCsrRequest {
+        assert_eq!(
+            Audited::Mutation,
+            audited(&RequestKind::SetAuth(SetAuthRequest {
+                seed: Vec::new(),
+                cert: Vec::new(),
+                trust_anchor: Vec::new(),
+            }))
+        );
+        assert_eq!(
+            Audited::Mutation,
+            audited(&RequestKind::SetConfig(SetConfigRequest { config: None }))
+        );
+        assert_eq!(
+            Audited::Mutation,
+            audited(&RequestKind::SubmitCsr(SubmitCsrRequest {
                 node_mac: Vec::new(),
                 ed_pubkey: Vec::new(),
                 x_pubkey: Vec::new(),
                 enrollment_token: String::new(),
-            }
-        )));
-        assert!(request_is_mutation(&RequestKind::RevokeNode(
-            RevokeNodeRequest {
+            }))
+        );
+        assert_eq!(
+            Audited::Mutation,
+            audited(&RequestKind::RevokeNode(RevokeNodeRequest {
                 node_mac: Vec::new(),
-            }
-        )));
-        assert!(request_is_mutation(&RequestKind::ApproveCsr(
-            ApproveCsrRequest {
+            }))
+        );
+        assert_eq!(
+            Audited::Mutation,
+            audited(&RequestKind::ApproveCsr(ApproveCsrRequest {
                 node_mac: Vec::new(),
-            }
-        )));
-        assert!(request_is_mutation(&RequestKind::DenyCsr(DenyCsrRequest {
-            node_mac: Vec::new(),
-        })));
+            }))
+        );
+        assert_eq!(
+            Audited::Mutation,
+            audited(&RequestKind::DenyCsr(DenyCsrRequest {
+                node_mac: Vec::new(),
+            }))
+        );
 
         // Queries: read-only.
-        assert!(!request_is_mutation(&RequestKind::GetNodeInfo(
-            GetNodeInfoRequest {}
-        )));
-        assert!(!request_is_mutation(&RequestKind::GetRoutingTable(
-            GetRoutingTableRequest {}
-        )));
-        assert!(!request_is_mutation(&RequestKind::GetLinkQualityTable(
-            GetLinkQualityTableRequest {}
-        )));
-        assert!(!request_is_mutation(&RequestKind::ResolveRoute(
-            ResolveRouteRequest {
+        assert_eq!(
+            Audited::Query,
+            audited(&RequestKind::GetNodeInfo(GetNodeInfoRequest {}))
+        );
+        assert_eq!(
+            Audited::Query,
+            audited(&RequestKind::GetRoutingTable(GetRoutingTableRequest {}))
+        );
+        assert_eq!(
+            Audited::Query,
+            audited(&RequestKind::GetLinkQualityTable(
+                GetLinkQualityTableRequest {}
+            ))
+        );
+        assert_eq!(
+            Audited::Query,
+            audited(&RequestKind::ResolveRoute(ResolveRouteRequest {
                 destination: Vec::new(),
-            }
-        )));
-        assert!(!request_is_mutation(&RequestKind::GetOgmSchedule(
-            GetOgmScheduleRequest {}
-        )));
-        assert!(!request_is_mutation(&RequestKind::GetThroughput(
-            GetThroughputRequest {}
-        )));
-        assert!(!request_is_mutation(&RequestKind::GetMetrics(
-            GetMetricsRequest {}
-        )));
-        assert!(!request_is_mutation(&RequestKind::GetTrustAnchor(
-            GetTrustAnchorRequest {}
-        )));
-        assert!(!request_is_mutation(&RequestKind::GetSecurityStatus(
-            GetSecurityStatusRequest {}
-        )));
-        assert!(!request_is_mutation(&RequestKind::ListCerts(
-            ListCertsRequest {}
-        )));
-        assert!(!request_is_mutation(&RequestKind::ListPendingCsrs(
-            ListPendingCsrsRequest {}
-        )));
-        assert!(!request_is_mutation(&RequestKind::GetKeepaliveTable(
-            GetKeepAliveTableRequest {}
-        )));
-        assert!(!request_is_mutation(&RequestKind::Authenticate(
-            AuthenticateRequest { cert: Vec::new() }
-        )));
-        assert!(!request_is_mutation(&RequestKind::GetLinkFeaturesTable(
-            GetLinkFeaturesTableRequest {}
-        )));
+            }))
+        );
+        assert_eq!(
+            Audited::Query,
+            audited(&RequestKind::GetOgmSchedule(GetOgmScheduleRequest {}))
+        );
+        assert_eq!(
+            Audited::Query,
+            audited(&RequestKind::GetThroughput(GetThroughputRequest {}))
+        );
+        assert_eq!(
+            Audited::Query,
+            audited(&RequestKind::GetMetrics(GetMetricsRequest {}))
+        );
+        assert_eq!(
+            Audited::Query,
+            audited(&RequestKind::GetTrustAnchor(GetTrustAnchorRequest {}))
+        );
+        assert_eq!(
+            Audited::Query,
+            audited(&RequestKind::GetSecurityStatus(GetSecurityStatusRequest {}))
+        );
+        assert_eq!(
+            Audited::Query,
+            audited(&RequestKind::ListCerts(ListCertsRequest {}))
+        );
+        assert_eq!(
+            Audited::Query,
+            audited(&RequestKind::ListPendingCsrs(ListPendingCsrsRequest {}))
+        );
+        assert_eq!(
+            Audited::Query,
+            audited(&RequestKind::GetKeepaliveTable(GetKeepAliveTableRequest {}))
+        );
+        assert_eq!(
+            Audited::Query,
+            audited(&RequestKind::Authenticate(AuthenticateRequest {
+                cert: Vec::new()
+            }))
+        );
+        assert_eq!(
+            Audited::Query,
+            audited(&RequestKind::GetLinkFeaturesTable(
+                GetLinkFeaturesTableRequest {}
+            ))
+        );
     }
 
     fn proto_kind_name(k: &ResponseKind) -> &'static str {
@@ -2348,6 +2585,7 @@ mod tests {
             ResponseKind::Error(_) => "Error",
             ResponseKind::Empty(_) => "Empty",
             ResponseKind::ListCerts(_) => "ListCerts",
+            ResponseKind::EnrollmentToken(_) => "EnrollmentToken",
             ResponseKind::ListPendingCsrs(_) => "ListPendingCsrs",
             ResponseKind::TrustAnchor(_) => "TrustAnchor",
             ResponseKind::SubmitCsr(_) => "SubmitCsr",

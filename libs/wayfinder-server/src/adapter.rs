@@ -21,6 +21,7 @@ use wayfinder::wayfinder_auth::RevocationRecord;
 use wayfinder::wayfinder_auth::TrustAnchor;
 use wayfinder_protos::service::CsrOutcome;
 use wayfinder_protos::service::EgressDecisionData;
+use wayfinder_protos::service::EnrollmentAdmission;
 use wayfinder_protos::service::InterfaceThroughputData;
 use wayfinder_protos::service::IssuedCertData;
 use wayfinder_protos::service::KeepAliveEntryData;
@@ -778,6 +779,16 @@ impl<
         }
     }
 
+    fn reveal_enrollment_token(&self) -> Result<EnrollmentAdmission, String> {
+        match &self.ca {
+            Some(ca) => Ok(ca.admission()),
+            // Deliberately an error rather than `Open`: a node that issues no
+            // certificates has no admission rule, and answering "open" would
+            // read as "anyone may join this mesh".
+            None => Err("node is not a certificate-authority provider".to_string()),
+        }
+    }
+
     fn submit_csr(
         &mut self,
         node_mac: &[u8],
@@ -1013,7 +1024,7 @@ mod tests {
         use wayfinder::wayfinder_auth::MembershipCert;
         use wayfinder::wayfinder_auth::TrustAnchor;
 
-        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, true);
         ca.set_now_unix(100);
         let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
         let me = mac(1);
@@ -1398,7 +1409,7 @@ mod tests {
         use wayfinder::wayfinder_auth::MembershipCert;
         use wayfinder::wayfinder_auth::TrustAnchor;
 
-        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, true);
         ca.set_now_unix(100);
         let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
 
@@ -1467,7 +1478,7 @@ mod tests {
         use wayfinder::wayfinder_auth::MembershipCert;
         use wayfinder::wayfinder_auth::TrustAnchor;
 
-        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, true);
         ca.set_now_unix(100);
 
         // The provider node is itself an authenticated member: its own CA issues
@@ -1563,7 +1574,7 @@ mod tests {
         use wayfinder::wayfinder_auth::MembershipCert;
         use wayfinder::wayfinder_auth::TrustAnchor;
 
-        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, true);
         ca.set_now_unix(100);
         let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
 
@@ -1667,7 +1678,7 @@ mod tests {
     fn revoke_node_errors_when_provider_router_has_no_auth() {
         use crate::CertAuthority;
 
-        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, true);
         ca.set_now_unix(100);
         let mut router = CentralRouter::new(mac(1)); // auth disabled
         let mut adapter = RouterAdapter::new(&mut router, Some(&mut ca), Duration::from_secs(0));
@@ -1826,7 +1837,7 @@ mod tests {
     #[test]
     fn set_auth_persists_the_installed_identity() {
         let mut router = CentralRouter::new(mac(1));
-        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
         ca.set_now_unix(1_000);
         let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
         let cert = ca_issue(
@@ -1890,7 +1901,7 @@ mod tests {
     #[test]
     fn set_auth_without_a_seed_certifies_the_existing_identity() {
         let mut router = CentralRouter::new(mac(1));
-        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
         ca.set_now_unix(1_000);
         let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
         // Bound to the MAC the node is *running* under, not the one its key
@@ -1945,7 +1956,7 @@ mod tests {
         // *new* seed, not the one it started with.
         {
             let mut router = CentralRouter::new(mac(1));
-            let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+            let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
             ca.set_now_unix(1_000);
             let new_kp = wayfinder::wayfinder_auth::Keypair::from_seed(&new_seed);
             let cert = ca_issue(
@@ -1976,7 +1987,7 @@ mod tests {
         // still reads back the same seed, and the write-back path still runs.
         {
             let mut router = CentralRouter::new(mac(1));
-            let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+            let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
             ca.set_now_unix(1_000);
             let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&old_seed);
             let cert = ca_issue(&mut ca, mac(1).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
@@ -1999,7 +2010,7 @@ mod tests {
     #[test]
     fn set_auth_without_a_seed_needs_an_identity_to_certify() {
         let mut router = CentralRouter::new(mac(1));
-        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
         ca.set_now_unix(1_000);
         let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
         let cert = ca_issue(&mut ca, mac(1).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
@@ -2036,14 +2047,14 @@ mod tests {
     #[test]
     fn set_auth_rejects_a_cert_with_a_bad_signature() {
         let mut router = CentralRouter::new(mac(1));
-        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
         ca.set_now_unix(1_000);
         let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
         let cert = ca_issue(&mut ca, mac(1).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
 
         // A different root key, same mesh id: the anchor a node would hold if
         // it belonged to a *different* mesh that happened to share an id.
-        let other_ca = crate::CertAuthority::new(&[99; 32], 0xABCD, 10_000, None, false);
+        let other_ca = crate::CertAuthority::new(&[99; 32], 0xABCD, 10_000, None, true);
         let foreign_anchor = other_ca.trust_anchor_bytes();
         let mut store = RecordingStore::default();
 
@@ -2064,7 +2075,7 @@ mod tests {
     #[test]
     fn set_auth_rejects_a_cert_for_the_wrong_mesh() {
         let mut router = CentralRouter::new(mac(1));
-        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
         ca.set_now_unix(1_000);
         let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
         let cert = ca_issue(&mut ca, mac(1).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
@@ -2093,7 +2104,7 @@ mod tests {
     #[test]
     fn set_auth_rejects_an_expired_cert() {
         let mut router = CentralRouter::new(mac(1));
-        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10, None, false);
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10, None, true);
         ca.set_now_unix(1_000);
         let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
         // not_before = 1_000, not_after = 1_010.
@@ -2119,7 +2130,7 @@ mod tests {
     #[test]
     fn set_auth_rejects_a_not_yet_valid_cert() {
         let mut router = CentralRouter::new(mac(1));
-        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
         ca.set_now_unix(1_000);
         let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
         // not_before = 1_000.
@@ -2148,7 +2159,7 @@ mod tests {
     #[test]
     fn set_auth_rejects_a_cert_for_the_wrong_key() {
         let mut router = CentralRouter::new(mac(1));
-        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
         ca.set_now_unix(1_000);
         // The cert names a key other than the one the request is installing.
         let other_kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[4; 32]);
@@ -2181,7 +2192,7 @@ mod tests {
     #[test]
     fn set_auth_rejects_a_cert_for_the_wrong_mac_when_certifying_in_place() {
         let mut router = CentralRouter::new(mac(1));
-        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
         ca.set_now_unix(1_000);
         let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
         // Bound to a MAC other than the one the router actually runs under.
@@ -2209,7 +2220,7 @@ mod tests {
     #[test]
     fn set_auth_with_a_seed_allows_a_new_mac() {
         let mut router = CentralRouter::new(mac(1));
-        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
         ca.set_now_unix(1_000);
         let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
         // Bound to a MAC different from the router's current identity —
@@ -2255,7 +2266,7 @@ mod tests {
         let result =
             RouterAdapter::new(&mut router, None, Duration::ZERO).set_config(RuntimeConfigData {
                 enrollment: Some(wayfinder_protos::service::EnrollmentPolicyData {
-                    require_approval: Some(true),
+                    auto_approve: Some(false),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2268,12 +2279,12 @@ mod tests {
     #[test]
     fn enrollment_policy_round_trips_through_the_provider() {
         let mut router = CentralRouter::new(mac(1));
-        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
 
         RouterAdapter::new(&mut router, Some(&mut ca), Duration::ZERO)
             .set_config(RuntimeConfigData {
                 enrollment: Some(wayfinder_protos::service::EnrollmentPolicyData {
-                    require_approval: Some(true),
+                    auto_approve: Some(false),
                     cert_ttl_secs: Some(4242),
                     ..Default::default()
                 }),
@@ -2284,7 +2295,54 @@ mod tests {
         let status =
             RouterAdapter::new(&mut router, Some(&mut ca), Duration::ZERO).security_status();
         let policy = status.enrollment.expect("a provider reports its policy");
-        assert!(policy.require_approval);
+        assert!(!policy.auto_approve);
         assert_eq!(policy.cert_ttl_secs, 4242);
+    }
+
+    /// The token is reached through its own request, and a node with no
+    /// authority answers with an error rather than with "open".
+    ///
+    /// The distinction is the whole point: "this node issues no certificates"
+    /// and "anyone may join this mesh" are opposite claims, and a client that
+    /// read the second for the first would tell an operator their mesh is
+    /// ungated when it has no gate to be through.
+    #[test]
+    fn the_enrollment_token_is_revealed_only_by_a_provider() {
+        let mut router = CentralRouter::new(mac(1));
+
+        assert!(
+            RouterAdapter::new(&mut router, None, Duration::ZERO)
+                .reveal_enrollment_token()
+                .is_err()
+        );
+
+        let mut ca = crate::CertAuthority::new(
+            &[9; 32],
+            0xABCD,
+            10_000,
+            Some(alloc::string::String::from("hunter2")),
+            true,
+        );
+        assert_eq!(
+            RouterAdapter::new(&mut router, Some(&mut ca), Duration::ZERO)
+                .reveal_enrollment_token(),
+            Ok(EnrollmentAdmission::Token(
+                wayfinder_protos::service::SharedSecret::new("hunter2")
+            ))
+        );
+    }
+
+    /// A provider with no token answers `Open`: a CSR is admitted on the
+    /// policy's other terms, which is a different state from "empty token".
+    #[test]
+    fn a_provider_with_no_token_reveals_open_admission() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
+
+        assert_eq!(
+            RouterAdapter::new(&mut router, Some(&mut ca), Duration::ZERO)
+                .reveal_enrollment_token(),
+            Ok(EnrollmentAdmission::Open)
+        );
     }
 }

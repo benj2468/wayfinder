@@ -16,6 +16,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use wayfinder_protos::service::CsrOutcome;
+use wayfinder_protos::service::EnrollmentAdmission;
 use wayfinder_protos::service::EnrollmentPolicyData;
 use wayfinder_protos::service::EnrollmentPolicyStatusData;
 use wayfinder_protos::service::IssuedCertData;
@@ -76,12 +77,19 @@ pub trait MeshAuthority {
     fn deny_csr(&mut self, node_mac: &[u8]) -> Result<(), String>;
 
     /// The enrollment policy this authority is currently applying, for the
-    /// management API to report.  Carries both whether a token is set and, when
-    /// one is, its value — the reader is already an admin or the node itself,
-    /// and so is already able to replace the token outright, which is why
-    /// reporting it confers nothing new.  `enrollment_token_set` stays the
-    /// authoritative flag: an absent value never means "no token".
+    /// management API to report.  Says whether a token is required and never
+    /// what it is: this answer rides a polled request, and a secret on it is
+    /// disclosed continuously rather than when someone asks.
     fn enrollment_policy(&self) -> EnrollmentPolicyStatusData;
+
+    /// The admission rule in force, token value included — the answer to an
+    /// explicit `RevealEnrollmentToken`.
+    ///
+    /// The reader is already an admin or the node itself, and so is already
+    /// able to replace the token outright, which is why handing it over confers
+    /// nothing new.  What the separate request buys is that each disclosure is
+    /// one discrete, logged event.
+    fn admission(&self) -> EnrollmentAdmission;
 
     /// Apply a partial enrollment-policy update; fields the update does not
     /// name are left as they are.  `Err` when the change could not be made

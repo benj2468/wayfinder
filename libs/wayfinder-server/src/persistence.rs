@@ -45,7 +45,7 @@ const MAX_STATE_BYTES: usize = 1024 * 1024;
 /// Current on-disk schema version. Bump this — and add an ordered migration
 /// from the prior version into [`parse_state`] — whenever [`CaState`]'s shape
 /// changes.
-pub(crate) const CURRENT_STATE_VERSION: u32 = 3;
+pub(crate) const CURRENT_STATE_VERSION: u32 = 4;
 
 /// Permission bits the CA state file is written with.
 ///
@@ -123,9 +123,11 @@ struct CaState {
     /// The held-CSR store (pending/approved/denied, awaiting or past operator
     /// review). Added in version 2 — see [`CaStateV1`] for the prior shape.
     held: Vec<HeldCsr>,
-    /// The operator's runtime enrollment-policy overrides. Added in version 3;
-    /// a version-2 snapshot migrates forward with none, which is exactly the
-    /// behavior it had (every field following the startup config).
+    /// The operator's runtime enrollment-policy overrides. Added in version 3
+    /// (a version-2 snapshot migrates forward with none, which is exactly the
+    /// behavior it had — every field following the startup config), and
+    /// re-shaped in version 4, which replaced the `require_approval` override
+    /// with its inverse.
     #[serde(default)]
     policy: PolicyOverrides,
 }
@@ -140,9 +142,10 @@ struct CaState {
 /// guessing which value the operator meant.
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub(crate) struct PolicyOverrides {
-    /// Whether submitted CSRs are parked pending operator approval.
+    /// Whether submitted CSRs are signed on submission, rather than parked
+    /// pending operator approval.
     #[serde(default)]
-    pub(crate) require_approval: Option<bool>,
+    pub(crate) auto_approve: Option<bool>,
     /// The validity window applied to issued certificates, in seconds.
     #[serde(default)]
     pub(crate) cert_ttl_secs: Option<u64>,
@@ -188,6 +191,33 @@ struct CaStateV2 {
     held: Vec<HeldCsr>,
 }
 
+/// Version 3 of the on-disk schema: as version 4, except that the enrollment
+/// posture was recorded the other way round — see [`PolicyOverridesV3`]. Kept
+/// so [`parse_state`] can migrate a version-3 snapshot.
+#[derive(Deserialize)]
+struct CaStateV3 {
+    issued: Vec<IssuedRecord>,
+    held: Vec<HeldCsr>,
+    #[serde(default)]
+    policy: PolicyOverridesV3,
+}
+
+/// Version 3's policy overrides, whose posture field was `require_approval` —
+/// the inverse of the `auto_approve` that replaced it. Only the posture
+/// differs, but the whole shape is mirrored here rather than deserialized into
+/// the current type with an alias: an alias would silently read a version-3
+/// `true` ("hold every request") as a version-4 `true` ("sign on submission"),
+/// which is the one misreading this rename must not permit.
+#[derive(Deserialize, Default)]
+struct PolicyOverridesV3 {
+    #[serde(default)]
+    require_approval: Option<bool>,
+    #[serde(default)]
+    cert_ttl_secs: Option<u64>,
+    #[serde(default)]
+    enrollment_token: Option<TokenOverride>,
+}
+
 /// Migrate a version-1 snapshot forward: the held-CSR store didn't exist yet,
 /// so it starts empty (the same behavior a version-1-only node had — held
 /// CSRs are simply not something that schema could have durably remembered).
@@ -201,12 +231,33 @@ fn migrate_v1_to_v2(v1: CaStateV1) -> CaStateV2 {
 /// Migrate a version-2 snapshot forward: no policy overrides were recorded, so
 /// the authority follows its startup `ProviderConfig` for every field —
 /// precisely the behavior a version-2 node had.
-fn migrate_v2_to_v3(v2: CaStateV2) -> CaState {
-    CaState {
-        version: 3,
+fn migrate_v2_to_v3(v2: CaStateV2) -> CaStateV3 {
+    CaStateV3 {
         issued: v2.issued,
         held: v2.held,
-        policy: PolicyOverrides::default(),
+        policy: PolicyOverridesV3::default(),
+    }
+}
+
+/// Migrate a version-3 snapshot forward, inverting the enrollment posture: the
+/// override was recorded as `require_approval` and is now its opposite,
+/// `auto_approve`.
+///
+/// Inverted rather than dropped. This override is the operator's most recent
+/// stated intent, and the two ways of getting it wrong are not symmetric: a
+/// provider that comes back from an upgrade signing for whoever asks, when its
+/// operator had pinned "hold every request", is handing out mesh membership
+/// unattended.
+fn migrate_v3_to_v4(v3: CaStateV3) -> CaState {
+    CaState {
+        version: 4,
+        issued: v3.issued,
+        held: v3.held,
+        policy: PolicyOverrides {
+            auto_approve: v3.policy.require_approval.map(|held| !held),
+            cert_ttl_secs: v3.policy.cert_ttl_secs,
+            enrollment_token: v3.policy.enrollment_token,
+        },
     }
 }
 
@@ -244,11 +295,15 @@ fn parse_state(bytes: &[u8], path: Option<&Path>) -> Result<CaState, String> {
     match probe.version {
         1 => {
             let v1: CaStateV1 = serde_json::from_slice(bytes).map_err(corrupt)?;
-            Ok(migrate_v2_to_v3(migrate_v1_to_v2(v1)))
+            Ok(migrate_v3_to_v4(migrate_v2_to_v3(migrate_v1_to_v2(v1))))
         }
         2 => {
             let v2: CaStateV2 = serde_json::from_slice(bytes).map_err(corrupt)?;
-            Ok(migrate_v2_to_v3(v2))
+            Ok(migrate_v3_to_v4(migrate_v2_to_v3(v2)))
+        }
+        3 => {
+            let v3: CaStateV3 = serde_json::from_slice(bytes).map_err(corrupt)?;
+            Ok(migrate_v3_to_v4(v3))
         }
         CURRENT_STATE_VERSION => serde_json::from_slice(bytes).map_err(corrupt),
         v if v > CURRENT_STATE_VERSION => Err(format!(

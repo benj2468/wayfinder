@@ -233,12 +233,15 @@ changing it:
 its address, the key that pins it, and the enrollment token. Two rules govern
 that panel:
 
-- **The token is reported by the node now.** `GetSecurityStatus` carries the
-  value, not just `enrollment_token_set`. This reversed an earlier rule that
-  never reported it; what makes it safe is that the request is reachable only by
-  a client authenticated as an admin or as the node itself — the same clients
-  that may replace or clear the token through `SetConfig` — so disclosure
-  confers nothing they did not already have.
+- **The token is fetched, never polled.** `GetSecurityStatus` reports only
+  `enrollment_token_set`; the value comes back from `reveal_enrollment_token`
+  when the operator presses "Show token". Who may read it has not changed — an
+  admin or the node itself, the same clients that may replace or clear the token
+  through `SetConfig`, so disclosure confers nothing they did not already have.
+  What changed is *how often*: on the poll, the secret crossed the wire once a
+  second into the browser and into anything that formats the snapshot, for the
+  sake of a value an operator reads perhaps twice in the life of a mesh. Do not
+  put it back on the snapshot to save a round trip.
 - **Shown, masked and copied are three different things.** The key is
   abbreviated and the token masked outright, while the copy button carries each
   in full. A dashboard gets read over a shoulder and screenshotted into chats;
