@@ -51,17 +51,23 @@ method, then the `handle` arm, then `RouterAdapter` in `wayfinder-server`, then
 the client and TUI. Skipping a layer compiles fine in the crates below it and
 fails at the adapter.
 
-## Mutation classification is audit-only
+## Audit classification is audit-only
 
-`request_is_mutation` tags a request kind as a write, and its **only** consumer
+`audited` tags a request kind as a write (`Mutation`), a read that hands out a
+secret (`Disclosure`), or an ordinary read (`Query`), and its **only** consumer
 is the `info!` audit line in `handle`. It is not an authorization gate.
+
+`Disclosure` exists because `RevealEnrollmentToken` changes nothing and still
+deserves a record: an operator asking "who learned the enrollment token, and
+when?" has nowhere else to look. Do not fold it into `Mutation` — a log line
+calling a read a mutation is a lie about what happened.
 
 Authorization is **admission-level**: `wayfinder-server`'s transport runs
 `decide_access` after the TLS handshake and either admits or refuses the whole
 connection (`transport.rs`). A client admitted on either full grant may invoke
 every request kind, so adding a mutating request does not require an authz
-change — but do add it to `request_is_mutation` (and to
-`request_is_mutation_classifies_writes_vs_reads`) or the write lands with no
+change — but do add it to `audited` (and to
+`audited_classifies_writes_disclosures_and_reads`) or the write lands with no
 audit trail.
 
 The one exception is the enrollment tier: a connection that presented no

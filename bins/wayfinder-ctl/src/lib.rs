@@ -532,12 +532,13 @@ async fn dispatch_query(
             out_anchor,
         } => {
             // Enrollment can be retried against the same `out_seed` path (e.g. a
-            // provider that requires operator approval, polled across process
-            // restarts). Reuse whatever identity is already on disk there rather
-            // than minting a fresh keypair each time: under `--require-approval`
-            // a new key on every retry looks like a different node reclaiming the
-            // MAC and is rejected. Persist a freshly-generated seed immediately,
-            // before polling, so a later retry finds it.
+            // provider that holds requests for operator approval, polled across
+            // process restarts). Reuse whatever identity is already on disk there
+            // rather than minting a fresh keypair each time: against a provider
+            // in that posture a new key on every retry looks like a different
+            // node reclaiming the MAC and is rejected. Persist a
+            // freshly-generated seed immediately, before polling, so a later
+            // retry finds it.
             let seed: [u8; 32] = if out_seed.exists() {
                 cert::read_seed(&out_seed)
                     .with_context(|| format!("reading existing seed at {}", out_seed.display()))?

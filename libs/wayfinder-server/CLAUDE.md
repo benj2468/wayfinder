@@ -136,6 +136,45 @@ things about it:
   back in memory if the persist failed. Do not add ad-hoc `persist()` calls
   alongside a direct field write; that ordering is the whole point of the type.
 
+**A provider's enrollment posture is one field, spelled so that silence is
+closed.** `ProviderConfig::auto_approve` (`#[serde(default)]` → `false`)
+decides whether a submitted CSR is signed on the spot or parked as pending for
+an operator; omitting it gets the queue. That direction is the whole reason it
+is not spelled `require_approval`: signing a certificate for whatever MAC and
+keys an anonymous client names is a legitimate configuration for a closed lab
+or the simulation, and not one anybody should reach by leaving a field out of a
+YAML file. There is deliberately **no** startup guard to add here — the default
+*is* the guard, and a second acknowledgement flag beside it was the redundancy
+this replaced. `enrollment_token` composes with the posture rather than
+substituting for it: the token says who may ask, `auto_approve` says whether
+asking is enough.
+
+The posture inverts across three boundaries, each of which has a comment saying
+so — do not "simplify" any of them away. On the wire, field 1 of
+`EnrollmentPolicy`/`EnrollmentPolicyStatus` is `reserved` and the posture moved
+to field 5, so a version-mismatched peer reads "not reported" rather than the
+posture backwards. On disk, state version 4 replaced version 3's
+`require_approval` override, and `migrate_v3_to_v4` inverts it rather than
+dropping it (an operator who pinned "hold every request" must not come back
+from an upgrade signing for whoever asks). The dashboard inverts on purpose:
+its switch is "Approve each request by hand", because a control you turn *on*
+to add a check reads right.
+
+`from_config` does refuse a `cert_ttl_secs` past `MAX_CERT_TTL_SECS` (90 days)
+without `allow_unbounded_cert_ttl` — passive expiry is this design's *primary*
+revocation mechanism, so a certificate that outlives the deployment cannot be
+recalled without reaching every node. That cap is enforced on the runtime path
+(`set_enrollment_policy`) too.
+
+**The enrollment token is handed out by request, not by poll.**
+`enrollment_policy()` reports only *whether* a token is set; `admission()`
+returns the value, and it is reached through `RevealEnrollmentToken` alone.
+`GetSecurityStatus` rides a once-a-second dashboard poll, so a secret on it is
+disclosed continuously to everything that touches the snapshot — including the
+log ring, through any `{:?}`. The value is a `SharedSecret` (`wayfinder-protos`)
+whose `Debug` redacts and whose reader is named `expose`, so every place it
+escapes is one a search finds.
+
 ## Persisting a runtime security setting
 
 Two stores, split by *what owns the thing*, not by convenience:

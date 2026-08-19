@@ -87,6 +87,10 @@ pub struct Mock {
     /// while refusing to list requests would let the dashboard get the
     /// combination wrong without any test noticing.
     pending_csrs: Option<Vec<PendingCsrData>>,
+    /// The shared enrollment token, kept beside the status rather than on it —
+    /// the polled status says only whether one is set, and this is what
+    /// `reveal_enrollment_token` hands over when asked.
+    enrollment_token: Option<String>,
     /// A real certificate authority, on the flavor that has one
     /// ([`Mock::authority`]).
     ///
@@ -120,6 +124,7 @@ impl Default for Mock {
                 own_ed_pubkey: MOCK_ED_PUBKEY.to_vec(),
                 own_x_pubkey: MOCK_X_PUBKEY.to_vec(),
             },
+            enrollment_token: None,
             pending_csrs: None,
             ca: None,
         }
@@ -153,6 +158,7 @@ impl Mock {
                 own_ed_pubkey: MOCK_ED_PUBKEY.to_vec(),
                 own_x_pubkey: MOCK_X_PUBKEY.to_vec(),
             },
+            enrollment_token: None,
             pending_csrs: None,
             ca: None,
         }
@@ -167,13 +173,13 @@ impl Mock {
         Self {
             security: SecurityStatusData {
                 enrollment: Some(EnrollmentPolicyStatusData {
-                    require_approval: true,
+                    auto_approve: false,
                     cert_ttl_secs: 86_400,
                     enrollment_token_set: true,
-                    enrollment_token: Some(MOCK_ENROLLMENT_TOKEN.to_string()),
                 }),
                 ..Self::default().security
             },
+            enrollment_token: Some(MOCK_ENROLLMENT_TOKEN.to_string()),
             pending_csrs: Some(vec![PendingCsrData {
                 node_mac: vec![0, 0, 0, 0, 0, 9],
                 ed_pubkey: vec![0xab; 32],
@@ -187,30 +193,30 @@ impl Mock {
     /// A certificate authority that really issues: the flavor an enrolling node
     /// is pointed at.
     ///
-    /// `require_approval` chooses which of the two enrollment paths it serves —
+    /// `auto_approve` chooses which of the two enrollment paths it serves —
     /// signing on submission, or parking the request until an operator says
     /// yes. `token`, when set, is the enrollment token `submit_csr` requires
     /// before it will consider a request at all — the primary admission
     /// control for the whole feature.
-    pub fn authority(require_approval: bool, token: Option<&str>) -> Self {
+    pub fn authority(auto_approve: bool, token: Option<&str>) -> Self {
         let mut ca = wayfinder_server::CertAuthority::new(
             &MESH_ROOT_SEED,
             MOCK_MESH_ID,
             86_400,
             token.map(str::to_string),
-            require_approval,
+            auto_approve,
         );
         ca.set_now_unix(1_700_000_000);
         Self {
             security: SecurityStatusData {
                 enrollment: Some(EnrollmentPolicyStatusData {
-                    require_approval,
+                    auto_approve,
                     cert_ttl_secs: 86_400,
                     enrollment_token_set: token.is_some(),
-                    enrollment_token: token.map(str::to_string),
                 }),
                 ..Self::default().security
             },
+            enrollment_token: token.map(str::to_string),
             pending_csrs: None,
             ca: Some(ca),
         }
@@ -339,6 +345,20 @@ impl WayfinderDataProvider for Mock {
     fn security_status(&self) -> SecurityStatusData {
         self.security.clone()
     }
+    fn reveal_enrollment_token(
+        &self,
+    ) -> Result<wayfinder_protos::service::EnrollmentAdmission, String> {
+        use wayfinder_protos::service::EnrollmentAdmission;
+        use wayfinder_protos::service::SharedSecret;
+
+        if self.security.enrollment.is_none() {
+            return Err("node is not a certificate-authority provider".to_string());
+        }
+        Ok(match &self.enrollment_token {
+            Some(token) => EnrollmentAdmission::Token(SharedSecret::new(token.clone())),
+            None => EnrollmentAdmission::Open,
+        })
+    }
     fn set_config(&mut self, config: RuntimeConfigData) -> Result<(), String> {
         // Applied to the reported status, so the dashboard's next poll shows
         // the change — a mock that accepted every write and reported the same
@@ -355,8 +375,8 @@ impl WayfinderDataProvider for Mock {
                 .enrollment
                 .as_mut()
                 .ok_or_else(|| "node is not a certificate-authority provider".to_string())?;
-            if let Some(require_approval) = update.require_approval {
-                policy.require_approval = require_approval;
+            if let Some(auto_approve) = update.auto_approve {
+                policy.auto_approve = auto_approve;
             }
             if let Some(ttl) = update.cert_ttl_secs {
                 policy.cert_ttl_secs = ttl;
@@ -365,14 +385,18 @@ impl WayfinderDataProvider for Mock {
             // are two projections of one `Option<String>` — a mock that set the
             // flag without storing the value would let the dashboard read a
             // token back that a real node would never have reported.
+            // The flag and the value move together, as they do on a real node
+            // where both come from one `Option<SharedSecret>` — but they travel
+            // separately: the polled status says only that a token is set, and
+            // the value is handed out by `reveal_enrollment_token`.
             match &update.enrollment_token {
                 Some(TokenUpdate::Clear) => {
                     policy.enrollment_token_set = false;
-                    policy.enrollment_token = None;
+                    self.enrollment_token = None;
                 }
                 Some(TokenUpdate::Set(token)) => {
                     policy.enrollment_token_set = true;
-                    policy.enrollment_token = Some(token.clone());
+                    self.enrollment_token = Some(token.expose().to_string());
                 }
                 None => {}
             }

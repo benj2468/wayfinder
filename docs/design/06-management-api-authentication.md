@@ -104,6 +104,14 @@ DNS rebinding.
 with the minimum fields therefore signs a membership certificate for any MAC
 and keys an anonymous client names, on demand.
 
+> **Since superseded.** Phase 2 item 1 below closed this with an explicit
+> `auto_approve` acknowledgement flag *beside* `require_approval`, refused at
+> startup when both were absent. That pair was two fields for one decision, and
+> the guard only governed omission in YAML. It has since been collapsed: the
+> posture is now the single field `auto_approve` (`#[serde(default)]` →
+> `false`, the closed posture), `require_approval` is gone, and the startup
+> guard with it — the default is the guard. See `libs/wayfinder-server/CLAUDE.md`.
+
 The certificate is not an admin certificate, so this is not management
 escalation — but mesh segregation is the entire purpose of the trust anchor,
 and this makes it opt-in. The issued cert lets its holder sign OGMs the mesh
@@ -277,8 +285,10 @@ matching itself.
 
 1. Make `ProviderConfig` require an explicit admission decision: reject a
    provider config that sets neither `enrollment_token` nor
-   `require_approval: true` unless it also sets `open_enrollment: true`. An
-   operator who wants TOFU says so; nobody gets it by omission.
+   `require_approval: true` unless it also sets `auto_approve: true`. An
+   operator who wants TOFU says so; nobody gets it by omission. *(Implemented
+   as written, then superseded — see the note under F3. The goal held; the
+   two-field-plus-guard shape did not.)*
 2. Move `enrollment_token` off `GetSecurityStatusResponse` onto its own
    `RevealEnrollmentToken` request, so disclosure is a discrete, logged,
    admin-gated act. Replace the `bool` + `Option<String>` pair with the sum

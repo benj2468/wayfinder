@@ -474,6 +474,40 @@ impl Client {
         }
     }
 
+    /// Read the shared enrollment token a provider-mode node is applying.
+    ///
+    /// Separate from [`security_status`](Self::security_status) because that
+    /// one is polled and this answer is a secret: asking is a discrete act the
+    /// node logs, rather than a value riding every refresh into whatever holds
+    /// the snapshot. Errors on a node that is not a provider — which is a
+    /// different answer from "no token is required".
+    ///
+    /// Returns `None` when enrollment is open (no token), `Some` with the token
+    /// otherwise; an empty token is not a state the node can report.
+    pub async fn reveal_enrollment_token(&mut self) -> anyhow::Result<Option<String>> {
+        use wayfinder_protos::wayfinder::v1alpha::RevealEnrollmentTokenRequest;
+        use wayfinder_protos::wayfinder::v1alpha::reveal_enrollment_token_response::Admission;
+
+        match self
+            .request(RequestKind::RevealEnrollmentToken(
+                RevealEnrollmentTokenRequest {},
+            ))
+            .await?
+        {
+            ResponseKind::EnrollmentToken(response) => match response.admission {
+                Some(Admission::Token(token)) => Ok(Some(token)),
+                Some(Admission::Open(_)) => Ok(None),
+                // An absent oneof is what prost yields for a variant added
+                // after this build: fail rather than read it as "open", which
+                // would report an ungated mesh on no evidence.
+                None => Err(anyhow::anyhow!(
+                    "node reported an enrollment admission rule this client does not understand"
+                )),
+            },
+            other => Err(unexpected("EnrollmentToken", &other)),
+        }
+    }
+
     /// Ask the node which next-hop neighbour and egress interface it would pick
     /// for a packet to `destination` (the raw identifier bytes, same encoding as
     /// [`NodeInfo::node_id`]).
@@ -759,6 +793,7 @@ impl Client {
 fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
     let got = match got {
         ResponseKind::NodeInfo(_) => "NodeInfo",
+        ResponseKind::EnrollmentToken(_) => "EnrollmentToken",
         ResponseKind::RoutingTable(_) => "RoutingTable",
         ResponseKind::LinkQualityTable(_) => "LinkQualityTable",
         ResponseKind::LinkFeaturesTable(_) => "LinkFeaturesTable",

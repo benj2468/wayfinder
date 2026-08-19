@@ -161,6 +161,58 @@ async fn set_link_gate_server_fn_answers_over_http() {
     );
 }
 
+/// The enrollment token comes back from its own endpoint, and only from there.
+///
+/// Two halves of one property: the polled snapshot no longer carries the
+/// secret, and an operator can still get it. Testing only the first would leave
+/// a dashboard that cannot hand a joining node the token it needs; testing only
+/// the second would not notice the value riding every poll as well.
+#[tokio::test]
+async fn the_enrollment_token_is_served_only_by_its_own_endpoint() {
+    let conn = common::serve_mock_provider_node().await;
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        conn,
+        common::test_hosts(),
+    );
+
+    let snapshot = app
+        .clone()
+        .oneshot(
+            Request::post("/api/snapshot")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("accept", "application/json")
+                .body(Body::from("since_seq=0"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = snapshot.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        !String::from_utf8_lossy(&body).contains(wayfinder_web::mock::MOCK_ENROLLMENT_TOKEN),
+        "the once-a-second poll carries no secret"
+    );
+
+    let revealed = app
+        .oneshot(
+            Request::post("/api/reveal_enrollment_token")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("accept", "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revealed.status(), StatusCode::OK);
+    let body = revealed.into_body().collect().await.unwrap().to_bytes();
+    let token: Option<String> = serde_json::from_slice(&body).expect("the browser decodes this");
+    assert_eq!(
+        token.as_deref(),
+        Some(wayfinder_web::mock::MOCK_ENROLLMENT_TOKEN),
+        "and asking hands over the value"
+    );
+}
+
 /// The wasm bundle is served `no-cache`, so a browser revalidates it instead of
 /// pairing a cached copy with freshly rendered markup.
 ///

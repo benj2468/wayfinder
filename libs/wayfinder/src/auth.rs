@@ -408,7 +408,12 @@ impl<
     /// recorded — `false` for an invalid record or one already known — so a
     /// caller can flood it exactly once and avoid amplification loops.
     pub fn ingest_revocation(&mut self, record: &RevocationRecord) -> bool {
-        let mac = match self.anchor.verify_revocation(record) {
+        // Verification takes the clock: an already-expired record is refused by
+        // the anchor itself (`AuthError::Expired`), so this loop never has to
+        // remember to check the half of validity that bounds the set's size. A
+        // `now_unix` of zero — clock never set — expires nothing, which is the
+        // behaviour a freshly booted board needs and had before.
+        let mac = match self.anchor.verify_revocation(record, self.now_unix) {
             Ok(m) => m,
             Err(e) => {
                 tracing::trace!(error = ?e, "auth: dropping a revocation that failed verification");
@@ -420,12 +425,6 @@ impl<
         // flood slot and budget.
         if mac.0 == self.cert.node_mac {
             tracing::warn!("auth: received a revocation naming this node");
-            return false;
-        }
-        // Ignore a revocation that has already expired on our clock — the
-        // cancelled cert is gone too, so there is nothing left to enforce.
-        if self.now_unix != 0 && record.not_after.get() <= self.now_unix {
-            tracing::trace!("auth: dropping a revocation that has already expired");
             return false;
         }
         if self.revocations.iter().any(|r| r.record.node_mac == mac.0) {

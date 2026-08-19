@@ -12,16 +12,19 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde::Serialize;
+use wayfinder::config::MAX_CERT_TTL_SECS;
 use wayfinder::config::ProviderConfig;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder_auth::Authority;
 use wayfinder_auth::MembershipCert;
 use wayfinder_protos::service::CsrOutcome;
 use wayfinder_protos::service::EnrollData;
+use wayfinder_protos::service::EnrollmentAdmission;
 use wayfinder_protos::service::EnrollmentPolicyData;
 use wayfinder_protos::service::EnrollmentPolicyStatusData;
 use wayfinder_protos::service::IssuedCertData;
 use wayfinder_protos::service::PendingCsrData;
+use wayfinder_protos::service::SharedSecret;
 use wayfinder_protos::service::TokenUpdate;
 use zerocopy::IntoBytes;
 
@@ -30,7 +33,7 @@ use crate::persistence::TokenOverride;
 use crate::provider::MeshAuthority;
 
 /// A certificate-signing request the authority is holding while it awaits an
-/// operator decision.  Only populated when `require_approval` is set; keyed by
+/// operator decision.  Only populated when `auto_approve` is off; keyed by
 /// MAC (one held request per node at a time). `pub(crate)` (fields stay
 /// private) so `persistence.rs` can name the type in `CaLog`'s signatures;
 /// derives `Serialize`/`Deserialize` directly (no separate on-disk mirror
@@ -75,12 +78,18 @@ pub struct CertAuthority {
     /// Validity window length applied to issued certificates, in seconds.  Keep
     /// it short — passive expiry is the primary revocation mechanism.
     cert_ttl_secs: u64,
+    /// Whether this authority may run with a certificate lifetime past
+    /// [`MAX_CERT_TTL_SECS`] — see [`ProviderConfig::allow_unbounded_cert_ttl`].
+    /// Carried from the config so the same rule holds for a lifetime set later
+    /// through the management API.
+    allow_unbounded_cert_ttl: bool,
     /// Optional shared enrollment token.  When set, a CSR must present the
     /// matching value; when `None`, enrollment is open (TOFU).
-    enrollment_token: Option<String>,
-    /// When set, a CSR is parked as pending until an operator approves it rather
-    /// than being signed on submission.
-    require_approval: bool,
+    enrollment_token: Option<SharedSecret>,
+    /// When set, a CSR is signed on submission rather than parked as pending
+    /// until an operator approves it.  Off is the closed posture, and the one a
+    /// `ProviderConfig` that says nothing gets.
+    auto_approve: bool,
     /// How long a held CSR survives (in seconds) before it is evicted, measured
     /// from when it last changed state.  Bounds the `held` table and frees a MAC
     /// for a fresh request once a stale one times out.
@@ -90,7 +99,7 @@ pub struct CertAuthority {
     now_unix: u64,
     /// The durable CA state: the issued-certificate log (for `ListCerts` and
     /// the impersonation guard) and the held-CSR store (for the
-    /// operator-approval flow, only used when `require_approval`), both
+    /// operator-approval flow, only used when `auto_approve` is off), both
     /// backed by one snapshot file. Every mutation goes through
     /// [`CaLog::mutate_issued`]/[`CaLog::mutate_held`]/
     /// [`CaLog::mutate_issued_and_held`], which persist the result to the
@@ -126,9 +135,28 @@ pub(crate) const MAX_HELD_CSRS: usize = 128;
 /// table.
 const DEFAULT_PENDING_TTL_SECS: u64 = 3600;
 
+/// Refuse a certificate lifetime past [`MAX_CERT_TTL_SECS`], unless the
+/// operator took the escape.
+///
+/// Passive expiry is this design's primary revocation mechanism; a lifetime
+/// measured in years leaves only the active flood, which needs every node to be
+/// reachable.
+fn check_cert_ttl(cert_ttl_secs: u64, allow_unbounded: bool) -> Result<(), String> {
+    if allow_unbounded || cert_ttl_secs <= MAX_CERT_TTL_SECS {
+        return Ok(());
+    }
+    Err(alloc::format!(
+        "cert_ttl_secs is {cert_ttl_secs}s, past the {MAX_CERT_TTL_SECS}s cap: passive \
+         expiry is this mesh's primary revocation mechanism, so a certificate that \
+         outlives the deployment cannot be recalled without reaching every node. \
+         Shorten it, or set `allow_unbounded_cert_ttl: true` to say the long lifetime \
+         is deliberate"
+    ))
+}
+
 impl CertAuthority {
-    /// Build a CA from a 32-byte root seed and its issuance policy.  When
-    /// `require_approval` is set, submitted CSRs are parked as pending until an
+    /// Build a CA from a 32-byte root seed and its issuance policy.  Unless
+    /// `auto_approve` is set, submitted CSRs are parked as pending until an
     /// operator approves them rather than issued on submission.  Held CSRs use
     /// [`DEFAULT_PENDING_TTL_SECS`]; [`CertAuthority::from_config`] honours the
     /// operator's configured value.
@@ -137,13 +165,18 @@ impl CertAuthority {
         mesh_id: u32,
         cert_ttl_secs: u64,
         enrollment_token: Option<String>,
-        require_approval: bool,
+        auto_approve: bool,
     ) -> Self {
         Self {
             authority: Authority::from_seed(root_seed, mesh_id),
             cert_ttl_secs,
-            enrollment_token,
-            require_approval,
+            // Bounded unless a config says otherwise: a caller constructing an
+            // authority directly (the offline `wayfinderctl cert` tooling, and
+            // tests) states its lifetime per invocation rather than persisting
+            // one.
+            allow_unbounded_cert_ttl: false,
+            enrollment_token: enrollment_token.map(SharedSecret::new),
+            auto_approve,
             pending_ttl_secs: DEFAULT_PENDING_TTL_SECS,
             now_unix: 0,
             log: CaLog::empty(),
@@ -161,16 +194,18 @@ impl CertAuthority {
     /// rather than silently treated as empty. Absent, state starts empty
     /// (in-memory only, as before).
     pub fn from_config(root_seed: &[u8; 32], cfg: &ProviderConfig) -> Result<Self, String> {
+        check_cert_ttl(cfg.cert_ttl_secs, cfg.allow_unbounded_cert_ttl)?;
         let log = CaLog::load(cfg.state_path.as_ref().map(PathBuf::from))?;
         let mut ca = Self {
             pending_ttl_secs: cfg.pending_ttl_secs,
+            allow_unbounded_cert_ttl: cfg.allow_unbounded_cert_ttl,
             log,
             ..Self::new(
                 root_seed,
                 cfg.mesh_id,
                 cfg.cert_ttl_secs,
                 cfg.enrollment_token.clone(),
-                cfg.require_approval,
+                cfg.auto_approve,
             )
         };
         ca.apply_policy_overrides();
@@ -188,23 +223,25 @@ impl CertAuthority {
     /// the state file returns the node wholly to its config.
     fn apply_policy_overrides(&mut self) {
         let overrides = self.log.policy().clone();
-        if let Some(require_approval) = overrides.require_approval {
-            self.require_approval = require_approval;
+        if let Some(auto_approve) = overrides.auto_approve {
+            self.auto_approve = auto_approve;
         }
         if let Some(cert_ttl_secs) = overrides.cert_ttl_secs {
             self.cert_ttl_secs = cert_ttl_secs;
         }
         match &overrides.enrollment_token {
             Some(TokenOverride::Cleared) => self.enrollment_token = None,
-            Some(TokenOverride::Set(token)) => self.enrollment_token = Some(token.clone()),
+            Some(TokenOverride::Set(token)) => {
+                self.enrollment_token = Some(SharedSecret::new(token.clone()));
+            }
             None => {}
         }
-        if overrides.require_approval.is_some()
+        if overrides.auto_approve.is_some()
             || overrides.cert_ttl_secs.is_some()
             || overrides.enrollment_token.is_some()
         {
             tracing::info!(
-                require_approval = self.require_approval,
+                auto_approve = self.auto_approve,
                 cert_ttl_secs = self.cert_ttl_secs,
                 enrollment_token_set = self.enrollment_token.is_some(),
                 "enrollment policy restored from persisted runtime overrides, taking \
@@ -216,19 +253,34 @@ impl CertAuthority {
     /// The enrollment policy currently in force, for the management API to
     /// report.
     ///
-    /// Carries the token itself as well as whether one is set: the operator
-    /// running this provider is the one who has to hand that token to a node
-    /// that is joining, and the only alternative — replacing a working token
-    /// just to learn it — kicks every node still holding the old one. It
-    /// travels no further than a client already authenticated as an admin or as
-    /// this node, which is a client that could replace the token anyway; see
-    /// the `.proto` field comment.
+    /// Says whether a token is required and never what it is. This answer rides
+    /// a polled request — a dashboard asks for it once a second — so a secret
+    /// on it is disclosed continuously to everything that touches the snapshot,
+    /// for the sake of an operator who reads the value perhaps twice in the
+    /// life of a mesh. [`admission`](Self::admission) hands the value over one
+    /// request at a time instead.
     pub fn enrollment_policy(&self) -> EnrollmentPolicyStatusData {
         EnrollmentPolicyStatusData {
-            require_approval: self.require_approval,
+            auto_approve: self.auto_approve,
             cert_ttl_secs: self.cert_ttl_secs,
             enrollment_token_set: self.enrollment_token.is_some(),
-            enrollment_token: self.enrollment_token.clone(),
+        }
+    }
+
+    /// The admission rule in force, token value included — the answer to an
+    /// explicit `RevealEnrollmentToken`.
+    ///
+    /// The operator running a provider is the one who has to hand the token to
+    /// a node that is joining, and the only alternative — replacing a working
+    /// token just to learn it — kicks every node still holding the old one. It
+    /// travels no further than a client already authenticated as an admin or as
+    /// this node, which is a client that could replace the token anyway; what
+    /// the separate request buys is that each disclosure is a discrete, logged
+    /// event rather than a continuous one.
+    pub fn admission(&self) -> EnrollmentAdmission {
+        match &self.enrollment_token {
+            Some(token) => EnrollmentAdmission::Token(token.clone()),
+            None => EnrollmentAdmission::Open,
         }
     }
 
@@ -240,9 +292,16 @@ impl CertAuthority {
     /// policy that the next restart would forget. Fields the update does not
     /// name are left alone, both in memory and on disk.
     pub fn set_enrollment_policy(&mut self, update: &EnrollmentPolicyData) -> Result<(), String> {
+        // Checked before anything is written: the dashboard can set this
+        // policy, so a cap enforced only on the config file would be a lock on
+        // one of two doors. Refusing here leaves the previous policy running,
+        // in memory and on disk both.
+        if let Some(cert_ttl_secs) = update.cert_ttl_secs {
+            check_cert_ttl(cert_ttl_secs, self.allow_unbounded_cert_ttl)?;
+        }
         let (_, persisted) = self.log.mutate_policy(|overrides| {
-            if let Some(require_approval) = update.require_approval {
-                overrides.require_approval = Some(require_approval);
+            if let Some(auto_approve) = update.auto_approve {
+                overrides.auto_approve = Some(auto_approve);
             }
             if let Some(cert_ttl_secs) = update.cert_ttl_secs {
                 overrides.cert_ttl_secs = Some(cert_ttl_secs);
@@ -252,7 +311,8 @@ impl CertAuthority {
                     overrides.enrollment_token = Some(TokenOverride::Cleared);
                 }
                 Some(TokenUpdate::Set(token)) => {
-                    overrides.enrollment_token = Some(TokenOverride::Set(token.clone()));
+                    overrides.enrollment_token =
+                        Some(TokenOverride::Set(token.expose().to_string()));
                 }
                 None => {}
             }
@@ -414,7 +474,7 @@ impl MeshAuthority for CertAuthority {
         // touch the held-CSR store (so it can't clobber a legitimate pending
         // request for the same MAC).
         if let Some(expected) = &self.enrollment_token
-            && token != expected
+            && token != expected.expose()
         {
             return Ok(CsrOutcome::Rejected(
                 "invalid or missing enrollment token".to_string(),
@@ -447,8 +507,8 @@ impl MeshAuthority for CertAuthority {
             });
         }
 
-        // Open enrollment (no approval gate): sign immediately.
-        if !self.require_approval {
+        // Approval is automatic: sign immediately.
+        if self.auto_approve {
             return Ok(CsrOutcome::Issued(self.issue(mac, ed, x)?));
         }
 
@@ -627,6 +687,10 @@ impl MeshAuthority for CertAuthority {
         CertAuthority::enrollment_policy(self)
     }
 
+    fn admission(&self) -> EnrollmentAdmission {
+        CertAuthority::admission(self)
+    }
+
     fn set_enrollment_policy(&mut self, update: &EnrollmentPolicyData) -> Result<(), String> {
         CertAuthority::set_enrollment_policy(self, update)
     }
@@ -648,7 +712,7 @@ mod tests {
 
     /// A CA with an already-set clock and no approval gate (the common setup).
     fn open_ca() -> CertAuthority {
-        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, true);
         ca.set_now_unix(100);
         ca
     }
@@ -682,7 +746,7 @@ mod tests {
 
     #[test]
     fn bad_token_is_a_rejected_outcome_not_an_error() {
-        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, Some("s3cret".to_string()), false);
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, Some("s3cret".to_string()), true);
         ca.set_now_unix(100);
         let (ed, x) = node_keys(2);
         let mac = [0, 0, 0, 0, 0, 9];
@@ -712,7 +776,7 @@ mod tests {
 
     #[test]
     fn issuance_rejected_before_clock_is_set() {
-        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, true);
         let (ed, x) = node_keys(2);
         let err = ca.submit_csr(&[0; 6], &ed, &x, "").unwrap_err();
         assert!(err.contains("clock not set"), "got: {err}");
@@ -757,16 +821,188 @@ mod tests {
         let (record, _) = RevocationRecord::ref_from_prefix(&record_bytes).unwrap();
         let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
         assert_eq!(
-            anchor.verify_revocation(record).unwrap().0,
+            anchor.verify_revocation(record, 0).unwrap().0,
             [0, 0, 0, 0, 0, 9]
         );
     }
 
-    // ── Operator-approval flow (require_approval = true) ───────────────────────
+    // ── Enrollment posture at construction ─────────────────────────────────────
+
+    /// A provider config naming its mesh, its seed and a TTL, and nothing about
+    /// who may join.
+    fn minimal_provider_config() -> ProviderConfig {
+        ProviderConfig {
+            root_seed_path: String::new(),
+            mesh_id: 0xABCD,
+            cert_ttl_secs: 3600,
+            enrollment_token: None,
+            auto_approve: false,
+            allow_unbounded_cert_ttl: false,
+            pending_ttl_secs: 3600,
+            state_path: None,
+        }
+    }
+
+    /// Submit a CSR from a fresh identity and report what the authority did
+    /// with it, for the posture tests below.
+    fn submit(ca: &mut CertAuthority, token: &str) -> CsrOutcome {
+        let (ed, x) = node_keys(2);
+        ca.submit_csr(&[0, 0, 0, 0, 0, 9], &ed, &x, token).unwrap()
+    }
+
+    /// A config that says nothing about who may join gets the closed posture.
+    ///
+    /// This is the whole point of spelling the field the way round it is spelled:
+    /// a provider signs with the mesh root key, and a certificate lets its holder
+    /// sign OGMs the mesh accepts, derive pairwise keys with any neighbour, and
+    /// route — so what an unattended provider would be handing out is mesh
+    /// membership itself. An operator who leaves the question out of a YAML file
+    /// gets a queue to review, not a signature for whoever asks.
+    #[test]
+    fn a_config_silent_about_admission_holds_csrs_for_approval() {
+        let mut ca = CertAuthority::from_config(&[1; 32], &minimal_provider_config())
+            .expect("silence about admission is a posture, not a configuration error");
+        ca.set_now_unix(100);
+
+        assert!(
+            matches!(submit(&mut ca, ""), CsrOutcome::Pending),
+            "an unstated posture holds the request for an operator"
+        );
+        assert!(
+            !ca.enrollment_policy().auto_approve,
+            "and reports itself closed"
+        );
+    }
+
+    /// Asking for it is what gets it: an operator who wants trust-on-first-use
+    /// for a closed lab or a simulation says so, and gets signatures on
+    /// submission.
+    #[test]
+    fn auto_approve_signs_on_submission() {
+        let cfg = ProviderConfig {
+            auto_approve: true,
+            ..minimal_provider_config()
+        };
+        let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+        ca.set_now_unix(100);
+
+        assert!(matches!(submit(&mut ca, ""), CsrOutcome::Issued(_)));
+        assert!(ca.enrollment_policy().auto_approve);
+    }
+
+    /// A token is a *separate* gate, not a way to lift this one.
+    ///
+    /// The two compose: a token says who may ask, `auto_approve` says
+    /// whether asking is enough. A config that names a token and stays silent
+    /// about the posture therefore still parks the request — which is the
+    /// direction an omission should fail in.
+    #[test]
+    fn a_token_alone_still_holds_the_csr_for_approval() {
+        let cfg = ProviderConfig {
+            enrollment_token: Some("shibboleth".into()),
+            ..minimal_provider_config()
+        };
+        let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+        ca.set_now_unix(100);
+
+        assert!(
+            matches!(submit(&mut ca, "shibboleth"), CsrOutcome::Pending),
+            "the right token buys a place in the queue, not a certificate"
+        );
+        assert!(
+            matches!(submit(&mut ca, "wrong"), CsrOutcome::Rejected(_)),
+            "and the wrong one buys nothing"
+        );
+    }
+
+    /// A certificate lifetime past the cap is refused.
+    ///
+    /// Passive expiry is this design's *primary* revocation mechanism, so a
+    /// certificate lifetime measured in centuries is a mesh with no revocation
+    /// at all. The simulation's ~3000-year value is fine there and one
+    /// copy-paste away from a real deployment.
+    #[test]
+    fn an_extravagant_certificate_lifetime_is_refused() {
+        let cfg = ProviderConfig {
+            cert_ttl_secs: 100_000_000_000,
+            enrollment_token: Some("shibboleth".into()),
+            ..minimal_provider_config()
+        };
+
+        let err = CertAuthority::from_config(&[1; 32], &cfg)
+            .map(|_| ())
+            .expect_err("a certificate lifetime past the cap is refused");
+        assert!(
+            err.contains("cert_ttl_secs") && err.contains("allow_unbounded_cert_ttl"),
+            "the error names the field and the way out: {err}"
+        );
+    }
+
+    /// The cap has an escape, because a simulation legitimately wants a
+    /// certificate that outlives it — but taking it is a sentence in the
+    /// config, not an accident.
+    #[test]
+    fn the_escape_hatch_admits_a_long_certificate_lifetime() {
+        let cfg = ProviderConfig {
+            cert_ttl_secs: 100_000_000_000,
+            enrollment_token: Some("shibboleth".into()),
+            allow_unbounded_cert_ttl: true,
+            ..minimal_provider_config()
+        };
+
+        assert!(CertAuthority::from_config(&[1; 32], &cfg).is_ok());
+    }
+
+    /// The cap holds on the runtime path too: the dashboard can set this
+    /// policy, and a config-only check would be a lock on the front door
+    /// alone.
+    #[test]
+    fn a_runtime_policy_update_cannot_exceed_the_certificate_lifetime_cap() {
+        let cfg = ProviderConfig {
+            enrollment_token: Some("shibboleth".into()),
+            ..minimal_provider_config()
+        };
+        let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+
+        let err = ca
+            .set_enrollment_policy(&EnrollmentPolicyData {
+                cert_ttl_secs: Some(100_000_000_000),
+                ..Default::default()
+            })
+            .expect_err("a policy update past the cap is refused");
+        assert!(err.contains("cert_ttl_secs"), "{err}");
+        assert_eq!(
+            ca.enrollment_policy().cert_ttl_secs,
+            3600,
+            "and the live policy is untouched by the refusal"
+        );
+    }
+
+    /// A provider that took the escape hatch keeps it at runtime: the operator
+    /// who said so in the config does not have to say so again per request.
+    #[test]
+    fn the_escape_hatch_carries_to_the_runtime_path() {
+        let cfg = ProviderConfig {
+            enrollment_token: Some("shibboleth".into()),
+            allow_unbounded_cert_ttl: true,
+            ..minimal_provider_config()
+        };
+        let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+
+        assert!(
+            ca.set_enrollment_policy(&EnrollmentPolicyData {
+                cert_ttl_secs: Some(100_000_000_000),
+                ..Default::default()
+            })
+            .is_ok()
+        );
+    }
+
+    // ── Operator-approval flow (auto_approve = false) ───────────────────────
 
     /// A CA that parks CSRs for approval, clock set.
     fn approval_ca() -> CertAuthority {
-        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, true);
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
         ca.set_now_unix(100);
         ca
     }
@@ -903,7 +1139,8 @@ mod tests {
             mesh_id: 0xABCD,
             cert_ttl_secs: 100_000,
             enrollment_token: None,
-            require_approval: true,
+            auto_approve: false,
+            allow_unbounded_cert_ttl: false,
             pending_ttl_secs: 10,
             state_path: None,
         };
@@ -948,7 +1185,8 @@ mod tests {
             mesh_id: 0xABCD,
             cert_ttl_secs: 100_000,
             enrollment_token: None,
-            require_approval: true,
+            auto_approve: false,
+            allow_unbounded_cert_ttl: false,
             pending_ttl_secs: 10,
             state_path: None,
         };
@@ -993,7 +1231,8 @@ mod tests {
             mesh_id: 0xABCD,
             cert_ttl_secs: 100_000,
             enrollment_token: None,
-            require_approval: true,
+            auto_approve: false,
+            allow_unbounded_cert_ttl: false,
             pending_ttl_secs: 10,
             state_path: None,
         };
@@ -1029,7 +1268,8 @@ mod tests {
             mesh_id: 0xABCD,
             cert_ttl_secs: 10,
             enrollment_token: None,
-            require_approval: true,
+            auto_approve: false,
+            allow_unbounded_cert_ttl: false,
             pending_ttl_secs: 10,
             state_path: None,
         };
@@ -1166,7 +1406,7 @@ mod tests {
 
     #[test]
     fn bad_token_does_not_clobber_a_pending_request() {
-        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, Some("s3cret".to_string()), true);
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, Some("s3cret".to_string()), false);
         ca.set_now_unix(100);
         let (ed, x) = node_keys(2);
         let mac = [0, 0, 0, 0, 0, 9];
@@ -1201,14 +1441,15 @@ mod tests {
         ))
     }
 
-    /// An open-enrollment `ProviderConfig` snapshotting to `state_path`.
+    /// An auto-approving `ProviderConfig` snapshotting to `state_path`.
     fn persisted_cfg(state_path: &std::path::Path) -> ProviderConfig {
         ProviderConfig {
             root_seed_path: String::new(),
             mesh_id: 0xABCD,
             cert_ttl_secs: 100_000,
             enrollment_token: None,
-            require_approval: false,
+            auto_approve: true,
+            allow_unbounded_cert_ttl: false,
             pending_ttl_secs: 3600,
             state_path: Some(state_path.to_string_lossy().into_owned()),
         }
@@ -1217,7 +1458,8 @@ mod tests {
     /// An operator-approval `ProviderConfig` snapshotting to `state_path`.
     fn approval_persisted_cfg(state_path: &std::path::Path) -> ProviderConfig {
         ProviderConfig {
-            require_approval: true,
+            auto_approve: false,
+            allow_unbounded_cert_ttl: false,
             ..persisted_cfg(state_path)
         }
     }
@@ -1657,41 +1899,39 @@ mod tests {
     /// the dashboard renders the real state before an operator edits it.
     #[test]
     fn enrollment_policy_reports_the_configured_policy() {
-        let ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, Some("hunter2".into()), true);
+        let ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, Some("hunter2".into()), false);
 
         let policy = ca.enrollment_policy();
-        assert!(policy.require_approval);
+        assert!(!policy.auto_approve);
         assert_eq!(policy.cert_ttl_secs, 1000);
         assert!(policy.enrollment_token_set);
     }
 
-    /// The policy carries the token itself, so the operator running a provider
-    /// can hand it to a node that is joining without replacing a working token
-    /// just to learn what it is.
+    /// The token is handed over by its own request, so the operator running a
+    /// provider can pass it to a joining node without replacing a working token
+    /// just to learn what it is — and so each disclosure is one event.
     ///
     /// It reaches only a client already authenticated as an admin or as this
     /// node — one that may replace or clear the token anyway — so the report
     /// grants nothing it did not already have.
     #[test]
-    fn enrollment_policy_carries_the_token_for_an_operator_to_hand_on() {
-        let ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, Some("hunter2".into()), true);
+    fn the_token_is_revealed_by_its_own_request() {
+        let ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, Some("hunter2".into()), false);
 
         assert_eq!(
-            ca.enrollment_policy().enrollment_token.as_deref(),
-            Some("hunter2")
+            ca.admission(),
+            EnrollmentAdmission::Token(SharedSecret::new("hunter2"))
         );
     }
 
-    /// With no token set there is no value to report, and the flag says so —
-    /// the two must not disagree, since a client reads the flag to decide
-    /// whether the mesh is gated at all.
+    /// With no token set the flag says so and the reveal answers `Open` — not
+    /// an empty token, which reads as "a token nobody can present".
     #[test]
-    fn enrollment_policy_reports_an_absent_token_as_unset() {
-        let ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
+    fn an_absent_token_reports_as_open_rather_than_empty() {
+        let ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, true);
 
-        let policy = ca.enrollment_policy();
-        assert!(!policy.enrollment_token_set);
-        assert_eq!(policy.enrollment_token, None);
+        assert!(!ca.enrollment_policy().enrollment_token_set);
+        assert_eq!(ca.admission(), EnrollmentAdmission::Open);
     }
 
     /// A token installed at runtime is reported back, not just recorded: this
@@ -1699,32 +1939,34 @@ mod tests {
     /// one there must be able to copy it afterwards.
     #[test]
     fn a_runtime_token_is_reported_back() {
-        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, false);
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, true);
 
         ca.set_enrollment_policy(&EnrollmentPolicyData {
-            enrollment_token: Some(TokenUpdate::Set("let-me-in".into())),
+            enrollment_token: Some(TokenUpdate::Set(SharedSecret::new("let-me-in"))),
             ..Default::default()
         })
         .unwrap();
 
-        let policy = ca.enrollment_policy();
-        assert!(policy.enrollment_token_set);
-        assert_eq!(policy.enrollment_token.as_deref(), Some("let-me-in"));
+        assert!(ca.enrollment_policy().enrollment_token_set);
+        assert_eq!(
+            ca.admission(),
+            EnrollmentAdmission::Token(SharedSecret::new("let-me-in"))
+        );
     }
 
     /// An update names only what it changes; everything else stays as it was.
     #[test]
     fn set_enrollment_policy_leaves_unnamed_fields_alone() {
-        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, Some("hunter2".into()), false);
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, Some("hunter2".into()), true);
 
         ca.set_enrollment_policy(&EnrollmentPolicyData {
-            require_approval: Some(true),
+            auto_approve: Some(false),
             ..Default::default()
         })
         .unwrap();
 
         let policy = ca.enrollment_policy();
-        assert!(policy.require_approval, "the named field changed");
+        assert!(!policy.auto_approve, "the named field changed");
         assert_eq!(policy.cert_ttl_secs, 1000, "the lifetime is untouched");
         assert!(policy.enrollment_token_set, "the token is untouched");
     }
@@ -1738,7 +1980,7 @@ mod tests {
         let mac = [0, 0, 0, 0, 0, 9];
 
         ca.set_enrollment_policy(&EnrollmentPolicyData {
-            require_approval: Some(true),
+            auto_approve: Some(false),
             ..Default::default()
         })
         .unwrap();
@@ -1759,7 +2001,7 @@ mod tests {
         let mac = [0, 0, 0, 0, 0, 9];
 
         ca.set_enrollment_policy(&EnrollmentPolicyData {
-            enrollment_token: Some(TokenUpdate::Set("hunter2".into())),
+            enrollment_token: Some(TokenUpdate::Set(SharedSecret::new("hunter2"))),
             ..Default::default()
         })
         .unwrap();
@@ -1778,7 +2020,7 @@ mod tests {
     /// for presenting nothing now issues.
     #[test]
     fn clearing_the_token_opens_enrollment() {
-        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, Some("hunter2".into()), false);
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, Some("hunter2".into()), true);
         ca.set_now_unix(100);
         let (ed, x) = node_keys(2);
         let mac = [0, 0, 0, 0, 0, 9];
@@ -1835,20 +2077,20 @@ mod tests {
             let cfg = persisted_cfg(&path);
             let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
             ca.set_enrollment_policy(&EnrollmentPolicyData {
-                require_approval: Some(true),
+                auto_approve: Some(false),
                 cert_ttl_secs: Some(4242),
-                enrollment_token: Some(TokenUpdate::Set("hunter2".into())),
+                enrollment_token: Some(TokenUpdate::Set(SharedSecret::new("hunter2"))),
             })
             .unwrap();
         } // Dropped here, simulating a process restart.
 
-        // `persisted_cfg` is open enrollment with a 100_000s lifetime, so
+        // `persisted_cfg` auto-approves with a 100_000s lifetime, so
         // every assertion below is a value the startup config would not have
         // produced on its own.
         let cfg = persisted_cfg(&path);
         let ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
         let policy = ca.enrollment_policy();
-        assert!(policy.require_approval);
+        assert!(!policy.auto_approve);
         assert_eq!(policy.cert_ttl_secs, 4242);
         assert!(policy.enrollment_token_set);
 
@@ -1895,7 +2137,7 @@ mod tests {
         {
             let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
             ca.set_enrollment_policy(&EnrollmentPolicyData {
-                require_approval: Some(true),
+                auto_approve: Some(false),
                 ..Default::default()
             })
             .unwrap();
@@ -1907,10 +2149,7 @@ mod tests {
             ..persisted_cfg(&path)
         };
         let ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
-        assert!(
-            ca.enrollment_policy().require_approval,
-            "the override holds"
-        );
+        assert!(!ca.enrollment_policy().auto_approve, "the override holds");
         assert_eq!(
             ca.enrollment_policy().cert_ttl_secs,
             777,
@@ -1934,13 +2173,13 @@ mod tests {
         let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
 
         let result = ca.set_enrollment_policy(&EnrollmentPolicyData {
-            require_approval: Some(true),
+            auto_approve: Some(false),
             ..Default::default()
         });
 
         assert!(result.is_err(), "an unpersistable policy change must fail");
         assert!(
-            !ca.enrollment_policy().require_approval,
+            ca.enrollment_policy().auto_approve,
             "and must not be left applied in memory"
         );
     }
@@ -1962,16 +2201,53 @@ mod tests {
         // config" is distinguishable from "fell back to something else".
         let cfg = ProviderConfig {
             cert_ttl_secs: 4321,
-            require_approval: true,
+            auto_approve: false,
+            allow_unbounded_cert_ttl: false,
             enrollment_token: Some("from-yaml".into()),
             ..persisted_cfg(&path)
         };
         let ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
 
         let policy = ca.enrollment_policy();
-        assert!(policy.require_approval);
+        assert!(!policy.auto_approve);
         assert_eq!(policy.cert_ttl_secs, 4321);
         assert!(policy.enrollment_token_set);
+
+        std::fs::remove_file(&path).ok();
+    }
+    /// A version-3 snapshot recorded the posture as `require_approval`, the
+    /// field this schema replaced with its inverse. The override has to survive
+    /// the rename inverted, not be dropped: an operator who pinned "hold every
+    /// request" from the dashboard must not come back from an upgrade to a
+    /// provider that signs on submission.
+    #[test]
+    fn v3_state_file_migrates_a_require_approval_override_to_its_inverse() {
+        let path = unique_state_path("v3-migrate-posture");
+        let v3 = serde_json::json!({
+            "version": 3,
+            "issued": [],
+            "held": [],
+            "policy": { "require_approval": true },
+        });
+        std::fs::write(&path, v3.to_string()).unwrap();
+
+        // A config that says the opposite, so "the override held" is
+        // distinguishable from "it fell back to the config".
+        let cfg = ProviderConfig {
+            auto_approve: true,
+            ..persisted_cfg(&path)
+        };
+        let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+        ca.set_now_unix(100);
+
+        assert!(
+            !ca.enrollment_policy().auto_approve,
+            "the pinned approval requirement carried across the rename"
+        );
+        assert!(
+            matches!(submit(&mut ca, ""), CsrOutcome::Pending),
+            "and still governs an incoming request"
+        );
 
         std::fs::remove_file(&path).ok();
     }

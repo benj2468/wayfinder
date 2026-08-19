@@ -566,6 +566,7 @@ mod tests {
             ReqKind::GetLinkFeaturesTable(GetLinkFeaturesTableRequest {}),
             ReqKind::GetLogs(GetLogsRequest::default()),
             ReqKind::SetLogLevel(SetLogLevelRequest::default()),
+            ReqKind::RevealEnrollmentToken(RevealEnrollmentTokenRequest {}),
         ]
     }
 
@@ -583,12 +584,15 @@ mod tests {
         let all = every_request_kind();
         assert_eq!(
             all.len(),
-            22,
+            23,
             "every_request_kind must list every variant of the request oneof; \
              add the new one (and decide what the enrollment tier may do with it)"
         );
 
         for request in &all {
+            // Notably not on the list: `RevealEnrollmentToken`. A node asking
+            // to join has to be *given* the token; a node that could ask the
+            // provider for it would make the token no barrier at all.
             let expected = matches!(request, ReqKind::SubmitCsr(_) | ReqKind::GetTrustAnchor(_));
             assert_eq!(
                 permits(MgmtAccess::GrantedEnrollment, request),

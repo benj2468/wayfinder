@@ -26,11 +26,27 @@ use wayfinder_web::enroll::request;
 use wayfinder_web::mock::MOCK_MESH_ID;
 use wayfinder_web::mock::Mock;
 
-/// Start an authority and describe it the way the dashboard's form does: an
-/// address, a pinned key as hex, and a token.
-async fn serve_authority(require_approval: bool) -> ProviderTarget {
-    let (addr, node_key) =
-        wayfinder_web::mock::serve_mock_node_with(Mock::authority(require_approval, None)).await;
+/// Start an auto-approving authority — one that signs on submission — and
+/// describe it the way the dashboard's form does: an address, a pinned key as
+/// hex, and a token.
+async fn serve_authority() -> ProviderTarget {
+    target(Mock::authority(true, None)).await
+}
+
+/// Start an authority in the closed posture, which holds each request until an
+/// operator approves it.
+///
+/// A named helper rather than a bool at the call site: which of the two paths a
+/// test drives is the most important thing about it, and `true`/`false` in
+/// argument position does not say.
+async fn serve_approval_gated_authority() -> ProviderTarget {
+    target(Mock::authority(false, None)).await
+}
+
+/// Serve `mock` and describe it as a provider target the enrollment form could
+/// have been filled in with.
+async fn target(mock: Mock) -> ProviderTarget {
+    let (addr, node_key) = wayfinder_web::mock::serve_mock_node_with(mock).await;
     ProviderTarget {
         address: addr.to_string(),
         node_key: node_key.iter().map(|b| format!("{b:02x}")).collect(),
@@ -42,13 +58,7 @@ async fn serve_authority(require_approval: bool) -> ProviderTarget {
 /// be admitted at all. The returned target's own `token` field is left empty —
 /// each test fills in what it wants to present, which is the point.
 async fn serve_token_gated_authority(token: &str) -> ProviderTarget {
-    let (addr, node_key) =
-        wayfinder_web::mock::serve_mock_node_with(Mock::authority(false, Some(token))).await;
-    ProviderTarget {
-        address: addr.to_string(),
-        node_key: node_key.iter().map(|b| format!("{b:02x}")).collect(),
-        token: String::new(),
-    }
+    target(Mock::authority(true, Some(token))).await
 }
 
 /// The node's security posture as it reports it right now.
@@ -98,7 +108,7 @@ fn hex(s: &str) -> [u8; 32] {
 #[tokio::test]
 async fn an_open_node_joins_a_mesh_and_reports_itself_a_member() {
     let node: Arc<NodeConnection> = common::serve_unauthenticated_mock_node().await;
-    let provider = serve_authority(false).await;
+    let provider = serve_authority().await;
 
     let before = posture(&node).await;
     assert!(!before.auth_enabled, "the node starts with no certificate");
@@ -123,7 +133,7 @@ async fn an_open_node_joins_a_mesh_and_reports_itself_a_member() {
 #[tokio::test]
 async fn joining_certifies_the_identity_the_node_already_had() {
     let node = common::serve_unauthenticated_mock_node().await;
-    let provider = serve_authority(false).await;
+    let provider = serve_authority().await;
 
     let before = posture(&node).await;
     let node_mac = node
@@ -153,7 +163,7 @@ async fn joining_certifies_the_identity_the_node_already_had() {
 #[tokio::test]
 async fn a_held_request_is_collected_once_an_operator_approves_it() {
     let node = common::serve_unauthenticated_mock_node().await;
-    let provider = serve_authority(true).await;
+    let provider = serve_approval_gated_authority().await;
 
     assert_eq!(
         request(&node, &provider).await.unwrap(),
@@ -189,7 +199,7 @@ async fn a_held_request_is_collected_once_an_operator_approves_it() {
 #[tokio::test]
 async fn a_malformed_provider_key_is_reported_as_one() {
     let node = common::serve_unauthenticated_mock_node().await;
-    let mut provider = serve_authority(false).await;
+    let mut provider = serve_authority().await;
     provider.node_key = "not-a-key".to_string();
 
     let err = format!("{:#}", request(&node, &provider).await.unwrap_err());
@@ -203,7 +213,7 @@ async fn a_malformed_provider_key_is_reported_as_one() {
 #[tokio::test]
 async fn a_provider_that_does_not_match_its_pinned_key_is_refused() {
     let node = common::serve_unauthenticated_mock_node().await;
-    let mut provider = serve_authority(false).await;
+    let mut provider = serve_authority().await;
     provider.node_key = "aa".repeat(32);
 
     assert!(request(&node, &provider).await.is_err());

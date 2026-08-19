@@ -41,6 +41,7 @@ use crate::api::TokenChange;
 use crate::api::approve_csr;
 use crate::api::deny_csr;
 use crate::api::request_enrollment;
+use crate::api::reveal_enrollment_token;
 use crate::api::revoke_node;
 use crate::api::set_enrollment_policy;
 use crate::api::set_lazy_cert_distribution;
@@ -208,13 +209,8 @@ pub fn Security() -> impl IntoView {
     // poll and there is no reason to rebuild it either.
     let join_details = Memo::new(move |_| {
         security().and_then(|s| {
-            s.enrollment.map(|policy| {
-                (
-                    format::hex(&s.own_ed_pubkey),
-                    policy.enrollment_token,
-                    policy.enrollment_token_set,
-                )
-            })
+            s.enrollment
+                .map(|policy| (format::hex(&s.own_ed_pubkey), policy.enrollment_token_set))
         })
     });
 
@@ -387,14 +383,8 @@ pub fn Security() -> impl IntoView {
                 // certificates has nothing for a joining node to be given.
                 join_details
                     .get()
-                    .map(|(node_key, token, token_set)| {
-                        view! {
-                            <ProviderJoinDetails
-                                node_key=node_key
-                                token=token
-                                token_set=token_set
-                            />
-                        }
+                    .map(|(node_key, token_set)| {
+                        view! { <ProviderJoinDetails node_key=node_key token_set=token_set /> }
                     })
             }}
 
@@ -784,24 +774,46 @@ fn JoinMesh(
 /// screenshot pasted into a chat, must not be where the mesh's shared secret
 /// leaks — but an operator who is deliberately handing it on should not be
 /// fighting the UI to do it.
+///
+/// # The token is fetched, not polled
+///
+/// The snapshot behind this panel is refreshed once a second and says only
+/// *whether* a token is required. The value arrives on its own request, when
+/// the operator asks for it — which is the difference between a secret
+/// disclosed continuously to everything that touches the snapshot and one
+/// disclosed in a discrete act the node writes to its log.
 #[component]
 fn ProviderJoinDetails(
     /// This provider's own Ed25519 public key, as 64 hex characters — what the
     /// joining node pins so nothing else can answer in this one's place.
     node_key: String,
-    /// The shared enrollment token.  Empty means only "this node did not report
-    /// the value" — never "no token is required", which is `token_set`'s to say.
-    token: String,
-    /// Whether a token is required at all.  The authoritative flag: a node may
-    /// report a token as set without reporting the token itself, and inferring
-    /// "no token" from an empty value would tell the operator the mesh is open
-    /// when it is gated.
+    /// Whether a token is required at all.  The authoritative flag, and the
+    /// only part of the token that rides the poll.
     token_set: bool,
 ) -> impl IntoView {
     let dash = use_dashboard();
     let key_shown = format::key(&hex_bytes(&node_key));
     let key_value = node_key.clone();
-    let token_known = !token.is_empty();
+    // The revealed token, once asked for. Local to this panel and dropped when
+    // the operator navigates away.
+    let (revealed, set_revealed) = signal(None::<String>);
+    let reveal = move |_| {
+        leptos::task::spawn_local(async move {
+            match reveal_enrollment_token().await {
+                // `None` is "no token required" — but this button is only
+                // rendered when the poll says one is, so the two disagreeing
+                // means the policy changed under the operator. Say so rather
+                // than rendering an empty field.
+                Ok(Some(token)) => set_revealed.set(Some(token)),
+                Ok(None) => dash.error.set(Some(
+                    "This provider no longer requires a token — enrollment is open.".to_string(),
+                )),
+                Err(e) => dash
+                    .error
+                    .set(Some(format!("Reading the token failed: {e}"))),
+            }
+        });
+    };
 
     view! {
         <Panel title="What a node needs to join">
@@ -825,39 +837,37 @@ fn ProviderJoinDetails(
                 shown=key_shown
                 value=key_value
             />
-            {match (token_set, token_known) {
-                (true, true) => {
-                    view! {
-                        <CopyField
-                            label="Enrollment token"
-                            shown="••••••••"
-                            value=token.clone()
-                        />
-                    }
-                        .into_any()
-                }
-                // A token is in force but its value did not come back. Saying so
-                // is the whole point: the alternative reading — that the mesh is
-                // ungated — is both wrong and the one that stops an operator
-                // looking for the token they actually need.
-                (true, false) => {
-                    view! {
-                        <Field
-                            label="Enrollment token"
-                            value="Required, but this node did not report it — read it from \
-                                   the provider's own configuration."
-                        />
-                    }
-                        .into_any()
-                }
-                (false, _) => {
-                    view! {
+            {move || {
+                if !token_set {
+                    return view! {
                         <Field
                             label="Enrollment token"
                             value="Not required — anyone in range may join"
                         />
                     }
-                        .into_any()
+                        .into_any();
+                }
+                match revealed.get() {
+                    Some(token) => {
+                        view! {
+                            <CopyField label="Enrollment token" shown="••••••••" value=token />
+                        }
+                            .into_any()
+                    }
+                    // Required, and not asked for yet. The button is the ask:
+                    // until it is pressed the value has not left the node, and
+                    // pressing it is what the node records.
+                    None => {
+                        view! {
+                            <div class="wf-field">
+                                <span class="wf-field-label">"Enrollment token"</span>
+                                <button type="button" class="wf-btn" on:click=reveal>
+                                    "Show token"
+                                </button>
+                            </div>
+                        }
+                            .into_any()
+                    }
                 }
             }}
 
@@ -997,7 +1007,11 @@ fn EnrollmentSettings(
     set_pending: WriteSignal<Option<Pending>>,
 ) -> impl IntoView {
     let dash = use_dashboard();
-    let require_approval = policy.require_approval;
+    // The switch is framed as the operator's own action — "approve by hand" —
+    // which is the inverse of the posture the node reports. A control you turn
+    // *on* to add a check reads correctly; one you turn off to add a check does
+    // not, and this one guards who joins the mesh.
+    let approval_required = !policy.auto_approve;
     let token_set = policy.enrollment_token_set;
     // Seeded from the node and edited locally. Not reseeded on every poll: that
     // would overwrite what the operator is in the middle of typing.
@@ -1013,9 +1027,11 @@ fn EnrollmentSettings(
     };
 
     let toggle_approval = move |_| {
-        let next = !require_approval;
+        // Flip the switch, then say it the way the node's field is spelled.
+        let next_approval = !approval_required;
+        let open = !next_approval;
         leptos::task::spawn_local(async move {
-            let result = set_enrollment_policy(Some(next), None, TokenChange::Unchanged).await;
+            let result = set_enrollment_policy(Some(open), None, TokenChange::Unchanged).await;
             report("Changing the approval requirement", result);
         });
     };
@@ -1067,11 +1083,11 @@ fn EnrollmentSettings(
                 type="button"
                 role="switch"
                 class="wf-gate"
-                aria-checked=if require_approval { "true" } else { "false" }
+                aria-checked=if approval_required { "true" } else { "false" }
                 title="Hold each request until an operator approves it here."
                 on:click=toggle_approval
             >
-                <span class="wf-gate-track" class:wf-gate-on=require_approval>
+                <span class="wf-gate-track" class:wf-gate-on=approval_required>
                     <span class="wf-gate-knob" />
                 </span>
                 <span class="wf-gate-label">

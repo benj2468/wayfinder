@@ -97,9 +97,11 @@ per-source rate limit. The key is `node_mac`, which is attacker-supplied.
 
 Two consequences, both new:
 
-- **Memory exhaustion.** A provider running `require_approval: true` with no
+- **Memory exhaustion.** A provider holding CSRs for operator approval with no
   enrollment token — the configuration the dashboard describes as *"anyone in
-  range may join"* — can be driven to OOM by one anonymous TCP client looping
+  range may join"*, and since the posture was inverted into
+  `auto_approve` the one a provider gets by default — can be driven to OOM
+  by one anonymous TCP client looping
   `SubmitCsr` with a fresh fabricated MAC each time. The store is also
   persisted, so the growth outlives a restart.
 - **MAC squatting.** A MAC already held under a different key is refused

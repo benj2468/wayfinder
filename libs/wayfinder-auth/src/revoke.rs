@@ -55,11 +55,39 @@ impl RevocationRecord {
 }
 
 impl crate::cert::TrustAnchor {
-    /// Verify a flooded `record` against this anchor, returning the revoked MAC
-    /// on success.  Checks the version, that it is for this mesh, and the root
-    /// signature — so an attacker cannot forge revocations to evict honest
-    /// nodes.
-    pub fn verify_revocation(&self, record: &RevocationRecord) -> Result<Mac, AuthError> {
+    /// Verify a flooded `record` against this anchor as of `now_unix`,
+    /// returning the revoked MAC on success.  Checks the version, that it is
+    /// for this mesh, the root signature — so an attacker cannot forge
+    /// revocations to evict honest nodes — and that the record has not already
+    /// expired.
+    ///
+    /// # What "as of `now_unix`" does and does not cover
+    ///
+    /// A record past its `not_after` is [`AuthError::Expired`]: the certificate
+    /// it cancels has expired too, so there is nothing left to enforce and
+    /// storing it would only occupy a slot in a bounded set. This check lives
+    /// here rather than at each call site because this is the function a new
+    /// caller reaches for, and a name like `verify_` should not leave the most
+    /// consequential half of validity to whatever the caller remembers.
+    ///
+    /// A record whose `not_before` has *not* arrived is deliberately still
+    /// `Ok`. It is a valid statement about the future, and a node that receives
+    /// one should store it and enforce it when the time comes; whether a stored
+    /// revocation is in force *now* is a separate question, answered where the
+    /// revocation set is consulted ([`OgmAuth::is_revoked`] in `wayfinder`).
+    ///
+    /// A `now_unix` of zero — a node whose clock has never been set, which is
+    /// the normal state of a freshly booted board — expires nothing, since no
+    /// real record has a `not_after` at or below it. That falls out of the
+    /// comparison rather than needing a special case, and a revocation is
+    /// exactly the message such a node most needs to act on.
+    ///
+    /// [`OgmAuth::is_revoked`]: https://docs.rs/wayfinder
+    pub fn verify_revocation(
+        &self,
+        record: &RevocationRecord,
+        now_unix: u64,
+    ) -> Result<Mac, AuthError> {
         if record.version != REVOKE_VERSION {
             return Err(AuthError::BadVersion);
         }
@@ -68,6 +96,11 @@ impl crate::cert::TrustAnchor {
         }
         if !verify_signature(&self.root_pubkey, record.signed_body(), &record.signature) {
             return Err(AuthError::BadSignature);
+        }
+        // Copy out of the packed struct before comparing (no refs into packed).
+        let not_after = record.not_after.get();
+        if not_after <= now_unix {
+            return Err(AuthError::Expired);
         }
         Ok(Mac(record.node_mac))
     }
@@ -89,7 +122,65 @@ mod tests {
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
         let record = authority.revoke(mac(7), 500, 1000);
         assert_eq!(
-            authority.trust_anchor().verify_revocation(&record),
+            authority.trust_anchor().verify_revocation(&record, 0),
+            Ok(mac(7))
+        );
+    }
+
+    /// A revocation that has already expired is refused by the anchor itself,
+    /// rather than by whatever the caller remembers to check afterwards.
+    ///
+    /// The cancelled certificate has expired too, so there is nothing left to
+    /// enforce — and the function a new caller reaches for should be the one
+    /// that says so.
+    #[test]
+    fn an_expired_revocation_is_refused() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let record = authority.revoke(mac(7), 500, 1000);
+
+        assert_eq!(
+            authority.trust_anchor().verify_revocation(&record, 1000),
+            Err(AuthError::Expired),
+            "not_after is the instant it stops applying, not the last instant it does"
+        );
+        assert_eq!(
+            authority.trust_anchor().verify_revocation(&record, 999),
+            Ok(mac(7))
+        );
+    }
+
+    /// A revocation dated to take effect later still verifies.
+    ///
+    /// Deliberately asymmetric with expiry, and the asymmetry is the point: a
+    /// record whose `not_before` has not arrived is one a node should *store*
+    /// and enforce when it does, so refusing it here would discard a valid
+    /// statement about the future. Whether it is in force *now* is a separate
+    /// question, answered where the revocation set is consulted.
+    #[test]
+    fn a_revocation_not_yet_in_force_still_verifies() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let record = authority.revoke(mac(7), 500, 1000);
+
+        assert_eq!(
+            authority.trust_anchor().verify_revocation(&record, 100),
+            Ok(mac(7))
+        );
+    }
+
+    /// A node whose clock has never been set treats every revocation as
+    /// unexpired, rather than discarding all of them.
+    ///
+    /// An embedded node boots with no time source, and a revocation is the one
+    /// message it most needs to act on. Zero falls out of the comparison
+    /// correctly — nothing is `not_after <= 0` — so this needs no special case,
+    /// only a test to keep one from being introduced.
+    #[test]
+    fn an_unset_clock_expires_nothing() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let record = authority.revoke(mac(7), 500, 1000);
+
+        assert_eq!(
+            authority.trust_anchor().verify_revocation(&record, 0),
             Ok(mac(7))
         );
     }
@@ -102,7 +193,7 @@ mod tests {
         let attacker = Authority::from_seed(&[8u8; 32], 0xABCD);
         let record = attacker.revoke(mac(7), 500, 1000);
         assert_eq!(
-            real.trust_anchor().verify_revocation(&record),
+            real.trust_anchor().verify_revocation(&record, 0),
             Err(AuthError::BadSignature)
         );
     }
@@ -114,7 +205,7 @@ mod tests {
         let mut record = authority.revoke(mac(7), 500, 1000);
         record.not_after = U64::new(9_999);
         assert_eq!(
-            authority.trust_anchor().verify_revocation(&record),
+            authority.trust_anchor().verify_revocation(&record, 0),
             Err(AuthError::BadSignature)
         );
     }
@@ -126,6 +217,9 @@ mod tests {
         let record = authority.revoke(mac(7), 500, 1000);
         let mut anchor = authority.trust_anchor();
         anchor.mesh_id = 0x2222;
-        assert_eq!(anchor.verify_revocation(&record), Err(AuthError::WrongMesh));
+        assert_eq!(
+            anchor.verify_revocation(&record, 0),
+            Err(AuthError::WrongMesh)
+        );
     }
 }

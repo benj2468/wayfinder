@@ -496,15 +496,47 @@ pub struct ProviderConfig {
     /// it short — passive expiry is the primary revocation mechanism.
     pub cert_ttl_secs: u64,
     /// Optional shared enrollment token.  When set, a CSR must present the
-    /// matching value; when absent, enrollment is open (TOFU — suitable for
-    /// closed or simulated networks).
+    /// matching value.
+    ///
+    /// A gate on *who may ask*, composed with — not an alternative to —
+    /// [`auto_approve`](Self::auto_approve), which decides whether asking
+    /// is enough.
     #[serde(default)]
     pub enrollment_token: Option<String>,
-    /// When `true`, an incoming CSR is parked as *pending* until an operator
-    /// approves it (`wayfinderctl csr approve`), rather than being signed on
-    /// submission.  Defaults to `false` (open/token-gated enrollment).
+    /// Sign a submitted CSR on the spot (`true`) rather than parking it as
+    /// *pending* until an operator approves it (`wayfinderctl csr approve`, or
+    /// the dashboard's Security tab).
+    ///
+    /// Defaults to `false`, and the default is the point: omitting this field
+    /// yields the closed posture. A provider signs membership certificates with
+    /// the mesh root key, and a certificate lets its holder sign OGMs the mesh
+    /// accepts, derive pairwise keys with any neighbour, and route — so what an
+    /// unattended provider hands out is mesh segregation itself, the entire
+    /// purpose of the trust anchor it signs with. Trust-on-first-use is a
+    /// legitimate configuration for a closed lab or a simulation; what an
+    /// operator should not be able to do is arrive at it by leaving a field out
+    /// of a YAML file.
+    ///
+    /// Composes with [`enrollment_token`](Self::enrollment_token) rather than
+    /// replacing it: with both set, a node must present the token *and* be
+    /// admitted on submission; with a token and this left `false`, the token
+    /// buys a place in the approval queue.
+    ///
+    /// Changeable at runtime through the management API by an authenticated
+    /// admin, which is a deliberate act and stays allowed.
     #[serde(default)]
-    pub require_approval: bool,
+    pub auto_approve: bool,
+    /// Permit a [`cert_ttl_secs`](Self::cert_ttl_secs) past
+    /// [`MAX_CERT_TTL_SECS`].
+    ///
+    /// The cap exists because passive expiry is this design's *primary*
+    /// revocation mechanism: a certificate lifetime measured in years is a mesh
+    /// whose only remaining recall is an active revocation flood reaching every
+    /// node. A simulation legitimately wants a certificate that outlives the
+    /// simulation, so the escape exists — as a sentence in the config, not as
+    /// an accident. Applies to a lifetime set through the management API too.
+    #[serde(default)]
+    pub allow_unbounded_cert_ttl: bool,
     /// How long a held CSR (pending, approved-but-uncollected, or a denial
     /// tombstone) survives before it is evicted, in seconds.  Eviction bounds
     /// the held-CSR table and frees a MAC for a fresh request after a stale one
@@ -522,6 +554,17 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub state_path: Option<String>,
 }
+
+/// The longest certificate lifetime a provider will issue for without
+/// [`ProviderConfig::allow_unbounded_cert_ttl`]: 90 days.
+///
+/// Chosen against how the two revocation paths compose. Passive expiry is the
+/// primary one and the only one that needs no reachability, so the cap is the
+/// worst-case delay before a node that must be removed is removed by nothing
+/// happening. A quarter is long enough that renewal is not an operational
+/// burden and short enough that a lost or compromised node is not a permanent
+/// member.
+pub const MAX_CERT_TTL_SECS: u64 = 90 * 24 * 60 * 60;
 
 /// Default [`ProviderConfig::pending_ttl_secs`]: one hour.
 fn default_pending_ttl_secs() -> u64 {

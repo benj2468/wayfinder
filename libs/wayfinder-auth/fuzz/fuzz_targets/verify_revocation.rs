@@ -15,6 +15,6 @@ fuzz_target!(|data: &[u8]| {
         root_pubkey: Keypair::from_seed(&[1; 32]).ed_pubkey(),
     };
     if let Ok((record, _)) = RevocationRecord::ref_from_prefix(data) {
-        let _ = anchor.verify_revocation(record);
+        let _ = anchor.verify_revocation(record, 0);
     }
 });
