@@ -35,8 +35,29 @@ pub use authz::decide_access;
 mod framing;
 #[cfg(feature = "embedded")]
 pub use framing::FrameError;
-#[cfg(feature = "embedded")]
-pub use framing::MAX_FRAME_LEN;
+
+/// The largest management *request* frame this node will read from a peer.
+///
+/// A remote peer supplies the 4-byte length prefix, so an unbounded value lets
+/// it demand an arbitrarily large allocation — on the embedded transport from a
+/// fixed heap, and on the host TLS transport from a process that is also
+/// routing the mesh, before it has presented any credential at all (the
+/// handshake authenticates a key, not an authorization).
+///
+/// 4 KiB comfortably covers every request: the largest is a `SetAuth` carrying
+/// a seed, a certificate and a trust anchor. It also covers a routing-table
+/// *response* on the node counts an embedded relay actually sees (dozens of
+/// originators, a couple of paths each — a few hundred entries at ~20-50
+/// encoded bytes apiece), which is why the embedded transport applies it in
+/// both directions. The host transport does not: a host node's log page or
+/// routing table runs well past this, and it is the peer's input, not the
+/// node's own answer, that this bound exists to limit.
+///
+/// A caller sizing an embedded node's heap around this cap should budget for
+/// **two** buffers at this size (`serve` keeps one in each direction) plus the
+/// response `Vec`s a query itself builds — see `HEAP_SIZE_BYTES` in
+/// `bins/wayfinder-nrf52840`.
+pub const MAX_FRAME_LEN: usize = 4 * 1024;
 #[cfg(feature = "embedded")]
 pub use framing::read_frame;
 #[cfg(feature = "embedded")]

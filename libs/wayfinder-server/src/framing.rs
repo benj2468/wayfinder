@@ -17,19 +17,7 @@ use embedded_io_async::Read;
 use embedded_io_async::ReadExactError;
 use embedded_io_async::Write;
 
-/// The largest frame body this transport will read.
-///
-/// A remote peer supplies the 4-byte length prefix, so an unbounded value would
-/// let it demand an arbitrarily large allocation on a memory-constrained node.
-/// 4 KiB comfortably covers a routing-table response on the node counts an
-/// embedded relay actually sees (dozens of originators, a couple of paths each
-/// — a few hundred entries at ~20-50 encoded bytes apiece) while staying tiny
-/// relative to `tokio_util`'s 8 MiB default. A caller sizing an embedded node's
-/// heap around this cap should budget for **two** buffers at this size (`serve`
-/// keeps one in each direction) plus the response `Vec`s a query itself builds
-/// — see `HEAP_SIZE_BYTES` in `bins/wayfinder-nrf52840`. A declared length above
-/// this is a protocol error, not something the node tries to allocate for.
-pub const MAX_FRAME_LEN: usize = 4 * 1024;
+use crate::MAX_FRAME_LEN;
 
 /// Why reading or writing a length-delimited frame failed.
 ///

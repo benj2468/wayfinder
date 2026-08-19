@@ -80,3 +80,8 @@ serde_json = { workspace = true, optional = true }
 # uses to hand a decoded request to the router loop and await its response.
 embedded-io-async = { workspace = true, optional = true }
 embassy-sync = { workspace = true, optional = true }
+
+[dev-dependencies]
+# `test-util` for the paused clock: the handshake-timeout test would otherwise
+# have to wait out `HANDSHAKE_TIMEOUT` in real seconds.
+tokio = { workspace = true, features = ["test-util"] }

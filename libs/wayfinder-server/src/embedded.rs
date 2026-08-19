@@ -36,8 +36,8 @@ use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderResponse;
 use wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response as RespKind;
 
+use crate::MAX_FRAME_LEN;
 use crate::framing::FrameError;
-use crate::framing::MAX_FRAME_LEN;
 use crate::framing::read_frame;
 use crate::framing::write_frame;
 
@@ -234,7 +234,7 @@ mod tests {
     use wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request as ReqKind;
 
     use super::*;
-    use crate::framing::MAX_FRAME_LEN;
+    use crate::MAX_FRAME_LEN;
 
     /// A one-shot in-memory stream for driving [`serve`] through exactly one
     /// request/response: reads drain `to_read` (a single pre-framed request)

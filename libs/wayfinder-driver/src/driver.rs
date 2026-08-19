@@ -632,24 +632,20 @@ async fn recv_auth_snapshot(
 /// from stops equalling `own_key` on the very next connection rather than only
 /// after a restart.
 ///
-/// `own_key` falls back to the all-zero key — unreachable by any real Ed25519
-/// handshake key — when `identity_seed` is absent. That only happens when no
-/// TLS management listener was ever configured, which is also when nothing
-/// drives `recv_auth_snapshot` to call this at all.
+/// `own_key` is `None` when no identity seed is configured — a node with no
+/// seed has no own key, so the self-key tier is simply unavailable rather than
+/// resting on a sentinel value nothing can present. That pairing should be
+/// unreachable in production (nothing drives an auth-snapshot request without a
+/// TLS listener, and nothing configures a TLS listener without an identity
+/// seed), so reaching it still warns: it silently disables the bootstrap grant
+/// for this node.
 fn build_auth_snapshot(router: &CentralRouter, identity_seed: Option<[u8; 32]>) -> AuthSnapshot {
-    let own_key = identity_seed
-        .map(|seed| Keypair::from_seed(&seed).ed_pubkey())
-        .unwrap_or_else(|| {
-            // By this function's own contract this should be unreachable in
-            // production (nothing drives an auth-snapshot request without a
-            // TLS listener, and nothing configures a TLS listener without an
-            // identity seed) — so reaching it at all means that pairing was
-            // violated somewhere, silently disabling the self-key bootstrap
-            // grant for this node. Loud on purpose: the fallback itself must
-            // not be silent even though it is safe.
-            warn!("auth snapshot requested with no identity seed configured; own_key reports the unreachable all-zero key");
-            [0u8; 32]
-        });
+    let own_key = identity_seed.map(|seed| Keypair::from_seed(&seed).ed_pubkey());
+    if own_key.is_none() {
+        warn!(
+            "auth snapshot requested with no identity seed configured; the self-key tier is unavailable on this node"
+        );
+    }
     match router.auth() {
         Some(auth) => AuthSnapshot {
             own_key,
@@ -841,21 +837,28 @@ mod tests {
 
         let snapshot = build_auth_snapshot(&router, Some(seed));
 
-        assert_eq!(snapshot.own_key, Keypair::from_seed(&seed).ed_pubkey());
+        assert_eq!(
+            snapshot.own_key,
+            Some(Keypair::from_seed(&seed).ed_pubkey())
+        );
         assert_eq!(snapshot.anchor, None);
         assert!(snapshot.revoked.is_empty());
     }
 
-    /// No identity seed configured at all falls back to the all-zero key —
-    /// unreachable by any real Ed25519 handshake key — rather than reporting
-    /// some prior value or panicking.
+    /// No identity seed configured at all reports no own key, rather than a
+    /// sentinel standing in for one.
+    ///
+    /// The sentinel was the all-zero key, defended as unreachable by any real
+    /// handshake key — but all-zeros is a valid Ed25519 encoding of a low-order
+    /// point, and the self-key tier is full management access. `None` makes the
+    /// question unaskable.
     #[test]
-    fn build_auth_snapshot_falls_back_to_the_zero_key_without_an_identity_seed() {
+    fn build_auth_snapshot_reports_no_own_key_without_an_identity_seed() {
         let router = CentralRouter::new(mac(1));
 
         let snapshot = build_auth_snapshot(&router, None);
 
-        assert_eq!(snapshot.own_key, [0u8; 32]);
+        assert_eq!(snapshot.own_key, None);
     }
 
     /// The core property the self-key staleness fix (§3.2) rests on: this
@@ -874,13 +877,14 @@ mod tests {
 
         assert_eq!(
             build_auth_snapshot(&router, Some(old_seed)).own_key,
-            old_key
+            Some(old_key)
         );
 
         let snapshot = build_auth_snapshot(&router, Some(new_seed));
-        assert_eq!(snapshot.own_key, new_key);
+        assert_eq!(snapshot.own_key, Some(new_key));
         assert_ne!(
-            snapshot.own_key, old_key,
+            snapshot.own_key,
+            Some(old_key),
             "a rotated-away-from seed's key must not still be reported as own_key"
         );
     }

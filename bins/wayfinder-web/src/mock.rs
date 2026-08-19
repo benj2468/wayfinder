@@ -513,7 +513,7 @@ pub async fn serve_mock_node_with(mock: Mock) -> (SocketAddr, [u8; 32]) {
     tokio::spawn(async move {
         while let Some(reply) = snapshot_rx.recv().await {
             let _ = reply.send(wayfinder_server::AuthSnapshot {
-                own_key: node_key,
+                own_key: Some(node_key),
                 anchor: None,
                 revoked: Vec::new(),
             });
