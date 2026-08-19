@@ -32,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
     use wayfinder_client::Endpoint;
     use wayfinder_web::conn::NodeConnection;
     use wayfinder_web::conn::Target;
+    use wayfinder_web::server::HostPolicy;
     use wayfinder_web::server::build_router;
 
     /// Command-line arguments.
@@ -44,6 +45,21 @@ async fn main() -> anyhow::Result<()> {
         /// non-loopback bind exposes the node to anyone who can reach the port.
         #[arg(long, env = "WAYFINDER_WEB_LISTEN", default_value = "127.0.0.1:8080")]
         listen: SocketAddr,
+
+        /// An extra `Host` name to answer to, beyond the loopback names and
+        /// `--listen`'s own address. Repeatable, or comma-separated.
+        ///
+        /// Needed for the reverse proxy a non-loopback deployment is supposed
+        /// to sit behind, since the browser then names the proxy rather than
+        /// this process. Requests naming anything else are refused: a page on
+        /// any site can point a name it controls at this address, and the
+        /// `Host` it sends is the only part of that it cannot choose.
+        #[arg(
+            long = "allowed-host",
+            env = "WAYFINDER_WEB_ALLOWED_HOSTS",
+            value_delimiter = ','
+        )]
+        allowed_host: Vec<String>,
 
         /// TLS address of the node's management API.
         #[arg(long, default_value = "127.0.0.1:7700")]
@@ -156,7 +172,13 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let app = build_router(leptos_options, conn);
+    info!(
+        allowed_hosts = ?args.allowed_host,
+        "answering to the loopback names, the listen address, and these"
+    );
+
+    let hosts = HostPolicy::for_listen(args.listen).allow(&args.allowed_host);
+    let app = build_router(leptos_options, conn, hosts);
 
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     info!(listen = %args.listen, "dashboard listening");

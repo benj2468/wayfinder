@@ -30,7 +30,11 @@ use wayfinder_web::snapshot::NodeSnapshot;
 #[tokio::test]
 async fn fetch_snapshot_server_fn_answers_over_http() {
     let conn = common::serve_mock_node().await;
-    let app = wayfinder_web::server::build_router(common::test_leptos_options(), conn);
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        conn,
+        common::test_hosts(),
+    );
 
     let response = app
         .oneshot(
@@ -68,7 +72,11 @@ async fn fetch_snapshot_server_fn_answers_over_http() {
 #[tokio::test]
 async fn dashboard_page_renders() {
     let conn = common::serve_mock_node().await;
-    let app = wayfinder_web::server::build_router(common::test_leptos_options(), conn);
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        conn,
+        common::test_hosts(),
+    );
 
     let response = app
         .oneshot(Request::get("/").body(Body::empty()).unwrap())
@@ -102,7 +110,11 @@ async fn every_tab_route_is_served() {
         "/logs",
     ] {
         let conn = common::serve_mock_node().await;
-        let app = wayfinder_web::server::build_router(common::test_leptos_options(), conn);
+        let app = wayfinder_web::server::build_router(
+            common::test_leptos_options(),
+            conn,
+            common::test_hosts(),
+        );
 
         let response = app
             .oneshot(Request::get(path).body(Body::empty()).unwrap())
@@ -125,7 +137,11 @@ async fn every_tab_route_is_served() {
 #[tokio::test]
 async fn set_link_gate_server_fn_answers_over_http() {
     let conn = common::serve_mock_node().await;
-    let app = wayfinder_web::server::build_router(common::test_leptos_options(), conn);
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        conn,
+        common::test_hosts(),
+    );
 
     let response = app
         .oneshot(
@@ -164,7 +180,7 @@ async fn set_link_gate_server_fn_answers_over_http() {
 async fn the_wasm_bundle_is_revalidated_rather_than_reused_blind() {
     let site = common::SiteRoot::new();
     let conn = common::serve_mock_node().await;
-    let app = wayfinder_web::server::build_router(site.options(), conn);
+    let app = wayfinder_web::server::build_router(site.options(), conn, common::test_hosts());
 
     let response = app
         .oneshot(
@@ -199,7 +215,7 @@ async fn the_wasm_bundle_is_revalidated_rather_than_reused_blind() {
 async fn revalidating_the_bundle_costs_a_304_not_another_copy() {
     let site = common::SiteRoot::new();
     let conn = common::serve_mock_node().await;
-    let app = wayfinder_web::server::build_router(site.options(), conn);
+    let app = wayfinder_web::server::build_router(site.options(), conn, common::test_hosts());
 
     let first = app
         .clone()
@@ -240,7 +256,11 @@ async fn revalidating_the_bundle_costs_a_304_not_another_copy() {
 #[tokio::test]
 async fn the_page_is_revalidated_rather_than_reused_blind() {
     let conn = common::serve_mock_node().await;
-    let app = wayfinder_web::server::build_router(common::test_leptos_options(), conn);
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        conn,
+        common::test_hosts(),
+    );
 
     let response = app
         .oneshot(Request::get("/security").body(Body::empty()).unwrap())
@@ -262,7 +282,11 @@ async fn the_page_is_revalidated_rather_than_reused_blind() {
 #[tokio::test]
 async fn the_favicon_keeps_its_long_cache() {
     let conn = common::serve_mock_node().await;
-    let app = wayfinder_web::server::build_router(common::test_leptos_options(), conn);
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        conn,
+        common::test_hosts(),
+    );
 
     let response = app
         .oneshot(Request::get("/favicon.svg").body(Body::empty()).unwrap())
@@ -285,7 +309,11 @@ async fn the_favicon_keeps_its_long_cache() {
 #[tokio::test]
 async fn favicon_is_served() {
     let conn = common::serve_mock_node().await;
-    let app = wayfinder_web::server::build_router(common::test_leptos_options(), conn);
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        conn,
+        common::test_hosts(),
+    );
 
     let response = app
         .oneshot(Request::get("/favicon.svg").body(Body::empty()).unwrap())
@@ -314,7 +342,11 @@ async fn favicon_is_served() {
 #[tokio::test]
 async fn dashboard_page_links_the_favicon() {
     let conn = common::serve_mock_node().await;
-    let app = wayfinder_web::server::build_router(common::test_leptos_options(), conn);
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        conn,
+        common::test_hosts(),
+    );
 
     let response = app
         .oneshot(Request::get("/").body(Body::empty()).unwrap())
@@ -338,7 +370,11 @@ async fn dashboard_page_links_the_favicon() {
 #[tokio::test]
 async fn dashboard_page_renders_the_logo() {
     let conn = common::serve_mock_node().await;
-    let app = wayfinder_web::server::build_router(common::test_leptos_options(), conn);
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        conn,
+        common::test_hosts(),
+    );
 
     let response = app
         .oneshot(Request::get("/").body(Body::empty()).unwrap())
@@ -355,5 +391,288 @@ async fn dashboard_page_renders_the_logo() {
     assert!(
         markup.contains(wayfinder_web::components::logo::MARK_PATH),
         "and it draws the real mark geometry"
+    );
+}
+
+/// A cross-site POST to a server function is refused before it reaches the
+/// node.
+///
+/// `#[server]` defaults to a form encoding, which is a CORS *simple request*:
+/// no preflight, so no opt-in from this side, and `server_fn` checks neither
+/// `Origin` nor a token of its own. Without this gate any page an operator
+/// happens to visit can drive `revoke_node`, `set_config` or the enrollment
+/// panel at whatever node this dashboard holds the identity for.
+#[tokio::test]
+async fn a_cross_site_post_to_a_server_fn_is_refused() {
+    let conn = common::serve_mock_node().await;
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        conn,
+        common::test_hosts(),
+    );
+
+    let response = app
+        .oneshot(
+            Request::post("/api/set_link_gate")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("origin", "http://evil.example")
+                .header("sec-fetch-site", "cross-site")
+                .body(Body::from("iface_idx=0&gate=TxOgm&value=false"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "a cross-site mutation never reaches the node"
+    );
+}
+
+/// A page served from a *sibling origin* — another port on this same host, or
+/// a neighbouring subdomain — is refused too.
+///
+/// `same-site` is not `same-origin`: a hostile page on `localhost:3000` is as
+/// foreign to this dashboard as one on the open internet, and it is the more
+/// plausible of the two on a developer's machine.
+#[tokio::test]
+async fn a_same_site_post_from_another_origin_is_refused() {
+    let conn = common::serve_mock_node().await;
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        conn,
+        common::test_hosts(),
+    );
+
+    let response = app
+        .oneshot(
+            Request::post("/api/set_link_gate")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("origin", "http://127.0.0.1:3000")
+                .header("sec-fetch-site", "same-site")
+                .body(Body::from("iface_idx=0&gate=TxOgm&value=false"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// A foreign `Origin` is refused even from a browser too old to send
+/// `Sec-Fetch-Site` — the two checks are independent, not a fallback chain.
+#[tokio::test]
+async fn a_foreign_origin_alone_is_refused() {
+    let conn = common::serve_mock_node().await;
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        conn,
+        common::test_hosts(),
+    );
+
+    let response = app
+        .oneshot(
+            Request::post("/api/snapshot")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("origin", "http://evil.example")
+                .body(Body::from("since_seq=0"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// The dashboard's own page keeps working: its polls carry the origin it was
+/// served from, and that origin is the listen address.
+#[tokio::test]
+async fn a_same_origin_post_is_served() {
+    let conn = common::serve_mock_node().await;
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        conn,
+        common::test_hosts(),
+    );
+
+    let response = app
+        .oneshot(
+            Request::post("/api/snapshot")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("accept", "application/json")
+                .header("host", common::TEST_LISTEN)
+                .header("origin", format!("http://{}", common::TEST_LISTEN))
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::from("since_seq=0"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// A request carrying neither header is served.
+///
+/// Deliberate, and the reason it is safe is narrow: every browser able to make
+/// a cross-site request at all sends at least one of the two, and a client that
+/// sends neither — `curl`, a script — has no ambient credentials for a forgery
+/// to borrow in the first place. Refusing here would buy nothing and break
+/// every non-browser caller.
+#[tokio::test]
+async fn a_request_with_no_origin_headers_is_served() {
+    let conn = common::serve_mock_node().await;
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        conn,
+        common::test_hosts(),
+    );
+
+    let response = app
+        .oneshot(
+            Request::post("/api/snapshot")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("accept", "application/json")
+                .body(Body::from("since_seq=0"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// A request for a host the dashboard was not configured to answer to is
+/// refused — the defence against DNS rebinding, which turns even a loopback
+/// bind into a remotely reachable one.
+#[tokio::test]
+async fn a_foreign_host_is_refused() {
+    let conn = common::serve_mock_node().await;
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        conn,
+        common::test_hosts(),
+    );
+
+    let response = app
+        .oneshot(
+            Request::post("/api/snapshot")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("host", "rebind.evil.example")
+                .body(Body::from("since_seq=0"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// The host check covers the rendered pages too, not just the server-function
+/// route: a rebound name that could load the dashboard could read every panel
+/// on it.
+#[tokio::test]
+async fn a_foreign_host_is_refused_on_a_page_route_too() {
+    let conn = common::serve_mock_node().await;
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        conn,
+        common::test_hosts(),
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/security")
+                .header("host", "rebind.evil.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// The port the browser names is not compared, so a published container port
+/// or a reverse proxy on 443 does not need its own allowlist entry. The *name*
+/// is what a rebinding attack has to control, and the name is what is checked.
+#[tokio::test]
+async fn the_host_is_matched_by_name_not_by_port() {
+    let conn = common::serve_mock_node().await;
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        conn,
+        common::test_hosts(),
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/")
+                .header("host", "127.0.0.1:9999")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// A name the operator named — `--allowed-host`, for the reverse proxy the
+/// posture doc says any non-loopback deployment needs — is served, and its
+/// origin is same-origin for the checks above.
+#[tokio::test]
+async fn an_operator_named_host_is_served() {
+    let conn = common::serve_mock_node().await;
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        conn,
+        common::test_hosts().allow(["wayfinder.example"]),
+    );
+
+    let response = app
+        .oneshot(
+            Request::post("/api/snapshot")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("accept", "application/json")
+                .header("host", "wayfinder.example")
+                .header("origin", "https://wayfinder.example")
+                .body(Body::from("since_seq=0"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// Server functions answer to `POST` alone.
+///
+/// No server function uses a GET encoding today, so the arm was unreachable —
+/// and it would have become a CSRF amplifier the moment one did, because a GET
+/// endpoint is forgeable from an `<img>` tag with no script at all.
+#[tokio::test]
+async fn server_fns_are_not_reachable_by_get() {
+    let conn = common::serve_mock_node().await;
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        conn,
+        common::test_hosts(),
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/api/snapshot?since_seq=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::METHOD_NOT_ALLOWED,
+        "the GET arm is gone, and the page routes do not swallow /api"
     );
 }

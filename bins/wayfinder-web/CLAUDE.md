@@ -181,6 +181,34 @@ the port has whatever access that identity carries; exposing it is a
 reverse-proxy's job. A session layer is a later, separable change — do not
 quietly widen the bind default in the meantime.
 
+**The bind address alone does not make it unreachable, which is why
+`server.rs` carries two gates** (`HostPolicy`, and the `known_host_only` /
+`same_origin_only` layers):
+
+- **A host allowlist**, because a page on any site can point a DNS name it
+  controls at `127.0.0.1` and become same-origin with a loopback-bound
+  dashboard. The `Host` it sends is the one part of that it cannot choose, so a
+  name that is neither loopback, nor `--listen`'s own address, nor one an
+  operator named with `--allowed-host`, is refused. Ports are not compared —
+  a published container port and a proxy on 443 both change the port while the
+  deployment is unchanged.
+- **A same-origin check on anything that mutates**, because `#[server]`
+  defaults to a form encoding, which is a CORS *simple request*: the browser
+  sends it cross-origin with no preflight and `server_fn` checks nothing
+  itself. `Sec-Fetch-Site` and `Origin` are checked independently and each is
+  only checked when present; a request carrying neither is not a browser and
+  has no session for a forgery to borrow.
+
+**Both are router-wide layers, and they have to be.**
+`leptos_routes_with_context` registers every `#[server]` function at its own
+exact path and method, and an exact route wins over the `/api/{*fn_name}`
+wildcard this crate declares — so a layer attached to that wildcard route never
+sees a real server-function call. It compiles, the tests that only assert a
+`200` still pass, and the gate is simply never invoked.
+
+Neither gate is a substitute for the session layer; both stop the deployment
+being remotely administrable by anyone who can get an operator to open a tab.
+
 **The Security tab enrolls the node**, too: its "Join a mesh" panel asks a
 provider to certify the node and installs what comes back (`enroll.rs`, and
 `api::request_enrollment`). Three things about it are worth knowing before

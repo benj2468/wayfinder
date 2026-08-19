@@ -14,6 +14,7 @@ use wayfinder_client::Endpoint;
 use wayfinder_client::Identity;
 use wayfinder_web::conn::NodeConnection;
 use wayfinder_web::conn::Target;
+use wayfinder_web::server::HostPolicy;
 
 /// Start the stand-in node (a plain member) and return a connection to it.
 pub async fn serve_mock_node() -> Arc<NodeConnection> {
@@ -58,6 +59,17 @@ pub fn test_leptos_options() -> LeptosOptions {
     LeptosOptions::builder()
         .output_name("wayfinder-web")
         .build()
+}
+
+/// The address the test router is treated as bound to.
+///
+/// Doubles as the `Host` and `Origin` a same-origin request carries, so a test
+/// that needs to look like the dashboard's own poll has one name to use.
+pub const TEST_LISTEN: &str = "127.0.0.1:8080";
+
+/// The host allowlist for a router bound at [`TEST_LISTEN`].
+pub fn test_hosts() -> HostPolicy {
+    HostPolicy::for_listen(TEST_LISTEN.parse().unwrap())
 }
 
 /// A throwaway `site-root` holding a stand-in wasm bundle, so a test can

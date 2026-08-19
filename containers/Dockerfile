@@ -308,9 +308,16 @@ ENTRYPOINT ["/usr/local/bin/wayfinder-ctl"]
 # The one image assembled from two build stages: the cross-compiled axum server
 # from `builder`, and the arch-independent wasm/JS/CSS bundle from `site`.
 #
-#   docker run --rm -p 8080:8080 \
+#   docker run --rm -p 127.0.0.1:8080:8080 \
 #       -v /var/lib/wayfinder:/var/lib/wayfinder:ro \
-#       <image> --addr <node-host>:7700
+#       <image> --listen 0.0.0.0:8080 --addr <node-host>:7700
+#
+# `--listen` is passed by the deployment, never by this image: the binary
+# defaults to loopback because it has *no authentication of its own*, and only
+# the deployment knows whether loopback means the container's own namespace
+# (where no published port could reach it) or the host's. Under
+# `network_mode: host` an image-level override would bind the dashboard to
+# every host interface — which is exactly the mistake this image used to make.
 #
 # The server holds the mesh identity and is the only party that speaks the
 # management API, so it needs an identity seed (and usually a membership cert)
@@ -336,13 +343,12 @@ ENV LEPTOS_OUTPUT_NAME=wayfinder-web \
     LEPTOS_SITE_PKG_DIR=pkg \
     LEPTOS_ENV=PROD
 
-# The binary defaults to loopback on purpose — it has no authentication of its
-# own, so whoever reaches the port has the access its node identity carries.
-# In a container, loopback is the container's own namespace and no published
-# port could ever reach it, so the image overrides the default; the process
-# still logs a warning on every non-loopback bind. Publishing that port to
-# anything wider than the host is a reverse proxy's job.
-ENV WAYFINDER_WEB_LISTEN=0.0.0.0:8080
+# Documents the port the run command above binds inside the container; it
+# publishes nothing on its own. Publishing it to anything wider than the host is
+# a reverse proxy's job, and a deployment reached through one has to name that
+# proxy's host with `--allowed-host` — the dashboard refuses a `Host` it was
+# never told about, which is what stops a page on any site pointing a name it
+# controls at this address.
 EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/wayfinder-web"]
