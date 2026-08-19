@@ -72,6 +72,22 @@ in
         '';
       };
 
+      allowedHosts = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "wayfinder.example.org" ];
+        description = ''
+          Extra `Host` names the dashboard answers to, beyond the loopback
+          names and `listen`'s own address.
+
+          Needed only behind a reverse proxy, since the browser then names the
+          proxy rather than this service. Everything else is refused: a page on
+          any site can point a DNS name it controls at this address and become
+          same-origin with the dashboard, and the `Host` it sends is the one
+          part of that it cannot choose.
+        '';
+      };
+
       addr = mkOption {
         type = types.str;
         default = "127.0.0.1:7700";
@@ -143,6 +159,7 @@ in
           ExecStart =
             "${wayfinder-web}/bin/wayfinder-web"
             + " --listen ${wayfinderCfg.web.listen}"
+            + lib.concatMapStrings (host: " --allowed-host ${host}") wayfinderCfg.web.allowedHosts
             + " --addr ${wayfinderCfg.web.addr}"
             + " --identity ${wayfinderCfg.web.identityPath}"
             + lib.optionalString (wayfinderCfg.web.cert != null) " --cert ${wayfinderCfg.web.cert}"

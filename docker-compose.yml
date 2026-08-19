@@ -64,12 +64,13 @@ services:
       target: web
     image: registry.haganah.net/wayfinder-web:nightly
     # Host networking, same as `node`. `--listen` (the dashboard's own bind
-    # address, distinct from `--addr` below) is left at its default,
-    # 127.0.0.1:8080 — under host networking that's the host's real loopback,
-    # so this stays host-local, matching bins/wayfinder-web/CLAUDE.md's "no
-    # auth of its own, binds loopback by default" posture. Overriding
-    # `--listen`/`WAYFINDER_WEB_LISTEN` to expose this beyond the host needs a
-    # reverse proxy in front, per that doc.
+    # address, distinct from `--addr` below) is passed explicitly rather than
+    # left to a default, because under host networking loopback is the *host's*
+    # real loopback and the difference is a security boundary: the dashboard has
+    # no auth of its own, so whoever reaches the port has the access the node
+    # identity carries (bins/wayfinder-web/CLAUDE.md). Widening it beyond the
+    # host needs a reverse proxy in front, per that doc, and `--allowed-host`
+    # naming that proxy.
     network_mode: host
     # --addr must be a literal socket address, not the `node` service name:
     # `network_mode: host` opts both containers out of Compose's embedded DNS,
@@ -78,7 +79,7 @@ services:
     # --identity is left at its default, /var/lib/wayfinder/identity.seed, which
     # on the shared volume is the *node's* seed; with no --cert that proves the
     # node's own key, the bootstrap path into a node that has not enrolled yet.
-    command: ["--addr", "127.0.0.1:7700"]
+    command: ["--listen", "127.0.0.1:8080", "--addr", "127.0.0.1:7700"]
     volumes:
       - state:/var/lib/wayfinder:ro
     environment:
