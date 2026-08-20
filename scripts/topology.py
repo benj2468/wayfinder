@@ -58,9 +58,22 @@ plain ``cargo build`` does *not* produce usably — build it with::
 
     cargo leptos build      # the ssr binary AND the wasm bundle it serves
 
-A dashboard authenticates with a shared *operator* identity minted alongside
-the node certificates: an enrolled node refuses any management connection that
-cannot present a certificate carrying the admin capability.
+A secured node's dashboard has **no credential of its own**: it is started in
+login mode (``--provider``), and whoever opens it signs in with one of the two
+accounts this script mints into the provider before the stack comes up —
+``admin`` (full management) and ``viewer`` (read-only).  Both use the password
+``SIM_PASSWORD`` below and have no second factor, since a simulation has nowhere
+to enrol an authenticator.  Signing in obtains a short-lived certificate from
+the provider; the dashboard holds it for that browser session and nobody else.
+
+The ``viewer`` account is the only way to see the read-only management tier end
+to end — no node in this sim would otherwise hold a viewer certificate.
+
+An *open* node's dashboard is the exception, and is the reason static
+credentials still exist at all (§8.3 of
+``docs/design/06-management-api-authentication.md``): an un-enrolled node has no
+user store, so there is nobody to sign in to, and proving the node's own key is
+the only credential there is.
 
 Identity
 --------
@@ -93,8 +106,8 @@ so an open node is heard and dropped rather than routed to.
 
 An open node's dashboard authenticates the *opposite* way to a secured one: the
 node is un-enrolled, so it admits only a client proving the node's own key, and
-its dashboard is given that seed instead of the operator certificate.  Its MAC
-is the one thing that is not reproducible across ``up``, since it has no
+its dashboard is given that seed as a static credential rather than a sign-in.
+Its MAC is the one thing that is not reproducible across ``up``, since it has no
 identity seed to derive one from — the node generates and persists a MAC on
 first boot instead.
 """
@@ -127,6 +140,27 @@ MESH_ID = 1
 # running never expires out from under itself; a real deployment keeps this
 # short, since passive expiry is the primary revocation mechanism.
 CERT_NOT_AFTER = 100_000_000_000
+
+# The two accounts minted into the provider's user store before the stack comes
+# up, so a dashboard has somebody to sign in as. `admin` can drive every control;
+# `viewer` can read and change nothing, which is the only way to exercise the
+# read-only management tier at all — no node in this sim holds a viewer
+# certificate otherwise.
+#
+# One password for both, printed by `up`: this is a simulation on a private
+# docker network, and a credential nobody can find is a credential nobody uses.
+# Neither account has a second factor (`--no-totp`), because there is nowhere
+# here to enrol an authenticator.
+SIM_ADMIN_USER = "admin"
+SIM_VIEWER_USER = "viewer"
+SIM_PASSWORD = "wayfinder"
+
+# How long a session certificate the sim's accounts obtain stays valid. A week:
+# long enough that a sim left running over a weekend does not sign everyone out,
+# short enough to stay under the provider's own 90-day cap rather than relying
+# on the `allow_unbounded_cert_ttl` escape the node config sets for device
+# certificates.
+SIM_SESSION_TTL_SECS = 7 * 24 * 60 * 60
 
 # Host port for the first node's dashboard; each subsequent node takes the next
 # port up, in the same order `node_order` assigns node IPs. Published on
@@ -216,12 +250,17 @@ def open_nodes(attach_to: str, count: int = -1) -> list[list[str]]:
 # node, and one admin cert for the dashboards. See `make_identities`.
 
 
-def _ctl(*args: str) -> str:
+def _ctl(*args: str, stdin: str | None = None) -> str:
     """Run `wayfinderctl` from the workspace, returning its stdout.
 
     Via ``cargo run`` rather than a path into ``target/``, so the caller never
     has to have built it first — the same reason ``make_identities`` can be the
     first thing ``up`` does.
+
+    ``stdin`` feeds a password to ``user add --password-stdin``.  It has to be
+    stdin and cannot be an argument: argv is readable by every process on the
+    host, and the prompt the command otherwise uses reads ``/dev/tty``, which
+    would block here on whatever terminal this script inherited.
     """
     result = subprocess.run(
         ["cargo", "run", "--quiet", "-p", "wayfinder-ctl", "--", *args],
@@ -229,6 +268,7 @@ def _ctl(*args: str) -> str:
         check=True,
         capture_output=True,
         text=True,
+        input=stdin,
     )
     return result.stdout
 
@@ -267,8 +307,16 @@ def make_identities(
       no mesh identity to certify; the seed exists only so its *management-TLS*
       server has a stable key (see below).
     * ``operator/``           — a single *admin* identity, not tied to any radio.
-      This is what the dashboards authenticate with; an enrolled node refuses a
-      management connection that cannot present one.
+      Not used by the dashboards any more (they sign in instead), but it is what
+      a ``wayfinderctl`` run from the host presents when it drives a node
+      directly, and an enrolled node refuses a management connection that cannot
+      present one.
+    * ``provider-state/``     — the provider's durable CA state, pre-seeded with
+      the two user accounts a dashboard signs in as, and mounted *writable* into
+      the provider (everything else here is read-only).  It has to be seeded
+      before the stack comes up: the provider holds this state in memory and
+      rewrites the whole snapshot, so an account added to a running provider's
+      file is overwritten by the next thing it persists.
 
     Pre-issuing rather than enrolling at runtime is what makes each node's MAC
     reproducible: the node derives its MAC from this seed, and ``cert issue``
@@ -329,14 +377,64 @@ def make_identities(
     }
     for name in open_names or []:
         node_keys[name] = keygen_into(ca_dir / "open" / name)
-    # One admin identity shared by every dashboard. Separate from the node certs
-    # on purpose: making each node its own administrator would hand the admin
-    # capability to every router in the mesh, which is exactly what the signed
-    # admin bit exists to prevent.
+    # One admin identity for a host-side `wayfinderctl`. Separate from the node
+    # certs on purpose: making each node its own administrator would hand the
+    # admin capability to every router in the mesh, which is exactly what the
+    # signed admin bit exists to prevent.
     issue_into(ca_dir / "operator", admin=True)
+
+    make_accounts(ca_dir)
 
     print(f"minted mesh identities in {ca_dir}", file=sys.stderr)
     return ca_dir, node_keys
+
+
+def provider_state_dir(ca_dir: Path) -> Path:
+    """Where the provider's durable CA state lives on the host.
+
+    A *directory*, mounted whole, rather than the state file alone: the durable
+    store replaces a snapshot by writing a temporary file beside it and renaming
+    over the top, which is what makes a torn read impossible — and a bind mount
+    of a single file has no "beside it" to write into.
+    """
+    return ca_dir / "provider-state"
+
+
+def provider_state_path(ca_dir: Path) -> Path:
+    """The provider's CA state file on the host."""
+    return provider_state_dir(ca_dir) / "ca-state.json"
+
+
+def make_accounts(ca_dir: Path) -> None:
+    """Seed the provider's user store with the accounts a dashboard signs in as.
+
+    Offline, on the host, before anything starts — the same reason
+    ``wayfinderctl user`` is an offline tool at all: the first account cannot be
+    created over the management API, because creating it needs the credential it
+    creates.  Here there is a second reason on top, which is that the provider
+    holds this state in memory and rewrites the whole snapshot, so an edit made
+    while it runs does not survive its next write.
+    """
+    state = provider_state_path(ca_dir)
+    state.parent.mkdir(parents=True, exist_ok=True)
+    for username, extra in ((SIM_ADMIN_USER, ["--admin"]), (SIM_VIEWER_USER, [])):
+        _ctl(
+            "user", "add",
+            "--state", str(state),
+            "--username", username,
+            "--session-ttl", str(SIM_SESSION_TTL_SECS),
+            # A simulation has nowhere to enrol an authenticator app, which is
+            # the case this flag exists for.
+            "--no-totp",
+            "--password-stdin",
+            *extra,
+            stdin=f"{SIM_PASSWORD}\n",
+        )  # fmt: skip
+    print(
+        f"minted sim accounts {SIM_ADMIN_USER!r} (admin) and {SIM_VIEWER_USER!r} "
+        f"(read-only), password {SIM_PASSWORD!r}",
+        file=sys.stderr,
+    )
 
 
 # ── the topology (edit me) ────────────────────────────────────────────────────
@@ -460,6 +558,10 @@ def render_compose(require_approval: bool = False) -> str:
     # Every other secured node is a plain member holding a certificate this CA
     # already signed; the open nodes hold nothing.
     provider_name = secured_names[0]
+    # The provider's own management address, so every dashboard knows where to
+    # send a sign-in. Derived from the same enumeration that assigns the
+    # addresses below rather than recomputed, so the two cannot drift.
+    provider_mgmt_ip = f"10.99.0.{list(nodes).index(provider_name) + 2}"
 
     e("# Shared service definition, merged into each node via a YAML anchor.")
     e("x-node: &node")
@@ -513,6 +615,10 @@ def render_compose(require_approval: bool = False) -> str:
             e("      - /nix/store:/nix/store:ro")
         if is_provider:
             e(f"      - {ca_dir!s}:/ca:ro")
+            # Writable, unlike everything else here: this is the CA's durable
+            # state, and it arrives pre-seeded with the user accounts a
+            # dashboard signs in as.
+            e(f"      - {provider_state_dir(ca_dir)!s}:/ca-state")
         e("    environment:")
         e(f"      NODE_IP: {cfg['ip']}")
         e(f"      RUST_LOG: {cfg['rust_log']}")
@@ -524,6 +630,7 @@ def render_compose(require_approval: bool = False) -> str:
             e('      SECURE: "0"')
         if is_provider:
             e('      PROVIDER: "1"')
+            e('      CA_STATE_PATH: "/ca-state/ca-state.json"')
             # Gate hand-submitted CSRs on operator approval instead of
             # auto-signing. Nothing enrols on its own here — every node is
             # already certified — so this only affects a CSR you submit
@@ -547,16 +654,20 @@ def render_compose(require_approval: bool = False) -> str:
         # How it authenticates depends on what the node it is talking to will
         # accept, and the two cases are opposites:
         #
-        # * A secured node is *enrolled*, so it refuses any connection that
-        #   cannot present an admin certificate — the shared operator identity.
-        # * An open node is *un-enrolled*, so the only credential that grants it
-        #   full management is proof of the node's own key. So its dashboard
-        #   presents that node's seed and no certificate at all. (A client with
-        #   no cert is still admitted, but only to enroll — see `authz::permits`
-        #   — which is not enough to drive a dashboard.)
+        # * A secured node is *enrolled*, so the dashboard holds no credential
+        #   at all: it runs in login mode, and whoever opens it signs in to the
+        #   provider for a session certificate of their own (`admin` or
+        #   `viewer`, minted by `make_accounts`).
+        # * An open node is *un-enrolled*, so there is no user store to sign in
+        #   to and the only credential that grants full management is proof of
+        #   the node's own key. So its dashboard presents that node's seed as a
+        #   static credential. (A client with no cert is still admitted, but
+        #   only to enroll — see `authz::permits` — which is not enough to drive
+        #   a dashboard.)
         #
         # `--node-key` pins the node being connected to either way — that node's
-        # own ed25519 key, which cannot be defaulted here.
+        # own ed25519 key, which cannot be defaulted here — and `--provider-key`
+        # pins the host a password is about to be sent to.
         e(f"  {name}-web:")
         e("    image: wayfinder-sim:latest")
         # Same image as the nodes purely to avoid a second build; its entrypoint
@@ -579,14 +690,12 @@ def render_compose(require_approval: bool = False) -> str:
         if is_open:
             e("          --identity /node-identity/seed \\")
         else:
-            e("          --identity /operator/seed \\")
-            e("          --cert /operator/cert \\")
+            e(f"          --provider {provider_mgmt_ip}:7700 \\")
+            e(f"          --provider-key {node_keys[provider_name]} \\")
         e(f"          --node-key {node_keys[name]}")
         e("    volumes:")
         if is_open:
             e(f"      - {secrets_dir!s}:/node-identity:ro")
-        else:
-            e(f"      - {ca_dir / 'operator'!s}:/operator:ro")
         e(f"      - {REPO_ROOT!s}:/workspace:ro")
         if Path("/nix/store").is_dir():
             e("      - /nix/store:/nix/store:ro")
@@ -599,8 +708,9 @@ def render_compose(require_approval: bool = False) -> str:
         e('      LEPTOS_SITE_ROOT: "/workspace/target/site"')
         e('      LEPTOS_SITE_PKG_DIR: "pkg"')
         e("    ports:")
-        # Loopback only: the dashboard has no authentication of its own, and it
-        # can now edit the mesh's security settings.
+        # Loopback only. A secured node's dashboard now has a sign-in, but this
+        # process terminates no TLS of its own, so a password would cross the
+        # network in the clear; an open node's has no sign-in at all.
         e(f'      - "127.0.0.1:{WEB_PORT_BASE + idx}:8080"')
         e("    networks:")
         e("      wf_mgmt: {}")
@@ -739,6 +849,18 @@ def print_web_urls() -> None:
     print("\ndashboards:", file=sys.stderr)
     for name, url in web_urls():
         print(f"  {name:<6} {url}", file=sys.stderr)
+    # Printed with the URLs, not buried in this file: a secured node's dashboard
+    # now shows a sign-in page and nothing else, so the accounts are part of
+    # knowing how to open it.
+    print(
+        f"  sign in as {SIM_ADMIN_USER!r} (full management) or {SIM_VIEWER_USER!r} "
+        f"(read-only); password {SIM_PASSWORD!r}, no authenticator code.",
+        file=sys.stderr,
+    )
+    print(
+        "  an open node's dashboard has no sign-in: it proves the node's own key.",
+        file=sys.stderr,
+    )
 
 
 def cmd_graph() -> None:

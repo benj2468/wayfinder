@@ -148,3 +148,71 @@ pub fn Empty(
 ) -> impl IntoView {
     view! { <p class="wf-empty">{message}</p> }
 }
+
+/// An action awaiting confirmation, held until the operator commits or cancels.
+///
+/// Generic over what the action *is*, because the two tabs that raise one have
+/// nothing in common but the dialog: the Security tab revokes and switches
+/// postures, the Provider tab approves and denies. Sharing the enum instead
+/// would give each tab a set of variants it must handle and can never receive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pending<K> {
+    /// What will happen, in plain language, for the dialog body.
+    pub prompt: String,
+    /// The label on the confirming button.
+    pub verb: &'static str,
+    /// Whether this is the destructive kind, which the dialog styles louder.
+    pub destructive: bool,
+    /// Which call to make on confirmation.
+    pub kind: K,
+}
+
+/// The modal that stands between a consequential button and what it does.
+///
+/// Not generic itself — it renders three already-decided values — so the
+/// `#[component]` machinery stays out of the way and each tab keeps its own
+/// action type.
+///
+/// # Why anything is behind one at all
+///
+/// Revoking a node floods a revocation every node acts on and re-approving does
+/// not undo it; the fail-closed gate can take a node off the mesh mid-session.
+/// In a terminal those sit behind a keystroke an operator had to know; in a
+/// browser they are buttons anyone can reach. What is *not* behind one matters
+/// as much: making a mesh harder to join is trivially reversible, and a dialog
+/// in front of every switch trains an operator to dismiss them.
+#[component]
+pub fn ConfirmDialog(
+    /// What will happen, in plain language.
+    #[prop(into)]
+    prompt: String,
+    /// The label on the confirming button.
+    verb: &'static str,
+    /// Whether to style the confirming button as destructive.
+    destructive: bool,
+    /// Run when the operator commits.
+    on_confirm: Callback<()>,
+    /// Run when the operator backs out.
+    on_cancel: Callback<()>,
+) -> impl IntoView {
+    view! {
+        <div class="wf-modal-backdrop">
+            <div class="wf-modal" role="alertdialog" aria-modal="true">
+                <p class="wf-modal-body">{prompt}</p>
+                <div class="wf-modal-actions">
+                    <button class="wf-button" on:click=move |_| on_cancel.run(())>
+                        "Cancel"
+                    </button>
+                    <button
+                        class="wf-button"
+                        class:wf-button-danger=destructive
+                        class:wf-button-primary=!destructive
+                        on:click=move |_| on_confirm.run(())
+                    >
+                        {verb}
+                    </button>
+                </div>
+            </div>
+        </div>
+    }
+}

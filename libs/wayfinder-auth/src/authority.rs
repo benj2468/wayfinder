@@ -8,6 +8,8 @@ use zerocopy::byteorder::network_endian::U32;
 use zerocopy::byteorder::network_endian::U64;
 
 use crate::cert::CERT_FLAG_ADMIN;
+use crate::cert::CERT_FLAG_USER;
+use crate::cert::CERT_FLAG_VIEWER;
 use crate::cert::CERT_VERSION;
 use crate::cert::MembershipCert;
 use crate::cert::TrustAnchor;
@@ -84,9 +86,42 @@ impl Authority {
         )
     }
 
+    /// Issue a **user session certificate**: a person's credential rather than
+    /// a node's, carrying [`CERT_FLAG_USER`] plus exactly one capability —
+    /// [`CERT_FLAG_ADMIN`] when `admin`, otherwise [`CERT_FLAG_VIEWER`].
+    ///
+    /// The window is expected to be hours, not months: this is what the
+    /// certificate authority mints in exchange for a user's credentials, and
+    /// its expiry is what bounds a stolen session key. The MAC is derived from
+    /// the session key by the caller, so it never contends with a device's.
+    pub fn issue_user_cert(
+        &self,
+        mac: Mac,
+        ed_pubkey: [u8; 32],
+        x_pubkey: [u8; 32],
+        not_before: u64,
+        not_after: u64,
+        admin: bool,
+    ) -> MembershipCert {
+        let capability = if admin {
+            CERT_FLAG_ADMIN
+        } else {
+            CERT_FLAG_VIEWER
+        };
+        self.issue_with_flags(
+            mac,
+            ed_pubkey,
+            x_pubkey,
+            not_before,
+            not_after,
+            CERT_FLAG_USER | capability,
+        )
+    }
+
     /// Build and sign a membership cert with the given `flags`, the shared body
-    /// behind [`issue_cert`](Self::issue_cert) and
-    /// [`issue_admin_cert`](Self::issue_admin_cert).
+    /// behind [`issue_cert`](Self::issue_cert),
+    /// [`issue_admin_cert`](Self::issue_admin_cert) and
+    /// [`issue_user_cert`](Self::issue_user_cert).
     fn issue_with_flags(
         &self,
         mac: Mac,

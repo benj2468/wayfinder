@@ -112,6 +112,28 @@ pub fn timestamp(unix_secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02} UTC")
 }
 
+/// A UTC instant as the compact stamp a *filename* carries: `YYYYMMDD-HHMM`.
+///
+/// The counterpart to [`timestamp`], for the one place a date has to survive a
+/// filesystem rather than be read on a page: the `.wfauth` credential file the
+/// Provider tab hands out. No colons — Windows refuses them in a filename — and
+/// no spaces, so the name survives being pasted into a shell without quoting.
+/// Sortable, which is what makes a folder of expiring credentials legible.
+///
+/// Zero is `unknown` rather than the em dash [`timestamp`] uses: a filename
+/// needs characters a filesystem accepts, and a credential with no expiry is
+/// not something this crate can produce anyway.
+pub fn filename_stamp(unix_secs: u64) -> String {
+    if unix_secs == 0 {
+        return "unknown".to_string();
+    }
+    let days = (unix_secs / 86_400) as i64;
+    let secs_of_day = unix_secs % 86_400;
+    let (y, m, d) = civil_from_days(days);
+    let (hh, mm) = (secs_of_day / 3600, secs_of_day % 3600 / 60);
+    format!("{y:04}{m:02}{d:02}-{hh:02}{mm:02}")
+}
+
 /// Convert days since the Unix epoch to a civil (year, month, day).
 ///
 /// Howard Hinnant's `civil_from_days`, which is exact over the whole range and
@@ -430,6 +452,25 @@ mod tests {
     fn timestamp_handles_a_leap_day() {
         // 2024-02-29 00:00:00 UTC — the case a hand-rolled calendar gets wrong.
         assert_eq!(timestamp(1_709_164_800), "2024-02-29 00:00 UTC");
+    }
+
+    /// The filename stamp is the same instant as [`timestamp`], spelled in the
+    /// characters a filesystem accepts: no colons, no spaces, and sortable.
+    #[test]
+    fn filename_stamp_renders_a_sortable_utc_stamp() {
+        assert_eq!(filename_stamp(1_700_000_000), "20231114-2213");
+        assert_eq!(filename_stamp(1_709_164_800), "20240229-0000");
+        assert!(
+            !filename_stamp(1_700_000_000).contains([':', ' ', '/', '\\']),
+            "a filename stamp may hold nothing a filesystem refuses"
+        );
+    }
+
+    /// Unlike [`timestamp`], zero cannot be an em dash: this ends up in a
+    /// `Content-Disposition` filename, which needs plain characters.
+    #[test]
+    fn filename_stamp_of_zero_is_still_a_filename() {
+        assert_eq!(filename_stamp(0), "unknown");
     }
 
     #[test]

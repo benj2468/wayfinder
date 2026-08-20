@@ -358,6 +358,21 @@ body {
 
 /* Wide tables scroll inside their own panel; the page body must never scroll
  * sideways. */
+/* Present to a screen reader, absent on screen.
+
+   For a control whose purpose is obvious from its position — a column of
+   per-row buttons under a blank header — but has no text a non-visual reader
+   can reach. `display: none` and `visibility: hidden` both take it out of the
+   accessibility tree, which is the opposite of what is wanted here. */
+.wf-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 .wf-table-scroll {
   overflow-x: auto;
 }
@@ -1028,4 +1043,282 @@ body {
 
 .wf-level-trace {
   color: var(--wf-text-faint);
+}
+
+/* ----------------------------------------------------------------- login -- */
+
+/* The dashboard is rendered even when nobody is signed in — `<Routes>` has to be
+ * in the view tree unconditionally or route discovery finds nothing (see
+ * `lib.rs`) — so it is hidden here rather than skipped.
+ *
+ * Keyed off the sign-in form's *presence* rather than a class the app toggles,
+ * because that class would mean reading the session resource outside a
+ * `<Suspense>`, which is a hydration mismatch — and a hydration mismatch here is
+ * a wasm panic that leaves the page looking right and answering nothing.
+ *
+ * `display: none` and not `visibility`/opacity: it takes the whole shell out of
+ * the tab order and the accessibility tree too, which a hidden-but-focusable
+ * dashboard behind a sign-in form would not. */
+.wf-app:has(.wf-login-page) .wf-shell {
+  display: none;
+}
+
+/* Centred in the viewport rather than sitting under a header, because there is
+ * no header yet: this is the whole page.
+ *
+ * Centred by *auto margins* on the first and last child rather than by
+ * `justify-content`, which is not the same thing once the form is taller than
+ * the window: a centred flex item overflows in both directions and the top of
+ * it cannot be scrolled to, while an auto margin collapses to zero as soon as
+ * there is no room to give. A short window is the ordinary case on a phone. */
+.wf-login-page {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--wf-space-4);
+  min-height: 100vh;
+  padding: var(--wf-space-5);
+}
+
+/* Nothing else in this stylesheet sets an explicit width on a padded element,
+ * so the page-wide default (`content-box`) has never mattered. Here it does:
+ * every field is a full-width input, and `width: 100%` plus 12px of padding and
+ * a border is a form 26px wider than the panel it sits in. Scoped to this page
+ * rather than reset globally — a global change would silently resize every
+ * table, tab and chart in the dashboard to prove a point about one page. */
+.wf-login-page,
+.wf-login-page * {
+  box-sizing: border-box;
+}
+
+/* The mark, above the form. The sign-in page is the front door now, and a page
+ * with a bare form on it says nothing about what it is a door to. */
+.wf-login-mark {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--wf-space-1);
+  margin-top: auto;
+}
+
+/* Which node this dashboard is pointed at. Several of these run side by side in
+ * a mesh, one per node, and they are otherwise identical pages on adjacent
+ * ports. */
+.wf-login-node {
+  color: var(--wf-text-muted);
+}
+
+.wf-login {
+  display: flex;
+  flex-direction: column;
+  gap: var(--wf-space-4);
+  width: min(28rem, 100%);
+  margin-bottom: auto;
+}
+
+/* The shared panel head is a baseline-aligned row — a short title beside its
+ * subtitle. Here the subtitle is three lines of explanation, which squeezes
+ * "Sign in" into a 33px column and wraps it. Stacked instead. */
+.wf-login .wf-panel-head {
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--wf-space-2);
+}
+
+/* Label above field, not beside it: three stacked fields read as one form, and
+ * a password manager fills a column faster than a grid. */
+.wf-login-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--wf-space-2);
+}
+
+/* The input is `flex: 1` for the settings rows it was sized for; in a column it
+ * has no row to share, so it stretches instead. */
+.wf-login-field .wf-input {
+  flex: none;
+  width: 100%;
+}
+
+.wf-login-error {
+  margin: 0;
+  color: var(--wf-error);
+  font-size: var(--wf-text-sm);
+}
+
+/* The credential file is the fourth field of the one sign-in form, not a second
+ * form: there is one "Sign in" and it uses whichever of the two the person
+ * actually filled in. Separated by a rule rather than by a panel, because it is
+ * an *alternative* to the three fields above it and not another thing to fill
+ * out on the way past them. */
+.wf-login-alt {
+  padding-top: var(--wf-space-4);
+  border-top: 1px solid var(--wf-border);
+}
+
+/* A file input renders as a button plus a filename and ignores most of what
+ * `.wf-input` sets, so it only keeps the box: padding tuned for a text caret
+ * leaves the browser's own button sitting off-centre. */
+.wf-file-input {
+  flex: none;
+  width: 100%;
+  padding: var(--wf-space-2);
+  font-size: var(--wf-text-sm);
+}
+
+/* ------------------------------------------------------------ header user -- */
+
+/* Pushed to the far end, beside the liveness indicator: who you are signed in
+ * as belongs with the other facts about *this session*, not in the middle of
+ * the facts about the node. `relative` anchors the card below. */
+.wf-header-user {
+  position: relative;
+  margin-left: auto;
+  font-size: var(--wf-text-sm);
+}
+
+/* The status strip has an auto left margin of its own, to pin the dot right
+ * when there is nobody signed in. Two auto margins in one flex row *share* the
+ * free space equally rather than the first one taking it, which parks the user
+ * strip in the middle of the header — so when both are present, only one of
+ * them pushes. */
+.wf-header-user + .wf-header-status {
+  margin-left: 0;
+}
+
+/* A button, not a span, so the card is reachable by keyboard and by touch:
+ * `:focus-within` opens it, and a tap focuses. Styled as text, because it is
+ * text — a control that looked like a button here would compete with the tabs
+ * below it for a thing you press about twice a session. */
+.wf-user-trigger {
+  display: flex;
+  align-items: center;
+  gap: var(--wf-space-1);
+  padding: var(--wf-space-1) var(--wf-space-2);
+  border: 1px solid transparent;
+  border-radius: var(--wf-radius-sm);
+  background: none;
+  color: var(--wf-text);
+  font-family: inherit;
+  font-size: inherit;
+  line-height: 1.45;
+  cursor: pointer;
+}
+
+.wf-user-trigger:hover,
+.wf-header-user:focus-within .wf-user-trigger {
+  border-color: var(--wf-border);
+  background: var(--wf-surface-raised);
+}
+
+.wf-user-trigger:focus-visible {
+  outline: 2px solid var(--wf-accent);
+  outline-offset: 2px;
+}
+
+.wf-user-caret {
+  color: var(--wf-text-faint);
+  font-size: 0.7em;
+}
+
+/* Opened by hover or focus, with no state in the app to disagree with. Anchored
+ * flush to the trigger's bottom edge on purpose: a gap between the two would
+ * drop the hover the moment the pointer crossed it, and the card would close
+ * on the way to the button inside it. */
+.wf-user-card {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 20;
+  display: none;
+  min-width: 17rem;
+  /* Capped as well as floored: an absolutely positioned box shrinks to fit its
+   * content and has nothing else to constrain it here, so a sentence of
+   * explanation inside it would stretch the card across the header rather than
+   * wrapping. */
+  max-width: 22rem;
+  padding: var(--wf-space-3);
+  border: 1px solid var(--wf-border);
+  border-radius: var(--wf-radius);
+  background: var(--wf-surface);
+  box-shadow: var(--wf-shadow);
+}
+
+.wf-header-user:hover .wf-user-card,
+.wf-header-user:focus-within .wf-user-card {
+  display: block;
+}
+
+/* Full width, like the download beside it: the card is read top to bottom and
+ * ends on the two things it offers to do. */
+.wf-user-signout {
+  width: 100%;
+  margin-top: var(--wf-space-3);
+}
+
+/* The credential download. An `<a>` rather than a `<button>`, so it needs the
+ * button's own box drawn back on: `.wf-button` sets the rest, but an anchor
+ * lays its text out as a line rather than as a centred label.
+ *
+ * `border-box` is load-bearing here, for the same reason it is on the sign-in
+ * page and nowhere else in this stylesheet: `width: 100%` plus padding and a
+ * border on a `content-box` element is wider than the card it sits in, and it
+ * would hang out over the edge. A `<button>` gets away without it because
+ * browsers already default buttons to `border-box`; an anchor does not. */
+.wf-user-download {
+  box-sizing: border-box;
+  display: block;
+  width: 100%;
+  margin-top: var(--wf-space-3);
+  text-align: center;
+  text-decoration: none;
+}
+
+/* What the file is, in the one place someone is about to take one. Short on
+ * purpose: the card is a hover panel, not a page. */
+.wf-user-note {
+  margin: var(--wf-space-2) 0 0;
+  color: var(--wf-text-muted);
+  font-size: var(--wf-text-sm);
+  line-height: 1.4;
+}
+
+
+/* --------------------------------------------------------------- accounts -- */
+
+/* The create-an-account form on the Provider tab. Stacked rows rather than the
+ * settings grid the panels above use: this is one form submitted as a whole,
+ * not four settings each saved on its own. */
+.wf-user-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--wf-space-3);
+  margin-top: var(--wf-space-4);
+  padding-top: var(--wf-space-4);
+  border-top: 1px solid var(--wf-border);
+}
+
+.wf-check {
+  display: flex;
+  align-items: center;
+  gap: var(--wf-space-2);
+  color: var(--wf-text-muted);
+  font-size: var(--wf-text-sm);
+}
+
+/* The one-time authenticator URI, which cannot be shown again. Louder than a
+ * plain note because dismissing it without copying it is unrecoverable. */
+.wf-note-strong {
+  display: flex;
+  flex-direction: column;
+  gap: var(--wf-space-2);
+  padding: var(--wf-space-3);
+  border: 1px solid var(--wf-accent);
+  border-radius: var(--wf-radius-sm);
+  background: var(--wf-accent-dim);
+  color: var(--wf-text);
+}
+
+.wf-note-strong p {
+  margin: 0;
 }

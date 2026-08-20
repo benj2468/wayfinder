@@ -1,9 +1,10 @@
 # Design: management-API security review and user credentials
 
-**Status:** proposed; **Phase 0 implemented** (see §3). Phases 1–3 unstarted.
-Supersedes nothing; extends
-`05-enrollment-tier-security-hardening.md`, whose §4 backlog is folded in
-below as F8.
+**Status:** Phases 0–2 implemented in full; **Phase 3 implemented except §6
+item 4** (silent renewal — see §8.5 for why it follows rather than leads).
+Every finding F1–F13 is closed or resolved; none remain open. Supersedes
+nothing; extends `05-enrollment-tier-security-hardening.md`, whose §4 backlog
+is folded in below as F8 (also closed — see F8's "Implemented" note).
 
 **Scope of the review:** the management API end to end — `wayfinder-auth`
 (seeds, certs, revocations, pairwise tags), `wayfinder-tls-mgmt` +
@@ -27,8 +28,11 @@ should not be touched while fixing the rest.
 - **`authz.rs` is a closed positive allowlist.** `permits` fails closed on an
   unknown request kind *and* on an absent oneof (what prost yields for a field
   number added after this build). `permits_confines_the_enrollment_tier_to_a_closed_allowlist`
-  sweeps a hand-maintained list of all 22 request kinds with a count assertion,
-  so adding a proto request forces a decision here.
+  and `permits_confines_the_viewer_tier_to_the_queries` each sweep the same
+  hand-maintained `every_request_kind()` — 27 variants as of Phase 3, up from
+  22 when this test was first written in `05-...` — with a hard count
+  assertion, so adding a proto request forces a decision at both tiers, not
+  just one.
 - **Certs are bound to the TLS session.** `decide_access` refuses a verified
   admin cert whose `ed_pubkey` is not the handshake key, so a cert lifted off
   the wire is worthless without the private half. A failed claim is a denial,
@@ -50,7 +54,12 @@ should not be touched while fixing the rest.
   rolls back on failure; `mutate_issued_and_held` makes an approval's two
   halves one atomic write.
 - **The anonymous tier is bounded** on both axes — `MAX_HELD_CSRS` mesh-wide
-  and `EnrollmentLimiter` per source IP.
+  and `SourceLimiter::for_enrollment()` per source IP (the type `05-...`
+  called `EnrollmentLimiter`, since generalized — see Phase 1 item 2 below).
+- **The pre-authentication surface is bounded too, since Phase 1.** Every
+  connection starts uncredentialed regardless of tier, and `PreAuthLimits`
+  caps that population mesh-wide and per source before any request is even
+  read.
 
 ## 2. Findings
 
@@ -174,9 +183,32 @@ is available to anything that can open the port.
 
 This is documented as unauthenticated in several places and is a deliberate
 trade for a device with no other console. It is recorded here because the
-authorization model has since grown three tiers on the TLS side, and the
+authorization model has since grown four tiers on the TLS side, and the
 serial port did not move with it: a USB port on a dongle is not the same
 trust boundary as a JTAG header.
+
+> **Resolved: the port becomes opt-in, and the gap is accepted.** Not
+> authenticated. The shape that would have worked — the node issues a nonce, the
+> client signs it with its mesh identity key, and the existing
+> `decide_access`/`permits` decide the rest — is a real protocol on a link that
+> has no connection boundary to hang it off: a UART has no "client attached"
+> event, so the challenge needs its own request, and a nonce that must not
+> repeat needs board-supplied randomness because the counter behind it restarts
+> at every reboot. That is a meaningful amount of protocol for a port whose
+> threat model is *physical access to the device*, which on these boards also
+> means access to a SWD header that reads flash outright.
+>
+> What changes instead is that the port is not live unless a board is configured
+> to bring it up, so a dongle does not ship with the whole request surface
+> exposed by default. The remaining exposure is stated rather than closed: **a
+> node whose serial management port is enabled is a node whose `SetAuth` and
+> `SetConfig` are available to anything that can open `/dev/ttyACM*`.** Enabling
+> it is an act, and this is what the act means.
+>
+> Nothing enables it today — the nRF boards' management wiring was removed
+> during BLE bring-up and has not returned — so the requirement lands on
+> whoever re-wires it, and is recorded in `libs/wayfinder-server/CLAUDE.md`
+> beside the transport it governs.
 
 ### F8 — Medium. The enrollment token is a bearer secret on a one-second poll.
 
@@ -190,6 +222,20 @@ Two additions to what §4 records: under F1 this is remote disclosure of a
 credential that admits nodes to the mesh; and the derived `Debug` on the prost
 type will print it in full through any `{:?}`, so it can reach the log ring
 that `GetLogs` serves.
+
+**Implemented.** `GetSecurityStatus`/`enrollment_policy()` now report only
+`enrollment_token_set`; the value itself comes back solely from a new
+`RevealEnrollmentToken` request, answered by `admission()`
+(`libs/wayfinder-server/src/authority.rs`). It is a read by shape but a
+disclosure by content, so `authz.rs`'s allowlists name it explicitly rather
+than folding it into "everything that isn't a mutation" — `permits` refuses it
+to `GrantedViewer` alongside `SetLogLevel` (§7 decision 2's tier), and it stays
+admin/self-key-only otherwise. The value itself is now a `SharedSecret`
+newtype (`wayfinder-protos`) whose `Debug` redacts and whose reader is named
+`expose`, so every place it escapes is greppable — the `SharedSecret`/sum-type
+half of §4's ask, done as part of this rather than separately. The dashboard's
+Provider tab fetches it on demand (`reveal_enrollment_token`) behind a "Show
+token" press rather than polling it; see §8.6.
 
 ### F9 — Low. The dashboard makes browser-directed outbound connections.
 
@@ -262,46 +308,106 @@ foreign `Host` on both a server function and a page route, port ignored,
 `--allowed-host` honoured, `GET` refused), and `server.rs` unit-tests the
 matching itself.
 
-### Phase 1 — node hardening (F4, F5, F6)
+### Phase 1 — node hardening (F4, F5, F6) — **done**
 
-1. **Revalidate authorization periodically.** Re-request the `AuthSnapshot`
-   and re-run `decide_access` every N requests or T seconds (T ≈ 60), and on a
-   changed verdict close the connection with the same generic error. This is
-   the fix that makes `RevokeNode` mean what operators think it means. Add an
-   absolute session lifetime capped at the presented cert's `not_after`.
-2. **Bound the pre-auth surface.** `max_frame_length(MAX_FRAME_LEN)` on the
-   host codec — reuse `framing.rs`'s 4 KiB rather than inventing a second
-   number; a `tokio::time::timeout` around `acceptor.accept`; a
-   `tokio::sync::Semaphore` capping in-flight unauthenticated connections;
-   and a per-IP connection cap reusing `EnrollmentLimiter`'s bucket shape.
-3. **Make the sentinel unrepresentable.** `AuthSnapshot::own_key:
-   Option<[u8; 32]>` and `decide_access(own_key: Option<&[u8; 32]>)`, granting
-   `GrantedSelfKey` only on `Some(k) if k == handshake_key`. Deletes the
-   fallback, the `warn!`, and the argument. Add the regression test: a
-   handshake key of all zeros against a snapshot with no seed must not be
-   granted.
+Landed independently, on `bjc/mgmt-session-hardening`, merged to `main` before
+this branch — this branch is built on top of it.
 
-### Phase 2 — enrollment posture (F3, F8, F11, F13)
+1. **Done.** `transport.rs`'s `AuthGate` re-requests the `AuthSnapshot` and
+   re-runs the same `authorize` helper the connect-time decision uses, at most
+   once every `REVALIDATE_AFTER` (60 s); a changed verdict closes the
+   connection with the same generic `"authentication denied"`. `RevokeNode`
+   now reaches an already-open session, and — because the clock is re-read
+   alongside it — a certificate expiring mid-session ends that session too.
+   Covered by `transport::tests::revalidation_leaves_an_unchanged_verdict_alone`
+   and the paired case that closes the connection on a changed one. An
+   absolute session-lifetime cap beyond the cert's own `not_after` was not
+   added as a separate mechanism — the cert's own expiry, now actually
+   enforced by revalidation, *is* that bound.
+2. **Done.** `libs/wayfinder-server/src/transport.rs`: `max_frame_length`
+   reuses `MAX_FRAME_LEN` (`lib.rs`, the same 4 KiB `framing.rs` uses) on the
+   **read** half only — responses stay uncapped, since a routing-table or
+   log-page reply is routinely larger than any request, and capping both
+   directions with one number would trade a memory bound for a dashboard that
+   cannot load. `HANDSHAKE_TIMEOUT` (10 s) wraps `acceptor.accept`.
+   `PreAuthLimits` bounds the population of not-yet-authenticated connections
+   both mesh-wide and per source IP, refusing rather than queuing at capacity,
+   and a connection hands its slot back (`PreAuthGuard::credentialed`) the
+   moment it earns a full grant — never on `GrantedEnrollment`, which is
+   exactly the population being bounded. The per-IP connection cap reuses
+   §3.1 of `05-...`'s bucket shape directly: that type was generalized from
+   `EnrollmentLimiter` to `SourceLimiter` with two constructors
+   (`for_enrollment()`, `for_connections()`), rather than duplicated — see the
+   correction to `05-...`'s file map.
+3. **Done.** `AuthSnapshot::own_key: Option<[u8; 32]>`; `decide_access` grants
+   `GrantedSelfKey` only on `Some(k) if k == handshake_key`. The all-zero
+   fallback, its `warn!`, and the invariant argument are gone — the sentinel is
+   unrepresentable rather than merely unreached. Regression test: a handshake
+   key of all zeros against a snapshot with no seed must not be granted.
 
-1. Make `ProviderConfig` require an explicit admission decision: reject a
-   provider config that sets neither `enrollment_token` nor
-   `require_approval: true` unless it also sets `auto_approve: true`. An
-   operator who wants TOFU says so; nobody gets it by omission. *(Implemented
-   as written, then superseded — see the note under F3. The goal held; the
-   two-field-plus-guard shape did not.)*
-2. Move `enrollment_token` off `GetSecurityStatusResponse` onto its own
-   `RevealEnrollmentToken` request, so disclosure is a discrete, logged,
-   admin-gated act. Replace the `bool` + `Option<String>` pair with the sum
-   type §4 proposes, and give it a `SharedSecret` newtype with a redacting
-   `Debug`. Rename the render test as §4 says.
-3. Fold the window check into `verify_revocation` (taking `now_unix`, as
-   `verify_cert` already does), and have `OgmAuth` call it that way.
-4. Cap `cert_ttl_secs` at parse time (say 90 days) with an
-   `i_know_what_i_am_doing` escape the sim sets.
+### Phase 2 — enrollment posture (F3, F8, F11, F13) — **done**
 
-### Phase 3 — credentials (F1, F2, F7 at the root)
+1. **Done, in its final rather than its first shape** — see the note under F3.
+   `ProviderConfig::auto_approve` (`#[serde(default)]` → `false`, the closed
+   posture) replaced the two-field-plus-startup-guard design as written: one
+   field spelled so silence is closed, rather than a guard that only governed
+   omission in YAML.
+2. **Done, and further than proposed.** See F8's "Implemented" note above.
+   `RevealEnrollmentToken`, `SharedSecret`, and the sum types on both the read
+   side (`RevealEnrollmentTokenResponse::admission`) and the write side
+   (`SetConfigRequest`'s `TokenUpdate`, which already existed and is now
+   mirrored) are in. §4's proposed fix was to rename the render test to
+   describe masking rather than confidentiality; what landed instead removes
+   the thing the old name overclaimed, rather than renaming around it — the
+   token is no longer on the polled snapshot at all, so there is nothing left
+   to mask. The replacement test asserts that directly:
+   `provider_renders_no_enrollment_token_because_the_poll_carries_none`
+   (`bins/wayfinder-web/tests/render.rs`).
+3. **Done.** `TrustAnchor::verify_revocation` (`libs/wayfinder-auth/src/revoke.rs`)
+   now takes `now_unix` and checks `not_after` itself, rather than leaving the
+   window to callers; `OgmAuth::is_revoked` calls it that way.
+4. **Done.** `authority.rs`'s `check_cert_ttl` refuses a `cert_ttl_secs` above
+   `MAX_CERT_TTL_SECS` (90 days, `libs/wayfinder/src/config.rs`) unless
+   `ProviderConfig::allow_unbounded_cert_ttl` is set — enforced both at parse
+   time (`from_config`) and on the runtime `set_enrollment_policy` path, so an
+   operator cannot raise it past the cap after startup either.
+   `containers/sim.Dockerfile`'s ~3000-year TTL sets the escape hatch
+   explicitly rather than relying on an unguarded field.
 
-§6 below.
+### Phase 3 — credentials (F1, F2 at the root; F7 resolved separately) — **done except §6 item 4**
+
+§5 and §6 below. Landing in order:
+
+1. **Done.** `CERT_FLAG_USER` and `CERT_FLAG_VIEWER`, `MgmtAccess::GrantedViewer`,
+   and `permits`' read-only allowlist — §7 decisions 1 and 2, taken first
+   because both live in the signed certificate body.
+2. **Done.** The user store at the CA (`wayfinder-server`'s `users.rs`),
+   `AuthenticateUser` on the enrollment tier, and CA state version 5 carrying
+   the accounts. `wayfinderctl user` administers them offline;
+   `wayfinderctl login` / `logout` / `whoami` and the `known_nodes` pin file are
+   §6 items 1–3.
+3. **§6 item 5 (the dashboard session layer) is done; §6 item 4 (silent
+   renewal) is the one thing in this whole document still outstanding.** They
+   were always separable from each other and from everything above them.
+
+   §6 item 4 is not the small change its wording suggests. "Re-prompting for
+   TOTP only if the refresh window has fully lapsed" means renewing *without*
+   re-authenticating, and there is nothing for the certificate authority to
+   renew against: `AuthenticateUser` takes a password, and the provider does not
+   learn which account an already-issued session belongs to. Making it work
+   needs the session's own key to be the proof — a renewal request carrying the
+   current certificate and a signature, made with the current session key, over
+   the new session public key — plus a `username` on the CA's issued record so a
+   MAC maps back to an account. What has landed is the detection half:
+   `SessionMeta::due_renewal`, which is what any renewal policy would be built
+   on. The dashboard needs it too now, and for the reason §8.5 gives: a session
+   certificate simply dies, and "sign in again" is a tolerable answer for
+   `wayfinderctl` and not for a dashboard somebody is watching.
+
+   F7 is resolved rather than outstanding — see the note under the finding.
+
+   **§8 records what the session layer turned out to be** — the decision taken
+   on the one open question, and the sim work that makes it exercisable.
 
 ### Ordering
 
@@ -465,21 +571,298 @@ says a session layer is "a later, separable change — do not" build it. That
 instruction is right that it is separable; the findings above are why it
 should now be scheduled. Update that file in the same change.
 
+**Implemented — see §8 for the full account of what got built and the one
+decision (§8.3) that turned out not to be exactly what this item's wording
+said.** In short: `--identity`/`--cert` static mode was kept rather than
+deleted, because an un-enrolled node and `--serial` have no provider to log in
+to; login mode is used whenever `--provider` is configured. `bins/wayfinder-web/CLAUDE.md`
+was rewritten, not merely updated, to describe the security posture that
+resulted.
+
 ## 7. Open decisions
 
-1. **Does a user certificate need to be distinguishable from a device
-   certificate?** `CERT_FLAG_ADMIN` is the only capability bit today. A
-   `CERT_FLAG_USER` would let `ListCerts` and the security tab tell an
-   operator apart from a node — but it is a signed-body change, so it wants
-   deciding before the first user cert is issued, not after.
-2. **Should read-only access be a tier?** `permits` has two full grants and
-   one enrollment grant. A viewer who can read the routing table but not
-   `SetAuth` is an obvious want once there are named users, and it is a
-   cheaper change to make while `permits` is already being edited.
-3. **How long is a session certificate valid?** Eight hours matches a shift
-   and bounds a stolen key. It also means the TOTP prompt recurs daily, which
-   some operators will route around. F4's fix makes a shorter TTL practical by
-   making expiry actually terminate a live session.
+1. ~~**Does a user certificate need to be distinguishable from a device
+   certificate?**~~ **Resolved: yes.** `CERT_FLAG_USER` (0x02) landed
+   alongside `CERT_FLAG_VIEWER` in the same change that first issued a user
+   certificate, precisely because it is a signed-body change and retrofitting
+   it later would mean re-issuing every certificate that predates it. It
+   grants nothing on its own; it is what lets `ListCerts` and the Security tab
+   tell an operator apart from a node.
+2. ~~**Should read-only access be a tier?**~~ **Resolved: yes, and earned by a
+   bit, never by the absence of the admin bit.** `CERT_FLAG_VIEWER` (0x04) and
+   `MgmtAccess::GrantedViewer` sit between the enrollment tier and the two full
+   grants; `authorize_admin` became `authorize_capability`, returning which
+   tier a verified certificate earns. The design's own wording above said "a
+   verified certificate that is not an admin" — that is *not* what landed,
+   deliberately: every device on the mesh already holds a verified non-admin
+   certificate, so a tier granted by absence would have handed every node
+   read access to every other node's management API in one release, with
+   nothing in any configuration changing to say so. A certificate carrying
+   neither bit stays denied exactly as it does today. `RevealEnrollmentToken`
+   and `SetLogLevel` are refused to a viewer even though the first reads like
+   a query and the second like a debugging convenience: the first is a read by
+   shape but the mesh's admission credential by content, and the second
+   changes what every sink on the node emits rather than merely observing one.
+   `authz.rs`'s viewer allowlist is written as an explicit refusal set over
+   the admin allowlist, not as "everything that isn't a mutation", so a
+   request that merely looks like a read still has to be classified on
+   purpose.
+3. ~~**How long is a session certificate valid?**~~ **Resolved: per account,
+   not a constant.** `UserRecord::session_ttl_secs` is chosen by the admin who
+   grants the account, so an automation account can be minutes and a field
+   operator a shift, and neither is a code change — still bounded by
+   `MAX_CERT_TTL_SECS`. Phase 1's revalidation fix (F4) is what makes a short
+   TTL actually mean something: before it, expiry stopped a *new* connection
+   but not one already open.
 4. **Where does the CA live in a multi-provider mesh?** This design assumes
    one provider holds the user store. Two providers with different user stores
    both signing for the same mesh id is a state this document does not model.
+   Still open — nothing in Phase 3 addresses it.
+
+---
+
+## 8. What the session layer turned out to be
+
+Written as notes for the next pass after §5/§6.1–6.3 landed, and rewritten here
+as the record of what was built. §6.5 and the sim accounts are done; §6.4 is
+what remains, for the reason §8.5 already gave.
+
+### 8.1 What `wayfinder-web` was
+
+`main.rs` built **one** `Target::Tls(Endpoint)` from `--identity` / `--cert` /
+`--node-key` (or `Target::Serial`), wrapped it in a single `NodeConnection`, and
+put that in the axum state. Every `#[server]` function reached it through
+`api.rs`'s `connection()`, which pulled it out of the Leptos context.
+
+So the credential was **process-wide and singular**, which is exactly F1 and
+F2's root: anyone who could reach the port had whatever access that one identity
+carried, and there was no per-viewer state for a forgery to be missing.
+
+### 8.2 What replaced it
+
+`session.rs` holds an `Access`, and the axum state holds that instead of a
+connection:
+
+- **A `SessionStore`** keyed by a random session id, each entry holding *its
+  own* `NodeConnection` built from the seed and certificate a login produced,
+  plus the username, the capability and the certificate's `not_after`. One
+  connection per session and not one per process, because the management API
+  authenticates at the TLS handshake — a shared connection would hand every
+  viewer the first viewer's access.
+- **`connection()` resolves the cookie**, and its absence is a distinct sentinel
+  (`session::NEEDS_LOGIN`) rather than a node failure, so a browser can render
+  "sign in" instead of "the node is unreachable". The polling loop watches for
+  it and re-asks who the viewer is, which is what turns an expiring session into
+  a sign-in form rather than a stream of failures.
+- **`login` / `logout` / `session` server functions and a sign-in page.**
+  `login` performs §5.1 server-side: generate a session keypair, connect to the
+  provider anonymously on the enrollment tier, `AuthenticateUser`, build the
+  `NodeConnection`, store it, set the cookie.
+- **Expiry pruning** on every read of the store, so a long-running dashboard
+  does not accumulate an entry — and a connection — per login for its whole
+  life.
+- **`--provider` and `--provider-key`**, the latter defaulting to `--node-key`
+  (correct when the node being viewed is itself the authority). `--provider` is
+  what *selects* login mode, rather than defaulting from `--addr`: see §8.3.
+
+One thing the notes did not anticipate. **`<Routes>` has to stay in the view
+tree unconditionally.** `generate_route_list` walks the app once at startup —
+with no request, and so no session — to discover the routes to register, so
+`<Routes>` behind "is anyone signed in?" registers nothing and every tab but the
+index answers 404, in both modes, from the first boot. The dashboard is
+therefore rendered and *hidden* for a signed-out viewer, with the sign-in form
+over the top. It costs nothing: no tab fetches anything of its own, and the
+polling loop does not run while signed out.
+
+### 8.3 The decision that was taken
+
+§6 item 5 said "the process-wide shared identity goes away". Taken literally
+that breaks two cases, and both are cases where a dashboard is the *only* way
+in:
+
+- **An un-enrolled node.** It has no user store, so no login is possible against
+  it — and self-key bootstrap is precisely why `MgmtAccess::GrantedSelfKey`
+  exists ("a dashboard that reached an un-enrolled node has no other credential
+  it could hold"). `topology.py --open N` produces exactly this.
+- **`--serial`**, which has no authentication at all and no provider behind it.
+- **A node provisioned and then taken offline**, which is the case below.
+
+**Resolved: `--identity` / `--cert` stay, as an explicit static-credential
+mode**, warned about at startup as *not* closing F1 and F2, with login as the
+path whenever a provider is configured. `--provider` is the switch, and it
+conflicts with `--identity`/`--cert`/`--serial` so a process is never in two
+minds about which credential it holds.
+
+#### Signing in needs the certificate authority. Using a session does not.
+
+A worthwhile question, because the answer is not symmetric:
+
+- **An existing session survives a partition entirely.** The node verifies the
+  session certificate against the trust anchor it already holds — no contact
+  with the provider, no revocation lookup beyond the flooded records it already
+  has — so a dashboard signed in before the link dropped keeps working until the
+  certificate expires.
+- **A new sign-in does not.** `AuthenticateUser` is answered by the provider and
+  nowhere else, because the password verifier is Argon2id at 64 MiB and the user
+  store is one store on purpose (§4). No provider reachable, no new session.
+- **And a dashboard restart is a new sign-in.** The session store is in the
+  `wayfinder-web` process's memory and is not persisted, deliberately — a
+  session key written to disk is a credential outliving the process that earned
+  it — so restarting the dashboard while the provider is unreachable locks
+  everyone out until it comes back.
+
+#### The credential file (`.wfauth`) — implemented
+
+The third point above is what the credential file answers, and it answers it
+without contradicting the second: the session key is still never written to
+disk *by the process*. It is handed to the **person**, who decides where it
+lives.
+
+A signed-in viewer downloads `<user>-<expiry>.wfauth` — that session's seed and
+the certificate the provider signed for it, as JSON — and hands it back to the
+sign-in form later. The dashboard rebuilds a session out of it with no contact
+with the provider whatsoever. Four things make that sound rather than a hole:
+
+- **Nothing is asserted by the file that the node does not re-check.** The
+  capability shown is recomputed from the certificate's signed flags, never read
+  from the file's own note of it, and the certificate is worth exactly what the
+  mesh root's signature makes it worth. The dashboard holds no trust anchor and
+  does not pretend to: it proves the credential by *using* it, with one
+  read-only RPC, before any session exists.
+- **It expires when the session it came from does.** There is no new certificate
+  and no extension of anything — which is why the expiry is in the filename. An
+  operator heading into the field still wants `session_ttl_secs` set to days,
+  the knob this section already describes; the file is what carries that session
+  across a dashboard restart, not what lengthens it.
+- **It is served only to the session it belongs to**, and never in static mode,
+  where the credential belongs to the process rather than to a person.
+- **It is a private key in a file, stated as such** — to the person downloading
+  it, in the panel that offers it. That is the trade, and it is a smaller one
+  than the alternative this section previously pointed at: provisioning a
+  *shared* admin certificate into static mode, which has no per-person identity
+  behind it and cannot be revoked without restarting the process.
+
+What it does not change: a **new** sign-in, by somebody who never had a file,
+still needs the provider. There is no offline password verification and this
+does not invent one.
+
+
+There is no step that "links a password to a certificate" ahead of time. An
+admin creates the account offline against the provider's state file
+(`wayfinderctl user add`), and the certificate is minted *at* sign-in, bound to
+a keypair the client generates then — which is what makes a captured login
+transcript worthless and a session revocable and expiring.
+
+So for a node that is provisioned and then goes offline for good — never having
+been signed in to, so with no `.wfauth` file to carry — the answer is not "log
+in anyway", it is **provision the credential too**: issue a certificate offline
+with `wayfinderctl cert issue --admin` (or `--viewer`) and start that node's
+dashboard in static mode with it. That is a deliberate trade — one shared
+credential, expiring on whatever window it was issued with, with no per-person
+identity behind it — and it is the trade an air-gapped node is making anyway.
+
+Two knobs soften the merely *intermittent* case, where the provider is reachable
+sometimes:
+
+- **Session lifetime is per account** (`UserRecord::session_ttl_secs`), so an
+  operator heading into the field can hold an account granted days rather than
+  the eight-hour default, and sign in before departure.
+- **§6 item 4 (silent renewal)** keeps a session alive across the windows when
+  the provider *is* reachable, rather than making the operator notice.
+
+What this design does not model is a second provider holding a replica of the
+user store, which is what "sign in at the edge" would really require — §7 open
+decision 4.
+
+### 8.4 Sim accounts (`scripts/topology.py`)
+
+Done, and it needed two things beyond minting the accounts:
+
+- **`wayfinderctl user add --password-stdin`.** The prompt reads `/dev/tty`, not
+  stdin, so a script that pipes a password does not supply one — it blocks on
+  whatever terminal it inherited.
+- **The provider's state file is seeded on the host and bind-mounted in**, as a
+  *directory* (the durable store renames a temporary file over the snapshot, and
+  a single-file bind mount has no "beside it" to write into), through a
+  `CA_STATE_PATH` the sim image now honours. It has to be seeded before the
+  stack comes up: the provider holds that state in memory and rewrites the whole
+  snapshot, so an account added to a running provider is overwritten by its next
+  write.
+
+Two accounts, `admin` and `viewer`, both `--no-totp` — a simulation has nowhere
+to enrol an authenticator, and the flag exists for exactly this. A viewer
+account is the only way to see `MgmtAccess::GrantedViewer` end to end, and the
+tier is otherwise unreachable in the sim.
+
+Each secured node's dashboard now runs in login mode against the provider; the
+open nodes keep their static credential, which is what §8.3 is about. The
+`--session` flag the notes proposed is unnecessary as a result — it was a way to
+point a dashboard at a logged-in session *before* login mode existed.
+
+### 8.5 Why §6.4 follows rather than leads
+
+An eight-hour session certificate currently just dies, and the CLI's answer is
+"log in again". That is tolerable for `wayfinderctl` and not for a dashboard
+somebody is watching, so silent renewal became user-visible the moment §6.5
+landed — but it could not be built first, because it needs the renewal protocol
+described under Phase 3 item 3 and that is independent of either.
+
+### 8.6 The Security tab split in two, and offline issuance caught up to it
+
+Two more pieces landed after §8.1–§8.5 were written, both downstream of §6.5
+rather than new decisions.
+
+**The Security tab split into Security and Provider.** It had grown to answer
+two different questions at once — who this node believes it is and who it
+trusts, versus who else it lets in — and only nodes running as a certificate
+authority need the second half at all. `components/security.rs` kept the
+first: identity, neighbours, the enrollment panel a *joining* node uses to ask
+a provider to certify it. `components/provider.rs` is new and holds the
+second: the account roster, the enrollment policy switch, the join details
+(address, pinned key, token) a joining node needs to be told, and the queue of
+held CSRs waiting on approval. The whole tab is gated on one fact from the
+poll — whether the node reports an enrollment policy at all — so a node that
+is not a provider gets one sentence saying so, not four empty panels. The
+split is documentation as much as refactor: `bins/wayfinder-web/CLAUDE.md` now
+states the same two-questions framing as the reason the file boundary exists,
+so it does not drift back together the next time someone reaches for "add one
+more thing to the Security tab".
+
+The Provider tab is also where §6.5's "account creation is still offline"
+softened, on purpose and with a stated trade: an admin session can now call
+`CreateUser`/`ListUsers`/`RemoveUser` from the browser, so `wayfinderctl user
+add` on the provider host remains the only way to bootstrap the *first*
+account, not every account after it. The proto comment on `CreateUserRequest`
+states the trade rather than leaving it implicit: an admin can already revoke
+nodes and rewrite enrollment policy, so this grants no new *class* of power,
+but it does put the user store on the network for the first time. A TOTP
+enrolment URI is shown once, at creation, because the CA does not retain the
+secret in a recoverable form — the panel says plainly that it will not be
+shown again. `MeshAuthority::remove_user` (the API-reachable path, unlike the
+unguarded `CertAuthority::remove_user` that `wayfinderctl user remove` calls)
+refuses to remove the last account able to administer the mesh, so the
+dashboard cannot be used to strand itself; the tab surfaces that refusal as an
+ordinary error rather than pre-computing the rule in the browser, per this
+crate's "the node is the authority" convention.
+
+**Offline issuance grew the same two bits.** `wayfinderctl cert issue
+--viewer` (mutually exclusive with `--admin`, which subsumes it) reaches
+`CERT_FLAG_VIEWER` without a login round trip at all, and `cert show` now
+prints a certificate's capabilities unconditionally rather than only its admin
+bit — both needed once a certificate could carry a capability a quick glance
+at "is this an admin cert" would no longer answer. This is what makes §8.3's
+"provision the credential too" answer for an air-gapped node complete: an
+operator can now hand out a read-only credential offline exactly as easily as
+an admin one.
+
+**The sign-in form carries the `.wfauth` upload as a fourth field, not a
+second form.** `components/login.rs` collects user name, password and TOTP
+code plus a file picker, under one "Sign in" button live once *either* a
+complete password answer or a chosen file is present — `credential_route`
+decides which at submit time, and the file wins if both are filled, because a
+password manager fills the first two fields unprompted while choosing a file
+is a deliberate act. The two paths' failure modes are asymmetric on purpose:
+the password path answers "those credentials were not accepted" for every
+cause (§5.2's uniform-failure rule extends to the browser), while a rejected
+file names what was wrong — expired, wrong node, malformed — because there is
+no account to enumerate by being specific about someone's own key.

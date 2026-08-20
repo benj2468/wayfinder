@@ -1,13 +1,26 @@
 //! The `wayfinder-web` server binary.
 //!
 //! Serves the dashboard over plain HTTP and is the only party that speaks the
-//! management API: it holds the mesh identity and the node connection, and the
+//! management API: it holds the credential and the node connection, and the
 //! browser reaches the node exclusively through `#[server]` functions.
 //!
-//! That makes the listen address a security boundary. It defaults to loopback,
-//! because there is no login here — anyone who can reach the port has whatever
-//! access the configured identity has. Exposing it beyond the host is a
-//! reverse-proxy's job, and binding elsewhere logs a warning to say so.
+//! # Which credential — the one argument that decides everything else
+//!
+//! `--provider` selects **login mode**: the dashboard holds no credential of
+//! its own, and a person signs in to obtain a short-lived session certificate
+//! from the mesh's certificate authority. Nothing is reachable without one.
+//!
+//! Without it the dashboard runs on a **static credential**: `--identity` and
+//! `--cert`, held by the process and shared by everyone who can reach the port.
+//! That mode is kept deliberately (§8.3 of
+//! `docs/design/06-management-api-authentication.md`) because two deployments
+//! have no login available to them and no other way in — an un-enrolled node,
+//! which has no user store, and an embedded node reached over `--serial`, which
+//! has no authentication at all. It is announced at startup as what it is.
+//!
+//! Either way the listen address is a security boundary, because this process
+//! terminates no TLS of its own: it defaults to loopback, and exposing it
+//! beyond the host is a reverse-proxy's job.
 //!
 //! The node-facing arguments mirror `wayfinder-tui`'s, so an operator who knows
 //! how to point the TUI at a node already knows how to point this at one.
@@ -34,6 +47,9 @@ async fn main() -> anyhow::Result<()> {
     use wayfinder_web::conn::Target;
     use wayfinder_web::server::HostPolicy;
     use wayfinder_web::server::build_router;
+    use wayfinder_web::session::Access;
+    use wayfinder_web::session::PinnedNode;
+    use wayfinder_web::session::SessionStore;
 
     /// Command-line arguments.
     #[derive(Parser, Debug)]
@@ -65,10 +81,43 @@ async fn main() -> anyhow::Result<()> {
         #[arg(long, default_value = "127.0.0.1:7700")]
         addr: SocketAddr,
 
+        /// TLS address of the certificate authority a viewer signs in to.
+        ///
+        /// Given, this dashboard runs in **login mode**: it holds no credential
+        /// of its own, and each viewer obtains a short-lived session
+        /// certificate by signing in with a user name, password and
+        /// authenticator code. Nothing but the sign-in page is reachable
+        /// without one, which is what makes a shared or exposed dashboard safe
+        /// in a way the static credential below never is.
+        ///
+        /// Often, but not always, the same node as `--addr`: the accounts live
+        /// wherever the mesh's certificate authority runs, and a dashboard may
+        /// be pointed at any node in the mesh.
+        #[arg(
+            long,
+            env = "WAYFINDER_WEB_PROVIDER",
+            conflicts_with_all = ["identity", "cert", "serial"]
+        )]
+        provider: Option<SocketAddr>,
+
+        /// The provider's Ed25519 public key (64 hex chars) to pin. Defaults to
+        /// `--node-key`, which is correct when the node being viewed is itself
+        /// the certificate authority.
+        ///
+        /// Not optional in substance: a sign-in sends a password to whatever
+        /// answers at `--provider`, so something has to say which host that is
+        /// allowed to be.
+        #[arg(long, env = "WAYFINDER_WEB_PROVIDER_KEY", requires = "provider")]
+        provider_key: Option<String>,
+
         /// Path to this dashboard's 32-byte Ed25519 identity seed (secret),
         /// presented as an RFC 7250 raw public key in the TLS handshake. To
         /// reach an un-enrolled node, point this at the node's own identity
-        /// seed and omit `--cert`. Required unless `--serial` is used.
+        /// seed and omit `--cert`.
+        ///
+        /// The **static credential**: one identity, held by the process and
+        /// shared by every viewer that can reach the port. Used when
+        /// `--provider` is not given.
         #[arg(
             long,
             env = "WAYFINDER_WEB_IDENTITY",
@@ -96,6 +145,10 @@ async fn main() -> anyhow::Result<()> {
         /// The node's Ed25519 public key (64 hex chars) to pin. Defaults to the
         /// public key of `--identity`, which is correct when bootstrapping a
         /// node with its own seed; pass it to reach a *different* node.
+        ///
+        /// Required in login mode: there is no identity to derive a default
+        /// from, and an unpinned node is one anything on the path may answer
+        /// for.
         #[arg(long, env = "WAYFINDER_WEB_NODE_KEY")]
         node_key: Option<String>,
     }
@@ -109,55 +162,104 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let target = match &args.serial {
-        Some(path) => Target::Serial {
-            path: path.clone(),
-            baud: args.baud,
-        },
-        None => {
-            let identity = args.identity.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("--identity is required unless --serial is given")
+    // Which credential this dashboard runs on, decided once, here. Every
+    // `#[server]` function then reaches the node through whichever this is,
+    // rather than each rediscovering the mode for itself.
+    let access = Arc::new(match (&args.serial, args.provider) {
+        // Serial: no TLS, no authentication and no provider to log in to. The
+        // port itself is the credential, which is why it is a debug interface.
+        (Some(path), _) => {
+            let conn = NodeConnection::new(Target::Serial {
+                path: path.clone(),
+                baud: args.baud,
+            });
+            info!(node = %conn.label(), "node target configured (serial, unauthenticated)");
+            Access::Static(Arc::new(conn))
+        }
+
+        // Login mode: this process holds no credential at all. Both endpoints
+        // are pinned by key, and neither key can be defaulted from an identity
+        // — there is none.
+        (None, Some(provider_addr)) => {
+            let node_key = args.node_key.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--node-key is required with --provider: a login holds no identity to \
+                     default the node's pinned key from"
+                )
             })?;
-            Target::Tls(Endpoint::load(
+            let node_key = wayfinder_client::parse_key32(node_key)
+                .map_err(|e| anyhow::anyhow!("parsing --node-key: {e}"))?;
+            let provider_key = match args.provider_key.as_deref() {
+                Some(hex) => wayfinder_client::parse_key32(hex)
+                    .map_err(|e| anyhow::anyhow!("parsing --provider-key: {e}"))?,
+                // The node being viewed is its own certificate authority, which
+                // is the single-node case and the simulation's.
+                None => node_key,
+            };
+            info!(
+                node = %args.addr,
+                provider = %provider_addr,
+                "login mode: viewers sign in for their own short-lived session certificate"
+            );
+            Access::Login(Arc::new(SessionStore::new(
+                PinnedNode {
+                    addr: args.addr,
+                    key: node_key,
+                },
+                PinnedNode {
+                    addr: provider_addr,
+                    key: provider_key,
+                },
+            )))
+        }
+
+        // Static credential: one identity for the whole process.
+        (None, None) => {
+            let identity = args.identity.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("--identity is required unless --serial or --provider is given")
+            })?;
+            let conn = NodeConnection::new(Target::Tls(Endpoint::load(
                 args.addr,
                 identity,
                 args.cert.as_deref(),
                 args.node_key.as_deref(),
-            )?)
-        }
-    };
-
-    // No I/O yet: the first poll establishes the connection, so the dashboard
-    // starts even with the node down and recovers on its own.
-    let conn = Arc::new(NodeConnection::new(target));
-
-    // Log which credentials are configured, not just the address.
-    //
-    // A node that has been enrolled refuses any management client that cannot
-    // present an *admin* membership certificate, and it deliberately answers
-    // with a bare "authentication denied" — the reason stays in the node's log
-    // so an unauthenticated peer cannot use the response to probe. That is the
-    // right call there and it leaves this side with nothing to report, so the
-    // next best thing is to say up front what was presented. "cert: none"
-    // beside a denial is the whole diagnosis: bootstrap credentials against a
-    // node that has outgrown them.
-    if args.serial.is_none() {
-        info!(
-            node = %conn.label(),
-            identity = ?args.identity,
-            cert = ?args.cert,
-            pinned_node_key = args.node_key.is_some(),
-            "node target configured"
-        );
-        if args.cert.is_none() {
+            )?));
+            // Which credentials are configured, not just the address.
+            //
+            // A node that has been enrolled refuses any management client that
+            // cannot present an *admin* membership certificate, and it
+            // deliberately answers with a bare "authentication denied" — the
+            // reason stays in the node's log so an unauthenticated peer cannot
+            // use the response to probe. That is the right call there and it
+            // leaves this side with nothing to report, so the next best thing
+            // is to say up front what was presented. "cert: none" beside a
+            // denial is the whole diagnosis: bootstrap credentials against a
+            // node that has outgrown them.
             info!(
-                "no --cert given: authenticating with the identity's own key, which only an \
-                 un-enrolled node accepts. An enrolled node needs an admin certificate."
+                node = %conn.label(),
+                identity = ?args.identity,
+                cert = ?args.cert,
+                pinned_node_key = args.node_key.is_some(),
+                "node target configured"
             );
+            if args.cert.is_none() {
+                info!(
+                    "no --cert given: authenticating with the identity's own key, which only an \
+                     un-enrolled node accepts. An enrolled node needs an admin certificate."
+                );
+            }
+            // Said every time, not only on a non-loopback bind: this is the
+            // mode where the process *is* the credential, so whoever reaches
+            // the port inherits it whole — with no sign-in to pass, nothing
+            // that expires, and nothing to revoke short of restarting this
+            // process. Pass --provider to make each viewer bring their own.
+            warn!(
+                "static credential: every viewer of this dashboard shares the identity it was \
+                 started with, and there is no sign-in to keep anyone out"
+            );
+            Access::Static(Arc::new(conn))
         }
-    } else {
-        info!(node = %conn.label(), "node target configured (serial, unauthenticated)");
-    }
+    });
 
     // Everything but the address comes from the environment cargo-leptos sets
     // (site root, package dir, hash file), so the binary finds its own assets.
@@ -165,11 +267,24 @@ async fn main() -> anyhow::Result<()> {
     leptos_options.site_addr = args.listen;
 
     if !args.listen.ip().is_loopback() {
-        warn!(
-            listen = %args.listen,
-            "dashboard bound to a non-loopback address; it has no authentication of its own, \
-             so anyone who can reach this port has the access its node identity carries"
-        );
+        // Two different warnings, because the two modes carry two different
+        // risks and one wording would be wrong for both. Static: everyone who
+        // can reach the port is an administrator. Login: the sign-in stands,
+        // but a password crosses the network in whatever this bind is reached
+        // over, and this process terminates no TLS.
+        if args.provider.is_some() {
+            warn!(
+                listen = %args.listen,
+                "dashboard bound to a non-loopback address and serves plain HTTP; put it behind \
+                 a TLS-terminating reverse proxy, or passwords cross the network in the clear"
+            );
+        } else {
+            warn!(
+                listen = %args.listen,
+                "dashboard bound to a non-loopback address with a static credential and no \
+                 sign-in, so anyone who can reach this port has the access that identity carries"
+            );
+        }
     }
 
     info!(
@@ -178,7 +293,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let hosts = HostPolicy::for_listen(args.listen).allow(&args.allowed_host);
-    let app = build_router(leptos_options, conn, hosts);
+    let app = build_router(leptos_options, access, hosts);
 
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     info!(listen = %args.listen, "dashboard listening");

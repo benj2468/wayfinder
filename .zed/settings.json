@@ -2,6 +2,9 @@
   "lsp": {
     "rust-analyzer": {
       "initialization_options": {
+        "cargo": {
+          "features": "all",
+        },
         "linkedProjects": [
           "Cargo.toml",
           "bins/wayfinder-nrf52840/Cargo.toml",

@@ -1,4 +1,6 @@
 use crate::wayfinder::v1alpha::AllInterfacesEgress;
+use crate::wayfinder::v1alpha::AuthenticateUserResponse;
+use crate::wayfinder::v1alpha::CreateUserResponse;
 use crate::wayfinder::v1alpha::CsrIssued;
 use crate::wayfinder::v1alpha::CsrPending;
 use crate::wayfinder::v1alpha::CsrRejected;
@@ -18,6 +20,7 @@ use crate::wayfinder::v1alpha::LinkQualityEntry;
 use crate::wayfinder::v1alpha::LinkQualityTable;
 use crate::wayfinder::v1alpha::ListCertsResponse;
 use crate::wayfinder::v1alpha::ListPendingCsrsResponse;
+use crate::wayfinder::v1alpha::ListUsersResponse;
 use crate::wayfinder::v1alpha::LogFilter;
 use crate::wayfinder::v1alpha::LogLevel;
 use crate::wayfinder::v1alpha::LogRecord;
@@ -36,8 +39,12 @@ use crate::wayfinder::v1alpha::RoutingTable;
 use crate::wayfinder::v1alpha::SubmitCsrResponse;
 use crate::wayfinder::v1alpha::TableOccupancy;
 use crate::wayfinder::v1alpha::Throughput;
+use crate::wayfinder::v1alpha::UserAccount;
+use crate::wayfinder::v1alpha::UserSessionIssued;
+use crate::wayfinder::v1alpha::UserSessionRejected;
 use crate::wayfinder::v1alpha::WayfinderRequest;
 use crate::wayfinder::v1alpha::WayfinderResponse;
+use crate::wayfinder::v1alpha::authenticate_user_response::Outcome as AuthenticateUserOutcomeKind;
 use crate::wayfinder::v1alpha::resolve_route_response::Egress as EgressKind;
 use crate::wayfinder::v1alpha::reveal_enrollment_token_response::Admission;
 use crate::wayfinder::v1alpha::submit_csr_response::Outcome as CsrOutcomeKind;
@@ -612,6 +619,28 @@ pub trait WayfinderDataProvider {
         Err("node is not a certificate-authority provider".into())
     }
 
+    /// Provider mode: exchange a user's credentials for a short-lived
+    /// management certificate bound to the session keys they name.  Default
+    /// errors (not a provider).
+    ///
+    /// The `Err` variant is reserved for the request being *unserviceable* —
+    /// this node is not a provider, the authority clock is unset, the keys are
+    /// malformed — and never for the credentials being wrong, which is
+    /// [`UserAuthOutcome::Rejected`].  Keeping the two apart is what lets a
+    /// misconfigured client be told what is wrong with its request while a
+    /// guessing one is told nothing at all.
+    fn authenticate_user(
+        &mut self,
+        username: &str,
+        password: &str,
+        totp_code: &str,
+        ed_pubkey: &[u8],
+        x_pubkey: &[u8],
+    ) -> Result<UserAuthOutcome, String> {
+        let _ = (username, password, totp_code, ed_pubkey, x_pubkey);
+        Err("node is not a certificate-authority provider".into())
+    }
+
     /// Provider mode: the admission rule this node applies to a submitted CSR
     /// — open, or a shared token whose value this returns.  Default errors
     /// (not a provider).
@@ -644,6 +673,49 @@ pub trait WayfinderDataProvider {
         Err("node is not a certificate-authority provider".into())
     }
 
+    /// Provider mode: list the user accounts this authority holds.  Default
+    /// errors (not a provider).
+    ///
+    /// Never the password hashes or TOTP secrets — see [`UserAccountData`].
+    fn list_users(&self) -> Result<Vec<UserAccountData>, String> {
+        Err("node is not a certificate-authority provider".into())
+    }
+
+    /// Provider mode: create a user account, returning the `otpauth://`
+    /// enrolment URI for its second factor (empty when created without one).
+    /// Default errors (not a provider).
+    ///
+    /// `Err` covers both "this node is not a provider" and "that name is
+    /// already taken" — unlike the sign-in path, which is deliberately mute
+    /// about which account exists. There is no oracle to protect here: this
+    /// request needs a full management grant, and a client holding one can list
+    /// the accounts outright.
+    fn create_user(
+        &mut self,
+        username: &str,
+        password: &str,
+        admin: bool,
+        session_ttl_secs: u64,
+        no_totp: bool,
+    ) -> Result<String, String> {
+        let _ = (username, password, admin, session_ttl_secs, no_totp);
+        Err("node is not a certificate-authority provider".into())
+    }
+
+    /// Provider mode: remove the named user account.  Default errors (not a
+    /// provider).
+    ///
+    /// Ends the account's ability to obtain *new* sessions; a certificate
+    /// already issued to it keeps working until it expires or is revoked.
+    ///
+    /// `Err` covers a name that is not on file as well as an implementation's
+    /// refusal to remove the last account that can still administer the mesh —
+    /// see [`RemoveUserRequest`](crate::wayfinder::v1alpha::RemoveUserRequest).
+    fn remove_user(&mut self, username: &str) -> Result<(), String> {
+        let _ = username;
+        Err("node is not a certificate-authority provider".into())
+    }
+
     /// Provider mode: approve the pending CSR bound to `node_mac`, so the
     /// enrolling node collects its certificate on the next `submit_csr` poll.
     /// Errors if no CSR for that MAC is pending.  Default errors (not a
@@ -660,6 +732,22 @@ pub trait WayfinderDataProvider {
         let _ = node_mac;
         Err("node is not a certificate-authority provider".into())
     }
+}
+
+/// The disposition of a login attempt against the certificate authority's user
+/// store.
+///
+/// Two variants, not five: unknown account, wrong password, wrong code, locked
+/// and disabled all land on [`UserAuthOutcome::Rejected`], because the caller
+/// is unauthenticated by definition — the request rides the enrollment tier —
+/// and every distinction is an oracle.
+#[derive(Debug)]
+pub enum UserAuthOutcome {
+    /// The credentials verified; carries the session certificate and the anchor
+    /// it chains to.
+    Issued(EnrollData),
+    /// The credentials did not verify, for a reason the caller does not learn.
+    Rejected,
 }
 
 /// The disposition of a submitted certificate-signing request.  Models the three
@@ -703,6 +791,40 @@ pub struct IssuedCertData {
     pub not_after: u64,
     /// Whether the provider has since revoked this node.
     pub revoked: bool,
+    /// Whether this is a person's session certificate (`CERT_FLAG_USER`)
+    /// rather than a device's membership certificate.
+    pub user: bool,
+    /// Whether the certificate carries the management-administration
+    /// capability (`CERT_FLAG_ADMIN`).
+    pub admin: bool,
+    /// Whether the certificate carries the read-only management capability
+    /// (`CERT_FLAG_VIEWER`).
+    pub viewer: bool,
+}
+
+/// One user account, as the management API reports it.
+///
+/// Deliberately not `wayfinder-server`'s `UserSummary`: this crate is the wire
+/// format and depends on nothing above it. The two say the same thing and the
+/// conversion is one `map`, which is the price of that direction of dependency.
+///
+/// Carries no password hash and no TOTP secret. Neither is recoverable from the
+/// authority in the first place, and a projection that could carry one is a
+/// projection that eventually does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserAccountData {
+    /// The account name presented at sign-in.
+    pub username: String,
+    /// Whether this account's sessions carry the administration capability.
+    pub admin: bool,
+    /// Validity window for this account's session certificates, in seconds.
+    pub session_ttl_secs: u64,
+    /// Whether a second factor is enrolled.
+    pub totp_enrolled: bool,
+    /// Whether the account can obtain no new sessions.
+    pub disabled: bool,
+    /// Whether the account is currently locked out after failed sign-ins.
+    pub locked: bool,
 }
 
 /// The result of a successful CSR: the issued certificate plus the trust anchor
@@ -812,6 +934,10 @@ fn request_kind_name(k: &RequestKind) -> &'static str {
         RequestKind::GetLogs(_) => "GetLogs",
         RequestKind::SetLogLevel(_) => "SetLogLevel",
         RequestKind::RevealEnrollmentToken(_) => "RevealEnrollmentToken",
+        RequestKind::AuthenticateUser(_) => "AuthenticateUser",
+        RequestKind::ListUsers(_) => "ListUsers",
+        RequestKind::CreateUser(_) => "CreateUser",
+        RequestKind::RemoveUser(_) => "RemoveUser",
     }
 }
 
@@ -849,7 +975,22 @@ fn audited(k: &RequestKind) -> Audited {
         | RequestKind::DenyCsr(_)
         // Changing what a node records is an operator action worth an audit
         // trail, and infrequent enough to afford one.
-        | RequestKind::SetLogLevel(_) => Audited::Mutation,
+        | RequestKind::SetLogLevel(_)
+        // A login mints a certificate the whole mesh honours, and the record is
+        // the only place "who logged in, and when" is answerable. Logged
+        // whatever the outcome — a failed login is the more interesting half —
+        // and never with the credentials, which `request_kind_name` guarantees
+        // by naming the kind and never the fields.
+        | RequestKind::AuthenticateUser(_)
+        // Creating an account is creating something that can mint a certificate
+        // the whole mesh honours. If any request deserves a durable record of
+        // who asked, it is this one — and, as above, the record names the kind
+        // and never the fields, so the password it carries is never in it.
+        | RequestKind::CreateUser(_)
+        // And removing one ends somebody's access. Both halves of an account's
+        // lifetime leave a record, or the record answers "who was given access"
+        // without ever answering "who took it away".
+        | RequestKind::RemoveUser(_) => Audited::Mutation,
 
         RequestKind::GetNodeInfo(_)
         | RequestKind::GetRoutingTable(_)
@@ -868,7 +1009,11 @@ fn audited(k: &RequestKind) -> Audited {
         // Deliberately a query, and deliberately unlogged: a client polls this
         // on every refresh tick, and a record emitted per poll would fill the
         // very ring the poll is reading.
-        | RequestKind::GetLogs(_) => Audited::Query,
+        | RequestKind::GetLogs(_)
+        // A read of provider state, like ListCerts beside it. Not a disclosure:
+        // it hands out no secret, only the roster — and only to a client that
+        // already holds a full management grant.
+        | RequestKind::ListUsers(_) => Audited::Query,
     }
 }
 
@@ -1238,6 +1383,37 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                 Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
             },
 
+            Some(RequestKind::AuthenticateUser(req)) => match self.provider.authenticate_user(
+                &req.username,
+                &req.password,
+                &req.totp_code,
+                &req.ed_pubkey,
+                &req.x_pubkey,
+            ) {
+                Ok(outcome) => {
+                    let variant = match outcome {
+                        UserAuthOutcome::Issued(data) => {
+                            AuthenticateUserOutcomeKind::Issued(UserSessionIssued {
+                                cert: data.cert,
+                                trust_anchor: data.trust_anchor,
+                            })
+                        }
+                        // One message for every reason, composed here rather
+                        // than by the provider so no implementation can widen
+                        // it into something branchable.
+                        UserAuthOutcome::Rejected => {
+                            AuthenticateUserOutcomeKind::Rejected(UserSessionRejected {
+                                message: "authentication denied".into(),
+                            })
+                        }
+                    };
+                    ResponseKind::AuthenticateUser(AuthenticateUserResponse {
+                        outcome: Some(variant),
+                    })
+                }
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            },
+
             Some(RequestKind::RevokeNode(req)) => match self.provider.revoke_node(&req.node_mac) {
                 Ok(()) => ResponseKind::Empty(Empty {}),
                 Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
@@ -1253,9 +1429,47 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                             not_before: c.not_before,
                             not_after: c.not_after,
                             revoked: c.revoked,
+                            user: c.user,
+                            admin: c.admin,
+                            viewer: c.viewer,
                         })
                         .collect(),
                 }),
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            },
+
+            Some(RequestKind::ListUsers(_)) => match self.provider.list_users() {
+                Ok(users) => ResponseKind::ListUsers(ListUsersResponse {
+                    users: users
+                        .into_iter()
+                        .map(|u| UserAccount {
+                            username: u.username,
+                            admin: u.admin,
+                            session_ttl_secs: u.session_ttl_secs,
+                            totp_enrolled: u.totp_enrolled,
+                            disabled: u.disabled,
+                            locked: u.locked,
+                        })
+                        .collect(),
+                }),
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            },
+
+            Some(RequestKind::CreateUser(req)) => match self.provider.create_user(
+                &req.username,
+                &req.password,
+                req.admin,
+                req.session_ttl_secs,
+                req.no_totp,
+            ) {
+                Ok(totp_enrolment_uri) => {
+                    ResponseKind::CreateUser(CreateUserResponse { totp_enrolment_uri })
+                }
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            },
+
+            Some(RequestKind::RemoveUser(req)) => match self.provider.remove_user(&req.username) {
+                Ok(()) => ResponseKind::Empty(Empty {}),
                 Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
             },
 
@@ -2569,6 +2783,38 @@ mod tests {
                 GetLinkFeaturesTableRequest {}
             ))
         );
+        // A login mints a certificate the whole mesh honours; "who logged in,
+        // and when" has nowhere else to be answered from.
+        assert_eq!(
+            Audited::Mutation,
+            audited(&RequestKind::AuthenticateUser(
+                crate::wayfinder::v1alpha::AuthenticateUserRequest::default()
+            ))
+        );
+        // Creating an account creates something that can mint such a
+        // certificate, which is the same record for the same reason.
+        assert_eq!(
+            Audited::Mutation,
+            audited(&RequestKind::CreateUser(
+                crate::wayfinder::v1alpha::CreateUserRequest::default()
+            ))
+        );
+        // Reading the roster is a read, like ListCerts beside it.
+        assert_eq!(
+            Audited::Query,
+            audited(&RequestKind::ListUsers(
+                crate::wayfinder::v1alpha::ListUsersRequest {}
+            ))
+        );
+        // And removing one ends somebody's ability to administer the mesh,
+        // which is the half of the account lifecycle nobody can undo by
+        // reading a log. It is recorded for the same reason its creation is.
+        assert_eq!(
+            Audited::Mutation,
+            audited(&RequestKind::RemoveUser(
+                crate::wayfinder::v1alpha::RemoveUserRequest::default()
+            ))
+        );
     }
 
     fn proto_kind_name(k: &ResponseKind) -> &'static str {
@@ -2592,6 +2838,9 @@ mod tests {
             ResponseKind::SecurityStatus(_) => "SecurityStatus",
             ResponseKind::Logs(_) => "Logs",
             ResponseKind::LogFilter(_) => "LogFilter",
+            ResponseKind::AuthenticateUser(_) => "AuthenticateUser",
+            ResponseKind::ListUsers(_) => "ListUsers",
+            ResponseKind::CreateUser(_) => "CreateUser",
         }
     }
 }

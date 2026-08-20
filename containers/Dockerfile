@@ -319,11 +319,21 @@ ENTRYPOINT ["/usr/local/bin/wayfinder-ctl"]
 # `network_mode: host` an image-level override would bind the dashboard to
 # every host interface — which is exactly the mistake this image used to make.
 #
-# The server holds the mesh identity and is the only party that speaks the
-# management API, so it needs an identity seed (and usually a membership cert)
-# mounted in — it defaults to /var/lib/wayfinder/identity.seed. Reaching an
-# embedded node over its USB management port instead takes `--serial /dev/ttyACM0`
-# and a `--device` flag on `docker run` to pass that port through.
+# The server is the only party that speaks the management API, so it needs a
+# credential — and there are two kinds, chosen by `--provider`:
+#
+#   * `--provider <ca-host>:7700 --provider-key <hex> --node-key <hex>` runs it
+#     in *login mode*: it holds nothing itself, and each viewer signs in for a
+#     short-lived session certificate of their own. Nothing to mount.
+#   * without it, the *static credential*: an identity seed (and usually a
+#     membership cert) mounted in, defaulting to
+#     /var/lib/wayfinder/identity.seed, shared by everyone who can reach the
+#     port. What an un-enrolled node — which has no user store to sign in to —
+#     is reached with.
+#
+# Reaching an embedded node over its USB management port instead takes `--serial
+# /dev/ttyACM0` and a `--device` flag on `docker run` to pass that port through;
+# that port has no authentication of its own either way.
 FROM gcr.io/distroless/cc-debian12 AS web
 
 COPY --from=builder /out/wayfinder-web /usr/local/bin/wayfinder-web

@@ -107,6 +107,19 @@ pretty-hex = "0.4.2"
 anyhow = "1.0.102"
 zerocopy = "0.8.48"
 rand = "0.10.1"
+# Password hashing for the certificate authority's user store (§5.2 of
+# docs/design/06). Memory-hard by construction, which is why the store lives at
+# the CA and never on a node — see §4 of that document.
+argon2 = { version = "0.5", features = ["std"] }
+# RFC 6238 TOTP is HMAC-SHA1 over a counter; these two are the primitives, and
+# the ~25 lines of RFC on top live in `wayfinder-server`'s `users` module rather
+# than in a dependency that would be almost entirely those same lines.
+hmac = "0.12"
+sha1 = "0.10"
+# Constant-time comparison for the TOTP code and the enrollment token.
+subtle = "2.6"
+# Reading a password from a terminal without echoing it (`wayfinderctl`).
+rpassword = "7.4"
 clap = { version = "4", features = ["derive"] }
 etherparse = "0.20.1"
 embedded-io-async = "0.7.0"

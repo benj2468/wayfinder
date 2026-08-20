@@ -595,13 +595,22 @@ where
                 ?decision,
                 "drop: request not permitted on this connection"
             );
+            let message = match decision {
+                MgmtAccess::GrantedViewer => {
+                    "this connection is read-only (its certificate carries the viewer \
+                     capability, not the admin one); mutations and the enrollment token \
+                     need an admin certificate or the node's own key"
+                }
+                _ => {
+                    "this connection is limited to enrollment (no admin \
+                     certificate was verified on it); everything else needs an \
+                     admin certificate or the node's own key"
+                }
+            };
             send_response(
                 &mut responses,
                 RespKind::Error(ErrorResponse {
-                    message: "this connection is limited to enrollment (no admin \
-                              certificate was verified on it); everything else needs an \
-                              admin certificate or the node's own key"
-                        .into(),
+                    message: message.into(),
                 }),
             )
             .await?;

@@ -41,6 +41,11 @@ pub enum MgmtAccess {
     /// Granted via the enrolled path: a verified, non-revoked admin cert bound to
     /// the handshake key.
     GrantedAdmin,
+    /// Granted read-only: a verified, non-revoked cert bound to the handshake
+    /// key carrying [`CERT_FLAG_VIEWER`](wayfinder::wayfinder_auth::CERT_FLAG_VIEWER)
+    /// but not the admin capability. What it may invoke is [`permits`]: the
+    /// queries, and nothing that mutates or discloses a secret.
+    GrantedViewer,
     /// Granted via the self-key path: the client proved possession of the node's
     /// *own* identity key.
     GrantedSelfKey,
@@ -54,9 +59,10 @@ pub enum MgmtAccess {
 
 /// Why a management client was refused ([`MgmtAccess::Denied`]).
 ///
-/// Every variant is a *failed claim to be an admin* — a client that presented a
-/// cert which did not hold up. Presenting no cert at all is not a denial: it is
-/// [`MgmtAccess::GrantedEnrollment`], which can do nothing but enroll.
+/// Every variant is a *failed claim to a management capability* — a client that
+/// presented a cert which did not hold up. Presenting no cert at all is not a
+/// denial: it is [`MgmtAccess::GrantedEnrollment`], which can do nothing but
+/// enroll.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MgmtDenied {
     /// The presented cert failed verification against the trust anchor (carries
@@ -66,8 +72,15 @@ pub enum MgmtDenied {
     /// handshake key, so it was not bound to this session (e.g. a cert replayed
     /// by someone who does not hold its private key).
     KeyMismatch,
-    /// Enrolled path: the verified cert lacks the admin capability.
-    NotAdmin,
+    /// Enrolled path: the verified cert carries no management capability at
+    /// all — neither
+    /// [`CERT_FLAG_ADMIN`](wayfinder::wayfinder_auth::CERT_FLAG_ADMIN) nor
+    /// [`CERT_FLAG_VIEWER`](wayfinder::wayfinder_auth::CERT_FLAG_VIEWER).
+    ///
+    /// This is where an ordinary *device* certificate lands, which is the
+    /// point: every node on the mesh holds one, so a tier granted by the
+    /// absence of the admin bit would be a tier every node already had.
+    NoCapability,
     /// Enrolled path: the verified admin's node has been revoked.
     Revoked,
 }
@@ -100,6 +113,14 @@ pub enum MgmtDenied {
 ///   session), carrying the admin capability for a node `is_revoked` reports as
 ///   active. Full management access. A cert that fails any of those checks is
 ///   [`MgmtAccess::Denied`] — a failed claim, not a fallback to a lesser tier.
+/// * **Viewer** ([`MgmtAccess::GrantedViewer`]): as the admin tier, but the
+///   verified cert carries
+///   [`CERT_FLAG_VIEWER`](wayfinder::wayfinder_auth::CERT_FLAG_VIEWER) instead
+///   of the admin capability. Read-only management access — see [`permits`].
+///   Note what this is *not*: it is not "a verified cert that is not an admin".
+///   Every device on the mesh holds a verified non-admin cert, so granting the
+///   tier by absence would be granting it to the whole mesh; it takes a signed
+///   bit, and a cert with neither bit is [`MgmtDenied::NoCapability`].
 /// * **Enrollment** ([`MgmtAccess::GrantedEnrollment`]): no cert was presented
 ///   at all, so the client is a stranger and may only enroll — see [`permits`]
 ///   and this module's header for why that door is open.
@@ -133,17 +154,18 @@ pub fn decide_access(
     if &verified.ed_pubkey != handshake_key {
         return MgmtAccess::Denied(MgmtDenied::KeyMismatch);
     }
-    match authorize_admin(&verified, is_revoked) {
-        None => MgmtAccess::GrantedAdmin,
-        Some(reason) => MgmtAccess::Denied(reason),
+    match authorize_capability(&verified, is_revoked) {
+        Ok(access) => access,
+        Err(reason) => MgmtAccess::Denied(reason),
     }
 }
 
 /// Whether a connection holding `access` may invoke `request`.
 ///
 /// Both full grants may invoke everything, so this is really the definition of
-/// what [`MgmtAccess::GrantedEnrollment`] means: the two requests a node that
-/// wants to join has to make, and nothing else.
+/// the two confined tiers: what [`MgmtAccess::GrantedEnrollment`] means — the
+/// two requests a node that wants to join has to make, and nothing else — and
+/// what [`MgmtAccess::GrantedViewer`] means, below.
 ///
 /// * `SubmitCsr` — ask the provider to certify this node's keys. Whether it is
 ///   granted, parked for approval or refused is the provider's enrollment
@@ -151,6 +173,13 @@ pub fn decide_access(
 /// * `GetTrustAnchor` — read the mesh's public trust anchor. Public by
 ///   construction: every OGM on the mesh is verified against it, so it is not a
 ///   secret being handed out.
+/// * `AuthenticateUser` — exchange a username, password and TOTP code for a
+///   short-lived management certificate. On this tier for the same reason
+///   `SubmitCsr` is: someone who has not logged in yet holds no credential, so
+///   a tier that required one would close the door they need to knock on.
+///   Admission control has not moved here either — it is the password, the
+///   second factor, the per-account lockout, and the account having been
+///   created by an admin in the first place.
 ///
 /// Everything else — every read of routing state, every setting, every
 /// provider action including approving a CSR — needs a full grant.
@@ -177,40 +206,84 @@ pub fn decide_access(
 /// provider's pending queue, up to the cap, which the enrollment token and
 /// operator approval are there to filter.
 ///
+/// # The viewer tier
+///
+/// [`MgmtAccess::GrantedViewer`] is the queries and nothing else: every
+/// `Get*`/`List*`/`ResolveRoute` request, and none of the mutations
+/// (`SetAuth`, `SetConfig`, `SetLogLevel`, `RevokeNode`, `ApproveCsr`,
+/// `DenyCsr`, `SubmitCsr`) or disclosures (`RevealEnrollmentToken`).
+///
+/// Two of those exclusions are worth stating rather than leaving to the reader.
+/// `RevealEnrollmentToken` is a *read* by shape and a secret by content — the
+/// credential that admits nodes to the mesh — and it is the one request whose
+/// disclosure the design already treats as a discrete, logged, admin-gated act;
+/// a read-only tier that could perform it would undo that. `SetLogLevel` reads
+/// like a debugging convenience, but it changes what every sink on the node
+/// emits, which is node-wide state and is exactly the sort of thing a viewer
+/// exists not to touch. `Authenticate` is excluded because the connection has
+/// already authenticated: a second one on the same connection has no defined
+/// meaning and must not silently re-tier it.
+///
 /// SECURITY ALERT: this function holds security-critical access-control
 /// logic. Changing it requires careful consideration.
 pub fn permits(access: MgmtAccess, request: &ReqKind) -> bool {
     match access {
         MgmtAccess::GrantedAdmin | MgmtAccess::GrantedSelfKey => true,
-        MgmtAccess::GrantedEnrollment => {
-            matches!(request, ReqKind::SubmitCsr(_) | ReqKind::GetTrustAnchor(_))
-        }
+        MgmtAccess::GrantedViewer => matches!(
+            request,
+            ReqKind::GetNodeInfo(_)
+                | ReqKind::GetRoutingTable(_)
+                | ReqKind::GetLinkQualityTable(_)
+                | ReqKind::ResolveRoute(_)
+                | ReqKind::GetOgmSchedule(_)
+                | ReqKind::GetThroughput(_)
+                | ReqKind::GetMetrics(_)
+                | ReqKind::GetTrustAnchor(_)
+                | ReqKind::GetSecurityStatus(_)
+                | ReqKind::ListCerts(_)
+                | ReqKind::ListPendingCsrs(_)
+                | ReqKind::GetKeepaliveTable(_)
+                | ReqKind::GetLinkFeaturesTable(_)
+                | ReqKind::GetLogs(_)
+        ),
+        MgmtAccess::GrantedEnrollment => matches!(
+            request,
+            ReqKind::SubmitCsr(_) | ReqKind::GetTrustAnchor(_) | ReqKind::AuthenticateUser(_)
+        ),
         MgmtAccess::Denied(_) => false,
     }
 }
 
-/// Decide whether an authenticated client bearing `cert` may invoke privileged
-/// management operations: `None` grants access, `Some(reason)` refuses it.
+/// Which management tier an authenticated client bearing `cert` earns:
+/// [`MgmtAccess::GrantedAdmin`], [`MgmtAccess::GrantedViewer`], or an
+/// `Err(reason)` refusing it.
 ///
 /// `cert` must already have been verified against the trust anchor (it is a
 /// [`VerifiedCert`], produced only on the verification success path), so its
-/// [`admin`](VerifiedCert::admin) bit is trustworthy.  `is_revoked` reports
-/// whether a given node MAC has an active revocation — supplied as a predicate so
-/// the policy stays decoupled from where revocation state lives (the router's
-/// `OgmAuth`).
+/// [`admin`](VerifiedCert::admin) and [`viewer`](VerifiedCert::viewer) bits are
+/// trustworthy.  `is_revoked` reports whether a given node MAC has an active
+/// revocation — supplied as a predicate so the policy stays decoupled from
+/// where revocation state lives (the router's `OgmAuth`).
 ///
-/// Revocation is checked first: it dominates the admin capability, so a revoked
-/// admin is refused ([`MgmtDenied::Revoked`]) rather than allowed.
-pub fn authorize_admin(
+/// Revocation is checked first: it dominates every capability, so a revoked
+/// admin is refused ([`MgmtDenied::Revoked`]) rather than allowed. The admin
+/// bit then dominates the viewer bit — a cert carrying both is an admin, not a
+/// viewer, so an admin need not also be flagged as a viewer in order to read.
+///
+/// SECURITY ALERT: this function holds security-critical access-control
+/// logic. Changing it requires careful consideration.
+pub fn authorize_capability(
     cert: &VerifiedCert,
     is_revoked: impl FnOnce(Mac) -> bool,
-) -> Option<MgmtDenied> {
+) -> Result<MgmtAccess, MgmtDenied> {
     if is_revoked(cert.mac) {
-        Some(MgmtDenied::Revoked)
-    } else if !cert.admin {
-        Some(MgmtDenied::NotAdmin)
+        Err(MgmtDenied::Revoked)
+    } else if cert.admin {
+        Ok(MgmtAccess::GrantedAdmin)
+    } else if cert.viewer {
+        Ok(MgmtAccess::GrantedViewer)
     } else {
-        None
+        Err(MgmtDenied::NoCapability)
     }
 }
 
@@ -235,6 +308,16 @@ mod tests {
             x_pubkey: [0u8; 32],
             not_after: 0,
             admin,
+            viewer: false,
+            user: false,
+        }
+    }
+
+    /// A verified cert carrying the read-only capability and nothing else.
+    fn verified_viewer(m: Mac) -> VerifiedCert {
+        VerifiedCert {
+            viewer: true,
+            ..verified(m, false)
         }
     }
 
@@ -244,20 +327,53 @@ mod tests {
     /// refused.
     #[test]
     fn admin_authorization_requires_admin_and_not_revoked() {
-        // Verified admin, not revoked → allowed (no denial reason).
-        assert_eq!(authorize_admin(&verified(mac(1), true), |_| false), None);
-
-        // Verified but lacking the admin capability → refused.
+        // Verified admin, not revoked → the full grant.
         assert_eq!(
-            authorize_admin(&verified(mac(1), false), |_| false),
-            Some(MgmtDenied::NotAdmin)
+            authorize_capability(&verified(mac(1), true), |_| false),
+            Ok(MgmtAccess::GrantedAdmin)
+        );
+
+        // Verified but carrying no management capability at all → refused.
+        // This is where an ordinary device certificate lands, and it must stay
+        // there: every node on the mesh holds one.
+        assert_eq!(
+            authorize_capability(&verified(mac(1), false), |_| false),
+            Err(MgmtDenied::NoCapability)
         );
 
         // Verified admin whose node has been revoked → refused despite the admin
         // bit; revocation is the dominant, mesh-wide fact.
         assert_eq!(
-            authorize_admin(&verified(mac(1), true), |m| m == mac(1)),
-            Some(MgmtDenied::Revoked)
+            authorize_capability(&verified(mac(1), true), |m| m == mac(1)),
+            Err(MgmtDenied::Revoked)
+        );
+    }
+
+    /// The viewer capability is earned by its own signed bit, is dominated by
+    /// revocation like every other capability, and is *subsumed* by the admin
+    /// bit — a cert carrying both is an admin, so an admin never has to be
+    /// flagged as a viewer as well in order to read.
+    #[test]
+    fn the_viewer_capability_is_its_own_bit_and_the_admin_bit_subsumes_it() {
+        assert_eq!(
+            authorize_capability(&verified_viewer(mac(1)), |_| false),
+            Ok(MgmtAccess::GrantedViewer)
+        );
+        assert_eq!(
+            authorize_capability(&verified_viewer(mac(1)), |m| m == mac(1)),
+            Err(MgmtDenied::Revoked),
+            "revocation dominates the viewer capability too"
+        );
+        assert_eq!(
+            authorize_capability(
+                &VerifiedCert {
+                    viewer: true,
+                    ..verified(mac(1), true)
+                },
+                |_| false
+            ),
+            Ok(MgmtAccess::GrantedAdmin),
+            "admin dominates viewer: both bits is an admin, not a viewer"
         );
     }
 
@@ -394,7 +510,7 @@ mod tests {
             assert!(permits(full, &set_auth));
         }
         assert!(!permits(
-            MgmtAccess::Denied(MgmtDenied::NotAdmin),
+            MgmtAccess::Denied(MgmtDenied::NoCapability),
             &trust_anchor
         ));
     }
@@ -456,7 +572,7 @@ mod tests {
                 100,
                 |_| false
             ),
-            MgmtAccess::Denied(MgmtDenied::NotAdmin)
+            MgmtAccess::Denied(MgmtDenied::NoCapability)
         );
 
         // Admin cert, bound, but the node is revoked → refused.
@@ -514,7 +630,7 @@ mod tests {
                 100,
                 |_| false
             ),
-            MgmtAccess::Denied(MgmtDenied::NotAdmin)
+            MgmtAccess::Denied(MgmtDenied::NoCapability)
         );
         // With no cert: admitted, but unable to invoke anything but enrollment.
         assert!(!permits(
@@ -567,12 +683,16 @@ mod tests {
             ReqKind::GetLogs(GetLogsRequest::default()),
             ReqKind::SetLogLevel(SetLogLevelRequest::default()),
             ReqKind::RevealEnrollmentToken(RevealEnrollmentTokenRequest {}),
+            ReqKind::AuthenticateUser(AuthenticateUserRequest::default()),
+            ReqKind::ListUsers(ListUsersRequest {}),
+            ReqKind::CreateUser(CreateUserRequest::default()),
+            ReqKind::RemoveUser(RemoveUserRequest::default()),
         ]
     }
 
     /// The enrollment tier is a *closed* allowlist over the whole request
-    /// surface: exactly `SubmitCsr` and `GetTrustAnchor`, and every one of the
-    /// other twenty kinds refused — including the ones that would otherwise be
+    /// surface: exactly `SubmitCsr`, `GetTrustAnchor` and `AuthenticateUser`,
+    /// and every one of the other twenty-four kinds refused — including the ones that would otherwise be
     /// the prize (`ApproveCsr` on its own request, `SetAuth`, `SetConfig`,
     /// `GetLogs`).
     ///
@@ -584,7 +704,7 @@ mod tests {
         let all = every_request_kind();
         assert_eq!(
             all.len(),
-            23,
+            27,
             "every_request_kind must list every variant of the request oneof; \
              add the new one (and decide what the enrollment tier may do with it)"
         );
@@ -593,7 +713,10 @@ mod tests {
             // Notably not on the list: `RevealEnrollmentToken`. A node asking
             // to join has to be *given* the token; a node that could ask the
             // provider for it would make the token no barrier at all.
-            let expected = matches!(request, ReqKind::SubmitCsr(_) | ReqKind::GetTrustAnchor(_));
+            let expected = matches!(
+                request,
+                ReqKind::SubmitCsr(_) | ReqKind::GetTrustAnchor(_) | ReqKind::AuthenticateUser(_)
+            );
             assert_eq!(
                 permits(MgmtAccess::GrantedEnrollment, request),
                 expected,
@@ -605,10 +728,114 @@ mod tests {
                 assert!(permits(full, request), "full grant refused {request:?}");
             }
             assert!(
-                !permits(MgmtAccess::Denied(MgmtDenied::NotAdmin), request),
+                !permits(MgmtAccess::Denied(MgmtDenied::NoCapability), request),
                 "a denied connection was permitted {request:?}"
             );
         }
+    }
+
+    /// The viewer tier is a closed allowlist over the same whole request
+    /// surface: every query, and not one mutation or disclosure.
+    ///
+    /// Written as an explicit *refusal* list rather than as "everything that
+    /// isn't a `Get`", so that a request named like a read but shaped like
+    /// something else has to be classified deliberately. `RevealEnrollmentToken`
+    /// is the one that makes the point: a read by shape, the mesh's admission
+    /// credential by content.
+    #[test]
+    fn permits_confines_the_viewer_tier_to_the_queries() {
+        let all = every_request_kind();
+        assert_eq!(
+            all.len(),
+            27,
+            "every_request_kind must list every variant of the request oneof; \
+             add the new one (and decide what the viewer tier may do with it)"
+        );
+
+        for request in &all {
+            let refused = matches!(
+                request,
+                ReqKind::SetAuth(_)
+                    | ReqKind::SetConfig(_)
+                    | ReqKind::SetLogLevel(_)
+                    | ReqKind::SubmitCsr(_)
+                    | ReqKind::RevokeNode(_)
+                    | ReqKind::ApproveCsr(_)
+                    | ReqKind::DenyCsr(_)
+                    | ReqKind::RevealEnrollmentToken(_)
+                    | ReqKind::Authenticate(_)
+                    // A viewer holds a certificate already; logging in again on
+                    // the same connection has no defined meaning, and letting
+                    // it through would put a credential-minting request behind
+                    // a read-only grant.
+                    | ReqKind::AuthenticateUser(_)
+                    | ReqKind::CreateUser(_)
+                    // Removing an account is administering who may administer
+                    // the mesh, which is the furthest thing there is from a
+                    // read-only tier's business.
+                    | ReqKind::RemoveUser(_)
+                    // A read by shape, and refused anyway: the account roster
+                    // is who may administer the mesh, which is an
+                    // administrator's business. A viewer reads the *network*.
+                    // Widening this later is one line; narrowing it after
+                    // somebody has relied on it is not.
+                    | ReqKind::ListUsers(_)
+            );
+            assert_eq!(
+                permits(MgmtAccess::GrantedViewer, request),
+                !refused,
+                "viewer tier verdict for {request:?}"
+            );
+        }
+    }
+
+    /// A viewer certificate is admitted as a viewer through the whole
+    /// `decide_access` path — verified against the anchor, bound to the
+    /// handshake key — while the *same* certificate stripped of its capability
+    /// bit is refused rather than demoted to a lesser grant.
+    #[test]
+    fn a_viewer_certificate_is_admitted_as_a_viewer_and_a_bare_one_is_not() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let anchor = authority.trust_anchor();
+        let own = Keypair::from_seed(&[7u8; 32]);
+        let operator = Keypair::from_seed(&[8u8; 32]);
+
+        let viewer_cert = authority.issue_user_cert(
+            mac(5),
+            operator.ed_pubkey(),
+            operator.x_pubkey(),
+            0,
+            200,
+            false,
+        );
+        assert_eq!(
+            decide_access(
+                &operator.ed_pubkey(),
+                Some(&viewer_cert),
+                Some(&anchor),
+                Some(&own.ed_pubkey()),
+                100,
+                |_| false
+            ),
+            MgmtAccess::GrantedViewer
+        );
+
+        // An ordinary device certificate — what every node on the mesh holds —
+        // earns nothing. This is the property that makes the tier safe to add:
+        // it is granted by a bit, never by the absence of one.
+        let device_cert =
+            authority.issue_cert(mac(6), operator.ed_pubkey(), operator.x_pubkey(), 0, 200);
+        assert_eq!(
+            decide_access(
+                &operator.ed_pubkey(),
+                Some(&device_cert),
+                Some(&anchor),
+                Some(&own.ed_pubkey()),
+                100,
+                |_| false
+            ),
+            MgmtAccess::Denied(MgmtDenied::NoCapability)
+        );
     }
 
     /// The anchor-absent column of the authorization matrix.

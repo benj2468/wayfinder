@@ -21,6 +21,8 @@ use wayfinder_protos::service::EnrollmentPolicyData;
 use wayfinder_protos::service::EnrollmentPolicyStatusData;
 use wayfinder_protos::service::IssuedCertData;
 use wayfinder_protos::service::PendingCsrData;
+use wayfinder_protos::service::UserAccountData;
+use wayfinder_protos::service::UserAuthOutcome;
 
 /// A mesh certificate authority, as seen by the management-API layer.
 ///
@@ -52,6 +54,71 @@ pub trait MeshAuthority {
         x_pubkey: &[u8],
         token: &str,
     ) -> Result<CsrOutcome, String>;
+
+    /// Exchange a user's credentials for a short-lived management certificate
+    /// bound to the session keys they name, returning its
+    /// [`UserAuthOutcome`].
+    ///
+    /// The `Err` variant is reserved for the request being *unserviceable* —
+    /// clock unset, malformed keys — and never for the credentials being
+    /// wrong, which is [`UserAuthOutcome::Rejected`]. That split is the same
+    /// one [`submit_csr`](Self::submit_csr) draws, and for a sharper reason
+    /// here: an implementation must never let the rejection carry, or its
+    /// timing imply, which of unknown-account / wrong-password / wrong-code /
+    /// locked / disabled occurred.
+    fn authenticate_user(
+        &mut self,
+        username: &str,
+        password: &str,
+        totp_code: &str,
+        ed_pubkey: &[u8],
+        x_pubkey: &[u8],
+    ) -> Result<UserAuthOutcome, String>;
+
+    /// The user accounts on file, for an operator listing them.
+    ///
+    /// Carries no password hash and no TOTP secret; see [`UserAccountData`].
+    fn list_users(&self) -> Vec<UserAccountData>;
+
+    /// Create a user account, returning the `otpauth://` enrolment URI for its
+    /// new second factor — or an empty string when `no_totp` was asked for.
+    ///
+    /// The URI is returned rather than stored because it is shown *once*: the
+    /// secret inside it is not recoverable from the authority afterwards, so an
+    /// implementation must hand it back here or not at all.
+    ///
+    /// `session_ttl_secs` of zero means "the default", so a caller with no
+    /// opinion does not have to know what the default is.
+    ///
+    /// `Err` covers a name already taken as well as a store that cannot be made
+    /// durable. Unlike [`authenticate_user`](Self::authenticate_user) there is
+    /// no oracle to protect: this call needs a full management grant, and a
+    /// client holding one can list the accounts outright.
+    fn create_user(
+        &mut self,
+        username: &str,
+        password: &str,
+        admin: bool,
+        session_ttl_secs: u64,
+        no_totp: bool,
+    ) -> Result<String, String>;
+
+    /// Remove the named user account.
+    ///
+    /// Ends the account's ability to obtain *new* sessions. A certificate
+    /// already issued to it is unaffected — that is what `revoke` and expiry
+    /// are for — so cutting off a compromised account is two acts, not one.
+    ///
+    /// An implementation must refuse to remove the last account that can still
+    /// administer the mesh. Both this and [`create_user`](Self::create_user)
+    /// need a full management grant, so an authority left with no enabled
+    /// administrator has a user store that can no longer be changed over the
+    /// management API at all — a state reachable in one click and escapable
+    /// only with a shell on the provider host.
+    ///
+    /// `Err` covers that refusal, a name that is not on file, and a store that
+    /// cannot be made durable.
+    fn remove_user(&mut self, username: &str) -> Result<(), String>;
 
     /// Sign a revocation for `node_mac`, returning raw `RevocationRecord` bytes
     /// for the caller to record and flood.  Returns an error string on malformed

@@ -30,6 +30,11 @@ use wayfinder_storage::PersistOutcome;
 use wayfinder_storage::Persisted;
 
 use crate::authority::HeldCsr;
+use wayfinder_auth::CERT_FLAG_ADMIN;
+use wayfinder_auth::CERT_FLAG_USER;
+use wayfinder_auth::CERT_FLAG_VIEWER;
+
+use crate::users::UserRecord;
 
 /// Largest encoded CA-state snapshot [`CaLog::load`] will read. `FileStore`
 /// (per `DurableStore::load`'s contract) needs a caller-supplied buffer
@@ -45,7 +50,7 @@ const MAX_STATE_BYTES: usize = 1024 * 1024;
 /// Current on-disk schema version. Bump this — and add an ordered migration
 /// from the prior version into [`parse_state`] — whenever [`CaState`]'s shape
 /// changes.
-pub(crate) const CURRENT_STATE_VERSION: u32 = 4;
+pub(crate) const CURRENT_STATE_VERSION: u32 = 5;
 
 /// Permission bits the CA state file is written with.
 ///
@@ -72,6 +77,15 @@ struct IssuedRecord {
     not_after: u64,
     /// Whether this certificate has been revoked.
     revoked: bool,
+    /// The certificate's signed capability bits, as issued. Recorded rather
+    /// than re-derived because the certificate itself is not kept — only this
+    /// summary of it — so without the flags an operator reading the list back
+    /// after a restart cannot tell a person's session from a device's
+    /// membership. Defaulted to 0 for a record written before version 5, which
+    /// is accurate for every certificate that could have existed then: user
+    /// and viewer certificates did not.
+    #[serde(default)]
+    flags: u8,
 }
 
 impl IssuedRecord {
@@ -88,6 +102,7 @@ impl IssuedRecord {
             not_before: c.not_before,
             not_after: c.not_after,
             revoked: c.revoked,
+            flags: pack_flags(c),
         })
     }
 
@@ -99,8 +114,33 @@ impl IssuedRecord {
             not_before: self.not_before,
             not_after: self.not_after,
             revoked: self.revoked,
+            user: self.flags & CERT_FLAG_USER != 0,
+            admin: self.flags & CERT_FLAG_ADMIN != 0,
+            viewer: self.flags & CERT_FLAG_VIEWER != 0,
         }
     }
+}
+
+/// Pack an [`IssuedCertData`]'s three capability booleans back into the signed
+/// flag byte, for storage.
+///
+/// The booleans are what the management API reports and the byte is what the
+/// certificate actually carries; keeping the byte on disk means a flag added
+/// later is storable without another schema version, and means this record
+/// says what the certificate said rather than what today's build knows how to
+/// name.
+fn pack_flags(c: &IssuedCertData) -> u8 {
+    let mut flags = 0u8;
+    if c.user {
+        flags |= CERT_FLAG_USER;
+    }
+    if c.admin {
+        flags |= CERT_FLAG_ADMIN;
+    }
+    if c.viewer {
+        flags |= CERT_FLAG_VIEWER;
+    }
+    flags
 }
 
 /// The persisted CA state (current schema, [`CURRENT_STATE_VERSION`]): the
@@ -130,6 +170,11 @@ struct CaState {
     /// with its inverse.
     #[serde(default)]
     policy: PolicyOverrides,
+    /// The certificate authority's user accounts. Added in version 5; a
+    /// version-4 snapshot migrates forward with none, which is exactly what a
+    /// version-4 provider had — no accounts, and so no way to log in.
+    #[serde(default)]
+    users: Vec<UserRecord>,
 }
 
 /// The runtime enrollment-policy overrides an operator has applied, as stored.
@@ -248,9 +293,8 @@ fn migrate_v2_to_v3(v2: CaStateV2) -> CaStateV3 {
 /// provider that comes back from an upgrade signing for whoever asks, when its
 /// operator had pinned "hold every request", is handing out mesh membership
 /// unattended.
-fn migrate_v3_to_v4(v3: CaStateV3) -> CaState {
-    CaState {
-        version: 4,
+fn migrate_v3_to_v4(v3: CaStateV3) -> CaStateV4 {
+    CaStateV4 {
         issued: v3.issued,
         held: v3.held,
         policy: PolicyOverrides {
@@ -258,6 +302,33 @@ fn migrate_v3_to_v4(v3: CaStateV3) -> CaState {
             cert_ttl_secs: v3.policy.cert_ttl_secs,
             enrollment_token: v3.policy.enrollment_token,
         },
+    }
+}
+
+/// Version 4 of the on-disk schema: as version 5, but with no `users` section
+/// — the certificate authority had no user store until version 5. Kept so
+/// [`parse_state`] can migrate a version-4 snapshot.
+#[derive(Deserialize)]
+struct CaStateV4 {
+    issued: Vec<IssuedRecord>,
+    held: Vec<HeldCsr>,
+    #[serde(default)]
+    policy: PolicyOverrides,
+}
+
+/// Migrate a version-4 snapshot forward: no user accounts were recorded, so
+/// there are none — which is not a loss of state but a faithful description of
+/// a provider that had no user store at all. Bootstrapping the first account is
+/// an offline, deliberate act (`wayfinderctl user add`), exactly as
+/// bootstrapping the root key is; inventing one here would be inventing a
+/// credential nobody chose.
+fn migrate_v4_to_v5(v4: CaStateV4) -> CaState {
+    CaState {
+        version: 5,
+        issued: v4.issued,
+        held: v4.held,
+        policy: v4.policy,
+        users: Vec::new(),
     }
 }
 
@@ -295,15 +366,21 @@ fn parse_state(bytes: &[u8], path: Option<&Path>) -> Result<CaState, String> {
     match probe.version {
         1 => {
             let v1: CaStateV1 = serde_json::from_slice(bytes).map_err(corrupt)?;
-            Ok(migrate_v3_to_v4(migrate_v2_to_v3(migrate_v1_to_v2(v1))))
+            Ok(migrate_v4_to_v5(migrate_v3_to_v4(migrate_v2_to_v3(
+                migrate_v1_to_v2(v1),
+            ))))
         }
         2 => {
             let v2: CaStateV2 = serde_json::from_slice(bytes).map_err(corrupt)?;
-            Ok(migrate_v3_to_v4(migrate_v2_to_v3(v2)))
+            Ok(migrate_v4_to_v5(migrate_v3_to_v4(migrate_v2_to_v3(v2))))
         }
         3 => {
             let v3: CaStateV3 = serde_json::from_slice(bytes).map_err(corrupt)?;
-            Ok(migrate_v3_to_v4(v3))
+            Ok(migrate_v4_to_v5(migrate_v3_to_v4(v3)))
+        }
+        4 => {
+            let v4: CaStateV4 = serde_json::from_slice(bytes).map_err(corrupt)?;
+            Ok(migrate_v4_to_v5(v4))
         }
         CURRENT_STATE_VERSION => serde_json::from_slice(bytes).map_err(corrupt),
         v if v > CURRENT_STATE_VERSION => Err(format!(
@@ -330,6 +407,7 @@ struct CaLogState {
     issued: Vec<IssuedCertData>,
     held: Vec<HeldCsr>,
     policy: PolicyOverrides,
+    users: Vec<UserRecord>,
 }
 
 impl CaLogState {
@@ -339,6 +417,7 @@ impl CaLogState {
             issued: Vec::new(),
             held: Vec::new(),
             policy: PolicyOverrides::default(),
+            users: Vec::new(),
         }
     }
 }
@@ -377,6 +456,7 @@ impl Codec<CaLogState> for CaStateCodec {
             issued,
             held: value.held.clone(),
             policy: value.policy.clone(),
+            users: value.users.clone(),
         };
         serde_json::to_vec_pretty(&state).map_err(|e| format!("failed to serialize CA state: {e}"))
     }
@@ -387,6 +467,7 @@ impl Codec<CaLogState> for CaStateCodec {
             issued: state.issued.iter().map(IssuedRecord::to_proto).collect(),
             held: state.held,
             policy: state.policy,
+            users: state.users,
         })
     }
 }
@@ -486,6 +567,27 @@ impl CaLog {
     /// Read-only view of the operator's runtime enrollment-policy overrides.
     pub(crate) fn policy(&self) -> &PolicyOverrides {
         &self.persisted.get().policy
+    }
+
+    /// Read-only view of the certificate authority's user accounts.
+    pub(crate) fn users(&self) -> &[UserRecord] {
+        &self.persisted.get().users
+    }
+
+    /// Run `f` against the user store, then attempt to persist the full state,
+    /// with the same rollback guarantee as [`Self::mutate_held`].
+    ///
+    /// A login is a *mutation* here even when it succeeds — it advances the
+    /// TOTP replay guard — and a failed one has to be recorded too, or the
+    /// lockout counter resets on restart and an attacker can trigger the reset
+    /// themselves. So this is on the path of every authentication attempt, not
+    /// only of administrative changes.
+    pub(crate) fn mutate_users<R>(
+        &mut self,
+        f: impl FnOnce(&mut Vec<UserRecord>) -> R,
+    ) -> (R, Result<(), String>) {
+        let (result, persisted) = self.persisted.mutate(|state| f(&mut state.users));
+        (result, self.report_persist_outcome(persisted))
     }
 
     /// Run `f` against the enrollment-policy overrides, then attempt to

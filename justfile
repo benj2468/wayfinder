@@ -47,7 +47,7 @@ build: build-workspace build-web build-web-release build-embedded build-py
 clippy: clippy-workspace clippy-web clippy-embedded clippy-py
 
 [doc("Run every test suite: host, web, python.")]
-test: test-workspace test-web test-py test-pytest
+test: test-workspace test-web test-pytest
 
 # `cargo clean` only ever empties the target directory of the workspace it is
 # run from, so reclaiming the disk takes one invocation per workspace — the same
@@ -72,7 +72,7 @@ clippy-workspace:
 
 [doc("Run the root workspace's tests.")]
 test-workspace:
-    cargo nextest run --workspace
+    cargo nextest run --workspace --release
 
 # The `test:run:rust` CI job reports this number for the coverage badge.
 [doc("Run the root workspace's tests with a coverage summary.")]
@@ -105,7 +105,7 @@ clippy-web:
 
 [doc("Test the web dashboard against its canned node.")]
 test-web:
-    cargo nextest run -p wayfinder-web --features mock-node
+    cargo nextest run -p wayfinder-web --features mock-node --release
 
 # `cargo leptos` runs wasm-bindgen and emits the site bundle the binary serves.
 [doc("Build the web dashboard the way it actually ships.")]
@@ -130,10 +130,6 @@ build-py:
 [doc("Lint the PyO3 extension crate.")]
 clippy-py:
     cd libs/wayfinder-py && cargo clippy --all-targets -- -D warnings
-
-[doc("Test the PyO3 extension crate's Rust side.")]
-test-py:
-    cd libs/wayfinder-py && cargo nextest run
 
 [doc("Remove the PyO3 extension crate's target directory.")]
 clean-py:

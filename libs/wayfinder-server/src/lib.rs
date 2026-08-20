@@ -28,7 +28,7 @@ pub use adapter::RouterAdapter;
 mod authz;
 pub use authz::MgmtAccess;
 pub use authz::MgmtDenied;
-pub use authz::authorize_admin;
+pub use authz::authorize_capability;
 pub use authz::decide_access;
 
 #[cfg(feature = "embedded")]
@@ -73,6 +73,17 @@ pub use embedded::EmbeddedQueryRx;
 pub use embedded::EmbeddedQueryTx;
 #[cfg(feature = "embedded")]
 pub use embedded::serve;
+
+#[cfg(feature = "std")]
+mod users;
+#[cfg(feature = "std")]
+pub use users::AuthOutcome;
+#[cfg(feature = "std")]
+pub use users::DEFAULT_SESSION_TTL_SECS;
+#[cfg(feature = "std")]
+pub use users::UserRecord;
+#[cfg(feature = "std")]
+pub use users::UserRole;
 
 #[cfg(feature = "std")]
 mod tls;

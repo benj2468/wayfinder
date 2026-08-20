@@ -26,11 +26,15 @@ use wayfinder_protos::service::IssuedCertData;
 use wayfinder_protos::service::PendingCsrData;
 use wayfinder_protos::service::SharedSecret;
 use wayfinder_protos::service::TokenUpdate;
+use wayfinder_protos::service::UserAuthOutcome;
 use zerocopy::IntoBytes;
 
 use crate::persistence::CaLog;
 use crate::persistence::TokenOverride;
 use crate::provider::MeshAuthority;
+use crate::users::AuthOutcome;
+use crate::users::UserRecord;
+use crate::users::UserRole;
 
 /// A certificate-signing request the authority is holding while it awaits an
 /// operator decision.  Only populated when `auto_approve` is off; keyed by
@@ -393,8 +397,136 @@ impl CertAuthority {
             not_before,
             not_after,
             revoked: false,
+            user: false,
+            admin: false,
+            viewer: false,
         };
         (cert, record)
+    }
+
+    /// Sign a *user session* certificate for `(mac, ed, x)` with `ttl_secs` of
+    /// validity and the capability `role` names, and build its record.
+    ///
+    /// Separate from [`Self::sign`] rather than a flags argument on it, for the
+    /// same reason `issue_admin_cert` is separate from `issue_cert`: the two
+    /// produce different kinds of credential, and a call site should say which
+    /// it means. The lifetime is the account's, not this authority's
+    /// `cert_ttl_secs` — §7 decision 3 of the design puts it with the admin who
+    /// granted the account — but is still bounded by the same cap the config
+    /// path applies.
+    fn sign_user_session(
+        &self,
+        mac: Mac,
+        ed: [u8; 32],
+        x: [u8; 32],
+        ttl_secs: u64,
+        role: UserRole,
+    ) -> (MembershipCert, IssuedCertData) {
+        let admin = role == UserRole::Admin;
+        let not_before = self.now_unix;
+        let not_after = self.now_unix.saturating_add(ttl_secs);
+        let cert = self
+            .authority
+            .issue_user_cert(mac, ed, x, not_before, not_after, admin);
+        let record = IssuedCertData {
+            node_mac: mac.0.to_vec(),
+            ed_pubkey: ed.to_vec(),
+            not_before,
+            not_after,
+            revoked: false,
+            user: true,
+            admin,
+            viewer: !admin,
+        };
+        (cert, record)
+    }
+
+    /// Add a user account, refusing a name that already exists.
+    ///
+    /// Two callers, and the *first* one is the reason this is a method at all:
+    /// `wayfinderctl user add`, operating directly on the state file the
+    /// provider owns, because the first account cannot be created over the
+    /// management API — creating it needs the very credential it creates. The
+    /// second is `MeshAuthority::create_user`, which is that same act performed
+    /// by an already-admitted administrator over the wire.
+    pub fn add_user(&mut self, user: UserRecord) -> Result<(), String> {
+        if user.username.is_empty() {
+            return Err("username must not be empty".to_string());
+        }
+        if self.log.users().iter().any(|u| u.username == user.username) {
+            return Err(alloc::format!("user {} already exists", user.username));
+        }
+        let (_, persisted) = self.log.mutate_users(|users| users.push(user));
+        persisted
+    }
+
+    /// The user accounts on file, for an operator listing them. Never carries a
+    /// password hash or a TOTP secret out of this module: the caller gets the
+    /// account's name, role, lifetime and status, which is what an operator
+    /// asking "who can log in?" wants and all of it.
+    pub fn list_users(&self) -> Vec<UserSummary> {
+        self.log
+            .users()
+            .iter()
+            .map(|u| UserSummary {
+                username: u.username.clone(),
+                role: u.role,
+                session_ttl_secs: u.session_ttl_secs,
+                totp_enrolled: u.totp_secret.is_some(),
+                disabled: u.disabled,
+                locked: u.is_locked(self.now_unix),
+            })
+            .collect()
+    }
+
+    /// Apply `f` to the named account and persist the result, or `Err` if no
+    /// such account exists.
+    ///
+    /// The single mutation seam for an existing account — disabling one,
+    /// resetting a password, changing a role or a session lifetime — so every
+    /// change goes through one persist with one rollback guarantee rather than
+    /// each caller opening the store for itself.
+    pub fn update_user(
+        &mut self,
+        username: &str,
+        f: impl FnOnce(&mut UserRecord),
+    ) -> Result<(), String> {
+        let (found, persisted) = self.log.mutate_users(|users| {
+            match users.iter_mut().find(|u| u.username == username) {
+                Some(user) => {
+                    f(user);
+                    true
+                }
+                None => false,
+            }
+        });
+        if !found {
+            return Err(alloc::format!("no such user: {username}"));
+        }
+        persisted
+    }
+
+    /// Remove the named account. A certificate it has already been issued is
+    /// unaffected — that is what `RevokeNode` and expiry are for — so this ends
+    /// the ability to obtain *new* sessions, not any session in flight.
+    ///
+    /// The raw store operation, with no policy on top: it will remove the last
+    /// administrator. That is deliberate, and it is why `wayfinderctl user
+    /// remove` is the documented way out of a mesh nobody can administer.
+    /// [`MeshAuthority::remove_user`] is the same act performed over the
+    /// management API, and *that* one refuses to strand the mesh — the caller
+    /// there is a browser one click away from it, not an operator with a shell
+    /// on this host.
+    pub fn remove_user(&mut self, username: &str) -> Result<(), String> {
+        let (found, persisted) = self.log.mutate_users(|users| {
+            let before = users.len();
+            users.retain(|u| u.username != username);
+            users.len() != before
+        });
+        if !found {
+            return Err(alloc::format!("no such user: {username}"));
+        }
+        persisted
     }
 
     /// Whether a held CSR has sat in its current state past the pending TTL.
@@ -444,9 +576,116 @@ fn node_mac_of(bytes: &[u8]) -> Result<Mac, String> {
     Mac::try_from(bytes).map_err(|_| "node_mac must be 6 bytes".to_string())
 }
 
+/// One user account as an operator sees it.
+///
+/// Deliberately not [`UserRecord`]: the record carries a password hash and a
+/// TOTP secret, and neither should leave the store at all — a summary type
+/// makes that a property of the API rather than of every call site remembering
+/// which fields not to print.
+#[derive(Clone, Debug)]
+pub struct UserSummary {
+    /// The account name.
+    pub username: String,
+    /// The capability this account's session certificates carry.
+    pub role: UserRole,
+    /// The validity window stamped on those certificates, in seconds.
+    pub session_ttl_secs: u64,
+    /// Whether a second factor is enrolled.
+    pub totp_enrolled: bool,
+    /// Whether the account is administratively disabled.
+    pub disabled: bool,
+    /// Whether the account is currently locked out by failed attempts.
+    pub locked: bool,
+}
+
 impl MeshAuthority for CertAuthority {
     fn trust_anchor_bytes(&self) -> Vec<u8> {
         self.authority.trust_anchor().to_bytes().to_vec()
+    }
+
+    fn authenticate_user(
+        &mut self,
+        username: &str,
+        password: &str,
+        totp_code: &str,
+        ed_pubkey: &[u8],
+        x_pubkey: &[u8],
+    ) -> Result<UserAuthOutcome, String> {
+        // Same fail-closed rule as `submit_csr`: without a clock this would
+        // mint a session whose window starts at the epoch and is already over.
+        if self.now_unix == 0 {
+            return Err("authority clock not set; cannot issue certificates yet".to_string());
+        }
+        // Malformed keys are an *unserviceable request*, not a wrong password,
+        // and are refused before any credential is looked at — a client that
+        // sent 31 bytes has a bug, and telling it so reveals nothing about
+        // whether the account exists.
+        let ed = fixed::<32>(ed_pubkey, "ed_pubkey")?;
+        let x = fixed::<32>(x_pubkey, "x_pubkey")?;
+
+        let now = self.now_unix;
+        let name = username.to_string();
+        // The whole attempt runs inside one `mutate_users` call, so the record
+        // it leaves behind — an advanced replay guard on success, an
+        // incremented failure count on failure — is persisted by the same
+        // write. A failed attempt that is not durably counted is a lockout an
+        // attacker can reset by making the process restart.
+        let (outcome, persisted) = self.log.mutate_users(|users| {
+            match users.iter_mut().find(|u| u.username == name) {
+                Some(user) => {
+                    let outcome = user.authenticate(password, totp_code, now);
+                    (outcome, user.role, user.session_ttl_secs)
+                }
+                None => {
+                    // Spend the work a real verification would have cost, or
+                    // the response time answers the question the uniform
+                    // rejection refuses to.
+                    crate::users::spend_absent_user_work(password);
+                    (AuthOutcome::Rejected, UserRole::Viewer, 0)
+                }
+            }
+        });
+        persisted?;
+
+        let (outcome, role, ttl_secs) = outcome;
+        if outcome == AuthOutcome::Rejected {
+            // No reason, here or anywhere above this: wrong password, wrong
+            // code, unknown account, locked and disabled are one answer.
+            tracing::warn!(%username, "drop: user authentication denied");
+            return Ok(UserAuthOutcome::Rejected);
+        }
+
+        // The account's lifetime, still bounded by the cap the config path
+        // applies — an admin may grant a shift or a minute, but not a decade.
+        check_cert_ttl(ttl_secs, self.allow_unbounded_cert_ttl)?;
+        // A user's MAC is derived from the session key it just presented, so it
+        // is fresh on every login and can never contend with a device's:
+        // `submit_csr`'s impersonation guard is about MACs a client *names*,
+        // and this one is not named by anybody.
+        let mac = wayfinder_auth::derive_mac(&ed);
+        let (cert, record) = self.sign_user_session(mac, ed, x, ttl_secs, role);
+
+        let (_, persisted) = self.log.mutate_issued(|issued| {
+            // Drop session records that have expired before adding this one.
+            // A device re-enrolling replaces its record in place (the MAC is
+            // stable), but a login mints a new MAC every time, so without this
+            // the log would grow by one entry per login forever. Only expired
+            // *user* records go: a device's history is not this path's to
+            // discard, and a live session's record is what `RevokeNode` and
+            // `ListCerts` are reading.
+            issued.retain(|c| !(c.user && c.not_after <= now));
+            match issued.iter_mut().find(|c| c.node_mac == record.node_mac) {
+                Some(existing) => *existing = record,
+                None => issued.push(record),
+            }
+        });
+        persisted?;
+
+        tracing::info!(%username, ?role, ttl_secs, "issued a user session certificate");
+        Ok(UserAuthOutcome::Issued(EnrollData {
+            cert: cert.as_bytes().to_vec(),
+            trust_anchor: self.trust_anchor_bytes(),
+        }))
     }
 
     fn submit_csr(
@@ -658,6 +897,82 @@ impl MeshAuthority for CertAuthority {
         Ok(())
     }
 
+    fn list_users(&self) -> Vec<wayfinder_protos::service::UserAccountData> {
+        self.list_users()
+            .into_iter()
+            .map(|u| wayfinder_protos::service::UserAccountData {
+                username: u.username,
+                admin: u.role == UserRole::Admin,
+                session_ttl_secs: u.session_ttl_secs,
+                totp_enrolled: u.totp_enrolled,
+                disabled: u.disabled,
+                locked: u.locked,
+            })
+            .collect()
+    }
+
+    fn create_user(
+        &mut self,
+        username: &str,
+        password: &str,
+        admin: bool,
+        session_ttl_secs: u64,
+        no_totp: bool,
+    ) -> Result<String, String> {
+        let role = if admin {
+            UserRole::Admin
+        } else {
+            UserRole::Viewer
+        };
+        let ttl = if session_ttl_secs == 0 {
+            crate::users::DEFAULT_SESSION_TTL_SECS
+        } else {
+            session_ttl_secs
+        };
+        // Refused here rather than at the first login it makes impossible: an
+        // account whose sessions the provider will not sign is an account that
+        // looks created and is not usable, and the operator finds out from
+        // somebody else's failed sign-in.
+        check_cert_ttl(ttl, self.allow_unbounded_cert_ttl)?;
+
+        let mut user = UserRecord::new(username, password, role, ttl)?;
+        if no_totp {
+            user = user.without_totp();
+        }
+        // Read out before the record moves into the store: this is the only
+        // moment the secret is available, here or anywhere else.
+        let uri = user.totp_enrolment_uri("wayfinder").unwrap_or_default();
+        self.add_user(user)?;
+        Ok(uri)
+    }
+
+    fn remove_user(&mut self, username: &str) -> Result<(), String> {
+        // Counted before the removal rather than after, so the check reads as
+        // the question being asked: would this leave the mesh with nobody who
+        // can administer it? A disabled account is not an answer to that — it
+        // obtains no session and so administers nothing.
+        let last_admin = self
+            .log
+            .users()
+            .iter()
+            .filter(|u| u.role == UserRole::Admin && !u.disabled)
+            .all(|u| u.username == username);
+        let is_enabled_admin = self
+            .log
+            .users()
+            .iter()
+            .any(|u| u.username == username && u.role == UserRole::Admin && !u.disabled);
+        if is_enabled_admin && last_admin {
+            return Err(
+                "refusing to remove the last administrator: no account would be left that can \
+                 administer this mesh over the management API. Create another administrator \
+                 first, or remove this one with `wayfinderctl user remove` on the provider host."
+                    .to_string(),
+            );
+        }
+        CertAuthority::remove_user(self, username)
+    }
+
     fn revoke(&mut self, node_mac: &[u8]) -> Result<Vec<u8>, String> {
         if self.now_unix == 0 {
             return Err("authority clock not set; cannot sign revocations yet".to_string());
@@ -729,6 +1044,297 @@ mod tests {
             CsrOutcome::Issued(data) => data.cert,
             other => panic!("expected Issued, got {other:?}"),
         }
+    }
+
+    /// Build a CA with one account, returning the CA and the account's TOTP
+    /// secret so a test can compute a live code.
+    fn ca_with_user(role: UserRole, ttl_secs: u64) -> (CertAuthority, Vec<u8>) {
+        let mut ca = open_ca();
+        let user = UserRecord::new("ops", "hunter2", role, ttl_secs).unwrap();
+        let secret = user.totp_secret.clone().unwrap();
+        ca.add_user(user).unwrap();
+        (ca, secret)
+    }
+
+    /// The current TOTP code for `secret` at the CA's clock.
+    fn live_code(secret: &[u8], now: u64) -> String {
+        crate::users::totp_code_for_tests(secret, now)
+    }
+
+    /// The whole login: correct credentials yield a certificate that verifies
+    /// against this CA's own anchor, carries the account's capability and the
+    /// user bit, and is bound to the session key the client named.
+    #[test]
+    fn a_valid_login_issues_a_session_certificate() {
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        let (ed, x) = node_keys(2);
+        let code = live_code(&secret, 100);
+
+        let data = match ca
+            .authenticate_user("ops", "hunter2", &code, &ed, &x)
+            .unwrap()
+        {
+            UserAuthOutcome::Issued(data) => data,
+            other => panic!("expected Issued, got {other:?}"),
+        };
+
+        let anchor = TrustAnchor::from_bytes(&data.trust_anchor).unwrap();
+        let cert = MembershipCert::from_bytes(&data.cert).unwrap();
+        let verified = anchor.verify_cert(&cert, 500).expect("verifies in window");
+
+        assert!(verified.user, "a session certificate carries the user bit");
+        assert!(
+            verified.admin,
+            "an Admin account mints an admin certificate"
+        );
+        assert!(
+            !verified.viewer,
+            "admin subsumes viewer rather than joining it"
+        );
+        assert_eq!(verified.ed_pubkey, ed, "bound to the key the client named");
+        assert_eq!(
+            verified.not_after,
+            100 + 900,
+            "the account's own lifetime, not the authority's cert_ttl_secs"
+        );
+        // The MAC is derived from the session key, so it is the CA's to compute
+        // and never contends with a device MAC a client could name.
+        assert_eq!(verified.mac, wayfinder_auth::derive_mac(&ed));
+    }
+
+    /// A Viewer account mints a read-only certificate. §7 decision 3: the role
+    /// is the account's, so this is the same code path with one field changed
+    /// rather than a different request.
+    #[test]
+    fn a_viewer_account_mints_a_viewer_certificate() {
+        let (mut ca, secret) = ca_with_user(UserRole::Viewer, 900);
+        let (ed, x) = node_keys(2);
+        let code = live_code(&secret, 100);
+
+        let data = match ca
+            .authenticate_user("ops", "hunter2", &code, &ed, &x)
+            .unwrap()
+        {
+            UserAuthOutcome::Issued(data) => data,
+            other => panic!("expected Issued, got {other:?}"),
+        };
+        let anchor = TrustAnchor::from_bytes(&data.trust_anchor).unwrap();
+        let verified = anchor
+            .verify_cert(&MembershipCert::from_bytes(&data.cert).unwrap(), 500)
+            .unwrap();
+        assert!(verified.viewer && !verified.admin && verified.user);
+    }
+
+    /// Every wrong-credential path is `Ok(Rejected)`, never `Err`: `Err` is for
+    /// an unserviceable request and carries a message, which is exactly what a
+    /// guessing client must not get.
+    #[test]
+    fn wrong_credentials_are_a_rejection_not_an_error() {
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        let (ed, x) = node_keys(2);
+        let code = live_code(&secret, 100);
+
+        for (label, user, password, totp) in [
+            ("wrong password", "ops", "wrong", code.as_str()),
+            ("wrong code", "ops", "hunter2", "000000"),
+            ("unknown account", "nobody", "hunter2", code.as_str()),
+        ] {
+            assert!(
+                matches!(
+                    ca.authenticate_user(user, password, totp, &ed, &x).unwrap(),
+                    UserAuthOutcome::Rejected
+                ),
+                "{label} must be a rejection"
+            );
+        }
+    }
+
+    /// A code is spent once. The skew window makes three codes live at any
+    /// instant, so without the replay guard a code seen in transit would stay
+    /// usable — and here that would mean a second session certificate.
+    #[test]
+    fn a_login_code_cannot_be_replayed() {
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        let (ed, x) = node_keys(2);
+        let code = live_code(&secret, 100);
+
+        assert!(matches!(
+            ca.authenticate_user("ops", "hunter2", &code, &ed, &x)
+                .unwrap(),
+            UserAuthOutcome::Issued(_)
+        ));
+        assert!(matches!(
+            ca.authenticate_user("ops", "hunter2", &code, &ed, &x)
+                .unwrap(),
+            UserAuthOutcome::Rejected
+        ));
+    }
+
+    /// A disabled account cannot log in even with correct credentials — which
+    /// is the point of the flag: an operator cuts an account off now, rather
+    /// than waiting for a certificate to expire.
+    #[test]
+    fn a_disabled_account_cannot_log_in() {
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        let (ed, x) = node_keys(2);
+        ca.update_user("ops", |u| u.disabled = true).unwrap();
+        let code = live_code(&secret, 100);
+
+        assert!(matches!(
+            ca.authenticate_user("ops", "hunter2", &code, &ed, &x)
+                .unwrap(),
+            UserAuthOutcome::Rejected
+        ));
+    }
+
+    /// A session certificate is recorded for `ListCerts` and flagged as a
+    /// user's, and expired session records are reclaimed rather than
+    /// accumulating one per login forever — a user's MAC is fresh every time,
+    /// so nothing else would ever replace them.
+    #[test]
+    fn session_records_are_listed_and_expired_ones_reclaimed() {
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        let (ed, x) = node_keys(2);
+
+        let code = live_code(&secret, 100);
+        ca.authenticate_user("ops", "hunter2", &code, &ed, &x)
+            .unwrap();
+        let listed = ca.list_certs();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].user && listed[0].admin);
+
+        // Well past the first session's expiry, with a different session key:
+        // the stale record goes and the new one takes its place.
+        ca.set_now_unix(10_000);
+        let (ed2, x2) = node_keys(3);
+        let code = live_code(&secret, 10_000);
+        ca.authenticate_user("ops", "hunter2", &code, &ed2, &x2)
+            .unwrap();
+        let listed = ca.list_certs();
+        assert_eq!(listed.len(), 1, "the expired session record was reclaimed");
+        assert_eq!(listed[0].ed_pubkey, ed2.to_vec());
+    }
+
+    /// A device's issued record is *not* reclaimed by a login, however stale:
+    /// a device's history — and its revocation flag — is not this path's to
+    /// discard.
+    #[test]
+    fn a_login_does_not_reclaim_a_device_record() {
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        let (dev_ed, dev_x) = node_keys(4);
+        issued_cert(&mut ca, &[0, 0, 0, 0, 0, 9], &dev_ed, &dev_x, "");
+
+        ca.set_now_unix(10_000_000);
+        let (ed, x) = node_keys(2);
+        let code = live_code(&secret, 10_000_000);
+        ca.authenticate_user("ops", "hunter2", &code, &ed, &x)
+            .unwrap();
+
+        assert_eq!(
+            ca.list_certs().iter().filter(|c| !c.user).count(),
+            1,
+            "the long-expired device record is still on file"
+        );
+    }
+
+    /// Adding a duplicate account name is refused, and the summary an operator
+    /// reads carries no password hash or TOTP secret.
+    #[test]
+    fn user_administration_refuses_duplicates_and_leaks_no_secrets() {
+        let (mut ca, _) = ca_with_user(UserRole::Admin, 900);
+        assert!(
+            ca.add_user(UserRecord::new("ops", "other", UserRole::Viewer, 60).unwrap())
+                .is_err()
+        );
+
+        let summaries = ca.list_users();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].username, "ops");
+        assert_eq!(summaries[0].role, UserRole::Admin);
+        assert!(summaries[0].totp_enrolled);
+        assert!(!summaries[0].disabled && !summaries[0].locked);
+
+        ca.remove_user("ops").unwrap();
+        assert!(ca.list_users().is_empty());
+        assert!(ca.remove_user("ops").is_err());
+    }
+
+    /// Removing an account over the management API is refused when it is the
+    /// last one that can still administer the mesh.
+    ///
+    /// `RemoveUser` needs a full management grant, and in login mode only an
+    /// admin account's session can obtain one — so an authority left with no
+    /// enabled administrator is one whose user store cannot be changed over the
+    /// network at all, in either direction. The way back is `wayfinderctl user
+    /// add` on the provider host, which needs a shell there and a maintenance
+    /// window. One unconfirmed click should not cost that.
+    ///
+    /// The guard is on this path and deliberately not on the inherent
+    /// [`CertAuthority::remove_user`], which is the offline tool's raw store
+    /// operation and the recovery path this refusal points at.
+    #[test]
+    fn removing_the_last_administrator_is_refused_over_the_api() {
+        let (mut ca, _) = ca_with_user(UserRole::Admin, 900);
+        ca.add_user(UserRecord::new("watcher", "other-password", UserRole::Viewer, 900).unwrap())
+            .unwrap();
+
+        // A viewer goes freely: the mesh is still administrable without it.
+        MeshAuthority::remove_user(&mut ca, "watcher").unwrap();
+
+        let err = MeshAuthority::remove_user(&mut ca, "ops").unwrap_err();
+        assert!(
+            err.contains("administrator"),
+            "the refusal says what it is protecting, so an operator can act on \
+             it rather than retry it: {err}"
+        );
+        assert_eq!(ca.list_users().len(), 1, "and the account is still there");
+    }
+
+    /// A second administrator makes the first removable — but only while it can
+    /// actually sign in. A disabled account obtains no session and so
+    /// administers nothing, which makes "there are two admins on file" the
+    /// wrong question to ask.
+    #[test]
+    fn a_disabled_administrator_is_not_the_one_left_standing() {
+        let (mut ca, _) = ca_with_user(UserRole::Admin, 900);
+        ca.add_user(UserRecord::new("second", "other-password", UserRole::Admin, 900).unwrap())
+            .unwrap();
+        ca.update_user("second", |user| user.disabled = true)
+            .unwrap();
+
+        assert!(
+            MeshAuthority::remove_user(&mut ca, "ops").is_err(),
+            "the only account that can still administer the mesh is not removable"
+        );
+
+        ca.update_user("second", |user| user.disabled = false)
+            .unwrap();
+        MeshAuthority::remove_user(&mut ca, "ops").unwrap();
+        assert_eq!(ca.list_users().len(), 1);
+    }
+
+    /// An unknown name is an error rather than a silent success: whoever typed
+    /// it has a wrong idea about the roster, and reporting nothing leaves them
+    /// with it.
+    #[test]
+    fn removing_an_unknown_account_is_refused() {
+        let (mut ca, _) = ca_with_user(UserRole::Admin, 900);
+        assert!(MeshAuthority::remove_user(&mut ca, "nobody").is_err());
+    }
+
+    /// A login is refused before the clock is set, for the same reason a CSR
+    /// is: the certificate's window would start at the epoch and be over
+    /// already.
+    #[test]
+    fn a_login_is_refused_before_the_clock_is_set() {
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, true);
+        ca.add_user(UserRecord::new("ops", "hunter2", UserRole::Admin, 900).unwrap())
+            .unwrap();
+        let (ed, x) = node_keys(2);
+        assert!(
+            ca.authenticate_user("ops", "hunter2", "000000", &ed, &x)
+                .is_err()
+        );
     }
 
     #[test]

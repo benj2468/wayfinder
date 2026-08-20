@@ -39,6 +39,10 @@ serde.workspace = true
 # is reached from the server rather than the browser.
 wayfinder-client = { workspace = true, optional = true }
 wayfinder-auth = { workspace = true, features = ["std"], optional = true }
+# The `.wfauth` bundle is JSON, so a person who opens the file months later
+# finds named fields rather than a wall of hex. Server-side only: the browser
+# carries the file's bytes and never looks inside them.
+serde_json = { workspace = true, optional = true }
 leptos_axum = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
@@ -65,10 +69,17 @@ wasm-bindgen = { version = "=0.2.126", optional = true }
 # happen to enable. Listing them here means a leptos upgrade that trims its
 # features cannot silently break the copy buttons.
 web-sys = { version = "0.3", optional = true, features = [
+  "Blob",
   "Document",
   "Element",
+  "Event",
+  "EventTarget",
+  "File",
+  "FileList",
+  "FileReader",
   "HtmlDocument",
   "HtmlElement",
+  "HtmlInputElement",
   "HtmlTextAreaElement",
   "Node",
   "Window",
@@ -83,6 +94,7 @@ default = []
 ssr = [
   "dep:wayfinder-client",
   "dep:wayfinder-auth",
+  "dep:serde_json",
   "dep:leptos_axum",
   "dep:axum",
   "dep:tokio",
@@ -113,6 +125,14 @@ mock-node = [
 ]
 
 [dev-dependencies]
+# `tests/render.rs` renders tabs outside a server, and a tab holding a
+# `Resource` spawns its fetcher even to render the fallback — which needs an
+# executor installed. Leptos does not re-export this, so the test harness
+# installs one itself.
+any_spawner = { version = "0.3", features = ["futures-executor"] }
+# `bundle.rs`'s tests mint a real certificate and need its wire bytes, which is
+# the `IntoBytes` trait rather than an inherent method.
+zerocopy.workspace = true
 # The integration tests drive a poll against the real `serve_tls_server` (see
 # the `mock-node` feature) rather than a stubbed client, so they catch a framing
 # or field-wiring mistake the way a live node would.

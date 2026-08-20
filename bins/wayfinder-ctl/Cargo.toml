@@ -16,6 +16,12 @@ path = "src/lib.rs"
 
 [dependencies]
 wayfinder-client.workspace = true
+# The offline `user` subcommands administer the certificate authority's user
+# store directly, the way `cert init-ca` administers the root seed: the first
+# account cannot be created over the management API, because creating it needs
+# the credential it creates.
+wayfinder-server.workspace = true
+wayfinder.workspace = true
 wayfinder-protos = { workspace = true, features = ["serde"] }
 wayfinder-auth = { workspace = true, features = ["std"] }
 interfaces.workspace = true
@@ -26,7 +32,9 @@ zerocopy.workspace = true
 rand = { workspace = true, features = ["std"] }
 serde.workspace = true
 serde_json = "1"
+# Reading a password from a terminal without echoing it.
+rpassword.workspace = true
 
 [dev-dependencies]
-wayfinder-server.workspace = true
 tempfile = "3"
+wayfinder-auth = { workspace = true, features = ["std"] }

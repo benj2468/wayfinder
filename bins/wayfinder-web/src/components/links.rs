@@ -178,6 +178,10 @@ fn LinkDetail(
 }
 
 /// One gate, as a switch that applies immediately.
+///
+/// Drawn and disabled for a read-only account rather than omitted: which links
+/// a node is announcing on is part of the picture someone signs in to read, and
+/// a gate that is simply absent reads as an interface with no gates at all.
 #[component]
 fn GateSwitch(
     /// Interface to reconfigure.
@@ -214,6 +218,7 @@ fn GateSwitch(
             class="wf-gate"
             aria-checked=move || if checked.get() { "true" } else { "false" }
             title=gate.help()
+            disabled=move || !dash.admin.get()
             on:click=toggle
         >
             <span class="wf-gate-track" class:wf-gate-on=move || checked.get()>

@@ -8,7 +8,18 @@ Each section's own "Implemented" note has the detail; in short — §3.1's
 proof-of-possession option (item 4) was deliberately **not** taken, a
 resolved threat-model decision (enrolling a node on another's behalf stays
 supported), not a gap; everything else in §§3.1–3.5 is done. **§4 (secondary
-items) is untouched** — out of scope for this pass.
+items) is untouched** — out of scope for this pass, and has since been closed
+anyway by `06-management-api-authentication.md` (its enrollment-token item as
+F8, its polling-loop and sum-type items folded into that design's own scope).
+
+**Counts below are pinned to this pass's landing, not to the current tree.**
+`every_request_kind` had 22 variants when §3.5 landed; `06-...`'s Phase 3
+(user accounts) added four more (`AuthenticateUser`, `ListUsers`,
+`CreateUser`, `RemoveUser`) and its Phase 2 added `RevealEnrollmentToken`, so
+the request surface `permits` covers today has 27. The shape §3.5 established
+— a hand-maintained enumeration with a hard count assertion — is what caught
+none of those slipping in silently; it did its job by forcing each one to be
+decided at `06-...`'s authz.rs, not by staying 22 forever.
 
 **Scope:** `libs/wayfinder-server` (`authz.rs`, `authority.rs`,
 `persistence.rs`, `adapter.rs`, `transport.rs`) and the enrollment panel in
@@ -150,7 +161,17 @@ specifically on `GrantedEnrollment` connections. The map backing it is itself
 bounded (`MAX_TRACKED_SOURCES = 1024`, evicting the least-recently-touched
 bucket past that — safe, since an evicted source just starts over at full
 burst capacity), so it does not reproduce the unbounded-growth problem it
-exists to bound. Covered by
+exists to bound.
+
+**Since generalized.** `EnrollmentLimiter` was renamed `SourceLimiter`, with
+`for_enrollment()`/`for_connections()` constructors, when
+`06-management-api-authentication.md`'s Phase 1 item 2 reused this exact
+bucket shape for a per-IP *connection* cap on the pre-authentication surface —
+the type was widened rather than duplicated. Every reference to
+`EnrollmentLimiter` below names what this section originally shipped; read it
+as `SourceLimiter::for_enrollment()` in the current tree.
+
+Covered by
 `submit_csr_on_the_enrollment_tier_is_rate_limited_per_source` (through the
 real `serve_authenticated_stream` gate: the burst succeeds, one more is
 refused, a non-`SubmitCsr` request on the same connection is unaffected),

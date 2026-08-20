@@ -37,6 +37,8 @@ mod revoke;
 mod authority;
 
 pub use cert::CERT_FLAG_ADMIN;
+pub use cert::CERT_FLAG_USER;
+pub use cert::CERT_FLAG_VIEWER;
 pub use cert::CERT_VERSION;
 pub use cert::MembershipCert;
 pub use cert::TrustAnchor;

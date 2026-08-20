@@ -31,6 +31,9 @@ use tokio_util::codec::Framed;
 use tokio_util::codec::LengthDelimitedCodec;
 use wayfinder_protos::wayfinder::v1alpha::ApproveCsrRequest;
 use wayfinder_protos::wayfinder::v1alpha::AuthenticateRequest;
+use wayfinder_protos::wayfinder::v1alpha::AuthenticateUserRequest;
+use wayfinder_protos::wayfinder::v1alpha::AuthenticateUserResponse;
+use wayfinder_protos::wayfinder::v1alpha::CreateUserRequest;
 use wayfinder_protos::wayfinder::v1alpha::DenyCsrRequest;
 use wayfinder_protos::wayfinder::v1alpha::EnrollmentPolicy;
 use wayfinder_protos::wayfinder::v1alpha::GetKeepAliveTableRequest;
@@ -54,10 +57,13 @@ use wayfinder_protos::wayfinder::v1alpha::ListCertsRequest;
 use wayfinder_protos::wayfinder::v1alpha::ListCertsResponse;
 use wayfinder_protos::wayfinder::v1alpha::ListPendingCsrsRequest;
 use wayfinder_protos::wayfinder::v1alpha::ListPendingCsrsResponse;
+use wayfinder_protos::wayfinder::v1alpha::ListUsersRequest;
+use wayfinder_protos::wayfinder::v1alpha::ListUsersResponse;
 use wayfinder_protos::wayfinder::v1alpha::LogRecords;
 use wayfinder_protos::wayfinder::v1alpha::NodeInfo;
 use wayfinder_protos::wayfinder::v1alpha::NodeMetrics;
 use wayfinder_protos::wayfinder::v1alpha::OgmSchedule;
+use wayfinder_protos::wayfinder::v1alpha::RemoveUserRequest;
 use wayfinder_protos::wayfinder::v1alpha::ResolveRouteRequest;
 use wayfinder_protos::wayfinder::v1alpha::ResolveRouteResponse;
 use wayfinder_protos::wayfinder::v1alpha::RevokeNodeRequest;
@@ -724,6 +730,36 @@ impl Client {
         }
     }
 
+    /// Provider mode: exchange a user's credentials for a short-lived
+    /// management certificate bound to the session keys given.
+    ///
+    /// Runs on the enrollment tier, so this is callable on a connection holding
+    /// no certificate at all — which is what a client that has not logged in
+    /// yet is. The password and code are sent over the authenticated TLS
+    /// channel and never persisted by either side.
+    pub async fn authenticate_user(
+        &mut self,
+        username: &str,
+        password: &str,
+        totp_code: &str,
+        ed_pubkey: &[u8],
+        x_pubkey: &[u8],
+    ) -> anyhow::Result<AuthenticateUserResponse> {
+        match self
+            .request(RequestKind::AuthenticateUser(AuthenticateUserRequest {
+                username: username.to_string(),
+                password: password.to_string(),
+                totp_code: totp_code.to_string(),
+                ed_pubkey: ed_pubkey.to_vec(),
+                x_pubkey: x_pubkey.to_vec(),
+            }))
+            .await?
+        {
+            ResponseKind::AuthenticateUser(resp) => Ok(resp),
+            other => Err(unexpected("AuthenticateUser", &other)),
+        }
+    }
+
     /// Provider mode: revoke `node_mac` from the mesh (the provider signs and
     /// floods a revocation record).
     pub async fn revoke_node(&mut self, node_mac: &[u8]) -> anyhow::Result<()> {
@@ -746,6 +782,73 @@ impl Client {
         {
             ResponseKind::ListCerts(resp) => Ok(resp),
             other => Err(unexpected("ListCerts", &other)),
+        }
+    }
+
+    /// Provider mode: list the certificate authority's user accounts.
+    ///
+    /// Needs a full management grant — the roster of who may administer the
+    /// mesh is not on the read-only tier.
+    pub async fn list_users(&mut self) -> anyhow::Result<ListUsersResponse> {
+        match self
+            .request(RequestKind::ListUsers(ListUsersRequest {}))
+            .await?
+        {
+            ResponseKind::ListUsers(resp) => Ok(resp),
+            other => Err(unexpected("ListUsers", &other)),
+        }
+    }
+
+    /// Provider mode: create a user account, returning the `otpauth://`
+    /// enrolment URI for its second factor (empty when `no_totp`).
+    ///
+    /// The URI comes back exactly once. The authority cannot serve it again —
+    /// the secret is not recoverable from it — so a caller that discards this
+    /// value has created an account whose second factor nobody can enrol.
+    ///
+    /// `session_ttl_secs` of zero takes the authority's default.
+    pub async fn create_user(
+        &mut self,
+        username: &str,
+        password: &str,
+        admin: bool,
+        session_ttl_secs: u64,
+        no_totp: bool,
+    ) -> anyhow::Result<String> {
+        match self
+            .request(RequestKind::CreateUser(CreateUserRequest {
+                username: username.to_string(),
+                password: password.to_string(),
+                admin,
+                session_ttl_secs,
+                no_totp,
+            }))
+            .await?
+        {
+            ResponseKind::CreateUser(resp) => Ok(resp.totp_enrolment_uri),
+            other => Err(unexpected("CreateUser", &other)),
+        }
+    }
+
+    /// Provider mode: remove a user account.
+    ///
+    /// Ends the account's ability to obtain *new* sessions. A certificate
+    /// already issued to it keeps working until it expires or is revoked, so an
+    /// account believed compromised needs [`revoke_node`](Self::revoke_node) as
+    /// well as this.
+    ///
+    /// Errors when the name is not on file, and when it is the last account
+    /// that can still administer the mesh — the authority refuses to leave
+    /// itself with no administrator.
+    pub async fn remove_user(&mut self, username: &str) -> anyhow::Result<()> {
+        match self
+            .request(RequestKind::RemoveUser(RemoveUserRequest {
+                username: username.to_string(),
+            }))
+            .await?
+        {
+            ResponseKind::Empty(_) => Ok(()),
+            other => Err(unexpected("RemoveUser", &other)),
         }
     }
 
@@ -789,6 +892,48 @@ impl Client {
     }
 }
 
+/// Complete a TLS handshake against `addr` purely to learn the raw public key
+/// the node presents, then hang up without sending a request.
+///
+/// This exists for one caller: the first connection to a node whose key is not
+/// yet recorded, where the operator has to be shown a fingerprint before
+/// anything can be pinned. It is the same bind SSH is in — there is no way to
+/// ask a host what key it has except by asking the host — and the same
+/// resolution: connect once, show the fingerprint, let a human decide.
+///
+/// **Nothing is trusted as a result.** The connection carries no request, its
+/// key is verified only to the extent that the peer proved possession of it,
+/// and the caller must confirm the value with a person before using it as a
+/// pin. A programmatic caller that skips that confirmation has built an
+/// unauthenticated management client.
+pub async fn probe_node_key(addr: SocketAddr) -> anyhow::Result<[u8; 32]> {
+    // An ephemeral identity: this connection issues no request, so what it
+    // presents is never authorized against anything, and minting a throwaway
+    // key avoids reaching for a real one to do it.
+    let mut seed = [0u8; 32];
+    rand::fill(&mut seed);
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let config = crate::tls::probing_client_config(&seed, seen.clone())
+        .map_err(|e| anyhow!("building management TLS probe config: {e}"))?;
+    let connector = TlsConnector::from(config);
+    let tcp = TcpStream::connect(addr)
+        .await
+        .with_context(|| format!("connecting to tls://{addr}"))?;
+    let server_name = ServerName::try_from("wayfinder-node")
+        .map_err(|_| anyhow!("internal: static server name is invalid"))?;
+    let _tls = connector
+        .connect(server_name, tcp)
+        .await
+        .context("TLS handshake with the management API")?;
+
+    let key = seen
+        .lock()
+        .map_err(|_| anyhow!("internal: probe slot poisoned"))?
+        .ok_or_else(|| anyhow!("the node completed a handshake without presenting a raw key"))?;
+    Ok(key)
+}
+
 /// Build an error for a response variant that does not match the request.
 fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
     let got = match got {
@@ -811,6 +956,9 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
         ResponseKind::ListPendingCsrs(_) => "ListPendingCsrs",
         ResponseKind::Logs(_) => "Logs",
         ResponseKind::LogFilter(_) => "LogFilter",
+        ResponseKind::AuthenticateUser(_) => "AuthenticateUser",
+        ResponseKind::ListUsers(_) => "ListUsers",
+        ResponseKind::CreateUser(_) => "CreateUser",
     };
     anyhow!("expected {want} response, got {got}")
 }

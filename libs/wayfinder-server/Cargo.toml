@@ -27,6 +27,11 @@ std = [
     "wayfinder-auth/std",
     "dep:wayfinder-storage",
     "wayfinder-storage/std",
+    "dep:argon2",
+    "dep:hmac",
+    "dep:sha1",
+    "dep:subtle",
+    "dep:rand",
 ]
 # The `no_std` + `alloc` embedded management transport: length-delimited request
 # framing over an `embedded-io-async` byte stream (`framing`) and the
@@ -74,6 +79,16 @@ anyhow = { workspace = true, optional = true }
 # CA-state snapshot persistence (authority.rs), std-only.
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+# The certificate authority's user store (`users.rs`), std-only: Argon2id
+# password verification, the HMAC-SHA1 primitive RFC 6238 TOTP is built on,
+# constant-time comparison, and the CSPRNG that mints TOTP secrets and salts.
+# An embedded node links none of this — it never learns what a password is (see
+# §4 of docs/design/06-management-api-authentication.md).
+argon2 = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+sha1 = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
 
 # The embedded management transport (`embedded` feature): the byte-stream I/O
 # trait the framing reads/writes over, and the SPSC channel the `serve` loop
