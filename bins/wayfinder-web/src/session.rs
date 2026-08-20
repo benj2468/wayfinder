@@ -56,6 +56,7 @@
 //! [`SessionStore::export`] is what produces one, and it hands out only the
 //! credential belonging to the session asking for it.
 
+use crate::TabDef;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -128,6 +129,17 @@ impl Viewer {
             Viewer::Static => true,
             Viewer::LoggedOut => false,
             Viewer::LoggedIn(info) => info.admin,
+        }
+    }
+
+    /// Whether this viewer has permission to view a specific Tab
+    ///
+    /// Tabs will be hidden from the tab bar if the viewer does not have permission to view them.
+    #[must_use]
+    pub fn can_view(&self, tab: &TabDef) -> bool {
+        match tab.path {
+            "provider" => self.can_administer(),
+            _ => true,
         }
     }
 }

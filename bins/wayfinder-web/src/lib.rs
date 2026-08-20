@@ -216,7 +216,7 @@ pub fn App() -> impl IntoView {
             <div class="wf-app">
                 <div class="wf-shell">
                     <Header dash=dash />
-                    <TabBar />
+                    <TabBar viewer=viewer dash=dash />
                     <StatusStrip dash=dash />
                     <main class="wf-main">
                         <Routes fallback=|| view! { <p class="wf-empty">"Not found."</p> }>
@@ -409,19 +409,46 @@ fn StatusStrip(
 /// browser's back button and a copied URL both work — two things a terminal
 /// dashboard cannot offer, and the first thing a non-technical user reaches for.
 #[component]
-fn TabBar() -> impl IntoView {
+fn TabBar(viewer: ViewerResource, dash: Dashboard) -> impl IntoView {
+    let security = move || {
+        dash.snapshot
+            .with(|s| s.as_ref().and_then(|s| s.security.clone()))
+    };
+
+    let enrollment = Memo::new(move |_| security().and_then(|s| s.enrollment));
+
     view! {
         <nav class="wf-tabs">
-            {TABS
-                .iter()
-                .map(|tab| {
-                    view! {
-                        <A href=format!("/{}", tab.path) attr:class="wf-tab">
-                            {tab.title}
-                        </A>
-                    }
-                })
-                .collect_view()}
+            {move || {
+                // 1. Read the resource reactively using .get() or .with()
+                let current_viewer = viewer.get();
+                let enrollment = enrollment.get();
+
+                TABS
+                    .iter()
+                    .filter(|tab| {
+                        match tab.path {
+                            "provider" => enrollment.is_some(),
+                            _ => true,
+                        }
+                    })
+                    .filter(|tab| {
+                        // 2. Check permissions safely against the reactive data
+                        current_viewer
+                            .as_ref()
+                            .and_then(|res| res.as_ref().ok())
+                            .map(|v| v.can_view(tab))
+                            .unwrap_or_default()
+                    })
+                    .map(|tab| {
+                        view! {
+                            <A href=format!("/{}", tab.path) attr:class="wf-tab">
+                                {tab.title}
+                            </A>
+                        }
+                    })
+                    .collect_view()
+            }}
         </nav>
     }
 }
