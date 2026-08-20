@@ -40,6 +40,7 @@ fn issue_into_tmp(mesh_id: u32) -> (tempfile::TempDir, Vec<u8>, Vec<u8>) {
         not_after: 1_000_000,
         out_cert: cert.clone(),
         admin: false,
+        viewer: false,
     })
     .unwrap();
 
@@ -100,6 +101,7 @@ fn issue_without_mac_derives_it_from_the_node_seed() {
         not_after: 1_000_000,
         out_cert: cert.clone(),
         admin: false,
+        viewer: false,
     })
     .unwrap();
 
@@ -184,6 +186,7 @@ fn an_admin_issued_cert_verifies_as_admin() {
         not_after: 1_000_000,
         out_cert: cert_path.clone(),
         admin: true,
+        viewer: false,
     })
     .unwrap();
 
@@ -193,6 +196,61 @@ fn an_admin_issued_cert_verifies_as_admin() {
     assert!(
         anchor.verify_cert(&cert, 100).unwrap().admin,
         "--admin must set the capability the management API authorizes on"
+    );
+}
+
+/// `--viewer` issues a read-only management credential: the viewer capability
+/// set, the admin capability *not* set, and the user bit set — because a
+/// read-only credential belongs to a person, not to a node that routes.
+///
+/// The negative half is the load-bearing one. A viewer certificate that also
+/// verified as an admin would be the tier collapsing into the thing it exists
+/// to be less than.
+#[test]
+fn a_viewer_issued_cert_verifies_as_viewer_and_not_admin() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root.seed");
+    let anchor_path = dir.path().join("anchor.bin");
+    let node = dir.path().join("node.seed");
+    let cert_path = dir.path().join("node.cert");
+
+    cert::run(CertCommand::InitCa {
+        mesh_id: 0xABCD,
+        seed: None,
+        generate: true,
+        out_seed: Some(root.clone()),
+        out_anchor: anchor_path.clone(),
+    })
+    .unwrap();
+    cert::run(CertCommand::Keygen {
+        out_seed: Some(node.clone()),
+    })
+    .unwrap();
+    cert::run(CertCommand::Issue {
+        ca_seed: root,
+        mesh_id: 0xABCD,
+        mac: None,
+        node_seed: node,
+        not_before: 0,
+        not_after: 1_000_000,
+        out_cert: cert_path.clone(),
+        admin: false,
+        viewer: true,
+    })
+    .unwrap();
+
+    let anchor = TrustAnchor::from_bytes(&std::fs::read(&anchor_path).unwrap()).unwrap();
+    let cert = MembershipCert::from_bytes(&std::fs::read(&cert_path).unwrap()).unwrap();
+    let verified = anchor.verify_cert(&cert, 100).unwrap();
+
+    assert!(
+        verified.viewer,
+        "--viewer must set the read-only capability"
+    );
+    assert!(!verified.admin, "--viewer must not confer administration");
+    assert!(
+        verified.user,
+        "a read-only credential is a person's, so it carries the user bit"
     );
 }
 
@@ -228,6 +286,7 @@ fn an_omitted_mac_binds_the_seed_derived_mac() {
         not_after: 1_000_000,
         out_cert: cert_path.clone(),
         admin: false,
+        viewer: false,
     })
     .unwrap();
 

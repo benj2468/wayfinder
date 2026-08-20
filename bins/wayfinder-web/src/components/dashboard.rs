@@ -26,6 +26,9 @@ use std::time::Duration;
 use leptos::prelude::*;
 
 use crate::api::fetch_snapshot;
+use crate::session::NEEDS_LOGIN;
+use crate::session::Viewer;
+use crate::session::ViewerResource;
 use crate::snapshot::NodeSnapshot;
 use crate::state::History;
 
@@ -53,6 +56,16 @@ pub struct Dashboard {
     pub connected: RwSignal<bool>,
     /// What the server is pointed at, for the header.
     pub label: RwSignal<String>,
+    /// Whether the viewer may change the node, rather than only read it.
+    ///
+    /// Mirrored out of the session resource by [`provide_dashboard`], for the
+    /// same reason `signed_out` is: every tab needs the answer, and a tab
+    /// reading a resource outside a `<Suspense>` is the hydration hazard this
+    /// crate cannot afford. Reading it from a plain signal costs an
+    /// administrator one frame of the read-only page after hydration, and that
+    /// is the direction to be wrong in — the fail-closed default means nothing
+    /// mutable is ever drawn for someone whose capability is not yet known.
+    pub admin: RwSignal<bool>,
 }
 
 impl Default for Dashboard {
@@ -70,6 +83,7 @@ impl Dashboard {
             error: RwSignal::new(None),
             connected: RwSignal::new(false),
             label: RwSignal::new(String::new()),
+            admin: RwSignal::new(false),
         }
     }
 
@@ -90,6 +104,28 @@ pub fn provide_dashboard() -> Dashboard {
     let dash = Dashboard::new();
     provide_context(dash);
 
+    // Whether there is anyone to poll *for*, mirrored out of the session
+    // resource into a plain signal.
+    //
+    // The mirroring is the point. The polling loop runs from a timer, which is
+    // neither a `<Suspense>` nor an effect, and reading a resource from one of
+    // those is what leptos warns about as a hydration hazard — once a second,
+    // forever, in this case. An effect is a sanctioned place to read it, so the
+    // read happens here and the timer reads the signal it wrote.
+    let signed_out = RwSignal::new(false);
+    let viewer = use_context::<ViewerResource>();
+    Effect::new(move |_| {
+        let seen = viewer.and_then(|viewer| viewer.get());
+        signed_out.set(matches!(seen, Some(Ok(Viewer::LoggedOut))));
+        // The other half of the same read, and mirrored for the same reason:
+        // what a viewer may *do* is asked by every tab that draws a control,
+        // none of which is a sanctioned place to touch the resource itself.
+        dash.admin.set(matches!(
+            seen,
+            Some(Ok(viewer)) if viewer.can_administer()
+        ));
+    });
+
     Effect::new(move |_| {
         // The label cannot change while the server runs, so it is fetched once
         // rather than riding along on every poll.
@@ -99,9 +135,9 @@ pub fn provide_dashboard() -> Dashboard {
             }
         });
 
-        poll_once(dash);
+        poll_once(dash, signed_out);
         leptos::leptos_dom::helpers::set_interval(
-            move || poll_once(dash),
+            move || poll_once(dash, signed_out),
             Duration::from_millis(POLL_INTERVAL_MS),
         );
     });
@@ -111,10 +147,17 @@ pub fn provide_dashboard() -> Dashboard {
 
 /// Issue one poll and fold the result into the dashboard.
 ///
-/// Reads the log cursor untracked: this runs from a timer, not from a reactive
-/// dependency, and tracking the cursor it is about to advance would make the
-/// poll retrigger itself.
-fn poll_once(dash: Dashboard) {
+/// Reads everything untracked: this runs from a timer, not from a reactive
+/// dependency, and tracking the log cursor it is about to advance would make
+/// the poll retrigger itself.
+fn poll_once(dash: Dashboard, signed_out: RwSignal<bool>) {
+    // A signed-out browser has no credential to poll with, so a poll would be
+    // one refusal per second behind a sign-in form nobody has filled in yet.
+    if signed_out.get_untracked() {
+        return;
+    }
+
+    let viewer = use_context::<ViewerResource>();
     let since_seq = dash.history.with_untracked(|h| h.next_seq);
 
     leptos::task::spawn_local(async move {
@@ -130,8 +173,18 @@ fn poll_once(dash: Dashboard) {
             }
             Err(e) => {
                 // The snapshot is left alone on purpose; see the module docs.
+                let error = e.to_string();
                 dash.connected.set(false);
-                dash.error.set(Some(e.to_string()));
+                // A session that has expired — or been ended elsewhere — is not
+                // a node that has gone away, and must not be rendered as one.
+                // Re-asking who the viewer is puts the login form up; the
+                // guard above then keeps the timer quiet until they sign in.
+                if let Some(viewer) = viewer
+                    && error.contains(NEEDS_LOGIN)
+                {
+                    viewer.refetch();
+                }
+                dash.error.set(Some(error));
             }
         }
     });

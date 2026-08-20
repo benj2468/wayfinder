@@ -7,6 +7,7 @@
 use clap::ValueEnum;
 use serde::Serialize;
 use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
+use wayfinder_protos::wayfinder::v1alpha::IssuedCert;
 use wayfinder_protos::wayfinder::v1alpha::KeepAliveTable;
 use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesTable;
 use wayfinder_protos::wayfinder::v1alpha::LinkQualityTable;
@@ -318,19 +319,41 @@ pub fn list_certs(v: &ListCertsResponse, fmt: OutputFormat) -> anyhow::Result<St
         if v.certs.is_empty() {
             return "no certificates issued".to_string();
         }
-        let mut out = String::from("NODE_MAC           NOT_BEFORE   NOT_AFTER    STATUS   ED25519");
+        let mut out = String::from(
+            "NODE_MAC           NOT_BEFORE   NOT_AFTER    STATUS   KIND           ED25519",
+        );
         for c in &v.certs {
             out.push_str(&format!(
-                "\n{:<18} {:>10} {:>10}   {:<7}  {}",
+                "\n{:<18} {:>10} {:>10}   {:<7}  {:<13}  {}",
                 format_mac(&c.node_mac),
                 c.not_before,
                 c.not_after,
                 if c.revoked { "revoked" } else { "active" },
+                cert_kind(c),
                 fingerprint(&c.ed_pubkey),
             ));
         }
         out
     })
+}
+
+/// A one-word description of what an issued certificate *is*, for the KIND
+/// column.
+///
+/// Both a person's session and a device's membership bind to a MAC, so without
+/// this the two are indistinguishable in the list — which is the whole reason
+/// `CERT_FLAG_USER` exists. The capability is folded in on the same line
+/// because "user" and "admin" are the two facts an operator scanning this
+/// column is looking for, and a second column for one bit would read worse.
+fn cert_kind(c: &IssuedCert) -> &'static str {
+    match (c.user, c.admin, c.viewer) {
+        (true, true, _) => "user/admin",
+        (true, _, true) => "user/viewer",
+        (true, _, _) => "user",
+        (false, true, _) => "device/admin",
+        (false, _, true) => "device/viewer",
+        (false, _, _) => "device",
+    }
 }
 
 /// Render the provider's [`ListPendingCsrsResponse`] (CSRs awaiting approval).

@@ -13,6 +13,8 @@
 
 pub mod cert;
 pub mod output;
+pub mod session;
+pub mod user;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -22,12 +24,14 @@ use anyhow::bail;
 use clap::Parser;
 use clap::Subcommand;
 use wayfinder_auth::Keypair;
+use wayfinder_auth::MembershipCert;
 use wayfinder_client::Client;
 // Re-exported so integration tests (and any embedder) can build the connection
 // endpoint the same way `run` does.
 pub use wayfinder_client::Endpoint;
 use wayfinder_protos::wayfinder::v1alpha::CsrIssued;
 use wayfinder_protos::wayfinder::v1alpha::LinkFeatures;
+use wayfinder_protos::wayfinder::v1alpha::authenticate_user_response::Outcome as UserOutcome;
 use wayfinder_protos::wayfinder::v1alpha::link_features::TxKeepaliveUpdate;
 use wayfinder_protos::wayfinder::v1alpha::submit_csr_response::Outcome as CsrOutcome;
 
@@ -276,6 +280,24 @@ pub enum Command {
     /// Offline certificate / trust-anchor tooling (no node connection).
     #[command(subcommand)]
     Cert(cert::CertCommand),
+    /// Offline administration of a provider's user accounts (no node
+    /// connection).
+    #[command(subcommand)]
+    User(user::UserCommand),
+    /// Log in to a provider and store the session it issues, so every other
+    /// subcommand finds a credential with no flags.
+    Login {
+        /// The provider's `IP:port`. Defaults to `--connect`.
+        #[arg(long)]
+        provider: Option<SocketAddr>,
+        /// The account to log in as.
+        #[arg(long)]
+        user: String,
+    },
+    /// Delete the stored session.
+    Logout,
+    /// Print what credential this client is holding and when it stops working.
+    Whoami,
 }
 
 /// Operator actions on pending certificate-signing requests (provider mode).
@@ -302,16 +324,232 @@ pub enum CsrCommand {
 /// not supplied.  The seed/cert reads and node-key resolution live in
 /// [`Endpoint::load`], shared with the TUI so both accept the same inputs.
 fn build_endpoint(cli: &Cli) -> anyhow::Result<Endpoint> {
-    let identity_path = cli
-        .identity
-        .as_ref()
-        .context("--identity <seed-path> is required to reach a node's TLS management API")?;
-    Endpoint::load(
-        cli.connect,
-        identity_path,
-        cli.cert.as_deref(),
-        cli.node_key.as_deref(),
-    )
+    // An explicit `--identity` still wins: it is how a node is bootstrapped
+    // with its own seed, which no login can substitute for.
+    if let Some(identity_path) = cli.identity.as_ref() {
+        return Endpoint::load(
+            cli.connect,
+            identity_path,
+            cli.cert.as_deref(),
+            cli.node_key.as_deref(),
+        );
+    }
+    // Otherwise a stored session is the credential, and the recorded pin is the
+    // node key — which is what removes all three flags from routine use.
+    let config = session::config_dir()?;
+    let session = session::load(&config)?.context(
+        "no credential: pass --identity <seed-path>, or run `wayfinderctl login --user <name>`",
+    )?;
+    let now = now_unix()?;
+    if session.meta.expired(now) {
+        bail!(
+            "the stored session for {} expired at {}; run `wayfinderctl login --user {}` again",
+            session.meta.username,
+            session.meta.not_after,
+            session.meta.username
+        );
+    }
+    let addr = cli.connect.to_string();
+    let node_key = match cli.node_key.as_deref() {
+        Some(hex) => wayfinder_client::parse_key32(hex).context("parsing --node-key")?,
+        None => session::pinned_key(&config, &addr)?.with_context(|| {
+            format!(
+                "no key recorded for {addr}: pass --node-key <hex>, or connect once \
+                 interactively to record it"
+            )
+        })?,
+    };
+    Ok(Endpoint {
+        addr: cli.connect,
+        node_key,
+        identity: wayfinder_client::Identity {
+            seed: session.seed,
+            cert: session.cert,
+        },
+    })
+}
+
+/// The current time in unix seconds, for session expiry arithmetic.
+fn now_unix() -> anyhow::Result<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .context("system clock is before the Unix epoch")
+}
+
+/// Log in to `provider` as `username`, storing the session it issues.
+///
+/// The keypair is generated here and never leaves this process, so what the
+/// provider signs is bound to a key only this client holds: a captured
+/// transcript of the exchange is useless without it. The password and code are
+/// read from the terminal and are not stored anywhere on either side.
+async fn login(provider: SocketAddr, username: &str, node_key: Option<&str>) -> anyhow::Result<()> {
+    // A login runs on the enrollment tier, so the connection needs an identity
+    // only to complete the TLS handshake — the session key it is about to have
+    // certified serves, and is the key the certificate will name.
+    let mut seed = [0u8; 32];
+    rand::fill(&mut seed);
+    let keypair = Keypair::from_seed(&seed);
+
+    let addr = provider.to_string();
+    // The provider's key has to be pinned *before* the handshake, so this is
+    // where trust-on-first-use happens.
+    //
+    // An explicit `--node-key` is the operator stating the fingerprint out of
+    // band, which is a stronger claim than anything this could learn by asking
+    // the network — so it wins, and it is checked against the recorded pin
+    // rather than silently replacing it. Without one, `resolve_pin` shows the
+    // fingerprint the node offers and asks, or refuses if the recorded one has
+    // changed. This is also what makes a non-interactive login possible at all:
+    // the prompt needs a terminal, and `--node-key` is the answer to the
+    // question the prompt would have asked.
+    let config = session::config_dir()?;
+    let node_key = match node_key {
+        Some(hex) => {
+            let stated = wayfinder_client::parse_key32(hex).context("parsing --node-key")?;
+            session::pin_stated(&config, &addr, &stated)?
+        }
+        None => match session::pinned_key(&config, &addr)? {
+            Some(recorded) => recorded,
+            None => {
+                let offered = probe_node_key(provider).await?;
+                session::resolve_pin(&config, &addr, &offered)?
+            }
+        },
+    };
+
+    let password = rpassword::prompt_password("Password: ").context("reading password")?;
+    let totp = prompt_line("TOTP code (empty if none): ")?;
+
+    let identity = wayfinder_client::Identity {
+        seed,
+        // No certificate: this connection is a stranger, which is exactly what
+        // someone who has not logged in yet is.
+        cert: Vec::new(),
+    };
+    let mut client = Client::connect_tls(provider, &node_key, &identity).await?;
+    let response = client
+        .authenticate_user(
+            username,
+            &password,
+            totp.trim(),
+            &keypair.ed_pubkey(),
+            &keypair.x_pubkey(),
+        )
+        .await?;
+
+    let issued = match response.outcome {
+        Some(UserOutcome::Issued(issued)) => issued,
+        // One message for every reason, by design: the provider does not say
+        // which of unknown-account / wrong-password / wrong-code / locked /
+        // disabled applied, so neither can this.
+        Some(UserOutcome::Rejected(_)) | None => {
+            bail!("authentication denied")
+        }
+    };
+
+    let cert = MembershipCert::from_bytes(&issued.cert)
+        .context("the provider returned a certificate this build cannot parse")?;
+    let meta = session::SessionMeta {
+        username: username.to_string(),
+        provider: addr,
+        provider_key: hex(&node_key),
+        not_before: cert.not_before.get(),
+        not_after: cert.not_after.get(),
+    };
+    session::store(&config, &seed, &issued.cert, &meta)?;
+
+    println!("logged in as {username}");
+    println!("  session valid until: {} unix", meta.not_after);
+    println!("  capability:          {}", cert_capability(cert.flags));
+    Ok(())
+}
+
+/// Complete a TLS handshake against `addr` purely to learn the key it presents,
+/// so it can be shown to the operator for confirmation.
+///
+/// Necessary because pinning happens before the connection that would otherwise
+/// reveal the key: there is no way to ask "what key do you have?" without
+/// speaking to the node, and no way to speak to it safely without a pin. The
+/// resolution is the same one SSH reaches — connect once, show the fingerprint,
+/// let a human decide — and it is why `resolve_pin` refuses without a terminal.
+async fn probe_node_key(addr: SocketAddr) -> anyhow::Result<[u8; 32]> {
+    wayfinder_client::probe_node_key(addr).await
+}
+
+/// Delete the stored session.
+fn logout() -> anyhow::Result<()> {
+    if session::clear(&session::config_dir()?)? {
+        println!("logged out");
+    } else {
+        println!("no stored session");
+    }
+    Ok(())
+}
+
+/// Print what credential this client holds and when it stops working.
+fn whoami() -> anyhow::Result<()> {
+    let Some(session) = session::load(&session::config_dir()?)? else {
+        println!("no stored session (use `wayfinderctl login --user <name>`)");
+        return Ok(());
+    };
+    let cert = MembershipCert::from_bytes(&session.cert)
+        .context("the stored session certificate does not parse")?;
+    let now = now_unix()?;
+
+    println!("user:       {}", session.meta.username);
+    println!("provider:   {}", session.meta.provider);
+    println!("mesh id:    {:#x}", cert.mesh_id.get());
+    println!("mac:        {}", output::format_mac(&cert.node_mac));
+    println!("capability: {}", cert_capability(cert.flags));
+    let not_after = session.meta.not_after;
+    if session.meta.expired(now) {
+        println!("expiry:     {not_after} unix (EXPIRED — log in again)");
+    } else if session.meta.due_renewal(now) {
+        println!(
+            "expiry:     {not_after} unix (in {}s — due renewal)",
+            not_after - now
+        );
+    } else {
+        println!("expiry:     {not_after} unix (in {}s)", not_after - now);
+    }
+    Ok(())
+}
+
+/// Describe a certificate's signed capability bits in one phrase.
+fn cert_capability(flags: u8) -> String {
+    let mut parts = Vec::new();
+    if flags & wayfinder_auth::CERT_FLAG_ADMIN != 0 {
+        parts.push("admin");
+    }
+    if flags & wayfinder_auth::CERT_FLAG_VIEWER != 0 {
+        parts.push("viewer");
+    }
+    if flags & wayfinder_auth::CERT_FLAG_USER != 0 {
+        parts.push("user session");
+    }
+    if parts.is_empty() {
+        return "none (routing membership only)".to_string();
+    }
+    parts.join(", ")
+}
+
+/// Read one line from the terminal, echoing it (for a TOTP code, which is not a
+/// secret worth hiding and is easier to get right when visible).
+fn prompt_line(prompt: &str) -> anyhow::Result<String> {
+    use std::io::Write;
+    print!("{prompt}");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("reading from the terminal")?;
+    Ok(line)
+}
+
+/// Lower-case hex, for keys in operator-facing output.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// How often `logs --follow` re-polls the node's ring.
@@ -325,9 +563,21 @@ const FOLLOW_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mill
 /// Run the parsed CLI: dispatch offline `cert` work synchronously, else open a
 /// client, service one query, and print the rendered result.
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
-    // The offline `cert` tooling needs no node connection.
-    if let Command::Cert(cmd) = cli.command {
-        return cert::run(cmd);
+    // The offline tooling needs no node connection.
+    match cli.command {
+        Command::Cert(cmd) => return cert::run(cmd),
+        Command::User(cmd) => return user::run(cmd),
+        Command::Logout => return logout(),
+        Command::Whoami => return whoami(),
+        Command::Login { provider, user } => {
+            return login(
+                provider.unwrap_or(cli.connect),
+                &user,
+                cli.node_key.as_deref(),
+            )
+            .await;
+        }
+        _ => {}
     }
     // A serial target reaches an embedded node's unauthenticated management API
     // directly; otherwise connect over the authenticated TLS endpoint.
@@ -592,7 +842,17 @@ async fn dispatch_query(
                 .context("denying CSR failed")?;
             format!("denied CSR for {mac}")
         }
-        Command::Cert(_) => unreachable!("cert is dispatched before run_query"),
+        // Every command that needs no node connection is dispatched by `run`
+        // before a client is opened; listing them here rather than under a
+        // wildcard keeps a newly added offline command from silently reaching
+        // a code path that would try to connect for it.
+        Command::Cert(_)
+        | Command::User(_)
+        | Command::Login { .. }
+        | Command::Logout
+        | Command::Whoami => {
+            unreachable!("offline commands are dispatched before a client is opened")
+        }
     })
 }
 

@@ -40,6 +40,7 @@ use wayfinder_protos::service::RoutingEntryData;
 use wayfinder_protos::service::RuntimeConfigData;
 use wayfinder_protos::service::SecurityStatusData;
 use wayfinder_protos::service::TableOccupancyData;
+use wayfinder_protos::service::UserAuthOutcome;
 use wayfinder_protos::service::WayfinderDataProvider;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
@@ -800,6 +801,48 @@ impl<
             .as_mut()
             .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
             .submit_csr(node_mac, ed_pubkey, x_pubkey, enrollment_token)
+    }
+
+    fn authenticate_user(
+        &mut self,
+        username: &str,
+        password: &str,
+        totp_code: &str,
+        ed_pubkey: &[u8],
+        x_pubkey: &[u8],
+    ) -> Result<UserAuthOutcome, String> {
+        self.ca
+            .as_mut()
+            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
+            .authenticate_user(username, password, totp_code, ed_pubkey, x_pubkey)
+    }
+
+    fn list_users(&self) -> Result<Vec<wayfinder_protos::service::UserAccountData>, String> {
+        match &self.ca {
+            Some(ca) => Ok(ca.list_users()),
+            None => Err("node is not a certificate-authority provider".to_string()),
+        }
+    }
+
+    fn create_user(
+        &mut self,
+        username: &str,
+        password: &str,
+        admin: bool,
+        session_ttl_secs: u64,
+        no_totp: bool,
+    ) -> Result<String, String> {
+        self.ca
+            .as_mut()
+            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
+            .create_user(username, password, admin, session_ttl_secs, no_totp)
+    }
+
+    fn remove_user(&mut self, username: &str) -> Result<(), String> {
+        self.ca
+            .as_mut()
+            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
+            .remove_user(username)
     }
 
     fn list_pending_csrs(&self) -> Result<Vec<PendingCsrData>, String> {

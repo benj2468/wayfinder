@@ -188,7 +188,12 @@ provider:
   # field would give the node the closed posture, which holds every request for
   # an operator.
   auto_approve: ${AUTO_APPROVE:-true}
-  state_path: /var/lib/wayfinder/ca-state.json
+  # Where the durable CA state lives — the issued-certificate log, the held
+  # CSRs, and the user accounts a dashboard signs in as. Overridable so the
+  # compose can point it at a host directory it seeded *before* this node
+  # started: accounts cannot be added to a running provider, which holds this
+  # state in memory and rewrites the whole snapshot.
+  state_path: ${CA_STATE_PATH:-/var/lib/wayfinder/ca-state.json}
 YAML
 fi
 

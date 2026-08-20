@@ -67,6 +67,19 @@ pub const MOCK_MESH_ID: u32 = 0xBEEF;
 /// "token" would match too much to prove anything.
 pub const MOCK_ENROLLMENT_TOKEN: &str = "mock-join-secret-9f3a";
 
+/// The administrator account [`Mock::login_provider`] carries.
+pub const MOCK_ADMIN_USER: &str = "ops";
+
+/// The read-only account [`Mock::login_provider`] carries, so the viewer tier
+/// — otherwise unreachable without a second account — can be driven end to end.
+pub const MOCK_VIEWER_USER: &str = "watcher";
+
+/// The password both [`Mock::login_provider`] accounts are created with.
+pub const MOCK_PASSWORD: &str = "hunter2-correct-horse";
+
+/// How long a session [`Mock::login_provider`] issues stays valid.
+pub const MOCK_SESSION_TTL_SECS: u64 = 3600;
+
 /// A provider with one originator, one link-quality row and one interface, so
 /// every field a snapshot reads has a distinguishable value to land in.
 ///
@@ -221,6 +234,73 @@ impl Mock {
             ca: Some(ca),
         }
     }
+
+    /// A certificate authority carrying two user accounts — one administrator,
+    /// one viewer — so a login can be driven end to end.
+    ///
+    /// Clocked from the *real* wall clock, unlike [`Mock::authority`]. A
+    /// session certificate is verified by the node it is then used against,
+    /// against that node's clock, so a fixed authority clock would mint
+    /// credentials that are already expired the moment they are presented.
+    pub fn login_provider() -> Self {
+        let mut ca =
+            wayfinder_server::CertAuthority::new(&MESH_ROOT_SEED, MOCK_MESH_ID, 86_400, None, true);
+        ca.set_now_unix(now_unix());
+        for (username, role) in [
+            (MOCK_ADMIN_USER, wayfinder_server::UserRole::Admin),
+            (MOCK_VIEWER_USER, wayfinder_server::UserRole::Viewer),
+        ] {
+            ca.add_user(
+                wayfinder_server::UserRecord::new(
+                    username,
+                    MOCK_PASSWORD,
+                    role,
+                    MOCK_SESSION_TTL_SECS,
+                )
+                .unwrap()
+                // No second factor: a test has nowhere to enrol an
+                // authenticator, which is the same reason the simulation's
+                // accounts are created with `--no-totp`.
+                .without_totp(),
+            )
+            .unwrap();
+        }
+        Self {
+            security: SecurityStatusData {
+                enrollment: Some(EnrollmentPolicyStatusData {
+                    auto_approve: true,
+                    cert_ttl_secs: 86_400,
+                    enrollment_token_set: false,
+                }),
+                ..Self::default().security
+            },
+            enrollment_token: None,
+            pending_csrs: None,
+            ca: Some(ca),
+        }
+    }
+
+    /// The trust anchor this mock's own management server verifies clients
+    /// against, or `None` for a flavor with no certificate authority behind it.
+    ///
+    /// A mock backed by a real CA is a node *enrolled in the mesh it signs
+    /// for*, which is what a provider is: without the anchor it would refuse
+    /// every certificate it had just issued, and a session obtained by logging
+    /// in to it could not then be used against it.
+    pub fn trust_anchor(&self) -> Option<wayfinder_auth::TrustAnchor> {
+        self.ca.as_ref().map(|ca| {
+            wayfinder_auth::Authority::from_seed(&MESH_ROOT_SEED, ca.mesh_id()).trust_anchor()
+        })
+    }
+}
+
+/// The current wall clock in unix seconds, for a mock that has to mint
+/// credentials a real verifier will accept.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 impl WayfinderDataProvider for Mock {
@@ -462,6 +542,48 @@ impl WayfinderDataProvider for Mock {
             .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
             .submit_csr(node_mac, ed_pubkey, x_pubkey, enrollment_token)
     }
+    fn authenticate_user(
+        &mut self,
+        username: &str,
+        password: &str,
+        totp_code: &str,
+        ed_pubkey: &[u8],
+        x_pubkey: &[u8],
+    ) -> Result<wayfinder_protos::service::UserAuthOutcome, String> {
+        self.ca
+            .as_mut()
+            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
+            .authenticate_user(username, password, totp_code, ed_pubkey, x_pubkey)
+    }
+    fn list_users(&self) -> Result<Vec<wayfinder_protos::service::UserAccountData>, String> {
+        match &self.ca {
+            Some(ca) => Ok(MeshAuthority::list_users(ca)),
+            None => Err("node is not a certificate-authority provider".to_string()),
+        }
+    }
+    fn create_user(
+        &mut self,
+        username: &str,
+        password: &str,
+        admin: bool,
+        session_ttl_secs: u64,
+        no_totp: bool,
+    ) -> Result<String, String> {
+        self.ca
+            .as_mut()
+            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
+            .create_user(username, password, admin, session_ttl_secs, no_totp)
+    }
+    fn remove_user(&mut self, username: &str) -> Result<(), String> {
+        // The trait method, not the inherent one: the last-administrator guard
+        // is part of what a test driving this mock is exercising.
+        MeshAuthority::remove_user(
+            self.ca
+                .as_mut()
+                .ok_or_else(|| "node is not a certificate-authority provider".to_string())?,
+            username,
+        )
+    }
     fn approve_csr(&mut self, node_mac: &[u8]) -> Result<(), String> {
         self.ca
             .as_mut()
@@ -517,10 +639,22 @@ pub async fn serve_mock_provider_node() -> (SocketAddr, [u8; 32]) {
     serve_mock_node_with(Mock::provider()).await
 }
 
+/// As [`serve_mock_node`], but backed by [`Mock::login_provider`]: a node that
+/// is its own certificate authority and holds user accounts, so a dashboard can
+/// log in to it and then use the session against it.
+pub async fn serve_mock_login_node() -> (SocketAddr, [u8; 32]) {
+    serve_mock_node_with(Mock::login_provider()).await
+}
+
 /// Start a TLS management server backed by the given [`Mock`].
 pub async fn serve_mock_node_with(mock: Mock) -> (SocketAddr, [u8; 32]) {
     let ck = wayfinder_tls_mgmt::certified_key_from_seed(&NODE_SEED).unwrap();
     let node_key = wayfinder_tls_mgmt::raw_ed25519_from_spki(ck.cert[0].as_ref()).unwrap();
+
+    // Read before the mock moves into the service task: a mock backed by a CA
+    // is enrolled in its own mesh, and the accept loop needs that anchor to
+    // verify the certificates it issued.
+    let anchor = mock.trust_anchor();
 
     let (query_tx, mut query_rx) =
         mpsc::channel::<(WayfinderRequest, oneshot::Sender<WayfinderResponse>)>(16);
@@ -531,14 +665,15 @@ pub async fn serve_mock_node_with(mock: Mock) -> (SocketAddr, [u8; 32]) {
         }
     });
 
-    // Un-enrolled router snapshot responder: no anchor, nothing revoked.
+    // Router snapshot responder: nothing revoked, and an anchor only for a
+    // flavor that has a mesh to be enrolled in.
     let (snapshot_tx, mut snapshot_rx) =
         mpsc::channel::<oneshot::Sender<wayfinder_server::AuthSnapshot>>(8);
     tokio::spawn(async move {
         while let Some(reply) = snapshot_rx.recv().await {
             let _ = reply.send(wayfinder_server::AuthSnapshot {
                 own_key: Some(node_key),
-                anchor: None,
+                anchor,
                 revoked: Vec::new(),
             });
         }

@@ -34,22 +34,18 @@
 use std::time::Duration;
 
 use leptos::prelude::*;
-use wayfinder_protos::wayfinder::v1alpha::EnrollmentPolicyStatus;
 use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
 
-use crate::api::TokenChange;
-use crate::api::approve_csr;
-use crate::api::deny_csr;
 use crate::api::request_enrollment;
-use crate::api::reveal_enrollment_token;
 use crate::api::revoke_node;
-use crate::api::set_enrollment_policy;
 use crate::api::set_lazy_cert_distribution;
 use crate::api::set_require_auth;
 use crate::components::dashboard::use_dashboard;
+use crate::components::widgets::ConfirmDialog;
 use crate::components::widgets::Empty;
 use crate::components::widgets::Field;
 use crate::components::widgets::Panel;
+use crate::components::widgets::Pending;
 use crate::enroll::EnrollmentOutcome;
 use crate::enroll::ProviderTarget;
 use crate::format;
@@ -62,13 +58,6 @@ use crate::format;
 /// hammered while someone reads the request, short enough that the node picks
 /// up its certificate while they are still watching this screen.
 const APPROVAL_POLL: Duration = Duration::from_secs(5);
-
-/// How long a copy button's "Copied" confirmation stays on screen.
-///
-/// Long enough to be read after the eye moves back from the button, short
-/// enough that it is gone before it could be mistaken for a statement about a
-/// *later* click.
-const COPY_FLASH_FOR: Duration = Duration::from_secs(3);
 
 /// The parts of the security status the "join a mesh" panel is built from:
 /// whether this node holds a certificate, and the mesh it belongs to.
@@ -84,39 +73,24 @@ fn membership_of(sec: &GetSecurityStatusResponse) -> (bool, u32) {
     (sec.auth_enabled, sec.mesh_id)
 }
 
-/// An action awaiting confirmation, held until the operator commits or cancels.
-#[derive(Clone, Debug, PartialEq)]
-struct Pending {
-    /// What will happen, in plain language, for the dialog body.
-    prompt: String,
-    /// The label on the confirming button.
-    verb: &'static str,
-    /// Whether this is the destructive kind, which the dialog styles louder.
-    destructive: bool,
-    /// Which call to make on confirmation.
-    kind: ActionKind,
-}
-
 /// Which management call a confirmed [`Pending`] performs.
 ///
 /// Each variant carries its own argument rather than the struct carrying a
-/// `node_mac` every variant would have to share: only three of these are about
-/// a node at all, and a settings change that had to name one would be carrying
-/// a field it has no meaning for.
+/// `node_mac` every variant would have to share: only one of these is about
+/// another node at all, and a settings change that had to name one would be
+/// carrying a field it has no meaning for.
+///
+/// What is *not* here is what moved to the Provider tab — approving and denying
+/// requests to join, and clearing the enrollment token. Those are decisions
+/// about who else gets in; these are about this node.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum ActionKind {
-    /// Admit the node with this MAC to the mesh.
-    Approve(Vec<u8>),
-    /// Refuse the request from the node with this MAC.
-    Deny(Vec<u8>),
+enum SecurityAction {
     /// Eject the node with this MAC from the mesh.
     Revoke(Vec<u8>),
     /// Switch the fail-closed gate on or off.
     RequireAuth(bool),
     /// Switch lazy cert distribution on or off.
     LazyCertDistribution(bool),
-    /// Clear the shared enrollment token, opening enrollment.
-    ClearEnrollmentToken,
     /// Ask this provider to admit the node — confirmed only when the node is
     /// already a member of some other mesh, which it would be leaving.
     Join(ProviderTarget),
@@ -182,7 +156,7 @@ fn ask_to_join(state: RwSignal<JoinState>, target: ProviderTarget) {
 #[component]
 pub fn Security() -> impl IntoView {
     let dash = use_dashboard();
-    let (pending, set_pending) = signal::<Option<Pending>>(None);
+    let (pending, set_pending) = signal::<Option<Pending<SecurityAction>>>(None);
     let join = RwSignal::new(JoinState::Idle);
 
     let security = move || {
@@ -202,43 +176,32 @@ pub fn Security() -> impl IntoView {
     // its own value changes, so the panels are rebuilt when the thing they are
     // about changes and at no other time. See [`membership_of`].
     let membership = Memo::new(move |_| security().as_ref().map(membership_of));
-    let enrollment = Memo::new(move |_| security().and_then(|s| s.enrollment));
-    // What a joining node must be told, on a provider: the key that pins this
-    // node and the token it will be asked for. Memoised on the same grounds,
-    // though this panel has no input of its own — it is rendered from the same
-    // poll and there is no reason to rebuild it either.
-    let join_details = Memo::new(move |_| {
-        security().and_then(|s| {
-            s.enrollment
-                .map(|policy| (format::hex(&s.own_ed_pubkey), policy.enrollment_token_set))
-        })
-    });
 
-    let confirm = move || {
-        let Some(action) = pending.get() else { return };
+    let confirm = move |kind: SecurityAction| {
         set_pending.set(None);
         // Joining runs its own state machine rather than reporting a one-shot
         // result, so it is dispatched before the uniform actions below.
-        if let ActionKind::Join(target) = action.kind {
+        if let SecurityAction::Join(target) = kind {
             ask_to_join(join, target);
             return;
         }
+        let verb = match &kind {
+            SecurityAction::Revoke(_) => "Revoking",
+            SecurityAction::RequireAuth(_) => "Changing the fail-closed gate",
+            SecurityAction::LazyCertDistribution(_) => "Changing certificate distribution",
+            SecurityAction::Join(_) => unreachable!("joining is dispatched above"),
+        };
         leptos::task::spawn_local(async move {
-            let result = match action.kind {
-                ActionKind::Approve(mac) => approve_csr(mac).await,
-                ActionKind::Deny(mac) => deny_csr(mac).await,
-                ActionKind::Revoke(mac) => revoke_node(mac).await,
-                ActionKind::RequireAuth(require) => set_require_auth(require).await,
-                ActionKind::LazyCertDistribution(enabled) => {
+            let result = match kind {
+                SecurityAction::Revoke(mac) => revoke_node(mac).await,
+                SecurityAction::RequireAuth(require) => set_require_auth(require).await,
+                SecurityAction::LazyCertDistribution(enabled) => {
                     set_lazy_cert_distribution(enabled).await
                 }
-                ActionKind::ClearEnrollmentToken => {
-                    set_enrollment_policy(None, None, TokenChange::Clear).await
-                }
-                ActionKind::Join(_) => unreachable!("joining is dispatched above"),
+                SecurityAction::Join(_) => unreachable!("joining is dispatched above"),
             };
             if let Err(e) = result {
-                dash.error.set(Some(format!("{} failed: {e}", action.verb)));
+                dash.error.set(Some(format!("{verb} failed: {e}")));
             }
         });
     };
@@ -283,6 +246,14 @@ pub fn Security() -> impl IntoView {
             </Panel>
 
             {move || {
+                // A read-only account is not the one that decides which mesh
+                // this node belongs to, and the node refuses the enrollment
+                // call from their session — so the panel is omitted rather than
+                // offered inert. Unlike the settings below it holds no state
+                // worth reading: it is three empty fields and a button.
+                if !dash.admin.get() {
+                    return None;
+                }
                 membership
                     .get()
                     .map(|(enrolled, mesh_id)| {
@@ -335,7 +306,7 @@ pub fn Security() -> impl IntoView {
                                 },
                                 verb: if next { "Refuse" } else { "Allow" },
                                 destructive: next && !has_cert,
-                                kind: ActionKind::RequireAuth(next),
+                                kind: SecurityAction::RequireAuth(next),
                             }
                         />
                         <PostureSwitch
@@ -358,120 +329,13 @@ pub fn Security() -> impl IntoView {
                                 },
                                 verb: if next { "Send fingerprints" } else { "Send full certificates" },
                                 destructive: next,
-                                kind: ActionKind::LazyCertDistribution(next),
+                                kind: SecurityAction::LazyCertDistribution(next),
                             }
                         />
                     }
                         .into_any()
                 }}
             </Panel>
-
-            {move || {
-                // Absent on a node that is not a certificate authority — a plain
-                // member has no enrollment policy to show or to change.
-                enrollment
-                    .get()
-                    .map(|policy| {
-                        view! {
-                            <EnrollmentSettings policy=policy set_pending=set_pending />
-                        }
-                    })
-            }}
-
-            {move || {
-                // Provider-only, for the same reason: a node that issues no
-                // certificates has nothing for a joining node to be given.
-                join_details
-                    .get()
-                    .map(|(node_key, token_set)| {
-                        view! { <ProviderJoinDetails node_key=node_key token_set=token_set /> }
-                    })
-            }}
-
-            {move || {
-                // Absent on a node that is not a certificate authority. Omitted
-                // entirely rather than shown empty: an empty queue reads as "no
-                // one is waiting", which is a different claim.
-                csrs()
-                    .map(|requests| {
-                        let count = requests.len();
-                        view! {
-                            <Panel
-                                title="Requests to join"
-                                subtitle=Signal::derive(move || format!("{count} waiting"))
-                            >
-                                {if requests.is_empty() {
-                                    view! { <Empty message="No nodes are waiting to join." /> }
-                                        .into_any()
-                                } else {
-                                    requests
-                                        .clone()
-                                        .into_iter()
-                                        .map(|csr| {
-                                            let mac = csr.node_mac.clone();
-                                            let approve_mac = mac.clone();
-                                            let deny_mac = mac.clone();
-                                            view! {
-                                                <div class="wf-csr">
-                                                    <div class="wf-csr-id">
-                                                        <span class="wf-mono">{format::id(&mac)}</span>
-                                                        <span class="wf-csr-key wf-mono">
-                                                            {format::key(&csr.ed_pubkey)}
-                                                        </span>
-                                                        <span class="wf-csr-when">
-                                                            "requested " {format::timestamp(csr.requested_at)}
-                                                        </span>
-                                                    </div>
-                                                    <div class="wf-csr-actions">
-                                                        <button
-                                                            class="wf-button wf-button-primary"
-                                                            on:click=move |_| {
-                                                                set_pending
-                                                                    .set(
-                                                                        Some(Pending {
-                                                                            prompt: format!(
-                                                                                "Admit {} to the mesh? It will be able to route traffic.",
-                                                                                format::id(&approve_mac),
-                                                                            ),
-                                                                            verb: "Approve",
-                                                                            destructive: false,
-                                                                            kind: ActionKind::Approve(approve_mac.clone()),
-                                                                        }),
-                                                                    )
-                                                            }
-                                                        >
-                                                            "Approve"
-                                                        </button>
-                                                        <button
-                                                            class="wf-button"
-                                                            on:click=move |_| {
-                                                                set_pending
-                                                                    .set(
-                                                                        Some(Pending {
-                                                                            prompt: format!(
-                                                                                "Refuse {}'s request to join?",
-                                                                                format::id(&deny_mac),
-                                                                            ),
-                                                                            verb: "Deny",
-                                                                            destructive: false,
-                                                                            kind: ActionKind::Deny(deny_mac.clone()),
-                                                                        }),
-                                                                    )
-                                                            }
-                                                        >
-                                                            "Deny"
-                                                        </button>
-                                                    </div>
-                                                </div>
-                                            }
-                                        })
-                                        .collect_view()
-                                        .into_any()
-                                }}
-                            </Panel>
-                        }
-                    })
-            }}
 
             <Panel title="Nodes">
                 {move || {
@@ -481,7 +345,10 @@ pub fn Security() -> impl IntoView {
                     if sec.nodes.is_empty() {
                         return view! { <Empty message="No other nodes known yet." /> }.into_any();
                     }
-                    let is_provider = csrs().is_some();
+                    // The column exists on a provider, which is the node that
+                    // can actually act on a revocation — and only for a viewer
+                    // who may ask for one.
+                    let can_revoke = csrs().is_some() && dash.admin.get();
                     view! {
                         <div class="wf-table-scroll">
                             <table class="wf-table">
@@ -490,7 +357,7 @@ pub fn Security() -> impl IntoView {
                                         <th>"Node"</th>
                                         <th>"Identity"</th>
                                         <th>"Certificate expires"</th>
-                                        {is_provider.then(|| view! { <th></th> })}
+                                        {can_revoke.then(|| view! { <th></th> })}
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -521,7 +388,7 @@ pub fn Security() -> impl IntoView {
                                                     <td class="wf-mono">{format::id(&mac)}</td>
                                                     <td class=class>{state}</td>
                                                     <td class="wf-mono">{expiry}</td>
-                                                    {is_provider
+                                                    {can_revoke
                                                         .then(|| {
                                                             view! {
                                                                 <td class="wf-num">
@@ -542,7 +409,7 @@ pub fn Security() -> impl IntoView {
                                                                                                     ),
                                                                                                     verb: "Revoke",
                                                                                                     destructive: true,
-                                                                                                    kind: ActionKind::Revoke(revoke_mac.clone()),
+                                                                                                    kind: SecurityAction::Revoke(revoke_mac.clone()),
                                                                                                 }),
                                                                                             )
                                                                                     }
@@ -570,28 +437,15 @@ pub fn Security() -> impl IntoView {
                 pending
                     .get()
                     .map(|action| {
+                        let kind = action.kind.clone();
                         view! {
-                            <div class="wf-modal-backdrop">
-                                <div class="wf-modal" role="alertdialog" aria-modal="true">
-                                    <p class="wf-modal-body">{action.prompt.clone()}</p>
-                                    <div class="wf-modal-actions">
-                                        <button
-                                            class="wf-button"
-                                            on:click=move |_| set_pending.set(None)
-                                        >
-                                            "Cancel"
-                                        </button>
-                                        <button
-                                            class="wf-button"
-                                            class:wf-button-danger=action.destructive
-                                            class:wf-button-primary=!action.destructive
-                                            on:click=move |_| confirm()
-                                        >
-                                            {action.verb}
-                                        </button>
-                                    </div>
-                                </div>
-                            </div>
+                            <ConfirmDialog
+                                prompt=action.prompt.clone()
+                                verb=action.verb
+                                destructive=action.destructive
+                                on_confirm=Callback::new(move |()| confirm(kind.clone()))
+                                on_cancel=Callback::new(move |()| set_pending.set(None))
+                            />
                         }
                     })
             }}
@@ -620,7 +474,7 @@ fn JoinMesh(
     /// How far the current request has got.
     state: RwSignal<JoinState>,
     /// Where a staged confirmation is written for the dialog to pick up.
-    set_pending: WriteSignal<Option<Pending>>,
+    set_pending: WriteSignal<Option<Pending<SecurityAction>>>,
 ) -> impl IntoView {
     let (address, set_address) = signal(String::new());
     let (key, set_key) = signal(String::new());
@@ -651,7 +505,7 @@ fn JoinMesh(
                 ),
                 verb: "Ask to join",
                 destructive: true,
-                kind: ActionKind::Join(target),
+                kind: SecurityAction::Join(target),
             }));
         } else {
             ask_to_join(state, target);
@@ -757,208 +611,19 @@ fn JoinMesh(
     }
 }
 
-/// What a node needs in order to ask *this* provider to admit it.
-///
-/// The other end of [`JoinMesh`]: that panel has three fields to fill in, and
-/// this one is where the values come from. Handing them over is otherwise a
-/// job of reading 64 hex characters aloud, or — for the token — of replacing a
-/// working secret just to learn what it was, which kicks out every node still
-/// holding the old one.
-///
-/// # Shown, hidden, and copied are three different things
-///
-/// Neither value is drawn in full. The key is abbreviated to its leading bytes,
-/// which is enough to tell two providers apart but not to retype; the token is
-/// masked outright. Both are copied to the clipboard in full. This is
-/// deliberate: a dashboard on a screen someone else can see, or in a
-/// screenshot pasted into a chat, must not be where the mesh's shared secret
-/// leaks — but an operator who is deliberately handing it on should not be
-/// fighting the UI to do it.
-///
-/// # The token is fetched, not polled
-///
-/// The snapshot behind this panel is refreshed once a second and says only
-/// *whether* a token is required. The value arrives on its own request, when
-/// the operator asks for it — which is the difference between a secret
-/// disclosed continuously to everything that touches the snapshot and one
-/// disclosed in a discrete act the node writes to its log.
-#[component]
-fn ProviderJoinDetails(
-    /// This provider's own Ed25519 public key, as 64 hex characters — what the
-    /// joining node pins so nothing else can answer in this one's place.
-    node_key: String,
-    /// Whether a token is required at all.  The authoritative flag, and the
-    /// only part of the token that rides the poll.
-    token_set: bool,
-) -> impl IntoView {
-    let dash = use_dashboard();
-    let key_shown = format::key(&hex_bytes(&node_key));
-    let key_value = node_key.clone();
-    // The revealed token, once asked for. Local to this panel and dropped when
-    // the operator navigates away.
-    let (revealed, set_revealed) = signal(None::<String>);
-    let reveal = move |_| {
-        leptos::task::spawn_local(async move {
-            match reveal_enrollment_token().await {
-                // `None` is "no token required" — but this button is only
-                // rendered when the poll says one is, so the two disagreeing
-                // means the policy changed under the operator. Say so rather
-                // than rendering an empty field.
-                Ok(Some(token)) => set_revealed.set(Some(token)),
-                Ok(None) => dash.error.set(Some(
-                    "This provider no longer requires a token — enrollment is open.".to_string(),
-                )),
-                Err(e) => dash
-                    .error
-                    .set(Some(format!("Reading the token failed: {e}"))),
-            }
-        });
-    };
-
-    view! {
-        <Panel title="What a node needs to join">
-            <p class="wf-note">
-                "These three go into the joining node's own \"Join a mesh\" panel, on its \
-                 Security tab. Copy them rather than reading them out — the key is 64 \
-                 characters and one wrong character reads as a provider that cannot be \
-                 reached."
-            </p>
-
-            // Where this dashboard reaches the node, which is the address a
-            // joining node needs too — subject to the one caveat in the note
-            // below, that the two are not always on the same network.
-            <CopyField
-                label="Provider address"
-                shown=Signal::derive(move || dash.label.get())
-                value=Signal::derive(move || dash.label.get())
-            />
-            <CopyField
-                label="Provider key"
-                shown=key_shown
-                value=key_value
-            />
-            {move || {
-                if !token_set {
-                    return view! {
-                        <Field
-                            label="Enrollment token"
-                            value="Not required — anyone in range may join"
-                        />
-                    }
-                        .into_any();
-                }
-                match revealed.get() {
-                    Some(token) => {
-                        view! {
-                            <CopyField label="Enrollment token" shown="••••••••" value=token />
-                        }
-                            .into_any()
-                    }
-                    // Required, and not asked for yet. The button is the ask:
-                    // until it is pressed the value has not left the node, and
-                    // pressing it is what the node records.
-                    None => {
-                        view! {
-                            <div class="wf-field">
-                                <span class="wf-field-label">"Enrollment token"</span>
-                                <button type="button" class="wf-btn" on:click=reveal>
-                                    "Show token"
-                                </button>
-                            </div>
-                        }
-                            .into_any()
-                    }
-                }
-            }}
-
-            <p class="wf-note">
-                "The address is the one this dashboard is pointed at. A node on a different \
-                 network may have to reach this one at a different address; the key and the \
-                 token do not change with it."
-            </p>
-        </Panel>
-    }
-}
-
-/// Decode hex back to bytes, for handing a key to [`format::key`].
-///
-/// The key arrives here already hex-encoded (it is what the copy button hands
-/// out), and abbreviating it means counting bytes rather than characters. A
-/// malformed pair yields no byte, so a garbled key abbreviates to something
-/// visibly wrong rather than to something plausible.
-fn hex_bytes(hex: &str) -> Vec<u8> {
-    hex.as_bytes()
-        .chunks(2)
-        .filter_map(|pair| {
-            let pair = core::str::from_utf8(pair).ok()?;
-            u8::from_str_radix(pair, 16).ok()
-        })
-        .collect()
-}
-
-/// A value an operator has to carry somewhere else: shown abbreviated or
-/// masked, copied in full.
-///
-/// The copy button is the only way out of a masked field, so it reports what
-/// actually happened — [`crate::clipboard::copy`] answers `false` when the
-/// browser refused, and this says so rather than claiming a copy that did not
-/// happen and leaving someone to paste whatever was on the clipboard before.
-#[component]
-fn CopyField(
-    /// The field name.
-    label: &'static str,
-    /// What is drawn on screen. Never the full value when that is a secret.
-    #[prop(into)]
-    shown: Signal<String>,
-    /// What the copy button puts on the clipboard, in full.
-    #[prop(into)]
-    value: Signal<String>,
-) -> impl IntoView {
-    // `None` until a copy is attempted, then the outcome for a few seconds.
-    // Transient rather than sticky: it is feedback on one click, and a "Copied"
-    // still sitting there a minute later says nothing true about the clipboard.
-    let (flash, set_flash) = signal::<Option<&'static str>>(None);
-
-    let copy = move |_| {
-        let copied = crate::clipboard::copy(&value.get());
-        set_flash.set(Some(if copied {
-            "Copied"
-        } else {
-            "Could not copy — this browser refused clipboard access"
-        }));
-        leptos::leptos_dom::helpers::set_timeout(move || set_flash.set(None), COPY_FLASH_FOR);
-    };
-
-    view! {
-        <div class="wf-copy-row">
-            <span class="wf-copy-label">{label}</span>
-            <span class="wf-copy-value wf-mono">{move || shown.get()}</span>
-            <button
-                type="button"
-                class="wf-button wf-copy-button"
-                aria-label=format!("Copy the {label} to the clipboard")
-                title=format!("Copy the {label} to the clipboard")
-                on:click=copy
-            >
-                // The word, not a clipboard emoji: this dashboard ships in a
-                // container, and a minimal image has no emoji font — the glyph
-                // renders as a tofu box there, leaving three unlabelled
-                // buttons. Verified as exactly that in a headless browser.
-                "Copy"
-            </button>
-            <span class="wf-copy-flash" aria-live="polite">
-                {move || flash.get().unwrap_or_default()}
-            </span>
-        </div>
-    }
-}
-
 /// One node-wide posture flag, as a switch that asks before it acts.
 ///
 /// Unlike the Links tab's gates, which apply on click, both flags here can take
 /// the node off the mesh — so the switch stages a [`Pending`] and the dialog
 /// commits it. It therefore shows the node's state, never an optimistic one: an
 /// operator who cancels must be left looking at what is actually in force.
+///
+/// For a read-only account it is drawn and disabled rather than omitted. The
+/// two are not interchangeable here: "is this node refusing to run
+/// unauthenticated?" is precisely the sort of question a read-only account is
+/// signed in to answer, and a missing switch answers it with nothing. A
+/// disabled one still carries `aria-checked`, so the state reads the same to a
+/// screen reader as it does on screen.
 #[component]
 fn PostureSwitch(
     /// Plain-language name of the setting.
@@ -968,10 +633,11 @@ fn PostureSwitch(
     /// The setting's state as of the last poll.
     on: bool,
     /// Where the staged action is written for the dialog to pick up.
-    set_pending: WriteSignal<Option<Pending>>,
+    set_pending: WriteSignal<Option<Pending<SecurityAction>>>,
     /// Builds the confirmation for flipping this switch to the given state.
-    action: impl Fn(bool) -> Pending + Copy + Send + 'static,
+    action: impl Fn(bool) -> Pending<SecurityAction> + Copy + Send + 'static,
 ) -> impl IntoView {
+    let dash = use_dashboard();
     view! {
         <button
             type="button"
@@ -979,6 +645,7 @@ fn PostureSwitch(
             class="wf-gate"
             aria-checked=if on { "true" } else { "false" }
             title=help
+            disabled=move || !dash.admin.get()
             on:click=move |_| set_pending.set(Some(action(!on)))
         >
             <span class="wf-gate-track" class:wf-gate-on=on>
@@ -989,192 +656,6 @@ fn PostureSwitch(
                 <span class="wf-gate-help">{help}</span>
             </span>
         </button>
-    }
-}
-
-/// The enrollment policy of a certificate-authority node: how a node asking to
-/// join is admitted.
-///
-/// Only rendered on a provider. Each control submits on its own, rather than
-/// the panel having one Save: an operator closing open enrollment in a hurry
-/// should not also be resubmitting a certificate lifetime they were halfway
-/// through editing.
-#[component]
-fn EnrollmentSettings(
-    /// The policy as of the last poll.
-    policy: EnrollmentPolicyStatus,
-    /// Where a staged confirmation is written for the dialog to pick up.
-    set_pending: WriteSignal<Option<Pending>>,
-) -> impl IntoView {
-    let dash = use_dashboard();
-    // The switch is framed as the operator's own action — "approve by hand" —
-    // which is the inverse of the posture the node reports. A control you turn
-    // *on* to add a check reads correctly; one you turn off to add a check does
-    // not, and this one guards who joins the mesh.
-    let approval_required = !policy.auto_approve;
-    let token_set = policy.enrollment_token_set;
-    // Seeded from the node and edited locally. Not reseeded on every poll: that
-    // would overwrite what the operator is in the middle of typing.
-    let (ttl_input, set_ttl_input) = signal(policy.cert_ttl_secs.to_string());
-    let (token_input, set_token_input) = signal(String::new());
-
-    // Report a failed change and leave the panel showing the node's state —
-    // the next poll re-renders from what the node actually has.
-    let report = move |verb: &'static str, result: Result<(), ServerFnError>| {
-        if let Err(e) = result {
-            dash.error.set(Some(format!("{verb} failed: {e}")));
-        }
-    };
-
-    let toggle_approval = move |_| {
-        // Flip the switch, then say it the way the node's field is spelled.
-        let next_approval = !approval_required;
-        let open = !next_approval;
-        leptos::task::spawn_local(async move {
-            let result = set_enrollment_policy(Some(open), None, TokenChange::Unchanged).await;
-            report("Changing the approval requirement", result);
-        });
-    };
-
-    let save_ttl = move |_| {
-        // Parsed here rather than leaning on the input's `type=number`: a
-        // browser will happily hand back an empty string, and the node rejects
-        // zero, so the operator gets the reason locally either way.
-        let raw = ttl_input.get();
-        let Ok(secs) = raw.trim().parse::<u64>() else {
-            dash.error
-                .set(Some(format!("\"{raw}\" is not a number of seconds")));
-            return;
-        };
-        if secs == 0 {
-            dash.error.set(Some(
-                "A certificate lifetime of zero would issue certificates that have already \
-                 expired."
-                    .to_string(),
-            ));
-            return;
-        }
-        leptos::task::spawn_local(async move {
-            let result = set_enrollment_policy(None, Some(secs), TokenChange::Unchanged).await;
-            report("Changing the certificate lifetime", result);
-        });
-    };
-
-    let save_token = move |_| {
-        let value = token_input.get();
-        if value.trim().is_empty() {
-            dash.error.set(Some(
-                "Enter a token, or clear the token to open enrollment.".to_string(),
-            ));
-            return;
-        }
-        leptos::task::spawn_local(async move {
-            let result = set_enrollment_policy(None, None, TokenChange::Set(value)).await;
-            report("Setting the enrollment token", result);
-        });
-        // Cleared whatever the outcome: leaving a shared secret sitting in a
-        // form field in a browser is how it ends up on someone's screen.
-        set_token_input.set(String::new());
-    };
-
-    view! {
-        <Panel title="How nodes join">
-            <button
-                type="button"
-                role="switch"
-                class="wf-gate"
-                aria-checked=if approval_required { "true" } else { "false" }
-                title="Hold each request until an operator approves it here."
-                on:click=toggle_approval
-            >
-                <span class="wf-gate-track" class:wf-gate-on=approval_required>
-                    <span class="wf-gate-knob" />
-                </span>
-                <span class="wf-gate-label">
-                    <span class="wf-gate-name">"Approve each request by hand"</span>
-                    <span class="wf-gate-help">
-                        "Hold every request to join until someone approves it below. \
-                         With this off, a node that satisfies the token is admitted \
-                         the moment it asks."
-                    </span>
-                </span>
-            </button>
-
-            <Field
-                label="Certificates are valid for"
-                value=format::duration_secs(policy.cert_ttl_secs)
-            />
-            <div class="wf-setting-row">
-                <label class="wf-setting-label" for="wf-cert-ttl">
-                    "New lifetime, in seconds"
-                </label>
-                <input
-                    id="wf-cert-ttl"
-                    class="wf-input"
-                    type="number"
-                    min="1"
-                    prop:value=move || ttl_input.get()
-                    on:input=move |ev| set_ttl_input.set(event_target_value(&ev))
-                />
-                <button class="wf-button" on:click=save_ttl>
-                    "Save"
-                </button>
-            </div>
-            <p class="wf-note">
-                "Applies to certificates issued from now on. Keep it short — a mesh \
-                 removes a node mainly by letting its certificate expire."
-            </p>
-
-            <Field
-                label="Token required to join"
-                value=if token_set { "Yes" } else { "No — anyone in range may join" }
-            />
-            <div class="wf-setting-row">
-                <label class="wf-setting-label" for="wf-enrollment-token">
-                    "New token"
-                </label>
-                <input
-                    id="wf-enrollment-token"
-                    class="wf-input"
-                    type="password"
-                    autocomplete="off"
-                    prop:value=move || token_input.get()
-                    on:input=move |ev| set_token_input.set(event_target_value(&ev))
-                />
-                <button class="wf-button" on:click=save_token>
-                    "Set token"
-                </button>
-                {token_set
-                    .then(|| {
-                        view! {
-                            <button
-                                class="wf-button wf-button-danger"
-                                on:click=move |_| {
-                                    set_pending
-                                        .set(
-                                            Some(Pending {
-                                                prompt: "Remove the token? Any node that can reach this \
-                                                         one will then be able to join the mesh without \
-                                                         presenting anything."
-                                                    .to_string(),
-                                                verb: "Remove token",
-                                                destructive: true,
-                                                kind: ActionKind::ClearEnrollmentToken,
-                                            }),
-                                        )
-                                }
-                            >
-                                "Remove token"
-                            </button>
-                        }
-                    })}
-            </div>
-            <p class="wf-note">
-                "What you type here is not echoed. The token currently in force can be \
-                 copied from the panel below, so setting a new one is not the way to find \
-                 out what the old one was."
-            </p>
-        </Panel>
     }
 }
 
@@ -1220,16 +701,5 @@ mod tests {
         before.auth_enabled = true;
         before.mesh_id = 0xF00D;
         assert_ne!(membership_of(&before), membership_of(&after));
-    }
-
-    /// The abbreviation the provider panel shows is derived from the same hex
-    /// the copy button hands out, so the two cannot describe different keys.
-    #[test]
-    fn a_copied_key_and_its_abbreviation_agree() {
-        let key = vec![0xab; 32];
-        let hex = format::hex(&key);
-
-        assert_eq!(hex_bytes(&hex), key, "the hex round-trips");
-        assert_eq!(format::key(&hex_bytes(&hex)), format::key(&key));
     }
 }

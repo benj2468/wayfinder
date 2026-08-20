@@ -710,6 +710,23 @@ message WayfinderRequest {
 
     // Read the shared enrollment token in force (provider mode).
     RevealEnrollmentTokenRequest reveal_enrollment_token = 23;
+
+    // Exchange user credentials for a short-lived management certificate
+    // (provider mode).  On the enrollment tier, which is what admits a client
+    // holding no credential at all — which is precisely what someone who has
+    // not logged in yet is.
+    AuthenticateUserRequest authenticate_user = 24;
+
+    // List the certificate authority's user accounts (provider mode).  Requires
+    // a full management grant: this is the roster of who can mint a certificate
+    // the whole mesh honours.
+    ListUsersRequest list_users = 25;
+
+    // Create a user account (provider mode).  Requires a full management grant.
+    CreateUserRequest create_user = 26;
+
+    // Remove a user account (provider mode).  Requires a full management grant.
+    RemoveUserRequest remove_user = 27;
   }
 }
 
@@ -1156,6 +1173,185 @@ message SubmitCsrResponse {
   }
 }
 
+// Exchange a username, password and TOTP code for a short-lived management
+// certificate bound to a keypair the client generated for this session.
+//
+// The credentials are verified at the certificate authority, never at a node:
+// a password verifier worth having is memory-hard, a password would be the
+// only fleet-wide bearer secret in this system, and it would have to be
+// replicated to every node.  What comes back is an ordinary membership
+// certificate, so every node authorizes its holder through the unchanged
+// certificate path and no node ever learns what a password is.
+message AuthenticateUserRequest {
+  // The account name, as created by `wayfinderctl user add`.
+  string username = 1;
+
+  // The account password.  Never logged and never persisted — the authority
+  // stores only an Argon2id hash of it.
+  string password = 2;
+
+  // The current TOTP code, or empty for an account explicitly created without
+  // a second factor.  A code is accepted once: presenting the same one again
+  // inside its own validity window is refused.
+  string totp_code = 3;
+
+  // The Ed25519 public key of the session keypair the client generated, which
+  // the issued certificate is bound to.  32 bytes.  The client holds the
+  // private half, so a captured transcript of this exchange is useless without
+  // it.
+  bytes ed_pubkey = 4;
+
+  // The X25519 public key of the same session keypair, for pairwise key
+  // agreement.  32 bytes.
+  bytes x_pubkey = 5;
+}
+
+// List the certificate authority's user accounts (provider mode).
+//
+// Administered offline by `wayfinderctl user` as well, and that tool remains
+// the only way to create the *first* account: creating one over this API needs
+// the credential it creates.
+message ListUsersRequest {}
+
+// Answer to a ListUsersRequest: the accounts this authority holds.
+message ListUsersResponse {
+  // One entry per account, in the order the authority stores them.
+  repeated UserAccount users = 1;
+}
+
+// One user account, as the management API reports it.
+//
+// Never the password hash and never the TOTP secret.  Neither is recoverable
+// from the authority at all — the hash by construction, the secret because it
+// is shown once, when the account is created, and never again.
+message UserAccount {
+  // The account name presented at sign-in.
+  string username = 1;
+
+  // Whether this account's session certificates carry the
+  // management-administration capability.  False means read-only: the account
+  // may read the management API and change nothing.
+  bool admin = 2;
+
+  // How long a session certificate issued to this account stays valid, in
+  // seconds.  Per account rather than per authority: an automation account may
+  // be worth minutes and a field operator a shift.
+  uint64 session_ttl_secs = 3;
+
+  // Whether a second factor is enrolled.  An account without one has a password
+  // as its whole credential.
+  bool totp_enrolled = 4;
+
+  // Whether the account is disabled: it can obtain no new sessions, while
+  // certificates already issued to it are unaffected until they expire or are
+  // revoked.
+  bool disabled = 5;
+
+  // Whether the account is currently locked out after consecutive failed
+  // sign-ins.  Temporary, and clears on its own.
+  bool locked = 6;
+}
+
+// Create a user account (provider mode).
+//
+// Requires a full management grant, and note what that means: an admin session
+// can mint another account, so this endpoint makes the user store remotely
+// mutable by anyone holding one.  That is a deliberate widening — an admin can
+// already revoke nodes and rewrite the enrollment policy — but it is a widening,
+// and `wayfinderctl user` on the provider host remains the path that needs no
+// network at all.
+message CreateUserRequest {
+  // The account name, unique within this authority.  A name already in use is
+  // an error rather than a silent replacement.
+  string username = 1;
+
+  // The initial password.  Never logged and never persisted: the authority
+  // stores only an Argon2id hash of it.  It does travel this channel, which is
+  // authenticated TLS and admits only a full management grant.
+  string password = 2;
+
+  // Grant the management-administration capability to the certificates this
+  // account is issued.  False creates a read-only (viewer) account.
+  bool admin = 3;
+
+  // Validity window for this account's session certificates, in seconds.  Zero
+  // takes the authority's default of eight hours, and any value is still bound
+  // by the provider's own certificate-lifetime cap.
+  uint64 session_ttl_secs = 4;
+
+  // Create the account with no second factor.
+  //
+  // Any account here can mint a certificate the whole mesh honours, so a
+  // password alone makes fleet-wide administrative access a phishable secret.
+  // For an automation account that cannot present a code — which should
+  // generally hold a long-lived certificate issued offline instead.
+  bool no_totp = 5;
+}
+
+// Answer to a CreateUserRequest.
+message CreateUserResponse {
+  // The `otpauth://` enrolment URI for the account's new second factor, or
+  // empty when it was created without one.
+  //
+  // Shown once.  The authority does not serve it again and the secret cannot be
+  // recovered from it, so an account whose URI was lost is one whose password
+  // must be reset.
+  string totp_enrolment_uri = 1;
+}
+
+// Remove a user account (provider mode).
+//
+// Ends the account's ability to obtain *new* sessions.  A certificate already
+// issued to it is unaffected — that is what `RevokeNode` and expiry are for —
+// so removing a compromised account is two acts, not one.
+//
+// Answered with the empty response on success.  The authority refuses to remove
+// the last account that can still administer the mesh: `CreateUserRequest` and
+// this one both need a full management grant, so an authority left with no
+// enabled administrator has a user store that can no longer be changed over
+// this API in either direction, recoverable only with `wayfinderctl user add`
+// on the provider host.
+message RemoveUserRequest {
+  // The account to remove.  A name that is not on file is an error rather than
+  // a silent success: whoever sent it has a wrong idea about the roster.
+  string username = 1;
+}
+
+// The result of an AuthenticateUserRequest.
+message AuthenticateUserResponse {
+  // The outcome.  Exactly one variant is set.
+  oneof outcome {
+    // The credentials verified; the session certificate is ready to use.
+    UserSessionIssued issued = 1;
+
+    // The credentials did not verify.  One variant covering unknown account,
+    // wrong password, wrong code, locked and disabled: distinguishing them
+    // would make this endpoint a user-enumeration oracle reachable by anyone
+    // who can route to the provider.
+    UserSessionRejected rejected = 2;
+  }
+}
+
+// A successfully issued session certificate.
+message UserSessionIssued {
+  // The issued membership certificate as raw `MembershipCert` bytes, carrying
+  // CERT_FLAG_USER plus the account's capability (admin or viewer) and bound
+  // to the session keys named in the request.
+  bytes cert = 1;
+
+  // The mesh trust anchor as raw `TrustAnchor` bytes, so the client can verify
+  // what it was just handed without fetching it separately.
+  bytes trust_anchor = 2;
+}
+
+// A refused login.  Deliberately carries no reason: any detail here would be
+// the enumeration oracle the outcome oneof's own comment describes.
+message UserSessionRejected {
+  // Human-readable text, identical for every failure reason.  Present so a
+  // client has something to print, not so it has something to branch on.
+  string message = 1;
+}
+
 // A successfully issued certificate: the signed cert plus the trust anchor it
 // chains to, so the enrolling node has everything it needs to enable auth.
 message CsrIssued {
@@ -1197,6 +1393,20 @@ message IssuedCert {
   // (rather than removed) so the operator can see the revocation; the node's
   // frames are dropped mesh-wide and its cert will also passively expire.
   bool revoked = 5;
+
+  // Whether this is a person's session certificate (CERT_FLAG_USER) rather
+  // than a device's membership certificate.  Both bind to a MAC, so without
+  // this an operator reading the list has no way to tell one from the other —
+  // which is the whole reason the flag exists.
+  bool user = 6;
+
+  // Whether the certificate carries the management-administration capability
+  // (CERT_FLAG_ADMIN).
+  bool admin = 7;
+
+  // Whether the certificate carries the read-only management capability
+  // (CERT_FLAG_VIEWER).  Never set alongside admin, which subsumes it.
+  bool viewer = 8;
 }
 
 // Answer to a ListCertsRequest: the certificates this provider has issued.
@@ -1293,5 +1503,14 @@ message WayfinderResponse {
 
     // Response to RevealEnrollmentTokenRequest.
     RevealEnrollmentTokenResponse enrollment_token = 19;
+
+    // Response to AuthenticateUserRequest.
+    AuthenticateUserResponse authenticate_user = 20;
+
+    // Response to ListUsersRequest.
+    ListUsersResponse list_users = 21;
+
+    // Response to CreateUserRequest.
+    CreateUserResponse create_user = 22;
   }
 }

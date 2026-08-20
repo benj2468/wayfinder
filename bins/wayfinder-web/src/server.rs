@@ -11,10 +11,12 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::Request;
+use axum::http::HeaderMap;
 use axum::http::HeaderValue;
 use axum::http::Method;
 use axum::http::StatusCode;
 use axum::http::header::CACHE_CONTROL;
+use axum::http::header::CONTENT_DISPOSITION;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::header::HOST;
 use axum::http::header::ORIGIN;
@@ -33,24 +35,23 @@ use tracing::warn;
 
 use crate::App;
 use crate::components::logo::FAVICON_SVG;
-use crate::conn::NodeConnection;
+use crate::session::Access;
 use crate::shell;
 
 /// Build the dashboard router: the wasm/CSS bundle, server-function endpoints,
 /// the server-rendered page routes, and a static-file fallback.
 ///
-/// `conn` is handed to both the server-function route and the page routes,
+/// `access` is handed to both the server-function route and the page routes,
 /// because a page rendered on the server runs the same resources the browser
-/// would and so calls the same server functions.
+/// would and so calls the same server functions. It is the credential source
+/// rather than a connection, so a page and a poll resolve the *same* session
+/// from the *same* cookie — see [`crate::session`].
 ///
 /// `hosts` is the set of names this dashboard answers to; see [`HostPolicy`]
-/// for why a dashboard with no login of its own has to care.
-pub fn build_router(
-    options: LeptosOptions,
-    conn: Arc<NodeConnection>,
-    hosts: HostPolicy,
-) -> Router {
-    let provide_conn = move || provide_context(Arc::clone(&conn));
+/// for why even a dashboard with a login has to care.
+pub fn build_router(options: LeptosOptions, access: Arc<Access>, hosts: HostPolicy) -> Router {
+    let download = Arc::clone(&access);
+    let provide_conn = move || provide_context(Arc::clone(&access));
     let hosts = Arc::new(hosts);
 
     // The build artifacts get their own service rather than riding the
@@ -68,6 +69,32 @@ pub fn build_router(
         // reads `site-root`, which only `cargo leptos` populates, so a plain
         // `cargo build` of the `ssr` binary would 404 its own icon.
         .route("/favicon.svg", get(favicon))
+        // The one route that answers with something other than a page or a
+        // server function: the signed-in viewer's own credential, as a file.
+        //
+        // A plain `GET` behind an `<a download>` rather than a `#[server]`
+        // function, because a download is a thing browsers already do
+        // properly: the response names the file, the browser saves it, and
+        // nothing has to pass through wasm — so it still works on a page whose
+        // hydration failed, which is exactly the page somebody is trying to
+        // rescue a credential off.
+        //
+        // Under `/api/` deliberately, and not for tidiness: [`is_guarded`]
+        // treats everything below that prefix as needing to have come from
+        // this dashboard's own page, so the cross-site check applies to it the
+        // same as to a mutation. `SameSite=Strict` closes the same door from
+        // the other side — a cross-site navigation carries no session cookie,
+        // so it resolves to no session and hands out nothing.
+        .route(
+            crate::bundle::DOWNLOAD_PATH,
+            get({
+                let access = Arc::clone(&download);
+                move |headers: HeaderMap| {
+                    let access = Arc::clone(&access);
+                    async move { auth_bundle(&access, &headers) }
+                }
+            }),
+        )
         // `POST` only. No server function uses a GET encoding, so a GET arm
         // would be unreachable today — and a CSRF amplifier the moment one did,
         // because a GET endpoint is forgeable from an `<img>` tag with no
@@ -353,6 +380,69 @@ async fn revalidate(request: Request, next: Next) -> Response {
         .entry(CACHE_CONTROL)
         .or_insert(HeaderValue::from_static("no-cache"));
     response
+}
+
+/// Serve the signed-in viewer their own credential as a `.wfauth` file.
+///
+/// Resolved from the session cookie and nothing else, so a viewer can download
+/// their own credential and no one else's — there is no id in the URL to change
+/// and no account to name. No session is a `403`, in the same words a poll
+/// without one gets, because the remedy is the same: sign in.
+///
+/// `no-store`, not the router's default `no-cache`: this is a private key, and
+/// the difference between "revalidate before reusing" and "do not write this to
+/// disk at all" is the whole point on a shared machine.
+fn auth_bundle(access: &Access, headers: &HeaderMap) -> Response {
+    let id = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(crate::session::id_from_cookie_header);
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+
+    let Some(bundle) = access.export(id, now_unix) else {
+        return (StatusCode::FORBIDDEN, crate::session::NEEDS_LOGIN).into_response();
+    };
+
+    // Worth a line in the operator's log, and at `info!` rather than `debug!`:
+    // a credential that was ephemeral and confined to this process has just
+    // become a file somebody carries. Everything else about the session is
+    // already logged at the sign-in that opened it.
+    tracing::info!(
+        username = %bundle.username,
+        expires_unix = bundle.not_after,
+        "session credential downloaded"
+    );
+
+    let disposition = format!("attachment; filename=\"{}\"", bundle.filename());
+    match HeaderValue::from_str(&disposition) {
+        Ok(disposition) => (
+            [
+                // Not `application/json`, though it is: the browser is being
+                // asked to save this, not to render or sniff it.
+                (
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("application/octet-stream"),
+                ),
+                (CACHE_CONTROL, HeaderValue::from_static("no-store")),
+                (CONTENT_DISPOSITION, disposition),
+            ],
+            bundle.encode(),
+        )
+            .into_response(),
+        Err(error) => {
+            // Unreachable: `AuthBundle::filename` reduces the user name to
+            // ASCII alphanumerics before it gets here, which is exactly what
+            // stops a name reaching this header as a second header field.
+            warn!(%error, "the credential filename is not a header value");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "cannot name this credential file",
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Serve the site icon.

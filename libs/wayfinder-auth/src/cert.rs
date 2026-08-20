@@ -27,6 +27,40 @@ pub const CERT_VERSION: u8 = 1;
 /// [`VerifiedCert::admin`]).
 pub const CERT_FLAG_ADMIN: u8 = 0x01;
 
+/// [`MembershipCert::flags`] bit marking the holder as a **person, not a
+/// device**: a short-lived session certificate minted by the certificate
+/// authority in exchange for user credentials, rather than a membership
+/// certificate issued to a node that routes.
+///
+/// It grants nothing on its own — capability is [`CERT_FLAG_ADMIN`] or
+/// [`CERT_FLAG_VIEWER`], and this bit is orthogonal to both. What it buys is
+/// that `ListCerts` and the security tab can tell an operator's credential
+/// apart from a node's, which is otherwise unanswerable: both are certificates
+/// bound to a MAC, and a user's MAC is derived from a session key that exists
+/// only for the length of a shift.
+///
+/// Part of the signed body, so it is decided by the issuer and cannot be
+/// claimed. That is also why it exists *before* the first user certificate is
+/// issued rather than after: retrofitting a signed flag means re-issuing every
+/// certificate that predates it.
+pub const CERT_FLAG_USER: u8 = 0x02;
+
+/// [`MembershipCert::flags`] bit granting the **read-only management
+/// capability**: the holder may invoke the management API's queries (routing
+/// table, link quality, metrics, logs) but none of its mutations and none of
+/// its secrets.
+///
+/// Deliberately a bit of its own rather than "a verified certificate that is
+/// not an admin". Every device on the mesh already holds a verified non-admin
+/// certificate, so a tier granted by *absence* would hand every node read
+/// access to every other node's management API in one release, with nothing in
+/// any configuration changing to say so. Earned by a bit, the tier is granted
+/// deliberately or not at all.
+///
+/// [`CERT_FLAG_ADMIN`] subsumes it: an admin certificate need not also carry
+/// this bit to read.
+pub const CERT_FLAG_VIEWER: u8 = 0x04;
+
 /// Domain-separation label folded into the fingerprint hash, so it can never
 /// collide with another `Blake2s256` use over the same or overlapping bytes
 /// elsewhere in the crate (e.g. [`crate::key::Keypair::pairwise_key`]).
@@ -46,9 +80,10 @@ const CERT_FINGERPRINT_LABEL: &[u8] = b"wayfinder-certfp-v1";
 pub struct MembershipCert {
     /// Layout/version marker; must equal [`CERT_VERSION`].
     pub version: u8,
-    /// Capability bits, part of the signed body.  Currently only
-    /// [`CERT_FLAG_ADMIN`] is defined (the management-administration
-    /// capability); the remaining bits are reserved and sent as 0.
+    /// Capability bits, part of the signed body: [`CERT_FLAG_ADMIN`] (full
+    /// management), [`CERT_FLAG_VIEWER`] (read-only management) and
+    /// [`CERT_FLAG_USER`] (the holder is a person's session, not a device).
+    /// The remaining bits are reserved and sent as 0.
     pub flags: u8,
     /// The mesh this cert grants membership to (must match the verifier's
     /// trust anchor).  Network byte order.
@@ -138,6 +173,16 @@ pub struct VerifiedCert {
     /// build one directly; the guarantee is the construction convention, not a
     /// type-level seal.)
     pub admin: bool,
+    /// Whether the cert carries the read-only management capability
+    /// ([`CERT_FLAG_VIEWER`]).  Same trust story as [`admin`](Self::admin).
+    /// An [`admin`](Self::admin) cert may read without also setting this;
+    /// callers deciding "may this read?" should accept either.
+    pub viewer: bool,
+    /// Whether the cert marks a person's session rather than a device
+    /// ([`CERT_FLAG_USER`]).  Carries no capability of its own — it is what
+    /// lets an operator's credential be told apart from a node's in
+    /// `ListCerts` and the security tab.
+    pub user: bool,
 }
 
 impl TrustAnchor {
@@ -205,6 +250,8 @@ impl TrustAnchor {
             x_pubkey: cert.x_pubkey,
             not_after,
             admin: cert.flags & CERT_FLAG_ADMIN != 0,
+            viewer: cert.flags & CERT_FLAG_VIEWER != 0,
+            user: cert.flags & CERT_FLAG_USER != 0,
         })
     }
 }

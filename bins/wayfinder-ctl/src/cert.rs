@@ -12,6 +12,9 @@ use anyhow::bail;
 use clap::Subcommand;
 use interfaces::frame::Mac;
 use wayfinder_auth::Authority;
+use wayfinder_auth::CERT_FLAG_ADMIN;
+use wayfinder_auth::CERT_FLAG_USER;
+use wayfinder_auth::CERT_FLAG_VIEWER;
 use wayfinder_auth::Keypair;
 use wayfinder_auth::MembershipCert;
 use wayfinder_auth::TrustAnchor;
@@ -93,6 +96,16 @@ pub enum CertCommand {
         /// member whose only job is to carry traffic.
         #[arg(long)]
         admin: bool,
+        /// Instead grant the read-only management capability: the holder may
+        /// invoke the management API's queries (routing table, link quality,
+        /// metrics, logs) and none of its mutations or secrets.
+        ///
+        /// A capability of its own, not the absence of `--admin`: an ordinary
+        /// membership cert reaches nothing on an enrolled node's management
+        /// API, which is deliberate, since every node on the mesh holds one.
+        /// Mutually exclusive with `--admin`, which subsumes it.
+        #[arg(long, conflicts_with = "admin")]
+        viewer: bool,
     },
 
     /// Decode and print a certificate or trust-anchor file.
@@ -122,8 +135,9 @@ pub fn run(cmd: CertCommand) -> anyhow::Result<()> {
             not_after,
             out_cert,
             admin,
+            viewer,
         } => issue(
-            &ca_seed, mesh_id, &mac, &node_seed, not_before, not_after, &out_cert, admin,
+            &ca_seed, mesh_id, &mac, &node_seed, not_before, not_after, &out_cert, admin, viewer,
         ),
         CertCommand::Show { file } => show(&file),
     }
@@ -188,6 +202,7 @@ fn issue(
     not_after: u64,
     out_cert: &Path,
     admin: bool,
+    viewer: bool,
 ) -> anyhow::Result<()> {
     if not_after <= not_before {
         bail!("--not-after ({not_after}) must be greater than --not-before ({not_before})");
@@ -199,9 +214,11 @@ fn issue(
         None => node.derived_mac(),
     };
 
-    // Two distinct calls rather than a flags argument: the admin capability is
-    // a privilege grant, and `issue_admin_cert` is the name that says so at
-    // every call site that has one.
+    // Distinct calls rather than a flags argument: a capability is a privilege
+    // grant, and the constructor's name is what says so at every call site that
+    // has one. `issue_user_cert` also stamps `CERT_FLAG_USER`, which is why the
+    // viewer path uses it — a read-only credential is a person's, not a
+    // device's.
     let cert = if admin {
         authority.issue_admin_cert(
             mac,
@@ -209,6 +226,15 @@ fn issue(
             node.x_pubkey(),
             not_before,
             not_after,
+        )
+    } else if viewer {
+        authority.issue_user_cert(
+            mac,
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            not_before,
+            not_after,
+            false,
         )
     } else {
         authority.issue_cert(
@@ -229,6 +255,8 @@ fn issue(
     // cert would train the reader to skip the one line that matters.
     if admin {
         println!("  capability: management-administration (admin)");
+    } else if viewer {
+        println!("  capability: read-only management (viewer)");
     }
     Ok(())
 }
@@ -253,6 +281,7 @@ fn show(file: &Path) -> anyhow::Result<()> {
                 cert.not_before.get(),
                 cert.not_after.get()
             );
+            println!("  capability: {}", describe_flags(cert.flags));
         }
         _ => {
             let anchor = TrustAnchor::from_bytes(&bytes)
@@ -263,6 +292,30 @@ fn show(file: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Render a certificate's signed capability bits for `cert show`.
+///
+/// Unlike `issue`, which prints a capability line only when there is one to
+/// print, `show` prints this unconditionally: someone running `show` is asking
+/// what a certificate *is*, and "none (routing membership only)" is the answer
+/// most worth being explicit about — it is what an ordinary node holds, and it
+/// is what reaches nothing on an enrolled node's management API.
+fn describe_flags(flags: u8) -> String {
+    let mut parts = Vec::new();
+    if flags & CERT_FLAG_ADMIN != 0 {
+        parts.push("management-administration (admin)");
+    }
+    if flags & CERT_FLAG_VIEWER != 0 {
+        parts.push("read-only management (viewer)");
+    }
+    if flags & CERT_FLAG_USER != 0 {
+        parts.push("user session, not a device");
+    }
+    if parts.is_empty() {
+        return "none (routing membership only)".into();
+    }
+    parts.join(", ")
 }
 
 /// Read a 32-byte seed file.  `pub(crate)` so `enroll` can reuse an

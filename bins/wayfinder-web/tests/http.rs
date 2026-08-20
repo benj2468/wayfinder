@@ -32,7 +32,7 @@ async fn fetch_snapshot_server_fn_answers_over_http() {
     let conn = common::serve_mock_node().await;
     let app = wayfinder_web::server::build_router(
         common::test_leptos_options(),
-        conn,
+        common::static_access(conn),
         common::test_hosts(),
     );
 
@@ -74,7 +74,7 @@ async fn dashboard_page_renders() {
     let conn = common::serve_mock_node().await;
     let app = wayfinder_web::server::build_router(
         common::test_leptos_options(),
-        conn,
+        common::static_access(conn),
         common::test_hosts(),
     );
 
@@ -107,12 +107,13 @@ async fn every_tab_route_is_served() {
         "/links",
         "/metrics",
         "/security",
+        "/provider",
         "/logs",
     ] {
         let conn = common::serve_mock_node().await;
         let app = wayfinder_web::server::build_router(
             common::test_leptos_options(),
-            conn,
+            common::static_access(conn),
             common::test_hosts(),
         );
 
@@ -139,7 +140,7 @@ async fn set_link_gate_server_fn_answers_over_http() {
     let conn = common::serve_mock_node().await;
     let app = wayfinder_web::server::build_router(
         common::test_leptos_options(),
-        conn,
+        common::static_access(conn),
         common::test_hosts(),
     );
 
@@ -172,7 +173,7 @@ async fn the_enrollment_token_is_served_only_by_its_own_endpoint() {
     let conn = common::serve_mock_provider_node().await;
     let app = wayfinder_web::server::build_router(
         common::test_leptos_options(),
-        conn,
+        common::static_access(conn),
         common::test_hosts(),
     );
 
@@ -232,7 +233,11 @@ async fn the_enrollment_token_is_served_only_by_its_own_endpoint() {
 async fn the_wasm_bundle_is_revalidated_rather_than_reused_blind() {
     let site = common::SiteRoot::new();
     let conn = common::serve_mock_node().await;
-    let app = wayfinder_web::server::build_router(site.options(), conn, common::test_hosts());
+    let app = wayfinder_web::server::build_router(
+        site.options(),
+        common::static_access(conn),
+        common::test_hosts(),
+    );
 
     let response = app
         .oneshot(
@@ -267,7 +272,11 @@ async fn the_wasm_bundle_is_revalidated_rather_than_reused_blind() {
 async fn revalidating_the_bundle_costs_a_304_not_another_copy() {
     let site = common::SiteRoot::new();
     let conn = common::serve_mock_node().await;
-    let app = wayfinder_web::server::build_router(site.options(), conn, common::test_hosts());
+    let app = wayfinder_web::server::build_router(
+        site.options(),
+        common::static_access(conn),
+        common::test_hosts(),
+    );
 
     let first = app
         .clone()
@@ -310,7 +319,7 @@ async fn the_page_is_revalidated_rather_than_reused_blind() {
     let conn = common::serve_mock_node().await;
     let app = wayfinder_web::server::build_router(
         common::test_leptos_options(),
-        conn,
+        common::static_access(conn),
         common::test_hosts(),
     );
 
@@ -336,7 +345,7 @@ async fn the_favicon_keeps_its_long_cache() {
     let conn = common::serve_mock_node().await;
     let app = wayfinder_web::server::build_router(
         common::test_leptos_options(),
-        conn,
+        common::static_access(conn),
         common::test_hosts(),
     );
 
@@ -363,7 +372,7 @@ async fn favicon_is_served() {
     let conn = common::serve_mock_node().await;
     let app = wayfinder_web::server::build_router(
         common::test_leptos_options(),
-        conn,
+        common::static_access(conn),
         common::test_hosts(),
     );
 
@@ -396,7 +405,7 @@ async fn dashboard_page_links_the_favicon() {
     let conn = common::serve_mock_node().await;
     let app = wayfinder_web::server::build_router(
         common::test_leptos_options(),
-        conn,
+        common::static_access(conn),
         common::test_hosts(),
     );
 
@@ -424,7 +433,7 @@ async fn dashboard_page_renders_the_logo() {
     let conn = common::serve_mock_node().await;
     let app = wayfinder_web::server::build_router(
         common::test_leptos_options(),
-        conn,
+        common::static_access(conn),
         common::test_hosts(),
     );
 
@@ -459,7 +468,7 @@ async fn a_cross_site_post_to_a_server_fn_is_refused() {
     let conn = common::serve_mock_node().await;
     let app = wayfinder_web::server::build_router(
         common::test_leptos_options(),
-        conn,
+        common::static_access(conn),
         common::test_hosts(),
     );
 
@@ -493,7 +502,7 @@ async fn a_same_site_post_from_another_origin_is_refused() {
     let conn = common::serve_mock_node().await;
     let app = wayfinder_web::server::build_router(
         common::test_leptos_options(),
-        conn,
+        common::static_access(conn),
         common::test_hosts(),
     );
 
@@ -519,7 +528,7 @@ async fn a_foreign_origin_alone_is_refused() {
     let conn = common::serve_mock_node().await;
     let app = wayfinder_web::server::build_router(
         common::test_leptos_options(),
-        conn,
+        common::static_access(conn),
         common::test_hosts(),
     );
 
@@ -544,7 +553,7 @@ async fn a_same_origin_post_is_served() {
     let conn = common::serve_mock_node().await;
     let app = wayfinder_web::server::build_router(
         common::test_leptos_options(),
-        conn,
+        common::static_access(conn),
         common::test_hosts(),
     );
 
@@ -577,7 +586,7 @@ async fn a_request_with_no_origin_headers_is_served() {
     let conn = common::serve_mock_node().await;
     let app = wayfinder_web::server::build_router(
         common::test_leptos_options(),
-        conn,
+        common::static_access(conn),
         common::test_hosts(),
     );
 
@@ -603,7 +612,7 @@ async fn a_foreign_host_is_refused() {
     let conn = common::serve_mock_node().await;
     let app = wayfinder_web::server::build_router(
         common::test_leptos_options(),
-        conn,
+        common::static_access(conn),
         common::test_hosts(),
     );
 
@@ -629,7 +638,7 @@ async fn a_foreign_host_is_refused_on_a_page_route_too() {
     let conn = common::serve_mock_node().await;
     let app = wayfinder_web::server::build_router(
         common::test_leptos_options(),
-        conn,
+        common::static_access(conn),
         common::test_hosts(),
     );
 
@@ -654,7 +663,7 @@ async fn the_host_is_matched_by_name_not_by_port() {
     let conn = common::serve_mock_node().await;
     let app = wayfinder_web::server::build_router(
         common::test_leptos_options(),
-        conn,
+        common::static_access(conn),
         common::test_hosts(),
     );
 
@@ -679,7 +688,7 @@ async fn an_operator_named_host_is_served() {
     let conn = common::serve_mock_node().await;
     let app = wayfinder_web::server::build_router(
         common::test_leptos_options(),
-        conn,
+        common::static_access(conn),
         common::test_hosts().allow(["wayfinder.example"]),
     );
 
@@ -709,7 +718,7 @@ async fn server_fns_are_not_reachable_by_get() {
     let conn = common::serve_mock_node().await;
     let app = wayfinder_web::server::build_router(
         common::test_leptos_options(),
-        conn,
+        common::static_access(conn),
         common::test_hosts(),
     );
 

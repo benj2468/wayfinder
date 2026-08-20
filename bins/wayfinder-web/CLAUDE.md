@@ -1,8 +1,9 @@
 # bins/wayfinder-web
 
-A browser dashboard for a running node: the same seven views `wayfinder-tui`
-shows in a terminal, reachable over HTTP. Built with Leptos in SSR mode — an
-axum server plus a wasm hydration bundle, compiled from this one crate.
+A browser dashboard for a running node: the seven views `wayfinder-tui` shows in
+a terminal, reachable over HTTP, plus a **Provider** tab the TUI has no
+equivalent for. Built with Leptos in SSR mode — an axum server plus a wasm
+hydration bundle, compiled from this one crate.
 
 ## The constraint that shapes everything
 
@@ -54,17 +55,34 @@ be bumped as one:
   whole client for one exchange, so a ten-RPC poll costs one lock.
 - `snapshot.rs` — `NodeSnapshot`, the bundle every tab reads, plus its fetcher.
   Carries the generated proto types directly; there is no parallel DTO layer.
+- `session.rs` — who is looking and what credential that gets them: the two
+  `Access` modes, the session store (one `NodeConnection` per signed-in viewer),
+  and the cookie mechanics. The shared `Viewer`/`SessionInfo`/`LoginResult`
+  types cross the wire; everything else is `ssr`-gated within the module.
+- `bundle.rs` — the `.wfauth` credential file: a session's seed and certificate
+  as JSON, plus the checks a file gets on the way back in. Only its two
+  constants (the extension, the download path) are ungated — the browser names
+  both and looks inside neither.
 - `api.rs` — the `#[server]` functions, thin wrappers over the above. Every one
   sets `endpoint` explicitly; the derived paths carry a rename-sensitive hash.
+  `connection()` is where the two modes converge: static hands back the
+  process's connection, login resolves the cookie to a session's own.
 - `state.rs` — what accumulates across polls (log scrollback, throughput trend).
 - `format.rs` — every display conversion, so none of them live in a `view!`
   macro where they cannot be tested.
-- `components/` — the tabs. Pure functions of the dashboard state. The one
-  exception is `logo.rs`: the mark, drawn inline so the ink can follow the
-  theme, and the favicon `server.rs` serves from its own route. It carries a
-  second copy of the geometry in `assets/logo/`, pinned to it by unit tests —
-  see that directory's README before replacing the logo.
+- `components/` — the tabs. Pure functions of the dashboard state. `security.rs`
+  is about *this node*: who it believes it is, who it believes its neighbours
+  are, what it refuses to do without a certificate. `provider.rs` is about the
+  node's other job, which most nodes do not have at all — deciding who else gets
+  in: the accounts, the enrollment policy, what a joining node must be told, and
+  the queue of nodes waiting. The one exception to "pure function of the state"
+  is `logo.rs`: the mark, drawn inline so the ink can follow the theme, and the
+  favicon `server.rs` serves from its own route. It carries a second copy of the
+  geometry in `assets/logo/`, pinned to it by unit tests — see that directory's
+  README before replacing the logo.
 - `clipboard.rs` — the one copy-to-clipboard path, browser-side only.
+- `filepicker.rs` — the one read-a-chosen-file path, browser-side only, for the
+  sign-in form's credential file. Reads bytes and judges nothing.
 - `mock.rs` (`mock-node` feature) — a canned node, for tests and for
   `examples/mock_node.rs`.
 
@@ -164,6 +182,15 @@ cargo test -p wayfinder-web --features mock-node     # all of the below
 - `tests/render.rs` — each tab rendered to markup from a seeded dashboard.
   Catches a tab reading the wrong field or inverting an emptiness check, which
   every other test above would pass.
+- `tests/session.rs` — a real sign-in against a mock node that is its own
+  certificate authority: password in, cookie out, and the node accepting the
+  connection that certificate authenticates. Catches the failure nothing else
+  can — a login that succeeds and hands back a credential the node refuses.
+  Also the whole `.wfauth` round trip: download, sign back in with the file
+  alone, poll the node with what it produced. One of those tests runs against a
+  **dead provider address** (`common::login_router_with_dead_provider`), and it
+  is the only thing that proves the feature's actual claim — a bundle sign-in
+  that quietly asked the provider anyway would pass every other test here.
 
 ## Charts
 
@@ -175,11 +202,78 @@ bytes per second — and the scale stays anchored at zero.
 
 ## Security posture
 
-No authentication of its own. It binds loopback by default and warns on any
-other bind. The server process holds the mesh identity, so anyone who can reach
-the port has whatever access that identity carries; exposing it is a
-reverse-proxy's job. A session layer is a later, separable change — do not
-quietly widen the bind default in the meantime.
+**Two credential modes, chosen once at startup by `--provider`** (`session.rs`,
+and §8.3 of `docs/design/06-management-api-authentication.md`):
+
+- **Login mode** (`--provider <addr>`) — the process holds *no* credential. A
+  viewer signs in, the provider issues a short-lived session certificate bound
+  to a keypair this process generates for them, and that session is what reaches
+  the node. No session, no node access. The session id lives in an `HttpOnly;
+  SameSite=Strict` cookie; the browser never holds a key, here as everywhere
+  else in this crate.
+- **Static mode** (`--identity`/`--cert`, or `--serial`) — one credential for
+  the whole process, shared by everyone who can reach the port. Kept
+  deliberately, because two deployments have no login available and no other way
+  in: an **un-enrolled node**, which has no user store to sign in to and admits
+  only a client proving the node's own key, and an **embedded node over
+  `--serial`**, which has no authentication at all. It warns at startup about
+  exactly what it is.
+
+Neither mode terminates TLS, so the bind address is still a boundary: loopback
+by default, a reverse proxy's job to expose, and a password crossing a
+non-loopback bind crosses it in the clear unless something else is terminating
+TLS in front.
+
+**A signed-in viewer can download their credential as a file** (`bundle.rs`,
+the `/api/auth_bundle` route in `server.rs`, and `api::login_with_bundle`). It
+exists because §8.3's offline case had no answer short of running the dashboard
+in static mode: a session survives losing the provider, but the session store is
+in memory, so restarting the dashboard locked everyone out until the certificate
+authority came back. The file is that session's own seed and certificate, and
+handing it back to the sign-in form rebuilds a session with **no contact with
+the provider at all**. Five things govern it:
+
+- **This is the one place the browser holds a key, deliberately.** Everywhere
+  else in this crate the rule is absolute; here the whole point is giving the
+  *person* their credential so it can outlive the process that minted it. The
+  file is not encrypted — that would need a second secret they have to keep
+  anyway — and it expires exactly when the session it came from does, which is
+  why the expiry is in the *filename* rather than only inside the file.
+- **It is a plain `GET` behind an `<a download>`, not a `#[server]` function.**
+  Browsers do downloads properly: the response names the file and nothing passes
+  through wasm — so it still works on a page whose hydration panicked, which is
+  exactly the page somebody is trying to rescue a credential off. `download` on
+  the anchor is also what makes `leptos_router` keep its hands off the click.
+  The route sits under `/api/` so `is_guarded` covers it, and `SameSite=Strict`
+  means a cross-site navigation carries no cookie and so resolves to no session.
+- **It is served only to the session it belongs to.** There is no id in the URL,
+  so the whole of the access control is which session the cookie names.
+  `Access::export` answers `None` in **static mode, always**: that credential
+  belongs to the process, and serving it would turn "can load this page" into
+  "holds the mesh's admin key, portably, forever".
+- **A bundle sign-in asks the node before it calls the session real.** This
+  process holds no trust anchor — in login mode it holds no mesh identity at all
+  — so it *cannot* check the mesh root's signature. It checks what it can (the
+  certificate belongs to the key beside it, the window contains now) and then
+  proves the rest by using it, with one `GetNodeInfo` on the node's read-only
+  tier. Skip that round trip and a forged or revoked file yields a dashboard
+  that looks signed in, names a capability, and fails every poll — which reads
+  as "the node is down".
+- **Its refusals are specific, unlike the password form's.** The reticence there
+  exists because a password refusal is an oracle anyone who can load the page
+  may query. A credential file is the person's *own*: there is no account to
+  enumerate, and "this expired on the 3rd" is the difference between downloading
+  a new one and filing a bug.
+
+**`<Routes>` must stay unconditional in `App`.** `generate_route_list` walks the
+app once at startup, with no request and so no session, to discover the routes
+to register — so a `<Routes>` behind "is anyone signed in?" registers nothing and
+every tab but the index answers 404, in both modes, from the first boot. That is
+why a signed-out page renders the whole shell and *hides* it (`wf-shell-hidden`,
+`display: none`, which takes it out of the tab order and the accessibility tree
+too) with the sign-in form over the top, rather than not rendering it. Nothing
+leaks by that: no tab fetches anything of its own, and the polling loop does not
+run while signed out. `tests/session.rs` pins both halves.
 
 **The bind address alone does not make it unreachable, which is why
 `server.rs` carries two gates** (`HostPolicy`, and the `known_host_only` /
@@ -197,7 +291,10 @@ quietly widen the bind default in the meantime.
   sends it cross-origin with no preflight and `server_fn` checks nothing
   itself. `Sec-Fetch-Site` and `Origin` are checked independently and each is
   only checked when present; a request carrying neither is not a browser and
-  has no session for a forgery to borrow.
+  has no session for a forgery to borrow. `SameSite=Strict` on the session
+  cookie closes the same hole from the other end in login mode — the browser
+  does not attach the cookie to a cross-site request at all — but the layer
+  stays, because static mode has no cookie to protect.
 
 **Both are router-wide layers, and they have to be.**
 `leptos_routes_with_context` registers every `#[server]` function at its own
@@ -206,8 +303,8 @@ wildcard this crate declares — so a layer attached to that wildcard route neve
 sees a real server-function call. It compiles, the tests that only assert a
 `200` still pass, and the gate is simply never invoked.
 
-Neither gate is a substitute for the session layer; both stop the deployment
-being remotely administrable by anyone who can get an operator to open a tab.
+Neither gate is a substitute for signing in; both stop the deployment being
+remotely administrable by anyone who can get an operator to open a tab.
 
 **The Security tab enrolls the node**, too: its "Join a mesh" panel asks a
 provider to certify the node and installs what comes back (`enroll.rs`, and
@@ -229,9 +326,9 @@ changing it:
   how a certificate is collected after approval, so the panel simply asks again
   on a timer while it waits.
 
-**The provider end of that exchange shows what a joining node must be told** —
-its address, the key that pins it, and the enrollment token. Two rules govern
-that panel:
+**The Provider tab is the other end of that exchange**, and it shows what a
+joining node must be told — the provider's address, the key that pins it, and
+the enrollment token. Two rules govern that panel:
 
 - **The token is fetched, never polled.** `GetSecurityStatus` reports only
   `enrollment_token_set`; the value comes back from `reveal_enrollment_token`
@@ -255,15 +352,46 @@ that panel:
 replaced once a second, so a `move ||` closure over it constructs a *fresh*
 component every second — and a component's `signal(String::new())` fields are
 re-created empty, wiping whatever was half-typed and taking the focus with it.
-The Security tab's "Join a mesh" and "How nodes join" panels are therefore
-driven from `Memo`s over the narrowest projection they need
-(`security::membership_of`), since a memo only notifies when its own value
+The Security tab's "Join a mesh" panel and the Provider tab's enrollment-policy
+and join-details panels are therefore driven from `Memo`s over the narrowest
+projection they need (`security::membership_of`, and the Provider tab's
+`enrollment`/`join_details`), since a memo only notifies when its own value
 changes. Widening one of those projections to something that moves on its own —
 a node list, a timestamp — silently restores the bug, which no markup test can
 see; `membership_ignores_everything_that_changes_on_its_own` is what guards it.
 
-**The Security tab writes, not just reads**, and that raises the stakes of
-the paragraph above. Whoever can reach this port can turn the node's
+**The Provider tab administers the mesh's accounts**, which is the surface with
+the longest reach on this dashboard: an account here mints certificates the
+whole mesh honours. Four things govern it:
+
+- **The roster is fetched, not polled.** It changes when somebody creates or
+  removes an account and at no other time, so `Users` holds a `Resource` it
+  refetches after its own mutations rather than putting the account list on the
+  once-a-second snapshot. That is also what keeps the create form from being
+  rebuilt mid-keystroke — the same failure the memoised panels above avoid.
+- **The first account cannot be created here.** Creating one over the API needs
+  the credential it creates, so `wayfinderctl user add` on the provider host
+  remains the only way to bootstrap. What this tab adds is every account after
+  that, and it is a real widening: an admin session can now mint another
+  account. The trade is stated in the proto (`CreateUserRequest`) — an admin can
+  already revoke nodes and rewrite the enrollment policy, so it grants no new
+  class of power, but it does put the user store on the network.
+- **The enrolment URI is shown once.** A TOTP secret is not recoverable from the
+  authority, so the panel holds the `otpauth://` URI on screen until dismissed,
+  says plainly that it will not be shown again, and offers it through the
+  clipboard rather than only as text on a screen someone else can see.
+- **The node refuses to strand itself, and the dashboard does not second-guess
+  it.** `MeshAuthority::remove_user` rejects removing the last account that can
+  still administer the mesh — both it and `CreateUser` need a full management
+  grant, so an authority with no enabled administrator has a user store that no
+  dashboard can change again. The *inherent* `CertAuthority::remove_user` has no
+  such guard on purpose: it is what `wayfinderctl user remove` calls on the
+  provider host, and it is the recovery path that refusal points at. The tab
+  shows the refusal as an error rather than pre-computing "is this the last
+  admin?" in the browser, per "the node is the authority" above.
+
+**The Security and Provider tabs write, not just read**, and that raises the
+stakes of the paragraph above. Whoever can reach this port can turn the node's
 fail-closed gate on or off, flip lazy cert distribution (a flag-day,
 wire-incompatible change for the whole mesh), and — on a certificate authority
 — change the enrollment policy, including clearing the enrollment token so any
@@ -271,10 +399,14 @@ node in range may join. Those changes **persist** on a node configured with a
 `runtime_state_path`, so they outlast the browser tab, the dashboard process,
 and the node's next restart.
 
-This was a deliberate call rather than an oversight: `revoke_node` was already
-exposed here with no authentication, so the port was already a full-privilege
-surface, and gating only the new controls would have implied a boundary that
-does not exist. The mitigation is the same one as before — do not expose the
-port — plus a confirmation dialog on each change that cannot be casually walked
-back. Adding the session layer would let all of this be scoped properly; until
-then, treat reachability of this port as equivalent to root on the mesh.
+**In login mode this is now scoped**, which it was not when these controls were
+added. Every one of them needs a full management grant, so a viewer account
+reaches none of them — `authz::permits` is the closed allowlist that decides,
+and `tests/session.rs` pins both halves of it (an admin lists and creates
+accounts; a viewer is refused the same calls).
+
+**In static mode it is not**, and that has not changed: one credential serves
+everyone who can reach the port, so treat reachability as equivalent to whatever
+that identity carries — root on the mesh, when it is an admin certificate. The
+mitigations there are the ones they always were: do not expose the port, and a
+confirmation dialog on each change that cannot be casually walked back.

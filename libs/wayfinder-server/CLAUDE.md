@@ -6,7 +6,7 @@ embedded node links only what it can run.
 | Layer | Feature | Files |
 |---|---|---|
 | `RouterAdapter` — projects a borrowed `CentralRouter` onto `WayfinderDataProvider` | always (`no_std` + `alloc`) | `adapter.rs`, `provider.rs`, `authz.rs`, `settings.rs` (trait half) |
-| host transports — authenticated TLS over TCP, plus an in-process channel | `std` (default) | `transport.rs`, `tls.rs`, `authority.rs`, `persistence.rs`, `settings.rs` (`SettingsFile`) |
+| host transports — authenticated TLS over TCP, plus an in-process channel | `std` (default) | `transport.rs`, `tls.rs`, `authority.rs`, `persistence.rs`, `users.rs`, `settings.rs` (`SettingsFile`) |
 | embedded transport — length-delimited frames over `embedded-io-async` | `embedded` | `framing.rs`, `embedded.rs` |
 
 `std` and `embedded` are mutually exclusive in practice — a target picks one.
@@ -56,7 +56,7 @@ Deliberately separated, and the boundary matters:
   (`decide_access` → `MgmtAccess`), with no transport and no crypto, so the
   policy is unit-testable standalone and identical across transports.
 
-Three grant tiers:
+Four grant tiers:
 
 - `GrantedAdmin` — a verified, non-revoked admin cert bound to the handshake key.
 - `GrantedSelfKey` — the client proved possession of the node's *own* key. A
@@ -75,16 +75,37 @@ Three grant tiers:
   connection (`AuthSnapshot::own_key`, `RouterAdapter::set_auth` writes through
   it) rather than cached at listener startup, so a seed a `SetAuth` rotates
   away from stops earning this grant on the very next connection.
+- `GrantedViewer` — a verified, non-revoked cert carrying `CERT_FLAG_VIEWER`.
+  Read-only: `permits` confines it to the queries and refuses every mutation
+  plus `RevealEnrollmentToken`, which is a read by shape and the mesh's
+  admission credential by content. **Earned by the bit, never by the absence of
+  the admin bit** — every device on the mesh holds a verified non-admin
+  certificate, so a tier granted by absence would be a tier the whole mesh
+  already had. A cert with neither bit is `Denied(NoCapability)`.
 - `GrantedEnrollment` — the client presented no cert at all. Admitted, but
-  `permits` confines it to `SubmitCsr` and `GetTrustAnchor`.
+  `permits` confines it to `SubmitCsr`, `GetTrustAnchor` and
+  `AuthenticateUser`.
 
 **Admission is per-connection; what an admitted client may invoke is
-per-request.** The first two tiers may invoke everything, so `permits` is really
-the definition of the third. That third tier exists because enrollment is
-otherwise impossible: a provider worth enrolling with is itself an enrolled
-member, so a node with no cert could never open the connection carrying its CSR.
-Admission control for it has not moved — it is the provider's enrollment token
-and the operator's approval.
+per-request.** The two full grants may invoke everything, so `permits` is really
+the definition of the other two. The enrollment tier exists because enrollment
+is otherwise impossible: a provider worth enrolling with is itself an enrolled
+member, so a node with no cert could never open the connection carrying its CSR
+— and, for the same reason, someone who has not logged in yet could never open
+the connection carrying their password. Admission control for it has not moved:
+the enrollment token and the operator's approval for a CSR, the password, the
+second factor and the per-account lockout for a login.
+
+**Authorization is revalidated, not snapshotted.** An authenticated connection
+re-requests the `AuthSnapshot` and re-runs `decide_access` every
+`AUTH_REVALIDATION_INTERVAL`; a changed verdict closes the connection with the
+same flat `"authentication denied"`. That is what makes `RevokeNode` reach an
+open session, and — because the clock is re-read with it — what makes a
+certificate expiring mid-session end that session. Before the handshake,
+`PreAuthSlots` bounds the population of not-yet-authenticated connections
+mesh-wide and per source IP, and refuses rather than queues at capacity;
+reads are capped at `MAX_FRAME_LEN` while responses are not, because a routing
+table is not a request and is not reachable before authentication.
 
 **Admission is decided again while the connection is open.** A connection has
 no bound, so deciding once at connect made `RevokeNode` a statement about
@@ -174,6 +195,56 @@ disclosed continuously to everything that touches the snapshot — including the
 log ring, through any `{:?}`. The value is a `SharedSecret` (`wayfinder-protos`)
 whose `Debug` redacts and whose reader is named `expose`, so every place it
 escapes is one a search finds.
+
+## The embedded serial port is unauthenticated, and opt-in because of it
+
+`embedded.rs`'s `serve` decodes a frame and forwards it to the router. There is
+no `Authenticate` first-frame requirement, no `decide_access` and no `permits`
+gate — the whole request surface, `SetAuth` and `SetConfig` included, is
+available to anything that can open the port. That is a resolved decision
+(F7 in `docs/design/06-management-api-authentication.md`), not an oversight
+waiting to be fixed: the port's threat model is physical access to the device,
+which on these boards also means access to an SWD header that reads flash
+outright, and a challenge-response would be a real protocol on a link with no
+connection boundary to hang it off.
+
+What follows is a requirement on whoever wires the port up: **bring it up only
+when a board is configured to, never unconditionally.** Enabling it is an act
+that means "this node's identity and configuration are available over
+`/dev/ttyACM*`", and it should read that way at the call site. Nothing enables
+it today — the nRF boards' management wiring was removed during BLE bring-up
+and has not returned.
+
+## The user store (`users.rs`)
+
+Named accounts that can be exchanged for a short-lived management certificate,
+at the CA and **never at a node**. The reasons are structural, not incidental:
+Argon2id at any honest parameter set wants tens of megabytes against a dongle's
+32 KiB heap; a password would be the only fleet-wide bearer secret in a system
+where everything else is scoped, expiring and revocable; and it would have to be
+replicated to every node. `AuthenticateUser` returns an ordinary membership
+certificate, so `decide_access`, the wire format and the `no_std` core are
+untouched and an embedded node never learns what a password is.
+
+Four rules to keep when touching it:
+
+- **A failed login is one answer.** Unknown account, wrong password, wrong
+  code, locked and disabled are all `AuthOutcome::Rejected`, and
+  `spend_absent_user_work` spends the same Argon2 work for an account that does
+  not exist — a uniform answer is no use if the timing answers instead.
+- **Every attempt is persisted**, success or failure. The failure counter and
+  the lockout live in the record; a failed attempt that is not durably counted
+  is a lockout an attacker can reset by making the process restart.
+- **A TOTP code is spent once.** The ±1-step skew window makes three codes live
+  at any instant, so `totp_last_step` is what stops one seen in transit from
+  being reused.
+- **The session lifetime is the account's**, chosen by the admin who granted it
+  (`UserRecord::session_ttl_secs`), not a constant here — still bounded by
+  `MAX_CERT_TTL_SECS`.
+
+Accounts are administered offline, by `wayfinderctl user` against the state
+file, for the same reason `cert init-ca` is: the first account cannot be created
+over the management API, because creating it needs the credential it creates.
 
 ## Persisting a runtime security setting
 

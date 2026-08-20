@@ -14,10 +14,14 @@
 #
 # The two share the `state` volume, which is how the dashboard gets an identity:
 # the node writes /var/lib/wayfinder/identity.seed on first boot, and the
-# dashboard reads that same file to bootstrap into an un-enrolled node. Once the
-# mesh has a CA, give the dashboard its own seed + membership cert instead
-# (`--identity`/`--cert`, and `--node-key` to pin the node) and drop the shared
-# volume — see the `web` service below.
+# dashboard reads that same file to bootstrap into an un-enrolled node. That is
+# the *static credential* mode, and it is the right one here: this node has no
+# certificate authority behind it, so there are no accounts to sign in to.
+#
+# Once the mesh has a CA, point the dashboard at it instead — `--provider
+# <ca-host>:7700 --provider-key <hex> --node-key <hex>` — and it holds no
+# credential at all: each viewer signs in for a session certificate of their
+# own, and the shared volume goes away with it.
 name: wayfinder
 services:
   node:
@@ -66,11 +70,12 @@ services:
     # Host networking, same as `node`. `--listen` (the dashboard's own bind
     # address, distinct from `--addr` below) is passed explicitly rather than
     # left to a default, because under host networking loopback is the *host's*
-    # real loopback and the difference is a security boundary: the dashboard has
-    # no auth of its own, so whoever reaches the port has the access the node
-    # identity carries (bins/wayfinder-web/CLAUDE.md). Widening it beyond the
-    # host needs a reverse proxy in front, per that doc, and `--allowed-host`
-    # naming that proxy.
+    # real loopback and the difference is a security boundary: this dashboard
+    # runs on a static credential and has no sign-in, so whoever reaches the
+    # port has the access the node identity carries
+    # (bins/wayfinder-web/CLAUDE.md). Widening it beyond the host needs a
+    # reverse proxy in front, per that doc, and `--allowed-host` naming that
+    # proxy.
     network_mode: host
     # --addr must be a literal socket address, not the `node` service name:
     # `network_mode: host` opts both containers out of Compose's embedded DNS,

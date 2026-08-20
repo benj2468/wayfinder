@@ -108,6 +108,93 @@ pub(crate) fn client_config(
     Ok(Arc::new(config))
 }
 
+/// A verifier that pins nothing and *records* whatever raw key the server
+/// presented.
+///
+/// For [`crate::probe_node_key`] alone: learning a node's key so an operator
+/// can be shown it and asked. Deliberately not reachable any other way — an
+/// unpinned management connection is a man-in-the-middle waiting to happen, and
+/// the only safe use of one is the moment before a human decides, on a
+/// connection that carries no request afterwards.
+#[derive(Debug)]
+struct RecordingServerVerifier {
+    /// The caller's slot, filled during the handshake. Shared rather than
+    /// internal because rustls hands the verifier over as an `Arc<dyn …>` with
+    /// no way back to the concrete type.
+    seen: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+    supported_algs: WebPkiSupportedAlgorithms,
+}
+
+impl ServerCertVerifier for RecordingServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let presented = raw_ed25519_from_spki(end_entity.as_ref()).ok_or_else(|| {
+            rustls::Error::General("server presented a non-Ed25519 raw key".into())
+        })?;
+        if let Ok(mut seen) = self.seen.lock() {
+            *seen = Some(presented);
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::General(
+            "TLS 1.2 is not supported by the management API".into(),
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        // Still verified: the signature proves the peer holds the private half
+        // of the key being recorded, so the fingerprint shown to the operator
+        // is one somebody actually possesses rather than one anybody can claim.
+        verify_raw_key_signature(message, cert, dss, &self.supported_algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.supported_algs.supported_schemes()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        true
+    }
+}
+
+/// Build a client config that records the server's key into `seen` instead of
+/// pinning one.
+pub(crate) fn probing_client_config(
+    own_seed: &[u8; 32],
+    seen: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+) -> Result<Arc<ClientConfig>, rustls::Error> {
+    let certified = certified_key_from_seed(own_seed)?;
+    let provider = Arc::new(ring::default_provider());
+    let verifier = Arc::new(RecordingServerVerifier {
+        seen,
+        supported_algs: provider.signature_verification_algorithms,
+    });
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_cert_resolver(Arc::new(AlwaysResolvesClientRawPublicKeys::new(certified)));
+    Ok(Arc::new(config))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

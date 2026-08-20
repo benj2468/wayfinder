@@ -66,12 +66,27 @@ pub fn Logs() -> impl IntoView {
                                             if f.is_empty() { "—".to_string() } else { f }
                                         }}
                                     </code>
-                                    <button
-                                        class="wf-button"
-                                        on:click=move |_| set_draft.set(Some(filter()))
-                                    >
-                                        "Change"
-                                    </button>
+                                    // `SetLogLevel` re-aims what the node
+                                    // records for everyone reading it, so it is
+                                    // an administrator's call. The filter in
+                                    // force is still shown to everybody: it is
+                                    // the difference between "nothing is
+                                    // happening" and "nothing is being
+                                    // recorded".
+                                    {move || {
+                                        dash.admin
+                                            .get()
+                                            .then(|| {
+                                                view! {
+                                                    <button
+                                                        class="wf-button"
+                                                        on:click=move |_| set_draft.set(Some(filter()))
+                                                    >
+                                                        "Change"
+                                                    </button>
+                                                }
+                                            })
+                                    }}
                                 </div>
                             }
                                 .into_any()
