@@ -366,11 +366,24 @@ impl<Local: FrameIo> Driver<Local> {
 
         let output: LoopOutput = {
             tokio::select! {
-                ((idx, result), _, _) = select_all(
-                    interfaces.iter_mut().enumerate().map(|(i, iface)| {
-                        Box::pin(async move { (i, iface.recv().await) })
-                    })
-                ), if check_mesh && !interfaces.is_empty() => {
+                // `select_all` panics if constructed over an empty iterator, and
+                // the `if` guard below only gates whether this branch's future is
+                // *polled* — Rust evaluates the branch expression itself
+                // unconditionally, before any guard is consulted. Wrapping the
+                // construction in this `async` block defers it to first poll,
+                // which the guard *does* control, so a linkless node (`links: []`,
+                // a valid dashboard-only config) never reaches the panicking call
+                // at all; it just never has a mesh frame to report.
+                ((idx, result), _, _) = async {
+                    if interfaces.is_empty() {
+                        std::future::pending().await
+                    } else {
+                        select_all(interfaces.iter_mut().enumerate().map(|(i, iface)| {
+                            Box::pin(async move { (i, iface.recv().await) })
+                        }))
+                        .await
+                    }
+                }, if check_mesh => {
                     let mut out = LoopOutput::none();
                     wayfinder_driver_core::handle_link_result(
                         now, router, idx, result, tx_buffer, &mut out,

@@ -119,6 +119,7 @@ import itertools
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -166,6 +167,16 @@ SIM_SESSION_TTL_SECS = 7 * 24 * 60 * 60
 # port up, in the same order `node_order` assigns node IPs. Published on
 # loopback only — the dashboard has no login of its own.
 WEB_PORT_BASE = 8090
+
+# Host port for the first node's own management API; each subsequent node
+# takes the next port up, same ordering as WEB_PORT_BASE. Published on
+# loopback so a *host-run* dashboard — `cargo leptos watch`, developing
+# wayfinder-web itself rather than just viewing it — can reach a node
+# directly, without an image rebuild or restarting the node underneath.
+# `up` prints the exact command per node; see `print_dev_watch_commands`.
+# Distinct range from the primary docker-compose.yml's bare 7700 (host
+# networking there, so it would otherwise collide) and from WEB_PORT_BASE.
+MGMT_PORT_BASE = 17700
 
 # How many *open* nodes to add: nodes that run with mesh authentication switched
 # off entirely (no `auth:` block, `require_auth: false`), named ``o1``, ``o2``, …
@@ -511,7 +522,26 @@ def build_nodes(links: list[list[str]]) -> dict[str, dict]:
     return nodes
 
 
-def render_compose(require_approval: bool = False) -> str:
+@dataclass
+class DevInfo:
+    """What one `render_compose` call minted, kept around so `up` can print
+    host dev-watch commands afterward without re-minting.
+
+    `ca_dir`/`node_keys` are randomly generated each call (`make_identities`),
+    so recomputing them from the topology alone — the way `web_urls` and
+    `mgmt_ports` do — would hand back a *different* identity than the one the
+    stack actually started with. This is the other half: the part of
+    `render_compose`'s output that has to be threaded through instead of
+    re-derived.
+    """
+
+    ca_dir: Path
+    provider_name: str
+    node_keys: dict[str, str]
+    open_names: list[str]
+
+
+def render_compose(require_approval: bool = False) -> tuple[str, DevInfo]:
     """Render the full docker-compose YAML for the current topology.
 
     When ``require_approval`` is set, the provider parks incoming CSRs as
@@ -639,6 +669,16 @@ def render_compose(require_approval: bool = False) -> str:
             e(f'      AUTO_APPROVE: "{str(not require_approval).lower()}"')
         for key, value in cfg["env"].items():
             e(f"      {key}: {value}")
+        # This node's own management API, published on loopback (distinct
+        # from the `{name}-web` companion's port below) so a *host-run*
+        # dashboard can reach it directly — the point being to develop
+        # wayfinder-web itself with `cargo leptos watch`'s own fast
+        # rebuild/reload, rather than viewing an already-built one through
+        # the companion container. `up` prints the exact command for every
+        # node; see `print_dev_watch_commands`. Loopback only, same posture
+        # as the companion's port.
+        e("    ports:")
+        e(f'      - "127.0.0.1:{MGMT_PORT_BASE + idx}:7700"')
         # Mesh links (map form so we can pin a static IP on the mgmt net), plus
         # the out-of-band management network with a deterministic address.
         e("    networks:")
@@ -731,7 +771,12 @@ def render_compose(require_approval: bool = False) -> str:
     e("      config:")
     e("        - subnet: 10.99.0.0/24")
     e("")
-    return "\n".join(lines)
+    return "\n".join(lines), DevInfo(
+        ca_dir=ca_dir,
+        provider_name=provider_name,
+        node_keys=node_keys,
+        open_names=open_names,
+    )
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -761,10 +806,12 @@ def nix_fmt(path: Path) -> None:
         print(f"warning: `nix fmt {path.name}` skipped ({exc})", file=sys.stderr)
 
 
-def write_compose(path: Path, require_approval: bool = False) -> None:
-    path.write_text(render_compose(require_approval))
+def write_compose(path: Path, require_approval: bool = False) -> DevInfo:
+    text, dev = render_compose(require_approval)
+    path.write_text(text)
     nix_fmt(path)
     print(f"wrote {path}", file=sys.stderr)
+    return dev
 
 
 # Bytes consumed by the IPv4 (20) + ICMP (8) headers in front of the ping
@@ -859,6 +906,74 @@ def print_web_urls() -> None:
     )
     print(
         "  an open node's dashboard has no sign-in: it proves the node's own key.",
+        file=sys.stderr,
+    )
+
+
+def mgmt_ports() -> dict[str, int]:
+    """Each node paired with the host loopback port its own management API is
+    published on — what a host-run dashboard's `--addr`/`--provider` connects
+    to. Same derivation as `web_urls`, from the topology alone, so it can
+    never drift from what `render_compose` actually publishes.
+    """
+    nodes = node_order(dedup_links(build_links()))
+    return {name: MGMT_PORT_BASE + idx for idx, name in enumerate(nodes)}
+
+
+def print_dev_watch_commands(dev: DevInfo) -> None:
+    """Print, for every node, the `cargo leptos watch` invocation that
+    develops *wayfinder-web itself* against it live on the host.
+
+    The `{name}-web` companion container each node already gets runs a
+    host-*built* binary — fine for viewing the dashboard, but a wayfinder-web
+    source change there means `cargo leptos build` plus a container restart.
+    Pointing a host-run `cargo leptos watch` at the same node instead gets
+    cargo-leptos's own fast wasm/server rebuild-and-reload, and never touches
+    the node: only the dashboard process bounces.
+
+    Takes the identities `up` already minted (`dev`) rather than re-deriving
+    them the way `mgmt_ports`/`web_urls` do — node keys and an open node's
+    seed are random per run, so recomputing them here would print a command
+    for a *different* mesh than the one actually running.
+    """
+    ports = mgmt_ports()
+    provider_port = ports[dev.provider_name]
+    print(
+        "\ndevelop wayfinder-web live against a node (cargo-leptos's own "
+        "watcher; the node underneath keeps running, untouched):",
+        file=sys.stderr,
+    )
+    for name, port in ports.items():
+        print(
+            f"\n  {name}{' (provider)' if name == dev.provider_name else ''}:",
+            file=sys.stderr,
+        )
+        if name in dev.open_names:
+            seed_path = dev.ca_dir / "open" / name / "seed"
+            print("    cargo leptos watch -- \\", file=sys.stderr)
+            print(f"      --addr 127.0.0.1:{port} \\", file=sys.stderr)
+            print(f"      --identity {seed_path}", file=sys.stderr)
+            print(
+                "    open http://127.0.0.1:8080/ — proves the node's own key, no sign-in",
+                file=sys.stderr,
+            )
+        else:
+            print("    cargo leptos watch -- \\", file=sys.stderr)
+            print(f"      --addr 127.0.0.1:{port} \\", file=sys.stderr)
+            print(f"      --provider 127.0.0.1:{provider_port} \\", file=sys.stderr)
+            print(
+                f"      --provider-key {dev.node_keys[dev.provider_name]} \\",
+                file=sys.stderr,
+            )
+            print(f"      --node-key {dev.node_keys[name]}", file=sys.stderr)
+            print(
+                f"    open http://127.0.0.1:8080/ and sign in as {SIM_ADMIN_USER!r} or "
+                f"{SIM_VIEWER_USER!r} (password {SIM_PASSWORD!r})",
+                file=sys.stderr,
+            )
+    print(
+        "\n  only one instance can bind 127.0.0.1:8080 at a time; add --listen to run "
+        "another concurrently",
         file=sys.stderr,
     )
 
@@ -995,7 +1110,8 @@ def main(argv: list[str]) -> int:
         OPEN_NODE_COUNT = args.open
 
     if args.cmd == "print":
-        print(render_compose(args.require_approval), end="")
+        text, _dev = render_compose(args.require_approval)
+        print(text, end="")
         return 0
     if args.cmd == "graph":
         cmd_graph()
@@ -1004,10 +1120,11 @@ def main(argv: list[str]) -> int:
         write_compose(Path(args.path), args.require_approval)
         return 0
     if args.cmd == "up":
-        write_compose(EPHEMERAL, args.require_approval)
+        dev = write_compose(EPHEMERAL, args.require_approval)
         rc = compose("up", "--build", "-d", *args.extra)
         if rc == 0:
             print_web_urls()
+            print_dev_watch_commands(dev)
         return rc
     if args.cmd == "down":
         if not EPHEMERAL.exists():

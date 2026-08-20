@@ -278,3 +278,33 @@ async fn process_pending_survives_recv_error() {
         "a link recv error must be traced, not swallowed; captured logs: {logs:?}"
     );
 }
+
+/// A node configured with no mesh links at all (`links: []`, a valid
+/// dashboard-only/no-radio config) must not crash the production event loop.
+/// `futures::future::select_all` panics if constructed over an empty
+/// iterator, and the mesh arm's `select!` guard (`if check_mesh && ...`)
+/// only gates whether the already-constructed future is *polled* — Rust
+/// evaluates every branch's expression up front regardless of its guard, so
+/// the panic fires during construction, before the guard is ever consulted.
+/// Every iteration of the production `run()` loop on a linkless node hits
+/// this line.
+#[tokio::test]
+async fn run_once_with_no_mesh_links_does_not_panic() {
+    let mut tr = LinkTestRouter::from_links(mac(1), Vec::new(), Vec::new());
+    tr.send_local(mac(2), b"payload")
+        .await
+        .unwrap_or_else(|e| panic!("send_local failed: {e:?}"));
+
+    let result = timeout(
+        Duration::from_secs(1),
+        tr.driver()
+            .run_once(Duration::from_secs(1), true, true, false, false),
+    )
+    .await;
+
+    let outcome = result.unwrap_or_else(|_| panic!("run_once hung with no mesh links"));
+    assert!(
+        outcome.is_ok(),
+        "an empty mesh interfaces list must not propagate out of the event loop: {outcome:?}"
+    );
+}
