@@ -398,6 +398,52 @@ pub const TAP_ENCAP_OVERHEAD: usize = 14 + 14 + 9 + 24 + 28;
 pub enum LocalDistributionMechanism {
     /// Bridge the mesh onto a host TAP device (see [`TapConfig`]).
     Tap(TapConfig),
+    /// Bridge the mesh onto a physical ethernet NIC at L2 (see
+    /// [`RawL2EgressConfig`]).
+    RawL2Egress(RawL2EgressConfig),
+}
+
+/// Configuration for a physical ethernet NIC used as the local host-facing
+/// egress, in place of a kernel TAP device.
+///
+/// Anyone with physical access to this interface gets full L2 mesh access —
+/// there is no mesh-identity gate on this path, unlike OGM/management-API
+/// auth — so this is meant for a NIC an operator can plug directly into (a
+/// field radio's spare ethernet port), not one bridged onto a larger network.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct RawL2EgressConfig {
+    /// Name of the physical NIC to bind (e.g. `"eth1"`).
+    ///
+    /// Wayfinder does not create or address this device the way it does a
+    /// TAP: it must already exist and be up, and any IP addressing (e.g. for
+    /// DHCP/management-API reachability) is the host's own network
+    /// configuration to provide.
+    pub interface: String,
+    /// Path persisting this node's mesh-identity MAC address across restarts,
+    /// the same role [`TapConfig::mac_state_path`] plays for a TAP egress.
+    /// This interface's own hardware MAC is unrelated to the node's mesh
+    /// identity. Defaults to [`RawL2EgressConfig::default_mac_state_path`]
+    /// when unset.
+    #[serde(default)]
+    pub mac_state_path: Option<String>,
+}
+
+impl RawL2EgressConfig {
+    /// Where [`mac_state_path`](Self::mac_state_path) resolves to when unset:
+    /// `/var/lib/wayfinder/<interface>.mac`, the same convention
+    /// [`TapConfig::default_mac_state_path`] follows.
+    pub fn default_mac_state_path(&self) -> String {
+        format!("/var/lib/wayfinder/{}.mac", self.interface)
+    }
+
+    /// The effective path to persist/read this node's mesh-identity MAC at:
+    /// the configured [`mac_state_path`](Self::mac_state_path), or
+    /// [`RawL2EgressConfig::default_mac_state_path`] when unset.
+    pub fn resolved_mac_state_path(&self) -> String {
+        self.mac_state_path
+            .clone()
+            .unwrap_or_else(|| self.default_mac_state_path())
+    }
 }
 
 /// Opt-in mesh authentication for this node.
@@ -591,6 +637,23 @@ local_egress:
         };
         assert_eq!(tap.ip_address, Some(Ipv4Addr::new(10, 0, 0, 1)));
         assert_eq!(tap.netmask, Some(Ipv4Addr::new(255, 255, 255, 0)));
+    }
+
+    /// A raw-L2 egress config round-trips through YAML, and `mac_state_path`
+    /// defaults to `None` when omitted.
+    #[test]
+    fn raw_l2_egress_config_parses() {
+        let yaml = "\
+local_egress:
+  type: RawL2Egress
+  interface: eth1
+";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let Some(LocalDistributionMechanism::RawL2Egress(cfg)) = config.local_egress else {
+            panic!("expected a raw-L2 egress");
+        };
+        assert_eq!(cfg.interface, "eth1");
+        assert_eq!(cfg.mac_state_path, None);
     }
 
     /// The IP/netmask are optional: a TAP config may omit them entirely.

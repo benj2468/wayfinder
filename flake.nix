@@ -343,6 +343,7 @@
               wayfinder-web
               ;
             wayfinder-simple = nixpkgs.callPackage ./nix/tests/simple.nix { };
+            wayfinder-ethernet-egress = nixpkgs.callPackage ./nix/tests/ethernet-egress.nix { };
           };
 
           treefmt = {

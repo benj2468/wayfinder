@@ -16,7 +16,7 @@ testers.nixosTest {
           netmask = "255.255.255.0";
         };
         server = {
-          type = "Tcp";
+          type = "Tls";
           addr = "0.0.0.0:7700";
         };
         links = [
@@ -35,7 +35,7 @@ testers.nixosTest {
     machine.wait_for_unit("wayfinder.service")
     machine.wait_for_open_port(7700, timeout=10)
 
-    machine.succeed("wayfinder-ctl node-info")
+    machine.succeed("wayfinder-ctl --identity /var/lib/wayfinder/identity.seed node-info")
     machine.succeed("wayfinder-tui --help")
   '';
 }

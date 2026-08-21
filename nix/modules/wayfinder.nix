@@ -14,6 +14,15 @@
 # it can equally be pointed at a node on another host — but the common case is
 # running it beside one, where it reuses that node's identity seed and needs no
 # key of its own.
+#
+# `services.wayfinder.ethernetAccess` addresses and serves DHCP on a physical
+# NIC the node uses as a `RawL2Egress` local egress (see
+# `LocalDistributionMechanism` in `libs/wayfinder/src/config.rs`) — the piece
+# of that setup wayfinder itself deliberately does not own, since (unlike a
+# TAP device) it does not create or address that interface. Only the
+# addressing/DHCP side lives here; `interface` must match the `interface`
+# named in `services.wayfinder.config.local_egress` for the two to describe
+# the same NIC.
 {
   lib,
   config,
@@ -28,6 +37,21 @@ in
 {
   options.services.wayfinder = with lib; {
     enable = mkEnableOption "the wayfinder mesh node service";
+
+    openFirewall = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      example = [ "eth1" ];
+      description = ''
+        Interface names to open the management API port
+        (`config.server.addr`) and dashboard port (`web.listen`) on, via
+        `networking.firewall.interfaces.<name>.allowedTCPPorts`. Ports are
+        parsed straight out of those two addresses, so name only interfaces
+        those services are actually meant to be reachable from — e.g. the
+        same physical NIC named in `ethernetAccess.interface`, not a
+        mesh-facing link.
+      '';
+    };
 
     # A freeform attrset rather than a typed submodule because it's just
     # serialized straight to JSON and handed to `wayfinder-tap --config` — the
@@ -90,7 +114,7 @@ in
 
       addr = mkOption {
         type = types.str;
-        default = "127.0.0.1:7700";
+        default = wayfinderCfg.config.server.addr;
         description = ''
           The node's TLS management API address. The default matches a local
           node configured with `server.tls` on its default port.
@@ -137,9 +161,70 @@ in
         description = "`RUST_LOG` filter for the dashboard service.";
       };
     };
+
+    ethernetAccess = {
+      enable = mkEnableOption "static addressing + DHCP on a physical ethernet NIC used as a RawL2Egress local egress";
+
+      interface = mkOption {
+        type = types.str;
+        example = "eth1";
+        description = ''
+          The physical NIC to address and serve DHCP on. Must match the
+          `interface` named in `services.wayfinder.config.local_egress` when
+          that is set to a `RawL2Egress` mechanism — this module only
+          addresses the interface, it does not tell wayfinder to use it.
+        '';
+      };
+
+      address = mkOption {
+        type = types.str;
+        default = "10.55.21.1";
+        description = "Static IPv4 address this node takes on `interface`.";
+      };
+
+      prefixLength = mkOption {
+        type = types.ints.between 1 32;
+        default = 24;
+        description = "Prefix length paired with `address`.";
+      };
+
+      dhcpRangeStart = mkOption {
+        type = types.str;
+        default = "10.55.21.10";
+        description = "First address `dnsmasq` may lease on `interface`.";
+      };
+
+      dhcpRangeEnd = mkOption {
+        type = types.str;
+        default = "10.55.21.254";
+        description = "Last address `dnsmasq` may lease on `interface`.";
+      };
+
+      leaseTime = mkOption {
+        type = types.str;
+        default = "12h";
+        description = "Lease duration passed to `dnsmasq`'s `dhcp-range`.";
+      };
+    };
   };
 
   config = lib.mkMerge [
+    (lib.mkIf (wayfinderCfg.openFirewall != [ ]) (
+      let
+        portOf = addr: lib.toInt (lib.last (lib.splitString ":" addr));
+        ports =
+          lib.optional (wayfinderCfg.config.server.addr or null != null) (
+            portOf wayfinderCfg.config.server.addr
+          )
+          ++ lib.optional wayfinderCfg.web.enable (portOf wayfinderCfg.web.listen);
+      in
+      {
+        networking.firewall.interfaces = lib.genAttrs wayfinderCfg.openFirewall (_: {
+          allowedTCPPorts = ports;
+        });
+      }
+    ))
+
     (lib.mkIf (wayfinderCfg.enable || wayfinderCfg.web.enable) {
       users.users.wayfinder = {
         isSystemUser = true;
@@ -244,6 +329,46 @@ in
         wants = [ "network-online.target" ];
 
         wantedBy = [ "multi-user.target" ];
+      };
+    })
+
+    (lib.mkIf wayfinderCfg.ethernetAccess.enable {
+      networking.interfaces.${wayfinderCfg.ethernetAccess.interface}.ipv4.addresses = [
+        {
+          address = wayfinderCfg.ethernetAccess.address;
+          prefixLength = wayfinderCfg.ethernetAccess.prefixLength;
+        }
+      ];
+
+      # `interface` + `bind-interfaces` restricts which NIC dnsmasq listens
+      # for DHCP/DNS on at all — it must never answer on the mesh-facing
+      # links or the loopback dashboard port. `dhcp-range` takes no interface
+      # field of its own; dnsmasq matches a range to an interface by matching
+      # the range's subnet against that interface's configured address,
+      # which is exactly the `address`/`prefixLength` pair set above.
+      services.dnsmasq = {
+        enable = true;
+        settings = {
+          interface = [ wayfinderCfg.ethernetAccess.interface ];
+          bind-interfaces = true;
+          dhcp-range = [
+            "${wayfinderCfg.ethernetAccess.dhcpRangeStart},${wayfinderCfg.ethernetAccess.dhcpRangeEnd},${wayfinderCfg.ethernetAccess.leaseTime}"
+          ];
+        };
+      };
+
+      # The default firewall drops non-unicast traffic on every interface —
+      # DHCP only works at all because a client's initial `DHCPDISCOVER` is a
+      # broadcast, so without this dnsmasq never sees it and the client falls
+      # back to a self-assigned link-local address instead. Scoped to
+      # `interface` alone, matching dnsmasq's own `bind-interfaces` boundary
+      # above — this must not open DHCP/DNS on the mesh-facing links.
+      networking.firewall.interfaces.${wayfinderCfg.ethernetAccess.interface} = {
+        allowedUDPPorts = [
+          53 # dnsmasq DNS
+          67 # dnsmasq DHCP
+        ];
+        allowedTCPPorts = [ 53 ]; # dnsmasq DNS (large responses)
       };
     })
   ];
