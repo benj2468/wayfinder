@@ -297,7 +297,9 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     info!(listen = %args.listen, "dashboard listening");
-    axum::serve(listener, app.into_make_service()).await?;
+    axum::serve(listener, app.into_make_service())
+        .with_graceful_shutdown(wayfinder_web::shutdown::shutdown_signal())
+        .await?;
 
     Ok(())
 }

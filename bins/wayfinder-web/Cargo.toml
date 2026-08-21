@@ -143,3 +143,7 @@ tokio.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 serde_json.workspace = true
+# `shutdown.rs`'s test raises a real SIGTERM against the test process itself,
+# rather than mocking the signal, since the behavior under test is exactly
+# whether the process's actual disposition reacts to it.
+libc.workspace = true
