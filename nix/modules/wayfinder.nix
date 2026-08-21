@@ -84,7 +84,11 @@ in
 
       listen = mkOption {
         type = types.str;
-        default = "127.0.0.1:8080";
+        default =
+          if wayfinderCfg.ethernetAccess.enable then
+            "${wayfinderCfg.ethernetAccess.address}:8080"
+          else
+            "127.0.0.1:8080";
         description = ''
           Address to serve the dashboard on.
 
@@ -114,7 +118,7 @@ in
 
       addr = mkOption {
         type = types.str;
-        default = wayfinderCfg.config.server.addr;
+        default = "127.0.0.1:7700";
         description = ''
           The node's TLS management API address. The default matches a local
           node configured with `server.tls` on its default port.
@@ -157,7 +161,7 @@ in
 
       logLevel = mkOption {
         type = types.str;
-        default = "info";
+        default = "debug";
         description = "`RUST_LOG` filter for the dashboard service.";
       };
     };

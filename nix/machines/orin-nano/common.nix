@@ -9,6 +9,11 @@
     ../../modules/wayfinder.nix
   ];
 
+  programs.vim = {
+    enable = true;
+    defaultEditor = true;
+  };
+
   services.wayfinder = {
     enable = true;
     web.enable = true;
@@ -27,7 +32,18 @@
         addr = "0.0.0.0:7700";
       };
       links = [
-        { type = "Ble"; }
+        {
+          type = "Ble";
+          ogm = {
+            i_min_ms = 1000;
+            i_max_ms = 20000;
+          };
+          features = {
+            tx_keepalive = {
+              interval_ms = 5000;
+            };
+          };
+        }
       ];
     };
   };
