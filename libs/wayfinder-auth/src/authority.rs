@@ -64,28 +64,6 @@ impl Authority {
         self.issue_with_flags(mac, ed_pubkey, x_pubkey, not_before, not_after, 0)
     }
 
-    /// Issue a membership certificate that additionally carries the
-    /// management-administration capability ([`CERT_FLAG_ADMIN`]): the holder
-    /// may invoke privileged management-API operations, not merely route.  Grant
-    /// this only to operator/"user" identities, never routine member nodes.
-    pub fn issue_admin_cert(
-        &self,
-        mac: Mac,
-        ed_pubkey: [u8; 32],
-        x_pubkey: [u8; 32],
-        not_before: u64,
-        not_after: u64,
-    ) -> MembershipCert {
-        self.issue_with_flags(
-            mac,
-            ed_pubkey,
-            x_pubkey,
-            not_before,
-            not_after,
-            CERT_FLAG_ADMIN,
-        )
-    }
-
     /// Issue a **user session certificate**: a person's credential rather than
     /// a node's, carrying [`CERT_FLAG_USER`] plus exactly one capability —
     /// [`CERT_FLAG_ADMIN`] when `admin`, otherwise [`CERT_FLAG_VIEWER`].
@@ -120,7 +98,6 @@ impl Authority {
 
     /// Build and sign a membership cert with the given `flags`, the shared body
     /// behind [`issue_cert`](Self::issue_cert),
-    /// [`issue_admin_cert`](Self::issue_admin_cert) and
     /// [`issue_user_cert`](Self::issue_user_cert).
     fn issue_with_flags(
         &self,

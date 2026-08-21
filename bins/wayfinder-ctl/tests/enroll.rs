@@ -30,6 +30,7 @@ use wayfinder_protos::service::RuntimeConfigData;
 use wayfinder_protos::service::TableOccupancyData;
 use wayfinder_protos::service::WayfinderDataProvider;
 use wayfinder_protos::service::WayfinderService;
+use wayfinder_protos::wayfinder::v1alpha::SubmitCsrRequest;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderResponse;
 use wayfinder_server::AuthSnapshot;
@@ -37,8 +38,8 @@ use wayfinder_server::CertAuthority;
 use wayfinder_server::MeshAuthority;
 use wayfinder_server::serve_tls_server;
 use wayfinderctl::Command;
-use wayfinderctl::CsrCommand;
 use wayfinderctl::Endpoint;
+use wayfinderctl::csr::CsrCommand;
 use wayfinderctl::output::OutputFormat;
 use wayfinderctl::run_query;
 
@@ -638,4 +639,184 @@ async fn enroll_fails_when_operator_denies() {
     .await
     .expect_err("a denied CSR fails enrollment");
     assert!(format!("{err:#}").contains("rejected"), "got: {err}");
+}
+
+/// Write a CSR file in the shape `csr request` produces at the node, so these
+/// tests consume exactly what an operator would carry to the provider.
+fn write_csr(path: &std::path::Path, kp: &Keypair, token: &str) {
+    let req = SubmitCsrRequest {
+        node_mac: kp.derived_mac().0.to_vec(),
+        ed_pubkey: kp.ed_pubkey().to_vec(),
+        x_pubkey: kp.x_pubkey().to_vec(),
+        enrollment_token: token.to_string(),
+    };
+    std::fs::write(path, serde_json::to_vec_pretty(&req).unwrap()).unwrap();
+}
+
+/// `csr submit` is the middle of the out-of-band chain: it uploads a CSR file
+/// that arrived from an unreachable node, and writes back the certificate and
+/// anchor to carry home.
+///
+/// Note what it does *not* need: a membership certificate of its own.
+/// `SubmitCsr` sits on the enrollment tier, so an operator can hand a provider
+/// a CSR without holding any credential for it — which is what makes this a
+/// substitute for `cert approve` and its copy of the mesh root key.
+#[tokio::test]
+async fn csr_submit_writes_the_certificate_the_provider_issues() {
+    let endpoint = spawn_provider(None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let request = dir.path().join("request.json");
+    let out_cert = dir.path().join("node.cert");
+    let out_anchor = dir.path().join("anchor.bin");
+
+    let node = Keypair::from_seed(&[33u8; 32]);
+    write_csr(&request, &node, "");
+
+    run_query(
+        Command::Csr(CsrCommand::Submit {
+            request: request.clone(),
+            out_cert: out_cert.clone(),
+            out_anchor: out_anchor.clone(),
+        }),
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .expect("an auto-approving provider issues on submission");
+
+    let anchor = TrustAnchor::from_bytes(&std::fs::read(&out_anchor).unwrap()).unwrap();
+    let cert = MembershipCert::from_bytes(&std::fs::read(&out_cert).unwrap()).unwrap();
+    let verified = anchor.verify_cert(&cert, 500).expect("cert verifies");
+    assert_eq!(
+        verified.ed_pubkey,
+        node.ed_pubkey(),
+        "the certificate must be bound to the keys the CSR named, not to anything \
+         about the operator who carried it"
+    );
+    assert_eq!(verified.mac, node.derived_mac());
+}
+
+/// The download half. A provider that parks requests for approval cannot answer
+/// the first submission, so the operator approves in the UI and re-runs the
+/// same command against the same file — re-submitting an identical CSR is how
+/// the issued certificate is collected, since the protocol has no separate
+/// "fetch my certificate" request.
+#[tokio::test]
+async fn csr_submit_collects_the_certificate_after_an_operator_approves() {
+    let endpoint = spawn_approval_gated_provider().await;
+    let dir = tempfile::tempdir().unwrap();
+    let request = dir.path().join("request.json");
+    let out_cert = dir.path().join("node.cert");
+    let out_anchor = dir.path().join("anchor.bin");
+
+    let node = Keypair::from_seed(&[44u8; 32]);
+    write_csr(&request, &node, "");
+
+    // First upload: parked, and nothing is written.
+    let err = run_query(
+        Command::Csr(CsrCommand::Submit {
+            request: request.clone(),
+            out_cert: out_cert.clone(),
+            out_anchor: out_anchor.clone(),
+        }),
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .expect_err("a gated provider cannot issue on first submission");
+    assert!(
+        format!("{err:#}").contains("awaiting operator approval"),
+        "got: {err}"
+    );
+    assert!(
+        !out_cert.exists() && !out_anchor.exists(),
+        "a pending submission must not leave files an operator could mistake for \
+         an issued certificate"
+    );
+
+    // The operator approves — here through the API the web/TUI screens call.
+    run_query(
+        Command::Csr(CsrCommand::Approve {
+            mac: node
+                .derived_mac()
+                .0
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(":"),
+        }),
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .unwrap();
+
+    // Re-running the identical submission collects the certificate.
+    run_query(
+        Command::Csr(CsrCommand::Submit {
+            request: request.clone(),
+            out_cert: out_cert.clone(),
+            out_anchor: out_anchor.clone(),
+        }),
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .expect("re-submitting an approved CSR collects the certificate");
+
+    let anchor = TrustAnchor::from_bytes(&std::fs::read(&out_anchor).unwrap()).unwrap();
+    let cert = MembershipCert::from_bytes(&std::fs::read(&out_cert).unwrap()).unwrap();
+    anchor.verify_cert(&cert, 500).expect("cert verifies");
+}
+
+/// A refusal must name why. The operator holding the file is not the person who
+/// configured the provider, so "rejected" alone leaves them nothing to act on.
+#[tokio::test]
+async fn csr_submit_surfaces_the_providers_rejection_reason() {
+    let endpoint = spawn_provider(Some("the-real-token".to_string())).await;
+    let dir = tempfile::tempdir().unwrap();
+    let request = dir.path().join("request.json");
+    let out_cert = dir.path().join("node.cert");
+    let out_anchor = dir.path().join("anchor.bin");
+
+    write_csr(&request, &Keypair::from_seed(&[55u8; 32]), "wrong-token");
+
+    let err = run_query(
+        Command::Csr(CsrCommand::Submit {
+            request,
+            out_cert: out_cert.clone(),
+            out_anchor: out_anchor.clone(),
+        }),
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .expect_err("a bad enrollment token is refused");
+    let err = format!("{err:#}");
+    assert!(err.contains("token"), "got: {err}");
+    assert!(!out_cert.exists() && !out_anchor.exists());
+}
+
+/// The enrollment token travels *in the CSR file*, written when the request was
+/// made at the node — so an operator relaying a file need not know the secret,
+/// and `csr submit` takes no token flag of its own.
+#[tokio::test]
+async fn csr_submit_presents_the_token_carried_in_the_request_file() {
+    let endpoint = spawn_provider(Some("the-real-token".to_string())).await;
+    let dir = tempfile::tempdir().unwrap();
+    let request = dir.path().join("request.json");
+
+    write_csr(&request, &Keypair::from_seed(&[66u8; 32]), "the-real-token");
+
+    run_query(
+        Command::Csr(CsrCommand::Submit {
+            request,
+            out_cert: dir.path().join("node.cert"),
+            out_anchor: dir.path().join("anchor.bin"),
+        }),
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .expect("the token in the file admits the request");
 }

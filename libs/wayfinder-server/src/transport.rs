@@ -1758,12 +1758,13 @@ mod tests {
 
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
         let admin_kp = Keypair::from_seed(&[2u8; 32]);
-        let admin_cert = authority.issue_admin_cert(
+        let admin_cert = authority.issue_user_cert(
             Mac([0, 0, 0, 0, 0, 5]),
             admin_kp.ed_pubkey(),
             admin_kp.x_pubkey(),
             0,
             200,
+            true,
         );
         let ctx = AuthContext {
             own_key: Some([9u8; 32]), // not the client's key: only the cert can admit it
@@ -1806,12 +1807,13 @@ mod tests {
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
         let admin_kp = Keypair::from_seed(&[2u8; 32]);
         let admin_mac = Mac([0, 0, 0, 0, 0, 5]);
-        let admin_cert = authority.issue_admin_cert(
+        let admin_cert = authority.issue_user_cert(
             admin_mac,
             admin_kp.ed_pubkey(),
             admin_kp.x_pubkey(),
             0,
             200,
+            true,
         );
         let ctx = AuthContext {
             own_key: Some([9u8; 32]),
@@ -2205,12 +2207,13 @@ mod tests {
 
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
         let admin_kp = Keypair::from_seed(&[2u8; 32]);
-        let cert = authority.issue_admin_cert(
+        let cert = authority.issue_user_cert(
             mac,
             admin_kp.ed_pubkey(),
             admin_kp.x_pubkey(),
             0,
             not_after,
+            true,
         );
         let bytes = cert.as_bytes().to_vec();
         (authority.trust_anchor(), admin_kp, bytes)

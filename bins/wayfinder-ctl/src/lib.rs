@@ -1,10 +1,12 @@
 //! `wayfinderctl` — a command-line client for the Wayfinder management API.
 //!
-//! Two families of subcommands:
+//! Three families of subcommands:
 //! * **Query** commands open a [`wayfinder_client::Client`] to a running node
 //!   (TCP or Unix-datagram) and print one management-API response.
-//! * **`cert`** commands run entirely offline, minting the seed / certificate /
-//!   trust-anchor files a node loads to join an authenticated mesh.
+//! * **[`cert`]** commands run entirely offline, minting the seed / certificate
+//!   / trust-anchor files a node loads to join an authenticated mesh.
+//! * **[`csr`]** commands enroll a node that cannot reach the provider, by
+//!   carrying its signing request there as a file and the certificate back.
 //!
 //! The library surface exists so the renderers and the cert tooling can be unit-
 //! tested; `main.rs` is a thin `clap` front end over [`run`].
@@ -12,6 +14,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod cert;
+pub mod csr;
 pub mod output;
 pub mod session;
 pub mod user;
@@ -35,6 +38,7 @@ use wayfinder_protos::wayfinder::v1alpha::authenticate_user_response::Outcome as
 use wayfinder_protos::wayfinder::v1alpha::link_features::TxKeepaliveUpdate;
 use wayfinder_protos::wayfinder::v1alpha::submit_csr_response::Outcome as CsrOutcome;
 
+use crate::csr::CsrCommand;
 use crate::output::OutputFormat;
 
 /// Top-level command-line interface.
@@ -274,7 +278,14 @@ pub enum Command {
     },
     /// List the certificates a provider node has issued.
     ListCerts,
-    /// Inspect and act on CSRs awaiting operator approval (provider node).
+    /// Enroll a node that cannot reach the provider, by carrying its request
+    /// there as a file.
+    ///
+    /// `request` and `install` talk to the node being **enrolled**: ask it what
+    /// to certify, then hand the signed result back. `submit` takes the file in
+    /// between to a **provider** and brings the certificate home, with
+    /// `list`/`approve`/`deny` for acting on what is waiting there. Signing the
+    /// file directly, wherever the mesh root key lives, is `cert approve`.
     #[command(subcommand)]
     Csr(CsrCommand),
     /// Offline certificate / trust-anchor tooling (no node connection).
@@ -298,25 +309,6 @@ pub enum Command {
     Logout,
     /// Print what credential this client is holding and when it stops working.
     Whoami,
-}
-
-/// Operator actions on pending certificate-signing requests (provider mode).
-#[derive(Subcommand, Debug)]
-pub enum CsrCommand {
-    /// List the CSRs currently awaiting approval.
-    List,
-    /// Approve a pending CSR, so the enrolling node collects its certificate.
-    Approve {
-        /// MAC of the pending CSR to approve.
-        #[arg(long)]
-        mac: String,
-    },
-    /// Deny a pending CSR; the enrolling node observes a rejection.
-    Deny {
-        /// MAC of the pending CSR to deny.
-        #[arg(long)]
-        mac: String,
-    },
 }
 
 /// Assemble the [`Endpoint`] a query command connects over from the parsed CLI,
@@ -823,25 +815,7 @@ async fn dispatch_query(
             format!("revoked {mac}")
         }
         Command::ListCerts => output::list_certs(&client.list_certs().await?, output)?,
-        Command::Csr(CsrCommand::List) => {
-            output::list_pending_csrs(&client.list_pending_csrs().await?, output)?
-        }
-        Command::Csr(CsrCommand::Approve { mac }) => {
-            let mac_bytes = parse_mac6(&mac)?;
-            client
-                .approve_csr(&mac_bytes)
-                .await
-                .context("approving CSR failed")?;
-            format!("approved CSR for {mac}")
-        }
-        Command::Csr(CsrCommand::Deny { mac }) => {
-            let mac_bytes = parse_mac6(&mac)?;
-            client
-                .deny_csr(&mac_bytes)
-                .await
-                .context("denying CSR failed")?;
-            format!("denied CSR for {mac}")
-        }
+        Command::Csr(cmd) => csr::run(cmd, client, output).await?,
         // Every command that needs no node connection is dispatched by `run`
         // before a client is opened; listing them here rather than under a
         // wildcard keeps a newly added offline command from silently reaching

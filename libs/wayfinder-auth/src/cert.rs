@@ -312,7 +312,8 @@ mod tests {
         );
 
         // A cert the CA issued with the admin capability verifies as admin.
-        let admin = authority.issue_admin_cert(mac(6), node.ed_pubkey(), node.x_pubkey(), 100, 200);
+        let admin =
+            authority.issue_user_cert(mac(6), node.ed_pubkey(), node.x_pubkey(), 100, 200, true);
         assert!(
             anchor.verify_cert(&admin, 150).unwrap().admin,
             "an admin-issued cert must carry the admin capability once verified"
