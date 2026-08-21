@@ -54,6 +54,8 @@ pub mod enroll;
 pub mod mock;
 #[cfg(feature = "ssr")]
 pub mod server;
+#[cfg(feature = "ssr")]
+pub mod shutdown;
 // The viewer and session types cross the wire, so the browser needs them; the
 // store, the credential modes and the cookie mechanics are server-side and
 // gated within the module.
