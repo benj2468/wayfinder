@@ -4,7 +4,7 @@
 # Two configurations consume this — `installer.nix` (the live USB image) and
 # `system.nix` (what lands on the NVMe). Anything that depends on how the disk
 # is treated belongs in one of those, not here.
-{ lib, ... }: {
+{ ... }: {
   imports = [
     ../../modules/wayfinder.nix
   ];
@@ -12,22 +12,22 @@
   services.wayfinder = {
     enable = true;
     web.enable = true;
+    openFirewall = [ "enP8p1s0" ];
+    ethernetAccess = {
+      enable = true;
+      interface = "enP8p1s0";
+    };
     config = {
       local_egress = {
-        type = "Tap";
-        device_name = "wayfinder0";
+        type = "RawL2Egress";
+        interface = "enP8p1s0";
       };
       server = {
         type = "Tls";
         addr = "0.0.0.0:7700";
       };
       links = [
-        {
-          type = "RawL2";
-          # this won't in the long run
-          interface = "enP8p1s0";
-          ethertype = lib.trivial.fromHexString "0xcafe";
-        }
+        { type = "Ble"; }
       ];
     };
   };
