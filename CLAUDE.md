@@ -206,6 +206,24 @@ top of the mesh want to observe this?" Two invariants when adding one:
 **Invoke the `add-metric` skill** to wire one end to end (proto → service →
 `RouterAdapter` → client → TUI Metrics tab → smoke test).
 
+### Nodes are reached over RPC, never through their filesystem
+
+A node may be an nRF52840 with no filesystem at all, so **host tooling must
+never provision a node by writing files it expects that node to read.** Every
+interaction with a node goes through the management API.
+
+Files are fine on the *operator's* side of that line — the CLI runs on a Linux
+box, so reading an input (`csr install --cert`) or writing an artifact to carry
+elsewhere (`csr request --out-request`) is exactly right. What is forbidden is
+the other direction: resolving a node's configured
+`seed_path`/`cert_path`/`trust_anchor_path` and writing there, or minting state
+on disk and assuming the node picks it up on its next restart. `wayfinderctl
+cert install` did the former and was deleted for it — `csr install` replaces it
+with `SetAuth` over the wire, which works against a board and a host alike.
+
+The test to apply: *would this command still work against a node with no
+filesystem?* If not, the state it produces belongs in an RPC.
+
 ### Merge requests
 
 Ships through GitLab MRs (`git.haganah.net`), not direct pushes to `main`. The

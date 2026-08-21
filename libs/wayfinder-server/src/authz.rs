@@ -30,6 +30,8 @@ use wayfinder::wayfinder_auth::AuthError;
 use wayfinder::wayfinder_auth::MembershipCert;
 use wayfinder::wayfinder_auth::TrustAnchor;
 use wayfinder::wayfinder_auth::VerifiedCert;
+
+#[cfg(feature = "std")]
 use wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request as ReqKind;
 
 /// The overall management access decision for a client that has completed the
@@ -226,6 +228,7 @@ pub fn decide_access(
 ///
 /// SECURITY ALERT: this function holds security-critical access-control
 /// logic. Changing it requires careful consideration.
+#[cfg(feature = "std")]
 pub fn permits(access: MgmtAccess, request: &ReqKind) -> bool {
     match access {
         MgmtAccess::GrantedAdmin | MgmtAccess::GrantedSelfKey => true,
@@ -526,8 +529,14 @@ mod tests {
         let own = Keypair::from_seed(&[7u8; 32]);
 
         let admin_kp = Keypair::from_seed(&[2u8; 32]);
-        let admin_cert =
-            authority.issue_admin_cert(mac(5), admin_kp.ed_pubkey(), admin_kp.x_pubkey(), 0, 200);
+        let admin_cert = authority.issue_user_cert(
+            mac(5),
+            admin_kp.ed_pubkey(),
+            admin_kp.x_pubkey(),
+            0,
+            200,
+            true,
+        );
 
         // Verified admin cert whose key matches the handshake key → granted.
         assert_eq!(
@@ -856,14 +865,20 @@ mod tests {
 
         // An admin cert bound to the presenting key — the strongest thing a
         // client could offer — and one already expired at `now`.
-        let admin_cert =
-            foreign.issue_admin_cert(mac(5), stranger.ed_pubkey(), stranger.x_pubkey(), 0, 200);
+        let admin_cert = foreign.issue_user_cert(
+            mac(5),
+            stranger.ed_pubkey(),
+            stranger.x_pubkey(),
+            0,
+            200,
+            true,
+        );
         // A plain member cert, and one issued to somebody else's key entirely.
         let member_cert =
             foreign.issue_cert(mac(6), stranger.ed_pubkey(), stranger.x_pubkey(), 0, 200);
         let other = Keypair::from_seed(&[9u8; 32]);
         let other_cert =
-            foreign.issue_admin_cert(mac(7), other.ed_pubkey(), other.x_pubkey(), 0, 200);
+            foreign.issue_user_cert(mac(7), other.ed_pubkey(), other.x_pubkey(), 0, 200, true);
 
         for (label, cert, now) in [
             ("no cert", None, 100),
@@ -917,8 +932,14 @@ mod tests {
 
         // A different root, a different mesh: rejected on the mesh id.
         let other_mesh = Authority::from_seed(&[42u8; 32], 0xBEEF);
-        let cert =
-            other_mesh.issue_admin_cert(mac(5), attacker.ed_pubkey(), attacker.x_pubkey(), 0, 200);
+        let cert = other_mesh.issue_user_cert(
+            mac(5),
+            attacker.ed_pubkey(),
+            attacker.x_pubkey(),
+            0,
+            200,
+            true,
+        );
         assert_eq!(
             decide_access(
                 &attacker.ed_pubkey(),
@@ -934,8 +955,14 @@ mod tests {
         // A different root claiming *our* mesh id: only the signature separates
         // this from a genuine admin cert.
         let impostor = Authority::from_seed(&[42u8; 32], 0xABCD);
-        let cert =
-            impostor.issue_admin_cert(mac(5), attacker.ed_pubkey(), attacker.x_pubkey(), 0, 200);
+        let cert = impostor.issue_user_cert(
+            mac(5),
+            attacker.ed_pubkey(),
+            attacker.x_pubkey(),
+            0,
+            200,
+            true,
+        );
         assert_eq!(
             decide_access(
                 &attacker.ed_pubkey(),

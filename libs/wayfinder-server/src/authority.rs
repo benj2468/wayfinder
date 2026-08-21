@@ -408,7 +408,7 @@ impl CertAuthority {
     /// validity and the capability `role` names, and build its record.
     ///
     /// Separate from [`Self::sign`] rather than a flags argument on it, for the
-    /// same reason `issue_admin_cert` is separate from `issue_cert`: the two
+    /// same reason `issue_user_cert` is separate from `issue_cert`: the two
     /// produce different kinds of credential, and a call site should say which
     /// it means. The lifetime is the account's, not this authority's
     /// `cert_ttl_secs` — §7 decision 3 of the design puts it with the admin who

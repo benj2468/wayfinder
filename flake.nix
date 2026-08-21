@@ -256,6 +256,7 @@
                 rustToolchain
                 cargo-nextest
                 cargo-machete
+                cargo-bloat
                 cargo-llvm-cov
                 cargo-fuzz
                 cargo-binutils
