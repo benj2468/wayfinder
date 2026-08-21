@@ -44,6 +44,21 @@ pub trait FrameIo: Send + Sync {
     async fn send(&self, buf: &[u8]) -> std::io::Result<usize>;
 }
 
+/// Forwards to the boxed value, so a caller that must pick one concrete
+/// [`FrameIo`] carrier at runtime (e.g. `wayfinder-tap` choosing between a TAP
+/// device and a raw-L2 NIC egress from config) can erase the choice to
+/// `Box<dyn FrameIo>` and hand the driver one uniform type — the same role
+/// `DynLinkT` plays for the mesh-link side.
+#[cfg_attr(feature = "std", async_trait::async_trait)]
+impl FrameIo for Box<dyn FrameIo> {
+    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (**self).recv(buf).await
+    }
+    async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
+        (**self).send(buf).await
+    }
+}
+
 #[cfg(feature = "tokio")]
 #[cfg_attr(feature = "std", async_trait::async_trait)]
 impl FrameIo for tokio::net::UnixDatagram {

@@ -20,8 +20,19 @@
 //!   EtherType — to isolate co-located meshes, or to coexist with real batman-adv
 //!   — without being forced onto the router's protocol number.  It implements
 //!   [`LinkT`] directly and routes each frame by its destination MAC.
+//! * **Raw L2 egress** ([`RawL2Egress`]) is a *host-facing* transport, not a mesh
+//!   interface: an `AF_PACKET`/`SOCK_RAW` socket bound to one physical NIC with
+//!   `ETH_P_ALL`, so it carries every frame on the wire rather than one transport
+//!   EtherType. It is the same shape as the kernel TAP device the driver's local
+//!   egress otherwise uses — a dumb whole-frame passthrough, [`FrameIo`] rather
+//!   than [`LinkT`] — just backed by a real NIC someone can plug a cable into
+//!   instead of a virtual device. Both raw-L2 carriers rely on the kernel's
+//!   `PACKET_IGNORE_OUTGOING` option so a frame this node just transmitted (mesh
+//!   traffic, or e.g. a co-located DHCP server's own broadcast replies) is never
+//!   read back and re-forwarded.
 //!
 //! [`transport`]: crate::transport
+//! [`FrameIo`]: crate::transport::FrameIo
 //! [`Link`]: crate::transport::Link
 
 use interfaces::frame::LinkFrame;
@@ -55,10 +66,22 @@ fn ipv4_payload_offset(datagram: &[u8]) -> Option<usize> {
     Some(header_len)
 }
 
+/// Extract the destination MAC — a raw-L2 frame's leading 6 bytes — from an
+/// Ethernet-shaped `[dst][src][ethertype][payload]` buffer, for addressing an
+/// `AF_PACKET` `sendto`. `None` if `frame` is shorter than a MAC address.
+fn frame_dst_mac(frame: &[u8]) -> Option<Mac> {
+    let bytes: [u8; 6] = frame.get(..6)?.try_into().ok()?;
+    Some(Mac(bytes))
+}
+
+#[cfg(feature = "tokio")]
+pub use tokio_impl::RawL2Egress;
 #[cfg(feature = "tokio")]
 pub use tokio_impl::RawL2Link;
 #[cfg(feature = "tokio")]
 pub use tokio_impl::build_raw_ip_link;
+#[cfg(feature = "tokio")]
+pub use tokio_impl::build_raw_l2_egress;
 #[cfg(feature = "tokio")]
 pub use tokio_impl::build_raw_l2_link;
 // Shared with the multi-access UDP link (`net::build_udp_multi_link`), which
@@ -88,6 +111,7 @@ mod tokio_impl {
     use tokio::net::UnixDatagram;
     use tokio::task::JoinSet;
 
+    use crate::transport::FrameIo;
     use crate::transport::Link;
     use wayfinder::DEFAULT_BATMAN_ETHER_TYPE;
     use wayfinder::link::DynLinkT;
@@ -263,6 +287,38 @@ mod tokio_impl {
         }
     }
 
+    /// Open, bind and configure an `AF_PACKET`/`SOCK_RAW` socket on `ifindex`
+    /// for wire `ethertype`: non-blocking, and — best-effort — set to skip the
+    /// kernel's loopback of this node's own transmitted frames back into its
+    /// own receive queue (`PACKET_IGNORE_OUTGOING`, Linux ≥ 4.20; older kernels
+    /// lack the option, so failure here is non-fatal). Shared by
+    /// [`build_raw_l2_link`] and [`build_raw_l2_egress`] — both are raw-L2
+    /// packet sockets differing only in what `ethertype` they bind/filter on
+    /// and what they do with the bytes.
+    fn open_packet_socket(ifindex: u32, ethertype: u16) -> anyhow::Result<Socket> {
+        let socket = Socket::new(
+            Domain::PACKET,
+            Type::RAW,
+            Some(Protocol::from(i32::from(ethertype.to_be()))),
+        )?;
+        socket.bind(&link_sockaddr(ifindex, ethertype, None))?;
+        socket.set_nonblocking(true)?;
+
+        let on: libc::c_int = 1;
+        // SAFETY: standard setsockopt with a correctly-sized `c_int` value.
+        unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                SOL_PACKET,
+                PACKET_IGNORE_OUTGOING,
+                &on as *const _ as *const libc::c_void,
+                size_of::<libc::c_int>() as socklen_t,
+            );
+        }
+
+        Ok(socket)
+    }
+
     /// Build a native raw-L2 mesh link bound to `interface`, filtering and
     /// stamping `ethertype`, type-erased as a [`LinkT`].
     ///
@@ -278,27 +334,7 @@ mod tokio_impl {
         ethertype: u16,
     ) -> anyhow::Result<Box<DynLinkT<'static>>> {
         let ifindex = interface_index(interface)?;
-        let socket = Socket::new(
-            Domain::PACKET,
-            Type::RAW,
-            Some(Protocol::from(i32::from(ethertype.to_be()))),
-        )?;
-        socket.bind(&link_sockaddr(ifindex, ethertype, None))?;
-        socket.set_nonblocking(true)?;
-
-        // Best-effort: suppress kernel loopback of our own transmissions.  Older
-        // kernels lack the option; a failure here is non-fatal.
-        let on: libc::c_int = 1;
-        // SAFETY: standard setsockopt with a correctly-sized `c_int` value.
-        unsafe {
-            libc::setsockopt(
-                socket.as_raw_fd(),
-                SOL_PACKET,
-                PACKET_IGNORE_OUTGOING,
-                &on as *const _ as *const libc::c_void,
-                size_of::<libc::c_int>() as socklen_t,
-            );
-        }
+        let socket = open_packet_socket(ifindex, ethertype)?;
 
         let link = RawL2Link {
             fd: AsyncFd::new(socket)?,
@@ -308,6 +344,62 @@ mod tokio_impl {
             wire_buf: [0u8; MAX_LINK_FRAME_LEN],
         };
         Ok(DynLinkT::new_box(link))
+    }
+
+    /// A physical NIC presented to the driver as a host-frame transport: an
+    /// `AF_PACKET`/`SOCK_RAW` socket bound to one interface with `ETH_P_ALL`, so
+    /// it captures every frame on the wire rather than one transport EtherType.
+    /// Plain byte-pipe passthrough — no EtherType retagging, and (unlike
+    /// [`RawL2Link`]) no mesh-protocol framing on send, since the bytes handed
+    /// to [`send`](FrameIo::send) are already a whole Ethernet frame, the same
+    /// shape the kernel TAP device produces and consumes. Construct with
+    /// [`build_raw_l2_egress`].
+    pub struct RawL2Egress {
+        /// The reactor-registered packet socket.
+        fd: AsyncFd<Socket>,
+        /// Kernel index of the bound interface, used to address outbound frames.
+        ifindex: u32,
+    }
+
+    #[cfg_attr(feature = "std", async_trait::async_trait)]
+    impl FrameIo for RawL2Egress {
+        async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+            async_recv(&self.fd, buf).await
+        }
+
+        async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+            // The frame carries its own destination MAC (it is Ethernet-shaped,
+            // like everything TAP passes through) — that MAC is what a packet
+            // socket's `sendto` needs to address, not anything this carrier
+            // decides on its own.
+            let Some(dst) = frame_dst_mac(buf) else {
+                tracing::trace!(
+                    len = buf.len(),
+                    "drop: egress frame too short for a destination address"
+                );
+                return Ok(0);
+            };
+            let addr = link_sockaddr(self.ifindex, libc::ETH_P_ALL as u16, Some(dst));
+            async_send_to(&self.fd, buf, &addr).await
+        }
+    }
+
+    /// Build a raw-L2 egress carrier bound to `interface`, type-erased as
+    /// [`FrameIo`].
+    ///
+    /// Requires `CAP_NET_RAW` (or root). Wayfinder does not create or address
+    /// this interface — it must already exist and be up. The socket ignores its
+    /// own outgoing frames where the kernel supports it (see
+    /// [`open_packet_socket`]), so this node's own transmissions — including a
+    /// co-located DHCP server's broadcast replies bound to this same interface —
+    /// are never read back and forwarded into the mesh.
+    pub fn build_raw_l2_egress(interface: &str) -> anyhow::Result<RawL2Egress> {
+        let ifindex = interface_index(interface)?;
+        let socket = open_packet_socket(ifindex, libc::ETH_P_ALL as u16)?;
+        Ok(RawL2Egress {
+            fd: AsyncFd::new(socket)?,
+            ifindex,
+        })
     }
 
     /// Build a point-to-point mesh link carried over a raw IPv4 socket, type-
@@ -391,6 +483,36 @@ mod tests {
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])
+    }
+
+    /// A raw-L2 egress frame is Ethernet-shaped (`[dst][src][ethertype][payload]`,
+    /// the same layout `frame_into_buf` writes and `TapDevice` passes through
+    /// verbatim), so the destination address to `sendto` on is just its leading
+    /// six bytes.
+    #[test]
+    fn frame_dst_mac_reads_leading_six_bytes() {
+        let mut wire = [0u8; 32];
+        let n = frame_into_buf(
+            mac(3),
+            0x0800,
+            &LinkFrameData {
+                dst: mac(9),
+                protocol: 0x0800,
+                payload: &[1, 2, 3],
+            },
+            &mut wire,
+        )
+        .expect("frame fits buffer");
+        assert_eq!(frame_dst_mac(&wire[..n]), Some(mac(9)));
+    }
+
+    /// A buffer shorter than a MAC address (6 bytes) has no destination to
+    /// extract, so `send` on such a frame should drop it rather than read past
+    /// the end or address it with garbage.
+    #[test]
+    fn frame_dst_mac_rejects_short_buffer() {
+        assert_eq!(frame_dst_mac(&[0, 0, 0, 0, 0]), None);
+        assert_eq!(frame_dst_mac(&[]), None);
     }
 
     /// A frame sent under a custom wire EtherType retags on receive into a

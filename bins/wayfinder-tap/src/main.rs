@@ -1,10 +1,13 @@
-//! The runnable Wayfinder node: bridges a host TAP device onto the mesh,
-//! carries mesh links over UDP, and exposes the management API.
+//! The runnable Wayfinder node: bridges its local host-facing egress (a kernel
+//! TAP device, or a physical ethernet NIC — see [`LocalDistributionMechanism`])
+//! onto the mesh, carries mesh links over UDP, and exposes the management API.
 //!
 //! All of the routing event loop lives in `wayfinder-driver`; this binary only
-//! assembles the concrete transports (a kernel TAP, UDP links) and the
+//! assembles the concrete transports (the local egress, UDP links) and the
 //! management-API listeners from the YAML config, then hands them to a
 //! [`Driver`] and runs it.
+//!
+//! [`LocalDistributionMechanism`]: wayfinder::config::LocalDistributionMechanism
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -34,12 +37,14 @@ use wayfinder_driver::AuthSnapshotRx;
 use wayfinder_driver::AuthSnapshotTx;
 use wayfinder_driver::BleLinkParams;
 use wayfinder_driver::Driver;
+use wayfinder_driver::FrameIo;
 use wayfinder_driver::QueryRx;
 use wayfinder_driver::QueryTx;
 use wayfinder_driver::Rylr998LinkParams;
 use wayfinder_driver::bind_tcp_server;
 use wayfinder_driver::build_ble_link;
 use wayfinder_driver::build_raw_ip_link;
+use wayfinder_driver::build_raw_l2_egress;
 use wayfinder_driver::build_raw_l2_link;
 use wayfinder_driver::build_rylr998_link;
 use wayfinder_driver::build_udp_link;
@@ -228,16 +233,19 @@ async fn main() -> anyhow::Result<()> {
 
     let mut join_set: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
-    // This binary's local egress is a kernel TAP; reject any other mechanism.
-    let LocalDistributionMechanism::Tap(tap) = match config.local_egress {
-        Some(mechanism) => mechanism,
-        None => bail!("config.local_egress must be a TAP for the wayfinder-tap node"),
-    };
+    let local_egress = config
+        .local_egress
+        .ok_or_else(|| anyhow!("config.local_egress must be set for the wayfinder-tap node"))?;
 
-    // Cap the TAP MTU so a full host frame still fits inside a mesh link's
-    // carrier once wrapped in BATMAN + link + auth encapsulation; without this,
-    // full-size frames would be silently truncated on read or dropped on wrap.
-    let mtu = tap.mtu.unwrap_or(wayfinder::config::TapConfig::DEFAULT_MTU);
+    // The mesh-identity MAC is persisted independently of which local egress
+    // is configured — a raw-L2 egress's own NIC hardware MAC is unrelated to
+    // it, just as a TAP's kernel-assigned MAC is. Resolved up front so the MAC
+    // derivation below (which needs it before either egress is constructed)
+    // stays a single block regardless of which mechanism is chosen.
+    let mac_state_path = match &local_egress {
+        LocalDistributionMechanism::Tap(tap) => tap.resolved_mac_state_path(),
+        LocalDistributionMechanism::RawL2Egress(cfg) => cfg.resolved_mac_state_path(),
+    };
 
     // Decide this node's MAC *before* creating the TAP device, rather than
     // trusting whatever the kernel assigns a freshly-created device — that is
@@ -269,25 +277,39 @@ async fn main() -> anyhow::Result<()> {
                 .node_mac
         }
         (None, Some(auth_cfg)) => load_keypair(&auth_cfg.seed_path)?.derived_mac().0,
-        (None, None) => load_or_generate_mac(&tap.resolved_mac_state_path())?,
+        (None, None) => load_or_generate_mac(&mac_state_path)?,
     };
 
-    let mut builder = DeviceBuilder::new()
-        .layer(Layer::L2)
-        .name(&tap.device_name)
-        .mtu(mtu)
-        .mac_addr(mac_addr);
-    // The IPv4 address/netmask are optional: when no address is configured the
-    // TAP is brought up unaddressed (the mesh routes on MAC, not IP).
-    if let Some(ip_address) = tap.ip_address {
-        let netmask = tap
-            .netmask
-            .unwrap_or(wayfinder::config::TapConfig::DEFAULT_NETMASK);
-        builder = builder.ipv4(ip_address, netmask, None);
-    }
-    let dev = builder
-        .build_async()
-        .context("failed to create TAP device")?;
+    let local: Box<dyn FrameIo> = match local_egress {
+        LocalDistributionMechanism::Tap(tap) => {
+            // Cap the TAP MTU so a full host frame still fits inside a mesh
+            // link's carrier once wrapped in BATMAN + link + auth
+            // encapsulation; without this, full-size frames would be silently
+            // truncated on read or dropped on wrap.
+            let mtu = tap.mtu.unwrap_or(wayfinder::config::TapConfig::DEFAULT_MTU);
+            let mut builder = DeviceBuilder::new()
+                .layer(Layer::L2)
+                .name(&tap.device_name)
+                .mtu(mtu)
+                .mac_addr(mac_addr);
+            // The IPv4 address/netmask are optional: when no address is
+            // configured the TAP is brought up unaddressed (the mesh routes
+            // on MAC, not IP).
+            if let Some(ip_address) = tap.ip_address {
+                let netmask = tap
+                    .netmask
+                    .unwrap_or(wayfinder::config::TapConfig::DEFAULT_NETMASK);
+                builder = builder.ipv4(ip_address, netmask, None);
+            }
+            let dev = builder
+                .build_async()
+                .context("failed to create TAP device")?;
+            Box::new(TapDevice(dev))
+        }
+        LocalDistributionMechanism::RawL2Egress(cfg) => {
+            Box::new(build_raw_l2_egress(&cfg.interface).context("failed to bind raw-L2 egress")?)
+        }
+    };
 
     tracing::info!(
         "Starting wayfinder with MAC address: {:?}",
@@ -441,7 +463,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut driver = Driver::new(
         Mac(mac_addr),
-        TapDevice(dev),
+        local,
         interfaces,
         trickle,
         features,
