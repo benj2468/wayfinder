@@ -1990,6 +1990,10 @@ fn keepalive_miss_switches_route_before_ogm_staleness_would() {
     let mut harness = single_machine_with_links(2);
     let ogm_via_2 = build_relayed_ogm_wire_frame(2, 100, 255, 1);
     let ogm_via_3 = build_relayed_ogm_wire_frame(3, 100, 100, 1);
+    // Neighbor 2's own OGM, so it's a known originator in its own right — a
+    // keep-alive is only accepted from a neighbor we've actually heard an
+    // OGM from.
+    let ogm_from_2 = build_relayed_ogm_wire_frame(2, 2, 255, 1);
     let keepalive_via_2 = build_keepalive_wire_frame(2);
 
     let a = harness.get_machine_mut("a");
@@ -1997,6 +2001,7 @@ fn keepalive_miss_switches_route_before_ogm_staleness_would() {
     // neighbors on different interfaces.
     a.receive_with_metrics(Duration::ZERO, 0, &ogm_via_2, LinkMetrics::default());
     a.receive_with_metrics(Duration::ZERO, 1, &ogm_via_3, LinkMetrics::default());
+    a.receive_with_metrics(Duration::ZERO, 0, &ogm_from_2, LinkMetrics::default());
     // Neighbor 2 sends two keep-alives a second apart, teaching a 1s cadence.
     a.receive_with_metrics(Duration::ZERO, 0, &keepalive_via_2, LinkMetrics::default());
     a.receive_with_metrics(

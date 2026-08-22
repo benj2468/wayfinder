@@ -24,7 +24,6 @@ use wayfinder::interfaces::link::LinkError;
 use wayfinder::interfaces::link::LinkMetrics;
 use wayfinder::link::LinkT;
 use wayfinder::link::Received;
-use wayfinder_link_utils::parse_fragment;
 use zerocopy::FromBytes;
 
 use crate::BleError;
@@ -221,6 +220,7 @@ impl LinkT for NrfBleLink {
             let n = frame::build_fragment_ad(
                 &frame_bytes,
                 frame_len,
+                origin,
                 msg_id,
                 index,
                 count,
@@ -250,12 +250,20 @@ impl LinkT for NrfBleLink {
         loop {
             let report = self.reports.channel.receive().await;
             trace!(addr = ?report.addr, rssi = ?report.rssi, len = report.len, "rx report");
-            let Some((hdr, body)) = parse_fragment(&report.data[..report.len as usize]) else {
+            let Some((hdr, origin, body)) =
+                frame::parse_fragment_with_origin(&report.data[..report.len as usize])
+            else {
                 trace!(addr = ?report.addr, "drop: malformed fragment header");
                 continue;
             };
+            // Keyed on the origin `Mac` embedded in every fragment, not
+            // `report.addr` — see `frame::ORIGIN_LEN` for why the medium's
+            // own advertiser address can't be trusted as a reassembly key
+            // (confirmed against the BlueZ backend; this backend's own
+            // address is stable, but the wire format must interoperate with
+            // one that isn't).
             let key = wayfinder_link_utils::FragKey {
-                addr: report.addr,
+                addr: origin,
                 msg_id: hdr.msg_id,
             };
             let metrics = LinkMetrics {

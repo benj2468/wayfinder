@@ -62,18 +62,20 @@ pub struct BleLinkParams {
     /// How long each fragment's advertisement stays registered with BlueZ.
     ///
     /// The airtime knob, and the one value here worth tuning per deployment.
-    /// It must outlast the controller's advertising interval (BlueZ defaults to
-    /// ~100 ms and this crate does not override it) or a fragment is retired
-    /// before any advertising event carried it. Raising it costs latency
+    /// It must outlast [`ADVERTISING_INTERVAL`] (the on-air repeat interval
+    /// this crate explicitly requests, `min_interval`/`max_interval` on the
+    /// `Advertisement`) by enough to cover several repeats, not just one — a
+    /// single on-air transmission is one coin flip against a scanner that
+    /// isn't listening at that exact moment. Raising it costs latency
     /// directly: a frame takes `dwell × fragment_count`, up to 14 fragments.
     pub advertise_dwell: Duration,
 }
 
 impl BleLinkParams {
-    /// Default per-fragment dwell: 150 ms, comfortably past BlueZ's ~100 ms
-    /// default advertising interval so each fragment gets at least one
-    /// advertising event on the air. Not yet validated against real
-    /// controllers — see `libs/blue/CLAUDE.md`.
+    /// Default per-fragment dwell: 150 ms, giving several repeats at
+    /// [`ADVERTISING_INTERVAL`] (20 ms) before the advertising set is torn
+    /// down. Confirmed via `btmon` against a real controller — see
+    /// `libs/blue/CLAUDE.md`.
     pub const DEFAULT_ADVERTISE_DWELL: Duration = Duration::from_millis(150);
 }
 
@@ -94,36 +96,80 @@ impl Default for BleLinkParams {
 /// its handle is dropped, so a fragment advertised and immediately released
 /// never reaches a scanner.
 ///
-/// **Depends on `Privacy = device` in the host's `main.conf`.** Reassembly keys
-/// on the advertiser address, and one advertisement per fragment is exactly the
-/// pattern that makes that address move: without it the kernel issues a fresh
-/// non-resolvable address per advertising session and nothing ever reassembles.
-/// BlueZ offers no per-advertisement or per-adapter override, so this stays a
-/// deployment requirement — see `libs/blue/CLAUDE.md`.
+/// No longer depends on `Privacy = device` in the host's `main.conf` for
+/// correctness (previously documented here): registering a fresh
+/// advertisement per fragment was assumed to hold one address for BlueZ's
+/// RPA rotation timeout, but a `btmon` capture against a real controller
+/// showed it drawing a new random address on *every* registration — so
+/// reassembly no longer keys on the advertiser address at all (see
+/// `crate::frame::ORIGIN_LEN`) and this requirement is gone. See
+/// `libs/blue/CLAUDE.md`.
 struct BluerAdvertiser {
     adapter: Adapter,
     advertise_dwell: Duration,
 }
 
+/// On-air advertising interval requested for each fragment's advertising set,
+/// in both `MinInterval` and `MaxInterval` — BlueZ's own protocol minimum
+/// (`bluer::adv::Advertisement::min_interval`'s valid range starts at 20ms)
+/// and the same cadence `nrf_link.rs`'s `ADV_INTERVAL_625US` uses.
+///
+/// Left unset, BlueZ picks its own default — observed at 1280ms on one real
+/// controller (`btmon`), an order of magnitude past `advertise_dwell`. A
+/// fragment's advertising set is only enabled for `advertise_dwell` before
+/// being torn down, so at a 1280ms interval most fragments got exactly one
+/// on-air transmission before teardown and some got zero (confirmed via the
+/// `LE Advertising Set Terminated` event's "Number of completed extended
+/// advertising events" field) — no redundancy against a scanner that isn't
+/// listening at that exact moment. At 20ms, `advertise_dwell` (150ms default)
+/// instead covers several repeats per fragment.
+const ADVERTISING_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Build the BlueZ advertisement for one fragment: broadcast-only manufacturer
+/// data carrying `fragment`, torn down no later than `advertise_dwell`, and
+/// repeated on-air every [`ADVERTISING_INTERVAL`] for as long as it stays
+/// registered.
+fn build_advertisement(fragment: &[u8], advertise_dwell: Duration) -> Advertisement {
+    Advertisement {
+        // Broadcast, not the `Peripheral` default: nothing here would
+        // answer a connection attempt. BlueZ forbids `discoverable` on a
+        // broadcast advertisement, so that stays unset.
+        advertisement_type: AdvertisementType::Broadcast,
+        manufacturer_data: BTreeMap::from([(MESH_COMPANY_ID, fragment.to_vec())]),
+        // Backstop against a leaked registration outliving the dwell below.
+        timeout: Some(advertise_dwell),
+        min_interval: Some(ADVERTISING_INTERVAL),
+        max_interval: Some(ADVERTISING_INTERVAL),
+        ..Default::default()
+    }
+}
+
 impl BleAdvertiser for BluerAdvertiser {
     async fn advertise(&self, fragment: &[u8]) -> Result<(), LinkError> {
-        let advertisement = Advertisement {
-            // Broadcast, not the `Peripheral` default: nothing here would
-            // answer a connection attempt. BlueZ forbids `discoverable` on a
-            // broadcast advertisement, so that stays unset.
-            advertisement_type: AdvertisementType::Broadcast,
-            manufacturer_data: BTreeMap::from([(MESH_COMPANY_ID, fragment.to_vec())]),
-            // Backstop against a leaked registration outliving the dwell below.
-            timeout: Some(self.advertise_dwell),
-            ..Default::default()
-        };
+        let advertisement = build_advertisement(fragment, self.advertise_dwell);
 
         let handle = self.adapter.advertise(advertisement).await.map_err(|e| {
             trace!(?e, "drop: BLE advertise failed");
             LinkError::TransmitFailed
         })?;
+        trace!(
+            dwell_ms = self.advertise_dwell.as_millis(),
+            "BLE advertisement registered"
+        );
         tokio::time::sleep(self.advertise_dwell).await;
+        // `drop(handle)` only closes a oneshot channel; the actual
+        // `UnregisterAdvertisement` D-Bus call runs on a task `bluer` detaches
+        // internally and is not awaited here, so in principle this
+        // fragment's registration could still be live with BlueZ when the
+        // next fragment's `advertise()` call registers a second one. A
+        // `btmon` capture against a real controller found no such overlap in
+        // practice (each advertising set's `LE Remove Advertising Set`
+        // completed before the next one's registration began) — the
+        // confirmed failure mode was the on-air advertising interval, not
+        // this race; see `ADVERTISING_INTERVAL` and `libs/blue/CLAUDE.md`.
+        // Left as a documented latent risk, not a demonstrated one.
         drop(handle);
+        trace!("BLE advertisement unregister requested (not confirmed by bluer)");
         Ok(())
     }
 }
@@ -514,6 +560,36 @@ mod tests {
         let monitor = mesh_monitor();
         assert_eq!(monitor.rssi_sampling_period, Some(RssiSamplingPeriod::All));
         assert_eq!(monitor.monitor_type, MonitorType::OrPatterns);
+    }
+
+    /// Left unset, BlueZ picks its own default advertising interval instead
+    /// of ours — observed via `btmon` at 1280ms on a real controller, an
+    /// order of magnitude past `advertise_dwell`, which starves most
+    /// fragments of more than one on-air transmission before their
+    /// advertising set is torn down. Both bounds must be set to
+    /// `ADVERTISING_INTERVAL` explicitly so a fragment gets repeated
+    /// transmissions within its dwell window instead of relying on
+    /// whatever BlueZ defaults to.
+    #[test]
+    fn build_advertisement_sets_explicit_advertising_interval() {
+        let advertisement = build_advertisement(&[1, 2, 3], Duration::from_millis(150));
+        assert_eq!(advertisement.min_interval, Some(ADVERTISING_INTERVAL));
+        assert_eq!(advertisement.max_interval, Some(ADVERTISING_INTERVAL));
+    }
+
+    #[test]
+    fn build_advertisement_carries_fragment_as_manufacturer_data_and_dwell_as_timeout() {
+        let dwell = Duration::from_millis(150);
+        let advertisement = build_advertisement(&[1, 2, 3], dwell);
+        assert_eq!(
+            advertisement.advertisement_type,
+            AdvertisementType::Broadcast
+        );
+        assert_eq!(
+            advertisement.manufacturer_data,
+            BTreeMap::from([(MESH_COMPANY_ID, vec![1, 2, 3])])
+        );
+        assert_eq!(advertisement.timeout, Some(dwell));
     }
 
     #[test]

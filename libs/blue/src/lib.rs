@@ -41,9 +41,10 @@ pub use generic_link::BleAdvertiser;
 pub use generic_link::BleLink;
 #[cfg(feature = "generic")]
 pub use generic_link::BleReportSink;
-// Exported in every configuration: it is the reassembly key both backends
-// share, and it appears in `BleReportSink::submit`/`RawReport::new`, so
-// gating it would leave those signatures unnameable.
+// Exported in every configuration: it appears in
+// `BleReportSink::submit`/`RawReport::new`, so gating it would leave those
+// signatures unnameable. No longer the reassembly key — see `addr`'s module
+// doc comment.
 pub use addr::BleAddr;
 
 #[cfg(feature = "std")]

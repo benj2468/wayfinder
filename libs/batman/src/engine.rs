@@ -784,6 +784,15 @@ impl<
     /// [`next_hop`](Self::next_hop) can deprioritize routes through it the
     /// instant it goes quiet, without waiting for OGM-interval-based
     /// staleness. Always [`Consumed`](RoutingAction::Consumed).
+    ///
+    /// Only accepted for a neighbor already known via a real OGM
+    /// (`orig_ident` in [`originator_table`](Self::originator_table)) — a
+    /// keep-alive proves the link is physically alive, not that the sender
+    /// is a validated originator, and this table is what the management
+    /// API's keep-alive query surfaces as neighbor liveness. Without this
+    /// gate a neighbor whose OGMs never reach this node (an asymmetric or
+    /// otherwise broken link) could still show as "alive" purely off
+    /// heartbeats, despite never appearing as a routable destination.
     fn handle_keepalive(&mut self, now: core::time::Duration, frame: &LinkFrame) -> RoutingAction {
         let Ok((_hdr, _)) = crate::wire::BatmanKeepAlivePacket::read_from_prefix(&frame.payload)
         else {
@@ -791,7 +800,11 @@ impl<
             return RoutingAction::Consumed;
         };
         if frame.src != self.self_ident {
-            self.note_keepalive(now, frame.src);
+            if self.originator_table.contains_key(&frame.src) {
+                self.note_keepalive(now, frame.src);
+            } else {
+                trace!(neighbor = ?frame.src, "drop: keepalive from a neighbor with no OGM-established route");
+            }
         }
         RoutingAction::Consumed
     }
@@ -1280,6 +1293,30 @@ mod tests {
         data
     }
 
+    /// A one-hop OGM: `neighbor` is both the originator and the immediate
+    /// sender, matching how a directly-heard neighbor's own OGM looks on the
+    /// wire. Used to give a neighbor an originator-table entry before a test
+    /// exercises keep-alive handling for it.
+    fn ogm_frame(neighbor: u8, dst: u8, seqno: u32) -> Vec<u8> {
+        let ogm = BatmanOgmPacket {
+            packet_type: BatmanPacketType::Ogm.as_u8(),
+            version: 5,
+            ttl: 5,
+            flags: 0,
+            seqno: seqno.to_be(),
+            orig: mac(neighbor),
+            reserved: 0,
+            tq: 200,
+            tvlv_len: 0,
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(mac(dst).as_bytes());
+        data.extend_from_slice(mac(neighbor).as_bytes());
+        data.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
+        data.extend_from_slice(ogm.as_bytes());
+        data
+    }
+
     /// One keep-alive from a neighbor arms `keepalive_missed` (no longer
     /// unconditionally `false`); a second heartbeat folds the observed gap
     /// into the learned `interval_estimate` via the same peak-hold technique
@@ -1288,6 +1325,13 @@ mod tests {
     fn handle_rx_keepalive_arms_and_learns_gap() {
         let mut engine = BatmanEngine::<4>::new(mac(1));
         let mut tx = [0u8; 64];
+
+        // A keep-alive is only accepted for a neighbor already known via a
+        // real OGM.
+        let ogm = ogm_frame(2, 1, 1);
+        let parsed_ogm = LinkFrame::ref_from_prefix(&ogm).unwrap().0;
+        let mut ogm_reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+        engine.handle_rx(core::time::Duration::ZERO, parsed_ogm, None, &mut ogm_reply);
 
         let frame1 = keepalive_frame(2, 1);
         let parsed1 = LinkFrame::ref_from_prefix(&frame1).unwrap().0;
@@ -1310,6 +1354,26 @@ mod tests {
         let stats = engine.keepalive.get(&mac(2)).unwrap();
         assert_eq!(stats.last_heard, core::time::Duration::from_secs(5));
         assert_eq!(stats.interval_estimate, core::time::Duration::from_secs(5));
+    }
+
+    /// A keep-alive from a neighbor with no OGM-established originator-table
+    /// entry must not arm liveness state — a physically-heard heartbeat is
+    /// not proof of a route, and the mgmt API's keep-alive table must never
+    /// report a neighbor the routing table has never known.
+    #[test]
+    fn handle_rx_keepalive_dropped_for_unknown_originator() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let mut tx = [0u8; 64];
+
+        let frame = keepalive_frame(2, 1);
+        let parsed = LinkFrame::ref_from_prefix(&frame).unwrap().0;
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+        engine.handle_rx(core::time::Duration::ZERO, parsed, None, &mut reply);
+
+        assert!(
+            engine.keepalive.get(&mac(2)).is_none(),
+            "a keep-alive from an unknown originator must not arm liveness state"
+        );
     }
 
     /// A keep-alive frame truncated shorter than its 2-byte header is
@@ -1346,6 +1410,13 @@ mod tests {
     fn keepalive_missed_flips_past_budget_and_self_heals() {
         let mut engine = BatmanEngine::<4>::new(mac(1));
         let mut tx = [0u8; 64];
+
+        // A keep-alive is only accepted for a neighbor already known via a
+        // real OGM.
+        let ogm = ogm_frame(2, 1, 1);
+        let parsed_ogm = LinkFrame::ref_from_prefix(&ogm).unwrap().0;
+        let mut ogm_reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+        engine.handle_rx(core::time::Duration::ZERO, parsed_ogm, None, &mut ogm_reply);
 
         // Two heartbeats 5s apart teach the engine a 5s cadence.
         for t in [0u64, 5] {
@@ -1397,32 +1468,35 @@ mod tests {
         let mut tx = [0u8; 64];
 
         // Fill the keep-alive table to capacity (4 neighbors), each first
-        // heard at a distinct, increasing time.
+        // heard at a distinct, increasing time. Each neighbor needs an OGM
+        // first — a keep-alive is only accepted for a known originator.
         for (i, src) in (10..14).enumerate() {
+            let t = core::time::Duration::from_secs(i as u64);
+            let ogm = ogm_frame(src, 1, 1);
+            let parsed_ogm = LinkFrame::ref_from_prefix(&ogm).unwrap().0;
+            let mut ogm_reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+            engine.handle_rx(t, parsed_ogm, None, &mut ogm_reply);
+
             let frame = keepalive_frame(src, 1);
             let parsed = LinkFrame::ref_from_prefix(&frame).unwrap().0;
             let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
-            engine.handle_rx(
-                core::time::Duration::from_secs(i as u64),
-                parsed,
-                None,
-                &mut reply,
-            );
+            engine.handle_rx(t, parsed, None, &mut reply);
         }
         assert_eq!(engine.keepalive.len(), 4);
         assert!(engine.keepalive.contains_key(&mac(10)));
 
         // A new neighbor's heartbeat must be admitted, evicting the
         // least-recently-heard entry (neighbor 10, heard at t=0).
+        let t = core::time::Duration::from_secs(100);
+        let ogm = ogm_frame(20, 1, 1);
+        let parsed_ogm = LinkFrame::ref_from_prefix(&ogm).unwrap().0;
+        let mut ogm_reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+        engine.handle_rx(t, parsed_ogm, None, &mut ogm_reply);
+
         let frame = keepalive_frame(20, 1);
         let parsed = LinkFrame::ref_from_prefix(&frame).unwrap().0;
         let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
-        engine.handle_rx(
-            core::time::Duration::from_secs(100),
-            parsed,
-            None,
-            &mut reply,
-        );
+        engine.handle_rx(t, parsed, None, &mut reply);
 
         assert_eq!(engine.keepalive.len(), 4, "table stays at capacity");
         assert!(

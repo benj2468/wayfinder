@@ -8,10 +8,18 @@ matching the fire-and-forget `LinkT` model the other radio drivers here use.
 `send` broadcasts a frame's fragments as short-lived non-connectable
 advertisements; `recv` reassembles fragments observed by continuous passive
 scanning. Fragmentation reuses the shared `wayfinder-link-utils` machinery
-(see its `CLAUDE.md`), instantiated with a BLE advertiser address
-(`BleAddr`) as the reassembly key — unlike RYLR998's 16-bit `AT+ADDRESS`,
-this needs no deployment-time configuration, since BLE addresses are already
-globally distinct per physical device and reported on every scan report.
+(see its `CLAUDE.md`), instantiated with the sender's own mesh `Mac` as the
+reassembly key — **not** the medium-reported advertiser address, unlike
+every other consumer of that crate. That's a deliberate departure: a `btmon`
+capture against a real BlueZ controller showed the advertiser address
+rotating on *every* advertising-set registration (new random address per
+fragment, not per rotation timeout), so no multi-fragment message's
+fragments ever shared one address. `frame::build_fragment` embeds the
+sender's `Mac` in *every* fragment (`ORIGIN_LEN`, 6 bytes) rather than
+relying on the address at all — costing some payload (`FRAG_PAYLOAD` drops
+from 25 to 19 bytes) but making reassembly correct regardless of what the
+medium's own address does. `BleAddr` (`addr.rs`) still exists for
+diagnostics (logging, RSSI association) but is no longer load-bearing.
 
 ## Two backends, one wire format
 
@@ -94,28 +102,44 @@ itself:
   `MonitorManager::register()` — guarding only the latter still propagates
   the failure. Check with
   `busctl introspect org.bluez /org/bluez org.bluez.AdvertisementMonitorManager1`.
-- **`Privacy = device`.** Reassembly keys on the advertiser address
-  (`FragKey`), so that address has to stay put for at least the time a frame
-  spends on the air. Non-connectable advertising asks the kernel for privacy,
-  and with no RPA configured it answers with a fresh *non-resolvable* private
-  address per advertising session — and since `BluerAdvertiser::advertise`
-  registers and tears down one advertisement per fragment, every fragment
-  would leave under a different address and nothing would ever reassemble.
-  `Privacy = device` moves it onto the RPA path, which holds one address for
-  the rotation timeout (~15 min) instead. This is a deployment dependency
-  accepted deliberately: the mesh owns every device it integrates with, so
-  pinning host config is cheaper than spending payload bytes on a sender tag
-  in the fragment header. It does not generalise to every platform's
-  advertising API, so a future backend without this kind of address control
-  would have to revisit the keying rather than inherit this.
+- **`Privacy = device` is no longer required for reassembly correctness**
+  (though there's no reason to remove it either). It used to be: reassembly
+  keyed on the advertiser address, so `Privacy = device` was needed to move
+  address assignment onto the RPA path, which was expected to hold one
+  address for the ~15-minute rotation timeout instead of drawing a fresh
+  *non-resolvable* private address per advertising session. That expectation
+  turned out to be wrong in practice — a `btmon` capture against a real
+  controller, with `Privacy = device` correctly set, showed
+  `BluerAdvertiser::advertise`'s one-registration-per-fragment pattern
+  drawing a new random address on *every* registration anyway, not just
+  every ~15 minutes. Every multi-fragment message's fragments went out under
+  different addresses, 100% of the time, so reassembly could never complete.
+  The fix (`frame::ORIGIN_LEN`) embeds the sender's own `Mac` in every
+  fragment and keys reassembly on that instead, so the address's behavior —
+  rotating per session, per registration, or not at all — no longer matters.
 
 `advertise_dwell` (config: `advertise_dwell_ms`, default 150 ms) is the
-airtime knob. It must outlast the controller's advertising interval — BlueZ's
-default is ~100 ms, and this crate deliberately doesn't override it, since
-the `MinInterval`/`MaxInterval` advertisement properties need BlueZ ≥ 5.56
-plus controller support and registration fails outright without it. The cost
-is paid per fragment: a frame takes `dwell × fragment_count`, up to 14
-fragments.
+airtime knob — how long each fragment's advertising set stays registered. It
+must outlast the on-air advertising interval by enough to cover *several*
+repeats, not just one. This crate explicitly requests a 20 ms interval
+(`ADVERTISING_INTERVAL` in `std_link.rs`, `min_interval`/`max_interval` on
+the `Advertisement`) rather than leaving it unset: left unset, BlueZ picks
+its own default, measured via `btmon` against a real controller at **1280
+ms** — an order of magnitude past `advertise_dwell`, which left most
+fragments with exactly one on-air transmission before their advertising set
+was torn down (confirmed by the `LE Advertising Set Terminated` event's
+"Number of completed extended advertising events" field — 0 or 1, never
+more), no redundancy against a scanner that isn't listening at that exact
+moment. This was the actual cause of a real-world failure: two nRF52840
+peers exchanged OGMs over BLE fine with each other, but neither ever
+completed an OGM reassembly *from* a `wayfinder-tap` host on the same mesh,
+while that host's own BLE receive path (decoding OGMs from the nRF peers)
+worked perfectly — a one-directional TX-only defect, matching a sender that
+gives the receiver a single, poorly-timed shot per fragment. Setting the
+interval explicitly needs `MinInterval`/`MaxInterval` support (BlueZ ≥ 5.56
+plus controller support); registration fails outright without it. The dwell
+cost is paid per fragment either way: a frame takes `dwell × fragment_count`,
+up to 14 fragments.
 
 ## Why `nrf-softdevice`, not `trouble-host`/`nrf-sdc`
 
@@ -288,12 +312,43 @@ constant in this section — are a first guess, not a validated tuning; if
 `send()` starts failing with `Resources` again, widen the gap (lower the
 window relative to the interval) before anything else.
 
-**BlueZ (`src/std_link.rs`)**: whether the 150 ms default dwell actually
-clears the controller's advertising interval; whether register/advertise/
-unregister per fragment sustains a usable frame rate, or whether the D-Bus
-round-trips dominate; and, above all, **whether the two backends really do
-interoperate on the air** — the shared wire format is pinned by unit test,
-but no nRF node and Linux node have yet exchanged a frame.
+**BlueZ (`src/std_link.rs`)**: whether register/advertise/unregister per
+fragment sustains a usable frame rate, or whether the D-Bus round-trips
+dominate, is still unvalidated (though `btmon` captures below show fragments
+routinely getting 34-42 completed advertising events within a 150 ms dwell,
+so registration latency clearly isn't the bottleneck it might have been).
+**Whether the two backends interoperate on the air** was chased through two
+root causes before landing on the real one:
+
+1. Two nRF52840 peers and a `wayfinder-tap` host shared one mesh; both nRF
+   peers routed to each other and to the host fine, but the host never
+   completed an OGM reassembly *from* either nRF peer despite decoding OGMs
+   *from* both of them correctly (its scan/receive path was never the
+   problem). First suspect: BlueZ was defaulting to a 1280 ms advertising
+   interval (unset `MinInterval`/`MaxInterval`) against a 150 ms dwell, so
+   most fragments got exactly one on-air transmission before teardown and
+   some got zero — fixed by setting both to 20 ms explicitly
+   (`ADVERTISING_INTERVAL`, matching `nrf_link.rs`'s own cadence).
+2. That fix alone didn't resolve it. A follow-up `btmon` capture (all other
+   mesh nodes powered off, to rule out cross-attribution) showed every
+   fragment now getting 30-42 completed advertising events — reliable
+   transmission — yet reassembly still never completed. The actual cause:
+   every 2-fragment OGM's two fragments went out under two *different*
+   random advertiser addresses, 100% of the time (7 of 7 OGMs captured),
+   because `BluerAdvertiser`'s one-registration-per-fragment pattern draws a
+   fresh RPA on every registration regardless of `Privacy = device` or the
+   ~15-minute rotation timeout. Reassembly keyed on that address
+   (`FragKey`), so no multi-fragment message could ever complete — see the
+   `Privacy = device` bullet above for the full history.
+
+Fixed by no longer trusting the medium's address at all: `frame::ORIGIN_LEN`
+embeds the sender's own `Mac` in every fragment, and reassembly keys on that
+instead (`frame::parse_fragment_with_origin`). Costs some payload
+(`FRAG_PAYLOAD` 25 → 19 bytes, `MAX_REASSEMBLED_LEN` 350 → 280) but makes
+reassembly correct regardless of what BlueZ's RPA does. Not yet re-confirmed
+on real hardware after this fix — the next real-mesh test should watch for a
+nRF peer completing a `discovered new originator` for the BlueZ host's
+identity.
 
 A `send` occupies the driver's event loop for `dwell × fragment_count` on both
 backends — the same "slow link stalls the loop" property the LoRa link has —
