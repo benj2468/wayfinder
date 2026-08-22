@@ -23,6 +23,12 @@ crate-type = ["cdylib", "rlib"]
 wayfinder-tick-driver = { path = "../wayfinder-tick-driver" }
 interfaces = { path = "../interfaces" }
 wayfinder = { path = "../wayfinder" }
+# `std` for `Authority` — a simulation runs the certificate authority
+# in-process, the role a real deployment gives the enrollment portal.
+wayfinder-auth = { path = "../wayfinder-auth", features = ["std"] }
+# The auth wire types (`MembershipCert`, `RevocationRecord`) are zerocopy
+# structs; parsing/serializing them for Python goes through its traits.
+zerocopy = { version = "0.8", features = ["derive"] }
 pyo3 = { version = "0.29", features = ["abi3-py310"] }
 # Bridges wayfinder's `tracing` events (otherwise silently dropped — no
 # subscriber is installed by default in a library) out to the process; see

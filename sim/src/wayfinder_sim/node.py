@@ -12,6 +12,7 @@ import dataclasses
 import wayfinder_py as wf
 
 from .mobility import Mobility, Static, Vec3
+from .security import Credential
 
 DEFAULT_TRICKLE = (200, 2000)
 """(i_min_ms, i_max_ms) — a reasonably fast default Trickle schedule."""
@@ -26,7 +27,10 @@ class Node:
     `Simulation` calls this node's `PyDriver.tick`; when `None` it's derived
     from `trickle`'s `i_min_ms`. `tx_keepalive_interval_ms` is this node's
     default per-interface keep-alive heartbeat cadence, also overridable
-    per-`Link`; `None` (the default) disables keep-alive transmission."""
+    per-`Link`; `None` (the default) disables keep-alive transmission.
+    `credential` is what this node presents to the mesh's root of trust;
+    `None` (the default) leaves it an open, unauthenticated node — which
+    is also what every node is in a `Simulation` given no `mesh`."""
 
     name: str
     mobility: Mobility = dataclasses.field(default_factory=lambda: Static(Vec3()))
@@ -34,3 +38,4 @@ class Node:
     trickle: tuple[int, int] = DEFAULT_TRICKLE
     tick_interval_ms: int | None = None
     tx_keepalive_interval_ms: int | None = None
+    credential: Credential | None = None

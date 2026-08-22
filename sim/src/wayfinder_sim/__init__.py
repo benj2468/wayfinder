@@ -32,6 +32,7 @@ class NoLinkError(ValueError):
 
 
 if TYPE_CHECKING:
+    from .adversary import CapturedFrame, Wiretap
     from .channel import (
         Channel,
         ChannelSample,
@@ -70,6 +71,7 @@ if TYPE_CHECKING:
         write_sweep_report,
     )
     from .scenario import Simulation
+    from .security import Credential, Mesh
     from .sweep import SweepResult, run_sweep
     from .terrain import (
         Bounds,
@@ -89,9 +91,11 @@ if TYPE_CHECKING:
 __all__ = [
     "EARTH_RADIUS_M",
     "Bounds",
+    "CapturedFrame",
     "Channel",
     "ChannelSample",
     "ConnectivityStats",
+    "Credential",
     "EarthOccluded",
     "EarthOrbit",
     "FlatGround",
@@ -101,6 +105,7 @@ __all__ = [
     "Heightmap",
     "ImagePanel",
     "Link",
+    "Mesh",
     "Mobility",
     "MountainRange",
     "NoLinkError",
@@ -121,6 +126,7 @@ __all__ = [
     "Timeline",
     "Vec3",
     "Waypoints",
+    "Wiretap",
     "connectivity_stats",
     "elevation_profile",
     "has_line_of_sight",
@@ -158,6 +164,8 @@ _EXPORTS = {
     "terrain_scene": "interactive",
     "track_scene": "interactive",
     "write_html": "interactive",
+    "CapturedFrame": "adversary",
+    "Wiretap": "adversary",
     "Link": "link",
     "Mobility": "mobility",
     "Orbit": "mobility",
@@ -172,6 +180,8 @@ _EXPORTS = {
     "sweep_report_html": "report",
     "write_sweep_report": "report",
     "Simulation": "scenario",
+    "Credential": "security",
+    "Mesh": "security",
     "SweepResult": "sweep",
     "run_sweep": "sweep",
     "Bounds": "terrain",

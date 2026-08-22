@@ -1,0 +1,228 @@
+"""Mesh identity in the simulation engine: enrolling nodes against a mesh
+root, and the credentials a red-team scenario deliberately gets wrong."""
+
+from __future__ import annotations
+
+import pytest
+from wayfinder_sim.channel import PerfectWire
+from wayfinder_sim.node import Node
+from wayfinder_sim.scenario import Simulation
+from wayfinder_sim.security import Credential, Mesh
+from wayfinder_sim.topology import pair
+
+
+def _mesh(seed: int = 1) -> Mesh:
+    return Mesh(mesh_id=0xABCD, root_seed=bytes([seed]) * 32)
+
+
+def test_mesh_derives_a_stable_keypair_per_node_name():
+    mesh = _mesh()
+    assert mesh.keypair("alice").derived_mac == mesh.keypair("alice").derived_mac
+    assert mesh.keypair("alice").derived_mac != mesh.keypair("bob").derived_mac
+
+
+def test_two_meshes_with_the_same_id_have_different_anchors():
+    """Mesh id is a label; the root key is the actual boundary."""
+    assert _mesh(1).trust_anchor.root_pubkey != _mesh(2).trust_anchor.root_pubkey
+    assert _mesh(1).mesh_id == _mesh(2).mesh_id
+
+
+def test_an_enrolled_node_takes_its_key_derived_mac():
+    """A certificate binds key to MAC, so an enrolled node cannot be given an
+    address it holds no key for."""
+    mesh = _mesh()
+    nodes = [Node("a", credential=Credential()), Node("b", credential=Credential())]
+    sim = Simulation(nodes, [pair("a", "b", PerfectWire())], mesh=mesh)
+
+    assert sim.mac("a") == mesh.keypair("a").derived_mac
+    assert sim.driver("a").auth_enabled
+
+
+def test_an_explicit_mac_on_an_enrolled_node_is_rejected():
+    mesh = _mesh()
+    import wayfinder_py as wf
+
+    nodes = [
+        Node("a", credential=Credential(), mac=wf.PyMac(b"\x02\x00\x00\x00\x00\x01")),
+        Node("b", credential=Credential()),
+    ]
+    with pytest.raises(ValueError, match="derived from its key"):
+        Simulation(nodes, [pair("a", "b", PerfectWire())], mesh=mesh)
+
+
+def test_enrolled_nodes_converge():
+    """The happy path: authentication must not stop a real mesh working."""
+    mesh = _mesh()
+    nodes = [Node("a", credential=Credential()), Node("b", credential=Credential())]
+    sim = Simulation(nodes, [pair("a", "b", PerfectWire())], mesh=mesh)
+    sim.run(until_s=20.0)
+
+    assert sim.admitted("a") == ("b",), "a verified b's certificate"
+    assert sim.admitted("b") == ("a",)
+    assert sim.has_route("a", "b")
+
+
+def test_an_unenrolled_node_is_never_admitted():
+    """A node with no credential at all, alongside an authenticated mesh."""
+    mesh = _mesh()
+    nodes = [
+        Node("a", credential=Credential()),
+        Node("intruder"),  # no credential
+    ]
+    sim = Simulation(nodes, [pair("a", "intruder", PerfectWire())], mesh=mesh)
+    sim.run(until_s=20.0)
+
+    assert sim.admitted("a") == ()
+    assert not sim.has_route("a", "intruder")
+
+
+def test_a_foreign_mesh_credential_is_never_admitted():
+    """Valid certificate, wrong root — the segregation guarantee."""
+    ours, theirs = _mesh(1), _mesh(2)
+    nodes = [
+        Node("a", credential=Credential()),
+        Node("intruder", credential=Credential(mesh=theirs)),
+    ]
+    sim = Simulation(nodes, [pair("a", "intruder", PerfectWire())], mesh=ours)
+    sim.run(until_s=20.0)
+
+    assert sim.admitted("a") == ()
+    assert not sim.has_route("a", "intruder")
+
+
+def test_an_expired_credential_loses_its_route():
+    """Certificate expiry is the passive revocation mechanism: a node whose
+    window closes mid-run stops being verifiable, with no network involved.
+
+    The control plane is where that bites. Every OGM's certificate is
+    re-checked against the clock, so once the window closes nothing from that
+    node verifies, and its route lapses when the last accepted OGM goes stale
+    — noticeably later than the expiry instant itself.
+    """
+    mesh = _mesh()
+    nodes = [
+        Node("a", credential=Credential()),
+        Node("b", credential=Credential(valid_until_s=10.0)),
+    ]
+    sim = Simulation(nodes, [pair("a", "b", PerfectWire())], mesh=mesh)
+
+    sim.record("route", lambda s: s.has_route("a", "b"))
+    rec = sim.run(until_s=60.0)
+
+    route = rec.column("route")
+    assert any(route), "b is routable while its certificate is valid"
+    assert not route[-1], "and unroutable once it expires and goes stale"
+
+
+def test_expiry_does_not_cut_off_an_already_cached_neighbor():
+    """A gap, asserted so it cannot regress silently or be forgotten.
+
+    Verifying an OGM caches the peer's `VerifiedCert` *and* the pairwise key
+    derived from it, and that cache is only ever overwritten — never pruned
+    when the certificate it came from expires. The directed data plane looks
+    the pairwise key up by MAC without consulting `not_after`, so between
+    immediate neighbours, traffic keeps flowing after expiry even though the
+    route is gone.
+
+    The practical shape: expiry reliably stops a lapsed node being *routed
+    to*, but does not evict it from a neighbour that already admitted it.
+    Only an explicit revocation does that — see `test_revoking_a_member_ejects_it`.
+    """
+    mesh = _mesh()
+    nodes = [
+        Node("a", credential=Credential()),
+        Node("b", credential=Credential(valid_until_s=10.0)),
+    ]
+    sim = Simulation(nodes, [pair("a", "b", PerfectWire())], mesh=mesh)
+    sim.run(until_s=40.0)
+
+    assert not sim.has_route("a", "b"), "the route is gone"
+    assert sim.admitted("a") == ("b",), (
+        "but the neighbor cache still holds the expired certificate"
+    )
+
+    sim.send("a", "b", b"POST-EXPIRY PAYLOAD", at_s=41.0)
+    sim.run(until_s=45.0)
+    assert sim.poll_local("b") == b"POST-EXPIRY PAYLOAD", (
+        "and the link-local data plane still authenticates with its key"
+    )
+
+
+def test_require_auth_locks_a_node_holding_no_certificate():
+    """Fail-closed: told to require auth with nothing installed, a node is
+    inert rather than falling back to open operation."""
+    mesh = _mesh()
+    nodes = [
+        Node("a", credential=Credential()),
+        Node("b", credential=Credential(enrolled=False)),
+    ]
+    sim = Simulation(nodes, [pair("a", "b", PerfectWire())], mesh=mesh)
+    assert sim.driver("b").auth_locked
+    sim.run(until_s=20.0)
+
+    assert sim.admitted("a") == ()
+    assert not sim.has_route("b", "a"), "a locked node learns nothing either"
+
+
+def test_revoking_a_member_ejects_it():
+    """The active purge: the root signs a revocation and the mesh drops the
+    named node, without waiting for its certificate to expire."""
+    mesh = _mesh()
+    nodes = [
+        Node("a", credential=Credential()),
+        Node("b", credential=Credential()),
+        Node("rogue", credential=Credential()),
+    ]
+    links = [
+        pair("a", "b", PerfectWire()),
+        pair("a", "rogue", PerfectWire()),
+        pair("b", "rogue", PerfectWire()),
+    ]
+    sim = Simulation(nodes, links, mesh=mesh)
+    sim.run(until_s=20.0)
+    assert "rogue" in sim.admitted("a")
+
+    sim.revoke("rogue")
+    sim.run(until_s=60.0)
+
+    assert "rogue" not in sim.admitted("a")
+    assert "rogue" not in sim.admitted("b"), "the revocation floods to b as well"
+    assert not sim.has_route("a", "rogue")
+
+
+def test_a_mesh_is_optional_and_absent_leaves_every_node_open():
+    """Existing scenarios declare no mesh and must be unaffected."""
+    nodes = [Node("a"), Node("b")]
+    sim = Simulation(nodes, [pair("a", "b", PerfectWire())])
+    sim.run(until_s=20.0)
+
+    assert not sim.driver("a").auth_enabled
+    assert sim.has_route("a", "b")
+
+
+def test_a_certificate_may_name_a_mac_its_key_does_not_derive():
+    """A gap, asserted so the dependency stays visible.
+
+    `verify_cert` checks the root's signature, the mesh id, and the validity
+    window — but never that `node_mac` is derived from `ed_pubkey`. A
+    certificate binding a key to somebody else's address therefore verifies
+    perfectly. Impersonation resistance rests entirely on the authority
+    refusing to issue one; the router is not a second line of defence here.
+    """
+    mesh = _mesh()
+    victim_mac = mesh.keypair("hq").derived_mac
+    nodes = [
+        Node("hq", credential=Credential()),
+        Node("field", credential=Credential()),
+        Node("imposter", credential=Credential(claim_mac=victim_mac)),
+    ]
+    links = [
+        pair("hq", "field", PerfectWire()),
+        pair("field", "imposter", PerfectWire()),
+    ]
+    sim = Simulation(nodes, links, mesh=mesh)
+    sim.run(until_s=30.0)
+
+    assert victim_mac in sim.driver("field").neighbor_macs(), (
+        "a misissued certificate is accepted — CA policy is the only control"
+    )

@@ -5,9 +5,14 @@ use core::time::Duration;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use wayfinder::EgressInterface;
+use wayfinder::auth::OgmAuth;
 use wayfinder::config::TrickleConfig;
 use wayfinder_tick_driver::Driver;
 
+use crate::auth::PyKeypair;
+use crate::auth::PyMembershipCert;
+use crate::auth::PyRevocationRecord;
+use crate::auth::PyTrustAnchor;
 use crate::errors::MalformedFrameError;
 use crate::state::PyLinkQualityRecord;
 use crate::state::PyOriginatorRecord;
@@ -160,6 +165,104 @@ impl PyDriver {
     /// saturated table changes what the candidate set means.
     fn originator_occupancy(&self) -> (usize, usize) {
         self.inner.router().originator_occupancy()
+    }
+
+    // --- mesh authentication --------------------------------------------
+
+    /// Enable mesh authentication with this node's `keypair`, the
+    /// `cert` attesting its membership, and the mesh `anchor` every peer's
+    /// credentials are verified against.
+    ///
+    /// From here the router signs the OGMs it emits and rejects incoming ones
+    /// that do not verify — an unsigned OGM, or one signed under a foreign
+    /// anchor, never becomes a route. Installing auth deliberately resets
+    /// learned routing state: it was learned under a different (or no) trust
+    /// regime.
+    ///
+    /// Pair this with [`set_epoch_unix`](Self::set_epoch_unix). Certificate
+    /// validity is judged in unix seconds while `tick` counts monotonic
+    /// milliseconds from zero, so without an epoch the auth clock never leaves
+    /// 0 and every validity window is judged against the wrong time.
+    fn set_auth(&mut self, keypair: &PyKeypair, cert: &PyMembershipCert, anchor: &PyTrustAnchor) {
+        self.inner
+            .router_mut()
+            .set_auth(OgmAuth::new(keypair.to_keypair(), cert.0, anchor.0));
+    }
+
+    /// Pin the wall-clock unix time that `tick(0)` corresponds to, so
+    /// certificate validity is judged against a real clock while the caller
+    /// keeps driving a monotonic `now` from zero. Each `tick` then advances
+    /// the auth clock to `epoch_unix + now`.
+    fn set_epoch_unix(&mut self, epoch_unix: u64) {
+        self.inner.set_epoch_unix(epoch_unix);
+    }
+
+    /// Set the fail-closed policy: with `require` true and no certificate
+    /// installed, the node goes `auth_locked` — completely inert on the mesh —
+    /// rather than falling back to open, unauthenticated operation.
+    fn set_require_auth(&mut self, require: bool) {
+        self.inner.router_mut().set_require_auth(require);
+    }
+
+    /// Whether mesh authentication is installed on this node.
+    #[getter]
+    fn auth_enabled(&self) -> bool {
+        self.inner.router().auth().is_some()
+    }
+
+    /// Whether this node is required to authenticate but holds no certificate
+    /// — inert on the mesh until one is installed.
+    #[getter]
+    fn auth_locked(&self) -> bool {
+        self.inner.router().auth_locked()
+    }
+
+    /// This node's own membership certificate, if auth is enabled.
+    fn own_cert(&self) -> Option<PyMembershipCert> {
+        self.inner
+            .router()
+            .auth()
+            .map(|auth| PyMembershipCert(*auth.own_cert()))
+    }
+
+    /// Ingest a root-signed revocation, returning whether it was newly
+    /// recorded. From here the named node's frames are dropped and its routes
+    /// purged, and this node re-floods the record on its own OGMs until its
+    /// budget is spent. A no-op returning `False` when auth is disabled.
+    fn ingest_revocation(&mut self, record: &PyRevocationRecord) -> bool {
+        self.inner
+            .router_mut()
+            .ingest_revocation(&record.0, self.last_now)
+    }
+
+    /// Every MAC this node currently enforces a revocation against.
+    fn revoked_macs(&self) -> Vec<PyMac> {
+        self.inner
+            .router()
+            .auth()
+            .map(|auth| auth.revoked_macs().map(PyMac).collect())
+            .unwrap_or_default()
+    }
+
+    /// Every neighbor whose membership certificate this node has verified and
+    /// cached — the peers it has actually admitted to the mesh, as distinct
+    /// from the ones it merely has a route to.
+    fn neighbor_macs(&self) -> Vec<PyMac> {
+        self.inner
+            .router()
+            .auth()
+            .map(|auth| auth.neighbors().iter().map(|n| PyMac(n.cert.mac)).collect())
+            .unwrap_or_default()
+    }
+
+    /// The verified certificate this node holds for neighbor `mac`, if it has
+    /// admitted it at all.
+    fn neighbor_cert(&self, mac: PyMac) -> Option<PyMembershipCert> {
+        self.inner
+            .router()
+            .auth()?
+            .neighbor_cert(mac.0)
+            .map(|(cert, _fp)| PyMembershipCert(cert))
     }
 
     /// Resolve the current egress interface(s) for `dest`, if routable —

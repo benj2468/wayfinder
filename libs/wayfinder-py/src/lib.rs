@@ -10,12 +10,18 @@
 use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
 
+mod auth;
 mod driver;
 mod errors;
 mod state;
 mod tracing_init;
 mod types;
 
+pub use auth::PyAuthority;
+pub use auth::PyKeypair;
+pub use auth::PyMembershipCert;
+pub use auth::PyRevocationRecord;
+pub use auth::PyTrustAnchor;
 pub use driver::PyDriver;
 pub use errors::MalformedFrameError;
 pub use errors::WayfinderError;
@@ -39,6 +45,11 @@ fn wayfinder_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyOriginatorRecord>()?;
     m.add_class::<PyLinkQualityRecord>()?;
     m.add_class::<PyDriver>()?;
+    m.add_class::<PyKeypair>()?;
+    m.add_class::<PyTrustAnchor>()?;
+    m.add_class::<PyMembershipCert>()?;
+    m.add_class::<PyRevocationRecord>()?;
+    m.add_class::<PyAuthority>()?;
     m.add_function(wrap_pyfunction!(init_tracing, m)?)?;
     m.add("WayfinderError", m.py().get_type::<WayfinderError>())?;
     m.add(

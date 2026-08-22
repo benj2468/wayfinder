@@ -24,10 +24,12 @@ import simpy
 import wayfinder_py as wf
 
 from . import NoLinkError
+from .adversary import Wiretap
 from .link import Link
 from .mobility import Vec3
 from .node import Node
 from .recorder import Recorder
+from .security import Mesh
 
 Probe = Callable[["Simulation"], Any]
 """A function of the running `Simulation`, sampled once per recorder tick —
@@ -51,14 +53,27 @@ class _NodeState:
     driver: wf.PyDriver
     interfaces: dict[int, Link]  # this node's interface index -> the Link on it
     tick_interval_ms: int
+    keypair: wf.PyKeypair | None = None
+    """This node's mesh identity, when it has one. Retained so a scenario can
+    sign or re-enroll on its behalf mid-run."""
 
 
 class Simulation:
     """A running mesh simulation over `nodes` wired by `links`."""
 
     def __init__(
-        self, nodes: Sequence[Node], links: Sequence[Link], *, seed: int = 0
+        self,
+        nodes: Sequence[Node],
+        links: Sequence[Link],
+        *,
+        seed: int = 0,
+        mesh: Mesh | None = None,
     ) -> None:
+        """`mesh`, when given, makes this an *authenticated* mesh: every node
+        carrying a `Credential` is enrolled against that root before the run
+        starts, its routers sign the OGMs they emit, and unverifiable ones are
+        rejected. Left `None` every node is open and unauthenticated, which is
+        what a scenario studying routing rather than trust wants."""
         node_list = list(nodes)
         names = [n.name for n in node_list]
         if len(set(names)) != len(names):
@@ -80,6 +95,8 @@ class Simulation:
         self._probe_rng = Random(seed)
 
         self._links = list(links)
+        self._mesh = mesh
+        self._taps: dict[str, list[Wiretap]] = {}
         node_by_name = {n.name: n for n in node_list}
 
         # Assign each node's interface indices and per-interface trickle
@@ -117,16 +134,28 @@ class Simulation:
 
         self._states: dict[str, _NodeState] = {}
         for idx, node in enumerate(node_list, start=1):
-            mac = (
-                node.mac
-                if node.mac is not None
-                else wf.PyMac(bytes((*_AUTO_MAC_OUI, idx)))
-            )
+            keypair = self._identity_for(node)
+            if keypair is not None:
+                # A certificate binds key to MAC, so an authenticated node's
+                # address is not a free choice: it is whatever its key
+                # derives. Silently overriding an explicitly requested MAC
+                # would hide that, so refuse instead.
+                if node.mac is not None:
+                    raise ValueError(
+                        f"node {node.name!r} has a credential, so its MAC is "
+                        f"derived from its key — remove the explicit mac="
+                    )
+                mac = keypair.derived_mac
+            elif node.mac is not None:
+                mac = node.mac
+            else:
+                mac = wf.PyMac(bytes((*_AUTO_MAC_OUI, idx)))
             features = [
                 wf.PyLinkFeatures(tx_keepalive_interval_ms=ka)
                 for ka in node_keepalive[node.name]
             ]
             driver = wf.PyDriver(mac, node_trickle[node.name], features)
+            self._install_credential(node, driver, keypair)
             tick_interval_ms = node.tick_interval_ms
             if tick_interval_ms is None:
                 i_mins = [t[0] for t in node_trickle[node.name]] or [node.trickle[0]]
@@ -139,6 +168,7 @@ class Simulation:
                 driver=driver,
                 interfaces=node_interfaces[node.name],
                 tick_interval_ms=tick_interval_ms,
+                keypair=keypair,
             )
 
         self._probes: dict[str, Probe] = {}
@@ -146,6 +176,193 @@ class Simulation:
 
         for name in self._states:
             self.env.process(self._tick_proc(name))
+
+    # --- identity ---------------------------------------------------------
+
+    def _identity_for(self, node: Node) -> wf.PyKeypair | None:
+        """The keypair `node` runs under, or `None` if it has no mesh identity
+        at all (no credential declared, or no mesh to declare it against).
+
+        Derived from the *issuing* mesh, so a foreign-mesh intruder gets an
+        identity from its own root rather than ours.
+        """
+        credential = node.credential
+        if credential is None or self._mesh is None:
+            return None
+        issuer = credential.mesh or self._mesh
+        return issuer.keypair(node.name, credential.seed)
+
+    def _install_credential(
+        self, node: Node, driver: wf.PyDriver, keypair: wf.PyKeypair | None
+    ) -> None:
+        """Put `node`'s credential into its router before the run starts.
+
+        The order matters: the epoch has to be pinned before any certificate
+        is installed, because validity is judged in unix seconds while the
+        driver counts monotonic milliseconds from zero. Skipping it leaves the
+        auth clock at zero, which reads as "never set" and judges every
+        window against the wrong time.
+        """
+        credential = node.credential
+        if credential is None or self._mesh is None:
+            return
+        issuer = credential.mesh or self._mesh
+        driver.set_epoch_unix(issuer.epoch_unix)
+        driver.set_require_auth(credential.require_auth)
+        if not credential.enrolled or keypair is None:
+            return  # fail-closed: required to authenticate, holding nothing
+        cert = issuer.enroll(
+            keypair,
+            valid_from_s=credential.valid_from_s,
+            valid_until_s=credential.valid_until_s,
+            claim_mac=credential.claim_mac,
+        )
+        driver.set_auth(keypair, cert, issuer.trust_anchor)
+
+    @property
+    def mesh(self) -> Mesh | None:
+        """The root of trust this simulation's members are enrolled against,
+        or `None` for an open, unauthenticated mesh."""
+        return self._mesh
+
+    def keypair(self, node: str) -> wf.PyKeypair | None:
+        """`node`'s mesh identity, or `None` if it has none."""
+        return self._states[node].keypair
+
+    def revoke(self, node: str, *, effective_s: float = 0.0) -> None:
+        """Have the mesh root purge `node`, and hand the signed record to
+        every other member.
+
+        Delivering it to each member directly models an operator pushing the
+        revocation over the management API — which is what a real deployment
+        does, because a node that has just been revoked is precisely the one
+        you cannot rely on to flood the order that revokes it. Members
+        re-flood it on their own OGMs from there.
+        """
+        if self._mesh is None:
+            raise ValueError("no mesh: nothing to revoke against")
+        record = self._mesh.revoke(self.mac(node), effective_s=effective_s)
+        for name, state in self._states.items():
+            if name != node:
+                state.driver.ingest_revocation(record)
+
+    def admitted(
+        self, node: str, targets: Sequence[str] | None = None
+    ) -> tuple[str, ...]:
+        """Which of `targets` `node` has actually verified as mesh members —
+        peers whose certificate it holds and checked against the trust anchor.
+
+        This, not `route_via` or `reachable`, is the membership question.
+        Route resolution falls back to the link-quality table, which is
+        populated when a frame is *received*, before its signature is judged —
+        so a node whose every OGM was rejected still resolves an egress
+        interface. Nothing can be sent to it (the data plane has no pairwise
+        key for an unverified peer, so the frame is dropped rather than sent
+        in the clear), but the resolution is there, and reading it as
+        membership would report an intruder as admitted.
+
+        Empty for an unauthenticated node: with no mesh there is nothing to
+        verify and no such thing as membership.
+        """
+        if targets is None:
+            targets = [name for name in self._states if name != node]
+        admitted = self._states[node].driver.neighbor_macs()
+        return tuple(
+            name
+            for name in targets
+            if name != node and self._states[name].mac in admitted
+        )
+
+    def has_route(self, src: str, dest: str | wf.PyMac) -> bool:
+        """Whether `src` has actually *learned* a route to `dest` (a node name,
+        or a raw `PyMac` for a destination that is not a node in this
+        simulation — an address an attacker invented, say).
+
+        Asks the originator table, which only a frame that passed
+        verification writes to — unlike `route_via`, which resolves through
+        link quality and so answers for rejected senders too.
+        """
+        mac = dest if isinstance(dest, wf.PyMac) else self._states[dest].mac
+        return any(
+            record.originator == mac
+            for record in self._states[src].driver.originator_table()
+        )
+
+    # --- red team ---------------------------------------------------------
+
+    def wiretap(self, link: str) -> Wiretap:
+        """Attach a passive listener to `link` and return it. Every frame
+        transmitted on that link from now on is recorded verbatim.
+
+        There is no node behind this and nothing for a router to reject: a
+        shared medium is audible to anyone in range. A wiretap that reads
+        application payloads has therefore *confirmed* wayfinder's threat
+        model rather than broken it — authenticity and segregation are what
+        the mesh provides, and confidentiality is left to the layer above.
+        """
+        if not any(existing.name == link for existing in self._links):
+            raise KeyError(f"no link named {link!r}")
+        tap = Wiretap(link=link)
+        self._taps.setdefault(link, []).append(tap)
+        return tap
+
+    def inject(
+        self,
+        src: str,
+        frame: bytes,
+        *,
+        at_s: float = 0.0,
+        link: str | None = None,
+    ) -> None:
+        """Put raw `frame` bytes on the medium from `src` at `at_s`, bypassing
+        `src`'s own router entirely.
+
+        This is the attacker primitive. `Simulation.send` asks a node's
+        routing stack to deliver a payload; `inject` asks nothing of anyone —
+        the bytes go through the same channel model (loss, latency, signal
+        metrics) a legitimate frame crosses and land in the receiver's `push_rx`
+        exactly as if a radio had produced them. Whatever `src` MAC the frame
+        claims is what receivers see; nothing checks it against `src`.
+
+        `link` names which of `src`'s links to transmit on, defaulting to all
+        of them — a node with several radios shouting on every one.
+        """
+        if src not in self._states:
+            raise KeyError(src)
+        if link is not None and not any(
+            existing.name == link for existing in self._states[src].interfaces.values()
+        ):
+            raise KeyError(f"node {src!r} has no link named {link!r}")
+        self.env.process(self._inject_proc(src, frame, at_s, link))
+
+    def flood(
+        self,
+        src: str,
+        frame: Callable[[], bytes],
+        *,
+        rate_hz: float,
+        start_s: float,
+        duration_s: float,
+        link: str | None = None,
+    ) -> None:
+        """Blast `frame()` from `src` at `rate_hz` for `duration_s`, starting
+        at `start_s` — a sustained storm rather than a single injected frame.
+
+        `frame` is called per transmission rather than taken as fixed bytes,
+        so a flood can vary its sequence numbers (or its claimed identity) the
+        way a real one would, instead of emitting one frame the mesh's
+        deduplication would collapse into nothing.
+
+        What this measures is not whether the frames are accepted — a forged
+        frame is rejected whether it arrives once or ten thousand times — but
+        what the *cost of rejecting them* does to a mesh that must keep
+        routing while it happens.
+        """
+        if rate_hz <= 0:
+            raise ValueError("rate_hz must be positive")
+        self.env.process(
+            self._flood_proc(src, frame, rate_hz, start_s, duration_s, link)
+        )
 
     # --- probe-facing introspection -----------------------------------
 
@@ -219,10 +436,14 @@ class Simulation:
         them — the one the router would use.
         """
         mac = self._states[neighbor].mac
+        # Unmeasurable rows (`ewma_quality is None`) are dropped rather than
+        # compared: `None` means the link never carried a physical-layer
+        # measurement, which is missing data, not a quality of zero. Keeping
+        # them would also make `max` raise on a pair joined by two such links.
         qualities = [
             record.ewma_quality
             for record in self._states[src].driver.link_quality_records()
-            if record.neighbor == mac
+            if record.neighbor == mac and record.ewma_quality is not None
         ]
         return max(qualities) if qualities else None
 
@@ -337,6 +558,13 @@ class Simulation:
         self, link: Link, src_name: str, src_iface: int, frame: bytes
     ) -> None:
         t_s = self.env.now / 1000.0
+        # Tap on transmit, not on delivery: a listener hears what went out
+        # over the medium, including the frames a lossy channel then drops
+        # before they reach their intended receiver.
+        # `Link.__post_init__` always fills `name`; the `or ""` is only to
+        # keep the key a `str` for the type checker.
+        for tap in self._taps.get(link.name or "", ()):
+            tap.capture(t_s, frame)
         tx_pos = self._states[src_name].node.mobility.position(t_s)
         for dst_name in link.endpoints:
             if dst_name == src_name:
@@ -363,6 +591,39 @@ class Simulation:
         if latency_ms > 0:
             yield self.env.timeout(latency_ms)
         dst_state.driver.push_rx(dst_iface, frame, metrics)
+
+    def _inject_proc(self, src: str, frame: bytes, at_s: float, link: str | None):
+        target_ms = at_s * 1000
+        if target_ms > self.env.now:
+            yield self.env.timeout(target_ms - self.env.now)
+        self._inject_now(src, frame, link)
+
+    def _inject_now(self, src: str, frame: bytes, link: str | None) -> None:
+        """Transmit `frame` on each of `src`'s links (or just `link`) right
+        now, through the ordinary delivery path — so injected traffic is
+        subject to the same channel model, and visible to the same wiretaps,
+        as anything a router emitted."""
+        for iface, candidate in self._states[src].interfaces.items():
+            if link is None or candidate.name == link:
+                self._schedule_delivery(candidate, src, iface, frame)
+
+    def _flood_proc(
+        self,
+        src: str,
+        frame: Callable[[], bytes],
+        rate_hz: float,
+        start_s: float,
+        duration_s: float,
+        link: str | None,
+    ):
+        start_ms = start_s * 1000
+        if start_ms > self.env.now:
+            yield self.env.timeout(start_ms - self.env.now)
+        interval_ms = 1000.0 / rate_hz
+        end_ms = start_ms + duration_s * 1000
+        while self.env.now < end_ms:
+            self._inject_now(src, frame(), link)
+            yield self.env.timeout(interval_ms)
 
     def _send_proc(self, src: str, dest: str, payload: bytes, at_s: float):
         target_ms = at_s * 1000
