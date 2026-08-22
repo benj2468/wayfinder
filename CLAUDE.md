@@ -233,6 +233,12 @@ title. **Invoke the `mr` skill** to run the checks, draft the title/description,
 and create it with `glab`; **`mr-review`** for the second-opinion review a
 complex MR needs.
 
+**Keep MR descriptions concise.** A short Summary plus what changed and why is
+usually enough — most MRs don't need every section of the description
+template filled in. Reach for the fuller template (key design decisions,
+deferred/follow-ups, detailed testing notes) only when the change is complex
+or risky enough that a reviewer would actually need it.
+
 ## Architecture map
 
 The workspace splits into the `no_std` routing core, radio drivers, host-side
