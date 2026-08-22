@@ -3,7 +3,7 @@ import pytest
 pytest.importorskip("simpy")
 
 import wayfinder_py as wf
-from wayfinder_sim.channel import PerfectWire
+from wayfinder_sim.channel import ChannelSample, PerfectWire
 from wayfinder_sim.link import Link
 from wayfinder_sim.node import Node
 from wayfinder_sim.scenario import Simulation
@@ -317,3 +317,46 @@ def test_link_age_rejects_an_unknown_node():
     sim = Simulation([Node("a")], [], seed=0)
     with pytest.raises(KeyError):
         sim.link_age_ms("nope", "a")
+
+
+class _MetricLessWire:
+    """A lossless link that reports no physical-layer metrics at all.
+
+    Every channel shipped in `wayfinder_sim.channel` supplies a quality
+    figure, but `PyLinkMetrics` explicitly allows their absence ("`None` is
+    *unknown*, not zero"), so a caller's own channel may omit them — a wired
+    carrier with no signal strength to report, for instance.
+    """
+
+    def evaluate(self, tx, rx, t_s, rng):
+        return ChannelSample(metrics=wf.PyLinkMetrics(), delivery_probability=1.0)
+
+
+def test_link_quality_is_unknown_rather_than_a_crash_on_unmeasurable_links():
+    """A pair joined by two links that never carried a measurement yields
+    `[None, None]`, which `max` cannot compare. Unmeasurable must read as
+    "unknown", not raise out of a probe mid-run.
+    """
+    nodes = [Node("a"), Node("b")]
+    links = [
+        Link(("a", "b"), _MetricLessWire(), name="left"),
+        Link(("a", "b"), _MetricLessWire(), name="right"),
+    ]
+    sim = Simulation(nodes, links)
+    sim.run(until_s=5.0)
+
+    assert sim.link_quality("a", "b") is None
+
+
+def test_link_quality_ignores_unmeasurable_rows_beside_measurable_ones():
+    """One measurable link and one not: the answer is the measurable one, not
+    `None` and not an error."""
+    nodes = [Node("a"), Node("b")]
+    links = [
+        Link(("a", "b"), _MetricLessWire(), name="quiet"),
+        Link(("a", "b"), PerfectWire(quality=200), name="measured"),
+    ]
+    sim = Simulation(nodes, links)
+    sim.run(until_s=5.0)
+
+    assert sim.link_quality("a", "b") == 200

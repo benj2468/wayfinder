@@ -137,6 +137,90 @@ Heights are drawn with a vertical exaggeration (`VERTICAL_EXAGGERATION`) —
 real terrain is far wider than it is tall, and a true-to-scale box renders as
 a flat plate. Read heights off the axis, not off the picture.
 
+### Red-teaming an authenticated mesh
+
+`sim/scenarios/red_team.py` stands up a real authenticated mesh — a mesh
+root, per-node membership certificates, signed OGMs — and runs a battery of
+attacks against it, each in its own isolated simulation. Every attack ends
+in one of three verdicts, all of them *measured* against the router's own
+state rather than assumed:
+
+* **HELD** — the mesh rejected it.
+* **BY DESIGN** — it succeeded and is supposed to. Wayfinder authenticates
+  and segregates; it never encrypts, so an attack that only reads the wire
+  has confirmed the threat model rather than broken it.
+* **GAP** — it succeeded in a way the design does not intend to allow.
+
+```bash
+uv run --group sim python sim/scenarios/red_team.py
+```
+
+The findings themselves are pinned as ordinary tests in
+`sim/tests/test_security.py` and `sim/tests/test_adversary.py`, so a
+regression turns a HELD into a failing test rather than a quietly changed
+line of console output.
+
+#### The three pieces a scenario needs
+
+**`wayfinder_sim.security`** gives the simulation a root of trust. A
+`Simulation` built with `mesh=Mesh(...)` is authenticated: every node
+carrying a `Credential` is enrolled before the run, and an enrolled node's
+MAC is *derived from its key* rather than assigned (passing an explicit
+`mac=` alongside a credential is refused, because a certificate binds the
+two). The `Credential` fields exist mostly to be got wrong on purpose —
+`mesh=<another Mesh>` for a foreign-mesh intruder, `valid_until_s` for an
+enrollment that lapses mid-run, `enrolled=False` for the fail-closed state,
+`claim_mac` for a certificate naming an address its key does not own.
+
+```python
+mesh = Mesh(mesh_id=0xABCD, root_seed=bytes([1]) * 32)
+nodes = [
+    Node("hq", credential=Credential()),                      # a member
+    Node("intruder", credential=Credential(mesh=other_mesh)), # foreign papers
+    Node("outsider"),                                          # no credential
+]
+sim = Simulation(nodes, links, mesh=mesh)
+sim.run(until_s=30)
+
+sim.admitted("hq")          # peers whose certificate hq verified
+sim.has_route("hq", "intruder")
+sim.revoke("rogue")         # root-signed purge, pushed to every other member
+```
+
+**`wayfinder_sim.forge`** builds raw frames with no router involved and no
+guardrails applied, and **`Simulation.inject`** puts them on the medium —
+asking nothing of anyone's routing stack, the way a real attacker works.
+`Simulation.flood` sustains that at a rate, for measuring what the *cost of
+rejecting* a storm does to a mesh that must keep routing through it.
+
+```python
+sim.inject("eve", forge.link_frame(wf.PyMac.BROADCAST, ghost,
+                                   forge.ogm(orig=ghost, seqno=1)), at_s=1.0)
+sim.flood("eve", lambda: forge.garbage(rng), rate_hz=500,
+          start_s=10.0, duration_s=5.0)
+```
+
+**`Simulation.wiretap`** attaches a passive listener to a link. There is no
+node behind it and nothing to reject — a shared medium is audible to anyone
+in range.
+
+```python
+tap = sim.wiretap("hq-field")
+sim.run(until_s=25)
+tap.containing(b"MEETING AT DAWN")   # readable: payloads are never encrypted
+```
+
+#### Asking the right question about membership
+
+Use `admitted` (verified certificates) and `has_route` (learned routes), not
+`route_via`/`reachable`. Route resolution falls back to the link-quality
+table, which is written when a frame is **received** — before its signature
+is judged — so it resolves an egress interface even for a peer whose every
+OGM was rejected. Nothing can actually be sent to such a peer (the directed
+data plane has no pairwise key for it, so the frame is dropped rather than
+emitted in the clear), but reading that resolution as membership reports an
+intruder as admitted.
+
 ### Sweep reports
 
 `wayfinder_sim.report` collects a whole sweep into one self-contained page:
