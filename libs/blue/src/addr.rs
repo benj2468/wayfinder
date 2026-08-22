@@ -1,20 +1,17 @@
-//! The BLE advertiser address: this driver's fragment-reassembly key address
-//! type (see `wayfinder_link_utils::FragKey`).
+//! The BLE advertiser address, as reported by the scan stack.
 //!
-//! Reassembly needs two properties from this key, and BLE gives only one for
-//! free. **Distinctness** between senders is free — unlike RYLR998's configured
-//! `AT+ADDRESS`, a BLE address is globally distinct and reported on every scan.
-//! **Stability** for as long as a frame is on the air is not, and is the trap:
-//! BLE privacy is designed to rotate the advertising address. The nRF backend
-//! gets it from the SoftDevice's static identity address, the BlueZ backend
-//! from `Privacy = device` in the host's `main.conf`. Nothing here enforces it
-//! — see `libs/blue/CLAUDE.md`.
+//! **No longer the fragment-reassembly key** (see `crate::frame::ORIGIN_LEN`)
+//! — it was, until a `btmon` capture against a real BlueZ controller showed
+//! the address rotating on *every* advertising-set registration despite
+//! `Privacy = device` being set correctly, so no multi-fragment message's
+//! fragments ever shared one. Kept only for diagnostics (logging, RSSI
+//! association) — see `libs/blue/CLAUDE.md`.
 
 /// A 6-byte BLE device address, public or random — this driver never
 /// distinguishes the two, only compares them for equality.
 ///
-/// The byte array is private so a reassembly key can only be minted from a
-/// real reported address via [`From`], not assembled ad hoc.
+/// The byte array is private so a value can only be minted from a real
+/// reported address via [`From`], not assembled ad hoc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BleAddr([u8; 6]);
 

@@ -3147,6 +3147,10 @@ mod keepalive_route_selection {
     fn build_two_paths(router: &mut CentralRouter, dest: Mac) {
         feed_ogm_via(router, dest, mac(2), 0, 1, 255, Duration::ZERO);
         feed_ogm_via(router, dest, mac(3), 1, 1, 100, Duration::ZERO);
+        // Neighbor 2's own OGM, so it's a known originator in its own right —
+        // a keep-alive is only accepted from a neighbor we've actually heard
+        // an OGM from.
+        feed_ogm_via(router, mac(2), mac(2), 0, 1, 255, Duration::ZERO);
         feed_keepalive_via(router, mac(2), 0, Duration::ZERO);
         feed_keepalive_via(router, mac(2), 0, Duration::from_secs(1));
     }

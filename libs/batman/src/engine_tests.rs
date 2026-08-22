@@ -1855,6 +1855,10 @@ mod keepalive_deprioritization {
         // Originator 9 reachable via neighbor 2 (TQ 255) and neighbor 3 (TQ 100).
         feed_ogm(&mut engine, 9, 2, 1, 255, Duration::ZERO);
         feed_ogm(&mut engine, 9, 3, 1, 100, Duration::ZERO);
+        // Neighbor 2's own OGM, so it's a known originator in its own right —
+        // a keep-alive is only accepted from a neighbor we've actually heard
+        // an OGM from.
+        feed_ogm(&mut engine, 2, 2, 1, 255, Duration::ZERO);
         // Arm keep-alive tracking for neighbor 2 with a 1s learned cadence;
         // neighbor 3 never sends keep-alives at all (opt-in by observation).
         feed_keepalive(&mut engine, 2, Duration::ZERO);

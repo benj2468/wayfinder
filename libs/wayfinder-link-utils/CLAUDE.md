@@ -18,16 +18,23 @@ exactly one receive code path.
 
 **Reassembly key is per-medium.** `Reassembler<A, MAX_REASSEMBLIES,
 FRAG_PAYLOAD, MAX_REASSEMBLED_LEN>` is generic over `A`, the reassembly key's
-address type — `FragKey<A> { addr: A, msg_id: u8 }`. Each consumer picks
-whatever address the medium already reports on receive, avoiding duplicating
-the 6-byte mesh `Mac` into every fragment:
+address type — `FragKey<A> { addr: A, msg_id: u8 }`. A consumer picks
+whatever address the medium already reports on receive when that address is
+trustworthy, avoiding duplicating the 6-byte mesh `Mac` into every fragment —
+but that trust has to be earned, not assumed:
 
 - `rylr998` uses `u16` (the RYLR module's `AT+ADDRESS`) — this means
   **distinct physical nodes must be configured with distinct `AT+ADDRESS`
   values**, since the medium doesn't assign these itself.
-- `blue` uses a BLE advertiser address (`BleAddr`, wrapping `[u8; 6]`) —
-  no configuration burden, since BLE addresses are already globally distinct
-  per physical device.
+- `blue` uses the sender's own mesh `Mac`, embedded in every fragment
+  (`blue::frame::ORIGIN_LEN`), *not* the BLE advertiser address the medium
+  reports. It used to be the address, on the same "no configuration burden,
+  already globally distinct" reasoning as RYLR998 — until a `btmon` capture
+  against a real BlueZ controller showed the address rotating on *every*
+  advertising-set registration, so no multi-fragment message's fragments
+  ever shared one. Embedding the origin costs 6 bytes of payload per
+  fragment but doesn't depend on the medium's address behavior at all. See
+  `libs/blue/CLAUDE.md` for the full story.
 
 **Eviction, not timeout.** The reassembly table (`MAX_REASSEMBLIES`, a
 per-consumer const generic) has no wall clock to expire stale partial state

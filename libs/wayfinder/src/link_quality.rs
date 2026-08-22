@@ -18,6 +18,7 @@
 use heapless::Vec as HVec;
 use interfaces::frame::MeshIdentifier;
 use interfaces::link::LinkMetrics;
+use tracing::debug;
 
 /// Maximum number of distinct `(neighbor, iface_idx)` entries tracked.
 ///
@@ -93,7 +94,18 @@ impl<Ident: MeshIdentifier, const CAP: usize> LinkQualityTable<Ident, CAP> {
     /// (otherwise inspection APIs would keep reporting a neighbor as reachable
     /// long after the routing table has forgotten it).
     pub fn retain_live(&mut self, mut is_live: impl FnMut(Ident) -> bool) {
-        self.entries.retain(|e| is_live(e.neighbor));
+        self.entries.retain(|e| {
+            let live = is_live(e.neighbor);
+            if !live {
+                debug!(
+                    neighbor = ?e.neighbor,
+                    iface_idx = e.iface_idx,
+                    sample_count = e.sample_count,
+                    "dropping link-quality entry: neighbor has no live route in the routing table"
+                );
+            }
+            live
+        });
     }
 
     /// Fold a new normalized quality sample for `(neighbor, iface_idx)` into

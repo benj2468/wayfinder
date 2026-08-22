@@ -255,6 +255,7 @@ where
                     );
                     self.entries.remove(0);
                 }
+                trace!(?key, count = hdr.count, "starting new fragment reassembly");
                 self.entries
                     .push(Reassembly::new(key, hdr.count))
                     .unwrap_or_else(|_| unreachable!("just ensured room above"));
@@ -275,6 +276,7 @@ where
 
         if entry.is_complete() {
             let entry = self.entries.remove(slot);
+            trace!(?key, len = entry.len, "fragment reassembly complete");
             out[..entry.len].copy_from_slice(&entry.buf[..entry.len]);
             Some((entry.len, entry.metrics))
         } else {

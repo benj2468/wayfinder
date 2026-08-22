@@ -25,7 +25,6 @@ use wayfinder::interfaces::link::LinkMetrics;
 use wayfinder::link::LinkT;
 use wayfinder::link::Received;
 use wayfinder_link_utils::FragKey;
-use wayfinder_link_utils::parse_fragment;
 use zerocopy::FromBytes;
 
 use crate::addr::BleAddr;
@@ -102,7 +101,8 @@ pub struct BleLink<A: BleAdvertiser> {
     report_rx: mpsc::Receiver<RawReport>,
     /// Fragmentation message-id counter, incremented once per `send()` call.
     msg_id_ctr: u8,
-    /// This link's reassembly table, keyed by advertiser address.
+    /// This link's reassembly table, keyed by the origin `Mac` embedded in
+    /// every fragment (see `frame::ORIGIN_LEN`), not the advertiser address.
     reassembler: Reassembler,
     /// Scratch buffer for the fragment `send` is currently building.
     tx_fragment: [u8; MAX_FRAGMENT_BYTES],
@@ -147,6 +147,7 @@ impl<A: BleAdvertiser> LinkT for BleLink<A> {
             let n = frame::build_fragment(
                 &frame_bytes,
                 frame_len,
+                origin,
                 msg_id,
                 index,
                 count,
@@ -169,17 +170,20 @@ impl<A: BleAdvertiser> LinkT for BleLink<A> {
                 // this link is dead, not momentarily idle.
                 return Err(LinkError::ReceiveFailed);
             };
-            let Some((hdr, body)) = parse_fragment(&report.data[..report.len as usize]) else {
+            let Some((hdr, origin, body)) =
+                frame::parse_fragment_with_origin(&report.data[..report.len as usize])
+            else {
                 trace!(addr = ?report.addr, "drop: malformed fragment header");
                 continue;
             };
-            // Keying on the advertiser address assumes it holds still for at
-            // least as long as a frame takes to go out, which BLE does not
-            // promise — see `BluerAdvertiser`'s doc comment for the host
-            // config the BlueZ backend needs to make it true, and why that
-            // was preferred over a sender tag in the fragment header.
+            // Keyed on the origin `Mac` embedded in every fragment, not the
+            // advertiser address `report.addr` reports: a `btmon` capture
+            // against a real controller showed BlueZ drawing a fresh random
+            // address on every advertising-set registration, so no
+            // multi-fragment message's fragments ever shared an address —
+            // see `frame::ORIGIN_LEN`.
             let key = FragKey {
-                addr: report.addr,
+                addr: origin,
                 msg_id: hdr.msg_id,
             };
             let metrics = LinkMetrics {
@@ -253,7 +257,10 @@ mod tests {
         let advertiser = FakeAdvertiser::default();
         let (mut link, _sink) = BleLink::new(advertiser.clone());
 
-        let payload: Vec<u8> = (0..30).collect();
+        // Sized so `HEADER_LEN + payload.len()` lands in `(FRAG_PAYLOAD,
+        // 2*FRAG_PAYLOAD]` — exactly two fragments, regardless of the exact
+        // value of `FRAG_PAYLOAD`.
+        let payload: Vec<u8> = (0..(frame::FRAG_PAYLOAD - frame::HEADER_LEN + 5) as u8).collect();
         let frame_len = link
             .send(
                 mac(1),
@@ -276,12 +283,14 @@ mod tests {
         let sent = advertiser.sent();
         assert_eq!(sent.len(), 2);
 
-        let (hdr0, body0) = parse_fragment(&sent[0]).unwrap();
+        let (hdr0, origin0, body0) = frame::parse_fragment_with_origin(&sent[0]).unwrap();
         assert_eq!((hdr0.index, hdr0.count), (0, 2));
+        assert_eq!(origin0, mac(1));
         assert_eq!(body0, &expected_frame[..frame::FRAG_PAYLOAD]);
 
-        let (hdr1, body1) = parse_fragment(&sent[1]).unwrap();
+        let (hdr1, origin1, body1) = frame::parse_fragment_with_origin(&sent[1]).unwrap();
         assert_eq!((hdr1.index, hdr1.count), (1, 2));
+        assert_eq!(origin1, mac(1));
         assert_eq!(body1, &expected_frame[frame::FRAG_PAYLOAD..]);
         assert_eq!(hdr0.msg_id, hdr1.msg_id);
     }
@@ -320,7 +329,8 @@ mod tests {
         )
         .unwrap();
         let mut fragment = [0u8; MAX_FRAGMENT_BYTES];
-        let n = frame::build_fragment(&frame_bytes, frame_len, 9, 0, 1, &mut fragment).unwrap();
+        let n =
+            frame::build_fragment(&frame_bytes, frame_len, mac(1), 9, 0, 1, &mut fragment).unwrap();
 
         sink.submit(addr(1), Some(-40), &fragment[..n]);
 
@@ -335,7 +345,10 @@ mod tests {
     async fn recv_reassembles_multi_fragment_report() {
         let (mut link, sink) = BleLink::new(FakeAdvertiser::default());
 
-        let payload: Vec<u8> = (0..30).collect();
+        // Sized so `HEADER_LEN + payload.len()` lands in `(FRAG_PAYLOAD,
+        // 2*FRAG_PAYLOAD]` — exactly two fragments, regardless of the exact
+        // value of `FRAG_PAYLOAD`.
+        let payload: Vec<u8> = (0..(frame::FRAG_PAYLOAD - frame::HEADER_LEN + 5) as u8).collect();
         let (frame_bytes, frame_len) = frame::assemble_frame(
             mac(1),
             &LinkFrameData {
@@ -350,10 +363,12 @@ mod tests {
 
         let mut fragment0 = [0u8; MAX_FRAGMENT_BYTES];
         let n0 =
-            frame::build_fragment(&frame_bytes, frame_len, 3, 0, count, &mut fragment0).unwrap();
+            frame::build_fragment(&frame_bytes, frame_len, mac(1), 3, 0, count, &mut fragment0)
+                .unwrap();
         let mut fragment1 = [0u8; MAX_FRAGMENT_BYTES];
         let n1 =
-            frame::build_fragment(&frame_bytes, frame_len, 3, 1, count, &mut fragment1).unwrap();
+            frame::build_fragment(&frame_bytes, frame_len, mac(1), 3, 1, count, &mut fragment1)
+                .unwrap();
 
         sink.submit(addr(1), Some(-60), &fragment0[..n0]);
         sink.submit(addr(1), Some(-60), &fragment1[..n1]);
@@ -382,7 +397,8 @@ mod tests {
         )
         .unwrap();
         let mut fragment = [0u8; MAX_FRAGMENT_BYTES];
-        let n = frame::build_fragment(&frame_bytes, frame_len, 1, 0, 1, &mut fragment).unwrap();
+        let n =
+            frame::build_fragment(&frame_bytes, frame_len, mac(1), 1, 0, 1, &mut fragment).unwrap();
         sink.submit(addr(1), None, &fragment[..n]);
 
         let received = link.recv().await.unwrap();
