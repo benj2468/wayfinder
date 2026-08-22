@@ -4,8 +4,9 @@ variables:
   AST_ENABLE_MR_PIPELINES: true
   CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
   CI_REGISTRY_IMAGE: registry.haganah.net
-  # TODO: This will need to change, or else different MRs will stomp on each other
-  CI_REGISTRY_IMAGE_TAG: "$CI_REGISTRY_IMAGE/rust-ci:latest"
+  # CI_REGISTRY_IMAGE_TAG is NOT set here: it's a per-content tag computed by
+  # the image-tag job below (see there for why), and every job that needs it
+  # pulls it in via that job's dotenv artifact.
 workflow:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_REF_PROTECTED == "true"'
@@ -25,6 +26,26 @@ stages:
   variables:
     SCCACHE_DIR: "/sccache"
     RUSTC_WRAPPER: "sccache"
+# Computes the tag every other job resolves the rust-ci image by: a hash of
+# containers/testenv.Dockerfile's own content, not a shared mutable "latest".
+# Two branches editing the Dockerfile differently get two different tags, so
+# neither can overwrite the other's published image; two branches that end up
+# with byte-identical content (e.g. one merges the other) get the SAME tag,
+# so build-image (below) can recognize "already published" and skip the
+# rebuild entirely rather than redoing work. Exposed to dependent jobs via a
+# dotenv artifact, since a job's `image:` can only be a variable, never a
+# shell command.
+image-tag:
+  stage: lint
+  image: alpine:latest
+  tags:
+    - docker
+  needs: []
+  script:
+    - echo "CI_REGISTRY_IMAGE_TAG=$CI_REGISTRY_IMAGE/rust-ci:$(sha256sum containers/testenv.Dockerfile | cut -c1-16)" >> image.env
+  artifacts:
+    reports:
+      dotenv: image.env
 lint:rust:
   stage: lint
   image: rustlang/rust:nightly
@@ -76,23 +97,55 @@ build-image:
     - docker:dind
   tags:
     - docker
+  needs:
+    - job: image-tag
+      artifacts: true
+  # This job always runs, but it's cheap: gating it on `rules: changes:
+  # containers/testenv.Dockerfile` looks tempting (and was tried), but a git
+  # diff touching that path is neither necessary nor sufficient for "the
+  # tag's image needs building" — the image can be missing for reasons a
+  # diff can't see (first pipeline under a new content hash, a registry GC,
+  # someone deleting the tag), and skipping on that basis leaves every
+  # downstream job unable to pull an image that was never built. The
+  # `docker pull` below is the real, self-healing gate: it's the same
+  # content-hash tag every other job resolves, so "already published" is a
+  # cheap pull-and-exit, and only a genuinely new hash pays for a real build.
   script:
-    # 1. Pull the existing image to use as a local cache layer source
-    - docker pull $CI_REGISTRY_IMAGE_TAG || true
-    # 2. Build using the pulled image as a cache reference
-    - docker build -f containers/testenv.Dockerfile --cache-from "$CI_REGISTRY_IMAGE_TAG" -t "$CI_REGISTRY_IMAGE_TAG" .
-    # 3. Push the newly evaluated/built image back to the registry
+    # $CI_REGISTRY_IMAGE_TAG (from the image-tag job) is a hash of this exact
+    # Dockerfile content. If it's already in the registry, some pipeline
+    # (this branch or another) already built this exact content — nothing to
+    # do, and nothing we'd push here could ever be a different image anyway.
+    - |
+      if docker pull "$CI_REGISTRY_IMAGE_TAG"; then
+        echo "$CI_REGISTRY_IMAGE_TAG already published for this Dockerfile content; skipping rebuild."
+        exit 0
+      fi
+    # Otherwise build fresh. $CACHE_IMAGE is a floating pointer used only as a
+    # --cache-from layer-cache source (most Dockerfile edits are incremental,
+    # e.g. one more `cargo binstall` line, so most base layers are unchanged)
+    # — never resolved by any other job, so branches racing to update it can't
+    # stomp on each other's actual build output, only on each other's cache hit rate.
+    - CACHE_IMAGE="$CI_REGISTRY_IMAGE/rust-ci:cache"
+    - docker pull "$CACHE_IMAGE" || true
+    - docker build -f containers/testenv.Dockerfile --cache-from "$CACHE_IMAGE" -t "$CI_REGISTRY_IMAGE_TAG" -t "$CACHE_IMAGE" .
     - docker push "$CI_REGISTRY_IMAGE_TAG"
+    - docker push "$CACHE_IMAGE"
 build:
   extends: .base-ci-docker
   stage: build
   needs:
     - lint-done
-    - build-image
+    - job: image-tag
+      artifacts: true
+    - job: build-image
+      optional: true
   script:
-    - cargo build --workspace
-    # Lint every target (libs, bins, tests, examples) and fail the build on any
-    # warning so clippy findings can't accumulate unnoticed.
+    # clippy fully subsumes a plain `cargo build` (it still fails on any
+    # compile error) and additionally covers tests/examples/benches via
+    # --all-targets, while cargo's fingerprinting invalidates the target dir
+    # between a plain build and a clippy build of the same crate (different
+    # rustc flags), so running both back-to-back was a full duplicate compile
+    # of the whole workspace for no extra signal.
     - cargo clippy --workspace --all-targets -- -D warnings
     - sccache --show-stats
 # Cross-compiles the `no_std` embedded stack for a real bare-metal target
@@ -116,7 +169,10 @@ build:embedded:
   stage: build
   needs:
     - lint-done
-    - build-image
+    - job: image-tag
+      artifacts: true
+    - job: build-image
+      optional: true
   variables:
     # Kept in sync with the `rustup target add` in containers/testenv.Dockerfile.
     BARE_METAL_TARGET: thumbv7em-none-eabihf
@@ -127,18 +183,19 @@ build:embedded:
     # (Nordic vs ST) — building all of them proves the shared driver is
     # portable, and building both nRF boards proves `libs/wayfinder-nrf` serves
     # both rather than having drifted onto one.
-    - (cd bins/wayfinder-nrf52840 && cargo build --locked)
+    #
+    # Only clippy runs, not a preceding plain `cargo build`: clippy still fails
+    # on any compile error, and pairing it with a plain build was a full
+    # duplicate compile per board (cargo's fingerprinting invalidates the
+    # target dir between a plain build and a clippy build of the same crate).
     - (cd bins/wayfinder-nrf52840 && cargo clippy --locked -- -D warnings)
-    - (cd bins/wayfinder-nrf52840-dongle && cargo build --locked)
     - (cd bins/wayfinder-nrf52840-dongle && cargo clippy --locked -- -D warnings)
     # The STM32F411RE (512 KB flash) needs an optimized build to fit the crypto
     # stack, so it's built --release rather than debug like the 1 MB nRF.
-    - (cd bins/wayfinder-stm32f411 && cargo build --release --locked)
     - (cd bins/wayfinder-stm32f411 && cargo clippy --release --locked -- -D warnings)
     # No board wires 802.15.4 today (it and BLE contend for the same RADIO), so
     # nothing above cross-compiles it. Built explicitly rather than being linked
     # into a firmware it doesn't serve.
-    - cargo build --locked -p nrf-ieee802154 --target "$BARE_METAL_TARGET"
     - cargo clippy --locked -p nrf-ieee802154 --target "$BARE_METAL_TARGET" -- -D warnings
     - sccache --show-stats
 # `bins/wayfinder-web` needs its own job for two reasons. Its `default` feature
@@ -152,7 +209,10 @@ build:web:
   stage: build
   needs:
     - lint-done
-    - build-image
+    - job: image-tag
+      artifacts: true
+    - job: build-image
+      optional: true
   script:
     # The real cargo-leptos path, which also runs wasm-bindgen and emits the
     # site bundle the binary serves.
@@ -165,14 +225,21 @@ test:run:rust:
   stage: test
   needs:
     - build
+    - job: image-tag
+      artifacts: true
   # GitLab scrapes this regex against job stdout to populate the coverage badge.
   # The `cargo llvm-cov report` step below prints the TOTAL summary line it matches.
   coverage: '/(?i)total.*?(\d+(?:\.\d+)?%)/'
   script:
+    # Run the suite once and collect coverage without generating a report yet
+    # (--no-report); `cargo llvm-cov report` below then emits both output
+    # formats from that same collected profile data, instead of running the
+    # entire nextest suite a second time just to get a differently-shaped report.
+    - cargo llvm-cov nextest --profile ci --workspace --no-report
     # Cobertura file for the MR diff coverage annotations.
-    - cargo llvm-cov nextest --profile ci --workspace --cobertura --output-path coverage.xml
+    - cargo llvm-cov report --cobertura --output-path coverage.xml
     # Text summary to stdout so the `coverage:` regex above can extract the badge number.
-    - cargo llvm-cov nextest --profile ci --workspace
+    - cargo llvm-cov report
     - sccache --show-stats
   artifacts:
     reports:
@@ -181,13 +248,17 @@ test:run:rust:
         coverage_format: cobertura
       junit: target/nextest/ci/junit.xml
 test:run:python:
+  extends: .base-ci-docker
   stage: test
-  image: $CI_REGISTRY_IMAGE_TAG
-  tags:
-    - docker
   needs:
     - build
+    - job: image-tag
+      artifacts: true
   script:
+    # `uv sync` builds libs/wayfinder-py from source via maturin (a real cargo
+    # invocation), so it's worth the same sccache reuse as the other cargo
+    # jobs; extending .base-ci-docker wires that in instead of restating
+    # image/tags here.
     # `uv sync` resolves+builds the whole Python side from the root
     # pyproject.toml/uv.lock, including `libs/wayfinder-py` (a uv workspace
     # member, built from source via its `maturin` build backend) — nothing
@@ -218,6 +289,16 @@ deploy:
     - docker
   needs:
     - test:run
+  # By far the longest job (multi-platform buildx for 4 apps), so it doesn't
+  # run on every MR commit — only automatically for a release tag or a merge
+  # to main. It's still available as an on-demand manual button on an MR
+  # pipeline (e.g. to sanity-check a dev image before merging); allow_failure
+  # keeps an untriggered manual job from blocking the MR's pipeline status.
+  rules:
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "merge_request_event"'
+    - when: manual
+      allow_failure: true
   # Build one image per runnable binary and push them to the registry, as
   # multi-platform (linux/amd64 + linux/arm64) images. A tagged commit is a
   # release: the images are tagged with the git tag itself (e.g.
