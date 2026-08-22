@@ -292,14 +292,17 @@ def attack_expired_credential() -> Finding:
     sim.run(until_s=45.0)
     data_flows = sim.poll_local("lapsed") == b"POST-EXPIRY"
 
-    if not routed and not data_flows:
-        verdict, detail = HELD, "expired member fully cut off"
+    if not routed and not data_flows and not still_admitted:
+        verdict = HELD
+        detail = (
+            "expired member fully cut off: route purged, cert evicted from the "
+            "neighbor cache, and no pairwise key left to carry its traffic"
+        )
     else:
         verdict = GAP
         detail = (
-            f"route purged: {not routed}, but the neighbor cache still holds the "
-            f"expired cert (admitted: {still_admitted}) and the link-local data "
-            f"plane still authenticates with its pairwise key (delivered: {data_flows})"
+            f"route purged: {not routed}, still admitted: {still_admitted}, "
+            f"link-local data still delivered: {data_flows}"
         )
     return Finding("Expired credential", verdict, detail)
 
