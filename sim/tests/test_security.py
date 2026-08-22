@@ -114,19 +114,14 @@ def test_an_expired_credential_loses_its_route():
     assert not route[-1], "and unroutable once it expires and goes stale"
 
 
-def test_expiry_does_not_cut_off_an_already_cached_neighbor():
-    """A gap, asserted so it cannot regress silently or be forgotten.
+def test_expiry_cuts_off_an_already_cached_neighbor():
+    """Certificate expiry is the mesh's *passive* revocation mechanism, so a
+    lapsed member must lose the data plane too, not just its route.
 
-    Verifying an OGM caches the peer's `VerifiedCert` *and* the pairwise key
-    derived from it, and that cache is only ever overwritten — never pruned
-    when the certificate it came from expires. The directed data plane looks
-    the pairwise key up by MAC without consulting `not_after`, so between
-    immediate neighbours, traffic keeps flowing after expiry even though the
-    route is gone.
-
-    The practical shape: expiry reliably stops a lapsed node being *routed
-    to*, but does not evict it from a neighbour that already admitted it.
-    Only an explicit revocation does that — see `test_revoking_a_member_ejects_it`.
+    Verifying an OGM caches the peer's certificate and the pairwise key derived
+    from it. Once that certificate expires the cache entry is evicted, so there
+    is no key left to tag a frame to it or to accept one from it — the link
+    goes quiet without anyone having to issue a revocation.
     """
     mesh = _mesh()
     nodes = [
@@ -137,14 +132,12 @@ def test_expiry_does_not_cut_off_an_already_cached_neighbor():
     sim.run(until_s=40.0)
 
     assert not sim.has_route("a", "b"), "the route is gone"
-    assert sim.admitted("a") == ("b",), (
-        "but the neighbor cache still holds the expired certificate"
-    )
+    assert sim.admitted("a") == (), "and the expired cert is out of the cache"
 
-    sim.send("a", "b", b"POST-EXPIRY PAYLOAD", at_s=41.0)
+    sim.send("a", "b", b"POST-EXPIRY", at_s=41.0)
     sim.run(until_s=45.0)
-    assert sim.poll_local("b") == b"POST-EXPIRY PAYLOAD", (
-        "and the link-local data plane still authenticates with its key"
+    assert sim.poll_local("b") is None, (
+        "and the link-local data plane no longer authenticates with its key"
     )
 
 

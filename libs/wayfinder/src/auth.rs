@@ -366,6 +366,7 @@ impl<
     pub fn set_time(&mut self, now_unix: u64) {
         self.now_unix = now_unix;
         self.prune_expired();
+        self.evict_expired_neighbors();
     }
 
     /// Drop revocations that have passed their `not_after`.  A no-op until the
@@ -542,9 +543,7 @@ impl<
     /// [`TvlvType::CertFp`] against: a fingerprint match here lets the OGM
     /// verify from the cached bytes with zero cert bytes on the wire.
     pub fn neighbor_cert(&self, mac: Mac) -> Option<(MembershipCert, [u8; 8])> {
-        self.neighbors
-            .iter()
-            .find(|n| n.cert.mac == mac)
+        self.live_neighbor(mac)
             .map(|n| (n.raw_cert, n.raw_cert.fingerprint()))
     }
 
@@ -562,10 +561,7 @@ impl<
 
     /// The X25519 key of a verified neighbor, for pairwise data-plane keying.
     pub fn neighbor_x_pubkey(&self, mac: Mac) -> Option<[u8; 32]> {
-        self.neighbors
-            .iter()
-            .find(|n| n.cert.mac == mac)
-            .map(|n| n.cert.x_pubkey)
+        self.live_neighbor(mac).map(|n| n.cert.x_pubkey)
     }
 
     /// Authenticate a directed (unicast/mcast) frame addressed to next-hop
@@ -583,11 +579,7 @@ impl<
         if trailer.len() < DIRECTED_TRAILER_LEN {
             return None;
         }
-        let key = self
-            .neighbors
-            .iter()
-            .find(|n| n.cert.mac == dst)
-            .map(|n| n.pairwise_key)?;
+        let key = self.live_neighbor(dst).map(|n| n.pairwise_key)?;
         let src_mac = self.cert.node_mac;
         let counter = self.next_send_counter(dst)?;
         let tag = frame_tag(&key, counter, &src_mac, frame);
@@ -606,12 +598,7 @@ impl<
             tracing::trace!("auth: dropping directed frame with malformed tag trailer");
             return false;
         }
-        let Some(key) = self
-            .neighbors
-            .iter()
-            .find(|n| n.cert.mac == src)
-            .map(|n| n.pairwise_key)
-        else {
+        let Some(key) = self.live_neighbor(src).map(|n| n.pairwise_key) else {
             tracing::trace!("auth: dropping directed frame from an unverified neighbor");
             return false;
         };
@@ -1311,6 +1298,41 @@ impl<
     }
 
     /// Insert or refresh a verified neighbor's keys.
+    /// The cached keys for `mac`, treating an expired certificate as absent.
+    ///
+    /// Every neighbor lookup goes through this rather than scanning
+    /// `self.neighbors` directly. Verifying an OGM caches the peer's
+    /// certificate *and* the pairwise key derived from it, and that cache is
+    /// only ever overwritten — so without an expiry check here, a peer whose
+    /// enrollment has lapsed keeps a working link-local data plane long after
+    /// its route is gone. Certificate expiry is this mesh's passive
+    /// revocation mechanism; it has to actually revoke something.
+    ///
+    /// `now_unix == 0` means the clock was never set, so expiry cannot be
+    /// judged at all; every cached entry is treated as live rather than as
+    /// expired, matching [`prune_expired`](Self::prune_expired).
+    fn live_neighbor(&self, mac: Mac) -> Option<&NeighborKeys> {
+        let now = self.now_unix;
+        self.neighbors
+            .iter()
+            .find(|n| n.cert.mac == mac && (now == 0 || n.cert.not_after >= now))
+    }
+
+    /// Drop every cached neighbor whose certificate has expired.
+    ///
+    /// [`live_neighbor`](Self::live_neighbor) already makes an expired entry
+    /// unusable; this reclaims the slot it occupies, so a long-lived node's
+    /// bounded neighbor table cannot fill with lapsed members and start
+    /// evicting live ones. A no-op until the clock has been set, for the same
+    /// reason `live_neighbor` is permissive then.
+    fn evict_expired_neighbors(&mut self) {
+        if self.now_unix == 0 {
+            return;
+        }
+        let now = self.now_unix;
+        self.neighbors.retain(|n| n.cert.not_after >= now);
+    }
+
     fn cache_neighbor(&mut self, keys: NeighborKeys) {
         if let Some(slot) = self
             .neighbors
@@ -1380,6 +1402,95 @@ mod tests {
         let mut auth = OgmAuth::new(kp, cert, authority.trust_anchor());
         auth.set_time(100);
         auth
+    }
+
+    /// **Gap 3.** Certificate expiry is the mesh's *passive* revocation
+    /// mechanism — the one that bounds the damage from a leaked key with no
+    /// network involved. It has to actually revoke something.
+    ///
+    /// Verifying an OGM caches the peer's `VerifiedCert` *and* the pairwise
+    /// key derived from it, and `cache_neighbor` only ever overwrites. Without
+    /// an expiry check on the lookup path, a peer whose enrollment has lapsed
+    /// keeps a working link-local data plane indefinitely: its route ages out,
+    /// but any neighbor that already admitted it goes on tagging and accepting
+    /// its directed frames.
+    #[test]
+    fn an_expired_neighbor_can_no_longer_tag_or_verify_directed_frames() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        // b admits a while a's cert is valid.
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        let mut trailer = [0u8; DIRECTED_TRAILER_LEN];
+        assert!(
+            b.tag_directed(mac(2), b"frame", &mut trailer).is_some(),
+            "a live neighbor is taggable"
+        );
+
+        // a's certificate lapses.
+        b.set_time(2000);
+
+        assert!(
+            b.tag_directed(mac(2), b"frame", &mut trailer).is_none(),
+            "an expired neighbor must not be taggable"
+        );
+        assert!(
+            !b.verify_directed(mac(2), b"frame", &trailer),
+            "nor may a frame claiming to come from it be accepted"
+        );
+        assert_eq!(
+            b.neighbor_x_pubkey(mac(2)),
+            None,
+            "nor may its key be handed out"
+        );
+        assert!(
+            b.neighbor_cert(mac(2)).is_none(),
+            "nor may its certificate still resolve"
+        );
+    }
+
+    /// The expired entry is reclaimed, not merely ignored: the neighbor table
+    /// is bounded, and a long-lived node whose peers' certs rotate through
+    /// would otherwise fill it with dead entries and start evicting live ones.
+    #[test]
+    fn expired_neighbors_are_evicted_from_the_table() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+        assert_eq!(b.neighbors().len(), 1);
+
+        b.set_time(2000);
+        assert!(
+            b.neighbors().is_empty(),
+            "the slot is reclaimed, not just made unusable"
+        );
+    }
+
+    /// A clock that was never set (`now_unix == 0`) cannot judge expiry, so it
+    /// must not be read as "everything has expired" — matching how
+    /// `prune_expired` already treats an unset clock. An embedded node has no
+    /// wall-clock source at all today, so this is the live case, not a corner.
+    #[test]
+    fn an_unset_clock_evicts_nothing() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        b.set_time(0);
+        assert_eq!(b.neighbors().len(), 1, "an unset clock judges nothing");
+        assert!(b.neighbor_cert(mac(2)).is_some());
     }
 
     /// A node augments its OGM; a peer on the same mesh accepts it and learns
@@ -2231,7 +2342,7 @@ mod tests {
     /// full anchor/expiry/revocation pipeline re-runs against the cached
     /// bytes on every OGM, not just at cache-population time.
     #[test]
-    fn certfp_ogm_expired_cached_cert_rejected() {
+    fn certfp_ogm_expired_cached_cert_is_dropped() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut a = member(&authority, 2, mac(2), 1000);
         let mut b = member(&authority, 3, mac(3), 1000);
@@ -2243,7 +2354,22 @@ mod tests {
         b.set_time(2000); // past a's not_after = 1000
         let (mut buf, len) = bare_ogm(mac(2), 8);
         let len = augment_ogm_with_certfp(&mut a, &mut buf, len);
-        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
+        // The expired entry is evicted the moment the clock passes it, so the
+        // fingerprint no longer resolves and the verdict is `NeedCert` rather
+        // than `Rejected`. Either way this OGM is dropped, which is the
+        // security property; the difference is that a fetch is now attempted,
+        // which is what recovers the link if the peer has since renewed.
+        assert_eq!(
+            b.verify_ogm(&buf[..len]),
+            OgmVerdict::NeedCert {
+                orig: mac(2),
+                fp: a.cert.fingerprint(),
+            },
+        );
+        assert!(
+            b.neighbor_cert(mac(2)).is_none(),
+            "an expired cert must not remain usable"
+        );
     }
 
     /// `build_cert_request` produces a self-authenticating body (the
