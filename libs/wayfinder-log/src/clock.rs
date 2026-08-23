@@ -6,7 +6,7 @@
 
 /// Milliseconds since this node started.
 #[cfg(target_os = "none")]
-pub(crate) fn uptime_ms() -> u64 {
+pub fn uptime_ms() -> u64 {
     // Reads the `embassy-time` driver every board already runs for the router's
     // `Clock`. A record emitted before that driver is initialised gets a
     // near-zero timestamp rather than failing — a slightly wrong time beats no
@@ -16,7 +16,7 @@ pub(crate) fn uptime_ms() -> u64 {
 
 /// Milliseconds since this process started.
 #[cfg(not(target_os = "none"))]
-pub(crate) fn uptime_ms() -> u64 {
+pub fn uptime_ms() -> u64 {
     use std::sync::OnceLock;
     use std::time::Instant;
 

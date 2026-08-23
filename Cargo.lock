@@ -4747,6 +4747,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wayfinder-alarm"
+version = "0.1.0"
+dependencies = [
+ "heapless",
+ "tracing",
+ "tracing-subscriber",
+ "wayfinder-log",
+]
+
+[[package]]
 name = "wayfinder-auth"
 version = "0.1.0"
 dependencies = [

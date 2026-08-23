@@ -1,0 +1,54 @@
+[package]
+name = "wayfinder-alarm"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+# The node's alarm board: the bounded set of conditions this node currently
+# believes are wrong, raisable from anywhere in the stack with no plumbing.
+#
+# Two layers, for the same reason `wayfinder-log` splits its ring from its
+# facades. `AlarmBoard` is plain owned state with an explicit `now_ms` on every
+# method, so the coalescing/eviction/staleness logic is deterministic and
+# testable on a virtual clock. `SharedBoard` wraps one in the cross-target lock,
+# stamps it from the shared uptime clock, and mirrors new alarms into the log;
+# a process-global instance plus a scoped override is what lets a raise site
+# deep in the routing core reach a board without carrying a handle.
+#
+# `no_std` only on bare metal, matching `wayfinder-log`: the host builds use
+# `std` for the lock and for the scope's thread-local, since `critical-section`
+# has no implementation registered there.
+
+[dependencies]
+# Fixed-capacity alarm table and detail strings, so raising an alarm on the hot
+# path of a flood touches no allocator.
+heapless.workspace = true
+
+# New and escalated alarms mirror into the log, which is what makes an alarm
+# correlatable with the frames around it. `default-features = false`: the
+# routing core is `no_std`, and the boards' global allocator backs what
+# `tracing` needs.
+tracing = { version = "0.1.44", default-features = false }
+
+# The uptime clock and the `critical-section`-vs-`std::sync::Mutex` lock, both
+# shared rather than copied. The clock especially: a second private copy on the
+# host would be a separate `OnceLock<Instant>` fixed at a different first use,
+# so alarm and log timestamps would sit on origins skewed by however far apart
+# those two moments fell — and correlating an alarm with the log lines around it
+# is the main thing an operator does with one.
+wayfinder-log.workspace = true
+
+[dev-dependencies]
+# Captures the mirrored records for the log-mirroring tests, the same way
+# `wayfinder-test`'s link-error suite does.
+tracing-subscriber.workspace = true
+
+# The same `tracing`, with `std` back on: `subscriber::set_default` — the scoped
+# subscriber those tests install — is gated behind it. A dev-dependency, so the
+# feature reaches the library only under `cargo test`; a real embedded build
+# resolves the `default-features = false` entry above and never sees it. Which
+# is why `cargo build --target thumbv7em-none-eabihf` is part of this crate's
+# verification: a green host test run would not notice `std` creeping in.
+tracing.workspace = true
