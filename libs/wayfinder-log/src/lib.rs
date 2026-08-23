@@ -25,6 +25,16 @@
 //!   `defmt-rtt` defines a second `_SEGGER_RTT` control block that collides
 //!   with [`rtt-target`]'s, leaving a probe to find only one of the two.
 //!
+//! Two pieces of that plumbing are exported rather than kept private, because
+//! `wayfinder-alarm` holds process-global state with exactly the same shape and
+//! must not fork them. [`Lock`] carries the
+//! `critical-section`-versus-`std::sync::Mutex` decision and the reasoning about
+//! interrupt-masking windows behind it; [`uptime_ms`] is the timebase. A second
+//! copy of the latter would be a separate `OnceLock<Instant>` fixed at a
+//! different first use, so alarm and log timestamps would sit on origins skewed
+//! by however far apart those two moments fell — and correlating an alarm with
+//! the records around it is the main thing an operator does with one.
+//!
 //! On non-bare-metal targets [`init`] is a no-op — the RTT backend cannot link
 //! there — but the filter and the ring are fully live, so this stays a
 //! host-buildable workspace member. A host *node* installs the equivalent
@@ -52,6 +62,7 @@ mod ring;
 pub mod subscriber;
 mod sync;
 
+pub use clock::uptime_ms;
 pub use filter::DEFAULT_SPEC;
 pub use filter::Filter;
 pub use filter::FilterParseError;
@@ -70,6 +81,7 @@ pub use ring::MESSAGE_CAP;
 pub use ring::RING_CAPACITY;
 pub use ring::logs_since;
 pub use ring::record;
+pub use sync::Lock;
 
 /// Install the bare-metal sinks: `tracing` events and `log` records onto RTT
 /// and into the log ring.

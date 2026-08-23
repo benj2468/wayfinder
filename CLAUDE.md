@@ -303,6 +303,21 @@ The workspace splits into the `no_std` routing core, radio drivers, host-side
   formatter. Two facades on top — the RTT subscriber/logger for `target_os =
   "none"`, and a `tracing-subscriber` layer stack (`subscriber` feature) for a
   host node.
+- **libs/wayfinder-alarm** — the node's alarm board: the bounded set of
+  conditions it currently believes are wrong. Where a log record is one line
+  about one moment, an alarm is a latched `(kind, subject)` condition with a
+  first/last window and a coalesced count, so it survives the burst that caused
+  it. Two layers: `AlarmBoard` is plain owned state with an explicit `now_ms`
+  (all the coalescing/eviction/staleness logic, deterministic on a virtual
+  clock), and `SharedBoard` adds the lock, the shared uptime clock, and the log
+  mirroring. Raised ambiently via `alarm!` against a process-global board — with
+  a host-only `with_board` scope, because the simulator runs many nodes in one
+  process. Two rules it exists to keep: raising the same condition again
+  coalesces rather than adding a row (an alarm system must not become the flood
+  it reports), and a full board admits something worse but is never displaced by
+  more of the same. Detectors live next to the state they watch; this crate
+  never decides *when* a condition holds. See
+  `docs/design/implemented/10-node-alarms.md`.
 
 **Drivers — one behavior, three loops**
 
