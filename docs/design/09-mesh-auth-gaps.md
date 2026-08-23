@@ -401,3 +401,4 @@ State lives in `CentralRouter`, not the driver, so an embedded node has it too.
 | `libs/wayfinder-embedded-driver/src/lib.rs` | 2 | wall-clock source, once §2's question is settled (see line 467) |
 | `sim/tests/test_security.py`, `sim/tests/test_adversary.py` | all | the gap tests flip from asserting the gap to asserting the fix |
 | `sim/scenarios/red_team.py` | all | verdicts flip `GAP` → `HELD` |
+| `sim/tests/test_red_team.py` | all | `BASELINE` flips with the verdicts it pins |
