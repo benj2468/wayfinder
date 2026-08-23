@@ -241,7 +241,10 @@ test:run:rust:
     # Text summary to stdout so the `coverage:` regex above can extract the badge number.
     - cargo llvm-cov report
     - sccache --show-stats
+  # `when: always`, so the JUnit report still uploads when the suite is red —
+  # the run whose failures GitLab most needs to show on the MR.
   artifacts:
+    when: always
     reports:
       coverage_report:
         path: coverage.xml
@@ -268,9 +271,19 @@ test:run:python:
     # tshark won't load the Lua dissector as root, so drop to the unprivileged
     # `ci` user (baked into the image) for the suite. The cargo jobs still run as
     # root over the root-owned checkout; only this job needs to be non-root.
+    # The JUnit report lands in a directory created for `ci` up front: the
+    # checkout is root-owned, so the unprivileged user cannot create one itself.
+    - install -d -o ci target/pytest
     # `uv run` (not a bare `python3 -m pytest`) so it resolves against the
     # `.venv` `uv sync` just built rather than the system interpreter.
-    - runuser -u ci -- uv run pytest
+    - runuser -u ci -- uv run pytest --junitxml=target/pytest/junit.xml
+  # `when: always` because the report is worth most on a red pipeline — the
+  # default (`on_success`) would upload it only for runs that had no failures
+  # to show.
+  artifacts:
+    when: always
+    reports:
+      junit: target/pytest/junit.xml
 test:run:
   stage: test
   tags:

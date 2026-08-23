@@ -158,7 +158,11 @@ uv run --group sim python sim/scenarios/red_team.py
 The findings themselves are pinned as ordinary tests in
 `sim/tests/test_security.py` and `sim/tests/test_adversary.py`, so a
 regression turns a HELD into a failing test rather than a quietly changed
-line of console output.
+line of console output. The script is not itself collected by pytest — it is
+a plain script, not a `test_*.py` — so `sim/tests/test_red_team.py` runs its
+attacks under pytest against a recorded baseline of verdicts, which keeps the
+script from rotting as the simulator API moves and fails the suite on any
+verdict that changes in either direction.
 
 #### The three pieces a scenario needs
 
