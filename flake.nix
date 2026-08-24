@@ -141,6 +141,49 @@
       # board is one attribute here plus its `nix/machines/<name>/` directory.
       mkWayfinderSystems =
         machines: nixpkgs.lib.mergeAttrsList (nixpkgs.lib.mapAttrsToList mkWayfinderSystem machines);
+
+      # A cloud instance, which needs none of `mkWayfinderSystem`'s installer
+      # half. That builder exists for a *board*: it pairs the system with a
+      # live USB image carrying the disk layout and the built closure, so a
+      # board with no network can be installed from the stick. A cloud VM is
+      # installed by `nixos-anywhere` kexec-ing over whatever stock image the
+      # provider booted — there is no stick, and the machine has a network by
+      # definition. So this yields the one configuration and nothing else.
+      #
+      # It still shares `common.nix`/`system.nix`/`disk.nix` + disko with the
+      # board path, so the two stay the same shape on disk.
+      mkCloudSystem =
+        name:
+        {
+          modules ? [ ],
+        }:
+        let
+          dir = ./nix/machines + "/${name}";
+        in
+        {
+          ${name} = nixpkgs.lib.nixosSystem {
+            specialArgs = { inherit inputs; };
+            modules = [
+              {
+                nixpkgs = {
+                  overlays = [
+                    fenix.overlays.default
+                    overlay
+                  ];
+                  config.allowUnfree = true;
+                };
+              }
+              inputs.disko.nixosModules.disko
+              (dir + "/common.nix")
+              (dir + "/system.nix")
+              (dir + "/disk.nix")
+            ]
+            ++ modules;
+          };
+        };
+
+      mkCloudSystems =
+        machines: nixpkgs.lib.mergeAttrsList (nixpkgs.lib.mapAttrsToList mkCloudSystem machines);
     in
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = nixpkgs.lib.systems.flakeExposed;
@@ -158,9 +201,16 @@
         # Each entry yields two configurations — `<name>` (the installer ISO)
         # and `<name>-system` (what that ISO installs). A new board is a line
         # here and a `nix/machines/<name>/` directory beside `orin-nano`.
-        nixosConfigurations = mkWayfinderSystems {
-          orin-nano.modules = [ jetpack.nixosModules.default ];
-        };
+        nixosConfigurations =
+          mkWayfinderSystems {
+            orin-nano.modules = [ jetpack.nixosModules.default ];
+          }
+          # Cloud instances, which have no installer image — see `mkCloudSystem`.
+          # `wayfinder-ca` is the mesh certificate authority; `infra/oracle/`
+          # provisions the instance it is installed onto.
+          // mkCloudSystems {
+            wayfinder-ca.modules = [ ];
+          };
       };
 
       perSystem =
@@ -285,6 +335,11 @@
                 glab
                 just
                 stdenv.cc.cc.lib
+                # Cloud deployment (`infra/oracle/`, `nix/machines/wayfinder-ca`):
+                # OpenTofu provisions the instance, `nixos-anywhere` installs
+                # NixOS over the stock image the provider booted.
+                opentofu
+                nixos-anywhere
               ]
               ++ (pkgs.lib.optionals pkgs.stdenv.isLinux onlyLinuxPkgs);
 
@@ -345,6 +400,10 @@
               ;
             wayfinder-simple = nixpkgs.callPackage ./nix/tests/simple.nix { };
             wayfinder-ethernet-egress = nixpkgs.callPackage ./nix/tests/ethernet-egress.nix { };
+            # The cloud certificate-authority posture: no local egress, no
+            # links, provider mode, unprivileged. Covers what
+            # `nix/machines/wayfinder-ca` deploys, without a cloud account.
+            wayfinder-ca-provider = nixpkgs.callPackage ./nix/tests/ca-provider.nix { };
           };
 
           treefmt = {

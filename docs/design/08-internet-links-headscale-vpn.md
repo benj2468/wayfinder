@@ -5,6 +5,19 @@ wayfinder node in the cloud as an auth provider/CA, and how two
 Starlink-connected boxes (no stable public IP, behind CGNAT) reach each
 other. Not yet reviewed or sequenced against other work.
 
+> **Update:** the CA half of that discussion has since shipped on its own —
+> see `docs/design/implemented/11-cloud-auth-provider.md`. There is now a
+> `wayfinder-tap` in provider mode on an Oracle Always Free instance
+> (`nix/machines/wayfinder-ca`, provisioned by `infra/oracle/`), carrying no
+> mesh links, which is the "cloud box with a stable public address" §1 below
+> assumes. Three things that design settled and this one can build on:
+> the instance defaults take *half* the Always Free allowance specifically to
+> leave room for the Headscale box; the UDP ingress rule this design needs is
+> already written and commented in `infra/oracle/main.tf`; and the host was
+> chosen partly *because* it has real UDP ingress — Cloudflare was rejected for
+> lacking it, which would have made Headscale's embedded DERP (STUN on
+> UDP/3478) impossible.
+
 **Scope:** `libs/wayfinder-protos` (new/extended RPCs), `libs/wayfinder-server`
 (`Authority`/`authority.rs`, `RouterAdapter`/`adapter.rs`), `bins/wayfinder-ctl`
 (`enroll` flow), `bins/wayfinder-web` (a new VPN-peers panel), and

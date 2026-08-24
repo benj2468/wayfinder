@@ -44,6 +44,35 @@ pub trait FrameIo: Send + Sync {
     async fn send(&self, buf: &[u8]) -> std::io::Result<usize>;
 }
 
+/// A local host-facing egress that carries nothing: `recv` parks forever and
+/// `send` accepts and discards.
+///
+/// The local device of a node that bridges no host traffic at all — a
+/// certificate authority reached only over the management API, which has no
+/// TAP device to create and no NIC to bind, and on a cloud host would not be
+/// granted the `CAP_NET_ADMIN`/`/dev/net/tun` access to create one anyway.
+/// Such a node still runs a full [`Driver`](crate::Driver): it holds an
+/// identity, answers management queries and issues certificates; it simply has
+/// no host-side traffic to move.
+///
+/// `recv` parks rather than returning `Ok(0)` deliberately. A zero-length read
+/// is how a real device reports end-of-file, and the driver's local-device arm
+/// would treat it as a readable device with an empty frame and spin. Parking
+/// leaves that `select!` arm permanently unready, which is what "there is no
+/// local device" actually means.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NullEgress;
+
+#[cfg_attr(feature = "std", async_trait::async_trait)]
+impl FrameIo for NullEgress {
+    async fn recv(&self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        std::future::pending().await
+    }
+    async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len())
+    }
+}
+
 /// Forwards to the boxed value, so a caller that must pick one concrete
 /// [`FrameIo`] carrier at runtime (e.g. `wayfinder-tap` choosing between a TAP
 /// device and a raw-L2 NIC egress from config) can erase the choice to
@@ -332,5 +361,28 @@ mod tests {
         assert_eq!(received.metrics.rssi_dbm, Some(-72));
         assert_eq!(received.metrics.snr_db, Some(9));
         assert_eq!(received.metrics.quality, Some(200));
+    }
+    /// `NullEgress` is the local device of a node that bridges nothing — a
+    /// certificate authority with no TAP and no NIC to attach. Its `send` must
+    /// accept and discard, reporting the whole frame written: a short write
+    /// would look to the driver like a partially-delivered frame.
+    #[tokio::test]
+    async fn null_egress_discards_sent_frames() {
+        let io = NullEgress;
+        assert_eq!(io.send(&[1, 2, 3, 4]).await.unwrap(), 4);
+        assert_eq!(io.send(&[]).await.unwrap(), 0);
+    }
+
+    /// And its `recv` must park forever rather than resolve — in particular
+    /// never `Ok(0)`, which the driver's local-device arm would read as a
+    /// readable-but-empty device and spin on. `now_or_never` yielding `None`
+    /// is what "parks" means here.
+    #[tokio::test]
+    async fn null_egress_never_receives() {
+        use futures::FutureExt;
+
+        let io = NullEgress;
+        let mut buf = [0u8; 64];
+        assert!(io.recv(&mut buf).now_or_never().is_none());
     }
 }

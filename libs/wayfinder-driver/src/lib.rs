@@ -18,6 +18,7 @@ mod transport;
 
 pub use snoop::McastSnooper;
 pub use transport::FrameIo;
+pub use transport::NullEgress;
 
 #[cfg(feature = "ble")]
 mod blue;

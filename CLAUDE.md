@@ -406,6 +406,37 @@ the root workspace" above)
 - **bins/wayfinder-stm32f411** — NUCLEO-F411RE, a LoRa-only relay on a
   non-Nordic Cortex-M: the proof the driver is HAL-portable.
 
+**Deployment targets** — the same `wayfinder-tap` binary, four ways
+- **nix/modules/wayfinder.nix** — the NixOS service module every host
+  deployment goes through. `services.wayfinder.config` is a freeform attrset
+  serialised to JSON and handed to `--config`, so the binary owns the schema,
+  not the module. It derives the node's privileges from that config
+  (`rawNetworkAccess`): a `Tap`/`RawL2Egress` egress or a `RawL2`/`RawIp` link
+  needs `CAP_NET_RAW`/`CAP_NET_ADMIN` and `/dev/net/tun`; a node carrying only
+  UDP/LoRa/BLE — or no carrier at all — gets an *empty* capability set and
+  systemd's filesystem sandbox instead. Don't add a capability here; add the
+  carrier that justifies it.
+- **nix/machines/orin-nano** — the Jetson, installed from a live USB built by
+  `mkWayfinderSystem` (`<name>` is the installer ISO, `<name>-system` is what
+  it installs).
+- **nix/machines/wayfinder-ca** → the cloud certificate authority: a node with
+  **no local egress and no mesh links**, holding the mesh root of trust and
+  serving enrollment over the management API. Built by `mkCloudSystem` (no
+  installer half — a cloud VM is installed by `nixos-anywhere` kexec-ing over
+  the provider's stock image) and provisioned by `infra/oracle/`. Its four
+  secret files are minted offline with `wayfinderctl cert` and never enter this
+  repo or the Nix store. Verified without a cloud account by
+  `nix build .#wayfinder-ca-provider`. See
+  `docs/design/implemented/11-cloud-auth-provider.md` — which also records why
+  Cloudflare (no TCP/UDP ingress) and GCP (external IPv4 is billed) were
+  evaluated and rejected, so that is not re-litigated.
+- **containers/Dockerfile + docker-compose.yml** — the container path, for a
+  host that is not NixOS.
+
+A node needs neither a local egress nor links: `local_egress` absent gives the
+driver a `NullEgress` local device, which is the certificate-authority posture.
+That is *the* thing to keep working when touching `wayfinder-tap`'s startup.
+
 ## Key design patterns
 
 - **Zero-copy parsing** — `zerocopy` for packet handling without allocations;

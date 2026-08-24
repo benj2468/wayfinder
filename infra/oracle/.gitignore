@@ -1,0 +1,12 @@
+# Local state and per-operator inputs. State names every resource in your
+# tenancy and is not shared through this repo; move it to a remote backend if
+# more than one person deploys this.
+#
+# `.terraform.lock.hcl` is deliberately NOT ignored: it pins the provider
+# versions every operator resolves, which is the same reproducibility argument
+# as `Cargo.lock` and `flake.lock`.
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+terraform.tfvars
+*.auto.tfvars

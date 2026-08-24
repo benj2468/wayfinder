@@ -1,0 +1,225 @@
+# The cloud certificate authority: a `wayfinder-tap` node that holds the mesh
+# root of trust and does nothing else.
+#
+# It carries **no mesh links and no local egress** — see
+# `docs/design/implemented/11-cloud-auth-provider.md`. That is not a limitation of the host
+# so much as the point: this box exists to be the one address every other node
+# can reach, on the open internet, so the less of the mesh it touches the
+# better. It serves `SubmitCsr`/`ApproveCsr`/`GetTrustAnchor`/`RevokeNode` over
+# the management API and nothing else, which is why `rawNetworkAccess` derives
+# to false and the unit runs with an empty capability set under systemd's
+# sandbox (see `nix/modules/wayfinder.nix`).
+#
+# Mesh links arrive with design 08 (internet links over a Headscale-coordinated
+# tunnel); until an encrypted internet link exists there is nothing for a link
+# on this host to carry.
+#
+# **The four files under `secretsDir` are not in this repo and not in the Nix
+# store.** They are minted offline and copied to the box before first start —
+# see `infra/oracle/README.md`. The mesh root seed in particular *is* the mesh:
+# whoever holds it can issue membership certificates for it.
+#
+# This is one deployment, not a reusable module: the values below are stated
+# directly rather than exposed as options, because nothing else imports this
+# file to set them.
+{ config, lib, ... }:
+let
+  # Directory holding the four files this node is provisioned with, all mode
+  # 0400 owned by `wayfinder`: `root.seed` (the mesh root of trust),
+  # `identity.seed`, `node.cert` and `trust-anchor` (this node's own membership
+  # in the mesh it signs for).
+  #
+  # Separate from `/var/lib/wayfinder` on purpose. That directory is writable
+  # state the node generates and rewrites; this one is operator-provisioned
+  # input the node only ever reads, and the unit's `ReadWritePaths` does not
+  # include it.
+  secretsDir = "/var/lib/wayfinder-secrets";
+
+  # This node's Ed25519 public key, as 64 hex characters — the public half of
+  # `identity.seed` in `secretsDir`, printed by `wayfinderctl cert issue` when
+  # the identity was minted (see infra/oracle/README.md step 1).
+  #
+  # The dashboard pins it, and so does every client that reaches this CA
+  # (`wayfinder-ctl --node-key ...`). Pinning is what stops a man-in-the-middle
+  # impersonating the authority; in login mode it is also what stops a sign-in
+  # sending a password to whatever happens to answer on the port.
+  #
+  # Stated rather than derived from the seed, because the seed is provisioned
+  # out of band and is deliberately not readable when this configuration is
+  # evaluated.
+  nodeKey = "21eca19792e0c231a790d86b0353e7625560f9139d32fff062a091be5fa49707";
+
+  # Public hostname the web dashboard is served on, through the Cloudflare
+  # Tunnel below. Three things follow from it: `cloudflared` dials out to
+  # Cloudflare, the dashboard runs in **login mode** (each viewer signs in for
+  # a short-lived session certificate of their own rather than sharing one
+  # identity held by the process), and this name is on the dashboard's
+  # `allowed-host` list — it refuses a `Host` it was not told about, which is
+  # what stops a page on any site pointing a name it controls at it.
+  #
+  # Note what is *not* opened: a tunnel is an **outbound** connection from this
+  # host to Cloudflare, so nothing is exposed on the public address and the
+  # security list needs no HTTP rule at all. The trade-off is that Cloudflare
+  # terminates TLS and therefore sees the dashboard's plaintext, including a
+  # password at sign-in — a real trust decision, not a free lunch. See
+  # `docs/design/implemented/11-cloud-auth-provider.md`.
+  dashboardHostname = "dash.wayfndr.dev";
+in
+{
+  imports = [
+    ../../modules/wayfinder.nix
+  ];
+
+  services.wayfinder = {
+    enable = true;
+
+    web = {
+      enable = true;
+      provider = "127.0.0.1:7700";
+      allowedHosts = [ dashboardHostname ];
+      inherit nodeKey;
+    };
+
+    # The cloud NIC's name depends on the image — check `ip link` on the
+    # instance before trusting this.
+    openFirewall = [ "ens3" ];
+
+    config = {
+      # No `local_egress` and no `links`: see the header. `wayfinder-tap`
+      # runs a `NullEgress` for the local device in this posture.
+      server = {
+        type = "Tls";
+        addr = "0.0.0.0:7700";
+      };
+
+      # This node's own membership in the mesh it signs for. A provider
+      # should be a member: it is what lets it flood revocations once it has
+      # a link to flood them over, and it means the key clients pin is a
+      # certified identity rather than a bare bootstrap key.
+      auth = {
+        seed_path = "${secretsDir}/identity.seed";
+        cert_path = "${secretsDir}/node.cert";
+        trust_anchor_path = "${secretsDir}/trust-anchor";
+      };
+
+      provider = {
+        root_seed_path = "${secretsDir}/root.seed";
+
+        # The mesh this authority signs for: 0x5741594e. Must equal the
+        # `--mesh-id` the trust anchor in `secretsDir` was created with
+        # (`wayfinder-ctl cert init-ca`) — `wayfinder-tap` refuses to start on
+        # a mismatch rather than signing for the wrong mesh.
+        mesh_id = 1463900494;
+
+        # Validity window applied to issued membership certificates.
+        # Deliberately short: passive expiry is this design's *primary*
+        # revocation mechanism — an active revocation has to reach every node
+        # over the mesh, and this CA has no links to flood it over — so a
+        # certificate lifetime is the real bound on how long a compromised
+        # node stays a member. One week means a node re-enrols weekly and a
+        # withdrawn node ages out within a week.
+        cert_ttl_secs = 7 * 24 * 60 * 60;
+
+        # False, and it matters: this node is reachable from the open
+        # internet, and what an unattended provider hands out is mesh
+        # membership itself. A submitted CSR is parked for an operator
+        # (`wayfinder-ctl csr approve`, or the dashboard's Security tab).
+        auto_approve = false;
+
+        # The issued-certificate log, its revocation status, and held CSRs.
+        # Without this a restart forgets every revocation and every pending
+        # approval, and the impersonation guard starts empty — so it is not
+        # optional on a node that is the mesh's root of trust.
+        state_path = "/var/lib/wayfinder/ca-state.json";
+      };
+
+      # Security settings an operator changes at runtime through the
+      # management API (the fail-closed gate, lazy cert distribution, an
+      # identity installed by SetAuth), so they survive a restart.
+      runtime_state_path = "/var/lib/wayfinder/settings.json";
+    };
+  };
+
+  # The provisioned secrets live outside `/var/lib/wayfinder` (which the unit
+  # can write) precisely so the node cannot rewrite its own root of trust.
+  # Created here so the directory's mode is declared rather than depending on
+  # however the operator's `scp` left it; the files inside are the operator's
+  # to place.
+  systemd.tmpfiles.settings."10-wayfinder-ca".${secretsDir}.d = {
+    mode = "0700";
+    user = "wayfinder";
+    group = "wayfinder";
+  };
+
+  # The tunnel: an outbound connection to Cloudflare that public requests for
+  # `dashboardHostname` are routed back down. Nothing is listening on the
+  # public address for this.
+  services.cloudflared = {
+    enable = true;
+    # The tunnel's UUID, not its name. `cloudflared` can resolve a *name* only
+    # by asking Cloudflare with an account-level origin certificate, which this
+    # host deliberately does not have: it holds a per-tunnel credentials file
+    # and nothing else, so a compromise of this box cannot reach any other
+    # tunnel in the account. Created by `infra/oracle/tunnel.tf`.
+    tunnels."97a81a85-ccfa-4af3-ac76-32a58feef68f" = {
+      # The credentials `cloudflared` authenticates with, provisioned out of
+      # band alongside the mesh trust material — it is a secret, and it is what
+      # lets anything claim to be this tunnel. Created by `tofu apply` (see
+      # `infra/oracle/tunnel.tf`) and copied up by `scripts/wayfinder-ca.sh
+      # secrets`.
+      credentialsFile = "${secretsDir}/cloudflared.json";
+      ingress.${dashboardHostname} = "http://127.0.0.1:8080";
+      # Anything arriving for a name this tunnel was not built for is
+      # refused here rather than being quietly handed to the dashboard.
+      default = "http_status:404";
+    };
+  };
+
+  services.openssh = {
+    enable = true;
+    settings = {
+      # Key-only: this box is on the open internet and holds the mesh root
+      # key. `prohibit-password` still allows key-based root login, which is
+      # what `nixos-anywhere` and `nixos-rebuild --target-host` both use.
+      PasswordAuthentication = false;
+      PermitRootLogin = "prohibit-password";
+    };
+  };
+
+  # Your key goes here, and this is not the same setting as `ssh_public_key`
+  # in `infra/oracle/terraform.tfvars` — the difference bites exactly once.
+  # That one authorises the *stock image's* user so `nixos-anywhere` can
+  # connect and install; `nixos-anywhere` does not carry it into the system
+  # it installs. In practice the same key belongs in both places.
+  users.users.root.openssh.authorizedKeys.keys = [
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJnzxkEIglEd359gj7fUp48N3VnX7bVjBkVzrAuHdvOL bcape@gantz.haganah.net"
+  ];
+
+  # An unreachable box is a worse failure than a build-time warning, and this
+  # is the one setting whose absence stays silent until after the install has
+  # already replaced the stock image's SSH access.
+  warnings = lib.optional (config.users.users.root.openssh.authorizedKeys.keys == [ ]) ''
+    nix/machines/wayfinder-ca/common.nix authorises no SSH key for root: once
+    installed, this host will be reachable only through the provider's serial
+    console. Set users.users.root.openssh.authorizedKeys.keys to the same
+    public key you gave the provider (see infra/oracle/README.md).
+  '';
+
+  # Oracle's serial console is the way back into a box you have locked
+  # yourself out of over SSH — worth having before you need it, not after.
+  boot.kernelParams = [ "console=ttyS0,115200n8" ];
+
+  programs.vim = {
+    enable = true;
+    defaultEditor = true;
+  };
+
+  system.stateVersion = "26.05";
+
+  # Must match `instance_shape` in `infra/oracle/terraform.tfvars`:
+  # `aarch64-linux` for `VM.Standard.A1.Flex` (Ampere), `x86_64-linux` for
+  # `VM.Standard.E2.1.Micro` (AMD). A mismatch installs a system the instance
+  # cannot boot, and it fails *after* `nixos-anywhere` has already replaced
+  # the disk.
+  nixpkgs.hostPlatform.system = "x86_64-linux";
+}
