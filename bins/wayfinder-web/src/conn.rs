@@ -23,48 +23,16 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 use wayfinder_client::Client;
-use wayfinder_client::Endpoint;
 
-/// How the dashboard reaches the node.
+/// How the dashboard reaches the node: the authenticated TLS management API of
+/// a host node, or the unauthenticated serial port an embedded node exposes for
+/// debugging.
 ///
-/// The same two transports the TUI offers: the authenticated TLS management API
-/// of a host node, or the unauthenticated serial port an embedded node exposes
-/// for debugging.
-pub enum Target {
-    /// The node's TLS management API, with the pinned node key and this
-    /// dashboard's client identity.
-    Tls(Endpoint),
-    /// A serial port opened at a fixed baud rate. No TLS and no authentication
-    /// — an embedded node's debug management port (e.g. the nRF52840's USB
-    /// CDC-ACM port).
-    Serial {
-        /// The serial device path.
-        path: String,
-        /// The baud rate to open it at.
-        baud: u32,
-    },
-}
-
-impl Target {
-    /// Open a fresh [`Client`] over this target.
-    pub async fn connect(&self) -> anyhow::Result<Client> {
-        match self {
-            Target::Tls(endpoint) => {
-                Client::connect_tls(endpoint.addr, &endpoint.node_key, &endpoint.identity).await
-            }
-            Target::Serial { path, baud } => Client::connect_serial(path, *baud).await,
-        }
-    }
-
-    /// A short human-readable label naming what the dashboard is pointed at,
-    /// shown in the header so it is never ambiguous which node is on screen.
-    pub fn label(&self) -> String {
-        match self {
-            Target::Tls(endpoint) => endpoint.addr.to_string(),
-            Target::Serial { path, baud } => format!("{path} @ {baud} baud"),
-        }
-    }
-}
+/// The same type the TUI and `wayfinderctl` connect over, re-exported under the
+/// name this crate uses it by. Kept shared rather than restated so a change to
+/// how a client reaches a node — a new transport, a different reconnect
+/// behaviour — reaches all three dashboards at once.
+pub use wayfinder_client::ConnectTarget as Target;
 
 /// What has already been said about the connection's health.
 ///

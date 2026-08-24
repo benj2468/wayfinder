@@ -401,7 +401,7 @@ async fn client_roundtrips_against_real_tls_server() {
         seed: node_seed,
         cert: Vec::new(),
     };
-    let mut client = Client::connect_tls(addr, &node_key, &identity)
+    let mut client = Client::connect_tls(&addr.into(), &node_key, &identity)
         .await
         .unwrap();
     assert_full_roundtrip(&mut client).await;

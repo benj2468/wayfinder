@@ -82,6 +82,7 @@ mod ssr {
     use wayfinder_auth::Keypair;
     use wayfinder_client::Client;
     use wayfinder_client::Identity;
+    use wayfinder_client::NodeAddr;
     use wayfinder_protos::wayfinder::v1alpha::submit_csr_response::Outcome;
 
     use super::EnrollmentOutcome;
@@ -104,7 +105,7 @@ mod ssr {
         provider: &ProviderTarget,
     ) -> anyhow::Result<EnrollmentOutcome> {
         let node_key = parse_node_key(&provider.node_key)?;
-        let address = provider
+        let address: NodeAddr = provider
             .address
             .parse()
             .with_context(|| format!("\"{}\" is not a host:port address", provider.address))?;
@@ -131,7 +132,7 @@ mod ssr {
             seed: Keypair::generate_seed(),
             cert: Vec::new(),
         };
-        let mut provider_client = Client::connect_tls(address, &node_key, &ephemeral)
+        let mut provider_client = Client::connect_tls(&address, &node_key, &ephemeral)
             .await
             .with_context(|| format!("connecting to the provider at {}", provider.address))?;
 

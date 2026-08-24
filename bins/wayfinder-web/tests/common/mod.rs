@@ -54,11 +54,11 @@ pub fn static_access(conn: Arc<NodeConnection>) -> Arc<wayfinder_web::session::A
 pub async fn login_router() -> axum::Router {
     let (addr, node_key) = wayfinder_web::mock::serve_mock_login_node().await;
     let endpoint = wayfinder_web::session::PinnedNode {
-        addr,
+        addr: addr.into(),
         key: node_key,
     };
     let access = Arc::new(wayfinder_web::session::Access::Login(Arc::new(
-        wayfinder_web::session::SessionStore::new(endpoint, endpoint),
+        wayfinder_web::session::SessionStore::new(endpoint.clone(), endpoint),
     )));
     wayfinder_web::server::build_router(test_leptos_options(), access, test_hosts())
 }
@@ -84,11 +84,11 @@ pub async fn login_router_with_dead_provider() -> axum::Router {
     let access = Arc::new(wayfinder_web::session::Access::Login(Arc::new(
         wayfinder_web::session::SessionStore::new(
             wayfinder_web::session::PinnedNode {
-                addr,
+                addr: addr.into(),
                 key: node_key,
             },
             wayfinder_web::session::PinnedNode {
-                addr: dead,
+                addr: dead.into(),
                 key: node_key,
             },
         ),
@@ -99,7 +99,7 @@ pub async fn login_router_with_dead_provider() -> axum::Router {
 /// Wrap a bound mock node's address and pinned key in a connection.
 fn connect((addr, node_key): (std::net::SocketAddr, [u8; 32])) -> Arc<NodeConnection> {
     Arc::new(NodeConnection::new(Target::Tls(Endpoint {
-        addr,
+        addr: addr.into(),
         node_key,
         identity: Identity {
             // Bootstrap: an un-enrolled node is reached by proving its own key.

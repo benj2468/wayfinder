@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
     println!("point the dashboard at it with:");
     println!();
     println!("  cargo leptos watch -- \\");
-    println!("    --addr {addr} \\");
+    println!("    --connect {addr} \\");
     println!("    --identity {} \\", seed_path.display());
     println!("    --node-key {key_hex}");
     println!();

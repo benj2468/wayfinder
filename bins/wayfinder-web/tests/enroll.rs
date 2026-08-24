@@ -74,7 +74,7 @@ async fn posture(
 /// from its own dashboard.
 async fn approve_the_pending_request(target: &ProviderTarget) {
     let mut admin = Client::connect_tls(
-        target.address.parse().unwrap(),
+        &target.address.parse().unwrap(),
         &hex(&target.node_key),
         // The authority's own key: full management access, which is what the
         // operator's dashboard has.

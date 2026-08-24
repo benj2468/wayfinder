@@ -310,7 +310,7 @@ ENTRYPOINT ["/usr/local/bin/wayfinder-ctl"]
 #
 #   docker run --rm -p 127.0.0.1:8080:8080 \
 #       -v /var/lib/wayfinder:/var/lib/wayfinder:ro \
-#       <image> --listen 0.0.0.0:8080 --addr <node-host>:7700
+#       <image> --listen 0.0.0.0:8080 --connect <node-host>:7700
 #
 # `--listen` is passed by the deployment, never by this image: the binary
 # defaults to loopback because it has *no authentication of its own*, and only

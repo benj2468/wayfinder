@@ -19,7 +19,6 @@ pub mod output;
 pub mod session;
 pub mod user;
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -38,6 +37,9 @@ use wayfinder_protos::wayfinder::v1alpha::authenticate_user_response::Outcome as
 use wayfinder_protos::wayfinder::v1alpha::link_features::TxKeepaliveUpdate;
 use wayfinder_protos::wayfinder::v1alpha::submit_csr_response::Outcome as CsrOutcome;
 
+use wayfinder_client::ConnectArgs;
+use wayfinder_client::NodeAddr;
+
 use crate::csr::CsrCommand;
 use crate::output::OutputFormat;
 
@@ -49,51 +51,13 @@ use crate::output::OutputFormat;
     about = "Command-line client for the Wayfinder management API"
 )]
 pub struct Cli {
-    /// Management-API endpoint: the node's `IP:port` TLS listener. Ignored by
-    /// the offline `cert` subcommands.
-    #[arg(
-        long,
-        short = 'c',
-        global = true,
-        env = "WAYFINDERCTL_CONNECT",
-        default_value = "127.0.0.1:7700"
-    )]
-    pub connect: SocketAddr,
-
-    /// Path to this client's 32-byte Ed25519 identity seed (secret), presented
-    /// as an RFC 7250 raw public key in the TLS handshake. Required by every
-    /// query command; ignored by the offline `cert` subcommands. To bootstrap
-    /// an un-enrolled node, point this at the node's own identity seed and omit
-    /// `--cert`.
-    #[arg(long, global = true, env = "WAYFINDERCTL_IDENTITY")]
-    pub identity: Option<PathBuf>,
-
-    /// Path to this client's membership certificate, binding its identity to an
-    /// admin capability. Omit to bootstrap an un-enrolled node (the client then
-    /// authenticates by proving the node's own key via `--identity`).
-    #[arg(long, global = true, env = "WAYFINDERCTL_CERT")]
-    pub cert: Option<PathBuf>,
-
-    /// The node's Ed25519 public key (64 hex chars) to pin, so a man-in-the-
-    /// middle can't impersonate it. When omitted it defaults to the public key
-    /// of `--identity` — correct when bootstrapping a node with its own seed,
-    /// but you must pass it explicitly to reach a *different* node.
-    #[arg(long, global = true, env = "WAYFINDERCTL_NODE_KEY")]
-    pub node_key: Option<String>,
-
-    /// Serial port of an embedded node's *unauthenticated* management API (e.g.
-    /// `/dev/ttyACMX` for an nRF52840 over its onboard-VCOM UART), and the
-    /// connection carries no TLS or authentication. `--identity`/`--cert`/
-    /// `--node-key` cannot be combined with this (clap rejects it, since they'd
-    /// imply a TLS handshake this transport never performs); `--connect` is
-    /// simply unused. Ignored by the offline `cert` subcommands.
-    #[arg(long, global = true, conflicts_with_all = ["identity", "cert", "node_key"])]
-    pub serial: Option<String>,
-
-    /// Baud rate for `--serial` (the nRF52840 firmware's VCOM UART runs at
-    /// 115200).
-    #[arg(long, global = true, default_value_t = 115_200)]
-    pub baud: u32,
+    /// How to reach the node: address, credentials, or a serial port.
+    ///
+    /// Shared with the TUI so both clients take the same flags, defaults and
+    /// environment variables. Every one of them is ignored by the offline
+    /// `cert` and `user` subcommands, which open no connection at all.
+    #[command(flatten)]
+    pub connection: ConnectArgs,
 
     /// Output format for query commands.
     #[arg(long, short = 'o', global = true, default_value = "human")]
@@ -298,9 +262,9 @@ pub enum Command {
     /// Log in to a provider and store the session it issues, so every other
     /// subcommand finds a credential with no flags.
     Login {
-        /// The provider's `IP:port`. Defaults to `--connect`.
+        /// The provider's `host:port`. Defaults to `--connect`.
         #[arg(long)]
-        provider: Option<SocketAddr>,
+        provider: Option<NodeAddr>,
         /// The account to log in as.
         #[arg(long)]
         user: String,
@@ -318,12 +282,12 @@ pub enum Command {
 fn build_endpoint(cli: &Cli) -> anyhow::Result<Endpoint> {
     // An explicit `--identity` still wins: it is how a node is bootstrapped
     // with its own seed, which no login can substitute for.
-    if let Some(identity_path) = cli.identity.as_ref() {
+    if let Some(identity_path) = cli.connection.identity.as_ref() {
         return Endpoint::load(
-            cli.connect,
+            cli.connection.connect.clone(),
             identity_path,
-            cli.cert.as_deref(),
-            cli.node_key.as_deref(),
+            cli.connection.cert.as_deref(),
+            cli.connection.node_key.as_deref(),
         );
     }
     // Otherwise a stored session is the credential, and the recorded pin is the
@@ -341,8 +305,8 @@ fn build_endpoint(cli: &Cli) -> anyhow::Result<Endpoint> {
             session.meta.username
         );
     }
-    let addr = cli.connect.to_string();
-    let node_key = match cli.node_key.as_deref() {
+    let addr = cli.connection.connect.to_string();
+    let node_key = match cli.connection.node_key.as_deref() {
         Some(hex) => wayfinder_client::parse_key32(hex).context("parsing --node-key")?,
         None => session::pinned_key(&config, &addr)?.with_context(|| {
             format!(
@@ -352,7 +316,7 @@ fn build_endpoint(cli: &Cli) -> anyhow::Result<Endpoint> {
         })?,
     };
     Ok(Endpoint {
-        addr: cli.connect,
+        addr: cli.connection.connect.clone(),
         node_key,
         identity: wayfinder_client::Identity {
             seed: session.seed,
@@ -375,7 +339,7 @@ fn now_unix() -> anyhow::Result<u64> {
 /// provider signs is bound to a key only this client holds: a captured
 /// transcript of the exchange is useless without it. The password and code are
 /// read from the terminal and are not stored anywhere on either side.
-async fn login(provider: SocketAddr, username: &str, node_key: Option<&str>) -> anyhow::Result<()> {
+async fn login(provider: NodeAddr, username: &str, node_key: Option<&str>) -> anyhow::Result<()> {
     // A login runs on the enrollment tier, so the connection needs an identity
     // only to complete the TLS handshake — the session key it is about to have
     // certified serves, and is the key the certificate will name.
@@ -404,7 +368,7 @@ async fn login(provider: SocketAddr, username: &str, node_key: Option<&str>) -> 
         None => match session::pinned_key(&config, &addr)? {
             Some(recorded) => recorded,
             None => {
-                let offered = probe_node_key(provider).await?;
+                let offered = probe_node_key(&provider).await?;
                 session::resolve_pin(&config, &addr, &offered)?
             }
         },
@@ -419,7 +383,7 @@ async fn login(provider: SocketAddr, username: &str, node_key: Option<&str>) -> 
         // someone who has not logged in yet is.
         cert: Vec::new(),
     };
-    let mut client = Client::connect_tls(provider, &node_key, &identity).await?;
+    let mut client = Client::connect_tls(&provider, &node_key, &identity).await?;
     let response = client
         .authenticate_user(
             username,
@@ -465,7 +429,7 @@ async fn login(provider: SocketAddr, username: &str, node_key: Option<&str>) -> 
 /// speaking to the node, and no way to speak to it safely without a pin. The
 /// resolution is the same one SSH reaches — connect once, show the fingerprint,
 /// let a human decide — and it is why `resolve_pin` refuses without a terminal.
-async fn probe_node_key(addr: SocketAddr) -> anyhow::Result<[u8; 32]> {
+async fn probe_node_key(addr: &NodeAddr) -> anyhow::Result<[u8; 32]> {
     wayfinder_client::probe_node_key(addr).await
 }
 
@@ -563,9 +527,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Whoami => return whoami(),
         Command::Login { provider, user } => {
             return login(
-                provider.unwrap_or(cli.connect),
+                provider.unwrap_or_else(|| cli.connection.connect.clone()),
                 &user,
-                cli.node_key.as_deref(),
+                cli.connection.node_key.as_deref(),
             )
             .await;
         }
@@ -573,11 +537,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     // A serial target reaches an embedded node's unauthenticated management API
     // directly; otherwise connect over the authenticated TLS endpoint.
-    let mut client = match cli.serial.clone() {
-        Some(path) => Client::connect_serial(&path, cli.baud).await?,
+    let mut client = match cli.connection.serial.clone() {
+        Some(path) => Client::connect_serial(&path, cli.connection.baud).await?,
         None => {
             let endpoint = build_endpoint(&cli)?;
-            Client::connect_tls(endpoint.addr, &endpoint.node_key, &endpoint.identity).await?
+            Client::connect_tls(&endpoint.addr, &endpoint.node_key, &endpoint.identity).await?
         }
     };
     // Streaming is the one command that outlives a single response, so it is
@@ -639,7 +603,7 @@ pub async fn run_query(
     output: OutputFormat,
 ) -> anyhow::Result<String> {
     let mut client =
-        Client::connect_tls(endpoint.addr, &endpoint.node_key, &endpoint.identity).await?;
+        Client::connect_tls(&endpoint.addr, &endpoint.node_key, &endpoint.identity).await?;
     dispatch_query(command, &mut client, output).await
 }
 

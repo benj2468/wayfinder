@@ -12,9 +12,16 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod addr;
+#[cfg(feature = "cli")]
+mod args;
+mod target;
 mod tls;
 
-use std::net::SocketAddr;
+pub use addr::NodeAddr;
+#[cfg(feature = "cli")]
+pub use args::ConnectArgs;
+pub use target::ConnectTarget;
 
 use anyhow::Context;
 use anyhow::anyhow;
@@ -147,8 +154,8 @@ pub struct Identity {
 /// per binary.
 #[derive(Clone)]
 pub struct Endpoint {
-    /// The node's TLS listener address.
-    pub addr: SocketAddr,
+    /// The node's TLS listener address, host unresolved.
+    pub addr: NodeAddr,
     /// The node's Ed25519 public key, pinned to defeat impersonation.
     pub node_key: [u8; 32],
     /// The client's identity: the seed it proves in the handshake and its
@@ -163,7 +170,7 @@ impl Endpoint {
     /// from `node_key` when given, else default it to the identity's own public
     /// key (correct when bootstrapping a node with its own seed).
     pub fn load(
-        addr: SocketAddr,
+        addr: NodeAddr,
         identity_path: &std::path::Path,
         cert_path: Option<&std::path::Path>,
         node_key: Option<&str>,
@@ -241,14 +248,14 @@ impl Client {
     /// and authorizes via `decide_access`. Returns once authentication succeeds;
     /// a rejection surfaces as an error.
     pub async fn connect_tls(
-        addr: SocketAddr,
+        addr: &NodeAddr,
         node_key: &[u8; 32],
         identity: &Identity,
     ) -> anyhow::Result<Self> {
         let config = crate::tls::client_config(&identity.seed, node_key)
             .map_err(|e| anyhow!("building management TLS client config: {e}"))?;
         let connector = TlsConnector::from(config);
-        let tcp = TcpStream::connect(addr)
+        let tcp = TcpStream::connect(addr.connect_target())
             .await
             .with_context(|| format!("connecting to tls://{addr}"))?;
         // The raw-public-key verifier ignores the SNI name (identity is the
@@ -906,7 +913,7 @@ impl Client {
 /// and the caller must confirm the value with a person before using it as a
 /// pin. A programmatic caller that skips that confirmation has built an
 /// unauthenticated management client.
-pub async fn probe_node_key(addr: SocketAddr) -> anyhow::Result<[u8; 32]> {
+pub async fn probe_node_key(addr: &NodeAddr) -> anyhow::Result<[u8; 32]> {
     // An ephemeral identity: this connection issues no request, so what it
     // presents is never authorized against anything, and minting a throwaway
     // key avoids reaching for a real one to do it.
@@ -917,7 +924,7 @@ pub async fn probe_node_key(addr: SocketAddr) -> anyhow::Result<[u8; 32]> {
     let config = crate::tls::probing_client_config(&seed, seen.clone())
         .map_err(|e| anyhow!("building management TLS probe config: {e}"))?;
     let connector = TlsConnector::from(config);
-    let tcp = TcpStream::connect(addr)
+    let tcp = TcpStream::connect(addr.connect_target())
         .await
         .with_context(|| format!("connecting to tls://{addr}"))?;
     let server_name = ServerName::try_from("wayfinder-node")

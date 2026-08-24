@@ -278,7 +278,7 @@ async fn spawn_node(has_identity: bool) -> (Endpoint, Arc<Mutex<Vec<SetAuthCall>
 
     (
         Endpoint {
-            addr,
+            addr: addr.into(),
             node_key,
             identity: Identity {
                 seed,
@@ -327,7 +327,7 @@ async fn spawn_provider_node() -> Endpoint {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     Endpoint {
-        addr,
+        addr: addr.into(),
         node_key,
         identity: Identity {
             seed,
