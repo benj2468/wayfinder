@@ -474,6 +474,19 @@ pub struct Config {
     /// If not specified, the behavior is based on the implementation.
     /// For example, in test mode it will just be an observable vector
     pub local_egress: Option<LocalDistributionMechanism>,
+    /// Where this node persists its mesh-identity MAC when no
+    /// [`local_egress`](Self::local_egress) names a device to derive the path
+    /// from.
+    ///
+    /// Both egress kinds carry a `mac_state_path` of their own, so this field
+    /// is the same override for the case where there is no device at all — a
+    /// certificate authority serving only the management API. Ignored when an
+    /// egress *is* configured: that egress's own setting (or its
+    /// device-derived default) wins, so adding this field cannot move an
+    /// existing node's already-written MAC. Defaults to
+    /// [`Config::DEFAULT_MAC_STATE_PATH`].
+    #[serde(default)]
+    pub mac_state_path: Option<String>,
     /// The mesh interfaces this node participates on.
     #[serde(default)]
     pub links: Vec<LinkConfig>,
@@ -525,6 +538,41 @@ pub struct Config {
     /// other generated state rather than beside the operator-authored config.
     #[serde(default)]
     pub runtime_state_path: Option<String>,
+}
+
+impl Config {
+    /// Where a node with no [`local_egress`](Self::local_egress) and no
+    /// [`mac_state_path`](Self::mac_state_path) persists its MAC:
+    /// `/var/lib/wayfinder/node.mac`, following the same `/var/lib` convention
+    /// as the per-device defaults, but named for the node rather than for a
+    /// device it does not have.
+    pub const DEFAULT_MAC_STATE_PATH: &'static str = "/var/lib/wayfinder/node.mac";
+
+    /// The effective path this node persists its mesh-identity MAC at.
+    ///
+    /// A node's MAC *is* its mesh identity, so it has to survive a restart even
+    /// when there is nothing to bridge: a certificate authority reached only
+    /// over the management API has no TAP and no NIC, but the identity it signs
+    /// with — and that its own certificate is bound to — must not change
+    /// underneath the fleet on every reboot.
+    ///
+    /// A configured egress answers for itself, so an existing node keeps
+    /// resolving to the file it already wrote; only with no egress at all does
+    /// [`mac_state_path`](Self::mac_state_path) (else
+    /// [`DEFAULT_MAC_STATE_PATH`](Self::DEFAULT_MAC_STATE_PATH)) apply.
+    ///
+    /// Only consulted when there is no identity keypair to derive a stable MAC
+    /// from; see [`Keypair::derived_mac`](wayfinder_auth::Keypair::derived_mac).
+    pub fn resolved_mac_state_path(&self) -> String {
+        match &self.local_egress {
+            Some(LocalDistributionMechanism::Tap(tap)) => tap.resolved_mac_state_path(),
+            Some(LocalDistributionMechanism::RawL2Egress(cfg)) => cfg.resolved_mac_state_path(),
+            None => self
+                .mac_state_path
+                .clone()
+                .unwrap_or_else(|| String::from(Self::DEFAULT_MAC_STATE_PATH)),
+        }
+    }
 }
 
 /// Enables certificate-authority (provider) mode on a node: it holds the mesh
@@ -1157,5 +1205,112 @@ name: \"\"
 ";
         let link: LinkConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(link.interface_name(1), "ble1");
+    }
+
+    /// A node with no local egress still needs a stable mesh-identity MAC, so
+    /// the path resolves to a device-independent default rather than having no
+    /// answer at all. This is the certificate-authority posture: no TAP and no
+    /// raw-L2 NIC to name the file after, but still an identity to keep across
+    /// restarts.
+    #[test]
+    fn mac_state_path_without_an_egress_uses_the_node_default() {
+        let config = Config::default();
+        assert_eq!(
+            config.resolved_mac_state_path(),
+            "/var/lib/wayfinder/node.mac"
+        );
+    }
+
+    /// A node with no egress can still say where its MAC lives — the same
+    /// override both egress kinds already offer, which without this field is
+    /// reachable only by configuring an egress the node does not want.
+    #[test]
+    fn mac_state_path_without_an_egress_honours_the_top_level_override() {
+        let config = Config {
+            mac_state_path: Some("/run/wayfinder/node.mac".into()),
+            ..Config::default()
+        };
+        assert_eq!(config.resolved_mac_state_path(), "/run/wayfinder/node.mac");
+    }
+
+    /// The top-level override applies only where there is no device to name
+    /// the file after: an egress's own `mac_state_path` (or its
+    /// device-derived default) still wins, so adding the field cannot silently
+    /// move an existing node's already-written MAC.
+    #[test]
+    fn an_egress_outranks_the_top_level_mac_state_path() {
+        let config = Config {
+            local_egress: Some(LocalDistributionMechanism::Tap(TapConfig {
+                device_name: "wayfinder0".into(),
+                ip_address: None,
+                netmask: None,
+                mtu: None,
+                mac_state_path: None,
+            })),
+            mac_state_path: Some("/run/wayfinder/node.mac".into()),
+            ..Config::default()
+        };
+        assert_eq!(
+            config.resolved_mac_state_path(),
+            "/var/lib/wayfinder/wayfinder0.mac"
+        );
+    }
+
+    /// With a TAP egress the path stays named after the device, so an existing
+    /// node's persisted MAC keeps resolving to the file it already wrote.
+    #[test]
+    fn mac_state_path_follows_a_tap_egress() {
+        let egress = LocalDistributionMechanism::Tap(TapConfig {
+            device_name: "wayfinder0".into(),
+            ip_address: None,
+            netmask: None,
+            mtu: None,
+            mac_state_path: None,
+        });
+        assert_eq!(
+            Config {
+                local_egress: Some(egress),
+                ..Config::default()
+            }
+            .resolved_mac_state_path(),
+            "/var/lib/wayfinder/wayfinder0.mac"
+        );
+    }
+
+    /// Likewise for a raw-L2 egress, named after the NIC it binds.
+    #[test]
+    fn mac_state_path_follows_a_raw_l2_egress() {
+        let egress = LocalDistributionMechanism::RawL2Egress(RawL2EgressConfig {
+            interface: "eth1".into(),
+            mac_state_path: None,
+        });
+        assert_eq!(
+            Config {
+                local_egress: Some(egress),
+                ..Config::default()
+            }
+            .resolved_mac_state_path(),
+            "/var/lib/wayfinder/eth1.mac"
+        );
+    }
+
+    /// An explicitly configured path wins over every default.
+    #[test]
+    fn mac_state_path_honours_an_explicit_override() {
+        let egress = LocalDistributionMechanism::Tap(TapConfig {
+            device_name: "wayfinder0".into(),
+            ip_address: None,
+            netmask: None,
+            mtu: None,
+            mac_state_path: Some("/run/wayfinder/mac".into()),
+        });
+        assert_eq!(
+            Config {
+                local_egress: Some(egress),
+                ..Config::default()
+            }
+            .resolved_mac_state_path(),
+            "/run/wayfinder/mac"
+        );
     }
 }

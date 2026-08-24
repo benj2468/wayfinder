@@ -117,6 +117,57 @@ watch-web:
     cargo leptos watch
 
 # ---------------------------------------------------------------------------
+# Cloud certificate authority
+# ---------------------------------------------------------------------------
+#
+# The one deployment target that is not a board and not a container: a
+# `wayfinder-tap` in provider mode on an Always Free cloud instance. See
+# `infra/oracle/README.md` for the runbook and `docs/design/implemented/11-cloud-auth-provider.md`
+# for why it looks like this.
+
+[doc("Build the cloud CA's NixOS system (no cloud account needed).")]
+build-ca:
+    nix build .#nixosConfigurations.wayfinder-ca.config.system.build.toplevel
+
+# A full VM test: CA-mode startup, an empty capability set, and a real
+# request/submit/approve/collect/install enrollment cycle between two nodes.
+[doc("Run the cloud CA's NixOS VM test.")]
+test-ca:
+    nix build .#wayfinder-ca-provider
+
+# The full lifecycle — provision, install, secrets, update, verify — lives in
+# `scripts/wayfinder-ca.sh`, which reads the instance address out of OpenTofu
+# state rather than taking it as an argument. These are thin passthroughs so
+# the common verbs are discoverable from `just --list`; run the script directly
+# for the rest (`./scripts/wayfinder-ca.sh --help`).
+
+[doc("Create or reconcile the cloud CA's instance (tofu apply).")]
+ca-provision:
+    ./scripts/wayfinder-ca.sh provision
+
+# Destructive and normally run once: it erases the instance's boot volume.
+# Use `ca-update` for an already-installed node.
+[doc("Install NixOS onto the provisioned CA instance (DESTRUCTIVE, first time only).")]
+ca-install:
+    ./scripts/wayfinder-ca.sh install
+
+[doc("Copy the offline-minted trust material onto the CA.")]
+ca-secrets:
+    ./scripts/wayfinder-ca.sh secrets
+
+[doc("Roll a config or code change out to the running CA (nixos-rebuild switch).")]
+ca-update:
+    ./scripts/wayfinder-ca.sh update
+
+[doc("Prove the deployed CA answers over the management API.")]
+ca-verify:
+    ./scripts/wayfinder-ca.sh verify
+
+[doc("Forward the CA's web dashboard to http://127.0.0.1:8080.")]
+ca-dashboard:
+    ./scripts/wayfinder-ca.sh dashboard
+
+# ---------------------------------------------------------------------------
 # libs/wayfinder-py
 # ---------------------------------------------------------------------------
 #

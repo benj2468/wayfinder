@@ -33,6 +33,24 @@ with pkgs;
 let
   wayfinderCfg = config.services.wayfinder;
   configFile = writeText "wayfinder-config.json" (builtins.toJSON wayfinderCfg.config);
+
+  # Which configured egress/link kinds actually need privilege, and which
+  # privilege. A node's capabilities follow from what it was asked to carry:
+  # a `Tap` egress has the kernel create a device (CAP_NET_ADMIN, plus
+  # /dev/net/tun), a raw-L2/raw-IP carrier opens an AF_PACKET/SOCK_RAW socket
+  # (CAP_NET_RAW), and everything else — UDP links, LoRa, BLE, and a node with
+  # no egress at all — needs neither. Granting them unconditionally would put
+  # CAP_NET_RAW on a certificate authority whose only socket is a TCP listener.
+  rawNetKinds = [
+    "Tap"
+    "RawL2Egress"
+    "RawL2"
+    "RawIp"
+  ];
+  egressKind = wayfinderCfg.config.local_egress.type or null;
+  linkKinds = map (link: link.type or "") (wayfinderCfg.config.links or [ ]);
+  usesKind = kind: egressKind == kind || lib.elem kind linkKinds;
+  derivedRawNetworkAccess = lib.any usesKind rawNetKinds;
 in
 {
   options.services.wayfinder = with lib; {
@@ -50,6 +68,28 @@ in
         those services are actually meant to be reachable from — e.g. the
         same physical NIC named in `ethernetAccess.interface`, not a
         mesh-facing link.
+      '';
+    };
+
+    rawNetworkAccess = mkOption {
+      type = types.bool;
+      default = derivedRawNetworkAccess;
+      defaultText = literalMD "true when `config` names a `Tap`/`RawL2Egress` egress or a `RawL2`/`RawIp` link";
+      description = ''
+        Whether the node service is granted `CAP_NET_RAW`/`CAP_NET_ADMIN` and
+        access to `/dev/net/tun`.
+
+        Derived from `config` by default — true exactly when a `Tap` or
+        `RawL2Egress` egress, or a `RawL2`/`RawIp` link, is configured. A node
+        carrying only UDP/LoRa/BLE links, and a certificate authority with no
+        egress and no links at all, needs neither capability, and with this
+        false the unit additionally runs under systemd's filesystem and
+        privilege hardening.
+
+        Set it explicitly only to override that derivation — e.g. for a carrier
+        added at runtime through `SetConfig` that the startup config does not
+        name. Turning it off for a node that does need it fails at startup, when
+        the device or socket cannot be created.
       '';
     };
 
@@ -122,6 +162,43 @@ in
         description = ''
           The node's TLS management API address. The default matches a local
           node configured with `server.tls` on its default port.
+        '';
+      };
+
+      provider = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "127.0.0.1:7700";
+        description = ''
+          TLS address of the certificate authority a viewer signs in to.
+
+          Set, the dashboard runs in **login mode**: it holds no credential of
+          its own, and each viewer signs in with a user name, password and
+          authenticator code to obtain a short-lived session certificate.
+          Nothing but the sign-in page is reachable without one — which is what
+          makes an exposed dashboard safe in a way `identityPath` never is,
+          where every viewer shares one identity held by the process.
+
+          Often the same node as `addr`, since the accounts live wherever the
+          mesh's certificate authority runs, but a dashboard may be pointed at
+          any node in the mesh.
+
+          Mutually exclusive with `identityPath`/`cert`: in login mode the
+          dashboard is given no credential to hold.
+        '';
+      };
+
+      providerKey = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = ''
+          The provider's Ed25519 public key (64 hex chars) to pin. Defaults to
+          `nodeKey`, which is correct when the node being viewed is itself the
+          certificate authority.
+
+          Not optional in substance: a sign-in sends a password to whatever
+          answers at `provider`, so something has to say which host that is
+          allowed to be.
         '';
       };
 
@@ -240,18 +317,53 @@ in
     (lib.mkIf wayfinderCfg.web.enable {
       environment.systemPackages = [ wayfinder-web ];
 
+      assertions = [
+        {
+          assertion =
+            wayfinderCfg.web.provider == null
+            || wayfinderCfg.web.providerKey != null
+            || wayfinderCfg.web.nodeKey != null;
+          message = ''
+            services.wayfinder.web.provider is set but neither providerKey nor
+            nodeKey is: a sign-in sends a password to whatever answers at that
+            address, so one of them has to say which host it is allowed to be.
+          '';
+        }
+        {
+          assertion = wayfinderCfg.web.provider == null || wayfinderCfg.web.cert == null;
+          message = ''
+            services.wayfinder.web.provider (login mode) and .cert (the static
+            credential) are mutually exclusive — the dashboard either holds one
+            identity for every viewer or holds none and makes each viewer sign
+            in. wayfinder-web refuses both together.
+          '';
+        }
+      ];
+
       systemd.services.wayfinder-web = {
         enable = true;
         description = "Wayfinder web dashboard";
 
         serviceConfig = {
+          # The two credential shapes are mutually exclusive, and the binary
+          # rejects them together (`--provider` conflicts with `--identity`
+          # and `--cert`). Login mode is given no credential at all: each
+          # viewer signs in for their own.
           ExecStart =
             "${wayfinder-web}/bin/wayfinder-web"
             + " --listen ${wayfinderCfg.web.listen}"
             + lib.concatMapStrings (host: " --allowed-host ${host}") wayfinderCfg.web.allowedHosts
             + " --addr ${wayfinderCfg.web.addr}"
-            + " --identity ${wayfinderCfg.web.identityPath}"
-            + lib.optionalString (wayfinderCfg.web.cert != null) " --cert ${wayfinderCfg.web.cert}"
+            + (
+              if wayfinderCfg.web.provider != null then
+                " --provider ${wayfinderCfg.web.provider}"
+                + lib.optionalString (
+                  wayfinderCfg.web.providerKey != null
+                ) " --provider-key ${wayfinderCfg.web.providerKey}"
+              else
+                " --identity ${wayfinderCfg.web.identityPath}"
+                + lib.optionalString (wayfinderCfg.web.cert != null) " --cert ${wayfinderCfg.web.cert}"
+            )
             + lib.optionalString (wayfinderCfg.web.nodeKey != null) " --node-key ${wayfinderCfg.web.nodeKey}";
 
           Restart = "always";
@@ -285,7 +397,11 @@ in
         wayfinder-ctl
       ];
 
-      services.udev.extraRules = ''
+      # Only a node that creates a kernel TAP needs the character device to be
+      # reachable by the `wayfinder` user; a CA (or a UDP/LoRa/BLE node) never
+      # opens it, and widening a device node for a service that does not use it
+      # is exactly the kind of grant that outlives its reason.
+      services.udev.extraRules = lib.mkIf wayfinderCfg.rawNetworkAccess ''
         KERNEL=="tun", GROUP="wayfinder", MODE="0660", OPTIONS+="static_node=net/tun"
       '';
 
@@ -318,16 +434,69 @@ in
           Environment = [
             "RUST_LOG=debug"
           ];
-
-          CapabilityBoundingSet = [
-            "CAP_NET_RAW"
-            "CAP_NET_ADMIN"
-          ];
-          AmbientCapabilities = [
-            "CAP_NET_RAW"
-            "CAP_NET_ADMIN"
-          ];
-        };
+        }
+        // (
+          if wayfinderCfg.rawNetworkAccess then
+            {
+              CapabilityBoundingSet = [
+                "CAP_NET_RAW"
+                "CAP_NET_ADMIN"
+              ];
+              AmbientCapabilities = [
+                "CAP_NET_RAW"
+                "CAP_NET_ADMIN"
+              ];
+            }
+          else
+            {
+              # A node with no privileged carrier holds one socket: the
+              # management-API TCP listener, which binds 7700 as an ordinary
+              # user. So the capability set is empty rather than merely
+              # narrowed — and once it is, the rest of systemd's sandbox costs
+              # nothing to switch on. This is the posture a cloud-hosted
+              # certificate authority runs in: it is reachable from the public
+              # internet, holds the mesh root key, and has no reason to be able
+              # to touch a network device or write anywhere but its own
+              # StateDirectory.
+              #
+              # `""`, not `[ ]`. NixOS renders a list as one `Name=element`
+              # line per element, so an empty list emits **no line at all** and
+              # the unit silently keeps systemd's default bounding set — every
+              # capability. The empty string emits `CapabilityBoundingSet=`,
+              # which is what systemd documents as "reset to the empty
+              # capability set". The difference is invisible in the Nix source
+              # and total at runtime, which is why `nix/tests/ca-provider.nix`
+              # asserts on `CapBnd` in /proc rather than on the option value.
+              CapabilityBoundingSet = "";
+              AmbientCapabilities = "";
+              NoNewPrivileges = true;
+              PrivateDevices = true;
+              PrivateTmp = true;
+              ProtectSystem = "strict";
+              ProtectHome = true;
+              ProtectKernelTunables = true;
+              ProtectKernelModules = true;
+              ProtectControlGroups = true;
+              RestrictNamespaces = true;
+              RestrictRealtime = true;
+              RestrictSUIDSGID = true;
+              LockPersonality = true;
+              MemoryDenyWriteExecute = true;
+              SystemCallArchitectures = "native";
+              SystemCallFilter = [
+                "@system-service"
+                "~@privileged"
+                "~@resources"
+              ];
+              # `ProtectSystem = "strict"` makes the whole filesystem
+              # read-only, so the two places the node legitimately writes have
+              # to be named: its own generated state (identity seed, MAC, CA
+              # snapshot) and nothing else. The secrets it *reads* — a mesh
+              # root seed, a membership cert — stay readable, since strict only
+              # blocks writes.
+              ReadWritePaths = [ "/var/lib/wayfinder" ];
+            }
+        );
 
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
