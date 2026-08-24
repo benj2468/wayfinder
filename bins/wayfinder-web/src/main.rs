@@ -22,8 +22,10 @@
 //! terminates no TLS of its own: it defaults to loopback, and exposing it
 //! beyond the host is a reverse-proxy's job.
 //!
-//! The node-facing arguments mirror `wayfinder-tui`'s, so an operator who knows
-//! how to point the TUI at a node already knows how to point this at one.
+//! The node-facing arguments are literally `wayfinder-tui`'s and
+//! `wayfinderctl`'s — one `ConnectArgs` flattened into all three — so an
+//! operator who knows how to point the TUI at a node already knows how to point
+//! this at one, and the three cannot drift apart.
 
 // The whole binary is server-side. Under `--features hydrate` (the wasm build)
 // this file compiles to an empty `main`, which is also what keeps a plain
@@ -35,16 +37,15 @@
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     use std::net::SocketAddr;
-    use std::path::PathBuf;
     use std::sync::Arc;
 
     use clap::Parser;
     use leptos::prelude::*;
     use tracing::info;
     use tracing::warn;
-    use wayfinder_client::Endpoint;
+    use wayfinder_client::ConnectArgs;
+    use wayfinder_client::NodeAddr;
     use wayfinder_web::conn::NodeConnection;
-    use wayfinder_web::conn::Target;
     use wayfinder_web::server::HostPolicy;
     use wayfinder_web::server::build_router;
     use wayfinder_web::session::Access;
@@ -53,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
 
     /// Command-line arguments.
     #[derive(Parser, Debug)]
-    #[command(about = "Web dashboard for the Wayfinder management API")]
+    #[command(about = "Web dashboard for the Wayfinder management API", long_about = None)]
     struct Args {
         /// Address to serve the dashboard on.
         ///
@@ -77,9 +78,14 @@ async fn main() -> anyhow::Result<()> {
         )]
         allowed_host: Vec<String>,
 
-        /// TLS address of the node's management API.
-        #[arg(long, default_value = "127.0.0.1:7700")]
-        addr: SocketAddr,
+        /// How this dashboard reaches the node it displays: `--connect` and a
+        /// credential to present, or `--serial` instead of both.
+        ///
+        /// The same arguments `wayfinderctl` and `wayfinder-tui` take, declared
+        /// once in `wayfinder-client` — a dashboard is one more management-API
+        /// client, and pointing one at a node should not be a third dialect.
+        #[command(flatten)]
+        connection: ConnectArgs,
 
         /// TLS address of the certificate authority a viewer signs in to.
         ///
@@ -88,17 +94,17 @@ async fn main() -> anyhow::Result<()> {
         /// certificate by signing in with a user name, password and
         /// authenticator code. Nothing but the sign-in page is reachable
         /// without one, which is what makes a shared or exposed dashboard safe
-        /// in a way the static credential below never is.
+        /// in a way the static credential (`--identity`/`--cert`) never is.
         ///
-        /// Often, but not always, the same node as `--addr`: the accounts live
-        /// wherever the mesh's certificate authority runs, and a dashboard may
-        /// be pointed at any node in the mesh.
+        /// Often, but not always, the same node as `--connect`: the accounts
+        /// live wherever the mesh's certificate authority runs, and a dashboard
+        /// may be pointed at any node in the mesh.
         #[arg(
             long,
             env = "WAYFINDER_WEB_PROVIDER",
             conflicts_with_all = ["identity", "cert", "serial"]
         )]
-        provider: Option<SocketAddr>,
+        provider: Option<NodeAddr>,
 
         /// The provider's Ed25519 public key (64 hex chars) to pin. Defaults to
         /// `--node-key`, which is correct when the node being viewed is itself
@@ -109,48 +115,6 @@ async fn main() -> anyhow::Result<()> {
         /// allowed to be.
         #[arg(long, env = "WAYFINDER_WEB_PROVIDER_KEY", requires = "provider")]
         provider_key: Option<String>,
-
-        /// Path to this dashboard's 32-byte Ed25519 identity seed (secret),
-        /// presented as an RFC 7250 raw public key in the TLS handshake. To
-        /// reach an un-enrolled node, point this at the node's own identity
-        /// seed and omit `--cert`.
-        ///
-        /// The **static credential**: one identity, held by the process and
-        /// shared by every viewer that can reach the port. Used when
-        /// `--provider` is not given.
-        #[arg(
-            long,
-            env = "WAYFINDER_WEB_IDENTITY",
-            default_value = "/var/lib/wayfinder/identity.seed"
-        )]
-        identity: Option<PathBuf>,
-
-        /// Serial port of an embedded node's *unauthenticated* management API
-        /// (e.g. `/dev/ttyACMX` for an nRF52840 over its USB CDC-ACM port).
-        /// The connection carries no TLS and no authentication, so the TLS
-        /// arguments cannot be combined with it; `--addr` is simply unused.
-        #[arg(long, conflicts_with_all = ["identity", "cert", "node_key"])]
-        serial: Option<String>,
-
-        /// Baud rate for `--serial`. A formality `tokio_serial` requires to
-        /// open the port rather than a rate a USB CDC-ACM device enforces.
-        #[arg(long, default_value_t = 115_200)]
-        baud: u32,
-
-        /// Path to this dashboard's membership certificate. Omit to reach an
-        /// un-enrolled node by proving the node's own key.
-        #[arg(long, env = "WAYFINDER_WEB_CERT")]
-        cert: Option<PathBuf>,
-
-        /// The node's Ed25519 public key (64 hex chars) to pin. Defaults to the
-        /// public key of `--identity`, which is correct when bootstrapping a
-        /// node with its own seed; pass it to reach a *different* node.
-        ///
-        /// Required in login mode: there is no identity to derive a default
-        /// from, and an unpinned node is one anything on the path may answer
-        /// for.
-        #[arg(long, env = "WAYFINDER_WEB_NODE_KEY")]
-        node_key: Option<String>,
     }
 
     let args = Args::parse();
@@ -165,14 +129,11 @@ async fn main() -> anyhow::Result<()> {
     // Which credential this dashboard runs on, decided once, here. Every
     // `#[server]` function then reaches the node through whichever this is,
     // rather than each rediscovering the mode for itself.
-    let access = Arc::new(match (&args.serial, args.provider) {
+    let access = Arc::new(match (&args.connection.serial, args.provider.clone()) {
         // Serial: no TLS, no authentication and no provider to log in to. The
         // port itself is the credential, which is why it is a debug interface.
-        (Some(path), _) => {
-            let conn = NodeConnection::new(Target::Serial {
-                path: path.clone(),
-                baud: args.baud,
-            });
+        (Some(_), _) => {
+            let conn = NodeConnection::new(args.connection.target()?);
             info!(node = %conn.label(), "node target configured (serial, unauthenticated)");
             Access::Static(Arc::new(conn))
         }
@@ -181,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
         // are pinned by key, and neither key can be defaulted from an identity
         // — there is none.
         (None, Some(provider_addr)) => {
-            let node_key = args.node_key.as_deref().ok_or_else(|| {
+            let node_key = args.connection.node_key.as_deref().ok_or_else(|| {
                 anyhow::anyhow!(
                     "--node-key is required with --provider: a login holds no identity to \
                      default the node's pinned key from"
@@ -197,13 +158,13 @@ async fn main() -> anyhow::Result<()> {
                 None => node_key,
             };
             info!(
-                node = %args.addr,
+                node = %args.connection.connect,
                 provider = %provider_addr,
                 "login mode: viewers sign in for their own short-lived session certificate"
             );
             Access::Login(Arc::new(SessionStore::new(
                 PinnedNode {
-                    addr: args.addr,
+                    addr: args.connection.connect.clone(),
                     key: node_key,
                 },
                 PinnedNode {
@@ -215,15 +176,7 @@ async fn main() -> anyhow::Result<()> {
 
         // Static credential: one identity for the whole process.
         (None, None) => {
-            let identity = args.identity.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("--identity is required unless --serial or --provider is given")
-            })?;
-            let conn = NodeConnection::new(Target::Tls(Endpoint::load(
-                args.addr,
-                identity,
-                args.cert.as_deref(),
-                args.node_key.as_deref(),
-            )?));
+            let conn = NodeConnection::new(args.connection.target()?);
             // Which credentials are configured, not just the address.
             //
             // A node that has been enrolled refuses any management client that
@@ -237,12 +190,12 @@ async fn main() -> anyhow::Result<()> {
             // node that has outgrown them.
             info!(
                 node = %conn.label(),
-                identity = ?args.identity,
-                cert = ?args.cert,
-                pinned_node_key = args.node_key.is_some(),
+                identity = ?args.connection.identity_path(),
+                cert = ?args.connection.cert,
+                pinned_node_key = args.connection.node_key.is_some(),
                 "node target configured"
             );
-            if args.cert.is_none() {
+            if args.connection.cert.is_none() {
                 info!(
                     "no --cert given: authenticating with the identity's own key, which only an \
                      un-enrolled node accepts. An enrolled node needs an admin certificate."

@@ -8,8 +8,6 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -21,121 +19,40 @@ use ratatui::crossterm::event::{self};
 use tokio::sync::mpsc;
 
 use wayfinder_client::Client;
-use wayfinder_client::Endpoint;
+use wayfinder_client::ConnectArgs;
+use wayfinder_client::ConnectTarget;
 use wayfinder_tui::app::App;
 use wayfinder_tui::app::{self};
 use wayfinder_tui::persist;
 use wayfinder_tui::ui;
 
 /// Command-line arguments.
+///
+/// Everything about *reaching* the node comes from [`ConnectArgs`], shared with
+/// `wayfinderctl` so both clients take the same flags and defaults; only the
+/// refresh interval below is the dashboard's own.
+//
+// `long_about = None` so `--help` prints the one-line `about` rather than this
+// doc comment, which is written for a reader of the source.
 #[derive(Parser, Debug)]
-#[command(about = "Terminal dashboard for the Wayfinder management API")]
+#[command(
+    about = "Terminal dashboard for the Wayfinder management API",
+    long_about = None
+)]
 struct Args {
-    /// TLS address of the node's management API (`ServerConfig::Tls` in the
-    /// node config).
-    #[arg(long, default_value = "127.0.0.1:7700")]
-    addr: SocketAddr,
-
-    /// Path to this client's 32-byte Ed25519 identity seed (secret), presented
-    /// as an RFC 7250 raw public key in the TLS handshake. To bootstrap an
-    /// un-enrolled node, point this at the node's own identity seed and omit
-    /// `--cert`. Required unless `--serial` is used.
-    #[arg(
-        long,
-        env = "WAYFINDER_TUI_IDENTITY",
-        default_value = "/var/lib/wayfinder/identity.seed"
-    )]
-    identity: Option<PathBuf>,
-
-    /// Serial port of an embedded node's *unauthenticated* management API (e.g.
-    /// `/dev/ttyACMX` for an nRF52840 over its USB CDC-ACM management port),
-    /// and the connection carries no TLS or authentication. `--identity`/`--cert`/
-    /// `--node-key` cannot be combined with this (clap rejects it, since they'd
-    /// imply a TLS handshake this transport never performs); `--addr` is simply
-    /// unused.
-    #[arg(long, conflicts_with_all = ["identity", "cert", "node_key"])]
-    serial: Option<String>,
-
-    /// Baud rate for `--serial`. The nRF52840 firmware's management port is
-    /// USB CDC-ACM, not a real UART, so this is a formality `tokio_serial`
-    /// requires to open the port rather than a rate the device enforces —
-    /// any value opens it identically.
-    #[arg(long, default_value_t = 115_200)]
-    baud: u32,
-
-    /// Path to this client's membership certificate. Omit to bootstrap an
-    /// un-enrolled node (authenticate by proving the node's own key).
-    #[arg(long, env = "WAYFINDER_TUI_CERT")]
-    cert: Option<PathBuf>,
-
-    /// The node's Ed25519 public key (64 hex chars) to pin. When omitted it
-    /// defaults to the public key of `--identity` (the self-key bootstrap case);
-    /// pass it explicitly to reach a *different* node.
-    #[arg(long, env = "WAYFINDER_TUI_NODE_KEY")]
-    node_key: Option<String>,
+    /// How to reach the node: address, credentials, or a serial port.
+    #[command(flatten)]
+    connection: ConnectArgs,
 
     /// Refresh interval in milliseconds.
     #[arg(long, default_value_t = 1000)]
     interval: u64,
 }
 
-/// How the TUI reaches the node: either the authenticated TLS endpoint or an
-/// embedded node's unauthenticated serial port.
-enum ConnectTarget {
-    /// The node's TLS management API, with the pinned key and client identity.
-    Tls(Endpoint),
-    /// A serial port opened at a fixed baud rate (no TLS, no authentication).
-    Serial {
-        /// The serial device path (e.g. `/dev/ttyACMX` for an nRF52840's USB
-        /// CDC-ACM management port).
-        path: String,
-        /// The baud rate to open it at.
-        baud: u32,
-    },
-}
-
-impl ConnectTarget {
-    /// Open a fresh [`Client`] over this target.
-    async fn connect(&self) -> anyhow::Result<Client> {
-        match self {
-            ConnectTarget::Tls(endpoint) => {
-                Client::connect_tls(endpoint.addr, &endpoint.node_key, &endpoint.identity).await
-            }
-            ConnectTarget::Serial { path, baud } => Client::connect_serial(path, *baud).await,
-        }
-    }
-
-    /// A short human-readable label for the status pane.
-    fn label(&self) -> String {
-        match self {
-            ConnectTarget::Tls(endpoint) => endpoint.addr.to_string(),
-            ConnectTarget::Serial { path, baud } => format!("{path} @ {baud} baud"),
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let target = match &args.serial {
-        Some(path) => ConnectTarget::Serial {
-            path: path.clone(),
-            baud: args.baud,
-        },
-        None => {
-            // clap's `required_unless_present = "serial"` guarantees this branch
-            // has an identity, but surface a clear error rather than unwrap.
-            let identity = args.identity.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("--identity is required unless --serial is given")
-            })?;
-            ConnectTarget::Tls(Endpoint::load(
-                args.addr,
-                identity,
-                args.cert.as_deref(),
-                args.node_key.as_deref(),
-            )?)
-        }
-    };
+    let target = args.connection.target()?;
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, args, target).await;

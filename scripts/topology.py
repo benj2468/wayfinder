@@ -726,7 +726,7 @@ def render_compose(require_approval: bool = False) -> tuple[str, DevInfo]:
         e("        }")
         e("        exec wayfinder-web \\")
         e("          --listen 0.0.0.0:8080 \\")
-        e(f"          --addr {mgmt_ip}:7700 \\")
+        e(f"          --connect {mgmt_ip}:7700 \\")
         if is_open:
             e("          --identity /node-identity/seed \\")
         else:
@@ -912,7 +912,7 @@ def print_web_urls() -> None:
 
 def mgmt_ports() -> dict[str, int]:
     """Each node paired with the host loopback port its own management API is
-    published on — what a host-run dashboard's `--addr`/`--provider` connects
+    published on — what a host-run dashboard's `--connect`/`--provider` connects
     to. Same derivation as `web_urls`, from the topology alone, so it can
     never drift from what `render_compose` actually publishes.
     """
@@ -951,7 +951,7 @@ def print_dev_watch_commands(dev: DevInfo) -> None:
         if name in dev.open_names:
             seed_path = dev.ca_dir / "open" / name / "seed"
             print("    cargo leptos watch -- \\", file=sys.stderr)
-            print(f"      --addr 127.0.0.1:{port} \\", file=sys.stderr)
+            print(f"      --connect 127.0.0.1:{port} \\", file=sys.stderr)
             print(f"      --identity {seed_path}", file=sys.stderr)
             print(
                 "    open http://127.0.0.1:8080/ — proves the node's own key, no sign-in",
@@ -959,7 +959,7 @@ def print_dev_watch_commands(dev: DevInfo) -> None:
             )
         else:
             print("    cargo leptos watch -- \\", file=sys.stderr)
-            print(f"      --addr 127.0.0.1:{port} \\", file=sys.stderr)
+            print(f"      --connect 127.0.0.1:{port} \\", file=sys.stderr)
             print(f"      --provider 127.0.0.1:{provider_port} \\", file=sys.stderr)
             print(
                 f"      --provider-key {dev.node_keys[dev.provider_name]} \\",

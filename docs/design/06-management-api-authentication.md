@@ -71,7 +71,7 @@ Severity is "what an attacker gets", not "how hard the fix is".
 `--listen` argument is declared `#[arg(long, env = "WAYFINDER_WEB_LISTEN",
 default_value = "127.0.0.1:8080")]`, and clap resolves an environment variable
 *above* `default_value`. The `web` service in `docker-compose.yml` runs
-`network_mode: host`, passes only `--addr`, and carries a comment asserting
+`network_mode: host`, passes only `--connect`, and carries a comment asserting
 that `--listen` "is left at its default, 127.0.0.1:8080 — under host
 networking that's the host's real loopback, so this stays host-local."
 
@@ -663,7 +663,7 @@ connection:
   life.
 - **`--provider` and `--provider-key`**, the latter defaulting to `--node-key`
   (correct when the node being viewed is itself the authority). `--provider` is
-  what *selects* login mode, rather than defaulting from `--addr`: see §8.3.
+  what *selects* login mode, rather than defaulting from `--connect`: see §8.3.
 
 One thing the notes did not anticipate. **`<Routes>` has to stay in the view
 tree unconditionally.** `generate_route_list` walks the app once at startup —

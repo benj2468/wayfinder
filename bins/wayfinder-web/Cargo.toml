@@ -37,7 +37,7 @@ serde.workspace = true
 # None of these build for wasm32 (`wayfinder-client` alone pulls in tokio net,
 # tokio-rustls and tokio-serial), which is the whole reason the management API
 # is reached from the server rather than the browser.
-wayfinder-client = { workspace = true, optional = true }
+wayfinder-client = { workspace = true, features = ["cli"], optional = true }
 wayfinder-auth = { workspace = true, features = ["std"], optional = true }
 # The `.wfauth` bundle is JSON, so a person who opens the file months later
 # finds named fields rather than a wall of hex. Server-side only: the browser

@@ -6,6 +6,12 @@ edition = "2024"
 [lints]
 workspace = true
 
+[features]
+# The shared clap arguments (`ConnectArgs`) every management-API *binary*
+# flattens. Off by default so an embedder that only speaks the protocol does not
+# pull in a CLI parser.
+cli = ["dep:clap"]
+
 [dependencies]
 wayfinder-protos.workspace = true
 # The Ed25519-identity <-> rustls-raw-public-key bridge shared with
@@ -31,8 +37,15 @@ bytes = "1"
 # carries no request.
 rand = { workspace = true, features = ["std"] }
 
+# Only for the `cli` feature: the shared `--connect`/`--identity`/... argument
+# definitions the CLI binaries flatten.
+clap = { workspace = true, features = ["derive", "env"], optional = true }
+
 [dev-dependencies]
 tokio.workspace = true
+# Test-only: `args.rs` writes an identity seed to a scratch path to exercise
+# endpoint resolution.
+tempfile = "3"
 anyhow.workspace = true
 # Test-only: the `tests/transport.rs` end-to-end test and this crate's own
 # handshake tests spin up a real `wayfinder-server` TLS listener to drive the

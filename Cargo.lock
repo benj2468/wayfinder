@@ -4775,10 +4775,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "clap",
  "futures",
  "prost",
  "rand 0.10.2",
  "rustls",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-serial",

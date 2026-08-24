@@ -18,6 +18,19 @@ Leptos SSR has integrations for axum and actix only, and its renderer is not
 `no_std` regardless. An embedded node is reached by pointing this dashboard at
 its serial management port (`--serial`), not by having the board serve HTTP.
 
+## Pointing it at a node
+
+The node-facing flags — `--connect`, `--identity`, `--cert`, `--node-key`,
+`--serial`, `--baud` — are not declared in this crate. They are
+`wayfinder_client::ConnectArgs`, flattened into `main.rs`'s `Args` and shared
+with `wayfinderctl` and `wayfinder-tui`, so an operator learns one vocabulary
+and the three cannot drift apart. Changing one of those six changes the CLI and
+the TUI with it.
+
+What *is* declared here is only what is genuinely the dashboard's own:
+`--listen`, `--allowed-host`, and the `--provider`/`--provider-key` pair that
+selects login mode.
+
 ## Two builds from one crate
 
 `cargo-leptos` compiles this crate twice, driven by `[[workspace.metadata.leptos]]`

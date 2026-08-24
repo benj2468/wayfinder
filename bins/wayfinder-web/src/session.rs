@@ -188,7 +188,6 @@ pub use ssr::session_cookie;
 #[cfg(feature = "ssr")]
 mod ssr {
     use std::collections::HashMap;
-    use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::Mutex;
 
@@ -201,6 +200,7 @@ mod ssr {
     use wayfinder_client::Client;
     use wayfinder_client::Endpoint;
     use wayfinder_client::Identity;
+    use wayfinder_client::NodeAddr;
     use wayfinder_protos::wayfinder::v1alpha::authenticate_user_response::Outcome;
 
     use super::SESSION_COOKIE;
@@ -219,10 +219,10 @@ mod ssr {
     /// from the identity it holds; a login has no identity to derive it from,
     /// so the operator states it — and without it there is nothing stopping
     /// another host answering in the node's place and collecting a password.
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Debug)]
     pub struct PinnedNode {
-        /// The management API's TLS address.
-        pub addr: SocketAddr,
+        /// The management API's TLS address, host unresolved.
+        pub addr: NodeAddr,
         /// The Ed25519 public key the endpoint must present.
         pub key: [u8; 32],
     }
@@ -304,8 +304,8 @@ mod ssr {
         }
 
         /// The provider a login goes to, for the login page and the startup log.
-        pub fn provider(&self) -> SocketAddr {
-            self.provider.addr
+        pub fn provider(&self) -> &NodeAddr {
+            &self.provider.addr
         }
 
         /// Exchange credentials at the provider for a session.
@@ -335,7 +335,7 @@ mod ssr {
                 cert: Vec::new(),
             };
             let mut client =
-                Client::connect_tls(self.provider.addr, &self.provider.key, &anonymous)
+                Client::connect_tls(&self.provider.addr, &self.provider.key, &anonymous)
                     .await
                     .with_context(|| {
                         format!("connecting to the provider at {}", self.provider.addr)
@@ -500,7 +500,7 @@ mod ssr {
         /// first request connects.
         fn credentialed(&self, seed: [u8; 32], cert: Vec<u8>) -> Arc<NodeConnection> {
             Arc::new(NodeConnection::new(Target::Tls(Endpoint {
-                addr: self.node.addr,
+                addr: self.node.addr.clone(),
                 node_key: self.node.key,
                 identity: Identity { seed, cert },
             })))

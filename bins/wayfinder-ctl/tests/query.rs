@@ -222,7 +222,7 @@ async fn spawn_server() -> Endpoint {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     Endpoint {
-        addr,
+        addr: addr.into(),
         node_key,
         identity: Identity {
             seed,

@@ -156,12 +156,18 @@ in
         '';
       };
 
-      addr = mkOption {
+      connect = mkOption {
         type = types.str;
         default = "127.0.0.1:7700";
+        example = "ca.wayfndr.dev:7700";
         description = ''
-          The node's TLS management API address. The default matches a local
-          node configured with `server.tls` on its default port.
+          The node's TLS management API endpoint, as `host:port` — a DNS name,
+          an IPv4 literal, or a bracketed IPv6 literal. A name is resolved per
+          connection attempt rather than once at startup, so a node that moves
+          is followed without restarting the dashboard.
+
+          The default matches a local node configured with `server.tls` on its
+          default port.
         '';
       };
 
@@ -179,7 +185,7 @@ in
           makes an exposed dashboard safe in a way `identityPath` never is,
           where every viewer shares one identity held by the process.
 
-          Often the same node as `addr`, since the accounts live wherever the
+          Often the same node as `connect`, since the accounts live wherever the
           mesh's certificate authority runs, but a dashboard may be pointed at
           any node in the mesh.
 
@@ -353,7 +359,7 @@ in
             "${wayfinder-web}/bin/wayfinder-web"
             + " --listen ${wayfinderCfg.web.listen}"
             + lib.concatMapStrings (host: " --allowed-host ${host}") wayfinderCfg.web.allowedHosts
-            + " --addr ${wayfinderCfg.web.addr}"
+            + " --connect ${wayfinderCfg.web.connect}"
             + (
               if wayfinderCfg.web.provider != null then
                 " --provider ${wayfinderCfg.web.provider}"
