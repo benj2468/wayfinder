@@ -5102,6 +5102,7 @@ dependencies = [
  "interfaces",
  "tracing",
  "wayfinder",
+ "wayfinder-alarm",
  "wayfinder-auth",
  "zerocopy",
 ]
@@ -5183,6 +5184,7 @@ dependencies = [
  "tracing",
  "url",
  "wayfinder",
+ "wayfinder-alarm",
  "wayfinder-auth",
  "wayfinder-log",
  "wayfinder-protos",

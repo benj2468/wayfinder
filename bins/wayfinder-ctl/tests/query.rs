@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use wayfinder_auth::Keypair;
 use wayfinder_client::Identity;
+use wayfinder_protos::service::AlarmsData;
 use wayfinder_protos::service::InterfaceThroughputData;
 use wayfinder_protos::service::KeepAliveEntryData;
 use wayfinder_protos::service::LinkFeaturesEntryData;
@@ -140,6 +141,12 @@ impl WayfinderDataProvider for Mock {
     /// `max_records` through `dropped`, so a test can prove the CLI's `--since`
     /// and `--max` actually reach the wire rather than being parsed and
     /// discarded.
+    fn alarms(&self) -> AlarmsData {
+        // Nothing wrong: an empty board is the node's "all systems normal", and
+        // none of these cases is about alarms.
+        AlarmsData::default()
+    }
+
     fn logs(&self, since_seq: u64, max_records: u32) -> LogsData {
         LogsData {
             records: vec![LogRecordData {

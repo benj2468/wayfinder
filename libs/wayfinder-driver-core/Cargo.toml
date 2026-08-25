@@ -22,6 +22,12 @@ zerocopy.workspace = true
 # `default-features`) so tracing's `std` feature stays off for the `no_std`
 # build — the same reason `libs/wayfinder` pins it.
 tracing = { version = "0.1.44", default-features = false }
+# The node's alarm board. Raised from here rather than from a shell because a
+# behaviour change belongs in the shared core: an embedded node has no tokio
+# loop, and a detector living in one shell would not exist on the other two.
+# `default-features = false` for the same reason as `tracing` above — the core
+# stays `no_std`.
+wayfinder-alarm = { path = "../wayfinder-alarm", default-features = false }
 
 [dev-dependencies]
 # The CA (`Authority`) used only in tests to mint membership certs and drive the

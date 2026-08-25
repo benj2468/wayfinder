@@ -13,6 +13,7 @@
 
 use serde::Deserialize;
 use serde::Serialize;
+use wayfinder_protos::wayfinder::v1alpha::Alarms;
 use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
 use wayfinder_protos::wayfinder::v1alpha::KeepAliveTable;
 use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesTable;
@@ -76,6 +77,14 @@ pub struct NodeSnapshot {
     pub vpn_peers: Option<ListVpnPeersResponse>,
     /// Log records since the cursor the poll asked from, plus the next cursor.
     pub logs: LogRecords,
+    /// The node's alarm board: the conditions it currently believes are wrong.
+    ///
+    /// Not `Option`, unlike `metrics` and `security` beside it: an empty board
+    /// is the node's answer — "nothing is wrong" — rather than the absence of
+    /// one, and that answer is what the header reports as normal. Whether the
+    /// node has been *reached* is `Dashboard::connected`'s question, and it is
+    /// answered an inch away in the same header.
+    pub alarms: Alarms,
 }
 
 /// What the credential behind a poll may ask the node for.
@@ -159,6 +168,11 @@ pub async fn build_snapshot(
                 },
             },
             logs: client.logs(since_seq, LOG_BATCH).await?,
+            // Fetched on every poll, and failing the poll if it fails, like
+            // every other table here: a header that kept claiming "all systems
+            // normal" from a board it stopped being able to read would be
+            // worse than one that says it lost the node.
+            alarms: client.alarms().await?,
         })
     })
     .await

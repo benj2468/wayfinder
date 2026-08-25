@@ -14,6 +14,7 @@ use wayfinder_auth::Keypair;
 use wayfinder_auth::MembershipCert;
 use wayfinder_auth::TrustAnchor;
 use wayfinder_client::Identity;
+use wayfinder_protos::service::AlarmsData;
 use wayfinder_protos::service::CsrOutcome;
 use wayfinder_protos::service::InterfaceThroughputData;
 use wayfinder_protos::service::IssuedCertData;
@@ -124,6 +125,12 @@ impl WayfinderDataProvider for ProviderMock {
     /// state, so this stub reports an empty one — these tests exercise the
     /// transport and the query commands, not the log path (covered in
     /// `wayfinder-log` and `RouterAdapter`).
+    fn alarms(&self) -> AlarmsData {
+        // Nothing wrong: an empty board is the node's "all systems normal", and
+        // none of these cases is about alarms.
+        AlarmsData::default()
+    }
+
     fn logs(&self, _since_seq: u64, _max_records: u32) -> LogsData {
         LogsData::default()
     }

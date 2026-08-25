@@ -60,6 +60,12 @@ wayfinder-storage = { workspace = true, optional = true }
 # both targets, and this crate needs only to read it — never the host-only
 # `subscriber` layer that writes it.
 wayfinder-log.workspace = true
+
+# The node's alarm board, which `RouterAdapter` serves GetAlarms from. Read
+# through the same process-global the raise sites write, rather than through a
+# handle: what raises an alarm is scattered across four crates with no owner to
+# thread one from, which is the whole reason that global exists.
+wayfinder-alarm.workspace = true
 zerocopy.workspace = true
 # Pinned directly (not workspace inheritance, which forces `default-features`
 # on) so tracing's `std` feature stays off for the `no_std` embedded build — the

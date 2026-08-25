@@ -254,7 +254,8 @@ pub fn decide_access(
 /// # The viewer tier
 ///
 /// [`MgmtAccess::GrantedViewer`] is the queries and nothing else: every
-/// `Get*`/`List*`/`ResolveRoute` request, and none of the mutations
+/// `Get*`/`List*`/`ResolveRoute` request except `ListUsers`, and none of the
+/// mutations
 /// (`SetAuth`, `SetConfig`, `SetLogLevel`, `RevokeNode`, `ApproveCsr`,
 /// `DenyCsr`, `SubmitCsr`, `RevokeVpnPeer`) or disclosures
 /// (`RevealEnrollmentToken`, `GetVpnEnrollment`).
@@ -317,6 +318,14 @@ pub fn permits(access: MgmtAccess, request: &ReqKind) -> bool {
                 | ReqKind::GetKeepaliveTable(_)
                 | ReqKind::GetLinkFeaturesTable(_)
                 | ReqKind::GetLogs(_)
+                // What the node believes is wrong with itself. A read, and one
+                // a viewer is exactly the audience for: the tier exists so
+                // somebody can be shown the state of the network without being
+                // handed the ability to change it, and "is this node healthy"
+                // is the first question they will have. It discloses no more
+                // than `GetSecurityStatus` beside it already does — peer
+                // identifiers, and the fact that something was refused.
+                | ReqKind::GetAlarms(_)
         ),
         MgmtAccess::GrantedEnrollment => matches!(
             request,
@@ -802,6 +811,7 @@ mod tests {
             ReqKind::ListUsers(ListUsersRequest {}),
             ReqKind::CreateUser(CreateUserRequest::default()),
             ReqKind::RemoveUser(RemoveUserRequest::default()),
+            ReqKind::GetAlarms(GetAlarmsRequest {}),
             ReqKind::GetVpnEnrollment(GetVpnEnrollmentRequest {}),
             ReqKind::ListVpnPeers(ListVpnPeersRequest {}),
             ReqKind::RevokeVpnPeer(RevokeVpnPeerRequest::default()),
@@ -822,7 +832,7 @@ mod tests {
         let all = every_request_kind();
         assert_eq!(
             all.len(),
-            30,
+            31,
             "every_request_kind must list every variant of the request oneof; \
              add the new one (and decide what the enrollment tier may do with it)"
         );
@@ -872,7 +882,7 @@ mod tests {
         let all = every_request_kind();
         assert_eq!(
             all.len(),
-            30,
+            31,
             "every_request_kind must list every variant of the request oneof; \
              add the new one (and decide what the viewer tier may do with it)"
         );

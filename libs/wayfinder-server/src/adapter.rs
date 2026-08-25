@@ -19,6 +19,11 @@ use wayfinder::wayfinder_auth::Keypair;
 use wayfinder::wayfinder_auth::MembershipCert;
 use wayfinder::wayfinder_auth::RevocationRecord;
 use wayfinder::wayfinder_auth::TrustAnchor;
+use wayfinder_protos::service::AlarmData;
+use wayfinder_protos::service::AlarmKindData;
+use wayfinder_protos::service::AlarmSeverityData;
+use wayfinder_protos::service::AlarmSubjectData;
+use wayfinder_protos::service::AlarmsData;
 use wayfinder_protos::service::CsrOutcome;
 use wayfinder_protos::service::EgressDecisionData;
 use wayfinder_protos::service::EnrollmentAdmission;
@@ -267,6 +272,36 @@ impl<
     /// Calculate the now time with the epoch unix offset.
     fn unix_now(&self) -> Duration {
         self.epoch_unix + self.now
+    }
+}
+
+/// Project `wayfinder-alarm`'s severity onto the service-layer one.
+///
+/// Two enums rather than a re-export because the crates must not depend on each
+/// other: `wayfinder-protos` names the wire's vocabulary and `wayfinder-alarm`
+/// names the raise site's, and this adapter is the one place that knows both.
+fn alarm_severity_data(severity: wayfinder_alarm::Severity) -> AlarmSeverityData {
+    match severity {
+        wayfinder_alarm::Severity::Info => AlarmSeverityData::Info,
+        wayfinder_alarm::Severity::Warning => AlarmSeverityData::Warning,
+        wayfinder_alarm::Severity::Critical => AlarmSeverityData::Critical,
+    }
+}
+
+/// Project `wayfinder-alarm`'s condition kind onto the service-layer one.
+///
+/// Exhaustive on purpose: adding a condition the node can raise must force a
+/// decision about what a client sees, rather than defaulting to a row nothing
+/// can name.
+fn alarm_kind_data(kind: wayfinder_alarm::AlarmKind) -> AlarmKindData {
+    match kind {
+        wayfinder_alarm::AlarmKind::UnauthenticatedTraffic => AlarmKindData::UnauthenticatedTraffic,
+        wayfinder_alarm::AlarmKind::TrafficFlood => AlarmKindData::TrafficFlood,
+        wayfinder_alarm::AlarmKind::ManagementAuthFailures => AlarmKindData::ManagementAuthFailures,
+        wayfinder_alarm::AlarmKind::OgmReplay => AlarmKindData::OgmReplay,
+        wayfinder_alarm::AlarmKind::RevokedPeer => AlarmKindData::RevokedPeer,
+        wayfinder_alarm::AlarmKind::LinkErrors => AlarmKindData::LinkErrors,
+        wayfinder_alarm::AlarmKind::TableSaturation => AlarmKindData::TableSaturation,
     }
 }
 
@@ -766,6 +801,50 @@ impl<
             next_seq: snapshot.next_seq,
             dropped: snapshot.dropped,
             filter: wayfinder_log::current_spec().as_str().into(),
+        }
+    }
+
+    /// Project the node's alarm board.
+    ///
+    /// Reads the process-global board directly, exactly as [`logs`](Self::logs)
+    /// reads the process-global log ring, and for the same reason: what writes
+    /// it is scattered across the stack with no handle to carry, so there is no
+    /// router field to project from. Nothing here decides whether a condition
+    /// holds — a detector did that when it raised the alarm — and nothing here
+    /// filters: a latched-but-quiet row travels with `active: false` rather
+    /// than being dropped, because "fired ten minutes ago and stopped" is the
+    /// answer an operator who attached late came for.
+    fn alarms(&self) -> AlarmsData {
+        let snapshot = wayfinder_alarm::snapshot();
+        let now_ms = snapshot.now_ms;
+        AlarmsData {
+            alarms: snapshot
+                .alarms
+                .into_iter()
+                .map(|a| AlarmData {
+                    kind: alarm_kind_data(a.kind),
+                    severity: alarm_severity_data(a.severity),
+                    subject: match a.subject {
+                        wayfinder_alarm::Subject::Node(id) => {
+                            AlarmSubjectData::Peer(id.as_bytes().into())
+                        }
+                        wayfinder_alarm::Subject::Interface(idx) => {
+                            AlarmSubjectData::Interface(u32::from(idx))
+                        }
+                        wayfinder_alarm::Subject::None => AlarmSubjectData::Node,
+                    },
+                    first_ms: a.first_ms,
+                    last_ms: a.last_ms,
+                    count: a.count,
+                    detail: a.detail.as_str().into(),
+                    // Evaluated here rather than left to the client: the hold
+                    // window is the node's policy and the uptime clock is the
+                    // node's, so a client computing this itself would need both.
+                    active: a.is_active(now_ms),
+                })
+                .collect(),
+            dropped: snapshot.dropped,
+            now_ms,
         }
     }
 
@@ -1552,6 +1631,80 @@ mod tests {
         }
         // The provider's own router now holds (and will flood) the revocation.
         assert!(router.auth().unwrap().revoked_macs().any(|m| m == mac(9)));
+    }
+
+    /// An alarm raised anywhere in the process is readable through the provider
+    /// — the same join the log ring rests on, and the reason neither needs a
+    /// handle threaded through the router.
+    ///
+    /// Raised into a scoped board rather than the process-global one: the
+    /// harness runs these tests on shared threads, and a test that wrote the
+    /// global would be visible to every other test that reads it.
+    #[test]
+    fn alarms_project_a_raise_from_the_ambient_board() {
+        let mut router = CentralRouter::new(mac(1));
+        let adapter = RouterAdapter::new(&mut router, None, Duration::from_secs(0));
+
+        let board = alloc::sync::Arc::new(wayfinder_alarm::SharedBoard::new());
+        let projected = wayfinder_alarm::with_board(&board, || {
+            board.raise_at(
+                wayfinder_alarm::AlarmKind::ManagementAuthFailures,
+                wayfinder_alarm::Subject::Node(wayfinder_alarm::NodeId::new(&[0xab, 0xcd])),
+                wayfinder_alarm::Severity::Warning,
+                format_args!("attempts=3"),
+                1_000,
+            );
+            adapter.alarms()
+        });
+
+        assert_eq!(projected.alarms.len(), 1);
+        let alarm = &projected.alarms[0];
+        assert_eq!(alarm.kind, AlarmKindData::ManagementAuthFailures);
+        assert_eq!(alarm.severity, AlarmSeverityData::Warning);
+        assert_eq!(
+            alarm.subject,
+            AlarmSubjectData::Peer(alloc::vec![0xab, 0xcd])
+        );
+        assert_eq!(alarm.first_ms, 1_000);
+        assert_eq!(alarm.count, 1);
+        assert_eq!(alarm.detail, "attempts=3");
+    }
+
+    /// A condition that has gone quiet past its hold window is still on the
+    /// board, reported as inactive rather than dropped.
+    ///
+    /// That distinction is the whole point of latching: an operator who
+    /// attaches after a burst ended must still learn it happened, and an
+    /// adapter that filtered on `active` would delete exactly that.
+    #[test]
+    fn alarms_report_a_quiet_condition_as_latched_but_inactive() {
+        let mut router = CentralRouter::new(mac(1));
+        let adapter = RouterAdapter::new(&mut router, None, Duration::from_secs(0));
+
+        let board = alloc::sync::Arc::new(wayfinder_alarm::SharedBoard::new());
+        board.raise_at(
+            wayfinder_alarm::AlarmKind::LinkErrors,
+            wayfinder_alarm::Subject::Interface(2),
+            wayfinder_alarm::Severity::Warning,
+            format_args!("errors=5"),
+            0,
+        );
+
+        // Inside the hold window: still firing.
+        let fresh = wayfinder_alarm::with_board(&board, || adapter.alarms());
+        assert!(fresh.alarms[0].active);
+
+        // The board's `now_ms` comes from the shared uptime clock, which a test
+        // cannot wind forward, so the staleness check is made against the row's
+        // own hold window directly — the same computation the projection runs.
+        let hold = wayfinder_alarm::Severity::Warning.hold_ms();
+        let stale = board.snapshot_at(hold + 1);
+        assert_eq!(
+            stale.alarms.len(),
+            1,
+            "a quiet condition stays on the board"
+        );
+        assert!(!stale.alarms[0].is_active(stale.now_ms));
     }
 
     /// A record written through the logging crate is readable through the

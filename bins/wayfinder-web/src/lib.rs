@@ -75,6 +75,7 @@ use leptos_router::components::Route;
 use leptos_router::components::Router;
 use leptos_router::components::Routes;
 
+use crate::components::alarms::AlarmStrip;
 use crate::components::dashboard::Dashboard;
 use crate::components::dashboard::provide_dashboard;
 use crate::components::link_quality::LinkQuality;
@@ -244,8 +245,15 @@ pub fn App() -> impl IntoView {
     }
 }
 
-/// The page header: product mark, the node being viewed, a live/stale dot, and
-/// — in login mode — who is signed in and how to stop being.
+/// The page header: product mark, the node being viewed, what the node says is
+/// wrong, a live/stale dot, and — in login mode — who is signed in and how to
+/// stop being.
+///
+/// The alarm strip and the liveness dot are deliberately adjacent, and answer
+/// the two halves of one question. The dot says whether this page is still in
+/// touch with the node; the strip says what the node reports about itself. Read
+/// apart, either is misleading — "all systems normal" from a snapshot ten
+/// minutes stale is the worst thing this page could say.
 #[component]
 fn Header(
     /// Shared dashboard state.
@@ -258,6 +266,7 @@ fn Header(
                 "Wayfinder"
             </span>
             <span class="wf-header-node wf-mono">{move || dash.label.get()}</span>
+            <AlarmStrip dash=dash />
             <ViewerStrip />
             <span class="wf-header-status">
                 <span

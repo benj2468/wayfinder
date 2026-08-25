@@ -528,6 +528,24 @@ where
         // response as an oracle (wrong-key vs revoked vs expired vs not-admin)
         // while probing with a stolen or revoked cert.
         tracing::warn!(?reason, "drop: management authentication denied");
+        // And latch it, so it outlives the log ring. This is one of the two
+        // conditions the alarm board was designed around: the evidence of
+        // someone working through the front door is a stream of `warn!` lines,
+        // and a stream is precisely what rolls that ring over.
+        //
+        // Subject is the key the peer *presented*, truncated — so one probing
+        // key cannot mask another by folding into its row, and so a client sees
+        // which credential was refused rather than only that one was. Not the
+        // `reason`, which stays in the local log: the wire answer is
+        // deliberately uninformative so a peer cannot use it as an oracle, and
+        // an alarm a client reads is a wire answer.
+        wayfinder_alarm::alarm!(
+            wayfinder_alarm::Severity::Warning,
+            wayfinder_alarm::AlarmKind::ManagementAuthFailures,
+            wayfinder_alarm::Subject::Node(wayfinder_alarm::NodeId::new(&peer_key)),
+            "cert_presented={}",
+            cert.is_some()
+        );
         send_response(
             &mut responses,
             RespKind::Error(ErrorResponse {
@@ -2122,6 +2140,83 @@ mod tests {
             "connection is closed after a revoked admin is refused"
         );
         let _ = server.await;
+    }
+
+    /// A refused management login leaves an alarm behind, so the attempt
+    /// outlives the log ring the `warn!` beside it lands in.
+    ///
+    /// This is one of the two conditions §1 of the alarm design is built around:
+    /// somebody working through the front door produces exactly the stream of
+    /// records that rolls that ring over, and an operator who attaches
+    /// afterwards would otherwise find no trace of it.
+    ///
+    /// Asserted against the *process* board rather than a scoped one, unlike the
+    /// detector tests in `wayfinder-driver-core`: the raise happens on the
+    /// server task, and `with_board`'s scope is thread-local, so it would not
+    /// reach it. Made robust instead by giving this client a key no other test
+    /// uses and looking that subject up — the board is keyed by
+    /// `(kind, subject)`, so the row is this test's alone.
+    #[tokio::test]
+    async fn a_refused_login_latches_an_alarm_naming_the_key_that_was_refused() {
+        use wayfinder::wayfinder_auth::Authority;
+        use zerocopy::IntoBytes;
+
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        // A seed no other test in this process uses, so the subject below
+        // identifies this attempt and nothing else.
+        let admin_kp = Keypair::from_seed(&[0x7eu8; 32]);
+        let admin_mac = Mac([0, 0, 0, 0, 0, 0x7e]);
+        let admin_cert = authority.issue_user_cert(
+            admin_mac,
+            admin_kp.ed_pubkey(),
+            admin_kp.x_pubkey(),
+            0,
+            200,
+            true,
+        );
+        let ctx = AuthContext {
+            own_key: Some([9u8; 32]),
+            anchor: Some(authority.trust_anchor()),
+            revoked: vec![admin_mac],
+            now_unix: 100,
+        };
+        let subject =
+            wayfinder_alarm::Subject::Node(wayfinder_alarm::NodeId::new(&admin_kp.ed_pubkey()));
+        assert!(
+            !wayfinder_alarm::snapshot()
+                .alarms
+                .iter()
+                .any(|a| a.subject == subject),
+            "this key must be unused before the attempt, or the assertion below proves nothing"
+        );
+
+        let (mut client, server) = spawn_authenticated_server(admin_kp.ed_pubkey(), ctx);
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: admin_cert.as_bytes().to_vec(),
+            })))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(resp.response, Some(Response::Error(_))));
+        assert!(client.next().await.is_none());
+        let _ = server.await;
+
+        let raised = wayfinder_alarm::snapshot()
+            .alarms
+            .into_iter()
+            .find(|a| a.subject == subject)
+            .expect("the refusal is on the board");
+        assert_eq!(
+            raised.kind,
+            wayfinder_alarm::AlarmKind::ManagementAuthFailures
+        );
+        assert_eq!(raised.severity, wayfinder_alarm::Severity::Warning);
+        assert!(
+            !raised.detail.contains("revoked"),
+            "the wire answer is deliberately uninformative, and an alarm a \
+             client reads is a wire answer"
+        );
     }
 
     /// A non-empty but unparseable membership cert is refused explicitly (not

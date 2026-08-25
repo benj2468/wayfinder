@@ -26,8 +26,13 @@ use ratatui::widgets::Table;
 use ratatui::widgets::Tabs;
 use ratatui::widgets::Wrap;
 
+use wayfinder_protos::wayfinder::v1alpha::Alarm;
+use wayfinder_protos::wayfinder::v1alpha::AlarmKind;
+use wayfinder_protos::wayfinder::v1alpha::AlarmSeverity;
+use wayfinder_protos::wayfinder::v1alpha::Alarms;
 use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesEntry;
 use wayfinder_protos::wayfinder::v1alpha::LogLevel;
+use wayfinder_protos::wayfinder::v1alpha::alarm::Subject as AlarmSubject;
 
 use crate::app::App;
 use crate::app::LogEntry;
@@ -283,7 +288,11 @@ fn render_tabs(frame: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Wayfinder ".bold().fg(ACCENT)),
+                .title(" Wayfinder ".bold().fg(ACCENT))
+                // Top-right of the frame, opposite the product mark: the one
+                // thing on screen that is true whichever tab is showing, so it
+                // belongs in the chrome rather than in any one view.
+                .title_top(alarm_badge(&app.snapshot.alarms).right_aligned()),
         )
         .select(app.tab.index())
         .highlight_style(Style::default().fg(Color::Black).bg(ACCENT).bold())
@@ -341,6 +350,9 @@ fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
         },
     ));
 
+    lines.push(Line::from(""));
+    lines.extend(alarm_lines(&app.snapshot.alarms));
+
     let para = Paragraph::new(lines)
         .block(
             Block::default()
@@ -349,6 +361,180 @@ fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
         )
         .wrap(Wrap { trim: true });
     frame.render_widget(para, area);
+}
+
+/// The tab bar's alarm badge: what the node believes is wrong, in one span.
+///
+/// Three states, because two would collapse a distinction that matters. A board
+/// with nothing on it and a board whose conditions have all gone quiet are both
+/// "nothing is happening right now", but the second means something *did*
+/// happen and the operator has not seen it yet — which is the whole reason the
+/// board latches instead of expiring.
+///
+/// Coloured by the worst *active* severity, so the badge's colour answers "how
+/// bad is it" before its text is read.
+fn alarm_badge(board: &Alarms) -> Line<'static> {
+    let active = board.alarms.iter().filter(|a| a.active).count();
+    let quiet = board.alarms.len() - active;
+
+    if active == 0 {
+        let mut spans = vec![Span::styled(
+            " ● all systems normal",
+            Style::default().fg(Color::Green),
+        )];
+        if quiet > 0 {
+            spans.push(Span::styled(
+                format!(" · {quiet} recent "),
+                Style::default().fg(Color::DarkGray),
+            ));
+        } else {
+            spans.push(Span::raw(" "));
+        }
+        return Line::from(spans);
+    }
+
+    let worst = board
+        .alarms
+        .iter()
+        .filter(|a| a.active)
+        .map(|a| a.severity)
+        .max()
+        .unwrap_or(AlarmSeverity::Info as i32);
+    let plural = if active == 1 { "" } else { "s" };
+    Line::from(Span::styled(
+        format!(" ▲ {active} alarm{plural} "),
+        severity_style(worst).add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// The Overview pane's alarm section: the badge's detail, spelled out.
+///
+/// Every row the node holds, not only the firing ones — a condition that
+/// stopped is dimmed rather than hidden, because "it happened and stopped" is
+/// what an operator who attached afterwards came to find out.
+fn alarm_lines(board: &Alarms) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        "Alarms",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    ))];
+
+    if board.alarms.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  nothing wrong — the node is holding no conditions",
+            Style::default().fg(Color::Green),
+        )));
+        return lines;
+    }
+
+    for alarm in &board.alarms {
+        lines.push(alarm_line(alarm, board.now_ms));
+    }
+
+    // A gap in the board is reported as a gap, exactly as a gap in the log
+    // stream is: a row that silently vanished would be indistinguishable from a
+    // condition that never happened.
+    if board.dropped > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  ⚠ {} condition(s) refused or evicted for want of room",
+                board.dropped
+            ),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines
+}
+
+/// One alarm as a line: severity, kind, subject, magnitude, age, detail.
+fn alarm_line(alarm: &Alarm, now_ms: u64) -> Line<'static> {
+    let style = if alarm.active {
+        severity_style(alarm.severity)
+    } else {
+        // Quiet rows recede rather than disappear — present, but not competing
+        // for attention with what is firing now.
+        Style::default().fg(Color::DarkGray)
+    };
+    Line::from(vec![
+        Span::styled(format!("  {} ", severity_glyph(alarm.severity)), style),
+        Span::styled(
+            format!("{:<24}", alarm_kind_name(alarm.kind)),
+            style.add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("{:<20}", alarm_subject(alarm)), style),
+        Span::styled(format!("×{:<6}", alarm.count), style),
+        Span::styled(
+            format!("{:>10}  ", format_age(now_ms, alarm.last_ms)),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(alarm.detail.clone(), Style::default().fg(Color::Gray)),
+    ])
+}
+
+/// The colour a severity is rendered in: warm for what needs acting on, cool
+/// for what is merely noted — the same rule [`level_style`] follows for logs.
+fn severity_style(severity: i32) -> Style {
+    match AlarmSeverity::try_from(severity) {
+        Ok(AlarmSeverity::Critical) => Style::default().fg(Color::Red),
+        Ok(AlarmSeverity::Warning) => Style::default().fg(Color::Yellow),
+        Ok(AlarmSeverity::Info) => Style::default().fg(Color::Cyan),
+        // Never emitted by a node; rendered rather than hidden so a version
+        // skew looks odd instead of looking normal.
+        _ => Style::default().fg(Color::Magenta),
+    }
+}
+
+/// A one-character severity mark, so the shape of the list reads before the
+/// words do even without colour.
+fn severity_glyph(severity: i32) -> &'static str {
+    match AlarmSeverity::try_from(severity) {
+        Ok(AlarmSeverity::Critical) => "✖",
+        Ok(AlarmSeverity::Warning) => "▲",
+        Ok(AlarmSeverity::Info) => "•",
+        _ => "?",
+    }
+}
+
+/// The node's own name for a condition, so what the TUI shows and what the log
+/// line beside it says are the same string.
+fn alarm_kind_name(kind: i32) -> &'static str {
+    match AlarmKind::try_from(kind) {
+        Ok(AlarmKind::UnauthenticatedTraffic) => "unauthenticated_traffic",
+        Ok(AlarmKind::TrafficFlood) => "traffic_flood",
+        Ok(AlarmKind::ManagementAuthFailures) => "management_auth_failures",
+        Ok(AlarmKind::OgmReplay) => "ogm_replay",
+        Ok(AlarmKind::RevokedPeer) => "revoked_peer",
+        Ok(AlarmKind::LinkErrors) => "link_errors",
+        Ok(AlarmKind::TableSaturation) => "table_saturation",
+        // A node newer than this build, holding a condition it has no name for.
+        // Shown as unknown rather than dropped: an alarm this client cannot name
+        // is still an alarm.
+        _ => "unknown",
+    }
+}
+
+/// Who or what an alarm is about, rendered for a human.
+fn alarm_subject(alarm: &Alarm) -> String {
+    match &alarm.subject {
+        Some(AlarmSubject::NodeId(id)) => format_id(id),
+        Some(AlarmSubject::InterfaceIndex(idx)) => format!("iface{idx}"),
+        // Not "—": a condition with no subject is about the node itself, which
+        // is a fact rather than a missing field.
+        None => "this node".to_string(),
+    }
+}
+
+/// How long ago something last happened, in the node's own uptime clock.
+///
+/// Both instants come from the same snapshot, so this needs no clock of its own
+/// and cannot disagree with the node about what "now" is.
+fn format_age(now_ms: u64, then_ms: u64) -> String {
+    let secs = now_ms.saturating_sub(then_ms) / 1000;
+    match secs {
+        0 => "now".to_string(),
+        s if s < 60 => format!("{s}s ago"),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s => format!("{}h ago", s / 3600),
+    }
 }
 
 /// Build a `label: value` line with a dim label and bright value. Both
@@ -1423,6 +1609,179 @@ mod tests {
     use crate::app::Tab;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    /// A board with three rows on it, straddling their hold windows: one
+    /// critical still firing, one warning still firing, one info that has gone
+    /// quiet. The same shape the mock node serves, so what these assert and what
+    /// a developer sees on screen are the same thing.
+    fn board_with_three_conditions() -> Alarms {
+        Alarms {
+            alarms: vec![
+                Alarm {
+                    kind: AlarmKind::ManagementAuthFailures as i32,
+                    severity: AlarmSeverity::Critical as i32,
+                    first_ms: 240_000,
+                    last_ms: 619_000,
+                    count: 412,
+                    detail: "denied=412 in 6m".into(),
+                    active: true,
+                    subject: Some(AlarmSubject::NodeId(vec![
+                        0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x09,
+                    ])),
+                },
+                Alarm {
+                    kind: AlarmKind::LinkErrors as i32,
+                    severity: AlarmSeverity::Warning as i32,
+                    first_ms: 480_000,
+                    last_ms: 600_000,
+                    count: 27,
+                    detail: "consecutive recv errors=27".into(),
+                    active: true,
+                    subject: Some(AlarmSubject::InterfaceIndex(1)),
+                },
+                Alarm {
+                    kind: AlarmKind::UnauthenticatedTraffic as i32,
+                    severity: AlarmSeverity::Info as i32,
+                    first_ms: 300_000,
+                    last_ms: 500_000,
+                    count: 3,
+                    detail: "dropped=3".into(),
+                    active: false,
+                    subject: Some(AlarmSubject::NodeId(vec![0, 0, 0, 0, 0, 7])),
+                },
+            ],
+            dropped: 0,
+            now_ms: 620_000,
+        }
+    }
+
+    /// Draw one frame and flatten the buffer to text.
+    fn rendered(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("terminal");
+        terminal.draw(|frame| render(frame, app)).expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// A node holding nothing says so, in the chrome and in the Overview alike.
+    ///
+    /// The positive statement is the point: an operator must be able to tell
+    /// "checked, and nothing is wrong" from "nothing has told me anything",
+    /// and a badge that appeared only when something broke could not.
+    #[test]
+    fn an_empty_board_reports_all_systems_normal() {
+        let mut app = App::new("test".to_string(), 1000);
+        app.tab = Tab::Overview;
+
+        let text = rendered(&mut app);
+        assert!(
+            text.contains("all systems normal"),
+            "the badge must state the normal case, not merely omit the bad one"
+        );
+        assert!(text.contains("nothing wrong"), "and the Overview must too");
+    }
+
+    /// With conditions on the board the badge counts the *firing* ones and the
+    /// Overview spells every row out — kind, subject, magnitude and detail.
+    #[test]
+    fn a_board_with_conditions_shows_a_count_and_the_rows_behind_it() {
+        let mut app = App::new("test".to_string(), 1000);
+        app.tab = Tab::Overview;
+        app.snapshot.alarms = board_with_three_conditions();
+
+        let text = rendered(&mut app);
+        assert!(
+            text.contains("2 alarms"),
+            "the badge counts what is firing, not what is on the board"
+        );
+        assert!(!text.contains("all systems normal"));
+
+        assert!(text.contains("management_auth_failures"));
+        assert!(text.contains("link_errors"));
+        assert!(text.contains("aa:bb:cc:dd:ee:09"), "peer subject rendered");
+        assert!(text.contains("iface1"), "interface subject rendered");
+        assert!(text.contains("×412"), "the magnitude is on the row");
+        assert!(text.contains("denied=412 in 6m"), "and so is the detail");
+    }
+
+    /// A condition that has gone quiet is still listed, and the badge reports it
+    /// separately from the ones firing now.
+    ///
+    /// This is the distinction latching exists for: an operator who attached
+    /// after a burst ended must still learn it happened, so "nothing is
+    /// happening" and "nothing happened" cannot look the same.
+    #[test]
+    fn a_quiet_condition_is_still_listed_and_counted_apart() {
+        let mut app = App::new("test".to_string(), 1000);
+        app.tab = Tab::Overview;
+        let mut board = board_with_three_conditions();
+        // Leave only the row that has gone quiet.
+        board.alarms.retain(|a| !a.active);
+        app.snapshot.alarms = board;
+
+        let text = rendered(&mut app);
+        assert!(
+            text.contains("all systems normal"),
+            "nothing is firing, and the badge says so"
+        );
+        assert!(
+            text.contains("1 recent"),
+            "but it does not pretend the board is empty"
+        );
+        assert!(
+            text.contains("unauthenticated_traffic"),
+            "and the quiet row is still listed in full"
+        );
+    }
+
+    /// A board that had to refuse or evict a row says so, rather than letting
+    /// the missing condition look like one that never happened.
+    #[test]
+    fn an_evicting_board_reports_the_gap() {
+        let mut app = App::new("test".to_string(), 1000);
+        app.tab = Tab::Overview;
+        let mut board = board_with_three_conditions();
+        board.dropped = 9;
+        app.snapshot.alarms = board;
+
+        assert!(rendered(&mut app).contains("9 condition(s) refused or evicted"));
+    }
+
+    /// An alarm kind this build has no name for is rendered as unknown, not
+    /// dropped: a client too old to name a condition is still a client that must
+    /// not tell its operator everything is fine.
+    #[test]
+    fn a_condition_this_build_cannot_name_is_still_shown() {
+        let mut app = App::new("test".to_string(), 1000);
+        app.tab = Tab::Overview;
+        app.snapshot.alarms = Alarms {
+            alarms: vec![Alarm {
+                kind: 9_999,
+                severity: AlarmSeverity::Critical as i32,
+                first_ms: 0,
+                last_ms: 1_000,
+                count: 1,
+                detail: "from the future".into(),
+                active: true,
+                subject: None,
+            }],
+            dropped: 0,
+            now_ms: 1_000,
+        };
+
+        let text = rendered(&mut app);
+        assert!(text.contains("1 alarm"), "counted despite being unnameable");
+        assert!(text.contains("unknown"), "and shown as what it is");
+        assert!(
+            text.contains("this node"),
+            "a subjectless condition is about the node, not about nothing"
+        );
+    }
 
     /// Render the Metrics tab through a real `TestBackend` so the chart's axis
     /// bounds, label vectors, and layout split are exercised end to end — both

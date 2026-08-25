@@ -36,6 +36,7 @@ use tokio_rustls::client::TlsStream;
 use tokio_serial::SerialStream;
 use tokio_util::codec::Framed;
 use tokio_util::codec::LengthDelimitedCodec;
+use wayfinder_protos::wayfinder::v1alpha::Alarms;
 use wayfinder_protos::wayfinder::v1alpha::ApproveCsrRequest;
 use wayfinder_protos::wayfinder::v1alpha::AuthenticateRequest;
 use wayfinder_protos::wayfinder::v1alpha::AuthenticateUserRequest;
@@ -43,6 +44,7 @@ use wayfinder_protos::wayfinder::v1alpha::AuthenticateUserResponse;
 use wayfinder_protos::wayfinder::v1alpha::CreateUserRequest;
 use wayfinder_protos::wayfinder::v1alpha::DenyCsrRequest;
 use wayfinder_protos::wayfinder::v1alpha::EnrollmentPolicy;
+use wayfinder_protos::wayfinder::v1alpha::GetAlarmsRequest;
 use wayfinder_protos::wayfinder::v1alpha::GetKeepAliveTableRequest;
 use wayfinder_protos::wayfinder::v1alpha::GetLinkFeaturesTableRequest;
 use wayfinder_protos::wayfinder::v1alpha::GetLinkQualityTableRequest;
@@ -458,6 +460,28 @@ impl Client {
         {
             ResponseKind::Logs(logs) => Ok(logs),
             other => Err(unexpected("Logs", &other)),
+        }
+    }
+
+    /// Read the node's alarm board: the conditions it currently believes are
+    /// wrong.
+    ///
+    /// Unlike [`logs`](Self::logs) there is no cursor — the board is small,
+    /// bounded and latched, so each poll takes the whole of it and a client
+    /// needs no state between polls.
+    ///
+    /// Every row is reported, including ones that have gone quiet: check
+    /// [`active`](wayfinder_protos::wayfinder::v1alpha::Alarm::active) against
+    /// [`now_ms`](wayfinder_protos::wayfinder::v1alpha::Alarms::now_ms) to tell
+    /// "firing now" from "fired recently and stopped". An empty board is the
+    /// node saying nothing is wrong, not an absence of an answer.
+    pub async fn alarms(&mut self) -> anyhow::Result<Alarms> {
+        match self
+            .request(RequestKind::GetAlarms(GetAlarmsRequest {}))
+            .await?
+        {
+            ResponseKind::Alarms(alarms) => Ok(alarms),
+            other => Err(unexpected("Alarms", &other)),
         }
     }
 
@@ -1016,6 +1040,7 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
         ResponseKind::ListCerts(_) => "ListCerts",
         ResponseKind::ListPendingCsrs(_) => "ListPendingCsrs",
         ResponseKind::Logs(_) => "Logs",
+        ResponseKind::Alarms(_) => "Alarms",
         ResponseKind::LogFilter(_) => "LogFilter",
         ResponseKind::AuthenticateUser(_) => "AuthenticateUser",
         ResponseKind::ListUsers(_) => "ListUsers",

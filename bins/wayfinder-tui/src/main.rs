@@ -427,6 +427,10 @@ async fn fetch(conn: &mut Client, app: &mut App) -> anyhow::Result<()> {
     // these RPCs — treat that as "no provider data" rather than a fetch failure,
     // so the rest of the snapshot still refreshes against a non-provider node.
     app.snapshot.pending_csrs = conn.list_pending_csrs().await.ok();
+    // Polled every tick like the tables above, and for a stronger reason: the
+    // badge that reports it is on screen whichever tab is showing, so a stale
+    // board would be a node saying "all normal" from a tab that never asked.
+    app.snapshot.alarms = conn.alarms().await?;
 
     // Polled every tick regardless of which tab is showing, so switching to the
     // Logs tab presents the history that accumulated while it was hidden rather

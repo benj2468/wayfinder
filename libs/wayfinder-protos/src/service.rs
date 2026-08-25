@@ -1,3 +1,7 @@
+use crate::wayfinder::v1alpha::Alarm;
+use crate::wayfinder::v1alpha::AlarmKind;
+use crate::wayfinder::v1alpha::AlarmSeverity;
+use crate::wayfinder::v1alpha::Alarms;
 use crate::wayfinder::v1alpha::AllInterfacesEgress;
 use crate::wayfinder::v1alpha::AuthenticateUserResponse;
 use crate::wayfinder::v1alpha::CreateUserResponse;
@@ -44,6 +48,7 @@ use crate::wayfinder::v1alpha::UserSessionIssued;
 use crate::wayfinder::v1alpha::UserSessionRejected;
 use crate::wayfinder::v1alpha::WayfinderRequest;
 use crate::wayfinder::v1alpha::WayfinderResponse;
+use crate::wayfinder::v1alpha::alarm::Subject as AlarmSubjectKind;
 use crate::wayfinder::v1alpha::authenticate_user_response::Outcome as AuthenticateUserOutcomeKind;
 use crate::wayfinder::v1alpha::resolve_route_response::Egress as EgressKind;
 use crate::wayfinder::v1alpha::reveal_enrollment_token_response::Admission;
@@ -531,6 +536,100 @@ pub struct LogsData {
     pub filter: String,
 }
 
+/// How bad a condition an alarm reports is.  Mirrors `wayfinder-alarm`'s
+/// `Severity` and the `AlarmSeverity` proto, so neither this crate nor a client
+/// has to depend on the alarm crate to name one.
+///
+/// Ordered worst-last so `>` means "worse", which is what a client sorting or
+/// thresholding a board compares.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AlarmSeverityData {
+    /// Worth recording, not worth waking anyone.
+    #[default]
+    Info,
+    /// Something is wrong and an operator should look.
+    Warning,
+    /// Something is wrong now and is degrading or attacking the mesh.
+    Critical,
+}
+
+/// What kind of condition an alarm reports.  Mirrors `wayfinder-alarm`'s
+/// `AlarmKind` and the `AlarmKind` proto.
+///
+/// A closed set: what a node can flag is a design decision, not caller data,
+/// and a fixed set is what lets a client render a condition it has never seen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlarmKindData {
+    /// Frames arriving from a source that fails authentication, in volume.
+    UnauthenticatedTraffic,
+    /// Frames offered far faster than this mesh's configured cadence explains.
+    TrafficFlood,
+    /// Repeated management-API authentication failures.
+    ManagementAuthFailures,
+    /// An OGM whose sequence number this node has already processed.
+    OgmReplay,
+    /// Traffic from a peer holding a certificate this node knows to be revoked.
+    RevokedPeer,
+    /// A link failing I/O persistently rather than transiently.
+    LinkErrors,
+    /// A bounded table at capacity and evicting.
+    TableSaturation,
+}
+
+/// Who or what an alarm is about.
+///
+/// Deliberately raw bytes rather than a parsed identifier, for the same reason
+/// the management API's other `node_id` fields are: the projection must not
+/// need to know this deployment's address family, and rendering is the client's
+/// job.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum AlarmSubjectData {
+    /// About the node as a whole rather than any one peer or interface.
+    #[default]
+    Node,
+    /// About the peer with these raw identifier bytes, at most 8 of them.
+    Peer(Vec<u8>),
+    /// About the interface at this index.
+    Interface(u32),
+}
+
+/// One latched condition from a node's alarm board.  Mirrors the `Alarm` proto.
+#[derive(Clone, Debug)]
+pub struct AlarmData {
+    /// What kind of condition this is.
+    pub kind: AlarmKindData,
+    /// The worst severity yet observed for it; ratchets up and never down.
+    pub severity: AlarmSeverityData,
+    /// Who or what it is about.
+    pub subject: AlarmSubjectData,
+    /// Node uptime in milliseconds when the condition started.
+    pub first_ms: u64,
+    /// Node uptime in milliseconds at the most recent observation.
+    pub last_ms: u64,
+    /// How many observations have folded into this row, saturating.
+    pub count: u32,
+    /// The most recent observation, rendered by the detector.  Metadata only.
+    pub detail: String,
+    /// Whether the node is still asserting the condition as of
+    /// [`AlarmsData::now_ms`] — evaluated by the node so a client needs no
+    /// clock of its own.  A `false` here means "fired and has since gone
+    /// quiet", not "gone": the board latches.
+    pub active: bool,
+}
+
+/// A node's whole alarm board as one snapshot.  Mirrors the `Alarms` proto.
+#[derive(Clone, Default)]
+pub struct AlarmsData {
+    /// The latched conditions, worst first and — among equal severities — most
+    /// recent first.  Ordered by the node so every reader agrees on the top.
+    pub alarms: Vec<AlarmData>,
+    /// How many raises the board's capacity policy refused or evicted since
+    /// boot, so a gap stays visible as a gap.
+    pub dropped: u64,
+    /// Node uptime in milliseconds when the snapshot was taken.
+    pub now_ms: u64,
+}
+
 /// Implemented by anything that can supply router state to [`WayfinderService`].
 /// Intentionally transport- and protocol-agnostic so callers can implement it
 /// for whatever router type they have without pulling in a dependency on this crate.
@@ -589,6 +688,14 @@ pub trait WayfinderDataProvider {
     /// reachable over the same transport as everything else, which on a board
     /// with no debug probe attached is the only way to read them at all.
     fn logs(&self, since_seq: u64, max_records: u32) -> LogsData;
+    /// The conditions this node currently believes are wrong.
+    ///
+    /// Not derived from the router: the board is process-global precisely
+    /// because what raises an alarm is scattered across the whole stack with no
+    /// handle to carry, so an implementor reads that global rather than
+    /// projecting state it owns.  A node that has never raised one answers with
+    /// an empty board, which is the "all systems normal" a client renders.
+    fn alarms(&self) -> AlarmsData;
 
     /// Install `directives` as the node's runtime log filter, across every sink
     /// it writes to.  Returns the spec now in force, for readback.
@@ -851,6 +958,32 @@ pub struct EnrollData {
 /// never producing `LOG_LEVEL_UNSPECIFIED`: that value exists only to satisfy
 /// proto3's zero-value rule, and a node emitting it would be reporting a record
 /// with no level.
+/// Project an alarm severity onto its wire enum.
+fn proto_alarm_severity(severity: AlarmSeverityData) -> AlarmSeverity {
+    match severity {
+        AlarmSeverityData::Info => AlarmSeverity::Info,
+        AlarmSeverityData::Warning => AlarmSeverity::Warning,
+        AlarmSeverityData::Critical => AlarmSeverity::Critical,
+    }
+}
+
+/// Project an alarm kind onto its wire enum.
+///
+/// Exhaustive on purpose: a new condition must be given a wire name here rather
+/// than falling through to `Unspecified`, which a client renders as "a node
+/// newer than this build".
+fn proto_alarm_kind(kind: AlarmKindData) -> AlarmKind {
+    match kind {
+        AlarmKindData::UnauthenticatedTraffic => AlarmKind::UnauthenticatedTraffic,
+        AlarmKindData::TrafficFlood => AlarmKind::TrafficFlood,
+        AlarmKindData::ManagementAuthFailures => AlarmKind::ManagementAuthFailures,
+        AlarmKindData::OgmReplay => AlarmKind::OgmReplay,
+        AlarmKindData::RevokedPeer => AlarmKind::RevokedPeer,
+        AlarmKindData::LinkErrors => AlarmKind::LinkErrors,
+        AlarmKindData::TableSaturation => AlarmKind::TableSaturation,
+    }
+}
+
 fn proto_log_level(level: LogLevelData) -> LogLevel {
     match level {
         LogLevelData::Error => LogLevel::Error,
@@ -942,6 +1075,7 @@ fn request_kind_name(k: &RequestKind) -> &'static str {
         RequestKind::Authenticate(_) => "Authenticate",
         RequestKind::GetLinkFeaturesTable(_) => "GetLinkFeaturesTable",
         RequestKind::GetLogs(_) => "GetLogs",
+        RequestKind::GetAlarms(_) => "GetAlarms",
         RequestKind::SetLogLevel(_) => "SetLogLevel",
         RequestKind::RevealEnrollmentToken(_) => "RevealEnrollmentToken",
         RequestKind::AuthenticateUser(_) => "AuthenticateUser",
@@ -1033,6 +1167,9 @@ fn audited(k: &RequestKind) -> Audited {
         // on every refresh tick, and a record emitted per poll would fill the
         // very ring the poll is reading.
         | RequestKind::GetLogs(_)
+        // A poll, on the same tick as GetLogs and unlogged for the same reason:
+        // a record per poll would fill the ring an operator reads next to it.
+        | RequestKind::GetAlarms(_)
         // A read of provider state, like ListCerts beside it. Not a disclosure:
         // it hands out no secret, only the roster — and only to a client that
         // already holds a full management grant.
@@ -1153,6 +1290,34 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                     next_seq: batch.next_seq,
                     dropped: batch.dropped,
                     filter: batch.filter,
+                })
+            }
+
+            Some(RequestKind::GetAlarms(_)) => {
+                let board = self.provider.alarms();
+                ResponseKind::Alarms(Alarms {
+                    alarms: board
+                        .alarms
+                        .into_iter()
+                        .map(|a| Alarm {
+                            kind: proto_alarm_kind(a.kind) as i32,
+                            severity: proto_alarm_severity(a.severity) as i32,
+                            first_ms: a.first_ms,
+                            last_ms: a.last_ms,
+                            count: a.count,
+                            detail: a.detail,
+                            active: a.active,
+                            subject: match a.subject {
+                                AlarmSubjectData::Node => None,
+                                AlarmSubjectData::Peer(id) => Some(AlarmSubjectKind::NodeId(id)),
+                                AlarmSubjectData::Interface(idx) => {
+                                    Some(AlarmSubjectKind::InterfaceIndex(idx))
+                                }
+                            },
+                        })
+                        .collect(),
+                    dropped: board.dropped,
+                    now_ms: board.now_ms,
                 })
             }
 
@@ -1610,6 +1775,9 @@ mod tests {
         /// The admission rule this provider reveals, or `None` for a node that
         /// is not a provider at all.
         enrollment_admission: Option<EnrollmentAdmission>,
+        /// The board this provider reports, so a test can prove every field
+        /// reaches the wire rather than being dropped in the projection.
+        alarms: AlarmsData,
     }
 
     impl WayfinderDataProvider for MockProvider {
@@ -1667,6 +1835,9 @@ mod tests {
         }
         fn runtime_config_active(&self) -> bool {
             self.runtime_config_active
+        }
+        fn alarms(&self) -> AlarmsData {
+            self.alarms.clone()
         }
         fn logs(&self, since_seq: u64, max_records: u32) -> LogsData {
             self.last_logs_query.set((since_seq, max_records));
@@ -1766,6 +1937,131 @@ mod tests {
                 assert_eq!(logs.dropped, 0);
             }
             other => panic!("expected Logs, got {}", proto_kind_name(&other)),
+        }
+    }
+
+    /// The board is projected whole: every field of every row, the eviction
+    /// count, and the instant `active` was evaluated against.
+    ///
+    /// `now_ms` and `active` are the two that a projection can plausibly drop
+    /// and still look right, and both are load-bearing — without them a client
+    /// cannot tell a condition firing now from one that fired an hour ago, and
+    /// has no clock of the node's to work it out for itself.
+    #[test]
+    fn get_alarms_projects_the_whole_board() {
+        let provider = MockProvider {
+            alarms: AlarmsData {
+                alarms: vec![
+                    AlarmData {
+                        kind: AlarmKindData::ManagementAuthFailures,
+                        severity: AlarmSeverityData::Critical,
+                        subject: AlarmSubjectData::Peer(vec![0xaa, 0xbb]),
+                        first_ms: 1_000,
+                        last_ms: 9_000,
+                        count: 412,
+                        detail: "attempts=412".into(),
+                        active: true,
+                    },
+                    AlarmData {
+                        kind: AlarmKindData::LinkErrors,
+                        severity: AlarmSeverityData::Warning,
+                        subject: AlarmSubjectData::Interface(3),
+                        first_ms: 2_000,
+                        last_ms: 3_000,
+                        count: 7,
+                        detail: "errors=7".into(),
+                        active: false,
+                    },
+                ],
+                dropped: 5,
+                now_ms: 10_000,
+            },
+            ..Default::default()
+        };
+
+        let response = handle(provider, RequestKind::GetAlarms(Default::default()));
+
+        match response {
+            ResponseKind::Alarms(board) => {
+                assert_eq!(
+                    board.dropped, 5,
+                    "an evicted row must stay visible as a gap"
+                );
+                assert_eq!(board.now_ms, 10_000);
+                assert_eq!(board.alarms.len(), 2);
+
+                let first = &board.alarms[0];
+                assert_eq!(first.kind, AlarmKind::ManagementAuthFailures as i32);
+                assert_eq!(first.severity, AlarmSeverity::Critical as i32);
+                assert_eq!(first.first_ms, 1_000);
+                assert_eq!(first.last_ms, 9_000);
+                assert_eq!(first.count, 412);
+                assert_eq!(first.detail, "attempts=412");
+                assert!(first.active);
+                assert_eq!(
+                    first.subject,
+                    Some(AlarmSubjectKind::NodeId(vec![0xaa, 0xbb]))
+                );
+
+                let second = &board.alarms[1];
+                assert_eq!(second.kind, AlarmKind::LinkErrors as i32);
+                assert_eq!(second.severity, AlarmSeverity::Warning as i32);
+                assert!(
+                    !second.active,
+                    "a latched-but-quiet row is reported, and reported as quiet"
+                );
+                assert_eq!(second.subject, Some(AlarmSubjectKind::InterfaceIndex(3)));
+            }
+            other => panic!("expected Alarms, got {}", proto_kind_name(&other)),
+        }
+    }
+
+    /// An alarm about the node itself carries no subject at all, rather than a
+    /// zero-length identifier a client would render as a peer named "".
+    #[test]
+    fn get_alarms_leaves_a_node_wide_condition_without_a_subject() {
+        let provider = MockProvider {
+            alarms: AlarmsData {
+                alarms: vec![AlarmData {
+                    kind: AlarmKindData::TableSaturation,
+                    severity: AlarmSeverityData::Warning,
+                    subject: AlarmSubjectData::Node,
+                    first_ms: 1,
+                    last_ms: 2,
+                    count: 1,
+                    detail: "originators 64/64".into(),
+                    active: true,
+                }],
+                dropped: 0,
+                now_ms: 3,
+            },
+            ..Default::default()
+        };
+
+        let response = handle(provider, RequestKind::GetAlarms(Default::default()));
+
+        match response {
+            ResponseKind::Alarms(board) => assert_eq!(board.alarms[0].subject, None),
+            other => panic!("expected Alarms, got {}", proto_kind_name(&other)),
+        }
+    }
+
+    /// A node with nothing wrong answers with an empty board, not an error.
+    /// That answer *is* the "all systems normal" a client renders, so it has to
+    /// be a successful response rather than something a client has to
+    /// interpret.
+    #[test]
+    fn get_alarms_with_an_empty_board_is_a_successful_empty_answer() {
+        let response = handle(
+            MockProvider::default(),
+            RequestKind::GetAlarms(Default::default()),
+        );
+        match response {
+            ResponseKind::Alarms(board) => {
+                assert!(board.alarms.is_empty());
+                assert_eq!(board.dropped, 0);
+            }
+            other => panic!("expected Alarms, got {}", proto_kind_name(&other)),
         }
     }
 
@@ -2886,6 +3182,7 @@ mod tests {
             ResponseKind::AuthenticateUser(_) => "AuthenticateUser",
             ResponseKind::ListUsers(_) => "ListUsers",
             ResponseKind::CreateUser(_) => "CreateUser",
+            ResponseKind::Alarms(_) => "Alarms",
         }
     }
 }
