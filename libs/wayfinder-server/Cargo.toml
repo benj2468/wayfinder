@@ -32,6 +32,8 @@ std = [
     "dep:sha1",
     "dep:subtle",
     "dep:rand",
+    "dep:reqwest",
+    "dep:url",
 ]
 # The `no_std` + `alloc` embedded management transport: length-delimited request
 # framing over an `embedded-io-async` byte stream (`framing`) and the
@@ -89,6 +91,17 @@ hmac = { workspace = true, optional = true }
 sha1 = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
+# The VPN coordination-server client (`vpn.rs`), std-only: an enrolled device
+# asks the CA for a tunnel credential and the CA mints it against Headscale's
+# REST API. Optional and behind `std` for the same reason the CA's user store
+# is — an embedded node is explicitly out of scope for VPN links (a tunnel
+# daemon needs a real OS network stack), so a board must not link an HTTP
+# client it can never call.
+reqwest = { workspace = true, optional = true }
+# Validates the configured coordination-server base URL at construction rather
+# than at first use, so a typo is a startup error instead of an enrollment that
+# fails hours later.
+url = { version = "2", optional = true }
 
 # The embedded management transport (`embedded` feature): the byte-stream I/O
 # trait the framing reads/writes over, and the SPSC channel the `serve` loop

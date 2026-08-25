@@ -27,6 +27,7 @@ fn config(state: &std::path::Path) -> wayfinder::config::ProviderConfig {
         allow_unbounded_cert_ttl: false,
         pending_ttl_secs: 3600,
         state_path: Some(state.display().to_string()),
+        headscale: None,
     }
 }
 

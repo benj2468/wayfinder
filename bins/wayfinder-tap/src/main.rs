@@ -56,7 +56,7 @@ use wayfinder_driver::build_raw_l2_link;
 use wayfinder_driver::build_rylr998_link;
 use wayfinder_driver::build_udp_link;
 use wayfinder_driver::build_udp_multi_link;
-use wayfinder_driver::serve_tls_server;
+use wayfinder_driver::serve_tls_server_with_vpn;
 use wayfinder_server::SettingsFile;
 use wayfinder_server::SettingsStore;
 
@@ -356,6 +356,13 @@ async fn main() -> anyhow::Result<()> {
                 discovery_addr,
                 multicast_interface,
             } => {
+                if discovery_addr.is_none() && multicast_interface.is_some() {
+                    bail!(
+                        "udpmulti link {:?}: multicast_interface is meaningless without a \
+                         discovery_addr to join a multicast group at",
+                        names.last()
+                    );
+                }
                 interfaces.push(
                     build_udp_multi_link(bind_addr, discovery_addr, multicast_interface.as_deref())
                         .await?,
@@ -441,6 +448,26 @@ async fn main() -> anyhow::Result<()> {
     // enrolls this node certifies the identity it was already talking to.
     let mut node_identity_seed: Option<[u8; 32]> = None;
 
+    // Built here, before the listener spawns, because the listener is what
+    // answers the VPN requests — the router loop is never told who is calling,
+    // and `GetVpnEnrollment` mints a credential for the caller's own identity.
+    // Constructing it now also means a bad URL or an unreadable API key file is
+    // a startup failure an operator sees immediately, rather than an enrollment
+    // that fails later against a node they have walked away from.
+    let vpn_coordinator: Option<wayfinder_server::vpn::SharedCoordinator> =
+        match config.provider.as_ref().and_then(|p| p.headscale.as_ref()) {
+            Some(headscale_cfg) => {
+                let coordinator = wayfinder_server::vpn::HeadscaleCoordinator::new(headscale_cfg)
+                    .map_err(|e| anyhow::anyhow!("VPN coordination: {e}"))?;
+                tracing::info!(
+                    api_url = %headscale_cfg.api_url,
+                    "VPN coordination enabled (Headscale)"
+                );
+                Some(std::sync::Arc::new(coordinator) as wayfinder_server::vpn::SharedCoordinator)
+            }
+            None => None,
+        };
+
     if let Some(server_cfg) = config.server {
         let tx = query_tx.clone();
         match server_cfg {
@@ -471,8 +498,9 @@ async fn main() -> anyhow::Result<()> {
                 let (snapshot_tx, snapshot_rx): (AuthSnapshotTx, AuthSnapshotRx) =
                     mpsc::channel(16);
                 auth_snapshot_rx = Some(snapshot_rx);
+                let vpn = vpn_coordinator.clone();
                 join_set.spawn(async move {
-                    serve_tls_server(listener, identity_seed, snapshot_tx, tx).await
+                    serve_tls_server_with_vpn(listener, identity_seed, snapshot_tx, tx, vpn).await
                 });
             }
         }

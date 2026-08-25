@@ -25,6 +25,13 @@ extern crate alloc;
 mod adapter;
 pub use adapter::RouterAdapter;
 
+/// VPN coordination against a Headscale server: the credential an enrolled
+/// device is handed to join the tunnel, and the peer list/revocation an
+/// operator manages it through.  `std` only — a tunnel daemon needs a real OS
+/// network stack, so an embedded node never links this.
+#[cfg(feature = "std")]
+pub mod vpn;
+
 mod authz;
 pub use authz::MgmtAccess;
 pub use authz::MgmtDenied;
@@ -134,3 +141,5 @@ pub use transport::bind_tcp_server;
 pub use transport::run_channel_server;
 #[cfg(feature = "std")]
 pub use transport::serve_tls_server;
+#[cfg(feature = "std")]
+pub use transport::serve_tls_server_with_vpn;

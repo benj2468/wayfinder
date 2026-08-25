@@ -938,6 +938,9 @@ fn request_kind_name(k: &RequestKind) -> &'static str {
         RequestKind::ListUsers(_) => "ListUsers",
         RequestKind::CreateUser(_) => "CreateUser",
         RequestKind::RemoveUser(_) => "RemoveUser",
+        RequestKind::GetVpnEnrollment(_) => "GetVpnEnrollment",
+        RequestKind::ListVpnPeers(_) => "ListVpnPeers",
+        RequestKind::RevokeVpnPeer(_) => "RevokeVpnPeer",
     }
 }
 
@@ -990,7 +993,17 @@ fn audited(k: &RequestKind) -> Audited {
         // And removing one ends somebody's access. Both halves of an account's
         // lifetime leave a record, or the record answers "who was given access"
         // without ever answering "who took it away".
-        | RequestKind::RemoveUser(_) => Audited::Mutation,
+        | RequestKind::RemoveUser(_)
+        // Minting a tunnel credential is handing out a bearer secret, so it is
+        // audited for the same reason RevealEnrollmentToken is — except that
+        // this one also *creates* the thing it discloses, and creates it at a
+        // remote coordination server this node cannot later query for "when was
+        // this issued". The record here is the only account of it.
+        | RequestKind::GetVpnEnrollment(_)
+        // Removing a peer's tunnel reachability is an operator action that
+        // takes access away, and the retry path for a partially-failed mesh
+        // revocation runs through it.
+        | RequestKind::RevokeVpnPeer(_) => Audited::Mutation,
 
         RequestKind::GetNodeInfo(_)
         | RequestKind::GetRoutingTable(_)
@@ -1013,7 +1026,10 @@ fn audited(k: &RequestKind) -> Audited {
         // A read of provider state, like ListCerts beside it. Not a disclosure:
         // it hands out no secret, only the roster — and only to a client that
         // already holds a full management grant.
-        | RequestKind::ListUsers(_) => Audited::Query,
+        | RequestKind::ListUsers(_)
+        // A read of the coordination server's roster, like ListCerts beside it,
+        // and polled by the dashboard the same way.
+        | RequestKind::ListVpnPeers(_) => Audited::Query,
     }
 }
 
@@ -1413,6 +1429,19 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                 }
                 Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
             },
+
+            // The VPN requests are answered by the management *transport*, which
+            // is the only layer that holds the caller's verified certificate —
+            // `GetVpnEnrollment` carries no fields because the identity it
+            // mints for is the connection's, and a provider here has no
+            // connection to read it from. Reaching this arm means a transport
+            // forwarded one instead of handling it, so it fails closed and
+            // says so rather than answering with something plausible.
+            Some(RequestKind::GetVpnEnrollment(_))
+            | Some(RequestKind::ListVpnPeers(_))
+            | Some(RequestKind::RevokeVpnPeer(_)) => ResponseKind::Error(ErrorResponse {
+                message: "VPN coordination is not served on this transport".into(),
+            }),
 
             Some(RequestKind::RevokeNode(req)) => match self.provider.revoke_node(&req.node_mac) {
                 Ok(()) => ResponseKind::Empty(Empty {}),
@@ -2835,6 +2864,8 @@ mod tests {
             ResponseKind::ListPendingCsrs(_) => "ListPendingCsrs",
             ResponseKind::TrustAnchor(_) => "TrustAnchor",
             ResponseKind::SubmitCsr(_) => "SubmitCsr",
+            ResponseKind::VpnEnrollment(_) => "VpnEnrollment",
+            ResponseKind::ListVpnPeers(_) => "ListVpnPeers",
             ResponseKind::SecurityStatus(_) => "SecurityStatus",
             ResponseKind::Logs(_) => "Logs",
             ResponseKind::LogFilter(_) => "LogFilter",

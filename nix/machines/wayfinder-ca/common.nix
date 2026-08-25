@@ -10,9 +10,11 @@
 # to false and the unit runs with an empty capability set under systemd's
 # sandbox (see `nix/modules/wayfinder.nix`).
 #
-# Mesh links arrive with design 08 (internet links over a Headscale-coordinated
-# tunnel); until an encrypted internet link exists there is nothing for a link
-# on this host to carry.
+# It does, however, run the *tunnel* control plane beside the mesh one — see
+# `nix/modules/wayfinder-headscale.nix` and design 08. That is the same
+# argument as the CA itself: this is the one box with a stable public address,
+# so it is where two CGNAT'd nodes have to meet. It still carries no mesh link
+# of its own; it coordinates the tunnel that other nodes' links run over.
 #
 # **The four files under `secretsDir` are not in this repo and not in the Nix
 # store.** They are minted offline and copied to the box before first start —
@@ -64,6 +66,22 @@ let
   # password at sign-in — a real trust decision, not a free lunch. See
   # `docs/design/implemented/11-cloud-auth-provider.md`.
   dashboardHostname = "dash.wayfndr.dev";
+
+  # Public name nodes register their tunnel against. A separate record from the
+  # CA's own `ca.wayfndr.dev` even though both resolve to this instance: the two
+  # planes are independently movable, and a node's `--login-server` is baked
+  # into its tunnel registration in a way the management endpoint is not.
+  #
+  # DNS-only, never proxied — the same constraint as the management API, for two
+  # stronger reasons. STUN is UDP, which no HTTP proxy carries at all; and the
+  # name has to resolve to *this* host for the ACME challenge below to be
+  # answerable.
+  vpnHostname = "vpn.wayfndr.dev";
+
+  # The dashboard's loopback port, moved off 8080 because Headscale is there.
+  # Nothing outside this file sees it: the dashboard is reached through the
+  # Cloudflare Tunnel below, whose ingress is the one thing that names it.
+  dashboardPort = 8081;
 in
 {
   imports = [
@@ -75,6 +93,7 @@ in
 
     web = {
       enable = true;
+      listen = "127.0.0.1:${toString dashboardPort}";
       provider = "127.0.0.1:7700";
       allowedHosts = [ dashboardHostname ];
       inherit nodeKey;
@@ -126,6 +145,26 @@ in
         # (`wayfinder-ctl csr approve`, or the dashboard's Security tab).
         auto_approve = false;
 
+        # VPN coordination, pointed at the Headscale started below.
+        #
+        # The API is reached over loopback (nothing crosses a network to get
+        # there) while nodes are handed the public name, because a
+        # `--login-server` of `127.0.0.1` is one every node would resolve to
+        # itself. `login_server` is what makes those two able to differ.
+        #
+        # The key is minted on this box by
+        # `wayfinder-headscale-apikey.service`, not carried here with the mesh
+        # trust material: it can only be issued by a running Headscale, and
+        # this host can reissue it at will.
+        headscale = {
+          # One URL for both halves: under TLS the certificate names the host,
+          # so the loopback call and the node's `--login-server` have to be the
+          # same string. The module resolves that name to 127.0.0.1 on this box
+          # so the request does not depend on Oracle hairpinning it back.
+          api_url = config.services.wayfinder-headscale.endpoint;
+          api_key_path = config.services.wayfinder-headscale.apiKey.path;
+        };
+
         # The issued-certificate log, its revocation status, and held CSRs.
         # Without this a restart forgets every revocation and every pending
         # approval, and the impersonation guard starts empty — so it is not
@@ -138,6 +177,33 @@ in
       # identity installed by SetAuth), so they survive a restart.
       runtime_state_path = "/var/lib/wayfinder/settings.json";
     };
+  };
+
+  # The tunnel control plane. Nodes register against `vpnHostname`, and the
+  # DERP relay they fall back to when hole-punching fails is the one this box
+  # runs — not Tailscale Inc.'s, which is what "isolated mesh" has to mean if
+  # it means anything. The security list in `infra/oracle/main.tf` carries the
+  # two matching rules: TCP/443 for the API and the relay, UDP/3478 for STUN.
+  services.wayfinder-headscale = {
+    enable = true;
+    domain = vpnHostname;
+
+    # Real TLS, from Let's Encrypt, on 443. Not a hardening preference: a
+    # `tailscaled` refuses a plaintext DERP connection and takes STUN probing
+    # down with it, so a plain-HTTP coordination server registers nodes
+    # perfectly and then leaves them unable to reach each other. The
+    # TLS-ALPN-01 challenge is answered on the 443 listener headscale already
+    # has, so the security list needs no HTTP rule — see
+    # `nix/modules/wayfinder-headscale.nix` and `nix/tests/vpn-data-plane.nix`.
+    tls.mode = "acme";
+
+    # Break-glass only: loopback-bound, reached with
+    # `ssh -L 3000:localhost:3000 root@<ca>` and then http://localhost:3000/admin.
+    # Sign in by pasting a throwaway Headscale API key
+    # (`headscale apikeys create --expiration 24h` over that same SSH session).
+    # The day-to-day surface is the dashboard's VPN panel; this is for the day
+    # wayfinder-server is down and the tunnel is not.
+    headplane.enable = true;
   };
 
   # The provisioned secrets live outside `/var/lib/wayfinder` (which the unit
@@ -168,7 +234,7 @@ in
       # `infra/oracle/tunnel.tf`) and copied up by `scripts/wayfinder-ca.sh
       # secrets`.
       credentialsFile = "${secretsDir}/cloudflared.json";
-      ingress.${dashboardHostname} = "http://127.0.0.1:8080";
+      ingress.${dashboardHostname} = "http://127.0.0.1:${toString dashboardPort}";
       # Anything arriving for a name this tunnel was not built for is
       # refused here rather than being quietly handed to the dashboard.
       default = "http_status:404";

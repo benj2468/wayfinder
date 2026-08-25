@@ -8,6 +8,7 @@ use zerocopy::byteorder::network_endian::U32;
 use zerocopy::byteorder::network_endian::U64;
 
 use crate::cert::CERT_FLAG_ADMIN;
+use crate::cert::CERT_FLAG_MEMBER;
 use crate::cert::CERT_FLAG_USER;
 use crate::cert::CERT_FLAG_VIEWER;
 use crate::cert::CERT_VERSION;
@@ -53,6 +54,11 @@ impl Authority {
     /// Issue a membership certificate binding `mac` to the given Ed25519 and
     /// X25519 public keys, valid over `[not_before, not_after]` (unix seconds).
     /// Keep the window short — expiry is the passive revocation mechanism.
+    ///
+    /// Carries [`CERT_FLAG_MEMBER`] and no management capability: this is the
+    /// credential of a node that routes.  The bit is set here rather than left
+    /// to a reader inferring device-ness from the absence of the other flags —
+    /// see [`CERT_FLAG_MEMBER`] for why that direction matters.
     pub fn issue_cert(
         &self,
         mac: Mac,
@@ -61,7 +67,14 @@ impl Authority {
         not_before: u64,
         not_after: u64,
     ) -> MembershipCert {
-        self.issue_with_flags(mac, ed_pubkey, x_pubkey, not_before, not_after, 0)
+        self.issue_with_flags(
+            mac,
+            ed_pubkey,
+            x_pubkey,
+            not_before,
+            not_after,
+            CERT_FLAG_MEMBER,
+        )
     }
 
     /// Issue a **user session certificate**: a person's credential rather than
@@ -99,7 +112,12 @@ impl Authority {
     /// Build and sign a membership cert with the given `flags`, the shared body
     /// behind [`issue_cert`](Self::issue_cert),
     /// [`issue_user_cert`](Self::issue_user_cert).
-    fn issue_with_flags(
+    ///
+    /// `pub(crate)` rather than private so the certificate tests can mint the
+    /// flag combinations no production path issues — in particular a
+    /// capability-less cert standing in for one issued before
+    /// [`CERT_FLAG_MEMBER`] existed.
+    pub(crate) fn issue_with_flags(
         &self,
         mac: Mac,
         ed_pubkey: [u8; 32],

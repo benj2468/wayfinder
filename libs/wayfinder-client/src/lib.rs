@@ -56,6 +56,8 @@ use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
 use wayfinder_protos::wayfinder::v1alpha::GetThroughputRequest;
 use wayfinder_protos::wayfinder::v1alpha::GetTrustAnchorRequest;
 use wayfinder_protos::wayfinder::v1alpha::GetTrustAnchorResponse;
+use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentRequest;
+use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentResponse;
 use wayfinder_protos::wayfinder::v1alpha::KeepAliveTable;
 use wayfinder_protos::wayfinder::v1alpha::LinkFeatures;
 use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesTable;
@@ -66,6 +68,8 @@ use wayfinder_protos::wayfinder::v1alpha::ListPendingCsrsRequest;
 use wayfinder_protos::wayfinder::v1alpha::ListPendingCsrsResponse;
 use wayfinder_protos::wayfinder::v1alpha::ListUsersRequest;
 use wayfinder_protos::wayfinder::v1alpha::ListUsersResponse;
+use wayfinder_protos::wayfinder::v1alpha::ListVpnPeersRequest;
+use wayfinder_protos::wayfinder::v1alpha::ListVpnPeersResponse;
 use wayfinder_protos::wayfinder::v1alpha::LogRecords;
 use wayfinder_protos::wayfinder::v1alpha::NodeInfo;
 use wayfinder_protos::wayfinder::v1alpha::NodeMetrics;
@@ -74,6 +78,7 @@ use wayfinder_protos::wayfinder::v1alpha::RemoveUserRequest;
 use wayfinder_protos::wayfinder::v1alpha::ResolveRouteRequest;
 use wayfinder_protos::wayfinder::v1alpha::ResolveRouteResponse;
 use wayfinder_protos::wayfinder::v1alpha::RevokeNodeRequest;
+use wayfinder_protos::wayfinder::v1alpha::RevokeVpnPeerRequest;
 use wayfinder_protos::wayfinder::v1alpha::RoutingTable;
 use wayfinder_protos::wayfinder::v1alpha::RuntimeConfig;
 use wayfinder_protos::wayfinder::v1alpha::SetAuthRequest;
@@ -781,6 +786,55 @@ impl Client {
         }
     }
 
+    /// Provider mode: ask for this device's VPN join credential.
+    ///
+    /// Answered only for a connection carrying *this device's own* membership
+    /// certificate — the request has no fields because the identity it mints
+    /// for is the connection's. A management session (an operator's login, or
+    /// the node's own key) is refused: neither is a device the coordination
+    /// server can register.
+    ///
+    /// A provider with no VPN configured answers with an error saying so, which
+    /// is the expected result on every deployment that does not run a tunnel —
+    /// callers should treat it as "no VPN here", not as a failure.
+    pub async fn get_vpn_enrollment(&mut self) -> anyhow::Result<GetVpnEnrollmentResponse> {
+        match self
+            .request(RequestKind::GetVpnEnrollment(GetVpnEnrollmentRequest {}))
+            .await?
+        {
+            ResponseKind::VpnEnrollment(resp) => Ok(resp),
+            other => Err(unexpected("GetVpnEnrollment", &other)),
+        }
+    }
+
+    /// Provider mode: list the VPN peers the coordination server knows.
+    pub async fn list_vpn_peers(&mut self) -> anyhow::Result<ListVpnPeersResponse> {
+        match self
+            .request(RequestKind::ListVpnPeers(ListVpnPeersRequest {}))
+            .await?
+        {
+            ResponseKind::ListVpnPeers(resp) => Ok(resp),
+            other => Err(unexpected("ListVpnPeers", &other)),
+        }
+    }
+
+    /// Provider mode: remove a node's VPN registration, leaving its mesh
+    /// membership alone.
+    ///
+    /// Idempotent: a MAC with no registration succeeds. This is the retry for a
+    /// `revoke_node` whose VPN half failed.
+    pub async fn revoke_vpn_peer(&mut self, node_mac: &[u8]) -> anyhow::Result<()> {
+        match self
+            .request(RequestKind::RevokeVpnPeer(RevokeVpnPeerRequest {
+                node_mac: node_mac.to_vec(),
+            }))
+            .await?
+        {
+            ResponseKind::Empty(_) => Ok(()),
+            other => Err(unexpected("RevokeVpnPeer", &other)),
+        }
+    }
+
     /// Provider mode: list the certificates this provider has issued.
     pub async fn list_certs(&mut self) -> anyhow::Result<ListCertsResponse> {
         match self
@@ -966,6 +1020,8 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
         ResponseKind::AuthenticateUser(_) => "AuthenticateUser",
         ResponseKind::ListUsers(_) => "ListUsers",
         ResponseKind::CreateUser(_) => "CreateUser",
+        ResponseKind::VpnEnrollment(_) => "VpnEnrollment",
+        ResponseKind::ListVpnPeers(_) => "ListVpnPeers",
     };
     anyhow!("expected {want} response, got {got}")
 }

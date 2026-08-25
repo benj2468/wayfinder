@@ -335,8 +335,15 @@ async fn a_viewer_session_can_poll_and_cannot_mutate() {
         "and the dashboard is told, so it offers no control the node would refuse"
     );
 
+    // The poll itself is the assertion. A viewer's connection is refused the
+    // admin-gated queries, so a poll that asked for one anyway would fail here
+    // whole — every table lost to the one the node was never going to serve.
     let snapshot: NodeSnapshot = json(call(&app, "snapshot", "since_seq=0", Some(&id)).await).await;
     assert_eq!(snapshot.routing.entries.len(), 1);
+    assert!(
+        snapshot.vpn_peers.is_none(),
+        "and the admin-gated table is simply absent, not asked for and swallowed"
+    );
 
     let response = call(
         &app,

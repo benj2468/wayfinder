@@ -13,6 +13,7 @@ use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesTable;
 use wayfinder_protos::wayfinder::v1alpha::LinkQualityTable;
 use wayfinder_protos::wayfinder::v1alpha::ListCertsResponse;
 use wayfinder_protos::wayfinder::v1alpha::ListPendingCsrsResponse;
+use wayfinder_protos::wayfinder::v1alpha::ListVpnPeersResponse;
 use wayfinder_protos::wayfinder::v1alpha::LogLevel;
 use wayfinder_protos::wayfinder::v1alpha::LogRecords;
 use wayfinder_protos::wayfinder::v1alpha::NodeInfo;
@@ -307,6 +308,45 @@ pub fn security(v: &GetSecurityStatusResponse, fmt: OutputFormat) -> anyhow::Res
                     "-".to_string()
                 },
                 if n.revoked { "revoked" } else { "active" },
+            ));
+        }
+        out
+    })
+}
+
+/// Render the provider's [`ListVpnPeersResponse`] (registered VPN peers).
+///
+/// A peer whose hostname is not one wayfinder registered shows its raw hostname
+/// in the MAC column rather than being hidden: it is still a peer with tunnel
+/// reachability, and an operator auditing who can reach the network needs to
+/// see it precisely *because* it does not correspond to an enrolled node.
+pub fn vpn_peers(v: &ListVpnPeersResponse, fmt: OutputFormat) -> anyhow::Result<String> {
+    render(v, fmt, |v| {
+        if v.peers.is_empty() {
+            return "no VPN peers registered".to_string();
+        }
+        let mut out =
+            String::from("NODE               ADDRESS          STATE    LAST_SEEN    KEY_EXPIRY");
+        for p in &v.peers {
+            out.push_str(&format!(
+                "\n{:<18} {:<16} {:<8} {:>10} {:>12}",
+                if p.node_mac.is_empty() {
+                    format!("({})", p.raw_hostname)
+                } else {
+                    format_mac(&p.node_mac)
+                },
+                p.tailscale_ip,
+                if p.online { "online" } else { "offline" },
+                if p.last_seen_unix == 0 {
+                    "never".to_string()
+                } else {
+                    p.last_seen_unix.to_string()
+                },
+                if p.key_expiry_unix == 0 {
+                    "-".to_string()
+                } else {
+                    p.key_expiry_unix.to_string()
+                },
             ));
         }
         out

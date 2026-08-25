@@ -177,6 +177,7 @@ fn open(state: &Path) -> anyhow::Result<CertAuthority> {
         allow_unbounded_cert_ttl: false,
         pending_ttl_secs: 3600,
         state_path: Some(state.display().to_string()),
+        headscale: None,
     };
     CertAuthority::from_config(&[0u8; 32], &cfg)
         .map_err(anyhow::Error::msg)

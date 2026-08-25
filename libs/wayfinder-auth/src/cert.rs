@@ -61,6 +61,24 @@ pub const CERT_FLAG_USER: u8 = 0x02;
 /// this bit to read.
 pub const CERT_FLAG_VIEWER: u8 = 0x04;
 
+/// [`MembershipCert::flags`] bit marking the holder as an **enrolled mesh
+/// device**: a node that routes, as distinct from a person's session
+/// ([`CERT_FLAG_USER`]) and from a management capability
+/// ([`CERT_FLAG_ADMIN`]/[`CERT_FLAG_VIEWER`]).
+///
+/// Deliberately a signed bit rather than "a verified certificate carrying none
+/// of the other bits". Inferring device-ness from absence makes every
+/// unrecognised or malformed capability combination silently become a device,
+/// and it makes the meaning of a certificate depend on which bits the *reader*
+/// happens to know about — so a cert issued by a newer CA would change tier
+/// under an older verifier. Issued explicitly, the classification is the
+/// issuer's decision and travels inside the signature.
+///
+/// It grants no management capability. What it earns is the management API's
+/// member tier, which is exactly one request wide — see
+/// `wayfinder_server::MgmtAccess::GrantedMember`.
+pub const CERT_FLAG_MEMBER: u8 = 0x08;
+
 /// Domain-separation label folded into the fingerprint hash, so it can never
 /// collide with another `Blake2s256` use over the same or overlapping bytes
 /// elsewhere in the crate (e.g. [`crate::key::Keypair::pairwise_key`]).
@@ -81,9 +99,13 @@ pub struct MembershipCert {
     /// Layout/version marker; must equal [`CERT_VERSION`].
     pub version: u8,
     /// Capability bits, part of the signed body: [`CERT_FLAG_ADMIN`] (full
-    /// management), [`CERT_FLAG_VIEWER`] (read-only management) and
-    /// [`CERT_FLAG_USER`] (the holder is a person's session, not a device).
+    /// management), [`CERT_FLAG_VIEWER`] (read-only management),
+    /// [`CERT_FLAG_USER`] (the holder is a person's session, not a device) and
+    /// [`CERT_FLAG_MEMBER`] (the holder is an enrolled device that routes).
     /// The remaining bits are reserved and sent as 0.
+    ///
+    /// Unknown bits are masked off on verification, never rejected, so a cert
+    /// issued by a newer CA still verifies against an older node's firmware.
     pub flags: u8,
     /// The mesh this cert grants membership to (must match the verifier's
     /// trust anchor).  Network byte order.
@@ -183,6 +205,12 @@ pub struct VerifiedCert {
     /// lets an operator's credential be told apart from a node's in
     /// `ListCerts` and the security tab.
     pub user: bool,
+    /// Whether the cert marks an enrolled mesh device ([`CERT_FLAG_MEMBER`]).
+    /// Same trust story as [`admin`](Self::admin).  Mutually exclusive with
+    /// [`user`](Self::user) in everything the CA issues, and false on a
+    /// certificate predating the bit — which is why nothing infers it from the
+    /// absence of the others.
+    pub member: bool,
 }
 
 impl TrustAnchor {
@@ -252,6 +280,7 @@ impl TrustAnchor {
             admin: cert.flags & CERT_FLAG_ADMIN != 0,
             viewer: cert.flags & CERT_FLAG_VIEWER != 0,
             user: cert.flags & CERT_FLAG_USER != 0,
+            member: cert.flags & CERT_FLAG_MEMBER != 0,
         })
     }
 }
@@ -274,6 +303,71 @@ mod tests {
         assert_eq!(TrustAnchor::from_bytes(&bytes), Some(anchor));
         // Too-short input is rejected rather than panicking.
         assert_eq!(TrustAnchor::from_bytes(&bytes[..10]), None);
+    }
+
+    /// A device's membership certificate carries the *member* capability as a
+    /// signed bit — not as the absence of every other bit.  This is what the
+    /// management API's member tier is granted on: an enrolled node proving
+    /// possession of the key the CA certified, and nothing more.  A cert with
+    /// no bits at all is a cert with no capability, which must stay
+    /// distinguishable from a device's.
+    #[test]
+    fn issued_member_cert_carries_the_member_capability() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let node = Keypair::from_seed(&[2u8; 32]);
+        let cert = authority.issue_cert(mac(5), node.ed_pubkey(), node.x_pubkey(), 100, 200);
+
+        let verified = authority.trust_anchor().verify_cert(&cert, 150).unwrap();
+        assert!(verified.member, "an enrolled device is a member");
+        assert!(!verified.admin);
+        assert!(!verified.viewer);
+        assert!(!verified.user);
+    }
+
+    /// A person's session certificate is *not* a member: it is a credential for
+    /// an operator, not a device that routes, so it must not earn the member
+    /// tier (and so cannot mint a VPN credential for a device identity it does
+    /// not have).
+    #[test]
+    fn issued_user_cert_is_not_a_member() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let session = Keypair::from_seed(&[3u8; 32]);
+
+        for admin in [true, false] {
+            let cert = authority.issue_user_cert(
+                mac(6),
+                session.ed_pubkey(),
+                session.x_pubkey(),
+                100,
+                200,
+                admin,
+            );
+            let verified = authority.trust_anchor().verify_cert(&cert, 150).unwrap();
+            assert!(!verified.member, "a user session is not a device");
+            assert!(verified.user);
+            assert_eq!(verified.admin, admin);
+            assert_eq!(verified.viewer, !admin);
+        }
+    }
+
+    /// A certificate predating the member bit (`flags == 0`) still verifies —
+    /// unknown/absent capability bits are masked, never rejected — and simply
+    /// carries no capability.  This is what keeps the new bit from being a flag
+    /// day for already-issued certs and already-flashed verifiers.
+    #[test]
+    fn cert_without_the_member_bit_verifies_without_capability() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let node = Keypair::from_seed(&[2u8; 32]);
+        // Signed with no flags at all, standing in for a cert issued before the
+        // member bit existed.
+        let legacy =
+            authority.issue_with_flags(mac(5), node.ed_pubkey(), node.x_pubkey(), 100, 200, 0);
+
+        let verified = authority.trust_anchor().verify_cert(&legacy, 150).unwrap();
+        assert!(!verified.member);
+        assert!(!verified.admin);
+        assert!(!verified.viewer);
+        assert!(!verified.user);
     }
 
     /// A cert issued by an authority verifies against that authority's anchor

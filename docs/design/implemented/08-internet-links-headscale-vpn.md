@@ -1,9 +1,62 @@
 # Design: Internet-connected mesh links via a Headscale-managed tunnel, managed from the wayfinder UI
 
-**Status:** Proposed. Grew out of a design discussion about deploying a
-wayfinder node in the cloud as an auth provider/CA, and how two
-Starlink-connected boxes (no stable public IP, behind CGNAT) reach each
-other. Not yet reviewed or sequenced against other work.
+**Status:** Implemented and deployed. The control plane, the CLI, the dashboard
+panel and the Nix modules are in; `nix/tests/ca-provider.nix` exercises the
+control-plane flow against a real Headscale in a VM, and
+`nix/tests/vpn-data-plane.nix` covers the data plane with real `tailscaled`
+clients in containers. The cloud CA (`nix/machines/wayfinder-ca`) runs the
+Headscale and Headplane this design calls for.
+
+What no test covers is two hosts behind *real* NAT, which is where hole-punching
+either happens or silently degrades to relaying.
+
+> **Five corrections to this document, found while implementing it.** Each was
+> a specific claim below that did not survive contact with the code or with
+> Headscale, and each is annotated inline where it appears:
+>
+> 1. **§3.2's authorization tier did not exist.** `GrantedSelfKey` is granted
+>    when the handshake key is the *node's own* key, not when it matches a
+>    verified `MembershipCert` — so an enrolled node presenting its own
+>    certificate landed on `Denied(NoCapability)` and had its connection closed
+>    before it could send a request. Fixed by adding `CERT_FLAG_MEMBER` to the
+>    certificate and a `GrantedMember` tier that is exactly one request wide.
+>    The bit is set explicitly rather than inferred from the absence of the
+>    management bits — see §3.2.
+> 2. **§3.3/§10 put the handlers in `RouterAdapter`. They cannot go there.**
+>    The router loop is never told *who* is calling (`QueryTx` carries a
+>    request and a reply channel, nothing else), and `GetVpnEnrollment` has no
+>    fields precisely because the identity it mints for is the connection's.
+>    The adapter is also synchronous and runs on the task that emits OGMs, so
+>    awaiting an HTTP round-trip there would stall routing. They live in the
+>    transport instead.
+> 3. **Headscale scopes a preauth key to a numeric user id, not a name.**
+>    §3.2's single `CreatePreAuthKey` call is really find-or-create-user
+>    followed by the mint. This turned out to be an improvement: giving each
+>    node its own Headscale user named by its MAC answers §9.2's open question
+>    about correlation robustness, since a user is not the display name an
+>    operator renames.
+> 4. **Headscale refuses to start with an empty DERP map**, so §3.1's embedded
+>    relay is not merely preferable to the public one — it is what makes
+>    dropping the public map possible at all.
+> 5. **`reqwest` under `rustls-no-provider` panics without a process-wide
+>    crypto provider**, which `tls.rs` never installs (it names providers
+>    explicitly per config). Uncaught, this would have surfaced as a panic at
+>    the first node's enrollment rather than at the CA's startup.
+> 6. **§3.1 does not say Headscale must be served over TLS. It must.** Not as
+>    hardening — `tailscaled` refuses a plaintext DERP connection outright,
+>    whatever scheme headscale advertises, and its `NetInfo`/STUN probing
+>    depends on that handshake succeeding *at all*. So a plain-HTTP
+>    coordination server registers every node correctly and then leaves them
+>    unable to reach each other, including two peers on the same LAN. Nothing
+>    reachable with `curl` shows it, which is why a control-plane test
+>    (`ca-provider.nix`) passes over plain HTTP while the deployment would not
+>    work; `vpn-data-plane.nix` is what found it. `tls.mode` in
+>    `nix/modules/wayfinder-headscale.nix` now defaults to Let's Encrypt, and
+>    plain HTTP is a thing a configuration has to ask for and gets warned about.
+
+Grew out of a design discussion about deploying a wayfinder node in the cloud
+as an auth provider/CA, and how two Starlink-connected boxes (no stable public
+IP, behind CGNAT) reach each other.
 
 > **Update:** the CA half of that discussion has since shipped on its own —
 > see `docs/design/implemented/11-cloud-auth-provider.md`. There is now a
@@ -128,7 +181,7 @@ assigned it (`100.64.0.0/10` range) — no wayfinder config schema change.
 
 ### 3.2 Enrollment: one CLI command, two RPCs, two different trust tiers
 
-Today's flow (`bins/wayfinder-ctl/src/lib.rs:775-849`, `poll_enroll`) sends
+Today's flow (`bins/wayfinder-ctl/src/lib.rs`, `poll_enroll`) sends
 `SubmitCsrRequest{node_mac, ed_pubkey, x_pubkey, enrollment_token}`
 (`wayfinder.proto:576-593`) and gets back `SubmitCsrResponse::CsrIssued{cert,
 trust_anchor}` (`wayfinder.proto:1357-1366`) on success.
@@ -158,20 +211,65 @@ message GetVpnEnrollmentResponse {
 }
 ```
 
-Gated at `GrantedSelfKey` — the same tier `SetAuth` already uses
-(`authz.rs:495-513`) — which `decide_access` (`authz.rs:127-161`) only grants
-when the *TLS handshake key itself* matches a verified, non-revoked
-`MembershipCert`. That's proof of possession of the issued identity's private
-key over an authenticated connection, not a self-asserted claim — a
-materially different, and much stronger, gate than `SubmitCsr`'s.
+> **Correction 1 (as implemented).** This paragraph named the wrong tier, and
+> the tier it described did not exist. `GrantedSelfKey` is granted when the
+> handshake key is the *node's own* key — the operator holding the CA's seed —
+> not when it matches a verified `MembershipCert`. A device certificate carries
+> neither the admin nor the viewer bit, so an enrolling node presenting it was
+> `Denied(NoCapability)` and had its connection closed before it could send
+> anything.
+>
+> What shipped instead: a new `CERT_FLAG_MEMBER` bit on the certificate, set by
+> `Authority::issue_cert` (the device path) and *not* by `issue_user_cert` (the
+> operator path), and a `GrantedMember` tier earned by that bit. The bit is
+> explicit rather than inferred from "carries none of the other bits" — an
+> inferred tier would silently widen every time a capability was added, and
+> would make a certificate's meaning depend on which bits the reader happens to
+> know about. Certificates issued before the bit existed keep landing on
+> `Denied(NoCapability)`, so this was additive rather than a flag day.
+>
+> `permits` gates this request *ahead of* the tier match, and refuses it to the
+> full grants: `GetVpnEnrollment` mints a credential for the caller's device
+> identity, and neither an operator's session certificate nor the node's own
+> seed is a device. That inverts the previous invariant that a full grant may
+> invoke everything, which is the point — it is what makes the two gates below
+> genuinely independent rather than one gate producing two artifacts.
 
-Server-side, this handler (not the CSR-issuance path) makes the one new
-outbound call: if Headscale integration is configured (new
-`provider.headscale.{api_url, api_key_file}` config, alongside the existing
-`enrollment_token`/`auto_approve` fields at `authority.rs:79-116`), call
-Headscale's `CreatePreAuthKey` API (REST, not gRPC — see §9) for a
-single-use key tagged e.g. `tag:wayfinder-node`, and return it. No new
-persisted state on the CA side for this step.
+Gated at the **member tier** (`MgmtAccess::GrantedMember`), which
+`decide_access` grants only when the *TLS handshake key itself* matches a
+verified, non-revoked `MembershipCert` carrying `CERT_FLAG_MEMBER`. That's
+proof of possession of the issued identity's private key over an authenticated
+connection, not a self-asserted claim — a materially different, and much
+stronger, gate than `SubmitCsr`'s.
+
+Server-side, this handler (not the CSR-issuance path) makes the new outbound
+calls: if Headscale integration is configured (`provider.headscale.{api_url,
+api_key_path, login_server, node_tag, preauth_ttl_secs}`, alongside the
+existing `enrollment_token`/`auto_approve` fields), mint a single-use key
+tagged `tag:wayfinder-node` and return it. No new persisted state on the CA
+side for this step.
+
+> **Correction 3 (as implemented).** Headscale scopes every preauth key to a
+> *user*, identified by a numeric id — passing a name is rejected outright
+> (`invalid value for uint64 field user`). So this is two calls, not one:
+> find-or-create a Headscale user named by the node's MAC as hex, then mint the
+> key against its id. Losing the find-or-create race is treated as success by
+> re-reading, since both callers wanted the user to exist.
+>
+> This is a better answer to §9.2 than the hostname join this document
+> proposed. A hostname is a display name an operator can rename in Headscale's
+> own UI; the owning user is not, so correlation and revocation target the user
+> and fall back to the hostname only for peers registered by hand — which are
+> listed rather than hidden, since a peer with tunnel reachability and no mesh
+> identity behind it is exactly what an audit needs to surface.
+>
+> **Correction 2 (as implemented).** The handler is in the management
+> *transport*, not `RouterAdapter`. Two independent reasons: the router loop is
+> never told which peer is calling — `QueryTx` carries a request and a reply
+> channel and nothing else, which is also *why* `GetVpnEnrollmentRequest` can
+> have no fields — and the adapter is synchronous, running on the same task
+> that emits OGMs and forwards frames, so awaiting an HTTP round-trip there
+> would stall routing for the length of the coordination server's timeout.
 
 Client-side, `wayfinderctl enroll` still does this as one command, just as
 two sequential connections: after `SubmitCsr` returns `CsrIssued` and the
@@ -180,12 +278,16 @@ freshly-issued identity as the TLS client key, which is what earns
 `GrantedSelfKey` — calls `GetVpnEnrollment`, and shells out to:
 
 ```
-tailscale up --login-server=<vpn_login_server> --authkey=<vpn_preauth_key> \
-             --hostname=<node_mac as hex>
+tailscale up --login-server=<vpn_login_server> --authkey=<vpn_preauth_key>
 ```
 
-The `--hostname` choice matters: it's the correlation key used in §3.3 instead
-of a new stored mapping table.
+> **Correction 3, continued.** As shipped, this does *not* pass `--hostname`.
+> Correlation instead runs through the Headscale *user* each node registers
+> under (see Correction 3 above) — the preauth key mints the user
+> find-or-created for this MAC, so the node lands under that user's ownership
+> without needing to also name itself on the command line. `§3.3`'s
+> `ListVpnPeers`/`RevokeVpnPeer` join against that owning user, falling back to
+> the hostname only for a peer with no owning user.
 
 If Headscale integration isn't configured on a given CA deployment,
 `GetVpnEnrollment` isn't called (or returns an empty/error result the CLI
@@ -195,13 +297,16 @@ today — VPN join is additive, not required.
 ### 3.3 Management surface: wayfinder proxies Headscale, doesn't replace it
 
 Two new provider-mode RPCs on `WayfinderDataProvider`, authorized the same way
-`SetAuth` is (`GrantedAdmin`/`GrantedSelfKey`, `authz.rs:495-513`):
+`SetAuth` is (`GrantedAdmin`/`GrantedSelfKey`, `authz.rs`'s `permits` — the
+`MgmtAccess::GrantedAdmin | MgmtAccess::GrantedSelfKey => true` arm):
 
 ```protobuf
+// illustrative — see the real message in wayfinder.proto, which also carries
+// raw_hostname
 message ListVpnPeersRequest {}
 message ListVpnPeersResponse { repeated VpnPeerStatus peers = 1; }
 message VpnPeerStatus {
-  bytes node_mac = 1;          // joined against IssuedCertData.node_mac by hostname match
+  bytes node_mac = 1;          // joined against the owning Headscale user, falling back to hostname
   string tailscale_ip = 2;
   bool online = 3;
   int64 last_seen_unix = 4;
@@ -212,17 +317,33 @@ message RevokeVpnPeerRequest { bytes node_mac = 1; }
 message RevokeVpnPeerResponse {}
 ```
 
-`RouterAdapter` (`libs/wayfinder-server/src/adapter.rs`, following the
-`set_auth` handler shape at `adapter.rs:585-651+`) implements these by calling
-Headscale's `ListNodes`/`DeleteNode` (or `ExpireNode`) REST endpoints and
-matching on the `--hostname` set during enrollment (§3.2) — no new mapping
-table, since the wayfinder MAC *is* the Tailscale hostname.
+> **Corrections 2 and 3 (as implemented).** These live in the management
+> transport, not `RouterAdapter` — see §3.2. And revocation deletes the node's
+> Headscale *user* rather than its nodes: that takes the registrations **and
+> any minted-but-unspent preauth keys** with it, so a revocation racing an
+> enrollment cannot leave a usable credential behind for a node that was just
+> removed. It is idempotent by contract, because the retry path for a
+> half-completed revoke has to converge.
 
-**Revocation is one action in the UI that does two things.** The existing
-cert-revocation path (wherever `IssuedCertData.revoked` is flipped — exact
-call site to be located by the implementer, see §9) is extended to also call
-`RevokeVpnPeer`'s Headscale-side logic. An operator clicks "revoke" once in
-`wayfinder-web`; both the mesh membership and the VPN registration go away.
+The transport implements these by calling Headscale's `ListNodes` /
+`DeleteUser` REST endpoints and matching on the owning user (§3.2) — no new
+mapping table, since the wayfinder MAC *is* that user's name.
+
+**Revocation is one action in the UI that does two things.** A `RevokeNode`
+that the router answers successfully is followed, in the transport, by the
+Headscale-side removal. An operator clicks "revoke" once in `wayfinder-web`;
+both the mesh membership and the VPN registration go away.
+
+> **As implemented (answering §9.4).** Ordered mesh-first, because mesh
+> membership is what grants routing trust: a failure there leaves the tunnel
+> alone rather than stranding a node that is still a member. If the mesh half
+> succeeds and the VPN half fails, the response is an **error naming both
+> outcomes**, not a success — the node can no longer route but can still reach
+> the tunnel, and an operator who is told "revoked" would never go looking.
+> `RevokeVpnPeer` is the retry, exposed as `wayfinderctl vpn revoke` and as the
+> dashboard's per-peer *Remove*, and it is idempotent so the retry converges.
+> Enforced server-side rather than by the client, so a client that forgets the
+> second call cannot produce a silent partial revoke.
 
 `bins/wayfinder-web` gets a new panel (likely alongside the existing
 Security-tab area, given that's where enrollment/cert UI already lives per
@@ -239,7 +360,8 @@ Security-tab area, given that's where enrollment/cert UI already lives per
 - **No NAT-traversal/relay logic.** Headscale's DERP relay + the standard
   Tailscale STUN-based hole-punching handle this entirely outside wayfinder.
 - **No new persisted CA state.** `ListVpnPeers`/`RevokeVpnPeer` are computed
-  on demand from Headscale's own node list, joined by hostname; nothing new is
+  on demand from Headscale's own node list, joined by the owning Headscale
+  user (falling back to hostname for a hand-registered peer); nothing new is
   added to `CaLog`/`Persisted` storage.
 
 ## 4. Correctness / edge cases
@@ -353,7 +475,41 @@ list).
   `MembershipCert` validity — disabling signing there would defeat live
   revocation checking for that link, not skip a redundant check.
 
-## 9. Open decisions for the implementing session
+## 9. Open decisions — resolved
+
+> Answered during implementation; the original questions are kept below with
+> what each turned out to be.
+>
+> 1. **REST vs. gRPC.** REST, as recommended. Verified against Headscale
+>    0.29.3: `GET/POST /api/v1/user`, `DELETE /api/v1/user/{id}`,
+>    `POST /api/v1/preauthkey`, `GET /api/v1/node`. Two contract details the
+>    document did not anticipate — `user` is a uint64 id on input (a name is
+>    rejected outright), and ids come back as JSON *strings* per the protobuf
+>    JSON mapping.
+> 2. **Correlation robustness.** Resolved better than hostname, and by
+>    necessity: since Headscale scopes every key to a user, each node gets its
+>    own user named by its MAC. A user is not the display name an operator
+>    renames, so that is the primary join; the hostname is a fallback that
+>    keeps hand-registered peers *visible* rather than hidden, which is what an
+>    audit of "who can reach this network" needs.
+> 3. **The revocation call site.** Not `authority.rs` — the coupling is in the
+>    transport, after the router answers `RevokeNode` successfully. See §3.3.
+> 4. **Half-completed revoke UX.** Server-side, mesh-first, reported as an
+>    error naming both outcomes, with an idempotent retry. See §3.3.
+> 5. **Re-enrollment / hostname collision.** Find-or-create on the node's user
+>    makes a second enrollment collect the existing user and mint a fresh key,
+>    so re-enrolling the same MAC is normal rather than a collision. Losing the
+>    create race is treated as success by re-reading.
+> 6. **Headplane.** `services.headplane` exists in nixpkgs (0.7.0) and is
+>    wired in `nix/modules/wayfinder-headscale.nix`, bound to loopback and off
+>    by default — reaching it is an SSH tunnel, which is the friction that
+>    keeps it a fallback.
+> 7. **Does the cloud box need special-casing as a routing hub?** No, as
+>    believed. It takes a tunnel address like any other node and BATMAN-adv
+>    selects paths over it normally; nothing in the implementation special-cases
+>    it.
+
+## 9.1 The original questions
 
 1. **REST vs. gRPC against Headscale's API.** REST is recommended (§8) to
    avoid a new protobuf dependency, but confirm Headscale's REST API covers
@@ -387,22 +543,34 @@ list).
   `RevokeVpnPeerRequest/Response` messages and their
   `WayfinderRequest`/`WayfinderResponse` oneof cases (pattern at
   `wayfinder.proto:668` for `submit_csr`).
-- `libs/wayfinder-server/src/authority.rs` — new `provider.headscale.*`
-  config fields near `authority.rs:79-116`; locate and extend the existing
-  revoke path (§9.3). The CSR-issuance path itself is **not** touched — the
-  Headscale preauth-key mint call belongs in the new `GetVpnEnrollment`
-  handler below, not here (§3.2).
-- `libs/wayfinder-server/src/adapter.rs` — new `RouterAdapter` handlers for
-  `GetVpnEnrollment` (gated `GrantedSelfKey`, makes the Headscale
-  `CreatePreAuthKey` call), `ListVpnPeers`/`RevokeVpnPeer` (gated
-  `GrantedAdmin`/`GrantedSelfKey`), following the `set_auth` shape at
-  `adapter.rs:585-651+`; same authorization checks as `authz.rs:495-513`.
-- `bins/wayfinder-ctl/src/lib.rs:775-849` (`poll_enroll`) — after writing the
-  issued cert/trust_anchor locally, reconnect using that identity and call
-  `GetVpnEnrollment`; invoke `tailscale up` with its response.
+- `libs/wayfinder-auth/src/cert.rs`, `authority.rs` — **`CERT_FLAG_MEMBER`**
+  (0x08), set by `issue_cert` and not by `issue_user_cert`, surfaced as
+  `VerifiedCert::member`. Additive: unknown flag bits are masked rather than
+  rejected, so an older verifier still accepts a newer certificate.
+- `libs/wayfinder-server/src/authz.rs` — the `GrantedMember` tier and the
+  request-first gate in `permits`. **Security-critical file**; the change is
+  five non-test lines.
+- `libs/wayfinder-server/src/vpn.rs` — the `VpnCoordinator` trait and the
+  Headscale REST client behind it, plus the MAC↔user/hostname correlation.
+- `libs/wayfinder-server/src/transport.rs` — the three VPN handlers and the
+  mesh-revoke coupling, *here* rather than in `adapter.rs` (§3.2). The
+  connection's verified certificate is what a credential is minted against.
+- `libs/wayfinder/src/config.rs` — `HeadscaleConfig`, reachable as
+  `provider.headscale`. The config schema lives beside every other config
+  type; the client that consumes it lives in `wayfinder-server`.
+- `nix/tests/ca-provider.nix` — the whole flow against a real Headscale.
+- `bins/wayfinder-ctl/src/vpn.rs` and the `Enroll` arm of `lib.rs` — after
+  writing the issued cert/trust_anchor locally, reconnect *presenting that
+  identity* and call `GetVpnEnrollment`, then invoke `tailscale up`. A failure
+  in that second step is reported in the summary rather than failing the
+  command: the enrollment is already durable, and failing would discard it
+  over an optional step. `wayfinderctl vpn list|revoke|enrollment` are the
+  operator-side and retry entry points.
 - `bins/wayfinder-web` — new VPN-peers panel near the existing Security-tab
   area; a clearly-labeled fallback link to Headplane, not primary nav.
-- `nix/modules/wayfinder.nix` — new `services.wayfinder.vpn.headscale.*`
-  option group (API URL/key path) alongside the existing `ethernetAccess`
-  pattern; likely new sibling modules for colocating `headscale`/`headplane`
-  and enabling `tailscaled` on host nodes.
+- `nix/modules/wayfinder-headscale.nix` — colocates `headscale` (embedded DERP
+  only) and, off by default, loopback-bound `headplane`.
+  `nix/modules/wayfinder-tailscale.nix` — `tailscaled` on a host node, pinned
+  to the mesh's own login server. `nix/modules/wayfinder.nix` itself needs no
+  change: `services.wayfinder.config` is freeform, so `provider.headscale`
+  passes through to the binary that owns the schema.

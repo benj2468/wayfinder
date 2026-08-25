@@ -102,10 +102,45 @@ resource "oci_core_security_list" "ca" {
     }
   }
 
-  # A mesh link on this node needs UDP, and arrives with design 08
-  # (internet links over a Headscale-coordinated tunnel). Left here, commented,
-  # so that day is a one-line change with the port already agreed rather than a
-  # rediscovery of why the node cannot hear its peers.
+  # The tunnel control plane (design 08). Every node that joins the VPN
+  # registers here, and the embedded DERP relay serves its own traffic on this
+  # same port when two peers cannot reach each other directly.
+  #
+  # 443, and TLS is not optional on it: a `tailscaled` refuses a plaintext DERP
+  # connection and loses STUN probing with it. The certificate comes from Let's
+  # Encrypt, answered with the TLS-ALPN-01 challenge on this very listener —
+  # which is why there is no HTTP-01 rule on port 80 here.
+  ingress_security_rules {
+    protocol    = "6" # TCP
+    source      = "0.0.0.0/0"
+    description = "Headscale coordination + embedded DERP relay (TLS)"
+    tcp_options {
+      min = 443
+      max = 443
+    }
+  }
+
+  # STUN, for the embedded relay. This is the one rule that made the host
+  # choice: Cloudflare was rejected for design 11 precisely because it offers
+  # no UDP ingress, which would have left every tunnel relaying through this
+  # box instead of hole-punching past the CGNAT it exists to defeat.
+  #
+  # Losing this rule does not break connectivity — it degrades it, silently and
+  # only under load. Nothing reports it but a latency measurement.
+  ingress_security_rules {
+    protocol    = "17" # UDP
+    source      = "0.0.0.0/0"
+    description = "Headscale embedded DERP relay (STUN)"
+    udp_options {
+      min = 3478
+      max = 3478
+    }
+  }
+
+  # A mesh link *on this node* would need UDP too. Still commented: the CA
+  # coordinates the tunnel other nodes' links run over and carries no link of
+  # its own, so there is nothing here to hear peers with yet. Left in place so
+  # that day is a one-line change with the port already agreed.
   #
   # ingress_security_rules {
   #   protocol    = "17" # UDP

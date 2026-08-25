@@ -18,6 +18,7 @@ use clap::Subcommand;
 use interfaces::frame::Mac;
 use wayfinder_auth::Authority;
 use wayfinder_auth::CERT_FLAG_ADMIN;
+use wayfinder_auth::CERT_FLAG_MEMBER;
 use wayfinder_auth::CERT_FLAG_USER;
 use wayfinder_auth::CERT_FLAG_VIEWER;
 use wayfinder_auth::Keypair;
@@ -457,8 +458,16 @@ fn describe_flags(flags: u8) -> String {
     if flags & CERT_FLAG_USER != 0 {
         parts.push("user session, not a device");
     }
+    if flags & CERT_FLAG_MEMBER != 0 {
+        parts.push("mesh device (member)");
+    }
     if parts.is_empty() {
-        return "none (routing membership only)".into();
+        // Not the same as a device certificate, and the difference is the one
+        // an operator is most likely to be staring at: a certificate issued
+        // before `CERT_FLAG_MEMBER` existed carries no capability at all, so
+        // its holder cannot obtain a VPN credential until it is reissued.
+        // Rendering both as "routing membership only" hid exactly that.
+        return "none (predates the member capability; reissue to grant it)".into();
     }
     parts.join(", ")
 }

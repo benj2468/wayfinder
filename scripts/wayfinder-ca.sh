@@ -25,10 +25,12 @@
 #   install     Install NixOS over the stock image          (DESTRUCTIVE, once)
 #   secrets     Copy the offline-minted trust material onto the node
 #   update      Roll out a config/code change               (nixos-rebuild)
-#   verify      Prove the CA answers, over the management API
+#   verify      Prove the CA answers and the tunnel plane is serving
 #   status      Where it is and what it is doing
 #   user-add    Create a dashboard sign-in account on the CA
 #   dashboard   Forward the web dashboard to localhost
+#   vpn         Show the tunnel control plane and its registered peers
+#   headplane   Forward the break-glass VPN admin UI to localhost
 #   destroy     Tear the whole deployment down              (DESTRUCTIVE)
 #
 # Environment:
@@ -56,6 +58,63 @@ warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 need() {
     command -v "$1" >/dev/null 2>&1 \
         || die "$1 is not on PATH — run this from the repo's dev shell ('nix develop')"
+}
+
+# Verification output.
+#
+# A failing check prints what it means and what to do about it, and the run
+# carries on rather than aborting: an operator wants the whole picture from one
+# invocation, and "the management API answers but STUN does not" is a different
+# problem from either half failing alone.
+VERIFY_FAILURES=0
+
+check_ok()   { printf '  \033[32mok\033[0m    %s\n' "$1"; }
+
+check_note() {
+    local line
+    for line in "$@"; do printf '        %s\n' "$line" >&2; done
+    printf '\n' >&2
+}
+
+check_failed() {
+    printf '  \033[31mFAIL\033[0m  %s\n' "$1" >&2
+    shift
+    check_note "$@"
+    VERIFY_FAILURES=$((VERIFY_FAILURES + 1))
+}
+
+# Not a failure: something this machine could not determine. Counted separately
+# because "we did not look" and "we looked and it is broken" call for opposite
+# reactions, and conflating them is how a check becomes noise.
+check_skipped() {
+    printf '  \033[33mskip\033[0m  %s\n' "$1" >&2
+    shift
+    check_note "$@"
+}
+
+# Looked, did not like what it saw, and cannot prove the box is at fault. Also
+# not counted: a check that fails the run on evidence this weak trains an
+# operator to ignore the run.
+check_warned() {
+    printf '  \033[33mwarn\033[0m  %s\n' "$1" >&2
+    shift
+    check_note "$@"
+}
+
+# The tunnel endpoint, read out of the machine configuration rather than
+# restated here: `services.wayfinder-headscale` derives the URL from the TLS
+# mode, the name and the port, and that derivation is exactly what `update`
+# deploys. A copy in this script could only ever be a second thing to keep in
+# step, and the one that is wrong is the one you would debug against.
+#
+# Prints "<url> <hostname> <stun-port>", or nothing if evaluation fails.
+vpn_settings() {
+    # The `${...}` below is Nix interpolation inside the --apply expression, and
+    # has to reach nix unexpanded — single quotes are the point, not an oversight.
+    # shellcheck disable=SC2016
+    (cd "$REPO_ROOT" && nix eval --raw \
+        ".#nixosConfigurations.wayfinder-ca.config.services.wayfinder-headscale" \
+        --apply 'c: "${c.endpoint} ${c.domain} ${toString c.stunPort}"' 2>/dev/null)
 }
 
 confirm() {
@@ -264,19 +323,182 @@ cmd_update() {
     info "rolled out; 'wayfinder-ca.sh verify' to confirm it still answers"
 }
 
+# The tunnel plane over HTTPS. Curl's exit code says *which* hop failed, and
+# the three hops fail for entirely different reasons — DNS that was never
+# created, a security-list rule that is not there, a certificate that has not
+# been issued yet — so they get three different sets of instructions rather
+# than one "check your config".
+verify_vpn_https() {
+    local url="$1" host="$2" ip="$3" code=0
+
+    curl -sf -o /dev/null --max-time 15 "$url/health" || code=$?
+    if [[ "$code" == 0 ]]; then
+        check_ok "$url/health answers, over a certificate that validates"
+        return
+    fi
+
+    case "$code" in
+        6)
+            check_failed "$host does not resolve." \
+                "The DNS record has not been created, or has not propagated yet." \
+                "  dig +short $host                 # expect $ip" \
+                "  (cd infra/oracle && tofu plan)   # is manage_dns true, and the vpn record in the plan?" \
+                "Records here must be DNS-only (grey cloud). A proxied record resolves to" \
+                "Cloudflare, which carries neither this port nor the UDP that STUN needs."
+            ;;
+        7 | 28)
+            check_failed "nothing answered at $url." \
+                "The name resolves, so this is a closed port rather than a missing record." \
+                "Two firewalls sit in front of it, and both have to agree:" \
+                "  (cd infra/oracle && tofu plan)             # the TCP/443 ingress rule" \
+                "  ssh root@$ip 'ss -lnt | grep 443'          # is headscale bound at all?" \
+                "  ssh root@$ip systemctl status headscale.service" \
+                "A headscale that cannot obtain its certificate does not serve, so check" \
+                "the certificate first if the unit is running but nothing is listening."
+            ;;
+        35 | 51 | 60)
+            check_failed "$host answered, but its certificate did not validate." \
+                "Almost always ACME: the certificate has not been issued yet, or was" \
+                "issued for a different name than the one being asked for." \
+                "  ssh root@$ip 'journalctl -u headscale | grep -i acme'" \
+                "  curl -kvI $url/health            # what is actually being served" \
+                "A first boot takes a minute or two. If it has been longer, check that" \
+                "$host resolves to $ip from the public internet — Let's Encrypt validates" \
+                "from outside, and it rate-limits failures to 5 per hostname per hour, so" \
+                "fix DNS before restarting headscale to retry." \
+                "Until this passes, no node can complete a tunnel handshake: tailscaled" \
+                "refuses a plaintext DERP connection and loses STUN probing with it."
+            ;;
+        *)
+            check_failed "could not reach $url/health (curl exit $code)." \
+                "  curl -v $url/health" \
+                "  ssh root@$ip systemctl status headscale.service"
+            ;;
+    esac
+}
+
+# STUN, which is the check most worth automating: losing it costs no
+# connectivity at all, only latency, so nothing reports it.
+verify_vpn_stun() {
+    local host="$1" port="$2" ip="$3" replied
+
+    if ! command -v nc >/dev/null 2>&1; then
+        check_skipped "no nc on PATH, so udp/$port went unchecked." \
+            "Run this from the repo's dev shell, or check it by hand from a machine" \
+            "with outbound UDP:" \
+            "  nc -zvu $host $port"
+        return
+    fi
+
+    # The exact 40-byte binding request a Tailscale client sends, because that
+    # is the only client this relay will ever serve — and it answers nothing
+    # else. `ParseBindingRequest` in tailscale's net/stun requires a SOFTWARE
+    # attribute whose value is the literal "tailnode", a FINGERPRINT as the
+    # *last* attribute, and a matching CRC-32; anything else is dropped in
+    # silence. A textbook-conformant client is refused too — `stunclient` from
+    # stuntman reports "Binding test: fail" against a relay that is working
+    # perfectly, and a bare 20-byte request that Google answers gets nothing
+    # here. Both were mistaken for a broken relay before this was understood.
+    #
+    # Every byte is fixed, so it is spelled out rather than computed. To
+    # regenerate (only needed if tailscale changes `software`, which would
+    # change what real clients send too):
+    #
+    #   python3 -c '
+    #   import struct, zlib
+    #   txid = b"wayfinder-ca"
+    #   body = struct.pack(">HH", 0x8022, 8) + b"tailnode"
+    #   head = b"\x00\x01" + struct.pack(">H", len(body)+8) + b"\x21\x12\xa4\x42" + txid
+    #   fp   = zlib.crc32(head+body) ^ 0x5354554e
+    #   print("".join("\\x%02x" % b for b in head+body+struct.pack(">HHI",0x8028,4,fp)))'
+    #
+    # `nc -zu` is no substitute: it reports "succeeded" whenever no ICMP
+    # port-unreachable comes back, so a black hole and a healthy relay print
+    # exactly the same line.
+    local request='\x00\x01\x00\x14\x21\x12\xa4\x42wayfinder-ca\x80\x22\x00\x08tailnode\x80\x28\x00\x04\xbc\x49\x66\xd7'
+    # shellcheck disable=SC2059  # the bytes are the format string, by design
+    replied="$(printf "$request" \
+        | nc -u -w 5 "$host" "$port" 2>/dev/null | head -c 64 | wc -c)" || replied=0
+
+    if [[ "${replied:-0}" -gt 0 ]]; then
+        check_ok "the embedded relay answered a STUN binding request on udp/$port"
+    else
+        # A warning rather than a failure: silence is real evidence now that the
+        # request is the one a client actually sends, but it is still not proof.
+        # Any network on the path may have dropped the datagram, and plenty do.
+        check_warned "no STUN response from $host:$port — could not confirm the relay answers." \
+            "Rule out the path before the box: a dropped UDP datagram and a dead relay" \
+            "look identical from here, and hotel and corporate networks drop plenty." \
+            "  ssh root@$ip 'ss -lun | grep 3478'         # is the relay bound?" \
+            "  ssh root@$ip 'journalctl -u headscale | grep -i stun'" \
+            "  (cd infra/oracle && tofu plan)             # the UDP/3478 ingress rule" \
+            "Do not reach for a generic STUN tool to double-check: this relay answers" \
+            "only tailscale's dialect and drops a textbook-conformant request in silence," \
+            "so stunclient and friends report failure against a healthy relay." \
+            "If it really is down nothing breaks outright — every tunnel just relays" \
+            "through the CA instead of hole-punching past the CGNAT this exists to defeat," \
+            "which shows up as latency and in no log at all."
+    fi
+}
+
 cmd_verify() {
     require_secrets
     local ip; ip="$(ca_ip)"
-    info "querying the management API at $ip:7700"
-    ctl --connect "$ip:7700" \
+    VERIFY_FAILURES=0
+
+    info "management API at $ip:7700"
+    if ctl --connect "$ip:7700" \
         --identity "$SECRETS_DIR/identity.seed" \
         --cert "$SECRETS_DIR/node.cert" \
         node-info
-    ctl --connect "$ip:7700" \
+    then
+        check_ok "the management API answers and accepted this identity"
+    else
+        check_failed "the management API did not answer at $ip:7700." \
+            "  ssh root@$ip systemctl status wayfinder.service" \
+            "  ssh root@$ip 'journalctl -u wayfinder -n 50'" \
+            "  (cd infra/oracle && tofu plan)   # the TCP/7700 ingress rule" \
+            "If the unit is restarting in a loop, read the first lines of a start attempt:" \
+            "the node refuses to run rather than serve for the wrong mesh, so a missing" \
+            "secret or a mesh id that disagrees with the trust anchor stops it here." \
+            "If SSH does not answer either, use Oracle's serial console — this box is" \
+            "configured with console=ttyS0 for exactly that."
+    fi
+
+    if ctl --connect "$ip:7700" \
         --identity "$SECRETS_DIR/identity.seed" \
         --cert "$SECRETS_DIR/node.cert" \
         security
-    info "the CA is reachable and authenticating"
+    then
+        check_ok "the security state reads back"
+    else
+        check_failed "the node answered but would not report its security state." \
+            "The connection authenticated, so this is authorization rather than reach:" \
+            "the identity in $SECRETS_DIR must be an admin of this mesh." \
+            "  $0 status                        # what the certificate actually carries"
+    fi
+
+    info "tunnel control plane"
+    local settings url host stun
+    settings="$(vpn_settings)" || settings=""
+    read -r url host stun <<<"$settings" || true
+
+    if [[ -z "${url:-}" ]]; then
+        check_skipped "could not read the VPN settings out of the machine configuration." \
+            "Everything below depends on knowing the name and port this deployment uses," \
+            "which is read from the flake rather than restated in this script:" \
+            "  nix eval .#nixosConfigurations.wayfinder-ca.config.services.wayfinder-headscale.endpoint" \
+            "If that fails to evaluate, the deployment would not build either — fix it" \
+            "before rolling anything out."
+    else
+        verify_vpn_https "$url" "$host" "$ip"
+        verify_vpn_stun "$host" "$stun" "$ip"
+    fi
+
+    if (( VERIFY_FAILURES > 0 )); then
+        die "$VERIFY_FAILURES check(s) failed — see above"
+    fi
+    info "the CA is reachable, authenticating, and coordinating tunnels"
 }
 
 cmd_status() {
@@ -289,8 +511,10 @@ cmd_status() {
         printf 'identity:\n'
         ctl cert show "$SECRETS_DIR/node.cert" | sed 's/^/  /'
     fi
+    printf 'VPN:       %s:443 (headscale, TLS), STUN on udp/3478\n' "$ip"
     ssh -o ConnectTimeout=8 "root@$ip" \
-        'systemctl is-active wayfinder.service wayfinder-web.service; uptime' 2>/dev/null \
+        'systemctl is-active wayfinder.service wayfinder-web.service \
+             headscale.service headplane.service; uptime' 2>/dev/null \
         || warn "could not reach the node over SSH"
 }
 
@@ -343,7 +567,77 @@ cmd_dashboard() {
     # runs on the static credential: it performs no authentication of its own,
     # so whoever reaches the port inherits the identity it holds — which on this
     # node is an admin of the mesh root.
-    ssh -N -L 8080:localhost:8080 "root@$ip"
+    #
+    # 8081 at the far end: Headscale has 8080 there. The dashboard does not
+    # compare ports when checking the Host header, so the mismatch is invisible
+    # to it (see HostPolicy in bins/wayfinder-web/src/server.rs).
+    ssh -N -L 8080:localhost:8081 "root@$ip"
+}
+
+cmd_vpn() {
+    local ip; ip="$(ca_ip)"
+    info "tunnel control plane on $ip"
+    # Read straight off the box: Headscale's own view of who is registered is
+    # the ground truth, and the reason to look here rather than at the
+    # dashboard is usually that the dashboard is the thing not answering.
+    #
+    # Sent as a heredoc rather than a quoted argument so the script below is
+    # ordinary shell — apostrophes and nested quoting included.
+    ssh "root@$ip" bash -s <<'REMOTE' || warn "could not reach the tunnel control plane"
+set -u
+
+systemctl is-active headscale.service headplane.service \
+    wayfinder-headscale-apikey.service || true
+
+printf '\napi key expires: '
+if [ -s /var/lib/wayfinder-headscale/api.key.expires ]; then
+    date -d "@$(cat /var/lib/wayfinder-headscale/api.key.expires)"
+else
+    echo 'not minted yet'
+fi
+
+# The URL headscale advertises, read out of the config the daemon was actually
+# started with: /etc/headscale/config.yaml is only a CLI stub (socket path,
+# update check), and the real settings are a store path named in the unit.
+unit_script=$(systemctl show -p ExecStart --value headscale.service \
+    | sed -n 's/.*path=\([^;]*\);.*/\1/p' | tr -d ' ')
+cfg=$(grep -oE -- '--config [^ ]+' "$unit_script" | head -1 | cut -d' ' -f2)
+url=$(grep -E '^server_url:' "$cfg" | cut -d' ' -f2 | tr -d '"')
+printf '\nserver_url: %s\n' "$url"
+
+# TLS is the quiet failure on this box. The control plane answers fine without
+# it while every tunnel handshake refuses, taking STUN probing down with it —
+# so nodes register and then cannot reach each other, even on the same LAN.
+case "$url" in
+    https://*)
+        echo 'certificate:'
+        curl -sv --max-time 10 "$url/health" 2>&1 >/dev/null \
+            | grep -E 'subject:|expire date:|SSL certificate verify' \
+            | sed 's/^\* */  /' \
+            || echo '  no TLS handshake — tunnels will not establish'
+        ;;
+    *)
+        echo 'WARNING: serving plain HTTP. A tailscaled refuses a plaintext DERP'
+        echo 'connection, so nodes will register and then fail to reach each other.'
+        ;;
+esac
+
+printf '\n'
+headscale nodes list
+REMOTE
+}
+
+cmd_headplane() {
+    local ip; ip="$(ca_ip)"
+    info "forwarding http://127.0.0.1:3001/admin -> $ip (Ctrl-C to stop)"
+    # Break-glass only. It is loopback-bound on the node deliberately, and the
+    # forward is the friction that keeps it a fallback rather than a surface
+    # anyone routes to — the day-to-day view is the dashboard's VPN panel.
+    #
+    # Sign in by pasting a Headscale API key; mint a throwaway one with
+    #   ssh root@<ca> headscale apikeys create --expiration 24h
+    # rather than reusing the node's, which has no expiry anyone is watching.
+    ssh -N -L 3001:localhost:3000 "root@$ip"
 }
 
 cmd_destroy() {
@@ -367,6 +661,8 @@ main() {
         status)    cmd_status "$@" ;;
         user-add)  cmd_user_add "$@" ;;
         dashboard) cmd_dashboard "$@" ;;
+        vpn)       cmd_vpn "$@" ;;
+        headplane) cmd_headplane "$@" ;;
         destroy)   cmd_destroy "$@" ;;
         ""|-h|--help|help)
             sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; $d'

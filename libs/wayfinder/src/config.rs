@@ -80,10 +80,23 @@ pub enum LinkTransport {
         /// is reached once its transport address has been learned from a
         /// received frame — in practice, the periodic OGM every mesh node
         /// broadcasts — so there is nothing else to configure per peer.
-        discovery_addr: SocketAddr,
+        ///
+        /// `None` is the hub/star-topology mode: there is no real broadcast
+        /// domain to send one datagram into (a Tailscale tunnel is exactly
+        /// this — point-to-point WireGuard links, not a shared segment), so a
+        /// broadcast/multicast-destined frame is instead fanned out to every
+        /// peer this node has learned. Same zero-per-peer-config precedent as
+        /// [`RawL2`](LinkTransport::RawL2), which has no discovery address at
+        /// all. Left unconfigured (rather than defaulting to it), so an
+        /// operator has to choose the mode rather than a link silently
+        /// changing behavior when a field is omitted.
+        #[serde(default)]
+        discovery_addr: Option<SocketAddr>,
         /// NIC to join the IPv6 multicast group on. Required when
         /// `discovery_addr` is an IPv6 multicast address (IPv6 multicast is
-        /// scoped to an interface, unlike IPv4 broadcast); ignored otherwise.
+        /// scoped to an interface, unlike IPv4 broadcast); meaningless (and
+        /// rejected by validation) when `discovery_addr` is `None`, since
+        /// there is then no multicast group to join.
         #[serde(default)]
         multicast_interface: Option<String>,
     },
@@ -647,6 +660,64 @@ pub struct ProviderConfig {
     /// than silently treated as empty.
     #[serde(default)]
     pub state_path: Option<String>,
+    /// Optional VPN coordination: where the Headscale server is, and the file
+    /// holding the API key this node mints tunnel credentials with.
+    ///
+    /// Absent on every deployment that does not run one, which is the default
+    /// — the VPN requests then answer "not configured" and enrollment proceeds
+    /// exactly as it does today. VPN links are additive, never required.
+    ///
+    /// See [`HeadscaleConfig`] for what each field means and why the API key
+    /// is a path rather than a value.
+    #[serde(default)]
+    pub headscale: Option<HeadscaleConfig>,
+}
+
+/// How this node reaches its VPN coordination server.
+///
+/// The API key is the reason this is a path and not a value: it can mint
+/// credentials granting tunnel reachability, so it belongs in the same custody
+/// tier as the mesh root seed and the enrollment token — read from a file mode
+/// 0600 outside the Nix store, never inlined into a config that gets copied
+/// around.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeadscaleConfig {
+    /// Base URL of the Headscale API (e.g. `https://vpn.example.net`).
+    pub api_url: String,
+    /// Path to a file containing the Headscale API key, and nothing else
+    /// (surrounding whitespace is trimmed).
+    pub api_key_path: String,
+    /// Base URL handed to enrolling nodes as `--login-server`. Defaults to
+    /// [`api_url`](Self::api_url) when absent, which is the common deployment;
+    /// they differ when the API is reachable only on an admin-side address
+    /// while nodes register against a public one.
+    #[serde(default)]
+    pub login_server: Option<String>,
+    /// Tag applied to every preauth key this node mints, so an operator can
+    /// tell wayfinder-enrolled peers apart from hand-registered ones in
+    /// Headscale's own UI. Defaults to `tag:wayfinder-node`.
+    #[serde(default = "default_node_tag")]
+    pub node_tag: String,
+    /// Lifetime of a minted preauth key, in seconds. Short by design: the key
+    /// is spent within seconds of being handed over, and its whole risk profile
+    /// is the window between minting and use.
+    #[serde(default = "default_preauth_ttl_secs")]
+    pub preauth_ttl_secs: u64,
+}
+
+/// Default [`HeadscaleConfig::node_tag`].
+fn default_node_tag() -> String {
+    String::from("tag:wayfinder-node")
+}
+
+/// Default [`HeadscaleConfig::preauth_ttl_secs`]: five minutes.
+///
+/// The key is minted mid-`wayfinderctl enroll` and spent by the `tailscale up`
+/// on the next line, so this is already orders of magnitude more than the
+/// happy path needs; what it buys is tolerance for a slow link, not for an
+/// operator who walks away.
+fn default_preauth_ttl_secs() -> u64 {
+    300
 }
 
 /// The longest certificate lifetime a provider will issue for without
@@ -1162,7 +1233,7 @@ name: rooftop-ble
             .kind(),
             LinkTransport::UdpMulti {
                 bind_addr: "127.0.0.1:1".parse().unwrap(),
-                discovery_addr: "127.0.0.1:2".parse().unwrap(),
+                discovery_addr: Some("127.0.0.1:2".parse().unwrap()),
                 multicast_interface: None,
             }
             .kind(),

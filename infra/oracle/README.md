@@ -234,8 +234,91 @@ whatever access its identity carries — and on *this* node that identity is an
 admin of the mesh root. Reach it over an SSH forward:
 
 ```bash
-ssh -L 8080:localhost:8080 root@<public_ip>
+ssh -L 8080:localhost:8081 root@<public_ip>
 # then open http://127.0.0.1:8080
+```
+
+The far side is 8081, not 8080: Headscale has 8080 on this box. The dashboard
+does not compare ports when checking the `Host` header, so the mismatch is
+invisible to it. `./scripts/wayfinder-ca.sh dashboard` does the same thing.
+
+## The VPN control plane
+
+The CA also runs Headscale, which is what lets two CGNAT'd nodes reach each
+other's mesh UDP link at all — see
+`docs/design/implemented/08-internet-links-headscale-vpn.md`. Nothing extra is
+provisioned for it: `tofu apply` opens TCP/443 and UDP/3478 and creates the
+`vpn` DNS record, and both secrets it needs are made on the box — the API key
+the CA mints tunnel credentials with (`wayfinder-headscale-apikey.service`, at
+first boot, renewed a month before it expires) and the TLS certificate, which
+Headscale obtains from Let's Encrypt itself.
+
+TLS is not optional here, and it is the part most likely to look fine when it
+is not: a `tailscaled` refuses a plaintext DERP connection and loses its
+`NetInfo`/STUN probing with it, so nodes register happily against a plain-HTTP
+coordination server and then cannot reach each other — even on the same LAN.
+The certificate is obtained with the TLS-ALPN-01 challenge, answered on the
+same 443 listener, which is why nothing here opens port 80.
+
+Two things to confirm after a deploy, both of which fail quietly:
+
+```bash
+./scripts/wayfinder-ca.sh verify      # mgmt API, TLS certificate, STUN
+./scripts/wayfinder-ca.sh vpn         # units, cert, key expiry, registered peers
+```
+
+`verify` checks the certificate is real and for the right name (on a first boot
+this can take a minute; until it succeeds, no node completes a tunnel
+handshake), and probes STUN with a real binding request. A failed check prints
+what it means and what to run next.
+
+The STUN result is a **warning, not a failure**, on purpose: an unanswered UDP
+datagram looks the same whether the relay is down or something between you and
+it drops UDP, so confirm on the box (`ss -lun | grep 3478`) before believing a
+complaint from your own laptop.
+
+**Do not check STUN by hand with a generic tool.** Two obvious ways to do it
+both lie, in opposite directions:
+
+- `nc -zvu <host> 3478` prints `succeeded` whenever no ICMP port-unreachable
+  comes back — a black hole and a healthy relay produce the identical line.
+- A textbook-conformant client (`stunclient`, a hand-rolled 20-byte binding
+  request) gets **silence**, because tailscale's STUN server answers only
+  tailscale: `ParseBindingRequest` demands a SOFTWARE attribute equal to the
+  literal `"tailnode"`, a FINGERPRINT as the last attribute, and a matching
+  CRC-32. Everything else is dropped without a word. `stunclient` reports
+  `Binding test: fail` against a relay that is working perfectly.
+
+`wayfinder-ca.sh verify` sends the exact request a real client sends, which is
+the only probe that answers the question you actually care about.
+
+Note that `https://vpn.<your-zone>/` in a browser is a **blank page**, and that
+is correct — Headscale serves an empty document at `/` and has no web UI. The
+admin UI is Headplane, below; the day-to-day surface is the dashboard's VPN
+panel.
+
+An enrolling node then gets its tunnel credential in the same step as its
+membership certificate, and registers against
+`https://vpn.<your-zone>:443` — the `login_server` in
+`nix/machines/wayfinder-ca/common.nix`, which must resolve **from the nodes**,
+not merely from here.
+
+### Headplane
+
+A break-glass admin UI for the case where the wayfinder dashboard is down but
+the tunnel is fine. It is loopback-bound, deliberately, and it is not a surface
+to route anyone to for day-to-day work — that is the dashboard's VPN panel.
+
+```bash
+./scripts/wayfinder-ca.sh headplane   # or: ssh -L 3000:localhost:3000 root@<public_ip>
+# then open http://127.0.0.1:3000/admin
+```
+
+Sign in by pasting a Headscale API key. Mint a throwaway one rather than
+reusing the node's, which has no expiry anyone is watching:
+
+```bash
+ssh root@<public_ip> headscale apikeys create --expiration 24h
 ```
 
 ## Troubleshooting
@@ -252,6 +335,24 @@ names an *interface*, and the default (`ens3`) depends on the image — run
 **The node will not start.** `journalctl -u wayfinder -n 50`. The usual causes
 are step 5 not done, a `meshId` that disagrees with the trust anchor, or the
 membership certificate not matching the identity seed's derived MAC.
+
+**A node enrols but gets no tunnel credential.** `journalctl -u wayfinder |
+grep -i vpn` on the CA. If the node's own start-up log has no "VPN coordination
+enabled", the API key was unreadable at start-up — check
+`systemctl status wayfinder-headscale-apikey` and that
+`/var/lib/wayfinder-headscale/api.key` is mode 0400 owned by `wayfinder`.
+
+**Nodes register but cannot reach each other.** Check TLS before anything
+else: `journalctl -u headscale | grep -i acme`. A plaintext coordination
+server, or one whose certificate never arrived, leaves `tailscaled` refusing
+the DERP connection — which also disables its STUN probing, so even two peers
+on the same LAN fail. The control plane keeps working throughout, which is what
+makes this one hard to see.
+
+**Tunnels work but everything is slow.** Almost always STUN: with UDP/3478
+unreachable, peers cannot hole-punch and every packet relays through this box.
+Check the security list rule in `main.tf` first, then `ss -lun | grep 3478` on
+the instance.
 
 **You have locked yourself out over SSH.** Use Oracle's serial console; the
 system is configured with `console=ttyS0` for exactly this.
