@@ -19,12 +19,12 @@
 //! pairwise tag keyed off the neighbor keys this module caches.
 //!
 //! **Scope (read before trusting this boundary):** this authenticates *OGMs*
-//! only.  Data-plane batman frames — `BatmanPacketType::Bcast` (flooded ARP etc.),
-//! `BatmanPacketType::Unicast`, `BatmanPacketType::Mcast` — are **not** authenticated yet, so an
-//! outsider can still inject/transit those (e.g. a broadcast flood) on an
-//! auth-enabled mesh.  Segregation here is *control-plane* (a foreign node
-//! cannot influence routing); full data-plane segregation arrives with the
-//! pairwise tag.
+//! and *directed* data-plane frames.  `BatmanPacketType::Unicast` and
+//! `BatmanPacketType::Mcast` carry the pairwise trailer (see
+//! [`DIRECTED_TRAILER_LEN`]), which `strip_directed` verifies on the way in.
+//! Flooded `BatmanPacketType::Bcast` frames (ARP etc.) are **not**
+//! authenticated — a pairwise tag cannot cover a one-to-many send — so an
+//! outsider can still inject a broadcast flood on an auth-enabled mesh.
 
 use batman::wire::BatmanOgmPacket;
 use batman::wire::BatmanTvlvHdr;
@@ -95,7 +95,68 @@ pub const DIRECTED_TRAILER_LEN: usize = 8 + TAG_LEN;
 /// Maximum number of revocation records held in the local revocation set.
 pub(crate) const MAX_REVOKED: usize = 32;
 /// Maximum number of verified neighbor key records cached.
-pub(crate) const MAX_NEIGHBOR_KEYS: usize = 64;
+///
+/// Also the ceiling on how many neighbors a node can hold at once, and so on
+/// how many next-hop proofs it can owe at once. [`MAX_IN_PROGRESS_PROOF`] is
+/// deliberately smaller than this — see there for why that is safe.
+pub const MAX_NEIGHBOR_KEYS: usize = 64;
+
+/// Length of the nonce in a next-hop proof challenge. One [`TAG_LEN`] block:
+/// the nonce need not be secret, only unpredictable and non-repeating, and 128
+/// bits of PRF output is far past any birthday concern for a value that is
+/// consumed once.
+pub const CHALLENGE_NONCE_LEN: usize = TAG_LEN;
+
+/// Maximum next-hop proof challenges outstanding at once.
+///
+/// One entry per neighbor being proven, and a neighbor is only ever challenged
+/// as a candidate next hop, so this can never usefully exceed the number of
+/// originators the router can hold routes for.
+///
+/// It is a quarter of [`MAX_NEIGHBOR_KEYS`], so a node at full neighbor density
+/// cannot hold a slot for every neighbor at once. That is deliberate, and it is
+/// safe only because of the retry: [`issue_challenge`](OgmAuth::issue_challenge)
+/// evicts the least-recently-issued entry rather than refusing, the evicted
+/// challenge is then never answered, and an unanswered challenge is retried on
+/// `BatmanEngine`'s ordinary backoff — so eviction costs a round trip, not a
+/// route. What this table really bounds is concurrent proof *throughput*, and
+/// the only requirement is that throughput stay above the rate at which proofs
+/// come due for renewal.
+///
+/// That margin is measured, not assumed. At the maximum density a node can
+/// reach (`MAX_NEIGHBOR_KEYS` mutual neighbors on one segment), 4, 8, 16 and 64
+/// slots all converge identically — every neighbor proven ~11 s in, and no
+/// route lost across the following two minutes — while a single slot never
+/// converges at all, settling near two thirds of them permanently proven.
+/// `attack_proof_starvation_by_neighbour_count` (`sim/scenarios/red_team.py`)
+/// is what holds that end of the range down; note that it only fails for a
+/// table small enough to fall under the renewal rate, so it is a guard against
+/// gross mis-sizing rather than a tight bound.
+pub const MAX_IN_PROGRESS_PROOF: usize = 16;
+
+const _: () = assert!(
+    MAX_IN_PROGRESS_PROOF <= crate::ORIGINATOR_CAPACITY,
+    "more outstanding proofs than originators the router can route to is \
+     unreachable state: a challenge is only ever issued for a candidate next hop"
+);
+
+/// Domain-separation prefix for the nonce PRF, keyed by this node's own secret
+/// (see [`OgmAuth::nonce_prf_key`]) so the nonce sequence is unpredictable to
+/// everyone else — a challenger whose next nonce can be guessed can have a
+/// response pre-fetched for it, which defeats the whole exchange.
+const NONCE_PRF_DOMAIN: &[u8] = b"wf-nexthop-nonce-v1";
+
+/// Domain-separation prefix bound into a challenge response's context, ahead of
+/// the responder's MAC.
+///
+/// This is what keeps a response from ever colliding with a directed-frame tag:
+/// [`tag_directed`](OgmAuth::tag_directed) passes a bare 6-byte MAC as
+/// `context`, so a context that is a domain *followed by* a MAC can never be
+/// the same byte string, whatever counter or payload an attacker chooses.
+const CHALLENGE_RESP_DOMAIN: &[u8] = b"wf-nexthop-resp-v1";
+
+/// Length of a challenge response's `context`: the domain plus a 6-byte MAC.
+const RESP_CONTEXT_LEN: usize = CHALLENGE_RESP_DOMAIN.len() + 6;
 
 /// Length of a [`RevocationRecord`] on the wire.
 const REVOKE_LEN: usize = core::mem::size_of::<RevocationRecord>();
@@ -205,6 +266,17 @@ pub struct NeighborKeys {
     /// cert to reconstruct the signed message, which `VerifiedCert` alone
     /// cannot provide.
     pub raw_cert: MembershipCert,
+}
+
+/// One next-hop proof challenge this node has issued and not yet resolved.
+struct OutstandingChallenge {
+    /// The neighbor challenged — the candidate next hop being proven.
+    neighbor: Mac,
+    /// The nonce sent, which the response must be computed over.
+    nonce: [u8; CHALLENGE_NONCE_LEN],
+    /// The issuing node's challenge counter at the time, used purely to pick
+    /// the least-recently-issued entry to evict when the table is full.
+    issued_seq: u64,
 }
 
 /// The outcome of [`OgmAuth::verify_ogm`].
@@ -318,6 +390,11 @@ pub struct OgmAuth<
     /// Per-requester last-accepted-`CertReq` instant (responder-side rate
     /// limit), keyed by requester MAC.
     cert_req_rate: HVec<(Mac, u64), MAX_NEIGHBOR_KEYS>,
+    /// Monotonic counter feeding the nonce PRF, so no two challenges this node
+    /// issues are ever over the same nonce.
+    challenge_counter: u64,
+    /// Next-hop proof challenges issued and not yet answered.
+    in_progress: HVec<OutstandingChallenge, MAX_IN_PROGRESS_PROOF>,
 }
 
 impl<
@@ -347,6 +424,8 @@ impl<
             in_flight: HVec::new(),
             pending_replies: HVec::new(),
             cert_req_rate: HVec::new(),
+            challenge_counter: 0,
+            in_progress: HVec::new(),
         }
     }
 
@@ -1318,6 +1397,137 @@ impl<
             .find(|n| n.cert.mac == mac && (now == 0 || n.cert.not_after >= now))
     }
 
+    // --- next-hop proof: challenge/response ----------------------------
+    //
+    // An OGM's signature attests its *originator*; nothing in it attests the
+    // *forwarder*, so a next hop would otherwise be installed on the strength
+    // of possessing bytes anyone can copy off the air. These three calls are
+    // how a candidate next hop proves it is really there: the challenger picks
+    // a fresh nonce, and only a node holding the pairwise key for the MAC it
+    // claims can answer. See `docs/design/09-mesh-auth-gaps.md` §4.
+
+    /// The PRF key for nonce derivation: this node's pairwise key *with
+    /// itself*.
+    ///
+    /// A nonce must be unpredictable to everyone else, and there is no entropy
+    /// source in `no_std` here (`getrandom` is a `std`-only dependency of
+    /// `wayfinder-auth`). Diffie-Hellman against our own public key yields a
+    /// value only the holder of our secret can compute, with no new dependency
+    /// and no RNG to plumb through every board.
+    fn nonce_prf_key(&self) -> [u8; 32] {
+        self.keypair.pairwise_key(&self.keypair.x_pubkey())
+    }
+
+    /// Build the `context` a challenge response is tagged under: the domain
+    /// followed by the *responder's* MAC.
+    ///
+    /// The MAC is bound in for the reason [`frame_tag`] documents — the
+    /// pairwise key is symmetric across both directions, so without the
+    /// sender's identity an `A→B` response would be interchangeable with a
+    /// `B→A` one.
+    fn resp_context(responder: &[u8; 6]) -> [u8; RESP_CONTEXT_LEN] {
+        let mut ctx = [0u8; RESP_CONTEXT_LEN];
+        ctx[..CHALLENGE_RESP_DOMAIN.len()].copy_from_slice(CHALLENGE_RESP_DOMAIN);
+        ctx[CHALLENGE_RESP_DOMAIN.len()..].copy_from_slice(responder);
+        ctx
+    }
+
+    /// Issue a next-hop proof challenge to `neighbor`, returning the nonce to
+    /// put on the wire and recording it as outstanding.
+    ///
+    /// Returns `None` — fails closed — when `neighbor` is not a verified,
+    /// unexpired member, since there would be no key to check an answer
+    /// against. A second challenge to a neighbor already outstanding replaces
+    /// it: only the newest nonce is ever accepted, so a response in flight for
+    /// the superseded one is correctly refused.
+    pub fn issue_challenge(&mut self, neighbor: Mac) -> Option<[u8; CHALLENGE_NONCE_LEN]> {
+        // Fail closed for an unverified or lapsed peer, on the same
+        // `live_neighbor` rule every other pairwise lookup goes through.
+        self.live_neighbor(neighbor)?;
+
+        let seq = self.challenge_counter.checked_add(1)?;
+        self.challenge_counter = seq;
+        let nonce = frame_tag(&self.nonce_prf_key(), seq, NONCE_PRF_DOMAIN, &neighbor.0);
+
+        let entry = OutstandingChallenge {
+            neighbor,
+            nonce,
+            issued_seq: seq,
+        };
+        if let Some(existing) = self.in_progress.iter_mut().find(|c| c.neighbor == neighbor) {
+            *existing = entry;
+        } else if self.in_progress.push(entry).is_err() {
+            // Table full. Evict the least-recently-issued rather than refusing:
+            // a churn of candidate next hops must not be able to lock out proof
+            // of a legitimate one.
+            let oldest = self
+                .in_progress
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, c)| c.issued_seq)
+                .map(|(i, _)| i)?;
+            self.in_progress[oldest] = OutstandingChallenge {
+                neighbor,
+                nonce,
+                issued_seq: seq,
+            };
+        }
+        Some(nonce)
+    }
+
+    /// Answer a next-hop proof challenge from `challenger` over `nonce`,
+    /// returning the tag to send back.
+    ///
+    /// Returns `None` when `nonce` is not exactly [`CHALLENGE_NONCE_LEN`]
+    /// bytes (malformed rather than silently tagged as given — the same
+    /// explicit check [`verify_challenge_response`](Self::verify_challenge_response)
+    /// applies to its `tag` argument) or when `challenger` is not a
+    /// verified, unexpired member — there is no pairwise key to answer
+    /// under, and answering an outsider would tell it nothing but cost this
+    /// node work.
+    pub fn answer_challenge(&self, challenger: Mac, nonce: &[u8]) -> Option<[u8; TAG_LEN]> {
+        if nonce.len() != CHALLENGE_NONCE_LEN {
+            tracing::trace!("auth: dropping challenge with a malformed nonce");
+            return None;
+        }
+        let key = self.live_neighbor(challenger)?.pairwise_key;
+        let ctx = Self::resp_context(&self.cert.node_mac);
+        // The nonce carries the freshness, so the counter argument is unused
+        // here; the domain in `ctx` is what separates this from a directed tag.
+        Some(frame_tag(&key, 0, &ctx, nonce))
+    }
+
+    /// Verify a challenge response claimed to come from `neighbor`, against the
+    /// nonce this node actually issued to it.
+    ///
+    /// Consumes the outstanding challenge on success, so one response proves
+    /// liveness exactly once: accepting a replay would let an attacker that
+    /// observed a single exchange keep a route alive without the neighbor ever
+    /// participating again.
+    pub fn verify_challenge_response(&mut self, neighbor: Mac, tag: &[u8]) -> bool {
+        let Ok(tag) = <[u8; TAG_LEN]>::try_from(tag) else {
+            tracing::trace!("auth: dropping challenge response with a malformed tag");
+            return false;
+        };
+        let Some(idx) = self.in_progress.iter().position(|c| c.neighbor == neighbor) else {
+            tracing::trace!("auth: dropping challenge response with nothing outstanding");
+            return false;
+        };
+        let nonce = self.in_progress[idx].nonce;
+        let Some(key) = self.live_neighbor(neighbor).map(|n| n.pairwise_key) else {
+            tracing::trace!("auth: dropping challenge response from an unverified neighbor");
+            return false;
+        };
+
+        let ctx = Self::resp_context(&neighbor.0);
+        if !verify_frame_tag(&key, 0, &ctx, &nonce, &tag) {
+            tracing::trace!("auth: dropping challenge response with an invalid tag");
+            return false;
+        }
+        self.in_progress.swap_remove(idx);
+        true
+    }
+
     /// Drop every cached neighbor whose certificate has expired.
     ///
     /// [`live_neighbor`](Self::live_neighbor) already makes an expired entry
@@ -1402,6 +1612,19 @@ mod tests {
         let mut auth = OgmAuth::new(kp, cert, authority.trust_anchor());
         auth.set_time(100);
         auth
+    }
+
+    /// Exchange one signed OGM each way, so both nodes hold the other's
+    /// verified certificate and the pairwise key derived from it — the
+    /// precondition for any pairwise operation between them.
+    fn admit_each_other(x: &mut OgmAuth, x_mac: Mac, y: &mut OgmAuth, y_mac: Mac) {
+        let (mut buf, len) = bare_ogm(x_mac, 7);
+        let len = x.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(y.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        let (mut buf, len) = bare_ogm(y_mac, 7);
+        let len = y.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(x.verify_ogm(&buf[..len]), OgmVerdict::Verified);
     }
 
     /// **Gap 3.** Certificate expiry is the mesh's *passive* revocation
@@ -2930,5 +3153,301 @@ mod tests {
         let (mut buf, len) = bare_ogm(mac(3), 7);
         let len = tiny.augment_ogm(&mut buf, len).expect("augment");
         assert_eq!(host.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+    }
+
+    // --- next-hop proof: challenge/response (gaps 1 + 2) -----------------
+    //
+    // See `docs/design/09-mesh-auth-gaps.md` §4. An OGM's signature attests
+    // its *originator*; nothing attests the *forwarder*, so a next hop is
+    // installed on the strength of possessing bytes anyone can copy. These
+    // primitives are the proof that possession is not enough: the challenger
+    // picks a fresh nonce, and only a node holding the pairwise key for the
+    // MAC it claims can answer.
+
+    /// The round trip a proven next hop rests on: `b` challenges `a`, `a`
+    /// answers with the pairwise key both derived from each other's certs,
+    /// and `b` accepts.
+    #[test]
+    fn a_challenge_response_round_trip_succeeds() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+
+        let nonce = b.issue_challenge(mac(2)).expect("a is a live neighbor");
+        let response = a.answer_challenge(mac(3), &nonce).expect("b is live too");
+
+        assert!(
+            b.verify_challenge_response(mac(2), &response),
+            "the holder of a's key answered b's own nonce"
+        );
+    }
+
+    /// The property the whole fix rests on. A captured response is worthless
+    /// against the next challenge, because the nonce is fresh and the
+    /// *challenger* chose it — unlike the OGM signature, which is a public
+    /// authenticator over static content and so replays forever.
+    #[test]
+    fn a_captured_response_does_not_answer_a_fresh_challenge() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+
+        let nonce = b.issue_challenge(mac(2)).expect("live neighbor");
+        let captured = a.answer_challenge(mac(3), &nonce).expect("live neighbor");
+        assert!(b.verify_challenge_response(mac(2), &captured));
+
+        // A later round: same parties, same keys, new nonce.
+        let _ = b.issue_challenge(mac(2)).expect("live neighbor");
+        assert!(
+            !b.verify_challenge_response(mac(2), &captured),
+            "a replayed response must not satisfy a fresh challenge"
+        );
+    }
+
+    /// A response is only meaningful once. Accepting the same one twice would
+    /// let an attacker who observed one exchange keep a route alive without
+    /// the neighbor participating again.
+    #[test]
+    fn a_response_is_consumed_and_cannot_be_reused() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+
+        let nonce = b.issue_challenge(mac(2)).expect("live neighbor");
+        let response = a.answer_challenge(mac(3), &nonce).expect("live neighbor");
+
+        assert!(b.verify_challenge_response(mac(2), &response));
+        assert!(
+            !b.verify_challenge_response(mac(2), &response),
+            "the outstanding challenge is consumed on the first acceptance"
+        );
+    }
+
+    /// The pairwise key is what is actually being proven. A third member
+    /// answering in `a`'s name holds a perfectly valid credential — and still
+    /// cannot produce `a`'s tag, because the key is (a, b)-specific.
+    #[test]
+    fn another_member_cannot_answer_in_a_neighbors_name() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        let mut c = member(&authority, 4, mac(4), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+        admit_each_other(&mut c, mac(4), &mut b, mac(3));
+
+        let nonce = b.issue_challenge(mac(2)).expect("a is a live neighbor");
+        let forged = c.answer_challenge(mac(3), &nonce).expect("c is live too");
+
+        assert!(
+            !b.verify_challenge_response(mac(2), &forged),
+            "c's tag must not pass as a's, however valid c's own credential"
+        );
+    }
+
+    /// Answering a nonce the challenger never issued proves nothing.
+    #[test]
+    fn a_response_over_an_unissued_nonce_is_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+
+        let _ = b.issue_challenge(mac(2)).expect("live neighbor");
+        let response = a
+            .answer_challenge(mac(3), &[0xAA; CHALLENGE_NONCE_LEN])
+            .expect("live neighbor");
+
+        assert!(
+            !b.verify_challenge_response(mac(2), &response),
+            "the response must be over the challenger's own nonce"
+        );
+    }
+
+    /// Nothing outstanding means nothing to accept — an unsolicited response
+    /// must never promote a next hop.
+    #[test]
+    fn a_response_with_no_outstanding_challenge_is_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+
+        let response = a
+            .answer_challenge(mac(3), &[0x11; CHALLENGE_NONCE_LEN])
+            .expect("live neighbor");
+
+        assert!(
+            !b.verify_challenge_response(mac(2), &response),
+            "b issued no challenge to a"
+        );
+    }
+
+    /// A nonce must never repeat, or a response captured in an earlier round
+    /// would answer a later one.
+    #[test]
+    fn successive_challenges_to_one_neighbor_never_repeat_a_nonce() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+
+        let mut seen: heapless::Vec<[u8; CHALLENGE_NONCE_LEN], 16> = heapless::Vec::new();
+        for _ in 0..16 {
+            let nonce = b.issue_challenge(mac(2)).expect("live neighbor");
+            assert!(!seen.contains(&nonce), "nonce repeated within one session");
+            seen.push(nonce).expect("capacity");
+        }
+    }
+
+    /// Two neighbors challenged in the same round get different nonces, so a
+    /// response to one is not a response to the other.
+    #[test]
+    fn challenges_to_different_neighbors_differ() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        let mut c = member(&authority, 4, mac(4), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+        admit_each_other(&mut c, mac(4), &mut b, mac(3));
+
+        let to_a = b.issue_challenge(mac(2)).expect("live neighbor");
+        let to_c = b.issue_challenge(mac(4)).expect("live neighbor");
+        assert_ne!(to_a, to_c);
+    }
+
+    /// The nonce is a PRF keyed by the challenger's *own* secret, not a
+    /// counter anyone can follow: two nodes at the same point in their
+    /// challenge sequence, challenging the same neighbor, must not produce the
+    /// same nonce. Without this an attacker could pre-fetch a response for a
+    /// nonce it knows is coming.
+    #[test]
+    fn two_challengers_derive_different_nonces_for_the_same_neighbor() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        let mut c = member(&authority, 4, mac(4), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+        admit_each_other(&mut a, mac(2), &mut c, mac(4));
+
+        let from_b = b.issue_challenge(mac(2)).expect("live neighbor");
+        let from_c = c.issue_challenge(mac(2)).expect("live neighbor");
+        assert_ne!(
+            from_b, from_c,
+            "the nonce must depend on the challenger's own key material"
+        );
+    }
+
+    /// Fails closed for a peer we hold no verified key for — there is nobody
+    /// to challenge, and no key to check an answer against.
+    #[test]
+    fn a_challenge_to_an_unverified_peer_fails_closed() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        assert!(
+            b.issue_challenge(mac(2)).is_none(),
+            "no verified neighbor, no challenge"
+        );
+        assert!(
+            b.answer_challenge(mac(2), &[0x22; CHALLENGE_NONCE_LEN])
+                .is_none(),
+            "nor can we answer one from an unverified peer"
+        );
+    }
+
+    /// A malformed (wrong-length) nonce is rejected explicitly rather than
+    /// silently tagged as-is: `verify_challenge_response` already validates
+    /// its `tag` argument the same way, so a challenge whose nonce was
+    /// truncated or padded in transit gets the same treatment as a malformed
+    /// response, not a silent pass-through.
+    #[test]
+    fn a_challenge_with_a_malformed_nonce_is_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+
+        assert!(
+            a.answer_challenge(mac(3), &[0xAA; CHALLENGE_NONCE_LEN - 1])
+                .is_none(),
+            "a short nonce must be rejected, not answered anyway"
+        );
+        assert!(
+            a.answer_challenge(mac(3), &[0xAA; CHALLENGE_NONCE_LEN + 1])
+                .is_none(),
+            "an over-long nonce must be rejected, not answered anyway"
+        );
+    }
+
+    /// Expiry is passive revocation (gap 3): a lapsed neighbor is not a
+    /// challengeable one, on the same `live_neighbor` rule every other
+    /// pairwise lookup goes through.
+    #[test]
+    fn a_challenge_to_an_expired_neighbor_fails_closed() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+        assert!(b.issue_challenge(mac(2)).is_some(), "live while valid");
+
+        b.set_time(2000);
+        assert!(
+            b.issue_challenge(mac(2)).is_none(),
+            "an expired neighbor must not be challengeable"
+        );
+    }
+
+    /// The in-progress table is bounded, and evicts the least-recently-issued
+    /// rather than refusing new challenges: failing closed on a full table
+    /// would let a churn of candidate next hops lock out proof of a
+    /// legitimate one.
+    ///
+    /// Two details of the setup exist to keep this test honest at any
+    /// [`MAX_IN_PROGRESS_PROOF`], including one raised to
+    /// [`MAX_NEIGHBOR_KEYS`]. Both were silent breakages the last time the
+    /// constant moved:
+    ///
+    /// - Each neighbor is challenged as soon as it is admitted, rather than
+    ///   admitting all of them first. Once the two capacities are equal,
+    ///   admitting one past the neighbor cache evicts the oldest cached
+    ///   neighbor, and [`issue_challenge`](OgmAuth::issue_challenge) fails
+    ///   closed on a neighbor it can no longer look up — so a challenge
+    ///   deferred until after the last admission would never be issued at all.
+    /// - Only the last peer is kept alive. An [`OgmAuth`] carries its whole
+    ///   neighbor cache inline, so holding one per slot overflows a test
+    ///   thread's stack well before the capacities meet.
+    #[test]
+    fn the_in_progress_table_evicts_least_recently_issued_when_full() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        // Fill the table, oldest first: one challenge per slot, each issued
+        // while its neighbor is still cached.
+        for i in 0..MAX_IN_PROGRESS_PROOF {
+            let m = mac(10 + i as u8);
+            let mut peer = member(&authority, 10 + i as u8, m, 1000);
+            admit_each_other(&mut peer, m, &mut b, mac(3));
+            assert!(b.issue_challenge(m).is_some());
+        }
+
+        // One more must be admitted, evicting the oldest outstanding challenge.
+        let seed = 10 + MAX_IN_PROGRESS_PROOF as u8;
+        let last = mac(seed);
+        let mut last_peer = member(&authority, seed, last, 1000);
+        admit_each_other(&mut last_peer, last, &mut b, mac(3));
+        let nonce = b
+            .issue_challenge(last)
+            .expect("a new challenge must never be refused for want of room");
+
+        let response = last_peer
+            .answer_challenge(mac(3), &nonce)
+            .expect("live neighbor");
+        assert!(
+            b.verify_challenge_response(last, &response),
+            "the newest challenge is the one that survives"
+        );
     }
 }

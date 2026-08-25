@@ -23,6 +23,8 @@ use batman::wire::BatmanBroadcastPacket;
 use batman::wire::BatmanCertReplyPacket;
 use batman::wire::BatmanCertReqPacket;
 use batman::wire::BatmanMcastPacket;
+use batman::wire::BatmanNextHopChallengePacket;
+use batman::wire::BatmanNextHopResponsePacket;
 use batman::wire::BatmanPacketType;
 use batman::wire::BatmanUnicastPacket;
 use batman::wire::ETH_P_BATMAN;
@@ -169,6 +171,18 @@ pub enum LocalSendError {
     /// must not originate any mesh traffic. The frame is dropped; install a
     /// valid cert via [`set_auth`](CentralRouter::set_auth) to unlock.
     AuthLocked,
+    /// A route to the destination is known, but no candidate next hop for it
+    /// has proven itself yet (or its proof has lapsed).
+    ///
+    /// Distinct from "no route known" (which still falls back to addressing
+    /// `dest` directly, on the assumption it may be a direct, non-mesh peer):
+    /// here a path genuinely exists, so silently falling back the same way
+    /// would address the frame to a destination that is not actually one hop
+    /// away, over whatever egress the link-quality table picks — writable by
+    /// a spoofed source before any authentication verdict. That is exactly
+    /// the interception the next-hop proof gate exists to close. See
+    /// `docs/design/09-mesh-auth-gaps.md` §4.
+    RouteUnproven,
 }
 
 /// Maximum number of mesh interfaces for which the router keeps independent
@@ -401,6 +415,21 @@ pub struct RxOutcome<'rx, 'tx> {
     /// present when a packet reached its final local destination.  Borrows
     /// the received frame.
     pub deliver_local: Option<&'rx [u8]>,
+    /// Force `forward`'s egress to this exact interface, bypassing
+    /// [`CentralRouter::get_egress_interface`] entirely.
+    ///
+    /// `None` for every ordinary forward (re-flood, cert reply, OGM reply):
+    /// those dispatch via the normal metric-driven/broadcast egress choice.
+    /// Set only for a next-hop proof *response* — link-local and single-hop
+    /// by construction (see `BatmanNextHopResponsePacket`), so it must go
+    /// straight back out the interface its challenge arrived on. Resolving it
+    /// through routing state instead would fall back to the link-quality
+    /// table whenever this node has not yet independently proven the
+    /// challenger itself, and that table is writable by a spoofed source on a
+    /// *different* interface before any authentication verdict — exactly the
+    /// misdirection this proof exists to rule out. See
+    /// `docs/design/09-mesh-auth-gaps.md` §4.
+    pub pin_egress_iface: Option<usize>,
 }
 
 impl RxOutcome<'_, '_> {
@@ -410,6 +439,7 @@ impl RxOutcome<'_, '_> {
         Self {
             forward: None,
             deliver_local: None,
+            pin_egress_iface: None,
         }
     }
 }
@@ -493,6 +523,10 @@ pub struct CentralRouter<
     /// `CertReq`, as the originator whose cert was asked for) — either
     /// immediately or via the opportunistic parked-reply flush.
     cert_reply_tx_rate: RateEstimator,
+    /// Smoothed rate of directed frames dropped for want of a pairwise key with
+    /// the chosen next hop. Lives here, not in a driver, so an embedded node —
+    /// which has no driver loop — reports it too.
+    untaggable_drop_rate: RateEstimator,
     /// Per-interface participation features, indexed by interface registration
     /// order (`iface_idx`).  Gates which traffic classes this node sends and
     /// receives on each link: an OGM/broadcast/unicast is dropped on ingress or
@@ -569,6 +603,7 @@ impl<
             runtime_config_active: false,
             cert_req_tx_rate: RateEstimator::default(),
             cert_reply_tx_rate: RateEstimator::default(),
+            untaggable_drop_rate: RateEstimator::default(),
             link_features: [crate::features::LinkFeatures::default(); INTERFACES],
             // `InterfaceName` isn't `Copy`, so the array-repeat shorthand the
             // other per-interface banks use doesn't apply here.
@@ -651,6 +686,16 @@ impl<
             Some(BatmanPacketType::Bcast)
             | Some(BatmanPacketType::Unicast)
             | Some(BatmanPacketType::Mcast) => f.tx_data,
+            // Next-hop proof rides the data gate: proof exists to decide which
+            // neighbor may *carry data*, so on a link that never transmits data
+            // it buys nothing and costs a challenge per unproven neighbor per
+            // refresh interval — on a duty-cycle-limited link an operator
+            // explicitly asked to stay quiet. Named rather than left to the
+            // catch-all below, so adding a packet type is a decision instead of
+            // a default.
+            Some(BatmanPacketType::NextHopChallenge) | Some(BatmanPacketType::NextHopResponse) => {
+                f.tx_data
+            }
             _ => true,
         }
     }
@@ -667,6 +712,26 @@ impl<
     /// rising rate signals this node is serving cert lookups for many peers.
     pub fn cert_reply_tx_rate(&self, now: Duration) -> f64 {
         self.cert_reply_tx_rate.rate(now).1
+    }
+
+    /// Record one directed frame dropped because this node holds no pairwise
+    /// key for the next hop it would have gone to.
+    ///
+    /// Called by the driver's dispatch planning, which is where the decision is
+    /// made; the state is kept here so every target reports it, driver or not.
+    pub fn record_untaggable_drop(&mut self, now: Duration) {
+        self.untaggable_drop_rate.observe(now, 0);
+    }
+
+    /// Smoothed frames/sec at which directed frames are being dropped for want
+    /// of a pairwise key with their next hop, evaluated as of `now`.
+    ///
+    /// The drop is silent from the sender's point of view — the route resolved,
+    /// the frame simply never went out — so this is the only signal that it is
+    /// happening. Sustained non-zero means traffic is aimed at a next hop this
+    /// node cannot authenticate to.
+    pub fn untaggable_drop_rate(&self, now: Duration) -> f64 {
+        self.untaggable_drop_rate.rate(now).1
     }
 
     /// Number of locally originated host frames dropped because they exceeded
@@ -703,12 +768,26 @@ impl<
     /// router will sign its emitted OGMs and reject incoming OGMs that do not
     /// verify against the mesh trust anchor.  Without this the router stays in
     /// its open, unauthenticated mode.
+    ///
+    /// Also turns on the next-hop proof gate (a candidate next hop must
+    /// answer a pairwise challenge before it can be selected — see
+    /// `docs/design/09-mesh-auth-gaps.md` §4) and resets all learned routing,
+    /// link-quality, and next-hop-proof state, since it was learned under the
+    /// previous (or no) auth regime and is stale the instant this node's
+    /// identity/anchor changes. A route can therefore sit unusable for one
+    /// challenge/response round trip immediately after this call, even to an
+    /// already-known neighbor.
     pub fn set_auth(
         &mut self,
         auth: OgmAuth<NEIGHBOR_KEYS, REVOKED, IN_FLIGHT_CERT_REQUESTS, PENDING_REPLIES>,
     ) {
         debug!("updating auth state; resetting learned routing state");
         self.auth = Some(auth);
+        // A next hop must now prove itself before it can be selected. Gated on
+        // auth being enabled because proof rests on pairwise keys: requiring it
+        // on an unauthenticated mesh would break every route rather than
+        // securing anything. See `docs/design/09-mesh-auth-gaps.md` §4.
+        self.batman.set_require_proof(true);
         // Routes, link-quality, ident mappings, and broadcast-dedup state were
         // all learned under the previous (or no) auth regime and are stale the
         // instant this node's identity/anchor changes — drop them so the node
@@ -979,6 +1058,7 @@ impl<
                             return RxOutcome {
                                 forward: None,
                                 deliver_local: None,
+                                pin_egress_iface: None,
                             };
                         }
                         auth::OgmVerdict::NeedCert { orig, fp } => {
@@ -1017,6 +1097,7 @@ impl<
                             return RxOutcome {
                                 forward,
                                 deliver_local: None,
+                                pin_egress_iface: None,
                             };
                         }
                     }
@@ -1037,6 +1118,98 @@ impl<
                     return RxOutcome {
                         forward: None,
                         deliver_local: None,
+                        pin_egress_iface: None,
+                    };
+                }
+
+                // Next-hop proof. Both arms are terminal: a challenge is
+                // answered right here, a response is consumed here, and neither
+                // ever reaches the engine or the wider mesh — they are
+                // link-local by construction.
+                //
+                // Both are also point-to-point: a challenger unicasts to the
+                // candidate and the candidate unicasts the answer back, so a
+                // destination that is not this node is malformed by
+                // construction. Checking it is load-bearing, not tidiness —
+                // `strip_directed` deliberately skips the pairwise-tag check
+                // for a multicast dst (broadcasts and OGMs carry their own
+                // signature instead), and the dst is attacker-chosen. Without
+                // this guard an outsider holding no credential at all can
+                // broadcast under any member MAC it has read off the air and
+                // have the arms below answer it, or credit a proof from a
+                // captured response that was never pairwise-authenticated.
+                if matches!(
+                    packet_type,
+                    Some(BatmanPacketType::NextHopChallenge)
+                        | Some(BatmanPacketType::NextHopResponse)
+                ) && frame.dst != self.batman.self_ident
+                {
+                    trace!(
+                        src = ?frame.src,
+                        dst = ?frame.dst,
+                        "drop: next-hop proof frame not addressed to this node"
+                    );
+                    return RxOutcome::empty();
+                }
+                if packet_type == Some(BatmanPacketType::NextHopChallenge) {
+                    let hdr_len = core::mem::size_of::<BatmanNextHopChallengePacket>();
+                    let nonce = &frame.payload[hdr_len.min(frame.payload.len())..];
+                    let reply = self.auth.as_ref().and_then(|auth| {
+                        // Answering an unverified peer is refused inside
+                        // `answer_challenge`: there is no pairwise key, and a
+                        // reply would cost work while telling it nothing.
+                        auth.answer_challenge(frame.src, nonce)
+                    });
+                    let forward = match reply {
+                        Some(tag) => {
+                            let rsp_len = core::mem::size_of::<BatmanNextHopResponsePacket>();
+                            let total = rsp_len + tag.len();
+                            if tx_buf.len() < total {
+                                trace!("drop: tx buffer too small for challenge response");
+                                None
+                            } else {
+                                let hdr = BatmanNextHopResponsePacket {
+                                    packet_type: BatmanPacketType::NextHopResponse.as_u8(),
+                                    version: 5,
+                                };
+                                tx_buf[..rsp_len].copy_from_slice(hdr.as_bytes());
+                                tx_buf[rsp_len..total].copy_from_slice(&tag);
+                                Some(LinkFrameData {
+                                    dst: frame.src,
+                                    protocol: ETH_P_BATMAN,
+                                    payload: &tx_buf[..total],
+                                })
+                            }
+                        }
+                        None => {
+                            trace!(src = ?frame.src, "drop: challenge from an unverified peer");
+                            None
+                        }
+                    };
+                    return RxOutcome {
+                        forward,
+                        deliver_local: None,
+                        // Link-local by construction: the answer must go
+                        // straight back out the interface this challenge
+                        // arrived on, never resolved through routing state.
+                        pin_egress_iface: Some(iface_idx),
+                    };
+                }
+                if packet_type == Some(BatmanPacketType::NextHopResponse) {
+                    let hdr_len = core::mem::size_of::<BatmanNextHopResponsePacket>();
+                    let tag = &frame.payload[hdr_len.min(frame.payload.len())..];
+                    let proven = self
+                        .auth
+                        .as_mut()
+                        .is_some_and(|auth| auth.verify_challenge_response(frame.src, tag));
+                    if proven {
+                        debug!(neighbor = ?frame.src, "auth: next hop proved itself");
+                        self.batman.note_proven(now, frame.src, iface_idx);
+                    }
+                    return RxOutcome {
+                        forward: None,
+                        deliver_local: None,
+                        pin_egress_iface: None,
                     };
                 }
 
@@ -1127,6 +1300,7 @@ impl<
                         RxOutcome {
                             forward,
                             deliver_local: None,
+                            pin_egress_iface: None,
                         }
                     }
                     RoutingAction::ForwardTo(next_hop) => {
@@ -1141,6 +1315,7 @@ impl<
                                 payload: &reply.payload[..len],
                             }),
                             deliver_local: None,
+                            pin_egress_iface: None,
                         }
                     }
                     RoutingAction::DeliverLocal => match packet_type {
@@ -1191,7 +1366,11 @@ impl<
                             let cert_bytes = own_cert.as_bytes();
                             let total = hdr_len + cert_bytes.len();
 
-                            match self.batman.next_hop(now, requester) {
+                            // Proof-agnostic on purpose: the cert-control
+                            // plane is what *supplies* the keys proof depends
+                            // on, so gating it on proof would deadlock
+                            // bootstrap. See `next_hop_unproven_ok`.
+                            match self.batman.next_hop_unproven_ok(now, requester) {
                                 Some(next) if total <= reply.payload.len() => {
                                     let reply_hdr = BatmanCertReplyPacket {
                                         packet_type: BatmanPacketType::CertReply.as_u8(),
@@ -1209,6 +1388,7 @@ impl<
                                             payload: &reply.payload[..total],
                                         }),
                                         deliver_local: None,
+                                        pin_egress_iface: None,
                                     };
                                 }
                                 Some(_) => {
@@ -1248,6 +1428,7 @@ impl<
                                 deliver_local: frame
                                     .payload
                                     .get(Self::inner_offset(&frame.payload)..),
+                                pin_egress_iface: None,
                             }
                         }
                     },
@@ -1268,6 +1449,7 @@ impl<
                         RxOutcome {
                             forward,
                             deliver_local: frame.payload.get(Self::inner_offset(&frame.payload)..),
+                            pin_egress_iface: None,
                         }
                     }
                 }
@@ -1321,7 +1503,8 @@ impl<
         if !auth.has_pending_reply(orig) {
             return None;
         }
-        let next = batman.next_hop(now, orig)?;
+        // Proof-agnostic: see the `handle_cert_req` reply path above.
+        let next = batman.next_hop_unproven_ok(now, orig)?;
         let cert = *auth.own_cert();
         let cert_bytes = cert.as_bytes();
         let hdr_len = core::mem::size_of::<BatmanCertReplyPacket>();
@@ -1372,8 +1555,10 @@ impl<
     /// [`BatmanPacketType::Mcast`] packet routed toward its best-known next hop.  Called
     /// once per target of a [`McastPlan::Unicast`].  Returns
     /// [`LocalSendError::BufferTooSmall`] if the header plus `payload` would
-    /// not fit in `tx_buf`, or [`LocalSendError::AuthLocked`] while
-    /// [`auth_locked`](CentralRouter::auth_locked).
+    /// not fit in `tx_buf`, [`LocalSendError::AuthLocked`] while
+    /// [`auth_locked`](CentralRouter::auth_locked), or
+    /// [`LocalSendError::RouteUnproven`] if a route to `dest` exists but no
+    /// candidate next hop for it has proven itself.
     pub fn handle_local_mcast<'a>(
         &mut self,
         now: core::time::Duration,
@@ -1385,7 +1570,10 @@ impl<
             trace!("drop: auth locked, suppressing local multicast egress");
             return Err(LocalSendError::AuthLocked);
         }
-        let next_hop = self.batman.next_hop(now, dest).unwrap_or(dest);
+        let Some(next_hop) = self.resolve_next_hop(now, dest) else {
+            trace!(?dest, "drop: route known but no proven next hop");
+            return Err(LocalSendError::RouteUnproven);
+        };
 
         let header = BatmanMcastPacket {
             packet_type: BatmanPacketType::Mcast.as_u8(),
@@ -1515,6 +1703,75 @@ impl<
             protocol: DEFAULT_BATMAN_ETHER_TYPE,
             payload: &tx_buf[..final_len],
         })
+    }
+
+    /// Produce a next-hop proof challenge for one neighbor still awaiting one,
+    /// if any is due.
+    ///
+    /// Returns the frame to send and the neighbor it is addressed to. Call in
+    /// a loop until `None`: **the selected candidate is marked challenged
+    /// before anything can fail below**, so the candidate set shrinks and the
+    /// loop terminates on every call, whether or not this call actually
+    /// produced a frame. Marking it unconditionally matters: a candidate this
+    /// node holds no cached key for yet — the ordinary state of an
+    /// unproven/uncredentialed relay, exactly the attacker case this feature
+    /// defends against — would otherwise fail the same way on every future
+    /// poll too, since nothing would ever back it off, permanently starving
+    /// every other candidate's proof behind it in the caller's `while let
+    /// Some(..)` loop.
+    ///
+    /// `None` when auth is off (nothing to prove with), when the node is
+    /// auth-locked (it originates nothing), when every candidate has either
+    /// proven itself or been challenged too recently to retry, or when the
+    /// selected candidate could not actually be challenged this call (no
+    /// cached key, or the transmit buffer was too small) — it is still marked
+    /// challenged and will be retried on its own backoff.
+    pub fn poll_challenge<'tx>(
+        &mut self,
+        now: core::time::Duration,
+        tx_buf: &'tx mut [u8],
+    ) -> Option<(Mac, LinkFrameData<'tx>)> {
+        if self.auth_locked() {
+            trace!("drop: auth locked, suppressing challenge emission");
+            return None;
+        }
+        // Pick one candidate, ending the borrow before mutating below.
+        let target = self.batman.challenge_candidates(now).next()?;
+
+        // Mark it challenged regardless of what follows. `poll_due_challenges`
+        // loops this call until `None`, so a candidate that fails below (no
+        // cached key yet — the ordinary state of an unproven/uncredentialed
+        // relay, exactly the attacker case this feature defends against) must
+        // still count as attempted: leaving it unmarked would make it fail
+        // the same way on every future poll too, permanently starving every
+        // other candidate's proof behind it.
+        self.batman.note_challenged(now, target);
+
+        let auth = self.auth.as_mut()?;
+        let nonce = auth.issue_challenge(target)?;
+
+        let hdr = BatmanNextHopChallengePacket {
+            packet_type: BatmanPacketType::NextHopChallenge.as_u8(),
+            version: 5,
+        };
+        let hdr_len = core::mem::size_of::<BatmanNextHopChallengePacket>();
+        let total = hdr_len + nonce.len();
+        if tx_buf.len() < total {
+            trace!("drop: tx buffer too small for challenge");
+            return None;
+        }
+        tx_buf[..hdr_len].copy_from_slice(hdr.as_bytes());
+        tx_buf[hdr_len..total].copy_from_slice(&nonce);
+
+        debug!(neighbor = ?target, "auth: challenging candidate next hop");
+        Some((
+            target,
+            LinkFrameData {
+                dst: target,
+                protocol: DEFAULT_BATMAN_ETHER_TYPE,
+                payload: &tx_buf[..total],
+            },
+        ))
     }
 
     /// Install (or replace) the adaptive OGM schedule for mesh interface `idx`,
@@ -1662,6 +1919,23 @@ impl<
         self.batman.next_keepalive_after(now)
     }
 
+    /// How long until the soonest next-hop proof challenge falls due, or
+    /// `None` when there is nothing to challenge (no unproven path, or
+    /// authentication off).
+    ///
+    /// The third deadline a driver's periodic arm sleeps on, alongside
+    /// [`next_broadcast_after`](Self::next_broadcast_after) and
+    /// [`next_keepalive_after`](Self::next_keepalive_after). Proof used to
+    /// ride the OGM timer, which meant a newly discovered originator was not
+    /// challenged until the next Trickle deadline — up to a full `i_max` on a
+    /// mesh that has settled, during which it could carry no traffic.
+    pub fn next_challenge_after(&self, now: core::time::Duration) -> Option<core::time::Duration> {
+        if self.auth_locked() {
+            return None;
+        }
+        self.batman.next_challenge_after(now)
+    }
+
     /// The index of the interface most overdue to emit a keep-alive as of
     /// `now`, or `None` when none is configured or due.
     pub fn due_keepalive_interface(&self, now: core::time::Duration) -> Option<usize> {
@@ -1674,14 +1948,40 @@ impl<
         self.batman.on_keepalive_emitted(idx, now);
     }
 
+    /// The next hop to address a frame for `dest` to, or `None` if `dest`
+    /// must not be dispatched to right now.
+    ///
+    /// Distinguishes the two reasons [`BatmanEngine::next_hop`] can return
+    /// `None`: **no route known at all** — `dest` may be a direct, non-mesh
+    /// peer (a plain device behind the TAP bridge that never runs BATMAN), so
+    /// falling back to addressing it directly is the original, legitimate
+    /// behavior — versus **a route is known, but nothing about it is
+    /// currently provable** (no live path, or every path's neighbor is
+    /// unproven or has lapsed). Conflating the two would address a frame
+    /// directly to a destination that is not actually one hop away over
+    /// whatever egress the (attacker-poisonable) link-quality table picks —
+    /// exactly the interception the next-hop proof gate exists to close. See
+    /// `docs/design/09-mesh-auth-gaps.md` §4.
+    fn resolve_next_hop(&self, now: core::time::Duration, dest: Mac) -> Option<Mac> {
+        if let Some(hop) = self.batman.next_hop(now, dest) {
+            return Some(hop);
+        }
+        if self.batman.originator_table.contains_key(&dest) {
+            return None;
+        }
+        Some(dest)
+    }
+
     /// Wrap host data destined for `dest` in the appropriate BATMAN packet,
     /// ready to hand to a link.  A `dest` of [`MeshIdentifier::BROADCAST`]
     /// produces a flooded [`BatmanBroadcastPacket`] (e.g. for a host ARP);
     /// any other destination produces a [`BatmanUnicastPacket`] routed toward
     /// the best-known next hop.  Returns [`LocalSendError::BufferTooSmall`] if
-    /// `payload` plus the header would not fit in `tx_buf`, or
+    /// `payload` plus the header would not fit in `tx_buf`,
     /// [`LocalSendError::AuthLocked`] while
-    /// [`auth_locked`](CentralRouter::auth_locked).
+    /// [`auth_locked`](CentralRouter::auth_locked), or
+    /// [`LocalSendError::RouteUnproven`] if a route to `dest` exists but no
+    /// candidate next hop for it has proven itself.
     ///
     /// [`MeshIdentifier::BROADCAST`]: interfaces::frame::MeshIdentifier::BROADCAST
     pub fn handle_local<'a>(
@@ -1720,10 +2020,9 @@ impl<
         }
 
         // 1. Query BATMAN for the next-hop physical address
-        let next_hop = if let Some(next_hop) = self.batman.next_hop(now, dest) {
-            next_hop
-        } else {
-            dest
+        let Some(next_hop) = self.resolve_next_hop(now, dest) else {
+            trace!(?dest, "drop: route known but no proven next hop");
+            return Err(LocalSendError::RouteUnproven);
         };
         // 2. Build the Unicast Header
         let header = BatmanUnicastPacket {
@@ -1753,18 +2052,33 @@ impl<
         })
     }
 
-    /// Choose the egress interface for a frame destined to `dest`.
+    /// Choose the egress interface for a frame addressed to `dest`.
+    ///
+    /// `dest` here is already the mac the caller has decided to address the
+    /// frame to — a proof-gated next hop chosen by [`handle_local`]/
+    /// [`handle_local_mcast`] (via [`resolve_next_hop`](Self::resolve_next_hop)),
+    /// a deliberately-unproven one chosen by the cert-control plane (via
+    /// [`next_hop_unproven_ok`](batman::BatmanEngine::next_hop_unproven_ok)),
+    /// or a re-flood/reply the engine already routed. This function does not
+    /// re-run the proof gate: *which* mac is trustworthy to address was the
+    /// caller's decision; this is purely *which interface* reaches the mac it
+    /// was given.
     ///
     /// Resolution order:
     /// 1. `BROADCAST` always returns [`EgressInterface::All`].
-    /// 2. If BATMAN has chosen a next-hop neighbor for `dest`, use the
-    ///    interface with the best EWMA link quality observed for *that
-    ///    neighbor*.  This is what makes the choice metric-driven.
-    /// 3. Otherwise (no BATMAN route — `dest` is presumed to be a direct
-    ///    neighbor or unknown), fall back to the best-quality interface
-    ///    observed for `dest` itself.
-    /// 4. If no quality data exists yet, fall back to the legacy
-    ///    last-seen [`IdentTable`] entry.
+    /// 2. If `dest` is itself a proven one-hop neighbor, the interface it
+    ///    actually answered a challenge on wins over the link-quality table's
+    ///    opinion — that table is written on receipt, before any
+    ///    authentication verdict, so a spoofed source address can steer it,
+    ///    while an answered challenge cannot be faked by anyone without the
+    ///    pairwise key.
+    /// 3. Otherwise, the interface with the best EWMA link quality observed
+    ///    for `dest`.  This is what makes the choice metric-driven.
+    /// 4. If no quality data exists yet, fall back to the legacy last-seen
+    ///    [`IdentTable`] entry.
+    ///
+    /// [`handle_local`]: CentralRouter::handle_local
+    /// [`handle_local_mcast`]: CentralRouter::handle_local_mcast
     #[tracing::instrument(skip(self))]
     pub fn get_egress_interface(
         &mut self,
@@ -1776,6 +2090,16 @@ impl<
         }
 
         let next_hop = self.batman.next_hop(now, dest).unwrap_or(dest);
+
+        // The interface the next hop actually answered a challenge on wins over
+        // the link-quality table's opinion. That table is written on receipt,
+        // before any authentication verdict, so a spoofed source address can
+        // steer it; an answered challenge cannot be faked by anyone without the
+        // pairwise key. Falls through when proof is not required (an
+        // unauthenticated mesh) or has lapsed.
+        if let Some(iface) = self.batman.proven_interface(now, next_hop) {
+            return Some(EgressInterface::Interface(iface));
+        }
 
         if let Some(iface) = self.link_quality.best_interface_for(next_hop) {
             return Some(EgressInterface::Interface(iface));
@@ -1789,6 +2113,15 @@ impl<
     /// This node's own mesh address.
     pub fn self_ident(&self) -> Mac {
         self.batman.self_ident
+    }
+
+    /// Whether `neighbor` currently holds a valid next-hop proof as of `now`.
+    ///
+    /// Surfaced for observability: the management API reports it per path, so
+    /// an operator can tell a candidate still being challenged from a genuinely
+    /// unreachable one. Always `true` on an unauthenticated mesh.
+    pub fn proof_current(&self, now: core::time::Duration, neighbor: Mac) -> bool {
+        self.batman.proof_current(now, neighbor)
     }
 
     /// Iterate every known originator record.  The originator table is keyed by
@@ -1837,7 +2170,7 @@ impl<
         self.batman
             .originator_table
             .values()
-            .filter(|r| r.best_next_hop == r.neighbor_ident)
+            .filter(|r| r.best_next_hop == Some(r.neighbor_ident))
             .count()
     }
 
@@ -1957,13 +2290,15 @@ impl<
     /// router state.  Used to back the management-API `ResolveRoute`
     /// request.
     ///
-    /// `next_hop` mirrors the `next_hop(now, dest).unwrap_or(dest)`
-    /// fallback used inside [`handle_local`] — when no live BATMAN route is
-    /// known the router will try to reach `dest` directly.
+    /// `next_hop` mirrors [`resolve_next_hop`](Self::resolve_next_hop)'s
+    /// fallback used inside [`handle_local`] — when no route to `dest` is
+    /// known at all, the router will try to reach `dest` directly, so this
+    /// still names `dest` itself.
     ///
     /// The egress value is `None` when no link-quality or last-seen
-    /// information exists for the destination; in that state the data
-    /// plane has nothing to transmit on either.
+    /// information exists for the destination, *or* when a route is known
+    /// but no candidate next hop for it has proven itself — in either state
+    /// the data plane has nothing it may transmit on.
     ///
     /// [`handle_local`]: CentralRouter::handle_local
     /// [`get_egress_interface`]: CentralRouter::get_egress_interface
@@ -1976,17 +2311,15 @@ impl<
             return (Mac::BROADCAST, Some(EgressInterface::All));
         }
 
-        let next_hop = self.batman.next_hop(now, dest).unwrap_or(dest);
-
-        let egress = if let Some(iface) = self.link_quality.best_interface_for(next_hop) {
-            Some(EgressInterface::Interface(iface))
-        } else {
-            self.ident_table
-                .peek_egress_interface(dest)
+        let next_hop = self.resolve_next_hop(now, dest);
+        let egress = next_hop.and_then(|hop| {
+            self.link_quality
+                .best_interface_for(hop)
+                .or_else(|| self.ident_table.peek_egress_interface(dest))
                 .map(EgressInterface::Interface)
-        };
+        });
 
-        (next_hop, egress)
+        (next_hop.unwrap_or(dest), egress)
     }
 }
 
@@ -2270,6 +2603,57 @@ mod cert_control_delivery {
         assert_eq!(fwd_hdr.ttl, 9);
         assert_eq!(&rest[..b"cert body".len()], b"cert body");
         assert!(outcome.deliver_local.is_none());
+    }
+}
+
+#[cfg(test)]
+mod untaggable_drop_metric {
+    //! The drop this counts is invisible from anywhere else: the route
+    //! resolved, the frame was planned, and then it simply never went out. See
+    //! `docs/design/09-mesh-auth-gaps.md` §7.
+
+    use super::*;
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    /// Nothing dropped, nothing reported — the zero case an operator reads as
+    /// "healthy", so it must not drift.
+    #[test]
+    fn rate_is_zero_before_any_drop() {
+        let router = CentralRouter::new(mac(1));
+        assert_eq!(router.untaggable_drop_rate(Duration::ZERO), 0.0);
+        assert_eq!(router.untaggable_drop_rate(Duration::from_secs(60)), 0.0);
+    }
+
+    /// A sustained stream of drops reads as a non-zero rate.
+    #[test]
+    fn sustained_drops_read_as_a_nonzero_rate() {
+        let mut router = CentralRouter::new(mac(1));
+        for tick in 0..50 {
+            router.record_untaggable_drop(Duration::from_millis(tick * 100));
+        }
+        assert!(
+            router.untaggable_drop_rate(Duration::from_millis(4900)) > 0.0,
+            "drops happening now must be visible now"
+        );
+    }
+
+    /// And it decays once they stop: a bounded here-and-now signal, not a
+    /// monotonic total that stays alarming forever after one bad minute.
+    #[test]
+    fn the_rate_decays_once_drops_stop() {
+        let mut router = CentralRouter::new(mac(1));
+        for tick in 0..50 {
+            router.record_untaggable_drop(Duration::from_millis(tick * 100));
+        }
+        let during = router.untaggable_drop_rate(Duration::from_millis(4900));
+        let long_after = router.untaggable_drop_rate(Duration::from_secs(600));
+        assert!(
+            long_after < during,
+            "rate must decay after the drops stop: {during} -> {long_after}"
+        );
     }
 }
 
@@ -3397,6 +3781,21 @@ mod ogm_auth_integration {
         r
     }
 
+    /// Mark `macs` as having proven themselves next hops for `r`.
+    ///
+    /// Enabling auth turns on the next-hop proof gate, so an unproven relay
+    /// carries no data — correct, but orthogonal to what most of these tests
+    /// are about. The real challenge/response exchange has its own coverage
+    /// (`auth::tests`, `batman::engine::tests`, and this module's own
+    /// `an_uncredentialed_candidate_does_not_starve_a_legitimate_ones_proof`,
+    /// which drives `poll_challenge` end to end); this shortcut keeps a test
+    /// of *route selection* about route selection.
+    fn prove(r: &mut CentralRouter, macs: &[Mac], now: Duration) {
+        for m in macs {
+            r.batman.note_proven(now, *m, 0);
+        }
+    }
+
     /// Drive one OGM out of `r` and return its serialized payload.
     fn poll_ogm_bytes(r: &mut CentralRouter) -> Vec<u8> {
         let mut tx = [0u8; 1500];
@@ -3537,6 +3936,48 @@ mod ogm_auth_integration {
             node.originator_count(),
             0,
             "set_auth must reset learned routing state"
+        );
+    }
+
+    /// `set_auth`'s reset must also drop next-hop proof state, not just the
+    /// originator table.
+    ///
+    /// A proof answered under the *old* pairwise key material says nothing
+    /// about the new identity/trust anchor `set_auth` just installed — the
+    /// same reasoning `set_auth`'s own doc gives for dropping routes and
+    /// link-quality. Leaving `proven`/`challenged` behind would let a MAC
+    /// proven under a stale regime keep carrying data for up to
+    /// `MAX_MISSED_PROOFS` proof cycles after re-anchoring, exactly the
+    /// window the reset exists to close.
+    #[test]
+    fn set_auth_also_resets_next_hop_proof_state() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut node = CentralRouter::new(mac(2));
+
+        // Anchor once, so the proof gate is live and `proof_current` reports
+        // the recorded proof rather than the unauthenticated-mesh `true`.
+        let first = Keypair::from_seed(&[4; 32]);
+        let first_cert = authority.issue_cert(mac(2), first.ed_pubkey(), first.x_pubkey(), 0, 1000);
+        let mut first_auth = crate::auth::OgmAuth::new(first, first_cert, authority.trust_anchor());
+        first_auth.set_time(100);
+        node.set_auth(first_auth);
+
+        node.batman.note_proven(Duration::ZERO, mac(5), 0);
+        assert!(
+            node.proof_current(Duration::ZERO, mac(5)),
+            "the proof is current under the regime it was answered in"
+        );
+
+        // Re-anchor onto fresh identity/trust-anchor material.
+        let kp = Keypair::from_seed(&[3; 32]);
+        let cert = authority.issue_cert(mac(2), kp.ed_pubkey(), kp.x_pubkey(), 0, 1000);
+        let mut auth = crate::auth::OgmAuth::new(kp, cert, authority.trust_anchor());
+        auth.set_time(100);
+        node.set_auth(auth);
+
+        assert!(
+            !node.proof_current(Duration::ZERO, mac(5)),
+            "a proof answered under the old regime must not survive set_auth"
         );
     }
 
@@ -3820,11 +4261,19 @@ mod ogm_auth_integration {
         let ka1 = neighbor_a.poll_keepalive(&mut tx).unwrap().payload.to_vec();
         feed_at(&mut router, mac(2), 0, &ka1, Duration::from_secs(1));
 
+        // Both relays prove themselves; the gate is orthogonal to the
+        // keep-alive selection this test is about.
+        prove(&mut router, &[mac(2), mac(3)], Duration::ZERO);
+
         let mut tx = [0u8; 256];
         let before = router
             .handle_local(Duration::from_secs(1), mac(9), b"hi", &mut tx)
             .unwrap();
         assert_eq!(before.dst, mac(2), "before any miss, higher TQ wins");
+
+        // Re-prove at the later instant: a proof lapses on its own budget, and
+        // a running node refreshes it from `poll_due_challenges`.
+        prove(&mut router, &[mac(2), mac(3)], Duration::from_secs(5));
 
         let mut tx2 = [0u8; 256];
         let after = router
@@ -3853,6 +4302,112 @@ mod ogm_auth_integration {
             mac(3),
             "a forged keep-alive must not resurrect the dead route"
         );
+    }
+
+    // ── `handle_local` must not fall back to an unproven route ─────────────
+
+    /// The interception this whole feature exists to prevent, reproduced at
+    /// `handle_local` — the *locally originated* send path, not a relay.
+    ///
+    /// `next_hop(now, dest) == None` has two different causes since the
+    /// next-hop proof gate landed: "no route is known at all" (`dest` may be
+    /// a direct, non-mesh peer — the original, legitimate meaning of the
+    /// `unwrap_or(dest)` fallback this replaces) and "a route is known, but
+    /// its next hop has not proven itself" (exactly the state an attacker's
+    /// spoofed or replayed OGM puts a route in — gap 1/2). Falling back to
+    /// `dest` in the second case addresses the frame directly to a
+    /// destination that is not actually one hop away, over whatever egress
+    /// the attacker-poisonable link-quality table picks — silently
+    /// reintroducing the interception this feature exists to close, for
+    /// every locally-originated frame sent before the real relay proves
+    /// itself. See `docs/design/09-mesh-auth-gaps.md` §4.
+    #[test]
+    fn handle_local_refuses_a_route_with_no_proven_next_hop() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut dest = router_with_auth(&authority, mac(9), 9);
+        let mut router = router_with_auth(&authority, mac(1), 1);
+
+        // `dest`'s own signed OGM, relayed by mac(2) — a route is learned,
+        // but nothing about the relay is trusted: `router` has never even
+        // seen mac(2)'s own OGM, let alone proven it.
+        let ogm = poll_ogm_bytes(&mut dest);
+        feed_at(&mut router, mac(2), 0, &ogm, Duration::ZERO);
+        assert_eq!(router.originator_count(), 1, "the route is learned");
+
+        let mut tx = [0u8; 256];
+        let err = router
+            .handle_local(Duration::ZERO, mac(9), b"hi", &mut tx)
+            .expect_err("a route whose next hop has not proven itself must be refused");
+        assert_eq!(err, LocalSendError::RouteUnproven);
+    }
+
+    /// The legitimate half of the same fallback survives: a destination with
+    /// *no* route at all (a direct, non-mesh peer on the link, or simply
+    /// unknown) is still dispatched to directly — refusing every unrouted
+    /// destination would break reaching a plain device behind the TAP
+    /// bridge, which never runs BATMAN at all.
+    #[test]
+    fn handle_local_still_falls_back_to_an_unrouted_destination() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = router_with_auth(&authority, mac(1), 1);
+
+        let mut tx = [0u8; 256];
+        let out = router
+            .handle_local(Duration::ZERO, mac(42), b"hi", &mut tx)
+            .expect("no route known at all must still fall back to dest");
+        assert_eq!(out.dst, mac(42));
+    }
+
+    // ── `poll_challenge` must not starve on an uncredentialed candidate ────
+
+    /// An outsider that only ever relays a real member's OGM (gap 1/2's own
+    /// attack, and precisely the case this feature exists to leave unproven
+    /// forever) must not permanently block every *other* candidate's proof.
+    ///
+    /// `issue_challenge` fails closed for a candidate with no cached key —
+    /// the ordinary state of exactly the attacker this feature defends
+    /// against. `poll_due_challenges` loops `poll_challenge` until it returns
+    /// `None`, so a candidate that fails without first being marked
+    /// challenged would return `None` on every future poll too (nothing ever
+    /// backs it off), stopping the loop at the very first uncredentialed
+    /// candidate on every tick and starving every legitimate candidate
+    /// behind it — turning the held gap-1/2 attack into an active,
+    /// uncredentialed denial of service worse than the blackhole it
+    /// replaced.
+    #[test]
+    fn an_uncredentialed_candidate_does_not_starve_a_legitimate_ones_proof() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = router_with_auth(&authority, mac(1), 1);
+        let mut orig = router_with_auth(&authority, mac(9), 9);
+        let mut real_neighbor = router_with_auth(&authority, mac(2), 2);
+
+        // An outsider (mac 3, no credential at all) relays `orig`'s genuine
+        // signed OGM under its own link-layer source. `router` verifies
+        // `orig`'s signature (which attests nothing about the relay) and
+        // records the outsider as a candidate next hop — discovered first,
+        // so it is the one `challenge_candidates` offers on every poll.
+        let orig_ogm = poll_ogm_bytes(&mut orig);
+        feed_at(&mut router, mac(3), 0, &orig_ogm, Duration::ZERO);
+
+        // A real, credentialed neighbor is discovered right after.
+        let neighbor_ogm = poll_ogm_bytes(&mut real_neighbor);
+        feed_at(&mut router, mac(2), 0, &neighbor_ogm, Duration::ZERO);
+
+        let mut tx = [0u8; 64];
+        assert!(
+            router.poll_challenge(Duration::ZERO, &mut tx).is_none(),
+            "the outsider has no cached key, so issuing it a challenge fails"
+        );
+
+        // A later poll must reach the real neighbor rather than getting
+        // stuck retrying the same uncredentialed candidate that just failed.
+        let (target, _) = router
+            .poll_challenge(Duration::from_millis(1), &mut tx)
+            .expect(
+                "a candidate that cannot be proven must not permanently \
+                 block every other candidate's proof renewal",
+            );
+        assert_eq!(target, mac(2));
     }
 }
 
@@ -4222,6 +4777,16 @@ mod link_features_tests {
         assert!(
             !r.link_may_tx(0, Some(BatmanPacketType::Mcast)),
             "tx_data gates MCAST"
+        );
+        assert!(
+            !r.link_may_tx(0, Some(BatmanPacketType::NextHopChallenge)),
+            "tx_data gates a next-hop challenge: a link that never carries data \
+             can never need a proven next hop, so proving one there is pure \
+             airtime on a link an operator asked to stay quiet"
+        );
+        assert!(
+            !r.link_may_tx(0, Some(BatmanPacketType::NextHopResponse)),
+            "tx_data gates a next-hop response for the same reason"
         );
         assert!(
             r.link_may_tx(0, Some(BatmanPacketType::CertReq)),

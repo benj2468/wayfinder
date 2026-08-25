@@ -485,10 +485,10 @@ fn test_authenticated_unicast_delivers_and_strips_tag() {
     enable_auth(harness.get_machine_mut("machine2"), &authority, m2, 3);
 
     // Converge: signed OGMs exchange, so each node learns the other's pairwise
-    // key (required to tag/verify directed frames).
-    harness.poll_due(Duration::from_secs(1));
-    harness.tick();
-    harness.tick();
+    // key (required to tag/verify directed frames), and settle so the
+    // next-hop proof challenge/response round trip completes too — a route
+    // whose next hop has not yet proven itself is refused by `send_local`.
+    harness.converge(Duration::from_secs(1));
     for router in harness.machines.values() {
         assert_eq!(router.router().originator_table().count(), 1);
     }
@@ -1022,7 +1022,7 @@ fn traffic_fails_over_when_best_next_hop_disconnects() {
     // the metric alone never promotes it over the recorded `b` path.
     assert_eq!(
         record(&harness).best_next_hop,
-        b,
+        Some(b),
         "a's best next hop to d should be b (the 2-hop path)"
     );
 
@@ -1042,7 +1042,8 @@ fn traffic_fails_over_when_best_next_hop_disconnects() {
 
     let after = record(&harness);
     assert_eq!(
-        after.best_next_hop, c,
+        after.best_next_hop,
+        Some(c),
         "after b is lost, a must fail over to the c→e path"
     );
 
@@ -1257,7 +1258,7 @@ fn best_hop_reclaims_preferred_path_after_reconnect() {
             .router()
             .originator_table()
             .find(|r| r.neighbor_ident == d)
-            .map(|r| r.best_next_hop)
+            .and_then(|r| r.best_next_hop)
     };
 
     // Converge: `a` prefers the 2-hop path via `b`.
@@ -1368,7 +1369,7 @@ fn simultaneous_disconnects_blackhole_then_recover() {
             .router()
             .originator_table()
             .find(|r| r.neighbor_ident == d)
-            .map(|r| r.best_next_hop)
+            .and_then(|r| r.best_next_hop)
     };
 
     // Converge both a→d paths.
@@ -1469,7 +1470,7 @@ fn equal_cost_path_swaps_do_not_trigger_reflood() {
         .router()
         .originator_table()
         .find(|r| r.neighbor_ident == d)
-        .map(|r| r.best_next_hop);
+        .and_then(|r| r.best_next_hop);
     assert!(
         hop == Some(b) || hop == Some(c),
         "a's best next hop to d must be one of the two equal-cost neighbors, got {hop:?}"
@@ -1526,7 +1527,7 @@ fn link_down_triggers_failover_then_restore_reclaims() {
             .router()
             .originator_table()
             .find(|r| r.neighbor_ident == d)
-            .map(|r| r.best_next_hop)
+            .and_then(|r| r.best_next_hop)
     };
 
     for round in 1..=3 {
@@ -1887,7 +1888,8 @@ fn relay_choice_follows_measured_link_quality_on_tied_hop_count() {
         .find(|r| r.neighbor_ident == d)
         .expect("a must have learned a route to d");
     assert_eq!(
-        record.best_next_hop, b,
+        record.best_next_hop,
+        Some(b),
         "the relay with strictly better measured link quality must win, even though c \
          arrived first and both advertised the same encoded TQ"
     );

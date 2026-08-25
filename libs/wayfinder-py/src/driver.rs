@@ -255,6 +255,21 @@ impl PyDriver {
             .unwrap_or_default()
     }
 
+    /// Whether `mac` currently holds a valid next-hop proof — it answered a
+    /// challenge with the pairwise key for the address it claims, recently
+    /// enough that the proof has not lapsed.
+    ///
+    /// Only a proven neighbor can be selected as a next hop, so this is how a
+    /// probe tells "still being challenged" apart from "unreachable" when
+    /// `best_next_hop` is `None` but `paths` is not empty. Always `True` on an
+    /// unauthenticated mesh, which has no pairwise keys to prove with.
+    ///
+    /// Evaluated at the driver's last-ticked clock, the same instant the
+    /// routing tables were last recomputed at.
+    fn proof_current(&self, mac: PyMac) -> bool {
+        self.inner.router().proof_current(self.last_now, mac.0)
+    }
+
     /// The verified certificate this node holds for neighbor `mac`, if it has
     /// admitted it at all.
     fn neighbor_cert(&self, mac: PyMac) -> Option<PyMembershipCert> {

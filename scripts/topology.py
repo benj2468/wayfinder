@@ -468,7 +468,8 @@ def build_links() -> list[list[str]]:
     secured = [
         # *diamond("d"),  # d1..d4: two 2-hop paths d1⇒d4
         # *complete_graph("m", 5),  # m1..m5: fully meshed (10 links)
-        ["d4", "m1"],  # the bridge joining the diamond to the mesh
+        ["d1", "m1"],  # the bridge joining the diamond to the mesh
+        ["m1", "r1"],
     ]
     return secured + open_nodes(node_order(secured)[0])
 

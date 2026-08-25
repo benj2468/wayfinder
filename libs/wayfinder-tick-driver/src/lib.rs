@@ -29,6 +29,7 @@ use core::fmt;
 use core::time::Duration;
 
 use interfaces::link::LinkMetrics;
+use tracing::warn;
 use wayfinder::CentralRouter;
 use wayfinder::MAX_INTERFACES;
 use wayfinder::auth::DIRECTED_TRAILER_LEN;
@@ -42,6 +43,7 @@ use wayfinder_driver_core::MeshSink;
 use wayfinder_driver_core::OutgoingFrame;
 use wayfinder_driver_core::handle_mesh_frame;
 use wayfinder_driver_core::plan_dispatch;
+use wayfinder_driver_core::poll_due_challenges;
 use wayfinder_driver_core::poll_due_keepalives;
 use wayfinder_driver_core::poll_due_ogms;
 use zerocopy::FromBytes;
@@ -108,7 +110,9 @@ impl fmt::Display for MalformedFrameError {
 /// step.
 ///
 /// Interface indices run `0..num_interfaces()`, fixed at construction (the
-/// length of the `trickle` slice passed to [`Driver::new`]).
+/// length of the `trickle` slice passed to [`Driver::new`], capped at
+/// [`MAX_INTERFACES`] — the router holds no more than that, so neither does
+/// this driver).
 pub struct Driver {
     router: CentralRouter,
     mac: Mac,
@@ -132,7 +136,10 @@ pub struct Driver {
 }
 
 impl Driver {
-    /// Build a driver for node `mac` with `trickle.len()` interfaces.
+    /// Build a driver for node `mac` with `trickle.len()` interfaces, or
+    /// [`MAX_INTERFACES`] of them if that is fewer — a surplus is dropped with
+    /// a warning rather than kept as an interface the router will never
+    /// schedule or gate.
     /// `trickle[idx]` supplies that interface's adaptive OGM schedule;
     /// `features[idx]` its participation gates, defaulting to full
     /// participation ([`LinkFeatures::default`]) for any interface `features`
@@ -146,13 +153,25 @@ impl Driver {
         features: &[LinkFeatures],
         names: &[&str],
     ) -> Self {
-        let n = trickle.len();
-        debug_assert!(
-            n <= MAX_INTERFACES,
-            "Driver supports at most MAX_INTERFACES mesh interfaces"
-        );
+        // The router only tracks `MAX_INTERFACES` interfaces; an index past
+        // that is silently ignored, so a surplus interface is never
+        // OGM-scheduled *and* never gated (a `set_link_features` past the cap
+        // no-ops, so a link configured as a read-only tap would transmit
+        // anyway). Say so, and hold this driver's own interface count to what
+        // the router will actually act on rather than handing back queues
+        // nothing drains. This replaces a `debug_assert!`, which compiled out
+        // of exactly the release builds — the Python extension among them —
+        // where the divergence was invisible.
+        let n = trickle.len().min(MAX_INTERFACES);
+        if trickle.len() > MAX_INTERFACES {
+            warn!(
+                configured = trickle.len(),
+                max = MAX_INTERFACES,
+                "more mesh interfaces than the router supports; interfaces past the cap are dropped"
+            );
+        }
         let mut router = CentralRouter::new(mac);
-        for (idx, cfg) in trickle.iter().enumerate() {
+        for (idx, cfg) in trickle.iter().take(n).enumerate() {
             router.configure_interface_ogm(idx, cfg.i_min(), cfg.i_max(), Duration::ZERO);
             let link_features = features.get(idx).copied().unwrap_or_default();
             router.set_link_features(idx, link_features);
@@ -301,6 +320,11 @@ impl Driver {
         if keepalives {
             poll_due_keepalives(&mut self.router, now, &mut self.tx_buffer, &mut stage);
         }
+        // Unconditional, unlike the two schedules above: a next-hop challenge
+        // is not on a timer the caller steps, it is owed to whichever
+        // neighbours are currently unproven. The router spaces retries per
+        // neighbour, so ticking often does not mean challenging often.
+        poll_due_challenges(&mut self.router, now, &mut self.tx_buffer, &mut stage);
 
         for staged in stage.frames.drain(..) {
             self.dispatch_one(now, staged);
@@ -406,6 +430,25 @@ mod tests {
             tvlv_len: 0,
         };
         ogm.as_bytes().to_vec()
+    }
+
+    /// More interfaces than the router can hold must not leave the driver
+    /// reporting interfaces the router will never schedule or gate.
+    ///
+    /// The router silently ignores an index at or past its capacity, so a
+    /// surplus interface gets no OGM timer and no `LinkFeatures` entry — it is
+    /// mute, and a read-only tap configured there would transmit anyway. The
+    /// driver must agree with the router about how many interfaces it has, so
+    /// a caller sees the truncation instead of addressing a queue nothing
+    /// drains.
+    #[test]
+    fn interfaces_past_the_router_capacity_are_not_silently_kept() {
+        let trickle = vec![TrickleConfig::default(); MAX_INTERFACES + 4];
+        let mut driver = Driver::new(mac(1), &trickle, &[], &[]);
+
+        assert_eq!(driver.router().num_interfaces(), MAX_INTERFACES);
+        assert_eq!(driver.num_interfaces(), driver.router().num_interfaces());
+        assert!(driver.poll_egress(MAX_INTERFACES).is_none());
     }
 
     /// One due interface's `tick` stages exactly one OGM broadcast into that

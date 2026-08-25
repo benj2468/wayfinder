@@ -64,13 +64,19 @@ pub struct NeighborPathData {
     pub tq: u32,
     /// Sequence number of the most recent OGM accepted on this path.
     pub last_seqno: u32,
+    /// Whether this neighbor currently holds a valid next-hop proof. Only a
+    /// proven path can be selected as the next hop; always `true` on an
+    /// unauthenticated mesh, which has no pairwise keys to prove with.
+    pub proven: bool,
 }
 
 /// Intermediate representation of a routing table entry.
 pub struct RoutingEntryData {
     /// The destination originator this entry routes to.
     pub destination: Vec<u8>,
-    /// Immediate neighbor on the currently-selected best path.
+    /// Immediate neighbor on the currently-selected best path, or empty when
+    /// no path is currently usable — including when every known path is via a
+    /// neighbor that has not proven itself.
     pub next_hop: Vec<u8>,
     /// Best-path transmission quality (0..=255) to the destination.
     pub tq: u32,
@@ -395,6 +401,10 @@ pub struct NodeMetricsData {
     /// Smoothed rate (frames/sec) at which this node sends `CertReply`. Zero
     /// when auth is disabled.
     pub cert_reply_rate: f64,
+    /// Smoothed frames/sec at which directed frames are dropped for want of a
+    /// pairwise key with their next hop — a silent drop from the sender's
+    /// point of view, and the only signal it is happening.
+    pub untaggable_drop_rate: f64,
 }
 
 /// Egress decision a router would make for a destination.  Mirrors
@@ -1084,6 +1094,7 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                                 neighbor_id: p.neighbor_id,
                                 tq: p.tq,
                                 last_seqno: p.last_seqno,
+                                proven: p.proven,
                             })
                             .collect(),
                     })
@@ -1232,6 +1243,7 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                     pending_cert_replies: occ(m.pending_cert_replies),
                     cert_req_rate: m.cert_req_rate,
                     cert_reply_rate: m.cert_reply_rate,
+                    untaggable_drop_rate: m.untaggable_drop_rate,
                 })
             }
 
@@ -2639,6 +2651,7 @@ mod tests {
                 },
                 cert_req_rate: 0.5,
                 cert_reply_rate: 1.25,
+                untaggable_drop_rate: 0.75,
             },
             ..Default::default()
         };
@@ -2662,6 +2675,7 @@ mod tests {
                 assert_eq!(m.pending_cert_replies.unwrap().used, 2);
                 assert_eq!(m.cert_req_rate, 0.5);
                 assert_eq!(m.cert_reply_rate, 1.25);
+                assert_eq!(m.untaggable_drop_rate, 0.75);
             }
             other => panic!("expected Metrics, got {:?}", proto_kind_name(&other)),
         }

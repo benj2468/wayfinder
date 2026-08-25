@@ -41,11 +41,19 @@ impl<
     /// receive hot path use the time-aware [`next_hop`](Self::next_hop) instead,
     /// which additionally ignores paths that have gone stale since the last
     /// sweep.
-    pub fn lookup_route(&self, destination: Mac) -> Option<Mac> {
-        // O(1) keyed lookup of the destination's record.
+    ///
+    /// Deliberately **not** `pub`: it takes no `now`, so it cannot answer the
+    /// time-dependent question of whether the cached hop's proof is still
+    /// current. Every production caller wants [`next_hop`](Self::next_hop);
+    /// this exists for tests that assert on the cache itself.
+    #[cfg(test)]
+    pub(crate) fn lookup_route(&self, destination: Mac) -> Option<Mac> {
+        // O(1) keyed lookup of the destination's record.  `best_next_hop` is
+        // already `None` for a record whose paths are all unproven, so the
+        // proof gate needs no separate check here.
         self.originator_table
             .get(&destination)
-            .map(|record| record.best_next_hop)
+            .and_then(|record| record.best_next_hop)
     }
 
     /// The best next hop toward `destination` as of `now`, ignoring any path
@@ -53,6 +61,14 @@ impl<
     /// own learned emission interval.  Returns `None` when the destination is
     /// unknown or every path to it is stale, so a caller never forwards toward a
     /// neighbor that has gone silent, even between periodic sweeps.
+    ///
+    /// Also `None` when a route exists but no live path's neighbor holds a
+    /// current next-hop proof (authenticated meshes only). That is a *distinct*
+    /// state from "destination unknown", and callers must not conflate the two
+    /// — doing so is how the `unwrap_or(dest)` fallback this gate removed gets
+    /// reintroduced. See [`CentralRouter::resolve_next_hop`] for the split.
+    ///
+    /// [`CentralRouter::resolve_next_hop`]: ../wayfinder/struct.CentralRouter.html
     ///
     /// Among the surviving (non-OGM-stale) paths, selection uses
     /// [`effective_tq`](Self::effective_tq) rather than the raw
@@ -69,8 +85,311 @@ impl<
             .paths
             .iter()
             .filter(|p| !Self::path_stale(now, p, seed))
+            // The proof gate. Separate from `recompute_best`'s because this is
+            // the hot path: it recomputes from `paths` rather than reading the
+            // cached `best_next_hop`, so gating only the cache would leave
+            // forwarding open to exactly the next hop the cache refused.
+            .filter(|p| self.proof_current(now, p.neighbor_ident))
             .max_by_key(|p| self.effective_tq(now, p))
             .map(|p| p.neighbor_ident)
+    }
+
+    /// The best next hop toward `destination` as of `now`, **ignoring the proof
+    /// gate** — the same selection [`next_hop`](Self::next_hop) makes, minus
+    /// the requirement that the relay have proven itself.
+    ///
+    /// Exists for the certificate-control plane alone, and is a deliberate
+    /// hole. Proving a neighbor needs its pairwise key, which needs its
+    /// certificate; under lazy cert distribution that certificate may itself
+    /// have to be fetched over the mesh. Gating the fetch on proof deadlocks
+    /// bootstrap: nobody can prove anything because nobody can obtain the keys
+    /// to prove with.
+    ///
+    /// Safe precisely because of what travels this path. A certificate is
+    /// public data and a `CertReq` carries the requester's own signed cert, so
+    /// an attacker attracting this traffic learns nothing it could not read off
+    /// the air, and can at worst blackhole cert distribution — which it could
+    /// already do by jamming. **The data plane must never use this.**
+    pub fn next_hop_unproven_ok(&self, now: core::time::Duration, destination: Mac) -> Option<Mac> {
+        let seed = self.seed_interval();
+        let record = self.originator_table.get(&destination)?;
+        record
+            .paths
+            .iter()
+            .filter(|p| !Self::path_stale(now, p, seed))
+            .max_by_key(|p| self.effective_tq(now, p))
+            .map(|p| p.neighbor_ident)
+    }
+
+    /// Record that `neighbor` has just proven itself a legitimate next hop.
+    ///
+    /// Called by the router when a challenge response verifies; the engine
+    /// holds the timestamp but never the key material.
+    pub fn note_proven(&mut self, now: core::time::Duration, neighbor: Mac, iface: usize) {
+        if self.proven.insert(neighbor, (now, iface)).is_err() {
+            // Table full: evict the least-recently-proven to make room, rather
+            // than refusing a fresh proof and stranding the route it unlocks.
+            if let Some(oldest) = self
+                .proven
+                .iter()
+                .min_by_key(|(_, (t, _))| *t)
+                .map(|(m, _)| *m)
+            {
+                self.proven.remove(&oldest);
+                let _ = self.proven.insert(neighbor, (now, iface));
+            }
+        }
+        // The peer answered, so whatever backoff its unanswered attempts had
+        // grown is spent: the next renewal starts from `i_min` again. Without
+        // this, one bad patch would permanently slow every future renewal of an
+        // otherwise healthy neighbor.
+        //
+        // Dropped outright rather than zeroed, so the *next* attempt is the
+        // first of a new run rather than the second of the old one. Nothing is
+        // challenged early as a result: `proof_needs_refresh` is false for a
+        // neighbor that has just proven itself, and it is the later of the two
+        // waits that governs in `next_challenge_after`.
+        self.challenged.remove(&neighbor);
+        // A fresh proof can unlock a route immediately; don't make it wait for
+        // the next periodic sweep.
+        self.recompute_all_best(now);
+    }
+
+    /// Recompute every record's cached `best_next_hop`/`max_tq` against the
+    /// current proof state.
+    ///
+    /// Run both after paths age out and the moment a neighbor proves itself:
+    /// a proof arriving is precisely when a route becomes usable, and waiting
+    /// for the next periodic sweep would leave the management API reporting no
+    /// route for a link that already works.
+    fn recompute_all_best(&mut self, now: core::time::Duration) {
+        let seed = self.seed_interval();
+        // Snapshot which neighbors are selectable before taking the mutable
+        // borrow on the table, since the proof check reads `&self`.
+        let require_proof = self.require_proof;
+        let selectable: heapless::Vec<Mac, MAX_ORIGINATORS> = self
+            .proven
+            .iter()
+            .filter(|(_, (last, _))| {
+                !Self::is_stale(
+                    now,
+                    *last,
+                    core::time::Duration::ZERO,
+                    seed,
+                    crate::MAX_MISSED_PROOFS,
+                )
+            })
+            .map(|(m, _)| *m)
+            .collect();
+        let is_selectable = |m: Mac| !require_proof || selectable.contains(&m);
+
+        for record in self.originator_table.values_mut() {
+            Self::recompute_best(record, &is_selectable);
+        }
+    }
+
+    /// Whether `neighbor`'s proof is current as of `now`.
+    ///
+    /// Always `true` when proof is not required (see
+    /// [`set_require_proof`](Self::set_require_proof)), so an unauthenticated
+    /// mesh — which has no pairwise keys and therefore no way to prove
+    /// anything — routes exactly as it did before.
+    pub fn proof_current(&self, now: core::time::Duration, neighbor: Mac) -> bool {
+        if !self.require_proof {
+            return true;
+        }
+        let seed = self.seed_interval();
+        self.proven.get(&neighbor).is_some_and(|(last, _)| {
+            !Self::is_stale(
+                now,
+                *last,
+                core::time::Duration::ZERO,
+                seed,
+                crate::MAX_MISSED_PROOFS,
+            )
+        })
+    }
+
+    /// The interface `neighbor` most recently answered a challenge on, if its
+    /// proof is still current.
+    ///
+    /// What egress resolution pins to, in preference to the link-quality
+    /// table — see the `proven` field for why that table cannot be
+    /// trusted to locate a peer under attack.
+    pub fn proven_interface(&self, now: core::time::Duration, neighbor: Mac) -> Option<usize> {
+        if !self.require_proof {
+            return None;
+        }
+        let seed = self.seed_interval();
+        self.proven.get(&neighbor).and_then(|(last, iface)| {
+            (!Self::is_stale(
+                now,
+                *last,
+                core::time::Duration::ZERO,
+                seed,
+                crate::MAX_MISSED_PROOFS,
+            ))
+            .then_some(*iface)
+        })
+    }
+
+    /// Set whether a next hop must prove itself before it can be selected.
+    ///
+    /// The router turns this on exactly when mesh authentication is enabled.
+    pub fn set_require_proof(&mut self, require: bool) {
+        self.require_proof = require;
+    }
+
+    /// Whether `neighbor`'s proof should be renewed now.
+    ///
+    /// True well *before* [`proof_current`](Self::proof_current) goes false —
+    /// after one expected interval against that call's
+    /// [`MAX_MISSED_PROOFS`](crate::MAX_MISSED_PROOFS). Refreshing only once a
+    /// proof has already lapsed would drop the route for however long the
+    /// round trip takes, so a steady-state mesh would flap its next hop on
+    /// every proof cycle. The gap between the two thresholds is the margin the
+    /// exchange gets to complete in.
+    fn proof_needs_refresh(&self, now: core::time::Duration, neighbor: Mac) -> bool {
+        let seed = self.seed_interval();
+        match self.proven.get(&neighbor) {
+            None => true,
+            Some((last, _)) => Self::is_stale(now, *last, core::time::Duration::ZERO, seed, 1),
+        }
+    }
+
+    /// Every neighbor offering a path whose proof is missing, lapsed, or due
+    /// for renewal — the set a driver should challenge.
+    ///
+    /// Empty when proof is not required. Yields each neighbor once even when it
+    /// relays for several originators, so a driver does not challenge the same
+    /// peer repeatedly in one pass.
+    pub fn challenge_candidates(
+        &self,
+        now: core::time::Duration,
+    ) -> impl Iterator<Item = Mac> + '_ {
+        let mut seen: heapless::Vec<Mac, MAX_ORIGINATORS> = heapless::Vec::new();
+        self.originator_table
+            .values()
+            .flat_map(|r| r.paths.iter())
+            .map(|p| p.neighbor_ident)
+            .filter(move |m| {
+                if !self.require_proof || seen.contains(m) || !self.proof_needs_refresh(now, *m) {
+                    return false;
+                }
+                // Back off between attempts at the same neighbor, so a peer
+                // that never answers costs one challenge per `seed_interval`
+                // rather than one per driver tick — but reach that rate by
+                // doubling from `i_min`, not by starting there. See the
+                // `challenged` field for why the first attempt is the one that
+                // most often needs a prompt retry.
+                if let Some((last, misses)) = self.challenged.get(m)
+                    && now.saturating_sub(*last) < self.challenge_backoff(*misses)
+                {
+                    return false;
+                }
+                let _ = seen.push(*m);
+                true
+            })
+    }
+
+    /// Record that `neighbor` has just been challenged, extending its retry
+    /// backoff by one doubling. Called by the router when it puts a challenge
+    /// on the wire.
+    ///
+    /// The miss count only grows here and is cleared in
+    /// [`note_proven`](Self::note_proven), so it counts *consecutive
+    /// unanswered* attempts: an attempt that is answered before the next one
+    /// is issued never lengthens the backoff. It saturates rather than wraps,
+    /// which is what keeps a long-silent peer's backoff at the cap instead of
+    /// snapping back to `i_min`.
+    pub fn note_challenged(&mut self, now: core::time::Duration, neighbor: Mac) {
+        let misses = self
+            .challenged
+            .get(&neighbor)
+            .map_or(0, |(_, n)| n.saturating_add(1));
+        if self.challenged.insert(neighbor, (now, misses)).is_err()
+            && let Some(oldest) = self
+                .challenged
+                .iter()
+                .min_by_key(|(_, (t, _))| *t)
+                .map(|(m, _)| *m)
+        {
+            self.challenged.remove(&oldest);
+            let _ = self.challenged.insert(neighbor, (now, misses));
+        }
+    }
+
+    /// How long to wait after a challenge that has gone unanswered `misses`
+    /// times before trying again: `i_min << misses`, capped at
+    /// [`seed_interval`](Self::seed_interval).
+    ///
+    /// The floor is the *smallest* configured `i_min` for the same reason
+    /// `seed_interval` takes the largest `i_max` — a node challenges out every
+    /// interface at once (see `poll_due_challenges`), so the cadence that
+    /// matters is the one of the fastest link carrying the attempt, and the
+    /// budget that matters is the one of the slowest.
+    fn challenge_backoff(&self, misses: u32) -> core::time::Duration {
+        let cap = self.seed_interval();
+        let floor = self
+            .ogm_timers
+            .iter()
+            .map(|t| t.i_min())
+            .min()
+            .unwrap_or(crate::DEFAULT_OGM_INTERVAL)
+            .min(cap);
+        // `checked_mul` rather than a shift: the doubling reaches the cap after
+        // a handful of misses and must saturate there, not overflow into a
+        // short wait.
+        1u32.checked_shl(misses)
+            .and_then(|factor| floor.checked_mul(factor))
+            .unwrap_or(cap)
+            .min(cap)
+    }
+
+    /// How long until the soonest next-hop challenge falls due, or `None` when
+    /// there is nothing to challenge.
+    ///
+    /// What a driver's periodic arm sleeps on, alongside the OGM and keep-alive
+    /// deadlines. Without it the proof exchange rides the OGM timer, and a
+    /// newly discovered originator is not challenged until the next Trickle
+    /// deadline — up to a full `i_max` after the path was learned, on a mesh
+    /// that has settled. `Some(ZERO)` means one is due now.
+    pub fn next_challenge_after(&self, now: core::time::Duration) -> Option<core::time::Duration> {
+        if !self.require_proof {
+            return None;
+        }
+        let mut seen: heapless::Vec<Mac, MAX_ORIGINATORS> = heapless::Vec::new();
+        let mut soonest: Option<core::time::Duration> = None;
+        for neighbor in self
+            .originator_table
+            .values()
+            .flat_map(|r| r.paths.iter())
+            .map(|p| p.neighbor_ident)
+        {
+            if seen.contains(&neighbor) {
+                continue;
+            }
+            let _ = seen.push(neighbor);
+            // Two independent waits, and the later one governs: a proof that is
+            // still fresh is not due however long ago it was last attempted,
+            // and an attempt inside its backoff is not due however stale the
+            // proof is.
+            let refresh = match self.proven.get(&neighbor) {
+                None => core::time::Duration::ZERO,
+                Some((last, _)) => self
+                    .seed_interval()
+                    .saturating_sub(now.saturating_sub(*last)),
+            };
+            let retry = match self.challenged.get(&neighbor) {
+                None => core::time::Duration::ZERO,
+                Some((last, misses)) => self
+                    .challenge_backoff(*misses)
+                    .saturating_sub(now.saturating_sub(*last)),
+            };
+            let due = refresh.max(retry);
+            soonest = Some(soonest.map_or(due, |s: core::time::Duration| s.min(due)));
+        }
+        soonest
     }
 
     /// `path.last_tq`, hard-zeroed when [`keepalive_missed`](Self::keepalive_missed)
@@ -242,8 +561,8 @@ impl<
             let paths_before = record.paths.len();
             record.paths.retain(|p| !Self::path_stale(now, p, seed));
             pruned_path |= record.paths.len() != paths_before;
-            Self::recompute_best(record);
         }
+        self.recompute_all_best(now);
 
         // An originator reachable on no live path is gone; drop the record.
         self.originator_table.retain(|_, r| !r.paths.is_empty());
@@ -254,19 +573,34 @@ impl<
     }
 
     /// Recompute `best_next_hop` and `max_tq` from a record's current paths,
-    /// choosing the highest-TQ path.  Called after pruning so the cached best
-    /// hop reflects only live paths.  Leaves the fields unchanged when no paths
-    /// remain (such a record is evicted by [`purge_stale`](Self::purge_stale)).
-    fn recompute_best(record: &mut OriginatorRecord) {
+    /// choosing the highest-TQ path that `selectable` admits — on an
+    /// authenticated mesh, one whose next-hop proof is current.  Called after
+    /// pruning so the cached best hop reflects only live paths.
+    ///
+    /// **Clears** both fields when no path is selectable — including when none
+    /// remain — so a cached next hop never outlives the proof behind it.
+    fn recompute_best(record: &mut OriginatorRecord, selectable: &dyn Fn(Mac) -> bool) {
         let mut best: Option<&NeighborStats> = None;
         for p in record.paths.iter() {
+            if !selectable(p.neighbor_ident) {
+                continue;
+            }
             if best.is_none_or(|b| p.last_tq >= b.last_tq) {
                 best = Some(p);
             }
         }
-        if let Some(b) = best {
-            record.max_tq = b.last_tq;
-            record.best_next_hop = b.neighbor_ident;
+        match best {
+            Some(b) => {
+                record.max_tq = b.last_tq;
+                record.best_next_hop = Some(b.neighbor_ident);
+            }
+            // No selectable path: clear rather than leave the previous next hop
+            // standing. Keeping a stale one is how an unproven — possibly
+            // spoofed — neighbor would survive its own demotion.
+            None => {
+                record.max_tq = 0;
+                record.best_next_hop = None;
+            }
         }
     }
 
@@ -548,6 +882,14 @@ impl<
         self.originator_table.clear();
         self.broadcast_seqno.clear();
         self.mcast_members.clear();
+        // A proof answered (or a challenge issued) under the previous auth
+        // regime's pairwise key material says nothing about the one just
+        // installed — the same reasoning that drops routes/link-quality/ident
+        // mappings above. Leaving it behind would let a MAC proven under a
+        // stale key keep carrying data for up to `MAX_MISSED_PROOFS` proof
+        // cycles after re-anchoring.
+        self.proven.clear();
+        self.challenged.clear();
     }
 
     /// Revoke all originators that have been marked as stale.
@@ -560,6 +902,11 @@ impl<
                     .paths
                     .retain(|path| revoked_mac != path.neighbor_ident);
             }
+            // A revoked neighbor's next-hop proof is worthless: it was
+            // answered before the revocation, and must not keep carrying data
+            // on that strength for up to `MAX_MISSED_PROOFS` more cycles.
+            self.proven.remove(&revoked_mac);
+            self.challenged.remove(&revoked_mac);
         }
     }
 
@@ -608,6 +955,11 @@ impl<
 
         let incoming_seqno = u32::from_be(ogm.seqno);
 
+        // Whether the relaying neighbor may be *selected* as a next hop. Read
+        // before the mutable borrow on the originator table below, since the
+        // proof check needs `&self`.
+        let src_proven = self.proof_current(now, frame.src);
+
         // Find or create the originator's record, keyed by its MAC.
         // A freshly discovered originator is itself a topology change.
         let is_new_orig = !self.originator_table.contains_key(&orig_ident);
@@ -626,7 +978,11 @@ impl<
             let new_record = OriginatorRecord {
                 last_heard: now,
                 neighbor_ident: orig_ident,
-                best_next_hop: frame.src,
+                // Deliberately not `Some(frame.src)`: a first-contact sender
+                // is exactly what must not be installed before the proof gate
+                // has had a chance to run. `recompute_best` below fills this in
+                // if — and only if — the path is selectable.
+                best_next_hop: None,
                 max_tq: 0,
                 last_seqno: 0,
                 paths: heapless::Vec::new(),
@@ -707,17 +1063,30 @@ impl<
                 });
             }
 
-            // Update routing-table selection with hysteresis.  Always refresh the
-            // incumbent next hop's metric when we hear it again (its quality may
-            // have risen or fallen), but only *switch* the next hop for a path
-            // that is strictly better.  An equal-quality copy arriving via a
-            // different neighbor — the common case in a redundant mesh — is kept
-            // as an alternate path (above) without displacing the incumbent.
-            if frame.src == record.best_next_hop {
+            // Update routing-table selection with hysteresis, under the proof
+            // gate.  Refresh the incumbent next hop's metric when we hear it
+            // again (its quality may have risen or fallen) — unless its proof
+            // has lapsed, in which case demote it here rather than waiting for
+            // the next `purge_stale`.  Promote a *different* sender only if it
+            // is proven, and only when there is no incumbent or its TQ is
+            // strictly better.  An equal-quality copy arriving via a different
+            // neighbor — the common case in a redundant mesh — is kept as an
+            // alternate path (above) without displacing the incumbent.
+            if record.best_next_hop == Some(frame.src) {
+                if src_proven {
+                    record.max_tq = computed_tq;
+                } else {
+                    // The incumbent's proof has lapsed. Demote it here rather
+                    // than waiting for the next `purge_stale`, so the cached
+                    // next hop the management API reports never outlives the
+                    // proof behind it.
+                    record.best_next_hop = None;
+                    record.max_tq = 0;
+                }
+            } else if src_proven && (record.best_next_hop.is_none() || computed_tq > record.max_tq)
+            {
                 record.max_tq = computed_tq;
-            } else if computed_tq > record.max_tq {
-                record.max_tq = computed_tq;
-                record.best_next_hop = frame.src;
+                record.best_next_hop = Some(frame.src);
             }
 
             // Fold this originator's multicast memberships (carried in the OGM's
@@ -1170,6 +1539,14 @@ impl<
             Some(BatmanPacketType::CertReq) => self.handle_cert_req(now, frame, reply),
             Some(BatmanPacketType::CertReply) => self.handle_cert_reply(now, frame, reply),
             Some(BatmanPacketType::Keepalive) => self.handle_keepalive(now, frame),
+            // Next-hop proof frames are consumed here and handled by the router,
+            // which owns the pairwise key material they are checked against.
+            // Consumed rather than routed by destination: they are link-local by
+            // construction (no `dest`, no `ttl`), and a proof the mesh would
+            // relay on an attacker's behalf would prove nothing.
+            Some(BatmanPacketType::NextHopChallenge) | Some(BatmanPacketType::NextHopResponse) => {
+                RoutingAction::Consumed
+            }
             None => self.route_by_dest(now, frame),
         }
     }
@@ -1442,6 +1819,401 @@ mod tests {
             &mut reply,
         );
         assert!(!engine.keepalive_missed(core::time::Duration::from_secs(30), mac(2)));
+    }
+
+    /// Build an OGM for `orig` relayed by link-layer source `src`, with an
+    /// explicit TQ — the two-path shape a next-hop contest needs.
+    fn ogm_via(orig: u8, src: u8, seqno: u32, tq: u8) -> Vec<u8> {
+        let ogm = BatmanOgmPacket {
+            packet_type: BatmanPacketType::Ogm.as_u8(),
+            version: 5,
+            ttl: 5,
+            flags: 0,
+            seqno: seqno.to_be(),
+            orig: mac(orig),
+            reserved: 0,
+            tq,
+            tvlv_len: 0,
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(mac(1).as_bytes());
+        data.extend_from_slice(mac(src).as_bytes());
+        data.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
+        data.extend_from_slice(ogm.as_bytes());
+        data
+    }
+
+    fn feed(engine: &mut BatmanEngine<4>, now: u64, frame: &[u8]) {
+        let mut tx = [0u8; 128];
+        let parsed = LinkFrame::ref_from_prefix(frame).unwrap().0;
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+        engine.handle_rx(
+            core::time::Duration::from_secs(now),
+            parsed,
+            None,
+            &mut reply,
+        );
+    }
+
+    /// An engine on an authenticated mesh, where a next hop must prove itself.
+    fn proving_engine() -> BatmanEngine<4> {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        engine.set_require_proof(true);
+        engine
+    }
+
+    /// The gap-1/gap-2 fix, at its narrowest: a neighbor that has not answered
+    /// a challenge is never forwarded to, however good its advertised metric.
+    ///
+    /// Both selection paths are asserted, because they are independent:
+    /// `lookup_route` reads the cached `best_next_hop`, while `next_hop`
+    /// recomputes from `paths` on the hot path. Gating only the cache would
+    /// leave forwarding wide open.
+    #[test]
+    fn an_unproven_next_hop_is_never_selected() {
+        let mut engine = proving_engine();
+        feed(&mut engine, 0, &ogm_via(2, 2, 1, 255));
+
+        assert_eq!(engine.next_hop(core::time::Duration::ZERO, mac(2)), None);
+        assert_eq!(engine.lookup_route(mac(2)), None);
+    }
+
+    /// Discovery still has to work, or there would be nobody to challenge:
+    /// the record and its path are recorded, they are simply not selectable.
+    #[test]
+    fn discovery_records_an_unproven_path_so_it_can_be_challenged() {
+        let mut engine = proving_engine();
+        feed(&mut engine, 0, &ogm_via(2, 2, 1, 255));
+
+        let record = engine.originator_table.get(&mac(2)).expect("discovered");
+        assert_eq!(record.paths.len(), 1, "the path is known");
+        assert_eq!(record.best_next_hop, None, "but not selected");
+        assert!(
+            engine
+                .challenge_candidates(core::time::Duration::ZERO)
+                .any(|m| m == mac(2)),
+            "and it is offered to the driver as a candidate to challenge"
+        );
+    }
+
+    /// An unanswered challenge must be retried promptly, and only slow down if
+    /// it keeps going unanswered.
+    ///
+    /// The regression this pins: the retry backoff was a flat
+    /// [`seed_interval`](BatmanEngine::seed_interval) — the OGM `i_max`, the
+    /// *configured worst case* — so a challenge lost for any reason was not
+    /// retried for a full `i_max` even while the mesh was still emitting OGMs
+    /// every second. That is not a corner case: a node's **first** challenge
+    /// routinely races the lazy certificate exchange and is dropped by a peer
+    /// that does not hold this node's certificate yet, which is exactly when
+    /// the mesh is at `i_min` and a retry would be nearly free. Measured on
+    /// the three-node sim, the hub challenged once at t=1.39 s, again at
+    /// t=142.17 s, and carried no traffic in between.
+    ///
+    /// Retrying from `i_min` and doubling keeps the steady-state cost
+    /// unchanged — a neighbor that never answers still settles at one frame
+    /// per `seed_interval`, the rate the duty-cycle budget in
+    /// `docs/design/09-mesh-auth-gaps.md` was written against.
+    #[test]
+    fn an_unanswered_challenge_is_retried_on_an_exponential_backoff() {
+        let mut engine = proving_engine();
+        engine.configure_interface_ogm(
+            0,
+            core::time::Duration::from_secs(1),
+            core::time::Duration::from_secs(128),
+            core::time::Duration::ZERO,
+        );
+        feed(&mut engine, 0, &ogm_via(2, 2, 1, 255));
+
+        // A freshly discovered path is challenged at once.
+        let mut at = core::time::Duration::ZERO;
+        assert_eq!(
+            engine.challenge_candidates(at).next(),
+            Some(mac(2)),
+            "a newly discovered path is challenged immediately"
+        );
+        engine.note_challenged(at, mac(2));
+
+        // Unanswered: the retry falls due after `i_min`, not `i_max`.
+        assert_eq!(
+            engine
+                .challenge_candidates(core::time::Duration::from_millis(500))
+                .next(),
+            None,
+            "still inside the first backoff"
+        );
+        at = core::time::Duration::from_millis(1_500);
+        assert_eq!(
+            engine.challenge_candidates(at).next(),
+            Some(mac(2)),
+            "retried one i_min after the unanswered attempt, not one i_max"
+        );
+        engine.note_challenged(at, mac(2));
+
+        // Still unanswered: the next wait is twice as long.
+        assert_eq!(
+            engine
+                .challenge_candidates(at + core::time::Duration::from_millis(1_500))
+                .next(),
+            None,
+            "the second backoff is longer than the first"
+        );
+        at += core::time::Duration::from_millis(2_500);
+        assert_eq!(
+            engine.challenge_candidates(at).next(),
+            Some(mac(2)),
+            "retried again after 2 x i_min"
+        );
+    }
+
+    /// The doubling stops at `seed_interval()`, so a neighbor that never
+    /// answers costs exactly what it cost before this backoff existed: one
+    /// challenge per interval, forever. Without a cap the retry would drift
+    /// past the point at which the proof itself lapses.
+    #[test]
+    fn the_challenge_backoff_is_capped_at_the_seed_interval() {
+        let mut engine = proving_engine();
+        engine.configure_interface_ogm(
+            0,
+            core::time::Duration::from_secs(1),
+            core::time::Duration::from_secs(128),
+            core::time::Duration::ZERO,
+        );
+        feed(&mut engine, 0, &ogm_via(2, 2, 1, 255));
+
+        // Twenty unanswered attempts: 2^20 x i_min would be ~12 days uncapped.
+        let mut at = core::time::Duration::ZERO;
+        for _ in 0..20 {
+            engine.note_challenged(at, mac(2));
+            at += core::time::Duration::from_secs(200);
+        }
+        engine.note_challenged(at, mac(2));
+
+        assert_eq!(
+            engine
+                .challenge_candidates(at + core::time::Duration::from_secs(127))
+                .next(),
+            None,
+            "still inside the capped backoff"
+        );
+        assert_eq!(
+            engine
+                .challenge_candidates(at + core::time::Duration::from_secs(129))
+                .next(),
+            Some(mac(2)),
+            "the backoff caps at seed_interval rather than doubling without bound"
+        );
+    }
+
+    /// A neighbor that answers starts over: the next time its proof needs
+    /// renewing, the first retry is an `i_min` away again, not wherever the
+    /// backoff had climbed to. Otherwise one bad patch would permanently
+    /// slow every future renewal of an otherwise healthy peer.
+    #[test]
+    fn proving_resets_the_challenge_backoff() {
+        let mut engine = proving_engine();
+        engine.configure_interface_ogm(
+            0,
+            core::time::Duration::from_secs(1),
+            core::time::Duration::from_secs(128),
+            core::time::Duration::ZERO,
+        );
+        feed(&mut engine, 0, &ogm_via(2, 2, 1, 255));
+
+        // Four misses, so the backoff has grown to 8 x i_min.
+        let mut at = core::time::Duration::ZERO;
+        for _ in 0..4 {
+            engine.note_challenged(at, mac(2));
+            at += core::time::Duration::from_secs(60);
+        }
+        // Then it answers.
+        engine.note_proven(at, mac(2), 0);
+
+        // Once the proof is due for renewal again, the first retry after an
+        // unanswered attempt is back to one i_min.
+        at += core::time::Duration::from_secs(200);
+        engine.note_challenged(at, mac(2));
+        assert_eq!(
+            engine
+                .challenge_candidates(at + core::time::Duration::from_millis(1_500))
+                .next(),
+            Some(mac(2)),
+            "an answered challenge resets the backoff to i_min"
+        );
+    }
+
+    /// How long until the soonest challenge falls due — what a driver sleeps
+    /// on so a proof is not welded to the OGM schedule.
+    ///
+    /// Before this existed, `poll_due_challenges` ran only on the OGM /
+    /// keep-alive timer arm, so a newly discovered originator waited for the
+    /// next Trickle deadline (up to `i_max`) before it was challenged at all,
+    /// and a retry whose backoff had already expired waited there too.
+    #[test]
+    fn a_due_challenge_has_its_own_deadline() {
+        let mut engine = proving_engine();
+        engine.configure_interface_ogm(
+            0,
+            core::time::Duration::from_secs(1),
+            core::time::Duration::from_secs(128),
+            core::time::Duration::ZERO,
+        );
+
+        assert_eq!(
+            engine.next_challenge_after(core::time::Duration::ZERO),
+            None,
+            "nothing to challenge, so nothing to wake for"
+        );
+
+        feed(&mut engine, 0, &ogm_via(2, 2, 1, 255));
+        assert_eq!(
+            engine.next_challenge_after(core::time::Duration::ZERO),
+            Some(core::time::Duration::ZERO),
+            "a freshly discovered path is due at once, not at the next OGM"
+        );
+
+        engine.note_challenged(core::time::Duration::ZERO, mac(2));
+        assert_eq!(
+            engine.next_challenge_after(core::time::Duration::ZERO),
+            Some(core::time::Duration::from_secs(1)),
+            "after an attempt, due one i_min later — the retry backoff, not i_max"
+        );
+
+        engine.note_proven(core::time::Duration::ZERO, mac(2), 0);
+        assert_eq!(
+            engine.next_challenge_after(core::time::Duration::ZERO),
+            Some(core::time::Duration::from_secs(128)),
+            "a proven neighbor is next due when its proof needs refreshing"
+        );
+    }
+
+    /// Once proven, the same path is selectable by both routes.
+    #[test]
+    fn a_proven_next_hop_becomes_selectable() {
+        let mut engine = proving_engine();
+        feed(&mut engine, 0, &ogm_via(2, 2, 1, 255));
+        engine.note_proven(core::time::Duration::ZERO, mac(2), 0);
+
+        assert_eq!(
+            engine.next_hop(core::time::Duration::ZERO, mac(2)),
+            Some(mac(2))
+        );
+        assert_eq!(engine.lookup_route(mac(2)), Some(mac(2)));
+    }
+
+    /// A proof is not permanent. Past its budget the path stops being
+    /// selectable again, so a neighbor that has gone away — or an attacker who
+    /// stopped relaying — cannot hold a route open forever.
+    #[test]
+    fn a_lapsed_proof_demotes_the_path() {
+        let mut engine = proving_engine();
+        feed(&mut engine, 0, &ogm_via(2, 2, 1, 255));
+        engine.note_proven(core::time::Duration::ZERO, mac(2), 0);
+        assert!(
+            engine
+                .next_hop(core::time::Duration::ZERO, mac(2))
+                .is_some()
+        );
+
+        // Past MAX_MISSED_PROOFS x the seeded interval.
+        let late = core::time::Duration::from_secs(u64::from(crate::MAX_MISSED_PROOFS) + 2);
+        feed(&mut engine, late.as_secs(), &ogm_via(2, 2, 2, 255));
+        assert_eq!(
+            engine.next_hop(late, mac(2)),
+            None,
+            "a lapsed proof must stop carrying the route"
+        );
+    }
+
+    /// Timeout falls back rather than dropping: a worse but proven path beats
+    /// a better unproven one, which is what keeps a mesh routing while a
+    /// candidate is still being challenged.
+    #[test]
+    fn an_unproven_better_path_loses_to_a_proven_worse_one() {
+        let mut engine = proving_engine();
+        // orig 4 heard via neighbor 2 (weak) and neighbor 3 (strong).
+        feed(&mut engine, 0, &ogm_via(4, 2, 1, 100));
+        feed(&mut engine, 0, &ogm_via(4, 3, 1, 255));
+        engine.note_proven(core::time::Duration::ZERO, mac(2), 0);
+
+        assert_eq!(
+            engine.next_hop(core::time::Duration::ZERO, mac(4)),
+            Some(mac(2)),
+            "the proven path carries traffic even though its TQ is lower"
+        );
+        assert_eq!(engine.lookup_route(mac(4)), Some(mac(2)));
+    }
+
+    /// An unauthenticated mesh has no pairwise keys, so nothing could ever be
+    /// proven. Requiring proof there would break every route — the gate is off
+    /// unless the router turns it on.
+    #[test]
+    fn proof_is_not_required_when_the_mesh_is_unauthenticated() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        feed(&mut engine, 0, &ogm_via(2, 2, 1, 255));
+
+        assert_eq!(
+            engine.next_hop(core::time::Duration::ZERO, mac(2)),
+            Some(mac(2))
+        );
+        assert_eq!(engine.lookup_route(mac(2)), Some(mac(2)));
+    }
+
+    /// A next-hop proof frame is the router's business, not the engine's: the
+    /// nonce and tag are checked against pairwise key material the engine has
+    /// no dependency on. The engine's only job is to make sure one never
+    /// *moves* — neither forwarded toward a destination nor re-flooded — since
+    /// a proof that the mesh could relay for an attacker would defeat itself.
+    #[test]
+    fn next_hop_proof_frames_are_consumed_never_routed() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let mut tx = [0u8; 64];
+
+        for packet_type in [
+            crate::wire::BatmanPacketType::NextHopChallenge,
+            crate::wire::BatmanPacketType::NextHopResponse,
+        ] {
+            let mut data = Vec::new();
+            data.extend_from_slice(mac(1).as_bytes());
+            data.extend_from_slice(mac(2).as_bytes());
+            data.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
+            data.push(packet_type.as_u8());
+            data.push(5);
+            data.extend_from_slice(&[0xAB; 16]); // nonce or tag body
+            let frame = LinkFrame::ref_from_prefix(&data).unwrap().0;
+
+            let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+            let action = engine.handle_rx(core::time::Duration::ZERO, frame, None, &mut reply);
+            assert!(
+                matches!(action, RoutingAction::Consumed),
+                "{packet_type:?} must not be routed by the engine"
+            );
+            assert_eq!(reply.protocol, 0, "{packet_type:?} must not be forwarded");
+        }
+    }
+
+    /// A revoked neighbor's next-hop proof state must not survive the
+    /// revocation, or it could keep carrying data on the strength of a proof
+    /// answered before it was revoked, for up to `MAX_MISSED_PROOFS` proof
+    /// cycles.
+    #[test]
+    fn revoking_an_originator_also_drops_its_proof_state() {
+        let mut engine = proving_engine();
+        engine.note_proven(core::time::Duration::ZERO, mac(2), 0);
+        engine.note_challenged(core::time::Duration::ZERO, mac(2));
+        assert!(engine.proven.contains_key(&mac(2)));
+        assert!(engine.challenged.contains_key(&mac(2)));
+
+        engine.revoke_originators(core::iter::once(mac(2)));
+
+        assert!(
+            !engine.proven.contains_key(&mac(2)),
+            "a revoked neighbor's proof must not survive its revocation"
+        );
+        assert!(
+            !engine.challenged.contains_key(&mac(2)),
+            "a revoked neighbor's challenge state must not survive its revocation"
+        );
     }
 
     /// A keep-alive is never forwarded or delivered locally — always

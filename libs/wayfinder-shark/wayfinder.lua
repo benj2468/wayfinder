@@ -65,6 +65,9 @@ local PACKET_TYPES = {
 	[0x04] = "Multicast",
 	[PKT_CERT_REQ] = "Cert Request",
 	[PKT_CERT_REPLY] = "Cert Reply",
+	[0x07] = "Keep-Alive",
+	[0x08] = "Next-Hop Challenge",
+	[0x09] = "Next-Hop Response",
 }
 
 -- TVLV record type bytes carried in an Originator packet's tail (libs/batman/src/wire.rs).

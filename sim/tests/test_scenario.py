@@ -75,6 +75,23 @@ def test_rejects_link_to_unknown_node():
         Simulation(nodes, links, seed=0)
 
 
+def test_rejects_a_node_with_more_links_than_the_router_has_interfaces():
+    """A node's links are its interfaces, and the router holds a fixed number.
+
+    Past `wf.MAX_INTERFACES` the router silently ignores the surplus: no OGM
+    timer, no participation gate, so the node is mute on links the topology
+    says are up. A scenario that trips this measures something other than what
+    it describes, and the only evidence is a route that never appears — so
+    refuse the topology instead of running it.
+    """
+    spokes = [f"spoke{i}" for i in range(wf.MAX_INTERFACES + 1)]
+    nodes = [Node("hub"), *(Node(s) for s in spokes)]
+    links = [pair("hub", s, PerfectWire()) for s in spokes]
+
+    with pytest.raises(ValueError, match="MAX_INTERFACES"):
+        Simulation(nodes, links, seed=0)
+
+
 def test_rejects_duplicate_node_names():
     nodes = [Node("a"), Node("a")]
     with pytest.raises(ValueError):

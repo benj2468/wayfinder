@@ -56,6 +56,20 @@ pub enum BatmanPacketType {
     /// affecting OGM-driven topology discovery at all. Wayfinder-specific, no
     /// batman-adv counterpart.  Header: [`BatmanKeepAlivePacket`].
     Keepalive = 0x07,
+    /// A next-hop proof challenge: a nonce a node sends to a candidate next hop,
+    /// which only the holder of that neighbor's pairwise key can answer.
+    ///
+    /// Link-local and single-hop, for the same reason as
+    /// [`BatmanPacketType::Keepalive`] and then some: a proof that carried a
+    /// `dest` would be relayable by the mesh's own forwarding, which is exactly
+    /// what it exists to rule out. Wayfinder-specific, no batman-adv
+    /// counterpart.  Header: [`BatmanNextHopChallengePacket`], nonce as body.
+    NextHopChallenge = 0x08,
+    /// The answer to a [`BatmanPacketType::NextHopChallenge`]: a pairwise tag
+    /// over the challenger's nonce. Link-local and single-hop like the
+    /// challenge. Wayfinder-specific, no batman-adv counterpart.  Header:
+    /// [`BatmanNextHopResponsePacket`], tag as body.
+    NextHopResponse = 0x09,
 }
 
 impl BatmanPacketType {
@@ -78,6 +92,8 @@ impl BatmanPacketType {
             0x05 => Some(Self::CertReq),
             0x06 => Some(Self::CertReply),
             0x07 => Some(Self::Keepalive),
+            0x08 => Some(Self::NextHopChallenge),
+            0x09 => Some(Self::NextHopResponse),
             _ => None,
         }
     }
@@ -345,6 +361,34 @@ pub struct BatmanCertReplyPacket {
     pub dest: Mac,
 }
 
+/// Header for a [`BatmanPacketType::NextHopChallenge`]. Minimal by the same
+/// reasoning as [`BatmanKeepAlivePacket`]: the challenger's nonce follows as the
+/// body, and its length is the router's concern — `batman` carries no crypto
+/// dependency, so no key or tag size appears here.
+///
+/// Carries no `dest` and no `ttl`: a proof is only meaningful between immediate
+/// neighbors, and the link-layer `frame.src` already names the challenger.
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, PartialEq, Eq)]
+#[repr(C, packed)]
+pub struct BatmanNextHopChallengePacket {
+    /// Always [`BatmanPacketType::NextHopChallenge`].
+    pub packet_type: u8,
+    /// Protocol version.
+    pub version: u8,
+}
+
+/// Header for a [`BatmanPacketType::NextHopResponse`]. The pairwise tag over
+/// the challenger's nonce follows as the body; see
+/// [`BatmanNextHopChallengePacket`] for why the header carries nothing else.
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, PartialEq, Eq)]
+#[repr(C, packed)]
+pub struct BatmanNextHopResponsePacket {
+    /// Always [`BatmanPacketType::NextHopResponse`].
+    pub packet_type: u8,
+    /// Protocol version.
+    pub version: u8,
+}
+
 /// Header for a [`BatmanPacketType::Keepalive`] heartbeat. Deliberately minimal
 /// (no seqno, no origin, no TVLV tail) — it exists purely to prove a link is
 /// still alive between OGMs, so it carries nothing beyond the packet-type
@@ -442,6 +486,8 @@ mod tests {
         assert_eq!(BatmanPacketType::CertReq.as_u8(), 0x05);
         assert_eq!(BatmanPacketType::CertReply.as_u8(), 0x06);
         assert_eq!(BatmanPacketType::Keepalive.as_u8(), 0x07);
+        assert_eq!(BatmanPacketType::NextHopChallenge.as_u8(), 0x08);
+        assert_eq!(BatmanPacketType::NextHopResponse.as_u8(), 0x09);
     }
 
     /// `from_u8` is the exact inverse of `as_u8` over the known types, and
@@ -457,12 +503,14 @@ mod tests {
             BatmanPacketType::CertReq,
             BatmanPacketType::CertReply,
             BatmanPacketType::Keepalive,
+            BatmanPacketType::NextHopChallenge,
+            BatmanPacketType::NextHopResponse,
         ];
         for ty in all {
             assert_eq!(BatmanPacketType::from_u8(ty.as_u8()), Some(ty));
         }
         assert_eq!(BatmanPacketType::from_u8(0x00), None);
-        assert_eq!(BatmanPacketType::from_u8(0x08), None);
+        assert_eq!(BatmanPacketType::from_u8(0x0a), None);
         assert_eq!(BatmanPacketType::from_u8(0xff), None);
     }
 
@@ -503,5 +551,71 @@ mod tests {
         let (parsed, _) = BatmanCertReqPacket::ref_from_prefix(req.as_bytes()).unwrap();
         assert_eq!(parsed.packet_type, BatmanPacketType::CertReq.as_u8());
         assert_eq!(parsed.dest, Mac([0, 0, 0, 0, 0, 9]));
+    }
+
+    /// The next-hop proof pair carries its payload — a nonce out, a tag back —
+    /// as the body after a minimal header, exactly as `BatmanKeepAlivePacket`
+    /// carries its auth trailer. The crypto lengths live in the router, not
+    /// here: `batman` stays free of any crypto dependency.
+    #[test]
+    fn next_hop_proof_packets_are_minimal_headers() {
+        let challenge = BatmanNextHopChallengePacket {
+            packet_type: BatmanPacketType::NextHopChallenge.as_u8(),
+            version: 5,
+        };
+        let (parsed, rest) =
+            BatmanNextHopChallengePacket::ref_from_prefix(challenge.as_bytes()).unwrap();
+        assert_eq!(
+            parsed.packet_type,
+            BatmanPacketType::NextHopChallenge.as_u8()
+        );
+        assert_eq!(parsed.version, 5);
+        assert!(rest.is_empty(), "the nonce is the body, not a header field");
+
+        let response = BatmanNextHopResponsePacket {
+            packet_type: BatmanPacketType::NextHopResponse.as_u8(),
+            version: 5,
+        };
+        let (parsed, _) =
+            BatmanNextHopResponsePacket::ref_from_prefix(response.as_bytes()).unwrap();
+        assert_eq!(
+            parsed.packet_type,
+            BatmanPacketType::NextHopResponse.as_u8()
+        );
+
+        assert_eq!(
+            core::mem::size_of::<BatmanNextHopChallengePacket>(),
+            core::mem::size_of::<BatmanKeepAlivePacket>()
+        );
+        assert_eq!(
+            core::mem::size_of::<BatmanNextHopResponsePacket>(),
+            core::mem::size_of::<BatmanKeepAlivePacket>()
+        );
+    }
+
+    /// Neither carries a `dest` or a `ttl`, and that is load-bearing rather
+    /// than an omission: a proof is link-local, so the mesh's own forwarding
+    /// can never relay one. An attacker wanting to wormhole a challenge to the
+    /// node it is impersonating has to carry the bytes itself.
+    #[test]
+    fn next_hop_proof_packets_are_not_routable() {
+        assert!(
+            core::mem::size_of::<BatmanNextHopChallengePacket>()
+                < core::mem::size_of::<BatmanUnicastPacket>(),
+            "a routable header would need at least a dest"
+        );
+        assert!(
+            core::mem::size_of::<BatmanNextHopResponsePacket>()
+                < core::mem::size_of::<BatmanUnicastPacket>()
+        );
+    }
+
+    /// A header truncated below its two bytes is refused rather than read as a
+    /// valid packet, matching every sibling handler's malformed-input rule.
+    #[test]
+    fn a_truncated_next_hop_proof_header_does_not_parse() {
+        let one_byte = [BatmanPacketType::NextHopChallenge.as_u8()];
+        assert!(BatmanNextHopChallengePacket::ref_from_prefix(&one_byte).is_err());
+        assert!(BatmanNextHopResponsePacket::ref_from_prefix(&one_byte).is_err());
     }
 }

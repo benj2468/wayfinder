@@ -330,7 +330,13 @@ impl<
             .originator_table()
             .map(|r| RoutingEntryData {
                 destination: r.neighbor_ident.as_bytes().to_vec(),
-                next_hop: r.best_next_hop.as_bytes().to_vec(),
+                // Empty when nothing is selectable — notably while every path
+                // is via a neighbor that has not proven itself. An unproven
+                // next hop must never be reported as the route.
+                next_hop: r
+                    .best_next_hop
+                    .map(|m| m.as_bytes().to_vec())
+                    .unwrap_or_default(),
                 tq: r.max_tq as u32,
                 last_seqno: r.last_seqno,
                 paths: r
@@ -340,6 +346,7 @@ impl<
                         neighbor_id: p.neighbor_ident.as_bytes().to_vec(),
                         tq: p.last_tq as u32,
                         last_seqno: p.last_seqno,
+                        proven: self.router.proof_current(self.now, p.neighbor_ident),
                     })
                     .collect(),
             })
@@ -563,6 +570,7 @@ impl<
             pending_cert_replies,
             cert_req_rate: self.router.cert_req_tx_rate(self.now),
             cert_reply_rate: self.router.cert_reply_tx_rate(self.now),
+            untaggable_drop_rate: self.router.untaggable_drop_rate(self.now),
         }
     }
 
@@ -1439,6 +1447,7 @@ mod tests {
         );
         assert_eq!(m.cert_req_rate, 0.0);
         assert_eq!(m.cert_reply_rate, 0.0);
+        assert_eq!(m.untaggable_drop_rate, 0.0);
     }
 
     /// With auth enabled, a verified neighbor's cert lands in the cert-store

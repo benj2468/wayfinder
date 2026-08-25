@@ -77,11 +77,18 @@ pub struct PyOriginatorRecord {
     /// at this boundary rather than propagating the confusion into Python.
     pub originator: PyMac,
     /// The next hop packets for this originator are currently forwarded to —
-    /// the relay of the best-TQ path. Equal to `originator` when the
-    /// destination is a direct neighbor.
-    pub best_next_hop: PyMac,
-    /// The highest transmission quality (0..=255) across all known paths; the
-    /// metric `best_next_hop` is selected by.
+    /// the relay of the best-TQ path — or `None` when no path is currently
+    /// usable. Equal to `originator` when the destination is a direct
+    /// neighbor.
+    ///
+    /// `None` with a non-empty `paths` means every known relay is still
+    /// unproven: on an authenticated mesh a next hop must answer a challenge
+    /// before it can carry traffic. Probe it with `PyDriver.proof_current`.
+    pub best_next_hop: Option<PyMac>,
+    /// Transmission quality (0..=255) of the currently selected path — the
+    /// best among *selectable* paths, not across all known ones; the metric
+    /// `best_next_hop` is selected by.  Zero when nothing is selectable,
+    /// including while every path's neighbor is still unproven.
     pub max_tq: u8,
     /// Sequence number of the freshest OGM accepted via *any* path. Per-path
     /// lag is measured against this.
@@ -106,7 +113,7 @@ impl From<&OriginatorRecord> for PyOriginatorRecord {
         } = record;
         Self {
             originator: PyMac(*neighbor_ident),
-            best_next_hop: PyMac(*best_next_hop),
+            best_next_hop: best_next_hop.map(PyMac),
             max_tq: *max_tq,
             last_seqno: *last_seqno,
             last_heard_ms: last_heard.as_millis() as u64,

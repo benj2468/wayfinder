@@ -115,6 +115,7 @@ impl WayfinderDataProvider for Mock {
             },
             cert_req_rate: 0.5,
             cert_reply_rate: 1.5,
+            untaggable_drop_rate: 2.25,
         }
     }
     fn resolve_route(&self, _destination: &[u8]) -> Option<RouteResolutionData> {
@@ -392,6 +393,7 @@ async fn metrics_query_renders_json_from_server() {
     assert_eq!(parsed["in_flight_cert_requests"]["used"], 1);
     assert_eq!(parsed["cert_req_rate"], 0.5);
     assert_eq!(parsed["cert_reply_rate"], 1.5);
+    assert_eq!(parsed["untaggable_drop_rate"], 2.25);
 }
 
 #[tokio::test]
@@ -407,6 +409,7 @@ async fn metrics_query_renders_human_from_server() {
     assert!(out.contains("pending_cert_replies: 0/16"), "got: {out}");
     assert!(out.contains("cert_req_rate: 0.50"), "got: {out}");
     assert!(out.contains("cert_reply_rate: 1.50"), "got: {out}");
+    assert!(out.contains("untaggable_drop_rate: 2.25"), "got: {out}");
 }
 
 #[tokio::test]

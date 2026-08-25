@@ -40,7 +40,8 @@ BATMAN-adv routing protocol implementation. `no_std`, heapless. Implements
 
 Protocol constants: `ETH_P_BATMAN` (0x4305) and the `BatmanPacketType`
 `#[repr(u8)]` enum — `Ogm` (0x01), `Bcast` (0x02), `Unicast` (0x03), `Mcast`
-(0x04), `CertReq` (0x05), `CertReply` (0x06), `Keepalive` (0x07). Modelled as an
+(0x04), `CertReq` (0x05), `CertReply` (0x06), `Keepalive` (0x07),
+`NextHopChallenge` (0x08), `NextHopResponse` (0x09). Modelled as an
 enum (not free consts) so the compiler guarantees the type bytes are unique;
 `as_u8()` is the wire byte, `from_u8()` decodes a received one (`None` = a type
 this build doesn't know, routed by destination). Header structs keep
@@ -90,6 +91,14 @@ the engine itself is unchanged. See `libs/wayfinder` for `OgmAuth`.
 4. Otherwise writes a re-flood (TTL−1, inner frame preserved) into the reply
    buffer and returns `DeliverLocalAndForward(BROADCAST)`. The caller delivers
    the inner frame locally *and* forwards the re-flood.
+
+**Next-hop proof** (`handle_rx`, `NextHopChallenge`/`NextHopResponse` arms):
+both are `Consumed` — the engine never routes or re-floods one. They are
+link-local by construction (`BatmanNextHopChallengePacket` /
+`BatmanNextHopResponsePacket` carry no `dest` and no `ttl`), and the router owns
+the pairwise key material the nonce and tag are checked against, keeping the
+engine free of any crypto dependency. See `libs/wayfinder`'s `OgmAuth` and
+`docs/design/09-mesh-auth-gaps.md` §4.
 
 **Unicast forwarding** (`handle_rx`, `BatmanPacketType::Unicast` arm):
 

@@ -138,6 +138,27 @@ pub trait RouterOps {
     /// Produce a due keep-alive into `tx_buf`, if one is due.
     fn poll_keepalive<'tx>(&mut self, tx_buf: &'tx mut [u8]) -> Option<LinkFrameData<'tx>>;
 
+    /// How many mesh interfaces are configured.
+    fn num_interfaces(&self) -> usize;
+
+    /// Record one directed frame dropped for want of a pairwise key with its
+    /// next hop.
+    fn record_untaggable_drop(&mut self, now: Duration);
+
+    /// Produce a next-hop proof challenge for one neighbor awaiting one, with
+    /// the neighbor it is addressed to. `None` when none is due.
+    /// **Implementations must mark the selected candidate as challenged before
+    /// anything can fail**, including on the paths that then return `None`.
+    /// Callers loop until `None` ([`poll_due_challenges`]), so a candidate left
+    /// unmarked is re-selected forever and the driver's event loop hangs.
+    ///
+    /// [`poll_due_challenges`]: ../../wayfinder_driver_core/fn.poll_due_challenges.html
+    fn poll_challenge<'tx>(
+        &mut self,
+        now: Duration,
+        tx_buf: &'tx mut [u8],
+    ) -> Option<(Mac, LinkFrameData<'tx>)>;
+
     /// Set interface `idx`'s Trickle bounds, so a fast LAN link and a slow LoRa
     /// link back off on their own schedules.
     fn configure_interface_ogm(
@@ -167,6 +188,19 @@ pub trait RouterOps {
 
     /// Time from `now` until the soonest keep-alive is due.
     fn next_keepalive_after(&self, now: Duration) -> Duration;
+
+    /// Time from `now` until the soonest next-hop proof challenge is due, or
+    /// `None` when there is nothing to challenge.
+    ///
+    /// A shell that sleeps must fold this into the same `min` as
+    /// [`next_broadcast_after`](Self::next_broadcast_after) and
+    /// [`next_keepalive_after`](Self::next_keepalive_after). Proof is not on
+    /// the OGM schedule and must not be left to ride it: a newly discovered
+    /// originator would then wait for the next Trickle deadline before it was
+    /// challenged, which on a settled mesh is a full `i_max` during which it
+    /// can carry no traffic. A shell whose caller drives its own clock
+    /// (`wayfinder-tick-driver`) has no sleep to shorten and can ignore this.
+    fn next_challenge_after(&self, now: Duration) -> Option<Duration>;
 
     /// Record that interface `idx` emitted its OGM at `now`, advancing Trickle.
     fn on_interface_emitted(&mut self, idx: usize, now: Duration);
@@ -268,6 +302,22 @@ impl<
         Self::poll_keepalive(self, tx_buf)
     }
 
+    fn num_interfaces(&self) -> usize {
+        Self::num_interfaces(self)
+    }
+
+    fn record_untaggable_drop(&mut self, now: Duration) {
+        Self::record_untaggable_drop(self, now);
+    }
+
+    fn poll_challenge<'tx>(
+        &mut self,
+        now: Duration,
+        tx_buf: &'tx mut [u8],
+    ) -> Option<(Mac, LinkFrameData<'tx>)> {
+        Self::poll_challenge(self, now, tx_buf)
+    }
+
     fn configure_interface_ogm(
         &mut self,
         idx: usize,
@@ -301,6 +351,10 @@ impl<
 
     fn next_keepalive_after(&self, now: Duration) -> Duration {
         Self::next_keepalive_after(self, now)
+    }
+
+    fn next_challenge_after(&self, now: Duration) -> Option<Duration> {
+        Self::next_challenge_after(self, now)
     }
 
     fn on_interface_emitted(&mut self, idx: usize, now: Duration) {

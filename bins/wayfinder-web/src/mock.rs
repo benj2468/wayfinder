@@ -323,6 +323,7 @@ impl WayfinderDataProvider for Mock {
                 neighbor_id: vec![0, 0, 0, 0, 0, 3],
                 tq: 240,
                 last_seqno: 17,
+                proven: true,
             }],
         }]
     }
@@ -414,6 +415,7 @@ impl WayfinderDataProvider for Mock {
             },
             cert_req_rate: 0.25,
             cert_reply_rate: 0.75,
+            untaggable_drop_rate: 0.0,
         }
     }
     fn resolve_route(&self, _destination: &[u8]) -> Option<RouteResolutionData> {
