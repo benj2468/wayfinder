@@ -634,10 +634,16 @@ pub struct AlarmsData {
     pub now_ms: u64,
 }
 
-/// Implemented by anything that can supply router state to [`WayfinderService`].
-/// Intentionally transport- and protocol-agnostic so callers can implement it
-/// for whatever router type they have without pulling in a dependency on this crate.
-pub trait WayfinderDataProvider {
+/// Router-facing state for [`WayfinderService`]: the routing and link tables,
+/// node settings, alarms and logs a node answers from its own router, with no
+/// certificate authority involved.
+///
+/// Split from [`AuthorityDataProvider`] so the two halves can be owned by
+/// different executors — see
+/// `docs/design/13-certificate-authority-off-the-router-loop.md`. Intentionally
+/// transport- and protocol-agnostic so callers can implement it for whatever
+/// router type they have.
+pub trait RouterDataProvider {
     /// This node's own identifier (raw MAC bytes).
     fn node_id(&self) -> Vec<u8>;
     /// Number of originators (reachable nodes) currently in the routing table.
@@ -714,7 +720,16 @@ pub trait WayfinderDataProvider {
     fn security_status(&self) -> SecurityStatusData {
         SecurityStatusData::default()
     }
+}
 
+/// Certificate-authority state for [`WayfinderService`]: enrollment, the user
+/// store, revocation and the issued-certificate log.
+///
+/// Every method defaults to "this node is not a certificate-authority
+/// provider", so a node that only routes satisfies this trait with an empty
+/// impl and only a provider overrides anything. That default is also what makes
+/// the split cheap: no existing implementor gains a method it has to write.
+pub trait AuthorityDataProvider {
     /// Provider mode: the mesh trust anchor as raw `TrustAnchor` bytes.  The
     /// default errors — only a node running as a certificate-authority provider
     /// overrides these three methods.
@@ -854,6 +869,18 @@ pub trait WayfinderDataProvider {
         Err("node is not a certificate-authority provider".into())
     }
 }
+
+/// Both halves at once: what a single-owner node supplies to one
+/// [`WayfinderService`].
+///
+/// Blanket-implemented over the two halves, so implementing them is all that is
+/// ever required and nothing names this trait in an `impl`. It exists so the
+/// combined dispatcher keeps one bound, and so callers that genuinely hold both
+/// — today's `RouterAdapter`, the web mock, the client tests — are unchanged by
+/// the split.
+pub trait WayfinderDataProvider: RouterDataProvider + AuthorityDataProvider {}
+
+impl<T: RouterDataProvider + AuthorityDataProvider> WayfinderDataProvider for T {}
 
 /// The disposition of a login attempt against the certificate authority's user
 /// store.
@@ -1184,329 +1211,352 @@ fn audited(k: &RequestKind) -> Audited {
     }
 }
 
-/// Stateful handler that maps [`WayfinderRequest`] → [`WayfinderResponse`].
+/// Which owner answers a given request.
 ///
-/// `P` is any type implementing [`WayfinderDataProvider`]; pass a reference
-/// (`WayfinderService::new(&router)`) or an owned wrapper.
-pub struct WayfinderService<P> {
-    provider: P,
+/// The management API is served from three different places, and a caller that
+/// knows which one *before* it sends anything can route a request to the right
+/// owner rather than discovering the answer from an error. That is what lets
+/// the certificate authority live off the router's event loop — see
+/// `docs/design/13-certificate-authority-off-the-router-loop.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestFacet {
+    /// Answered from router state alone, by [`handle_router`].
+    Router,
+    /// Answered from certificate-authority state alone, by [`handle_authority`].
+    Authority,
+    /// Reaches neither dispatcher: the VPN requests are served in the
+    /// connection task (they are scoped to the caller's own identity, which no
+    /// provider holds), and `Authenticate` is the transport's own first frame.
+    Transport,
 }
 
-impl<P: WayfinderDataProvider> WayfinderService<P> {
-    /// Wrap a data provider in a request handler.
-    pub fn new(provider: P) -> Self {
-        Self { provider }
+/// Classify `kind` by the owner that answers it.
+///
+/// Exhaustive over [`RequestKind`] on purpose — a new request kind must be
+/// given an owner here before it will compile, which is the check that keeps a
+/// forked caller from silently sending it to the wrong half.
+pub fn request_facet(kind: &RequestKind) -> RequestFacet {
+    match kind {
+        RequestKind::GetAlarms(_)
+        | RequestKind::GetKeepaliveTable(_)
+        | RequestKind::GetLinkFeaturesTable(_)
+        | RequestKind::GetLinkQualityTable(_)
+        | RequestKind::GetLogs(_)
+        | RequestKind::GetMetrics(_)
+        | RequestKind::GetNodeInfo(_)
+        | RequestKind::GetOgmSchedule(_)
+        | RequestKind::GetRoutingTable(_)
+        | RequestKind::GetSecurityStatus(_)
+        | RequestKind::GetThroughput(_)
+        | RequestKind::ResolveRoute(_)
+        | RequestKind::SetAuth(_)
+        | RequestKind::SetConfig(_)
+        | RequestKind::SetLogLevel(_) => RequestFacet::Router,
+        RequestKind::ApproveCsr(_)
+        | RequestKind::AuthenticateUser(_)
+        | RequestKind::CreateUser(_)
+        | RequestKind::DenyCsr(_)
+        | RequestKind::GetTrustAnchor(_)
+        | RequestKind::ListCerts(_)
+        | RequestKind::ListPendingCsrs(_)
+        | RequestKind::ListUsers(_)
+        | RequestKind::RemoveUser(_)
+        | RequestKind::RevealEnrollmentToken(_)
+        | RequestKind::RevokeNode(_)
+        | RequestKind::SubmitCsr(_) => RequestFacet::Authority,
+        RequestKind::Authenticate(_)
+        | RequestKind::GetVpnEnrollment(_)
+        | RequestKind::ListVpnPeers(_)
+        | RequestKind::RevokeVpnPeer(_) => RequestFacet::Transport,
     }
+}
 
-    /// Dispatch one request to the provider and build the matching response,
-    /// mapping any provider error into an [`ErrorResponse`].
-    pub fn handle(&mut self, request: WayfinderRequest) -> WayfinderResponse {
-        if let Some(kind) = &request.request {
-            let name = request_kind_name(kind);
-            match audited(kind) {
-                Audited::Mutation => info!(kind = name, "management API mutation"),
-                Audited::Disclosure => info!(kind = name, "management API secret disclosed"),
-                Audited::Query => {}
+/// Emit the audit record for `request`, if its kind warrants one.
+///
+/// Split out of [`WayfinderService::handle`] so a caller that forks a request
+/// between the two dispatchers still records it exactly once, where the request
+/// arrives rather than once per half.
+pub fn audit_request(request: &WayfinderRequest) {
+    if let Some(kind) = &request.request {
+        let name = request_kind_name(kind);
+        match audited(kind) {
+            Audited::Mutation => info!(kind = name, "management API mutation"),
+            Audited::Disclosure => info!(kind = name, "management API secret disclosed"),
+            Audited::Query => {}
+        }
+    }
+}
+
+/// Answer `request` from router state.
+///
+/// Returns the request unconsumed as `Err` when it is not
+/// [`RequestFacet::Router`], so a caller holding only this half can forward it
+/// to the owner that can answer it — rather than returning an error from a half
+/// that was never asked. Does not audit; see [`audit_request`].
+pub fn handle_router<P: RouterDataProvider>(
+    provider: &mut P,
+    request: WayfinderRequest,
+) -> Result<WayfinderResponse, WayfinderRequest> {
+    let response = match request.request {
+        Some(RequestKind::GetNodeInfo(_)) => ResponseKind::NodeInfo(NodeInfo {
+            node_id: provider.node_id(),
+            num_originators: provider.num_originators(),
+            auth_locked: provider.auth_locked(),
+            runtime_config_active: provider.runtime_config_active(),
+        }),
+        Some(RequestKind::GetRoutingTable(_)) => {
+            let entries = provider
+                .routing_table()
+                .into_iter()
+                .map(|e| RoutingEntry {
+                    destination: e.destination,
+                    next_hop: e.next_hop,
+                    tq: e.tq,
+                    last_seqno: e.last_seqno,
+                    paths: e
+                        .paths
+                        .into_iter()
+                        .map(|p| NeighborPath {
+                            neighbor_id: p.neighbor_id,
+                            tq: p.tq,
+                            last_seqno: p.last_seqno,
+                            proven: p.proven,
+                        })
+                        .collect(),
+                })
+                .collect();
+            ResponseKind::RoutingTable(RoutingTable { entries })
+        }
+        Some(RequestKind::GetLinkQualityTable(_)) => {
+            let entries = provider
+                .link_quality_table()
+                .into_iter()
+                .map(|e| LinkQualityEntry {
+                    neighbor_id: e.neighbor_id,
+                    iface_idx: e.iface_idx,
+                    ewma_quality: e.ewma_quality,
+                    sample_count: e.sample_count,
+                    iface_name: e.iface_name,
+                })
+                .collect();
+            ResponseKind::LinkQualityTable(LinkQualityTable { entries })
+        }
+        Some(RequestKind::GetLinkFeaturesTable(_)) => {
+            let entries = provider
+                .link_features_table()
+                .into_iter()
+                .map(|e| LinkFeaturesEntry {
+                    iface_idx: e.iface_idx,
+                    tx_ogm: e.tx_ogm,
+                    rx_ogm: e.rx_ogm,
+                    tx_data: e.tx_data,
+                    rx_data: e.rx_data,
+                    tx_keepalive_interval_ms: e.tx_keepalive_interval_ms,
+                    iface_name: e.iface_name,
+                })
+                .collect();
+            ResponseKind::LinkFeaturesTable(LinkFeaturesTable { entries })
+        }
+        Some(RequestKind::GetLogs(req)) => {
+            let batch = provider.logs(req.since_seq, req.max_records);
+            ResponseKind::Logs(LogRecords {
+                records: batch
+                    .records
+                    .into_iter()
+                    .map(|r| LogRecord {
+                        seq: r.seq,
+                        uptime_ms: r.uptime_ms,
+                        level: proto_log_level(r.level) as i32,
+                        target: r.target,
+                        message: r.message,
+                    })
+                    .collect(),
+                next_seq: batch.next_seq,
+                dropped: batch.dropped,
+                filter: batch.filter,
+            })
+        }
+        Some(RequestKind::GetAlarms(_)) => {
+            let board = provider.alarms();
+            ResponseKind::Alarms(Alarms {
+                alarms: board
+                    .alarms
+                    .into_iter()
+                    .map(|a| Alarm {
+                        kind: proto_alarm_kind(a.kind) as i32,
+                        severity: proto_alarm_severity(a.severity) as i32,
+                        first_ms: a.first_ms,
+                        last_ms: a.last_ms,
+                        count: a.count,
+                        detail: a.detail,
+                        active: a.active,
+                        subject: match a.subject {
+                            AlarmSubjectData::Node => None,
+                            AlarmSubjectData::Peer(id) => Some(AlarmSubjectKind::NodeId(id)),
+                            AlarmSubjectData::Interface(idx) => {
+                                Some(AlarmSubjectKind::InterfaceIndex(idx))
+                            }
+                        },
+                    })
+                    .collect(),
+                dropped: board.dropped,
+                now_ms: board.now_ms,
+            })
+        }
+        Some(RequestKind::SetLogLevel(req)) => {
+            match provider.set_log_level(&req.directives) {
+                Ok(directives) => ResponseKind::LogFilter(LogFilter { directives }),
+                // A spec that didn't parse. The previous filter is still in
+                // force, so this is a report, not a state change.
+                Err(message) => ResponseKind::Error(ErrorResponse { message }),
             }
         }
-
-        let response = match request.request {
-            Some(RequestKind::GetNodeInfo(_)) => ResponseKind::NodeInfo(NodeInfo {
-                node_id: self.provider.node_id(),
-                num_originators: self.provider.num_originators(),
-                auth_locked: self.provider.auth_locked(),
-                runtime_config_active: self.provider.runtime_config_active(),
-            }),
-
-            Some(RequestKind::GetRoutingTable(_)) => {
-                let entries = self
-                    .provider
-                    .routing_table()
-                    .into_iter()
-                    .map(|e| RoutingEntry {
-                        destination: e.destination,
-                        next_hop: e.next_hop,
-                        tq: e.tq,
-                        last_seqno: e.last_seqno,
-                        paths: e
-                            .paths
-                            .into_iter()
-                            .map(|p| NeighborPath {
-                                neighbor_id: p.neighbor_id,
-                                tq: p.tq,
-                                last_seqno: p.last_seqno,
-                                proven: p.proven,
-                            })
-                            .collect(),
-                    })
-                    .collect();
-                ResponseKind::RoutingTable(RoutingTable { entries })
-            }
-
-            Some(RequestKind::GetLinkQualityTable(_)) => {
-                let entries = self
-                    .provider
-                    .link_quality_table()
-                    .into_iter()
-                    .map(|e| LinkQualityEntry {
-                        neighbor_id: e.neighbor_id,
+        Some(RequestKind::GetOgmSchedule(_)) => {
+            let entries = provider
+                .ogm_schedule()
+                .into_iter()
+                .map(|e| OgmScheduleEntry {
+                    iface_idx: e.iface_idx,
+                    current_interval_ms: e.current_interval_ms,
+                    min_interval_ms: e.min_interval_ms,
+                    max_interval_ms: e.max_interval_ms,
+                    iface_name: e.iface_name,
+                })
+                .collect();
+            ResponseKind::OgmSchedule(OgmSchedule { entries })
+        }
+        Some(RequestKind::GetThroughput(_)) => {
+            let mut total_rx_bps = 0.0;
+            let mut total_rx_fps = 0.0;
+            let mut total_tx_bps = 0.0;
+            let mut total_tx_fps = 0.0;
+            let interfaces = provider
+                .throughput()
+                .into_iter()
+                .map(|e| {
+                    // The node-wide rate is the sum of the per-interface
+                    // rates, accumulated as we project each entry.
+                    total_rx_bps += e.rx_bps;
+                    total_rx_fps += e.rx_fps;
+                    total_tx_bps += e.tx_bps;
+                    total_tx_fps += e.tx_fps;
+                    InterfaceThroughput {
                         iface_idx: e.iface_idx,
-                        ewma_quality: e.ewma_quality,
-                        sample_count: e.sample_count,
+                        rx_bps: e.rx_bps,
+                        rx_fps: e.rx_fps,
+                        tx_bps: e.tx_bps,
+                        tx_fps: e.tx_fps,
                         iface_name: e.iface_name,
-                    })
-                    .collect();
-                ResponseKind::LinkQualityTable(LinkQualityTable { entries })
-            }
-
-            Some(RequestKind::GetLinkFeaturesTable(_)) => {
-                let entries = self
-                    .provider
-                    .link_features_table()
-                    .into_iter()
-                    .map(|e| LinkFeaturesEntry {
-                        iface_idx: e.iface_idx,
-                        tx_ogm: e.tx_ogm,
-                        rx_ogm: e.rx_ogm,
-                        tx_data: e.tx_data,
-                        rx_data: e.rx_data,
-                        tx_keepalive_interval_ms: e.tx_keepalive_interval_ms,
-                        iface_name: e.iface_name,
-                    })
-                    .collect();
-                ResponseKind::LinkFeaturesTable(LinkFeaturesTable { entries })
-            }
-
-            Some(RequestKind::GetLogs(req)) => {
-                let batch = self.provider.logs(req.since_seq, req.max_records);
-                ResponseKind::Logs(LogRecords {
-                    records: batch
-                        .records
-                        .into_iter()
-                        .map(|r| LogRecord {
-                            seq: r.seq,
-                            uptime_ms: r.uptime_ms,
-                            level: proto_log_level(r.level) as i32,
-                            target: r.target,
-                            message: r.message,
-                        })
-                        .collect(),
-                    next_seq: batch.next_seq,
-                    dropped: batch.dropped,
-                    filter: batch.filter,
-                })
-            }
-
-            Some(RequestKind::GetAlarms(_)) => {
-                let board = self.provider.alarms();
-                ResponseKind::Alarms(Alarms {
-                    alarms: board
-                        .alarms
-                        .into_iter()
-                        .map(|a| Alarm {
-                            kind: proto_alarm_kind(a.kind) as i32,
-                            severity: proto_alarm_severity(a.severity) as i32,
-                            first_ms: a.first_ms,
-                            last_ms: a.last_ms,
-                            count: a.count,
-                            detail: a.detail,
-                            active: a.active,
-                            subject: match a.subject {
-                                AlarmSubjectData::Node => None,
-                                AlarmSubjectData::Peer(id) => Some(AlarmSubjectKind::NodeId(id)),
-                                AlarmSubjectData::Interface(idx) => {
-                                    Some(AlarmSubjectKind::InterfaceIndex(idx))
-                                }
-                            },
-                        })
-                        .collect(),
-                    dropped: board.dropped,
-                    now_ms: board.now_ms,
-                })
-            }
-
-            Some(RequestKind::SetLogLevel(req)) => {
-                match self.provider.set_log_level(&req.directives) {
-                    Ok(directives) => ResponseKind::LogFilter(LogFilter { directives }),
-                    // A spec that didn't parse. The previous filter is still in
-                    // force, so this is a report, not a state change.
-                    Err(message) => ResponseKind::Error(ErrorResponse { message }),
-                }
-            }
-
-            Some(RequestKind::GetOgmSchedule(_)) => {
-                let entries = self
-                    .provider
-                    .ogm_schedule()
-                    .into_iter()
-                    .map(|e| OgmScheduleEntry {
-                        iface_idx: e.iface_idx,
-                        current_interval_ms: e.current_interval_ms,
-                        min_interval_ms: e.min_interval_ms,
-                        max_interval_ms: e.max_interval_ms,
-                        iface_name: e.iface_name,
-                    })
-                    .collect();
-                ResponseKind::OgmSchedule(OgmSchedule { entries })
-            }
-
-            Some(RequestKind::GetThroughput(_)) => {
-                let mut total_rx_bps = 0.0;
-                let mut total_rx_fps = 0.0;
-                let mut total_tx_bps = 0.0;
-                let mut total_tx_fps = 0.0;
-                let interfaces = self
-                    .provider
-                    .throughput()
-                    .into_iter()
-                    .map(|e| {
-                        // The node-wide rate is the sum of the per-interface
-                        // rates, accumulated as we project each entry.
-                        total_rx_bps += e.rx_bps;
-                        total_rx_fps += e.rx_fps;
-                        total_tx_bps += e.tx_bps;
-                        total_tx_fps += e.tx_fps;
-                        InterfaceThroughput {
-                            iface_idx: e.iface_idx,
-                            rx_bps: e.rx_bps,
-                            rx_fps: e.rx_fps,
-                            tx_bps: e.tx_bps,
-                            tx_fps: e.tx_fps,
-                            iface_name: e.iface_name,
-                        }
-                    })
-                    .collect();
-                ResponseKind::Throughput(Throughput {
-                    interfaces,
-                    total_rx_bps,
-                    total_rx_fps,
-                    total_tx_bps,
-                    total_tx_fps,
-                })
-            }
-
-            Some(RequestKind::GetMetrics(_)) => {
-                let m = self.provider.node_metrics();
-                let occ = |o: TableOccupancyData| {
-                    Some(TableOccupancy {
-                        used: o.used,
-                        capacity: o.capacity,
-                    })
-                };
-                ResponseKind::Metrics(NodeMetrics {
-                    uptime_secs: m.uptime_secs,
-                    neighbor_count: m.neighbor_count,
-                    originators: occ(m.originators),
-                    broadcast_dedup: occ(m.broadcast_dedup),
-                    local_mcast_groups: occ(m.local_mcast_groups),
-                    mcast_memberships: occ(m.mcast_memberships),
-                    tq_min: m.tq_min,
-                    tq_max: m.tq_max,
-                    tq_mean: m.tq_mean,
-                    paths_max: m.paths_max,
-                    paths_mean: m.paths_mean,
-                    oversize_drops: m.oversize_drops,
-                    relay_oversize_drops: m.relay_oversize_drops,
-                    cert_store: occ(m.cert_store),
-                    in_flight_cert_requests: occ(m.in_flight_cert_requests),
-                    pending_cert_replies: occ(m.pending_cert_replies),
-                    cert_req_rate: m.cert_req_rate,
-                    cert_reply_rate: m.cert_reply_rate,
-                    untaggable_drop_rate: m.untaggable_drop_rate,
-                })
-            }
-
-            Some(RequestKind::GetSecurityStatus(_)) => {
-                let s = self.provider.security_status();
-                ResponseKind::SecurityStatus(GetSecurityStatusResponse {
-                    auth_enabled: s.auth_enabled,
-                    mesh_id: s.mesh_id,
-                    node_mac: s.node_mac,
-                    cert_not_after: s.cert_not_after,
-                    revocation_count: s.revocation_count,
-                    nodes: s
-                        .nodes
-                        .into_iter()
-                        .map(|n| NodeSecurity {
-                            node_id: n.node_id,
-                            verified: n.verified,
-                            cert_not_after: n.cert_not_after,
-                            revoked: n.revoked,
-                            revocation_not_after: n.revocation_not_after,
-                        })
-                        .collect(),
-                    require_auth: s.require_auth,
-                    lazy_cert_distribution: s.lazy_cert_distribution,
-                    enrollment: s.enrollment.map(|e| EnrollmentPolicyStatus {
-                        auto_approve: e.auto_approve,
-                        cert_ttl_secs: e.cert_ttl_secs,
-                        enrollment_token_set: e.enrollment_token_set,
-                    }),
-                    own_ed_pubkey: s.own_ed_pubkey,
-                    own_x_pubkey: s.own_x_pubkey,
-                })
-            }
-
-            Some(RequestKind::RevealEnrollmentToken(_)) => {
-                match self.provider.reveal_enrollment_token() {
-                    Ok(admission) => ResponseKind::EnrollmentToken(RevealEnrollmentTokenResponse {
-                        admission: Some(match admission {
-                            EnrollmentAdmission::Open => Admission::Open(Empty {}),
-                            EnrollmentAdmission::Token(token) => {
-                                Admission::Token(token.expose().into())
-                            }
-                        }),
-                    }),
-                    Err(message) => ResponseKind::Error(ErrorResponse { message }),
-                }
-            }
-
-            Some(RequestKind::ResolveRoute(req)) => {
-                match self.provider.resolve_route(&req.destination) {
-                    Some(resolution) => ResponseKind::ResolveRoute(ResolveRouteResponse {
-                        next_hop: resolution.next_hop,
-                        egress: resolution.egress.map(|d| match d {
-                            EgressDecisionData::AllInterfaces => {
-                                EgressKind::AllInterfaces(AllInterfacesEgress {})
-                            }
-                            EgressDecisionData::Interface(idx) => EgressKind::InterfaceIndex(idx),
-                        }),
-                    }),
-                    None => ResponseKind::Error(ErrorResponse {
-                        message: "invalid destination identifier".into(),
-                    }),
-                }
-            }
-
-            Some(RequestKind::SetAuth(set_auth)) => {
-                match self
-                    .provider
-                    .set_auth(&set_auth.seed, &set_auth.cert, &set_auth.trust_anchor)
-                {
-                    Ok(_) => ResponseKind::Empty(Empty {}),
-                    Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
-                }
-            }
-
-            Some(RequestKind::SetConfig(set_config)) => {
-                let raw_config = set_config.config.unwrap_or_default();
-                // Validated here rather than in each provider: a rejected value
-                // is one that cannot mean what any caller intended, which is a
-                // property of the *request* rather than of the node's state, so
-                // every implementation would otherwise repeat the same check.
-                let enrollment = raw_config
-                    .enrollment
-                    .map(enrollment_policy_data)
-                    .transpose();
-                let enrollment = match enrollment {
-                    Ok(enrollment) => enrollment,
-                    Err(message) => {
-                        return WayfinderResponse {
-                            response: Some(ResponseKind::Error(ErrorResponse { message })),
-                        };
                     }
-                };
-                let config = RuntimeConfigData {
+                })
+                .collect();
+            ResponseKind::Throughput(Throughput {
+                interfaces,
+                total_rx_bps,
+                total_rx_fps,
+                total_tx_bps,
+                total_tx_fps,
+            })
+        }
+        Some(RequestKind::GetMetrics(_)) => {
+            let m = provider.node_metrics();
+            let occ = |o: TableOccupancyData| {
+                Some(TableOccupancy {
+                    used: o.used,
+                    capacity: o.capacity,
+                })
+            };
+            ResponseKind::Metrics(NodeMetrics {
+                uptime_secs: m.uptime_secs,
+                neighbor_count: m.neighbor_count,
+                originators: occ(m.originators),
+                broadcast_dedup: occ(m.broadcast_dedup),
+                local_mcast_groups: occ(m.local_mcast_groups),
+                mcast_memberships: occ(m.mcast_memberships),
+                tq_min: m.tq_min,
+                tq_max: m.tq_max,
+                tq_mean: m.tq_mean,
+                paths_max: m.paths_max,
+                paths_mean: m.paths_mean,
+                oversize_drops: m.oversize_drops,
+                relay_oversize_drops: m.relay_oversize_drops,
+                cert_store: occ(m.cert_store),
+                in_flight_cert_requests: occ(m.in_flight_cert_requests),
+                pending_cert_replies: occ(m.pending_cert_replies),
+                cert_req_rate: m.cert_req_rate,
+                cert_reply_rate: m.cert_reply_rate,
+                untaggable_drop_rate: m.untaggable_drop_rate,
+            })
+        }
+        Some(RequestKind::GetSecurityStatus(_)) => {
+            let s = provider.security_status();
+            ResponseKind::SecurityStatus(GetSecurityStatusResponse {
+                auth_enabled: s.auth_enabled,
+                mesh_id: s.mesh_id,
+                node_mac: s.node_mac,
+                cert_not_after: s.cert_not_after,
+                revocation_count: s.revocation_count,
+                nodes: s
+                    .nodes
+                    .into_iter()
+                    .map(|n| NodeSecurity {
+                        node_id: n.node_id,
+                        verified: n.verified,
+                        cert_not_after: n.cert_not_after,
+                        revoked: n.revoked,
+                        revocation_not_after: n.revocation_not_after,
+                    })
+                    .collect(),
+                require_auth: s.require_auth,
+                lazy_cert_distribution: s.lazy_cert_distribution,
+                enrollment: s.enrollment.map(|e| EnrollmentPolicyStatus {
+                    auto_approve: e.auto_approve,
+                    cert_ttl_secs: e.cert_ttl_secs,
+                    enrollment_token_set: e.enrollment_token_set,
+                }),
+                own_ed_pubkey: s.own_ed_pubkey,
+                own_x_pubkey: s.own_x_pubkey,
+            })
+        }
+        Some(RequestKind::ResolveRoute(req)) => match provider.resolve_route(&req.destination) {
+            Some(resolution) => ResponseKind::ResolveRoute(ResolveRouteResponse {
+                next_hop: resolution.next_hop,
+                egress: resolution.egress.map(|d| match d {
+                    EgressDecisionData::AllInterfaces => {
+                        EgressKind::AllInterfaces(AllInterfacesEgress {})
+                    }
+                    EgressDecisionData::Interface(idx) => EgressKind::InterfaceIndex(idx),
+                }),
+            }),
+            None => ResponseKind::Error(ErrorResponse {
+                message: "invalid destination identifier".into(),
+            }),
+        },
+        Some(RequestKind::SetAuth(set_auth)) => {
+            match provider.set_auth(&set_auth.seed, &set_auth.cert, &set_auth.trust_anchor) {
+                Ok(_) => ResponseKind::Empty(Empty {}),
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            }
+        }
+        Some(RequestKind::SetConfig(set_config)) => {
+            let raw_config = set_config.config.unwrap_or_default();
+            // Validated here rather than in each provider: a rejected value
+            // is one that cannot mean what any caller intended, which is a
+            // property of the *request* rather than of the node's state, so
+            // every implementation would otherwise repeat the same check.
+            let enrollment = raw_config
+                .enrollment
+                .map(enrollment_policy_data)
+                .transpose();
+            let enrollment = match enrollment {
+                Ok(enrollment) => enrollment,
+                Err(message) => {
+                    return Ok(WayfinderResponse {
+                        response: Some(ResponseKind::Error(ErrorResponse { message })),
+                    });
+                }
+            };
+            let config = RuntimeConfigData {
                     trickle: raw_config.trickle.map(|t| TrickleConfigData {
                         iface_idx: t.iface_idx,
                         min_interval_ms: t.min_interval_ms,
@@ -1529,204 +1579,271 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                     require_auth: raw_config.require_auth,
                     enrollment,
                 };
-                match self.provider.set_config(config) {
-                    Ok(_) => ResponseKind::Empty(Empty {}),
-                    Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
-                }
-            }
-
-            Some(RequestKind::GetKeepaliveTable(_)) => {
-                let entries = self
-                    .provider
-                    .keepalive_table()
-                    .into_iter()
-                    .map(|e| KeepAliveEntry {
-                        neighbor_id: e.neighbor_id,
-                        ms_since_last_heard: e.ms_since_last_heard,
-                        interval_estimate_ms: e.interval_estimate_ms,
-                        missed: e.missed,
-                    })
-                    .collect();
-                ResponseKind::KeepaliveTable(KeepAliveTable { entries })
-            }
-
-            Some(RequestKind::GetTrustAnchor(_)) => match self.provider.get_trust_anchor() {
-                Ok(trust_anchor) => {
-                    ResponseKind::TrustAnchor(GetTrustAnchorResponse { trust_anchor })
-                }
+            match provider.set_config(config) {
+                Ok(_) => ResponseKind::Empty(Empty {}),
                 Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
-            },
+            }
+        }
+        Some(RequestKind::GetKeepaliveTable(_)) => {
+            let entries = provider
+                .keepalive_table()
+                .into_iter()
+                .map(|e| KeepAliveEntry {
+                    neighbor_id: e.neighbor_id,
+                    ms_since_last_heard: e.ms_since_last_heard,
+                    interval_estimate_ms: e.interval_estimate_ms,
+                    missed: e.missed,
+                })
+                .collect();
+            ResponseKind::KeepaliveTable(KeepAliveTable { entries })
+        }
 
-            Some(RequestKind::SubmitCsr(req)) => match self.provider.submit_csr(
-                &req.node_mac,
-                &req.ed_pubkey,
-                &req.x_pubkey,
-                &req.enrollment_token,
-            ) {
-                Ok(outcome) => {
-                    let variant = match outcome {
-                        CsrOutcome::Issued(data) => CsrOutcomeKind::Issued(CsrIssued {
+        other => return Err(WayfinderRequest { request: other }),
+    };
+
+    Ok(WayfinderResponse {
+        response: Some(response),
+    })
+}
+
+/// Answer `request` from certificate-authority state.
+///
+/// The mirror of [`handle_router`]: returns the request unconsumed as `Err`
+/// when it is not [`RequestFacet::Authority`].
+pub fn handle_authority<P: AuthorityDataProvider>(
+    provider: &mut P,
+    request: WayfinderRequest,
+) -> Result<WayfinderResponse, WayfinderRequest> {
+    let response = match request.request {
+        Some(RequestKind::RevealEnrollmentToken(_)) => match provider.reveal_enrollment_token() {
+            Ok(admission) => ResponseKind::EnrollmentToken(RevealEnrollmentTokenResponse {
+                admission: Some(match admission {
+                    EnrollmentAdmission::Open => Admission::Open(Empty {}),
+                    EnrollmentAdmission::Token(token) => Admission::Token(token.expose().into()),
+                }),
+            }),
+            Err(message) => ResponseKind::Error(ErrorResponse { message }),
+        },
+        Some(RequestKind::GetTrustAnchor(_)) => match provider.get_trust_anchor() {
+            Ok(trust_anchor) => ResponseKind::TrustAnchor(GetTrustAnchorResponse { trust_anchor }),
+            Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+        },
+        Some(RequestKind::SubmitCsr(req)) => match provider.submit_csr(
+            &req.node_mac,
+            &req.ed_pubkey,
+            &req.x_pubkey,
+            &req.enrollment_token,
+        ) {
+            Ok(outcome) => {
+                let variant = match outcome {
+                    CsrOutcome::Issued(data) => CsrOutcomeKind::Issued(CsrIssued {
+                        cert: data.cert,
+                        trust_anchor: data.trust_anchor,
+                    }),
+                    CsrOutcome::Pending => CsrOutcomeKind::Pending(CsrPending {}),
+                    CsrOutcome::Rejected(reason) => {
+                        CsrOutcomeKind::Rejected(CsrRejected { reason })
+                    }
+                };
+                ResponseKind::SubmitCsr(SubmitCsrResponse {
+                    outcome: Some(variant),
+                })
+            }
+            Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+        },
+        Some(RequestKind::AuthenticateUser(req)) => match provider.authenticate_user(
+            &req.username,
+            &req.password,
+            &req.totp_code,
+            &req.ed_pubkey,
+            &req.x_pubkey,
+        ) {
+            Ok(outcome) => {
+                let variant = match outcome {
+                    UserAuthOutcome::Issued(data) => {
+                        AuthenticateUserOutcomeKind::Issued(UserSessionIssued {
                             cert: data.cert,
                             trust_anchor: data.trust_anchor,
-                        }),
-                        CsrOutcome::Pending => CsrOutcomeKind::Pending(CsrPending {}),
-                        CsrOutcome::Rejected(reason) => {
-                            CsrOutcomeKind::Rejected(CsrRejected { reason })
-                        }
-                    };
-                    ResponseKind::SubmitCsr(SubmitCsrResponse {
-                        outcome: Some(variant),
+                        })
+                    }
+                    // One message for every reason, composed here rather
+                    // than by the provider so no implementation can widen
+                    // it into something branchable.
+                    UserAuthOutcome::Rejected => {
+                        AuthenticateUserOutcomeKind::Rejected(UserSessionRejected {
+                            message: "authentication denied".into(),
+                        })
+                    }
+                };
+                ResponseKind::AuthenticateUser(AuthenticateUserResponse {
+                    outcome: Some(variant),
+                })
+            }
+            Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+        },
+        Some(RequestKind::RevokeNode(req)) => match provider.revoke_node(&req.node_mac) {
+            Ok(()) => ResponseKind::Empty(Empty {}),
+            Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+        },
+        Some(RequestKind::ListCerts(_)) => match provider.list_certs() {
+            Ok(certs) => ResponseKind::ListCerts(ListCertsResponse {
+                certs: certs
+                    .into_iter()
+                    .map(|c| IssuedCert {
+                        node_mac: c.node_mac,
+                        ed_pubkey: c.ed_pubkey,
+                        not_before: c.not_before,
+                        not_after: c.not_after,
+                        revoked: c.revoked,
+                        user: c.user,
+                        admin: c.admin,
+                        viewer: c.viewer,
                     })
-                }
-                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
-            },
-
-            Some(RequestKind::AuthenticateUser(req)) => match self.provider.authenticate_user(
-                &req.username,
-                &req.password,
-                &req.totp_code,
-                &req.ed_pubkey,
-                &req.x_pubkey,
-            ) {
-                Ok(outcome) => {
-                    let variant = match outcome {
-                        UserAuthOutcome::Issued(data) => {
-                            AuthenticateUserOutcomeKind::Issued(UserSessionIssued {
-                                cert: data.cert,
-                                trust_anchor: data.trust_anchor,
-                            })
-                        }
-                        // One message for every reason, composed here rather
-                        // than by the provider so no implementation can widen
-                        // it into something branchable.
-                        UserAuthOutcome::Rejected => {
-                            AuthenticateUserOutcomeKind::Rejected(UserSessionRejected {
-                                message: "authentication denied".into(),
-                            })
-                        }
-                    };
-                    ResponseKind::AuthenticateUser(AuthenticateUserResponse {
-                        outcome: Some(variant),
-                    })
-                }
-                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
-            },
-
-            // The VPN requests are answered by the management *transport*, which
-            // is the only layer that holds the caller's verified certificate —
-            // `GetVpnEnrollment` carries no fields because the identity it
-            // mints for is the connection's, and a provider here has no
-            // connection to read it from. Reaching this arm means a transport
-            // forwarded one instead of handling it, so it fails closed and
-            // says so rather than answering with something plausible.
-            Some(RequestKind::GetVpnEnrollment(_))
-            | Some(RequestKind::ListVpnPeers(_))
-            | Some(RequestKind::RevokeVpnPeer(_)) => ResponseKind::Error(ErrorResponse {
-                message: "VPN coordination is not served on this transport".into(),
+                    .collect(),
             }),
+            Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+        },
+        Some(RequestKind::ListUsers(_)) => match provider.list_users() {
+            Ok(users) => ResponseKind::ListUsers(ListUsersResponse {
+                users: users
+                    .into_iter()
+                    .map(|u| UserAccount {
+                        username: u.username,
+                        admin: u.admin,
+                        session_ttl_secs: u.session_ttl_secs,
+                        totp_enrolled: u.totp_enrolled,
+                        disabled: u.disabled,
+                        locked: u.locked,
+                    })
+                    .collect(),
+            }),
+            Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+        },
+        Some(RequestKind::CreateUser(req)) => match provider.create_user(
+            &req.username,
+            &req.password,
+            req.admin,
+            req.session_ttl_secs,
+            req.no_totp,
+        ) {
+            Ok(totp_enrolment_uri) => {
+                ResponseKind::CreateUser(CreateUserResponse { totp_enrolment_uri })
+            }
+            Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+        },
+        Some(RequestKind::RemoveUser(req)) => match provider.remove_user(&req.username) {
+            Ok(()) => ResponseKind::Empty(Empty {}),
+            Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+        },
+        Some(RequestKind::ListPendingCsrs(_)) => match provider.list_pending_csrs() {
+            Ok(pending) => ResponseKind::ListPendingCsrs(ListPendingCsrsResponse {
+                pending: pending
+                    .into_iter()
+                    .map(|p| PendingCsr {
+                        node_mac: p.node_mac,
+                        ed_pubkey: p.ed_pubkey,
+                        x_pubkey: p.x_pubkey,
+                        requested_at: p.requested_at,
+                    })
+                    .collect(),
+            }),
+            Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+        },
+        Some(RequestKind::ApproveCsr(req)) => match provider.approve_csr(&req.node_mac) {
+            Ok(()) => ResponseKind::Empty(Empty {}),
+            Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+        },
+        Some(RequestKind::DenyCsr(req)) => match provider.deny_csr(&req.node_mac) {
+            Ok(()) => ResponseKind::Empty(Empty {}),
+            Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+        },
 
-            Some(RequestKind::RevokeNode(req)) => match self.provider.revoke_node(&req.node_mac) {
-                Ok(()) => ResponseKind::Empty(Empty {}),
-                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
-            },
+        other => return Err(WayfinderRequest { request: other }),
+    };
 
-            Some(RequestKind::ListCerts(_)) => match self.provider.list_certs() {
-                Ok(certs) => ResponseKind::ListCerts(ListCertsResponse {
-                    certs: certs
-                        .into_iter()
-                        .map(|c| IssuedCert {
-                            node_mac: c.node_mac,
-                            ed_pubkey: c.ed_pubkey,
-                            not_before: c.not_before,
-                            not_after: c.not_after,
-                            revoked: c.revoked,
-                            user: c.user,
-                            admin: c.admin,
-                            viewer: c.viewer,
-                        })
-                        .collect(),
-                }),
-                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
-            },
+    Ok(WayfinderResponse {
+        response: Some(response),
+    })
+}
 
-            Some(RequestKind::ListUsers(_)) => match self.provider.list_users() {
-                Ok(users) => ResponseKind::ListUsers(ListUsersResponse {
-                    users: users
-                        .into_iter()
-                        .map(|u| UserAccount {
-                            username: u.username,
-                            admin: u.admin,
-                            session_ttl_secs: u.session_ttl_secs,
-                            totp_enrolled: u.totp_enrolled,
-                            disabled: u.disabled,
-                            locked: u.locked,
-                        })
-                        .collect(),
-                }),
-                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
-            },
+/// Answer a request no provider owns: one the transport should already have
+/// handled, or an empty one.  Reaching here is a protocol error by the client
+/// rather than a capability the node lacks, and each arm says which.
+fn handle_unowned(request: WayfinderRequest) -> WayfinderResponse {
+    let response = match request.request {
+        // The VPN requests are answered by the management *transport*, which
+        // is the only layer that holds the caller's verified certificate —
+        // `GetVpnEnrollment` carries no fields because the identity it
+        // mints for is the connection's, and a provider here has no
+        // connection to read it from. Reaching this arm means a transport
+        // forwarded one instead of handling it, so it fails closed and
+        // says so rather than answering with something plausible.
+        Some(RequestKind::GetVpnEnrollment(_))
+        | Some(RequestKind::ListVpnPeers(_))
+        | Some(RequestKind::RevokeVpnPeer(_)) => ResponseKind::Error(ErrorResponse {
+            message: "VPN coordination is not served on this transport".into(),
+        }),
 
-            Some(RequestKind::CreateUser(req)) => match self.provider.create_user(
-                &req.username,
-                &req.password,
-                req.admin,
-                req.session_ttl_secs,
-                req.no_totp,
-            ) {
-                Ok(totp_enrolment_uri) => {
-                    ResponseKind::CreateUser(CreateUserResponse { totp_enrolment_uri })
-                }
-                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
-            },
-
-            Some(RequestKind::RemoveUser(req)) => match self.provider.remove_user(&req.username) {
-                Ok(()) => ResponseKind::Empty(Empty {}),
-                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
-            },
-
-            Some(RequestKind::ListPendingCsrs(_)) => match self.provider.list_pending_csrs() {
-                Ok(pending) => ResponseKind::ListPendingCsrs(ListPendingCsrsResponse {
-                    pending: pending
-                        .into_iter()
-                        .map(|p| PendingCsr {
-                            node_mac: p.node_mac,
-                            ed_pubkey: p.ed_pubkey,
-                            x_pubkey: p.x_pubkey,
-                            requested_at: p.requested_at,
-                        })
-                        .collect(),
-                }),
-                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
-            },
-
-            Some(RequestKind::ApproveCsr(req)) => match self.provider.approve_csr(&req.node_mac) {
-                Ok(()) => ResponseKind::Empty(Empty {}),
-                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
-            },
-
-            Some(RequestKind::DenyCsr(req)) => match self.provider.deny_csr(&req.node_mac) {
-                Ok(()) => ResponseKind::Empty(Empty {}),
-                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
-            },
-
-            // Authentication is handled by the transport before any request
-            // reaches this dispatcher (it needs the TLS-authenticated key, which
-            // the router-facing provider has no access to). Seeing one here means
-            // the client sent it out of order — after already authenticating —
-            // which is a protocol error, not a router query.
-            Some(RequestKind::Authenticate(_)) => ResponseKind::Error(ErrorResponse {
-                message: "unexpected Authenticate request: authentication must be the first \
+        // Authentication is handled by the transport before any request
+        // reaches this dispatcher (it needs the TLS-authenticated key, which
+        // the router-facing provider has no access to). Seeing one here means
+        // the client sent it out of order — after already authenticating —
+        // which is a protocol error, not a router query.
+        Some(RequestKind::Authenticate(_)) => ResponseKind::Error(ErrorResponse {
+            message: "unexpected Authenticate request: authentication must be the first \
                           message on a connection and may not be repeated"
-                    .into(),
-            }),
+                .into(),
+        }),
+        None => ResponseKind::Error(ErrorResponse {
+            message: "empty request".into(),
+        }),
 
-            None => ResponseKind::Error(ErrorResponse {
-                message: "empty request".into(),
-            }),
+        // Unreachable as called: this function only ever sees what both
+        // dispatchers declined, which is exactly the transport-owned kinds and
+        // `None`. Answered rather than unreachable!() so that a request kind
+        // added later without an owner degrades to an error the client can read
+        // instead of taking the node down.
+        _ => ResponseKind::Error(ErrorResponse {
+            message: "request has no handler on this node".into(),
+        }),
+    };
+
+    WayfinderResponse {
+        response: Some(response),
+    }
+}
+
+/// Stateful handler that maps [`WayfinderRequest`] → [`WayfinderResponse`].
+///
+/// `P` is any type implementing [`WayfinderDataProvider`]; pass a reference
+/// (`WayfinderService::new(&router)`) or an owned wrapper.
+pub struct WayfinderService<P> {
+    provider: P,
+}
+
+impl<P: WayfinderDataProvider> WayfinderService<P> {
+    /// Wrap a data provider in a request handler.
+    pub fn new(provider: P) -> Self {
+        Self { provider }
+    }
+
+    /// Dispatch one request to the provider and build the matching response,
+    /// mapping any provider error into an [`ErrorResponse`].
+    ///
+    /// Tries each half in turn against the single provider that implements
+    /// both. A caller that owns the halves separately should classify with
+    /// [`request_facet`] and call [`handle_router`] / [`handle_authority`]
+    /// directly instead.
+    pub fn handle(&mut self, request: WayfinderRequest) -> WayfinderResponse {
+        audit_request(&request);
+
+        let request = match handle_router(&mut self.provider, request) {
+            Ok(response) => return response,
+            Err(request) => request,
         };
-
-        WayfinderResponse {
-            response: Some(response),
+        match handle_authority(&mut self.provider, request) {
+            Ok(response) => response,
+            Err(request) => handle_unowned(request),
         }
     }
 }
@@ -1734,13 +1851,18 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wayfinder::v1alpha::AuthenticateRequest;
     use crate::wayfinder::v1alpha::GetLinkFeaturesTableRequest;
     use crate::wayfinder::v1alpha::GetLinkQualityTableRequest;
     use crate::wayfinder::v1alpha::GetMetricsRequest;
     use crate::wayfinder::v1alpha::GetNodeInfoRequest;
     use crate::wayfinder::v1alpha::GetOgmScheduleRequest;
+    use crate::wayfinder::v1alpha::GetRoutingTableRequest;
     use crate::wayfinder::v1alpha::GetSecurityStatusRequest;
     use crate::wayfinder::v1alpha::GetThroughputRequest;
+    use crate::wayfinder::v1alpha::GetTrustAnchorRequest;
+    use crate::wayfinder::v1alpha::ListUsersRequest;
+    use crate::wayfinder::v1alpha::ListVpnPeersRequest;
     use crate::wayfinder::v1alpha::ResolveRouteRequest;
     use crate::wayfinder::v1alpha::RevealEnrollmentTokenRequest;
     use crate::wayfinder::v1alpha::RuntimeConfig;
@@ -1785,7 +1907,7 @@ mod tests {
         alarms: AlarmsData,
     }
 
-    impl WayfinderDataProvider for MockProvider {
+    impl RouterDataProvider for MockProvider {
         fn node_id(&self) -> Vec<u8> {
             vec![]
         }
@@ -1851,11 +1973,6 @@ mod tests {
         fn security_status(&self) -> SecurityStatusData {
             self.security_status.clone()
         }
-        fn reveal_enrollment_token(&self) -> Result<EnrollmentAdmission, String> {
-            self.enrollment_admission
-                .clone()
-                .ok_or_else(|| "node is not a certificate-authority provider".into())
-        }
         fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
             match &self.set_log_level_error {
                 Some(error) => Err(error.clone()),
@@ -1863,6 +1980,14 @@ mod tests {
                 // mock echoes what it was handed.
                 None => Ok(directives.into()),
             }
+        }
+    }
+
+    impl AuthorityDataProvider for MockProvider {
+        fn reveal_enrollment_token(&self) -> Result<EnrollmentAdmission, String> {
+            self.enrollment_admission
+                .clone()
+                .ok_or_else(|| "node is not a certificate-authority provider".into())
         }
     }
 
@@ -3188,6 +3313,157 @@ mod tests {
             ResponseKind::ListUsers(_) => "ListUsers",
             ResponseKind::CreateUser(_) => "CreateUser",
             ResponseKind::Alarms(_) => "Alarms",
+        }
+    }
+
+    /// A provider implementing *only* the authority half.
+    ///
+    /// That this compiles at all is the property the split exists to create:
+    /// before it, an authority had to satisfy the whole thirty-method surface,
+    /// including every router projection it has no state to answer from.  Every
+    /// method here is a default, so the body is empty by design.
+    #[derive(Default)]
+    struct AuthorityOnly;
+
+    impl AuthorityDataProvider for AuthorityOnly {}
+
+    /// Dispatch a request through the router half alone.
+    fn router_handle<P: RouterDataProvider>(
+        provider: &mut P,
+        req: RequestKind,
+    ) -> Result<ResponseKind, WayfinderRequest> {
+        handle_router(provider, WayfinderRequest { request: Some(req) })
+            .map(|r| r.response.expect("dispatch always sets a response"))
+    }
+
+    /// Dispatch a request through the authority half alone.
+    fn authority_handle<P: AuthorityDataProvider>(
+        provider: &mut P,
+        req: RequestKind,
+    ) -> Result<ResponseKind, WayfinderRequest> {
+        handle_authority(provider, WayfinderRequest { request: Some(req) })
+            .map(|r| r.response.expect("dispatch always sets a response"))
+    }
+
+    /// Every request kind belongs to exactly one facet, and the classification
+    /// is what lets a connection task pick a channel before it sends anything.
+    #[test]
+    fn request_facet_assigns_each_kind_to_one_half() {
+        assert_eq!(
+            request_facet(&RequestKind::GetRoutingTable(GetRoutingTableRequest {})),
+            RequestFacet::Router
+        );
+        assert_eq!(
+            request_facet(&RequestKind::ListUsers(ListUsersRequest {})),
+            RequestFacet::Authority
+        );
+        // Answered before dispatch is reached: the VPN requests in the
+        // connection task, `Authenticate` by the transport's own first frame.
+        assert_eq!(
+            request_facet(&RequestKind::ListVpnPeers(ListVpnPeersRequest {})),
+            RequestFacet::Transport
+        );
+        assert_eq!(
+            request_facet(&RequestKind::Authenticate(AuthenticateRequest::default())),
+            RequestFacet::Transport
+        );
+    }
+
+    /// The router dispatcher answers a router request from a provider that
+    /// knows nothing about certificates.
+    #[test]
+    fn router_dispatch_answers_a_router_request() {
+        let mut provider = MockProvider::default();
+
+        match router_handle(
+            &mut provider,
+            RequestKind::GetNodeInfo(GetNodeInfoRequest {}),
+        ) {
+            Ok(ResponseKind::NodeInfo(info)) => assert_eq!(info.num_originators, 0),
+            Ok(other) => panic!("expected NodeInfo, got {}", proto_kind_name(&other)),
+            Err(_) => panic!("GetNodeInfo is a router request and must be handled here"),
+        }
+    }
+
+    /// An authority request handed to the router dispatcher comes back
+    /// untouched, so the caller can forward it to the other half rather than
+    /// receiving a misleading "not a provider" error from the wrong owner.
+    #[test]
+    fn router_dispatch_returns_an_authority_request_untouched() {
+        let mut provider = MockProvider::default();
+
+        let returned = router_handle(&mut provider, RequestKind::ListUsers(ListUsersRequest {}))
+            .expect_err("ListUsers belongs to the authority half");
+
+        assert!(
+            matches!(returned.request, Some(RequestKind::ListUsers(_))),
+            "the request must be returned intact for the caller to re-route"
+        );
+    }
+
+    /// The authority dispatcher answers an authority request from a provider
+    /// that holds no router state at all.
+    #[test]
+    fn authority_dispatch_answers_an_authority_request() {
+        let mut provider = AuthorityOnly;
+
+        // The default authority impl is a node that is not a provider, so the
+        // answer is that error -- the point being that it is *this* half that
+        // produced it.
+        match authority_handle(
+            &mut provider,
+            RequestKind::GetTrustAnchor(GetTrustAnchorRequest {}),
+        ) {
+            Ok(ResponseKind::Error(e)) => {
+                assert_eq!(e.message, "node is not a certificate-authority provider")
+            }
+            Ok(other) => panic!("expected Error, got {}", proto_kind_name(&other)),
+            Err(_) => panic!("GetTrustAnchor is an authority request and must be handled here"),
+        }
+    }
+
+    /// The mirror of the router case: a router request handed to the authority
+    /// dispatcher comes back untouched.
+    #[test]
+    fn authority_dispatch_returns_a_router_request_untouched() {
+        let mut provider = AuthorityOnly;
+
+        let returned = authority_handle(
+            &mut provider,
+            RequestKind::GetRoutingTable(GetRoutingTableRequest {}),
+        )
+        .expect_err("GetRoutingTable belongs to the router half");
+
+        assert!(
+            matches!(returned.request, Some(RequestKind::GetRoutingTable(_))),
+            "the request must be returned intact for the caller to re-route"
+        );
+    }
+
+    /// Backwards compatibility: a single provider implementing both halves is
+    /// still served by one `WayfinderService`, answering both kinds exactly as
+    /// it did before the split.  This is what keeps every existing caller --
+    /// the driver loop, the web mock, the client tests -- working unchanged.
+    #[test]
+    fn combined_service_still_answers_both_halves() {
+        let router = handle(
+            MockProvider::default(),
+            RequestKind::GetNodeInfo(GetNodeInfoRequest {}),
+        );
+        match router {
+            ResponseKind::NodeInfo(info) => assert_eq!(info.num_originators, 0),
+            other => panic!("expected NodeInfo, got {}", proto_kind_name(&other)),
+        }
+
+        let authority = handle(
+            MockProvider::default(),
+            RequestKind::GetTrustAnchor(GetTrustAnchorRequest {}),
+        );
+        match authority {
+            ResponseKind::Error(e) => {
+                assert_eq!(e.message, "node is not a certificate-authority provider")
+            }
+            other => panic!("expected Error, got {}", proto_kind_name(&other)),
         }
     }
 }

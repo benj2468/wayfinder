@@ -22,6 +22,7 @@ use wayfinder_protos::service::AlarmKindData;
 use wayfinder_protos::service::AlarmSeverityData;
 use wayfinder_protos::service::AlarmSubjectData;
 use wayfinder_protos::service::AlarmsData;
+use wayfinder_protos::service::AuthorityDataProvider;
 use wayfinder_protos::service::EgressDecisionData;
 use wayfinder_protos::service::EnrollmentPolicyStatusData;
 use wayfinder_protos::service::InterfaceThroughputData;
@@ -37,12 +38,12 @@ use wayfinder_protos::service::NodeSecurityData;
 use wayfinder_protos::service::OgmScheduleEntryData;
 use wayfinder_protos::service::PendingCsrData;
 use wayfinder_protos::service::RouteResolutionData;
+use wayfinder_protos::service::RouterDataProvider;
 use wayfinder_protos::service::RoutingEntryData;
 use wayfinder_protos::service::RuntimeConfigData;
 use wayfinder_protos::service::SecurityStatusData;
 use wayfinder_protos::service::TableOccupancyData;
 use wayfinder_protos::service::TokenUpdate;
-use wayfinder_protos::service::WayfinderDataProvider;
 use wayfinder_protos::service::WayfinderService;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderResponse;
@@ -380,7 +381,7 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
-impl WayfinderDataProvider for Mock {
+impl RouterDataProvider for Mock {
     fn node_id(&self) -> Vec<u8> {
         vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]
     }
@@ -504,20 +505,6 @@ impl WayfinderDataProvider for Mock {
     fn security_status(&self) -> SecurityStatusData {
         self.security.clone()
     }
-    fn reveal_enrollment_token(
-        &self,
-    ) -> Result<wayfinder_protos::service::EnrollmentAdmission, String> {
-        use wayfinder_protos::service::EnrollmentAdmission;
-        use wayfinder_protos::service::SharedSecret;
-
-        if self.security.enrollment.is_none() {
-            return Err("node is not a certificate-authority provider".to_string());
-        }
-        Ok(match &self.enrollment_token {
-            Some(token) => EnrollmentAdmission::Token(SharedSecret::new(token.clone())),
-            None => EnrollmentAdmission::Open,
-        })
-    }
     fn set_config(&mut self, config: RuntimeConfigData) -> Result<(), String> {
         // Applied to the reported status, so the dashboard's next poll shows
         // the change — a mock that accepted every write and reported the same
@@ -599,6 +586,48 @@ impl WayfinderDataProvider for Mock {
             .map(|()| wayfinder_log::current_spec().as_str().to_string())
             .map_err(|e| format!("{e}"))
     }
+    /// Install a certificate, the way a node does when it is enrolled.
+    ///
+    /// An empty seed means the node keeps the identity it has, so the reported
+    /// keys are left alone; a seed that *is* supplied replaces them, exactly as
+    /// a real node's would be re-derived. Reporting that faithfully is the
+    /// point — it is how a test can tell which of the two happened.
+    fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String> {
+        let anchor = wayfinder_auth::TrustAnchor::from_bytes(trust_anchor)
+            .ok_or_else(|| "unable to parse trust anchor".to_string())?;
+        let cert = wayfinder_auth::MembershipCert::from_bytes(cert)
+            .ok_or_else(|| "unable to parse membership cert".to_string())?;
+        if !seed.is_empty() {
+            let seed: [u8; 32] = seed
+                .try_into()
+                .map_err(|_| "seed must be exactly 32 bytes".to_string())?;
+            let kp = wayfinder_auth::Keypair::from_seed(&seed);
+            self.security.own_ed_pubkey = kp.ed_pubkey().to_vec();
+            self.security.own_x_pubkey = kp.x_pubkey().to_vec();
+        }
+        self.security.auth_enabled = true;
+        self.security.mesh_id = anchor.mesh_id;
+        self.security.node_mac = cert.node_mac.to_vec();
+        self.security.cert_not_after = cert.not_after.get();
+        Ok(())
+    }
+}
+
+impl AuthorityDataProvider for Mock {
+    fn reveal_enrollment_token(
+        &self,
+    ) -> Result<wayfinder_protos::service::EnrollmentAdmission, String> {
+        use wayfinder_protos::service::EnrollmentAdmission;
+        use wayfinder_protos::service::SharedSecret;
+
+        if self.security.enrollment.is_none() {
+            return Err("node is not a certificate-authority provider".to_string());
+        }
+        Ok(match &self.enrollment_token {
+            Some(token) => EnrollmentAdmission::Token(SharedSecret::new(token.clone())),
+            None => EnrollmentAdmission::Open,
+        })
+    }
     fn get_trust_anchor(&self) -> Result<Vec<u8>, String> {
         match &self.ca {
             Some(ca) => Ok(ca.trust_anchor_bytes()),
@@ -672,31 +701,6 @@ impl WayfinderDataProvider for Mock {
             .as_mut()
             .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
             .approve_csr(node_mac)
-    }
-    /// Install a certificate, the way a node does when it is enrolled.
-    ///
-    /// An empty seed means the node keeps the identity it has, so the reported
-    /// keys are left alone; a seed that *is* supplied replaces them, exactly as
-    /// a real node's would be re-derived. Reporting that faithfully is the
-    /// point — it is how a test can tell which of the two happened.
-    fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String> {
-        let anchor = wayfinder_auth::TrustAnchor::from_bytes(trust_anchor)
-            .ok_or_else(|| "unable to parse trust anchor".to_string())?;
-        let cert = wayfinder_auth::MembershipCert::from_bytes(cert)
-            .ok_or_else(|| "unable to parse membership cert".to_string())?;
-        if !seed.is_empty() {
-            let seed: [u8; 32] = seed
-                .try_into()
-                .map_err(|_| "seed must be exactly 32 bytes".to_string())?;
-            let kp = wayfinder_auth::Keypair::from_seed(&seed);
-            self.security.own_ed_pubkey = kp.ed_pubkey().to_vec();
-            self.security.own_x_pubkey = kp.x_pubkey().to_vec();
-        }
-        self.security.auth_enabled = true;
-        self.security.mesh_id = anchor.mesh_id;
-        self.security.node_mac = cert.node_mac.to_vec();
-        self.security.cert_not_after = cert.not_after.get();
-        Ok(())
     }
 }
 

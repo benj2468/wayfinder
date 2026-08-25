@@ -9,6 +9,7 @@ use tokio::sync::oneshot;
 use wayfinder_auth::Keypair;
 use wayfinder_client::Identity;
 use wayfinder_protos::service::AlarmsData;
+use wayfinder_protos::service::AuthorityDataProvider;
 use wayfinder_protos::service::InterfaceThroughputData;
 use wayfinder_protos::service::KeepAliveEntryData;
 use wayfinder_protos::service::LinkFeaturesEntryData;
@@ -20,11 +21,11 @@ use wayfinder_protos::service::NodeMetricsData;
 use wayfinder_protos::service::NodeSecurityData;
 use wayfinder_protos::service::OgmScheduleEntryData;
 use wayfinder_protos::service::RouteResolutionData;
+use wayfinder_protos::service::RouterDataProvider;
 use wayfinder_protos::service::RoutingEntryData;
 use wayfinder_protos::service::RuntimeConfigData;
 use wayfinder_protos::service::SecurityStatusData;
 use wayfinder_protos::service::TableOccupancyData;
-use wayfinder_protos::service::WayfinderDataProvider;
 use wayfinder_protos::service::WayfinderService;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderResponse;
@@ -46,7 +47,7 @@ fn occ() -> TableOccupancyData {
     }
 }
 
-impl WayfinderDataProvider for Mock {
+impl RouterDataProvider for Mock {
     fn node_id(&self) -> Vec<u8> {
         vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x07]
     }
@@ -192,6 +193,8 @@ impl WayfinderDataProvider for Mock {
         }
     }
 }
+
+impl AuthorityDataProvider for Mock {}
 
 /// Spawn a node serving the authenticated TLS management API in front of the
 /// `Mock` provider, and return an [`Endpoint`] that bootstraps against it (the

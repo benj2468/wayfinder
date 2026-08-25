@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use wayfinder_client::Client;
 use wayfinder_protos::service::AlarmsData;
+use wayfinder_protos::service::AuthorityDataProvider;
 use wayfinder_protos::service::EgressDecisionData;
 use wayfinder_protos::service::InterfaceThroughputData;
 use wayfinder_protos::service::KeepAliveEntryData;
@@ -27,10 +28,10 @@ use wayfinder_protos::service::NeighborPathData;
 use wayfinder_protos::service::NodeMetricsData;
 use wayfinder_protos::service::OgmScheduleEntryData;
 use wayfinder_protos::service::RouteResolutionData;
+use wayfinder_protos::service::RouterDataProvider;
 use wayfinder_protos::service::RoutingEntryData;
 use wayfinder_protos::service::RuntimeConfigData;
 use wayfinder_protos::service::TableOccupancyData;
-use wayfinder_protos::service::WayfinderDataProvider;
 use wayfinder_protos::service::WayfinderService;
 use wayfinder_protos::wayfinder::v1alpha::LogLevel;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
@@ -54,7 +55,7 @@ fn format_mac(bytes: &[u8]) -> String {
 /// resolvable route, so every typed client method has something to return.
 struct Mock;
 
-impl WayfinderDataProvider for Mock {
+impl RouterDataProvider for Mock {
     fn node_id(&self) -> Vec<u8> {
         vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]
     }
@@ -221,7 +222,9 @@ impl WayfinderDataProvider for Mock {
             .map(|()| wayfinder_log::current_spec().as_str().to_string())
             .map_err(|e| format!("{e}"))
     }
+}
 
+impl AuthorityDataProvider for Mock {
     fn get_trust_anchor(&self) -> Result<Vec<u8>, String> {
         Ok(vec![0xab; 36])
     }

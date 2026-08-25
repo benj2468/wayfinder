@@ -15,6 +15,7 @@ use wayfinder_auth::MembershipCert;
 use wayfinder_auth::TrustAnchor;
 use wayfinder_client::Identity;
 use wayfinder_protos::service::AlarmsData;
+use wayfinder_protos::service::AuthorityDataProvider;
 use wayfinder_protos::service::CsrOutcome;
 use wayfinder_protos::service::InterfaceThroughputData;
 use wayfinder_protos::service::IssuedCertData;
@@ -26,10 +27,10 @@ use wayfinder_protos::service::NodeMetricsData;
 use wayfinder_protos::service::OgmScheduleEntryData;
 use wayfinder_protos::service::PendingCsrData;
 use wayfinder_protos::service::RouteResolutionData;
+use wayfinder_protos::service::RouterDataProvider;
 use wayfinder_protos::service::RoutingEntryData;
 use wayfinder_protos::service::RuntimeConfigData;
 use wayfinder_protos::service::TableOccupancyData;
-use wayfinder_protos::service::WayfinderDataProvider;
 use wayfinder_protos::service::WayfinderService;
 use wayfinder_protos::wayfinder::v1alpha::SubmitCsrRequest;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
@@ -57,7 +58,7 @@ fn occ() -> TableOccupancyData {
     }
 }
 
-impl WayfinderDataProvider for ProviderMock {
+impl RouterDataProvider for ProviderMock {
     fn node_id(&self) -> Vec<u8> {
         vec![0, 0, 0, 0, 0, 1]
     }
@@ -138,7 +139,9 @@ impl WayfinderDataProvider for ProviderMock {
     fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
         Ok(directives.to_string())
     }
+}
 
+impl AuthorityDataProvider for ProviderMock {
     fn get_trust_anchor(&self) -> Result<Vec<u8>, String> {
         Ok(self.ca.trust_anchor_bytes())
     }
