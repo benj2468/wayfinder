@@ -209,6 +209,244 @@ body {
   background: var(--wf-warn);
 }
 
+/* ------------------------------------------------------------- alarms -- */
+
+/* The alarm strip sits between the node label and everything pinned right, so
+ * it reads as a fact about the node rather than about this session. `relative`
+ * anchors the card below it; `margin-left: auto` is deliberately absent — the
+ * strip follows the label rather than being pushed to the far end, because a
+ * gap between "which node" and "how it is" invites reading them separately. */
+.wf-header-alarms {
+  position: relative;
+  font-size: var(--wf-text-sm);
+}
+
+/* A button, not a span, for the same reason the user trigger is one: the card
+ * has to be reachable by keyboard and by touch, and `:focus-within` plus a tap
+ * is what does that without any open/closed state in the app. */
+.wf-alarm-trigger {
+  display: flex;
+  align-items: center;
+  gap: var(--wf-space-2);
+  padding: var(--wf-space-1) var(--wf-space-2);
+  border: 1px solid transparent;
+  border-radius: var(--wf-radius-sm);
+  background: none;
+  color: var(--wf-text-muted);
+  font-family: inherit;
+  font-size: inherit;
+  line-height: 1.45;
+  cursor: pointer;
+}
+
+.wf-alarm-trigger:hover,
+.wf-header-alarms:focus-within .wf-alarm-trigger {
+  border-color: var(--wf-border);
+  background: var(--wf-surface-raised);
+}
+
+.wf-alarm-trigger:focus-visible {
+  outline: 2px solid var(--wf-accent);
+  outline-offset: 2px;
+}
+
+/* The mark carries the colour, the words stay in the header's muted grey. An
+ * all-red pill for one warning would shout as loudly as one for an attack, and
+ * the whole point of a severity ramp is that those look different. */
+.wf-alarm-mark {
+  font-size: 0.75em;
+  line-height: 1;
+}
+
+/* Severity ramp, shared by the trigger's mark and each row's. Warm pulls the
+ * eye and cold recedes, matching the log-level colouring and the TUI's. */
+.wf-sev-clear .wf-alarm-mark,
+.wf-sev-clear.wf-alarm-row .wf-alarm-row-mark {
+  color: var(--wf-ok);
+}
+
+.wf-sev-info .wf-alarm-mark,
+.wf-sev-info.wf-alarm-row .wf-alarm-row-mark {
+  color: var(--wf-accent);
+}
+
+.wf-sev-warning .wf-alarm-mark,
+.wf-sev-warning.wf-alarm-row .wf-alarm-row-mark {
+  color: var(--wf-warn);
+}
+
+.wf-sev-critical .wf-alarm-mark,
+.wf-sev-critical.wf-alarm-row .wf-alarm-row-mark {
+  color: var(--wf-error);
+}
+
+/* A severity this build has no name for. Deliberately loud rather than
+ * neutral: it means a node newer than this page, and a row it cannot classify
+ * is the last thing that should read as unimportant. */
+.wf-sev-unknown .wf-alarm-mark,
+.wf-sev-unknown.wf-alarm-row .wf-alarm-row-mark {
+  color: var(--wf-accent);
+}
+
+/* Something *is* wrong: the count itself takes the severity colour, so the
+ * trigger is legible at a glance without reading the word beside it. */
+.wf-alarm-trigger.wf-sev-warning,
+.wf-alarm-trigger.wf-sev-critical,
+.wf-alarm-trigger.wf-sev-unknown {
+  color: var(--wf-text);
+  font-weight: 600;
+}
+
+.wf-alarm-quiet-count {
+  color: var(--wf-text-faint);
+}
+
+/* Anchored flush to the trigger's bottom edge, like the user card: a gap would
+ * drop the hover the moment the pointer crossed it. Left-anchored rather than
+ * right, because the strip sits mid-header and a right-anchored card would
+ * hang off toward the middle of the page. */
+.wf-alarm-card {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 20;
+  display: none;
+  width: 26rem;
+  max-width: min(26rem, 90vw);
+  /* Capped, and scrolling past the cap: the board holds up to 64 rows on a
+   * host, and a card that grew to fit all of them would run off the bottom of
+   * the viewport with the worst ones — which are first — pushed out of reach. */
+  max-height: 60vh;
+  padding: var(--wf-space-3);
+  overflow-y: auto;
+  border: 1px solid var(--wf-border);
+  border-radius: var(--wf-radius);
+  background: var(--wf-surface);
+  box-shadow: var(--wf-shadow);
+}
+
+.wf-header-alarms:hover .wf-alarm-card,
+.wf-header-alarms:focus-within .wf-alarm-card {
+  display: block;
+}
+
+.wf-alarm-none {
+  margin: 0;
+  color: var(--wf-text-muted);
+  font-size: var(--wf-text-sm);
+  line-height: 1.5;
+}
+
+.wf-alarm-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--wf-space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* A left rule in the severity colour rather than a filled background: the rows
+ * are read as a list, and a stack of tinted blocks reads as a stack of
+ * warnings even when most of them are notices. */
+.wf-alarm-row {
+  display: flex;
+  gap: var(--wf-space-2);
+  padding-left: var(--wf-space-2);
+  border-left: 2px solid currentcolor;
+}
+
+.wf-sev-info.wf-alarm-row {
+  border-left-color: var(--wf-accent);
+}
+
+.wf-sev-warning.wf-alarm-row {
+  border-left-color: var(--wf-warn);
+}
+
+.wf-sev-critical.wf-alarm-row {
+  border-left-color: var(--wf-error);
+}
+
+.wf-sev-unknown.wf-alarm-row {
+  border-left-color: var(--wf-accent);
+}
+
+/* A condition that has stopped recedes rather than disappearing — still
+ * legible, no longer competing with what is happening now. */
+.wf-alarm-row-quiet {
+  border-left-color: var(--wf-idle) !important;
+  opacity: 0.62;
+}
+
+.wf-alarm-row-mark {
+  display: none;
+}
+
+.wf-alarm-row-body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.wf-alarm-row-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--wf-space-2);
+}
+
+.wf-alarm-row-title {
+  color: var(--wf-text);
+  font-size: var(--wf-text-sm);
+  font-weight: 600;
+}
+
+.wf-alarm-row-sev {
+  color: var(--wf-text-faint);
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.wf-alarm-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--wf-space-1);
+  color: var(--wf-text-muted);
+  font-size: 0.75rem;
+}
+
+.wf-alarm-dot {
+  color: var(--wf-text-faint);
+}
+
+/* The detector's own words. Wrapped rather than truncated: it is at most 96
+ * bytes by construction, and an ellipsis would hide the number that explains
+ * the row. */
+.wf-alarm-row-detail {
+  overflow-wrap: anywhere;
+  color: var(--wf-text-muted);
+  font-size: 0.75rem;
+}
+
+.wf-alarm-row-code {
+  color: var(--wf-text-faint);
+  font-size: 0.6875rem;
+}
+
+.wf-alarm-dropped {
+  margin: var(--wf-space-3) 0 0;
+  padding-top: var(--wf-space-2);
+  border-top: 1px solid var(--wf-border);
+  color: var(--wf-error);
+  font-size: 0.75rem;
+}
+
 /* ---------------------------------------------------------------- banner -- */
 
 .wf-banner {

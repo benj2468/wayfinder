@@ -27,6 +27,7 @@ use wayfinder_auth::MembershipCert;
 use wayfinder_auth::TrustAnchor;
 use wayfinder_client::Endpoint;
 use wayfinder_client::Identity;
+use wayfinder_protos::service::AlarmsData;
 use wayfinder_protos::service::CsrOutcome;
 use wayfinder_protos::service::EnrollmentPolicyStatusData;
 use wayfinder_protos::service::InterfaceThroughputData;
@@ -165,6 +166,12 @@ impl WayfinderDataProvider for NodeMock {
     fn runtime_config_active(&self) -> bool {
         false
     }
+    fn alarms(&self) -> AlarmsData {
+        // Nothing wrong: an empty board is the node's "all systems normal", and
+        // none of these cases is about alarms.
+        AlarmsData::default()
+    }
+
     fn logs(&self, _since_seq: u64, _max_records: u32) -> LogsData {
         LogsData::default()
     }

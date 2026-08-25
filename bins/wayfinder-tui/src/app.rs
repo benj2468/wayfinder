@@ -7,6 +7,7 @@ use std::time::Instant;
 use ratatui::widgets::TableState;
 use serde::Deserialize;
 use serde::Serialize;
+use wayfinder_protos::wayfinder::v1alpha::Alarms;
 use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
 use wayfinder_protos::wayfinder::v1alpha::KeepAliveTable;
 use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesTable;
@@ -170,6 +171,14 @@ pub struct Snapshot {
     /// certificate-authority provider.  `None` when it is not a provider (the
     /// enrollment RPCs error) or before the first fetch.
     pub pending_csrs: Option<ListPendingCsrsResponse>,
+    /// The node's alarm board: what it currently believes is wrong.
+    ///
+    /// Not `Option`, unlike the fields above, and that is the point: an empty
+    /// board is a meaningful answer — "nothing is wrong" — rather than an
+    /// absent one, so the default value is already the state the badge renders
+    /// as normal. What distinguishes "no alarms" from "not asked yet" is the
+    /// connection indicator beside it, which is where that question belongs.
+    pub alarms: Alarms,
 }
 
 /// Lines of log scrollback the TUI retains.

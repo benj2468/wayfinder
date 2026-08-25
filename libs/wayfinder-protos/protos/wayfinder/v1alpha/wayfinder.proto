@@ -331,6 +331,154 @@ message LogFilter {
   string directives = 1;
 }
 
+// Read the node's alarm board: the bounded set of conditions it currently
+// believes are wrong.
+//
+// Where GetLogs serves a stream of moments, this serves latched *conditions*.
+// An alarm survives the burst that caused it — a flood is precisely the load
+// that rolls the log ring over in seconds, so the evidence of the flood is
+// what destroys the record of it — and it costs O(1) in the number of
+// observations rather than one record per observation.
+//
+// Polled, like GetLogs and for the same reason: the management protocol is
+// strictly one request to one response, and a poll lets a client attach after
+// something went wrong and still see it.
+message GetAlarmsRequest {}
+
+// How bad a condition is, and — through the node's hold window — how long the
+// node keeps asserting it after the last observation before deciding it has
+// stopped.
+enum AlarmSeverity {
+  // Unset — never emitted by a node; present because proto3 enums must have a
+  // zero value.
+  ALARM_SEVERITY_UNSPECIFIED = 0;
+
+  // Worth recording, not worth waking anyone: unusual, but with a benign
+  // explanation more often than not.
+  ALARM_SEVERITY_INFO = 1;
+
+  // Something is wrong and an operator should look: the mesh is still carrying
+  // traffic, but not the way it was configured to.
+  ALARM_SEVERITY_WARNING = 2;
+
+  // Something is wrong now and is degrading or attacking the mesh.
+  ALARM_SEVERITY_CRITICAL = 3;
+}
+
+// What kind of condition an alarm reports.
+//
+// A closed enum rather than a free-form string: the set of things a node can
+// flag is a design decision, not caller data, and a fixed set is what lets a
+// client render, group and threshold alarms it has never seen.  Numbered from
+// the node's own stable alarm codes rather than declaration order, so a
+// variant can be added without renumbering the rest.
+enum AlarmKind {
+  // Unset — never emitted by a node.  A client that decodes this is talking to
+  // a newer node holding a condition this build has no name for; render the
+  // row as unknown rather than hiding it.
+  ALARM_KIND_UNSPECIFIED = 0;
+
+  // Frames are arriving from a source that fails authentication, in volume.
+  ALARM_KIND_UNAUTHENTICATED_TRAFFIC = 1;
+
+  // A source or interface is offering frames far faster than this mesh's
+  // configured cadence explains.
+  ALARM_KIND_TRAFFIC_FLOOD = 2;
+
+  // Repeated management-API authentication failures — the mesh's
+  // administrative front door being tried.
+  ALARM_KIND_MANAGEMENT_AUTH_FAILURES = 3;
+
+  // An OGM was seen whose sequence number this node has already processed: the
+  // signature of a replay rather than a fresh advertisement.
+  ALARM_KIND_OGM_REPLAY = 4;
+
+  // Traffic from a peer holding a certificate this node knows to be revoked.
+  ALARM_KIND_REVOKED_PEER = 5;
+
+  // A link is failing I/O persistently rather than transiently — the radio or
+  // its transport is not merely busy.
+  ALARM_KIND_LINK_ERRORS = 6;
+
+  // A bounded table is at capacity and evicting, so the node is now forgetting
+  // state it would otherwise have kept.
+  ALARM_KIND_TABLE_SATURATION = 7;
+}
+
+// One latched condition the node is holding.
+//
+// Identified by (kind, subject): every raise of that pair folds into this one
+// row rather than adding another, which is what keeps a flood from becoming a
+// flood of alarms.  `count` is the condition's magnitude, where the row itself
+// is only its existence.
+message Alarm {
+  // What kind of condition this is.
+  AlarmKind kind = 1;
+
+  // The worst severity yet observed for this condition.  Ratchets up over the
+  // condition's life and never down: a later, milder observation must not talk
+  // the node down from what it already saw.
+  AlarmSeverity severity = 2;
+
+  // Uptime in milliseconds at the first raise: when the condition started,
+  // preserved across every later observation.  The same clock as
+  // LogRecord.uptime_ms, so an alarm correlates with the records around it.
+  uint64 first_ms = 3;
+
+  // Uptime in milliseconds at the most recent raise.  What `active` measures
+  // from.
+  uint64 last_ms = 4;
+
+  // How many raises have folded into this row, saturating.
+  uint32 count = 5;
+
+  // The most recent observation, rendered by the detector and truncated by the
+  // node.  Metadata only — rates, counts, windows, identifiers — never payload
+  // bytes, on the same rule as a log record.
+  string detail = 6;
+
+  // Whether the node is still asserting this condition as of Alarms.now_ms:
+  // whether it has been re-raised within its severity's hold window.  Computed
+  // by the node so a client needs no clock of its own.
+  //
+  // A false here does not mean the row is gone.  Nothing expires on a timer —
+  // the board latches, so an operator who polls after a burst ended still
+  // learns it happened.
+  bool active = 7;
+
+  // Who or what the condition is about.  Unset when it is about the node as a
+  // whole rather than any one peer or interface.
+  oneof subject {
+    // Raw identifier bytes of the peer this is about.  Address-family
+    // agnostic and at most 8 bytes, so it holds a 6-byte MAC, a 1-byte short
+    // address, or the leading bytes of a key fingerprint equally well.  Same
+    // rendering as NodeInfo.node_id.
+    bytes node_id = 8;
+
+    // Index of the interface this is about, in the same numbering as
+    // InterfaceThroughput.interface_index.
+    uint32 interface_index = 9;
+  }
+}
+
+// Answer to a GetAlarmsRequest: the whole board as one snapshot.
+message Alarms {
+  // Every alarm the board holds, worst first and — among equal severities —
+  // most recent first.  Ordered by the node rather than the client so every
+  // reader of a node agrees on what is at the top.
+  repeated Alarm alarms = 1;
+
+  // How many raises the board's capacity policy has refused or evicted since
+  // boot.  Reported so a gap is visible as a gap, exactly as
+  // LogRecords.dropped is.
+  uint64 dropped = 2;
+
+  // Node uptime in milliseconds at the moment this snapshot was taken.  What
+  // Alarm.active was evaluated against, and what a client renders an alarm's
+  // age from without needing a clock the node shares.
+  uint64 now_ms = 3;
+}
+
 // Request a routing decision for a hypothetical packet to `destination`,
 // mirroring what the router would compute on send.  Returns a
 // ResolveRouteResponse with the next-hop neighbor and the egress
@@ -837,6 +985,10 @@ message WayfinderRequest {
     // Remove a node's VPN registration (provider mode).  Requires a full
     // management grant.
     RevokeVpnPeerRequest revoke_vpn_peer = 30;
+
+    // Read the node's alarm board: the conditions it currently believes are
+    // wrong.
+    GetAlarmsRequest get_alarms = 31;
   }
 }
 
@@ -1658,5 +1810,8 @@ message WayfinderResponse {
     // Response to ListVpnPeersRequest.  (RevokeVpnPeer answers with the Empty
     // response above.)
     ListVpnPeersResponse list_vpn_peers = 24;
+
+    // Response to GetAlarmsRequest: the node's whole alarm board.
+    Alarms alarms = 25;
   }
 }

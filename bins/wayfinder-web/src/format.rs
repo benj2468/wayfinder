@@ -10,8 +10,13 @@
 //! `app::format_id`). The two dashboards are read against each other when
 //! something looks wrong, so `42s` in one has to mean `42s` in the other.
 
+use wayfinder_protos::wayfinder::v1alpha::Alarm;
+use wayfinder_protos::wayfinder::v1alpha::AlarmKind;
+use wayfinder_protos::wayfinder::v1alpha::AlarmSeverity;
+use wayfinder_protos::wayfinder::v1alpha::Alarms;
 use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesEntry;
 use wayfinder_protos::wayfinder::v1alpha::LogLevel;
+use wayfinder_protos::wayfinder::v1alpha::alarm::Subject as AlarmSubject;
 
 /// Format an opaque mesh identifier for display.
 ///
@@ -212,6 +217,156 @@ pub fn duration_secs(secs: u64) -> String {
         plural(secs / 60, "minute")
     } else {
         plural(secs, "second")
+    }
+}
+
+/// How a node's alarm board reads at a glance.
+///
+/// Computed once, in one place, because the header and the card behind it must
+/// not be able to disagree about what is wrong — and because the arithmetic
+/// ("firing" is not the same as "on the board") is exactly the kind that gets
+/// written differently the second time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BoardSummary {
+    /// Conditions the node is still asserting.
+    pub firing: usize,
+    /// Conditions it holds that have gone quiet: they happened, and stopped.
+    pub quiet: usize,
+    /// The worst severity among the firing ones, or `None` when none are.
+    pub worst: Option<AlarmSeverity>,
+}
+
+impl BoardSummary {
+    /// Whether the node is reporting nothing wrong right now.
+    ///
+    /// True with quiet rows still on the board: they are history, not a current
+    /// condition, and conflating the two would mean a node could never report
+    /// itself well again after one bad minute.
+    pub fn all_clear(&self) -> bool {
+        self.firing == 0
+    }
+}
+
+/// Read a board into a [`BoardSummary`].
+pub fn summarize_board(board: &Alarms) -> BoardSummary {
+    let firing = board.alarms.iter().filter(|a| a.active).count();
+    BoardSummary {
+        firing,
+        quiet: board.alarms.len() - firing,
+        worst: board
+            .alarms
+            .iter()
+            .filter(|a| a.active)
+            .filter_map(|a| AlarmSeverity::try_from(a.severity).ok())
+            .max_by_key(|s| *s as i32),
+    }
+}
+
+/// The sentence the header shows: what the node believes about itself, stated
+/// positively when there is nothing wrong.
+///
+/// "All systems normal" rather than an absent badge, because those are
+/// different claims. A dashboard that only speaks up when something breaks
+/// cannot be distinguished from one that has stopped checking, and the second
+/// is the failure an operator most needs to notice.
+pub fn board_headline(summary: BoardSummary) -> String {
+    if summary.all_clear() {
+        return "All systems normal".to_string();
+    }
+    if summary.firing == 1 {
+        "1 alarm".to_string()
+    } else {
+        format!("{} alarms", summary.firing)
+    }
+}
+
+/// A condition's name in plain language, leading with what happened rather than
+/// with the node's identifier for it.
+pub fn alarm_title(kind: i32) -> &'static str {
+    match AlarmKind::try_from(kind) {
+        Ok(AlarmKind::UnauthenticatedTraffic) => "Unauthenticated traffic",
+        Ok(AlarmKind::TrafficFlood) => "Traffic flood",
+        Ok(AlarmKind::ManagementAuthFailures) => "Management logins refused",
+        Ok(AlarmKind::OgmReplay) => "Replayed route advertisement",
+        Ok(AlarmKind::RevokedPeer) => "Revoked peer still talking",
+        Ok(AlarmKind::LinkErrors) => "Link errors",
+        Ok(AlarmKind::TableSaturation) => "A table is full",
+        // A node newer than this build, holding a condition it has no name for.
+        // Named as unrecognised rather than hidden: a dashboard that silently
+        // dropped the alarms it did not understand would report a node under
+        // attack as healthy.
+        _ => "Unrecognised condition",
+    }
+}
+
+/// The node's own identifier for a condition, for the operator who is going to
+/// grep the logs for it next.
+///
+/// The jargon half of "plain language leads, jargon follows": [`alarm_title`]
+/// says what happened, this says what to search for, and it is the same string
+/// the node writes into its own log record.
+pub fn alarm_code(kind: i32) -> &'static str {
+    match AlarmKind::try_from(kind) {
+        Ok(AlarmKind::UnauthenticatedTraffic) => "unauthenticated_traffic",
+        Ok(AlarmKind::TrafficFlood) => "traffic_flood",
+        Ok(AlarmKind::ManagementAuthFailures) => "management_auth_failures",
+        Ok(AlarmKind::OgmReplay) => "ogm_replay",
+        Ok(AlarmKind::RevokedPeer) => "revoked_peer",
+        Ok(AlarmKind::LinkErrors) => "link_errors",
+        Ok(AlarmKind::TableSaturation) => "table_saturation",
+        _ => "unknown",
+    }
+}
+
+/// How bad a condition is, as a word.
+pub fn alarm_severity(severity: i32) -> &'static str {
+    match AlarmSeverity::try_from(severity) {
+        Ok(AlarmSeverity::Critical) => "Critical",
+        Ok(AlarmSeverity::Warning) => "Warning",
+        // "Notice", not "Info": the row is on an alarm board, and every word on
+        // it should read as something that happened.
+        Ok(AlarmSeverity::Info) => "Notice",
+        _ => "Unknown",
+    }
+}
+
+/// The CSS modifier a severity is styled through, so colour is chosen in one
+/// place rather than inside a `view!` where it cannot be tested.
+pub fn alarm_severity_class(severity: i32) -> &'static str {
+    match AlarmSeverity::try_from(severity) {
+        Ok(AlarmSeverity::Critical) => "wf-sev-critical",
+        Ok(AlarmSeverity::Warning) => "wf-sev-warning",
+        Ok(AlarmSeverity::Info) => "wf-sev-info",
+        _ => "wf-sev-unknown",
+    }
+}
+
+/// Who or what an alarm is about, in the vocabulary the rest of the dashboard
+/// uses for the same things.
+pub fn alarm_subject(alarm: &Alarm) -> String {
+    match &alarm.subject {
+        Some(AlarmSubject::NodeId(bytes)) => id(bytes),
+        Some(AlarmSubject::InterfaceIndex(idx)) => format!("interface {idx}"),
+        // A condition with no subject is about the node itself. Named, not left
+        // blank: an empty cell reads as a missing value rather than as a fact.
+        None => "this node".to_string(),
+    }
+}
+
+/// How long ago a condition was last observed.
+///
+/// Both instants come out of the same snapshot — the node's uptime clock — so
+/// this needs no clock of the browser's and cannot disagree with the node about
+/// what "now" is. That matters more here than elsewhere: a board has no RTC,
+/// and the browser's wall clock has no relationship to it at all.
+pub fn alarm_age(now_ms: u64, then_ms: u64) -> String {
+    let secs = now_ms.saturating_sub(then_ms) / 1000;
+    match secs {
+        0..=2 => "just now".to_string(),
+        s if s < 60 => format!("{s}s ago"),
+        s if s < 3_600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3_600),
+        s => format!("{}d ago", s / 86_400),
     }
 }
 

@@ -17,6 +17,11 @@ use std::net::SocketAddr;
 
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use wayfinder_protos::service::AlarmData;
+use wayfinder_protos::service::AlarmKindData;
+use wayfinder_protos::service::AlarmSeverityData;
+use wayfinder_protos::service::AlarmSubjectData;
+use wayfinder_protos::service::AlarmsData;
 use wayfinder_protos::service::EgressDecisionData;
 use wayfinder_protos::service::EnrollmentPolicyStatusData;
 use wayfinder_protos::service::InterfaceThroughputData;
@@ -113,6 +118,13 @@ pub struct Mock {
     /// that an enrolling node talks to runs the production `CertAuthority` and
     /// really signs.
     ca: Option<wayfinder_server::CertAuthority>,
+    /// The alarm board this mock reports.
+    ///
+    /// Empty on every flavor, because "nothing is wrong" is the state a real
+    /// node is in nearly all the time and the one the dashboard has to render
+    /// convincingly. [`Mock::raising`] is the other half — it composes onto any
+    /// flavor, so the two states can be compared without a second node.
+    alarms: AlarmsData,
 }
 
 impl Default for Mock {
@@ -140,6 +152,7 @@ impl Default for Mock {
             enrollment_token: None,
             pending_csrs: None,
             ca: None,
+            alarms: AlarmsData::default(),
         }
     }
 }
@@ -174,6 +187,7 @@ impl Mock {
             enrollment_token: None,
             pending_csrs: None,
             ca: None,
+            alarms: AlarmsData::default(),
         }
     }
 
@@ -200,6 +214,7 @@ impl Mock {
                 requested_at: 1_700_000_000,
             }]),
             ca: None,
+            alarms: AlarmsData::default(),
         }
     }
 
@@ -232,6 +247,7 @@ impl Mock {
             enrollment_token: token.map(str::to_string),
             pending_csrs: None,
             ca: Some(ca),
+            alarms: AlarmsData::default(),
         }
     }
 
@@ -277,7 +293,67 @@ impl Mock {
             enrollment_token: None,
             pending_csrs: None,
             ca: Some(ca),
+            alarms: AlarmsData::default(),
         }
+    }
+
+    /// The same node, but with things going wrong: a board carrying one
+    /// condition of each severity, one of each kind of subject, and one that
+    /// has already gone quiet.
+    ///
+    /// A modifier rather than a flavor of its own, so it composes with whichever
+    /// node the Security tab needs — what a node is and what is wrong with it
+    /// are independent.
+    ///
+    /// The quiet row is the one worth having: a board that only ever showed
+    /// firing conditions would let a client get away with rendering `active`
+    /// wrong, and "fired ten minutes ago and stopped" is exactly what an
+    /// operator who attached late came to find out.
+    #[must_use]
+    pub fn raising(mut self) -> Self {
+        // A fixed instant, like the rest of the mock's data. Chosen so the
+        // three rows straddle their hold windows: 1s since the critical one
+        // (900s window), 20s since the warning (300s), and 120s since the info
+        // one (60s) — which has therefore stopped.
+        const NOW_MS: u64 = 620_000;
+
+        self.alarms = AlarmsData {
+            alarms: vec![
+                AlarmData {
+                    kind: AlarmKindData::ManagementAuthFailures,
+                    severity: AlarmSeverityData::Critical,
+                    subject: AlarmSubjectData::Peer(vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x09]),
+                    first_ms: 240_000,
+                    last_ms: 619_000,
+                    count: 412,
+                    detail: "denied=412 in 6m".into(),
+                    active: true,
+                },
+                AlarmData {
+                    kind: AlarmKindData::LinkErrors,
+                    severity: AlarmSeverityData::Warning,
+                    subject: AlarmSubjectData::Interface(1),
+                    first_ms: 480_000,
+                    last_ms: 600_000,
+                    count: 27,
+                    detail: "consecutive recv errors=27".into(),
+                    active: true,
+                },
+                AlarmData {
+                    kind: AlarmKindData::UnauthenticatedTraffic,
+                    severity: AlarmSeverityData::Info,
+                    subject: AlarmSubjectData::Peer(vec![0, 0, 0, 0, 0, 7]),
+                    first_ms: 300_000,
+                    last_ms: 500_000,
+                    count: 3,
+                    detail: "dropped=3".into(),
+                    active: false,
+                },
+            ],
+            dropped: 0,
+            now_ms: NOW_MS,
+        };
+        self
     }
 
     /// The trust anchor this mock's own management server verifies clients
@@ -488,6 +564,10 @@ impl WayfinderDataProvider for Mock {
     fn runtime_config_active(&self) -> bool {
         false
     }
+    fn alarms(&self) -> AlarmsData {
+        self.alarms.clone()
+    }
+
     fn logs(&self, since_seq: u64, max_records: u32) -> LogsData {
         let snapshot = wayfinder_log::logs_since(since_seq, max_records as usize);
         LogsData {

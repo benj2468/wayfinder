@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use wayfinder_client::Client;
+use wayfinder_protos::service::AlarmsData;
 use wayfinder_protos::service::EgressDecisionData;
 use wayfinder_protos::service::InterfaceThroughputData;
 use wayfinder_protos::service::KeepAliveEntryData;
@@ -183,6 +184,12 @@ impl WayfinderDataProvider for Mock {
     /// does, so the end-to-end test below proves a record emitted on the server
     /// side actually reaches a client over the wire — not just that the stub's
     /// canned value survives encoding.
+    fn alarms(&self) -> AlarmsData {
+        // Nothing wrong: an empty board is the node's "all systems normal", and
+        // none of these cases is about alarms.
+        AlarmsData::default()
+    }
+
     fn logs(&self, since_seq: u64, max_records: u32) -> LogsData {
         let snapshot = wayfinder_log::logs_since(since_seq, max_records as usize);
         LogsData {

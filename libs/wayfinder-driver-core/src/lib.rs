@@ -57,6 +57,11 @@ use wayfinder::interfaces::frame::Mac;
 use wayfinder::link::Received;
 use wayfinder::router_ops::OgmAuthOps;
 use wayfinder::router_ops::RouterOps;
+use wayfinder_alarm::AlarmKind;
+use wayfinder_alarm::NodeId;
+use wayfinder_alarm::Severity;
+use wayfinder_alarm::Subject;
+use wayfinder_alarm::alarm;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
@@ -170,6 +175,22 @@ fn strip_directed<'a, R: RouterOps>(router: &mut R, frame: &'a LinkFrame) -> Opt
         // Unverified/foreign neighbor or a replayed counter — drop rather than
         // route an unauthenticated directed frame.
         trace!(src = ?frame.src, "drop: directed frame failed pairwise auth");
+        // And flag it, once per source however long the stream runs. Raised on
+        // every frame on purpose: the board coalesces by `(kind, subject)`, so
+        // a flood of these is one row with a count rather than one row each —
+        // which is exactly why the detector needs no rate limiter of its own.
+        //
+        // `Info`, not `Warning`: a single frame from a peer that has not
+        // finished enrolling looks identical to one from a peer that never
+        // will, and the first is the commoner explanation. What separates them
+        // is the row's count, which an operator reads.
+        alarm!(
+            Severity::Info,
+            AlarmKind::UnauthenticatedTraffic,
+            Subject::Node(NodeId::new(&frame.src.0)),
+            "body_len={}",
+            body_len
+        );
         return None;
     }
 
@@ -446,7 +467,27 @@ pub fn handle_link_result<R: RouterOps>(
                 sink,
             );
         }
-        Err(e) => trace!(iface = idx, error = ?e, "drop: link recv error"),
+        Err(e) => {
+            trace!(iface = idx, error = ?e, "drop: link recv error");
+            // One row per interface, however many errors it produces. `Info`
+            // rather than `Warning` because a single failed receive is usually
+            // transient — an ICMP unreachable behind a UDP carrier, a radio
+            // mid-reset — and the row's `count` is what distinguishes that from
+            // a link that has genuinely stopped working.
+            //
+            // Escalating on persistence would be better still, and needs a
+            // per-interface consecutive-error counter this function has nowhere
+            // to keep: it is deliberately stateless, and the router is the only
+            // state a shell hands it. Left as the natural follow-up rather than
+            // smuggled in as a `static`.
+            alarm!(
+                Severity::Info,
+                AlarmKind::LinkErrors,
+                Subject::Interface(idx as u8),
+                "{:?}",
+                e
+            );
+        }
     }
 }
 
@@ -1196,6 +1237,98 @@ mod tests {
         );
     }
 
+    /// Dropping a directed frame that failed its pairwise check also *flags* it:
+    /// the drop is a `trace!` nobody is watching, and this is the record that
+    /// outlives it.
+    ///
+    /// Raised onto a scoped board rather than the process-global one: these
+    /// tests share a process, and writing the global would leak into every
+    /// other test that reads it.
+    #[test]
+    fn a_frame_failing_pairwise_auth_raises_an_alarm_against_its_source() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = CentralRouter::new(mac(1));
+        router.set_auth(member_auth(&authority, 1, mac(1)));
+
+        let mut payload = [0x01u8, 0x02, 0x03].to_vec();
+        payload.resize(3 + DIRECTED_TRAILER_LEN, 0); // bogus zero trailer
+        let link = frame_bytes(mac(1), mac(9), DEFAULT_BATMAN_ETHER_TYPE, &payload);
+        let frame = LinkFrame::ref_from_bytes(&link).unwrap();
+
+        let board = std::sync::Arc::new(wayfinder_alarm::SharedBoard::new());
+        wayfinder_alarm::with_board(&board, || {
+            assert!(strip_directed(&mut router, frame).is_none());
+        });
+
+        let snapshot = board.snapshot();
+        assert_eq!(snapshot.alarms.len(), 1);
+        let raised = &snapshot.alarms[0];
+        assert_eq!(raised.kind, AlarmKind::UnauthenticatedTraffic);
+        assert_eq!(raised.severity, Severity::Info);
+        assert_eq!(
+            raised.subject,
+            Subject::Node(NodeId::new(&mac(9).0)),
+            "attributed to the frame's source, not to the node itself"
+        );
+    }
+
+    /// A stream of unauthenticated frames from one source is one row with a
+    /// count, not one row per frame.
+    ///
+    /// This is the property that lets the detector above be as naive as it is —
+    /// it raises on every frame, from inside the very flood it reports, and
+    /// carries no rate limiter of its own. If coalescing ever stopped working
+    /// the alarm board would become the flood.
+    #[test]
+    fn a_flood_of_unauthenticated_frames_coalesces_into_one_row() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = CentralRouter::new(mac(1));
+        router.set_auth(member_auth(&authority, 1, mac(1)));
+
+        let mut payload = [0x01u8, 0x02, 0x03].to_vec();
+        payload.resize(3 + DIRECTED_TRAILER_LEN, 0);
+        let link = frame_bytes(mac(1), mac(9), DEFAULT_BATMAN_ETHER_TYPE, &payload);
+        let frame = LinkFrame::ref_from_bytes(&link).unwrap();
+
+        let board = std::sync::Arc::new(wayfinder_alarm::SharedBoard::new());
+        wayfinder_alarm::with_board(&board, || {
+            for _ in 0..500 {
+                assert!(strip_directed(&mut router, frame).is_none());
+            }
+        });
+
+        let snapshot = board.snapshot();
+        assert_eq!(snapshot.alarms.len(), 1, "500 frames, one row");
+        assert_eq!(
+            snapshot.alarms[0].count, 500,
+            "and the magnitude is the count"
+        );
+        assert_eq!(snapshot.dropped, 0, "nothing was refused for want of room");
+    }
+
+    /// Two misbehaving sources are two rows, so neither can hide behind the
+    /// other: the dedup key is `(kind, subject)`, not `kind` alone.
+    #[test]
+    fn two_unauthenticated_sources_get_a_row_each() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = CentralRouter::new(mac(1));
+        router.set_auth(member_auth(&authority, 1, mac(1)));
+
+        let mut payload = [0x01u8, 0x02, 0x03].to_vec();
+        payload.resize(3 + DIRECTED_TRAILER_LEN, 0);
+
+        let board = std::sync::Arc::new(wayfinder_alarm::SharedBoard::new());
+        wayfinder_alarm::with_board(&board, || {
+            for src in [mac(8), mac(9)] {
+                let link = frame_bytes(mac(1), src, DEFAULT_BATMAN_ETHER_TYPE, &payload);
+                let frame = LinkFrame::ref_from_bytes(&link).unwrap();
+                assert!(strip_directed(&mut router, frame).is_none());
+            }
+        });
+
+        assert_eq!(board.snapshot().alarms.len(), 2);
+    }
+
     // ---- plan_dispatch ----------------------------------------------------
     //
     // Egress resolution and the per-link transmit gate were written out in all
@@ -1260,6 +1393,42 @@ mod tests {
 
         assert!(sink.mesh.is_empty(), "a recv error plans nothing");
         assert!(sink.local.is_empty());
+    }
+
+    /// …and raises an alarm against the interface that produced it, so a link
+    /// that has quietly stopped receiving is visible without anyone watching
+    /// `trace!` at the moment it happened.
+    ///
+    /// Attributed to the interface rather than the node: one dead radio on a
+    /// multi-link node is a different condition from the node being unwell, and
+    /// folding them together would let a working link's silence be explained by
+    /// a broken one's noise.
+    #[test]
+    fn a_link_recv_error_raises_an_alarm_against_that_interface() {
+        let mut router = router_with_interfaces(2);
+        let mut tx = [0u8; 256];
+        let mut sink = CaptureSink::default();
+
+        let board = std::sync::Arc::new(wayfinder_alarm::SharedBoard::new());
+        wayfinder_alarm::with_board(&board, || {
+            for _ in 0..3 {
+                handle_link_result(
+                    Duration::from_secs(1),
+                    &mut router,
+                    1,
+                    Err(interfaces::link::LinkError::Io),
+                    &mut tx,
+                    &mut sink,
+                );
+            }
+        });
+
+        let snapshot = board.snapshot();
+        assert_eq!(snapshot.alarms.len(), 1, "three errors, one row");
+        let raised = &snapshot.alarms[0];
+        assert_eq!(raised.kind, AlarmKind::LinkErrors);
+        assert_eq!(raised.subject, Subject::Interface(1));
+        assert_eq!(raised.count, 3);
     }
 
     /// The periodic arm drives both schedules in one call: an interface due an

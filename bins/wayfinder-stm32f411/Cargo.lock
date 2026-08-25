@@ -1352,6 +1352,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wayfinder-alarm"
+version = "0.1.0"
+dependencies = [
+ "heapless",
+ "tracing",
+ "wayfinder-log",
+]
+
+[[package]]
 name = "wayfinder-auth"
 version = "0.1.0"
 dependencies = [
@@ -1370,6 +1379,7 @@ dependencies = [
  "interfaces",
  "tracing",
  "wayfinder",
+ "wayfinder-alarm",
  "zerocopy",
 ]
 
@@ -1428,6 +1438,7 @@ dependencies = [
  "prost",
  "tracing",
  "wayfinder",
+ "wayfinder-alarm",
  "wayfinder-auth",
  "wayfinder-log",
  "wayfinder-protos",
