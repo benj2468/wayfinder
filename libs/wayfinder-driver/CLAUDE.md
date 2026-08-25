@@ -22,15 +22,19 @@ outgoing frames, due OGMs, due keepalives) is **not** in this crate; it is
 "One behavior, N loops." A behavior change almost always belongs in
 `driver-core`, not here.
 
-The whole transmit-side *decision* — auth-tagging, egress resolution,
-split-horizon, the per-link transmit gate — is `driver_core::plan_dispatch`.
+The whole transmit-side *decision* — auth-tagging, egress resolution, the
+per-link transmit gate — is `driver_core::plan_dispatch`.
 `dispatch` in `driver.rs` only does the I/O: reserve the auth trailer, call the
-planner, then transmit `buf[..send_len]` on each interface in `plan.targets`.
+planner, then transmit `plan.payload()` on each interface in `plan.targets()`.
 
 **So a change to *what* goes out belongs in `plan_dispatch`, not here.** This
-logic used to be written out in all three shells, which made split-horizon — a
-correctness invariant — something you could fix in one and silently leave broken
-in two.
+logic used to be written out in all three shells, which made a correctness
+invariant something you could fix in one and silently leave broken in two.
+
+`Egress::Auto` floods **every** interface, the ingress one included — there is
+no interface-level split-horizon, and re-introducing one black-holes any
+multi-access link whose neighbors cannot hear each other. Its doc comment in
+`wayfinder-driver-core` is the canonical statement of why.
 
 ## Two ways to drive it
 

@@ -353,15 +353,25 @@ loop. **A behavior change almost always belongs in the core, not a shell.**
   simulation (a Python-driven physics sim) rather than a live node.
 
 The transmit side is shared the same way: `plan_dispatch` makes the whole
-decision (auth-tagging, egress resolution, split-horizon, the per-link transmit
-gate) and returns *how much to send* plus *which interfaces*. Each shell only
-does the I/O for the interfaces in that plan — a `LinkT::send` on embedded, a
-`DynLinkT` send on the host, a queue push in the tick driver.
+decision (auth-tagging, egress resolution, the per-link transmit gate) and
+returns *how much to send* plus *which interfaces*. Each shell only does the
+I/O for the interfaces in that plan — a `LinkT::send` on embedded, a `DynLinkT`
+send on the host, a queue push in the tick driver.
+
+**A flood goes out every interface, including the one it arrived on.** There is
+no interface-level split-horizon, and adding one back is a black hole rather
+than an optimization — one interface is not one neighbor. Loop protection is
+the engine's seqno high-water mark, not an egress exclusion. `Egress::Auto` in
+`wayfinder-driver-core` carries the full argument.
+
+It costs **N² OGM frames per Trickle round on a shared segment of N nodes**,
+where it cost N — BATMAN-IV's normal flooding cost, and the first number to
+look at if a duty-cycle-limited radio segment gets crowded.
 
 **Host node & tooling**
 - **libs/wayfinder-test** → `Switch` simulator + per-node harness for
   multi-node integration tests (no hardware). **Synchronous**: `TestRouter`
-  drives `wayfinder-tick-driver` over plain queues, so the 63 routing tests are
+  drives `wayfinder-tick-driver` over plain queues, so the routing tests are
   plain `#[test]` with a virtual clock. `LinkTestRouter` keeps the async
   `wayfinder-driver` for the two suites that need a real `LinkT` (link I/O
   error policy, a real `RylrClient`) — which is also what covers the tokio

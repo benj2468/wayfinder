@@ -13,7 +13,7 @@
 //! whichever interface index carried them, optionally
 //! [`queue_local_send`](Driver::queue_local_send)s host-originated data, then
 //! calls [`tick`](Driver::tick) once per step — which drains everything
-//! queued, runs the same egress-resolution/split-horizon/auth-tagging logic
+//! queued, runs the same egress-resolution/gating/auth-tagging logic
 //! the real drivers use, and stages the results into each interface's egress
 //! queue (or the local-delivery queue) for the caller to
 //! [`poll_egress`](Driver::poll_egress)/[`poll_local`](Driver::poll_local)
@@ -308,8 +308,7 @@ impl Driver {
                     dst: f.dst,
                     protocol: f.protocol,
                     payload: f.payload,
-                    // Locally originated: no ingress interface to exclude.
-                    egress: Egress::Auto { exclude: None },
+                    egress: Egress::Auto,
                 });
             }
         }
@@ -484,14 +483,14 @@ mod tests {
         assert_eq!(parsed.src, mac(1), "src is stamped with this driver's mac");
     }
 
-    /// A received OGM pushed on interface 0 is re-flooded into interface 1's
-    /// egress queue only — split-horizon keeps it off the interface it
-    /// arrived on. Ticks at `now = ZERO`, before either interface's own
-    /// Trickle timer can be due (armed within `[i_min/2, i_min)` after
-    /// construction), so the only thing in interface 1's queue is the
-    /// re-flood.
+    /// A received OGM pushed on interface 0 is re-flooded into **both**
+    /// interfaces' egress queues, the ingress one included — there is no
+    /// interface-level split-horizon (see `driver_core::Egress::Auto`). Ticks
+    /// at `now = ZERO`, before either interface's own Trickle timer can be due
+    /// (armed within `[i_min/2, i_min)` after construction), so the only thing
+    /// in either queue is the re-flood.
     #[test]
-    fn tick_reforwards_received_ogm_with_split_horizon() {
+    fn tick_reforwards_received_ogm_onto_every_interface() {
         let trickle = [TrickleConfig::default(), TrickleConfig::default()];
         let mut driver = Driver::new(mac(1), &trickle, &[], &[]);
 
@@ -503,10 +502,17 @@ mod tests {
 
         driver.tick(Duration::ZERO);
 
+        let echoed = driver
+            .poll_egress(0)
+            .expect("the re-flood returns out the ingress interface too");
         assert!(
             driver.poll_egress(0).is_none(),
-            "split-horizon: no re-flood back out the ingress interface"
+            "exactly one re-flood out the ingress interface, not a double send"
         );
+        let echoed = LinkFrame::ref_from_bytes(&echoed).unwrap();
+        assert_eq!(echoed.dst, Mac::BROADCAST);
+        assert_eq!(echoed.src, mac(1), "src is stamped with this driver's mac");
+
         let refloaded = driver
             .poll_egress(1)
             .expect("re-flooded out the other interface");

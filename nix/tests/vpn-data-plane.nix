@@ -4,31 +4,17 @@
 # out) but that the routing engine actually converges over a `UdpMulti` link
 # riding on top of the resulting tunnel. `nix/tests/ca-provider.nix` proves
 # the *control* plane (a real preauth key gets minted); this proves the
-# *data* plane, which `docs/design/implemented/08-internet-links-headscale-vpn.md`
-# names as its one remaining gap: "two hosts actually reaching each other's
-# UDP mesh link over a tunnel — because that needs two real machines behind
-# real NAT."
+# *data* plane. What remains uncovered even here is what
+# `docs/design/implemented/08-internet-links-headscale-vpn.md` names: two hosts
+# behind *real* NAT, "which is where hole-punching either happens or silently
+# degrades to relaying" — that needs two real machines, not two containers.
 #
-# **Currently fails, on a confirmed real bug, not a test problem.** Every
-# other stage passes — coordination server, real preauth keys, real
-# `tailscale up`, both spokes' OGMs correctly signed and accepted by the hub
-# — but the two spokes never see each other's routes. Trace logging showed
-# why: hub relays nothing it receives. `plan_dispatch`'s split-horizon
-# (`libs/wayfinder-driver-core/src/lib.rs`) excludes the *ingress interface*
-# unconditionally, and hub has exactly one link — the single `UdpMultiLink` —
-# for both spokes. Receiving spokeA's OGM on interface 0 excludes interface 0
-# from the relay targets, which is also the *only* way to reach spokeB, so
-# the relay list is always empty. Split-horizon's model assumes one link is
-# one logical neighbor (true for a point-to-point link or a real shared
-# broadcast medium, where anyone reachable via that interface already heard
-# the transmission directly); `UdpMultiLink`'s whole point is the opposite —
-# many distinct peers multiplexed onto one link, unaware of each other's
-# traffic — and nothing before this test exercised the "receive from A, relay
-# to B, both via the same link" path end to end. This is a real architectural
-# gap in the hub/fan-out mode as currently built, not a config mistake here;
-# see the memory note on this branch for the full finding. Left failing
-# deliberately rather than working around it, since a green build here would
-# say the data plane works when it does not.
+# This is also the regression test for the relay gap it originally uncovered:
+# every stage but the last used to pass while the two spokes never saw each
+# other's routes, because split-horizon excluded the ingress interface and the
+# hub has exactly one link for both spokes. The exclusion is gone (see
+# `driver_core::Egress::Auto`). `libs/wayfinder-test`'s star-fabric tests cover
+# the shape without a tunnel; this covers it over a real one.
 #
 # Three containers on one shared network (deliberately *not* isolated onto
 # disjoint vlans — see below). `hub` runs the coordination server
@@ -235,6 +221,10 @@ testers.nixosTest {
             # No discovery_addr: hub/fan-out mode. Unlike the spokes' links,
             # this needs no runtime-learned address, so it is fully
             # module-rendered and never needs a config rewrite.
+            #
+            # Nothing here marks this node as a relay between the two spokes;
+            # it works because a flood is no longer withheld from the interface
+            # it arrived on. See the header.
             links = [
               {
                 type = "UdpMulti";

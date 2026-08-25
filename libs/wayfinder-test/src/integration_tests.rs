@@ -132,9 +132,7 @@ fn single_machine_with_links(n: usize) -> TestHarness {
     let mut links = Vec::new();
     for i in 0..n {
         let switch_name = format!("switch{i}");
-        config.switches.push(TestSwitchConfig {
-            name: switch_name.clone(),
-        });
+        config.switches.push(TestSwitchConfig::shared(&switch_name));
         links.push(LinkConfig::test(switch_name));
     }
     config.machines.push(TestMachineConfig {
@@ -151,9 +149,7 @@ fn single_machine_with_links(n: usize) -> TestHarness {
 /// neighbor of the other two.
 fn one_switch_with_machines(n: usize) -> TestHarness {
     let mut config = TestConfig::default();
-    config.switches.push(TestSwitchConfig {
-        name: "switch1".into(),
-    });
+    config.switches.push(TestSwitchConfig::shared("switch1"));
 
     for i in 0..n {
         let name = format!("machine{i}");
@@ -216,9 +212,7 @@ fn age_out(h: &mut TestHarness) {
 
 fn simple_pair() -> TestHarness {
     let mut config = TestConfig::default();
-    config.switches.push(TestSwitchConfig {
-        name: "switch1".into(),
-    });
+    config.switches.push(TestSwitchConfig::shared("switch1"));
     config.machines.push(TestMachineConfig {
         name: "machine1".into(),
         wayfinder: Config {
@@ -238,12 +232,8 @@ fn simple_pair() -> TestHarness {
 
 fn line_of_three() -> TestHarness {
     let mut config = TestConfig::default();
-    config.switches.push(TestSwitchConfig {
-        name: "switch1".into(),
-    });
-    config.switches.push(TestSwitchConfig {
-        name: "switch2".into(),
-    });
+    config.switches.push(TestSwitchConfig::shared("switch1"));
+    config.switches.push(TestSwitchConfig::shared("switch2"));
     config.machines.push(TestMachineConfig {
         name: "machine1".into(),
         wayfinder: Config {
@@ -276,7 +266,7 @@ fn line_of_three() -> TestHarness {
 fn line_of_three_mid_gated(mid_far_link: LinkFeatures) -> TestHarness {
     let mut config = TestConfig::default();
     for sw in ["switch1", "switch2"] {
-        config.switches.push(TestSwitchConfig { name: sw.into() });
+        config.switches.push(TestSwitchConfig::shared(sw));
     }
     config.machines.push(TestMachineConfig {
         name: "machine1".into(),
@@ -332,7 +322,7 @@ fn line_of_three_mid_gated(mid_far_link: LinkFeatures) -> TestHarness {
 fn two_paths_unequal_length() -> TestHarness {
     let mut config = TestConfig::default();
     for sw in ["ab", "ac", "bd", "ce", "ed"] {
-        config.switches.push(TestSwitchConfig { name: sw.into() });
+        config.switches.push(TestSwitchConfig::shared(sw));
     }
     let machine = |name: &str, links: &[&str]| TestMachineConfig {
         name: name.into(),
@@ -359,7 +349,7 @@ fn two_paths_unequal_length() -> TestHarness {
 fn diamond(i_max_ms: u64) -> TestHarness {
     let mut config = TestConfig::default();
     for sw in ["ab", "ac", "bd", "cd"] {
-        config.switches.push(TestSwitchConfig { name: sw.into() });
+        config.switches.push(TestSwitchConfig::shared(sw));
     }
     let machine = |name: &str, links: &[&str]| TestMachineConfig {
         name: name.into(),
@@ -397,12 +387,8 @@ fn test_validate() {
 #[test]
 fn test_multi_same_switch() {
     let mut config = TestConfig::default();
-    config.switches.push(TestSwitchConfig {
-        name: "test1".into(),
-    });
-    config.switches.push(TestSwitchConfig {
-        name: "test1".into(),
-    });
+    config.switches.push(TestSwitchConfig::shared("test1"));
+    config.switches.push(TestSwitchConfig::shared("test1"));
     assert!(config.validate().is_err());
 }
 
@@ -772,6 +758,217 @@ fn broadcast_suppressed_on_tx_data_disabled_link() {
             .is_empty(),
         "a broadcast must not egress a tx_data-disabled link"
     );
+}
+
+/// A star switch naming a machine that is not wired to it must fail to build.
+/// Falling back to a shared segment would make every star test pass for the
+/// wrong reason: that is the one topology which cannot detect this bug class.
+#[test]
+fn a_star_switch_naming_an_unwired_hub_is_rejected() {
+    setup();
+    let mut config = TestConfig::default();
+    config
+        .switches
+        .push(TestSwitchConfig::star("vpn", "absent"));
+    config.machines.push(TestMachineConfig {
+        name: "present".into(),
+        wayfinder: Config {
+            links: vec![LinkConfig::test("vpn")],
+            ..Default::default()
+        },
+    });
+
+    let Err(err) = config.validate() else {
+        panic!("an unwired hub must be rejected");
+    };
+    assert!(
+        err.contains("absent"),
+        "the error must name the machine that could not be found: {err}"
+    );
+}
+
+/// A hub-and-spoke fabric: one switch in star mode, so a spoke's transmission
+/// reaches only the hub (see [`Switch::set_hub_port`]). Every node has exactly
+/// one interface, which is the point: the hub's only path to `spokeB` is the
+/// same interface `spokeA` was heard on.
+fn hub_and_two_spokes() -> TestHarness {
+    let mut config = TestConfig::default();
+    config.switches.push(TestSwitchConfig::star("vpn", "hub"));
+    for name in ["hub", "spokeA", "spokeB"] {
+        config.machines.push(TestMachineConfig {
+            name: name.into(),
+            wayfinder: Config {
+                links: vec![LinkConfig::test("vpn")],
+                ..Default::default()
+            },
+        });
+    }
+    config.validate().unwrap()
+}
+
+/// **A node relays between neighbors on one interface that cannot hear each
+/// other.** Each spoke learns the other *via the hub*, and data then reaches
+/// the far spoke. Excluding the ingress interface left the relay set empty on a
+/// one-interface hub, so the spokes never converged — the failure
+/// `nix/tests/vpn-data-plane.nix` hit against a real Tailscale tunnel.
+#[test]
+fn node_relays_between_neighbors_that_cannot_hear_each_other() {
+    setup();
+    let mut harness = hub_and_two_spokes();
+
+    let a = harness.get_machine("spokeA").ident;
+    let b = harness.get_machine("spokeB").ident;
+
+    // Two rounds, not one: a spoke's first OGM reaches the hub before the hub
+    // has anything of its own to say about the *other* spoke, so the mesh
+    // needs a second Trickle round to carry each spoke's identity all the way
+    // across. Inherent to a two-hop path, not to the flooding rule.
+    converge_at(&mut harness, Duration::from_secs(1));
+    converge_at(&mut harness, Duration::from_secs(2));
+
+    // `neighbor_ident` is the originator's own address, not the next hop, so
+    // checking only that a record exists would pass on any path. The next hop
+    // is what makes "through the hub's relay" true, and what would catch a
+    // regression to direct spoke-to-spoke learning.
+    let hub = harness.get_machine("hub").ident;
+    assert!(
+        harness
+            .get_machine("spokeA")
+            .router()
+            .originator_table()
+            .any(|r| r.neighbor_ident == b && r.best_next_hop == Some(hub)),
+        "spokeA must learn spokeB with the hub as next hop"
+    );
+    assert!(
+        harness
+            .get_machine("spokeB")
+            .router()
+            .originator_table()
+            .any(|r| r.neighbor_ident == a && r.best_next_hop == Some(hub)),
+        "spokeB must learn spokeA with the hub as next hop"
+    );
+
+    harness
+        .get_machine_mut("spokeA")
+        .send_local(b, b"over the tunnel");
+    harness.settle();
+
+    assert_eq!(
+        harness.get_machine("spokeB").local_deliveries(),
+        vec![host_frame(b, a, b"over the tunnel")],
+        "the learned route must actually carry data, forwarded by the hub"
+    );
+}
+
+/// Churning the hub off and back on must not silently break the star. A
+/// reconnected machine gets a **fresh** port, so a designation captured at
+/// build time would go on naming the dead one — every spoke frame forwarded
+/// into a receiver that no longer exists, and no panic and no log to say so.
+#[test]
+fn a_reconnected_hub_still_relays_between_the_spokes() {
+    setup();
+    let mut harness = hub_and_two_spokes();
+
+    let a = harness.get_machine("spokeA").ident;
+    let b = harness.get_machine("spokeB").ident;
+    converge_at(&mut harness, Duration::from_secs(1));
+    converge_at(&mut harness, Duration::from_secs(2));
+
+    harness.disconnect_machine("hub");
+    harness.reconnect_machine("hub");
+
+    // The reborn hub starts with empty tables, so it has to re-learn both
+    // spokes before it can relay between them again. Assert on the *hub*, not
+    // the spokes: a spoke keeps its stale record of the other for a while, so
+    // it would report success against a completely dead fabric.
+    converge_at(&mut harness, Duration::from_secs(3));
+    converge_at(&mut harness, Duration::from_secs(4));
+
+    let hub_originators: Vec<Mac> = harness
+        .get_machine("hub")
+        .router()
+        .originator_table()
+        .map(|r| r.neighbor_ident)
+        .collect();
+    assert!(
+        hub_originators.contains(&a) && hub_originators.contains(&b),
+        "the reconnected hub must hear both spokes again on its fresh port, got {hub_originators:?}"
+    );
+
+    // And the relay must still carry data end to end.
+    harness
+        .get_machine_mut("spokeA")
+        .send_local(b, b"after the reboot");
+    harness.settle();
+    assert_eq!(
+        harness.get_machine("spokeB").local_deliveries(),
+        vec![host_frame(b, a, b"after the reboot")],
+        "spokeA must still reach spokeB through the reconnected hub"
+    );
+}
+
+/// **What flooding every interface costs.** A shared segment of N nodes carries
+/// **N² OGM frames** per Trickle round — N own emissions plus each node
+/// re-flooding the other N-1 — where it carried N. Pinned so any future change
+/// to the flooding rule has to move these numbers on purpose.
+///
+/// Every re-flood here is waste, since each peer heard the original directly;
+/// a node just cannot tell this segment from a radio with hidden peers (see
+/// `driver_core::Egress::Auto`), and BATMAN-IV floods the same way.
+///
+/// If a duty-cycle-limited radio segment ever gets crowded: suppressing the
+/// re-flood when the sender is the only neighbour heard on that interface
+/// recovers N=2, and hearing-based suppression the rest. Both want a
+/// measurement behind them, and both would move these numbers deliberately.
+#[test]
+fn flooding_every_interface_costs_a_quadratic_number_of_ogms() {
+    setup();
+    for (nodes, expected) in [(2usize, 4usize), (3, 9), (4, 16)] {
+        let mut harness = one_switch_with_machines(nodes);
+
+        // Converge first, then count, so this covers steady state only.
+        converge_at(&mut harness, Duration::from_secs(1));
+        let counter = count_ogms(&mut harness);
+
+        harness.poll_due(Duration::from_secs(30));
+        harness.settle();
+
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            expected,
+            "{nodes} nodes on one segment: expected {expected} OGM frames per round (n²)"
+        );
+    }
+}
+
+/// **A broadcast still reaches each node exactly once on a multi-access
+/// segment.** Newly worth pinning: every node now re-floods every broadcast it
+/// hears, so only the engine's de-duplication stops a three-node segment
+/// turning one broadcast into a storm of duplicate local deliveries. That path
+/// never executed here before — the re-flood set was always empty.
+#[test]
+fn a_broadcast_is_delivered_exactly_once_despite_mutual_reflooding() {
+    setup();
+    let mut harness = one_switch_with_machines(3);
+    converge_at(&mut harness, Duration::from_secs(1));
+
+    harness
+        .get_machine_mut("machine0")
+        .send_local(Mac::BROADCAST, b"one copy each");
+    harness.settle();
+
+    assert_eq!(
+        harness.get_machine("machine0").local_deliveries().len(),
+        0,
+        "the originator must not deliver its own broadcast back to itself"
+    );
+    for name in ["machine1", "machine2"] {
+        assert_eq!(
+            harness.get_machine(name).local_deliveries().len(),
+            1,
+            "{name} must deliver the broadcast exactly once, not once per re-flood heard"
+        );
+    }
 }
 
 /// A transit OGM is not re-flooded out a `tx_ogm`-disabled link. On a
@@ -2063,7 +2260,7 @@ fn real_keepalive_tick_switches_route_when_it_stops() {
 
     let mut config = TestConfig::default();
     for name in ["ab", "bc", "ac"] {
-        config.switches.push(TestSwitchConfig { name: name.into() });
+        config.switches.push(TestSwitchConfig::shared(name));
     }
     let link = |switch_name: &str| LinkConfig {
         name: None,
@@ -2207,9 +2404,9 @@ fn diamond_plus_k5(i_max_ms: u64) -> TestHarness {
 
     let mut config = TestConfig::default();
     for (a, b) in EDGES {
-        config.switches.push(TestSwitchConfig {
-            name: format!("{a}_{b}"),
-        });
+        config
+            .switches
+            .push(TestSwitchConfig::shared(format!("{a}_{b}")));
     }
     for node in NODES {
         let links: Vec<LinkConfig> = EDGES

@@ -24,10 +24,41 @@ pub struct TestConfig {
 }
 
 /// Config for one switch in a [`TestConfig`].
+///
+/// Built with [`shared`](Self::shared) or [`star`](Self::star) rather than a
+/// struct literal — there is no sensible default for `name`, so a `Default`
+/// impl would manufacture an empty-named switch that validates happily and
+/// matches no link.
 #[derive(Serialize, Deserialize)]
 pub struct TestSwitchConfig {
     /// The switch's name, referenced by machines' link transports.
     pub name: String,
+    /// Name of the machine whose port on this switch is the **hub**, turning
+    /// the fabric into a star instead of a shared segment: every other machine
+    /// on it reaches only the hub, never another spoke.  See
+    /// [`Switch::set_hub_port`].  `None` is the shared segment every other
+    /// topology in this harness wants.
+    #[serde(default)]
+    pub hub: Option<String>,
+}
+
+impl TestSwitchConfig {
+    /// A shared-segment switch: one transmission, every other port hears it.
+    pub fn shared(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            hub: None,
+        }
+    }
+
+    /// A star switch hubbed on machine `hub`: every other machine on it reaches
+    /// only the hub, never another spoke.  See [`Switch::set_hub_port`].
+    pub fn star(name: impl Into<String>, hub: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            hub: Some(hub.into()),
+        }
+    }
 }
 
 /// Config for one mesh node in a [`TestConfig`].
@@ -93,6 +124,13 @@ pub struct TestHarness {
     /// order, so a single link's loss can be tuned (up/down) without disturbing
     /// the node.  Refreshed whenever a node is (re)wired.
     links: HashMap<String, Vec<(String, PortId)>>,
+    /// Which machine is the hub of each star switch, keyed by switch name.
+    ///
+    /// A machine *name*, not the `PortId` the switch stores, because a `PortId`
+    /// does not survive node churn — a reconnected machine gets a fresh port.
+    /// [`rewire_hubs`](Self::rewire_hubs) re-resolves it on every rewire; skip
+    /// that and the star silently black-holes.
+    hubs: HashMap<String, String>,
 }
 
 impl TestHarness {
@@ -313,6 +351,30 @@ impl TestHarness {
         let mut router = TestRouter::new(spec.mac, interfaces, spec.trickle.clone());
         spec.apply_features(&mut router);
         self.machines.insert(name.to_string(), router);
+        // The reborn node holds different ports than the one it replaced, so
+        // any star it hubs has to be re-pointed at them.
+        self.rewire_hubs();
+    }
+
+    /// Point every star switch at its hub machine's *current* port.  Idempotent,
+    /// and cheap enough to re-run after any rewire rather than tracking which
+    /// switches a given machine hubs.
+    fn rewire_hubs(&mut self) {
+        for (switch_name, machine) in &self.hubs {
+            let Some(port) = self.links.get(machine).and_then(|links| {
+                links
+                    .iter()
+                    .find(|(name, _)| name == switch_name)
+                    .map(|(_, port)| *port)
+            }) else {
+                continue;
+            };
+            if let Some(switch) = self.switches.get_mut(switch_name) {
+                // Infallible: `port` was just read back from this switch's own
+                // wiring, so it is a port the switch holds.
+                let _ = switch.set_hub_port(port);
+            }
+        }
     }
 
     /// Attach a fresh port to `switch_name`, returning the node's end of the
@@ -470,6 +532,37 @@ impl TestConfig {
                 ));
             }
         }
+
+        // Hub designation happens after every machine is wired, since it names
+        // a port that only exists once that machine has been attached.
+        for switch in &self.switches {
+            let Some(hub) = &switch.hub else { continue };
+            let links = h.links.get(hub).ok_or_else(|| {
+                format!(
+                    "Switch '{}' names hub machine '{}', which does not exist",
+                    switch.name, hub
+                )
+            })?;
+            // Exactly one link, not the first of several: a machine wired twice
+            // to the same switch would have only its first port designated and
+            // the second silently demoted to a spoke, modelling a topology
+            // nobody asked for.
+            let mut ports = links.iter().filter(|(name, _)| *name == switch.name);
+            let (_, _port) = ports.next().ok_or_else(|| {
+                format!(
+                    "Switch '{}' names hub machine '{}', which is not wired to it",
+                    switch.name, hub
+                )
+            })?;
+            if ports.next().is_some() {
+                return Err(format!(
+                    "Switch '{}' names hub machine '{}', which is wired to it more than once",
+                    switch.name, hub
+                ));
+            }
+            h.hubs.insert(switch.name.clone(), hub.clone());
+        }
+        h.rewire_hubs();
 
         Ok(h)
     }

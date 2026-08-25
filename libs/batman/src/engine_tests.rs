@@ -165,6 +165,65 @@ mod ogm_processing {
         assert_eq!(engine.originator_table.len(), 0);
     }
 
+    /// **The only thing preventing an OGM ping-pong.** Re-seeing a sequence
+    /// number this node has already forwarded must not re-flood it.
+    ///
+    /// The driver floods every interface, the ingress one included (see
+    /// `driver_core::Egress::Auto`), so an echo comes straight back from every
+    /// neighbour on a shared segment. The seqno gate tested here is the sole
+    /// barrier to it going round again — there is no egress exclusion behind it.
+    #[test]
+    fn test_duplicate_ogm_seqno_not_reflooded() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        let payload = make_ogm(2, 100, 50, 255);
+        let frame_bytes = make_link_frame(2, 0xff, ETH_P_BATMAN, payload);
+
+        // First sighting of (orig 2, seqno 100): re-flooded, with the TTL
+        // decremented into the caller's scratchpad.
+        let mut reply_buffer = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut reply_buffer[..]);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            None,
+            &mut reply,
+        );
+        assert_eq!(
+            reply.protocol, ETH_P_BATMAN,
+            "the first sighting of a seqno is re-flooded"
+        );
+
+        // The same (orig, seqno) again — an echo of our own re-flood, or the
+        // same OGM via another neighbour. Nothing may be written this time.
+        let mut reply2_buffer = [0u8; 256];
+        let mut reply2 = LinkFrameDataMut::from(&mut reply2_buffer[..]);
+        let second = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            None,
+            &mut reply2,
+        );
+        assert!(matches!(second, RoutingAction::Consumed));
+        assert_eq!(
+            reply2.protocol, 0,
+            "a seqno already forwarded must not be re-flooded again"
+        );
+
+        // An older seqno is likewise not re-flooded, so a straggler arriving
+        // late cannot restart the flood.
+        let stale = make_link_frame(2, 0xff, ETH_P_BATMAN, make_ogm(2, 99, 50, 255));
+        let mut reply3_buffer = [0u8; 256];
+        let mut reply3 = LinkFrameDataMut::from(&mut reply3_buffer[..]);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&stale),
+            None,
+            &mut reply3,
+        );
+        assert_eq!(reply3.protocol, 0, "a stale seqno must not be re-flooded");
+    }
+
     #[test]
     fn test_new_originator_creation() {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));

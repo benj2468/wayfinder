@@ -266,6 +266,23 @@ pub struct NeighborKeys {
     /// cert to reconstruct the signed message, which `VerifiedCert` alone
     /// cannot provide.
     pub raw_cert: MembershipCert,
+    /// The `(seqno, signature)` of the last OGM from this neighbor that
+    /// verified — the memo [`verify_ogm`](OgmAuth::verify_ogm) recognises its
+    /// re-flooded copies by.
+    ///
+    /// Private, unlike the rest: it is evidence this node has already spent,
+    /// not a fact about the neighbor. Together with `raw_cert` (the third and
+    /// last thing the signature commits to) it pins the whole signed message,
+    /// so a match means *this exact signature over this exact message* was
+    /// checked — never that a different message is being trusted on an old
+    /// verdict.
+    ///
+    /// One slot, holding the newest: a neighbor floods one seqno at a time, so
+    /// that is what its copies are copies of. Someone interleaving *older*
+    /// genuine copies can miss the memo every time and force the full check —
+    /// which is exactly the cost this path had before the memo existed, so the
+    /// worst case is unchanged rather than newly exposed.
+    last_ogm: Option<([u8; 4], [u8; SIG_LEN])>,
 }
 
 /// One next-hop proof challenge this node has issued and not yet resolved.
@@ -395,6 +412,15 @@ pub struct OgmAuth<
     challenge_counter: u64,
     /// Next-hop proof challenges issued and not yet answered.
     in_progress: HVec<OutstandingChallenge, MAX_IN_PROGRESS_PROOF>,
+    /// Public-key operations (Ed25519 verifications, X25519 agreements) spent
+    /// on the OGM verification path since boot.
+    ///
+    /// Not a metric — it is what pins the cost of
+    /// [`verify_ogm`](Self::verify_ogm) in tests. A flooded OGM arrives once
+    /// per neighbour on a shared segment, so the number that has to stay flat
+    /// as a segment grows is *per distinct OGM*, not per copy; a test that
+    /// only asserted verdicts could not tell the two apart.
+    ogm_crypto_ops: u64,
 }
 
 impl<
@@ -426,6 +452,7 @@ impl<
             cert_req_rate: HVec::new(),
             challenge_counter: 0,
             in_progress: HVec::new(),
+            ogm_crypto_ops: 0,
         }
     }
 
@@ -960,11 +987,59 @@ impl<
             tracing::trace!("auth: dropping OGM with malformed membership certificate");
             return OgmVerdict::Rejected;
         };
-        let verified = match self.anchor.verify_cert(cert, self.now_unix) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::trace!(error = ?e, "auth: dropping OGM whose certificate failed verification");
-                return OgmVerdict::Rejected;
+
+        let mut seqno = [0u8; 4];
+        seqno.copy_from_slice(&payload[SEQNO_OFF..SEQNO_OFF + 4]);
+        let mut signature = [0u8; SIG_LEN];
+        signature.copy_from_slice(sig_bytes);
+
+        // A flood arrives once per neighbor on a shared segment, and a
+        // forwarder rewrites only unsigned fields (TTL, TQ) — so every copy
+        // carries the same certificate and the same signature over the same
+        // message.  Verifying each copy from scratch would make a node's
+        // crypto load the square of the segment's size; recognising the ones
+        // already checked keeps it linear.
+        //
+        // Everything skipped below is a *pure* function of bytes this node has
+        // already run it on: the anchor never changes for the life of this
+        // state, so the same certificate bytes yield the same verdict and the
+        // same pairwise key, and the same signature over the same message
+        // yields the same answer.  What is not skipped is everything that can
+        // change *since* then — the validity window and revocation — which is
+        // re-judged per frame below.
+        let known = self
+            .neighbors
+            .iter()
+            .find(|n| n.cert.mac.0 == orig && n.raw_cert.as_bytes() == cert_bytes)
+            .copied();
+
+        let (verified, pairwise_key, signature_already_checked) = match known {
+            Some(known) => {
+                // `verify_cert`'s window check, against the clock as it is now
+                // rather than as it was when this certificate was admitted.
+                let not_before = known.raw_cert.not_before.get();
+                let not_after = known.raw_cert.not_after.get();
+                if self.now_unix < not_before || self.now_unix > not_after {
+                    tracing::trace!(
+                        "auth: dropping OGM whose cached certificate is outside its validity window"
+                    );
+                    return OgmVerdict::Rejected;
+                }
+                let same_ogm = known.last_ogm == Some((seqno, signature));
+                (known.cert, known.pairwise_key, same_ogm)
+            }
+            None => {
+                self.ogm_crypto_ops += 1;
+                let verified = match self.anchor.verify_cert(cert, self.now_unix) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::trace!(error = ?e, "auth: dropping OGM whose certificate failed verification");
+                        return OgmVerdict::Rejected;
+                    }
+                };
+                self.ogm_crypto_ops += 1;
+                let pairwise_key = self.keypair.pairwise_key(&verified.x_pubkey);
+                (verified, pairwise_key, false)
             }
         };
 
@@ -978,35 +1053,36 @@ impl<
             return OgmVerdict::Rejected;
         }
 
-        let mut seqno = [0u8; 4];
-        seqno.copy_from_slice(&payload[SEQNO_OFF..SEQNO_OFF + 4]);
-        let ed_pubkey = verified.ed_pubkey;
-        let mut signature = [0u8; SIG_LEN];
-        signature.copy_from_slice(sig_bytes);
         // The signature is computed over the full `cert_bytes`, so any
         // padding past the 156-byte cert (which `ref_from_prefix` ignores)
         // changes the signed message and fails below — the cert length is
         // implicitly pinned by the signature.  On the lazy path `cert_bytes`
         // is always exactly 156 bytes (a `MembershipCert::as_bytes()`), so
         // this only bites the legacy wire path, unchanged from before.
-        let signature_ok =
-            match Self::signed_message(&orig, &seqno, cert_bytes, &mut self.sign_scratch) {
-                Some(signed) => verify_signature(&ed_pubkey, signed, &signature),
-                None => {
-                    tracing::trace!("auth: dropping OGM, signed-message buffer too small");
-                    return OgmVerdict::Rejected;
-                }
-            };
-        if !signature_ok {
-            tracing::trace!("auth: dropping OGM with an invalid signature");
-            return OgmVerdict::Rejected;
+        if !signature_already_checked {
+            let ed_pubkey = verified.ed_pubkey;
+            let signature_ok =
+                match Self::signed_message(&orig, &seqno, cert_bytes, &mut self.sign_scratch) {
+                    Some(signed) => {
+                        self.ogm_crypto_ops += 1;
+                        verify_signature(&ed_pubkey, signed, &signature)
+                    }
+                    None => {
+                        tracing::trace!("auth: dropping OGM, signed-message buffer too small");
+                        return OgmVerdict::Rejected;
+                    }
+                };
+            if !signature_ok {
+                tracing::trace!("auth: dropping OGM with an invalid signature");
+                return OgmVerdict::Rejected;
+            }
         }
 
-        let pairwise_key = self.keypair.pairwise_key(&verified.x_pubkey);
         self.cache_neighbor(NeighborKeys {
             cert: verified,
             pairwise_key,
             raw_cert: *cert,
+            last_ogm: Some((seqno, signature)),
         });
 
         // Fold in any revocation records this OGM carries — each independently
@@ -1213,6 +1289,8 @@ impl<
             cert: verified,
             pairwise_key,
             raw_cert: *cert,
+            // No OGM of theirs has been verified through this cert yet.
+            last_ogm: None,
         });
         true
     }
@@ -1287,6 +1365,8 @@ impl<
             cert: verified,
             pairwise_key,
             raw_cert: *cert,
+            // No OGM of theirs has been verified through this cert yet.
+            last_ogm: None,
         });
         Some(requester)
     }
@@ -1730,6 +1810,123 @@ mod tests {
         assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
         assert_eq!(b.neighbors().len(), 1);
         assert_eq!(b.neighbor_x_pubkey(mac(2)), Some(a.cert.x_pubkey));
+    }
+
+    /// A flooded OGM reaches a node once per neighbour on a shared segment —
+    /// every copy carrying the same originator, seqno, certificate and
+    /// signature, since none of the fields a forwarder rewrites (TTL, TQ) are
+    /// signed. Verifying each copy from scratch makes a node's crypto load the
+    /// *square* of the segment's size: at `MAX_NEIGHBOR_KEYS` mutual
+    /// neighbours that is ~4k verifications per Trickle round instead of ~64,
+    /// which no board can carry.
+    ///
+    /// So a repeat of an OGM already verified costs no public-key operation at
+    /// all. This is memoisation of a pure function, not a relaxed check: the
+    /// key covers every byte the signature commits to, and anything that
+    /// differs by one bit takes the slow path below.
+    #[test]
+    fn a_repeated_ogm_copy_costs_no_public_key_operations() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+        let after_first = b.ogm_crypto_ops;
+
+        // The same OGM again, as a neighbour's re-flood of it delivers it.
+        for _ in 0..8 {
+            assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+        }
+        assert_eq!(
+            b.ogm_crypto_ops, after_first,
+            "a copy of an already-verified OGM must not re-run any public-key operation"
+        );
+    }
+
+    /// The next seqno from a neighbour already admitted is a genuinely new
+    /// signed message, so its signature must be verified — but its certificate
+    /// is the same bytes already verified against the anchor, and the pairwise
+    /// key already derived from it. Only the signature costs anything.
+    #[test]
+    fn a_new_seqno_from_a_known_neighbor_verifies_only_its_signature() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+        let after_first = b.ogm_crypto_ops;
+
+        let (mut buf, len) = bare_ogm(mac(2), 8);
+        let len = a.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+        assert_eq!(
+            b.ogm_crypto_ops - after_first,
+            1,
+            "a known neighbour's next OGM costs one signature check, not a \
+             re-verified certificate and a re-derived pairwise key too"
+        );
+    }
+
+    /// The memo is keyed on the signature, so an attacker who replays a
+    /// verified originator/seqno pair under a signature of its own is still
+    /// refused — and pays the full verification, rather than being handed a
+    /// verdict some earlier honest frame earned.
+    #[test]
+    fn a_forged_signature_on_a_verified_seqno_is_still_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+        let after_first = b.ogm_crypto_ops;
+
+        buf[len - 1] ^= 0xff; // same orig and seqno, a signature nobody signed
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
+        assert!(
+            b.ogm_crypto_ops > after_first,
+            "a signature that is not the memoised one must be checked, not assumed"
+        );
+    }
+
+    /// Expiry is judged per frame, not per distinct OGM: a copy arriving after
+    /// the originator's certificate lapses is refused even though an identical
+    /// copy verified while it was live. The memo shortcuts the *evidence*, not
+    /// the validity window it was evidence for.
+    #[test]
+    fn a_repeated_copy_is_rejected_once_the_certificate_expires() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        b.set_time(2000);
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
+    }
+
+    /// Likewise for revocation: a repeat of the very OGM that admitted a node
+    /// is refused once that node is revoked.
+    #[test]
+    fn a_repeated_copy_is_rejected_once_the_originator_is_revoked() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).expect("augment");
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        let record = authority.revoke(mac(2), 0, 1000);
+        assert!(b.ingest_revocation(&record));
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
     }
 
     /// A verified neighbor carries its cert's expiry, so the security view can

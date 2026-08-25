@@ -737,7 +737,7 @@ fn plan_host_frame(
                 dst: f.dst,
                 protocol: f.protocol,
                 payload: f.payload.to_vec(),
-                egress: Egress::Auto { exclude: None },
+                egress: Egress::Auto,
             });
         }
     };
@@ -754,7 +754,7 @@ fn plan_host_frame(
                             dst: f.dst,
                             protocol: f.protocol,
                             payload: f.payload.to_vec(),
-                            egress: Egress::Auto { exclude: None },
+                            egress: Egress::Auto,
                         });
                     }
                 }
@@ -766,7 +766,7 @@ fn plan_host_frame(
             dst: f.dst,
             protocol: f.protocol,
             payload: f.payload.to_vec(),
-            egress: Egress::Auto { exclude: None },
+            egress: Egress::Auto,
         });
     }
 
@@ -804,9 +804,9 @@ async fn dispatch<Local: FrameIo>(
 
         // Reserve the trailer bytes so the shared planner can write a pairwise
         // tag into them when this directed frame needs one, then resolve which
-        // interfaces carry the frame (split-horizon and per-link transmit gates
-        // included). `None` means auth is on but this directed frame cannot be
-        // tagged — drop it rather than emit it in the clear.
+        // interfaces carry the frame (per-link transmit gates included).
+        // `None` means auth is on but this directed frame cannot be tagged —
+        // drop it rather than emit it in the clear.
         let body_len = payload.len();
         payload.resize(body_len + DIRECTED_TRAILER_LEN, 0);
         let num_interfaces = interfaces.len();
