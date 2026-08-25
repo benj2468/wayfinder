@@ -29,6 +29,33 @@ variable "dns_name" {
   description = "Record name within the zone, e.g. \"ca\" for ca.example.org."
 }
 
+variable "vpn_dns_name" {
+  type        = string
+  default     = "vpn"
+  description = "Record name for the Headscale coordination server, e.g. \"vpn\" for vpn.example.org. Must match services.wayfinder-headscale.domain in nix/machines/wayfinder-ca/common.nix — a node registers against this name."
+}
+
+# The tunnel control plane's name (design 08). Same instance as the record
+# below, separate name: a node bakes `--login-server` into its tunnel
+# registration, so the VPN plane wants to be repointable without touching the
+# management one.
+#
+# Also DNS-only, and for two reasons stronger than the CA's: the embedded relay
+# serves STUN over UDP, which no HTTP proxy carries at all, and Headscale
+# answers an ACME challenge on this name — which needs it pointing at the
+# instance, not at a proxy holding someone else's certificate.
+resource "cloudflare_dns_record" "vpn" {
+  count = var.manage_dns ? 1 : 0
+
+  zone_id = var.cloudflare_zone_id
+  name    = var.vpn_dns_name
+  type    = "A"
+  content = oci_core_public_ip.ca.ip_address
+  ttl     = 300
+  proxied = false
+  comment = "Wayfinder VPN coordination (Headscale on TCP 443, STUN on UDP 3478)"
+}
+
 resource "cloudflare_dns_record" "ca" {
   count = var.manage_dns ? 1 : 0
 

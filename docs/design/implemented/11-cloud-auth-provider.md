@@ -17,7 +17,7 @@ the management-API wire format, or to any client — `wayfinder-ctl --connect
 
 Wayfinder deploys to a Jetson Orin Nano, to bare-metal boards, and to Docker.
 None of those has a stable public address, and
-`docs/design/08-internet-links-headscale-vpn.md` names the consequence
+`docs/design/implemented/08-internet-links-headscale-vpn.md` names the consequence
 directly: two Starlink-connected nodes behind CGNAT cannot reach each other,
 and *"a cloud-deployed wayfinder auth provider (the CA) is the one box in this
 topology with a stable public address"*.

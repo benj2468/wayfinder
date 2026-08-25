@@ -56,7 +56,7 @@ Deliberately separated, and the boundary matters:
   (`decide_access` → `MgmtAccess`), with no transport and no crypto, so the
   policy is unit-testable standalone and identical across transports.
 
-Four grant tiers:
+Five grant tiers:
 
 - `GrantedAdmin` — a verified, non-revoked admin cert bound to the handshake key.
 - `GrantedSelfKey` — the client proved possession of the node's *own* key. A
@@ -81,16 +81,40 @@ Four grant tiers:
   admission credential by content. **Earned by the bit, never by the absence of
   the admin bit** — every device on the mesh holds a verified non-admin
   certificate, so a tier granted by absence would be a tier the whole mesh
-  already had. A cert with neither bit is `Denied(NoCapability)`.
+  already had.
+- `GrantedMember` — a verified, non-revoked cert carrying `CERT_FLAG_MEMBER`
+  and no management capability: an enrolled *device*, which is what every node
+  on the mesh holds. Exactly one request wide (`GetVpnEnrollment`), and that
+  narrowness is the whole point — anything added to this tier is added to the
+  entire mesh at once. Earned by the bit, never by the absence of the others,
+  for the same reason the viewer tier is.
 - `GrantedEnrollment` — the client presented no cert at all. Admitted, but
   `permits` confines it to `SubmitCsr`, `GetTrustAnchor` and
   `AuthenticateUser`.
 
+A cert with *no* capability bit at all is `Denied(NoCapability)`. Since
+`CERT_FLAG_MEMBER` exists that means one of two things: a certificate issued
+before the bit did (which keeps the access it always had — none — until
+reissued), or one whose bits this build does not recognise, since unknown flags
+are masked rather than guessed at.
+
 **Admission is per-connection; what an admitted client may invoke is
-per-request.** The two full grants may invoke everything, so `permits` is really
-the definition of the other two. The enrollment tier exists because enrollment
-is otherwise impossible: a provider worth enrolling with is itself an enrolled
-member, so a node with no cert could never open the connection carrying its CSR
+per-request.** The two full grants may invoke everything *except one request*,
+so `permits` is really the definition of the three confined tiers.
+
+That one exception is `GetVpnEnrollment`, gated on the **request** ahead of the
+tier match. It is not a management capability being exercised: it mints a
+tunnel credential bound to the calling *device's* identity, read from the
+verified certificate on the connection. An operator's session certificate and
+the node's own seed are both fully privileged and neither is a device, so for
+them the request has no meaning rather than being a privilege they lack. This
+is also what makes design 08's two gates independent — a party holding only the
+shared enrollment token can have a certificate issued for keys it names, but
+cannot separately prove possession of that key to reach this request.
+
+The enrollment tier exists because enrollment is otherwise impossible: a
+provider worth enrolling with is itself an enrolled member, so a node with no
+cert could never open the connection carrying its CSR
 — and, for the same reason, someone who has not logged in yet could never open
 the connection carrying their password. Admission control for it has not moved:
 the enrollment token and the operator's approval for a CSR, the password, the

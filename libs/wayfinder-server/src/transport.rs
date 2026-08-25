@@ -400,6 +400,27 @@ impl PreAuthGuard {
 /// runs; a denial is answered with a generic [`ErrorResponse`] and the
 /// connection closed.
 ///
+/// The listener-wide services every connection is served with: the shared
+/// pre-authentication limiter, the channel to the router loop, and the optional
+/// VPN coordinator.
+///
+/// Bundled rather than passed as four more parameters because they travel
+/// together and are identical for every connection a listener accepts — only
+/// the socket, the peer's key and its `PreAuthGuard` differ per connection.
+/// Cloning is cheap: an `Arc`, an `mpsc::Sender`, and an `Option<Arc<_>>`.
+#[derive(Clone)]
+pub(crate) struct ServeContext {
+    /// Bounds the population of not-yet-credentialed connections, mesh-wide and
+    /// per source IP, and rate-limits enrollment-tier `SubmitCsr`.
+    pub(crate) limits: std::sync::Arc<PreAuthLimits>,
+    /// Forwards a decoded request to the single task that owns the router.
+    pub(crate) query_tx: QueryTx,
+    /// Answers the VPN requests, or `None` on every deployment that runs no
+    /// coordination server — which is the default, and every node that is not
+    /// the certificate authority.
+    pub(crate) vpn: Option<crate::vpn::SharedCoordinator>,
+}
+
 /// The grant does not stand for the life of the connection: `gate` re-decides
 /// it before serving a request once its interval has elapsed, and a changed
 /// verdict — revoked, expired, or a rotated identity seed — closes the
@@ -413,14 +434,18 @@ pub(crate) async fn serve_authenticated_stream<S>(
     stream: S,
     peer_key: [u8; 32],
     peer_addr: std::net::IpAddr,
-    limits: std::sync::Arc<PreAuthLimits>,
     mut guard: PreAuthGuard,
     gate: AuthGate,
-    query_tx: QueryTx,
+    ctx: ServeContext,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let ServeContext {
+        limits,
+        query_tx,
+        vpn,
+    } = ctx;
     // Read and write are framed separately so the length cap applies to one
     // direction only: [`crate::MAX_FRAME_LEN`] bounds what an unauthenticated
     // peer can make this node buffer, while a response — a host node's routing
@@ -595,8 +620,22 @@ where
                 ?decision,
                 "drop: request not permitted on this connection"
             );
-            let message = match decision {
-                MgmtAccess::GrantedViewer => {
+            // Matched on the request first, because `GetVpnEnrollment` is the
+            // one request a *full* grant can be refused — so keying only on the
+            // tier would tell an admin it "is limited to enrollment", which is
+            // both false and points them at the wrong fix.
+            let message = match (decision, req) {
+                (_, ReqKind::GetVpnEnrollment(_)) => {
+                    "a VPN credential is issued only to an enrolled device presenting its \
+                     own certificate; an operator's session certificate and the node's own \
+                     key are not devices, so there is no identity to issue one for"
+                }
+                (MgmtAccess::GrantedMember, _) => {
+                    "this connection is an enrolled device (its certificate carries the \
+                     member capability, not a management one); it may fetch its own VPN \
+                     credential and nothing else"
+                }
+                (MgmtAccess::GrantedViewer, _) => {
                     "this connection is read-only (its certificate carries the viewer \
                      capability, not the admin one); mutations and the enrollment token \
                      need an admin certificate or the node's own key"
@@ -641,14 +680,219 @@ where
             .await?;
             continue;
         }
+        // The VPN requests are answered here rather than by the router loop.
+        // Two reasons, and either alone would be decisive: the router loop is
+        // never told *who* is asking (the query channel carries a request and a
+        // reply channel, nothing else), and `GetVpnEnrollment` mints a
+        // credential for the caller's own identity — which only this layer
+        // holds. They are also network I/O, and the router loop that would
+        // otherwise await them is the loop emitting OGMs.
+        if let Some(vpn_response) =
+            serve_vpn_request(req, decision, cert.as_ref(), vpn.as_ref()).await
+        {
+            send_response(&mut responses, vpn_response).await?;
+            continue;
+        }
         let (resp_tx, resp_rx) = oneshot::channel();
-        query_tx.send((request, resp_tx)).await?;
+        query_tx.send((request.clone(), resp_tx)).await?;
         let response = resp_rx.await?;
+        // Mesh revocation and VPN revocation are one operator action, so the
+        // second half runs here once the first has succeeded. Ordered this way
+        // deliberately: mesh membership is what actually grants routing trust,
+        // so it goes first and a failure there leaves the tunnel alone rather
+        // than stranding a node that is still a member.
+        let response = match (&request.request, &response.response) {
+            (Some(ReqKind::RevokeNode(revoke)), Some(RespKind::Empty(_))) => {
+                revoke_vpn_alongside_mesh(&revoke.node_mac, vpn.as_ref(), response).await
+            }
+            _ => response,
+        };
         let mut buf = Vec::new();
         response.encode(&mut buf)?;
         responses.send(Bytes::from(buf)).await?;
     }
     Ok(())
+}
+
+/// Answer one of the three VPN requests, or `None` if `req` is not one and the
+/// router should serve it.
+///
+/// `permits` has already run, so reaching a given arm here means the tier was
+/// authorized for it. The MAC a credential is minted for is taken from `cert`
+/// — the certificate the handshake key was bound to — never from the request,
+/// which is why `GetVpnEnrollmentRequest` carries no fields at all.
+async fn serve_vpn_request(
+    req: &ReqKind,
+    decision: MgmtAccess,
+    cert: Option<&MembershipCert>,
+    vpn: Option<&crate::vpn::SharedCoordinator>,
+) -> Option<RespKind> {
+    use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentResponse;
+    use wayfinder_protos::wayfinder::v1alpha::ListVpnPeersResponse;
+    use wayfinder_protos::wayfinder::v1alpha::VpnPeerStatus;
+
+    let configured = match (req, vpn) {
+        (
+            ReqKind::GetVpnEnrollment(_) | ReqKind::ListVpnPeers(_) | ReqKind::RevokeVpnPeer(_),
+            Some(vpn),
+        ) => vpn,
+        // Not a VPN request: the router serves it.
+        (
+            ReqKind::GetVpnEnrollment(_) | ReqKind::ListVpnPeers(_) | ReqKind::RevokeVpnPeer(_),
+            None,
+        ) => {
+            return Some(vpn_error(&crate::vpn::VpnError::NotConfigured));
+        }
+        _ => return None,
+    };
+
+    Some(match req {
+        ReqKind::GetVpnEnrollment(_) => {
+            // Belt and braces with `permits`, which already confined this
+            // request to the member tier. The MAC below is only meaningful
+            // because the tier means "this certificate verified and its key is
+            // the one this connection's handshake proved", so re-stating the
+            // condition here keeps the two from drifting apart silently if the
+            // policy is ever edited.
+            let Some(mac) = member_mac(decision, cert) else {
+                tracing::warn!("VPN enrollment refused: no bound member certificate");
+                return Some(RespKind::Error(ErrorResponse {
+                    message: "a VPN credential is issued only to an enrolled device presenting \
+                              its own certificate"
+                        .into(),
+                }));
+            };
+            match configured.enroll(mac).await {
+                Ok(enrollment) => {
+                    // The MAC, never the key: this line records that a
+                    // credential was minted and for whom, which is the whole
+                    // audit value, while the key itself is a bearer secret.
+                    tracing::info!(?mac, "minted a VPN enrollment credential");
+                    RespKind::VpnEnrollment(GetVpnEnrollmentResponse {
+                        vpn_login_server: enrollment.login_server,
+                        vpn_preauth_key: enrollment.preauth_key,
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!(?mac, error = %e, "VPN enrollment failed");
+                    vpn_error(&e)
+                }
+            }
+        }
+        ReqKind::ListVpnPeers(_) => match configured.peers().await {
+            Ok(peers) => RespKind::ListVpnPeers(ListVpnPeersResponse {
+                peers: peers
+                    .into_iter()
+                    .map(|p| VpnPeerStatus {
+                        node_mac: p.mac.map(|m| m.0.to_vec()).unwrap_or_default(),
+                        raw_hostname: p.hostname,
+                        tailscale_ip: p.address,
+                        online: p.online,
+                        last_seen_unix: p.last_seen_unix,
+                        key_expiry_unix: p.key_expiry_unix,
+                    })
+                    .collect(),
+            }),
+            Err(e) => {
+                tracing::warn!(error = %e, "listing VPN peers failed");
+                vpn_error(&e)
+            }
+        },
+        ReqKind::RevokeVpnPeer(revoke) => match mac_from_bytes(&revoke.node_mac) {
+            Some(mac) => match configured.revoke(mac).await {
+                Ok(()) => {
+                    tracing::info!(?mac, "revoked a VPN registration");
+                    RespKind::Empty(Empty {})
+                }
+                Err(e) => {
+                    tracing::warn!(?mac, error = %e, "VPN revocation failed");
+                    vpn_error(&e)
+                }
+            },
+            None => RespKind::Error(ErrorResponse {
+                message: "node_mac must be exactly 6 bytes".into(),
+            }),
+        },
+        _ => return None,
+    })
+}
+
+/// Remove `node_mac`'s VPN registration after its mesh membership has been
+/// revoked, downgrading `mesh_response` to an error if that second half fails.
+///
+/// A partial revoke is not a security hole — tunnel reachability is not mesh
+/// trust, and the mesh half (the half that matters) has already succeeded — but
+/// reporting it as a clean success would leave an operator believing a node was
+/// fully removed when its tunnel access remains. The error names the retry, and
+/// `RevokeVpnPeer` is idempotent precisely so that retry converges.
+async fn revoke_vpn_alongside_mesh(
+    node_mac: &[u8],
+    vpn: Option<&crate::vpn::SharedCoordinator>,
+    mesh_response: WayfinderResponse,
+) -> WayfinderResponse {
+    let (Some(vpn), Some(mac)) = (vpn, mac_from_bytes(node_mac)) else {
+        return mesh_response;
+    };
+    match vpn.revoke(mac).await {
+        Ok(()) => mesh_response,
+        Err(e) => {
+            // A handled, retried failure of an outbound call to the
+            // coordination server — not a fault originating in this node —
+            // so `warn!`, matching every other `VpnError` log site in this
+            // file rather than `error!`.
+            tracing::warn!(
+                ?mac,
+                error = %e,
+                "mesh revocation succeeded but VPN revocation failed; the node's tunnel \
+                 access remains until this is retried"
+            );
+            WayfinderResponse {
+                response: Some(RespKind::Error(ErrorResponse {
+                    message: half_completed_revoke_message(mac),
+                })),
+            }
+        }
+    }
+}
+
+/// The message a half-completed revoke answers with. Split out so the sentence
+/// an operator reads is in one place.
+fn half_completed_revoke_message(mac: Mac) -> String {
+    format!(
+        "mesh membership for {mac:?} was revoked, but removing its VPN registration failed; \
+         the node can no longer route but can still reach the tunnel. Retry with \
+         `wayfinderctl vpn revoke`."
+    )
+}
+
+/// The MAC a member-tier connection is bound to, or `None` if `decision` is not
+/// the member tier or no certificate was presented.
+///
+/// The tier is what makes the MAC trustworthy: `decide_access` grants it only
+/// after verifying the certificate against the anchor *and* checking that its
+/// key is the one the handshake proved. Reading `node_mac` off an unverified
+/// certificate would be reading a value the client chose.
+fn member_mac(decision: MgmtAccess, cert: Option<&MembershipCert>) -> Option<Mac> {
+    if decision != MgmtAccess::GrantedMember {
+        return None;
+    }
+    Some(Mac(cert?.node_mac))
+}
+
+/// A 6-byte MAC from wire bytes, or `None` if the length is wrong.
+fn mac_from_bytes(bytes: &[u8]) -> Option<Mac> {
+    bytes.try_into().ok().map(Mac)
+}
+
+/// Render a [`VpnError`](crate::vpn::VpnError) as a response.
+///
+/// "Not configured" is deliberately the same shape as a failure rather than a
+/// distinct success: a client asking a CA that has no VPN gets a sentence
+/// saying so, and the CLI treats it as "no VPN here" and finishes enrolling.
+fn vpn_error(e: &crate::vpn::VpnError) -> RespKind {
+    RespKind::Error(ErrorResponse {
+        message: e.to_string(),
+    })
 }
 
 /// Decide what a connection may do, given the key its handshake proved, the
@@ -737,6 +981,23 @@ pub async fn serve_tls_server(
     snapshot_tx: AuthSnapshotTx,
     query_tx: QueryTx,
 ) -> anyhow::Result<()> {
+    serve_tls_server_with_vpn(listener, own_seed, snapshot_tx, query_tx, None).await
+}
+
+/// [`serve_tls_server`], plus the VPN coordinator this listener answers the
+/// VPN requests with.
+///
+/// `vpn` is `None` for every deployment that does not run a coordination server
+/// — which is the default, and every node that is not the CA. Those answer the
+/// three VPN requests with "not configured" rather than failing to parse them,
+/// so a client can ask without knowing in advance.
+pub async fn serve_tls_server_with_vpn(
+    listener: TcpListener,
+    own_seed: [u8; 32],
+    snapshot_tx: AuthSnapshotTx,
+    query_tx: QueryTx,
+    vpn: Option<crate::vpn::SharedCoordinator>,
+) -> anyhow::Result<()> {
     let config = crate::server_config(&own_seed)
         .map_err(|e| anyhow::anyhow!("building management TLS server config: {e}"))?;
     let acceptor = TlsAcceptor::from(config);
@@ -761,12 +1022,13 @@ pub async fn serve_tls_server(
         tracing::debug!(%peer, "management TLS connection accepted");
         let acceptor = acceptor.clone();
         let snapshot_tx = snapshot_tx.clone();
-        let query_tx = query_tx.clone();
-        let limits = std::sync::Arc::clone(&limits);
+        let ctx = ServeContext {
+            limits: std::sync::Arc::clone(&limits),
+            query_tx: query_tx.clone(),
+            vpn: vpn.clone(),
+        };
         tokio::spawn(async move {
-            if let Err(e) =
-                serve_tls_connection(acceptor, tcp, peer, snapshot_tx, query_tx, limits, guard)
-                    .await
+            if let Err(e) = serve_tls_connection(acceptor, tcp, peer, snapshot_tx, guard, ctx).await
             {
                 tracing::warn!(%peer, error = ?e, "management TLS connection error");
             }
@@ -781,9 +1043,8 @@ async fn serve_tls_connection(
     tcp: tokio::net::TcpStream,
     peer: SocketAddr,
     snapshot_tx: AuthSnapshotTx,
-    query_tx: QueryTx,
-    limits: std::sync::Arc<PreAuthLimits>,
     guard: PreAuthGuard,
+    ctx: ServeContext,
 ) -> anyhow::Result<()> {
     // A peer that opens a connection and then says nothing would otherwise hold
     // this task and its socket indefinitely; the handshake itself is sub-second
@@ -810,10 +1071,9 @@ async fn serve_tls_connection(
         tls,
         peer_key,
         peer.ip(),
-        limits,
         guard,
         AuthGate::new(snapshot_tx),
-        query_tx,
+        ctx,
     )
     .await
 }
@@ -1076,6 +1336,20 @@ mod tests {
         Framed<tokio::io::DuplexStream, LengthDelimitedCodec>,
         tokio::task::JoinHandle<anyhow::Result<()>>,
     ) {
+        spawn_gated_server_with_vpn(peer_key, gate, response, None)
+    }
+
+    /// As [`spawn_gated_server_answering`], with the VPN coordinator the
+    /// connection answers the VPN requests from.
+    fn spawn_gated_server_with_vpn(
+        peer_key: [u8; 32],
+        gate: AuthGate,
+        response: Response,
+        vpn: Option<crate::vpn::SharedCoordinator>,
+    ) -> (
+        Framed<tokio::io::DuplexStream, LengthDelimitedCodec>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
         let (query_tx, query_rx) = mpsc::channel(16);
         spawn_echo_of(query_rx, response);
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -1085,7 +1359,16 @@ mod tests {
             .admit(peer_addr, std::time::Instant::now())
             .expect("a fresh limiter admits the first connection");
         let server = tokio::spawn(serve_authenticated_stream(
-            server_io, peer_key, peer_addr, limits, guard, gate, query_tx,
+            server_io,
+            peer_key,
+            peer_addr,
+            guard,
+            gate,
+            ServeContext {
+                limits,
+                query_tx,
+                vpn,
+            },
         ));
         (
             LengthDelimitedCodec::builder().new_framed(client_io),
@@ -2053,10 +2336,13 @@ mod tests {
             server_io,
             key,
             source(spare - 1),
-            std::sync::Arc::clone(&limits),
             guard,
             gate_returning(ctx),
-            query_tx,
+            ServeContext {
+                limits: std::sync::Arc::clone(&limits),
+                query_tx,
+                vpn: None,
+            },
         ));
         let mut client = LengthDelimitedCodec::builder().new_framed(client_io);
 
@@ -2367,5 +2653,419 @@ mod tests {
 
         drop(client);
         let _ = server.await;
+    }
+
+    // ── VPN coordination ──────────────────────────────────────────────────
+
+    /// A coordinator that records what it was asked and answers from a script,
+    /// so a test can assert *which MAC* a credential was minted for — the whole
+    /// security property of the enrollment RPC.
+    #[derive(Default)]
+    struct FakeCoordinator {
+        enrolled: std::sync::Mutex<Vec<Mac>>,
+        revoked: std::sync::Mutex<Vec<Mac>>,
+        fail_revoke: bool,
+    }
+
+    impl crate::vpn::VpnCoordinator for FakeCoordinator {
+        fn enroll(
+            &self,
+            mac: Mac,
+        ) -> impl std::future::Future<
+            Output = Result<crate::vpn::VpnEnrollment, crate::vpn::VpnError>,
+        > + Send {
+            self.enrolled.lock().unwrap().push(mac);
+            std::future::ready(Ok(crate::vpn::VpnEnrollment {
+                login_server: "https://vpn.example.net".into(),
+                preauth_key: format!("key-for-{}", crate::vpn::hostname_for(mac)),
+            }))
+        }
+
+        fn peers(
+            &self,
+        ) -> impl std::future::Future<
+            Output = Result<Vec<crate::vpn::VpnPeer>, crate::vpn::VpnError>,
+        > + Send {
+            std::future::ready(Ok(vec![crate::vpn::VpnPeer {
+                mac: Some(Mac([0, 0, 0, 0, 0, 9])),
+                hostname: crate::vpn::hostname_for(Mac([0, 0, 0, 0, 0, 9])),
+                address: "100.64.0.3".into(),
+                online: true,
+                last_seen_unix: 1_700_000_000,
+                key_expiry_unix: 0,
+            }]))
+        }
+
+        fn revoke(
+            &self,
+            mac: Mac,
+        ) -> impl std::future::Future<Output = Result<(), crate::vpn::VpnError>> + Send {
+            self.revoked.lock().unwrap().push(mac);
+            std::future::ready(if self.fail_revoke {
+                Err(crate::vpn::VpnError::Unreachable("down".into()))
+            } else {
+                Ok(())
+            })
+        }
+    }
+
+    /// An enrolled device, its certificate, and the anchor that verifies it —
+    /// the fixture the VPN tests share.
+    fn enrolled_device(
+        node_mac: Mac,
+    ) -> (
+        wayfinder::wayfinder_auth::Keypair,
+        MembershipCert,
+        TrustAnchor,
+        [u8; 32],
+    ) {
+        use wayfinder::wayfinder_auth::Authority;
+        use wayfinder::wayfinder_auth::Keypair;
+
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let node = Keypair::from_seed(&[2u8; 32]);
+        let cert = authority.issue_cert(node_mac, node.ed_pubkey(), node.x_pubkey(), 0, 10_000);
+        let ca_own = Keypair::from_seed(&[7u8; 32]).ed_pubkey();
+        (node, cert, authority.trust_anchor(), ca_own)
+    }
+
+    /// Authenticate `client` with `cert` and consume the acknowledgement.
+    async fn authenticate_with(
+        client: &mut Framed<tokio::io::DuplexStream, LengthDelimitedCodec>,
+        cert: &MembershipCert,
+    ) {
+        use zerocopy::IntoBytes;
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: cert.as_bytes().to_vec(),
+            })))
+            .await
+            .unwrap();
+        let ack = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(
+            matches!(ack.response, Some(Response::Empty(_))),
+            "expected an authentication acknowledgement, got {:?}",
+            ack.response
+        );
+    }
+
+    /// The end-to-end enrollment path: an enrolled device presenting its own
+    /// certificate gets a credential minted **for the MAC in that certificate**,
+    /// not for anything it asked for — the request has no fields to ask with.
+    #[tokio::test]
+    async fn a_member_gets_a_credential_minted_for_its_certified_mac() {
+        use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentRequest;
+
+        let node_mac = Mac([2, 0, 0, 0, 0, 9]);
+        let (node, cert, anchor, ca_own) = enrolled_device(node_mac);
+        let coordinator = std::sync::Arc::new(FakeCoordinator::default());
+        let (mut client, _server) = spawn_gated_server_with_vpn(
+            node.ed_pubkey(),
+            gate_returning(AuthContext {
+                own_key: Some(ca_own),
+                anchor: Some(anchor),
+                revoked: Vec::new(),
+                now_unix: 100,
+            }),
+            canned_node_info(),
+            Some(coordinator.clone()),
+        );
+
+        authenticate_with(&mut client, &cert).await;
+        client
+            .send(encode_request(Request::GetVpnEnrollment(
+                GetVpnEnrollmentRequest {},
+            )))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+
+        let Some(Response::VpnEnrollment(enrollment)) = resp.response else {
+            panic!("expected a VPN enrollment, got {:?}", resp.response);
+        };
+        assert_eq!(enrollment.vpn_login_server, "https://vpn.example.net");
+        assert_eq!(enrollment.vpn_preauth_key, "key-for-020000000009");
+        assert_eq!(
+            *coordinator.enrolled.lock().unwrap(),
+            vec![node_mac],
+            "the credential must be minted for the certificate's MAC"
+        );
+    }
+
+    /// A connection that never proved a device identity is refused before the
+    /// coordinator is reached — nothing is minted. This is the transport half
+    /// of the policy `authz` states: an enrollment-tier client holding only the
+    /// shared token cannot turn it into tunnel reachability.
+    #[tokio::test]
+    async fn an_enrollment_tier_client_mints_nothing() {
+        use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentRequest;
+
+        let coordinator = std::sync::Arc::new(FakeCoordinator::default());
+        let (mut client, _server) = spawn_gated_server_with_vpn(
+            [9u8; 32],
+            gate_returning(AuthContext {
+                own_key: Some([7u8; 32]),
+                anchor: None,
+                revoked: Vec::new(),
+                now_unix: 100,
+            }),
+            canned_node_info(),
+            Some(coordinator.clone()),
+        );
+
+        // No certificate: the enrollment tier.
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: Vec::new(),
+            })))
+            .await
+            .unwrap();
+        let _ack = client.next().await.unwrap().unwrap();
+
+        client
+            .send(encode_request(Request::GetVpnEnrollment(
+                GetVpnEnrollmentRequest {},
+            )))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(
+            matches!(resp.response, Some(Response::Error(_))),
+            "expected a refusal, got {:?}",
+            resp.response
+        );
+        assert!(
+            coordinator.enrolled.lock().unwrap().is_empty(),
+            "nothing may be minted for a client that proved no device identity"
+        );
+    }
+
+    /// Revoking a node's mesh membership removes its VPN registration in the
+    /// same action, so an operator's one click does both.
+    #[tokio::test]
+    async fn mesh_revocation_also_revokes_the_vpn_registration() {
+        use wayfinder_protos::wayfinder::v1alpha::RevokeNodeRequest;
+
+        let target = Mac([2, 0, 0, 0, 0, 42]);
+        let (_node, cert, anchor, ca_own) = enrolled_device(Mac([2, 0, 0, 0, 0, 1]));
+        let coordinator = std::sync::Arc::new(FakeCoordinator::default());
+        // An admin connection: the node's own key earns the full grant.
+        let (mut client, _server) = spawn_gated_server_with_vpn(
+            ca_own,
+            gate_returning(AuthContext {
+                own_key: Some(ca_own),
+                anchor: Some(anchor),
+                revoked: Vec::new(),
+                now_unix: 100,
+            }),
+            Response::Empty(wayfinder_protos::wayfinder::v1alpha::Empty {}),
+            Some(coordinator.clone()),
+        );
+        let _ = &cert;
+
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: Vec::new(),
+            })))
+            .await
+            .unwrap();
+        let _ack = client.next().await.unwrap().unwrap();
+
+        client
+            .send(encode_request(Request::RevokeNode(RevokeNodeRequest {
+                node_mac: target.0.to_vec(),
+            })))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+
+        assert!(
+            matches!(resp.response, Some(Response::Empty(_))),
+            "a fully successful revoke reports success, got {:?}",
+            resp.response
+        );
+        assert_eq!(*coordinator.revoked.lock().unwrap(), vec![target]);
+    }
+
+    /// A revoke whose VPN half fails is reported as a failure, not as success.
+    /// The mesh half has already taken effect (the node cannot route), but the
+    /// tunnel access it still holds is exactly what an operator needs told.
+    #[tokio::test]
+    async fn a_half_completed_revoke_is_not_reported_as_success() {
+        use wayfinder_protos::wayfinder::v1alpha::RevokeNodeRequest;
+
+        let (_node, _cert, anchor, ca_own) = enrolled_device(Mac([2, 0, 0, 0, 0, 1]));
+        let coordinator = std::sync::Arc::new(FakeCoordinator {
+            fail_revoke: true,
+            ..Default::default()
+        });
+        let (mut client, _server) = spawn_gated_server_with_vpn(
+            ca_own,
+            gate_returning(AuthContext {
+                own_key: Some(ca_own),
+                anchor: Some(anchor),
+                revoked: Vec::new(),
+                now_unix: 100,
+            }),
+            Response::Empty(wayfinder_protos::wayfinder::v1alpha::Empty {}),
+            Some(coordinator.clone()),
+        );
+
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: Vec::new(),
+            })))
+            .await
+            .unwrap();
+        let _ack = client.next().await.unwrap().unwrap();
+
+        client
+            .send(encode_request(Request::RevokeNode(RevokeNodeRequest {
+                node_mac: vec![2, 0, 0, 0, 0, 42],
+            })))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+
+        let Some(Response::Error(err)) = resp.response else {
+            panic!(
+                "expected an error naming the retry, got {:?}",
+                resp.response
+            );
+        };
+        assert!(
+            err.message.contains("VPN"),
+            "the message must say which half failed: {:?}",
+            err.message
+        );
+    }
+
+    /// A CA with no VPN configured answers the VPN requests with a sentence
+    /// saying so, rather than failing to parse them. That is what lets
+    /// `wayfinderctl enroll` ask unconditionally and finish normally against a
+    /// deployment that has no tunnel at all.
+    #[tokio::test]
+    async fn a_provider_without_vpn_says_so() {
+        use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentRequest;
+
+        let node_mac = Mac([2, 0, 0, 0, 0, 9]);
+        let (node, cert, anchor, ca_own) = enrolled_device(node_mac);
+        let (mut client, _server) = spawn_gated_server_with_vpn(
+            node.ed_pubkey(),
+            gate_returning(AuthContext {
+                own_key: Some(ca_own),
+                anchor: Some(anchor),
+                revoked: Vec::new(),
+                now_unix: 100,
+            }),
+            canned_node_info(),
+            None,
+        );
+
+        authenticate_with(&mut client, &cert).await;
+        client
+            .send(encode_request(Request::GetVpnEnrollment(
+                GetVpnEnrollmentRequest {},
+            )))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+
+        let Some(Response::Error(err)) = resp.response else {
+            panic!("expected a 'not configured' error, got {:?}", resp.response);
+        };
+        assert!(
+            err.message.contains("no VPN coordination configured"),
+            "unexpected message: {:?}",
+            err.message
+        );
+    }
+
+    /// A refusal has to say the *right* thing, not merely refuse. Three tiers
+    /// can be refused now, and the message keyed on the tier alone told an
+    /// admin refused `GetVpnEnrollment` that its connection "is limited to
+    /// enrollment" — false, and pointing at a fix that would not have helped.
+    ///
+    /// Pinned per case, because the failure mode is a *correct refusal with a
+    /// misleading explanation*, which no assertion on the refusal itself
+    /// catches.
+    #[tokio::test]
+    async fn a_refusal_explains_the_actual_reason() {
+        use wayfinder_protos::wayfinder::v1alpha::GetRoutingTableRequest;
+        use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentRequest;
+
+        let node_mac = Mac([2, 0, 0, 0, 0, 9]);
+        let (node, cert, anchor, ca_own) = enrolled_device(node_mac);
+
+        // An admin refused the device-scoped request: the message must name
+        // *that*, not claim the connection lacks an admin certificate.
+        let (mut client, _server) = spawn_gated_server_with_vpn(
+            ca_own,
+            gate_returning(AuthContext {
+                own_key: Some(ca_own),
+                anchor: Some(anchor),
+                revoked: Vec::new(),
+                now_unix: 100,
+            }),
+            canned_node_info(),
+            Some(std::sync::Arc::new(FakeCoordinator::default())),
+        );
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: Vec::new(),
+            })))
+            .await
+            .unwrap();
+        let _ack = client.next().await.unwrap().unwrap();
+        client
+            .send(encode_request(Request::GetVpnEnrollment(
+                GetVpnEnrollmentRequest {},
+            )))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        let Some(Response::Error(err)) = resp.response else {
+            panic!("expected a refusal, got {:?}", resp.response);
+        };
+        assert!(
+            err.message.contains("enrolled device"),
+            "a full grant refused the device credential must be told why: {:?}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("limited to enrollment"),
+            "an admin must not be told it lacks an admin certificate: {:?}",
+            err.message
+        );
+
+        // And a member refused a management request is told it is a device,
+        // not that it is a stranger.
+        let (mut member_client, _server2) = spawn_gated_server_with_vpn(
+            node.ed_pubkey(),
+            gate_returning(AuthContext {
+                own_key: Some(ca_own),
+                anchor: Some(anchor),
+                revoked: Vec::new(),
+                now_unix: 100,
+            }),
+            canned_node_info(),
+            None,
+        );
+        authenticate_with(&mut member_client, &cert).await;
+        member_client
+            .send(encode_request(Request::GetRoutingTable(
+                GetRoutingTableRequest {},
+            )))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(member_client.next().await.unwrap().unwrap()).unwrap();
+        let Some(Response::Error(err)) = resp.response else {
+            panic!("expected a refusal, got {:?}", resp.response);
+        };
+        assert!(
+            err.message.contains("member capability"),
+            "a member refused a management request must be told what it is: {:?}",
+            err.message
+        );
     }
 }

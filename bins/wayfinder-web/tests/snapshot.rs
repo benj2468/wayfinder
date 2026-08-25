@@ -16,13 +16,16 @@ mod common;
 
 use common::serve_mock_node;
 use common::serve_mock_provider_node;
+use wayfinder_web::snapshot::PollScope;
 use wayfinder_web::snapshot::build_snapshot;
 
 /// Every table in one poll lands in the field the tabs read it from.
 #[tokio::test]
 async fn snapshot_reads_every_table_from_a_real_node() {
     let conn = serve_mock_node().await;
-    let snap = build_snapshot(&conn, 0).await.unwrap();
+    let snap = build_snapshot(&conn, 0, PollScope::Administrator)
+        .await
+        .unwrap();
 
     let info = snap.node_info.expect("node info was fetched");
     assert_eq!(info.node_id, vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]);
@@ -69,7 +72,9 @@ async fn snapshot_reads_every_table_from_a_real_node() {
 #[tokio::test]
 async fn snapshot_survives_a_node_that_is_not_a_certificate_authority() {
     let conn = serve_mock_node().await;
-    let snap = build_snapshot(&conn, 0).await.unwrap();
+    let snap = build_snapshot(&conn, 0, PollScope::Administrator)
+        .await
+        .unwrap();
 
     assert!(snap.pending_csrs.is_none());
     assert!(
@@ -84,7 +89,9 @@ async fn snapshot_survives_a_node_that_is_not_a_certificate_authority() {
 async fn snapshot_log_cursor_advances_across_polls() {
     let conn = serve_mock_node().await;
 
-    let first = build_snapshot(&conn, 0).await.unwrap();
+    let first = build_snapshot(&conn, 0, PollScope::Administrator)
+        .await
+        .unwrap();
     let cursor = first.logs.next_seq;
 
     wayfinder_log::record(
@@ -93,7 +100,9 @@ async fn snapshot_log_cursor_advances_across_polls() {
         "drop: no route",
     );
 
-    let second = build_snapshot(&conn, cursor).await.unwrap();
+    let second = build_snapshot(&conn, cursor, PollScope::Administrator)
+        .await
+        .unwrap();
     assert!(
         second
             .logs
@@ -116,9 +125,13 @@ async fn snapshot_reuses_the_connection_across_polls() {
     let conn = serve_mock_node().await;
 
     assert!(!conn.is_connected(), "no connection before the first poll");
-    build_snapshot(&conn, 0).await.unwrap();
+    build_snapshot(&conn, 0, PollScope::Administrator)
+        .await
+        .unwrap();
     assert!(conn.is_connected(), "the first poll left a live connection");
-    build_snapshot(&conn, 0).await.unwrap();
+    build_snapshot(&conn, 0, PollScope::Administrator)
+        .await
+        .unwrap();
     assert!(conn.is_connected(), "and the second reused it");
 }
 
@@ -133,7 +146,7 @@ async fn snapshot_reuses_the_connection_across_polls() {
 async fn a_security_setting_changed_through_the_api_shows_up_on_the_next_poll() {
     let conn = serve_mock_provider_node().await;
 
-    let before = build_snapshot(&conn, 0)
+    let before = build_snapshot(&conn, 0, PollScope::Administrator)
         .await
         .unwrap()
         .security
@@ -147,7 +160,7 @@ async fn a_security_setting_changed_through_the_api_shows_up_on_the_next_poll() 
         .await
         .expect("the node accepted the change");
 
-    let after = build_snapshot(&conn, 0)
+    let after = build_snapshot(&conn, 0, PollScope::Administrator)
         .await
         .unwrap()
         .security
@@ -178,7 +191,7 @@ async fn clearing_the_enrollment_token_is_reported_back() {
     .await
     .expect("the node accepted the change");
 
-    let policy = build_snapshot(&conn, 0)
+    let policy = build_snapshot(&conn, 0, PollScope::Administrator)
         .await
         .unwrap()
         .security

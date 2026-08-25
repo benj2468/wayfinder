@@ -37,6 +37,7 @@ use crate::api::deny_csr;
 use crate::api::list_users;
 use crate::api::remove_user;
 use crate::api::reveal_enrollment_token;
+use crate::api::revoke_vpn_peer;
 use crate::api::set_enrollment_policy;
 use crate::components::dashboard::use_dashboard;
 use crate::components::widgets::ConfirmDialog;
@@ -65,6 +66,8 @@ enum ProviderAction {
     Deny(Vec<u8>),
     /// Clear the shared enrollment token, opening enrollment.
     ClearEnrollmentToken,
+    /// Remove this MAC's VPN registration, leaving its mesh membership alone.
+    RevokeVpnPeer(Vec<u8>),
 }
 
 /// Render the Provider tab.
@@ -81,6 +84,11 @@ pub fn Provider() -> impl IntoView {
         dash.snapshot
             .with(|s| s.as_ref().and_then(|s| s.pending_csrs.clone()))
             .map(|p| p.pending)
+    };
+    let vpn_peers = move || {
+        dash.snapshot
+            .with(|s| s.as_ref().and_then(|s| s.vpn_peers.clone()))
+            .map(|p| p.peers)
     };
 
     // Memoised for the reason the Security tab's panels are: the snapshot is
@@ -100,6 +108,7 @@ pub fn Provider() -> impl IntoView {
             ProviderAction::Approve(_) => "Approving",
             ProviderAction::Deny(_) => "Denying",
             ProviderAction::ClearEnrollmentToken => "Removing the token",
+            ProviderAction::RevokeVpnPeer(_) => "Removing the VPN registration",
         };
         leptos::task::spawn_local(async move {
             let result = match kind {
@@ -108,6 +117,7 @@ pub fn Provider() -> impl IntoView {
                 ProviderAction::ClearEnrollmentToken => {
                     set_enrollment_policy(None, None, TokenChange::Clear).await
                 }
+                ProviderAction::RevokeVpnPeer(mac) => revoke_vpn_peer(mac).await,
             };
             if let Err(e) = result {
                 dash.error.set(Some(format!("{verb} failed: {e}")));
@@ -247,6 +257,102 @@ pub fn Provider() -> impl IntoView {
                     })
             }}
 
+            {move || {
+                // Absent unless this provider actually coordinates a tunnel.
+                // `None` covers both "not a provider" and "no VPN configured",
+                // which is every deployment that reaches the mesh over radio
+                // alone — the panel simply is not there, which is right for
+                // both. A configured-but-unreachable coordination server does
+                // not land here: it fails the poll, because an empty list and
+                // a broken control plane must not look the same.
+                if !dash.admin.get() {
+                    return None;
+                }
+                vpn_peers()
+                    .map(|peers| {
+                        let count = peers.len();
+                        view! {
+                            <Panel
+                                title="VPN peers"
+                                subtitle=Signal::derive(move || format!("{count} registered"))
+                            >
+                                {if peers.is_empty() {
+                                    view! {
+                                        <Empty message="No nodes have joined the tunnel yet. A node joins when it enrolls, if its host runs the tunnel daemon." />
+                                    }
+                                        .into_any()
+                                } else {
+                                    peers
+                                        .clone()
+                                        .into_iter()
+                                        .map(|peer| {
+                                            let revoke_mac = peer.node_mac.clone();
+                                            // A peer whose hostname is not one wayfinder
+                                            // registered has no MAC to show — and is exactly
+                                            // the peer an operator most needs to see, since
+                                            // it has tunnel reachability without a mesh
+                                            // identity behind it. Named by its raw hostname
+                                            // rather than hidden.
+                                            let known = !peer.node_mac.is_empty();
+                                            let label = if known {
+                                                format::id(&peer.node_mac)
+                                            } else {
+                                                peer.raw_hostname.clone()
+                                            };
+                                            let confirm_label = label.clone();
+                                            view! {
+                                                <div class="wf-csr">
+                                                    <div class="wf-csr-id">
+                                                        <span class="wf-mono">{label}</span>
+                                                        <span class="wf-csr-key wf-mono">
+                                                            {peer.tailscale_ip.clone()}
+                                                        </span>
+                                                        <span class="wf-csr-when">
+                                                            {if peer.online {
+                                                                "online".to_string()
+                                                            } else if peer.last_seen_unix == 0 {
+                                                                "never connected".to_string()
+                                                            } else {
+                                                                format!(
+                                                                    "last seen {}",
+                                                                    format::timestamp(peer.last_seen_unix as u64),
+                                                                )
+                                                            }}
+                                                        </span>
+                                                    </div>
+                                                    <div class="wf-csr-actions">
+                                                        <button
+                                                            class="wf-button wf-button-danger"
+                                                            on:click=move |_| {
+                                                                pending
+                                                                    .set(
+                                                                        Some(Pending {
+                                                                            prompt: format!(
+                                                                                "Remove {confirm_label}'s VPN registration? It loses tunnel \
+                                                                                 reachability but keeps its mesh membership — revoke the node \
+                                                                                 itself to remove both.",
+                                                                            ),
+                                                                            verb: "Remove",
+                                                                            destructive: true,
+                                                                            kind: ProviderAction::RevokeVpnPeer(revoke_mac.clone()),
+                                                                        }),
+                                                                    )
+                                                            }
+                                                            disabled=!known
+                                                        >
+                                                            "Remove"
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            }
+                                        })
+                                        .collect_view()
+                                        .into_any()
+                                }}
+                            </Panel>
+                        }
+                    })
+            }}
 
                 }
                     .into_any()

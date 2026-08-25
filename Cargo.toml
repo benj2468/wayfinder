@@ -144,6 +144,18 @@ libc = "0.2.186"
 # carry the mesh Ed25519 identity in the handshake — no X.509.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
+# The HTTP client the CA's VPN coordination talks to Headscale's REST API with.
+# `rustls-no-provider` rather than `rustls`: it reuses the `ring` provider this
+# workspace already installs process-wide (see wayfinder-server's tls.rs) rather
+# than pulling a second crypto backend in beside it, which would make which
+# provider serves a given handshake depend on link order.
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls-no-provider",
+    "json",
+    "http2",
+    "charset",
+    "query",
+] }
 # The web dashboard (`bins/wayfinder-web`). Leptos is pinned as a family — the
 # four crates share a version and `cargo-leptos` 0.3.x expects the 0.8 line.
 leptos = "0.8"

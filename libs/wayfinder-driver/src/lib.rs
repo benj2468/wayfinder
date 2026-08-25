@@ -89,3 +89,4 @@ pub use wayfinder_server::bind_tcp_server;
 pub use wayfinder_server::run_channel_server;
 #[cfg(feature = "tokio")]
 pub use wayfinder_server::serve_tls_server;
+pub use wayfinder_server::serve_tls_server_with_vpn;

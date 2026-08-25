@@ -3423,6 +3423,70 @@ mod ogm_auth_integration {
         b.originator_count()
     }
 
+    /// Feed `ogm` (from `src`) into `b` on interface `iface`, reporting how
+    /// many originators it learned.  The link index is the only thing that
+    /// varies from [`feed`].
+    fn feed_on(b: &mut CentralRouter, src: Mac, ogm: &[u8], iface: usize) -> usize {
+        let bytes = link_frame(src, ogm);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 1500];
+        b.handle_frame(Duration::ZERO, iface, frame, &mut tx);
+        b.originator_count()
+    }
+
+    /// **Authentication is a property of the frame, never of the link it
+    /// arrived on.**
+    ///
+    /// This is the invariant §6 of
+    /// `docs/design/implemented/08-internet-links-headscale-vpn.md` argues for
+    /// and that nothing else enforces. A VPN-backed mesh link is an ordinary
+    /// `LinkTransport::Udp` whose addresses happen to sit in the tunnel's
+    /// range, so it is tempting to reason that WireGuard's transport integrity
+    /// makes the mesh's own signing redundant there and to skip it per link.
+    /// It is not redundant, for two reasons that outlive any particular link:
+    ///
+    /// * BATMAN-adv is multi-hop. A signed OGM is forwarded and re-verified by
+    ///   nodes many hops past the originator, over links (LoRa, BLE, 802.15.4)
+    ///   the tunnel never covered. A tunnel secures exactly the one hop it
+    ///   terminates, not the path a frame travels afterward.
+    /// * Tunnel reachability is not current `MembershipCert` validity. A
+    ///   stolen preauth key, or a node whose certificate was revoked while its
+    ///   VPN registration lagged, would get fully trusted mesh access on that
+    ///   link — and revocation would stop being enforced there at all.
+    ///
+    /// So the assertion is deliberately about *sameness across links* rather
+    /// than about any one link: whatever verdict a frame earns on interface 0
+    /// it must earn on every other interface, because the router has no notion
+    /// of a trusted link and must not grow one.
+    #[test]
+    fn authentication_never_varies_by_link() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+
+        let mut signer = router_with_auth(&authority, mac(1), 2);
+        let signed = poll_ogm_bytes(&mut signer);
+        let mut plain = CentralRouter::new(mac(1));
+        let unsigned = poll_ogm_bytes(&mut plain);
+
+        // Every interface the router has, not just a sample: a per-link escape
+        // hatch would most plausibly be added for one specific index.
+        for iface in 0..MAX_INTERFACES {
+            let mut node = router_with_auth(&authority, mac(2), 3);
+            assert_eq!(
+                feed_on(&mut node, mac(1), &signed, iface),
+                1,
+                "a signed OGM must be accepted on interface {iface}"
+            );
+
+            let mut node = router_with_auth(&authority, mac(2), 3);
+            assert_eq!(
+                feed_on(&mut node, mac(1), &unsigned, iface),
+                0,
+                "an unsigned OGM must be dropped on interface {iface}; no link is \
+                 trusted enough to skip verification, however it is carried"
+            );
+        }
+    }
+
     /// A signed OGM is accepted by a peer on the same mesh.
     #[test]
     fn signed_ogm_accepted_by_same_mesh() {

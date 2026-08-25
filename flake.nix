@@ -404,6 +404,11 @@
             # links, provider mode, unprivileged. Covers what
             # `nix/machines/wayfinder-ca` deploys, without a cloud account.
             wayfinder-ca-provider = nixpkgs.callPackage ./nix/tests/ca-provider.nix { };
+            # The VPN data plane: real mesh traffic over a real Tailscale
+            # tunnel between two nodes with no other path to each other. See
+            # docs/design/implemented/08-internet-links-headscale-vpn.md's own
+            # stated gap.
+            wayfinder-vpn-data-plane = nixpkgs.callPackage ./nix/tests/vpn-data-plane.nix { };
           };
 
           treefmt = {

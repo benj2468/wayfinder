@@ -1446,6 +1446,7 @@ mod tests {
             allow_unbounded_cert_ttl: false,
             pending_ttl_secs: 3600,
             state_path: None,
+            headscale: None,
         }
     }
 
@@ -1749,6 +1750,7 @@ mod tests {
             allow_unbounded_cert_ttl: false,
             pending_ttl_secs: 10,
             state_path: None,
+            headscale: None,
         };
         let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
         ca.set_now_unix(100);
@@ -1795,6 +1797,7 @@ mod tests {
             allow_unbounded_cert_ttl: false,
             pending_ttl_secs: 10,
             state_path: None,
+            headscale: None,
         };
         let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
         ca.set_now_unix(100);
@@ -1841,6 +1844,7 @@ mod tests {
             allow_unbounded_cert_ttl: false,
             pending_ttl_secs: 10,
             state_path: None,
+            headscale: None,
         };
         let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
         ca.set_now_unix(100);
@@ -1878,6 +1882,7 @@ mod tests {
             allow_unbounded_cert_ttl: false,
             pending_ttl_secs: 10,
             state_path: None,
+            headscale: None,
         };
         let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
         ca.set_now_unix(100);
@@ -2058,6 +2063,7 @@ mod tests {
             allow_unbounded_cert_ttl: false,
             pending_ttl_secs: 3600,
             state_path: Some(state_path.to_string_lossy().into_owned()),
+            headscale: None,
         }
     }
 

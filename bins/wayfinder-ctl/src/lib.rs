@@ -31,6 +31,9 @@ use wayfinder_client::Client;
 // Re-exported so integration tests (and any embedder) can build the connection
 // endpoint the same way `run` does.
 pub use wayfinder_client::Endpoint;
+
+pub mod vpn;
+pub use vpn::VpnCommand;
 use wayfinder_protos::wayfinder::v1alpha::CsrIssued;
 use wayfinder_protos::wayfinder::v1alpha::LinkFeatures;
 use wayfinder_protos::wayfinder::v1alpha::authenticate_user_response::Outcome as UserOutcome;
@@ -233,7 +236,26 @@ pub enum Command {
         /// Where to write the mesh trust anchor.
         #[arg(long)]
         out_anchor: PathBuf,
+        /// Do not join the VPN, even if the provider offers a tunnel.
+        ///
+        /// Enrollment otherwise asks for a tunnel credential once the
+        /// certificate is in hand and runs `tailscale up` with it. A provider
+        /// with no VPN configured answers "not configured" and enrollment
+        /// finishes normally either way, so this is for a host that reaches the
+        /// mesh some other way rather than for talking to a CA without one.
+        #[arg(long)]
+        no_vpn: bool,
+        /// Print the `tailscale up` command instead of running it.
+        ///
+        /// For a host where the tunnel daemon is managed elsewhere (a NixOS
+        /// module, a container entrypoint). The preauth key is single-use and
+        /// short-lived, so a printed command has minutes to be used, not days.
+        #[arg(long)]
+        print_vpn_command: bool,
     },
+    /// Manage the VPN peers registered with the provider's coordination server.
+    #[command(subcommand)]
+    Vpn(vpn::VpnCommand),
     /// Revoke a node from the mesh (talks to a provider node).
     Revoke {
         /// MAC of the node to revoke.
@@ -554,9 +576,16 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     {
         return follow_logs(&mut client, since, max, cli.output).await;
     }
+    // The endpoint is what `enroll` reconnects through once it holds a
+    // certificate; a serial target has none, and cannot join a VPN anyway (an
+    // embedded node runs no tunnel daemon).
+    let endpoint = match cli.connection.serial {
+        Some(_) => None,
+        None => Some(build_endpoint(&cli)?),
+    };
     println!(
         "{}",
-        dispatch_query(cli.command, &mut client, cli.output).await?
+        dispatch_query(cli.command, &mut client, cli.output, endpoint.as_ref()).await?
     );
     Ok(())
 }
@@ -604,7 +633,7 @@ pub async fn run_query(
 ) -> anyhow::Result<String> {
     let mut client =
         Client::connect_tls(&endpoint.addr, &endpoint.node_key, &endpoint.identity).await?;
-    dispatch_query(command, &mut client, output).await
+    dispatch_query(command, &mut client, output, Some(endpoint)).await
 }
 
 /// Dispatch one query `command` against an already-connected `client`, returning
@@ -615,6 +644,7 @@ async fn dispatch_query(
     command: Command,
     client: &mut Client,
     output: OutputFormat,
+    endpoint: Option<&Endpoint>,
 ) -> anyhow::Result<String> {
     Ok(match command {
         Command::NodeInfo => output::node_info(&client.node_info().await?, output)?,
@@ -736,6 +766,8 @@ async fn dispatch_query(
             out_seed,
             out_cert,
             out_anchor,
+            no_vpn,
+            print_vpn_command,
         } => {
             // Enrollment can be retried against the same `out_seed` path (e.g. a
             // provider that holds requests for operator approval, polled across
@@ -765,11 +797,27 @@ async fn dispatch_query(
                 .with_context(|| format!("writing certificate to {}", out_cert.display()))?;
             std::fs::write(&out_anchor, &issued.trust_anchor)
                 .with_context(|| format!("writing trust anchor to {}", out_anchor.display()))?;
+            // Enrollment is complete and durable at this point. The VPN step
+            // below is additive: it reconnects presenting the certificate just
+            // issued — the only credential that earns the member tier
+            // `GetVpnEnrollment` needs — and anything that goes wrong there is
+            // reported in the summary rather than failing the command, since
+            // failing would discard an enrollment that already succeeded.
+            let vpn_note = match (no_vpn, endpoint) {
+                (true, _) => String::new(),
+                (false, None) => String::new(),
+                (false, Some(endpoint)) => {
+                    join_vpn_as_enrolled_node(endpoint, &seed, &issued.cert, print_vpn_command)
+                        .await
+                        .enrollment_note()
+                }
+            };
             format!(
-                "enrolled {}: wrote seed, certificate, and trust anchor",
+                "enrolled {}: wrote seed, certificate, and trust anchor{vpn_note}",
                 output::format_mac(&mac_bytes)
             )
         }
+        Command::Vpn(cmd) => vpn::run(cmd, client, output).await?,
         Command::Revoke { mac } => {
             let mac_bytes = parse_mac6(&mac)?;
             client
@@ -792,6 +840,35 @@ async fn dispatch_query(
             unreachable!("offline commands are dispatched before a client is opened")
         }
     })
+}
+
+/// Open a second connection to `endpoint` as the freshly-enrolled node and ask
+/// for a tunnel credential.
+///
+/// A *second* connection, not the one enrollment ran over: that one was opened
+/// as a stranger (no certificate), which is the enrollment tier and cannot mint
+/// a tunnel credential — deliberately, since every field of a CSR is
+/// self-asserted. Presenting the issued certificate here is what proves
+/// possession of the key that was certified.
+///
+/// Never fails the caller: it returns the outcome, whatever happened, for the
+/// caller to render into the enrollment summary.
+async fn join_vpn_as_enrolled_node(
+    endpoint: &Endpoint,
+    seed: &[u8; 32],
+    cert: &[u8],
+    print_only: bool,
+) -> vpn::VpnJoinOutcome {
+    let identity = wayfinder_client::Identity {
+        seed: *seed,
+        cert: cert.to_vec(),
+    };
+    match Client::connect_tls(&endpoint.addr, &endpoint.node_key, &identity).await {
+        Ok(mut client) => vpn::join(&mut client, print_only).await,
+        Err(e) => vpn::VpnJoinOutcome::NotConfigured(format!(
+            "reconnecting as the enrolled node failed: {e}"
+        )),
+    }
 }
 
 /// Poll `submit_csr`. A provider configured to require operator approval parks the

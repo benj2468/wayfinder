@@ -53,6 +53,12 @@ let
   derivedRawNetworkAccess = lib.any usesKind rawNetKinds;
 in
 {
+
+  imports = [
+    ./wayfinder-tailscale.nix
+    ./wayfinder-headscale.nix
+  ];
+
   options.services.wayfinder = with lib; {
     enable = mkEnableOption "the wayfinder mesh node service";
 
