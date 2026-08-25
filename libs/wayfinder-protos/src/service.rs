@@ -444,6 +444,10 @@ pub struct NodeSecurityData {
     pub cert_not_after: u64,
     /// Whether we currently hold a revocation for it.
     pub revoked: bool,
+    /// When that revocation stops being enforced (unix seconds) when
+    /// `revoked`, else 0.  The record is dropped at that instant, so it is
+    /// also when the originator leaves this list.
+    pub revocation_not_after: u64,
 }
 
 /// This node's mesh authentication / security posture.  Mirrors the
@@ -1263,6 +1267,7 @@ impl<P: WayfinderDataProvider> WayfinderService<P> {
                             verified: n.verified,
                             cert_not_after: n.cert_not_after,
                             revoked: n.revoked,
+                            revocation_not_after: n.revocation_not_after,
                         })
                         .collect(),
                     require_auth: s.require_auth,

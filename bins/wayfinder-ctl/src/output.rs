@@ -18,6 +18,7 @@ use wayfinder_protos::wayfinder::v1alpha::LogLevel;
 use wayfinder_protos::wayfinder::v1alpha::LogRecords;
 use wayfinder_protos::wayfinder::v1alpha::NodeInfo;
 use wayfinder_protos::wayfinder::v1alpha::NodeMetrics;
+use wayfinder_protos::wayfinder::v1alpha::NodeSecurity;
 use wayfinder_protos::wayfinder::v1alpha::OgmSchedule;
 use wayfinder_protos::wayfinder::v1alpha::ResolveRouteResponse;
 use wayfinder_protos::wayfinder::v1alpha::RoutingTable;
@@ -65,6 +66,44 @@ pub fn format_mac(bytes: &[u8]) -> String {
     } else {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
+}
+
+/// Render a wall-clock instant (unix seconds) as an ISO 8601 UTC stamp:
+/// `2023-11-14T22:13:20Z`.
+///
+/// Human output is read by a person, and unix seconds are not: every expiry
+/// column in this client used to need a `date -d @…` to answer "is that soon?".
+/// JSON keeps the raw number, so a script is not made to parse a date back out
+/// of text.
+///
+/// Zero is `-` rather than 1970. Zero means "not recorded" across this API
+/// (`cert_not_after` on an unverified node, a peer never seen), and a
+/// real-looking date is the worst way to render an absent one.
+///
+/// Hand-rolled rather than pulling `chrono`/`time` in for one conversion,
+/// matching `wayfinder-server`'s `format_rfc3339`. Civil-date arithmetic from
+/// Howard Hinnant's `civil_from_days`, which is exact over the whole range.
+pub fn format_timestamp(unix_secs: u64) -> String {
+    if unix_secs == 0 {
+        return "-".to_string();
+    }
+    let secs_of_day = unix_secs % 86_400;
+    let z = (unix_secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60
+    )
 }
 
 /// Render [`NodeInfo`].
@@ -291,29 +330,41 @@ pub fn security(v: &GetSecurityStatusResponse, fmt: OutputFormat) -> anyhow::Res
             "authentication: enabled\nmesh_id: {:#x}\nnode: {}\nown cert expires: {}\nrevocations: {}",
             v.mesh_id,
             format_mac(&v.node_mac),
-            v.cert_not_after,
+            format_timestamp(v.cert_not_after),
             v.revocation_count,
         );
         if v.nodes.is_empty() {
             out.push_str("\n\nno originators known");
             return out;
         }
-        out.push_str("\n\nNODE               VERIFIED  EXPIRES       STATUS");
+        out.push_str("\n\nNODE               VERIFIED  EXPIRES               STATUS");
         for n in &v.nodes {
             out.push_str(&format!(
-                "\n{:<18} {:<9} {:<13} {}",
+                "\n{:<18} {:<9} {:<21} {}",
                 format_mac(&n.node_id),
                 if n.verified { "yes" } else { "no" },
-                if n.verified {
-                    n.cert_not_after.to_string()
-                } else {
-                    "-".to_string()
-                },
-                if n.revoked { "revoked" } else { "active" },
+                format_timestamp(if n.verified { n.cert_not_after } else { 0 }),
+                revocation_status(n),
             ));
         }
         out
     })
+}
+
+/// The STATUS cell for one originator: `active`, or `revoked` with the instant
+/// the revocation stops being enforced.
+///
+/// The date rides in this cell rather than a column of its own because it is
+/// meaningful on revoked rows only, and it is worth carrying: it is when this
+/// node drops the record — and so when the row stops reading as revoked and
+/// disappears — which is otherwise unanswerable from the outside. A revocation
+/// with no window is spelled plainly rather than dated to 1970.
+fn revocation_status(n: &NodeSecurity) -> String {
+    match (n.revoked, n.revocation_not_after) {
+        (false, _) => "active".to_string(),
+        (true, 0) => "revoked".to_string(),
+        (true, until) => format!("revoked until {}", format_timestamp(until)),
+    }
 }
 
 /// Render the provider's [`ListVpnPeersResponse`] (registered VPN peers).
@@ -327,11 +378,12 @@ pub fn vpn_peers(v: &ListVpnPeersResponse, fmt: OutputFormat) -> anyhow::Result<
         if v.peers.is_empty() {
             return "no VPN peers registered".to_string();
         }
-        let mut out =
-            String::from("NODE               ADDRESS          STATE    LAST_SEEN    KEY_EXPIRY");
+        let mut out = String::from(
+            "NODE               ADDRESS          STATE    LAST_SEEN             KEY_EXPIRY",
+        );
         for p in &v.peers {
             out.push_str(&format!(
-                "\n{:<18} {:<16} {:<8} {:>10} {:>12}",
+                "\n{:<18} {:<16} {:<8} {:<21} {}",
                 if p.node_mac.is_empty() {
                     format!("({})", p.raw_hostname)
                 } else {
@@ -339,16 +391,15 @@ pub fn vpn_peers(v: &ListVpnPeersResponse, fmt: OutputFormat) -> anyhow::Result<
                 },
                 p.tailscale_ip,
                 if p.online { "online" } else { "offline" },
-                if p.last_seen_unix == 0 {
+                // Signed on the wire, and Headscale reports an unknown
+                // instant as an epoch-or-earlier value rather than exactly
+                // zero, so anything not in the future of 1970 is "no date".
+                if p.last_seen_unix <= 0 {
                     "never".to_string()
                 } else {
-                    p.last_seen_unix.to_string()
+                    format_timestamp(p.last_seen_unix as u64)
                 },
-                if p.key_expiry_unix == 0 {
-                    "-".to_string()
-                } else {
-                    p.key_expiry_unix.to_string()
-                },
+                format_timestamp(p.key_expiry_unix.max(0) as u64),
             ));
         }
         out
@@ -361,15 +412,19 @@ pub fn list_certs(v: &ListCertsResponse, fmt: OutputFormat) -> anyhow::Result<St
         if v.certs.is_empty() {
             return "no certificates issued".to_string();
         }
-        let mut out = String::from(
-            "NODE_MAC           NOT_BEFORE   NOT_AFTER    STATUS   KIND           ED25519",
+        // Header built through the same widths as the rows below, rather than
+        // hand-spaced: an ISO stamp is wide enough that the two drifted apart
+        // the moment the columns changed.
+        let mut out = format!(
+            "{:<18} {:<21} {:<21} {:<7}  {:<13}  {}",
+            "NODE_MAC", "NOT_BEFORE", "NOT_AFTER", "STATUS", "KIND", "ED25519",
         );
         for c in &v.certs {
             out.push_str(&format!(
-                "\n{:<18} {:>10} {:>10}   {:<7}  {:<13}  {}",
+                "\n{:<18} {:<21} {:<21} {:<7}  {:<13}  {}",
                 format_mac(&c.node_mac),
-                c.not_before,
-                c.not_after,
+                format_timestamp(c.not_before),
+                format_timestamp(c.not_after),
                 if c.revoked { "revoked" } else { "active" },
                 cert_kind(c),
                 fingerprint(&c.ed_pubkey),
@@ -404,12 +459,12 @@ pub fn list_pending_csrs(v: &ListPendingCsrsResponse, fmt: OutputFormat) -> anyh
         if v.pending.is_empty() {
             return "no pending CSRs".to_string();
         }
-        let mut out = String::from("NODE_MAC           REQUESTED_AT   ED25519    X25519");
+        let mut out = String::from("NODE_MAC           REQUESTED_AT          ED25519    X25519");
         for c in &v.pending {
             out.push_str(&format!(
-                "\n{:<18} {:>12}   {:<9}  {}",
+                "\n{:<18} {:<21} {:<9}  {}",
                 format_mac(&c.node_mac),
-                c.requested_at,
+                format_timestamp(c.requested_at),
                 fingerprint(&c.ed_pubkey),
                 fingerprint(&c.x_pubkey),
             ));
@@ -496,4 +551,176 @@ pub fn logs(v: &LogRecords, fmt: OutputFormat) -> anyhow::Result<String> {
 /// First 8 hex chars of a public key, for a compact fingerprint column.
 fn fingerprint(key: &[u8]) -> String {
     key.iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wayfinder_protos::wayfinder::v1alpha::PendingCsr;
+    use wayfinder_protos::wayfinder::v1alpha::VpnPeerStatus;
+
+    /// 2023-11-14 22:13:20 UTC, the instant every date test below is anchored
+    /// to.
+    const T: u64 = 1_700_000_000;
+    const T_ISO: &str = "2023-11-14T22:13:20Z";
+
+    /// A wall-clock instant renders as an ISO 8601 UTC stamp, not the unix
+    /// seconds an operator would otherwise have to pipe through `date -d @`.
+    #[test]
+    fn timestamp_renders_iso_8601_utc() {
+        assert_eq!(format_timestamp(T), T_ISO);
+    }
+
+    /// Zero means "not recorded" across this API, so it must not render as a
+    /// real-looking 1970 date in an expiry column.
+    #[test]
+    fn timestamp_of_zero_reads_as_unset() {
+        assert_eq!(format_timestamp(0), "-");
+    }
+
+    /// The case a hand-rolled civil calendar gets wrong.
+    #[test]
+    fn timestamp_handles_a_leap_day() {
+        assert_eq!(format_timestamp(1_709_164_800), "2024-02-29T00:00:00Z");
+    }
+
+    /// The security view dates its own certificate and each verified
+    /// originator's in ISO, and carries no bare unix seconds.
+    #[test]
+    fn security_renders_iso_dates() {
+        let v = GetSecurityStatusResponse {
+            auth_enabled: true,
+            mesh_id: 0xABCD,
+            node_mac: vec![0, 0, 0, 0, 0, 1],
+            cert_not_after: T,
+            revocation_count: 0,
+            nodes: vec![NodeSecurity {
+                node_id: vec![0, 0, 0, 0, 0, 2],
+                verified: true,
+                cert_not_after: T,
+                revoked: false,
+                revocation_not_after: 0,
+            }],
+            ..Default::default()
+        };
+        let out = security(&v, OutputFormat::Human).unwrap();
+        assert!(out.contains(&format!("own cert expires: {T_ISO}")), "{out}");
+        assert!(out.contains(T_ISO), "{out}");
+        assert!(
+            !out.contains(&T.to_string()),
+            "raw unix seconds left in: {out}"
+        );
+    }
+
+    /// A revoked originator shows *until when* the revocation is enforced —
+    /// the answer to "how long will this row keep saying revoked?", which was
+    /// otherwise not on the wire at all.
+    #[test]
+    fn security_dates_a_revocation_enforcement_window() {
+        let v = GetSecurityStatusResponse {
+            auth_enabled: true,
+            mesh_id: 0xABCD,
+            node_mac: vec![0, 0, 0, 0, 0, 1],
+            cert_not_after: 0,
+            revocation_count: 1,
+            nodes: vec![NodeSecurity {
+                node_id: vec![0, 0, 0, 0, 0, 3],
+                // A revocation evicts the neighbor entry that carries the
+                // cert, so a revoked row is never also a verified one.
+                verified: false,
+                cert_not_after: 0,
+                revoked: true,
+                revocation_not_after: T,
+            }],
+            ..Default::default()
+        };
+        let out = security(&v, OutputFormat::Human).unwrap();
+        assert!(out.contains("revoked"), "{out}");
+        assert!(out.contains(T_ISO), "{out}");
+    }
+
+    /// The issued-certificate list dates both ends of the validity window.
+    #[test]
+    fn list_certs_renders_iso_dates() {
+        let v = ListCertsResponse {
+            certs: vec![IssuedCert {
+                node_mac: vec![0, 0, 0, 0, 0, 2],
+                ed_pubkey: vec![0xab; 32],
+                not_before: T,
+                not_after: T + 86_400,
+                revoked: false,
+                user: false,
+                admin: false,
+                viewer: false,
+            }],
+        };
+        let out = list_certs(&v, OutputFormat::Human).unwrap();
+        assert!(out.contains(T_ISO), "{out}");
+        assert!(out.contains("2023-11-15T22:13:20Z"), "{out}");
+        assert!(
+            !out.contains(&T.to_string()),
+            "raw unix seconds left in: {out}"
+        );
+    }
+
+    /// A pending CSR dates when it was submitted.
+    #[test]
+    fn list_pending_csrs_renders_an_iso_date() {
+        let v = ListPendingCsrsResponse {
+            pending: vec![PendingCsr {
+                node_mac: vec![0, 0, 0, 0, 0, 2],
+                ed_pubkey: vec![0xab; 32],
+                x_pubkey: vec![0xcd; 32],
+                requested_at: T,
+            }],
+        };
+        let out = list_pending_csrs(&v, OutputFormat::Human).unwrap();
+        assert!(out.contains(T_ISO), "{out}");
+    }
+
+    /// VPN peers date last-seen and key expiry, keeping the "never"/"-"
+    /// wording for a peer that has neither.
+    #[test]
+    fn vpn_peers_renders_iso_dates() {
+        let v = ListVpnPeersResponse {
+            peers: vec![
+                VpnPeerStatus {
+                    node_mac: vec![0, 0, 0, 0, 0, 2],
+                    raw_hostname: "node-2".to_string(),
+                    tailscale_ip: "100.64.0.2".to_string(),
+                    online: true,
+                    last_seen_unix: T as i64,
+                    key_expiry_unix: T as i64,
+                },
+                VpnPeerStatus {
+                    node_mac: vec![0, 0, 0, 0, 0, 3],
+                    raw_hostname: "node-3".to_string(),
+                    tailscale_ip: "100.64.0.3".to_string(),
+                    online: false,
+                    last_seen_unix: 0,
+                    key_expiry_unix: 0,
+                },
+            ],
+        };
+        let out = vpn_peers(&v, OutputFormat::Human).unwrap();
+        assert!(out.contains(T_ISO), "{out}");
+        assert!(out.contains("never"), "{out}");
+        assert!(
+            !out.contains(&T.to_string()),
+            "raw unix seconds left in: {out}"
+        );
+    }
+
+    /// JSON is the machine-readable half and must keep the raw unix seconds:
+    /// re-spelling them as text would force a script to parse a date back out.
+    #[test]
+    fn json_keeps_raw_unix_seconds() {
+        let v = GetSecurityStatusResponse {
+            auth_enabled: true,
+            cert_not_after: T,
+            ..Default::default()
+        };
+        let out = security(&v, OutputFormat::Json).unwrap();
+        assert!(out.contains(&T.to_string()), "{out}");
+    }
 }

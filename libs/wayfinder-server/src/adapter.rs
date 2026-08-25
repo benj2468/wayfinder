@@ -484,11 +484,16 @@ impl<
             .into_iter()
             .map(|mac| {
                 let verified = auth.neighbors().iter().find(|n| n.cert.mac == mac);
+                // One lookup answers both halves: holding a record *is* being
+                // revoked, and the record's `not_after` is the only date the
+                // row has once the cached cert has been evicted.
+                let revocation_not_after = auth.revocation_not_after(mac);
                 NodeSecurityData {
                     node_id: mac.as_bytes().to_vec(),
                     verified: verified.is_some(),
                     cert_not_after: verified.map(|n| n.cert.not_after).unwrap_or(0),
-                    revoked: auth.revoked_macs().any(|m| m == mac),
+                    revoked: revocation_not_after.is_some(),
+                    revocation_not_after: revocation_not_after.unwrap_or(0),
                 }
             })
             .collect();
@@ -1704,6 +1709,10 @@ mod tests {
         assert!(row.verified);
         assert_eq!(row.cert_not_after, 1100);
         assert!(!row.revoked);
+        assert_eq!(
+            row.revocation_not_after, 0,
+            "a node we hold no revocation for has no enforcement window"
+        );
 
         // Revoke the peer through the provider path (signs + floods into our auth).
         {
@@ -1721,6 +1730,13 @@ mod tests {
         assert!(
             row.revoked,
             "revoked node stays visible in the security view"
+        );
+        // The record the CA signs runs to `now + cert_ttl`, so this is also
+        // when the row stops saying "revoked" and disappears: the one number
+        // that answers "how long will I keep seeing this?".
+        assert_eq!(
+            row.revocation_not_after, 1100,
+            "the row carries when the revocation stops being enforced"
         );
     }
 

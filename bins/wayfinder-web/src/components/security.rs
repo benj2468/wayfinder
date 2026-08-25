@@ -684,6 +684,7 @@ mod tests {
             verified: true,
             cert_not_after: 1_800_000_000,
             revoked: false,
+            revocation_not_after: 0,
         });
         after.revocation_count = before.revocation_count + 1;
         after.cert_not_after = 1_900_000_000;
