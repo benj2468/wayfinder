@@ -134,6 +134,9 @@ pub struct Driver<Local: FrameIo> {
     /// time) via the `now` it already controls.  Defaults to the wall clock at
     /// construction; override with [`set_epoch_unix`](Self::set_epoch_unix).
     epoch_unix: Duration,
+    /// Publishing half of the certificate-validity clock, for an authority that
+    /// does not share this loop.  See [`Driver::auth_clock`].
+    auth_clock_tx: AuthClockTx,
     /// Receive scratchpad for frames read from the host device.
     rx_buffer: [u8; MAX_LINK_FRAME_LEN],
     /// Transmit scratchpad the router builds outgoing frames into.
@@ -172,6 +175,9 @@ impl<Local: FrameIo> Driver<Local> {
         names: Vec<String>,
         query_rx: QueryRx,
     ) -> Self {
+        let epoch_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO);
         let mut router = CentralRouter::new(mac);
         // Install each interface's adaptive OGM schedule and participation
         // features up front so the periodic loop and the egress gates have a
@@ -216,9 +222,8 @@ impl<Local: FrameIo> Driver<Local> {
             mac,
             snooper: McastSnooper::new(),
             start: Instant::now(),
-            epoch_unix: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or(Duration::ZERO),
+            epoch_unix,
+            auth_clock_tx: new_auth_clock(epoch_unix).0,
             rx_buffer: [0u8; MAX_LINK_FRAME_LEN],
             tx_buffer: [0u8; MAX_LINK_FRAME_LEN],
             provider: None,
@@ -270,6 +275,19 @@ impl<Local: FrameIo> Driver<Local> {
     /// exercise expiry deterministically, faster than real time.
     pub fn set_epoch_unix(&mut self, epoch_unix: Duration) {
         self.epoch_unix = epoch_unix;
+        // Re-seed, or a subscriber that reads before the next loop iteration
+        // sees the wall-clock seed this driver was built with rather than the
+        // virtual epoch a test just set.
+        publish_auth_clock(&self.auth_clock_tx, epoch_unix, self.start.elapsed());
+    }
+
+    /// Subscribe to this driver's certificate-validity clock.
+    ///
+    /// The instant the router verifies certificates against, republished on
+    /// every loop iteration. An authority that does not share this loop reads
+    /// its issuance clock from here, so the two cannot drift apart.
+    pub fn auth_clock(&self) -> AuthClockRx {
+        self.auth_clock_tx.subscribe()
     }
 
     /// Advance the auth state's certificate-validity clock to `epoch_unix +
@@ -278,6 +296,9 @@ impl<Local: FrameIo> Driver<Local> {
     fn refresh_auth_clock(&mut self, now: Duration) {
         let epoch = self.epoch_unix;
         let unix = epoch.saturating_add(now);
+        // Publish to whatever holds the other half — an authority task that no
+        // longer shares this loop reads its issuance clock from here.
+        publish_auth_clock(&self.auth_clock_tx, epoch, now);
         if let Some(auth) = self.router.auth_mut() {
             auth.set_time(unix.as_secs());
         }
@@ -375,6 +396,7 @@ impl<Local: FrameIo> Driver<Local> {
             settings,
             identity_seed,
             auth_snapshot_rx,
+            auth_clock_tx: _,
         } = self;
         let mac = *mac;
 
@@ -680,6 +702,37 @@ async fn recv_auth_snapshot(
 /// TLS listener, and nothing configures a TLS listener without an identity
 /// seed), so reaching it still warns: it silently disables the bootstrap grant
 /// for this node.
+/// The certificate-validity clock the router loop publishes, as Unix seconds.
+///
+/// A `watch` rather than a request: the authority that reads it may be
+/// mid-Argon2id when the loop wants to publish, and the loop must never wait on
+/// it. See `docs/design/13-certificate-authority-off-the-router-loop.md` §3.3.
+pub type AuthClockTx = tokio::sync::watch::Sender<u64>;
+
+/// The receiving half of [`AuthClockTx`].
+pub type AuthClockRx = tokio::sync::watch::Receiver<u64>;
+
+/// Open a certificate-validity clock channel seeded from `epoch_unix`.
+///
+/// Seeded with a real time, never zero. A `CertAuthority` reads this before
+/// issuing, and treats `now_unix == 0` as fail-closed — so a channel that
+/// started at zero would give a reader that got there before the router loop's
+/// first iteration an authority that refuses everything, silently.
+fn new_auth_clock(epoch_unix: Duration) -> (AuthClockTx, AuthClockRx) {
+    tokio::sync::watch::channel(epoch_unix.as_secs())
+}
+
+/// Publish `epoch_unix + now` as the certificate-validity clock, returning what
+/// was published.
+///
+/// Uses `send_replace`, which cannot fail: an authority task that has already
+/// shut down must not make the router loop's clock tick an error.
+fn publish_auth_clock(tx: &AuthClockTx, epoch_unix: Duration, now: Duration) -> u64 {
+    let unix = epoch_unix.saturating_add(now).as_secs();
+    tx.send_replace(unix);
+    unix
+}
+
 fn build_auth_snapshot(router: &CentralRouter, identity_seed: Option<[u8; 32]>) -> AuthSnapshot {
     let own_key = identity_seed.map(|seed| Keypair::from_seed(&seed).ed_pubkey());
     if own_key.is_none() {
@@ -866,6 +919,66 @@ mod tests {
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])
+    }
+
+    /// The published certificate-validity clock is `epoch_unix + now`, in whole
+    /// seconds — the same instant the router verifies certificates against, so
+    /// an authority issuing from it cannot drift from the router checking it.
+    #[test]
+    fn publish_auth_clock_reports_epoch_plus_elapsed() {
+        let (tx, rx) = tokio::sync::watch::channel(0);
+
+        let published = publish_auth_clock(
+            &tx,
+            Duration::from_secs(1_700_000_000),
+            Duration::from_secs(42),
+        );
+
+        assert_eq!(published, 1_700_000_042);
+        assert_eq!(*rx.borrow(), 1_700_000_042);
+    }
+
+    /// The clock channel is seeded from `epoch_unix` at construction rather
+    /// than from zero.
+    ///
+    /// This is the whole point of the seam. A `CertAuthority` whose `now_unix`
+    /// is 0 fails closed on `submit_csr`, `authenticate_user` and `revoke` — so
+    /// an authority that read this channel before the driver's first loop
+    /// iteration would refuse every request, and would do it silently while
+    /// every router-side test stayed green. Seeded, there is no such window.
+    #[test]
+    fn auth_clock_channel_is_seeded_with_a_usable_time() {
+        let epoch = Duration::from_secs(1_700_000_000);
+
+        let (_tx, rx) = new_auth_clock(epoch);
+
+        assert_eq!(
+            *rx.borrow(),
+            1_700_000_000,
+            "an authority reading this before the first publish must still see a real time"
+        );
+        assert_ne!(
+            *rx.borrow(),
+            0,
+            "zero is the fail-closed value, never a seed"
+        );
+    }
+
+    /// A publish with no subscribers left is not an error: the authority task
+    /// may have shut down first, and that must not take the router loop with
+    /// it.
+    #[test]
+    fn publish_auth_clock_survives_every_receiver_being_dropped() {
+        let (tx, rx) = new_auth_clock(Duration::from_secs(1_700_000_000));
+        drop(rx);
+
+        let published = publish_auth_clock(
+            &tx,
+            Duration::from_secs(1_700_000_000),
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(published, 1_700_000_001);
     }
 
     /// `own_key` is derived from whatever `identity_seed` this call was given
