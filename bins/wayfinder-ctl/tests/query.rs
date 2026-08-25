@@ -178,12 +178,14 @@ impl WayfinderDataProvider for Mock {
                     verified: true,
                     cert_not_after: 1100,
                     revoked: false,
+                    revocation_not_after: 0,
                 },
                 NodeSecurityData {
                     node_id: vec![0, 0, 0, 0, 0, 3],
                     verified: false,
                     cert_not_after: 0,
                     revoked: true,
+                    revocation_not_after: 2100,
                 },
             ],
             ..Default::default()

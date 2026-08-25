@@ -925,6 +925,7 @@ mod tests {
                 verified: true,
                 cert_not_after: 1100,
                 revoked: false,
+                revocation_not_after: 0,
             }],
             ..Default::default()
         });

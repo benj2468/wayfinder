@@ -94,6 +94,14 @@ message NodeSecurity {
   // Whether this node currently holds a revocation for the originator (its
   // frames are dropped mesh-wide).
   bool revoked = 4;
+
+  // When the revocation stops being enforced (unix seconds), when `revoked`;
+  // zero otherwise.  This node drops the record at that instant and the
+  // originator disappears from this list, so it is the answer to "how long
+  // will this keep reading as revoked?".  Reported because it is nowhere else:
+  // a revocation evicts the cached certificate the row would otherwise be
+  // dated by, leaving `cert_not_after` zero.
+  uint64 revocation_not_after = 5;
 }
 
 // Answer to a GetSecurityStatusRequest: the mesh-level crypto header plus a

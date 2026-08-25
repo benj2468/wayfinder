@@ -608,6 +608,22 @@ impl<
         self.revocations.iter().map(|r| Mac(r.record.node_mac))
     }
 
+    /// When the revocation this node holds for `mac` stops being enforced
+    /// (unix seconds), or `None` if it holds none.
+    ///
+    /// The companion to [`revoked_macs`](Self::revoked_macs), and the only
+    /// date a revoked node has: ingesting a revocation evicts the cached
+    /// neighbor entry that carries the certificate, so the cert expiry a
+    /// security view would otherwise show is gone. Past this instant
+    /// [`set_time`](Self::set_time) drops the record, and the node stops being
+    /// reported as revoked at all.
+    pub fn revocation_not_after(&self, mac: Mac) -> Option<u64> {
+        self.revocations
+            .iter()
+            .find(|r| r.record.node_mac == mac.0)
+            .map(|r| r.record.not_after.get())
+    }
+
     /// This node's own trust anchor (for the security view / observability).
     pub fn anchor(&self) -> &TrustAnchor {
         &self.anchor
@@ -2170,6 +2186,31 @@ mod tests {
         // Advance past not_after: the record is pruned on the clock update.
         b.set_time(1001);
         assert_eq!(b.revoked_macs().count(), 0);
+    }
+
+    /// The set reports *when* a held revocation stops being enforced, not only
+    /// that one is held. That instant is what tells an operator how long a node
+    /// will keep reading as revoked, and it is otherwise nowhere: the
+    /// revocation evicts the neighbor entry that carries the cert expiry, so a
+    /// revoked row has no other date on it.
+    #[test]
+    fn revocation_not_after_reports_the_enforcement_window() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1_000_000); // now_unix = 100
+        assert_eq!(b.revocation_not_after(mac(2)), None, "none held yet");
+
+        let record = authority.revoke(mac(2), 0, 1000);
+        assert!(b.ingest_revocation(&record));
+        assert_eq!(b.revocation_not_after(mac(2)), Some(1000));
+        assert_eq!(
+            b.revocation_not_after(mac(9)),
+            None,
+            "a MAC we never revoked"
+        );
+
+        // Pruned at expiry: the window goes with the record it described.
+        b.set_time(1001);
+        assert_eq!(b.revocation_not_after(mac(2)), None);
     }
 
     /// A new revocation raises the Trickle-reset hint (so the router accelerates

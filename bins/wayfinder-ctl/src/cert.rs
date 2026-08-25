@@ -346,7 +346,11 @@ fn write_cert_with_summary(
     println!("wrote certificate to {}", out_cert.display());
     println!("  mesh_id:    {mesh_id:#x}");
     println!("  node_mac:   {}", crate::output::format_mac(&mac.0));
-    println!("  valid:      [{not_before}, {not_after}] unix");
+    println!(
+        "  valid:      {} .. {}",
+        crate::output::format_timestamp(not_before),
+        crate::output::format_timestamp(not_after)
+    );
     // Printed only when set: a line reading "admin: false" on every ordinary
     // cert would train the reader to skip the one line that matters.
     if admin {

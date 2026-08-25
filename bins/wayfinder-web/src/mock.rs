@@ -142,6 +142,7 @@ impl Default for Mock {
                     verified: true,
                     cert_not_after: 1_800_000_000,
                     revoked: false,
+                    revocation_not_after: 0,
                 }],
                 require_auth: true,
                 lazy_cert_distribution: false,
