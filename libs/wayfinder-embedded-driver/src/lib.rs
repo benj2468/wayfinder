@@ -756,12 +756,11 @@ mod tests {
         assert_eq!(*protocol, wayfinder::DEFAULT_BATMAN_ETHER_TYPE);
     }
 
-    /// A `run_once` where a received OGM (on interface 0) is re-flooded exercises
-    /// the embedded dispatch's `Egress::Auto` fan-out: the OGM goes out the
-    /// *other* interface (1) and not back out the ingress interface (0) —
-    /// split-horizon across the full recv → handle → stage → dispatch path.
+    /// A received OGM re-floods onto **both** interfaces, the ingress one
+    /// included, across the full recv → handle → stage → dispatch path. The
+    /// echo out interface 0 is deliberate; see `driver_core::Egress::Auto`.
     #[test]
-    fn run_once_reforwards_received_ogm_to_other_interface_only() {
+    fn run_once_reforwards_received_ogm_onto_every_interface() {
         let ogm = link_frame_bytes(
             Mac::BROADCAST,
             mac(2),
@@ -782,9 +781,10 @@ mod tests {
 
         futures::executor::block_on(driver.run_once());
 
-        assert!(
-            driver.links[0].sent.is_empty(),
-            "split-horizon: no re-flood back out the ingress interface"
+        assert_eq!(
+            driver.links[0].sent.len(),
+            1,
+            "the re-flood returns out the ingress interface too"
         );
         assert_eq!(
             driver.links[1].sent.len(),

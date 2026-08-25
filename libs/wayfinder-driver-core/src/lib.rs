@@ -13,7 +13,7 @@
 //!
 //! The transmit side is shared the same way: [`plan_dispatch`] makes the whole
 //! outgoing decision — authenticate the frame, resolve its egress, apply
-//! split-horizon and the per-link transmit gate — and returns *how much to
+//! the per-link transmit gate — and returns *how much to
 //! send* and *which interfaces* to send it on.  What stays in each driver is
 //! only the async event loop, the interface set, and the actual I/O for the
 //! interfaces in that plan: "one behavior, three loops".
@@ -34,7 +34,7 @@
 //! one step in isolation — deterministic stepping in tests, mostly.
 //!
 //! Everything else — authenticating a directed frame on the way in or out,
-//! resolving egress, split-horizon — is internal, deliberately: a shell that
+//! resolving egress, gating each link — is internal, deliberately: a shell that
 //! reached past these could apply half the policy.
 //!
 //! [`wayfinder-tick-driver`]: https://docs.rs/wayfinder-tick-driver
@@ -65,16 +65,33 @@ use zerocopy::IntoBytes;
 pub enum Egress {
     /// Let the router pick the egress (`get_egress_interface`): a metric-driven
     /// single interface for a unicast, or every interface for a
-    /// broadcast/flood.  `exclude` is the interface index a re-flood arrived on
-    /// (split-horizon), so a re-flood never goes back toward the neighbor it
-    /// came from; `None` for locally originated frames.
-    Auto {
-        /// The interface index to omit from an `All` fan-out, or `None`.
-        exclude: Option<usize>,
-    },
+    /// broadcast/flood.
+    ///
+    /// **A flood goes out every interface, including the one a re-flood arrived
+    /// on** — there is deliberately no interface-level split-horizon, because
+    /// one interface is not one neighbor. On a radio whose peers are out of
+    /// range of each other, or a `UdpMulti` link with one tunnel per peer, the
+    /// ingress interface is the only path to whoever missed the original.
+    /// This is the canonical statement of that rule; elsewhere points here.
+    ///
+    /// Loop protection lives in the engine: a node drops the copy that comes
+    /// back to it as its own originator, and every other copy is stopped by a
+    /// per-originator seqno **high-water mark** (separate ones for OGMs and
+    /// broadcasts). That is a watermark, not set membership — it resets when an
+    /// originator record is evicted or purged, and is not wraparound-aware.
+    /// The exclusion this replaced masked neither: it never bounded a loop
+    /// across a cyclic mesh, only the immediate one-hop echo.
+    ///
+    /// Costs N² OGM frames per Trickle round on a shared segment of N nodes,
+    /// where it cost N; see `flooding_every_interface_costs_a_quadratic_number_of_ogms`.
+    Auto,
     /// Send out exactly one interface by index, bypassing the router's egress
     /// choice — used for per-link OGM emission on each link's own Trickle
     /// schedule.
+    ///
+    /// Also bypasses the per-link **transmit gate**, deliberately: the emitter
+    /// (`poll_due_ogms`) has already consulted that link's `tx_ogm`, and
+    /// gating again here would be both redundant and wrong.
     Iface(usize),
 }
 
@@ -258,8 +275,10 @@ pub fn handle_mesh_frame<R: RouterOps>(
                 // on rather than through routing state (see `RxOutcome`'s
                 // `pin_egress_iface` doc).
                 Some(pinned) => Egress::Iface(pinned),
-                // A re-flood must not go back out the interface it arrived on.
-                None => Egress::Auto { exclude: Some(idx) },
+                // Everything else — a re-flood included, which goes back out
+                // the interface it arrived on too; see [`Egress::Auto`] for why
+                // there is no split-horizon here.
+                None => Egress::Auto,
             },
         });
     }
@@ -528,8 +547,11 @@ const INTERFACE_SET_FITS_ROUTER: () = assert!(
 ///
 /// Constructed only by [`plan_dispatch`] — the fields are private because every
 /// invariant here is something that function establishes: the payload is
-/// authenticated (or legitimately needs no tag), and the targets have already
-/// been split-horizon filtered and transmit-gated.
+/// authenticated (or legitimately needs no tag); every target is an interface
+/// the driver actually holds (`< num_interfaces`), which is what lets a caller
+/// index its own link array with one; and any target the *router* chose has
+/// passed that link's transmit gate. An explicit [`Egress::Iface`] is passed
+/// through ungated by design — see [`plan_dispatch`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DispatchPlan<'a> {
     payload: &'a [u8],
@@ -613,14 +635,9 @@ pub fn plan_dispatch<'a, R: RouterOps>(
             );
         }
         // Otherwise let the router's metric-driven egress choice decide.
-        Egress::Auto { exclude } => match router.get_egress_interface(now, dst) {
+        Egress::Auto => match router.get_egress_interface(now, dst) {
             Some(EgressInterface::All) => {
                 for idx in 0..num_interfaces {
-                    // Split-horizon: never re-flood back out the interface a
-                    // re-flood arrived on.
-                    if Some(idx) == exclude {
-                        continue;
-                    }
                     // Per-link transmit gate: skip a link that does not send
                     // this traffic class (an OGM re-flood onto a `tx_ogm`-off
                     // link, or any broadcast onto a listen-only link).
@@ -937,12 +954,10 @@ mod tests {
         assert!(sink.local.is_empty());
     }
 
-    /// A received OGM from a neighbor is re-flooded, tagged with
-    /// `Egress::Auto { exclude: Some(idx) }` so split-horizon keeps it off the
-    /// interface it arrived on (the loop-prevention invariant behind the
-    /// broadcast-flood fix).
+    /// A received OGM is re-flooded onto **every** interface, the one it
+    /// arrived on included — see [`Egress::Auto`].
     #[test]
-    fn handle_mesh_frame_reforwards_ogm_with_split_horizon_exclude() {
+    fn handle_mesh_frame_reforwards_ogm_onto_every_interface() {
         let mut router = CentralRouter::new(mac(1)); // auth off
         let ogm = bare_ogm_bytes(mac(2), 1, 50);
         let link = frame_bytes(Mac::BROADCAST, mac(2), DEFAULT_BATMAN_ETHER_TYPE, &ogm);
@@ -963,8 +978,8 @@ mod tests {
         assert_eq!(sink.mesh.len(), 1, "the OGM is re-flooded once");
         assert_eq!(
             sink.mesh[0].egress,
-            Egress::Auto { exclude: Some(2) },
-            "split-horizon excludes the ingress interface"
+            Egress::Auto,
+            "the ingress interface is not excluded"
         );
     }
 
@@ -1183,11 +1198,11 @@ mod tests {
 
     // ---- plan_dispatch ----------------------------------------------------
     //
-    // Egress resolution, split-horizon and the per-link transmit gate are
-    // written out in all three driver shells today. That makes split-horizon —
-    // a correctness invariant — a thing you can fix in one shell and silently
-    // leave broken in two. These pin the shared decision so the shells can be
-    // reduced to "do the I/O for each interface in the plan".
+    // Egress resolution and the per-link transmit gate were written out in all
+    // three driver shells once. That made a correctness invariant a thing you
+    // could fix in one shell and silently leave broken in two. These pin the
+    // shared decision so the shells can be reduced to "do the I/O for each
+    // interface in the plan".
 
     // ---- event-loop handlers ----------------------------------------------
     //
@@ -1355,7 +1370,6 @@ mod tests {
     fn plan_broadcast(
         router: &mut CentralRouter,
         payload: &[u8],
-        exclude: Option<usize>,
         num_interfaces: usize,
     ) -> Option<Vec<usize>> {
         let mut buf = payload.to_vec();
@@ -1365,7 +1379,7 @@ mod tests {
             Duration::from_secs(1),
             Mac::BROADCAST,
             DEFAULT_BATMAN_ETHER_TYPE,
-            Egress::Auto { exclude },
+            Egress::Auto,
             payload.len(),
             &mut buf,
             num_interfaces,
@@ -1403,30 +1417,10 @@ mod tests {
     #[test]
     fn broadcast_floods_every_interface() {
         let mut router = router_with_interfaces(4);
-        let targets = plan_broadcast(&mut router, &[BatmanPacketType::Ogm.as_u8(), 0x02], None, 4)
+        let targets = plan_broadcast(&mut router, &[BatmanPacketType::Ogm.as_u8(), 0x02], 4)
             .expect("a broadcast is dispatchable");
 
         assert_eq!(targets, std::vec![0, 1, 2, 3]);
-    }
-
-    /// **Split-horizon.** A re-flood must never go back out the interface it
-    /// arrived on, or two nodes ping-pong the same broadcast between them.
-    #[test]
-    fn reflood_never_returns_out_the_ingress_interface() {
-        let mut router = router_with_interfaces(4);
-        let targets = plan_broadcast(
-            &mut router,
-            &[BatmanPacketType::Ogm.as_u8(), 0x02],
-            Some(1),
-            4,
-        )
-        .expect("a re-flood is dispatchable");
-
-        assert_eq!(targets, std::vec![0, 2, 3]);
-        assert!(
-            !targets.contains(&1),
-            "split-horizon: the ingress interface must be excluded"
-        );
     }
 
     /// The per-link transmit gate suppresses a traffic class on a link
@@ -1440,7 +1434,7 @@ mod tests {
         };
         router.set_link_features(2, off);
 
-        let targets = plan_broadcast(&mut router, &[BatmanPacketType::Ogm.as_u8(), 0x02], None, 4)
+        let targets = plan_broadcast(&mut router, &[BatmanPacketType::Ogm.as_u8(), 0x02], 4)
             .expect("a broadcast is dispatchable");
 
         assert_eq!(
@@ -1456,7 +1450,7 @@ mod tests {
     #[test]
     fn fanout_is_bounded_by_the_drivers_interface_count() {
         let mut router = router_with_interfaces(8);
-        let targets = plan_broadcast(&mut router, &[BatmanPacketType::Ogm.as_u8(), 0x02], None, 2)
+        let targets = plan_broadcast(&mut router, &[BatmanPacketType::Ogm.as_u8(), 0x02], 2)
             .expect("a broadcast is dispatchable");
 
         assert_eq!(targets, std::vec![0, 1]);
@@ -1481,7 +1475,7 @@ mod tests {
                 Duration::from_secs(1),
                 mac(9),
                 DEFAULT_BATMAN_ETHER_TYPE,
-                Egress::Auto { exclude: None },
+                Egress::Auto,
                 payload.len(),
                 &mut buf,
                 2,
@@ -1505,7 +1499,7 @@ mod tests {
             Duration::from_secs(1),
             mac(200),
             DEFAULT_BATMAN_ETHER_TYPE,
-            Egress::Auto { exclude: None },
+            Egress::Auto,
             payload.len(),
             &mut buf,
             2,

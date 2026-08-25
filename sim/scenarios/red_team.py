@@ -613,7 +613,7 @@ def attack_ca_misissuance() -> Finding:
 
 
 def attack_proof_starvation_by_neighbour_count() -> Finding:
-    """As many concurrent proof candidates as the prover can hold neighbours.
+    """More concurrent proof candidates than the prover's table has slots.
 
     Every next hop must answer a challenge before it is selectable, and
     ``poll_due_challenges`` issues to *every* due candidate in one synchronous
@@ -629,20 +629,33 @@ def attack_proof_starvation_by_neighbour_count() -> Finding:
     legitimate deployment would silently lose routes, and the only evidence is
     trace-level lines on two different nodes that have to be correlated.
 
-    The density is taken from ``MAX_NEIGHBOR_KEYS``, not a literal: that is the
-    most neighbours a node can hold verified keys for at all, so it is also the
-    most proof candidates it can ever face at once — the worst case the table
-    has to survive.
+    The density is ``MAX_NEIGHBOR_KEYS``, not a literal: that is the most
+    neighbours a node can hold verified keys for at all, so it is also the most
+    proof candidates it can ever face at once — the worst case the table has to
+    survive. ``MAX_IN_PROGRESS_PROOF`` is deliberately a quarter of it, so this
+    density *does* evict; the assertion below states that relationship rather
+    than assuming it.
 
-    ``MAX_IN_PROGRESS_PROOF`` is deliberately a quarter of that, so this density
-    *does* evict. It holds anyway, because an evicted challenge is never
-    answered and an unanswered challenge is retried on a backoff: eviction costs
-    a round trip, not a route. What the table has to satisfy is only that
-    concurrent proof throughput stay above the renewal rate. Measured at this
-    density, 4 slots and 64 slots converge identically and a single slot never
-    converges — so this scenario catches a table small enough to fall under the
-    renewal rate, and nothing finer. Read a pass as "not grossly mis-sized",
-    not as "this size is right".
+    It has to be that dense to measure anything. Below it the mesh converges no
+    matter how small the table is — with a *single* slot, 48 spokes and fewer
+    all still route every neighbour — so a cheaper version of this scenario
+    would report a pass having tested nothing. The cost is real and it is the
+    flooding, not the crypto: a segment of mutual neighbours is a complete
+    graph and a flood goes out every interface, so each node receives ~N²
+    copies per round and the mesh carries ~N³.
+
+    What is trimmed instead is the horizon. Starvation shows up early — by 20 s
+    a single-slot table has left 4 of 64 neighbours unproven while the real
+    table has proven all 64 — and running to 40 s only widens that to 11, for
+    double the wall time. So the run stops at 20 s: enough for the signal, not
+    for the margin.
+
+    The mesh holds at this density because an evicted challenge is never
+    answered and an unanswered challenge is retried on a backoff: eviction
+    costs a round trip, not a route. What the table has to satisfy is only that
+    concurrent proof throughput stay above the renewal rate, and this catches a
+    table small enough to fall under it — nothing finer. Read a pass as "not
+    grossly mis-sized", not as "this size is right".
 
     They must all be *mutual* neighbours of the prover simultaneously, so this
     is one shared segment rather than a star of point-to-point links: a star
@@ -653,11 +666,15 @@ def attack_proof_starvation_by_neighbour_count() -> Finding:
     """
     hub = "hub"
     spokes = [f"spoke{i}" for i in range(wf.MAX_NEIGHBOR_KEYS)]
+    assert len(spokes) > wf.MAX_IN_PROGRESS_PROOF, (
+        "a density at or under MAX_IN_PROGRESS_PROOF evicts nothing, so this "
+        "scenario would report a pass having tested nothing"
+    )
     m = mesh()
     nodes = [Node(hub, credential=Credential())]
     nodes += [Node(s, credential=Credential()) for s in spokes]
     sim = Simulation(nodes, shared_lan([hub, *spokes], PerfectWire()), mesh=m)
-    sim.run(until_s=40.0)
+    sim.run(until_s=20.0)
 
     starved = [s for s in spokes if not sim.has_route(hub, s)]
     return Finding(

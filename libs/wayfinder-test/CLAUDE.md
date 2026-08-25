@@ -7,11 +7,11 @@ integration tests, no hardware. **Synchronous** — the caller owns the clock.
 
 | | driver | used by |
 |---|---|---|
-| `TestRouter` (`test_router.rs`) | `wayfinder-tick-driver`, synchronous | `integration_tests.rs` (63 tests) via `TestHarness` |
+| `TestRouter` (`test_router.rs`) | `wayfinder-tick-driver`, synchronous | `integration_tests.rs` via `TestHarness` |
 | `LinkTestRouter` (`link_router.rs`) | `wayfinder-driver`, async | `link_error_tests.rs`, `rylr998_integration_tests.rs` |
 
-The split is the point. Routing behaviour — convergence, split-horizon,
-failover, auth, multicast — has nothing to do with links, so it is tested
+The split is the point. Routing behaviour — convergence, flooding, failover,
+auth, multicast — has nothing to do with links, so it is tested
 synchronously against plain queues. **Link *plumbing*** — `send`/`recv` error
 policy, a real `RylrClient` over a simulated LoRa medium — needs an actual
 `LinkT`, which the tick driver does not have (its interfaces *are* queues). So
@@ -20,6 +20,22 @@ those two suites keep the async driver, and are consequently what keeps
 
 Put a new test in `integration_tests.rs` unless it is specifically about a
 `LinkT` implementation or the driver's I/O error posture.
+
+## Two fabrics
+
+`TestSwitchConfig::shared(name)` is a segment where every port hears every
+transmission; `TestSwitchConfig::star(name, hub)` is the opposite — spokes reach
+only the hub and nothing reaches a spoke except from the hub. A star is a
+`UdpMulti` link in fan-out mode, and equally a radio whose two peers are out of
+range of each other.
+
+Use it whenever correctness depends on peers *not* hearing one another: a shared
+segment cannot detect a re-introduced ingress-interface exclusion, because there
+every peer heard the original anyway. Three tests pin the star —
+`node_relays_between_neighbors_that_cannot_hear_each_other`,
+`a_reconnected_hub_still_relays_between_the_spokes` (a reconnected machine gets
+a *fresh* port, so the designation is re-applied on every rewire), and
+`flooding_every_interface_costs_a_quadratic_number_of_ogms`.
 
 ## How a step works
 

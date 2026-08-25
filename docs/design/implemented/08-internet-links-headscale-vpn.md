@@ -10,7 +10,10 @@ Headscale and Headplane this design calls for.
 What no test covers is two hosts behind *real* NAT, which is where hole-punching
 either happens or silently degrades to relaying.
 
-> **Five corrections to this document, found while implementing it.** Each was
+The hub needs no special configuration — see Correction 7, and question 7 in
+§9.
+
+> **Seven corrections to this document, found while implementing it.** Each was
 > a specific claim below that did not survive contact with the code or with
 > Headscale, and each is annotated inline where it appears:
 >
@@ -53,6 +56,18 @@ either happens or silently degrades to relaying.
 >    work; `vpn-data-plane.nix` is what found it. `tls.mode` in
 >    `nix/modules/wayfinder-headscale.nix` now defaults to Let's Encrypt, and
 >    plain HTTP is a thing a configuration has to ask for and gets warned about.
+> 7. **§9's answer to "does the cloud box need special-casing as a routing
+>    hub?" was right, but for the wrong reason — and the router had to be
+>    fixed before it became true.** A `UdpMulti` link in fan-out mode carries
+>    every spoke on its own point-to-point tunnel, so no spoke ever hears
+>    another's transmission. Split-horizon excluded the *ingress interface*
+>    unconditionally, and the hub has only that one interface, so the relay set
+>    was always empty and the mesh converged no further than "every spoke can
+>    see the hub". The fix is not a hub-specific setting but the removal of the
+>    interface-level exclusion: a flood goes out every interface, and the
+>    engine's `(originator, seqno)` de-duplication is what keeps it from
+>    circulating. The old rule was equally wrong for a radio with two peers
+>    hidden from each other. See §9's revised answer.
 
 Grew out of a design discussion about deploying a wayfinder node in the cloud
 as an auth provider/CA, and how two Starlink-connected boxes (no stable public
@@ -504,10 +519,29 @@ list).
 >    wired in `nix/modules/wayfinder-headscale.nix`, bound to loopback and off
 >    by default — reaching it is an SSH tunnel, which is the friction that
 >    keeps it a fallback.
-> 7. **Does the cloud box need special-casing as a routing hub?** No, as
->    believed. It takes a tunnel address like any other node and BATMAN-adv
->    selects paths over it normally; nothing in the implementation special-cases
->    it.
+> 7. **Does the cloud box need special-casing as a routing hub?** No — but
+>    only after a router bug was fixed (Correction 7), not because the belief
+>    was already true. It takes a tunnel address like any other node and
+>    BATMAN-adv routes over it normally, and its configuration names nothing
+>    about being a hub. What had to change was split-horizon: a `UdpMulti` link
+>    with no `discovery_addr` reaches each spoke down a separate tunnel, so a
+>    spoke's OGM is heard by the hub alone and relaying it onward means
+>    re-flooding out the interface it arrived on. That exclusion is gone, so the
+>    hub relays automatically — and so does a radio node whose two peers cannot
+>    hear each other. It costs airtime: a shared segment of N nodes now carries
+>    N² OGM frames per Trickle round where it carried N, since every node
+>    re-floods every other node's OGM even when all of them heard the original
+>    directly. That is BATMAN-IV's normal flooding cost rather than a wayfinder
+>    quirk, and `libs/wayfinder-test` pins the numbers, but it is the figure to
+>    revisit first if a duty-cycle-limited radio segment ever gets crowded.
+>
+>    Spoke-to-spoke *data* consequently transits the hub, since a spoke only
+>    ever learns the hub's transport address (a relayed OGM carries the hub as
+>    its link source). Letting two spokes address each other directly over the
+>    tunnel would need the node's own UDP endpoint carried in an OGM TVLV so
+>    peers could learn it without static configuration — worth doing if hub
+>    transit becomes the bottleneck, but a separate design, not a
+>    special-case.
 
 ## 9.1 The original questions
 

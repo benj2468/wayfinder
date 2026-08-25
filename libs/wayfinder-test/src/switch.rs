@@ -8,6 +8,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use thiserror::Error;
 use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::mpsc::error::TrySendError;
 
 use crate::Direction;
 
@@ -143,6 +144,10 @@ pub struct Switch<Ident> {
     taps: HashMap<PortId, Vec<TapConfig>>,
     // Ident address mapping of port
     ident_map: HashMap<Ident, PortId>,
+    // When set, the fabric is a star rather than a shared segment: this port is
+    // the hub, and every other port is a spoke that can reach only it.  See
+    // `set_hub_port`.
+    hub: Option<PortId>,
 }
 
 impl<Ident> Default for Switch<Ident>
@@ -166,6 +171,7 @@ where
             ports: HashMap::new(),
             taps: HashMap::new(),
             ident_map: HashMap::new(),
+            hub: None,
             rng: StdRng::from_seed([0; 32]),
         }
     }
@@ -177,10 +183,7 @@ where
     pub fn new_with_name(name: String) -> Self {
         Self {
             name,
-            ports: HashMap::new(),
-            taps: HashMap::new(),
-            ident_map: HashMap::new(),
-            rng: StdRng::from_seed([0; 32]),
+            ..Self::new()
         }
     }
 
@@ -219,9 +222,37 @@ where
         Ok(())
     }
 
-    /// Disconnect a port
+    /// Turn this switch into a **star** fabric hubbed on `id`: a frame from any
+    /// other port reaches only the hub, and a frame from the hub reaches its
+    /// destination (or, unaddressed, every spoke).
+    ///
+    /// The default fabric is a shared segment, where a flood reaches everyone;
+    /// a star is the opposite — many peers on *one* interface with no path
+    /// between them, which is what a `UdpMulti` link in fan-out mode over a VPN
+    /// tunnel is.  It exists to catch a re-introduced ingress-interface
+    /// exclusion (`driver_core::Egress::Auto`), which a shared segment cannot
+    /// detect: there, every peer heard the original anyway.
+    pub fn set_hub_port(&mut self, id: PortId) -> Result<(), SwitchError> {
+        if !self.ports.contains_key(&id) {
+            return Err(SwitchError::InvalidPort);
+        }
+        self.hub = Some(id);
+        Ok(())
+    }
+
+    /// Disconnect a port, dropping every reference to it the fabric still
+    /// holds.
+    ///
+    /// The learned-address map and the hub designation are pruned with it: both
+    /// otherwise outlive the port, are still consulted when choosing a frame's
+    /// targets, and would turn a disconnect into a panic in
+    /// [`tick`](Self::tick) several frames later, nowhere near its cause.
     pub fn disconnect_port(&mut self, id: PortId) -> Result<(), SwitchError> {
         self.ports.remove(&id).ok_or(SwitchError::InvalidPort)?;
+        self.ident_map.retain(|_, port| *port != id);
+        if self.hub == Some(id) {
+            self.hub = None;
+        }
         Ok(())
     }
 
@@ -237,6 +268,39 @@ where
         let taps = self.taps.entry(id).or_default();
         taps.push(tap_config);
         Ok(())
+    }
+
+    /// The ports a frame entering on `source` addressed to `dest_port` (`None`
+    /// when the fabric has not learned that identifier, i.e. a broadcast) is
+    /// delivered to.
+    ///
+    /// On the default shared-segment fabric this is the classic learning
+    /// switch: forward to the learned port, or flood every port but the source.
+    /// On a star fabric ([`set_hub_port`](Self::set_hub_port)) a spoke can
+    /// reach only the hub — an unaddressed frame goes there and nowhere else,
+    /// and one addressed to another spoke goes nowhere at all, because on the
+    /// real medium a spoke has no transport address for its peers.
+    fn forward_targets(&self, source: PortId, dest_port: Option<PortId>) -> Vec<PortId> {
+        if let Some(hub) = self.hub
+            && source != hub
+        {
+            return match dest_port {
+                Some(p) if p != hub => {
+                    tracing::trace!(?source, dest = ?p, "drop: spokes have no path to each other");
+                    Vec::new()
+                }
+                _ => std::vec![hub],
+            };
+        }
+        match dest_port {
+            Some(p) => std::vec![p],
+            None => self
+                .ports
+                .keys()
+                .copied()
+                .filter(|id| *id != source)
+                .collect(),
+        }
     }
 
     /// Tick the switch, multiplexing messages between ports and calling the tap
@@ -297,8 +361,8 @@ where
             }
         }
 
-        // Forward each frame toward its destination (or flood when the
-        // destination is unknown).  A port's `outgoing_loss` is the switch→node
+        // Forward each frame toward its destination (or, on a shared segment,
+        // flood when the destination is unknown — see `forward_targets`).  A port's `outgoing_loss` is the switch→node
         // egress drop, applied here keyed on the *destination* port — so a port
         // configured for total loss is deaf to the fabric, the complement of
         // `incoming_loss` muting its transmissions above.  Together they let a
@@ -311,31 +375,33 @@ where
                 let Ok((dest, _)) = Ident::ref_from_prefix(&msg) else {
                     continue;
                 };
+                let dest_port = self.ident_map.get(dest).copied();
+                tracing::trace!(dest = ?dest, port = ?dest_port, "forwarding message");
 
-                tracing::trace!(dest = ?dest, port = ?self.ident_map.get(dest), "forwarding message");
-                if let Some(dest_port) = self.ident_map.get(dest).copied() {
-                    // Drop on the wire toward the destination node if its link is lossy.
+                for target in self.forward_targets(port, dest_port) {
+                    // Drop on the wire toward the destination node if its link
+                    // is lossy.
                     #[expect(
                         clippy::expect_used,
-                        reason = "dest_port came from ident_map, and ports are never removed once added"
+                        reason = "forward_targets names only ports the fabric holds: it reads `ports`, `ident_map` and `hub`, and `disconnect_port` prunes all three together"
                     )]
                     let outgoing_loss = self
                         .ports
-                        .get(&dest_port)
+                        .get(&target)
                         .expect("ports are never removed once added")
                         .config
                         .outgoing_loss;
                     if self.rng.random_bool(outgoing_loss) {
                         continue;
                     }
-                    tracing::trace!(port_id = ?dest_port, direction = ?Direction::FromSwitch, len = msg.len(), "switch frame");
-                    // Send to specific destination port
-                    if let Some(taps) = self.taps.get_mut(&dest_port) {
+                    tracing::trace!(port_id = ?target, direction = ?Direction::FromSwitch, len = msg.len(), "switch frame");
+
+                    if let Some(taps) = self.taps.get_mut(&target) {
                         for tap in taps.iter_mut() {
                             if !(tap.clb)(TapMeta {
                                 data: msg.as_mut_slice(),
                                 direction: Direction::FromSwitch,
-                                id: dest_port,
+                                id: target,
                             }) {
                                 tap.invalid = true;
                             }
@@ -345,41 +411,39 @@ where
 
                     #[expect(
                         clippy::expect_used,
-                        reason = "dest_port came from ident_map, and ports are never removed once added"
+                        reason = "forward_targets names only ports the fabric holds: it reads `ports`, `ident_map` and `hub`, and `disconnect_port` prunes all three together"
                     )]
-                    let _ = self
+                    // A full queue here is a mis-sized harness, not a lossy
+                    // medium — `outgoing_loss` above is how loss is modelled.
+                    // Swallowing the frame would surface later as a routing
+                    // test failing for a reason nowhere near its cause, so it
+                    // is loud.
+                    let send = self
                         .ports
-                        .get(&dest_port)
+                        .get(&target)
                         .expect("ports are never removed once added")
                         .duplex
                         .egress
                         .try_send(msg.clone());
-                } else {
-                    // Broadcast to all ports except source, each copy subject to
-                    // that port's own egress loss.
-                    for (other_port_id, other_port) in self.ports.iter() {
-                        if *other_port_id == port {
-                            continue; // Don't send back to source
+                    match send {
+                        Ok(()) => {}
+                        // The node behind this port is gone (`disconnect_machine`
+                        // drops its router, and with it the receiving end). Its
+                        // port is deliberately left attached so the same wiring
+                        // can be reused on reconnect, so this is the expected
+                        // steady state for an offline node, not a fault.
+                        Err(TrySendError::Closed(_)) => {
+                            tracing::trace!(port_id = ?target, "drop: port receiver is gone")
                         }
-                        if self.rng.random_bool(other_port.config.outgoing_loss) {
-                            continue;
-                        }
-                        tracing::trace!(port_id = ?other_port_id, direction = ?Direction::FromSwitch, len = msg.len(), "switch frame");
-
-                        if let Some(taps) = self.taps.get_mut(other_port_id) {
-                            for tap in taps.iter_mut() {
-                                if !(tap.clb)(TapMeta {
-                                    data: msg.as_mut_slice(),
-                                    direction: Direction::FromSwitch,
-                                    id: *other_port_id,
-                                }) {
-                                    tap.invalid = true;
-                                }
-                            }
-                            taps.retain(|t| !t.invalid);
-                        }
-
-                        let _ = other_port.duplex.egress.try_send(msg.clone());
+                        // A full queue is a mis-sized harness, not a lossy
+                        // medium — `outgoing_loss` above is how loss is
+                        // modelled. Swallowed silently it would surface later
+                        // as a routing test failing nowhere near its cause.
+                        Err(TrySendError::Full(_)) => tracing::warn!(
+                            port_id = ?target,
+                            switch = %self.name,
+                            "drop: port egress queue full; raise the PortComms::pair() depth"
+                        ),
                     }
                 }
             }
@@ -942,5 +1006,106 @@ mod tests {
             "50% loss port should receive roughly half of {N}, got {partial}"
         );
         assert_eq!(drain(&mut rx4), 0, "100% loss port must receive nothing");
+    }
+
+    // ── Star (hub-and-spoke) fabric ──────────────────────────────────────────
+    //
+    // A medium whose peers cannot hear each other; see `set_hub_port`.
+
+    #[test]
+    fn star_confines_a_spoke_broadcast_to_the_hub() {
+        let mut switch: Switch<u8> = Switch::new();
+        let (_tx_hub, mut rx_hub, hub) = create_port_pair(10);
+        let (tx_a, _rx_a, a) = create_port_pair(10);
+        let (_tx_b, mut rx_b, b) = create_port_pair(10);
+
+        let hub_id = switch.add_port(hub, PortConfig::no_loss()).unwrap();
+        switch.add_port(a, PortConfig::no_loss()).unwrap();
+        switch.add_port(b, PortConfig::no_loss()).unwrap();
+        switch.set_hub_port(hub_id).unwrap();
+
+        tx_a.try_send(make_frame(10, 99)).unwrap(); // unknown dest -> flood
+        switch.tick().unwrap();
+
+        assert!(rx_hub.try_recv().is_ok(), "the hub hears every spoke");
+        assert!(
+            rx_b.try_recv().is_err(),
+            "a spoke never hears another spoke directly — that is the whole point of a star"
+        );
+    }
+
+    #[test]
+    fn star_fans_a_hub_broadcast_out_to_every_spoke() {
+        let mut switch: Switch<u8> = Switch::new();
+        let (tx_hub, _rx_hub, hub) = create_port_pair(10);
+        let (_tx_a, mut rx_a, a) = create_port_pair(10);
+        let (_tx_b, mut rx_b, b) = create_port_pair(10);
+
+        let hub_id = switch.add_port(hub, PortConfig::no_loss()).unwrap();
+        switch.add_port(a, PortConfig::no_loss()).unwrap();
+        switch.add_port(b, PortConfig::no_loss()).unwrap();
+        switch.set_hub_port(hub_id).unwrap();
+
+        tx_hub.try_send(make_frame(1, 99)).unwrap();
+        switch.tick().unwrap();
+
+        assert!(rx_a.try_recv().is_ok(), "the hub reaches every spoke");
+        assert!(rx_b.try_recv().is_ok(), "the hub reaches every spoke");
+    }
+
+    #[test]
+    fn star_delivers_a_spoke_unicast_addressed_to_the_hub() {
+        let mut switch: Switch<u8> = Switch::new();
+        let (tx_hub, mut rx_hub, hub) = create_port_pair(10);
+        let (tx_a, _rx_a, a) = create_port_pair(10);
+
+        let hub_id = switch.add_port(hub, PortConfig::no_loss()).unwrap();
+        switch.add_port(a, PortConfig::no_loss()).unwrap();
+        switch.set_hub_port(hub_id).unwrap();
+
+        // Teach the fabric where the hub lives, so the frame below resolves to
+        // a known port and takes the addressed branch rather than the
+        // unaddressed catch-all.
+        tx_hub.try_send(make_frame(1, 99)).unwrap();
+        switch.tick().unwrap();
+
+        tx_a.try_send(make_frame(10, 1)).unwrap();
+        switch.tick().unwrap();
+
+        assert!(
+            rx_hub.try_recv().is_ok(),
+            "a spoke can always reach the hub, addressed or not"
+        );
+    }
+
+    #[test]
+    fn star_drops_a_spoke_to_spoke_unicast() {
+        let mut switch: Switch<u8> = Switch::new();
+        let (_tx_hub, mut rx_hub, hub) = create_port_pair(10);
+        let (tx_a, _rx_a, a) = create_port_pair(10);
+        let (tx_b, mut rx_b, b) = create_port_pair(10);
+
+        let hub_id = switch.add_port(hub, PortConfig::no_loss()).unwrap();
+        switch.add_port(a, PortConfig::no_loss()).unwrap();
+        switch.add_port(b, PortConfig::no_loss()).unwrap();
+        switch.set_hub_port(hub_id).unwrap();
+
+        // Teach the fabric where B lives, so the drop below is the star rule
+        // and not merely an unlearned destination.
+        tx_b.try_send(make_frame(20, 99)).unwrap();
+        switch.tick().unwrap();
+        while rx_hub.try_recv().is_ok() {}
+
+        tx_a.try_send(make_frame(10, 20)).unwrap();
+        switch.tick().unwrap();
+
+        assert!(
+            rx_b.try_recv().is_err(),
+            "a spoke has no transport address for another spoke, so the frame goes nowhere"
+        );
+        assert!(
+            rx_hub.try_recv().is_err(),
+            "nor is it silently rerouted to the hub, which is not its destination"
+        );
     }
 }
