@@ -56,9 +56,14 @@ BASELINE = {
     "attack_flood": red_team.HELD,
     "attack_passive_eavesdrop": red_team.BY_DESIGN,
     "attack_expired_credential": red_team.HELD,
-    "attack_ogm_replay": red_team.GAP,
-    "attack_unauthenticated_relay": red_team.GAP,
+    "attack_ogm_replay": red_team.HELD,
+    "attack_ogm_replay_hijacks_local_traffic": red_team.HELD,
+    "attack_forged_challenge_response_flood": red_team.HELD,
+    "attack_challenge_response_replay": red_team.HELD,
+    "attack_broadcast_addressed_challenge": red_team.HELD,
+    "attack_unauthenticated_relay": red_team.HELD,
     "attack_ca_misissuance": red_team.GAP,
+    "attack_proof_starvation_by_neighbour_count": red_team.HELD,
 }
 """Expected verdict per attack — the table in ``docs/design/09-mesh-auth-gaps.md``.
 Update both together."""

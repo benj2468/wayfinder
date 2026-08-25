@@ -144,6 +144,7 @@ impl WayfinderDataProvider for NodeMock {
             pending_cert_replies: occ(),
             cert_req_rate: 0.0,
             cert_reply_rate: 0.0,
+            untaggable_drop_rate: 0.0,
         }
     }
     fn resolve_route(&self, _destination: &[u8]) -> Option<RouteResolutionData> {

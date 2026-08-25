@@ -1196,6 +1196,10 @@ fn render_node_metrics(frame: &mut Frame, app: &App, area: Rect) {
                 field("Pending cert replies", &occ(&m.pending_cert_replies)),
                 field("Cert req rate", &format!("{:.2}/s", m.cert_req_rate)),
                 field("Cert reply rate", &format!("{:.2}/s", m.cert_reply_rate)),
+                field(
+                    "Untaggable drops",
+                    &format!("{:.2}/s", m.untaggable_drop_rate),
+                ),
             ]
         }
     };
@@ -1459,6 +1463,7 @@ mod tests {
             }),
             cert_req_rate: 0.5,
             cert_reply_rate: 1.5,
+            untaggable_drop_rate: 0.0,
             ..Default::default()
         });
         app.snapshot.keepalive = wayfinder_protos::wayfinder::v1alpha::KeepAliveTable {

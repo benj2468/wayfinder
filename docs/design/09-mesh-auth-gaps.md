@@ -2,17 +2,29 @@
 
 **Status:** Proposed. Each gap is a separate, independently landable change;
 this document exists so they can be taken one at a time without re-deriving the
-analysis. Gap 3 is fixed in its own MR alongside this doc; gaps 1, 2 and 4
-remain open. The instrument that found them shipped in MR !113
+analysis. Gaps 1, 2 and 3 have since shipped — 1 and 2 together, via §4. Gap 4
+remains open. The instrument that found them shipped in MR !113
 (`sim/scenarios/red_team.py`).
+
+> **§4 supersedes part of §2 and §3.** A second round of measurement showed
+> gaps 1 and 2 to be one bug, and neither section's proposed fix closes it.
+> Read §4 before implementing either.
+>
+> **§4's fix has since shipped**, closing gaps 1 and 2 together. The red team
+> now runs 15 attacks and reports 13 held, 1 by design, 1 gap — §5 (CA
+> misissuance). §4's "Implementation notes" record four things the build
+> surfaced that the design did not predict; the fourth is the proof-starvation
+> scare, which was a mismeasurement rather than a gap.
 
 **Scope:** `libs/wayfinder/src/auth.rs` (`OgmAuth`: OGM verification, the
 neighbor-key cache, the directed-frame tag path), `libs/wayfinder-auth`
 (`verify_cert`, `AuthError`), `libs/wayfinder-server/src/authority.rs`
 (`submit_csr`), `bins/wayfinder-ctl/src/cert.rs` (offline `issue`/`approve`),
 and — for gap 2 only — `libs/batman/src/wire.rs` (`TvlvType`) plus every
-driver shell that supplies a clock. No change to `LinkT`/`FrameIo`, to the
-routing engine's path selection, or to `MembershipCert`'s layout.
+driver shell that supplies a clock, plus — for §4 — `libs/batman/src/engine.rs`
+and `libs/wayfinder-driver-core`. No change to `LinkT`/`FrameIo` or to
+`MembershipCert`'s layout. (§4 *did* change the routing engine's path
+selection, which the original scope ruled out; see §9's file map.)
 
 **Threat model, restated up front.** Wayfinder buys *authenticity* and *mesh
 segregation*. It never buys confidentiality — payloads are not encrypted, and a
@@ -24,9 +36,9 @@ routing, or a member outliving its credential.
 
 ## 1. Motivation
 
-`sim/scenarios/red_team.py` runs ten attacks against a real authenticated mesh
-and classifies each from measured router state. Five held; one succeeded by
-design (passive eavesdropping); four are gaps.
+`sim/scenarios/red_team.py` classifies each attack from measured router state.
+At the time of writing it ran ten: five held, one succeeded by design (passive
+eavesdropping), four were gaps. It now runs 14 — see the status note above.
 
 | # | Gap | Impact | Severity |
 |---|-----|--------|----------|
@@ -35,10 +47,11 @@ design (passive eavesdropping); four are gaps.
 | 4 | Certificate MAC is not bound to its key | Impersonation, reachable via the shipped CSR path | High |
 | 3 | Certificate expiry does not evict a cached neighbor | Lapsed member keeps link-local data plane | Medium |
 
-They are not independent: **gap 2's fix (freshness) also substantially
-mitigates gap 1**, and the natural mechanism for gap 1 (a per-hop forwarder
-signature) reuses gap 2's freshness field. Fixing them in the order 2 → 1 → 4
-avoids building a mechanism twice. Gap 3 is orthogonal and cheap.
+They are not independent — and they are less independent than first written.
+§2 and §3 originally proposed freshness (a time bucket) for gap 2 and a per-hop
+forwarder signature reusing it for gap 1. **§4 shows gaps 1 and 2 to be a
+single bug that neither mechanism closes**, and replaces both with one fix.
+Gaps 3 and 4 are orthogonal; gap 3 is done.
 
 Every claim below was verified empirically against the real router, not
 inferred from reading the code. The reproducing test is named for each.
@@ -46,6 +59,10 @@ inferred from reading the code. The reproducing test is named for each.
 ---
 
 ## 2. Gap 2 — OGM replay (critical)
+
+> **Partly superseded by §4.** The mechanism below is real, but the scope
+> ("a receiver with no prior state") is too narrow and the proposed fix (a time
+> bucket) does not close the attack. §4 has the measurement and the replacement.
 
 ### What happens
 
@@ -158,6 +175,10 @@ is called out rather than settled here.
 
 ## 3. Gap 1 — unauthenticated OGM relay (high)
 
+> **Partly superseded by §4.** The `SenderSig` fix below exempts `src == orig`,
+> which is precisely the attacker's case in §4. Its "what does *not* fix it"
+> subsection still stands, and generalises.
+
 ### What happens
 
 An OGM's link-layer sender becomes the **next hop** for that OGM's originator.
@@ -249,7 +270,357 @@ revocation is then for.
 
 ---
 
-## 4. Gap 4 — certificate MAC is not bound to its key (high)
+## 4. Gaps 1 and 2 are one bug — and neither proposed fix closes it
+
+Added after §2 and §3 were written, from a second round of adversarial
+measurement. It supersedes part of both. Read it before implementing either.
+
+### The measurement
+
+`test_a_replayed_ogm_cannot_take_an_established_route` (renamed from
+`test_a_replayed_ogm_hijacks_an_established_route_and_blackholes_it` when the
+verdict flipped)
+(`sim/tests/test_adversary.py`, parametrised `verbatim` / `tq_maxed`) runs
+`hq — relay — {victim, eve}`, where the victim's only real path to hq is
+through the relay. Eve holds no credential. She re-emits the freshest OGM she
+has heard under **hq's spoofed link-layer source**, four times a second.
+
+Measured, deterministically, on a victim whose route is live and converged:
+
+| | before | after 30 s of replay |
+|---|---|---|
+| `best_next_hop` for hq | relay | **hq's own MAC** |
+| traffic to hq reaching the hq–relay link | — | **none** |
+
+Three consequences that contradict what §2 and §3 assume:
+
+1. **Replay is not confined to a receiver with no prior state.** The engine
+   accepts `incoming_seqno >= record.last_seqno` (`libs/batman/src/engine.rs:925`
+   — equal, not just greater, so a same-seqno copy via a second neighbour
+   registers as an alternate path; that is how a redundant mesh learns its
+   backup route). An attacker therefore never needs to advance the seqno she
+   cannot sign — she replays the *current* one, heard for free off the same
+   flood.
+2. **She needs no field manipulation at all.** The `verbatim` parametrisation
+   alters not one byte — not the unsigned TTL, not the unsigned TQ — and still
+   takes the next hop, because every accepted copy refreshes `last_heard` while
+   the incumbent is refreshed only on real OGMs. Maxing TQ (`tq_maxed`) merely
+   makes it immediate rather than eventual.
+3. **This one is *not* the "silent blackhole" of §3.** Spoofing the
+   originator's MAC rather than her own means the next hop is a verified member
+   whose pairwise key the victim holds — so the `plan_dispatch` gate that saves
+   §3 from being interception *passes*, and the victim really transmits. The
+   same probe with Eve's own source confirms the contrast: next hop stolen in
+   both cases, frame emitted only when the source is spoofed.
+
+### Why §2's time bucket does not fix it
+
+Binding `bucket` into the OGM signature bounds how *old* a replayed OGM may be.
+Eve replays the **current** OGM, so she is always inside the freshness window,
+whatever its width. The bucket closes the stale-OGM-at-a-fresh-receiver case §2
+describes and nothing more. It remains worth doing; it is not a fix for this.
+
+### Why §3's `SenderSig` does not fix it either
+
+§3's verification rule carves out exactly the attacker's case:
+
+> `src == orig` → no `SenderSig` required; the originator's own signature
+> already attests the sender.
+
+Eve's whole move is to set `src == orig`. She drives straight through the
+carve-out. The carve-out cannot simply be deleted, because it is also the
+bootstrap case — a node with no neighbours must be able to learn a first one.
+
+**So gaps 1 and 2 are not two bugs with two fixes. They are one bug**: the
+signature authenticates the *originator's identity*, but the routing table
+stores a claim about a *link* ("`orig` is reachable via `frame.src`"), and
+nothing about the forwarder is ever checked. Spoof `src = orig` and the claim
+is "hq is reachable via hq"; use `src = self` and it is "hq is reachable via
+eve". Neither is verified, because no claim about the forwarder ever is.
+
+Cryptographically: the OGM authenticator is publicly verifiable — it must be,
+for one-to-many flooding — over static content. **A public authenticator over
+static content is inherently replayable**, so possession of it proves nothing
+whatsoever about the possessor.
+
+### Three fixes ruled out by measurement
+
+Recorded so none is re-attempted. §3 already records a fourth (the
+`live_neighbor(src)` lookup), and it failed for the same reason as (c): a
+lookup on an attacker-written MAC is not proof of possession.
+
+- **(a) `>` instead of `>=` for installing a new path.** A speed bump, not a
+  fix: Eve replays seqno N+1 on hearing it, before the legitimate copy arrives.
+  Hers is then the strictly-newer one and the legitimate copy lands as `==` and
+  merely refreshes. She is one hop closer to the victim than the relay is, so
+  it is a race she is favoured to win.
+- **(b) A timestamp in the OGM signature.** See above — always in-window.
+- **(c) Gating route selection on keepalive-proven liveness.** The keepalive
+  has the *same* defect: `augment_keepalive` signs
+  `KEEPALIVE_SIG_DOMAIN ‖ src_mac ‖ bucket` — public, static — so it proves
+  "Alice existed recently, somewhere", never "Alice is at the other end of this
+  link, now, talking to me". It cannot fix a flaw it shares. Its documented 60 s
+  bound (`(KEEPALIVE_TOLERANCE_BUCKETS + 1) * KEEPALIVE_BUCKET_SECS`) does not
+  even bite against an attacker adjacent to a *live* originator: in
+  `Alice — Eve — Bob` with Alice out of Bob's range, Eve receives a fresh
+  keepalive every interval and sustains the spoof indefinitely.
+
+### What the data plane already got right
+
+`verify_directed` (`auth.rs:651`) has both properties the control plane lacks:
+
+- a **receiver-bound** authenticator — a pairwise X25519 key, so a tag for Bob
+  is meaningless to Carol, and Eve, holding no key, cannot produce one at all;
+- **receiver-controlled freshness** — a per-neighbour strictly-monotonic
+  receive counter (`accept_recv_counter`), with `next_send_counter` failing
+  closed rather than reusing a value, "since a `(key, counter)` reuse with the
+  static pairwise key would make tags replayable".
+
+That is IPsec's SA model, implemented correctly, already in this tree. The
+control plane never got it because an OGM is broadcast one-to-many and a
+pairwise tag does not broadcast.
+
+The IPsec comparison is worth stating precisely, because the OGM seqno *looks*
+like an anti-replay counter and is not one. IPsec's per-SA sequence number
+(RFC 4303 §3.4.3) works because the integrity key is pairwise-secret, so a
+counter value is unforgeable, **and** because the window is initialised by a
+live IKE handshake with nonces and DH, which proves the peer is present *now*.
+The counter maintains freshness; it never creates it. Wayfinder has the counter
+with no handshake underneath it — hence a receiver with state is protected and
+a receiver without has nothing.
+
+### The fix: split the two claims
+
+The OGM currently conflates two claims that have different audiences.
+
+- **"`orig` is a member, and this is its seqno N"** — genuinely one-to-many.
+  Keep the public signature exactly as it is. No wire change, no extra bytes on
+  a 164-byte LoRa fragment.
+- **"`orig` is reachable through me"** — only ever acted on for the *chosen*
+  next hop, and next-hop changes are rare. Verify it **pairwise, on demand**:
+  before promoting a new `best_next_hop`, challenge the proposed neighbour with
+  a fresh nonce and require a `frame_tag` response under the pairwise key.
+
+Eve cannot answer (no key), cannot replay an old answer (the nonce is fresh and
+receiver-chosen), and cannot reuse another node's answer (the key is pairwise).
+In the dead-originator case there is nothing to answer at all, so the route
+drops.
+
+Two design notes that follow from the costs in §3:
+
+- **Tag, do not sign.** A signed nonce costs an Ed25519 sign per challenge per
+  neighbour per interval (order 1–2 ms each on a Cortex-M4, per §3's own
+  estimate) plus a verify. `frame_tag` is 16 bytes, symmetric, microseconds,
+  and already in the tree.
+- **Do not run it at keep-alive rate.** It is load-bearing at exactly one
+  moment: promoting a new next hop. Block *that*, then refresh the incumbent
+  slowly. A continuous per-neighbour challenge is O(neighbours) of extra
+  traffic on every link every interval, which runs straight into LoRa
+  duty-cycle limits — the same budget pressure that makes §3's +68 bytes per
+  relayed OGM painful.
+
+### Residual: wormhole
+
+Challenge-response proves "the holder of `orig`'s key is reachable from me
+*somehow*", not "is one hop away". Eve can relay the challenge to a live hq and
+pass the answer back, and the victim will believe hq is adjacent.
+
+Accept it, for a reason worth stating: she must then relay continuously and in
+both directions, and **if she relays honestly she is a working route** —
+traffic flows, which is not the attack. The moment she stops relaying in order
+to blackhole, the next challenge fails and the route drops. Eliminating
+wormhole needs distance bounding, which is RTT-based and hopeless on LoRa,
+where modulation latency dwarfs propagation. This is the right stopping point:
+it converts a free, silent, permanent blackhole into an attack that requires
+sustained active relaying and delivers traffic while it runs.
+
+### The MACsec relationship
+
+This is MACsec-shaped, and the resemblance is exact rather than loose. IEEE
+802.1AE is hop-by-hop link-layer integrity with a SecTAG carrying a
+receiver-tracked Packet Number and a replay window per secure association —
+that is "authenticate the forwarder", which is precisely the missing X above.
+The challenge-response above is a narrow, routing-layer instance of what
+MACsec provides generally at the link layer.
+
+**What per-link authentication would subsume.** All of the above, plus
+something challenge-response structurally cannot reach: `tag_directed_into`
+(`libs/wayfinder-driver-core/src/lib.rs:196`) skips any multicast destination —
+"Broadcasts/OGMs (a multicast dst) are signed instead" — but only OGMs actually
+carry a signature, so **flooded `Bcast` frames are authenticated by nothing
+today** (the scope note at the head of `auth.rs` says as much). Pairwise tags
+cannot cover broadcast; a per-link group key can. That is the strongest
+argument for going there eventually.
+
+**Two reasons it is not simply "MACsec will solve this later".**
+
+1. *It only helps on links that have it.* Landing it on TAP/Ethernet and not on
+   LoRa, 802.15.4 and BLE leaves the gap exactly where a physically present
+   attacker is most plausible. So it belongs at the router's frame
+   ingress/egress or a shared link layer — not per-driver. Literal 802.1AE does
+   not port regardless: MKA is 802.1X/EAP-based, while this tree already has
+   Ed25519 identity and X25519 pairwise keys. What is buildable is
+   MACsec-*shaped* framing over existing key material — SecTAG-equivalent
+   framing, per-link group keys, rekeying, and a replay window per secure
+   channel, across four heterogeneous link types. That is a project, not a
+   change.
+2. *A group key authenticates against outsiders, not insiders.* Every wayfinder
+   link is multi-access — LoRa and BLE advertising are shared broadcast media —
+   so a per-link connectivity association means a shared key, and any member
+   holding it can forge frames as any other member. Eve holds no credential, so
+   it stops Eve cold; a compromised node, or a revoked one before the purge
+   propagates, could still spoof a peer. On that axis the pairwise
+   challenge-response is *stronger*, being per-sender rather than per-group.
+
+So the two are complementary, not redundant, and the ordering is: do the narrow
+routing-layer fix now, because the gap is live, it reuses machinery that
+already exists, and it needs no wire change. Keep it behind a tight boundary —
+one module, one gate on next-hop promotion — so that if link-layer
+authentication later makes `frame.src` trustworthy, removing this is a deletion
+rather than an excavation.
+
+### Implementation notes — four things the design did not predict
+
+Recorded because each is a defect the design would have shipped with, and each
+was found only by running the attack against the built fix.
+
+**1. Gating route *selection* is not enough; there are two selection paths.**
+`lookup_route` reads the cached `OriginatorRecord::best_next_hop`, but the
+forwarding hot path uses `next_hop`, which recomputes from `paths` and never
+consults the cache. Gating only the cache would have left forwarding open to
+precisely the next hop the cache had refused. Both are gated; an engine test
+asserts both, because the gap between them is invisible from either one alone.
+
+`best_next_hop` also became `Option<Mac>`. It had been initialised to
+`frame.src` at record insertion — before any gate could run — so a
+first-contact attacker installed itself by construction. There is no honest
+`Mac` for "no usable path yet".
+
+**2. A proof must be renewed before it lapses, not after.** The first cut
+challenged only neighbours whose proof was already gone, which meant every
+proof cycle dropped the route for as long as the round trip took, and a
+steady-state mesh flapped its next hop. `proof_needs_refresh` fires after one
+expected interval against `proof_current`'s `MAX_MISSED_PROOFS`; the gap
+between the two thresholds is the margin the exchange gets to complete in.
+
+**3. The attacker can misdirect the challenge itself — and that was the sharp
+one.** `get_egress_interface` resolves through the link-quality table, which is
+written on frame *receipt*, before any authentication verdict. An attacker
+spoofing a member's source address at a few frames a second makes its own link
+look like the way to reach that member, and collects the challenge. It cannot
+answer — but it does not need to. The proof never renews and the victim loses a
+route it should have kept: the hijack degrades into a denial of service, which
+is better but still a regression the fix itself introduced.
+
+Two changes close it, and both are worth keeping in mind for anything else that
+reasons about *where* a peer is:
+
+- A challenge is emitted on **every** interface rather than the metric-chosen
+  one. It is a couple of dozen bytes and rare, which is what makes the fan-out
+  affordable, and it means the attacker no longer chooses where the challenge
+  goes.
+- Egress pins to the interface a challenge was actually **answered** on
+  (`proven_interface`), in preference to the link-quality table. An answered
+  challenge is attacker-proof by construction: only the key holder could have
+  produced it. Without this the *data* still followed the poisoned egress even
+  once the route was correct — the attacker collected the traffic without ever
+  owning the route.
+
+**4. The proof table looked starvable, and was not — the instrument was
+wrong.** `attack_proof_starvation_by_neighbour_count` reported a gap: on a
+20-neighbour mesh, twelve fully credentialed neighbours never became usable
+next hops, which read as `MAX_IN_PROGRESS_PROOF` (then 16) evicting in-flight
+challenges before their answers arrived. It was not. The scenario built its
+density as a **star of 20 point-to-point links**, and in the simulator every
+link an endpoint touches is one router interface — so the hub was configured
+with 20 interfaces against a `MAX_INTERFACES` of 8. The router ignores an index
+past that bound, silently, so spokes 8..19 had no OGM timer and no
+participation gate. The starved set was exactly the interfaces that did not
+exist, and the boundary sat at 8 whatever `MAX_IN_PROGRESS_PROOF` was set to.
+
+Three things follow, and the second is the one worth carrying forward:
+
+- **The scenario now uses one shared segment**, sized from
+  `MAX_NEIGHBOR_KEYS` — the most neighbours a node can hold verified keys for,
+  and so the most proofs it can ever legitimately owe at once. All 64 prove and
+  route, and the verdict is `HELD`.
+- **The table is not what makes it hold; the retry is.** `MAX_IN_PROGRESS_PROOF`
+  stays at 16, a quarter of the key cache, so this density evicts. An evicted
+  challenge is simply one that is never answered, and an unanswered challenge is
+  already retried on `BatmanEngine`'s backoff — so eviction costs a round trip,
+  not a route. The table bounds concurrent proof *throughput*, and the only
+  requirement is that throughput exceed the rate at which proofs come due for
+  renewal. Measured at full density: 4, 8, 16 and 64 slots all converge
+  identically (every neighbour proven ~11 s in, no route lost over the following
+  two minutes), while 1 slot never converges — it settles at 42 of 64 proven,
+  the equilibrium where proof completions match expiries. The cliff is between 1
+  and 4, so 16 carries at least fourfold margin.
+- **Read the scenario's pass accordingly.** It fails only for a table small
+  enough to fall under the renewal rate, which makes it a guard against gross
+  mis-sizing, not a tight bound on the constant. Nothing currently pins the
+  finer property it rests on — that a challenge lost to *eviction specifically*
+  is retried and eventually proves. `an_unanswered_challenge_is_retried_on_an_
+  exponential_backoff` (`libs/batman`) covers the retry and
+  `the_in_progress_table_evicts_least_recently_issued_when_full`
+  (`libs/wayfinder/src/auth.rs`) covers the eviction, but the two live in
+  different crates and neither knows about the other.
+- **Silent capacity truncation is the failure mode to design against.** Three
+  of the four shells had already met this: the tokio driver `warn!`s on
+  over-capacity wiring and the embedded driver made it a compile-time assert,
+  its doc comment noting that the `debug_assert!` it replaced "compiled out of
+  the `--release` images boards actually flash". `wayfinder-tick-driver` still
+  carried that same `debug_assert!` — and the Python extension the simulator
+  runs is a release build, so it compiled out there too. It now `warn!`s and
+  holds its own interface count to the router's, and `Simulation` refuses a
+  topology that gives any node more links than `wf.MAX_INTERFACES` outright,
+  rather than measuring a mesh that is quietly not the one described.
+- **A red-team verdict is a measurement, and measurements need controls.** The
+  gap stood for as long as it did because the verdict was plausible. What
+  settled it in minutes was running the same topology *unauthenticated* (all 20
+  routed — so not a trust problem) and the same neighbour count on *one
+  interface* (all 20 proved — so not a proof problem). Neither control existed
+  in the suite.
+
+**A bootstrap deadlock, avoided deliberately.** Proving a neighbour needs its
+pairwise key, which needs its certificate, which under lazy cert distribution
+may itself have to be fetched over the mesh. Gating that fetch on proof
+deadlocks: nobody can prove anything because nobody can obtain the keys to
+prove with. The cert-control plane therefore routes through
+`next_hop_unproven_ok`, a deliberate hole. It is safe because of what travels
+it — a certificate is public data and a `CertReq` carries the requester's own
+signed cert — so an attacker attracting it learns nothing it could not read off
+the air and can at worst blackhole cert distribution, which jamming already
+achieves. **The data plane must never use it.**
+
+**What shipped, by crate:** `MAX_MISSED_PROOFS`, the `proven`/`challenged`
+tables, `challenge_candidates`, `note_proven`/`note_challenged`,
+`proof_current`, `proven_interface` and the gate in `recompute_best`/`next_hop`
+(`libs/batman`); `CHALLENGE_NONCE_LEN`, `MAX_IN_PROGRESS_PROOF`,
+`issue_challenge`/`answer_challenge`/`verify_challenge_response` over
+`frame_tag` and the pairwise-key cache (`libs/wayfinder/src/auth.rs`);
+`poll_challenge` plus the two receive arms (`libs/wayfinder/src/lib.rs`);
+`NextHopChallenge`/`NextHopResponse` and their headers (`libs/batman/src/wire.rs`);
+`poll_due_challenges` (`libs/wayfinder-driver-core`), wired into all three
+shells.
+
+**The nonce needs no entropy.** `getrandom` is a `std`-only dependency of
+`wayfinder-auth`, so there is none in `no_std`. The nonce is a PRF over a
+monotonic counter keyed by this node's pairwise key *with itself* — a
+Diffie-Hellman against its own public key, which only the holder of its secret
+can compute. No RNG to plumb through every board.
+
+**Domain separation is load-bearing.** A challenge response is a `frame_tag`
+under the same pairwise key `tag_directed` uses, so the two could collide. The
+response's `context` is `CHALLENGE_RESP_DOMAIN ‖ responder_mac` while
+`tag_directed` passes a bare 6-byte MAC; a domain-then-MAC string can never
+equal a bare MAC, whatever counter or payload an attacker picks. Relying on
+counter values never colliding would have been fragile.
+
+---
+
+---
+
+## 5. Gap 4 — certificate MAC is not bound to its key (high)
 
 ### What happens
 
@@ -309,7 +680,7 @@ Two layers:
 
 ---
 
-## 5. Gap 3 — certificate expiry does not evict a cached neighbor (medium)
+## 6. Gap 3 — certificate expiry does not evict a cached neighbor (medium)
 
 ### What happens
 
@@ -349,7 +720,7 @@ validity already needs.
 
 ---
 
-## 6. Observability (applies to gaps 1 and 2)
+## 7. Observability (applies to gaps 1 and 2)
 
 Per the root `CLAUDE.md`'s "metrics are first-class": the blackhole in gaps 1
 and 2 is currently **silent**. `tag_directed_into`
@@ -373,32 +744,46 @@ State lives in `CentralRouter`, not the driver, so an embedded node has it too.
 
 ---
 
-## 7. Sequencing
+## 8. Sequencing
 
-1. **Gap 3** — self-contained, no wire change, no open questions. Landing
-   alongside this doc.
-2. **Observability (§6)** — small, independent, and makes the remaining gaps
-   visible while they are still open. Worth doing before the hard ones.
-3. **Gap 2** — highest severity, but blocked on the wall-clock question (§2).
-   Settle that first.
-4. **Gap 1** — reuses gap 2's `bucket`, so it must follow it. Measure the
-   per-hop signing cost on real hardware before committing.
-5. **Gap 4** — independent of 1–3, but the widest test churn; best done when
-   nothing else is in flight to avoid conflicts.
+Revised by §4. The original order (2 → 1) assumed two bugs sharing a freshness
+field; they are one bug with one fix, and it is no longer blocked on the
+wall-clock question.
 
-## 8. Key file map for the implementer
+1. ~~**Gap 3**~~ — done.
+2. ~~**Observability (§7)**~~ — done: `untaggable_drop_rate` on
+   `CentralRouter`, surfaced through `NodeMetrics` to `wayfinderctl`, the TUI
+   and the web UI, and the remote-drivable `warn!` demoted to `trace!`.
+3. ~~**Gaps 1 + 2, via §4's next-hop challenge**~~ — done. One change closed
+   both. No wire-format change to the OGM, no per-hop signature, and it did not
+   need §2's wall clock, because the freshness is a receiver-chosen nonce
+   rather than a shared clock.
+4. **Gap 4** — the only gap still open. Independent of the rest, but the widest
+   test churn; best done when nothing else is in flight to avoid conflicts.
+5. **§2's time bucket** — still worth landing on its own merits (it bounds
+   replay of a *stale* OGM at a fresh receiver, which the challenge does not
+   address), but it is no longer on the critical path and it still owns the
+   embedded wall-clock question. Sequence it after the above, or drop it if the
+   clock question stays unsettled.
+6. **Per-link (MACsec-shaped) authentication** — the eventual general answer,
+   and the only one that also covers unauthenticated flooded `Bcast`. A
+   project, not a change; see §4's closing subsection for what it does and does
+   not subsume.
+
+## 9. Key file map for the implementer
 
 | File | Gaps | What changes |
 |------|------|--------------|
-| `libs/wayfinder/src/auth.rs` | 1, 2, 3 | `signed_message`, `augment_ogm`, `verify_ogm`, `cache_neighbor`, `live_neighbor`/`evict_expired_neighbors`, `set_time`, `tag_directed`, `verify_directed`, `neighbor_cert`, `neighbor_x_pubkey` |
-| `libs/batman/src/wire.rs` | 1 | `TvlvType::SenderSig = 0x84` |
-| `libs/wayfinder/src/lib.rs` | 1 | `verify_ogm` call site gains `frame.src` |
+| `libs/wayfinder/src/auth.rs` | 3 | `cache_neighbor`, `live_neighbor`/`evict_expired_neighbors`, `set_time`, `tag_directed`, `verify_directed`, `neighbor_cert`, `neighbor_x_pubkey` |
 | `libs/wayfinder-auth/src/cert.rs` | 4 | `verify_cert` MAC/key check |
 | `libs/wayfinder-auth/src/error.rs` | 4 | `AuthError::MacKeyMismatch` |
 | `libs/wayfinder-server/src/authority.rs` | 4 | `submit_csr` derivation guard (~line 722) |
 | `bins/wayfinder-ctl/src/cert.rs` | 4 | `issue` (`--mac` validation), `approve` (CSR MAC check) |
-| `libs/wayfinder-driver-core/src/lib.rs` | §6 | `tag_directed_into` counter + `warn!` → `trace!` (line ~215) |
-| `libs/wayfinder-embedded-driver/src/lib.rs` | 2 | wall-clock source, once §2's question is settled (see line 467) |
+| `libs/wayfinder-driver-core/src/lib.rs` | §7 | `tag_directed_into` counter + `warn!` → `trace!` (line ~215) |
+| `libs/wayfinder-embedded-driver/src/lib.rs` | 2 | wall-clock source, once §2's question is settled (see line 467) — **not** needed for §4's fix |
+| `libs/wayfinder/src/auth.rs` | §4 | the challenge/response pair over `frame_tag` + the pairwise-key cache |
+| `libs/batman/src/engine.rs` | §4 | gate `best_next_hop` promotion (`handle_rx`'s incumbent/challenger comparison) and both selection paths (`next_hop`, `lookup_route`) on a proven next hop |
+| `libs/batman/src/wire.rs` | §4 | `BatmanPacketType` variants for the challenge and its response |
 | `sim/tests/test_security.py`, `sim/tests/test_adversary.py` | all | the gap tests flip from asserting the gap to asserting the fix |
 | `sim/scenarios/red_team.py` | all | verdicts flip `GAP` → `HELD` |
 | `sim/tests/test_red_team.py` | all | `BASELINE` flips with the verdicts it pins |

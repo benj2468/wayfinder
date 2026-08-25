@@ -66,6 +66,7 @@ fn routing_table_human_lists_entries() {
                 neighbor_id: vec![0, 0, 0, 0, 0, 3],
                 tq: 240,
                 last_seqno: 17,
+                proven: true,
             }],
         }],
     };

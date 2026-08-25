@@ -70,6 +70,15 @@ pub const DEFAULT_OGM_INTERVAL: Duration = Duration::from_secs(1);
 /// rather than the minutes an OGM-interval timeout can take in steady state.
 pub const MAX_MISSED_KEEPALIVES: u32 = 3;
 
+/// How many expected intervals a next-hop proof stays current for before the
+/// path it vouches for stops being selectable.
+///
+/// Smaller than [`MAX_MISSED_OGMS`] on purpose: an OGM path aging out costs a
+/// route, but a *proof* aging out is the only thing standing between a spoofed
+/// next hop and the traffic aimed at it, so it should lapse well before the
+/// path it guards does. See `docs/design/09-mesh-auth-gaps.md` §4.
+pub const MAX_MISSED_PROOFS: u32 = 3;
+
 /// Fallback expected keep-alive interval used to seed a freshly-heard
 /// neighbor's miss budget before a second heartbeat provides a real gap to
 /// measure, and whenever no interface has a keep-alive schedule configured.
@@ -145,14 +154,27 @@ pub struct OriginatorRecord {
     /// The name is historical and reads as though it were a relay; it is not.
     /// The relays are in [`paths`](Self::paths), and the selected one is
     /// [`best_next_hop`](Self::best_next_hop). `best_next_hop ==
-    /// neighbor_ident` is precisely the test for "reachable directly", which
-    /// is how `CentralRouter::neighbor_count` counts one-hop neighbors.
+    /// Some(neighbor_ident)` is precisely the test for "reachable directly",
+    /// which is how `CentralRouter::neighbor_count` counts one-hop neighbors.
     pub neighbor_ident: Mac,
     /// The next-hop MAC that packets for this originator are forwarded to —
-    /// the immediate neighbor of the best path.
-    pub best_next_hop: Mac,
-    /// The highest transmission quality (0..=255) among all known paths to this
-    /// originator; the metric the best next hop is chosen by.
+    /// the immediate neighbor of the best path — or `None` when no path is
+    /// currently usable.
+    ///
+    /// `None` is not merely "no paths known": on an authenticated mesh a path
+    /// whose neighbor has not proven itself is deliberately not selectable, so
+    /// a freshly discovered originator sits here with `None` and a populated
+    /// [`paths`](Self::paths) until its next hop answers a challenge. Modelled
+    /// as an `Option` rather than defaulting to the first sender precisely so
+    /// that state cannot be skipped: an attacker's spoofed OGM would otherwise
+    /// install itself here before any gate ran.
+    pub best_next_hop: Option<Mac>,
+    /// Transmission quality (0..=255) of the *currently selected* path — the
+    /// highest among **selectable** paths, not among all known ones; the metric
+    /// the best next hop is chosen by.  Zero when nothing is selectable,
+    /// including while every path's neighbor is still unproven, so a `0`
+    /// alongside populated `paths` reads as "being challenged", not "dead
+    /// link".
     pub max_tq: u8,
     /// Sequence number of the most recent OGM accepted for this originator via
     /// any path.
@@ -248,6 +270,49 @@ pub struct BatmanEngine<
     /// [`BatmanEngine::keepalive_missed`]). Bounded like `originator_table`;
     /// a newly-heard neighbor evicts the least-recently-heard entry when full.
     pub keepalive: FnvIndexMap<Mac, KeepAliveStats, MAX_ORIGINATORS>,
+    /// When a neighbor last proved itself a legitimate next hop by answering a
+    /// challenge, and **which interface the answer arrived on**. Only consulted
+    /// while [`require_proof`](Self::require_proof) is set; bounded like
+    /// `originator_table`.
+    ///
+    /// The interface is recorded because egress resolution cannot be trusted to
+    /// find the peer on its own: it goes through the link-quality table, which
+    /// is written on frame receipt before any authentication verdict, so an
+    /// attacker spoofing a member's source address can make its own link look
+    /// like the best way to reach that member. An answered challenge cannot be
+    /// *manufactured* — only the key holder could have produced the tag — so it
+    /// is what egress pins to. Note the narrower guarantee: the tag is
+    /// unforgeable, but the interface is whichever link delivered the answer
+    /// first, which a wormhole relaying the genuine answer can be (see
+    /// "Residual: wormhole" in `docs/design/09-mesh-auth-gaps.md`).
+    pub(crate) proven: FnvIndexMap<Mac, (Duration, usize), MAX_ORIGINATORS>,
+    /// When each neighbor was last *challenged*, and how many attempts have
+    /// gone unanswered since it last proved itself — so a candidate is
+    /// re-probed on a bounded cadence rather than on every driver tick.
+    /// Independent of [`proven`](Self::proven): a neighbor that never answers
+    /// stays in here and out of there.
+    ///
+    /// The count is what makes the retry *exponential* rather than flat, and
+    /// the distinction is the difference between a mesh that converges in a
+    /// second and one that takes over two minutes. A node's first challenge
+    /// routinely loses a race it cannot see: it fires as soon as an originator
+    /// appears, which under lazy certificate distribution is before the peer
+    /// holds this node's certificate, and the peer drops it as an unverified
+    /// directed frame. A flat backoff of one
+    /// [`seed_interval`](BatmanEngine::seed_interval) charged a full OGM
+    /// `i_max` for that, even while the mesh was still emitting at `i_min`.
+    /// Doubling from `i_min` instead recovers in about a second and still
+    /// settles at one frame per `seed_interval` for a peer that genuinely
+    /// never answers, so the duty-cycle budget in
+    /// `docs/design/09-mesh-auth-gaps.md` is unchanged.
+    pub(crate) challenged: FnvIndexMap<Mac, (Duration, u32), MAX_ORIGINATORS>,
+    /// Whether a next hop must have proven itself to be selectable.
+    ///
+    /// Off by default and set by the router when mesh authentication is
+    /// enabled: proof rests on pairwise keys, which an unauthenticated mesh
+    /// does not have, so requiring it there would break every route rather
+    /// than securing anything.
+    pub(crate) require_proof: bool,
     /// Per-interface fixed-cadence keep-alive emission schedules, indexed by
     /// interface index. `None` (the default for every slot) means that
     /// interface never transmits keep-alives — opt-in per
@@ -299,6 +364,9 @@ impl<
             mcast_members: HVec::new(),
             ogm_timers: HVec::new(),
             keepalive: FnvIndexMap::new(),
+            proven: FnvIndexMap::new(),
+            challenged: FnvIndexMap::new(),
+            require_proof: false,
             keepalive_timers: HVec::new(),
             topology_changed: false,
             relay_oversize_drops: 0,

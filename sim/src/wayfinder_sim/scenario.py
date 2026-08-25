@@ -125,6 +125,26 @@ class Simulation:
                 )
                 node_keepalive[endpoint].append(keepalive)
 
+        # A node's links are its router interfaces, and the router holds a
+        # fixed `wf.MAX_INTERFACES` of them. The driver drops the surplus (with
+        # a warning nobody reads in a sweep), so a node past the cap goes mute
+        # on links this topology says are up — and the only symptom is a route
+        # that never converges, which reads as a routing or trust result rather
+        # than a wiring mistake. Refuse the topology instead of measuring it.
+        overloaded = {
+            name: len(ifaces)
+            for name, ifaces in node_interfaces.items()
+            if len(ifaces) > wf.MAX_INTERFACES
+        }
+        if overloaded:
+            detail = ", ".join(
+                f"{name!r} has {count}" for name, count in sorted(overloaded.items())
+            )
+            raise ValueError(
+                f"a node may have at most wf.MAX_INTERFACES={wf.MAX_INTERFACES} "
+                f"links, one per router interface: {detail}"
+            )
+
         # A pair of node names -> the (possibly shared-LAN) Link joining
         # them, for `sample_channel`'s probing.
         self._link_for_pair: dict[frozenset[str], Link] = {}
@@ -281,10 +301,16 @@ class Simulation:
         Asks the originator table, which only a frame that passed
         verification writes to — unlike `route_via`, which resolves through
         link quality and so answers for rejected senders too.
+
+        A *usable* route, not merely a discovered originator: on an
+        authenticated mesh a path is recorded before its next hop has proven
+        itself, and cannot carry traffic until it has. Asking only whether the
+        record exists would call an attacker's re-flood a route, since
+        discovery is exactly the part an outsider can still drive.
         """
         mac = dest if isinstance(dest, wf.PyMac) else self._states[dest].mac
         return any(
-            record.originator == mac
+            record.originator == mac and record.best_next_hop is not None
             for record in self._states[src].driver.originator_table()
         )
 

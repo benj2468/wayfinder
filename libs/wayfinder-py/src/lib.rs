@@ -57,6 +57,11 @@ fn wayfinder_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.py().get_type::<MalformedFrameError>(),
     )?;
     m.add("MAX_INTERFACES", wayfinder::MAX_INTERFACES)?;
+    m.add("MAX_NEIGHBOR_KEYS", wayfinder::auth::MAX_NEIGHBOR_KEYS)?;
+    m.add(
+        "MAX_IN_PROGRESS_PROOF",
+        wayfinder::auth::MAX_IN_PROGRESS_PROOF,
+    )?;
     m.add("MAX_LINK_FRAME_LEN", interfaces::frame::MAX_LINK_FRAME_LEN)?;
     Ok(())
 }

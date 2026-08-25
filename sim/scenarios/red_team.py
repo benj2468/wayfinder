@@ -195,7 +195,14 @@ def attack_passive_eavesdrop() -> Finding:
 def attack_ogm_replay() -> Finding:
     """Replay one captured, genuinely-signed OGM at a node that has never met
     its originator — a node that just booted, or one out of the real
-    originator's range."""
+    originator's range.
+
+    Held by the next-hop proof, not by anything about the OGM: the replay still
+    verifies and is still learned as a path. It simply cannot be *selected*,
+    because the address it spoofs would have to answer a challenge with a
+    pairwise key the attacker does not hold. See
+    ``docs/design/09-mesh-auth-gaps.md`` §4.
+    """
     body, hq_mac = _capture_signed_ogm()
     m = mesh()
     sim = Simulation(
@@ -218,7 +225,235 @@ def attack_ogm_replay() -> Finding:
             "seqno replay protection is per-receiver state, so it does not cover "
             "a receiver that has none"
             if fooled
-            else "replayed OGM rejected"
+            else "replayed OGM is accepted for path learning — its signature is "
+            "genuine and covers no freshness — but the spoofed next hop cannot "
+            "answer a challenge, so it never becomes a usable route"
+        ),
+    )
+
+
+def attack_ogm_replay_hijacks_local_traffic() -> Finding:
+    """The interception `attack_ogm_replay` doesn't test: even though a
+    replayed OGM cannot win `best_next_hop` (§4), can it still make the
+    *victim's own locally-originated traffic* leak to the attacker?
+
+    Eve replays hq's captured, genuinely-signed OGM under hq's own spoofed
+    link-layer source — unlike `attack_unauthenticated_relay`, which spoofs
+    her *own* identity as the relay. That distinction is what makes this a
+    different attack surface: the link-quality table's entry for hq's own MAC
+    now points at Eve's link, written on receipt before any authentication
+    verdict. `victim` still holds hq's real pairwise key regardless — an
+    OGM's signature attests its originator no matter who relayed it — so a
+    locally-originated send to hq tags correctly under that real key. The
+    only open question is which physical interface it goes out on, and
+    that's a route decision, not a tagging one: it must be refused the same
+    way forwarding through an unproven next hop already is (§4), or the
+    proof gate protects relayed traffic while leaving the node's own traffic
+    exposed to exactly the interception the whole feature exists to close.
+    """
+    body, hq_mac = _capture_signed_ogm()
+    m = mesh()
+    sim = Simulation(
+        [Node("victim", credential=Credential()), Node("eve")],
+        [pair("victim", "eve", PerfectWire())],
+        mesh=m,
+    )
+    frame = forge.link_frame(wf.PyMac.BROADCAST, hq_mac, body)
+    for i in range(60):
+        sim.inject("eve", frame, at_s=0.5 + i * 0.3)
+    sim.run(until_s=25.0)
+
+    tap = sim.wiretap("victim-eve")
+    sim.driver("victim").queue_local_send(hq_mac, b"SENSITIVE TRAFFIC")
+    sim.run(until_s=31.0)
+    intercepted = bool(tap.containing(b"SENSITIVE TRAFFIC"))
+
+    return Finding(
+        "OGM replay hijacks locally-originated traffic",
+        GAP if intercepted else HELD,
+        (
+            "victim's own send to hq is silently addressed to hq directly and "
+            "dispatched over whatever interface the spoofed identity poisoned "
+            "-- Eve's link -- leaking a real payload she cannot forge but can "
+            "read (payloads are never encrypted, only authenticated)"
+            if intercepted
+            else "a route whose next hop has not proven itself is refused for "
+            "locally-originated sends too, not only for forwarding: the send "
+            "is dropped rather than silently addressed to an unproven "
+            "destination over a route the spoof poisoned"
+        ),
+    )
+
+
+def attack_forged_challenge_response_flood() -> Finding:
+    """Eve, holding no credential at all, blasts next-hop-proof *responses*
+    claiming to answer for hq — without ever holding hq's pairwise key to
+    compute a real one.
+
+    hq is captured off the air the same way as `_capture_signed_ogm`'s other
+    callers: victim genuinely verifies hq's own signature (an OGM's signature
+    attests nothing about who relays it — gap 1/2), so victim keeps hq as a
+    candidate next hop and keeps challenging it. hq itself is never live in
+    this topology, so every challenge sits outstanding and unanswered —
+    exactly the gap Eve is trying to fill by volume instead of by key: can
+    enough guesses, or just enough noise, ever satisfy a `frame_tag` neither
+    verifies without the real pairwise secret?
+    """
+    body, hq_mac = _capture_signed_ogm()
+    m = mesh()
+    sim = Simulation(
+        [Node("victim", credential=Credential()), Node("eve")],
+        [pair("victim", "eve", PerfectWire())],
+        mesh=m,
+    )
+    frame = forge.link_frame(wf.PyMac.BROADCAST, hq_mac, body)
+    for i in range(60):
+        sim.inject("eve", frame, at_s=0.5 + i * 0.3)
+    sim.run(until_s=25.0)  # converge, and let victim issue its first real challenge
+
+    victim_mac = sim.mac("victim")
+    rng = random.Random(0xE7E)
+
+    def forged_response() -> bytes:
+        tag = bytes(rng.getrandbits(8) for _ in range(16))
+        return forge.link_frame(victim_mac, hq_mac, forge.next_hop_response(tag))
+
+    sim.flood("eve", forged_response, rate_hz=500, start_s=25.5, duration_s=10.0)
+    sim.run(until_s=40.0)
+
+    proven = sim.driver("victim").proof_current(hq_mac)
+    return Finding(
+        "Forged challenge-response flood",
+        GAP if proven else HELD,
+        (
+            "5,000 forged responses, none computed over hq's real pairwise "
+            "key, still satisfied an outstanding challenge"
+            if proven
+            else "every forged tag failed verification -- the pairwise key "
+            "Eve does not hold is the only thing that can ever answer a "
+            "challenge, however many guesses she sends"
+        ),
+    )
+
+
+def attack_broadcast_addressed_challenge() -> Finding:
+    """Eve, holding no credential, sends a next-hop-proof *challenge* to the
+    broadcast address while spoofing hq as its source.
+
+    The pairwise trailer that authenticates every directed frame is skipped
+    for a multicast destination — broadcasts and OGMs carry their own
+    signature instead — and the destination MAC is Eve's to choose. So a
+    broadcast-addressed challenge reaches the proof handler having been
+    authenticated by nothing at all. If victim answers it, an outsider has an
+    unauthenticated reflection primitive: one forged frame in, one tagged
+    response out, burning shared-medium airtime and a pairwise counter per
+    frame, at whatever rate the medium allows.
+
+    Measured by whether victim actually puts a response on Eve's link.
+    """
+    body, hq_mac = _capture_signed_ogm()
+    m = mesh()
+    sim = Simulation(
+        [Node("victim", credential=Credential()), Node("eve")],
+        [pair("victim", "eve", PerfectWire())],
+        mesh=m,
+    )
+    # victim verifies hq's certificate off the relayed OGM, so it holds hq's
+    # pairwise key — the precondition for `answer_challenge` to succeed at all.
+    relayed = forge.link_frame(wf.PyMac.BROADCAST, hq_mac, body)
+    for i in range(20):
+        sim.inject("eve", relayed, at_s=0.5 + i * 0.3)
+    sim.run(until_s=20.0)
+
+    tap = sim.wiretap("victim-eve")  # fresh: only frames from here on
+    rng = random.Random(0xB0A)
+    nonce = bytes(rng.getrandbits(8) for _ in range(16))
+    forged = forge.link_frame(
+        wf.PyMac.BROADCAST, hq_mac, forge.next_hop_challenge(nonce)
+    )
+    for i in range(20):
+        sim.inject("eve", forged, at_s=20.5 + i * 0.25)
+    sim.run(until_s=28.0)
+
+    victim_mac = sim.mac("victim")
+    answered = [
+        f for f in tap.of_type(forge.PACKET_NEXT_HOP_RESPONSE) if f.src == victim_mac
+    ]
+    return Finding(
+        "Broadcast-addressed next-hop challenge",
+        GAP if answered else HELD,
+        (
+            f"victim answered {len(answered)} of 20 unauthenticated broadcast "
+            "challenges -- a keyless outsider can reflect a tagged response "
+            "out of any member on demand"
+            if answered
+            else "every broadcast-addressed challenge was refused before it "
+            "reached the proof handler -- a proof frame not addressed to this "
+            "node is malformed by construction"
+        ),
+    )
+
+
+def attack_challenge_response_replay() -> Finding:
+    """Eve captures one genuine next-hop-proof response — bob answering
+    victim's real challenge, over the real victim-bob link — and blasts
+    those exact bytes at victim from her own, separate link.
+
+    `verify_challenge_response` consumes the outstanding challenge on
+    success, so a captured response is supposed to prove liveness exactly
+    once (design doc §4): "accepting a replay would let an attacker that
+    observed a single exchange keep a route alive without the neighbor ever
+    participating again." Whether victim still reads hq as proven afterward
+    can't tell the two apart — bob keeps answering for real regardless of
+    what Eve does — so the sharper question is whether the replay ever gets
+    *credited*: `note_proven` also records which interface answered, and
+    egress trusts that over the (spoofable) link-quality table precisely
+    because an answered challenge is supposed to be unforgeable. If Eve's
+    replay were accepted, real traffic addressed to bob would follow it onto
+    her link instead of bob's.
+    """
+    m = mesh()
+    sim = Simulation(
+        [
+            Node("victim", credential=Credential()),
+            Node("bob", credential=Credential()),
+            Node("eve"),
+        ],
+        [pair("victim", "bob", PerfectWire()), pair("victim", "eve", PerfectWire())],
+        mesh=m,
+    )
+    tap = sim.wiretap("victim-bob")
+    sim.run(until_s=30.0)  # converge, and let a real challenge/response complete
+
+    bob_mac = sim.mac("bob")
+    responses = [
+        f for f in tap.of_type(forge.PACKET_NEXT_HOP_RESPONSE) if f.src == bob_mac
+    ]
+    if not responses:
+        raise RuntimeError(
+            "captured no genuine next-hop response -- bob never proved itself"
+        )
+    captured = responses[-1].raw
+
+    sim.flood("eve", lambda: captured, rate_hz=200, start_s=30.5, duration_s=5.0)
+    sim.run(until_s=36.0)
+
+    eve_tap = sim.wiretap("victim-eve")  # fresh: only frames from here on
+    sim.send("victim", "bob", b"SENSITIVE TRAFFIC", at_s=36.5)
+    sim.run(until_s=41.0)
+
+    hijacked = bool(eve_tap.containing(b"SENSITIVE TRAFFIC"))
+    delivered = sim.poll_local("bob") == b"SENSITIVE TRAFFIC"
+    return Finding(
+        "Next-hop challenge-response replay",
+        GAP if hijacked else HELD,
+        (
+            "the replayed response got credited: real traffic addressed to "
+            "bob followed it onto eve's link instead"
+            if hijacked
+            else f"1,000 replays of the exact captured bytes never got "
+            f"credited -- traffic to bob still delivered over the real link: "
+            f"{delivered}"
         ),
     )
 
@@ -272,7 +507,12 @@ def attack_unauthenticated_relay() -> Finding:
             "interception"
         )
     else:
-        verdict, detail = HELD, "relayed OGM did not poison the route table"
+        verdict = HELD
+        detail = (
+            "outsider is still recorded as a path — discovery must keep "
+            "working — but holds no pairwise key, so it can never answer a "
+            "next-hop challenge and never wins best_next_hop"
+        )
     return Finding("Unauthenticated OGM relay", verdict, detail)
 
 
@@ -372,6 +612,71 @@ def attack_ca_misissuance() -> Finding:
     )
 
 
+def attack_proof_starvation_by_neighbour_count() -> Finding:
+    """As many concurrent proof candidates as the prover can hold neighbours.
+
+    Every next hop must answer a challenge before it is selectable, and
+    ``poll_due_challenges`` issues to *every* due candidate in one synchronous
+    pass — no response can arrive until the pass ends. If the outstanding-proof
+    table is smaller than the number of candidates in that pass,
+    ``issue_challenge`` evicts the least-recently-issued entry, the earliest
+    candidates lose their challenge before their answer comes back, the answer
+    is refused as "nothing outstanding", and no route through that neighbour is
+    ever selectable.
+
+    Not attacker-driven — it needs no forged frame at all, only a mesh denser
+    than the table. That is what makes it worth tracking: a dense but entirely
+    legitimate deployment would silently lose routes, and the only evidence is
+    trace-level lines on two different nodes that have to be correlated.
+
+    The density is taken from ``MAX_NEIGHBOR_KEYS``, not a literal: that is the
+    most neighbours a node can hold verified keys for at all, so it is also the
+    most proof candidates it can ever face at once — the worst case the table
+    has to survive.
+
+    ``MAX_IN_PROGRESS_PROOF`` is deliberately a quarter of that, so this density
+    *does* evict. It holds anyway, because an evicted challenge is never
+    answered and an unanswered challenge is retried on a backoff: eviction costs
+    a round trip, not a route. What the table has to satisfy is only that
+    concurrent proof throughput stay above the renewal rate. Measured at this
+    density, 4 slots and 64 slots converge identically and a single slot never
+    converges — so this scenario catches a table small enough to fall under the
+    renewal rate, and nothing finer. Read a pass as "not grossly mis-sized",
+    not as "this size is right".
+
+    They must all be *mutual* neighbours of the prover simultaneously, so this
+    is one shared segment rather than a star of point-to-point links: a star
+    would need one router interface per spoke and ``MAX_INTERFACES`` is 8, so
+    it would measure the interface table instead — which is what an earlier
+    version of this scenario did, reporting a gap that had nothing to do with
+    proofs.
+    """
+    hub = "hub"
+    spokes = [f"spoke{i}" for i in range(wf.MAX_NEIGHBOR_KEYS)]
+    m = mesh()
+    nodes = [Node(hub, credential=Credential())]
+    nodes += [Node(s, credential=Credential()) for s in spokes]
+    sim = Simulation(nodes, shared_lan([hub, *spokes], PerfectWire()), mesh=m)
+    sim.run(until_s=40.0)
+
+    starved = [s for s in spokes if not sim.has_route(hub, s)]
+    return Finding(
+        "Proof starvation by neighbour count",
+        GAP if starved else HELD,
+        (
+            f"{len(starved)} of {len(spokes)} fully credentialed neighbours "
+            f"never became usable next hops ({', '.join(starved[:4])}"
+            f"{', …' if len(starved) > 4 else ''}) — more concurrent "
+            "candidates than MAX_IN_PROGRESS_PROOF can hold, so in-flight "
+            "challenges are evicted before their answers arrive"
+            if starved
+            else f"all {len(spokes)} neighbours — the most a node can hold "
+            "keys for, so the most proofs it can ever owe at once — proved "
+            "themselves and routed"
+        ),
+    )
+
+
 def attack_flood() -> Finding:
     """A storm of garbage and forged frames, while the mesh must keep routing.
 
@@ -428,8 +733,13 @@ ATTACKS: list[Callable[[], Finding]] = [
     attack_passive_eavesdrop,
     attack_expired_credential,
     attack_ogm_replay,
+    attack_ogm_replay_hijacks_local_traffic,
+    attack_forged_challenge_response_flood,
+    attack_challenge_response_replay,
+    attack_broadcast_addressed_challenge,
     attack_unauthenticated_relay,
     attack_ca_misissuance,
+    attack_proof_starvation_by_neighbour_count,
 ]
 
 

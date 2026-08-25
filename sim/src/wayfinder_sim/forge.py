@@ -28,6 +28,8 @@ PACKET_OGM = 0x01
 PACKET_BCAST = 0x02
 PACKET_UNICAST = 0x03
 PACKET_KEEPALIVE = 0x07
+PACKET_NEXT_HOP_CHALLENGE = 0x08
+PACKET_NEXT_HOP_RESPONSE = 0x09
 """`batman::wire::BatmanPacketType` discriminants, as the first payload
 byte."""
 
@@ -101,6 +103,22 @@ def keepalive(seqno: int = 1) -> bytes:
     """A link-local keep-alive heartbeat, single-hop and unrouted. Cheap to
     forge and cheap to send, which is what makes it interesting as a flood."""
     return bytes((PACKET_KEEPALIVE, OGM_VERSION)) + (seqno & 0xFFFF).to_bytes(2, "big")
+
+
+def next_hop_challenge(nonce: bytes) -> bytes:
+    """A next-hop proof challenge: `[type][version][nonce]`, link-local and
+    single-hop like `keepalive`. A real challenger derives `nonce` from a PRF
+    keyed on its own secret, unpredictable to anyone else; nothing about the
+    wire format stops an attacker sending whatever bytes it likes here."""
+    return bytes((PACKET_NEXT_HOP_CHALLENGE, OGM_VERSION)) + nonce
+
+
+def next_hop_response(tag: bytes) -> bytes:
+    """The answer to a next-hop proof challenge: `[type][version][tag]`. A
+    real responder computes `tag` as a pairwise-keyed MAC over the
+    challenger's nonce — proof of holding a key this forges nothing about;
+    this just writes whatever bytes the caller gives it."""
+    return bytes((PACKET_NEXT_HOP_RESPONSE, OGM_VERSION)) + tag
 
 
 def tvlv(record_type: int, value: bytes, *, version: int = 1) -> bytes:

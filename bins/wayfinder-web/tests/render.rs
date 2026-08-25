@@ -64,6 +64,7 @@ fn seeded_snapshot() -> NodeSnapshot {
             neighbor_id: vec![0, 0, 0, 0, 0, 3],
             tq: 240,
             last_seqno: 17,
+            proven: true,
         }],
     });
     snap.link_features.entries.push(LinkFeaturesEntry {

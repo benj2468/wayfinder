@@ -333,16 +333,30 @@ impl<Local: FrameIo> Driver<Local> {
         self.refresh_auth_clock(now);
 
         // When the soonest interface is next due to emit an OGM or a
-        // keep-alive, on the tokio clock.  Each interface backs off (Trickle)
-        // on its own OGM schedule and ticks its own independent fixed-cadence
-        // keep-alive schedule, so the periodic arm sleeps until whichever
-        // fires first, of either kind.  Recomputed every iteration, so a
-        // timer reset by the frame just processed (an inconsistency) shortens
-        // the next sleep automatically.
+        // keep-alive, or the soonest next-hop proof challenge falls due, on the
+        // tokio clock.  Each interface backs off (Trickle) on its own OGM
+        // schedule and ticks its own independent fixed-cadence keep-alive
+        // schedule, so the periodic arm sleeps until whichever fires first, of
+        // any of the three.  Recomputed every iteration, so a timer reset by
+        // the frame just processed (an inconsistency) shortens the next sleep
+        // automatically.
+        //
+        // The challenge deadline is the one that must not be dropped from this
+        // `min`.  Without it proof rides the OGM timer, and a newly discovered
+        // originator is not challenged until the next Trickle deadline — up to
+        // a full `i_max` after its path was learned, on a mesh that has
+        // settled into its quiet cadence.  With it, the frame that discovers a
+        // path also shortens this sleep to zero, so the challenge goes out on
+        // the next turn of the loop.
         let next_due = self
             .router
             .next_broadcast_after(now)
-            .min(self.router.next_keepalive_after(now));
+            .min(self.router.next_keepalive_after(now))
+            .min(
+                self.router
+                    .next_challenge_after(now)
+                    .unwrap_or(Duration::MAX),
+            );
 
         // Destructure into disjoint field borrows so the `select!` can hold a
         // mutable borrow of the interfaces alongside the router and buffers.
@@ -353,7 +367,7 @@ impl<Local: FrameIo> Driver<Local> {
             query_rx,
             mac,
             snooper,
-            start: _,
+            start,
             epoch_unix: _,
             rx_buffer,
             tx_buffer,
@@ -364,7 +378,12 @@ impl<Local: FrameIo> Driver<Local> {
         } = self;
         let mac = *mac;
 
-        let output: LoopOutput = {
+        // Each arm reports the clock it planned against alongside its output:
+        // every arm but the periodic one plans at the `now` sampled above,
+        // while that one re-reads the clock after its sleep.  Dispatch must
+        // use the same instant the frames were planned at, or the transmit
+        // gate and auth tagging would judge them against a different one.
+        let (now, output): (Duration, LoopOutput) = {
             tokio::select! {
                 // `select_all` panics if constructed over an empty iterator, and
                 // the `if` guard below only gates whether this branch's future is
@@ -388,15 +407,15 @@ impl<Local: FrameIo> Driver<Local> {
                     wayfinder_driver_core::handle_link_result(
                         now, router, idx, result, tx_buffer, &mut out,
                     );
-                    out
+                    (now, out)
                 },
                 Ok(len) = local.recv(rx_buffer), if check_local => {
                     trace!(len, "host device rx frame");
                     let eth = &rx_buffer[..len];
-                    LoopOutput {
+                    (now, LoopOutput {
                         mesh: plan_host_frame(now, router, snooper, eth, tx_buffer),
                         local: None,
-                    }
+                    })
                 },
                 Some((request, resp_tx)) = query_rx.recv(), if check_server => {
                     let ca = provider.as_mut().map(|c| c as &mut dyn MeshAuthority);
@@ -408,18 +427,27 @@ impl<Local: FrameIo> Driver<Local> {
                     }
                     let response = WayfinderService::new(adapter).handle(request);
                     let _ = resp_tx.send(response);
-                    LoopOutput::none()
+                    (now, LoopOutput::none())
                 },
                 Some(reply) = recv_auth_snapshot(auth_snapshot_rx), if check_server => {
                     let _ = reply.send(build_auth_snapshot(router, *identity_seed));
-                    LoopOutput::none()
+                    (now, LoopOutput::none())
                 },
                 _ = sleep(next_due), if check_periodic => {
-                    trace!("polling OGMs and keep-alives");
+                    // Re-read the clock: `now` was sampled before the `select!`
+                    // and this arm has just slept `next_due` past it, so using
+                    // it here would stamp every schedule, proof and backoff the
+                    // whole sleep in the past.  On a settled mesh that is a
+                    // two-minute error, and it is the same clock the receive
+                    // arm — which does *not* sleep — stamps proofs with, so the
+                    // two would disagree about how old a proof is.
+                    let now = start.elapsed();
+                    trace!("polling OGMs, keep-alives and next-hop challenges");
                     let mut out = LoopOutput::none();
                     wayfinder_driver_core::poll_due_ogms(router, now, tx_buffer, &mut out);
                     wayfinder_driver_core::poll_due_keepalives(router, now, tx_buffer, &mut out);
-                    out
+                    wayfinder_driver_core::poll_due_challenges(router, now, tx_buffer, &mut out);
+                    (now, out)
                 }
             }
         };

@@ -6,6 +6,18 @@ this module is a thin, one-to-one binding over it.
 
 MAX_INTERFACES: int
 MAX_LINK_FRAME_LEN: int
+MAX_NEIGHBOR_KEYS: int
+"""Neighbors a node can cache verified keys for — its ceiling on concurrent
+neighbors, and so on concurrent next-hop proof candidates."""
+
+MAX_IN_PROGRESS_PROOF: int
+"""Next-hop proof challenges a node can have outstanding at once.
+
+Deliberately smaller than `MAX_NEIGHBOR_KEYS`: an evicted challenge is never
+answered, so it is retried on the ordinary unanswered-challenge backoff. The
+table therefore sizes concurrent proof *throughput*, not one slot per possible
+neighbor — but it is not free to shrink, since throughput below the proof
+renewal rate leaves neighbors permanently unproven."""
 
 def init_tracing(filter: str | None = None) -> None:
     """Install a `tracing_subscriber::fmt` subscriber (writing to stdout) so
@@ -100,7 +112,7 @@ class PyOriginatorRecord:
     authenticated mesh."""
 
     originator: PyMac
-    best_next_hop: PyMac
+    best_next_hop: PyMac | None
     max_tq: int
     last_seqno: int
     last_heard_ms: int
@@ -309,3 +321,4 @@ class PyDriver:
         can outlive the credential that created it."""
 
     def neighbor_cert(self, mac: PyMac) -> PyMembershipCert | None: ...
+    def proof_current(self, mac: PyMac) -> bool: ...

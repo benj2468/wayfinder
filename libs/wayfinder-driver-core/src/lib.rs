@@ -48,7 +48,6 @@ use core::time::Duration;
 use interfaces::link::LinkError;
 use interfaces::link::LinkMetrics;
 use tracing::trace;
-use tracing::warn;
 use wayfinder::DEFAULT_BATMAN_ETHER_TYPE;
 use wayfinder::EgressInterface;
 use wayfinder::auth::DIRECTED_TRAILER_LEN;
@@ -184,6 +183,7 @@ fn strip_directed<'a, R: RouterOps>(router: &mut R, frame: &'a LinkFrame) -> Opt
 /// [`DIRECTED_TRAILER_LEN`]: wayfinder::auth::DIRECTED_TRAILER_LEN
 fn tag_directed_into<R: RouterOps>(
     router: &mut R,
+    now: Duration,
     dst: Mac,
     protocol: u16,
     body_len: usize,
@@ -212,7 +212,15 @@ fn tag_directed_into<R: RouterOps>(
         // Auth on but we can't tag this directed frame (no verified key for dst
         // yet, or counter exhausted): the caller drops it rather than emit it in
         // the clear.
-        warn!(?dst, "auth: dropping untaggable directed frame");
+        //
+        // `trace!`, not `warn!`: `dst` comes from routing state a remote peer
+        // can influence, so a peer could otherwise drive this at frame rate and
+        // flood the bounded log ring a probe-less board depends on
+        // (CLAUDE.md's logging rules). The counter below is what makes the drop
+        // visible instead — a `warn!` nobody can afford to leave on is not
+        // observability.
+        trace!(?dst, "drop: untaggable directed frame");
+        router.record_untaggable_drop(now);
         None
     }
 }
@@ -244,8 +252,15 @@ pub fn handle_mesh_frame<R: RouterOps>(
             dst: f.dst,
             protocol: f.protocol,
             payload: f.payload,
-            // A re-flood must not go back out the interface it arrived on.
-            egress: Egress::Auto { exclude: Some(idx) },
+            egress: match rx.pin_egress_iface {
+                // A next-hop proof response: link-local by construction, so it
+                // must return out exactly the interface its challenge arrived
+                // on rather than through routing state (see `RxOutcome`'s
+                // `pin_egress_iface` doc).
+                Some(pinned) => Egress::Iface(pinned),
+                // A re-flood must not go back out the interface it arrived on.
+                None => Egress::Auto { exclude: Some(idx) },
+            },
         });
     }
     if let Some(inner) = rx.deliver_local {
@@ -313,6 +328,72 @@ pub fn poll_due_keepalives<R: RouterOps>(
     }
 }
 
+/// Emit a next-hop proof challenge to each neighbor still awaiting one,
+/// addressed to that neighbor.
+///
+/// A challenge goes out only for a candidate whose proof is missing, lapsed or
+/// due for renewal, and the router spaces retries per neighbor, so an
+/// unanswered candidate costs one frame per backoff step rather than one per
+/// tick.
+///
+/// **This is not silent in the steady state.** Renewal falls due after one
+/// `seed_interval()` while a proof only lapses after `MAX_MISSED_PROOFS` of
+/// them — the gap is the margin the round trip gets — so a fully proven mesh
+/// still re-challenges every path neighbor about once per interval, times the
+/// interface count below. Budget duty cycle against that, not against zero.
+///
+/// A candidate that is *not* answering is louder than that at first and no
+/// louder in the end: the retry starts at `i_min` and doubles, capping at
+/// `seed_interval()`. That shape is deliberate. A node's first challenge to a
+/// neighbor races the lazy certificate exchange and is routinely dropped by a
+/// peer that does not hold this node's certificate yet, and charging a full
+/// `i_max` for that lost frame left a settled mesh unable to route for over
+/// two minutes. The handful of extra frames a doubling retry spends are
+/// bounded by the cap, which is the rate the duty-cycle budget in
+/// `docs/design/09-mesh-auth-gaps.md` was written against.
+///
+/// Emitted on **every** interface rather than the router's metric-chosen one,
+/// which is the security-relevant part. `get_egress_interface` resolves through
+/// the link-quality table, and that table is written on frame *receipt* —
+/// before any authentication verdict — so an attacker spoofing a member's
+/// source address can make its own link look like the way to reach that member
+/// and collect the challenge itself. It could not answer, but it would not need
+/// to: the proof would simply never renew and the victim would lose a route it
+/// should have kept. Letting the attacker choose where the challenge goes hands
+/// it a denial of service, so the challenge does not ask. A challenge is a
+/// couple of dozen bytes and rare, which is what makes the fan-out affordable.
+pub fn poll_due_challenges<R: RouterOps>(
+    router: &mut R,
+    now: Duration,
+    tx_buffer: &mut [u8],
+    sink: &mut impl MeshSink,
+) {
+    let ifaces = router.num_interfaces();
+    // Each call marks its target challenged, so the candidate set shrinks every
+    // pass and the loop terminates.
+    while let Some((dst, f)) = router.poll_challenge(now, tx_buffer) {
+        trace!(
+            ?dst,
+            ifaces, "emitting next-hop challenge on every interface"
+        );
+        for idx in 0..ifaces {
+            // `Egress::Iface` is not re-gated by `plan_dispatch` (the OGM path
+            // already consulted `tx_ogm` before staging), so the per-link
+            // transmit gate has to be consulted here or not at all.
+            if !router.link_may_tx(idx, Some(BatmanPacketType::NextHopChallenge)) {
+                trace!(iface_idx = idx, "drop: tx gate disabled on this link");
+                continue;
+            }
+            sink.emit(OutgoingFrame {
+                dst: f.dst,
+                protocol: f.protocol,
+                payload: f.payload,
+                egress: Egress::Iface(idx),
+            });
+        }
+    }
+}
+
 /// Plan one mesh link's `recv` outcome into `sink`: a received frame, or a drop
 /// on error.
 ///
@@ -350,22 +431,33 @@ pub fn handle_link_result<R: RouterOps>(
     }
 }
 
-/// Plan everything the periodic timer made due into `sink` — OGMs and
-/// keep-alives, on their independent schedules.
+/// Plan the periodic work into `sink` — OGMs and keep-alives on their
+/// independent schedules, plus any next-hop proof that has fallen due.
 ///
 /// The timer arm of every shell's event loop, which sleeps until whichever
-/// schedule fires first and so must service both on waking. Callers that need
-/// to drive one schedule in isolation (deterministic stepping in tests) call
-/// [`poll_due_ogms`] and [`poll_due_keepalives`] directly.
+/// schedule fires first and so must service them all on waking. The third
+/// keeps no timer of its own — [`poll_due_challenges`] re-derives its candidate
+/// set from current routing and proof state on every call — but it does have a
+/// *deadline*, and a shell that sleeps must fold
+/// [`RouterOps::next_challenge_after`] into the same `min` as the OGM and
+/// keep-alive ones. Leaving it out is what welds proof to the OGM schedule: a
+/// newly discovered originator then waits for the next Trickle deadline, up to
+/// a full `i_max` on a settled mesh, carrying no traffic until it arrives.
+/// Callers that need to drive one in isolation (deterministic stepping in
+/// tests) call [`poll_due_ogms`], [`poll_due_keepalives`] and
+/// [`poll_due_challenges`] directly.
+///
+/// [`RouterOps::next_challenge_after`]: wayfinder::router_ops::RouterOps::next_challenge_after
 pub fn poll_due_all<R: RouterOps>(
     router: &mut R,
     now: Duration,
     tx_buffer: &mut [u8],
     sink: &mut impl MeshSink,
 ) {
-    trace!("polling OGMs and keep-alives");
+    trace!("polling OGMs, keep-alives and next-hop challenges");
     poll_due_ogms(router, now, tx_buffer, sink);
     poll_due_keepalives(router, now, tx_buffer, sink);
+    poll_due_challenges(router, now, tx_buffer, sink);
 }
 
 /// A set of mesh-interface indices, as a bitmask.
@@ -494,7 +586,7 @@ pub fn plan_dispatch<'a, R: RouterOps>(
     num_interfaces: usize,
 ) -> Option<DispatchPlan<'a>> {
     let () = INTERFACE_SET_FITS_ROUTER;
-    let send_len = tag_directed_into(router, dst, protocol, body_len, buf)?;
+    let send_len = tag_directed_into(router, now, dst, protocol, body_len, buf)?;
 
     // The BATMAN sub-type of this outgoing frame (its leading payload byte),
     // used to consult each candidate interface's per-link transmit gates
@@ -890,6 +982,7 @@ mod tests {
         buf.resize(body.len() + DIRECTED_TRAILER_LEN, 0);
         let out = tag_directed_into(
             &mut router,
+            Duration::ZERO,
             mac(2), // never verified => no pairwise key
             DEFAULT_BATMAN_ETHER_TYPE,
             body.len(),
@@ -912,6 +1005,7 @@ mod tests {
         buf.resize(body.len() + DIRECTED_TRAILER_LEN, 0);
         let out = tag_directed_into(
             &mut router,
+            Duration::ZERO,
             mac(2),
             DEFAULT_BATMAN_ETHER_TYPE,
             body.len(),
@@ -958,6 +1052,111 @@ mod tests {
             &stripped.payload[..],
             &inner[..],
             "trailer stripped, inner intact"
+        );
+    }
+
+    /// A next-hop proof *response* must go back out exactly the interface its
+    /// challenge arrived on — never resolved through routing state.
+    ///
+    /// Unlike the challenge itself (fanned out to every interface for this
+    /// exact reason, see `poll_due_challenges`), the response is a reply
+    /// planned by `handle_frame_with_metrics` and returned through the generic
+    /// `RxOutcome::forward` path, which `handle_mesh_frame` dispatches with
+    /// `Egress::Auto` — resolved via `CentralRouter::get_egress_interface`.
+    /// That function falls back to the link-quality table whenever the
+    /// responder has not *itself* independently proven the challenger yet
+    /// (proof is asymmetric and this is a real, if narrow, window: a
+    /// responder answering the very first challenge it ever receives from a
+    /// newly-discovered neighbor has typically not yet completed its own
+    /// reciprocal challenge of that neighbor). The link-quality table is
+    /// written from any broadcast frame's `frame.src` on receipt, before any
+    /// authentication verdict — so an attacker spoofing the challenger's MAC
+    /// on a *different* interface (e.g. replaying one of its genuine OGMs,
+    /// gap 1/2's own attack) can steer the response away from the real
+    /// challenger, denying exactly the proof exchange this feature exists to
+    /// secure. The link-quality poisoning is reproduced inline below, via a
+    /// spoofed broadcast on a second interface.
+    #[test]
+    fn next_hop_response_is_pinned_to_the_arrival_interface() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = CentralRouter::new(mac(1));
+        router.set_auth(member_auth(&authority, 1, mac(1)));
+        let mut challenger = member_auth(&authority, 2, mac(2));
+
+        // The router verifies mac(2) over the genuine link, interface 0.
+        let ogm = signed_ogm_bytes(&mut challenger, mac(2), 1);
+        let link = frame_bytes(Mac::BROADCAST, mac(2), DEFAULT_BATMAN_ETHER_TYPE, &ogm);
+        let mut tx = [0u8; wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN];
+        let mut sink = CaptureSink::default();
+        handle_mesh_frame(
+            Duration::ZERO,
+            &mut router,
+            0,
+            LinkFrame::ref_from_bytes(&link).unwrap(),
+            LinkMetrics::default(),
+            &mut tx,
+            &mut sink,
+        );
+        // mac(2) verifies the router right back, so it can tag a directed
+        // challenge to it below — the precondition `tag_directed` checks.
+        let router_ogm = signed_ogm_bytes(router.auth_mut().unwrap(), mac(1), 1);
+        assert_eq!(challenger.verify_ogm(&router_ogm), OgmVerdict::Verified);
+
+        // An attacker elsewhere replays mac(2)'s own (genuinely signed)
+        // broadcast OGM on interface 1 with a strong measured signal —
+        // exactly gap 1/2's attack — poisoning the link-quality table's
+        // opinion of where mac(2) lives, before the router's own reciprocal
+        // challenge of mac(2) has had a chance to complete.
+        let metrics = LinkMetrics {
+            quality: Some(200),
+            ..Default::default()
+        };
+        let mut poison_sink = CaptureSink::default();
+        handle_mesh_frame(
+            Duration::ZERO,
+            &mut router,
+            1,
+            LinkFrame::ref_from_bytes(&link).unwrap(),
+            metrics,
+            &mut tx,
+            &mut poison_sink,
+        );
+
+        // mac(2) genuinely (and correctly, pairwise-tagged like any other
+        // directed frame) challenges the router over the real link,
+        // interface 0.
+        let hdr = wayfinder::batman::wire::BatmanNextHopChallengePacket {
+            packet_type: BatmanPacketType::NextHopChallenge.as_u8(),
+            version: 5,
+        };
+        let mut inner = hdr.as_bytes().to_vec();
+        inner.extend_from_slice(&[0xAB; wayfinder::auth::CHALLENGE_NONCE_LEN]);
+        let mut body = inner.clone();
+        body.resize(inner.len() + DIRECTED_TRAILER_LEN, 0);
+        let (frame, trailer) = body.split_at_mut(inner.len());
+        challenger
+            .tag_directed(mac(1), frame, trailer)
+            .expect("challenger tags to a verified neighbor");
+        let challenge = frame_bytes(mac(1), mac(2), DEFAULT_BATMAN_ETHER_TYPE, &body);
+
+        let mut sink = CaptureSink::default();
+        handle_mesh_frame(
+            Duration::ZERO,
+            &mut router,
+            0,
+            LinkFrame::ref_from_bytes(&challenge).unwrap(),
+            LinkMetrics::default(),
+            &mut tx,
+            &mut sink,
+        );
+
+        assert_eq!(sink.mesh.len(), 1, "the challenge is answered");
+        assert_eq!(
+            sink.mesh[0].egress,
+            Egress::Iface(0),
+            "the response must return out the interface the challenge arrived \
+             on, not wherever routing state (poisonable from another \
+             interface) would otherwise send it"
         );
     }
 
@@ -1316,6 +1515,197 @@ mod tests {
         assert!(
             plan.targets().is_empty(),
             "no route to an unknown destination ⇒ nothing to transmit"
+        );
+    }
+
+    /// A next-hop proof frame must be addressed to *this node*. Both proof
+    /// types are point-to-point by construction — a challenger unicasts to the
+    /// candidate, and the candidate unicasts the answer back — so a multicast
+    /// destination is malformed, never something a legitimate peer emits.
+    ///
+    /// Load-bearing rather than tidy-mindedness: `strip_directed` deliberately
+    /// skips the pairwise-tag check whenever `frame.dst.is_multicast()`, since
+    /// broadcasts and OGMs carry their own signature instead. The destination
+    /// MAC is attacker-chosen, so without this guard an outsider holding *no
+    /// credential at all* can broadcast a challenge under any member MAC it has
+    /// read off the air and have this node answer it — an unauthenticated
+    /// reflection primitive that burns shared-medium airtime and a pairwise
+    /// counter per forged frame. Nothing else on this path authenticates a
+    /// multicast-addressed frame, so the check has to live here.
+    #[test]
+    fn a_broadcast_addressed_challenge_is_never_answered() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = CentralRouter::new(mac(1));
+        router.set_auth(member_auth(&authority, 1, mac(1)));
+        let mut member = member_auth(&authority, 2, mac(2));
+
+        // The router learns mac(2) as a verified, live neighbor on interface 0,
+        // so `answer_challenge` would otherwise find a pairwise key for it.
+        let ogm = signed_ogm_bytes(&mut member, mac(2), 1);
+        let link = frame_bytes(Mac::BROADCAST, mac(2), DEFAULT_BATMAN_ETHER_TYPE, &ogm);
+        let mut tx = [0u8; wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN];
+        let mut sink = CaptureSink::default();
+        handle_mesh_frame(
+            Duration::ZERO,
+            &mut router,
+            0,
+            LinkFrame::ref_from_bytes(&link).unwrap(),
+            LinkMetrics::default(),
+            &mut tx,
+            &mut sink,
+        );
+
+        // An attacker with no credential, on a different interface: broadcast
+        // destination, mac(2)'s address spoofed as the source, and no directed
+        // trailer whatsoever.
+        let hdr = wayfinder::batman::wire::BatmanNextHopChallengePacket {
+            packet_type: BatmanPacketType::NextHopChallenge.as_u8(),
+            version: 5,
+        };
+        let mut body = hdr.as_bytes().to_vec();
+        body.extend_from_slice(&[0xCD; wayfinder::auth::CHALLENGE_NONCE_LEN]);
+        let forged = frame_bytes(Mac::BROADCAST, mac(2), DEFAULT_BATMAN_ETHER_TYPE, &body);
+
+        let mut sink = CaptureSink::default();
+        handle_mesh_frame(
+            Duration::ZERO,
+            &mut router,
+            1,
+            LinkFrame::ref_from_bytes(&forged).unwrap(),
+            LinkMetrics::default(),
+            &mut tx,
+            &mut sink,
+        );
+        assert!(
+            sink.mesh.is_empty(),
+            "an unauthenticated broadcast-addressed challenge must not be answered"
+        );
+    }
+
+    /// The response arm carries the same guard, and there it protects the
+    /// proof itself rather than just cost.
+    ///
+    /// A response's freshness rests on two things: the nonce inside it, and the
+    /// pairwise trailer `strip_directed` checks on the way in — the trailer's
+    /// replay counter is what stops a captured response being re-credited
+    /// later. A multicast destination skips that trailer check entirely, so
+    /// without this guard an attacker holding no key can take a genuine
+    /// response off the air and credit a proof with it, which is precisely the
+    /// replay `sim/tests/test_adversary.py::attack_challenge_response_replay`
+    /// covers on the directed path.
+    #[test]
+    fn a_broadcast_addressed_response_cannot_credit_a_proof() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = CentralRouter::new(mac(1));
+        router.set_auth(member_auth(&authority, 1, mac(1)));
+        let mut member = member_auth(&authority, 2, mac(2));
+
+        // Mutual verification, so each side holds the other's pairwise key.
+        let ogm = signed_ogm_bytes(&mut member, mac(2), 1);
+        let link = frame_bytes(Mac::BROADCAST, mac(2), DEFAULT_BATMAN_ETHER_TYPE, &ogm);
+        let mut tx = [0u8; wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN];
+        let mut sink = CaptureSink::default();
+        handle_mesh_frame(
+            Duration::ZERO,
+            &mut router,
+            0,
+            LinkFrame::ref_from_bytes(&link).unwrap(),
+            LinkMetrics::default(),
+            &mut tx,
+            &mut sink,
+        );
+        let router_ogm = signed_ogm_bytes(router.auth_mut().unwrap(), mac(1), 1);
+        assert_eq!(member.verify_ogm(&router_ogm), OgmVerdict::Verified);
+
+        // The router challenges mac(2) for real, and mac(2) answers for real.
+        let mut chal_buf = [0u8; wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN];
+        let (_, challenge) = router
+            .poll_challenge(Duration::ZERO, &mut chal_buf)
+            .expect("mac(2) is a live candidate next hop");
+        let hdr_len = core::mem::size_of::<wayfinder::batman::wire::BatmanNextHopChallengePacket>();
+        let nonce = challenge.payload[hdr_len..].to_vec();
+        let tag = member
+            .answer_challenge(mac(1), &nonce)
+            .expect("the router is a live neighbor of mac(2)");
+
+        // An attacker with no key relays those genuine response bytes with a
+        // broadcast destination, so no pairwise trailer is ever demanded.
+        let rsp_hdr = wayfinder::batman::wire::BatmanNextHopResponsePacket {
+            packet_type: BatmanPacketType::NextHopResponse.as_u8(),
+            version: 5,
+        };
+        let mut body = rsp_hdr.as_bytes().to_vec();
+        body.extend_from_slice(&tag);
+        let forged = frame_bytes(Mac::BROADCAST, mac(2), DEFAULT_BATMAN_ETHER_TYPE, &body);
+
+        let mut sink = CaptureSink::default();
+        handle_mesh_frame(
+            Duration::ZERO,
+            &mut router,
+            1,
+            LinkFrame::ref_from_bytes(&forged).unwrap(),
+            LinkMetrics::default(),
+            &mut tx,
+            &mut sink,
+        );
+        assert!(
+            !router.proof_current(Duration::ZERO, mac(2)),
+            "a proof must never be credited from a frame that was never \
+             pairwise-authenticated"
+        );
+    }
+
+    /// A challenge must not go out a link whose data gate is closed.
+    ///
+    /// `poll_due_challenges` emits with `Egress::Iface`, and `plan_dispatch`
+    /// deliberately does not re-gate that variant (the OGM path already
+    /// consulted `tx_ogm` before staging). So unless this loop consults the
+    /// gate itself, nothing does — and a link configured `tx_data: false`
+    /// transmits a challenge per unproven neighbor per refresh interval, which
+    /// on a duty-cycle-limited LoRa link is exactly the airtime the operator
+    /// turned the gate off to reclaim.
+    #[test]
+    fn a_challenge_skips_a_link_whose_data_gate_is_closed() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = CentralRouter::new(mac(1));
+        router.set_auth(member_auth(&authority, 1, mac(1)));
+        let mut member = member_auth(&authority, 2, mac(2));
+
+        // Two interfaces; interface 1 carries OGMs but never data.
+        router.set_link_features(0, wayfinder::features::LinkFeatures::default());
+        router.set_link_features(
+            1,
+            wayfinder::features::LinkFeatures {
+                tx_data: false,
+                ..Default::default()
+            },
+        );
+
+        // mac(2) becomes a known, verified candidate next hop on interface 0.
+        let ogm = signed_ogm_bytes(&mut member, mac(2), 1);
+        let link = frame_bytes(Mac::BROADCAST, mac(2), DEFAULT_BATMAN_ETHER_TYPE, &ogm);
+        let mut tx = [0u8; wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN];
+        let mut sink = CaptureSink::default();
+        handle_mesh_frame(
+            Duration::ZERO,
+            &mut router,
+            0,
+            LinkFrame::ref_from_bytes(&link).unwrap(),
+            LinkMetrics::default(),
+            &mut tx,
+            &mut sink,
+        );
+
+        let mut sink = CaptureSink::default();
+        poll_due_challenges(&mut router, Duration::ZERO, &mut tx, &mut sink);
+
+        assert!(
+            !sink.mesh.is_empty(),
+            "the candidate is challenged on the link that may carry data"
+        );
+        assert!(
+            sink.mesh.iter().all(|f| f.egress == Egress::Iface(0)),
+            "no challenge may go out interface 1, whose data gate is closed"
         );
     }
 }

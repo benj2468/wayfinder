@@ -242,7 +242,8 @@ pub fn node_metrics(v: &NodeMetrics, fmt: OutputFormat) -> anyhow::Result<String
              tq (min/mean/max): {}/{:.1}/{}\npaths (mean/max): {:.2}/{}\n\
              oversize_drops: {}\nrelay_oversize_drops: {}\n\
              cert_store: {}\nin_flight_cert_requests: {}\npending_cert_replies: {}\n\
-             cert_req_rate: {:.2}\ncert_reply_rate: {:.2}",
+             cert_req_rate: {:.2}\ncert_reply_rate: {:.2}\n\
+             untaggable_drop_rate: {:.2}",
             v.uptime_secs,
             v.neighbor_count,
             occ(&v.originators),
@@ -261,6 +262,7 @@ pub fn node_metrics(v: &NodeMetrics, fmt: OutputFormat) -> anyhow::Result<String
             occ(&v.pending_cert_replies),
             v.cert_req_rate,
             v.cert_reply_rate,
+            v.untaggable_drop_rate,
         )
     })
 }

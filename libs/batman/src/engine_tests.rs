@@ -184,7 +184,7 @@ mod ogm_processing {
 
         let record = &engine.originator_table[&mac(2)];
         assert_eq!(record.neighbor_ident, mac(2));
-        assert_eq!(record.best_next_hop, mac(2));
+        assert_eq!(record.best_next_hop, Some(mac(2)));
         assert_eq!(record.last_seqno, 1);
         // TQ should be 255 - 10 = 245 after attenuation
         assert_eq!(record.max_tq, 245);
@@ -329,7 +329,7 @@ mod ogm_processing {
         assert_eq!(record.paths.len(), 2);
 
         // Best next hop should be node 3 (higher TQ: 250-10=240 vs 240-10=230)
-        assert_eq!(record.best_next_hop, mac(3));
+        assert_eq!(record.best_next_hop, Some(mac(3)));
         assert_eq!(record.max_tq, 240);
     }
 
@@ -799,7 +799,10 @@ mod edge_cases {
         assert_eq!(engine.originator_table.len(), 1);
         assert_eq!(engine.originator_table[&mac(10)].paths.len(), 4);
         // Best path should be via neighbor 2 (highest TQ)
-        assert_eq!(engine.originator_table[&mac(10)].best_next_hop, mac(2));
+        assert_eq!(
+            engine.originator_table[&mac(10)].best_next_hop,
+            Some(mac(2))
+        );
     }
 
     #[test]
@@ -1802,7 +1805,7 @@ mod route_expiry {
         assert_eq!(r.paths.len(), 1);
         assert_eq!(r.paths[0].neighbor_ident, mac(3));
         // Cached best hop recomputed from the surviving (lower-TQ) path.
-        assert_eq!(r.best_next_hop, mac(3));
+        assert_eq!(r.best_next_hop, Some(mac(3)));
         assert_eq!(r.max_tq, 90);
     }
 }
@@ -1883,7 +1886,7 @@ mod keepalive_deprioritization {
         // the time-aware `next_hop` sees the deprioritization.
         assert_eq!(engine.lookup_route(mac(9)), Some(mac(2)));
         let r = &engine.originator_table[&mac(9)];
-        assert_eq!(r.best_next_hop, mac(2));
+        assert_eq!(r.best_next_hop, Some(mac(2)));
         // 255 minus the per-hop OGM penalty (10) applied in `handle_ogm`.
         assert_eq!(r.max_tq, 245);
     }

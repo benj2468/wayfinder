@@ -7,9 +7,12 @@ send path — it puts bytes on the medium.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 import wayfinder_py as wf
 from wayfinder_sim import forge
+from wayfinder_sim.adversary import Wiretap
 from wayfinder_sim.channel import PerfectWire
 from wayfinder_sim.node import Node
 from wayfinder_sim.scenario import Simulation
@@ -217,15 +220,18 @@ def _capture_signed_ogm(mesh: Mesh) -> tuple[bytes, wf.PyMac]:
     return ogms[-1].payload, sim.mac("hq")
 
 
-def test_a_captured_signed_ogm_replays_against_a_node_with_no_prior_state():
-    """A gap, asserted so it cannot regress silently.
+def test_a_captured_signed_ogm_does_not_route_a_node_with_no_prior_state():
+    """The narrowest form of the replay, and the first one found.
 
-    The OGM signature covers `orig || seqno || cert` and binds no freshness —
-    no timestamp, no nonce. Replay protection is the receiver's per-originator
-    seqno state, so it protects only a receiver that *has* such state. Against
-    one that does not — a node that just booted, or one out of the real
-    originator's range — a single captured OGM presents an absent node as
-    present, for as long as the attacker keeps replaying it.
+    The OGM signature covers `orig ‖ seqno ‖ cert` and binds no freshness — no
+    timestamp, no nonce — so a captured OGM verifies forever, and seqno replay
+    protection is per-receiver state that a just-booted or out-of-range node
+    does not have. All of that is still true: the replay is still *accepted*.
+
+    What stops it being a route is the next-hop proof. The address the attacker
+    spoofs would have to answer a challenge with a pairwise key it does not
+    hold, so the absent originator never becomes reachable however long the
+    replay continues. Freshness was never the fix; proving the forwarder was.
     """
     mesh = Mesh(mesh_id=0xABCD, root_seed=bytes([1]) * 32)
     body, hq_mac = _capture_signed_ogm(mesh)
@@ -241,23 +247,141 @@ def test_a_captured_signed_ogm_replays_against_a_node_with_no_prior_state():
     sim.record("route", lambda s: s.has_route("victim", hq_mac))
     rec = sim.run(until_s=25.0)
 
-    assert any(rec.column("route")), (
-        "replayed signed OGM installs a route to a node that is not present"
+    assert not any(rec.column("route")), (
+        "a replayed OGM never yields a usable route to an absent originator"
+    )
+    record = next(
+        (r for r in sim.driver("victim").originator_table() if r.originator == hq_mac),
+        None,
+    )
+    assert record is not None and record.best_next_hop is None, (
+        "it is still learned as a path — the signature is genuine — but is "
+        "never selected"
     )
 
 
-def test_an_outsider_can_relay_a_members_ogm_but_cannot_carry_its_traffic():
-    """A gap, and the precise limit of it.
+def _freshest_ogm_by(tap: Wiretap, orig: wf.PyMac) -> bytearray:
+    """The highest-seqno OGM *originated* by `orig` that crossed `tap`.
 
-    BATMAN's forwarding model has every relay re-flood a member's OGM under
-    its own link-layer source. Authentication covers the *originator*, not the
-    forwarder — so an outsider holding no credential can do the same and
-    install itself as a next hop for a member it cannot impersonate.
+    Selected on the OGM's own `orig` field rather than the frame's link-layer
+    source, because the copy an attacker one segment away actually hears is
+    the one a relay re-flooded under its own source.
+    """
+    ogms = sorted(
+        (
+            frame
+            for frame in tap.of_type(forge.PACKET_OGM)
+            if len(frame.payload) > 15 and frame.payload[8:14] == orig.bytes
+        ),
+        key=lambda frame: int.from_bytes(frame.payload[4:8], "big"),
+    )
+    assert ogms, "the attacker heard no OGM from the originator she is replaying"
+    return bytearray(ogms[-1].payload)
 
-    What saves it from being interception is the directed data plane: the
-    victim has no pairwise key for an unverified next hop, so the frame is
-    dropped at dispatch rather than sent in the clear. The result is a silent
-    blackhole — the victim believes it has a route, and its traffic vanishes.
+
+def _next_hop(sim: Simulation, node: str, orig: wf.PyMac) -> str:
+    """`node`'s currently chosen next hop toward `orig`."""
+    for record in sim.driver(node).originator_table():
+        if record.originator == orig:
+            return str(record.best_next_hop)
+    raise AssertionError(f"{node} has no route to {orig}")
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda body: None,
+        lambda body: body.__setitem__(15, 255),
+    ],
+    ids=["verbatim", "tq_maxed"],
+)
+def test_a_replayed_ogm_cannot_take_an_established_route(
+    mutate: Callable[[bytearray], object],
+):
+    """The gap-1/gap-2 fix, measured against the attack that found it.
+
+    This test asserted the *hijack* until the next-hop proof landed. The
+    replayed OGM still verifies — it is genuinely signed, and the signature
+    covers no freshness — and the engine still accepts it for path learning,
+    since its seqno is current. What has changed is that a path can no longer
+    be *selected* on the strength of the OGM alone: before it can win
+    `best_next_hop` its relay must answer a challenge with the pairwise key for
+    the address it claims. Eve holds no credential and cannot, so the victim
+    keeps routing through the relay.
+
+    Both parametrisations are kept from the attack: `verbatim` was the cheapest
+    form of the hijack (nothing altered but the link-layer source) and
+    `tq_maxed` the most forceful (the unsigned TQ field maxed). Neither moves
+    the route now.
+
+    See `docs/design/09-mesh-auth-gaps.md` §4.
+    """
+    mesh = Mesh(mesh_id=0xABCD, root_seed=bytes([1]) * 32)
+    sim = Simulation(
+        [
+            Node("hq", credential=Credential()),
+            Node("relay", credential=Credential()),
+            Node("victim", credential=Credential()),
+            Node("eve"),
+        ],
+        [
+            pair("hq", "relay", PerfectWire()),
+            *shared_lan(["relay", "victim", "eve"], PerfectWire()),
+        ],
+        mesh=mesh,
+    )
+    hq_mac, relay_mac = sim.mac("hq"), sim.mac("relay")
+    segment = sim.wiretap("relay-victim-eve")
+    backhaul = sim.wiretap("hq-relay")
+
+    sim.run(until_s=40.0)
+    assert _next_hop(sim, "victim", hq_mac) == str(relay_mac), (
+        "the victim starts with a live, converged route through the relay"
+    )
+
+    now = 40.0
+    while now < 70.0:
+        body = _freshest_ogm_by(segment, hq_mac)
+        mutate(body)
+        sim.inject(
+            "eve",
+            forge.link_frame(wf.PyMac.BROADCAST, hq_mac, bytes(body)),
+            at_s=now + 0.01,
+            link="relay-victim-eve",
+        )
+        now += 0.25
+        sim.run(until_s=now)
+
+    assert _next_hop(sim, "victim", hq_mac) == str(relay_mac), (
+        "30s of sustained replay does not move the route: the spoofed next hop "
+        "never proved itself"
+    )
+
+    # The route is not merely unmoved, it still works — the gate must not cost
+    # the victim the legitimate path it already had.
+    backhaul.reset()
+    sim.driver("victim").queue_local_send(hq_mac, b"SENSITIVE TRAFFIC")
+    sim.run(until_s=76.0)
+    assert backhaul.containing(b"SENSITIVE TRAFFIC"), (
+        "traffic still reaches hq over the relay"
+    )
+
+
+def test_an_outsider_relaying_a_members_ogm_never_becomes_a_next_hop():
+    """The other half of the same fix, and what changed about it.
+
+    BATMAN's forwarding model has every relay re-flood a member's OGM under its
+    own link-layer source, and authentication covers the *originator*, not the
+    forwarder — so an outsider can re-flood a genuine OGM and be recorded as a
+    path toward a member it cannot impersonate. That much still happens: the
+    OGM is real, and discovery has to keep working or there would be nobody to
+    challenge.
+
+    What no longer happens is selection. Eve holds no credential, so she has no
+    pairwise key, so she can never answer a challenge, so she can never win
+    `best_next_hop`. Before the next-hop proof this was a silent blackhole —
+    the victim believed it had a route and its traffic vanished at dispatch.
+    Now the victim simply has no route to offer, which is the honest answer.
     """
     mesh = Mesh(mesh_id=0xABCD, root_seed=bytes([1]) * 32)
     body, hq_mac = _capture_signed_ogm(mesh)
@@ -275,25 +399,26 @@ def test_an_outsider_can_relay_a_members_ogm_but_cannot_carry_its_traffic():
         sim.inject("eve", frame, at_s=0.5 + i * 0.3)
     sim.run(until_s=25.0)
 
-    assert sim.has_route("victim", hq_mac), "the outsider poisoned the route table"
-    next_hops = {
-        str(path.neighbor)
-        for record in sim.driver("victim").originator_table()
-        if record.originator == hq_mac
-        for path in record.paths
-    }
-    assert str(eve_mac) in next_hops, "with itself as the next hop"
-    assert eve_mac not in sim.driver("victim").neighbor_macs(), (
-        "while never being admitted as a member"
+    driver = sim.driver("victim")
+    record = next(
+        (r for r in driver.originator_table() if r.originator == hq_mac), None
+    )
+    assert record is not None, "the OGM is genuine, so the originator is learned"
+    assert str(eve_mac) in {str(p.neighbor) for p in record.paths}, (
+        "and eve is recorded as a path — discovery must keep working"
+    )
+    assert not driver.proof_current(eve_mac), (
+        "but she holds no credential, so she can never prove herself"
+    )
+    assert record.best_next_hop is None, "and therefore never carries the route"
+    assert eve_mac not in driver.neighbor_macs(), (
+        "while never being admitted as a member either"
     )
 
     tap = sim.wiretap("victim-eve")
-    sim.driver("victim").queue_local_send(hq_mac, b"SENSITIVE TRAFFIC")
+    driver.queue_local_send(hq_mac, b"SENSITIVE TRAFFIC")
     sim.run(until_s=31.0)
-    assert not tap.containing(b"SENSITIVE TRAFFIC"), (
-        "but nothing is sent through the unverified next hop — a blackhole, "
-        "not an interception"
-    )
+    assert not tap.containing(b"SENSITIVE TRAFFIC"), "and nothing is sent toward her"
 
 
 def test_tq_and_ttl_are_mutable_but_the_signed_identity_fields_are_not():
@@ -304,6 +429,14 @@ def test_tq_and_ttl_are_mutable_but_the_signed_identity_fields_are_not():
     body, hq_mac = _capture_signed_ogm(mesh)
 
     def replay_accepted(mutate) -> bool:
+        """Whether the replayed OGM is *accepted* — learned as a path.
+
+        Deliberately not `has_route`: since the next-hop proof landed, no
+        replay yields a usable route regardless of what it mutates, which would
+        make every case below indistinguishable. What this test is about is
+        which bytes the signature covers, and that shows in whether the OGM
+        verifies at all.
+        """
         b = bytearray(body)
         mutate(b)
         sim = Simulation(
@@ -314,8 +447,10 @@ def test_tq_and_ttl_are_mutable_but_the_signed_identity_fields_are_not():
         frame = forge.link_frame(wf.PyMac.BROADCAST, hq_mac, bytes(b))
         for i in range(40):
             sim.inject("eve", frame, at_s=0.5 + i * 0.3)
-        sim.record("route", lambda s: s.has_route("victim", hq_mac))
-        return any(sim.run(until_s=20.0).column("route"))
+        sim.run(until_s=20.0)
+        return any(
+            r.originator == hq_mac for r in sim.driver("victim").originator_table()
+        )
 
     # Offsets within the OGM header: [type][ver][ttl][flags][seqno:4][orig:6][rsv][tq]
     assert replay_accepted(lambda b: b.__setitem__(2, 255)), "TTL is not signed"

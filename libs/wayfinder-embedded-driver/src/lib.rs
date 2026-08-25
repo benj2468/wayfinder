@@ -330,12 +330,23 @@ impl<L: LinkT, C: Clock, const N: usize, const FRAME_LEN: usize, R: RouterOps>
     pub async fn run_once(&mut self) {
         let now = self.clock.now();
         // When the soonest interface is next due to emit an OGM or a
-        // keep-alive.  Recomputed every iteration, so a timer reset by the
-        // frame just processed shortens the next sleep automatically.
+        // keep-alive, or the soonest next-hop proof challenge falls due.
+        // Recomputed every iteration, so a timer reset by the frame just
+        // processed shortens the next sleep automatically.
+        //
+        // The challenge deadline has to be in this `min`, not left to ride the
+        // OGM timer: a newly discovered originator would otherwise wait for the
+        // next Trickle deadline — up to a full `i_max` on a settled mesh —
+        // before it was challenged at all, and carry no traffic until then.
         let due = self
             .router
             .next_broadcast_after(now)
-            .min(self.router.next_keepalive_after(now));
+            .min(self.router.next_keepalive_after(now))
+            .min(
+                self.router
+                    .next_challenge_after(now)
+                    .unwrap_or(core::time::Duration::MAX),
+            );
         trace!(?now, ?due, "run_once");
 
         // Destructure into disjoint field borrows so the planning step can hold
@@ -437,10 +448,16 @@ impl<
     /// stages nothing, so its dispatch is a no-op.
     async fn run_once_with_mgmt(&mut self, mgmt: &EmbeddedQueryRx<'_>) {
         let now = self.clock.now();
+        // Same three deadlines as `run_once`, and for the same reasons.
         let due = self
             .router
             .next_broadcast_after(now)
-            .min(self.router.next_keepalive_after(now));
+            .min(self.router.next_keepalive_after(now))
+            .min(
+                self.router
+                    .next_challenge_after(now)
+                    .unwrap_or(core::time::Duration::MAX),
+            );
 
         let Driver {
             router,

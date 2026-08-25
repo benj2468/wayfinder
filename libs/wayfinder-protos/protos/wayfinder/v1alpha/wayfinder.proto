@@ -771,6 +771,16 @@ message NeighborPath {
   // Sequence number of the most recent OGM received via this neighbor.
   // Monotonically increasing; wraps at u32::MAX.
   uint32 last_seqno = 3;
+
+  // Whether this neighbor currently holds a valid next-hop proof — it has
+  // answered a challenge with the pairwise key for the address it claims,
+  // recently enough that the proof has not lapsed.
+  //
+  // Only a proven path can be selected as next_hop; an unproven one is
+  // reported here so an operator can see a candidate being challenged rather
+  // than a silent gap.  Always true on an unauthenticated mesh, which has no
+  // pairwise keys and so requires no proof.
+  bool proven = 4;
 }
 
 // A single entry in the BATMAN originator table, describing how to reach one
@@ -781,10 +791,18 @@ message RoutingEntry {
 
   // Raw bytes of the immediate next-hop neighbor to use for the best-known
   // path to destination.
+  //
+  // Empty when no path is currently usable — including when every known path
+  // is via a neighbor that has not proven itself.  A destination with paths
+  // but no next_hop is one still being challenged, not one that is
+  // unreachable; see NeighborPath.proven.
   bytes next_hop = 2;
 
-  // Best Transmission Quality seen across all paths to this destination.
-  // Range 0–255; higher is better.
+  // Transmission Quality of the currently selected path -- the best among
+  // *selectable* paths, not across all known ones. Range 0–255; higher is
+  // better. Zero when no path is selectable, including while every path's
+  // neighbor is still unproven, so a tq of 0 alongside populated paths means
+  // "still being challenged", not "dead link"; see NeighborPath.proven.
   uint32 tq = 3;
 
   // Sequence number of the most recent OGM received from this originator
@@ -1107,6 +1125,17 @@ message NodeMetrics {
   // Smoothed rate (frames/sec) at which this node sends CertReply, answering
   // CertReqs as the requested originator. Zero when auth is disabled.
   double cert_reply_rate = 18;
+
+  // Smoothed rate (frames/sec) at which this node drops a directed frame
+  // because it holds no pairwise key for the chosen next hop, so the frame
+  // could neither be authenticated nor sent in the clear.
+  //
+  // A security-relevant drop, and one an application on top of the mesh
+  // otherwise cannot see: to the sender the route looked fine and the traffic
+  // simply vanished. Sustained non-zero means traffic is being aimed at a next
+  // hop this node cannot authenticate to — a peer whose certificate lapsed, or
+  // an outsider that got itself into the path. Zero when auth is disabled.
+  double untaggable_drop_rate = 19;
 }
 
 // Marker payload indicating the router would flood a packet out of every

@@ -410,6 +410,19 @@ fn StatusStrip(
 /// The top-level navigation. Each tab is a real link to a real route, so the
 /// browser's back button and a copied URL both work — two things a terminal
 /// dashboard cannot offer, and the first thing a non-technical user reaches for.
+///
+/// A tab is drawn only if the node has the thing behind it *and* the viewer may
+/// look at it: the provider tab needs an enrolled node, and — through
+/// [`Viewer::can_view`] — an administrator to look at it. A tab that is drawn
+/// and then answers "forbidden" is the same broken promise a mutating button
+/// the viewer cannot press would be.
+///
+/// The `<Suspense>` is not decoration. Asking what the viewer may see means
+/// reading the session resource, and reading a resource outside a `<Suspense>`
+/// in `hydrate` mode is the hydration hazard [`App`] describes — which in this
+/// crate is a wasm panic, not a cosmetic reflow. Inside one, the *blocking*
+/// resource is already resolved and serialized by the time the browser gets the
+/// page, so the first paint carries the right tabs and hydration agrees with it.
 #[component]
 fn TabBar(viewer: ViewerResource, dash: Dashboard) -> impl IntoView {
     let security = move || {
@@ -421,36 +434,36 @@ fn TabBar(viewer: ViewerResource, dash: Dashboard) -> impl IntoView {
 
     view! {
         <nav class="wf-tabs">
-            {move || {
-                // 1. Read the resource reactively using .get() or .with()
-                let current_viewer = viewer.get();
-                let enrollment = enrollment.get();
+            <Suspense>
+                {move || {
+                    let current_viewer = viewer.get();
+                    let enrollment = enrollment.get();
 
-                TABS
-                    .iter()
-                    .filter(|tab| {
-                        match tab.path {
-                            "provider" => enrollment.is_some(),
-                            _ => true,
-                        }
-                    })
-                    .filter(|tab| {
-                        // 2. Check permissions safely against the reactive data
-                        current_viewer
-                            .as_ref()
-                            .and_then(|res| res.as_ref().ok())
-                            .map(|v| v.can_view(tab))
-                            .unwrap_or_default()
-                    })
-                    .map(|tab| {
-                        view! {
-                            <A href=format!("/{}", tab.path) attr:class="wf-tab">
-                                {tab.title}
-                            </A>
-                        }
-                    })
-                    .collect_view()
-            }}
+                    TABS
+                        .iter()
+                        .filter(|tab| {
+                            match tab.path {
+                                "provider" => enrollment.is_some(),
+                                _ => true,
+                            }
+                        })
+                        .filter(|tab| {
+                            current_viewer
+                                .as_ref()
+                                .and_then(|res| res.as_ref().ok())
+                                .map(|v| v.can_view(tab))
+                                .unwrap_or_default()
+                        })
+                        .map(|tab| {
+                            view! {
+                                <A href=format!("/{}", tab.path) attr:class="wf-tab">
+                                    {tab.title}
+                                </A>
+                            }
+                        })
+                        .collect_view()
+                }}
+            </Suspense>
         </nav>
     }
 }
