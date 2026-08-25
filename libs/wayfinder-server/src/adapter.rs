@@ -1,4 +1,5 @@
-//! The [`WayfinderDataProvider`] adapter over the router.
+//! The [`RouterDataProvider`] / [`AuthorityDataProvider`] adapter over the
+//! router.
 //!
 //! Newtype so we can implement the external trait for the external
 //! [`CentralRouter`]. This layer is `no_std` + `alloc` and carries no
@@ -24,6 +25,7 @@ use wayfinder_protos::service::AlarmKindData;
 use wayfinder_protos::service::AlarmSeverityData;
 use wayfinder_protos::service::AlarmSubjectData;
 use wayfinder_protos::service::AlarmsData;
+use wayfinder_protos::service::AuthorityDataProvider;
 use wayfinder_protos::service::CsrOutcome;
 use wayfinder_protos::service::EgressDecisionData;
 use wayfinder_protos::service::EnrollmentAdmission;
@@ -41,12 +43,12 @@ use wayfinder_protos::service::NodeSecurityData;
 use wayfinder_protos::service::OgmScheduleEntryData;
 use wayfinder_protos::service::PendingCsrData;
 use wayfinder_protos::service::RouteResolutionData;
+use wayfinder_protos::service::RouterDataProvider;
 use wayfinder_protos::service::RoutingEntryData;
 use wayfinder_protos::service::RuntimeConfigData;
 use wayfinder_protos::service::SecurityStatusData;
 use wayfinder_protos::service::TableOccupancyData;
 use wayfinder_protos::service::UserAuthOutcome;
-use wayfinder_protos::service::WayfinderDataProvider;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
@@ -332,7 +334,7 @@ impl<
     const REVOKED: usize,
     const IN_FLIGHT_CERT_REQUESTS: usize,
     const PENDING_REPLIES: usize,
-> WayfinderDataProvider
+> RouterDataProvider
     for RouterAdapter<
         '_,
         ORIGINATORS,
@@ -864,7 +866,36 @@ impl<
             Err(e) => Err(alloc::format!("{e}")),
         }
     }
+}
 
+impl<
+    const ORIGINATORS: usize,
+    const INTERFACES: usize,
+    const MCAST_MEMBERS: usize,
+    const LOCAL_MCAST: usize,
+    const IDENT_TABLE: usize,
+    const IDENT_LIVE: usize,
+    const LINK_QUALITY: usize,
+    const NEIGHBOR_KEYS: usize,
+    const REVOKED: usize,
+    const IN_FLIGHT_CERT_REQUESTS: usize,
+    const PENDING_REPLIES: usize,
+> AuthorityDataProvider
+    for RouterAdapter<
+        '_,
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    >
+{
     fn get_trust_anchor(&self) -> Result<Vec<u8>, String> {
         match &self.ca {
             Some(ca) => Ok(ca.trust_anchor_bytes()),
