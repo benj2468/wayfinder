@@ -487,3 +487,28 @@ fn Failed(
         </div>
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// The rule that hides the dashboard behind the sign-in form must not hide
+    /// *this* page, which reuses the sign-in page's layout class.
+    ///
+    /// `.wf-app:has(.wf-login-page) .wf-shell` matches on the presence of
+    /// `.wf-login-page` anywhere inside the shell — and this page renders one,
+    /// inside the shell, on a route that has no sign-in overlay to hide
+    /// anything behind. Without the exclusion the whole shell is
+    /// `display: none` and the registrant gets a blank page: the markup is all
+    /// there, correct, and painted nowhere. A lower-specificity
+    /// `.wf-shell-bare { display: block }` does not undo it.
+    #[test]
+    fn the_stylesheet_does_not_hide_the_bare_shell() {
+        const CSS: &str = include_str!("../../style/main.css");
+
+        assert!(
+            CSS.contains(
+                ".wf-app:has(.wf-login-page) .wf-shell:not(.wf-shell-bare) {\n  display: none;\n}"
+            ),
+            "the sign-in form's hiding rule no longer spares the registration page's bare shell"
+        );
+    }
+}
