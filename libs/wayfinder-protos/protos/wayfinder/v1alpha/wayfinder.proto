@@ -1735,10 +1735,17 @@ message UserInvite {
   // Unix seconds registration was started at — when the TOTP secret was
   // revealed — or 0 if it has not been.
   //
-  // **This is the security-relevant field.**  A non-zero `started_at` with the
-  // account still absent means somebody took the second factor and did not
-  // finish, which is either an abandoned registration or a disclosure.  Either
-  // way the response is the same: revoke and re-mint.
+  // **This is the security-relevant field**, and a deliberately short-lived
+  // one: a started invitation is swept the moment its handle window closes,
+  // fifteen minutes after the secret was revealed.  So this listing carries the
+  // condition while an admin can still act on it, and not afterwards.  The
+  // lasting record is the node's log, which says both that a registration
+  // started and that it was later abandoned.
+  //
+  // A non-zero `started_at` with the account still absent means somebody took
+  // the second factor and did not finish, which is either an abandoned
+  // registration or a disclosure.  Either way the response is the same: revoke
+  // and re-mint.
   uint64 started_at = 6;
 
   // Unix seconds after which the registration handle issued at start is dead

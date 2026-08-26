@@ -984,6 +984,15 @@ impl CertAuthority {
     /// window has closed, there is nothing left the record can be used for, and
     /// leaving it to sit out the remaining hours would hold its name reserved
     /// against the re-mint that is the correct response.
+    ///
+    /// **Each eviction is logged, and the started case is why.** An invitation
+    /// record is the shorter-lived of the two accounts of a disclosure: the log
+    /// line survives a restart in the host CA's journal, while `started_at`
+    /// leaves the admin's listing here, fifteen minutes after the secret was
+    /// revealed. Without a line at this moment, "somebody took a second factor
+    /// and never finished" would be visible for a quarter of an hour and then
+    /// simply absent, with the name freed and nothing recording that it had
+    /// ever happened.
     fn evict_expired_invites(&mut self) -> Result<(), String> {
         if self.now_unix == 0 {
             return Ok(());
@@ -993,6 +1002,37 @@ impl CertAuthority {
         if self.log.invites().iter().all(live) {
             return Ok(());
         }
+
+        // Named one at a time rather than counted: the subject is the whole
+        // value of the record, and an operator asking after the fact needs the
+        // account name, not how many went at once. Bounded by
+        // `MAX_PENDING_INVITES`, and reached only when something has actually
+        // expired, so this cannot become a flood.
+        for invite in self.log.invites().iter().filter(|i| !live(i)) {
+            match invite.status {
+                InviteStatus::Pending => tracing::info!(
+                    username = %invite.username,
+                    expired_at = invite.expires_at,
+                    "invitation expired unredeemed; its name is free again"
+                ),
+                // The security-relevant one. This is the last moment the
+                // provider says anything about a second factor that was handed
+                // out and never turned into an account.
+                InviteStatus::Started {
+                    started_at,
+                    handle_expires_at,
+                    ..
+                } => tracing::info!(
+                    username = %invite.username,
+                    started_at,
+                    handle_expires_at,
+                    "registration abandoned after the second factor was revealed; \
+                     invitation dropped and its name freed — re-mint, and treat an \
+                     unexpected start as a disclosure"
+                ),
+            }
+        }
+
         let (_, persisted) = self.log.mutate_invites(|invites| invites.retain(live));
         persisted
     }

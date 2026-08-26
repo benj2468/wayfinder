@@ -1362,10 +1362,19 @@ fn audited(k: &RequestKind) -> Audited {
         // record shows a start nobody expected.
         | RequestKind::RevokeUserInvite(_)
         // A mutation, not a Disclosure, despite handing out the account's
-        // `otpauth://` URI. It consumes the invite, so classifying it as "reads
+        // `otpauth://` URI: it consumes the invite, so classifying it as "reads
         // public state but hands out a secret" would be a lie about what
-        // happened — and the durable answer to "who took that secret, and
-        // when" is the invite's own `started_at`, which outlives this ring.
+        // happened.
+        //
+        // **This record is the durable one.** The invitation's own `started_at`
+        // is the shorter-lived account of the same event, not the longer one —
+        // a started invite is swept fifteen minutes later when its handle
+        // window closes (`CertAuthority::evict_expired_invites`), taking the
+        // name and the signal with it. What persists is the log: on a host CA
+        // this line reaches the process's journal, which outlives both this
+        // bounded ring and the invite record. `started_at` is the *operator's*
+        // signal — the thing an admin triaging the panel acts on now — and its
+        // disappearance is logged too, for the same reason this is.
         | RequestKind::BeginUserRegistration(_)
         // Creating an account that can mint a certificate the whole mesh
         // honours, *from an anonymous connection*. Strictly more deserving of a
@@ -4007,10 +4016,10 @@ mod tests {
     /// the listing is a read.
     ///
     /// `BeginUserRegistration` is a mutation and not a `Disclosure` despite
-    /// handing out the TOTP secret, because it *also* consumes the invite —
-    /// and the durable record of who took that secret is the invite's own
-    /// `started_at`, which outlives the log ring a disclosure record would sit
-    /// in.
+    /// handing out the TOTP secret, because it *also* consumes the invite. The
+    /// record this produces is the durable account of who took that secret: the
+    /// invite's own `started_at` is swept fifteen minutes later with the
+    /// invitation, while a log line on a host CA reaches the journal.
     #[test]
     fn audited_classifies_the_invite_requests() {
         use crate::wayfinder::v1alpha::BeginUserRegistrationRequest;
