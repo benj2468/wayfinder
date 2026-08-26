@@ -1943,6 +1943,20 @@ mod tests {
         /// The board this provider reports, so a test can prove every field
         /// reaches the wire rather than being dropped in the projection.
         alarms: AlarmsData,
+        /// What a `create_user_invite` mints, or `None` for a node that is not
+        /// a provider.
+        invite: Option<UserInviteMintedData>,
+        /// The invites `list_user_invites` reports.
+        invites: Vec<UserInviteData>,
+        /// The invite store's capacity, reported beside the listing.  Zero
+        /// stands for "not a provider", so a default `MockProvider` refuses the
+        /// listing rather than answering an empty one.
+        invite_capacity: u32,
+        /// What a `begin_user_registration` reveals, or `None` for a node that
+        /// is not a provider.
+        registration: Option<RegistrationStartedData>,
+        /// Whether `complete_user_registration` succeeds.
+        registration_completes: bool,
     }
 
     impl RouterDataProvider for MockProvider {
@@ -2026,6 +2040,49 @@ mod tests {
             self.enrollment_admission
                 .clone()
                 .ok_or_else(|| "node is not a certificate-authority provider".into())
+        }
+
+        fn create_user_invite(
+            &mut self,
+            _username: &str,
+            _admin: bool,
+            _session_ttl_secs: u64,
+            _invite_ttl_secs: u64,
+        ) -> Result<UserInviteMintedData, String> {
+            self.invite.clone().ok_or_else(|| NOT_A_PROVIDER.into())
+        }
+
+        fn list_user_invites(&self) -> Result<(Vec<UserInviteData>, u32), String> {
+            if self.invite_capacity == 0 {
+                return Err(NOT_A_PROVIDER.into());
+            }
+            Ok((self.invites.clone(), self.invite_capacity))
+        }
+
+        fn revoke_user_invite(&mut self, _username: &str) -> Result<(), String> {
+            Err(NOT_A_PROVIDER.into())
+        }
+
+        fn begin_user_registration(
+            &mut self,
+            _token: &str,
+        ) -> Result<RegistrationStartedData, String> {
+            self.registration
+                .clone()
+                .ok_or_else(|| NOT_A_PROVIDER.into())
+        }
+
+        fn complete_user_registration(
+            &mut self,
+            _handle: &str,
+            _password: &str,
+            _totp_code: &str,
+        ) -> Result<(), String> {
+            if self.registration_completes {
+                Ok(())
+            } else {
+                Err(NOT_A_PROVIDER.into())
+            }
         }
     }
 
@@ -3351,6 +3408,9 @@ mod tests {
             ResponseKind::ListUsers(_) => "ListUsers",
             ResponseKind::CreateUser(_) => "CreateUser",
             ResponseKind::Alarms(_) => "Alarms",
+            ResponseKind::CreateUserInvite(_) => "CreateUserInvite",
+            ResponseKind::ListUserInvites(_) => "ListUserInvites",
+            ResponseKind::BeginUserRegistration(_) => "BeginUserRegistration",
         }
     }
 
@@ -3503,5 +3563,280 @@ mod tests {
             }
             other => panic!("expected Error, got {}", proto_kind_name(&other)),
         }
+    }
+
+    /// A minted invite's token reaches the wire exactly as the provider
+    /// returned it.
+    ///
+    /// The token is a bearer credential the authority stores only as a hash, so
+    /// this response is the single moment it exists in readable form anywhere.
+    /// A dispatch that dropped or mangled it would leave the admin with an
+    /// invite they cannot deliver and no way to recover it.
+    #[test]
+    fn create_user_invite_carries_the_token_and_its_expiry() {
+        use crate::wayfinder::v1alpha::CreateUserInviteRequest;
+
+        let provider = MockProvider {
+            invite: Some(UserInviteMintedData {
+                username: "rowan".into(),
+                token: "JBSWY3DPEHPK3PXP".into(),
+                expires_at: 1_800_086_400,
+            }),
+            ..Default::default()
+        };
+
+        match handle(
+            provider,
+            RequestKind::CreateUserInvite(CreateUserInviteRequest {
+                username: "rowan".into(),
+                admin: false,
+                session_ttl_secs: 0,
+                invite_ttl_secs: 0,
+            }),
+        ) {
+            ResponseKind::CreateUserInvite(response) => {
+                assert_eq!(response.username, "rowan");
+                assert_eq!(response.token, "JBSWY3DPEHPK3PXP");
+                assert_eq!(response.expires_at, 1_800_086_400);
+            }
+            other => panic!("expected CreateUserInvite, got {}", proto_kind_name(&other)),
+        }
+    }
+
+    /// The listing carries the whole triage answer: who was invited, and — the
+    /// state §3.6 of the design exists for — who took the second factor and did
+    /// not finish.  Plus the store's capacity, so "nothing more can be minted"
+    /// is readable rather than inferred from a failed mint.
+    #[test]
+    fn list_user_invites_projects_the_started_state_and_the_capacity() {
+        use crate::wayfinder::v1alpha::ListUserInvitesRequest;
+
+        let provider = MockProvider {
+            invites: vec![
+                UserInviteData {
+                    username: "rowan".into(),
+                    admin: true,
+                    session_ttl_secs: 3600,
+                    created_at: 1_800_000_000,
+                    expires_at: 1_800_086_400,
+                    started_at: 1_800_000_600,
+                    handle_expires_at: 1_800_001_500,
+                },
+                UserInviteData {
+                    username: "wren".into(),
+                    admin: false,
+                    session_ttl_secs: 28800,
+                    created_at: 1_800_000_100,
+                    expires_at: 1_800_086_500,
+                    started_at: 0,
+                    handle_expires_at: 0,
+                },
+            ],
+            invite_capacity: 32,
+            ..Default::default()
+        };
+
+        match handle(
+            provider,
+            RequestKind::ListUserInvites(ListUserInvitesRequest {}),
+        ) {
+            ResponseKind::ListUserInvites(response) => {
+                assert_eq!(response.capacity, 32, "current-vs-cap, not a bare count");
+                assert_eq!(response.invites.len(), 2);
+                let started = &response.invites[0];
+                assert_eq!(started.username, "rowan");
+                assert!(started.admin);
+                assert_eq!(
+                    started.started_at, 1_800_000_600,
+                    "a started invite must say when its secret was revealed"
+                );
+                assert_eq!(started.handle_expires_at, 1_800_001_500);
+                let pending = &response.invites[1];
+                assert_eq!(pending.username, "wren");
+                assert_eq!(
+                    pending.started_at, 0,
+                    "an unstarted invite reports no start, not a fabricated one"
+                );
+            }
+            other => panic!("expected ListUserInvites, got {}", proto_kind_name(&other)),
+        }
+    }
+
+    /// Starting a registration hands back the account name, the `otpauth://`
+    /// URI and the short-lived handle that alone can complete it.
+    #[test]
+    fn begin_user_registration_carries_the_uri_and_the_handle() {
+        use crate::wayfinder::v1alpha::BeginUserRegistrationRequest;
+
+        let provider = MockProvider {
+            registration: Some(RegistrationStartedData {
+                username: "rowan".into(),
+                totp_enrolment_uri: "otpauth://totp/wayfinder:rowan?secret=AAAA".into(),
+                handle: "handle-abc".into(),
+                handle_expires_at: 1_800_001_500,
+            }),
+            ..Default::default()
+        };
+
+        match handle(
+            provider,
+            RequestKind::BeginUserRegistration(BeginUserRegistrationRequest {
+                token: "JBSWY3DPEHPK3PXP".into(),
+            }),
+        ) {
+            ResponseKind::BeginUserRegistration(response) => {
+                assert_eq!(response.username, "rowan");
+                assert!(response.totp_enrolment_uri.starts_with("otpauth://totp/"));
+                assert_eq!(response.handle, "handle-abc");
+                assert_eq!(response.handle_expires_at, 1_800_001_500);
+            }
+            other => panic!(
+                "expected BeginUserRegistration, got {}",
+                proto_kind_name(&other)
+            ),
+        }
+    }
+
+    /// Completion answers `Empty`: the account now exists and the caller's next
+    /// act is an ordinary sign-in.  Nothing is handed back, because there is
+    /// nothing left that only this response could carry.
+    #[test]
+    fn complete_user_registration_answers_empty() {
+        use crate::wayfinder::v1alpha::CompleteUserRegistrationRequest;
+
+        let provider = MockProvider {
+            registration_completes: true,
+            ..Default::default()
+        };
+
+        match handle(
+            provider,
+            RequestKind::CompleteUserRegistration(CompleteUserRegistrationRequest {
+                handle: "handle-abc".into(),
+                password: "correct horse battery staple".into(),
+                totp_code: "287082".into(),
+            }),
+        ) {
+            ResponseKind::Empty(_) => {}
+            other => panic!("expected Empty, got {}", proto_kind_name(&other)),
+        }
+    }
+
+    /// A node that is not a certificate authority has no invite store, and says
+    /// so rather than answering with an empty listing — which would read as
+    /// "nobody has been invited" on a node that could not know.
+    #[test]
+    fn the_invite_requests_are_errors_on_a_non_provider() {
+        use crate::wayfinder::v1alpha::BeginUserRegistrationRequest;
+        use crate::wayfinder::v1alpha::ListUserInvitesRequest;
+
+        for request in [
+            RequestKind::ListUserInvites(ListUserInvitesRequest {}),
+            RequestKind::BeginUserRegistration(BeginUserRegistrationRequest {
+                token: "anything".into(),
+            }),
+        ] {
+            match handle(MockProvider::default(), request) {
+                ResponseKind::Error(_) => {}
+                other => panic!("expected Error, got {}", proto_kind_name(&other)),
+            }
+        }
+    }
+
+    /// All five are answered from certificate-authority state, so a forked
+    /// caller must send them to that half — including the two an anonymous
+    /// registrant reaches, which hold no router state at all.
+    #[test]
+    fn the_invite_requests_are_owned_by_the_authority_facet() {
+        use crate::wayfinder::v1alpha::BeginUserRegistrationRequest;
+        use crate::wayfinder::v1alpha::CompleteUserRegistrationRequest;
+        use crate::wayfinder::v1alpha::CreateUserInviteRequest;
+        use crate::wayfinder::v1alpha::ListUserInvitesRequest;
+        use crate::wayfinder::v1alpha::RevokeUserInviteRequest;
+
+        for kind in [
+            RequestKind::CreateUserInvite(CreateUserInviteRequest::default()),
+            RequestKind::ListUserInvites(ListUserInvitesRequest {}),
+            RequestKind::RevokeUserInvite(RevokeUserInviteRequest::default()),
+            RequestKind::BeginUserRegistration(BeginUserRegistrationRequest::default()),
+            RequestKind::CompleteUserRegistration(CompleteUserRegistrationRequest::default()),
+        ] {
+            assert_eq!(
+                request_facet(&kind),
+                RequestFacet::Authority,
+                "{} is answered from authority state",
+                request_kind_name(&kind)
+            );
+        }
+    }
+
+    /// Four of the five change the account store and are audited as mutations;
+    /// the listing is a read.
+    ///
+    /// `BeginUserRegistration` is a mutation and not a `Disclosure` despite
+    /// handing out the TOTP secret, because it *also* consumes the invite —
+    /// and the durable record of who took that secret is the invite's own
+    /// `started_at`, which outlives the log ring a disclosure record would sit
+    /// in.
+    #[test]
+    fn audited_classifies_the_invite_requests() {
+        use crate::wayfinder::v1alpha::BeginUserRegistrationRequest;
+        use crate::wayfinder::v1alpha::CompleteUserRegistrationRequest;
+        use crate::wayfinder::v1alpha::CreateUserInviteRequest;
+        use crate::wayfinder::v1alpha::ListUserInvitesRequest;
+        use crate::wayfinder::v1alpha::RevokeUserInviteRequest;
+
+        for kind in [
+            RequestKind::CreateUserInvite(CreateUserInviteRequest::default()),
+            RequestKind::RevokeUserInvite(RevokeUserInviteRequest::default()),
+            RequestKind::BeginUserRegistration(BeginUserRegistrationRequest::default()),
+            RequestKind::CompleteUserRegistration(CompleteUserRegistrationRequest::default()),
+        ] {
+            assert_eq!(
+                Audited::Mutation,
+                audited(&kind),
+                "{} changes the account store",
+                request_kind_name(&kind)
+            );
+        }
+        assert_eq!(
+            Audited::Query,
+            audited(&RequestKind::ListUserInvites(ListUserInvitesRequest {}))
+        );
+    }
+
+    /// The kind names are what the audit record carries, and a request whose
+    /// fields are a token, a password and a TOTP code must be identified by its
+    /// kind alone.
+    #[test]
+    fn request_kind_name_covers_the_invite_requests() {
+        use crate::wayfinder::v1alpha::BeginUserRegistrationRequest;
+        use crate::wayfinder::v1alpha::CompleteUserRegistrationRequest;
+        use crate::wayfinder::v1alpha::CreateUserInviteRequest;
+
+        assert_eq!(
+            request_kind_name(&RequestKind::CreateUserInvite(
+                CreateUserInviteRequest::default()
+            )),
+            "CreateUserInvite"
+        );
+        assert_eq!(
+            request_kind_name(&RequestKind::BeginUserRegistration(
+                BeginUserRegistrationRequest {
+                    token: "a-secret-token".into(),
+                }
+            )),
+            "BeginUserRegistration"
+        );
+        assert_eq!(
+            request_kind_name(&RequestKind::CompleteUserRegistration(
+                CompleteUserRegistrationRequest {
+                    handle: "h".into(),
+                    password: "hunter2".into(),
+                    totp_code: "000000".into(),
+                }
+            )),
+            "CompleteUserRegistration"
+        );
     }
 }
