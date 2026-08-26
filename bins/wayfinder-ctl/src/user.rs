@@ -509,9 +509,37 @@ fn set_disabled(state: &Path, username: &str, disabled: bool) -> anyhow::Result<
 /// Remove an account.
 fn remove(state: &Path, username: &str) -> anyhow::Result<()> {
     let mut ca = open(state)?;
+    // Read before the removal: afterwards the account is gone and with it the
+    // only thing that says which certificates were its.
+    let sessions = ca.live_session_macs(username);
     ca.remove_user(username).map_err(anyhow::Error::msg)?;
+
+    if sessions.is_empty() {
+        println!("removed {username}; it held no session certificates");
+        return Ok(());
+    }
+
+    // The online `RemoveUser` revokes an account's sessions as part of removing
+    // it. This path cannot: a revocation has to be *flooded* to the mesh, and
+    // there is no router here to flood it — marking the entries would announce
+    // nothing, since nothing re-floods revocations at startup either.
+    //
+    // So it names them instead. That is the whole remedy available offline, and
+    // it is worth the lines: the account has just been deleted, so nothing left
+    // in the state file says these certificates were ever its, and an operator
+    // without this list has no way to find them again.
+    let count = sessions.len();
+    let plural = if count == 1 { "" } else { "s" };
     println!(
-        "removed {username}; existing certificates are unaffected — revoke them if the account is compromised"
+        "removed {username}, but {count} session certificate{plural} it holds \
+         remain valid and this offline path cannot revoke them"
+    );
+    for mac in &sessions {
+        println!("  {}", crate::output::format_mac(&mac.0));
+    }
+    println!(
+        "revoke each against a running provider (`wayfinderctl revoke-node`), or let them \
+         expire; removing the account over the management API would have done it in one act"
     );
     Ok(())
 }

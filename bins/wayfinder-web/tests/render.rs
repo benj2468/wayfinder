@@ -32,6 +32,7 @@ use wayfinder_protos::wayfinder::v1alpha::OgmScheduleEntry;
 use wayfinder_protos::wayfinder::v1alpha::PendingCsr;
 use wayfinder_protos::wayfinder::v1alpha::RoutingEntry;
 use wayfinder_protos::wayfinder::v1alpha::TableOccupancy;
+use wayfinder_protos::wayfinder::v1alpha::UserAccount;
 use wayfinder_protos::wayfinder::v1alpha::VpnPeerStatus;
 use wayfinder_web::components::dashboard::Dashboard;
 use wayfinder_web::components::link_quality::LinkQuality;
@@ -40,6 +41,7 @@ use wayfinder_web::components::logs::Logs;
 use wayfinder_web::components::metrics::Metrics;
 use wayfinder_web::components::overview::Overview;
 use wayfinder_web::components::provider::accounts::Accounts;
+use wayfinder_web::components::provider::accounts::UserTable;
 use wayfinder_web::components::provider::enrollment::Enrollment;
 use wayfinder_web::components::provider::members::Members;
 use wayfinder_web::components::provider::requests::Requests;
@@ -830,6 +832,60 @@ fn provider_accounts_offers_the_roster_and_the_form_beneath_it() {
     assert!(
         html.contains("Administrator — may change anything"),
         "and the capability it grants: {html}"
+    );
+}
+
+/// The roster offers both account controls, and the hint that tells them apart.
+///
+/// Two buttons whose names cannot carry the difference between them, where
+/// pressing the wrong one costs somebody their account — so what is asserted is
+/// not only that both exist but that the explanation ships with them.
+#[test]
+fn provider_accounts_offers_revoke_and_remove_and_explains_the_difference() {
+    let account = UserAccount {
+        username: "watcher".into(),
+        admin: false,
+        session_ttl_secs: 900,
+        totp_enrolled: true,
+        disabled: false,
+        locked: false,
+    };
+    let html = render_with(Some(provider_snapshot()), move || {
+        view! {
+            <UserTable
+                users=vec![account.clone()]
+                on_revoke=Callback::new(|_| {})
+                on_remove=Callback::new(|_| {})
+            />
+        }
+    });
+
+    assert!(html.contains(">Revoke<"), "the revoke control: {html}");
+    assert!(html.contains(">Remove<"), "and the remove control: {html}");
+    assert!(
+        html.contains("aria-label=\"Revoke watcher's sessions\""),
+        "each control names the account it acts on, for a reader who cannot see \
+         which row the button is in: {html}"
+    );
+    assert!(
+        html.contains("What does Revoke do?"),
+        "the explanation is reachable by name rather than only by hovering a \
+         mouse, which is the whole reason it is not a title= tooltip: {html}"
+    );
+    assert!(
+        html.contains("deletes the account"),
+        "and it says what Remove does that Revoke does not: {html}"
+    );
+    assert!(
+        html.contains("popover=\"auto\"") && html.contains("popovertarget="),
+        "the explanation is a popover, so the browser renders it in the top layer \
+         rather than inside the scroll container that would clip it: {html}"
+    );
+    assert!(
+        html.contains("anchor-name: --wf-hint-account-actions")
+            && html.contains("position-anchor: --wf-hint-account-actions"),
+        "and its anchor is derived from the hint's own id, so a second hint on \
+         the page would not steal its placement: {html}"
     );
 }
 

@@ -34,6 +34,7 @@ use wayfinder_auth::CERT_FLAG_ADMIN;
 use wayfinder_auth::CERT_FLAG_USER;
 use wayfinder_auth::CERT_FLAG_VIEWER;
 
+use crate::users::AccountId;
 use crate::users::UserInvite;
 use crate::users::UserRecord;
 
@@ -51,7 +52,7 @@ const MAX_STATE_BYTES: usize = 1024 * 1024;
 /// Current on-disk schema version. Bump this — and add an ordered migration
 /// from the prior version into [`parse_state`] — whenever [`CaState`]'s shape
 /// changes.
-pub(crate) const CURRENT_STATE_VERSION: u32 = 6;
+pub(crate) const CURRENT_STATE_VERSION: u32 = 7;
 
 /// Permission bits the CA state file is written with.
 ///
@@ -87,6 +88,15 @@ struct IssuedRecord {
     /// and viewer certificates did not.
     #[serde(default)]
     flags: u8,
+    /// The account whose sign-in produced this certificate, or `None` for a
+    /// device's membership certificate.
+    ///
+    /// Added in version 7. `None` for a record written before it, which is the
+    /// honest answer rather than a guess: nothing in an earlier snapshot ever
+    /// recorded whose session a certificate was, so those cannot be attributed
+    /// and expire on their own schedule.
+    #[serde(default)]
+    account_id: Option<AccountId>,
 }
 
 impl IssuedRecord {
@@ -104,6 +114,16 @@ impl IssuedRecord {
             not_after: c.not_after,
             revoked: c.revoked,
             flags: pack_flags(c),
+            // A wrong-length id is dropped rather than refusing the whole
+            // record: the certificate and its revocation status are the part
+            // that must survive, and an unattributable session is exactly what
+            // a `None` here says.
+            account_id: c
+                .account_id
+                .as_slice()
+                .try_into()
+                .ok()
+                .map(AccountId::from_bytes),
         })
     }
 
@@ -118,6 +138,10 @@ impl IssuedRecord {
             user: self.flags & CERT_FLAG_USER != 0,
             admin: self.flags & CERT_FLAG_ADMIN != 0,
             viewer: self.flags & CERT_FLAG_VIEWER != 0,
+            account_id: self
+                .account_id
+                .map(|id| id.as_bytes().to_vec())
+                .unwrap_or_default(),
         }
     }
 }
@@ -358,14 +382,57 @@ struct CaStateV5 {
 /// none — a faithful description of a provider that had no invite store at all,
 /// not a loss of state. An invite is a bearer credential with an expiry, so
 /// there is nothing here that could be reconstructed even in principle.
-fn migrate_v5_to_v6(v5: CaStateV5) -> CaState {
-    CaState {
-        version: 6,
+fn migrate_v5_to_v6(v5: CaStateV5) -> CaStateV6 {
+    CaStateV6 {
         issued: v5.issued,
         held: v5.held,
         policy: v5.policy,
         users: v5.users,
         invites: Vec::new(),
+    }
+}
+
+/// Version 6 of the on-disk schema: as version 7, but with no account ids on
+/// its accounts and no owning account on its issued certificates — the
+/// authority did not link a session certificate to the account that minted it
+/// until version 7. Kept so [`parse_state`] can migrate a version-6 snapshot.
+#[derive(Deserialize)]
+struct CaStateV6 {
+    issued: Vec<IssuedRecord>,
+    held: Vec<HeldCsr>,
+    #[serde(default)]
+    policy: PolicyOverrides,
+    #[serde(default)]
+    users: Vec<UserRecord>,
+    #[serde(default)]
+    invites: Vec<UserInvite>,
+}
+
+/// Migrate a version-6 snapshot forward: a shape-preserving step, because the
+/// two fields version 7 adds carry `serde` defaults that have already done the
+/// work by the time this runs.
+///
+/// This is the [`IssuedRecord::flags`] pattern rather than a rewrite, and both
+/// halves matter. Each [`UserRecord`] takes a **freshly minted**
+/// [`AccountId`] — `#[serde(default = "AccountId::generate")]` is called once
+/// per record with a missing field, so no two accounts share one; a default
+/// returning a constant would make every account's revocation cut every other,
+/// invisibly. Each [`IssuedRecord`] takes `None`, which is accurate for every
+/// certificate that could exist in a version-6 snapshot: nothing there ever
+/// recorded whose session it was, so those certificates cannot be attributed
+/// and run to their own expiry. `RevokeNode` on the MAC remains the tool for
+/// one of them.
+///
+/// The step is still written out rather than collapsed into "deserialize as
+/// version 7", so the chain stays a sequence of versions each of which existed.
+fn migrate_v6_to_v7(v6: CaStateV6) -> CaState {
+    CaState {
+        version: 7,
+        issued: v6.issued,
+        held: v6.held,
+        policy: v6.policy,
+        users: v6.users,
+        invites: v6.invites,
     }
 }
 
@@ -403,27 +470,33 @@ fn parse_state(bytes: &[u8], path: Option<&Path>) -> Result<CaState, String> {
     match probe.version {
         1 => {
             let v1: CaStateV1 = serde_json::from_slice(bytes).map_err(corrupt)?;
-            Ok(migrate_v5_to_v6(migrate_v4_to_v5(migrate_v3_to_v4(
-                migrate_v2_to_v3(migrate_v1_to_v2(v1)),
+            Ok(migrate_v6_to_v7(migrate_v5_to_v6(migrate_v4_to_v5(
+                migrate_v3_to_v4(migrate_v2_to_v3(migrate_v1_to_v2(v1))),
             ))))
         }
         2 => {
             let v2: CaStateV2 = serde_json::from_slice(bytes).map_err(corrupt)?;
-            Ok(migrate_v5_to_v6(migrate_v4_to_v5(migrate_v3_to_v4(
-                migrate_v2_to_v3(v2),
+            Ok(migrate_v6_to_v7(migrate_v5_to_v6(migrate_v4_to_v5(
+                migrate_v3_to_v4(migrate_v2_to_v3(v2)),
             ))))
         }
         3 => {
             let v3: CaStateV3 = serde_json::from_slice(bytes).map_err(corrupt)?;
-            Ok(migrate_v5_to_v6(migrate_v4_to_v5(migrate_v3_to_v4(v3))))
+            Ok(migrate_v6_to_v7(migrate_v5_to_v6(migrate_v4_to_v5(
+                migrate_v3_to_v4(v3),
+            ))))
         }
         4 => {
             let v4: CaStateV4 = serde_json::from_slice(bytes).map_err(corrupt)?;
-            Ok(migrate_v5_to_v6(migrate_v4_to_v5(v4)))
+            Ok(migrate_v6_to_v7(migrate_v5_to_v6(migrate_v4_to_v5(v4))))
         }
         5 => {
             let v5: CaStateV5 = serde_json::from_slice(bytes).map_err(corrupt)?;
-            Ok(migrate_v5_to_v6(v5))
+            Ok(migrate_v6_to_v7(migrate_v5_to_v6(v5)))
+        }
+        6 => {
+            let v6: CaStateV6 = serde_json::from_slice(bytes).map_err(corrupt)?;
+            Ok(migrate_v6_to_v7(v6))
         }
         CURRENT_STATE_VERSION => serde_json::from_slice(bytes).map_err(corrupt),
         v if v > CURRENT_STATE_VERSION => Err(format!(
@@ -678,6 +751,31 @@ impl CaLog {
         let (result, persisted) = self
             .persisted
             .mutate(|state| f(&mut state.users, &mut state.invites));
+        (result, self.report_persist_outcome(persisted))
+    }
+
+    /// Run `f` against *both* the user store and the issued-certificate log,
+    /// persisting the combined result as a single write — for the one caller
+    /// (`CertAuthority::remove_user_revoking_sessions`) that must delete an
+    /// account and revoke the certificates it holds as one durable unit.
+    ///
+    /// The same hazard [`Self::mutate_users_and_invites`] exists for, pointed at
+    /// the pair design 14 §5.6 is about, and it splits badly in both directions.
+    /// If the account is deleted durably and the revocations then fail and roll
+    /// back, the operator is told the account is gone while every session it
+    /// held keeps working — which is precisely the bug that design exists to
+    /// end, reintroduced in the window where it is hardest to notice. If the
+    /// revocations land and the deletion rolls back, the account survives with
+    /// its sessions cut and can simply sign in again for a fresh one. One
+    /// [`Persisted::mutate`] closes both: either the account is gone and its
+    /// sessions are revoked, or neither happened.
+    pub(crate) fn mutate_users_and_issued<R>(
+        &mut self,
+        f: impl FnOnce(&mut Vec<UserRecord>, &mut Vec<IssuedCertData>) -> R,
+    ) -> (R, Result<(), String>) {
+        let (result, persisted) = self
+            .persisted
+            .mutate(|state| f(&mut state.users, &mut state.issued));
         (result, self.report_persist_outcome(persisted))
     }
 
@@ -1040,5 +1138,76 @@ mod tests {
         let written: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(written["version"], CURRENT_STATE_VERSION);
+    }
+
+    /// A snapshot written before accounts had ids gives each one its own,
+    /// freshly minted.
+    ///
+    /// Per account, not one shared default: the id is what links a session
+    /// certificate to its owner, so two accounts sharing one would make every
+    /// revocation cut both. That is the whole failure mode a `#[serde(default)]`
+    /// returning a constant would introduce, and it would be invisible until
+    /// somebody was cut off by somebody else's removal.
+    #[test]
+    fn a_v6_snapshot_mints_a_distinct_account_id_per_account() {
+        let dir = unique_dir("v6-migration");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let hash = "$argon2id$v=19$m=65536,t=3,p=1$c2FsdHNhbHQ$aGFzaGhhc2g";
+        let key = [0u8; 32];
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": 6,
+                "issued": [{
+                    "node_mac": [0, 0, 0, 0, 0, 1],
+                    "ed_pubkey": key,
+                    "not_before": 0,
+                    "not_after": 1,
+                    "revoked": false,
+                }],
+                "held": [],
+                "invites": [],
+                "users": [
+                    {
+                        "username": "ops",
+                        "password_hash": hash,
+                        "totp_secret": null,
+                        "session_ttl_secs": 3600,
+                    },
+                    {
+                        "username": "watcher",
+                        "password_hash": hash,
+                        "totp_secret": null,
+                        "session_ttl_secs": 3600,
+                    },
+                ],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut log = CaLog::load(Some(path.clone())).unwrap();
+
+        assert_eq!(log.users().len(), 2, "both accounts survive the migration");
+        assert_ne!(
+            log.users()[0].id,
+            log.users()[1].id,
+            "each account is given its own id, or a revocation would cut both"
+        );
+        assert!(
+            log.issued()[0].account_id.is_empty(),
+            "a certificate from before the link existed is attributed to nobody,              which is the honest answer rather than a guess"
+        );
+
+        // The rewrite carries the new version, so a downgrade fails loudly
+        // rather than silently dropping the ids the accounts now depend on.
+        let (_, persisted) = log.mutate_users(|_| {});
+        persisted.unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["version"], CURRENT_STATE_VERSION);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -41,6 +41,7 @@ use crate::wayfinder::v1alpha::OgmScheduleEntry;
 use crate::wayfinder::v1alpha::PendingCsr;
 use crate::wayfinder::v1alpha::ResolveRouteResponse;
 use crate::wayfinder::v1alpha::RevealEnrollmentTokenResponse;
+use crate::wayfinder::v1alpha::RevokeUserSessionsResponse;
 use crate::wayfinder::v1alpha::RoutingEntry;
 use crate::wayfinder::v1alpha::RoutingTable;
 use crate::wayfinder::v1alpha::SubmitCsrResponse;
@@ -910,6 +911,22 @@ pub trait AuthorityDataProvider {
         Err(NOT_A_PROVIDER.into())
     }
 
+    /// Provider mode: revoke every session certificate `username` currently
+    /// holds, leaving the account in place, and report how many were revoked.
+    /// Default errors (not a provider).
+    ///
+    /// The difference from removing the account is the account: this ends what
+    /// it is currently holding and leaves it able to sign in again.
+    ///
+    /// An implementation must skip sessions it has already revoked and sessions
+    /// that have expired, so **zero is an ordinary success** rather than a
+    /// failure to find the account. `Err` is for a name that is not on file, and
+    /// for a store that cannot be made durable.
+    fn revoke_user_sessions(&mut self, username: &str) -> Result<u32, String> {
+        let _ = username;
+        Err(NOT_A_PROVIDER.into())
+    }
+
     /// Provider mode: delete the invite minted for `username`, at any status.
     /// Default errors (not a provider).
     ///
@@ -1055,6 +1072,16 @@ pub struct IssuedCertData {
     /// Whether the certificate carries the read-only management capability
     /// (`CERT_FLAG_VIEWER`).
     pub viewer: bool,
+    /// The stable id of the account whose sign-in produced this certificate,
+    /// or empty for a device's membership certificate — and for any session
+    /// recorded before the authority linked the two.
+    ///
+    /// A CA-side fact that never reaches the wire: no field of the `IssuedCert`
+    /// protobuf carries it, and this type is the authority's in-memory record
+    /// as well as its projection.  It is what makes "revoke this account's
+    /// sessions" answerable, and it is an *id* rather than a username because a
+    /// name can be recycled — see `wayfinder-server`'s `AccountId`.
+    pub account_id: Vec<u8>,
 }
 
 /// One user account, as the management API reports it.
@@ -1291,6 +1318,7 @@ pub fn request_kind_name(k: &RequestKind) -> &'static str {
         RequestKind::RevokeUserInvite(_) => "RevokeUserInvite",
         RequestKind::BeginUserRegistration(_) => "BeginUserRegistration",
         RequestKind::CompleteUserRegistration(_) => "CompleteUserRegistration",
+        RequestKind::RevokeUserSessions(_) => "RevokeUserSessions",
     }
 }
 
@@ -1361,6 +1389,10 @@ fn audited(k: &RequestKind) -> Audited {
         // And revoking one takes that decision back — often *because* the
         // record shows a start nobody expected.
         | RequestKind::RevokeUserInvite(_)
+        // Taking away access somebody currently holds, which is the same
+        // reasoning that audits RemoveUser beside it — and this is the half of
+        // RemoveUser that actually ends a session, reachable on its own.
+        | RequestKind::RevokeUserSessions(_)
         // A mutation, not a Disclosure, despite handing out the account's
         // `otpauth://` URI: it consumes the invite, so classifying it as "reads
         // public state but hands out a secret" would be a lie about what
@@ -1483,7 +1515,8 @@ pub fn request_facet(kind: &RequestKind) -> RequestFacet {
         | RequestKind::ListUserInvites(_)
         | RequestKind::RevokeUserInvite(_)
         | RequestKind::BeginUserRegistration(_)
-        | RequestKind::CompleteUserRegistration(_) => RequestFacet::Authority,
+        | RequestKind::CompleteUserRegistration(_)
+        | RequestKind::RevokeUserSessions(_) => RequestFacet::Authority,
         RequestKind::Authenticate(_)
         | RequestKind::GetVpnEnrollment(_)
         | RequestKind::ListVpnPeers(_)
@@ -1986,6 +2019,14 @@ pub fn handle_authority<P: AuthorityDataProvider>(
             }),
             Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
         },
+        Some(RequestKind::RevokeUserSessions(req)) => {
+            match provider.revoke_user_sessions(&req.username) {
+                Ok(revoked) => {
+                    ResponseKind::RevokeUserSessions(RevokeUserSessionsResponse { revoked })
+                }
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            }
+        }
         Some(RequestKind::RevokeUserInvite(req)) => {
             match provider.revoke_user_invite(&req.username) {
                 Ok(()) => ResponseKind::Empty(Empty {}),
@@ -3653,6 +3694,7 @@ mod tests {
             ResponseKind::CreateUserInvite(_) => "CreateUserInvite",
             ResponseKind::ListUserInvites(_) => "ListUserInvites",
             ResponseKind::BeginUserRegistration(_) => "BeginUserRegistration",
+            ResponseKind::RevokeUserSessions(_) => "RevokeUserSessions",
         }
     }
 

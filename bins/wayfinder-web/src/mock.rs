@@ -708,13 +708,30 @@ impl AuthorityDataProvider for Mock {
     }
     fn remove_user(&mut self, username: &str) -> Result<(), String> {
         // The trait method, not the inherent one: the last-administrator guard
-        // is part of what a test driving this mock is exercising.
+        // and the session revocation are both part of what a test driving this
+        // mock is exercising, and only the trait method has either.
+        //
+        // The signed revocations are dropped, and that is correct *here* and
+        // nowhere else: a mock has no router beside it and no mesh to flood
+        // them to. What a test reads instead is the `revoked` flag they left on
+        // the issued log, which is the same fact from the authority's side.
         MeshAuthority::remove_user(
             self.ca
                 .as_mut()
                 .ok_or_else(|| "node is not a certificate-authority provider".to_string())?,
             username,
         )
+        .map(|_| ())
+    }
+
+    fn revoke_user_sessions(&mut self, username: &str) -> Result<u32, String> {
+        MeshAuthority::revoke_user_sessions(
+            self.ca
+                .as_mut()
+                .ok_or_else(|| "node is not a certificate-authority provider".to_string())?,
+            username,
+        )
+        .map(|records| records.len() as u32)
     }
     fn approve_csr(&mut self, node_mac: &[u8]) -> Result<(), String> {
         self.ca

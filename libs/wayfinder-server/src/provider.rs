@@ -111,22 +111,49 @@ pub trait MeshAuthority {
         no_totp: bool,
     ) -> Result<String, String>;
 
-    /// Remove the named user account.
+    /// Remove the named user account **and** revoke every session certificate
+    /// it holds, returning one [`RevocationRecord`] per revoked session for the
+    /// caller to flood.
     ///
-    /// Ends the account's ability to obtain *new* sessions. A certificate
-    /// already issued to it is unaffected — that is what `revoke` and expiry
-    /// are for — so cutting off a compromised account is two acts, not one.
+    /// Cutting off an account is one act, not two. It used to be two — this
+    /// ended the ability to obtain *new* sessions and left every certificate
+    /// already issued working until it expired, so deleting a compromised
+    /// account left the compromise running for up to the account's session
+    /// lifetime. See design 14.
     ///
-    /// An implementation must refuse to remove the last account that can still
-    /// administer the mesh. Both this and [`create_user`](Self::create_user)
-    /// need a full management grant, so an authority left with no enabled
-    /// administrator has a user store that can no longer be changed over the
-    /// management API at all — a state reachable in one click and escapable
-    /// only with a shell on the provider host.
+    /// An implementation must delete the account and revoke its sessions as one
+    /// durable unit. Splitting them leaves, in the direction that matters, an
+    /// account reported gone whose sessions came back alive.
+    ///
+    /// It must also refuse to remove the last account that can still administer
+    /// the mesh, and must evaluate that refusal *before* signing anything — a
+    /// refused removal revokes nothing. Both this and
+    /// [`create_user`](Self::create_user) need a full management grant, so an
+    /// authority left with no enabled administrator has a user store that can no
+    /// longer be changed over the management API at all — a state reachable in
+    /// one click and escapable only with a shell on the provider host.
     ///
     /// `Err` covers that refusal, a name that is not on file, and a store that
     /// cannot be made durable.
-    fn remove_user(&mut self, username: &str) -> Result<(), String>;
+    fn remove_user(&mut self, username: &str) -> Result<Vec<RevocationRecord>, String>;
+
+    /// Revoke every session certificate the named account holds, leaving the
+    /// account itself in place, and return one [`RevocationRecord`] per revoked
+    /// session for the caller to flood.
+    ///
+    /// The difference from [`remove_user`](Self::remove_user) is the account:
+    /// this ends what the account is currently holding and leaves it able to
+    /// sign in again. It is the control for a lost laptop, where the person
+    /// still works here.
+    ///
+    /// An implementation must skip sessions it has already revoked — re-sending
+    /// spends mesh airtime to say what the mesh already believes — and sessions
+    /// that have expired, which passive expiry already ended. So an empty vector
+    /// is an ordinary success, not a failure to find the account.
+    ///
+    /// `Err` covers a name that is not on file and a store that cannot be made
+    /// durable.
+    fn revoke_user_sessions(&mut self, username: &str) -> Result<Vec<RevocationRecord>, String>;
 
     /// Sign a revocation for `node_mac`, returning the [`RevocationRecord`] for
     /// the caller to record and flood.  Returns an error string on malformed

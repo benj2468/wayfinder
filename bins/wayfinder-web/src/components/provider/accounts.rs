@@ -20,6 +20,28 @@
 //! plainly that it will not be shown again, and offers it through the clipboard
 //! rather than only as text on a screen someone else can see.
 //!
+//! # Two controls, because there are two acts
+//!
+//! **Revoke** ends every session certificate the account is currently holding
+//! and leaves the account able to sign in again. **Remove** does both: it
+//! revokes and then deletes.
+//!
+//! Remove used to do only the second half, which made the destructive-looking
+//! control the one that left a compromised account's certificates working for
+//! up to their whole lifetime. Both now go through the node as one act each —
+//! see `docs/design/implemented/14-account-scoped-session-revocation.md`.
+//!
+//! The distinction is carried by a [`Hint`] beside the pair rather than by
+//! their names, because no two verbs make it obvious and the cost of guessing
+//! wrong is somebody's account. It is a focusable button, not a `title=`
+//! tooltip: this is precisely the explanation somebody needs *before* pressing
+//! an irreversible control, and `title` never reaches a keyboard or touch user.
+//!
+//! It sits in the table header rather than on every row — what it explains is
+//! the pair of controls, not any one account — and its panel is a `popover`,
+//! because this table scrolls and anything positioned inside that scroll
+//! container is clipped by it. See [`Hint`]'s own docs.
+//!
 //! # The node refuses to strand itself, and this does not second-guess it
 //!
 //! `MeshAuthority::remove_user` rejects removing the last account that can
@@ -36,12 +58,14 @@ use crate::api::list_user_invites;
 use crate::api::list_users;
 use crate::api::remove_user;
 use crate::api::revoke_user_invite;
+use crate::api::revoke_user_sessions;
 use crate::components::dashboard::use_dashboard;
 use crate::components::provider::CopyField;
 use crate::components::provider::ProviderGate;
 use crate::components::provider::confirmation;
 use crate::components::provider::report_failure;
 use crate::components::widgets::Empty;
+use crate::components::widgets::Hint;
 use crate::components::widgets::Panel;
 use crate::components::widgets::Pending;
 use crate::format;
@@ -57,6 +81,19 @@ pub fn Accounts() -> impl IntoView {
             <Invitations />
         </ProviderGate>
     }
+}
+
+/// Which of the two account controls an operator has pressed.
+///
+/// Both are destructive and neither can be undone, so they share the
+/// confirmation dialog — but they are genuinely different acts and the dialog
+/// has to say which one it is about. A bare username could not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AccountAction {
+    /// End every session the account currently holds, leaving the account.
+    RevokeSessions(String),
+    /// Revoke those sessions *and* delete the account.
+    Remove(String),
 }
 
 /// The account roster and the form that adds to it.
@@ -82,19 +119,42 @@ fn Users() -> impl IntoView {
     let created = RwSignal::new(None::<(String, String)>);
 
     // `Pending` is generic precisely so a panel keeps an action type it can
-    // actually receive — here, the name of the account being removed — and the
-    // roster's `Resource`, which the removal has to refetch, lives here and
-    // nowhere else.
-    let pending = RwSignal::new(None::<Pending<String>>);
+    // actually receive — here, which of the two account controls was pressed
+    // and against whom — and the roster's `Resource`, which both of them have
+    // to refetch, lives here and nowhere else.
+    let pending = RwSignal::new(None::<Pending<AccountAction>>);
+    // What the last action did, held until the next one replaces it. A
+    // revocation's whole result is a number, and "revoked nothing" and "revoked
+    // three" call for different follow-up — so it is reported rather than left
+    // to be inferred from a table that looks identical either way.
+    let outcome = RwSignal::new(None::<String>);
 
-    let confirm_removal = move |username: String| {
+    let confirm = move |action: AccountAction| {
         leptos::task::spawn_local(async move {
-            match remove_user(username).await {
-                // Wrong by exactly one row, the same as after a creation.
-                Ok(()) => users.refetch(),
-                Err(e) => dash
-                    .error
-                    .set(Some(format!("Removing the account failed: {e}"))),
+            outcome.set(None);
+            match action {
+                AccountAction::RevokeSessions(username) => {
+                    match revoke_user_sessions(username.clone()).await {
+                        Ok(revoked) => {
+                            outcome.set(Some(format::sessions_revoked(&username, revoked)));
+                            // The roster itself is unchanged — the account is
+                            // still there — but its Status may not be, and a
+                            // refetch is cheaper than reasoning about which.
+                            users.refetch();
+                        }
+                        Err(e) => report_failure(dash, "Revoking the sessions", Err::<(), _>(e)),
+                    }
+                }
+                AccountAction::Remove(username) => match remove_user(username.clone()).await {
+                    Ok(()) => {
+                        outcome.set(Some(format!(
+                            "Removed {username} and revoked the sessions it held."
+                        )));
+                        // Wrong by exactly one row, the same as after a creation.
+                        users.refetch();
+                    }
+                    Err(e) => report_failure(dash, "Removing the account", Err::<(), _>(e)),
+                },
             }
         });
     };
@@ -169,18 +229,34 @@ fn Users() -> impl IntoView {
                                 view! {
                                     <UserTable
                                         users=list
+                                        on_revoke=Callback::new(move |username: String| {
+                                            pending
+                                                .set(
+                                                    Some(Pending {
+                                                        prompt: format!(
+                                                            "End every session {username} is currently signed in with? \
+                                                             The account stays and can sign in again; what it is holding \
+                                                             now stops working everywhere on the mesh, and that cannot \
+                                                             be undone.",
+                                                        ),
+                                                        verb: "Revoke sessions",
+                                                        destructive: true,
+                                                        kind: AccountAction::RevokeSessions(username),
+                                                    }),
+                                                )
+                                        })
                                         on_remove=Callback::new(move |username: String| {
                                             pending
                                                 .set(
                                                     Some(Pending {
                                                         prompt: format!(
-                                                            "Remove {username}? It can obtain no new sessions after this. \
-                                                             A certificate already issued to it keeps working until it \
-                                                             expires, so revoke that too if the account is compromised.",
+                                                            "Remove {username}? This revokes every session it is holding \
+                                                             and deletes the account, so it cannot sign in again. \
+                                                             Neither half can be undone.",
                                                         ),
                                                         verb: "Remove",
                                                         destructive: true,
-                                                        kind: username,
+                                                        kind: AccountAction::Remove(username),
                                                     }),
                                                 )
                                         })
@@ -200,6 +276,12 @@ fn Users() -> impl IntoView {
                     )
                 }}
             </Suspense>
+
+            {move || {
+                outcome
+                    .get()
+                    .map(|message| view! { <p class="wf-note">{message}</p> })
+            }}
 
             {move || {
                 created
@@ -294,22 +376,32 @@ fn Users() -> impl IntoView {
                 </button>
             </form>
             <p class="wf-note">
-                "Disabling and renaming an account are done on the provider host with \
-                 `wayfinderctl user`, which needs no network at all. The last account that \
-                 can administer this mesh cannot be removed here — leaving none would mean \
-                 no further change to this list from any dashboard."
+                "Disabling an account stops it signing in again but leaves the sessions it \
+                 already holds — reach for Revoke as well. Disabling and renaming are done \
+                 on the provider host with `wayfinderctl user`, which needs no network at \
+                 all. The last account that can administer this mesh cannot be removed \
+                 here — leaving none would mean no further change to this list from any \
+                 dashboard."
             </p>
 
-            {confirmation(pending, confirm_removal)}
+            {confirmation(pending, confirm)}
         </Panel>
     }
 }
 
 /// The account roster.
+///
+/// `pub` for the render tests, and for a reason particular to this panel: the
+/// roster arrives on a `Resource`, which the SSR test harness does not resolve
+/// — a test that rendered the whole tab would only ever see "Reading the
+/// accounts…". Every other tab's table hangs off the polled snapshot and needs
+/// no such seam.
 #[component]
-fn UserTable(
+pub fn UserTable(
     /// The accounts as the authority reported them.
     users: Vec<UserAccount>,
+    /// Raise the confirmation for ending the named account's sessions.
+    on_revoke: Callback<String>,
     /// Raise the confirmation for removing the named account.
     on_remove: Callback<String>,
 ) -> impl IntoView {
@@ -323,12 +415,37 @@ fn UserTable(
                         <th>"Session length"</th>
                         <th>"Second factor"</th>
                         <th>"Status"</th>
-                        // Visually unlabelled — the column is one button per
-                        // row, and a heading over it tells a sighted reader
-                        // nothing the button does not. A non-visual reader has
-                        // no such context, so the name is there for them.
+                        // Visually unlabelled — the column is buttons, and a
+                        // heading over it tells a sighted reader nothing they
+                        // do not. A non-visual reader has no such context, so
+                        // the name is there for them.
+                        //
+                        // The hint is in the header rather than repeated on
+                        // every row: the distinction it explains is about the
+                        // two controls, not about any one account.
                         <th>
                             <span class="wf-sr-only">"Actions"</span>
+                            <Hint label="Revoke" id="wf-hint-account-actions">
+                                <p>
+                                    <strong>"Revoke"</strong>
+                                    " ends every session the account is signed in with right \
+                                     now — on every device — and leaves the account alone. It \
+                                     can sign in again straight away. Reach for it when a \
+                                     laptop or phone goes missing and the person still works \
+                                     here."
+                                </p>
+                                <p>
+                                    <strong>"Remove"</strong>
+                                    " does that and then deletes the account, so it cannot \
+                                     sign in again at all."
+                                </p>
+                                <p>
+                                    "Both take effect across the whole mesh and neither can \
+                                     be undone. A session already connected to a node can \
+                                     keep working for up to a minute; anything reconnecting \
+                                     is refused straight away."
+                                </p>
+                            </Hint>
                         </th>
                     </tr>
                 </thead>
@@ -358,7 +475,17 @@ fn UserTable(
                                         "wf-status-mixed"
                                     }>{if u.totp_enrolled { "Enrolled" } else { "None" }}</td>
                                     <td class=class>{status}</td>
-                                    <td>
+                                    <td class="wf-row-actions">
+                                        <button
+                                            class="wf-button"
+                                            aria-label=format!("Revoke {username}'s sessions")
+                                            on:click={
+                                                let username = username.clone();
+                                                move |_| on_revoke.run(username.clone())
+                                            }
+                                        >
+                                            "Revoke"
+                                        </button>
                                         <button
                                             class="wf-button"
                                             aria-label=format!("Remove {username}")

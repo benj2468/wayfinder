@@ -864,12 +864,13 @@ mod tests {
             ReqKind::RevokeUserInvite(RevokeUserInviteRequest::default()),
             ReqKind::BeginUserRegistration(BeginUserRegistrationRequest::default()),
             ReqKind::CompleteUserRegistration(CompleteUserRegistrationRequest::default()),
+            ReqKind::RevokeUserSessions(RevokeUserSessionsRequest::default()),
         ]
     }
 
     /// The enrollment tier is a *closed* allowlist over the whole request
     /// surface: exactly `SubmitCsr`, `GetTrustAnchor` and `AuthenticateUser`,
-    /// and every one of the other twenty-seven kinds refused — including the ones that would otherwise be
+    /// and every one of the other thirty-two kinds refused — including the ones that would otherwise be
     /// the prize (`ApproveCsr` on its own request, `SetAuth`, `SetConfig`,
     /// `GetLogs`).
     ///
@@ -881,7 +882,7 @@ mod tests {
         let all = every_request_kind();
         assert_eq!(
             all.len(),
-            36,
+            37,
             "every_request_kind must list every variant of the request oneof; \
              add the new one (and decide what the enrollment tier may do with it)"
         );
@@ -951,7 +952,7 @@ mod tests {
         let all = every_request_kind();
         assert_eq!(
             all.len(),
-            36,
+            37,
             "every_request_kind must list every variant of the request oneof; \
              add the new one (and decide what the viewer tier may do with it)"
         );
@@ -1008,6 +1009,9 @@ mod tests {
                     // an account-creating request behind a read-only grant.
                     | ReqKind::BeginUserRegistration(_)
                     | ReqKind::CompleteUserRegistration(_)
+                    // Ending the sessions somebody currently holds is the same
+                    // administration `RemoveUser` above is, minus the deletion.
+                    | ReqKind::RevokeUserSessions(_)
             );
             assert_eq!(
                 permits(MgmtAccess::GrantedViewer, request),

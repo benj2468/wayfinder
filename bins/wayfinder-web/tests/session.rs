@@ -471,6 +471,86 @@ async fn an_admin_session_lists_and_creates_accounts() {
     assert_eq!(info.capability, "read-only");
 }
 
+/// An admin ends another account's sessions, and the count says what happened.
+///
+/// The whole path this feature adds, over the wire: server function → client →
+/// management TLS → `permits` → the authority's issued log. Nothing here is a
+/// canned answer — the viewer really signs in first, so the certificate the
+/// revocation ends is one the mock's certificate authority actually minted.
+///
+/// The **second** revocation is the half worth having. It must report zero
+/// rather than one, which is what says the authority skipped the entry it had
+/// already revoked instead of signing and flooding a second record to tell the
+/// mesh something it already believes.
+///
+/// What this cannot show is the revoked session being turned away at the door:
+/// the stand-in node answers every snapshot with `revoked: Vec::new()`, having
+/// no router to hold a revocation set. That property is covered where the
+/// revocation actually happens, in `wayfinder-server`'s authority tests.
+#[tokio::test]
+async fn an_admin_ends_another_accounts_sessions() {
+    let app = common::login_router().await;
+
+    // The viewer signs in, so there is a real certificate to revoke.
+    let response = call(
+        &app,
+        "login",
+        &format!("username={MOCK_VIEWER_USER}&password={MOCK_PASSWORD}&totp_code="),
+        None,
+    )
+    .await;
+    let outcome: LoginResult = json(response).await;
+    assert!(
+        matches!(outcome, LoginResult::LoggedIn(_)),
+        "the viewer signs in first: {outcome:?}"
+    );
+
+    let response = call(
+        &app,
+        "login",
+        &format!("username={MOCK_ADMIN_USER}&password={MOCK_PASSWORD}&totp_code="),
+        None,
+    )
+    .await;
+    let (admin, _) = session_cookie(&response);
+
+    let revoked: u32 = json(
+        call(
+            &app,
+            "revoke_user_sessions",
+            &format!("username={MOCK_VIEWER_USER}"),
+            Some(&admin),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(revoked, 1, "the session the viewer just obtained");
+
+    let again: u32 = json(
+        call(
+            &app,
+            "revoke_user_sessions",
+            &format!("username={MOCK_VIEWER_USER}"),
+            Some(&admin),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        again, 0,
+        "an already-revoked session is not revoked twice: re-sending spends mesh \
+         airtime to say what the mesh already believes"
+    );
+
+    // The account itself is untouched — that is the whole difference from
+    // removing it.
+    let users: Vec<UserAccount> = json(call(&app, "list_users", "", Some(&admin)).await).await;
+    assert!(
+        users.iter().any(|u| u.username == MOCK_VIEWER_USER),
+        "revoking sessions leaves the account able to sign in again: {users:?}"
+    );
+}
+
 /// A read-only session may not read the roster and may not add to it.
 ///
 /// Both refusals come from the node's `permits` allowlist rather than from

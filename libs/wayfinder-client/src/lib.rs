@@ -88,6 +88,7 @@ use wayfinder_protos::wayfinder::v1alpha::ResolveRouteRequest;
 use wayfinder_protos::wayfinder::v1alpha::ResolveRouteResponse;
 use wayfinder_protos::wayfinder::v1alpha::RevokeNodeRequest;
 use wayfinder_protos::wayfinder::v1alpha::RevokeUserInviteRequest;
+use wayfinder_protos::wayfinder::v1alpha::RevokeUserSessionsRequest;
 use wayfinder_protos::wayfinder::v1alpha::RevokeVpnPeerRequest;
 use wayfinder_protos::wayfinder::v1alpha::RoutingTable;
 use wayfinder_protos::wayfinder::v1alpha::RuntimeConfig;
@@ -1039,12 +1040,18 @@ impl Client {
         }
     }
 
-    /// Provider mode: remove a user account.
+    /// Provider mode: remove a user account **and** revoke every session
+    /// certificate it holds.
     ///
-    /// Ends the account's ability to obtain *new* sessions. A certificate
-    /// already issued to it keeps working until it expires or is revoked, so an
-    /// account believed compromised needs [`revoke_node`](Self::revoke_node) as
-    /// well as this.
+    /// One act, not two. It used to end only the account's ability to obtain
+    /// *new* sessions, leaving every certificate already issued working until it
+    /// expired — so deleting a compromised account left the compromise running
+    /// for up to that account's whole session lifetime.
+    ///
+    /// The revocations flood the mesh before this returns. An error naming what
+    /// stopped them does **not** mean the removal was undone: the account is
+    /// gone and its sessions are marked revoked in the authority's records, and
+    /// what failed is the mesh being told.
     ///
     /// Errors when the name is not on file, and when it is the last account
     /// that can still administer the mesh — the authority refuses to leave
@@ -1058,6 +1065,30 @@ impl Client {
         {
             ResponseKind::Empty(_) => Ok(()),
             other => Err(unexpected("RemoveUser", &other)),
+        }
+    }
+
+    /// Provider mode: revoke every session certificate an account holds, leaving
+    /// the account itself, and report how many were revoked.
+    ///
+    /// The difference from [`remove_user`](Self::remove_user) is the account:
+    /// this ends what it is currently holding and leaves it able to sign in
+    /// again. Reach for it when a device is lost and the person still has the
+    /// job.
+    ///
+    /// **Zero is an ordinary success.** An account that has not signed in, or
+    /// whose sessions were already revoked or have expired, has nothing left to
+    /// end — that is an answer, not a failure to find it. `Err` covers a name
+    /// that is not on file.
+    pub async fn revoke_user_sessions(&mut self, username: &str) -> anyhow::Result<u32> {
+        match self
+            .request(RequestKind::RevokeUserSessions(RevokeUserSessionsRequest {
+                username: username.to_string(),
+            }))
+            .await?
+        {
+            ResponseKind::RevokeUserSessions(r) => Ok(r.revoked),
+            other => Err(unexpected("RevokeUserSessions", &other)),
         }
     }
 
@@ -1173,6 +1204,7 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
         ResponseKind::ListVpnPeers(_) => "ListVpnPeers",
         ResponseKind::CreateUserInvite(_) => "CreateUserInvite",
         ResponseKind::ListUserInvites(_) => "ListUserInvites",
+        ResponseKind::RevokeUserSessions(_) => "RevokeUserSessions",
         ResponseKind::BeginUserRegistration(_) => "BeginUserRegistration",
     };
     anyhow!("expected {want} response, got {got}")
