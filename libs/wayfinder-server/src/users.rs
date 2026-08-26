@@ -92,6 +92,31 @@ const TOTP_DIGITS: u32 = 6;
 /// every authenticator app expects.
 const TOTP_SECRET_LEN: usize = 20;
 
+/// Bytes of entropy in an invite token or a registration handle.
+///
+/// 256 bits from the OS CSPRNG, which is what lets [`UserInvite`] be looked up
+/// by an unauthenticated caller's token without any of the defences a
+/// low-entropy identifier needs: it is not enumerable on any timescale, so
+/// there is no oracle for a timing difference to leak and no reason to spend
+/// memory-hard work refusing a bad one.
+const INVITE_SECRET_LEN: usize = 32;
+
+/// Domain-separation label for an invite token's hash.
+///
+/// The convention is `wayfinder-auth`'s `CERT_FINGERPRINT_LABEL`. Owned here
+/// rather than borrowed from that crate because the bytes being hashed are this
+/// module's, and a label shared across modules is a collision waiting for the
+/// day two of them hash the same string.
+const INVITE_TOKEN_LABEL: &[u8] = b"wayfinder-invite-v1";
+
+/// Domain-separation label for a registration handle's hash.
+///
+/// Separate from [`INVITE_TOKEN_LABEL`] so the two credentials cannot be
+/// substituted for one another: both are 256-bit base32 strings in the same
+/// record, and without distinct labels a handle presented as a token (or the
+/// reverse) would hash to a value the other lookup recognises.
+const REGISTRATION_HANDLE_LABEL: &[u8] = b"wayfinder-registration-handle-v1";
+
 /// Consecutive failed logins before an account is locked.
 ///
 /// The per-account half of the rate limit, and the dominant half: it is
@@ -171,6 +196,142 @@ pub struct UserRecord {
     pub disabled: bool,
 }
 
+/// A pending invitation to register one named account.
+///
+/// **Deliberately not a [`UserRecord`] with a flag.** It lives in its own
+/// persisted collection beside the user store, so no code path that iterates
+/// accounts can ever authenticate one. A half-built account that can log in is
+/// a strictly worse failure mode than an invite that cannot, and the
+/// distinction should not depend on every future reader of the user store
+/// remembering a flag.
+///
+/// Serialized into the CA state snapshot, so its shape is part of the on-disk
+/// schema (see `persistence.rs`).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct UserInvite {
+    /// The account name this invite will create. Reserved from the moment it
+    /// is minted, against the user store *and* against another invite.
+    pub username: String,
+    /// The role the created account will hold. Decided by the admin at mint
+    /// and never by the redeemer: no field on either redemption request can
+    /// ask for more than this.
+    pub role: UserRole,
+    /// Session-certificate lifetime for the created account. Re-clamped to the
+    /// authority's cap at completion, not only at mint — the value is chosen
+    /// now and applied up to a day later.
+    pub session_ttl_secs: u64,
+    /// `Blake2s256` of the invite token under [`INVITE_TOKEN_LABEL`]. The
+    /// token itself is never stored: it is a bearer credential sitting in the
+    /// provider's state file, and should be no more readable there than
+    /// [`UserRecord::password_hash`] is.
+    pub token_hash: [u8; 32],
+    /// The account's TOTP secret, minted here and revealed exactly once, to
+    /// whoever starts registration.
+    ///
+    /// Not an `Option`, unlike [`UserRecord::totp_secret`]. An invite with no
+    /// second factor degenerates to "a bearer token in a chat message buys an
+    /// account that can mint a certificate the whole mesh honours", and drops
+    /// the proof-of-enrolment this path exists for. An automation account that
+    /// cannot present a code has nobody to send a URL to either;
+    /// `CreateUser`'s `no_totp` remains its path. The invariant lives in the
+    /// type so it cannot be re-opened by accident.
+    pub totp_secret: Vec<u8>,
+    /// Unix seconds the invite was minted at.
+    pub created_at: u64,
+    /// Unix seconds after which the invite is refused.
+    pub expires_at: u64,
+    /// Whether registration has been started, and by whom.
+    pub status: InviteStatus,
+}
+
+/// Where an invite is in its one-way lifecycle.
+///
+/// Two states and no third: an invite that has been completed does not have a
+/// status, it has been deleted — atomically, with the account's creation.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum InviteStatus {
+    /// Minted, and its TOTP secret not yet revealed to anyone.
+    Pending,
+    /// The secret has been revealed. Both the single-use interlock and the
+    /// signal an admin reads: started-and-not-completed means somebody took the
+    /// second factor and did not finish.
+    Started {
+        /// `Blake2s256` of the registration handle issued at start, under
+        /// [`REGISTRATION_HANDLE_LABEL`]. Only the party holding the handle can
+        /// complete.
+        handle_hash: [u8; 32],
+        /// Unix seconds the secret was revealed at.
+        started_at: u64,
+        /// Unix seconds after which the handle is dead and the invite is spent.
+        handle_expires_at: u64,
+    },
+}
+
+impl UserInvite {
+    /// Mint an invite for `username`, with a freshly generated TOTP secret.
+    ///
+    /// `token_hash` rather than the token: the caller generates the token,
+    /// hands it to whoever asked, and keeps only this. Passing the token in
+    /// here would put it inside the type that gets serialized, which is exactly
+    /// where it must not be.
+    pub fn new(
+        username: &str,
+        role: UserRole,
+        session_ttl_secs: u64,
+        token_hash: [u8; 32],
+        created_at: u64,
+        expires_at: u64,
+    ) -> Self {
+        Self {
+            username: username.to_string(),
+            role,
+            session_ttl_secs,
+            token_hash,
+            totp_secret: generate_totp_secret(),
+            created_at,
+            expires_at,
+            status: InviteStatus::Pending,
+        }
+    }
+
+    /// The `otpauth://` enrolment URI for this invite's second factor.
+    ///
+    /// Unlike [`UserRecord::totp_enrolment_uri`] this is never `None`: a second
+    /// factor is mandatory on this path.
+    pub fn totp_enrolment_uri(&self, issuer: &str) -> String {
+        totp_enrolment_uri(issuer, &self.username, &self.totp_secret)
+    }
+
+    /// Whether this invite has passed its expiry as of `now_unix`.
+    pub fn is_expired(&self, now_unix: u64) -> bool {
+        now_unix >= self.expires_at
+    }
+
+    /// Whether `hash` is this invite's token hash, compared in constant time.
+    ///
+    /// Constant-time per comparison, though a lookup across the store is a
+    /// scan, so the *work* is occupancy-dependent even though each comparison
+    /// is not. That is not a leak worth closing here: the occupancy is
+    /// readable by any admin and tells an anonymous caller nothing about which
+    /// token would match.
+    pub fn token_matches(&self, hash: &[u8; 32]) -> bool {
+        self.token_hash.ct_eq(hash).into()
+    }
+
+    /// Whether `hash` is the handle hash of a *started* invite whose handle has
+    /// not expired as of `now_unix`, compared in constant time.
+    pub fn handle_matches(&self, hash: &[u8; 32], now_unix: u64) -> bool {
+        match &self.status {
+            InviteStatus::Pending => false,
+            InviteStatus::Started {
+                handle_hash,
+                handle_expires_at,
+                ..
+            } => now_unix < *handle_expires_at && handle_hash.ct_eq(hash).into(),
+        }
+    }
+}
+
 /// What a login attempt resolved to.
 ///
 /// Deliberately two variants and not five. Unknown user, wrong password, wrong
@@ -215,6 +376,40 @@ impl UserRecord {
         })
     }
 
+    /// Create an account from a redeemed invite: an existing TOTP secret the
+    /// registrant has already enrolled, and the replay guard already advanced
+    /// past the code they proved it with.
+    ///
+    /// Separate from [`Self::new`] rather than a pair of extra arguments on it,
+    /// because `new` *mints* a secret and this one must not — and because both
+    /// of the differences are the security-relevant part.
+    ///
+    /// `totp_last_step` is the one that fails silently. The code accepted at
+    /// completion sits inside the ±[`TOTP_SKEW_STEPS`] window that
+    /// [`Self::authenticate`] will accept from, so an account that started at
+    /// step 0 would take that same code again at its first sign-in — up to 90
+    /// seconds of replay against a brand-new administrative account.
+    pub fn from_registration(
+        username: &str,
+        password: &str,
+        totp_secret: Vec<u8>,
+        totp_last_step: u64,
+        role: UserRole,
+        session_ttl_secs: u64,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            username: username.to_string(),
+            password_hash: hash_password(password)?,
+            totp_secret: Some(totp_secret),
+            totp_last_step,
+            failed_attempts: 0,
+            locked_until: 0,
+            role,
+            session_ttl_secs,
+            disabled: false,
+        })
+    }
+
     /// Drop this account's second factor, for an automation account that
     /// cannot present one. Such an account should hold a long-lived
     /// certificate issued offline instead of logging in at all; this exists so
@@ -234,13 +429,7 @@ impl UserRecord {
     /// else.
     pub fn totp_enrolment_uri(&self, issuer: &str) -> Option<String> {
         let secret = self.totp_secret.as_ref()?;
-        Some(format!(
-            "otpauth://totp/{issuer}:{}?secret={}&issuer={issuer}&algorithm=SHA1&digits={}&period={}",
-            self.username,
-            base32_encode(secret),
-            TOTP_DIGITS,
-            TOTP_STEP_SECS,
-        ))
+        Some(totp_enrolment_uri(issuer, &self.username, secret))
     }
 
     /// Whether this account is locked out as of `now_unix`.
@@ -361,13 +550,68 @@ fn verify_password(hash: &str, password: &str) -> bool {
 }
 
 /// A fresh 20-byte TOTP shared secret from the OS CSPRNG.
-fn generate_totp_secret() -> Vec<u8> {
+pub(crate) fn generate_totp_secret() -> Vec<u8> {
     let mut secret = vec![0u8; TOTP_SECRET_LEN];
     argon2::password_hash::rand_core::RngCore::fill_bytes(
         &mut argon2::password_hash::rand_core::OsRng,
         &mut secret,
     );
     secret
+}
+
+/// The `otpauth://` enrolment URI for `secret`, as `issuer` will name it in an
+/// authenticator app's list.
+///
+/// Shared by [`UserRecord::totp_enrolment_uri`] and
+/// [`UserInvite::totp_enrolment_uri`], which differ in whether the secret can
+/// be absent and in nothing else. The URI carries the shared secret in the
+/// clear by construction — that is what enrolment *is* — so the question that
+/// matters at every call site is who is about to read it.
+fn totp_enrolment_uri(issuer: &str, username: &str, secret: &[u8]) -> String {
+    format!(
+        "otpauth://totp/{issuer}:{username}?secret={}&issuer={issuer}&algorithm=SHA1&digits={}&period={}",
+        base32_encode(secret),
+        TOTP_DIGITS,
+        TOTP_STEP_SECS,
+    )
+}
+
+/// A fresh invite token or registration handle: [`INVITE_SECRET_LEN`] bytes
+/// from the OS CSPRNG, rendered base32 without padding.
+///
+/// Base32 because it is the alphabet the `otpauth://` URI beside it already
+/// uses, and because it is unambiguous if the value ever has to be read aloud
+/// or retyped — a token travels through whatever channel the operator has to
+/// hand, which is sometimes a phone call.
+pub(crate) fn generate_invite_secret() -> String {
+    let mut bytes = vec![0u8; INVITE_SECRET_LEN];
+    argon2::password_hash::rand_core::RngCore::fill_bytes(
+        &mut argon2::password_hash::rand_core::OsRng,
+        &mut bytes,
+    );
+    base32_encode(&bytes)
+}
+
+/// `Blake2s256(INVITE_TOKEN_LABEL || token)` — what the store keeps in place of
+/// the token.
+pub(crate) fn invite_token_hash(token: &str) -> [u8; 32] {
+    labelled_hash(INVITE_TOKEN_LABEL, token)
+}
+
+/// `Blake2s256(REGISTRATION_HANDLE_LABEL || handle)` — what a started invite
+/// keeps in place of the handle.
+pub(crate) fn registration_handle_hash(handle: &str) -> [u8; 32] {
+    labelled_hash(REGISTRATION_HANDLE_LABEL, handle)
+}
+
+/// Hash `value` under `label`, so two credentials of the same shape in the same
+/// record can never be presented as one another.
+fn labelled_hash(label: &[u8], value: &str) -> [u8; 32] {
+    use blake2::Digest as _;
+    let mut h = blake2::Blake2s256::new();
+    h.update(label);
+    h.update(value.as_bytes());
+    h.finalize().into()
 }
 
 /// The RFC 6238 code for `secret` at time step `step`.
@@ -399,7 +643,7 @@ fn totp_code(secret: &[u8], step: u64) -> u32 {
 /// A step at or below `last_step` is refused even when the code is correct:
 /// [`TOTP_SKEW_STEPS`] makes three codes valid at any instant, and without this
 /// a code observed in transit could be spent again within that window.
-fn verify_totp(secret: &[u8], code: &str, now_unix: u64, last_step: u64) -> Option<u64> {
+pub(crate) fn verify_totp(secret: &[u8], code: &str, now_unix: u64, last_step: u64) -> Option<u64> {
     let code = code.trim();
     if code.len() != TOTP_DIGITS as usize {
         return None;

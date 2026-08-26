@@ -241,12 +241,22 @@ pub fn decide_access(
 ///   Admission control has not moved here either — it is the password, the
 ///   second factor, the per-account lockout, and the account having been
 ///   created by an admin in the first place.
+/// * `BeginUserRegistration` / `CompleteUserRegistration` — redeem a one-time
+///   invitation into the account it was minted for. On this tier for the
+///   sharpest version of the same reason: somebody who does not have an account
+///   *yet* holds no credential of any kind, and this is the request that gives
+///   them one. Admission control is the token — 256 bits, single-use, expiring,
+///   and minted by an admin who chose both the name and the role it will
+///   create. Note what is deliberately *not* admitted beside them: an
+///   enrollment connection can redeem an invitation it already holds and can do
+///   nothing else to the account store — it cannot mint one, list one, or
+///   revoke one.
 ///
 /// Everything else — every read of routing state, every setting, every
 /// provider action including approving a CSR — needs a full grant.
 ///
 /// **What actually confines an enrollment connection is this *request set***
-/// (exactly `SubmitCsr` and `GetTrustAnchor`) — not anything about a
+/// (the five above) — not anything about a
 /// `SubmitCsr`'s *contents*. `node_mac`, `ed_pubkey` and `x_pubkey` are
 /// entirely client-supplied and bound to nothing about this connection: the
 /// handshake key is never checked against them, so a client can submit a CSR
@@ -358,7 +368,11 @@ pub fn permits(access: MgmtAccess, request: &ReqKind) -> bool {
         ),
         MgmtAccess::GrantedEnrollment => matches!(
             request,
-            ReqKind::SubmitCsr(_) | ReqKind::GetTrustAnchor(_) | ReqKind::AuthenticateUser(_)
+            ReqKind::SubmitCsr(_)
+                | ReqKind::GetTrustAnchor(_)
+                | ReqKind::AuthenticateUser(_)
+                | ReqKind::BeginUserRegistration(_)
+                | ReqKind::CompleteUserRegistration(_)
         ),
         MgmtAccess::Denied(_) => false,
     }

@@ -5165,6 +5165,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "argon2",
+ "blake2",
  "bytes",
  "embassy-sync",
  "embedded-io-async 0.7.0",

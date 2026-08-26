@@ -209,6 +209,29 @@ const LOGIN_BURST: f64 = 5.0;
 /// that reason. A collapsed source address costs it nothing.
 const LOGIN_REFILL_PER_SEC: f64 = 1.0;
 
+/// Burst capacity for the invite-redemption limiter.
+///
+/// One bucket covers both `BeginUserRegistration` and
+/// `CompleteUserRegistration`, unlike the split between logins and `SubmitCsr`:
+/// those two are unrelated flows at unrelated cadences, while begin and
+/// complete are two steps of *one* flow driven by one person. Separate budgets
+/// would bound neither half of what a redemption actually costs.
+///
+/// Sized for that flow with room to fumble: a start, then a couple of
+/// completions while somebody reads a code off their phone.
+const REGISTRATION_BURST: f64 = 5.0;
+
+/// Steady-state refill for the invite-redemption limiter: one attempt every two
+/// seconds.
+///
+/// Slower than the login bucket because the flow behind it is rarer — an
+/// account is registered once, where a person signs in daily — and because the
+/// thing being bounded is worse. A `BeginUserRegistration` scans the invite
+/// store and performs a durable write for every call, valid or not, and a
+/// `CompleteUserRegistration` that gets past its handle and code checks spends
+/// a full Argon2id. Both run on the authority's single command queue.
+const REGISTRATION_REFILL_PER_SEC: f64 = 0.5;
+
 /// Distinct source addresses a [`SourceLimiter`] tracks at once. Past this,
 /// the least-recently-touched bucket is evicted to make room for a new
 /// source — safe to evict (unlike the held-CSR store this sits in front of):
@@ -322,6 +345,11 @@ impl SourceLimiter {
         Self::new(LOGIN_BURST, LOGIN_REFILL_PER_SEC)
     }
 
+    /// The limiter guarding the enrollment tier's two invite-redemption kinds.
+    fn for_registrations() -> Self {
+        Self::new(REGISTRATION_BURST, REGISTRATION_REFILL_PER_SEC)
+    }
+
     /// The limiter guarding new connections to the listener.
     fn for_connections() -> Self {
         Self::new(CONNECT_BURST, CONNECT_REFILL_PER_SEC)
@@ -401,6 +429,15 @@ pub(crate) struct PreAuthLimits {
     /// — see [`SourceLimiter`] for why the bound survives that and what does
     /// not.
     logins: SourceLimiter,
+    /// Rate limit on the enrollment tier's two invite-redemption kinds, per
+    /// source, shared between them.
+    ///
+    /// Both are reachable with no credential and both reach the authority task:
+    /// a start scans the invite store and writes durably whatever the token
+    /// turns out to be, and a completion that passes its cheap checks spends a
+    /// full Argon2id. One bucket rather than two because they are two steps of
+    /// one flow at one person's cadence — see [`REGISTRATION_BURST`].
+    registrations: SourceLimiter,
     /// Rate limit on new connections, per source.
     connects: SourceLimiter,
     /// Slots for connections that have not proved a credential.
@@ -413,6 +450,7 @@ impl PreAuthLimits {
         Self {
             enrollment: SourceLimiter::for_enrollment(),
             logins: SourceLimiter::for_logins(),
+            registrations: SourceLimiter::for_registrations(),
             connects: SourceLimiter::for_connections(),
             uncredentialed: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_UNCREDENTIALED_CONNECTIONS,
@@ -444,6 +482,12 @@ impl PreAuthLimits {
     /// Whether an `AuthenticateUser` from `addr` may proceed right now.
     fn allow_login(&self, addr: std::net::IpAddr, now: std::time::Instant) -> bool {
         self.logins.allow(addr, now)
+    }
+
+    /// Whether an invite redemption — either half — from `addr` may proceed
+    /// right now.
+    fn allow_registration(&self, addr: std::net::IpAddr, now: std::time::Instant) -> bool {
+        self.registrations.allow(addr, now)
     }
 }
 
@@ -1010,6 +1054,16 @@ where
                     "AuthenticateUser",
                     "too many login attempts from this source; wait before retrying",
                 )),
+                // Both halves of a redemption share one bucket: they are one
+                // flow, and bounding either alone bounds nothing.
+                ReqKind::BeginUserRegistration(_) | ReqKind::CompleteUserRegistration(_)
+                    if !limits.allow_registration(peer_addr, now) =>
+                {
+                    Some((
+                        "UserRegistration",
+                        "too many registration attempts from this source; wait before retrying",
+                    ))
+                }
                 _ => None,
             }
         } else {
