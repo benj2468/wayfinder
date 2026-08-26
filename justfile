@@ -29,6 +29,22 @@ bare_metal_target := "thumbv7em-none-eabihf"
 # Browser target for `bins/wayfinder-web`'s hydration bundle.
 wasm_target := "wasm32-unknown-unknown"
 
+# Toolchain image `sim-binaries` builds the docker sim's Linux binaries in.
+sim_builder_image := "wayfinder-sim-builder:latest"
+
+# `nrf-ieee802154` is a root-workspace member that reaches the nRF52840's
+# registers through `nrf-pac`, whose interrupt-vector table is placed with
+# `#[link_section = ".vector_table.interrupts"]` — an ELF section name Mach-O
+# has no way to express (it wants `__SEGMENT,__section`). So the crate cannot
+# be compiled for a macOS *host* at all, and any root-workspace command that
+# includes it fails there before reaching anything else.
+#
+# Dropping it on macOS costs its two unit tests locally and nothing else: the
+# coverage that matters is `build-loose-drivers`/`clippy-loose-drivers`, which
+# cross-compile it for `bare_metal_target` — the only target it ever runs on —
+# and work on every host. CI is Linux, so it stays fully covered there.
+host_workspace_excludes := if os() == "macos" { "--exclude nrf-ieee802154" } else { "" }
+
 [doc("List the available recipes.")]
 default:
     @just --list --unsorted
@@ -62,22 +78,22 @@ clean: clean-workspace clean-py clean-embedded clean-fuzz
 
 [doc("Build the root workspace (no_std core, host crates, tooling).")]
 build-workspace:
-    cargo build --workspace
+    cargo build --workspace {{ host_workspace_excludes }}
 
 # Lints every target — libs, bins, tests and examples — so findings in test code
 # can't accumulate unnoticed.
 [doc("Lint the root workspace, all targets, warnings denied.")]
 clippy-workspace:
-    cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --workspace {{ host_workspace_excludes }} --all-targets -- -D warnings
 
 [doc("Run the root workspace's tests.")]
 test-workspace:
-    cargo nextest run --workspace --release
+    cargo nextest run --workspace {{ host_workspace_excludes }} --release
 
 # The `test:run:rust` CI job reports this number for the coverage badge.
 [doc("Run the root workspace's tests with a coverage summary.")]
 coverage:
-    cargo llvm-cov nextest --workspace
+    cargo llvm-cov nextest --workspace {{ host_workspace_excludes }}
 
 # Also drops the `cargo leptos` site bundle, which lands under the same target
 # directory.
@@ -115,6 +131,42 @@ build-web-release:
 [doc("Serve the web dashboard with live reload, for local development.")]
 watch-web:
     cargo leptos watch
+
+# ---------------------------------------------------------------------------
+# Docker mesh simulation
+# ---------------------------------------------------------------------------
+#
+# `scripts/topology.py` runs each node from the host-built binaries under
+# `./target`, bind-mounted into a Linux container. On a Linux host a plain
+# `cargo build` is therefore all the sim needs and this recipe is unnecessary.
+# On macOS it is the whole story: `cargo build` there emits Mach-O, which a
+# Linux container cannot exec at all.
+
+# The cargo registry and git checkouts live in named volumes so a rebuild
+# re-resolves nothing, and `target/sim-linux` is on the repo mount rather than
+# in the image, so builds are incremental across runs exactly like host ones.
+# The loop is `just sim-binaries` then `./scripts/topology.py restart`.
+[doc("Build the sim's node binaries for Linux, in a container (macOS hosts).")]
+sim-binaries:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    docker build -f containers/sim-builder.Dockerfile -t {{ sim_builder_image }} .
+    docker run --rm \
+        -v "$PWD":/workspace \
+        -v wayfinder-sim-cargo-registry:/usr/local/cargo/registry \
+        -v wayfinder-sim-cargo-git:/usr/local/cargo/git \
+        -e CARGO_TARGET_DIR=/workspace/target/sim-linux \
+        {{ sim_builder_image }} \
+        cargo build -p wayfinder-tap -p wayfinder-ctl -p wayfinder-tui \
+                    -p wayfinder-web --features wayfinder-web/ssr
+
+[doc("Bring the docker mesh simulation up (see scripts/topology.py).")]
+sim-up *ARGS:
+    ./scripts/topology.py up {{ ARGS }}
+
+[doc("Tear the docker mesh simulation down.")]
+sim-down:
+    ./scripts/topology.py down
 
 # ---------------------------------------------------------------------------
 # Cloud certificate authority

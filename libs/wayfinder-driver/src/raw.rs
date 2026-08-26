@@ -9,7 +9,8 @@
 //!   behaviour from the [`Link`] adapter.  The kernel prepends the IPv4 header on
 //!   send and (on Linux) *delivers* it on recv, so the bridge strips it back off
 //!   before handing the frame up.
-//! * **Raw L2** ([`RawL2Link`]) is a native multi-access interface: an
+//! * **Raw L2** (`RawL2Link`, Linux-only — hence not a link) is a native
+//!   multi-access interface: an
 //!   `AF_PACKET`/`SOCK_RAW` socket bound to one NIC.  The wire frame is the
 //!   Ethernet-shaped `[dst][src][ethertype][payload]`, but the **EtherType** is a
 //!   configurable *transport label* (the value the socket binds/filters on, e.g.
@@ -31,20 +32,23 @@
 //!   traffic, or e.g. a co-located DHCP server's own broadcast replies) is never
 //!   read back and re-forwarded.
 //!
+//! **The two raw-L2 carriers are Linux-only.** `AF_PACKET` is a Linux socket
+//! family with no portable equivalent (macOS's nearest analog is BPF, a
+//! different API), so on any other host they are constructor stubs that fail
+//! with a clear reason instead of compiling away — a configured raw-L2
+//! carrier is then a startup error, not a compile error in the node that
+//! reads the config. Raw IP is `AF_INET`/`SOCK_RAW` and stays portable,
+//! though the header-on-receive behaviour described above is Linux's.
+//!
 //! [`transport`]: crate::transport
 //! [`FrameIo`]: crate::transport::FrameIo
 //! [`Link`]: crate::transport::Link
 
-use interfaces::frame::LinkFrame;
-use interfaces::frame::LinkFrameData;
-use interfaces::frame::MAX_LINK_FRAME_LEN;
+// Only what the portable helpers below need. The frame-shaping imports the
+// raw-L2 carriers use are scoped to them (`tokio_impl`), so a non-Linux build
+// — where those carriers are `cfg`'d out — doesn't drag in a pile of unused
+// imports; the tests import their own.
 use interfaces::frame::Mac;
-use interfaces::link::LinkError;
-use interfaces::link::LinkMetrics;
-use interfaces::wire::ETH_HEADER_LEN;
-use interfaces::wire::frame_into_buf;
-use interfaces::wire::retag_ethertype;
-use zerocopy::FromBytes;
 
 /// Offset of the payload within a raw IPv4 datagram as delivered by an
 /// `AF_INET`/`SOCK_RAW` socket, i.e. the length of the IPv4 header (IHL × 4).
@@ -69,6 +73,10 @@ fn ipv4_payload_offset(datagram: &[u8]) -> Option<usize> {
 /// Extract the destination MAC — a raw-L2 frame's leading 6 bytes — from an
 /// Ethernet-shaped `[dst][src][ethertype][payload]` buffer, for addressing an
 /// `AF_PACKET` `sendto`. `None` if `frame` is shorter than a MAC address.
+///
+/// Pure logic, so it is compiled and unit-tested on every host even though its
+/// only caller is the Linux-only egress carrier below.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn frame_dst_mac(frame: &[u8]) -> Option<Mac> {
     let bytes: [u8; 6] = frame.get(..6)?.try_into().ok()?;
     Some(Mac(bytes))
@@ -76,7 +84,10 @@ fn frame_dst_mac(frame: &[u8]) -> Option<Mac> {
 
 #[cfg(feature = "tokio")]
 pub use tokio_impl::RawL2Egress;
-#[cfg(feature = "tokio")]
+// No non-Linux counterpart, unlike `RawL2Egress`: nothing outside this module
+// names this type — it only ever travels as a `Box<DynLinkT>` — so there is
+// nothing for a stub to keep compiling.
+#[cfg(all(feature = "tokio", target_os = "linux"))]
 pub use tokio_impl::RawL2Link;
 #[cfg(feature = "tokio")]
 pub use tokio_impl::build_raw_ip_link;
@@ -94,34 +105,73 @@ pub(crate) use tokio_impl::interface_index;
 mod tokio_impl {
     use super::*;
 
+    use interfaces::frame::MAX_LINK_FRAME_LEN;
+
+    // The Ethernet-frame shaping the `AF_PACKET` carriers do; raw IP hands the
+    // kernel an opaque payload and needs none of it.
+    #[cfg(target_os = "linux")]
+    use interfaces::frame::LinkFrame;
+    #[cfg(target_os = "linux")]
+    use interfaces::frame::LinkFrameData;
+    #[cfg(target_os = "linux")]
+    use interfaces::link::LinkError;
+    #[cfg(target_os = "linux")]
+    use interfaces::link::LinkMetrics;
+    #[cfg(target_os = "linux")]
+    use interfaces::wire::ETH_HEADER_LEN;
+    #[cfg(target_os = "linux")]
+    use interfaces::wire::frame_into_buf;
+    #[cfg(target_os = "linux")]
+    use interfaces::wire::retag_ethertype;
+    #[cfg(target_os = "linux")]
+    use zerocopy::FromBytes;
+
     use std::io;
     use std::mem::MaybeUninit;
-    use std::mem::size_of;
     use std::net::IpAddr;
-    use std::os::fd::AsRawFd;
 
     use socket2::Domain;
     use socket2::Protocol;
-    use socket2::SockAddr;
-    use socket2::SockAddrStorage;
     use socket2::Socket;
     use socket2::Type;
-    use socket2::socklen_t;
     use tokio::io::unix::AsyncFd;
     use tokio::net::UnixDatagram;
     use tokio::task::JoinSet;
 
     use crate::transport::FrameIo;
     use crate::transport::Link;
-    use wayfinder::DEFAULT_BATMAN_ETHER_TYPE;
     use wayfinder::link::DynLinkT;
-    use wayfinder::link::LinkT;
+
+    // Named only by the `AF_PACKET` carriers: hand-building a `sockaddr_ll`
+    // (`size_of`/`socklen_t`/`SockAddr*`), reaching the fd for `setsockopt`
+    // (`AsRawFd`), and the `LinkT` those carriers implement.
+    #[cfg(target_os = "linux")]
+    use socket2::SockAddr;
+    #[cfg(target_os = "linux")]
+    use socket2::SockAddrStorage;
+    #[cfg(target_os = "linux")]
+    use socket2::socklen_t;
+    #[cfg(target_os = "linux")]
+    use std::mem::size_of;
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "linux")]
+    use wayfinder::DEFAULT_BATMAN_ETHER_TYPE;
+    #[cfg(target_os = "linux")]
     use wayfinder::link::Received;
 
+    // Kept unconditional: `build_raw_ip_link`'s documentation intra-doc-links
+    // to it on every platform, and rustdoc resolves that through this import
+    // while rustc doesn't count a doc link as a use.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+    use wayfinder::link::LinkT;
+
     /// `SOL_PACKET` setsockopt level (not exported by `libc` on all targets).
+    #[cfg(target_os = "linux")]
     const SOL_PACKET: libc::c_int = 263;
     /// `PACKET_IGNORE_OUTGOING`: stop the kernel looping our own transmitted
     /// frames back into our receive queue (Linux ≥ 4.20).  Best-effort.
+    #[cfg(target_os = "linux")]
     const PACKET_IGNORE_OUTGOING: libc::c_int = 23;
 
     /// Receive into an `[u8]` buffer through `socket2`'s `MaybeUninit` API.
@@ -149,6 +199,10 @@ mod tokio_impl {
     }
 
     /// Await writability, then perform one non-blocking `send_to`.
+    ///
+    /// Only the `AF_PACKET` carriers address per-frame; raw IP is a connected
+    /// socket and uses [`async_send`].
+    #[cfg(target_os = "linux")]
     async fn async_send_to(fd: &AsyncFd<Socket>, buf: &[u8], addr: &SockAddr) -> io::Result<usize> {
         loop {
             let mut guard = fd.writable().await?;
@@ -177,6 +231,7 @@ mod tokio_impl {
     /// Used both to `bind` the socket to a NIC (with `dst = None`) and to address
     /// each outbound frame (with `dst = Some(mac)`).  `ethertype` is stored in
     /// network byte order, as the kernel expects in `sll_protocol`.
+    #[cfg(target_os = "linux")]
     fn link_sockaddr(ifindex: u32, ethertype: u16, dst: Option<Mac>) -> SockAddr {
         let mut storage = SockAddrStorage::zeroed();
         // SAFETY: `sockaddr_ll` is a valid `sockaddr_storage` view for AF_PACKET
@@ -213,6 +268,7 @@ mod tokio_impl {
     /// destination MAC via `sendto`, so one socket reaches every peer on the
     /// segment (and `ff:ff:ff:ff:ff:ff` broadcasts).  Construct with
     /// [`build_raw_l2_link`].
+    #[cfg(target_os = "linux")]
     pub struct RawL2Link {
         /// The reactor-registered packet socket.
         fd: AsyncFd<Socket>,
@@ -237,6 +293,7 @@ mod tokio_impl {
         wire_buf: [u8; MAX_LINK_FRAME_LEN],
     }
 
+    #[cfg(target_os = "linux")]
     impl LinkT for RawL2Link {
         async fn send(
             &mut self,
@@ -295,6 +352,7 @@ mod tokio_impl {
     /// [`build_raw_l2_link`] and [`build_raw_l2_egress`] — both are raw-L2
     /// packet sockets differing only in what `ethertype` they bind/filter on
     /// and what they do with the bytes.
+    #[cfg(target_os = "linux")]
     fn open_packet_socket(ifindex: u32, ethertype: u16) -> anyhow::Result<Socket> {
         let socket = Socket::new(
             Domain::PACKET,
@@ -329,6 +387,10 @@ mod tokio_impl {
     /// Requires `CAP_NET_RAW` (or root).  The socket ignores its own outgoing
     /// frames where the kernel supports it, so a frame this node transmits is not
     /// echoed back into [`recv`](LinkT::recv).
+    ///
+    /// Linux-only; see [the module documentation](self) for the non-Linux
+    /// behaviour.
+    #[cfg(target_os = "linux")]
     pub fn build_raw_l2_link(
         interface: &str,
         ethertype: u16,
@@ -354,6 +416,7 @@ mod tokio_impl {
     /// to [`send`](FrameIo::send) are already a whole Ethernet frame, the same
     /// shape the kernel TAP device produces and consumes. Construct with
     /// [`build_raw_l2_egress`].
+    #[cfg(target_os = "linux")]
     pub struct RawL2Egress {
         /// The reactor-registered packet socket.
         fd: AsyncFd<Socket>,
@@ -361,6 +424,7 @@ mod tokio_impl {
         ifindex: u32,
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg_attr(feature = "std", async_trait::async_trait)]
     impl FrameIo for RawL2Egress {
         async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
@@ -393,6 +457,10 @@ mod tokio_impl {
     /// [`open_packet_socket`]), so this node's own transmissions — including a
     /// co-located DHCP server's broadcast replies bound to this same interface —
     /// are never read back and forwarded into the mesh.
+    ///
+    /// Linux-only; see [the module documentation](self) for the non-Linux
+    /// behaviour.
+    #[cfg(target_os = "linux")]
     pub fn build_raw_l2_egress(interface: &str) -> anyhow::Result<RawL2Egress> {
         let ifindex = interface_index(interface)?;
         let socket = open_packet_socket(ifindex, libc::ETH_P_ALL as u16)?;
@@ -400,6 +468,54 @@ mod tokio_impl {
             fd: AsyncFd::new(socket)?,
             ifindex,
         })
+    }
+
+    /// The non-Linux stand-in for the `AF_PACKET` egress carrier.
+    ///
+    /// Uninhabited on purpose: there is no packet socket to hold, and making
+    /// that a type-level fact means every `FrameIo` method below is discharged
+    /// by an empty match rather than by a panic or a placeholder value. It
+    /// exists only so [`build_raw_l2_egress`]'s signature — and therefore
+    /// every caller that builds a local egress from a config — is identical on
+    /// all platforms.
+    #[cfg(not(target_os = "linux"))]
+    pub enum RawL2Egress {}
+
+    #[cfg(not(target_os = "linux"))]
+    #[cfg_attr(feature = "std", async_trait::async_trait)]
+    impl FrameIo for RawL2Egress {
+        async fn recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
+            match *self {}
+        }
+
+        async fn send(&self, _buf: &[u8]) -> io::Result<usize> {
+            match *self {}
+        }
+    }
+
+    /// The non-Linux counterpart of the raw-L2 mesh link; always fails. See
+    /// [the module documentation](self).
+    #[cfg(not(target_os = "linux"))]
+    pub fn build_raw_l2_link(
+        _interface: &str,
+        _ethertype: u16,
+    ) -> anyhow::Result<Box<DynLinkT<'static>>> {
+        anyhow::bail!(
+            "raw-L2 mesh links are supported on Linux only (they need an \
+             AF_PACKET socket, which this host has no equivalent of); use a \
+             `udp` link instead, or run this node on Linux"
+        )
+    }
+
+    /// The non-Linux counterpart of the raw-L2 egress carrier; always fails.
+    /// See [the module documentation](self).
+    #[cfg(not(target_os = "linux"))]
+    pub fn build_raw_l2_egress(_interface: &str) -> anyhow::Result<RawL2Egress> {
+        anyhow::bail!(
+            "raw-L2 local egress is supported on Linux only (it needs an \
+             AF_PACKET socket, which this host has no equivalent of); use a \
+             `tap` egress instead, or run this node on Linux"
+        )
     }
 
     /// Build a point-to-point mesh link carried over a raw IPv4 socket, type-
@@ -480,6 +596,13 @@ mod tokio_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use interfaces::frame::LinkFrame;
+    use interfaces::frame::LinkFrameData;
+    use interfaces::wire::ETH_HEADER_LEN;
+    use interfaces::wire::frame_into_buf;
+    use interfaces::wire::retag_ethertype;
+    use zerocopy::FromBytes;
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])

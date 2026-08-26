@@ -1624,7 +1624,19 @@ mod tests {
     /// `IpAddr` — the property that matters is that `peer.ip()` at the
     /// accept loop (`serve_tls_connection`) actually reaches the limiter
     /// keyed correctly, not just that the bucket type can do it in theory.
+    ///
+    /// Linux-only in practice, hence the `ignore`: the second source needs a
+    /// second loopback address, and only Linux gives `127.0.0.0/8` to `lo`
+    /// wholesale. macOS assigns `lo0` just `127.0.0.1`, so binding `127.0.0.2`
+    /// fails with `EADDRNOTAVAIL` there. Ignored rather than `cfg`'d out so it
+    /// stays visible in the test list, and so a macOS developer who wants it
+    /// can have it: `sudo ifconfig lo0 alias 127.0.0.2 up`, then
+    /// `cargo nextest run --run-ignored all -E 'test(submit_csr_rate_limit)'`.
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "needs a second loopback address (127.0.0.2); see the doc comment"
+    )]
     async fn submit_csr_rate_limit_is_isolated_per_source_over_real_connections() {
         use tokio_rustls::TlsConnector;
 

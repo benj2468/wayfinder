@@ -375,6 +375,20 @@
               }"
 
               export PATH=/run/wrappers/bin:$PATH
+              ${pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
+                # The `rust-lld` fenix ships for darwin is linked against
+                # `@rpath/libLLVM.dylib`, but its only usable `LC_RPATH` is
+                # `@loader_path/../lib` — and the binary lives in
+                # `lib/rustlib/aarch64-apple-darwin/bin/`, so that resolves to a
+                # directory the library is not in. It sits one level up, in the
+                # toolchain's own `lib/`. Nothing on the host build path notices
+                # (Apple's `cc` links those), but `wasm32-unknown-unknown` uses
+                # `rust-lld` directly, so `bins/wayfinder-web`'s hydration half
+                # dies at link time with `dyld: Library not loaded`. Point the
+                # fallback search there; the trailing entries are dyld's own
+                # defaults, which setting this variable would otherwise replace.
+                export DYLD_FALLBACK_LIBRARY_PATH="${rustToolchain}/lib:$HOME/lib:/usr/local/lib:/usr/lib"
+              ''}
             '';
           };
 

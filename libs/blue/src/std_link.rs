@@ -49,44 +49,10 @@ use wayfinder::link::Received;
 
 use crate::BleAdvertiser;
 use crate::BleLink;
+use crate::BleLinkParams;
 use crate::BleReportSink;
 use crate::ad::MESH_COMPANY_ID;
 use crate::addr::BleAddr;
-
-/// Deployment parameters for a [`StdBleLink`].
-pub struct BleLinkParams {
-    /// BlueZ adapter to use (e.g. `hci0`). `None` selects the system's
-    /// default adapter, which is the right choice on a host with one
-    /// controller.
-    pub adapter: Option<String>,
-    /// How long each fragment's advertisement stays registered with BlueZ.
-    ///
-    /// The airtime knob, and the one value here worth tuning per deployment.
-    /// It must outlast [`ADVERTISING_INTERVAL`] (the on-air repeat interval
-    /// this crate explicitly requests, `min_interval`/`max_interval` on the
-    /// `Advertisement`) by enough to cover several repeats, not just one — a
-    /// single on-air transmission is one coin flip against a scanner that
-    /// isn't listening at that exact moment. Raising it costs latency
-    /// directly: a frame takes `dwell × fragment_count`, up to 14 fragments.
-    pub advertise_dwell: Duration,
-}
-
-impl BleLinkParams {
-    /// Default per-fragment dwell: 150 ms, giving several repeats at
-    /// [`ADVERTISING_INTERVAL`] (20 ms) before the advertising set is torn
-    /// down. Confirmed via `btmon` against a real controller — see
-    /// `libs/blue/CLAUDE.md`.
-    pub const DEFAULT_ADVERTISE_DWELL: Duration = Duration::from_millis(150);
-}
-
-impl Default for BleLinkParams {
-    fn default() -> Self {
-        Self {
-            adapter: None,
-            advertise_dwell: Self::DEFAULT_ADVERTISE_DWELL,
-        }
-    }
-}
 
 /// The [`BleAdvertiser`] backing [`StdBleLink`]: registers one fragment as a
 /// BlueZ broadcast advertisement, holds the registration for
