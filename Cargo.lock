@@ -5209,6 +5209,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "libc",
  "pretty-hex",
  "sd-notify",
  "serde",

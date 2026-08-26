@@ -31,14 +31,12 @@ use wayfinder_protos::service::RouterDataProvider;
 use wayfinder_protos::service::RoutingEntryData;
 use wayfinder_protos::service::RuntimeConfigData;
 use wayfinder_protos::service::TableOccupancyData;
-use wayfinder_protos::service::WayfinderService;
 use wayfinder_protos::wayfinder::v1alpha::SubmitCsrRequest;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderResponse;
 use wayfinder_server::AuthSnapshot;
 use wayfinder_server::CertAuthority;
 use wayfinder_server::MeshAuthority;
-use wayfinder_server::serve_tls_server;
 use wayfinderctl::Command;
 use wayfinderctl::Endpoint;
 use wayfinderctl::csr::CsrCommand;
@@ -234,13 +232,40 @@ async fn spawn_provider_full(
             });
         }
     });
+    let (authority_tx, mut authority_rx) =
+        tokio::sync::mpsc::channel::<wayfinder_server::AuthorityCommand>(8);
     tokio::spawn(async move {
-        let _ = serve_tls_server(listener, seed, snapshot_tx, query_tx).await;
+        let _ = wayfinder_server::serve_tls_server_with_vpn(
+            listener,
+            seed,
+            snapshot_tx,
+            query_tx,
+            None,
+            Some(authority_tx),
+        )
+        .await;
     });
     tokio::spawn(async move {
-        let mut service = WayfinderService::new(ProviderMock { ca });
-        while let Some((req, resp_tx)) = query_rx.recv().await {
-            let _ = resp_tx.send(service.handle(req));
+        let mut provider = ProviderMock { ca };
+        loop {
+            tokio::select! {
+                Some((req, resp_tx)) = query_rx.recv() => {
+                    let resp = wayfinder_protos::service::handle_router(&mut provider, req)
+                        .unwrap_or_else(|_| wayfinder_server::not_a_provider_response());
+                    let _ = resp_tx.send(resp);
+                }
+                Some(command) = authority_rx.recv() => match command {
+                    wayfinder_server::AuthorityCommand::Request(req, reply) => {
+                        let resp = wayfinder_protos::service::handle_authority(&mut provider, req)
+                            .unwrap_or_else(|_| wayfinder_server::not_a_provider_response());
+                        let _ = reply.send(resp);
+                    }
+                    wayfinder_server::AuthorityCommand::SetEnrollmentPolicy(_, reply) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                },
+                else => break,
+            }
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;

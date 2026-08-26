@@ -1,8 +1,11 @@
 # Design: taking the certificate authority off the router loop
 
-**Status:** Proposed. **Implement before design 12.** Independently valuable —
-it is what makes a link-carrying provider safe — and a prerequisite for anything
-that raises management-request volume.
+**Status:** Implemented. §3.1, §3.2, §3.4, §3.5 and §3.7 landed together — the
+authority cannot be owned in two places, so they could not be separated. What is
+*not* done is recorded in §10.
+
+Still a prerequisite for design 12, and still what makes a link-carrying
+provider safe.
 
 **Scope:** `libs/wayfinder-driver` (`driver.rs`: the `provider` field, the
 `select!` query arm, `process_pending`, `set_provider`, `refresh_auth_clock`),
@@ -469,3 +472,45 @@ never reaches the authority; `GetSecurityStatus` reflects a policy set moments
 earlier on the same connection; a saturated authority channel returns busy rather
 than blocking; a non-provider node still answers authority requests with the
 provider-mode error.
+
+## 10. What landed, and what did not
+
+Implemented: §3.1–§3.5 and §3.7. The authority owns a `CertAuthority` outright
+on its own task; the connection task classifies with `request_facet` and forks
+before sending; the router publishes `RouterFacts` (clock + auth-present) and
+reads the enrollment policy without waiting; a signed revocation crosses to the
+router and its verdict comes back; `AuthenticateUser` is rate-limited per source
+on the enrollment tier.
+
+Deliberately deferred, each with the reason:
+
+- **§6's observability.** No authority queue-depth gauge, request-rate estimator
+  or saturation alarm. With `try_send` + a busy answer, a full queue is exactly
+  the condition nothing on the node records — the client gets a string and the
+  node says nothing. This is the highest-value follow-up, and it is what makes
+  the §3.7 limiter verifiable in production rather than merely tested.
+- **A read-only lane for cheap authority requests.** `ListPendingCsrs` still
+  queues behind any `AuthenticateUser` already in flight. Fixing it needs either
+  a second owner of the `CertAuthority` (an `RwLock`, which §7 rejects) or the
+  two code paths `serve_one_request` argues against. Under normal load the queue
+  is empty; under a flood it is the limiter's job, not the queue's.
+- **A pipelined connection read loop.** `serve_tls_connection` is
+  send → await → read-next sequentially per connection, so one slow authority
+  request still delays *that connection's* later router queries. The dashboard
+  is one connection, so this is the real throughput ceiling — but it is a
+  transport change, not a CA change.
+- **`RevokeNode` on a node with no OGM-emitting interface** reports success. The
+  record is stored and queued for re-advertisement, which is all
+  `ingest_revocation` promises; a node with no links (the certificate-authority
+  posture) will never emit it. Closing this wants a `CentralRouter` accessor for
+  "does any interface transmit OGMs", which belongs in the `no_std` core.
+- **A stale enrollment policy after the authority dies.** The `watch` keeps its
+  last value readable once the sender drops, so `GetSecurityStatus` reports a
+  policy from an authority that can no longer act on it. Authority-facing
+  requests do report the death.
+- **`auth_present` is published one loop iteration late.** A `SetAuth`
+  immediately followed by a `RevokeNode` can be refused against the pre-`SetAuth`
+  snapshot. Publishing from the `SetAuth` arm itself would close it.
+- **`run_channel_server` serves only the router half.** The in-process transport
+  has no authority channel, so a provider driven through it answers authority
+  kinds with the not-a-provider error. Only tests use it in-tree.

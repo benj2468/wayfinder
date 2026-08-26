@@ -1,12 +1,13 @@
 # libs/wayfinder-server
 
-The management-API server. Three layers in one crate, split by feature so an
+The management-API server. Four layers in one crate, split by feature so an
 embedded node links only what it can run.
 
 | Layer | Feature | Files |
 |---|---|---|
-| `RouterAdapter` — projects a borrowed `CentralRouter` onto `WayfinderDataProvider` | always (`no_std` + `alloc`) | `adapter.rs`, `provider.rs`, `authz.rs`, `settings.rs` (trait half) |
+| `RouterAdapter` — projects a borrowed `CentralRouter` onto `RouterDataProvider` | always (`no_std` + `alloc`) | `adapter.rs`, `authz.rs`, `settings.rs` (trait half) |
 | host transports — authenticated TLS over TCP, plus an in-process channel | `std` (default) | `transport.rs`, `tls.rs`, `authority.rs`, `persistence.rs`, `users.rs`, `settings.rs` (`SettingsFile`) |
+| the certificate authority's own task — `AuthorityAdapter` onto `AuthorityDataProvider` | `std` | `authority_task.rs`, `provider.rs` (the `MeshAuthority` trait half, compiled always so it stays `no_std`) |
 | embedded transport — length-delimited frames over `embedded-io-async` | `embedded` | `framing.rs`, `embedded.rs` |
 
 `std` and `embedded` are mutually exclusive in practice — a target picks one.
@@ -165,11 +166,48 @@ certificate would otherwise see every request fail with no explanation.
 
 ## Provider mode (the CA)
 
-A node in provider mode answers enrollment (`GetTrustAnchor`, `SubmitCsr`,
-`RevokeNode`) by delegating to the `MeshAuthority` trait (`provider.rs`). The
-trait is byte-oriented on purpose so it stays `no_std + alloc`; the concrete
-`CertAuthority` holding the mesh root key is `std`-only (`authority.rs`) and is
-injected into `RouterAdapter` by the host driver.
+A node in provider mode answers enrollment (`GetTrustAnchor`, `SubmitCsr`) by
+delegating to the `MeshAuthority` trait (`provider.rs`). Every `wayfinder-auth`
+value crossing that trait does so as raw bytes, with one exception (`revoke`
+returns a `RevocationRecord`), so it carries no key types and stays
+`no_std + alloc`; the concrete `CertAuthority` holding the mesh root key is
+`std`-only (`authority.rs`).
+
+`RevokeNode` is no longer one delegation but four hops, and that is the most
+surprising thing in this crate: the connection task forwards it, the authority
+signs *and durably persists*, the router ingests and floods it on its OGMs, and
+the connection task then revokes the VPN peer. The middle two are owned by
+different tasks, which is why a revocation can be recorded and never announced —
+and why every step reports whether it actually happened.
+
+**The authority runs on its own task, never on the router's event loop**
+(`authority_task.rs`, design 13). A login spends Argon2id at 64 MiB and then
+performs a durable write; on the driver's `select!` arm that meant ~100 ms with
+no link `recv` serviced and no OGM emitted, reachable by anyone who could open a
+connection. The connection task now classifies each request with
+`request_facet` *before* sending it and forwards it to the owner that can answer
+it — a second channel, so authority work and router work never queue behind each
+other.
+
+Three rules follow, and all three are load-bearing:
+
+- **The router loop must never `await` the authority task.** The authority may
+  be mid-Argon2id. Everything the loop needs from it is a *published* value it
+  reads without waiting: the enrollment policy for `GetSecurityStatus`
+  (`EnrollmentPolicyRx`). The only edge in the other direction is a signed
+  revocation travelling to the loop to be flooded, which is safe.
+- **The authority's clock comes from the router loop**, published as
+  `RouterFacts` through `AuthorityComms` and handed to the task by
+  `Driver::attach_authority` as `AuthorityPorts::facts`. `now_unix == 0` is
+  fail-closed in `submit_csr`, `authenticate_user` and `revoke`, so an authority
+  wired up without it refuses every *issuing* path — silently, with every
+  router-side test still green. `attach_authority` mints every channel at once
+  precisely so no caller can wire three of the four.
+- **`RouterAdapter` does not implement `AuthorityDataProvider` at all.**
+  Misrouting an authority request to the router half is a compile error rather
+  than a runtime string. Where an answer is still owed — an embedded node, or a
+  host node with no provider — it comes from the trait's own defaults
+  (`NOT_A_PROVIDER`) or from the connection task finding no authority channel.
 
 `persistence.rs` snapshots the issued-cert log and held CSRs so the
 impersonation guard, revocations, and pending approvals survive a restart. Two
@@ -280,8 +318,8 @@ Two stores, split by *what owns the thing*, not by convenience:
   restart performs, so the live path and the restart path cannot drift apart.
 - **Everything node-wide** (the fail-closed gate, lazy cert distribution, an
   identity installed by `SetAuth`) goes to `settings.rs`, injected into
-  `RouterAdapter` via `.with_settings(...)` by the host driver, exactly as the
-  CA is.
+  `RouterAdapter` via `.with_settings(...)` by the host driver. The CA, by
+  contrast, is no longer injected here at all — see *Provider mode (the CA)*.
 
 Both stores hold **overrides**, never values: `None` means "the operator never
 changed this", so the startup config still governs it and deleting the state

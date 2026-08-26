@@ -17,6 +17,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod shutdown;
 mod tap;
 
 use std::path::Path;
@@ -57,6 +58,8 @@ use wayfinder_driver::build_rylr998_link;
 use wayfinder_driver::build_udp_link;
 use wayfinder_driver::build_udp_multi_link;
 use wayfinder_driver::serve_tls_server_with_vpn;
+use wayfinder_server::AuthorityRx;
+use wayfinder_server::AuthorityTx;
 use wayfinder_server::SettingsFile;
 use wayfinder_server::SettingsStore;
 
@@ -188,6 +191,16 @@ fn load_or_generate_seed(path: &str) -> anyhow::Result<[u8; 32]> {
         Err(e) => Err(e).with_context(|| format!("failed to read identity seed at {path}")),
     }
 }
+
+/// How many commands may be queued for the certificate authority before new
+/// ones are refused.
+///
+/// Bounded and shallow on purpose. The authority serves one command at a time
+/// and a login costs ~100 ms, so a deep queue would not absorb a flood — it
+/// would only convert it into connections waiting minutes for an answer. At
+/// capacity the connection task answers "busy" immediately instead, which is
+/// the failure a client can act on.
+const AUTHORITY_QUEUE_DEPTH: usize = 16;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -431,6 +444,18 @@ async fn main() -> anyhow::Result<()> {
     // a channel so the router is never shared across tasks.
     let (query_tx, query_rx): (QueryTx, QueryRx) = mpsc::channel(16);
 
+    // The certificate authority's own channel, separate from `query_tx` so
+    // authority work and router work never queue behind each other — the point
+    // of design 13. Opened here because a management listener needs the sending
+    // half, while the authority itself is not loaded until further down; both
+    // halves are `None` on a node that runs no authority at all.
+    let authority_channel: Option<(AuthorityTx, AuthorityRx)> = config
+        .provider
+        .as_ref()
+        .map(|_| mpsc::channel(AUTHORITY_QUEUE_DEPTH));
+    let authority_tx = authority_channel.as_ref().map(|(tx, _)| tx.clone());
+    let mut authority_channel = authority_channel;
+
     // Set when a TLS management server is configured. The `CentralRouter` (and
     // so the current trust anchor + revocation list) lives only on the driver's
     // task, but the TLS server needs that state on its own task to decide
@@ -499,8 +524,17 @@ async fn main() -> anyhow::Result<()> {
                     mpsc::channel(16);
                 auth_snapshot_rx = Some(snapshot_rx);
                 let vpn = vpn_coordinator.clone();
+                let authority = authority_tx.clone();
                 join_set.spawn(async move {
-                    serve_tls_server_with_vpn(listener, identity_seed, snapshot_tx, tx, vpn).await
+                    serve_tls_server_with_vpn(
+                        listener,
+                        identity_seed,
+                        snapshot_tx,
+                        tx,
+                        vpn,
+                        authority,
+                    )
+                    .await
                 });
             }
         }
@@ -675,7 +709,24 @@ async fn main() -> anyhow::Result<()> {
             "certificate-authority (provider) mode enabled (mesh_id = {:#x})",
             provider_cfg.mesh_id
         );
-        driver.set_provider(ca);
+        // The authority runs on its own task from here: it no longer shares the
+        // driver's event loop, so a login's Argon2id and its durable write
+        // cannot stall a link `recv` or an OGM.
+        // Opened above iff `config.provider` was set, which is the branch we are
+        // in — matched rather than unwrapped so the two stay tied together by
+        // the compiler instead of by a comment.
+        let Some((_, authority_rx)) = authority_channel.take() else {
+            bail!("internal: provider configured but its command channel was never opened");
+        };
+        // Every direction wired in one call, so provider mode cannot be
+        // half-enabled. Without the clock the authority's `now_unix` stays 0,
+        // which every issuing path treats as fail-closed — so it would refuse
+        // every request, silently.
+        let ports = driver.attach_authority(authority_rx);
+        join_set.spawn(async move {
+            wayfinder_server::serve_authority(ca, ports).await;
+            Ok(())
+        });
     }
 
     // Hand the store to the driver last, so every startup-time read of the
@@ -686,5 +737,18 @@ async fn main() -> anyhow::Result<()> {
         tracing::trace!("Failed to notify systemd: {}", err);
     }
 
-    driver.run().await
+    // Not `driver.run().await`: every listener and carrier spawned above lives
+    // in `join_set`, and awaiting only the driver let one of them die leaving
+    // the node routing perfectly with no management API and nothing said about
+    // it. See `shutdown`, which also installs the signal handling this binary
+    // had none of.
+    let outcome = shutdown::run_until_shutdown(driver.run(), &mut join_set).await;
+
+    // Announced before the tasks are torn down, so `systemctl stop` sees a
+    // service on its way out rather than one that stopped answering.
+    if let Err(err) = sd_notify::notify(&[sd_notify::NotifyState::Stopping]) {
+        tracing::trace!("Failed to notify systemd: {}", err);
+    }
+    join_set.shutdown().await;
+    outcome
 }

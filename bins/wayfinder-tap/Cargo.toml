@@ -25,3 +25,8 @@ serde_yaml = "0.9.34"
 pretty-hex.workspace = true
 async-trait.workspace = true
 sd-notify = "0.5.0"
+
+[dev-dependencies]
+# Raising a real SIGTERM in the shutdown test: what is under test is the
+# process's actual signal disposition, which a mocked trigger would not touch.
+libc.workspace = true
