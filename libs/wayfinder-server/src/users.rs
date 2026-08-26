@@ -723,4 +723,149 @@ mod tests {
             AuthOutcome::Accepted
         );
     }
+
+    /// The token is a bearer credential living in the provider's state file,
+    /// and it is stored there the way a password is: not at all.
+    ///
+    /// Only its domain-separated hash is kept, so a snapshot that leaks tells
+    /// its reader nothing they could redeem. The label is what keeps that hash
+    /// from colliding with the handle's over the same bytes.
+    #[test]
+    fn an_invite_stores_a_hash_of_its_token_and_never_the_token() {
+        let token = generate_invite_secret();
+        let invite = UserInvite::new(
+            "rowan",
+            UserRole::Viewer,
+            3600,
+            invite_token_hash(&token),
+            1_700_000_000,
+            1_700_086_400,
+        );
+
+        let stored = alloc::format!("{invite:?}");
+        assert!(
+            !stored.contains(&token),
+            "the token itself must not be recoverable from the record"
+        );
+        assert_eq!(invite.token_hash, invite_token_hash(&token));
+        assert_ne!(
+            invite_token_hash(&token),
+            registration_handle_hash(&token),
+            "token and handle hashes are domain-separated, so one cannot be \
+             presented as the other"
+        );
+    }
+
+    /// A minted secret is 256 bits from the OS CSPRNG, rendered in the base32
+    /// alphabet the `otpauth://` URI already uses — unambiguous if it ever has
+    /// to be read aloud, and unguessable on any timescale, which is what lets
+    /// an unknown token be refused without spending Argon2id on it.
+    #[test]
+    fn a_minted_secret_is_unguessable_and_base32() {
+        let a = generate_invite_secret();
+        let b = generate_invite_secret();
+
+        assert_ne!(a, b, "two mints must not collide");
+        assert_eq!(
+            a.len(),
+            52,
+            "256 bits in unpadded base32 is 52 characters: {a}"
+        );
+        assert!(
+            a.bytes()
+                .all(|c| c.is_ascii_uppercase() || (b'2'..=b'7').contains(&c)),
+            "base32 alphabet only: {a}"
+        );
+    }
+
+    /// A second factor is mandatory on this path, so the secret is not an
+    /// `Option`: an invite with none would make a bearer token in a chat
+    /// message the whole credential for an account that can mint a certificate
+    /// the entire mesh honours.
+    #[test]
+    fn an_invite_always_carries_a_second_factor_to_enrol() {
+        let invite = UserInvite::new(
+            "rowan",
+            UserRole::Admin,
+            3600,
+            [0u8; 32],
+            1_700_000_000,
+            1_700_086_400,
+        );
+
+        assert_eq!(invite.totp_secret.len(), TOTP_SECRET_LEN);
+        let uri = invite.totp_enrolment_uri("wayfinder");
+        assert!(uri.starts_with("otpauth://totp/wayfinder:rowan?"));
+        assert!(uri.contains(&base32_encode(&invite.totp_secret)));
+    }
+
+    /// The account built at completion keeps the secret the invite enrolled —
+    /// so the code the registrant just proved keeps working — *and* starts its
+    /// replay guard at the step that code was accepted at.
+    ///
+    /// Without the second half, the code typed at registration stays valid at
+    /// the next sign-in for the rest of its ±1-step window: up to 90 seconds of
+    /// replay against a brand-new administrative account.
+    #[test]
+    fn an_account_registered_from_an_invite_inherits_the_secret_and_the_step() {
+        let now = 1_700_000_000u64;
+        let step = now / TOTP_STEP_SECS;
+        let secret = generate_totp_secret();
+
+        let user = UserRecord::from_registration(
+            "rowan",
+            "correct horse battery staple",
+            secret.clone(),
+            step,
+            UserRole::Admin,
+            3600,
+        )
+        .unwrap();
+
+        assert_eq!(user.totp_secret.as_deref(), Some(secret.as_slice()));
+        assert_eq!(
+            user.totp_last_step, step,
+            "the accepted step must be carried in, or the registration code \
+             replays at the first sign-in"
+        );
+        assert_eq!(user.role, UserRole::Admin);
+        assert_eq!(user.session_ttl_secs, 3600);
+        assert!(!user.disabled);
+    }
+
+    /// The concrete replay this closes: the code accepted at completion is
+    /// refused by the very next `authenticate`, while the *next* step's code is
+    /// taken.
+    #[test]
+    fn the_code_accepted_at_registration_is_refused_at_the_next_sign_in() {
+        let now = 1_700_000_000u64;
+        let secret = generate_totp_secret();
+        let step = verify_totp(&secret, &totp_code_for_tests(&secret, now), now, 0)
+            .expect("a live code verifies");
+
+        let mut user = UserRecord::from_registration(
+            "rowan",
+            "hunter2",
+            secret.clone(),
+            step,
+            UserRole::Viewer,
+            3600,
+        )
+        .unwrap();
+
+        let same_code = totp_code_for_tests(&secret, now);
+        assert_eq!(
+            user.authenticate("hunter2", &same_code, now),
+            AuthOutcome::Rejected,
+            "the registration code must not be spendable again at sign-in"
+        );
+
+        let later = now + TOTP_STEP_SECS;
+        let next_code = totp_code_for_tests(&secret, later);
+        assert_eq!(
+            user.authenticate("hunter2", &next_code, later),
+            AuthOutcome::Accepted,
+            "and the account must still be usable with a fresh code"
+        );
+    }
 }

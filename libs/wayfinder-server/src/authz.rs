@@ -844,6 +844,11 @@ mod tests {
             ReqKind::GetVpnEnrollment(GetVpnEnrollmentRequest {}),
             ReqKind::ListVpnPeers(ListVpnPeersRequest {}),
             ReqKind::RevokeVpnPeer(RevokeVpnPeerRequest::default()),
+            ReqKind::CreateUserInvite(CreateUserInviteRequest::default()),
+            ReqKind::ListUserInvites(ListUserInvitesRequest {}),
+            ReqKind::RevokeUserInvite(RevokeUserInviteRequest::default()),
+            ReqKind::BeginUserRegistration(BeginUserRegistrationRequest::default()),
+            ReqKind::CompleteUserRegistration(CompleteUserRegistrationRequest::default()),
         ]
     }
 
@@ -861,7 +866,7 @@ mod tests {
         let all = every_request_kind();
         assert_eq!(
             all.len(),
-            31,
+            36,
             "every_request_kind must list every variant of the request oneof; \
              add the new one (and decide what the enrollment tier may do with it)"
         );
@@ -872,7 +877,22 @@ mod tests {
             // provider for it would make the token no barrier at all.
             let expected = matches!(
                 request,
-                ReqKind::SubmitCsr(_) | ReqKind::GetTrustAnchor(_) | ReqKind::AuthenticateUser(_)
+                ReqKind::SubmitCsr(_)
+                    | ReqKind::GetTrustAnchor(_)
+                    | ReqKind::AuthenticateUser(_)
+                    // Redeeming an invite: somebody who does not have an
+                    // account yet holds no credential, so a tier that required
+                    // one would close the door they need to knock on. What
+                    // confines them is the token — 256 bits, single-use,
+                    // expiring, and minted by an admin who chose the name and
+                    // the role.
+                    //
+                    // Note what is *not* admitted beside them: an enrollment
+                    // connection can redeem an invite it holds and can do
+                    // nothing else to the account store. It cannot mint one,
+                    // list one, or revoke one.
+                    | ReqKind::BeginUserRegistration(_)
+                    | ReqKind::CompleteUserRegistration(_)
             );
             assert_eq!(
                 permits(MgmtAccess::GrantedEnrollment, request),
@@ -916,7 +936,7 @@ mod tests {
         let all = every_request_kind();
         assert_eq!(
             all.len(),
-            31,
+            36,
             "every_request_kind must list every variant of the request oneof; \
              add the new one (and decide what the viewer tier may do with it)"
         );
@@ -958,6 +978,21 @@ mod tests {
                     // not be reachable from a read-only grant.
                     | ReqKind::ListVpnPeers(_)
                     | ReqKind::RevokeVpnPeer(_)
+                    // Deciding that an account will exist, with a role, is the
+                    // same administration `CreateUser` beside it is — taken one
+                    // step earlier in time. And revoking one is how an admin
+                    // responds to a token they believe has leaked.
+                    | ReqKind::CreateUserInvite(_)
+                    | ReqKind::RevokeUserInvite(_)
+                    // A read by shape, refused for the reason `ListUsers` above
+                    // is: who is being given administrative access is an
+                    // administrator's business. A viewer reads the *network*.
+                    | ReqKind::ListUserInvites(_)
+                    // A viewer holds a certificate already. Redeeming an invite
+                    // on that connection has no defined meaning, and would put
+                    // an account-creating request behind a read-only grant.
+                    | ReqKind::BeginUserRegistration(_)
+                    | ReqKind::CompleteUserRegistration(_)
             );
             assert_eq!(
                 permits(MgmtAccess::GrantedViewer, request),

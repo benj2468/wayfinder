@@ -2099,6 +2099,99 @@ mod tests {
         let _ = server.await;
     }
 
+    /// Redeeming an invite is rate-limited per source too, and both halves of
+    /// the redemption share one bucket.
+    ///
+    /// Both are reachable with no credential, and both reach the authority
+    /// task: a `BeginUserRegistration` scans the invite store and performs a
+    /// durable write, and a `CompleteUserRegistration` that gets past its
+    /// handle and TOTP checks spends a full Argon2id. Unbounded, either keeps
+    /// the authority's single command queue full and every operator request on
+    /// that facet answers "busy".
+    ///
+    /// One bucket rather than one each, unlike the split between logins and
+    /// `SubmitCsr`: begin and complete are two steps of *one* flow at one
+    /// human's cadence, so giving them separate budgets would bound neither
+    /// half of what a redemption actually costs.
+    #[tokio::test]
+    async fn redeeming_an_invite_on_the_enrollment_tier_is_rate_limited_per_source() {
+        use wayfinder_protos::wayfinder::v1alpha::BeginUserRegistrationRequest;
+        use wayfinder_protos::wayfinder::v1alpha::CompleteUserRegistrationRequest;
+
+        let ctx = AuthContext {
+            own_key: Some([1u8; 32]), // un-enrolled ⇒ every other key is GrantedEnrollment
+            anchor: None,
+            revoked: Vec::new(),
+            now_unix: 100,
+        };
+        let (mut client, server) = spawn_authenticated_server([2u8; 32], ctx);
+
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: Vec::new(),
+            })))
+            .await
+            .unwrap();
+        let ack = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(ack.response, Some(Response::Empty(_))));
+
+        let begin = || {
+            encode_request(Request::BeginUserRegistration(
+                BeginUserRegistrationRequest::default(),
+            ))
+        };
+        let complete = || {
+            encode_request(Request::CompleteUserRegistration(
+                CompleteUserRegistrationRequest::default(),
+            ))
+        };
+
+        // The burst is spent without throttling: somebody mistyping their TOTP
+        // code a couple of times must be able to finish registering.
+        for n in 0..REGISTRATION_BURST as u32 {
+            client.send(begin()).await.unwrap();
+            let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+            assert!(
+                !matches!(&resp.response, Some(Response::Error(e)) if e.message.contains("too many")),
+                "redemption {n} of the burst capacity was throttled early"
+            );
+        }
+
+        // One more, immediately: refused before it can reach the authority —
+        // and refused for the *other* half of the flow too, since they share a
+        // bucket.
+        for request in [begin(), complete()] {
+            client.send(request).await.unwrap();
+            let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+            match resp.response {
+                Some(Response::Error(e)) => {
+                    assert!(e.message.contains("too many"), "got: {}", e.message)
+                }
+                other => panic!("expected the rate limit to refuse this, got {other:?}"),
+            }
+        }
+
+        // Its own bucket, though: a node genuinely enrolling, and a person
+        // genuinely signing in, must not be throttled by somebody else's
+        // registration attempts from behind the same address.
+        for request in [
+            encode_request(Request::SubmitCsr(SubmitCsrRequest::default())),
+            encode_request(Request::AuthenticateUser(
+                wayfinder_protos::wayfinder::v1alpha::AuthenticateUserRequest::default(),
+            )),
+        ] {
+            client.send(request).await.unwrap();
+            let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+            assert!(
+                !matches!(&resp.response, Some(Response::Error(e)) if e.message.contains("too many")),
+                "the registration limiter must not spend another limiter's tokens"
+            );
+        }
+
+        drop(client);
+        let _ = server.await;
+    }
+
     /// A login on a fully-granted connection is not rate-limited: the tier
     /// already required a real credential, which is not the resource an
     /// anonymous flood is spending.

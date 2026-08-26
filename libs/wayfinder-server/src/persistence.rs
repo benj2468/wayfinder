@@ -847,4 +847,100 @@ mod tests {
             "the second write's mutation rolled back, in isolation from the first"
         );
     }
+
+    /// Completing a registration creates the account and deletes the invite,
+    /// and those are one durable act or the whole flow is unrecoverable: a
+    /// crash between two separate writes leaves a burnt invite with no account
+    /// behind it, and the person holding the handle has nothing left to redeem.
+    ///
+    /// Same white-box level, and for the same reason, as
+    /// [`mutate_issued_and_held_rolls_back_both_collections_together_on_persist_failure`]:
+    /// only here can the failure be forced to land after both halves of the
+    /// mutation have run.
+    #[test]
+    fn mutate_users_and_invites_rolls_back_both_collections_together_on_persist_failure() {
+        let dir = unique_dir("atomic-users-invites");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(&path, seed_snapshot().to_string()).unwrap();
+
+        let mut log = CaLog::load(Some(path)).unwrap();
+        assert!(log.users().is_empty());
+        assert!(log.invites().is_empty());
+
+        // Doom every subsequent write.
+        std::fs::remove_dir_all(&dir).ok();
+
+        let (_, persisted) = log.mutate_users_and_invites(|users, invites| {
+            users.push(
+                UserRecord::new("rowan", "hunter2", crate::users::UserRole::Viewer, 3600).unwrap(),
+            );
+            invites.push(crate::users::UserInvite::new(
+                "wren",
+                crate::users::UserRole::Viewer,
+                3600,
+                [7u8; 32],
+                0,
+                1,
+            ));
+        });
+        assert!(
+            persisted.is_err(),
+            "the write should have failed: its directory is gone"
+        );
+
+        assert!(
+            log.users().is_empty(),
+            "the account must roll back with the invite deletion, or a failed \
+             persist leaves an account nobody asked to create"
+        );
+        assert!(
+            log.invites().is_empty(),
+            "and the invite side must roll back too — the split is exactly the \
+             hazard this method exists to close"
+        );
+    }
+
+    /// A snapshot written before invites existed loads with an empty invite
+    /// store, which is not a loss of state but a faithful description of a
+    /// provider that had no invite store at all.
+    #[test]
+    fn a_v5_snapshot_migrates_forward_with_an_empty_invite_store() {
+        let dir = unique_dir("v5-migration");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": 5,
+                "issued": [],
+                "held": [],
+                "users": [{
+                    "username": "ops",
+                    "password_hash": "$argon2id$v=19$m=65536,t=3,p=1$c2FsdHNhbHQ$aGFzaGhhc2g",
+                    "totp_secret": null,
+                    "session_ttl_secs": 3600,
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let log = CaLog::load(Some(path.clone())).unwrap();
+
+        assert_eq!(log.users().len(), 1, "the account survives the migration");
+        assert!(
+            log.invites().is_empty(),
+            "and the invite store starts empty rather than being invented"
+        );
+
+        // The rewrite carries the new version, so a downgrade fails loudly
+        // rather than silently dropping invites.
+        let mut log = log;
+        let (_, persisted) = log.mutate_invites(|_| {});
+        persisted.unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["version"], CURRENT_STATE_VERSION);
+    }
 }
