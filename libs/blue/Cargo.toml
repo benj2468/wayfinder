@@ -60,7 +60,6 @@ tracing = { version = "0.1.44", default-features = false }
 # would break the `thumbv7em-none-eabihf` firmware build if pulled in
 # unconditionally — the `no_std` path reports bring-up failures as `BleError`
 # instead.
-bluer = { version = "0.17.4", features = ["bluetoothd"], optional = true }
 tokio = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
@@ -93,3 +92,12 @@ embassy-sync = { version = "0.8", optional = true }
 # `'static` promotion for the report queue, constructed once at
 # `NrfBleLink::new` and shared with the spawned scan task.
 static_cell = { version = "2", optional = true }
+
+# BlueZ is Linux's Bluetooth stack and `bluer` is a thin D-Bus client for it —
+# it `compile_error!`s outright on any other OS. Target-gated rather than
+# feature-gated so `std` keeps meaning the same thing everywhere: the portable
+# half of this crate (`generic_link.rs`, `ad.rs`, `frame.rs`) still builds and
+# tests on macOS, and only `std_link.rs` — the one module that speaks D-Bus —
+# drops out. See the `target_os` gate in `lib.rs`.
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { version = "0.17.4", features = ["bluetoothd"], optional = true }

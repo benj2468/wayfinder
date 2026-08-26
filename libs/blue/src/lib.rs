@@ -9,10 +9,12 @@
 //!
 //! - [`NrfBleLink`] (`hardware` feature) — the nRF52840's built-in 2.4 GHz
 //!   radio via `nrf-softdevice`, `no_std`, for `bins/wayfinder-nrf52840`.
-//! - [`StdBleLink`] (`std` feature) — a Linux host's controller via BlueZ's
-//!   D-Bus API, for `bins/wayfinder-tap`.
+//! - `StdBleLink` (`std` feature, Linux hosts only) — a Linux host's
+//!   controller via BlueZ's D-Bus API, for `bins/wayfinder-tap`. BlueZ has no
+//!   counterpart on other operating systems, so on a non-Linux host the `std`
+//!   feature builds everything here *except* this backend.
 //!
-//! [`StdBleLink`] builds on [`BleLink`], generic over a platform-supplied
+//! `StdBleLink` builds on [`BleLink`], generic over a platform-supplied
 //! [`BleAdvertiser`]; see `generic_link.rs`.
 //!
 //! `std` is on by default (needed by `wayfinder-driver`'s host build). Only
@@ -47,12 +49,26 @@ pub use generic_link::BleReportSink;
 // doc comment.
 pub use addr::BleAddr;
 
-#[cfg(feature = "std")]
+// The BlueZ backend is Linux-only — `bluer` speaks D-Bus to `bluetoothd` and
+// `compile_error!`s on any other OS (its `libc` constants don't exist there
+// either), so the dependency is target-gated in `Cargo.toml` and the module
+// with it. Everything else under `std` — the generic `BleLink` core, the AD
+// framing, the fragmentation — is portable and keeps building and testing on
+// a macOS host, which is the point of gating this narrowly rather than
+// switching off `std` wholesale.
+#[cfg(all(feature = "std", target_os = "linux"))]
 mod std_link;
 
-#[cfg(feature = "std")]
-pub use std_link::BleLinkParams;
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", target_os = "linux"))]
 pub use std_link::StdBleLink;
+
+// Deliberately *not* target-gated: `BleLinkParams` is plain configuration, so
+// a host node's config types and CLI plumbing still name it on a platform
+// where the link itself can't be built.
+#[cfg(feature = "std")]
+mod params;
+
+#[cfg(feature = "std")]
+pub use params::BleLinkParams;
 
 pub use error::BleError;

@@ -45,7 +45,7 @@ pub use net::build_udp_multi_link;
 pub use ::blue::BleLinkParams;
 #[cfg(feature = "tokio")]
 pub use raw::RawL2Egress;
-#[cfg(feature = "tokio")]
+#[cfg(all(feature = "tokio", target_os = "linux"))]
 pub use raw::RawL2Link;
 #[cfg(feature = "tokio")]
 pub use raw::build_raw_ip_link;

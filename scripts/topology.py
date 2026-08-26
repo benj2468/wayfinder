@@ -47,6 +47,15 @@ run by bare name — in the entrypoint and via ``docker exec``::
 rebuilds without ``docker compose build``. (On a Nix host ``/nix/store`` is
 mounted read-only so the host binary's interpreter resolves.)
 
+**On macOS, substitute** ``just sim-binaries`` **for that** ``cargo build``.
+The containers are Linux and a macOS ``cargo build`` emits Mach-O, so the
+entrypoint would fail with "exec format error"; that recipe builds the same
+binaries inside a Linux container into ``target/sim-linux/``, which
+``containers/sim.Dockerfile`` puts first on the container's ``PATH``. Rebuilds
+are still incremental, so the loop is unchanged apart from the command name.
+Everything else here — minting identities, ``docker compose``, the dashboards —
+runs natively.
+
 Dashboards
 ----------
 Every node gets its own ``wayfinder-web`` container beside it, published on
@@ -57,6 +66,11 @@ repeats it per node.  They run the host-built ``wayfinder-web`` from
 plain ``cargo build`` does *not* produce usably — build it with::
 
     cargo leptos build      # the ssr binary AND the wasm bundle it serves
+
+(``cargo leptos build`` on the host is right on macOS too: what the sidecar
+needs from it is the *browser* half under ``target/site``, which is
+architecture-independent. ``just sim-binaries`` supplies the Linux server
+binary that serves it.)
 
 A secured node's dashboard has **no credential of its own**: it is started in
 login mode (``--provider``), and whoever opens it signs in with one of the two
@@ -195,6 +209,23 @@ OPEN_NODE_COUNT = 0
 # Name prefix for the open nodes, kept distinct from any secured prefix so
 # `graph`/`logs`/`blast` name them unambiguously.
 OPEN_NODE_PREFIX = "o"
+
+
+def nix_store_needed() -> bool:
+    """Whether the node containers need ``/nix/store`` mounted read-only.
+
+    Only on a Linux host: there, the binaries under ``./target`` are the ones
+    the containers run, and a Nix-provided toolchain links them against an ELF
+    interpreter and glibc that live in the store — without the mount the
+    Debian-based container cannot start them.
+
+    Elsewhere (macOS) the host's own artifacts are not Linux binaries at all,
+    so the containers run the ones ``just sim-binaries`` builds *inside* a
+    Linux container against Debian's glibc, and the store has nothing to
+    contribute. Mounting it anyway would only ask Docker Desktop to share a
+    large directory it has no reason to see.
+    """
+    return sys.platform.startswith("linux") and Path("/nix/store").is_dir()
 
 
 # ── topology helpers ──────────────────────────────────────────────────────────
@@ -609,7 +640,7 @@ def render_compose(require_approval: bool = False) -> tuple[str, DevInfo]:
     # On a Nix host the host-built binary's ELF interpreter (and glibc) live in
     # /nix/store; mount it read-only so a plain `cargo build` artifact is
     # runnable in the Debian-based container without a musl/static rebuild.
-    if Path("/nix/store").is_dir():
+    if nix_store_needed():
         e("    - /nix/store:/nix/store:ro")
     e("  cap_add:")
     e("    - NET_ADMIN # create the kernel TAP device")
@@ -642,7 +673,7 @@ def render_compose(require_approval: bool = False) -> tuple[str, DevInfo]:
         # On a Nix host the host-built binary's ELF interpreter (and glibc) live in
         # /nix/store; mount it read-only so a plain `cargo build` artifact is
         # runnable in the Debian-based container without a musl/static rebuild.
-        if Path("/nix/store").is_dir():
+        if nix_store_needed():
             e("      - /nix/store:/nix/store:ro")
         if is_provider:
             e(f"      - {ca_dir!s}:/ca:ro")
@@ -738,7 +769,7 @@ def render_compose(require_approval: bool = False) -> tuple[str, DevInfo]:
         if is_open:
             e(f"      - {secrets_dir!s}:/node-identity:ro")
         e(f"      - {REPO_ROOT!s}:/workspace:ro")
-        if Path("/nix/store").is_dir():
+        if nix_store_needed():
             e("      - /nix/store:/nix/store:ro")
         e("    environment:")
         e("      RUST_LOG: info")

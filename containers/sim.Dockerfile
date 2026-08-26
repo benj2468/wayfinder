@@ -39,7 +39,13 @@ FROM debian:bookworm-slim
 # on PATH so `wayfinder-tap`/`wayfinder-ctl`/`wayfinder-tui` are runnable by bare
 # name everywhere — the entrypoint and an interactive `docker exec`. Debug first
 # (the default `cargo build` profile), then release.
-ENV PATH="/workspace/target/debug:/workspace/target/release:${PATH}"
+#
+# `target/sim-linux/` comes first because it only exists on a host whose own
+# `cargo build` output this container cannot exec — macOS, where the artifacts
+# under `target/debug` are Mach-O. `just sim-binaries` builds Linux ones into
+# that directory (see containers/sim-builder.Dockerfile); on a Linux host it is
+# absent and PATH falls straight through to the normal entries below.
+ENV PATH="/workspace/target/sim-linux/debug:/workspace/target/sim-linux/release:/workspace/target/debug:/workspace/target/release:${PATH}"
 
 # Network tooling for poking around inside the container while debugging the
 # mesh: tcpdump (watch RawL2 frames on the wire), net-tools (netstat/ifconfig),

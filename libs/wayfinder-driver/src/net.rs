@@ -133,7 +133,8 @@ fn resolve_target(
 
 /// A native multi-access UDP mesh interface: an unconnected socket that
 /// reaches every peer on a shared IP network without a static peer list, the
-/// UDP analog of [`RawL2Link`](crate::RawL2Link) — except unlike raw L2, UDP
+/// UDP analog of `RawL2Link` (raw L2 is Linux-only, so this is deliberately
+/// not a link) — except unlike raw L2, UDP
 /// addressing isn't the mesh MAC, so this link (unlike `RawL2Link`) has to
 /// learn each neighbor's transport address for itself, in [`UdpPeerTable`].
 /// [`send`](LinkT::send) reaches [`Mac::BROADCAST`]/multicast via

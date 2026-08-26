@@ -90,6 +90,40 @@ cargo test -p wayfinder-web --features mock-node
 cargo leptos build            # both halves, the way it actually ships
 ```
 
+## Developing on macOS
+
+The host crates, the web dashboard and the whole test suite build and run on an
+Apple-silicon Mac; the devShell (`nix develop` / direnv) is the same one. Four
+things differ, and each is already handled — this section is so the *reasons*
+aren't rediscovered:
+
+- **BlueZ and `AF_PACKET` are Linux kernel interfaces with no macOS analog.**
+  `bluer` won't even compile off Linux, so `libs/blue`'s BlueZ backend is
+  target-gated (the portable `BleLink` core still builds and tests), as are
+  `wayfinder-driver`'s raw-L2 carriers. Their *constructors* exist everywhere
+  and fail with a stated reason, so a config naming a `ble` or `RawL2` link is
+  a startup error rather than a compile error. Keep that shape when adding a
+  Linux-only carrier: gate the implementation, not the seam.
+- **`nrf-ieee802154` cannot be host-compiled here at all** — `nrf-pac` places
+  its interrupt vector table with an ELF section name Mach-O can't express — so
+  the `justfile` drops it from root-workspace commands on macOS
+  (`host_workspace_excludes`). Its real coverage is the cross-compile in
+  `just build-loose-drivers`, which works on every host.
+- **One test is `ignore`d off Linux**: the per-source rate-limit test needs a
+  second loopback address (`127.0.0.2`), which only Linux gives `lo` by
+  default. Its doc comment has the `ifconfig lo0 alias` line to run it anyway.
+- **The docker sim needs Linux binaries**, and a macOS `cargo build` produces
+  Mach-O. `just sim-binaries` builds them in a container into
+  `target/sim-linux/`, which `containers/sim.Dockerfile` puts first on the
+  node's `PATH`. See `scripts/topology.py`'s module docstring.
+
+One environment quirk, fixed in `flake.nix`'s devShell rather than per-command:
+fenix's darwin `rust-lld` has an unusable rpath for `libLLVM.dylib`, which
+breaks *only* `wasm32-unknown-unknown` links (host builds use Apple's `cc`) —
+i.e. `bins/wayfinder-web`'s hydration half. The shell exports
+`DYLD_FALLBACK_LIBRARY_PATH` to compensate; a `cargo build --target
+wasm32-unknown-unknown` outside the devShell will still fail.
+
 ## Always-on rules
 
 ### Model selection
