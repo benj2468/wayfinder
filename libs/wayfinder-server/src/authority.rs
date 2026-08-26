@@ -166,7 +166,7 @@ pub(crate) const MAX_PENDING_INVITES: usize = 128;
 /// worth anything. Long enough to survive a time zone and a night's sleep,
 /// short enough that a token found later is already dead — and the cost of
 /// guessing short is one more mint, which is cheap.
-pub(crate) const DEFAULT_INVITE_TTL_SECS: u64 = 24 * 3600;
+pub const DEFAULT_INVITE_TTL_SECS: u64 = 24 * 3600;
 
 /// How long a started registration may be resumed for: 15 minutes.
 ///

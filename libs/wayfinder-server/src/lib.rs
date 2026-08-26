@@ -148,6 +148,14 @@ mod persistence;
 mod authority;
 #[cfg(feature = "std")]
 pub use authority::CertAuthority;
+#[cfg(feature = "std")]
+pub use authority::DEFAULT_INVITE_TTL_SECS;
+#[cfg(feature = "std")]
+pub use authority::InviteSummary;
+#[cfg(feature = "std")]
+pub use authority::MintedInvite;
+#[cfg(feature = "std")]
+pub use authority::StartedRegistration;
 
 /// A mesh address, re-exported because this crate's public API is stated in
 /// terms of it — [`decide_access`] takes one, [`AuthSnapshot`] carries one —

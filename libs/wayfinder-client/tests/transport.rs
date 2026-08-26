@@ -512,7 +512,10 @@ async fn client_roundtrips_against_real_tls_server() {
 /// dropped one — the token from a mint, the handle from a start — would leave a
 /// caller with an invitation nobody can redeem and nothing to say so.
 async fn assert_invite_roundtrip(client: &mut Client) {
-    let minted = client.create_user_invite("rowan", true, 900, 0).await.unwrap();
+    let minted = client
+        .create_user_invite("rowan", true, 900, 0)
+        .await
+        .unwrap();
     assert_eq!(minted.username, "rowan");
     assert_eq!(minted.token, "JBSWY3DPEHPK3PXP");
     assert_eq!(minted.expires_at, 1_800_086_400);
