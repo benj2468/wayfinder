@@ -85,7 +85,11 @@ You will also need:
 - Your compartment OCID — the tenancy root compartment is a fine answer.
 - An SSH keypair whose public half goes in `terraform.tfvars`.
 - A Cloudflare API token, if `manage_tunnel` or `manage_dns` is set — scoped
-  `Zone:DNS:Edit` on the zone and `Account:Cloudflare Tunnel:Edit`. Put it in
+  `Zone:DNS:Edit` on the zone and `Account:Cloudflare Tunnel:Edit`, plus
+  `Zone:Zone:Read` and `Zone:Cache Purge:Purge` so that
+  `scripts/wayfinder-ca.sh update` can drop the previous dashboard bundle from
+  the edge cache (without those two the rollout still succeeds and warns, and
+  viewers keep the old stylesheet for up to four hours). Put it in
   `~/.cf-token` (mode `0600`, the token and nothing else) and
   `scripts/wayfinder-ca.sh` reads it; override the path with
   `CA_CF_TOKEN_FILE`. A bare `tofu` does not read that file — it only ever

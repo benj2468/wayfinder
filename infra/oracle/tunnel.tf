@@ -30,7 +30,9 @@ variable "manage_tunnel" {
 
     Requires `cloudflare_zone_id`, `cloudflare_account_id` and a
     `CLOUDFLARE_API_TOKEN` with `Zone:DNS:Edit` on the zone and
-    `Account:Cloudflare Tunnel:Edit`.
+    `Account:Cloudflare Tunnel:Edit`, plus `Zone:Zone:Read` and
+    `Zone:Cache Purge:Purge` for the post-rollout cache purge in
+    `scripts/wayfinder-ca.sh`.
   EOT
 }
 
