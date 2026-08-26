@@ -722,7 +722,94 @@ impl AuthorityDataProvider for Mock {
             .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
             .approve_csr(node_mac)
     }
+    fn create_user_invite(
+        &mut self,
+        username: &str,
+        admin: bool,
+        session_ttl_secs: u64,
+        invite_ttl_secs: u64,
+    ) -> Result<wayfinder_protos::service::UserInviteMintedData, String> {
+        let role = if admin {
+            wayfinder_server::UserRole::Admin
+        } else {
+            wayfinder_server::UserRole::Viewer
+        };
+        let minted = self
+            .ca
+            .as_mut()
+            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
+            .create_user_invite(username, role, session_ttl_secs, invite_ttl_secs)?;
+        Ok(wayfinder_protos::service::UserInviteMintedData {
+            username: minted.username,
+            token: minted.token,
+            expires_at: minted.expires_at,
+        })
+    }
+    fn list_user_invites(
+        &self,
+    ) -> Result<(Vec<wayfinder_protos::service::UserInviteData>, u32), String> {
+        let ca = self
+            .ca
+            .as_ref()
+            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?;
+        let invites = ca
+            .list_user_invites()
+            .into_iter()
+            .map(|i| wayfinder_protos::service::UserInviteData {
+                username: i.username,
+                admin: i.role == wayfinder_server::UserRole::Admin,
+                session_ttl_secs: i.session_ttl_secs,
+                created_at: i.created_at,
+                expires_at: i.expires_at,
+                started_at: i.started_at.unwrap_or(0),
+                handle_expires_at: i.handle_expires_at.unwrap_or(0),
+            })
+            .collect();
+        // The mock's own number rather than the authority's cap, which is
+        // `pub(crate)` there. A dashboard reading "3 of 8" against a mock is
+        // reading the shape, not the deployment's real headroom.
+        Ok((invites, MOCK_INVITE_CAPACITY))
+    }
+    fn revoke_user_invite(&mut self, username: &str) -> Result<(), String> {
+        self.ca
+            .as_mut()
+            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
+            .revoke_user_invite(username)
+    }
+    fn begin_user_registration(
+        &mut self,
+        token: &str,
+    ) -> Result<wayfinder_protos::service::RegistrationStartedData, String> {
+        let started = self
+            .ca
+            .as_mut()
+            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
+            .begin_user_registration(token)?;
+        Ok(wayfinder_protos::service::RegistrationStartedData {
+            username: started.username,
+            totp_enrolment_uri: started.totp_enrolment_uri,
+            handle: started.handle,
+            handle_expires_at: started.handle_expires_at,
+        })
+    }
+    fn complete_user_registration(
+        &mut self,
+        handle: &str,
+        password: &str,
+        totp_code: &str,
+    ) -> Result<(), String> {
+        self.ca
+            .as_mut()
+            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
+            .complete_user_registration(handle, password, totp_code)
+    }
 }
+
+/// Invitation-store capacity the mock reports.
+///
+/// Small on purpose: a dashboard developed against "0 of 128" never shows what
+/// it looks like near the cap, which is the state the gauge exists for.
+const MOCK_INVITE_CAPACITY: u32 = 8;
 
 /// Grab an almost-certainly-free localhost port by binding to :0 and releasing.
 pub fn free_port() -> SocketAddr {

@@ -1625,3 +1625,49 @@ body {
 .wf-note-strong p {
   margin: 0;
 }
+
+/* --------------------------------------------------------- registration -- */
+
+/* The registration page reuses the sign-in page's whole layout — centred mark,
+ * one panel, stacked fields — because from where the person is standing it is
+ * the same moment: a door, before any dashboard exists. What it does not reuse
+ * is `.wf-app:has(.wf-login-page) .wf-shell { display: none }` above, since
+ * there is no sign-in overlay here to hide the shell behind. `App` renders no
+ * chrome on this route instead, and this class is what gives the bare shell its
+ * page back. */
+.wf-shell-bare {
+  display: block;
+}
+
+/* No header, no tab bar, no status strip — so no padding for them either. */
+.wf-shell-bare .wf-main {
+  padding: 0;
+}
+
+/* The enrolment block, above the password fields.
+ *
+ * Set apart by a rule rather than a panel of its own, because it is not a step
+ * to complete on the way past: it is the one thing on this page that cannot be
+ * shown again, and it has to read as more important than the form below it. */
+.wf-register-enrol {
+  display: flex;
+  flex-direction: column;
+  gap: var(--wf-space-2);
+  padding-bottom: var(--wf-space-4);
+  border-bottom: 1px solid var(--wf-border);
+}
+
+/* The `otpauth://` URI, for an authenticator app that takes a pasted link.
+ *
+ * Wrapped rather than truncated: this is a secret shown exactly once, and a
+ * value the reader can see only the first 40 characters of is a value they
+ * cannot check they copied. `anywhere` and not `break-word` — the URI has no
+ * spaces to break at, so `break-word` leaves it overflowing the panel. */
+.wf-register-uri {
+  padding: var(--wf-space-2);
+  overflow-wrap: anywhere;
+  font-size: var(--wf-text-sm);
+  background: var(--wf-surface-2);
+  border: 1px solid var(--wf-border);
+  border-radius: var(--wf-radius);
+}

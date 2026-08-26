@@ -31,16 +31,22 @@ use leptos::prelude::*;
 use wayfinder_protos::wayfinder::v1alpha::UserAccount;
 
 use crate::api::create_user;
+use crate::api::create_user_invite;
+use crate::api::list_user_invites;
 use crate::api::list_users;
 use crate::api::remove_user;
+use crate::api::revoke_user_invite;
 use crate::components::dashboard::use_dashboard;
 use crate::components::provider::CopyField;
 use crate::components::provider::ProviderGate;
 use crate::components::provider::confirmation;
+use crate::components::provider::report_failure;
 use crate::components::widgets::Empty;
 use crate::components::widgets::Panel;
 use crate::components::widgets::Pending;
 use crate::format;
+use crate::invite::InviteMinted;
+use crate::invite::InviteRow;
 
 /// Render the Accounts tab.
 #[component]
@@ -48,6 +54,7 @@ pub fn Accounts() -> impl IntoView {
     view! {
         <ProviderGate>
             <Users />
+            <Invitations />
         </ProviderGate>
     }
 }
@@ -368,4 +375,305 @@ fn UserTable(
             </table>
         </div>
     }
+}
+
+/// Invitations: the way to create an account without ever holding its secrets.
+///
+/// Sits beside [`Users`] because they are two answers to one question, and this
+/// is the one to reach for. "Create account" mints both of an account's secrets
+/// here and hands the operator its `otpauth://` URI, so the account's second
+/// factor ends up permanently known to somebody who is not its owner — which is
+/// not a second factor, it is a second thing the operator knows. An invitation
+/// hands over a link instead: whoever opens it is the first party to see the
+/// TOTP secret.
+///
+/// # What the operator is actually watching for
+///
+/// The `Started` column. An invitation that is still listed and shows a start
+/// means somebody took the account's second factor and did not finish — a
+/// completed registration deletes its invitation, so a started one is never a
+/// finished one. That is either an abandoned registration or a disclosure, and
+/// the response to both is the same: revoke, and invite again.
+///
+/// That column is also the whole of what this buys, and it is worth being exact
+/// about the limit. An operator holds the token between minting it and
+/// delivering it, and could always redeem it themselves; nothing prevents that.
+/// What is guaranteed is that doing so **spends** the invitation, so the
+/// intended registration fails, the person says so, and this list shows a start
+/// nobody expected.
+///
+/// # The token is shown once
+///
+/// The authority stores only a hash of it, so this panel is the only place it
+/// exists in readable form. It is offered through the clipboard as a whole
+/// registration URL rather than as bare text, because the URL is the part that
+/// has to be right — the token belongs after the `#`, where no server, no
+/// access log and no chat-app link preview ever sees it.
+#[component]
+fn Invitations() -> impl IntoView {
+    let dash = use_dashboard();
+    let invites = Resource::new(|| (), |()| async move { list_user_invites().await });
+
+    let name = RwSignal::new(String::new());
+    let admin = RwSignal::new(false);
+    let busy = RwSignal::new(false);
+    // The invitation just minted, held on screen until dismissed: its token is
+    // not recoverable, exactly like the enrolment URI above.
+    let minted = RwSignal::new(None::<InviteMinted>);
+    let pending = RwSignal::new(None::<Pending<String>>);
+
+    let confirm_revoke = move |username: String| {
+        leptos::task::spawn_local(async move {
+            match revoke_user_invite(username).await {
+                Ok(()) => invites.refetch(),
+                Err(e) => report_failure(dash, "Revoking the invitation", Err::<(), _>(e)),
+            }
+        });
+    };
+
+    let submit = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        if busy.get_untracked() {
+            return;
+        }
+        let username = name.get_untracked();
+        if username.trim().is_empty() {
+            dash.error.set(Some("A user name is required.".to_string()));
+            return;
+        }
+        busy.set(true);
+        leptos::task::spawn_local(async move {
+            // Zero for both lifetimes: the authority's defaults, which are the
+            // right answer unless somebody has a reason. An operator who does
+            // sets them with `wayfinderctl user invite`, where a form's worth
+            // of rarely-used fields is a flag instead.
+            let result = create_user_invite(username, admin.get_untracked(), 0, 0).await;
+            busy.set(false);
+            match result {
+                Ok(invite) => {
+                    name.set(String::new());
+                    minted.set(Some(invite));
+                    invites.refetch();
+                }
+                Err(e) => report_failure(dash, "Creating the invitation", Err::<(), _>(e)),
+            }
+        });
+    };
+
+    view! {
+        <Panel title="Invitations">
+            <p class="wf-note">
+                "An invitation creates an account without you ever holding its password or its \
+                 authenticator secret. Send the link to the person it is for; they set both \
+                 themselves. The link works once and expires."
+            </p>
+
+            <Suspense fallback=|| view! { <Empty message="Reading the invitations…" /> }>
+                {move || {
+                    Some(
+                        match invites.get()? {
+                            Ok(listing) if listing.invites.is_empty() => {
+                                view! { <Empty message="No invitations outstanding." /> }.into_any()
+                            }
+                            Ok(listing) => {
+                                let capacity = listing.capacity;
+                                let outstanding = listing.invites.len();
+                                view! {
+                                    <InviteTable
+                                        invites=listing.invites
+                                        on_revoke=Callback::new(move |username: String| {
+                                            pending
+                                                .set(
+                                                    Some(Pending {
+                                                        prompt: format!(
+                                                            "Revoke the invitation for {username}? The link stops working \
+                                                             immediately. If it was already started, revoking is the right \
+                                                             move — somebody has that account's authenticator secret.",
+                                                        ),
+                                                        verb: "Revoke",
+                                                        destructive: true,
+                                                        kind: username,
+                                                    }),
+                                                )
+                                        })
+                                    />
+                                    <p class="wf-note">
+                                        {format!(
+                                            "{outstanding} of {capacity} invitations outstanding.",
+                                        )}
+                                    </p>
+                                }
+                                    .into_any()
+                            }
+                            Err(e) => {
+                                view! {
+                                    <Empty message=format!(
+                                        "The invitations could not be read: {e}",
+                                    ) />
+                                }
+                                    .into_any()
+                            }
+                        },
+                    )
+                }}
+            </Suspense>
+
+            {move || {
+                minted
+                    .get()
+                    .map(|invite| {
+                        let username = invite.username.clone();
+                        view! {
+                            <div class="wf-note wf-note-strong">
+                                <p>
+                                    "Invited " <span class="wf-mono">{username}</span>
+                                    ". Send them this link now — it is not shown again, and it \
+                                     works once."
+                                </p>
+                                <CopyField
+                                    label="Registration link"
+                                    shown="••••••••"
+                                    value=registration_url(&invite.token)
+                                />
+                                <button class="wf-button" on:click=move |_| minted.set(None)>
+                                    "Done"
+                                </button>
+                            </div>
+                        }
+                    })
+            }}
+
+            <form class="wf-user-form" on:submit=submit>
+                <div class="wf-setting-row">
+                    <label class="wf-setting-label" for="wf-invite-user">
+                        "Invite"
+                    </label>
+                    <input
+                        id="wf-invite-user"
+                        class="wf-input"
+                        type="text"
+                        autocomplete="off"
+                        placeholder="user name"
+                        prop:value=move || name.get()
+                        on:input=move |ev| name.set(event_target_value(&ev))
+                    />
+                </div>
+                <label class="wf-check">
+                    <input
+                        type="checkbox"
+                        prop:checked=move || admin.get()
+                        on:change=move |ev| admin.set(event_target_checked(&ev))
+                    />
+                    "Administrator — may change anything, not only read it"
+                </label>
+                <button
+                    class="wf-button wf-button-primary"
+                    type="submit"
+                    disabled=move || busy.get()
+                >
+                    {move || if busy.get() { "Inviting…" } else { "Create invitation" }}
+                </button>
+            </form>
+
+            {confirmation(pending, confirm_revoke)}
+        </Panel>
+    }
+}
+
+/// The outstanding invitations.
+#[component]
+fn InviteTable(
+    /// The invitations as the authority reported them.
+    invites: Vec<InviteRow>,
+    /// Raise the confirmation for revoking the named invitation.
+    on_revoke: Callback<String>,
+) -> impl IntoView {
+    view! {
+        <div class="wf-table-scroll">
+            <table class="wf-table">
+                <thead>
+                    <tr>
+                        <th>"Account"</th>
+                        <th>"Access"</th>
+                        <th>"Expires"</th>
+                        <th>"Started"</th>
+                        // Unlabelled for a sighted reader, named for everyone
+                        // else — the same reason the account table's is.
+                        <th>
+                            <span class="wf-sr-only">"Actions"</span>
+                        </th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {invites
+                        .into_iter()
+                        .map(|invite| {
+                            let username = invite.username.clone();
+                            let started = invite.started_unix.is_some();
+                            view! {
+                                <tr>
+                                    <td class="wf-mono">{invite.username.clone()}</td>
+                                    <td>
+                                        {if invite.admin { "Administrator" } else { "Read-only" }}
+                                    </td>
+                                    <td>{format::timestamp(invite.expires_unix)}</td>
+                                    <td>
+                                        {
+                                            // Spelled out, not shown as a
+                                            // timestamp. This is the row an
+                                            // operator is scanning for, and the
+                                            // fact that somebody holds the
+                                            // account's second factor matters
+                                            // more than when they took it.
+                                            if started {
+                                                "Yes — someone has the secret"
+                                            } else {
+                                                "Not yet"
+                                            }
+                                        }
+                                    </td>
+                                    <td>
+                                        <button
+                                            class="wf-button wf-button-danger"
+                                            on:click=move |_| on_revoke.run(username.clone())
+                                        >
+                                            "Revoke"
+                                        </button>
+                                    </td>
+                                </tr>
+                            }
+                        })
+                        .collect_view()}
+                </tbody>
+            </table>
+        </div>
+    }
+}
+
+/// The registration URL for `token`, as it should be sent.
+///
+/// The token goes in the **fragment**, and that is the whole reason this is a
+/// function rather than string concatenation at the call site. A fragment is
+/// never transmitted to a server, so the token stays out of the dashboard's
+/// access logs and any reverse proxy's, is not sent in a `Referer` header, and
+/// is invisible to the link unfurlers that fetch any URL pasted into Slack,
+/// Signal or iMessage — that fetch is a plain `GET` running no wasm, and with
+/// the token in a query string it would reach the platform's logs instead.
+///
+/// Built from the browser's own origin, so a dashboard reached through a tunnel
+/// produces the name the recipient can actually open, rather than whatever the
+/// server thinks it is bound to.
+#[cfg(feature = "hydrate")]
+fn registration_url(token: &str) -> String {
+    let origin = web_sys::window()
+        .and_then(|w| w.location().origin().ok())
+        .unwrap_or_default();
+    format!("{origin}/register#{token}")
+}
+
+/// Server-rendered, there is no origin to read; the browser rebuilds this on
+/// hydration before anyone can click it.
+#[cfg(not(feature = "hydrate"))]
+fn registration_url(token: &str) -> String {
+    format!("/register#{token}")
 }

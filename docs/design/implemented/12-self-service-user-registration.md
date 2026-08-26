@@ -1,9 +1,9 @@
 # Design: self-service user registration by one-time invite
 
-**Status:** Proposed. **Implement after design 13** — completing a registration
-runs an Argon2id hash on the certificate authority, which today executes inside
-the router's `select!` arm; design 13 is what makes that safe on a CA that
-carries links.
+**Status:** Implemented (§11 records what landed and what did not). Built on
+design 13, which is what makes an Argon2id hash on a link-carrying certificate
+authority safe — completing a registration runs one, and before 13 it would have
+executed inside the router's `select!` arm.
 
 **Scope:** `libs/wayfinder-protos` (five request/response pairs — `.proto` *and*
 `service.rs`: the `WayfinderDataProvider` trait, the dispatch, the request-name
@@ -473,3 +473,74 @@ the next login (§3.4); a consumed token is unknown on replay; an expired invite
 and an expired handle are each refused; an unknown token is rejected without
 spending Argon2id (§4.4); creating an account by another path refuses a name
 that is invited (§4.1); a v5 snapshot migrates forward with an empty invite store.
+
+## 11. What landed, and what did not
+
+Implemented: §3 whole, §4 with two stated departures, §5, §6, and the `user
+invite` half of §9.
+
+The five open decisions in §9 were closed as follows.
+
+- **TTLs.** 24 h for an invitation, 15 min for a handle, as suggested. Both are
+  settable at mint (`invite_ttl_secs`; the handle's is not, see below).
+- **Redemption goes through the tunnel**, like sign-in. The caveat in §5.1
+  therefore stands in full: against `dash.wayfndr.dev` as deployed, "the first
+  party to see the secret" means the first party other than Cloudflare. This was
+  a deliberate choice and not an inherited one — the alternative is a
+  registration-only vhost on a DNS-only name with its own ACME certificate,
+  which is real infrastructure work and remains available.
+- **The registration page is routed but rendered outside the shell.** Not the
+  axum-served page §9 leaned to, and the reason is this crate's own constraint
+  rather than a change of mind: `generate_route_list` walks `App` once at
+  startup, so `<Routes>` has to stay unconditional or every tab 404s. So
+  `/register` is a `<Route>` whose *chrome* — header, tab bar, status strip, and
+  the sign-in overlay — is excluded on that path. The property §3.5 asked for is
+  the same one: a registrant does not get a dashboard's navigation, and is not
+  covered by a sign-in form gated on the state they are in.
+- **`wayfinderctl user invite` landed**, with `user invites` and
+  `user revoke-invite` beside it so an invitation minted offline can also be
+  seen and withdrawn offline.
+
+Two departures from §4, each recorded in the test that covers it.
+
+- **`RemoveUser` does not sweep a matching invitation** (§4.1's last sentence).
+  The reservation is bidirectional — a name that is an account cannot be
+  invited, and a name that is invited cannot become an account — so the state
+  the sweep would reconcile is unreachable, and the code would be untestable
+  insurance against it. `revoke_user_invite` is the tool for a pending
+  invitation; `remove_user` frees the name for a fresh one.
+- **Completion clamps an over-long session lifetime where mint refuses it**
+  (§4.6 says "re-clamps" and does not say the two differ). Deliberate: the
+  administrator can act on a refusal and is standing in front of it at mint,
+  while the registrant can act on nothing, and refusing them would burn their
+  invitation for a policy decision they had no part in. The reachable version of
+  that drift is `allow_unbounded_cert_ttl` being given back between mint and
+  redemption, which is what the test drives.
+
+Deferred, each with the reason:
+
+- **§7's observability, in the shape §7 asked for.** There is no
+  `pending_invites` gauge on `GetMetrics`. `TableOccupancy` is reported through
+  the *router* facet, and design 13's own §6 observability was deferred, so
+  there is still no precedent for a CA-sourced metric on that request and adding
+  one would mean forking `GetMetrics` across both facets. What landed instead is
+  the capacity beside the listing (`ListUserInvitesResponse::capacity`), which
+  is the same current-vs-cap signal delivered where an operator is already
+  looking — and on the facet that owns it. A real gauge should follow design
+  13's observability, not precede it.
+- **No `TableSaturation` alarm when the invitation store is full.** The cap
+  guards operator error rather than a remote party, and a full store already
+  refuses the next mint with a message naming the cap and the remedy. An alarm
+  is worth adding alongside the held-CSR one, which does not exist either.
+- **The handle TTL is not settable at mint.** §9 asked for both; only the
+  invitation's is. Fifteen minutes is a page, a QR code and a six-digit code,
+  and no deployment has yet wanted a different number — a request field nobody
+  sets is a field that gets set wrong once.
+- **No password reset and no TOTP re-enrolment**, as §2 already scoped out. Both
+  are natural follow-ups on the same record, and the invitation machinery is
+  most of what a re-enrolment would need.
+- **The registration page does not render a QR code**, only the `otpauth://`
+  URI with a copy button. Every authenticator app accepts a pasted setup link,
+  and a QR encoder is a dependency (and a wasm size cost) for a convenience.
+  Worth revisiting for phone-only users, who are the audience this whole flow is
+  for.

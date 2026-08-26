@@ -2093,6 +2093,7 @@ mod tests {
             own_key: Some([1u8; 32]), // un-enrolled ⇒ every other key is GrantedEnrollment
             anchor: None,
             revoked: Vec::new(),
+            own_mac: Mac([2, 0, 0, 0, 0, 1]),
             now_unix: 100,
         };
         let (mut client, server) = spawn_authenticated_server([2u8; 32], ctx);
@@ -2176,6 +2177,7 @@ mod tests {
             own_key: Some([1u8; 32]), // un-enrolled ⇒ every other key is GrantedEnrollment
             anchor: None,
             revoked: Vec::new(),
+            own_mac: Mac([2, 0, 0, 0, 0, 1]),
             now_unix: 100,
         };
         let (mut client, server) = spawn_authenticated_server([2u8; 32], ctx);
@@ -2268,6 +2270,7 @@ mod tests {
             own_key: Some([9u8; 32]), // not the client's key: only the cert can admit it
             anchor: Some(authority.trust_anchor()),
             revoked: Vec::new(),
+            own_mac: Mac([2, 0, 0, 0, 0, 1]),
             now_unix: 100,
         };
         let (mut client, server) = spawn_authenticated_server(admin_kp.ed_pubkey(), ctx);
