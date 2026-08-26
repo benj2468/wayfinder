@@ -1017,6 +1017,10 @@ message WayfinderRequest {
     // Finish redeeming an invite, creating the account (provider mode).  On the
     // enrollment tier, for the same reason.
     CompleteUserRegistrationRequest complete_user_registration = 36;
+
+    // End every session an account currently holds, leaving the account itself
+    // (provider mode).  Requires a full management grant.
+    RevokeUserSessionsRequest revoke_user_sessions = 37;
   }
 }
 
@@ -1620,9 +1624,15 @@ message CreateUserResponse {
 
 // Remove a user account (provider mode).
 //
-// Ends the account's ability to obtain *new* sessions.  A certificate already
-// issued to it is unaffected — that is what `RevokeNode` and expiry are for —
-// so removing a compromised account is two acts, not one.
+// Ends the account's ability to obtain new sessions **and revokes every session
+// certificate it currently holds**, as one durable act.  Cutting off a
+// compromised account is one request, not two: it used to leave every
+// certificate already issued working until it expired, which is up to the
+// account's whole session lifetime.
+//
+// The revocations flood the mesh, so this request is answered only once they
+// have been — or with an error naming what stopped them, which does not undo the
+// removal.  `RevokeUserSessionsRequest` is the same act without the deletion.
 //
 // Answered with the empty response on success.  The authority refuses to remove
 // the last account that can still administer the mesh: `CreateUserRequest` and
@@ -1634,6 +1644,35 @@ message RemoveUserRequest {
   // The account to remove.  A name that is not on file is an error rather than
   // a silent success: whoever sent it has a wrong idea about the roster.
   string username = 1;
+}
+
+// End every session certificate an account currently holds, leaving the account
+// itself in place (provider mode).  Requires a full management grant.
+//
+// The difference from `RemoveUserRequest` is the account.  This ends what the
+// account is *currently holding* and leaves it able to sign in again, which is
+// the control for a lost laptop where the person still works here.  Removing
+// does both: it revokes and then deletes.
+//
+// A revocation floods the mesh and is not undone by anything.  The account
+// simply signs in again for a fresh certificate; what it cannot do is keep using
+// the old one.
+message RevokeUserSessionsRequest {
+  // The account whose sessions to end.  A name that is not on file is an error
+  // rather than a silent success, for the same reason it is above.
+  string username = 1;
+}
+
+// Answer to a RevokeUserSessionsRequest.
+message RevokeUserSessionsResponse {
+  // How many session certificates were revoked.
+  //
+  // Zero is an ordinary success, not a failure to find the account: it is the
+  // answer for somebody who has not signed in, and for an account whose sessions
+  // were revoked already or have expired.  Reported because the operator asked a
+  // question whose answer is a number — "nothing was cut off" and "three devices
+  // were" call for different follow-up.
+  uint32 revoked = 1;
 }
 
 // Mint a one-time invite that lets the person an account is for register it
@@ -2076,5 +2115,8 @@ message WayfinderResponse {
     // Response to BeginUserRegistrationRequest.  (CompleteUserRegistration
     // answers with the Empty response above.)
     BeginUserRegistrationResponse begin_user_registration = 28;
+
+    // Response to RevokeUserSessionsRequest.
+    RevokeUserSessionsResponse revoke_user_sessions = 29;
   }
 }

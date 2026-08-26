@@ -75,7 +75,7 @@ const ARGON2_ITERATIONS: u32 = 3;
 const ARGON2_LANES: u32 = 1;
 
 /// RFC 6238 time step, in seconds: the window one TOTP code is valid for.
-const TOTP_STEP_SECS: u64 = 30;
+pub(crate) const TOTP_STEP_SECS: u64 = 30;
 
 /// How many steps either side of the current one a code is accepted from,
 /// absorbing clock skew between the client's authenticator and the CA.
@@ -138,6 +138,71 @@ pub(crate) const LOCKOUT_SECS: u64 = 900;
 /// field operator a shift, without either being a code change.
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 8 * 3600;
 
+/// How many bytes an [`AccountId`] carries.
+///
+/// 128 bits from the OS CSPRNG. The value is never presented to a person and
+/// never travels the wire, so nothing pulls it shorter for readability; what it
+/// has to be is unguessable-adjacent and, above all, non-colliding across every
+/// account a mesh ever holds, including the recycled names §3.1 of design 14 is
+/// about.
+const ACCOUNT_ID_LEN: usize = 16;
+
+/// The stable identity of one user account, minted once and never reused.
+///
+/// What links a session certificate back to the account whose sign-in produced
+/// it ([`crate::authority::CertAuthority::revoke_user_sessions`] follows it).
+/// Deliberately **not** the username: a name can be recycled, and a name-keyed
+/// link silently hands a new account the certificates of the deleted one that
+/// shared its name. An id cannot be recycled, so a session belongs to the
+/// account that actually minted it or to nothing at all.
+///
+/// The reference points from the certificate *to* the account and never the
+/// reverse — see design 14 §3.1. A list of certificates hanging off the account
+/// would be destroyed by the deletion that makes revoking them urgent.
+///
+/// Serialized into the CA state snapshot as part of [`UserRecord`], so its shape
+/// is part of the on-disk schema (see `persistence.rs`).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccountId([u8; ACCOUNT_ID_LEN]);
+
+impl AccountId {
+    /// Mint a fresh id from the OS CSPRNG.
+    ///
+    /// Also the `serde` default, which is what gives every account in a
+    /// pre-version-7 snapshot its *own* id on load rather than one shared
+    /// constant — two accounts sharing an id would make each one's revocation
+    /// cut the other.
+    pub fn generate() -> Self {
+        let mut bytes = [0u8; ACCOUNT_ID_LEN];
+        argon2::password_hash::rand_core::RngCore::fill_bytes(
+            &mut argon2::password_hash::rand_core::OsRng,
+            &mut bytes,
+        );
+        Self(bytes)
+    }
+
+    /// Rebuild an id from its stored bytes.
+    pub fn from_bytes(bytes: [u8; ACCOUNT_ID_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// The raw bytes, for stamping onto an issued-certificate record and for
+    /// comparing one against an account.
+    pub fn as_bytes(&self) -> &[u8; ACCOUNT_ID_LEN] {
+        &self.0
+    }
+
+    /// Whether `bytes` is this id, for matching a certificate record's
+    /// `account_id` (which is a `Vec<u8>`, empty for a device's certificate).
+    ///
+    /// A length mismatch is simply "not this account" rather than an error: the
+    /// empty id every pre-version-7 record carries is a legitimate value meaning
+    /// "attributed to nobody", and it reaches this comparison on every scan.
+    pub fn matches(&self, bytes: &[u8]) -> bool {
+        bytes == self.0
+    }
+}
+
 /// What an account's session certificates may do.
 ///
 /// Two roles, not a bitmask, because they are the two management tiers that
@@ -164,6 +229,15 @@ pub enum UserRole {
 /// re-hashes only on the next password change.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UserRecord {
+    /// This account's stable identity, minted at creation and never reused.
+    ///
+    /// What a session certificate is stamped with, so that revoking "this
+    /// person's access" is answerable — and stays answerable across a rename or
+    /// a recycled name, neither of which [`Self::username`] survives. Defaulted
+    /// by minting a fresh one, which is what gives each account in a
+    /// pre-version-7 snapshot its own.
+    #[serde(default = "AccountId::generate")]
+    pub id: AccountId,
     /// The account name, as presented at login. Compared verbatim.
     pub username: String,
     /// Argon2id PHC string (`$argon2id$v=19$m=...`), carrying its own
@@ -393,6 +467,7 @@ impl UserRecord {
     ) -> Result<Self, String> {
         check_password_present(password)?;
         Ok(Self {
+            id: AccountId::generate(),
             username: username.to_string(),
             password_hash: hash_password(password)?,
             totp_secret: Some(generate_totp_secret()),
@@ -428,6 +503,7 @@ impl UserRecord {
     ) -> Result<Self, String> {
         check_password_present(password)?;
         Ok(Self {
+            id: AccountId::generate(),
             username: username.to_string(),
             password_hash: hash_password(password)?,
             totp_secret: Some(totp_secret),

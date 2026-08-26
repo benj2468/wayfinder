@@ -1735,6 +1735,7 @@ mod tests {
             authority.revoke_node(&peer.0).expect("revoke");
             authority
                 .finish()
+                .pop()
                 .expect("a successful revoke signs a record for the router to flood")
         };
         router.ingest_revocation(&record, Duration::from_secs(0));

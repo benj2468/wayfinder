@@ -457,6 +457,20 @@ pub fn iface_label(iface_name: &str, iface_idx: u32) -> String {
     }
 }
 
+/// What a session revocation did, for the operator who asked for it.
+///
+/// Zero gets its own sentence rather than "revoked 0 sessions". It is an
+/// ordinary outcome — the account had not signed in, or its sessions were
+/// already revoked or expired — and phrasing it as a count reads as a failure
+/// that needs chasing.
+pub fn sessions_revoked(username: &str, revoked: u32) -> String {
+    match revoked {
+        0 => format!("{username} had no active sessions to revoke."),
+        1 => format!("Revoked 1 session for {username}."),
+        n => format!("Revoked {n} sessions for {username}."),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,5 +714,18 @@ mod tests {
     #[test]
     fn duration_secs_renders_zero() {
         assert_eq!(duration_secs(0), "0 seconds");
+    }
+
+    /// Nothing to revoke reads as an outcome, not as a count of zero — and one
+    /// session is singular, because an operator reading "1 sessions" starts
+    /// wondering what else the page got wrong.
+    #[test]
+    fn sessions_revoked_says_what_happened_at_every_count() {
+        assert_eq!(
+            sessions_revoked("ops", 0),
+            "ops had no active sessions to revoke."
+        );
+        assert_eq!(sessions_revoked("ops", 1), "Revoked 1 session for ops.");
+        assert_eq!(sessions_revoked("ops", 4), "Revoked 4 sessions for ops.");
     }
 }

@@ -149,6 +149,90 @@ pub fn Empty(
     view! { <p class="wf-empty">{message}</p> }
 }
 
+/// A `?` affordance that reveals a short explanation beside it.
+///
+/// For the control whose *name* cannot carry its meaning — where the operator's
+/// real question is not "what does this button do" but "how is it different
+/// from the one next to it". Revoke and Remove on the Accounts tab are exactly
+/// that pair, and getting them the wrong way round costs somebody their account.
+///
+/// # Why not `title=`
+///
+/// The native tooltip is what this would otherwise be, and it is unreachable for
+/// the people most likely to need it: `title` never appears for a keyboard user,
+/// never appears on touch, and is announced inconsistently by screen readers.
+/// An explanation that only arrives if you happen to hover a mouse is not an
+/// explanation of an irreversible control.
+///
+/// So this is a real `<button>` — focusable, operable by <kbd>Enter</kbd> and
+/// <kbd>Space</kbd> for free. It toggles on click rather than appearing on
+/// hover, so it cannot flicker away from a shaky pointer or a magnified
+/// viewport.
+///
+/// # Why the panel is a `popover`
+///
+/// It has to escape its container, and an absolutely-positioned panel does not.
+/// The first cut was one, and it was clipped: this widget's first home is the
+/// header of a table inside `.wf-table-scroll`, whose `overflow-x` establishes
+/// a clipping context, so with only a few accounts the explanation was cut off
+/// at the bottom of a short table.
+///
+/// The native `popover` attribute is the fix that needs no positioning code at
+/// all. The browser promotes the element to the **top layer** — above every
+/// stacking context, clipped by no ancestor's `overflow`, and contributing
+/// nothing to any container's size — which is exactly the set of properties an
+/// explanation panel needs and the one an `absolute`/`z-index` pair can only
+/// approximate.
+///
+/// `popovertarget` also makes the button its invoker, so the browser owns the
+/// open/close state, the light-dismiss on <kbd>Esc</kbd> or an outside click,
+/// and the invoker's expanded semantics. There is no signal here and no click
+/// handler, which is why there is nothing for hydration to get wrong.
+///
+/// Placement uses CSS anchor positioning, keyed to an anchor name derived from
+/// `id` so two hints on one page cannot collide. Where a browser does not
+/// support it the panel keeps the popover default — centred in the viewport —
+/// which is unanchored but never clipped and never unreadable.
+#[component]
+pub fn Hint(
+    /// Names what is being explained, for the button's accessible label —
+    /// "Revoke" yields "What does Revoke do?".
+    #[prop(into)]
+    label: String,
+    /// A DOM id unique on the page, naming the panel and deriving its anchor.
+    #[prop(into)]
+    id: String,
+    /// The explanation itself.
+    children: Children,
+) -> impl IntoView {
+    // Derived from `id` rather than fixed, so two hints on one page anchor to
+    // their own buttons. It goes in an inline style because a CSS custom ident
+    // cannot be read out of an attribute by a stylesheet.
+    let anchor = format!("--{id}");
+    view! {
+        <span class="wf-hint">
+            <button
+                type="button"
+                class="wf-hint-toggle"
+                aria-label=format!("What does {label} do?")
+                popovertarget=id.clone()
+                style=format!("anchor-name: {anchor}")
+            >
+                "?"
+            </button>
+            <span
+                class="wf-hint-panel"
+                id=id
+                popover="auto"
+                role="note"
+                style=format!("position-anchor: {anchor}")
+            >
+                {children()}
+            </span>
+        </span>
+    }
+}
+
 /// An action awaiting confirmation, held until the operator commits or cancels.
 ///
 /// Generic over what the action *is*, because the two tabs that raise one have

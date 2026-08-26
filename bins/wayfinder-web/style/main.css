@@ -833,6 +833,108 @@ body {
   outline-offset: 2px;
 }
 
+/* A row's controls, laid out so they neither wrap mid-word nor collapse into
+ * each other on a narrow viewport. */
+.wf-row-actions {
+  display: flex;
+  gap: var(--wf-space-2);
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------ hint -- */
+
+/* A `?` that reveals a short explanation beside it, for a control whose name
+ * cannot carry the distinction that matters — Revoke versus Remove.
+ *
+ * The panel is a native `popover`, so the browser renders it in the **top
+ * layer**: above every stacking context, clipped by no ancestor's `overflow`,
+ * and adding nothing to any container's height. That is not a refinement over
+ * `position: absolute` — it is the only thing that works here. This hint lives
+ * in the header of a table inside `.wf-table-scroll`, and an absolutely
+ * positioned panel is clipped by that scroll container, so with a short roster
+ * the explanation was cut off partway down. No z-index can fix that; escaping
+ * the container is the fix. */
+.wf-hint {
+  position: relative;
+  display: inline-flex;
+  vertical-align: middle;
+}
+
+.wf-hint-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.35em;
+  height: 1.35em;
+  padding: 0;
+  border: 1px solid var(--wf-border);
+  border-radius: 50%;
+  background: var(--wf-surface-raised);
+  color: var(--wf-text-muted);
+  font-family: inherit;
+  font-size: var(--wf-text-sm);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.wf-hint-toggle:hover,
+.wf-hint-toggle:has(+ .wf-hint-panel:popover-open) {
+  border-color: var(--wf-accent);
+  color: var(--wf-accent);
+}
+
+.wf-hint-toggle:focus-visible {
+  outline: 2px solid var(--wf-accent);
+  outline-offset: 2px;
+}
+
+/* `[popover]` is `display: none` until opened, so everything here describes the
+ * open state; the closed state needs no rule. The UA stylesheet also supplies
+ * `position: fixed`, `margin: auto` and `inset: 0` — which centres it in the
+ * viewport, and is what a browser without anchor positioning keeps. Unanchored,
+ * but readable and never clipped. */
+.wf-hint-panel {
+  width: max-content;
+  max-width: min(22rem, calc(100vw - 2 * var(--wf-space-4)));
+  padding: var(--wf-space-3);
+  border: 1px solid var(--wf-border);
+  border-radius: var(--wf-radius-sm);
+  background: var(--wf-surface-raised);
+  box-shadow: 0 4px 16px rgb(0 0 0 / 35%);
+  color: var(--wf-text);
+  font-size: var(--wf-text-sm);
+  line-height: 1.5;
+  text-align: left;
+  white-space: normal;
+  overflow: visible;
+}
+
+/* Anchored to the button that opened it, where the browser supports it. The
+ * anchor name itself is set inline by the component, derived from the hint's
+ * id, so two hints on one page do not collide.
+ *
+ * `position-try-fallbacks` is what keeps it on screen: this sits in the last
+ * column of a table, hard against the right edge, so the block-start/inline-end
+ * placement it asks for is exactly the one with no room. */
+@supports (anchor-name: --wf-hint) {
+  .wf-hint-panel:popover-open {
+    position: fixed;
+    margin: var(--wf-space-2) 0 0;
+    inset: auto;
+    top: anchor(bottom);
+    right: anchor(right);
+    position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+  }
+}
+
+.wf-hint-panel p {
+  margin: 0;
+}
+
+.wf-hint-panel p + p {
+  margin-top: var(--wf-space-2);
+}
+
 /* ----------------------------------------------------------------- stack -- */
 
 .wf-stack {

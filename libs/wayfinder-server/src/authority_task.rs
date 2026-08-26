@@ -269,15 +269,20 @@ pub struct AuthorityAdapter<'a> {
     /// authentication in that window — so a value read at the top of the
     /// request is exactly the value that must not be trusted here.
     facts: RouterFactsRx,
-    /// A revocation signed while serving this request, for the caller to hand
-    /// to the router loop.
+    /// The revocations signed while serving this request, for the caller to
+    /// hand to the router loop.
     ///
     /// Stashed rather than flooded here because the trait method is
-    /// synchronous and the router hop is not. The task takes it immediately
+    /// synchronous and the router hop is not. The task takes them immediately
     /// after the request returns, so the two stay adjacent (§4.3: the window
     /// between signing and flooding is one this design widens, and a crash
-    /// inside it leaves nothing to re-derive the record from).
-    signed_revocation: Option<RevocationRecord>,
+    /// inside it leaves nothing to re-derive the records from).
+    ///
+    /// A vector rather than the single slot this once held: `RemoveUser` and
+    /// `RevokeUserSessions` each end *every* session an account holds, and an
+    /// account holds one per sign-in inside its lifetime. See design 14 §3.3,
+    /// which also has the airtime that costs.
+    signed_revocations: Vec<RevocationRecord>,
 }
 
 impl<'a> AuthorityAdapter<'a> {
@@ -287,21 +292,69 @@ impl<'a> AuthorityAdapter<'a> {
         Self {
             ca,
             facts,
-            signed_revocation: None,
+            signed_revocations: Vec::new(),
         }
     }
 
-    /// Consume the adapter, yielding the revocation it signed, if any.
+    /// Refuse to sign unless the neighbouring router could actually flood the
+    /// result.
     ///
-    /// Consuming rather than a `take(&mut self)`: the record is already signed
-    /// and durably recorded, so dropping it would leave the node revoked in the
-    /// authority's own log and never announced to the mesh. Taking `self` means
-    /// a caller cannot keep using the adapter and forget it, and `must_use`
-    /// means it cannot discard the result silently.
-    #[must_use = "a signed revocation is already persisted; dropping it leaves the node \
-                  revoked in the authority's records but never announced to the mesh"]
-    pub fn finish(self) -> Option<RevocationRecord> {
-        self.signed_revocation
+    /// Checked at the instant of signing rather than when the request arrived —
+    /// see [`Self::facts`] — and before signing rather than after, because every
+    /// path here persists: a provider that signs a revocation it cannot flood
+    /// leaves the operator believing access ended when nothing was ever
+    /// announced, and refusing afterwards would not undo it.
+    fn can_flood(&self, act: &str) -> Result<(), String> {
+        if self.facts.borrow().auth_present {
+            return Ok(());
+        }
+        Err(alloc::format!(
+            "cannot {act}: this provider node has mesh authentication disabled, so the \
+             revocation cannot be flooded"
+        ))
+    }
+
+    /// Run a session-revoking act, gating it on the router's ability to flood
+    /// and keeping whatever it signed.
+    ///
+    /// The gate is applied **only when the act actually revokes something**, and
+    /// that ordering is why this is one helper rather than a check in each
+    /// caller. `RemoveUser` against an account with no live sessions signs
+    /// nothing, so on a node with mesh authentication disabled it must keep
+    /// working exactly as it does today; refusing it would be a regression
+    /// dressed as a safety check. Running the act first and rejecting after is
+    /// not an option either — every path here persists — so the account is asked
+    /// what it holds *before* anything is signed, and the gate applies to the
+    /// answer.
+    ///
+    /// See design 14 §5.2 and §5.3.
+    fn gated_session_revocation(
+        &mut self,
+        username: &str,
+        act: &str,
+        f: impl FnOnce(&mut CertAuthority, &str) -> Result<Vec<RevocationRecord>, String>,
+    ) -> Result<u32, String> {
+        if self.ca.has_live_sessions(username) {
+            self.can_flood(act)?;
+        }
+        let records = f(self.ca, username)?;
+        let count = records.len() as u32;
+        self.signed_revocations.extend(records);
+        Ok(count)
+    }
+
+    /// Consume the adapter, yielding the revocations it signed.
+    ///
+    /// Consuming rather than a `take(&mut self)`: the records are already signed
+    /// and durably recorded, so dropping them would leave certificates revoked
+    /// in the authority's own log and never announced to the mesh. Taking `self`
+    /// means a caller cannot keep using the adapter and forget them, and
+    /// `must_use` means it cannot discard the result silently.
+    #[must_use = "a signed revocation is already persisted; dropping it leaves the \
+                  certificate revoked in the authority's records but never announced to \
+                  the mesh"]
+    pub fn finish(self) -> Vec<RevocationRecord> {
+        self.signed_revocations
     }
 }
 
@@ -357,7 +410,17 @@ impl AuthorityDataProvider for AuthorityAdapter<'_> {
     }
 
     fn remove_user(&mut self, username: &str) -> Result<(), String> {
-        self.ca.remove_user(username)
+        // `MeshAuthority::remove_user`, named explicitly, and that is not
+        // stylistic. `CertAuthority` has an *inherent* `remove_user` — the
+        // offline tool's raw store operation — and an inherent method wins
+        // method resolution over a trait one, so `self.ca.remove_user(..)` here
+        // silently reached the raw version: no last-administrator guard, and now
+        // no revocation either. The guard was written, tested, and never on this
+        // path.
+        self.gated_session_revocation(username, "remove this account", |ca, name| {
+            MeshAuthority::remove_user(ca, name)
+        })
+        .map(|_| ())
     }
 
     fn create_user_invite(
@@ -440,25 +503,15 @@ impl AuthorityDataProvider for AuthorityAdapter<'_> {
     }
 
     fn revoke_node(&mut self, node_mac: &[u8]) -> Result<(), String> {
-        // Checked here, at the instant of signing, rather than at the
-        // connection task: `CertAuthority::revoke` persists, so a provider that
-        // signs a revocation it cannot flood leaves the operator believing a
-        // node was revoked when nothing was ever announced, and refusing
-        // afterwards would not undo it. Read live rather than from a value
-        // captured when the request arrived — see the field's doc.
-        if !self.facts.borrow().auth_present {
-            return Err(
-                "cannot revoke: this provider node has mesh authentication disabled, \
-                        so the revocation cannot be flooded"
-                    .to_string(),
-            );
-        }
-        debug_assert!(
-            self.signed_revocation.is_none(),
-            "one request signs at most one revocation; a second would clobber the first"
-        );
-        self.signed_revocation = Some(self.ca.revoke(node_mac)?);
+        self.can_flood("revoke")?;
+        self.signed_revocations.push(self.ca.revoke(node_mac)?);
         Ok(())
+    }
+
+    fn revoke_user_sessions(&mut self, username: &str) -> Result<u32, String> {
+        self.gated_session_revocation(username, "revoke this account's sessions", |ca, name| {
+            MeshAuthority::revoke_user_sessions(ca, name)
+        })
     }
 
     fn list_certs(&self) -> Result<Vec<IssuedCertData>, String> {
@@ -512,10 +565,7 @@ pub async fn serve_authority(mut ca: CertAuthority, ports: AuthorityPorts) {
                     serve_one_request(ca, request, facts.clone()).await;
                 ca = returned_ca;
 
-                let response = match signed {
-                    Some(record) => flood_revocation(&revocations, record, response).await,
-                    None => response,
-                };
+                let response = flood_revocations(&revocations, signed, response).await;
                 // The client hanging up between asking and being answered is
                 // ordinary, not an error: the work is already done and durable.
                 let _ = reply.send(response);
@@ -559,7 +609,7 @@ async fn serve_one_request(
     mut ca: CertAuthority,
     request: WayfinderRequest,
     facts: RouterFactsRx,
-) -> (CertAuthority, WayfinderResponse, Option<RevocationRecord>) {
+) -> (CertAuthority, WayfinderResponse, Vec<RevocationRecord>) {
     let handle = move || {
         let mut adapter = AuthorityAdapter::new(&mut ca, facts);
         let response = handle_authority(&mut adapter, request).unwrap_or_else(|returned| {
@@ -601,27 +651,51 @@ async fn serve_one_request(
     }
 }
 
-/// Hand a signed revocation to the router loop and fold its verdict into the
-/// response.
+/// Hand every signed revocation to the router loop and fold their verdicts into
+/// the response.
 ///
-/// The two are adjacent by construction — no other command is served in
-/// between — because a crash after signing and before flooding leaves, in
-/// general, nothing to re-derive the record from: `CertAuthority::revoke`
-/// persists only a `revoked` flag on a matching issued entry, never the signed
-/// record, and nothing reloads or re-floods revocations at startup.
-async fn flood_revocation(
+/// Signing and flooding are adjacent by construction — no other command is
+/// served in between — because a crash after signing and before flooding leaves,
+/// in general, nothing to re-derive the records from: the authority persists
+/// only a `revoked` flag on the matching issued entries, never the signed
+/// records, and nothing reloads or re-floods revocations at startup.
+///
+/// Every record is offered even after one fails, and the *first* failure is what
+/// the caller is told. Stopping at the first would leave the remaining sessions
+/// revoked in the authority's log and unannounced with nothing left to retry
+/// from, which is the state this whole path exists to avoid; and reporting the
+/// last failure would let a later, more ordinary one hide the first.
+///
+/// The router's verdict is awaited per record, so a large batch paces itself
+/// against the bounded channel rather than buffering — design 14 §3.3.
+async fn flood_revocations(
     revocations: &RevocationTx,
-    record: RevocationRecord,
+    records: Vec<RevocationRecord>,
     response: WayfinderResponse,
 ) -> WayfinderResponse {
+    let mut failure = None;
+    for record in records {
+        if let Err(reason) = flood_one(revocations, record).await {
+            failure.get_or_insert(reason);
+        }
+    }
+    match failure {
+        Some(reason) => signed_but_not_flooded(&reason),
+        None => response,
+    }
+}
+
+/// Offer one signed revocation to the router loop, reporting why it did not
+/// reach the mesh.
+async fn flood_one(revocations: &RevocationTx, record: RevocationRecord) -> Result<(), String> {
     let (tx, rx) = oneshot::channel();
     if revocations.send((record, tx)).await.is_err() {
-        return signed_but_not_flooded("the router is no longer accepting revocations");
+        return Err("the router is no longer accepting revocations".to_string());
     }
     match rx.await {
-        Ok(Ok(())) => response,
-        Ok(Err(message)) => signed_but_not_flooded(&message),
-        Err(_) => signed_but_not_flooded("the router did not report whether it was flooded"),
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(message)) => Err(message),
+        Err(_) => Err("the router did not report whether it was flooded".to_string()),
     }
 }
 
@@ -655,6 +729,7 @@ fn error_response(message: &str) -> WayfinderResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::users::UserRecord;
     use wayfinder_protos::service::CsrOutcome;
     use wayfinder_protos::wayfinder::v1alpha::SubmitCsrRequest;
     use wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request as ReqKind;
@@ -870,9 +945,40 @@ mod tests {
 
         assert!(err.contains("authentication disabled"), "got: {err}");
         assert!(
-            adapter.finish().is_none(),
+            adapter.finish().is_empty(),
             "nothing may be signed when it could never be flooded"
         );
+    }
+
+    /// Removing an account through the adapter reaches the *trait* method — the
+    /// one with the last-administrator guard and the session revocation — and
+    /// not `CertAuthority`'s inherent `remove_user` beside it.
+    ///
+    /// A regression test for a bug that was invisible for exactly the reason it
+    /// was dangerous. `CertAuthority` has both an inherent `remove_user` (the
+    /// offline tool's raw store operation, no guard and no revocation) and a
+    /// `MeshAuthority::remove_user` (which has both), and Rust resolves
+    /// `self.ca.remove_user(..)` to the inherent one. So the guard was written,
+    /// unit-tested against the trait directly, and never on the path a
+    /// dashboard's Remove button actually took.
+    ///
+    /// It asserts the guard rather than the revocation because the guard is the
+    /// half that was silently missing before design 14 existed; the two now
+    /// arrive together, so either one proves the right method was called.
+    #[test]
+    fn removing_an_account_through_the_adapter_applies_the_last_admin_guard() {
+        let mut ca = authority();
+        ca.set_now_unix(NOW_UNIX);
+        ca.add_user(UserRecord::new("ops", "hunter2", UserRole::Admin, 900).unwrap())
+            .unwrap();
+
+        let mut adapter = AuthorityAdapter::new(&mut ca, facts(true));
+        let err = AuthorityDataProvider::remove_user(&mut adapter, "ops")
+            .expect_err("the last administrator must not be removable over the API");
+
+        assert!(err.contains("administrator"), "got: {err}");
+        assert!(adapter.finish().is_empty(), "and nothing was signed");
+        assert_eq!(ca.list_users().len(), 1, "the account is still there");
     }
 
     /// A successful revocation leaves the router a record to flood — the other
@@ -885,8 +991,9 @@ mod tests {
         let mut adapter = AuthorityAdapter::new(&mut ca, facts(true));
         adapter.revoke_node(&mac(9)).expect("revoke succeeds");
 
-        assert!(
-            adapter.finish().is_some(),
+        assert_eq!(
+            adapter.finish().len(),
+            1,
             "the signed record must reach the router, or the revocation is recorded but silent"
         );
     }

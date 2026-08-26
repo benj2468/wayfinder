@@ -33,6 +33,7 @@ use zerocopy::IntoBytes;
 use crate::persistence::CaLog;
 use crate::persistence::TokenOverride;
 use crate::provider::MeshAuthority;
+use crate::users::AccountId;
 use crate::users::AuthOutcome;
 use crate::users::DEFAULT_SESSION_TTL_SECS;
 use crate::users::InviteStatus;
@@ -485,6 +486,10 @@ impl CertAuthority {
             user: false,
             admin: false,
             viewer: false,
+            // A device's certificate belongs to no account: nobody signed in
+            // to obtain it, so there is nothing for a per-account revocation
+            // to match it against.
+            account_id: Vec::new(),
         };
         (cert, record)
     }
@@ -506,6 +511,7 @@ impl CertAuthority {
         x: [u8; 32],
         ttl_secs: u64,
         role: UserRole,
+        account: AccountId,
     ) -> (MembershipCert, IssuedCertData) {
         let admin = role == UserRole::Admin;
         let not_before = self.now_unix;
@@ -522,6 +528,10 @@ impl CertAuthority {
             user: true,
             admin,
             viewer: !admin,
+            // The whole point of the record: without this the log knows a
+            // person's session exists and not whose, which makes "end this
+            // account's access" unanswerable.
+            account_id: account.as_bytes().to_vec(),
         };
         (cert, record)
     }
@@ -632,6 +642,169 @@ impl CertAuthority {
             return Err(alloc::format!("no such user: {username}"));
         }
         persisted
+    }
+
+    /// Revoke every session certificate `username` currently holds, signing one
+    /// [`RevocationRecord`] per certificate for the caller to flood.
+    ///
+    /// The control an administrator reaches for when somebody's laptop is lost
+    /// and they still work here: the account keeps its credentials and can sign
+    /// in again, but nothing it was already holding is honoured. That is the
+    /// whole difference from [`Self::remove_user_revoking_sessions`].
+    ///
+    /// The returned records are *already durably marked* revoked here and are
+    /// not yet announced to the mesh. A caller that drops them leaves the
+    /// authority believing something the mesh was never told — which is why the
+    /// adapter's `finish` is `#[must_use]`.
+    pub fn revoke_user_sessions(
+        &mut self,
+        username: &str,
+    ) -> Result<Vec<RevocationRecord>, String> {
+        let account = self.account_id_of(username)?;
+        let sessions = self.live_sessions_of(account);
+        self.revoke_sessions(username, &sessions, |log, revoked| {
+            let (_, persisted) = log.mutate_issued(|issued| mark_revoked(issued, revoked));
+            persisted
+        })
+    }
+
+    /// Delete `username` **and** revoke every session certificate it holds, as
+    /// one durable write.
+    ///
+    /// The raw [`Self::remove_user`] above ends the account's ability to obtain
+    /// *new* sessions and nothing more, which is what made deleting a
+    /// compromised account leave the compromise running. This is that act done
+    /// completely.
+    ///
+    /// Deletion and revocation share one [`crate::persistence::CaLog::
+    /// mutate_users_and_issued`] call rather than two, so they cannot durably
+    /// split: either the account is gone and its sessions are revoked, or
+    /// neither happened. The direction that matters is the first one — an
+    /// account deleted whose sessions came back un-revoked is this method's own
+    /// bug, reintroduced in the window where nobody would look for it.
+    ///
+    /// Carries no last-administrator guard: like [`Self::remove_user`], this is
+    /// the raw act, and [`MeshAuthority::remove_user`] is where the policy that
+    /// refuses to strand the mesh lives.
+    pub fn remove_user_revoking_sessions(
+        &mut self,
+        username: &str,
+    ) -> Result<Vec<RevocationRecord>, String> {
+        let account = self.account_id_of(username)?;
+        let sessions = self.live_sessions_of(account);
+        let name = username.to_string();
+        self.revoke_sessions(username, &sessions, move |log, revoked| {
+            let (_, persisted) = log.mutate_users_and_issued(|users, issued| {
+                users.retain(|u| u.username != name);
+                mark_revoked(issued, revoked);
+            });
+            persisted
+        })
+    }
+
+    /// Sign a revocation for each of `sessions`, apply `commit` to record them,
+    /// and return the signed records.
+    ///
+    /// The shared middle of the two paths above. Signing happens *before* the
+    /// commit and outside it, because signing is stateless local computation
+    /// with nothing to roll back — so a failed persist rolls the store back and
+    /// the records are dropped without ever having been announced, which is the
+    /// truthful outcome to report.
+    fn revoke_sessions(
+        &mut self,
+        username: &str,
+        sessions: &[(Mac, u64)],
+        commit: impl FnOnce(&mut CaLog, &[Mac]) -> Result<(), String>,
+    ) -> Result<Vec<RevocationRecord>, String> {
+        // Only when there is something to sign. An account with no live
+        // sessions is removable on a node whose clock was never set, exactly as
+        // it is today; what must not happen is signing a window that starts at
+        // the epoch and is already over.
+        if !sessions.is_empty() && self.now_unix == 0 {
+            return Err("authority clock not set; cannot sign revocations yet".to_string());
+        }
+        let records: Vec<RevocationRecord> = sessions
+            .iter()
+            // The certificate's *own* expiry, not this authority's
+            // `cert_ttl_secs`. A session's lifetime belongs to the account that
+            // holds it and may be longer than the authority's, in which case
+            // the conservative guess `Self::revoke` makes for a device would
+            // stop being enforced while the certificate it cancels still
+            // verified — a revocation with a hole at the end of it.
+            .map(|(mac, not_after)| self.authority.revoke(*mac, self.now_unix, *not_after))
+            .collect();
+        let macs: Vec<Mac> = sessions.iter().map(|(mac, _)| *mac).collect();
+        commit(&mut self.log, &macs)?;
+        // Logged even at zero: "revoked nothing" is the answer to a question an
+        // operator asked, and its absence reads as a failure.
+        tracing::info!(
+            %username,
+            count = records.len(),
+            "revoked an account's session certificates"
+        );
+        Ok(records)
+    }
+
+    /// Whether `username` holds at least one session certificate that revoking
+    /// would actually end.
+    ///
+    /// The question a caller asks *before* signing anything, so that a gate on
+    /// "can this node flood a revocation?" applies to acts that revoke and not
+    /// to acts that merely turn out to have nothing to revoke — see
+    /// `AuthorityAdapter::gated_session_revocation`. An unknown account holds
+    /// nothing, which lets the "no such user" error come from the act itself
+    /// rather than from a gate that would have masked it.
+    pub fn has_live_sessions(&self, username: &str) -> bool {
+        !self.live_session_macs(username).is_empty()
+    }
+
+    /// The MACs of the session certificates `username` currently holds.
+    ///
+    /// Public for the one caller that must *report* what it cannot revoke:
+    /// `wayfinderctl user remove` operates on the state file with no router
+    /// beside it, so it cannot flood a revocation, and naming the certificates
+    /// it is leaving live is the only remedy available offline — an operator
+    /// with these MACs can revoke them against a running provider afterwards.
+    /// Without them the sessions are unfindable, which is the orphan case
+    /// design 14 §3.1 is about.
+    pub fn live_session_macs(&self, username: &str) -> Vec<Mac> {
+        self.account_id_of(username)
+            .map(|account| {
+                self.live_sessions_of(account)
+                    .into_iter()
+                    .map(|(mac, _)| mac)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The stable id of `username`, or an error naming what is missing.
+    fn account_id_of(&self, username: &str) -> Result<AccountId, String> {
+        self.log
+            .users()
+            .iter()
+            .find(|u| u.username == username)
+            .map(|u| u.id)
+            .ok_or_else(|| alloc::format!("no such user: {username}"))
+    }
+
+    /// The MAC and expiry of every session certificate `account` currently
+    /// holds and that is worth revoking.
+    ///
+    /// Two exclusions, both deliberate. An **already-revoked** entry is skipped
+    /// because re-sending costs mesh airtime to say something the mesh already
+    /// believes — the same rule the dashboard's Members tab applies to a node
+    /// that is already revoked. An **expired** one is skipped because passive
+    /// expiry has already ended it, and a record enforcing a window that is
+    /// over ends nothing.
+    fn live_sessions_of(&self, account: AccountId) -> Vec<(Mac, u64)> {
+        self.log
+            .issued()
+            .iter()
+            .filter(|c| c.user && !c.revoked && c.not_after > self.now_unix)
+            .filter(|c| account.matches(&c.account_id))
+            .filter_map(|c| Some((Mac(c.node_mac.as_slice().try_into().ok()?), c.not_after)))
+            .collect()
     }
 
     /// Mint a one-time invitation for `username`, returning the token that
@@ -1168,6 +1341,19 @@ pub struct UserSummary {
     pub locked: bool,
 }
 
+/// Mark every issued entry whose MAC is in `macs` revoked.
+///
+/// A free function rather than a closure at each call site so the two paths
+/// that revoke sessions cannot drift: what "revoked" means to the store is one
+/// piece of code, run inside whichever `mutate_*` the caller needs.
+fn mark_revoked(issued: &mut [IssuedCertData], macs: &[Mac]) {
+    for entry in issued.iter_mut() {
+        if macs.iter().any(|m| m.0 == entry.node_mac.as_slice()) {
+            entry.revoked = true;
+        }
+    }
+}
+
 impl MeshAuthority for CertAuthority {
     fn trust_anchor_bytes(&self) -> Vec<u8> {
         self.authority.trust_anchor().to_bytes().to_vec()
@@ -1204,20 +1390,25 @@ impl MeshAuthority for CertAuthority {
             match users.iter_mut().find(|u| u.username == name) {
                 Some(user) => {
                     let outcome = user.authenticate(password, totp_code, now);
-                    (outcome, user.role, user.session_ttl_secs)
+                    (outcome, user.role, user.session_ttl_secs, user.id)
                 }
                 None => {
                     // Spend the work a real verification would have cost, or
                     // the response time answers the question the uniform
                     // rejection refuses to.
                     crate::users::spend_absent_user_work(password);
-                    (AuthOutcome::Rejected, UserRole::Viewer, 0)
+                    (
+                        AuthOutcome::Rejected,
+                        UserRole::Viewer,
+                        0,
+                        AccountId::generate(),
+                    )
                 }
             }
         });
         persisted?;
 
-        let (outcome, role, ttl_secs) = outcome;
+        let (outcome, role, ttl_secs, account) = outcome;
         if outcome == AuthOutcome::Rejected {
             // No reason, here or anywhere above this: wrong password, wrong
             // code, unknown account, locked and disabled are one answer.
@@ -1233,7 +1424,12 @@ impl MeshAuthority for CertAuthority {
         // `submit_csr`'s impersonation guard is about MACs a client *names*,
         // and this one is not named by anybody.
         let mac = wayfinder_auth::derive_mac(&ed);
-        let (cert, record) = self.sign_user_session(mac, ed, x, ttl_secs, role);
+        // The account id read above is durable by now: the `mutate_users` this
+        // path already performs persists the whole state, ids included, before
+        // the `mutate_issued` below records the certificate. That ordering is
+        // what keeps a session minted just after a version-6 migration
+        // attributable across the next restart — see design 14 §4.
+        let (cert, record) = self.sign_user_session(mac, ed, x, ttl_secs, role, account);
 
         let (_, persisted) = self.log.mutate_issued(|issued| {
             // Drop session records that have expired before adding this one.
@@ -1516,7 +1712,7 @@ impl MeshAuthority for CertAuthority {
         Ok(uri)
     }
 
-    fn remove_user(&mut self, username: &str) -> Result<(), String> {
+    fn remove_user(&mut self, username: &str) -> Result<Vec<RevocationRecord>, String> {
         // Counted before the removal rather than after, so the check reads as
         // the question being asked: would this leave the mesh with nobody who
         // can administer it? A disabled account is not an answer to that — it
@@ -1540,7 +1736,20 @@ impl MeshAuthority for CertAuthority {
                     .to_string(),
             );
         }
-        CertAuthority::remove_user(self, username)
+        // The guard is evaluated before anything is signed, so a refused
+        // removal has revoked nothing — the account it declined to delete keeps
+        // the sessions it holds.
+        //
+        // And it is `remove_user_revoking_sessions`, not the raw
+        // `CertAuthority::remove_user`: this is the path a dashboard's Remove
+        // button reaches, and an administrator pressing it because an account is
+        // compromised must not be handed an account that is gone and a
+        // compromise that is still running.
+        self.remove_user_revoking_sessions(username)
+    }
+
+    fn revoke_user_sessions(&mut self, username: &str) -> Result<Vec<RevocationRecord>, String> {
+        CertAuthority::revoke_user_sessions(self, username)
     }
 
     fn revoke(&mut self, node_mac: &[u8]) -> Result<RevocationRecord, String> {
@@ -1944,6 +2153,289 @@ mod tests {
     fn removing_an_unknown_account_is_refused() {
         let (mut ca, _) = ca_with_user(UserRole::Admin, 900);
         assert!(MeshAuthority::remove_user(&mut ca, "nobody").is_err());
+    }
+
+    /// The account id of `username`, read straight out of the store.
+    ///
+    /// Reaching in rather than through `list_users`: the id is deliberately not
+    /// on the wire (design 14 §3.1 keeps it a CA-side fact), so there is no
+    /// projection to read it from and a test that wants it has to go here.
+    fn account_id(ca: &CertAuthority, username: &str) -> AccountId {
+        ca.log
+            .users()
+            .iter()
+            .find(|u| u.username == username)
+            .unwrap_or_else(|| panic!("no account on file for {username}"))
+            .id
+    }
+
+    /// Sign `username` in with `seed`'s keypair, returning the MAC of the
+    /// session certificate it was issued.
+    ///
+    /// Each seed is a different session key, so each call mints a different MAC
+    /// — which is what makes "an account with several live sessions" expressible
+    /// at all.
+    fn sign_in(ca: &mut CertAuthority, username: &str, secret: &[u8], seed: u8) -> Vec<u8> {
+        let (ed, x) = node_keys(seed);
+        let code = live_code(secret, ca.now_unix);
+        match ca
+            .authenticate_user(username, "hunter2", &code, &ed, &x)
+            .expect("the login is serviceable")
+        {
+            UserAuthOutcome::Issued(data) => {
+                let cert = MembershipCert::from_bytes(&data.cert).expect("a parseable certificate");
+                cert.node_mac.to_vec()
+            }
+            UserAuthOutcome::Rejected => panic!("correct credentials were rejected"),
+        }
+    }
+
+    /// Advance the clock past one TOTP step, so the next sign-in presents a
+    /// different code.
+    ///
+    /// Two sign-ins by one account are separated in time in reality and have to
+    /// be here too: `authenticate` advances the replay guard past the step it
+    /// accepted, so the same code a moment later is refused. That is the guard
+    /// working, not an obstacle to route around.
+    fn next_totp_step(ca: &mut CertAuthority) {
+        ca.set_now_unix(ca.now_unix + crate::users::TOTP_STEP_SECS);
+    }
+
+    /// The issued-log entry for `mac`.
+    fn entry(ca: &CertAuthority, mac: &[u8]) -> IssuedCertData {
+        ca.list_certs()
+            .into_iter()
+            .find(|c| c.node_mac == mac)
+            .expect("the certificate is on file")
+    }
+
+    /// A session certificate records which account's sign-in produced it.
+    ///
+    /// The whole of what design 14 adds to the store, and the thing whose
+    /// absence made "revoke this person's access" unanswerable: the issued log
+    /// knew a user certificate existed and not whose it was.
+    #[test]
+    fn a_session_certificate_records_the_account_that_minted_it() {
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        let mac = sign_in(&mut ca, "ops", &secret, 2);
+
+        assert_eq!(
+            entry(&ca, &mac).account_id,
+            account_id(&ca, "ops").as_bytes().to_vec(),
+            "the session is attributed to the account that signed in"
+        );
+    }
+
+    /// A device's membership certificate is attributed to no account: it was
+    /// not minted by a sign-in, and an empty id is how that is said.
+    #[test]
+    fn a_device_certificate_names_no_account() {
+        let mut ca = open_ca();
+        let (ed, x) = node_keys(2);
+        issued_cert(&mut ca, &[0, 0, 0, 0, 0, 9], &ed, &x, "");
+
+        assert!(
+            entry(&ca, &[0, 0, 0, 0, 0, 9]).account_id.is_empty(),
+            "an enrolled device belongs to no user account"
+        );
+    }
+
+    /// Revoking an account's sessions ends *every* certificate it currently
+    /// holds — one signed record per session, and each entry marked.
+    ///
+    /// Two sessions rather than one on purpose: a person signs in from a laptop
+    /// and a phone, and a revocation that ended only the most recent would leave
+    /// the other one running while telling the operator access was cut.
+    #[test]
+    fn revoking_an_accounts_sessions_ends_every_live_one() {
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        let laptop = sign_in(&mut ca, "ops", &secret, 2);
+        next_totp_step(&mut ca);
+        let phone = sign_in(&mut ca, "ops", &secret, 3);
+        assert_ne!(laptop, phone, "each sign-in mints its own session MAC");
+
+        let records = ca.revoke_user_sessions("ops").expect("revoking succeeds");
+
+        assert_eq!(records.len(), 2, "one signed revocation per live session");
+        assert!(entry(&ca, &laptop).revoked);
+        assert!(entry(&ca, &phone).revoked);
+        assert_eq!(
+            ca.list_users().len(),
+            1,
+            "revoking sessions is not removing the account"
+        );
+    }
+
+    /// The signed records name the sessions, and verify against this CA's own
+    /// anchor — a revocation the mesh will not accept is one that ends nothing.
+    #[test]
+    fn the_signed_revocations_name_the_sessions_and_verify() {
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        let mac = sign_in(&mut ca, "ops", &secret, 2);
+
+        let records = ca.revoke_user_sessions("ops").expect("revoking succeeds");
+
+        let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
+        assert_eq!(records[0].node_mac.to_vec(), mac);
+        assert_eq!(
+            anchor
+                .verify_revocation(&records[0], ca.now_unix)
+                .expect("the mesh can act on what was signed")
+                .0
+                .to_vec(),
+            mac,
+        );
+    }
+
+    /// Revoking leaves the account able to sign in again, and the new session is
+    /// not born revoked.
+    ///
+    /// This is the whole difference from Remove, and the reason both controls
+    /// exist: the laptop is lost, the person still works here.
+    #[test]
+    fn revoking_sessions_leaves_the_account_able_to_sign_in_again() {
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        let lost = sign_in(&mut ca, "ops", &secret, 2);
+        ca.revoke_user_sessions("ops").expect("revoking succeeds");
+
+        next_totp_step(&mut ca);
+        let replacement = sign_in(&mut ca, "ops", &secret, 3);
+
+        assert!(entry(&ca, &lost).revoked, "the lost session stays revoked");
+        assert!(
+            !entry(&ca, &replacement).revoked,
+            "the new one is not born revoked"
+        );
+    }
+
+    /// Removing an account revokes its sessions in the same act.
+    ///
+    /// The gap design 14 exists to close: Remove was the only control a
+    /// dashboard offered for cutting somebody off, and it left every
+    /// certificate they held working until it expired.
+    #[test]
+    fn removing_an_account_revokes_its_sessions_and_deletes_it() {
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        ca.add_user(UserRecord::new("second", "hunter2", UserRole::Admin, 900).unwrap())
+            .unwrap();
+        let mac = sign_in(&mut ca, "ops", &secret, 2);
+
+        let records = MeshAuthority::remove_user(&mut ca, "ops").expect("removing succeeds");
+
+        assert_eq!(records.len(), 1, "the session was revoked on the way out");
+        assert!(entry(&ca, &mac).revoked);
+        assert!(
+            !ca.list_users().iter().any(|u| u.username == "ops"),
+            "and the account is gone"
+        );
+    }
+
+    /// The last-administrator guard runs before anything is signed: a refused
+    /// removal must not have revoked the sessions of the account it refused to
+    /// remove.
+    #[test]
+    fn a_refused_removal_revokes_nothing() {
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        let mac = sign_in(&mut ca, "ops", &secret, 2);
+
+        MeshAuthority::remove_user(&mut ca, "ops").expect_err("the last administrator stays");
+
+        assert!(
+            !entry(&ca, &mac).revoked,
+            "the session of an account that was not removed is untouched"
+        );
+    }
+
+    /// Revoking again signs nothing. Re-sending costs mesh airtime to say what
+    /// the mesh already believes — the same rule the Members tab applies to a
+    /// node that is already revoked.
+    #[test]
+    fn revoking_an_already_revoked_session_signs_nothing() {
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        sign_in(&mut ca, "ops", &secret, 2);
+        assert_eq!(ca.revoke_user_sessions("ops").unwrap().len(), 1);
+
+        assert!(
+            ca.revoke_user_sessions("ops").unwrap().is_empty(),
+            "the second revocation has nothing left to say"
+        );
+    }
+
+    /// An expired session is not revoked either: passive expiry already ended
+    /// it, and a revocation record would be enforcement for a window that is
+    /// over.
+    #[test]
+    fn an_expired_session_is_not_revoked() {
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        sign_in(&mut ca, "ops", &secret, 2);
+        ca.set_now_unix(100 + 901);
+
+        assert!(
+            ca.revoke_user_sessions("ops").unwrap().is_empty(),
+            "an expired certificate needs no revoking"
+        );
+    }
+
+    /// An account with no sessions is not an error — it is the ordinary answer
+    /// for somebody who has not signed in.
+    #[test]
+    fn revoking_an_account_with_no_sessions_succeeds_with_nothing() {
+        let (mut ca, _) = ca_with_user(UserRole::Admin, 900);
+        assert!(ca.revoke_user_sessions("ops").unwrap().is_empty());
+    }
+
+    /// An unknown name is an error rather than a silent success, for the same
+    /// reason removing one is: whoever sent it has a wrong idea about the
+    /// roster, and answering "revoked nothing" leaves them with it.
+    #[test]
+    fn revoking_an_unknown_accounts_sessions_is_refused() {
+        let (mut ca, _) = ca_with_user(UserRole::Admin, 900);
+        assert!(ca.revoke_user_sessions("nobody").is_err());
+    }
+
+    /// A recycled name does not inherit the previous account's sessions.
+    ///
+    /// The reason the link is an id and not a username. `CertAuthority::
+    /// remove_user` is the *raw* store operation the offline tool uses, which
+    /// does not revoke — so this is exactly the state a name-keyed link would
+    /// mis-attribute: a live certificate belonging to a deleted `ops`, and a
+    /// new `ops` standing in its place.
+    #[test]
+    fn a_recycled_username_does_not_inherit_the_previous_accounts_sessions() {
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        let stale = sign_in(&mut ca, "ops", &secret, 2);
+        ca.remove_user("ops")
+            .expect("the raw removal leaves it live");
+        ca.add_user(UserRecord::new("ops", "hunter2", UserRole::Admin, 900).unwrap())
+            .unwrap();
+
+        assert!(
+            ca.revoke_user_sessions("ops").unwrap().is_empty(),
+            "the new account holds none of the old one's sessions"
+        );
+        assert!(
+            !entry(&ca, &stale).revoked,
+            "and the orphan is not silently re-parented"
+        );
+    }
+
+    /// Two accounts' sessions do not revoke each other.
+    #[test]
+    fn revoking_one_account_leaves_anothers_sessions_alone() {
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        let other = UserRecord::new("second", "hunter2", UserRole::Admin, 900).unwrap();
+        let other_secret = other.totp_secret.clone().unwrap();
+        ca.add_user(other).unwrap();
+        let theirs = sign_in(&mut ca, "ops", &secret, 2);
+        let mine = sign_in(&mut ca, "second", &other_secret, 3);
+
+        ca.revoke_user_sessions("ops").expect("revoking succeeds");
+
+        assert!(entry(&ca, &theirs).revoked);
+        assert!(
+            !entry(&ca, &mine).revoked,
+            "a different account is untouched"
+        );
     }
 
     /// A login is refused before the clock is set, for the same reason a CSR
@@ -2755,6 +3247,57 @@ mod tests {
         assert_eq!(certs.len(), 1, "the issued cert survives the restart");
         assert_eq!(certs[0].node_mac, mac);
         assert!(certs[0].revoked, "the revocation survives the restart too");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A session signed after loading a snapshot from before account ids
+    /// existed is still attributed to its account after a restart.
+    ///
+    /// The one ordering property design 14 §4 leans on, tested end to end
+    /// rather than asserted in a comment. Ids minted during a migration live in
+    /// memory until something writes, so a certificate stamped with an id that
+    /// never reached disk would be orphaned by the next restart — silently, and
+    /// only discovered when a revocation found nothing to revoke. It cannot
+    /// happen because `authenticate_user` persists the user store (ids and all)
+    /// before it records the certificate, and this is what says so.
+    #[test]
+    fn a_session_signed_after_a_migration_survives_a_restart_attributed() {
+        let path = unique_state_path("pre-id-snapshot");
+
+        // Build a real v7 snapshot through the ordinary path, then age it back
+        // to v6 by hand. Hand-writing the v6 file directly would mean
+        // hand-writing an Argon2id hash and a TOTP secret to sign in against.
+        let secret = {
+            let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+            ca.set_now_unix(100);
+            let user = UserRecord::new("ops", "hunter2", UserRole::Admin, 900).unwrap();
+            let secret = user.totp_secret.clone().unwrap();
+            ca.add_user(user).unwrap();
+            secret
+        };
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        snapshot["version"] = serde_json::json!(6);
+        for user in snapshot["users"].as_array_mut().unwrap() {
+            user.as_object_mut().unwrap().remove("id");
+        }
+        std::fs::write(&path, snapshot.to_string()).unwrap();
+
+        // Load the aged snapshot — which mints an id — and sign in against it.
+        let mac = {
+            let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+            ca.set_now_unix(100);
+            sign_in(&mut ca, "ops", &secret, 2)
+        }; // Dropped here, simulating a process restart.
+
+        let ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+        assert_eq!(
+            entry(&ca, &mac).account_id,
+            account_id(&ca, "ops").as_bytes().to_vec(),
+            "the session is still attributed to the account that minted it, so \
+             it is still revocable",
+        );
 
         std::fs::remove_file(&path).ok();
     }
