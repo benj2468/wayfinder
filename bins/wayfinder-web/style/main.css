@@ -178,6 +178,71 @@ body {
   color: var(--wf-accent);
 }
 
+/* ----------------------------------------------------------------- scope -- */
+
+/* The switch between this node's two jobs. A pill rather than two more tabs,
+ * because it selects *which* tab bar is below it — the same relationship a
+ * segmented control has to the pane it governs, and one a third row of
+ * tab-looking links could not express.
+ *
+ * Drawn only for an administrator of a certificate-authority node, so on the
+ * overwhelming majority of deployments the header is exactly what it was. */
+.wf-scope {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--wf-border);
+  border-radius: 999px;
+  background: var(--wf-bg);
+}
+
+.wf-scope-item {
+  display: flex;
+  align-items: center;
+  gap: var(--wf-space-2);
+  padding: var(--wf-space-1) var(--wf-space-4);
+  border-radius: 999px;
+  color: var(--wf-text-muted);
+  font-size: var(--wf-text-sm);
+  font-weight: 500;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.wf-scope-item:hover {
+  color: var(--wf-text);
+}
+
+/* The raised surface is what says "selected" — the accent is spent on the
+ * active tab below, and two accents in a vertical line read as two competing
+ * claims about where you are. */
+.wf-scope-item[aria-current="page"] {
+  background: var(--wf-surface-raised);
+  color: var(--wf-text);
+  box-shadow: var(--wf-shadow);
+}
+
+/* Except here: being *in* the provider scope is worth naming, because every
+ * control below it acts on other nodes rather than on this one. */
+.wf-scope-provider[aria-current="page"] {
+  color: var(--wf-accent);
+}
+
+/* Nodes waiting to be admitted, carried on the switch so an administrator
+ * working in the router scope still learns of them — see `ScopeSwitch`. Warn
+ * rather than accent: it is a thing waiting on a person, not a place to be. */
+.wf-scope-count {
+  min-width: 1.25rem;
+  padding: 0 var(--wf-space-1);
+  border-radius: 999px;
+  background: var(--wf-warn);
+  color: var(--wf-bg);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  line-height: 1.25rem;
+  text-align: center;
+}
+
 .wf-header-node {
   color: var(--wf-text-muted);
   font-size: var(--wf-text-sm);

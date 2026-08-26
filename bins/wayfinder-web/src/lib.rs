@@ -74,6 +74,7 @@ use leptos_router::components::A;
 use leptos_router::components::Route;
 use leptos_router::components::Router;
 use leptos_router::components::Routes;
+use leptos_router::hooks::use_location;
 
 use crate::components::alarms::AlarmStrip;
 use crate::components::dashboard::Dashboard;
@@ -85,7 +86,11 @@ use crate::components::logo::Logo;
 use crate::components::logs::Logs;
 use crate::components::metrics::Metrics;
 use crate::components::overview::Overview;
-use crate::components::provider::Provider;
+use crate::components::provider::accounts::Accounts;
+use crate::components::provider::enrollment::Enrollment;
+use crate::components::provider::members::Members;
+use crate::components::provider::requests::Requests;
+use crate::components::provider::vpn::Vpn;
 use crate::components::routing::Routing;
 use crate::components::security::Security;
 use crate::session::Viewer;
@@ -117,58 +122,184 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
     }
 }
 
-/// One entry in the dashboard's top-level navigation: its route path and the
-/// label shown in the tab bar.
+/// One of the dashboard's two top-level views.
 ///
-/// Mirrors `wayfinder_tui::app::Tab` for the seven views the two dashboards
-/// share, in the same order, so they stay comparable when reading one against
-/// the other. "Provider" is the one this dashboard has and the TUI does not:
-/// it is a page of forms — accounts, an enrollment policy — rather than a view
-/// of the mesh, and the TUI's Security tab already carries the parts of it that
-/// are worth watching.
+/// A node can be doing two jobs at once, and they are not the same job. Almost
+/// every node only routes: it carries frames, keeps a routing table, and an
+/// operator watches the seven views in [`ROUTER_TABS`] to see whether the mesh
+/// is working. A handful of nodes are *also* the mesh's certificate authority,
+/// and that job is about other nodes — who is admitted, who is ejected, and who
+/// holds an account that decides either.
+///
+/// Those two used to share one tab bar, which put "is this link any good?" and
+/// "admit this node to the mesh" at the same rank and one click apart. They are
+/// separated here because they have different audiences: the router scope is
+/// generally available, and the provider scope is an administrator's, whole and
+/// entire (see [`Viewer::can_view`]).
+///
+/// The scope of the page is not held in a signal. It is read back off the URL
+/// by [`Scope::of_path`], so a copied link, a bookmark and the back button all
+/// land in the scope they were taken from — which a signal could not do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scope {
+    /// The node as a router: what it can reach, over which links, how well.
+    Router,
+    /// The node as the mesh's certificate authority: who may join, who has been
+    /// ejected, and the accounts that decide.
+    Provider,
+}
+
+impl Scope {
+    /// The first path segment every provider route sits under.
+    ///
+    /// One prefix is the whole basis of [`Scope::of_path`]; a provider route
+    /// parked outside it would render its panels under the router's tab bar.
+    pub const PROVIDER_PREFIX: &'static str = "provider";
+
+    /// The label the scope switch draws.
+    #[must_use]
+    pub const fn title(self) -> &'static str {
+        match self {
+            Scope::Router => "Router",
+            Scope::Provider => "Provider",
+        }
+    }
+
+    /// Where the scope switch sends a viewer entering this scope: its first
+    /// tab.
+    #[must_use]
+    pub const fn home(self) -> &'static str {
+        match self {
+            Scope::Router => "/",
+            Scope::Provider => "/provider",
+        }
+    }
+
+    /// This scope's tabs, in display order.
+    #[must_use]
+    pub const fn tabs(self) -> &'static [TabDef] {
+        match self {
+            Scope::Router => &ROUTER_TABS,
+            Scope::Provider => &PROVIDER_TABS,
+        }
+    }
+
+    /// Which scope a pathname belongs to.
+    ///
+    /// Matched on the first path segment rather than with `starts_with`, which
+    /// would put `/providers` — or any later route that merely begins with the
+    /// word — into the administrator's scope and silently swap the tab bar for
+    /// one nobody may use. Anything unrecognised is the router scope, which is
+    /// the safe direction to be wrong in: the 404 view then renders under the
+    /// generally-available tab bar rather than an administrator's.
+    #[must_use]
+    pub fn of_path(pathname: &str) -> Self {
+        match pathname.trim_start_matches('/').split('/').next() {
+            Some(Self::PROVIDER_PREFIX) => Scope::Provider,
+            _ => Scope::Router,
+        }
+    }
+}
+
+/// One entry in a scope's tab bar: its route path, its label, and the scope it
+/// belongs to.
+///
+/// [`ROUTER_TABS`] mirrors `wayfinder_tui::app::Tab`, in the same order, so the
+/// two dashboards stay comparable when reading one against the other. The TUI
+/// has no equivalent of [`PROVIDER_TABS`]: those are pages of forms rather than
+/// views of the mesh, and the TUI's Security tab already carries the parts of
+/// them worth watching.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TabDef {
     /// Route path, relative to the site root. `""` is the index route.
     pub path: &'static str,
     /// Label shown in the tab bar.
     pub title: &'static str,
+    /// Which scope's tab bar this appears in, and — through
+    /// [`Viewer::can_view`] — who may see it at all.
+    ///
+    /// Held on the tab rather than derived from its path, so the capability
+    /// check is one `match` on two variants instead of an arm per route. A tab
+    /// declared without a scope does not compile; one that forgot to ask for a
+    /// capability check would simply be readable by everyone.
+    pub scope: Scope,
 }
 
-/// The dashboard's tabs, in display order.
-pub const TABS: [TabDef; 8] = [
+/// The router scope's tabs, in display order. Generally available.
+pub const ROUTER_TABS: [TabDef; 7] = [
     TabDef {
         path: "",
         title: "Overview",
+        scope: Scope::Router,
     },
     TabDef {
         path: "routing",
         title: "Routing",
+        scope: Scope::Router,
     },
     TabDef {
         path: "link-quality",
         title: "Link Quality",
+        scope: Scope::Router,
     },
     TabDef {
         path: "links",
         title: "Links",
+        scope: Scope::Router,
     },
     TabDef {
         path: "metrics",
         title: "Metrics",
+        scope: Scope::Router,
     },
     TabDef {
         path: "security",
         title: "Security",
-    },
-    TabDef {
-        path: "provider",
-        title: "Provider",
+        scope: Scope::Router,
     },
     TabDef {
         path: "logs",
         title: "Logs",
+        scope: Scope::Router,
     },
 ];
+
+/// The provider scope's tabs, in display order. Administrators only.
+///
+/// Ordered by how often an operator has a reason to be there: the queue of
+/// nodes waiting on a decision leads, and the accounts that make those
+/// decisions — changed perhaps twice in the life of a mesh — come last.
+pub const PROVIDER_TABS: [TabDef; 5] = [
+    TabDef {
+        path: Scope::PROVIDER_PREFIX,
+        title: "Requests",
+        scope: Scope::Provider,
+    },
+    TabDef {
+        path: "provider/members",
+        title: "Members",
+        scope: Scope::Provider,
+    },
+    TabDef {
+        path: "provider/enrollment",
+        title: "Enrollment",
+        scope: Scope::Provider,
+    },
+    TabDef {
+        path: "provider/accounts",
+        title: "Accounts",
+        scope: Scope::Provider,
+    },
+    TabDef {
+        path: VPN_TAB_PATH,
+        title: "VPN",
+        scope: Scope::Provider,
+    },
+];
+
+/// The VPN tab's route, named so the tab bar can drop it on a provider that
+/// coordinates no tunnel without matching on a title.
+const VPN_TAB_PATH: &str = "provider/vpn";
 
 /// The application root: who is looking, and therefore what they get.
 ///
@@ -229,8 +360,30 @@ pub fn App() -> impl IntoView {
                             <Route path=StaticSegment("links") view=Links />
                             <Route path=StaticSegment("metrics") view=Metrics />
                             <Route path=StaticSegment("security") view=Security />
-                            <Route path=StaticSegment("provider") view=Provider />
                             <Route path=StaticSegment("logs") view=Logs />
+                            // The provider scope. Flat routes under a shared
+                            // first segment rather than a nested `<Routes>`:
+                            // the two scopes share the whole chrome above and
+                            // differ only in which tabs the one bar draws, so
+                            // there is no nested outlet for a nested router to
+                            // render into.
+                            <Route path=StaticSegment("provider") view=Requests />
+                            <Route
+                                path=(StaticSegment("provider"), StaticSegment("members"))
+                                view=Members
+                            />
+                            <Route
+                                path=(StaticSegment("provider"), StaticSegment("enrollment"))
+                                view=Enrollment
+                            />
+                            <Route
+                                path=(StaticSegment("provider"), StaticSegment("accounts"))
+                                view=Accounts
+                            />
+                            <Route
+                                path=(StaticSegment("provider"), StaticSegment("vpn"))
+                                view=Vpn
+                            />
                         </Routes>
                     </main>
                 </div>
@@ -265,6 +418,7 @@ fn Header(
                 <Logo />
                 "Wayfinder"
             </span>
+            <ScopeSwitch dash=dash />
             <span class="wf-header-node wf-mono">{move || dash.label.get()}</span>
             <AlarmStrip dash=dash />
             <ViewerStrip />
@@ -285,6 +439,112 @@ fn Header(
                 }}
             </span>
         </header>
+    }
+}
+
+/// The switch between the two scopes, drawn only for someone both of them
+/// apply to.
+///
+/// Two conditions, and each removes it for a different reason. A node that
+/// reports no enrollment policy is not a certificate authority, so the provider
+/// scope is about a job it does not have — the overwhelming majority of nodes.
+/// A viewer who may not administer is refused every call those tabs make, so
+/// the scope is about a job that is not theirs. Either way the switch is absent
+/// entirely, and the dashboard is the seven router views it always was: a
+/// control that is drawn and then leads to a refusal is the same broken promise
+/// as a button that fails when pressed.
+///
+/// # Why the count is here
+///
+/// Putting the provider scope behind a switch makes it less discoverable, and
+/// the one thing in it that is genuinely time-sensitive is a node waiting to be
+/// let in — which nobody would think to go and look for. The count rides the
+/// switch so an administrator working in the router scope still learns of it,
+/// which is the discoverability the old flat tab bar had for free.
+///
+/// The `<Suspense>` is not decoration: reading the viewer resource outside one
+/// in `hydrate` mode is the hydration hazard [`App`] describes, which in this
+/// crate is a wasm panic rather than a cosmetic reflow. Inside one, the
+/// *blocking* resource is already resolved by the time the browser has the
+/// page, so the first paint carries the right switch and hydration agrees.
+#[component]
+fn ScopeSwitch(
+    /// Shared dashboard state.
+    dash: Dashboard,
+) -> impl IntoView {
+    let viewer = use_context::<ViewerResource>();
+    let location = use_location();
+    let scope = Memo::new(move |_| Scope::of_path(&location.pathname.get()));
+
+    // Whether the node issues certificates at all — the same fact the provider
+    // tabs gate themselves on, read from the same field of the same poll.
+    let is_authority = Memo::new(move |_| {
+        dash.snapshot
+            .with(|s| s.as_ref().and_then(|s| s.security.as_ref()?.enrollment))
+            .is_some()
+    });
+    let waiting = Memo::new(move |_| {
+        dash.snapshot.with(|s| {
+            s.as_ref()
+                .and_then(|s| s.pending_csrs.as_ref())
+                .map_or(0, |csrs| csrs.pending.len())
+        })
+    });
+
+    view! {
+        <Suspense>
+            {move || {
+                let may_administer = viewer
+                    .and_then(|viewer| viewer.get())
+                    .and_then(Result::ok)
+                    .is_some_and(|viewer| viewer.can_administer());
+                if !may_administer || !is_authority.get() {
+                    return None;
+                }
+                Some(
+                    view! {
+                        <nav class="wf-scope" aria-label="Which of this node's two jobs to look at">
+                            {[Scope::Router, Scope::Provider]
+                                .into_iter()
+                                .map(|target| {
+                                    let current = move || scope.get() == target;
+                                    view! {
+                                        // A plain anchor, not an `<A>`: the
+                                        // link is current for a whole scope
+                                        // rather than for the one route it
+                                        // points at, which is not what `<A>`'s
+                                        // own `aria-current` means. The router
+                                        // still intercepts the click, so this
+                                        // navigates client-side either way.
+                                        <a
+                                            class="wf-scope-item"
+                                            class:wf-scope-provider=target == Scope::Provider
+                                            href=target.home()
+                                            aria-current=move || current().then_some("page")
+                                        >
+                                            {target.title()}
+                                            {move || {
+                                                (target == Scope::Provider && waiting.get() > 0)
+                                                    .then(|| {
+                                                        view! {
+                                                            <span
+                                                                class="wf-scope-count"
+                                                                title="Nodes waiting to be admitted"
+                                                            >
+                                                                {waiting.get()}
+                                                            </span>
+                                                        }
+                                                    })
+                                            }}
+                                        </a>
+                                    }
+                                })
+                                .collect_view()}
+                        </nav>
+                    },
+                )
+            }}
+        </Suspense>
     }
 }
 
@@ -416,46 +676,50 @@ fn StatusStrip(
     }
 }
 
-/// The top-level navigation. Each tab is a real link to a real route, so the
-/// browser's back button and a copied URL both work — two things a terminal
-/// dashboard cannot offer, and the first thing a non-technical user reaches for.
+/// The current scope's tab bar. Each tab is a real link to a real route, so
+/// the browser's back button and a copied URL both work — two things a terminal
+/// dashboard cannot offer, and the first thing a non-technical user reaches
+/// for.
 ///
-/// A tab is drawn only if the node has the thing behind it *and* the viewer may
-/// look at it: the provider tab needs an enrolled node, and — through
-/// [`Viewer::can_view`] — an administrator to look at it. A tab that is drawn
-/// and then answers "forbidden" is the same broken promise a mutating button
-/// the viewer cannot press would be.
+/// Which tabs those are follows the URL, through [`Scope::of_path`], rather
+/// than a signal the switch writes. A signal would be one more thing that can
+/// disagree with the address bar, and it would disagree exactly when someone
+/// arrived by a pasted link.
 ///
-/// The `<Suspense>` is not decoration. Asking what the viewer may see means
-/// reading the session resource, and reading a resource outside a `<Suspense>`
-/// in `hydrate` mode is the hydration hazard [`App`] describes — which in this
-/// crate is a wasm panic, not a cosmetic reflow. Inside one, the *blocking*
-/// resource is already resolved and serialized by the time the browser gets the
-/// page, so the first paint carries the right tabs and hydration agrees with it.
+/// A tab is still drawn only if the viewer may look at it. That is now one
+/// question about the scope rather than one per path
+/// ([`Viewer::can_view`]), and it stays here as well as on the switch because
+/// a URL can be pasted: the switch is the discoverable way in, not the only
+/// one.
+///
+/// The `<Suspense>` is not decoration — see [`ScopeSwitch`] for why reading the
+/// viewer resource outside one is a wasm panic in this crate.
 #[component]
 fn TabBar(viewer: ViewerResource, dash: Dashboard) -> impl IntoView {
-    let security = move || {
-        dash.snapshot
-            .with(|s| s.as_ref().and_then(|s| s.security.clone()))
-    };
+    let location = use_location();
+    let scope = Memo::new(move |_| Scope::of_path(&location.pathname.get()));
 
-    let enrollment = Memo::new(move |_| security().and_then(|s| s.enrollment));
+    // Absent on a provider that coordinates no tunnel, which is every
+    // deployment reaching the mesh over radio alone. `vpn_peers` is `None` for
+    // that and for a node that is not a provider at all; both mean there is no
+    // tunnel to administer, and neither is an empty list of peers.
+    let has_tunnel = Memo::new(move |_| {
+        dash.snapshot
+            .with(|s| s.as_ref().is_some_and(|s| s.vpn_peers.is_some()))
+    });
 
     view! {
         <nav class="wf-tabs">
             <Suspense>
                 {move || {
                     let current_viewer = viewer.get();
-                    let enrollment = enrollment.get();
+                    let has_tunnel = has_tunnel.get();
 
-                    TABS
+                    scope
+                        .get()
+                        .tabs()
                         .iter()
-                        .filter(|tab| {
-                            match tab.path {
-                                "provider" => enrollment.is_some(),
-                                _ => true,
-                            }
-                        })
+                        .filter(|tab| tab.path != VPN_TAB_PATH || has_tunnel)
                         .filter(|tab| {
                             current_viewer
                                 .as_ref()
@@ -465,7 +729,12 @@ fn TabBar(viewer: ViewerResource, dash: Dashboard) -> impl IntoView {
                         })
                         .map(|tab| {
                             view! {
-                                <A href=format!("/{}", tab.path) attr:class="wf-tab">
+                                // `exact`, because the provider scope has a
+                                // two-segment route under a one-segment one:
+                                // without it `/provider` reads as current on
+                                // every tab beneath it and two tabs light up
+                                // at once.
+                                <A href=format!("/{}", tab.path) attr:class="wf-tab" exact=true>
                                     {tab.title}
                                 </A>
                             }
@@ -563,4 +832,109 @@ fn report_panic() {
     ));
 
     let _ = body.insert_before(&banner, body.first_child().as_ref());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every tab knows which scope it is in, and the two tables agree with it.
+    ///
+    /// The tables are what the tab bar draws and what [`Viewer::can_view`]
+    /// judges, and they are consulted separately. A provider tab that had
+    /// wandered into the router table would be drawn for everyone *and* pass
+    /// the capability check, because both of those read the field rather than
+    /// the table it came from.
+    #[test]
+    fn each_table_holds_only_its_own_scope() {
+        for tab in &ROUTER_TABS {
+            assert_eq!(tab.scope, Scope::Router, "{} is a router tab", tab.title);
+        }
+        for tab in &PROVIDER_TABS {
+            assert_eq!(
+                tab.scope,
+                Scope::Provider,
+                "{} is a provider tab",
+                tab.title
+            );
+        }
+    }
+
+    /// Provider tabs live under one prefix, which is the whole basis of
+    /// [`Scope::of_path`].
+    ///
+    /// The scope of the page being viewed is read back off the URL rather than
+    /// held in a signal — a copied link has to land in the right scope, and a
+    /// signal cannot be in the URL. A provider route parked outside the prefix
+    /// would render its panels under the router's tab bar.
+    #[test]
+    fn every_provider_route_lives_under_the_provider_prefix() {
+        for tab in &PROVIDER_TABS {
+            assert!(
+                tab.path == Scope::PROVIDER_PREFIX
+                    || tab
+                        .path
+                        .starts_with(&format!("{}/", Scope::PROVIDER_PREFIX)),
+                "{} is at {:?}, outside the prefix",
+                tab.title,
+                tab.path
+            );
+        }
+    }
+
+    /// No two tabs claim the same route.
+    ///
+    /// Two `<Route>`s on one path resolve to whichever leptos matched first,
+    /// so the loser is a tab in the bar that navigates to somebody else's page
+    /// — with a 200 and no error anywhere.
+    #[test]
+    fn no_two_tabs_share_a_route() {
+        let mut seen = Vec::new();
+        for tab in ROUTER_TABS.iter().chain(PROVIDER_TABS.iter()) {
+            assert!(!seen.contains(&tab.path), "{:?} is claimed twice", tab.path);
+            seen.push(tab.path);
+        }
+    }
+
+    /// Each tab's own route resolves back to the scope it declares.
+    ///
+    /// The round trip is the property that matters: the tab bar picks its tabs
+    /// by [`Scope::of_path`] on the current URL, so a tab whose path resolves
+    /// elsewhere is one that removes its own tab bar the moment it is clicked.
+    #[test]
+    fn a_tab_route_resolves_to_the_scope_it_declares() {
+        for tab in ROUTER_TABS.iter().chain(PROVIDER_TABS.iter()) {
+            assert_eq!(
+                Scope::of_path(&format!("/{}", tab.path)),
+                tab.scope,
+                "{} at {:?}",
+                tab.title,
+                tab.path
+            );
+        }
+    }
+
+    /// The router scope is what an unrecognised path falls back to.
+    ///
+    /// The fallback direction is the safe one: an unknown path renders the 404
+    /// view under the generally-available tab bar. Falling back to the provider
+    /// scope would draw an administrator's tab bar around it.
+    #[test]
+    fn an_unknown_path_is_in_the_router_scope() {
+        assert_eq!(Scope::of_path("/"), Scope::Router);
+        assert_eq!(Scope::of_path("/nothing-here"), Scope::Router);
+    }
+
+    /// The prefix matches at a segment boundary, not as a string prefix.
+    ///
+    /// `starts_with("/provider")` would put `/providers` — or any future route
+    /// that merely begins with the word — into the administrator's scope, and
+    /// the failure is a tab bar that silently swaps for one nobody may use.
+    #[test]
+    fn a_path_that_merely_begins_with_provider_is_not_in_that_scope() {
+        assert_eq!(Scope::of_path("/providers"), Scope::Router);
+        assert_eq!(Scope::of_path("/provider-notes"), Scope::Router);
+        assert_eq!(Scope::of_path("/provider"), Scope::Provider);
+        assert_eq!(Scope::of_path("/provider/members"), Scope::Provider);
+    }
 }

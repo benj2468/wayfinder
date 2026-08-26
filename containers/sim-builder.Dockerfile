@@ -36,13 +36,41 @@ RUN apt-get update \
         protobuf-compiler \
         pkg-config \
         libdbus-1-dev \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 ENV PROTOC=/usr/bin/protoc
 
 # Compile-time, not runtime: `leptos` reads this through `std::option_env!`, so
 # it is baked in when the leptos crate itself compiles. Unset, the dashboard
 # asks the browser for `<name>_bg.wasm` while cargo-leptos emits `<name>.wasm`,
-# and the page renders but never hydrates. See bins/wayfinder-web/CLAUDE.md.
+# and the page renders but never hydrates. `cargo leptos` sets it for its own
+# builds; this belt-and-braces copy covers a plain `cargo build` of the crate in
+# here. See bins/wayfinder-web/CLAUDE.md.
 ENV LEPTOS_OUTPUT_NAME=wayfinder-web
+
+# The dashboard is built by `cargo leptos` in here, not by a plain `cargo
+# build`, and that is not a convenience: cargo-leptos compiles BOTH halves with
+# `RUSTFLAGS=--cfg erase_components`, which changes the markup the `view!` macro
+# emits. A server binary built without it serves HTML the hydration bundle
+# cannot adopt, and the browser panics on the mismatch instead of the dashboard
+# going live. See bins/wayfinder-web/CLAUDE.md — the whole reason this image
+# carries a wasm toolchain at all.
+RUN rustup target add wasm32-unknown-unknown
+
+# cargo-binstall pulls prebuilt binaries instead of compiling cargo-leptos from
+# source, the same trick containers/Dockerfile and containers/testenv.Dockerfile
+# use.
+#
+# wasm-bindgen-cli is deliberately NOT installed alongside it: cargo-leptos
+# reads the `wasm-bindgen` version out of Cargo.lock and fetches exactly that
+# CLI (it refuses to run on a mismatch), so leaving it to do so keeps this file
+# out of the version-pin triple that bins/wayfinder-web/CLAUDE.md tracks. It
+# fetches its own wasm-opt from Binaryen the same way. Those downloads land in
+# `/root/.cache`, which `just sim-binaries` mounts as a named volume so they
+# happen once rather than once per run.
+RUN curl -L --proto '=https' --tlsv1.2 -sSf \
+    https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
+    | bash \
+    && cargo binstall -y cargo-leptos
 
 WORKDIR /workspace

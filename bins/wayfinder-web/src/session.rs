@@ -56,6 +56,7 @@
 //! [`SessionStore::export`] is what produces one, and it hands out only the
 //! credential belonging to the session asking for it.
 
+use crate::Scope;
 use crate::TabDef;
 use serde::Deserialize;
 use serde::Serialize;
@@ -132,14 +133,33 @@ impl Viewer {
         }
     }
 
-    /// Whether this viewer has permission to view a specific Tab
+    /// Whether this viewer may see a tab at all.
     ///
-    /// Tabs will be hidden from the tab bar if the viewer does not have permission to view them.
+    /// A tab the viewer fails this on is left out of the tab bar, and the page
+    /// behind it says who it is for rather than rendering empty — the node
+    /// refuses every call the provider tabs make, so "nothing here" and "not
+    /// yours to see" would otherwise look identical.
+    ///
+    /// Judged on [`TabDef::scope`] rather than on the path, so this is one
+    /// question about two scopes instead of one arm per route. That matters
+    /// more than it looks: an arm-per-route check fails *open* when someone
+    /// adds a tab and forgets the arm, and the failure is a page of the mesh's
+    /// certificate authority readable by every account that can log in.
     #[must_use]
     pub fn can_view(&self, tab: &TabDef) -> bool {
-        match tab.path {
-            "provider" => self.can_administer(),
-            _ => true,
+        self.can_view_scope(tab.scope)
+    }
+
+    /// Whether this viewer may see a whole scope.
+    ///
+    /// What the header's scope switch is drawn from, and what
+    /// [`Viewer::can_view`] delegates to — the switch and the tab bar must
+    /// answer the same question, and there is one place that answers it.
+    #[must_use]
+    pub fn can_view_scope(&self, scope: Scope) -> bool {
+        match scope {
+            Scope::Router => true,
+            Scope::Provider => self.can_administer(),
         }
     }
 }
@@ -844,5 +864,55 @@ mod tests {
         assert!(!Viewer::LoggedOut.can_administer());
         // Static mode is the operator's own process credential; see the method.
         assert!(Viewer::Static.can_administer());
+    }
+
+    /// The provider scope is an administrator's, whole and entire; the router
+    /// scope is everyone's.
+    ///
+    /// Asserted over the real tables rather than over a hand-written path, so a
+    /// tab added to either one is covered the day it is added. That is the
+    /// point of hanging the judgement on [`Scope`] instead of on the path
+    /// string: a new provider tab inherits the capability check, where a new
+    /// arm of a `match tab.path` would have to remember to ask for it and would
+    /// be readable by everyone until someone noticed.
+    #[test]
+    fn a_read_only_viewer_sees_the_router_scope_and_none_of_the_provider_one() {
+        let viewer = Viewer::LoggedIn(SessionInfo {
+            username: "watcher".to_string(),
+            capability: "read-only".to_string(),
+            admin: false,
+            expires_unix: 1_800_000_000,
+        });
+
+        for tab in &crate::ROUTER_TABS {
+            assert!(viewer.can_view(tab), "{} is generally available", tab.title);
+        }
+        for tab in &crate::PROVIDER_TABS {
+            assert!(
+                !viewer.can_view(tab),
+                "{} is the certificate authority's",
+                tab.title
+            );
+        }
+    }
+
+    /// An administrator sees both scopes, and so does the static credential.
+    ///
+    /// The other half of the assertion above: what is being tested there is the
+    /// capability, not the provider tabs having quietly gone away for everyone.
+    #[test]
+    fn an_administrator_sees_both_scopes() {
+        let admin = Viewer::LoggedIn(SessionInfo {
+            username: "ops".to_string(),
+            capability: "administrator".to_string(),
+            admin: true,
+            expires_unix: 1_800_000_000,
+        });
+
+        for viewer in [admin, Viewer::Static] {
+            for tab in crate::ROUTER_TABS.iter().chain(crate::PROVIDER_TABS.iter()) {
+                assert!(viewer.can_view(tab), "{} is visible", tab.title);
+            }
+        }
     }
 }

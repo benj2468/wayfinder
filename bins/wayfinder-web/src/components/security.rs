@@ -6,22 +6,20 @@
 //! could not be established. Showing the rows without the header would make the
 //! two indistinguishable.
 //!
-//! # The confirmation is the point
+//! # This tab reports on the mesh; it does not govern it
 //!
-//! Approving a request admits a node to the mesh. Revoking one floods a
-//! revocation that every node acts on, and re-approving does not undo it. In a
-//! terminal these sit behind a keystroke an operator had to know; in a browser
-//! they are buttons anyone can reach, so each states what it is about to do,
-//! names the node, and waits.
+//! The node roster here says who this node can verify, and stops there. Who is
+//! admitted and who is ejected are decisions the mesh's certificate authority
+//! makes about *other* nodes' membership, and they live in the provider scope
+//! ([`crate::components::provider`]) — including the revocation that used to be
+//! a column in the table below.
 //!
-//! The same reasoning governs the settings below them, but not uniformly —
-//! confirmation is spent where an action is hard to walk back, not on every
-//! control. Turning the fail-closed gate on can take this node off the mesh
-//! mid-session; switching lazy cert distribution is a flag-day change no
-//! un-upgraded peer survives; clearing the enrollment token opens the mesh to
-//! anyone who can reach it. Those three ask. Tightening enrollment, or setting
-//! a token, does not: making the mesh harder to join is trivially reversible,
-//! and a dialog in front of every switch trains an operator to dismiss them.
+//! What is left that changes anything is about this node alone: its two posture
+//! switches, and the panel that asks another mesh to take it. Both are behind a
+//! confirmation, because either can take the node off the mesh mid-session and
+//! a flag-day change is one no un-upgraded peer survives. What is *not* behind
+//! one matters as much: a dialog in front of every switch trains an operator to
+//! dismiss them.
 //!
 //! # What persists
 //!
@@ -37,7 +35,6 @@ use leptos::prelude::*;
 use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
 
 use crate::api::request_enrollment;
-use crate::api::revoke_node;
 use crate::api::set_lazy_cert_distribution;
 use crate::api::set_require_auth;
 use crate::components::dashboard::use_dashboard;
@@ -80,13 +77,12 @@ fn membership_of(sec: &GetSecurityStatusResponse) -> (bool, u32) {
 /// another node at all, and a settings change that had to name one would be
 /// carrying a field it has no meaning for.
 ///
-/// What is *not* here is what moved to the Provider tab — approving and denying
-/// requests to join, and clearing the enrollment token. Those are decisions
-/// about who else gets in; these are about this node.
+/// What is *not* here is everything that decides another node's membership —
+/// approving and denying requests to join, clearing the enrollment token, and
+/// revoking a node. Those live in the provider scope; these are about this
+/// node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SecurityAction {
-    /// Eject the node with this MAC from the mesh.
-    Revoke(Vec<u8>),
     /// Switch the fail-closed gate on or off.
     RequireAuth(bool),
     /// Switch lazy cert distribution on or off.
@@ -163,12 +159,6 @@ pub fn Security() -> impl IntoView {
         dash.snapshot
             .with(|s| s.as_ref().and_then(|s| s.security.clone()))
     };
-    let csrs = move || {
-        dash.snapshot
-            .with(|s| s.as_ref().and_then(|s| s.pending_csrs.clone()))
-            .map(|p| p.pending)
-    };
-
     // The two panels below own operator input — a provider address, a token, a
     // certificate lifetime — so neither may be rebuilt by a poll. A plain
     // closure over the snapshot would construct a fresh component every second
@@ -186,14 +176,12 @@ pub fn Security() -> impl IntoView {
             return;
         }
         let verb = match &kind {
-            SecurityAction::Revoke(_) => "Revoking",
             SecurityAction::RequireAuth(_) => "Changing the fail-closed gate",
             SecurityAction::LazyCertDistribution(_) => "Changing certificate distribution",
             SecurityAction::Join(_) => unreachable!("joining is dispatched above"),
         };
         leptos::task::spawn_local(async move {
             let result = match kind {
-                SecurityAction::Revoke(mac) => revoke_node(mac).await,
                 SecurityAction::RequireAuth(require) => set_require_auth(require).await,
                 SecurityAction::LazyCertDistribution(enabled) => {
                     set_lazy_cert_distribution(enabled).await
@@ -345,10 +333,6 @@ pub fn Security() -> impl IntoView {
                     if sec.nodes.is_empty() {
                         return view! { <Empty message="No other nodes known yet." /> }.into_any();
                     }
-                    // The column exists on a provider, which is the node that
-                    // can actually act on a revocation — and only for a viewer
-                    // who may ask for one.
-                    let can_revoke = csrs().is_some() && dash.admin.get();
                     view! {
                         <div class="wf-table-scroll">
                             <table class="wf-table">
@@ -357,7 +341,6 @@ pub fn Security() -> impl IntoView {
                                         <th>"Node"</th>
                                         <th>"Identity"</th>
                                         <th>"Certificate expires"</th>
-                                        {can_revoke.then(|| view! { <th></th> })}
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -366,7 +349,6 @@ pub fn Security() -> impl IntoView {
                                         .clone()
                                         .into_iter()
                                         .map(|n| {
-                                            let mac = n.node_id.clone();
                                             // Ordered by severity: revocation is a
                                             // statement about the node, verification
                                             // only about what we could establish.
@@ -382,45 +364,11 @@ pub fn Security() -> impl IntoView {
                                             } else {
                                                 "—".to_string()
                                             };
-                                            let revoke_mac = mac.clone();
                                             view! {
                                                 <tr>
-                                                    <td class="wf-mono">{format::id(&mac)}</td>
+                                                    <td class="wf-mono">{format::id(&n.node_id)}</td>
                                                     <td class=class>{state}</td>
                                                     <td class="wf-mono">{expiry}</td>
-                                                    {can_revoke
-                                                        .then(|| {
-                                                            view! {
-                                                                <td class="wf-num">
-                                                                    {(!n.revoked)
-                                                                        .then(|| {
-                                                                            view! {
-                                                                                <button
-                                                                                    class="wf-button wf-button-danger"
-                                                                                    on:click=move |_| {
-                                                                                        set_pending
-                                                                                            .set(
-                                                                                                Some(Pending {
-                                                                                                    prompt: format!(
-                                                                                                        "Revoke {}? Every node in the mesh will drop its traffic. \
-                                                                                                         This floods across the mesh and cannot be undone by \
-                                                                                                         re-approving it.",
-                                                                                                        format::id(&revoke_mac),
-                                                                                                    ),
-                                                                                                    verb: "Revoke",
-                                                                                                    destructive: true,
-                                                                                                    kind: SecurityAction::Revoke(revoke_mac.clone()),
-                                                                                                }),
-                                                                                            )
-                                                                                    }
-                                                                                >
-                                                                                    "Revoke"
-                                                                                </button>
-                                                                            }
-                                                                        })}
-                                                                </td>
-                                                            }
-                                                        })}
                                                 </tr>
                                             }
                                         })
