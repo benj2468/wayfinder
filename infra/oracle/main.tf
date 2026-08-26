@@ -137,20 +137,26 @@ resource "oci_core_security_list" "ca" {
     }
   }
 
-  # A mesh link *on this node* would need UDP too. Still commented: the CA
-  # coordinates the tunnel other nodes' links run over and carries no link of
-  # its own, so there is nothing here to hear peers with yet. Left in place so
-  # that day is a one-line change with the port already agreed.
+  # This box's own `tailscaled`, now that the CA carries a mesh link of its own
+  # (`nix/machines/wayfinder-ca/common.nix`). Opening it is what lets a spoke
+  # hole-punch a direct WireGuard path to this node instead of relaying — and
+  # relaying here means through the DERP server running on this same box, so
+  # every mesh frame between two spokes would cross it twice.
   #
-  # ingress_security_rules {
-  #   protocol    = "17" # UDP
-  #   source      = "0.0.0.0/0"
-  #   description = "Wayfinder mesh link (design 08)"
-  #   udp_options {
-  #     min = 41641
-  #     max = 41641
-  #   }
-  # }
+  # Note what is deliberately *not* opened: the mesh link's own UDP port. It
+  # binds 0.0.0.0 but is reached only inside the tunnel, where `tailscale0` is
+  # a trusted interface in the host firewall. A rule for it here would put the
+  # mesh on the public address, which is the one thing this arrangement exists
+  # to avoid.
+  ingress_security_rules {
+    protocol    = "17" # UDP
+    source      = "0.0.0.0/0"
+    description = "Tailscale direct connections (design 08)"
+    udp_options {
+      min = 41641
+      max = 41641
+    }
+  }
 }
 
 resource "oci_core_subnet" "ca" {

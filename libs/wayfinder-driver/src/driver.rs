@@ -740,16 +740,22 @@ fn build_auth_snapshot(router: &CentralRouter, identity_seed: Option<[u8; 32]>) 
             "auth snapshot requested with no identity seed configured; the self-key tier is unavailable on this node"
         );
     }
+    // The node's own mesh address, whether or not it is enrolled: it is what a
+    // self-key management connection's VPN credential is minted for, and the
+    // transport has no other trustworthy source for it.
+    let own_mac = router.self_ident();
     match router.auth() {
         Some(auth) => AuthSnapshot {
             own_key,
             anchor: Some(*auth.anchor()),
             revoked: auth.revoked_macs().collect(),
+            own_mac,
         },
         None => AuthSnapshot {
             own_key,
             anchor: None,
             revoked: Vec::new(),
+            own_mac,
         },
     }
 }
@@ -997,6 +1003,23 @@ mod tests {
         );
         assert_eq!(snapshot.anchor, None);
         assert!(snapshot.revoked.is_empty());
+    }
+
+    /// The node's own mesh address travels with the snapshot, because the
+    /// transport needs it and cannot ask the router directly.
+    ///
+    /// It is the identity a self-key connection's VPN credential is minted for
+    /// (`libs/wayfinder-server/src/transport.rs`). Taken from the router
+    /// rather than from the certificate on the connection: the self-key tier
+    /// is granted before any certificate is verified, so a MAC read off one
+    /// there would be a value the client chose.
+    #[test]
+    fn build_auth_snapshot_reports_the_routers_own_mac() {
+        let router = CentralRouter::new(mac(1));
+
+        let snapshot = build_auth_snapshot(&router, Some([3u8; 32]));
+
+        assert_eq!(snapshot.own_mac, mac(1));
     }
 
     /// No identity seed configured at all reports no own key, rather than a

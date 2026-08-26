@@ -3,9 +3,14 @@
 This provisions the one box in a Wayfinder deployment that has a stable public
 address: a `wayfinder-tap` node in **provider (certificate authority) mode**,
 holding the mesh root of trust and serving enrollment over the management API.
-It carries **no mesh links and no local egress** — see
+It carries **no local egress** — see
 [`docs/design/implemented/11-cloud-auth-provider.md`](../../docs/design/implemented/11-cloud-auth-provider.md)
 for why, and for why Cloudflare and GCP were evaluated and set aside.
+
+It does carry one mesh link, over the Tailscale tunnel it coordinates: see
+[The VPN control plane](#the-vpn-control-plane) below. That makes it a routing
+participant as well as an authority, so a revocation has somewhere to be
+flooded and two spokes with no direct path can converge through it.
 
 Two halves, deliberately kept apart:
 
@@ -120,8 +125,10 @@ stops a man-in-the-middle impersonating your CA.
 The CA's own certificate is issued for a year while the certificates it hands
 out live a week (`certTtlSecs`). That asymmetry is intended — the CA's identity
 is what the fleet pins and should be stable, while member certificates expire
-often *because* passive expiry is this design's primary revocation mechanism,
-and this node has no mesh links to flood an active revocation over.
+often *because* passive expiry is the only revocation mechanism that reaches
+*every* member. The CA's mesh link means a node that is up and on the tunnel
+learns of a revocation in seconds; a node that is offline when it goes out
+still only finds out by ageing out, which is what the week bounds.
 
 ## 2. Provision the instance
 
@@ -181,11 +188,28 @@ missing seed rather than coming up as a CA with no root of trust.
 
 ```bash
 cd ca-secrets
-ssh root@<public_ip> 'install -d -m 0700 -o wayfinder -g wayfinder /var/lib/wayfinder-secrets'
-scp root.seed identity.seed node.cert trust-anchor root@<public_ip>:/var/lib/wayfinder-secrets/
-ssh root@<public_ip> 'chown wayfinder:wayfinder /var/lib/wayfinder-secrets/*; chmod 0400 /var/lib/wayfinder-secrets/*'
+files='root.seed identity.seed node.cert trust-anchor'
+ssh root@<public_ip> 'install -d -m 0700 -o wayfinder -g wayfinder /var/lib/wayfinder'
+scp $files root@<public_ip>:/var/lib/wayfinder/
+# One by one, never `/var/lib/wayfinder/*` — see the warning below.
+ssh root@<public_ip> "cd /var/lib/wayfinder && chown wayfinder:wayfinder $files && chmod 0400 $files"
 ssh root@<public_ip> 'systemctl restart wayfinder && systemctl status wayfinder'
 ```
+
+`./scripts/wayfinder-ca.sh secrets` is this same sequence, made repeatable, and
+it also carries `cloudflared.json` when the deployment has a dashboard tunnel.
+
+They go in `/var/lib/wayfinder`, beside the state the node writes, because
+`wayfinder-ctl` defaults `--identity` to `/var/lib/wayfinder/identity.seed` and
+the CA is the box you type the most commands on. The node still cannot rewrite
+its own root of trust: `nix/machines/wayfinder-ca/common.nix` re-mounts these
+four files read-only inside the unit's namespace, which is what a separate
+directory used to buy.
+
+> **Never `chmod 0400 /var/lib/wayfinder/*`.** That directory also holds
+> `ca-state.json`, `settings.json` and `node.mac`, which the node writes. A
+> glob takes them with it and leaves a certificate authority that cannot record
+> what it issues.
 
 These four files are the one thing this deployment does *not* manage
 declaratively. `sops-nix` or `agenix` is the natural next step; until then they
@@ -247,11 +271,38 @@ invisible to it. `./scripts/wayfinder-ca.sh dashboard` does the same thing.
 The CA also runs Headscale, which is what lets two CGNAT'd nodes reach each
 other's mesh UDP link at all — see
 `docs/design/implemented/08-internet-links-headscale-vpn.md`. Nothing extra is
-provisioned for it: `tofu apply` opens TCP/443 and UDP/3478 and creates the
-`vpn` DNS record, and both secrets it needs are made on the box — the API key
-the CA mints tunnel credentials with (`wayfinder-headscale-apikey.service`, at
-first boot, renewed a month before it expires) and the TLS certificate, which
-Headscale obtains from Let's Encrypt itself.
+provisioned for it: `tofu apply` opens TCP/443, UDP/3478 and UDP/41641 and
+creates the `vpn` DNS record, and both secrets it needs are made on the box —
+the API key the CA mints tunnel credentials with
+(`wayfinder-headscale-apikey.service`, at first boot, renewed a month before it
+expires) and the TLS certificate, which Headscale obtains from Let's Encrypt
+itself.
+
+**The CA is on that tunnel too.** `wayfinder-headscale-selfjoin.service` mints
+a preauth key against the local Headscale at first boot and spends it, so this
+box holds a `100.64.0.0/10` address like any other node — which is what its own
+`UdpMulti` mesh link is reached on, and what every spoke's `discovery_addr`
+points at. It registers under the Headscale user named after its own MAC, the
+same convention an enrolled node's credential is scoped to, so `wayfinderctl
+vpn list` names this peer like the rest.
+
+It cannot use the `vpn enrollment` RPC every other node uses: that credential is
+scoped to a *device* identity and a node connecting to itself with its own key
+is refused by design. It does not need to — the coordination server is on the
+same box.
+
+`UDP/41641` is `tailscaled`'s own port, so a spoke can hole-punch a direct
+WireGuard path here. The mesh link's port is *not* opened: it binds `0.0.0.0`
+but only `tailscale0` is a trusted interface, so the link is reachable inside
+the tunnel and nowhere else.
+
+```bash
+ssh root@<public_ip> 'tailscale ip -4'      # the address spokes point at
+ssh root@<public_ip> 'ss -lun | grep 6000'  # the mesh link, bound
+```
+
+`./scripts/wayfinder-ca.sh verify` checks both, and `status` prints the tunnel
+address beside the public one.
 
 TLS is not optional here, and it is the part most likely to look fine when it
 is not: a `tailscaled` refuses a plaintext DERP connection and loses its

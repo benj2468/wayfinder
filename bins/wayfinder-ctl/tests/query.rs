@@ -219,6 +219,7 @@ async fn spawn_server() -> Endpoint {
                 own_key: Some(node_key),
                 anchor: None,
                 revoked: Vec::new(),
+                own_mac: wayfinder_server::Mac([2, 0, 0, 0, 0, 1]),
             });
         }
     });

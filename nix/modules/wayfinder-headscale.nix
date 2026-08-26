@@ -34,8 +34,8 @@
 # Headscale API key the colocated node mints tunnel credentials with, and
 # Headplane's cookie secret. Both are machine-generated state this host can
 # recreate against its own Headscale at any time, which is what separates them
-# from the mesh trust material in `/var/lib/wayfinder-secrets` — that is minted
-# offline and is the mesh itself. Neither ever enters the Nix store.
+# from the mesh trust material an operator carries to the box by hand — that is
+# minted offline and is the mesh itself. Neither ever enters the Nix store.
 #
 # To sign in to Headplane, paste a Headscale API key at its login page; mint a
 # throwaway one over SSH with `headscale apikeys create --expiration 24h`. It
@@ -71,6 +71,15 @@ let
   # can be wrong is by disagreeing with what headscale actually listens on.
   # Spelling it out makes the two impossible to drift apart while looking fine.
   endpoint = "${scheme}://${cfg.domain}:${toString cfg.port}";
+
+  # The port the colocated node's management API listens on, taken from its own
+  # configuration rather than restated. `selfJoin` reaches that API over
+  # loopback, so a node moved off 7700 must not leave the self-join dialling the
+  # old port. Split on the last colon so a bracketed IPv6 bind address
+  # (`[::]:7700`) yields the port too.
+  wayfinderMgmtPort = lib.last (
+    lib.splitString ":" (config.services.wayfinder.config.server.addr or "0.0.0.0:7700")
+  );
 in
 {
   options.services.wayfinder-headscale = {
@@ -205,9 +214,9 @@ in
           `services.wayfinder` provider to read as
           `config.provider.headscale.api_key_path`.
 
-          Deliberately outside `/var/lib/wayfinder-secrets`: that directory is
-          exactly the files an operator carries to the box by hand, and this
-          one is not among them.
+          In headscale's own state directory, not the node's: this key is
+          machine-generated state the box recreates at will, not something an
+          operator carries here with the mesh trust material.
         '';
       };
 
@@ -246,6 +255,74 @@ in
           anything breaks and while an operator is not looking at it. The node
           is restarted when the key changes: it reads the key once, at
           startup.
+        '';
+      };
+    };
+
+    selfJoin = {
+      enable = lib.mkEnableOption ''
+        joining this box to the tunnel it coordinates.
+
+        The CA is a mesh node as well as the coordination server, so its own
+        `UdpMulti` link needs a tunnel address like every other node's — and it
+        obtains one exactly the way every other node does, by asking the
+        management API for a credential (`wayfinderctl vpn enrollment`) and
+        spending it. The connection is to itself, over loopback, presenting its
+        own identity seed, which earns `MgmtAccess::GrantedSelfKey`: the node
+        asking on its own behalf. The MAC the credential is minted for comes
+        from the router, so this box registers under the same MAC-named
+        Headscale user an enrolled node's credential is scoped to, by the same
+        code (`libs/wayfinder-server/src/vpn.rs`).
+
+        An earlier revision reimplemented that sequence in shell against the
+        local `headscale` CLI, because `GetVpnEnrollment` refused every full
+        management grant. See design 08's Correction 1 for why that refusal
+        was really about where the MAC came from rather than about privilege,
+        and what changed.
+
+        A unit rather than a runbook step, for the same reason
+        `wayfinder-headscale-apikey` is one: a preauth key can only be issued
+        by a running Headscale, so it cannot be provisioned alongside the
+        offline-minted mesh trust material, and a manual step is one that gets
+        skipped when the box is rebuilt from scratch
+      '';
+
+      identityFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = config.services.wayfinder.config.auth.seed_path or null;
+        defaultText = lib.literalMD "`services.wayfinder.config.auth.seed_path`";
+        description = ''
+          This node's Ed25519 identity seed — the credential the self-join
+          presents to the node's own management API.
+
+          It is the node's own key, so the connection earns
+          `MgmtAccess::GrantedSelfKey` and the node mints a credential for
+          itself. No certificate is passed alongside it: on this tier a
+          presented certificate is never verified and never consulted for the
+          MAC, so passing one would suggest it does something.
+
+          The same file also pins the connection. `wayfinder-ctl` defaults
+          `--node-key` to the public half of `--identity`, which is exactly the
+          key this node's TLS listener presents — the one case where that
+          default is right rather than something to be spelled out.
+
+          Read at runtime by the unit rather than at evaluation: a seed
+          provisioned out of band is deliberately not readable when this
+          configuration is built.
+        '';
+      };
+
+      managementAddr = lib.mkOption {
+        type = lib.types.str;
+        default = "127.0.0.1:${wayfinderMgmtPort}";
+        defaultText = lib.literalMD "loopback, on the node's own `server.addr` port";
+        description = ''
+          `host:port` of the colocated node's management API.
+
+          Loopback: the two ends are on this host, so this never leaves the
+          box and does not depend on the provider hairpinning a public address
+          back. Only the port is taken from the node's configuration — its
+          bind address is typically `0.0.0.0`, which is not an address to dial.
         '';
       };
     };
@@ -316,6 +393,46 @@ in
         message = ''
           services.wayfinder-headscale.tls.mode = "files" needs both
           tls.certFile and tls.keyFile.
+        '';
+      }
+      {
+        assertion = !cfg.selfJoin.enable || config.services.wayfinder-tailscale.enable;
+        message = ''
+          services.wayfinder-headscale.selfJoin.enable joins this box to its
+          own tunnel, which needs the tunnel daemon: set
+          services.wayfinder-tailscale.enable = true.
+        '';
+      }
+      {
+        # Guarded on `enable` as well, so a configuration missing the daemon
+        # entirely reports *that* rather than dying on an undefined
+        # `loginServer` before the assertion above can be read.
+        assertion =
+          !(cfg.selfJoin.enable && config.services.wayfinder-tailscale.enable)
+          || config.services.wayfinder-tailscale.loginServer == endpoint;
+        message = ''
+          services.wayfinder-tailscale.loginServer is
+          "${config.services.wayfinder-tailscale.loginServer}" but this box
+          coordinates "${endpoint}". They must agree, or the self-join
+          registers against one coordination server while every manual
+          `tailscale up` on this host reaches another.
+        '';
+      }
+      {
+        assertion = !cfg.selfJoin.enable || config.services.wayfinder.enable;
+        message = ''
+          services.wayfinder-headscale.selfJoin.enable joins this box to its
+          own tunnel through its own management API, so there has to be a node
+          serving one: set services.wayfinder.enable = true.
+        '';
+      }
+      {
+        assertion = !cfg.selfJoin.enable || cfg.selfJoin.identityFile != null;
+        message = ''
+          services.wayfinder-headscale.selfJoin.enable needs
+          selfJoin.identityFile: the self-join authenticates to the node as
+          the node, and that is the only credential which earns the tier the
+          enrollment request needs.
         '';
       }
     ];
@@ -446,6 +563,100 @@ in
         Persistent = true;
         RandomizedDelaySec = "1h";
       };
+    };
+
+    # This box joining the tunnel it coordinates, so its own mesh link has a
+    # tunnel address to be reached on.
+    #
+    # The same request every other node's join goes through, and deliberately
+    # so: `wayfinderctl vpn enrollment` asks the management API for a
+    # credential and spends it. What differs is only which credential opens the
+    # connection — this node's own identity seed rather than a membership
+    # certificate — and the answer is minted by the same `Coordinator::enroll`
+    # a spoke's enrollment reaches, scoped to the same MAC-named Headscale user.
+    #
+    # An earlier revision did the sequence by hand here (find-or-create the
+    # user, mint a preauth key, spend it) against the local `headscale` CLI,
+    # because the RPC refused a self-key connection. Sixty lines of shell
+    # holding a convention `vpn.rs` also holds, with no test that the two
+    # agree — the drift that would have cost most was the Headscale user name,
+    # which is the only record of the peer↔mesh-identity mapping and would
+    # have broken silently, since the tunnel works either way.
+    systemd.services.wayfinder-headscale-selfjoin = lib.mkIf cfg.selfJoin.enable {
+      description = "Join this box to the tunnel it coordinates";
+      wantedBy = [ "multi-user.target" ];
+      after = [
+        "headscale.service"
+        "tailscaled.service"
+        "wayfinder.service"
+      ];
+      requires = [
+        "headscale.service"
+        "tailscaled.service"
+        "wayfinder.service"
+      ];
+      # `path` replaces PATH outright rather than extending it, so everything
+      # the script below calls has to be named here. `wayfinder-ctl` shells out
+      # to `tailscale` itself, which is why that is on the list as well as
+      # being called directly.
+      path = [
+        pkgs.coreutils
+        pkgs.tailscale
+        pkgs.wayfinder-ctl
+      ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        # A first boot reaches here before headscale can issue anything, and
+        # under ACME before it answers at all — and before the node's
+        # management listener is accepting, since systemd's "started" is not
+        # "listening". Retry rather than leave the box off its own tunnel until
+        # someone notices.
+        Restart = "on-failure";
+        RestartSec = "30s";
+      };
+      script = ''
+        set -euo pipefail
+
+        # Already joined. `tailscale ip` fails when logged out, so it doubles
+        # as the "is this box registered" check without parsing status JSON —
+        # and skipping keeps a reboot from minting a preauth key it does not
+        # need.
+        if tailscale ip -4 >/dev/null 2>&1; then
+          echo "already on the tunnel: $(tailscale ip -4)"
+          exit 0
+        fi
+
+        # Ask this node for its own tunnel credential and spend it. Over
+        # loopback, presenting the node's own seed: that earns
+        # `MgmtAccess::GrantedSelfKey`, and the MAC the credential is minted
+        # for is read from the router rather than from anything on this
+        # connection. `--node-key` is left to default to the public half of
+        # `--identity`, which is the key this node's own listener presents.
+        #
+        # No `--cert`: on this tier a presented certificate is never verified,
+        # so passing one would imply it does something.
+        #
+        # `vpn enrollment` runs `tailscale up` itself and exits non-zero if any
+        # part of it failed, which is what `Restart = on-failure` retries.
+        wayfinder-ctl \
+          --connect ${cfg.selfJoin.managementAddr} \
+          --identity ${cfg.selfJoin.identityFile} \
+          vpn enrollment
+
+        # `tailscale up` returns once the backend is running, but the address
+        # is what the mesh link is actually reached on — so that, not the exit
+        # status above, is what this unit succeeds on.
+        for _ in $(seq 1 60); do
+          if tailscale ip -4 >/dev/null 2>&1; then
+            echo "joined the tunnel: $(tailscale ip -4)"
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "registered but no tunnel address was assigned" >&2
+        exit 1
+      '';
     };
 
     services.headplane = lib.mkIf cfg.headplane.enable {

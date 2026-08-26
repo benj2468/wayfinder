@@ -169,6 +169,17 @@ testers.nixosTest {
             certFile = "${hubTls}/cert.pem";
             keyFile = "${hubTls}/key.pem";
           };
+
+          # The hub joins the tunnel it coordinates, through the module's own
+          # unit rather than the test script's shell — which is what the
+          # deployment does (`nix/machines/wayfinder-ca/common.nix`), and the
+          # only place that unit is exercised against a real `tailscaled`.
+          #
+          # An earlier revision of this test did the same sequence by hand
+          # under a `hub-self` user. It worked, and it left the deployment's
+          # version untested and the hub as the one peer `vpn list` could not
+          # name.
+          selfJoin.enable = true;
         };
         # The module's default (0.0.0.0, IPv4-only) leaves a hole on a
         # dual-stack host like this container: "hub" resolves an AAAA record
@@ -183,7 +194,10 @@ testers.nixosTest {
 
         services.wayfinder-tailscale = {
           enable = true;
-          loginServer = "https://hub:8080";
+          # Taken from the module, not restated: `selfJoin` asserts the two
+          # agree before it will build, so a literal here would be one more
+          # string to keep in step with the port and TLS mode above.
+          loginServer = config.services.wayfinder-headscale.endpoint;
         };
 
         services.wayfinder = {
@@ -193,13 +207,18 @@ testers.nixosTest {
               type = "Tls";
               addr = "0.0.0.0:7700";
             };
+            # In the node's own state directory, as the deployment provisions
+            # them — see `secretsDir` in `nix/machines/wayfinder-ca/common.nix`
+            # for why they are not in a directory of their own. It also puts
+            # the hub's paths on the same footing as the spokes' below, which
+            # were always here.
             auth = {
-              seed_path = "/var/lib/wayfinder-secrets/identity.seed";
-              cert_path = "/var/lib/wayfinder-secrets/node.cert";
-              trust_anchor_path = "/var/lib/wayfinder-secrets/trust-anchor";
+              seed_path = "/var/lib/wayfinder/identity.seed";
+              cert_path = "/var/lib/wayfinder/node.cert";
+              trust_anchor_path = "/var/lib/wayfinder/trust-anchor";
             };
             provider = {
-              root_seed_path = "/var/lib/wayfinder-secrets/root.seed";
+              root_seed_path = "/var/lib/wayfinder/root.seed";
               mesh_id = 1463900494; # 0x5741594e, same as ca-provider.nix
               cert_ttl_secs = 604800;
               # Auto-approved: what this test exercises is the data plane, not
@@ -236,8 +255,14 @@ testers.nixosTest {
         };
 
         # Held back until the identity mint below writes its files, same
-        # reason as ca-provider.nix.
+        # reason as ca-provider.nix. The self-join reaches the node's own
+        # management API, so it waits on the same thing — a node that has not
+        # started is one there is nothing to ask. It would retry its way to
+        # success on its own (`Restart = on-failure`), but a test that ships a
+        # minute of expected failures in the journal is a test nobody reads the
+        # journal of.
         systemd.services.wayfinder.wantedBy = lib.mkForce [ ];
+        systemd.services.wayfinder-headscale-selfjoin.wantedBy = lib.mkForce [ ];
 
         # See `hubCaBundle`'s comment above: `security.pki.certificateFiles`
         # alone does not reach this path on a NixOS container.
@@ -259,27 +284,37 @@ testers.nixosTest {
     spokeB.wait_for_unit("multi-user.target")
 
     with subtest("mint the mesh root of trust and the hub's own device identity"):
-        hub.succeed("install -d -m 0700 -o wayfinder -g wayfinder /var/lib/wayfinder-secrets")
+        # Into /var/lib/wayfinder, beside the node's own state, as the
+        # deployment provisions them — the directory the `wayfinder.nix`
+        # module's tmpfiles rule already created.
         hub.succeed(
             "wayfinder-ctl cert init-ca --mesh-id 0x5741594e --generate "
-            "--out-seed /var/lib/wayfinder-secrets/root.seed "
-            "--out-anchor /var/lib/wayfinder-secrets/trust-anchor"
+            "--out-seed /var/lib/wayfinder/root.seed "
+            "--out-anchor /var/lib/wayfinder/trust-anchor"
         )
         hub.succeed(
-            "wayfinder-ctl cert keygen --out-seed /var/lib/wayfinder-secrets/identity.seed"
+            "wayfinder-ctl cert keygen --out-seed /var/lib/wayfinder/identity.seed"
         )
         now = int(hub.succeed("date +%s").strip())
         # No --admin: the hub is a device on its own mesh, not an operator of
         # it — the same distinction design 08 draws for every other node.
         hub.succeed(
             "wayfinder-ctl cert issue "
-            "--ca-seed /var/lib/wayfinder-secrets/root.seed --mesh-id 0x5741594e "
-            "--node-seed /var/lib/wayfinder-secrets/identity.seed "
+            "--ca-seed /var/lib/wayfinder/root.seed --mesh-id 0x5741594e "
+            "--node-seed /var/lib/wayfinder/identity.seed "
             f"--not-before {now - 60} --not-after {now + 31536000} "
-            "--out-cert /var/lib/wayfinder-secrets/node.cert"
+            "--out-cert /var/lib/wayfinder/node.cert"
         )
-        hub.succeed("chown wayfinder:wayfinder /var/lib/wayfinder-secrets/*")
-        hub.succeed("chmod 0400 /var/lib/wayfinder-secrets/*")
+        # Named one by one rather than globbed: this directory also holds the
+        # state the node writes, and `chmod 0400 /var/lib/wayfinder/*` would
+        # take that with it. `scripts/wayfinder-ca.sh secrets` has the same
+        # constraint for the same reason.
+        secrets = " ".join(
+            f"/var/lib/wayfinder/{f}"
+            for f in ("root.seed", "identity.seed", "node.cert", "trust-anchor")
+        )
+        hub.succeed(f"chown wayfinder:wayfinder {secrets}")
+        hub.succeed(f"chmod 0400 {secrets}")
 
     with subtest("the coordination server comes up on its own relay"):
         hub.wait_for_unit("headscale.service")
@@ -303,40 +338,53 @@ testers.nixosTest {
         hub.wait_for_unit("wayfinder.service")
         hub.wait_for_open_port(7700, timeout=30)
         hub.succeed("journalctl -u wayfinder | grep -q 'VPN coordination enabled'")
+        hub_cert = hub.succeed("wayfinder-ctl cert show /var/lib/wayfinder/node.cert")
         hub_key = [
             l.split()[-1]
-            for l in hub.succeed(
-                "wayfinder-ctl cert show /var/lib/wayfinder-secrets/node.cert"
-            ).splitlines()
+            for l in hub_cert.splitlines()
             if l.strip().startswith("ed25519:")
+        ][0]
+        # The hub's own MAC, unseparated and lowercase — `hostname_for` in
+        # `libs/wayfinder-server/src/vpn.rs`, and the Headscale user the
+        # self-join below must register under.
+        hub_mac_hex = [
+            l.split()[-1].replace(":", "").lower()
+            for l in hub_cert.splitlines()
+            if l.strip().startswith("node_mac:")
         ][0]
 
     with subtest("the hub joins its own tunnel — it is a mesh device too"):
-        # Not via `vpn enrollment`: connecting to itself with its own
-        # `identity_seed_path` always earns GrantedSelfKey (a full management
-        # grant), and `GetVpnEnrollment` refuses both full grants on purpose
-        # (authz.rs) — the credential is scoped to a *device* identity, and
-        # neither an operator's session nor a node's own key is one. A remote
-        # node has no other way to reach the coordination server, which is
-        # what the RPC is for; the hub has direct local access to headscale's
-        # own CLI and does not need the indirection. This mints the same
-        # shape of credential `vpn.rs` would over the wire, just locally.
-        hub.succeed("headscale users create hub-self || true")
-        # Headscale's preauth-key API scopes a key to a user's numeric id, not
-        # its name — the same REST-API quirk `vpn.rs` itself works around
-        # (see design 08's Correction 3) — so the CLI here needs the id too,
-        # looked up rather than assumed.
-        hub_user_id = [
-            u["id"]
-            for u in json.loads(hub.succeed("headscale users list -o json"))
-            if u["name"] == "hub-self"
-        ][0]
-        hub_preauth_key = hub.succeed(
-            f"headscale preauthkeys create --user {hub_user_id} --expiration 1h | tail -1"
-        ).strip()
-        hub.succeed(f"tailscale up --login-server=https://hub:8080 --authkey={hub_preauth_key}")
+        # Through `wayfinderctl vpn enrollment` against its own management API,
+        # which is the same request a spoke's enrollment makes below. The hub
+        # connects to itself with its own identity seed and earns
+        # `GrantedSelfKey`; the MAC the credential is minted for comes from the
+        # router, so the Headscale user is the one `hostname_for` names for
+        # every other node too.
+        #
+        # A module unit, not a shell sequence in this file: it is what
+        # `nix/machines/wayfinder-ca` deploys, and this is the only test that
+        # runs it against a real `tailscaled`. Started explicitly rather than
+        # at boot because it needs the node started above.
+        hub.succeed("systemctl start wayfinder-headscale-selfjoin.service")
+        hub.wait_for_unit("wayfinder-headscale-selfjoin.service")
         hub.wait_until_succeeds("tailscale ip -4 | grep -q '^100\\.'", timeout=60)
         hub_ts_ip = hub.succeed("tailscale ip -4").strip()
+
+        # Registered under the MAC-named user, not under some name of its own.
+        # That name *is* the peer↔mesh-identity mapping — nothing persists it
+        # anywhere else — so a self-join under a convenient label would leave
+        # this box the one peer `wayfinderctl vpn list` could not name, and
+        # would do it silently: the tunnel works either way.
+        users = [u["name"] for u in json.loads(hub.succeed("headscale users list -o json"))]
+        assert hub_mac_hex in users, f"no headscale user '{hub_mac_hex}' among {users}"
+
+        # Idempotent. It runs on every boot, and a re-run that minted a fresh
+        # preauth key and re-registered would churn this box's tunnel identity
+        # for nothing.
+        hub.succeed("systemctl restart wayfinder-headscale-selfjoin.service")
+        assert hub.succeed("tailscale ip -4").strip() == hub_ts_ip, (
+            "the self-join re-registered instead of recognising it was already joined"
+        )
 
     for name, node in [("spokeA", spokeA), ("spokeB", spokeB)]:
         with subtest(f"{name} enrols offline and joins the tunnel"):
@@ -351,7 +399,7 @@ testers.nixosTest {
             now = int(hub.succeed("date +%s").strip())
             hub.succeed(
                 "wayfinder-ctl cert issue "
-                "--ca-seed /var/lib/wayfinder-secrets/root.seed --mesh-id 0x5741594e "
+                "--ca-seed /var/lib/wayfinder/root.seed --mesh-id 0x5741594e "
                 "--node-seed /tmp/spoke.seed "
                 f"--not-before {now - 60} --not-after {now + 31536000} "
                 "--out-cert /tmp/spoke.cert"
@@ -359,7 +407,7 @@ testers.nixosTest {
             cert_b64 = hub.succeed("base64 -w0 /tmp/spoke.cert").strip()
             node.succeed(f"echo {cert_b64} | base64 -d > /var/lib/wayfinder/node.cert")
             anchor_b64 = hub.succeed(
-                "base64 -w0 /var/lib/wayfinder-secrets/trust-anchor"
+                "base64 -w0 /var/lib/wayfinder/trust-anchor"
             ).strip()
             node.succeed(f"echo {anchor_b64} | base64 -d > /var/lib/wayfinder/trust-anchor")
             # Readable by the `wayfinder` user the unit runs as (written here

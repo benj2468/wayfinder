@@ -117,6 +117,20 @@ vpn_settings() {
         --apply 'c: "${c.endpoint} ${c.domain} ${toString c.stunPort}"' 2>/dev/null)
 }
 
+# The CA's own mesh link, read out of the machine configuration for the same
+# reason the tunnel endpoint is: the port is chosen there, and a copy here would
+# be the one that is wrong when a check fails.
+#
+# Prints "<name> <bind-addr>", or nothing when the deployment carries no link
+# (which it did until design 08 landed on this box) or evaluation fails.
+mesh_settings() {
+    # shellcheck disable=SC2016
+    (cd "$REPO_ROOT" && nix eval --raw \
+        ".#nixosConfigurations.wayfinder-ca.config.services.wayfinder.config.links" \
+        --apply 'ls: if ls == [ ] then "" else
+                   let l = builtins.head ls; in "${(l.name or "udpm0")} ${l.bind_addr}"' 2>/dev/null)
+}
+
 confirm() {
     [[ "${CA_ASSUME_YES:-0}" == "1" ]] && return 0
     printf '\033[33m%s\033[0m\n' "$1"
@@ -284,26 +298,51 @@ cmd_secrets() {
     # straight after `install` put that key there.
     ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "root@$ip" true \
         || die "cannot reach root@$ip over SSH — has '$0 install' run?"
-    # The directory is created here rather than trusted to exist: the node's
-    # systemd unit cannot write it (it is outside ReadWritePaths, deliberately —
-    # the node reads its root of trust and must not be able to rewrite it).
-    ssh "root@$ip" 'install -d -m 0700 -o wayfinder -g wayfinder /var/lib/wayfinder-secrets'
+    # The node's own state directory, which systemd-tmpfiles has already
+    # created from the module. Created here anyway so this works on a box that
+    # has been installed but not yet booted the unit, and so the mode is what
+    # the machine declares rather than whatever `scp` would have left.
+    #
+    # These files live *beside* the node's writable state rather than in a
+    # directory of their own, because `wayfinder-ctl` defaults `--identity` to
+    # /var/lib/wayfinder/identity.seed and an operator on this box types that
+    # path more than any other. The node still cannot rewrite its own root of
+    # trust: `nix/machines/wayfinder-ca/common.nix` re-mounts these four files
+    # read-only inside the unit's namespace (`ReadOnlyPaths`).
+    ssh "root@$ip" 'install -d -m 0700 -o wayfinder -g wayfinder /var/lib/wayfinder'
+    local provisioned=("${SECRET_FILES[@]}")
     for f in "${SECRET_FILES[@]}"; do
-        scp -q "$SECRETS_DIR/$f" "root@$ip:/var/lib/wayfinder-secrets/$f"
+        scp -q "$SECRETS_DIR/$f" "root@$ip:/var/lib/wayfinder/$f"
     done
     # The Cloudflare Tunnel credentials, when the deployment has a public
     # dashboard. Written by `tofu apply` (infra/oracle/tunnel.tf) rather than
     # minted by hand, and optional: a deployment reached only over an SSH
     # forward has no tunnel and no such file.
     if [[ -f "$SECRETS_DIR/cloudflared.json" ]]; then
-        scp -q "$SECRETS_DIR/cloudflared.json" "root@$ip:/var/lib/wayfinder-secrets/cloudflared.json"
+        scp -q "$SECRETS_DIR/cloudflared.json" "root@$ip:/var/lib/wayfinder/cloudflared.json"
+        provisioned+=(cloudflared.json)
         info "tunnel credentials provisioned"
     fi
-    ssh "root@$ip" '
-        chown wayfinder:wayfinder /var/lib/wayfinder-secrets/*
-        chmod 0400 /var/lib/wayfinder-secrets/*
+    # Named one by one, never globbed. This directory now also holds the state
+    # the node *writes* — ca-state.json, settings.json, node.mac — and a
+    # `chmod 0400 /var/lib/wayfinder/*` would take those with it and leave a CA
+    # that cannot record what it issues.
+    local remote; remote="$(printf '/var/lib/wayfinder/%s ' "${provisioned[@]}")"
+    # Expanded here rather than on the node, deliberately: the list is what this
+    # script just copied, and the node has no variable holding it.
+    # shellcheck disable=SC2029
+    ssh "root@$ip" "
+        chown wayfinder:wayfinder $remote
+        chmod 0400 $remote
         systemctl restart wayfinder.service
-        systemctl is-active --quiet wayfinder.service'
+        systemctl is-active --quiet wayfinder.service
+        # The self-join asks the node's own management API for its tunnel
+        # credential, so before this moment — with no identity seed on the box
+        # — it was failing and backing off. Nudged rather than waited on, and
+        # non-fatal, since a deployment without selfJoin has no such unit.
+        # '\$0 verify' is what reports a real failure here, with somewhere to
+        # go next.
+        systemctl restart wayfinder-headscale-selfjoin.service || true"
     info "trust material in place; wayfinder.service restarted"
 }
 
@@ -441,6 +480,51 @@ verify_vpn_stun() {
     fi
 }
 
+# The CA's own mesh link, and the tunnel it rides.
+#
+# Checked over SSH rather than from here on purpose: the link is deliberately
+# *not* reachable from the public address — it binds 0.0.0.0 but only
+# `tailscale0` is a trusted interface, and no security-list rule opens its port
+# — so there is nothing to probe from outside. What can be established from the
+# outside is that this box is registered on its own coordination server, and
+# `cmd_vpn` already shows that.
+#
+# The two halves fail independently and mean different things: off the tunnel,
+# the node is a CA that no spoke can route to; on the tunnel with no socket
+# bound, the node started without its link.
+verify_mesh_link() {
+    local ip="$1" link_name="$2" bind_addr="$3"
+    local port="${bind_addr##*:}"
+    local ts_ip
+
+    if ! ts_ip="$(ssh -o ConnectTimeout=8 -o BatchMode=yes "root@$ip" \
+        'tailscale ip -4' 2>/dev/null)" || [[ -z "$ts_ip" ]]; then
+        check_failed "the CA is not on the tunnel it coordinates." \
+            "Its mesh link rides that tunnel, so until this box holds a tunnel address" \
+            "it is a certificate authority no spoke has a route to — enrollment still" \
+            "works, and nothing else does." \
+            "  ssh root@$ip 'systemctl status wayfinder-headscale-selfjoin.service'" \
+            "  ssh root@$ip 'journalctl -u wayfinder-headscale-selfjoin -n 50'" \
+            "The unit is idempotent and retries on failure; the usual cause is headscale" \
+            "not yet serving (a fresh boot, or ACME still fetching a certificate)." \
+            "  ssh root@$ip 'systemctl restart wayfinder-headscale-selfjoin.service'"
+        return
+    fi
+    check_ok "on its own tunnel at $ts_ip"
+
+    if ssh -o ConnectTimeout=8 -o BatchMode=yes "root@$ip" \
+        "ss -lun | grep -q ':$port'" 2>/dev/null
+    then
+        check_ok "the mesh link '$link_name' is bound on udp/$port"
+    else
+        check_failed "the CA holds a tunnel address but its mesh link is not bound." \
+            "The node came up without the link it is configured with, which means it is" \
+            "routing nothing even though the management API answers." \
+            "  ssh root@$ip 'journalctl -u wayfinder | grep -i link'" \
+            "  $0 status                        # is wayfinder.service even active?"
+    fi
+}
+
 cmd_verify() {
     require_secrets
     local ip; ip="$(ca_ip)"
@@ -495,10 +579,26 @@ cmd_verify() {
         verify_vpn_stun "$host" "$stun" "$ip"
     fi
 
+    info "the CA's own mesh link"
+    local mesh link_name bind_addr
+    mesh="$(mesh_settings)" || mesh=""
+    read -r link_name bind_addr <<<"$mesh" || true
+    if [[ -z "${bind_addr:-}" ]]; then
+        # Not a failure: a CA with no link of its own is the posture this
+        # deployment ran in before design 08, and is still a working
+        # certificate authority — just one that cannot flood a revocation or
+        # relay between two spokes.
+        check_skipped "this deployment configures no mesh link on the CA." \
+            "Nothing below applies. If that is unexpected, the link is declared in" \
+            "nix/machines/wayfinder-ca/common.nix and rendered into services.wayfinder.config."
+    else
+        verify_mesh_link "$ip" "$link_name" "$bind_addr"
+    fi
+
     if (( VERIFY_FAILURES > 0 )); then
         die "$VERIFY_FAILURES check(s) failed — see above"
     fi
-    info "the CA is reachable, authenticating, and coordinating tunnels"
+    info "the CA is reachable, authenticating, coordinating tunnels, and on the mesh"
 }
 
 cmd_status() {
@@ -512,9 +612,17 @@ cmd_status() {
         ctl cert show "$SECRETS_DIR/node.cert" | sed 's/^/  /'
     fi
     printf 'VPN:       %s:443 (headscale, TLS), STUN on udp/3478\n' "$ip"
+    # The CA is a mesh participant too, over the tunnel it coordinates. Its
+    # tunnel address is the one every spoke's link is pointed at, so it belongs
+    # in the same summary as the public one.
+    local ts_ip
+    ts_ip="$(ssh -o ConnectTimeout=8 -o BatchMode=yes "root@$ip" 'tailscale ip -4' 2>/dev/null)" \
+        || ts_ip=""
+    printf 'mesh:      %s\n' "${ts_ip:-not on the tunnel}"
     ssh -o ConnectTimeout=8 "root@$ip" \
         'systemctl is-active wayfinder.service wayfinder-web.service \
-             headscale.service headplane.service; uptime' 2>/dev/null \
+             headscale.service headplane.service \
+             wayfinder-headscale-selfjoin.service tailscaled.service; uptime' 2>/dev/null \
         || warn "could not reach the node over SSH"
 }
 

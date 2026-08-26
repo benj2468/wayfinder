@@ -82,18 +82,23 @@ Two things make it worse than a slow request:
 
 ### 1.3 Why now
 
-`nix/machines/wayfinder-ca/common.nix:4` and `:107` both assert that the CA
-carries no mesh links, and `:136` leans on that to justify short certificate TTLs
-as the primary revocation path. That is true of the deployment today, and it is
-the reason this has been survivable so far.
+`nix/machines/wayfinder-ca/common.nix` used to assert that the CA carries no
+mesh links, and leaned on that to justify short certificate TTLs as the primary
+revocation path. That was true of the deployment, and it is the reason this has
+been survivable so far.
 
-Two things change it. The CA is the one box in the topology with a stable public
-address, so it is where design 08's tunnel terminates and it is expected to carry
-links. And — independent of any forecast — **any node can already be configured
-as both a provider and a link carrier**: `provider` is an `Option` on a `Driver`
-that also owns interfaces, so nothing but convention keeps these two roles on
-separate boxes today. Design 12 is about to raise traffic on exactly the
-`AuthenticateUser` path above.
+**It is no longer true.** The CA now joins the tunnel it coordinates and carries
+a `UdpMulti` link over it — see `docs/design/implemented/11-cloud-auth-provider.md`
+§12. So the box holding the mesh root key, answering `AuthenticateUser` from the
+open internet, is also emitting OGMs and relaying between spokes on the same
+event loop. That is precisely the collision §1.1 describes, on the one node where
+it matters most, and it is now the deployed configuration rather than a forecast.
+
+Independent of that: **any node can already be configured as both a provider and
+a link carrier** — `provider` is an `Option` on a `Driver` that also owns
+interfaces, so nothing but convention ever kept these two roles on separate
+boxes. Design 12 is about to raise traffic on exactly the `AuthenticateUser` path
+above.
 
 ## 2. Goals / Non-goals
 
@@ -456,7 +461,7 @@ embedded node on which a router-owned version would mean anything.
 | `bins/wayfinder-tap/src/main.rs` | `:630-678` spawns the authority task instead of `driver.set_provider`; wire both channels into `serve_tls_server_with_vpn` (`:498-503`). |
 | `bins/wayfinder-web/src/mock.rs` | Own `CertAuthority` (`:115`), authority impl (`:522-590`), `set_now_unix` (`:222`, `:248`), service construction (`:664`) — same split, same clock. |
 | `libs/wayfinder-embedded-driver/src/lib.rs` | `:491` constructs `RouterAdapter::new(…, None, …)`; changes if the parameter is dropped. |
-| `nix/machines/wayfinder-ca/common.nix` | `:4`, `:107` and `:136` all assert or rely on the CA having no links. Update when it gains them — a stale "no links here" comment is what made this issue easy to miss. |
+| `nix/machines/wayfinder-ca/common.nix` | **Nothing to change — already done.** It gained a `UdpMulti` link over the tunnel it coordinates (design 11 §12), and the "no links here" comments that made this issue easy to miss are gone. The row is kept because it is the file that motivates §1.3. |
 
 Tests first, per the root `CLAUDE.md` and the `tdd` skill. The specifying cases:
 **a certificate can still be issued after the split** (the §3.3 regression, and

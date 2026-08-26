@@ -1,7 +1,15 @@
 # Design: a cloud-hosted Wayfinder certificate authority
 
-**Status:** Implemented. The node posture, the NixOS machine and the OpenTofu
-module all landed together; see the key file map in §10.
+**Status:** Implemented and deployed. The node posture, the NixOS machine and
+the OpenTofu module all landed together; see the key file map in §10.
+
+**§12 supersedes the "no mesh links" posture** this document was written
+around. Design 08 landed on this same box, and the CA now joins the tunnel it
+coordinates and carries one `UdpMulti` link over it. Everything else here —
+no local egress, no capabilities, the sandbox, the offline-minted root — is
+unchanged. Where a section below still says "no links", §12 says what replaced
+it; the sections are left as written rather than edited in place, because the
+reasoning that held with no link is what makes it clear what the link changed.
 
 **Scope:** `libs/wayfinder-driver` (a `NullEgress` carrier), `libs/wayfinder`
 (`Config::resolved_mac_state_path` and a top-level `mac_state_path`),
@@ -38,7 +46,9 @@ mesh links at all is a complete, useful deployment: it serves `SubmitCsr`,
 - The mesh root key is generated *offline*, by the operator, and never appears
   in this repository, the Nix store, or Terraform state.
 - The CA's own posture is minimal by construction: no mesh links, no local
-  egress, no network capabilities, and a systemd sandbox.
+  egress, no network capabilities, and a systemd sandbox. (§12 revisits the
+  first of those. The other three are unchanged, and the capability set is
+  still empty *with* a link — which is the assertion `ca-provider.nix` grew.)
 - Reproducible: the instance from `tofu apply`, the system from
   `nixosConfigurations.wayfinder-ca`, and both verifiable without a cloud
   account (`nix build .#wayfinder-ca-provider`).
@@ -47,7 +57,8 @@ mesh links at all is a complete, useful deployment: it serves `SubmitCsr`,
 
 - **No mesh links on this node.** There is no encrypted internet link to carry
   one; that is design 08. Everything here is arranged so adding one later is a
-  config change plus a firewall rule, not a redesign.
+  config change plus a firewall rule, not a redesign. (§12: that turned out to
+  be true — a config block and one ingress rule, no redesign.)
 - Not managing the four secret files declaratively. `sops-nix`/`agenix` is the
   natural follow-up; v1 copies them once, by hand, per `infra/oracle/README.md`.
 - Not deploying from CI. That needs cloud credentials in GitLab CI and is a
@@ -174,7 +185,7 @@ membership.
 
 Four files, minted offline with tooling that already exists
 (`wayfinder-ctl cert init-ca` / `keygen` / `issue`) and copied to
-`/var/lib/wayfinder-secrets` (mode 0400, owner `wayfinder`):
+`/var/lib/wayfinder` (mode 0400, owner `wayfinder`):
 
 | file | what it is |
 |---|---|
@@ -183,9 +194,28 @@ Four files, minted offline with tooling that already exists
 | `node.cert` | this node's admin membership in the mesh it signs for |
 | `trust-anchor` | the public anchor every member verifies against |
 
-The secrets directory is deliberately *outside* `/var/lib/wayfinder` and
-outside the unit's `ReadWritePaths`, so the node can read its root of trust and
-cannot rewrite it.
+The node must not be able to rewrite its own root of trust. The first
+implementation bought that with a separate `/var/lib/wayfinder-secrets`, outside
+the unit's `ReadWritePaths` — correct, and it cost something every day: this is
+the box an operator types the most commands on, and `wayfinder-ctl` defaults
+`--identity` to `/var/lib/wayfinder/identity.seed`, so a CA whose identity lived
+elsewhere made every local invocation spell out paths it would otherwise have
+found. The files now sit in the node's own state directory and the property is
+held by `ReadOnlyPaths` instead: each of the four is re-mounted read-only inside
+the unit's namespace, which is the same guarantee by a more specific mechanism.
+
+Two consequences worth stating, because both fail quietly:
+
+- **`ReadOnlyPaths` entries are `-`-prefixed.** These files are legitimately
+  absent on a box that has been installed but not yet provisioned, and a unit
+  that refused to start then would hide the real error (a missing seed) behind
+  a namespace failure. The cost is that a file placed while the node is running
+  is protected only from its next restart — which `scripts/wayfinder-ca.sh
+  secrets` performs anyway.
+- **Never `chmod 0400 /var/lib/wayfinder/*`.** That directory also holds
+  `ca-state.json`, `settings.json` and `node.mac`, which the node writes; a glob
+  takes them with it and leaves an authority that cannot record what it issues.
+  The script and both VM tests name the four files one by one for this reason.
 
 This does not conflict with the root `CLAUDE.md`'s "nodes are reached over RPC,
 never through their filesystem". That rule forbids host tooling provisioning
@@ -293,9 +323,12 @@ so an operator can see enrollment pressure without polling `csr list`.
 
 ## 8. Measurements
 
-Taken against a release build in this exact posture (no egress, no links,
+Taken against a release build in the original posture (no egress, no links,
 provider mode, offline-minted root), driving live enrollments over the
-management API:
+management API. The single `UdpMulti` link added in §12 does not move these
+numbers meaningfully — one more UDP socket and one originator table on a node
+whose whole working set is 3 MB — but they were measured before it and are left
+labelled as what they are rather than restated as current:
 
 | | measured |
 |---|---|
@@ -351,9 +384,10 @@ Headscale.
 
 ## 11. Follow-ups
 
-- **Design 08 lands here.** The UDP ingress rule is already written and
-  commented in `infra/oracle/main.tf`; Headscale wants the second Always Free
-  box the shape defaults leave room for.
+- ~~**Design 08 lands here.**~~ Done, in two steps. Headscale moved onto this
+  same box rather than the second Always Free one (`mkCloudSystem` builds one
+  system; a second box would have been a second deployment to keep alive for a
+  service that idles). The CA then stopped being link-less: see §12.
 - **`sops-nix`** for the four secret files.
 - **A held-CSR occupancy metric** (§7).
 - **CI deploys**, once there is somewhere safe to keep OCI credentials.
@@ -376,3 +410,122 @@ Headscale.
   that had built cleanly an hour earlier; a retry succeeded. If the deployment
   settles on the x86_64 shape long-term, an x86_64 remote builder — or a
   CI-built closure — is worth more than the emulation is.
+
+## 12. The CA joins the mesh it signs for
+
+§2 promised a node with **no mesh links**, and §9's non-goals said so plainly:
+*"There is no encrypted internet link to carry one; that is design 08.
+Everything here is arranged so adding one later is a config change plus a
+firewall rule, not a redesign."*
+
+Design 08 landed, and that turned out to be exactly right — the change is a
+config block and an ingress rule. Recording what it is, and the three things
+that were *not* obvious.
+
+### 12.1 What was added
+
+| where | what |
+|---|---|
+| `nix/machines/wayfinder-ca/common.nix` | one `UdpMulti` link (`vpn0`), `services.wayfinder-tailscale`, `selfJoin.enable` |
+| `nix/modules/wayfinder-headscale.nix` | `selfJoin` — the box joining the tunnel it coordinates, over the same enrollment RPC every node uses |
+| `infra/oracle/main.tf` | the UDP/41641 ingress rule, uncommented |
+| `nix/tests/ca-provider.nix` | the link, and the capability assertion made about a node that has one |
+| `nix/tests/vpn-data-plane.nix` | its hub now uses `selfJoin` rather than joining by hand |
+
+The link is `UdpMulti` in **hub/fan-out mode** — no `discovery_addr`. A
+Tailscale tunnel is a set of point-to-point WireGuard links, not a shared
+segment, so there is no broadcast address to put one datagram into; a
+broadcast-destined frame is fanned out to every peer learned from a received
+datagram instead. Every spoke is learned from the OGMs it sends here, which is
+why this is the one link configuration in the fleet that needs no
+runtime-discovered address and can be rendered at build time. A spoke's link is
+the mirror image, and its `discovery_addr` is this node's tunnel address.
+
+### 12.2 How the CA enrols itself
+
+Through `GetVpnEnrollment`, the same request every other node's join goes
+through. `wayfinder-headscale-selfjoin.service` runs `wayfinderctl vpn
+enrollment` against the node's own management API over loopback, presenting the
+node's own identity seed, and spends the credential it gets back.
+
+> **This section used to say the CA *could not* do that.** The claim was that
+> `GetVpnEnrollment` is scoped to a **device** identity while a node connecting
+> to itself earns `GrantedSelfKey`, a full management grant and not a device —
+> so the unit reimplemented the mint in shell against the local `headscale`
+> CLI, on the argument that a box running the coordination server does not need
+> the RPC hop anyway.
+>
+> Half of that was wrong. The node's own seed *is* a device identity — the
+> node's — and whoever holds it already signs that node's OGMs and terminates
+> its TLS. What actually blocked the request was narrower and mechanical: the
+> transport read the MAC off the certificate presented on the connection, which
+> is sound only on the member tier, where `decide_access` verified it against
+> the anchor and bound it to the handshake key. The self-key tier short-circuits
+> before any of that, so a MAC read there would have been a value the client
+> chose — and here that means registering a device under *another* node's
+> Headscale user.
+>
+> The fix was to stop taking it from the connection: the router publishes its
+> own mesh address through `AuthSnapshot::own_mac`, and the self-key tier mints
+> for that. It cannot name anyone else even when it attaches a certificate that
+> does. The admin tier stays refused — an operator's session certificate is a
+> person, not a device — so `GetVpnEnrollment` is still the one request a *full*
+> grant can be denied, just not both of them. See design 08's Correction 1.
+>
+> What this bought was not the RPC hop, which the box genuinely does not need.
+> It was deleting sixty lines of shell that held a convention `vpn.rs` also
+> holds, with nothing asserting the two agreed.
+
+A unit rather than a runbook step, for the same reason
+`wayfinder-headscale-apikey.service` is one: a preauth key can only be issued
+by a running Headscale, so it cannot be provisioned alongside the offline-minted
+mesh trust material, and a manual step is one that gets skipped when the box is
+rebuilt.
+
+**It registers under the MAC-named user**, not under a label of its own. That
+name is the peer↔mesh-identity correlation — `hostname_for` in
+`libs/wayfinder-server/src/vpn.rs`, and the design deliberately persists it
+nowhere else — so a self-join under a convenient name would leave this box the
+one peer `wayfinderctl vpn list` could not name, and would do it silently: the
+tunnel works either way. Going through the RPC is what makes that hold by
+construction rather than by two implementations agreeing:
+`Coordinator::enroll` names the user, for this node exactly as for every other.
+`nix/tests/vpn-data-plane.nix` asserts the user exists under that name.
+
+One consequence to note: `Coordinator::enroll` applies an ACL tag to every key
+it mints, so this box is now a *tagged* device and Headscale reports its owner
+as the synthetic `tagged-devices` user. `vpn list` correlates it anyway —
+through the per-MAC user the *key* was scoped to, which is checked first
+precisely because of tagging — and the shape a tagged device leaves behind on
+revocation does not arise here, since this is the box doing the revoking.
+
+### 12.3 What the link does and does not change
+
+- **A revocation now has somewhere to go.** §6 called passive expiry "this
+  design's primary revocation mechanism" *because this node has no mesh links
+  to flood an active revocation over*. It has one now. But `cert_ttl_secs` stays
+  at a week: a flood reaches the nodes that are up and on the tunnel, and a
+  spoke that is offline when it goes out never hears it. Expiry remains the only
+  bound that holds for every member; what the link changes is the common case,
+  not the worst one.
+- **Two spokes converge through this node.** The hub has exactly one link for
+  both of them, so relaying between them depends on a flood going back out of
+  the interface it arrived on — which is why the split-horizon removal
+  (`driver_core::Egress::Auto`) is load-bearing here and not an optimization
+  detail. `nix/tests/vpn-data-plane.nix` is the regression test for precisely
+  that gap.
+- **The capability set stays empty.** `UdpMulti` is not in
+  `nix/modules/wayfinder.nix`'s `rawNetKinds`, so a link on this node must not
+  pull `CAP_NET_RAW` back in. That is the one regression here that would be
+  completely invisible — the node works exactly as well either way, on an
+  internet-facing box holding the mesh root key — so `ca-provider.nix` now
+  carries the link specifically to keep asserting on `/proc/<pid>/status` with
+  one configured.
+- **Nothing new is exposed publicly.** The rule added to the security list is
+  UDP/41641, `tailscaled`'s own port, so a spoke can hole-punch a direct path
+  instead of relaying through the DERP server on this same box — which would
+  make every frame between two spokes cross it twice. The **mesh link's** port
+  is deliberately not opened: it binds `0.0.0.0`, but only `tailscale0` is a
+  trusted interface in the host firewall, so it is reachable inside the tunnel
+  and nowhere else. The public address still hears TCP/22, TCP/7700, TCP/443,
+  UDP/3478 and UDP/41641, and nothing else.

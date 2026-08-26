@@ -395,6 +395,7 @@ async fn client_roundtrips_against_real_tls_server() {
                 own_key: Some(node_key),
                 anchor: None,
                 revoked: Vec::new(),
+                own_mac: wayfinder_server::Mac([2, 0, 0, 0, 0, 1]),
             });
         }
     });

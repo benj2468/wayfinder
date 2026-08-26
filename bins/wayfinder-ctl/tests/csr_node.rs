@@ -267,6 +267,7 @@ async fn spawn_node(has_identity: bool) -> (Endpoint, Arc<Mutex<Vec<SetAuthCall>
                 own_key: Some(node_key),
                 anchor: None,
                 revoked: Vec::new(),
+                own_mac: wayfinder_server::Mac([2, 0, 0, 0, 0, 1]),
             });
         }
     });
@@ -318,6 +319,7 @@ async fn spawn_provider_node() -> Endpoint {
                 own_key: Some(node_key),
                 anchor: None,
                 revoked: Vec::new(),
+                own_mac: wayfinder_server::Mac([2, 0, 0, 0, 0, 1]),
             });
         }
     });

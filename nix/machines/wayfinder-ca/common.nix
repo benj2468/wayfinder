@@ -1,22 +1,31 @@
 # The cloud certificate authority: a `wayfinder-tap` node that holds the mesh
-# root of trust and does nothing else.
+# root of trust, coordinates the tunnel every internet-connected node reaches
+# the mesh over, and carries one mesh link riding that same tunnel.
 #
-# It carries **no mesh links and no local egress** — see
-# `docs/design/implemented/11-cloud-auth-provider.md`. That is not a limitation of the host
-# so much as the point: this box exists to be the one address every other node
-# can reach, on the open internet, so the less of the mesh it touches the
-# better. It serves `SubmitCsr`/`ApproveCsr`/`GetTrustAnchor`/`RevokeNode` over
-# the management API and nothing else, which is why `rawNetworkAccess` derives
-# to false and the unit runs with an empty capability set under systemd's
-# sandbox (see `nix/modules/wayfinder.nix`).
+# It has **no local egress** — see
+# `docs/design/implemented/11-cloud-auth-provider.md`. That is not a limitation
+# of the host so much as the point: this box exists to be the one address every
+# other node can reach, on the open internet, so the less of the mesh it
+# touches the better. It bridges no host traffic, needs no TAP, and therefore
+# needs no network capability at all: `rawNetworkAccess` derives to false and
+# the unit runs with an empty capability set under systemd's sandbox (see
+# `nix/modules/wayfinder.nix`).
 #
-# It does, however, run the *tunnel* control plane beside the mesh one — see
+# It runs the *tunnel* control plane beside the mesh one — see
 # `nix/modules/wayfinder-headscale.nix` and design 08. That is the same
 # argument as the CA itself: this is the one box with a stable public address,
-# so it is where two CGNAT'd nodes have to meet. It still carries no mesh link
-# of its own; it coordinates the tunnel that other nodes' links run over.
+# so it is where two CGNAT'd nodes have to meet.
 #
-# **The four files under `secretsDir` are not in this repo and not in the Nix
+# And, since design 08 landed, it is a mesh **participant** rather than only a
+# coordinator. It joins the tunnel it serves (`selfJoin` below) and carries a
+# single `UdpMulti` link in hub/fan-out mode over it. Two things follow that
+# the link-less posture could not do: a revocation has somewhere to be flooded
+# rather than waiting out a certificate's expiry, and two spokes with no direct
+# path converge through this node — a flood arriving on the one link goes back
+# out of it, which is exactly what `driver_core::Egress::Auto` stopped
+# withholding. `nix/tests/vpn-data-plane.nix` is that shape, tested.
+#
+# **The files under `secretsDir` are not in this repo and not in the Nix
 # store.** They are minted offline and copied to the box before first start —
 # see `infra/oracle/README.md`. The mesh root seed in particular *is* the mesh:
 # whoever holds it can issue membership certificates for it.
@@ -26,16 +35,56 @@
 # file to set them.
 { config, lib, ... }:
 let
-  # Directory holding the four files this node is provisioned with, all mode
-  # 0400 owned by `wayfinder`: `root.seed` (the mesh root of trust),
-  # `identity.seed`, `node.cert` and `trust-anchor` (this node's own membership
-  # in the mesh it signs for).
+  # Where this node's four provisioned files live, all mode 0400 owned by
+  # `wayfinder`: `root.seed` (the mesh root of trust), `identity.seed`,
+  # `node.cert` and `trust-anchor` (this node's own membership in the mesh it
+  # signs for).
   #
-  # Separate from `/var/lib/wayfinder` on purpose. That directory is writable
-  # state the node generates and rewrites; this one is operator-provisioned
-  # input the node only ever reads, and the unit's `ReadWritePaths` does not
-  # include it.
-  secretsDir = "/var/lib/wayfinder-secrets";
+  # The node's own state directory, deliberately — the same one it writes
+  # `ca-state.json` and `settings.json` into. An earlier revision kept these in
+  # a separate `/var/lib/wayfinder-secrets`, on the argument that the node
+  # should not be able to rewrite its own root of trust. That property is worth
+  # keeping and is kept, by `ReadOnlyPaths` below rather than by the directory
+  # split; what the split cost was ergonomics, every day, on the box where an
+  # operator does the most typing: `wayfinder-ctl` defaults `--identity` to
+  # `/var/lib/wayfinder/identity.seed`, so a CA whose identity lived elsewhere
+  # made every local invocation spell out paths it would otherwise have found.
+  secretsDir = "/var/lib/wayfinder";
+
+  # Everything an operator provisions into `secretsDir`, re-mounted read-only
+  # *for the node's own unit*.
+  #
+  # `ReadWritePaths` in `nix/modules/wayfinder.nix` covers `secretsDir` now
+  # that it is the state directory, so without this the process that reads the
+  # mesh root of trust could also overwrite it — and could rewrite the
+  # Cloudflare Tunnel credentials, which are not its business at all. Each file
+  # is re-mounted read-only inside the unit's namespace, which restores exactly
+  # what the separate directory used to give.
+  #
+  # Nothing legitimate is lost: `wayfinder-tap` only ever *reads* all of these.
+  # An identity installed at runtime by `SetAuth` is persisted to
+  # `runtime_state_path`, not written back over `cert_path`.
+  #
+  # `-`-prefixed: these are operator-provisioned and legitimately absent on a
+  # box that has been installed but not yet given its secrets, and a unit that
+  # refuses to start then would hide the real error (a missing seed) behind a
+  # namespace failure. The cost is that a file placed while the node is running
+  # is protected only from its next restart — which `scripts/wayfinder-ca.sh
+  # secrets` performs anyway.
+  nodeReadOnly = map (f: "-${secretsDir}/${f}") [
+    "root.seed"
+    "identity.seed"
+    "node.cert"
+    "trust-anchor"
+    "cloudflared.json"
+  ];
+
+  # Mesh link port. Bound on every address but reachable only over the tunnel:
+  # `services.wayfinder-tailscale` trusts `tailscale0` wholesale, and nothing
+  # opens this port on the public NIC — neither the NixOS firewall below nor
+  # the Oracle security list in `infra/oracle/main.tf`. The public address
+  # hears TCP/22, TCP/443, TCP/7700, UDP/3478 and UDP/41641, and nothing else.
+  meshPort = 6000;
 
   # This node's Ed25519 public key, as 64 hex characters — the public half of
   # `identity.seed` in `secretsDir`, printed by `wayfinderctl cert issue` when
@@ -104,17 +153,47 @@ in
     openFirewall = [ "ens3" ];
 
     config = {
-      # No `local_egress` and no `links`: see the header. `wayfinder-tap`
-      # runs a `NullEgress` for the local device in this posture.
+      # No `local_egress`: see the header. `wayfinder-tap` runs a `NullEgress`
+      # for the local device in this posture — the node routes, it just has no
+      # host traffic of its own to bridge.
       server = {
         type = "Tls";
         addr = "0.0.0.0:7700";
       };
 
+      # The one mesh link, riding the tunnel this box coordinates.
+      #
+      # **Hub/fan-out mode** — `discovery_addr` deliberately absent. A Tailscale
+      # tunnel is a set of point-to-point WireGuard links, not a shared
+      # segment, so there is no broadcast address to put one datagram into; a
+      # broadcast-destined frame is fanned out to every peer this node has
+      # learned from a received datagram instead. Every spoke is learned from
+      # the OGMs it sends here, so there is nothing to configure per peer —
+      # which is also what makes this the one link config on the fleet that
+      # needs no runtime-known address and can be fully rendered at build time.
+      # A spoke's link is the mirror image: it *does* set `discovery_addr`, to
+      # this node's tunnel address.
+      #
+      # `0.0.0.0`, not the tunnel address, for the same reason: `tailscale0`
+      # does not exist at boot and its address is not known when this is
+      # evaluated. The firewall is what confines the link to the tunnel — see
+      # `meshPort` above.
+      links = [
+        {
+          # Named rather than left to synthesize `udpm0`: this is the name an
+          # operator reads in `wayfinderctl links`, the dashboard and the TUI,
+          # and "which tunnel link" is more useful there than "which carrier
+          # kind". `scripts/wayfinder-ca.sh verify` looks for it too.
+          name = "vpn0";
+          type = "UdpMulti";
+          bind_addr = "0.0.0.0:${toString meshPort}";
+        }
+      ];
+
       # This node's own membership in the mesh it signs for. A provider
-      # should be a member: it is what lets it flood revocations once it has
-      # a link to flood them over, and it means the key clients pin is a
-      # certified identity rather than a bare bootstrap key.
+      # should be a member: it is what lets it flood revocations over the link
+      # above, and it means the key clients pin is a certified identity rather
+      # than a bare bootstrap key.
       auth = {
         seed_path = "${secretsDir}/identity.seed";
         cert_path = "${secretsDir}/node.cert";
@@ -131,12 +210,16 @@ in
         mesh_id = 1463900494;
 
         # Validity window applied to issued membership certificates.
-        # Deliberately short: passive expiry is this design's *primary*
-        # revocation mechanism — an active revocation has to reach every node
-        # over the mesh, and this CA has no links to flood it over — so a
-        # certificate lifetime is the real bound on how long a compromised
-        # node stays a member. One week means a node re-enrols weekly and a
-        # withdrawn node ages out within a week.
+        #
+        # Deliberately short, and still short now that this node has a link.
+        # An active revocation reaches only the nodes the flood actually gets
+        # to — a spoke that is offline, or off the tunnel, when the revocation
+        # goes out never hears it — so a certificate lifetime remains the only
+        # bound that holds for *every* member. What the link changes is the
+        # common case, not the worst one: a node that is up learns of a
+        # revocation in seconds instead of ageing out over a week. One week
+        # means a node re-enrols weekly and an unreachable withdrawn node ages
+        # out within a week.
         cert_ttl_secs = 7 * 24 * 60 * 60;
 
         # False, and it matters: this node is reachable from the open
@@ -183,10 +266,24 @@ in
   # DERP relay they fall back to when hole-punching fails is the one this box
   # runs — not Tailscale Inc.'s, which is what "isolated mesh" has to mean if
   # it means anything. The security list in `infra/oracle/main.tf` carries the
-  # two matching rules: TCP/443 for the API and the relay, UDP/3478 for STUN.
+  # matching rules: TCP/443 for the API and the relay, UDP/3478 for STUN, and
+  # UDP/41641 so this box's own `tailscaled` can be hole-punched to directly
+  # rather than relaying its mesh link through itself.
   services.wayfinder-headscale = {
     enable = true;
     domain = vpnHostname;
+
+    # Put this box on the tunnel it serves, so the `UdpMulti` link above has a
+    # tunnel address to be reached on. It goes through the same enrollment RPC
+    # every other node uses — connecting to its own management API over
+    # loopback with the identity seed above — so it registers under the
+    # Headscale user named after its own MAC, minted by the same code, and
+    # `wayfinderctl vpn list` names this peer like any other.
+    #
+    # A unit rather than an operator step: a preauth key can only be issued by
+    # a running Headscale, so it cannot be provisioned alongside the
+    # offline-minted trust material in `secretsDir`.
+    selfJoin.enable = true;
 
     # Real TLS, from Let's Encrypt, on 443. Not a hardening preference: a
     # `tailscaled` refuses a plaintext DERP connection and takes STUN probing
@@ -206,16 +303,28 @@ in
     headplane.enable = true;
   };
 
-  # The provisioned secrets live outside `/var/lib/wayfinder` (which the unit
-  # can write) precisely so the node cannot rewrite its own root of trust.
-  # Created here so the directory's mode is declared rather than depending on
-  # however the operator's `scp` left it; the files inside are the operator's
-  # to place.
-  systemd.tmpfiles.settings."10-wayfinder-ca".${secretsDir}.d = {
-    mode = "0700";
-    user = "wayfinder";
-    group = "wayfinder";
+  # The tunnel daemon this box's own mesh link rides. Pinned at the Headscale
+  # started above rather than at a literal, so the two cannot drift — the
+  # module asserts they agree before `selfJoin` will build.
+  #
+  # `networking.hosts` (set by the headscale module under TLS) resolves that
+  # name to 127.0.0.1 here, so this registration never leaves the box and does
+  # not depend on Oracle hairpinning the public address back.
+  services.wayfinder-tailscale = {
+    enable = true;
+    loginServer = config.services.wayfinder-headscale.endpoint;
   };
+
+  # `/var/lib/wayfinder` holds both the node's own state and the trust material
+  # an operator provisions (see `secretsDir`). 0700 rather than the module's
+  # 0755: on this box the directory contains the mesh root seed, and only the
+  # `wayfinder` user — and root — has any business traversing it.
+  systemd.tmpfiles.settings."10-wayfinder".${secretsDir}.d.mode = lib.mkForce "0700";
+
+  # The node reads its root of trust and must not be able to rewrite it. With
+  # the secrets inside the unit's own `ReadWritePaths`, that is a namespace
+  # remount rather than a directory it cannot reach — see `nodeReadOnly`.
+  systemd.services.wayfinder.serviceConfig.ReadOnlyPaths = nodeReadOnly;
 
   # The tunnel: an outbound connection to Cloudflare that public requests for
   # `dashboardHostname` are routed back down. Nothing is listening on the

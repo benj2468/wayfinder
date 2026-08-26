@@ -115,6 +115,12 @@ mod authority;
 #[cfg(feature = "std")]
 pub use authority::CertAuthority;
 
+/// A mesh address, re-exported because this crate's public API is stated in
+/// terms of it — [`decide_access`] takes one, [`AuthSnapshot`] carries one —
+/// and a caller should not have to depend on `wayfinder` to name a type it is
+/// handed here.
+pub use wayfinder::interfaces::frame::Mac;
+
 #[cfg(feature = "std")]
 mod transport;
 #[cfg(feature = "std")]

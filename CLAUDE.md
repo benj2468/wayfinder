@@ -468,8 +468,10 @@ the root workspace" above)
   `mkWayfinderSystem` (`<name>` is the installer ISO, `<name>-system` is what
   it installs).
 - **nix/machines/wayfinder-ca** → the cloud certificate authority: a node with
-  **no local egress and no mesh links**, holding the mesh root of trust and
-  serving enrollment over the management API. Built by `mkCloudSystem` (no
+  **no local egress**, holding the mesh root of trust and serving enrollment
+  over the management API. It also runs the tunnel control plane (design 08),
+  joins that tunnel itself, and carries one `UdpMulti` mesh link over it — so
+  it routes as well as signs. Built by `mkCloudSystem` (no
   installer half — a cloud VM is installed by `nixos-anywhere` kexec-ing over
   the provider's stock image) and provisioned by `infra/oracle/`. Its four
   secret files are minted offline with `wayfinderctl cert` and never enter this

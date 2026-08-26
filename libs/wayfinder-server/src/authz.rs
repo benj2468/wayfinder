@@ -56,7 +56,9 @@ pub enum MgmtAccess {
     /// Every node on the mesh holds such a certificate, so this tier is
     /// deliberately the narrowest in the enum: [`permits`] confines it to
     /// `GetVpnEnrollment` and nothing else. Anything admitted here is admitted
-    /// to the whole mesh at once.
+    /// to the whole mesh at once. (It is not the *only* tier admitted to that
+    /// request — [`MgmtAccess::GrantedSelfKey`] is too — but it is the only
+    /// one for which the request is the whole of what the tier can do.)
     ///
     /// It is earned by a *signed bit*, never by the absence of the others — see
     /// [`CERT_FLAG_MEMBER`](wayfinder::wayfinder_auth::CERT_FLAG_MEMBER). A
@@ -66,6 +68,12 @@ pub enum MgmtAccess {
     GrantedMember,
     /// Granted via the self-key path: the client proved possession of the node's
     /// *own* identity key.
+    ///
+    /// The widest tier: [`permits`] admits every request without exception,
+    /// including `GetVpnEnrollment` — which the admin tier is refused. That is
+    /// not this tier being *more* privileged so much as it being the only full
+    /// grant that is a device: it is the node, so the credential minted for it
+    /// is the node's own.
     GrantedSelfKey,
     /// Granted for enrollment only: the client presented no membership cert, so
     /// it is a stranger — admitted solely to submit a CSR and read the mesh
@@ -134,7 +142,9 @@ pub enum MgmtDenied {
 ///   caller (the TLS accept loop) reads it fresh from the router loop on every
 ///   connection, so a seed the node has since rotated away from — via
 ///   `SetAuth` installing a different one — stops earning this grant on the
-///   very next connection, not only after a restart.
+///   very next connection, not only after a restart. It is also the one full
+///   grant that is a *device* rather than a person, so it is the one admitted
+///   to `GetVpnEnrollment` — see [`permits`].
 /// * **Admin** ([`MgmtAccess::GrantedAdmin`]): the node is enrolled and the
 ///   client presented a `cert` that verifies against the `anchor` as of
 ///   `now_unix`, whose key matches `handshake_key` (binding the cert to this
@@ -195,22 +205,28 @@ pub fn decide_access(
 
 /// Whether a connection holding `access` may invoke `request`.
 ///
-/// Both full grants may invoke everything *except one request*, so this is
-/// really the definition of the three confined tiers: what
+/// [`MgmtAccess::GrantedSelfKey`] may invoke everything and
+/// [`MgmtAccess::GrantedAdmin`] everything but one request, so this is really
+/// the definition of the three confined tiers: what
 /// [`MgmtAccess::GrantedEnrollment`] means — the two requests a node that wants
 /// to join has to make, and nothing else — what [`MgmtAccess::GrantedViewer`]
 /// means, below, and what [`MgmtAccess::GrantedMember`] means, which is the one
-/// request the full grants are excluded from.
+/// request the admin tier is excluded from.
 ///
-/// # The one request a full grant may not invoke
+/// # The one request the admin tier may not invoke
 ///
 /// `GetVpnEnrollment` is gated on the request, ahead of the tier match. It is
 /// not a management capability being exercised — it mints a tunnel credential
-/// bound to *the calling device's own identity*, taken from the verified
-/// certificate on the connection. An operator's session certificate and the
-/// node's own seed are both fully privileged and neither is a device identity,
-/// so for them the request has no meaning rather than being a privilege they
-/// lack. See the comment at the top of the function body.
+/// bound to *the calling device's own identity*. An operator's session
+/// certificate is fully privileged and is not a device identity, so for it the
+/// request has no meaning rather than being a privilege it lacks.
+///
+/// The node's own seed *is* a device identity — the node's — which is why
+/// [`MgmtAccess::GrantedSelfKey`] is admitted here and the certificate
+/// authority can join the tunnel it coordinates through the same RPC every
+/// other node uses. What makes that safe is where the MAC comes from: the
+/// router, not the connection. See the comment at the top of the function
+/// body.
 ///
 /// * `SubmitCsr` — ask the provider to certify this node's keys. Whether it is
 ///   granted, parked for approval or refused is the provider's enrollment
@@ -282,19 +298,32 @@ pub fn decide_access(
 pub fn permits(access: MgmtAccess, request: &ReqKind) -> bool {
     // Decided by the request before the tier, and the only request that is.
     // `GetVpnEnrollment` does not grant its caller a capability — it mints a
-    // credential *for the caller's device identity*, which the transport reads
-    // from the verified certificate on the connection. A tier that holds no
-    // device identity therefore has nothing to mint for: an operator's session
-    // certificate is a person, and the self-key tier is whoever holds this
-    // node's seed. Neither is a node the coordination server can register, so
-    // both are refused here rather than served something meaningless.
+    // credential *for the caller's device identity*. So the question here is
+    // not how privileged a tier is but whether it names a node the
+    // coordination server can register.
+    //
+    // Two tiers do. The member tier is an enrolled device presenting the
+    // certificate this mesh's CA issued it, and the transport takes the MAC
+    // from that verified certificate. The self-key tier is the node itself —
+    // whoever holds its seed signs its OGMs and terminates its TLS — and the
+    // transport takes the MAC from the router (`AuthSnapshot::own_mac`),
+    // never from the connection, because a certificate presented on a
+    // self-key connection is never verified.
+    //
+    // The admin tier does not: an operator's session certificate is a person,
+    // not a device, so for it the request has no meaning rather than being a
+    // privilege it lacks.
     //
     // This is also what makes the design's two gates genuinely independent: a
     // party holding the shared enrollment token can have *a* certificate issued
     // for keys it names, but reaching this request additionally requires
-    // proving possession of the key that was certified.
+    // proving possession of a key that names a node — the certified one, or
+    // the node's own seed.
     if matches!(request, ReqKind::GetVpnEnrollment(_)) {
-        return matches!(access, MgmtAccess::GrantedMember);
+        return matches!(
+            access,
+            MgmtAccess::GrantedMember | MgmtAccess::GrantedSelfKey
+        );
     }
     match access {
         MgmtAccess::GrantedAdmin | MgmtAccess::GrantedSelfKey => true,
@@ -850,18 +879,23 @@ mod tests {
                 expected,
                 "enrollment tier verdict for {request:?}"
             );
-            // Both full grants may invoke anything *except* `GetVpnEnrollment`
-            // — the one request neither full grant means anything for, since
-            // its response is scoped to a device identity that neither tier
-            // holds. Asserted over the same closed set so neither can drift.
-            let full_grant_refuses = matches!(request, ReqKind::GetVpnEnrollment(_));
-            for full in [MgmtAccess::GrantedAdmin, MgmtAccess::GrantedSelfKey] {
-                assert_eq!(
-                    permits(full, request),
-                    !full_grant_refuses,
-                    "full grant verdict for {request:?}"
-                );
-            }
+            // The admin tier may invoke anything *except* `GetVpnEnrollment`
+            // — the one request it means nothing for, since its response is
+            // scoped to a device identity an operator's session certificate
+            // is not. Asserted over the same closed set so the two cannot
+            // drift.
+            assert_eq!(
+                permits(MgmtAccess::GrantedAdmin, request),
+                !matches!(request, ReqKind::GetVpnEnrollment(_)),
+                "admin tier verdict for {request:?}"
+            );
+            // The self-key tier is the one grant with no exception at all: it
+            // is the node itself, so `GetVpnEnrollment` has an identity to
+            // mint for — its own.
+            assert!(
+                permits(MgmtAccess::GrantedSelfKey, request),
+                "self-key tier verdict for {request:?}"
+            );
             assert!(
                 !permits(MgmtAccess::Denied(MgmtDenied::NoCapability), request),
                 "a denied connection was permitted {request:?}"
@@ -1217,22 +1251,21 @@ mod tests {
         }
     }
 
-    /// The VPN credential is the one request a *full* management grant may not
-    /// invoke. The response is scoped to the calling device's identity, and
-    /// neither an operator's session certificate nor the node's own seed is a
-    /// device identity — so there would be nothing to mint it for. Refusing it
-    /// here is what makes the design's "two gates in series" literal: the
-    /// credential is reachable only by proving possession of the key the CA
-    /// certified.
+    /// The VPN credential is minted for a *device*, so a tier that holds no
+    /// device identity may not ask for one however privileged it is. An
+    /// operator's session certificate is a person and a stranger holds nothing
+    /// at all — for both the request has no meaning rather than being a
+    /// privilege they lack. Refusing it here is what makes the design's "two
+    /// gates in series" literal: the credential is reachable only by proving
+    /// possession of a key that names a node.
     #[test]
-    fn no_management_grant_can_mint_a_device_credential() {
+    fn a_tier_holding_no_device_identity_cannot_mint_a_credential() {
         use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentRequest;
 
         let vpn_enrollment = ReqKind::GetVpnEnrollment(GetVpnEnrollmentRequest {});
 
         for tier in [
             MgmtAccess::GrantedAdmin,
-            MgmtAccess::GrantedSelfKey,
             MgmtAccess::GrantedViewer,
             MgmtAccess::GrantedEnrollment,
             MgmtAccess::Denied(MgmtDenied::NoCapability),
@@ -1242,6 +1275,30 @@ mod tests {
                 "{tier:?} must not mint a device's VPN credential"
             );
         }
+    }
+
+    /// The self-key tier *is* a device identity — the node itself — so it may
+    /// mint its own credential.
+    ///
+    /// This is the certificate authority's own case. It coordinates the tunnel
+    /// and is also a node on it, and the only credential it can present to
+    /// itself is its own seed. The tier was refused here for as long as the
+    /// MAC came off the presented certificate, which the self-key path never
+    /// verifies; the transport now takes it from the router instead
+    /// (`AuthSnapshot::own_mac`), so there is a device identity to mint for
+    /// and no client-supplied value anywhere in it.
+    ///
+    /// It gives its holder nothing new. Whoever holds the node's seed already
+    /// signs that node's OGMs and terminates its TLS, and on a provider can
+    /// reveal the enrollment token and approve its own CSR — so the long way
+    /// round to the same credential was always open.
+    #[test]
+    fn the_self_key_tier_may_mint_its_own_nodes_credential() {
+        use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentRequest;
+
+        let vpn_enrollment = ReqKind::GetVpnEnrollment(GetVpnEnrollmentRequest {});
+
+        assert!(permits(MgmtAccess::GrantedSelfKey, &vpn_enrollment));
     }
 
     /// Managing *other* peers' VPN registrations is ordinary administration, so

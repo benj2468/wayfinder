@@ -2,19 +2,21 @@
 # no hardware needed.
 #
 # It exercises the posture `nix/machines/wayfinder-ca` deploys and
-# `infra/oracle/` provisions for: a `wayfinder-tap` node with **no local egress
-# and no mesh links**, running in provider mode. Each assertion below is
-# something that has silently broken before, or that would break silently:
+# `infra/oracle/` provisions for: a `wayfinder-tap` node with **no local
+# egress** and one unprivileged `UdpMulti` mesh link, running in provider mode.
+# Each assertion below is something that has silently broken before, or that
+# would break silently:
 #
 #  1. Such a node starts at all. `wayfinder-tap` used to refuse a config with
 #     no `local_egress` — which is exactly the config a CA wants, since it has
 #     no host traffic to bridge and, on a cloud host, no CAP_NET_ADMIN or
 #     /dev/net/tun to build a TAP with even if it did.
-#  2. It runs **unprivileged**. `nix/modules/wayfinder.nix` derives
-#     `rawNetworkAccess` from the configured carriers, so a node with none must
-#     end up with an empty capability set. A regression here fails nothing
-#     visibly — it just quietly hands CAP_NET_RAW to an internet-facing process
-#     holding the mesh root key.
+#  2. It runs **unprivileged**, mesh link and all. `nix/modules/wayfinder.nix`
+#     derives `rawNetworkAccess` from the configured carriers, and a UDP socket
+#     is not one that needs privilege — so a CA carrying a link must still end
+#     up with an empty capability set. A regression here fails nothing visibly
+#     — it just quietly hands CAP_NET_RAW to an internet-facing process holding
+#     the mesh root key.
 #  3. A full enrollment cycle works: `csr request` at the node, `csr submit` to
 #     the CA, `csr approve` by an operator, collect, `csr install` back at the
 #     node. That is the entire reason the box exists.
@@ -35,7 +37,10 @@
 #     operator's admin identity is *refused* the tunnel credential, because the
 #     response is scoped to a device identity and an operator does not have
 #     one. This is the property that keeps the design's two gates independent
-#     rather than one gate handing out two artifacts.
+#     rather than one gate handing out two artifacts. It takes an admin key
+#     this box does not itself hold — the node's own seed is matched by the
+#     self-key tier first, and that tier is admitted to the request by design,
+#     since it is the node asking for its own credential.
 #  7. The two secrets the box mints for itself, neither of which can be
 #     provisioned the way the mesh trust material is: the Headscale API key the
 #     node reads at start-up (owned by the node's user, kept across a re-run
@@ -88,18 +93,44 @@ testers.nixosTest {
         services.wayfinder = {
           enable = true;
           config = {
-            # No `local_egress` and no `links`. That is the whole point.
+            # No `local_egress`. That is the whole point: this node bridges no
+            # host traffic, so it needs no TAP and no capability to build one.
             server = {
               type = "Tls";
               addr = "0.0.0.0:7700";
             };
+            # The CA's own mesh link, as `nix/machines/wayfinder-ca` deploys
+            # it: hub/fan-out mode, no `discovery_addr`, learning peers from
+            # the datagrams they send it.
+            #
+            # It is here for the capability assertion below rather than to
+            # carry traffic — nothing else in this test speaks to it. That is
+            # the point worth pinning: `UdpMulti` is not in
+            # `nix/modules/wayfinder.nix`'s `rawNetKinds`, so a link on this
+            # node must *not* pull `CAP_NET_RAW` back in and undo the sandbox.
+            # A regression there is invisible: the node works perfectly, on an
+            # internet-facing box holding the mesh root key, with every
+            # capability systemd grants by default.
+            #
+            # `nix/tests/vpn-data-plane.nix` is where this link shape actually
+            # carries frames, over a real tunnel. There is no `tailscaled`
+            # here: this CA serves plain HTTP (see the module block above), and
+            # a `tailscaled` refuses a plaintext DERP connection outright — so
+            # `selfJoin` belongs in that test, not this one.
+            links = [
+              {
+                name = "vpn0";
+                type = "UdpMulti";
+                bind_addr = "0.0.0.0:6000";
+              }
+            ];
             auth = {
-              seed_path = "/var/lib/wayfinder-secrets/identity.seed";
-              cert_path = "/var/lib/wayfinder-secrets/node.cert";
-              trust_anchor_path = "/var/lib/wayfinder-secrets/trust-anchor";
+              seed_path = "/var/lib/wayfinder/identity.seed";
+              cert_path = "/var/lib/wayfinder/node.cert";
+              trust_anchor_path = "/var/lib/wayfinder/trust-anchor";
             };
             provider = {
-              root_seed_path = "/var/lib/wayfinder-secrets/root.seed";
+              root_seed_path = "/var/lib/wayfinder/root.seed";
               mesh_id = 1463900494; # 0x5741594e
               cert_ttl_secs = 604800;
               # Operator approval, matching the deployed default: what an
@@ -116,8 +147,8 @@ testers.nixosTest {
                 # Minted on the box by the module's bootstrap unit, not
                 # provisioned out of band with the mesh trust material: an API
                 # key is machine-generated state this host can recreate at
-                # will, and it lives outside `wayfinder-secrets` to keep that
-                # directory exactly the four files an operator carries there.
+                # will, so it lives in headscale's own state directory rather
+                # than beside the four files an operator carries here.
                 api_key_path = "/var/lib/wayfinder-headscale/api.key";
                 login_server = "http://ca:8080";
                 preauth_ttl_secs = 300;
@@ -169,22 +200,50 @@ testers.nixosTest {
     node.wait_for_open_port(7700, timeout=30)
 
     with subtest("mint the mesh root of trust and the CA's own membership"):
-        ca.succeed("install -d -m 0700 -o wayfinder -g wayfinder /var/lib/wayfinder-secrets")
+        # Into /var/lib/wayfinder, beside the node's own state, as the
+        # deployment provisions them: `wayfinder-ctl` defaults `--identity` to
+        # /var/lib/wayfinder/identity.seed, and the CA is the box an operator
+        # types the most commands on. The node still cannot rewrite its root of
+        # trust — `nix/machines/wayfinder-ca/common.nix` remounts those files
+        # read-only inside the unit — which is the property the directory used
+        # to carry. The directory itself is the `wayfinder.nix` module's, made
+        # by its tmpfiles rule, so nothing creates it here.
         ca.succeed(
             "wayfinder-ctl cert init-ca --mesh-id 0x5741594e --generate "
-            "--out-seed /var/lib/wayfinder-secrets/root.seed "
-            "--out-anchor /var/lib/wayfinder-secrets/trust-anchor"
+            "--out-seed /var/lib/wayfinder/root.seed "
+            "--out-anchor /var/lib/wayfinder/trust-anchor"
         )
         ca.succeed(
-            "wayfinder-ctl cert keygen --out-seed /var/lib/wayfinder-secrets/identity.seed"
+            "wayfinder-ctl cert keygen --out-seed /var/lib/wayfinder/identity.seed"
         )
         now = int(ca.succeed("date +%s").strip())
         ca.succeed(
             "wayfinder-ctl cert issue "
-            "--ca-seed /var/lib/wayfinder-secrets/root.seed --mesh-id 0x5741594e "
-            "--node-seed /var/lib/wayfinder-secrets/identity.seed "
+            "--ca-seed /var/lib/wayfinder/root.seed --mesh-id 0x5741594e "
+            "--node-seed /var/lib/wayfinder/identity.seed "
             f"--not-before {now - 60} --not-after {now + 31536000} "
-            "--admin --out-cert /var/lib/wayfinder-secrets/node.cert"
+            "--admin --out-cert /var/lib/wayfinder/node.cert"
+        )
+
+        # A *second* admin identity, belonging to nobody on the mesh: a person's
+        # credential rather than this box's. It is minted into /tmp on purpose —
+        # an operator's key lives on the operator's laptop, not in the node's
+        # state directory, and nothing on this box provisions it.
+        #
+        # It exists for one assertion, the tunnel-credential refusal below, and
+        # that assertion cannot be made with the seed above. `decide_access`
+        # tests the self-key tier *first*, so the node's own seed earns
+        # `GrantedSelfKey` no matter what certificate accompanies it — and that
+        # tier is admitted to `GetVpnEnrollment`, because it is the node asking
+        # on its own behalf (`libs/wayfinder-server/src/authz.rs`). Reaching the
+        # admin tier at all therefore takes a key this node does not hold.
+        ca.succeed("wayfinder-ctl cert keygen --out-seed /tmp/operator.seed")
+        ca.succeed(
+            "wayfinder-ctl cert issue "
+            "--ca-seed /var/lib/wayfinder/root.seed --mesh-id 0x5741594e "
+            "--node-seed /tmp/operator.seed "
+            f"--not-before {now - 60} --not-after {now + 31536000} "
+            "--admin --out-cert /tmp/operator.cert"
         )
     with subtest("the colocated coordination server comes up on its own relay"):
         # Headscale refuses to start with an empty DERP map, so this also
@@ -305,15 +364,24 @@ testers.nixosTest {
         ca_key = [
             l.split()[-1]
             for l in ca.succeed(
-                "wayfinder-ctl cert show /var/lib/wayfinder-secrets/node.cert"
+                "wayfinder-ctl cert show /var/lib/wayfinder/node.cert"
             ).splitlines()
             if l.strip().startswith("ed25519:")
         ][0]
 
-        ca.succeed("chown wayfinder:wayfinder /var/lib/wayfinder-secrets/*")
-        ca.succeed("chmod 0400 /var/lib/wayfinder-secrets/*")
+        # Named one by one, never globbed. This directory also holds the state
+        # the node *writes* — ca-state.json, settings.json — and a `chmod 0400
+        # /var/lib/wayfinder/*` would take those with it and leave a CA that
+        # cannot record what it issues. `scripts/wayfinder-ca.sh secrets` has
+        # the same constraint for the same reason.
+        secrets = " ".join(
+            f"/var/lib/wayfinder/{f}"
+            for f in ("root.seed", "identity.seed", "node.cert", "trust-anchor")
+        )
+        ca.succeed(f"chown wayfinder:wayfinder {secrets}")
+        ca.succeed(f"chmod 0400 {secrets}")
 
-    with subtest("a node with no local egress and no links starts and serves"):
+    with subtest("a node with no local egress starts and serves"):
         ca.succeed("systemctl start wayfinder.service")
         ca.wait_for_unit("wayfinder.service")
         ca.wait_for_open_port(7700, timeout=30)
@@ -325,10 +393,25 @@ testers.nixosTest {
         # file fails here rather than at some node's enrollment hours later.
         ca.succeed("journalctl -u wayfinder | grep -q 'VPN coordination enabled'")
 
-    with subtest("it runs with no network capabilities at all"):
+        # And its mesh link is really bound, not merely configured. The socket
+        # is what the deployment's `scripts/wayfinder-ca.sh verify` checks for
+        # over SSH, and a link that failed to bind leaves a node that answers
+        # the management API while routing nothing.
+        ca.wait_until_succeeds("ss -lun | grep -q ':6000'", timeout=30)
+
+    with subtest("it runs with no network capabilities at all, link and all"):
         # Not merely "fewer than before": the effective, permitted and bounding
-        # sets must all be empty. A CA opens one TCP listener as an ordinary
-        # user and has no business being able to touch a network device.
+        # sets must all be empty. A CA opens one TCP listener and one UDP
+        # socket as an ordinary user and has no business being able to touch a
+        # network device.
+        #
+        # The `UdpMulti` link configured above is the live half of this
+        # assertion. `nix/modules/wayfinder.nix` derives `rawNetworkAccess`
+        # from the carriers a node is asked to carry, and a UDP socket needs no
+        # privilege — so adding a link to the CA must leave this set empty. If
+        # `UdpMulti` ever lands in `rawNetKinds`, this is what says so, and
+        # nothing else would: the node would work exactly as well with
+        # CAP_NET_RAW as without it.
         pid = ca.succeed("systemctl show -p MainPID --value wayfinder.service").strip()
         status = ca.succeed(f"cat /proc/{pid}/status")
         for field in ("CapEff", "CapPrm", "CapBnd"):
@@ -341,8 +424,8 @@ testers.nixosTest {
     with subtest("an operator reaches the CA with its admin identity"):
         info = ca.succeed(
             "wayfinder-ctl --connect 127.0.0.1:7700 "
-            "--identity /var/lib/wayfinder-secrets/identity.seed "
-            "--cert /var/lib/wayfinder-secrets/node.cert node-info"
+            "--identity /var/lib/wayfinder/identity.seed "
+            "--cert /var/lib/wayfinder/node.cert node-info"
         )
         assert "node" in info, info
 
@@ -368,7 +451,7 @@ testers.nixosTest {
         # incidental step.
         ca.succeed(
             "wayfinder-ctl --connect 127.0.0.1:7700 "
-            "--identity /var/lib/wayfinder-secrets/identity.seed "
+            "--identity /var/lib/wayfinder/identity.seed "
             "csr submit --request /tmp/req.json "
             "--out-cert /tmp/node.cert --out-anchor /tmp/anchor || true"
         )
@@ -376,8 +459,8 @@ testers.nixosTest {
 
         ca.succeed(
             "wayfinder-ctl --connect 127.0.0.1:7700 "
-            "--identity /var/lib/wayfinder-secrets/identity.seed "
-            "--cert /var/lib/wayfinder-secrets/node.cert "
+            "--identity /var/lib/wayfinder/identity.seed "
+            "--cert /var/lib/wayfinder/node.cert "
             f"csr approve --mac {node_mac}"
         )
 
@@ -385,7 +468,7 @@ testers.nixosTest {
         # the management protocol has no separate "fetch my certificate" call.
         ca.succeed(
             "wayfinder-ctl --connect 127.0.0.1:7700 "
-            "--identity /var/lib/wayfinder-secrets/identity.seed "
+            "--identity /var/lib/wayfinder/identity.seed "
             "csr submit --request /tmp/req.json "
             "--out-cert /tmp/node.cert --out-anchor /tmp/anchor"
         )
@@ -403,21 +486,45 @@ testers.nixosTest {
 
     with subtest("an operator's admin identity is refused a tunnel credential"):
         # The boundary that makes the two gates independent. This identity is a
-        # full admin — it approved the CSR above — and it still cannot obtain a
-        # tunnel credential, because the credential is scoped to a *device*
-        # identity and an operator's certificate is not one. If this ever starts
-        # succeeding, holding the enrollment token would be one step from
-        # holding network reachability.
+        # full admin — the same authority that approved the CSR above — and it
+        # still cannot obtain a tunnel credential, because the credential is
+        # scoped to a *device* identity and an operator's certificate is not
+        # one. If this ever starts succeeding, holding the enrollment token
+        # would be one step from holding network reachability.
+        #
+        # The operator seed minted at the top, not the node's own one every
+        # other command here uses: `decide_access` matches the self-key tier
+        # before it looks at any certificate, so this box's own seed never
+        # reaches the admin tier to be refused from it. It earns
+        # `GrantedSelfKey` — the node asking on its own behalf — which *is*
+        # admitted to this request, and is how the CA joins the tunnel it
+        # coordinates (`selfJoin`, exercised in `nix/tests/vpn-data-plane.nix`).
+        # Asserting the refusal with that seed asserted the opposite of what it
+        # said, and passed only while `tailscale up` was missing from this
+        # container.
+        #
+        # `--node-key` is therefore explicit here, where it is defaulted
+        # everywhere else: `wayfinder-ctl` falls back to the public half of
+        # `--identity`, which is the right pin only when the identity *is* the
+        # node's.
+        #
+        # `--print-command` stops at printing what it was given, so a regression
+        # fails at the authorization gate rather than at a `tailscale up` that
+        # would have failed anyway for want of a daemon.
         before = json.loads(ca.succeed("headscale users list -o json")) or []  # null when empty
         refusal = ca.fail(
-            "wayfinder-ctl --connect 127.0.0.1:7700 "
-            "--identity /var/lib/wayfinder-secrets/identity.seed "
-            "--cert /var/lib/wayfinder-secrets/node.cert vpn enrollment 2>&1"
+            f"wayfinder-ctl --connect 127.0.0.1:7700 --node-key {ca_key} "
+            "--identity /tmp/operator.seed "
+            "--cert /tmp/operator.cert vpn enrollment --print-command 2>&1"
         )
         # The exact wording matters here, not just the refusal: keyed on the
         # tier alone, an admin used to be told its connection "is limited to
-        # enrollment", which is false and points at the wrong fix.
-        assert "enrolled device" in refusal, refusal
+        # enrollment", which is false and points at the wrong fix. What it must
+        # say instead is the distinction the refusal actually rests on — the
+        # caller is a person and the credential names a device — because that
+        # is the difference between "ask for more privilege" (there is none to
+        # get) and "ask from the node".
+        assert "a person, not a device" in refusal, refusal
         assert "limited to enrollment" not in refusal, refusal
         # And nothing was minted for it. A refusal that still created the user
         # (or the key) would be a refusal in the response only.
@@ -462,8 +569,8 @@ testers.nixosTest {
     with subtest("an operator sees the node listed as a VPN peer"):
         peers = ca.succeed(
             "wayfinder-ctl --connect 127.0.0.1:7700 "
-            "--identity /var/lib/wayfinder-secrets/identity.seed "
-            "--cert /var/lib/wayfinder-secrets/node.cert vpn list"
+            "--identity /var/lib/wayfinder/identity.seed "
+            "--cert /var/lib/wayfinder/node.cert vpn list"
         )
         # No tailscaled has registered, so there is no *node* yet — the
         # assertion is that the call round-trips against the real API, which is
@@ -475,8 +582,8 @@ testers.nixosTest {
         # rather than hidden, so a clean success here means both actually ran.
         ca.succeed(
             "wayfinder-ctl --connect 127.0.0.1:7700 "
-            "--identity /var/lib/wayfinder-secrets/identity.seed "
-            "--cert /var/lib/wayfinder-secrets/node.cert "
+            "--identity /var/lib/wayfinder/identity.seed "
+            "--cert /var/lib/wayfinder/node.cert "
             f"revoke --mac {node_mac}"
         )
         users = json.loads(ca.succeed("headscale users list -o json")) or []
@@ -497,8 +604,8 @@ testers.nixosTest {
         # converge, so removing an already-absent registration is success.
         ca.succeed(
             "wayfinder-ctl --connect 127.0.0.1:7700 "
-            "--identity /var/lib/wayfinder-secrets/identity.seed "
-            "--cert /var/lib/wayfinder-secrets/node.cert "
+            "--identity /var/lib/wayfinder/identity.seed "
+            "--cert /var/lib/wayfinder/node.cert "
             f"vpn revoke --mac {node_mac}"
         )
 
@@ -507,8 +614,8 @@ testers.nixosTest {
         ca.wait_for_open_port(7700, timeout=30)
         certs = ca.succeed(
             "wayfinder-ctl --connect 127.0.0.1:7700 "
-            "--identity /var/lib/wayfinder-secrets/identity.seed "
-            "--cert /var/lib/wayfinder-secrets/node.cert list-certs"
+            "--identity /var/lib/wayfinder/identity.seed "
+            "--cert /var/lib/wayfinder/node.cert list-certs"
         )
         assert node_mac in certs, f"{node_mac} missing from the restarted CA's log:\n{certs}"
   '';
