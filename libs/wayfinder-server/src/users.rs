@@ -207,7 +207,7 @@ pub struct UserRecord {
 ///
 /// Serialized into the CA state snapshot, so its shape is part of the on-disk
 /// schema (see `persistence.rs`).
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct UserInvite {
     /// The account name this invite will create. Reserved from the moment it
     /// is minted, against the user store *and* against another invite.
@@ -216,9 +216,10 @@ pub struct UserInvite {
     /// and never by the redeemer: no field on either redemption request can
     /// ask for more than this.
     pub role: UserRole,
-    /// Session-certificate lifetime for the created account. Re-clamped to the
-    /// authority's cap at completion, not only at mint — the value is chosen
-    /// now and applied up to a day later.
+    /// Session-certificate lifetime for the created account. Refused at mint if
+    /// it is past the authority's cap, and re-checked at completion — where it
+    /// is *clamped* rather than refused, since the value is chosen now and
+    /// applied later, under a cap that may have moved in between.
     pub session_ttl_secs: u64,
     /// `Blake2s256` of the invite token under [`INVITE_TOKEN_LABEL`]. The
     /// token itself is never stored: it is a bearer credential sitting in the
@@ -246,6 +247,33 @@ pub struct UserInvite {
 
 /// Where an invite is in its one-way lifecycle.
 ///
+/// Redacted by hand rather than derived, because this record carries an
+/// account's second factor.
+///
+/// [`HeldCsr`](crate::authority) omits `Debug` outright for the same reason;
+/// this type keeps one because a `Vec<UserInvite>` is worth being able to print
+/// while debugging the store. What it must never do is put `totp_secret` in the
+/// bounded record ring that `GetLogs` serves over the management API — one
+/// `?invite` in a future log line would hand an account's second factor to any
+/// viewer-tier connection.
+///
+/// The token hash is shown as a length only: it is not a secret, but printing
+/// 32 bytes of it teaches a reader nothing and buries the fields that do.
+impl core::fmt::Debug for UserInvite {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("UserInvite")
+            .field("username", &self.username)
+            .field("role", &self.role)
+            .field("session_ttl_secs", &self.session_ttl_secs)
+            .field("token_hash", &"<32 bytes>")
+            .field("totp_secret", &"<redacted>")
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .field("status", &self.status)
+            .finish()
+    }
+}
+
 /// Two states and no third: an invite that has been completed does not have a
 /// status, it has been deleted — atomically, with the account's creation.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -363,6 +391,7 @@ impl UserRecord {
         role: UserRole,
         session_ttl_secs: u64,
     ) -> Result<Self, String> {
+        check_password_present(password)?;
         Ok(Self {
             username: username.to_string(),
             password_hash: hash_password(password)?,
@@ -397,6 +426,7 @@ impl UserRecord {
         role: UserRole,
         session_ttl_secs: u64,
     ) -> Result<Self, String> {
+        check_password_present(password)?;
         Ok(Self {
             username: username.to_string(),
             password_hash: hash_password(password)?,
@@ -495,6 +525,7 @@ impl UserRecord {
     /// resetting a password is also the way an operator locked out of their
     /// own account gets back in.
     pub fn set_password(&mut self, password: &str) -> Result<(), String> {
+        check_password_present(password)?;
         self.password_hash = hash_password(password)?;
         self.failed_attempts = 0;
         self.locked_until = 0;
@@ -517,6 +548,25 @@ impl UserRecord {
 /// well-formed PHC string as the parameters move.
 pub(crate) fn spend_absent_user_work(password: &str) {
     let _ = hash_password(password);
+}
+
+/// Refuse a password that carries no knowledge at all.
+///
+/// Checked where an account is *built*, not inside [`hash_password`]:
+/// [`spend_absent_user_work`] hashes on behalf of an account that does not
+/// exist, and an early return there would answer an empty password faster for
+/// an absent user than for a present one — precisely the enumeration oracle
+/// that function exists to close.
+///
+/// Both front ends already refuse this (`wayfinder-web`'s `api.rs`,
+/// `wayfinderctl`), but neither is the trust boundary:
+/// `CompleteUserRegistration` is on the enrollment tier, so a wire client
+/// holding an invite handle and no credential reaches the authority directly.
+fn check_password_present(password: &str) -> Result<(), String> {
+    if password.is_empty() {
+        return Err("a password is required".to_string());
+    }
+    Ok(())
 }
 
 /// Hash `password` with Argon2id at this module's parameters, returning a PHC
@@ -688,7 +738,7 @@ pub(crate) fn totp_code_for_tests(secret: &[u8], now_unix: u64) -> String {
 ///
 /// Unpadded because that is the form authenticator apps accept in a `secret=`
 /// query parameter; padding is not part of what they parse.
-fn base32_encode(bytes: &[u8]) -> String {
+pub(crate) fn base32_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     let mut out = String::new();
     let mut buffer: u16 = 0;
@@ -990,6 +1040,15 @@ mod tests {
         assert!(
             !stored.contains(&token),
             "the token itself must not be recoverable from the record"
+        );
+        // Asserted against the secret's own rendering, not against the word
+        // "secret": a check for a substring the type could never contain
+        // passes whatever the type grows later.
+        let secret = base32_encode(&invite.totp_secret);
+        assert!(
+            !stored.contains(&secret),
+            "and neither must the second factor: this record's `Debug` reaches \
+             the ring `GetLogs` serves the moment anyone writes `?invite`"
         );
         assert_eq!(invite.token_hash, invite_token_hash(&token));
         assert_ne!(

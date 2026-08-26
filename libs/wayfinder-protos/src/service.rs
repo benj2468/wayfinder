@@ -1355,7 +1355,7 @@ fn audited(k: &RequestKind) -> Audited {
         // revocation runs through it.
         | RequestKind::RevokeVpnPeer(_)
         // Minting an invite is deciding that an account will exist, with a role
-        // chosen now and applied up to a day later. The same reasoning as
+        // chosen now and applied up to a week later. The same reasoning as
         // CreateUser beside it, one step earlier in time.
         | RequestKind::CreateUserInvite(_)
         // And revoking one takes that decision back — often *because* the

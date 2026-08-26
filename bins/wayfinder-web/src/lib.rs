@@ -322,8 +322,10 @@ const VPN_TAB_PATH: &str = "provider/vpn";
 /// is the empty state every tab starts in.
 ///
 /// The hiding is done in the stylesheet — `.wf-app:has(.wf-login-page)
-/// .wf-shell` — rather than by a reactive class here, and that is not a style
-/// preference. Every read of the viewer resource has to happen inside a
+/// .wf-shell:not(.wf-shell-bare)` — rather than by a reactive class here, and
+/// that is not a style preference. (The `:not()` is `/register`'s exemption:
+/// that page reuses `.wf-login-page` for its layout and renders inside the
+/// shell, so without it the rule hides the registration page from itself.) Every read of the viewer resource has to happen inside a
 /// `<Suspense>`, or leptos renders one thing on the server and another on
 /// hydration; a class *attribute* on the shell cannot be inside one. In this
 /// crate a hydration mismatch is not a cosmetic bug, it is a wasm panic that
@@ -363,8 +365,11 @@ pub fn App() -> impl IntoView {
 /// route is being rendered, and `use_location` is only available inside
 /// `<Router>`.
 ///
-/// `/register` is the one route that renders without the shell around it. Two
-/// things follow, and the second is the load-bearing one:
+/// `/register` is the one route that renders with the shell's chrome
+/// suppressed — inside `.wf-shell` like every other route, since `<Routes>` is
+/// unconditional, but with the header, tab bar and status strip skipped and the
+/// bare-shell class set. Two things follow, and the second is the load-bearing
+/// one:
 ///
 /// * The header, tab bar and status strip are chrome for somebody looking at a
 ///   node. A person creating an account is not, and giving them a dashboard's

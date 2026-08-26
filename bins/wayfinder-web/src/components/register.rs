@@ -4,8 +4,11 @@
 //! # Why it is not part of the dashboard
 //!
 //! It is routed (`/register`) so `generate_route_list` registers it, but it
-//! renders *without* the shell: no header, no tab bar, no status strip, and —
-//! critically — no sign-in overlay. A registrant is signed out by definition,
+//! renders inside the shell with the shell's chrome suppressed: no header, no
+//! tab bar, no status strip, and — critically — no sign-in overlay. (Inside,
+//! not outside: `<Routes>` sits within `.wf-shell` unconditionally, which is
+//! why the stylesheet needs `wf-shell-bare` to stop the sign-in rule hiding
+//! this page along with it.) A registrant is signed out by definition,
 //! which is exactly the state that overlay covers the page for, so a
 //! registration page inside the shell would be a page nobody could reach. And
 //! giving somebody who has no account a dashboard's tab bar to look at is
@@ -63,6 +66,39 @@ const HANDLE_KEY: &str = "wf_registration_handle";
 #[cfg(feature = "hydrate")]
 const USERNAME_KEY: &str = "wf_registration_username";
 
+/// Where the handle's deadline is kept beside it.
+///
+/// Without it a lapsed registration is indistinguishable from a live one until
+/// the provider refuses it — and an unrecognisable dead handle is what lets it
+/// shadow the next invitation opened in this tab.
+#[cfg(feature = "hydrate")]
+const EXPIRES_KEY: &str = "wf_registration_expires";
+
+/// A registration this tab is part-way through.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StoredRegistration {
+    /// The account being registered, so a resumed page still says whose it is.
+    username: String,
+    /// The handle that finishes it.
+    handle: String,
+    /// Unix seconds after which the handle is dead. Zero when it was written by
+    /// a build that did not record one, which is treated as live — the
+    /// provider is the authority on that, and guessing "dead" would throw away
+    /// a registration that might still finish.
+    expires_unix: u64,
+}
+
+impl StoredRegistration {
+    /// Whether this handle could still complete a registration.
+    ///
+    /// `now_unix == 0` means the page could not read a clock, in which case
+    /// nothing here is decidable and the handle is given the benefit of the
+    /// doubt.
+    fn is_live(&self, now_unix: u64) -> bool {
+        self.expires_unix == 0 || now_unix == 0 || now_unix < self.expires_unix
+    }
+}
+
 /// What the page is currently doing, which is also what it renders.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Stage {
@@ -71,7 +107,13 @@ enum Stage {
     /// whether a token is valid — the server has not seen one.
     Opening,
     /// The invitation was redeemed: enrol the second factor, choose a password.
-    Enrolling(RegistrationStart),
+    Enrolling {
+        /// What the redemption revealed.
+        start: RegistrationStart,
+        /// Whether this browser refused to keep the handle, so a refresh would
+        /// end the registration rather than resume it.
+        at_risk: bool,
+    },
     /// A refresh resumed a registration whose secret has already been shown.
     /// The handle survived; the URI deliberately did not.
     Resumed {
@@ -79,6 +121,8 @@ enum Stage {
         username: String,
         /// The handle that finishes it.
         handle: String,
+        /// Unix seconds after which that handle is dead, or zero if unknown.
+        expires_unix: u64,
     },
     /// The account exists. Nothing left to do here but sign in.
     Done {
@@ -89,6 +133,14 @@ enum Stage {
     Failed {
         /// What to show. The provider's own wording where there is one.
         message: String,
+        /// Whether the invitation was actually spent by this attempt.
+        ///
+        /// False for a failure that never reached the provider, where the
+        /// invitation is untouched and the link is still worth retrying. The
+        /// two must not read alike: "somebody else opened your link" sends a
+        /// registrant to their administrator to report a compromise, and a
+        /// network blip is not one.
+        spent: bool,
     },
 }
 
@@ -116,15 +168,26 @@ pub fn Register() -> impl IntoView {
             </div>
             {move || match stage.get() {
                 Stage::Opening => view! { <Opening /> }.into_any(),
-                Stage::Enrolling(start) => {
-                    view! { <Enrol start=start stage=stage busy=busy message=message /> }.into_any()
+                Stage::Enrolling { start, at_risk } => {
+                    view! {
+                        <Enrol
+                            start=start
+                            at_risk=at_risk
+                            stage=stage
+                            busy=busy
+                            message=message
+                        />
+                    }
+                        .into_any()
                 }
-                Stage::Resumed { username, handle } => {
+                Stage::Resumed { username, handle, expires_unix } => {
                     view! {
                         <Finish
                             username=username
                             handle=handle
                             uri=None
+                            deadline=expires_unix
+                            at_risk=false
                             stage=stage
                             busy=busy
                             message=message
@@ -133,54 +196,130 @@ pub fn Register() -> impl IntoView {
                         .into_any()
                 }
                 Stage::Done { username } => view! { <Done username=username /> }.into_any(),
-                Stage::Failed { message } => view! { <Failed message=message /> }.into_any(),
+                Stage::Failed { message, spent } => {
+                    view! { <Failed message=message spent=spent /> }.into_any()
+                }
             }}
         </div>
     }
 }
 
-/// Read the fragment, resume or redeem, and move `stage` on.
+/// What opening the page should do, given what the tab remembers and what the
+/// link carries.
 ///
-/// Split out of the component so the ordering is readable in one place: a
-/// resumable handle wins over a token, because the token that produced that
-/// handle is already spent and re-presenting it would fail.
-fn open_registration(stage: RwSignal<Stage>) {
-    // Resuming beats starting. A refresh still has the fragment in the address
-    // bar only if `replaceState` did not run, and re-sending that token would
-    // be refused as already-started — which is correct behaviour producing the
-    // wrong outcome for the person in front of it.
-    if let Some((username, handle)) = stored_registration() {
-        stage.set(Stage::Resumed { username, handle });
-        return;
-    }
+/// A pure function so the precedence is testable without a browser — the three
+/// inputs meet in exactly one place, and getting the order wrong strands
+/// somebody holding a perfectly good invitation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Opening {
+    /// Finish the registration this tab already started.
+    Resume(StoredRegistration),
+    /// Redeem this token.
+    Redeem(String),
+    /// Neither: there is nothing here to work with.
+    NothingToDo,
+}
 
-    let Some(token) = token_from_fragment() else {
-        stage.set(Stage::Failed {
+/// Decide between a remembered registration and a token in the link.
+///
+/// A *live* remembered registration wins: the token that produced it is already
+/// spent, so re-presenting it would be refused — correct behaviour producing
+/// the wrong outcome for the person in front of it.
+///
+/// A remembered registration whose handle window has closed loses to a token,
+/// and this is the case that matters. Without it a dead handle shadows every
+/// later invitation opened in the same tab: the window lapses, the admin
+/// re-mints, the registrant opens the new link in the tab already sitting on
+/// this page — and the dead handle answers first, so the new token is never
+/// even read. The admin then sees a second untouched invitation and concludes
+/// the link is not arriving. The only escape was closing the tab, and nothing
+/// on screen said so.
+fn decide_opening(
+    stored: Option<StoredRegistration>,
+    token: Option<String>,
+    now_unix: u64,
+) -> Opening {
+    match (stored, token) {
+        (Some(stored), token) if stored.is_live(now_unix) => {
+            debug_assert!(token.is_some() || stored.is_live(now_unix));
+            Opening::Resume(stored)
+        }
+        (_, Some(token)) => Opening::Redeem(token),
+        // Dead, and there is no token to prefer over it. Resuming anyway
+        // reaches the provider's own "no longer valid" wording, which says
+        // more than this page could.
+        (Some(stored), None) => Opening::Resume(stored),
+        (None, None) => Opening::NothingToDo,
+    }
+}
+
+/// Read the fragment, resume or redeem, and move `stage` on.
+fn open_registration(stage: RwSignal<Stage>) {
+    match decide_opening(stored_registration(), token_from_fragment(), now_unix()) {
+        Opening::Resume(stored) => stage.set(Stage::Resumed {
+            username: stored.username,
+            handle: stored.handle,
+            expires_unix: stored.expires_unix,
+        }),
+        Opening::Redeem(token) => redeem(token, stage),
+        Opening::NothingToDo => stage.set(Stage::Failed {
             message: "This page needs an invitation link. Ask whoever invited you for one — the \
                       link carries the invitation after a '#'."
                 .to_string(),
-        });
-        return;
-    };
+            spent: false,
+        }),
+    }
+}
 
+/// Spend the token and move the page on to enrolment.
+fn redeem(token: String, stage: RwSignal<Stage>) {
     leptos::task::spawn_local(async move {
         match crate::api::begin_registration(token).await {
             Ok(start) => {
                 // Stored before anything is rendered: the invitation is spent
                 // by now, so a page that showed the QR code and *then* failed
                 // to keep the handle would leave nothing to recover with.
-                remember_registration(&start.username, &start.handle);
-                stage.set(Stage::Enrolling(start));
+                let kept = remember_registration(&start);
+                // Only now is the token worth discarding. Clearing it before
+                // the call meant a transport failure took the token out of the
+                // address bar without ever redeeming it — a good invitation
+                // lost to a two-second blip, with the provider still showing it
+                // as pending and nothing anywhere saying what happened.
+                clear_fragment();
+                stage.set(Stage::Enrolling {
+                    start,
+                    // A browser that will not keep the handle is one where a
+                    // refresh ends the registration. The person can still
+                    // finish, and is the only one who can be told not to
+                    // navigate away.
+                    at_risk: !kept,
+                });
             }
-            Err(error) => stage.set(Stage::Failed {
-                message: error.to_string(),
-            }),
+            Err(error) => {
+                // The provider refused, or we never reached it. Only the first
+                // spends an invitation, and telling somebody their link was
+                // "already used" when the node was simply unreachable sends
+                // them to an administrator to report a compromise that did not
+                // happen.
+                let spent = !is_transport_failure(&error);
+                if spent {
+                    clear_fragment();
+                }
+                stage.set(Stage::Failed {
+                    message: error.to_string(),
+                    spent,
+                });
+            }
         }
     });
 }
 
-/// The invitation token from `window.location.hash`, clearing the fragment once
-/// it has been read.
+/// The invitation token from `window.location.hash`.
+///
+/// Reads and does **not** clear: the token is the only copy of a credential
+/// until the provider has answered, and taking it out of the address bar before
+/// then turns any transport failure into a lost invitation. [`clear_fragment`]
+/// is called once the answer is in.
 ///
 /// `None` on the server (there is no window), and for a `/register` opened with
 /// no fragment at all — which is somebody who followed a bare link, and is told
@@ -190,15 +329,64 @@ fn token_from_fragment() -> Option<String> {
     let window = web_sys::window()?;
     let hash = window.location().hash().ok()?;
     let token = hash.trim_start_matches('#').trim().to_string();
+    (!token.is_empty()).then_some(token)
+}
 
-    // Cleared immediately, whether or not it turns out to be redeemable: the
-    // address bar is read over shoulders and copied into chats, and the token
-    // has no further use on this page — the handle has replaced it.
+/// Take the token out of the address bar.
+///
+/// Called once the invitation has actually been spent — by a redemption or by
+/// the provider's refusal of it — and not before: the address bar is read over
+/// shoulders and copied into chats, but a token that still has work to do is
+/// worth more there than the risk costs.
+#[cfg(feature = "hydrate")]
+fn clear_fragment() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
     if let Ok(history) = window.history() {
         let _ = history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some("/register"));
     }
+}
 
-    (!token.is_empty()).then_some(token)
+/// Server rendering has no address bar.
+#[cfg(not(feature = "hydrate"))]
+fn clear_fragment() {}
+
+/// The browser's wall clock in Unix seconds, or zero when there is none.
+///
+/// Zero is "undecidable", not "the epoch": every caller treats it as a reason
+/// to defer to the provider rather than to judge a deadline itself.
+#[cfg(feature = "hydrate")]
+fn now_unix() -> u64 {
+    (js_sys::Date::now() / 1000.0) as u64
+}
+
+/// Server rendering decides no deadlines.
+#[cfg(not(feature = "hydrate"))]
+fn now_unix() -> u64 {
+    0
+}
+
+/// Whether this error means the provider was never reached.
+///
+/// The distinction decides whether an invitation was spent, so it is made from
+/// the transport-level variants rather than by matching on message text: a
+/// request that failed to go out, or whose response never came back, cannot
+/// have redeemed anything. Anything the provider itself said — including a
+/// refusal — is treated as having spent the invitation, which is the safe
+/// direction to be wrong in.
+#[cfg(feature = "hydrate")]
+fn is_transport_failure(error: &ServerFnError) -> bool {
+    matches!(
+        error,
+        ServerFnError::Request(_) | ServerFnError::Response(_) | ServerFnError::Deserialization(_)
+    )
+}
+
+/// Server rendering never calls this.
+#[cfg(not(feature = "hydrate"))]
+fn is_transport_failure(_error: &ServerFnError) -> bool {
+    false
 }
 
 /// No fragment exists on the server, which is the whole point of putting the
@@ -209,36 +397,70 @@ fn token_from_fragment() -> Option<String> {
 }
 
 /// The registration this tab is part-way through, if any.
+///
+/// The handle is the load-bearing value; the username is decoration and the
+/// deadline is advisory, so neither may veto a resume. Gating on all three —
+/// which the `?` chain used to do — meant a browser that wrote one key and
+/// refused the next discarded a perfectly usable handle.
 #[cfg(feature = "hydrate")]
-fn stored_registration() -> Option<(String, String)> {
+fn stored_registration() -> Option<StoredRegistration> {
     let storage = web_sys::window()?.session_storage().ok()??;
     let handle = storage.get_item(HANDLE_KEY).ok()??;
-    let username = storage.get_item(USERNAME_KEY).ok()??;
-    (!handle.is_empty()).then_some((username, handle))
+    if handle.is_empty() {
+        return None;
+    }
+    Some(StoredRegistration {
+        username: storage
+            .get_item(USERNAME_KEY)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "your account".to_string()),
+        handle,
+        expires_unix: storage
+            .get_item(EXPIRES_KEY)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+    })
 }
 
 /// Nothing is stored during server rendering.
 #[cfg(not(feature = "hydrate"))]
-fn stored_registration() -> Option<(String, String)> {
+fn stored_registration() -> Option<StoredRegistration> {
     None
 }
 
-/// Keep the handle so a refresh resumes rather than stranding the registration.
+/// Keep the handle so a refresh resumes rather than stranding the registration,
+/// reporting whether the browser actually took it.
+///
+/// The answer matters and used to be discarded. By the time this is called the
+/// invitation is spent and the TOTP secret has been shown for the only time it
+/// ever will be, so a browser that silently refuses the write — Safari's
+/// private mode hands out a live `sessionStorage` whose every `setItem` throws
+/// on a zero quota, and this flow is often run on a phone — leaves a
+/// registration that ends at the next refresh with nothing to recover from.
+/// The person in front of it is the only one who can be told not to navigate
+/// away.
 #[cfg(feature = "hydrate")]
-fn remember_registration(username: &str, handle: &str) {
+fn remember_registration(start: &RegistrationStart) -> bool {
     let Some(Ok(Some(storage))) = web_sys::window().map(|w| w.session_storage()) else {
-        // Storage can be denied outright (a locked-down browser, some private
-        // modes). The registration still works — it just will not survive a
-        // refresh, which is a worse day and not a broken one.
-        return;
+        // Storage denied outright (a locked-down browser, some private modes).
+        return false;
     };
-    let _ = storage.set_item(HANDLE_KEY, handle);
-    let _ = storage.set_item(USERNAME_KEY, username);
+    // The handle alone decides the answer: without it there is nothing to
+    // resume, while the other two only make a resumed page friendlier.
+    let kept = storage.set_item(HANDLE_KEY, &start.handle).is_ok();
+    let _ = storage.set_item(USERNAME_KEY, &start.username);
+    let _ = storage.set_item(EXPIRES_KEY, &start.handle_expires_unix.to_string());
+    kept
 }
 
 /// Server rendering keeps nothing.
 #[cfg(not(feature = "hydrate"))]
-fn remember_registration(_username: &str, _handle: &str) {}
+fn remember_registration(_start: &RegistrationStart) -> bool {
+    false
+}
 
 /// Drop the stored handle: the registration finished, or is beyond finishing.
 #[cfg(feature = "hydrate")]
@@ -248,6 +470,7 @@ fn forget_registration() {
     };
     let _ = storage.remove_item(HANDLE_KEY);
     let _ = storage.remove_item(USERNAME_KEY);
+    let _ = storage.remove_item(EXPIRES_KEY);
 }
 
 /// Server rendering has nothing to forget.
@@ -273,6 +496,8 @@ fn Opening() -> impl IntoView {
 fn Enrol(
     /// What the redemption revealed.
     start: RegistrationStart,
+    /// Whether this browser refused to keep the handle.
+    at_risk: bool,
     /// The page's stage, moved on when the account is created.
     stage: RwSignal<Stage>,
     /// Whether a submit is in flight.
@@ -283,11 +508,14 @@ fn Enrol(
     let username = start.username.clone();
     let handle = start.handle.clone();
     let uri = start.totp_enrolment_uri.clone();
+    let deadline = start.handle_expires_unix;
     view! {
         <Finish
             username=username
             handle=handle
             uri=Some(uri)
+            deadline=deadline
+            at_risk=at_risk
             stage=stage
             busy=busy
             message=message
@@ -309,6 +537,11 @@ fn Finish(
     handle: String,
     /// The enrolment URI, or `None` on a resumed registration.
     uri: Option<String>,
+    /// Unix seconds after which the handle is dead, or zero if unknown.
+    deadline: u64,
+    /// Whether this browser refused to keep the handle, so a refresh ends the
+    /// registration rather than resuming it.
+    at_risk: bool,
     /// The page's stage, moved on when the account is created.
     stage: RwSignal<Stage>,
     /// Whether a submit is in flight.
@@ -319,6 +552,8 @@ fn Finish(
     let password = RwSignal::new(String::new());
     let repeat = RwSignal::new(String::new());
     let code = RwSignal::new(String::new());
+    // `None` until the button is pressed; then what the browser actually did.
+    let copied = RwSignal::new(Option::<bool>::None);
 
     let name_for_submit = username.clone();
     let submit = move |ev: SubmitEvent| {
@@ -362,7 +597,19 @@ fn Finish(
                 // A wrong code does not spend the handle, so this really is a
                 // "try again" rather than a dead end — and saying so is the
                 // difference between retyping six digits and giving up.
-                Err(error) => message.set(Some(error.to_string())),
+                Err(error) => {
+                    // A handle past its own deadline is not retryable, and
+                    // leaving it in storage is what let a dead registration
+                    // shadow the next invitation opened in this tab. Judged by
+                    // the deadline rather than by the provider's wording: the
+                    // message is prose meant for a person, and matching on it
+                    // would break the day it is reworded.
+                    let expired = deadline != 0 && now_unix() >= deadline;
+                    if expired {
+                        forget_registration();
+                    }
+                    message.set(Some(error.to_string()));
+                }
             }
         });
     };
@@ -376,7 +623,32 @@ fn Finish(
                     <strong class="wf-mono">{username.clone()}</strong>
                     ". Nobody else sees the password or the authenticator secret you set here."
                 </p>
+                // The window exists whether or not it is shown, and the page's
+                // own instruction is to go and do something on another device.
+                // Blowing a deadline nobody mentioned is the ordinary outcome,
+                // not the exceptional one.
+                {(deadline != 0)
+                    .then(|| {
+                        view! {
+                            <p class="wf-panel-sub">
+                                "Finish by "
+                                <strong class="wf-mono">
+                                    {crate::format::timestamp(deadline)}
+                                </strong>
+                                ". After that this invitation has to be minted again."
+                            </p>
+                        }
+                    })}
             </div>
+
+            {at_risk
+                .then(|| {
+                    view! {
+                        <p class="wf-login-error">
+                            "This browser will not let the page save your progress. Finish here without refreshing or closing the tab — this invitation cannot be started again."
+                        </p>
+                    }
+                })}
 
             {uri
                 .map(|uri| {
@@ -390,10 +662,22 @@ fn Finish(
                                 type="button"
                                 class="wf-button"
                                 on:click=move |_| {
-                                    let _ = crate::clipboard::copy(&uri);
+                                    // The answer is reported, never assumed:
+                                    // `copy` returns false for a refusal, and
+                                    // a registrant who believes a copy that did
+                                    // not happen pastes the previous clipboard
+                                    // into their authenticator and loses a
+                                    // secret shown once. There is no QR code
+                                    // here, so on a desktop this button is the
+                                    // only practical route to a phone.
+                                    copied.set(Some(crate::clipboard::copy(&uri)));
                                 }
                             >
-                                "Copy setup link"
+                                {move || match copied.get() {
+                                    Some(true) => "Copied",
+                                    Some(false) => "Could not copy — select it and copy by hand",
+                                    None => "Copy setup link",
+                                }}
                             </button>
                         </div>
                     }
@@ -474,14 +758,27 @@ fn Done(
 fn Failed(
     /// What to tell the reader. The provider's own wording where there is one.
     message: String,
+    /// Whether the invitation was actually spent by this attempt.
+    spent: bool,
 ) -> impl IntoView {
     view! {
         <div class="wf-panel wf-login">
             <div class="wf-panel-head">
-                <h2 class="wf-panel-title">"This invitation cannot be used"</h2>
+                <h2 class="wf-panel-title">
+                    {if spent { "This invitation cannot be used" } else { "Could not reach the node" }}
+                </h2>
                 <p class="wf-panel-sub">{message}</p>
+                // Two different things to say, and saying the wrong one has a
+                // cost in each direction. "Somebody else opened your link"
+                // sends a registrant to their administrator to report a
+                // compromise; telling somebody whose invitation really was
+                // spent to "try again" leaves them retrying a dead link.
                 <p class="wf-panel-sub">
-                    "An invitation is good once and expires. If somebody else opened your link, it is already spent — tell whoever invited you, and ask for a new one."
+                    {if spent {
+                        "An invitation is good once and expires. If somebody else opened your link, it is already spent — tell whoever invited you, and ask for a new one."
+                    } else {
+                        "Your invitation has not been used. Open the same link again in a moment — if it keeps failing, tell whoever invited you that the node is not answering."
+                    }}
                 </p>
             </div>
         </div>
@@ -490,24 +787,110 @@ fn Failed(
 
 #[cfg(test)]
 mod tests {
+    use super::Opening;
+    use super::StoredRegistration;
+    use super::decide_opening;
+
+    /// A registration in progress, as `sessionStorage` would hand it back.
+    fn stored(expires_unix: u64) -> StoredRegistration {
+        StoredRegistration {
+            username: "rowan".to_string(),
+            handle: "HANDLE".to_string(),
+            expires_unix,
+        }
+    }
+
+    /// A live registration in progress beats a token, because the token that
+    /// produced it is already spent and re-presenting it would be refused.
+    #[test]
+    fn a_live_registration_resumes_rather_than_re_redeeming() {
+        assert_eq!(
+            decide_opening(Some(stored(2_000)), Some("TOKEN".to_string()), 1_000),
+            Opening::Resume(stored(2_000))
+        );
+    }
+
+    /// A registration whose handle window has closed loses to a token.
+    ///
+    /// This is the case that strands people. Without it the dead handle answers
+    /// first and the new token is never read — so the invitation an admin
+    /// re-minted in response to the *first* failure is not spent either, the
+    /// panel shows it untouched, and it reads as a delivery problem. The only
+    /// escape was closing the tab, which nothing on screen suggested.
+    #[test]
+    fn a_dead_registration_does_not_shadow_a_fresh_token() {
+        assert_eq!(
+            decide_opening(Some(stored(1_000)), Some("TOKEN".to_string()), 2_000),
+            Opening::Redeem("TOKEN".to_string())
+        );
+    }
+
+    /// A dead handle with no token still resumes, so the provider's own wording
+    /// explains it rather than this page guessing.
+    #[test]
+    fn a_dead_registration_with_no_token_still_resumes() {
+        assert_eq!(
+            decide_opening(Some(stored(1_000)), None, 2_000),
+            Opening::Resume(stored(1_000))
+        );
+    }
+
+    /// A handle stored without a deadline — written by a build that did not
+    /// record one — is given the benefit of the doubt rather than discarded.
+    #[test]
+    fn a_handle_with_no_recorded_deadline_is_treated_as_live() {
+        assert_eq!(
+            decide_opening(Some(stored(0)), Some("TOKEN".to_string()), 2_000),
+            Opening::Resume(stored(0))
+        );
+    }
+
+    /// A page that cannot read a clock defers to the provider instead of
+    /// declaring a handle dead on a guess.
+    #[test]
+    fn an_unreadable_clock_does_not_condemn_a_handle() {
+        assert_eq!(
+            decide_opening(Some(stored(1_000)), Some("TOKEN".to_string()), 0),
+            Opening::Resume(stored(1_000))
+        );
+    }
+
+    /// Nothing stored and nothing in the link is the bare-link case.
+    #[test]
+    fn nothing_stored_and_no_token_is_nothing_to_do() {
+        assert_eq!(decide_opening(None, None, 1_000), Opening::NothingToDo);
+    }
+
+    /// A token with nothing stored is the ordinary first visit.
+    #[test]
+    fn a_token_with_nothing_stored_is_redeemed() {
+        assert_eq!(
+            decide_opening(None, Some("TOKEN".to_string()), 1_000),
+            Opening::Redeem("TOKEN".to_string())
+        );
+    }
+
     /// The rule that hides the dashboard behind the sign-in form must not hide
     /// *this* page, which reuses the sign-in page's layout class.
     ///
-    /// `.wf-app:has(.wf-login-page) .wf-shell` matches on the presence of
-    /// `.wf-login-page` anywhere inside the shell — and this page renders one,
-    /// inside the shell, on a route that has no sign-in overlay to hide
-    /// anything behind. Without the exclusion the whole shell is
-    /// `display: none` and the registrant gets a blank page: the markup is all
-    /// there, correct, and painted nowhere. A lower-specificity
-    /// `.wf-shell-bare { display: block }` does not undo it.
+    /// `.wf-app:has(.wf-login-page) .wf-shell` asks whether `.wf-app` contains
+    /// a `.wf-login-page` anywhere — and then hides `.wf-shell`. For the
+    /// sign-in form that is a sibling of the shell, which is the case it was
+    /// written for. This page puts one *inside* the shell, so the same rule
+    /// hides the element containing the very thing it matched on: a blank page,
+    /// with the markup all present, correct, and painted nowhere. A
+    /// lower-specificity `.wf-shell-bare { display: block }` does not undo it —
+    /// one class loses to three.
     #[test]
     fn the_stylesheet_does_not_hide_the_bare_shell() {
         const CSS: &str = include_str!("../../style/main.css");
 
+        // Matched with the whitespace squeezed out, not byte-for-byte: a
+        // `nix fmt` reflow of the stylesheet must not fail a test whose message
+        // is about a security-adjacent rendering bug.
+        let squeezed: String = CSS.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            CSS.contains(
-                ".wf-app:has(.wf-login-page) .wf-shell:not(.wf-shell-bare) {\n  display: none;\n}"
-            ),
+            squeezed.contains(".wf-app:has(.wf-login-page) .wf-shell:not(.wf-shell-bare) {"),
             "the sign-in form's hiding rule no longer spares the registration page's bare shell"
         );
     }

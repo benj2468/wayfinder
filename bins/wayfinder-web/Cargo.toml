@@ -64,6 +64,10 @@ console_error_panic_hook = { version = "0.1", optional = true }
 # pins the matching `wasm-bindgen-cli_0_2_126`; bump both together or the
 # hydrate build fails with a version-mismatch error.
 wasm-bindgen = { version = "=0.2.126", optional = true }
+# The browser's wall clock, for judging whether a stored registration handle is
+# already dead before letting it shadow a fresh invitation. `web-sys` does not
+# expose `Date`; this is the crate that does.
+js-sys = { version = "0.3", optional = true }
 # Depended on explicitly, though `leptos` already pulls it in: the features are
 # additive and `src/clipboard.rs` needs two that leptos's own set does not
 # happen to enable. Listing them here means a leptos upgrade that trims its
@@ -117,6 +121,7 @@ ssr = [
 ]
 hydrate = [
   "dep:console_error_panic_hook",
+  "dep:js-sys",
   "dep:wasm-bindgen",
   "dep:web-sys",
   "leptos/hydrate",

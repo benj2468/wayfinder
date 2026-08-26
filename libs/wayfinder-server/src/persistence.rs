@@ -773,21 +773,28 @@ impl CaLog {
                 .as_deref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
-            // Both arms get the same "failed to persist ... to <path>"
-            // framing and structured `path` field below, even though an
-            // `Encode` failure (unlike `Store`) never actually touched the
-            // filesystem — `CaStateCodec::encode` serializing this schema
-            // (fixed arrays, `String`, `bool`, `u64`) essentially can't
-            // fail, so keeping the two arms' shape consistent matters more
-            // here than distinguishing an outcome that shouldn't occur.
-            let msg = match e {
-                PersistError::Encode(encode_err) => {
-                    format!("failed to persist CA state to {path_display}: {encode_err}")
-                }
-                PersistError::Store(io_err) => {
-                    format!("failed to persist CA state to {path_display}: {io_err}")
-                }
+            // Both arms get the same framing and structured `path` field
+            // below, even though an `Encode` failure (unlike `Store`) never
+            // actually touched the filesystem — `CaStateCodec::encode`
+            // serializing this schema (fixed arrays, `String`, `bool`, `u64`)
+            // essentially can't fail, so keeping the two arms' shape consistent
+            // matters more here than distinguishing an outcome that shouldn't
+            // occur.
+            let detail = match e {
+                PersistError::Encode(encode_err) => encode_err.to_string(),
+                PersistError::Store(io_err) => io_err.to_string(),
             };
+            // The path and the OS error go to the log, not to the caller.
+            // Three of this store's mutations sit behind requests on the
+            // enrollment tier, which admits a caller holding no credential at
+            // all — and `begin_user_registration` reaches one on a token that
+            // matches nothing. Returning this verbatim showed an anonymous
+            // visitor the CA's absolute state-file path and its errno, under
+            // the heading "This invitation cannot be used".
+            let msg = "the node could not record this change; it is still \
+                       serving from memory. Try again shortly, and check the \
+                       node's logs"
+                .to_string();
             // A handled-and-retried I/O error (the caller keeps serving from
             // memory and the next successful mutation retries the write), so
             // `warn!` rather than `error!` — but still surfaced to the
@@ -795,8 +802,8 @@ impl CaLog {
             // whether to retry, alert, or accept the risk.
             tracing::warn!(
                 path = %path_display,
-                error = %msg,
-                "failed to persist CA state; issued-certificate/held-CSR durability is degraded until this is fixed"
+                error = %detail,
+                "failed to persist CA state; durability of certificates, held CSRs, accounts and invitations is degraded until this is fixed"
             );
             msg
         })

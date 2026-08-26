@@ -445,8 +445,10 @@ fn Invitations() -> impl IntoView {
         leptos::task::spawn_local(async move {
             // Zero for both lifetimes: the authority's defaults, which are the
             // right answer unless somebody has a reason. An operator who does
-            // sets them with `wayfinderctl user invite`, where a form's worth
-            // of rarely-used fields is a flag instead.
+            // have one sets them with `wayfinderctl user invite` — which is
+            // *offline* tooling against the provider's own state file, so it
+            // means stopping the node, not an alternative to this form. Naming
+            // it here is a pointer to where the knobs exist, not a workaround.
             let result = create_user_invite(username, admin.get_untracked(), 0, 0).await;
             busy.set(false);
             match result {
@@ -671,9 +673,40 @@ fn registration_url(token: &str) -> String {
     format!("{origin}/register#{token}")
 }
 
-/// Server-rendered, there is no origin to read; the browser rebuilds this on
-/// hydration before anyone can click it.
+/// The `ssr` build's stand-in: there is no window to read an origin from.
+///
+/// Never actually rendered — a minted token only ever exists in a browser-side
+/// response to a click — but the click handler still has to *compile* into the
+/// server binary. Kept as a real relative URL rather than a panic so the shape
+/// under test here is the shape that ships.
 #[cfg(not(feature = "hydrate"))]
 fn registration_url(token: &str) -> String {
     format!("/register#{token}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::registration_url;
+
+    /// The token goes after a `#`, and never after a `?`.
+    ///
+    /// A one-character regression to a query string still produces a link that
+    /// works end to end, so every behavioural test in this crate keeps passing
+    /// while the token starts reaching the dashboard's access log, any reverse
+    /// proxy's, the `Referer` header, and every chat-app unfurler that fetches
+    /// a pasted URL. Nothing else in the suite can see that difference.
+    #[test]
+    fn the_token_rides_in_the_fragment_not_the_query_string() {
+        let url = registration_url("TOKEN");
+
+        assert!(
+            url.ends_with("/register#TOKEN"),
+            "the token belongs after the '#': {url}"
+        );
+        assert!(
+            !url.contains('?'),
+            "a query string would put the token on every server between here \
+             and the reader: {url}"
+        );
+    }
 }

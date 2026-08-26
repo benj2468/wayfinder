@@ -208,8 +208,9 @@ pub fn decide_access(
 /// [`MgmtAccess::GrantedSelfKey`] may invoke everything and
 /// [`MgmtAccess::GrantedAdmin`] everything but one request, so this is really
 /// the definition of the three confined tiers: what
-/// [`MgmtAccess::GrantedEnrollment`] means — the two requests a node that wants
-/// to join has to make, and nothing else — what [`MgmtAccess::GrantedViewer`]
+/// [`MgmtAccess::GrantedEnrollment`] means — the requests a caller holding
+/// nothing this mesh has signed has to make, whether it is a node joining or a
+/// person redeeming an invitation, and nothing else — what [`MgmtAccess::GrantedViewer`]
 /// means, below, and what [`MgmtAccess::GrantedMember`] means, which is the one
 /// request the admin tier is excluded from.
 ///

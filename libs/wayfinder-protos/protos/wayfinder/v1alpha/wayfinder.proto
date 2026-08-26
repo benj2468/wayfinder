@@ -1665,13 +1665,17 @@ message CreateUserInviteRequest {
   // Validity window for the created account's session certificates, in seconds.
   // Zero takes the authority's default of eight hours.
   //
-  // Re-clamped to the provider's certificate-lifetime cap at completion as well
-  // as at mint, since an invite may be redeemed up to a day after it was
-  // minted and the cap can move in between.
+  // Refused at mint if it is past the provider's certificate-lifetime cap, and
+  // re-checked at completion — where it is clamped rather than refused, since
+  // an invite may be redeemed long after it was minted and the cap can move in
+  // between. The asymmetry is deliberate: the admin is standing in front of the
+  // error at mint and can fix it, while the registrant can fix nothing and
+  // would lose their invitation to somebody else's policy change.
   uint64 session_ttl_secs = 3;
 
   // How long the invite may go unredeemed, in seconds.  Zero takes the
-  // authority's default of 24 hours.
+  // authority's default of 24 hours; anything past the authority's cap of 7
+  // days is refused, the same way an over-long session lifetime is.
   //
   // The bound on how long a bearer token sitting in somebody's chat history is
   // worth anything.  Short is better; the cost of it expiring is one more mint.

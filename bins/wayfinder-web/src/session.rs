@@ -465,9 +465,14 @@ mod ssr {
         /// certificate — the enrollment tier, and all a caller with no account
         /// can reach.
         ///
-        /// Shared by [`Self::login`] and both halves of a registration, because
-        /// all three are the same posture: whoever is asking holds nothing this
-        /// mesh has ever signed.
+        /// Shared by both halves of a registration, which are the same posture:
+        /// whoever is asking holds nothing this mesh has ever signed.
+        ///
+        /// [`Self::login`] is that posture too and deliberately does **not**
+        /// call this — it has to keep the seed it generated in order to build
+        /// the session certificate from what the provider returns, and this
+        /// hands back only the `Client`. Anything changed here (timeouts, key
+        /// type, pinning) has to be changed there as well.
         async fn anonymous_client(&self) -> anyhow::Result<Client> {
             let anonymous = Identity {
                 seed: Keypair::generate_seed(),

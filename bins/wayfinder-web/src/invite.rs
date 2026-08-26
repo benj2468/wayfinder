@@ -30,7 +30,7 @@ use serde::Serialize;
 /// it. What the fragment does *not* fix is the URL landing in browser history,
 /// a clipboard, or the messaging app that carried it — the short expiry, the
 /// single use, and the operator's own listing are what bound those.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InviteMinted {
     /// The account name the invitation will create.
     pub username: String,
@@ -92,7 +92,7 @@ pub struct InviteListing {
 /// again. And only the handle may be persisted — `sessionStorage`, so a refresh
 /// survives — never the URI, which has no reason to outlive the moment it is
 /// scanned.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegistrationStart {
     /// The account being registered. Chosen by the administrator who minted the
     /// invitation, never by whoever is redeeming it.
@@ -103,4 +103,35 @@ pub struct RegistrationStart {
     pub handle: String,
     /// Unix seconds after which the handle is dead and the invitation spent.
     pub handle_expires_unix: u64,
+}
+
+/// Redacted by hand, not derived: this carries a bearer token.
+///
+/// `Debug` on a value like this reaches further in this crate than in most —
+/// in the wasm half a `{:?}` lands in the browser console, and in the `ssr`
+/// half it lands in the node's log ring, which `GetLogs` serves over the
+/// management API. The fields worth seeing while debugging are the ones that
+/// are not secret.
+impl core::fmt::Debug for InviteMinted {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("InviteMinted")
+            .field("username", &self.username)
+            .field("token", &"<redacted>")
+            .field("expires_unix", &self.expires_unix)
+            .finish()
+    }
+}
+
+/// Redacted by hand, for the same reason as [`InviteMinted`] — and with more at
+/// stake, since this carries the `otpauth://` URI and so the raw TOTP secret,
+/// which is shown exactly once and cannot be reissued.
+impl core::fmt::Debug for RegistrationStart {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RegistrationStart")
+            .field("username", &self.username)
+            .field("totp_enrolment_uri", &"<redacted>")
+            .field("handle", &"<redacted>")
+            .field("handle_expires_unix", &self.handle_expires_unix)
+            .finish()
+    }
 }

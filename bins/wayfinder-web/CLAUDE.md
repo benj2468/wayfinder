@@ -371,7 +371,7 @@ the provider at all**. Five things govern it:
   enumerate, and "this expired on the 3rd" is the difference between downloading
   a new one and filing a bug.
 
-**`/register` is routed, and renders outside the shell.** It is the one page
+**`/register` is routed, and renders with the shell's chrome suppressed.** It is the one page
 here served to somebody who has no account at all: they open an invitation link,
 redeem it, and set their own password and second factor. Three things about it,
 and the second is the one that fails silently:
