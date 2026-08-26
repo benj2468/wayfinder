@@ -4,6 +4,8 @@ use crate::wayfinder::v1alpha::AlarmSeverity;
 use crate::wayfinder::v1alpha::Alarms;
 use crate::wayfinder::v1alpha::AllInterfacesEgress;
 use crate::wayfinder::v1alpha::AuthenticateUserResponse;
+use crate::wayfinder::v1alpha::BeginUserRegistrationResponse;
+use crate::wayfinder::v1alpha::CreateUserInviteResponse;
 use crate::wayfinder::v1alpha::CreateUserResponse;
 use crate::wayfinder::v1alpha::CsrIssued;
 use crate::wayfinder::v1alpha::CsrPending;
@@ -24,6 +26,7 @@ use crate::wayfinder::v1alpha::LinkQualityEntry;
 use crate::wayfinder::v1alpha::LinkQualityTable;
 use crate::wayfinder::v1alpha::ListCertsResponse;
 use crate::wayfinder::v1alpha::ListPendingCsrsResponse;
+use crate::wayfinder::v1alpha::ListUserInvitesResponse;
 use crate::wayfinder::v1alpha::ListUsersResponse;
 use crate::wayfinder::v1alpha::LogFilter;
 use crate::wayfinder::v1alpha::LogLevel;
@@ -44,6 +47,7 @@ use crate::wayfinder::v1alpha::SubmitCsrResponse;
 use crate::wayfinder::v1alpha::TableOccupancy;
 use crate::wayfinder::v1alpha::Throughput;
 use crate::wayfinder::v1alpha::UserAccount;
+use crate::wayfinder::v1alpha::UserInvite;
 use crate::wayfinder::v1alpha::UserSessionIssued;
 use crate::wayfinder::v1alpha::UserSessionRejected;
 use crate::wayfinder::v1alpha::WayfinderRequest;
@@ -874,6 +878,87 @@ pub trait AuthorityDataProvider {
         Err(NOT_A_PROVIDER.into())
     }
 
+    /// Provider mode: mint a one-time invite for `username`, returning its
+    /// token — the one moment that token is readable anywhere.  Default errors
+    /// (not a provider).
+    ///
+    /// `session_ttl_secs` and `invite_ttl_secs` of zero each mean "the
+    /// authority's default", so a caller with no opinion need not know what the
+    /// defaults are.
+    ///
+    /// `Err` covers a name that is already taken *or* already invited, and a
+    /// store at capacity. There is no oracle to protect: this needs a full
+    /// management grant, and a client holding one can list both stores outright.
+    fn create_user_invite(
+        &mut self,
+        username: &str,
+        admin: bool,
+        session_ttl_secs: u64,
+        invite_ttl_secs: u64,
+    ) -> Result<UserInviteMintedData, String> {
+        let _ = (username, admin, session_ttl_secs, invite_ttl_secs);
+        Err(NOT_A_PROVIDER.into())
+    }
+
+    /// Provider mode: the invites on file, and the store's capacity.  Default
+    /// errors (not a provider).
+    ///
+    /// The capacity travels with the listing rather than in a separate metric
+    /// because it is what makes the listing readable: without it a full store
+    /// looks like an unexplained refusal at the next mint.
+    fn list_user_invites(&self) -> Result<(Vec<UserInviteData>, u32), String> {
+        Err(NOT_A_PROVIDER.into())
+    }
+
+    /// Provider mode: delete the invite minted for `username`, at any status.
+    /// Default errors (not a provider).
+    ///
+    /// `Err` for a name with no invite on file: whoever sent it has a wrong
+    /// idea about what is pending.
+    fn revoke_user_invite(&mut self, username: &str) -> Result<(), String> {
+        let _ = username;
+        Err(NOT_A_PROVIDER.into())
+    }
+
+    /// Provider mode: **consume** `token` and reveal the account's second
+    /// factor, returning it with the handle that alone can complete the
+    /// registration.  Default errors (not a provider).
+    ///
+    /// Consuming is the point, not an implementation detail: a start that could
+    /// be repeated would let anyone who read the invite URL take the TOTP
+    /// secret while the legitimate registration still completed, leaving no
+    /// record anywhere. An implementation that reveals the secret without
+    /// spending the invite has not implemented this method.
+    ///
+    /// `Err` covers an unknown, expired or already-started invite. An unknown
+    /// token must be refused *without* spending password-hashing work — see
+    /// [`BeginUserRegistrationRequest`](crate::wayfinder::v1alpha::BeginUserRegistrationRequest).
+    fn begin_user_registration(&mut self, token: &str) -> Result<RegistrationStartedData, String> {
+        let _ = token;
+        Err(NOT_A_PROVIDER.into())
+    }
+
+    /// Provider mode: verify `handle` and `totp_code`, create the account with
+    /// `password`, and delete the invite — as one durable act.  Default errors
+    /// (not a provider).
+    ///
+    /// The two halves must not be separately durable: a crash between them
+    /// leaves a burnt invite and no account, which is unrecoverable by the
+    /// person holding the handle.
+    ///
+    /// The step `totp_code` is accepted at must be carried into the new
+    /// account's replay guard, or the code typed here stays valid at sign-in
+    /// for the rest of its skew window.
+    fn complete_user_registration(
+        &mut self,
+        handle: &str,
+        password: &str,
+        totp_code: &str,
+    ) -> Result<(), String> {
+        let _ = (handle, password, totp_code);
+        Err(NOT_A_PROVIDER.into())
+    }
+
     /// Provider mode: approve the pending CSR bound to `node_mac`, so the
     /// enrolling node collects its certificate on the next `submit_csr` poll.
     /// Errors if no CSR for that MAC is pending.  Default errors (not a
@@ -995,6 +1080,65 @@ pub struct UserAccountData {
     pub disabled: bool,
     /// Whether the account is currently locked out after failed sign-ins.
     pub locked: bool,
+}
+
+/// A freshly minted invite, as the management API reports it.
+///
+/// The one moment [`token`](Self::token) exists in readable form: the authority
+/// keeps only a domain-separated hash of it, so a caller that drops this value
+/// has to revoke the invite and mint another.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserInviteMintedData {
+    /// The account name the invite will create.
+    pub username: String,
+    /// The invite token, base32 and unpadded. A bearer credential.
+    pub token: String,
+    /// Unix seconds after which the invite is refused.
+    pub expires_at: u64,
+}
+
+/// One pending invite, as an admin triaging them sees it.
+///
+/// Carries neither the token nor the TOTP secret. The first is stored only as a
+/// hash; the second is the thing this whole path exists to keep out of an
+/// admin's hands, so a projection that *could* carry it is a projection that
+/// eventually does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserInviteData {
+    /// The account name the invite will create.
+    pub username: String,
+    /// Whether the created account will hold the administration capability.
+    pub admin: bool,
+    /// Validity window for the created account's session certificates.
+    pub session_ttl_secs: u64,
+    /// Unix seconds the invite was minted at.
+    pub created_at: u64,
+    /// Unix seconds after which the invite is refused.
+    pub expires_at: u64,
+    /// Unix seconds registration was started at — when the TOTP secret was
+    /// revealed — or 0 if it has not been. The security-relevant field: a
+    /// non-zero value with no account to show for it means somebody took the
+    /// second factor and did not finish.
+    pub started_at: u64,
+    /// Unix seconds after which the handle issued at start is dead, or 0.
+    pub handle_expires_at: u64,
+}
+
+/// What starting a registration reveals: the account's identity and second
+/// factor, plus the handle that alone can finish it.
+///
+/// Returned exactly once per invite — the call that produces it consumes the
+/// token — so an implementation must hand it back here or not at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegistrationStartedData {
+    /// The account name the invite creates. Not the redeemer's to choose.
+    pub username: String,
+    /// The `otpauth://` enrolment URI for the account's second factor.
+    pub totp_enrolment_uri: String,
+    /// The registration handle, base32 and unpadded. Single-use.
+    pub handle: String,
+    /// Unix seconds after which the handle is dead and the invite is spent.
+    pub handle_expires_at: u64,
 }
 
 /// The result of a successful CSR: the issued certificate plus the trust anchor
@@ -1142,6 +1286,11 @@ pub fn request_kind_name(k: &RequestKind) -> &'static str {
         RequestKind::GetVpnEnrollment(_) => "GetVpnEnrollment",
         RequestKind::ListVpnPeers(_) => "ListVpnPeers",
         RequestKind::RevokeVpnPeer(_) => "RevokeVpnPeer",
+        RequestKind::CreateUserInvite(_) => "CreateUserInvite",
+        RequestKind::ListUserInvites(_) => "ListUserInvites",
+        RequestKind::RevokeUserInvite(_) => "RevokeUserInvite",
+        RequestKind::BeginUserRegistration(_) => "BeginUserRegistration",
+        RequestKind::CompleteUserRegistration(_) => "CompleteUserRegistration",
     }
 }
 
@@ -1204,7 +1353,24 @@ fn audited(k: &RequestKind) -> Audited {
         // Removing a peer's tunnel reachability is an operator action that
         // takes access away, and the retry path for a partially-failed mesh
         // revocation runs through it.
-        | RequestKind::RevokeVpnPeer(_) => Audited::Mutation,
+        | RequestKind::RevokeVpnPeer(_)
+        // Minting an invite is deciding that an account will exist, with a role
+        // chosen now and applied up to a day later. The same reasoning as
+        // CreateUser beside it, one step earlier in time.
+        | RequestKind::CreateUserInvite(_)
+        // And revoking one takes that decision back — often *because* the
+        // record shows a start nobody expected.
+        | RequestKind::RevokeUserInvite(_)
+        // A mutation, not a Disclosure, despite handing out the account's
+        // `otpauth://` URI. It consumes the invite, so classifying it as "reads
+        // public state but hands out a secret" would be a lie about what
+        // happened — and the durable answer to "who took that secret, and
+        // when" is the invite's own `started_at`, which outlives this ring.
+        | RequestKind::BeginUserRegistration(_)
+        // Creating an account that can mint a certificate the whole mesh
+        // honours, *from an anonymous connection*. Strictly more deserving of a
+        // record than CreateUser, which at least required a grant to reach.
+        | RequestKind::CompleteUserRegistration(_) => Audited::Mutation,
 
         RequestKind::GetNodeInfo(_)
         | RequestKind::GetRoutingTable(_)
@@ -1233,7 +1399,11 @@ fn audited(k: &RequestKind) -> Audited {
         | RequestKind::ListUsers(_)
         // A read of the coordination server's roster, like ListCerts beside it,
         // and polled by the dashboard the same way.
-        | RequestKind::ListVpnPeers(_) => Audited::Query,
+        | RequestKind::ListVpnPeers(_)
+        // A read of provider state, beside ListUsers. The security-relevant
+        // signal it carries — a started-but-unfinished invite — is durable in
+        // the record itself, so it needs no log line to survive.
+        | RequestKind::ListUserInvites(_) => Audited::Query,
     }
 }
 
@@ -1295,7 +1465,16 @@ pub fn request_facet(kind: &RequestKind) -> RequestFacet {
         | RequestKind::RemoveUser(_)
         | RequestKind::RevealEnrollmentToken(_)
         | RequestKind::RevokeNode(_)
-        | RequestKind::SubmitCsr(_) => RequestFacet::Authority,
+        | RequestKind::SubmitCsr(_)
+        // The invite store lives beside the user store, on the authority. The
+        // two redemption kinds included: an anonymous registrant reaches them
+        // with no credential, but what answers them is still authority state
+        // and nothing the router holds.
+        | RequestKind::CreateUserInvite(_)
+        | RequestKind::ListUserInvites(_)
+        | RequestKind::RevokeUserInvite(_)
+        | RequestKind::BeginUserRegistration(_)
+        | RequestKind::CompleteUserRegistration(_) => RequestFacet::Authority,
         RequestKind::Authenticate(_)
         | RequestKind::GetVpnEnrollment(_)
         | RequestKind::ListVpnPeers(_)
@@ -1767,6 +1946,60 @@ pub fn handle_authority<P: AuthorityDataProvider>(
             Ok(()) => ResponseKind::Empty(Empty {}),
             Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
         },
+        Some(RequestKind::CreateUserInvite(req)) => match provider.create_user_invite(
+            &req.username,
+            req.admin,
+            req.session_ttl_secs,
+            req.invite_ttl_secs,
+        ) {
+            Ok(minted) => ResponseKind::CreateUserInvite(CreateUserInviteResponse {
+                username: minted.username,
+                token: minted.token,
+                expires_at: minted.expires_at,
+            }),
+            Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+        },
+        Some(RequestKind::ListUserInvites(_)) => match provider.list_user_invites() {
+            Ok((invites, capacity)) => ResponseKind::ListUserInvites(ListUserInvitesResponse {
+                invites: invites
+                    .into_iter()
+                    .map(|i| UserInvite {
+                        username: i.username,
+                        admin: i.admin,
+                        session_ttl_secs: i.session_ttl_secs,
+                        created_at: i.created_at,
+                        expires_at: i.expires_at,
+                        started_at: i.started_at,
+                        handle_expires_at: i.handle_expires_at,
+                    })
+                    .collect(),
+                capacity,
+            }),
+            Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+        },
+        Some(RequestKind::RevokeUserInvite(req)) => {
+            match provider.revoke_user_invite(&req.username) {
+                Ok(()) => ResponseKind::Empty(Empty {}),
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            }
+        }
+        Some(RequestKind::BeginUserRegistration(req)) => {
+            match provider.begin_user_registration(&req.token) {
+                Ok(started) => ResponseKind::BeginUserRegistration(BeginUserRegistrationResponse {
+                    username: started.username,
+                    totp_enrolment_uri: started.totp_enrolment_uri,
+                    handle: started.handle,
+                    handle_expires_at: started.handle_expires_at,
+                }),
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            }
+        }
+        Some(RequestKind::CompleteUserRegistration(req)) => {
+            match provider.complete_user_registration(&req.handle, &req.password, &req.totp_code) {
+                Ok(()) => ResponseKind::Empty(Empty {}),
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            }
+        }
         Some(RequestKind::ListPendingCsrs(_)) => match provider.list_pending_csrs() {
             Ok(pending) => ResponseKind::ListPendingCsrs(ListPendingCsrsResponse {
                 pending: pending

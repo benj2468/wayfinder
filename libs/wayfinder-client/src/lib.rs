@@ -1047,6 +1047,9 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
         ResponseKind::CreateUser(_) => "CreateUser",
         ResponseKind::VpnEnrollment(_) => "VpnEnrollment",
         ResponseKind::ListVpnPeers(_) => "ListVpnPeers",
+        ResponseKind::CreateUserInvite(_) => "CreateUserInvite",
+        ResponseKind::ListUserInvites(_) => "ListUserInvites",
+        ResponseKind::BeginUserRegistration(_) => "BeginUserRegistration",
     };
     anyhow!("expected {want} response, got {got}")
 }
