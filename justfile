@@ -157,8 +157,8 @@ sim-binaries:
         -v wayfinder-sim-cargo-git:/usr/local/cargo/git \
         -e CARGO_TARGET_DIR=/workspace/target/sim-linux \
         {{ sim_builder_image }} \
-        cargo build -p wayfinder-tap -p wayfinder-ctl -p wayfinder-tui \
-                    -p wayfinder-web --features wayfinder-web/ssr
+        bash -c 'cargo build -p wayfinder-tap -p wayfinder-ctl -p wayfinder-tui && \
+            cargo leptos build'
 
 [doc("Bring the docker mesh simulation up (see scripts/topology.py).")]
 sim-up *ARGS:

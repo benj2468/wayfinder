@@ -1,9 +1,47 @@
 # bins/wayfinder-web
 
 A browser dashboard for a running node: the seven views `wayfinder-tui` shows in
-a terminal, reachable over HTTP, plus a **Provider** tab the TUI has no
-equivalent for. Built with Leptos in SSR mode — an axum server plus a wasm
-hydration bundle, compiled from this one crate.
+a terminal, reachable over HTTP, plus five the TUI has no equivalent for. Built
+with Leptos in SSR mode — an axum server plus a wasm hydration bundle, compiled
+from this one crate.
+
+## Two scopes, because a node does two jobs
+
+The twelve tabs are not one bar. `Scope` (in `lib.rs`) splits them:
+
+- **Router** — the seven views the TUI has. What this node can reach, over
+  which links, how well. Generally available.
+- **Provider** — Requests, Members, Enrollment, Accounts, VPN. What this node
+  governs as the mesh's *certificate authority*: who is admitted, who is
+  ejected, and who holds an account that decides either. **Administrators
+  only**, and only on a node that issues certificates at all.
+
+A header pill switches between them and the one tab bar redraws; the pill is
+absent entirely unless both conditions hold, so on the overwhelming majority of
+deployments the dashboard is the seven router views it always was.
+
+Three things about that split are load-bearing:
+
+- **The current scope is read off the URL** (`Scope::of_path`), never held in a
+  signal. A copied link, a bookmark and the back button all have to land in the
+  scope they were taken from, and a signal cannot be in the URL. The prefix
+  matches at a *segment boundary*, so a later `/providers` route does not
+  silently swap the tab bar for an administrator's.
+- **The capability check hangs on the scope, not the path.** `Viewer::can_view`
+  delegates to `can_view_scope`, so a provider tab added later inherits the
+  check. The alternative — an arm per route — fails *open* when somebody
+  forgets one, and the failure is a page of the mesh's certificate authority
+  readable by every account that can log in.
+- **Every provider tab re-asks both questions itself** (`ProviderGate`), because
+  the tab bar leaving a tab out is not access control: a URL can be pasted and a
+  bookmark can outlive a demotion. The gate answers *capability first* — telling
+  a read-only viewer that a node is not a certificate authority would be
+  answering a question they were not allowed to ask.
+
+The provider scope carries a count of nodes waiting to be admitted on its half
+of the pill. That is not decoration: putting the scope behind a switch makes it
+less discoverable, and a node waiting on a human decision is the one thing in
+there nobody would think to go and look for.
 
 ## The constraint that shapes everything
 
@@ -51,6 +89,45 @@ Anything server-side must be behind `#[cfg(feature = "ssr")]` (`conn`, `server`,
 it drops every server dependency, so a misplaced `cfg` fails there and nowhere
 else.
 
+### Both halves must come from one `cargo leptos` build
+
+cargo-leptos compiles the server binary *and* the wasm bundle with
+`RUSTFLAGS=--cfg erase_components` (visible in `cargo leptos build -v`, in
+release as well as debug). That flag reaches `leptos_macro`'s build script,
+which turns on its `__internal_erase_components` feature, and the `view!` macro
+then erases every component to `AnyView` — which changes the *markup*: the SSR
+output grows a placeholder comment per erased view, and the hydration bundle
+walks the DOM expecting exactly those markers.
+
+So the two halves are not independently buildable artifacts that happen to
+share a version. Serve a `cargo build --features ssr` binary's HTML to a
+`cargo leptos`-built wasm bundle and hydration dies at the first marker it
+cannot find:
+
+```
+A hydration error occurred while trying to hydrate an element defined at
+leptos_meta-0.8.6/src/stylesheet.rs:38:14.
+The framework expected a marker node, but found this instead: div.wf-app
+panicked at tachys-0.2.18/src/hydration.rs:216:9:
+Unrecoverable hydration error.
+```
+
+The page renders, looks right, and never becomes interactive — the same failure
+mode a wrong `LEPTOS_OUTPUT_NAME` produces, arrived at from the other side.
+
+The mixed build is a real temptation, because the two halves *are* wanted from
+different places: `bins/wayfinder-web` builds for the host arch, while the wasm
+is architecture-independent. `just sim-binaries` used to do exactly that — a
+plain `cargo build -p wayfinder-web --features ssr` in the Linux builder
+container beside a host `cargo leptos build` — and the docker sim's dashboards
+were dead on arrival on macOS for it. It now runs `cargo leptos build` inside
+that container instead, so both halves carry the same flag.
+
+**`containers/Dockerfile` still splits them** (`cargo build --release -p
+wayfinder-web --features ssr` in the builder stage, `cargo leptos build
+--release --frontend-only` in the `site` stage) and should be expected to have
+the same defect.
+
 ### Version pins that move together
 
 `wasm-bindgen` refuses to run when the CLI generating the JS glue differs from
@@ -85,10 +162,14 @@ be bumped as one:
   macro where they cannot be tested.
 - `components/` — the tabs. Pure functions of the dashboard state. `security.rs`
   is about *this node*: who it believes it is, who it believes its neighbours
-  are, what it refuses to do without a certificate. `provider.rs` is about the
-  node's other job, which most nodes do not have at all — deciding who else gets
-  in: the accounts, the enrollment policy, what a joining node must be told, and
-  the queue of nodes waiting. The one exception to "pure function of the state"
+  are, what it refuses to do without a certificate — and it **reports without
+  acting**, since every decision about another node's membership belongs to the
+  provider scope. `provider/` is that scope, one module per tab over a shared
+  `mod.rs` (the gate, the confirmation helper, the copy field). Note that
+  `provider/members.rs` and the Security tab draw the same roster on purpose:
+  Security answers "can this node verify its neighbours?" and reports, Members
+  answers "who is still a member?" and carries the Revoke button. The one
+  exception to "pure function of the state"
   is `logo.rs`: the mark, drawn inline so the ink can follow the theme, and the
   favicon `server.rs` serves from its own route. It carries a second copy of the
   geometry in `assets/logo/`, pinned to it by unit tests — see that directory's
@@ -194,7 +275,13 @@ cargo test -p wayfinder-web --features mock-node     # all of the below
   perfect dashboard that fails every poll.
 - `tests/render.rs` — each tab rendered to markup from a seeded dashboard.
   Catches a tab reading the wrong field or inverting an emptiness check, which
-  every other test above would pass.
+  every other test above would pass. `each_provider_tab` drives all five
+  provider tabs through the same two gate assertions, so a tab added later is
+  covered by them the day it is added.
+- `lib.rs` / `session.rs` unit tests — the scope tables and the capability
+  check over them: paths unique, every route resolving back to the scope it
+  declares, and a read-only viewer seeing all of one scope and none of the
+  other.
 - `tests/session.rs` — a real sign-in against a mock node that is its own
   certificate authority: password in, cookie out, and the node accepting the
   connection that certificate authenticates. Catches the failure nothing else
@@ -339,8 +426,8 @@ changing it:
   how a certificate is collected after approval, so the panel simply asks again
   on a timer while it waits.
 
-**The Provider tab is the other end of that exchange**, and it shows what a
-joining node must be told — the provider's address, the key that pins it, and
+**The provider scope's Enrollment tab is the other end of that exchange**, and
+it shows what a joining node must be told — the provider's address, the key that pins it, and
 the enrollment token. Two rules govern that panel:
 
 - **The token is fetched, never polled.** `GetSecurityStatus` reports only
@@ -365,21 +452,21 @@ the enrollment token. Two rules govern that panel:
 replaced once a second, so a `move ||` closure over it constructs a *fresh*
 component every second — and a component's `signal(String::new())` fields are
 re-created empty, wiping whatever was half-typed and taking the focus with it.
-The Security tab's "Join a mesh" panel and the Provider tab's enrollment-policy
+The Security tab's "Join a mesh" panel and the Enrollment tab's policy
 and join-details panels are therefore driven from `Memo`s over the narrowest
-projection they need (`security::membership_of`, and the Provider tab's
-`enrollment`/`join_details`), since a memo only notifies when its own value
+projection they need (`security::membership_of`, and `provider::enrollment`'s
+`policy`/`join_details`), since a memo only notifies when its own value
 changes. Widening one of those projections to something that moves on its own —
 a node list, a timestamp — silently restores the bug, which no markup test can
 see; `membership_ignores_everything_that_changes_on_its_own` is what guards it.
 
-**The Provider tab administers the mesh's accounts**, which is the surface with
-the longest reach on this dashboard: an account here mints certificates the
+**The provider scope's Accounts tab administers the mesh's accounts**, which is
+the surface with the longest reach on this dashboard: an account here mints certificates the
 whole mesh honours. Four things govern it:
 
 - **The roster is fetched, not polled.** It changes when somebody creates or
-  removes an account and at no other time, so `Users` holds a `Resource` it
-  refetches after its own mutations rather than putting the account list on the
+  removes an account and at no other time, so `provider::accounts::Users` holds
+  a `Resource` it refetches after its own mutations rather than putting the account list on the
   once-a-second snapshot. That is also what keeps the create form from being
   rebuilt mid-keystroke — the same failure the memoised panels above avoid.
 - **The first account cannot be created here.** Creating one over the API needs
@@ -403,8 +490,8 @@ whole mesh honours. Four things govern it:
   shows the refusal as an error rather than pre-computing "is this the last
   admin?" in the browser, per "the node is the authority" above.
 
-**The Security and Provider tabs write, not just read**, and that raises the
-stakes of the paragraph above. Whoever can reach this port can turn the node's
+**The Security tab and the provider scope write, not just read**, and that
+raises the stakes of the paragraph above. Whoever can reach this port can turn the node's
 fail-closed gate on or off, flip lazy cert distribution (a flag-day,
 wire-incompatible change for the whole mesh), and — on a certificate authority
 — change the enrollment policy, including clearing the enrollment token so any

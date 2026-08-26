@@ -100,16 +100,17 @@ async fn dashboard_page_renders() {
 /// route.
 #[tokio::test]
 async fn every_tab_route_is_served() {
-    for path in [
-        "/",
-        "/routing",
-        "/link-quality",
-        "/links",
-        "/metrics",
-        "/security",
-        "/provider",
-        "/logs",
-    ] {
+    // Enumerated from the tables the tab bar draws from, rather than repeated
+    // here: a tab added to one and not the other is exactly the drift this
+    // test exists to catch, and a hand-written list cannot catch it.
+    let paths: Vec<String> = wayfinder_web::ROUTER_TABS
+        .iter()
+        .chain(wayfinder_web::PROVIDER_TABS.iter())
+        .map(|tab| format!("/{}", tab.path))
+        .collect();
+
+    for path in paths {
+        let path = path.as_str();
         let conn = common::serve_mock_node().await;
         let app = wayfinder_web::server::build_router(
             common::test_leptos_options(),

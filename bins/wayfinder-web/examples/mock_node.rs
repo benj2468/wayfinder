@@ -17,6 +17,11 @@
 //! * `unauthenticated` — mesh authentication switched off, so every identity
 //!   field is empty. The flavor with the least on the screen, and the one whose
 //!   emptiness the other two never exercise.
+//! * `login` — a certificate authority holding two accounts, one administrator
+//!   and one read-only, so the dashboard can be run in **login mode**. The only
+//!   flavor that exercises the provider scope's other half: every other one
+//!   runs on a static credential, which `Viewer::can_administer` treats as an
+//!   administrator, so the read-only view is unreachable from them.
 //!
 //! Leave it running and start the dashboard in another shell with the command
 //! it prints. The data is fixed — this exercises layout and wiring, not live
@@ -34,10 +39,14 @@ async fn main() -> anyhow::Result<()> {
         "provider" => wayfinder_web::mock::Mock::provider(),
         "member" => wayfinder_web::mock::Mock::default(),
         "unauthenticated" => wayfinder_web::mock::Mock::unauthenticated(),
+        "login" => wayfinder_web::mock::Mock::login_provider(),
         other => {
-            anyhow::bail!("unknown flavor {other:?}: expected provider, member or unauthenticated")
+            anyhow::bail!(
+                "unknown flavor {other:?}: expected provider, member, unauthenticated or login"
+            )
         }
     };
+    let login = flavor == "login";
     let (addr, node_key) = wayfinder_web::mock::serve_mock_node_with(mock).await;
 
     // The dashboard authenticates by proving a key. Against an un-enrolled node
@@ -52,10 +61,28 @@ async fn main() -> anyhow::Result<()> {
     println!();
     println!("point the dashboard at it with:");
     println!();
-    println!("  cargo leptos watch -- \\");
-    println!("    --connect {addr} \\");
-    println!("    --identity {} \\", seed_path.display());
-    println!("    --node-key {key_hex}");
+    if login {
+        // Login mode holds no credential of its own, so neither key can be
+        // defaulted from an identity — there is none. This node is its own
+        // authority, so both keys are the same one.
+        println!("  cargo leptos watch -- \\");
+        println!("    --connect {addr} \\");
+        println!("    --node-key {key_hex} \\");
+        println!("    --provider {addr} \\");
+        println!("    --provider-key {key_hex}");
+        println!();
+        println!(
+            "sign in as {} (administrator) or {} (read-only), password {}",
+            wayfinder_web::mock::MOCK_ADMIN_USER,
+            wayfinder_web::mock::MOCK_VIEWER_USER,
+            wayfinder_web::mock::MOCK_PASSWORD,
+        );
+    } else {
+        println!("  cargo leptos watch -- \\");
+        println!("    --connect {addr} \\");
+        println!("    --identity {} \\", seed_path.display());
+        println!("    --node-key {key_hex}");
+    }
     println!();
     println!("then open http://127.0.0.1:8080/  (ctrl-c here to stop the node)");
 

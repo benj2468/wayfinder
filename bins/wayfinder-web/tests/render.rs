@@ -20,6 +20,7 @@ use wayfinder_protos::wayfinder::v1alpha::KeepAliveEntry;
 use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesEntry;
 use wayfinder_protos::wayfinder::v1alpha::LinkQualityEntry;
 use wayfinder_protos::wayfinder::v1alpha::ListPendingCsrsResponse;
+use wayfinder_protos::wayfinder::v1alpha::ListVpnPeersResponse;
 use wayfinder_protos::wayfinder::v1alpha::LogLevel;
 use wayfinder_protos::wayfinder::v1alpha::LogRecord;
 use wayfinder_protos::wayfinder::v1alpha::LogRecords;
@@ -31,13 +32,18 @@ use wayfinder_protos::wayfinder::v1alpha::OgmScheduleEntry;
 use wayfinder_protos::wayfinder::v1alpha::PendingCsr;
 use wayfinder_protos::wayfinder::v1alpha::RoutingEntry;
 use wayfinder_protos::wayfinder::v1alpha::TableOccupancy;
+use wayfinder_protos::wayfinder::v1alpha::VpnPeerStatus;
 use wayfinder_web::components::dashboard::Dashboard;
 use wayfinder_web::components::link_quality::LinkQuality;
 use wayfinder_web::components::links::Links;
 use wayfinder_web::components::logs::Logs;
 use wayfinder_web::components::metrics::Metrics;
 use wayfinder_web::components::overview::Overview;
-use wayfinder_web::components::provider::Provider;
+use wayfinder_web::components::provider::accounts::Accounts;
+use wayfinder_web::components::provider::enrollment::Enrollment;
+use wayfinder_web::components::provider::members::Members;
+use wayfinder_web::components::provider::requests::Requests;
+use wayfinder_web::components::provider::vpn::Vpn;
 use wayfinder_web::components::routing::Routing;
 use wayfinder_web::components::security::Security;
 use wayfinder_web::snapshot::NodeSnapshot;
@@ -475,36 +481,117 @@ fn security_distinguishes_revoked_from_unverified() {
     assert!(html.contains("Verified"), "the verified node: {html}");
 }
 
-/// Destructive actions are offered, but only behind a confirmation.
+/// The node roster on this tab reports and does not act.
+///
+/// Revoking a node is a decision the certificate authority makes about somebody
+/// else's membership, so it moved to the provider scope with the rest of them.
+/// What is left here is this node's own view of who it can verify — a router
+/// fact, and one every viewer of the mesh has a reason to read.
+#[test]
+fn security_reports_the_nodes_it_knows_without_acting_on_them() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <Security /> });
+
+    assert!(html.contains("00:00:00:00:00:02"), "the roster: {html}");
+    assert!(
+        !html.contains(">Revoke</button>"),
+        "and no revocation from the router scope: {html}"
+    );
+}
+
+/// Destructive settings are offered, but only behind a confirmation.
 #[test]
 fn security_puts_destructive_actions_behind_a_confirmation() {
     let html = render_with(Some(seeded_snapshot()), || view! { <Security /> });
 
-    assert!(html.contains("Revoke"), "revoke is offered: {html}");
+    assert!(
+        html.contains("Refuse to run unauthenticated"),
+        "a switch that can take this node off the mesh: {html}"
+    );
     // The dialog is only rendered once armed, so nothing is one click from
-    // ejecting a node from the mesh.
+    // taking the node off the mesh.
     assert!(!html.contains("wf-modal"), "not armed yet: {html}");
 }
 
-/// A node that is not a certificate authority has no CSR queue, and the tab
-/// says so once rather than rendering four empty panels that each look like
-/// "nothing has happened yet".
-#[test]
-fn provider_omits_the_csr_queue_on_a_non_provider() {
-    let html = render_with(Some(seeded_snapshot()), || view! { <Provider /> });
+// ----------------------------------------------------------------- Provider --
 
-    assert!(!html.contains("Approve"), "no approvals offered: {html}");
-    assert!(
-        html.contains("not a certificate authority"),
-        "and the tab says why it is empty: {html}"
-    );
+/// Render one snapshot through every tab in the provider scope, labelled.
+///
+/// The gate each of these tabs sits behind is the same gate, and a tab that
+/// forgot to ask is invisible in a test that only renders the tab it was added
+/// beside. Driving all five from one list is what makes a new provider tab
+/// covered by the two tests below on the day it is added.
+fn each_provider_tab(snapshot: NodeSnapshot, admin: bool) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "Requests",
+            render_seeded(Some(snapshot.clone()), None, admin, || {
+                view! { <Requests /> }
+            }),
+        ),
+        (
+            "Members",
+            render_seeded(Some(snapshot.clone()), None, admin, || {
+                view! { <Members /> }
+            }),
+        ),
+        (
+            "Enrollment",
+            render_seeded(Some(snapshot.clone()), None, admin, || {
+                view! { <Enrollment /> }
+            }),
+        ),
+        (
+            "Accounts",
+            render_seeded(Some(snapshot.clone()), None, admin, || {
+                view! { <Accounts /> }
+            }),
+        ),
+        (
+            "VPN",
+            render_seeded(Some(snapshot), None, admin, || {
+                view! { <Vpn /> }
+            }),
+        ),
+    ]
 }
 
-/// On a provider, each pending request shows the key being vouched for.
+/// The provider scope belongs to administrators, whole and entire.
+///
+/// The tab bar does not offer it to a read-only account, but a link can be
+/// pasted and a bookmark can outlive a demotion — so the refusal is in the
+/// page, not only in the navigation. It is stated rather than rendered as an
+/// empty panel: the node refuses every call these tabs make, so "nothing here"
+/// and "not yours to see" would otherwise look identical.
 #[test]
-fn provider_lists_pending_requests_on_a_provider() {
-    // Both halves together, the way a real provider has them: the tab is gated
-    // on the node reporting an enrollment policy at all.
+fn every_provider_tab_refuses_a_read_only_viewer() {
+    for (tab, html) in each_provider_tab(provider_snapshot(), false) {
+        assert!(
+            html.contains("Only an administrator"),
+            "{tab} says who this is for: {html}"
+        );
+        assert!(
+            !html.contains("wf-button-danger"),
+            "{tab} offers nothing destructive: {html}"
+        );
+    }
+}
+
+/// Most nodes are not certificate authorities, and every tab in the scope says
+/// so in one sentence rather than rendering an empty panel each.
+#[test]
+fn every_provider_tab_says_when_the_node_is_not_a_certificate_authority() {
+    for (tab, html) in each_provider_tab(seeded_snapshot(), true) {
+        assert!(
+            html.contains("not a certificate authority"),
+            "{tab} says why it is empty: {html}"
+        );
+    }
+}
+
+/// Each pending request shows the key being vouched for, because that is what
+/// approving it endorses.
+#[test]
+fn provider_requests_lists_what_is_waiting() {
     let mut snap = provider_snapshot();
     snap.pending_csrs = Some(ListPendingCsrsResponse {
         pending: vec![PendingCsr {
@@ -514,16 +601,290 @@ fn provider_lists_pending_requests_on_a_provider() {
             requested_at: 1_700_000_000,
         }],
     });
-    let html = render_with(Some(snap), || view! { <Provider /> });
+    let html = render_with(Some(snap), || view! { <Requests /> });
 
     assert!(html.contains("00:00:00:00:00:09"), "the applicant: {html}");
     assert!(html.contains("Approve"), "approval offered: {html}");
     assert!(html.contains("Deny"), "denial offered: {html}");
-    // The key is what an operator is actually vouching for, so it has to be
-    // visible before they can approve it.
     assert!(
         html.contains("abababab"),
         "the key being vouched for: {html}"
+    );
+    assert!(!html.contains("wf-modal"), "nothing armed yet: {html}");
+}
+
+/// An empty queue says nobody is waiting, which is not the same claim as a
+/// node that has no queue at all.
+#[test]
+fn provider_requests_says_when_nobody_is_waiting() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Requests /> });
+
+    assert!(
+        html.contains("No nodes are waiting to join"),
+        "the empty queue: {html}"
+    );
+    assert!(!html.contains("Approve"), "nothing to approve: {html}");
+}
+
+/// Revoking a node is the certificate authority's call, so the control is in
+/// the provider scope — and it names each node's state, since revoking one
+/// that is already revoked is a wasted flood.
+#[test]
+fn provider_members_offers_a_revocation() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Members /> });
+
+    assert!(html.contains("00:00:00:00:00:02"), "a member: {html}");
+    assert!(html.contains(">Revoke</button>"), "the control: {html}");
+    // The seed has one verified node, one revoked and one unverified; only the
+    // two that are still members can be revoked.
+    assert_eq!(
+        html.matches(">Revoke</button>").count(),
+        2,
+        "the already-revoked node is not offered again: {html}"
+    );
+}
+
+/// A revoked node must not read as merely unverified — one is a node whose
+/// identity could not be established, the other one the mesh has ejected.
+#[test]
+fn provider_members_distinguishes_revoked_from_unverified() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Members /> });
+
+    assert!(html.contains("Revoked"), "the revoked node: {html}");
+    assert!(html.contains("Unverified"), "the unverified node: {html}");
+    assert!(html.contains("Verified"), "the verified node: {html}");
+}
+
+/// A revocation floods the mesh and re-approving does not undo it, so nothing
+/// here is one click from ejecting a node.
+#[test]
+fn provider_members_puts_a_revocation_behind_a_confirmation() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Members /> });
+
+    assert!(!html.contains("wf-modal"), "not armed yet: {html}");
+}
+
+/// The enrollment policy is shown in the units an operator set it in, and
+/// reports whether a token is required without ever drawing the token.
+#[test]
+fn provider_enrollment_renders_the_policy() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Enrollment /> });
+
+    assert!(html.contains("How nodes join"), "the policy panel: {html}");
+    assert!(
+        html.contains("Approve each request by hand"),
+        "the approval switch: {html}"
+    );
+    assert!(
+        html.contains("1 day"),
+        "the 86400s lifetime reads as a day: {html}"
+    );
+    assert!(
+        html.contains("Remove token"),
+        "clearing a set token is offered: {html}"
+    );
+}
+
+/// A provider shows what a joining node has to be told: where it is, the key
+/// that pins it, and the token it will be asked for. This is the other end of
+/// the Security tab's "Join a mesh" panel, and the values have to be copyable
+/// because two of the three are not readable back off the screen.
+#[test]
+fn provider_enrollment_offers_the_details_a_joining_node_needs() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Enrollment /> });
+
+    assert!(
+        html.contains("What a node needs to join"),
+        "the panel: {html}"
+    );
+    assert!(
+        html.contains("Provider address") && html.contains("Provider key"),
+        "the two non-secret values: {html}"
+    );
+    assert_eq!(
+        html.matches("wf-copy-button").count(),
+        2,
+        "address and key are copyable: {html}"
+    );
+    assert!(
+        html.contains("Show token"),
+        "and the token is fetched on request: {html}"
+    );
+    assert!(
+        html.contains("127.0.0.1:7700"),
+        "the address this dashboard reaches the node at: {html}"
+    );
+}
+
+/// The rendered page carries no enrollment token, because the snapshot it is
+/// rendered from carries none — the polled status reports only that one is
+/// required, and the value comes back from `reveal_enrollment_token`.
+#[test]
+fn provider_enrollment_renders_no_token_because_the_poll_carries_none() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Enrollment /> });
+
+    assert!(
+        !html.contains(PROVIDER_TOKEN),
+        "no token value in the markup: {html}"
+    );
+    assert!(
+        html.contains("Show token"),
+        "the row offers to fetch it instead: {html}"
+    );
+}
+
+/// The provider's own key is shown abbreviated — enough to tell two providers
+/// apart, not enough to retype — while the copy button carries all 64
+/// characters, which is what the far end actually parses.
+#[test]
+fn provider_enrollment_abbreviates_the_provider_key_it_shows() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Enrollment /> });
+
+    // The seed's own key is 32 bytes of 0x11.
+    assert!(
+        html.contains("11111111…"),
+        "abbreviated for recognition: {html}"
+    );
+    assert!(
+        !html.contains(&"11".repeat(32)),
+        "the full key is not drawn on screen: {html}"
+    );
+}
+
+/// With no token required the row says so rather than offering a copy button
+/// for an empty string.
+#[test]
+fn provider_enrollment_says_when_there_is_no_token_to_hand_over() {
+    let mut snap = provider_snapshot();
+    if let Some(policy) = snap.security.as_mut().and_then(|s| s.enrollment.as_mut()) {
+        policy.enrollment_token_set = false;
+    }
+    let html = render_with(Some(snap), || view! { <Enrollment /> });
+
+    assert!(
+        html.contains("Not required"),
+        "the token row states there is none: {html}"
+    );
+    assert!(
+        !html.contains("Show token"),
+        "and offers nothing to fetch: {html}"
+    );
+    assert_eq!(
+        html.matches("wf-copy-button").count(),
+        2,
+        "only the address and the key are copyable: {html}"
+    );
+}
+
+/// A required token that has not been fetched must never read as "no token
+/// required".
+///
+/// The two are opposite claims about whether the mesh is gated, and only one of
+/// them stops an operator looking for the token they need. Inferring the mesh
+/// is open from the value's absence is a bug this once had.
+#[test]
+fn provider_enrollment_does_not_read_an_unfetched_token_as_an_open_mesh() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Enrollment /> });
+
+    assert!(
+        !html.contains("Not required"),
+        "a gated mesh must not be described as open: {html}"
+    );
+    assert!(
+        html.contains("Show token"),
+        "it offers to fetch the value instead: {html}"
+    );
+    assert_eq!(
+        html.matches("wf-copy-button").count(),
+        2,
+        "nothing to copy for a value that has not been asked for: {html}"
+    );
+}
+
+/// With no token set, the tab says enrollment is open and offers no "remove
+/// token" button — there is nothing to remove, and offering it would imply the
+/// mesh is gated when it is not.
+#[test]
+fn provider_enrollment_says_so_when_enrollment_is_open() {
+    let mut snap = provider_snapshot();
+    if let Some(policy) = snap.security.as_mut().and_then(|s| s.enrollment.as_mut()) {
+        policy.enrollment_token_set = false;
+    }
+    let html = render_with(Some(snap), || view! { <Enrollment /> });
+
+    assert!(
+        html.contains("anyone in range may join"),
+        "open enrollment is stated plainly: {html}"
+    );
+    assert!(!html.contains("Remove token"), "nothing to remove: {html}");
+}
+
+/// The accounts tab carries the roster and the form that adds to it, and says
+/// plainly that the first account is not created here.
+#[test]
+fn provider_accounts_offers_the_roster_and_the_form_beneath_it() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Accounts /> });
+
+    assert!(html.contains("Accounts"), "the panel: {html}");
+    assert!(html.contains("New account"), "the create form: {html}");
+    assert!(
+        html.contains("Administrator — may change anything"),
+        "and the capability it grants: {html}"
+    );
+}
+
+/// Registered tunnel peers are listed with the address the coordination server
+/// gave them, which is what a UDP mesh link on that host points at.
+#[test]
+fn provider_vpn_lists_registered_peers() {
+    let mut snap = provider_snapshot();
+    snap.vpn_peers = Some(ListVpnPeersResponse {
+        peers: vec![VpnPeerStatus {
+            node_mac: vec![0, 0, 0, 0, 0, 2],
+            raw_hostname: "000000000002".into(),
+            tailscale_ip: "100.64.0.7".into(),
+            online: true,
+            last_seen_unix: 1_700_000_000,
+            key_expiry_unix: 0,
+        }],
+    });
+    let html = render_with(Some(snap), || view! { <Vpn /> });
+
+    assert!(html.contains("00:00:00:00:00:02"), "the peer: {html}");
+    assert!(html.contains("100.64.0.7"), "its tunnel address: {html}");
+    assert!(
+        html.contains("online"),
+        "and whether it is connected: {html}"
+    );
+}
+
+/// A provider that coordinates a tunnel nobody has joined says so, rather than
+/// rendering the same blank table as a provider with no tunnel at all.
+#[test]
+fn provider_vpn_says_when_no_peer_has_joined() {
+    let mut snap = provider_snapshot();
+    snap.vpn_peers = Some(ListVpnPeersResponse { peers: Vec::new() });
+    let html = render_with(Some(snap), || view! { <Vpn /> });
+
+    assert!(
+        html.contains("No nodes have joined the tunnel yet"),
+        "the empty state says why: {html}"
+    );
+}
+
+/// A provider with no tunnel configured is a different state again, and must
+/// not read as one whose peers have all left.
+#[test]
+fn provider_vpn_distinguishes_no_tunnel_from_an_empty_one() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Vpn /> });
+
+    assert!(
+        html.contains("does not coordinate a tunnel"),
+        "no tunnel is configured: {html}"
+    );
+    assert!(
+        !html.contains("No nodes have joined the tunnel yet"),
+        "which is not the same as an empty one: {html}"
     );
 }
 
@@ -680,27 +1041,6 @@ fn security_settings_are_not_one_click_from_leaving_the_mesh() {
     assert!(!html.contains("wf-modal"), "nothing armed yet: {html}");
 }
 
-/// A provider's enrollment policy is shown in the units an operator set it in,
-/// and reports whether a token is required without ever showing the token.
-#[test]
-fn provider_renders_the_enrollment_policy_on_a_provider() {
-    let html = render_with(Some(provider_snapshot()), || view! { <Provider /> });
-
-    assert!(html.contains("How nodes join"), "the policy panel: {html}");
-    assert!(
-        html.contains("Approve each request by hand"),
-        "the approval switch: {html}"
-    );
-    assert!(
-        html.contains("1 day"),
-        "the 86400s lifetime reads as a day: {html}"
-    );
-    assert!(
-        html.contains("Remove token"),
-        "clearing a set token is offered: {html}"
-    );
-}
-
 /// With authentication off, the tab says so in words and renders none of the
 /// identity fields — every one of which would be empty or zero.
 ///
@@ -803,238 +1143,7 @@ fn security_frames_joining_as_a_move_for_an_enrolled_node() {
     assert!(!html.contains("wf-modal"), "nothing armed yet: {html}");
 }
 
-/// A plain member has no enrollment policy at all, and the panel is omitted
-/// rather than rendered with defaults — "nothing to change here" and "a policy
-/// that happens to be all zeros" are different claims.
-#[test]
-fn provider_omits_the_enrollment_policy_on_a_non_provider() {
-    let html = render_with(Some(seeded_snapshot()), || view! { <Provider /> });
-
-    assert!(!html.contains("How nodes join"), "no policy panel: {html}");
-    assert!(!html.contains("Accounts"), "and no account roster: {html}");
-}
-
-/// A provider shows what a joining node has to be told: where it is, the key
-/// that pins it, and the token it will be asked for. This is the other end of
-/// the "Join a mesh" panel, and the values have to be copyable because two of
-/// the three are not readable back off the screen.
-#[test]
-fn provider_offers_a_provider_the_details_a_joining_node_needs() {
-    let html = render_with(Some(provider_snapshot()), || view! { <Provider /> });
-
-    assert!(
-        html.contains("What a node needs to join"),
-        "the panel: {html}"
-    );
-    assert!(
-        html.contains("Provider address") && html.contains("Provider key"),
-        "the two non-secret values: {html}"
-    );
-    // The two values that ride the poll each offer a copy button, since neither
-    // can be retyped reliably — the key least of all. The token has none yet:
-    // it is not in the snapshot at all until an operator asks for it.
-    assert_eq!(
-        html.matches("wf-copy-button").count(),
-        2,
-        "address and key are copyable: {html}"
-    );
-    assert!(
-        html.contains("Show token"),
-        "and the token is fetched on request: {html}"
-    );
-    // The address comes from the connection, not from the snapshot.
-    assert!(
-        html.contains("127.0.0.1:7700"),
-        "the address this dashboard reaches the node at: {html}"
-    );
-}
-
-/// The rendered page carries no enrollment token, because the snapshot it is
-/// rendered from carries none.
-///
-/// This test used to assert that a token the snapshot *did* carry was masked in
-/// the markup — true, and a weaker property than its name claimed: the value
-/// still crossed the wire on every poll and sat in the browser's memory. The
-/// polled status now reports only that a token is required, and the value comes
-/// back from `reveal_enrollment_token` when an operator asks. What is asserted
-/// here is therefore the absence, not the masking.
-#[test]
-fn provider_renders_no_enrollment_token_because_the_poll_carries_none() {
-    let html = render_with(Some(provider_snapshot()), || view! { <Provider /> });
-
-    assert!(
-        !html.contains(PROVIDER_TOKEN),
-        "no token value in the markup: {html}"
-    );
-    assert!(
-        html.contains("Show token"),
-        "the row offers to fetch it instead: {html}"
-    );
-}
-
-/// The provider's own key is shown abbreviated — enough to tell two providers
-/// apart, not enough to retype — while the copy button carries all 64
-/// characters, which is what the far end actually parses.
-#[test]
-fn provider_abbreviates_the_provider_key_it_shows() {
-    let html = render_with(Some(provider_snapshot()), || view! { <Provider /> });
-
-    // The seed's own key is 32 bytes of 0x11.
-    assert!(
-        html.contains("11111111…"),
-        "abbreviated for recognition: {html}"
-    );
-    assert!(
-        !html.contains(&"11".repeat(32)),
-        "the full key is not drawn on screen: {html}"
-    );
-}
-
-/// A plain member is offered none of it: it issues no certificates, so there is
-/// no key to pin *it* by and no token to hand out.
-#[test]
-fn provider_omits_the_join_details_on_a_non_provider() {
-    let html = render_with(Some(seeded_snapshot()), || view! { <Provider /> });
-
-    assert!(
-        !html.contains("What a node needs to join"),
-        "no join details on a plain member: {html}"
-    );
-    assert!(!html.contains("wf-copy-button"), "nothing to copy: {html}");
-}
-
-/// With no token required the row says so rather than offering a copy button
-/// for an empty string — "copy the token" on a mesh with no token is an
-/// instruction that cannot be followed.
-#[test]
-fn provider_says_when_there_is_no_token_to_hand_over() {
-    let mut snap = provider_snapshot();
-    if let Some(policy) = snap.security.as_mut().and_then(|s| s.enrollment.as_mut()) {
-        policy.enrollment_token_set = false;
-    }
-    let html = render_with(Some(snap), || view! { <Provider /> });
-
-    assert!(
-        html.contains("Not required"),
-        "the token row states there is none: {html}"
-    );
-    assert!(
-        !html.contains("Show token"),
-        "and offers nothing to fetch: {html}"
-    );
-    assert_eq!(
-        html.matches("wf-copy-button").count(),
-        2,
-        "only the address and the key are copyable: {html}"
-    );
-}
-
-/// A required token that has not been fetched must never read as "no token
-/// required".
-///
-/// The two are opposite claims about whether the mesh is gated, and only one of
-/// them stops an operator looking for the token they need. Nothing about the
-/// value's absence from the snapshot says the mesh is open — the flag says
-/// that, and the flag is what the panel branches on. Inferring from emptiness
-/// is a bug this once had.
-#[test]
-fn provider_does_not_read_an_unfetched_token_as_an_open_mesh() {
-    let html = render_with(Some(provider_snapshot()), || view! { <Provider /> });
-
-    assert!(
-        !html.contains("Not required"),
-        "a gated mesh must not be described as open: {html}"
-    );
-    assert!(
-        html.contains("Show token"),
-        "it offers to fetch the value instead: {html}"
-    );
-    assert_eq!(
-        html.matches("wf-copy-button").count(),
-        2,
-        "nothing to copy for a value that has not been asked for: {html}"
-    );
-}
-
-/// With no token set, the panel says enrollment is open and offers no "remove
-/// token" button — there is nothing to remove, and offering it would imply
-/// the mesh is gated when it is not.
-#[test]
-fn provider_says_so_when_enrollment_is_open() {
-    let mut snap = provider_snapshot();
-    if let Some(policy) = snap.security.as_mut().and_then(|s| s.enrollment.as_mut()) {
-        policy.enrollment_token_set = false;
-    }
-    let html = render_with(Some(snap), || view! { <Provider /> });
-
-    assert!(
-        html.contains("anyone in range may join"),
-        "open enrollment is stated plainly: {html}"
-    );
-    assert!(!html.contains("Remove token"), "nothing to remove: {html}");
-}
-
 // ------------------------------------------------------- Read-only viewers --
-
-/// A read-only account is shown the provider's *state* and none of its
-/// administration.
-///
-/// The three panels omitted are the ones that only exist to change something:
-/// the account roster and the form that adds to it, the enrollment policy, and
-/// the queue of nodes waiting to be admitted. The node refuses all three to a
-/// viewer — `list_users` is not even readable — so rendering them would produce
-/// a panel that fails to load above two panels of controls that fail on click.
-#[test]
-fn provider_hides_its_administration_from_a_read_only_viewer() {
-    let mut snap = provider_snapshot();
-    snap.pending_csrs = Some(ListPendingCsrsResponse {
-        pending: vec![PendingCsr {
-            node_mac: vec![0, 0, 0, 0, 0, 9],
-            ed_pubkey: vec![0x33; 32],
-            x_pubkey: vec![0x44; 32],
-            requested_at: 1_700_000_000,
-        }],
-    });
-    let html = render_as_viewer(Some(snap), || view! { <Provider /> });
-
-    assert!(!html.contains("Accounts"), "the account roster: {html}");
-    assert!(!html.contains("How nodes join"), "the policy: {html}");
-    assert!(!html.contains("Requests to join"), "the queue: {html}");
-    assert!(
-        !html.contains("00:00:00:00:00:09"),
-        "and no request from it survives the omitted panel: {html}"
-    );
-    assert!(
-        html.contains("What a node needs to join"),
-        "what is left is the one panel that only reports: {html}"
-    );
-}
-
-/// The enrollment token is not offered to a read-only account.
-///
-/// `GetEnrollmentToken` is an administrator's call — a viewer asking for the
-/// mesh's shared secret is refused by the node — so the button that asks is
-/// not drawn. Whether a token is required is a different fact, already on the
-/// polled status, and it stays: it is what tells an operator why a node in
-/// range has not joined.
-#[test]
-fn provider_does_not_offer_a_read_only_viewer_the_enrollment_token() {
-    let html = render_as_viewer(Some(provider_snapshot()), || view! { <Provider /> });
-
-    assert!(!html.contains("Show token"), "no way to ask: {html}");
-    assert!(
-        !html.contains("Not required"),
-        "and a gated mesh is still not described as open: {html}"
-    );
-    assert!(
-        html.contains("Required"),
-        "the fact itself is still reported: {html}"
-    );
-    assert!(
-        html.contains("Provider key"),
-        "the details that are not secret are still handed over: {html}"
-    );
-}
 
 /// A read-only account sees what this node's security posture *is*, and is
 /// offered nothing that would change it.
@@ -1042,8 +1151,8 @@ fn provider_does_not_offer_a_read_only_viewer_the_enrollment_token() {
 /// The settings are deliberately shown rather than hidden: "is this node
 /// refusing to run unauthenticated?" is exactly the question a read-only
 /// account is signed in to answer. What goes is the ability to act — the
-/// switches are inert, the per-node revoke button is gone, and so is the panel
-/// that would move this node to another mesh.
+/// switches are inert, and the panel that would move this node to another mesh
+/// is gone.
 #[test]
 fn security_shows_a_read_only_viewer_the_posture_it_cannot_change() {
     let html = render_as_viewer(Some(seeded_snapshot()), || view! { <Security /> });
@@ -1063,10 +1172,6 @@ fn security_shows_a_read_only_viewer_the_posture_it_cannot_change() {
         "both switches are inert: {html}"
     );
 
-    assert!(
-        html.contains("<td class=\"wf-status-off\">Revoked</td>"),
-        "no revoking a node: {html}"
-    );
     assert!(
         !html.contains("Move to another mesh"),
         "no leaving the mesh: {html}"
@@ -1101,7 +1206,6 @@ fn security_does_not_offer_a_read_only_viewer_a_mesh_to_join() {
 fn security_still_offers_an_administrator_every_control() {
     let html = render_with(Some(seeded_snapshot()), || view! { <Security /> });
 
-    assert!(html.contains("Revoke"), "{html}");
     assert!(html.contains("Move to another mesh"), "{html}");
     assert!(!html.contains("disabled"), "and nothing is inert: {html}");
 }

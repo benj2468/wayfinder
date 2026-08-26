@@ -50,9 +50,10 @@ mounted read-only so the host binary's interpreter resolves.)
 **On macOS, substitute** ``just sim-binaries`` **for that** ``cargo build``.
 The containers are Linux and a macOS ``cargo build`` emits Mach-O, so the
 entrypoint would fail with "exec format error"; that recipe builds the same
-binaries inside a Linux container into ``target/sim-linux/``, which
-``containers/sim.Dockerfile`` puts first on the container's ``PATH``. Rebuilds
-are still incremental, so the loop is unchanged apart from the command name.
+binaries — and the dashboard, see below — inside a Linux container into
+``target/sim-linux/``, which ``containers/sim.Dockerfile`` puts first on the
+container's ``PATH``. Rebuilds are still incremental, so the loop is unchanged
+apart from the command name.
 Everything else here — minting identities, ``docker compose``, the dashboards —
 runs natively.
 
@@ -67,10 +68,17 @@ plain ``cargo build`` does *not* produce usably — build it with::
 
     cargo leptos build      # the ssr binary AND the wasm bundle it serves
 
-(``cargo leptos build`` on the host is right on macOS too: what the sidecar
-needs from it is the *browser* half under ``target/site``, which is
-architecture-independent. ``just sim-binaries`` supplies the Linux server
-binary that serves it.)
+Both halves have to come out of that one command.  cargo-leptos compiles them
+with ``RUSTFLAGS=--cfg erase_components``, which changes the markup the
+``view!`` macro emits; a server binary built by a plain ``cargo build`` serves
+HTML a cargo-leptos-built wasm bundle cannot adopt, and the browser panics on
+the hydration mismatch instead of the dashboard going live.  It looks like a
+working page that answers nothing.
+
+(On macOS ``just sim-binaries`` runs that same ``cargo leptos build`` inside
+the Linux builder container, alongside the node binaries, for the same reason
+it builds those there: a macOS ``cargo build`` emits Mach-O.  Nothing extra to
+run on the host.)
 
 A secured node's dashboard has **no credential of its own**: it is started in
 login mode (``--provider``), and whoever opens it signs in with one of the two
@@ -749,7 +757,8 @@ def render_compose(require_approval: bool = False) -> tuple[str, DevInfo]:
         e("      - |")
         e("        test -s /workspace/target/site/pkg/wayfinder-web.wasm || {")
         e(
-            "          echo \"dashboard assets missing: run 'cargo leptos build' on the host\" >&2"
+            "          echo \"dashboard assets missing: run 'cargo leptos build'"
+            " (macOS: 'just sim-binaries')\" >&2"
         )
         e(
             "          echo \"(a plain 'cargo build' makes a stub binary and no wasm).\" >&2"

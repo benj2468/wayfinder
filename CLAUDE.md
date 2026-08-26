@@ -425,11 +425,15 @@ look at if a duty-cycle-limited radio segment gets crowded.
 - **bins/wayfinder-tui** — `ratatui` dashboard (routing, link quality, OGM
   schedule, throughput/metrics, security tabs).
 - **bins/wayfinder-web** → the same seven views in a browser, for reaching a
-  node without a terminal and for supporting non-technical users. Leptos in SSR
-  mode: one crate built twice, into an axum server that holds the node
-  connection and a wasm bundle that hydrates its markup. The browser never
-  speaks the management protocol — `wayfinder-client` is tokio/rustls and does
-  not build for wasm — so every node interaction is a `#[server]` function.
+  node without a terminal and for supporting non-technical users, plus five the
+  TUI has no equivalent for. Leptos in SSR mode: one crate built twice, into an
+  axum server that holds the node connection and a wasm bundle that hydrates its
+  markup. The browser never speaks the management protocol —
+  `wayfinder-client` is tokio/rustls and does not build for wasm — so every node
+  interaction is a `#[server]` function. The twelve tabs sit in **two scopes**:
+  a generally-available *Router* scope (the TUI's seven) and an
+  administrators-only *Provider* scope for what the node governs as the mesh's
+  certificate authority. A node's two jobs, kept apart.
 - **bins/wayfinder-ctl** (`wayfinderctl`) — CLI mgmt client (query commands) +
   offline `cert` tooling + online `enroll`.
 - **bins/rylr998-cli** — a small host CLI for driving a RYLR998/498 module over
