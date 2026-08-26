@@ -67,6 +67,12 @@ pub struct AuthContext {
     pub anchor: Option<TrustAnchor>,
     /// Node MACs with an active revocation as of the snapshot instant.
     pub revoked: Vec<Mac>,
+    /// This node's own mesh address — see [`AuthSnapshot::own_mac`].
+    ///
+    /// No part of the access decision: [`decide_access`] never reads it. It
+    /// travels here because the VPN handlers run on this task and the router
+    /// is the only trustworthy source for it.
+    pub own_mac: Mac,
     /// Current unix time (seconds), for certificate validity checks.
     pub now_unix: u64,
 }
@@ -134,6 +140,7 @@ impl AuthGate {
             own_key: snapshot.own_key,
             anchor: snapshot.anchor,
             revoked: snapshot.revoked,
+            own_mac: snapshot.own_mac,
             now_unix: (self.clock)()?,
         })
     }
@@ -519,6 +526,11 @@ where
     };
 
     let ctx = gate.context().await?;
+    // Kept beside `decision` and refreshed with it below, for the same reason
+    // every other field is read fresh: it is the router's answer, and a serve
+    // task that cached one from connect-time would be answering from a
+    // snapshot rather than from the router.
+    let mut own_mac = ctx.own_mac;
     let decision = authorize(&peer_key, cert.as_ref(), &ctx);
     if let MgmtAccess::Denied(reason) = decision {
         // A rejected management login is security-relevant and worth an
@@ -579,6 +591,7 @@ where
         // decision — fail-closed, the same way the connect-time path does.
         if decided_at.elapsed() >= gate.revalidate_after {
             let ctx = gate.context().await?;
+            own_mac = ctx.own_mac;
             let current = authorize(&peer_key, cert.as_ref(), &ctx);
             if current != decision {
                 // Revoked, expired, or a rotated seed. Same generic message as
@@ -639,14 +652,15 @@ where
                 "drop: request not permitted on this connection"
             );
             // Matched on the request first, because `GetVpnEnrollment` is the
-            // one request a *full* grant can be refused — so keying only on the
-            // tier would tell an admin it "is limited to enrollment", which is
-            // both false and points them at the wrong fix.
+            // one request the *admin* tier can be refused — so keying only on
+            // the tier would tell an admin it "is limited to enrollment", which
+            // is both false and points them at the wrong fix.
             let message = match (decision, req) {
                 (_, ReqKind::GetVpnEnrollment(_)) => {
-                    "a VPN credential is issued only to an enrolled device presenting its \
-                     own certificate; an operator's session certificate and the node's own \
-                     key are not devices, so there is no identity to issue one for"
+                    "a VPN credential is issued only to a device: an enrolled node presenting \
+                     its own certificate, or a node connecting to itself with its own key. An \
+                     operator's session certificate is a person, not a device, so there is no \
+                     identity to issue one for"
                 }
                 (MgmtAccess::GrantedMember, _) => {
                     "this connection is an enrolled device (its certificate carries the \
@@ -706,7 +720,7 @@ where
         // holds. They are also network I/O, and the router loop that would
         // otherwise await them is the loop emitting OGMs.
         if let Some(vpn_response) =
-            serve_vpn_request(req, decision, cert.as_ref(), vpn.as_ref()).await
+            serve_vpn_request(req, decision, cert.as_ref(), own_mac, vpn.as_ref()).await
         {
             send_response(&mut responses, vpn_response).await?;
             continue;
@@ -736,13 +750,14 @@ where
 /// router should serve it.
 ///
 /// `permits` has already run, so reaching a given arm here means the tier was
-/// authorized for it. The MAC a credential is minted for is taken from `cert`
-/// — the certificate the handshake key was bound to — never from the request,
-/// which is why `GetVpnEnrollmentRequest` carries no fields at all.
+/// authorized for it. The MAC a credential is minted for comes from the
+/// connection's tier — see [`credential_mac`] — never from the request, which
+/// is why `GetVpnEnrollmentRequest` carries no fields at all.
 async fn serve_vpn_request(
     req: &ReqKind,
     decision: MgmtAccess,
     cert: Option<&MembershipCert>,
+    own_mac: Mac,
     vpn: Option<&crate::vpn::SharedCoordinator>,
 ) -> Option<RespKind> {
     use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentResponse;
@@ -767,16 +782,17 @@ async fn serve_vpn_request(
     Some(match req {
         ReqKind::GetVpnEnrollment(_) => {
             // Belt and braces with `permits`, which already confined this
-            // request to the member tier. The MAC below is only meaningful
-            // because the tier means "this certificate verified and its key is
-            // the one this connection's handshake proved", so re-stating the
-            // condition here keeps the two from drifting apart silently if the
-            // policy is ever edited.
-            let Some(mac) = member_mac(decision, cert) else {
-                tracing::warn!("VPN enrollment refused: no bound member certificate");
+            // request to the two tiers that name a device. The MAC below is
+            // only meaningful because of what those tiers mean — a verified
+            // certificate bound to this handshake, or the node's own address —
+            // so re-stating the condition here keeps the two from drifting
+            // apart silently if the policy is ever edited.
+            let Some(mac) = credential_mac(decision, cert, own_mac) else {
+                tracing::warn!("VPN enrollment refused: connection holds no device identity");
                 return Some(RespKind::Error(ErrorResponse {
-                    message: "a VPN credential is issued only to an enrolled device presenting \
-                              its own certificate"
+                    message: "a VPN credential is issued only to a device: an enrolled node \
+                              presenting its own certificate, or a node connecting to itself \
+                              with its own key"
                         .into(),
                 }));
             };
@@ -883,18 +899,37 @@ fn half_completed_revoke_message(mac: Mac) -> String {
     )
 }
 
-/// The MAC a member-tier connection is bound to, or `None` if `decision` is not
-/// the member tier or no certificate was presented.
+/// The device identity a VPN credential is minted for on this connection, or
+/// `None` if the connection holds no device identity at all.
 ///
-/// The tier is what makes the MAC trustworthy: `decide_access` grants it only
-/// after verifying the certificate against the anchor *and* checking that its
-/// key is the one the handshake proved. Reading `node_mac` off an unverified
-/// certificate would be reading a value the client chose.
-fn member_mac(decision: MgmtAccess, cert: Option<&MembershipCert>) -> Option<Mac> {
-    if decision != MgmtAccess::GrantedMember {
-        return None;
+/// Two tiers do, and the MAC comes from a different place for each — which is
+/// the whole security property of the enrollment RPC, since the request itself
+/// carries no fields to ask with.
+///
+/// * [`MgmtAccess::GrantedMember`]: the MAC in the presented certificate. The
+///   tier is what makes it trustworthy — `decide_access` grants it only after
+///   verifying that certificate against the anchor *and* checking that its key
+///   is the one the handshake proved.
+/// * [`MgmtAccess::GrantedSelfKey`]: `own_mac`, this node's own mesh address,
+///   read from the router. Deliberately *not* the presented certificate: the
+///   self-key tier is granted on the handshake key alone, before any
+///   certificate is verified, so a `node_mac` read there would let whoever
+///   holds a node's seed register a device under another node's Headscale user
+///   — and that user name is the only record of the peer↔mesh-identity
+///   mapping.
+///
+/// Every other tier is `None`: an operator's session certificate is a person
+/// and a stranger holds nothing, so there is nothing to mint for.
+fn credential_mac(
+    decision: MgmtAccess,
+    cert: Option<&MembershipCert>,
+    own_mac: Mac,
+) -> Option<Mac> {
+    match decision {
+        MgmtAccess::GrantedMember => Some(Mac(cert?.node_mac)),
+        MgmtAccess::GrantedSelfKey => Some(own_mac),
+        _ => None,
     }
-    Some(Mac(cert?.node_mac))
 }
 
 /// A 6-byte MAC from wire bytes, or `None` if the length is wrong.
@@ -953,6 +988,18 @@ pub struct AuthSnapshot {
     pub anchor: Option<TrustAnchor>,
     /// Node MACs with an active revocation.
     pub revoked: Vec<Mac>,
+    /// This node's own mesh address (`CentralRouter::self_ident`).
+    ///
+    /// The identity a
+    /// [`MgmtAccess::GrantedSelfKey`](crate::MgmtAccess::GrantedSelfKey)
+    /// connection's VPN credential is minted for. It comes from the router
+    /// rather than from the certificate on the connection because that
+    /// certificate is never verified on the self-key path — `decide_access`
+    /// grants the tier on the handshake key alone, before it reaches the
+    /// anchor — so a MAC read there would be a value the client chose. Not
+    /// an `Option`: a router always has an address, whether or not it is
+    /// enrolled.
+    pub own_mac: Mac,
 }
 
 /// Sender the TLS accept loop uses to ask the router loop for an
@@ -1282,6 +1329,7 @@ mod tests {
         own_key: Option<[u8; 32]>,
         anchor: Option<TrustAnchor>,
         revoked: Vec<Mac>,
+        own_mac: Mac,
     ) {
         tokio::spawn(async move {
             while let Some(reply) = rx.recv().await {
@@ -1289,6 +1337,7 @@ mod tests {
                     own_key,
                     anchor,
                     revoked: revoked.clone(),
+                    own_mac,
                 });
             }
         });
@@ -1324,7 +1373,13 @@ mod tests {
     fn gate_returning(ctx: AuthContext) -> AuthGate {
         let now_unix = ctx.now_unix;
         let (snapshot_tx, snapshot_rx) = mpsc::channel(8);
-        spawn_snapshots(snapshot_rx, ctx.own_key, ctx.anchor, ctx.revoked);
+        spawn_snapshots(
+            snapshot_rx,
+            ctx.own_key,
+            ctx.anchor,
+            ctx.revoked,
+            ctx.own_mac,
+        );
         AuthGate {
             snapshot_tx,
             clock: std::sync::Arc::new(move || Ok(now_unix)),
@@ -1403,6 +1458,7 @@ mod tests {
             own_key: Some(key), // bootstrap: handshake key equals the node's own key
             anchor: None,       // un-enrolled
             revoked: Vec::new(),
+            own_mac: Mac([2, 0, 0, 0, 0, 1]),
             now_unix: 100,
         };
         let (mut client, server) = spawn_authenticated_server(key, ctx);
@@ -1446,6 +1502,7 @@ mod tests {
             own_key: Some([1u8; 32]),
             anchor: None,
             revoked: Vec::new(),
+            own_mac: Mac([2, 0, 0, 0, 0, 1]),
             now_unix: 100,
         };
         let (mut client, server) = spawn_authenticated_server([2u8; 32], ctx);
@@ -1488,6 +1545,7 @@ mod tests {
             own_key: Some([1u8; 32]),
             anchor: None,
             revoked: Vec::new(),
+            own_mac: Mac([2, 0, 0, 0, 0, 1]),
             now_unix: 100,
         };
         let (mut client, server) = spawn_authenticated_server([2u8; 32], ctx);
@@ -1550,6 +1608,7 @@ mod tests {
             own_key: Some([1u8; 32]), // un-enrolled ⇒ every other key is GrantedEnrollment
             anchor: None,
             revoked: Vec::new(),
+            own_mac: Mac([2, 0, 0, 0, 0, 1]),
             now_unix: 100,
         };
         let (mut client, server) = spawn_authenticated_server([2u8; 32], ctx);
@@ -1650,6 +1709,7 @@ mod tests {
                     own_key: Some(server_key),
                     anchor: None,
                     revoked: Vec::new(),
+                    own_mac: Mac([2, 0, 0, 0, 0, 1]),
                 });
             }
         });
@@ -1747,6 +1807,7 @@ mod tests {
             own_key: Some([1u8; 32]),
             anchor: None,
             revoked: Vec::new(),
+            own_mac: Mac([2, 0, 0, 0, 0, 1]),
             now_unix: 100,
         };
         // The connection's own key: self-key/bootstrap, a full grant.
@@ -1865,6 +1926,7 @@ mod tests {
                     own_key: Some(server_key),
                     anchor: None,
                     revoked: Vec::new(),
+                    own_mac: Mac([2, 0, 0, 0, 0, 1]),
                 });
             }
         });
@@ -1950,6 +2012,7 @@ mod tests {
                         own_key: Some(own_key),
                         anchor: None,
                         revoked: Vec::new(),
+                        own_mac: Mac([2, 0, 0, 0, 0, 1]),
                     });
                 }
             });
@@ -2039,6 +2102,7 @@ mod tests {
             own_key: Some(key),
             anchor: None,
             revoked: Vec::new(),
+            own_mac: Mac([2, 0, 0, 0, 0, 1]),
             now_unix: 100,
         };
         let (mut client, server) = spawn_authenticated_server(key, ctx);
@@ -2083,6 +2147,7 @@ mod tests {
             own_key: Some([9u8; 32]), // not the client's key: only the cert can admit it
             anchor: Some(authority.trust_anchor()),
             revoked: Vec::new(),
+            own_mac: Mac([2, 0, 0, 0, 0, 1]),
             now_unix: 100,
         };
         let (mut client, server) = spawn_authenticated_server(admin_kp.ed_pubkey(), ctx);
@@ -2132,6 +2197,7 @@ mod tests {
             own_key: Some([9u8; 32]),
             anchor: Some(authority.trust_anchor()),
             revoked: vec![admin_mac], // this admin's node is revoked
+            own_mac: Mac([2, 0, 0, 0, 0, 1]),
             now_unix: 100,
         };
         let (mut client, server) = spawn_authenticated_server(admin_kp.ed_pubkey(), ctx);
@@ -2190,6 +2256,7 @@ mod tests {
             own_key: Some([9u8; 32]),
             anchor: Some(authority.trust_anchor()),
             revoked: vec![admin_mac],
+            own_mac: Mac([2, 0, 0, 0, 0, 1]),
             now_unix: 100,
         };
         let subject =
@@ -2239,6 +2306,7 @@ mod tests {
             own_key: Some([9u8; 32]),
             anchor: None,
             revoked: Vec::new(),
+            own_mac: Mac([2, 0, 0, 0, 0, 1]),
             now_unix: 100,
         };
         let (mut client, server) = spawn_authenticated_server([2u8; 32], ctx);
@@ -2274,6 +2342,7 @@ mod tests {
             own_key: Some(key),
             anchor: None,
             revoked: Vec::new(),
+            own_mac: Mac([2, 0, 0, 0, 0, 1]),
             now_unix: 100,
         };
         let (mut client, server) = spawn_authenticated_server(key, ctx);
@@ -2304,6 +2373,7 @@ mod tests {
             own_key: Some(key),
             anchor: None,
             revoked: Vec::new(),
+            own_mac: Mac([2, 0, 0, 0, 0, 1]),
             now_unix: 100,
         };
         let big = Response::NodeInfo(NodeInfo {
@@ -2416,6 +2486,7 @@ mod tests {
             own_key: Some(key), // bootstrap: a full grant
             anchor: None,
             revoked: Vec::new(),
+            own_mac: Mac([2, 0, 0, 0, 0, 1]),
             now_unix: 100,
         };
         let source = |n: usize| std::net::IpAddr::from(std::net::Ipv4Addr::from(n as u32));
@@ -2523,6 +2594,7 @@ mod tests {
             Some(Keypair::from_seed(&[1u8; 32]).ed_pubkey()),
             None,
             Vec::new(),
+            Mac([2, 0, 0, 0, 0, 1]),
         );
         tokio::spawn(serve_tls_server(listener, [1u8; 32], snapshot_tx, query_tx));
 
@@ -2567,6 +2639,7 @@ mod tests {
                         own_key: current.own_key,
                         anchor: current.anchor,
                         revoked: current.revoked.clone(),
+                        own_mac: Mac([2, 0, 0, 0, 0, 1]),
                     });
                 }
             });
@@ -2628,6 +2701,7 @@ mod tests {
                 own_key: Some([9u8; 32]),
                 anchor: Some(anchor),
                 revoked: Vec::new(),
+                own_mac: Mac([2, 0, 0, 0, 0, 1]),
             },
             100,
         );
@@ -2688,6 +2762,7 @@ mod tests {
                 own_key: Some([9u8; 32]),
                 anchor: Some(anchor),
                 revoked: Vec::new(),
+                own_mac: Mac([2, 0, 0, 0, 0, 1]),
             },
             100,
         );
@@ -2732,6 +2807,7 @@ mod tests {
                 own_key: Some([9u8; 32]),
                 anchor: Some(anchor),
                 revoked: Vec::new(),
+                own_mac: Mac([2, 0, 0, 0, 0, 1]),
             },
             100,
         );
@@ -2872,6 +2948,7 @@ mod tests {
                 own_key: Some(ca_own),
                 anchor: Some(anchor),
                 revoked: Vec::new(),
+                own_mac: Mac([2, 0, 0, 0, 0, 1]),
                 now_unix: 100,
             }),
             canned_node_info(),
@@ -2914,6 +2991,7 @@ mod tests {
                 own_key: Some([7u8; 32]),
                 anchor: None,
                 revoked: Vec::new(),
+                own_mac: Mac([2, 0, 0, 0, 0, 1]),
                 now_unix: 100,
             }),
             canned_node_info(),
@@ -2947,6 +3025,114 @@ mod tests {
         );
     }
 
+    /// The certificate authority's own case: a connection that proved the
+    /// node's *own* key gets a credential minted for the node's own mesh
+    /// address, read from the router — not from anything on the connection.
+    ///
+    /// The CA coordinates the tunnel and is also a node on it, and the only
+    /// credential it can present to itself is its seed. Nothing else it holds
+    /// would do: a certificate presented over a connection whose handshake key
+    /// is already the node's own key is never verified (`decide_access`
+    /// short-circuits to the self-key tier before it reaches the anchor), so
+    /// the router is the only trustworthy source for the MAC here.
+    #[tokio::test]
+    async fn a_self_key_connection_mints_for_the_routers_own_mac() {
+        use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentRequest;
+
+        let own_mac = Mac([2, 0, 0, 0, 0, 1]);
+        let own_key = [7u8; 32];
+        let coordinator = std::sync::Arc::new(FakeCoordinator::default());
+        let (mut client, _server) = spawn_gated_server_with_vpn(
+            own_key,
+            gate_returning(AuthContext {
+                own_key: Some(own_key),
+                anchor: None,
+                revoked: Vec::new(),
+                own_mac,
+                now_unix: 100,
+            }),
+            canned_node_info(),
+            Some(coordinator.clone()),
+        );
+
+        // No certificate: whoever holds the seed presents the node's key and
+        // nothing else, which is exactly what the CA's self-join does.
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: Vec::new(),
+            })))
+            .await
+            .unwrap();
+        let _ack = client.next().await.unwrap().unwrap();
+
+        client
+            .send(encode_request(Request::GetVpnEnrollment(
+                GetVpnEnrollmentRequest {},
+            )))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+
+        let Some(Response::VpnEnrollment(enrollment)) = resp.response else {
+            panic!("expected a VPN enrollment, got {:?}", resp.response);
+        };
+        assert_eq!(enrollment.vpn_preauth_key, "key-for-020000000001");
+        assert_eq!(
+            *coordinator.enrolled.lock().unwrap(),
+            vec![own_mac],
+            "the credential must be minted for the router's own MAC"
+        );
+    }
+
+    /// And it cannot be talked into minting for anyone else. A self-key
+    /// connection may present any certificate it likes — that one is never
+    /// verified on this path — so if the MAC came off the certificate, the
+    /// holder of a node's seed could register a device under *another* node's
+    /// Headscale user and break the peer↔mesh-identity correlation that
+    /// `hostname_for` is the only record of.
+    #[tokio::test]
+    async fn a_self_key_connection_cannot_mint_for_another_nodes_mac() {
+        use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentRequest;
+
+        let victim = Mac([2, 0, 0, 0, 0, 42]);
+        let (_node, victim_cert, _anchor, _ca_own) = enrolled_device(victim);
+        let own_mac = Mac([2, 0, 0, 0, 0, 1]);
+        let own_key = [7u8; 32];
+        let coordinator = std::sync::Arc::new(FakeCoordinator::default());
+        let (mut client, _server) = spawn_gated_server_with_vpn(
+            own_key,
+            gate_returning(AuthContext {
+                own_key: Some(own_key),
+                anchor: None,
+                revoked: Vec::new(),
+                own_mac,
+                now_unix: 100,
+            }),
+            canned_node_info(),
+            Some(coordinator.clone()),
+        );
+
+        authenticate_with(&mut client, &victim_cert).await;
+        client
+            .send(encode_request(Request::GetVpnEnrollment(
+                GetVpnEnrollmentRequest {},
+            )))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+
+        assert!(
+            matches!(resp.response, Some(Response::VpnEnrollment(_))),
+            "expected a VPN enrollment, got {:?}",
+            resp.response
+        );
+        assert_eq!(
+            *coordinator.enrolled.lock().unwrap(),
+            vec![own_mac],
+            "a presented certificate must not choose the MAC on the self-key tier"
+        );
+    }
+
     /// Revoking a node's mesh membership removes its VPN registration in the
     /// same action, so an operator's one click does both.
     #[tokio::test]
@@ -2963,6 +3149,7 @@ mod tests {
                 own_key: Some(ca_own),
                 anchor: Some(anchor),
                 revoked: Vec::new(),
+                own_mac: Mac([2, 0, 0, 0, 0, 1]),
                 now_unix: 100,
             }),
             Response::Empty(wayfinder_protos::wayfinder::v1alpha::Empty {}),
@@ -3012,6 +3199,7 @@ mod tests {
                 own_key: Some(ca_own),
                 anchor: Some(anchor),
                 revoked: Vec::new(),
+                own_mac: Mac([2, 0, 0, 0, 0, 1]),
                 now_unix: 100,
             }),
             Response::Empty(wayfinder_protos::wayfinder::v1alpha::Empty {}),
@@ -3063,6 +3251,7 @@ mod tests {
                 own_key: Some(ca_own),
                 anchor: Some(anchor),
                 revoked: Vec::new(),
+                own_mac: Mac([2, 0, 0, 0, 0, 1]),
                 now_unix: 100,
             }),
             canned_node_info(),
@@ -3098,32 +3287,41 @@ mod tests {
     /// catches.
     #[tokio::test]
     async fn a_refusal_explains_the_actual_reason() {
+        use wayfinder::wayfinder_auth::Authority;
         use wayfinder_protos::wayfinder::v1alpha::GetRoutingTableRequest;
         use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentRequest;
 
         let node_mac = Mac([2, 0, 0, 0, 0, 9]);
         let (node, cert, anchor, ca_own) = enrolled_device(node_mac);
 
-        // An admin refused the device-scoped request: the message must name
-        // *that*, not claim the connection lacks an admin certificate.
+        // A real *admin* refused the device-scoped request: an operator's
+        // session certificate, whose key is not this node's own key — a
+        // connection proving the node's own key would be the self-key tier,
+        // which is a device and is served. The message must name that
+        // distinction, not claim the connection lacks an admin certificate.
+        let operator = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let admin_kp = Keypair::from_seed(&[3u8; 32]);
+        let admin_cert = operator.issue_user_cert(
+            Mac([0, 0, 0, 0, 0, 5]),
+            admin_kp.ed_pubkey(),
+            admin_kp.x_pubkey(),
+            0,
+            200,
+            true,
+        );
         let (mut client, _server) = spawn_gated_server_with_vpn(
-            ca_own,
+            admin_kp.ed_pubkey(),
             gate_returning(AuthContext {
                 own_key: Some(ca_own),
                 anchor: Some(anchor),
                 revoked: Vec::new(),
+                own_mac: Mac([2, 0, 0, 0, 0, 1]),
                 now_unix: 100,
             }),
             canned_node_info(),
             Some(std::sync::Arc::new(FakeCoordinator::default())),
         );
-        client
-            .send(encode_request(Request::Authenticate(AuthenticateRequest {
-                cert: Vec::new(),
-            })))
-            .await
-            .unwrap();
-        let _ack = client.next().await.unwrap().unwrap();
+        authenticate_with(&mut client, &admin_cert).await;
         client
             .send(encode_request(Request::GetVpnEnrollment(
                 GetVpnEnrollmentRequest {},
@@ -3135,8 +3333,8 @@ mod tests {
             panic!("expected a refusal, got {:?}", resp.response);
         };
         assert!(
-            err.message.contains("enrolled device"),
-            "a full grant refused the device credential must be told why: {:?}",
+            err.message.contains("session certificate is a person"),
+            "an admin refused the device credential must be told why: {:?}",
             err.message
         );
         assert!(
@@ -3153,6 +3351,7 @@ mod tests {
                 own_key: Some(ca_own),
                 anchor: Some(anchor),
                 revoked: Vec::new(),
+                own_mac: Mac([2, 0, 0, 0, 0, 1]),
                 now_unix: 100,
             }),
             canned_node_info(),

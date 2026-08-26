@@ -231,6 +231,7 @@ async fn spawn_provider_full(
                 own_key: Some(node_key),
                 anchor,
                 revoked: Vec::new(),
+                own_mac: wayfinder_server::Mac([2, 0, 0, 0, 0, 1]),
             });
         }
     });

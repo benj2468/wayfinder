@@ -1,10 +1,13 @@
 //! Operator-side VPN peer management, and the tunnel-join half of enrollment.
 //!
-//! Two audiences in one module, matching the two authorization tiers behind
-//! them. `list`/`revoke` are provider-side operator actions needing a full
+//! Two audiences in one module, matching the authorization tiers behind them.
+//! `list`/`revoke` are provider-side operator actions needing a full
 //! management grant. [`join`] is the other end: it runs as part of
 //! `wayfinderctl enroll`, on a connection carrying the certificate that was
-//! just issued, which is the only credential that can mint a tunnel key.
+//! just issued — or, on the coordination server itself, on a connection
+//! carrying that node's own identity seed. Either proves a *device*, which is
+//! what a tunnel credential is scoped to; an operator's session certificate
+//! does not and is refused.
 //!
 //! Nothing here writes a file a node is expected to read. The credential goes
 //! straight from the management API into the tunnel daemon's own CLI, and the
@@ -26,10 +29,17 @@ pub enum VpnCommand {
     /// Ask the provider for *this* device's tunnel credential and join with it.
     ///
     /// `enroll` already does this as its last step, so this is for a node that
-    /// enrolled before the mesh had a VPN, or one whose join failed and is
-    /// being retried. It needs the connection to carry this device's own
-    /// certificate: an operator's identity is refused, since the credential is
-    /// scoped to a device and an operator is not one.
+    /// enrolled before the mesh had a VPN, one whose join failed and is being
+    /// retried, or the certificate authority putting itself on the tunnel it
+    /// coordinates.
+    ///
+    /// It needs the connection to prove a *device* identity, in one of the two
+    /// ways there are: this device's own membership certificate
+    /// (`--identity`/`--cert`), or — connecting to a node from the host it
+    /// runs on — that node's own identity seed with no certificate at all,
+    /// which is the node asking on its own behalf. An operator's session
+    /// certificate is refused however privileged it is, since the credential
+    /// is scoped to a device and an operator is not one.
     Enrollment {
         /// Print the `tailscale up` command instead of running it.
         #[arg(long)]
@@ -142,9 +152,12 @@ impl VpnJoinOutcome {
 /// Ask the provider for a tunnel credential over `client` and join the VPN with
 /// it.
 ///
-/// `client` must be connected as the *enrolling node's own identity* — that is
-/// what earns the member tier the request needs. Called by `enroll` after the
-/// certificate is written, on a second connection opened with it.
+/// `client` must be connected as a *device*: the enrolling node's own
+/// certificate (the member tier), or the node's own identity seed presented to
+/// the node itself (the self-key tier). Called by `enroll` after the
+/// certificate is written, on a second connection opened with it, and by
+/// `wayfinderctl vpn enrollment` — which is how the certificate authority
+/// joins its own tunnel, over the same RPC as every other node.
 ///
 /// A provider with no VPN configured is not a failure: enrollment succeeded,
 /// there is simply no tunnel to join, and the caller keeps its certificate.

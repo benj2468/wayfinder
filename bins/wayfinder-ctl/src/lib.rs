@@ -799,10 +799,11 @@ async fn dispatch_query(
                 .with_context(|| format!("writing trust anchor to {}", out_anchor.display()))?;
             // Enrollment is complete and durable at this point. The VPN step
             // below is additive: it reconnects presenting the certificate just
-            // issued — the only credential that earns the member tier
-            // `GetVpnEnrollment` needs — and anything that goes wrong there is
-            // reported in the summary rather than failing the command, since
-            // failing would discard an enrollment that already succeeded.
+            // issued, which earns the member tier `GetVpnEnrollment` needs —
+            // the connection enrollment ran over was a stranger's and cannot
+            // mint anything. Anything that goes wrong there is reported in the
+            // summary rather than failing the command, since failing would
+            // discard an enrollment that already succeeded.
             let vpn_note = match (no_vpn, endpoint) {
                 (true, _) => String::new(),
                 (false, None) => String::new(),

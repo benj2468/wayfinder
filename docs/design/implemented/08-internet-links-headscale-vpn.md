@@ -10,8 +10,15 @@ Headscale and Headplane this design calls for.
 What no test covers is two hosts behind *real* NAT, which is where hole-punching
 either happens or silently degrades to relaying.
 
-The hub needs no special configuration — see Correction 7, and question 7 in
-§9.
+The hub needs no special configuration *as a hub* — nothing in its config says
+"relay", and its link is an ordinary `UdpMulti` in fan-out mode. See Correction
+7, and question 7 in §9.
+
+The cloud CA now runs one, and the two pieces of configuration it did need are
+recorded in `docs/design/implemented/11-cloud-auth-provider.md` §12: the link
+itself, and `services.wayfinder-headscale.selfJoin` — the box joining the
+tunnel it coordinates, which it cannot do over `GetVpnEnrollment` for the
+reason Correction 1 draws.
 
 > **Seven corrections to this document, found while implementing it.** Each was
 > a specific claim below that did not survive contact with the code or with
@@ -24,7 +31,9 @@ The hub needs no special configuration — see Correction 7, and question 7 in
 >    before it could send a request. Fixed by adding `CERT_FLAG_MEMBER` to the
 >    certificate and a `GrantedMember` tier that is exactly one request wide.
 >    The bit is set explicitly rather than inferred from the absence of the
->    management bits — see §3.2.
+>    management bits — see §3.2. **Amended since:** the first fix also refused
+>    `GetVpnEnrollment` to `GrantedSelfKey`, which was wrong for a reason that
+>    took the CA's own self-join to expose. See the amendment under §3.2.
 > 2. **§3.3/§10 put the handlers in `RouterAdapter`. They cannot go there.**
 >    The router loop is never told *who* is calling (`QueryTx` carries a
 >    request and a reply channel, nothing else), and `GetVpnEnrollment` has no
@@ -244,11 +253,43 @@ message GetVpnEnrollmentResponse {
 > `Denied(NoCapability)`, so this was additive rather than a flag day.
 >
 > `permits` gates this request *ahead of* the tier match, and refuses it to the
-> full grants: `GetVpnEnrollment` mints a credential for the caller's device
-> identity, and neither an operator's session certificate nor the node's own
-> seed is a device. That inverts the previous invariant that a full grant may
-> invoke everything, which is the point — it is what makes the two gates below
-> genuinely independent rather than one gate producing two artifacts.
+> admin tier: `GetVpnEnrollment` mints a credential for the caller's device
+> identity, and an operator's session certificate is a person, not a device.
+> That inverts the previous invariant that a full grant may invoke everything,
+> which is the point — it is what makes the two gates below genuinely
+> independent rather than one gate producing two artifacts.
+>
+> **Amendment: `GrantedSelfKey` is admitted here, and was wrongly refused.**
+> The original correction lumped the node's own seed in with an operator's
+> session certificate as "not a device". An operator is not a device; the
+> node's own seed *is* one — the node's — and whoever holds it already signs
+> that node's OGMs and terminates its TLS, so refusing it protected nothing.
+>
+> What genuinely blocked the request was mechanical, and worth stating because
+> it is the part that had to change: the transport read the MAC off the
+> certificate presented on the connection (`member_mac`). That is sound only on
+> the member tier, where `decide_access` verified the certificate against the
+> anchor *and* bound it to the handshake key. The self-key tier is granted on
+> the handshake key alone and short-circuits before any of that, so a `node_mac`
+> read there would have been a value the client chose — which on the
+> coordination server means registering a device under another node's Headscale
+> user, breaking the peer↔mesh-identity correlation `hostname_for` is the only
+> record of.
+>
+> So the MAC no longer comes from the connection on that tier. The router
+> publishes its own mesh address through `AuthSnapshot::own_mac`, read fresh per
+> connection like every other field of the snapshot, and `credential_mac` mints
+> for that. A self-key connection cannot name anyone else even when it attaches
+> a certificate that does.
+>
+> The two gates stay independent: reaching this request still means proving
+> possession of a key that *names a node* — the certified one, or the node's own
+> seed. And it grants its holder nothing new, since whoever holds a provider's
+> seed can already reveal the enrollment token and approve its own CSR.
+>
+> The consequence is that the certificate authority joins the tunnel it
+> coordinates through this RPC rather than through a shell reimplementation of
+> it — see design 11 §12.2, which is where the refusal was actually paid for.
 
 Gated at the **member tier** (`MgmtAccess::GrantedMember`), which
 `decide_access` grants only when the *TLS handshake key itself* matches a
@@ -256,6 +297,12 @@ verified, non-revoked `MembershipCert` carrying `CERT_FLAG_MEMBER`. That's
 proof of possession of the issued identity's private key over an authenticated
 connection, not a self-asserted claim — a materially different, and much
 stronger, gate than `SubmitCsr`'s.
+
+And, per the amendment above, at the **self-key tier**
+(`MgmtAccess::GrantedSelfKey`) — a node connecting to its own management API
+with its own identity seed, which is the same standard of proof applied to the
+one identity a node does not need a certificate to hold. The MAC is then the
+router's own (`AuthSnapshot::own_mac`), never one read off the connection.
 
 Server-side, this handler (not the CSR-issuance path) makes the new outbound
 calls: if Headscale integration is configured (`provider.headscale.{api_url,

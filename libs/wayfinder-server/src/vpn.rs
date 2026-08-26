@@ -17,8 +17,11 @@
 //!   routing for as long as the coordination server takes to answer, which for
 //!   an unreachable one is the full timeout.
 //!
-//! So the transport handles them: it is already async, and it is the only layer
-//! that holds the verified certificate the credential is scoped to.
+//! So the transport handles them: it is already async, and it is the layer that
+//! knows which identity the credential is scoped to — the verified certificate
+//! on the connection for an enrolled device, or (for a node connecting to
+//! itself with its own key) the node's own address, which reaches it through
+//! `AuthSnapshot::own_mac` rather than through the request.
 //!
 //! # What a tunnel credential is and is not
 //!

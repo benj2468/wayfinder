@@ -87,10 +87,10 @@ in
 
         Derived from `config` by default — true exactly when a `Tap` or
         `RawL2Egress` egress, or a `RawL2`/`RawIp` link, is configured. A node
-        carrying only UDP/LoRa/BLE links, and a certificate authority with no
-        egress and no links at all, needs neither capability, and with this
-        false the unit additionally runs under systemd's filesystem and
-        privilege hardening.
+        carrying only UDP/LoRa/BLE links needs neither capability — including
+        the cloud certificate authority, which has no egress and one `UdpMulti`
+        link over its tunnel — and with this false the unit additionally runs
+        under systemd's filesystem and privilege hardening.
 
         Set it explicitly only to override that derivation — e.g. for a carrier
         added at runtime through `SetConfig` that the startup config does not
