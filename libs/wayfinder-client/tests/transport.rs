@@ -404,9 +404,38 @@ async fn client_roundtrips_against_real_tls_server() {
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
+    // The authority half runs on its own channel now, exactly as it does on a
+    // real provider node: the connection task routes an authority-facing
+    // request there rather than to the task that owns the router. Backed by the
+    // same `Mock`, so `GetTrustAnchor` still round-trips real framing.
+    let (authority_tx, mut authority_rx) =
+        tokio::sync::mpsc::channel::<wayfinder_server::AuthorityCommand>(8);
     tokio::spawn(async move {
-        let _ =
-            wayfinder_server::serve_tls_server(listener, node_seed, snapshot_tx, query_tx).await;
+        while let Some(command) = authority_rx.recv().await {
+            match command {
+                wayfinder_server::AuthorityCommand::Request(request, reply) => {
+                    let mut provider = Mock;
+                    let response =
+                        wayfinder_protos::service::handle_authority(&mut provider, request)
+                            .unwrap_or_else(|_| wayfinder_server::not_a_provider_response());
+                    let _ = reply.send(response);
+                }
+                wayfinder_server::AuthorityCommand::SetEnrollmentPolicy(_, reply) => {
+                    let _ = reply.send(Ok(()));
+                }
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let _ = wayfinder_server::serve_tls_server_with_vpn(
+            listener,
+            node_seed,
+            snapshot_tx,
+            query_tx,
+            None,
+            Some(authority_tx),
+        )
+        .await;
     });
 
     // Bootstrap: present the node's own seed and an empty cert; pin the node key.

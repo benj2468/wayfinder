@@ -640,7 +640,7 @@ pub struct AlarmsData {
 ///
 /// Split from [`AuthorityDataProvider`] so the two halves can be owned by
 /// different executors — see
-/// `docs/design/13-certificate-authority-off-the-router-loop.md`. Intentionally
+/// `docs/design/implemented/13-certificate-authority-off-the-router-loop.md`. Intentionally
 /// transport- and protocol-agnostic so callers can implement it for whatever
 /// router type they have.
 pub trait RouterDataProvider {
@@ -722,6 +722,28 @@ pub trait RouterDataProvider {
     }
 }
 
+/// The answer every authority-facing request gives on a node that runs no
+/// certificate authority.
+///
+/// One definition, because two code paths produce it — this trait's defaults on
+/// a router-only node, and the connection task when no authority is wired — and
+/// a client that distinguishes them would be distinguishing a detail of which
+/// task answered.
+pub const NOT_A_PROVIDER: &str = "node is not a certificate-authority provider";
+
+/// Build the response a node with no certificate authority gives to a request
+/// only one could serve.
+///
+/// Lives here rather than beside the authority task because an embedded node —
+/// which never links that task, or `std` at all — needs the same answer.
+pub fn not_a_provider_response() -> WayfinderResponse {
+    WayfinderResponse {
+        response: Some(ResponseKind::Error(ErrorResponse {
+            message: NOT_A_PROVIDER.into(),
+        })),
+    }
+}
+
 /// Certificate-authority state for [`WayfinderService`]: enrollment, the user
 /// store, revocation and the issued-certificate log.
 ///
@@ -734,7 +756,7 @@ pub trait AuthorityDataProvider {
     /// default errors — only a node running as a certificate-authority provider
     /// overrides these three methods.
     fn get_trust_anchor(&self) -> Result<Vec<u8>, String> {
-        Err("node is not a certificate-authority provider".into())
+        Err(NOT_A_PROVIDER.into())
     }
 
     /// Provider mode: submit a certificate-signing request.  Returns the CSR's
@@ -752,7 +774,7 @@ pub trait AuthorityDataProvider {
         enrollment_token: &str,
     ) -> Result<CsrOutcome, String> {
         let _ = (node_mac, ed_pubkey, x_pubkey, enrollment_token);
-        Err("node is not a certificate-authority provider".into())
+        Err(NOT_A_PROVIDER.into())
     }
 
     /// Provider mode: exchange a user's credentials for a short-lived
@@ -774,7 +796,7 @@ pub trait AuthorityDataProvider {
         x_pubkey: &[u8],
     ) -> Result<UserAuthOutcome, String> {
         let _ = (username, password, totp_code, ed_pubkey, x_pubkey);
-        Err("node is not a certificate-authority provider".into())
+        Err(NOT_A_PROVIDER.into())
     }
 
     /// Provider mode: the admission rule this node applies to a submitted CSR
@@ -787,26 +809,26 @@ pub trait AuthorityDataProvider {
     /// when asked for can be logged as a disclosure. An implementation should
     /// treat every call as an audited read.
     fn reveal_enrollment_token(&self) -> Result<EnrollmentAdmission, String> {
-        Err("node is not a certificate-authority provider".into())
+        Err(NOT_A_PROVIDER.into())
     }
 
     /// Provider mode: revoke a node, signing and flooding a revocation record.
     /// Default errors.
     fn revoke_node(&mut self, node_mac: &[u8]) -> Result<(), String> {
         let _ = node_mac;
-        Err("node is not a certificate-authority provider".into())
+        Err(NOT_A_PROVIDER.into())
     }
 
     /// Provider mode: list the certificates this provider has issued.  Default
     /// errors.
     fn list_certs(&self) -> Result<Vec<IssuedCertData>, String> {
-        Err("node is not a certificate-authority provider".into())
+        Err(NOT_A_PROVIDER.into())
     }
 
     /// Provider mode: list the CSRs currently awaiting operator approval.
     /// Default errors (not a provider).
     fn list_pending_csrs(&self) -> Result<Vec<PendingCsrData>, String> {
-        Err("node is not a certificate-authority provider".into())
+        Err(NOT_A_PROVIDER.into())
     }
 
     /// Provider mode: list the user accounts this authority holds.  Default
@@ -814,7 +836,7 @@ pub trait AuthorityDataProvider {
     ///
     /// Never the password hashes or TOTP secrets — see [`UserAccountData`].
     fn list_users(&self) -> Result<Vec<UserAccountData>, String> {
-        Err("node is not a certificate-authority provider".into())
+        Err(NOT_A_PROVIDER.into())
     }
 
     /// Provider mode: create a user account, returning the `otpauth://`
@@ -835,7 +857,7 @@ pub trait AuthorityDataProvider {
         no_totp: bool,
     ) -> Result<String, String> {
         let _ = (username, password, admin, session_ttl_secs, no_totp);
-        Err("node is not a certificate-authority provider".into())
+        Err(NOT_A_PROVIDER.into())
     }
 
     /// Provider mode: remove the named user account.  Default errors (not a
@@ -849,7 +871,7 @@ pub trait AuthorityDataProvider {
     /// see [`RemoveUserRequest`](crate::wayfinder::v1alpha::RemoveUserRequest).
     fn remove_user(&mut self, username: &str) -> Result<(), String> {
         let _ = username;
-        Err("node is not a certificate-authority provider".into())
+        Err(NOT_A_PROVIDER.into())
     }
 
     /// Provider mode: approve the pending CSR bound to `node_mac`, so the
@@ -858,7 +880,7 @@ pub trait AuthorityDataProvider {
     /// provider).
     fn approve_csr(&mut self, node_mac: &[u8]) -> Result<(), String> {
         let _ = node_mac;
-        Err("node is not a certificate-authority provider".into())
+        Err(NOT_A_PROVIDER.into())
     }
 
     /// Provider mode: deny the pending CSR bound to `node_mac`; the enrolling
@@ -866,7 +888,7 @@ pub trait AuthorityDataProvider {
     /// that MAC is pending.  Default errors (not a provider).
     fn deny_csr(&mut self, node_mac: &[u8]) -> Result<(), String> {
         let _ = node_mac;
-        Err("node is not a certificate-authority provider".into())
+        Err(NOT_A_PROVIDER.into())
     }
 }
 
@@ -1038,7 +1060,11 @@ fn proto_log_level(level: LogLevelData) -> LogLevel {
 /// field names the act of clearing the token, so `false` states nothing at
 /// all. Treating it as "leave the token alone" would answer `Empty` to a
 /// request that changed nothing, which reads to the caller as success.
-fn enrollment_policy_data(policy: EnrollmentPolicy) -> Result<EnrollmentPolicyData, String> {
+/// Public because the connection task splits a `SetConfig` between the router
+/// and the certificate authority, and the authority half has to be converted
+/// before it is sent — the router-side adapter that used to do it no longer
+/// sees this field.
+pub fn enrollment_policy_data(policy: EnrollmentPolicy) -> Result<EnrollmentPolicyData, String> {
     use crate::wayfinder::v1alpha::enrollment_policy::EnrollmentTokenUpdate;
 
     if policy.cert_ttl_secs == Some(0) {
@@ -1083,7 +1109,7 @@ fn enrollment_policy_data(policy: EnrollmentPolicy) -> Result<EnrollmentPolicyDa
 /// Never derived from `Debug` on the whole variant: some request payloads
 /// (`SetAuthRequest`'s identity seed, CSR key material) are secret, so only
 /// the kind — never the fields — may be logged.
-fn request_kind_name(k: &RequestKind) -> &'static str {
+pub fn request_kind_name(k: &RequestKind) -> &'static str {
     match k {
         RequestKind::GetNodeInfo(_) => "GetNodeInfo",
         RequestKind::GetRoutingTable(_) => "GetRoutingTable",
@@ -1217,16 +1243,22 @@ fn audited(k: &RequestKind) -> Audited {
 /// knows which one *before* it sends anything can route a request to the right
 /// owner rather than discovering the answer from an error. That is what lets
 /// the certificate authority live off the router's event loop — see
-/// `docs/design/13-certificate-authority-off-the-router-loop.md`.
+/// `docs/design/implemented/13-certificate-authority-off-the-router-loop.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestFacet {
     /// Answered from router state alone, by [`handle_router`].
     Router,
     /// Answered from certificate-authority state alone, by [`handle_authority`].
     Authority,
-    /// Reaches neither dispatcher: the VPN requests are served in the
-    /// connection task (they are scoped to the caller's own identity, which no
-    /// provider holds), and `Authenticate` is the transport's own first frame.
+    /// Answered by the transport itself rather than by either dispatcher: the
+    /// VPN requests are served in the connection task (they are scoped to the
+    /// caller's own identity, which no provider holds), and `Authenticate` is
+    /// the transport's own first frame.
+    ///
+    /// A fork on this enum must still handle one arriving anyway — an
+    /// `Authenticate` repeated mid-connection reaches the router half, which
+    /// declines it. Answer that with [`handle_unowned`], which names the
+    /// protocol error, not with the not-a-provider message.
     Transport,
 }
 
@@ -1769,7 +1801,13 @@ pub fn handle_authority<P: AuthorityDataProvider>(
 /// Answer a request no provider owns: one the transport should already have
 /// handled, or an empty one.  Reaching here is a protocol error by the client
 /// rather than a capability the node lacks, and each arm says which.
-fn handle_unowned(request: WayfinderRequest) -> WayfinderResponse {
+///
+/// `pub` because every dispatcher fork needs it as its fallback.  Answering one
+/// of these with the not-a-provider error instead — which is what a fork that
+/// only knows `handle_router` will reach for — tells a client debugging its
+/// handshake that the node is not a certificate authority, which is both false
+/// and pointed at the wrong subsystem.
+pub fn handle_unowned(request: WayfinderRequest) -> WayfinderResponse {
     let response = match request.request {
         // The VPN requests are answered by the management *transport*, which
         // is the only layer that holds the caller's verified certificate —

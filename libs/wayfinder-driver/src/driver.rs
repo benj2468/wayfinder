@@ -7,7 +7,9 @@
 //!
 //! * [`Driver::run`] / [`Driver::run_once`] — the free-running `select!` loop
 //!   used in production: it awaits whichever event happens first (a mesh frame,
-//!   a host frame, a management query, or the periodic-broadcast timer).
+//!   a host frame, a management query, an authorization-snapshot request, a
+//!   signed revocation from the certificate authority, or the
+//!   periodic-broadcast timer).
 //! * [`Driver::poll`] + [`Driver::process_pending`] — deterministic stepping
 //!   for tests: drive the periodic broadcast at a chosen instant, then drain
 //!   every already-pending frame in one non-blocking sweep.
@@ -31,11 +33,10 @@ use wayfinder::interfaces::frame::Mac;
 use wayfinder::wayfinder_auth::Keypair;
 use wayfinder_driver_core::Egress;
 use wayfinder_driver_core::MeshSink;
-use wayfinder_protos::service::WayfinderService;
+use wayfinder_protos::service::handle_router;
+use wayfinder_protos::service::handle_unowned;
 use wayfinder_server::AuthSnapshot;
 use wayfinder_server::AuthSnapshotRx;
-use wayfinder_server::CertAuthority;
-use wayfinder_server::MeshAuthority;
 use wayfinder_server::QueryRx;
 use wayfinder_server::RouterAdapter;
 use wayfinder_server::SettingsFile;
@@ -134,17 +135,19 @@ pub struct Driver<Local: FrameIo> {
     /// time) via the `now` it already controls.  Defaults to the wall clock at
     /// construction; override with [`set_epoch_unix`](Self::set_epoch_unix).
     epoch_unix: Duration,
-    /// Publishing half of the certificate-validity clock, for an authority that
-    /// does not share this loop.  See [`Driver::auth_clock`].
-    auth_clock_tx: AuthClockTx,
+    /// Everything exchanged with a certificate-authority task that does not
+    /// share this loop: the clock and auth-present state this loop publishes,
+    /// and the enrollment policy and signed revocations it receives back.
+    ///
+    /// One field rather than four channels because they are one relationship,
+    /// and because wiring them separately is how one gets forgotten.  The
+    /// publishing half is live on every node, including one that never runs an
+    /// authority; see [`AuthorityComms`](wayfinder_server::AuthorityComms).
+    authority: wayfinder_server::AuthorityComms,
     /// Receive scratchpad for frames read from the host device.
     rx_buffer: [u8; MAX_LINK_FRAME_LEN],
     /// Transmit scratchpad the router builds outgoing frames into.
     tx_buffer: [u8; MAX_LINK_FRAME_LEN],
-    /// The mesh certificate authority, present only when this node runs in
-    /// provider mode (set via [`set_provider`](Self::set_provider)).  Serves the
-    /// enrollment management-API requests; absent ⇒ those return an error.
-    provider: Option<CertAuthority>,
     /// Where accepted security settings are recorded so they outlive a
     /// restart (set via [`set_settings_store`](Self::set_settings_store)).
     /// Absent ⇒ a runtime change applies in memory only.
@@ -223,10 +226,9 @@ impl<Local: FrameIo> Driver<Local> {
             snooper: McastSnooper::new(),
             start: Instant::now(),
             epoch_unix,
-            auth_clock_tx: new_auth_clock(epoch_unix).0,
+            authority: wayfinder_server::AuthorityComms::new(epoch_unix.as_secs()),
             rx_buffer: [0u8; MAX_LINK_FRAME_LEN],
             tx_buffer: [0u8; MAX_LINK_FRAME_LEN],
-            provider: None,
             settings: None,
             identity_seed: None,
             auth_snapshot_rx: None,
@@ -245,10 +247,23 @@ impl<Local: FrameIo> Driver<Local> {
         self.identity_seed = Some(seed);
     }
 
-    /// Enable provider (certificate-authority) mode: the node serves enrollment
-    /// requests (`GetTrustAnchor`/`SubmitCsr`/`RevokeNode`) from this `ca`.
-    pub fn set_provider(&mut self, ca: CertAuthority) {
-        self.provider = Some(ca);
+    /// Wire a certificate-authority task to this driver, returning everything
+    /// that task needs to run.
+    ///
+    /// One call rather than four, so provider mode cannot be half-enabled: the
+    /// clock and auth-present state this loop publishes, the enrollment policy
+    /// `GetSecurityStatus` reports, and the signed revocations this loop floods
+    /// are all wired together or not at all.  Hand the result straight to
+    /// `wayfinder_server::serve_authority`.
+    ///
+    /// Only the revocation half is an edge running *into* this loop, and it is
+    /// safe in that direction: this loop never waits on the authority for an
+    /// answer, so no cycle can form back to it.
+    pub fn attach_authority(
+        &mut self,
+        commands: wayfinder_server::AuthorityRx,
+    ) -> wayfinder_server::AuthorityPorts {
+        self.authority.attach(commands)
     }
 
     /// Record accepted security settings in `settings`, so a change made
@@ -278,35 +293,36 @@ impl<Local: FrameIo> Driver<Local> {
         // Re-seed, or a subscriber that reads before the next loop iteration
         // sees the wall-clock seed this driver was built with rather than the
         // virtual epoch a test just set.
-        publish_auth_clock(&self.auth_clock_tx, epoch_unix, self.start.elapsed());
+        self.authority
+            .set_clock(epoch_unix.saturating_add(self.start.elapsed()).as_secs());
     }
 
-    /// Subscribe to this driver's certificate-validity clock.
+    /// Advance the certificate-validity clock to `epoch_unix + now` and
+    /// republish this node's auth-present state for the certificate authority.
     ///
-    /// The instant the router verifies certificates against, republished on
-    /// every loop iteration. An authority that does not share this loop reads
-    /// its issuance clock from here, so the two cannot drift apart.
-    pub fn auth_clock(&self) -> AuthClockRx {
-        self.auth_clock_tx.subscribe()
-    }
-
-    /// Advance the auth state's certificate-validity clock to `epoch_unix +
-    /// now`.  A no-op when auth is disabled.  Called from every entry point that
-    /// processes frames so cert expiry tracks the loop's `now` consistently.
+    /// Called from every entry point that processes frames, so cert expiry
+    /// tracks the loop's `now` consistently. Only the router's own `set_time` is
+    /// skipped when auth is disabled — both publications happen either way, and
+    /// the auth-disabled case is precisely the one the authority needs told.
     fn refresh_auth_clock(&mut self, now: Duration) {
-        let epoch = self.epoch_unix;
-        let unix = epoch.saturating_add(now);
-        // Publish to whatever holds the other half — an authority task that no
-        // longer shares this loop reads its issuance clock from here.
-        publish_auth_clock(&self.auth_clock_tx, epoch, now);
-        if let Some(auth) = self.router.auth_mut() {
-            auth.set_time(unix.as_secs());
-        }
-        // Keep the provider CA's issuance clock in step, so issued certificate
-        // validity windows track the same time the router verifies against.
-        if let Some(ca) = self.provider.as_mut() {
-            ca.set_now_unix(unix.as_secs());
-        }
+        let unix = self.epoch_unix.saturating_add(now);
+        let auth_present = match self.router.auth_mut() {
+            Some(auth) => {
+                auth.set_time(unix.as_secs());
+                true
+            }
+            None => false,
+        };
+        // Published to whatever holds the other half — an authority task that
+        // no longer shares this loop reads its issuance clock from here.  Both
+        // facts go out every iteration rather than only when they change:
+        // `SetAuth` can turn authentication on or off between iterations, and
+        // the authority must not sign a revocation this node can no longer
+        // flood.
+        self.authority.publish(wayfinder_server::RouterFacts {
+            unix_secs: unix.as_secs(),
+            auth_present,
+        });
     }
 
     /// The underlying router, for inspecting routing state (originator tables,
@@ -331,8 +347,10 @@ impl<Local: FrameIo> Driver<Local> {
 
     /// Run a single iteration: wait for whichever happens first — a frame from a
     /// mesh interface, a frame from the local host device, a management query,
-    /// or the periodic-broadcast timer — process it, then deliver any inner
-    /// frame to the host and dispatch any outgoing frame onto the mesh.
+    /// an authorization-snapshot request, a signed revocation from the
+    /// certificate-authority task, or the periodic-broadcast timer — process
+    /// it, then deliver any inner frame to the host and dispatch any outgoing
+    /// frame onto the mesh.
     ///
     /// `now` is the current instant (relative to the driver's reference instant)
     /// stamped on received originator records and on any OGM produced, so a
@@ -392,13 +410,16 @@ impl<Local: FrameIo> Driver<Local> {
             epoch_unix: _,
             rx_buffer,
             tx_buffer,
-            provider,
             settings,
             identity_seed,
             auth_snapshot_rx,
-            auth_clock_tx: _,
+            authority,
         } = self;
         let mac = *mac;
+        // Two disjoint borrows in one call: `select!` builds every branch's
+        // future before polling any, so the revocation arm's `&mut` and the
+        // policy read's `&` are live at the same moment.
+        let (revocation_rx, enrollment_policy_rx) = authority.split();
 
         // Each arm reports the clock it planned against alongside its output:
         // every arm but the periodic one plans at the `now` sampled above,
@@ -440,15 +461,34 @@ impl<Local: FrameIo> Driver<Local> {
                     })
                 },
                 Some((request, resp_tx)) = query_rx.recv(), if check_server => {
-                    let ca = provider.as_mut().map(|c| c as &mut dyn MeshAuthority);
-                    let mut adapter = RouterAdapter::new(&mut *router, ca, now)
+                    let mut adapter = RouterAdapter::new(&mut *router, now)
                         .with_epoch_unix(self.epoch_unix)
-                        .with_identity(identity_seed);
+                        .with_identity(identity_seed)
+                        .with_enrollment_policy(read_enrollment_policy(enrollment_policy_rx));
                     if let Some(store) = settings.as_mut() {
                         adapter = adapter.with_settings(store as &mut dyn SettingsStore);
                     }
-                    let response = WayfinderService::new(adapter).handle(request);
+                    // `handle_router`, not the combined service: the authority
+                    // half is served by its own task now, and the connection
+                    // task routes by `request_facet` so nothing else arrives
+                    // here. What `handle_router` declines is answered by
+                    // `handle_unowned`, which knows the transport-owned kinds
+                    // and says which one this is — not the not-a-provider
+                    // message, which would tell a client that repeated an
+                    // `Authenticate` out of order that this node is not a
+                    // certificate authority: false, and aimed at the wrong
+                    // subsystem.
+                    let response = handle_router(&mut adapter, request)
+                        .unwrap_or_else(handle_unowned);
                     let _ = resp_tx.send(response);
+                    (now, LoopOutput::none())
+                },
+                Some((record, ack)) = recv_revocation(revocation_rx), if check_server => {
+                    // The authority signed and persisted this; flooding it is
+                    // this loop's half of the act. Acknowledged either way, so
+                    // the operator is told whether the revocation was actually
+                    // announced rather than only that it was recorded.
+                    ingest_and_report(router, &record, now, epoch_unix_secs(self.epoch_unix, now), ack);
                     (now, LoopOutput::none())
                 },
                 Some(reply) = recv_auth_snapshot(auth_snapshot_rx), if check_server => {
@@ -541,8 +581,9 @@ impl<Local: FrameIo> Driver<Local> {
         .await
     }
 
-    /// Drain every already-pending event — host frames, mesh frames, and
-    /// management queries — in non-blocking sweeps until nothing remains.
+    /// Drain every already-pending event — host frames, mesh frames, management
+    /// queries, authorization snapshots and signed revocations — in
+    /// non-blocking sweeps until nothing remains.
     ///
     /// This is the deterministic counterpart to [`run_once`]: where `run_once`
     /// awaits the next single event, `process_pending` consumes the current
@@ -600,15 +641,33 @@ impl<Local: FrameIo> Driver<Local> {
             if let Ok((request, resp_tx)) = self.query_rx.try_recv() {
                 progressed = true;
                 let now = self.start.elapsed();
-                let ca = self.provider.as_mut().map(|c| c as &mut dyn MeshAuthority);
-                let mut adapter = RouterAdapter::new(&mut self.router, ca, now)
+                let (_, policy_rx) = self.authority.split();
+                let policy = read_enrollment_policy(policy_rx);
+                let mut adapter = RouterAdapter::new(&mut self.router, now)
                     .with_epoch_unix(self.epoch_unix)
-                    .with_identity(&mut self.identity_seed);
+                    .with_identity(&mut self.identity_seed)
+                    .with_enrollment_policy(policy);
                 if let Some(store) = self.settings.as_mut() {
                     adapter = adapter.with_settings(store as &mut dyn SettingsStore);
                 }
-                let response = WayfinderService::new(adapter).handle(request);
+                // See the same fallback in `run_once`: `handle_unowned` names the
+                // transport-owned kind rather than misreporting the node's role.
+                let response = handle_router(&mut adapter, request).unwrap_or_else(handle_unowned);
                 let _ = resp_tx.send(response);
+            }
+
+            // Signed revocations from the certificate-authority task. Drained
+            // here as well as in `run_once`: the authority awaits this
+            // acknowledgement before serving anything else, so a sweep that
+            // skipped it would park the authority forever and every later
+            // request behind it.
+            if let Some(rx) = self.authority.split().0.as_mut()
+                && let Ok((record, ack)) = rx.try_recv()
+            {
+                progressed = true;
+                let now = self.start.elapsed();
+                let now_unix = epoch_unix_secs(self.epoch_unix, now);
+                ingest_and_report(&mut self.router, &record, now, now_unix, ack);
             }
 
             // Authorization-state snapshot requests from the TLS management server.
@@ -670,6 +729,118 @@ fn poll_due_keepalives(
     out.mesh
 }
 
+/// The certificate-validity instant for `now`, as Unix seconds.
+///
+/// The same arithmetic the loop publishes to the authority, so a record is
+/// verified against the instant the authority issued it against.
+fn epoch_unix_secs(epoch_unix: Duration, now: Duration) -> u64 {
+    epoch_unix.saturating_add(now).as_secs()
+}
+
+/// Fold a revocation the authority signed into the router, so it floods across
+/// the mesh on this node's OGMs.
+///
+/// The router half of `RevokeNode`. The authority has already signed and
+/// persisted by the time this runs, so a failure here means the revocation is
+/// recorded but unannounced — which the caller reports rather than swallowing.
+///
+/// Takes the parsed record, not its bytes: the authority signed it in this same
+/// process, so "the authority produced something this loop cannot parse" was
+/// never a condition that could arise — only one the receiver had to invent an
+/// answer for.
+fn ingest_signed_revocation(
+    router: &mut CentralRouter,
+    record: &wayfinder::wayfinder_auth::RevocationRecord,
+    now: Duration,
+    now_unix: u64,
+) -> Result<(), String> {
+    // Every `Err` here is a *clause*, never a sentence: the authority's
+    // `signed_but_not_flooded` supplies the "signed and recorded, but not
+    // flooded to the mesh" framing. A reason that restated it produced a
+    // message the operator actually read twice over.
+    let Some(auth) = router.auth() else {
+        return Err(
+            "this node's mesh authentication is disabled, so a revocation has no OGMs to ride"
+                .to_string(),
+        );
+    };
+    // Checked explicitly rather than inferred from `ingest_revocation`'s
+    // `false`, which collapses three causes into one. Verification failure is
+    // the one worth naming on its own: it means the authority's root key and
+    // this node's trust anchor have diverged, and it must be reported even when
+    // the MAC below turns out to be revoked already — that benign-looking
+    // success is exactly how a re-keyed mesh stays hidden.
+    if let Err(e) = auth.anchor().verify_revocation(record, now_unix) {
+        return Err(format!(
+            "it does not verify against the trust anchor this node is running ({e:?}) — the \
+             authority's root key and this node's anchor have diverged"
+        ));
+    }
+    if router.ingest_revocation(record, now) {
+        return Ok(());
+    }
+    // Already-known is the one benign `false` left. It verified above, so the
+    // record is in the store and was flooded when it first arrived: the
+    // operator's intent holds, even though this request re-floods nothing.
+    if router
+        .auth()
+        .is_some_and(|auth| auth.revoked_macs().any(|m| m.0 == record.node_mac))
+    {
+        return Ok(());
+    }
+    Err("it names this node, which never floods its own revocation".to_string())
+}
+
+/// Fold a signed revocation in and report the verdict, logging a divergence
+/// where it is *determined* rather than only where it is answered.
+///
+/// The `Err` travels back to the authority, which logs it — but that task may
+/// already be gone (an aborted `JoinSet` on shutdown, a panic), and then the
+/// acknowledgement is dropped and nothing anywhere records that this node's
+/// certificate authority says "revoked" while the mesh was never told. That is
+/// the precise divergence this hop exists to surface, so the log lives on this
+/// side of the channel too.
+fn ingest_and_report(
+    router: &mut CentralRouter,
+    record: &wayfinder::wayfinder_auth::RevocationRecord,
+    now: Duration,
+    now_unix: u64,
+    ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+) {
+    let outcome = ingest_signed_revocation(router, record, now, now_unix);
+    if let Err(reason) = &outcome {
+        tracing::error!(
+            reason,
+            node_mac = ?record.node_mac,
+            "revocation signed and durably recorded, but this node could not flood it"
+        );
+    }
+    if ack.send(outcome).is_err() {
+        tracing::warn!(
+            node_mac = ?record.node_mac,
+            "no reader for the revocation verdict; the certificate-authority task is gone"
+        );
+    }
+}
+
+/// Await the next signed revocation from the certificate-authority task, or
+/// never resolve when no authority is attached.
+///
+/// The only edge that runs from the authority into this loop. Safe in that
+/// direction: this loop never waits on the authority for an *answer*, so no
+/// cycle can form.
+async fn recv_revocation(
+    rx: &mut Option<wayfinder_server::RevocationRx>,
+) -> Option<(
+    wayfinder::wayfinder_auth::RevocationRecord,
+    tokio::sync::oneshot::Sender<Result<(), String>>,
+)> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Await the next authorization-snapshot request from the TLS management server,
 /// or never resolve when none is attached — keeping the corresponding `select!`
 /// arm dormant rather than requiring a separate enable flag.
@@ -680,6 +851,17 @@ async fn recv_auth_snapshot(
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }
+}
+
+/// Read the authority's last-published enrollment policy, without waiting.
+///
+/// `watch::Receiver::borrow` is synchronous and never blocks, which is what
+/// makes reporting the authority's policy from this loop safe: the authority may
+/// be mid-Argon2id, and asking it would be the stall this design removes.
+fn read_enrollment_policy(
+    rx: &Option<wayfinder_server::EnrollmentPolicyRx>,
+) -> Option<wayfinder_protos::service::EnrollmentPolicyStatusData> {
+    rx.as_ref().and_then(|rx| rx.borrow().clone())
 }
 
 /// Project the router's current authorization-relevant state — this node's own
@@ -702,37 +884,6 @@ async fn recv_auth_snapshot(
 /// TLS listener, and nothing configures a TLS listener without an identity
 /// seed), so reaching it still warns: it silently disables the bootstrap grant
 /// for this node.
-/// The certificate-validity clock the router loop publishes, as Unix seconds.
-///
-/// A `watch` rather than a request: the authority that reads it may be
-/// mid-Argon2id when the loop wants to publish, and the loop must never wait on
-/// it. See `docs/design/13-certificate-authority-off-the-router-loop.md` §3.3.
-pub type AuthClockTx = tokio::sync::watch::Sender<u64>;
-
-/// The receiving half of [`AuthClockTx`].
-pub type AuthClockRx = tokio::sync::watch::Receiver<u64>;
-
-/// Open a certificate-validity clock channel seeded from `epoch_unix`.
-///
-/// Seeded with a real time, never zero. A `CertAuthority` reads this before
-/// issuing, and treats `now_unix == 0` as fail-closed — so a channel that
-/// started at zero would give a reader that got there before the router loop's
-/// first iteration an authority that refuses everything, silently.
-fn new_auth_clock(epoch_unix: Duration) -> (AuthClockTx, AuthClockRx) {
-    tokio::sync::watch::channel(epoch_unix.as_secs())
-}
-
-/// Publish `epoch_unix + now` as the certificate-validity clock, returning what
-/// was published.
-///
-/// Uses `send_replace`, which cannot fail: an authority task that has already
-/// shut down must not make the router loop's clock tick an error.
-fn publish_auth_clock(tx: &AuthClockTx, epoch_unix: Duration, now: Duration) -> u64 {
-    let unix = epoch_unix.saturating_add(now).as_secs();
-    tx.send_replace(unix);
-    unix
-}
-
 fn build_auth_snapshot(router: &CentralRouter, identity_seed: Option<[u8; 32]>) -> AuthSnapshot {
     let own_key = identity_seed.map(|seed| Keypair::from_seed(&seed).ed_pubkey());
     if own_key.is_none() {
@@ -922,69 +1073,86 @@ async fn send_on_link(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only to mint a certificate for a `SetAuth`; the driver no longer holds an
+    // authority of its own.
+    use wayfinder_server::CertAuthority;
+    use wayfinder_server::MeshAuthority as _;
 
     fn mac(n: u8) -> Mac {
         Mac([0, 0, 0, 0, 0, n])
     }
 
-    /// The published certificate-validity clock is `epoch_unix + now`, in whole
-    /// seconds — the same instant the router verifies certificates against, so
-    /// an authority issuing from it cannot drift from the router checking it.
-    #[test]
-    fn publish_auth_clock_reports_epoch_plus_elapsed() {
-        let (tx, rx) = tokio::sync::watch::channel(0);
-
-        let published = publish_auth_clock(
-            &tx,
-            Duration::from_secs(1_700_000_000),
-            Duration::from_secs(42),
-        );
-
-        assert_eq!(published, 1_700_000_042);
-        assert_eq!(*rx.borrow(), 1_700_000_042);
+    /// A driver with no interfaces at all, for testing what the loop publishes.
+    fn idle_driver() -> Driver<NeverIo> {
+        let (_query_tx, query_rx) = tokio::sync::mpsc::channel(4);
+        Driver::new(
+            mac(1),
+            NeverIo,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            query_rx,
+        )
     }
 
-    /// The clock channel is seeded from `epoch_unix` at construction rather
-    /// than from zero.
+    /// The clock an attached authority reads is seeded from `epoch_unix`, not
+    /// from zero — before the loop has run a single iteration.
     ///
     /// This is the whole point of the seam. A `CertAuthority` whose `now_unix`
     /// is 0 fails closed on `submit_csr`, `authenticate_user` and `revoke` — so
-    /// an authority that read this channel before the driver's first loop
-    /// iteration would refuse every request, and would do it silently while
-    /// every router-side test stayed green. Seeded, there is no such window.
+    /// an authority that read this before the driver's first loop iteration
+    /// would refuse every request, and would do it silently while every
+    /// router-side test stayed green. Seeded, there is no such window.
     #[test]
-    fn auth_clock_channel_is_seeded_with_a_usable_time() {
-        let epoch = Duration::from_secs(1_700_000_000);
+    fn an_attached_authority_reads_a_usable_clock_before_the_loop_runs() {
+        let mut driver = idle_driver();
+        driver.set_epoch_unix(Duration::from_secs(1_700_000_000));
 
-        let (_tx, rx) = new_auth_clock(epoch);
+        let (_tx, rx) = tokio::sync::mpsc::channel(4);
+        let ports = driver.attach_authority(rx);
 
-        assert_eq!(
-            *rx.borrow(),
-            1_700_000_000,
-            "an authority reading this before the first publish must still see a real time"
+        let seeded = ports.facts.borrow().unix_secs;
+        assert!(
+            seeded >= 1_700_000_000,
+            "an authority reading this before the first publish must still see a real time, \
+             got {seeded}"
         );
-        assert_ne!(
-            *rx.borrow(),
-            0,
-            "zero is the fail-closed value, never a seed"
+        assert_ne!(seeded, 0, "zero is the fail-closed value, never a seed");
+    }
+
+    /// The published clock is `epoch_unix + now` in whole seconds — the same
+    /// instant the router verifies certificates against, so an authority
+    /// issuing from it cannot drift from the router checking it.
+    #[test]
+    fn the_published_clock_is_epoch_plus_elapsed() {
+        let mut driver = idle_driver();
+        let (_tx, rx) = tokio::sync::mpsc::channel(4);
+        let ports = driver.attach_authority(rx);
+
+        driver.refresh_auth_clock(Duration::from_secs(42));
+
+        let facts = *ports.facts.borrow();
+        assert_eq!(facts.unix_secs, driver.epoch_unix.as_secs() + 42);
+        assert!(
+            !facts.auth_present,
+            "a router with no auth state must say so, or the authority signs a \
+             revocation that can never be flooded"
         );
     }
 
-    /// A publish with no subscribers left is not an error: the authority task
-    /// may have shut down first, and that must not take the router loop with
-    /// it.
+    /// Publishing with no authority attached is not an error: most nodes never
+    /// run one, and an authority task that shut down first must not take the
+    /// router loop with it.
     #[test]
-    fn publish_auth_clock_survives_every_receiver_being_dropped() {
-        let (tx, rx) = new_auth_clock(Duration::from_secs(1_700_000_000));
-        drop(rx);
+    fn publishing_survives_having_no_authority_at_all() {
+        let mut driver = idle_driver();
 
-        let published = publish_auth_clock(
-            &tx,
-            Duration::from_secs(1_700_000_000),
-            Duration::from_secs(1),
-        );
-
-        assert_eq!(published, 1_700_000_001);
+        // No `attach_authority`, and then one that is attached and dropped.
+        driver.refresh_auth_clock(Duration::from_secs(1));
+        let (_tx, rx) = tokio::sync::mpsc::channel(4);
+        drop(driver.attach_authority(rx));
+        driver.refresh_auth_clock(Duration::from_secs(2));
     }
 
     /// `own_key` is derived from whatever `identity_seed` this call was given
@@ -1151,6 +1319,107 @@ mod tests {
         assert!(
             driver.router().auth().is_some(),
             "the certificate was actually installed"
+        );
+    }
+
+    /// The claim this whole change exists to make: a slow authority request does
+    /// not delay a router query.
+    ///
+    /// Argued in prose everywhere and, until this test, pinned nowhere — which
+    /// is the dangerous kind of claim, because the regression that breaks it is
+    /// invisible to every other test. Anyone who "simplifies" the enrollment
+    /// policy watch into a request, or otherwise makes the router loop `await`
+    /// the authority, turns this loop back into one that stalls for ~100 ms of
+    /// Argon2id per login while emitting no OGMs. Everything else stays green.
+    ///
+    /// The authority is occupied with a login for an account that does not
+    /// exist, which spends the full `ARGON2_MEMORY_KIB` by design — see
+    /// `users.rs`'s `spend_absent_user_work`, whose whole point is that an
+    /// unknown username costs what a known one does. That is also precisely the
+    /// request an anonymous peer can send, which is why it is the one worth
+    /// proving the router survives.
+    ///
+    /// The assertion is an *ordering*, not a duration: the router's answer must
+    /// arrive while the authority's is still outstanding. A wall-clock threshold
+    /// would be the flaky way to ask the same question.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_authority_request_does_not_delay_a_router_query() {
+        use wayfinder_protos::wayfinder::v1alpha::AuthenticateUserRequest;
+        use wayfinder_protos::wayfinder::v1alpha::GetNodeInfoRequest;
+        use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
+        use wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request as ReqKind;
+        use wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response as RespKind;
+
+        let mut ca = CertAuthority::new(&[9u8; 32], 0xABCD, 10_000, None, true);
+        ca.set_now_unix(1_700_000_000);
+
+        let (query_tx, query_rx) = tokio::sync::mpsc::channel(4);
+        let mut driver = Driver::new(
+            mac(1),
+            NeverIo,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            query_rx,
+        );
+
+        let (authority_tx, authority_rx) = tokio::sync::mpsc::channel(4);
+        let ports = driver.attach_authority(authority_rx);
+
+        tokio::spawn(wayfinder_server::serve_authority(ca, ports));
+        // The driver is not spawned: its link futures are not `Send`, so it is
+        // driven in place below, concurrently with awaiting the reply. The
+        // authority *is* spawned, which is the concurrency under test.
+
+        // Occupy the authority. Unknown account on purpose: it spends the same
+        // memory-hard work a real login does.
+        let (authority_reply_tx, mut authority_reply_rx) = tokio::sync::oneshot::channel();
+        authority_tx
+            .send(wayfinder_server::AuthorityCommand::Request(
+                WayfinderRequest {
+                    request: Some(ReqKind::AuthenticateUser(AuthenticateUserRequest {
+                        username: "nobody".into(),
+                        password: "wrong".into(),
+                        totp_code: String::new(),
+                        ed_pubkey: [1u8; 32].to_vec(),
+                        x_pubkey: [2u8; 32].to_vec(),
+                    })),
+                },
+                authority_reply_tx,
+            ))
+            .await
+            .expect("the authority accepts the command");
+
+        // ...and ask the router something while it is busy.
+        let (query_reply_tx, query_reply_rx) = tokio::sync::oneshot::channel();
+        query_tx
+            .send((
+                WayfinderRequest {
+                    request: Some(ReqKind::GetNodeInfo(GetNodeInfoRequest {})),
+                },
+                query_reply_tx,
+            ))
+            .await
+            .expect("the router accepts the query");
+
+        // Drive the router loop and await its answer together. If the loop were
+        // still serving the authority's request — the arrangement this change
+        // removes — this would not resolve until the Argon2id finished.
+        let router_response = tokio::select! {
+            outcome = driver.run() => panic!("the driver loop exited: {outcome:?}"),
+            reply = query_reply_rx => reply.expect("the router answers while the authority works"),
+        };
+        assert!(
+            matches!(router_response.response, Some(RespKind::NodeInfo(_))),
+            "the router answered its own query, got {:?}",
+            router_response.response
+        );
+
+        assert!(
+            authority_reply_rx.try_recv().is_err(),
+            "the authority was still working when the router answered — if it had already \
+             finished, this test proved nothing and needs a slower authority request"
         );
     }
 }

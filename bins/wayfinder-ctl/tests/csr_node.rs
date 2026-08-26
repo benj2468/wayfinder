@@ -46,12 +46,10 @@ use wayfinder_protos::service::RoutingEntryData;
 use wayfinder_protos::service::RuntimeConfigData;
 use wayfinder_protos::service::SecurityStatusData;
 use wayfinder_protos::service::TableOccupancyData;
-use wayfinder_protos::service::WayfinderService;
 use wayfinder_protos::wayfinder::v1alpha::SubmitCsrRequest;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderResponse;
 use wayfinder_server::AuthSnapshot;
-use wayfinder_server::serve_tls_server;
 use wayfinderctl::Command;
 use wayfinderctl::cert::CertCommand;
 use wayfinderctl::cert::{self};
@@ -271,19 +269,46 @@ async fn spawn_node(has_identity: bool) -> (Endpoint, Arc<Mutex<Vec<SetAuthCall>
             });
         }
     });
+    let (authority_tx, mut authority_rx) =
+        tokio::sync::mpsc::channel::<wayfinder_server::AuthorityCommand>(8);
     tokio::spawn(async move {
-        let _ = serve_tls_server(listener, seed, snapshot_tx, query_tx).await;
+        let _ = wayfinder_server::serve_tls_server_with_vpn(
+            listener,
+            seed,
+            snapshot_tx,
+            query_tx,
+            None,
+            Some(authority_tx),
+        )
+        .await;
     });
     let provider_calls = Arc::clone(&calls);
     tokio::spawn(async move {
-        let mut service = WayfinderService::new(NodeMock {
+        let mut provider = NodeMock {
             keypair: Keypair::from_seed(&seed),
             has_identity,
             is_provider: false,
             set_auth_calls: provider_calls,
-        });
-        while let Some((req, resp_tx)) = query_rx.recv().await {
-            let _ = resp_tx.send(service.handle(req));
+        };
+        loop {
+            tokio::select! {
+                Some((req, resp_tx)) = query_rx.recv() => {
+                    let resp = wayfinder_protos::service::handle_router(&mut provider, req)
+                        .unwrap_or_else(|_| wayfinder_server::not_a_provider_response());
+                    let _ = resp_tx.send(resp);
+                }
+                Some(command) = authority_rx.recv() => match command {
+                    wayfinder_server::AuthorityCommand::Request(req, reply) => {
+                        let resp = wayfinder_protos::service::handle_authority(&mut provider, req)
+                            .unwrap_or_else(|_| wayfinder_server::not_a_provider_response());
+                        let _ = reply.send(resp);
+                    }
+                    wayfinder_server::AuthorityCommand::SetEnrollmentPolicy(_, reply) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                },
+                else => break,
+            }
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -323,18 +348,45 @@ async fn spawn_provider_node() -> Endpoint {
             });
         }
     });
+    let (authority_tx, mut authority_rx) =
+        tokio::sync::mpsc::channel::<wayfinder_server::AuthorityCommand>(8);
     tokio::spawn(async move {
-        let _ = serve_tls_server(listener, seed, snapshot_tx, query_tx).await;
+        let _ = wayfinder_server::serve_tls_server_with_vpn(
+            listener,
+            seed,
+            snapshot_tx,
+            query_tx,
+            None,
+            Some(authority_tx),
+        )
+        .await;
     });
     tokio::spawn(async move {
-        let mut service = WayfinderService::new(NodeMock {
+        let mut provider = NodeMock {
             keypair: Keypair::from_seed(&seed),
             has_identity: true,
             is_provider: true,
             set_auth_calls: Arc::new(Mutex::new(Vec::new())),
-        });
-        while let Some((req, resp_tx)) = query_rx.recv().await {
-            let _ = resp_tx.send(service.handle(req));
+        };
+        loop {
+            tokio::select! {
+                Some((req, resp_tx)) = query_rx.recv() => {
+                    let resp = wayfinder_protos::service::handle_router(&mut provider, req)
+                        .unwrap_or_else(|_| wayfinder_server::not_a_provider_response());
+                    let _ = resp_tx.send(resp);
+                }
+                Some(command) = authority_rx.recv() => match command {
+                    wayfinder_server::AuthorityCommand::Request(req, reply) => {
+                        let resp = wayfinder_protos::service::handle_authority(&mut provider, req)
+                            .unwrap_or_else(|_| wayfinder_server::not_a_provider_response());
+                        let _ = reply.send(resp);
+                    }
+                    wayfinder_server::AuthorityCommand::SetEnrollmentPolicy(_, reply) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                },
+                else => break,
+            }
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;

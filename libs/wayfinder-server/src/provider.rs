@@ -2,11 +2,13 @@
 //!
 //! A node running in *provider mode* answers enrollment requests
 //! ([`GetTrustAnchorRequest`], [`SubmitCsrRequest`], [`RevokeNodeRequest`]) by
-//! delegating to a [`MeshAuthority`].  The trait is deliberately byte-oriented
-//! so it stays `no_std + alloc`: the concrete implementation that holds the mesh
-//! root key ([`CertAuthority`](crate::CertAuthority)) lives behind the `std`
-//! feature, and is injected into the [`RouterAdapter`](crate::RouterAdapter) by
-//! the host driver.
+//! delegating to a [`MeshAuthority`].  The trait keeps every `wayfinder-auth`
+//! value in its raw byte form (bar one — see the trait) so it carries no key
+//! types and stays `no_std + alloc`: the concrete implementation that holds the
+//! mesh root key ([`CertAuthority`](crate::CertAuthority)) lives behind the
+//! `std` feature, and is owned outright by the certificate
+//! authority's own task (`authority_task.rs`), which projects it through
+//! `AuthorityAdapter`.
 //!
 //! [`GetTrustAnchorRequest`]: wayfinder_protos::wayfinder::v1alpha::GetTrustAnchorRequest
 //! [`SubmitCsrRequest`]: wayfinder_protos::wayfinder::v1alpha::SubmitCsrRequest
@@ -14,6 +16,8 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+
+use wayfinder_auth::RevocationRecord;
 
 use wayfinder_protos::service::CsrOutcome;
 use wayfinder_protos::service::EnrollmentAdmission;
@@ -26,9 +30,13 @@ use wayfinder_protos::service::UserAuthOutcome;
 
 /// A mesh certificate authority, as seen by the management-API layer.
 ///
-/// All inputs and outputs are raw bytes (the same `wayfinder-auth` wire forms a
-/// node loads from disk), so this trait carries no crypto types and compiles on
-/// `no_std`.  Errors are human-readable strings surfaced to the client as an
+/// Every `wayfinder-auth` value crossing this trait does so as raw bytes (the
+/// same wire forms a node loads from disk) — with one exception,
+/// [`revoke`](MeshAuthority::revoke), whose [`RevocationRecord`] is a plain
+/// `no_std` wire struct rather than a key; see that method for why it is typed.
+/// Everything else returned here is a `wayfinder-protos` projection type, never
+/// a `wayfinder-auth` one.  Neither pulls in a key type, so the trait compiles
+/// on `no_std`.  Errors are human-readable strings surfaced to the client as an
 /// `ErrorResponse`.
 pub trait MeshAuthority {
     /// The mesh trust anchor as raw `TrustAnchor` bytes (mesh id + root public
@@ -120,10 +128,16 @@ pub trait MeshAuthority {
     /// cannot be made durable.
     fn remove_user(&mut self, username: &str) -> Result<(), String>;
 
-    /// Sign a revocation for `node_mac`, returning raw `RevocationRecord` bytes
-    /// for the caller to record and flood.  Returns an error string on malformed
+    /// Sign a revocation for `node_mac`, returning the [`RevocationRecord`] for
+    /// the caller to record and flood.  Returns an error string on malformed
     /// input.
-    fn revoke(&mut self, node_mac: &[u8]) -> Result<Vec<u8>, String>;
+    ///
+    /// The one output of this trait that is not raw bytes.  A revocation leaves
+    /// here and travels to the router loop to be flooded, and a byte vector on
+    /// that hop would make "the authority signed something the router cannot
+    /// parse" a state the receiver has to handle — for a record this very
+    /// process just constructed.  The typed record makes it unrepresentable.
+    fn revoke(&mut self, node_mac: &[u8]) -> Result<RevocationRecord, String>;
 
     /// The certificates this authority has issued (for operator observability),
     /// in issuance order.

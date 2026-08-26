@@ -25,6 +25,40 @@ extern crate alloc;
 mod adapter;
 pub use adapter::RouterAdapter;
 
+/// The certificate authority's own executor: the task that owns a
+/// [`CertAuthority`] so no management request runs on the router's event loop.
+#[cfg(feature = "std")]
+mod authority_task;
+#[cfg(feature = "std")]
+pub use authority_task::AuthorityAdapter;
+#[cfg(feature = "std")]
+pub use authority_task::AuthorityCommand;
+#[cfg(feature = "std")]
+pub use authority_task::AuthorityComms;
+#[cfg(feature = "std")]
+pub use authority_task::AuthorityPorts;
+#[cfg(feature = "std")]
+pub use authority_task::AuthorityRx;
+#[cfg(feature = "std")]
+pub use authority_task::AuthorityTx;
+#[cfg(feature = "std")]
+pub use authority_task::EnrollmentPolicyRx;
+#[cfg(feature = "std")]
+pub use authority_task::EnrollmentPolicyTx;
+#[cfg(feature = "std")]
+pub use authority_task::NOT_A_PROVIDER;
+#[cfg(feature = "std")]
+pub use authority_task::RevocationRx;
+#[cfg(feature = "std")]
+pub use authority_task::RevocationTx;
+#[cfg(feature = "std")]
+pub use authority_task::RouterFacts;
+#[cfg(feature = "std")]
+pub use authority_task::RouterFactsRx;
+#[cfg(feature = "std")]
+pub use authority_task::serve_authority;
+pub use wayfinder_protos::service::not_a_provider_response;
+
 /// VPN coordination against a Headscale server: the credential an enrolled
 /// device is handed to join the tunnel, and the peer list/revocation an
 /// operator manages it through.  `std` only — a tunnel daemon needs a real OS

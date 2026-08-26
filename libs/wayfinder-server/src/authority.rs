@@ -17,6 +17,7 @@ use wayfinder::config::ProviderConfig;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder_auth::Authority;
 use wayfinder_auth::MembershipCert;
+use wayfinder_auth::RevocationRecord;
 use wayfinder_protos::service::CsrOutcome;
 use wayfinder_protos::service::EnrollData;
 use wayfinder_protos::service::EnrollmentAdmission;
@@ -973,7 +974,7 @@ impl MeshAuthority for CertAuthority {
         CertAuthority::remove_user(self, username)
     }
 
-    fn revoke(&mut self, node_mac: &[u8]) -> Result<Vec<u8>, String> {
+    fn revoke(&mut self, node_mac: &[u8]) -> Result<RevocationRecord, String> {
         if self.now_unix == 0 {
             return Err("authority clock not set; cannot sign revocations yet".to_string());
         }
@@ -991,7 +992,7 @@ impl MeshAuthority for CertAuthority {
         });
         persisted?;
 
-        Ok(record.as_bytes().to_vec())
+        Ok(record)
     }
 
     fn list_certs(&self) -> Vec<IssuedCertData> {
@@ -1016,9 +1017,7 @@ mod tests {
     use super::*;
     use wayfinder_auth::Keypair;
     use wayfinder_auth::MembershipCert;
-    use wayfinder_auth::RevocationRecord;
     use wayfinder_auth::TrustAnchor;
-    use zerocopy::FromBytes;
 
     fn node_keys(seed: u8) -> ([u8; 32], [u8; 32]) {
         let kp = Keypair::from_seed(&[seed; 32]);
@@ -1423,11 +1422,10 @@ mod tests {
     #[test]
     fn revoke_produces_a_verifiable_record() {
         let mut ca = open_ca();
-        let record_bytes = ca.revoke(&[0, 0, 0, 0, 0, 9]).unwrap();
-        let (record, _) = RevocationRecord::ref_from_prefix(&record_bytes).unwrap();
+        let record = ca.revoke(&[0, 0, 0, 0, 0, 9]).unwrap();
         let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
         assert_eq!(
-            anchor.verify_revocation(record, 0).unwrap().0,
+            anchor.verify_revocation(&record, 0).unwrap().0,
             [0, 0, 0, 0, 0, 9]
         );
     }

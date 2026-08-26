@@ -85,7 +85,9 @@ use embassy_futures::select::Either3;
 #[cfg(feature = "mgmt")]
 use embassy_futures::select::select3;
 #[cfg(feature = "mgmt")]
-use wayfinder_protos::service::WayfinderService;
+use wayfinder_protos::service::audit_request;
+#[cfg(feature = "mgmt")]
+use wayfinder_protos::service::handle_router;
 #[cfg(feature = "mgmt")]
 use wayfinder_server::EmbeddedQueryRx;
 #[cfg(feature = "mgmt")]
@@ -488,8 +490,19 @@ impl<
                 // every certificate as "not yet valid" if ever reached this
                 // way — consistent with `SetAuth` over this management port
                 // not being wired up yet.
-                let response = WayfinderService::new(RouterAdapter::new(&mut *router, None, now))
-                    .handle(request);
+                // `handle_router`, not the combined service: an embedded node
+                // has no certificate authority, so the router half is all it
+                // can answer. The audit record is emitted explicitly because
+                // `WayfinderService::handle` used to emit it and no longer runs
+                // on this path.
+                audit_request(&request);
+                let response = handle_router(&mut RouterAdapter::new(&mut *router, now), request)
+                    // `handle_unowned`, not the not-a-provider message: an
+                    // embedded node genuinely is not a provider, but a repeated
+                    // `Authenticate` is a client protocol error and saying
+                    // "not a certificate-authority provider" points its author
+                    // at the wrong thing entirely.
+                    .unwrap_or_else(wayfinder_protos::service::handle_unowned);
                 mgmt.reply(response).await;
             }
         }

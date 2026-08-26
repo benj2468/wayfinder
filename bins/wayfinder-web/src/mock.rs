@@ -44,7 +44,6 @@ use wayfinder_protos::service::RuntimeConfigData;
 use wayfinder_protos::service::SecurityStatusData;
 use wayfinder_protos::service::TableOccupancyData;
 use wayfinder_protos::service::TokenUpdate;
-use wayfinder_protos::service::WayfinderService;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderResponse;
 use wayfinder_server::MeshAuthority;
@@ -381,6 +380,50 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
+impl Mock {
+    /// Apply an enrollment-policy update the way the certificate authority
+    /// would, for the mock's `AuthorityCommand::SetEnrollmentPolicy` arm.
+    ///
+    /// Separate from `set_config` because the two halves are owned by different
+    /// tasks on a real node: the connection task strips `config.enrollment` off
+    /// the router half and sends it here instead. A mock whose authority arm
+    /// acknowledged the command without applying it would report the *old*
+    /// policy on the next poll — a broken control that looks like a working
+    /// one, which is the one thing this mock exists to rule out.
+    pub fn apply_enrollment_policy(
+        &mut self,
+        update: &wayfinder_protos::service::EnrollmentPolicyData,
+    ) -> Result<(), String> {
+        let policy = self
+            .security
+            .enrollment
+            .as_mut()
+            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?;
+        if let Some(auto_approve) = update.auto_approve {
+            policy.auto_approve = auto_approve;
+        }
+        if let Some(ttl) = update.cert_ttl_secs {
+            policy.cert_ttl_secs = ttl;
+        }
+        // The flag and the value move together, as they do on a real node where
+        // both come from one `Option<SharedSecret>` — but they travel
+        // separately: the polled status says only that a token is set, and the
+        // value is handed out by `reveal_enrollment_token`.
+        match &update.enrollment_token {
+            Some(TokenUpdate::Clear) => {
+                policy.enrollment_token_set = false;
+                self.enrollment_token = None;
+            }
+            Some(TokenUpdate::Set(token)) => {
+                policy.enrollment_token_set = true;
+                self.enrollment_token = Some(token.expose().to_string());
+            }
+            None => {}
+        }
+        Ok(())
+    }
+}
+
 impl RouterDataProvider for Mock {
     fn node_id(&self) -> Vec<u8> {
         vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]
@@ -515,37 +558,14 @@ impl RouterDataProvider for Mock {
         if let Some(lazy) = config.lazy_cert_distribution {
             self.security.lazy_cert_distribution = lazy;
         }
-        if let Some(update) = &config.enrollment {
-            let policy = self
-                .security
-                .enrollment
-                .as_mut()
-                .ok_or_else(|| "node is not a certificate-authority provider".to_string())?;
-            if let Some(auto_approve) = update.auto_approve {
-                policy.auto_approve = auto_approve;
-            }
-            if let Some(ttl) = update.cert_ttl_secs {
-                policy.cert_ttl_secs = ttl;
-            }
-            // Both halves move together, as they do on a real node where they
-            // are two projections of one `Option<String>` — a mock that set the
-            // flag without storing the value would let the dashboard read a
-            // token back that a real node would never have reported.
-            // The flag and the value move together, as they do on a real node
-            // where both come from one `Option<SharedSecret>` — but they travel
-            // separately: the polled status says only that a token is set, and
-            // the value is handed out by `reveal_enrollment_token`.
-            match &update.enrollment_token {
-                Some(TokenUpdate::Clear) => {
-                    policy.enrollment_token_set = false;
-                    self.enrollment_token = None;
-                }
-                Some(TokenUpdate::Set(token)) => {
-                    policy.enrollment_token_set = true;
-                    self.enrollment_token = Some(token.expose().to_string());
-                }
-                None => {}
-            }
+        if config.enrollment.is_some() {
+            // Mirrors `RouterAdapter::set_config`. The authority's state lives
+            // on the authority, and the connection task strips this field and
+            // forwards it as an `AuthorityCommand::SetEnrollmentPolicy` — so
+            // one arriving here means the caller had no authority to apply it.
+            // Refused rather than ignored, exactly as a real node refuses, or
+            // the mock would answer `Empty` to a policy nothing applied.
+            return Err("node is not a certificate-authority provider".to_string());
         }
         Ok(())
     }
@@ -745,10 +765,32 @@ pub async fn serve_mock_node_with(mock: Mock) -> (SocketAddr, [u8; 32]) {
 
     let (query_tx, mut query_rx) =
         mpsc::channel::<(WayfinderRequest, oneshot::Sender<WayfinderResponse>)>(16);
+    // One owner, two channels — the shape a real provider node has since the
+    // certificate authority moved off the router's event loop: the connection
+    // task classifies each request and sends it to the half that can answer it.
+    let (authority_tx, mut authority_rx) = mpsc::channel::<wayfinder_server::AuthorityCommand>(16);
     tokio::spawn(async move {
-        let mut service = WayfinderService::new(mock);
-        while let Some((req, resp_tx)) = query_rx.recv().await {
-            let _ = resp_tx.send(service.handle(req));
+        let mut provider = mock;
+        loop {
+            tokio::select! {
+                Some((req, resp_tx)) = query_rx.recv() => {
+                    let response = wayfinder_protos::service::handle_router(&mut provider, req)
+                        .unwrap_or_else(|_| wayfinder_server::not_a_provider_response());
+                    let _ = resp_tx.send(response);
+                }
+                Some(command) = authority_rx.recv() => match command {
+                    wayfinder_server::AuthorityCommand::Request(req, reply) => {
+                        let response =
+                            wayfinder_protos::service::handle_authority(&mut provider, req)
+                                .unwrap_or_else(|_| wayfinder_server::not_a_provider_response());
+                        let _ = reply.send(response);
+                    }
+                    wayfinder_server::AuthorityCommand::SetEnrollmentPolicy(update, reply) => {
+                        let _ = reply.send(provider.apply_enrollment_policy(&update));
+                    }
+                },
+                else => break,
+            }
         }
     });
 
@@ -772,8 +814,15 @@ pub async fn serve_mock_node_with(mock: Mock) -> (SocketAddr, [u8; 32]) {
         .unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ =
-            wayfinder_server::serve_tls_server(listener, NODE_SEED, snapshot_tx, query_tx).await;
+        let _ = wayfinder_server::serve_tls_server_with_vpn(
+            listener,
+            NODE_SEED,
+            snapshot_tx,
+            query_tx,
+            None,
+            Some(authority_tx),
+        )
+        .await;
     });
 
     (addr, node_key)

@@ -1,12 +1,12 @@
-//! The [`RouterDataProvider`] / [`AuthorityDataProvider`] adapter over the
-//! router.
+//! The [`RouterDataProvider`] adapter over the router.
 //!
 //! Newtype so we can implement the external trait for the external
 //! [`CentralRouter`]. This layer is `no_std` + `alloc` and carries no
 //! transport dependencies. Most methods are pure projections of router state
-//! into the management-API intermediate representation, but some — `set_auth`,
-//! `set_config`, `revoke_node`, `approve_csr`, `deny_csr` — mutate the borrowed
-//! router (or the provider-mode CA) in response to a request.
+//! into the management-API intermediate representation, but some — `set_auth`
+//! and `set_config` — mutate the borrowed router in response to a request. The
+//! certificate-authority half lives in `authority_task.rs` and is not reachable
+//! from here.
 
 use core::time::Duration;
 
@@ -18,19 +18,15 @@ use wayfinder::auth::OgmAuth;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder::wayfinder_auth::Keypair;
 use wayfinder::wayfinder_auth::MembershipCert;
-use wayfinder::wayfinder_auth::RevocationRecord;
 use wayfinder::wayfinder_auth::TrustAnchor;
 use wayfinder_protos::service::AlarmData;
 use wayfinder_protos::service::AlarmKindData;
 use wayfinder_protos::service::AlarmSeverityData;
 use wayfinder_protos::service::AlarmSubjectData;
 use wayfinder_protos::service::AlarmsData;
-use wayfinder_protos::service::AuthorityDataProvider;
-use wayfinder_protos::service::CsrOutcome;
 use wayfinder_protos::service::EgressDecisionData;
-use wayfinder_protos::service::EnrollmentAdmission;
+use wayfinder_protos::service::EnrollmentPolicyStatusData;
 use wayfinder_protos::service::InterfaceThroughputData;
-use wayfinder_protos::service::IssuedCertData;
 use wayfinder_protos::service::KeepAliveEntryData;
 use wayfinder_protos::service::LinkFeaturesEntryData;
 use wayfinder_protos::service::LinkQualityEntryData;
@@ -41,18 +37,15 @@ use wayfinder_protos::service::NeighborPathData;
 use wayfinder_protos::service::NodeMetricsData;
 use wayfinder_protos::service::NodeSecurityData;
 use wayfinder_protos::service::OgmScheduleEntryData;
-use wayfinder_protos::service::PendingCsrData;
 use wayfinder_protos::service::RouteResolutionData;
 use wayfinder_protos::service::RouterDataProvider;
 use wayfinder_protos::service::RoutingEntryData;
 use wayfinder_protos::service::RuntimeConfigData;
 use wayfinder_protos::service::SecurityStatusData;
 use wayfinder_protos::service::TableOccupancyData;
-use wayfinder_protos::service::UserAuthOutcome;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
-use crate::provider::MeshAuthority;
 use crate::settings::NodeIdentity;
 use crate::settings::NodeSettings;
 use crate::settings::SettingsStore;
@@ -98,10 +91,14 @@ pub struct RouterAdapter<
     >,
     epoch_unix: Duration,
     now: Duration,
-    /// The mesh certificate authority, present only when this node runs in
-    /// provider mode.  Drives the enrollment requests (`get_trust_anchor`,
-    /// `submit_csr`, `revoke_node`); absent ⇒ those return an error.
-    ca: Option<&'a mut dyn MeshAuthority>,
+    /// The enrollment policy in force, as the authority last published it, or
+    /// `None` on a node that runs no authority at all.
+    ///
+    /// A snapshot handed in by the caller, not a live borrow of the authority:
+    /// the two are owned by different executors now, and this crate is
+    /// `no_std` + `alloc`, so it cannot hold the `watch::Receiver` the host
+    /// driver reads this from.
+    enrollment: Option<EnrollmentPolicyStatusData>,
     /// Where an accepted security setting is recorded so it outlives a
     /// restart.  Absent on a node with no runtime state configured (and on
     /// every embedded node), where a change applies in memory only.
@@ -164,8 +161,9 @@ impl<
 {
     /// Wrap a borrowed router so its state can be served through the management
     /// API, evaluating time-varying metrics (throughput) as of `now` — the same
-    /// monotonic instant the driver stamps on received frames.  `ca` is the
-    /// optional provider-mode certificate authority.
+    /// monotonic instant the driver stamps on received frames.  The enrollment policy this adapter
+    /// reports is supplied separately — see
+    /// [`with_enrollment_policy`](Self::with_enrollment_policy).
     pub fn new(
         router: &'a mut CentralRouter<
             ORIGINATORS,
@@ -180,13 +178,12 @@ impl<
             IN_FLIGHT_CERT_REQUESTS,
             PENDING_REPLIES,
         >,
-        ca: Option<&'a mut dyn MeshAuthority>,
         now: Duration,
     ) -> Self {
         Self {
             router,
             now,
-            ca,
+            enrollment: None,
             epoch_unix: Duration::default(),
             settings: None,
             identity_seed: None,
@@ -233,6 +230,19 @@ impl<
     /// never called) and when one was offered but is still empty.
     fn current_identity_seed(&self) -> Option<[u8; 32]> {
         self.identity_seed.as_deref().copied().flatten()
+    }
+
+    /// Report `enrollment` as the enrollment policy in force.
+    ///
+    /// The host driver reads this from the authority task's published value,
+    /// never by asking the authority — which may be mid-Argon2id when the
+    /// router loop wants it.
+    pub fn with_enrollment_policy(
+        mut self,
+        enrollment: Option<EnrollmentPolicyStatusData>,
+    ) -> Self {
+        self.enrollment = enrollment;
+        self
     }
 
     /// Record accepted security settings in `settings` so they survive a
@@ -483,7 +493,7 @@ impl<
         let posture = SecurityStatusData {
             require_auth: self.router.require_auth(),
             lazy_cert_distribution: self.router.lazy_cert_distribution(),
-            enrollment: self.ca.as_ref().map(|ca| ca.enrollment_policy()),
+            enrollment: self.enrollment.clone(),
             own_ed_pubkey: identity
                 .as_ref()
                 .map(|kp| kp.ed_pubkey().to_vec())
@@ -737,15 +747,15 @@ impl<
         if let Some(lazy) = config.lazy_cert_distribution {
             self.router.apply_runtime_lazy_cert_distribution(lazy);
         }
-        if let Some(enrollment) = &config.enrollment {
-            // The authority owns its own durability (its policy rides the CA
-            // state snapshot, next to the issued certs the policy governs), so
-            // this is not routed through `persist_settings`.
-            let ca = self
-                .ca
-                .as_mut()
-                .ok_or_else(|| "node is not a certificate-authority provider".to_string())?;
-            ca.set_enrollment_policy(enrollment)?;
+        if config.enrollment.is_some() {
+            // The authority's state, and the authority no longer shares this
+            // executor. On the host the connection task strips this field and
+            // sends it on as an `AuthorityCommand::SetEnrollmentPolicy`, so
+            // seeing one here means the caller has no authority to apply it —
+            // an embedded node, or a host node without a provider. Refused
+            // rather than ignored: answering `Empty` would tell the client a
+            // policy it never applied is now in force.
+            return Err("node is not a certificate-authority provider".to_string());
         }
         if let Some(lf) = config.link_features {
             let idx = lf.iface_idx as usize;
@@ -868,170 +878,17 @@ impl<
     }
 }
 
-impl<
-    const ORIGINATORS: usize,
-    const INTERFACES: usize,
-    const MCAST_MEMBERS: usize,
-    const LOCAL_MCAST: usize,
-    const IDENT_TABLE: usize,
-    const IDENT_LIVE: usize,
-    const LINK_QUALITY: usize,
-    const NEIGHBOR_KEYS: usize,
-    const REVOKED: usize,
-    const IN_FLIGHT_CERT_REQUESTS: usize,
-    const PENDING_REPLIES: usize,
-> AuthorityDataProvider
-    for RouterAdapter<
-        '_,
-        ORIGINATORS,
-        INTERFACES,
-        MCAST_MEMBERS,
-        LOCAL_MCAST,
-        IDENT_TABLE,
-        IDENT_LIVE,
-        LINK_QUALITY,
-        NEIGHBOR_KEYS,
-        REVOKED,
-        IN_FLIGHT_CERT_REQUESTS,
-        PENDING_REPLIES,
-    >
-{
-    fn get_trust_anchor(&self) -> Result<Vec<u8>, String> {
-        match &self.ca {
-            Some(ca) => Ok(ca.trust_anchor_bytes()),
-            None => Err("node is not a certificate-authority provider".to_string()),
-        }
-    }
-
-    fn reveal_enrollment_token(&self) -> Result<EnrollmentAdmission, String> {
-        match &self.ca {
-            Some(ca) => Ok(ca.admission()),
-            // Deliberately an error rather than `Open`: a node that issues no
-            // certificates has no admission rule, and answering "open" would
-            // read as "anyone may join this mesh".
-            None => Err("node is not a certificate-authority provider".to_string()),
-        }
-    }
-
-    fn submit_csr(
-        &mut self,
-        node_mac: &[u8],
-        ed_pubkey: &[u8],
-        x_pubkey: &[u8],
-        enrollment_token: &str,
-    ) -> Result<CsrOutcome, String> {
-        self.ca
-            .as_mut()
-            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
-            .submit_csr(node_mac, ed_pubkey, x_pubkey, enrollment_token)
-    }
-
-    fn authenticate_user(
-        &mut self,
-        username: &str,
-        password: &str,
-        totp_code: &str,
-        ed_pubkey: &[u8],
-        x_pubkey: &[u8],
-    ) -> Result<UserAuthOutcome, String> {
-        self.ca
-            .as_mut()
-            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
-            .authenticate_user(username, password, totp_code, ed_pubkey, x_pubkey)
-    }
-
-    fn list_users(&self) -> Result<Vec<wayfinder_protos::service::UserAccountData>, String> {
-        match &self.ca {
-            Some(ca) => Ok(ca.list_users()),
-            None => Err("node is not a certificate-authority provider".to_string()),
-        }
-    }
-
-    fn create_user(
-        &mut self,
-        username: &str,
-        password: &str,
-        admin: bool,
-        session_ttl_secs: u64,
-        no_totp: bool,
-    ) -> Result<String, String> {
-        self.ca
-            .as_mut()
-            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
-            .create_user(username, password, admin, session_ttl_secs, no_totp)
-    }
-
-    fn remove_user(&mut self, username: &str) -> Result<(), String> {
-        self.ca
-            .as_mut()
-            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
-            .remove_user(username)
-    }
-
-    fn list_pending_csrs(&self) -> Result<Vec<PendingCsrData>, String> {
-        match &self.ca {
-            Some(ca) => Ok(ca.list_pending()),
-            None => Err("node is not a certificate-authority provider".to_string()),
-        }
-    }
-
-    fn approve_csr(&mut self, node_mac: &[u8]) -> Result<(), String> {
-        self.ca
-            .as_mut()
-            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
-            .approve_csr(node_mac)
-    }
-
-    fn deny_csr(&mut self, node_mac: &[u8]) -> Result<(), String> {
-        self.ca
-            .as_mut()
-            .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
-            .deny_csr(node_mac)
-    }
-
-    fn revoke_node(&mut self, node_mac: &[u8]) -> Result<(), String> {
-        // Flooding a revocation requires the provider node to itself be an
-        // authenticated member (the revoke record rides this node's OGMs).
-        // Reject up front rather than sign a record that would silently never
-        // propagate, leaving the operator believing the node was revoked.
-        if self.router.auth().is_none() {
-            return Err(
-                "cannot revoke: this provider node has mesh authentication disabled, \
-                 so the revocation cannot be flooded"
-                    .to_string(),
-            );
-        }
-        // Sign the revocation with the CA, then fold it into our own router so it
-        // floods across the mesh (provider node is also a member).
-        let record_bytes = {
-            let ca = self
-                .ca
-                .as_mut()
-                .ok_or_else(|| "node is not a certificate-authority provider".to_string())?;
-            ca.revoke(node_mac)?
-        };
-        let (record, _) = RevocationRecord::ref_from_prefix(&record_bytes)
-            .map_err(|_| "authority produced a malformed revocation record".to_string())?;
-        self.router.ingest_revocation(record, self.now);
-        Ok(())
-    }
-
-    fn list_certs(&self) -> Result<Vec<IssuedCertData>, String> {
-        match &self.ca {
-            Some(ca) => Ok(ca.list_certs()),
-            None => Err("node is not a certificate-authority provider".to_string()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::MeshAuthority as _;
     use wayfinder::CentralRouter;
     use wayfinder::batman::wire::BatmanOgmPacket;
     use wayfinder::batman::wire::BatmanPacketType;
     use wayfinder::interfaces::frame::LinkFrame;
     use wayfinder::interfaces::frame::Mac;
+    use wayfinder_protos::service::AuthorityDataProvider as _;
+    use wayfinder_protos::service::EnrollmentAdmission;
     use wayfinder_protos::service::LinkFeaturesData;
     use wayfinder_protos::service::TrickleConfigData;
     use zerocopy::FromBytes;
@@ -1115,7 +972,7 @@ mod tests {
         // Give interface 0 a link-quality sample to project.
         feed_direct_ogm(&mut router, mac(2), 1, 255);
 
-        let adapter = RouterAdapter::new(&mut router, None, Duration::ZERO);
+        let adapter = RouterAdapter::new(&mut router, Duration::ZERO);
 
         let lq = adapter.link_quality_table();
         assert_eq!(lq.len(), 1);
@@ -1150,10 +1007,10 @@ mod tests {
             Duration::from_secs(8),
             Duration::ZERO,
         );
-        assert!(!RouterAdapter::new(&mut router, None, Duration::ZERO).runtime_config_active());
+        assert!(!RouterAdapter::new(&mut router, Duration::ZERO).runtime_config_active());
 
         let result =
-            RouterAdapter::new(&mut router, None, Duration::ZERO).set_config(RuntimeConfigData {
+            RouterAdapter::new(&mut router, Duration::ZERO).set_config(RuntimeConfigData {
                 trickle: Some(TrickleConfigData {
                     iface_idx: 0,
                     min_interval_ms: 500,
@@ -1163,7 +1020,7 @@ mod tests {
             });
         assert!(result.is_ok());
 
-        let adapter = RouterAdapter::new(&mut router, None, Duration::ZERO);
+        let adapter = RouterAdapter::new(&mut router, Duration::ZERO);
         assert!(adapter.runtime_config_active());
         let entry = adapter
             .ogm_schedule()
@@ -1203,15 +1060,15 @@ mod tests {
         router.set_auth(OgmAuth::new(kp, cert, anchor));
         router.auth_mut().unwrap().set_time(100);
 
-        assert!(!RouterAdapter::new(&mut router, None, Duration::ZERO).runtime_config_active());
+        assert!(!RouterAdapter::new(&mut router, Duration::ZERO).runtime_config_active());
 
         let result =
-            RouterAdapter::new(&mut router, None, Duration::ZERO).set_config(RuntimeConfigData {
+            RouterAdapter::new(&mut router, Duration::ZERO).set_config(RuntimeConfigData {
                 lazy_cert_distribution: Some(true),
                 ..Default::default()
             });
         assert!(result.is_ok());
-        assert!(RouterAdapter::new(&mut router, None, Duration::ZERO).runtime_config_active());
+        assert!(RouterAdapter::new(&mut router, Duration::ZERO).runtime_config_active());
 
         let mut tx = [0u8; 1500];
         let ogm = router.poll(Duration::ZERO, &mut tx).unwrap().payload;
@@ -1242,7 +1099,7 @@ mod tests {
 
         // Flip only tx_ogm off — every other gate must stay as it was.
         let result =
-            RouterAdapter::new(&mut router, None, Duration::ZERO).set_config(RuntimeConfigData {
+            RouterAdapter::new(&mut router, Duration::ZERO).set_config(RuntimeConfigData {
                 link_features: Some(LinkFeaturesData {
                     iface_idx: 0,
                     tx_ogm: Some(false),
@@ -1258,7 +1115,7 @@ mod tests {
             f.rx_ogm && f.tx_data && f.rx_data,
             "unnamed flags left untouched"
         );
-        assert!(RouterAdapter::new(&mut router, None, Duration::ZERO).runtime_config_active());
+        assert!(RouterAdapter::new(&mut router, Duration::ZERO).runtime_config_active());
     }
 
     /// `set_config` with a `tx_keepalive` update arms the heartbeat schedule
@@ -1276,7 +1133,7 @@ mod tests {
         assert!(router.link_features(0).tx_keepalive.is_none());
 
         let result =
-            RouterAdapter::new(&mut router, None, Duration::ZERO).set_config(RuntimeConfigData {
+            RouterAdapter::new(&mut router, Duration::ZERO).set_config(RuntimeConfigData {
                 link_features: Some(LinkFeaturesData {
                     iface_idx: 0,
                     tx_keepalive: Some(Some(2_000)),
@@ -1309,7 +1166,7 @@ mod tests {
             Duration::from_secs(8),
             Duration::ZERO,
         );
-        RouterAdapter::new(&mut router, None, Duration::ZERO)
+        RouterAdapter::new(&mut router, Duration::ZERO)
             .set_config(RuntimeConfigData {
                 link_features: Some(LinkFeaturesData {
                     iface_idx: 0,
@@ -1321,7 +1178,7 @@ mod tests {
             .unwrap();
         assert!(router.link_features(0).tx_keepalive.is_some());
 
-        RouterAdapter::new(&mut router, None, Duration::ZERO)
+        RouterAdapter::new(&mut router, Duration::ZERO)
             .set_config(RuntimeConfigData {
                 link_features: Some(LinkFeaturesData {
                     iface_idx: 0,
@@ -1351,7 +1208,7 @@ mod tests {
             Duration::from_secs(8),
             Duration::ZERO,
         );
-        RouterAdapter::new(&mut router, None, Duration::ZERO)
+        RouterAdapter::new(&mut router, Duration::ZERO)
             .set_config(RuntimeConfigData {
                 link_features: Some(LinkFeaturesData {
                     iface_idx: 0,
@@ -1363,7 +1220,7 @@ mod tests {
             })
             .unwrap();
 
-        let table = RouterAdapter::new(&mut router, None, Duration::ZERO).link_features_table();
+        let table = RouterAdapter::new(&mut router, Duration::ZERO).link_features_table();
         assert_eq!(table.len(), 1);
         let e = &table[0];
         assert_eq!(e.iface_idx, 0);
@@ -1388,7 +1245,7 @@ mod tests {
             Duration::ZERO,
         );
 
-        let table = RouterAdapter::new(&mut router, None, Duration::ZERO).link_features_table();
+        let table = RouterAdapter::new(&mut router, Duration::ZERO).link_features_table();
         assert_eq!(table.len(), 1);
         let e = &table[0];
         assert_eq!(e.iface_idx, 0);
@@ -1402,7 +1259,7 @@ mod tests {
     fn set_config_link_features_out_of_range_iface_idx_errors() {
         let mut router = CentralRouter::new(mac(1));
         let result =
-            RouterAdapter::new(&mut router, None, Duration::ZERO).set_config(RuntimeConfigData {
+            RouterAdapter::new(&mut router, Duration::ZERO).set_config(RuntimeConfigData {
                 link_features: Some(LinkFeaturesData {
                     iface_idx: 0, // nothing registered yet
                     tx_data: Some(false),
@@ -1412,17 +1269,17 @@ mod tests {
             });
         let err = result.unwrap_err();
         assert!(err.contains("out of range"), "got: {err}");
-        assert!(!RouterAdapter::new(&mut router, None, Duration::ZERO).runtime_config_active());
+        assert!(!RouterAdapter::new(&mut router, Duration::ZERO).runtime_config_active());
     }
 
     /// `set_config` with no fields set is a no-op that still succeeds.
     #[test]
     fn set_config_with_no_fields_is_a_no_op() {
         let mut router = CentralRouter::new(mac(1));
-        let result = RouterAdapter::new(&mut router, None, Duration::ZERO)
+        let result = RouterAdapter::new(&mut router, Duration::ZERO)
             .set_config(RuntimeConfigData::default());
         assert!(result.is_ok());
-        assert!(!RouterAdapter::new(&mut router, None, Duration::ZERO).runtime_config_active());
+        assert!(!RouterAdapter::new(&mut router, Duration::ZERO).runtime_config_active());
     }
 
     /// An out-of-range interface index is rejected rather than silently
@@ -1431,7 +1288,7 @@ mod tests {
     fn set_config_out_of_range_iface_idx_errors() {
         let mut router = CentralRouter::new(mac(1));
         let result =
-            RouterAdapter::new(&mut router, None, Duration::ZERO).set_config(RuntimeConfigData {
+            RouterAdapter::new(&mut router, Duration::ZERO).set_config(RuntimeConfigData {
                 trickle: Some(TrickleConfigData {
                     iface_idx: wayfinder::MAX_INTERFACES as u32,
                     min_interval_ms: 500,
@@ -1441,7 +1298,7 @@ mod tests {
             });
         let err = result.unwrap_err();
         assert!(err.contains("out of range"), "got: {err}");
-        assert!(!RouterAdapter::new(&mut router, None, Duration::ZERO).runtime_config_active());
+        assert!(!RouterAdapter::new(&mut router, Duration::ZERO).runtime_config_active());
     }
 
     /// An index within `MAX_INTERFACES` capacity but not yet registered by
@@ -1458,7 +1315,7 @@ mod tests {
         );
 
         let result =
-            RouterAdapter::new(&mut router, None, Duration::ZERO).set_config(RuntimeConfigData {
+            RouterAdapter::new(&mut router, Duration::ZERO).set_config(RuntimeConfigData {
                 trickle: Some(TrickleConfigData {
                     iface_idx: 1,
                     min_interval_ms: 500,
@@ -1468,7 +1325,7 @@ mod tests {
             });
         let err = result.unwrap_err();
         assert!(err.contains("out of range"), "got: {err}");
-        assert!(!RouterAdapter::new(&mut router, None, Duration::ZERO).runtime_config_active());
+        assert!(!RouterAdapter::new(&mut router, Duration::ZERO).runtime_config_active());
     }
 
     /// An inverted range (`min_interval_ms > max_interval_ms`) is rejected
@@ -1486,7 +1343,7 @@ mod tests {
         );
 
         let result =
-            RouterAdapter::new(&mut router, None, Duration::ZERO).set_config(RuntimeConfigData {
+            RouterAdapter::new(&mut router, Duration::ZERO).set_config(RuntimeConfigData {
                 trickle: Some(TrickleConfigData {
                     iface_idx: 0,
                     min_interval_ms: 5000,
@@ -1496,7 +1353,7 @@ mod tests {
             });
         let err = result.unwrap_err();
         assert!(err.contains("min_interval_ms"), "got: {err}");
-        assert!(!RouterAdapter::new(&mut router, None, Duration::ZERO).runtime_config_active());
+        assert!(!RouterAdapter::new(&mut router, Duration::ZERO).runtime_config_active());
     }
 
     /// An empty originator table must fold to all-zero metrics — in particular a
@@ -1505,7 +1362,7 @@ mod tests {
     #[test]
     fn node_metrics_empty_table_folds_to_zero_not_nan() {
         let mut router = CentralRouter::new(mac(1));
-        let m = RouterAdapter::new(&mut router, None, Duration::from_secs(5)).node_metrics();
+        let m = RouterAdapter::new(&mut router, Duration::from_secs(5)).node_metrics();
 
         assert_eq!(m.neighbor_count, 0);
         assert_eq!((m.tq_min, m.tq_max), (0, 0));
@@ -1529,7 +1386,7 @@ mod tests {
         feed_direct_ogm(&mut router, mac(3), 1, 205);
         feed_direct_ogm(&mut router, mac(4), 1, 155);
 
-        let m = RouterAdapter::new(&mut router, None, Duration::from_secs(10)).node_metrics();
+        let m = RouterAdapter::new(&mut router, Duration::from_secs(10)).node_metrics();
 
         assert_eq!(m.neighbor_count, 3);
         assert_eq!(m.tq_min, 145);
@@ -1546,7 +1403,7 @@ mod tests {
     #[test]
     fn node_metrics_cert_fields_zero_without_auth() {
         let mut router = CentralRouter::new(mac(1));
-        let m = RouterAdapter::new(&mut router, None, Duration::from_secs(5)).node_metrics();
+        let m = RouterAdapter::new(&mut router, Duration::from_secs(5)).node_metrics();
 
         assert_eq!((m.cert_store.used, m.cert_store.capacity), (0, 0));
         assert_eq!(
@@ -1629,44 +1486,9 @@ mod tests {
         let mut tx = [0u8; 512];
         router.handle_frame(Duration::ZERO, 0, frame, &mut tx);
 
-        let m = RouterAdapter::new(&mut router, None, Duration::from_secs(5)).node_metrics();
+        let m = RouterAdapter::new(&mut router, Duration::from_secs(5)).node_metrics();
         assert_eq!(m.cert_store.used, 1);
         assert_eq!(m.cert_store.capacity, 64);
-    }
-
-    /// `revoke_node` on a provider whose router *is* authenticated signs the
-    /// record and folds it into the router so it floods — exercising the real
-    /// adapter path (CA → parse → `ingest_revocation`), not just the CA.
-    #[test]
-    fn revoke_node_floods_when_provider_router_is_authenticated() {
-        use crate::CertAuthority;
-        use wayfinder::auth::OgmAuth;
-        use wayfinder::wayfinder_auth::Keypair;
-        use wayfinder::wayfinder_auth::MembershipCert;
-        use wayfinder::wayfinder_auth::TrustAnchor;
-
-        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, true);
-        ca.set_now_unix(100);
-
-        // The provider node is itself an authenticated member: its own CA issues
-        // its cert.
-        let kp = Keypair::from_seed(&[2; 32]);
-        let me = mac(1);
-        let cert_bytes = ca_issue(&mut ca, &me.0, &kp.ed_pubkey(), &kp.x_pubkey());
-        let cert = MembershipCert::from_bytes(&cert_bytes).unwrap();
-        let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
-
-        let mut router = CentralRouter::new(me);
-        router.set_auth(OgmAuth::new(kp, cert, anchor));
-        router.auth_mut().unwrap().set_time(100);
-
-        {
-            let mut adapter =
-                RouterAdapter::new(&mut router, Some(&mut ca), Duration::from_secs(0));
-            adapter.revoke_node(&mac(9).0).expect("revoke succeeds");
-        }
-        // The provider's own router now holds (and will flood) the revocation.
-        assert!(router.auth().unwrap().revoked_macs().any(|m| m == mac(9)));
     }
 
     /// An alarm raised anywhere in the process is readable through the provider
@@ -1679,7 +1501,7 @@ mod tests {
     #[test]
     fn alarms_project_a_raise_from_the_ambient_board() {
         let mut router = CentralRouter::new(mac(1));
-        let adapter = RouterAdapter::new(&mut router, None, Duration::from_secs(0));
+        let adapter = RouterAdapter::new(&mut router, Duration::from_secs(0));
 
         let board = alloc::sync::Arc::new(wayfinder_alarm::SharedBoard::new());
         let projected = wayfinder_alarm::with_board(&board, || {
@@ -1715,7 +1537,7 @@ mod tests {
     #[test]
     fn alarms_report_a_quiet_condition_as_latched_but_inactive() {
         let mut router = CentralRouter::new(mac(1));
-        let adapter = RouterAdapter::new(&mut router, None, Duration::from_secs(0));
+        let adapter = RouterAdapter::new(&mut router, Duration::from_secs(0));
 
         let board = alloc::sync::Arc::new(wayfinder_alarm::SharedBoard::new());
         board.raise_at(
@@ -1750,7 +1572,7 @@ mod tests {
     #[test]
     fn logs_projects_records_from_the_global_ring() {
         let mut router = CentralRouter::new(mac(1));
-        let adapter = RouterAdapter::new(&mut router, None, Duration::from_secs(0));
+        let adapter = RouterAdapter::new(&mut router, Duration::from_secs(0));
 
         let start = adapter.logs(0, 0).next_seq;
         wayfinder_log::record(
@@ -1775,7 +1597,7 @@ mod tests {
     #[test]
     fn set_log_level_installs_a_valid_spec_and_rejects_an_invalid_one() {
         let mut router = CentralRouter::new(mac(1));
-        let mut adapter = RouterAdapter::new(&mut router, None, Duration::from_secs(0));
+        let mut adapter = RouterAdapter::new(&mut router, Duration::from_secs(0));
 
         assert_eq!(
             adapter.set_log_level("info,batman=trace"),
@@ -1797,7 +1619,7 @@ mod tests {
     #[test]
     fn security_status_reports_auth_disabled_by_default() {
         let mut router = CentralRouter::new(mac(1));
-        let s = RouterAdapter::new(&mut router, None, Duration::from_secs(0)).security_status();
+        let s = RouterAdapter::new(&mut router, Duration::from_secs(0)).security_status();
         assert!(!s.auth_enabled);
         assert_eq!(s.mesh_id, 0);
         assert!(s.node_mac.is_empty());
@@ -1880,7 +1702,7 @@ mod tests {
             "peer became a verified originator"
         );
 
-        let s = RouterAdapter::new(&mut router, None, Duration::from_secs(0)).security_status();
+        let s = RouterAdapter::new(&mut router, Duration::from_secs(0)).security_status();
         assert!(s.auth_enabled);
         assert_eq!(s.mesh_id, 0xABCD);
         assert_eq!(s.node_mac, me.0.to_vec());
@@ -1898,13 +1720,25 @@ mod tests {
             "a node we hold no revocation for has no enforcement window"
         );
 
-        // Revoke the peer through the provider path (signs + floods into our auth).
-        {
-            let mut adapter =
-                RouterAdapter::new(&mut router, Some(&mut ca), Duration::from_secs(0));
-            adapter.revoke_node(&peer.0).expect("revoke");
-        }
-        let s = RouterAdapter::new(&mut router, None, Duration::from_secs(0)).security_status();
+        // Revocation is two acts by two owners now: the authority signs and
+        // persists, the router ingests and floods. Driven here exactly as the
+        // authority task and the driver loop drive them.
+        let record = {
+            let mut authority = crate::AuthorityAdapter::new(
+                &mut ca,
+                tokio::sync::watch::channel(crate::RouterFacts {
+                    unix_secs: 1_700_000_000,
+                    auth_present: true,
+                })
+                .1,
+            );
+            authority.revoke_node(&peer.0).expect("revoke");
+            authority
+                .finish()
+                .expect("a successful revoke signs a record for the router to flood")
+        };
+        router.ingest_revocation(&record, Duration::from_secs(0));
+        let s = RouterAdapter::new(&mut router, Duration::from_secs(0)).security_status();
         assert_eq!(s.revocation_count, 1);
         let row = s
             .nodes
@@ -1922,20 +1756,6 @@ mod tests {
             row.revocation_not_after, 1100,
             "the row carries when the revocation stops being enforced"
         );
-    }
-
-    /// `revoke_node` on a provider whose router has auth *disabled* errors rather
-    /// than signing a record that would silently never flood.
-    #[test]
-    fn revoke_node_errors_when_provider_router_has_no_auth() {
-        use crate::CertAuthority;
-
-        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, true);
-        ca.set_now_unix(100);
-        let mut router = CentralRouter::new(mac(1)); // auth disabled
-        let mut adapter = RouterAdapter::new(&mut router, Some(&mut ca), Duration::from_secs(0));
-        let err = adapter.revoke_node(&mac(9).0).unwrap_err();
-        assert!(err.contains("authentication disabled"), "got: {err}");
     }
 
     // ── Persisting security settings ───────────────────────────────────────────
@@ -1975,7 +1795,7 @@ mod tests {
         let mut router = CentralRouter::new(mac(1));
         let mut store = RecordingStore::default();
 
-        RouterAdapter::new(&mut router, None, Duration::ZERO)
+        RouterAdapter::new(&mut router, Duration::ZERO)
             .with_settings(&mut store)
             .set_config(RuntimeConfigData {
                 require_auth: Some(true),
@@ -1998,7 +1818,7 @@ mod tests {
         let mut router = CentralRouter::new(mac(1));
         let mut store = RecordingStore::default();
 
-        RouterAdapter::new(&mut router, None, Duration::ZERO)
+        RouterAdapter::new(&mut router, Duration::ZERO)
             .with_settings(&mut store)
             .set_config(RuntimeConfigData {
                 require_auth: Some(true),
@@ -2023,7 +1843,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = RouterAdapter::new(&mut router, None, Duration::ZERO)
+        let result = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_settings(&mut store)
             .set_config(RuntimeConfigData {
                 require_auth: Some(true),
@@ -2044,7 +1864,7 @@ mod tests {
     fn set_config_without_a_store_still_applies_in_memory() {
         let mut router = CentralRouter::new(mac(1));
 
-        RouterAdapter::new(&mut router, None, Duration::ZERO)
+        RouterAdapter::new(&mut router, Duration::ZERO)
             .set_config(RuntimeConfigData {
                 require_auth: Some(true),
                 ..Default::default()
@@ -2068,7 +1888,7 @@ mod tests {
         );
         let mut store = RecordingStore::default();
 
-        RouterAdapter::new(&mut router, None, Duration::ZERO)
+        RouterAdapter::new(&mut router, Duration::ZERO)
             .with_settings(&mut store)
             .set_config(RuntimeConfigData {
                 trickle: Some(TrickleConfigData {
@@ -2101,7 +1921,7 @@ mod tests {
         let anchor = ca.trust_anchor_bytes();
         let mut store = RecordingStore::default();
 
-        RouterAdapter::new(&mut router, None, Duration::ZERO)
+        RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
             .set_auth(&[3; 32], &cert, &anchor)
@@ -2126,7 +1946,7 @@ mod tests {
         let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
         let mut identity_seed = Some([3u8; 32]);
 
-        let status = RouterAdapter::new(&mut router, None, Duration::ZERO)
+        let status = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_identity(&mut identity_seed)
             .security_status();
 
@@ -2141,7 +1961,7 @@ mod tests {
     fn security_status_reports_no_identity_when_the_node_has_none() {
         let mut router = CentralRouter::new(mac(1));
 
-        let status = RouterAdapter::new(&mut router, None, Duration::ZERO).security_status();
+        let status = RouterAdapter::new(&mut router, Duration::ZERO).security_status();
 
         assert!(status.own_ed_pubkey.is_empty());
         assert!(status.own_x_pubkey.is_empty());
@@ -2164,7 +1984,7 @@ mod tests {
         let mut store = RecordingStore::default();
         let mut identity_seed = Some([3u8; 32]);
 
-        RouterAdapter::new(&mut router, None, Duration::ZERO)
+        RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_identity(&mut identity_seed)
             .with_settings(&mut store)
@@ -2220,7 +2040,7 @@ mod tests {
             let anchor = ca.trust_anchor_bytes();
             let mut identity_seed = Some(old_seed);
 
-            RouterAdapter::new(&mut router, None, Duration::ZERO)
+            RouterAdapter::new(&mut router, Duration::ZERO)
                 .with_epoch_unix(Duration::from_secs(1_000))
                 .with_identity(&mut identity_seed)
                 .set_auth(&new_seed, &cert, &anchor)
@@ -2246,7 +2066,7 @@ mod tests {
             let anchor = ca.trust_anchor_bytes();
             let mut identity_seed = Some(old_seed);
 
-            RouterAdapter::new(&mut router, None, Duration::ZERO)
+            RouterAdapter::new(&mut router, Duration::ZERO)
                 .with_epoch_unix(Duration::from_secs(1_000))
                 .with_identity(&mut identity_seed)
                 .set_auth(&[], &cert, &anchor)
@@ -2268,7 +2088,7 @@ mod tests {
         let cert = ca_issue(&mut ca, mac(1).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
         let anchor = ca.trust_anchor_bytes();
 
-        let err = RouterAdapter::new(&mut router, None, Duration::ZERO)
+        let err = RouterAdapter::new(&mut router, Duration::ZERO)
             .set_auth(&[], &cert, &anchor)
             .expect_err("no identity to certify");
 
@@ -2284,7 +2104,7 @@ mod tests {
         let mut router = CentralRouter::new(mac(1));
         let mut store = RecordingStore::default();
 
-        let result = RouterAdapter::new(&mut router, None, Duration::ZERO)
+        let result = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_settings(&mut store)
             .set_auth(&[3; 32], b"not a cert", b"not an anchor");
 
@@ -2310,7 +2130,7 @@ mod tests {
         let foreign_anchor = other_ca.trust_anchor_bytes();
         let mut store = RecordingStore::default();
 
-        let err = RouterAdapter::new(&mut router, None, Duration::ZERO)
+        let err = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
             .set_auth(&[3; 32], &cert, &foreign_anchor)
@@ -2339,7 +2159,7 @@ mod tests {
         let wrong_mesh_anchor = anchor.to_bytes().to_vec();
         let mut store = RecordingStore::default();
 
-        let err = RouterAdapter::new(&mut router, None, Duration::ZERO)
+        let err = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
             .set_auth(&[3; 32], &cert, &wrong_mesh_anchor)
@@ -2364,7 +2184,7 @@ mod tests {
         let anchor = ca.trust_anchor_bytes();
         let mut store = RecordingStore::default();
 
-        let err = RouterAdapter::new(&mut router, None, Duration::ZERO)
+        let err = RouterAdapter::new(&mut router, Duration::ZERO)
             // Well past not_after.
             .with_epoch_unix(Duration::from_secs(2_000))
             .with_settings(&mut store)
@@ -2390,7 +2210,7 @@ mod tests {
         let anchor = ca.trust_anchor_bytes();
         let mut store = RecordingStore::default();
 
-        let err = RouterAdapter::new(&mut router, None, Duration::ZERO)
+        let err = RouterAdapter::new(&mut router, Duration::ZERO)
             // Adapter clock defaults to unix time 0, well before not_before.
             .with_settings(&mut store)
             .set_auth(&[3; 32], &cert, &anchor)
@@ -2424,7 +2244,7 @@ mod tests {
         let anchor = ca.trust_anchor_bytes();
         let mut store = RecordingStore::default();
 
-        let err = RouterAdapter::new(&mut router, None, Duration::ZERO)
+        let err = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
             .set_auth(&[3; 32], &cert, &anchor)
@@ -2453,7 +2273,7 @@ mod tests {
         let mut store = RecordingStore::default();
         let mut identity_seed = Some([3u8; 32]);
 
-        let err = RouterAdapter::new(&mut router, None, Duration::ZERO)
+        let err = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_identity(&mut identity_seed)
             .with_settings(&mut store)
@@ -2481,7 +2301,7 @@ mod tests {
         let anchor = ca.trust_anchor_bytes();
         let mut store = RecordingStore::default();
 
-        RouterAdapter::new(&mut router, None, Duration::ZERO)
+        RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
             .set_auth(&[3; 32], &cert, &anchor)
@@ -2499,7 +2319,7 @@ mod tests {
         router.set_require_auth(true);
         router.set_lazy_cert_distribution(true);
 
-        let status = RouterAdapter::new(&mut router, None, Duration::ZERO).security_status();
+        let status = RouterAdapter::new(&mut router, Duration::ZERO).security_status();
 
         assert!(!status.auth_enabled);
         assert!(status.require_auth);
@@ -2512,40 +2332,53 @@ mod tests {
     fn enrollment_policy_is_absent_and_unsettable_without_a_provider() {
         let mut router = CentralRouter::new(mac(1));
 
-        let status = RouterAdapter::new(&mut router, None, Duration::ZERO).security_status();
+        let status = RouterAdapter::new(&mut router, Duration::ZERO).security_status();
         assert!(status.enrollment.is_none());
 
+        // An enrollment policy is the authority's state, and this adapter has
+        // no authority. On the host the connection task strips the field and
+        // sends it to the authority task, so one arriving here means nobody can
+        // apply it — an embedded node, or a host node with no provider.
+        // Refused, never silently accepted: answering `Empty` would tell the
+        // client a policy it never applied is now in force.
         let result =
-            RouterAdapter::new(&mut router, None, Duration::ZERO).set_config(RuntimeConfigData {
+            RouterAdapter::new(&mut router, Duration::ZERO).set_config(RuntimeConfigData {
                 enrollment: Some(wayfinder_protos::service::EnrollmentPolicyData {
                     auto_approve: Some(false),
                     ..Default::default()
                 }),
                 ..Default::default()
             });
-        assert!(result.is_err());
+        assert!(
+            result.is_err(),
+            "an unappliable enrollment policy is refused"
+        );
     }
 
-    /// With a provider attached, the policy is both reported and settable
-    /// through the same request that carries the node's own posture.
+    /// The policy an authority publishes is what `GetSecurityStatus` reports.
+    /// The write no longer travels with it: `SetConfig`'s enrollment half is
+    /// split off by the connection task, so this test drives the two sides
+    /// separately, exactly as production does.
     #[test]
     fn enrollment_policy_round_trips_through_the_provider() {
         let mut router = CentralRouter::new(mac(1));
         let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
 
-        RouterAdapter::new(&mut router, Some(&mut ca), Duration::ZERO)
-            .set_config(RuntimeConfigData {
-                enrollment: Some(wayfinder_protos::service::EnrollmentPolicyData {
-                    auto_approve: Some(false),
-                    cert_ttl_secs: Some(4242),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            })
-            .unwrap();
+        // The write is the authority's, and no longer reachable through a
+        // `SetConfig` served here: the connection task splits that request and
+        // sends this half on as an `AuthorityCommand::SetEnrollmentPolicy`.
+        ca.set_enrollment_policy(&wayfinder_protos::service::EnrollmentPolicyData {
+            auto_approve: Some(false),
+            cert_ttl_secs: Some(4242),
+            ..Default::default()
+        })
+        .unwrap();
 
-        let status =
-            RouterAdapter::new(&mut router, Some(&mut ca), Duration::ZERO).security_status();
+        // The read is the router's, from what the authority published — never
+        // by asking the authority, which may be mid-Argon2id.
+        let status = RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_enrollment_policy(Some(ca.enrollment_policy()))
+            .security_status();
         let policy = status.enrollment.expect("a provider reports its policy");
         assert!(!policy.auto_approve);
         assert_eq!(policy.cert_ttl_secs, 4242);
@@ -2560,14 +2393,11 @@ mod tests {
     /// ungated when it has no gate to be through.
     #[test]
     fn the_enrollment_token_is_revealed_only_by_a_provider() {
-        let mut router = CentralRouter::new(mac(1));
-
-        assert!(
-            RouterAdapter::new(&mut router, None, Duration::ZERO)
-                .reveal_enrollment_token()
-                .is_err()
-        );
-
+        // No `RouterAdapter` case here any more: it does not implement the
+        // authority half at all, so "a router with no authority cannot reveal a
+        // token" is a compile error rather than a runtime one. What is left to
+        // check is that a real authority reveals the token it was configured
+        // with.
         let mut ca = crate::CertAuthority::new(
             &[9; 32],
             0xABCD,
@@ -2576,8 +2406,15 @@ mod tests {
             true,
         );
         assert_eq!(
-            RouterAdapter::new(&mut router, Some(&mut ca), Duration::ZERO)
-                .reveal_enrollment_token(),
+            crate::AuthorityAdapter::new(
+                &mut ca,
+                tokio::sync::watch::channel(crate::RouterFacts {
+                    unix_secs: 1_700_000_000,
+                    auth_present: true,
+                })
+                .1
+            )
+            .reveal_enrollment_token(),
             Ok(EnrollmentAdmission::Token(
                 wayfinder_protos::service::SharedSecret::new("hunter2")
             ))
@@ -2588,12 +2425,18 @@ mod tests {
     /// policy's other terms, which is a different state from "empty token".
     #[test]
     fn a_provider_with_no_token_reveals_open_admission() {
-        let mut router = CentralRouter::new(mac(1));
         let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, false);
 
         assert_eq!(
-            RouterAdapter::new(&mut router, Some(&mut ca), Duration::ZERO)
-                .reveal_enrollment_token(),
+            crate::AuthorityAdapter::new(
+                &mut ca,
+                tokio::sync::watch::channel(crate::RouterFacts {
+                    unix_secs: 1_700_000_000,
+                    auth_present: true,
+                })
+                .1
+            )
+            .reveal_enrollment_token(),
             Ok(EnrollmentAdmission::Open)
         );
     }

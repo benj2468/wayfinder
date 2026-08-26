@@ -22,6 +22,11 @@ use tokio_util::codec::LengthDelimitedCodec;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder::wayfinder_auth::MembershipCert;
 use wayfinder::wayfinder_auth::TrustAnchor;
+use wayfinder_protos::service::EnrollmentPolicyData;
+use wayfinder_protos::service::RequestFacet;
+use wayfinder_protos::service::audit_request;
+use wayfinder_protos::service::enrollment_policy_data;
+use wayfinder_protos::service::request_facet;
 use wayfinder_protos::wayfinder::v1alpha::Empty;
 use wayfinder_protos::wayfinder::v1alpha::ErrorResponse;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
@@ -175,6 +180,35 @@ const SUBMIT_CSR_BURST: f64 = 5.0;
 /// steady state.
 const SUBMIT_CSR_REFILL_PER_SEC: f64 = 1.0 / 5.0;
 
+/// Burst capacity for the login limiter.
+///
+/// Sized for the node, not for a person. `bins/wayfinder-web` performs a login
+/// server-side — `session.rs`'s `login` opens the anonymous connection from the
+/// axum process, the browser never speaks this protocol — so everyone signing
+/// in through one dashboard arrives from one address and spends one bucket.
+/// What has to fit inside this number is therefore the whole dashboard's
+/// sign-in wave against what the authority can actually serve: one Argon2id at
+/// `ARGON2_MEMORY_KIB` at a time, so five already costs the better part of a
+/// second during which `AUTHORITY_QUEUE_DEPTH` fills behind it. Enlarging it to
+/// give a dashboard's population room re-opens, in proportion, the hole this
+/// limiter exists to close.
+const LOGIN_BURST: f64 = 5.0;
+
+/// Steady-state refill for the login limiter: one attempt per second.
+///
+/// Far above any human cadence and far below what a flood needs to be worth
+/// mounting. A separate bucket from the enrollment one rather than a shared
+/// "anonymous" budget: `SUBMIT_CSR_REFILL_PER_SEC` is a token every five
+/// seconds, tuned to the dashboard's approval poll, and a person retyping a
+/// password would hit it — while a node polling for approval must not have its
+/// budget spent by someone else's failed logins from the same address.
+///
+/// What this bucket is *not* is the defence against password guessing. That is
+/// `users.rs`'s `LOCKOUT_THRESHOLD`, counted against the account rather than
+/// the sender, and its own doc already names it the dominant half for exactly
+/// that reason. A collapsed source address costs it nothing.
+const LOGIN_REFILL_PER_SEC: f64 = 1.0;
+
 /// Distinct source addresses a [`SourceLimiter`] tracks at once. Past this,
 /// the least-recently-touched bucket is evicted to make room for a new
 /// source — safe to evict (unlike the held-CSR store this sits in front of):
@@ -246,6 +280,20 @@ impl TokenBucket {
 /// fresh connection (and so a fresh ephemeral port) on every poll — see
 /// `SUBMIT_CSR_REFILL_PER_SEC` — so keying by port as well would give every
 /// poll its own untouched bucket and defeat the limiter entirely.
+///
+/// **A shared frontend collapses the key, and that is understood here.**
+/// `bins/wayfinder-web` speaks the management protocol from its own process, so
+/// a dashboard presents one address for its whole population — logins, the
+/// enrollment panel's submissions, and every session's connection alike.
+/// Behind such a frontend each of these limiters is a node-wide cap rather than
+/// a per-peer one. That is still the bound the node needs, because what
+/// saturates the authority's queue is the arrival rate and not the sender's
+/// identity, and the constants above are sized as node-wide caps for that
+/// reason. What is genuinely given up is isolation: the people behind one
+/// dashboard share fate, so one of them spending the bucket throttles the rest.
+/// Restoring that has to happen in the frontend, the only party that sees a
+/// browser's real address — never by letting the node take a source address
+/// from a peer that has proved nothing.
 pub(crate) struct SourceLimiter {
     buckets: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, TokenBucket>>,
     /// Tokens a source starts with, and the most it can bank.
@@ -267,6 +315,11 @@ impl SourceLimiter {
     /// The limiter guarding the enrollment tier's `SubmitCsr`.
     fn for_enrollment() -> Self {
         Self::new(SUBMIT_CSR_BURST, SUBMIT_CSR_REFILL_PER_SEC)
+    }
+
+    /// The limiter guarding the enrollment tier's `AuthenticateUser`.
+    fn for_logins() -> Self {
+        Self::new(LOGIN_BURST, LOGIN_REFILL_PER_SEC)
     }
 
     /// The limiter guarding new connections to the listener.
@@ -334,6 +387,20 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 pub(crate) struct PreAuthLimits {
     /// Rate limit on the enrollment tier's `SubmitCsr`, per source.
     enrollment: SourceLimiter,
+    /// Rate limit on the enrollment tier's `AuthenticateUser`, per source.
+    ///
+    /// The costliest thing an uncredentialed peer can ask this node to do: a
+    /// full Argon2id at `ARGON2_MEMORY_KIB` plus a durable write, which
+    /// `spend_absent_user_work` deliberately charges for an unknown username
+    /// too. The authority serves one command at a time, so unthrottled this is
+    /// not merely wasted CPU — it holds the authority's queue full and every
+    /// operator request on that facet answers "busy" for the duration.
+    ///
+    /// Per source in name; per *dashboard* for anyone signing in through
+    /// `bins/wayfinder-web`, which is the common case rather than the exception
+    /// — see [`SourceLimiter`] for why the bound survives that and what does
+    /// not.
+    logins: SourceLimiter,
     /// Rate limit on new connections, per source.
     connects: SourceLimiter,
     /// Slots for connections that have not proved a credential.
@@ -345,6 +412,7 @@ impl PreAuthLimits {
     pub(crate) fn new() -> Self {
         Self {
             enrollment: SourceLimiter::for_enrollment(),
+            logins: SourceLimiter::for_logins(),
             connects: SourceLimiter::for_connections(),
             uncredentialed: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_UNCREDENTIALED_CONNECTIONS,
@@ -372,6 +440,11 @@ impl PreAuthLimits {
     fn allow_submit_csr(&self, addr: std::net::IpAddr, now: std::time::Instant) -> bool {
         self.enrollment.allow(addr, now)
     }
+
+    /// Whether an `AuthenticateUser` from `addr` may proceed right now.
+    fn allow_login(&self, addr: std::net::IpAddr, now: std::time::Instant) -> bool {
+        self.logins.allow(addr, now)
+    }
 }
 
 /// A connection's claim on an uncredentialed slot, held from accept until the
@@ -390,6 +463,224 @@ impl PreAuthGuard {
     /// with no certificate at all is exactly the population being bounded.
     fn credentialed(&mut self) {
         self.0 = None;
+    }
+}
+
+/// Send `request` to the owner that can answer it, and return its response.
+///
+/// This is the fork design 13 §3.2 is about, and it happens *here* — before
+/// anything is sent — rather than by trying one owner and falling back. A
+/// caller that discovers the owner from an error has already spent the wrong
+/// queue's time, and on a node whose authority is mid-Argon2id that queue is
+/// the one that stalls the mesh.
+///
+/// `SetConfig` is the one request that reaches both: it carries an enrollment
+/// policy alongside router settings. The router half goes first, preserving the
+/// order a single adapter applied them in, and the authority half is sent only
+/// when the request actually names one — so a `SetConfig` with no enrollment
+/// field never waits on the authority at all.
+async fn serve_by_facet(
+    request: &WayfinderRequest,
+    query_tx: &QueryTx,
+    authority_tx: Option<&crate::AuthorityTx>,
+) -> anyhow::Result<WayfinderResponse> {
+    // Audited here and nowhere else on this path. The host no longer goes
+    // through `WayfinderService::handle`, which is where the audit record used
+    // to be emitted, so without this every management mutation and every secret
+    // disclosure would stop being logged — and on the certificate authority, a
+    // node reachable only over this API, that log ring *is* the audit trail.
+    // Emitted before the fork so a request is recorded once, not once per half.
+    audit_request(request);
+
+    let Some(kind) = &request.request else {
+        return forward_to_router(request, query_tx).await;
+    };
+
+    if let ReqKind::SetConfig(set_config) = kind {
+        let enrollment = set_config
+            .config
+            .as_ref()
+            .and_then(|c| c.enrollment.clone());
+        // Validated *before* the router half runs, not on the way to the
+        // authority. These rejections are properties of the request, and the
+        // single-adapter path refused the whole `SetConfig` before applying
+        // anything — so validating late would apply and durably persist
+        // `require_auth` and then answer with the same bare error the operator
+        // used to get when nothing had happened. Rejecting up front keeps the
+        // request atomic, which is better than reporting a partial one.
+        let enrollment = match enrollment.map(enrollment_policy_data).transpose() {
+            Ok(enrollment) => enrollment,
+            Err(message) => return Ok(error_response(&message)),
+        };
+        // The router half is forwarded with the enrollment field *removed*, not
+        // merely ignored. A `RouterDataProvider` cannot apply it, and a request
+        // it silently answers `Empty` to is a request the client believes was
+        // applied — so the field is stripped here and the router half errors if
+        // it ever sees one, which is what keeps the embedded path (whose only
+        // caller is `WayfinderService::handle`, with no fork in front of it)
+        // honest about not being a provider.
+        let mut router_half = request.clone();
+        if let Some(ReqKind::SetConfig(sc)) = &mut router_half.request
+            && let Some(config) = sc.config.as_mut()
+        {
+            config.enrollment = None;
+        }
+        let response = forward_to_router(&router_half, query_tx).await?;
+        // Only if the router half succeeded, and only if there is an enrollment
+        // half to apply. Reporting the first error matches the ordering a single
+        // adapter had: it applied the router fields before reaching the
+        // authority, so a failure there never reached the authority either.
+        let (Some(enrollment), Some(RespKind::Empty(_))) = (enrollment, &response.response) else {
+            return Ok(response);
+        };
+        return Ok(set_enrollment_policy(enrollment, authority_tx).await);
+    }
+
+    match request_facet(kind) {
+        RequestFacet::Authority => match authority_tx {
+            Some(tx) => Ok(forward_to_authority(request, tx).await),
+            // Answered here rather than by the router loop, which no longer has
+            // an authority to produce this from.
+            None => Ok(crate::not_a_provider_response()),
+        },
+        RequestFacet::Router | RequestFacet::Transport => {
+            forward_to_router(request, query_tx).await
+        }
+    }
+}
+
+/// Forward `request` to the task that owns the router and await its answer.
+async fn forward_to_router(
+    request: &WayfinderRequest,
+    query_tx: &QueryTx,
+) -> anyhow::Result<WayfinderResponse> {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    query_tx.send((request.clone(), resp_tx)).await?;
+    Ok(resp_rx.await?)
+}
+
+/// Forward `request` to the certificate authority's task and await its answer.
+///
+/// A full authority queue is answered, not waited on: an unbounded wait here is
+/// how a queue full of logins becomes a queue full of stuck connections.
+async fn forward_to_authority(
+    request: &WayfinderRequest,
+    authority_tx: &crate::AuthorityTx,
+) -> WayfinderResponse {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if let Err(e) =
+        authority_tx.try_send(crate::AuthorityCommand::Request(request.clone(), resp_tx))
+    {
+        return authority_send_failure(e);
+    }
+    match resp_rx.await {
+        Ok(response) => response,
+        // The authority dropped the reply without answering: it died mid-request.
+        Err(_) => authority_died(),
+    }
+}
+
+/// Answer a failed hand-off to the authority, distinguishing a full queue from
+/// a dead one.
+///
+/// They are not the same condition and must not read the same: a full queue
+/// clears on its own and "retry shortly" is honest, while a closed channel means
+/// the authority task is gone for the life of the process and no amount of
+/// retrying will help.
+fn authority_send_failure(
+    e: tokio::sync::mpsc::error::TrySendError<crate::AuthorityCommand>,
+) -> WayfinderResponse {
+    error_response(authority_send_failure_reason(e))
+}
+
+/// The sentence [`authority_send_failure`] answers with, for a caller that has
+/// to wrap it in a larger one (a partially-applied `SetConfig`) rather than
+/// send it as the whole response.
+fn authority_send_failure_reason(
+    e: tokio::sync::mpsc::error::TrySendError<crate::AuthorityCommand>,
+) -> &'static str {
+    match e {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => BUSY,
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => authority_died_reason(),
+    }
+}
+
+/// Answer a request that reached a certificate authority which is no longer
+/// running.
+fn authority_died() -> WayfinderResponse {
+    error_response(authority_died_reason())
+}
+
+/// The sentence [`authority_died`] answers with, logged as it is produced.
+///
+/// `error!`, not `warn!`: a provider node whose authority has stopped cannot
+/// issue, enroll or revoke anything for the rest of the process's life, and it
+/// keeps routing perfectly meanwhile — so nothing else about the node looks
+/// wrong. An operator has to be told.
+fn authority_died_reason() -> &'static str {
+    tracing::error!(
+        "the certificate-authority task is no longer running; this node cannot issue, enroll or revoke"
+    );
+    "this node's certificate authority is not running; it cannot serve enrollment, \
+     logins or revocation until the node is restarted"
+}
+
+/// Apply the already-validated enrollment half of a `SetConfig` on the
+/// authority task.
+///
+/// Every failure here is a *partial* application: the router half has been
+/// applied and durably recorded by the time this runs, so none of these may be
+/// answered with a bare error. That includes the no-authority case — "node is
+/// not a certificate-authority provider" is a statement about the node's role,
+/// and an operator reads it as a wholesale refusal.
+async fn set_enrollment_policy(
+    enrollment: EnrollmentPolicyData,
+    authority_tx: Option<&crate::AuthorityTx>,
+) -> WayfinderResponse {
+    let Some(tx) = authority_tx else {
+        return partial_set_config(crate::NOT_A_PROVIDER);
+    };
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if let Err(e) = tx.try_send(crate::AuthorityCommand::SetEnrollmentPolicy(
+        enrollment, resp_tx,
+    )) {
+        return partial_set_config(authority_send_failure_reason(e));
+    }
+    match resp_rx.await {
+        Ok(Ok(())) => WayfinderResponse {
+            response: Some(RespKind::Empty(Empty {})),
+        },
+        Ok(Err(message)) => partial_set_config(&message),
+        Err(_) => partial_set_config(authority_died_reason()),
+    }
+}
+
+/// Restate a failed enrollment half so it cannot be read as "nothing happened".
+///
+/// By the time this is reached the router half of the `SetConfig` has already
+/// been applied *and durably recorded*. An operator told only that the authority
+/// refused would reasonably conclude the whole request was a no-op and retry it,
+/// re-applying settings that are already live.
+fn partial_set_config(detail: &str) -> WayfinderResponse {
+    error_response(&alloc::format!(
+        "the node settings in this request were applied and saved; the enrollment policy \
+         was not: {detail}"
+    ))
+}
+
+/// The answer when the authority cannot take more work right now.
+///
+/// A full queue clears on its own, so "retry shortly" is honest — unlike a
+/// closed one, which means the task is gone for the life of the process and no
+/// amount of retrying will help.
+const BUSY: &str = "the certificate authority is busy; retry shortly";
+
+/// A management error response carrying `message`.
+fn error_response(message: &str) -> WayfinderResponse {
+    WayfinderResponse {
+        response: Some(RespKind::Error(ErrorResponse {
+            message: message.to_string(),
+        })),
     }
 }
 
@@ -426,6 +717,14 @@ pub(crate) struct ServeContext {
     /// coordination server — which is the default, and every node that is not
     /// the certificate authority.
     pub(crate) vpn: Option<crate::vpn::SharedCoordinator>,
+    /// Forwards an authority-facing request to the certificate authority's own
+    /// task, or `None` on a node that runs no authority.
+    ///
+    /// A second channel and not a second use of `query_tx`, which is the point
+    /// of the split: authority work and router work must not queue behind each
+    /// other. See
+    /// `docs/design/implemented/13-certificate-authority-off-the-router-loop.md`.
+    pub(crate) authority_tx: Option<crate::AuthorityTx>,
 }
 
 /// The grant does not stand for the life of the connection: `gate` re-decides
@@ -452,6 +751,7 @@ where
         limits,
         query_tx,
         vpn,
+        authority_tx,
     } = ctx;
     // Read and write are framed separately so the length cap applies to one
     // direction only: [`crate::MAX_FRAME_LEN`] bounds what an unauthenticated
@@ -692,21 +992,40 @@ where
         // real credential (an admin cert or the node's own key), which is
         // not the resource an anonymous flood is spending. See
         // `PreAuthLimits`.
-        if matches!(decision, MgmtAccess::GrantedEnrollment)
-            && matches!(req, ReqKind::SubmitCsr(_))
-            && !limits.allow_submit_csr(peer_addr, std::time::Instant::now())
-        {
+        //
+        // One arm per costly uncredentialed kind, each with its own bucket:
+        // the two cadences are unrelated (a node polling for approval every
+        // five seconds, a person retyping a password), so a shared budget would
+        // let either starve the other from behind the same address — which a
+        // dashboard fronting both flows makes the ordinary case, not a NAT
+        // coincidence.
+        let refusal = if matches!(decision, MgmtAccess::GrantedEnrollment) {
+            let now = std::time::Instant::now();
+            match req {
+                ReqKind::SubmitCsr(_) if !limits.allow_submit_csr(peer_addr, now) => Some((
+                    "SubmitCsr",
+                    "too many enrollment requests from this source; wait before retrying",
+                )),
+                ReqKind::AuthenticateUser(_) if !limits.allow_login(peer_addr, now) => Some((
+                    "AuthenticateUser",
+                    "too many login attempts from this source; wait before retrying",
+                )),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some((kind, message)) = refusal {
             tracing::warn!(
                 key = ?peer_key,
                 %peer_addr,
-                "drop: enrollment-tier SubmitCsr rate limit exceeded"
+                kind,
+                "drop: enrollment-tier rate limit exceeded"
             );
             send_response(
                 &mut responses,
                 RespKind::Error(ErrorResponse {
-                    message: "too many enrollment requests from this source; wait before \
-                              retrying"
-                        .into(),
+                    message: message.into(),
                 }),
             )
             .await?;
@@ -725,9 +1044,7 @@ where
             send_response(&mut responses, vpn_response).await?;
             continue;
         }
-        let (resp_tx, resp_rx) = oneshot::channel();
-        query_tx.send((request.clone(), resp_tx)).await?;
-        let response = resp_rx.await?;
+        let response = serve_by_facet(&request, &query_tx, authority_tx.as_ref()).await?;
         // Mesh revocation and VPN revocation are one operator action, so the
         // second half runs here once the first has succeeded. Ordered this way
         // deliberately: mesh membership is what actually grants routing trust,
@@ -1046,7 +1363,7 @@ pub async fn serve_tls_server(
     snapshot_tx: AuthSnapshotTx,
     query_tx: QueryTx,
 ) -> anyhow::Result<()> {
-    serve_tls_server_with_vpn(listener, own_seed, snapshot_tx, query_tx, None).await
+    serve_tls_server_with_vpn(listener, own_seed, snapshot_tx, query_tx, None, None).await
 }
 
 /// [`serve_tls_server`], plus the VPN coordinator this listener answers the
@@ -1062,6 +1379,7 @@ pub async fn serve_tls_server_with_vpn(
     snapshot_tx: AuthSnapshotTx,
     query_tx: QueryTx,
     vpn: Option<crate::vpn::SharedCoordinator>,
+    authority_tx: Option<crate::AuthorityTx>,
 ) -> anyhow::Result<()> {
     let config = crate::server_config(&own_seed)
         .map_err(|e| anyhow::anyhow!("building management TLS server config: {e}"))?;
@@ -1091,6 +1409,7 @@ pub async fn serve_tls_server_with_vpn(
             limits: std::sync::Arc::clone(&limits),
             query_tx: query_tx.clone(),
             vpn: vpn.clone(),
+            authority_tx: authority_tx.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = serve_tls_connection(acceptor, tcp, peer, snapshot_tx, guard, ctx).await
@@ -1283,6 +1602,28 @@ mod tests {
         assert!(bind_tcp_server(addr).await.is_err());
     }
 
+    /// A stand-in certificate authority that answers every request with
+    /// `Empty`, for harnesses whose subject is the connection task rather than
+    /// the authority itself.
+    fn spawn_stub_authority() -> crate::AuthorityTx {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::AuthorityCommand>(8);
+        tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                match command {
+                    crate::AuthorityCommand::Request(_, reply) => {
+                        let _ = reply.send(WayfinderResponse {
+                            response: Some(RespKind::Empty(Empty {})),
+                        });
+                    }
+                    crate::AuthorityCommand::SetEnrollmentPolicy(_, reply) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                }
+            }
+        });
+        tx
+    }
+
     /// Answers every forwarded query with a canned `NodeInfo`, so a well-formed
     /// reply can be told apart from silence.
     fn spawn_echo(rx: QueryRx) {
@@ -1441,6 +1782,10 @@ mod tests {
                 limits,
                 query_tx,
                 vpn,
+                // These harnesses stand in for a provider node: the subject is
+                // the connection task's routing, so the authority answers
+                // trivially rather than being absent.
+                authority_tx: Some(spawn_stub_authority()),
             },
         ));
         (
@@ -1665,9 +2010,144 @@ mod tests {
             .unwrap();
         let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
         assert!(
-            !matches!(&resp.response, Some(Response::Error(_))),
+            !matches!(&resp.response, Some(Response::Error(e)) if e.message.contains("too many")),
             "GetTrustAnchor is not itself rate-limited"
         );
+
+        drop(client);
+        let _ = server.await;
+    }
+
+    /// A login is rate-limited per source on the enrollment tier, for the same
+    /// reason `SubmitCsr` is and more urgently.
+    ///
+    /// `AuthenticateUser` is reachable by any peer that completes the handshake
+    /// with a self-generated key — no credential — and `spend_absent_user_work`
+    /// makes an unknown username cost exactly what a known one does: a full
+    /// Argon2id at `ARGON2_MEMORY_KIB` plus a durable write. The authority task
+    /// serves one command at a time, so an unthrottled flood of logins does not
+    /// merely waste CPU: it keeps the authority's queue permanently full, and
+    /// every operator `ApproveCsr`, `ListCerts` or `RevokeNode` comes back
+    /// "busy; retry shortly" for as long as the flood lasts. Design 13 §3.7.
+    ///
+    /// Its own bucket, not the enrollment one: `SUBMIT_CSR_REFILL_PER_SEC` is a
+    /// token every five seconds, tuned to the dashboard's approval poll, and a
+    /// person retyping a mistyped password would hit it.
+    #[tokio::test]
+    async fn authenticate_user_on_the_enrollment_tier_is_rate_limited_per_source() {
+        let ctx = AuthContext {
+            own_key: Some([1u8; 32]), // un-enrolled ⇒ every other key is GrantedEnrollment
+            anchor: None,
+            revoked: Vec::new(),
+            now_unix: 100,
+        };
+        let (mut client, server) = spawn_authenticated_server([2u8; 32], ctx);
+
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: Vec::new(),
+            })))
+            .await
+            .unwrap();
+        let ack = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(ack.response, Some(Response::Empty(_))));
+
+        let login = || {
+            encode_request(Request::AuthenticateUser(
+                wayfinder_protos::wayfinder::v1alpha::AuthenticateUserRequest::default(),
+            ))
+        };
+
+        // The burst is spent without being throttled: a person mistyping a
+        // password a few times must not be locked out.
+        for n in 0..LOGIN_BURST as u32 {
+            client.send(login()).await.unwrap();
+            let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+            assert!(
+                !matches!(&resp.response, Some(Response::Error(_))),
+                "login {n} of the burst capacity was refused: {:?}",
+                resp.response
+            );
+        }
+
+        // One more, immediately: refused before it can reach the authority.
+        client.send(login()).await.unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        match resp.response {
+            Some(Response::Error(e)) => {
+                assert!(e.message.contains("too many"), "got: {}", e.message)
+            }
+            other => panic!("expected the rate limit to refuse this login, got {other:?}"),
+        }
+
+        // A separate bucket from enrollment: spending every login token must
+        // not throttle the `SubmitCsr` of a node that is genuinely enrolling.
+        client
+            .send(encode_request(Request::SubmitCsr(
+                SubmitCsrRequest::default(),
+            )))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(
+            !matches!(&resp.response, Some(Response::Error(_))),
+            "the login limiter must not spend the enrollment limiter's tokens, got {:?}",
+            resp.response
+        );
+
+        drop(client);
+        let _ = server.await;
+    }
+
+    /// A login on a fully-granted connection is not rate-limited: the tier
+    /// already required a real credential, which is not the resource an
+    /// anonymous flood is spending.
+    #[tokio::test]
+    async fn authenticate_user_is_not_rate_limited_on_a_fully_granted_connection() {
+        use wayfinder::wayfinder_auth::Authority;
+        use zerocopy::IntoBytes;
+
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let admin_kp = Keypair::from_seed(&[2u8; 32]);
+        let admin_cert = authority.issue_user_cert(
+            Mac([0, 0, 0, 0, 0, 5]),
+            admin_kp.ed_pubkey(),
+            admin_kp.x_pubkey(),
+            0,
+            200,
+            true,
+        );
+        let ctx = AuthContext {
+            own_key: Some([9u8; 32]), // not the client's key: only the cert can admit it
+            anchor: Some(authority.trust_anchor()),
+            revoked: Vec::new(),
+            now_unix: 100,
+        };
+        let (mut client, server) = spawn_authenticated_server(admin_kp.ed_pubkey(), ctx);
+
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: admin_cert.as_bytes().to_vec(),
+            })))
+            .await
+            .unwrap();
+        let ack = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(ack.response, Some(Response::Empty(_))), "admin");
+
+        for n in 0..(LOGIN_BURST as u32 + 5) {
+            client
+                .send(encode_request(Request::AuthenticateUser(
+                    wayfinder_protos::wayfinder::v1alpha::AuthenticateUserRequest::default(),
+                )))
+                .await
+                .unwrap();
+            let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+            assert!(
+                !matches!(&resp.response, Some(Response::Error(_))),
+                "login {n} on a credentialed connection was refused: {:?}",
+                resp.response
+            );
+        }
 
         drop(client);
         let _ = server.await;
@@ -2520,6 +3000,7 @@ mod tests {
                 limits: std::sync::Arc::clone(&limits),
                 query_tx,
                 vpn: None,
+                authority_tx: None,
             },
         ));
         let mut client = LengthDelimitedCodec::builder().new_framed(client_io);
