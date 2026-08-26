@@ -24,6 +24,7 @@ use anyhow::Context;
 use anyhow::bail;
 use clap::Subcommand;
 use wayfinder_server::CertAuthority;
+use wayfinder_server::DEFAULT_INVITE_TTL_SECS;
 use wayfinder_server::DEFAULT_SESSION_TTL_SECS;
 use wayfinder_server::UserRecord;
 use wayfinder_server::UserRole;
@@ -71,6 +72,68 @@ pub enum UserCommand {
         /// simply an argument: argv is readable by every process on the host.
         #[arg(long)]
         password_stdin: bool,
+    },
+
+    /// Mint a one-time invitation and print the token that redeems it.
+    ///
+    /// The difference from `add`, and the whole reason this exists: `add`
+    /// generates the account's TOTP secret and prints its `otpauth://` URI on
+    /// *this* terminal, so the person the account is for receives their second
+    /// factor from somebody else — it is permanently known to at least one
+    /// other party.  An invitation carries the secret instead, and reveals it
+    /// only to whoever redeems it against the running provider.
+    ///
+    /// That matters most for the **first administrator**.  This command needs
+    /// the provider stopped (see the module docs), so the invitation is minted
+    /// before start-up and redeemed after — which makes it the only way to
+    /// create the first account without anyone but its owner ever holding its
+    /// second factor.
+    Invite {
+        /// The provider's state file (`provider.state_path` in its config).
+        #[arg(long)]
+        state: PathBuf,
+        /// The account name the invitation will create.  Refused if the name
+        /// is already an account or already invited.
+        #[arg(long)]
+        username: String,
+        /// Grant the management-administration capability to the account this
+        /// invitation creates.  Decided here and never by the redeemer.
+        #[arg(long)]
+        admin: bool,
+        /// Validity window for the created account's session certificates, in
+        /// seconds.
+        #[arg(long, default_value_t = DEFAULT_SESSION_TTL_SECS)]
+        session_ttl: u64,
+        /// How long the invitation may go unredeemed, in seconds.
+        ///
+        /// The bound on how long the token is worth anything to whoever finds
+        /// it later.  Short is better; the cost of it expiring is one more
+        /// mint.
+        #[arg(long, default_value_t = DEFAULT_INVITE_TTL_SECS)]
+        invite_ttl: u64,
+    },
+
+    /// List the invitations on file (never their tokens or TOTP secrets).
+    ///
+    /// The column to read is `STARTED`.  A started invitation with no account
+    /// under its name means somebody took the account's second factor and did
+    /// not finish registering — either an abandoned registration or a
+    /// disclosure, and the response to both is `revoke-invite` and a fresh
+    /// `invite`.
+    Invites {
+        /// The provider's state file.
+        #[arg(long)]
+        state: PathBuf,
+    },
+
+    /// Delete an invitation, at any status.
+    RevokeInvite {
+        /// The provider's state file.
+        #[arg(long)]
+        state: PathBuf,
+        /// The account name the invitation was minted for.
+        #[arg(long)]
+        username: String,
     },
 
     /// List the accounts on file (never their hashes or TOTP secrets).
@@ -146,6 +209,15 @@ pub fn run(cmd: UserCommand) -> anyhow::Result<()> {
             no_totp,
             password_stdin,
         ),
+        UserCommand::Invite {
+            state,
+            username,
+            admin,
+            session_ttl,
+            invite_ttl,
+        } => invite(&state, &username, admin, session_ttl, invite_ttl),
+        UserCommand::Invites { state } => list_invites(&state),
+        UserCommand::RevokeInvite { state, username } => revoke_invite(&state, &username),
         UserCommand::List { state } => list(&state),
         UserCommand::Passwd {
             state,
@@ -271,6 +343,94 @@ fn add(
         ),
     }
     Ok(())
+}
+
+/// Mint an invitation and print its token.
+fn invite(
+    state: &Path,
+    username: &str,
+    admin: bool,
+    session_ttl: u64,
+    invite_ttl: u64,
+) -> anyhow::Result<()> {
+    let mut ca = open(state)?;
+    // `open` does not set the clock — nothing else in this module needs one —
+    // but an invitation has a window, and the authority refuses to mint one
+    // against a zero clock rather than issuing something already expired.
+    ca.set_now_unix(now_unix()?);
+    let role = if admin {
+        UserRole::Admin
+    } else {
+        UserRole::Viewer
+    };
+    let minted = ca
+        .create_user_invite(username, role, session_ttl, invite_ttl)
+        .map_err(anyhow::Error::msg)?;
+
+    println!("invited {username}");
+    println!("  role:        {}", role_label(role));
+    println!("  session ttl: {session_ttl}s");
+    println!("  expires:     {} (unix)", minted.expires_at);
+    println!("  send this token to them now — it is not shown again:");
+    // Prefixed on its own line so a script can lift it with `grep`/`cut`
+    // without parsing prose, which is the difference between this being usable
+    // from an installer and being a thing an operator retypes.
+    println!("    token: {}", minted.token);
+    println!(
+        "  they redeem it at the dashboard's /register page (the token belongs in the URL's \
+         fragment, after the '#', so it never reaches a server log or a link preview).\n  \
+         Their password and second factor are chosen there; nothing about them is printed here."
+    );
+    Ok(())
+}
+
+/// Print the invitations on file.
+fn list_invites(state: &Path) -> anyhow::Result<()> {
+    let ca = open(state)?;
+    let invites = ca.list_user_invites();
+    if invites.is_empty() {
+        println!("no invitations");
+        return Ok(());
+    }
+    println!("USERNAME             ROLE     EXPIRES        STARTED");
+    for i in invites {
+        let started = match i.started_at {
+            // Spelled out rather than shown as a timestamp: this is the row an
+            // operator is scanning for, and "somebody has the second factor"
+            // is the thing to notice, not when.
+            Some(at) => format!("yes, at {at} — revoke and re-invite if unexpected"),
+            None => "no".to_string(),
+        };
+        println!(
+            "{:<20} {:<8} {:<14} {}",
+            i.username,
+            role_label(i.role),
+            i.expires_at,
+            started,
+        );
+    }
+    Ok(())
+}
+
+/// Delete an invitation.
+fn revoke_invite(state: &Path, username: &str) -> anyhow::Result<()> {
+    let mut ca = open(state)?;
+    ca.revoke_user_invite(username)
+        .map_err(anyhow::Error::msg)?;
+    println!("revoked the invitation for {username}");
+    Ok(())
+}
+
+/// The host's wall clock in unix seconds.
+///
+/// The offline tool runs on a Linux box with a clock, so unlike a node this can
+/// simply read one — and must, since an invitation's expiry is meaningless
+/// otherwise.
+fn now_unix() -> anyhow::Result<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .context("reading the system clock")
 }
 
 /// Print the accounts on file.

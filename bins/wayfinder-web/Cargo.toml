@@ -64,6 +64,10 @@ console_error_panic_hook = { version = "0.1", optional = true }
 # pins the matching `wasm-bindgen-cli_0_2_126`; bump both together or the
 # hydrate build fails with a version-mismatch error.
 wasm-bindgen = { version = "=0.2.126", optional = true }
+# The browser's wall clock, for judging whether a stored registration handle is
+# already dead before letting it shadow a fresh invitation. `web-sys` does not
+# expose `Date`; this is the crate that does.
+js-sys = { version = "0.3", optional = true }
 # Depended on explicitly, though `leptos` already pulls it in: the features are
 # additive and `src/clipboard.rs` needs two that leptos's own set does not
 # happen to enable. Listing them here means a leptos upgrade that trims its
@@ -82,6 +86,14 @@ web-sys = { version = "0.3", optional = true, features = [
   "HtmlInputElement",
   "HtmlTextAreaElement",
   "Node",
+  # Reading the invitation token out of the URL's fragment, and clearing the
+  # fragment once it has been read.
+  "History",
+  "Location",
+  # Where a registration in progress keeps its handle, so a page refresh does
+  # not strand it: the token that produced the handle is already spent by then,
+  # and `sessionStorage` is per-tab and cleared when the tab closes.
+  "Storage",
   "Window",
 ] }
 
@@ -109,6 +121,7 @@ ssr = [
 ]
 hydrate = [
   "dep:console_error_panic_hook",
+  "dep:js-sys",
   "dep:wasm-bindgen",
   "dep:web-sys",
   "leptos/hydrate",
@@ -137,6 +150,12 @@ zerocopy.workspace = true
 # the `mock-node` feature) rather than a stubbed client, so they catch a framing
 # or field-wiring mistake the way a live node would.
 wayfinder-log.workspace = true
+# So `tests/session.rs` can present a live TOTP code the way an authenticator
+# app would, against a secret it reads out of an `otpauth://` URI. Registering
+# by invitation requires one — there is no `no_totp` on that path — so the whole
+# flow is untestable without a code generator on this side.
+hmac.workspace = true
+sha1.workspace = true
 tokio.workspace = true
 # `tests/http.rs` drives the router in-process with `ServiceExt::oneshot`
 # instead of over a socket: same code path, no port to race on.

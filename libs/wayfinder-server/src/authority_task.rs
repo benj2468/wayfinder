@@ -37,8 +37,11 @@ use wayfinder_protos::service::EnrollmentPolicyData;
 use wayfinder_protos::service::EnrollmentPolicyStatusData;
 use wayfinder_protos::service::IssuedCertData;
 use wayfinder_protos::service::PendingCsrData;
+use wayfinder_protos::service::RegistrationStartedData;
 use wayfinder_protos::service::UserAccountData;
 use wayfinder_protos::service::UserAuthOutcome;
+use wayfinder_protos::service::UserInviteData;
+use wayfinder_protos::service::UserInviteMintedData;
 use wayfinder_protos::service::handle_authority;
 use wayfinder_protos::wayfinder::v1alpha::ErrorResponse;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
@@ -49,6 +52,8 @@ use wayfinder_auth::RevocationRecord;
 
 use crate::CertAuthority;
 use crate::MeshAuthority;
+use crate::authority::MAX_PENDING_INVITES;
+use crate::users::UserRole;
 
 /// Re-exported so a caller of this module does not have to reach into
 /// `wayfinder-protos` for the string the trait defaults already produce.
@@ -353,6 +358,73 @@ impl AuthorityDataProvider for AuthorityAdapter<'_> {
 
     fn remove_user(&mut self, username: &str) -> Result<(), String> {
         self.ca.remove_user(username)
+    }
+
+    fn create_user_invite(
+        &mut self,
+        username: &str,
+        admin: bool,
+        session_ttl_secs: u64,
+        invite_ttl_secs: u64,
+    ) -> Result<UserInviteMintedData, String> {
+        let role = if admin {
+            UserRole::Admin
+        } else {
+            UserRole::Viewer
+        };
+        let minted =
+            self.ca
+                .create_user_invite(username, role, session_ttl_secs, invite_ttl_secs)?;
+        Ok(UserInviteMintedData {
+            username: minted.username,
+            token: minted.token,
+            expires_at: minted.expires_at,
+        })
+    }
+
+    fn list_user_invites(&self) -> Result<(Vec<UserInviteData>, u32), String> {
+        let invites = self
+            .ca
+            .list_user_invites()
+            .into_iter()
+            .map(|i| UserInviteData {
+                username: i.username,
+                admin: i.role == UserRole::Admin,
+                session_ttl_secs: i.session_ttl_secs,
+                created_at: i.created_at,
+                expires_at: i.expires_at,
+                // Zero for "not started" on the wire, `None` in the summary.
+                // The projection is the only place the two spellings meet, and
+                // the wire one is proto3's — a message has no absent scalar.
+                started_at: i.started_at.unwrap_or(0),
+                handle_expires_at: i.handle_expires_at.unwrap_or(0),
+            })
+            .collect();
+        Ok((invites, MAX_PENDING_INVITES as u32))
+    }
+
+    fn revoke_user_invite(&mut self, username: &str) -> Result<(), String> {
+        self.ca.revoke_user_invite(username)
+    }
+
+    fn begin_user_registration(&mut self, token: &str) -> Result<RegistrationStartedData, String> {
+        let started = self.ca.begin_user_registration(token)?;
+        Ok(RegistrationStartedData {
+            username: started.username,
+            totp_enrolment_uri: started.totp_enrolment_uri,
+            handle: started.handle,
+            handle_expires_at: started.handle_expires_at,
+        })
+    }
+
+    fn complete_user_registration(
+        &mut self,
+        handle: &str,
+        password: &str,
+        totp_code: &str,
+    ) -> Result<(), String> {
+        self.ca
+            .complete_user_registration(handle, password, totp_code)
     }
 
     fn list_pending_csrs(&self) -> Result<Vec<PendingCsrData>, String> {

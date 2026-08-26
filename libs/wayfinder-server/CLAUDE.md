@@ -90,8 +90,13 @@ Five grant tiers:
   entire mesh at once. Earned by the bit, never by the absence of the others,
   for the same reason the viewer tier is.
 - `GrantedEnrollment` — the client presented no cert at all. Admitted, but
-  `permits` confines it to `SubmitCsr`, `GetTrustAnchor` and
-  `AuthenticateUser`.
+  `permits` confines it to `SubmitCsr`, `GetTrustAnchor`, `AuthenticateUser`,
+  and the two invitation-redemption requests (`BeginUserRegistration`,
+  `CompleteUserRegistration`) — somebody who does not have an account *yet*
+  holds no credential of any kind, and those are the requests that give them
+  one. An enrollment connection can redeem an invitation it already holds and
+  can do nothing else to the account store: not mint one, list one, or revoke
+  one.
 
 A cert with *no* capability bit at all is `Denied(NoCapability)`. Since
 `CERT_FLAG_MEMBER` exists that means one of two things: a certificate issued
@@ -119,7 +124,9 @@ cert could never open the connection carrying its CSR
 — and, for the same reason, someone who has not logged in yet could never open
 the connection carrying their password. Admission control for it has not moved:
 the enrollment token and the operator's approval for a CSR, the password, the
-second factor and the per-account lockout for a login.
+second factor and the per-account lockout for a login, and for a redemption the
+invitation token — 256 bits, single-use, expiring, and minted by an admin who
+chose both the name and the role it will create.
 
 **Authorization is revalidated, not snapshotted.** An authenticated connection
 re-requests the `AuthSnapshot` and re-runs `decide_access` every
@@ -307,6 +314,42 @@ Four rules to keep when touching it:
 Accounts are administered offline, by `wayfinderctl user` against the state
 file, for the same reason `cert init-ca` is: the first account cannot be created
 over the management API, because creating it needs the credential it creates.
+
+## Invitations (`UserInvite`, in the same module)
+
+`CreateUser` mints both of an account's secrets and hands the *admin* its
+`otpauth://` URI, so the account's second factor is permanently known to someone
+who is not its owner. An invitation is the other way round: an admin decides the
+name and the role, and the person redeeming it is the first party to see the
+TOTP secret. Design 12.
+
+Four rules, and the first two are the design rather than the implementation:
+
+- **`begin_user_registration` spends the invitation.** A start that could be
+  repeated would let anyone who read the URL out of a chat log take the secret
+  while the real registration still completed, recording nothing. Spending it
+  turns a silent disclosure into a burnt invitation and a failed registration
+  the invitee reports. Do not add a "peek" that reveals without consuming.
+- **An invitation is not a `UserRecord` with a flag**, it is its own persisted
+  collection. A half-built account that can log in is a strictly worse failure
+  mode than an invitation that cannot, and that must not depend on every future
+  reader of the user store remembering to check a field. Its `totp_secret` is
+  not an `Option` for the same reason: the invariant lives in the type.
+- **Completion is one durable write** (`CaLog::mutate_users_and_invites`).
+  Creating the account and deleting the invitation must land together, or a
+  crash leaves either an account under a name whose invitation still reads
+  `Started`, or a spent invitation with nothing left to redeem — and the person
+  holding the handle can see neither.
+- **An unknown handle costs no Argon2id.** This *inverts* `spend_absent_user_work`'s
+  rule above, deliberately: that exists because usernames are guessable and
+  timing would enumerate accounts, while a handle is 256 bits from `OsRng` and
+  has no oracle to protect. Charging memory-hard work per bad handle would hand
+  an anonymous caller a DoS amplifier. So `complete_user_registration` checks
+  everything cheap first and hashes the password last.
+
+A name is reserved in **both** directions — an account cannot be created under
+an invited name, and a name with an account cannot be invited — which is what
+keeps the two stores from ever disagreeing about who exists.
 
 ## Persisting a runtime security setting
 

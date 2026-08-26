@@ -997,6 +997,26 @@ message WayfinderRequest {
     // Read the node's alarm board: the conditions it currently believes are
     // wrong.
     GetAlarmsRequest get_alarms = 31;
+
+    // Mint a one-time invite for a named account (provider mode).  Requires a
+    // full management grant.
+    CreateUserInviteRequest create_user_invite = 32;
+
+    // List the invites on file (provider mode).  Requires a full management
+    // grant.
+    ListUserInvitesRequest list_user_invites = 33;
+
+    // Delete an invite (provider mode).  Requires a full management grant.
+    RevokeUserInviteRequest revoke_user_invite = 34;
+
+    // Start redeeming an invite, revealing the account's TOTP secret and
+    // consuming the token (provider mode).  On the enrollment tier: somebody
+    // who has no account yet holds no credential.
+    BeginUserRegistrationRequest begin_user_registration = 35;
+
+    // Finish redeeming an invite, creating the account (provider mode).  On the
+    // enrollment tier, for the same reason.
+    CompleteUserRegistrationRequest complete_user_registration = 36;
   }
 }
 
@@ -1616,6 +1636,230 @@ message RemoveUserRequest {
   string username = 1;
 }
 
+// Mint a one-time invite that lets the person an account is for register it
+// themselves (provider mode).  Requires a full management grant.
+//
+// The problem it exists for: `CreateUserRequest` mints both of an account's
+// secrets on the admin's behalf and hands the admin its `otpauth://` URI, so
+// the account's second factor is permanently known to at least one other party.
+// That is not a second factor; it is a second thing the admin knows.  Here the
+// admin decides *who* gets an account and *what role it has*, and the TOTP
+// secret is revealed to whoever redeems the invite — once.
+//
+// The admin still holds the token between minting and delivering it, and could
+// redeem it themselves.  What this design guarantees is not that they cannot,
+// but that doing so **costs the invite**: the legitimate registration then
+// fails, and `ListUserInvitesRequest` shows a start the admin did not expect.
+message CreateUserInviteRequest {
+  // The account name this invite will create.  Reserved from the moment it is
+  // minted: a name already taken, or already invited, is an error.
+  string username = 1;
+
+  // Grant the management-administration capability to the certificates the
+  // created account is issued.  False creates a read-only (viewer) account.
+  //
+  // Decided by the admin at mint and never by the redeemer.  No field on either
+  // redemption request can ask for more than this.
+  bool admin = 2;
+
+  // Validity window for the created account's session certificates, in seconds.
+  // Zero takes the authority's default of eight hours.
+  //
+  // Refused at mint if it is past the provider's certificate-lifetime cap, and
+  // re-checked at completion — where it is clamped rather than refused, since
+  // an invite may be redeemed long after it was minted and the cap can move in
+  // between. The asymmetry is deliberate: the admin is standing in front of the
+  // error at mint and can fix it, while the registrant can fix nothing and
+  // would lose their invitation to somebody else's policy change.
+  uint64 session_ttl_secs = 3;
+
+  // How long the invite may go unredeemed, in seconds.  Zero takes the
+  // authority's default of 24 hours; anything past the authority's cap of 7
+  // days is refused, the same way an over-long session lifetime is.
+  //
+  // The bound on how long a bearer token sitting in somebody's chat history is
+  // worth anything.  Short is better; the cost of it expiring is one more mint.
+  uint64 invite_ttl_secs = 4;
+}
+
+// Answer to a CreateUserInviteRequest.
+message CreateUserInviteResponse {
+  // The account name the invite will create, echoed back so a caller building
+  // the registration URL does not have to re-derive it.
+  string username = 1;
+
+  // The invite token, base32 and unpadded.  **Shown once.**
+  //
+  // A bearer credential: whoever holds it can take the account's TOTP secret.
+  // The authority stores only a domain-separated Blake2s256 of it, so this
+  // response is the single moment it exists in readable form anywhere — a
+  // caller that loses it must revoke the invite and mint another.
+  //
+  // It belongs in the *fragment* of the registration URL
+  // (`https://…/register#<token>`), never the query string: a fragment is never
+  // transmitted to a server, so it stays out of access logs, out of `Referer`,
+  // and out of the reach of the link unfurlers that fetch any URL pasted into a
+  // chat app.
+  string token = 2;
+
+  // Unix seconds after which the invite is refused.
+  uint64 expires_at = 3;
+}
+
+// List the invites this authority holds (provider mode).  Requires a full
+// management grant.
+message ListUserInvitesRequest {}
+
+// One pending invite, as an admin triaging them sees it.
+//
+// Carries neither the token nor the TOTP secret: the first is stored only as a
+// hash, and the second is the thing the whole design exists to keep out of an
+// admin's hands.
+message UserInvite {
+  // The account name this invite will create.
+  string username = 1;
+
+  // Whether the created account will hold the management-administration
+  // capability.
+  bool admin = 2;
+
+  // Validity window for the created account's session certificates, in seconds.
+  uint64 session_ttl_secs = 3;
+
+  // Unix seconds the invite was minted at.
+  uint64 created_at = 4;
+
+  // Unix seconds after which the invite is refused.
+  uint64 expires_at = 5;
+
+  // Unix seconds registration was started at — when the TOTP secret was
+  // revealed — or 0 if it has not been.
+  //
+  // **This is the security-relevant field**, and a deliberately short-lived
+  // one: a started invitation is swept the moment its handle window closes,
+  // fifteen minutes after the secret was revealed.  So this listing carries the
+  // condition while an admin can still act on it, and not afterwards.  The
+  // lasting record is the node's log, which says both that a registration
+  // started and that it was later abandoned.
+  //
+  // A non-zero `started_at` with the account still absent means somebody took
+  // the second factor and did not finish, which is either an abandoned
+  // registration or a disclosure.  Either way the response is the same: revoke
+  // and re-mint.
+  uint64 started_at = 6;
+
+  // Unix seconds after which the registration handle issued at start is dead
+  // and the invite is spent, or 0 if registration has not started.
+  uint64 handle_expires_at = 7;
+}
+
+// Answer to a ListUserInvitesRequest.
+message ListUserInvitesResponse {
+  // The invites on file, redeemed ones excluded — completion deletes the
+  // invite.
+  repeated UserInvite invites = 1;
+
+  // The largest number of invites this authority will hold at once.
+  //
+  // Reported beside the listing so a full store reads as itself rather than as
+  // an unexplained mint failure.  Only a full grant can add one, so the cap
+  // guards against operator error rather than against a remote party.
+  uint32 capacity = 2;
+}
+
+// Delete an invite (provider mode).  Requires a full management grant.
+//
+// Answered with the empty response.  Works at any status: an unredeemed invite,
+// and a started-but-unfinished one — which is the case it exists for, since a
+// start nobody expected is the signal that the token leaked.
+message RevokeUserInviteRequest {
+  // The account name the invite was minted for.  A name with no invite on file
+  // is an error rather than a silent success.
+  //
+  // An invite for a name whose account already exists is not reachable here:
+  // completion deletes the invite, and `RemoveUserRequest` is the tool for the
+  // account.
+  string username = 1;
+}
+
+// Start redeeming an invite (provider mode).  On the *enrollment* tier, which
+// is what admits a client holding no credential at all — which is precisely
+// what someone who does not have an account yet is.
+//
+// **This consumes the token**, and that is the design's load-bearing decision.
+// A non-consuming start would reveal the TOTP secret to anyone who read the URL
+// out of a chat log or a browser history, let the legitimate registration
+// complete normally afterwards, and record nothing anywhere — today's problem
+// with detectability removed.  Consuming it converts a silent disclosure into a
+// burnt invite and a failed registration the invitee reports.
+//
+// The cost is that a mid-registration page refresh must carry the handle rather
+// than re-deriving it from the URL.  An abandoned registration is re-minted by
+// the admin, which is cheap, and is also the right response to "something odd
+// happened".
+message BeginUserRegistrationRequest {
+  // The invite token, as it appeared in the registration URL's fragment.
+  //
+  // An unknown token is refused without spending any password-hashing work, and
+  // deliberately so: it is 256 bits from the OS CSPRNG, so it is not enumerable
+  // on any timescale and there is no timing oracle to protect — while charging
+  // 64 MiB of memory-hard work per bad token would hand any anonymous party a
+  // denial-of-service amplifier against the authority.
+  string token = 1;
+}
+
+// Answer to a BeginUserRegistrationRequest.
+message BeginUserRegistrationResponse {
+  // The account name the invite creates.  The redeemer does not choose it.
+  string username = 1;
+
+  // The `otpauth://` enrolment URI for the account's second factor.
+  //
+  // Revealed exactly once, to whoever started registration.  There is no
+  // no-second-factor path here: an invite with no second factor would make a
+  // bearer token in a chat message the whole credential for an account that can
+  // mint a certificate the entire mesh honours.
+  string totp_enrolment_uri = 2;
+
+  // The registration handle, base32 and unpadded.  Only the party holding it
+  // can complete this registration.
+  //
+  // Held in the page's `sessionStorage` so a refresh survives — the token is
+  // already spent by the time this is returned, so the handle is the only way
+  // back into a registration in progress.
+  string handle = 3;
+
+  // Unix seconds after which the handle is dead and the invite is spent.  Much
+  // shorter than the invite's own expiry: it bounds how long a
+  // started-but-unfinished registration can be resumed.
+  uint64 handle_expires_at = 4;
+}
+
+// Finish redeeming an invite: create the account (provider mode).  On the
+// enrollment tier, for the same reason `BeginUserRegistrationRequest` is.
+//
+// Answered with the empty response.  The effect — creating the `UserRecord` and
+// deleting the invite — is one durable act, so a crash cannot leave a burnt
+// invite with no account behind it.
+message CompleteUserRegistrationRequest {
+  // The handle from BeginUserRegistrationResponse.  Single-use.
+  string handle = 1;
+
+  // The account's password, chosen by the person the account is for.  The
+  // authority stores only an Argon2id hash of it; the admin never sees it.
+  string password = 2;
+
+  // A TOTP code computed against the secret just enrolled.
+  //
+  // Required, and the point of requiring it: it proves the authenticator
+  // actually holds the secret *before* an account depends on it — the failure
+  // `CreateUserRequest` has today, where a URI is printed and nobody checks it
+  // was ever scanned.  The step this code is accepted at is carried into the
+  // new account's replay guard, so the same code cannot then be replayed at
+  // sign-in.
+  string totp_code = 3;
+}
+
 // The result of an AuthenticateUserRequest.
 message AuthenticateUserResponse {
   // The outcome.  Exactly one variant is set.
@@ -1821,5 +2065,16 @@ message WayfinderResponse {
 
     // Response to GetAlarmsRequest: the node's whole alarm board.
     Alarms alarms = 25;
+
+    // Response to CreateUserInviteRequest.
+    CreateUserInviteResponse create_user_invite = 26;
+
+    // Response to ListUserInvitesRequest.  (RevokeUserInvite answers with the
+    // Empty response above.)
+    ListUserInvitesResponse list_user_invites = 27;
+
+    // Response to BeginUserRegistrationRequest.  (CompleteUserRegistration
+    // answers with the Empty response above.)
+    BeginUserRegistrationResponse begin_user_registration = 28;
   }
 }

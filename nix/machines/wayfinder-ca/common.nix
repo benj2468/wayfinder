@@ -114,6 +114,19 @@ let
   # terminates TLS and therefore sees the dashboard's plaintext, including a
   # password at sign-in — a real trust decision, not a free lunch. See
   # `docs/design/implemented/11-cloud-auth-provider.md`.
+  #
+  # Design 12's `/register` page crosses the same boundary, and it is worth
+  # saying plainly because that design's whole point is secret custody: the
+  # invitation token, the `otpauth://` URI carrying an account's TOTP secret,
+  # and the password chosen at registration all pass through the tunnel. So
+  # against this deployment, "the person registering is the first party to see
+  # the second factor" means the first party *other than the tunnel provider*.
+  # That is not a new class of exposure — sign-in already crosses it — and it
+  # was chosen deliberately rather than inherited. The alternative, if that
+  # trade stops being acceptable for the TOTP secret specifically, is a
+  # registration-only vhost on a DNS-only name with its own ACME certificate,
+  # the way `vpnHostname` below already works. See
+  # `docs/design/implemented/12-self-service-user-registration.md` §5.1.
   dashboardHostname = "dash.wayfndr.dev";
 
   # Public name nodes register their tunnel against. A separate record from the

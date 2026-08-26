@@ -34,8 +34,18 @@ use crate::persistence::CaLog;
 use crate::persistence::TokenOverride;
 use crate::provider::MeshAuthority;
 use crate::users::AuthOutcome;
+use crate::users::DEFAULT_SESSION_TTL_SECS;
+use crate::users::InviteStatus;
+use crate::users::UserInvite;
 use crate::users::UserRecord;
 use crate::users::UserRole;
+
+/// How this mesh names itself in an authenticator app's account list.
+///
+/// One constant rather than a literal at each call site: the string is part of
+/// what a person sees when they enrol, so two paths spelling it differently
+/// would put an account under two names in the same app.
+const TOTP_ISSUER: &str = "wayfinder";
 
 /// A certificate-signing request the authority is holding while it awaits an
 /// operator decision.  Only populated when `auto_approve` is off; keyed by
@@ -134,6 +144,62 @@ pub struct CertAuthority {
 /// kilobytes even when full.
 pub(crate) const MAX_HELD_CSRS: usize = 128;
 
+/// Largest number of pending invitations the authority will hold at once.
+///
+/// Mirrors [`MAX_HELD_CSRS`], and for one of the same two reasons: the store is
+/// persisted, so unbounded growth is growth that survives a restart. The other
+/// reason does *not* apply — only a full management grant can add an invite, so
+/// this bounds operator error rather than an anonymous flood, which is why it
+/// refuses a new mint rather than evicting an incumbent. Evicting would mean an
+/// admin's earlier invitation silently stopping working because a later one was
+/// issued.
+///
+/// Sized for the human on the other end, like the held-CSR queue beside it: a
+/// list an admin is expected to read row by row and act on is unusable long
+/// before 128 entries.
+pub(crate) const MAX_PENDING_INVITES: usize = 128;
+
+/// How long an invitation may go unredeemed when the admin does not say: 24
+/// hours.
+///
+/// The bound on how long a bearer token sitting in somebody's chat history is
+/// worth anything. Long enough to survive a time zone and a night's sleep,
+/// short enough that a token found later is already dead — and the cost of
+/// guessing short is one more mint, which is cheap.
+pub const DEFAULT_INVITE_TTL_SECS: u64 = 24 * 3600;
+
+/// What a refused registration start is told, whatever the reason.
+///
+/// One message for an unknown token, an expired one and a spent one. Not to
+/// protect an oracle — a 256-bit `OsRng` token is not enumerable, so there is
+/// nothing to protect — but because the three are indistinguishable to the
+/// person reading it, whose next act is the same in all three cases: ask the
+/// admin for a new invitation.
+const REGISTRATION_START_REFUSED: &str = "this invitation is not valid: it may have expired, already been used, or been revoked. Ask \
+     for a new one.";
+
+/// The longest invitation lifetime an admin may ask for: 7 days.
+///
+/// [`DEFAULT_INVITE_TTL_SECS`] describes itself as the bound on how long a
+/// bearer token sitting in somebody's chat history is worth anything — which it
+/// was only while the admin said nothing, since `invite_ttl_secs` was otherwise
+/// taken verbatim. This is that bound made real.
+///
+/// Refused rather than clamped, matching [`check_cert_ttl`] and for the same
+/// reason: the admin is standing in front of the error and can fix it, which is
+/// not true of the registrant at the other end.
+pub const MAX_INVITE_TTL_SECS: u64 = 7 * 24 * 3600;
+
+/// How long a started registration may be resumed for: 15 minutes.
+///
+/// Much shorter than the invite's own lifetime, and bounding a different thing.
+/// The invite's expiry bounds "nobody has started yet"; this bounds "somebody
+/// took the second factor and has not finished", which is the window in which a
+/// disclosure is still convertible into an account. A registration is a page,
+/// a QR code and a six-digit code — fifteen minutes is generous for that and
+/// stingy for anything else.
+pub(crate) const REGISTRATION_HANDLE_TTL_SECS: u64 = 15 * 60;
+
 /// Default held-CSR lifetime when a CA is built with [`CertAuthority::new`]
 /// (the config-driven constructor takes the operator's value instead): one
 /// hour, long enough for an operator to approve and short enough to bound the
@@ -157,6 +223,24 @@ fn check_cert_ttl(cert_ttl_secs: u64, allow_unbounded: bool) -> Result<(), Strin
          Shorten it, or set `allow_unbounded_cert_ttl: true` to say the long lifetime \
          is deliberate"
     ))
+}
+
+/// Whether an invitation is still capable of producing an account.
+///
+/// The two states expire on different clocks: a `Pending` invitation dies at
+/// its own expiry, while a `Started` one dies when its handle window closes —
+/// its original expiry is superseded the moment the secret is revealed.
+///
+/// Shared by [`CertAuthority::evict_expired_invites`] and
+/// [`CertAuthority::list_user_invites`] so the sweep and the admin's listing
+/// cannot drift apart about what counts as an invitation.
+fn invite_is_live(invite: &UserInvite, now_unix: u64) -> bool {
+    match invite.status {
+        InviteStatus::Pending => !invite.is_expired(now_unix),
+        InviteStatus::Started {
+            handle_expires_at, ..
+        } => now_unix < handle_expires_at,
+    }
 }
 
 impl CertAuthority {
@@ -451,14 +535,34 @@ impl CertAuthority {
     /// second is `MeshAuthority::create_user`, which is that same act performed
     /// by an already-admitted administrator over the wire.
     pub fn add_user(&mut self, user: UserRecord) -> Result<(), String> {
-        if user.username.is_empty() {
-            return Err("username must not be empty".to_string());
-        }
-        if self.log.users().iter().any(|u| u.username == user.username) {
-            return Err(alloc::format!("user {} already exists", user.username));
-        }
+        self.evict_expired_invites()?;
+        self.check_name_available(&user.username)?;
         let (_, persisted) = self.log.mutate_users(|users| users.push(user));
         persisted
+    }
+
+    /// Refuse `username` if it is empty, already an account, or already
+    /// invited.
+    ///
+    /// The invite half is the one that is easy to leave out, and leaving it out
+    /// is not merely untidy: an admin creating an account for a name that has a
+    /// pending invite would silently strand that invite until it expired, and
+    /// the invitee's registration would fail with nothing to point at. Every
+    /// path that claims a name goes through here, in both directions.
+    fn check_name_available(&self, username: &str) -> Result<(), String> {
+        if username.is_empty() {
+            return Err("username must not be empty".to_string());
+        }
+        if self.log.users().iter().any(|u| u.username == username) {
+            return Err(alloc::format!("user {username} already exists"));
+        }
+        if self.log.invites().iter().any(|i| i.username == username) {
+            return Err(alloc::format!(
+                "user {username} has already been invited; revoke that invitation first, or \
+                 wait for it to expire"
+            ));
+        }
+        Ok(())
     }
 
     /// The user accounts on file, for an operator listing them. Never carries a
@@ -530,6 +634,409 @@ impl CertAuthority {
         persisted
     }
 
+    /// Mint a one-time invitation for `username`, returning the token that
+    /// redeems it — the one moment that token is readable anywhere.
+    ///
+    /// The admin decides *who* gets an account and *what role it has*, here and
+    /// once. What they do not decide, and never see, is the account's password
+    /// or its second factor: the TOTP secret is minted with the invite and
+    /// revealed only to whoever redeems it.
+    ///
+    /// A zero `session_ttl_secs` takes [`DEFAULT_SESSION_TTL_SECS`]; a zero
+    /// `invite_ttl_secs` takes [`DEFAULT_INVITE_TTL_SECS`].
+    ///
+    /// The lifetime is refused here rather than clamped — the admin is standing
+    /// in front of the error and can fix it, which is not true of the registrant
+    /// at the other end (see [`Self::complete_user_registration`]).
+    pub fn create_user_invite(
+        &mut self,
+        username: &str,
+        role: UserRole,
+        session_ttl_secs: u64,
+        invite_ttl_secs: u64,
+    ) -> Result<MintedInvite, String> {
+        // Same fail-closed rule as `submit_csr`: without a clock this would
+        // mint an invitation whose window starts at the epoch and is over.
+        if self.now_unix == 0 {
+            return Err("authority clock not set; cannot mint an invitation yet".to_string());
+        }
+        self.evict_expired_invites()?;
+        self.check_name_available(username)?;
+        if self.log.invites().len() >= MAX_PENDING_INVITES {
+            return Err(alloc::format!(
+                "the invitation store is full ({MAX_PENDING_INVITES} pending): revoke an \
+                 outstanding invitation, or wait for one to expire"
+            ));
+        }
+        let ttl = if session_ttl_secs == 0 {
+            DEFAULT_SESSION_TTL_SECS
+        } else {
+            session_ttl_secs
+        };
+        // Refused at mint rather than at the completion it would make
+        // impossible: an invitation whose account the provider will not sign
+        // sessions for is one that looks issued and is not usable, and the
+        // admin finds out from the person they invited.
+        check_cert_ttl(ttl, self.allow_unbounded_cert_ttl)?;
+        // The same rule for the *invitation's* own lifetime, which was
+        // previously taken verbatim however long the caller asked for.
+        if invite_ttl_secs > MAX_INVITE_TTL_SECS {
+            return Err(alloc::format!(
+                "invite_ttl_secs is {invite_ttl_secs}s, past the {MAX_INVITE_TTL_SECS}s cap: an \
+                 invitation is a bearer token sitting in somebody's chat history, and one that \
+                 outlives the conversation cannot be recalled. Shorten it, or mint again when it \
+                 expires"
+            ));
+        }
+
+        let token = crate::users::generate_invite_secret();
+        let expires_at = self.now_unix.saturating_add(if invite_ttl_secs == 0 {
+            DEFAULT_INVITE_TTL_SECS
+        } else {
+            invite_ttl_secs
+        });
+        let invite = UserInvite::new(
+            username,
+            role,
+            ttl,
+            crate::users::invite_token_hash(&token),
+            self.now_unix,
+            expires_at,
+        );
+        let (_, persisted) = self.log.mutate_invites(|invites| invites.push(invite));
+        persisted?;
+
+        // The name and the role, never the token and never the secret.
+        tracing::info!(%username, ?role, expires_at, "minted a user invitation");
+        Ok(MintedInvite {
+            username: username.to_string(),
+            token,
+            expires_at,
+        })
+    }
+
+    /// The invitations on file, for an admin triaging them.
+    ///
+    /// Never carries a token hash or a TOTP secret out of this module, for the
+    /// same reason [`Self::list_users`] carries no password hash: a summary type
+    /// makes that a property of the API rather than of every call site
+    /// remembering which fields not to print.
+    ///
+    /// **Dead invitations are filtered, not swept.** This is a read — the
+    /// provider trait behind it takes `&self` — so an entry past its expiry or
+    /// its handle window is omitted here and removed by the next mutating call.
+    /// Without the filter, an admin triaging a quiet provider would be shown
+    /// rows that can never produce an account, including ones carrying the
+    /// `started_at` this panel documents as meaning *act now*: a resolved
+    /// disclosure presented as a live one.
+    pub fn list_user_invites(&self) -> Vec<InviteSummary> {
+        let now = self.now_unix;
+        self.log
+            .invites()
+            .iter()
+            .filter(|i| invite_is_live(i, now))
+            .map(|i| {
+                let (started_at, handle_expires_at) = match &i.status {
+                    InviteStatus::Pending => (None, None),
+                    InviteStatus::Started {
+                        started_at,
+                        handle_expires_at,
+                        ..
+                    } => (Some(*started_at), Some(*handle_expires_at)),
+                };
+                InviteSummary {
+                    username: i.username.clone(),
+                    role: i.role,
+                    session_ttl_secs: i.session_ttl_secs,
+                    created_at: i.created_at,
+                    expires_at: i.expires_at,
+                    started_at,
+                    handle_expires_at,
+                }
+            })
+            .collect()
+    }
+
+    /// Delete the invitation minted for `username`, whatever its status.
+    ///
+    /// The started case is the one this exists for: a start the admin did not
+    /// expect means the token reached somebody it should not have, and
+    /// revoke-then-re-mint is the whole response.
+    pub fn revoke_user_invite(&mut self, username: &str) -> Result<(), String> {
+        let (found, persisted) = self.log.mutate_invites(|invites| {
+            let before = invites.len();
+            invites.retain(|i| i.username != username);
+            invites.len() != before
+        });
+        // Before the not-found answer, deliberately: `Persisted::mutate`
+        // attempts a write whatever the closure did, so `persisted` carries a
+        // real verdict on this path too. An admin who typo'd a username and an
+        // admin whose node cannot write its state file need different answers,
+        // and the second is the more important one.
+        persisted?;
+        if !found {
+            return Err(alloc::format!("no invitation on file for {username}"));
+        }
+        tracing::info!(%username, "revoked a user invitation");
+        Ok(())
+    }
+
+    /// Redeem `token`: reveal the account's second factor and issue the handle
+    /// that alone can finish the registration.
+    ///
+    /// **This consumes the invitation**, and that is the design's load-bearing
+    /// decision rather than an implementation detail. A start that could be
+    /// repeated would let anyone who read the invitation URL out of a chat log,
+    /// a clipboard or a browser history take the account's TOTP secret, while
+    /// the legitimate registration still completed normally and nothing
+    /// anywhere recorded that a second party holds it — which is today's
+    /// property with detectability removed. Spending the invitation converts a
+    /// silent disclosure into a burnt invitation and a failed registration the
+    /// invitee reports.
+    ///
+    /// The cost is that a mid-registration page refresh has to carry the
+    /// handle. A genuinely abandoned registration is re-minted by the admin,
+    /// which is cheap and is also the correct response to "something odd
+    /// happened".
+    ///
+    /// No password hashing happens on this path at all, including for an
+    /// unknown token — see [`Self::complete_user_registration`] for why that is
+    /// deliberate rather than an oversight.
+    pub fn begin_user_registration(&mut self, token: &str) -> Result<StartedRegistration, String> {
+        if self.now_unix == 0 {
+            return Err("authority clock not set; cannot start a registration yet".to_string());
+        }
+        self.evict_expired_invites()?;
+        let now = self.now_unix;
+        let hash = crate::users::invite_token_hash(token);
+        let handle = crate::users::generate_invite_secret();
+        let handle_hash = crate::users::registration_handle_hash(&handle);
+        let handle_expires_at = now.saturating_add(REGISTRATION_HANDLE_TTL_SECS);
+
+        // A token matching nothing must not cost a write. `Persisted::mutate`
+        // persists whatever the closure did — so entering it unconditionally
+        // made every garbage token from an anonymous caller a full CA-state
+        // serialize and atomic file write, on the one tier that needs no
+        // credential. `submit_csr` checks its token before touching the
+        // held-CSR store for the same reason.
+        //
+        // The re-check inside the mutation below is what keeps this safe: this
+        // read decides only whether a write is worth attempting, never that it
+        // will succeed.
+        if !self
+            .log
+            .invites()
+            .iter()
+            .any(|i| i.token_matches(&hash) && matches!(i.status, InviteStatus::Pending))
+        {
+            tracing::trace!("drop: registration start refused (unknown, expired or spent token)");
+            return Err(REGISTRATION_START_REFUSED.to_string());
+        }
+
+        // The lookup and the state change happen inside one `mutate_invites`,
+        // so two concurrent starts cannot both find the invitation `Pending`:
+        // one wins and the other sees it already `Started`.
+        let (found, persisted) = self.log.mutate_invites(|invites| {
+            let invite = invites.iter_mut().find(|i| i.token_matches(&hash))?;
+            if !matches!(invite.status, InviteStatus::Pending) {
+                return None;
+            }
+            invite.status = InviteStatus::Started {
+                handle_hash,
+                started_at: now,
+                handle_expires_at,
+            };
+            Some((
+                invite.username.clone(),
+                invite.totp_enrolment_uri(TOTP_ISSUER),
+            ))
+        });
+        persisted?;
+
+        // Reachable only by losing a race with another start between the
+        // read above and this write.
+        let Some((username, totp_enrolment_uri)) = found else {
+            tracing::trace!("drop: registration start refused (lost the race to another start)");
+            return Err(REGISTRATION_START_REFUSED.to_string());
+        };
+
+        tracing::info!(%username, "user registration started; second factor revealed");
+        Ok(StartedRegistration {
+            username,
+            totp_enrolment_uri,
+            handle,
+            handle_expires_at,
+        })
+    }
+
+    /// Finish a registration: verify the handle and the TOTP code, then create
+    /// the account and delete the invitation as one durable act.
+    ///
+    /// The code is what makes this more than a password form. It proves the
+    /// authenticator actually holds the secret *before* an account depends on
+    /// it — the failure `create_user` has today, where a URI is printed and
+    /// nobody checks it was ever scanned. The step it is accepted at is carried
+    /// into the new account, so the same code cannot be spent again at sign-in.
+    ///
+    /// **An unknown handle costs no Argon2id.** That is the opposite of
+    /// `spend_absent_user_work`'s rule for an unknown username, and deliberately
+    /// so: a username is low-entropy and guessable, so timing there would
+    /// enumerate accounts, whereas a handle is 256 bits from `OsRng` and is not
+    /// enumerable on any timescale. There is no oracle left for timing to leak,
+    /// and spending 64 MiB of memory-hard work per bad handle would hand any
+    /// anonymous party a denial-of-service amplifier against the authority.
+    /// Everything cheap is therefore checked first, and the password is hashed
+    /// last.
+    ///
+    /// **A wrong code does not spend the handle.** Whoever holds the handle was
+    /// handed the TOTP secret by the same call that issued it, so they can
+    /// compute a correct code at will and guessing buys them nothing — while
+    /// burning the handle on a typo would strand a legitimate registration with
+    /// no way back.
+    pub fn complete_user_registration(
+        &mut self,
+        handle: &str,
+        password: &str,
+        totp_code: &str,
+    ) -> Result<(), String> {
+        if self.now_unix == 0 {
+            return Err("authority clock not set; cannot create an account yet".to_string());
+        }
+        self.evict_expired_invites()?;
+        let now = self.now_unix;
+        let handle_hash = crate::users::registration_handle_hash(handle);
+
+        // Everything cheap, and nothing that touches the store, before the
+        // password is hashed.
+        let Some(invite) = self
+            .log
+            .invites()
+            .iter()
+            .find(|i| i.handle_matches(&handle_hash, now))
+        else {
+            tracing::trace!("drop: registration completion refused (unknown or expired handle)");
+            return Err(
+                "this registration is no longer valid: it may have expired or been revoked. Ask \
+                 for a new invitation."
+                    .to_string(),
+            );
+        };
+        let Some(step) = crate::users::verify_totp(&invite.totp_secret, totp_code, now, 0) else {
+            // Left un-spent on purpose — see this method's own doc.
+            tracing::debug!(username = %invite.username, "drop: registration code rejected");
+            return Err("that code is not correct. Check your authenticator and try again.".into());
+        };
+
+        let username = invite.username.clone();
+        let role = invite.role;
+        // Re-clamped rather than re-refused. The value was chosen up to a week
+        // ago under a policy that may since have changed (`from_config`'s
+        // `allow_unbounded_cert_ttl` is the reachable way), and the person on
+        // this end of the call can do nothing about it — refusing them would
+        // burn their invitation for somebody else's decision.
+        let ttl = if check_cert_ttl(invite.session_ttl_secs, self.allow_unbounded_cert_ttl).is_ok()
+        {
+            invite.session_ttl_secs
+        } else {
+            MAX_CERT_TTL_SECS
+        };
+        let secret = invite.totp_secret.clone();
+        let user = UserRecord::from_registration(&username, password, secret, step, role, ttl)?;
+
+        // The account and the invitation's deletion are one write. Two would
+        // leave a crash window with a burnt invitation and no account, which
+        // the person holding the handle cannot recover from and cannot see.
+        let (created, persisted) = self.log.mutate_users_and_invites(|users, invites| {
+            // Re-checked inside the mutation, against the state the write will
+            // actually commit: between the read above and here nothing else
+            // runs today, but "the name is free" is the invariant this store
+            // exists to hold and it should be asserted where it is committed.
+            if users.iter().any(|u| u.username == user.username) {
+                return false;
+            }
+            users.push(user);
+            invites.retain(|i| i.username != username);
+            true
+        });
+        persisted?;
+        if !created {
+            return Err(alloc::format!(
+                "user {username} already exists; this invitation can no longer be redeemed"
+            ));
+        }
+
+        tracing::info!(%username, ?role, ttl_secs = ttl, "user registration completed");
+        Ok(())
+    }
+
+    /// Drop invitations that have passed their expiry, and started ones whose
+    /// handle window has closed.
+    ///
+    /// Called at the head of every invite operation that *mutates* the store,
+    /// mirroring
+    /// [`Self::evict_expired`]: a persisted store nobody tends would otherwise
+    /// fill with records that can never be redeemed, and — worse — keep
+    /// reserving the names they carry. A no-op (and no persist) when nothing
+    /// has actually expired.
+    ///
+    /// A started invitation is dropped when its *handle* expires, not when the
+    /// invitation would have: once the secret has been revealed and the handle
+    /// window has closed, there is nothing left the record can be used for, and
+    /// leaving it to sit out the remaining hours would hold its name reserved
+    /// against the re-mint that is the correct response.
+    ///
+    /// **Each eviction is logged, and the started case is why.** An invitation
+    /// record is the shorter-lived of the two accounts of a disclosure: the log
+    /// line survives a restart in the host CA's journal, while `started_at`
+    /// leaves the admin's listing here, fifteen minutes after the secret was
+    /// revealed. Without a line at this moment, "somebody took a second factor
+    /// and never finished" would be visible for a quarter of an hour and then
+    /// simply absent, with the name freed and nothing recording that it had
+    /// ever happened.
+    fn evict_expired_invites(&mut self) -> Result<(), String> {
+        if self.now_unix == 0 {
+            return Ok(());
+        }
+        let now = self.now_unix;
+        let live = |i: &UserInvite| invite_is_live(i, now);
+        if self.log.invites().iter().all(live) {
+            return Ok(());
+        }
+
+        // Named one at a time rather than counted: the subject is the whole
+        // value of the record, and an operator asking after the fact needs the
+        // account name, not how many went at once. Bounded by
+        // `MAX_PENDING_INVITES`, and reached only when something has actually
+        // expired, so this cannot become a flood.
+        for invite in self.log.invites().iter().filter(|i| !live(i)) {
+            match invite.status {
+                InviteStatus::Pending => tracing::info!(
+                    username = %invite.username,
+                    expired_at = invite.expires_at,
+                    "invitation expired unredeemed; its name is free again"
+                ),
+                // The security-relevant one. This is the last moment the
+                // provider says anything about a second factor that was handed
+                // out and never turned into an account.
+                InviteStatus::Started {
+                    started_at,
+                    handle_expires_at,
+                    ..
+                } => tracing::info!(
+                    username = %invite.username,
+                    started_at,
+                    handle_expires_at,
+                    "registration abandoned after the second factor was revealed; \
+                     invitation dropped and its name freed — re-mint, and treat an \
+                     unexpected start as a disclosure"
+                ),
+            }
+        }
+
+        let (_, persisted) = self.log.mutate_invites(|invites| invites.retain(live));
+        persisted
+    }
+
     /// Whether a held CSR has sat in its current state past the pending TTL.
     /// Never true before the clock is set (`now_unix == 0`), so a CA that has
     /// not yet learned the time does not evict everything as "expired".
@@ -575,6 +1082,68 @@ fn fixed<const N: usize>(bytes: &[u8], what: &str) -> Result<[u8; N], String> {
 /// enrollment methods below don't each open-code the length check and label.
 fn node_mac_of(bytes: &[u8]) -> Result<Mac, String> {
     Mac::try_from(bytes).map_err(|_| "node_mac must be 6 bytes".to_string())
+}
+
+/// A freshly minted invitation, as its caller sees it once.
+///
+/// [`token`](Self::token) is the whole reason this type is returned rather than
+/// the invitation being minted silently: the store keeps only a hash of it, so
+/// a caller that drops this value has to revoke and mint again.
+#[derive(Clone)]
+pub struct MintedInvite {
+    /// The account name the invitation will create.
+    pub username: String,
+    /// The token that redeems it. A bearer credential, readable here and
+    /// nowhere else.
+    pub token: String,
+    /// Unix seconds after which the invitation is refused.
+    pub expires_at: u64,
+}
+
+/// What a started registration hands back to the person redeeming it.
+///
+/// Produced by the call that *spends* the invitation, so there is no second
+/// chance to read it — which is why the handle is here rather than being
+/// re-derivable from the token.
+#[derive(Clone)]
+pub struct StartedRegistration {
+    /// The account name being registered. Not the redeemer's to choose.
+    pub username: String,
+    /// The `otpauth://` enrolment URI for the account's second factor.
+    pub totp_enrolment_uri: String,
+    /// The handle that alone can complete this registration.
+    pub handle: String,
+    /// Unix seconds after which the handle is dead and the invitation spent.
+    pub handle_expires_at: u64,
+}
+
+/// One pending invitation as an admin sees it.
+///
+/// Deliberately not [`UserInvite`]: the record carries a token hash and a TOTP
+/// secret, and neither should leave the store — a summary type makes that a
+/// property of the API rather than of every call site remembering which fields
+/// not to print.
+#[derive(Clone, Debug)]
+pub struct InviteSummary {
+    /// The account name the invitation will create.
+    pub username: String,
+    /// The role the created account will hold.
+    pub role: UserRole,
+    /// The validity window its session certificates will carry, in seconds.
+    pub session_ttl_secs: u64,
+    /// Unix seconds the invitation was minted at.
+    pub created_at: u64,
+    /// Unix seconds after which it is refused.
+    pub expires_at: u64,
+    /// When the second factor was revealed, or `None` if it has not been.
+    ///
+    /// The field an admin is actually reading for. `Some(_)` with the account
+    /// still absent means somebody took the second factor and did not finish:
+    /// either an abandoned registration or a disclosure, and the response to
+    /// both is the same.
+    pub started_at: Option<u64>,
+    /// When the handle issued at start dies, or `None` if unstarted.
+    pub handle_expires_at: Option<u64>,
 }
 
 /// One user account as an operator sees it.
@@ -942,7 +1511,7 @@ impl MeshAuthority for CertAuthority {
         }
         // Read out before the record moves into the store: this is the only
         // moment the secret is available, here or anywhere else.
-        let uri = user.totp_enrolment_uri("wayfinder").unwrap_or_default();
+        let uri = user.totp_enrolment_uri(TOTP_ISSUER).unwrap_or_default();
         self.add_user(user)?;
         Ok(uri)
     }
@@ -1012,6 +1581,31 @@ impl MeshAuthority for CertAuthority {
     }
 }
 
+/// Redacted by hand: this value exists to carry a bearer token to exactly one
+/// caller, and a derived `Debug` would carry it to the log ring as well.
+impl core::fmt::Debug for MintedInvite {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MintedInvite")
+            .field("username", &self.username)
+            .field("token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// Redacted by hand: this carries both the `otpauth://` URI (and so the raw
+/// TOTP secret) and the handle that finishes the registration.
+impl core::fmt::Debug for StartedRegistration {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StartedRegistration")
+            .field("username", &self.username)
+            .field("totp_enrolment_uri", &"<redacted>")
+            .field("handle", &"<redacted>")
+            .field("handle_expires_at", &self.handle_expires_at)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1058,6 +1652,37 @@ mod tests {
     /// The current TOTP code for `secret` at the CA's clock.
     fn live_code(secret: &[u8], now: u64) -> String {
         crate::users::totp_code_for_tests(secret, now)
+    }
+
+    /// The TOTP secret an invite carries, read straight out of the store.
+    ///
+    /// A real registrant reads it out of the `otpauth://` URI in an
+    /// authenticator app; a test needs the raw bytes to compute a live code,
+    /// and reaching into the store is less machinery than a base32 decoder that
+    /// exists for tests alone.
+    fn invite_secret(ca: &CertAuthority, username: &str) -> Vec<u8> {
+        ca.log
+            .invites()
+            .iter()
+            .find(|i| i.username == username)
+            .unwrap_or_else(|| panic!("no invite on file for {username}"))
+            .totp_secret
+            .clone()
+    }
+
+    /// Mint an invite and start redeeming it, for the tests whose subject is
+    /// what happens after that.
+    fn start_registration(
+        ca: &mut CertAuthority,
+        username: &str,
+        role: UserRole,
+        ttl_secs: u64,
+    ) -> StartedRegistration {
+        let minted = ca
+            .create_user_invite(username, role, ttl_secs, 0)
+            .expect("minting an invite");
+        ca.begin_user_registration(&minted.token)
+            .expect("starting the registration")
     }
 
     /// The whole login: correct credentials yield a certificate that verifies
@@ -2074,6 +2699,42 @@ mod tests {
         }
     }
 
+    /// A token matching nothing must not cost a durable write.
+    ///
+    /// `Persisted::mutate` persists whatever its closure did — so entering it
+    /// unconditionally made every garbage token a full CA-state serialize and
+    /// atomic file write, from a caller holding no credential, on the one
+    /// request tier that admits one.
+    ///
+    /// Observed by dooming the store and reading *which* refusal comes back: a
+    /// pre-check that has been removed reaches `mutate_invites` and answers
+    /// with the persist failure, while the read-only check answers with the
+    /// invitation refusal and never touches disk.
+    #[test]
+    fn an_unknown_token_is_refused_without_touching_the_store() {
+        let path = unique_state_path("unknown-token-no-write");
+        let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+        ca.set_now_unix(100);
+        ca.create_user_invite("rowan", UserRole::Viewer, 900, 0)
+            .unwrap();
+
+        // Doom every subsequent write: the parent is now a file, so creating
+        // the temporary alongside it cannot succeed.
+        std::fs::remove_file(&path).ok();
+        std::fs::create_dir_all(&path).unwrap();
+
+        let err = ca
+            .begin_user_registration("NOTATOKEN")
+            .expect_err("an unknown token is refused");
+        assert!(
+            err.contains("this invitation is not valid"),
+            "the refusal must come from the read-only check, not from a failed \
+             write the token should never have caused: {err}"
+        );
+
+        std::fs::remove_dir_all(&path).ok();
+    }
+
     #[test]
     fn issued_certs_persist_across_a_restart() {
         let path = unique_state_path("restart");
@@ -2348,8 +3009,8 @@ mod tests {
         // must not be told an action durably succeeded when it didn't.
         let err = ca.submit_csr(&mac, &ed, &x, "").unwrap_err();
         assert!(
-            err.contains("persist"),
-            "error should mention persistence, got: {err}"
+            err.contains("could not record"),
+            "the caller must be told the write did not land, got: {err}"
         );
 
         // The in-memory mutation is rolled back to what it was before `f`
@@ -2371,8 +3032,8 @@ mod tests {
         let mac2 = [0, 0, 0, 0, 0, 10];
         let err2 = ca.submit_csr(&mac2, &ed2, &x2, "").unwrap_err();
         assert!(
-            err2.contains("persist"),
-            "error should mention persistence, got: {err2}"
+            err2.contains("could not record"),
+            "the caller must be told the write did not land, got: {err2}"
         );
         assert_eq!(
             ca.list_certs().len(),
@@ -2410,8 +3071,8 @@ mod tests {
 
         let err = ca.approve_csr(&mac).unwrap_err();
         assert!(
-            err.contains("persist"),
-            "error should mention persistence, got: {err}"
+            err.contains("could not record"),
+            "the caller must be told the write did not land, got: {err}"
         );
 
         // End-to-end confirmation that `approve_csr` never leaves an
@@ -2480,8 +3141,8 @@ mod tests {
 
         let err = ca.deny_csr(&mac).unwrap_err();
         assert!(
-            err.contains("persist"),
-            "error should mention persistence, got: {err}"
+            err.contains("could not record"),
+            "the caller must be told the write did not land, got: {err}"
         );
 
         // The status flip to Denied rolled back — the entry is still
@@ -2858,6 +3519,629 @@ mod tests {
             matches!(submit(&mut ca, ""), CsrOutcome::Pending),
             "and still governs an incoming request"
         );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The whole self-service flow, once: an admin mints an invite for a named
+    /// account, the invitee redeems it, and the account they end up with is the
+    /// one the admin decided on — with a second factor the admin never saw.
+    ///
+    /// The mint returns the token *once*; the store keeps only its hash, so
+    /// this is the single moment it is readable anywhere.
+    #[test]
+    fn an_invite_is_minted_redeemed_and_becomes_the_account_the_admin_specified() {
+        let mut ca = open_ca();
+
+        let minted = ca
+            .create_user_invite("rowan", UserRole::Admin, 900, 0)
+            .unwrap();
+        assert_eq!(minted.username, "rowan");
+        assert!(!minted.token.is_empty());
+        assert_eq!(
+            minted.expires_at,
+            100 + DEFAULT_INVITE_TTL_SECS,
+            "an unstated lifetime takes the default"
+        );
+        assert!(
+            ca.list_users().is_empty(),
+            "an invite is not an account: nothing that iterates the user store \
+             may ever see one"
+        );
+
+        let started = ca.begin_user_registration(&minted.token).unwrap();
+        assert_eq!(started.username, "rowan");
+        assert!(started.totp_enrolment_uri.starts_with("otpauth://totp/"));
+        assert_eq!(
+            started.handle_expires_at,
+            100 + REGISTRATION_HANDLE_TTL_SECS
+        );
+
+        let secret = invite_secret(&ca, "rowan");
+        ca.complete_user_registration(
+            &started.handle,
+            "correct horse battery staple",
+            &live_code(&secret, 100),
+        )
+        .unwrap();
+
+        let users = ca.list_users();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].username, "rowan");
+        assert_eq!(
+            users[0].role,
+            UserRole::Admin,
+            "the role is the admin's decision at mint, never the redeemer's"
+        );
+        assert_eq!(users[0].session_ttl_secs, 900);
+        assert!(users[0].totp_enrolled);
+        assert!(
+            ca.list_user_invites().is_empty(),
+            "completion deletes the invite"
+        );
+    }
+
+    /// The account the flow produces actually works: the credentials chosen at
+    /// registration sign in and mint a session certificate.
+    ///
+    /// Proving enrolment before the account exists is the property `user add`
+    /// does not have — there, a URI is printed and nobody checks it was ever
+    /// scanned.
+    #[test]
+    fn the_registered_account_can_sign_in() {
+        let mut ca = open_ca();
+        let (ed, x) = node_keys(2);
+        let started = start_registration(&mut ca, "rowan", UserRole::Viewer, 900);
+        let secret = invite_secret(&ca, "rowan");
+        ca.complete_user_registration(&started.handle, "hunter2", &live_code(&secret, 100))
+            .unwrap();
+
+        // A step on, so the code accepted at completion is not the one offered
+        // here — see `the_code_accepted_at_registration_is_refused_at_the_next_sign_in`.
+        let later = 130;
+        ca.set_now_unix(later);
+        let outcome = ca
+            .authenticate_user("rowan", "hunter2", &live_code(&secret, later), &ed, &x)
+            .unwrap();
+
+        assert!(
+            matches!(outcome, UserAuthOutcome::Issued(_)),
+            "the account registered by its own owner must be an ordinary account"
+        );
+    }
+
+    /// **The design's load-bearing interlock.** Starting a registration
+    /// consumes the token, so a second start with the same token is refused.
+    ///
+    /// A non-consuming start would let anyone who read the URL out of a chat
+    /// log take the account's second factor while the legitimate registration
+    /// completed normally afterwards, recording nothing anywhere. Consuming it
+    /// converts a silent disclosure into a burnt invite and a failed
+    /// registration the invitee reports.
+    #[test]
+    fn a_started_invite_refuses_a_second_begin() {
+        let mut ca = open_ca();
+        let minted = ca
+            .create_user_invite("rowan", UserRole::Viewer, 900, 0)
+            .unwrap();
+
+        ca.begin_user_registration(&minted.token)
+            .expect("the first start is served");
+
+        assert!(
+            ca.begin_user_registration(&minted.token).is_err(),
+            "the token is spent: a second start must not reveal the secret again"
+        );
+    }
+
+    /// And once the account exists, the token is not merely spent but unknown —
+    /// the invite is gone, so a replayed redemption has nothing to match.
+    #[test]
+    fn a_consumed_token_is_unknown_on_replay() {
+        let mut ca = open_ca();
+        let minted = ca
+            .create_user_invite("rowan", UserRole::Viewer, 900, 0)
+            .unwrap();
+        let started = ca.begin_user_registration(&minted.token).unwrap();
+        let secret = invite_secret(&ca, "rowan");
+        ca.complete_user_registration(&started.handle, "hunter2", &live_code(&secret, 100))
+            .unwrap();
+
+        assert!(ca.begin_user_registration(&minted.token).is_err());
+        assert!(
+            ca.complete_user_registration(&started.handle, "other", &live_code(&secret, 160))
+                .is_err(),
+            "the handle is single-use too"
+        );
+        assert_eq!(ca.list_users().len(), 1, "and no second account appeared");
+    }
+
+    /// The state an admin actually reads: started, and not completed.
+    ///
+    /// It means somebody took the second factor and did not finish — either an
+    /// abandoned registration or a disclosure, and either way the response is
+    /// the same: revoke and re-mint. Everything else in the listing is context
+    /// for that one field.
+    #[test]
+    fn a_started_but_unfinished_invite_is_visible_to_the_admin() {
+        let mut ca = open_ca();
+        ca.create_user_invite("rowan", UserRole::Admin, 900, 0)
+            .unwrap();
+        ca.create_user_invite("wren", UserRole::Viewer, 900, 0)
+            .unwrap();
+        let taken = ca
+            .create_user_invite("linnet", UserRole::Viewer, 900, 0)
+            .unwrap();
+        ca.begin_user_registration(&taken.token).unwrap();
+
+        let listed = ca.list_user_invites();
+
+        let linnet = listed
+            .iter()
+            .find(|i| i.username == "linnet")
+            .expect("the started invite is still listed");
+        assert_eq!(
+            linnet.started_at,
+            Some(100),
+            "the moment the secret was revealed is the answer an admin needs"
+        );
+        assert_eq!(
+            linnet.handle_expires_at,
+            Some(100 + REGISTRATION_HANDLE_TTL_SECS)
+        );
+        assert!(
+            listed
+                .iter()
+                .filter(|i| i.username != "linnet")
+                .all(|i| i.started_at.is_none()),
+            "an untouched invite must not report a start it never had"
+        );
+        // Asserted against the secrets' own renderings, not against the word
+        // "secret": `InviteSummary` has no field that could ever contain that
+        // substring, so the old check passed by construction and would have
+        // gone on passing if the type grew a `totp: Vec<u8>`.
+        let rendered = alloc::format!("{listed:?}");
+        assert!(
+            !rendered.contains(&taken.token),
+            "the listing must not carry the invitation token: {rendered}"
+        );
+        let secret = crate::users::base32_encode(&invite_secret(&ca, "linnet"));
+        assert!(
+            !rendered.contains(&secret),
+            "nor the second factor, which is the thing this design exists to \
+             keep out of an admin's hands: {rendered}"
+        );
+    }
+
+    /// A wrong code creates nothing — and does not spend the handle either, so
+    /// somebody who mistyped can simply try again.
+    ///
+    /// Not spending it is safe rather than lax: whoever holds the handle was
+    /// handed the TOTP secret by the same call, so they can compute a correct
+    /// code at will. Guessing buys an attacker nothing that holding the handle
+    /// did not already give them, while burning the handle on a typo would
+    /// strand a legitimate registration.
+    #[test]
+    fn a_wrong_totp_code_at_completion_creates_no_account() {
+        let mut ca = open_ca();
+        let started = start_registration(&mut ca, "rowan", UserRole::Admin, 900);
+
+        assert!(
+            ca.complete_user_registration(&started.handle, "hunter2", "000000")
+                .is_err(),
+            "an unproven second factor must not become an account"
+        );
+        assert!(ca.list_users().is_empty());
+
+        let secret = invite_secret(&ca, "rowan");
+        ca.complete_user_registration(&started.handle, "hunter2", &live_code(&secret, 100))
+            .expect("a mistyped code must not cost the registration");
+        assert_eq!(ca.list_users().len(), 1);
+    }
+
+    /// An empty password is refused where the account is built, not only by
+    /// whichever front end happened to ask for it.
+    ///
+    /// `CompleteUserRegistration` is on the **enrollment tier** — a wire client
+    /// holding an invite handle and no credential at all reaches it directly.
+    /// The `is_empty` checks in `wayfinder-web`'s `api.rs` and `wayfinderctl`
+    /// are the two front ends being polite; neither is the trust boundary, and
+    /// an account whose only knowledge factor is `""` is one whose second
+    /// factor was already handed to whoever is asking.
+    #[test]
+    fn an_empty_password_is_refused_at_completion() {
+        let mut ca = open_ca();
+        let started = start_registration(&mut ca, "rowan", UserRole::Admin, 900);
+        let secret = invite_secret(&ca, "rowan");
+
+        assert!(
+            ca.complete_user_registration(&started.handle, "", &live_code(&secret, 100))
+                .is_err(),
+            "an account must not be created with no password"
+        );
+        assert!(
+            ca.list_users().is_empty(),
+            "and nothing is left behind by the refusal"
+        );
+
+        // The handle survives, for the same reason a mistyped code does not
+        // spend it: the person can fix this and try again.
+        ca.complete_user_registration(&started.handle, "hunter2", &live_code(&secret, 100))
+            .expect("a refused password must not cost the registration");
+        assert_eq!(ca.list_users().len(), 1);
+    }
+
+    /// An over-long invitation lifetime is refused at mint, the way an
+    /// over-long session lifetime three lines above it already is.
+    ///
+    /// `DEFAULT_INVITE_TTL_SECS`' own doc calls itself "the bound on how long a
+    /// bearer token sitting in somebody's chat history is worth anything" — a
+    /// bound that only applied when the admin said nothing. Refused rather than
+    /// clamped, matching `check_cert_ttl`: the admin is standing in front of
+    /// the error and can fix it.
+    #[test]
+    fn an_over_long_invite_lifetime_is_refused_at_mint() {
+        let mut ca = open_ca();
+
+        assert!(
+            ca.create_user_invite("rowan", UserRole::Viewer, 900, MAX_INVITE_TTL_SECS + 1)
+                .is_err(),
+            "a ten-year bearer token is not an invitation"
+        );
+        assert!(
+            ca.list_user_invites().is_empty(),
+            "and the refusal reserves no name"
+        );
+
+        ca.create_user_invite("rowan", UserRole::Viewer, 900, MAX_INVITE_TTL_SECS)
+            .expect("the cap itself is allowed");
+    }
+
+    /// An invite past its expiry is refused at the start, and one whose handle
+    /// has expired is refused at the finish. Both leave nothing behind.
+    #[test]
+    fn an_expired_invite_and_an_expired_handle_are_each_refused() {
+        let mut ca = open_ca();
+        let stale = ca
+            .create_user_invite("rowan", UserRole::Viewer, 900, 60)
+            .unwrap();
+        ca.set_now_unix(100 + 61);
+        assert!(
+            ca.begin_user_registration(&stale.token).is_err(),
+            "an expired invite is not redeemable"
+        );
+
+        ca.set_now_unix(200);
+        let started = start_registration(&mut ca, "wren", UserRole::Viewer, 900);
+        let secret = invite_secret(&ca, "wren");
+        ca.set_now_unix(200 + REGISTRATION_HANDLE_TTL_SECS + 1);
+        assert!(
+            ca.complete_user_registration(
+                &started.handle,
+                "hunter2",
+                &live_code(&secret, 200 + REGISTRATION_HANDLE_TTL_SECS + 1)
+            )
+            .is_err(),
+            "a handle past its window is dead, and the invite with it"
+        );
+        assert!(ca.list_users().is_empty());
+    }
+
+    /// An unknown handle costs no password hashing.
+    ///
+    /// The opposite of `spend_absent_user_work`'s rule, and deliberately so:
+    /// that exists because usernames are low-entropy and guessable, so timing
+    /// would enumerate accounts. A handle is 256 bits from `OsRng` and is not
+    /// enumerable on any timescale, so there is no oracle left for timing to
+    /// leak — while spending `ARGON2_MEMORY_KIB` per bad handle would hand any
+    /// anonymous party a denial-of-service amplifier against the authority.
+    ///
+    /// Measured as a ratio rather than an absolute, so it is the *presence* of
+    /// a memory-hard hash being asserted, not a wall-clock budget.
+    #[test]
+    fn an_unknown_handle_is_refused_without_spending_argon2id() {
+        let mut ca = open_ca();
+
+        let one_hash = std::time::Instant::now();
+        UserRecord::new("cost", "hunter2", UserRole::Viewer, 900).unwrap();
+        let one_hash = one_hash.elapsed();
+
+        let refusals = std::time::Instant::now();
+        for n in 0..20 {
+            assert!(
+                ca.complete_user_registration(
+                    &alloc::format!("no-such-handle-{n}"),
+                    "guess",
+                    "000000"
+                )
+                .is_err()
+            );
+        }
+        let refusals = refusals.elapsed();
+
+        assert!(
+            refusals < one_hash,
+            "twenty unknown handles took {refusals:?}, which is not less than the \
+             {one_hash:?} a single Argon2id costs — the refusal is hashing when it \
+             must not"
+        );
+    }
+
+    /// A name is reserved from the moment it is invited, in both directions.
+    ///
+    /// Without this an admin creating an account directly would silently strand
+    /// the pending invite until it expired, and the invitee's registration
+    /// would fail with nothing to point at.
+    #[test]
+    fn a_name_is_reserved_by_its_invite_against_every_other_path() {
+        let mut ca = open_ca();
+        ca.create_user_invite("rowan", UserRole::Viewer, 900, 0)
+            .unwrap();
+
+        assert!(
+            ca.add_user(UserRecord::new("rowan", "hunter2", UserRole::Viewer, 900).unwrap())
+                .is_err(),
+            "the offline path must see the reservation too"
+        );
+        assert!(
+            MeshAuthority::create_user(&mut ca, "rowan", "hunter2", false, 900, false).is_err(),
+            "and so must the management API"
+        );
+        assert!(
+            ca.create_user_invite("rowan", UserRole::Admin, 900, 0)
+                .is_err(),
+            "a second invite for the same name would strand the first"
+        );
+    }
+
+    /// And the reservation runs the other way: a name with an account cannot be
+    /// invited, because completion would have nowhere to put the result.
+    #[test]
+    fn minting_refuses_a_name_that_already_has_an_account() {
+        let (mut ca, _secret) = ca_with_user(UserRole::Admin, 900);
+
+        assert!(
+            ca.create_user_invite("ops", UserRole::Viewer, 900, 0)
+                .is_err()
+        );
+    }
+
+    /// Removing an account frees its name for a fresh invite.
+    ///
+    /// The two stores are reserved against each other in both directions, so
+    /// "remove the account, then invite the name again" is the whole lifecycle
+    /// — there is no third state where an account and an invite for one name
+    /// coexist and have to be reconciled.
+    #[test]
+    fn removing_an_account_frees_its_name_to_be_invited_again() {
+        let (mut ca, _secret) = ca_with_user(UserRole::Admin, 900);
+        assert!(
+            ca.create_user_invite("ops", UserRole::Viewer, 900, 0)
+                .is_err()
+        );
+
+        ca.remove_user("ops").unwrap();
+
+        assert!(
+            ca.create_user_invite("ops", UserRole::Viewer, 900, 0)
+                .is_ok()
+        );
+    }
+
+    /// Revocation works at any status, and the started case is the one it
+    /// exists for: a start the admin did not expect is the signal that the
+    /// token leaked, and revoke-and-re-mint is the response.
+    #[test]
+    fn revoking_an_invite_deletes_it_at_any_status() {
+        let mut ca = open_ca();
+        let pending = ca
+            .create_user_invite("rowan", UserRole::Viewer, 900, 0)
+            .unwrap();
+        let taken = ca
+            .create_user_invite("wren", UserRole::Viewer, 900, 0)
+            .unwrap();
+        let started = ca.begin_user_registration(&taken.token).unwrap();
+
+        ca.revoke_user_invite("rowan").unwrap();
+        ca.revoke_user_invite("wren").unwrap();
+
+        assert!(ca.list_user_invites().is_empty());
+        assert!(ca.begin_user_registration(&pending.token).is_err());
+        assert!(
+            ca.complete_user_registration(&started.handle, "hunter2", "000000")
+                .is_err(),
+            "a revoked invite's registration cannot be finished"
+        );
+        assert!(
+            ca.revoke_user_invite("rowan").is_err(),
+            "a name with no invite on file is an error, not a silent success"
+        );
+    }
+
+    /// A persisted store that grows without bound leaves the growth behind
+    /// across a restart. Unlike held CSRs only a full grant can add one, so the
+    /// cap guards against operator error rather than a remote party — but it is
+    /// still a cap, and it refuses rather than evicting an incumbent.
+    #[test]
+    fn a_full_invite_store_refuses_a_new_mint_rather_than_evicting() {
+        let mut ca = open_ca();
+        for n in 0..MAX_PENDING_INVITES {
+            ca.create_user_invite(&alloc::format!("user{n}"), UserRole::Viewer, 900, 0)
+                .unwrap_or_else(|e| panic!("minting invite {n} of {MAX_PENDING_INVITES}: {e}"));
+        }
+
+        assert!(
+            ca.create_user_invite("overflow", UserRole::Viewer, 900, 0)
+                .is_err()
+        );
+        assert_eq!(
+            ca.list_user_invites().len(),
+            MAX_PENDING_INVITES,
+            "no incumbent evicted"
+        );
+    }
+
+    /// An expired invite is swept lazily, the way a stale held CSR is, so a
+    /// store nobody tends does not fill with records that can never be
+    /// redeemed.
+    #[test]
+    fn an_expired_invite_is_evicted_lazily() {
+        let mut ca = open_ca();
+        ca.create_user_invite("rowan", UserRole::Viewer, 900, 60)
+            .unwrap();
+        assert_eq!(ca.list_user_invites().len(), 1);
+
+        ca.set_now_unix(100 + 61);
+        ca.create_user_invite("wren", UserRole::Viewer, 900, 0)
+            .unwrap();
+
+        let listed = ca.list_user_invites();
+        assert_eq!(listed.len(), 1, "the expired invite is gone");
+        assert_eq!(listed[0].username, "wren");
+    }
+
+    /// A started registration whose handle window closed frees its name.
+    ///
+    /// The `Started` arm of the sweep is the one that matters and the one a
+    /// test can miss: the refusal a caller sees on an expired handle comes from
+    /// `handle_matches`' own clock check, so changing that arm to
+    /// `!i.is_expired(now)` leaves every other test green while the record sits
+    /// there holding its name reserved for the rest of the invitation's life —
+    /// against the re-mint that is the documented response to a disclosure.
+    #[test]
+    fn a_started_registration_past_its_handle_window_frees_its_name() {
+        let mut ca = open_ca();
+        start_registration(&mut ca, "rowan", UserRole::Admin, 900);
+        assert_eq!(ca.list_user_invites().len(), 1);
+
+        ca.set_now_unix(100 + REGISTRATION_HANDLE_TTL_SECS + 1);
+        assert!(
+            ca.list_user_invites().is_empty(),
+            "a registration nobody can finish is not an invitation"
+        );
+
+        ca.create_user_invite("rowan", UserRole::Admin, 900, 0)
+            .expect("re-minting for the same name is the documented response");
+    }
+
+    /// A store full of dead invitations still admits a new mint.
+    ///
+    /// `create_user_invite` sweeps *before* it checks capacity, and that
+    /// ordering is the whole behaviour: reverse the two lines and an operator
+    /// whose store is full of yesterday's expired invitations is refused every
+    /// mint until something else happens to sweep — with every other test still
+    /// green, because they fill the store with live invitations only.
+    #[test]
+    fn a_store_full_of_expired_invites_still_admits_a_mint() {
+        let mut ca = open_ca();
+        for n in 0..MAX_PENDING_INVITES {
+            ca.create_user_invite(&alloc::format!("user{n}"), UserRole::Viewer, 900, 60)
+                .unwrap_or_else(|e| panic!("minting invite {n}: {e}"));
+        }
+
+        ca.set_now_unix(100 + 61);
+        ca.create_user_invite("wren", UserRole::Viewer, 900, 0)
+            .expect("a full store of dead invitations is not a full store");
+        assert_eq!(
+            ca.list_user_invites().len(),
+            1,
+            "and the dead ones went with the sweep"
+        );
+    }
+
+    /// Role and lifetime are frozen at mint but applied up to a week later, so
+    /// completion re-checks the lifetime against the cap in force *then*.
+    ///
+    /// The reachable version of that: an invite minted while the operator had
+    /// taken `allow_unbounded_cert_ttl`, redeemed after they gave it back. The
+    /// value passed at mint and the rule applied at completion genuinely differ.
+    ///
+    /// Completion **clamps** where mint **refuses**, which looks inconsistent
+    /// and is not. The admin can fix an over-long lifetime and is standing
+    /// there at mint, so a refusal reaches somebody who can act on it. The
+    /// registrant can fix nothing, so refusing them would burn their invite for
+    /// a policy decision they had no part in.
+    #[test]
+    fn completion_clamps_a_lifetime_the_policy_no_longer_allows() {
+        let path = unique_state_path("invite-ttl-clamp");
+        let overlong = MAX_CERT_TTL_SECS + 86_400;
+
+        let (handle, secret) = {
+            let cfg = ProviderConfig {
+                allow_unbounded_cert_ttl: true,
+                ..persisted_cfg(&path)
+            };
+            let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+            ca.set_now_unix(100);
+            let minted = ca
+                .create_user_invite("rowan", UserRole::Viewer, overlong, 0)
+                .expect("the escape hatch admits it at mint");
+            let started = ca.begin_user_registration(&minted.token).unwrap();
+            (started.handle, invite_secret(&ca, "rowan"))
+        };
+
+        // Restarted with the escape hatch given back.
+        let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+        ca.set_now_unix(100);
+        ca.complete_user_registration(&handle, "hunter2", &live_code(&secret, 100))
+            .expect("a policy that moved must not burn the invitee's registration");
+
+        assert_eq!(
+            ca.list_users()[0].session_ttl_secs,
+            MAX_CERT_TTL_SECS,
+            "the created account's lifetime is clamped to the cap now in force, \
+             not the one the invite was minted under"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Fail-closed before the clock is set, the same rule `submit_csr` and
+    /// `authenticate_user` apply: without a clock this would mint an invite
+    /// whose window starts at the epoch and is already over.
+    #[test]
+    fn invites_are_refused_before_the_clock_is_set() {
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, true);
+
+        assert!(
+            ca.create_user_invite("rowan", UserRole::Viewer, 900, 0)
+                .is_err()
+        );
+        assert!(ca.begin_user_registration("anything").is_err());
+        assert!(
+            ca.complete_user_registration("anything", "hunter2", "000000")
+                .is_err()
+        );
+    }
+
+    /// An invite is durable state: a provider restarted mid-registration must
+    /// still honour the handle it issued, or every restart silently burns every
+    /// registration in flight.
+    #[test]
+    fn a_started_invite_survives_a_restart() {
+        let path = unique_state_path("invite-restart");
+        let cfg = persisted_cfg(&path);
+
+        let (handle, secret) = {
+            let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+            ca.set_now_unix(100);
+            let minted = ca
+                .create_user_invite("rowan", UserRole::Admin, 900, 0)
+                .unwrap();
+            let started = ca.begin_user_registration(&minted.token).unwrap();
+            (started.handle, invite_secret(&ca, "rowan"))
+        };
+
+        let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+        ca.set_now_unix(130);
+        let listed = ca.list_user_invites();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].started_at, Some(100));
+
+        ca.complete_user_registration(&handle, "hunter2", &live_code(&secret, 130))
+            .expect("the handle issued before the restart still completes");
+        assert_eq!(ca.list_users().len(), 1);
+        assert!(ca.list_user_invites().is_empty());
 
         std::fs::remove_file(&path).ok();
     }

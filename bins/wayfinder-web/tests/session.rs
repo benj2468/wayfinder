@@ -32,6 +32,9 @@ use axum::http::header::SET_COOKIE;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 use wayfinder_protos::wayfinder::v1alpha::UserAccount;
+use wayfinder_web::invite::InviteListing;
+use wayfinder_web::invite::InviteMinted;
+use wayfinder_web::invite::RegistrationStart;
 use wayfinder_web::mock::MOCK_ADMIN_USER;
 use wayfinder_web::mock::MOCK_PASSWORD;
 use wayfinder_web::mock::MOCK_VIEWER_USER;
@@ -948,4 +951,290 @@ fn urlencoded(text: &str) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect()
+}
+
+/// The whole self-service registration, over HTTP: an administrator invites,
+/// somebody with no session at all redeems, and the account exists.
+///
+/// The step that cannot be proved anywhere else is the middle one. Every other
+/// provider call in this crate goes through `connection()`, which resolves the
+/// caller's own session; the two redemption calls deliberately do not, because
+/// whoever is registering has neither a session nor an account. A wiring
+/// mistake there — reaching for the session's connection out of habit — would
+/// make the feature reachable only by people who already have what it creates,
+/// and would pass every other test here.
+#[tokio::test]
+async fn an_invitation_is_minted_by_an_admin_and_redeemed_with_no_session() {
+    let app = common::login_router().await;
+    let admin = sign_in(&app, MOCK_ADMIN_USER).await;
+
+    let minted: InviteMinted = json(
+        call(
+            &app,
+            "create_user_invite",
+            "username=rowan&admin=false&session_ttl_secs=0&invite_ttl_secs=0",
+            Some(&admin),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(minted.username, "rowan");
+    assert!(!minted.token.is_empty(), "the token is returned once");
+    assert!(
+        !minted.token.contains("otpauth"),
+        "and the operator is handed no second factor: {minted:?}"
+    );
+
+    // No cookie: this is the whole point.
+    let started: RegistrationStart = json(
+        call(
+            &app,
+            "begin_registration",
+            &format!("token={}", urlencoded(&minted.token)),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(started.username, "rowan");
+    assert!(
+        started.totp_enrolment_uri.starts_with("otpauth://totp/"),
+        "the person redeeming it is the first party to see the second factor"
+    );
+    assert!(!started.handle.is_empty());
+
+    let secret = secret_from_uri(&started.totp_enrolment_uri);
+    let body = format!(
+        "handle={}&password={}&totp_code={}",
+        urlencoded(&started.handle),
+        urlencoded("correct horse battery staple"),
+        totp_code_now(&secret),
+    );
+    let response = call(&app, "complete_registration", &body, None).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "completion is refused: {}",
+        String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+    );
+
+    // The account exists, with the role the administrator chose and the second
+    // factor the registrant enrolled.
+    let users: Vec<UserAccount> = json(call(&app, "list_users", "", Some(&admin)).await).await;
+    let created = users
+        .iter()
+        .find(|u| u.username == "rowan")
+        .expect("the registered account is in the roster");
+    assert!(
+        !created.admin,
+        "the role is the admin's decision, not the redeemer's"
+    );
+    assert!(
+        created.totp_enrolled,
+        "a second factor is mandatory on this path"
+    );
+
+    // Completing deletes the invitation, so nothing is left to redeem.
+    let listing: InviteListing =
+        json(call(&app, "list_user_invites", "", Some(&admin)).await).await;
+    assert!(
+        listing.invites.is_empty(),
+        "a redeemed invitation is deleted: {listing:?}"
+    );
+    assert!(listing.capacity > 0, "the cap travels with the listing");
+
+    let replayed = call(
+        &app,
+        "begin_registration",
+        &format!("token={}", urlencoded(&minted.token)),
+        None,
+    )
+    .await;
+    assert_ne!(
+        replayed.status(),
+        StatusCode::OK,
+        "a spent token must not start a second registration"
+    );
+}
+
+/// Starting a registration **spends** the invitation, and the administrator can
+/// see that it was started.
+///
+/// The design's whole promise rests on this pair. Nobody is prevented from
+/// redeeming an invitation they were only meant to deliver — what is guaranteed
+/// is that doing so costs the invitation, so the intended registration fails
+/// and the operator's own listing shows a start they did not expect.
+#[tokio::test]
+async fn a_started_invitation_is_spent_and_visible_to_the_administrator() {
+    let app = common::login_router().await;
+    let admin = sign_in(&app, MOCK_ADMIN_USER).await;
+
+    let minted: InviteMinted = json(
+        call(
+            &app,
+            "create_user_invite",
+            "username=wren&admin=true&session_ttl_secs=0&invite_ttl_secs=0",
+            Some(&admin),
+        )
+        .await,
+    )
+    .await;
+
+    let listing: InviteListing =
+        json(call(&app, "list_user_invites", "", Some(&admin)).await).await;
+    assert_eq!(listing.invites.len(), 1);
+    assert!(
+        listing.invites[0].started_unix.is_none(),
+        "an untouched invitation reports no start it never had"
+    );
+
+    let token = format!("token={}", urlencoded(&minted.token));
+    let first = call(&app, "begin_registration", &token, None).await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = call(&app, "begin_registration", &token, None).await;
+    assert_ne!(
+        second.status(),
+        StatusCode::OK,
+        "the token is spent: a second start must not reveal the secret again"
+    );
+
+    let listing: InviteListing =
+        json(call(&app, "list_user_invites", "", Some(&admin)).await).await;
+    let row = &listing.invites[0];
+    assert!(
+        row.started_unix.is_some(),
+        "started-and-unfinished is the signal an operator acts on: {row:?}"
+    );
+    assert!(row.admin, "and the listing still says what it would create");
+
+    // The response: revoke, and invite again.
+    let revoked = call(&app, "revoke_user_invite", "username=wren", Some(&admin)).await;
+    assert_eq!(revoked.status(), StatusCode::OK);
+    let listing: InviteListing =
+        json(call(&app, "list_user_invites", "", Some(&admin)).await).await;
+    assert!(listing.invites.is_empty());
+}
+
+/// A read-only session may not mint, list or revoke an invitation.
+///
+/// Refused by the node's `permits` allowlist rather than by anything in this
+/// crate — which is why it is worth asserting from this end: the dashboard
+/// hides the panel from a viewer, and what actually stops them is the node.
+#[tokio::test]
+async fn a_viewer_session_cannot_touch_invitations() {
+    let app = common::login_router().await;
+    let viewer = sign_in(&app, MOCK_VIEWER_USER).await;
+
+    for (endpoint, body) in [
+        (
+            "create_user_invite",
+            "username=rowan&admin=true&session_ttl_secs=0&invite_ttl_secs=0",
+        ),
+        ("list_user_invites", ""),
+        ("revoke_user_invite", "username=rowan"),
+    ] {
+        let response = call(&app, endpoint, body, Some(&viewer)).await;
+        assert_ne!(
+            response.status(),
+            StatusCode::OK,
+            "a read-only session reached {endpoint}"
+        );
+    }
+}
+
+/// The registration page renders without the sign-in form over it.
+///
+/// The failure this catches is silent and total. That overlay is gated on
+/// `Viewer::LoggedOut`, which is exactly what somebody arriving from an
+/// invitation link is — so a registration page inside the dashboard shell would
+/// render perfectly, underneath a sign-in form, for precisely the audience it
+/// exists for. Nothing about it would look broken.
+#[tokio::test]
+async fn the_registration_page_is_not_covered_by_the_sign_in_form() {
+    let app = common::login_router().await;
+
+    let body = String::from_utf8(
+        get(&app, "/register", None)
+            .await
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+
+    assert!(
+        body.contains("wf-register-page"),
+        "the registration page is what /register renders: {body}"
+    );
+    assert!(
+        !body.contains("wf-login-alt"),
+        "and the sign-in form is not rendered over it"
+    );
+    // The chrome is absent too: a person creating an account is not a viewer,
+    // and a dashboard's tab bar tells them nothing about what they are doing.
+    assert!(
+        !body.contains("wf-tabs"),
+        "no dashboard navigation on the registration page: {body}"
+    );
+    // The server has seen no token and rendered no form that claims otherwise:
+    // the token is in the fragment, which never reaches it.
+    assert!(
+        !body.contains("otpauth://"),
+        "the server-rendered page carries no secret"
+    );
+}
+
+/// The 20-byte TOTP secret an `otpauth://` URI carries, so a test can present a
+/// live code the way an authenticator app would.
+fn secret_from_uri(uri: &str) -> Vec<u8> {
+    let encoded = uri
+        .split_once("secret=")
+        .and_then(|(_, rest)| rest.split('&').next())
+        .expect("the enrolment URI carries a secret");
+    let mut out = Vec::new();
+    let mut buffer: u16 = 0;
+    let mut bits: u32 = 0;
+    for c in encoded.bytes() {
+        let value = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'2'..=b'7' => c - b'2' + 26,
+            other => panic!("not base32: {other}"),
+        };
+        buffer = (buffer << 5) | u16::from(value);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    out
+}
+
+/// The RFC 6238 code an authenticator would show for `secret` right now.
+///
+/// The mock authority's clock is taken from the wall clock when it is built, a
+/// moment before this runs, so the step computed here is the authority's own or
+/// one past it — and `verify_totp` accepts either.
+fn totp_code_now(secret: &[u8]) -> String {
+    use hmac::Mac as _;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(secret).unwrap();
+    mac.update(&(now / 30).to_be_bytes());
+    let digest = mac.finalize().into_bytes();
+    let offset = (digest[digest.len() - 1] & 0x0f) as usize;
+    let binary = u32::from_be_bytes([
+        digest[offset] & 0x7f,
+        digest[offset + 1],
+        digest[offset + 2],
+        digest[offset + 3],
+    ]);
+    format!("{:06}", binary % 1_000_000)
 }

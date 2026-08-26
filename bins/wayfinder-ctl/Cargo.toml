@@ -38,3 +38,10 @@ rpassword.workspace = true
 [dev-dependencies]
 tempfile = "3"
 wayfinder-auth = { workspace = true, features = ["std"] }
+# So a test can present a live TOTP code the way an authenticator app would,
+# against a secret it read out of an `otpauth://` URI. The authority's own
+# generator is private to `wayfinder-server`, and widening it for a test in
+# another crate would put a code *generator* on a type whose whole job is to
+# verify one.
+hmac.workspace = true
+sha1.workspace = true
