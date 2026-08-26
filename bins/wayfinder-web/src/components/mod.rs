@@ -22,6 +22,7 @@ pub mod logs;
 pub mod metrics;
 pub mod overview;
 pub mod provider;
+pub mod register;
 pub mod routing;
 pub mod security;
 pub mod widgets;

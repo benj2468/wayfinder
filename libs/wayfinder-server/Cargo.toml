@@ -28,6 +28,7 @@ std = [
     "dep:wayfinder-storage",
     "wayfinder-storage/std",
     "dep:argon2",
+    "dep:blake2",
     "dep:hmac",
     "dep:sha1",
     "dep:subtle",
@@ -93,6 +94,12 @@ serde_json = { workspace = true, optional = true }
 # An embedded node links none of this — it never learns what a password is (see
 # §4 of docs/design/06-management-api-authentication.md).
 argon2 = { workspace = true, optional = true }
+# Hashing for the invite token and the registration handle (`users.rs`). Taken
+# directly rather than through `wayfinder-auth`, which happens to pull the same
+# crate in: this crate owns its own domain-separation label, and a hash function
+# reached through somebody else's dependency graph is one an unrelated change
+# can take away.
+blake2 = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 sha1 = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }

@@ -34,6 +34,7 @@ use wayfinder_auth::CERT_FLAG_ADMIN;
 use wayfinder_auth::CERT_FLAG_USER;
 use wayfinder_auth::CERT_FLAG_VIEWER;
 
+use crate::users::UserInvite;
 use crate::users::UserRecord;
 
 /// Largest encoded CA-state snapshot [`CaLog::load`] will read. `FileStore`
@@ -50,7 +51,7 @@ const MAX_STATE_BYTES: usize = 1024 * 1024;
 /// Current on-disk schema version. Bump this — and add an ordered migration
 /// from the prior version into [`parse_state`] — whenever [`CaState`]'s shape
 /// changes.
-pub(crate) const CURRENT_STATE_VERSION: u32 = 5;
+pub(crate) const CURRENT_STATE_VERSION: u32 = 6;
 
 /// Permission bits the CA state file is written with.
 ///
@@ -175,6 +176,15 @@ struct CaState {
     /// version-4 provider had — no accounts, and so no way to log in.
     #[serde(default)]
     users: Vec<UserRecord>,
+    /// Pending invitations to register an account. Added in version 6; a
+    /// version-5 snapshot migrates forward with none.
+    ///
+    /// A collection of its own beside [`users`](Self::users), never a flag on a
+    /// `UserRecord`: no code path that iterates accounts can then authenticate
+    /// a half-built one, and that guarantee does not depend on every future
+    /// reader remembering to check a field.
+    #[serde(default)]
+    invites: Vec<UserInvite>,
 }
 
 /// The runtime enrollment-policy overrides an operator has applied, as stored.
@@ -322,13 +332,40 @@ struct CaStateV4 {
 /// an offline, deliberate act (`wayfinderctl user add`), exactly as
 /// bootstrapping the root key is; inventing one here would be inventing a
 /// credential nobody chose.
-fn migrate_v4_to_v5(v4: CaStateV4) -> CaState {
-    CaState {
-        version: 5,
+fn migrate_v4_to_v5(v4: CaStateV4) -> CaStateV5 {
+    CaStateV5 {
         issued: v4.issued,
         held: v4.held,
         policy: v4.policy,
         users: Vec::new(),
+    }
+}
+
+/// Version 5 of the on-disk schema: as version 6, but with no `invites`
+/// section — the certificate authority had no invite store until version 6.
+/// Kept so [`parse_state`] can migrate a version-5 snapshot.
+#[derive(Deserialize)]
+struct CaStateV5 {
+    issued: Vec<IssuedRecord>,
+    held: Vec<HeldCsr>,
+    #[serde(default)]
+    policy: PolicyOverrides,
+    #[serde(default)]
+    users: Vec<UserRecord>,
+}
+
+/// Migrate a version-5 snapshot forward: no invites were recorded, so there are
+/// none — a faithful description of a provider that had no invite store at all,
+/// not a loss of state. An invite is a bearer credential with an expiry, so
+/// there is nothing here that could be reconstructed even in principle.
+fn migrate_v5_to_v6(v5: CaStateV5) -> CaState {
+    CaState {
+        version: 6,
+        issued: v5.issued,
+        held: v5.held,
+        policy: v5.policy,
+        users: v5.users,
+        invites: Vec::new(),
     }
 }
 
@@ -366,21 +403,27 @@ fn parse_state(bytes: &[u8], path: Option<&Path>) -> Result<CaState, String> {
     match probe.version {
         1 => {
             let v1: CaStateV1 = serde_json::from_slice(bytes).map_err(corrupt)?;
-            Ok(migrate_v4_to_v5(migrate_v3_to_v4(migrate_v2_to_v3(
-                migrate_v1_to_v2(v1),
+            Ok(migrate_v5_to_v6(migrate_v4_to_v5(migrate_v3_to_v4(
+                migrate_v2_to_v3(migrate_v1_to_v2(v1)),
             ))))
         }
         2 => {
             let v2: CaStateV2 = serde_json::from_slice(bytes).map_err(corrupt)?;
-            Ok(migrate_v4_to_v5(migrate_v3_to_v4(migrate_v2_to_v3(v2))))
+            Ok(migrate_v5_to_v6(migrate_v4_to_v5(migrate_v3_to_v4(
+                migrate_v2_to_v3(v2),
+            ))))
         }
         3 => {
             let v3: CaStateV3 = serde_json::from_slice(bytes).map_err(corrupt)?;
-            Ok(migrate_v4_to_v5(migrate_v3_to_v4(v3)))
+            Ok(migrate_v5_to_v6(migrate_v4_to_v5(migrate_v3_to_v4(v3))))
         }
         4 => {
             let v4: CaStateV4 = serde_json::from_slice(bytes).map_err(corrupt)?;
-            Ok(migrate_v4_to_v5(v4))
+            Ok(migrate_v5_to_v6(migrate_v4_to_v5(v4)))
+        }
+        5 => {
+            let v5: CaStateV5 = serde_json::from_slice(bytes).map_err(corrupt)?;
+            Ok(migrate_v5_to_v6(v5))
         }
         CURRENT_STATE_VERSION => serde_json::from_slice(bytes).map_err(corrupt),
         v if v > CURRENT_STATE_VERSION => Err(format!(
@@ -408,6 +451,7 @@ struct CaLogState {
     held: Vec<HeldCsr>,
     policy: PolicyOverrides,
     users: Vec<UserRecord>,
+    invites: Vec<UserInvite>,
 }
 
 impl CaLogState {
@@ -418,6 +462,7 @@ impl CaLogState {
             held: Vec::new(),
             policy: PolicyOverrides::default(),
             users: Vec::new(),
+            invites: Vec::new(),
         }
     }
 }
@@ -457,6 +502,7 @@ impl Codec<CaLogState> for CaStateCodec {
             held: value.held.clone(),
             policy: value.policy.clone(),
             users: value.users.clone(),
+            invites: value.invites.clone(),
         };
         serde_json::to_vec_pretty(&state).map_err(|e| format!("failed to serialize CA state: {e}"))
     }
@@ -468,6 +514,7 @@ impl Codec<CaLogState> for CaStateCodec {
             held: state.held,
             policy: state.policy,
             users: state.users,
+            invites: state.invites,
         })
     }
 }
@@ -590,6 +637,50 @@ impl CaLog {
         (result, self.report_persist_outcome(persisted))
     }
 
+    /// Read-only view of the pending invitations.
+    pub(crate) fn invites(&self) -> &[UserInvite] {
+        &self.persisted.get().invites
+    }
+
+    /// Run `f` against the invite store, then attempt to persist the full
+    /// state, with the same rollback guarantee as [`Self::mutate_held`].
+    ///
+    /// Minting, starting and revoking an invite each go through here.
+    /// *Completing* one does not — it must also create an account, and the two
+    /// halves have to land as one write: see [`Self::mutate_users_and_invites`].
+    pub(crate) fn mutate_invites<R>(
+        &mut self,
+        f: impl FnOnce(&mut Vec<UserInvite>) -> R,
+    ) -> (R, Result<(), String>) {
+        let (result, persisted) = self.persisted.mutate(|state| f(&mut state.invites));
+        (result, self.report_persist_outcome(persisted))
+    }
+
+    /// Run `f` against *both* the user store and the invite store, persisting
+    /// the combined result as a single write — for the one caller
+    /// (`CertAuthority::complete_user_registration`) that must create an account
+    /// and delete the invite it was registered from as one durable unit.
+    ///
+    /// The same hazard [`Self::mutate_issued_and_held`] exists for, with a
+    /// sharper consequence. Two separate calls means two separate persists: if
+    /// the account is written durably and the invite deletion then fails and
+    /// rolls back, the invite comes back as `Started` with an account already
+    /// under its name — and the registrant, who has no way to see either store,
+    /// is told their registration failed. If the deletion lands first and the
+    /// account write fails, the invite is gone and the person holding the handle
+    /// has nothing left to redeem and no way to ask for another. One
+    /// [`Persisted::mutate`] closes both: either the account exists and the
+    /// invite is gone, or neither happened.
+    pub(crate) fn mutate_users_and_invites<R>(
+        &mut self,
+        f: impl FnOnce(&mut Vec<UserRecord>, &mut Vec<UserInvite>) -> R,
+    ) -> (R, Result<(), String>) {
+        let (result, persisted) = self
+            .persisted
+            .mutate(|state| f(&mut state.users, &mut state.invites));
+        (result, self.report_persist_outcome(persisted))
+    }
+
     /// Run `f` against the enrollment-policy overrides, then attempt to
     /// persist the full state, with the same rollback guarantee as
     /// [`Self::mutate_held`]: a failed persist leaves the overrides as they
@@ -682,21 +773,28 @@ impl CaLog {
                 .as_deref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
-            // Both arms get the same "failed to persist ... to <path>"
-            // framing and structured `path` field below, even though an
-            // `Encode` failure (unlike `Store`) never actually touched the
-            // filesystem — `CaStateCodec::encode` serializing this schema
-            // (fixed arrays, `String`, `bool`, `u64`) essentially can't
-            // fail, so keeping the two arms' shape consistent matters more
-            // here than distinguishing an outcome that shouldn't occur.
-            let msg = match e {
-                PersistError::Encode(encode_err) => {
-                    format!("failed to persist CA state to {path_display}: {encode_err}")
-                }
-                PersistError::Store(io_err) => {
-                    format!("failed to persist CA state to {path_display}: {io_err}")
-                }
+            // Both arms get the same framing and structured `path` field
+            // below, even though an `Encode` failure (unlike `Store`) never
+            // actually touched the filesystem — `CaStateCodec::encode`
+            // serializing this schema (fixed arrays, `String`, `bool`, `u64`)
+            // essentially can't fail, so keeping the two arms' shape consistent
+            // matters more here than distinguishing an outcome that shouldn't
+            // occur.
+            let detail = match e {
+                PersistError::Encode(encode_err) => encode_err.to_string(),
+                PersistError::Store(io_err) => io_err.to_string(),
             };
+            // The path and the OS error go to the log, not to the caller.
+            // Three of this store's mutations sit behind requests on the
+            // enrollment tier, which admits a caller holding no credential at
+            // all — and `begin_user_registration` reaches one on a token that
+            // matches nothing. Returning this verbatim showed an anonymous
+            // visitor the CA's absolute state-file path and its errno, under
+            // the heading "This invitation cannot be used".
+            let msg = "the node could not record this change; it is still \
+                       serving from memory. Try again shortly, and check the \
+                       node's logs"
+                .to_string();
             // A handled-and-retried I/O error (the caller keeps serving from
             // memory and the next successful mutation retries the write), so
             // `warn!` rather than `error!` — but still surfaced to the
@@ -704,8 +802,8 @@ impl CaLog {
             // whether to retry, alert, or accept the risk.
             tracing::warn!(
                 path = %path_display,
-                error = %msg,
-                "failed to persist CA state; issued-certificate/held-CSR durability is degraded until this is fixed"
+                error = %detail,
+                "failed to persist CA state; durability of certificates, held CSRs, accounts and invitations is degraded until this is fixed"
             );
             msg
         })
@@ -846,5 +944,101 @@ mod tests {
             1,
             "the second write's mutation rolled back, in isolation from the first"
         );
+    }
+
+    /// Completing a registration creates the account and deletes the invite,
+    /// and those are one durable act or the whole flow is unrecoverable: a
+    /// crash between two separate writes leaves a burnt invite with no account
+    /// behind it, and the person holding the handle has nothing left to redeem.
+    ///
+    /// Same white-box level, and for the same reason, as
+    /// [`mutate_issued_and_held_rolls_back_both_collections_together_on_persist_failure`]:
+    /// only here can the failure be forced to land after both halves of the
+    /// mutation have run.
+    #[test]
+    fn mutate_users_and_invites_rolls_back_both_collections_together_on_persist_failure() {
+        let dir = unique_dir("atomic-users-invites");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(&path, seed_snapshot().to_string()).unwrap();
+
+        let mut log = CaLog::load(Some(path)).unwrap();
+        assert!(log.users().is_empty());
+        assert!(log.invites().is_empty());
+
+        // Doom every subsequent write.
+        std::fs::remove_dir_all(&dir).ok();
+
+        let (_, persisted) = log.mutate_users_and_invites(|users, invites| {
+            users.push(
+                UserRecord::new("rowan", "hunter2", crate::users::UserRole::Viewer, 3600).unwrap(),
+            );
+            invites.push(crate::users::UserInvite::new(
+                "wren",
+                crate::users::UserRole::Viewer,
+                3600,
+                [7u8; 32],
+                0,
+                1,
+            ));
+        });
+        assert!(
+            persisted.is_err(),
+            "the write should have failed: its directory is gone"
+        );
+
+        assert!(
+            log.users().is_empty(),
+            "the account must roll back with the invite deletion, or a failed \
+             persist leaves an account nobody asked to create"
+        );
+        assert!(
+            log.invites().is_empty(),
+            "and the invite side must roll back too — the split is exactly the \
+             hazard this method exists to close"
+        );
+    }
+
+    /// A snapshot written before invites existed loads with an empty invite
+    /// store, which is not a loss of state but a faithful description of a
+    /// provider that had no invite store at all.
+    #[test]
+    fn a_v5_snapshot_migrates_forward_with_an_empty_invite_store() {
+        let dir = unique_dir("v5-migration");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": 5,
+                "issued": [],
+                "held": [],
+                "users": [{
+                    "username": "ops",
+                    "password_hash": "$argon2id$v=19$m=65536,t=3,p=1$c2FsdHNhbHQ$aGFzaGhhc2g",
+                    "totp_secret": null,
+                    "session_ttl_secs": 3600,
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let log = CaLog::load(Some(path.clone())).unwrap();
+
+        assert_eq!(log.users().len(), 1, "the account survives the migration");
+        assert!(
+            log.invites().is_empty(),
+            "and the invite store starts empty rather than being invented"
+        );
+
+        // The rewrite carries the new version, so a downgrade fails loudly
+        // rather than silently dropping invites.
+        let mut log = log;
+        let (_, persisted) = log.mutate_invites(|_| {});
+        persisted.unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["version"], CURRENT_STATE_VERSION);
     }
 }

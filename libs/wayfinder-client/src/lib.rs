@@ -41,6 +41,11 @@ use wayfinder_protos::wayfinder::v1alpha::ApproveCsrRequest;
 use wayfinder_protos::wayfinder::v1alpha::AuthenticateRequest;
 use wayfinder_protos::wayfinder::v1alpha::AuthenticateUserRequest;
 use wayfinder_protos::wayfinder::v1alpha::AuthenticateUserResponse;
+use wayfinder_protos::wayfinder::v1alpha::BeginUserRegistrationRequest;
+use wayfinder_protos::wayfinder::v1alpha::BeginUserRegistrationResponse;
+use wayfinder_protos::wayfinder::v1alpha::CompleteUserRegistrationRequest;
+use wayfinder_protos::wayfinder::v1alpha::CreateUserInviteRequest;
+use wayfinder_protos::wayfinder::v1alpha::CreateUserInviteResponse;
 use wayfinder_protos::wayfinder::v1alpha::CreateUserRequest;
 use wayfinder_protos::wayfinder::v1alpha::DenyCsrRequest;
 use wayfinder_protos::wayfinder::v1alpha::EnrollmentPolicy;
@@ -68,6 +73,8 @@ use wayfinder_protos::wayfinder::v1alpha::ListCertsRequest;
 use wayfinder_protos::wayfinder::v1alpha::ListCertsResponse;
 use wayfinder_protos::wayfinder::v1alpha::ListPendingCsrsRequest;
 use wayfinder_protos::wayfinder::v1alpha::ListPendingCsrsResponse;
+use wayfinder_protos::wayfinder::v1alpha::ListUserInvitesRequest;
+use wayfinder_protos::wayfinder::v1alpha::ListUserInvitesResponse;
 use wayfinder_protos::wayfinder::v1alpha::ListUsersRequest;
 use wayfinder_protos::wayfinder::v1alpha::ListUsersResponse;
 use wayfinder_protos::wayfinder::v1alpha::ListVpnPeersRequest;
@@ -80,6 +87,7 @@ use wayfinder_protos::wayfinder::v1alpha::RemoveUserRequest;
 use wayfinder_protos::wayfinder::v1alpha::ResolveRouteRequest;
 use wayfinder_protos::wayfinder::v1alpha::ResolveRouteResponse;
 use wayfinder_protos::wayfinder::v1alpha::RevokeNodeRequest;
+use wayfinder_protos::wayfinder::v1alpha::RevokeUserInviteRequest;
 use wayfinder_protos::wayfinder::v1alpha::RevokeVpnPeerRequest;
 use wayfinder_protos::wayfinder::v1alpha::RoutingTable;
 use wayfinder_protos::wayfinder::v1alpha::RuntimeConfig;
@@ -796,6 +804,122 @@ impl Client {
         }
     }
 
+    /// Provider mode: mint a one-time invitation for `username`.
+    ///
+    /// The returned token is **shown once**: the authority stores only a hash
+    /// of it, so a caller that drops this response has to revoke the invitation
+    /// and mint another. It belongs in the *fragment* of the registration URL
+    /// (`https://…/register#<token>`) — a fragment never reaches a server, so it
+    /// stays out of access logs, out of `Referer`, and out of reach of the link
+    /// unfurlers that fetch any URL pasted into a chat app.
+    ///
+    /// Zero for `session_ttl_secs` or `invite_ttl_secs` takes the authority's
+    /// own default.
+    pub async fn create_user_invite(
+        &mut self,
+        username: &str,
+        admin: bool,
+        session_ttl_secs: u64,
+        invite_ttl_secs: u64,
+    ) -> anyhow::Result<CreateUserInviteResponse> {
+        match self
+            .request(RequestKind::CreateUserInvite(CreateUserInviteRequest {
+                username: username.to_string(),
+                admin,
+                session_ttl_secs,
+                invite_ttl_secs,
+            }))
+            .await?
+        {
+            ResponseKind::CreateUserInvite(resp) => Ok(resp),
+            other => Err(unexpected("CreateUserInvite", &other)),
+        }
+    }
+
+    /// Provider mode: the invitations on file, and the store's capacity.
+    ///
+    /// The field to read is each invitation's `started_at`: non-zero, with no
+    /// account under that name, means somebody took the account's second factor
+    /// and did not finish registering.
+    pub async fn list_user_invites(&mut self) -> anyhow::Result<ListUserInvitesResponse> {
+        match self
+            .request(RequestKind::ListUserInvites(ListUserInvitesRequest {}))
+            .await?
+        {
+            ResponseKind::ListUserInvites(resp) => Ok(resp),
+            other => Err(unexpected("ListUserInvites", &other)),
+        }
+    }
+
+    /// Provider mode: delete the invitation minted for `username`, at any
+    /// status — including a started one, which is the case this exists for.
+    pub async fn revoke_user_invite(&mut self, username: &str) -> anyhow::Result<()> {
+        match self
+            .request(RequestKind::RevokeUserInvite(RevokeUserInviteRequest {
+                username: username.to_string(),
+            }))
+            .await?
+        {
+            ResponseKind::Empty(_) => Ok(()),
+            other => Err(unexpected("RevokeUserInvite", &other)),
+        }
+    }
+
+    /// Provider mode: redeem `token`, revealing the account's second factor and
+    /// receiving the handle that alone can finish the registration.
+    ///
+    /// Runs on the enrollment tier, so this is callable on a connection holding
+    /// no certificate at all — which is what somebody who does not have an
+    /// account yet is.
+    ///
+    /// **This spends the invitation.** A caller that loses the returned handle
+    /// cannot start again: the token is already gone, and the remedy is a fresh
+    /// invitation from an administrator. Hold the handle somewhere a page
+    /// refresh survives.
+    pub async fn begin_user_registration(
+        &mut self,
+        token: &str,
+    ) -> anyhow::Result<BeginUserRegistrationResponse> {
+        match self
+            .request(RequestKind::BeginUserRegistration(
+                BeginUserRegistrationRequest {
+                    token: token.to_string(),
+                },
+            ))
+            .await?
+        {
+            ResponseKind::BeginUserRegistration(resp) => Ok(resp),
+            other => Err(unexpected("BeginUserRegistration", &other)),
+        }
+    }
+
+    /// Provider mode: finish a registration, creating the account.
+    ///
+    /// `totp_code` is computed against the secret the start revealed, and
+    /// proves the authenticator actually holds it before the account depends on
+    /// it. A wrong code is an error and does not spend the handle, so a mistyped
+    /// one can simply be retried.
+    pub async fn complete_user_registration(
+        &mut self,
+        handle: &str,
+        password: &str,
+        totp_code: &str,
+    ) -> anyhow::Result<()> {
+        match self
+            .request(RequestKind::CompleteUserRegistration(
+                CompleteUserRegistrationRequest {
+                    handle: handle.to_string(),
+                    password: password.to_string(),
+                    totp_code: totp_code.to_string(),
+                },
+            ))
+            .await?
+        {
+            ResponseKind::Empty(_) => Ok(()),
+            other => Err(unexpected("CompleteUserRegistration", &other)),
+        }
+    }
+
     /// Provider mode: revoke `node_mac` from the mesh (the provider signs and
     /// floods a revocation record).
     pub async fn revoke_node(&mut self, node_mac: &[u8]) -> anyhow::Result<()> {
@@ -1047,6 +1171,9 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
         ResponseKind::CreateUser(_) => "CreateUser",
         ResponseKind::VpnEnrollment(_) => "VpnEnrollment",
         ResponseKind::ListVpnPeers(_) => "ListVpnPeers",
+        ResponseKind::CreateUserInvite(_) => "CreateUserInvite",
+        ResponseKind::ListUserInvites(_) => "ListUserInvites",
+        ResponseKind::BeginUserRegistration(_) => "BeginUserRegistration",
     };
     anyhow!("expected {want} response, got {got}")
 }

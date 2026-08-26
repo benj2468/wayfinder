@@ -160,7 +160,13 @@ be bumped as one:
 - `state.rs` — what accumulates across polls (log scrollback, throughput trend).
 - `format.rs` — every display conversion, so none of them live in a `view!`
   macro where they cannot be tested.
-- `components/` — the tabs. Pure functions of the dashboard state. `security.rs`
+- `invite.rs` — the invitation flow's view models. Not on the snapshot, and
+  deliberately: the listing is read when an operator opens the panel, and a
+  minted token is read exactly once, so putting either on the once-a-second poll
+  would put a bearer token on a wire that runs continuously.
+- `components/` — the tabs, plus `register.rs`, which is a whole page rather
+  than a tab (see the security posture below). Pure functions of the dashboard
+  state. `security.rs`
   is about *this node*: who it believes it is, who it believes its neighbours
   are, what it refuses to do without a certificate — and it **reports without
   acting**, since every decision about another node's membership belongs to the
@@ -365,15 +371,46 @@ the provider at all**. Five things govern it:
   enumerate, and "this expired on the 3rd" is the difference between downloading
   a new one and filing a bug.
 
+**`/register` is routed, and renders with the shell's chrome suppressed.** It is the one page
+here served to somebody who has no account at all: they open an invitation link,
+redeem it, and set their own password and second factor. Three things about it,
+and the second is the one that fails silently:
+
+- **The token is in the URL's fragment**, never the query string. A fragment is
+  not transmitted to any server, so it stays out of access logs and `Referer`
+  headers, and the link unfurlers that fetch any URL pasted into a chat app
+  never see it — that fetch is a plain `GET` running no wasm, and an
+  implementation that redeemed on `GET` would burn the invitation on a chat
+  preview. So the server renders the page knowing no token; the wasm reads
+  `window.location.hash` after hydration and clears it with `replaceState`.
+- **The sign-in overlay must not cover it.** That overlay is gated on
+  `Viewer::LoggedOut`, which is precisely what a registrant is — so a
+  registration page inside the shell would render perfectly, underneath a
+  sign-in form, for exactly the audience it exists for, and nothing about it
+  would look broken. `RegistrationAware` excludes the chrome *and* the overlay
+  on that path; `tests/session.rs` pins it.
+- **Starting spends the invitation**, so the page cannot re-derive its state
+  from the URL on a refresh. It keeps the handle in `sessionStorage` and the
+  `otpauth://` URI nowhere — the URI has no reason to outlive the moment it is
+  scanned, and the handle is what a refresh needs.
+
 **`<Routes>` must stay unconditional in `App`.** `generate_route_list` walks the
 app once at startup, with no request and so no session, to discover the routes
 to register — so a `<Routes>` behind "is anyone signed in?" registers nothing and
 every tab but the index answers 404, in both modes, from the first boot. That is
-why a signed-out page renders the whole shell and *hides* it (`wf-shell-hidden`,
-`display: none`, which takes it out of the tab order and the accessibility tree
-too) with the sign-in form over the top, rather than not rendering it. Nothing
+why a signed-out page renders the whole shell and *hides* it with the sign-in
+form over the top, rather than not rendering it — the stylesheet's
+`.wf-app:has(.wf-login-page) .wf-shell:not(.wf-shell-bare) { display: none }`,
+which takes it out of the tab order and the accessibility tree too. Nothing
 leaks by that: no tab fetches anything of its own, and the polling loop does not
 run while signed out. `tests/session.rs` pins both halves.
+
+That rule keys off the sign-in page's *layout class*, which `/register` reuses —
+hence the `:not()`, and hence `wf-shell-bare` on the shell for that route.
+Without it the registration page hides itself and the registrant gets a blank
+page with perfect markup underneath. A rule that hides a container on evidence
+found *inside* it has this hazard by construction; both sides pin it in a unit
+test (`login.rs`, `register.rs`).
 
 **The bind address alone does not make it unreachable, which is why
 `server.rs` carries two gates** (`HostPolicy`, and the `known_host_only` /
@@ -480,6 +517,19 @@ whole mesh honours. Four things govern it:
   authority, so the panel holds the `otpauth://` URI on screen until dismissed,
   says plainly that it will not be shown again, and offers it through the
   clipboard rather than only as text on a screen someone else can see.
+- **An invitation is the other way to create one, and the one to reach for.**
+  `Create account` mints both of an account's secrets and shows the operator its
+  `otpauth://` URI, so the account's second factor ends up permanently known to
+  somebody who is not its owner. The Invitations panel hands over a link
+  instead: whoever opens it is the first party to see the TOTP secret. What that
+  buys is *detectability*, not prevention — an operator holds the token between
+  minting and delivering it and can always redeem it themselves. The guarantee
+  is that doing so **spends** the invitation, so the real registration fails and
+  the panel's `Started` column shows a start nobody expected. That column is the
+  one thing on the panel worth watching: a still-listed invitation showing a
+  start means somebody took the second factor and did not finish, and the
+  response either way is revoke-and-re-invite.
+
 - **The node refuses to strand itself, and the dashboard does not second-guess
   it.** `MeshAuthority::remove_user` rejects removing the last account that can
   still administer the mesh — both it and `CreateUser` need a full management

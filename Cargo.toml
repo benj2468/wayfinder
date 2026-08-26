@@ -113,6 +113,7 @@ rand = "0.10.1"
 # docs/design/06). Memory-hard by construction, which is why the store lives at
 # the CA and never on a node — see §4 of that document.
 argon2 = { version = "0.5", features = ["std"] }
+blake2 = { version = "0.10", default-features = false }
 # RFC 6238 TOTP is HMAC-SHA1 over a counter; these two are the primitives, and
 # the ~25 lines of RFC on top live in `wayfinder-server`'s `users` module rather
 # than in a dependency that would be almost entirely those same lines.

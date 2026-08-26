@@ -43,6 +43,9 @@ pub mod components;
 // the `on:change` handler that calls it is compiled into both builds.
 pub mod filepicker;
 pub mod format;
+/// The invitation flow's view models: what an administrator sees of the
+/// invitations they have minted, and what the person redeeming one sees.
+pub mod invite;
 pub mod state;
 
 #[cfg(feature = "ssr")]
@@ -91,6 +94,7 @@ use crate::components::provider::enrollment::Enrollment;
 use crate::components::provider::members::Members;
 use crate::components::provider::requests::Requests;
 use crate::components::provider::vpn::Vpn;
+use crate::components::register::Register;
 use crate::components::routing::Routing;
 use crate::components::security::Security;
 use crate::session::Viewer;
@@ -318,8 +322,10 @@ const VPN_TAB_PATH: &str = "provider/vpn";
 /// is the empty state every tab starts in.
 ///
 /// The hiding is done in the stylesheet — `.wf-app:has(.wf-login-page)
-/// .wf-shell` — rather than by a reactive class here, and that is not a style
-/// preference. Every read of the viewer resource has to happen inside a
+/// .wf-shell:not(.wf-shell-bare)` — rather than by a reactive class here, and
+/// that is not a style preference. (The `:not()` is `/register`'s exemption:
+/// that page reuses `.wf-login-page` for its layout and renders inside the
+/// shell, so without it the rule hides the registration page from itself.) Every read of the viewer resource has to happen inside a
 /// `<Suspense>`, or leptos renders one thing on the server and another on
 /// hydration; a class *attribute* on the shell cannot be inside one. In this
 /// crate a hydration mismatch is not a cosmetic bug, it is a wasm panic that
@@ -347,54 +353,102 @@ pub fn App() -> impl IntoView {
         <Title text="Wayfinder" />
 
         <Router>
-            <div class="wf-app">
-                <div class="wf-shell">
+            <RegistrationAware viewer=viewer dash=dash />
+        </Router>
+    }
+}
+
+/// The page's outer frame, minus everything a registrant has no business
+/// seeing.
+///
+/// Split out of [`App`] purely because it needs a router *context* to ask which
+/// route is being rendered, and `use_location` is only available inside
+/// `<Router>`.
+///
+/// `/register` is the one route that renders with the shell's chrome
+/// suppressed — inside `.wf-shell` like every other route, since `<Routes>` is
+/// unconditional, but with the header, tab bar and status strip skipped and the
+/// bare-shell class set. Two things follow, and the second is the load-bearing
+/// one:
+///
+/// * The header, tab bar and status strip are chrome for somebody looking at a
+///   node. A person creating an account is not, and giving them a dashboard's
+///   navigation to look at is misleading about what they are doing here.
+/// * **The sign-in overlay must not cover it.** That overlay is gated on
+///   [`Viewer::LoggedOut`], which is precisely what a registrant is — so
+///   without this exclusion the registration page would render correctly,
+///   underneath a sign-in form, for exactly the audience it exists for.
+///
+/// What is *not* conditional is `<Routes>` itself, and that is deliberate:
+/// `generate_route_list` walks this component once at startup with no request,
+/// so a `<Routes>` behind any condition registers nothing and every route but
+/// the index answers 404. See this crate's `CLAUDE.md`.
+#[component]
+fn RegistrationAware(
+    /// The viewer question the sign-in overlay hangs on.
+    viewer: ViewerResource,
+    /// Shared dashboard state.
+    dash: Dashboard,
+) -> impl IntoView {
+    let location = use_location();
+    // Derived from the router's own path, which the server knows when it
+    // renders and the browser knows when it hydrates — so both halves agree,
+    // and hydration does not desynchronise. Anything less deterministic here
+    // would be a wasm panic, not a cosmetic bug.
+    let registering = move || location.pathname.get().trim_end_matches('/') == "/register";
+
+    view! {
+        <div class="wf-app">
+            <div class="wf-shell" class:wf-shell-bare=registering>
+                <Show when=move || !registering() fallback=|| ()>
                     <Header dash=dash />
                     <TabBar viewer=viewer dash=dash />
                     <StatusStrip dash=dash />
-                    <main class="wf-main">
-                        <Routes fallback=|| view! { <p class="wf-empty">"Not found."</p> }>
-                            <Route path=StaticSegment("") view=Overview />
-                            <Route path=StaticSegment("routing") view=Routing />
-                            <Route path=StaticSegment("link-quality") view=LinkQuality />
-                            <Route path=StaticSegment("links") view=Links />
-                            <Route path=StaticSegment("metrics") view=Metrics />
-                            <Route path=StaticSegment("security") view=Security />
-                            <Route path=StaticSegment("logs") view=Logs />
-                            // The provider scope. Flat routes under a shared
-                            // first segment rather than a nested `<Routes>`:
-                            // the two scopes share the whole chrome above and
-                            // differ only in which tabs the one bar draws, so
-                            // there is no nested outlet for a nested router to
-                            // render into.
-                            <Route path=StaticSegment("provider") view=Requests />
-                            <Route
-                                path=(StaticSegment("provider"), StaticSegment("members"))
-                                view=Members
-                            />
-                            <Route
-                                path=(StaticSegment("provider"), StaticSegment("enrollment"))
-                                view=Enrollment
-                            />
-                            <Route
-                                path=(StaticSegment("provider"), StaticSegment("accounts"))
-                                view=Accounts
-                            />
-                            <Route
-                                path=(StaticSegment("provider"), StaticSegment("vpn"))
-                                view=Vpn
-                            />
-                        </Routes>
-                    </main>
-                </div>
-                <Suspense>
-                    {move || {
-                        matches!(viewer.get(), Some(Ok(Viewer::LoggedOut)))
-                            .then(|| view! { <Login viewer=viewer /> })
-                    }}
-                </Suspense>
+                </Show>
+                <main class="wf-main">
+                    <Routes fallback=|| view! { <p class="wf-empty">"Not found."</p> }>
+                        <Route path=StaticSegment("") view=Overview />
+                        <Route path=StaticSegment("routing") view=Routing />
+                        <Route path=StaticSegment("link-quality") view=LinkQuality />
+                        <Route path=StaticSegment("links") view=Links />
+                        <Route path=StaticSegment("metrics") view=Metrics />
+                        <Route path=StaticSegment("security") view=Security />
+                        <Route path=StaticSegment("logs") view=Logs />
+                        // The provider scope. Flat routes under a shared
+                        // first segment rather than a nested `<Routes>`:
+                        // the two scopes share the whole chrome above and
+                        // differ only in which tabs the one bar draws, so
+                        // there is no nested outlet for a nested router to
+                        // render into.
+                        <Route path=StaticSegment("provider") view=Requests />
+                        <Route
+                            path=(StaticSegment("provider"), StaticSegment("members"))
+                            view=Members
+                        />
+                        <Route
+                            path=(StaticSegment("provider"), StaticSegment("enrollment"))
+                            view=Enrollment
+                        />
+                        <Route
+                            path=(StaticSegment("provider"), StaticSegment("accounts"))
+                            view=Accounts
+                        />
+                        <Route path=(StaticSegment("provider"), StaticSegment("vpn")) view=Vpn />
+                        // In neither scope, and rendered without the chrome
+                        // above: whoever opens this has no account yet, so a
+                        // tab bar for either scope would be navigation to
+                        // pages they cannot reach.
+                        <Route path=StaticSegment("register") view=Register />
+                    </Routes>
+                </main>
             </div>
-        </Router>
+            <Suspense>
+                {move || {
+                    (!registering() && matches!(viewer.get(), Some(Ok(Viewer::LoggedOut))))
+                        .then(|| view! { <Login viewer=viewer /> })
+                }}
+            </Suspense>
+        </div>
     }
 }
 

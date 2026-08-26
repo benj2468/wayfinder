@@ -231,6 +231,7 @@ mod ssr {
     use crate::bundle::is_admin;
     use crate::conn::NodeConnection;
     use crate::conn::Target;
+    use crate::invite::RegistrationStart;
 
     /// One management endpoint this dashboard reaches, and the key that pins
     /// it.
@@ -403,6 +404,83 @@ mod ssr {
                 "dashboard session opened"
             );
             Ok(LoginOutcome::LoggedIn { id, info })
+        }
+
+        /// Redeem an invitation token at the provider, revealing the account's
+        /// second factor and receiving the handle that finishes the
+        /// registration.
+        ///
+        /// The same anonymous connection [`Self::login`] uses — a throwaway key
+        /// and no certificate — because somebody who does not have an account
+        /// yet is exactly what that tier is for. **No session is created**: this
+        /// call produces an account, not a sign-in, and whoever completes it
+        /// signs in afterwards like anybody else.
+        ///
+        /// The call spends the invitation, so a caller that drops the returned
+        /// handle cannot start again. Errors carry the provider's own message:
+        /// there is no account to enumerate here — an unknown token, an expired
+        /// one and a spent one are one answer at the provider already — and the
+        /// person reading it needs to know their next act is to ask for a new
+        /// invitation.
+        pub async fn begin_registration(&self, token: &str) -> anyhow::Result<RegistrationStart> {
+            let mut client = self.anonymous_client().await?;
+            let response = client
+                .begin_user_registration(token)
+                .await
+                .context("asking the provider to start this registration")?;
+            info!(
+                username = %response.username,
+                provider = %self.provider.addr,
+                "registration started at the provider"
+            );
+            Ok(RegistrationStart {
+                username: response.username,
+                totp_enrolment_uri: response.totp_enrolment_uri,
+                handle: response.handle,
+                handle_expires_unix: response.handle_expires_at,
+            })
+        }
+
+        /// Finish a registration: the provider verifies the handle and the code,
+        /// then creates the account.
+        ///
+        /// The password reaches the provider over the same authenticated TLS a
+        /// sign-in uses and is stored nowhere on this side.
+        pub async fn complete_registration(
+            &self,
+            handle: &str,
+            password: &str,
+            totp_code: &str,
+        ) -> anyhow::Result<()> {
+            let mut client = self.anonymous_client().await?;
+            client
+                .complete_user_registration(handle, password, totp_code)
+                .await
+                .context("asking the provider to finish this registration")?;
+            info!(provider = %self.provider.addr, "registration completed at the provider");
+            Ok(())
+        }
+
+        /// A connection to the provider carrying a throwaway key and no
+        /// certificate — the enrollment tier, and all a caller with no account
+        /// can reach.
+        ///
+        /// Shared by both halves of a registration, which are the same posture:
+        /// whoever is asking holds nothing this mesh has ever signed.
+        ///
+        /// [`Self::login`] is that posture too and deliberately does **not**
+        /// call this — it has to keep the seed it generated in order to build
+        /// the session certificate from what the provider returns, and this
+        /// hands back only the `Client`. Anything changed here (timeouts, key
+        /// type, pinning) has to be changed there as well.
+        async fn anonymous_client(&self) -> anyhow::Result<Client> {
+            let anonymous = Identity {
+                seed: Keypair::generate_seed(),
+                cert: Vec::new(),
+            };
+            Client::connect_tls(&self.provider.addr, &self.provider.key, &anonymous)
+                .await
+                .with_context(|| format!("connecting to the provider at {}", self.provider.addr))
         }
 
         /// Build a session out of a `.wfauth` credential file, with no contact
