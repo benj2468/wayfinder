@@ -25,6 +25,7 @@
 #   install     Install NixOS over the stock image          (DESTRUCTIVE, once)
 #   secrets     Copy the offline-minted trust material onto the node
 #   update      Roll out a config/code change               (nixos-rebuild)
+#   purge       Drop the dashboard bundle from Cloudflare's cache
 #   verify      Prove the CA answers and the tunnel plane is serving
 #   status      Where it is and what it is doing
 #   user-add    Create a dashboard sign-in account on the CA
@@ -258,7 +259,8 @@ load_cf_token() {
         "$INFRA_DIR/terraform.tfvars" 2>/dev/null; then
         die "no Cloudflare API token, but terraform.tfvars manages Cloudflare resources.
 Put the token in $CF_TOKEN_FILE (or export CLOUDFLARE_API_TOKEN).
-It needs Zone:DNS:Edit on the zone and Account:Cloudflare Tunnel:Edit."
+It needs Zone:DNS:Edit on the zone and Account:Cloudflare Tunnel:Edit, plus
+Zone:Zone:Read and Zone:Cache Purge:Purge for the post-rollout cache purge."
     fi
 }
 
@@ -346,6 +348,126 @@ cmd_secrets() {
     info "trust material in place; wayfinder.service restarted"
 }
 
+# A value out of infra/oracle/terraform.tfvars.
+#
+# Read rather than taken from `tofu output`, because the two callers below need
+# it in cases where there is no state to read: a deployment whose Cloudflare
+# resources are managed by hand still has the zone id written here, and a purge
+# has to work without a `tofu init` first.
+tfvar() {
+    local key="$1" default="${2:-}" value
+    value="$(sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" \
+        "$INFRA_DIR/terraform.tfvars" 2>/dev/null | tail -1)"
+    printf '%s' "${value:-$default}"
+}
+
+# The dashboard's public name, asked of Cloudflare rather than configured here.
+#
+# The zone id is the only thing terraform.tfvars records; the zone's *name* lives
+# only in Cloudflare. Deriving it from the id keeps the hostname in exactly one
+# place — a second copy in tfvars or in this script is a copy that goes stale
+# the day the zone is renamed, and the failure would be a purge that silently
+# hits nothing.
+dashboard_hostname() {
+    local zone_id="$1" body
+
+    body="$(curl -sf --max-time 15 \
+        -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+        "https://api.cloudflare.com/client/v4/zones/$zone_id")" || return 1
+
+    # `result.name` specifically, not the first "name" in the document: the zone
+    # object embeds an `account` and an `owner`, each carrying a name of its own.
+    printf '%s' "$body" | python3 -c '
+import json, sys
+zone = json.load(sys.stdin)
+if not zone.get("success"):
+    sys.exit(1)
+print(zone["result"]["name"])' || return 1
+}
+
+# Drop the built bundle from Cloudflare's edge cache.
+#
+# Necessary because the dashboard ships from a Nix store path, where every file
+# carries the same mtime (1970-01-01T00:00:01) in every build. `ServeDir` serves
+# `/pkg` with `Last-Modified` as its only validator and emits no `ETag`, so that
+# constant is all a conditional request has to go on — and the origin answers
+# `304 Not Modified` for a file whose bytes did change. Cloudflare caches `.css`
+# and `.js` by extension regardless of the `no-cache` the dashboard sets, then
+# revalidates into that wrong answer and keeps the previous build's stylesheet
+# indefinitely. The visible result is today's markup with yesterday's CSS.
+#
+# Purged by explicit URL rather than by hostname or prefix, which Cloudflare
+# offers only on an Enterprise plan. The list is the whole build output:
+# cargo-leptos emits no content hash in these names (see bins/wayfinder-web's
+# CLAUDE.md on `hash-files`), so they are stable across deployments and can be
+# named here.
+#
+# Never fatal. It runs after `nixos-rebuild switch` has already succeeded, and
+# reporting a completed rollout as a failure would send an operator looking in
+# the wrong place. A failure here leaves the edge stale, which is what the
+# printed command fixes.
+purge_dashboard_cache() {
+    local zone_id host code=0
+    zone_id="$(tfvar cloudflare_zone_id)"
+
+    if [[ -z "$zone_id" ]]; then
+        info "no cloudflare_zone_id in terraform.tfvars — nothing at an edge to purge"
+        return 0
+    fi
+
+    load_cf_token
+    if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+        warn "no Cloudflare API token, so the dashboard bundle was left in the edge cache.
+Viewers will keep the previous build's stylesheet for up to four hours.
+Put the token in $CF_TOKEN_FILE and run '$0 purge'."
+        return 0
+    fi
+
+    host="$(dashboard_hostname "$zone_id")" || {
+        warn "could not resolve the zone name for $zone_id, so nothing was purged.
+The token needs Zone:Zone:Read as well as Zone:Cache Purge:Purge.
+  curl -H \"Authorization: Bearer \$CLOUDFLARE_API_TOKEN\" \\
+    https://api.cloudflare.com/client/v4/zones/$zone_id"
+        return 0
+    }
+
+    local base="https://$host"
+    info "purging the dashboard bundle from Cloudflare ($host)"
+    curl -sf --max-time 30 -o /dev/null \
+        -X POST "https://api.cloudflare.com/client/v4/zones/$zone_id/purge_cache" \
+        -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data "{\"files\":[
+            \"$base/pkg/wayfinder-web.css\",
+            \"$base/pkg/wayfinder-web.js\",
+            \"$base/pkg/wayfinder-web.wasm\",
+            \"$base/favicon.svg\"
+        ]}" || code=$?
+
+    if [[ "$code" == 0 ]]; then
+        info "edge cache purged"
+        return 0
+    fi
+
+    # 22 is curl's `--fail` on a 4xx/5xx, which for this endpoint is almost
+    # always the token: purging is its own permission and is not implied by the
+    # DNS and Tunnel scopes the rest of this script needs.
+    warn "the purge was refused (curl exit $code), so the edge cache is still stale.
+Most likely the API token lacks Zone:Cache Purge:Purge — add it at
+https://dash.cloudflare.com/profile/api-tokens and run '$0 purge'.
+To see what Cloudflare said:
+  curl -X POST https://api.cloudflare.com/client/v4/zones/$zone_id/purge_cache \\
+    -H \"Authorization: Bearer \$CLOUDFLARE_API_TOKEN\" \\
+    -H 'Content-Type: application/json' \\
+    --data '{\"files\":[\"$base/pkg/wayfinder-web.css\"]}'"
+}
+
+# Standalone, because the cache outlives any one rollout: a deployment updated
+# before this ran at all is stale at the edge with nothing left to redeploy.
+cmd_purge() {
+    purge_dashboard_cache
+}
+
 cmd_update() {
     need nixos-rebuild
     local ip; ip="$(ca_ip)"
@@ -359,6 +481,10 @@ cmd_update() {
     # time; it is still the right side to build on, since the instance has
     # 1 GB of RAM and would OOM.
     (cd "$REPO_ROOT" && nixos-rebuild switch --flake "$FLAKE_ATTR" --target-host "root@$ip")
+    # Part of a rollout, not a separate chore: the new bundle is on the box the
+    # moment the switch returns, and until this runs Cloudflare goes on serving
+    # the old one to everybody.
+    purge_dashboard_cache
     info "rolled out; 'wayfinder-ca.sh verify' to confirm it still answers"
 }
 
@@ -765,6 +891,7 @@ main() {
         install)   cmd_install "$@" ;;
         secrets)   cmd_secrets "$@" ;;
         update)    cmd_update "$@" ;;
+        purge)     cmd_purge "$@" ;;
         verify)    cmd_verify "$@" ;;
         status)    cmd_status "$@" ;;
         user-add)  cmd_user_add "$@" ;;
