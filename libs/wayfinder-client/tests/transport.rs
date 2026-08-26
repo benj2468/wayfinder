@@ -27,11 +27,14 @@ use wayfinder_protos::service::LogsData;
 use wayfinder_protos::service::NeighborPathData;
 use wayfinder_protos::service::NodeMetricsData;
 use wayfinder_protos::service::OgmScheduleEntryData;
+use wayfinder_protos::service::RegistrationStartedData;
 use wayfinder_protos::service::RouteResolutionData;
 use wayfinder_protos::service::RouterDataProvider;
 use wayfinder_protos::service::RoutingEntryData;
 use wayfinder_protos::service::RuntimeConfigData;
 use wayfinder_protos::service::TableOccupancyData;
+use wayfinder_protos::service::UserInviteData;
+use wayfinder_protos::service::UserInviteMintedData;
 use wayfinder_protos::service::WayfinderService;
 use wayfinder_protos::wayfinder::v1alpha::LogLevel;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
@@ -227,6 +230,57 @@ impl RouterDataProvider for Mock {
 impl AuthorityDataProvider for Mock {
     fn get_trust_anchor(&self) -> Result<Vec<u8>, String> {
         Ok(vec![0xab; 36])
+    }
+
+    fn create_user_invite(
+        &mut self,
+        username: &str,
+        _admin: bool,
+        _session_ttl_secs: u64,
+        _invite_ttl_secs: u64,
+    ) -> Result<UserInviteMintedData, String> {
+        Ok(UserInviteMintedData {
+            username: username.to_string(),
+            token: "JBSWY3DPEHPK3PXP".to_string(),
+            expires_at: 1_800_086_400,
+        })
+    }
+
+    fn list_user_invites(&self) -> Result<(Vec<UserInviteData>, u32), String> {
+        Ok((
+            vec![UserInviteData {
+                username: "rowan".to_string(),
+                admin: true,
+                session_ttl_secs: 900,
+                created_at: 1_800_000_000,
+                expires_at: 1_800_086_400,
+                started_at: 1_800_000_600,
+                handle_expires_at: 1_800_001_500,
+            }],
+            128,
+        ))
+    }
+
+    fn revoke_user_invite(&mut self, _username: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn begin_user_registration(&mut self, _token: &str) -> Result<RegistrationStartedData, String> {
+        Ok(RegistrationStartedData {
+            username: "rowan".to_string(),
+            totp_enrolment_uri: "otpauth://totp/wayfinder:rowan?secret=AAAA".to_string(),
+            handle: "handle-abc".to_string(),
+            handle_expires_at: 1_800_001_500,
+        })
+    }
+
+    fn complete_user_registration(
+        &mut self,
+        _handle: &str,
+        _password: &str,
+        _totp_code: &str,
+    ) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -447,4 +501,40 @@ async fn client_roundtrips_against_real_tls_server() {
         .await
         .unwrap();
     assert_full_roundtrip(&mut client).await;
+    assert_invite_roundtrip(&mut client).await;
+}
+
+/// The five invitation requests reach the authority half and their responses
+/// come back projected whole.
+///
+/// Worth a round trip of its own rather than trusting the dispatch tests: these
+/// are the requests whose fields *are* the secrets, so a client method that
+/// dropped one — the token from a mint, the handle from a start — would leave a
+/// caller with an invitation nobody can redeem and nothing to say so.
+async fn assert_invite_roundtrip(client: &mut Client) {
+    let minted = client.create_user_invite("rowan", true, 900, 0).await.unwrap();
+    assert_eq!(minted.username, "rowan");
+    assert_eq!(minted.token, "JBSWY3DPEHPK3PXP");
+    assert_eq!(minted.expires_at, 1_800_086_400);
+
+    let listed = client.list_user_invites().await.unwrap();
+    assert_eq!(listed.capacity, 128, "current-vs-cap survives the wire");
+    assert_eq!(listed.invites.len(), 1);
+    assert_eq!(
+        listed.invites[0].started_at, 1_800_000_600,
+        "the started-and-unfinished signal is the point of the listing"
+    );
+
+    client.revoke_user_invite("rowan").await.unwrap();
+
+    let started = client.begin_user_registration("some-token").await.unwrap();
+    assert_eq!(started.username, "rowan");
+    assert!(started.totp_enrolment_uri.starts_with("otpauth://totp/"));
+    assert_eq!(started.handle, "handle-abc");
+    assert_eq!(started.handle_expires_at, 1_800_001_500);
+
+    client
+        .complete_user_registration("handle-abc", "hunter2", "287082")
+        .await
+        .unwrap();
 }

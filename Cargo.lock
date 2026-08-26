@@ -5054,11 +5054,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hmac",
  "interfaces",
  "rand 0.10.2",
  "rpassword",
  "serde",
  "serde_json",
+ "sha1",
  "tempfile",
  "tokio",
  "wayfinder",

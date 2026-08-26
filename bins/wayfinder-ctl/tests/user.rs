@@ -202,3 +202,181 @@ fn an_account_can_be_created_with_the_password_on_stdin() {
     // And the seeded account is still there: `add` rewrites the whole snapshot.
     assert_eq!(ca.list_users().len(), 2);
 }
+
+/// The reason `user invite` exists offline, driven end to end: **the first
+/// administrator can be created without anybody but its owner ever seeing its
+/// second factor.**
+///
+/// `user add` cannot do that. It mints the TOTP secret and prints the
+/// `otpauth://` URI on the operator's terminal, so the person the account is
+/// for receives their second factor from somebody else — and `user add` is the
+/// only way to create the first account, because creating it over the
+/// management API needs the credential it creates. An invitation breaks that
+/// loop from the other side: it is minted before the provider starts, and
+/// redeemed against the running provider by the person it is for.
+///
+/// Driven through the real binary because the token is printed once, on stdout,
+/// and never recoverable afterwards — which is exactly the property under test.
+#[test]
+fn an_invitation_minted_offline_is_redeemed_against_the_running_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("ca.json");
+    seed_state(&state);
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_wayfinder-ctl"))
+        .args([
+            "user",
+            "invite",
+            "--state",
+            state.to_str().unwrap(),
+            "--username",
+            "rowan",
+            "--admin",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "user invite failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let printed = String::from_utf8(output.stdout).unwrap();
+
+    // The token is printed for the operator to deliver, and nothing else that
+    // belongs to the account is.
+    let token = printed
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("token: "))
+        .unwrap_or_else(|| panic!("no token in:\n{printed}"))
+        .trim()
+        .to_string();
+    assert!(!token.is_empty());
+    assert!(
+        !printed.contains("otpauth://"),
+        "the operator must not be shown the second factor — that is the whole \
+         point of inviting rather than adding:\n{printed}"
+    );
+
+    // Now the provider is running, and the person the account is for redeems
+    // it. Nothing here touches the filesystem the CLI wrote: this is what the
+    // management API would drive.
+    let mut ca = CertAuthority::from_config(&[1u8; 32], &config(&state)).unwrap();
+    let now = 1_700_000_000;
+    ca.set_now_unix(now);
+    let started = ca.begin_user_registration(&token).unwrap();
+    assert_eq!(started.username, "rowan");
+    assert!(started.totp_enrolment_uri.starts_with("otpauth://totp/"));
+
+    let secret = secret_from_uri(&started.totp_enrolment_uri);
+    let code = totp_code_at(&secret, now);
+    ca.complete_user_registration(&started.handle, "correct horse battery staple", &code)
+        .unwrap();
+
+    // The account exists, holds the role the operator chose, and signs in with
+    // credentials the operator never saw.
+    let session = wayfinder_auth::Keypair::from_seed(&[4u8; 32]);
+    let later = now + 30;
+    ca.set_now_unix(later);
+    let outcome = wayfinder_server::MeshAuthority::authenticate_user(
+        &mut ca,
+        "rowan",
+        "correct horse battery staple",
+        &totp_code_at(&secret, later),
+        &session.ed_pubkey(),
+        &session.x_pubkey(),
+    )
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        wayfinder_protos::service::UserAuthOutcome::Issued(_)
+    ));
+
+    // And the seeded account is still there: `invite` rewrites the whole
+    // snapshot, like every other `user` subcommand.
+    assert_eq!(ca.list_users().len(), 2);
+    assert!(
+        ca.list_user_invites().is_empty(),
+        "a redeemed invitation is deleted, not left behind"
+    );
+}
+
+/// `user invites` shows what is outstanding, including the state an operator
+/// acts on: started, and not finished.
+#[test]
+fn the_offline_listing_shows_an_outstanding_invitation() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("ca.json");
+    seed_state(&state);
+
+    run(UserCommand::Invite {
+        state: state.clone(),
+        username: "rowan".into(),
+        admin: false,
+        session_ttl: 900,
+        invite_ttl: 3600,
+    })
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_wayfinder-ctl"))
+        .args(["user", "invites", "--state", state.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let printed = String::from_utf8(output.stdout).unwrap();
+
+    assert!(printed.contains("rowan"), "got:\n{printed}");
+    assert!(
+        !printed.contains("otpauth://"),
+        "a listing must never carry a second factor:\n{printed}"
+    );
+
+    run(UserCommand::RevokeInvite {
+        state: state.clone(),
+        username: "rowan".into(),
+    })
+    .unwrap();
+    let ca = CertAuthority::from_config(&[1u8; 32], &config(&state)).unwrap();
+    assert!(ca.list_user_invites().is_empty());
+}
+
+/// The 20-byte TOTP secret an `otpauth://` URI carries, for a test that has to
+/// present a live code the way an authenticator app would.
+fn secret_from_uri(uri: &str) -> Vec<u8> {
+    let encoded = uri
+        .split_once("secret=")
+        .and_then(|(_, rest)| rest.split('&').next())
+        .expect("the enrolment URI carries a secret");
+    let mut out = Vec::new();
+    let mut buffer: u16 = 0;
+    let mut bits: u32 = 0;
+    for c in encoded.bytes() {
+        let value = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'2'..=b'7' => c - b'2' + 26,
+            other => panic!("not base32: {other}"),
+        };
+        buffer = (buffer << 5) | u16::from(value);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    out
+}
+
+/// The RFC 6238 code an authenticator would show for `secret` at `now_unix`.
+fn totp_code_at(secret: &[u8], now_unix: u64) -> String {
+    use hmac::Mac as _;
+    let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(secret).unwrap();
+    mac.update(&(now_unix / 30).to_be_bytes());
+    let digest = mac.finalize().into_bytes();
+    let offset = (digest[digest.len() - 1] & 0x0f) as usize;
+    let binary = u32::from_be_bytes([
+        digest[offset] & 0x7f,
+        digest[offset + 1],
+        digest[offset + 2],
+        digest[offset + 3],
+    ]);
+    format!("{:06}", binary % 1_000_000)
+}
