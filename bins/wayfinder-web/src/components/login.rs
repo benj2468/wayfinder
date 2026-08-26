@@ -334,12 +334,17 @@ mod tests {
     /// session resource outside a `<Suspense>`, which is a hydration mismatch,
     /// and a hydration mismatch in this crate is a wasm panic that leaves the
     /// page looking right and answering nothing.
+    ///
+    /// The `:not(.wf-shell-bare)` is the registration page's exemption, pinned
+    /// from its own side in `register.rs`.
     #[test]
     fn the_stylesheet_hides_the_shell_behind_this_form() {
         const CSS: &str = include_str!("../../style/main.css");
 
         assert!(
-            CSS.contains(".wf-app:has(.wf-login-page) .wf-shell {\n  display: none;\n}"),
+            CSS.contains(
+                ".wf-app:has(.wf-login-page) .wf-shell:not(.wf-shell-bare) {\n  display: none;\n}"
+            ),
             "the rule that hides the dashboard behind the sign-in form is gone"
         );
     }

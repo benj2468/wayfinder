@@ -1361,8 +1361,16 @@ body {
  *
  * `display: none` and not `visibility`/opacity: it takes the whole shell out of
  * the tab order and the accessibility tree too, which a hidden-but-focusable
- * dashboard behind a sign-in form would not. */
-.wf-app:has(.wf-login-page) .wf-shell {
+ * dashboard behind a sign-in form would not.
+ *
+ * The `:not()` is what keeps the registration page visible. That page reuses
+ * this one's layout class, renders *inside* the shell, and has no sign-in
+ * overlay to hide anything behind — so without the exclusion `:has()` matches
+ * on the registration page's own markup and hides it from itself: a blank page,
+ * with everything correct in the DOM. The exclusion belongs in this selector
+ * rather than in a `display: block` further down, because `.wf-shell-bare`
+ * alone loses the cascade to three classes. */
+.wf-app:has(.wf-login-page) .wf-shell:not(.wf-shell-bare) {
   display: none;
 }
 
@@ -1631,15 +1639,11 @@ body {
 /* The registration page reuses the sign-in page's whole layout — centred mark,
  * one panel, stacked fields — because from where the person is standing it is
  * the same moment: a door, before any dashboard exists. What it does not reuse
- * is `.wf-app:has(.wf-login-page) .wf-shell { display: none }` above, since
- * there is no sign-in overlay here to hide the shell behind. `App` renders no
- * chrome on this route instead, and this class is what gives the bare shell its
- * page back. */
-.wf-shell-bare {
-  display: block;
-}
-
-/* No header, no tab bar, no status strip — so no padding for them either. */
+ * is the `display: none` above, which spares this class by name — there is no
+ * sign-in overlay here to hide the shell behind, and `App` renders no chrome on
+ * this route instead.
+ *
+ * No header, no tab bar, no status strip — so no padding for them either. */
 .wf-shell-bare .wf-main {
   padding: 0;
 }

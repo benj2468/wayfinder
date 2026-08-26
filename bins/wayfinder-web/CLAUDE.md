@@ -398,11 +398,19 @@ and the second is the one that fails silently:
 app once at startup, with no request and so no session, to discover the routes
 to register — so a `<Routes>` behind "is anyone signed in?" registers nothing and
 every tab but the index answers 404, in both modes, from the first boot. That is
-why a signed-out page renders the whole shell and *hides* it (`wf-shell-hidden`,
-`display: none`, which takes it out of the tab order and the accessibility tree
-too) with the sign-in form over the top, rather than not rendering it. Nothing
+why a signed-out page renders the whole shell and *hides* it with the sign-in
+form over the top, rather than not rendering it — the stylesheet's
+`.wf-app:has(.wf-login-page) .wf-shell:not(.wf-shell-bare) { display: none }`,
+which takes it out of the tab order and the accessibility tree too. Nothing
 leaks by that: no tab fetches anything of its own, and the polling loop does not
 run while signed out. `tests/session.rs` pins both halves.
+
+That rule keys off the sign-in page's *layout class*, which `/register` reuses —
+hence the `:not()`, and hence `wf-shell-bare` on the shell for that route.
+Without it the registration page hides itself and the registrant gets a blank
+page with perfect markup underneath. A rule that hides a container on evidence
+found *inside* it has this hazard by construction; both sides pin it in a unit
+test (`login.rs`, `register.rs`).
 
 **The bind address alone does not make it unreachable, which is why
 `server.rs` carries two gates** (`HostPolicy`, and the `known_host_only` /
