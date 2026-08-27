@@ -833,7 +833,7 @@ fn render_link_detail(frame: &mut Frame, app: &App, area: Rect) {
         ))],
         Some(entry) => {
             // Both the label and the raw index: the index is what an operator
-            // types into `wayfinderctl link-enable --iface N`, so a named
+            // types into `wayfinderctl link enable --iface N`, so a named
             // interface must not hide it.
             let mut out = vec![
                 field(
@@ -1130,8 +1130,8 @@ fn focus_border(focused: bool) -> Style {
 
 /// The certificate-authority panel: CSRs awaiting this operator's approval.
 /// Shown only when the connected node is a provider.  The selected row is
-/// approved with `a` / denied with `d` (or from the CLI, `wayfinderctl csr
-/// approve|deny --mac <mac>`).
+/// approved with `a` / denied with `d` (or from the CLI, `wayfinderctl provider
+/// requests approve|deny --mac <mac>`).
 fn render_pending_csrs(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     let block = Block::default()
         .borders(Borders::ALL)

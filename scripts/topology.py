@@ -654,7 +654,7 @@ def render_compose(require_approval: bool = False) -> tuple[str, DevInfo]:
     """Render the full docker-compose YAML for the current topology.
 
     When ``require_approval`` is set, the provider parks incoming CSRs as
-    pending until an operator approves them (``wayfinderctl csr approve`` / the
+    pending until an operator approves them (``wayfinderctl provider requests approve`` / the
     Security tab) instead of auto-signing on submission. Nothing in this sim
     enrols at runtime — every node is minted a certificate up front — so this
     only affects a CSR you submit yourself, by hand.
@@ -1119,7 +1119,7 @@ def main(argv: list[str]) -> int:
             "--require-approval",
             action="store_true",
             help="provider parks CSRs as pending until an operator approves them "
-            "(`wayfinderctl csr approve` / TUI Security tab) instead of auto-signing",
+            "(`wayfinderctl provider requests approve` / TUI Security tab) instead of auto-signing",
         )
 
     # Shared flag: how many unauthenticated nodes to add. Accepted by every

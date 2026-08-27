@@ -109,7 +109,7 @@ outsiders and foreign nodes can't inject topology.
 | `libs/wayfinder-shark` | Wireshark/`tshark` Lua dissector for on-air BATMAN frames, with pytest tests |
 | `bins/wayfinder-tap` | The runnable node — bridges a kernel TAP onto the mesh over UDP and serves the management API |
 | `bins/wayfinder-tui` | `ratatui` terminal dashboard: routing, link quality, OGM schedule, throughput, and security tabs |
-| `bins/wayfinder-ctl` | `wayfinderctl` CLI — query a live node or mint/enroll node certificates offline |
+| `bins/wayfinder-ctl` | `wayfinderctl` CLI — query a live node, administer a provider, or mint/enroll node certificates offline |
 | `bins/rylr998-cli` | CLI to drive/debug a physical RYLR998/RYLR498 module directly over its AT-command serial interface |
 
 ### Bare-metal embedded targets

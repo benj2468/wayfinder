@@ -18,7 +18,7 @@
 #     — it just quietly hands CAP_NET_RAW to an internet-facing process holding
 #     the mesh root key.
 #  3. A full enrollment cycle works: `csr request` at the node, `csr submit` to
-#     the CA, `csr approve` by an operator, collect, `csr install` back at the
+#     the CA, `provider requests approve` by an operator, collect, `csr install` back at the
 #     node. That is the entire reason the box exists.
 #  4. The issued-certificate log survives a restart. It is what the
 #     impersonation guard and every future revocation are built on; an
@@ -461,7 +461,7 @@ testers.nixosTest {
             "wayfinder-ctl --connect 127.0.0.1:7700 "
             "--identity /var/lib/wayfinder/identity.seed "
             "--cert /var/lib/wayfinder/node.cert "
-            f"csr approve --mac {node_mac}"
+            f"provider requests approve --mac {node_mac}"
         )
 
         # Re-submitting the same CSR is how an issued certificate is collected;
@@ -570,7 +570,7 @@ testers.nixosTest {
         peers = ca.succeed(
             "wayfinder-ctl --connect 127.0.0.1:7700 "
             "--identity /var/lib/wayfinder/identity.seed "
-            "--cert /var/lib/wayfinder/node.cert vpn list"
+            "--cert /var/lib/wayfinder/node.cert provider vpn list"
         )
         # No tailscaled has registered, so there is no *node* yet — the
         # assertion is that the call round-trips against the real API, which is
@@ -584,7 +584,7 @@ testers.nixosTest {
             "wayfinder-ctl --connect 127.0.0.1:7700 "
             "--identity /var/lib/wayfinder/identity.seed "
             "--cert /var/lib/wayfinder/node.cert "
-            f"revoke --mac {node_mac}"
+            f"provider revoke --mac {node_mac}"
         )
         users = json.loads(ca.succeed("headscale users list -o json")) or []
         assert all(u["name"] != node_mac_hex for u in users), (
@@ -606,7 +606,7 @@ testers.nixosTest {
             "wayfinder-ctl --connect 127.0.0.1:7700 "
             "--identity /var/lib/wayfinder/identity.seed "
             "--cert /var/lib/wayfinder/node.cert "
-            f"vpn revoke --mac {node_mac}"
+            f"provider vpn revoke --mac {node_mac}"
         )
 
     with subtest("the issued-certificate log survives a CA restart"):
@@ -615,7 +615,7 @@ testers.nixosTest {
         certs = ca.succeed(
             "wayfinder-ctl --connect 127.0.0.1:7700 "
             "--identity /var/lib/wayfinder/identity.seed "
-            "--cert /var/lib/wayfinder/node.cert list-certs"
+            "--cert /var/lib/wayfinder/node.cert provider members"
         )
         assert node_mac in certs, f"{node_mac} missing from the restarted CA's log:\n{certs}"
   '';

@@ -611,7 +611,8 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub enrollment_token: Option<String>,
     /// Sign a submitted CSR on the spot (`true`) rather than parking it as
-    /// *pending* until an operator approves it (`wayfinderctl csr approve`, or
+    /// *pending* until an operator approves it (`wayfinderctl provider requests
+    /// approve`, or
     /// the dashboard's Security tab).
     ///
     /// Defaults to `false`, and the default is the point: omitting this field

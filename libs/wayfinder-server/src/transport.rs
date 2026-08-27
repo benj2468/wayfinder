@@ -3868,7 +3868,7 @@ mod tests {
 
     /// A CA with no VPN configured answers the VPN requests with a sentence
     /// saying so, rather than failing to parse them. That is what lets
-    /// `wayfinderctl enroll` ask unconditionally and finish normally against a
+    /// `wayfinderctl auth enroll` ask unconditionally and finish normally against a
     /// deployment that has no tunnel at all.
     #[tokio::test]
     async fn a_provider_without_vpn_says_so() {

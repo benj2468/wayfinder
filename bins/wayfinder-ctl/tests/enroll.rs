@@ -19,8 +19,12 @@ use wayfinder_auth::TrustAnchor;
 use wayfinder_protos::wayfinder::v1alpha::SubmitCsrRequest;
 use wayfinderctl::Command;
 use wayfinderctl::Endpoint;
+use wayfinderctl::auth::AuthCommand;
+use wayfinderctl::auth::EnrollArgs;
 use wayfinderctl::csr::CsrCommand;
 use wayfinderctl::output::OutputFormat;
+use wayfinderctl::provider::ProviderCommand;
+use wayfinderctl::provider::RequestsCommand;
 use wayfinderctl::run_query;
 
 use provider::spawn_approval_gated_provider;
@@ -44,7 +48,7 @@ async fn a_node_with_no_certificate_can_enroll_with_an_enrolled_provider() {
     let cert_path = dir.path().join("cert");
 
     run_query(
-        Command::Enroll {
+        Command::Auth(AuthCommand::Enroll(EnrollArgs {
             mac: Some("02:00:00:00:00:09".into()),
             token: String::new(),
             out_seed: dir.path().join("seed"),
@@ -52,7 +56,7 @@ async fn a_node_with_no_certificate_can_enroll_with_an_enrolled_provider() {
             out_anchor: anchor_path.clone(),
             no_vpn: true,
             print_vpn_command: false,
-        },
+        })),
         &endpoint,
         OutputFormat::Human,
     )
@@ -71,16 +75,20 @@ async fn a_node_with_no_certificate_can_enroll_with_an_enrolled_provider() {
 async fn an_enrolling_node_cannot_do_anything_but_enroll() {
     let endpoint = spawn_provider_full(None, false, true).await;
 
-    let err = run_query(Command::ListCerts, &endpoint, OutputFormat::Human)
-        .await
-        .unwrap_err();
+    let err = run_query(
+        Command::Provider(ProviderCommand::Members),
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .unwrap_err();
     let err = format!("{err:#}");
     assert!(err.contains("limited to enrollment"), "got: {err}");
 
     let err = run_query(
-        Command::Csr(CsrCommand::Approve {
+        Command::Provider(ProviderCommand::Requests(RequestsCommand::Approve {
             mac: "02:00:00:00:00:09".into(),
-        }),
+        })),
         &endpoint,
         OutputFormat::Human,
     )
@@ -102,7 +110,7 @@ async fn enroll_yields_a_cert_that_verifies_against_the_anchor() {
     let anchor = dir.path().join("anchor");
 
     let out = run_query(
-        Command::Enroll {
+        Command::Auth(AuthCommand::Enroll(EnrollArgs {
             mac: Some("02:00:00:00:00:09".into()),
             token: String::new(),
             out_seed: seed.clone(),
@@ -110,7 +118,7 @@ async fn enroll_yields_a_cert_that_verifies_against_the_anchor() {
             out_anchor: anchor.clone(),
             no_vpn: true,
             print_vpn_command: false,
-        },
+        })),
         &endpoint,
         OutputFormat::Human,
     )
@@ -140,7 +148,7 @@ async fn enroll_without_mac_derives_it_from_the_keypair() {
     let anchor = dir.path().join("anchor");
 
     run_query(
-        Command::Enroll {
+        Command::Auth(AuthCommand::Enroll(EnrollArgs {
             mac: None,
             token: String::new(),
             out_seed: seed.clone(),
@@ -148,7 +156,7 @@ async fn enroll_without_mac_derives_it_from_the_keypair() {
             out_anchor: anchor.clone(),
             no_vpn: true,
             print_vpn_command: false,
-        },
+        })),
         &endpoint,
         OutputFormat::Human,
     )
@@ -177,14 +185,16 @@ async fn enroll_reuses_an_existing_seed_file_instead_of_minting_a_new_identity()
     let cert = dir.path().join("cert");
     let anchor = dir.path().join("anchor");
 
-    let enroll_cmd = |seed: PathBuf, cert: PathBuf, anchor: PathBuf| Command::Enroll {
-        mac: Some("02:00:00:00:00:09".into()),
-        token: String::new(),
-        out_seed: seed,
-        out_cert: cert,
-        out_anchor: anchor,
-        no_vpn: true,
-        print_vpn_command: false,
+    let enroll_cmd = |seed: PathBuf, cert: PathBuf, anchor: PathBuf| {
+        Command::Auth(AuthCommand::Enroll(EnrollArgs {
+            mac: Some("02:00:00:00:00:09".into()),
+            token: String::new(),
+            out_seed: seed,
+            out_cert: cert,
+            out_anchor: anchor,
+            no_vpn: true,
+            print_vpn_command: false,
+        }))
     };
 
     run_query(
@@ -227,7 +237,7 @@ async fn enroll_rejected_without_required_token() {
     let endpoint = spawn_provider(Some("s3cret".to_string())).await;
     let dir = tempfile::tempdir().unwrap();
     let err = run_query(
-        Command::Enroll {
+        Command::Auth(AuthCommand::Enroll(EnrollArgs {
             mac: Some("02:00:00:00:00:09".into()),
             token: String::new(), // missing
             out_seed: dir.path().join("seed"),
@@ -235,7 +245,7 @@ async fn enroll_rejected_without_required_token() {
             out_anchor: dir.path().join("anchor"),
             no_vpn: true,
             print_vpn_command: false,
-        },
+        })),
         &endpoint,
         OutputFormat::Human,
     )
@@ -252,7 +262,7 @@ async fn list_certs_shows_an_enrolled_node() {
     let endpoint = spawn_provider(None).await;
     let dir = tempfile::tempdir().unwrap();
     run_query(
-        Command::Enroll {
+        Command::Auth(AuthCommand::Enroll(EnrollArgs {
             mac: Some("02:00:00:00:00:09".into()),
             token: String::new(),
             out_seed: dir.path().join("seed"),
@@ -260,16 +270,20 @@ async fn list_certs_shows_an_enrolled_node() {
             out_anchor: dir.path().join("anchor"),
             no_vpn: true,
             print_vpn_command: false,
-        },
+        })),
         &endpoint,
         OutputFormat::Json,
     )
     .await
     .unwrap();
 
-    let out = run_query(Command::ListCerts, &endpoint, OutputFormat::Json)
-        .await
-        .expect("list-certs succeeds");
+    let out = run_query(
+        Command::Provider(ProviderCommand::Members),
+        &endpoint,
+        OutputFormat::Json,
+    )
+    .await
+    .expect("list-certs succeeds");
     let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
     let certs = parsed["certs"].as_array().unwrap();
     assert_eq!(certs.len(), 1, "the provider lists the enrolled node");
@@ -281,9 +295,13 @@ async fn list_certs_shows_an_enrolled_node() {
 #[tokio::test]
 async fn list_certs_is_empty_before_any_enrollment() {
     let endpoint = spawn_provider(None).await;
-    let out = run_query(Command::ListCerts, &endpoint, OutputFormat::Human)
-        .await
-        .unwrap();
+    let out = run_query(
+        Command::Provider(ProviderCommand::Members),
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .unwrap();
     assert!(out.contains("no certificates issued"), "got: {out}");
 }
 
@@ -291,9 +309,9 @@ async fn list_certs_is_empty_before_any_enrollment() {
 async fn revoke_round_trips() {
     let endpoint = spawn_provider(None).await;
     let out = run_query(
-        Command::Revoke {
+        Command::Provider(ProviderCommand::Revoke {
             mac: "02:00:00:00:00:09".into(),
-        },
+        }),
         &endpoint,
         OutputFormat::Human,
     )
@@ -306,9 +324,13 @@ async fn revoke_round_trips() {
 /// operator's cue to act.
 async fn wait_for_pending(endpoint: &Endpoint) {
     for _ in 0..500 {
-        let out = run_query(Command::Csr(CsrCommand::List), endpoint, OutputFormat::Json)
-            .await
-            .unwrap();
+        let out = run_query(
+            Command::Provider(ProviderCommand::Requests(RequestsCommand::List)),
+            endpoint,
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         if parsed["pending"].as_array().is_some_and(|p| !p.is_empty()) {
             return;
@@ -333,7 +355,7 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
 
     // Enrolling node: fails at first, responds with pending
     let err = run_query(
-        Command::Enroll {
+        Command::Auth(AuthCommand::Enroll(EnrollArgs {
             mac: Some("02:00:00:00:00:09".into()),
             token: String::new(),
             out_seed: dir.path().join("seed"),
@@ -341,7 +363,7 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
             out_anchor: anchor_path.clone(),
             no_vpn: true,
             print_vpn_command: false,
-        },
+        })),
         &endpoint,
         OutputFormat::Human,
     )
@@ -353,9 +375,9 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
     );
 
     run_query(
-        Command::Csr(CsrCommand::Approve {
+        Command::Provider(ProviderCommand::Requests(RequestsCommand::Approve {
             mac: "02:00:00:00:00:09".into(),
-        }),
+        })),
         &endpoint,
         OutputFormat::Human,
     )
@@ -364,7 +386,7 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
 
     // Enrolling node: once approved, collects the cert
     let out = run_query(
-        Command::Enroll {
+        Command::Auth(AuthCommand::Enroll(EnrollArgs {
             mac: Some("02:00:00:00:00:09".into()),
             token: String::new(),
             out_seed: dir.path().join("seed"),
@@ -372,7 +394,7 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
             out_anchor: anchor_path.clone(),
             no_vpn: true,
             print_vpn_command: false,
-        },
+        })),
         &endpoint,
         OutputFormat::Human,
     )
@@ -395,7 +417,7 @@ async fn enroll_fails_when_operator_denies() {
     let dir = tempfile::tempdir().unwrap();
 
     let err = run_query(
-        Command::Enroll {
+        Command::Auth(AuthCommand::Enroll(EnrollArgs {
             mac: Some("02:00:00:00:00:09".into()),
             token: String::new(),
             out_seed: dir.path().join("seed"),
@@ -403,7 +425,7 @@ async fn enroll_fails_when_operator_denies() {
             out_anchor: dir.path().join("anchor"),
             no_vpn: true,
             print_vpn_command: false,
-        },
+        })),
         &endpoint,
         OutputFormat::Human,
     )
@@ -415,9 +437,9 @@ async fn enroll_fails_when_operator_denies() {
     );
 
     run_query(
-        Command::Csr(CsrCommand::Deny {
+        Command::Provider(ProviderCommand::Requests(RequestsCommand::Deny {
             mac: "02:00:00:00:00:09".into(),
-        }),
+        })),
         &endpoint,
         OutputFormat::Human,
     )
@@ -425,7 +447,7 @@ async fn enroll_fails_when_operator_denies() {
     .unwrap();
 
     let err = run_query(
-        Command::Enroll {
+        Command::Auth(AuthCommand::Enroll(EnrollArgs {
             mac: Some("02:00:00:00:00:09".into()),
             token: String::new(),
             out_seed: dir.path().join("seed"),
@@ -433,7 +455,7 @@ async fn enroll_fails_when_operator_denies() {
             out_anchor: dir.path().join("anchor"),
             no_vpn: true,
             print_vpn_command: false,
-        },
+        })),
         &endpoint,
         OutputFormat::Human,
     )
@@ -537,7 +559,7 @@ async fn csr_submit_collects_the_certificate_after_an_operator_approves() {
 
     // The operator approves — here through the API the web/TUI screens call.
     run_query(
-        Command::Csr(CsrCommand::Approve {
+        Command::Provider(ProviderCommand::Requests(RequestsCommand::Approve {
             mac: node
                 .derived_mac()
                 .0
@@ -545,7 +567,7 @@ async fn csr_submit_collects_the_certificate_after_an_operator_approves() {
                 .map(|b| format!("{b:02x}"))
                 .collect::<Vec<_>>()
                 .join(":"),
-        }),
+        })),
         &endpoint,
         OutputFormat::Human,
     )

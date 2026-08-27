@@ -120,8 +120,9 @@ in
         must exist on disk before `wayfinder.service` starts (provision them
         with your secrets tooling of choice — this module does not); or at
         runtime, against the *already-running* node's management API via
-        `wayfinder-ctl set-auth <seed> <cert> <anchor>` (a oneshot service or
-        activation script gated on `wayfinder.service` being up).
+        `wayfinder-ctl auth set --seed <seed> --cert <cert> --trust-anchor
+        <anchor>` (a oneshot service or activation script gated on
+        `wayfinder.service` being up).
       '';
     };
 
