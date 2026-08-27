@@ -255,6 +255,23 @@ on disk and assuming the node picks it up on its next restart. `wayfinderctl
 cert install` did the former and was deleted for it — `csr install` replaces it
 with `SetAuth` over the wire, which works against a board and a host alike.
 
+The rule extends to state a node *owns* on its own disk, not only to state it
+reads. `wayfinderctl user` administered a provider's accounts by editing its
+`ca-state.json`, and was rewritten as pure RPC for it (design 15): a provider
+loads that snapshot once at startup and rewrites it whole on every write, so a
+host-side editor does not merge with those writes — whichever wrote last won the
+entire file, silently discarding either the operator's change or the provider's
+issued-certificate log. **A file with one owning process has one writer**, and
+reaching it from beside that process is the same mistake as reaching a node's
+filesystem from off-box.
+
+What that leaves is the bootstrap objection — the first account cannot be
+created *by* an account — and its answer is the credential the operator is
+already standing next to: the node's own identity seed authenticates at the
+self-key tier, which is admitted to every request. Whoever has a shell on the
+provider host can therefore do anything an admin can, over the wire, without an
+account existing.
+
 The test to apply: *would this command still work against a node with no
 filesystem?* If not, the state it produces belongs in an RPC.
 
@@ -434,8 +451,10 @@ look at if a duty-cycle-limited radio segment gets crowded.
   a generally-available *Router* scope (the TUI's seven) and an
   administrators-only *Provider* scope for what the node governs as the mesh's
   certificate authority. A node's two jobs, kept apart.
-- **bins/wayfinder-ctl** (`wayfinderctl`) — CLI mgmt client (query commands) +
-  offline `cert` tooling + online `enroll`.
+- **bins/wayfinder-ctl** (`wayfinderctl`) — CLI mgmt client (query commands,
+  and `user` account administration) + offline `cert` tooling + online
+  `enroll`. `cert` is the only offline half that touches authority state, and
+  it operates on the mesh root seed, never on a provider's `ca-state.json`.
 - **bins/rylr998-cli** — a small host CLI for driving a RYLR998/498 module over
   a real serial port, for bringing up and debugging a LoRa link outside a full
   node. Split lib (`rylr998_cli::run_command`) + thin `clap` binary on purpose,

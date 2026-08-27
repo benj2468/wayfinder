@@ -2,286 +2,30 @@
 //! real `CertAuthority`, and `run_query` drives the full client → server →
 //! authority path.  Asserts the issued certificate verifies against the anchor
 //! the client wrote.
+//!
+//! The provider itself lives in `provider/mod.rs`, shared with the account
+//! tests — see that module for why the mock routes its mutations through a real
+//! `AuthorityAdapter`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod provider;
+
 use std::path::PathBuf;
 
-use tokio::net::TcpListener;
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use wayfinder_auth::Keypair;
 use wayfinder_auth::MembershipCert;
 use wayfinder_auth::TrustAnchor;
-use wayfinder_client::Identity;
-use wayfinder_protos::service::AlarmsData;
-use wayfinder_protos::service::AuthorityDataProvider;
-use wayfinder_protos::service::CsrOutcome;
-use wayfinder_protos::service::InterfaceThroughputData;
-use wayfinder_protos::service::IssuedCertData;
-use wayfinder_protos::service::KeepAliveEntryData;
-use wayfinder_protos::service::LinkFeaturesEntryData;
-use wayfinder_protos::service::LinkQualityEntryData;
-use wayfinder_protos::service::LogsData;
-use wayfinder_protos::service::NodeMetricsData;
-use wayfinder_protos::service::OgmScheduleEntryData;
-use wayfinder_protos::service::PendingCsrData;
-use wayfinder_protos::service::RouteResolutionData;
-use wayfinder_protos::service::RouterDataProvider;
-use wayfinder_protos::service::RoutingEntryData;
-use wayfinder_protos::service::RuntimeConfigData;
-use wayfinder_protos::service::TableOccupancyData;
 use wayfinder_protos::wayfinder::v1alpha::SubmitCsrRequest;
-use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
-use wayfinder_protos::wayfinder::v1alpha::WayfinderResponse;
-use wayfinder_server::AuthSnapshot;
-use wayfinder_server::CertAuthority;
-use wayfinder_server::MeshAuthority;
 use wayfinderctl::Command;
 use wayfinderctl::Endpoint;
 use wayfinderctl::csr::CsrCommand;
 use wayfinderctl::output::OutputFormat;
 use wayfinderctl::run_query;
 
-/// A provider node: a real certificate authority behind the data-provider trait.
-/// Only the provider methods carry behaviour; the rest are trivial.
-struct ProviderMock {
-    ca: CertAuthority,
-}
-
-fn occ() -> TableOccupancyData {
-    TableOccupancyData {
-        used: 0,
-        capacity: 0,
-    }
-}
-
-impl RouterDataProvider for ProviderMock {
-    fn node_id(&self) -> Vec<u8> {
-        vec![0, 0, 0, 0, 0, 1]
-    }
-    fn num_originators(&self) -> u32 {
-        0
-    }
-    fn auth_locked(&self) -> bool {
-        false
-    }
-    fn routing_table(&self) -> Vec<RoutingEntryData> {
-        vec![]
-    }
-    fn link_quality_table(&self) -> Vec<LinkQualityEntryData> {
-        vec![]
-    }
-    fn link_features_table(&self) -> Vec<LinkFeaturesEntryData> {
-        vec![]
-    }
-    fn keepalive_table(&self) -> Vec<KeepAliveEntryData> {
-        vec![]
-    }
-    fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData> {
-        vec![]
-    }
-    fn throughput(&self) -> Vec<InterfaceThroughputData> {
-        vec![]
-    }
-    fn node_metrics(&self) -> NodeMetricsData {
-        NodeMetricsData {
-            uptime_secs: 0,
-            neighbor_count: 0,
-            originators: occ(),
-            broadcast_dedup: occ(),
-            local_mcast_groups: occ(),
-            mcast_memberships: occ(),
-            tq_min: 0,
-            tq_max: 0,
-            tq_mean: 0.0,
-            paths_max: 0,
-            paths_mean: 0.0,
-            oversize_drops: 0,
-            relay_oversize_drops: 0,
-            cert_store: occ(),
-            in_flight_cert_requests: occ(),
-            pending_cert_replies: occ(),
-            cert_req_rate: 0.0,
-            cert_reply_rate: 0.0,
-            untaggable_drop_rate: 0.0,
-        }
-    }
-    fn resolve_route(&self, _destination: &[u8]) -> Option<RouteResolutionData> {
-        None
-    }
-    fn set_auth(&mut self, _seed: &[u8], _cert: &[u8], _trust_anchor: &[u8]) -> Result<(), String> {
-        Ok(())
-    }
-    fn set_config(&mut self, _config: RuntimeConfigData) -> Result<(), String> {
-        Ok(())
-    }
-    fn runtime_config_active(&self) -> bool {
-        false
-    }
-
-    /// Log access is served from a process-wide ring rather than from router
-    /// state, so this stub reports an empty one — these tests exercise the
-    /// transport and the query commands, not the log path (covered in
-    /// `wayfinder-log` and `RouterAdapter`).
-    fn alarms(&self) -> AlarmsData {
-        // Nothing wrong: an empty board is the node's "all systems normal", and
-        // none of these cases is about alarms.
-        AlarmsData::default()
-    }
-
-    fn logs(&self, _since_seq: u64, _max_records: u32) -> LogsData {
-        LogsData::default()
-    }
-
-    fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
-        Ok(directives.to_string())
-    }
-}
-
-impl AuthorityDataProvider for ProviderMock {
-    fn get_trust_anchor(&self) -> Result<Vec<u8>, String> {
-        Ok(self.ca.trust_anchor_bytes())
-    }
-    fn submit_csr(
-        &mut self,
-        node_mac: &[u8],
-        ed_pubkey: &[u8],
-        x_pubkey: &[u8],
-        enrollment_token: &str,
-    ) -> Result<CsrOutcome, String> {
-        self.ca
-            .submit_csr(node_mac, ed_pubkey, x_pubkey, enrollment_token)
-    }
-    fn revoke_node(&mut self, node_mac: &[u8]) -> Result<(), String> {
-        self.ca.revoke(node_mac).map(|_| ())
-    }
-    fn list_certs(&self) -> Result<Vec<IssuedCertData>, String> {
-        Ok(self.ca.list_certs())
-    }
-    fn list_pending_csrs(&self) -> Result<Vec<PendingCsrData>, String> {
-        Ok(self.ca.list_pending())
-    }
-    fn approve_csr(&mut self, node_mac: &[u8]) -> Result<(), String> {
-        self.ca.approve_csr(node_mac)
-    }
-    fn deny_csr(&mut self, node_mac: &[u8]) -> Result<(), String> {
-        self.ca.deny_csr(node_mac)
-    }
-}
-
-/// Spawn an auto-approving provider node (mesh `0xABCD`, optional token) — one
-/// that signs on submission — and return a bootstrap [`Endpoint`] for it.
-async fn spawn_provider(token: Option<String>) -> Endpoint {
-    spawn_provider_with(token, true).await
-}
-
-/// Spawn a provider node in the closed posture, which holds each request until
-/// an operator approves it, and return a bootstrap [`Endpoint`] for it.
-///
-/// A named helper rather than a bool at the call site: which of the two
-/// enrollment paths a test drives is the most important thing about it.
-async fn spawn_approval_gated_provider() -> Endpoint {
-    spawn_provider_with(None, false).await
-}
-
-/// Spawn a provider node, choosing its enrollment posture, and return an
-/// [`Endpoint`] that bootstraps against it (the node is un-enrolled at the
-/// transport layer, so proving its own key is admitted).
-async fn spawn_provider_with(token: Option<String>, auto_approve: bool) -> Endpoint {
-    spawn_provider_full(token, auto_approve, false).await
-}
-
-/// Spawn a provider node, and choose whether it is *itself* enrolled — whether
-/// its transport reports a trust anchor, which is what a real certificate
-/// authority looks like (it is a member of the mesh it certifies).
-///
-/// The returned endpoint's identity differs accordingly: against an un-enrolled
-/// provider it presents the node's own key, and against an enrolled one it
-/// presents a freshly-minted key with no certificate at all — a stranger, which
-/// is exactly what a node asking to join is.
-async fn spawn_provider_full(
-    token: Option<String>,
-    auto_approve: bool,
-    provider_enrolled: bool,
-) -> Endpoint {
-    // The node's TLS identity seed; the bootstrap client presents this same key.
-    let seed = [9u8; 32];
-    let node_key = Keypair::from_seed(&seed).ed_pubkey();
-
-    let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, token, auto_approve);
-    ca.set_now_unix(100);
-    let anchor =
-        provider_enrolled.then(|| TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap());
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    let (query_tx, mut query_rx) =
-        mpsc::channel::<(WayfinderRequest, oneshot::Sender<WayfinderResponse>)>(16);
-
-    // Auth snapshot responder: nothing revoked, and an anchor only when the
-    // provider is enrolled.
-    let (snapshot_tx, mut snapshot_rx) = mpsc::channel::<oneshot::Sender<AuthSnapshot>>(4);
-    tokio::spawn(async move {
-        while let Some(reply) = snapshot_rx.recv().await {
-            let _ = reply.send(AuthSnapshot {
-                own_key: Some(node_key),
-                anchor,
-                revoked: Vec::new(),
-                own_mac: wayfinder_server::Mac([2, 0, 0, 0, 0, 1]),
-            });
-        }
-    });
-    let (authority_tx, mut authority_rx) =
-        tokio::sync::mpsc::channel::<wayfinder_server::AuthorityCommand>(8);
-    tokio::spawn(async move {
-        let _ = wayfinder_server::serve_tls_server_with_vpn(
-            listener,
-            seed,
-            snapshot_tx,
-            query_tx,
-            None,
-            Some(authority_tx),
-        )
-        .await;
-    });
-    tokio::spawn(async move {
-        let mut provider = ProviderMock { ca };
-        loop {
-            tokio::select! {
-                Some((req, resp_tx)) = query_rx.recv() => {
-                    let resp = wayfinder_protos::service::handle_router(&mut provider, req)
-                        .unwrap_or_else(|_| wayfinder_server::not_a_provider_response());
-                    let _ = resp_tx.send(resp);
-                }
-                Some(command) = authority_rx.recv() => match command {
-                    wayfinder_server::AuthorityCommand::Request(req, reply) => {
-                        let resp = wayfinder_protos::service::handle_authority(&mut provider, req)
-                            .unwrap_or_else(|_| wayfinder_server::not_a_provider_response());
-                        let _ = reply.send(resp);
-                    }
-                    wayfinder_server::AuthorityCommand::SetEnrollmentPolicy(_, reply) => {
-                        let _ = reply.send(Ok(()));
-                    }
-                },
-                else => break,
-            }
-        }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    Endpoint {
-        addr: addr.into(),
-        node_key,
-        identity: Identity {
-            // A stranger's key against an enrolled provider; the node's own key
-            // (the bootstrap path) against an un-enrolled one.
-            seed: if provider_enrolled { [4u8; 32] } else { seed },
-            cert: Vec::new(),
-        },
-    }
-}
+use provider::spawn_approval_gated_provider;
+use provider::spawn_provider;
+use provider::spawn_provider_full;
 
 /// The case online enrollment actually has to serve: the provider is itself an
 /// enrolled member of the mesh it certifies, and the node asking to join holds

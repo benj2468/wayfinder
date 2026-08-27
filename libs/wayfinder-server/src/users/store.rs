@@ -25,8 +25,9 @@
 //! story. A user proves a username, password and TOTP code here and receives a
 //! certificate bound to a keypair the *client* generated; from that point it is
 //! an ordinary certificate holder and every node authorizes it through the
-//! unchanged `decide_access`. The whole module is `std`-gated and an embedded
-//! node never links it.
+//! unchanged `decide_access`. This module is `std`-gated and an embedded node
+//! never links it — only [`UserRole`](super::types::UserRole), which the
+//! management-API seam names on every target, sits outside the gate.
 //!
 //! # What a failed login tells the caller
 //!
@@ -42,6 +43,7 @@ use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::users::types::UserRole;
 use argon2::Algorithm;
 use argon2::Argon2;
 use argon2::Params;
@@ -50,6 +52,7 @@ use argon2::PasswordVerifier;
 use argon2::Version;
 use argon2::password_hash::PasswordHash;
 use argon2::password_hash::SaltString;
+
 use hmac::Hmac;
 use hmac::Mac as _;
 use serde::Deserialize;
@@ -201,23 +204,6 @@ impl AccountId {
     pub fn matches(&self, bytes: &[u8]) -> bool {
         bytes == self.0
     }
-}
-
-/// What an account's session certificates may do.
-///
-/// Two roles, not a bitmask, because they are the two management tiers that
-/// exist: `CERT_FLAG_ADMIN` and `CERT_FLAG_VIEWER`. A third would mean a third
-/// tier in `permits`, which is a decision to take there rather than here.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum UserRole {
-    /// Session certificates carry `CERT_FLAG_ADMIN`: full management.
-    Admin,
-    /// Session certificates carry `CERT_FLAG_VIEWER`: the queries only.
-    ///
-    /// The default, so an account created without a role stated is the one
-    /// that can do less.
-    #[default]
-    Viewer,
 }
 
 /// One user account in the certificate authority's store.

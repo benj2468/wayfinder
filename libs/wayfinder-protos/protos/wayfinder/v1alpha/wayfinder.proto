@@ -1021,6 +1021,18 @@ message WayfinderRequest {
     // End every session an account currently holds, leaving the account itself
     // (provider mode).  Requires a full management grant.
     RevokeUserSessionsRequest revoke_user_sessions = 37;
+
+    // Change an account's role between administrator and read-only (provider
+    // mode).  Requires a full management grant.
+    SetUserRoleRequest set_user_role = 38;
+
+    // Enable or disable an account (provider mode).  Requires a full management
+    // grant.
+    SetUserEnabledRequest set_user_enabled = 39;
+
+    // Replace an account's password (provider mode).  Requires a full
+    // management grant.
+    SetUserPasswordRequest set_user_password = 40;
   }
 }
 
@@ -1531,9 +1543,11 @@ message AuthenticateUserRequest {
 
 // List the certificate authority's user accounts (provider mode).
 //
-// Administered offline by `wayfinderctl user` as well, and that tool remains
-// the only way to create the *first* account: creating one over this API needs
-// the credential it creates.
+// Administered by `wayfinderctl user` as well, which speaks this same API —
+// including for the *first* account, which cannot be created by an account
+// because creating one needs the credential it creates.  An operator on the
+// provider host presents the node's own identity seed instead, which
+// authenticates at the self-key tier and may invoke every request here.
 message ListUsersRequest {}
 
 // Answer to a ListUsersRequest: the accounts this authority holds.
@@ -1581,8 +1595,8 @@ message UserAccount {
 // can mint another account, so this endpoint makes the user store remotely
 // mutable by anyone holding one.  That is a deliberate widening — an admin can
 // already revoke nodes and rewrite the enrollment policy — but it is a widening,
-// and `wayfinderctl user` on the provider host remains the path that needs no
-// network at all.
+// and `wayfinderctl user` on the provider host reaches this same request over
+// the node's loopback listener.
 message CreateUserRequest {
   // The account name, unique within this authority.  A name already in use is
   // an error rather than a silent replacement.
@@ -1637,9 +1651,12 @@ message CreateUserResponse {
 // Answered with the empty response on success.  The authority refuses to remove
 // the last account that can still administer the mesh: `CreateUserRequest` and
 // this one both need a full management grant, so an authority left with no
-// enabled administrator has a user store that can no longer be changed over
-// this API in either direction, recoverable only with `wayfinderctl user add`
-// on the provider host.
+// enabled administrator has a user store no ordinary session can change in
+// either direction.  Recovery does not need a shell editing state: an operator
+// on the provider host holds the node's own identity seed, which authenticates
+// at the self-key tier and may invoke every request here — so `wayfinderctl user
+// add --identity <node seed> --admin` creates a fresh administrator against the
+// running provider.
 message RemoveUserRequest {
   // The account to remove.  A name that is not on file is an error rather than
   // a silent success: whoever sent it has a wrong idea about the roster.
@@ -1673,6 +1690,121 @@ message RevokeUserSessionsResponse {
   // question whose answer is a number — "nothing was cut off" and "three devices
   // were" call for different follow-up.
   uint32 revoked = 1;
+}
+
+// Change an account's role between administrator and read-only (provider mode).
+// Requires a full management grant.
+//
+// **A demotion revokes the account's live sessions**, as one durable act with
+// the role change.  The capability lives on the certificate, not on the account:
+// a session issued while the account was an administrator carries
+// `CERT_FLAG_ADMIN` and keeps carrying it until it is revoked or expires.  So a
+// role change that only altered what the account is issued *next* would report
+// an access as removed while it was still being exercised — the same gap
+// `RemoveUserRequest` used to have, for the same reason.
+//
+// A promotion revokes nothing.  The certificates the account already holds grant
+// less than the account now does, which costs its holder a sign-in and nobody
+// any access.
+//
+// The authority refuses to demote the last account that can still administer the
+// mesh, exactly as it refuses to remove it: the two acts leave the same mesh.
+message SetUserRoleRequest {
+  // The account to change.  A name that is not on file is an error rather than
+  // a silent success: whoever sent it has a wrong idea about the roster.
+  string username = 1;
+
+  // The role the account should hold: true for the management-administration
+  // capability, false for read-only.
+  //
+  // The role is *stated*, never toggled.  A toggle's outcome depends on a
+  // present state the caller may be wrong about, and being wrong about it here
+  // means granting administration to an account somebody meant to demote.
+  bool admin = 2;
+}
+
+// Answer to a SetUserRoleRequest.
+message SetUserRoleResponse {
+  // How many session certificates the change revoked.
+  //
+  // Zero for every promotion, and for a demotion of an account holding nothing
+  // live.  Reported because "the demotion also cut off two live admin sessions"
+  // and "it cut off nothing" call for different follow-up.
+  uint32 revoked = 1;
+
+  // Whether the account was already in the requested role, so nothing changed.
+  //
+  // Not an error: a caller stating the role it wants got the account it wanted.
+  // Reported so an operator is not shown a change that did not happen.
+  bool unchanged = 2;
+}
+
+// Enable or disable an account (provider mode).  Requires a full management
+// grant.
+//
+// **Disabling revokes the account's live sessions**, as one durable act.  A
+// disabled account obtains no *new* session; without the revocation the ones it
+// already held would keep working for up to its whole session lifetime, which
+// makes "disabled" a statement about the future rather than about access now.
+//
+// Enabling clears any lockout with it: an operator turning an account back on
+// means it should work, not that it should work in fifteen minutes.
+//
+// The authority refuses to disable the last account that can still administer
+// the mesh — a disabled administrator administers nothing, so this strands the
+// mesh exactly as removing it would.
+message SetUserEnabledRequest {
+  // The account to change.  A name that is not on file is an error rather than
+  // a silent success.
+  string username = 1;
+
+  // True to enable the account, false to disable it.  Stated rather than
+  // toggled, for the reason `SetUserRoleRequest.admin` gives.
+  bool enabled = 2;
+}
+
+// Answer to a SetUserEnabledRequest.
+message SetUserEnabledResponse {
+  // How many session certificates disabling the account revoked.  Zero for
+  // every enable, and for an account holding nothing live.
+  uint32 revoked = 1;
+
+  // Whether the account was already in the requested state, so nothing changed.
+  bool unchanged = 2;
+}
+
+// Replace an account's password (provider mode).  Requires a full management
+// grant.
+//
+// The administrative reset, for somebody who has lost their password — not a
+// self-service change, which would need the old password and does not exist
+// here yet.  Clears any lockout, since an operator setting a password means the
+// account should be usable with it.
+//
+// **Revokes nothing.**  A reset is not by itself a statement that the account's
+// current sessions are untrusted: the common case is a forgotten password, and
+// ending every device the person is signed in on is a bigger act than they
+// asked for.  When the reset *is* a response to a compromise, the act that ends
+// the sessions is `RevokeUserSessionsRequest`, which says so explicitly.
+//
+// The second factor is untouched.  An operator who can also replace that is an
+// operator who can take over an account with one request, leaving its owner no
+// signal; whoever needs a fresh factor gets a fresh invite.
+//
+// Answered with the empty response on success.
+message SetUserPasswordRequest {
+  // The account to change.  A name that is not on file is an error rather than
+  // a silent success.
+  string username = 1;
+
+  // The new password, in the clear on an already-encrypted channel — the same
+  // treatment `CreateUserRequest` and `AuthenticateUserRequest` give one.  The
+  // authority stores only an Argon2id hash of it.
+  //
+  // Refused if empty: an account whose password is the empty string is not a
+  // credential, and the refusal belongs here rather than at the sign-in it would
+  // otherwise make trivially guessable.
+  string password = 2;
 }
 
 // Mint a one-time invite that lets the person an account is for register it
@@ -2118,5 +2250,11 @@ message WayfinderResponse {
 
     // Response to RevokeUserSessionsRequest.
     RevokeUserSessionsResponse revoke_user_sessions = 29;
+
+    // Response to SetUserRoleRequest.
+    SetUserRoleResponse set_user_role = 30;
+
+    // Response to SetUserEnabledRequest.
+    SetUserEnabledResponse set_user_enabled = 31;
   }
 }

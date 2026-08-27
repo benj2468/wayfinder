@@ -82,8 +82,11 @@ run on the host.)
 
 A secured node's dashboard has **no credential of its own**: it is started in
 login mode (``--provider``), and whoever opens it signs in with one of the two
-accounts this script mints into the provider before the stack comes up —
-``admin`` (full management) and ``viewer`` (read-only).  Both use the password
+accounts this script creates once the provider is up — ``admin`` (full
+management) and ``viewer`` (read-only).  They are created over the provider's
+management API, not by writing its state file: a running provider rewrites that
+whole file from memory on every write, so an edit made beside it is discarded by
+its next one (see ``make_accounts``).  Both use the password
 ``SIM_PASSWORD`` below and have no second factor, since a simulation has nowhere
 to enrol an authenticator.  Signing in obtains a short-lived certificate from
 the provider; the dashboard holds it for that browser session and nobody else.
@@ -141,6 +144,7 @@ import itertools
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -300,7 +304,7 @@ def open_nodes(attach_to: str, count: int = -1) -> list[list[str]]:
 # node, and one admin cert for the dashboards. See `make_identities`.
 
 
-def _ctl(*args: str, stdin: str | None = None) -> str:
+def _ctl(*args: str, stdin: str | None = None, check: bool = True) -> str:
     """Run `wayfinderctl` from the workspace, returning its stdout.
 
     Via ``cargo run`` rather than a path into ``target/``, so the caller never
@@ -311,15 +315,31 @@ def _ctl(*args: str, stdin: str | None = None) -> str:
     stdin and cannot be an argument: argv is readable by every process on the
     host, and the prompt the command otherwise uses reads ``/dev/tty``, which
     would block here on whatever terminal this script inherited.
+
+    ``check`` is exposed so a caller can poll a command that is *expected* to
+    fail while the stack is still coming up.
     """
     result = subprocess.run(
         ["cargo", "run", "--quiet", "-p", "wayfinder-ctl", "--", *args],
         cwd=REPO_ROOT,
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
         input=stdin,
     )
+    if result.returncode != 0:
+        if not check:
+            _ctl.last_error = result.stderr.strip()
+            return ""
+        # `check=True` on `subprocess.run` would raise "returned non-zero exit
+        # status 1" and nothing else — `wayfinderctl`'s actual message ("user
+        # rowan already exists", an auth denial, a TLS pin mismatch) is on
+        # stderr, which we captured and would otherwise drop on the floor. The
+        # reason is the whole value of the failure.
+        raise RuntimeError(
+            f"wayfinderctl {' '.join(args)} failed (exit {result.returncode}):\n"
+            f"{result.stderr.strip()}"
+        )
     return result.stdout
 
 
@@ -361,12 +381,14 @@ def make_identities(
       a ``wayfinderctl`` run from the host presents when it drives a node
       directly, and an enrolled node refuses a management connection that cannot
       present one.
-    * ``provider-state/``     — the provider's durable CA state, pre-seeded with
-      the two user accounts a dashboard signs in as, and mounted *writable* into
-      the provider (everything else here is read-only).  It has to be seeded
-      before the stack comes up: the provider holds this state in memory and
-      rewrites the whole snapshot, so an account added to a running provider's
-      file is overwritten by the next thing it persists.
+    * ``provider-state/``     — where the provider's durable CA state lands,
+      mounted *writable* into the provider (everything else here is read-only)
+      and empty until it writes there itself.  Nothing on the host writes into
+      it: the two dashboard accounts are created over the management API once
+      the provider is running (``make_accounts``), because a provider holds this
+      state in memory and rewrites the whole snapshot, so a host-side edit is
+      discarded by the next thing it persists — or discards that, in the other
+      order.
 
     Pre-issuing rather than enrolling at runtime is what makes each node's MAC
     reproducible: the node derives its MAC from this seed, and ``cert issue``
@@ -433,8 +455,6 @@ def make_identities(
     # signed admin bit exists to prevent.
     issue_into(ca_dir / "operator", admin=True)
 
-    make_accounts(ca_dir)
-
     print(f"minted mesh identities in {ca_dir}", file=sys.stderr)
     return ca_dir, node_keys
 
@@ -450,27 +470,61 @@ def provider_state_dir(ca_dir: Path) -> Path:
     return ca_dir / "provider-state"
 
 
-def provider_state_path(ca_dir: Path) -> Path:
-    """The provider's CA state file on the host."""
-    return provider_state_dir(ca_dir) / "ca-state.json"
+def make_accounts(dev: DevInfo) -> None:
+    """Create the dashboard accounts on the running provider, over its API.
 
+    Returns whether they were created — `up` exits non-zero when they were not,
+    because a stack whose dashboards nobody can sign in to is not a stack that
+    came up.
 
-def make_accounts(ca_dir: Path) -> None:
-    """Seed the provider's user store with the accounts a dashboard signs in as.
+    **After the stack is up, not before, and over RPC rather than into the CA
+    state file.**  Both halves of that used to be the other way round, and the
+    reason they changed is a failure mode nobody running the script could see: a
+    provider holds the whole CA snapshot in memory and rewrites it *whole* on
+    every login, issuance and revocation, so a second writer editing the file
+    beside it does not merge — it races.  Whoever writes last wins the entire
+    file, so an offline edit either vanished at the provider's next write or
+    took the provider's issued-certificate log back to whatever it was when the
+    file was read.
 
-    Offline, on the host, before anything starts — the same reason
-    ``wayfinderctl user`` is an offline tool at all: the first account cannot be
-    created over the management API, because creating it needs the credential it
-    creates.  Here there is a second reason on top, which is that the provider
-    holds this state in memory and rewrites the whole snapshot, so an edit made
-    while it runs does not survive its next write.
+    The credential is the host-side ``operator`` admin certificate this script
+    already mints — an administrator that exists before any *account* does,
+    which is what breaks the loop that made an offline tool look necessary.  (On
+    a real deployment the other key works too: an operator on the provider host
+    presents the node's own identity seed, which authenticates as the node
+    itself.)
     """
-    state = provider_state_path(ca_dir)
-    state.parent.mkdir(parents=True, exist_ok=True)
+    port = mgmt_ports()[dev.provider_name]
+    operator = dev.ca_dir / "operator"
+    connect = [
+        "--connect", f"127.0.0.1:{port}",
+        "--identity", str(operator / "seed"),
+        "--cert", str(operator / "cert"),
+        # Pinning the *provider's* key, not our own: the default pins the
+        # identity we present, which is right only when talking to the node
+        # whose seed that is.
+        "--node-key", dev.node_keys[dev.provider_name],
+    ]  # fmt: skip
+
+    if not _wait_for_provider(connect):
+        # The last failure verbatim, rather than asserting a cause. Polling
+        # cannot tell "not bound yet" from a rejected certificate, a wrong pin,
+        # or `cargo` failing to build `wayfinder-ctl` at all — and a message
+        # that picks one sends the operator after the wrong thing.
+        reason = getattr(_ctl, "last_error", "") or "(no output)"
+        print(
+            f"could not reach the provider's management API on {dev.provider_name}; "
+            f"accounts NOT created. Last error:\n{reason}\n"
+            f"Retry with: wayfinderctl {' '.join(connect)} user add --username "
+            f"{SIM_ADMIN_USER} --admin --no-totp --password-stdin",
+            file=sys.stderr,
+        )
+        return False
+
     for username, extra in ((SIM_ADMIN_USER, ["--admin"]), (SIM_VIEWER_USER, [])):
         _ctl(
+            *connect,
             "user", "add",
-            "--state", str(state),
             "--username", username,
             "--session-ttl", str(SIM_SESSION_TTL_SECS),
             # A simulation has nowhere to enrol an authenticator app, which is
@@ -481,10 +535,25 @@ def make_accounts(ca_dir: Path) -> None:
             stdin=f"{SIM_PASSWORD}\n",
         )  # fmt: skip
     print(
-        f"minted sim accounts {SIM_ADMIN_USER!r} (admin) and {SIM_VIEWER_USER!r} "
-        f"(read-only), password {SIM_PASSWORD!r}",
+        f"created sim accounts {SIM_ADMIN_USER!r} (admin) and {SIM_VIEWER_USER!r} "
+        f"(read-only) on {dev.provider_name}, password {SIM_PASSWORD!r}",
         file=sys.stderr,
     )
+    return True
+
+
+def _wait_for_provider(connect: list[str], attempts: int = 30) -> bool:
+    """Poll the provider's management API until it answers, or give up.
+
+    `docker compose up -d` returns when the containers are *started*, which is
+    before the node inside one has bound its listener — so the first request
+    after it would otherwise fail on a race rather than on anything real.
+    """
+    for _ in range(attempts):
+        if _ctl(*connect, "node-info", check=False):
+            return True
+        time.sleep(1)
+    return False
 
 
 # ── the topology (edit me) ────────────────────────────────────────────────────
@@ -1164,6 +1233,13 @@ def main(argv: list[str]) -> int:
         dev = write_compose(EPHEMERAL, args.require_approval)
         rc = compose("up", "--build", "-d", *args.extra)
         if rc == 0:
+            # After the stack, because the accounts are created *on* the running
+            # provider now. See `make_accounts`.
+            if not make_accounts(dev):
+                # Reported as a failure rather than printing the dashboard URLs
+                # over the top of it: every one of those dashboards shows a
+                # sign-in page, and there is nothing to sign in with.
+                return 1
             print_web_urls()
             print_dev_watch_commands(dev)
         return rc

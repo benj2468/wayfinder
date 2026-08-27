@@ -311,9 +311,18 @@ Four rules to keep when touching it:
   (`UserRecord::session_ttl_secs`), not a constant here — still bounded by
   `MAX_CERT_TTL_SECS`.
 
-Accounts are administered offline, by `wayfinderctl user` against the state
-file, for the same reason `cert init-ca` is: the first account cannot be created
-over the management API, because creating it needs the credential it creates.
+Accounts are administered over the management API, by `wayfinderctl user` — and
+nothing administers them through the state file. A provider rewrites that whole
+snapshot from memory on every write, so a second writer beside it raced those
+writes and silently discarded one side or the other; design 15 has the detail.
+
+The first account is the case that looks like it needs a file: it cannot be
+created *by* an account, because creating one needs the credential it creates.
+It does not, because an operator on the provider host holds the node's own
+identity seed, which authenticates at `MgmtAccess::GrantedSelfKey` and may
+invoke every request. The same credential is the way back from a mesh whose last
+administrator was removed, which is why `refuse_to_strand_the_mesh` can afford
+to refuse.
 
 ## Invitations (`UserInvite`, in the same module)
 

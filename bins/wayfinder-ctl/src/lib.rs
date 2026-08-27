@@ -57,8 +57,12 @@ pub struct Cli {
     /// How to reach the node: address, credentials, or a serial port.
     ///
     /// Shared with the TUI so both clients take the same flags, defaults and
-    /// environment variables. Every one of them is ignored by the offline
-    /// `cert` and `user` subcommands, which open no connection at all.
+    /// environment variables. Ignored by the subcommands that open no
+    /// connection: `cert` (which works on the mesh root seed) and
+    /// `login`/`logout`/`whoami` (which work on the stored session file).
+    /// `user` is *not* among them any more — see its module docs for why
+    /// administering accounts through the provider's state file was removed
+    /// rather than documented.
     #[command(flatten)]
     pub connection: ConnectArgs,
 
@@ -277,8 +281,12 @@ pub enum Command {
     /// Offline certificate / trust-anchor tooling (no node connection).
     #[command(subcommand)]
     Cert(cert::CertCommand),
-    /// Offline administration of a provider's user accounts (no node
-    /// connection).
+    /// Administration of a provider's user accounts, over the management API.
+    ///
+    /// Bootstrapping included: with no account on file yet, an operator on the
+    /// provider host creates the first administrator by presenting the node's
+    /// own identity seed (`--identity /var/lib/wayfinder/identity.seed`), which
+    /// authenticates as the node itself.
     #[command(subcommand)]
     User(user::UserCommand),
     /// Log in to a provider and store the session it issues, so every other
@@ -544,7 +552,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // The offline tooling needs no node connection.
     match cli.command {
         Command::Cert(cmd) => return cert::run(cmd),
-        Command::User(cmd) => return user::run(cmd),
         Command::Logout => return logout(),
         Command::Whoami => return whoami(),
         Command::Login { provider, user } => {
@@ -682,6 +689,7 @@ async fn dispatch_query(
                 .context("failed to disable link")?;
             format!("link {iface} disabled")
         }
+        Command::User(cmd) => user::run(cmd, client).await?,
         Command::OgmSchedule => output::ogm_schedule(&client.ogm_schedule().await?, output)?,
         Command::Throughput => output::throughput(&client.throughput().await?, output)?,
         Command::Metrics => output::node_metrics(&client.node_metrics().await?, output)?,
@@ -833,11 +841,7 @@ async fn dispatch_query(
         // before a client is opened; listing them here rather than under a
         // wildcard keeps a newly added offline command from silently reaching
         // a code path that would try to connect for it.
-        Command::Cert(_)
-        | Command::User(_)
-        | Command::Login { .. }
-        | Command::Logout
-        | Command::Whoami => {
+        Command::Cert(_) | Command::Login { .. } | Command::Logout | Command::Whoami => {
             unreachable!("offline commands are dispatched before a client is opened")
         }
     })

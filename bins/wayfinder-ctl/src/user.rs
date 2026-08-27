@@ -1,62 +1,105 @@
-//! Offline administration of a certificate authority's user accounts.
+//! Administration of a certificate authority's user accounts, over the
+//! management API.
 //!
-//! Operates directly on the provider's state file, the way `cert init-ca`
-//! operates directly on the root seed, and for the same reason: **the first
-//! account cannot be created over the management API, because creating it needs
-//! the credential it creates.** Breaking that loop is what an offline tool is
-//! for.
+//! **Every subcommand here is an RPC to a running provider.** None of them
+//! opens the provider's state file, and that is the point: a provider holds the
+//! whole CA snapshot in memory and rewrites it whole on every login, issuance
+//! and revocation, so a second writer editing the file beside it does not merge
+//! with those writes — it races them. Whichever writes last wins the *entire*
+//! file, so an offline edit either vanishes at the provider's next write or
+//! takes the provider's issued-certificate log back to whatever it was when the
+//! file was read. The durable store's atomic rename does not help: it promises
+//! a reader never sees a torn old/new mix, not that a stale writer is refused.
+//! Neither outcome is visible to whoever ran the command, which is what made it
+//! worth removing rather than documenting.
 //!
-//! It stays the tool for the rest of the account lifecycle too, rather than
-//! growing a matching set of management-API requests. A user store is the mesh's
-//! root of administrative trust — every account in it can mint a certificate the
-//! whole mesh honours — so keeping its mutation on the provider host, behind
-//! whatever guards that host's shell already has, is one fewer remotely
-//! reachable surface than the alternative buys anything for.
+//! # The bootstrap loop, and how it is broken
 //!
-//! Requires the provider to be **stopped**, or at least not writing: this
-//! rewrites the same snapshot `CertAuthority` owns, and the durable-store
-//! contract is about torn reads, not about two writers.
-
-use std::path::Path;
-use std::path::PathBuf;
+//! The first account cannot be created *by an account*: creating one needs the
+//! credential it creates. That loop is what an offline tool used to be for.
+//!
+//! It is broken from the other side instead. Whoever runs this is on the
+//! provider host — that was always the requirement — and the host holds the
+//! node's own identity seed. A client presenting that seed authenticates at the
+//! self-key tier, which is admitted to every request, so:
+//!
+//! ```text
+//! wayfinderctl user add --identity /var/lib/wayfinder/identity.seed \
+//!     --username rowan --admin
+//! ```
+//!
+//! creates the first administrator against the *running* provider. The same
+//! credential is the way back from a mesh whose last administrator was removed:
+//! it does not depend on any account existing.
+//!
+//! Nothing here needs the provider stopped, and nothing here can corrupt it.
 
 use anyhow::Context;
 use anyhow::bail;
 use clap::Subcommand;
-use wayfinder_server::CertAuthority;
-use wayfinder_server::DEFAULT_INVITE_TTL_SECS;
-use wayfinder_server::DEFAULT_SESSION_TTL_SECS;
-use wayfinder_server::UserRecord;
-use wayfinder_server::UserRole;
+use wayfinder_client::Client;
 
-/// Account administration on a provider's state file.
+/// The role named on the command line by `set-role`.
+///
+/// A stated role rather than an `--admin` flag, which is what `add` and
+/// `invite` use: on those the absence of the flag means "create the account
+/// that can do less", and creating is unambiguous. Here the absence of a flag
+/// would have to mean *demote*, so an operator who forgot it would silently
+/// take away an access instead of failing. Both directions are spelled.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoleArg {
+    /// Session certificates carry the management-administration capability.
+    Admin,
+    /// Session certificates are read-only.
+    Viewer,
+}
+
+impl RoleArg {
+    /// Whether this role is the administrative one, as the wire spells it.
+    fn is_admin(self) -> bool {
+        matches!(self, RoleArg::Admin)
+    }
+
+    /// The word for this role in operator-facing output.
+    fn label(self) -> &'static str {
+        match self {
+            RoleArg::Admin => "admin",
+            RoleArg::Viewer => "viewer",
+        }
+    }
+}
+
+/// Account administration against a running provider.
 #[derive(Subcommand, Debug)]
 pub enum UserCommand {
     /// Create an account and print its TOTP enrolment URI.
+    ///
+    /// The URI is shown once, here. Prefer `invite` where the person the
+    /// account is for can redeem it themselves: this command mints their second
+    /// factor on *this* terminal, so it is permanently known to somebody other
+    /// than its owner.
     Add {
-        /// The provider's state file (`provider.state_path` in its config).
-        #[arg(long)]
-        state: PathBuf,
         /// The account name, as presented at login.
         #[arg(long)]
         username: String,
         /// Grant the management-administration capability to the certificates
-        /// this account is issued.  Without it the account is a viewer: it may
+        /// this account is issued. Without it the account is a viewer: it may
         /// read the management API and change nothing.
         #[arg(long)]
         admin: bool,
         /// Validity window for this account's session certificates, in seconds.
+        /// Zero means the provider's own default.
         ///
         /// The lifetime belongs to the admin granting the account, not to the
         /// code: an automation account may be worth minutes and a field
-        /// operator a shift.  Bounded by the provider's own certificate cap.
-        #[arg(long, default_value_t = DEFAULT_SESSION_TTL_SECS)]
+        /// operator a shift. Bounded by the provider's certificate cap.
+        #[arg(long, default_value_t = 0)]
         session_ttl: u64,
         /// Create the account with **no** second factor.
         ///
         /// Any account here can mint a certificate the whole mesh honours, so a
         /// password alone makes fleet-wide administrative access a phishable
-        /// secret.  This exists for an automation account that cannot present a
+        /// secret. This exists for an automation account that cannot present a
         /// code — which should generally hold a long-lived certificate issued
         /// offline (`cert issue`) rather than log in at all.
         #[arg(long)]
@@ -66,7 +109,7 @@ pub enum UserCommand {
         ///
         /// The prompt reads `/dev/tty`, not stdin, so a script that pipes a
         /// password does not supply one — it blocks on whatever terminal the
-        /// process inherited.  This is the flag for a caller that has no
+        /// process inherited. This is the flag for a caller that has no
         /// terminal at all (`scripts/topology.py`, an installer, a
         /// configuration-management run), and the reason the password is not
         /// simply an argument: argv is readable by every process on the host.
@@ -78,76 +121,75 @@ pub enum UserCommand {
     ///
     /// The difference from `add`, and the whole reason this exists: `add`
     /// generates the account's TOTP secret and prints its `otpauth://` URI on
-    /// *this* terminal, so the person the account is for receives their second
-    /// factor from somebody else — it is permanently known to at least one
-    /// other party.  An invitation carries the secret instead, and reveals it
-    /// only to whoever redeems it against the running provider.
-    ///
-    /// That matters most for the **first administrator**.  This command needs
-    /// the provider stopped (see the module docs), so the invitation is minted
-    /// before start-up and redeemed after — which makes it the only way to
-    /// create the first account without anyone but its owner ever holding its
-    /// second factor.
+    /// this terminal, so the person the account is for receives their second
+    /// factor from somebody else. An invitation carries the secret instead, and
+    /// reveals it only to whoever redeems it.
     Invite {
-        /// The provider's state file (`provider.state_path` in its config).
-        #[arg(long)]
-        state: PathBuf,
-        /// The account name the invitation will create.  Refused if the name
-        /// is already an account or already invited.
+        /// The account name the invitation will create. Refused if the name is
+        /// already an account or already invited.
         #[arg(long)]
         username: String,
         /// Grant the management-administration capability to the account this
-        /// invitation creates.  Decided here and never by the redeemer.
+        /// invitation creates. Decided here and never by the redeemer.
         #[arg(long)]
         admin: bool,
         /// Validity window for the created account's session certificates, in
-        /// seconds.
-        #[arg(long, default_value_t = DEFAULT_SESSION_TTL_SECS)]
+        /// seconds. Zero means the provider's own default.
+        #[arg(long, default_value_t = 0)]
         session_ttl: u64,
-        /// How long the invitation may go unredeemed, in seconds.
+        /// How long the invitation may go unredeemed, in seconds. Zero means
+        /// the provider's own default.
         ///
         /// The bound on how long the token is worth anything to whoever finds
-        /// it later.  Short is better; the cost of it expiring is one more
-        /// mint.
-        #[arg(long, default_value_t = DEFAULT_INVITE_TTL_SECS)]
+        /// it later. Short is better; the cost of it expiring is one more mint.
+        #[arg(long, default_value_t = 0)]
         invite_ttl: u64,
     },
 
     /// List the invitations on file (never their tokens or TOTP secrets).
     ///
-    /// The column to read is `STARTED`.  A started invitation with no account
+    /// The column to read is `STARTED`. A started invitation with no account
     /// under its name means somebody took the account's second factor and did
     /// not finish registering — either an abandoned registration or a
     /// disclosure, and the response to both is `revoke-invite` and a fresh
     /// `invite`.
-    Invites {
-        /// The provider's state file.
-        #[arg(long)]
-        state: PathBuf,
-    },
+    Invites,
 
     /// Delete an invitation, at any status.
     RevokeInvite {
-        /// The provider's state file.
-        #[arg(long)]
-        state: PathBuf,
         /// The account name the invitation was minted for.
         #[arg(long)]
         username: String,
     },
 
     /// List the accounts on file (never their hashes or TOTP secrets).
-    List {
-        /// The provider's state file.
+    List,
+
+    /// Change an account's role between admin and read-only.
+    ///
+    /// **A demotion also ends the admin sessions the account already holds.**
+    /// The capability is stamped on the certificate, not read from the account
+    /// at each request, so a session minted while the account was an
+    /// administrator would go on administering until it expired. The
+    /// revocations flood the mesh as part of the change.
+    ///
+    /// Refused if it would leave the mesh with no enabled administrator.
+    SetRole {
+        /// The account to change.
         #[arg(long)]
-        state: PathBuf,
+        username: String,
+        /// The role the account should hold.
+        #[arg(long, value_enum)]
+        role: RoleArg,
     },
 
     /// Change an account's password, clearing any lockout.
+    ///
+    /// The administrative reset, for somebody who has lost their password. It
+    /// leaves the second factor alone, and revokes nothing — when the reset
+    /// answers a compromise rather than a forgotten password, `revoke-sessions`
+    /// is the command that ends what the account is holding.
     Passwd {
-        /// The provider's state file.
-        #[arg(long)]
-        state: PathBuf,
         /// The account to change.
         #[arg(long)]
         username: String,
@@ -157,14 +199,13 @@ pub enum UserCommand {
         password_stdin: bool,
     },
 
-    /// Disable an account: it can obtain no new sessions.
+    /// Disable an account: it can obtain no new sessions, and the sessions it
+    /// already holds are revoked.
     ///
-    /// A certificate already issued is unaffected — that is what `revoke` and
-    /// expiry are for — so this ends future logins, not a session in flight.
+    /// Both halves, so that "disabled" is a statement about access now rather
+    /// than only about future sign-ins. Refused if it would leave the mesh with
+    /// no enabled administrator.
     Disable {
-        /// The provider's state file.
-        #[arg(long)]
-        state: PathBuf,
         /// The account to disable.
         #[arg(long)]
         username: String,
@@ -172,100 +213,285 @@ pub enum UserCommand {
 
     /// Re-enable a disabled account, clearing any lockout with it.
     Enable {
-        /// The provider's state file.
-        #[arg(long)]
-        state: PathBuf,
         /// The account to enable.
         #[arg(long)]
         username: String,
     },
 
-    /// Remove an account entirely.
-    Remove {
-        /// The provider's state file.
+    /// End every session certificate an account holds, leaving the account
+    /// itself in place.
+    ///
+    /// The control for a lost laptop where the person still works here: they
+    /// sign in again for a fresh certificate; what they cannot do is keep using
+    /// the old one.
+    RevokeSessions {
+        /// The account whose sessions to end.
         #[arg(long)]
-        state: PathBuf,
+        username: String,
+    },
+
+    /// Remove an account entirely, revoking every session it holds.
+    ///
+    /// One act, not two: an account deleted whose certificates kept working
+    /// would leave a compromise running for up to its whole session lifetime.
+    /// Refused if it would leave the mesh with no enabled administrator.
+    Remove {
         /// The account to remove.
         #[arg(long)]
         username: String,
     },
 }
 
-/// Run an offline `user` subcommand.
-pub fn run(cmd: UserCommand) -> anyhow::Result<()> {
+/// Run one `user` subcommand against `client`, returning what to print.
+pub async fn run(cmd: UserCommand, client: &mut Client) -> anyhow::Result<String> {
     match cmd {
         UserCommand::Add {
-            state,
             username,
             admin,
             session_ttl,
             no_totp,
             password_stdin,
-        } => add(
-            &state,
-            &username,
-            admin,
-            session_ttl,
-            no_totp,
-            password_stdin,
-        ),
+        } => {
+            let password = new_password(password_stdin)?;
+            let uri = client
+                .create_user(&username, &password, admin, session_ttl, no_totp)
+                .await
+                .context("creating the account")?;
+            Ok(created(&username, admin, &uri))
+        }
+
         UserCommand::Invite {
-            state,
             username,
             admin,
             session_ttl,
             invite_ttl,
-        } => invite(&state, &username, admin, session_ttl, invite_ttl),
-        UserCommand::Invites { state } => list_invites(&state),
-        UserCommand::RevokeInvite { state, username } => revoke_invite(&state, &username),
-        UserCommand::List { state } => list(&state),
+        } => {
+            let minted = client
+                .create_user_invite(&username, admin, session_ttl, invite_ttl)
+                .await
+                .context("minting the invitation")?;
+            Ok(invited(
+                &minted.username,
+                admin,
+                minted.expires_at,
+                &minted.token,
+            ))
+        }
+
+        UserCommand::Invites => {
+            let listing = client
+                .list_user_invites()
+                .await
+                .context("listing invitations")?;
+            Ok(invite_listing(&listing))
+        }
+
+        UserCommand::RevokeInvite { username } => {
+            client
+                .revoke_user_invite(&username)
+                .await
+                .context("revoking the invitation")?;
+            Ok(format!("revoked the invitation for {username}"))
+        }
+
+        UserCommand::List => {
+            let listing = client.list_users().await.context("listing accounts")?;
+            Ok(account_listing(&listing))
+        }
+
+        UserCommand::SetRole { username, role } => {
+            let (revoked, unchanged) = client
+                .set_user_role(&username, role.is_admin())
+                .await
+                .context("changing the account's role")?;
+            if unchanged {
+                return Ok(format!(
+                    "{username} is already {}; nothing changed",
+                    role.label()
+                ));
+            }
+            Ok(with_revocations(
+                format!("{username} is now {}", role.label()),
+                revoked,
+                "admin session",
+            ))
+        }
+
         UserCommand::Passwd {
-            state,
             username,
             password_stdin,
-        } => passwd(&state, &username, password_stdin),
-        UserCommand::Disable { state, username } => set_disabled(&state, &username, true),
-        UserCommand::Enable { state, username } => set_disabled(&state, &username, false),
-        UserCommand::Remove { state, username } => remove(&state, &username),
+        } => {
+            let password = new_password(password_stdin)?;
+            client
+                .set_user_password(&username, &password)
+                .await
+                .context("changing the password")?;
+            Ok(format!(
+                "changed the password for {username} (any lockout cleared)\n  \
+                 sessions it already holds are untouched — `user revoke-sessions \
+                 --username {username}` ends those, if the reset answers a compromise"
+            ))
+        }
+
+        UserCommand::Disable { username } => {
+            let (revoked, unchanged) = client
+                .set_user_enabled(&username, false)
+                .await
+                .context("disabling the account")?;
+            if unchanged {
+                return Ok(format!("{username} is already disabled; nothing changed"));
+            }
+            Ok(with_revocations(
+                format!("disabled {username}"),
+                revoked,
+                "session",
+            ))
+        }
+
+        UserCommand::Enable { username } => {
+            let (revoked, unchanged) = client
+                .set_user_enabled(&username, true)
+                .await
+                .context("enabling the account")?;
+            if unchanged {
+                return Ok(format!("{username} is already enabled; nothing changed"));
+            }
+            // The count is reported rather than discarded, even though an
+            // enable is documented to revoke nothing. That guarantee belongs to
+            // the authority, and `AuthorityAdapter::keep` deliberately keeps
+            // whatever an ungated direction signs instead of assuming zero —
+            // so a record that reached the mesh must reach the operator too.
+            Ok(with_revocations(
+                format!("enabled {username} (any lockout cleared)"),
+                revoked,
+                "session",
+            ))
+        }
+
+        UserCommand::RevokeSessions { username } => {
+            let revoked = client
+                .revoke_user_sessions(&username)
+                .await
+                .context("revoking the account's sessions")?;
+            if revoked == 0 {
+                return Ok(format!(
+                    "{username} held no live session certificates; nothing was revoked"
+                ));
+            }
+            Ok(with_revocations(
+                format!("{username} keeps its account"),
+                revoked,
+                "session",
+            ))
+        }
+
+        UserCommand::Remove { username } => {
+            client
+                .remove_user(&username)
+                .await
+                .context("removing the account")?;
+            Ok(format!(
+                "removed {username}, and revoked every session certificate it held"
+            ))
+        }
     }
 }
 
-/// Open the authority backing `state`, for a command that only touches the user
-/// store.
+/// Append what a change revoked, when it revoked anything.
 ///
-/// The mesh id and root seed are irrelevant here — nothing this module does
-/// signs anything — so a placeholder root is used rather than requiring the
-/// operator to hand the mesh root key to a command that has no use for it. The
-/// state file's other sections round-trip untouched: `CaLog` loads and rewrites
-/// the whole snapshot, so the issued log, held CSRs and policy overrides come
-/// back exactly as they went in.
-///
-/// **The clock comes with `from_config`**, which puts the authority on
-/// `Clock::System` — so every command here reads the host clock, not only the
-/// one that mints a window.
-///
-/// That used to be missing, and the failure was quiet. A freshly loaded
-/// authority's time was zero, and zero is not "no opinion": `invite_is_live`
-/// reads it as *now is the epoch*, under which no expiry has arrived yet. So
-/// `user invites` listed invitations that died days ago as though somebody might
-/// still redeem them, and every mutating command's expiry sweep quietly swept
-/// nothing. Nothing here sets a time explicitly any more, because pinning one at
-/// `open` would reintroduce the same shape a command at a time.
-fn open(state: &Path) -> anyhow::Result<CertAuthority> {
-    let cfg = wayfinder::config::ProviderConfig {
-        root_seed_path: String::new(),
-        mesh_id: 0,
-        cert_ttl_secs: DEFAULT_SESSION_TTL_SECS,
-        enrollment_token: None,
-        auto_approve: false,
-        allow_unbounded_cert_ttl: false,
-        pending_ttl_secs: 3600,
-        state_path: Some(state.display().to_string()),
-        headscale: None,
-    };
-    CertAuthority::from_config(&[0u8; 32], &cfg)
-        .map_err(anyhow::Error::msg)
-        .with_context(|| format!("opening CA state at {}", state.display()))
+/// The count is worth a line of its own because "this also cut off two live
+/// sessions" and "it cut off nothing" call for different follow-up — and
+/// because a revocation is the half of the act the operator did not explicitly
+/// ask for.
+fn with_revocations(head: String, revoked: u32, noun: &str) -> String {
+    if revoked == 0 {
+        return head;
+    }
+    let plural = if revoked == 1 { "" } else { "s" };
+    format!("{head}; revoked {revoked} live {noun} certificate{plural}")
+}
+
+/// What to print after creating an account.
+fn created(username: &str, admin: bool, totp_enrolment_uri: &str) -> String {
+    let mut out = format!(
+        "created user {username}\n  role: {}",
+        if admin { "admin" } else { "viewer" }
+    );
+    if totp_enrolment_uri.is_empty() {
+        out.push_str(
+            "\n  second factor: none. This account's password is the whole credential; \
+             prefer an offline `cert issue --admin` certificate for automation.",
+        );
+    } else {
+        out.push_str(&format!(
+            "\n  enrol this in an authenticator app now — it is not shown again:\n    \
+             {totp_enrolment_uri}"
+        ));
+    }
+    out
+}
+
+/// What to print after minting an invitation.
+fn invited(username: &str, admin: bool, expires_at: u64, token: &str) -> String {
+    format!(
+        "invited {username}\n  role:    {}\n  expires: {expires_at} (unix)\n  \
+         send this token to them now — it is not shown again:\n    token: {token}\n  \
+         they redeem it at the dashboard's /register page (the token belongs in the URL's \
+         fragment, after the '#', so it never reaches a server log or a link preview).\n  \
+         Their password and second factor are chosen there; nothing about them is printed here.",
+        if admin { "admin" } else { "viewer" }
+    )
+}
+
+/// Render the account roster.
+fn account_listing(listing: &wayfinder_protos::wayfinder::v1alpha::ListUsersResponse) -> String {
+    if listing.users.is_empty() {
+        return "no users".to_string();
+    }
+    let mut out = String::from("USERNAME             ROLE     SESSION_TTL  TOTP  STATUS");
+    for u in &listing.users {
+        let status = match (u.disabled, u.locked) {
+            (true, _) => "disabled",
+            (_, true) => "locked",
+            _ => "active",
+        };
+        out.push_str(&format!(
+            "\n{:<20} {:<8} {:>10}s  {:<4}  {}",
+            u.username,
+            if u.admin { "admin" } else { "viewer" },
+            u.session_ttl_secs,
+            if u.totp_enrolled { "yes" } else { "no" },
+            status,
+        ));
+    }
+    out
+}
+
+/// Render the outstanding invitations.
+fn invite_listing(
+    listing: &wayfinder_protos::wayfinder::v1alpha::ListUserInvitesResponse,
+) -> String {
+    if listing.invites.is_empty() {
+        return "no invitations".to_string();
+    }
+    let mut out = String::from("USERNAME             ROLE     EXPIRES        STARTED");
+    for i in &listing.invites {
+        // Spelled out rather than shown as a timestamp: this is the row an
+        // operator is scanning for, and "somebody has the second factor" is the
+        // thing to notice, not when.
+        let started = match i.started_at {
+            0 => "no".to_string(),
+            at => format!("yes, at {at} — revoke and re-invite if unexpected"),
+        };
+        out.push_str(&format!(
+            "\n{:<20} {:<8} {:<14} {}",
+            i.username,
+            if i.admin { "admin" } else { "viewer" },
+            i.expires_at,
+            started,
+        ));
+    }
+    out
 }
 
 /// Obtain a new password, either from stdin or by prompting twice.
@@ -282,7 +508,7 @@ fn new_password(from_stdin: bool) -> anyhow::Result<String> {
 /// leading or trailing space is a legitimate part of a password, and silently
 /// stripping one would produce an account whose password is not the one the
 /// caller piped — a failure that only shows up at the first login, with nothing
-/// to point at.  There is no confirmation, because a piped password cannot be
+/// to point at. There is no confirmation, because a piped password cannot be
 /// mistyped twice differently and a second read would simply block.
 fn read_password_line(reader: &mut impl std::io::BufRead) -> anyhow::Result<String> {
     let mut line = String::new();
@@ -315,239 +541,6 @@ fn prompt_new_password() -> anyhow::Result<String> {
     Ok(first)
 }
 
-/// Create an account.
-fn add(
-    state: &Path,
-    username: &str,
-    admin: bool,
-    session_ttl: u64,
-    no_totp: bool,
-    password_stdin: bool,
-) -> anyhow::Result<()> {
-    let mut ca = open(state)?;
-    let password = new_password(password_stdin)?;
-    let role = if admin {
-        UserRole::Admin
-    } else {
-        UserRole::Viewer
-    };
-    let mut user =
-        UserRecord::new(username, &password, role, session_ttl).map_err(anyhow::Error::msg)?;
-    if no_totp {
-        user = user.without_totp();
-    }
-    // Read the URI out before the record moves into the store: it is shown
-    // once, here, and the secret is never printed again.
-    let uri = user.totp_enrolment_uri("wayfinder");
-    ca.add_user(user).map_err(anyhow::Error::msg)?;
-
-    println!("created user {username}");
-    println!("  role:        {}", role_label(role));
-    println!("  session ttl: {session_ttl}s");
-    match uri {
-        Some(uri) => {
-            println!("  enrol this in an authenticator app now — it is not shown again:");
-            println!("    {uri}");
-        }
-        None => println!(
-            "  second factor: none. This account's password is the whole credential; \
-             prefer an offline `cert issue --admin` certificate for automation."
-        ),
-    }
-    Ok(())
-}
-
-/// Mint an invitation and print its token.
-fn invite(
-    state: &Path,
-    username: &str,
-    admin: bool,
-    session_ttl: u64,
-    invite_ttl: u64,
-) -> anyhow::Result<()> {
-    let mut ca = open(state)?;
-    let role = if admin {
-        UserRole::Admin
-    } else {
-        UserRole::Viewer
-    };
-    let minted = ca
-        .create_user_invite(username, role, session_ttl, invite_ttl)
-        .map_err(anyhow::Error::msg)?;
-
-    println!("invited {username}");
-    println!("  role:        {}", role_label(role));
-    println!("  session ttl: {session_ttl}s");
-    println!("  expires:     {} (unix)", minted.expires_at);
-    println!("  send this token to them now — it is not shown again:");
-    // Prefixed on its own line so a script can lift it with `grep`/`cut`
-    // without parsing prose, which is the difference between this being usable
-    // from an installer and being a thing an operator retypes.
-    println!("    token: {}", minted.token);
-    println!(
-        "  they redeem it at the dashboard's /register page (the token belongs in the URL's \
-         fragment, after the '#', so it never reaches a server log or a link preview).\n  \
-         Their password and second factor are chosen there; nothing about them is printed here."
-    );
-    Ok(())
-}
-
-/// Print the invitations on file.
-fn list_invites(state: &Path) -> anyhow::Result<()> {
-    let ca = open(state)?;
-    let invites = ca.list_user_invites();
-    if invites.is_empty() {
-        println!("no invitations");
-        return Ok(());
-    }
-    println!("USERNAME             ROLE     EXPIRES        STARTED");
-    for i in invites {
-        let started = match i.started_at {
-            // Spelled out rather than shown as a timestamp: this is the row an
-            // operator is scanning for, and "somebody has the second factor"
-            // is the thing to notice, not when.
-            Some(at) => format!("yes, at {at} — revoke and re-invite if unexpected"),
-            None => "no".to_string(),
-        };
-        println!(
-            "{:<20} {:<8} {:<14} {}",
-            i.username,
-            role_label(i.role),
-            i.expires_at,
-            started,
-        );
-    }
-    Ok(())
-}
-
-/// Delete an invitation.
-fn revoke_invite(state: &Path, username: &str) -> anyhow::Result<()> {
-    let mut ca = open(state)?;
-    ca.revoke_user_invite(username)
-        .map_err(anyhow::Error::msg)?;
-    println!("revoked the invitation for {username}");
-    Ok(())
-}
-
-/// Print the accounts on file.
-fn list(state: &Path) -> anyhow::Result<()> {
-    let ca = open(state)?;
-    let users = ca.list_users();
-    if users.is_empty() {
-        println!("no users");
-        return Ok(());
-    }
-    println!("USERNAME             ROLE     SESSION_TTL  TOTP  STATUS");
-    for u in users {
-        let status = match (u.disabled, u.locked) {
-            (true, _) => "disabled",
-            (_, true) => "locked",
-            _ => "active",
-        };
-        println!(
-            "{:<20} {:<8} {:>10}s  {:<4}  {}",
-            u.username,
-            role_label(u.role),
-            u.session_ttl_secs,
-            if u.totp_enrolled { "yes" } else { "no" },
-            status,
-        );
-    }
-    Ok(())
-}
-
-/// Change an account's password.
-fn passwd(state: &Path, username: &str, password_stdin: bool) -> anyhow::Result<()> {
-    let mut ca = open(state)?;
-    let password = new_password(password_stdin)?;
-    let mut failed = None;
-    ca.update_user(username, |user| {
-        // `set_password` can fail (Argon2 parameters), and `update_user`'s
-        // callback returns nothing, so the failure is carried out rather than
-        // swallowed — a "changed" password that did not change is the worst
-        // possible outcome here.
-        if let Err(e) = user.set_password(&password) {
-            failed = Some(e);
-        }
-    })
-    .map_err(anyhow::Error::msg)?;
-    if let Some(e) = failed {
-        bail!("{e}");
-    }
-    println!("changed password for {username} (any lockout cleared)");
-    Ok(())
-}
-
-/// Disable or re-enable an account.
-fn set_disabled(state: &Path, username: &str, disabled: bool) -> anyhow::Result<()> {
-    let mut ca = open(state)?;
-    ca.update_user(username, |user| {
-        user.disabled = disabled;
-        if !disabled {
-            // Re-enabling clears the lockout too: an operator turning an
-            // account back on means it should work, not that it should work in
-            // fifteen minutes.
-            user.failed_attempts = 0;
-            user.locked_until = 0;
-        }
-    })
-    .map_err(anyhow::Error::msg)?;
-    if disabled {
-        println!(
-            "disabled {username}; existing certificates are unaffected — revoke them if the account is compromised"
-        );
-    } else {
-        println!("enabled {username}");
-    }
-    Ok(())
-}
-
-/// Remove an account.
-fn remove(state: &Path, username: &str) -> anyhow::Result<()> {
-    let mut ca = open(state)?;
-    // Read before the removal: afterwards the account is gone and with it the
-    // only thing that says which certificates were its.
-    let sessions = ca.live_session_macs(username);
-    ca.remove_user(username).map_err(anyhow::Error::msg)?;
-
-    if sessions.is_empty() {
-        println!("removed {username}; it held no session certificates");
-        return Ok(());
-    }
-
-    // The online `RemoveUser` revokes an account's sessions as part of removing
-    // it. This path cannot: a revocation has to be *flooded* to the mesh, and
-    // there is no router here to flood it — marking the entries would announce
-    // nothing, since nothing re-floods revocations at startup either.
-    //
-    // So it names them instead. That is the whole remedy available offline, and
-    // it is worth the lines: the account has just been deleted, so nothing left
-    // in the state file says these certificates were ever its, and an operator
-    // without this list has no way to find them again.
-    let count = sessions.len();
-    let plural = if count == 1 { "" } else { "s" };
-    println!(
-        "removed {username}, but {count} session certificate{plural} it holds \
-         remain valid and this offline path cannot revoke them"
-    );
-    for mac in &sessions {
-        println!("  {}", crate::output::format_mac(&mac.0));
-    }
-    println!(
-        "revoke each against a running provider (`wayfinderctl revoke-node`), or let them \
-         expire; removing the account over the management API would have done it in one act"
-    );
-    Ok(())
-}
-
-/// The word for a role in operator-facing output.
-fn role_label(role: UserRole) -> &'static str {
-    match role {
-        UserRole::Admin => "admin",
-        UserRole::Viewer => "viewer",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,5 +571,21 @@ mod tests {
         // password is the empty string.
         assert!(read("\n").is_err());
         assert!(read("").is_err());
+    }
+
+    /// A change that revoked nothing says so by saying nothing: the count line
+    /// appears only when there is something to report.
+    #[test]
+    fn only_a_change_that_revoked_something_mentions_revocations() {
+        assert_eq!(with_revocations("demoted".into(), 0, "session"), "demoted");
+        assert!(
+            with_revocations("demoted".into(), 1, "session").contains("1 live session certificate")
+        );
+        // The plural belongs on the noun the count counts, which is the
+        // certificate — three sessions is three certificates, not "sessions".
+        assert!(
+            with_revocations("demoted".into(), 3, "session")
+                .contains("3 live session certificates")
+        );
     }
 }

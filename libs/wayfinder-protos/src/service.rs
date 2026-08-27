@@ -44,6 +44,8 @@ use crate::wayfinder::v1alpha::RevealEnrollmentTokenResponse;
 use crate::wayfinder::v1alpha::RevokeUserSessionsResponse;
 use crate::wayfinder::v1alpha::RoutingEntry;
 use crate::wayfinder::v1alpha::RoutingTable;
+use crate::wayfinder::v1alpha::SetUserEnabledResponse;
+use crate::wayfinder::v1alpha::SetUserRoleResponse;
 use crate::wayfinder::v1alpha::SubmitCsrResponse;
 use crate::wayfinder::v1alpha::TableOccupancy;
 use crate::wayfinder::v1alpha::Throughput;
@@ -927,6 +929,74 @@ pub trait AuthorityDataProvider {
         Err(NOT_A_PROVIDER.into())
     }
 
+    /// Provider mode: set `username`'s role, revoking the sessions the change
+    /// invalidates, and report how many were revoked.  Default errors (not a
+    /// provider).
+    ///
+    /// **A demotion must revoke the account's live sessions**, as one durable
+    /// act with the role change. The capability is stamped on the certificate,
+    /// so a session minted while the account was an administrator keeps
+    /// administering until it is revoked or expires; an implementation that
+    /// changed only what is issued *next* would report an access as removed
+    /// while its holder still had it.
+    ///
+    /// A promotion revokes nothing — the certificates the account holds now
+    /// grant less than it does, which costs a sign-in and no access.
+    ///
+    /// Returns how many sessions were revoked and **whether anything actually
+    /// changed**. Restating the role an account already holds is a success that
+    /// revokes nothing: an operator unsure whether the first call landed will
+    /// make the second one, and it must not cut off a session on the way
+    /// through. The second half of the pair is why the implementation answers
+    /// it rather than a caller re-reading the roster — a promotion also revokes
+    /// nothing, so the count alone cannot distinguish the two, and two
+    /// independently-derived answers to one predicate drift.
+    ///
+    /// `Err` covers a name that is not on file, an implementation's refusal to
+    /// demote the last account that can still administer the mesh, and a store
+    /// that cannot be made durable.
+    fn set_user_role(&mut self, username: &str, admin: bool) -> Result<(u32, bool), String> {
+        let _ = (username, admin);
+        Err(NOT_A_PROVIDER.into())
+    }
+
+    /// Provider mode: enable or disable `username`, revoking the sessions the
+    /// change invalidates, and report how many were revoked.  Default errors
+    /// (not a provider).
+    ///
+    /// **Disabling must revoke the account's live sessions**, for the reason
+    /// the demotion above does: an account that obtains no new session while
+    /// every certificate it already holds keeps working is disabled only in the
+    /// future tense. Enabling revokes nothing and must clear any lockout.
+    ///
+    /// `Err` covers a name that is not on file, an implementation's refusal to
+    /// disable the last account that can still administer the mesh, and a store
+    /// that cannot be made durable.
+    fn set_user_enabled(&mut self, username: &str, enabled: bool) -> Result<(u32, bool), String> {
+        let _ = (username, enabled);
+        Err(NOT_A_PROVIDER.into())
+    }
+
+    /// Provider mode: replace `username`'s password, clearing any lockout.
+    /// Default errors (not a provider).
+    ///
+    /// The administrative reset. It must leave the second factor alone: an
+    /// operator who could replace both would be able to take an account over in
+    /// one request, leaving its owner no signal.
+    ///
+    /// It revokes nothing, deliberately — a forgotten password is the common
+    /// case, and ending every device its owner is signed in on is a larger act
+    /// than was asked for. When the reset answers a compromise, the request that
+    /// ends the sessions is
+    /// [`revoke_user_sessions`](Self::revoke_user_sessions).
+    ///
+    /// `Err` covers a name that is not on file, an empty password, and a store
+    /// that cannot be made durable.
+    fn set_user_password(&mut self, username: &str, password: &str) -> Result<(), String> {
+        let _ = (username, password);
+        Err(NOT_A_PROVIDER.into())
+    }
+
     /// Provider mode: delete the invite minted for `username`, at any status.
     /// Default errors (not a provider).
     ///
@@ -1319,6 +1389,9 @@ pub fn request_kind_name(k: &RequestKind) -> &'static str {
         RequestKind::BeginUserRegistration(_) => "BeginUserRegistration",
         RequestKind::CompleteUserRegistration(_) => "CompleteUserRegistration",
         RequestKind::RevokeUserSessions(_) => "RevokeUserSessions",
+        RequestKind::SetUserRole(_) => "SetUserRole",
+        RequestKind::SetUserEnabled(_) => "SetUserEnabled",
+        RequestKind::SetUserPassword(_) => "SetUserPassword",
     }
 }
 
@@ -1411,7 +1484,23 @@ fn audited(k: &RequestKind) -> Audited {
         // Creating an account that can mint a certificate the whole mesh
         // honours, *from an anonymous connection*. Strictly more deserving of a
         // record than CreateUser, which at least required a grant to reach.
-        | RequestKind::CompleteUserRegistration(_) => Audited::Mutation,
+        | RequestKind::CompleteUserRegistration(_)
+        // Changing what an account may do, and — on a demotion — ending the
+        // admin sessions it already held. The same reasoning that audits
+        // RemoveUser and RevokeUserSessions beside it: this is how somebody's
+        // administrative access begins and ends without the account itself
+        // changing, and a log that recorded only creation and deletion would
+        // answer "who can administer this mesh?" with a roster that was never
+        // true.
+        | RequestKind::SetUserRole(_)
+        // Cutting an account off, and restoring it. Both directions matter: the
+        // record of who re-enabled a disabled account is the one an operator
+        // wants when the account turns out to have been disabled for a reason.
+        | RequestKind::SetUserEnabled(_)
+        // Replacing the credential of an account that can mint a certificate
+        // the whole mesh honours. As with CreateUser, the record names the kind
+        // and never the fields, so the password it carries is never in it.
+        | RequestKind::SetUserPassword(_) => Audited::Mutation,
 
         RequestKind::GetNodeInfo(_)
         | RequestKind::GetRoutingTable(_)
@@ -1516,7 +1605,10 @@ pub fn request_facet(kind: &RequestKind) -> RequestFacet {
         | RequestKind::RevokeUserInvite(_)
         | RequestKind::BeginUserRegistration(_)
         | RequestKind::CompleteUserRegistration(_)
-        | RequestKind::RevokeUserSessions(_) => RequestFacet::Authority,
+        | RequestKind::RevokeUserSessions(_)
+        | RequestKind::SetUserRole(_)
+        | RequestKind::SetUserEnabled(_)
+        | RequestKind::SetUserPassword(_) => RequestFacet::Authority,
         RequestKind::Authenticate(_)
         | RequestKind::GetVpnEnrollment(_)
         | RequestKind::ListVpnPeers(_)
@@ -2024,6 +2116,30 @@ pub fn handle_authority<P: AuthorityDataProvider>(
                 Ok(revoked) => {
                     ResponseKind::RevokeUserSessions(RevokeUserSessionsResponse { revoked })
                 }
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            }
+        }
+        Some(RequestKind::SetUserRole(req)) => {
+            match provider.set_user_role(&req.username, req.admin) {
+                Ok((revoked, changed)) => ResponseKind::SetUserRole(SetUserRoleResponse {
+                    revoked,
+                    unchanged: !changed,
+                }),
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            }
+        }
+        Some(RequestKind::SetUserEnabled(req)) => {
+            match provider.set_user_enabled(&req.username, req.enabled) {
+                Ok((revoked, changed)) => ResponseKind::SetUserEnabled(SetUserEnabledResponse {
+                    revoked,
+                    unchanged: !changed,
+                }),
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            }
+        }
+        Some(RequestKind::SetUserPassword(req)) => {
+            match provider.set_user_password(&req.username, &req.password) {
+                Ok(()) => ResponseKind::Empty(Empty {}),
                 Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
             }
         }
@@ -3695,6 +3811,8 @@ mod tests {
             ResponseKind::ListUserInvites(_) => "ListUserInvites",
             ResponseKind::BeginUserRegistration(_) => "BeginUserRegistration",
             ResponseKind::RevokeUserSessions(_) => "RevokeUserSessions",
+            ResponseKind::SetUserRole(_) => "SetUserRole",
+            ResponseKind::SetUserEnabled(_) => "SetUserEnabled",
         }
     }
 

@@ -29,14 +29,17 @@
 //!   policy, no queue, no roster and no accounts. One sentence saying so beats
 //!   five tabs of empty panels that each read as "nothing has happened yet".
 //!
-//! # Accounts are created here *and* offline
+//! # Accounts are created here *and* from the CLI
 //!
-//! `wayfinderctl user` administers the same store against the provider's state
-//! file, and remains the only way to create the *first* account: creating one
-//! over the management API needs the credential it creates. What [`accounts`]
-//! adds is every account after that, without an SSH session — and it is a real
-//! widening of the surface, since an admin session can now mint another
-//! account. The trade is stated in the proto (`CreateUserRequest`): an admin
+//! `wayfinderctl user` administers the same store over this same management
+//! API — including the *first* account, which cannot be created by an account
+//! because creating one needs the credential it creates: an operator on the
+//! provider host presents the node's own identity seed instead, which
+//! authenticates at the self-key tier. (It once did this by editing the
+//! provider's state file; design 15 has why that raced the provider's own
+//! writes.) What [`accounts`] adds is doing it without an SSH session — and it
+//! is a real widening of the surface, since an admin session can now mint
+//! another account. The trade is stated in the proto (`CreateUserRequest`): an admin
 //! can already revoke nodes and rewrite the enrollment policy, so this grants
 //! no new class of power, but it does put the user store on the network.
 

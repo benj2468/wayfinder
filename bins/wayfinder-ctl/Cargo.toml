@@ -16,11 +16,6 @@ path = "src/lib.rs"
 
 [dependencies]
 wayfinder-client = { workspace = true, features = ["cli"] }
-# The offline `user` subcommands administer the certificate authority's user
-# store directly, the way `cert init-ca` administers the root seed: the first
-# account cannot be created over the management API, because creating it needs
-# the credential it creates.
-wayfinder-server.workspace = true
 wayfinder.workspace = true
 wayfinder-protos = { workspace = true, features = ["serde"] }
 wayfinder-auth = { workspace = true, features = ["std"] }
@@ -37,6 +32,10 @@ rpassword.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only since design 15: the `user` subcommands became pure RPC, so nothing
+# in `src/` constructs a `CertAuthority` any more. What still needs one is the
+# in-process provider the integration tests run against.
+wayfinder-server.workspace = true
 wayfinder-auth = { workspace = true, features = ["std"] }
 # So a test can present a live TOTP code the way an authenticator app would,
 # against a secret it read out of an `otpauth://` URI. The authority's own

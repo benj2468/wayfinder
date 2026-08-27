@@ -814,78 +814,109 @@ mod tests {
         ));
     }
 
-    /// Every management request kind this build knows, one value each, so a
-    /// policy test can sweep the whole surface rather than the handful someone
-    /// remembered.
+    /// Declares this build's entire request-oneof surface exactly once, and
+    /// expands it into two things: `every_request_kind()`, one value per
+    /// variant for the sweep tests below to iterate; and
+    /// `all_kinds_exhaustive`, an exhaustive `match &ReqKind` whose only job is
+    /// to fail to *compile* when this list falls behind the proto.
     ///
-    /// Deliberately hand-written rather than derived: prost generates no
-    /// variant iterator, and the point of the list is that adding a proto
-    /// request forces a decision *here* about what the enrollment tier may do
-    /// with it. `permits` fails closed on its own (it is a positive
-    /// allowlist), so the risk this guards is the opposite one — a privileged
-    /// kind being quietly moved *into* the allowlist, which nothing else would
-    /// make a reviewer look at.
-    fn every_request_kind() -> Vec<ReqKind> {
-        use wayfinder_protos::wayfinder::v1alpha::*;
-        vec![
-            ReqKind::GetNodeInfo(GetNodeInfoRequest {}),
-            ReqKind::GetRoutingTable(GetRoutingTableRequest {}),
-            ReqKind::GetLinkQualityTable(GetLinkQualityTableRequest {}),
-            ReqKind::ResolveRoute(ResolveRouteRequest::default()),
-            ReqKind::GetOgmSchedule(GetOgmScheduleRequest {}),
-            ReqKind::GetThroughput(GetThroughputRequest {}),
-            ReqKind::GetMetrics(GetMetricsRequest {}),
-            ReqKind::SetAuth(SetAuthRequest::default()),
-            ReqKind::GetTrustAnchor(GetTrustAnchorRequest {}),
-            ReqKind::SubmitCsr(SubmitCsrRequest::default()),
-            ReqKind::RevokeNode(RevokeNodeRequest::default()),
-            ReqKind::GetSecurityStatus(GetSecurityStatusRequest {}),
-            ReqKind::ListCerts(ListCertsRequest {}),
-            ReqKind::ListPendingCsrs(ListPendingCsrsRequest {}),
-            ReqKind::ApproveCsr(ApproveCsrRequest::default()),
-            ReqKind::DenyCsr(DenyCsrRequest::default()),
-            ReqKind::SetConfig(SetConfigRequest::default()),
-            ReqKind::GetKeepaliveTable(GetKeepAliveTableRequest {}),
-            ReqKind::Authenticate(AuthenticateRequest::default()),
-            ReqKind::GetLinkFeaturesTable(GetLinkFeaturesTableRequest {}),
-            ReqKind::GetLogs(GetLogsRequest::default()),
-            ReqKind::SetLogLevel(SetLogLevelRequest::default()),
-            ReqKind::RevealEnrollmentToken(RevealEnrollmentTokenRequest {}),
-            ReqKind::AuthenticateUser(AuthenticateUserRequest::default()),
-            ReqKind::ListUsers(ListUsersRequest {}),
-            ReqKind::CreateUser(CreateUserRequest::default()),
-            ReqKind::RemoveUser(RemoveUserRequest::default()),
-            ReqKind::GetAlarms(GetAlarmsRequest {}),
-            ReqKind::GetVpnEnrollment(GetVpnEnrollmentRequest {}),
-            ReqKind::ListVpnPeers(ListVpnPeersRequest {}),
-            ReqKind::RevokeVpnPeer(RevokeVpnPeerRequest::default()),
-            ReqKind::CreateUserInvite(CreateUserInviteRequest::default()),
-            ReqKind::ListUserInvites(ListUserInvitesRequest {}),
-            ReqKind::RevokeUserInvite(RevokeUserInviteRequest::default()),
-            ReqKind::BeginUserRegistration(BeginUserRegistrationRequest::default()),
-            ReqKind::CompleteUserRegistration(CompleteUserRegistrationRequest::default()),
-            ReqKind::RevokeUserSessions(RevokeUserSessionsRequest::default()),
-        ]
+    /// That second function is the actual guarantee, and it replaced an
+    /// `assert_eq!(all.len(), N, ..)` that could not be one. The list and the
+    /// count were edited by the same human action — adding a proto variant and
+    /// remembering to come here — so a variant added to the proto and never
+    /// added to this list left the list and the count agreeing with each other
+    /// at the old, wrong size. Not hypothetical: `SetUserRole`,
+    /// `SetUserEnabled` and `SetUserPassword` were added to the proto and both
+    /// sweeps below kept passing until a human updated this file by hand.
+    ///
+    /// The exhaustive matches in `wayfinder-protos`'s `service.rs`
+    /// (`request_kind_name`, `audited`, `request_facet`) do force a decision on
+    /// a new variant, and they caught those three. What none of them forces is
+    /// an *authorization* decision: `permits` matches on the access tier, and
+    /// the request appears only inside `matches!`, which has an implicit
+    /// catch-all — so a new kind silently becomes permitted for admin and
+    /// self-key and refused for viewer and enrollment. This is the check that
+    /// makes somebody choose. A wildcard arm on `all_kinds_exhaustive` would
+    /// restore the hole; do not add one.
+    macro_rules! every_request_kind_variants {
+        ($($variant:ident($ty:ty)),+ $(,)?) => {
+            fn every_request_kind() -> Vec<ReqKind> {
+                use wayfinder_protos::wayfinder::v1alpha::*;
+                // `Default` uniformly, which every prost message implements,
+                // rather than the mix of `Foo {}` and `Foo::default()` the
+                // hand-written list had.
+                vec![$(ReqKind::$variant(<$ty>::default())),+]
+            }
+
+            // Never called: the only property that matters is that it
+            // compiles. See the comment above — a oneof variant this arm list
+            // omits makes this match, and so this whole test module, fail to
+            // build.
+            #[allow(dead_code)]
+            fn all_kinds_exhaustive(kind: &ReqKind) {
+                match kind {
+                    $(ReqKind::$variant(_) => (),)+
+                }
+            }
+        };
+    }
+
+    every_request_kind_variants! {
+        GetNodeInfo(GetNodeInfoRequest),
+        GetRoutingTable(GetRoutingTableRequest),
+        GetLinkQualityTable(GetLinkQualityTableRequest),
+        ResolveRoute(ResolveRouteRequest),
+        GetOgmSchedule(GetOgmScheduleRequest),
+        GetThroughput(GetThroughputRequest),
+        GetMetrics(GetMetricsRequest),
+        SetAuth(SetAuthRequest),
+        GetTrustAnchor(GetTrustAnchorRequest),
+        SubmitCsr(SubmitCsrRequest),
+        RevokeNode(RevokeNodeRequest),
+        GetSecurityStatus(GetSecurityStatusRequest),
+        ListCerts(ListCertsRequest),
+        ListPendingCsrs(ListPendingCsrsRequest),
+        ApproveCsr(ApproveCsrRequest),
+        DenyCsr(DenyCsrRequest),
+        SetConfig(SetConfigRequest),
+        GetKeepaliveTable(GetKeepAliveTableRequest),
+        Authenticate(AuthenticateRequest),
+        GetLinkFeaturesTable(GetLinkFeaturesTableRequest),
+        GetLogs(GetLogsRequest),
+        SetLogLevel(SetLogLevelRequest),
+        RevealEnrollmentToken(RevealEnrollmentTokenRequest),
+        AuthenticateUser(AuthenticateUserRequest),
+        ListUsers(ListUsersRequest),
+        CreateUser(CreateUserRequest),
+        RemoveUser(RemoveUserRequest),
+        GetAlarms(GetAlarmsRequest),
+        GetVpnEnrollment(GetVpnEnrollmentRequest),
+        ListVpnPeers(ListVpnPeersRequest),
+        RevokeVpnPeer(RevokeVpnPeerRequest),
+        CreateUserInvite(CreateUserInviteRequest),
+        ListUserInvites(ListUserInvitesRequest),
+        RevokeUserInvite(RevokeUserInviteRequest),
+        BeginUserRegistration(BeginUserRegistrationRequest),
+        CompleteUserRegistration(CompleteUserRegistrationRequest),
+        RevokeUserSessions(RevokeUserSessionsRequest),
+        SetUserRole(SetUserRoleRequest),
+        SetUserEnabled(SetUserEnabledRequest),
+        SetUserPassword(SetUserPasswordRequest),
     }
 
     /// The enrollment tier is a *closed* allowlist over the whole request
-    /// surface: exactly `SubmitCsr`, `GetTrustAnchor` and `AuthenticateUser`,
-    /// and every one of the other thirty-two kinds refused — including the ones that would otherwise be
-    /// the prize (`ApproveCsr` on its own request, `SetAuth`, `SetConfig`,
-    /// `GetLogs`).
+    /// surface: exactly `SubmitCsr`, `GetTrustAnchor`, `AuthenticateUser`,
+    /// `BeginUserRegistration` and `CompleteUserRegistration`, and every other
+    /// kind refused — including the ones that would otherwise be the prize
+    /// (`ApproveCsr` on its own request, `SetAuth`, `SetConfig`, `GetLogs`).
     ///
-    /// The count assertion is the load-bearing half. Without it a request kind
-    /// added to the proto and forgotten here would pass by omission, and the
-    /// sweep would silently stop covering the surface it claims to.
+    /// What makes this a sweep of the *whole* surface rather than a hand-picked
+    /// sample is `every_request_kind_variants!`: its exhaustive match fails to
+    /// compile when a proto variant is missing from the list, so
+    /// `every_request_kind()` is guaranteed complete rather than asserted to be.
     #[test]
     fn permits_confines_the_enrollment_tier_to_a_closed_allowlist() {
         let all = every_request_kind();
-        assert_eq!(
-            all.len(),
-            37,
-            "every_request_kind must list every variant of the request oneof; \
-             add the new one (and decide what the enrollment tier may do with it)"
-        );
 
         for request in &all {
             // Notably not on the list: `RevealEnrollmentToken`. A node asking
@@ -950,12 +981,6 @@ mod tests {
     #[test]
     fn permits_confines_the_viewer_tier_to_the_queries() {
         let all = every_request_kind();
-        assert_eq!(
-            all.len(),
-            37,
-            "every_request_kind must list every variant of the request oneof; \
-             add the new one (and decide what the viewer tier may do with it)"
-        );
 
         for request in &all {
             let refused = matches!(
@@ -1012,6 +1037,15 @@ mod tests {
                     // Ending the sessions somebody currently holds is the same
                     // administration `RemoveUser` above is, minus the deletion.
                     | ReqKind::RevokeUserSessions(_)
+                    // Deciding who may administer the mesh, whether an account
+                    // may sign in at all, and what its credential is. The three
+                    // are the account lifecycle between `CreateUser` and
+                    // `RemoveUser`, and belong to the same tier those do — a
+                    // read-only grant that could promote its own holder would
+                    // not be read-only for longer than one request.
+                    | ReqKind::SetUserRole(_)
+                    | ReqKind::SetUserEnabled(_)
+                    | ReqKind::SetUserPassword(_)
             );
             assert_eq!(
                 permits(MgmtAccess::GrantedViewer, request),

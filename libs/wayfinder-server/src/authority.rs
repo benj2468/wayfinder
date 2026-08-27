@@ -650,12 +650,13 @@ impl CertAuthority {
 
     /// Add a user account, refusing a name that already exists.
     ///
-    /// Two callers, and the *first* one is the reason this is a method at all:
-    /// `wayfinderctl user add`, operating directly on the state file the
-    /// provider owns, because the first account cannot be created over the
-    /// management API — creating it needs the very credential it creates. The
-    /// second is `MeshAuthority::create_user`, which is that same act performed
-    /// by an already-admitted administrator over the wire.
+    /// Two callers. `MeshAuthority::create_user` is this act performed by an
+    /// already-admitted administrator over the wire, and the bootstrap path is
+    /// the same request made by an operator on the provider host presenting the
+    /// node's own identity seed — which authenticates at the self-key tier and
+    /// so needs no account to exist yet. (Before design 15 the second caller
+    /// was `wayfinderctl user add` writing the state file directly, which raced
+    /// the provider's own writes.)
     pub fn add_user(&mut self, user: UserRecord) -> Result<(), String> {
         self.evict_expired_invites()?;
         self.check_name_available(&user.username)?;
@@ -814,6 +815,213 @@ impl CertAuthority {
         })
     }
 
+    /// Set `username`'s role, revoking every session certificate the change
+    /// invalidates, as one durable write.
+    ///
+    /// **A demotion revokes.** The capability is stamped on the certificate,
+    /// not read from the account at each request, so a session minted while the
+    /// account was an administrator goes on administering until it is revoked
+    /// or expires. Changing only what the account is issued *next* would report
+    /// an access as removed while its holder still had it — the gap design 14
+    /// closed for `RemoveUser`.
+    ///
+    /// **A promotion does not.** The certificates the account holds now grant
+    /// less than the account does, which costs its holder one sign-in and
+    /// nobody any access; revoking them would spend mesh airtime for nothing.
+    ///
+    /// Restating the role an account already holds is a success that writes and
+    /// revokes nothing — the call an operator makes when unsure the first one
+    /// landed must not cut off a session on its way through. That case is
+    /// reported as `false` in the returned pair rather than being
+    /// indistinguishable from a change that revoked nothing: a promotion also
+    /// returns no records, so the vector alone cannot tell an operator whether
+    /// anything happened. Reporting it here is what lets the layers above stop
+    /// re-deriving the same answer from a second roster read.
+    ///
+    /// The role change and the revocations share one
+    /// [`CaLog::mutate_users_and_issued`] call, for the reason
+    /// [`Self::remove_user_revoking_sessions`] gives: they must not durably
+    /// split, and the direction that matters is a demotion recorded whose
+    /// admin sessions came back un-revoked.
+    ///
+    /// Carries no last-administrator guard — like the raw removal above, this
+    /// is the act, and [`MeshAuthority::set_user_role`] is where the policy
+    /// that refuses to strand the mesh lives.
+    pub fn set_user_role_revoking_sessions(
+        &mut self,
+        username: &str,
+        role: UserRole,
+    ) -> Result<(Vec<RevocationRecord>, bool), String> {
+        let account = self.account_id_of(username)?;
+        if self.user_record(username)?.role == role {
+            return Ok((Vec::new(), false));
+        }
+        let sessions = match role {
+            UserRole::Viewer => self.live_sessions_of(account),
+            UserRole::Admin => Vec::new(),
+        };
+        let name = username.to_string();
+        self.revoke_sessions(username, &sessions, move |log, revoked| {
+            let (_, persisted) = log.mutate_users_and_issued(|users, issued| {
+                if let Some(user) = users.iter_mut().find(|u| u.username == name) {
+                    user.role = role;
+                }
+                mark_revoked(issued, revoked);
+            });
+            persisted
+        })
+        .map(|records| {
+            tracing::info!(%username, ?role, "changed an account's role");
+            (records, true)
+        })
+    }
+
+    /// Enable or disable `username`, revoking every session certificate the
+    /// change invalidates, as one durable write.
+    ///
+    /// **Disabling revokes**, for the reason a demotion does above: an account
+    /// that obtains no *new* session while every certificate it already holds
+    /// keeps working is disabled only in the future tense, and an operator
+    /// disabling an account believes access stopped now.
+    ///
+    /// **Enabling revokes nothing and clears the lockout** — an operator
+    /// turning an account back on means it should work, not that it should work
+    /// in fifteen minutes.
+    ///
+    /// Restating the state an account is already in writes nothing, and is
+    /// reported as `false` in the returned pair — see
+    /// [`Self::set_user_role_revoking_sessions`] for why the vector alone
+    /// cannot carry that.
+    ///
+    /// Carries no last-administrator guard; see
+    /// [`Self::set_user_role_revoking_sessions`].
+    pub fn set_user_enabled_revoking_sessions(
+        &mut self,
+        username: &str,
+        enabled: bool,
+    ) -> Result<(Vec<RevocationRecord>, bool), String> {
+        let account = self.account_id_of(username)?;
+        // A lockout counts as something to change, not just the `disabled`
+        // flag. The two are independent — five failed sign-ins lock an account
+        // that was never disabled — and that is the state an operator reaches
+        // for `enable` to clear. Keyed on `disabled` alone, this answered
+        // "already enabled" and left the lockout standing, in the case the
+        // command is most often typed for.
+        let record = self.user_record(username)?;
+        let already_enabled = record.disabled != enabled;
+        let nothing_to_clear = !enabled || !record.is_locked(self.now_unix());
+        if already_enabled && nothing_to_clear {
+            return Ok((Vec::new(), false));
+        }
+        let sessions = if enabled {
+            Vec::new()
+        } else {
+            self.live_sessions_of(account)
+        };
+        let name = username.to_string();
+        self.revoke_sessions(username, &sessions, move |log, revoked| {
+            let (_, persisted) = log.mutate_users_and_issued(|users, issued| {
+                if let Some(user) = users.iter_mut().find(|u| u.username == name) {
+                    user.disabled = !enabled;
+                    if enabled {
+                        user.failed_attempts = 0;
+                        user.locked_until = 0;
+                    }
+                }
+                mark_revoked(issued, revoked);
+            });
+            persisted
+        })
+        .map(|records| {
+            tracing::info!(%username, enabled, "changed an account's enabled state");
+            (records, true)
+        })
+    }
+
+    /// Replace `username`'s password, clearing any lockout with it.
+    ///
+    /// The administrative reset, for somebody who has lost their password. It
+    /// leaves the second factor alone: an operator able to replace both could
+    /// take an account over in one act and leave its owner no signal, and
+    /// whoever needs a fresh factor gets a fresh invite.
+    ///
+    /// Revokes nothing, deliberately. A forgotten password is the common case,
+    /// and ending every device its owner is signed in on is a larger act than
+    /// was asked for; when the reset answers a compromise,
+    /// [`Self::revoke_user_sessions`] is the act that says so.
+    pub fn set_user_password(&mut self, username: &str, password: &str) -> Result<(), String> {
+        let mut failed = None;
+        self.update_user(username, |user| {
+            // `set_password` can fail (an empty password, Argon2 parameters)
+            // and the callback returns nothing, so the failure is carried out
+            // rather than swallowed: a "changed" password that did not change
+            // is the worst outcome available here.
+            if let Err(e) = user.set_password(password) {
+                failed = Some(e);
+            }
+        })?;
+        match failed {
+            Some(e) => Err(e),
+            None => {
+                // Named here and never in the audit record, which carries the
+                // request kind and no fields — so this is the only place the
+                // question "whose password was reset, and when?" is answerable
+                // on a node whose log ring is its audit trail. The password
+                // itself is not logged, here or anywhere.
+                tracing::info!(%username, "reset an account's password");
+                Ok(())
+            }
+        }
+    }
+
+    /// Refuse `act` when it would leave the mesh with nobody who can administer
+    /// it over the management API.
+    ///
+    /// Three acts reach here — removing, demoting and disabling — and they
+    /// leave the same mesh: one whose user store no ordinary session can change
+    /// in either direction, because every request that could change it needs a
+    /// full management grant and only an administrator's session carries one.
+    /// A guard on removal alone would be a locked front door beside an open
+    /// window.
+    ///
+    /// Counted before the act rather than after, so the check reads as the
+    /// question being asked. A disabled account is not an answer to it — it
+    /// obtains no session and so administers nothing — which is also why
+    /// disabling is one of the three acts guarded.
+    ///
+    /// Every caller evaluates this *before* signing anything, so a refusal has
+    /// revoked nothing: the account it declined to touch keeps the sessions it
+    /// holds.
+    fn refuse_to_strand_the_mesh(&self, username: &str, act: &str) -> Result<(), String> {
+        let enabled_admins = || {
+            self.log
+                .users()
+                .iter()
+                .filter(|u| u.role == UserRole::Admin && !u.disabled)
+        };
+        let is_enabled_admin = enabled_admins().any(|u| u.username == username);
+        let is_the_last = enabled_admins().all(|u| u.username == username);
+        if is_enabled_admin && is_the_last {
+            return Err(alloc::format!(
+                "refusing to {act} the last administrator: no account would be left that can \
+                 administer this mesh over the management API. Create another administrator \
+                 first — an operator on the provider host can do that against the running \
+                 provider with `wayfinderctl user add --identity <node identity seed>`, which \
+                 authenticates as the node itself."
+            ));
+        }
+        Ok(())
+    }
+
+    /// The stored record for `username`, or an error naming what is missing.
+    fn user_record(&self, username: &str) -> Result<&UserRecord, String> {
+        self.log
+            .users()
+            .iter()
+            .find(|u| u.username == username)
+            .ok_or_else(|| alloc::format!("no such user: {username}"))
+    }
+
     /// Sign a revocation for each of `sessions`, apply `commit` to record them,
     /// and return the signed records.
     ///
@@ -872,13 +1080,13 @@ impl CertAuthority {
 
     /// The MACs of the session certificates `username` currently holds.
     ///
-    /// Public for the one caller that must *report* what it cannot revoke:
-    /// `wayfinderctl user remove` operates on the state file with no router
-    /// beside it, so it cannot flood a revocation, and naming the certificates
-    /// it is leaving live is the only remedy available offline — an operator
-    /// with these MACs can revoke them against a running provider afterwards.
-    /// Without them the sessions are unfindable, which is the orphan case
-    /// design 14 §3.1 is about.
+    /// Public because the question "what would revoking this account end?" is
+    /// worth asking without answering it — [`Self::has_live_sessions`] is the
+    /// gate `AuthorityAdapter` applies before signing anything, and it is built
+    /// from this. It was once public for `wayfinderctl user remove`, which
+    /// operated on the state file with no router beside it and so could only
+    /// *name* the certificates it was leaving live; that path is gone, and the
+    /// act it could not perform is now an ordinary request.
     pub fn live_session_macs(&self, username: &str) -> Vec<Mac> {
         self.account_id_of(username)
             .map(|account| {
@@ -1848,30 +2056,34 @@ impl MeshAuthority for CertAuthority {
         Ok(uri)
     }
 
-    fn remove_user(&mut self, username: &str) -> Result<Vec<RevocationRecord>, String> {
-        // Counted before the removal rather than after, so the check reads as
-        // the question being asked: would this leave the mesh with nobody who
-        // can administer it? A disabled account is not an answer to that — it
-        // obtains no session and so administers nothing.
-        let last_admin = self
-            .log
-            .users()
-            .iter()
-            .filter(|u| u.role == UserRole::Admin && !u.disabled)
-            .all(|u| u.username == username);
-        let is_enabled_admin = self
-            .log
-            .users()
-            .iter()
-            .any(|u| u.username == username && u.role == UserRole::Admin && !u.disabled);
-        if is_enabled_admin && last_admin {
-            return Err(
-                "refusing to remove the last administrator: no account would be left that can \
-                 administer this mesh over the management API. Create another administrator \
-                 first, or remove this one with `wayfinderctl user remove` on the provider host."
-                    .to_string(),
-            );
+    fn set_user_role(
+        &mut self,
+        username: &str,
+        role: UserRole,
+    ) -> Result<(Vec<RevocationRecord>, bool), String> {
+        if role == UserRole::Viewer {
+            self.refuse_to_strand_the_mesh(username, "demote")?;
         }
+        self.set_user_role_revoking_sessions(username, role)
+    }
+
+    fn set_user_enabled(
+        &mut self,
+        username: &str,
+        enabled: bool,
+    ) -> Result<(Vec<RevocationRecord>, bool), String> {
+        if !enabled {
+            self.refuse_to_strand_the_mesh(username, "disable")?;
+        }
+        self.set_user_enabled_revoking_sessions(username, enabled)
+    }
+
+    fn set_user_password(&mut self, username: &str, password: &str) -> Result<(), String> {
+        CertAuthority::set_user_password(self, username, password)
+    }
+
+    fn remove_user(&mut self, username: &str) -> Result<Vec<RevocationRecord>, String> {
+        self.refuse_to_strand_the_mesh(username, "remove")?;
         // The guard is evaluated before anything is signed, so a refused
         // removal has revoked nothing — the account it declined to delete keeps
         // the sessions it holds.
@@ -4917,5 +5129,334 @@ mod tests {
         assert!(ca.list_user_invites().is_empty());
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// **Demoting an administrator ends the admin certificates it is already
+    /// holding**, in the same act.
+    ///
+    /// The capability lives on the certificate, not on the account. A session
+    /// minted while the account was an administrator carries `CERT_FLAG_ADMIN`
+    /// and goes on carrying it until it is revoked or expires — so a demotion
+    /// that changed only what the account is issued *next* would report an
+    /// access as removed while its holder was still exercising it. That is the
+    /// gap design 14 closed for `RemoveUser`, reopened one request along.
+    ///
+    /// Two sessions rather than one, for the reason
+    /// [`revoking_an_accounts_sessions_ends_every_live_one`] uses two: a person
+    /// signs in from a laptop and a phone, and ending only the most recent
+    /// leaves the other one administering the mesh.
+    #[test]
+    fn demoting_an_administrator_revokes_the_admin_sessions_it_holds() {
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        ca.add_user(UserRecord::new("second", "hunter2", UserRole::Admin, 900).unwrap())
+            .unwrap();
+        let laptop = sign_in(&mut ca, "ops", &secret, 2);
+        next_totp_step(&mut ca);
+        let phone = sign_in(&mut ca, "ops", &secret, 3);
+
+        let (records, changed) = ca
+            .set_user_role_revoking_sessions("ops", UserRole::Viewer)
+            .expect("the demotion succeeds");
+
+        assert!(changed, "the account was an administrator a moment ago");
+        assert_eq!(records.len(), 2, "one signed revocation per live session");
+        assert!(entry(&ca, &laptop).revoked);
+        assert!(entry(&ca, &phone).revoked);
+
+        let ops = ca
+            .list_users()
+            .into_iter()
+            .find(|u| u.username == "ops")
+            .unwrap();
+        assert_eq!(ops.role, UserRole::Viewer, "and the account is demoted");
+    }
+
+    /// A promotion revokes nothing.
+    ///
+    /// The asymmetry is the point: the certificates the account already holds
+    /// now grant *less* than the account does, which costs its holder one
+    /// sign-in and nobody any access. Revoking them anyway would sign the mesh
+    /// a record to flood in exchange for nothing.
+    #[test]
+    fn promoting_an_account_revokes_nothing() {
+        let (mut ca, secret) = ca_with_user(UserRole::Viewer, 900);
+        let laptop = sign_in(&mut ca, "ops", &secret, 2);
+
+        let (records, changed) = ca
+            .set_user_role_revoking_sessions("ops", UserRole::Admin)
+            .expect("the promotion succeeds");
+
+        assert!(changed);
+        assert!(records.is_empty(), "nothing to cut off");
+        assert!(!entry(&ca, &laptop).revoked, "the session keeps working");
+        assert_eq!(
+            ca.list_users()[0].role,
+            UserRole::Admin,
+            "and the account is promoted"
+        );
+    }
+
+    /// Stating the role an account already holds is a success that revokes
+    /// nothing — not an error, and not a re-issue.
+    ///
+    /// A caller that states a role got the account it asked for. What must not
+    /// happen is that saying "this account is a viewer" twice revokes a session
+    /// the first call already accounted for, since the second call is exactly
+    /// what an operator does when they are unsure whether the first landed.
+    #[test]
+    fn restating_the_role_an_account_already_holds_revokes_nothing() {
+        let (mut ca, secret) = ca_with_user(UserRole::Viewer, 900);
+        let laptop = sign_in(&mut ca, "ops", &secret, 2);
+
+        let (records, changed) = ca
+            .set_user_role_revoking_sessions("ops", UserRole::Viewer)
+            .expect("restating a role is not an error");
+
+        assert!(!changed, "and it says so, rather than reporting a change");
+        assert!(records.is_empty());
+        assert!(!entry(&ca, &laptop).revoked);
+    }
+
+    /// **Disabling an account ends the sessions it is already holding.**
+    ///
+    /// Without that, "disabled" is a statement about the future only: the
+    /// account obtains no *new* session while every certificate it already has
+    /// keeps working, for up to its whole session lifetime. An operator
+    /// disabling an account believes access stopped now.
+    #[test]
+    fn disabling_an_account_revokes_the_sessions_it_holds() {
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        let laptop = sign_in(&mut ca, "ops", &secret, 2);
+
+        let (records, changed) = ca
+            .set_user_enabled_revoking_sessions("ops", false)
+            .expect("disabling succeeds");
+
+        assert!(changed);
+        assert_eq!(records.len(), 1);
+        assert!(entry(&ca, &laptop).revoked);
+        assert!(ca.list_users()[0].disabled);
+    }
+
+    /// Re-enabling clears the lockout with it, and revokes nothing: an operator
+    /// turning an account back on means it should work, not that it should work
+    /// in fifteen minutes.
+    #[test]
+    fn enabling_an_account_clears_its_lockout_and_revokes_nothing() {
+        let (mut ca, _) = ca_with_user(UserRole::Admin, 900);
+        ca.update_user("ops", |user| {
+            user.disabled = true;
+            user.failed_attempts = 5;
+            user.locked_until = ca_locked_until();
+        })
+        .unwrap();
+
+        let (records, changed) = ca
+            .set_user_enabled_revoking_sessions("ops", true)
+            .expect("enabling succeeds");
+
+        assert!(changed);
+        assert!(records.is_empty());
+        let ops = &ca.list_users()[0];
+        assert!(!ops.disabled);
+        assert!(!ops.locked, "the lockout went with it");
+    }
+
+    /// Enabling clears a lockout on an account that was **never disabled**.
+    ///
+    /// `disabled` and `locked_until` are independent: five failed sign-ins lock
+    /// an account that is otherwise perfectly enabled, and that is the state an
+    /// operator actually reaches for `enable` to fix. A fast path keyed on
+    /// `disabled` alone answers "already enabled; nothing changed" and leaves
+    /// the lockout standing — which makes the command's own promise false in
+    /// the only case it is usually typed for. There is no `unlock` command, so
+    /// the alternatives are waiting out the window or resetting the password.
+    #[test]
+    fn enabling_a_locked_but_never_disabled_account_clears_the_lockout() {
+        let (mut ca, _) = ca_with_user(UserRole::Admin, 900);
+        ca.set_now_unix(1_000);
+        ca.update_user("ops", |user| {
+            user.failed_attempts = 5;
+            user.locked_until = ca_locked_until();
+        })
+        .unwrap();
+        assert!(ca.list_users()[0].locked, "locked, and never disabled");
+        assert!(!ca.list_users()[0].disabled);
+
+        ca.set_user_enabled_revoking_sessions("ops", true)
+            .expect("enabling succeeds");
+
+        assert!(
+            !ca.list_users()[0].locked,
+            "the lockout is cleared even though `disabled` never changed"
+        );
+    }
+
+    /// A demotion that cannot be made durable changes nothing and says so.
+    ///
+    /// Both halves are absent afterwards — the role is unchanged *and* the
+    /// session is un-revoked — and the caller is told, rather than being handed
+    /// a success for a write that never landed.
+    ///
+    /// What this deliberately does **not** prove is that the two halves share
+    /// one write. Under a doomed store two separate writes both fail and both
+    /// roll back, so the end state is identical; the split is only observable
+    /// when the first write succeeds and the second does not, which cannot be
+    /// arranged from out here — there is no way to intervene between two writes
+    /// internal to the method. That property is pinned one layer down, in
+    /// `persistence.rs`'s
+    /// `mutate_users_and_issued_rolls_back_both_collections_together_on_persist_failure`,
+    /// where the directory can be removed *between* the halves. Left explicit
+    /// because a reader could reasonably assume this test covers it, and act on
+    /// that assumption when changing the method.
+    #[test]
+    fn a_demotion_that_cannot_be_persisted_changes_nothing_and_reports_it() {
+        // Set up against a store that *works*, so the account and its session
+        // are durably there — then take the directory away, which dooms every
+        // later write. Dooming it up front instead would roll back the setup
+        // itself and leave nothing to demote.
+        let dir = std::env::temp_dir().join(format!(
+            "wayfinder-server-test-{}-demotion-atomicity",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let cfg = persisted_cfg(&path);
+        let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
+        ca.set_now_unix(1_700_000_000);
+
+        let user = UserRecord::new("ops", "hunter2", UserRole::Admin, 900)
+            .unwrap()
+            .without_totp();
+        ca.add_user(user).unwrap();
+        let session = Keypair::from_seed(&[5u8; 32]);
+        MeshAuthority::authenticate_user(
+            &mut ca,
+            "ops",
+            "hunter2",
+            "",
+            &session.ed_pubkey(),
+            &session.x_pubkey(),
+        )
+        .expect("the login is serviceable");
+        let live = ca.live_session_macs("ops");
+        assert_eq!(live.len(), 1, "the account holds one session to revoke");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let err = ca
+            .set_user_role_revoking_sessions("ops", UserRole::Viewer)
+            .expect_err("a write that cannot be made durable is an error");
+        assert!(err.contains("could not record"), "got: {err}");
+
+        // Both halves rolled back, together.
+        assert_eq!(
+            ca.list_users()[0].role,
+            UserRole::Admin,
+            "the role change did not land"
+        );
+        assert!(
+            !entry(&ca, &live[0].0).revoked,
+            "and neither did the revocation"
+        );
+    }
+
+    /// An administrative password reset replaces the password, clears any
+    /// lockout, and leaves the second factor alone.
+    ///
+    /// The last clause is the security-relevant one. An operator who could
+    /// replace the second factor too could take an account over with one
+    /// request and leave its owner no signal; whoever needs a fresh factor gets
+    /// a fresh invite.
+    #[test]
+    fn resetting_a_password_keeps_the_second_factor() {
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        ca.update_user("ops", |user| {
+            user.failed_attempts = 5;
+            user.locked_until = ca_locked_until();
+        })
+        .unwrap();
+
+        ca.set_user_password("ops", "correct horse battery staple")
+            .expect("the reset succeeds");
+
+        assert!(!ca.list_users()[0].locked, "the lockout is cleared");
+
+        // The new password signs in, with the *same* authenticator code.
+        let (ed, x) = node_keys(2);
+        let code = live_code(&secret, ca.now_unix());
+        let outcome = ca
+            .authenticate_user("ops", "correct horse battery staple", &code, &ed, &x)
+            .expect("the login is serviceable");
+        assert!(
+            matches!(outcome, UserAuthOutcome::Issued(_)),
+            "the new password works and the old second factor still does"
+        );
+    }
+
+    /// An empty password is refused rather than stored: an account whose
+    /// password is the empty string is not a credential.
+    #[test]
+    fn resetting_a_password_to_nothing_is_refused() {
+        let (mut ca, _) = ca_with_user(UserRole::Admin, 900);
+        assert!(ca.set_user_password("ops", "").is_err());
+    }
+
+    /// Every one of the three refuses an unknown name rather than reporting a
+    /// silent success — whoever typed it has a wrong idea about the roster.
+    #[test]
+    fn changing_an_unknown_account_is_refused() {
+        let (mut ca, _) = ca_with_user(UserRole::Admin, 900);
+        assert!(
+            ca.set_user_role_revoking_sessions("nobody", UserRole::Viewer)
+                .is_err()
+        );
+        assert!(
+            ca.set_user_enabled_revoking_sessions("nobody", false)
+                .is_err()
+        );
+        assert!(ca.set_user_password("nobody", "hunter2").is_err());
+    }
+
+    /// Demoting or disabling the last account that can still administer the
+    /// mesh is refused over the management API, exactly as removing it is.
+    ///
+    /// All three leave the same mesh: one with no enabled administrator, whose
+    /// user store no ordinary session can change in either direction. The guard
+    /// belongs to all three or to none — a refusal on `RemoveUser` alone is a
+    /// locked front door beside an open window.
+    ///
+    /// Refused *before* anything is signed, so a declined demotion has revoked
+    /// nothing: the account it would not demote keeps the sessions it holds.
+    #[test]
+    fn stranding_the_mesh_by_demoting_or_disabling_the_last_admin_is_refused() {
+        let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
+        let laptop = sign_in(&mut ca, "ops", &secret, 2);
+
+        let err = MeshAuthority::set_user_role(&mut ca, "ops", UserRole::Viewer).unwrap_err();
+        assert!(
+            err.contains("administrator"),
+            "the refusal says what it is protecting: {err}"
+        );
+        let err = MeshAuthority::set_user_enabled(&mut ca, "ops", false).unwrap_err();
+        assert!(err.contains("administrator"), "{err}");
+
+        assert_eq!(ca.list_users()[0].role, UserRole::Admin);
+        assert!(!ca.list_users()[0].disabled);
+        assert!(
+            !entry(&ca, &laptop).revoked,
+            "a refused act signs nothing: the session is untouched"
+        );
+
+        // A second enabled administrator makes both go through.
+        ca.add_user(UserRecord::new("second", "hunter2", UserRole::Admin, 900).unwrap())
+            .unwrap();
+        MeshAuthority::set_user_role(&mut ca, "ops", UserRole::Viewer).unwrap();
+        MeshAuthority::set_user_enabled(&mut ca, "ops", false).unwrap();
+    }
+
+    /// A lockout instant far enough ahead of the test clock to be in force.
+    fn ca_locked_until() -> u64 {
+        u64::MAX
     }
 }
