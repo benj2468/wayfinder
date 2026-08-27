@@ -93,6 +93,43 @@ async fn dashboard_page_renders() {
     );
 }
 
+/// The header names no node, because the address it used to name is the
+/// dashboard's own dial target rather than the node's identity.
+///
+/// On a deployment where this process and the node share a host that address is
+/// `127.0.0.1:7700`, which says nothing about which node is on screen and reads
+/// as though the mesh itself were loopback. It is still shown on the Overview
+/// tab, as "Management API", which is what it actually is.
+#[tokio::test]
+async fn the_header_does_not_name_the_dial_address() {
+    let conn = common::serve_mock_node().await;
+    let app = wayfinder_web::server::build_router(
+        common::test_leptos_options(),
+        common::static_access(conn),
+        common::test_hosts(),
+    );
+
+    let response = app
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8_lossy(&body);
+
+    // By class rather than by the address itself: the label is fetched by an
+    // effect in the browser, so the server renders the element empty and only
+    // its absence is assertable here.
+    assert!(
+        !html.contains("wf-header-node"),
+        "no node label in the header: {html:.400}"
+    );
+    assert!(
+        html.contains("wf-header-status"),
+        "the liveness indicator it sat beside is untouched: {html:.400}"
+    );
+}
+
 /// Every tab route is served, rather than falling through to the 404 view.
 ///
 /// A typo'd route path renders the fallback with a 200, so status alone would

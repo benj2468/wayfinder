@@ -40,7 +40,6 @@
 use leptos::ev::SubmitEvent;
 use leptos::prelude::*;
 
-use crate::components::dashboard::use_dashboard;
 use crate::components::logo::Logo;
 use crate::session::LoginResult;
 use crate::session::ViewerResource;
@@ -174,21 +173,19 @@ pub fn Login(
         });
     };
 
-    // The node this dashboard is pointed at, from the shared dashboard state —
-    // which fetches it once at startup and does not need a session to do it.
-    // Worth showing here and not only past the sign-in: several of these
-    // dashboards run side by side, one per node, and they are otherwise
-    // identical pages on adjacent ports.
-    let node = use_dashboard().label;
-
     view! {
         <div class="wf-login-page">
+            // The mark alone, naming no node. What this process could name one
+            // by is the address it dials, and on a co-located deployment that
+            // is `127.0.0.1:7700` for every dashboard on the host — so it told
+            // adjacent dashboards apart no better than the mark does, while
+            // being the first thing a person reads before signing in. See
+            // `crate::Header`, which drops it for the same reason.
             <div class="wf-login-mark">
                 <span class="wf-brand">
                     <Logo />
                     "Wayfinder"
                 </span>
-                <span class="wf-login-node wf-mono">{move || node.get()}</span>
             </div>
             <form class="wf-panel wf-login" on:submit=submit>
                 <div class="wf-panel-head">

@@ -452,15 +452,23 @@ fn RegistrationAware(
     }
 }
 
-/// The page header: product mark, the node being viewed, what the node says is
-/// wrong, a live/stale dot, and — in login mode — who is signed in and how to
-/// stop being.
+/// The page header: product mark, what the node says is wrong, a live/stale
+/// dot, and — in login mode — who is signed in and how to stop being.
 ///
 /// The alarm strip and the liveness dot are deliberately adjacent, and answer
 /// the two halves of one question. The dot says whether this page is still in
 /// touch with the node; the strip says what the node reports about itself. Read
 /// apart, either is misleading — "all systems normal" from a snapshot ten
 /// minutes stale is the worst thing this page could say.
+///
+/// It names no node, and that is a deliberate subtraction. The only thing this
+/// process knows to name one by is the address it dials, which is a fact about
+/// this dashboard's reach rather than about the node: co-locate the two — the
+/// certificate authority does — and the header reads `127.0.0.1:7700`, which
+/// identifies nothing and invites the reading that the mesh is loopback. That
+/// address is still shown, on the Overview tab, under the name of what it
+/// actually is. A header that named the node would need the node to say its
+/// own name over the management API, which nothing does today.
 #[component]
 fn Header(
     /// Shared dashboard state.
@@ -473,7 +481,6 @@ fn Header(
                 "Wayfinder"
             </span>
             <ScopeSwitch dash=dash />
-            <span class="wf-header-node wf-mono">{move || dash.label.get()}</span>
             <AlarmStrip dash=dash />
             <ViewerStrip />
             <span class="wf-header-status">
@@ -607,7 +614,7 @@ fn ScopeSwitch(
 /// The header carries the *name* and nothing else — it is the one fact a person
 /// glances at to check they are who they think they are. What the session is
 /// (its capability, when it stops working) and what to do about it (sign out)
-/// are details, and details in a header are noise between the node label and
+/// are details, and details in a header are noise between the alarm strip and
 /// the liveness dot. They live in a card that opens on hover or focus.
 ///
 /// Opened by CSS rather than by a signal, so there is no open/closed state to
