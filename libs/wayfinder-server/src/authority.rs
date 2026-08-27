@@ -832,7 +832,7 @@ impl CertAuthority {
         // sessions is removable on a node whose clock was never set, exactly as
         // it is today; what must not happen is signing a window that starts at
         // the epoch and is already over.
-        if !sessions.is_empty() && self.now_unix == 0 {
+        if !sessions.is_empty() && self.now_unix() == 0 {
             return Err("authority clock not set; cannot sign revocations yet".to_string());
         }
         let records: Vec<RevocationRecord> = sessions
@@ -843,7 +843,7 @@ impl CertAuthority {
             // the conservative guess `Self::revoke` makes for a device would
             // stop being enforced while the certificate it cancels still
             // verified — a revocation with a hole at the end of it.
-            .map(|(mac, not_after)| self.authority.revoke(*mac, self.now_unix, *not_after))
+            .map(|(mac, not_after)| self.authority.revoke(*mac, self.now_unix(), *not_after))
             .collect();
         let macs: Vec<Mac> = sessions.iter().map(|(mac, _)| *mac).collect();
         commit(&mut self.log, &macs)?;
@@ -913,7 +913,7 @@ impl CertAuthority {
         self.log
             .issued()
             .iter()
-            .filter(|c| c.user && !c.revoked && c.not_after > self.now_unix)
+            .filter(|c| c.user && !c.revoked && c.not_after > self.now_unix())
             .filter(|c| account.matches(&c.account_id))
             .filter_map(|c| Some((Mac(c.node_mac.as_slice().try_into().ok()?), c.not_after)))
             .collect()
@@ -2397,7 +2397,7 @@ mod tests {
     /// at all.
     fn sign_in(ca: &mut CertAuthority, username: &str, secret: &[u8], seed: u8) -> Vec<u8> {
         let (ed, x) = node_keys(seed);
-        let code = live_code(secret, ca.now_unix);
+        let code = live_code(secret, ca.now_unix());
         match ca
             .authenticate_user(username, "hunter2", &code, &ed, &x)
             .expect("the login is serviceable")
@@ -2418,7 +2418,7 @@ mod tests {
     /// accepted, so the same code a moment later is refused. That is the guard
     /// working, not an obstacle to route around.
     fn next_totp_step(ca: &mut CertAuthority) {
-        ca.set_now_unix(ca.now_unix + crate::users::TOTP_STEP_SECS);
+        ca.set_now_unix(ca.now_unix() + crate::users::TOTP_STEP_SECS);
     }
 
     /// The issued-log entry for `mac`.
@@ -2499,7 +2499,7 @@ mod tests {
         assert_eq!(records[0].node_mac.to_vec(), mac);
         assert_eq!(
             anchor
-                .verify_revocation(&records[0], ca.now_unix)
+                .verify_revocation(&records[0], ca.now_unix())
                 .expect("the mesh can act on what was signed")
                 .0
                 .to_vec(),

@@ -982,6 +982,38 @@ async fn a_file_that_is_not_a_usable_credential_says_why() {
     );
 }
 
+/// The sign-in page names no node, for the same reason the header does not.
+///
+/// It used to, on the argument that several of these dashboards run side by
+/// side on adjacent ports and are otherwise identical pages. What it named them
+/// by was the address this process dials, which on a co-located deployment is
+/// `127.0.0.1:7700` for every one of them — so it did not tell them apart, and
+/// it is the first thing a person sees before signing in.
+#[tokio::test]
+async fn the_sign_in_page_does_not_name_the_dial_address() {
+    let app = common::login_router().await;
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8_lossy(&body);
+
+    // By class rather than by the address: the label is fetched by an effect in
+    // the browser, so the server renders the element empty and only its absence
+    // is assertable here.
+    assert!(
+        !html.contains("wf-login-node"),
+        "no node label above the sign-in form: {html:.600}"
+    );
+    assert!(
+        html.contains("wf-login-mark"),
+        "the product mark it sat under is untouched: {html:.600}"
+    );
+}
+
 /// The sign-in page offers the file route, in the one form, filtered to the
 /// extension the download actually produces.
 ///

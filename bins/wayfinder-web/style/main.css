@@ -243,13 +243,8 @@ body {
   text-align: center;
 }
 
-.wf-header-node {
-  color: var(--wf-text-muted);
-  font-size: var(--wf-text-sm);
-}
-
 /* Pushed to the far end, so the liveness indicator is always in the same
- * place regardless of how long the node label is. */
+ * place regardless of how much the alarm strip has to say. */
 .wf-header-status {
   display: flex;
   align-items: center;
@@ -1512,13 +1507,6 @@ body {
   align-items: center;
   gap: var(--wf-space-1);
   margin-top: auto;
-}
-
-/* Which node this dashboard is pointed at. Several of these run side by side in
- * a mesh, one per node, and they are otherwise identical pages on adjacent
- * ports. */
-.wf-login-node {
-  color: var(--wf-text-muted);
 }
 
 .wf-login {
