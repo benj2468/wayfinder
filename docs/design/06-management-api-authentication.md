@@ -383,7 +383,9 @@ this branch — this branch is built on top of it.
    because both live in the signed certificate body.
 2. **Done.** The user store at the CA (`wayfinder-server`'s `users.rs`),
    `AuthenticateUser` on the enrollment tier, and CA state version 5 carrying
-   the accounts. `wayfinderctl user` administers them offline;
+   the accounts. `wayfinderctl user` administers them over the management API
+   (design 15 — it administered them offline, through the provider's state
+   file, until that turned out to race the provider's own writes);
    `wayfinderctl login` / `logout` / `whoami` and the `known_nodes` pin file are
    §6 items 1–3.
 3. **§6 item 5 (the dashboard session layer) is done; §6 item 4 (silent
@@ -531,10 +533,23 @@ struct UserRecord {
 }
 ```
 
-Bootstrap is offline, mirroring `cert init-ca`: `wayfinderctl user add
---state <path> --username <name> --admin`, which prompts for a password and
-prints the TOTP enrolment URI. The `disabled` flag is what lets an operator
-cut off an account without waiting for a certificate to expire.
+Bootstrap runs against the *running* provider, with the credential an operator
+on its host already holds — the node's own identity seed, which authenticates at
+the self-key tier and is admitted to every request:
+
+```
+wayfinderctl user add --identity /var/lib/wayfinder/identity.seed \
+    --username <name> --admin
+```
+
+It prompts for a password and prints the TOTP enrolment URI. That the *first*
+account cannot be created by an account is what made an offline tool look
+necessary; the node vouching for whoever is standing at its console is what
+makes it not. See design 15, which also has why the offline path was removed
+rather than kept for this one case. The `disabled` flag is what lets an operator
+cut off an account without waiting for a certificate to expire — and disabling
+now revokes what the account already holds, so it is not merely a statement
+about future sign-ins.
 
 ## 6. Making certificates easy for everyone else
 
@@ -748,7 +763,7 @@ does not invent one.
 
 
 There is no step that "links a password to a certificate" ahead of time. An
-admin creates the account offline against the provider's state file
+admin creates the account against the running provider
 (`wayfinderctl user add`), and the certificate is minted *at* sign-in, bound to
 a keypair the client generates then — which is what makes a captured login
 transcript worthless and a session revocable and expiring.
@@ -781,13 +796,15 @@ Done, and it needed two things beyond minting the accounts:
 - **`wayfinderctl user add --password-stdin`.** The prompt reads `/dev/tty`, not
   stdin, so a script that pipes a password does not supply one — it blocks on
   whatever terminal it inherited.
-- **The provider's state file is seeded on the host and bind-mounted in**, as a
+- **The provider's state directory is bind-mounted in** as a
   *directory* (the durable store renames a temporary file over the snapshot, and
   a single-file bind mount has no "beside it" to write into), through a
-  `CA_STATE_PATH` the sim image now honours. It has to be seeded before the
-  stack comes up: the provider holds that state in memory and rewrites the whole
-  snapshot, so an account added to a running provider is overwritten by its next
-  write.
+  `CA_STATE_PATH` the sim image now honours. Nothing on the host writes into it:
+  the accounts are created over the management API once the provider is running.
+  That is the other way round from how this started — it *was* seeded before the
+  stack came up, on the reasoning that a provider holds the state in memory and
+  rewrites the whole snapshot — but a host-side writer does not merge with those
+  rewrites, it races them, and either side can lose. See design 15.
 
 Two accounts, `admin` and `viewer`, both `--no-totp` — a simulation has nowhere
 to enrol an authenticator, and the flag exists for exactly this. A viewer
@@ -830,17 +847,20 @@ more thing to the Security tab".
 
 The Provider tab is also where §6.5's "account creation is still offline"
 softened, on purpose and with a stated trade: an admin session can now call
-`CreateUser`/`ListUsers`/`RemoveUser` from the browser, so `wayfinderctl user
-add` on the provider host remains the only way to bootstrap the *first*
-account, not every account after it. The proto comment on `CreateUserRequest`
+`CreateUser`/`ListUsers`/`RemoveUser` from the browser. (Design 15 later took
+this the rest of the way — *every* account mutation is a request now, including
+the first one, which an operator on the provider host makes by presenting the
+node's own identity seed. Nothing administers the user store through the
+filesystem any more.) The proto comment on `CreateUserRequest`
 states the trade rather than leaving it implicit: an admin can already revoke
 nodes and rewrite enrollment policy, so this grants no new *class* of power,
 but it does put the user store on the network for the first time. A TOTP
 enrolment URI is shown once, at creation, because the CA does not retain the
 secret in a recoverable form — the panel says plainly that it will not be
 shown again. `MeshAuthority::remove_user` (the API-reachable path, unlike the
-unguarded `CertAuthority::remove_user` that `wayfinderctl user remove` calls)
-refuses to remove the last account able to administer the mesh, so the
+unguarded inherent `CertAuthority::remove_user` beneath it)
+refuses to remove the last account able to administer the mesh — as, since
+design 15, do demoting and disabling it, so the
 dashboard cannot be used to strand itself; the tab surfaces that refusal as an
 ordinary error rather than pre-computing the rule in the browser, per this
 crate's "the node is the authority" convention.

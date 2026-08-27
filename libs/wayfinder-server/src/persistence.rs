@@ -1044,6 +1044,62 @@ mod tests {
         );
     }
 
+    /// A role change and the revocations it forces are one durable act.
+    ///
+    /// [`CaLog::mutate_users_and_issued`] backs `RemoveUser` and, since design
+    /// 15, every demotion and disable — each of which changes an account *and*
+    /// marks its session certificates revoked. Two separate writes could
+    /// durably split (`separate_mutate_issued_and_mutate_held_calls_can_durably_split`
+    /// above shows how), and the direction that matters is an account recorded
+    /// as demoted whose admin certificates came back un-revoked: the operator
+    /// is told the access ended, and it did not.
+    ///
+    /// White-box, at this level, for the reason its two siblings are: only here
+    /// can the failure be forced to land *after* both halves of the mutation
+    /// have run. From `CertAuthority` there is no way to intervene between two
+    /// internal writes, so a test up there cannot tell one write from two.
+    #[test]
+    fn mutate_users_and_issued_rolls_back_both_collections_together_on_persist_failure() {
+        let dir = unique_dir("atomic-users-issued");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(&path, seed_snapshot().to_string()).unwrap();
+
+        let mut log = CaLog::load(Some(path)).unwrap();
+        log.mutate_users(|users| {
+            users.push(
+                UserRecord::new("rowan", "hunter2", crate::users::UserRole::Admin, 3600).unwrap(),
+            );
+        })
+        .1
+        .expect("the setup write lands while the directory is still there");
+        assert!(!log.issued()[0].revoked, "and the seeded cert is live");
+
+        // Doom every subsequent write.
+        std::fs::remove_dir_all(&dir).ok();
+
+        let (_, persisted) = log.mutate_users_and_issued(|users, issued| {
+            users[0].role = crate::users::UserRole::Viewer;
+            issued[0].revoked = true;
+        });
+        assert!(
+            persisted.is_err(),
+            "the write should have failed: its directory is gone"
+        );
+
+        assert_eq!(
+            log.users()[0].role,
+            crate::users::UserRole::Admin,
+            "the demotion must roll back with the revocation"
+        );
+        assert!(
+            !log.issued()[0].revoked,
+            "and the revocation must roll back with the demotion — a certificate \
+             marked revoked whose account came back an administrator is the same \
+             split seen from the other side"
+        );
+    }
+
     /// Completing a registration creates the account and deletes the invite,
     /// and those are one durable act or the whole flow is unrecoverable: a
     /// crash between two separate writes leaves a burnt invite with no account

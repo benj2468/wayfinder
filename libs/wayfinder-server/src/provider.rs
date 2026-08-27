@@ -19,6 +19,8 @@ use alloc::vec::Vec;
 
 use wayfinder_auth::RevocationRecord;
 
+use crate::users::UserRole;
+
 use wayfinder_protos::service::CsrOutcome;
 use wayfinder_protos::service::EnrollmentAdmission;
 use wayfinder_protos::service::EnrollmentPolicyData;
@@ -154,6 +156,69 @@ pub trait MeshAuthority {
     /// `Err` covers a name that is not on file and a store that cannot be made
     /// durable.
     fn revoke_user_sessions(&mut self, username: &str) -> Result<Vec<RevocationRecord>, String>;
+
+    /// Set `username`'s role, revoking every session certificate the change
+    /// invalidates, and returning one [`RevocationRecord`] per revoked session
+    /// for the caller to flood.
+    ///
+    /// **A demotion must revoke.** The capability is stamped on the
+    /// certificate, so a session minted while the account was an administrator
+    /// keeps administering until it is revoked or expires; an implementation
+    /// that changed only what is issued *next* would report an access as
+    /// removed while its holder still had it. A promotion revokes nothing — the
+    /// certificates the account holds grant less than the account now does.
+    ///
+    /// Restating the role an account already holds must succeed and revoke
+    /// nothing: the second call is what an operator makes when unsure the first
+    /// landed. The returned `bool` is whether anything actually changed —
+    /// necessary because an unchanged account and a promotion both revoke
+    /// nothing, so the record count alone cannot answer it, and a caller that
+    /// re-derived the answer from its own roster read would be a second author
+    /// of the same predicate.
+    ///
+    /// Like [`remove_user`](Self::remove_user), an implementation must refuse to
+    /// demote the last account that can still administer the mesh, and must
+    /// evaluate that refusal *before* signing anything.
+    ///
+    /// `Err` covers that refusal, a name that is not on file, and a store that
+    /// cannot be made durable.
+    fn set_user_role(
+        &mut self,
+        username: &str,
+        role: UserRole,
+    ) -> Result<(Vec<RevocationRecord>, bool), String>;
+
+    /// Enable or disable `username`, revoking every session certificate the
+    /// change invalidates, and returning one [`RevocationRecord`] per revoked
+    /// session for the caller to flood.
+    ///
+    /// **Disabling must revoke**, for the reason a demotion must: an account
+    /// that obtains no new session while every certificate it already holds
+    /// keeps working is disabled only in the future tense. Enabling revokes
+    /// nothing and must clear any lockout.
+    ///
+    /// An implementation must refuse to disable the last account that can still
+    /// administer the mesh — a disabled administrator administers nothing, so
+    /// this strands the mesh exactly as removing it would.
+    fn set_user_enabled(
+        &mut self,
+        username: &str,
+        enabled: bool,
+    ) -> Result<(Vec<RevocationRecord>, bool), String>;
+
+    /// Replace `username`'s password, clearing any lockout with it.
+    ///
+    /// The administrative reset. An implementation must leave the second factor
+    /// alone: an operator able to replace both could take an account over in one
+    /// act, leaving its owner no signal.
+    ///
+    /// Revokes nothing, deliberately — see
+    /// [`revoke_user_sessions`](Self::revoke_user_sessions), which is the act
+    /// for a reset that answers a compromise.
+    ///
+    /// `Err` covers a name that is not on file, an empty password, and a store
+    /// that cannot be made durable.
+    fn set_user_password(&mut self, username: &str, password: &str) -> Result<(), String>;
 
     /// Sign a revocation for `node_mac`, returning the [`RevocationRecord`] for
     /// the caller to record and flood.  Returns an error string on malformed

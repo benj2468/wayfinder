@@ -266,6 +266,12 @@ leaves the operator believing access ended when nothing was announced, so — as
 revoke*, and are unaffected when there is not. Remove on a sessionless account
 keeps working on such a node, which is what today's behavior is.
 
+> **Since superseded.** §5.4's conclusion — that disabling must not revoke —
+> was reversed by design 15, which makes `SetUserEnabled` revoke the account's
+> live sessions so that "disabled" describes access now rather than only
+> future sign-ins. §5.5's offline path no longer exists at all: `wayfinderctl
+> user` is RPC-only.
+
 **5.4 Why `disabled` does not revoke.** Disabling is reversible by design and is
 how an operator parks an account. A revocation is not reversible: it floods, every
 node holds it until the certificate would have expired anyway, and re-enabling the

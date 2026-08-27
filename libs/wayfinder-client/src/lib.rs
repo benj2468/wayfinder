@@ -95,6 +95,9 @@ use wayfinder_protos::wayfinder::v1alpha::RuntimeConfig;
 use wayfinder_protos::wayfinder::v1alpha::SetAuthRequest;
 use wayfinder_protos::wayfinder::v1alpha::SetConfigRequest;
 use wayfinder_protos::wayfinder::v1alpha::SetLogLevelRequest;
+use wayfinder_protos::wayfinder::v1alpha::SetUserEnabledRequest;
+use wayfinder_protos::wayfinder::v1alpha::SetUserPasswordRequest;
+use wayfinder_protos::wayfinder::v1alpha::SetUserRoleRequest;
 use wayfinder_protos::wayfinder::v1alpha::SubmitCsrRequest;
 use wayfinder_protos::wayfinder::v1alpha::SubmitCsrResponse;
 use wayfinder_protos::wayfinder::v1alpha::Throughput;
@@ -1092,6 +1095,79 @@ impl Client {
         }
     }
 
+    /// Provider mode: set an account's role, returning how many session
+    /// certificates the change revoked and whether it changed anything.
+    ///
+    /// A demotion revokes the account's live sessions in the same act — the
+    /// capability is stamped on the certificate, so an admin session outlives
+    /// the account's demotion otherwise. A promotion revokes nothing.
+    ///
+    /// The second half of the answer is `unchanged`: the account was already in
+    /// that role, so nothing was written. Not an error — a caller that states a
+    /// role got the account it asked for — but an operator should not be shown a
+    /// change that did not happen.
+    pub async fn set_user_role(
+        &mut self,
+        username: &str,
+        admin: bool,
+    ) -> anyhow::Result<(u32, bool)> {
+        match self
+            .request(RequestKind::SetUserRole(SetUserRoleRequest {
+                username: username.to_string(),
+                admin,
+            }))
+            .await?
+        {
+            ResponseKind::SetUserRole(r) => Ok((r.revoked, r.unchanged)),
+            other => Err(unexpected("SetUserRole", &other)),
+        }
+    }
+
+    /// Provider mode: enable or disable an account, returning how many session
+    /// certificates the change revoked and whether it changed anything.
+    ///
+    /// Disabling revokes the account's live sessions, so that "disabled" is a
+    /// statement about access now rather than only about future sign-ins.
+    /// Enabling revokes nothing and clears any lockout.
+    pub async fn set_user_enabled(
+        &mut self,
+        username: &str,
+        enabled: bool,
+    ) -> anyhow::Result<(u32, bool)> {
+        match self
+            .request(RequestKind::SetUserEnabled(SetUserEnabledRequest {
+                username: username.to_string(),
+                enabled,
+            }))
+            .await?
+        {
+            ResponseKind::SetUserEnabled(r) => Ok((r.revoked, r.unchanged)),
+            other => Err(unexpected("SetUserEnabled", &other)),
+        }
+    }
+
+    /// Provider mode: replace an account's password, clearing any lockout.
+    ///
+    /// The administrative reset. It leaves the second factor alone and revokes
+    /// nothing; [`Self::revoke_user_sessions`] is the act for a reset that
+    /// answers a compromise.
+    pub async fn set_user_password(
+        &mut self,
+        username: &str,
+        password: &str,
+    ) -> anyhow::Result<()> {
+        match self
+            .request(RequestKind::SetUserPassword(SetUserPasswordRequest {
+                username: username.to_string(),
+                password: password.to_string(),
+            }))
+            .await?
+        {
+            ResponseKind::Empty(_) => Ok(()),
+            other => Err(unexpected("SetUserPassword", &other)),
+        }
+    }
+
     /// Provider mode: list the CSRs currently awaiting operator approval.
     pub async fn list_pending_csrs(&mut self) -> anyhow::Result<ListPendingCsrsResponse> {
         match self
@@ -1205,6 +1281,8 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
         ResponseKind::CreateUserInvite(_) => "CreateUserInvite",
         ResponseKind::ListUserInvites(_) => "ListUserInvites",
         ResponseKind::RevokeUserSessions(_) => "RevokeUserSessions",
+        ResponseKind::SetUserRole(_) => "SetUserRole",
+        ResponseKind::SetUserEnabled(_) => "SetUserEnabled",
         ResponseKind::BeginUserRegistration(_) => "BeginUserRegistration",
     };
     anyhow!("expected {want} response, got {got}")

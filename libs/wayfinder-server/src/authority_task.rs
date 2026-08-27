@@ -317,8 +317,12 @@ impl<'a> AuthorityAdapter<'a> {
     /// Run a session-revoking act, gating it on the router's ability to flood
     /// and keeping whatever it signed.
     ///
-    /// The gate is applied **only when the act actually revokes something**, and
-    /// that ordering is why this is one helper rather than a check in each
+    /// The gate is applied only when the *account* holds live sessions, which
+    /// is the right question for an act that always revokes — every caller here
+    /// is one. An act whose direction revokes nothing must not come through
+    /// here at all; see [`Self::keep`].
+    ///
+    /// That ordering is why this is one helper rather than a check in each
     /// caller. `RemoveUser` against an account with no live sessions signs
     /// nothing, so on a node with mesh authentication disabled it must keep
     /// working exactly as it does today; refusing it would be a regression
@@ -338,9 +342,42 @@ impl<'a> AuthorityAdapter<'a> {
             self.can_flood(act)?;
         }
         let records = f(self.ca, username)?;
+        Ok(self.keep(records))
+    }
+
+    /// [`Self::gated_session_revocation`] for an act that also reports whether
+    /// it changed anything, forwarding that answer beside the revoked count.
+    fn gated_account_change(
+        &mut self,
+        username: &str,
+        act: &str,
+        f: impl FnOnce(&mut CertAuthority, &str) -> Result<(Vec<RevocationRecord>, bool), String>,
+    ) -> Result<(u32, bool), String> {
+        if self.ca.has_live_sessions(username) {
+            self.can_flood(act)?;
+        }
+        let (records, changed) = f(self.ca, username)?;
+        Ok((self.keep(records), changed))
+    }
+
+    /// Keep `records` for [`Self::finish`] to flood, returning how many.
+    ///
+    /// The half of [`Self::gated_session_revocation`] that is *not* the gate,
+    /// for the acts that carry a direction which revokes nothing — a promotion,
+    /// an enable. Those must not be gated on the router's ability to flood:
+    /// gating keys on whether the *account* holds live sessions, which is the
+    /// right question only when the act itself revokes. A promotion refused on a
+    /// node with mesh authentication disabled would be an act that signs nothing
+    /// turned away for being unable to announce nothing.
+    ///
+    /// They still come through here rather than returning a bare zero, because
+    /// "this direction revokes nothing" is the core's guarantee to keep, not
+    /// this layer's to assume: if one ever does sign something, it is flooded
+    /// instead of dropped.
+    fn keep(&mut self, records: Vec<RevocationRecord>) -> u32 {
         let count = records.len() as u32;
         self.signed_revocations.extend(records);
-        Ok(count)
+        count
     }
 
     /// Consume the adapter, yielding the revocations it signed.
@@ -412,7 +449,7 @@ impl AuthorityDataProvider for AuthorityAdapter<'_> {
     fn remove_user(&mut self, username: &str) -> Result<(), String> {
         // `MeshAuthority::remove_user`, named explicitly, and that is not
         // stylistic. `CertAuthority` has an *inherent* `remove_user` — the
-        // offline tool's raw store operation — and an inherent method wins
+        // raw store operation, with no guard and no revocation — and an inherent method wins
         // method resolution over a trait one, so `self.ca.remove_user(..)` here
         // silently reached the raw version: no last-administrator guard, and now
         // no revocation either. The guard was written, tested, and never on this
@@ -421,6 +458,38 @@ impl AuthorityDataProvider for AuthorityAdapter<'_> {
             MeshAuthority::remove_user(ca, name)
         })
         .map(|_| ())
+    }
+
+    fn set_user_role(&mut self, username: &str, admin: bool) -> Result<(u32, bool), String> {
+        // `MeshAuthority::set_user_role`, named explicitly, for the reason
+        // `remove_user` below spells out: `CertAuthority` has an inherent
+        // `set_user_role_revoking_sessions` that carries no last-administrator
+        // guard, and an inherent method wins method resolution over a trait one.
+        // Here the two even share a prefix.
+        if admin {
+            let (records, changed) =
+                MeshAuthority::set_user_role(self.ca, username, UserRole::Admin)?;
+            return Ok((self.keep(records), changed));
+        }
+        self.gated_account_change(username, "demote this account", |ca, name| {
+            MeshAuthority::set_user_role(ca, name, UserRole::Viewer)
+        })
+    }
+
+    fn set_user_enabled(&mut self, username: &str, enabled: bool) -> Result<(u32, bool), String> {
+        if enabled {
+            let (records, changed) = MeshAuthority::set_user_enabled(self.ca, username, true)?;
+            return Ok((self.keep(records), changed));
+        }
+        self.gated_account_change(username, "disable this account", |ca, name| {
+            MeshAuthority::set_user_enabled(ca, name, false)
+        })
+    }
+
+    fn set_user_password(&mut self, username: &str, password: &str) -> Result<(), String> {
+        // Not through `gated_session_revocation`: a reset revokes nothing, so
+        // there is nothing to flood and nothing to gate on being able to.
+        MeshAuthority::set_user_password(self.ca, username, password)
     }
 
     fn create_user_invite(
@@ -1022,6 +1091,161 @@ mod tests {
         assert!(err.contains("administrator"), "got: {err}");
         assert!(adapter.finish().is_empty(), "and nothing was signed");
         assert_eq!(ca.list_users().len(), 1, "the account is still there");
+    }
+
+    /// Demoting and disabling apply the last-administrator guard **on the path
+    /// a request takes**, not merely when the trait method is called directly.
+    ///
+    /// The twin of the `remove_user` test above, and it exists for the same
+    /// reason one act along. `CertAuthority` has inherent
+    /// `set_user_role_revoking_sessions` / `set_user_enabled_revoking_sessions`
+    /// with no guard, and `MeshAuthority` methods that have one; Rust resolves
+    /// `self.ca.set_user_role_revoking_sessions(..)` to the inherent one, and
+    /// here the two even share a name prefix. Without this, dropping the
+    /// `MeshAuthority::` qualification in `AuthorityAdapter` compiles, passes
+    /// every other test, and lets an administrator demote the last enabled
+    /// administrator over the API — leaving a mesh whose user store no session
+    /// can change in either direction.
+    #[test]
+    fn demoting_or_disabling_through_the_adapter_applies_the_last_admin_guard() {
+        for (act, call) in [("demote", 0), ("disable", 1)] {
+            let mut ca = authority();
+            ca.set_now_unix(NOW_UNIX);
+            ca.add_user(UserRecord::new("ops", "hunter2", UserRole::Admin, 900).unwrap())
+                .unwrap();
+
+            let mut adapter = AuthorityAdapter::new(&mut ca, facts(true));
+            let err = match call {
+                0 => AuthorityDataProvider::set_user_role(&mut adapter, "ops", false),
+                _ => AuthorityDataProvider::set_user_enabled(&mut adapter, "ops", false),
+            }
+            .expect_err("the last administrator must not be demotable or disablable");
+
+            assert!(err.contains("administrator"), "{act}: got {err}");
+            assert!(adapter.finish().is_empty(), "{act}: and nothing was signed");
+            let ops = &ca.list_users()[0];
+            assert_eq!(ops.role, UserRole::Admin, "{act}: role untouched");
+            assert!(!ops.disabled, "{act}: still enabled");
+        }
+    }
+
+    /// A demotion's signed revocations reach the router.
+    ///
+    /// `keep` both counts the records and stashes them for [`
+    /// AuthorityAdapter::finish`], and only the count is returned to the
+    /// caller — so an implementation that counted without stashing would report
+    /// "revoked 1 live admin session certificate" while the mesh was never
+    /// told. The demoted operator's laptop would go on administering every
+    /// other node until its certificate expired, which is precisely the outcome
+    /// the revocation exists to prevent.
+    #[test]
+    fn a_demotion_hands_its_revocations_to_the_router() {
+        let mut ca = authority();
+        ca.set_now_unix(NOW_UNIX);
+        let user = UserRecord::new("ops", "hunter2", UserRole::Admin, 900)
+            .unwrap()
+            .without_totp();
+        ca.add_user(user).unwrap();
+        // A second enabled administrator, so the guard is not what is under
+        // test here.
+        ca.add_user(
+            UserRecord::new("second", "hunter2", UserRole::Admin, 900)
+                .unwrap()
+                .without_totp(),
+        )
+        .unwrap();
+        let session = wayfinder_auth::Keypair::from_seed(&[5u8; 32]);
+        MeshAuthority::authenticate_user(
+            &mut ca,
+            "ops",
+            "hunter2",
+            "",
+            &session.ed_pubkey(),
+            &session.x_pubkey(),
+        )
+        .expect("the login is serviceable");
+
+        let mut adapter = AuthorityAdapter::new(&mut ca, facts(true));
+        let (revoked, changed) = AuthorityDataProvider::set_user_role(&mut adapter, "ops", false)
+            .expect("the demotion succeeds");
+
+        assert!(changed);
+        assert_eq!(revoked, 1, "the reported count");
+        assert_eq!(
+            adapter.finish().len(),
+            1,
+            "and the signed record reaches the router, or the demotion is recorded but silent"
+        );
+    }
+
+    /// A promotion is **not** gated on the router's ability to flood.
+    ///
+    /// The gate keys on whether the *account* holds live sessions, which is the
+    /// right question only for an act that revokes. A promotion signs nothing,
+    /// so routing it through the gate would refuse it on a node with mesh
+    /// authentication disabled — turning away an act for being unable to
+    /// announce nothing. See `AuthorityAdapter::keep`.
+    #[test]
+    fn a_promotion_is_not_refused_by_the_flood_gate() {
+        let mut ca = authority();
+        ca.set_now_unix(NOW_UNIX);
+        let user = UserRecord::new("ops", "hunter2", UserRole::Viewer, 900)
+            .unwrap()
+            .without_totp();
+        ca.add_user(user).unwrap();
+        let session = wayfinder_auth::Keypair::from_seed(&[6u8; 32]);
+        MeshAuthority::authenticate_user(
+            &mut ca,
+            "ops",
+            "hunter2",
+            "",
+            &session.ed_pubkey(),
+            &session.x_pubkey(),
+        )
+        .expect("the login is serviceable");
+
+        // `auth_present: false` — this node cannot flood a revocation at all.
+        let mut adapter = AuthorityAdapter::new(&mut ca, facts(false));
+        let (revoked, changed) = AuthorityDataProvider::set_user_role(&mut adapter, "ops", true)
+            .expect("a promotion signs nothing, so the flood gate has no say in it");
+
+        assert_eq!(revoked, 0);
+        assert!(changed);
+        assert!(adapter.finish().is_empty());
+    }
+
+    /// A demotion of an account holding live sessions **is** refused when the
+    /// router cannot flood — and refused before anything is signed.
+    #[test]
+    fn a_demotion_is_refused_without_signing_when_the_router_cannot_flood() {
+        let mut ca = authority();
+        ca.set_now_unix(NOW_UNIX);
+        for name in ["ops", "second"] {
+            ca.add_user(
+                UserRecord::new(name, "hunter2", UserRole::Admin, 900)
+                    .unwrap()
+                    .without_totp(),
+            )
+            .unwrap();
+        }
+        let session = wayfinder_auth::Keypair::from_seed(&[7u8; 32]);
+        MeshAuthority::authenticate_user(
+            &mut ca,
+            "ops",
+            "hunter2",
+            "",
+            &session.ed_pubkey(),
+            &session.x_pubkey(),
+        )
+        .expect("the login is serviceable");
+
+        let mut adapter = AuthorityAdapter::new(&mut ca, facts(false));
+        let err = AuthorityDataProvider::set_user_role(&mut adapter, "ops", false)
+            .expect_err("a revocation this node cannot announce must not be signed");
+
+        assert!(err.contains("mesh authentication"), "got: {err}");
+        assert!(adapter.finish().is_empty(), "nothing was signed");
+        assert_eq!(ca.list_users()[0].role, UserRole::Admin, "nor demoted");
     }
 
     /// A successful revocation leaves the router a record to flood — the other

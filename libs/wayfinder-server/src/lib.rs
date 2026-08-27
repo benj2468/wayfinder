@@ -115,7 +115,8 @@ pub use embedded::EmbeddedQueryTx;
 #[cfg(feature = "embedded")]
 pub use embedded::serve;
 
-#[cfg(feature = "std")]
+// Ungated: the account *store* inside is `std`-only, but the role it hands the
+// `MeshAuthority` seam (`users::types`) has to compile wherever that trait does.
 mod users;
 #[cfg(feature = "std")]
 pub use users::AuthOutcome;
@@ -123,7 +124,6 @@ pub use users::AuthOutcome;
 pub use users::DEFAULT_SESSION_TTL_SECS;
 #[cfg(feature = "std")]
 pub use users::UserRecord;
-#[cfg(feature = "std")]
 pub use users::UserRole;
 
 #[cfg(feature = "std")]

@@ -759,17 +759,21 @@ cmd_user_add() {
     [[ "${1:-}" == "--viewer" ]] && role=""
     local ip; ip="$(ca_ip)"
 
-    # `wayfinder-ctl user add` edits the authority's state file directly, so it
-    # runs on the node and not here — and the node has to be stopped while it
-    # does. The running process holds that state in memory and rewrites the
-    # whole blob on its next change, so an edit underneath it would be
-    # overwritten without a word.
+    # One `CreateUser` request to the running CA, over its loopback management
+    # API. This used to stop the service and edit `ca-state.json` in place,
+    # because creating the *first* account needs the credential it creates —
+    # but a provider rewrites that whole file from memory on its next write, so
+    # the edit raced it (design 15).
     #
-    # (There is an online path too — `CreateUser` over the management API,
-    # which the dashboard's own Security tab uses — but it needs an
-    # authenticated admin session, which is the thing this command exists to
-    # bootstrap.)
-    info "creating account '$username' on $ip (the CA restarts around this)"
+    # What breaks the loop without a file: the credential presented here is the
+    # node's *own* identity seed, which authenticates at the self-key tier and
+    # is admitted to every request. It depends on no account existing, so it
+    # bootstraps the first administrator and is equally the way back from a CA
+    # whose last administrator was removed.
+    #
+    # Still over SSH rather than from here, because the management API is bound
+    # to the CA's loopback — and now with no stop/start around it.
+    info "creating account '$username' on $ip"
     local password password2
     read_password "Password for $username: " password
     [[ -n "$password" ]] || die "empty password"
@@ -785,12 +789,10 @@ cmd_user_add() {
     # shellcheck disable=SC2029
     printf '%s\n' "$password" | ssh "root@$ip" "
         set -e
-        systemctl stop wayfinder.service
-        wayfinder-ctl user add \\
-            --state /var/lib/wayfinder/ca-state.json \\
-            --username $username $role --password-stdin
-        chown wayfinder:wayfinder /var/lib/wayfinder/ca-state.json
-        systemctl start wayfinder.service"
+        wayfinder-ctl \\
+            --connect 127.0.0.1:7700 \\
+            --identity /var/lib/wayfinder/identity.seed \\
+            user add --username $username $role --password-stdin"
     info "account created — scan the TOTP URI above into your authenticator"
 }
 

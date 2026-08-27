@@ -376,12 +376,12 @@ fn Users() -> impl IntoView {
                 </button>
             </form>
             <p class="wf-note">
-                "Disabling an account stops it signing in again but leaves the sessions it \
-                 already holds — reach for Revoke as well. Disabling and renaming are done \
-                 on the provider host with `wayfinderctl user`, which needs no network at \
-                 all. The last account that can administer this mesh cannot be removed \
-                 here — leaving none would mean no further change to this list from any \
-                 dashboard."
+                "Disabling an account stops it signing in again and revokes the sessions \
+                 it already holds, as one act — so access ends now, not when the last \
+                 certificate expires. `wayfinderctl user` does the same over this same \
+                 management API. The last account that can administer this mesh cannot be \
+                 removed, demoted or disabled here — leaving none would mean no further \
+                 change to this list from any dashboard."
             </p>
 
             {confirmation(pending, confirm)}
@@ -572,10 +572,9 @@ fn Invitations() -> impl IntoView {
         leptos::task::spawn_local(async move {
             // Zero for both lifetimes: the authority's defaults, which are the
             // right answer unless somebody has a reason. An operator who does
-            // have one sets them with `wayfinderctl user invite` — which is
-            // *offline* tooling against the provider's own state file, so it
-            // means stopping the node, not an alternative to this form. Naming
-            // it here is a pointer to where the knobs exist, not a workaround.
+            // have one sets them with `wayfinderctl user invite`, which reaches
+            // this same request over the management API. Naming it here is a
+            // pointer to where the knobs exist, not a workaround.
             let result = create_user_invite(username, admin.get_untracked(), 0, 0).await;
             busy.set(false);
             match result {

@@ -438,6 +438,10 @@ downgrade fails loudly rather than silently dropping invites.
 - **How the registration page is served** — a route-aware exclusion on the
   `LoggedOut` overlay, or an axum-served page outside the dashboard shell (§3.5).
   Leaning to the latter.
+> **Since superseded.** Design 15 made `wayfinderctl user` RPC-only, so
+> `user invite` no longer edits the provider's state file and no longer needs
+> the provider stopped.
+
 - **`wayfinderctl user invite`** offline, mirroring `user add`. Note the real
   argument for it: `bins/wayfinder-ctl/src/user.rs` requires the provider
   to be **stopped**, so an offline invite must be minted before start-up and
