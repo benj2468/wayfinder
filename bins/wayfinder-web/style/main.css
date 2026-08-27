@@ -63,6 +63,13 @@
   --wf-idle: #6b7280;
 
   --wf-shadow: 0 1px 2px rgb(0 0 0 / 30%);
+
+  /* A floating hint has to read as *above* the card it covers, and the two
+   * themes need opposite moves for that. On a dark surface, lift: the raised
+   * step is lighter than the card underneath. */
+  --wf-hint-surface: var(--wf-surface-raised);
+  --wf-hint-shadow:
+    0 12px 28px rgb(0 0 0 / 55%), 0 2px 6px rgb(0 0 0 / 45%);
 }
 
 @media (prefers-color-scheme: light) {
@@ -86,6 +93,13 @@
     --wf-idle: #8b93a1;
 
     --wf-shadow: 0 1px 2px rgb(0 0 0 / 8%);
+
+    /* On a light surface the raised step is *darker* than the card, which
+     * reads as a hole rather than a panel in front of it. So here the hint
+     * keeps the card's own white and the shadow alone does the lifting. */
+    --wf-hint-surface: var(--wf-surface);
+    --wf-hint-shadow:
+      0 12px 28px rgb(15 17 21 / 16%), 0 2px 6px rgb(15 17 21 / 10%);
   }
 }
 
@@ -850,6 +864,15 @@ body {
  * the explanation was cut off partway down. No z-index can fix that; escaping
  * the container is the fix. */
 .wf-hint {
+  /* Shared by the toggle and the panel because the tail's placement is derived
+   * from the toggle's geometry: they are declared once, on the one ancestor
+   * both inherit from, so the two can never drift apart. `--wf-hint-tail` is
+   * the tail square's side before rotation; half its diagonal (~7px) is what
+   * protrudes, which is what `--wf-hint-gap` leaves room for. */
+  --wf-hint-toggle-size: calc(1.35 * var(--wf-text-sm));
+  --wf-hint-tail: 10px;
+  --wf-hint-gap: 8px;
+
   position: relative;
   display: inline-flex;
   vertical-align: middle;
@@ -859,8 +882,8 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 1.35em;
-  height: 1.35em;
+  width: var(--wf-hint-toggle-size);
+  height: var(--wf-hint-toggle-size);
   padding: 0;
   border: 1px solid var(--wf-border);
   border-radius: 50%;
@@ -872,10 +895,19 @@ body {
   cursor: pointer;
 }
 
-.wf-hint-toggle:hover,
-.wf-hint-toggle:has(+ .wf-hint-panel:popover-open) {
+.wf-hint-toggle:hover {
   border-color: var(--wf-accent);
   color: var(--wf-accent);
+}
+
+/* Lit while its panel is open. The fill is half of the tether: the tail says
+ * *which* `?` the panel belongs to, and the filled disc says *this one is
+ * speaking* — so the pair still reads as connected in the flipped placement
+ * the fallbacks can pick, where the tail ends up on the far side. */
+.wf-hint-toggle:has(+ .wf-hint-panel:popover-open) {
+  border-color: var(--wf-accent);
+  background: var(--wf-accent);
+  color: var(--wf-surface);
 }
 
 .wf-hint-toggle:focus-visible {
@@ -890,15 +922,15 @@ body {
  * but readable and never clipped. */
 .wf-hint-panel {
   width: max-content;
-  max-width: min(22rem, calc(100vw - 2 * var(--wf-space-4)));
+  max-width: min(19rem, calc(100vw - 2 * var(--wf-space-4)));
   padding: var(--wf-space-3);
   border: 1px solid var(--wf-border);
-  border-radius: var(--wf-radius-sm);
-  background: var(--wf-surface-raised);
-  box-shadow: 0 4px 16px rgb(0 0 0 / 35%);
+  border-radius: var(--wf-radius);
+  background: var(--wf-hint-surface);
+  box-shadow: var(--wf-hint-shadow);
   color: var(--wf-text);
   font-size: var(--wf-text-sm);
-  line-height: 1.5;
+  line-height: 1.45;
   text-align: left;
   white-space: normal;
   overflow: visible;
@@ -908,17 +940,59 @@ body {
  * anchor name itself is set inline by the component, derived from the hint's
  * id, so two hints on one page do not collide.
  *
+ * It opens **beside** the toggle rather than under it, and that is the whole
+ * fix for the panel landing on the buttons it describes. The header cell and
+ * the body cells of a column share a left edge, so the `?` sits directly above
+ * the first row's Revoke — any panel dropped from it covers that control no
+ * matter how narrow it is. Placed inline-start of the toggle it ends where the
+ * actions column begins, and both buttons stay legible behind nothing.
+ *
+ * Opening *upward* was tried first and is worse than it sounds: the panel is
+ * taller than the strip of page above a table header, so the block fallback
+ * fires immediately and it lands under the toggle anyway — with its tail now
+ * pointing at empty page, since a fallback cannot restyle the tail. Aligning
+ * the panel's block-start to the toggle's instead means the room it needs is
+ * the room below a table header, which a table always has.
+ *
  * `position-try-fallbacks` is what keeps it on screen: this sits in the last
- * column of a table, hard against the right edge, so the block-start/inline-end
- * placement it asks for is exactly the one with no room. */
+ * column of a table, so on a narrow viewport the inline-start side is the one
+ * that runs out. */
 @supports (anchor-name: --wf-hint) {
   .wf-hint-panel:popover-open {
     position: fixed;
-    margin: var(--wf-space-2) 0 0;
+    margin: calc(-1 * var(--wf-space-3)) var(--wf-hint-gap) 0 0;
     inset: auto;
-    top: anchor(bottom);
-    right: anchor(right);
-    position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+    top: anchor(top);
+    right: anchor(left);
+    position-try-fallbacks: flip-inline, flip-block, flip-inline flip-block;
+  }
+
+  /* The tail. A square rotated 45° with only its two outer faces bordered, so
+   * its unbordered half sits inside the panel and hides the stretch of panel
+   * border it covers — one element, no seam.
+   *
+   * Its offset down the panel is not a guess: `top: anchor(top)` puts the
+   * panel's block-start on the toggle's, and the negative block-start margin
+   * above is the only thing between them, so the toggle's centre is that margin
+   * plus half a toggle down. `--wf-hint-toggle-size` and the panel share a font
+   * size, so one measure serves both. */
+  .wf-hint-panel:popover-open::after {
+    content: "";
+    position: absolute;
+    left: 100%;
+    top: calc(
+      var(--wf-space-3) + var(--wf-hint-toggle-size) / 2 - 0.5 *
+        var(--wf-hint-tail)
+    );
+    width: var(--wf-hint-tail);
+    height: var(--wf-hint-tail);
+    margin-left: calc(-0.5 * var(--wf-hint-tail) - 1px);
+    border: 1px solid var(--wf-border);
+    border-bottom: 0;
+    border-left: 0;
+    border-top-right-radius: 2px;
+    background: var(--wf-hint-surface);
+    transform: rotate(45deg);
   }
 }
 
@@ -928,6 +1002,45 @@ body {
 
 .wf-hint-panel p + p {
   margin-top: var(--wf-space-2);
+}
+
+/* Two controls, two entries — so the explanation is a definition list, which is
+ * what it always was: a term that is literally the word on the button, and what
+ * pressing it does. The shape carries the comparison, so neither name has to be
+ * hunted for inside a paragraph. */
+.wf-hint-defs {
+  margin: 0;
+}
+
+/* The terms are set in the data face because in this dashboard monospace means
+ * "a literal thing in the system" — a MAC, an account name, a command. These
+ * are the words printed on the two buttons, character for character. */
+.wf-hint-defs dt {
+  font-family: var(--wf-font-mono);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--wf-text);
+}
+
+.wf-hint-defs dd {
+  margin: var(--wf-space-1) 0 0;
+  color: var(--wf-text-muted);
+}
+
+.wf-hint-defs dd + dt {
+  margin-top: var(--wf-space-3);
+}
+
+/* What is true of both, held below a rule so it is read as a caveat on the pair
+ * rather than as a third entry. */
+.wf-hint-panel .wf-hint-foot {
+  margin: var(--wf-space-3) 0 0;
+  padding-top: var(--wf-space-3);
+  border-top: 1px solid var(--wf-border);
+  color: var(--wf-text-muted);
+  font-size: 0.75rem;
+  line-height: 1.4;
 }
 
 /* ----------------------------------------------------------------- stack -- */
