@@ -254,6 +254,25 @@ nix run .#wayfinder-ctl -- --connect <node>:7700 --identity <node-seed> \
     csr install --cert node.cert --trust-anchor anchor
 ```
 
+That chain is for a node that has **no certificate yet**. Once it is installed,
+the node holds it — in the runtime state `csr install` persisted, or in the file
+static auth loads — and nothing afterwards should make you produce a second
+copy. Putting an already-enrolled node on the tunnel is therefore one command,
+run on the node's own host:
+
+```bash
+nix run .#wayfinder-ctl -- --connect <public_ip>:7700 --node-key <ca-pubkey> \
+    --cert-from 127.0.0.1:7700 vpn enrollment
+```
+
+`--cert-from` asks the node at that address for the certificate it is running
+under and presents *that* to the CA, so there is no `csr request`/`csr submit`
+round trip and no certificate file on your disk. It changes only the credential
+presented — `--connect` still names the CA — and the node it reads from is
+pinned to `--identity`'s own public key, which defaults to
+`/var/lib/wayfinder/identity.seed`, the seed the node runs as. A node holding no
+certificate is told to enroll rather than handed an empty one.
+
 ## The dashboard
 
 `services.wayfinder.web` is enabled but bound to loopback, and must stay there.

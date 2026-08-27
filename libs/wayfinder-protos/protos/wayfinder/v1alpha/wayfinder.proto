@@ -156,6 +156,52 @@ message GetSecurityStatusResponse {
   bytes own_x_pubkey = 11;
 }
 
+// Ask a node for the membership certificate it is currently running under,
+// together with the trust anchor that certificate chains to.
+//
+// Neither is a secret.  A membership certificate is public-key material plus
+// the root's signature over it — every field it carries is already served by
+// GetSecurityStatus, and the anchor is the verification key GetTrustAnchor
+// already hands to a stranger.
+//
+// Deliberately *not* argued from "it travels on the air anyway": under
+// lazy_cert_distribution this node's OGMs carry an 8-byte fingerprint in place
+// of the certificate, so that reasoning would be false in a configuration this
+// build supports.  (It remains fetchable from the medium in that mode, but on
+// demand and only by a peer the anchor already verifies.)
+//
+// What this saves is a round trip to the certificate authority: a client that
+// holds the node's
+// identity seed can present the node's *own* certificate without re-running an
+// enrollment purely to obtain a copy of a certificate the node already has.
+// That is what makes a one-command `vpn enrollment` possible for a node that
+// enrolled long ago, and it is why this exists as a request rather than as a
+// path an operator is told to read.
+//
+// Answered from live router state, so it reports what the node is *running*
+// under — a certificate installed at runtime by SetAuth as readily as one
+// loaded from a file at startup, with no way for the two to disagree.
+//
+// Returns an ErrorResponse on a node holding no membership certificate at all
+// (auth disabled, or configured but not yet enrolled).
+message GetOwnCertRequest {}
+
+// Answer to a GetOwnCertRequest: the certificate this node runs under and the
+// anchor it chains to, in the same encodings SetAuth accepts and `wayfinderctl
+// csr submit` writes out — so a client may hand the pair straight back to
+// another node without reserialising either.
+message GetOwnCertResponse {
+  // The node's membership certificate, verbatim as it is signed and as it
+  // travels on the wire.  Never empty: a node with no certificate answers with
+  // an ErrorResponse instead, so an empty field here would be a node bug.
+  bytes cert = 1;
+
+  // The mesh trust anchor `cert` verifies against.  The same bytes
+  // GetTrustAnchor serves on a provider, reported here by any node that holds
+  // one so a client needs only this one request to obtain a usable pair.
+  bytes trust_anchor = 2;
+}
+
 // The enrollment policy a provider-mode node is currently applying, as
 // reported by GetSecurityStatus.  The read counterpart to the
 // EnrollmentPolicy message SetConfig accepts.
@@ -1033,6 +1079,9 @@ message WayfinderRequest {
     // Replace an account's password (provider mode).  Requires a full
     // management grant.
     SetUserPasswordRequest set_user_password = 40;
+
+    // Read the membership certificate and trust anchor this node runs under.
+    GetOwnCertRequest get_own_cert = 41;
   }
 }
 
@@ -2256,5 +2305,8 @@ message WayfinderResponse {
 
     // Response to SetUserEnabledRequest.
     SetUserEnabledResponse set_user_enabled = 31;
+
+    // Response to GetOwnCertRequest.
+    GetOwnCertResponse own_cert = 32;
   }
 }

@@ -14,6 +14,7 @@ use crate::wayfinder::v1alpha::Empty;
 use crate::wayfinder::v1alpha::EnrollmentPolicy;
 use crate::wayfinder::v1alpha::EnrollmentPolicyStatus;
 use crate::wayfinder::v1alpha::ErrorResponse;
+use crate::wayfinder::v1alpha::GetOwnCertResponse;
 use crate::wayfinder::v1alpha::GetSecurityStatusResponse;
 use crate::wayfinder::v1alpha::GetTrustAnchorResponse;
 use crate::wayfinder::v1alpha::InterfaceThroughput;
@@ -498,6 +499,28 @@ pub struct SecurityStatusData {
     pub own_x_pubkey: Vec<u8>,
 }
 
+/// The membership credential a node is running under: its certificate and the
+/// trust anchor that certificate chains to.  Mirrors the `GetOwnCertResponse`
+/// proto.
+///
+/// Both halves together, never one: a certificate without the anchor it
+/// verifies against is not a usable credential, and a caller that had to source
+/// the two separately would be the caller that eventually pairs a certificate
+/// with the wrong mesh's anchor.
+///
+/// There is no [`Default`], deliberately.  A node with no certificate is
+/// represented by `None` at the call site ([`RouterDataProvider::own_cert`]),
+/// not by an all-empty value of this type — an empty certificate is not a
+/// certificate, and a type that could hold one would let it travel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnCertData {
+    /// The membership certificate, verbatim as it was installed and as it
+    /// travels on the wire.  Never empty.
+    pub cert: Vec<u8>,
+    /// The mesh trust anchor `cert` verifies against.
+    pub trust_anchor: Vec<u8>,
+}
+
 /// The verbosity of one log record.  Mirrors the `LogLevel` proto enum, minus
 /// its proto3-mandated zero value — a record always has a real level, so
 /// "unspecified" is unrepresentable here.
@@ -727,6 +750,22 @@ pub trait RouterDataProvider {
     fn security_status(&self) -> SecurityStatusData {
         SecurityStatusData::default()
     }
+
+    /// The membership certificate this node is currently running under, with
+    /// the trust anchor it chains to, or `None` on a node holding none.
+    ///
+    /// Read from live state rather than from wherever the material was loaded,
+    /// which is what makes one answer cover both provisioning modes: a
+    /// certificate installed at runtime by [`set_auth`](Self::set_auth) and one
+    /// read from a file at startup are the same certificate here, and cannot
+    /// disagree.
+    ///
+    /// The default is `None` — a node has no certificate until something gives
+    /// it one, and an implementor that never overrides this is telling the
+    /// truth.
+    fn own_cert(&self) -> Option<OwnCertData> {
+        None
+    }
 }
 
 /// The answer every authority-facing request gives on a node that runs no
@@ -737,6 +776,14 @@ pub trait RouterDataProvider {
 /// a client that distinguishes them would be distinguishing a detail of which
 /// task answered.
 pub const NOT_A_PROVIDER: &str = "node is not a certificate-authority provider";
+
+/// The answer `GetOwnCert` gives on a node that holds no membership
+/// certificate.
+///
+/// One definition because a client matches on it to tell "this node has not
+/// enrolled" — a state an operator can fix, and can be told how to — apart from
+/// a transport failure, which is a different problem with a different remedy.
+pub const NO_MEMBERSHIP_CERT: &str = "node holds no membership certificate";
 
 /// Build the response a node with no certificate authority gives to a request
 /// only one could serve.
@@ -1374,6 +1421,7 @@ pub fn request_kind_name(k: &RequestKind) -> &'static str {
         RequestKind::GetLinkFeaturesTable(_) => "GetLinkFeaturesTable",
         RequestKind::GetLogs(_) => "GetLogs",
         RequestKind::GetAlarms(_) => "GetAlarms",
+        RequestKind::GetOwnCert(_) => "GetOwnCert",
         RequestKind::SetLogLevel(_) => "SetLogLevel",
         RequestKind::RevealEnrollmentToken(_) => "RevealEnrollmentToken",
         RequestKind::AuthenticateUser(_) => "AuthenticateUser",
@@ -1523,6 +1571,17 @@ fn audited(k: &RequestKind) -> Audited {
         // A poll, on the same tick as GetLogs and unlogged for the same reason:
         // a record per poll would fill the ring an operator reads next to it.
         | RequestKind::GetAlarms(_)
+        // Hands out no secret, so it is a query rather than the disclosure
+        // record `RevealEnrollmentToken` earns. A membership certificate is
+        // public-key material plus the root's signature over it: every field
+        // it carries is already served by `GetSecurityStatus` beside it, and
+        // what this adds is the signature, which is what one *verifies* with.
+        //
+        // Note the reason is that overlap and not "it is on the air anyway" —
+        // under `lazy_cert_distribution` this node's OGMs carry an 8-byte
+        // fingerprint instead of the certificate, so an argument resting on
+        // the medium would be false in a configuration this build supports.
+        | RequestKind::GetOwnCert(_)
         // A read of provider state, like ListCerts beside it. Not a disclosure:
         // it hands out no secret, only the roster — and only to a client that
         // already holds a full management grant.
@@ -1577,6 +1636,10 @@ pub fn request_facet(kind: &RequestKind) -> RequestFacet {
         | RequestKind::GetMetrics(_)
         | RequestKind::GetNodeInfo(_)
         | RequestKind::GetOgmSchedule(_)
+        // Answered from the router's live auth state, like the security status
+        // beside it — never from wherever the certificate was loaded, which is
+        // the authority's business and not every node has one.
+        | RequestKind::GetOwnCert(_)
         | RequestKind::GetRoutingTable(_)
         | RequestKind::GetSecurityStatus(_)
         | RequestKind::GetThroughput(_)
@@ -1863,6 +1926,19 @@ pub fn handle_router<P: RouterDataProvider>(
                 own_x_pubkey: s.own_x_pubkey,
             })
         }
+        Some(RequestKind::GetOwnCert(_)) => match provider.own_cert() {
+            Some(pair) => ResponseKind::OwnCert(GetOwnCertResponse {
+                cert: pair.cert,
+                trust_anchor: pair.trust_anchor,
+            }),
+            // An error rather than an empty pair: a client that received one
+            // would present it, and the refusal would then arrive from the far
+            // end, about a credential, naming neither this node nor the
+            // enrollment it never had.
+            None => ResponseKind::Error(ErrorResponse {
+                message: NO_MEMBERSHIP_CERT.into(),
+            }),
+        },
         Some(RequestKind::ResolveRoute(req)) => match provider.resolve_route(&req.destination) {
             Some(resolution) => ResponseKind::ResolveRoute(ResolveRouteResponse {
                 next_hop: resolution.next_hop,
@@ -2294,6 +2370,7 @@ mod tests {
     use crate::wayfinder::v1alpha::GetMetricsRequest;
     use crate::wayfinder::v1alpha::GetNodeInfoRequest;
     use crate::wayfinder::v1alpha::GetOgmScheduleRequest;
+    use crate::wayfinder::v1alpha::GetOwnCertRequest;
     use crate::wayfinder::v1alpha::GetRoutingTableRequest;
     use crate::wayfinder::v1alpha::GetSecurityStatusRequest;
     use crate::wayfinder::v1alpha::GetThroughputRequest;
@@ -2356,6 +2433,10 @@ mod tests {
         registration: Option<RegistrationStartedData>,
         /// Whether `complete_user_registration` succeeds.
         registration_completes: bool,
+        /// The certificate pair this node runs under, or `None` for a node
+        /// holding none — which is a default `MockProvider`, so a test has to
+        /// say it is certified before it can be asked for a certificate.
+        own_cert: Option<OwnCertData>,
     }
 
     impl RouterDataProvider for MockProvider {
@@ -2423,6 +2504,9 @@ mod tests {
         }
         fn security_status(&self) -> SecurityStatusData {
             self.security_status.clone()
+        }
+        fn own_cert(&self) -> Option<OwnCertData> {
+            self.own_cert.clone()
         }
         fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
             match &self.set_log_level_error {
@@ -2725,6 +2809,54 @@ mod tests {
             ResponseKind::Error(e) => assert_eq!(e.message, "unknown log level"),
             other => panic!("expected Error, got {}", proto_kind_name(&other)),
         }
+    }
+
+    /// A node that holds a certificate hands back the pair it is *running*
+    /// under — the certificate and the anchor it chains to — so a client can
+    /// present that certificate elsewhere without a round trip to the CA to
+    /// obtain a copy of something the node already has.
+    #[test]
+    fn own_cert_reports_the_pair_the_node_runs_under() {
+        let provider = MockProvider {
+            own_cert: Some(OwnCertData {
+                cert: vec![0xc0, 0xff, 0xee],
+                trust_anchor: vec![0xa1, 0xa2],
+            }),
+            ..Default::default()
+        };
+
+        match handle(provider, RequestKind::GetOwnCert(GetOwnCertRequest {})) {
+            ResponseKind::OwnCert(response) => {
+                assert_eq!(response.cert, vec![0xc0, 0xff, 0xee]);
+                assert_eq!(response.trust_anchor, vec![0xa1, 0xa2]);
+            }
+            other => panic!("expected OwnCert, got {}", proto_kind_name(&other)),
+        }
+    }
+
+    /// A node holding no certificate refuses rather than answering with an
+    /// empty pair. The difference matters: an empty `cert` field would reach a
+    /// client as a certificate, and it would present it — the request has to
+    /// fail where the certificate is missing, not where it is used.
+    #[test]
+    fn own_cert_on_an_uncertified_node_is_an_error() {
+        let provider = MockProvider::default();
+
+        match handle(provider, RequestKind::GetOwnCert(GetOwnCertRequest {})) {
+            ResponseKind::Error(e) => assert_eq!(e.message, NO_MEMBERSHIP_CERT),
+            other => panic!("expected Error, got {}", proto_kind_name(&other)),
+        }
+    }
+
+    /// Reading a certificate that already travels on every OGM this node emits
+    /// discloses nothing, so it is a query — not the disclosure record
+    /// `RevealEnrollmentToken` earns, and not a mutation.
+    #[test]
+    fn own_cert_is_a_query_answered_by_the_router_half() {
+        let kind = RequestKind::GetOwnCert(GetOwnCertRequest {});
+        assert_eq!(request_facet(&kind), RequestFacet::Router);
+        assert_eq!(request_kind_name(&kind), "GetOwnCert");
+        assert_eq!(audited(&kind), Audited::Query);
     }
 
     fn handle(provider: MockProvider, req: RequestKind) -> ResponseKind {
@@ -3813,6 +3945,7 @@ mod tests {
             ResponseKind::RevokeUserSessions(_) => "RevokeUserSessions",
             ResponseKind::SetUserRole(_) => "SetUserRole",
             ResponseKind::SetUserEnabled(_) => "SetUserEnabled",
+            ResponseKind::OwnCert(_) => "OwnCert",
         }
     }
 

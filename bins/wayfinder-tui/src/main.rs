@@ -52,7 +52,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let target = args.connection.target()?;
+    // `resolve_target` rather than `target`: it is the same resolution plus
+    // the one step that cannot be done from disk — fetching the certificate
+    // from the node named by `--cert-from`, when one is named.
+    let target = args.connection.resolve_target().await?;
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, args, target).await;

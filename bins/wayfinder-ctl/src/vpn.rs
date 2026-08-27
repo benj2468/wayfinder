@@ -12,6 +12,12 @@
 //! Nothing here writes a file a node is expected to read. The credential goes
 //! straight from the management API into the tunnel daemon's own CLI, and the
 //! daemon owns its state from there.
+//!
+//! Nor does it make the operator produce one. The certificate [`join`] must
+//! present is the node's own, and an already-enrolled node holds it — so
+//! `--cert-from` reads it back over the management API rather than sending the
+//! operator through a second enrollment for a duplicate. Same rule, applied to
+//! the *read* direction: ask the node, do not go looking in its filesystem.
 
 use anyhow::Context;
 use clap::Subcommand;
@@ -40,6 +46,15 @@ pub enum VpnCommand {
     /// which is the node asking on its own behalf. An operator's session
     /// certificate is refused however privileged it is, since the credential
     /// is scoped to a device and an operator is not one.
+    ///
+    /// A node that enrolled long ago already holds the certificate this needs,
+    /// so `--cert-from` supplies it without a file and without a second
+    /// enrollment. Run on the node's own host, that is one command:
+    /// `wayfinderctl --connect <ca-host>:7700 --node-key <hex> --cert-from
+    /// 127.0.0.1:7700 vpn enrollment`. It replaces the `csr request` → `csr
+    /// submit` → `vpn enrollment` chain this used to require, whose first two
+    /// steps existed only to obtain a copy of a certificate the node was
+    /// already running under.
     Enrollment {
         /// Print the `tailscale up` command instead of running it.
         #[arg(long)]
