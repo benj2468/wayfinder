@@ -109,9 +109,15 @@ pub struct CertAuthority {
     /// from when it last changed state.  Bounds the `held` table and frees a MAC
     /// for a fresh request once a stale one times out.
     pending_ttl_secs: u64,
-    /// Current wall-clock time in unix seconds, refreshed by the driver so issued
-    /// validity windows track the node's auth clock.  Zero until first set.
-    now_unix: u64,
+    /// Where this authority reads wall-clock time from.
+    ///
+    /// Was a `now_unix: u64` that something outside had to keep refreshed, and
+    /// that shape was a bug: the refresher was the router loop, which on a
+    /// provider with no mesh interfaces wakes once an hour, so the authority's
+    /// idea of "now" froze between wakeups and every expiry check froze with it.
+    /// A clock it reads *itself*, at the moment it needs the answer, cannot go
+    /// stale.
+    clock: Clock,
     /// The durable CA state: the issued-certificate log (for `ListCerts` and
     /// the impersonation guard) and the held-CSR store (for the
     /// operator-approval flow, only used when `auto_approve` is off), both
@@ -234,6 +240,82 @@ fn check_cert_ttl(cert_ttl_secs: u64, allow_unbounded: bool) -> Result<(), Strin
 /// Shared by [`CertAuthority::evict_expired_invites`] and
 /// [`CertAuthority::list_user_invites`] so the sweep and the admin's listing
 /// cannot drift apart about what counts as an invitation.
+/// The earliest unix second this build will believe from a host clock.
+///
+/// 2025-01-01T00:00:00Z. A host whose real-time clock has died, or which booted
+/// before NTP answered, reports a time near the epoch — and unlike an unset
+/// clock, that reading *looks* like a valid instant. Certificates stamped from
+/// it would carry validity windows decades in the past, and every expiry check
+/// in this module would read "not yet expired" forever.
+///
+/// So a reading below this floor is mapped onto zero, which is the value every
+/// issuing path here already refuses. The floor only has to be late enough that
+/// no real deployment predates it and early enough never to reject a working
+/// clock; the gap between those is decades wide, so the exact value is not
+/// delicate.
+const MIN_PLAUSIBLE_UNIX: u64 = 1_735_689_600;
+
+/// Where a [`CertAuthority`] reads wall-clock time from.
+///
+/// Time is a trust input here: it decides a certificate's validity window, when
+/// an invitation stops being redeemable, when a lockout lifts and how long a
+/// revocation is enforced. A wrong clock is not a cosmetic fault — it is an
+/// expired bearer token that still works.
+///
+/// This is an abstraction rather than a bare `SystemTime::now()` for one reason:
+/// the properties worth testing here are *all* time-dependent, and a clock that
+/// cannot be pinned cannot be tested. [`Clock::Fixed`] is what makes an expiry
+/// test deterministic; [`Clock::System`] is what makes production correct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Clock {
+    /// The host's system clock, read afresh at every use.
+    ///
+    /// What a real provider runs on, and the only variant that cannot go stale:
+    /// it is read at the moment it is needed rather than pushed in beforehand by
+    /// something whose own schedule decides how often it bothers.
+    ///
+    /// Subject to [`MIN_PLAUSIBLE_UNIX`] — an implausible reading fails closed
+    /// rather than being trusted.
+    System,
+    /// A fixed instant, in unix seconds.
+    ///
+    /// For tests, and for a caller that owns its own clock. `Fixed(0)` is the
+    /// "no clock yet" state that every issuing path refuses, and is what a
+    /// [`CertAuthority::new`] starts in.
+    ///
+    /// **Not** subject to [`MIN_PLAUSIBLE_UNIX`], deliberately: a fixed time is
+    /// a value the caller chose, and flooring it would make a test asking about
+    /// second 100 silently ask about something else. The floor exists for the
+    /// reading nobody chose.
+    Fixed(u64),
+}
+
+impl Clock {
+    /// The current time in unix seconds, or zero when there is no usable clock.
+    fn now_unix(self) -> u64 {
+        match self {
+            Clock::Fixed(secs) => secs,
+            Clock::System => plausible_or_zero(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|since| since.as_secs())
+                    // A system clock before the unix epoch is as unusable as one
+                    // that was never set, and lands in the same place.
+                    .unwrap_or(0),
+            ),
+        }
+    }
+}
+
+/// Map a host-clock reading below [`MIN_PLAUSIBLE_UNIX`] onto the fail-closed
+/// zero, passing a plausible one through.
+///
+/// Split out so the boundary is testable without a machine whose clock is
+/// actually wrong.
+fn plausible_or_zero(secs: u64) -> u64 {
+    if secs < MIN_PLAUSIBLE_UNIX { 0 } else { secs }
+}
+
 fn invite_is_live(invite: &UserInvite, now_unix: u64) -> bool {
     match invite.status {
         InviteStatus::Pending => !invite.is_expired(now_unix),
@@ -267,7 +349,10 @@ impl CertAuthority {
             enrollment_token: enrollment_token.map(SharedSecret::new),
             auto_approve,
             pending_ttl_secs: DEFAULT_PENDING_TTL_SECS,
-            now_unix: 0,
+            // No clock until one is set. `from_config` — the production path —
+            // immediately replaces this with `Clock::System`; a test that never
+            // sets one is exercising the fail-closed state on purpose.
+            clock: Clock::Fixed(0),
             log: CaLog::empty(),
         }
     }
@@ -282,6 +367,14 @@ impl CertAuthority {
     /// corrupt, foreign, or newer-than-known snapshot is refused (`Err`)
     /// rather than silently treated as empty. Absent, state starts empty
     /// (in-memory only, as before).
+    ///
+    /// **This is the production path, and it is what puts the authority on
+    /// [`Clock::System`].** Every real provider — `wayfinder-tap`'s node and
+    /// `wayfinderctl`'s offline commands — arrives here, so a provider reads the
+    /// host clock and needs nobody to refresh it. [`Self::new`] deliberately
+    /// does not: it is the constructor tests and mocks use, and starting it at
+    /// `Clock::Fixed(0)` is what lets a test choose its own time — or assert the
+    /// fail-closed behaviour of an authority that has none.
     pub fn from_config(root_seed: &[u8; 32], cfg: &ProviderConfig) -> Result<Self, String> {
         check_cert_ttl(cfg.cert_ttl_secs, cfg.allow_unbounded_cert_ttl)?;
         let log = CaLog::load(cfg.state_path.as_ref().map(PathBuf::from))?;
@@ -289,6 +382,7 @@ impl CertAuthority {
             pending_ttl_secs: cfg.pending_ttl_secs,
             allow_unbounded_cert_ttl: cfg.allow_unbounded_cert_ttl,
             log,
+            clock: Clock::System,
             ..Self::new(
                 root_seed,
                 cfg.mesh_id,
@@ -416,11 +510,29 @@ impl CertAuthority {
         Ok(())
     }
 
-    /// Update the current wall-clock time (unix seconds) used to stamp issued
-    /// certificate / revocation validity windows.  Called by the driver before
-    /// serving a request, the same way the router's auth clock is refreshed.
+    /// Pin this authority to a fixed instant (unix seconds).
+    ///
+    /// Equivalent to `set_clock(Clock::Fixed(now_unix))`, and kept under its
+    /// original name because that is what nearly every test in this workspace
+    /// means by it: "the time is now this". A provider does **not** call it —
+    /// `from_config` gives it [`Clock::System`], which needs no refreshing.
     pub fn set_now_unix(&mut self, now_unix: u64) {
-        self.now_unix = now_unix;
+        self.set_clock(Clock::Fixed(now_unix));
+    }
+
+    /// Choose where this authority reads time from.
+    pub fn set_clock(&mut self, clock: Clock) {
+        self.clock = clock;
+    }
+
+    /// The current time in unix seconds, or zero when there is no usable clock
+    /// — which every issuing path in this module refuses to act on.
+    ///
+    /// A method rather than a field because [`Clock::System`] has to be read at
+    /// the moment of use. The whole point is that there is no stored "now" to go
+    /// stale between one request and the next.
+    pub fn now_unix(&self) -> u64 {
+        self.clock.now_unix()
     }
 
     /// The mesh id this authority signs for.
@@ -473,8 +585,8 @@ impl CertAuthority {
     /// halves of an approval can never durably split (see that method's own
     /// doc for the impersonation-guard gap this closes).
     fn sign(&self, mac: Mac, ed: [u8; 32], x: [u8; 32]) -> (MembershipCert, IssuedCertData) {
-        let not_before = self.now_unix;
-        let not_after = self.now_unix.saturating_add(self.cert_ttl_secs);
+        let not_before = self.now_unix();
+        let not_after = self.now_unix().saturating_add(self.cert_ttl_secs);
         let cert = self.authority.issue_cert(mac, ed, x, not_before, not_after);
         let record = IssuedCertData {
             node_mac: mac.0.to_vec(),
@@ -508,8 +620,8 @@ impl CertAuthority {
         role: UserRole,
     ) -> (MembershipCert, IssuedCertData) {
         let admin = role == UserRole::Admin;
-        let not_before = self.now_unix;
-        let not_after = self.now_unix.saturating_add(ttl_secs);
+        let not_before = self.now_unix();
+        let not_after = self.now_unix().saturating_add(ttl_secs);
         let cert = self
             .authority
             .issue_user_cert(mac, ed, x, not_before, not_after, admin);
@@ -579,7 +691,7 @@ impl CertAuthority {
                 session_ttl_secs: u.session_ttl_secs,
                 totp_enrolled: u.totp_secret.is_some(),
                 disabled: u.disabled,
-                locked: u.is_locked(self.now_unix),
+                locked: u.is_locked(self.now_unix()),
             })
             .collect()
     }
@@ -657,8 +769,12 @@ impl CertAuthority {
     ) -> Result<MintedInvite, String> {
         // Same fail-closed rule as `submit_csr`: without a clock this would
         // mint an invitation whose window starts at the epoch and is over.
-        if self.now_unix == 0 {
-            return Err("authority clock not set; cannot mint an invitation yet".to_string());
+        if self.now_unix() == 0 {
+            return Err(
+                "the authority has no usable clock (never set, or a host clock reading \
+                 before 2025 — check NTP or the hardware clock); cannot mint an invitation yet"
+                    .to_string(),
+            );
         }
         self.evict_expired_invites()?;
         self.check_name_available(username)?;
@@ -690,7 +806,7 @@ impl CertAuthority {
         }
 
         let token = crate::users::generate_invite_secret();
-        let expires_at = self.now_unix.saturating_add(if invite_ttl_secs == 0 {
+        let expires_at = self.now_unix().saturating_add(if invite_ttl_secs == 0 {
             DEFAULT_INVITE_TTL_SECS
         } else {
             invite_ttl_secs
@@ -700,7 +816,7 @@ impl CertAuthority {
             role,
             ttl,
             crate::users::invite_token_hash(&token),
-            self.now_unix,
+            self.now_unix(),
             expires_at,
         );
         let (_, persisted) = self.log.mutate_invites(|invites| invites.push(invite));
@@ -730,7 +846,7 @@ impl CertAuthority {
     /// `started_at` this panel documents as meaning *act now*: a resolved
     /// disclosure presented as a live one.
     pub fn list_user_invites(&self) -> Vec<InviteSummary> {
-        let now = self.now_unix;
+        let now = self.now_unix();
         self.log
             .invites()
             .iter()
@@ -803,11 +919,15 @@ impl CertAuthority {
     /// unknown token — see [`Self::complete_user_registration`] for why that is
     /// deliberate rather than an oversight.
     pub fn begin_user_registration(&mut self, token: &str) -> Result<StartedRegistration, String> {
-        if self.now_unix == 0 {
-            return Err("authority clock not set; cannot start a registration yet".to_string());
+        if self.now_unix() == 0 {
+            return Err(
+                "the authority has no usable clock (never set, or a host clock reading \
+                 before 2025 — check NTP or the hardware clock); cannot start a registration yet"
+                    .to_string(),
+            );
         }
         self.evict_expired_invites()?;
-        let now = self.now_unix;
+        let now = self.now_unix();
         let hash = crate::users::invite_token_hash(token);
         let handle = crate::users::generate_invite_secret();
         let handle_hash = crate::users::registration_handle_hash(&handle);
@@ -899,11 +1019,15 @@ impl CertAuthority {
         password: &str,
         totp_code: &str,
     ) -> Result<(), String> {
-        if self.now_unix == 0 {
-            return Err("authority clock not set; cannot create an account yet".to_string());
+        if self.now_unix() == 0 {
+            return Err(
+                "the authority has no usable clock (never set, or a host clock reading \
+                 before 2025 — check NTP or the hardware clock); cannot create an account yet"
+                    .to_string(),
+            );
         }
         self.evict_expired_invites()?;
-        let now = self.now_unix;
+        let now = self.now_unix();
         let handle_hash = crate::users::registration_handle_hash(handle);
 
         // Everything cheap, and nothing that touches the store, before the
@@ -994,10 +1118,10 @@ impl CertAuthority {
     /// simply absent, with the name freed and nothing recording that it had
     /// ever happened.
     fn evict_expired_invites(&mut self) -> Result<(), String> {
-        if self.now_unix == 0 {
+        if self.now_unix() == 0 {
             return Ok(());
         }
-        let now = self.now_unix;
+        let now = self.now_unix();
         let live = |i: &UserInvite| invite_is_live(i, now);
         if self.log.invites().iter().all(live) {
             return Ok(());
@@ -1041,8 +1165,8 @@ impl CertAuthority {
     /// Never true before the clock is set (`now_unix == 0`), so a CA that has
     /// not yet learned the time does not evict everything as "expired".
     fn is_expired(&self, held: &HeldCsr) -> bool {
-        self.now_unix != 0
-            && self.now_unix.saturating_sub(held.requested_at) > self.pending_ttl_secs
+        self.now_unix() != 0
+            && self.now_unix().saturating_sub(held.requested_at) > self.pending_ttl_secs
     }
 
     /// Drop held CSRs that have timed out.  Called at the start of every poll
@@ -1051,10 +1175,10 @@ impl CertAuthority {
     /// bounded. A no-op (and no persist) when nothing has actually timed out,
     /// so a routine poll that evicts nothing doesn't touch disk.
     fn evict_expired(&mut self) -> Result<(), String> {
-        if self.now_unix == 0 {
+        if self.now_unix() == 0 {
             return Ok(());
         }
-        let now = self.now_unix;
+        let now = self.now_unix();
         let ttl = self.pending_ttl_secs;
         let has_expired = self
             .log
@@ -1183,8 +1307,12 @@ impl MeshAuthority for CertAuthority {
     ) -> Result<UserAuthOutcome, String> {
         // Same fail-closed rule as `submit_csr`: without a clock this would
         // mint a session whose window starts at the epoch and is already over.
-        if self.now_unix == 0 {
-            return Err("authority clock not set; cannot issue certificates yet".to_string());
+        if self.now_unix() == 0 {
+            return Err(
+                "the authority has no usable clock (never set, or a host clock reading \
+                 before 2025 — check NTP or the hardware clock); cannot issue certificates yet"
+                    .to_string(),
+            );
         }
         // Malformed keys are an *unserviceable request*, not a wrong password,
         // and are refused before any credential is looked at — a client that
@@ -1193,7 +1321,7 @@ impl MeshAuthority for CertAuthority {
         let ed = fixed::<32>(ed_pubkey, "ed_pubkey")?;
         let x = fixed::<32>(x_pubkey, "x_pubkey")?;
 
-        let now = self.now_unix;
+        let now = self.now_unix();
         let name = username.to_string();
         // The whole attempt runs inside one `mutate_users` call, so the record
         // it leaves behind — an advanced replay guard on success, an
@@ -1268,8 +1396,12 @@ impl MeshAuthority for CertAuthority {
         // The clock must have been set (via `set_now_unix`), or we'd issue a cert
         // whose validity window starts at the unix epoch and is already expired
         // against any real wall clock.  Fail closed.
-        if self.now_unix == 0 {
-            return Err("authority clock not set; cannot issue certificates yet".to_string());
+        if self.now_unix() == 0 {
+            return Err(
+                "the authority has no usable clock (never set, or a host clock reading \
+                 before 2025 — check NTP or the hardware clock); cannot issue certificates yet"
+                    .to_string(),
+            );
         }
         // Reclaim any timed-out held requests before consulting the store, so a
         // stale entry frees the MAC for this poll (the escape hatch for a
@@ -1304,7 +1436,7 @@ impl MeshAuthority for CertAuthority {
             .log
             .issued()
             .iter()
-            .find(|c| c.node_mac == mac.0 && !c.revoked && self.now_unix <= c.not_after)
+            .find(|c| c.node_mac == mac.0 && !c.revoked && self.now_unix() <= c.not_after)
             .map(|c| c.ed_pubkey == ed)
         {
             return Ok(if same_key {
@@ -1374,7 +1506,7 @@ impl MeshAuthority for CertAuthority {
                     .to_string(),
             ));
         }
-        let requested_at = self.now_unix;
+        let requested_at = self.now_unix();
         let (_, persisted) = self.log.mutate_held(|held| {
             held.push(HeldCsr {
                 node_mac: mac.0,
@@ -1403,8 +1535,12 @@ impl MeshAuthority for CertAuthority {
     }
 
     fn approve_csr(&mut self, node_mac: &[u8]) -> Result<(), String> {
-        if self.now_unix == 0 {
-            return Err("authority clock not set; cannot issue certificates yet".to_string());
+        if self.now_unix() == 0 {
+            return Err(
+                "the authority has no usable clock (never set, or a host clock reading \
+                 before 2025 — check NTP or the hardware clock); cannot issue certificates yet"
+                    .to_string(),
+            );
         }
         let mac = node_mac_of(node_mac)?;
         self.evict_expired()?;
@@ -1423,7 +1559,7 @@ impl MeshAuthority for CertAuthority {
         // node gets a full pending-TTL window to collect from the approval.
         let (cert, record) = self.sign(mac, ed, x);
         let cert_bytes = cert.as_bytes().to_vec();
-        let now = self.now_unix;
+        let now = self.now_unix();
         // Record the issued cert *and* flip the held entry to Approved as one
         // write: doing these as two separate `mutate_issued`/`mutate_held`
         // calls (as this used to) left a real gap under `Persisted`'s
@@ -1455,7 +1591,7 @@ impl MeshAuthority for CertAuthority {
             .iter()
             .position(|h| h.node_mac == mac.0 && matches!(h.status, CsrStatus::Pending))
             .ok_or_else(|| alloc::format!("no pending CSR for {:02x?}", mac.0))?;
-        let now = self.now_unix;
+        let now = self.now_unix();
         let (_, persisted) = self.log.mutate_held(|held| {
             held[idx].status = CsrStatus::Denied("denied by operator".to_string());
             // Restart the TTL clock so the denial tombstone lives a full
@@ -1544,14 +1680,18 @@ impl MeshAuthority for CertAuthority {
     }
 
     fn revoke(&mut self, node_mac: &[u8]) -> Result<RevocationRecord, String> {
-        if self.now_unix == 0 {
-            return Err("authority clock not set; cannot sign revocations yet".to_string());
+        if self.now_unix() == 0 {
+            return Err(
+                "the authority has no usable clock (never set, or a host clock reading \
+                 before 2025 — check NTP or the hardware clock); cannot sign revocations yet"
+                    .to_string(),
+            );
         }
         let mac = node_mac_of(node_mac)?;
         // The revocation must outlive any cert we issued for the node, so reuse
         // the same ttl window from now; passive expiry then takes over.
-        let not_after = self.now_unix.saturating_add(self.cert_ttl_secs);
-        let record = self.authority.revoke(mac, self.now_unix, not_after);
+        let not_after = self.now_unix().saturating_add(self.cert_ttl_secs);
+        let record = self.authority.revoke(mac, self.now_unix(), not_after);
 
         // Mark the issued entry revoked (retained for ListCerts observability).
         let (_, persisted) = self.log.mutate_issued(|issued| {
@@ -1937,6 +2077,86 @@ mod tests {
         assert_eq!(ca.list_users().len(), 1);
     }
 
+    /// A host clock too early to believe reads as *no* clock, not as a valid
+    /// instant in 1970.
+    ///
+    /// The failure this closes is quiet and total. A node whose RTC has died, or
+    /// which issued before NTP answered, reports a time near the epoch — and
+    /// unlike an unset clock, that reading looks perfectly valid. Certificates
+    /// would be stamped decades in the past, and every expiry check in this
+    /// module would read "not yet expired" forever, which is an invitation that
+    /// never dies and a lockout that never lifts.
+    ///
+    /// Mapping it onto zero costs nothing to write and reuses the refusal every
+    /// issuing path here already performs.
+    #[test]
+    fn a_host_clock_from_before_2025_reads_as_no_clock_at_all() {
+        assert_eq!(plausible_or_zero(0), 0, "an unset clock");
+        assert_eq!(plausible_or_zero(1), 0, "one second after the epoch");
+        assert_eq!(
+            plausible_or_zero(1_700_000_000),
+            0,
+            "2023 — a plausible-looking instant, and still before this build \
+             could have been deployed"
+        );
+        assert_eq!(
+            plausible_or_zero(MIN_PLAUSIBLE_UNIX - 1),
+            0,
+            "the floor is exclusive below"
+        );
+        assert_eq!(
+            plausible_or_zero(MIN_PLAUSIBLE_UNIX),
+            MIN_PLAUSIBLE_UNIX,
+            "and inclusive at it"
+        );
+        assert_eq!(
+            plausible_or_zero(2_000_000_000),
+            2_000_000_000,
+            "a working clock passes through untouched"
+        );
+    }
+
+    /// A fixed clock is **not** floored, and that asymmetry is deliberate.
+    ///
+    /// Nearly every test in this workspace pins the authority to a small number
+    /// — second 100, second 1000 — and flooring those would silently turn a test
+    /// asking about second 100 into one asking about nothing. The floor exists
+    /// for the reading nobody chose; a fixed time is a value the caller chose.
+    #[test]
+    fn a_fixed_clock_is_taken_at_its_word() {
+        let mut ca = open_ca();
+        ca.set_now_unix(100);
+        assert_eq!(ca.now_unix(), 100, "well below the plausibility floor");
+        ca.set_now_unix(0);
+        assert_eq!(ca.now_unix(), 0, "and zero stays the fail-closed sentinel");
+    }
+
+    /// The production constructor puts the authority on the host clock, so a
+    /// provider needs nobody to refresh it.
+    ///
+    /// The whole of the fix: a `now_unix` something outside had to push in went
+    /// stale whenever that something stopped pushing, and the router — which was
+    /// doing the pushing — wakes once an hour on a provider with no mesh
+    /// interfaces.
+    #[test]
+    fn a_provider_built_from_config_reads_the_host_clock() {
+        let path = unique_state_path("system-clock");
+        let ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+
+        let host_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the test host's clock is after the epoch")
+            .as_secs();
+        assert!(
+            ca.now_unix().abs_diff(host_now) <= 5,
+            "a provider reads the host clock without being told the time: got {}, \
+             host says {host_now}",
+            ca.now_unix()
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
     /// An unknown name is an error rather than a silent success: whoever typed
     /// it has a wrong idea about the roster, and reporting nothing leaves them
     /// with it.
@@ -2004,12 +2224,22 @@ mod tests {
         assert!(ca.submit_csr(&[0; 6], &ed[..16], &x, "").is_err()); // short ed key
     }
 
+    /// Nothing is issued without a usable clock, and the refusal says what an
+    /// operator should go and look at.
+    ///
+    /// The message names both causes on purpose — a clock never set, and a host
+    /// clock reading before the plausibility floor — because from the outside
+    /// they are the same refusal and only one of them is fixed by restarting.
     #[test]
     fn issuance_rejected_before_clock_is_set() {
         let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, true);
         let (ed, x) = node_keys(2);
         let err = ca.submit_csr(&[0; 6], &ed, &x, "").unwrap_err();
-        assert!(err.contains("clock not set"), "got: {err}");
+        assert!(err.contains("no usable clock"), "got: {err}");
+        assert!(
+            err.contains("NTP") || err.contains("hardware clock"),
+            "the refusal points at what to fix, not just at itself: {err}"
+        );
     }
 
     #[test]

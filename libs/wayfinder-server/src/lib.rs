@@ -149,6 +149,8 @@ mod authority;
 #[cfg(feature = "std")]
 pub use authority::CertAuthority;
 #[cfg(feature = "std")]
+pub use authority::Clock;
+#[cfg(feature = "std")]
 pub use authority::DEFAULT_INVITE_TTL_SECS;
 #[cfg(feature = "std")]
 pub use authority::InviteSummary;

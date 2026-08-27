@@ -255,14 +255,21 @@ impl Mock {
     /// A certificate authority carrying two user accounts — one administrator,
     /// one viewer — so a login can be driven end to end.
     ///
-    /// Clocked from the *real* wall clock, unlike [`Mock::authority`]. A
-    /// session certificate is verified by the node it is then used against,
-    /// against that node's clock, so a fixed authority clock would mint
-    /// credentials that are already expired the moment they are presented.
+    /// On the *real* wall clock, unlike [`Mock::authority`]. A session
+    /// certificate is verified by the node it is then used against, against
+    /// that node's clock, so a fixed authority clock would mint credentials
+    /// already expired the moment they are presented.
+    ///
+    /// `Clock::System` rather than a `set_now_unix(now)` snapshot taken here:
+    /// the snapshot is read once at construction and then never moves, so
+    /// `examples/mock_node.rs` — which runs for as long as somebody is poking at
+    /// the dashboard — drifted a little further from the truth every minute, and
+    /// its invitations never expired at all. Same freezing shape the real
+    /// provider had, in the one stand-in meant to behave like it.
     pub fn login_provider() -> Self {
         let mut ca =
             wayfinder_server::CertAuthority::new(&MESH_ROOT_SEED, MOCK_MESH_ID, 86_400, None, true);
-        ca.set_now_unix(now_unix());
+        ca.set_clock(wayfinder_server::Clock::System);
         for (username, role) in [
             (MOCK_ADMIN_USER, wayfinder_server::UserRole::Admin),
             (MOCK_VIEWER_USER, wayfinder_server::UserRole::Viewer),
@@ -369,15 +376,6 @@ impl Mock {
             wayfinder_auth::Authority::from_seed(&MESH_ROOT_SEED, ca.mesh_id()).trust_anchor()
         })
     }
-}
-
-/// The current wall clock in unix seconds, for a mock that has to mint
-/// credentials a real verifier will accept.
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
 }
 
 impl Mock {
