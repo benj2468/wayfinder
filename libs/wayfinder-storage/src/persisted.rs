@@ -183,7 +183,7 @@ impl<S: DurableStore> DurableStore for Option<S> {
 
 // `std`-only: the test double below shares state via `Rc<RefCell<_>>`, a
 // `std` convenience. `Persisted` itself stays `no_std`-clean (see the crate
-// doc); this module just isn't the place that proves it — `cargo test -p
+// doc); this module just isn't the place that proves it — `cargo nextest run -p
 // wayfinder-storage --no-default-features` would otherwise fail to even
 // compile, since `#[cfg(test)]` alone doesn't imply `std` is available.
 #[cfg(all(test, feature = "std"))]

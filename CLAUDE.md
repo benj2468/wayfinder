@@ -25,10 +25,10 @@ TUI/CLI clients) live in separate `std` crates layered on top.
 ```bash
 cargo build                       # whole workspace (add --release for optimized)
 cargo build -p batman             # a single package
-cargo test --workspace            # all tests
-cargo test -p wayfinder           # one package
-cargo test test_ogm_forwarding    # one test by name
-cargo test -- --nocapture         # with output visible
+cargo nextest run --workspace            # all tests
+cargo nextest run -p wayfinder           # one package
+cargo nextest run test_ogm_forwarding    # one test by name
+cargo nextest run -- --nocapture         # with output visible
 ```
 
 Run binaries:
@@ -54,7 +54,7 @@ The `libs/wayfinder-shark` Wireshark dissector is tested with pytest
 dissector — outside the Cargo test harness.
 
 **Crates outside the root workspace don't run under a root `cargo
-nextest run --workspace`/`cargo test --workspace`** — each needs its own
+nextest run --workspace`/`nextest run --workspace`** — each needs its own
 invocation from its own directory:
 
 - `libs/wayfinder-py` — a separate `[workspace]` (needs a linkable libpython;
@@ -86,7 +86,7 @@ invocations, which CI's `build:web` job runs:
 ```bash
 cargo build -p wayfinder-web --features ssr
 cargo build -p wayfinder-web --features hydrate --target wasm32-unknown-unknown
-cargo test -p wayfinder-web --features mock-node
+cargo nextest run -p wayfinder-web --features mock-node
 cargo leptos build            # both halves, the way it actually ships
 ```
 

@@ -141,7 +141,7 @@ cd bins/wayfinder-nrf52840 && cargo build --release   # target thumbv7em-none-ea
 cargo build
 
 # Run the full test suite
-cargo test --workspace
+cargo nextest run --workspace
 
 # Run a mesh node from a YAML config (TAP bridge + UDP links + management API)
 cargo run -p wayfinder-tap -- --config node.yaml
@@ -167,7 +167,7 @@ it pass. Every public API carries documentation (enforced for protobuf via
 ```bash
 nix fmt                                # format the whole tree (treefmt)
 cargo clippy --workspace               # lint
-cargo test --workspace                 # test
+cargo nextest run --workspace                 # test
 cd libs/wayfinder-protos && buf lint   # proto docs + style
 ```
 

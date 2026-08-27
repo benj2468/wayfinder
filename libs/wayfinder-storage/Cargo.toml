@@ -26,7 +26,7 @@ heapless.workspace = true
 # `default-features = false` and opts into `std` or `flash` explicitly (see
 # `libs/wayfinder-server` and `bins/wayfinder-nrf52840` respectively), so this
 # default set only governs building/testing the crate directly — e.g. `cargo
-# nextest run --workspace`, which resolves each member's own defaults. Both
+# cargo nextest run --workspace`, which resolves each member's own defaults. Both
 # are listed here so that command exercises `FlashStore` too, not just
 # `FileStore`; `flash` is a plain host-buildable trait dependency
 # (`embedded-storage`), unlike e.g. `blue`'s `hardware` feature.

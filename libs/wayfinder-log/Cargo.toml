@@ -18,7 +18,7 @@ workspace = true
 # and one record shape.
 #
 # `no_std` only on bare metal: the host builds of this crate (as a dependency of
-# `wayfinder-server`/`wayfinder-tap`, and under `cargo test`) use `std` for the
+# `wayfinder-server`/`wayfinder-tap`, and under `nextest run`) use `std` for the
 # ring/filter locks, since `critical-section` has no impl registered there.
 
 [features]

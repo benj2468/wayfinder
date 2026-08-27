@@ -1,12 +1,12 @@
 //! Exercises the Headscale REST client against a **real** Headscale server.
 //!
 //! Ignored by default: it needs a live server, so it is not part of an ordinary
-//! `cargo test`. Run it against one with
+//! `cargo nextest run`. Run it against one with
 //!
 //! ```text
 //! WAYFINDER_HEADSCALE_URL=http://127.0.0.1:8080 \
 //! WAYFINDER_HEADSCALE_KEY_FILE=/path/to/api.key \
-//!   cargo test -p wayfinder-server --test headscale_live -- --ignored
+//!   cargo nextest run -p wayfinder-server --test headscale_live -- --ignored
 //! ```
 //!
 //! It exists because the parts of this client that can be wrong are exactly the

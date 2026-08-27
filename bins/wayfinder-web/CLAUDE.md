@@ -270,7 +270,7 @@ without it this whole failure mode is invisible.
 ## Testing
 
 ```bash
-cargo test -p wayfinder-web --features mock-node     # all of the below
+cargo nextest run -p wayfinder-web --features mock-node     # all of the below
 ```
 
 - `format.rs` / `state.rs` / `chart.rs` unit tests — the pure conversions.
