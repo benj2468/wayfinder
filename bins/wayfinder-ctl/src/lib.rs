@@ -309,7 +309,32 @@ pub enum Command {
 /// erroring if `--identity` (required to reach a node's TLS management API) was
 /// not supplied.  The seed/cert reads and node-key resolution live in
 /// [`Endpoint::load`], shared with the TUI so both accept the same inputs.
-fn build_endpoint(cli: &Cli) -> anyhow::Result<Endpoint> {
+///
+/// `pub` so an integration test can drive credential resolution directly, the
+/// same reason [`run_query`] is.  It is worth reaching: the `--cert-from`
+/// branch below is the one piece of this decision that
+/// [`ConnectArgs::resolve_target`] does not share, because only this side has a
+/// stored login session to choose against.
+pub async fn build_endpoint(cli: &Cli) -> anyhow::Result<Endpoint> {
+    // `--cert-from` decides the credential outright, and decides it *before*
+    // the identity question below: it says the certificate presented is a
+    // node's own, and a node's certificate names the key in its identity seed.
+    // A stored login session is therefore never the right seed to pair it with
+    // — that key is an operator's, and no node's certificate names it — so this
+    // takes the identity path (`--identity`, else the default a node's own host
+    // has) rather than falling through to the session.
+    if let Some(source) = cli.connection.cert_from.as_ref() {
+        let mut endpoint = Endpoint::load(
+            cli.connection.connect.clone(),
+            cli.connection.identity_path(),
+            // No certificate read from disk: fetching one is the whole point,
+            // and clap has already refused `--cert` alongside this.
+            None,
+            cli.connection.node_key.as_deref(),
+        )?;
+        endpoint.load_cert_from_node(source).await?;
+        return Ok(endpoint);
+    }
     // An explicit `--identity` still wins: it is how a node is bootstrapped
     // with its own seed, which no login can substitute for.
     if let Some(identity_path) = cli.connection.identity.as_ref() {
@@ -564,14 +589,26 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         _ => {}
     }
+    // Resolved once and reused below, rather than rebuilt per connection: with
+    // `--cert-from` the resolution itself talks to a node, and doing that twice
+    // would double the round trips for one command.
+    //
+    // `None` for a serial target: that transport has no endpoint, and cannot
+    // join a VPN anyway (an embedded node runs no tunnel daemon).
+    let endpoint = match cli.connection.serial {
+        Some(_) => None,
+        None => Some(build_endpoint(&cli).await?),
+    };
     // A serial target reaches an embedded node's unauthenticated management API
     // directly; otherwise connect over the authenticated TLS endpoint.
-    let mut client = match cli.connection.serial.clone() {
-        Some(path) => Client::connect_serial(&path, cli.connection.baud).await?,
-        None => {
-            let endpoint = build_endpoint(&cli)?;
+    let mut client = match (cli.connection.serial.clone(), &endpoint) {
+        (Some(path), _) => Client::connect_serial(&path, cli.connection.baud).await?,
+        (None, Some(endpoint)) => {
             Client::connect_tls(&endpoint.addr, &endpoint.node_key, &endpoint.identity).await?
         }
+        // Unreachable: the match above gives every non-serial target an
+        // endpoint, and every serial one takes the first arm.
+        (None, None) => bail!("internal: a TLS target resolved to no endpoint"),
     };
     // Streaming is the one command that outlives a single response, so it is
     // handled here rather than in `dispatch_query`.
@@ -583,13 +620,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     {
         return follow_logs(&mut client, since, max, cli.output).await;
     }
-    // The endpoint is what `enroll` reconnects through once it holds a
-    // certificate; a serial target has none, and cannot join a VPN anyway (an
-    // embedded node runs no tunnel daemon).
-    let endpoint = match cli.connection.serial {
-        Some(_) => None,
-        None => Some(build_endpoint(&cli)?),
-    };
     println!(
         "{}",
         dispatch_query(cli.command, &mut client, cli.output, endpoint.as_ref()).await?

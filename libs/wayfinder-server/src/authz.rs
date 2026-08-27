@@ -890,6 +890,7 @@ mod tests {
         CreateUser(CreateUserRequest),
         RemoveUser(RemoveUserRequest),
         GetAlarms(GetAlarmsRequest),
+        GetOwnCert(GetOwnCertRequest),
         GetVpnEnrollment(GetVpnEnrollmentRequest),
         ListVpnPeers(ListVpnPeersRequest),
         RevokeVpnPeer(RevokeVpnPeerRequest),
@@ -1046,6 +1047,25 @@ mod tests {
                     | ReqKind::SetUserRole(_)
                     | ReqKind::SetUserEnabled(_)
                     | ReqKind::SetUserPassword(_)
+                    // A read of public material, and refused all the same —
+                    // because nothing needs it. `--cert-from` fetches a node's
+                    // certificate over a connection that proves the node's own
+                    // seed, which is `GrantedSelfKey` before any certificate is
+                    // examined, so no caller in this workspace reaches this
+                    // request as a viewer. Granting it anyway would be widening
+                    // a `SECURITY ALERT` allowlist for a consumer that does not
+                    // exist, and the rule this file already applies to
+                    // `ListUsers` above applies here: widening later is one
+                    // line, narrowing after somebody has relied on it is not.
+                    //
+                    // Nothing is being protected by the refusal, to be clear.
+                    // A viewer already reads every *field* of the certificate
+                    // from `GetSecurityStatus` (mesh id, own MAC, both public
+                    // keys, expiry) and `ListCerts` beside it; what this adds
+                    // is the root's signature over those fields, which is
+                    // verification material rather than a secret. Grant it the
+                    // day something needs it.
+                    | ReqKind::GetOwnCert(_)
             );
             assert_eq!(
                 permits(MgmtAccess::GrantedViewer, request),

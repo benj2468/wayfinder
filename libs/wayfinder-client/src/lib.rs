@@ -25,6 +25,7 @@ pub use target::ConnectTarget;
 
 use anyhow::Context;
 use anyhow::anyhow;
+use anyhow::bail;
 use bytes::Bytes;
 use futures::SinkExt;
 use futures::StreamExt;
@@ -36,6 +37,7 @@ use tokio_rustls::client::TlsStream;
 use tokio_serial::SerialStream;
 use tokio_util::codec::Framed;
 use tokio_util::codec::LengthDelimitedCodec;
+use wayfinder_protos::service::NO_MEMBERSHIP_CERT;
 use wayfinder_protos::wayfinder::v1alpha::Alarms;
 use wayfinder_protos::wayfinder::v1alpha::ApproveCsrRequest;
 use wayfinder_protos::wayfinder::v1alpha::AuthenticateRequest;
@@ -57,6 +59,8 @@ use wayfinder_protos::wayfinder::v1alpha::GetLogsRequest;
 use wayfinder_protos::wayfinder::v1alpha::GetMetricsRequest;
 use wayfinder_protos::wayfinder::v1alpha::GetNodeInfoRequest;
 use wayfinder_protos::wayfinder::v1alpha::GetOgmScheduleRequest;
+use wayfinder_protos::wayfinder::v1alpha::GetOwnCertRequest;
+use wayfinder_protos::wayfinder::v1alpha::GetOwnCertResponse;
 use wayfinder_protos::wayfinder::v1alpha::GetRoutingTableRequest;
 use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusRequest;
 use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
@@ -223,6 +227,119 @@ impl Endpoint {
             identity: Identity { seed, cert },
         })
     }
+
+    /// Adopt, as this endpoint's credential, the membership certificate held by
+    /// the node at `node_addr` — fetched from that node over its management
+    /// API rather than read off a disk.
+    ///
+    /// This is what `--cert-from` does, and it exists because a node that
+    /// enrolled once already holds its certificate: in a file under static
+    /// auth, or in the runtime state a `SetAuth` install persisted. Without
+    /// this, an operator wanting to *present* that certificate had to run a
+    /// whole second enrollment to obtain a copy of it — a CSR round trip whose
+    /// only product was a duplicate of something the node already had.
+    ///
+    /// Nothing about where this endpoint connects changes: [`addr`](Self::addr)
+    /// and [`node_key`](Self::node_key) still name the far end, and the seed is
+    /// untouched. Only the certificate presented on arrival is filled in.
+    ///
+    /// # Why the source node is pinned to this identity's own key
+    ///
+    /// The connection to `node_addr` presents this endpoint's seed with no
+    /// certificate — the self-key bootstrap — and pins the node to that seed's
+    /// own public key. There is no flag to point it elsewhere, and that is the
+    /// security property rather than a convenience: a membership certificate is
+    /// useful only to the holder of the key it names, so the only node with a
+    /// certificate worth having here is the node whose seed this is. A pin that
+    /// could be overridden would let a wrong — or hostile — address hand back a
+    /// certificate this client would then go and present somewhere.
+    ///
+    /// A node presenting any other key therefore fails the handshake, which is
+    /// the intended outcome and not a misconfiguration to work around.
+    pub async fn load_cert_from_node(&mut self, node_addr: &NodeAddr) -> anyhow::Result<()> {
+        // No certificate on this connection: the node is being asked on its own
+        // behalf, by whoever holds its seed, which is the one credential a
+        // node's local operator is guaranteed to have.
+        let bootstrap = Identity {
+            seed: self.identity.seed,
+            cert: Vec::new(),
+        };
+        let pin = wayfinder_auth::Keypair::from_seed(&self.identity.seed).ed_pubkey();
+        let mut client = Client::connect_tls(node_addr, &pin, &bootstrap)
+            .await
+            .with_context(|| format!("connecting to {node_addr} to read its certificate"))?;
+        let pair = match client.own_cert().await {
+            Ok(pair) => pair,
+            // The node answered, and its answer was "I have none". That is a
+            // state an operator fixes, not a failure to retry, so it is
+            // rewritten into the instruction rather than left as a refusal the
+            // caller has to interpret. Matched on the shared constant, which is
+            // why that constant exists.
+            Err(e) if e.to_string().contains(NO_MEMBERSHIP_CERT) => anyhow::bail!(
+                "{node_addr} holds no membership certificate to present: it has an \
+                 identity, but nothing has certified it yet. Enroll it first — \
+                 `wayfinderctl enroll` where the node can reach the provider, or \
+                 `csr request` / `csr submit` / `csr install` where it cannot."
+            ),
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("asking {node_addr} for the membership certificate it runs under")
+                });
+            }
+        };
+        check_usable(&pair, &pin, node_addr)?;
+        self.identity.cert = pair.cert;
+        Ok(())
+    }
+}
+
+/// Check that a fetched [`GetOwnCertResponse`] is a credential this client can
+/// actually present, before adopting it.
+///
+/// The pin already makes a *hostile* answer here unreachable: reaching this
+/// point means the far end proved possession of the very seed being presented,
+/// and anyone holding that seed already has the self-key tier on that node.
+/// So this is not a trust boundary — it is the difference between a failure
+/// that names what is wrong and one that does not. Without it a node that
+/// answered with a certificate for some other key (a provisioning mistake, a
+/// half-finished `SetAuth`, a corrupted store) would be adopted here and
+/// refused at the *far* end, which answers a deliberately generic
+/// "authentication denied" and leaves the operator with nothing to go on.
+///
+/// Two checks, and deliberately not a third:
+///
+/// * the certificate parses, and names the key this client will prove in the
+///   handshake — the mismatch the far end would report as `KeyMismatch`;
+/// * it belongs to the same mesh as the anchor served beside it, which is what
+///   makes the response's "both halves together" invariant real rather than
+///   merely asserted. This is the only reader that field has.
+///
+/// **Not** expiry, and not the root signature. Both are the far end's to
+/// judge, and it is authoritative where this client is not: validating them
+/// here would let a skewed clock on an operator's laptop refuse a certificate
+/// the mesh accepts, turning a working flow into a confusing local failure.
+fn check_usable(
+    pair: &GetOwnCertResponse,
+    pin: &[u8; 32],
+    node_addr: &NodeAddr,
+) -> anyhow::Result<()> {
+    let cert = wayfinder_auth::MembershipCert::from_bytes(&pair.cert).ok_or_else(|| {
+        anyhow!("{node_addr} returned {} bytes that are not a membership certificate this build can parse", pair.cert.len())
+    })?;
+    if &cert.ed_pubkey != pin {
+        bail!(
+            "{node_addr} returned a certificate for a different key than the identity              being presented, so nothing would accept it. The node is running under an              identity this client does not hold — check that --identity names that              node's own seed."
+        );
+    }
+    let anchor = wayfinder_auth::TrustAnchor::from_bytes(&pair.trust_anchor)
+        .ok_or_else(|| anyhow!("{node_addr} returned a trust anchor this build cannot parse"))?;
+    let (cert_mesh, anchor_mesh) = (cert.mesh_id.get(), anchor.mesh_id);
+    if cert_mesh != anchor_mesh {
+        bail!(
+            "{node_addr} returned a certificate for mesh {cert_mesh:#x} alongside the              anchor of mesh {anchor_mesh:#x}; the node's own credential does not hang              together, which is a fault on that node rather than a usable certificate."
+        );
+    }
+    Ok(())
 }
 
 /// Parse a 32-byte Ed25519 key from `s`, accepting either a colon-delimited or a
@@ -525,6 +642,30 @@ impl Client {
         {
             ResponseKind::SecurityStatus(status) => Ok(status),
             other => Err(unexpected("SecurityStatus", &other)),
+        }
+    }
+
+    /// Fetch the membership certificate this node is running under, with the
+    /// trust anchor it chains to.
+    ///
+    /// The pair is public: a membership certificate is public-key material plus
+    /// the root's signature over it, every field of which
+    /// [`security_status`](Self::security_status) already reports, and the
+    /// anchor is the key peers verify it against. What it saves is a
+    /// second enrollment: a client holding the node's identity seed can present
+    /// the node's own certificate elsewhere without asking a certificate
+    /// authority to reissue one the node already has.
+    ///
+    /// Errors on a node that holds no certificate at all; the message is
+    /// [`NO_MEMBERSHIP_CERT`](wayfinder_protos::service::NO_MEMBERSHIP_CERT),
+    /// which is a state an operator can fix rather than a transport failure.
+    pub async fn own_cert(&mut self) -> anyhow::Result<GetOwnCertResponse> {
+        match self
+            .request(RequestKind::GetOwnCert(GetOwnCertRequest {}))
+            .await?
+        {
+            ResponseKind::OwnCert(resp) => Ok(resp),
+            other => Err(unexpected("OwnCert", &other)),
         }
     }
 
@@ -1284,6 +1425,7 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
         ResponseKind::SetUserRole(_) => "SetUserRole",
         ResponseKind::SetUserEnabled(_) => "SetUserEnabled",
         ResponseKind::BeginUserRegistration(_) => "BeginUserRegistration",
+        ResponseKind::OwnCert(_) => "OwnCert",
     };
     anyhow!("expected {want} response, got {got}")
 }

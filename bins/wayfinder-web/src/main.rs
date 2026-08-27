@@ -142,6 +142,21 @@ async fn main() -> anyhow::Result<()> {
         // are pinned by key, and neither key can be defaulted from an identity
         // — there is none.
         (None, Some(provider_addr)) => {
+            // Refused rather than ignored. `--cert-from` fetches a node's
+            // certificate over a connection proving that node's seed, and this
+            // mode deliberately holds no identity at all — each viewer signs in
+            // for a session certificate of their own. There is nothing for the
+            // flag to act on, and silently dropping a credential argument is
+            // how somebody ends up believing they configured one.
+            //
+            // Not expressible as a clap conflict: `--provider` is this
+            // binary's own argument, while `--cert-from` lives on the shared
+            // `ConnectArgs`, so nothing rejects the pair before this point.
+            if args.connection.cert_from.is_some() {
+                anyhow::bail!(
+                    "--cert-from cannot be combined with --provider: in login mode this                      dashboard holds no identity of its own, so there is no node whose                      certificate it could present. Drop --cert-from, or run in static                      credential mode without --provider."
+                );
+            }
             let node_key = args.connection.node_key.as_deref().ok_or_else(|| {
                 anyhow::anyhow!(
                     "--node-key is required with --provider: a login holds no identity to \
@@ -176,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
 
         // Static credential: one identity for the whole process.
         (None, None) => {
-            let conn = NodeConnection::new(args.connection.target()?);
+            let conn = NodeConnection::new(args.connection.resolve_target().await?);
             // Which credentials are configured, not just the address.
             //
             // A node that has been enrolled refuses any management client that
@@ -192,14 +207,31 @@ async fn main() -> anyhow::Result<()> {
                 node = %conn.label(),
                 identity = ?args.connection.identity_path(),
                 cert = ?args.connection.cert,
+                cert_from = ?args.connection.cert_from,
                 pinned_node_key = args.connection.node_key.is_some(),
                 "node target configured"
             );
-            if args.connection.cert.is_none() {
-                info!(
-                    "no --cert given: authenticating with the identity's own key, which only an \
-                     un-enrolled node accepts. An enrolled node needs an admin certificate."
-                );
+            // Gated on `cert_from` too, not `cert` alone. Under `--cert-from` a
+            // certificate *was* fetched and will be presented, while `--cert`
+            // is necessarily `None` (clap forbids both) — so keying this on
+            // `--cert` alone made the one message written to explain an
+            // otherwise unexplainable denial state the opposite of the truth.
+            match (&args.connection.cert, &args.connection.cert_from) {
+                (None, None) => info!(
+                    "no certificate given: authenticating with the identity's own key, which \
+                     only an un-enrolled node accepts. An enrolled node needs an admin \
+                     certificate."
+                ),
+                // A node's own certificate carries membership, not a management
+                // capability, so it is admitted at the member tier and reads
+                // nothing. Said plainly here because the node's denial will not.
+                (None, Some(source)) => info!(
+                    %source,
+                    "presenting the certificate fetched from this node. If it carries no \
+                     admin capability the node will refuse every query — --cert-from is for \
+                     presenting a device identity elsewhere, not for reading this node."
+                ),
+                (Some(_), _) => {}
             }
             // Said every time, not only on a non-loopback bind: this is the
             // mode where the process *is* the credential, so whoever reaches

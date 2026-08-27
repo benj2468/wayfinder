@@ -72,6 +72,28 @@ pub struct ConnectArgs {
     #[arg(long, global = true, env = "WAYFINDER_CERT")]
     pub cert: Option<PathBuf>,
 
+    /// Address of the node to fetch this client's membership certificate from,
+    /// instead of reading one with `--cert`.
+    ///
+    /// For an operator standing on a node's own host who needs to present that
+    /// node's certificate somewhere else — asking the certificate authority for
+    /// a VPN credential, say. The node already holds the certificate it
+    /// enrolled with, so this asks it over the management API rather than
+    /// making the operator run a second enrollment to obtain a copy.
+    ///
+    /// It changes only the credential presented, never where this client
+    /// connects: `--connect` still names the far end. The node named here is
+    /// pinned to `--identity`'s own public key and cannot be pointed elsewhere
+    /// — a certificate is useful only to the holder of the key it names, so the
+    /// node holding a useful one is the node whose seed `--identity` is.
+    #[arg(
+        long,
+        global = true,
+        env = "WAYFINDER_CERT_FROM",
+        conflicts_with = "cert"
+    )]
+    pub cert_from: Option<NodeAddr>,
+
     /// The node's Ed25519 public key (64 hex chars) to pin, so a man-in-the-
     /// middle can't impersonate it. When omitted it defaults to the public key
     /// of `--identity` — correct when bootstrapping a node with its own seed,
@@ -86,7 +108,7 @@ pub struct ConnectArgs {
     /// `--identity`/`--cert`/`--node-key` cannot be combined with this (clap
     /// rejects it, since they'd imply a TLS handshake this transport never
     /// performs); `--connect` is simply unused.
-    #[arg(long, global = true, conflicts_with_all = ["identity", "cert", "node_key"])]
+    #[arg(long, global = true, conflicts_with_all = ["identity", "cert", "cert_from", "node_key"])]
     pub serial: Option<String>,
 
     /// Baud rate for `--serial`. An embedded management port is USB CDC-ACM
@@ -134,6 +156,26 @@ impl ConnectArgs {
             self.cert.as_deref(),
             self.node_key.as_deref(),
         )?))
+    }
+
+    /// Resolve these arguments into a connect target, asking the node named by
+    /// `--cert-from` for a certificate when one is given.
+    ///
+    /// The async counterpart to [`target`](Self::target), and what a caller
+    /// should reach for by default: it is the same resolution plus the one step
+    /// that cannot be done from disk, and it degrades to exactly `target` when
+    /// no `--cert-from` was passed. `target` stays for a caller that has no
+    /// runtime to await on.
+    ///
+    /// A serial target is returned untouched: that transport performs no
+    /// handshake, so it has no certificate to present, and clap has already
+    /// refused the combination.
+    pub async fn resolve_target(&self) -> anyhow::Result<ConnectTarget> {
+        let mut target = self.target()?;
+        if let (ConnectTarget::Tls(endpoint), Some(source)) = (&mut target, &self.cert_from) {
+            endpoint.load_cert_from_node(source).await?;
+        }
+        Ok(target)
     }
 }
 
@@ -255,6 +297,46 @@ mod tests {
             }
             ConnectTarget::Serial { .. } => panic!("no --serial was given"),
         }
+    }
+
+    /// `--cert-from` names a node to ask for a certificate, in the same
+    /// address syntax `--connect` takes.
+    #[test]
+    fn cert_from_takes_a_node_address() {
+        let args = parse(&["--cert-from", "127.0.0.1:7700"]);
+        let from = args.cert_from.expect("--cert-from was given");
+        assert_eq!(from.host(), "127.0.0.1");
+        assert_eq!(from.port(), 7700);
+        assert!(parse(&[]).cert_from.is_none(), "opt-in, with no default");
+    }
+
+    /// A certificate comes from a file or from a node, never from both: two
+    /// sources silently disagreeing about which credential is being presented
+    /// is the failure this rules out, and clap rules it out at parse time
+    /// rather than by a precedence rule nobody would remember.
+    #[test]
+    fn cert_from_cannot_be_combined_with_a_cert_file() {
+        assert!(
+            Harness::try_parse_from(["harness", "--cert", "c", "--cert-from", "127.0.0.1:7700"])
+                .is_err()
+        );
+    }
+
+    /// A serial port performs no handshake, so there is no certificate for it
+    /// to present and nothing for `--cert-from` to supply — refused alongside
+    /// the other TLS credentials rather than silently ignored.
+    #[test]
+    fn cert_from_cannot_be_combined_with_a_serial_port() {
+        assert!(
+            Harness::try_parse_from([
+                "harness",
+                "--serial",
+                "/dev/ttyACM0",
+                "--cert-from",
+                "127.0.0.1:7700"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

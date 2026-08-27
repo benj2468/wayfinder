@@ -37,6 +37,7 @@ use wayfinder_protos::service::NeighborPathData;
 use wayfinder_protos::service::NodeMetricsData;
 use wayfinder_protos::service::NodeSecurityData;
 use wayfinder_protos::service::OgmScheduleEntryData;
+use wayfinder_protos::service::OwnCertData;
 use wayfinder_protos::service::RouteResolutionData;
 use wayfinder_protos::service::RouterDataProvider;
 use wayfinder_protos::service::RoutingEntryData;
@@ -639,6 +640,19 @@ impl<
                 EgressInterface::All => EgressDecisionData::AllInterfaces,
                 EgressInterface::Interface(idx) => EgressDecisionData::Interface(idx as u32),
             }),
+        })
+    }
+
+    fn own_cert(&self) -> Option<OwnCertData> {
+        // Straight off the live auth state, so this reports what the node is
+        // *running* under. Which is the whole value: an operator asking a node
+        // for its certificate gets the one its OGMs are signed with, whether
+        // that arrived through `set_auth` at runtime or out of a file at
+        // startup, with no second source of truth that could disagree.
+        let auth = self.router.auth()?;
+        Some(OwnCertData {
+            cert: auth.own_cert().as_bytes().to_vec(),
+            trust_anchor: auth.anchor().to_bytes().to_vec(),
         })
     }
 
@@ -1954,6 +1968,59 @@ mod tests {
         assert!(!status.auth_enabled, "no certificate yet");
         assert_eq!(status.own_ed_pubkey, kp.ed_pubkey().to_vec());
         assert_eq!(status.own_x_pubkey, kp.x_pubkey().to_vec());
+    }
+
+    /// The certificate a node runs under is readable over the management API,
+    /// as the exact bytes it was installed with, paired with the anchor it
+    /// chains to. That pairing is the point: a caller gets a usable credential
+    /// from one request, rather than a certificate it must then go and find an
+    /// anchor for.
+    ///
+    /// Read from live router state, so this is the certificate the node is
+    /// *running* under — an `SetAuth` install and a file loaded at startup are
+    /// indistinguishable here, which is what makes one client work against
+    /// both.
+    #[test]
+    fn own_cert_reports_the_installed_pair_verbatim() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
+        ca.set_now_unix(1_000);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let cert = ca_issue(
+            &mut ca,
+            &kp.derived_mac().0,
+            &kp.ed_pubkey(),
+            &kp.x_pubkey(),
+        );
+        let anchor = ca.trust_anchor_bytes();
+        let mut store = RecordingStore::default();
+        let mut adapter = RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_epoch_unix(Duration::from_secs(1_000))
+            .with_settings(&mut store);
+        adapter.set_auth(&[3; 32], &cert, &anchor).unwrap();
+
+        let pair = adapter.own_cert().expect("the node is certified");
+
+        assert_eq!(pair.cert, cert);
+        assert_eq!(pair.trust_anchor, anchor);
+    }
+
+    /// A node with no auth installed has no certificate to report, and says so
+    /// rather than reporting an empty one — a client that presented an empty
+    /// certificate would be refused by the far end for a reason that named
+    /// neither this node nor the missing enrollment.
+    #[test]
+    fn own_cert_is_absent_on_an_uncertified_node() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut identity_seed = Some([3u8; 32]);
+
+        let adapter =
+            RouterAdapter::new(&mut router, Duration::ZERO).with_identity(&mut identity_seed);
+
+        assert!(
+            adapter.own_cert().is_none(),
+            "an identity is not a certificate: the node has a key but nothing signed it"
+        );
     }
 
     /// A node whose identity was never handed to the adapter reports none,
