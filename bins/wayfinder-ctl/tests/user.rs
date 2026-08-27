@@ -339,6 +339,49 @@ fn the_offline_listing_shows_an_outstanding_invitation() {
     assert!(ca.list_user_invites().is_empty());
 }
 
+/// An invitation that expired yesterday is not shown as one an operator can
+/// still expect somebody to redeem.
+///
+/// `open` deliberately does not set a clock — nothing else in `user` needs one
+/// — but `list_user_invites` filters on exactly that clock, and an unset clock
+/// is zero. `invite_is_live` reads zero as "now is the epoch", under which no
+/// expiry has arrived yet and every dead invitation is live: the listing an
+/// admin triages by shows rows that can never produce an account, and the
+/// `STARTED` column that means *act now* alongside them.
+#[test]
+fn an_expired_invitation_is_not_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("ca.json");
+    seed_state(&state);
+
+    // Minted a day ago with a one-hour lifetime: dead by any clock the operator
+    // running this command has.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    {
+        let mut ca = CertAuthority::from_config(&[1u8; 32], &config(&state)).unwrap();
+        ca.set_now_unix(now - 86_400);
+        ca.create_user_invite("rowan", UserRole::Viewer, 900, 3600)
+            .unwrap();
+    }
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_wayfinder-ctl"))
+        .args(["user", "invites", "--state", state.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let printed = String::from_utf8(output.stdout).unwrap();
+
+    assert!(
+        !printed.contains("rowan"),
+        "an invitation that expired yesterday cannot produce an account, and \
+         listing it tells the admin the opposite:\n{printed}"
+    );
+    assert!(printed.contains("no invitations"), "got:\n{printed}");
+}
+
 /// The 20-byte TOTP secret an `otpauth://` URI carries, for a test that has to
 /// present a live code the way an authenticator app would.
 fn secret_from_uri(uri: &str) -> Vec<u8> {

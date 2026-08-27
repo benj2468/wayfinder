@@ -239,6 +239,18 @@ pub fn run(cmd: UserCommand) -> anyhow::Result<()> {
 /// state file's other sections round-trip untouched: `CaLog` loads and rewrites
 /// the whole snapshot, so the issued log, held CSRs and policy overrides come
 /// back exactly as they went in.
+///
+/// **The clock comes with `from_config`**, which puts the authority on
+/// `Clock::System` — so every command here reads the host clock, not only the
+/// one that mints a window.
+///
+/// That used to be missing, and the failure was quiet. A freshly loaded
+/// authority's time was zero, and zero is not "no opinion": `invite_is_live`
+/// reads it as *now is the epoch*, under which no expiry has arrived yet. So
+/// `user invites` listed invitations that died days ago as though somebody might
+/// still redeem them, and every mutating command's expiry sweep quietly swept
+/// nothing. Nothing here sets a time explicitly any more, because pinning one at
+/// `open` would reintroduce the same shape a command at a time.
 fn open(state: &Path) -> anyhow::Result<CertAuthority> {
     let cfg = wayfinder::config::ProviderConfig {
         root_seed_path: String::new(),
@@ -354,10 +366,6 @@ fn invite(
     invite_ttl: u64,
 ) -> anyhow::Result<()> {
     let mut ca = open(state)?;
-    // `open` does not set the clock — nothing else in this module needs one —
-    // but an invitation has a window, and the authority refuses to mint one
-    // against a zero clock rather than issuing something already expired.
-    ca.set_now_unix(now_unix()?);
     let role = if admin {
         UserRole::Admin
     } else {
@@ -419,18 +427,6 @@ fn revoke_invite(state: &Path, username: &str) -> anyhow::Result<()> {
         .map_err(anyhow::Error::msg)?;
     println!("revoked the invitation for {username}");
     Ok(())
-}
-
-/// The host's wall clock in unix seconds.
-///
-/// The offline tool runs on a Linux box with a clock, so unlike a node this can
-/// simply read one — and must, since an invitation's expiry is meaningless
-/// otherwise.
-fn now_unix() -> anyhow::Result<u64> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .context("reading the system clock")
 }
 
 /// Print the accounts on file.

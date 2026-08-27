@@ -554,11 +554,20 @@ pub async fn serve_authority(mut ca: CertAuthority, ports: AuthorityPorts) {
     }
     tracing::info!("certificate-authority task started");
 
+    // No clock is pushed in here, and that absence is the fix rather than an
+    // omission. This line used to be `ca.set_now_unix(facts.borrow().unix_secs)`
+    // — the authority borrowing the router's notion of now — and the router
+    // publishes only when its loop wakes, which on a provider with no mesh
+    // interfaces is once an hour. An authority request never wakes it either:
+    // the connection task routes an `Authority` facet straight to this channel,
+    // past the router loop entirely. So "now" froze between wakeups, and with it
+    // every expiry this authority enforces — including an invitation's, which is
+    // a bearer token that outlived its stated life and still redeemed.
+    //
+    // A provider is built by `CertAuthority::from_config`, which puts it on
+    // `Clock::System`: it reads the host clock at the moment it needs an answer,
+    // so there is no stored instant left to go stale.
     while let Some(command) = commands.recv().await {
-        // Take the router's clock for this command. Read, never awaited: the
-        // loop that publishes it must never be waiting on this task.
-        ca.set_now_unix(facts.borrow().unix_secs);
-
         match command {
             AuthorityCommand::Request(request, reply) => {
                 let (returned_ca, response, signed) =
@@ -738,8 +747,27 @@ mod tests {
         [0, 0, 0, 0, 0, n]
     }
 
+    /// An authority with **no clock**, for a test whose subject is the
+    /// fail-closed state.
+    ///
+    /// `CertAuthority::new` starts at `Clock::Fixed(0)`; only `from_config` —
+    /// the production path — takes `Clock::System`. Most tests here want
+    /// [`clocked_authority`] instead.
     fn authority() -> CertAuthority {
         CertAuthority::new(&[9u8; 32], 0xABCD, 10_000, None, true)
+    }
+
+    /// An authority pinned to [`NOW_UNIX`], which is what a test driving
+    /// `serve_authority` needs.
+    ///
+    /// The task does not push a clock in — a provider reads the host clock
+    /// itself — so a test that wants issuing to work sets one here rather than
+    /// publishing it on `facts`. Pinned rather than `Clock::System` because
+    /// every window these tests assert on is measured from `NOW_UNIX`.
+    fn clocked_authority() -> CertAuthority {
+        let mut ca = authority();
+        ca.set_now_unix(NOW_UNIX);
+        ca
     }
 
     /// The instant every test in this module runs at.
@@ -842,7 +870,7 @@ mod tests {
     }
 
     /// The regression this whole design most needs pinned: an authority that
-    /// never receives the router's clock refuses to issue anything.
+    /// has no usable clock refuses to issue anything.
     ///
     /// `now_unix == 0` is fail-closed in `submit_csr`, `authenticate_user` and
     /// `revoke`, so a task wired up without the clock would answer every
@@ -851,7 +879,7 @@ mod tests {
     /// test is what makes a future refactor that drops the clock go red here
     /// rather than in production.
     #[tokio::test]
-    async fn an_authority_issues_only_once_the_router_has_published_a_clock() {
+    async fn an_authority_with_no_usable_clock_refuses_to_issue() {
         let mut ca = authority();
 
         // Clock never set: this is the shape of the bug.
@@ -863,7 +891,9 @@ mod tests {
             "an authority with no clock must refuse to issue, not issue badly"
         );
 
-        // The clock the router publishes is what makes it work.
+        // A clock — any clock — is what makes it work. Which one is the
+        // authority's own business now: a provider is built by `from_config`
+        // and reads the host's, and a test says so explicitly.
         ca.set_now_unix(NOW_UNIX);
         let mut adapter = AuthorityAdapter::new(&mut ca, facts(true));
         let outcome = adapter
@@ -872,22 +902,34 @@ mod tests {
         assert!(matches!(outcome, CsrOutcome::Issued(_)));
     }
 
-    /// The task applies the published clock before serving, so the wiring in
-    /// `serve_authority` — not just `CertAuthority` — is what is under test.
+    /// The authority stamps a certificate from **its own** clock, and the
+    /// router's published time has no say in it.
     ///
-    /// Asserts the issued certificate's validity window against the *value* the
-    /// router published, not merely that a certificate came back. Zero-vs-nonzero
-    /// is already covered next door; what this adds is the drift the module
-    /// header warns about — an epoch published without the elapsed time,
-    /// milliseconds where seconds were meant, a snapshot taken once at startup.
-    /// Every one of those still issues, and still issues a certificate the mesh
-    /// will reject.
+    /// This test used to assert the opposite — that `serve_authority` applied
+    /// the value on `facts` — and that coupling was the bug. The router
+    /// publishes only when its loop wakes, once an hour on a provider with no
+    /// mesh interfaces, and an authority request never wakes it; so the
+    /// authority's "now" froze between wakeups and every expiry froze with it.
+    ///
+    /// The facts channel here publishes a *deliberately absurd* time, and the
+    /// certificate must be stamped from the authority's clock regardless. What
+    /// that pins is the absence of the old path: if anything ever starts pushing
+    /// `facts.unix_secs` into the authority again, this goes red.
+    ///
+    /// It still asserts the window's exact *value* rather than merely that a
+    /// certificate came back, which is what catches the drift the module header
+    /// warns about — milliseconds where seconds were meant, an epoch without the
+    /// elapsed time. Every one of those still issues, and still issues a
+    /// certificate the mesh will reject.
     #[tokio::test]
-    async fn the_task_applies_the_routers_clock_to_every_request() {
+    async fn the_authority_stamps_from_its_own_clock_not_the_routers() {
         use wayfinder_auth::MembershipCert;
         use wayfinder_protos::wayfinder::v1alpha::submit_csr_response::Outcome as CsrOutcomeKind;
 
-        let authority = TestAuthority::start(authority());
+        let authority = TestAuthority::start(clocked_authority());
+        // A time the router has no business imposing, and which no assertion
+        // below will tolerate.
+        authority.comms.set_clock(NOW_UNIX + 999_999);
 
         let response = authority.request(submit_csr(mac(3))).await;
 
@@ -906,7 +948,8 @@ mod tests {
         assert_eq!(
             cert.not_before.get(),
             NOW_UNIX,
-            "the certificate must be stamped with the instant the router published"
+            "the certificate is stamped from the authority's own clock, not from \
+             whatever the router last published"
         );
         assert_eq!(
             cert.not_after.get(),
@@ -920,7 +963,7 @@ mod tests {
     /// policy in force rather than nothing.
     #[tokio::test]
     async fn the_policy_is_published_before_the_first_command_is_served() {
-        let mut authority = TestAuthority::start(authority());
+        let mut authority = TestAuthority::start(clocked_authority());
 
         authority.policy.changed().await.unwrap();
         assert!(
@@ -1012,7 +1055,7 @@ mod tests {
     /// which is what this asserts.
     #[tokio::test]
     async fn a_policy_change_is_readable_as_soon_as_its_reply_lands() {
-        let authority = TestAuthority::start(authority());
+        let authority = TestAuthority::start(clocked_authority());
 
         let (reply_tx, reply_rx) = oneshot::channel();
         authority
@@ -1049,7 +1092,7 @@ mod tests {
     /// acknowledgement returning — is only exercised here.
     #[tokio::test]
     async fn a_signed_revocation_crosses_to_the_router_and_its_verdict_returns() {
-        let mut authority = TestAuthority::start(authority());
+        let mut authority = TestAuthority::start(clocked_authority());
 
         // Sent, not awaited: the authority blocks on the router's verdict
         // below, so awaiting the reply here would deadlock the test.
@@ -1084,7 +1127,7 @@ mod tests {
     /// how an operator ends up believing a node is off the mesh when it is not.
     #[tokio::test]
     async fn a_revocation_the_router_refuses_is_reported_as_not_flooded() {
-        let mut authority = TestAuthority::start(authority());
+        let mut authority = TestAuthority::start(clocked_authority());
 
         let (reply_tx, reply_rx) = oneshot::channel();
         authority
@@ -1104,6 +1147,99 @@ mod tests {
                 e.message
             ),
             other => panic!("expected an error reporting the failed flood, got {other:?}"),
+        }
+    }
+
+    /// A provider on the production clock stamps from real wall time, with the
+    /// router's published time playing no part.
+    ///
+    /// This replaces a regression test for the coupling bug — an invitation that
+    /// outlived its expiry and still redeemed, because `serve_authority` pushed
+    /// `facts.unix_secs` into the authority and the router publishes that only
+    /// when its loop wakes, once an hour on a provider with no mesh interfaces.
+    /// That test drove a virtual clock through the workaround. The coupling is
+    /// gone rather than mitigated now, so what is worth asserting is the
+    /// arrangement that replaced it, end to end through the task.
+    ///
+    /// The expiry property itself did not move: it is covered deterministically
+    /// by `an_expired_invite_and_an_expired_handle_are_each_refused` in
+    /// `authority.rs`, on a fixed clock, where it belongs.
+    ///
+    /// `Clock::System` is otherwise exercised only in production — `from_config`
+    /// is the sole path that selects it — so without this nothing would notice
+    /// it being mis-wired.
+    #[tokio::test]
+    async fn a_provider_on_the_system_clock_stamps_from_real_time() {
+        use wayfinder_auth::MembershipCert;
+        use wayfinder_protos::wayfinder::v1alpha::submit_csr_response::Outcome as CsrOutcomeKind;
+
+        let mut ca = authority();
+        // What `CertAuthority::from_config` gives every real provider.
+        ca.set_clock(crate::Clock::System);
+        let authority = TestAuthority::start(ca);
+        // A time from the router that no assertion below will tolerate.
+        authority.comms.set_clock(NOW_UNIX);
+
+        let response = authority.request(submit_csr(mac(4))).await;
+
+        let Some(RespKind::SubmitCsr(csr)) = &response.response else {
+            panic!(
+                "expected an issued certificate, got {:?}",
+                response.response
+            );
+        };
+        let Some(CsrOutcomeKind::Issued(issued)) = &csr.outcome else {
+            panic!("expected an issued certificate, got {:?}", csr.outcome);
+        };
+        let cert = MembershipCert::from_bytes(&issued.cert).expect("a real certificate");
+
+        let host_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the test host's clock is after the epoch")
+            .as_secs();
+        let stamped = cert.not_before.get();
+        assert_ne!(
+            stamped, NOW_UNIX,
+            "the router's published time must not reach the authority at all"
+        );
+        assert!(
+            stamped.abs_diff(host_now) <= 5,
+            "a provider stamps from the host clock: got {stamped}, host says {host_now}"
+        );
+    }
+
+    /// The fail-closed zero does not age into a valid time.
+    ///
+    /// `Clock::Fixed(0)` is the "no clock yet" sentinel every issuing path
+    /// refuses, and the thing to pin is that elapsed time alone never resolves
+    /// it. An hour of the task running must not turn an authority that was
+    /// never given a clock into one happily issuing certificates dated a few
+    /// seconds past the epoch — which the mesh would reject while the operator
+    /// saw success.
+    ///
+    /// Distinct from `an_authority_with_no_usable_clock_refuses_to_issue`, which
+    /// asks the same question of `CertAuthority` directly at a single instant.
+    /// This one asks it of the running task, across time.
+    #[tokio::test(start_paused = true)]
+    async fn a_clock_that_was_never_set_stays_the_fail_closed_zero() {
+        let mut comms = AuthorityComms::new(0);
+        let (commands, commands_rx) = mpsc::channel(4);
+        let ports = comms.attach(commands_rx);
+        // `authority()` is the no-clock constructor: `Clock::Fixed(0)`.
+        tokio::spawn(serve_authority(authority(), ports));
+
+        // An hour passes and nothing gives this authority a clock.
+        tokio::time::advance(core::time::Duration::from_secs(3600)).await;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands
+            .send(AuthorityCommand::Request(submit_csr(mac(4)), reply_tx))
+            .await
+            .expect("the authority task is running");
+
+        match reply_rx.await.expect("the authority answers").response {
+            Some(RespKind::Error(_)) => {}
+            other => panic!("an authority with no clock must refuse to issue, got {other:?}"),
         }
     }
 }
