@@ -425,25 +425,29 @@ pub fn UserTable(
                         // two controls, not about any one account.
                         <th>
                             <span class="wf-sr-only">"Actions"</span>
+                            // A definition list, not paragraphs: the reader is
+                            // here to tell two buttons apart, and the terms
+                            // being the words on those buttons is the whole
+                            // answer. Prose made both names something to find
+                            // rather than something to compare.
                             <Hint label="Revoke" id="wf-hint-account-actions">
-                                <p>
-                                    <strong>"Revoke"</strong>
-                                    " ends every session the account is signed in with right \
-                                     now — on every device — and leaves the account alone. It \
-                                     can sign in again straight away. Reach for it when a \
-                                     laptop or phone goes missing and the person still works \
-                                     here."
-                                </p>
-                                <p>
-                                    <strong>"Remove"</strong>
-                                    " does that and then deletes the account, so it cannot \
-                                     sign in again at all."
-                                </p>
-                                <p>
-                                    "Both take effect across the whole mesh and neither can \
-                                     be undone. A session already connected to a node can \
-                                     keep working for up to a minute; anything reconnecting \
-                                     is refused straight away."
+                                <dl class="wf-hint-defs">
+                                    <dt>"Revoke"</dt>
+                                    <dd>
+                                        "Signs the account out on every device. It can sign \
+                                         in again right away — reach for it when a laptop or \
+                                         phone goes missing."
+                                    </dd>
+                                    <dt>"Remove"</dt>
+                                    <dd>
+                                        "Signs it out everywhere, then deletes the account. \
+                                         It cannot sign in again."
+                                    </dd>
+                                </dl>
+                                <p class="wf-hint-foot">
+                                    "Both apply across the whole mesh and neither can be \
+                                     undone. A connection already open can keep working for \
+                                     up to a minute."
                                 </p>
                             </Hint>
                         </th>
