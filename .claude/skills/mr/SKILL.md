@@ -19,7 +19,7 @@ MR diff is exactly the intended change. If it wasn't, say so before proceeding
 These block the MR if they fail, so run them first and fix anything broken:
 
 ```bash
-cargo test --workspace
+cargo nextest run --workspace
 nix fmt
 cargo clippy --workspace
 ```

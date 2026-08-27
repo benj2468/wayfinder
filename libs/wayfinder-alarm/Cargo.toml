@@ -47,7 +47,7 @@ tracing-subscriber.workspace = true
 
 # The same `tracing`, with `std` back on: `subscriber::set_default` — the scoped
 # subscriber those tests install — is gated behind it. A dev-dependency, so the
-# feature reaches the library only under `cargo test`; a real embedded build
+# feature reaches the library only under `nextest run`; a real embedded build
 # resolves the `default-features = false` entry above and never sees it. Which
 # is why `cargo build --target thumbv7em-none-eabihf` is part of this crate's
 # verification: a green host test run would not notice `std` creeping in.

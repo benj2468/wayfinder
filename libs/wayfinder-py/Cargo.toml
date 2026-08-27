@@ -38,7 +38,7 @@ pyo3 = { version = "0.29", features = ["abi3-py310"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [features]
-# Off by default so plain `cargo build`/`cargo test` in this crate link a
+# Off by default so plain `cargo build`/`nextest run` in this crate link a
 # normal embeddable libpython; `maturin` passes this explicitly (see
 # pyproject.toml) to build the portable, dlopen-loaded extension module.
 extension-module = ["pyo3/extension-module"]

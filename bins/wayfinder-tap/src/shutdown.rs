@@ -120,7 +120,7 @@ mod tests {
     ///
     /// `libc::raise` is process-wide and so is tokio's signal registry, so the
     /// `SIGTERM` test below wakes *any* concurrently-running test that happens
-    /// to be inside `run_until_shutdown` — and `cargo test` runs them on
+    /// to be inside `run_until_shutdown` — and `cargo nextest run` runs them on
     /// several threads in one process. Held across each test, only one stream
     /// is ever subscribed when the signal lands. Without it this suite fails
     /// intermittently and points at the wrong test.
