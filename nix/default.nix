@@ -1,30 +1,5 @@
 { pkgs, src, ... }:
-let
-  # One toolchain for every package here, deliberately.
-  #
-  # crane keys `cargoArtifacts` on the toolchain, so two toolchains mean two
-  # full compiles of the same lockfile. Of the 507 packages in `Cargo.lock`,
-  # 404 are reachable from tap/tui/ctl and 387 from the web dashboard — 298 of
-  # them from both. Building the host binaries against nixpkgs' rustc and the
-  # dashboard against a fenix one paid for those 298 twice.
-  #
-  # `bins/wayfinder-web` is what constrains the choice: `cargo leptos` compiles
-  # it twice, once for the host and once for wasm32, and nixpkgs' rustc carries
-  # no wasm32 `rust-std`. So everything builds on a fenix toolchain that has
-  # one, and the host binaries share the dashboard's dependency layer rather
-  # than growing a second one.
-  #
-  # Stable, not the devShell's nightly: nightly 1.99 hits an internal compiler
-  # error building tokio at `opt-level=3`, which is exactly what the release
-  # builds here perform. Nothing here needs nightly.
-  toolchain = pkgs.fenix.combine [
-    pkgs.fenix.stable.minimalToolchain
-    pkgs.fenix.targets.wasm32-unknown-unknown.stable.rust-std
-  ];
-
-  craneLib = pkgs.craneLib.overrideToolchain toolchain;
-in
-with craneLib;
+with pkgs.craneLib;
 let
   protoFilter = path: type: builtins.match ".*proto$" path != null;
   # `bins/wayfinder-web`'s stylesheet is a build input to `cargo leptos`, and
@@ -51,19 +26,6 @@ let
     ];
   };
 
-  # One dependency layer for every package below, host target only.
-  #
-  # Carrying the wasm32 dependencies that `bins/wayfinder-web`'s hydration half
-  # needs was tried twice and abandoned; crane's artifact model does not hold
-  # two targets in one layer. Chaining a wasm-scoped `buildDepsOnly` onto this
-  # one pruned the inherited host artifacts from 2351 `release/deps` entries to
-  # 289, so web recompiled its `ssr` half: 450 crates in-derivation, against 313
-  # with no wasm layer at all. Running the wasm build from this derivation's
-  # `postBuild` fared worse still — no wasm artifacts survived into the output
-  # (0 entries) and the host half fell to 1237, degrading tap/tui/ctl too.
-  #
-  # So the hydration half's dependencies are compiled inside the `wayfinder-web`
-  # derivation on every build. That is the remaining known waste here.
   cargoArtifacts = buildDepsOnly commonArgs;
 
   mkWayfinderPkg =
@@ -83,18 +45,37 @@ let
 
   # The web dashboard is built by `cargo-leptos`, not plain `cargo`, because it
   # compiles the crate twice: the axum server for the host and a hydration
-  # bundle for wasm32. Both halves come out of the same `craneLib` as
-  # tap/tui/ctl — see the toolchain note at the top for why that is one
-  # toolchain and not two.
-  wayfinder-web = buildPackage (
+  # bundle for wasm32. That needs a toolchain carrying wasm32's `rust-std`,
+  # which nixpkgs' rustc does not — so this package gets its own crane
+  # instance rather than switching the toolchain under `tap`/`tui`/`ctl` and
+  # rebuilding all of them.
+  # Stable, not the devShell's nightly: nightly 1.99 hits an internal compiler
+  # error building tokio at `opt-level=3`, which is exactly what the release
+  # build this package performs does. Nothing here needs nightly.
+  webToolchain = pkgs.fenix.combine [
+    (pkgs.fenix.stable.withComponents [
+      "cargo"
+      "rustc"
+      "rust-src"
+    ])
+    pkgs.fenix.targets.wasm32-unknown-unknown.stable.rust-std
+  ];
+  craneLibWeb = pkgs.craneLib.overrideToolchain webToolchain;
+
+  wayfinder-web = craneLibWeb.buildPackage (
     commonArgs
     // {
       pname = "wayfinder-web";
-      # The same layer tap/tui/ctl use. It covers this crate's host (`ssr`) half;
-      # the wasm32 half is a different target and is not in there, so
-      # `cargo leptos` recompiles its dependencies here — see the note on
-      # `cargoArtifacts` for why that is not cached.
-      inherit cargoArtifacts;
+      # Deliberately not sharing `cargoArtifacts`: those were built by a
+      # different toolchain and for the host target only, so they are of no use
+      # to the wasm half and cannot be reused across toolchains anyway.
+      cargoArtifacts = craneLibWeb.buildDepsOnly (
+        commonArgs
+        // {
+          pname = "wayfinder-web-deps";
+          cargoExtraArgs = "-p wayfinder-web --features ssr";
+        }
+      );
       doCheck = false;
 
       # `buildPhaseCargoCommand` below runs `cargo leptos build`, not plain
