@@ -62,9 +62,9 @@ pub enum VpnCommand {
     },
     /// Remove a node's VPN registration, leaving its mesh membership alone.
     ///
-    /// `wayfinderctl revoke` already does this as part of removing a node, so
-    /// this is the retry for the case where that second half failed — which the
-    /// revoke reports rather than hiding. Removing a registration that is
+    /// `wayfinderctl provider revoke` already does this as part of removing a node,
+    /// so this is the retry for the case where that second half failed — which
+    /// the revoke reports rather than hiding. Removing a registration that is
     /// already gone succeeds, so retrying is always safe.
     Revoke {
         /// MAC of the node whose VPN registration to remove.

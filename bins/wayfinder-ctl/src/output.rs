@@ -49,7 +49,8 @@ fn render<T: Serialize>(
 /// An interface's configured name, or `-` when the node reported none.
 ///
 /// Unlike the TUI, `wayfinderctl` keeps the numeric `IFACE` column alongside
-/// this one: the index is what an operator types into `link-enable`/`set-ogm`,
+/// this one: the index is what an operator types into `link enable`/`link
+/// trickle`,
 /// so replacing it with the name would break the copy-paste path.
 pub fn format_iface_name(name: &str) -> &str {
     if name.is_empty() { "-" } else { name }
@@ -166,7 +167,7 @@ pub fn link_quality_table(v: &LinkQualityTable, fmt: OutputFormat) -> anyhow::Re
 }
 
 /// Render the [`LinkFeaturesTable`], with a derived STATUS column (on/off/
-/// mixed) so an operator can confirm a `link-enable`/`link-disable` took
+/// mixed) so an operator can confirm a `link enable`/`link disable` took
 /// effect at a glance.
 pub fn link_features_table(v: &LinkFeaturesTable, fmt: OutputFormat) -> anyhow::Result<String> {
     render(v, fmt, |v| {

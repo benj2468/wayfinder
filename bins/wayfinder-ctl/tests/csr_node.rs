@@ -51,6 +51,7 @@ use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderResponse;
 use wayfinder_server::AuthSnapshot;
 use wayfinderctl::Command;
+use wayfinderctl::auth::AuthCommand;
 use wayfinderctl::cert::CertCommand;
 use wayfinderctl::cert::{self};
 use wayfinderctl::csr::CsrCommand;
@@ -562,6 +563,117 @@ async fn csr_install_certifies_the_identity_the_node_already_holds() {
     );
     assert_eq!(calls[0].cert, std::fs::read(&cert_path).unwrap());
     assert_eq!(calls[0].trust_anchor, std::fs::read(&anchor_path).unwrap());
+}
+
+/// `auth set` is the same `SetAuth` with the opposite intent: it carries a
+/// **non-empty** seed, replacing the node's identity outright.
+///
+/// This is the pair to `csr_install_certifies_the_identity_the_node_already_holds`
+/// above, and the two together are what keep the distinction real. One command
+/// re-identifies a node and one cannot, and the difference is visible on the
+/// wire as the seed field rather than only in the documentation.
+#[tokio::test]
+async fn auth_set_replaces_the_nodes_identity() {
+    let (endpoint, calls) = spawn_node(true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Keypair::from_seed(&[9u8; 32]);
+    let (cert_path, anchor_path) = issue_for_node(dir.path(), &node);
+    let seed_path = dir.path().join("new.seed");
+    std::fs::write(&seed_path, [7u8; 32]).unwrap();
+
+    run_query(
+        Command::Auth(AuthCommand::Set {
+            seed: seed_path,
+            cert: cert_path.clone(),
+            trust_anchor: anchor_path.clone(),
+        }),
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .unwrap();
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "expected exactly one SetAuth");
+    assert_eq!(
+        calls[0].seed,
+        vec![7u8; 32],
+        "auth set must carry the new identity seed"
+    );
+    assert_eq!(calls[0].cert, std::fs::read(&cert_path).unwrap());
+    assert_eq!(calls[0].trust_anchor, std::fs::read(&anchor_path).unwrap());
+}
+
+/// A cross-mesh certificate and anchor are refused before anything is sent.
+///
+/// `auth set` gained this pre-flight when it moved; the check is shared with
+/// `csr install` through `cert::read_credential`, and this pins that `auth set`
+/// actually calls it. A pair that reached the node would leave it unable to
+/// verify its own certificate.
+#[tokio::test]
+async fn auth_set_refuses_a_cross_mesh_pair_without_transmitting() {
+    let (endpoint, calls) = spawn_node(true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Keypair::from_seed(&[9u8; 32]);
+    let (cert_path, _) = issue_for_node(dir.path(), &node);
+    // An anchor from a different mesh entirely, well-formed on its own.
+    let other = wayfinder_auth::Authority::from_seed(&[2u8; 32], 0xBEEF);
+    let anchor_path = dir.path().join("other.anchor");
+    std::fs::write(&anchor_path, other.trust_anchor().to_bytes()).unwrap();
+    let seed_path = dir.path().join("new.seed");
+    std::fs::write(&seed_path, [7u8; 32]).unwrap();
+
+    let err = run_query(
+        Command::Auth(AuthCommand::Set {
+            seed: seed_path,
+            cert: cert_path,
+            trust_anchor: anchor_path,
+        }),
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(err.to_string().contains("mesh_id"), "got: {err}");
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "a refused pair must never reach the node"
+    );
+}
+
+/// A seed that is not 32 bytes is refused locally rather than installed.
+///
+/// The seed is the node's private key; a truncated one is a node that cannot
+/// sign. It is also the one input to `auth set` whose contents are otherwise
+/// unexaminable, so nothing downstream would catch this in a way an operator
+/// could act on.
+#[tokio::test]
+async fn auth_set_refuses_a_short_seed() {
+    let (endpoint, calls) = spawn_node(true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Keypair::from_seed(&[9u8; 32]);
+    let (cert_path, anchor_path) = issue_for_node(dir.path(), &node);
+    let seed_path = dir.path().join("short.seed");
+    std::fs::write(&seed_path, [7u8; 12]).unwrap();
+
+    let err = run_query(
+        Command::Auth(AuthCommand::Set {
+            seed: seed_path,
+            cert: cert_path,
+            trust_anchor: anchor_path,
+        }),
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(err.to_string().contains("32 bytes"), "got: {err}");
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "a refused seed must never reach the node"
+    );
 }
 
 /// The workflow end to end, from an operator who never holds the node's seed:

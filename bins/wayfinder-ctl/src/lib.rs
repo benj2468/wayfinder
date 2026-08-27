@@ -1,25 +1,31 @@
 //! `wayfinderctl` — a command-line client for the Wayfinder management API.
 //!
-//! Three families of subcommands:
-//! * **Query** commands open a [`wayfinder_client::Client`] to a running node
-//!   (TCP or Unix-datagram) and print one management-API response.
-//! * **[`cert`]** commands run entirely offline, minting the seed / certificate
-//!   / trust-anchor files a node loads to join an authenticated mesh.
-//! * **[`csr`]** commands enroll a node that cannot reach the provider, by
-//!   carrying its signing request there as a file and the certificate back.
+//! Subcommands are grouped by subject, and the groups answer four different
+//! questions:
+//! * **The node you name** — `node-info`, `routes`, `keepalive`, `throughput`,
+//!   `metrics`, `logs`, `resolve`, and the [`link`] and [`auth`] groups. These
+//!   open a [`wayfinder_client::Client`] and ask a node about itself.
+//! * **[`provider`]** asks a *different* node — the mesh's certificate
+//!   authority — about the mesh: its members, its enrollment queue, its
+//!   accounts and VPN peers. This is the group that needs its own `--connect`.
+//! * **[`cert`]** runs entirely offline, minting the seed / certificate /
+//!   trust-anchor files a node loads to join an authenticated mesh.
+//! * **[`csr`]** enrolls a node that cannot reach the provider, by carrying its
+//!   signing request there as a file and the certificate back.
 //!
 //! The library surface exists so the renderers and the cert tooling can be unit-
 //! tested; `main.rs` is a thin `clap` front end over [`run`].
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod auth;
 pub mod cert;
 pub mod csr;
+pub mod link;
 pub mod output;
+pub mod provider;
 pub mod session;
 pub mod user;
-
-use std::path::PathBuf;
 
 use anyhow::Context;
 use anyhow::bail;
@@ -34,11 +40,7 @@ pub use wayfinder_client::Endpoint;
 
 pub mod vpn;
 pub use vpn::VpnCommand;
-use wayfinder_protos::wayfinder::v1alpha::CsrIssued;
-use wayfinder_protos::wayfinder::v1alpha::LinkFeatures;
 use wayfinder_protos::wayfinder::v1alpha::authenticate_user_response::Outcome as UserOutcome;
-use wayfinder_protos::wayfinder::v1alpha::link_features::TxKeepaliveUpdate;
-use wayfinder_protos::wayfinder::v1alpha::submit_csr_response::Outcome as CsrOutcome;
 
 use wayfinder_client::ConnectArgs;
 use wayfinder_client::NodeAddr;
@@ -60,8 +62,8 @@ pub struct Cli {
     /// environment variables. Ignored by the subcommands that open no
     /// connection: `cert` (which works on the mesh root seed) and
     /// `login`/`logout`/`whoami` (which work on the stored session file).
-    /// `user` is *not* among them any more — see its module docs for why
-    /// administering accounts through the provider's state file was removed
+    /// `provider user` is *not* among them any more — see its module docs for
+    /// why administering accounts through the provider's state file was removed
     /// rather than documented.
     #[command(flatten)]
     pub connection: ConnectArgs,
@@ -76,49 +78,27 @@ pub struct Cli {
 }
 
 /// Every `wayfinderctl` subcommand.
+///
+/// Grouped by subject rather than by verb, so the read of a setting and the
+/// write of it sit together: an operator looks at a table and then changes a
+/// row in it, and splitting those into "queries" and "set-*" put them several
+/// screens apart in `--help`.
+///
+/// The one axis that is not a subject is [`Command::Provider`], and it earns
+/// its place by being the one thing that changes *which node you are talking
+/// to* — see that module's header.
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Basic identity and capacity of the node.
     NodeInfo,
     /// The BATMAN originator (routing) table.
     Routes,
-    /// The per-(neighbor, interface) link-quality table.
-    Links,
     /// The per-neighbor keep-alive heartbeat liveness table.
     Keepalive,
-    /// The current per-interface participation-feature state (the tx/rx
-    /// OGM/data gates and keep-alive cadence), with a derived on/off/mixed
-    /// status per interface.
-    LinkFeatures,
-    /// Turn a link fully on: set all four participation gates (tx_ogm,
-    /// rx_ogm, tx_data, rx_data) to true. Does not re-arm keep-alive — there
-    /// is no prior cadence to restore, so a link disabled with an armed
-    /// keep-alive stays keep-alive-silent after enabling; arm it explicitly
-    /// with `set-link-features --tx-keepalive-interval-ms` if wanted.
-    LinkEnable {
-        /// Index of the interface to enable, in registration order.
-        #[arg(long)]
-        iface: u32,
-    },
-    /// Turn a link fully off: set all four participation gates to false and
-    /// disarm keep-alive transmission, so a disabled link goes fully silent
-    /// rather than continuing to send heartbeats. This is a routing-layer
-    /// silence, not a transport shutdown — the underlying socket/serial/radio
-    /// stays open and polled.
-    LinkDisable {
-        /// Index of the interface to disable, in registration order.
-        #[arg(long)]
-        iface: u32,
-    },
-    /// The per-interface adaptive OGM emission schedule.
-    OgmSchedule,
     /// Per-interface and node-wide throughput estimates.
     Throughput,
     /// Aggregate node health and topology metrics.
     Metrics,
-    /// Mesh authentication / security posture: auth on/off, the mesh and
-    /// own-cert header, and per-originator verified / expiry / revoked state.
-    Security,
     /// Read recent log records from the node's in-memory ring.
     ///
     /// This is how a board's logs are read with no debug probe attached, and on
@@ -146,149 +126,33 @@ pub enum Command {
         /// Destination identifier: a MAC like `02:00:00:00:00:09`, or raw hex.
         dest: String,
     },
-    /// Set the Trickle/OGM emission bounds for one mesh interface at runtime.
-    /// Applied in memory only — it does not persist across a restart. Resets
-    /// the interface's live Trickle timer, discarding any backoff already
-    /// grown toward the old bound — expect a burst of OGMs shortly after this
-    /// on a live interface. `iface` must refer to an interface the node
-    /// already has configured; this cannot provision a new one.
-    SetTrickleConfig {
-        /// Index of the interface to reconfigure, in registration order.
-        #[arg(long)]
-        iface: u32,
-        /// New backoff floor (Trickle i_min), in milliseconds.
-        #[arg(long)]
-        min_ms: u32,
-        /// New backoff ceiling (Trickle i_max), in milliseconds.
-        #[arg(long)]
-        max_ms: u32,
-    },
-    /// Override one interface's participation features at runtime. Each flag is
-    /// optional (`--tx-ogm true|false`, etc.): omit it to leave that gate
-    /// unchanged, so you can flip one capability without restating the others.
-    /// `--tx-keepalive-interval-ms`/`--tx-keepalive-disable` behave the same
-    /// way but are mutually exclusive with each other (a cadence to arm, or a
-    /// bare disable). Applied in memory only — it does not persist across a
-    /// restart. `--iface` must refer to an interface the node already has
-    /// configured.
-    SetLinkFeatures {
-        /// Index of the interface to reconfigure, in registration order.
-        #[arg(long)]
-        iface: u32,
-        /// Send OGMs (own + re-flooded) onto this link.
-        #[arg(long)]
-        tx_ogm: Option<bool>,
-        /// Receive OGMs on this link and learn routes from them.
-        #[arg(long)]
-        rx_ogm: Option<bool>,
-        /// Send data-plane traffic (unicast/multicast/broadcast) onto this link.
-        /// Also governs route re-advertisement.
-        #[arg(long)]
-        tx_data: Option<bool>,
-        /// Accept data-plane traffic (unicast/multicast/broadcast) on this link.
-        #[arg(long)]
-        rx_data: Option<bool>,
-        /// Arm (or re-arm) keep-alive heartbeat transmission on this link at
-        /// this cadence, in milliseconds. Mutually exclusive with
-        /// `--tx-keepalive-disable`; omit both to leave the schedule
-        /// unchanged.
-        #[arg(long)]
-        tx_keepalive_interval_ms: Option<u64>,
-        /// Disable keep-alive heartbeat transmission on this link. Mutually
-        /// exclusive with `--tx-keepalive-interval-ms`.
-        #[arg(long)]
-        tx_keepalive_disable: bool,
-    },
-    /// Switch lazy cert distribution on or off at runtime. Applied in memory
-    /// only — it does not persist across a restart. A flag-day, wire-
-    /// incompatible switch with un-upgraded auth nodes: only flip this on a
-    /// mesh where every node has already been upgraded.
-    SetLazyCertDistribution {
-        /// `true` to emit an 8-byte cert fingerprint on OGMs instead of the
-        /// full membership cert; `false` to emit the full cert as before.
-        #[arg(long)]
-        enabled: bool,
-    },
-    /// Store authenticate data into the application
-    SetAuth {
-        /// Seed for the node
-        seed: PathBuf,
-        /// Certificate for the node, signed by the CA
-        cert: PathBuf,
-        /// Trust anchor of the CA
-        trust_anchor: PathBuf,
-    },
-    /// Enroll with a provider: generate a keypair, submit a CSR, and write the
-    /// returned certificate and trust anchor (online enrollment).
-    Enroll {
-        /// This node's MAC, bound into the issued certificate. Defaults to the
-        /// MAC deterministically derived from the enrolling keypair (the same
-        /// derivation `wayfinder-tap` applies at startup), so the enrolled
-        /// cert matches the MAC the node will actually run under; pass this to
-        /// override that default.
-        #[arg(long)]
-        mac: Option<String>,
-        /// Enrollment token, if the provider requires one.
-        #[arg(long, default_value = "")]
-        token: String,
-        /// Where to write the generated 32-byte identity seed (secret).
-        #[arg(long)]
-        out_seed: PathBuf,
-        /// Where to write the issued certificate.
-        #[arg(long)]
-        out_cert: PathBuf,
-        /// Where to write the mesh trust anchor.
-        #[arg(long)]
-        out_anchor: PathBuf,
-        /// Do not join the VPN, even if the provider offers a tunnel.
-        ///
-        /// Enrollment otherwise asks for a tunnel credential once the
-        /// certificate is in hand and runs `tailscale up` with it. A provider
-        /// with no VPN configured answers "not configured" and enrollment
-        /// finishes normally either way, so this is for a host that reaches the
-        /// mesh some other way rather than for talking to a CA without one.
-        #[arg(long)]
-        no_vpn: bool,
-        /// Print the `tailscale up` command instead of running it.
-        ///
-        /// For a host where the tunnel daemon is managed elsewhere (a NixOS
-        /// module, a container entrypoint). The preauth key is single-use and
-        /// short-lived, so a printed command has minutes to be used, not days.
-        #[arg(long)]
-        print_vpn_command: bool,
-    },
-    /// Manage the VPN peers registered with the provider's coordination server.
+    /// Per-interface state: link quality, participation features, OGM schedule,
+    /// and the runtime overrides for each.
     #[command(subcommand)]
-    Vpn(vpn::VpnCommand),
-    /// Revoke a node from the mesh (talks to a provider node).
-    Revoke {
-        /// MAC of the node to revoke.
-        #[arg(long)]
-        mac: String,
-    },
-    /// List the certificates a provider node has issued.
-    ListCerts,
+    Link(link::LinkCommand),
+    /// This node's own membership credential: its posture, how it is obtained,
+    /// and how it is advertised.
+    #[command(subcommand)]
+    Auth(auth::AuthCommand),
     /// Enroll a node that cannot reach the provider, by carrying its request
     /// there as a file.
     ///
     /// `request` and `install` talk to the node being **enrolled**: ask it what
     /// to certify, then hand the signed result back. `submit` takes the file in
-    /// between to a **provider** and brings the certificate home, with
-    /// `list`/`approve`/`deny` for acting on what is waiting there. Signing the
+    /// between to a **provider** and brings the certificate home. Acting on
+    /// what is waiting at that provider is `provider requests`; signing the
     /// file directly, wherever the mesh root key lives, is `cert approve`.
     #[command(subcommand)]
     Csr(CsrCommand),
+    /// The node as the mesh's certificate authority: members, revocations, the
+    /// enrollment queue, accounts and VPN peers.
+    ///
+    /// Every command here is pointed at a provider, not at your own node.
+    #[command(subcommand, visible_alias = "ca")]
+    Provider(provider::ProviderCommand),
     /// Offline certificate / trust-anchor tooling (no node connection).
     #[command(subcommand)]
     Cert(cert::CertCommand),
-    /// Administration of a provider's user accounts, over the management API.
-    ///
-    /// Bootstrapping included: with no account on file yet, an operator on the
-    /// provider host creates the first administrator by presenting the node's
-    /// own identity seed (`--identity /var/lib/wayfinder/identity.seed`), which
-    /// authenticates as the node itself.
-    #[command(subcommand)]
-    User(user::UserCommand),
     /// Log in to a provider and store the session it issues, so every other
     /// subcommand finds a credential with no flags.
     Login {
@@ -303,6 +167,60 @@ pub enum Command {
     Logout,
     /// Print what credential this client is holding and when it stops working.
     Whoami,
+
+    // ── Compatibility spellings ─────────────────────────────────────────────
+    //
+    // Hidden rather than removed. Between them these three account for roughly
+    // seventy call sites across `docs/design/implemented/**`, the nix modules,
+    // the VM tests and `scripts/`, and the design docs in particular are a
+    // record of what shipped — rewriting them to match a later rename would
+    // falsify that record. They forward to the grouped spelling, which is what
+    // `--help` teaches and what new writing should use.
+    //
+    // Each carries the *same* type as the command it aliases rather than a
+    // restatement of its fields. `--help` still renders for a hidden alias, so
+    // an alias with its own copy of the arguments has its own copy of their
+    // documentation — which is exactly how the first version of this drifted,
+    // dropping `--mac`'s defaulting rule from the spelling most call sites
+    // use.
+    /// Alias for `provider user`.
+    #[command(hide = true, subcommand)]
+    User(user::UserCommand),
+    /// Alias for `provider vpn`.
+    #[command(hide = true, subcommand)]
+    Vpn(vpn::VpnCommand),
+    /// Alias for `auth enroll`.
+    #[command(hide = true)]
+    Enroll(auth::EnrollArgs),
+    /// Alias for `auth status`.
+    ///
+    /// Kept visible, unlike the three above: "Security" is what the TUI tab and
+    /// the web tab are both called, and the three clients answering to the same
+    /// word is worth one extra spelling.
+    Security,
+}
+
+impl Command {
+    /// Rewrite a compatibility spelling into the grouped command it stands for.
+    ///
+    /// Done once, here, rather than by duplicating dispatch arms: the aliases
+    /// then cannot drift from what they alias, because after this point they no
+    /// longer exist.
+    ///
+    /// `pub` because it is the second half of parsing: `Cli::parse_from` yields
+    /// whichever spelling was typed, and this is what says which command that
+    /// spelling *is*. An embedder — or a test asserting on the grammar — needs
+    /// both halves to know what an argv actually reaches.
+    #[must_use]
+    pub fn canonical(self) -> Self {
+        match self {
+            Command::User(cmd) => Command::Provider(provider::ProviderCommand::User(cmd)),
+            Command::Vpn(cmd) => Command::Provider(provider::ProviderCommand::Vpn(cmd)),
+            Command::Security => Command::Auth(auth::AuthCommand::Status),
+            Command::Enroll(args) => Command::Auth(auth::AuthCommand::Enroll(args)),
+            other => other,
+        }
+    }
 }
 
 /// Assemble the [`Endpoint`] a query command connects over from the parsed CLI,
@@ -573,7 +491,10 @@ const FOLLOW_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mill
 
 /// Run the parsed CLI: dispatch offline `cert` work synchronously, else open a
 /// client, service one query, and print the rendered result.
-pub async fn run(cli: Cli) -> anyhow::Result<()> {
+pub async fn run(mut cli: Cli) -> anyhow::Result<()> {
+    // Folded before anything inspects the command, so the offline check and the
+    // `--follow` interception below each need to know only the grouped form.
+    cli.command = cli.command.canonical();
     // The offline tooling needs no node connection.
     match cli.command {
         Command::Cert(cmd) => return cert::run(cmd),
@@ -677,53 +598,25 @@ pub async fn run_query(
 /// the rendered response. Shared by the TLS path ([`run_query`]) and the
 /// unauthenticated serial path (`--serial`), so every command works identically
 /// over either transport.
+///
+/// Canonicalizes before matching. `run` has already done so for the CLI path,
+/// but the public [`run_query`] has not, so removing the call here as redundant
+/// would make `run_query(Command::Security, ..)` hit the compatibility arm and
+/// panic. It is idempotent, which is what makes doing it twice the cheap
+/// option.
 async fn dispatch_query(
     command: Command,
     client: &mut Client,
     output: OutputFormat,
     endpoint: Option<&Endpoint>,
 ) -> anyhow::Result<String> {
+    let command = command.canonical();
     Ok(match command {
         Command::NodeInfo => output::node_info(&client.node_info().await?, output)?,
         Command::Routes => output::routing_table(&client.routing_table().await?, output)?,
-        Command::Links => output::link_quality_table(&client.link_quality_table().await?, output)?,
         Command::Keepalive => output::keepalive_table(&client.keepalive_table().await?, output)?,
-        Command::LinkFeatures => {
-            output::link_features_table(&client.link_features_table().await?, output)?
-        }
-        Command::LinkEnable { iface } => {
-            client
-                .set_link_features(LinkFeatures {
-                    iface_idx: iface,
-                    tx_ogm: Some(true),
-                    rx_ogm: Some(true),
-                    tx_data: Some(true),
-                    rx_data: Some(true),
-                    tx_keepalive_update: None,
-                })
-                .await
-                .context("failed to enable link")?;
-            format!("link {iface} enabled")
-        }
-        Command::LinkDisable { iface } => {
-            client
-                .set_link_features(LinkFeatures {
-                    iface_idx: iface,
-                    tx_ogm: Some(false),
-                    rx_ogm: Some(false),
-                    tx_data: Some(false),
-                    rx_data: Some(false),
-                    tx_keepalive_update: Some(TxKeepaliveUpdate::TxKeepaliveDisabled(true)),
-                })
-                .await
-                .context("failed to disable link")?;
-            format!("link {iface} disabled")
-        }
-        Command::User(cmd) => user::run(cmd, client).await?,
-        Command::OgmSchedule => output::ogm_schedule(&client.ogm_schedule().await?, output)?,
         Command::Throughput => output::throughput(&client.throughput().await?, output)?,
         Command::Metrics => output::node_metrics(&client.node_metrics().await?, output)?,
-        Command::Security => output::security(&client.security_status().await?, output)?,
         // `--follow` never reaches here: `run` intercepts it, since a stream of
         // batches cannot be returned as the one rendered response every other
         // command produces.
@@ -732,205 +625,30 @@ async fn dispatch_query(
             let id = parse_id(&dest)?;
             output::resolve(&client.resolve_route(id).await?, output)?
         }
-        Command::SetTrickleConfig {
-            iface,
-            min_ms,
-            max_ms,
-        } => {
-            client
-                .set_trickle_config(iface, min_ms, max_ms)
-                .await
-                .context("failed to set trickle config")?;
-            "trickle config updated".to_string()
-        }
-        Command::SetLinkFeatures {
-            iface,
-            tx_ogm,
-            rx_ogm,
-            tx_data,
-            rx_data,
-            tx_keepalive_interval_ms,
-            tx_keepalive_disable,
-        } => {
-            let tx_keepalive_update = match (tx_keepalive_disable, tx_keepalive_interval_ms) {
-                (true, Some(_)) => anyhow::bail!(
-                    "--tx-keepalive-disable and --tx-keepalive-interval-ms are mutually exclusive"
-                ),
-                (true, None) => Some(TxKeepaliveUpdate::TxKeepaliveDisabled(true)),
-                (false, Some(ms)) => Some(TxKeepaliveUpdate::TxKeepaliveIntervalMs(ms)),
-                (false, None) => None,
-            };
-            client
-                .set_link_features(LinkFeatures {
-                    iface_idx: iface,
-                    tx_ogm,
-                    rx_ogm,
-                    tx_data,
-                    rx_data,
-                    tx_keepalive_update,
-                })
-                .await
-                .context("failed to set link features")?;
-            "link features updated".to_string()
-        }
-        Command::SetLazyCertDistribution { enabled } => {
-            client
-                .set_lazy_cert_distribution(enabled)
-                .await
-                .context("failed to set lazy cert distribution")?;
-            format!(
-                "lazy cert distribution {}",
-                if enabled { "enabled" } else { "disabled" }
-            )
-        }
-        Command::SetAuth {
-            seed,
-            cert,
-            trust_anchor,
-        } => {
-            client
-                .set_auth(
-                    &std::fs::read(&seed)?,
-                    &std::fs::read(&cert)?,
-                    &std::fs::read(&trust_anchor)?,
-                )
-                .await
-                .context("failed to set auth")?;
-            "auth updated".to_string()
-        }
-        Command::Enroll {
-            mac,
-            token,
-            out_seed,
-            out_cert,
-            out_anchor,
-            no_vpn,
-            print_vpn_command,
-        } => {
-            // Enrollment can be retried against the same `out_seed` path (e.g. a
-            // provider that holds requests for operator approval, polled across
-            // process restarts). Reuse whatever identity is already on disk there
-            // rather than minting a fresh keypair each time: against a provider
-            // in that posture a new key on every retry looks like a different
-            // node reclaiming the MAC and is rejected. Persist a
-            // freshly-generated seed immediately, before polling, so a later
-            // retry finds it.
-            let seed: [u8; 32] = if out_seed.exists() {
-                cert::read_seed(&out_seed)
-                    .with_context(|| format!("reading existing seed at {}", out_seed.display()))?
-            } else {
-                let seed: [u8; 32] = rand::random();
-                cert::write_secret(&out_seed, &seed)?;
-                seed
-            };
-            let kp = Keypair::from_seed(&seed);
-            let mac_bytes = match &mac {
-                Some(mac) => parse_mac6(mac)?,
-                None => kp.derived_mac().0,
-            };
-            let issued = poll_enroll(client, &mac_bytes, &kp, &token).await?;
-            // The seed is already on disk (reused from `out_seed`, or written
-            // above before polling), so it needs no second write here.
-            std::fs::write(&out_cert, &issued.cert)
-                .with_context(|| format!("writing certificate to {}", out_cert.display()))?;
-            std::fs::write(&out_anchor, &issued.trust_anchor)
-                .with_context(|| format!("writing trust anchor to {}", out_anchor.display()))?;
-            // Enrollment is complete and durable at this point. The VPN step
-            // below is additive: it reconnects presenting the certificate just
-            // issued, which earns the member tier `GetVpnEnrollment` needs —
-            // the connection enrollment ran over was a stranger's and cannot
-            // mint anything. Anything that goes wrong there is reported in the
-            // summary rather than failing the command, since failing would
-            // discard an enrollment that already succeeded.
-            let vpn_note = match (no_vpn, endpoint) {
-                (true, _) => String::new(),
-                (false, None) => String::new(),
-                (false, Some(endpoint)) => {
-                    join_vpn_as_enrolled_node(endpoint, &seed, &issued.cert, print_vpn_command)
-                        .await
-                        .enrollment_note()
-                }
-            };
-            format!(
-                "enrolled {}: wrote seed, certificate, and trust anchor{vpn_note}",
-                output::format_mac(&mac_bytes)
-            )
-        }
-        Command::Vpn(cmd) => vpn::run(cmd, client, output).await?,
-        Command::Revoke { mac } => {
-            let mac_bytes = parse_mac6(&mac)?;
-            client
-                .revoke_node(&mac_bytes)
-                .await
-                .context("revocation failed")?;
-            format!("revoked {mac}")
-        }
-        Command::ListCerts => output::list_certs(&client.list_certs().await?, output)?,
-        Command::Csr(cmd) => csr::run(cmd, client, output).await?,
+        Command::Link(cmd) => link::run(cmd, client, output).await?,
+        Command::Auth(cmd) => auth::run(cmd, client, output, endpoint).await?,
+        Command::Csr(cmd) => csr::run(cmd, client).await?,
+        Command::Provider(cmd) => provider::run(cmd, client, output).await?,
         // Every command that needs no node connection is dispatched by `run`
         // before a client is opened; listing them here rather than under a
         // wildcard keeps a newly added offline command from silently reaching
         // a code path that would try to connect for it.
+        // `run` dispatches these before opening a client. Listing them rather
+        // than using a wildcard keeps a newly added offline command from
+        // silently reaching a path that would try to connect for it.
+        //
+        // `bail!` rather than `unreachable!`: `run_query` is public and has
+        // already opened a TLS connection by the time it gets here, so an
+        // embedder passing an offline command deserves an error, not a panic
+        // in a library.
         Command::Cert(_) | Command::Login { .. } | Command::Logout | Command::Whoami => {
-            unreachable!("offline commands are dispatched before a client is opened")
+            bail!("internal: this command needs no connection and cannot be dispatched as a query")
+        }
+        // Rewritten by `canonical` above, so they cannot appear here.
+        Command::User(_) | Command::Vpn(_) | Command::Enroll(_) | Command::Security => {
+            bail!("internal: a compatibility spelling survived canonicalization")
         }
     })
-}
-
-/// Open a second connection to `endpoint` as the freshly-enrolled node and ask
-/// for a tunnel credential.
-///
-/// A *second* connection, not the one enrollment ran over: that one was opened
-/// as a stranger (no certificate), which is the enrollment tier and cannot mint
-/// a tunnel credential — deliberately, since every field of a CSR is
-/// self-asserted. Presenting the issued certificate here is what proves
-/// possession of the key that was certified.
-///
-/// Never fails the caller: it returns the outcome, whatever happened, for the
-/// caller to render into the enrollment summary.
-async fn join_vpn_as_enrolled_node(
-    endpoint: &Endpoint,
-    seed: &[u8; 32],
-    cert: &[u8],
-    print_only: bool,
-) -> vpn::VpnJoinOutcome {
-    let identity = wayfinder_client::Identity {
-        seed: *seed,
-        cert: cert.to_vec(),
-    };
-    match Client::connect_tls(&endpoint.addr, &endpoint.node_key, &identity).await {
-        Ok(mut client) => vpn::join(&mut client, print_only).await,
-        Err(e) => vpn::VpnJoinOutcome::NotConfigured(format!(
-            "reconnecting as the enrolled node failed: {e}"
-        )),
-    }
-}
-
-/// Poll `submit_csr`. A provider configured to require operator approval parks the
-/// CSR as pending; re-submitting the identical request is how the enrolling node
-/// collects the certificate once an operator approves it.
-async fn poll_enroll(
-    client: &mut Client,
-    mac: &[u8],
-    kp: &Keypair,
-    token: &str,
-) -> anyhow::Result<CsrIssued> {
-    let resp = client
-        .submit_csr(mac, &kp.ed_pubkey(), &kp.x_pubkey(), token)
-        .await
-        .context("enrollment (submit_csr) failed")?;
-    match resp.outcome {
-        Some(CsrOutcome::Issued(issued)) => Ok(issued),
-        Some(CsrOutcome::Rejected(r)) => bail!("enrollment rejected: {}", r.reason),
-        // Pending (or an empty outcome, treated the same): the caller should keep polling until
-        // until the requset is approval.
-        Some(CsrOutcome::Pending(_)) | None => {
-            bail!(
-                "CSR still awaiting operator approval; approve it with \
-                    `wayfinderctl csr approve --mac <mac>` and retry",
-            );
-        }
-    }
 }
 
 /// Parse a node identifier from `s`: a colon-delimited MAC

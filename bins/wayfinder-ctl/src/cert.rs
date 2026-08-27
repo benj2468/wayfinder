@@ -476,30 +476,6 @@ fn describe_flags(flags: u8) -> String {
     parts.join(", ")
 }
 
-/// Read and parse a membership certificate file.
-///
-/// `pub(crate)` because both installs go through it — the offline one copying
-/// files into place, and `csr install` sending the same bytes over the wire —
-/// so a file that is not a certificate is refused identically by either, before
-/// anything has been written or transmitted.
-pub(crate) fn read_cert(path: &Path) -> anyhow::Result<MembershipCert> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading cert {}", path.display()))?;
-    MembershipCert::from_bytes(&bytes).ok_or_else(|| {
-        anyhow::anyhow!(
-            "cert {} is not a valid {CERT_LEN}-byte membership certificate",
-            path.display()
-        )
-    })
-}
-
-/// Read and parse a trust-anchor file.  See [`read_cert`] for why it is shared.
-pub(crate) fn read_trust_anchor(path: &Path) -> anyhow::Result<TrustAnchor> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("reading trust anchor {}", path.display()))?;
-    TrustAnchor::from_bytes(&bytes)
-        .ok_or_else(|| anyhow::anyhow!("{} is not a valid trust anchor", path.display()))
-}
-
 /// Refuse a certificate and trust anchor that describe different meshes.
 ///
 /// The pair is installed together and the node verifies one against the other,
@@ -515,6 +491,58 @@ pub(crate) fn check_mesh_match(cert: &MembershipCert, anchor: &TrustAnchor) -> a
         );
     }
     Ok(())
+}
+
+/// A certificate and trust anchor validated as a pair, with the exact bytes to
+/// transmit.
+///
+/// `bytes` are the files as read, not a re-encoding of the parsed values:
+/// round-tripping through [`MembershipCert`]/[`TrustAnchor`] would only add a
+/// way for what was checked and what is sent to disagree.
+#[derive(Debug)]
+pub(crate) struct Credential {
+    /// The parsed certificate, for reporting what was installed.
+    pub cert: MembershipCert,
+    /// The parsed trust anchor, for reporting which mesh it belongs to.
+    pub anchor: TrustAnchor,
+    /// The certificate file's bytes, as sent to the node.
+    pub cert_bytes: Vec<u8>,
+    /// The trust-anchor file's bytes, as sent to the node.
+    pub anchor_bytes: Vec<u8>,
+}
+
+/// Read a certificate and trust-anchor pair, refusing anything malformed or
+/// cross-mesh before a caller transmits it.
+///
+/// Shared by `auth set` and `csr install`, which are the same `SetAuth` call
+/// with and without a seed. Both need the identical seven steps — parse each,
+/// cross-check the mesh, keep the raw bytes — and having written them twice is
+/// how the two would drift on the credential-install path, which is the one
+/// path where a divergence is least survivable. A swapped `--cert`/
+/// `--trust-anchor` pair is named as such here rather than surfacing as a
+/// remote rejection.
+///
+/// Each file is read once; the earlier shape read every file twice.
+pub(crate) fn read_credential(cert: &Path, trust_anchor: &Path) -> anyhow::Result<Credential> {
+    let cert_bytes =
+        std::fs::read(cert).with_context(|| format!("reading cert {}", cert.display()))?;
+    let parsed_cert = MembershipCert::from_bytes(&cert_bytes).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cert {} is not a valid {CERT_LEN}-byte membership certificate",
+            cert.display()
+        )
+    })?;
+    let anchor_bytes = std::fs::read(trust_anchor)
+        .with_context(|| format!("reading trust anchor {}", trust_anchor.display()))?;
+    let parsed_anchor = TrustAnchor::from_bytes(&anchor_bytes)
+        .ok_or_else(|| anyhow::anyhow!("{} is not a valid trust anchor", trust_anchor.display()))?;
+    check_mesh_match(&parsed_cert, &parsed_anchor)?;
+    Ok(Credential {
+        cert: parsed_cert,
+        anchor: parsed_anchor,
+        cert_bytes,
+        anchor_bytes,
+    })
 }
 
 /// Read a 32-byte seed file.  `pub(crate)` so `enroll` can reuse an
@@ -784,17 +812,36 @@ mod tests {
         assert!(err.to_string().contains("mac"), "got: {err}");
     }
 
-    /// A file that is not a certificate is refused by length rather than
-    /// reinterpreted. `csr install` sends these bytes to a node, so a swapped
-    /// `--cert`/`--trust-anchor` pair must be caught here — before anything is
-    /// transmitted — not diagnosed from a remote rejection.
-    #[test]
-    fn read_cert_rejects_a_wrong_length_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("not-a-cert");
-        std::fs::write(&path, [0u8; 12]).unwrap();
+    /// Write a valid cert/anchor pair into `dir` and return their paths, so the
+    /// tests below can corrupt exactly one half and pin which half is blamed.
+    fn valid_pair(dir: &Path) -> (PathBuf, PathBuf) {
+        let ca = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let node = Keypair::from_seed(&[9u8; 32]);
+        let cert = ca.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            0,
+            1000,
+        );
+        let cert_path = dir.join("cert");
+        let anchor_path = dir.join("anchor");
+        std::fs::write(&cert_path, cert.as_bytes()).unwrap();
+        std::fs::write(&anchor_path, ca.trust_anchor().to_bytes()).unwrap();
+        (cert_path, anchor_path)
+    }
 
-        let err = read_cert(&path).unwrap_err();
+    /// A file that is not a certificate is refused by length rather than
+    /// reinterpreted. `auth set` and `csr install` send these bytes to a node,
+    /// so a swapped `--cert`/`--trust-anchor` pair must be caught here — before
+    /// anything is transmitted — not diagnosed from a remote rejection.
+    #[test]
+    fn read_credential_rejects_a_wrong_length_cert() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, anchor) = valid_pair(dir.path());
+        std::fs::write(&cert, [0u8; 12]).unwrap();
+
+        let err = read_credential(&cert, &anchor).unwrap_err();
         assert!(
             err.to_string().contains("membership certificate"),
             "got: {err}"
@@ -804,13 +851,39 @@ mod tests {
     /// The same for a trust anchor, which is the other half of the pair an
     /// install sends and the easier of the two to pass in the wrong slot.
     #[test]
-    fn read_trust_anchor_rejects_a_wrong_length_file() {
+    fn read_credential_rejects_a_wrong_length_trust_anchor() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("not-an-anchor");
-        std::fs::write(&path, [0u8; 12]).unwrap();
+        let (cert, anchor) = valid_pair(dir.path());
+        std::fs::write(&anchor, [0u8; 12]).unwrap();
 
-        let err = read_trust_anchor(&path).unwrap_err();
+        let err = read_credential(&cert, &anchor).unwrap_err();
         assert!(err.to_string().contains("trust anchor"), "got: {err}");
+    }
+
+    /// The bytes handed back are the files as read, not a re-encoding of the
+    /// parsed values — the two must not be able to disagree about what is
+    /// actually transmitted.
+    #[test]
+    fn read_credential_returns_the_bytes_as_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, anchor) = valid_pair(dir.path());
+
+        let loaded = read_credential(&cert, &anchor).unwrap();
+        assert_eq!(loaded.cert_bytes, std::fs::read(&cert).unwrap());
+        assert_eq!(loaded.anchor_bytes, std::fs::read(&anchor).unwrap());
+    }
+
+    /// A cross-mesh pair is refused by `read_credential` itself, so neither
+    /// install path can transmit one by forgetting to call the check.
+    #[test]
+    fn read_credential_rejects_a_cross_mesh_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, anchor) = valid_pair(dir.path());
+        let theirs = Authority::from_seed(&[2u8; 32], 0xBEEF);
+        std::fs::write(&anchor, theirs.trust_anchor().to_bytes()).unwrap();
+
+        let err = read_credential(&cert, &anchor).unwrap_err();
+        assert!(err.to_string().contains("mesh_id"), "got: {err}");
     }
 
     /// A certificate and anchor from *different* meshes are individually

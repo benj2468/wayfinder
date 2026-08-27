@@ -33,6 +33,8 @@ use wayfinder_server::AuthSnapshot;
 use wayfinder_server::serve_tls_server;
 use wayfinderctl::Command;
 use wayfinderctl::Endpoint;
+use wayfinderctl::auth::AuthCommand;
+use wayfinderctl::link::LinkCommand;
 use wayfinderctl::output::OutputFormat;
 use wayfinderctl::run_query;
 
@@ -296,9 +298,13 @@ async fn keepalive_query_renders_human_from_server() {
 #[tokio::test]
 async fn link_features_query_renders_json_from_server() {
     let endpoint = spawn_server().await;
-    let out = run_query(Command::LinkFeatures, &endpoint, OutputFormat::Json)
-        .await
-        .expect("query succeeds");
+    let out = run_query(
+        Command::Link(LinkCommand::Features),
+        &endpoint,
+        OutputFormat::Json,
+    )
+    .await
+    .expect("query succeeds");
     let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(parsed["entries"][0]["iface_idx"], 0);
     assert_eq!(parsed["entries"][0]["tx_ogm"], false);
@@ -309,9 +315,13 @@ async fn link_features_query_renders_json_from_server() {
 #[tokio::test]
 async fn link_features_query_renders_human_from_server() {
     let endpoint = spawn_server().await;
-    let out = run_query(Command::LinkFeatures, &endpoint, OutputFormat::Human)
-        .await
-        .unwrap();
+    let out = run_query(
+        Command::Link(LinkCommand::Features),
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .unwrap();
     assert!(out.contains("3000"), "got: {out}");
     assert!(out.contains("mixed"), "got: {out}");
 }
@@ -320,7 +330,7 @@ async fn link_features_query_renders_human_from_server() {
 async fn link_enable_query_succeeds_against_server() {
     let endpoint = spawn_server().await;
     let out = run_query(
-        Command::LinkEnable { iface: 0 },
+        Command::Link(LinkCommand::Enable { iface: 0 }),
         &endpoint,
         OutputFormat::Human,
     )
@@ -333,7 +343,7 @@ async fn link_enable_query_succeeds_against_server() {
 async fn link_disable_query_succeeds_against_server() {
     let endpoint = spawn_server().await;
     let out = run_query(
-        Command::LinkDisable { iface: 0 },
+        Command::Link(LinkCommand::Disable { iface: 0 }),
         &endpoint,
         OutputFormat::Human,
     )
@@ -346,11 +356,11 @@ async fn link_disable_query_succeeds_against_server() {
 async fn set_trickle_config_query_succeeds_against_server() {
     let endpoint = spawn_server().await;
     let out = run_query(
-        Command::SetTrickleConfig {
+        Command::Link(LinkCommand::Trickle {
             iface: 0,
             min_ms: 500,
             max_ms: 4000,
-        },
+        }),
         &endpoint,
         OutputFormat::Human,
     )
@@ -363,7 +373,7 @@ async fn set_trickle_config_query_succeeds_against_server() {
 async fn set_link_features_query_succeeds_against_server() {
     let endpoint = spawn_server().await;
     let out = run_query(
-        Command::SetLinkFeatures {
+        Command::Link(LinkCommand::Set {
             iface: 0,
             tx_ogm: Some(false),
             rx_ogm: None,
@@ -371,7 +381,7 @@ async fn set_link_features_query_succeeds_against_server() {
             rx_data: None,
             tx_keepalive_interval_ms: None,
             tx_keepalive_disable: false,
-        },
+        }),
         &endpoint,
         OutputFormat::Human,
     )
@@ -384,7 +394,7 @@ async fn set_link_features_query_succeeds_against_server() {
 async fn set_lazy_cert_distribution_query_succeeds_against_server() {
     let endpoint = spawn_server().await;
     let out = run_query(
-        Command::SetLazyCertDistribution { enabled: true },
+        Command::Auth(AuthCommand::LazyCerts { enabled: true }),
         &endpoint,
         OutputFormat::Human,
     )
@@ -428,9 +438,13 @@ async fn metrics_query_renders_human_from_server() {
 #[tokio::test]
 async fn security_query_renders_json_from_server() {
     let endpoint = spawn_server().await;
-    let out = run_query(Command::Security, &endpoint, OutputFormat::Json)
-        .await
-        .expect("query succeeds");
+    let out = run_query(
+        Command::Auth(AuthCommand::Status),
+        &endpoint,
+        OutputFormat::Json,
+    )
+    .await
+    .expect("query succeeds");
     let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(parsed["auth_enabled"], true);
     assert_eq!(parsed["mesh_id"], 0xABCD);
@@ -440,9 +454,13 @@ async fn security_query_renders_json_from_server() {
 #[tokio::test]
 async fn security_query_renders_human_from_server() {
     let endpoint = spawn_server().await;
-    let out = run_query(Command::Security, &endpoint, OutputFormat::Human)
-        .await
-        .unwrap();
+    let out = run_query(
+        Command::Auth(AuthCommand::Status),
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .unwrap();
     assert!(out.contains("authentication: enabled"), "got: {out}");
     assert!(out.contains("revoked"), "got: {out}");
     assert!(out.contains("00:00:00:00:00:02"), "got: {out}");

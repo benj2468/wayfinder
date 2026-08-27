@@ -194,7 +194,7 @@ in
       links = [
         {
           # Named rather than left to synthesize `udpm0`: this is the name an
-          # operator reads in `wayfinderctl links`, the dashboard and the TUI,
+          # operator reads in `wayfinderctl link list`, the dashboard and the TUI,
           # and "which tunnel link" is more useful there than "which carrier
           # kind". `scripts/wayfinder-ca.sh verify` looks for it too.
           name = "vpn0";
@@ -238,7 +238,7 @@ in
         # False, and it matters: this node is reachable from the open
         # internet, and what an unattended provider hands out is mesh
         # membership itself. A submitted CSR is parked for an operator
-        # (`wayfinder-ctl csr approve`, or the dashboard's Security tab).
+        # (`wayfinder-ctl provider requests approve`, or the dashboard's Security tab).
         auto_approve = false;
 
         # VPN coordination, pointed at the Headscale started below.
@@ -291,7 +291,7 @@ in
     # every other node uses — connecting to its own management API over
     # loopback with the identity seed above — so it registers under the
     # Headscale user named after its own MAC, minted by the same code, and
-    # `wayfinderctl vpn list` names this peer like any other.
+    # `wayfinderctl provider vpn list` names this peer like any other.
     #
     # A unit rather than an operator step: a preauth key can only be issued by
     # a running Headscale, so it cannot be provisioned alongside the

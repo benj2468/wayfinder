@@ -247,7 +247,7 @@ nix run .#wayfinder-ctl -- --connect <public_ip>:7700 --identity <any-seed> --no
 # above to collect — re-submitting the same CSR is how a certificate is fetched.
 nix run .#wayfinder-ctl -- --connect <public_ip>:7700 \
     --identity ca-secrets/identity.seed --cert ca-secrets/node.cert \
-    csr approve --mac <node-mac>
+    provider requests approve --mac <node-mac>
 
 # Back on the node:
 nix run .#wayfinder-ctl -- --connect <node>:7700 --identity <node-seed> \

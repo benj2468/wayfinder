@@ -1,7 +1,7 @@
 //! The certificate-signing-request workflow, from both ends.
 //!
-//! Online enrollment (`wayfinderctl enroll`) needs the node and the provider to
-//! be mutually reachable: the node opens a connection and asks to join. These
+//! Online enrollment (`wayfinderctl auth enroll`) needs the node and the provider
+//! to be mutually reachable: the node opens a connection and asks to join. These
 //! commands are for the case where it cannot — a node on an isolated network,
 //! behind an air gap, or simply out in the field. The request travels
 //! out-of-band instead, as a file:
@@ -21,8 +21,10 @@
 //! private key — which is what makes this work for a node that minted its own
 //! identity and for one whose filesystem is not reachable by path.
 //!
-//! `list`/`approve`/`deny` are the provider-side operator actions, the same
-//! ones the web and TUI screens drive.
+//! Only the node-side steps live here. The provider-side operator actions on
+//! what is waiting — listing the queue, approving, denying — are
+//! `provider requests`, because they are pointed at the CA rather than at the
+//! node being enrolled, and that is a different `--connect`.
 
 use std::path::PathBuf;
 
@@ -35,29 +37,11 @@ use wayfinder_protos::wayfinder::v1alpha::submit_csr_response::Outcome as CsrOut
 
 use crate::cert;
 use crate::output;
-use crate::output::OutputFormat;
-use crate::parse_mac6;
 
-/// The certificate-signing-request workflow: the node-side steps that carry a
-/// request out and a certificate back, and the provider-side operator actions
-/// on what is waiting.  See the module header for how they chain.
+/// The node-side certificate-signing-request steps: carry a request out, and a
+/// certificate back.  See the module header for how they chain.
 #[derive(Subcommand, Debug)]
 pub enum CsrCommand {
-    /// List the CSRs currently awaiting approval.
-    List,
-    /// Approve a pending CSR, so the enrolling node collects its certificate.
-    Approve {
-        /// MAC of the pending CSR to approve.
-        #[arg(long)]
-        mac: String,
-    },
-    /// Deny a pending CSR; the enrolling node observes a rejection.
-    Deny {
-        /// MAC of the pending CSR to deny.
-        #[arg(long)]
-        mac: String,
-    },
-
     /// Ask the node at `--connect` to describe the identity it already runs
     /// under, and write that out as a certificate signing request for an
     /// offline CA.
@@ -105,7 +89,8 @@ pub enum CsrCommand {
     /// CSR is how an issued certificate is collected. So against a provider
     /// that parks requests for approval, the first run reports the request as
     /// pending and writes nothing; approve it (in the web UI, the TUI, or with
-    /// `csr approve`) and re-run this against the same file to collect.
+    /// `provider requests approve`) and re-run this against the same file to
+    /// collect.
     ///
     /// Needs no membership certificate of its own: `SubmitCsr` is on the
     /// enrollment tier, so relaying someone else's request requires no
@@ -148,30 +133,9 @@ pub enum CsrCommand {
 ///
 /// Which end of the workflow `client` is connected to depends on the
 /// subcommand: `request` and `install` talk to the node being enrolled, while
-/// `list`/`approve`/`deny`/`submit` talk to the provider.
-pub async fn run(
-    cmd: CsrCommand,
-    client: &mut Client,
-    output: OutputFormat,
-) -> anyhow::Result<String> {
+/// `submit` talks to the provider.
+pub async fn run(cmd: CsrCommand, client: &mut Client) -> anyhow::Result<String> {
     Ok(match cmd {
-        CsrCommand::List => output::list_pending_csrs(&client.list_pending_csrs().await?, output)?,
-        CsrCommand::Approve { mac } => {
-            let mac_bytes = parse_mac6(&mac)?;
-            client
-                .approve_csr(&mac_bytes)
-                .await
-                .context("approving CSR failed")?;
-            format!("approved CSR for {mac}")
-        }
-        CsrCommand::Deny { mac } => {
-            let mac_bytes = parse_mac6(&mac)?;
-            client
-                .deny_csr(&mac_bytes)
-                .await
-                .context("denying CSR failed")?;
-            format!("denied CSR for {mac}")
-        }
         CsrCommand::Request { out_request, token } => {
             let request = csr_for_connected_node(client, token).await?;
             let mac = output::format_mac(&request.node_mac);
@@ -223,7 +187,7 @@ pub async fn run(
                 // rather than describing the request abstractly.
                 Some(CsrOutcome::Pending(_)) => bail!(
                     "{mac} is awaiting operator approval; approve it in the web UI, the \
-                     TUI, or with `wayfinderctl csr approve --mac {mac}`, then re-run \
+                     TUI, or with `wayfinderctl provider requests approve --mac {mac}`, then re-run \
                      this command against {} to collect the certificate",
                     request.display()
                 ),
@@ -251,29 +215,19 @@ pub async fn run(
             )
         }
         CsrCommand::Install { cert, trust_anchor } => {
-            // Parsed and cross-checked here rather than trusted to the node:
-            // the node's own validation is the backstop, but a swapped pair of
-            // filenames is worth naming as such instead of surfacing as a
-            // remote rejection.
-            let parsed_cert = cert::read_cert(&cert)?;
-            let parsed_anchor = cert::read_trust_anchor(&trust_anchor)?;
-            cert::check_mesh_match(&parsed_cert, &parsed_anchor)?;
-
-            // The bytes as read are what is sent — round-tripping them through
-            // the parsed types would only add a way for the two to disagree.
-            let cert_bytes = std::fs::read(&cert)
-                .with_context(|| format!("re-reading cert {}", cert.display()))?;
-            let anchor_bytes = std::fs::read(&trust_anchor)
-                .with_context(|| format!("re-reading trust anchor {}", trust_anchor.display()))?;
+            // Validated here rather than trusted to the node: the node's own
+            // checks are the backstop, but a swapped pair of filenames is worth
+            // naming as such instead of surfacing as a remote rejection.
+            let credential = cert::read_credential(&cert, &trust_anchor)?;
             client
-                .install_cert(&cert_bytes, &anchor_bytes)
+                .install_cert(&credential.cert_bytes, &credential.anchor_bytes)
                 .await
                 .context("installing the certificate on the node failed")?;
             format!(
                 "installed certificate for {} (mesh {:#x}), valid until {}",
-                output::format_mac(&parsed_cert.node_mac),
-                parsed_anchor.mesh_id,
-                parsed_cert.not_after.get()
+                output::format_mac(&credential.cert.node_mac),
+                credential.anchor.mesh_id,
+                credential.cert.not_after.get()
             )
         }
     })
