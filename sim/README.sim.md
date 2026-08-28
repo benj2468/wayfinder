@@ -155,6 +155,15 @@ state rather than assumed:
 uv run --group sim python sim/scenarios/red_team.py
 ```
 
+It writes two things from the one battery: the console table above, and
+`output/red_team_report.html` — a self-contained page built the same way the
+sweep reports are, so a run can be handed to someone who was not at the
+terminal. The page leads with the answer (a tally, then every attack indexed
+worst-verdict-first) and then walks the battery in the order it ran, giving
+each attack the prose it already carries: its own docstring says what was
+attempted and why it should have failed, beside the measurement the verdict
+was actually read off.
+
 The findings themselves are pinned as ordinary tests in
 `sim/tests/test_security.py` and `sim/tests/test_adversary.py`, so a
 regression turns a HELD into a failing test rather than a quietly changed
@@ -225,13 +234,18 @@ data plane has no pairwise key for it, so the frame is dropped rather than
 emitted in the clear), but reading that resolution as membership reports an
 intruder as admitted.
 
-### Sweep reports
+### Reports
 
-`wayfinder_sim.report` collects a whole sweep into one self-contained page:
-a ranked outcome list first, then every run with the parameters that produced
-it and the charts it produced. It exists because a sweep's actual question —
-which setting won, and what did the losers look like? — is the one thing a
-directory of PNGs and a wall of console output makes hardest to answer.
+`wayfinder_sim.report` collects a whole run of the simulator into one
+self-contained page. Two pages share its chrome, its escaping and its
+one-file-no-network contract, and differ only in the question the reader
+brought.
+
+**A sweep report** puts a ranked outcome list first, then every run with the
+parameters that produced it and the charts it produced. It exists because a
+sweep's actual question — which setting won, and what did the losers look
+like? — is the one thing a directory of PNGs and a wall of console output
+makes hardest to answer.
 
 ```python
 from wayfinder_sim.report import ImagePanel, RunReport, ScenePanel, write_sweep_report
@@ -254,6 +268,40 @@ inside the page, with one shared copy of the runtime. `ImagePanel` needs
 nothing beyond the standard library; `ScenePanel` needs the `interactive`
 extra. Leave `headline` unset for a sweep with no single winner and the page
 drops the ranking rather than inventing one.
+
+**A red-team report** inverts that one question. A battery of attacks has no
+headline number to rank by — the outcome is a verdict — so the ordering that
+matters is severity, and the page opens on a tally instead of a leaderboard.
+
+```python
+from wayfinder_sim.report import GAP, HELD, FindingReport, write_red_team_report
+
+write_red_team_report(
+    Path("red_team_report.html"),
+    "Wayfinder red team",
+    [
+        FindingReport(
+            name="CA misissuance",
+            verdict=GAP,               # ranks, colours and tallies by this
+            detail="a cert binding a key to a MAC it does not derive is accepted",
+            description=inspect.getdoc(attack),   # what was attempted, and why
+        ),
+        ...
+    ],
+)
+```
+
+`HELD` / `BY_DESIGN` / `GAP` live here rather than in the scenario, so the
+words the report ranks by and the words an attack returns are the same
+strings. `VERDICTS` is the whole vocabulary in severity order, read by the
+tally, the legend and the index alike — a fourth verdict is one entry there,
+and one the page has never heard of renders as an unranked row rather than
+being dropped from the report that exists to list it. Chips carry the
+categorical palette's red/yellow/green, which is exactly the pairing a
+colour-blind reader cannot resolve, so the verdict is spelled out in words
+everywhere a chip appears. `description` is rendered as prose — hard wrapping
+collapsed, backticks and `*emphasis*` honoured — which is what lets an attack
+hand over its docstring instead of restating itself for the report.
 
 ### Terrain scenario
 

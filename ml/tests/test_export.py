@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import pytest
 
-torch = pytest.importorskip("torch")
 onnx = pytest.importorskip("onnx")
 
 from wayfinder_ml import schema
@@ -13,6 +12,7 @@ from wayfinder_ml.train import NextHopScorer, export_onnx, metadata
 
 
 def test_export_embeds_schema_metadata(tmp_path) -> None:
+
     out = tmp_path / "next_hop.onnx"
     export_onnx(NextHopScorer(), out)
 

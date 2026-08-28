@@ -1,4 +1,11 @@
-"""One self-contained HTML page for a whole parameter sweep.
+"""Self-contained HTML pages for a whole run of the simulator.
+
+Two pages, one set of chrome. `sweep_report_html` renders a parameter sweep;
+`red_team_report_html` renders a battery of attacks. They share the
+stylesheet, the escaping and the one-file-no-network contract, and differ
+only in the question the reader brought.
+
+## The sweep page
 
 A sweep produces N runs that differ in one controlled way, and the question
 is always the same: *which setting won, and what did the losers look like?*
@@ -8,7 +15,8 @@ ranked outcome list first, then every run with the parameters that produced
 it and the charts it produced — and writes the whole thing, images and all,
 into a single file that can be copied elsewhere and opened offline.
 
-Design notes, since this is a page and not a chart:
+Design notes, since this is a page and not a chart — the first three are the
+shared chrome, the fourth is the sweep page's own:
 
 - The palette is `palette.PALETTE`, unchanged. The page is a *frame* for
   figures that already carry a validated palette; inventing a second one
@@ -26,6 +34,19 @@ Design notes, since this is a page and not a chart:
 
 `ImagePanel` needs nothing beyond the standard library; `ScenePanel` needs
 plotly (the `interactive` extra), and only when one is actually used.
+
+## The red-team page
+
+It inverts the sweep page's one question. A sweep asks "which setting won", so
+it ranks by a headline number; a red team asks "what got through", which is
+not a number at all but a verdict, and the ordering that matters is severity.
+
+What is kept is the shape: the answer first — a tally, then a severity-ordered
+index — and below it every attack in the order it ran, each carrying what was
+attempted beside what was actually measured. That second half is why the page
+takes prose at all: the reasoning for why an attack *should* fail already
+exists as the attack's docstring, and a report that only scored the outcome
+would leave a reader unable to judge whether a HELD meant anything.
 """
 
 from __future__ import annotations
@@ -34,6 +55,7 @@ import base64
 import dataclasses
 import html as html_lib
 import itertools
+import re
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -114,9 +136,10 @@ def _fmt(value: Any) -> str:
     return str(value)
 
 
-def _slug(label: str, index: int) -> str:
+def _slug(label: str, index: int, prefix: str = "run") -> str:
     keep = "".join(c if c.isalnum() else "-" for c in label.lower()).strip("-")
-    return f"run-{index + 1}-{keep}" if keep else f"run-{index + 1}"
+    stem = f"{prefix}-{index + 1}"
+    return f"{stem}-{keep}" if keep else stem
 
 
 def _data_uri(path: Path) -> str:
@@ -550,4 +573,349 @@ def write_sweep_report(
     creating parent directories as needed. Returns the path written."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(sweep_report_html(title, runs, **kwargs), encoding="utf-8")
+    return out_path
+
+
+# --- the red-team page ------------------------------------------------------
+
+HELD = "HELD"
+"""The mesh rejected the attack. The guarantee holds."""
+
+BY_DESIGN = "BY DESIGN"
+"""The attack succeeded, and is supposed to. Wayfinder authenticates and
+segregates; it never encrypts, so an attack that only reads the wire has
+confirmed the threat model rather than broken it."""
+
+GAP = "GAP"
+"""The attack succeeded in a way the design does not intend to allow. These
+are the findings."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Verdict:
+    """How one verdict is presented: what the word means to a reader meeting
+    it for the first time, and what fills its chip."""
+
+    label: str
+    meaning: str
+    series_index: int | None = None
+    """Which categorical hue carries it, as an index into `Palette.series`.
+    `None` for a verdict the page does not recognise, which is drawn in muted
+    ink rather than assigned a colour that would imply a severity."""
+
+    def color(self, palette: Palette) -> str:
+        """The chip fill for this verdict under `palette`."""
+        if self.series_index is None:
+            return palette.ink_muted
+        return palette.series[self.series_index]
+
+
+VERDICTS: tuple[Verdict, ...] = (
+    Verdict(GAP, "succeeded in a way the design does not intend to allow", 5),
+    Verdict(BY_DESIGN, "succeeded, and is supposed to — the threat model confirmed", 2),
+    Verdict(HELD, "the mesh rejected it", 3),
+)
+"""Every verdict the page knows, worst first.
+
+One list, read three times — by the tally, by the legend, and by the summary's
+ordering — so a fourth verdict is one entry and not four edits. The order is
+the page's severity order, which is the whole reason this page does not sort
+the way the sweep page does.
+
+The hues are the categorical palette's red / yellow / green. Red-versus-green
+is precisely the pairing a colour-blind reader cannot resolve, so the chip is
+never the only carrier: every place a chip appears, the verdict is also spelled
+out in words beside it.
+"""
+
+
+@dataclasses.dataclass(frozen=True)
+class FindingReport:
+    """One attack's outcome, as the page needs it.
+
+    `detail` is what was *measured* — the router state the verdict was read
+    off. `description` is what was attempted and why it should have failed;
+    the scenario supplies the attack's own docstring, so the prose lives next
+    to the code it describes rather than being restated for the report.
+    """
+
+    name: str
+    verdict: str
+    detail: str
+    description: str = ""
+
+
+_UNCLASSIFIED = Verdict("", "not a verdict this page knows how to rank")
+
+
+def _verdict(label: str) -> Verdict:
+    """The presentation for `label`, or an unranked, uncoloured stand-in.
+
+    A verdict the page has never heard of has to survive to the reader: the
+    one outcome worse than an unstyled row is a finding silently dropped from
+    the report that exists to list it.
+    """
+    for verdict in VERDICTS:
+        if verdict.label == label:
+            return verdict
+    return dataclasses.replace(_UNCLASSIFIED, label=label)
+
+
+def _severity(label: str) -> int:
+    """Sort key for a verdict: worst first, unknown last."""
+    for index, verdict in enumerate(VERDICTS):
+        if verdict.label == label:
+            return index
+    return len(VERDICTS)
+
+
+_INLINE = re.compile(
+    r"``(?P<code2>.+?)``"  # the double-backtick form the scenario prefers
+    r"|`(?P<code1>.+?)`"  # the single-backtick form the rest of the repo uses
+    r"|\*(?P<em>\S(?:[^*]*\S)?)\*",  # *emphasis*, never spanning a blank side
+    re.DOTALL,
+)
+"""The two docstring conventions the descriptions are written in.
+
+One pattern rather than two passes, so an asterisk that happens to sit inside
+a code span is consumed by the code alternative and never re-read as the start
+of an emphasis run.
+"""
+
+
+def _inline(match: re.Match[str]) -> str:
+    code = match.group("code2") or match.group("code1")
+    if code is not None:
+        return f"<code>{code}</code>"
+    return f"<em>{match.group('em')}</em>"
+
+
+def _prose(text: str) -> str:
+    """A docstring as HTML paragraphs.
+
+    Blank-line-separated blocks become paragraphs and the hard wrapping inside
+    each is collapsed, since a docstring is wrapped to the source column rather
+    than to the page. Escaping happens first and the inline pass runs over the
+    escaped text, so a description can never introduce markup of its own — only
+    the `<code>` and `<em>` the page put there.
+    """
+    paragraphs = []
+    for block in re.split(r"\n\s*\n", text.strip()):
+        collapsed = " ".join(block.split())
+        if not collapsed:
+            continue
+        marked = _INLINE.sub(_inline, _esc(collapsed))
+        paragraphs.append(f'<p class="wf-prose">{marked}</p>')
+    return "".join(paragraphs)
+
+
+def _red_team_stylesheet(palette: Palette) -> str:
+    """The red-team page's own rules, on top of the shared chrome.
+
+    Kept out of `_stylesheet` rather than merged into it: a sweep page would
+    carry them to style nothing, and the two pages are easier to change
+    independently when their rules are not interleaved.
+    """
+    return f"""
+.wf-tally {{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 48px;
+  border-top: 1px solid var(--rule);
+  border-bottom: 1px solid var(--rule);
+  padding: 4px 0;
+}}
+.wf-tally-cell {{ flex: 1 1 210px; padding: 22px 0; }}
+.wf-tally-n {{
+  font-family: var(--mono);
+  font-size: 46px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}}
+.wf-tally-label {{
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 12px 0 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+}}
+.wf-tally-meaning {{
+  margin: 6px 0 0;
+  max-width: 34ch;
+  font-size: 12px;
+  color: var(--ink-3);
+}}
+
+/* Chip, verdict, name, one-line result — the whole battery at a glance. */
+.wf-finding-row {{
+  display: grid;
+  grid-template-columns: 14px 84px minmax(160px, 1fr) 2.2fr;
+  gap: 16px;
+  align-items: baseline;
+  padding: 13px 0;
+  border-bottom: 1px solid var(--rule);
+}}
+.wf-finding-row .wf-chip {{ position: relative; top: 2px; }}
+.wf-verdict {{
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--ink-2);
+  white-space: nowrap;
+}}
+.wf-finding-detail {{ font-size: 13px; color: var(--ink-2); }}
+
+.wf-badge {{
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  color: var(--ink-2);
+  white-space: nowrap;
+}}
+
+.wf-body {{ padding-top: 22px; }}
+.wf-body .wf-eyebrow {{ margin-top: 22px; }}
+.wf-body > .wf-eyebrow:first-child {{ margin-top: 0; }}
+.wf-prose {{ margin: 0 0 12px; max-width: 74ch; color: var(--ink-2); }}
+.wf-measured {{
+  margin: 0;
+  padding: 14px 18px;
+  border-left: 3px solid var(--contour);
+  background: {palette.gridline}40;
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--ink);
+}}
+code {{ font-family: var(--mono); font-size: 0.92em; }}
+
+@media (max-width: 720px) {{
+  .wf-finding-row {{ grid-template-columns: 14px 1fr; }}
+  .wf-finding-row .wf-verdict {{ grid-column: 2; }}
+  .wf-finding-row .wf-finding-detail {{ grid-column: 2; }}
+}}
+"""
+
+
+def red_team_report_html(
+    title: str,
+    findings: Sequence[FindingReport],
+    *,
+    subtitle: str | None = None,
+    palette: Palette = PALETTE,
+) -> str:
+    """Render a whole battery of attacks as one self-contained HTML document.
+
+    The two orderings are deliberate and they differ. The index at the top is
+    ordered by `VERDICTS` — gaps first, because those are what the page is
+    opened for — while the body below keeps `findings` in the order they were
+    given, which is the order the attacks ran. So "what got through" and "what
+    was tried, in sequence" are each answerable in one pass rather than by
+    reading the page twice.
+    """
+    if not findings:
+        raise ValueError("a red-team report needs at least one finding")
+
+    slugs = {
+        id(finding): _slug(finding.name, i, "finding")
+        for i, finding in enumerate(findings)
+    }
+
+    counts = {verdict.label: 0 for verdict in VERDICTS}
+    for finding in findings:
+        counts[finding.verdict] = counts.get(finding.verdict, 0) + 1
+
+    tally = "".join(
+        f'<div class="wf-tally-cell">'
+        f'<div class="wf-tally-n">{counts[verdict.label]:02d}</div>'
+        f'<p class="wf-tally-label">'
+        f'<span class="wf-chip" style="background:{verdict.color(palette)}"></span>'
+        f"{_esc(verdict.label)}</p>"
+        f'<p class="wf-tally-meaning">{_esc(verdict.meaning)}</p>'
+        f"</div>"
+        for verdict in VERDICTS
+    )
+
+    # Stable within a verdict: `sorted` keeps the run order the body uses, so
+    # two views of the same battery never disagree about which gap came first.
+    ordered = sorted(findings, key=lambda f: _severity(f.verdict))
+    rows = "".join(
+        f'<li class="wf-finding-row">'
+        f'<span class="wf-chip" style="background:{_verdict(f.verdict).color(palette)}"></span>'
+        f'<span class="wf-verdict">{_esc(f.verdict)}</span>'
+        f'<span class="wf-rank-label"><a href="#{slugs[id(f)]}">{_esc(f.name)}</a></span>'
+        f'<span class="wf-finding-detail">{_esc(f.detail)}</span>'
+        f"</li>"
+        for f in ordered
+    )
+
+    sections = []
+    for finding in findings:
+        verdict = _verdict(finding.verdict)
+        badge = (
+            f'<span class="wf-badge">'
+            f'<span class="wf-chip" style="background:{verdict.color(palette)}"></span>'
+            f"{_esc(finding.verdict)}</span>"
+        )
+        description = (
+            f'<p class="wf-eyebrow">The attack</p>{_prose(finding.description)}'
+            if finding.description
+            else ""
+        )
+        sections.append(
+            f'<section class="wf-section" id="{slugs[id(finding)]}">'
+            f'<div class="wf-section-head">'
+            f'<h2 class="wf-section-title">{_esc(finding.name)}</h2>{badge}</div>'
+            f'<div class="wf-body">{description}'
+            f'<p class="wf-eyebrow">Measured</p>'
+            f'<p class="wf-measured">{_esc(finding.detail)}</p></div>'
+            f"</section>"
+        )
+
+    lede = f'<p class="wf-lede">{_esc(subtitle)}</p>' if subtitle else ""
+    attack_word = "attack" if len(findings) == 1 else "attacks"
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{_esc(title)}</title>
+<style>{_stylesheet(palette)}{_red_team_stylesheet(palette)}</style>
+</head>
+<body>
+<div class="wf-wrap">
+<header class="wf-head">
+<p class="wf-eyebrow">Red team report &middot; {len(findings)} {attack_word}</p>
+<h1 class="wf-h1">{_esc(title)}</h1>
+{lede}
+</header>
+<div class="wf-tally" data-tally>{tally}</div>
+<div data-summary><ol class="wf-rank">{rows}</ol></div>
+<main data-findings>{"".join(sections)}</main>
+<footer class="wf-foot">Generated by wayfinder-sim. Every verdict here was measured against the router's own state, never assumed; this file needs no network to open.</footer>
+</div>
+</body>
+</html>
+"""
+
+
+def write_red_team_report(
+    out_path: Path,
+    title: str,
+    findings: Sequence[FindingReport],
+    **kwargs: Any,
+) -> Path:
+    """Render `findings` with `red_team_report_html` and write them to
+    `out_path`, creating parent directories as needed. Returns the path
+    written."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        red_team_report_html(title, findings, **kwargs), encoding="utf-8"
+    )
     return out_path
