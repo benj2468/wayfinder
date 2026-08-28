@@ -24,6 +24,16 @@ extern crate alloc;
 
 mod adapter;
 pub use adapter::RouterAdapter;
+pub use adapter::RouterView;
+
+/// Shared read access to the router, so a management read runs on the
+/// connection's own task rather than on the driver's event loop.
+#[cfg(feature = "std")]
+mod router_handle;
+#[cfg(feature = "std")]
+pub use router_handle::RouterHandle;
+#[cfg(feature = "std")]
+pub use router_handle::SharedRouter;
 
 /// The certificate authority's own executor: the task that owns a
 /// [`CertAuthority`] so no management request runs on the router's event loop.
@@ -185,6 +195,8 @@ pub use transport::ChannelServerTx;
 pub use transport::QueryRx;
 #[cfg(feature = "std")]
 pub use transport::QueryTx;
+#[cfg(feature = "std")]
+pub use transport::ServerServices;
 #[cfg(feature = "std")]
 pub use transport::bind_tcp_server;
 #[cfg(feature = "std")]

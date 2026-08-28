@@ -212,11 +212,43 @@ async fn send_error_on_one_link_does_not_block_others() {
         clippy::expect_used,
         reason = "test: a poisoned mutex means the test already panicked"
     )]
-    let recorded = sent.lock().expect("sent mutex poisoned");
+    let recorded_len = sent.lock().expect("sent mutex poisoned").len();
     assert_eq!(
-        recorded.len(),
-        1,
+        recorded_len, 1,
         "the healthy link after the failing one must still have transmitted"
+    );
+
+    // And the bytes actually reached the router's counters — on the link that
+    // sent them, and only that one.
+    //
+    // `record_tx` used to happen inside `send_on_link`, right after the await.
+    // It is now collected and applied in a batch once every send has finished,
+    // so that no router lock is held across a radio transmission. Nothing
+    // asserted it afterwards: delete the batch loop and `GetThroughput` reports
+    // zero forever on every host node, with the whole suite green.
+    //
+    // Asserted as "some vs none" rather than an exact byte count, because the
+    // frame carries a header and an auth trailer whose sizes are not this
+    // test's business — what is being pinned is that the recording happens at
+    // all, and that a failed send records nothing.
+    let now = std::time::Duration::from_millis(1);
+    let (failed_iface, healthy_iface) = tr
+        .with_router(|router| {
+            (
+                router.interface_throughput(0, now).map(|t| t.tx_bps),
+                router.interface_throughput(1, now).map(|t| t.tx_bps),
+            )
+        })
+        .await;
+    assert_eq!(
+        failed_iface.unwrap_or(0.0),
+        0.0,
+        "a link whose send failed must record no transmitted bytes"
+    );
+    assert!(
+        healthy_iface.unwrap_or(0.0) > 0.0,
+        "the healthy link transmitted, so its bytes must reach the router's \
+         throughput counters: got {healthy_iface:?}"
     );
 }
 

@@ -38,7 +38,8 @@ use wayfinder_protos::service::NodeSecurityData;
 use wayfinder_protos::service::OgmScheduleEntryData;
 use wayfinder_protos::service::PendingCsrData;
 use wayfinder_protos::service::RouteResolutionData;
-use wayfinder_protos::service::RouterDataProvider;
+use wayfinder_protos::service::RouterReads;
+use wayfinder_protos::service::RouterWrites;
 use wayfinder_protos::service::RoutingEntryData;
 use wayfinder_protos::service::RuntimeConfigData;
 use wayfinder_protos::service::SecurityStatusData;
@@ -422,16 +423,19 @@ impl Mock {
     }
 }
 
-impl RouterDataProvider for Mock {
+impl RouterReads for Mock {
     fn node_id(&self) -> Vec<u8> {
         vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]
     }
+
     fn num_originators(&self) -> u32 {
         2
     }
+
     fn auth_locked(&self) -> bool {
         true
     }
+
     fn routing_table(&self) -> Vec<RoutingEntryData> {
         vec![RoutingEntryData {
             destination: vec![0, 0, 0, 0, 0, 2],
@@ -446,6 +450,7 @@ impl RouterDataProvider for Mock {
             }],
         }]
     }
+
     fn link_quality_table(&self) -> Vec<LinkQualityEntryData> {
         vec![LinkQualityEntryData {
             neighbor_id: vec![0, 0, 0, 0, 0, 3],
@@ -455,6 +460,7 @@ impl RouterDataProvider for Mock {
             iface_name: "lora0".into(),
         }]
     }
+
     fn link_features_table(&self) -> Vec<LinkFeaturesEntryData> {
         vec![LinkFeaturesEntryData {
             iface_idx: 0,
@@ -466,6 +472,7 @@ impl RouterDataProvider for Mock {
             iface_name: "lora0".into(),
         }]
     }
+
     fn keepalive_table(&self) -> Vec<KeepAliveEntryData> {
         vec![KeepAliveEntryData {
             neighbor_id: vec![0, 0, 0, 0, 0, 3],
@@ -474,6 +481,7 @@ impl RouterDataProvider for Mock {
             missed: true,
         }]
     }
+
     fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData> {
         vec![OgmScheduleEntryData {
             iface_idx: 0,
@@ -483,6 +491,7 @@ impl RouterDataProvider for Mock {
             iface_name: "lora0".into(),
         }]
     }
+
     fn throughput(&self) -> Vec<InterfaceThroughputData> {
         vec![InterfaceThroughputData {
             iface_idx: 0,
@@ -493,6 +502,7 @@ impl RouterDataProvider for Mock {
             iface_name: "lora0".into(),
         }]
     }
+
     fn node_metrics(&self) -> NodeMetricsData {
         NodeMetricsData {
             uptime_secs: 7384,
@@ -537,39 +547,22 @@ impl RouterDataProvider for Mock {
             untaggable_drop_rate: 0.0,
         }
     }
+
     fn resolve_route(&self, _destination: &[u8]) -> Option<RouteResolutionData> {
         Some(RouteResolutionData {
             next_hop: vec![0, 0, 0, 0, 0, 3],
             egress: Some(EgressDecisionData::Interface(0)),
         })
     }
+
     fn security_status(&self) -> SecurityStatusData {
         self.security.clone()
     }
-    fn set_config(&mut self, config: RuntimeConfigData) -> Result<(), String> {
-        // Applied to the reported status, so the dashboard's next poll shows
-        // the change — a mock that accepted every write and reported the same
-        // state forever would make a broken control look like a working one.
-        if let Some(require_auth) = config.require_auth {
-            self.security.require_auth = require_auth;
-        }
-        if let Some(lazy) = config.lazy_cert_distribution {
-            self.security.lazy_cert_distribution = lazy;
-        }
-        if config.enrollment.is_some() {
-            // Mirrors `RouterAdapter::set_config`. The authority's state lives
-            // on the authority, and the connection task strips this field and
-            // forwards it as an `AuthorityCommand::SetEnrollmentPolicy` — so
-            // one arriving here means the caller had no authority to apply it.
-            // Refused rather than ignored, exactly as a real node refuses, or
-            // the mock would answer `Empty` to a policy nothing applied.
-            return Err("node is not a certificate-authority provider".to_string());
-        }
-        Ok(())
-    }
+
     fn runtime_config_active(&self) -> bool {
         false
     }
+
     fn alarms(&self) -> AlarmsData {
         self.alarms.clone()
     }
@@ -599,11 +592,37 @@ impl RouterDataProvider for Mock {
             filter: wayfinder_log::current_spec().as_str().into(),
         }
     }
+}
+
+impl RouterWrites for Mock {
+    fn set_config(&mut self, config: RuntimeConfigData) -> Result<(), String> {
+        // Applied to the reported status, so the dashboard's next poll shows
+        // the change — a mock that accepted every write and reported the same
+        // state forever would make a broken control look like a working one.
+        if let Some(require_auth) = config.require_auth {
+            self.security.require_auth = require_auth;
+        }
+        if let Some(lazy) = config.lazy_cert_distribution {
+            self.security.lazy_cert_distribution = lazy;
+        }
+        if config.enrollment.is_some() {
+            // Mirrors `RouterAdapter::set_config`. The authority's state lives
+            // on the authority, and the connection task strips this field and
+            // forwards it as an `AuthorityCommand::SetEnrollmentPolicy` — so
+            // one arriving here means the caller had no authority to apply it.
+            // Refused rather than ignored, exactly as a real node refuses, or
+            // the mock would answer `Empty` to a policy nothing applied.
+            return Err("node is not a certificate-authority provider".to_string());
+        }
+        Ok(())
+    }
+
     fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
         wayfinder_log::set_filter(directives)
             .map(|()| wayfinder_log::current_spec().as_str().to_string())
             .map_err(|e| format!("{e}"))
     }
+
     /// Install a certificate, the way a node does when it is enrolled.
     ///
     /// An empty seed means the node keeps the identity it has, so the reported
@@ -921,8 +940,13 @@ pub async fn serve_mock_node_with(mock: Mock) -> (SocketAddr, [u8; 32]) {
             NODE_SEED,
             snapshot_tx,
             query_tx,
-            None,
-            Some(authority_tx),
+            wayfinder_server::ServerServices {
+                authority_tx: Some(authority_tx),
+                // No shared read handle: this harness has no driver behind
+                // the listener, so reads travel the query channel as they
+                // always did.
+                ..Default::default()
+            },
         )
         .await;
     });

@@ -32,6 +32,10 @@ use wayfinder::wayfinder_auth::TrustAnchor;
 use wayfinder::wayfinder_auth::VerifiedCert;
 
 #[cfg(feature = "std")]
+use wayfinder_protos::rpc::AccessTier;
+#[cfg(feature = "std")]
+use wayfinder_protos::rpc::access_tiers;
+#[cfg(feature = "std")]
 use wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request as ReqKind;
 
 /// The overall management access decision for a client that has completed the
@@ -205,178 +209,65 @@ pub fn decide_access(
 
 /// Whether a connection holding `access` may invoke `request`.
 ///
-/// [`MgmtAccess::GrantedSelfKey`] may invoke everything and
-/// [`MgmtAccess::GrantedAdmin`] everything but one request, so this is really
-/// the definition of the three confined tiers: what
-/// [`MgmtAccess::GrantedEnrollment`] means — the requests a caller holding
-/// nothing this mesh has signed has to make, whether it is a node joining or a
-/// person redeeming an invitation, and nothing else — what [`MgmtAccess::GrantedViewer`]
-/// means, below, and what [`MgmtAccess::GrantedMember`] means, which is the one
-/// request the admin tier is excluded from.
+/// Two halves, and the split is the point. *Which tiers a request admits* is
+/// declared per-request in `wayfinder-protos`'s `rpc_table!`, next to that
+/// request's owner and audit class. *Which tier a connection earned* is
+/// [`decide_access`], here. This function is only the join between them, so
+/// there is no list to fall out of step with the proto: a request kind added
+/// without an `access` list does not compile, where the tier lists this
+/// replaced were `matches!` arms with an implicit catch-all — a new kind
+/// silently became permitted for admin and self-key and refused for viewer and
+/// enrollment. `SetUserRole`, `SetUserEnabled` and `SetUserPassword` all
+/// reached the proto that way.
 ///
-/// # The one request the admin tier may not invoke
+/// The policy those declarations encode is unchanged, and three parts of it are
+/// worth reading in one place even though each is now stated at its own entry:
 ///
-/// `GetVpnEnrollment` is gated on the request, ahead of the tier match. It is
-/// not a management capability being exercised — it mints a tunnel credential
-/// bound to *the calling device's own identity*. An operator's session
-/// certificate is fully privileged and is not a device identity, so for it the
-/// request has no meaning rather than being a privilege it lacks.
+/// * **`GetVpnEnrollment` is the one request the admin tier may not invoke.**
+///   It is not a management capability being exercised — it mints a tunnel
+///   credential bound to *the calling device's own identity*. An operator's
+///   session certificate is fully privileged and is not a device, so for it the
+///   request has no meaning rather than being a privilege it lacks. The node's
+///   own seed *is* a device identity — the node's — which is why
+///   [`MgmtAccess::GrantedSelfKey`] is admitted and the certificate authority
+///   can join the tunnel it coordinates through the same RPC every other node
+///   uses. What makes that safe is where the MAC comes from: the router, not
+///   the connection.
 ///
-/// The node's own seed *is* a device identity — the node's — which is why
-/// [`MgmtAccess::GrantedSelfKey`] is admitted here and the certificate
-/// authority can join the tunnel it coordinates through the same RPC every
-/// other node uses. What makes that safe is where the MAC comes from: the
-/// router, not the connection. See the comment at the top of the function
-/// body.
+/// * **The enrollment tier is a closed allowlist** — `SubmitCsr`,
+///   `GetTrustAnchor`, `AuthenticateUser` and the two invitation-redemption
+///   requests. A caller holding nothing this mesh has signed has to be able to
+///   make those, whether it is a node joining or a person redeeming an
+///   invitation, and admission control for them has not moved: the enrollment
+///   token and the operator's approval for a CSR, the password, the second
+///   factor and the per-account lockout for a login, and the 256-bit
+///   single-use invitation for a redemption. What is deliberately *not*
+///   admitted beside them is the rest of the account store — an enrollment
+///   connection can redeem an invitation it already holds and cannot mint one,
+///   list one, or revoke one.
 ///
-/// * `SubmitCsr` — ask the provider to certify this node's keys. Whether it is
-///   granted, parked for approval or refused is the provider's enrollment
-///   policy to decide, not this function's.
-/// * `GetTrustAnchor` — read the mesh's public trust anchor. Public by
-///   construction: every OGM on the mesh is verified against it, so it is not a
-///   secret being handed out.
-/// * `AuthenticateUser` — exchange a username, password and TOTP code for a
-///   short-lived management certificate. On this tier for the same reason
-///   `SubmitCsr` is: someone who has not logged in yet holds no credential, so
-///   a tier that required one would close the door they need to knock on.
-///   Admission control has not moved here either — it is the password, the
-///   second factor, the per-account lockout, and the account having been
-///   created by an admin in the first place.
-/// * `BeginUserRegistration` / `CompleteUserRegistration` — redeem a one-time
-///   invitation into the account it was minted for. On this tier for the
-///   sharpest version of the same reason: somebody who does not have an account
-///   *yet* holds no credential of any kind, and this is the request that gives
-///   them one. Admission control is the token — 256 bits, single-use, expiring,
-///   and minted by an admin who chose both the name and the role it will
-///   create. Note what is deliberately *not* admitted beside them: an
-///   enrollment connection can redeem an invitation it already holds and can do
-///   nothing else to the account store — it cannot mint one, list one, or
-///   revoke one.
+/// * **The viewer and member tiers are earned by a signed bit, never by the
+///   absence of another.** Every device on the mesh holds a verified non-admin
+///   certificate, so a tier granted by absence would be a tier the whole mesh
+///   already had. That is why [`MgmtAccess::GrantedMember`] names exactly one
+///   request: anything added to it is added to the entire mesh at once.
 ///
-/// Everything else — every read of routing state, every setting, every
-/// provider action including approving a CSR — needs a full grant.
-///
-/// **What actually confines an enrollment connection is this *request set***
-/// (the five above) — not anything about a
-/// `SubmitCsr`'s *contents*. `node_mac`, `ed_pubkey` and `x_pubkey` are
-/// entirely client-supplied and bound to nothing about this connection: the
-/// handshake key is never checked against them, so a client can submit a CSR
-/// naming a MAC and keys it does not hold. That reach-past is deliberate, not
-/// an oversight — it is what lets one node enroll another on its behalf,
-/// which nothing else in this design offers a substitute for — but it is
-/// real, and it is what lets an anonymous client park a CSR under a real
-/// node's MAC and block that node's genuine enrollment (a scenario
-/// `authority.rs`'s held-CSR docs describe, though not by this name). Two
-/// things bound how much that reach can cost, without closing it:
-/// `authority.rs`'s `MAX_HELD_CSRS` caps how large the held-CSR store may
-/// grow no matter how many sources contribute to it, and
-/// `PreAuthLimits` in `transport.rs` caps how fast any *one* source may
-/// contribute. Neither stops a single submission from squatting a MAC; both
-/// stop it from being repeated without bound. The certificate that comes
-/// back is bound to the keys named in the CSR, so it is useless to anyone
-/// but their holder — all a squatting client achieves is one entry in the
-/// provider's pending queue, up to the cap, which the enrollment token and
-/// operator approval are there to filter.
-///
-/// # The viewer tier
-///
-/// [`MgmtAccess::GrantedViewer`] is the queries and nothing else: every
-/// `Get*`/`List*`/`ResolveRoute` request except `ListUsers`, and none of the
-/// mutations
-/// (`SetAuth`, `SetConfig`, `SetLogLevel`, `RevokeNode`, `ApproveCsr`,
-/// `DenyCsr`, `SubmitCsr`, `RevokeVpnPeer`) or disclosures
-/// (`RevealEnrollmentToken`, `GetVpnEnrollment`).
-///
-/// `ListVpnPeers` is a query and is *not* on the viewer's list, unlike the
-/// `List*` requests beside it. It is answered by calling out to the
-/// coordination server, so admitting it on a read-only tier would let a viewer
-/// drive outbound requests from the CA at whatever rate it polls.
-///
-/// Two of those exclusions are worth stating rather than leaving to the reader.
-/// `RevealEnrollmentToken` is a *read* by shape and a secret by content — the
-/// credential that admits nodes to the mesh — and it is the one request whose
-/// disclosure the design already treats as a discrete, logged, admin-gated act;
-/// a read-only tier that could perform it would undo that. `SetLogLevel` reads
-/// like a debugging convenience, but it changes what every sink on the node
-/// emits, which is node-wide state and is exactly the sort of thing a viewer
-/// exists not to touch. `Authenticate` is excluded because the connection has
-/// already authenticated: a second one on the same connection has no defined
-/// meaning and must not silently re-tier it.
-///
-/// SECURITY ALERT: this function holds security-critical access-control
-/// logic. Changing it requires careful consideration.
+/// SECURITY ALERT: this function and the `access` lists it reads hold
+/// security-critical access-control logic. Changing either requires careful
+/// consideration.
 #[cfg(feature = "std")]
 pub fn permits(access: MgmtAccess, request: &ReqKind) -> bool {
-    // Decided by the request before the tier, and the only request that is.
-    // `GetVpnEnrollment` does not grant its caller a capability — it mints a
-    // credential *for the caller's device identity*. So the question here is
-    // not how privileged a tier is but whether it names a node the
-    // coordination server can register.
-    //
-    // Two tiers do. The member tier is an enrolled device presenting the
-    // certificate this mesh's CA issued it, and the transport takes the MAC
-    // from that verified certificate. The self-key tier is the node itself —
-    // whoever holds its seed signs its OGMs and terminates its TLS — and the
-    // transport takes the MAC from the router (`AuthSnapshot::own_mac`),
-    // never from the connection, because a certificate presented on a
-    // self-key connection is never verified.
-    //
-    // The admin tier does not: an operator's session certificate is a person,
-    // not a device, so for it the request has no meaning rather than being a
-    // privilege it lacks.
-    //
-    // This is also what makes the design's two gates genuinely independent: a
-    // party holding the shared enrollment token can have *a* certificate issued
-    // for keys it names, but reaching this request additionally requires
-    // proving possession of a key that names a node — the certified one, or
-    // the node's own seed.
-    if matches!(request, ReqKind::GetVpnEnrollment(_)) {
-        return matches!(
-            access,
-            MgmtAccess::GrantedMember | MgmtAccess::GrantedSelfKey
-        );
-    }
-    match access {
-        MgmtAccess::GrantedAdmin | MgmtAccess::GrantedSelfKey => true,
-        // Exactly the request handled above, and nothing else. Every node on
-        // the mesh holds a member certificate, so a request added to this arm
-        // is a request granted to the entire mesh.
-        MgmtAccess::GrantedMember => false,
-        MgmtAccess::GrantedViewer => matches!(
-            request,
-            ReqKind::GetNodeInfo(_)
-                | ReqKind::GetRoutingTable(_)
-                | ReqKind::GetLinkQualityTable(_)
-                | ReqKind::ResolveRoute(_)
-                | ReqKind::GetOgmSchedule(_)
-                | ReqKind::GetThroughput(_)
-                | ReqKind::GetMetrics(_)
-                | ReqKind::GetTrustAnchor(_)
-                | ReqKind::GetSecurityStatus(_)
-                | ReqKind::ListCerts(_)
-                | ReqKind::ListPendingCsrs(_)
-                | ReqKind::GetKeepaliveTable(_)
-                | ReqKind::GetLinkFeaturesTable(_)
-                | ReqKind::GetLogs(_)
-                // What the node believes is wrong with itself. A read, and one
-                // a viewer is exactly the audience for: the tier exists so
-                // somebody can be shown the state of the network without being
-                // handed the ability to change it, and "is this node healthy"
-                // is the first question they will have. It discloses no more
-                // than `GetSecurityStatus` beside it already does — peer
-                // identifiers, and the fact that something was refused.
-                | ReqKind::GetAlarms(_)
-        ),
-        MgmtAccess::GrantedEnrollment => matches!(
-            request,
-            ReqKind::SubmitCsr(_)
-                | ReqKind::GetTrustAnchor(_)
-                | ReqKind::AuthenticateUser(_)
-                | ReqKind::BeginUserRegistration(_)
-                | ReqKind::CompleteUserRegistration(_)
-        ),
-        MgmtAccess::Denied(_) => false,
-    }
+    // A denial is not a tier: it names no row in the table, and must not be
+    // mapped onto one.
+    let tier = match access {
+        MgmtAccess::GrantedAdmin => AccessTier::Admin,
+        MgmtAccess::GrantedSelfKey => AccessTier::SelfKey,
+        MgmtAccess::GrantedViewer => AccessTier::Viewer,
+        MgmtAccess::GrantedMember => AccessTier::Member,
+        MgmtAccess::GrantedEnrollment => AccessTier::Enrollment,
+        MgmtAccess::Denied(_) => return false,
+    };
+    access_tiers(request).contains(&tier)
 }
 
 /// Which management tier an authenticated client bearing `cert` earns:
@@ -814,95 +705,140 @@ mod tests {
         ));
     }
 
-    /// Declares this build's entire request-oneof surface exactly once, and
-    /// expands it into two things: `every_request_kind()`, one value per
-    /// variant for the sweep tests below to iterate; and
-    /// `all_kinds_exhaustive`, an exhaustive `match &ReqKind` whose only job is
-    /// to fail to *compile* when this list falls behind the proto.
+    use wayfinder_protos::rpc::AccessTier;
+    use wayfinder_protos::rpc::Audited;
+    use wayfinder_protos::rpc::RateLimit;
+    use wayfinder_protos::rpc::access_tiers;
+    use wayfinder_protos::rpc::audited;
+    /// One value per request variant, so the sweeps below cover the whole
+    /// request surface rather than a hand-picked sample of it.
     ///
-    /// That second function is the actual guarantee, and it replaced an
-    /// `assert_eq!(all.len(), N, ..)` that could not be one. The list and the
-    /// count were edited by the same human action — adding a proto variant and
-    /// remembering to come here — so a variant added to the proto and never
-    /// added to this list left the list and the count agreeing with each other
-    /// at the old, wrong size. Not hypothetical: `SetUserRole`,
-    /// `SetUserEnabled` and `SetUserPassword` were added to the proto and both
-    /// sweeps below kept passing until a human updated this file by hand.
+    /// Re-exported from `wayfinder-protos`'s declaration table (behind its
+    /// `test-support` feature) rather than listed here. It used to be a
+    /// test-only macro in this file that expanded to both the list and an
+    /// exhaustive match whose only job was to fail to compile when the list
+    /// fell behind the proto — a check this module needed because `permits`
+    /// classified requests with `matches!` arms that had an implicit
+    /// catch-all, so nothing else forced a decision on a new kind.
     ///
-    /// The exhaustive matches in `wayfinder-protos`'s `service.rs`
-    /// (`request_kind_name`, `audited`, `request_facet`) do force a decision on
-    /// a new variant, and they caught those three. What none of them forces is
-    /// an *authorization* decision: `permits` matches on the access tier, and
-    /// the request appears only inside `matches!`, which has an implicit
-    /// catch-all — so a new kind silently becomes permitted for admin and
-    /// self-key and refused for viewer and enrollment. This is the check that
-    /// makes somebody choose. A wildcard arm on `all_kinds_exhaustive` would
-    /// restore the hole; do not add one.
-    macro_rules! every_request_kind_variants {
-        ($($variant:ident($ty:ty)),+ $(,)?) => {
-            fn every_request_kind() -> Vec<ReqKind> {
-                use wayfinder_protos::wayfinder::v1alpha::*;
-                // `Default` uniformly, which every prost message implements,
-                // rather than the mix of `Foo {}` and `Foo::default()` the
-                // hand-written list had.
-                vec![$(ReqKind::$variant(<$ty>::default())),+]
-            }
+    /// `rpc_table!` forces it at the declaration now: a request with no
+    /// `access` list does not compile, and this list is generated from the same
+    /// table, so it cannot fall behind what it is sweeping.
+    use wayfinder_protos::rpc::every_request_kind;
+    use wayfinder_protos::rpc::rate_limit;
+    use wayfinder_protos::rpc::request_kind_name;
 
-            // Never called: the only property that matters is that it
-            // compiles. See the comment above — a oneof variant this arm list
-            // omits makes this match, and so this whole test module, fail to
-            // build.
-            #[allow(dead_code)]
-            fn all_kinds_exhaustive(kind: &ReqKind) {
-                match kind {
-                    $(ReqKind::$variant(_) => (),)+
-                }
-            }
-        };
+    /// The classifications the design calls one-of-a-kind really are, counted
+    /// over the whole surface rather than spot-checked on the named instance.
+    ///
+    /// This replaced a test in `rpc.rs` whose name promised "exactly one" and
+    /// whose body asserted only that the one it named was classified correctly
+    /// — so a *second* disclosure, or a second request refusing admin, would
+    /// have passed it. Both properties are load-bearing:
+    ///
+    /// * A disclosure is a secret leaving the node. The audit log is the only
+    ///   record of who learned the enrollment token and when, and a second
+    ///   request that hands out a secret without being classified `Disclosure`
+    ///   would leave no trace at all.
+    /// * `GetVpnEnrollment` is the one request an *admin* is refused, because
+    ///   it mints a credential for a device identity an operator's session
+    ///   certificate does not have. A second such request would mean the "two
+    ///   full grants may invoke everything except one" rule stated throughout
+    ///   this crate's docs had quietly stopped being true.
+    #[test]
+    fn the_singular_classifications_are_singular() {
+        let all = every_request_kind();
+
+        let disclosures: Vec<_> = all
+            .iter()
+            .filter(|k| audited(k) == Audited::Disclosure)
+            .map(request_kind_name)
+            .collect();
+        assert_eq!(
+            disclosures,
+            ["RevealEnrollmentToken"],
+            "the set of requests classified as a secret disclosure changed"
+        );
+
+        let admin_refused: Vec<_> = all
+            .iter()
+            .filter(|k| !access_tiers(k).contains(&AccessTier::Admin))
+            .map(request_kind_name)
+            .collect();
+        assert_eq!(
+            admin_refused,
+            ["GetVpnEnrollment"],
+            "the set of requests the admin tier may not invoke changed"
+        );
+
+        let member_granted: Vec<_> = all
+            .iter()
+            .filter(|k| access_tiers(k).contains(&AccessTier::Member))
+            .map(request_kind_name)
+            .collect();
+        assert_eq!(
+            member_granted,
+            ["GetVpnEnrollment"],
+            "the member tier is every device on the mesh; widening it widens the mesh"
+        );
     }
 
-    every_request_kind_variants! {
-        GetNodeInfo(GetNodeInfoRequest),
-        GetRoutingTable(GetRoutingTableRequest),
-        GetLinkQualityTable(GetLinkQualityTableRequest),
-        ResolveRoute(ResolveRouteRequest),
-        GetOgmSchedule(GetOgmScheduleRequest),
-        GetThroughput(GetThroughputRequest),
-        GetMetrics(GetMetricsRequest),
-        SetAuth(SetAuthRequest),
-        GetTrustAnchor(GetTrustAnchorRequest),
-        SubmitCsr(SubmitCsrRequest),
-        RevokeNode(RevokeNodeRequest),
-        GetSecurityStatus(GetSecurityStatusRequest),
-        ListCerts(ListCertsRequest),
-        ListPendingCsrs(ListPendingCsrsRequest),
-        ApproveCsr(ApproveCsrRequest),
-        DenyCsr(DenyCsrRequest),
-        SetConfig(SetConfigRequest),
-        GetKeepaliveTable(GetKeepAliveTableRequest),
-        Authenticate(AuthenticateRequest),
-        GetLinkFeaturesTable(GetLinkFeaturesTableRequest),
-        GetLogs(GetLogsRequest),
-        SetLogLevel(SetLogLevelRequest),
-        RevealEnrollmentToken(RevealEnrollmentTokenRequest),
-        AuthenticateUser(AuthenticateUserRequest),
-        ListUsers(ListUsersRequest),
-        CreateUser(CreateUserRequest),
-        RemoveUser(RemoveUserRequest),
-        GetAlarms(GetAlarmsRequest),
-        GetOwnCert(GetOwnCertRequest),
-        GetVpnEnrollment(GetVpnEnrollmentRequest),
-        ListVpnPeers(ListVpnPeersRequest),
-        RevokeVpnPeer(RevokeVpnPeerRequest),
-        CreateUserInvite(CreateUserInviteRequest),
-        ListUserInvites(ListUserInvitesRequest),
-        RevokeUserInvite(RevokeUserInviteRequest),
-        BeginUserRegistration(BeginUserRegistrationRequest),
-        CompleteUserRegistration(CompleteUserRegistrationRequest),
-        RevokeUserSessions(RevokeUserSessionsRequest),
-        SetUserRole(SetUserRoleRequest),
-        SetUserEnabled(SetUserEnabledRequest),
-        SetUserPassword(SetUserPasswordRequest),
+    /// Every request reachable on the enrollment tier that *costs* something
+    /// spends a bucket, and every bucket holds only the requests it was sized
+    /// for.
+    ///
+    /// `access` and `limit` are declared independently in `rpc_table!`, and
+    /// nothing else cross-checks them: mutation testing showed
+    /// `GetTrustAnchor` could be moved to `RateLimit::Login` with the whole
+    /// suite still green. That is not cosmetic — an anonymous node polling for
+    /// the trust anchor would then drain the login budget for its source
+    /// address, locking out sign-ins from behind the same NAT, which is
+    /// precisely the cross-flow starvation the separate buckets exist to
+    /// prevent (see `RateLimit`'s doc).
+    ///
+    /// So the buckets are pinned per kind, not merely spot-checked.
+    #[test]
+    fn every_request_spends_the_bucket_its_flow_was_sized_for() {
+        for request in every_request_kind() {
+            let expected = match &request {
+                ReqKind::SubmitCsr(_) => RateLimit::SubmitCsr,
+                ReqKind::AuthenticateUser(_) => RateLimit::Login,
+                // Both halves of one redemption, one bucket: bounding either
+                // alone bounds nothing.
+                ReqKind::BeginUserRegistration(_) | ReqKind::CompleteUserRegistration(_) => {
+                    RateLimit::Registration
+                }
+                _ => RateLimit::Unmetered,
+            };
+            assert_eq!(
+                rate_limit(&request),
+                expected,
+                "rate-limit bucket for {request:?}"
+            );
+        }
+    }
+
+    /// Nothing an anonymous caller can reach is free unless it is a pure read.
+    ///
+    /// The invariant behind the table above, asserted separately so that adding
+    /// an expensive request to the enrollment tier and forgetting to meter it
+    /// fails here rather than in production. `GetTrustAnchor` is the one
+    /// deliberate exception: it hands back a public value every OGM on the mesh
+    /// is already verified against, and it is what a joining node must read
+    /// before it can verify anything at all.
+    #[test]
+    fn an_unmetered_enrollment_request_is_a_read_or_the_trust_anchor() {
+        for request in every_request_kind() {
+            if !permits(MgmtAccess::GrantedEnrollment, &request) {
+                continue;
+            }
+            if matches!(rate_limit(&request), RateLimit::Unmetered) {
+                assert!(
+                    matches!(request, ReqKind::GetTrustAnchor(_)),
+                    "{request:?} is reachable with no credential and spends no bucket"
+                );
+            }
+        }
     }
 
     /// The enrollment tier is a *closed* allowlist over the whole request
@@ -912,9 +848,9 @@ mod tests {
     /// (`ApproveCsr` on its own request, `SetAuth`, `SetConfig`, `GetLogs`).
     ///
     /// What makes this a sweep of the *whole* surface rather than a hand-picked
-    /// sample is `every_request_kind_variants!`: its exhaustive match fails to
-    /// compile when a proto variant is missing from the list, so
-    /// `every_request_kind()` is guaranteed complete rather than asserted to be.
+    /// sample is that `every_request_kind()` is generated from the same
+    /// `rpc_table!` entries being swept: it cannot fall behind the proto,
+    /// because a variant missing from the table does not compile.
     #[test]
     fn permits_confines_the_enrollment_tier_to_a_closed_allowlist() {
         let all = every_request_kind();

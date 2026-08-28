@@ -126,3 +126,8 @@ embassy-sync = { workspace = true, optional = true }
 # `test-util` for the paused clock: the handshake-timeout test would otherwise
 # have to wait out `HANDSHAKE_TIMEOUT` in real seconds.
 tokio = { workspace = true, features = ["test-util"] }
+# `test-support` for `rpc::every_request_kind()`, which the authorization
+# sweeps in `authz.rs` iterate so they cover the whole request surface rather
+# than a sample of it. A dev-dependency so the 41 default-message constructors
+# it generates stay out of every firmware build.
+wayfinder-protos = { workspace = true, features = ["test-support"] }

@@ -122,6 +122,8 @@ above.
   in-memory projections, and the arm holds `&mut CentralRouter`; moving them
   means a per-request snapshot or an `Arc<RwLock<CentralRouter>>`, which reaches
   into the `no_std` core's ownership model for little gain (§7).
+  **Superseded — see §11.** The *read* half was moved off the loop afterwards,
+  behind an `Arc<RwLock<..>>` on the `std` side only.
 - Not making `CertAuthority` shared-by-lock (§7).
 - Not changing the mgmt-TLS handshake, tier derivation, or any tier's request
   set.
@@ -430,6 +432,8 @@ embedded node on which a router-owned version would mean anything.
   non-goal: needs a per-request snapshot or an `Arc<RwLock<CentralRouter>>`, both
   reaching into the `no_std` core's ownership model, for requests that already
   cost microseconds.
+  **Partly reversed later — see §11.** The reads were moved; the mutations were
+  not, and the `no_std` core was left alone.
 - **Run the CA as a separate process.** Rejected: a larger operational change (a
   second unit, a second config, an IPC boundary) than the problem needs, and the
   provider node is deliberately one binary (design 11). Revisit only if the CA
@@ -519,3 +523,57 @@ Deliberately deferred, each with the reason:
 - **`run_channel_server` serves only the router half.** The in-process transport
   has no authority channel, so a provider driven through it answers authority
   kinds with the not-a-provider error. Only tests use it in-tree.
+
+## 11. Amendment: the read half did move, later
+
+This design's Non-goals and Rejected-alternatives above both say the router
+queries stay on the loop, and name `Arc<RwLock<CentralRouter>>` as the thing not
+to build. That is what MR !143 built, for the *reads*. This section records why,
+so the contradiction is a decision rather than an oversight — and what part of
+the original objection still stands.
+
+**What the objection had two halves, and only one survived.**
+
+1. *"Reaches into the `no_std` core's ownership model."* This no longer applies,
+   because the lock is not in the core. `CentralRouter` is unchanged; the
+   `Arc<RwLock<SharedRouter>>` lives in `wayfinder-driver` and
+   `wayfinder-server`, both `std`. The embedded transport keeps its
+   `embassy-sync` channel untouched, and no board links an `RwLock` — a
+   cooperative single-core executor serving one serial connection has no
+   concurrency for one to recover. The half of the objection that was about the
+   *core* was answered by putting the lock somewhere else.
+
+2. *"For requests that already cost microseconds."* This half was **not**
+   re-derived, and the change was made on structural grounds rather than
+   measured ones. Stated plainly so nobody later mistakes it for evidence.
+
+**What changed since, and it is a fact this design did not have.**
+`bins/wayfinder-web` did not exist when this was written. It renders twelve tabs
+from a node, fetches several tables per SSR render, and more than one dashboard
+polls one node at a time. This design reasoned about *a* client issuing
+microsecond queries; the shape it now faces is N clients issuing bursts
+concurrently, where the cost is not the query but the serialisation — every read
+in the fleet single-file through one channel and one `select!` arm, between mesh
+frames.
+
+**What was actually claimed, and what was not.** The reads no longer serialise
+against *each other*, and a read no longer costs a channel send, a loop wake-up
+and a oneshot reply. What is emphatically **not** claimed is that reads became
+free: the loop takes the write guard per frame, so a large `GetLogs` contends
+with it exactly as before. `tokio::sync::RwLock` is write-preferring, which is
+what keeps a polling dashboard from starving the mesh, and
+`libs/wayfinder-server/src/router_handle.rs` carries this same accounting at the
+call site.
+
+**What did not move, and should not.** `SetAuth`, `SetConfig` and `SetLogLevel`
+still go to the loop over `QueryTx`. They are operator actions rather than
+polls, so there is nothing to win, and `set_auth` writes back through an
+identity-seed slot only the loop's write guard reaches. §7's refusal to make
+`CertAuthority` shared-by-lock also stands untouched — the authority still owns
+its own task, which is this design's actual subject.
+
+**If this is revisited.** The honest case for reverting it is that nobody has
+measured the win. A benchmark of N concurrent readers against a node whose loop
+is forwarding frames — read latency and loop throughput, channel path versus
+handle path — would settle it in either direction, and is the thing to build
+before either defending or removing this.

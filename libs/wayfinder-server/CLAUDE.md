@@ -5,7 +5,8 @@ embedded node links only what it can run.
 
 | Layer | Feature | Files |
 |---|---|---|
-| `RouterAdapter` — projects a borrowed `CentralRouter` onto `RouterDataProvider` | always (`no_std` + `alloc`) | `adapter.rs`, `authz.rs`, `settings.rs` (trait half) |
+| `RouterAdapter`/`RouterView` — project a borrowed `CentralRouter` onto `RouterWrites`/`RouterReads` | always (`no_std` + `alloc`) | `adapter.rs`, `authz.rs`, `settings.rs` (trait half) |
+| `RouterHandle` — the shared read lock the management reads are served from | `std` | `router_handle.rs` |
 | host transports — authenticated TLS over TCP, plus an in-process channel | `std` (default) | `transport.rs`, `tls.rs`, `authority.rs`, `persistence.rs`, `users.rs`, `settings.rs` (`SettingsFile`) |
 | the certificate authority's own task — `AuthorityAdapter` onto `AuthorityDataProvider` | `std` | `authority_task.rs`, `provider.rs` (the `MeshAuthority` trait half, compiled always so it stays `no_std`) |
 | embedded transport — length-delimited frames over `embedded-io-async` | `embedded` | `framing.rs`, `embedded.rs` |
@@ -19,17 +20,52 @@ Entry points for the host transport are `bind_tcp_server` (bind the listener),
 no Unix-datagram or UDP listener — earlier docs referenced `run_unix_server` /
 `run_udp_server`, which no longer exist.
 
-## The query channel, and why the router is never shared
+## Reads are shared; mutations are not
 
-`QueryTx`/`QueryRx` (and their `embassy-sync` twins `EmbeddedQueryTx`/`Rx`)
-exist so the router is owned by exactly one task. Listener tasks accept
-connections concurrently, but they do not touch `CentralRouter` — they forward a
-request over the channel and await a oneshot reply. The driver's event loop
-services it between frames.
+The rule here used to be *nothing outside the driver loop touches
+`CentralRouter`*. It is now narrower, and the narrowing is the point:
 
-This is the constraint to respect when adding anything here: **nothing outside
-the driver loop may hold a `&mut CentralRouter`.** If a new feature seems to
-need one, it needs a new request kind, not a lock.
+> **Nothing outside the driver loop may hold a `&mut CentralRouter`.** A shared
+> `&` is fine, and is how every management *read* is served.
+
+Sixteen of the nineteen router-facing answers take `&self`. Serving those on the
+loop meant a dashboard polling seven tables a second built seven response `Vec`s
+between mesh frames, one at a time, behind a depth-16 channel. `RouterHandle`
+(`router_handle.rs`) gives them a read lock instead, so they run on the
+connection's own task and concurrently with each other. Its module doc has the
+honest accounting — including the part that has *not* changed, which is that a
+large read still contends with the loop for the lock.
+
+The three mutations (`SetAuth`, `SetConfig`, `SetLogLevel`) still travel
+`QueryTx`/`QueryRx` to the loop, and should. They are operator actions rather
+than polls, so there is nothing to win; and `set_auth` writes back through the
+identity-seed slot that lives beside the router under the same lock, which only
+the loop's write guard reaches.
+
+**The split is enforced by types, not by discipline.** `RouterDataProvider` is
+now `RouterReads` (`&self`) + `RouterWrites` (`&mut self`), and
+`handle_router_read` takes `&P`. `RouterView` — the shared-borrow projection
+behind the handle — implements only `RouterReads`, so a mutation routed to the
+read path is a compile error, not a runtime string. `RequestFacet` splits the
+same way (`RouterRead`/`RouterWrite`) so a transport knows which borrow a
+request needs before it sends anything, exactly as design 13's facet fork tells
+it which *owner*.
+
+Two rules for anything added here:
+
+- **A new `&self` answer goes on `RouterReads`**, and is then automatically
+  served off the loop. A new `&mut self` one goes on `RouterWrites` and stays on
+  it. Declare which in `rpc_table!`; there is no third option.
+- **Never hold a router guard across an `await` that does I/O.** The driver's
+  `dispatch` is the worked example: it takes the write guard to *plan* a frame,
+  drops it before the link send (a LoRa transmission is not a moment), and takes
+  it again to record the bytes sent. `Driver::with_router`/`with_router_mut` are
+  scoped callbacks rather than returned guards for the same reason.
+
+The embedded transport keeps the channel unchanged (`EmbeddedQueryTx`/`Rx`).
+A board's executor is cooperative and single-core and its management port is one
+serial connection issuing one request at a time, so there is no concurrency for
+a lock to recover — and the `no_std` half of this crate stays free of one.
 
 ## `RouterAdapter` and the eleven const generics
 
@@ -45,6 +81,12 @@ received frames. Don't call `Instant::now()` inside it — a metric read at a
 different clock than the frames it describes is how throughput graphs go
 subtly wrong.
 
+The sixteen reads do not actually live on `RouterAdapter`: they are implemented
+once on `RouterView`, which holds a shared `&CentralRouter`, and the adapter
+delegates to a view it builds from its own `&mut`. That is what lets a
+connection task answer them without the `&mut` the adapter requires. Add a read
+to `RouterView`; the adapter's delegating impl is mechanical.
+
 ## Authentication vs. authorization
 
 Deliberately separated, and the boundary matters:
@@ -56,6 +98,22 @@ Deliberately separated, and the boundary matters:
 - **Authorization** is `authz.rs`: a pure decision over already-verified inputs
   (`decide_access` → `MgmtAccess`), with no transport and no crypto, so the
   policy is unit-testable standalone and identical across transports.
+
+Authorization is itself split in two, and the split is where to look when
+changing it. *Which tier a connection earned* is `decide_access`, here. *Which
+tiers a request admits* is declared per-request in `wayfinder-protos`'s
+`rpc_table!`, beside that request's owner, audit class and rate-limit bucket.
+`permits` is only the join between them.
+
+That is deliberate: the tier lists used to live here as `matches!` arms with an
+implicit catch-all, so a request kind added to the proto silently became
+*permitted for admin and self-key and refused for viewer and enrollment* —
+which is how `SetUserRole`, `SetUserEnabled` and `SetUserPassword` arrived. The
+`every_request_kind_variants!` test macro that used to sit at the bottom of
+this file existed to compensate. Now an entry with no `access` list does not
+parse, so the decision is forced at the declaration and that macro is gone
+(the sweeps iterate `rpc::every_request_kind()` instead, behind the protos
+crate's `test-support` feature).
 
 Five grant tiers:
 

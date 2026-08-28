@@ -29,7 +29,8 @@ use wayfinder_protos::service::NodeMetricsData;
 use wayfinder_protos::service::OgmScheduleEntryData;
 use wayfinder_protos::service::RegistrationStartedData;
 use wayfinder_protos::service::RouteResolutionData;
-use wayfinder_protos::service::RouterDataProvider;
+use wayfinder_protos::service::RouterReads;
+use wayfinder_protos::service::RouterWrites;
 use wayfinder_protos::service::RoutingEntryData;
 use wayfinder_protos::service::RuntimeConfigData;
 use wayfinder_protos::service::TableOccupancyData;
@@ -58,16 +59,19 @@ fn format_mac(bytes: &[u8]) -> String {
 /// resolvable route, so every typed client method has something to return.
 struct Mock;
 
-impl RouterDataProvider for Mock {
+impl RouterReads for Mock {
     fn node_id(&self) -> Vec<u8> {
         vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]
     }
+
     fn num_originators(&self) -> u32 {
         2
     }
+
     fn auth_locked(&self) -> bool {
         true
     }
+
     fn routing_table(&self) -> Vec<RoutingEntryData> {
         vec![RoutingEntryData {
             destination: vec![0, 0, 0, 0, 0, 2],
@@ -82,6 +86,7 @@ impl RouterDataProvider for Mock {
             }],
         }]
     }
+
     fn link_quality_table(&self) -> Vec<LinkQualityEntryData> {
         vec![LinkQualityEntryData {
             neighbor_id: vec![0, 0, 0, 0, 0, 3],
@@ -91,9 +96,11 @@ impl RouterDataProvider for Mock {
             iface_name: "lora0".into(),
         }]
     }
+
     fn link_features_table(&self) -> Vec<LinkFeaturesEntryData> {
         vec![]
     }
+
     fn keepalive_table(&self) -> Vec<KeepAliveEntryData> {
         vec![KeepAliveEntryData {
             neighbor_id: vec![0, 0, 0, 0, 0, 3],
@@ -102,6 +109,7 @@ impl RouterDataProvider for Mock {
             missed: true,
         }]
     }
+
     fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData> {
         vec![OgmScheduleEntryData {
             iface_idx: 0,
@@ -111,6 +119,7 @@ impl RouterDataProvider for Mock {
             iface_name: "lora0".into(),
         }]
     }
+
     fn throughput(&self) -> Vec<InterfaceThroughputData> {
         vec![InterfaceThroughputData {
             iface_idx: 0,
@@ -121,6 +130,7 @@ impl RouterDataProvider for Mock {
             iface_name: "lora0".into(),
         }]
     }
+
     fn node_metrics(&self) -> NodeMetricsData {
         NodeMetricsData {
             uptime_secs: 7384,
@@ -165,19 +175,12 @@ impl RouterDataProvider for Mock {
             untaggable_drop_rate: 0.0,
         }
     }
+
     fn resolve_route(&self, _destination: &[u8]) -> Option<RouteResolutionData> {
         Some(RouteResolutionData {
             next_hop: vec![0, 0, 0, 0, 0, 3],
             egress: Some(EgressDecisionData::Interface(0)),
         })
-    }
-
-    fn set_auth(&mut self, _seed: &[u8], _cert: &[u8], _trust_anchor: &[u8]) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn set_config(&mut self, _config: RuntimeConfigData) -> Result<(), String> {
-        Ok(())
     }
 
     fn runtime_config_active(&self) -> bool {
@@ -218,6 +221,16 @@ impl RouterDataProvider for Mock {
             dropped: snapshot.dropped,
             filter: wayfinder_log::current_spec().as_str().into(),
         }
+    }
+}
+
+impl RouterWrites for Mock {
+    fn set_auth(&mut self, _seed: &[u8], _cert: &[u8], _trust_anchor: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn set_config(&mut self, _config: RuntimeConfigData) -> Result<(), String> {
+        Ok(())
     }
 
     fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
@@ -486,8 +499,13 @@ async fn client_roundtrips_against_real_tls_server() {
             node_seed,
             snapshot_tx,
             query_tx,
-            None,
-            Some(authority_tx),
+            wayfinder_server::ServerServices {
+                authority_tx: Some(authority_tx),
+                // No shared read handle: this harness has no driver behind
+                // the listener, so reads travel the query channel as they
+                // always did.
+                ..Default::default()
+            },
         )
         .await;
     });

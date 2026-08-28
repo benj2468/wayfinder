@@ -325,13 +325,21 @@ The workspace splits into the `no_std` routing core, radio drivers, host-side
   core does verification + X25519 agreement; the `std`-gated `Authority` is the
   CA. Payloads are never encrypted — authenticity + segregation only.
 - **libs/wayfinder-protos** → management API protobuf (`prost`, package
-  `wayfinder.v1alpha`); `service.rs` defines `WayfinderDataProvider`. `buf lint`
-  runs here; the `serde` feature is used by the CLI.
-- **libs/wayfinder-server** → the mgmt-API server: `RouterAdapter` (`no_std`+
-  `alloc`, projects a borrowed `CentralRouter`), the `std` authenticated
-  TLS-over-TCP transport (`bind_tcp_server`/`serve_tls_server` +
-  `QueryTx`/`QueryRx`), the `embedded` framing/`serve` loop, and `authority.rs`
-  (the CA in provider mode; embedded nodes never link this).
+  `wayfinder.v1alpha`); `service.rs` defines `WayfinderDataProvider`. `rpc.rs`
+  holds the **RPC declaration table**: every request kind declared once with the
+  owner that answers it, its audit class, the access tiers that may invoke it,
+  and the rate-limit bucket it spends — `rpc_table!` generates the five
+  classifiers those used to be spread across. Adding a request kind means one
+  proto field and one table entry; a kind missing from either does not compile.
+  `buf lint` runs here; the `serde` feature is used by the CLI.
+- **libs/wayfinder-server** → the mgmt-API server: `RouterAdapter`/`RouterView`
+  (`no_std`+`alloc`, project a borrowed `CentralRouter` onto the `RouterWrites`
+  and `RouterReads` halves), the `std` authenticated TLS-over-TCP transport
+  (`bind_tcp_server`/`serve_tls_server` + `QueryTx`/`QueryRx`), `RouterHandle`
+  (the shared read lock a management *read* is served through, on the
+  connection's own task rather than on the driver loop), the `embedded`
+  framing/`serve` loop, and `authority.rs` (the CA in provider mode; embedded
+  nodes never link this).
 - **libs/wayfinder-tls-mgmt** — the shared mgmt-TLS bridge between the mesh
   Ed25519 identity and rustls **raw public keys** (RFC 7250, no X.509):
   `certified_key_from_seed`, `verify_raw_key_signature`. Depended on by both

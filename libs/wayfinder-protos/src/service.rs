@@ -664,16 +664,29 @@ pub struct AlarmsData {
     pub now_ms: u64,
 }
 
-/// Router-facing state for [`WayfinderService`]: the routing and link tables,
-/// node settings, alarms and logs a node answers from its own router, with no
-/// certificate authority involved.
+/// The router state a node can answer *without mutating anything*: the routing
+/// and link tables, metrics, alarms and logs.
 ///
-/// Split from [`AuthorityDataProvider`] so the two halves can be owned by
-/// different executors — see
-/// `docs/design/implemented/13-certificate-authority-off-the-router-loop.md`. Intentionally
-/// transport- and protocol-agnostic so callers can implement it for whatever
-/// router type they have.
-pub trait RouterDataProvider {
+/// Split from [`RouterWrites`] so the two can be reached through different
+/// borrows of the same router. Every method here takes `&self`, so a host can
+/// serve them from a shared read lock on its own task while the driver's event
+/// loop keeps forwarding frames — where a single `&mut` provider would have
+/// forced every read onto that loop. An implementor that owns its router
+/// exclusively (an embedded node, the tick driver) implements both halves and
+/// notices nothing.
+///
+/// Two traits rather than one, and the reason is narrower than it looks. It is
+/// *not* that this makes a misrouted mutation a compile error — `handle_router_read`
+/// taking `&P` would give that on its own, by ordinary borrowing. It is that a
+/// read-only projection over a shared borrow (`wayfinder-server`'s `RouterView`,
+/// which holds `&CentralRouter` and an owned seed) **structurally cannot
+/// implement the mutations at all**. With one combined trait it would have to
+/// stub them with `unreachable!()` to exist, and a stub is exactly the runtime
+/// failure this arrangement is supposed to remove.
+///
+/// Intentionally transport- and protocol-agnostic so callers can implement it
+/// for whatever router type they have.
+pub trait RouterReads {
     /// This node's own identifier (raw MAC bytes).
     fn node_id(&self) -> Vec<u8>;
     /// Number of originators (reachable nodes) currently in the routing table.
@@ -706,14 +719,6 @@ pub trait RouterDataProvider {
     /// `None` if the raw bytes can't be parsed as a valid identifier for
     /// this provider's address family.
     fn resolve_route(&self, destination: &[u8]) -> Option<RouteResolutionData>;
-    /// Set the auth state on the node
-    fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String>;
-
-    /// Apply a partial update to the node's runtime configuration. Only the
-    /// fields present in `config` are changed; unset fields are left as they
-    /// are. In-memory only — does not persist across a restart.
-    fn set_config(&mut self, config: RuntimeConfigData) -> Result<(), String>;
-
     /// Whether this node currently has a runtime configuration override
     /// applied via [`set_config`](WayfinderDataProvider::set_config), as
     /// opposed to running purely off its startup configuration.
@@ -736,13 +741,6 @@ pub trait RouterDataProvider {
     /// projecting state it owns.  A node that has never raised one answers with
     /// an empty board, which is the "all systems normal" a client renders.
     fn alarms(&self) -> AlarmsData;
-
-    /// Install `directives` as the node's runtime log filter, across every sink
-    /// it writes to.  Returns the spec now in force, for readback.
-    ///
-    /// The `Err` variant is a spec that failed to parse, and leaves the previous
-    /// filter untouched: an operator typo must never blind a node.
-    fn set_log_level(&mut self, directives: &str) -> Result<String, String>;
 
     /// This node's mesh authentication / security posture, evaluated from live
     /// auth state at the moment of the call.  The default reports auth disabled;
@@ -767,6 +765,47 @@ pub trait RouterDataProvider {
         None
     }
 }
+
+/// The router operations that change node state: new auth material, a runtime
+/// configuration override, a new log filter.
+///
+/// Three requests wide, and deliberately its own trait. Everything here needs
+/// `&mut`, so on a host these stay on the driver's event loop — forwarded to it
+/// over the query channel — while [`RouterReads`] is served from a shared read
+/// lock on the connection's own task. Keeping them apart in the type system is
+/// what makes that safe to rely on: a transport that routes a mutation to the
+/// read path does not compile, rather than failing at run time with a string.
+///
+/// Rare by nature, which is why they keep the channel: an operator installs a
+/// certificate or changes a log level, where a dashboard polls the reads
+/// several times a second. There is nothing to gain by taking a write lock off
+/// the loop, and a real invariant to keep by not — `set_auth` writes back
+/// through the caller's own identity-seed slot, which only the loop holds.
+pub trait RouterWrites {
+    /// Set the auth state on the node.
+    fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String>;
+
+    /// Apply a partial update to the node's runtime configuration. Only the
+    /// fields present in `config` are changed; unset fields are left as they
+    /// are. In-memory only — does not persist across a restart.
+    fn set_config(&mut self, config: RuntimeConfigData) -> Result<(), String>;
+
+    /// Install `directives` as the node's runtime log filter, across every sink
+    /// it writes to.  Returns the spec now in force, for readback.
+    ///
+    /// The `Err` variant is a spec that failed to parse, and leaves the previous
+    /// filter untouched: an operator typo must never blind a node.
+    fn set_log_level(&mut self, directives: &str) -> Result<String, String>;
+}
+
+/// Both halves of the router-facing surface, for an implementor that owns its
+/// router exclusively and has no reason to distinguish them.
+///
+/// A blanket impl, so implementing [`RouterReads`] and [`RouterWrites`] is all
+/// anyone has to do.
+pub trait RouterDataProvider: RouterReads + RouterWrites {}
+
+impl<T: RouterReads + RouterWrites> RouterDataProvider for T {}
 
 /// The answer every authority-facing request gives on a node that runs no
 /// certificate authority.
@@ -1393,291 +1432,18 @@ pub fn enrollment_policy_data(policy: EnrollmentPolicy) -> Result<EnrollmentPoli
     })
 }
 
-/// A short, stable, non-secret name for a request variant, for logging.
-/// Never derived from `Debug` on the whole variant: some request payloads
-/// (`SetAuthRequest`'s identity seed, CSR key material) are secret, so only
-/// the kind — never the fields — may be logged.
-pub fn request_kind_name(k: &RequestKind) -> &'static str {
-    match k {
-        RequestKind::GetNodeInfo(_) => "GetNodeInfo",
-        RequestKind::GetRoutingTable(_) => "GetRoutingTable",
-        RequestKind::GetLinkQualityTable(_) => "GetLinkQualityTable",
-        RequestKind::ResolveRoute(_) => "ResolveRoute",
-        RequestKind::GetOgmSchedule(_) => "GetOgmSchedule",
-        RequestKind::GetThroughput(_) => "GetThroughput",
-        RequestKind::GetMetrics(_) => "GetMetrics",
-        RequestKind::SetAuth(_) => "SetAuth",
-        RequestKind::GetTrustAnchor(_) => "GetTrustAnchor",
-        RequestKind::SubmitCsr(_) => "SubmitCsr",
-        RequestKind::RevokeNode(_) => "RevokeNode",
-        RequestKind::GetSecurityStatus(_) => "GetSecurityStatus",
-        RequestKind::ListCerts(_) => "ListCerts",
-        RequestKind::ListPendingCsrs(_) => "ListPendingCsrs",
-        RequestKind::ApproveCsr(_) => "ApproveCsr",
-        RequestKind::DenyCsr(_) => "DenyCsr",
-        RequestKind::SetConfig(_) => "SetConfig",
-        RequestKind::GetKeepaliveTable(_) => "GetKeepaliveTable",
-        RequestKind::Authenticate(_) => "Authenticate",
-        RequestKind::GetLinkFeaturesTable(_) => "GetLinkFeaturesTable",
-        RequestKind::GetLogs(_) => "GetLogs",
-        RequestKind::GetAlarms(_) => "GetAlarms",
-        RequestKind::GetOwnCert(_) => "GetOwnCert",
-        RequestKind::SetLogLevel(_) => "SetLogLevel",
-        RequestKind::RevealEnrollmentToken(_) => "RevealEnrollmentToken",
-        RequestKind::AuthenticateUser(_) => "AuthenticateUser",
-        RequestKind::ListUsers(_) => "ListUsers",
-        RequestKind::CreateUser(_) => "CreateUser",
-        RequestKind::RemoveUser(_) => "RemoveUser",
-        RequestKind::GetVpnEnrollment(_) => "GetVpnEnrollment",
-        RequestKind::ListVpnPeers(_) => "ListVpnPeers",
-        RequestKind::RevokeVpnPeer(_) => "RevokeVpnPeer",
-        RequestKind::CreateUserInvite(_) => "CreateUserInvite",
-        RequestKind::ListUserInvites(_) => "ListUserInvites",
-        RequestKind::RevokeUserInvite(_) => "RevokeUserInvite",
-        RequestKind::BeginUserRegistration(_) => "BeginUserRegistration",
-        RequestKind::CompleteUserRegistration(_) => "CompleteUserRegistration",
-        RequestKind::RevokeUserSessions(_) => "RevokeUserSessions",
-        RequestKind::SetUserRole(_) => "SetUserRole",
-        RequestKind::SetUserEnabled(_) => "SetUserEnabled",
-        RequestKind::SetUserPassword(_) => "SetUserPassword",
-    }
-}
-
-/// What kind of record a request deserves in the node's log.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Audited {
-    /// Changes node or provider state: new auth material, a config change, a
-    /// CSR issued/approved/denied, a node revoked.
-    Mutation,
-    /// Changes nothing but hands out a secret. Worth the same record as a
-    /// mutation and for the same reason — an operator asking "who learned the
-    /// enrollment token, and when?" has nowhere else to look — but it is not a
-    /// mutation, and a log line calling it one would be a lie about what
-    /// happened.
-    Disclosure,
-    /// Reads public state. Frequent (a dashboard polls several per second), so
-    /// logged at `debug!` and off by default.
-    Query,
-}
-
-/// Classify `k` for [`WayfinderService::handle`]'s audit record.
-///
-/// Deliberately exhaustive (no wildcard arm) so a newly added `RequestKind`
-/// variant forces an explicit classification here rather than silently
-/// defaulting to the quietest one.
-fn audited(k: &RequestKind) -> Audited {
-    match k {
-        RequestKind::RevealEnrollmentToken(_) => Audited::Disclosure,
-
-        RequestKind::SetAuth(_)
-        | RequestKind::SetConfig(_)
-        | RequestKind::SubmitCsr(_)
-        | RequestKind::RevokeNode(_)
-        | RequestKind::ApproveCsr(_)
-        | RequestKind::DenyCsr(_)
-        // Changing what a node records is an operator action worth an audit
-        // trail, and infrequent enough to afford one.
-        | RequestKind::SetLogLevel(_)
-        // A login mints a certificate the whole mesh honours, and the record is
-        // the only place "who logged in, and when" is answerable. Logged
-        // whatever the outcome — a failed login is the more interesting half —
-        // and never with the credentials, which `request_kind_name` guarantees
-        // by naming the kind and never the fields.
-        | RequestKind::AuthenticateUser(_)
-        // Creating an account is creating something that can mint a certificate
-        // the whole mesh honours. If any request deserves a durable record of
-        // who asked, it is this one — and, as above, the record names the kind
-        // and never the fields, so the password it carries is never in it.
-        | RequestKind::CreateUser(_)
-        // And removing one ends somebody's access. Both halves of an account's
-        // lifetime leave a record, or the record answers "who was given access"
-        // without ever answering "who took it away".
-        | RequestKind::RemoveUser(_)
-        // Minting a tunnel credential is handing out a bearer secret, so it is
-        // audited for the same reason RevealEnrollmentToken is — except that
-        // this one also *creates* the thing it discloses, and creates it at a
-        // remote coordination server this node cannot later query for "when was
-        // this issued". The record here is the only account of it.
-        | RequestKind::GetVpnEnrollment(_)
-        // Removing a peer's tunnel reachability is an operator action that
-        // takes access away, and the retry path for a partially-failed mesh
-        // revocation runs through it.
-        | RequestKind::RevokeVpnPeer(_)
-        // Minting an invite is deciding that an account will exist, with a role
-        // chosen now and applied up to a week later. The same reasoning as
-        // CreateUser beside it, one step earlier in time.
-        | RequestKind::CreateUserInvite(_)
-        // And revoking one takes that decision back — often *because* the
-        // record shows a start nobody expected.
-        | RequestKind::RevokeUserInvite(_)
-        // Taking away access somebody currently holds, which is the same
-        // reasoning that audits RemoveUser beside it — and this is the half of
-        // RemoveUser that actually ends a session, reachable on its own.
-        | RequestKind::RevokeUserSessions(_)
-        // A mutation, not a Disclosure, despite handing out the account's
-        // `otpauth://` URI: it consumes the invite, so classifying it as "reads
-        // public state but hands out a secret" would be a lie about what
-        // happened.
-        //
-        // **This record is the durable one.** The invitation's own `started_at`
-        // is the shorter-lived account of the same event, not the longer one —
-        // a started invite is swept fifteen minutes later when its handle
-        // window closes (`CertAuthority::evict_expired_invites`), taking the
-        // name and the signal with it. What persists is the log: on a host CA
-        // this line reaches the process's journal, which outlives both this
-        // bounded ring and the invite record. `started_at` is the *operator's*
-        // signal — the thing an admin triaging the panel acts on now — and its
-        // disappearance is logged too, for the same reason this is.
-        | RequestKind::BeginUserRegistration(_)
-        // Creating an account that can mint a certificate the whole mesh
-        // honours, *from an anonymous connection*. Strictly more deserving of a
-        // record than CreateUser, which at least required a grant to reach.
-        | RequestKind::CompleteUserRegistration(_)
-        // Changing what an account may do, and — on a demotion — ending the
-        // admin sessions it already held. The same reasoning that audits
-        // RemoveUser and RevokeUserSessions beside it: this is how somebody's
-        // administrative access begins and ends without the account itself
-        // changing, and a log that recorded only creation and deletion would
-        // answer "who can administer this mesh?" with a roster that was never
-        // true.
-        | RequestKind::SetUserRole(_)
-        // Cutting an account off, and restoring it. Both directions matter: the
-        // record of who re-enabled a disabled account is the one an operator
-        // wants when the account turns out to have been disabled for a reason.
-        | RequestKind::SetUserEnabled(_)
-        // Replacing the credential of an account that can mint a certificate
-        // the whole mesh honours. As with CreateUser, the record names the kind
-        // and never the fields, so the password it carries is never in it.
-        | RequestKind::SetUserPassword(_) => Audited::Mutation,
-
-        RequestKind::GetNodeInfo(_)
-        | RequestKind::GetRoutingTable(_)
-        | RequestKind::GetLinkQualityTable(_)
-        | RequestKind::ResolveRoute(_)
-        | RequestKind::GetOgmSchedule(_)
-        | RequestKind::GetThroughput(_)
-        | RequestKind::GetMetrics(_)
-        | RequestKind::GetTrustAnchor(_)
-        | RequestKind::GetSecurityStatus(_)
-        | RequestKind::ListCerts(_)
-        | RequestKind::ListPendingCsrs(_)
-        | RequestKind::GetKeepaliveTable(_)
-        | RequestKind::Authenticate(_)
-        | RequestKind::GetLinkFeaturesTable(_)
-        // Deliberately a query, and deliberately unlogged: a client polls this
-        // on every refresh tick, and a record emitted per poll would fill the
-        // very ring the poll is reading.
-        | RequestKind::GetLogs(_)
-        // A poll, on the same tick as GetLogs and unlogged for the same reason:
-        // a record per poll would fill the ring an operator reads next to it.
-        | RequestKind::GetAlarms(_)
-        // Hands out no secret, so it is a query rather than the disclosure
-        // record `RevealEnrollmentToken` earns. A membership certificate is
-        // public-key material plus the root's signature over it: every field
-        // it carries is already served by `GetSecurityStatus` beside it, and
-        // what this adds is the signature, which is what one *verifies* with.
-        //
-        // Note the reason is that overlap and not "it is on the air anyway" —
-        // under `lazy_cert_distribution` this node's OGMs carry an 8-byte
-        // fingerprint instead of the certificate, so an argument resting on
-        // the medium would be false in a configuration this build supports.
-        | RequestKind::GetOwnCert(_)
-        // A read of provider state, like ListCerts beside it. Not a disclosure:
-        // it hands out no secret, only the roster — and only to a client that
-        // already holds a full management grant.
-        | RequestKind::ListUsers(_)
-        // A read of the coordination server's roster, like ListCerts beside it,
-        // and polled by the dashboard the same way.
-        | RequestKind::ListVpnPeers(_)
-        // A read of provider state, beside ListUsers. The security-relevant
-        // signal it carries — a started-but-unfinished invite — is durable in
-        // the record itself, so it needs no log line to survive.
-        | RequestKind::ListUserInvites(_) => Audited::Query,
-    }
-}
-
-/// Which owner answers a given request.
-///
-/// The management API is served from three different places, and a caller that
-/// knows which one *before* it sends anything can route a request to the right
-/// owner rather than discovering the answer from an error. That is what lets
-/// the certificate authority live off the router's event loop — see
-/// `docs/design/implemented/13-certificate-authority-off-the-router-loop.md`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestFacet {
-    /// Answered from router state alone, by [`handle_router`].
-    Router,
-    /// Answered from certificate-authority state alone, by [`handle_authority`].
-    Authority,
-    /// Answered by the transport itself rather than by either dispatcher: the
-    /// VPN requests are served in the connection task (they are scoped to the
-    /// caller's own identity, which no provider holds), and `Authenticate` is
-    /// the transport's own first frame.
-    ///
-    /// A fork on this enum must still handle one arriving anyway — an
-    /// `Authenticate` repeated mid-connection reaches the router half, which
-    /// declines it. Answer that with [`handle_unowned`], which names the
-    /// protocol error, not with the not-a-provider message.
-    Transport,
-}
-
-/// Classify `kind` by the owner that answers it.
-///
-/// Exhaustive over [`RequestKind`] on purpose — a new request kind must be
-/// given an owner here before it will compile, which is the check that keeps a
-/// forked caller from silently sending it to the wrong half.
-pub fn request_facet(kind: &RequestKind) -> RequestFacet {
-    match kind {
-        RequestKind::GetAlarms(_)
-        | RequestKind::GetKeepaliveTable(_)
-        | RequestKind::GetLinkFeaturesTable(_)
-        | RequestKind::GetLinkQualityTable(_)
-        | RequestKind::GetLogs(_)
-        | RequestKind::GetMetrics(_)
-        | RequestKind::GetNodeInfo(_)
-        | RequestKind::GetOgmSchedule(_)
-        // Answered from the router's live auth state, like the security status
-        // beside it — never from wherever the certificate was loaded, which is
-        // the authority's business and not every node has one.
-        | RequestKind::GetOwnCert(_)
-        | RequestKind::GetRoutingTable(_)
-        | RequestKind::GetSecurityStatus(_)
-        | RequestKind::GetThroughput(_)
-        | RequestKind::ResolveRoute(_)
-        | RequestKind::SetAuth(_)
-        | RequestKind::SetConfig(_)
-        | RequestKind::SetLogLevel(_) => RequestFacet::Router,
-        RequestKind::ApproveCsr(_)
-        | RequestKind::AuthenticateUser(_)
-        | RequestKind::CreateUser(_)
-        | RequestKind::DenyCsr(_)
-        | RequestKind::GetTrustAnchor(_)
-        | RequestKind::ListCerts(_)
-        | RequestKind::ListPendingCsrs(_)
-        | RequestKind::ListUsers(_)
-        | RequestKind::RemoveUser(_)
-        | RequestKind::RevealEnrollmentToken(_)
-        | RequestKind::RevokeNode(_)
-        | RequestKind::SubmitCsr(_)
-        // The invite store lives beside the user store, on the authority. The
-        // two redemption kinds included: an anonymous registrant reaches them
-        // with no credential, but what answers them is still authority state
-        // and nothing the router holds.
-        | RequestKind::CreateUserInvite(_)
-        | RequestKind::ListUserInvites(_)
-        | RequestKind::RevokeUserInvite(_)
-        | RequestKind::BeginUserRegistration(_)
-        | RequestKind::CompleteUserRegistration(_)
-        | RequestKind::RevokeUserSessions(_)
-        | RequestKind::SetUserRole(_)
-        | RequestKind::SetUserEnabled(_)
-        | RequestKind::SetUserPassword(_) => RequestFacet::Authority,
-        RequestKind::Authenticate(_)
-        | RequestKind::GetVpnEnrollment(_)
-        | RequestKind::ListVpnPeers(_)
-        | RequestKind::RevokeVpnPeer(_) => RequestFacet::Transport,
-    }
-}
+// The five per-request classifiers — `request_kind_name`, `audited`,
+// `request_facet`, `access_tiers` and `rate_limit` — used to be five
+// hand-written matches here. They are generated from the one declaration table
+// in `crate::rpc` now, so a request kind is classified where it is declared
+// rather than in five places that had to be kept in step by hand. Re-exported
+// under their original paths because this module is where every caller names
+// them.
+pub use crate::rpc::Audited;
+pub use crate::rpc::RequestFacet;
+pub use crate::rpc::audited;
+pub use crate::rpc::request_facet;
+pub use crate::rpc::request_kind_name;
 
 /// Emit the audit record for `request`, if its kind warrants one.
 ///
@@ -1695,14 +1461,20 @@ pub fn audit_request(request: &WayfinderRequest) {
     }
 }
 
-/// Answer `request` from router state.
+/// Answer `request` from router state, without mutating anything.
 ///
-/// Returns the request unconsumed as `Err` when it is not
-/// [`RequestFacet::Router`], so a caller holding only this half can forward it
-/// to the owner that can answer it — rather than returning an error from a half
-/// that was never asked. Does not audit; see [`audit_request`].
-pub fn handle_router<P: RouterDataProvider>(
-    provider: &mut P,
+/// Takes the provider by shared reference, which is the whole point: a host
+/// serves this from a read lock on the router while the driver's event loop
+/// goes on forwarding frames, and several connections serve it at once. A
+/// request that would mutate cannot be answered here — it is not in the match,
+/// so it comes back as `Err` for [`handle_router_write`] to take.
+///
+/// Returns the request unconsumed as `Err` when this half does not own it, so a
+/// caller holding only this half can forward it to the owner that can — rather
+/// than returning an error from a half that was never asked. Does not audit;
+/// see [`audit_request`].
+pub fn handle_router_read<P: RouterReads + ?Sized>(
+    provider: &P,
     request: WayfinderRequest,
 ) -> Result<WayfinderResponse, WayfinderRequest> {
     let response = match request.request {
@@ -1810,14 +1582,6 @@ pub fn handle_router<P: RouterDataProvider>(
                 dropped: board.dropped,
                 now_ms: board.now_ms,
             })
-        }
-        Some(RequestKind::SetLogLevel(req)) => {
-            match provider.set_log_level(&req.directives) {
-                Ok(directives) => ResponseKind::LogFilter(LogFilter { directives }),
-                // A spec that didn't parse. The previous filter is still in
-                // force, so this is a report, not a state change.
-                Err(message) => ResponseKind::Error(ErrorResponse { message }),
-            }
         }
         Some(RequestKind::GetOgmSchedule(_)) => {
             let entries = provider
@@ -1953,6 +1717,43 @@ pub fn handle_router<P: RouterDataProvider>(
                 message: "invalid destination identifier".into(),
             }),
         },
+        Some(RequestKind::GetKeepaliveTable(_)) => {
+            let entries = provider
+                .keepalive_table()
+                .into_iter()
+                .map(|e| KeepAliveEntry {
+                    neighbor_id: e.neighbor_id,
+                    ms_since_last_heard: e.ms_since_last_heard,
+                    interval_estimate_ms: e.interval_estimate_ms,
+                    missed: e.missed,
+                })
+                .collect();
+            ResponseKind::KeepaliveTable(KeepAliveTable { entries })
+        }
+
+        other => return Err(WayfinderRequest { request: other }),
+    };
+
+    Ok(WayfinderResponse {
+        response: Some(response),
+    })
+}
+
+/// Answer `request` by changing router state.
+///
+/// The mutating mirror of [`handle_router_read`], and deliberately a separate
+/// function reached through a separate trait: on a host these three run on the
+/// driver's event loop, where a `&mut CentralRouter` exists, while the reads
+/// run anywhere. A transport that sent a mutation down the read path would
+/// have to pass a `&P` where `&mut P` is required, which does not compile.
+///
+/// Returns the request unconsumed as `Err` when this half does not own it.
+/// Does not audit; see [`audit_request`].
+pub fn handle_router_write<P: RouterWrites + ?Sized>(
+    provider: &mut P,
+    request: WayfinderRequest,
+) -> Result<WayfinderResponse, WayfinderRequest> {
+    let response = match request.request {
         Some(RequestKind::SetAuth(set_auth)) => {
             match provider.set_auth(&set_auth.seed, &set_auth.cert, &set_auth.trust_anchor) {
                 Ok(_) => ResponseKind::Empty(Empty {}),
@@ -2005,18 +1806,13 @@ pub fn handle_router<P: RouterDataProvider>(
                 Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
             }
         }
-        Some(RequestKind::GetKeepaliveTable(_)) => {
-            let entries = provider
-                .keepalive_table()
-                .into_iter()
-                .map(|e| KeepAliveEntry {
-                    neighbor_id: e.neighbor_id,
-                    ms_since_last_heard: e.ms_since_last_heard,
-                    interval_estimate_ms: e.interval_estimate_ms,
-                    missed: e.missed,
-                })
-                .collect();
-            ResponseKind::KeepaliveTable(KeepAliveTable { entries })
+        Some(RequestKind::SetLogLevel(req)) => {
+            match provider.set_log_level(&req.directives) {
+                Ok(directives) => ResponseKind::LogFilter(LogFilter { directives }),
+                // A spec that didn't parse. The previous filter is still in
+                // force, so this is a report, not a state change.
+                Err(message) => ResponseKind::Error(ErrorResponse { message }),
+            }
         }
 
         other => return Err(WayfinderRequest { request: other }),
@@ -2025,6 +1821,28 @@ pub fn handle_router<P: RouterDataProvider>(
     Ok(WayfinderResponse {
         response: Some(response),
     })
+}
+
+/// Answer `request` from either half of the router surface.
+///
+/// For an implementor that owns its router exclusively and has no reason to
+/// split the two — an embedded node, the tick driver, a test harness. A host
+/// that serves reads off its event loop calls the two halves directly instead,
+/// which is what lets it hold different borrows for each.
+///
+/// Returns the request unconsumed as `Err` when neither half owns it. Does not
+/// audit; see [`audit_request`].
+pub fn handle_router<P: RouterDataProvider + ?Sized>(
+    provider: &mut P,
+    request: WayfinderRequest,
+) -> Result<WayfinderResponse, WayfinderRequest> {
+    // Reads first: they are the overwhelming majority of what arrives, and the
+    // write half's match is three arms long.
+    let request = match handle_router_read(provider, request) {
+        Ok(response) => return Ok(response),
+        Err(request) => request,
+    };
+    handle_router_write(provider, request)
 }
 
 /// Answer `request` from certificate-authority state.
@@ -2439,40 +2257,74 @@ mod tests {
         own_cert: Option<OwnCertData>,
     }
 
-    impl RouterDataProvider for MockProvider {
+    impl RouterReads for MockProvider {
         fn node_id(&self) -> Vec<u8> {
             vec![]
         }
+
         fn num_originators(&self) -> u32 {
             0
         }
+
         fn auth_locked(&self) -> bool {
             false
         }
+
         fn routing_table(&self) -> Vec<RoutingEntryData> {
             vec![]
         }
+
         fn link_quality_table(&self) -> Vec<LinkQualityEntryData> {
             self.link_quality.clone()
         }
+
         fn link_features_table(&self) -> Vec<LinkFeaturesEntryData> {
             self.link_features.clone()
         }
+
         fn keepalive_table(&self) -> Vec<KeepAliveEntryData> {
             self.keepalive.clone()
         }
+
         fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData> {
             self.ogm_schedule.clone()
         }
+
         fn throughput(&self) -> Vec<InterfaceThroughputData> {
             self.throughput.clone()
         }
+
         fn node_metrics(&self) -> NodeMetricsData {
             self.node_metrics.clone()
         }
+
         fn resolve_route(&self, _destination: &[u8]) -> Option<RouteResolutionData> {
             self.route_resolution.clone()
         }
+
+        fn runtime_config_active(&self) -> bool {
+            self.runtime_config_active
+        }
+
+        fn alarms(&self) -> AlarmsData {
+            self.alarms.clone()
+        }
+
+        fn logs(&self, since_seq: u64, max_records: u32) -> LogsData {
+            self.last_logs_query.set((since_seq, max_records));
+            self.logs.clone()
+        }
+
+        fn security_status(&self) -> SecurityStatusData {
+            self.security_status.clone()
+        }
+
+        fn own_cert(&self) -> Option<OwnCertData> {
+            self.own_cert.clone()
+        }
+    }
+
+    impl RouterWrites for MockProvider {
         fn set_auth(
             &mut self,
             _seed: &[u8],
@@ -2481,6 +2333,7 @@ mod tests {
         ) -> Result<(), String> {
             Ok(())
         }
+
         fn set_config(&mut self, config: RuntimeConfigData) -> Result<(), String> {
             if let Some(t) = &config.trickle
                 && t.iface_idx == u32::MAX
@@ -2492,22 +2345,7 @@ mod tests {
             self.last_set_config = Some(config);
             Ok(())
         }
-        fn runtime_config_active(&self) -> bool {
-            self.runtime_config_active
-        }
-        fn alarms(&self) -> AlarmsData {
-            self.alarms.clone()
-        }
-        fn logs(&self, since_seq: u64, max_records: u32) -> LogsData {
-            self.last_logs_query.set((since_seq, max_records));
-            self.logs.clone()
-        }
-        fn security_status(&self) -> SecurityStatusData {
-            self.security_status.clone()
-        }
-        fn own_cert(&self) -> Option<OwnCertData> {
-            self.own_cert.clone()
-        }
+
         fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
             match &self.set_log_level_error {
                 Some(error) => Err(error.clone()),
@@ -2854,7 +2692,7 @@ mod tests {
     #[test]
     fn own_cert_is_a_query_answered_by_the_router_half() {
         let kind = RequestKind::GetOwnCert(GetOwnCertRequest {});
-        assert_eq!(request_facet(&kind), RequestFacet::Router);
+        assert_eq!(request_facet(&kind), RequestFacet::RouterRead);
         assert_eq!(request_kind_name(&kind), "GetOwnCert");
         assert_eq!(audited(&kind), Audited::Query);
     }
@@ -3984,7 +3822,7 @@ mod tests {
     fn request_facet_assigns_each_kind_to_one_half() {
         assert_eq!(
             request_facet(&RequestKind::GetRoutingTable(GetRoutingTableRequest {})),
-            RequestFacet::Router
+            RequestFacet::RouterRead
         );
         assert_eq!(
             request_facet(&RequestKind::ListUsers(ListUsersRequest {})),
