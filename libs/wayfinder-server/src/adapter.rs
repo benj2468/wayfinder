@@ -1,4 +1,4 @@
-//! The [`RouterDataProvider`] adapter over the router.
+//! The [`RouterReads`]/[`RouterWrites`] adapter over the router.
 //!
 //! Newtype so we can implement the external trait for the external
 //! [`CentralRouter`]. This layer is `no_std` + `alloc` and carries no
@@ -39,7 +39,8 @@ use wayfinder_protos::service::NodeSecurityData;
 use wayfinder_protos::service::OgmScheduleEntryData;
 use wayfinder_protos::service::OwnCertData;
 use wayfinder_protos::service::RouteResolutionData;
-use wayfinder_protos::service::RouterDataProvider;
+use wayfinder_protos::service::RouterReads;
+use wayfinder_protos::service::RouterWrites;
 use wayfinder_protos::service::RoutingEntryData;
 use wayfinder_protos::service::RuntimeConfigData;
 use wayfinder_protos::service::SecurityStatusData;
@@ -274,14 +275,6 @@ impl<
         }
     }
 
-    /// Interface `idx`'s configured name, or the empty string when it was never
-    /// named.  The wire carries "unnamed" as an empty `iface_name` rather than a
-    /// synthesized placeholder, so a client can tell a deliberately-named
-    /// interface from one that just fell back to its index.
-    fn interface_name(&self, idx: usize) -> String {
-        self.router.interface_name(idx).unwrap_or_default().into()
-    }
-
     /// Calculate the now time with the epoch unix offset.
     fn unix_now(&self) -> Duration {
         self.epoch_unix + self.now
@@ -333,6 +326,60 @@ fn log_level_data(level: wayfinder_log::Level) -> LogLevelData {
     }
 }
 
+/// A read-only projection of the router, and everything the sixteen `&self`
+/// answers need to build a response.
+///
+/// Exists so those answers have exactly one implementation while being
+/// reachable through two different borrows. A host serves them from a shared
+/// read lock on its own connection task, several at once, while the driver's
+/// event loop goes on forwarding frames; [`RouterAdapter`] — which holds the
+/// `&mut` the three mutations need — answers them by building one of these and
+/// delegating.
+///
+/// Carries `now` for the same reason [`RouterAdapter`] does: throughput is a
+/// *rate* evaluated at an instant, so an idle interface must read as a decaying
+/// rate rather than a stale one. Build a fresh view per request.
+///
+/// The identity seed is a *value* here, not the writable slot
+/// [`RouterAdapter`] holds: nothing on this side installs one, and a read that
+/// could write back through a shared borrow is precisely what this type exists
+/// to make unrepresentable.
+pub struct RouterView<
+    'a,
+    const ORIGINATORS: usize = { wayfinder::host::ORIGINATORS },
+    const INTERFACES: usize = { wayfinder::host::INTERFACES },
+    const MCAST_MEMBERS: usize = { wayfinder::host::MCAST_MEMBERS },
+    const LOCAL_MCAST: usize = { wayfinder::host::LOCAL_MCAST },
+    const IDENT_TABLE: usize = { wayfinder::host::IDENT_TABLE },
+    const IDENT_LIVE: usize = { wayfinder::host::IDENT_LIVE },
+    const LINK_QUALITY: usize = { wayfinder::host::LINK_QUALITY },
+    const NEIGHBOR_KEYS: usize = { wayfinder::host::NEIGHBOR_KEYS },
+    const REVOKED: usize = { wayfinder::host::REVOKED },
+    const IN_FLIGHT_CERT_REQUESTS: usize = { wayfinder::host::IN_FLIGHT_CERT_REQUESTS },
+    const PENDING_REPLIES: usize = { wayfinder::host::PENDING_REPLIES },
+> {
+    router: &'a CentralRouter<
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    >,
+    now: Duration,
+    /// The enrollment policy in force, as the authority last published it, or
+    /// `None` on a node that runs no authority at all.
+    enrollment: Option<EnrollmentPolicyStatusData>,
+    /// This node's identity seed, if it has one — reported by
+    /// `security_status`, and by nothing else here.
+    identity_seed: Option<[u8; 32]>,
+}
+
 impl<
     const ORIGINATORS: usize,
     const INTERFACES: usize,
@@ -345,8 +392,103 @@ impl<
     const REVOKED: usize,
     const IN_FLIGHT_CERT_REQUESTS: usize,
     const PENDING_REPLIES: usize,
-> RouterDataProvider
-    for RouterAdapter<
+>
+    RouterView<
+        '_,
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    >
+{
+    /// Wrap a borrowed router for reading, evaluating time-varying metrics as
+    /// of `now` — the same monotonic instant the driver stamps on received
+    /// frames.
+    pub fn new(
+        router: &CentralRouter<
+            ORIGINATORS,
+            INTERFACES,
+            MCAST_MEMBERS,
+            LOCAL_MCAST,
+            IDENT_TABLE,
+            IDENT_LIVE,
+            LINK_QUALITY,
+            NEIGHBOR_KEYS,
+            REVOKED,
+            IN_FLIGHT_CERT_REQUESTS,
+            PENDING_REPLIES,
+        >,
+        now: Duration,
+    ) -> RouterView<
+        '_,
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    > {
+        RouterView {
+            router,
+            now,
+            enrollment: None,
+            identity_seed: None,
+        }
+    }
+
+    /// Report `enrollment` as the enrollment policy in force.
+    #[must_use]
+    pub fn with_enrollment_policy(
+        mut self,
+        enrollment: Option<EnrollmentPolicyStatusData>,
+    ) -> Self {
+        self.enrollment = enrollment;
+        self
+    }
+
+    /// Report `seed` as the identity this node runs as, so `security_status`
+    /// can name the keys a client would ask a provider to certify.
+    #[must_use]
+    pub fn with_identity(mut self, seed: Option<[u8; 32]>) -> Self {
+        self.identity_seed = seed;
+        self
+    }
+
+    /// Interface `idx`'s configured name, or the empty string when it was never
+    /// named.  The wire carries "unnamed" as an empty `iface_name` rather than a
+    /// synthesized placeholder, so a client can tell a deliberately-named
+    /// interface from one that just fell back to its index.
+    fn interface_name(&self, idx: usize) -> String {
+        self.router.interface_name(idx).unwrap_or_default().into()
+    }
+}
+
+impl<
+    const ORIGINATORS: usize,
+    const INTERFACES: usize,
+    const MCAST_MEMBERS: usize,
+    const LOCAL_MCAST: usize,
+    const IDENT_TABLE: usize,
+    const IDENT_LIVE: usize,
+    const LINK_QUALITY: usize,
+    const NEIGHBOR_KEYS: usize,
+    const REVOKED: usize,
+    const IN_FLIGHT_CERT_REQUESTS: usize,
+    const PENDING_REPLIES: usize,
+> RouterReads
+    for RouterView<
         '_,
         ORIGINATORS,
         INTERFACES,
@@ -488,9 +630,7 @@ impl<
         // un-enrolled node still has one, and reporting it is what lets a
         // client ask a provider to certify *this* node rather than mint some
         // new identity the node would then have to adopt.
-        let identity = self
-            .current_identity_seed()
-            .map(|seed| Keypair::from_seed(&seed));
+        let identity = self.identity_seed.map(|seed| Keypair::from_seed(&seed));
         let posture = SecurityStatusData {
             require_auth: self.router.require_auth(),
             lazy_cert_distribution: self.router.lazy_cert_distribution(),
@@ -656,6 +796,259 @@ impl<
         })
     }
 
+    fn runtime_config_active(&self) -> bool {
+        self.router.runtime_config_active()
+    }
+
+    /// Read from the process-wide log ring.
+    ///
+    /// Takes nothing from `self`: the ring is filled by the installed logging
+    /// subscriber, which is itself process-wide with no handle to thread
+    /// anywhere. That is deliberate — it is what lets a node answer `GetLogs`
+    /// without a reference to the ring being carried through the router, the
+    /// driver, and every board's bring-up, on targets where none of those layers
+    /// even exist in the same form.
+    fn logs(&self, since_seq: u64, max_records: u32) -> LogsData {
+        let snapshot = wayfinder_log::logs_since(since_seq, max_records as usize);
+        LogsData {
+            records: snapshot
+                .records
+                .into_iter()
+                .map(|r| LogRecordData {
+                    seq: r.seq,
+                    uptime_ms: r.uptime_ms,
+                    level: log_level_data(r.level),
+                    target: r.target.as_str().into(),
+                    message: r.message.as_str().into(),
+                })
+                .collect(),
+            next_seq: snapshot.next_seq,
+            dropped: snapshot.dropped,
+            filter: wayfinder_log::current_spec().as_str().into(),
+        }
+    }
+
+    /// Project the node's alarm board.
+    ///
+    /// Reads the process-global board directly, exactly as [`logs`](Self::logs)
+    /// reads the process-global log ring, and for the same reason: what writes
+    /// it is scattered across the stack with no handle to carry, so there is no
+    /// router field to project from. Nothing here decides whether a condition
+    /// holds — a detector did that when it raised the alarm — and nothing here
+    /// filters: a latched-but-quiet row travels with `active: false` rather
+    /// than being dropped, because "fired ten minutes ago and stopped" is the
+    /// answer an operator who attached late came for.
+    fn alarms(&self) -> AlarmsData {
+        let snapshot = wayfinder_alarm::snapshot();
+        let now_ms = snapshot.now_ms;
+        AlarmsData {
+            alarms: snapshot
+                .alarms
+                .into_iter()
+                .map(|a| AlarmData {
+                    kind: alarm_kind_data(a.kind),
+                    severity: alarm_severity_data(a.severity),
+                    subject: match a.subject {
+                        wayfinder_alarm::Subject::Node(id) => {
+                            AlarmSubjectData::Peer(id.as_bytes().into())
+                        }
+                        wayfinder_alarm::Subject::Interface(idx) => {
+                            AlarmSubjectData::Interface(u32::from(idx))
+                        }
+                        wayfinder_alarm::Subject::None => AlarmSubjectData::Node,
+                    },
+                    first_ms: a.first_ms,
+                    last_ms: a.last_ms,
+                    count: a.count,
+                    detail: a.detail.as_str().into(),
+                    // Evaluated here rather than left to the client: the hold
+                    // window is the node's policy and the uptime clock is the
+                    // node's, so a client computing this itself would need both.
+                    active: a.is_active(now_ms),
+                })
+                .collect(),
+            dropped: snapshot.dropped,
+            now_ms,
+        }
+    }
+}
+
+impl<
+    const ORIGINATORS: usize,
+    const INTERFACES: usize,
+    const MCAST_MEMBERS: usize,
+    const LOCAL_MCAST: usize,
+    const IDENT_TABLE: usize,
+    const IDENT_LIVE: usize,
+    const LINK_QUALITY: usize,
+    const NEIGHBOR_KEYS: usize,
+    const REVOKED: usize,
+    const IN_FLIGHT_CERT_REQUESTS: usize,
+    const PENDING_REPLIES: usize,
+>
+    RouterAdapter<
+        '_,
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    >
+{
+    /// A read-only view of this adapter's router, for answering the [`RouterReads`]
+    /// half.
+    ///
+    /// Reborrows the adapter's `&mut` as shared, so the sixteen reads have one
+    /// implementation rather than two that can drift.
+    fn view(
+        &self,
+    ) -> RouterView<
+        '_,
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    > {
+        RouterView::new(self.router, self.now)
+            .with_enrollment_policy(self.enrollment.clone())
+            .with_identity(self.current_identity_seed())
+    }
+}
+
+impl<
+    const ORIGINATORS: usize,
+    const INTERFACES: usize,
+    const MCAST_MEMBERS: usize,
+    const LOCAL_MCAST: usize,
+    const IDENT_TABLE: usize,
+    const IDENT_LIVE: usize,
+    const LINK_QUALITY: usize,
+    const NEIGHBOR_KEYS: usize,
+    const REVOKED: usize,
+    const IN_FLIGHT_CERT_REQUESTS: usize,
+    const PENDING_REPLIES: usize,
+> RouterReads
+    for RouterAdapter<
+        '_,
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    >
+{
+    fn node_id(&self) -> Vec<u8> {
+        self.view().node_id()
+    }
+
+    fn num_originators(&self) -> u32 {
+        self.view().num_originators()
+    }
+
+    fn auth_locked(&self) -> bool {
+        self.view().auth_locked()
+    }
+
+    fn routing_table(&self) -> Vec<RoutingEntryData> {
+        self.view().routing_table()
+    }
+
+    fn link_quality_table(&self) -> Vec<LinkQualityEntryData> {
+        self.view().link_quality_table()
+    }
+
+    fn link_features_table(&self) -> Vec<LinkFeaturesEntryData> {
+        self.view().link_features_table()
+    }
+
+    fn keepalive_table(&self) -> Vec<KeepAliveEntryData> {
+        self.view().keepalive_table()
+    }
+
+    fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData> {
+        self.view().ogm_schedule()
+    }
+
+    fn throughput(&self) -> Vec<InterfaceThroughputData> {
+        self.view().throughput()
+    }
+
+    fn node_metrics(&self) -> NodeMetricsData {
+        self.view().node_metrics()
+    }
+
+    fn resolve_route(&self, destination: &[u8]) -> Option<RouteResolutionData> {
+        self.view().resolve_route(destination)
+    }
+
+    fn runtime_config_active(&self) -> bool {
+        self.view().runtime_config_active()
+    }
+
+    fn logs(&self, since_seq: u64, max_records: u32) -> LogsData {
+        self.view().logs(since_seq, max_records)
+    }
+
+    fn alarms(&self) -> AlarmsData {
+        self.view().alarms()
+    }
+
+    fn security_status(&self) -> SecurityStatusData {
+        self.view().security_status()
+    }
+
+    fn own_cert(&self) -> Option<OwnCertData> {
+        self.view().own_cert()
+    }
+}
+
+impl<
+    const ORIGINATORS: usize,
+    const INTERFACES: usize,
+    const MCAST_MEMBERS: usize,
+    const LOCAL_MCAST: usize,
+    const IDENT_TABLE: usize,
+    const IDENT_LIVE: usize,
+    const LINK_QUALITY: usize,
+    const NEIGHBOR_KEYS: usize,
+    const REVOKED: usize,
+    const IN_FLIGHT_CERT_REQUESTS: usize,
+    const PENDING_REPLIES: usize,
+> RouterWrites
+    for RouterAdapter<
+        '_,
+        ORIGINATORS,
+        INTERFACES,
+        MCAST_MEMBERS,
+        LOCAL_MCAST,
+        IDENT_TABLE,
+        IDENT_LIVE,
+        LINK_QUALITY,
+        NEIGHBOR_KEYS,
+        REVOKED,
+        IN_FLIGHT_CERT_REQUESTS,
+        PENDING_REPLIES,
+    >
+{
     fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String> {
         // An empty seed means "certify the identity I already have" — the
         // enrollment case, where the point is that the node's key (and so its
@@ -801,82 +1194,6 @@ impl<
             }
         }
         Ok(())
-    }
-
-    fn runtime_config_active(&self) -> bool {
-        self.router.runtime_config_active()
-    }
-
-    /// Read from the process-wide log ring.
-    ///
-    /// Takes nothing from `self`: the ring is filled by the installed logging
-    /// subscriber, which is itself process-wide with no handle to thread
-    /// anywhere. That is deliberate — it is what lets a node answer `GetLogs`
-    /// without a reference to the ring being carried through the router, the
-    /// driver, and every board's bring-up, on targets where none of those layers
-    /// even exist in the same form.
-    fn logs(&self, since_seq: u64, max_records: u32) -> LogsData {
-        let snapshot = wayfinder_log::logs_since(since_seq, max_records as usize);
-        LogsData {
-            records: snapshot
-                .records
-                .into_iter()
-                .map(|r| LogRecordData {
-                    seq: r.seq,
-                    uptime_ms: r.uptime_ms,
-                    level: log_level_data(r.level),
-                    target: r.target.as_str().into(),
-                    message: r.message.as_str().into(),
-                })
-                .collect(),
-            next_seq: snapshot.next_seq,
-            dropped: snapshot.dropped,
-            filter: wayfinder_log::current_spec().as_str().into(),
-        }
-    }
-
-    /// Project the node's alarm board.
-    ///
-    /// Reads the process-global board directly, exactly as [`logs`](Self::logs)
-    /// reads the process-global log ring, and for the same reason: what writes
-    /// it is scattered across the stack with no handle to carry, so there is no
-    /// router field to project from. Nothing here decides whether a condition
-    /// holds — a detector did that when it raised the alarm — and nothing here
-    /// filters: a latched-but-quiet row travels with `active: false` rather
-    /// than being dropped, because "fired ten minutes ago and stopped" is the
-    /// answer an operator who attached late came for.
-    fn alarms(&self) -> AlarmsData {
-        let snapshot = wayfinder_alarm::snapshot();
-        let now_ms = snapshot.now_ms;
-        AlarmsData {
-            alarms: snapshot
-                .alarms
-                .into_iter()
-                .map(|a| AlarmData {
-                    kind: alarm_kind_data(a.kind),
-                    severity: alarm_severity_data(a.severity),
-                    subject: match a.subject {
-                        wayfinder_alarm::Subject::Node(id) => {
-                            AlarmSubjectData::Peer(id.as_bytes().into())
-                        }
-                        wayfinder_alarm::Subject::Interface(idx) => {
-                            AlarmSubjectData::Interface(u32::from(idx))
-                        }
-                        wayfinder_alarm::Subject::None => AlarmSubjectData::Node,
-                    },
-                    first_ms: a.first_ms,
-                    last_ms: a.last_ms,
-                    count: a.count,
-                    detail: a.detail.as_str().into(),
-                    // Evaluated here rather than left to the client: the hold
-                    // window is the node's policy and the uptime clock is the
-                    // node's, so a client computing this itself would need both.
-                    active: a.is_active(now_ms),
-                })
-                .collect(),
-            dropped: snapshot.dropped,
-            now_ms,
-        }
     }
 
     /// Install a new runtime log filter, and report the spec now in force.

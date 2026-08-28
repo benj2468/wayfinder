@@ -473,6 +473,22 @@ async fn main() -> anyhow::Result<()> {
     // enrolls this node certifies the identity it was already talking to.
     let mut node_identity_seed: Option<[u8; 32]> = None;
 
+    /// A management listener that is bound but not yet served.
+    ///
+    /// Binding has to happen during config parsing, so a taken address fails
+    /// startup rather than a minute later; serving has to happen after the
+    /// driver is built, because a connection task answers reads through the
+    /// driver's `RouterHandle`. This carries the arguments between the two.
+    struct PendingTlsListener {
+        listener: tokio::net::TcpListener,
+        identity_seed: [u8; 32],
+        snapshot_tx: AuthSnapshotTx,
+        query_tx: QueryTx,
+        vpn: Option<wayfinder_server::vpn::SharedCoordinator>,
+        authority: Option<wayfinder_server::AuthorityTx>,
+    }
+    let mut pending_tls_listener: Option<PendingTlsListener> = None;
+
     // Built here, before the listener spawns, because the listener is what
     // answers the VPN requests — the router loop is never told who is calling,
     // and `GetVpnEnrollment` mints a credential for the caller's own identity.
@@ -519,22 +535,21 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
                 node_identity_seed = Some(identity_seed);
+                // Bound here, so an address already in use is a startup error
+                // an operator sees immediately — but *served* below, once the
+                // driver exists to hand out the read handle the connection
+                // tasks answer their queries from.
                 let listener = bind_tcp_server(addr).await?;
                 let (snapshot_tx, snapshot_rx): (AuthSnapshotTx, AuthSnapshotRx) =
                     mpsc::channel(16);
                 auth_snapshot_rx = Some(snapshot_rx);
-                let vpn = vpn_coordinator.clone();
-                let authority = authority_tx.clone();
-                join_set.spawn(async move {
-                    serve_tls_server_with_vpn(
-                        listener,
-                        identity_seed,
-                        snapshot_tx,
-                        tx,
-                        vpn,
-                        authority,
-                    )
-                    .await
+                pending_tls_listener = Some(PendingTlsListener {
+                    listener,
+                    identity_seed,
+                    snapshot_tx,
+                    query_tx: tx,
+                    vpn: vpn_coordinator.clone(),
+                    authority: authority_tx.clone(),
                 });
             }
         }
@@ -557,7 +572,7 @@ async fn main() -> anyhow::Result<()> {
     // And the identity that server presents, so the management API can report
     // its public half for enrollment and install a certificate issued for it.
     if let Some(seed) = node_identity_seed {
-        driver.set_identity_seed(seed);
+        driver.set_identity_seed(seed).await;
     }
 
     // The two posture flags, each taking the runtime override when the
@@ -574,7 +589,9 @@ async fn main() -> anyhow::Result<()> {
     // present below: a `require_auth: true` node with no `[auth]` block
     // (relying entirely on a runtime `set-auth`) must still start out
     // correctly locked.
-    driver.router_mut().set_require_auth(require_auth);
+    driver
+        .with_router_mut(|r| r.set_require_auth(require_auth))
+        .await;
     if require_auth && config.auth.is_none() && settings.identity.is_none() {
         tracing::warn!(
             "require_auth is set but no [auth] block is configured; this node will \
@@ -589,8 +606,8 @@ async fn main() -> anyhow::Result<()> {
     // until auth is enabled either way. Flag-day only — see
     // `Config::lazy_cert_distribution`.
     driver
-        .router_mut()
-        .set_lazy_cert_distribution(lazy_cert_distribution);
+        .with_router_mut(|r| r.set_lazy_cert_distribution(lazy_cert_distribution))
+        .await;
     if lazy_cert_distribution && config.auth.is_none() && settings.identity.is_none() {
         tracing::warn!(
             "lazy_cert_distribution is set but no [auth] block is configured; it has \
@@ -656,8 +673,8 @@ async fn main() -> anyhow::Result<()> {
         let mesh_id = anchor.mesh_id;
         auth_mesh_id = Some(mesh_id);
         driver
-            .router_mut()
-            .set_auth(OgmAuth::new(keypair, cert, anchor));
+            .with_router_mut(|r| r.set_auth(OgmAuth::new(keypair, cert, anchor)))
+            .await;
         tracing::info!("mesh authentication enabled (mesh_id = {:#x})", mesh_id);
     }
 
@@ -732,6 +749,36 @@ async fn main() -> anyhow::Result<()> {
     // Hand the store to the driver last, so every startup-time read of the
     // settings above is done before anything can write to it.
     driver.set_settings_store(settings_store);
+
+    // Serve the management listener now that the driver exists to hand out a
+    // read handle. Every router *read* is then answered on the connection's own
+    // task under a shared borrow, instead of being forwarded to the loop that
+    // forwards mesh frames; the three mutations still go down `query_tx`.
+    if let Some(pending) = pending_tls_listener.take() {
+        let PendingTlsListener {
+            listener,
+            identity_seed,
+            snapshot_tx,
+            query_tx,
+            vpn,
+            authority,
+        } = pending;
+        let router_handle = driver.router_handle();
+        join_set.spawn(async move {
+            serve_tls_server_with_vpn(
+                listener,
+                identity_seed,
+                snapshot_tx,
+                query_tx,
+                wayfinder_server::ServerServices {
+                    vpn,
+                    authority_tx: authority,
+                    router: Some(router_handle),
+                },
+            )
+            .await
+        });
+    }
 
     if let Err(err) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
         tracing::trace!("Failed to notify systemd: {}", err);

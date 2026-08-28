@@ -14,11 +14,13 @@
 //!   for tests: drive the periodic broadcast at a chosen instant, then drain
 //!   every already-pending frame in one non-blocking sweep.
 
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
 use futures::FutureExt;
 use futures::future::select_all;
+use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::trace;
 use tracing::warn;
@@ -41,6 +43,7 @@ use wayfinder_server::QueryRx;
 use wayfinder_server::RouterAdapter;
 use wayfinder_server::SettingsFile;
 use wayfinder_server::SettingsStore;
+use wayfinder_server::SharedRouter;
 
 use wayfinder::link::DynLinkT;
 use wayfinder::link::LinkT;
@@ -111,8 +114,16 @@ pub struct Driver<Local: FrameIo> {
     local: Local,
     /// The mesh interfaces, indexed by interface index.
     interfaces: Vec<Box<DynLinkT<'static>>>,
-    /// The routing engine for this node.
-    router: CentralRouter,
+    /// The routing engine for this node, and the identity seed beside it,
+    /// behind the lock the management reads share.
+    ///
+    /// Behind a lock rather than owned outright because sixteen of the
+    /// nineteen management answers only *read* it, and serving those on this
+    /// loop meant a dashboard's poll built its response `Vec`s between mesh
+    /// frames. This loop takes the write guard — in short scopes, never across
+    /// a link send — and a connection task reads through a
+    /// [`RouterHandle`](wayfinder_server::RouterHandle).
+    shared: Arc<RwLock<SharedRouter>>,
     /// Management-API queries forwarded from the server tasks.
     query_rx: QueryRx,
     /// Requests from the TLS management server for a snapshot of this node's
@@ -152,11 +163,6 @@ pub struct Driver<Local: FrameIo> {
     /// restart (set via [`set_settings_store`](Self::set_settings_store)).
     /// Absent ⇒ a runtime change applies in memory only.
     settings: Option<SettingsFile>,
-    /// This node's own identity seed (set via
-    /// [`set_identity_seed`](Self::set_identity_seed)), which the management
-    /// API reports the public half of and certifies on enrollment.  Absent ⇒
-    /// the node reports no identity and can only be handed a whole new one.
-    identity_seed: Option<[u8; 32]>,
 }
 
 impl<Local: FrameIo> Driver<Local> {
@@ -220,7 +226,7 @@ impl<Local: FrameIo> Driver<Local> {
         Self {
             local,
             interfaces,
-            router,
+            shared: Arc::new(RwLock::new(SharedRouter::new(router))),
             query_rx,
             mac,
             snooper: McastSnooper::new(),
@@ -230,7 +236,6 @@ impl<Local: FrameIo> Driver<Local> {
             rx_buffer: [0u8; MAX_LINK_FRAME_LEN],
             tx_buffer: [0u8; MAX_LINK_FRAME_LEN],
             settings: None,
-            identity_seed: None,
             auth_snapshot_rx: None,
         }
     }
@@ -243,8 +248,8 @@ impl<Local: FrameIo> Driver<Local> {
     /// comes back without the node's identity (and therefore its MAC) changing
     /// underneath it. Without this the node reports no identity, and a
     /// `SetAuth` must carry a whole new one.
-    pub fn set_identity_seed(&mut self, seed: [u8; 32]) {
-        self.identity_seed = Some(seed);
+    pub async fn set_identity_seed(&mut self, seed: [u8; 32]) {
+        self.shared.write().await.identity_seed = Some(seed);
     }
 
     /// Wire a certificate-authority task to this driver, returning everything
@@ -304,9 +309,12 @@ impl<Local: FrameIo> Driver<Local> {
     /// tracks the loop's `now` consistently. Only the router's own `set_time` is
     /// skipped when auth is disabled — both publications happen either way, and
     /// the auth-disabled case is precisely the one the authority needs told.
-    fn refresh_auth_clock(&mut self, now: Duration) {
+    async fn refresh_auth_clock(&mut self, now: Duration) {
         let unix = self.epoch_unix.saturating_add(now);
-        let auth_present = match self.router.auth_mut() {
+        // A short write guard: setting the clock is a field store, and holding
+        // the lock any longer than this would stall every management read for
+        // no reason.
+        let auth_present = match self.shared.write().await.router.auth_mut() {
             Some(auth) => {
                 auth.set_time(unix.as_secs());
                 true
@@ -325,16 +333,35 @@ impl<Local: FrameIo> Driver<Local> {
         });
     }
 
-    /// The underlying router, for inspecting routing state (originator tables,
-    /// link quality, route resolution).
-    pub fn router(&self) -> &CentralRouter {
-        &self.router
+    /// Read the router under the shared lock.
+    ///
+    /// A scoped callback rather than a returned guard, so a caller cannot hold
+    /// the lock across an `await` it did not think about — which on this type
+    /// means stalling the mesh, since the event loop needs the write half for
+    /// every frame it forwards.
+    pub async fn with_router<R>(&self, f: impl FnOnce(&CentralRouter) -> R) -> R {
+        f(&self.shared.read().await.router)
     }
 
-    /// The underlying router, mutably — lets callers inject crafted frames with
-    /// explicit link metrics that the message-oriented transports cannot carry.
-    pub fn router_mut(&mut self) -> &mut CentralRouter {
-        &mut self.router
+    /// Mutate the router under the shared lock — lets callers inject crafted
+    /// frames with explicit link metrics that the message-oriented transports
+    /// cannot carry.
+    ///
+    /// Scoped for the same reason as [`with_router`](Self::with_router), and
+    /// more so: this takes the write half, which excludes every reader.
+    pub async fn with_router_mut<R>(&self, f: impl FnOnce(&mut CentralRouter) -> R) -> R {
+        f(&mut self.shared.write().await.router)
+    }
+
+    /// A handle the management transport serves its *reads* through, so they
+    /// run on the connection's own task rather than on this loop.
+    ///
+    /// Read-only by construction: [`RouterHandle`](wayfinder_server::RouterHandle)
+    /// exposes no way to take the write guard, so wiring one up cannot move a
+    /// mutation off this loop by accident.
+    pub fn router_handle(&self) -> wayfinder_server::RouterHandle {
+        wayfinder_server::RouterHandle::new(Arc::clone(&self.shared), self.start)
+            .with_enrollment_policy(Some(self.authority.enrollment_policy_rx()))
     }
 
     /// Run the event loop forever.
@@ -369,7 +396,7 @@ impl<Local: FrameIo> Driver<Local> {
         check_periodic: bool,
     ) -> anyhow::Result<()> {
         // Advance the auth clock from the loop's `now` (see `refresh_auth_clock`).
-        self.refresh_auth_clock(now);
+        self.refresh_auth_clock(now).await;
 
         // When the soonest interface is next due to emit an OGM or a
         // keep-alive, or the soonest next-hop proof challenge falls due, on the
@@ -387,22 +414,37 @@ impl<Local: FrameIo> Driver<Local> {
         // settled into its quiet cadence.  With it, the frame that discovers a
         // path also shortens this sleep to zero, so the challenge goes out on
         // the next turn of the loop.
-        let next_due = self
-            .router
-            .next_broadcast_after(now)
-            .min(self.router.next_keepalive_after(now))
-            .min(
-                self.router
-                    .next_challenge_after(now)
-                    .unwrap_or(Duration::MAX),
-            );
+        let next_due = {
+            // A *read* guard, and dropped before the `select!`: holding it
+            // across the sleep would block every management read for as long as
+            // the mesh is quiet, which on a settled network is minutes.
+            let guard = self.shared.read().await;
+            guard
+                .router
+                .next_broadcast_after(now)
+                .min(guard.router.next_keepalive_after(now))
+                .min(
+                    guard
+                        .router
+                        .next_challenge_after(now)
+                        .unwrap_or(Duration::MAX),
+                )
+        };
 
+        // Cloned before the destructure below, which borrows `self`: an `Arc`
+        // clone is two atomics, and it keeps the shared router reachable from
+        // inside the `select!` arms without entangling it in those borrows.
+        //
+        // Deliberately *not* locked here. Every arm takes its own guard in its
+        // own body, so the lock is never held across the `select!` itself —
+        // which waits, often for the whole of `next_due`.
+        let shared = Arc::clone(&self.shared);
         // Destructure into disjoint field borrows so the `select!` can hold a
-        // mutable borrow of the interfaces alongside the router and buffers.
+        // mutable borrow of the interfaces alongside the buffers.
         let Driver {
             local,
             interfaces,
-            router,
+            shared: _,
             query_rx,
             mac,
             snooper,
@@ -411,7 +453,6 @@ impl<Local: FrameIo> Driver<Local> {
             rx_buffer,
             tx_buffer,
             settings,
-            identity_seed,
             auth_snapshot_rx,
             authority,
         } = self;
@@ -448,7 +489,7 @@ impl<Local: FrameIo> Driver<Local> {
                 }, if check_mesh => {
                     let mut out = LoopOutput::none();
                     wayfinder_driver_core::handle_link_result(
-                        now, router, idx, result, tx_buffer, &mut out,
+                        now, &mut shared.write().await.router, idx, result, tx_buffer, &mut out,
                     );
                     (now, out)
                 },
@@ -456,12 +497,22 @@ impl<Local: FrameIo> Driver<Local> {
                     trace!(len, "host device rx frame");
                     let eth = &rx_buffer[..len];
                     (now, LoopOutput {
-                        mesh: plan_host_frame(now, router, snooper, eth, tx_buffer),
+                        mesh: plan_host_frame(
+                            now, &mut shared.write().await.router, snooper, eth, tx_buffer,
+                        ),
                         local: None,
                     })
                 },
                 Some((request, resp_tx)) = query_rx.recv(), if check_server => {
-                    let mut adapter = RouterAdapter::new(&mut *router, now)
+                    // Still served here, and still under the write guard. Reads
+                    // reaching this arm are the ones from a transport with no
+                    // `RouterHandle` wired (the in-process channel server);
+                    // everything else arriving here is a mutation, which has to
+                    // be on this task because `set_auth` writes back through the
+                    // identity-seed slot beside the router.
+                    let mut guard = shared.write().await;
+                    let SharedRouter { router, identity_seed } = &mut *guard;
+                    let mut adapter = RouterAdapter::new(router, now)
                         .with_epoch_unix(self.epoch_unix)
                         .with_identity(identity_seed)
                         .with_enrollment_policy(read_enrollment_policy(enrollment_policy_rx));
@@ -487,12 +538,26 @@ impl<Local: FrameIo> Driver<Local> {
                     // The authority signed and persisted this; flooding it is
                     // this loop's half of the act. Acknowledged either way, so
                     // the operator is told whether the revocation was actually
-                    // announced rather than only that it was recorded.
-                    ingest_and_report(router, &record, now, epoch_unix_secs(self.epoch_unix, now), ack);
+                    // announced rather than only that it was recorded — short
+                    // of this loop itself being torn down between the receive
+                    // and the write guard below, which drops the ack with the
+                    // process. Only `run_until_shutdown` cancels `run_once`,
+                    // and every arm of it ends the process, so that window is
+                    // not reachable in a running node.
+                    ingest_and_report(
+                        &mut shared.write().await.router,
+                        &record,
+                        now,
+                        epoch_unix_secs(self.epoch_unix, now),
+                        ack,
+                    );
                     (now, LoopOutput::none())
                 },
                 Some(reply) = recv_auth_snapshot(auth_snapshot_rx), if check_server => {
-                    let _ = reply.send(build_auth_snapshot(router, *identity_seed));
+                    // A *read* guard: projecting the snapshot mutates nothing,
+                    // so this does not have to exclude the management reads.
+                    let guard = shared.read().await;
+                    let _ = reply.send(build_auth_snapshot(&guard.router, guard.identity_seed));
                     (now, LoopOutput::none())
                 },
                 _ = sleep(next_due), if check_periodic => {
@@ -506,15 +571,18 @@ impl<Local: FrameIo> Driver<Local> {
                     let now = start.elapsed();
                     trace!("polling OGMs, keep-alives and next-hop challenges");
                     let mut out = LoopOutput::none();
+                    let mut guard = shared.write().await;
+                    let router = &mut guard.router;
                     wayfinder_driver_core::poll_due_ogms(router, now, tx_buffer, &mut out);
                     wayfinder_driver_core::poll_due_keepalives(router, now, tx_buffer, &mut out);
                     wayfinder_driver_core::poll_due_challenges(router, now, tx_buffer, &mut out);
+                    drop(guard);
                     (now, out)
                 }
             }
         };
 
-        dispatch(local, interfaces, router, mac, now, output).await
+        dispatch(local, interfaces, &shared, mac, now, output).await
     }
 
     /// Inject one host Ethernet frame as if it had arrived from the local
@@ -527,7 +595,7 @@ impl<Local: FrameIo> Driver<Local> {
         let now = self.start.elapsed();
         let mesh = plan_host_frame(
             now,
-            &mut self.router,
+            &mut self.shared.write().await.router,
             &mut self.snooper,
             eth,
             &mut self.tx_buffer,
@@ -548,13 +616,17 @@ impl<Local: FrameIo> Driver<Local> {
     ///
     /// [`run_once`]: Driver::run_once
     pub async fn poll_due(&mut self, now: Duration) -> anyhow::Result<()> {
-        self.refresh_auth_clock(now);
-        let mesh = poll_due_ogms(&mut self.router, now, &mut self.tx_buffer);
+        self.refresh_auth_clock(now).await;
+        let mesh = poll_due_ogms(
+            &mut self.shared.write().await.router,
+            now,
+            &mut self.tx_buffer,
+        );
         let output = LoopOutput { mesh, local: None };
         dispatch(
             &self.local,
             &mut self.interfaces,
-            &mut self.router,
+            &self.shared,
             self.mac,
             now,
             output,
@@ -567,13 +639,17 @@ impl<Local: FrameIo> Driver<Local> {
     /// (advancing that timer), the keep-alive counterpart of
     /// [`poll_due`](Self::poll_due).
     pub async fn poll_due_keepalive(&mut self, now: Duration) -> anyhow::Result<()> {
-        self.refresh_auth_clock(now);
-        let mesh = poll_due_keepalives(&mut self.router, now, &mut self.tx_buffer);
+        self.refresh_auth_clock(now).await;
+        let mesh = poll_due_keepalives(
+            &mut self.shared.write().await.router,
+            now,
+            &mut self.tx_buffer,
+        );
         let output = LoopOutput { mesh, local: None };
         dispatch(
             &self.local,
             &mut self.interfaces,
-            &mut self.router,
+            &self.shared,
             self.mac,
             now,
             output,
@@ -593,7 +669,7 @@ impl<Local: FrameIo> Driver<Local> {
     ///
     /// [`run_once`]: Driver::run_once
     pub async fn process_pending(&mut self) -> anyhow::Result<()> {
-        self.refresh_auth_clock(self.start.elapsed());
+        self.refresh_auth_clock(self.start.elapsed()).await;
         loop {
             let mut progressed = false;
 
@@ -605,7 +681,7 @@ impl<Local: FrameIo> Driver<Local> {
                 let eth = self.rx_buffer[..len].to_vec();
                 let mesh = plan_host_frame(
                     self.start.elapsed(),
-                    &mut self.router,
+                    &mut self.shared.write().await.router,
                     &mut self.snooper,
                     &eth,
                     &mut self.tx_buffer,
@@ -628,7 +704,7 @@ impl<Local: FrameIo> Driver<Local> {
                 let mut output = LoopOutput::none();
                 wayfinder_driver_core::handle_link_result(
                     self.start.elapsed(),
-                    &mut self.router,
+                    &mut self.shared.write().await.router,
                     idx,
                     result,
                     &mut self.tx_buffer,
@@ -643,9 +719,14 @@ impl<Local: FrameIo> Driver<Local> {
                 let now = self.start.elapsed();
                 let (_, policy_rx) = self.authority.split();
                 let policy = read_enrollment_policy(policy_rx);
-                let mut adapter = RouterAdapter::new(&mut self.router, now)
+                let mut guard = self.shared.write().await;
+                let SharedRouter {
+                    router,
+                    identity_seed,
+                } = &mut *guard;
+                let mut adapter = RouterAdapter::new(router, now)
                     .with_epoch_unix(self.epoch_unix)
-                    .with_identity(&mut self.identity_seed)
+                    .with_identity(identity_seed)
                     .with_enrollment_policy(policy);
                 if let Some(store) = self.settings.as_mut() {
                     adapter = adapter.with_settings(store as &mut dyn SettingsStore);
@@ -653,6 +734,7 @@ impl<Local: FrameIo> Driver<Local> {
                 // See the same fallback in `run_once`: `handle_unowned` names the
                 // transport-owned kind rather than misreporting the node's role.
                 let response = handle_router(&mut adapter, request).unwrap_or_else(handle_unowned);
+                drop(guard);
                 let _ = resp_tx.send(response);
             }
 
@@ -667,7 +749,13 @@ impl<Local: FrameIo> Driver<Local> {
                 progressed = true;
                 let now = self.start.elapsed();
                 let now_unix = epoch_unix_secs(self.epoch_unix, now);
-                ingest_and_report(&mut self.router, &record, now, now_unix, ack);
+                ingest_and_report(
+                    &mut self.shared.write().await.router,
+                    &record,
+                    now,
+                    now_unix,
+                    ack,
+                );
             }
 
             // Authorization-state snapshot requests from the TLS management server.
@@ -675,7 +763,10 @@ impl<Local: FrameIo> Driver<Local> {
                 && let Ok(reply) = rx.try_recv()
             {
                 progressed = true;
-                let _ = reply.send(build_auth_snapshot(&self.router, self.identity_seed));
+                let guard = self.shared.read().await;
+                let snapshot = build_auth_snapshot(&guard.router, guard.identity_seed);
+                drop(guard);
+                let _ = reply.send(snapshot);
             }
 
             if !progressed {
@@ -691,7 +782,7 @@ impl<Local: FrameIo> Driver<Local> {
         dispatch(
             &self.local,
             &mut self.interfaces,
-            &mut self.router,
+            &self.shared,
             self.mac,
             now,
             output,
@@ -859,9 +950,9 @@ async fn recv_auth_snapshot(
 /// makes reporting the authority's policy from this loop safe: the authority may
 /// be mid-Argon2id, and asking it would be the stall this design removes.
 fn read_enrollment_policy(
-    rx: &Option<wayfinder_server::EnrollmentPolicyRx>,
+    tx: &wayfinder_server::EnrollmentPolicyTx,
 ) -> Option<wayfinder_protos::service::EnrollmentPolicyStatusData> {
-    rx.as_ref().and_then(|rx| rx.borrow().clone())
+    tx.borrow().clone()
 }
 
 /// Project the router's current authorization-relevant state — this node's own
@@ -988,7 +1079,7 @@ fn plan_host_frame(
 async fn dispatch<Local: FrameIo>(
     local: &Local,
     interfaces: &mut [Box<DynLinkT<'static>>],
-    router: &mut CentralRouter,
+    shared: &RwLock<SharedRouter>,
     mac: Mac,
     now: Duration,
     output: LoopOutput,
@@ -1020,16 +1111,34 @@ async fn dispatch<Local: FrameIo>(
         let body_len = payload.len();
         payload.resize(body_len + DIRECTED_TRAILER_LEN, 0);
         let num_interfaces = interfaces.len();
-        let Some(plan) = wayfinder_driver_core::plan_dispatch(
-            router,
-            now,
-            dst,
-            protocol,
-            egress,
-            body_len,
-            &mut payload,
-            num_interfaces,
-        ) else {
+        // Planning needs the router; sending does not. The guard is scoped to
+        // the plan and dropped before any link I/O, because a link send is a
+        // radio transmission — holding the write lock across one would block
+        // every management read for the length of a LoRa frame.
+        //
+        // `DispatchPlan` borrows the payload buffer, not the router, which is
+        // what makes dropping the guard here sound.
+        //
+        // The visible consequence: between this plan and the `record_tx` below,
+        // a concurrent `GetThroughput` sees a router that has planned a
+        // transmission but not yet counted its bytes, so tx rate under-reports
+        // by up to one frame for the length of the send. Accepted — the rate is
+        // a decaying EWMA and the next sample corrects it — and strictly better
+        // than the alternative, which is holding the lock across the radio.
+        let plan = {
+            let mut guard = shared.write().await;
+            wayfinder_driver_core::plan_dispatch(
+                &mut guard.router,
+                now,
+                dst,
+                protocol,
+                egress,
+                body_len,
+                &mut payload,
+                num_interfaces,
+            )
+        };
+        let Some(plan) = plan else {
             continue;
         };
 
@@ -1039,9 +1148,21 @@ async fn dispatch<Local: FrameIo>(
             payload: plan.payload(),
         };
 
+        // Collected rather than recorded as they go, so the lock is taken once
+        // per frame instead of once per interface — and, more importantly, only
+        // after every send has finished.
+        let mut sent = Vec::new();
         for idx in plan.targets().iter() {
-            if let Some(iface) = interfaces.get_mut(idx) {
-                send_on_link(iface, idx, router, mac, &data, now).await;
+            if let Some(iface) = interfaces.get_mut(idx)
+                && let Some(bytes) = send_on_link(iface, idx, mac, &data).await
+            {
+                sent.push((idx, bytes));
+            }
+        }
+        if !sent.is_empty() {
+            let mut guard = shared.write().await;
+            for (idx, bytes) in sent {
+                guard.router.record_tx(idx, bytes, now);
             }
         }
     }
@@ -1059,14 +1180,18 @@ async fn dispatch<Local: FrameIo>(
 async fn send_on_link(
     iface: &mut DynLinkT<'static>,
     iface_idx: usize,
-    router: &mut CentralRouter,
     mac: Mac,
     data: &LinkFrameData<'_>,
-    now: Duration,
-) {
+) -> Option<usize> {
     match iface.send(mac, data).await {
-        Ok(sent) => router.record_tx(iface_idx, sent, now),
-        Err(e) => warn!(iface_idx, error = ?e, "link send failed; frame dropped"),
+        // Returned rather than recorded here: the caller holds no router lock
+        // while this runs, and taking one inside a send loop is exactly what
+        // this signature exists to prevent.
+        Ok(sent) => Some(sent),
+        Err(e) => {
+            warn!(iface_idx, error = ?e, "link send failed; frame dropped");
+            None
+        }
     }
 }
 
@@ -1124,13 +1249,13 @@ mod tests {
     /// The published clock is `epoch_unix + now` in whole seconds — the same
     /// instant the router verifies certificates against, so an authority
     /// issuing from it cannot drift from the router checking it.
-    #[test]
-    fn the_published_clock_is_epoch_plus_elapsed() {
+    #[tokio::test]
+    async fn the_published_clock_is_epoch_plus_elapsed() {
         let mut driver = idle_driver();
         let (_tx, rx) = tokio::sync::mpsc::channel(4);
         let ports = driver.attach_authority(rx);
 
-        driver.refresh_auth_clock(Duration::from_secs(42));
+        driver.refresh_auth_clock(Duration::from_secs(42)).await;
 
         let facts = *ports.facts.borrow();
         assert_eq!(facts.unix_secs, driver.epoch_unix.as_secs() + 42);
@@ -1144,15 +1269,68 @@ mod tests {
     /// Publishing with no authority attached is not an error: most nodes never
     /// run one, and an authority task that shut down first must not take the
     /// router loop with it.
-    #[test]
-    fn publishing_survives_having_no_authority_at_all() {
+    #[tokio::test]
+    async fn publishing_survives_having_no_authority_at_all() {
         let mut driver = idle_driver();
 
         // No `attach_authority`, and then one that is attached and dropped.
-        driver.refresh_auth_clock(Duration::from_secs(1));
+        driver.refresh_auth_clock(Duration::from_secs(1)).await;
         let (_tx, rx) = tokio::sync::mpsc::channel(4);
         drop(driver.attach_authority(rx));
-        driver.refresh_auth_clock(Duration::from_secs(2));
+        driver.refresh_auth_clock(Duration::from_secs(2)).await;
+    }
+
+    /// A `RouterHandle` taken *before* the authority attaches still observes the
+    /// policy that authority publishes afterwards.
+    ///
+    /// The receiver used to be captured by value from an `Option` that `attach`
+    /// filled in, so a handle built first captured `None` and reported "no
+    /// enrollment policy" for the life of the process — on a certificate
+    /// authority, which is the one node that has one. Nothing failed; the same
+    /// request forwarded to the loop answered correctly, so the two paths
+    /// disagreed silently about a security posture a dashboard renders.
+    ///
+    /// `wayfinder-tap` happens to attach first today. This pins the property
+    /// rather than the call order, because the call order is one refactor from
+    /// changing and `router_handle()` only needs `&self`.
+    #[tokio::test]
+    async fn a_handle_taken_before_attach_still_sees_the_policy() {
+        let mut driver = idle_driver();
+
+        // Deliberately the wrong order: handle first, authority second.
+        let handle = driver.router_handle();
+
+        let (_tx, rx) = tokio::sync::mpsc::channel(4);
+        let ports = driver.attach_authority(rx);
+        ports.policy.send_replace(Some(
+            wayfinder_protos::service::EnrollmentPolicyStatusData {
+                auto_approve: true,
+                ..Default::default()
+            },
+        ));
+
+        let response = handle
+            .serve_read(wayfinder_protos::wayfinder::v1alpha::WayfinderRequest {
+                request: Some(
+                    wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request::GetSecurityStatus(
+                        wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusRequest {},
+                    ),
+                ),
+            })
+            .await
+            .expect("GetSecurityStatus is a router read");
+
+        match response.response {
+            Some(
+                wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response::SecurityStatus(
+                    status,
+                ),
+            ) => assert!(
+                status.enrollment.is_some(),
+                "a handle built before attach_authority reported no enrollment policy"
+            ),
+            other => panic!("expected SecurityStatus, got {other:?}"),
+        }
     }
 
     /// `own_key` is derived from whatever `identity_seed` this call was given
@@ -1286,7 +1464,7 @@ mod tests {
             Vec::new(),
             query_rx,
         );
-        driver.set_identity_seed(seed);
+        driver.set_identity_seed(seed).await;
         // The same real wall-clock epoch `run_once` would use by default —
         // nowhere near the tiny monotonic `now` this freshly-built `Driver`
         // reports, which is exactly the gap that goes uncaught if
@@ -1317,7 +1495,7 @@ mod tests {
             ),
         }
         assert!(
-            driver.router().auth().is_some(),
+            driver.with_router(|r| r.auth().is_some()).await,
             "the certificate was actually installed"
         );
     }

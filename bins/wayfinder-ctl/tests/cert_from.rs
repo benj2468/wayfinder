@@ -34,7 +34,8 @@ use wayfinder_protos::service::NodeMetricsData;
 use wayfinder_protos::service::OgmScheduleEntryData;
 use wayfinder_protos::service::OwnCertData;
 use wayfinder_protos::service::RouteResolutionData;
-use wayfinder_protos::service::RouterDataProvider;
+use wayfinder_protos::service::RouterReads;
+use wayfinder_protos::service::RouterWrites;
 use wayfinder_protos::service::RoutingEntryData;
 use wayfinder_protos::service::RuntimeConfigData;
 use wayfinder_protos::service::SecurityStatusData;
@@ -77,34 +78,43 @@ struct NodeMock {
     own_cert: Option<OwnCertData>,
 }
 
-impl RouterDataProvider for NodeMock {
+impl RouterReads for NodeMock {
     fn node_id(&self) -> Vec<u8> {
         self.keypair.derived_mac().0.to_vec()
     }
+
     fn num_originators(&self) -> u32 {
         0
     }
+
     fn auth_locked(&self) -> bool {
         false
     }
+
     fn routing_table(&self) -> Vec<RoutingEntryData> {
         vec![]
     }
+
     fn link_quality_table(&self) -> Vec<LinkQualityEntryData> {
         vec![]
     }
+
     fn link_features_table(&self) -> Vec<LinkFeaturesEntryData> {
         vec![]
     }
+
     fn keepalive_table(&self) -> Vec<KeepAliveEntryData> {
         vec![]
     }
+
     fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData> {
         vec![]
     }
+
     fn throughput(&self) -> Vec<InterfaceThroughputData> {
         vec![]
     }
+
     fn node_metrics(&self) -> NodeMetricsData {
         NodeMetricsData {
             uptime_secs: 0,
@@ -128,27 +138,23 @@ impl RouterDataProvider for NodeMock {
             untaggable_drop_rate: 0.0,
         }
     }
+
     fn resolve_route(&self, _destination: &[u8]) -> Option<RouteResolutionData> {
         None
     }
-    fn set_auth(&mut self, _seed: &[u8], _cert: &[u8], _anchor: &[u8]) -> Result<(), String> {
-        Ok(())
-    }
-    fn set_config(&mut self, _config: RuntimeConfigData) -> Result<(), String> {
-        Ok(())
-    }
+
     fn runtime_config_active(&self) -> bool {
         false
     }
+
     fn alarms(&self) -> AlarmsData {
         AlarmsData::default()
     }
+
     fn logs(&self, _since_seq: u64, _max_records: u32) -> LogsData {
         LogsData::default()
     }
-    fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
-        Ok(directives.to_string())
-    }
+
     fn security_status(&self) -> SecurityStatusData {
         SecurityStatusData {
             own_ed_pubkey: self.keypair.ed_pubkey().to_vec(),
@@ -156,8 +162,23 @@ impl RouterDataProvider for NodeMock {
             ..SecurityStatusData::default()
         }
     }
+
     fn own_cert(&self) -> Option<OwnCertData> {
         self.own_cert.clone()
+    }
+}
+
+impl RouterWrites for NodeMock {
+    fn set_auth(&mut self, _seed: &[u8], _cert: &[u8], _anchor: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn set_config(&mut self, _config: RuntimeConfigData) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
+        Ok(directives.to_string())
     }
 }
 

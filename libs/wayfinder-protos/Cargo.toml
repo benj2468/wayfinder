@@ -24,6 +24,12 @@ serde = { version = "1", optional = true, default-features = false, features = [
 # fields, since this crate is `no_std` + `alloc` (serde's `std`/`alloc` are off
 # by default).
 serde = ["dep:serde", "serde/alloc"]
+# Exposes `rpc::every_request_kind()`, one value per request variant, so a
+# consumer's tests can sweep the whole request surface instead of a hand-picked
+# sample of it. Off by default because constructing 41 default messages is code
+# an embedded node has no use for; `wayfinder-server` turns it on as a
+# dev-dependency, which keeps it out of every firmware build.
+test-support = []
 
 [build-dependencies]
 prost-build = "0.13"

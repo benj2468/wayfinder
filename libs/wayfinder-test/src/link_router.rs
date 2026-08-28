@@ -152,16 +152,19 @@ impl LinkTestRouter {
         }
     }
 
-    /// The underlying router, for inspecting routing state (originator tables,
-    /// route resolution).
-    pub fn router(&self) -> &CentralRouter {
-        self.driver.router()
+    /// Read the underlying router (originator tables, route resolution).
+    ///
+    /// Scoped rather than returning a reference: the driver keeps its router
+    /// behind the lock the management reads share, so a borrow cannot outlive
+    /// the guard it came from.
+    pub async fn with_router<R>(&self, f: impl FnOnce(&CentralRouter) -> R) -> R {
+        self.driver.with_router(f).await
     }
 
-    /// The underlying router, mutably — for the metric-driven egress queries
+    /// Mutate the underlying router — for the metric-driven egress queries
     /// (`get_egress_interface`) and crafted-frame injection.
-    pub fn router_mut(&mut self) -> &mut CentralRouter {
-        self.driver.router_mut()
+    pub async fn with_router_mut<R>(&self, f: impl FnOnce(&mut CentralRouter) -> R) -> R {
+        self.driver.with_router_mut(f).await
     }
 
     /// Get the underlying driver for this router.
@@ -203,8 +206,8 @@ impl LinkTestRouter {
 
     /// Time until this node's soonest interface is next due to emit an OGM, as of
     /// `now` — used by the harness to advance the virtual clock event-to-event.
-    pub fn next_broadcast_after(&self, now: Duration) -> Duration {
-        self.router().next_broadcast_after(now)
+    pub async fn next_broadcast_after(&self, now: Duration) -> Duration {
+        self.with_router(|r| r.next_broadcast_after(now)).await
     }
 
     /// Drive one periodic keep-alive tick at `now`, emitting a heartbeat for
@@ -212,7 +215,7 @@ impl LinkTestRouter {
     /// counterpart to the production periodic loop
     /// ([`Driver::poll_due_keepalive`]). A test wanting keep-alive active on
     /// an interface arms it first via
-    /// `router_mut().configure_interface_keepalive(idx, Some(interval), now)`,
+    /// `with_router_mut(|r| r.configure_interface_keepalive(idx, Some(interval), now))`,
     /// same pattern as `set_link_features` — this is not a `LinkTestRouter::new`/
     /// `from_links` constructor parameter.
     pub async fn poll_due_keepalive(&mut self, now: Duration) {
@@ -230,8 +233,8 @@ impl LinkTestRouter {
 
     /// Time until this node's soonest interface is next due to emit a
     /// keep-alive, as of `now`.
-    pub fn next_keepalive_after(&self, now: Duration) -> Duration {
-        self.router().next_keepalive_after(now)
+    pub async fn next_keepalive_after(&self, now: Duration) -> Duration {
+        self.with_router(|r| r.next_keepalive_after(now)).await
     }
 
     /// Inject host application data destined for `dest` into the mesh.
@@ -278,9 +281,9 @@ impl LinkTestRouter {
     ) {
         let mut buf = [0u8; MAX_LINK_FRAME_LEN];
         let frame = parse_frame(raw);
-        let _ = self
-            .driver
-            .router_mut()
-            .handle_frame_with_metrics(now, iface_idx, frame, metrics, &mut buf);
+        self.with_router_mut(|router| {
+            let _ = router.handle_frame_with_metrics(now, iface_idx, frame, metrics, &mut buf);
+        })
+        .await;
     }
 }

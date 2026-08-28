@@ -36,7 +36,8 @@ use wayfinder_protos::service::OgmScheduleEntryData;
 use wayfinder_protos::service::PendingCsrData;
 use wayfinder_protos::service::RegistrationStartedData;
 use wayfinder_protos::service::RouteResolutionData;
-use wayfinder_protos::service::RouterDataProvider;
+use wayfinder_protos::service::RouterReads;
+use wayfinder_protos::service::RouterWrites;
 use wayfinder_protos::service::RoutingEntryData;
 use wayfinder_protos::service::RuntimeConfigData;
 use wayfinder_protos::service::TableOccupancyData;
@@ -94,34 +95,43 @@ pub fn occ() -> TableOccupancyData {
     }
 }
 
-impl RouterDataProvider for ProviderMock {
+impl RouterReads for ProviderMock {
     fn node_id(&self) -> Vec<u8> {
         vec![0, 0, 0, 0, 0, 1]
     }
+
     fn num_originators(&self) -> u32 {
         0
     }
+
     fn auth_locked(&self) -> bool {
         false
     }
+
     fn routing_table(&self) -> Vec<RoutingEntryData> {
         vec![]
     }
+
     fn link_quality_table(&self) -> Vec<LinkQualityEntryData> {
         vec![]
     }
+
     fn link_features_table(&self) -> Vec<LinkFeaturesEntryData> {
         vec![]
     }
+
     fn keepalive_table(&self) -> Vec<KeepAliveEntryData> {
         vec![]
     }
+
     fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData> {
         vec![]
     }
+
     fn throughput(&self) -> Vec<InterfaceThroughputData> {
         vec![]
     }
+
     fn node_metrics(&self) -> NodeMetricsData {
         NodeMetricsData {
             uptime_secs: 0,
@@ -145,15 +155,11 @@ impl RouterDataProvider for ProviderMock {
             untaggable_drop_rate: 0.0,
         }
     }
+
     fn resolve_route(&self, _destination: &[u8]) -> Option<RouteResolutionData> {
         None
     }
-    fn set_auth(&mut self, _seed: &[u8], _cert: &[u8], _trust_anchor: &[u8]) -> Result<(), String> {
-        Ok(())
-    }
-    fn set_config(&mut self, _config: RuntimeConfigData) -> Result<(), String> {
-        Ok(())
-    }
+
     fn runtime_config_active(&self) -> bool {
         false
     }
@@ -170,6 +176,16 @@ impl RouterDataProvider for ProviderMock {
 
     fn logs(&self, _since_seq: u64, _max_records: u32) -> LogsData {
         LogsData::default()
+    }
+}
+
+impl RouterWrites for ProviderMock {
+    fn set_auth(&mut self, _seed: &[u8], _cert: &[u8], _trust_anchor: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn set_config(&mut self, _config: RuntimeConfigData) -> Result<(), String> {
+        Ok(())
     }
 
     fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
@@ -377,8 +393,13 @@ pub async fn spawn_provider_full(
             seed,
             snapshot_tx,
             query_tx,
-            None,
-            Some(authority_tx),
+            wayfinder_server::ServerServices {
+                authority_tx: Some(authority_tx),
+                // No shared read handle: this harness has no driver behind
+                // the listener, so reads travel the query channel as they
+                // always did.
+                ..Default::default()
+            },
         )
         .await;
     });

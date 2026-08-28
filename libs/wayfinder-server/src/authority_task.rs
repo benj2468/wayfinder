@@ -148,12 +148,20 @@ pub struct AuthorityComms {
     /// no receivers costs one atomic store and cannot fail, so a node that
     /// never runs an authority pays nothing for holding it.
     facts: watch::Sender<RouterFacts>,
-    /// The authority's last-published enrollment policy.
+    /// The authority's enrollment-policy channel, held from construction.
     ///
-    /// `None` until it publishes, and forever on a node with no authority —
-    /// which is what `GetSecurityStatus` must keep reporting, rather than a
-    /// default-valued policy that would read as a real one.
-    policy: Option<EnrollmentPolicyRx>,
+    /// Not an `Option`, and opened in [`new`](Self::new) — for exactly the
+    /// reason `facts` above is: a reader may be built before any authority
+    /// attaches, and one that captured `None` at that moment would report "no
+    /// enrollment policy" forever on a node that has one. `RouterHandle` is
+    /// precisely such a reader, and it is constructed from `&Driver` at
+    /// whatever point a binary finds convenient.
+    ///
+    /// The *value* stays `Option` and starts `None`, which is what
+    /// `GetSecurityStatus` reports as "not reported" — distinct from a
+    /// default-valued policy that would read as a real one, and the state a
+    /// node with no authority stays in forever.
+    policy: EnrollmentPolicyTx,
     /// Signed revocations awaiting ingestion.  `None` keeps the router loop's
     /// corresponding `select!` arm dormant without a separate enable flag.
     revocations: Option<RevocationRx>,
@@ -185,7 +193,7 @@ impl AuthorityComms {
         });
         Self {
             facts,
-            policy: None,
+            policy: watch::channel(None).0,
             revocations: None,
         }
     }
@@ -221,16 +229,31 @@ impl AuthorityComms {
             "attach called twice: a router serves at most one certificate authority, and a \
              second silently orphans the first's revocation path"
         );
-        let (policy, policy_rx) = watch::channel(None);
         let (revocations, revocations_rx) = mpsc::channel(REVOCATION_QUEUE_DEPTH);
-        self.policy = Some(policy_rx);
         self.revocations = Some(revocations_rx);
         AuthorityPorts {
             commands,
             facts: self.facts.subscribe(),
-            policy,
+            // A clone of the channel opened at construction, not a fresh one:
+            // every receiver handed out before this call must observe what this
+            // authority publishes.
+            policy: self.policy.clone(),
             revocations,
         }
+    }
+
+    /// A receiver for the enrollment policy, for a reader that is not the
+    /// router loop — the management read handle, which reports the policy on
+    /// `GetSecurityStatus`.
+    ///
+    /// Valid whether or not an authority has attached yet, and whether or not
+    /// one ever will: the channel is opened at construction, so a receiver
+    /// taken now observes a policy published later. That is the whole reason
+    /// `policy` is not an `Option` — see its field doc. A node with no
+    /// authority simply never publishes, and the receiver keeps reading `None`,
+    /// which `GetSecurityStatus` reports as "not reported".
+    pub fn enrollment_policy_rx(&self) -> EnrollmentPolicyRx {
+        self.policy.subscribe()
     }
 
     /// Borrow the two inbound halves at once.
@@ -240,7 +263,7 @@ impl AuthorityComms {
     /// revocation (`&mut`) and the arm reading the policy (`&`) are live at the
     /// same moment, so two accessor methods on `&mut self`/`&self` would not
     /// compile.
-    pub fn split(&mut self) -> (&mut Option<RevocationRx>, &Option<EnrollmentPolicyRx>) {
+    pub fn split(&mut self) -> (&mut Option<RevocationRx>, &EnrollmentPolicyTx) {
         (&mut self.revocations, &self.policy)
     }
 }
@@ -878,12 +901,10 @@ mod tests {
             });
             let (commands, commands_rx) = mpsc::channel(4);
             let ports = comms.attach(commands_rx);
-            let policy = comms
-                .split()
-                .1
-                .as_ref()
-                .expect("attach wires the policy half")
-                .clone();
+            // Valid whether or not `attach` has run: the channel is opened at
+            // construction, which is the property that keeps a `RouterHandle`
+            // built early from reporting no policy forever.
+            let policy = comms.enrollment_policy_rx();
             tokio::spawn(serve_authority(ca, ports));
             Self {
                 comms,

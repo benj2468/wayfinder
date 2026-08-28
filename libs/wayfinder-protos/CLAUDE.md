@@ -46,32 +46,57 @@ that wire changes are noticed, not that they're free.
 ## Adding a request/response
 
 Prefer the `add-metric` skill, which walks the whole path. The ordering that
-matters: `.proto` first, then the `Data` struct + `WayfinderDataProvider`
-method, then the `handle` arm, then `RouterAdapter` in `wayfinder-server`, then
-the client and TUI. Skipping a layer compiles fine in the crates below it and
-fails at the adapter.
+matters: `.proto` first, then **the `rpc_table!` entry in [`rpc.rs`](src/rpc.rs)**,
+then the `Data` struct + the `RouterReads`/`RouterWrites`/`AuthorityDataProvider`
+method, then the dispatcher arm, then `RouterAdapter`/`RouterView` in
+`wayfinder-server`, then the client and TUI. Skipping a layer compiles fine in
+the crates below it and fails at the adapter.
+
+The table entry is not optional and cannot be deferred: the five classifiers it
+generates are exhaustive matches, so a proto variant with no entry does not
+compile. Its five fields each force a decision — the owner that answers it
+(`RouterRead`/`RouterWrite`/`Authority`/`Transport`), its audit class, the
+access tiers admitted, and the anonymous rate-limit bucket it spends.
+
+Two of those are worth extra care because getting them wrong is quiet rather
+than loud. `owner:` decides whether a read is served off the driver's event
+loop or forwarded to it — a read mis-declared `RouterWrite` still works, just
+slowly, forever. And `limit:` is declared independently of `access:`, so a
+request reachable with no credential can be left unmetered. Both are pinned by
+sweeps in `wayfinder-server` (`the_read_facet_and_the_read_dispatcher_agree_on_every_kind`,
+`every_request_spends_the_bucket_its_flow_was_sized_for`); if you are adding a
+kind, expect to touch them.
 
 ## Audit classification is audit-only
 
 `audited` tags a request kind as a write (`Mutation`), a read that hands out a
 secret (`Disclosure`), or an ordinary read (`Query`), and its **only** consumer
-is the `info!` audit line in `handle`. It is not an authorization gate.
+is the `info!` audit line in `audit_request`. It is not an authorization gate.
+
+It is declared in [`rpc.rs`](src/rpc.rs)'s `rpc_table!` alongside the request's
+owner, access tiers and rate-limit bucket, rather than in a `match` of its own —
+see the table's header for why all five live together.
 
 `Disclosure` exists because `RevealEnrollmentToken` changes nothing and still
 deserves a record: an operator asking "who learned the enrollment token, and
 when?" has nowhere else to look. Do not fold it into `Mutation` — a log line
 calling a read a mutation is a lie about what happened.
 
-Authorization is **admission-level**: `wayfinder-server`'s transport runs
-`decide_access` after the TLS handshake and either admits or refuses the whole
-connection (`transport.rs`). A client admitted on either full grant may invoke
-every request kind, so adding a mutating request does not require an authz
-change — but do add it to `audited` (and to
-`audited_classifies_writes_disclosures_and_reads`) or the write lands with no
-audit trail.
+**Adding a request kind now requires an explicit authorization decision, and
+there is no default.** This paragraph used to say the opposite — that a client
+on either full grant could invoke everything, so a new mutating request needed
+no authz change. That was true, and it was the bug: `authz::permits` classified
+requests with `matches!` arms that had an implicit catch-all, so a new kind
+silently became permitted for admin and self-key and refused for viewer and
+enrollment. `SetUserRole`, `SetUserEnabled` and `SetUserPassword` all reached
+the proto that way.
 
-The one exception is the enrollment tier: a connection that presented no
-membership certificate is admitted solely to enroll, and `authz::permits` — not
-this function — is what confines it. A new request kind is refused there by
-default, which is the right default; widen `permits` only for something a node
-with no certificate genuinely has to be able to do.
+Every request's tiers are now declared in [`rpc.rs`](src/rpc.rs)'s `rpc_table!`,
+and `access:` is a required field — an entry without one does not parse.
+`authz::permits` is only the join between that declaration and the tier a
+connection earned.
+
+Admission is still per-connection (`decide_access` after the TLS handshake,
+admitting or refusing the whole connection), and the enrollment tier is still
+the one a client with no membership certificate lands in. What changed is that
+"which tiers may invoke this request" is no longer answered by omission.

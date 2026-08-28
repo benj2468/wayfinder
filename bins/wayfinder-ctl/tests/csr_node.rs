@@ -41,7 +41,8 @@ use wayfinder_protos::service::NodeMetricsData;
 use wayfinder_protos::service::OgmScheduleEntryData;
 use wayfinder_protos::service::PendingCsrData;
 use wayfinder_protos::service::RouteResolutionData;
-use wayfinder_protos::service::RouterDataProvider;
+use wayfinder_protos::service::RouterReads;
+use wayfinder_protos::service::RouterWrites;
 use wayfinder_protos::service::RoutingEntryData;
 use wayfinder_protos::service::RuntimeConfigData;
 use wayfinder_protos::service::SecurityStatusData;
@@ -97,34 +98,43 @@ fn occ() -> TableOccupancyData {
     }
 }
 
-impl RouterDataProvider for NodeMock {
+impl RouterReads for NodeMock {
     fn node_id(&self) -> Vec<u8> {
         self.keypair.derived_mac().0.to_vec()
     }
+
     fn num_originators(&self) -> u32 {
         0
     }
+
     fn auth_locked(&self) -> bool {
         true
     }
+
     fn routing_table(&self) -> Vec<RoutingEntryData> {
         vec![]
     }
+
     fn link_quality_table(&self) -> Vec<LinkQualityEntryData> {
         vec![]
     }
+
     fn link_features_table(&self) -> Vec<LinkFeaturesEntryData> {
         vec![]
     }
+
     fn keepalive_table(&self) -> Vec<KeepAliveEntryData> {
         vec![]
     }
+
     fn ogm_schedule(&self) -> Vec<OgmScheduleEntryData> {
         vec![]
     }
+
     fn throughput(&self) -> Vec<InterfaceThroughputData> {
         vec![]
     }
+
     fn node_metrics(&self) -> NodeMetricsData {
         NodeMetricsData {
             uptime_secs: 0,
@@ -148,24 +158,15 @@ impl RouterDataProvider for NodeMock {
             untaggable_drop_rate: 0.0,
         }
     }
+
     fn resolve_route(&self, _destination: &[u8]) -> Option<RouteResolutionData> {
         None
     }
-    fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String> {
-        #[allow(clippy::unwrap_used)]
-        self.set_auth_calls.lock().unwrap().push(SetAuthCall {
-            seed: seed.to_vec(),
-            cert: cert.to_vec(),
-            trust_anchor: trust_anchor.to_vec(),
-        });
-        Ok(())
-    }
-    fn set_config(&mut self, _config: RuntimeConfigData) -> Result<(), String> {
-        Ok(())
-    }
+
     fn runtime_config_active(&self) -> bool {
         false
     }
+
     fn alarms(&self) -> AlarmsData {
         // Nothing wrong: an empty board is the node's "all systems normal", and
         // none of these cases is about alarms.
@@ -174,9 +175,6 @@ impl RouterDataProvider for NodeMock {
 
     fn logs(&self, _since_seq: u64, _max_records: u32) -> LogsData {
         LogsData::default()
-    }
-    fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
-        Ok(directives.to_string())
     }
 
     /// An un-enrolled member: auth off, no certificate, no mesh — but it still
@@ -208,6 +206,26 @@ impl RouterDataProvider for NodeMock {
             own_ed_pubkey: ed,
             own_x_pubkey: x,
         }
+    }
+}
+
+impl RouterWrites for NodeMock {
+    fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String> {
+        #[allow(clippy::unwrap_used)]
+        self.set_auth_calls.lock().unwrap().push(SetAuthCall {
+            seed: seed.to_vec(),
+            cert: cert.to_vec(),
+            trust_anchor: trust_anchor.to_vec(),
+        });
+        Ok(())
+    }
+
+    fn set_config(&mut self, _config: RuntimeConfigData) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
+        Ok(directives.to_string())
     }
 }
 
@@ -278,8 +296,13 @@ async fn spawn_node(has_identity: bool) -> (Endpoint, Arc<Mutex<Vec<SetAuthCall>
             seed,
             snapshot_tx,
             query_tx,
-            None,
-            Some(authority_tx),
+            wayfinder_server::ServerServices {
+                authority_tx: Some(authority_tx),
+                // No shared read handle: this harness has no driver behind
+                // the listener, so reads travel the query channel as they
+                // always did.
+                ..Default::default()
+            },
         )
         .await;
     });
@@ -357,8 +380,13 @@ async fn spawn_provider_node() -> Endpoint {
             seed,
             snapshot_tx,
             query_tx,
-            None,
-            Some(authority_tx),
+            wayfinder_server::ServerServices {
+                authority_tx: Some(authority_tx),
+                // No shared read handle: this harness has no driver behind
+                // the listener, so reads travel the query channel as they
+                // always did.
+                ..Default::default()
+            },
         )
         .await;
     });

@@ -57,7 +57,7 @@ fn fast_trickle() -> Vec<TrickleConfig> {
 async fn drive_until(
     a: &mut LinkTestRouter,
     b: &mut LinkTestRouter,
-    mut done: impl FnMut(&LinkTestRouter, &LinkTestRouter) -> bool,
+    mut done: impl AsyncFnMut(&LinkTestRouter, &LinkTestRouter) -> bool,
 ) {
     let t0 = Instant::now();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -69,7 +69,7 @@ async fn drive_until(
             );
             ra.unwrap();
             rb.unwrap();
-            if done(a, b) {
+            if done(a, b).await {
                 break;
             }
         }
@@ -93,13 +93,14 @@ async fn rylr_two_node_convergence() {
     let mut a = LinkTestRouter::from_links(mac(1), vec![DynLinkT::new_box(ca)], fast_trickle());
     let mut b = LinkTestRouter::from_links(mac(2), vec![DynLinkT::new_box(cb)], fast_trickle());
 
-    drive_until(&mut a, &mut b, |a, b| {
-        a.router().originator_count() == 1 && b.router().originator_count() == 1
+    drive_until(&mut a, &mut b, async |a, b| {
+        a.with_router(|r| r.originator_count()).await == 1
+            && b.with_router(|r| r.originator_count()).await == 1
     })
     .await;
 
-    assert_eq!(a.router().originator_count(), 1);
-    assert_eq!(b.router().originator_count(), 1);
+    assert_eq!(a.with_router(|r| r.originator_count()).await, 1);
+    assert_eq!(b.with_router(|r| r.originator_count()).await, 1);
 }
 
 /// A payload well past the RYLR998 link's single-fragment payload budget
@@ -117,8 +118,9 @@ async fn rylr_fragmented_payload_end_to_end() {
     let mut b = LinkTestRouter::from_links(mac(2), vec![DynLinkT::new_box(cb)], fast_trickle());
 
     // A unicast needs a route first.
-    drive_until(&mut a, &mut b, |a, b| {
-        a.router().originator_count() == 1 && b.router().originator_count() == 1
+    drive_until(&mut a, &mut b, async |a, b| {
+        a.with_router(|r| r.originator_count()).await == 1
+            && b.with_router(|r| r.originator_count()).await == 1
     })
     .await;
 
@@ -130,7 +132,7 @@ async fn rylr_fragmented_payload_end_to_end() {
     a.send_local(mac(2), &payload).await.unwrap();
 
     let expected = host_frame(mac(2), mac(1), &payload);
-    drive_until(&mut a, &mut b, |_, b| {
+    drive_until(&mut a, &mut b, async |_, b| {
         b.local_deliveries().contains(&expected)
     })
     .await;

@@ -18,6 +18,11 @@ mod bindings {
 
 pub use bindings::wayfinder;
 
+/// The RPC declaration table: every management request kind declared once, with
+/// the owner that answers it, the audit record it deserves, the access tiers
+/// that may invoke it, and the rate-limit bucket it spends.
+pub mod rpc;
+
 /// The [`WayfinderDataProvider`](service::WayfinderDataProvider) trait and the
 /// request/response dispatch that projects a data source onto the wire types.
 pub mod service;

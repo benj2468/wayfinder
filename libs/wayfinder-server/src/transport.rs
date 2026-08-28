@@ -22,6 +22,8 @@ use tokio_util::codec::LengthDelimitedCodec;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder::wayfinder_auth::MembershipCert;
 use wayfinder::wayfinder_auth::TrustAnchor;
+use wayfinder_protos::rpc::RateLimit;
+use wayfinder_protos::rpc::rate_limit;
 use wayfinder_protos::service::EnrollmentPolicyData;
 use wayfinder_protos::service::RequestFacet;
 use wayfinder_protos::service::audit_request;
@@ -527,6 +529,7 @@ async fn serve_by_facet(
     request: &WayfinderRequest,
     query_tx: &QueryTx,
     authority_tx: Option<&crate::AuthorityTx>,
+    router: Option<&crate::RouterHandle>,
 ) -> anyhow::Result<WayfinderResponse> {
     // Audited here and nowhere else on this path. The host no longer goes
     // through `WayfinderService::handle`, which is where the audit record used
@@ -587,7 +590,38 @@ async fn serve_by_facet(
             // an authority to produce this from.
             None => Ok(crate::not_a_provider_response()),
         },
-        RequestFacet::Router | RequestFacet::Transport => {
+        // Answered on *this* task, under a shared borrow of the router, rather
+        // than by forwarding to the loop that forwards mesh frames. That is the
+        // whole point of the read/write split: sixteen of the nineteen
+        // router-facing answers never touch a byte of router state, and a
+        // dashboard polling seven of them a second used to build every response
+        // on the loop, one at a time, behind a depth-16 channel.
+        //
+        // Falls back to the channel when no handle was wired — the in-process
+        // channel server and the tests that drive a stream directly — so the
+        // handle is an optimisation a caller opts into, never a requirement for
+        // correctness.
+        RequestFacet::RouterRead => match router {
+            Some(handle) => match handle.serve_read(request.clone()).await {
+                Ok(response) => Ok(response),
+                // The read half declined it, which for a `RouterRead` facet
+                // should not happen. Forward rather than invent an error: a
+                // disagreement between the table and the dispatcher is a bug to
+                // be found in a log, not a request to be failed.
+                Err(request) => {
+                    tracing::warn!(
+                        kind = wayfinder_protos::service::request_kind_name(kind),
+                        "a RouterRead request was declined by the read dispatcher; forwarding"
+                    );
+                    forward_to_router(&request, query_tx).await
+                }
+            },
+            None => forward_to_router(request, query_tx).await,
+        },
+        // A mutation stays on the loop, which is the only place a
+        // `&mut CentralRouter` exists — and, for `SetAuth`, the only place the
+        // identity-seed slot it writes back through does.
+        RequestFacet::RouterWrite | RequestFacet::Transport => {
             forward_to_router(request, query_tx).await
         }
     }
@@ -769,6 +803,46 @@ pub(crate) struct ServeContext {
     /// other. See
     /// `docs/design/implemented/13-certificate-authority-off-the-router-loop.md`.
     pub(crate) authority_tx: Option<crate::AuthorityTx>,
+    /// Serves the router *reads* under a shared borrow, on the connection's own
+    /// task. `None` falls every read back onto `query_tx`, which is what the
+    /// in-process channel server and the stream-level tests do.
+    pub(crate) router: Option<crate::RouterHandle>,
+}
+
+/// The optional collaborators a management listener serves its connections
+/// with: the VPN coordinator, the certificate authority's queue, and the shared
+/// router handle.
+///
+/// One parameter rather than three, because they are one thing — *what this
+/// node can additionally answer* — and because a listener signature that grew
+/// to seven positional arguments, five of them `Option`, is exactly the
+/// per-request illegibility this crate has been pulling apart. Every field is
+/// independently optional and every combination is legitimate: a plain relay
+/// wires none of them, a certificate authority wires all three.
+///
+/// [`Default`] is the plain-relay posture, so a caller adds only what it has.
+#[derive(Clone, Default)]
+pub struct ServerServices {
+    /// Answers the three VPN requests, or `None` on every deployment that runs
+    /// no coordination server — the default, and every node that is not the CA.
+    /// Those answer with "not configured" rather than failing to parse, so a
+    /// client can ask without knowing in advance.
+    pub vpn: Option<crate::vpn::SharedCoordinator>,
+    /// Forwards an authority-facing request to the certificate authority's own
+    /// task, or `None` on a node that runs no authority.
+    ///
+    /// A second channel and not a second use of the query channel, which is the
+    /// point of the split: authority work and router work must not queue behind
+    /// each other. See
+    /// `docs/design/implemented/13-certificate-authority-off-the-router-loop.md`.
+    pub authority_tx: Option<crate::AuthorityTx>,
+    /// Serves the router *reads* under a shared borrow on the connection's own
+    /// task, instead of forwarding them to the driver's event loop.
+    ///
+    /// `None` sends every read down the query channel as before — correct, just
+    /// serialised behind the loop — which is what a test driving a listener
+    /// with no driver behind it does.
+    pub router: Option<crate::RouterHandle>,
 }
 
 /// The grant does not stand for the life of the connection: `gate` re-decides
@@ -796,6 +870,7 @@ where
         query_tx,
         vpn,
         authority_tx,
+        router,
     } = ctx;
     // Read and write are framed separately so the length cap applies to one
     // direction only: [`crate::MAX_FRAME_LEN`] bounds what an unauthenticated
@@ -1043,28 +1118,31 @@ where
         // let either starve the other from behind the same address — which a
         // dashboard fronting both flows makes the ordinary case, not a NAT
         // coincidence.
+        //
+        // Which bucket a request spends is declared beside that request in
+        // `rpc_table!`, not matched on here: the two facts a reader needs
+        // together — "this request is reachable with no credential" and "this
+        // is what it costs" — are then one line apart rather than in two files.
         let refusal = if matches!(decision, MgmtAccess::GrantedEnrollment) {
             let now = std::time::Instant::now();
-            match req {
-                ReqKind::SubmitCsr(_) if !limits.allow_submit_csr(peer_addr, now) => Some((
+            match rate_limit(req) {
+                RateLimit::Unmetered => None,
+                RateLimit::SubmitCsr => (!limits.allow_submit_csr(peer_addr, now)).then_some((
                     "SubmitCsr",
                     "too many enrollment requests from this source; wait before retrying",
                 )),
-                ReqKind::AuthenticateUser(_) if !limits.allow_login(peer_addr, now) => Some((
+                RateLimit::Login => (!limits.allow_login(peer_addr, now)).then_some((
                     "AuthenticateUser",
                     "too many login attempts from this source; wait before retrying",
                 )),
                 // Both halves of a redemption share one bucket: they are one
                 // flow, and bounding either alone bounds nothing.
-                ReqKind::BeginUserRegistration(_) | ReqKind::CompleteUserRegistration(_)
-                    if !limits.allow_registration(peer_addr, now) =>
-                {
-                    Some((
+                RateLimit::Registration => {
+                    (!limits.allow_registration(peer_addr, now)).then_some((
                         "UserRegistration",
                         "too many registration attempts from this source; wait before retrying",
                     ))
                 }
-                _ => None,
             }
         } else {
             None
@@ -1098,7 +1176,8 @@ where
             send_response(&mut responses, vpn_response).await?;
             continue;
         }
-        let response = serve_by_facet(&request, &query_tx, authority_tx.as_ref()).await?;
+        let response =
+            serve_by_facet(&request, &query_tx, authority_tx.as_ref(), router.as_ref()).await?;
         // Mesh revocation and VPN revocation are one operator action, so the
         // second half runs here once the first has succeeded. Ordered this way
         // deliberately: mesh membership is what actually grants routing trust,
@@ -1417,7 +1496,14 @@ pub async fn serve_tls_server(
     snapshot_tx: AuthSnapshotTx,
     query_tx: QueryTx,
 ) -> anyhow::Result<()> {
-    serve_tls_server_with_vpn(listener, own_seed, snapshot_tx, query_tx, None, None).await
+    serve_tls_server_with_vpn(
+        listener,
+        own_seed,
+        snapshot_tx,
+        query_tx,
+        ServerServices::default(),
+    )
+    .await
 }
 
 /// [`serve_tls_server`], plus the VPN coordinator this listener answers the
@@ -1427,14 +1513,36 @@ pub async fn serve_tls_server(
 /// — which is the default, and every node that is not the CA. Those answer the
 /// three VPN requests with "not configured" rather than failing to parse them,
 /// so a client can ask without knowing in advance.
+///
+/// `router` serves the router *reads* under a shared borrow, on the connection
+/// task, instead of forwarding them to the driver's event loop. `None` sends
+/// every read down `query_tx` as before — correct, just serialised behind the
+/// loop — which is what the tests that drive a listener without a driver do.
 pub async fn serve_tls_server_with_vpn(
     listener: TcpListener,
     own_seed: [u8; 32],
     snapshot_tx: AuthSnapshotTx,
     query_tx: QueryTx,
-    vpn: Option<crate::vpn::SharedCoordinator>,
-    authority_tx: Option<crate::AuthorityTx>,
+    services: ServerServices,
 ) -> anyhow::Result<()> {
+    let ServerServices {
+        vpn,
+        authority_tx,
+        router,
+    } = services;
+    // Which path the reads will take, said once at startup. A missing handle
+    // is not an error — it is correct, just serialised behind the driver loop —
+    // so nothing else would ever mention it, and "the dashboard feels slow
+    // again" is not a diagnosis anyone can reach from the logs. Lifecycle fact,
+    // once per listener: `info!`.
+    match &router {
+        Some(_) => tracing::info!(
+            "management reads served off the driver loop (shared router handle wired)"
+        ),
+        None => tracing::info!(
+            "no shared router handle; management reads are forwarded to the driver loop"
+        ),
+    }
     let config = crate::server_config(&own_seed)
         .map_err(|e| anyhow::anyhow!("building management TLS server config: {e}"))?;
     let acceptor = TlsAcceptor::from(config);
@@ -1464,6 +1572,7 @@ pub async fn serve_tls_server_with_vpn(
             query_tx: query_tx.clone(),
             vpn: vpn.clone(),
             authority_tx: authority_tx.clone(),
+            router: router.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = serve_tls_connection(acceptor, tcp, peer, snapshot_tx, guard, ctx).await
@@ -1840,12 +1949,90 @@ mod tests {
                 // the connection task's routing, so the authority answers
                 // trivially rather than being absent.
                 authority_tx: Some(spawn_stub_authority()),
+                // No shared handle: these harnesses have no driver, so reads go
+                // down the query channel exactly as they did before it existed.
+                router: None,
             },
         ));
         (
             LengthDelimitedCodec::builder().new_framed(client_io),
             server,
         )
+    }
+
+    /// A read is answered from the shared handle and **never reaches the query
+    /// channel** — which is the whole point of wiring one in.
+    ///
+    /// Proved by giving the connection a query channel whose receiver is
+    /// dropped: anything forwarded to the loop fails the send, so a read that
+    /// took the old path could not be answered at all. The `GetNodeInfo` that
+    /// comes back therefore came from the handle.
+    #[tokio::test]
+    async fn a_read_is_served_from_the_handle_and_never_reaches_the_loop() {
+        let key = [11u8; 32];
+        let ctx = AuthContext {
+            own_key: Some(key),
+            anchor: None,
+            revoked: Vec::new(),
+            now_unix: 0,
+            own_mac: Mac([0, 0, 0, 0, 0, 9]),
+        };
+
+        // A live sender with a dead receiver: `forward_to_router` errors on the
+        // send, so the loop path is not merely unused here, it is unusable.
+        let (query_tx, query_rx) = mpsc::channel(16);
+        drop(query_rx);
+
+        let shared = std::sync::Arc::new(tokio::sync::RwLock::new(crate::SharedRouter::new(
+            wayfinder::CentralRouter::new(Mac([0, 0, 0, 0, 0, 9])),
+        )));
+        let handle = crate::RouterHandle::new(shared, std::time::Instant::now());
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let peer_addr = std::net::Ipv4Addr::LOCALHOST.into();
+        let limits = std::sync::Arc::new(PreAuthLimits::new());
+        let guard = limits
+            .admit(peer_addr, std::time::Instant::now())
+            .expect("a fresh limiter admits the first connection");
+        let server = tokio::spawn(serve_authenticated_stream(
+            server_io,
+            key,
+            peer_addr,
+            guard,
+            gate_returning(ctx),
+            ServeContext {
+                limits,
+                query_tx,
+                vpn: None,
+                authority_tx: None,
+                router: Some(handle),
+            },
+        ));
+        let mut client = LengthDelimitedCodec::builder().new_framed(client_io);
+
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: Vec::new(),
+            })))
+            .await
+            .unwrap();
+        let ack = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(ack.response, Some(RespKind::Empty(_))));
+
+        client
+            .send(encode_request(Request::GetNodeInfo(
+                wayfinder_protos::wayfinder::v1alpha::GetNodeInfoRequest {},
+            )))
+            .await
+            .unwrap();
+        let response = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        match response.response {
+            Some(RespKind::NodeInfo(info)) => assert_eq!(info.node_id, vec![0, 0, 0, 0, 0, 9]),
+            other => panic!("expected NodeInfo served from the handle, got {other:?}"),
+        }
+
+        drop(client);
+        let _ = server.await;
     }
 
     /// On an un-enrolled node, a client that proves the node's own key
@@ -3151,6 +3338,7 @@ mod tests {
                 query_tx,
                 vpn: None,
                 authority_tx: None,
+                router: None,
             },
         ));
         let mut client = LengthDelimitedCodec::builder().new_framed(client_io);
