@@ -31,7 +31,7 @@
 #   user-add    Create a dashboard sign-in account on the CA
 #   dashboard   Forward the web dashboard to localhost
 #   vpn         Show the tunnel control plane and its registered peers
-#   headplane   Forward the break-glass VPN admin UI to localhost
+#   headplane   Mint a session API key and forward the VPN admin UI
 #   destroy     Tear the whole deployment down              (DESTRUCTIVE)
 #
 # Environment:
@@ -865,14 +865,33 @@ REMOTE
 
 cmd_headplane() {
     local ip; ip="$(ca_ip)"
+    local expiry="${1:-24h}"
+
+    # Headplane signs in by pasting a Headscale API key, so mint a throwaway
+    # one per session rather than reusing the node's own — that one is minted
+    # for wayfinder-headscale-apikey.service and rotating out from under it
+    # would take the selfjoin unit and the dashboard's VPN panel down with it.
+    #
+    # `apikeys create` prints the key once and never again (headscale keeps
+    # only its hash), so this is the single chance to capture it. Its stderr is
+    # left alone: when the mint fails, the reason is the useful output.
+    info "minting a $expiry Headplane API key on $ip"
+    local key
+    # shellcheck disable=SC2029
+    key="$(ssh "root@$ip" "headscale apikeys create --expiration $expiry")"
+
+    if [ -n "$key" ]; then
+        printf '\napi key (paste into Headplane, expires in %s):\n\n    %s\n\n' \
+            "$expiry" "$key"
+    else
+        warn "could not mint an API key — sign in with one from
+  ssh root@$ip headscale apikeys create --expiration $expiry"
+    fi
+
     info "forwarding http://127.0.0.1:3001/admin -> $ip (Ctrl-C to stop)"
     # Break-glass only. It is loopback-bound on the node deliberately, and the
     # forward is the friction that keeps it a fallback rather than a surface
     # anyone routes to — the day-to-day view is the dashboard's VPN panel.
-    #
-    # Sign in by pasting a Headscale API key; mint a throwaway one with
-    #   ssh root@<ca> headscale apikeys create --expiration 24h
-    # rather than reusing the node's, which has no expiry anyone is watching.
     ssh -N -L 3001:localhost:3000 "root@$ip"
 }
 
