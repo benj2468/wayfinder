@@ -392,6 +392,19 @@ pub struct OgmAuth<
     send_counters: HVec<(Mac, u64), MAX_NEIGHBOR_KEYS>,
     /// Per-neighbor highest accepted incoming counter (monotonic replay guard).
     recv_counters: HVec<(Mac, u64), MAX_NEIGHBOR_KEYS>,
+    /// A verified revocation naming **this** node, held until the router
+    /// drains it.
+    ///
+    /// Not in [`revocations`](Self::revocations) and never re-flooded: there
+    /// is no third party to keep dropping frames from, and echoing our own
+    /// death warrant would only spend a flood slot peers already spent. It
+    /// sits here instead because the reaction is the router's — clearing the
+    /// certificate and anchor, which `OgmAuth` cannot do to itself.
+    ///
+    /// Held rather than acted on immediately when the record is not yet in
+    /// force or this node has no clock; see
+    /// [`take_self_revoked`](Self::take_self_revoked).
+    self_revocation: Option<RevocationRecord>,
     /// Set whenever a *new* revocation is ingested, signalling the router to
     /// snap the engine's Trickle timers back to `i_min` so the carrying OGM (and
     /// thus the emergency purge) floods promptly instead of waiting out the
@@ -446,6 +459,7 @@ impl<
             sign_scratch: [0u8; SIGN_SCRATCH_LEN],
             send_counters: HVec::new(),
             recv_counters: HVec::new(),
+            self_revocation: None,
             trickle_reset_hint: false,
             in_flight: HVec::new(),
             pending_replies: HVec::new(),
@@ -454,6 +468,49 @@ impl<
             in_progress: HVec::new(),
             ogm_crypto_ops: 0,
         }
+    }
+
+    /// Take the latched revocation of *this* node, if one is in force.
+    ///
+    /// `None` — leaving the record latched for a later call — when:
+    ///
+    /// * no record naming this node has been ingested;
+    /// * this node has **no clock** (`now_unix == 0`). It cannot judge the
+    ///   record's window at all, and `verify_revocation`'s expiry test passes
+    ///   everything at zero, so acting here would let a long-dead record no
+    ///   live peer still holds brick a freshly booted board — with no way to
+    ///   garbage-collect it, since that needs the clock it lacks;
+    /// * the record has **already expired** (`not_after` is at or before the
+    ///   clock). The clause above defers the judgement until a clock arrives;
+    ///   this is the judgement. Without it that deferral merely postpones the
+    ///   brick to the moment NTP lands, which is the long-dead-record case
+    ///   verbatim. An expired record is dropped rather than held: no peer
+    ///   enforces it any more, so it can never become live again;
+    /// * the record's `not_before` has not arrived. Going inert early makes
+    ///   this node a **black hole**: peers apply the same instant, so they
+    ///   keep advertising and using routes through a node that has stopped
+    ///   forwarding, with no route withdrawal to correct them. Worse than the
+    ///   purge it is trying to perform.
+    ///
+    /// Drains on success, so the router acts exactly once.
+    pub fn take_self_revoked(&mut self) -> Option<RevocationRecord> {
+        let record = self.self_revocation?;
+        if self.now_unix == 0 {
+            return None;
+        }
+        if record.not_after.get() <= self.now_unix {
+            // Expired before this node could ever judge it. Drop it: holding it
+            // would leave a record no peer enforces armed against a future
+            // clock adjustment.
+            tracing::debug!("auth: discarding a self-revocation that expired before it applied");
+            self.self_revocation = None;
+            return None;
+        }
+        if record.not_before.get() > self.now_unix {
+            return None;
+        }
+        self.self_revocation = None;
+        Some(record)
     }
 
     /// Take and clear the pending Trickle-reset hint: `true` if a new revocation
@@ -527,11 +584,53 @@ impl<
                 return false;
             }
         };
-        // A revocation of *this* node is a no-op here: peers enforce it against
-        // us, and storing/flooding our own death warrant would only waste a
-        // flood slot and budget.
+        // A revocation of *this* node never joins the enforcement set and is
+        // never re-flooded — peers enforce it against us, and echoing our own
+        // death warrant would only spend a flood slot. It latches instead, for
+        // the router to act on by clearing this state entirely.
         if mac.0 == self.cert.node_mac {
-            tracing::warn!("auth: received a revocation naming this node");
+            // Only if it cancels the certificate this node is *currently*
+            // running under. A record naming this MAC but predating this
+            // certificate describes a membership that has already been
+            // superseded by a re-admission, and acting on it would hand
+            // anyone a kill switch: the OGM tail is not covered by the OGM
+            // signature, so any record ever seen on the wire can be spliced
+            // into a captured frame and replayed.
+            if !record.cancels_cert_for(
+                &self.cert.node_mac,
+                self.cert.not_before.get(),
+                // The enforcement window is judged in `take_self_revoked`,
+                // against a clock this node may not have yet, so this asks
+                // only the issuance question by evaluating "now" at the
+                // record's own effective instant.
+                record.not_before.get(),
+            ) {
+                tracing::trace!(
+                    "drop: revocation names this node but cancels only a superseded certificate"
+                );
+                return false;
+            }
+            // Logged on the *transition* only. While a record is held — no
+            // clock yet, or its instant not reached — this node is not yet
+            // locked, so every replayed OGM tail carrying it re-enters here.
+            // An unconditional `error!` would then be a remote-triggerable log
+            // flood on a hot path, against CLAUDE.md and into the same bounded
+            // `GetLogs` ring a dongle has already OOM'd on. The arming
+            // transition itself is logged once by `apply_self_revocation`.
+            let known = self
+                .self_revocation
+                .is_some_and(|held| held.not_before.get() >= record.not_before.get());
+            if !known {
+                tracing::error!(
+                    node_mac = ?Mac(record.node_mac),
+                    not_before = record.not_before.get(),
+                    "auth: this node's mesh membership has been revoked"
+                );
+                // A later instant supersedes a held record; an earlier one must
+                // not pull the arming instant backwards, which would arm this
+                // node early and black-hole the peers still routing through it.
+                self.self_revocation = Some(*record);
+            }
             return false;
         }
         // Deduplicate on `(node_mac, not_before)`, not on the MAC alone.  Under
@@ -718,6 +817,15 @@ impl<
             .iter()
             .find(|r| r.record.node_mac == mac.0)
             .map(|r| r.record.not_after.get())
+    }
+
+    /// This node's own membership certificate.
+    ///
+    /// Exposed so the router can ask whether a revocation it is latched under
+    /// cancels the certificate about to be installed — the re-admission check
+    /// in [`CentralRouter::set_auth`](crate::CentralRouter::set_auth).
+    pub fn cert(&self) -> &MembershipCert {
+        &self.cert
     }
 
     /// This node's own trust anchor (for the security view / observability).
@@ -2451,15 +2559,153 @@ mod tests {
         assert!(a.tag_directed(mac(3), b"f", &mut trailer).is_none());
     }
 
-    /// A revocation naming *this* node is a no-op: it is neither stored nor
-    /// re-flooded (peers enforce it against us; we don't carry our own).
+    /// A revocation naming *this* node is never stored in the enforcement set
+    /// and never re-flooded — peers enforce it against us, and carrying our own
+    /// death warrant would only spend a flood slot. What it does instead is
+    /// latch, for the router to act on.
     #[test]
-    fn self_revocation_is_a_noop() {
+    fn self_revocation_latches_instead_of_being_stored() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut a = member(&authority, 2, mac(2), 1000);
         let record = authority.revoke(mac(2), 50, 1000); // a's own MAC
         assert!(!a.ingest_revocation(&record));
-        assert_eq!(a.revoked_macs().count(), 0);
+        assert_eq!(a.revoked_macs().count(), 0, "not in the enforcement set");
+        assert_eq!(
+            a.take_self_revoked().map(|r| r.node_mac),
+            Some(record.node_mac),
+            "but latched for the router to act on"
+        );
+        assert_eq!(
+            a.take_self_revoked().map(|r| r.node_mac),
+            None,
+            "and drained exactly once"
+        );
+    }
+
+    /// A revocation naming this node but cancelling only a *superseded*
+    /// certificate is ignored: it was issued before the certificate this node
+    /// now runs under, so it says nothing about the current one.
+    ///
+    /// This is what makes a replayed record harmless after a re-admission —
+    /// the OGM tail carrying it is not covered by the OGM signature, so an
+    /// attacker can splice any record they have ever seen into a captured
+    /// frame.
+    #[test]
+    fn a_revocation_of_a_superseded_certificate_does_not_latch() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        // This node's certificate was issued at 600, after the record's 500.
+        let mut a = member_issued_at(&authority, 2, mac(2), 600, 100_000, 700);
+        let stale = authority.revoke(mac(2), 500, 100_000);
+        assert!(!a.ingest_revocation(&stale));
+        assert_eq!(a.take_self_revoked().map(|r| r.node_mac), None);
+    }
+
+    /// A self-revocation whose effective instant has not arrived is held, not
+    /// acted on: going inert early makes this node a black hole, because peers
+    /// are still advertising routes through it until the same instant.
+    #[test]
+    fn self_revocation_waits_for_its_effective_instant() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member_issued_at(&authority, 2, mac(2), 0, 100_000, 100);
+        let record = authority.revoke(mac(2), 500, 100_000);
+        assert!(!a.ingest_revocation(&record));
+        assert_eq!(
+            a.take_self_revoked().map(|r| r.node_mac),
+            None,
+            "not yet in force"
+        );
+
+        a.set_time(500);
+        assert_eq!(
+            a.take_self_revoked().map(|r| r.node_mac),
+            Some(record.node_mac),
+            "the clock reaching the instant arms it"
+        );
+    }
+
+    /// A node whose clock has never been set does not self-revoke: it cannot
+    /// judge the record's window at all, and `verify_revocation`'s expiry test
+    /// passes everything at zero, so a long-dead record would otherwise brick
+    /// a freshly booted board.
+    #[test]
+    fn self_revocation_waits_for_a_clock() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let kp = Keypair::from_seed(&[2; 32]);
+        let cert = authority.issue_cert(mac(2), kp.ed_pubkey(), kp.x_pubkey(), 0, 100_000);
+        let mut a = OgmAuth::new(kp, cert, authority.trust_anchor()); // no set_time
+        let record = authority.revoke(mac(2), 500, 100_000);
+        assert!(!a.ingest_revocation(&record));
+        assert_eq!(
+            a.take_self_revoked().map(|r| r.node_mac),
+            None,
+            "no clock, no judgement"
+        );
+
+        a.set_time(600);
+        assert_eq!(
+            a.take_self_revoked().map(|r| r.node_mac),
+            Some(record.node_mac)
+        );
+    }
+
+    /// A replayed *older* record must not pull the arming instant backwards.
+    ///
+    /// The OGM tail is not covered by the OGM signature, so any record ever
+    /// seen on the wire can be spliced into a captured frame and replayed. If
+    /// an older instant overwrote a held newer one, that replay would arm this
+    /// node early — black-holing the peers still routing through it, which is
+    /// exactly what the instant gate exists to prevent.
+    #[test]
+    fn an_older_replayed_self_revocation_does_not_pull_the_instant_backwards() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let kp = Keypair::from_seed(&[2; 32]);
+        let cert = authority.issue_cert(mac(2), kp.ed_pubkey(), kp.x_pubkey(), 0, 100_000);
+        let mut a = OgmAuth::new(kp, cert, authority.trust_anchor());
+        a.set_time(400);
+
+        // Held: its instant is still in the future.
+        assert!(!a.ingest_revocation(&authority.revoke(mac(2), 1_000, 100_000)));
+        assert_eq!(a.take_self_revoked().map(|r| r.node_mac), None);
+
+        // An older record, replayed. It must not replace the held one.
+        assert!(!a.ingest_revocation(&authority.revoke(mac(2), 500, 100_000)));
+
+        a.set_time(600);
+        assert_eq!(
+            a.take_self_revoked().map(|r| r.node_mac),
+            None,
+            "a replayed older record must not arm this node ahead of the instant it was given"
+        );
+
+        // The originally-held instant still governs.
+        a.set_time(1_000);
+        assert!(a.take_self_revoked().is_some());
+    }
+
+    /// A record that has already expired by the time the clock arrives must not
+    /// fire.
+    ///
+    /// The clockless gate defers the judgement; it must not skip it. Without an
+    /// expiry check the gate merely postpones the brick to the moment NTP
+    /// lands — which is precisely the "long-dead record no live peer still
+    /// holds" case it exists to prevent.
+    #[test]
+    fn a_self_revocation_expired_before_the_clock_arrives_does_not_fire() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let kp = Keypair::from_seed(&[2; 32]);
+        let cert = authority.issue_cert(mac(2), kp.ed_pubkey(), kp.x_pubkey(), 0, 100_000);
+        let mut a = OgmAuth::new(kp, cert, authority.trust_anchor()); // no set_time
+        // Verified at `now_unix == 0`, where nothing expires, so it latches.
+        let record = authority.revoke(mac(2), 500, 700);
+        assert!(!a.ingest_revocation(&record));
+
+        // The clock arrives long after the record's window closed.
+        a.set_time(5_000);
+        assert_eq!(
+            a.take_self_revoked().map(|r| r.node_mac),
+            None,
+            "a record that expired before this node could judge it must not brick it"
+        );
     }
 
     /// A node whose clock is unset (`now_unix == 0`) does not enforce a

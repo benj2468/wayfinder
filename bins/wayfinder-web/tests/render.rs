@@ -121,6 +121,8 @@ fn seeded_snapshot() -> NodeSnapshot {
         node_mac: vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01],
         cert_not_after: 1_800_000_000,
         revocation_count: 1,
+        self_revoked: false,
+        self_revocation_not_after: 0,
         nodes: vec![
             NodeSecurity {
                 node_id: vec![0, 0, 0, 0, 0, 2],

@@ -1179,6 +1179,35 @@ where
             send_response(&mut responses, vpn_response).await?;
             continue;
         }
+        // A certificate authority must not revoke itself.
+        //
+        // Refused *here*, before the request reaches the authority, because
+        // the authority signs and durably records a revocation before the
+        // router is ever asked to flood it — so by the time anything could
+        // notice, the act is irreversible. And what it would destroy is the
+        // mesh's root of trust: the CA would go inert, partitioning whatever
+        // it routes for, and clearing its auth state empties the anchor every
+        // management connection is authorized against, dropping every admin to
+        // the enrollment tier. No `ApproveCsr`, no `RevokeNode`, no account
+        // administration, and nothing left that can enroll anybody — recovered
+        // only from the CA's own identity seed.
+        //
+        // This layer is the one that knows: `own_mac` comes from the router,
+        // which the authority task cannot see.
+        if let Some(ReqKind::RevokeNode(revoke)) = &request.request
+            && revoke.node_mac == own_mac.0
+        {
+            tracing::warn!("drop: refusing to revoke this node, which is the authority");
+            send_response(
+                &mut responses,
+                RespKind::Error(ErrorResponse {
+                    message: "this node is the certificate authority; revoking it would take the mesh's root of trust off the mesh and leave nobody able to enroll or re-admit anyone, including itself"
+                        .into(),
+                }),
+            )
+            .await?;
+            continue;
+        }
         let response =
             serve_by_facet(&request, &query_tx, authority_tx.as_ref(), router.as_ref()).await?;
         // Mesh revocation and VPN revocation are one operator action, so the
@@ -4028,6 +4057,64 @@ mod tests {
             resp.response
         );
         assert_eq!(*coordinator.revoked.lock().unwrap(), vec![target]);
+    }
+
+    /// A certificate authority refuses to revoke *itself*.
+    ///
+    /// Refused before the request reaches the authority, because the authority
+    /// signs and durably records a revocation before the router is asked to
+    /// flood it — so there is no later point at which this could be undone.
+    /// What it would destroy is the mesh's root of trust: the CA goes inert,
+    /// its anchor is cleared, and every admin connection drops to the
+    /// enrollment tier, leaving nobody able to enroll or re-admit anyone.
+    #[tokio::test]
+    async fn the_authority_refuses_to_revoke_itself() {
+        use wayfinder_protos::wayfinder::v1alpha::RevokeNodeRequest;
+
+        let own = Mac([2, 0, 0, 0, 0, 1]);
+        let (_node, _cert, anchor, ca_own) = enrolled_device(own);
+        let coordinator = std::sync::Arc::new(FakeCoordinator::default());
+        let (mut client, _server) = spawn_gated_server_with_vpn(
+            ca_own,
+            gate_returning(AuthContext {
+                own_key: Some(ca_own),
+                anchor: Some(anchor),
+                revoked: Vec::new(),
+                own_mac: own,
+                now_unix: 100,
+            }),
+            Response::Empty(wayfinder_protos::wayfinder::v1alpha::Empty {}),
+            Some(coordinator.clone()),
+        );
+
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: Vec::new(),
+            })))
+            .await
+            .unwrap();
+        let _ack = client.next().await.unwrap().unwrap();
+
+        client
+            .send(encode_request(Request::RevokeNode(RevokeNodeRequest {
+                node_mac: own.0.to_vec(),
+            })))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+
+        let Some(Response::Error(err)) = resp.response else {
+            panic!("revoking the authority itself must be refused: {resp:?}");
+        };
+        assert!(
+            err.message.contains("certificate authority"),
+            "the reason names why: {}",
+            err.message
+        );
+        assert!(
+            coordinator.revoked.lock().unwrap().is_empty(),
+            "and nothing was revoked anywhere"
+        );
     }
 
     /// A revoke whose VPN half fails is reported as a failure, not as success.

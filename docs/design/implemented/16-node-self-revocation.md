@@ -1,9 +1,9 @@
 # Design: node self-revocation, and revocation by invalidity date
 
-**Status:** Part A implemented (§3); Part B proposed (§4).  The two ship as
-**sequenced MRs**, and Part A is a prerequisite for Part B rather than a
-follow-up — §5.1 records why the reverse order is unsafe.  §11 records what
-Part A's implementation found that this design did not anticipate.
+**Status:** Implemented.  Shipped as **two sequenced MRs** — Part A (§3) then
+Part B (§4) — because Part A is a prerequisite rather than a follow-up; §5.1
+records why the reverse order is unsafe.  §11 and §12 record what each
+implementation found that this design did not anticipate.
 
 **Scope:** `libs/wayfinder-auth` (`RevocationRecord`'s `not_before` gains a
 second meaning and a version bump — the layout is unchanged;
@@ -706,3 +706,52 @@ does not run in this environment — 44 failures and 13 collection errors on a
 clean tree, unrelated to this work — so the version bump in
 `libs/wayfinder-shark/tests/test_ogm_dissector.py` and the field relabel in
 `wayfinder.lua` are unexercised.  CI's `test:run:python` job covers them.
+
+---
+
+## 12. What Part B's implementation found
+
+**Clearing the stored identity turned out to be unnecessary, and unexpressible.**
+§4.4 called for persisting `identity: None` alongside the record.
+`NodeSettings::merge` reads an absent field as "leave alone", so a clear cannot
+be expressed that way at all — and it is not needed: the boot-time
+re-verification of the stored record covers the runtime-installed and
+config-file cases *uniformly*, because in both it is the record that decides
+whether to arm.  One mechanism instead of two, and the node keeps a legible
+history of what it was enrolled as.
+
+**An empty record is the "clear" sentinel.**  Falling out of the same `merge`
+semantics: re-admission has to remove the record in the same durable write that
+installs the new certificate, so `Some(Vec::new())` means remove.  Documented on
+the field and on `merge`, and covered by
+`an_empty_self_revocation_update_clears_the_record`.
+
+**The authority's self-revoke refusal lives in the transport, not the
+authority.**  §4.7 said "at the authority, before it signs".  The authority
+cannot: `CertAuthority` does not know the node's own mesh MAC.  The transport
+does — `AuthContext.own_mac`, which exists precisely because the router is its
+only trustworthy source — so the refusal sits there, still ahead of the signing
+and persisting.  Same guarantee, one layer earlier.
+
+**Arming is evaluated on read, not by a flag set in `set_time`.**
+`OgmAuth::take_self_revoked` re-checks the clock and the record's `not_before`
+on every call and returns `None` while either gate is unmet, leaving the record
+latched.  `CentralRouter::poll` drains it, which makes the periodic timer the
+hook that arms a held record — a node with no inbound traffic would otherwise
+never re-evaluate one.
+
+**`RevocationRecord::from_bytes`** was added, mirroring
+`MembershipCert::from_bytes`, so `bins/wayfinder-tap` can parse the persisted
+blob without taking a `zerocopy` dependency.
+
+**The security-view field (§8) landed with it** rather than being deferred:
+`self_revoked` and `self_revocation_not_after` on `GetSecurityStatusResponse`
+(fields 12 and 13), surfaced on both the TUI and web Security tabs.  Both check
+it *before* `auth_enabled`, because going inert means dropping the certificate —
+a revoked node reports auth disabled, and reporting only that would hide the one
+thing about it that matters.
+
+**Not verified locally:** the Wireshark dissector, for the same reason as
+Part A — its pytest suite does not run in this environment (44 failures and 13
+collection errors on a clean tree, unrelated to this work).  CI's
+`test:run:python` job covers it.

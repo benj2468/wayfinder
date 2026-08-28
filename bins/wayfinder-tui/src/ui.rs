@@ -517,6 +517,7 @@ fn alarm_kind_name(kind: i32) -> &'static str {
         Ok(AlarmKind::LinkErrors) => "link_errors",
         Ok(AlarmKind::TableSaturation) => "table_saturation",
         Ok(AlarmKind::ClockUnsynchronized) => "clock_unsynchronized",
+        Ok(AlarmKind::SelfRevoked) => "self_revoked",
         // A node newer than this build, holding a condition it has no name for.
         // Shown as unknown rather than dropped: an alarm this client cannot name
         // is still an alarm.
@@ -1214,6 +1215,20 @@ fn render_security_header(frame: &mut Frame, app: &App, area: Rect) {
             "(waiting for data)",
             Style::default().fg(Color::DarkGray),
         ))],
+        // Checked before `auth_enabled`, because going inert *is* dropping the
+        // certificate: a revoked node reports auth disabled, and reporting only
+        // that would hide the one thing an operator needs to know about it.
+        Some(s) if s.self_revoked => vec![
+            field("Authentication", "revoked"),
+            field(
+                "Membership",
+                "revoked — inert until an authority re-admits this node",
+            ),
+            field(
+                "Revocation enforced until",
+                &s.self_revocation_not_after.to_string(),
+            ),
+        ],
         Some(s) if !s.auth_enabled => vec![field("Authentication", "disabled")],
         Some(s) => vec![
             field("Authentication", "enabled"),

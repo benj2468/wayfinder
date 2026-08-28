@@ -715,6 +715,7 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some((keypair, cert_bytes, anchor_bytes, source)) = identity_material {
         use wayfinder::auth::OgmAuth;
+        use wayfinder::wayfinder_auth::RevocationRecord;
         use wayfinder::wayfinder_auth::TrustAnchor;
 
         let cert = MembershipCert::from_bytes(&cert_bytes)
@@ -733,12 +734,97 @@ async fn main() -> anyhow::Result<()> {
             );
         }
 
+        // A revocation naming this node, heard before some earlier restart and
+        // written to the settings store, is re-verified here against the
+        // anchor about to be installed.
+        //
+        // This is the half that cannot be handled by clearing the stored
+        // identity: when the material comes from a config `auth:` block, those
+        // files belong to the operator and the node must not rewrite them, so
+        // the record is the only thing it can durably change. Re-verified
+        // rather than trusted as a flag, so a hand-edited settings file cannot
+        // forge one without the mesh root key — and it self-expires, since
+        // past its `not_after` the anchor refuses it and this node may
+        // legitimately arm again.
+        // `host_unix_now` rather than a raw `SystemTime::now()`: it is this
+        // repo's one definition of a *plausible* wall clock, floors an
+        // undisciplined reading to zero, and is what the router's own clock
+        // uses. A second host-clock read with a different floor is how the two
+        // come to disagree.
+        let now_unix = wayfinder_server::host_unix_now();
+        let stored = settings
+            .self_revocation
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .and_then(RevocationRecord::from_bytes);
+        // Judged only when this node has a clock to judge with. Without one,
+        // the record is *held* rather than discarded — the opposite of the
+        // wire path's caution, and deliberately so: this record was already
+        // accepted by this node under a good clock and durably stored, so an
+        // unreadable clock is a reason not to decide, never a reason to arm.
+        // Discarding it here would let a dead RTC undo the revocation on every
+        // boot, which is the most ordinary way this feature could fail.
+        let self_revocation = match (stored, now_unix) {
+            (Some(record), 0) => {
+                tracing::error!(
+                    ?record,
+                    "this node holds a revocation of itself but has no usable clock to judge it; staying inert"
+                );
+                Some(record)
+            }
+            (Some(record), now) => {
+                match anchor.verify_revocation(&record, now) {
+                    Ok(_)
+                        if record.cancels_cert_for(&cert.node_mac, cert.not_before.get(), now) =>
+                    {
+                        Some(record)
+                    }
+                    // Superseded by the certificate about to be installed: the
+                    // authority re-admitted this node, which is the recovery
+                    // path working.
+                    Ok(_) => {
+                        tracing::info!(
+                            "the stored self-revocation no longer cancels this node's certificate; re-admitting"
+                        );
+                        None
+                    }
+                    // Expired is the documented self-heal. Anything else means
+                    // the stored record and this anchor do not belong together
+                    // — say which, rather than silently arming.
+                    Err(e) => {
+                        tracing::warn!(
+                            error = ?e,
+                            "the stored self-revocation does not verify against this node's anchor; ignoring it"
+                        );
+                        None
+                    }
+                }
+            }
+            (None, _) => None,
+        };
+
         let mesh_id = anchor.mesh_id;
         auth_mesh_id = Some(mesh_id);
-        driver
-            .with_router_mut(|r| r.set_auth(OgmAuth::new(keypair, cert, anchor)))
-            .await;
-        tracing::info!("mesh authentication enabled (mesh_id = {:#x})", mesh_id);
+        if let Some(record) = self_revocation {
+            tracing::error!(
+                ?record,
+                "this node's mesh membership was revoked; it stays inert until an authority re-admits it with a newer certificate"
+            );
+            wayfinder_alarm::alarm!(
+                wayfinder_alarm::Severity::Critical,
+                wayfinder_alarm::AlarmKind::SelfRevoked,
+                wayfinder_alarm::Subject::Node(wayfinder_alarm::NodeId::new(&record.node_mac)),
+                "mesh membership revoked; re-enroll this node to bring it back"
+            );
+            driver
+                .with_router_mut(|r| r.note_self_revoked(record))
+                .await;
+        } else {
+            driver
+                .with_router_mut(|r| r.set_auth(OgmAuth::new(keypair, cert, anchor)))
+                .await;
+            tracing::info!("mesh authentication enabled (mesh_id = {:#x})", mesh_id);
+        }
     }
 
     // Opt-in provider (certificate-authority) mode: load the mesh root seed and

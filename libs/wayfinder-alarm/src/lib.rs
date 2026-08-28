@@ -181,6 +181,15 @@ pub enum AlarmKind {
     /// thing. The node keeps routing, which is exactly why this needs saying
     /// out loud: it looks healthy.
     ClockUnsynchronized,
+    /// This node's own mesh membership has been revoked: it holds a
+    /// root-signed record naming itself, has dropped its certificate and trust
+    /// anchor, and is inert until an authority re-admits it.
+    ///
+    /// Distinct from [`RevokedPeer`](Self::RevokedPeer), which is about
+    /// somebody else. This one is the node reporting its own removal, and it
+    /// is the only record of *why* the node went silent — so it is the alarm
+    /// that has to survive the burst of frames that carried it.
+    SelfRevoked,
 }
 
 impl AlarmKind {
@@ -197,6 +206,7 @@ impl AlarmKind {
             Self::LinkErrors => 6,
             Self::TableSaturation => 7,
             Self::ClockUnsynchronized => 8,
+            Self::SelfRevoked => 9,
         }
     }
 
@@ -213,6 +223,7 @@ impl AlarmKind {
             Self::LinkErrors => "link_errors",
             Self::TableSaturation => "table_saturation",
             Self::ClockUnsynchronized => "clock_unsynchronized",
+            Self::SelfRevoked => "self_revoked",
         }
     }
 }

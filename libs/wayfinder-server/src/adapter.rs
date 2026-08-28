@@ -332,6 +332,7 @@ fn alarm_kind_data(kind: wayfinder_alarm::AlarmKind) -> AlarmKindData {
         wayfinder_alarm::AlarmKind::LinkErrors => AlarmKindData::LinkErrors,
         wayfinder_alarm::AlarmKind::TableSaturation => AlarmKindData::TableSaturation,
         wayfinder_alarm::AlarmKind::ClockUnsynchronized => AlarmKindData::ClockUnsynchronized,
+        wayfinder_alarm::AlarmKind::SelfRevoked => AlarmKindData::SelfRevoked,
     }
 }
 
@@ -688,6 +689,13 @@ impl<
                 .as_ref()
                 .map(|kp| kp.x_pubkey().to_vec())
                 .unwrap_or_default(),
+            // Reported with the posture rather than with the auth block below,
+            // because a revoked node *has* no auth block — dropping the
+            // certificate is what going inert means. Without it here, the one
+            // state that most needs explaining would be the one the security
+            // view could not describe.
+            self_revoked: self.router.self_revoked(),
+            self_revocation_not_after: self.router.self_revocation_not_after().unwrap_or(0),
             ..SecurityStatusData::default()
         };
 
@@ -1152,6 +1160,18 @@ impl<
             return Err("certificate MAC does not match the MAC this node runs under".to_string());
         }
 
+        // A node under a revocation may only be re-admitted with a certificate
+        // that revocation does not cancel. Refused here rather than installed
+        // and quietly ignored, because the alternative is the one genuinely
+        // misleading state: a node reporting itself enrolled while every peer
+        // holding the record drops it, which looks like a routing fault and is
+        // not one. The remedy is a certificate issued *after* the revocation
+        // instant — what re-approving the node's enrollment produces.
+        if self.router.self_revocation_cancels(&parsed_cert) {
+            return Err("this node has been revoked from the mesh, and this certificate predates the revocation; it must be re-issued by the authority before this node can rejoin"
+                .to_string());
+        }
+
         // Recorded only once every blob has parsed, so a malformed request
         // cannot leave unusable identity material behind for the next boot to
         // trip over. The bytes as received are what is stored — they are what
@@ -1163,6 +1183,11 @@ impl<
                 cert: cert.to_vec(),
                 trust_anchor: trust_anchor.to_vec(),
             }),
+            // Cleared in the same durable write that installs the identity:
+            // this certificate has just been checked against the record above,
+            // so leaving the record behind would only re-lock the node on its
+            // next boot.
+            self_revocation: Some(Vec::new()),
             ..Default::default()
         })?;
 
@@ -2324,6 +2349,63 @@ mod tests {
         assert_eq!(identity.seed, [3u8; 32].to_vec());
         assert_eq!(identity.cert, cert);
         assert_eq!(identity.trust_anchor, anchor);
+    }
+
+    /// A node under a revocation refuses a certificate that revocation still
+    /// cancels, rather than installing one that leaves it inert while
+    /// reporting itself enrolled.
+    ///
+    /// The failure this prevents is a node that looks healthy locally and is
+    /// invisible to every peer holding the record — which reads as a routing
+    /// fault and is not one.
+    #[test]
+    fn set_auth_refuses_a_certificate_the_revocation_still_cancels() {
+        use wayfinder::wayfinder_auth::Authority;
+
+        let authority = Authority::from_seed(&[9; 32], 0xABCD);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let node = kp.derived_mac();
+
+        let mut router = CentralRouter::new(node);
+        // Enrolled, then revoked at 1_000.
+        let old_cert = authority.issue_cert(node, kp.ed_pubkey(), kp.x_pubkey(), 0, 100_000);
+        router.set_auth(wayfinder::auth::OgmAuth::new(
+            wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]),
+            old_cert,
+            authority.trust_anchor(),
+        ));
+        router.auth_mut().unwrap().set_time(2_000);
+        router.ingest_revocation(&authority.revoke(node, 1_000, 100_000), Duration::ZERO);
+        assert!(router.self_revoked());
+
+        let anchor = authority.trust_anchor();
+        let anchor_bytes = anchor.to_bytes().to_vec();
+        let mut store = RecordingStore::default();
+
+        // A certificate from before the revocation is refused...
+        let stale = authority.issue_cert(node, kp.ed_pubkey(), kp.x_pubkey(), 500, 100_000);
+        let err = RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_epoch_unix(Duration::from_secs(2_000))
+            .with_settings(&mut store)
+            .set_auth(&[3; 32], stale.as_bytes(), &anchor_bytes)
+            .expect_err("a cancelled certificate is refused");
+        assert!(err.contains("revoked"), "the reason names the cause: {err}");
+        assert!(router.auth_locked(), "and the node stays inert");
+
+        // ...while one issued after it re-admits the node and clears the
+        // stored record in the same write.
+        let fresh = authority.issue_cert(node, kp.ed_pubkey(), kp.x_pubkey(), 1_500, 100_000);
+        RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_epoch_unix(Duration::from_secs(2_000))
+            .with_settings(&mut store)
+            .set_auth(&[3; 32], fresh.as_bytes(), &anchor_bytes)
+            .expect("a certificate issued after the revocation re-admits the node");
+        assert!(!router.self_revoked());
+        assert!(!router.auth_locked());
+        assert!(
+            store.settings().self_revocation.is_none(),
+            "the stored record is cleared, or the next boot would re-lock the node"
+        );
     }
 
     /// Online enrollment needs to name the keys it is asking a provider to

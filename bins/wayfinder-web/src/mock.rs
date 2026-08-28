@@ -150,6 +150,8 @@ impl Default for Mock {
                 enrollment: None,
                 own_ed_pubkey: MOCK_ED_PUBKEY.to_vec(),
                 own_x_pubkey: MOCK_X_PUBKEY.to_vec(),
+                self_revoked: false,
+                self_revocation_not_after: 0,
             },
             enrollment_token: None,
             pending_csrs: None,
@@ -185,6 +187,8 @@ impl Mock {
                 // populated even though every other identity field is empty.
                 own_ed_pubkey: MOCK_ED_PUBKEY.to_vec(),
                 own_x_pubkey: MOCK_X_PUBKEY.to_vec(),
+                self_revoked: false,
+                self_revocation_not_after: 0,
             },
             enrollment_token: None,
             pending_csrs: None,
