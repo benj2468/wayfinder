@@ -149,11 +149,17 @@ f.cert_req_sig = ProtoField.bytes("wayfinder.cert_req.signature", "Requester Sig
 
 -- Revocation record fields (wayfinder_auth::RevocationRecord; see
 -- libs/wayfinder-auth/src/revoke.rs).
+--
+-- Version 2 keeps v1's layout exactly and changes only what not_before means:
+-- it is both the instant enforcement begins and the issuance cut-off, so a
+-- certificate for node_mac survives the record if it was issued after it. The
+-- two versions are therefore indistinguishable by shape and only the version
+-- byte tells them apart.
 f.revoke_version = ProtoField.uint8("wayfinder.tvlv.revoke.version", "Revoke Version", base.DEC)
 f.revoke_flags = ProtoField.uint8("wayfinder.tvlv.revoke.flags", "Flags", base.HEX)
 f.revoke_mesh = ProtoField.uint32("wayfinder.tvlv.revoke.mesh_id", "Mesh ID", base.HEX)
 f.revoke_mac = ProtoField.ether("wayfinder.tvlv.revoke.node_mac", "Revoked Node MAC")
-f.revoke_nb = ProtoField.uint64("wayfinder.tvlv.revoke.not_before", "Not Before", base.DEC)
+f.revoke_nb = ProtoField.uint64("wayfinder.tvlv.revoke.not_before", "Effective / Issuance Cut-off", base.DEC)
 f.revoke_na = ProtoField.uint64("wayfinder.tvlv.revoke.not_after", "Not After", base.DEC)
 f.revoke_sig = ProtoField.bytes("wayfinder.tvlv.revoke.signature", "Root Signature")
 

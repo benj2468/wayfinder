@@ -717,15 +717,18 @@ impl<
             .into_iter()
             .map(|mac| {
                 let verified = auth.neighbors().iter().find(|n| n.cert.mac == mac);
-                // One lookup answers both halves: holding a record *is* being
-                // revoked, and the record's `not_after` is the only date the
-                // row has once the cached cert has been evicted.
+                // Holding a record is no longer the same question as being
+                // revoked: a node re-admitted with a certificate issued after
+                // the record's instant survives it, and is routing normally.
+                // `is_shunned` asks whether the record actually bites; the
+                // record's `not_after` is still reported either way, as the
+                // only date the row has once the cached cert has been evicted.
                 let revocation_not_after = auth.revocation_not_after(mac);
                 NodeSecurityData {
                     node_id: mac.as_bytes().to_vec(),
                     verified: verified.is_some(),
                     cert_not_after: verified.map(|n| n.cert.not_after).unwrap_or(0),
-                    revoked: revocation_not_after.is_some(),
+                    revoked: auth.is_shunned(mac),
                     revocation_not_after: revocation_not_after.unwrap_or(0),
                 }
             })
@@ -736,7 +739,7 @@ impl<
             mesh_id: auth.anchor().mesh_id,
             node_mac: cert.node_mac.to_vec(),
             cert_not_after: cert.not_after.get(),
-            revocation_count: auth.revoked_macs().count() as u32,
+            revocation_count: auth.macs_to_purge().count() as u32,
             nodes,
             ..posture
         }

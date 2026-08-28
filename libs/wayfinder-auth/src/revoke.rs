@@ -14,12 +14,25 @@ use crate::error::AuthError;
 use crate::key::verify_signature;
 
 /// Version byte for [`RevocationRecord`]; the only version accepted.
-pub const REVOKE_VERSION: u8 = 1;
+///
+/// Bumped 1 → 2 when `not_before` gained its second meaning (the issuance
+/// cut-off, see the field's docs).  The layout is byte-identical across the
+/// two, so the version is the *only* thing separating them — and the two
+/// readings fail in opposite directions (a v1 record read as v2 cancels
+/// nothing; a v2 record read as v1 cancels a legitimate re-admission), which
+/// is why there is no compatibility shim and a v1 record is simply refused.
+pub const REVOKE_VERSION: u8 = 2;
 
-/// A mesh root's signed statement that a node MAC is no longer a member, flooded
-/// across the mesh for immediate removal.  Nodes add the MAC to their local
-/// revocation set and drop its frames; passive cert expiry then makes the
-/// removal permanent without further traffic.
+/// A mesh root's signed statement that a node's credentials *as of a given
+/// instant* are no longer valid, flooded across the mesh for immediate removal.
+///
+/// Nodes store the record and drop frames from any certificate for `node_mac`
+/// issued at or before its [`not_before`](Self::not_before); one issued after is
+/// a re-admission and survives.  It is deliberately **not** keyed on the MAC
+/// alone — a node whose MAC it cannot change (an nRF derives it from factory
+/// FICR) would otherwise be excluded until `not_after` with no recovery.
+/// Passive cert expiry then makes the removal permanent without further
+/// traffic.
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Debug)]
 #[repr(C, packed)]
 pub struct RevocationRecord {
@@ -31,7 +44,28 @@ pub struct RevocationRecord {
     pub mesh_id: U32,
     /// The node MAC being revoked.
     pub node_mac: [u8; 6],
-    /// Unix-seconds instant the revocation takes effect.  Network byte order.
+    /// Unix-seconds instant the revocation takes effect, **and** the line
+    /// dividing cancelled certificates from surviving ones: a certificate for
+    /// [`node_mac`](Self::node_mac) is cancelled by this record only if its
+    /// own `not_before` is at or before this instant.
+    ///
+    /// So a certificate issued *after* the revocation — a re-admission, which
+    /// by definition the authority signed knowing it had revoked — is
+    /// unaffected, and a re-approved node rejoins under its own MAC instead of
+    /// waiting out [`not_after`](Self::not_after).  That matters most where a
+    /// MAC cannot be changed at all: an nRF board derives its MAC from the
+    /// chip's factory FICR, so without this, revoking one would exclude it
+    /// with no way back.
+    ///
+    /// The tie (a certificate issued in the same second) resolves toward
+    /// *revoked*: this is a security control, and an authority re-admitting a
+    /// node can trivially stamp the new certificate a second later, whereas
+    /// the other reading would leave a same-second hole.
+    ///
+    /// **Must be non-zero.**  Zero would cancel no certificate at all while
+    /// still verifying and flooding, so
+    /// [`verify_revocation`](crate::cert::TrustAnchor::verify_revocation)
+    /// refuses it as [`AuthError::NoRevocationInstant`].  Network byte order.
     pub not_before: U64,
     /// Unix-seconds instant the revocation expires and may be forgotten.  Set by
     /// the issuer to (at least) the revoked certificate's own `not_after`, so a
@@ -52,14 +86,41 @@ impl RevocationRecord {
         let body_len = core::mem::size_of::<RevocationRecord>() - 64;
         &self.as_bytes()[..body_len]
     }
+
+    /// Whether this record cancels `cert` as of `now_unix`.
+    ///
+    /// Three questions at once, which is the point of having one function
+    /// rather than the condition spelled out at each call site: the record
+    /// must name the certificate's MAC, its enforcement window
+    /// (`not_before .. not_after`, half-open) must contain `now_unix`, and the
+    /// certificate must have been issued at or before the revocation instant.
+    ///
+    /// That last clause is what makes a revocation cancel *credentials* rather
+    /// than a MAC forever — see [`not_before`](Self::not_before) for why, and
+    /// for why the tie resolves toward cancelled.
+    ///
+    /// The caller must already have verified this record against the trust
+    /// anchor; this is the enforcement question, not the authenticity one.
+    #[must_use]
+    pub fn cancels(&self, cert: &crate::cert::VerifiedCert, now_unix: u64) -> bool {
+        self.node_mac == cert.mac.0
+            && cert.not_before <= self.not_before.get()
+            && self.not_before.get() <= now_unix
+            && now_unix < self.not_after.get()
+    }
 }
 
 impl crate::cert::TrustAnchor {
     /// Verify a flooded `record` against this anchor as of `now_unix`,
     /// returning the revoked MAC on success.  Checks the version, that it is
-    /// for this mesh, the root signature — so an attacker cannot forge
-    /// revocations to evict honest nodes — and that the record has not already
-    /// expired.
+    /// for this mesh, that it carries a revocation instant at all, the root
+    /// signature — so an attacker cannot forge revocations to evict honest
+    /// nodes — and that the record has not already expired.
+    ///
+    /// Note what this does *not* answer: whether the record cancels a
+    /// particular certificate.  That needs the certificate, and is decided
+    /// where the revocation set is consulted (`OgmAuth::is_revoked` in
+    /// `wayfinder`), against `not_before` as the issuance cut-off.
     ///
     /// # What "as of `now_unix`" does and does not cover
     ///
@@ -93,6 +154,12 @@ impl crate::cert::TrustAnchor {
         }
         if record.mesh_id.get() != self.mesh_id {
             return Err(AuthError::WrongMesh);
+        }
+        // Structural, so it sits with the version/mesh checks rather than with
+        // the dated ones below: a zero instant is not a record that has gone
+        // stale, it is a record that could never cancel anything.
+        if record.not_before.get() == 0 {
+            return Err(AuthError::NoRevocationInstant);
         }
         if !verify_signature(&self.root_pubkey, record.signed_body(), &record.signature) {
             return Err(AuthError::BadSignature);
@@ -146,6 +213,24 @@ mod tests {
         assert_eq!(
             authority.trust_anchor().verify_revocation(&record, 999),
             Ok(mac(7))
+        );
+    }
+
+    /// A revocation with no instant (`not_before == 0`) is refused as
+    /// malformed rather than accepted as a record that cancels nothing.
+    ///
+    /// Under v1 semantics zero meant "effective immediately"; under v2 the
+    /// field is also the issuance cut-off, so a zero would verify, be stored,
+    /// flood the mesh, and cancel no certificate at all — a security control
+    /// that silently no-ops.  Refusing it here is what makes a v1-shaped
+    /// record impossible to mistake for a v2 one.
+    #[test]
+    fn a_revocation_with_no_instant_is_refused() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let record = authority.revoke(mac(7), 0, 1000);
+        assert_eq!(
+            authority.trust_anchor().verify_revocation(&record, 100),
+            Err(AuthError::NoRevocationInstant)
         );
     }
 

@@ -521,7 +521,7 @@ fn test_revocation_floods_and_shuns_node() {
 
     // Operator revokes machine3 at machine1 — the injection point a provider's
     // RevokeNode RPC will drive in the portal phase.
-    let record = authority.revoke(m3, 0, 1_000_000);
+    let record = authority.revoke(m3, 50, 1_000_000);
     assert!(
         harness
             .get_machine_mut("machine1")

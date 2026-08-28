@@ -87,6 +87,12 @@ pub enum CertCommand {
         #[arg(long)]
         node_seed: PathBuf,
         /// Validity window start (unix seconds).
+        ///
+        /// Also decides whether an outstanding revocation cancels this
+        /// certificate: a record cancels only certificates issued at or before
+        /// its own instant.  Re-issuing for a re-admitted node therefore needs
+        /// a `not_before` *after* the revocation, or the new certificate is
+        /// cancelled the moment a peer holding the record sees it.
         #[arg(long)]
         not_before: u64,
         /// Validity window end (unix seconds).  Keep it short — expiry is the
@@ -145,6 +151,12 @@ pub enum CertCommand {
         #[arg(long)]
         request: PathBuf,
         /// Validity window start (unix seconds).
+        ///
+        /// Also decides whether an outstanding revocation cancels this
+        /// certificate: a record cancels only certificates issued at or before
+        /// its own instant.  Re-issuing for a re-admitted node therefore needs
+        /// a `not_before` *after* the revocation, or the new certificate is
+        /// cancelled the moment a peer holding the record sees it.
         #[arg(long)]
         not_before: u64,
         /// Validity window end (unix seconds).

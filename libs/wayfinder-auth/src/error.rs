@@ -21,6 +21,14 @@ pub enum AuthError {
     NotYetValid,
     /// The subject MAC has been revoked.
     Revoked,
+    /// A revocation record carries no revocation instant (`not_before == 0`).
+    ///
+    /// Structurally malformed rather than merely stale: `not_before` is also
+    /// the issuance cut-off a certificate is judged against, so a zero would
+    /// cancel nothing while still verifying and flooding — a revocation that
+    /// silently does nothing.  It is also exactly the shape a v1 record has,
+    /// so refusing it here is what keeps the two versions from being confused.
+    NoRevocationInstant,
 }
 
 impl core::fmt::Display for AuthError {
@@ -33,6 +41,7 @@ impl core::fmt::Display for AuthError {
             AuthError::Expired => "certificate expired",
             AuthError::NotYetValid => "certificate not yet valid",
             AuthError::Revoked => "subject revoked",
+            AuthError::NoRevocationInstant => "revocation carries no instant",
         };
         f.write_str(msg)
     }

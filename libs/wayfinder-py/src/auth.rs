@@ -402,6 +402,11 @@ impl PyAuthority {
 
     /// Sign a revocation purging `mac`, effective at `not_before` and
     /// forgettable after `not_after` (unix seconds).
+    ///
+    /// `not_before` is also the issuance cut-off: only certificates for `mac`
+    /// whose own `not_before` is at or before it are cancelled, so one issued
+    /// afterwards (a re-admission) survives. It **must be non-zero** — a zero
+    /// cancels nothing and is refused on verification.
     fn revoke(&self, mac: PyMac, not_before: u64, not_after: u64) -> PyRevocationRecord {
         PyRevocationRecord(self.0.revoke(mac.0, not_before, not_after))
     }

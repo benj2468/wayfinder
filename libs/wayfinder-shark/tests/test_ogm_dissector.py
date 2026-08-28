@@ -72,9 +72,13 @@ def revocation_record(
     not_after: int = 1000,
     signature: bytes = b"\x33" * 64,
 ) -> bytes:
-    """A synthetic 92-byte ``RevocationRecord`` (layout only; not a real signature)."""
+    """A synthetic 92-byte ``RevocationRecord`` (layout only; not a real signature).
+
+    Version 2: same layout as v1, but ``not_before`` is also the issuance
+    cut-off — see ``libs/wayfinder-auth/src/revoke.rs``.
+    """
     return (
-        struct.pack(">BB", 1, 0)  # version, flags
+        struct.pack(">BB", 2, 0)  # version, flags
         + struct.pack(">I", mesh_id)
         + node_mac
         + struct.pack(">Q", not_before)
@@ -185,7 +189,7 @@ def test_walk_handles_cert_then_signature(dissect):
 # Expected decoded revocation fields for the synthetic revocation_record() above.
 EXPECTED_REVOKE_FIELDS = {
     "wayfinder.tvlv.type": "0x82",
-    "wayfinder.tvlv.revoke.version": "1",
+    "wayfinder.tvlv.revoke.version": "2",
     "wayfinder.tvlv.revoke.mesh_id": "0x0000abcd",
     "wayfinder.tvlv.revoke.node_mac": "02:00:00:00:00:02",
     "wayfinder.tvlv.revoke.not_before": "500",
