@@ -5223,6 +5223,7 @@ dependencies = [
  "tracing",
  "tun-rs",
  "wayfinder",
+ "wayfinder-alarm",
  "wayfinder-driver",
  "wayfinder-log",
  "wayfinder-server",

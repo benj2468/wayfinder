@@ -497,6 +497,13 @@ pub struct SecurityStatusData {
     /// This node's own X25519 public key, on the same terms as
     /// [`own_ed_pubkey`](Self::own_ed_pubkey).
     pub own_x_pubkey: Vec<u8>,
+    /// Whether this node has been revoked from the mesh and is inert as a
+    /// result — distinct from "fail-closed and never enrolled", which needs a
+    /// different remedy.
+    pub self_revoked: bool,
+    /// When the revocation naming this node stops being enforced (unix
+    /// seconds); zero unless [`self_revoked`](Self::self_revoked).
+    pub self_revocation_not_after: u64,
 }
 
 /// The membership credential a node is running under: its certificate and the
@@ -611,6 +618,9 @@ pub enum AlarmKindData {
     /// The host's system clock is not disciplined, so the node refuses every
     /// credential decision that depends on knowing the time.
     ClockUnsynchronized,
+    /// This node's own membership has been revoked; it is inert until
+    /// re-admitted.
+    SelfRevoked,
 }
 
 /// Who or what an alarm is about.
@@ -1377,6 +1387,7 @@ fn proto_alarm_kind(kind: AlarmKindData) -> AlarmKind {
         AlarmKindData::LinkErrors => AlarmKind::LinkErrors,
         AlarmKindData::TableSaturation => AlarmKind::TableSaturation,
         AlarmKindData::ClockUnsynchronized => AlarmKind::ClockUnsynchronized,
+        AlarmKindData::SelfRevoked => AlarmKind::SelfRevoked,
     }
 }
 
@@ -1705,6 +1716,8 @@ pub fn handle_router_read<P: RouterReads + ?Sized>(
                 }),
                 own_ed_pubkey: s.own_ed_pubkey,
                 own_x_pubkey: s.own_x_pubkey,
+                self_revoked: s.self_revoked,
+                self_revocation_not_after: s.self_revocation_not_after,
             })
         }
         Some(RequestKind::GetOwnCert(_)) => match provider.own_cert() {

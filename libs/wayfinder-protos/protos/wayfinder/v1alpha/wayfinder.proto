@@ -157,6 +157,25 @@ message GetSecurityStatusResponse {
   // keys that tag its frames.  Reported on the same terms as own_ed_pubkey and
   // bound into the same CSR.
   bytes own_x_pubkey = 11;
+
+  // Whether this node has been revoked from the mesh: it holds a root-signed
+  // record naming itself, has dropped its certificate and trust anchor, and is
+  // inert until an authority re-admits it.
+  //
+  // Reported separately from `require_auth` and `auth_enabled` because the two
+  // causes of an inert node need different remedies, and without this they are
+  // indistinguishable: a revoked node presents as "fail-closed and never
+  // enrolled", which reads as *provision me* and points an operator at an
+  // enrollment that will be refused.
+  bool self_revoked = 12;
+
+  // When the revocation naming this node stops being enforced (unix seconds);
+  // zero unless `self_revoked`.
+  //
+  // The only date a revoked node has: going inert drops the certificate whose
+  // expiry would otherwise be reported, and this is what tells an operator how
+  // long peers will keep dropping this MAC.
+  uint64 self_revocation_not_after = 13;
 }
 
 // Ask a node for the membership certificate it is currently running under,
@@ -465,6 +484,12 @@ enum AlarmKind {
   // credential decision that depends on knowing the time.  Routing is
   // unaffected, which is why it is worth reporting: the node looks healthy.
   ALARM_KIND_CLOCK_UNSYNCHRONIZED = 8;
+
+  // This node's own membership has been revoked: it holds a root-signed record
+  // naming itself, has dropped its certificate and trust anchor, and is inert
+  // until an authority re-admits it.  Distinct from ALARM_KIND_REVOKED_PEER,
+  // which is about somebody else.
+  ALARM_KIND_SELF_REVOKED = 9;
 }
 
 // One latched condition the node is holding.

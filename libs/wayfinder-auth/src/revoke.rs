@@ -80,6 +80,23 @@ pub struct RevocationRecord {
 }
 
 impl RevocationRecord {
+    /// Parse an owned record from its raw
+    /// [`as_bytes`](zerocopy::IntoBytes::as_bytes) form — a blob read back
+    /// from a settings store, say — ignoring any trailing bytes.  `None` if
+    /// `bytes` is shorter than the fixed layout.
+    ///
+    /// Mirrors [`MembershipCert::from_bytes`](crate::cert::MembershipCert::from_bytes),
+    /// and exists for the same reason: a caller holding bytes should not have
+    /// to depend on `zerocopy` to turn them into a record.  Parsing is not
+    /// verification — the result still has to go through
+    /// [`TrustAnchor::verify_revocation`](crate::cert::TrustAnchor::verify_revocation).
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<RevocationRecord> {
+        RevocationRecord::read_from_prefix(bytes)
+            .ok()
+            .map(|(r, _)| r)
+    }
+
     /// The byte range the signature covers: every field except the trailing
     /// signature.
     pub fn signed_body(&self) -> &[u8] {
@@ -103,8 +120,26 @@ impl RevocationRecord {
     /// anchor; this is the enforcement question, not the authenticity one.
     #[must_use]
     pub fn cancels(&self, cert: &crate::cert::VerifiedCert, now_unix: u64) -> bool {
-        self.node_mac == cert.mac.0
-            && cert.not_before <= self.not_before.get()
+        self.cancels_cert_for(&cert.mac.0, cert.not_before, now_unix)
+    }
+
+    /// [`cancels`](Self::cancels) against a certificate's MAC and issuance
+    /// instant directly, for the one caller that has neither a
+    /// [`VerifiedCert`](crate::cert::VerifiedCert) nor a reason to make one:
+    /// a node asking whether a record cancels **its own** certificate, which
+    /// it already holds and has no need to re-verify against its own anchor.
+    ///
+    /// Kept as the primitive both entry points call so the condition is
+    /// written once — two copies of it are two things to keep in step.
+    #[must_use]
+    pub fn cancels_cert_for(
+        &self,
+        node_mac: &[u8; 6],
+        cert_not_before: u64,
+        now_unix: u64,
+    ) -> bool {
+        &self.node_mac == node_mac
+            && cert_not_before <= self.not_before.get()
             && self.not_before.get() <= now_unix
             && now_unix < self.not_after.get()
     }

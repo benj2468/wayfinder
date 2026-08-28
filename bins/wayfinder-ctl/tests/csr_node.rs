@@ -209,6 +209,8 @@ impl RouterReads for NodeMock {
             }),
             own_ed_pubkey: ed,
             own_x_pubkey: x,
+            self_revoked: false,
+            self_revocation_not_after: 0,
         }
     }
 }

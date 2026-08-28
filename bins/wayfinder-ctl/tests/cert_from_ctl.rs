@@ -151,6 +151,8 @@ impl RouterReads for NodeMock {
         SecurityStatusData {
             own_ed_pubkey: self.keypair.ed_pubkey().to_vec(),
             own_x_pubkey: self.keypair.x_pubkey().to_vec(),
+            self_revoked: false,
+            self_revocation_not_after: 0,
             ..SecurityStatusData::default()
         }
     }

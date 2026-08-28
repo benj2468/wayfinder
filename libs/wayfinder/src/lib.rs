@@ -37,6 +37,7 @@ use interfaces::frame::LinkFrameDataMut;
 use interfaces::frame::Mac;
 use interfaces::link::LinkMetrics;
 use tracing::debug;
+use tracing::error;
 use tracing::info;
 use tracing::trace;
 use tracing::warn;
@@ -492,6 +493,29 @@ pub struct CentralRouter<
     /// with no cert yet still routes in the open, unauthenticated mode. See
     /// [`auth_locked`](CentralRouter::auth_locked).
     require_auth: bool,
+    /// The revocation this node was removed from the mesh by, once it has
+    /// heard one. `Some` is the self-revoked latch: the node is inert
+    /// regardless of [`require_auth`](Self::require_auth), and stays that way
+    /// until an authority re-admits it with a certificate the record does not
+    /// cancel (see [`set_auth`](CentralRouter::set_auth)).
+    ///
+    /// Deliberately not expressed by flipping `require_auth`, which was the
+    /// obvious shortcut and is wrong: that flag is remotely settable over the
+    /// management API's self-key tier and persists, so one request would clear
+    /// the lock — and clear it into a state *more* open than before the
+    /// revocation, since a router with no auth state skips OGM verification
+    /// entirely rather than failing closed.
+    self_revocation: Option<wayfinder_auth::RevocationRecord>,
+    /// The same record, awaiting collection by the host layer so it can be
+    /// persisted and alarmed on. Drained by
+    /// [`take_self_revocation`](CentralRouter::take_self_revocation).
+    ///
+    /// Separate from the latch above because they have different lifetimes:
+    /// the latch lasts until re-admission, this is a one-shot report. The
+    /// `no_std` core cannot write files or reach the alarm board, so the
+    /// reaction it *can* perform happens immediately and the rest is handed
+    /// out through here.
+    pending_self_revocation: Option<wayfinder_auth::RevocationRecord>,
     /// Lazy cert distribution: when `true`, [`poll`](CentralRouter::poll)
     /// emits an OGM cert fingerprint instead of the full cert (see
     /// [`OgmAuth::augment_ogm_lazy`]). `false` (the default) preserves
@@ -598,6 +622,8 @@ impl<
             iface_count: 0,
             auth: None,
             require_auth: false,
+            self_revocation: None,
+            pending_self_revocation: None,
             lazy_cert_distribution: false,
             oversize_drops: 0,
             runtime_config_active: false,
@@ -782,6 +808,18 @@ impl<
         auth: OgmAuth<NEIGHBOR_KEYS, REVOKED, IN_FLIGHT_CERT_REQUESTS, PENDING_REPLIES>,
     ) {
         debug!("updating auth state; resetting learned routing state");
+        // A re-admission clears the self-revoked latch, but only if the
+        // certificate being installed actually survives the record. One the
+        // record still cancels leaves the node latched: peers would drop it
+        // anyway, so unlocking here would produce a node that reports itself
+        // enrolled while being invisible to the mesh.
+        if !self.self_revocation_cancels(auth.cert()) {
+            self.self_revocation = None;
+        } else {
+            warn!(
+                "installed certificate is cancelled by the revocation this node is under; it stays inert until re-admitted with a newer one"
+            );
+        }
         self.auth = Some(auth);
         // A next hop must now prove itself before it can be selected. Gated on
         // auth being enabled because proof rests on pairwise keys: requiring it
@@ -894,7 +932,96 @@ impl<
     /// [`handle_local`]: CentralRouter::handle_local
     /// [`handle_local_mcast`]: CentralRouter::handle_local_mcast
     pub fn auth_locked(&self) -> bool {
-        self.require_auth && self.auth.is_none()
+        self.self_revoked() || (self.require_auth && self.auth.is_none())
+    }
+
+    /// Whether this node has been revoked from the mesh and is inert as a
+    /// result.
+    ///
+    /// Distinct from [`auth_locked`](Self::auth_locked)'s other cause — "fail
+    /// closed, never enrolled" — which reads to an operator as *provision me*
+    /// and points at a remedy that does not apply here.
+    pub fn self_revoked(&self) -> bool {
+        self.self_revocation.is_some()
+    }
+
+    /// Whether the revocation this node is latched under cancels `cert`.
+    ///
+    /// `false` when the node is not revoked, and when the certificate was
+    /// issued after the revocation instant — a re-admission. A caller about to
+    /// install a certificate should ask this first: installing one the record
+    /// still cancels leaves the node inert and reporting itself enrolled,
+    /// which is the one state that lies to the operator.
+    pub fn self_revocation_cancels(&self, cert: &wayfinder_auth::MembershipCert) -> bool {
+        self.self_revocation.is_some_and(|r| {
+            r.cancels_cert_for(&cert.node_mac, cert.not_before.get(), r.not_before.get())
+        })
+    }
+
+    /// When the revocation this node is latched under stops being enforced
+    /// (unix seconds), or `None` if it is not revoked.
+    ///
+    /// The only date a revoked node has: going inert drops the certificate
+    /// whose expiry the security view would otherwise report, so without this
+    /// there is nothing to tell an operator how long peers will keep dropping
+    /// this MAC.
+    pub fn self_revocation_not_after(&self) -> Option<u64> {
+        self.self_revocation.map(|r| r.not_after.get())
+    }
+
+    /// Whether a revocation of this node is waiting for the host layer to
+    /// collect — a shared-borrow precheck for
+    /// [`take_self_revocation`](Self::take_self_revocation), which needs `&mut`.
+    ///
+    /// Exists so the driver's per-iteration check can be a *read* lock rather
+    /// than a write one. Management reads are deliberately served off the
+    /// driver loop through a shared read lock, and taking a write lock every
+    /// iteration to ask a question whose answer is almost always "no" would
+    /// stall them for nothing.
+    pub fn self_revocation_pending(&self) -> bool {
+        self.pending_self_revocation.is_some()
+    }
+
+    /// Take the revocation of this node for the host layer to persist and
+    /// alarm on, if one has not been collected yet.
+    pub fn take_self_revocation(&mut self) -> Option<wayfinder_auth::RevocationRecord> {
+        self.pending_self_revocation.take()
+    }
+
+    /// Latch a revocation of this node that the host layer already knows about
+    /// — the boot path, restoring a record persisted before a restart.
+    ///
+    /// The counterpart to [`take_self_revocation`](Self::take_self_revocation)
+    /// and deliberately *not* its inverse: nothing is queued for reporting,
+    /// because whoever restored this record is the layer that would have been
+    /// told. Without this a restart would silently undo the revocation, which
+    /// is the most ordinary way it could fail — an operator seeing a dead node
+    /// restarts it.
+    pub fn note_self_revoked(&mut self, record: wayfinder_auth::RevocationRecord) {
+        self.self_revocation = Some(record);
+        self.auth = None;
+    }
+
+    /// Act on a latched self-revocation, if one is now in force: drop this
+    /// node's whole auth state and go inert.
+    ///
+    /// Returns whether it fired, because one caller — the frame path — must
+    /// stop processing the frame that carried it. Everything the certificate
+    /// and anchor underwrote is dropped together: cached neighbour keys, the
+    /// replay counters, and every learned route, which was selected under a
+    /// membership this node no longer holds.
+    fn apply_self_revocation(&mut self) -> bool {
+        let Some(record) = self.auth.as_mut().and_then(OgmAuth::take_self_revoked) else {
+            return false;
+        };
+        error!("this node's mesh membership has been revoked; going inert until re-enrolled");
+        self.auth = None;
+        self.self_revocation = Some(record);
+        self.pending_self_revocation = Some(record);
+        self.batman.reset();
+        self.ident_table.clear();
+        self.link_quality.clear();
+        true
     }
 
     /// Ingest a signed revocation (the operator/management-API entry point for
@@ -911,6 +1038,14 @@ impl<
             return false;
         };
         let newly = auth.ingest_revocation(record);
+        if self.apply_self_revocation() {
+            return false;
+        }
+        // Re-borrowed: `apply_self_revocation` needed `self` mutably, and on
+        // the path that did not fire the auth state is still there.
+        let Some(auth) = self.auth.as_mut() else {
+            return newly;
+        };
         if auth.take_trickle_reset_hint() {
             info!(
                 "ingested revocation; resetting timers, revoking originators, and purging stale OGMs"
@@ -1206,6 +1341,19 @@ impl<
                         debug!(neighbor = ?frame.src, "auth: next hop proved itself");
                         self.batman.note_proven(now, frame.src, iface_idx);
                     }
+                    return RxOutcome {
+                        forward: None,
+                        deliver_local: None,
+                        pin_egress_iface: None,
+                    };
+                }
+
+                // If verifying that OGM folded in a revocation of *this* node,
+                // act on it and stop: the auth state it was verified against
+                // is gone, and letting the frame reach `batman.handle_rx`
+                // below would install a route from — and possibly re-flood —
+                // one more OGM after this node is supposed to be inert.
+                if self.apply_self_revocation() {
                     return RxOutcome {
                         forward: None,
                         deliver_local: None,
@@ -1606,6 +1754,10 @@ impl<
         now: core::time::Duration,
         tx_buf: &'tx mut [u8],
     ) -> Option<LinkFrameData<'tx>> {
+        // Arm a self-revocation that was held for its effective instant or for
+        // a clock. Checked here because this is the periodic hook: a node with
+        // no inbound traffic would otherwise never re-evaluate it.
+        self.apply_self_revocation();
         // Fail closed: locked nodes originate nothing (total mesh silence)
         // until a valid membership cert is installed.
         if self.auth_locked() {
@@ -4942,6 +5094,232 @@ mod link_features_tests {
         assert!(
             out.forward.is_none(),
             "tx_data off: OGM not re-advertised, so no peer black-holes"
+        );
+    }
+}
+
+#[cfg(test)]
+mod self_revocation {
+    //! What this node does when it hears a revocation naming *itself*: clear
+    //! its membership certificate and trust anchor, go inert, and stay that
+    //! way until an authority re-admits it.
+    //!
+    //! The router half. `auth.rs` covers which records latch (the four gates);
+    //! these cover what the router does once one has.
+
+    use super::*;
+    use interfaces::frame::Mac;
+    use wayfinder_auth::Authority;
+    use wayfinder_auth::Keypair;
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    /// A router enrolled under `authority`, holding a certificate for `m`
+    /// issued at `issued_at`, with its clock at `now`.
+    fn enrolled(
+        authority: &Authority,
+        seed: u8,
+        m: Mac,
+        issued_at: u64,
+        now: u64,
+    ) -> CentralRouter {
+        let kp = Keypair::from_seed(&[seed; 32]);
+        let cert = authority.issue_cert(m, kp.ed_pubkey(), kp.x_pubkey(), issued_at, 100_000);
+        let mut router: CentralRouter = CentralRouter::new(m);
+        router.set_auth(auth::OgmAuth::new(kp, cert, authority.trust_anchor()));
+        router.auth_mut().unwrap().set_time(now);
+        router
+    }
+
+    /// Ingesting a revocation of this node drops the whole auth state — the
+    /// certificate, the trust anchor, the cached neighbour keys and the replay
+    /// counters go together, because every one of them was minted under a
+    /// membership this node no longer holds.
+    #[test]
+    fn clears_the_certificate_and_the_trust_anchor() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = enrolled(&authority, 2, mac(2), 0, 700);
+        assert!(router.auth().is_some());
+
+        let record = authority.revoke(mac(2), 500, 100_000);
+        router.ingest_revocation(&record, core::time::Duration::from_secs(1));
+
+        assert!(
+            router.auth().is_none(),
+            "a revoked node holds no certificate and no anchor"
+        );
+        assert!(router.self_revoked());
+    }
+
+    /// The lock must not depend on `require_auth`.
+    ///
+    /// This is the trap the whole design turns on: clearing `auth` on a node
+    /// configured `require_auth: false` would drop it back into *open,
+    /// unauthenticated* routing — the OGM verification gate is skipped
+    /// entirely when there is no auth state — leaving it more permissive after
+    /// the revocation than before it.
+    #[test]
+    fn locks_the_router_even_when_auth_is_not_required() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = enrolled(&authority, 2, mac(2), 0, 700);
+        router.set_require_auth(false);
+        assert!(!router.auth_locked());
+
+        let record = authority.revoke(mac(2), 500, 100_000);
+        router.ingest_revocation(&record, core::time::Duration::from_secs(1));
+
+        assert!(
+            router.auth_locked(),
+            "a revoked node is inert regardless of the configured posture"
+        );
+        let mut tx = [0u8; 512];
+        assert!(
+            router
+                .poll(core::time::Duration::from_secs(60), &mut tx)
+                .is_none(),
+            "and originates nothing"
+        );
+    }
+
+    /// The record this node was revoked by is reported to the host layer
+    /// exactly once, so it can be persisted and alarmed on without the
+    /// `no_std` core touching either.
+    #[test]
+    fn reports_the_record_to_the_host_layer_once() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = enrolled(&authority, 2, mac(2), 0, 700);
+
+        let record = authority.revoke(mac(2), 500, 100_000);
+        router.ingest_revocation(&record, core::time::Duration::from_secs(1));
+
+        let reported = router.take_self_revocation().expect("reported");
+        assert_eq!(reported.node_mac, mac(2).0);
+        assert!(router.take_self_revocation().is_none(), "drained once");
+    }
+
+    /// Re-admission: a certificate issued after the revocation instant unlocks
+    /// the node, because the record no longer cancels what it holds.
+    #[test]
+    fn a_newer_certificate_unlocks_the_node() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = enrolled(&authority, 2, mac(2), 0, 700);
+        let record = authority.revoke(mac(2), 500, 100_000);
+        router.ingest_revocation(&record, core::time::Duration::from_secs(1));
+        assert!(router.auth_locked());
+
+        let kp = Keypair::from_seed(&[2; 32]);
+        let readmitted = authority.issue_cert(mac(2), kp.ed_pubkey(), kp.x_pubkey(), 600, 100_000);
+        assert!(!router.self_revocation_cancels(&readmitted));
+        router.set_auth(auth::OgmAuth::new(kp, readmitted, authority.trust_anchor()));
+
+        assert!(
+            !router.self_revoked(),
+            "the latch is cleared by re-admission"
+        );
+        assert!(!router.auth_locked());
+    }
+
+    /// Re-installing a certificate the record still cancels does *not* unlock
+    /// the node. Peers would drop it anyway, so a node that reported itself
+    /// enrolled here would be lying about being on the mesh.
+    #[test]
+    fn a_cancelled_certificate_does_not_unlock_the_node() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router = enrolled(&authority, 2, mac(2), 0, 700);
+        let record = authority.revoke(mac(2), 500, 100_000);
+        router.ingest_revocation(&record, core::time::Duration::from_secs(1));
+
+        let kp = Keypair::from_seed(&[2; 32]);
+        let same_era = authority.issue_cert(mac(2), kp.ed_pubkey(), kp.x_pubkey(), 100, 100_000);
+        assert!(
+            router.self_revocation_cancels(&same_era),
+            "the caller can tell before installing it"
+        );
+        router.set_auth(auth::OgmAuth::new(kp, same_era, authority.trust_anchor()));
+        assert!(router.auth_locked(), "still inert");
+    }
+
+    /// The path that actually happens in the field: the record arrives in a
+    /// peer's OGM tail, flooded with ordinary control traffic.
+    ///
+    /// The frame must also stop being processed. Without the early return it
+    /// would fall through to the engine, and this node would install a route
+    /// from — and possibly re-flood — one more OGM after going inert.
+    #[test]
+    fn arrives_in_an_ogm_tail_and_stops_the_frame() {
+        use batman::wire::BatmanOgmPacket;
+        use interfaces::frame::LinkFrame;
+        use zerocopy::FromBytes;
+        use zerocopy::IntoBytes;
+
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        // The victim, and a peer that holds a revocation naming it.
+        let mut victim = enrolled(&authority, 2, mac(2), 0, 700);
+        let peer_kp = Keypair::from_seed(&[3; 32]);
+        let peer_cert =
+            authority.issue_cert(mac(3), peer_kp.ed_pubkey(), peer_kp.x_pubkey(), 0, 100_000);
+        let mut peer = auth::OgmAuth::new(peer_kp, peer_cert, authority.trust_anchor());
+        peer.set_time(700);
+        assert!(peer.ingest_revocation(&authority.revoke(mac(2), 500, 100_000)));
+
+        // The peer's next OGM carries it.
+        let ogm = BatmanOgmPacket {
+            packet_type: batman::wire::BatmanPacketType::Ogm.as_u8(),
+            version: 5,
+            ttl: 50,
+            flags: 0,
+            seqno: 7u32.to_be(),
+            orig: mac(3),
+            reserved: 0,
+            tq: 255,
+            tvlv_len: 0,
+        };
+        let hdr = core::mem::size_of::<BatmanOgmPacket>();
+        let mut payload = vec![0u8; 1024];
+        payload[..hdr].copy_from_slice(ogm.as_bytes());
+        let len = peer.augment_ogm(&mut payload, hdr).unwrap();
+        payload.truncate(len);
+
+        let mut frame_bytes = Vec::new();
+        frame_bytes.extend_from_slice(&mac(2).0);
+        frame_bytes.extend_from_slice(&mac(3).0);
+        frame_bytes.extend_from_slice(&0x4305u16.to_be_bytes());
+        frame_bytes.extend_from_slice(&payload);
+        let frame = LinkFrame::ref_from_bytes(&frame_bytes).unwrap();
+
+        let mut tx = [0u8; 1024];
+        let out = victim.handle_frame(core::time::Duration::from_secs(1), 0, frame, &mut tx);
+
+        assert!(victim.self_revoked(), "the flooded record took effect");
+        assert!(victim.auth().is_none());
+        assert!(
+            out.forward.is_none() && out.deliver_local.is_none(),
+            "and the carrying frame goes no further"
+        );
+        assert_eq!(
+            victim.originator_table().count(),
+            0,
+            "no route installed from an OGM heard after going inert"
+        );
+    }
+
+    /// The boot-time path: a node re-reading a persisted record latches
+    /// without ever ingesting one, so a restart does not undo the revocation.
+    #[test]
+    fn a_persisted_record_latches_at_startup() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut router: CentralRouter = CentralRouter::new(mac(2));
+        let record = authority.revoke(mac(2), 500, 100_000);
+
+        router.note_self_revoked(record);
+
+        assert!(router.self_revoked());
+        assert!(router.auth_locked());
+        assert!(
+            router.take_self_revocation().is_none(),
+            "already persisted by whoever restored it; nothing to report back"
         );
     }
 }

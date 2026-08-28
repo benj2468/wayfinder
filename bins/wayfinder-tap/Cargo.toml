@@ -8,6 +8,7 @@ workspace = true
 
 [dependencies]
 wayfinder.workspace = true
+wayfinder-alarm.workspace = true
 wayfinder-driver.workspace = true
 wayfinder-server.workspace = true
 

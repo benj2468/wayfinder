@@ -833,7 +833,15 @@ impl<Local: FrameIo> Driver<Local> {
             }
         };
 
-        dispatch(local, interfaces, &shared, mac, now, output).await
+        dispatch(local, interfaces, &shared, mac, now, output).await?;
+        // The live loop's counterpart to `process_pending`'s call. Both drains
+        // are needed: `run()` — which is what a real node runs — never goes
+        // through `process_pending`, so wiring this only there left a
+        // production node inert with no durable record and no alarm, exactly
+        // the failure `record_self_revocation`'s own doc warns a missed call
+        // site would cause.
+        self.record_self_revocation().await;
+        Ok(())
     }
 
     /// Inject one host Ethernet frame as if it had arrived from the local
@@ -1027,7 +1035,61 @@ impl<Local: FrameIo> Driver<Local> {
                 break;
             }
         }
+        self.record_self_revocation().await;
         Ok(())
+    }
+
+    /// Persist and alarm on a revocation of *this* node, if the router acted
+    /// on one this iteration.
+    ///
+    /// The router has already gone inert by the time this runs — that part is
+    /// the `no_std` core's and happens the instant the record verifies. What
+    /// is left is everything the core cannot do: writing the record where the
+    /// next boot will find it, and raising the alarm that tells an operator
+    /// why the node went silent.
+    ///
+    /// Called once per loop iteration rather than from each arm that can
+    /// trigger it, because three of them can (a flooded OGM, a management-API
+    /// ingest, and the periodic timer arming a record that was held for its
+    /// effective instant) and a missed one would leave the node inert with no
+    /// durable record and no alarm — undone by the next restart, with nothing
+    /// anywhere saying why.
+    async fn record_self_revocation(&mut self) {
+        // Shared borrow first: the answer is "nothing to do" on every
+        // iteration but the one, and management reads are served through this
+        // same lock off the driver loop — a write lock per iteration would
+        // stall them to ask a question whose answer is almost always no.
+        if !self.shared.read().await.router.self_revocation_pending() {
+            return;
+        }
+        let Some(record) = self.shared.write().await.router.take_self_revocation() else {
+            return;
+        };
+        wayfinder_alarm::alarm!(
+            wayfinder_alarm::Severity::Critical,
+            wayfinder_alarm::AlarmKind::SelfRevoked,
+            wayfinder_alarm::Subject::Node(wayfinder_alarm::NodeId::new(&record.node_mac)),
+            "mesh membership revoked; re-enroll this node to bring it back"
+        );
+        let Some(store) = self.settings.as_mut() else {
+            tracing::error!(
+                "this node's membership was revoked, but it has no settings store to \
+                 record that in — a restart will bring it back under the revoked \
+                 certificate"
+            );
+            return;
+        };
+        use zerocopy::IntoBytes;
+        if let Err(e) = store.persist(wayfinder_server::NodeSettings {
+            self_revocation: Some(record.as_bytes().to_vec()),
+            ..Default::default()
+        }) {
+            tracing::error!(
+                error = %e,
+                "this node's membership was revoked, but the record could not be made \
+                 durable — a restart will bring it back under the revoked certificate"
+            );
+        }
     }
 
     /// Deliver one unit of work via the borrowed `self` fields, stamping any
@@ -1131,12 +1193,12 @@ fn ingest_signed_revocation(
         return Ok(());
     }
     // The remaining `false` from `ingest_revocation`: the record names this
-    // node, which never floods its own revocation — peers enforce it against
-    // us. Still a failure to *flood*, which is what the authority asked for
-    // and what this reports.
+    // node. It is not "nothing happened" any more — this node has just dropped
+    // its own certificate and gone inert — but it is still a failure to
+    // *flood*, which is what the authority asked for and what this reports.
     Err(
-        "it names this node, which never floods its own revocation; no peer will \
-         learn of the revocation from here"
+        "it names this node, which has therefore gone inert rather than flooding it; \
+         no peer will learn of the revocation from here"
             .to_string(),
     )
 }

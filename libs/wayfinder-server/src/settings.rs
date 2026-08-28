@@ -64,6 +64,23 @@ pub struct NodeSettings {
     pub lazy_cert_distribution: Option<bool>,
     /// The mesh identity installed over the management API.
     pub identity: Option<NodeIdentity>,
+    /// The root-signed revocation naming this node, if it has heard one: raw
+    /// `RevocationRecord` bytes.
+    ///
+    /// The record rather than a `revoked: bool`, for three reasons. It is
+    /// **self-authenticating** — re-verified against the trust anchor on every
+    /// boot, so a hand-edited state file cannot forge one without the mesh
+    /// root key. It **covers the config-file case**, which clearing
+    /// [`identity`](Self::identity) cannot: when the identity comes from a
+    /// YAML `auth:` block the node must not rewrite the operator's files, so
+    /// the only thing it can durably change is this. And it **self-expires**:
+    /// past the record's `not_after` the anchor refuses it and the node may
+    /// legitimately arm again, by which point the certificate it cancelled has
+    /// expired too.
+    ///
+    /// In an *update* passed to [`merge`](Self::merge), an empty vector means
+    /// **clear** — see there.
+    pub self_revocation: Option<Vec<u8>>,
 }
 
 impl NodeSettings {
@@ -79,6 +96,14 @@ impl NodeSettings {
         if let Some(identity) = update.identity {
             self.identity = Some(identity);
         }
+        if let Some(record) = update.self_revocation {
+            // An **empty** record clears the field. `merge` reads `None` as
+            // "leave this alone", so re-admission — which must remove the
+            // record in the same durable write that installs the new
+            // certificate — needs a value meaning "remove", and a zero-length
+            // revocation is not something that can otherwise exist.
+            self.self_revocation = (!record.is_empty()).then_some(record);
+        }
     }
 
     /// Whether this carries any override at all — false for the settings a
@@ -87,6 +112,7 @@ impl NodeSettings {
         self.require_auth.is_none()
             && self.lazy_cert_distribution.is_none()
             && self.identity.is_none()
+            && self.self_revocation.is_none()
     }
 }
 
@@ -168,6 +194,14 @@ mod file {
         /// The mesh identity installed at runtime.
         #[serde(default)]
         identity: Option<IdentityRecord>,
+        /// The root-signed revocation naming this node, if it has heard one.
+        ///
+        /// `#[serde(default)]` like every field beside it, so a blob written
+        /// before this existed still parses — an older node's settings must
+        /// not fail closed into "unreadable" over a field that simply was not
+        /// there.
+        #[serde(default)]
+        self_revocation: Option<Vec<u8>>,
     }
 
     /// One installed identity in the on-disk blob. Byte vectors are stored as
@@ -239,6 +273,7 @@ mod file {
                 version: CURRENT_SETTINGS_VERSION,
                 require_auth: value.require_auth,
                 lazy_cert_distribution: value.lazy_cert_distribution,
+                self_revocation: value.self_revocation.clone(),
                 identity: value.identity.as_ref().map(|i| IdentityRecord {
                     seed: i.seed.clone(),
                     cert: i.cert.clone(),
@@ -256,6 +291,7 @@ mod file {
             Ok(NodeSettings {
                 require_auth: state.require_auth,
                 lazy_cert_distribution: state.lazy_cert_distribution,
+                self_revocation: state.self_revocation,
                 identity: state.identity.map(|i| NodeIdentity {
                     seed: i.seed,
                     cert: i.cert,
@@ -390,6 +426,58 @@ mod tests {
             cert: vec![1, 2, 3],
             trust_anchor: vec![4, 5, 6],
         }
+    }
+
+    /// The self-revocation field's three-way update: absent leaves it alone,
+    /// a record sets it, and an **empty** record clears it.
+    ///
+    /// The clear is what re-admission needs. `merge`'s `None` already means
+    /// "leave alone", so without a value meaning "remove" a re-enrolled node
+    /// would carry its old revocation into the next boot and lock itself back
+    /// out — the exact failure the persistence exists to cause, aimed at the
+    /// wrong moment.
+    #[test]
+    fn an_empty_self_revocation_update_clears_the_record() {
+        let mut settings = NodeSettings::default();
+
+        settings.merge(NodeSettings {
+            self_revocation: Some(vec![1, 2, 3]),
+            ..Default::default()
+        });
+        assert_eq!(settings.self_revocation, Some(vec![1, 2, 3]));
+
+        settings.merge(NodeSettings {
+            require_auth: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(
+            settings.self_revocation,
+            Some(vec![1, 2, 3]),
+            "an absent field leaves the record alone"
+        );
+
+        settings.merge(NodeSettings {
+            self_revocation: Some(Vec::new()),
+            ..Default::default()
+        });
+        assert_eq!(settings.self_revocation, None, "an empty record clears it");
+    }
+
+    /// The record survives a round trip through the on-disk blob — the whole
+    /// reason it is persisted rather than held in RAM.
+    #[test]
+    fn a_self_revocation_survives_a_restart() {
+        let path = unique_path("self-revocation");
+        let mut store = SettingsFile::load(Some(path.clone())).unwrap();
+        store
+            .persist(NodeSettings {
+                self_revocation: Some(vec![9; 92]),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let reloaded = SettingsFile::load(Some(path)).unwrap();
+        assert_eq!(reloaded.settings().self_revocation, Some(vec![9; 92]));
     }
 
     /// A node that has never had a setting changed starts from no overrides at

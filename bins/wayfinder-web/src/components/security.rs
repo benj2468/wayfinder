@@ -228,6 +228,28 @@ pub fn Security() -> impl IntoView {
                             label="Revocations held"
                             value=sec.revocation_count.to_string()
                         />
+                        // Shown only when it applies, and phrased as what the
+                        // operator has to do. A revoked node otherwise reads as
+                        // "no certificate", which is true and points at an
+                        // enrollment the authority will refuse until it
+                        // re-approves this node.
+                        {sec
+                            .self_revoked
+                            .then(|| {
+                                view! {
+                                    <Field
+                                        label="Membership"
+                                        value="Revoked — inert until an authority re-admits this node"
+                                            .to_string()
+                                    />
+                                    <Field
+                                        label="Revocation enforced until"
+                                        value=crate::format::timestamp(
+                                            sec.self_revocation_not_after,
+                                        )
+                                    />
+                                }
+                            })}
                     }
                         .into_any()
                 }}
