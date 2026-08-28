@@ -580,6 +580,15 @@ testers.nixosTest {
     with subtest("revoking a node's membership takes its tunnel registration too"):
         # One operator action, both halves. The half-completed case is reported
         # rather than hidden, so a clean success here means both actually ran.
+        #
+        # What this cannot reach, for the same reason the enrollment subtest
+        # above stops at `--print-command`: no tailscaled has spent the key, so
+        # there is no registered *node* to delete and only the user half of a
+        # revocation runs here. That is precisely the gap #27 shipped through —
+        # every assertion below passed while a node that had actually
+        # registered kept its tunnel. `nix/tests/vpn-data-plane.nix` revokes a
+        # spoke that a real tailscaled registered, and is the test that covers
+        # it.
         ca.succeed(
             "wayfinder-ctl --connect 127.0.0.1:7700 "
             "--identity /var/lib/wayfinder/identity.seed "
