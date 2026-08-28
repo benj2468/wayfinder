@@ -1116,16 +1116,29 @@ fn ingest_signed_revocation(
     if router.ingest_revocation(record, now) {
         return Ok(());
     }
-    // Already-known is the one benign `false` left. It verified above, so the
-    // record is in the store and was flooded when it first arrived: the
+    // Already-known is the one benign `false` left. It verified above, so this
+    // exact record is in the store and was flooded when it first arrived: the
     // operator's intent holds, even though this request re-floods nothing.
-    if router
-        .auth()
-        .is_some_and(|auth| auth.revoked_macs().any(|m| m.0 == record.node_mac))
-    {
+    //
+    // Matched on the whole record rather than on the MAC. `revoked_macs()`
+    // would also match a *stale* record for the same MAC — one the authority
+    // has since superseded, naming a node it re-admitted in between — and
+    // report success for a purge this node never recorded and never flooded.
+    if router.auth().is_some_and(|auth| {
+        auth.revocations()
+            .any(|r| r.node_mac == record.node_mac && r.not_before.get() == record.not_before.get())
+    }) {
         return Ok(());
     }
-    Err("it names this node, which never floods its own revocation".to_string())
+    // The remaining `false` from `ingest_revocation`: the record names this
+    // node, which never floods its own revocation — peers enforce it against
+    // us. Still a failure to *flood*, which is what the authority asked for
+    // and what this reports.
+    Err(
+        "it names this node, which never floods its own revocation; no peer will \
+         learn of the revocation from here"
+            .to_string(),
+    )
 }
 
 /// Fold a signed revocation in and report the verdict, logging a divergence
@@ -1236,7 +1249,7 @@ fn build_auth_snapshot(router: &CentralRouter, identity_seed: Option<[u8; 32]>) 
         Some(auth) => AuthSnapshot {
             own_key,
             anchor: Some(*auth.anchor()),
-            revoked: auth.revoked_macs().collect(),
+            revoked: auth.revocations().copied().collect(),
             own_mac,
         },
         None => AuthSnapshot {

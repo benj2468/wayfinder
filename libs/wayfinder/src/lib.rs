@@ -916,7 +916,7 @@ impl<
                 "ingested revocation; resetting timers, revoking originators, and purging stale OGMs"
             );
             self.batman.reset_ogm_timers(now);
-            self.batman.revoke_originators(auth.revoked_macs());
+            self.batman.revoke_originators(auth.macs_to_purge());
             self.batman.purge_stale(now);
         }
         newly
@@ -1220,7 +1220,7 @@ impl<
                     && auth.take_trickle_reset_hint()
                 {
                     self.batman.reset_ogm_timers(now);
-                    self.batman.revoke_originators(auth.revoked_macs());
+                    self.batman.revoke_originators(auth.macs_to_purge());
                     self.batman.purge_stale(now);
                 }
 

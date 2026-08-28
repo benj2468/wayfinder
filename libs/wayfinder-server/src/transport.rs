@@ -21,6 +21,7 @@ use tokio_util::codec::FramedWrite;
 use tokio_util::codec::LengthDelimitedCodec;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder::wayfinder_auth::MembershipCert;
+use wayfinder::wayfinder_auth::RevocationRecord;
 use wayfinder::wayfinder_auth::TrustAnchor;
 use wayfinder_protos::rpc::RateLimit;
 use wayfinder_protos::rpc::rate_limit;
@@ -72,8 +73,10 @@ pub struct AuthContext {
     /// The installed trust anchor, or `None` when the node is un-enrolled
     /// (bootstrap mode — self-key admission only).
     pub anchor: Option<TrustAnchor>,
-    /// Node MACs with an active revocation as of the snapshot instant.
-    pub revoked: Vec<Mac>,
+    /// The revocation records the router held as of the snapshot instant.
+    ///
+    /// Records rather than MACs — see [`AuthSnapshot::revoked`].
+    pub revoked: Vec<RevocationRecord>,
     /// This node's own mesh address — see [`AuthSnapshot::own_mac`].
     ///
     /// No part of the access decision: [`decide_access`] never reads it. It
@@ -1411,7 +1414,7 @@ fn authorize(peer_key: &[u8; 32], cert: Option<&MembershipCert>, ctx: &AuthConte
         ctx.anchor.as_ref(),
         ctx.own_key.as_ref(),
         ctx.now_unix,
-        |mac| ctx.revoked.contains(&mac),
+        |cert| ctx.revoked.iter().any(|r| r.cancels(cert, ctx.now_unix)),
     )
 }
 
@@ -1436,8 +1439,15 @@ pub struct AuthSnapshot {
     pub own_key: Option<[u8; 32]>,
     /// The installed trust anchor, or `None` when the node is un-enrolled.
     pub anchor: Option<TrustAnchor>,
-    /// Node MACs with an active revocation.
-    pub revoked: Vec<Mac>,
+    /// The revocation records the router currently holds.
+    ///
+    /// The records themselves rather than the MACs they name, because a MAC
+    /// can no longer answer "is this certificate cancelled?": a certificate
+    /// issued after the revocation instant is a re-admission and survives it.
+    /// Carrying the records keeps that judgement on the accept loop's side of
+    /// the channel, which is the property this snapshot exists to preserve —
+    /// no router borrow is taken to authorize a connection.
+    pub revoked: Vec<RevocationRecord>,
     /// This node's own mesh address (`CentralRouter::self_ident`).
     ///
     /// The identity a
@@ -1833,7 +1843,7 @@ mod tests {
         mut rx: mpsc::Receiver<oneshot::Sender<AuthSnapshot>>,
         own_key: Option<[u8; 32]>,
         anchor: Option<TrustAnchor>,
-        revoked: Vec<Mac>,
+        revoked: Vec<RevocationRecord>,
         own_mac: Mac,
     ) {
         tokio::spawn(async move {
@@ -3014,7 +3024,9 @@ mod tests {
         let ctx = AuthContext {
             own_key: Some([9u8; 32]),
             anchor: Some(authority.trust_anchor()),
-            revoked: vec![admin_mac], // this admin's node is revoked
+            // This admin's node is revoked: the record's instant is after the
+            // certificate's `not_before` of 0, so it cancels it.
+            revoked: vec![authority.revoke(admin_mac, 50, 200)],
             own_mac: Mac([2, 0, 0, 0, 0, 1]),
             now_unix: 100,
         };
@@ -3073,7 +3085,7 @@ mod tests {
         let ctx = AuthContext {
             own_key: Some([9u8; 32]),
             anchor: Some(authority.trust_anchor()),
-            revoked: vec![admin_mac],
+            revoked: vec![authority.revoke(admin_mac, 50, 200)],
             own_mac: Mac([2, 0, 0, 0, 0, 1]),
             now_unix: 100,
         };
@@ -3437,6 +3449,8 @@ mod tests {
 
     /// A live connection whose state a test can move under it: the router's
     /// answer to an auth-snapshot request, and the clock the serve task reads.
+    use wayfinder::wayfinder_auth::Authority;
+
     struct MovableState {
         snapshot: std::sync::Arc<std::sync::Mutex<AuthSnapshot>>,
         now: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -3476,8 +3490,19 @@ mod tests {
             (Self { snapshot, now }, gate)
         }
 
-        fn revoke(&self, mac: Mac) {
-            self.snapshot.lock().unwrap().revoked.push(mac);
+        /// Revoke `mac` as of `instant`, signed by `authority` so the record
+        /// is one the production path would actually accept.
+        ///
+        /// Takes the authority rather than fabricating a record because a
+        /// revocation now has to be judged against the certificate it
+        /// cancels — `instant` must be at or after that certificate's own
+        /// `not_before`, or the record verifies and cancels nothing.
+        fn revoke(&self, authority: &Authority, mac: Mac, instant: u64, not_after: u64) {
+            self.snapshot
+                .lock()
+                .unwrap()
+                .revoked
+                .push(authority.revoke(mac, instant, not_after));
         }
 
         fn set_now(&self, now_unix: u64) {
@@ -3486,10 +3511,13 @@ mod tests {
         }
     }
 
-    /// An admin certificate, the anchor it verifies against, and the key it is
-    /// bound to.
-    fn admin_credentials(mac: Mac, not_after: u64) -> (TrustAnchor, Keypair, Vec<u8>) {
-        use wayfinder::wayfinder_auth::Authority;
+    /// An admin certificate, the anchor it verifies against, the key it is
+    /// bound to, and the authority that issued it.
+    ///
+    /// The authority comes back because revoking this certificate now needs a
+    /// record signed by the same root — a MAC on its own no longer says
+    /// whether a given certificate is cancelled.
+    fn admin_credentials(mac: Mac, not_after: u64) -> (TrustAnchor, Keypair, Vec<u8>, Authority) {
         use zerocopy::IntoBytes;
 
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
@@ -3503,7 +3531,7 @@ mod tests {
             true,
         );
         let bytes = cert.as_bytes().to_vec();
-        (authority.trust_anchor(), admin_kp, bytes)
+        (authority.trust_anchor(), admin_kp, bytes, authority)
     }
 
     /// Revoking a node ends its open management session, rather than only
@@ -3516,7 +3544,7 @@ mod tests {
     #[tokio::test]
     async fn a_revocation_ends_an_open_session() {
         let mac = Mac([0, 0, 0, 0, 0, 5]);
-        let (anchor, admin_kp, cert) = admin_credentials(mac, 200);
+        let (anchor, admin_kp, cert, authority) = admin_credentials(mac, 200);
         let (state, gate) = MovableState::new(
             AuthSnapshot {
                 own_key: Some([9u8; 32]),
@@ -3547,7 +3575,7 @@ mod tests {
             "the session serves normally before the revocation"
         );
 
-        state.revoke(mac);
+        state.revoke(&authority, mac, 50, 200);
 
         client
             .send(encode_request(Request::GetNodeInfo(GetNodeInfoRequest {})))
@@ -3577,7 +3605,7 @@ mod tests {
     #[tokio::test]
     async fn a_certificate_that_expires_mid_session_stops_being_honoured() {
         let mac = Mac([0, 0, 0, 0, 0, 5]);
-        let (anchor, admin_kp, cert) = admin_credentials(mac, 200);
+        let (anchor, admin_kp, cert, _authority) = admin_credentials(mac, 200);
         let (state, gate) = MovableState::new(
             AuthSnapshot {
                 own_key: Some([9u8; 32]),
@@ -3622,7 +3650,7 @@ mod tests {
     #[tokio::test]
     async fn revalidation_leaves_an_unchanged_verdict_alone() {
         let mac = Mac([0, 0, 0, 0, 0, 5]);
-        let (anchor, admin_kp, cert) = admin_credentials(mac, 200);
+        let (anchor, admin_kp, cert, _authority) = admin_credentials(mac, 200);
         let (_state, gate) = MovableState::new(
             AuthSnapshot {
                 own_key: Some([9u8; 32]),

@@ -534,13 +534,42 @@ impl<
             tracing::warn!("auth: received a revocation naming this node");
             return false;
         }
-        if self.revocations.iter().any(|r| r.record.node_mac == mac.0) {
-            // Already known (MAC granularity): do not re-arm the flood budget, or
-            // two nodes could keep re-flooding each other's records forever.  A
-            // re-issued revocation for an already-revoked MAC therefore does not
-            // re-propagate — acceptable, since the node is already being dropped.
-            tracing::trace!("auth: dropping a revocation that is already known");
-            return false;
+        // Deduplicate on `(node_mac, not_before)`, not on the MAC alone.  Under
+        // v1 a MAC was revoked or it was not, so a second record for a known MAC
+        // was always redundant.  Under v2 it carries an issuance cut-off, so a
+        // later record is *new information*: it is what re-revokes a node the
+        // authority had re-admitted, whose held record no longer cancels the
+        // certificate it now presents.  Dropping it at MAC granularity would
+        // leave that node unrevokable until the first record passively expired.
+        //
+        // The later instant wins because it cancels a superset: every
+        // certificate the earlier record reached was issued no later than it,
+        // and so was issued before this one too.
+        if let Some(slot) = self
+            .revocations
+            .iter_mut()
+            .find(|r| r.record.node_mac == mac.0)
+        {
+            if record.not_before.get() <= slot.record.not_before.get() {
+                // Genuinely redundant — the same record, or one already
+                // superseded.  Do not re-arm the flood budget, or two nodes
+                // could keep re-flooding each other's records forever.
+                tracing::trace!("auth: dropping a revocation that is already known");
+                return false;
+            }
+            // A strictly later instant supersedes the stored record in place,
+            // re-arming the flood budget so the mesh learns of it.  That cannot
+            // loop: `not_before` only ever increases here, so each re-flood is
+            // driven by a record no peer has seen.
+            tracing::info!(
+                ?record,
+                "auth: superseding a revocation with a later instant"
+            );
+            slot.record = *record;
+            slot.floods_left = REVOKE_FLOOD_BUDGET;
+            self.evict_neighbor(mac);
+            self.trickle_reset_hint = true;
+            return true;
         }
         let known = KnownRevocation {
             record: *record,
@@ -571,17 +600,35 @@ impl<
         true
     }
 
-    /// Whether `mac` is currently revoked: a known record whose enforcement
-    /// window (`not_before ..= not_after`) contains this node's clock.  Outside
-    /// the window — not yet effective, or expired (where the cancelled cert has
-    /// also expired) — the node is not dropped on this basis.
-    fn is_revoked(&self, mac: &[u8; 6]) -> bool {
+    /// Whether `cert` is currently cancelled by a known revocation: a record
+    /// naming the same MAC, whose enforcement window (`not_before ..
+    /// not_after`, half-open) contains this node's clock, **and** which was issued at or
+    /// after the certificate was.
+    ///
+    /// The last clause is why this takes the certificate rather than a MAC. A
+    /// revocation cancels the credentials that existed when the authority
+    /// signed it, not the MAC forever: a certificate issued *after* the
+    /// revocation instant is a deliberate re-admission and survives, which is
+    /// what lets a re-approved node rejoin under its own MAC instead of
+    /// waiting out `not_after`. The tie resolves toward revoked — see
+    /// [`RevocationRecord::not_before`].
+    ///
+    /// Outside the enforcement window — not yet effective, or expired (where
+    /// the cancelled cert has also expired) — nothing is dropped on this basis.
+    fn is_revoked(&self, cert: &VerifiedCert) -> bool {
         let now = self.now_unix;
-        self.revocations.iter().any(|r| {
-            &r.record.node_mac == mac
-                && r.record.not_before.get() <= now
-                && now < r.record.not_after.get()
-        })
+        self.revocations.iter().any(|r| r.record.cancels(cert, now))
+    }
+
+    /// The revocation records this node currently holds.
+    ///
+    /// The companion to [`revoked_macs`](Self::revoked_macs) for callers that
+    /// must decide whether a *particular certificate* is cancelled — the
+    /// management API's authorization path — rather than merely which MACs are
+    /// named. A MAC alone can no longer answer that question, since a
+    /// certificate issued after the revocation survives it.
+    pub fn revocations(&self) -> impl Iterator<Item = &RevocationRecord> + '_ {
+        self.revocations.iter().map(|r| &r.record)
     }
 
     /// Drop any cached neighbor state for `mac` so a revoked node can no longer
@@ -604,8 +651,57 @@ impl<
     /// The MACs this node currently holds revocations for (for the security
     /// view / observability), regardless of whether their effective instant has
     /// been reached yet.
+    ///
+    /// **Observability only — this cannot answer whether a node is shunned.**
+    /// Holding a record for a MAC no longer implies the node presenting that
+    /// MAC is cancelled: one re-admitted with a certificate issued after the
+    /// record's instant survives it. Use [`revocations`](Self::revocations)
+    /// with [`RevocationRecord::cancels`] to decide enforcement, or
+    /// [`macs_to_purge`](Self::macs_to_purge) to decide teardown.
     pub fn revoked_macs(&self) -> impl Iterator<Item = Mac> + '_ {
         self.revocations.iter().map(|r| Mac(r.record.node_mac))
+    }
+
+    /// The MACs whose routing state a landing revocation should tear down.
+    ///
+    /// Narrower than [`revoked_macs`](Self::revoked_macs), and the difference
+    /// is the point: holding a record no longer means the named node is being
+    /// shunned. A node the authority re-admitted presents a certificate issued
+    /// after the record's instant, so the record does not cancel it — tearing
+    /// down its originator entry and next-hop proofs every time some
+    /// *unrelated* revocation arrived would cost it a re-proof cycle for
+    /// nothing, undoing the immediate re-admission this exists to allow.
+    ///
+    /// A node is spared exactly when the cached certificate it re-verified
+    /// under survives the record. One that has been evicted and not yet come
+    /// back has no cached certificate and is still purged, which is the
+    /// freshly-revoked case.
+    pub fn macs_to_purge(&self) -> impl Iterator<Item = Mac> + '_ {
+        self.revocations
+            .iter()
+            .map(|r| Mac(r.record.node_mac))
+            .filter(|mac| self.is_shunned(*mac))
+    }
+
+    /// Whether the node at `mac` is currently shunned by a revocation this node
+    /// holds — the question a security view is really asking, and the one
+    /// [`revoked_macs`](Self::revoked_macs) can no longer answer.
+    ///
+    /// True when a held record cancels the certificate `mac` most recently
+    /// verified under, or when no certificate is cached for it (the
+    /// freshly-revoked case, whose cached entry ingestion evicted). False for a
+    /// node re-admitted with a certificate issued after the record's instant:
+    /// the record is still held and still listed, but it no longer bites.
+    pub fn is_shunned(&self, mac: Mac) -> bool {
+        self.revocations
+            .iter()
+            .filter(|r| r.record.node_mac == mac.0)
+            .any(|r| {
+                self.neighbors
+                    .iter()
+                    .find(|n| n.cert.mac == mac)
+                    .is_none_or(|n| r.record.cancels(&n.cert, self.now_unix))
+            })
     }
 
     /// When the revocation this node holds for `mac` stops being enforced
@@ -1064,7 +1160,7 @@ impl<
             tracing::trace!("auth: dropping OGM whose cert MAC does not match the originator");
             return OgmVerdict::Rejected;
         }
-        if self.is_revoked(&orig) {
+        if self.is_revoked(&verified) {
             tracing::trace!("auth: dropping OGM from a revoked originator");
             return OgmVerdict::Rejected;
         }
@@ -1188,7 +1284,7 @@ impl<
             tracing::trace!("auth: dropping keep-alive whose cached cert has expired");
             return false;
         }
-        if self.is_revoked(&src.0) {
+        if self.is_revoked(&neighbor.cert) {
             tracing::trace!("auth: dropping keep-alive from a revoked neighbor");
             return false;
         }
@@ -1344,7 +1440,7 @@ impl<
         };
         let requester = verified.mac;
 
-        if self.is_revoked(&requester.0) {
+        if self.is_revoked(&verified) {
             tracing::trace!("auth: dropping cert request from a revoked requester");
             return None;
         }
@@ -1710,6 +1806,37 @@ mod tests {
         auth
     }
 
+    /// A [`VerifiedCert`] for `m` issued at `issued_at`, for the tests that
+    /// exercise [`OgmAuth::is_revoked`] directly rather than driving it
+    /// through [`OgmAuth::verify_ogm`].
+    fn verified_cert(authority: &Authority, seed: u8, m: Mac, issued_at: u64) -> VerifiedCert {
+        let kp = Keypair::from_seed(&[seed; 32]);
+        let cert = authority.issue_cert(m, kp.ed_pubkey(), kp.x_pubkey(), issued_at, 1_000_000);
+        authority
+            .trust_anchor()
+            .verify_cert(&cert, issued_at)
+            .expect("a freshly issued cert verifies at its own issuance instant")
+    }
+
+    /// [`member`] with an explicit issuance instant and clock, for the
+    /// revocation-by-invalidity-date tests: which side of a revocation's
+    /// instant a certificate was issued on is the whole question there, and
+    /// [`member`]'s hardcoded `not_before` of 0 cannot express it.
+    fn member_issued_at(
+        authority: &Authority,
+        seed: u8,
+        m: Mac,
+        issued_at: u64,
+        valid_to: u64,
+        now: u64,
+    ) -> OgmAuth {
+        let kp = Keypair::from_seed(&[seed; 32]);
+        let cert = authority.issue_cert(m, kp.ed_pubkey(), kp.x_pubkey(), issued_at, valid_to);
+        let mut auth = OgmAuth::new(kp, cert, authority.trust_anchor());
+        auth.set_time(now);
+        auth
+    }
+
     /// Exchange one signed OGM each way, so both nodes hold the other's
     /// verified certificate and the pairwise key derived from it — the
     /// precondition for any pairwise operation between them.
@@ -1940,7 +2067,7 @@ mod tests {
         let len = a.augment_ogm(&mut buf, len).expect("augment");
         assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
 
-        let record = authority.revoke(mac(2), 0, 1000);
+        let record = authority.revoke(mac(2), 50, 1000);
         assert!(b.ingest_revocation(&record));
         assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
     }
@@ -2027,7 +2154,7 @@ mod tests {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut a = member(&authority, 2, mac(2), 1000);
         let mut b = member(&authority, 3, mac(3), 1000);
-        let record = authority.revoke(mac(2), 0, 1000);
+        let record = authority.revoke(mac(2), 50, 1000);
         assert!(b.ingest_revocation(&record));
         let (mut buf, len) = bare_ogm(mac(2), 7);
         let len = a.augment_ogm(&mut buf, len).unwrap();
@@ -2054,6 +2181,185 @@ mod tests {
         assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
     }
 
+    /// A certificate issued *after* the revocation instant is not cancelled by
+    /// it: the authority re-admitted the node, and a revocation only cancels
+    /// what existed when it was signed.  This is what lets a re-approved node
+    /// rejoin under its own MAC instead of waiting out `not_after` — which on
+    /// an nRF board, whose MAC is FICR-derived and cannot change, is the only
+    /// way back at all.
+    #[test]
+    fn a_certificate_issued_after_the_revocation_is_not_cancelled() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        // a's certificate is issued at 600, after the revocation instant 500.
+        let mut a = member_issued_at(&authority, 2, mac(2), 600, 100_000, 700);
+        let mut b = member_issued_at(&authority, 3, mac(3), 0, 100_000, 700);
+
+        let record = authority.revoke(mac(2), 500, 100_000);
+        assert!(b.ingest_revocation(&record));
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(
+            b.verify_ogm(&buf[..len]),
+            OgmVerdict::Verified,
+            "a certificate issued after the revocation instant survives it"
+        );
+    }
+
+    /// The tie — a certificate whose `not_before` is exactly the revocation
+    /// instant — resolves toward *revoked*.  A revocation is a security
+    /// control, and re-admission is a deliberate act the authority can stamp a
+    /// second later; the reverse reading would leave a same-second hole.
+    #[test]
+    fn a_certificate_issued_at_the_revocation_instant_is_cancelled() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member_issued_at(&authority, 2, mac(2), 500, 100_000, 700);
+        let mut b = member_issued_at(&authority, 3, mac(3), 0, 100_000, 700);
+
+        let record = authority.revoke(mac(2), 500, 100_000);
+        assert!(b.ingest_revocation(&record));
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(
+            b.verify_ogm(&buf[..len]),
+            OgmVerdict::Rejected,
+            "the tie goes to revoked"
+        );
+    }
+
+    /// The whole re-admission sequence, in the order it actually happens: a
+    /// peer is trusted, revoked, and then re-approved under the *same MAC*
+    /// with a fresh certificate — and is trusted again without waiting out
+    /// `not_after`.
+    ///
+    /// Worth its own test because the three steps interact through the
+    /// neighbour cache: ingesting the revocation evicts the cached
+    /// certificate, so the re-issued one is verified fresh rather than being
+    /// shadowed by the cancelled copy. A test that only ever ingests the
+    /// revocation first would never exercise that.
+    #[test]
+    fn a_re_approved_node_is_trusted_again_under_the_same_mac() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut old = member_issued_at(&authority, 2, mac(2), 0, 100_000, 700);
+        let mut b = member_issued_at(&authority, 3, mac(3), 0, 100_000, 700);
+
+        // Trusted to begin with, which also caches its certificate on `b`.
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = old.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        // Revoked at 500, which cancels the certificate issued at 0.
+        let record = authority.revoke(mac(2), 500, 100_000);
+        assert!(b.ingest_revocation(&record));
+        let (mut buf, len) = bare_ogm(mac(2), 8);
+        let len = old.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
+
+        // Re-approved: the same key and the same MAC, a certificate issued
+        // after the revocation instant.
+        let mut readmitted = member_issued_at(&authority, 2, mac(2), 600, 100_000, 700);
+        let (mut buf, len) = bare_ogm(mac(2), 9);
+        let len = readmitted.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(
+            b.verify_ogm(&buf[..len]),
+            OgmVerdict::Verified,
+            "a re-approved node routes again immediately, without waiting out not_after"
+        );
+        // And the record is still held — it just no longer cancels anything
+        // this node presents.
+        assert!(b.revoked_macs().any(|m| m == mac(2)));
+    }
+
+    /// A node that was revoked, re-admitted, and then misbehaved again can be
+    /// revoked a second time.
+    ///
+    /// The first record no longer cancels the re-admitted certificate — that is
+    /// the whole point of the issuance cut-off — so the second record is the
+    /// only thing standing between the mesh and the node. Dropping it as
+    /// "already known" would leave the node permanently unrevokable until the
+    /// *first* record passively expires.
+    #[test]
+    fn a_re_admitted_node_can_be_revoked_a_second_time() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member_issued_at(&authority, 3, mac(3), 0, 100_000, 700);
+
+        // Revoked at 500, cancelling the certificate issued at 0.
+        let first = authority.revoke(mac(2), 500, 100_000);
+        assert!(b.ingest_revocation(&first));
+
+        // Re-admitted at 600, and routing again.
+        let mut readmitted = member_issued_at(&authority, 2, mac(2), 600, 100_000, 700);
+        let (mut buf, len) = bare_ogm(mac(2), 9);
+        let len = readmitted.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        // Revoked again at 650, which does cancel the certificate issued at 600.
+        let second = authority.revoke(mac(2), 650, 100_000);
+        assert!(
+            b.ingest_revocation(&second),
+            "a revocation naming an already-revoked MAC at a later instant is new information"
+        );
+
+        let (mut buf, len) = bare_ogm(mac(2), 10);
+        let len = readmitted.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(
+            b.verify_ogm(&buf[..len]),
+            OgmVerdict::Rejected,
+            "the second revocation must cancel the re-admitted certificate"
+        );
+    }
+
+    /// A re-admitted node keeps its routing state when an *unrelated* revocation
+    /// lands.
+    ///
+    /// `macs_to_purge` is what a landing revocation tears down. It must not
+    /// name a node whose current certificate survives its held record, or every
+    /// unrelated purge would cost that node a next-hop re-proof cycle — the
+    /// opposite of the immediate re-admission this change exists to allow.
+    #[test]
+    fn a_re_admitted_node_is_not_purged_by_an_unrelated_revocation() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member_issued_at(&authority, 3, mac(3), 0, 100_000, 700);
+
+        // Node 2 revoked at 500, then re-admitted with a cert issued at 600 and
+        // re-verified, so `b` caches the surviving certificate.
+        assert!(b.ingest_revocation(&authority.revoke(mac(2), 500, 100_000)));
+        let mut readmitted = member_issued_at(&authority, 2, mac(2), 600, 100_000, 700);
+        let (mut buf, len) = bare_ogm(mac(2), 9);
+        let len = readmitted.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        assert!(
+            !b.macs_to_purge().any(|m| m == mac(2)),
+            "a re-admitted node's routing state must survive an unrelated purge"
+        );
+        // The record is still held, so the MAC-only view still names it — which
+        // is exactly why that view must not drive the teardown.
+        assert!(b.revoked_macs().any(|m| m == mac(2)));
+
+        // A genuinely revoked node is still purged.
+        assert!(b.ingest_revocation(&authority.revoke(mac(4), 500, 100_000)));
+        assert!(b.macs_to_purge().any(|m| m == mac(4)));
+    }
+
+    /// A certificate issued *before* the revocation instant is cancelled — the
+    /// ordinary case, stated alongside its two boundary siblings so the three
+    /// read as one specification.
+    #[test]
+    fn a_certificate_issued_before_the_revocation_is_cancelled() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member_issued_at(&authority, 2, mac(2), 400, 100_000, 700);
+        let mut b = member_issued_at(&authority, 3, mac(3), 0, 100_000, 700);
+
+        let record = authority.revoke(mac(2), 500, 100_000);
+        assert!(b.ingest_revocation(&record));
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Rejected);
+    }
+
     /// An invalid (forged) revocation is ignored: `ingest_revocation` returns
     /// false and the targeted node keeps routing.
     #[test]
@@ -2062,7 +2368,7 @@ mod tests {
         let attacker = Authority::from_seed(&[7; 32], 0xABCD);
         let mut a = member(&authority, 2, mac(2), 1000);
         let mut b = member(&authority, 3, mac(3), 1000);
-        let forged = attacker.revoke(mac(2), 0, 1000);
+        let forged = attacker.revoke(mac(2), 50, 1000);
         assert!(!b.ingest_revocation(&forged));
         let (mut buf, len) = bare_ogm(mac(2), 7);
         let len = a.augment_ogm(&mut buf, len).unwrap();
@@ -2075,7 +2381,7 @@ mod tests {
     fn duplicate_revocation_recorded_once() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut b = member(&authority, 3, mac(3), 1000);
-        let record = authority.revoke(mac(2), 0, 1000);
+        let record = authority.revoke(mac(2), 50, 1000);
         assert!(b.ingest_revocation(&record));
         assert!(!b.ingest_revocation(&record));
         assert_eq!(b.revoked_macs().filter(|m| *m == mac(2)).count(), 1);
@@ -2090,7 +2396,7 @@ mod tests {
         let mut a = member(&authority, 2, mac(2), 1000);
         let mut b = member(&authority, 3, mac(3), 1000);
 
-        let record = authority.revoke(mac(9), 0, 1000);
+        let record = authority.revoke(mac(9), 50, 1000);
         assert!(a.ingest_revocation(&record));
 
         let (mut buf, len) = bare_ogm(mac(2), 7);
@@ -2106,7 +2412,7 @@ mod tests {
     fn revoke_flood_budget_is_finite() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut a = member(&authority, 2, mac(2), 1000);
-        let record = authority.revoke(mac(9), 0, 1000);
+        let record = authority.revoke(mac(9), 50, 1000);
         assert!(a.ingest_revocation(&record));
 
         // Drain the budget; each emission should carry the revoke TVLV.
@@ -2140,7 +2446,7 @@ mod tests {
         assert!(a.tag_directed(mac(3), b"f", &mut trailer).is_some());
 
         // Revoke b on a; a forgets b's key and can no longer tag to it.
-        let record = authority.revoke(mac(3), 0, 1000);
+        let record = authority.revoke(mac(3), 50, 1000);
         assert!(a.ingest_revocation(&record));
         assert!(a.tag_directed(mac(3), b"f", &mut trailer).is_none());
     }
@@ -2151,7 +2457,7 @@ mod tests {
     fn self_revocation_is_a_noop() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut a = member(&authority, 2, mac(2), 1000);
-        let record = authority.revoke(mac(2), 0, 1000); // a's own MAC
+        let record = authority.revoke(mac(2), 50, 1000); // a's own MAC
         assert!(!a.ingest_revocation(&record));
         assert_eq!(a.revoked_macs().count(), 0);
     }
@@ -2171,7 +2477,7 @@ mod tests {
         assert!(b.ingest_revocation(&record));
         // now_unix is 0, which is below not_before (500), so mac(2) is not yet
         // revoked: the check is a window, not "stored ⇒ dropped".
-        assert!(!b.is_revoked(&mac(2).0));
+        assert!(!b.is_revoked(&verified_cert(&authority, 2, mac(2), 0)));
     }
 
     /// Once a revocation's `not_after` passes, `set_time` garbage-collects it,
@@ -2180,7 +2486,7 @@ mod tests {
     fn expired_revocation_is_garbage_collected() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut b = member(&authority, 3, mac(3), 1_000_000); // now_unix = 100
-        let record = authority.revoke(mac(2), 0, 1000);
+        let record = authority.revoke(mac(2), 50, 1000);
         assert!(b.ingest_revocation(&record));
         assert_eq!(b.revoked_macs().count(), 1);
         // Advance past not_after: the record is pruned on the clock update.
@@ -2199,7 +2505,7 @@ mod tests {
         let mut b = member(&authority, 3, mac(3), 1_000_000); // now_unix = 100
         assert_eq!(b.revocation_not_after(mac(2)), None, "none held yet");
 
-        let record = authority.revoke(mac(2), 0, 1000);
+        let record = authority.revoke(mac(2), 50, 1000);
         assert!(b.ingest_revocation(&record));
         assert_eq!(b.revocation_not_after(mac(2)), Some(1000));
         assert_eq!(
@@ -2224,7 +2530,7 @@ mod tests {
             "no hint before any revocation"
         );
 
-        let record = authority.revoke(mac(2), 0, 1000);
+        let record = authority.revoke(mac(2), 50, 1000);
         assert!(b.ingest_revocation(&record));
         assert!(
             b.take_trickle_reset_hint(),
@@ -2246,7 +2552,7 @@ mod tests {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut b = member(&authority, 3, mac(3), 1_000_000);
         b.set_time(2000);
-        let record = authority.revoke(mac(2), 0, 1000); // not_after 1000 < now 2000
+        let record = authority.revoke(mac(2), 50, 1000); // not_after 1000 < now 2000
         assert!(!b.ingest_revocation(&record));
         assert_eq!(b.revoked_macs().count(), 0);
     }
@@ -2331,7 +2637,7 @@ mod tests {
     fn augment_ogm_lazy_still_floods_revocations() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut a = member(&authority, 2, mac(2), 1000);
-        let record = authority.revoke(mac(9), 0, 1000);
+        let record = authority.revoke(mac(9), 50, 1000);
         assert!(a.ingest_revocation(&record));
 
         let (mut buf, len) = bare_ogm(mac(2), 7);
@@ -2509,7 +2815,7 @@ mod tests {
         let mut a = member(&authority, 2, mac(2), 1000);
         let mut b = member(&authority, 3, mac(3), 1000);
         mutual_verify(&mut a, mac(2), &mut b, mac(3));
-        let record = authority.revoke(mac(2), 0, 1000);
+        let record = authority.revoke(mac(2), 50, 1000);
         assert!(b.ingest_revocation(&record));
 
         let (mut buf, len) = bare_keepalive();
@@ -3066,7 +3372,7 @@ mod tests {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut a = member(&authority, 2, mac(2), 1000);
         let mut requester = member(&authority, 3, mac(3), 1000);
-        let record = authority.revoke(mac(3), 0, 1000);
+        let record = authority.revoke(mac(3), 50, 1000);
         assert!(a.ingest_revocation(&record));
 
         let mut buf = [0u8; 512];

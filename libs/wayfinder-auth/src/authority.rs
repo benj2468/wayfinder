@@ -149,6 +149,18 @@ impl Authority {
     /// purge.  Set `not_after` to at least the revoked certificate's own
     /// `not_after`, so members enforce the revocation until the cancelled cert
     /// would have expired anyway and may then forget the record.
+    ///
+    /// `not_before` is also the **issuance cut-off**: the record cancels only
+    /// certificates issued at or before it, so pass the current time rather
+    /// than a backdated one, and re-revoke after a re-admission rather than
+    /// assuming the first record still bites.
+    ///
+    /// `not_before` must be non-zero — [`verify_revocation`] refuses a zero
+    /// instant as [`AuthError::NoRevocationInstant`], so a record minted with
+    /// one verifies nowhere and silently cancels nothing.
+    ///
+    /// [`verify_revocation`]: crate::TrustAnchor::verify_revocation
+    /// [`AuthError::NoRevocationInstant`]: crate::AuthError::NoRevocationInstant
     pub fn revoke(&self, mac: Mac, not_before: u64, not_after: u64) -> RevocationRecord {
         let mut record = RevocationRecord {
             version: REVOKE_VERSION,

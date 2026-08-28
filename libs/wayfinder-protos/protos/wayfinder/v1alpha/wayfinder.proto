@@ -91,8 +91,11 @@ message NodeSecurity {
   // when not verified.
   uint64 cert_not_after = 3;
 
-  // Whether this node currently holds a revocation for the originator (its
-  // frames are dropped mesh-wide).
+  // Whether a revocation this node holds currently cancels the originator's
+  // credentials (its frames are dropped mesh-wide).  False for a node the
+  // authority re-admitted with a certificate issued after the revocation
+  // instant: the record is still held, and `revocation_not_after` still
+  // reports its expiry, but it no longer cancels anything the node presents.
   bool revoked = 4;
 
   // When the revocation stops being enforced (unix seconds), when `revoked`;
@@ -2176,7 +2179,9 @@ message IssuedCert {
 
   // Whether this provider has since revoked the node.  The entry is retained
   // (rather than removed) so the operator can see the revocation; the node's
-  // frames are dropped mesh-wide and its cert will also passively expire.
+  // frames are dropped mesh-wide and its cert will also passively expire —
+  // unless the provider has since re-admitted it with a certificate issued
+  // after the revocation instant, which the revocation does not cancel.
   bool revoked = 5;
 
   // Whether this is a person's session certificate (CERT_FLAG_USER) rather

@@ -25,7 +25,6 @@
 //! it always was, in the provider's enrollment policy: the shared token, and the
 //! operator approving the request. What this grants is the ability to *ask*.
 
-use wayfinder::interfaces::frame::Mac;
 use wayfinder::wayfinder_auth::AuthError;
 use wayfinder::wayfinder_auth::MembershipCert;
 use wayfinder::wayfinder_auth::TrustAnchor;
@@ -177,7 +176,7 @@ pub fn decide_access(
     anchor: Option<&TrustAnchor>,
     own_key: Option<&[u8; 32]>,
     now_unix: u64,
-    is_revoked: impl FnOnce(Mac) -> bool,
+    is_revoked: impl FnOnce(&VerifiedCert) -> bool,
 ) -> MgmtAccess {
     if own_key == Some(handshake_key) {
         return MgmtAccess::GrantedSelfKey;
@@ -277,9 +276,14 @@ pub fn permits(access: MgmtAccess, request: &ReqKind) -> bool {
 /// `cert` must already have been verified against the trust anchor (it is a
 /// [`VerifiedCert`], produced only on the verification success path), so its
 /// [`admin`](VerifiedCert::admin) and [`viewer`](VerifiedCert::viewer) bits are
-/// trustworthy.  `is_revoked` reports whether a given node MAC has an active
-/// revocation — supplied as a predicate so the policy stays decoupled from
-/// where revocation state lives (the router's `OgmAuth`).
+/// trustworthy.  `is_revoked` reports whether an active revocation cancels
+/// *this certificate* — supplied as a predicate so the policy stays decoupled
+/// from where revocation state lives (the router's `OgmAuth`).
+///
+/// It takes the whole certificate, not its MAC, because a revocation cancels
+/// the credentials that existed when it was signed: a certificate issued after
+/// the revocation instant is a re-admission and must not be refused here. See
+/// [`RevocationRecord::cancels`](wayfinder_auth::RevocationRecord::cancels).
 ///
 /// Revocation is checked first: it dominates every capability, so a revoked
 /// admin is refused ([`MgmtDenied::Revoked`]) rather than allowed. The
@@ -294,9 +298,9 @@ pub fn permits(access: MgmtAccess, request: &ReqKind) -> bool {
 /// logic. Changing it requires careful consideration.
 pub fn authorize_capability(
     cert: &VerifiedCert,
-    is_revoked: impl FnOnce(Mac) -> bool,
+    is_revoked: impl FnOnce(&VerifiedCert) -> bool,
 ) -> Result<MgmtAccess, MgmtDenied> {
-    if is_revoked(cert.mac) {
+    if is_revoked(cert) {
         Err(MgmtDenied::Revoked)
     } else if cert.admin {
         Ok(MgmtAccess::GrantedAdmin)
@@ -335,6 +339,7 @@ mod tests {
             mac: m,
             ed_pubkey: [0u8; 32],
             x_pubkey: [0u8; 32],
+            not_before: 0,
             not_after: 0,
             admin,
             viewer: false,
@@ -383,7 +388,7 @@ mod tests {
         // Verified admin whose node has been revoked → refused despite the admin
         // bit; revocation is the dominant, mesh-wide fact.
         assert_eq!(
-            authorize_capability(&verified(mac(1), true), |m| m == mac(1)),
+            authorize_capability(&verified(mac(1), true), |c: &VerifiedCert| c.mac == mac(1)),
             Err(MgmtDenied::Revoked)
         );
     }
@@ -399,7 +404,7 @@ mod tests {
             Ok(MgmtAccess::GrantedViewer)
         );
         assert_eq!(
-            authorize_capability(&verified_viewer(mac(1)), |m| m == mac(1)),
+            authorize_capability(&verified_viewer(mac(1)), |c: &VerifiedCert| c.mac == mac(1)),
             Err(MgmtDenied::Revoked),
             "revocation dominates the viewer capability too"
         );
@@ -640,7 +645,7 @@ mod tests {
                 Some(&anchor),
                 Some(&own.ed_pubkey()),
                 100,
-                |m| m == mac(5)
+                |c: &VerifiedCert| c.mac == mac(5)
             ),
             MgmtAccess::Denied(MgmtDenied::Revoked)
         );
@@ -1205,7 +1210,7 @@ mod tests {
             Ok(MgmtAccess::GrantedMember)
         );
         assert_eq!(
-            authorize_capability(&verified_member(mac(1)), |m| m == mac(1)),
+            authorize_capability(&verified_member(mac(1)), |c: &VerifiedCert| c.mac == mac(1)),
             Err(MgmtDenied::Revoked),
             "revocation dominates the member capability too"
         );
@@ -1404,7 +1409,7 @@ mod tests {
                 Some(&anchor),
                 Some(&ca_own.ed_pubkey()),
                 150,
-                |m| m == mac(3)
+                |c: &VerifiedCert| c.mac == mac(3)
             ),
             MgmtAccess::Denied(MgmtDenied::Revoked)
         );

@@ -185,6 +185,13 @@ pub struct VerifiedCert {
     pub ed_pubkey: [u8; 32],
     /// The node's verified X25519 agreement key.
     pub x_pubkey: [u8; 32],
+    /// When the cert becomes valid (unix seconds) — its issuance instant.
+    ///
+    /// Carried through verification because it is what a revocation is judged
+    /// against: a `RevocationRecord` cancels this certificate only if this
+    /// instant is at or before the record's own `not_before`.  Without it here
+    /// every revocation check would have to re-parse the raw certificate.
+    pub not_before: u64,
     /// When the cert expires (unix seconds), so the router can age it out.
     pub not_after: u64,
     /// Whether the cert carries the management-administration capability
@@ -276,6 +283,7 @@ impl TrustAnchor {
             mac: Mac(cert.node_mac),
             ed_pubkey: cert.ed_pubkey,
             x_pubkey: cert.x_pubkey,
+            not_before,
             not_after,
             admin: cert.flags & CERT_FLAG_ADMIN != 0,
             viewer: cert.flags & CERT_FLAG_VIEWER != 0,
