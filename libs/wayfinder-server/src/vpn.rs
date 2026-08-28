@@ -321,6 +321,30 @@ mod headscale {
                 .map_err(|e| VpnError::Malformed(strip_secret(&e.to_string(), &self.api_key)))
         }
 
+        /// `DELETE url`, treating "already gone" as success.
+        ///
+        /// A 404 is not a failure here: every caller is on the revocation path,
+        /// whose idempotence is contractual — the retry after a half-completed
+        /// mesh revoke runs through it and has to converge, and a node listed a
+        /// moment ago may have been deleted since. `what` names the thing being
+        /// removed, for the error an operator reads.
+        async fn delete(&self, url: &str, what: &str) -> Result<(), VpnError> {
+            let response = self
+                .authorized(self.http.delete(url))
+                .send()
+                .await
+                .map_err(|e| {
+                    VpnError::Unreachable(strip_secret(&format!("{e:?}"), &self.api_key))
+                })?;
+            let status = response.status();
+            if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
+                return Err(VpnError::Unreachable(format!(
+                    "coordination server answered {status} deleting {what}"
+                )));
+            }
+            Ok(())
+        }
+
         /// Every node Headscale knows, as its own API reports them.
         async fn list_nodes(&self) -> Result<Vec<HeadscaleNode>, VpnError> {
             let url = format!("{}/api/v1/node", self.api_url);
@@ -409,24 +433,12 @@ mod headscale {
                 .await?
                 .into_iter()
                 .map(|n| VpnPeer {
-                    // The user the *credential* was scoped to first, not the
-                    // one owning the node: `enroll` tags every key it mints, and
-                    // Headscale reassigns a tagged node to the synthetic
-                    // `tagged-devices` user — so `user` is never the MAC on a
-                    // node this system registered, while the key it spent still
-                    // carries the per-MAC user `user_id_for` created. Checked
-                    // before `user` rather than instead of it, so a peer
-                    // registered against a MAC-named user without a tag still
-                    // resolves. Falling back last to the hostname still lists a
-                    // peer somebody registered by hand — an operator auditing
-                    // who can reach the tunnel needs to see exactly those.
-                    mac: n
-                        .pre_auth_key
-                        .as_ref()
-                        .and_then(|k| k.user.as_ref())
-                        .and_then(|u| mac_from_hostname(&u.name))
-                        .or_else(|| n.user.as_ref().and_then(|u| mac_from_hostname(&u.name)))
-                        .or_else(|| mac_from_hostname(&n.given_name)),
+                    // The same correlation a revocation selects by — see
+                    // `node_mac`. A peer it cannot name is still listed: it has
+                    // tunnel reachability with no mesh identity behind it, and
+                    // an operator auditing who can reach the tunnel needs to see
+                    // exactly those.
+                    mac: node_mac(&n),
                     hostname: n.given_name,
                     address: n.ip_addresses.first().cloned().unwrap_or_default(),
                     online: n.online,
@@ -438,11 +450,44 @@ mod headscale {
 
         async fn revoke(&self, mac: Mac) -> Result<(), VpnError> {
             let name = hostname_for(mac);
-            // Delete the node's *user*, which takes its registrations and its
-            // outstanding preauth keys with it. Deleting the nodes alone would
-            // leave the user behind holding any key minted but not yet spent —
-            // so a revocation racing an enrollment could leave a usable
-            // credential for a node that was just removed.
+
+            // The registered nodes first. Deleting the per-MAC *user* alone
+            // does not take them: `enroll` tags every key it mints, and
+            // Headscale reassigns a tagged node to the synthetic
+            // `tagged-devices` user — so a node this system registered is never
+            // among its MAC user's nodes, and deleting that user reaps only the
+            // unspent keys. That is the whole bug this ordering exists to fix:
+            // Headscale answered success, the RPC logged a revocation, and the
+            // node kept its tunnel.
+            //
+            // Selected by the same correlation `peers` lists by, so an operator
+            // revokes the peer they were shown — see `node_mac`.
+            for node in self.list_nodes().await? {
+                if node_mac(&node) != Some(mac) {
+                    continue;
+                }
+                // A node with no id is one this cannot address — `id` is the
+                // only thing `DELETE /api/v1/node/{id}` accepts — so this is a
+                // schema break, and it fails rather than skipping. Skipping
+                // would return the success that this whole path exists to stop
+                // lying about, and deleting `/api/v1/node/` instead would be an
+                // unbounded request whose meaning is Headscale's to decide.
+                if node.id.is_empty() {
+                    return Err(VpnError::Malformed(format!(
+                        "coordination server reported a node for {name} with no id"
+                    )));
+                }
+                self.delete(
+                    &format!("{}/api/v1/node/{}", self.api_url, node.id),
+                    &format!("the node registered by {name}"),
+                )
+                .await?;
+            }
+
+            // Then the user, which takes any key minted but not yet spent with
+            // it. Last, not first: a revocation racing an enrollment would
+            // otherwise leave a usable credential behind for a node that was
+            // just removed.
             //
             // Idempotent by contract: a MAC with no user is success. The retry
             // path for a partially-failed mesh revocation runs through here and
@@ -450,28 +495,54 @@ mod headscale {
             let Some(id) = self.find_user(&name).await? else {
                 return Ok(());
             };
-            let url = format!("{}/api/v1/user/{id}", self.api_url);
-            let response = self
-                .authorized(self.http.delete(&url))
-                .send()
-                .await
-                .map_err(|e| {
-                    VpnError::Unreachable(strip_secret(&format!("{e:?}"), &self.api_key))
-                })?;
-            let status = response.status();
-            if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
-                return Err(VpnError::Unreachable(format!(
-                    "coordination server answered {status} deleting the registration for {name}"
-                )));
-            }
-            Ok(())
+            self.delete(
+                &format!("{}/api/v1/user/{id}", self.api_url),
+                &format!("the registration for {name}"),
+            )
+            .await
         }
+    }
+
+    /// The mesh MAC behind a node Headscale reports, or `None` for a peer this
+    /// system did not enroll.
+    ///
+    /// Three arms, narrowest first, and the order is the whole point:
+    ///
+    /// 1. The user its *preauth key* was minted for. `enroll` tags every key,
+    ///    and Headscale reassigns a tagged node to the synthetic
+    ///    `tagged-devices` user — so this is the only arm that resolves a node
+    ///    this system actually registered, which is all of them.
+    /// 2. The node's own owning user, for a peer registered against a MAC-named
+    ///    user without a tag.
+    /// 3. The hostname, last, for a peer registered by hand under this
+    ///    convention.
+    ///
+    /// Shared by [`peers`](VpnCoordinator::peers) and
+    /// [`revoke`](VpnCoordinator::revoke) rather than written twice: an
+    /// operator revokes the peer the listing named, so the two must select the
+    /// same node or a revocation silently misses. The strictness of
+    /// [`mac_from_hostname`] is what keeps arm 3 from letting an
+    /// operator-chosen name alias a real node — revoking one peer must never
+    /// take out another's tunnel.
+    fn node_mac(node: &HeadscaleNode) -> Option<Mac> {
+        node.pre_auth_key
+            .as_ref()
+            .and_then(|k| k.user.as_ref())
+            .and_then(|u| mac_from_hostname(&u.name))
+            .or_else(|| node.user.as_ref().and_then(|u| mac_from_hostname(&u.name)))
+            .or_else(|| mac_from_hostname(&node.given_name))
     }
 
     /// Headscale's node representation, narrowed to the fields used here.
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct HeadscaleNode {
+        /// Headscale's own id for this node, and the only thing
+        /// `DELETE /api/v1/node/{id}` accepts. A JSON *string*, like every
+        /// other 64-bit id in this API — echoed back verbatim rather than
+        /// parsed and re-rendered.
+        #[serde(default)]
+        id: String,
         #[serde(default)]
         given_name: String,
         /// The Headscale user this node belongs to. **Not** the per-MAC user
@@ -778,22 +849,60 @@ mod headscale {
             }
         }
 
+        /// A request log shared between a test and the server task answering
+        /// it, so the test can read what arrived *without* waiting for the
+        /// server to finish. A client that issues fewer requests than were
+        /// queued is exactly what a regression on this path looks like, and
+        /// joining the task to get its return value would hang on that case
+        /// instead of failing it.
+        type RequestLog = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+        /// An empty [`RequestLog`].
+        fn request_log() -> RequestLog {
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))
+        }
+
         /// Serve exactly `responses.len()` HTTP/1.1 requests on `listener`, one
         /// canned `(status, body)` response each, then stop accepting — so a
         /// connection attempt beyond that count fails the way an unreachable
         /// server would.
-        async fn serve_n(listener: tokio::net::TcpListener, responses: Vec<(u16, String)>) {
+        ///
+        /// Records each request's start line (`"DELETE /api/v1/node/1"`) into
+        /// `log` in arrival order, before answering it — so every request the
+        /// client has seen a response to is already logged by the time its call
+        /// returns. For a call whose whole point is *which* endpoints it hits —
+        /// `revoke` — the response bodies say nothing and the request lines say
+        /// everything. Every response carries `Connection: close`, so one
+        /// accept is one request and arrival order is request order.
+        async fn serve_logged(
+            listener: tokio::net::TcpListener,
+            responses: Vec<(u16, String)>,
+            log: RequestLog,
+        ) {
             for (status, body) in responses {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 // Requests in this test carry no body worth reading; draining
                 // headers only is enough to let the client see a response.
                 let mut buf = [0u8; 4096];
+                let mut head = Vec::new();
                 loop {
                     let n = stream.read(&mut buf).await.unwrap();
-                    if n == 0 || buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                    head.extend_from_slice(&buf[..n]);
+                    if n == 0 || head.windows(4).any(|w| w == b"\r\n\r\n") {
                         break;
                     }
                 }
+                let line = String::from_utf8_lossy(&head)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                // "GET /path HTTP/1.1" -> "GET /path": the version is noise.
+                log.lock().unwrap().push(
+                    line.rsplit_once(' ')
+                        .map(|(m, _)| m.to_string())
+                        .unwrap_or(line),
+                );
                 let reason = if status == 200 { "OK" } else { "Error" };
                 let response = format!(
                     "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
@@ -805,6 +914,12 @@ mod headscale {
             }
             // Dropping the listener here (end of scope) is what makes the next
             // connection attempt fail closed rather than hang.
+        }
+
+        /// [`serve_logged`] for a test that only needs the responses served,
+        /// not the requests that fetched them.
+        async fn serve_n(listener: tokio::net::TcpListener, responses: Vec<(u16, String)>) {
+            serve_logged(listener, responses, request_log()).await
         }
 
         /// When creating a Headscale user fails for a reason that is *not* the
@@ -921,6 +1036,207 @@ mod headscale {
             assert_eq!(peers.len(), 1);
             assert_eq!(peers[0].mac, None);
             assert_eq!(peers[0].hostname, "intruder");
+        }
+
+        /// A `GET /api/v1/node` body carrying `nodes`, in the field shape a
+        /// live Headscale 0.29.3 emits (camelCase protojson).
+        ///
+        /// Written as a helper because every revoke test below needs one and
+        /// the interesting part of each is a single field.
+        fn node_list(nodes: &[String]) -> String {
+            format!(r#"{{"nodes":[{}]}}"#, nodes.join(","))
+        }
+
+        /// A node this system registered: tagged, so Headscale reports its
+        /// owning user as the synthetic `tagged-devices` while the preauth key
+        /// it spent still carries the per-MAC user.
+        fn tagged_node(id: &str, mac: Mac) -> String {
+            format!(
+                r#"{{"id":"{id}","givenName":"some-laptop",
+                    "user":{{"id":"2147455555","name":"tagged-devices"}},
+                    "preAuthKey":{{"user":{{"id":"1","name":"{}"}}}},
+                    "ipAddresses":["100.64.0.1"],"online":true}}"#,
+                hostname_for(mac)
+            )
+        }
+
+        /// Run `revoke(mac)` against a server answering `responses`, and return
+        /// the outcome together with the requests it actually issued.
+        ///
+        /// The server task is aborted rather than joined: a `revoke` that stops
+        /// early leaves responses unconsumed, and that case has to fail an
+        /// assertion below rather than block the test forever.
+        async fn revoke_against(
+            responses: Vec<(u16, String)>,
+            mac: Mac,
+        ) -> (Result<(), VpnError>, Vec<String>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let log = request_log();
+            let server = tokio::spawn(serve_logged(listener, responses, log.clone()));
+
+            let coord = coordinator(format!("http://{addr}"));
+            let result = VpnCoordinator::revoke(&coord, mac).await;
+            server.abort();
+            let requests = log.lock().unwrap().clone();
+            (result, requests)
+        }
+
+        /// Revoking a MAC deletes the *node* it registered, not only the
+        /// per-MAC Headscale user.
+        ///
+        /// Regression test for a silent failure: `enroll` tags every key it
+        /// mints, Headscale reassigns a tagged node to the synthetic
+        /// `tagged-devices` user, and so the registered node is not among the
+        /// MAC user's nodes. Deleting that user alone therefore reaped only
+        /// unspent keys — the coordination server answered success, the RPC
+        /// logged "revoked a VPN registration", and the node kept its tunnel.
+        ///
+        /// Ordering is asserted, not incidental: the nodes go first so a
+        /// revocation racing an enrollment cannot leave a usable credential
+        /// behind, which is what deleting the user last is for.
+        #[tokio::test]
+        async fn revoking_deletes_the_registered_node_before_its_user() {
+            let revoked = Mac([0x32, 0xed, 0x2e, 0x13, 0x5d, 0xf9]);
+            let (result, requests) = revoke_against(
+                vec![
+                    (200, node_list(&[tagged_node("7", revoked)])),
+                    // DELETE /api/v1/node/7
+                    (200, "{}".to_string()),
+                    // find_user
+                    (
+                        200,
+                        r#"{"users":[{"id":"9","name":"32ed2e135df9"}]}"#.to_string(),
+                    ),
+                    // DELETE /api/v1/user/9
+                    (200, "{}".to_string()),
+                ],
+                revoked,
+            )
+            .await;
+            assert_eq!(result, Ok(()));
+
+            let node_delete = requests
+                .iter()
+                .position(|r| r == "DELETE /api/v1/node/7")
+                .unwrap_or_else(|| panic!("the registered node was never deleted: {requests:?}"));
+            let user_delete = requests
+                .iter()
+                .position(|r| r == "DELETE /api/v1/user/9")
+                .unwrap_or_else(|| panic!("the per-MAC user was never deleted: {requests:?}"));
+            assert!(
+                node_delete < user_delete,
+                "the node must be deleted before its user: {requests:?}"
+            );
+        }
+
+        /// Revoking one MAC touches no other peer's registration.
+        ///
+        /// The correlation is the same three-way one `peers` lists by, and its
+        /// widest arm — the hostname — is a display name an operator can edit.
+        /// A looser match here would revoke somebody else's tunnel, which is
+        /// strictly worse than the bug this path exists to fix.
+        #[tokio::test]
+        async fn revoking_leaves_every_other_peer_registered() {
+            let revoked = Mac([0x32, 0xed, 0x2e, 0x13, 0x5d, 0xf9]);
+            let other = Mac([0x32, 0xed, 0x2e, 0x13, 0x5d, 0xfa]);
+            let (result, requests) = revoke_against(
+                vec![
+                    (
+                        200,
+                        node_list(&[
+                            tagged_node("7", revoked),
+                            tagged_node("8", other),
+                            // Registered by hand, under no name of ours.
+                            r#"{"id":"9","givenName":"intruder",
+                                "user":{"id":"3","name":"alice"},
+                                "ipAddresses":["100.64.0.9"],"online":false}"#
+                                .to_string(),
+                        ]),
+                    ),
+                    (200, "{}".to_string()),
+                    (
+                        200,
+                        r#"{"users":[{"id":"5","name":"32ed2e135df9"}]}"#.to_string(),
+                    ),
+                    (200, "{}".to_string()),
+                ],
+                revoked,
+            )
+            .await;
+            assert_eq!(result, Ok(()));
+
+            assert!(
+                requests.iter().any(|r| r == "DELETE /api/v1/node/7"),
+                "the revoked node was not deleted: {requests:?}"
+            );
+            for spared in ["DELETE /api/v1/node/8", "DELETE /api/v1/node/9"] {
+                assert!(
+                    !requests.iter().any(|r| r == spared),
+                    "{spared} took out an unrelated peer: {requests:?}"
+                );
+            }
+        }
+
+        /// A node this cannot address fails the revoke rather than being
+        /// skipped.
+        ///
+        /// `id` is the only thing `DELETE /api/v1/node/{id}` accepts, so a node
+        /// reported without one cannot be removed. Reporting success anyway
+        /// would be the exact shape of the bug above — a clean `Ok(())` while
+        /// the node keeps its tunnel — so this is the one place on the
+        /// revocation path that is deliberately *not* forgiving.
+        #[tokio::test]
+        async fn a_node_with_no_id_fails_the_revoke_rather_than_being_skipped() {
+            let revoked = Mac([0x32, 0xed, 0x2e, 0x13, 0x5d, 0xf9]);
+            let (result, _) = revoke_against(
+                vec![(
+                    200,
+                    node_list(&[format!(
+                        r#"{{"givenName":"some-laptop",
+                            "preAuthKey":{{"user":{{"id":"1","name":"{}"}}}},
+                            "ipAddresses":["100.64.0.1"],"online":true}}"#,
+                        hostname_for(revoked)
+                    )]),
+                )],
+                revoked,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(VpnError::Malformed(_))),
+                "expected a malformed-response error, got {result:?}"
+            );
+        }
+
+        /// A MAC with nothing registered is success, and a node that vanished
+        /// between the listing and the delete is too.
+        ///
+        /// Idempotence is contractual: `revoke_vpn_alongside_mesh` retries
+        /// through this path after a half-completed mesh revoke, and the
+        /// operator-facing message tells them to re-run `wayfinderctl vpn
+        /// revoke`. An "already gone" that errored would make that retry report
+        /// failure forever.
+        #[tokio::test]
+        async fn revoking_an_absent_or_vanished_registration_is_success() {
+            let revoked = Mac([0x32, 0xed, 0x2e, 0x13, 0x5d, 0xf9]);
+
+            for (case, responses) in [
+                (
+                    "nothing registered at all",
+                    vec![(200, node_list(&[])), (200, r#"{"users":[]}"#.to_string())],
+                ),
+                (
+                    "the node was deleted between the listing and the delete",
+                    vec![
+                        (200, node_list(&[tagged_node("7", revoked)])),
+                        (404, r#"{"message":"node not found"}"#.to_string()),
+                        (200, r#"{"users":[]}"#.to_string()),
+                    ],
+                ),
+            ] {
+                let (result, requests) = revoke_against(responses, revoked).await;
+                assert_eq!(result, Ok(()), "{case}: {requests:?}");
+            }
         }
     }
 }

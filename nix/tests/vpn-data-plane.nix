@@ -9,6 +9,11 @@
 # behind *real* NAT, "which is where hole-punching either happens or silently
 # degrades to relaying" — that needs two real machines, not two containers.
 #
+# It is also where a tunnel *registration* is revoked, for the same reason: a
+# revocation can only be checked against a node that really registered, and
+# every other test in the repo revokes a MAC whose preauth key was never spent.
+# See the last subtest — that gap is how #27 shipped.
+#
 # This is also the regression test for the relay gap it originally uncovered:
 # every stage but the last used to pass while the two spokes never saw each
 # other's routes, because split-horizon excluded the ingress interface and the
@@ -489,6 +494,91 @@ testers.nixosTest {
             "--identity /var/lib/wayfinder/identity.seed routes "
             f"| grep -qi '{spokeA_mac}'",
             timeout=120,
+        )
+
+    with subtest("revoking a spoke's registration takes its node off the tunnel"):
+        # The regression this exists for (#27): `revoke` deleted only the
+        # per-MAC Headscale *user*, on the reasoning that this takes the node's
+        # registrations with it. It does not — `enroll` tags every key it mints
+        # and Headscale reassigns a tagged node to the synthetic
+        # `tagged-devices` user, so the registered node is not the MAC user's to
+        # delete. Headscale answered success, the RPC logged "revoked a VPN
+        # registration", and the node kept its tunnel.
+        #
+        # It could only show against a *registered* node, and this is the only
+        # test in the repo where a real `tailscaled` has registered one:
+        # `ca-provider.nix` revokes a MAC that never spent its key (no
+        # tailscaled — it serves headscale over plain HTTP, which a tailscaled
+        # refuses outright), and `headscale_live.rs` does the same. Both passed
+        # throughout.
+        def registered_ips():
+            # `headscale nodes list -o json` prints snake_case, unlike the
+            # camelCase protojson the REST API serves the coordinator; accept
+            # either rather than pinning the CLI's rendering, which is not what
+            # is under test here.
+            nodes = json.loads(hub.succeed("headscale nodes list -o json")) or []
+            return {
+                ip
+                for n in nodes
+                for ip in (n.get("ip_addresses") or n.get("ipAddresses") or [])
+            }
+
+        spokeB_ts_ip = spokeB.succeed("tailscale ip -4").strip()
+        spokeA_ts_ip = spokeA.succeed("tailscale ip -4").strip()
+        before = registered_ips()
+        assert spokeB_ts_ip in before, (
+            f"spokeB ({spokeB_ts_ip}) is not registered to begin with: {before}"
+        )
+
+        # The VPN half alone, not `provider revoke` — mesh membership is a
+        # separate gate, and leaving it in place keeps this subtest about the
+        # tunnel. The hub asks its own management API with its own seed, which
+        # reaches `GrantedSelfKey`; that tier is admitted to `RevokeVpnPeer`.
+        hub.succeed(
+            "wayfinder-ctl --connect 127.0.0.1:7700 "
+            "--identity /var/lib/wayfinder/identity.seed "
+            "--cert /var/lib/wayfinder/node.cert "
+            f"provider vpn revoke --mac {spokeB_mac}"
+        )
+
+        after = registered_ips()
+        assert spokeB_ts_ip not in after, (
+            f"spokeB ({spokeB_ts_ip}) still holds a tunnel registration after "
+            f"a successful revoke: {after}"
+        )
+        # Not a scorched-earth delete: revoking one peer must leave every other
+        # tunnel standing, which is the failure mode a looser correlation would
+        # trade this bug for.
+        assert spokeA_ts_ip in after, (
+            f"revoking spokeB took spokeA ({spokeA_ts_ip}) off the tunnel too: {after}"
+        )
+        assert hub_ts_ip in after, (
+            f"revoking spokeB took the hub ({hub_ts_ip}) off the tunnel too: {after}"
+        )
+
+        # And the tunnel itself, not only the coordination server's bookkeeping:
+        # spokeA is still on it, so its peer list is where a node that was
+        # really removed disappears from. Polled — Headscale pushes the map
+        # update, but not synchronously with the REST call above.
+        #
+        # Written as two commands rather than `! tailscale status | grep`: in a
+        # pipeline the negation applies to `grep`'s status alone, so a
+        # `tailscale` that failed outright would pass this as "the peer is
+        # gone". The redirect makes tailscale's own success a precondition.
+        spokeA.wait_until_succeeds(
+            "tailscale status --json > /tmp/ts-status.json && "
+            f"! grep -q '{spokeB_ts_ip}' /tmp/ts-status.json",
+            timeout=120,
+        )
+
+        # Idempotent, and through a branch the earlier revoke did not reach:
+        # the user is gone *and* so is the node. This is the retry
+        # `half_completed_revoke_message` tells an operator to run.
+        hub.succeed(
+            "wayfinder-ctl --connect 127.0.0.1:7700 "
+            "--identity /var/lib/wayfinder/identity.seed "
+            "--cert /var/lib/wayfinder/node.cert "
+            f"provider vpn revoke --mac {spokeB_mac}"
         )
   '';
 }

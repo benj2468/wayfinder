@@ -12,10 +12,19 @@
 //! It exists because the parts of this client that can be wrong are exactly the
 //! parts a mock cannot catch: whether `user` is a name or a numeric id, whether
 //! an id arrives as a string or a number, whether deleting a user takes its
-//! nodes and unspent keys with it. The unit tests cover the logic above the
-//! wire; this covers the wire. `nix/tests/ca-provider.nix` runs the same shape
-//! of check against a Headscale started by the NixOS module, which is what
-//! guards the version the deployment actually pins.
+//! unspent keys with it. The unit tests cover the logic above the wire; this
+//! covers the wire. `nix/tests/ca-provider.nix` runs the same shape of check
+//! against a Headscale started by the NixOS module, which is what guards the
+//! version the deployment actually pins.
+//!
+//! What it cannot cover, no matter which live server it is pointed at: anything
+//! needing a node to have *registered*. That takes a real `tailscaled`, which a
+//! cargo test has no way to bring up. This file used to claim it checked
+//! "whether deleting a user takes its nodes with it" — it does not, and the
+//! answer turned out to be no for exactly the nodes this system creates (#27:
+//! a tagged node belongs to the synthetic `tagged-devices` user, not to its
+//! MAC's). `nix/tests/vpn-data-plane.nix` is where a registered node is
+//! revoked.
 
 // Panicking on a failed assertion *is* the reporting mechanism in a test, and
 // every other integration test in this workspace opts out the same way.
@@ -83,14 +92,21 @@ async fn mints_revokes_and_is_idempotent() {
     // in `src/vpn.rs`, against a byte-accurate capture of this server's node
     // representation. That gap is how a dead correlation shipped: every live
     // assertion here passed while `vpn list` could not name a single peer.
+    //
+    // The same gap swallowed #27 a second time, one call further on: `revoke`
+    // below removes a user that owns no node, so the case that was broken —
+    // deleting a node that really registered — is never reached. Twice now, so
+    // treat a green run of this file as evidence about the *wire format* only,
+    // never about what happens to a node.
     let peers = vpn.peers().await.expect("listing peers");
     assert!(
         peers.iter().all(|p| p.mac != Some(mac)),
         "no node has registered yet"
     );
 
-    // Revoking removes the registration, and revoking again succeeds — the
-    // idempotence the half-completed-revoke retry path depends on.
+    // Revoking removes the user and its unspent keys, and revoking again
+    // succeeds — the idempotence the half-completed-revoke retry path depends
+    // on. Not the node half: see above.
     vpn.revoke(mac).await.expect("first revoke");
     vpn.revoke(mac)
         .await
