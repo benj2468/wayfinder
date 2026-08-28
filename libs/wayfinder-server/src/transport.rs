@@ -1801,6 +1801,7 @@ mod tests {
             num_originators: 7,
             auth_locked: false,
             runtime_config_active: false,
+            clock_trusted: true,
         })
     }
 
@@ -3198,6 +3199,7 @@ mod tests {
             num_originators: 1,
             auth_locked: false,
             runtime_config_active: false,
+            clock_trusted: true,
         });
         let (mut client, server) = spawn_authenticated_server_answering(key, ctx, big);
 

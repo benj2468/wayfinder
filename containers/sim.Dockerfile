@@ -171,6 +171,15 @@ cat >> "$CFG" <<YAML
 # survives \`topology.py restart\`. Under /var/lib rather than /secrets because
 # the node writes it and /secrets is mounted read-only.
 runtime_state_path: /var/lib/wayfinder/runtime.json
+# This is the "isolated lab" posture the setting's own doc names. Two reasons,
+# and either alone would be enough: the sim's containers do not run a time
+# daemon, and Docker's default seccomp profile denies \`adjtimex\` without
+# CAP_SYS_TIME, so the node could not read a verdict even if one existed.
+# Leaving enforcement on would refuse every enrolment and dashboard sign-in in
+# the sim, which is most of what the sim exists to exercise. Routing is
+# unaffected either way -- the router keeps a best-effort clock -- so this only
+# affects the credential paths.
+require_time_sync: false
 YAML
 
 # Provider (certificate-authority) node: it alone holds the mesh root seed

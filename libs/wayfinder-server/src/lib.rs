@@ -154,6 +154,39 @@ pub use settings::SettingsStore;
 #[cfg(feature = "std")]
 mod persistence;
 
+/// Whether the host's system clock is disciplined enough to make credential
+/// decisions with — the gate that keeps a plausible-but-wrong clock from
+/// minting or accepting dated credentials.
+#[cfg(feature = "std")]
+mod clock_trust;
+#[cfg(feature = "std")]
+pub use clock_trust::ClockSync;
+#[cfg(feature = "std")]
+pub use clock_trust::ClockTrust;
+#[cfg(feature = "std")]
+pub use clock_trust::DEFAULT_MAX_CLOCK_ERROR_US;
+/// Ask the host what it thinks of its own clock, under the given policy.
+///
+/// Re-exported under a qualified name because `read` alone says nothing at a
+/// call site in another crate.
+#[cfg(feature = "std")]
+pub use clock_trust::read as clock_sync;
+/// The host's wall clock in unix seconds, or zero if it reads before 2025.
+///
+/// The plausibility floor on its own, without the NTP trust gate — for the
+/// router's certificate-validity clock, which must stay best-effort rather than
+/// fail closed (see `Driver::refresh_auth_clock`). Exported so there is exactly
+/// one definition of "plausible" across the crates that read the host clock.
+#[cfg(feature = "std")]
+pub fn host_unix_now() -> u64 {
+    authority::plausible_or_zero(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or(0),
+    )
+}
+
 #[cfg(feature = "std")]
 mod authority;
 #[cfg(feature = "std")]

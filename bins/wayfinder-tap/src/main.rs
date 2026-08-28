@@ -202,6 +202,57 @@ fn load_or_generate_seed(path: &str) -> anyhow::Result<[u8; 32]> {
 /// the failure a client can act on.
 const AUTHORITY_QUEUE_DEPTH: usize = 16;
 
+/// Say, at startup, whether this node's clock is trusted and what follows from
+/// it.
+///
+/// Worth a dedicated line because the failure it describes is otherwise
+/// invisible in the right way to be maximally confusing: routing comes up, the
+/// node looks healthy, and enrollment and logins fail with what read like
+/// unrelated errors. An operator should be able to find the cause in the first
+/// screen of logs.
+fn report_clock_posture(require_time_sync: bool, sync: wayfinder_server::ClockSync) {
+    use wayfinder_server::ClockSync;
+    match sync {
+        ClockSync::Synchronized { max_error_us } => tracing::info!(
+            max_error_us,
+            "system clock is disciplined; credential operations enabled"
+        ),
+        // Not an `error!`: the node is working as configured and an operator
+        // who turned the gate off does not need to be told again every restart.
+        ClockSync::Unsupported if !require_time_sync => tracing::warn!(
+            "clock-sync enforcement is disabled (require_time_sync = false); this node will \
+             issue and accept credentials against an unverified clock"
+        ),
+        ClockSync::Unsupported => tracing::warn!(
+            "this platform exposes no NTP status, so require_time_sync cannot be enforced \
+             here; credentials will be issued and accepted against an unverified clock"
+        ),
+        // `error!` is right by CLAUDE.md's rule: a misconfiguration of *this*
+        // node that an operator must act on, not reachable by remote input.
+        ClockSync::Unreadable { errno } => tracing::error!(
+            errno,
+            "could not read the host's NTP status at all; refusing every credential \
+             operation. This is not a missing time daemon -- the syscall itself failed. \
+             The usual cause is a sandbox denying `adjtimex` (Docker's default seccomp \
+             profile without CAP_SYS_TIME, or a systemd SystemCallFilter without @clock)"
+        ),
+        ClockSync::Unsynchronized => tracing::error!(
+            "system clock is not disciplined (no NTP sync); refusing every credential \
+             operation until it is. The node still routes. Start chronyd, or set \
+             require_time_sync = false to accept an unverified clock"
+        ),
+        ClockSync::ErrorTooLarge {
+            max_error_us,
+            bound_us,
+        } => tracing::error!(
+            max_error_us,
+            bound_us,
+            "system clock's estimated error exceeds max_clock_error_us; refusing every \
+             credential operation until it converges. The node still routes"
+        ),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // `wayfinder-log`'s stack rather than a bare `tracing_subscriber::fmt`, so
@@ -564,6 +615,18 @@ async fn main() -> anyhow::Result<()> {
         names,
         query_rx,
     );
+    // Where certificate-validity time comes from. Applied before anything can
+    // make a dated decision, and reported at startup either way: an operator
+    // whose node is silently refusing to issue certificates must be able to see
+    // *why* in the first screen of logs rather than inferring it from the
+    // refusals.
+    let clock_trust = wayfinder_server::ClockTrust::from_settings(
+        config.require_time_sync,
+        config.max_clock_error_us,
+    );
+    driver.set_clock_trust(clock_trust);
+    report_clock_posture(config.require_time_sync, driver.clock_sync());
+
     // Give the driver the receiver the TLS server snapshots authorization state
     // over (no-op when no TLS server is configured).
     if let Some(rx) = auth_snapshot_rx {
@@ -711,14 +774,29 @@ async fn main() -> anyhow::Result<()> {
                     provider_cfg.root_seed_path
                 )
             })?;
-        let ca = CertAuthority::from_config(&root_seed, &provider_cfg)
+        let mut ca = CertAuthority::from_config(&root_seed, &provider_cfg)
             .map_err(|e| anyhow!("failed to load certificate-authority state: {e}"))?;
+        // The authority reads the same clock under the same policy as the
+        // router. Two components disagreeing about whether time is trustworthy
+        // is how a node signs a certificate it will then refuse to verify.
+        ca.set_clock(wayfinder_server::Clock::System(clock_trust));
         // The posture is worth an operator's attention at startup, and it is
         // read back off the authority rather than off the config: a persisted
         // runtime override wins over the YAML, so the config alone can say the
         // wrong thing. `auto_approve` means this node signs a membership
         // certificate for whoever asks (subject to the token, if one is set);
         // off means requests queue for approval.
+        // Read off the authority, not the driver: this is the clock the CA
+        // will actually sign against, and a provider that cannot sign is worth
+        // saying so beside the posture it would have signed under.
+        let ca_clock = ca.clock_sync();
+        if !ca_clock.is_trusted() {
+            tracing::error!(
+                state = ca_clock.name(),
+                "certificate authority has no trusted clock; every issuing path will \
+                 refuse until it does"
+            );
+        }
         let policy = ca.enrollment_policy();
         tracing::info!(
             auto_approve = policy.auto_approve,

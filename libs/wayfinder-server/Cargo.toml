@@ -35,6 +35,9 @@ std = [
     "dep:rand",
     "dep:reqwest",
     "dep:url",
+    # Linux-only in practice: the dependency is target-gated, so this is a no-op
+    # on every other host and `clock_trust` reports `Unsupported` there.
+    "dep:libc",
 ]
 # The `no_std` + `alloc` embedded management transport: length-delimited request
 # framing over an `embedded-io-async` byte stream (`framing`) and the
@@ -121,6 +124,12 @@ url = { version = "2", optional = true }
 # uses to hand a decoded request to the router loop and await its response.
 embedded-io-async = { workspace = true, optional = true }
 embassy-sync = { workspace = true, optional = true }
+
+# `ntp_adjtime`, for reading whether the host clock is disciplined (see
+# `clock_trust.rs`). Linux-only because the status word is: every other target
+# reports `ClockSync::Unsupported` and links none of this.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true, optional = true }
 
 [dev-dependencies]
 # `test-util` for the paused clock: the handshake-timeout test would otherwise

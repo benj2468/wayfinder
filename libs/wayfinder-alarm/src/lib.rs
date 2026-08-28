@@ -172,6 +172,15 @@ pub enum AlarmKind {
     /// A bounded table is at capacity and evicting, so the node is now
     /// forgetting state it would otherwise have kept.
     TableSaturation,
+    /// The host's system clock is not disciplined, so this node refuses every
+    /// credential decision that depends on knowing the time.
+    ///
+    /// Latched rather than momentary: it stays wrong until someone fixes NTP,
+    /// and an operator who sees only the downstream refusals — a certificate
+    /// that will not issue, a login that will not complete — debugs the wrong
+    /// thing. The node keeps routing, which is exactly why this needs saying
+    /// out loud: it looks healthy.
+    ClockUnsynchronized,
 }
 
 impl AlarmKind {
@@ -187,6 +196,7 @@ impl AlarmKind {
             Self::RevokedPeer => 5,
             Self::LinkErrors => 6,
             Self::TableSaturation => 7,
+            Self::ClockUnsynchronized => 8,
         }
     }
 
@@ -202,6 +212,7 @@ impl AlarmKind {
             Self::RevokedPeer => "revoked_peer",
             Self::LinkErrors => "link_errors",
             Self::TableSaturation => "table_saturation",
+            Self::ClockUnsynchronized => "clock_unsynchronized",
         }
     }
 }

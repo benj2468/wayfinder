@@ -418,6 +418,28 @@ in
         KERNEL=="tun", GROUP="wayfinder", MODE="0660", OPTIONS+="static_node=net/tun"
       '';
 
+      # A wayfinder node makes credential decisions against the wall clock —
+      # certificate validity windows, invitation expiry, lockouts, revocation
+      # enforcement, TOTP steps — and refuses all of them while the clock is
+      # undisciplined (`require_time_sync`, on by default). So the node needs a
+      # time daemon, and it needs one that behaves on the deployments this
+      # module targets.
+      #
+      # chrony rather than NixOS's default systemd-timesyncd because the node
+      # reads the kernel's `maxerror` as a real error bound (see
+      # `clock_trust.rs`). chronyd writes its measured root dispersion there;
+      # systemd-timesyncd writes zero on every successful sync and tracks no
+      # dispersion at all, so under it `max_clock_error_us` would degrade into a
+      # stopwatch on time-since-last-poll rather than a bound on error. chrony
+      # also keeps disciplining across a network partition rather than giving
+      # up, which is the ordinary condition of a mesh node.
+      #
+      # `mkDefault` so an operator who has their own time setup (a GPS-backed
+      # local stratum-1, say, which a genuinely offline mesh would need) can
+      # replace it without fighting the module.
+      services.chrony.enable = lib.mkDefault true;
+      services.timesyncd.enable = lib.mkDefault false;
+
       systemd.tmpfiles.settings = {
         "10-wayfinder" = {
           "/var/lib/wayfinder" = {
@@ -500,6 +522,19 @@ in
                 "@system-service"
                 "~@privileged"
                 "~@resources"
+                # `adjtimex` is how the node asks whether its clock is
+                # disciplined (see `clock_trust.rs`). It lives in `@clock`,
+                # which `@system-service` does not include and `~@privileged`
+                # subtracts again -- so without this the very first call, in
+                # `Driver::new`, is answered with SIGSYS and the node
+                # crash-loops on `Restart = "always"` with no log line
+                # mentioning clocks. Re-added by name rather than by unmasking
+                # `@clock` wholesale, because the node only ever *reads* the
+                # status word: `clock_settime`/`settimeofday` stay denied, so
+                # this cannot become a node that disciplines the host clock.
+                "adjtimex"
+                "clock_adjtime"
+                "clock_adjtime64"
               ];
               # `ProtectSystem = "strict"` makes the whole filesystem
               # read-only, so the two places the node legitimately writes have

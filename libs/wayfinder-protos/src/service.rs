@@ -608,6 +608,9 @@ pub enum AlarmKindData {
     LinkErrors,
     /// A bounded table at capacity and evicting.
     TableSaturation,
+    /// The host's system clock is not disciplined, so the node refuses every
+    /// credential decision that depends on knowing the time.
+    ClockUnsynchronized,
 }
 
 /// Who or what an alarm is about.
@@ -723,6 +726,18 @@ pub trait RouterReads {
     /// applied via [`set_config`](WayfinderDataProvider::set_config), as
     /// opposed to running purely off its startup configuration.
     fn runtime_config_active(&self) -> bool;
+
+    /// Whether this node will currently make a credential decision against its
+    /// clock.
+    ///
+    /// Required rather than defaulted, deliberately. A defaulted `true` on a
+    /// security posture means the next implementor to forget it silently claims
+    /// a protection it does not have, and the compiler says nothing -- which is
+    /// exactly what happened to the web dashboard's mock while this was
+    /// defaulted. An implementor with no clock policy to report (an embedded
+    /// node, whose time comes from elsewhere entirely) returns `true`
+    /// explicitly, and says so.
+    fn clock_trusted(&self) -> bool;
 
     /// Recent log records from this node's bounded in-memory ring, from
     /// `since_seq` onward and at most `max_records` of them (0 meaning the
@@ -1361,6 +1376,7 @@ fn proto_alarm_kind(kind: AlarmKindData) -> AlarmKind {
         AlarmKindData::RevokedPeer => AlarmKind::RevokedPeer,
         AlarmKindData::LinkErrors => AlarmKind::LinkErrors,
         AlarmKindData::TableSaturation => AlarmKind::TableSaturation,
+        AlarmKindData::ClockUnsynchronized => AlarmKind::ClockUnsynchronized,
     }
 }
 
@@ -1483,6 +1499,7 @@ pub fn handle_router_read<P: RouterReads + ?Sized>(
             num_originators: provider.num_originators(),
             auth_locked: provider.auth_locked(),
             runtime_config_active: provider.runtime_config_active(),
+            clock_trusted: provider.clock_trusted(),
         }),
         Some(RequestKind::GetRoutingTable(_)) => {
             let entries = provider
@@ -2304,6 +2321,10 @@ mod tests {
 
         fn runtime_config_active(&self) -> bool {
             self.runtime_config_active
+        }
+
+        fn clock_trusted(&self) -> bool {
+            true
         }
 
         fn alarms(&self) -> AlarmsData {

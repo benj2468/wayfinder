@@ -60,6 +60,7 @@ fn seeded_snapshot() -> NodeSnapshot {
             num_originators: 2,
             auth_locked: false,
             runtime_config_active: false,
+            clock_trusted: true,
         }),
         ..Default::default()
     };

@@ -304,14 +304,24 @@ fn render_tabs(frame: &mut Frame, app: &App, area: Rect) {
 fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
-    let (node_id, num_orig, locked) = match &app.snapshot.node_info {
+    let (node_id, num_orig, locked, clock) = match &app.snapshot.node_info {
         Some(info) => (
             format_id(&info.node_id),
             info.num_originators.to_string(),
             if info.auth_locked { "yes" } else { "no" }.to_string(),
+            // "trusted", not "synchronized": the flag is true whenever the
+            // node will act on its clock, which includes a node whose operator
+            // turned enforcement off. Claiming synchronisation there would be
+            // a lie about a security posture.
+            if info.clock_trusted {
+                "trusted".to_string()
+            } else {
+                "NOT SYNCHRONIZED".to_string()
+            },
         ),
         None => (
             "(waiting for data)".to_string(),
+            "—".to_string(),
             "—".to_string(),
             "—".to_string(),
         ),
@@ -320,6 +330,7 @@ fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
     lines.push(field("Node ID", &node_id));
     lines.push(field("Originators", &num_orig));
     lines.push(field("Locked", &locked));
+    lines.push(field("Clock", &clock));
     lines.push(field(
         "Routing entries",
         &app.snapshot.routing.entries.len().to_string(),
@@ -505,6 +516,7 @@ fn alarm_kind_name(kind: i32) -> &'static str {
         Ok(AlarmKind::RevokedPeer) => "revoked_peer",
         Ok(AlarmKind::LinkErrors) => "link_errors",
         Ok(AlarmKind::TableSaturation) => "table_saturation",
+        Ok(AlarmKind::ClockUnsynchronized) => "clock_unsynchronized",
         // A node newer than this build, holding a condition it has no name for.
         // Shown as unknown rather than dropped: an alarm this client cannot name
         // is still an alarm.

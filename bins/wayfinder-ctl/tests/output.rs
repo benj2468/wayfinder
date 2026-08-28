@@ -20,12 +20,20 @@ fn node_info_human_renders_mac_and_count() {
         num_originators: 3,
         auth_locked: true,
         runtime_config_active: true,
+        clock_trusted: false,
     };
     let human = output::node_info(&v, OutputFormat::Human).unwrap();
     assert!(human.contains("aa:bb:cc:dd:ee:01"), "got: {human}");
     assert!(human.contains("originators: 3"), "got: {human}");
     assert!(human.contains("locked: yes"), "got: {human}");
     assert!(human.contains("runtime config: yes"), "got: {human}");
+    // An untrusted clock has to say what it *means*, not just report a flag:
+    // whoever is reading this is most likely here because something failed.
+    assert!(human.contains("NOT SYNCHRONIZED"), "got: {human}");
+    assert!(
+        human.contains("credential operations refused"),
+        "got: {human}"
+    );
 }
 
 #[test]
@@ -35,6 +43,7 @@ fn node_info_json_is_valid_and_complete() {
         num_originators: 3,
         auth_locked: true,
         runtime_config_active: true,
+        clock_trusted: true,
     };
     let json = output::node_info(&v, OutputFormat::Json).unwrap();
     // Parse it back to confirm it is well-formed JSON with the expected fields.

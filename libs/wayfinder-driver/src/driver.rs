@@ -21,6 +21,7 @@ use std::time::Instant;
 use futures::FutureExt;
 use futures::future::select_all;
 use tokio::sync::RwLock;
+use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::trace;
 use tracing::warn;
@@ -39,6 +40,7 @@ use wayfinder_protos::service::handle_router;
 use wayfinder_protos::service::handle_unowned;
 use wayfinder_server::AuthSnapshot;
 use wayfinder_server::AuthSnapshotRx;
+use wayfinder_server::ClockTrust;
 use wayfinder_server::QueryRx;
 use wayfinder_server::RouterAdapter;
 use wayfinder_server::SettingsFile;
@@ -50,6 +52,125 @@ use wayfinder::link::LinkT;
 
 use crate::snoop::McastSnooper;
 use crate::transport::FrameIo;
+
+/// Where the driver's certificate-validity clock comes from.
+///
+/// Two variants because production and tests want opposite things from a clock,
+/// and the old single mechanism gave production the test's answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthClock {
+    /// Read the host's wall clock at the moment it is needed, floored by
+    /// `MIN_PLAUSIBLE_UNIX`.
+    ///
+    /// What a real node runs on, and it deliberately **ignores** the loop's
+    /// elapsed offset. The previous scheme was `epoch + elapsed` with `epoch`
+    /// sampled once in [`Driver::new`], so a node that booted before NTP
+    /// reached it captured a wrong epoch and carried it for the rest of its
+    /// life: a later `chronyd` step-correct never reached the router, and every
+    /// certificate-validity check stayed offset by the original error. A clock
+    /// that never consults a stored epoch cannot go stale that way.
+    ///
+    /// **Deliberately not gated on the NTP verdict.** This clock feeds the
+    /// router's own `OgmAuth`, which judges every peer certificate's validity
+    /// window against it. Handing it the fail-closed zero would make
+    /// `verify_cert` return `NotYetValid` for every certificate ever issued, so
+    /// an authenticated mesh would verify no peer and be verified by none —
+    /// a total partition, and precisely the self-inflicted outage this feature
+    /// exists to avoid. The gate belongs on *credential decisions*
+    /// ([`Driver::credential_unix`]), not on the router's view of time.
+    Host,
+    /// `epoch + the loop's elapsed time`, in unix seconds.
+    ///
+    /// What a test drives, and why [`Host`](Self::Host) is an added variant
+    /// rather than a replacement: pinning the epoch and stepping the loop's
+    /// `now` is how the suite exercises certificate expiry faster than real
+    /// time. Set by [`Driver::set_epoch_unix`].
+    Epoch(u64),
+}
+
+impl AuthClock {
+    /// The certificate-validity time to install, given how long the loop has
+    /// been running.
+    ///
+    /// `elapsed` is consulted only by [`Epoch`](Self::Epoch) — see its and
+    /// [`Host`](Self::Host)'s doc comments for why that asymmetry is the point.
+    fn now_unix(self, elapsed: Duration) -> u64 {
+        match self {
+            Self::Epoch(epoch) => epoch.saturating_add(elapsed.as_secs()),
+            // One shared definition of "plausible" with the authority's
+            // `Clock::System`, rather than a second host-clock read here with a
+            // different floor.
+            Self::Host => wayfinder_server::host_unix_now(),
+        }
+    }
+}
+
+/// How often the host's NTP status word is re-read.
+///
+/// `refresh_auth_clock` runs on every frame, and `ntp_adjtime` is a syscall —
+/// consulting it per frame would put a syscall on the data path to answer a
+/// question whose answer changes on the order of minutes. Ten seconds is far
+/// below any credential lifetime and far above the frame rate.
+const CLOCK_RECHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The certificate-validity time at loop instant `now`, expressed as the offset
+/// [`RouterAdapter::with_epoch_unix`] wants — it adds the loop's `now` back on,
+/// so what it needs is `absolute - now`.
+///
+/// The adapter's `epoch + now` shape predates the clock being read live and is
+/// still right *for the adapter*, whose metrics are all stamped at one `now`;
+/// only the source of the absolute time changed.
+///
+/// A free function rather than a method so it can be called while the router is
+/// borrowed mutably out of the same struct.
+/// The time a **credential decision** may be made against: the host clock, or
+/// zero — the sentinel every credential path refuses on — while `trusted` is
+/// false.
+///
+/// Distinct from [`AuthClock::now_unix`], which is the router's own view of
+/// time and is deliberately never gated. See [`AuthClock::Host`] for why gating
+/// that one partitions an authenticated mesh.
+fn credential_unix(clock: AuthClock, trusted: bool, now: Duration) -> u64 {
+    if trusted { clock.now_unix(now) } else { 0 }
+}
+
+fn epoch_offset(clock: AuthClock, trusted: bool, now: Duration) -> Duration {
+    if !trusted {
+        // Fail closed, deliberately. The adapter recovers `epoch + now`, so a
+        // zero offset makes its `unix_now()` the loop's monotonic `now` — a few
+        // seconds past 1970, which precedes every real certificate's
+        // `not_before`, so a `SetAuth` install is refused as not-yet-valid.
+        // There is no offset that recovers an exact zero, so this is the
+        // fail-closed value rather than the sentinel itself; do not "fix" the
+        // saturation below into something that produces a plausible time.
+        return Duration::ZERO;
+    }
+    Duration::from_secs(credential_unix(clock, trusted, now)).saturating_sub(now)
+}
+
+/// Whether the host clock is currently trusted, from the driver's cached
+/// verdict — the same answer its auth clock acted on, which is the point.
+///
+/// `true` before the first check has happened, and for an [`AuthClock::Epoch`],
+/// which is a value its caller chose rather than a host reading. In practice
+/// the cache is always populated by the time a management query is served:
+/// `refresh_auth_clock` runs ahead of every request-handling path.
+///
+/// A free function for the same reason [`epoch_offset`] is — it is called while
+/// the router is borrowed mutably out of the same struct.
+fn clock_trusted(clock: AuthClock, checked: Option<(bool, Duration)>) -> bool {
+    match clock {
+        AuthClock::Epoch(_) => true,
+        // `false` until the first check, not `true`: this field's whole job is
+        // to not overstate the node's posture, and "we have not established
+        // trust yet" is honestly reported as untrusted. Every path that serves
+        // a management query calls `refresh_auth_clock` first, so in practice
+        // the cache is already populated — but that is an ordering convention,
+        // and guessing `true` when it is broken is the one answer this field
+        // must never give.
+        AuthClock::Host => checked.is_some_and(|(trusted, _)| trusted),
+    }
+}
 
 /// One frame to put on the mesh, plus how to fan it out.  The owned,
 /// `std`-side counterpart to [`wayfinder_driver_core::OutgoingFrame`] (whose
@@ -139,13 +260,37 @@ pub struct Driver<Local: FrameIo> {
     snooper: McastSnooper,
     /// Reference instant for periodic-broadcast timing.
     start: Instant,
-    /// Wall-clock unix time corresponding to `now == 0` (the `start`
-    /// instant).  The auth clock is then `epoch_unix + now`, so it advances
-    /// with the loop's `now` rather than reading the wall clock each tick — which
-    /// lets a test drive certificate-validity time forward (faster than real
-    /// time) via the `now` it already controls.  Defaults to the wall clock at
-    /// construction; override with [`set_epoch_unix`](Self::set_epoch_unix).
-    epoch_unix: Duration,
+    /// Where certificate-validity time comes from.
+    ///
+    /// Defaults to [`AuthClock::Host`], which reads the wall clock live. A test
+    /// swaps in [`AuthClock::Epoch`] via
+    /// [`set_epoch_unix`](Self::set_epoch_unix) to drive expiry
+    /// deterministically.
+    clock: AuthClock,
+    /// Whether the host's clock is disciplined enough to make a *credential*
+    /// decision against — separate from [`clock`](Self::clock), which is where
+    /// time comes from. Kept apart because the two questions have different
+    /// answers and different blast radii: an undisciplined clock must not stop
+    /// the router judging routes, but must stop it installing a certificate.
+    clock_trust: ClockTrust,
+    /// The last NTP verdict and the loop instant it was taken at, so the status
+    /// word is read on [`CLOCK_RECHECK_INTERVAL`] rather than once per frame.
+    /// `None` until the first check.
+    clock_checked: Option<(bool, Duration)>,
+    /// The verdict above, republished for the management *reads* that no longer
+    /// run on this loop.
+    ///
+    /// `GetNodeInfo` reports `clock_trusted`, and it is a `RouterRead` — so on a
+    /// node with a [`RouterHandle`](wayfinder_server::RouterHandle) wired it is
+    /// answered on a connection task that cannot see these fields at all. A
+    /// `watch` for the same reason the enrollment policy is one: the reader must
+    /// never await this loop, and this loop must never await the reader.
+    ///
+    /// Publishing it rather than recomputing it on the read side is the point.
+    /// The posture a client is shown has to be the one the driver's auth clock
+    /// actually acted on; two implementations of "is the clock trusted" is
+    /// precisely how those drift apart without anything failing.
+    clock_trusted_tx: watch::Sender<bool>,
     /// Everything exchanged with a certificate-authority task that does not
     /// share this loop: the clock and auth-present state this loop publishes,
     /// and the enrollment policy and signed revocations it receives back.
@@ -184,9 +329,12 @@ impl<Local: FrameIo> Driver<Local> {
         names: Vec<String>,
         query_rx: QueryRx,
     ) -> Self {
-        let epoch_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO);
+        // Gated on the host's NTP verdict by default: a node whose clock
+        // nothing is disciplining reports zero rather than a plausible wrong
+        // time, and every certificate-validity check refuses on that sentinel.
+        // `wayfinder-tap` overrides the policy from config.
+        let clock = AuthClock::Host;
+        let clock_trust = ClockTrust::default();
         let mut router = CentralRouter::new(mac);
         // Install each interface's adaptive OGM schedule and participation
         // features up front so the periodic loop and the egress gates have a
@@ -231,8 +379,15 @@ impl<Local: FrameIo> Driver<Local> {
             mac,
             snooper: McastSnooper::new(),
             start: Instant::now(),
-            epoch_unix,
-            authority: wayfinder_server::AuthorityComms::new(epoch_unix.as_secs()),
+            clock,
+            clock_trust,
+            clock_checked: None,
+            // `false`, not `true`: no check has happened yet, and this field's
+            // whole job is to not overstate the node's posture. The first
+            // `refresh_auth_clock` — which runs ahead of every path that serves
+            // a request — replaces it with a real verdict.
+            clock_trusted_tx: watch::Sender::new(false),
+            authority: wayfinder_server::AuthorityComms::new(clock.now_unix(Duration::ZERO)),
             rx_buffer: [0u8; MAX_LINK_FRAME_LEN],
             tx_buffer: [0u8; MAX_LINK_FRAME_LEN],
             settings: None,
@@ -294,15 +449,86 @@ impl<Local: FrameIo> Driver<Local> {
     /// `epoch + now`.  Tests set this to a fixed value and drive `now` forward to
     /// exercise expiry deterministically, faster than real time.
     pub fn set_epoch_unix(&mut self, epoch_unix: Duration) {
-        self.epoch_unix = epoch_unix;
+        self.clock = AuthClock::Epoch(epoch_unix.as_secs());
+        self.clock_checked = None;
+        self.publish_clock_trust();
         // Re-seed, or a subscriber that reads before the next loop iteration
         // sees the wall-clock seed this driver was built with rather than the
         // virtual epoch a test just set.
         self.authority
-            .set_clock(epoch_unix.saturating_add(self.start.elapsed()).as_secs());
+            .set_clock(self.clock.now_unix(self.start.elapsed()));
     }
 
-    /// Advance the certificate-validity clock to `epoch_unix + now` and
+    /// Choose where certificate-validity time comes from.
+    ///
+    /// `wayfinder-tap` calls this to apply the operator's `require_time_sync` /
+    /// `max_clock_error_us` settings; everything else wants the default.
+    pub fn set_clock_trust(&mut self, trust: ClockTrust) {
+        self.clock_trust = trust;
+        // A cached verdict was taken under the old policy and says nothing
+        // about the new one.
+        self.clock_checked = None;
+        self.publish_clock_trust();
+    }
+
+    /// What the host says about this node's clock, for the alarm and the
+    /// operator-facing projection.
+    #[must_use]
+    pub fn clock_sync(&self) -> wayfinder_server::ClockSync {
+        match self.clock {
+            AuthClock::Host => wayfinder_server::clock_sync(self.clock_trust),
+            // A pinned epoch is a value its caller chose; there is nothing to
+            // ask the host about.
+            AuthClock::Epoch(_) => wayfinder_server::ClockSync::Unsupported,
+        }
+    }
+
+    /// Refresh the cached NTP verdict, at most once per
+    /// [`CLOCK_RECHECK_INTERVAL`], and report whether the clock is trusted.
+    ///
+    /// The verdict is cached because this runs once per turn of the driver loop
+    /// — so on a busy node, per frame — and `ntp_adjtime` is a real syscall,
+    /// unlike the vDSO wall-clock read beside it. Its answer changes on the
+    /// order of minutes.
+    ///
+    /// Each refresh that finds the clock untrusted raises an alarm. The board
+    /// coalesces it into one latched row, so a node that has been
+    /// unsynchronised for an hour reports one condition rather than a flood.
+    fn refresh_clock_trust(&mut self, now: Duration) -> bool {
+        if let AuthClock::Epoch(_) = self.clock {
+            // A pinned epoch is a value its caller chose; there is no host
+            // verdict to seek and nothing to warn about.
+            return true;
+        }
+        if let Some((trusted, at)) = self.clock_checked
+            && now.saturating_sub(at) < CLOCK_RECHECK_INTERVAL
+        {
+            return trusted;
+        }
+        let sync = wayfinder_server::clock_sync(self.clock_trust);
+        self.clock_checked = Some((sync.is_trusted(), now));
+        if !sync.is_trusted() {
+            wayfinder_alarm::alarm!(
+                wayfinder_alarm::Severity::Warning,
+                wayfinder_alarm::AlarmKind::ClockUnsynchronized,
+                wayfinder_alarm::Subject::None,
+                "state={}",
+                sync.name()
+            );
+        }
+        sync.is_trusted()
+    }
+
+    /// Republish the clock-trust verdict for readers off this loop.
+    ///
+    /// Goes through the same [`clock_trusted`] free function the on-loop adapter
+    /// uses, so the two paths cannot answer the same question differently.
+    fn publish_clock_trust(&self) {
+        self.clock_trusted_tx
+            .send_replace(clock_trusted(self.clock, self.clock_checked));
+    }
+
+    /// Advance the certificate-validity clock to the current auth time and
     /// republish this node's auth-present state for the certificate authority.
     ///
     /// Called from every entry point that processes frames, so cert expiry
@@ -310,7 +536,18 @@ impl<Local: FrameIo> Driver<Local> {
     /// skipped when auth is disabled — both publications happen either way, and
     /// the auth-disabled case is precisely the one the authority needs told.
     async fn refresh_auth_clock(&mut self, now: Duration) {
-        let unix = self.epoch_unix.saturating_add(now);
+        // Refresh the verdict for the alarm and the reported status, but do
+        // *not* let it gate the value: the router judges every peer
+        // certificate's validity window against this clock, and handing it the
+        // fail-closed zero would reject every certificate ever issued. See
+        // `AuthClock::Host`.
+        //
+        // Ahead of the guard below, deliberately: this reads the host's NTP
+        // status and touches no router state, so there is no reason for it to
+        // happen with every management read excluded.
+        self.refresh_clock_trust(now);
+        self.publish_clock_trust();
+        let unix = Duration::from_secs(self.clock.now_unix(now));
         // A short write guard: setting the clock is a field store, and holding
         // the lock any longer than this would stall every management read for
         // no reason.
@@ -362,6 +599,7 @@ impl<Local: FrameIo> Driver<Local> {
     pub fn router_handle(&self) -> wayfinder_server::RouterHandle {
         wayfinder_server::RouterHandle::new(Arc::clone(&self.shared), self.start)
             .with_enrollment_policy(Some(self.authority.enrollment_policy_rx()))
+            .with_clock_trust(Some(self.clock_trusted_tx.subscribe()))
     }
 
     /// Run the event loop forever.
@@ -449,7 +687,12 @@ impl<Local: FrameIo> Driver<Local> {
             mac,
             snooper,
             start,
-            epoch_unix: _,
+            clock,
+            clock_trust: _,
+            clock_checked,
+            // Published by `refresh_auth_clock`, which has already run for this
+            // turn of the loop; no arm below republishes.
+            clock_trusted_tx: _,
             rx_buffer,
             tx_buffer,
             settings,
@@ -510,10 +753,18 @@ impl<Local: FrameIo> Driver<Local> {
                     // everything else arriving here is a mutation, which has to
                     // be on this task because `set_auth` writes back through the
                     // identity-seed slot beside the router.
+                    //
+                    // The clock verdict is resolved before the guard is taken:
+                    // both are `Copy` fields of this struct rather than router
+                    // state, so reading them under the write guard would widen
+                    // its scope for nothing.
+                    let clock_trusted = clock_trusted(*clock, *clock_checked);
+                    let epoch_offset = epoch_offset(*clock, clock_trusted, now);
                     let mut guard = shared.write().await;
                     let SharedRouter { router, identity_seed } = &mut *guard;
                     let mut adapter = RouterAdapter::new(router, now)
-                        .with_epoch_unix(self.epoch_unix)
+                        .with_epoch_unix(epoch_offset)
+                        .with_clock_trusted(clock_trusted)
                         .with_identity(identity_seed)
                         .with_enrollment_policy(read_enrollment_policy(enrollment_policy_rx));
                     if let Some(store) = settings.as_mut() {
@@ -548,7 +799,7 @@ impl<Local: FrameIo> Driver<Local> {
                         &mut shared.write().await.router,
                         &record,
                         now,
-                        epoch_unix_secs(self.epoch_unix, now),
+                        clock.now_unix(now),
                         ack,
                     );
                     (now, LoopOutput::none())
@@ -719,13 +970,16 @@ impl<Local: FrameIo> Driver<Local> {
                 let now = self.start.elapsed();
                 let (_, policy_rx) = self.authority.split();
                 let policy = read_enrollment_policy(policy_rx);
+                let clock_trusted = clock_trusted(self.clock, self.clock_checked);
+                let epoch_offset = epoch_offset(self.clock, clock_trusted, now);
                 let mut guard = self.shared.write().await;
                 let SharedRouter {
                     router,
                     identity_seed,
                 } = &mut *guard;
                 let mut adapter = RouterAdapter::new(router, now)
-                    .with_epoch_unix(self.epoch_unix)
+                    .with_epoch_unix(epoch_offset)
+                    .with_clock_trusted(clock_trusted)
                     .with_identity(identity_seed)
                     .with_enrollment_policy(policy);
                 if let Some(store) = self.settings.as_mut() {
@@ -748,7 +1002,7 @@ impl<Local: FrameIo> Driver<Local> {
             {
                 progressed = true;
                 let now = self.start.elapsed();
-                let now_unix = epoch_unix_secs(self.epoch_unix, now);
+                let now_unix = self.clock.now_unix(now);
                 ingest_and_report(
                     &mut self.shared.write().await.router,
                     &record,
@@ -818,14 +1072,6 @@ fn poll_due_keepalives(
     let mut out = LoopOutput::none();
     wayfinder_driver_core::poll_due_keepalives(router, now, tx_buffer, &mut out);
     out.mesh
-}
-
-/// The certificate-validity instant for `now`, as Unix seconds.
-///
-/// The same arithmetic the loop publishes to the authority, so a record is
-/// verified against the instant the authority issued it against.
-fn epoch_unix_secs(epoch_unix: Duration, now: Duration) -> u64 {
-    epoch_unix.saturating_add(now).as_secs()
 }
 
 /// Fold a revocation the authority signed into the router, so it floods across
@@ -1207,6 +1453,202 @@ mod tests {
         Mac([0, 0, 0, 0, 0, n])
     }
 
+    /// The production auth clock reads the host at the moment it is asked, and
+    /// ignores the loop's elapsed offset entirely.
+    ///
+    /// That indifference *is* the fix. The old clock was `epoch + elapsed` with
+    /// `epoch` sampled once in `Driver::new`, so a node that booted before NTP
+    /// reached it captured a wrong epoch and carried it for the rest of its
+    /// life — a later `chronyd` step-correct never reached the router, and
+    /// every certificate-validity check stayed offset by the original error. A
+    /// clock that ignores the offset cannot go stale that way.
+    #[test]
+    fn a_host_auth_clock_ignores_the_loop_offset() {
+        let clock = AuthClock::Host;
+        let host_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the test host's clock is after the epoch")
+            .as_secs();
+
+        let fresh = clock.now_unix(Duration::ZERO);
+        let after_an_hour = clock.now_unix(Duration::from_secs(3_600));
+        assert_eq!(
+            fresh, after_an_hour,
+            "a host clock must not drift with how long the loop has been running"
+        );
+        assert!(fresh.abs_diff(host_now) <= 5, "and it is the host's time");
+    }
+
+    /// An undisciplined clock must NOT gate the router's own view of time.
+    ///
+    /// This is the scope boundary, and getting it wrong partitions the mesh.
+    /// The router judges every peer certificate's validity window against this
+    /// clock; hand it the fail-closed zero and `verify_cert` returns
+    /// `NotYetValid` for every certificate ever issued, so an authenticated
+    /// node verifies no peer and is verified by none. An earlier revision of
+    /// this branch did exactly that while five operator-facing strings promised
+    /// "routing is unaffected".
+    #[tokio::test]
+    async fn an_untrusted_clock_does_not_gate_the_routers_view_of_time() {
+        let mut driver = idle_driver();
+        let (_tx, rx) = tokio::sync::mpsc::channel(4);
+        let ports = driver.attach_authority(rx);
+        driver.set_clock_trust(ClockTrust::Never);
+
+        driver.refresh_auth_clock(Duration::ZERO).await;
+
+        let host_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the test host's clock is after the epoch")
+            .as_secs();
+        let published = ports.facts.borrow().unix_secs;
+        assert!(
+            published.abs_diff(host_now) <= 5,
+            "the router keeps a usable clock even while credentials are refused: \
+             got {published}, host says {host_now}"
+        );
+    }
+
+    /// ...while a *credential* decision made at the same instant is refused.
+    ///
+    /// The other half of the boundary: the gate did not simply disappear, it
+    /// moved to the decisions that can afford to fail closed.
+    #[test]
+    fn an_untrusted_clock_does_gate_a_credential_decision() {
+        let mut driver = idle_driver();
+        driver.set_clock_trust(ClockTrust::Never);
+
+        let trusted = driver.refresh_clock_trust(Duration::ZERO);
+        assert_eq!(
+            credential_unix(driver.clock, trusted, Duration::ZERO),
+            0,
+            "a credential decision has no usable time while the clock is untrusted"
+        );
+
+        driver.set_clock_trust(ClockTrust::Assume);
+        let trusted = driver.refresh_clock_trust(Duration::ZERO);
+        assert!(
+            credential_unix(driver.clock, trusted, Duration::ZERO) > 1_700_000_000,
+            "and it recovers as soon as the clock is trusted again"
+        );
+    }
+
+    /// The reported status is `false` before the first check rather than `true`.
+    ///
+    /// A status field about a security posture must never overstate it; "not
+    /// yet established" is honestly untrusted.
+    #[test]
+    fn the_reported_clock_status_does_not_guess_before_the_first_check() {
+        assert!(!clock_trusted(AuthClock::Host, None));
+        assert!(clock_trusted(AuthClock::Epoch(1_000), None));
+    }
+
+    /// The cached verdict expires, so a clock that becomes good is picked up.
+    ///
+    /// Without this the MR would reintroduce its own bug one layer up: a node
+    /// that captured "untrusted" and never re-read would refuse credentials
+    /// forever after chronyd arrived.
+    #[test]
+    fn the_clock_verdict_cache_expires() {
+        let board = std::sync::Arc::new(wayfinder_alarm::SharedBoard::default());
+        wayfinder_alarm::with_board(&board, || {
+            let mut driver = idle_driver();
+            driver.set_clock_trust(ClockTrust::Never);
+
+            driver.refresh_clock_trust(Duration::ZERO);
+            driver.refresh_clock_trust(Duration::from_secs(5));
+            assert_eq!(
+                board.snapshot_at(0).alarms[0].count,
+                1,
+                "inside the interval the cached verdict is reused, no syscall"
+            );
+
+            driver.refresh_clock_trust(CLOCK_RECHECK_INTERVAL);
+            assert_eq!(
+                board.snapshot_at(0).alarms[0].count,
+                2,
+                "past the interval the verdict is re-read"
+            );
+        });
+    }
+
+    /// Changing the policy invalidates the cached verdict immediately, rather
+    /// than leaving the old answer standing for up to a recheck interval.
+    #[test]
+    fn changing_the_policy_invalidates_the_cached_verdict() {
+        let mut driver = idle_driver();
+        driver.set_clock_trust(ClockTrust::Never);
+        let trusted = driver.refresh_clock_trust(Duration::ZERO);
+        assert_eq!(credential_unix(driver.clock, trusted, Duration::ZERO), 0);
+
+        driver.set_clock_trust(ClockTrust::Assume);
+        let trusted = driver.refresh_clock_trust(Duration::ZERO);
+        assert!(
+            credential_unix(driver.clock, trusted, Duration::ZERO) > 1_700_000_000,
+            "a stale 'untrusted' must not outlive the policy that produced it"
+        );
+    }
+
+    /// An untrusted clock raises the alarm, on the board a `GetAlarms` reads.
+    ///
+    /// The link this whole feature turns on: routing stays up and the node
+    /// looks healthy, so without a raised condition an operator sees only
+    /// enrollment and logins failing for no stated reason. Scoped to a local
+    /// board so the assertion does not depend on what else ran in this process.
+    #[test]
+    fn an_untrusted_clock_raises_an_alarm_an_operator_can_read() {
+        let board = std::sync::Arc::new(wayfinder_alarm::SharedBoard::default());
+        wayfinder_alarm::with_board(&board, || {
+            let mut driver = idle_driver();
+            driver.set_clock_trust(ClockTrust::Never);
+
+            // Driven to completion inside the board scope, which is a
+            // thread-local around a synchronous closure. `refresh_auth_clock`
+            // only awaits an uncontended lock here, and a `#[tokio::test]`
+            // could not hold the scope across the await anyway.
+            futures::executor::block_on(driver.refresh_auth_clock(Duration::ZERO));
+
+            let raised = board.snapshot_at(0);
+            assert!(
+                raised
+                    .alarms
+                    .iter()
+                    .any(|a| a.kind == wayfinder_alarm::AlarmKind::ClockUnsynchronized),
+                "an untrusted clock must be reported, not merely acted on: {:?}",
+                raised.alarms.iter().map(|a| a.kind).collect::<Vec<_>>()
+            );
+        });
+    }
+
+    /// A trusted clock raises nothing. Pinned because an alarm that is always
+    /// present is an alarm nobody reads.
+    #[test]
+    fn a_trusted_clock_raises_nothing() {
+        let board = std::sync::Arc::new(wayfinder_alarm::SharedBoard::default());
+        wayfinder_alarm::with_board(&board, || {
+            let mut driver = idle_driver();
+            driver.set_clock_trust(ClockTrust::Assume);
+
+            // Driven to completion inside the board scope, which is a
+            // thread-local around a synchronous closure. `refresh_auth_clock`
+            // only awaits an uncontended lock here, and a `#[tokio::test]`
+            // could not hold the scope across the await anyway.
+            futures::executor::block_on(driver.refresh_auth_clock(Duration::ZERO));
+
+            assert!(board.snapshot_at(0).alarms.is_empty());
+        });
+    }
+
+    /// The epoch clock still advances with the loop, so a test can drive
+    /// certificate expiry forward faster than real time. Preserving this is why
+    /// the production clock is a separate variant rather than a replacement.
+    #[test]
+    fn an_epoch_auth_clock_advances_with_the_loop() {
+        let clock = AuthClock::Epoch(1_000);
+        assert_eq!(clock.now_unix(Duration::ZERO), 1_000);
+        assert_eq!(clock.now_unix(Duration::from_secs(500)), 1_500);
+    }
+
     /// A driver with no interfaces at all, for testing what the loop publishes.
     fn idle_driver() -> Driver<NeverIo> {
         let (_query_tx, query_rx) = tokio::sync::mpsc::channel(4);
@@ -1246,19 +1688,24 @@ mod tests {
         assert_ne!(seeded, 0, "zero is the fail-closed value, never a seed");
     }
 
-    /// The published clock is `epoch_unix + now` in whole seconds — the same
+    /// The published clock is whatever the driver's own clock says — the same
     /// instant the router verifies certificates against, so an authority
     /// issuing from it cannot drift from the router checking it.
+    ///
+    /// Pinned on an epoch clock so the assertion is arithmetic rather than a
+    /// read of the build machine's wall clock; the production `Host` variant is
+    /// covered by `a_host_auth_clock_ignores_the_loop_offset`.
     #[tokio::test]
     async fn the_published_clock_is_epoch_plus_elapsed() {
         let mut driver = idle_driver();
         let (_tx, rx) = tokio::sync::mpsc::channel(4);
         let ports = driver.attach_authority(rx);
+        driver.set_epoch_unix(Duration::from_secs(1_700_000_000));
 
         driver.refresh_auth_clock(Duration::from_secs(42)).await;
 
         let facts = *ports.facts.borrow();
-        assert_eq!(facts.unix_secs, driver.epoch_unix.as_secs() + 42);
+        assert_eq!(facts.unix_secs, 1_700_000_000 + 42);
         assert!(
             !facts.auth_present,
             "a router with no auth state must say so, or the authority signs a \
@@ -1278,6 +1725,63 @@ mod tests {
         let (_tx, rx) = tokio::sync::mpsc::channel(4);
         drop(driver.attach_authority(rx));
         driver.refresh_auth_clock(Duration::from_secs(2)).await;
+    }
+
+    /// The clock-trust posture a client is shown comes from the driver's own
+    /// verdict, even when the read is served off the loop entirely.
+    ///
+    /// `GetNodeInfo` reports `clock_trusted` and is a `RouterRead`, so on a node
+    /// with a `RouterHandle` wired it is answered on a connection task that
+    /// cannot see the driver's clock fields at all. Nothing fails if that
+    /// posture is never plumbed through: the read still succeeds, and reports
+    /// `RouterView`'s default of "trusted" — a node refusing every credential
+    /// operation while its dashboard says the clock is fine. That is the exact
+    /// failure `RouterReads::clock_trusted`'s doc comment refuses to let a
+    /// defaulted trait method cause, restated for the second read path.
+    ///
+    /// Handle taken *before* the policy is set, for the same reason
+    /// `a_handle_taken_before_attach_still_sees_the_policy` does it: a handle
+    /// that captured a value rather than a receiver passes the other order.
+    #[tokio::test]
+    async fn a_handle_served_read_reports_the_drivers_clock_verdict() {
+        let mut driver = idle_driver();
+        let handle = driver.router_handle();
+        driver.set_clock_trust(ClockTrust::Never);
+
+        // What the loop does every turn, and what publishes the verdict.
+        driver.refresh_auth_clock(Duration::ZERO).await;
+
+        assert!(
+            !handle_says_clock_trusted(&handle).await,
+            "a node refusing every credential operation reported a trusted clock \
+             on the read path"
+        );
+
+        // And the other way, so the assertion above is not passing on a
+        // constant: the same handle follows the driver's verdict when it changes.
+        driver.set_clock_trust(ClockTrust::Assume);
+        driver.refresh_auth_clock(Duration::ZERO).await;
+        assert!(handle_says_clock_trusted(&handle).await);
+    }
+
+    /// `clock_trusted` as a `GetNodeInfo` served through `handle` reports it.
+    async fn handle_says_clock_trusted(handle: &wayfinder_server::RouterHandle) -> bool {
+        let response = handle
+            .serve_read(wayfinder_protos::wayfinder::v1alpha::WayfinderRequest {
+                request: Some(
+                    wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request::GetNodeInfo(
+                        wayfinder_protos::wayfinder::v1alpha::GetNodeInfoRequest {},
+                    ),
+                ),
+            })
+            .await
+            .expect("GetNodeInfo is a router read");
+        match response.response {
+            Some(wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response::NodeInfo(
+                info,
+            )) => info.clock_trusted,
+            other => panic!("expected NodeInfo, got {other:?}"),
+        }
     }
 
     /// A `RouterHandle` taken *before* the authority attaches still observes the

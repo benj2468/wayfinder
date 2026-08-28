@@ -1420,7 +1420,7 @@ mod tests {
 
         let mut ca = authority();
         // What `CertAuthority::from_config` gives every real provider.
-        ca.set_clock(crate::Clock::System);
+        ca.set_clock(crate::Clock::System(crate::ClockTrust::Assume));
         let authority = TestAuthority::start(ca);
         // A time from the router that no assertion below will tolerate.
         authority.comms.set_clock(NOW_UNIX);

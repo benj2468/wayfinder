@@ -167,6 +167,10 @@ impl RouterReads for NodeMock {
         false
     }
 
+    fn clock_trusted(&self) -> bool {
+        true
+    }
+
     fn alarms(&self) -> AlarmsData {
         // Nothing wrong: an empty board is the node's "all systems normal", and
         // none of these cases is about alarms.

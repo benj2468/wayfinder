@@ -164,6 +164,10 @@ impl RouterReads for ProviderMock {
         false
     }
 
+    fn clock_trusted(&self) -> bool {
+        true
+    }
+
     /// Log access is served from a process-wide ring rather than from router
     /// state, so this stub reports an empty one — these tests exercise the
     /// transport and the query commands, not the log path (covered in

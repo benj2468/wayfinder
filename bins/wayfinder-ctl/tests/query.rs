@@ -141,6 +141,10 @@ impl RouterReads for Mock {
         true
     }
 
+    fn clock_trusted(&self) -> bool {
+        true
+    }
+
     /// Log access is served from a process-wide ring rather than from router
     /// state, so this stub synthesises a batch instead of consulting one — these
     /// tests exercise the transport and the query commands, not the ring itself
