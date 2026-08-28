@@ -19,6 +19,13 @@ server:
   # not load-bearing for that specific deployment.
   type: Tls
   addr: 0.0.0.0:7700
+# This node makes no credential decisions -- no `auth:` block, no `provider:` --
+# so there is nothing for the clock gate to protect, and Docker's default
+# seccomp profile denies `adjtimex` without CAP_SYS_TIME anyway. Turning
+# enforcement off keeps the node from logging a startup error about a gate that
+# is guarding nothing here. Set it back to `true` (and grant CAP_SYS_TIME, or
+# run with `seccomp:unconfined`) if you add an `auth:` or `provider:` block.
+require_time_sync: false
 links:
   # One raw-L2 mesh link (AF_PACKET, needs the container's NET_RAW cap — see
   # ../docker-compose.yml). `network_mode: host` there means `interface` names

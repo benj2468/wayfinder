@@ -291,6 +291,7 @@ pub fn alarm_title(kind: i32) -> &'static str {
         Ok(AlarmKind::RevokedPeer) => "Revoked peer still talking",
         Ok(AlarmKind::LinkErrors) => "Link errors",
         Ok(AlarmKind::TableSaturation) => "A table is full",
+        Ok(AlarmKind::ClockUnsynchronized) => "The system clock is not synchronized",
         // A node newer than this build, holding a condition it has no name for.
         // Named as unrecognised rather than hidden: a dashboard that silently
         // dropped the alarms it did not understand would report a node under
@@ -314,6 +315,7 @@ pub fn alarm_code(kind: i32) -> &'static str {
         Ok(AlarmKind::RevokedPeer) => "revoked_peer",
         Ok(AlarmKind::LinkErrors) => "link_errors",
         Ok(AlarmKind::TableSaturation) => "table_saturation",
+        Ok(AlarmKind::ClockUnsynchronized) => "clock_unsynchronized",
         _ => "unknown",
     }
 }

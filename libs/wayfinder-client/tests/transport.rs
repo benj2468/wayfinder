@@ -187,6 +187,10 @@ impl RouterReads for Mock {
         false
     }
 
+    fn clock_trusted(&self) -> bool {
+        true
+    }
+
     /// Delegates to the real process-wide ring, exactly as `RouterAdapter`
     /// does, so the end-to-end test below proves a record emitted on the server
     /// side actually reaches a client over the wire — not just that the stub's

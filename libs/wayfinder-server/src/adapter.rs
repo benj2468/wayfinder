@@ -93,6 +93,15 @@ pub struct RouterAdapter<
     >,
     epoch_unix: Duration,
     now: Duration,
+    /// Whether the host's clock is disciplined enough to make credential
+    /// decisions with, as the driver last determined.
+    ///
+    /// Injected rather than read here: this adapter is `no_std` + `alloc` and
+    /// has no host to ask, and the answer must be the *same* one the driver's
+    /// auth clock acted on. Defaults to `true`, so an embedded node — which has
+    /// no NTP status and gets its time from elsewhere — reports the state it is
+    /// actually in rather than a fabricated failure.
+    clock_trusted: bool,
     /// The enrollment policy in force, as the authority last published it, or
     /// `None` on a node that runs no authority at all.
     ///
@@ -187,6 +196,7 @@ impl<
             now,
             enrollment: None,
             epoch_unix: Duration::default(),
+            clock_trusted: true,
             settings: None,
             identity_seed: None,
         }
@@ -208,6 +218,19 @@ impl<
     /// `wayfinder-embedded-driver`'s `run_once_with_mgmt`).
     pub fn with_epoch_unix(mut self, offset: Duration) -> Self {
         self.epoch_unix = offset;
+        self
+    }
+
+    /// Tell the adapter whether the host's clock is currently trusted, so
+    /// `GetNodeInfo` can report it.
+    ///
+    /// Supplied by the same caller that supplies
+    /// [`with_epoch_unix`](Self::with_epoch_unix), and it must be the verdict
+    /// that clock was resolved under — a node reporting "clock fine" while
+    /// refusing every credential operation on the grounds that it is not would
+    /// be worse than reporting nothing.
+    pub fn with_clock_trusted(mut self, trusted: bool) -> Self {
+        self.clock_trusted = trusted;
         self
     }
 
@@ -308,6 +331,7 @@ fn alarm_kind_data(kind: wayfinder_alarm::AlarmKind) -> AlarmKindData {
         wayfinder_alarm::AlarmKind::RevokedPeer => AlarmKindData::RevokedPeer,
         wayfinder_alarm::AlarmKind::LinkErrors => AlarmKindData::LinkErrors,
         wayfinder_alarm::AlarmKind::TableSaturation => AlarmKindData::TableSaturation,
+        wayfinder_alarm::AlarmKind::ClockUnsynchronized => AlarmKindData::ClockUnsynchronized,
     }
 }
 
@@ -372,6 +396,16 @@ pub struct RouterView<
         PENDING_REPLIES,
     >,
     now: Duration,
+    /// Whether the host's clock is disciplined enough to make credential
+    /// decisions with, as the driver last determined.
+    ///
+    /// Injected for the same reason [`RouterAdapter`] injects it: this crate is
+    /// `no_std` + `alloc` and has no host to ask, and the answer must be the
+    /// *same* one the driver's auth clock acted on rather than a second opinion
+    /// formed here. Defaults to `true`, so an embedded node — which has no NTP
+    /// status and gets its time from elsewhere — reports the state it is
+    /// actually in rather than a fabricated failure.
+    clock_trusted: bool,
     /// The enrollment policy in force, as the authority last published it, or
     /// `None` on a node that runs no authority at all.
     enrollment: Option<EnrollmentPolicyStatusData>,
@@ -443,9 +477,20 @@ impl<
         RouterView {
             router,
             now,
+            clock_trusted: true,
             enrollment: None,
             identity_seed: None,
         }
+    }
+
+    /// Report whether this node's clock is disciplined enough to make a
+    /// credential decision against.
+    ///
+    /// The caller's verdict, not one taken here — see the field's doc comment.
+    #[must_use]
+    pub fn with_clock_trusted(mut self, trusted: bool) -> Self {
+        self.clock_trusted = trusted;
+        self
     }
 
     /// Report `enrollment` as the enrollment policy in force.
@@ -800,6 +845,10 @@ impl<
         self.router.runtime_config_active()
     }
 
+    fn clock_trusted(&self) -> bool {
+        self.clock_trusted
+    }
+
     /// Read from the process-wide log ring.
     ///
     /// Takes nothing from `self`: the ring is filled by the installed logging
@@ -923,6 +972,7 @@ impl<
         PENDING_REPLIES,
     > {
         RouterView::new(self.router, self.now)
+            .with_clock_trusted(self.clock_trusted)
             .with_enrollment_policy(self.enrollment.clone())
             .with_identity(self.current_identity_seed())
     }
@@ -1002,6 +1052,10 @@ impl<
 
     fn runtime_config_active(&self) -> bool {
         self.view().runtime_config_active()
+    }
+
+    fn clock_trusted(&self) -> bool {
+        self.view().clock_trusted()
     }
 
     fn logs(&self, since_seq: u64, max_records: u32) -> LogsData {

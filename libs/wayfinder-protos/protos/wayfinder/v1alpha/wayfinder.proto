@@ -457,6 +457,11 @@ enum AlarmKind {
   // A bounded table is at capacity and evicting, so the node is now forgetting
   // state it would otherwise have kept.
   ALARM_KIND_TABLE_SATURATION = 7;
+
+  // The host's system clock is not disciplined, so the node refuses every
+  // credential decision that depends on knowing the time.  Routing is
+  // unaffected, which is why it is worth reporting: the node looks healthy.
+  ALARM_KIND_CLOCK_UNSYNCHRONIZED = 8;
 }
 
 // One latched condition the node is holding.
@@ -1109,6 +1114,23 @@ message NodeInfo {
   // configuration. Overrides are in-memory only and do not survive a
   // restart.
   bool runtime_config_active = 4;
+
+  // Whether this node will currently make a credential decision -- certificate
+  // issuance and verification, enrollment, login.  False means all of those are
+  // being refused until a time daemon brings the clock into sync.
+  //
+  // Note this is "may the node act", not "is the clock verified".  It is also
+  // TRUE on a node whose operator set require_time_sync = false, and on a
+  // platform that exposes no NTP status: nothing is vouching for the clock
+  // there either, but the node is not refusing anything.  The field cannot
+  // distinguish those from a genuinely synchronized clock; the node's startup
+  // log does, and GetAlarms carries ALARM_KIND_CLOCK_UNSYNCHRONIZED whenever
+  // the gate is actually engaged.
+  //
+  // Routing is unaffected while this is false: the router keeps a best-effort
+  // clock so it can still judge peer certificate windows.  That is why this
+  // needs reporting at all -- the node looks, and is, healthy as a router.
+  bool clock_trusted = 5;
 }
 
 // Per-neighbor path metrics for a single path to an originator.

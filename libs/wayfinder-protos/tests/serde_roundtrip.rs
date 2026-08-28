@@ -32,6 +32,7 @@ fn node_info_round_trips_through_json() {
         num_originators: 3,
         auth_locked: false,
         runtime_config_active: true,
+        clock_trusted: true,
     };
 
     let json = serde_json::to_string(&original).unwrap();
@@ -96,6 +97,7 @@ fn response_oneof_round_trips_through_json() {
             num_originators: 1,
             auth_locked: true,
             runtime_config_active: false,
+            clock_trusted: true,
         })),
     };
 

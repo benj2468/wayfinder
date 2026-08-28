@@ -270,7 +270,13 @@ impl Mock {
     pub fn login_provider() -> Self {
         let mut ca =
             wayfinder_server::CertAuthority::new(&MESH_ROOT_SEED, MOCK_MESH_ID, 86_400, None, true);
-        ca.set_clock(wayfinder_server::Clock::System);
+        // `Assume` rather than the `Ntp` policy a real node runs: this mock
+        // exists to make the dashboard usable without a node, and it must mint
+        // working credentials on a developer's laptop whether or not anything
+        // is disciplining its clock.
+        ca.set_clock(wayfinder_server::Clock::System(
+            wayfinder_server::ClockTrust::Assume,
+        ));
         for (username, role) in [
             (MOCK_ADMIN_USER, wayfinder_server::UserRole::Admin),
             (MOCK_VIEWER_USER, wayfinder_server::UserRole::Viewer),
@@ -561,6 +567,10 @@ impl RouterReads for Mock {
 
     fn runtime_config_active(&self) -> bool {
         false
+    }
+
+    fn clock_trusted(&self) -> bool {
+        true
     }
 
     fn alarms(&self) -> AlarmsData {

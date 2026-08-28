@@ -51,6 +51,17 @@ pub fn Overview() -> impl IntoView {
                                         "As started"
                                     }
                                 />
+                                // Phrased for the audience this dashboard
+                                // exists for: someone who will not think to
+                                // connect "enrollment keeps failing" to NTP.
+                                <Field
+                                    label="Clock"
+                                    value=if info.clock_trusted {
+                                        "OK"
+                                    } else {
+                                        "Not synchronized — sign-in and enrollment are paused"
+                                    }
+                                />
                             }
                                 .into_any()
                         })

@@ -313,6 +313,7 @@ mod tests {
                     num_originators: 9,
                     auth_locked: false,
                     runtime_config_active: false,
+                    clock_trusted: true,
                 })),
             })
             .await;
@@ -409,6 +410,7 @@ mod tests {
                         num_originators,
                         auth_locked: false,
                         runtime_config_active: false,
+                        clock_trusted: true,
                     })),
                 })
                 .await;
@@ -467,6 +469,7 @@ mod tests {
                     num_originators: 0,
                     auth_locked: false,
                     runtime_config_active: false,
+                    clock_trusted: true,
                 })),
             })
             .await;

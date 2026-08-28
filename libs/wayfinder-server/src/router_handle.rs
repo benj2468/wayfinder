@@ -47,6 +47,7 @@ use alloc::sync::Arc;
 use core::time::Duration;
 
 use tokio::sync::RwLock;
+use tokio::sync::watch;
 use wayfinder::CentralRouter;
 use wayfinder_protos::service::EnrollmentPolicyStatusData;
 use wayfinder_protos::service::handle_router_read;
@@ -114,6 +115,18 @@ pub struct RouterHandle {
     /// policy an authority publishes afterwards. Capturing a dead receiver was
     /// otherwise a silent way to report "no enrollment policy" forever on a CA.
     enrollment: Option<EnrollmentPolicyRx>,
+    /// Whether the driver's clock is disciplined enough for a credential
+    /// decision, as its loop last published it.
+    ///
+    /// A `watch` receiver read without awaiting, exactly like `enrollment`, and
+    /// for the same two reasons: the driver loop must never block on a reader,
+    /// and a reader holding the read lock must never block on the loop.
+    ///
+    /// Absent where nothing publishes one — a test handle, and the embedded
+    /// path — which reports `true`: "no clock policy to report" is the honest
+    /// answer for a node whose time comes from elsewhere, and is what
+    /// `RouterView` defaults to.
+    clock_trusted: Option<watch::Receiver<bool>>,
 }
 
 impl RouterHandle {
@@ -124,6 +137,7 @@ impl RouterHandle {
             inner,
             start,
             enrollment: None,
+            clock_trusted: None,
         }
     }
 
@@ -135,6 +149,18 @@ impl RouterHandle {
     #[must_use]
     pub fn with_enrollment_policy(mut self, rx: Option<EnrollmentPolicyRx>) -> Self {
         self.enrollment = rx;
+        self
+    }
+
+    /// Report the clock-trust verdict from `rx` on `GetNodeInfo`.
+    ///
+    /// The driver's own verdict, forwarded — never recomputed here. This half
+    /// runs on a connection task with no view of the driver's clock policy, and
+    /// a second opinion formed locally would be free to disagree with the one
+    /// the node's auth clock actually acted on.
+    #[must_use]
+    pub fn with_clock_trust(mut self, rx: Option<watch::Receiver<bool>>) -> Self {
+        self.clock_trusted = rx;
         self
     }
 
@@ -166,9 +192,11 @@ impl RouterHandle {
         // loop is still evaluated at the instant it is *served* rather than the
         // instant it was queued.
         let enrollment = self.enrollment_policy();
+        let clock_trusted = self.clock_trusted();
         let guard = self.inner.read().await;
         let now = self.now();
         let view = RouterView::new(&guard.router, now)
+            .with_clock_trusted(clock_trusted)
             .with_enrollment_policy(enrollment)
             .with_identity(guard.identity_seed);
         handle_router_read(&view, request)
@@ -182,6 +210,13 @@ impl RouterHandle {
     /// The enrollment policy in force, read without awaiting the authority.
     fn enrollment_policy(&self) -> Option<EnrollmentPolicyStatusData> {
         self.enrollment.as_ref().and_then(|rx| rx.borrow().clone())
+    }
+
+    /// The driver's clock-trust verdict, read without awaiting its loop.
+    ///
+    /// `true` where no publisher was wired — see the field's doc comment.
+    fn clock_trusted(&self) -> bool {
+        self.clock_trusted.as_ref().is_none_or(|rx| *rx.borrow())
     }
 }
 

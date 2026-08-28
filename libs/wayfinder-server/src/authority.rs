@@ -30,6 +30,8 @@ use wayfinder_protos::service::TokenUpdate;
 use wayfinder_protos::service::UserAuthOutcome;
 use zerocopy::IntoBytes;
 
+use crate::clock_trust::ClockSync;
+use crate::clock_trust::ClockTrust;
 use crate::persistence::CaLog;
 use crate::persistence::TokenOverride;
 use crate::provider::MeshAuthority;
@@ -269,15 +271,25 @@ const MIN_PLAUSIBLE_UNIX: u64 = 1_735_689_600;
 /// test deterministic; [`Clock::System`] is what makes production correct.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Clock {
-    /// The host's system clock, read afresh at every use.
+    /// The host's system clock, read afresh at every use, gated on the host's
+    /// own NTP verdict.
     ///
     /// What a real provider runs on, and the only variant that cannot go stale:
     /// it is read at the moment it is needed rather than pushed in beforehand by
     /// something whose own schedule decides how often it bothers.
     ///
-    /// Subject to [`MIN_PLAUSIBLE_UNIX`] — an implausible reading fails closed
-    /// rather than being trusted.
-    System,
+    /// Two independent checks, catching two different wrong clocks. The
+    /// [`ClockTrust`] policy asks whether anything is *disciplining* this clock
+    /// — the case of a node that booted before NTP reached it, whose reading is
+    /// plausible and hours out. `MIN_PLAUSIBLE_UNIX` then catches a clock that
+    /// was never set at all, which reads as 1970.
+    ///
+    /// The floor is not redundant with the gate: it is what still holds on the
+    /// paths where the gate passes *by construction* — an operator who set
+    /// `require_time_sync = false`, and a platform that exposes no NTP status
+    /// at all. Either failing yields the same zero, because to every caller
+    /// they are the same fact: there is no usable time here.
+    System(ClockTrust),
     /// A fixed instant, in unix seconds.
     ///
     /// For tests, and for a caller that owns its own clock. `Fixed(0)` is the
@@ -296,7 +308,11 @@ impl Clock {
     fn now_unix(self) -> u64 {
         match self {
             Clock::Fixed(secs) => secs,
-            Clock::System => plausible_or_zero(
+            // Nothing vouches for this reading, so it is worth exactly as much
+            // as no reading at all. Checked before the clock is read at all: an
+            // untrusted reading is not wanted even to log.
+            Clock::System(trust) if !crate::clock_trust::read(trust).is_trusted() => 0,
+            Clock::System(_) => plausible_or_zero(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|since| since.as_secs())
@@ -306,14 +322,30 @@ impl Clock {
             ),
         }
     }
+
+    /// What the host says about this clock's discipline, for the operator-facing
+    /// projection and the alarm.
+    ///
+    /// A [`Clock::Fixed`] is a value its caller chose, so there is nothing to
+    /// ask the host about and it reports [`ClockSync::Unsupported`] — "no
+    /// verdict is being enforced here", which is exactly true of a pinned clock.
+    fn sync(self) -> ClockSync {
+        match self {
+            Clock::Fixed(_) => ClockSync::Unsupported,
+            Clock::System(trust) => crate::clock_trust::read(trust),
+        }
+    }
 }
 
 /// Map a host-clock reading below [`MIN_PLAUSIBLE_UNIX`] onto the fail-closed
 /// zero, passing a plausible one through.
 ///
 /// Split out so the boundary is testable without a machine whose clock is
-/// actually wrong.
-fn plausible_or_zero(secs: u64) -> u64 {
+/// actually wrong, and `pub(crate)` so the driver's own host-clock read applies
+/// the *same* floor this one does — two components reading the host clock with
+/// different notions of "plausible" is how they end up disagreeing about
+/// whether a certificate is inside its window.
+pub(crate) fn plausible_or_zero(secs: u64) -> u64 {
     if secs < MIN_PLAUSIBLE_UNIX { 0 } else { secs }
 }
 
@@ -383,7 +415,7 @@ impl CertAuthority {
             pending_ttl_secs: cfg.pending_ttl_secs,
             allow_unbounded_cert_ttl: cfg.allow_unbounded_cert_ttl,
             log,
-            clock: Clock::System,
+            clock: Clock::System(ClockTrust::default()),
             ..Self::new(
                 root_seed,
                 cfg.mesh_id,
@@ -534,6 +566,18 @@ impl CertAuthority {
     /// stale between one request and the next.
     pub fn now_unix(&self) -> u64 {
         self.clock.now_unix()
+    }
+
+    /// What the host says about this clock's discipline.
+    ///
+    /// Exists so a refusal can be *explained*. Every issuing path here fails on
+    /// `now_unix() == 0`, which is the same sentinel for "never set" and "not
+    /// trusted"; without this an operator would see a node refusing to sign and
+    /// have nothing to distinguish a clock nobody ever set from one NTP has not
+    /// reached yet.
+    #[must_use]
+    pub fn clock_sync(&self) -> ClockSync {
+        self.clock.sync()
     }
 
     /// The mesh id this authority signs for.
@@ -1152,8 +1196,9 @@ impl CertAuthority {
         // mint an invitation whose window starts at the epoch and is over.
         if self.now_unix() == 0 {
             return Err(
-                "the authority has no usable clock (never set, or a host clock reading \
-                 before 2025 — check NTP or the hardware clock); cannot mint an invitation yet"
+                "the authority has no usable clock (never set, a host clock reading \
+                 before 2025, or a clock no time daemon is disciplining — check \
+                 chronyd and the hardware clock); cannot mint an invitation yet"
                     .to_string(),
             );
         }
@@ -1302,8 +1347,9 @@ impl CertAuthority {
     pub fn begin_user_registration(&mut self, token: &str) -> Result<StartedRegistration, String> {
         if self.now_unix() == 0 {
             return Err(
-                "the authority has no usable clock (never set, or a host clock reading \
-                 before 2025 — check NTP or the hardware clock); cannot start a registration yet"
+                "the authority has no usable clock (never set, a host clock reading \
+                 before 2025, or a clock no time daemon is disciplining — check \
+                 chronyd and the hardware clock); cannot start a registration yet"
                     .to_string(),
             );
         }
@@ -1402,8 +1448,9 @@ impl CertAuthority {
     ) -> Result<(), String> {
         if self.now_unix() == 0 {
             return Err(
-                "the authority has no usable clock (never set, or a host clock reading \
-                 before 2025 — check NTP or the hardware clock); cannot create an account yet"
+                "the authority has no usable clock (never set, a host clock reading \
+                 before 2025, or a clock no time daemon is disciplining — check \
+                 chronyd and the hardware clock); cannot create an account yet"
                     .to_string(),
             );
         }
@@ -1703,8 +1750,9 @@ impl MeshAuthority for CertAuthority {
         // mint a session whose window starts at the epoch and is already over.
         if self.now_unix() == 0 {
             return Err(
-                "the authority has no usable clock (never set, or a host clock reading \
-                 before 2025 — check NTP or the hardware clock); cannot issue certificates yet"
+                "the authority has no usable clock (never set, a host clock reading \
+                 before 2025, or a clock no time daemon is disciplining — check \
+                 chronyd and the hardware clock); cannot issue certificates yet"
                     .to_string(),
             );
         }
@@ -1802,8 +1850,9 @@ impl MeshAuthority for CertAuthority {
         // against any real wall clock.  Fail closed.
         if self.now_unix() == 0 {
             return Err(
-                "the authority has no usable clock (never set, or a host clock reading \
-                 before 2025 — check NTP or the hardware clock); cannot issue certificates yet"
+                "the authority has no usable clock (never set, a host clock reading \
+                 before 2025, or a clock no time daemon is disciplining — check \
+                 chronyd and the hardware clock); cannot issue certificates yet"
                     .to_string(),
             );
         }
@@ -1941,8 +1990,9 @@ impl MeshAuthority for CertAuthority {
     fn approve_csr(&mut self, node_mac: &[u8]) -> Result<(), String> {
         if self.now_unix() == 0 {
             return Err(
-                "the authority has no usable clock (never set, or a host clock reading \
-                 before 2025 — check NTP or the hardware clock); cannot issue certificates yet"
+                "the authority has no usable clock (never set, a host clock reading \
+                 before 2025, or a clock no time daemon is disciplining — check \
+                 chronyd and the hardware clock); cannot issue certificates yet"
                     .to_string(),
             );
         }
@@ -2103,8 +2153,9 @@ impl MeshAuthority for CertAuthority {
     fn revoke(&mut self, node_mac: &[u8]) -> Result<RevocationRecord, String> {
         if self.now_unix() == 0 {
             return Err(
-                "the authority has no usable clock (never set, or a host clock reading \
-                 before 2025 — check NTP or the hardware clock); cannot sign revocations yet"
+                "the authority has no usable clock (never set, a host clock reading \
+                 before 2025, or a clock no time daemon is disciplining — check \
+                 chronyd and the hardware clock); cannot sign revocations yet"
                     .to_string(),
             );
         }
@@ -2552,6 +2603,80 @@ mod tests {
         assert_eq!(ca.now_unix(), 0, "and zero stays the fail-closed sentinel");
     }
 
+    /// An undisciplined host clock reads as the fail-closed sentinel, not as
+    /// whatever the hardware happens to say.
+    ///
+    /// This is the gate itself. `MIN_PLAUSIBLE_UNIX` already catches a clock
+    /// that was never set; it cannot catch one that is plausible and wrong,
+    /// which is what a node that booted before NTP reached it has.
+    #[test]
+    fn an_untrusted_host_clock_reads_as_zero() {
+        assert_eq!(
+            Clock::System(ClockTrust::Never).now_unix(),
+            0,
+            "an untrusted clock is indistinguishable from no clock at all"
+        );
+    }
+
+    /// The opt-out reads the host clock unconditionally, so a node whose
+    /// operator has accepted the risk — or a platform with no NTP status to
+    /// consult — is not bricked by the gate.
+    #[test]
+    fn an_assumed_host_clock_still_reads_the_host() {
+        let host_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the test host's clock is after the epoch")
+            .as_secs();
+        assert!(
+            Clock::System(ClockTrust::Assume)
+                .now_unix()
+                .abs_diff(host_now)
+                <= 5
+        );
+    }
+
+    /// A credential decision is refused outright while the clock is untrusted.
+    ///
+    /// Minting an invitation is the representative case — it stamps a window
+    /// that a wrong clock makes either already-expired or valid far longer than
+    /// intended. The refusal rides the existing `now_unix() == 0` guard, so
+    /// gating the clock gates every path that already had one.
+    #[test]
+    fn an_untrusted_clock_refuses_to_mint_an_invitation() {
+        let (mut ca, _) = ca_with_user(UserRole::Admin, 900);
+        ca.set_clock(Clock::System(ClockTrust::Never));
+
+        let err = ca
+            .create_user_invite("newcomer", UserRole::Viewer, 900, 3600)
+            .expect_err("an untrusted clock must not mint a dated credential");
+        assert!(
+            err.contains("clock"),
+            "the refusal has to name the clock, or the operator debugs the wrong thing: {err}"
+        );
+    }
+
+    /// An untrusted clock is *reported*, not merely acted on, so a refusal can
+    /// be explained.
+    ///
+    /// Every issuing path here fails on the same `now_unix() == 0` sentinel,
+    /// which is also what a never-set clock produces — without this an operator
+    /// could not tell a clock nobody set from one NTP has not reached.
+    ///
+    /// This test says nothing about routing: `CertAuthority` has none. The
+    /// scope boundary is pinned where routing actually exists, by
+    /// `an_untrusted_clock_does_not_gate_the_routers_view_of_time` in
+    /// `wayfinder-driver`.
+    #[test]
+    fn an_untrusted_clock_is_reported_rather_than_hidden() {
+        let (mut ca, _) = ca_with_user(UserRole::Admin, 900);
+        ca.set_clock(Clock::System(ClockTrust::Never));
+        assert!(
+            !ca.clock_sync().is_trusted(),
+            "the authority can say why it is refusing"
+        );
+        assert_eq!(ca.clock_sync().name(), "unsynchronized");
+    }
+
     /// The production constructor puts the authority on the host clock, so a
     /// provider needs nobody to refresh it.
     ///
@@ -2559,10 +2684,24 @@ mod tests {
     /// stale whenever that something stopped pushing, and the router — which was
     /// doing the pushing — wakes once an hour on a provider with no mesh
     /// interfaces.
+    ///
+    /// Put on `ClockTrust::Assume`, so the property under test is the clock
+    /// being *read live* rather than the build machine's NTP state — CI
+    /// containers routinely report `STA_UNSYNC`, and so does this repo's own
+    /// dev shell. The gate itself is covered by
+    /// `an_untrusted_host_clock_reads_as_zero`.
     #[test]
     fn a_provider_built_from_config_reads_the_host_clock() {
         let path = unique_state_path("system-clock");
-        let ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+        let mut ca = CertAuthority::from_config(&[1; 32], &persisted_cfg(&path)).unwrap();
+        // Pinned before the override, or this test would pass with
+        // `from_config` returning any clock at all.
+        assert_eq!(
+            ca.clock,
+            Clock::System(ClockTrust::default()),
+            "the production constructor enforces by default"
+        );
+        ca.set_clock(Clock::System(ClockTrust::Assume));
 
         let host_now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

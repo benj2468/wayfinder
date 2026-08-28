@@ -135,6 +135,10 @@ impl RouterReads for NodeMock {
         false
     }
 
+    fn clock_trusted(&self) -> bool {
+        true
+    }
+
     fn alarms(&self) -> AlarmsData {
         AlarmsData::default()
     }

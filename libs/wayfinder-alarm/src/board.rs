@@ -358,6 +358,60 @@ mod tests {
         Subject::Node(NodeId::new(&[0, 0, 0, 0, 0, n]))
     }
 
+    /// An undisciplined system clock is a latched condition an operator must
+    /// act on, not a passing event — it stays wrong until someone fixes NTP,
+    /// and while it is wrong the node refuses every credential decision. That
+    /// is exactly what the alarm board is for: a log line about the moment
+    /// would scroll away, and the operator would be left debugging the
+    /// downstream refusals instead of their cause.
+    ///
+    /// Its subject is the node itself rather than a peer, so it coalesces into
+    /// a single row however many refusals it causes.
+    #[test]
+    fn a_clock_alarm_is_one_latched_row_however_often_it_is_raised() {
+        let mut board = AlarmBoard::default();
+        for t in 0..5 {
+            raise(
+                &mut board,
+                AlarmKind::ClockUnsynchronized,
+                // `Subject::None`, matching what the driver actually raises —
+                // coalescing keys on `(kind, subject)`, so proving it for a
+                // subject production never uses would prove nothing.
+                Subject::None,
+                Severity::Warning,
+                t * 1_000,
+            );
+        }
+        let row = row(&board, AlarmKind::ClockUnsynchronized, &Subject::None);
+        assert_eq!(
+            row.count, 5,
+            "repeat raises coalesce rather than adding rows"
+        );
+        assert_eq!(board.alarms().len(), 1);
+    }
+
+    /// The new kind carries a stable code that does not collide with an
+    /// existing one, since the wire enum is numbered from these codes and a
+    /// collision would silently render one condition as another.
+    #[test]
+    fn the_clock_kind_has_its_own_stable_code() {
+        let existing = [
+            AlarmKind::UnauthenticatedTraffic,
+            AlarmKind::TrafficFlood,
+            AlarmKind::ManagementAuthFailures,
+            AlarmKind::OgmReplay,
+            AlarmKind::RevokedPeer,
+            AlarmKind::LinkErrors,
+            AlarmKind::TableSaturation,
+        ];
+        let clock = AlarmKind::ClockUnsynchronized;
+        assert_eq!(clock.code(), 8);
+        for kind in existing {
+            assert_ne!(kind.code(), clock.code());
+            assert_ne!(kind.as_str(), clock.as_str());
+        }
+    }
+
     /// Raise with an empty detail and check the board's invariants afterwards.
     /// Most tests care about the bookkeeping, not the rendered text.
     fn raise(

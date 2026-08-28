@@ -111,11 +111,16 @@ pub fn format_timestamp(unix_secs: u64) -> String {
 pub fn node_info(v: &NodeInfo, fmt: OutputFormat) -> anyhow::Result<String> {
     render(v, fmt, |v| {
         format!(
-            "node {}\noriginators: {}\nlocked: {}\nruntime config: {}",
+            "node {}\noriginators: {}\nlocked: {}\nruntime config: {}\nclock: {}",
             format_mac(&v.node_id),
             v.num_originators,
             if v.auth_locked { "yes" } else { "no" },
-            if v.runtime_config_active { "yes" } else { "no" }
+            if v.runtime_config_active { "yes" } else { "no" },
+            if v.clock_trusted {
+                "trusted"
+            } else {
+                "NOT SYNCHRONIZED (credential operations refused)"
+            }
         )
     })
 }

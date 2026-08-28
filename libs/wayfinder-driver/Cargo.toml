@@ -39,6 +39,8 @@ wayfinder-driver-core.workspace = true
 interfaces.workspace = true
 wayfinder-protos.workspace = true
 wayfinder-server.workspace = true
+# Raising the clock-unsynchronized alarm from the loop's periodic clock check.
+wayfinder-alarm.workspace = true
 
 async-trait = { workspace = true, optional = true }
 anyhow.workspace = true

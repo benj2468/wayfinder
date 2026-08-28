@@ -480,7 +480,7 @@ pub struct AuthConfig {
 }
 
 /// Top-level configuration loaded from the YAML config file.
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Config {
     /// The local host-facing Distribution Mechanism.
     ///
@@ -551,6 +551,80 @@ pub struct Config {
     /// other generated state rather than beside the operator-authored config.
     #[serde(default)]
     pub runtime_state_path: Option<String>,
+    /// Whether this node requires a disciplined system clock before it will
+    /// make a credential decision. Defaults to `true`.
+    ///
+    /// Time is a trust input: it decides a certificate's validity window, when
+    /// an invitation stops being redeemable, when a lockout lifts, how long a
+    /// revocation is enforced, and which TOTP step a code belongs to. A node
+    /// that booted before NTP reached it — the ordinary condition of a field
+    /// mesh with no upstream — holds a clock that is *plausible* and hours
+    /// wrong, which no existing sanity floor catches.
+    ///
+    /// While the host reports the clock undisciplined, every credential path
+    /// fails closed and an alarm is raised. **Routing keeps working**: the
+    /// router holds its own best-effort clock rather than the fail-closed
+    /// sentinel, so it still judges peer certificate windows and still forwards.
+    /// A node that refused to carry traffic because NTP was unreachable would
+    /// be a self-inflicted outage, and on an authenticated mesh it would be a
+    /// total partition — no peer verified, and none verifying this node.
+    ///
+    /// What the gate cannot rescue is a clock that is *badly* wrong rather than
+    /// merely unattested: certificate windows cannot be judged against a time
+    /// that is years out, whatever this setting says.
+    ///
+    /// Set `false` on a deliberately clock-less deployment — an isolated lab,
+    /// or a host with no time daemon whose operator accepts the risk. Has no
+    /// effect on a platform that exposes no NTP status (anything but Linux),
+    /// where nothing is enforced either way and a startup warning says so.
+    #[serde(default = "default_require_time_sync")]
+    pub require_time_sync: bool,
+    /// Largest estimated clock error, in microseconds, this node still treats
+    /// as trustworthy. Absent ⇒ five seconds.
+    ///
+    /// Compared against the kernel's own `maxerror` bound, which grows between
+    /// a time daemon's polls. The functional requirement is much looser than
+    /// the default — a TOTP step is 30 s, a certificate window is hours — so
+    /// the default is set by what does not *flap* rather than by what is barely
+    /// sufficient. Lower it only with a reason; a bound near the true
+    /// requirement toggles trust on a healthy node every poll interval.
+    ///
+    /// Ignored entirely when [`require_time_sync`](Self::require_time_sync) is
+    /// `false`.
+    #[serde(default)]
+    pub max_clock_error_us: Option<u64>,
+}
+
+/// A node enforces clock discipline unless told otherwise: silence has to be
+/// the safe posture, since the failure it prevents is silent too.
+fn default_require_time_sync() -> bool {
+    true
+}
+
+/// Hand-written rather than derived, because `#[derive(Default)]` would give
+/// `require_time_sync` Rust's `bool` default (`false`) while `#[serde(default)]`
+/// gives it `true`.
+///
+/// Two "defaults" for one field, disagreeing on a security posture, is a trap
+/// worth the boilerplate: a caller reaching for `Config::default()` would get
+/// the permissive node that no config file can produce. `defaults_agree` pins
+/// the two together.
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            local_egress: None,
+            mac_state_path: None,
+            links: Vec::new(),
+            server: None,
+            auth: None,
+            provider: None,
+            require_auth: false,
+            lazy_cert_distribution: false,
+            runtime_state_path: None,
+            require_time_sync: default_require_time_sync(),
+            max_clock_error_us: None,
+        }
+    }
 }
 
 impl Config {
@@ -902,6 +976,48 @@ local_egress:
 
     /// `require_auth` defaults to `false` (open/pre-auth behavior preserved)
     /// when omitted from the config.
+    #[test]
+    fn require_time_sync_defaults_to_true() {
+        let yaml = "\
+local_egress:
+  type: Tap
+  device_name: wayfinder0
+";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            config.require_time_sync,
+            "a node nobody configured must enforce clock discipline: the failure it \
+             prevents (credentials judged against a plausible-but-wrong clock) is silent"
+        );
+        assert_eq!(
+            config.max_clock_error_us, None,
+            "and takes the built-in bound"
+        );
+    }
+
+    /// `Config::default()` and the serde defaults agree.
+    ///
+    /// They did not: `#[derive(Default)]` gave `require_time_sync` Rust's
+    /// `bool` default while `#[serde(default)]` gave it `true`, so a caller
+    /// reaching for `Config::default()` got a permissive node no config file
+    /// could produce. Pinned because the next `#[serde(default = "...")]` field
+    /// added here would reopen it silently.
+    #[test]
+    fn the_derived_and_serde_defaults_agree() {
+        let from_yaml: Config = serde_yaml::from_str("{}").unwrap();
+        let from_default = Config::default();
+        assert_eq!(from_yaml.require_time_sync, from_default.require_time_sync);
+        assert_eq!(from_yaml.require_auth, from_default.require_auth);
+        assert_eq!(
+            from_yaml.lazy_cert_distribution,
+            from_default.lazy_cert_distribution
+        );
+        assert_eq!(
+            from_yaml.max_clock_error_us,
+            from_default.max_clock_error_us
+        );
+    }
+
     #[test]
     fn require_auth_defaults_to_false() {
         let yaml = "\
