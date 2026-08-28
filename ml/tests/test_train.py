@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from wayfinder_ml import schema
 
 torch = pytest.importorskip("torch")
 
+from wayfinder_ml import schema
 from wayfinder_ml.train import NextHopScorer, evaluate, train
 
 
@@ -52,6 +52,8 @@ def _learnable_batch(rows: int = 512) -> schema.FeatureBatch:
 
 
 def test_scorer_emits_one_logit_per_slot() -> None:
+    torch = pytest.importorskip("torch")
+
     model = NextHopScorer()
     scores = model(
         torch.zeros(3, schema.MAX_PATHS, len(schema.CANDIDATE_FEATURES)),

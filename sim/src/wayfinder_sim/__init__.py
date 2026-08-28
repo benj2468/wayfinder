@@ -64,10 +64,18 @@ if TYPE_CHECKING:
     from .node import Node
     from .recorder import Recorder
     from .report import (
+        BY_DESIGN,
+        GAP,
+        HELD,
+        VERDICTS,
+        FindingReport,
         ImagePanel,
         RunReport,
         ScenePanel,
+        Verdict,
+        red_team_report_html,
         sweep_report_html,
+        write_red_team_report,
         write_sweep_report,
     )
     from .scenario import Simulation
@@ -89,7 +97,11 @@ if TYPE_CHECKING:
     )
 
 __all__ = [
+    "BY_DESIGN",
     "EARTH_RADIUS_M",
+    "GAP",
+    "HELD",
+    "VERDICTS",
     "Bounds",
     "CapturedFrame",
     "Channel",
@@ -98,6 +110,7 @@ __all__ = [
     "Credential",
     "EarthOccluded",
     "EarthOrbit",
+    "FindingReport",
     "FlatGround",
     "FreeSpacePathLoss",
     "GaussianPeak",
@@ -125,6 +138,7 @@ __all__ = [
     "TerrainMasked",
     "Timeline",
     "Vec3",
+    "Verdict",
     "Waypoints",
     "Wiretap",
     "connectivity_stats",
@@ -134,12 +148,14 @@ __all__ = [
     "max_fresnel_parameter",
     "outage_windows",
     "peak_sites",
+    "red_team_report_html",
     "run_sweep",
     "sweep_report_html",
     "terrain_scene",
     "track_scene",
     "valley_sites",
     "write_html",
+    "write_red_team_report",
     "write_sweep_report",
 ]
 
@@ -174,10 +190,18 @@ _EXPORTS = {
     "Waypoints": "mobility",
     "Node": "node",
     "Recorder": "recorder",
+    "BY_DESIGN": "report",
+    "FindingReport": "report",
+    "GAP": "report",
+    "HELD": "report",
     "ImagePanel": "report",
     "RunReport": "report",
     "ScenePanel": "report",
+    "VERDICTS": "report",
+    "Verdict": "report",
+    "red_team_report_html": "report",
     "sweep_report_html": "report",
+    "write_red_team_report": "report",
     "write_sweep_report": "report",
     "Simulation": "scenario",
     "Credential": "security",

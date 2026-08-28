@@ -375,7 +375,9 @@ class EarthOccluded:
         los_len = math.sqrt(sum(c * c for c in los))
         if up_len == 0.0 or los_len == 0.0:
             return 90.0
-        sin_elevation = sum(u * l for u, l in zip(up, los)) / (up_len * los_len)
+        sin_elevation = sum(up_n * los_n for up_n, los_n in zip(up, los)) / (
+            up_len * los_len
+        )
         return math.degrees(math.asin(max(-1.0, min(1.0, sin_elevation))))
 
     def _passes_through_the_earth(self, tx: Vec3, rx: Vec3) -> bool:

@@ -4,10 +4,16 @@ import re
 
 import pytest
 from wayfinder_sim.report import (
+    BY_DESIGN,
+    GAP,
+    HELD,
+    FindingReport,
     ImagePanel,
     RunReport,
     ScenePanel,
+    red_team_report_html,
     sweep_report_html,
+    write_red_team_report,
     write_sweep_report,
 )
 
@@ -347,3 +353,190 @@ def test_an_expanded_scene_is_unchanged():
     html = sweep_report_html("Sweep", [RunReport(label="a", panels=[_scene()])])
     assert "<details" not in html
     assert 'class="plotly-graph-div"' in html
+
+
+# --- the red-team page ------------------------------------------------------
+
+
+def _findings() -> list[FindingReport]:
+    return [
+        FindingReport(
+            name="Unauthenticated joiner",
+            verdict=HELD,
+            detail="hq admitted nobody; route to intruder: False",
+            description="An outsider running a stock, open router next to the mesh.",
+        ),
+        FindingReport(
+            name="Passive eavesdropping",
+            verdict=BY_DESIGN,
+            detail="payload readable in the clear off an authenticated mesh",
+        ),
+        FindingReport(
+            name="CA misissuance",
+            verdict=GAP,
+            detail="a cert binding a key to a MAC it does not derive is accepted",
+        ),
+    ]
+
+
+def test_red_team_report_is_a_complete_html_document():
+    html = red_team_report_html("Wayfinder red team", _findings())
+    assert html.lstrip().startswith("<!doctype html>")
+    assert "</html>" in html.rstrip()
+
+
+def test_red_team_report_carries_the_title_into_the_page_and_the_tab():
+    html = red_team_report_html("Wayfinder red team", _findings())
+    assert "<title>Wayfinder red team</title>" in html
+    assert html.count("Wayfinder red team") >= 2
+
+
+def test_red_team_report_renders_every_finding_with_what_was_measured():
+    html = red_team_report_html("Red team", _findings())
+    for finding in _findings():
+        assert finding.name in html
+        assert finding.detail in html
+
+
+def test_every_verdict_is_named_in_words_not_only_shown_as_a_colour():
+    """Held/gap is the page's whole signal, and green-vs-red is exactly the
+    encoding a colour-blind reader cannot resolve — so the verdict is always
+    spelled out beside its chip."""
+    html = red_team_report_html("Red team", _findings())
+    for verdict in (HELD, BY_DESIGN, GAP):
+        assert verdict in html
+
+
+def test_the_tally_counts_each_verdict():
+    """The first question a red-team page has to answer is "how many gaps",
+    without reading a single finding."""
+    findings = [*_findings(), FindingReport("Second gap", GAP, "also open")]
+    html = red_team_report_html("Red team", findings)
+    tally = html[html.index("data-tally") : html.index("data-summary")]
+    counted = {
+        verdict: int(count)
+        for count, verdict in re.findall(
+            r'wf-tally-n">(\d+)</div>.*?wf-tally-label">.*?</span>([A-Z ]+)</p>',
+            tally,
+            re.DOTALL,
+        )
+    }
+    assert counted == {GAP: 2, BY_DESIGN: 1, HELD: 1}
+
+
+def test_the_summary_leads_with_the_gaps():
+    """A sweep report ranks by its headline; here the ordering *is* severity —
+    the findings are what the page is opened for, so they come first and what
+    held comes last."""
+    html = red_team_report_html("Red team", _findings())
+    summary = html[html.index("data-summary") : html.index("data-findings")]
+    assert (
+        summary.index("CA misissuance")
+        < summary.index("Passive eavesdropping")
+        < summary.index("Unauthenticated joiner")
+    )
+
+
+def test_the_body_keeps_the_order_the_attacks_ran_in():
+    """Severity orders the summary; the body stays in run order, so the page
+    answers both "what is broken" and "what was tried, in what sequence"
+    without being read twice."""
+    html = red_team_report_html("Red team", _findings())
+    body = html[html.index("data-findings") :]
+    assert (
+        body.index("Unauthenticated joiner")
+        < body.index("Passive eavesdropping")
+        < body.index("CA misissuance")
+    )
+
+
+def test_each_summary_row_links_to_its_finding():
+    html = red_team_report_html("Red team", _findings())
+    for anchor in re.findall(r'href="#([^"]+)"', html):
+        assert f'id="{anchor}"' in html
+
+
+def test_the_attacks_own_description_is_rendered():
+    """The detail line says what was observed; the description says what was
+    attempted and why it should have failed. A report with only the first is
+    a scoreboard, not a finding."""
+    html = red_team_report_html("Red team", _findings())
+    assert "An outsider running a stock, open router next to the mesh." in html
+
+
+def test_a_description_becomes_one_paragraph_per_block():
+    findings = [
+        FindingReport("A", HELD, "d", description="First para.\n\nSecond para.")
+    ]
+    html = red_team_report_html("Red team", findings)
+    assert "<p" in html
+    assert "First para." in html
+    assert "Second para." in html
+    # Not one run-on block with the blank line collapsed away.
+    assert "First para. Second para." not in html
+
+
+def test_inline_code_in_a_description_is_rendered_as_code():
+    """The descriptions are Python docstrings, so they are written in
+    backticks; left raw they read as punctuation noise."""
+    findings = [
+        FindingReport("A", HELD, "d", description="Held by ``best_next_hop`` alone.")
+    ]
+    html = red_team_report_html("Red team", findings)
+    assert "<code>best_next_hop</code>" in html
+    assert "``" not in html
+
+
+def test_finding_text_is_escaped():
+    findings = [
+        FindingReport(
+            "<script>alert(1)</script>",
+            GAP,
+            "<img src=x onerror=alert(2)>",
+            description="<b>bold</b>",
+        )
+    ]
+    html = red_team_report_html("Red team", findings)
+    assert "<script>alert(1)</script>" not in html
+    assert "<img src=x" not in html
+    assert "<b>bold</b>" not in html
+    assert "&lt;script&gt;" in html
+
+
+def test_an_unrecognised_verdict_still_renders():
+    """A new verdict must show up as an unclassified row rather than crash the
+    report or, worse, be silently dropped from it."""
+    html = red_team_report_html("Red team", [FindingReport("A", "INCONCLUSIVE", "d")])
+    assert "INCONCLUSIVE" in html
+    assert "A" in html
+
+
+def test_red_team_report_rejects_an_empty_battery():
+    with pytest.raises(ValueError):
+        red_team_report_html("Red team", [])
+
+
+def test_the_red_team_page_needs_no_network():
+    """Same contract as the sweep page: one file, openable offline."""
+    html = red_team_report_html("Red team", _findings())
+    assert "http://" not in html
+    assert "https://" not in html
+
+
+def test_write_red_team_report_creates_its_parent_directories(tmp_path):
+    out = tmp_path / "nested" / "red_team_report.html"
+    written = write_red_team_report(out, "Red team", _findings())
+    assert written == out
+    assert "CA misissuance" in out.read_text(encoding="utf-8")
+
+
+def test_emphasis_in_a_description_is_rendered_as_emphasis():
+    """The docstrings lean on emphasis to carry the distinction each attack
+    turns on — the *victim's own* traffic, a *single* captured frame. Left as
+    literal asterisks that stress reads as noise."""
+    findings = [
+        FindingReport("A", HELD, "d", description="It is the *victim's own* traffic.")
+    ]
+    html = red_team_report_html("Red team", findings)
+    assert "<em>victim&#x27;s own</em>" in html
+    assert "*" not in html[html.index("data-findings") :]

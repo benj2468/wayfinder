@@ -64,9 +64,40 @@ BASELINE = {
     "attack_unauthenticated_relay": red_team.HELD,
     "attack_ca_misissuance": red_team.GAP,
     "attack_proof_starvation_by_neighbour_count": red_team.HELD,
+    # --- 2026-08 sweep: certificate issuance / identity / enrollment ---
+    "attack_reserved_address_originator": red_team.GAP,
+    "attack_misissued_cert_overwrites_live_member": red_team.GAP,
+    "attack_unbounded_validity_window": red_team.BY_DESIGN,
+    "attack_degenerate_validity_window": red_team.HELD,
+    "attack_fail_open_bridge_containment": red_team.HELD,
+    # --- 2026-08 sweep: directed data plane / pairwise trailer ---
+    "attack_multicast_addressed_directed_delivery": red_team.GAP,
+    "attack_injected_directed_laundered_by_relay": red_team.GAP,
+    "attack_directed_unicast_replay": red_team.HELD,
+    "attack_cross_pair_tag_forgery": red_team.HELD,
+    "attack_directed_frame_parsing_robustness": red_team.HELD,
+    # --- 2026-08 sweep: next-hop proof protocol ---
+    "attack_unicast_addressed_challenge_reflection": red_team.HELD,
+    "attack_forged_response_reaches_proof_handler": red_team.HELD,
+    "attack_challenge_nonce_is_unpredictable": red_team.HELD,
+    "attack_captured_challenge_replayed": red_team.HELD,
+    "attack_proof_survives_key_eviction_window": red_team.GAP,
+    # --- 2026-08 sweep: revocation as a weapon ---
+    "attack_forged_self_revocation_killswitch": red_team.HELD,
+    "attack_self_revocation_replay_after_reenrollment": red_team.HELD,
+    "attack_self_revocation_same_second_tie": red_team.BY_DESIGN,
+    "attack_foreign_root_revokes_member": red_team.HELD,
+    "attack_forged_revocation_flood_evicts_genuine": red_team.HELD,
+    "attack_stale_revocation_denies_readmission": red_team.HELD,
+    # --- 2026-08 sweep: OGM semantics / routing engine ---
+    "attack_ogm_seqno_highwater_jam": red_team.GAP,
+    "attack_broadcast_seqno_blackhole": red_team.GAP,
+    "attack_broadcast_dedup_table_exhaustion": red_team.GAP,
+    "attack_relayed_tq_inflation": red_team.HELD,
 }
-"""Expected verdict per attack — the table in ``docs/design/09-mesh-auth-gaps.md``.
-Update both together."""
+"""Expected verdict per attack — the baseline the ``09-mesh-auth-gaps.md`` design
+doc records. A newly-succeeding attack (or a fix that closes a gap) must flip the
+verdict here, in the report, and in the doc together."""
 
 
 @pytest.mark.parametrize("attack", red_team.ATTACKS, ids=lambda a: a.__name__)
@@ -92,3 +123,66 @@ def test_the_report_renders_every_finding(capsys):
         assert finding.name in out
         assert finding.detail in out
     assert "1 held, 1 by design, 1 gap(s)" in out
+
+
+# --- the HTML report --------------------------------------------------------
+
+
+def test_each_finding_carries_its_attacks_own_docstring():
+    """The console line reports what was measured; the page also has to say
+    what was attempted. That prose already exists — it is the attack's
+    docstring — so the report reads it off the function rather than asking
+    every attack to repeat itself into its `Finding`."""
+    finding = red_team.described(
+        red_team.Finding("Flood", red_team.HELD, "held"), red_team.attack_flood
+    )
+    assert "storm of garbage" in finding.description
+
+
+def test_findings_render_into_the_report_rows_the_page_takes():
+    findings = [
+        red_team.Finding("Held one", red_team.HELD, "held", description="why"),
+        red_team.Finding("Gap one", red_team.GAP, "gap"),
+    ]
+    rows = red_team.finding_reports(findings)
+
+    assert [row.name for row in rows] == ["Held one", "Gap one"]
+    assert [row.verdict for row in rows] == [red_team.HELD, red_team.GAP]
+    assert rows[0].description == "why"
+
+
+def test_write_report_writes_a_self_contained_page(tmp_path):
+    out = tmp_path / "red_team_report.html"
+    findings = [
+        red_team.Finding("Held one", red_team.HELD, "the mesh refused it"),
+        red_team.Finding("Gap one", red_team.GAP, "it got in"),
+    ]
+    written = red_team.write_report(findings, out)
+
+    page = written.read_text(encoding="utf-8")
+    assert page.lstrip().startswith("<!doctype html>")
+    assert "the mesh refused it" in page
+    assert "it got in" in page
+
+
+def test_the_scenario_and_the_page_share_one_verdict_vocabulary():
+    """Two copies of these strings is exactly the fragmentation the report is
+    meant to remove: a verdict renamed in one place would silently render as
+    an unclassified row in the other."""
+    from wayfinder_sim import report
+
+    assert (red_team.HELD, red_team.BY_DESIGN, red_team.GAP) == (
+        report.HELD,
+        report.BY_DESIGN,
+        report.GAP,
+    )
+
+
+def test_the_page_says_plainly_when_nothing_got_through(tmp_path):
+    """The state the repo is working towards, and the one the live battery
+    never renders while a gap is still open."""
+    out = red_team.write_report(
+        [red_team.Finding("Held one", red_team.HELD, "refused")],
+        tmp_path / "red_team_report.html",
+    )
+    assert "None of them got through" in out.read_text(encoding="utf-8")
