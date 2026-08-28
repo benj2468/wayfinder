@@ -1053,6 +1053,14 @@ impl<
             self.batman.reset_ogm_timers(now);
             self.batman.revoke_originators(auth.macs_to_purge());
             self.batman.purge_stale(now);
+            // And the shunned node's link-quality rows with them. The periodic
+            // tick prunes on the same predicate, but a management read landing
+            // between the two would still show the node an operator was just
+            // told is gone — which is exactly what it looked like from the
+            // dashboard.
+            let batman = &self.batman;
+            self.link_quality
+                .retain_live(|neighbor| batman.originator_table.contains_key(&neighbor));
         }
         newly
     }
@@ -1083,7 +1091,16 @@ impl<
     /// `RxOutcome` immediately — before any link-quality/throughput
     /// accounting or protocol demux — when [`auth_locked`].
     ///
+    /// A frame whose *link source* is currently shunned by a revocation this
+    /// node holds ([`OgmAuth::is_shunned`]) contributes no link-quality sample
+    /// and no rx throughput either, and is dropped outright unless it is auth
+    /// control traffic (an OGM, or the `CertReq`/`CertReply` that resolves
+    /// one). That exception is load-bearing rather than lenient: a node the
+    /// authority re-admitted carries its new certificate only inside those, and
+    /// caching it is the one thing that clears the shun.
+    ///
     /// [`auth_locked`]: CentralRouter::auth_locked
+    /// [`OgmAuth::is_shunned`]: crate::auth::OgmAuth::is_shunned
     pub fn handle_frame_with_metrics<'rx, 'tx>(
         &mut self,
         now: Duration,
@@ -1116,14 +1133,70 @@ impl<
         }
 
         tx_buf.fill(0);
+
+        // The frame's BATMAN sub-type, decoded once for every gate and demux
+        // below.  `None` is a non-BATMAN protocol, an empty payload, or a
+        // sub-type this build does not know — none of which is gated or
+        // specially handled by type; the engine routes those by destination.
+        let packet_type = if protocol == DEFAULT_BATMAN_ETHER_TYPE {
+            frame
+                .payload
+                .first()
+                .copied()
+                .and_then(BatmanPacketType::from_u8)
+        } else {
+            None
+        };
+
+        // Whether the link-layer sender is shunned by a revocation this node
+        // holds.  A *link-source* check, not an originator one: it therefore
+        // covers frames a revoked node relays as well as ones it originates.
+        //
+        // It overlaps `strip_directed`'s pairwise check (see the demux below)
+        // without being redundant with it. That check already stops a revoked
+        // node's *directed* frames, because ingesting a revocation evicts the
+        // pairwise key it would have to tag with. This one additionally
+        // reaches the frames no pairwise tag can cover — broadcasts — which is
+        // the class a revoked node on a shared segment actually floods.
+        let shunned = self.auth.as_ref().is_some_and(|auth| auth.is_shunned(src));
+
         // 0. Update the link-quality table for the sender, keyed on the
         //    interface this frame arrived on.  Done before any further
         //    processing so even frames that the upper layers drop still
         //    contribute their signal information. (This no longer holds when
         //    `auth_locked()`: the fail-closed gate above already returned
         //    before this step runs.)
-        let quality = normalize_quality(&metrics);
-        self.link_quality.update(frame.src, iface_idx, quality);
+        //
+        //    A shunned sender is the other exception, and the reason this
+        //    ticket existed: accounting here is pre-auth, so a revoked node
+        //    that was still transmitting re-created its link-quality row on
+        //    every frame, faster than the periodic prune could remove it. It
+        //    also kept biasing `best_interface_for`, which reads this table —
+        //    a node the operator has ejected must not steer egress.
+        //
+        //    Narrower than "any sender the routing table does not know", which
+        //    would state the same invariant `retain_live` enforces on the tick
+        //    and would subsume revocation — but cannot be applied here. This
+        //    measurement feeds `local_quality` *for the frame in flight*, so a
+        //    new neighbor's first OGM would carry no clamp and could advertise
+        //    a TQ the link does not support (`measured_poor_link_clamps_tq`),
+        //    repeatably, by going quiet until its entry expired. Measuring
+        //    before the demux is what makes the clamp bite on the frame being
+        //    clamped; a shunned sender is exempt only because its frames are
+        //    dropped below anyway, so there is no clamp left to preserve.
+        if !shunned {
+            let quality = normalize_quality(&metrics);
+            self.link_quality.update(frame.src, iface_idx, quality);
+        }
+
+        // 0b. Account the frame against this interface's ingress rate before
+        //     any demux, so even frames the upper layers drop still register as
+        //     received throughput on the wire. Deliberately *not* gated by the
+        //     shun: this measures the wire, and a revoked node that will not
+        //     stop transmitting is precisely when an operator needs the
+        //     interface's real load. Excluding it would make the one metric
+        //     that could explain a saturated link read zero.
+        self.record_rx(iface_idx, link_frame_wire_len(frame.payload.len()), now);
         // The smoothed link quality to this neighbor, used to clamp any OGM's
         // advertised TQ so a node can't claim a path better than the link we
         // measure to it.  `quality_for` yields `None` for a link that has never
@@ -1132,27 +1205,33 @@ impl<
         // cannot measure would wrongly zero every TQ through it.
         let local_quality = self.link_quality.quality_for(frame.src, iface_idx);
 
-        // 0b. Account the frame against this interface's ingress rate before any
-        //     demux, so even frames the upper layers drop still register as
-        //     received throughput on the wire. (Again, this no longer holds
-        //     when `auth_locked()`: such frames never reach this point.)
-        self.record_rx(iface_idx, link_frame_wire_len(frame.payload.len()), now);
+        // A shunned sender is silenced for everything but the auth control
+        // plane, which is deliberately still admitted.  A node the authority
+        // re-admitted carries its new certificate only inside an OGM (resolved,
+        // under lazy distribution, by a CertReq/CertReply exchange), and
+        // caching that certificate is the *only* thing that clears the shun —
+        // so dropping those first would lock a re-admitted node out until the
+        // record passively expired, undoing revoking by invalidity date rather
+        // than by MAC forever.  Nothing is admitted by being let through here:
+        // `verify_ogm` still judges the certificate against the record, and
+        // one issued before it is still rejected.
+        if shunned
+            && !matches!(
+                packet_type,
+                Some(BatmanPacketType::Ogm)
+                    | Some(BatmanPacketType::CertReq)
+                    | Some(BatmanPacketType::CertReply)
+            )
+        {
+            trace!("drop: revoked sender");
+            return RxOutcome::empty();
+        }
 
         // 1. Add a record to the identifier table
         self.ident_table.add_record(iface_idx, frame.dst);
         // 2. Demux by Protocol ID
         match frame.protocol.get() {
             DEFAULT_BATMAN_ETHER_TYPE => {
-                // The frame's BATMAN sub-type, decoded once for every gate and
-                // demux below.  `None` is an empty payload or a sub-type this
-                // build does not know — neither is gated nor specially handled
-                // here; the engine routes it by destination.
-                let packet_type = frame
-                    .payload
-                    .first()
-                    .copied()
-                    .and_then(BatmanPacketType::from_u8);
-
                 // Per-link receive gating: drop a traffic class this link is
                 // configured not to accept before it can touch the routing
                 // tables, be delivered, or generate a re-flood.  The rx-rate
@@ -1180,10 +1259,26 @@ impl<
 
                 // Opt-in control-plane segregation: when auth is enabled, an OGM
                 // that does not verify against our trust anchor is dropped before
-                // it can touch the routing table.  Only OGMs are gated here (the
-                // one-to-many control plane).  Data-plane frames (BCAST/UNICAST/
-                // MCAST) are NOT authenticated yet — an outsider can still inject
-                // them until the pairwise data-plane tag lands; see auth.rs scope.
+                // it can touch the routing table.  Only OGMs are gated *here*,
+                // and only because this is the layer that can gate them.
+                //
+                // The data plane is gated a layer up rather than not at all:
+                // `strip_directed` (`wayfinder-driver-core`) verifies a pairwise
+                // tag on every *directed* frame — unicast and mcast — before
+                // this function is reached, on every driver shell, and drops
+                // one that fails. `docs/design/09-mesh-auth-gaps.md` §4 has the
+                // detail; it is a receiver-bound authenticator with a
+                // monotonic per-neighbour counter, so an outsider holding no
+                // pairwise key cannot produce or replay one.
+                //
+                // What genuinely has no authenticator is **broadcast**, which
+                // `strip_directed` exempts by construction: a pairwise tag is
+                // by definition not one-to-many, exactly as an OGM's signature
+                // is. Say "broadcast", then, and not "the data plane" — this
+                // comment used to claim BCAST/UNICAST/MCAST alike were
+                // unauthenticated, which was true when written and has since
+                // been copied into two tickets and a merge request as though
+                // it still were.
                 if packet_type == Some(BatmanPacketType::Ogm)
                     && let Some(auth) = self.auth.as_mut()
                 {
@@ -4560,6 +4655,174 @@ mod ogm_auth_integration {
                  block every other candidate's proof renewal",
             );
         assert_eq!(target, mac(2));
+    }
+
+    /// Whether `r` currently holds a link-quality row for `neighbor` — the
+    /// thing `GetLinkQualityTable` reports, and the dashboard row this is all
+    /// about.
+    fn has_link_quality_row(r: &CentralRouter, neighbor: Mac) -> bool {
+        r.link_quality_records()
+            .iter()
+            .any(|e| e.neighbor == neighbor)
+    }
+
+    /// A revoked node that is still on the wire stops appearing in the
+    /// link-quality table.
+    ///
+    /// Regression test for the "revoked node still shows a signal-quality row"
+    /// report. Three things stacked up to produce it. Link-quality accounting
+    /// is deliberately *pre-auth* — a frame contributes its signal information
+    /// before any upper layer can drop it — so a revoked node kept re-creating
+    /// its row on every frame. The only thing that removed rows ran on the
+    /// periodic tick (`retain_live`, against the originator table the
+    /// revocation had purged), so the row was deleted once per tick and
+    /// reinserted milliseconds later. Essentially every read saw it.
+    ///
+    /// Both halves are asserted here: the row must go *at ingestion* rather
+    /// than at the next tick, and a further frame from a node that has not
+    /// stopped transmitting must not bring it back.
+    #[test]
+    fn a_revoked_sender_stops_populating_the_link_quality_table() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut node = router_with_auth(&authority, mac(1), 2);
+        let revoked = mac(9);
+
+        // Baseline: an ordinary member's OGM builds the row this is about.
+        let mut peer = router_with_auth(&authority, revoked, 3);
+        let ogm = poll_ogm_bytes(&mut peer);
+        assert_eq!(feed(&mut node, revoked, &ogm), 1);
+        assert!(
+            has_link_quality_row(&node, revoked),
+            "the row must exist before revocation, or this proves nothing"
+        );
+
+        // `not_before = 50` is at or after the peer's certificate was issued
+        // (`router_with_auth` issues from 0), so the record cancels it.
+        let record = authority.revoke(revoked, 50, 1_000_000);
+        assert!(node.ingest_revocation(&record, Duration::ZERO));
+        assert!(
+            !has_link_quality_row(&node, revoked),
+            "the row must go when the revocation lands, not at the next tick — a \
+             management read between the two would still show the revoked node"
+        );
+
+        // The revoked node does not know it was revoked, so it keeps emitting.
+        // This is the frame that used to re-create the row.
+        let ogm = poll_ogm_bytes(&mut peer);
+        assert_eq!(
+            feed(&mut node, revoked, &ogm),
+            0,
+            "a revoked node must not be learned as an originator again"
+        );
+        assert!(
+            !has_link_quality_row(&node, revoked),
+            "a frame from a revoked sender must not re-create its link-quality row"
+        );
+    }
+
+    /// A node the authority re-admitted is accepted again, row and all.
+    ///
+    /// The gate above keys on the *link source*, before anything verifies the
+    /// frame — so the obvious form of it (drop every frame from a MAC we hold a
+    /// record for) would lock a re-admitted node out permanently. Its new
+    /// certificate reaches this node only inside an OGM, and caching it is what
+    /// clears the shun; dropping the OGM first means the shun can never clear
+    /// and the node waits out `not_after`. That is exactly what revoking by
+    /// invalidity date rather than by MAC forever exists to avoid, so the
+    /// control plane is deliberately not gated here.
+    #[test]
+    fn a_readmitted_node_is_not_locked_out_by_the_revoked_sender_gate() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut node = router_with_auth(&authority, mac(1), 2);
+        let readmitted = mac(9);
+
+        let record = authority.revoke(readmitted, 50, 1_000_000);
+        assert!(node.ingest_revocation(&record, Duration::ZERO));
+
+        // Re-issued *after* the revocation instant: a deliberate re-admission,
+        // which `RevocationRecord::cancels` spares.
+        let kp = Keypair::from_seed(&[3; 32]);
+        let cert = authority.issue_cert(readmitted, kp.ed_pubkey(), kp.x_pubkey(), 60, 1000);
+        let mut peer = CentralRouter::new(readmitted);
+        let mut auth = crate::auth::OgmAuth::new(kp, cert, authority.trust_anchor());
+        auth.set_time(100);
+        peer.set_auth(auth);
+
+        let ogm = poll_ogm_bytes(&mut peer);
+        assert_eq!(
+            feed(&mut node, readmitted, &ogm),
+            1,
+            "a certificate issued after the revocation must still be admitted"
+        );
+
+        // The re-admitting OGM's *own* signal sample is skipped: the shun is
+        // evaluated once, when the frame arrives, and this is the very frame
+        // that clears it. One sample, and it heals itself on the next frame —
+        // which is worth far less than keeping the accounting pre-auth for
+        // every sender that is not shunned.
+        assert!(
+            !has_link_quality_row(&node, readmitted),
+            "the frame that clears the shun is still judged by the state it arrived under"
+        );
+        let ogm = poll_ogm_bytes(&mut peer);
+        feed(&mut node, readmitted, &ogm);
+        assert!(
+            has_link_quality_row(&node, readmitted),
+            "a re-admitted node's link quality must be measured again"
+        );
+    }
+
+    /// A revoked node carries no data, including data it is only relaying.
+    ///
+    /// The gate is on the *link source*, so a frame a revoked node forwards on
+    /// behalf of an honest originator is dropped along with the ones it
+    /// originates. That is the intended reading — a revoked node is off the
+    /// mesh, not merely unable to speak for itself — and it is worth pinning
+    /// down, because the frame here is signed by nobody and originated by
+    /// somebody perfectly legitimate.
+    ///
+    /// Not a claim that the data plane is authenticated: it is not, and an
+    /// outsider spoofing `frame.src` still gets through until the pairwise tag
+    /// lands (§4 of `docs/design/09-mesh-auth-gaps.md`). This closes the case
+    /// where the node is *known*, which is the one revocation is about.
+    #[test]
+    fn a_revoked_relay_carries_no_data_frame() {
+        const INNER: &[u8] = &[0x45, 0x00, 0x00, 0x1c, 0xde, 0xad];
+        let relay = mac(9);
+
+        let mut payload = Vec::new();
+        let hdr = BatmanBroadcastPacket {
+            packet_type: BatmanPacketType::Bcast.as_u8(),
+            version: 5,
+            ttl: 50,
+            seqno: 7u32.to_be(),
+            // Originated by an honest third party — only the relay is revoked.
+            orig: mac(3),
+        };
+        payload.extend_from_slice(hdr.as_bytes());
+        payload.extend_from_slice(INNER);
+        let bytes = link_frame(relay, &payload);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut node = router_with_auth(&authority, mac(1), 2);
+        let record = authority.revoke(relay, 50, 1_000_000);
+        assert!(node.ingest_revocation(&record, Duration::ZERO));
+
+        let mut tx = [0u8; 256];
+        let outcome = node.handle_frame(Duration::ZERO, 0, frame, &mut tx);
+        assert!(
+            outcome.forward.is_none(),
+            "a revoked node's relayed frame must not be re-flooded"
+        );
+        assert!(
+            outcome.deliver_local.is_none(),
+            "a revoked node's relayed frame must not be delivered to the host"
+        );
+        assert!(
+            !has_link_quality_row(&node, relay),
+            "and it must not restore the relay's link-quality row on the way past"
+        );
     }
 }
 
