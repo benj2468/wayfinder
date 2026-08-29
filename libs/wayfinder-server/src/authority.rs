@@ -1878,31 +1878,91 @@ impl MeshAuthority for CertAuthority {
         let ed = fixed::<32>(ed_pubkey, "ed_pubkey")?;
         let x = fixed::<32>(x_pubkey, "x_pubkey")?;
 
-        // A MAC that already holds a still-valid, non-revoked certificate is handled off
+        // A MAC that already holds a certificate inside its validity window is handled off
         // `issued` (not `held`, which is evicted at pending_ttl) so protection outlives the
         // held entry: the holder's own re-enrolment under the same ed key is re-issued
         // immediately (never re-parked for approval again — a duplicate MAC must not create
         // another held entry), while a *different* key claiming that MAC is rejected (a
         // second live cert for one MAC would let a new key impersonate the holder). The MAC
         // stays protected until its cert passively expires, the point at which re-keying is safe.
-        if let Some(same_key) = self
+        //
+        // Revocation does **not** lift that protection, and this is the subtle
+        // half. The record is matched on its validity window, not on its
+        // revocation status, so a revoked MAC is still MAC-locked; the
+        // `revoked` flag only decides what the *holder* gets, never whether
+        // anyone else may take the address. Reading the flag in the `find`
+        // predicate instead — which is what this did — made a revoked record
+        // invisible here, so revoking a node handed its MAC to whoever asked
+        // next, under a key of their choosing. Since a revocation is judged by
+        // date, the certificate that yielded post-dated the record and was
+        // honoured mesh-wide: revocation defeated by the act of revoking.
+        //
+        // The lock this builds is only as long-lived as the *issued record*,
+        // which is a narrower thing than the revocation: `revoke` stamps its
+        // `RevocationRecord` `not_after` at `now + cert_ttl_secs`, so it
+        // outlives the certificate it cancels, and this log row does not.
+        // Between the row expiring and the revocation expiring the MAC is
+        // free again. See `a_revoked_mac_is_only_locked_while_its_record_lives`
+        // for the exact window, and issue #37 for closing it — the fix is to
+        // consult persisted revocations rather than to widen this predicate.
+        //
+        // Read the two facts out rather than keeping the record borrowed:
+        // `issue` below takes `&mut self`.
+        let holder = self
             .log
             .issued()
             .iter()
-            .find(|c| c.node_mac == mac.0 && !c.revoked && self.now_unix() <= c.not_after)
-            .map(|c| c.ed_pubkey == ed)
-        {
-            return Ok(if same_key {
-                CsrOutcome::Issued(self.issue(mac, ed, x)?)
-            } else {
-                CsrOutcome::Rejected(
-                    "this MAC already has a valid certificate under a different key".to_string(),
-                )
-            });
+            .find(|c| c.node_mac == mac.0 && self.now_unix() <= c.not_after)
+            .map(|c| (c.ed_pubkey == ed, c.revoked));
+        // Named here because the case it describes is the one that *falls
+        // through* the block below, and so is read again past it.
+        let revoked_holder = matches!(holder, Some((_, true)));
+
+        if let Some((same_key, revoked)) = holder {
+            if !same_key {
+                // Someone else's address. The wording does not distinguish a
+                // revoked record from a live one: the caller holds no
+                // credential for this MAC either way, and which it is, is the
+                // authority's business.
+                //
+                // Logged because this is the impersonation attempt the lock
+                // exists for, and an operator watching a MAC collision needs
+                // to tell it from a node that is merely stuck. The MAC is not
+                // a secret — every OGM carries one — and the keys are not
+                // logged.
+                tracing::warn!(
+                    node_mac = ?mac,
+                    "drop: CSR for a MAC already certified under a different key"
+                );
+                return Ok(CsrOutcome::Rejected(
+                    "this MAC already has a certificate under a different key".to_string(),
+                ));
+            }
+            if !revoked {
+                // The holder, still in good standing: re-issue on the spot.
+                return Ok(CsrOutcome::Issued(self.issue(mac, ed, x)?));
+            }
+            // The holder, revoked: fall through to the approval path below —
+            // never to `issue`, which would clear the `revoked` flag it is
+            // standing on. Revocation ejects a node that still holds its own
+            // key, so the key is exactly what the ejected party has.
+            //
+            // Worth a line of its own: under `auto_approve` this request used
+            // to be answered with a certificate, and now silently joins a
+            // queue nobody is necessarily watching.
+            tracing::warn!(
+                node_mac = ?mac,
+                "enrollment request from a revoked holder parked for operator approval"
+            );
         }
 
-        // Approval is automatic: sign immediately.
-        if self.auto_approve {
+        // Approval is automatic: sign immediately — unless the record this MAC
+        // holds is flagged revoked. An operator revoking a node and a config
+        // saying "sign for whoever asks" are both deliberate, and where they
+        // collide the specific, later act wins: re-admission is parked for
+        // approval rather than granted on the spot. Without this, `auto_approve`
+        // let a revoked node re-enroll itself the moment it was ejected.
+        if self.auto_approve && !revoked_holder {
             return Ok(CsrOutcome::Issued(self.issue(mac, ed, x)?));
         }
 
@@ -3522,9 +3582,11 @@ mod tests {
 
     #[test]
     fn revoked_same_key_resubmit_is_not_reissued() {
-        // Proves the `!c.revoked` term in the same-key shortcut is load-bearing:
-        // a revoked holder must go back through approval, not be silently
-        // re-issued a fresh certificate on the same key.
+        // Proves the revoked-holder branch of the MAC-lock is load-bearing: a
+        // revoked holder must go back through approval, not be silently
+        // re-issued a fresh certificate on the same key. (This used to name the
+        // `!c.revoked` term in the `find` predicate, which no longer exists —
+        // the flag now selects a branch rather than filtering the record out.)
         //
         // A short `pending_ttl_secs` (with a long `cert_ttl_secs`) is used so the
         // held (Approved) entry ages out of `held` before we revoke — otherwise
@@ -3561,6 +3623,206 @@ mod tests {
             ca.submit_csr(&mac, &ed, &x, "").unwrap(),
             CsrOutcome::Pending
         ));
+    }
+
+    /// Revoking a MAC must not hand it to the next caller that asks for it.
+    ///
+    /// The MAC-lock's `find` used to carry `!c.revoked`, so a revoked record
+    /// matched nothing and the request fell straight through to the issuing
+    /// paths below — under `auto_approve`, to a root-signed certificate binding
+    /// the just-revoked MAC to the *caller's* key. A revocation is judged by
+    /// date, so once a second has passed that fresh certificate post-dates the
+    /// record and is honoured mesh-wide: revocation defeated by the act of
+    /// revoking. (`RevocationRecord::cancels` resolves an exact tie toward
+    /// revoked, which is why the clock moves below — otherwise the scenario
+    /// this describes would not be the one the test runs.)
+    ///
+    /// `auto_approve` is the sharp case — no operator ever sees the request —
+    /// so it is what this pins.
+    #[test]
+    fn a_different_key_cannot_reclaim_a_revoked_mac() {
+        let mut ca = open_ca();
+        let (ed1, x1) = node_keys(2);
+        let (ed2, x2) = node_keys(3);
+        let mac = [0, 0, 0, 0, 0, 9];
+
+        assert!(matches!(
+            ca.submit_csr(&mac, &ed1, &x1, "").unwrap(),
+            CsrOutcome::Issued(_)
+        ));
+        ca.revoke(&mac).unwrap();
+        // Past the revocation's instant, so a certificate minted now would
+        // out-date it. Still well inside the issued record's window.
+        ca.set_now_unix(101);
+
+        // The MAC stays bound to the key it was issued to. Re-keying waits for
+        // that certificate to passively expire, exactly as it does for a MAC
+        // that was never revoked.
+        let outcome = ca.submit_csr(&mac, &ed2, &x2, "").unwrap();
+        let CsrOutcome::Rejected(why) = outcome else {
+            panic!("a revoked MAC was claimable by a key that never held it: {outcome:?}");
+        };
+        // The refusal must not be a revocation oracle. An anonymous caller
+        // learns that the MAC is taken — which it could infer by asking — and
+        // not that this node was ejected from the mesh.
+        assert!(
+            !why.to_lowercase().contains("revok"),
+            "the refusal told a stranger this MAC was revoked: {why}"
+        );
+        assert_eq!(ca.list_certs().len(), 1, "no second cert for the MAC");
+        assert!(
+            ca.list_certs()[0].revoked,
+            "and the revocation still stands"
+        );
+        // A rejected claim must not occupy the MAC's approval slot either: an
+        // operator reading `list_pending` sees bare MACs, and could not tell a
+        // squatted entry from the legitimate node's.
+        assert!(
+            ca.log.held().is_empty(),
+            "a rejected claim parked a held entry for the MAC"
+        );
+    }
+
+    /// The lock above lasts exactly as long as the *issued record*, which is
+    /// strictly shorter than the revocation that made it matter. This pins the
+    /// gap so it is a known, measured limitation rather than a surprise.
+    ///
+    /// `revoke` stamps `RevocationRecord::not_after` at `now + cert_ttl_secs`,
+    /// deliberately outliving the certificate it cancels — but the issued row
+    /// this guard reads keeps the *original* `not_after`. Between the two the
+    /// MAC is unlocked while still revoked, so a stranger can be issued a
+    /// certificate that post-dates the revocation and is honoured mesh-wide.
+    /// The window is as long as the node was enrolled before being revoked.
+    ///
+    /// Closing it means consulting persisted revocations instead of inferring
+    /// them from the issued log — a new persisted collection and a state-schema
+    /// bump, tracked as issue #37. **When that lands this test should start
+    /// failing**, and its assertion is written to say so.
+    #[test]
+    fn a_revoked_mac_is_only_locked_while_its_record_lives() {
+        let mut ca = open_ca(); // auto_approve, cert_ttl_secs = 1000
+        let (ed1, x1) = node_keys(2);
+        let (ed2, x2) = node_keys(3);
+        let mac = [0, 0, 0, 0, 0, 9];
+
+        // Enrolled at 100, so the issued row expires at 1100.
+        assert!(matches!(
+            ca.submit_csr(&mac, &ed1, &x1, "").unwrap(),
+            CsrOutcome::Issued(_)
+        ));
+        // Revoked at 600, so the revocation runs to 1600.
+        ca.set_now_unix(600);
+        let record = ca.revoke(&mac).unwrap();
+        assert_eq!(record.not_after, 1600, "the revocation outlives the cert");
+
+        // 1101: the issued row has expired, the revocation has not.
+        ca.set_now_unix(1101);
+        let outcome = ca.submit_csr(&mac, &ed2, &x2, "").unwrap();
+        assert!(
+            matches!(outcome, CsrOutcome::Issued(_)),
+            "issue #37 appears to be fixed — a stranger can no longer claim a \
+             revoked MAC once its issued row expires. Delete this test and \
+             fold the case into a_different_key_cannot_reclaim_a_revoked_mac. \
+             Got: {outcome:?}"
+        );
+    }
+
+    /// The revoked holder cannot re-admit *itself* either, which is the point:
+    /// revocation ejects a node that still holds its own key, so that key is
+    /// precisely what the party being ejected has.
+    ///
+    /// `revoked_same_key_resubmit_is_not_reissued` pins this for an authority
+    /// that parks requests for approval. This is the same rule for one that
+    /// approves automatically: a live revocation suspends `auto_approve` for
+    /// that MAC rather than being overridden by it, so re-admission is an
+    /// operator's decision under both postures.
+    #[test]
+    fn auto_approve_does_not_re_admit_a_revoked_holder() {
+        let mut ca = open_ca();
+        let (ed, x) = node_keys(2);
+        let mac = [0, 0, 0, 0, 0, 9];
+
+        assert!(matches!(
+            ca.submit_csr(&mac, &ed, &x, "").unwrap(),
+            CsrOutcome::Issued(_)
+        ));
+        ca.revoke(&mac).unwrap();
+
+        assert!(
+            matches!(
+                ca.submit_csr(&mac, &ed, &x, "").unwrap(),
+                CsrOutcome::Pending
+            ),
+            "a revoked node re-enrolled itself under auto_approve"
+        );
+        assert_eq!(ca.list_certs().len(), 1, "no second cert for the MAC");
+        assert!(
+            ca.list_certs()[0].revoked,
+            "the revocation stands until an operator approves the re-admission"
+        );
+        assert_eq!(
+            ca.list_pending().len(),
+            1,
+            "and the operator can see the request waiting"
+        );
+    }
+
+    /// Approving that parked request is the way back, and it is the *only* way
+    /// back — so it needs pinning. Re-admission clears the revocation, because
+    /// an operator approving a CSR for a MAC they revoked is deciding exactly
+    /// that; what must not happen is the node arriving there without them.
+    #[test]
+    fn an_operator_can_re_admit_a_revoked_holder_by_approving_its_parked_csr() {
+        let mut ca = open_ca();
+        let (ed, x) = node_keys(2);
+        let mac = [0, 0, 0, 0, 0, 9];
+
+        ca.submit_csr(&mac, &ed, &x, "").unwrap();
+        ca.revoke(&mac).unwrap();
+        assert!(matches!(
+            ca.submit_csr(&mac, &ed, &x, "").unwrap(),
+            CsrOutcome::Pending
+        ));
+
+        ca.approve_csr(&mac)
+            .expect("the parked request is approvable");
+        assert!(
+            matches!(
+                ca.submit_csr(&mac, &ed, &x, "").unwrap(),
+                CsrOutcome::Issued(_)
+            ),
+            "an approved re-admission never yielded a certificate"
+        );
+        assert!(
+            !ca.list_certs()[0].revoked,
+            "re-admission left the node marked revoked"
+        );
+    }
+
+    /// And denying it leaves the ejection standing, rather than quietly
+    /// reopening the MAC.
+    #[test]
+    fn denying_a_revoked_holders_csr_leaves_the_revocation_standing() {
+        let mut ca = open_ca();
+        let (ed, x) = node_keys(2);
+        let mac = [0, 0, 0, 0, 0, 9];
+
+        ca.submit_csr(&mac, &ed, &x, "").unwrap();
+        ca.revoke(&mac).unwrap();
+        ca.submit_csr(&mac, &ed, &x, "").unwrap();
+
+        ca.deny_csr(&mac).expect("the parked request is deniable");
+        assert!(
+            matches!(
+                ca.submit_csr(&mac, &ed, &x, "").unwrap(),
+                CsrOutcome::Rejected(_)
+            ),
+            "a denied re-admission did not report the denial"
+        );
+        assert!(
+            ca.list_certs()[0].revoked,
+            "denial left the node un-revoked"
+        );
     }
 
     #[test]
