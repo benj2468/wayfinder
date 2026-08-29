@@ -16,6 +16,7 @@ use wayfinder::CentralRouter;
 use wayfinder::EgressInterface;
 use wayfinder::auth::OgmAuth;
 use wayfinder::interfaces::frame::Mac;
+use wayfinder::ping::ProbeState;
 use wayfinder::wayfinder_auth::Keypair;
 use wayfinder::wayfinder_auth::MembershipCert;
 use wayfinder::wayfinder_auth::TrustAnchor;
@@ -38,6 +39,10 @@ use wayfinder_protos::service::NodeMetricsData;
 use wayfinder_protos::service::NodeSecurityData;
 use wayfinder_protos::service::OgmScheduleEntryData;
 use wayfinder_protos::service::OwnCertData;
+use wayfinder_protos::service::PingSessionData;
+use wayfinder_protos::service::PingStartData;
+use wayfinder_protos::service::ProbeData;
+use wayfinder_protos::service::ProbeStateData;
 use wayfinder_protos::service::RouteResolutionData;
 use wayfinder_protos::service::RouterReads;
 use wayfinder_protos::service::RouterWrites;
@@ -521,6 +526,47 @@ impl<
     }
 }
 
+/// Project a router-owned [`PingSession`] onto its wire shape.
+///
+/// Free rather than a method because both the status read and the cancel
+/// return the same document, and the one thing here that is easy to get wrong —
+/// how "unmeasured" is spelled — should be got wrong in at most one place.
+fn project_session(session: &wayfinder::ping::PingSession) -> PingSessionData {
+    PingSessionData {
+        session_seq: session.session_seq(),
+        destination: session.target().as_bytes().to_vec(),
+        active: session.active(),
+        requested: u32::from(session.requested()),
+        sent: session.sent(),
+        received: session.received(),
+        lost: session.lost(),
+        // Each unwraps to 0 before anything has been answered. The wire shape
+        // has no room for "unmeasured", so `received` is what a client reads to
+        // tell a genuine zero from a missing one — said once here and once in
+        // the proto comment, because it is the only thing about these four
+        // fields that can be got wrong.
+        rtt_min_us: session.rtt_min_us().unwrap_or(0),
+        rtt_avg_us: session.rtt_avg_us().unwrap_or(0),
+        rtt_max_us: session.rtt_max_us().unwrap_or(0),
+        rtt_mdev_us: session.rtt_mdev_us().unwrap_or(0),
+        payload_bytes: u32::from(session.payload_len()),
+        probes: session
+            .probes()
+            .map(|p| ProbeData {
+                seqno: u32::from(p.seqno),
+                state: match p.state {
+                    ProbeState::Pending => ProbeStateData::Pending,
+                    ProbeState::Replied => ProbeStateData::Replied,
+                    ProbeState::TimedOut => ProbeStateData::TimedOut,
+                    ProbeState::NoRoute => ProbeStateData::NoRoute,
+                },
+                rtt_us: p.rtt_us,
+                forward_hops: u32::from(p.fwd_hops),
+                return_hops: u32::from(p.rev_hops),
+            })
+            .collect(),
+    }
+}
 impl<
     const ORIGINATORS: usize,
     const INTERFACES: usize,
@@ -852,6 +898,10 @@ impl<
         })
     }
 
+    fn ping_session(&self, session_seq: u32) -> Option<PingSessionData> {
+        self.router.ping_session(session_seq).map(project_session)
+    }
+
     fn runtime_config_active(&self) -> bool {
         self.router.runtime_config_active()
     }
@@ -1059,6 +1109,10 @@ impl<
 
     fn resolve_route(&self, destination: &[u8]) -> Option<RouteResolutionData> {
         self.view().resolve_route(destination)
+    }
+
+    fn ping_session(&self, session_seq: u32) -> Option<PingSessionData> {
+        self.view().ping_session(session_seq)
     }
 
     fn runtime_config_active(&self) -> bool {
@@ -1276,6 +1330,55 @@ impl<
             }
         }
         Ok(())
+    }
+
+    /// Start a probe session against `destination`.
+    ///
+    /// A *write* because of what it does to the node, not because of what it
+    /// records: it puts frames on the air at a caller-chosen cadence and
+    /// replaces whatever session was running. Only the malformed-identifier
+    /// case is an error — a well-formed request against a node this router
+    /// cannot reach starts a session perfectly well and reports the
+    /// unreachability probe by probe, which is the answer the operator asked
+    /// for.
+    fn start_ping(
+        &mut self,
+        destination: &[u8],
+        count: u32,
+        interval_ms: u32,
+        timeout_ms: u32,
+        payload_bytes: u32,
+    ) -> Result<PingStartData, String> {
+        // Exact-length parse, for the same reason `resolve_route` insists on
+        // one: a truncated or zero-padded address would silently become a
+        // different node's.
+        let dest = Mac::read_from_bytes(destination).map_err(|_| {
+            alloc::string::String::from("destination is not a valid node identifier")
+        })?;
+
+        // The session comes back with the call, so the settings reported below
+        // are the ones the router actually applied — it owns the defaulting and
+        // the clamping — and there is no lookup-by-handle to assume succeeded.
+        let (session_seq, session) = self.router.start_ping(
+            self.now,
+            dest,
+            count.try_into().unwrap_or(u16::MAX),
+            Duration::from_millis(u64::from(interval_ms)),
+            Duration::from_millis(u64::from(timeout_ms)),
+            payload_bytes.try_into().unwrap_or(u16::MAX),
+        );
+
+        Ok(PingStartData {
+            session_seq,
+            count: u32::from(session.requested()),
+            interval_ms: session.interval().as_millis() as u32,
+            timeout_ms: session.timeout().as_millis() as u32,
+            payload_bytes: u32::from(session.payload_len()),
+        })
+    }
+
+    fn cancel_ping(&mut self, session_seq: u32) -> Option<PingSessionData> {
+        self.router.cancel_ping(session_seq).map(project_session)
     }
 
     /// Install a new runtime log filter, and report the spec now in force.

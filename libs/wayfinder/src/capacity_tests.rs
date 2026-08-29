@@ -179,3 +179,17 @@ fn tables_shrink_with_the_profile() {
     assert!(size_of::<IdentTable<u8, 16, 12>>() * 4 < size_of::<IdentTable<u8>>());
     assert!(size_of::<LinkQualityTable<u8, 16>>() * 3 < size_of::<LinkQualityTable<u8>>());
 }
+
+/// What the probe session costs, stated as a number rather than left to
+/// accumulate unnoticed. It lands in *every* profile — a session is fixed-size
+/// on purpose, so a board pays the same bytes a gateway does — which is exactly
+/// why it needs a ceiling somebody has to raise deliberately.
+#[test]
+fn a_ping_session_stays_small_enough_for_a_board() {
+    let session = size_of::<Option<crate::ping::PingSession>>();
+    assert!(
+        session <= 512,
+        "a ping session is {session} B; it is carried by every node including \
+         an nRF52840, so growing it past 512 B should be a deliberate call"
+    );
+}

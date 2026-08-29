@@ -75,6 +75,41 @@ Central router orchestration. `no_std`; the `std` feature enables `DynLinkT`.
     second near-copy to keep in step. `RouterAdapter` (and the one
     `#[cfg(feature = "mgmt")]` impl in `wayfinder-embedded-driver` that feeds
     it) therefore still spell the capacities out.
+- `ping.rs` (`PingSession`) — the node's single reachability-probe session, the
+  mesh's `ping`. **The node owns the session, not the client**: probes are paced
+  on the node's own timer and round trips measured against its own clock, so
+  interposing a management round trip between "send" and the reading that dates
+  it would measure the management link as much as the mesh — and an nRF52840
+  pings over exactly the same code a Linux gateway does. A client holds only a
+  *handle* (`session_seq`), presented on every status read; a node runs one
+  session at a time and a new one replaces it, so without the handle a client
+  whose session had been displaced would silently report somebody else's round
+  trips. Fixed-size (~350 B on every profile): a 16-row ring bounds the
+  *display*, while the aggregates are folded as probes resolve, so loss and
+  min/avg/max/mdev stay exact however long a session runs.
+
+  `CentralRouter::start_ping` / `poll_ping` / `next_ping_after` /
+  `ping_session` / `cancel_ping` are the surface; `poll_ping` emits **at most one probe per
+  call, paced from `now`**, deliberately unlike `poll`/`poll_challenge` whose
+  callers loop — a shell that slept through three intervals must not wake to a
+  burst, which would time the burst rather than the path. A driver that sleeps
+  must fold `next_ping_after` into the same `min` as its OGM and keep-alive
+  deadlines. Probes ride the `tx_data`/`rx_data` gates in **both** directions:
+  a probe exists to prove the data path, so on a link that carries no data it
+  proves nothing, and gating one direction only would have a node answering
+  probes on a link it will not carry data over.
+
+  `cancel_ping` is handle-guarded like `ping_session`, and more sharply: without
+  the check a client polling a session that had already been displaced would
+  stop *somebody else's* run on its way out. It keeps the statistics rather than
+  discarding them — as `ping(8)` prints its summary on Ctrl+C, since the probes
+  that completed are the answer the operator was waiting for and the airtime is
+  spent either way — and it must both pull `requested` down to what was emitted
+  *and* resolve every outstanding probe. Missing either leaves the session
+  undead: still `active`, still polled, still reporting a deadline a driver will
+  wake on. Because the node owns the session, **a client that merely exits
+  leaves it running**; `wayfinderctl ping` cancels on Ctrl+C and the TUI binds
+  `c` for it.
 - `config.rs` — per-link Trickle bounds (`i_min_ms`/`i_max_ms`) so a fast LAN
   link and a slow LoRa link back off on different schedules.
 - Observability: `RateEstimator` throughput EWMAs, `TableOccupancy` gauges —

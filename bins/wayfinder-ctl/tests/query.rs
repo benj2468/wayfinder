@@ -20,6 +20,10 @@ use wayfinder_protos::service::LogsData;
 use wayfinder_protos::service::NodeMetricsData;
 use wayfinder_protos::service::NodeSecurityData;
 use wayfinder_protos::service::OgmScheduleEntryData;
+use wayfinder_protos::service::PingSessionData;
+use wayfinder_protos::service::PingStartData;
+use wayfinder_protos::service::ProbeData;
+use wayfinder_protos::service::ProbeStateData;
 use wayfinder_protos::service::RouteResolutionData;
 use wayfinder_protos::service::RouterReads;
 use wayfinder_protos::service::RouterWrites;
@@ -137,6 +141,47 @@ impl RouterReads for Mock {
         None
     }
 
+    /// A finished two-probe session under the handle `start_ping` below
+    /// issues, and nothing under any other handle — so a test can drive the
+    /// whole start-poll-render path while the displaced-session case stays
+    /// reachable, rather than being papered over by a mock that answers to
+    /// anything.
+    fn ping_session(&self, session_seq: u32) -> Option<PingSessionData> {
+        if session_seq != 1 {
+            return None;
+        }
+        Some(PingSessionData {
+            session_seq: 1,
+            destination: vec![0, 0, 0, 0, 0, 2],
+            active: false,
+            requested: 2,
+            sent: 2,
+            received: 1,
+            lost: 1,
+            rtt_min_us: 12_000,
+            rtt_avg_us: 12_000,
+            rtt_max_us: 12_000,
+            rtt_mdev_us: 0,
+            payload_bytes: 16,
+            probes: vec![
+                ProbeData {
+                    seqno: 0,
+                    state: ProbeStateData::Replied,
+                    rtt_us: 12_000,
+                    forward_hops: 2,
+                    return_hops: 3,
+                },
+                ProbeData {
+                    seqno: 1,
+                    state: ProbeStateData::TimedOut,
+                    rtt_us: 0,
+                    forward_hops: 0,
+                    return_hops: 0,
+                },
+            ],
+        })
+    }
+
     fn runtime_config_active(&self) -> bool {
         true
     }
@@ -210,6 +255,40 @@ impl RouterWrites for Mock {
 
     fn set_config(&mut self, _config: RuntimeConfigData) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Accepts a session and echoes back what was asked for, defaulting
+    /// zeroes the way a real node does, but never emits anything: there is
+    /// no mesh behind this mock to probe.
+    fn start_ping(
+        &mut self,
+        destination: &[u8],
+        count: u32,
+        interval_ms: u32,
+        timeout_ms: u32,
+        payload_bytes: u32,
+    ) -> Result<PingStartData, String> {
+        if destination.len() != 6 {
+            return Err("destination must be a 6-byte node identifier".into());
+        }
+        Ok(PingStartData {
+            session_seq: 1,
+            count: if count == 0 { 5 } else { count },
+            interval_ms: if interval_ms == 0 { 1_000 } else { interval_ms },
+            timeout_ms: if timeout_ms == 0 { 5_000 } else { timeout_ms },
+            payload_bytes: if payload_bytes == 0 {
+                16
+            } else {
+                payload_bytes
+            },
+        })
+    }
+
+    /// Honours the handle, answering with the same session the read side
+    /// serves — so the CLI's cancel path is driven end to end and the
+    /// wrong-handle case stays reachable.
+    fn cancel_ping(&mut self, session_seq: u32) -> Option<PingSessionData> {
+        RouterReads::ping_session(self, session_seq)
     }
 
     fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
@@ -529,4 +608,135 @@ async fn logs_query_sends_since_and_max_to_the_node() {
     assert_eq!(parsed["records"][0]["seq"], 41);
     assert_eq!(parsed["next_seq"], 42);
     assert_eq!(parsed["dropped"], 7);
+}
+
+#[tokio::test]
+async fn ping_query_runs_a_session_and_renders_it() {
+    let endpoint = spawn_server().await;
+    let out = run_query(
+        Command::Ping {
+            dest: "00:00:00:00:00:02".into(),
+            count: 2,
+            interval: 10,
+            timeout: 100,
+            size: 16,
+        },
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .expect("query succeeds");
+
+    // The replied probe reports both hop counts and a round trip; the lost one
+    // says so instead of being silently dropped from the output.
+    assert!(
+        out.contains("16 bytes from 00:00:00:00:00:02: seq=0 hops=2/3 time=12.0 ms"),
+        "got: {out}"
+    );
+    assert!(
+        out.contains("no answer from 00:00:00:00:00:02: seq=1"),
+        "got: {out}"
+    );
+    assert!(
+        out.contains("2 probes attempted, 1 received, 50% loss"),
+        "got: {out}"
+    );
+    assert!(out.contains("rtt min/avg/max/mdev"), "got: {out}");
+}
+
+#[tokio::test]
+async fn ping_query_renders_json() {
+    let endpoint = spawn_server().await;
+    let out = run_query(
+        Command::Ping {
+            dest: "00:00:00:00:00:02".into(),
+            count: 2,
+            interval: 10,
+            timeout: 100,
+            size: 16,
+        },
+        &endpoint,
+        OutputFormat::Json,
+    )
+    .await
+    .expect("query succeeds");
+    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(parsed["sent"], 2);
+    assert_eq!(parsed["received"], 1);
+    assert_eq!(parsed["probes"][0]["rtt_us"], 12_000);
+}
+
+/// A destination that is not a node identifier is refused before anything
+/// reaches the wire, rather than probing a truncated address.
+#[tokio::test]
+async fn ping_query_rejects_a_malformed_destination() {
+    let endpoint = spawn_server().await;
+    let err = run_query(
+        Command::Ping {
+            dest: "not-a-mac".into(),
+            count: 1,
+            interval: 10,
+            timeout: 100,
+            size: 0,
+        },
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .expect_err("a malformed destination must be refused");
+    assert!(
+        format!("{err:#}").to_lowercase().contains("hex"),
+        "got: {err:#}"
+    );
+}
+
+/// Cancelling over the wire returns the session as it stood, so the client that
+/// stopped it can print what it measured rather than discarding a run that
+/// already cost the airtime.
+#[tokio::test]
+async fn cancel_ping_returns_the_stopped_session() {
+    let endpoint = spawn_server().await;
+    let mut client = wayfinder_client::Client::connect_tls(
+        &endpoint.addr,
+        &endpoint.node_key,
+        &endpoint.identity,
+    )
+    .await
+    .expect("connect");
+
+    let started = client
+        .ping(vec![0, 0, 0, 0, 0, 2], 5, 10, 100, 16)
+        .await
+        .expect("start");
+    let cancelled = client
+        .cancel_ping(started.session_seq)
+        .await
+        .expect("cancel succeeds");
+
+    let session = cancelled
+        .session
+        .expect("our own handle cancels our session");
+    assert!(!session.active, "a cancelled session has no work left");
+    assert_eq!(session.received, 1, "and keeps what it measured");
+}
+
+/// A handle the node is not running cancels nothing, and that is success rather
+/// than an error: cancelling is what a client does on its way out, and a
+/// session that has already stopped is the outcome it wanted.
+#[tokio::test]
+async fn cancelling_an_unknown_handle_is_not_an_error() {
+    let endpoint = spawn_server().await;
+    let mut client = wayfinder_client::Client::connect_tls(
+        &endpoint.addr,
+        &endpoint.node_key,
+        &endpoint.identity,
+    )
+    .await
+    .expect("connect");
+
+    let cancelled = client
+        .cancel_ping(9_999)
+        .await
+        .expect("cancel is not an error");
+    assert!(cancelled.session.is_none());
 }

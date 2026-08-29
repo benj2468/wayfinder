@@ -32,6 +32,9 @@ use wayfinder_protos::wayfinder::v1alpha::AlarmSeverity;
 use wayfinder_protos::wayfinder::v1alpha::Alarms;
 use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesEntry;
 use wayfinder_protos::wayfinder::v1alpha::LogLevel;
+use wayfinder_protos::wayfinder::v1alpha::PingProbe;
+use wayfinder_protos::wayfinder::v1alpha::PingProbeState;
+use wayfinder_protos::wayfinder::v1alpha::PingSession;
 use wayfinder_protos::wayfinder::v1alpha::alarm::Subject as AlarmSubject;
 
 use crate::app::App;
@@ -616,7 +619,174 @@ fn render_routing(frame: &mut Frame, app: &mut App, area: Rect) {
     .highlight_symbol("▶ ");
 
     frame.render_stateful_widget(table, cols[0], &mut app.routing_state);
-    render_path_detail(frame, app, cols[1]);
+
+    // The right column carries two answers to the same question, stacked: what
+    // the routing table *believes* about this destination, and — underneath —
+    // what a probe actually found. Keeping them adjacent is the point of
+    // putting ping here rather than on a tab of its own.
+    let detail = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(11)])
+        .split(cols[1]);
+    render_path_detail(frame, app, detail[0]);
+    render_ping_detail(frame, app, detail[1]);
+}
+
+/// Draw the probe panel beneath the path breakdown: the session this client
+/// started against the selected originator, or the hint that starts one.
+///
+/// Shows a session only when it is *for the selected row*. Moving the selection
+/// therefore returns this to the hint rather than leaving one target's round
+/// trips sitting under another's row, which is the way a panel like this
+/// misleads.
+fn render_ping_detail(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(" Ping ");
+    let selected = app
+        .routing_state
+        .selected()
+        .and_then(|i| app.snapshot.routing.entries.get(i));
+
+    let hint = |text: &str| {
+        vec![Line::from(Span::styled(
+            text.to_string(),
+            Style::default().fg(Color::DarkGray),
+        ))]
+    };
+
+    let lines: Vec<Line> = match selected {
+        None => hint("Select an originator, then press p to ping it."),
+        Some(entry) if !app.ping_is_for(&entry.destination) => {
+            hint("Press p to ping this originator.")
+        }
+        // `ping_is_for` returned true, so the view is there. Falling back to
+        // the hint rather than returning early: an early return would skip
+        // `render_widget` below and leave an unexplained hole in the layout
+        // where the bordered pane should be.
+        Some(_) => match app.ping.as_ref() {
+            None => hint("Press p to ping this originator."),
+            Some(view) => {
+                let mut out = Vec::new();
+                if view.displaced {
+                    out.push(Line::from(Span::styled(
+                        // Two causes, one message: the node answers a handle it
+                        // no longer knows the same way whether somebody else
+                        // took the session or it restarted. Naming only the
+                        // first would hand an operator debugging a crash-looping
+                        // node a wrong lead.
+                        "Session no longer running (replaced, or the node restarted).",
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
+                if let Some(error) = &view.error {
+                    out.push(Line::from(Span::styled(
+                        format!("Cannot read session: {error}"),
+                        Style::default().fg(Color::Red),
+                    )));
+                }
+                match &view.session {
+                    None => out.extend(hint("Starting…")),
+                    Some(session) => out.extend(ping_lines(session)),
+                }
+                out
+            }
+        },
+    };
+
+    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    frame.render_widget(para, area);
+}
+
+/// The probe rows and running summary for one session.
+fn ping_lines(session: &PingSession) -> Vec<Line<'static>> {
+    let mut out = vec![Line::from(vec![
+        Span::styled(
+            format!("{}/{} sent", session.sent, session.requested),
+            Style::default().fg(Color::White),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("{} recv", session.received),
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("{} lost", session.lost),
+            if session.lost > 0 {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ),
+        Span::raw("  "),
+        Span::styled(
+            if session.active { "running" } else { "done" },
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])];
+
+    // Omitted entirely until something has been answered: rendering
+    // `0.0/0.0/0.0` would be reporting a measurement nobody took.
+    if session.received > 0 {
+        out.push(Line::from(Span::styled(
+            format!(
+                "rtt {} / {} / {} ms  (min/avg/max)",
+                fmt_ms(session.rtt_min_us),
+                fmt_ms(session.rtt_avg_us),
+                fmt_ms(session.rtt_max_us),
+            ),
+            Style::default().fg(ACCENT),
+        )));
+    }
+
+    // Newest first: a running ping is watched at its leading edge, and the
+    // pane is shorter than the node's window.
+    for probe in session.probes.iter().rev() {
+        out.push(ping_probe_line(probe));
+    }
+    out
+}
+
+/// One probe's row, coloured by what became of it.
+fn ping_probe_line(probe: &PingProbe) -> Line<'static> {
+    let (text, style) = match probe.state() {
+        PingProbeState::Replied => (
+            format!(
+                "  seq {:<4} {:>8} ms  hops {}/{}",
+                probe.seqno,
+                fmt_ms(probe.rtt_us),
+                probe.forward_hops,
+                probe.return_hops,
+            ),
+            Style::default().fg(Color::Green),
+        ),
+        PingProbeState::Pending => (
+            format!("  seq {:<4}        …", probe.seqno),
+            Style::default().fg(Color::DarkGray),
+        ),
+        PingProbeState::NoRoute => (
+            format!("  seq {:<4}   no route", probe.seqno),
+            Style::default().fg(Color::Red),
+        ),
+        // A timeout, and anything a newer node might report that this build
+        // does not know: both mean "no answer", which is worth a row rather
+        // than a silent omission.
+        _ => (
+            format!("  seq {:<4}  no answer", probe.seqno),
+            Style::default().fg(Color::Red),
+        ),
+    };
+    Line::from(Span::styled(text, style))
+}
+
+/// Microseconds as milliseconds, keeping the precision a sub-millisecond round
+/// trip deserves — on a local link `0.0` would read as broken rather than fast.
+fn fmt_ms(us: u32) -> String {
+    let ms = f64::from(us) / 1000.0;
+    if ms < 1.0 {
+        format!("{ms:.3}")
+    } else {
+        format!("{ms:.1}")
+    }
 }
 
 /// Title for the routing table, including a count.
@@ -1591,6 +1761,25 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::raw(" toggle gate  "));
     }
 
+    // Routing-tab probe: the one action reachable from a read-only-looking tab,
+    // so it needs saying.
+    if app.tab == Tab::Routing {
+        spans.push(Span::styled(
+            " p ",
+            Style::default().fg(Color::Black).bg(Color::Green),
+        ));
+        spans.push(Span::raw(" ping  "));
+        // Advertised only while there is something to stop, so the footer says
+        // what the key will actually do right now.
+        if app.ping.as_ref().is_some_and(|v| v.needs_poll()) {
+            spans.push(Span::styled(
+                " c ",
+                Style::default().fg(Color::Black).bg(Color::Red),
+            ));
+            spans.push(Span::raw(" cancel  "));
+        }
+    }
+
     // Security-tab operator actions (provider node only): approve/deny CSRs,
     // revoke originators, and Tab to switch which panel has focus.
     if app.tab == Tab::Security && app.snapshot.pending_csrs.is_some() {
@@ -2122,5 +2311,164 @@ mod tests {
     fn iface_label_falls_back_to_index() {
         assert_eq!(iface_label("wlan0", 2), "wlan0");
         assert_eq!(iface_label("", 2), "#2");
+    }
+
+    // ---- the ping panel on the Routing tab ------------------------------
+
+    /// One originator, so the Routing tab has a row to select.
+    fn app_with_one_originator() -> App {
+        let mut app = App::new("test".to_string(), 1000);
+        app.tab = Tab::Routing;
+        app.snapshot.routing = wayfinder_protos::wayfinder::v1alpha::RoutingTable {
+            entries: vec![wayfinder_protos::wayfinder::v1alpha::RoutingEntry {
+                destination: vec![0, 0, 0, 0, 0, 9],
+                next_hop: vec![0, 0, 0, 0, 0, 2],
+                tq: 200,
+                last_seqno: 4,
+                paths: vec![],
+            }],
+        };
+        app.routing_state.select(Some(0));
+        app
+    }
+
+    fn probe(seqno: u32, state: PingProbeState, rtt_us: u32) -> PingProbe {
+        PingProbe {
+            seqno,
+            state: state as i32,
+            rtt_us,
+            forward_hops: 2,
+            return_hops: 3,
+        }
+    }
+
+    fn session_for(destination: Vec<u8>, probes: Vec<PingProbe>) -> PingSession {
+        PingSession {
+            session_seq: 1,
+            destination,
+            active: true,
+            requested: 5,
+            sent: 2,
+            received: 1,
+            lost: 1,
+            rtt_min_us: 12_000,
+            rtt_avg_us: 12_000,
+            rtt_max_us: 12_000,
+            rtt_mdev_us: 0,
+            payload_bytes: 16,
+            probes,
+        }
+    }
+
+    /// With no session running, the panel tells the operator how to start one —
+    /// which is the whole discoverability story for a key that is not on a tab
+    /// of its own.
+    #[test]
+    fn the_ping_panel_advertises_the_key_when_idle() {
+        let mut app = app_with_one_originator();
+        let text = rendered(&mut app);
+        assert!(text.contains("Press p to ping"), "got: {text}");
+        assert!(text.contains(" p  ping"), "the footer names it too: {text}");
+    }
+
+    /// A running session reports its counts, its RTT spread, and each probe.
+    #[test]
+    fn the_ping_panel_reports_a_running_session() {
+        let mut app = app_with_one_originator();
+        app.ping = Some(crate::app::PingView {
+            session_seq: 1,
+            destination: vec![0, 0, 0, 0, 0, 9],
+            session: Some(session_for(
+                vec![0, 0, 0, 0, 0, 9],
+                vec![
+                    probe(0, PingProbeState::Replied, 12_000),
+                    probe(1, PingProbeState::TimedOut, 0),
+                ],
+            )),
+            displaced: false,
+            error: None,
+        });
+
+        let text = rendered(&mut app);
+        assert!(text.contains("2/5 sent"), "got: {text}");
+        assert!(text.contains("1 recv"), "got: {text}");
+        assert!(text.contains("1 lost"), "got: {text}");
+        assert!(text.contains("hops 2/3"), "both legs reported: {text}");
+        assert!(
+            text.contains("no answer"),
+            "the lost probe is a row: {text}"
+        );
+    }
+
+    /// A session against a *different* originator must not render under the
+    /// selected row. This is the way a panel like this misleads: the numbers
+    /// are real, they are just about somebody else.
+    #[test]
+    fn another_targets_session_does_not_render_under_this_row() {
+        let mut app = app_with_one_originator();
+        app.ping = Some(crate::app::PingView {
+            session_seq: 1,
+            destination: vec![0, 0, 0, 0, 0, 8],
+            session: Some(session_for(vec![0, 0, 0, 0, 0, 8], vec![])),
+            displaced: false,
+            error: None,
+        });
+
+        let text = rendered(&mut app);
+        assert!(text.contains("Press p to ping"), "got: {text}");
+        assert!(!text.contains("2/5 sent"), "got: {text}");
+    }
+
+    /// A displaced session says so rather than sitting there looking live: an
+    /// operator watching a run half-finish needs to know it was taken away.
+    #[test]
+    fn a_displaced_session_says_so() {
+        let mut app = app_with_one_originator();
+        app.ping = Some(crate::app::PingView {
+            session_seq: 1,
+            destination: vec![0, 0, 0, 0, 0, 9],
+            session: Some(session_for(vec![0, 0, 0, 0, 0, 9], vec![])),
+            displaced: true,
+            error: None,
+        });
+
+        // Single words, so the assertion survives the pane's word wrapping.
+        // Both are asserted because the message deliberately names *both*
+        // causes: the node answers an unknown handle the same way whether
+        // somebody else took the session or it restarted, and naming only the
+        // first would hand an operator debugging a crash-looping node a wrong
+        // lead.
+        let text = rendered(&mut app);
+        assert!(
+            text.contains("replaced"),
+            "the panel must not present a taken-away session as current: {text}"
+        );
+        assert!(text.contains("restarted"), "got: {text}");
+    }
+
+    /// Nothing answered yet means no RTT line at all — `0.0 / 0.0 / 0.0` is a
+    /// measurement, and "we measured nothing" is not one.
+    #[test]
+    fn a_session_with_no_replies_shows_no_rtt_line() {
+        let mut app = app_with_one_originator();
+        let mut session = session_for(
+            vec![0, 0, 0, 0, 0, 9],
+            vec![probe(0, PingProbeState::Pending, 0)],
+        );
+        session.received = 0;
+        session.rtt_min_us = 0;
+        session.rtt_avg_us = 0;
+        session.rtt_max_us = 0;
+        app.ping = Some(crate::app::PingView {
+            session_seq: 1,
+            destination: vec![0, 0, 0, 0, 0, 9],
+            session: Some(session),
+            displaced: false,
+            error: None,
+        });
+
+        let text = rendered(&mut app);
+        assert!(text.contains("0 recv"), "got: {text}");
+        assert!(!text.contains("(min/avg/max)"), "got: {text}");
     }
 }

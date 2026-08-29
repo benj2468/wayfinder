@@ -40,6 +40,8 @@ use wayfinder_protos::service::LogsData;
 use wayfinder_protos::service::NodeMetricsData;
 use wayfinder_protos::service::OgmScheduleEntryData;
 use wayfinder_protos::service::PendingCsrData;
+use wayfinder_protos::service::PingSessionData;
+use wayfinder_protos::service::PingStartData;
 use wayfinder_protos::service::RouteResolutionData;
 use wayfinder_protos::service::RouterReads;
 use wayfinder_protos::service::RouterWrites;
@@ -163,6 +165,13 @@ impl RouterReads for NodeMock {
         None
     }
 
+    /// This mock runs no ping session, and says so rather than
+    /// fabricating one — a handle that always resolved would hide exactly
+    /// the displaced-session case the handle exists to expose.
+    fn ping_session(&self, _session_seq: u32) -> Option<PingSessionData> {
+        None
+    }
+
     fn runtime_config_active(&self) -> bool {
         false
     }
@@ -228,6 +237,40 @@ impl RouterWrites for NodeMock {
 
     fn set_config(&mut self, _config: RuntimeConfigData) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Accepts a session and echoes back what was asked for, defaulting
+    /// zeroes the way a real node does, but never emits anything: there is
+    /// no mesh behind this mock to probe.
+    fn start_ping(
+        &mut self,
+        destination: &[u8],
+        count: u32,
+        interval_ms: u32,
+        timeout_ms: u32,
+        payload_bytes: u32,
+    ) -> Result<PingStartData, String> {
+        if destination.len() != 6 {
+            return Err("destination must be a 6-byte node identifier".into());
+        }
+        Ok(PingStartData {
+            session_seq: 1,
+            count: if count == 0 { 5 } else { count },
+            interval_ms: if interval_ms == 0 { 1_000 } else { interval_ms },
+            timeout_ms: if timeout_ms == 0 { 5_000 } else { timeout_ms },
+            payload_bytes: if payload_bytes == 0 {
+                16
+            } else {
+                payload_bytes
+            },
+        })
+    }
+
+    /// Nothing to cancel: these mocks run no session. Distinct from a mock
+    /// that cancelled anything asked of it, which would hide the wrong-handle
+    /// case the handle exists to catch.
+    fn cancel_ping(&mut self, _session_seq: u32) -> Option<PingSessionData> {
+        None
     }
 
     fn set_log_level(&mut self, directives: &str) -> Result<String, String> {

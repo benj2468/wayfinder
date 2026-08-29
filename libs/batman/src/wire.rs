@@ -70,6 +70,18 @@ pub enum BatmanPacketType {
     /// challenge. Wayfinder-specific, no batman-adv counterpart.  Header:
     /// [`BatmanNextHopResponsePacket`], tag as body.
     NextHopResponse = 0x09,
+    /// A reachability probe addressed to one node — the mesh's answer to
+    /// `ping`, at the layer this stack actually operates at (there are no IP
+    /// addresses here, so ICMP is not available). Routed hop-by-hop toward
+    /// `dest` exactly like a unicast, and answered by the destination with a
+    /// [`BatmanPacketType::EchoReply`]. Wayfinder-specific, no batman-adv
+    /// counterpart.  Header: [`BatmanEchoPacket`], pad bytes as body.
+    EchoRequest = 0x0a,
+    /// The answer to a [`BatmanPacketType::EchoRequest`], routed hop-by-hop
+    /// back toward the node that sent it. Wayfinder-specific, no batman-adv
+    /// counterpart.  Header: [`BatmanEchoPacket`], the request's pad bytes
+    /// echoed verbatim as body.
+    EchoReply = 0x0b,
 }
 
 impl BatmanPacketType {
@@ -94,6 +106,8 @@ impl BatmanPacketType {
             0x07 => Some(Self::Keepalive),
             0x08 => Some(Self::NextHopChallenge),
             0x09 => Some(Self::NextHopResponse),
+            0x0a => Some(Self::EchoRequest),
+            0x0b => Some(Self::EchoReply),
             _ => None,
         }
     }
@@ -361,6 +375,51 @@ pub struct BatmanCertReplyPacket {
     pub dest: Mac,
 }
 
+/// Header for both halves of the reachability-probe pair
+/// ([`BatmanPacketType::EchoRequest`] and [`BatmanPacketType::EchoReply`]) —
+/// one struct, because a reply is the request with the addresses swapped and
+/// the hop counters carried forward. Pad bytes follow it on the wire and are
+/// echoed back verbatim, so a probe can be sized to exercise a link's MTU.
+///
+/// Structurally a unicast header plus what a round trip needs to be *measured*:
+/// the packet is routed hop by hop toward `dest`, TTL-limited, and delivered
+/// locally on arrival.
+///
+/// Carries **no transmit timestamp**, deliberately. The node that originates a
+/// probe owns the ping session that produced it, so it already knows when it
+/// sent sequence *n*; reading the round trip from local state rather than from
+/// bytes a peer handed back is both smaller on the wire and not something a
+/// peer can skew.
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, PartialEq, Eq)]
+#[repr(C, packed)]
+pub struct BatmanEchoPacket {
+    /// [`BatmanPacketType::EchoRequest`] or [`BatmanPacketType::EchoReply`].
+    pub packet_type: u8,
+    /// Protocol version.
+    pub version: u8,
+    /// Time-to-live, decremented per hop to prevent routing loops.
+    pub ttl: u8,
+    /// The node this packet is routed toward: the probe's target in a request,
+    /// the node that sent the probe in a reply.
+    pub dest: Mac,
+    /// The node that sent *this* packet: the pinger in a request, the
+    /// responder in a reply.  Together with `seqno` it is what lets a pinger
+    /// match a reply to the probe it issued.
+    pub orig: Mac,
+    /// The probe's sequence number within its ping session, in network byte
+    /// order (big endian).  Echoed unchanged in the reply.
+    pub seqno: u16,
+    /// How many relays the *request* traversed.  Zero in a request that has not
+    /// been relayed yet, incremented at each hop, then frozen by the responder
+    /// into the reply — so a pinger learns the forward path length even when
+    /// the return path differs, which on an asymmetric mesh it often does.
+    pub req_hops: u8,
+    /// How many relays *this* packet has traversed so far, incremented at each
+    /// hop.  In a reply this counts the return path only; `req_hops` holds the
+    /// forward one.
+    pub hops: u8,
+}
+
 /// Header for a [`BatmanPacketType::NextHopChallenge`]. Minimal by the same
 /// reasoning as [`BatmanKeepAlivePacket`]: the challenger's nonce follows as the
 /// body, and its length is the router's concern — `batman` carries no crypto
@@ -488,6 +547,8 @@ mod tests {
         assert_eq!(BatmanPacketType::Keepalive.as_u8(), 0x07);
         assert_eq!(BatmanPacketType::NextHopChallenge.as_u8(), 0x08);
         assert_eq!(BatmanPacketType::NextHopResponse.as_u8(), 0x09);
+        assert_eq!(BatmanPacketType::EchoRequest.as_u8(), 0x0a);
+        assert_eq!(BatmanPacketType::EchoReply.as_u8(), 0x0b);
     }
 
     /// `from_u8` is the exact inverse of `as_u8` over the known types, and
@@ -505,12 +566,14 @@ mod tests {
             BatmanPacketType::Keepalive,
             BatmanPacketType::NextHopChallenge,
             BatmanPacketType::NextHopResponse,
+            BatmanPacketType::EchoRequest,
+            BatmanPacketType::EchoReply,
         ];
         for ty in all {
             assert_eq!(BatmanPacketType::from_u8(ty.as_u8()), Some(ty));
         }
         assert_eq!(BatmanPacketType::from_u8(0x00), None);
-        assert_eq!(BatmanPacketType::from_u8(0x0a), None);
+        assert_eq!(BatmanPacketType::from_u8(0x0c), None);
         assert_eq!(BatmanPacketType::from_u8(0xff), None);
     }
 
@@ -551,6 +614,31 @@ mod tests {
         let (parsed, _) = BatmanCertReqPacket::ref_from_prefix(req.as_bytes()).unwrap();
         assert_eq!(parsed.packet_type, BatmanPacketType::CertReq.as_u8());
         assert_eq!(parsed.dest, Mac([0, 0, 0, 0, 0, 9]));
+    }
+
+    /// `BatmanEchoPacket` round-trips through `zerocopy` parsing, and its
+    /// multi-byte field is big-endian on the wire like every other one here.
+    /// The size is pinned because it is a wire contract: the dissector and any
+    /// other implementation are written against these 19 bytes.
+    #[test]
+    fn echo_packet_roundtrips() {
+        let pkt = BatmanEchoPacket {
+            packet_type: BatmanPacketType::EchoRequest.as_u8(),
+            version: 5,
+            ttl: 50,
+            dest: Mac([0, 0, 0, 0, 0, 9]),
+            orig: Mac([0, 0, 0, 0, 0, 1]),
+            seqno: 0x1234u16.to_be(),
+            req_hops: 0,
+            hops: 0,
+        };
+        let (parsed, rest) = BatmanEchoPacket::ref_from_prefix(pkt.as_bytes()).unwrap();
+        assert_eq!(parsed.packet_type, BatmanPacketType::EchoRequest.as_u8());
+        assert_eq!(parsed.dest, Mac([0, 0, 0, 0, 0, 9]));
+        assert_eq!(parsed.orig, Mac([0, 0, 0, 0, 0, 1]));
+        assert_eq!(u16::from_be(parsed.seqno), 0x1234);
+        assert!(rest.is_empty());
+        assert_eq!(core::mem::size_of::<BatmanEchoPacket>(), 19);
     }
 
     /// The next-hop proof pair carries its payload — a nonce out, a tag back —

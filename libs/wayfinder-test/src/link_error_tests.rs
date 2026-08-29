@@ -340,3 +340,121 @@ async fn run_once_with_no_mesh_links_does_not_panic() {
         "an empty mesh interfaces list must not propagate out of the event loop: {outcome:?}"
     );
 }
+
+// ── the tokio shell's periodic arm ───────────────────────────────────────────
+//
+// These drive `Driver::run_once` — the *production* loop body — rather than the
+// `poll_due`/`poll_due_keepalive` test helpers beside it. That distinction is
+// the whole point: the periodic arm enumerates its `poll_due_*` calls by hand
+// while the sleep above it folds in every schedule's deadline, so a schedule
+// can be waited on and never serviced. It happened: `poll_due_pings` was added
+// to `poll_due_all` and to the tick and embedded shells, and missed here — the
+// one shell `bins/wayfinder-tap` actually runs. Every test in the repo passed,
+// because they all drive the tick driver.
+
+/// A probe that has fallen due must actually be serviced when the tokio
+/// driver's own periodic arm runs.
+///
+/// Asserts against `run_once` — the production loop body — rather than the
+/// `poll_due`/`poll_due_keepalive` helpers beside it, so it fails if a future
+/// schedule is folded into that arm's sleep and left out of the arm.
+///
+/// The assertion is the session's own counter rather than a frame on the wire:
+/// this harness has no route to the target, so `plan_dispatch` resolves no
+/// egress and drops the frame after the router has counted it. What is under
+/// test is whether the arm *services the schedule*, which is exactly what was
+/// missing; the wire path is covered by the multi-hop integration tests.
+#[tokio::test]
+async fn the_periodic_arm_services_a_due_probe() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let recording = RecordingLink { sent };
+    let mut tr = LinkTestRouter::from_links(mac(1), vec![DynLinkT::new_box(recording)], Vec::new());
+
+    tr.with_router_mut(|r| {
+        r.start_ping(
+            Duration::ZERO,
+            mac(9),
+            2,
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+            0,
+        );
+    })
+    .await;
+
+    // Only the periodic arm, so nothing races it. The probe is due, so the
+    // arm's sleep is zero-length; the timeout is a backstop against the bug
+    // this test exists for, whose symptom is a loop that never settles.
+    timeout(
+        Duration::from_secs(5),
+        tr.driver()
+            .run_once(Duration::ZERO, false, false, false, true),
+    )
+    .await
+    .expect("the periodic arm must not hang on a due probe")
+    .expect("run_once");
+
+    assert_eq!(
+        tr.with_router(|r| r.ping_session(1).map(|s| s.sent()))
+            .await,
+        Some(1),
+        "the periodic arm must service the probe schedule"
+    );
+}
+
+/// And the deadline it was woken by must be discharged.
+///
+/// The other half of the same bug, and the more damaging half: a fresh session
+/// is due *now*, so `next_ping_after` returns zero and the arm's sleep is
+/// zero-length. An arm that waits on that deadline without servicing it
+/// re-sleeps zero forever — the node busy-spins at full tilt holding the router
+/// write lock, from one `Ping` RPC, with no way to stop it short of a restart.
+#[tokio::test]
+async fn servicing_a_probe_clears_the_deadline_it_woke_on() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let recording = RecordingLink { sent };
+    let mut tr = LinkTestRouter::from_links(mac(1), vec![DynLinkT::new_box(recording)], Vec::new());
+
+    // A long cadence, so "the next probe is due" and "the deadline never
+    // moved" are distinguishable instants. At the default 100 ms they are not,
+    // and the assertion below would pass or fail on scheduling noise.
+    tr.with_router_mut(|r| {
+        r.start_ping(
+            Duration::ZERO,
+            mac(9),
+            2,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            0,
+        );
+    })
+    .await;
+
+    assert_eq!(
+        tr.with_router(|r| r.next_ping_after(Duration::ZERO)).await,
+        Some(Duration::ZERO),
+        "a fresh session is due at once — this is the deadline that spins"
+    );
+
+    timeout(
+        Duration::from_secs(5),
+        tr.driver()
+            .run_once(Duration::ZERO, false, false, false, true),
+    )
+    .await
+    .expect("the periodic arm must not hang")
+    .expect("run_once");
+
+    // Read at a `now` past the arm's own instant: the arm re-samples the clock
+    // from the driver's start (`start.elapsed()`), so querying at zero would
+    // ask what was due *before* the probe went out and get zero back for a
+    // reason that has nothing to do with the bug.
+    let next = tr
+        .with_router(|r| r.next_ping_after(Duration::from_secs(1)))
+        .await
+        .expect("the session still has a probe to send");
+    assert!(
+        !next.is_zero(),
+        "after servicing, the deadline must move forward — a zero here is a busy-spin"
+    );
+}

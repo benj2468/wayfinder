@@ -348,6 +348,15 @@ impl<L: LinkT, C: Clock, const N: usize, const FRAME_LEN: usize, R: RouterOps>
                 self.router
                     .next_challenge_after(now)
                     .unwrap_or(core::time::Duration::MAX),
+            )
+            // A running ping session's deadline. Same requirement as the
+            // challenge one above: a probe left riding the OGM schedule waits
+            // up to a full `i_max` on a settled mesh, by which time it has
+            // already timed out and a working path reads as totally lossy.
+            .min(
+                self.router
+                    .next_ping_after(now)
+                    .unwrap_or(core::time::Duration::MAX),
             );
         trace!(?now, ?due, "run_once");
 
@@ -450,7 +459,7 @@ impl<
     /// stages nothing, so its dispatch is a no-op.
     async fn run_once_with_mgmt(&mut self, mgmt: &EmbeddedQueryRx<'_>) {
         let now = self.clock.now();
-        // Same three deadlines as `run_once`, and for the same reasons.
+        // Same four deadlines as `run_once`, and for the same reasons.
         let due = self
             .router
             .next_broadcast_after(now)
@@ -458,6 +467,15 @@ impl<
             .min(
                 self.router
                     .next_challenge_after(now)
+                    .unwrap_or(core::time::Duration::MAX),
+            )
+            // A running ping session's deadline. Same requirement as the
+            // challenge one above: a probe left riding the OGM schedule waits
+            // up to a full `i_max` on a settled mesh, by which time it has
+            // already timed out and a working path reads as totally lossy.
+            .min(
+                self.router
+                    .next_ping_after(now)
                     .unwrap_or(core::time::Duration::MAX),
             );
 

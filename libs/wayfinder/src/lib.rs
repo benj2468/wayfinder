@@ -22,6 +22,7 @@ use batman::BatmanEngine;
 use batman::wire::BatmanBroadcastPacket;
 use batman::wire::BatmanCertReplyPacket;
 use batman::wire::BatmanCertReqPacket;
+use batman::wire::BatmanEchoPacket;
 use batman::wire::BatmanMcastPacket;
 use batman::wire::BatmanNextHopChallengePacket;
 use batman::wire::BatmanNextHopResponsePacket;
@@ -145,6 +146,7 @@ mod routing_table;
 
 /// Capacity-erased access to a [`CentralRouter`], so a driver generic over a
 /// router names one type parameter instead of eleven const arguments.
+pub mod ping;
 pub mod router_ops;
 
 /// EtherType demuxed to the BATMAN engine by
@@ -566,6 +568,30 @@ pub struct CentralRouter<
     /// the wire — but they live here rather than in a driver so an embedded node
     /// with no host-side event loop reports the same labels a host node does.
     iface_names: [InterfaceName; INTERFACES],
+    /// The reachability-probe session this node is currently running, if any.
+    ///
+    /// One at a time, and a new one replaces it. That is a deliberate bound
+    /// rather than a simplification: a probe session is an operator's
+    /// diagnostic, and a node able to run several would be a node able to be
+    /// asked, over the management API, to spend an unbounded amount of its
+    /// airtime. See [`ping`](crate::ping) for why the session lives here at
+    /// all rather than in the client that started it.
+    ping: Option<crate::ping::PingSession>,
+    /// Handle to issue to the next session. Monotonic, never zero — zero is
+    /// how "no session" is spelled over the management API — so a client
+    /// polling a session that has since been displaced is told so rather than
+    /// shown its successor's numbers.
+    next_ping_seq: u32,
+    /// The probe sequence number the next session's first probe will carry.
+    ///
+    /// Node-wide and monotonic, **not** restarted per session, because a reply
+    /// names only `(orig, seqno)` — nothing says which session sent it. An
+    /// operator restarting a ping against a host that has not answered yet
+    /// would otherwise have the old session's in-flight replies credited to the
+    /// new session's identically-numbered probes, stamping a round trip
+    /// measured from the wrong send. Handing each session a fresh block instead
+    /// makes that collision unreachable within any timeout.
+    next_probe_seqno: u16,
 }
 
 impl CentralRouter {
@@ -634,6 +660,9 @@ impl<
             // `InterfaceName` isn't `Copy`, so the array-repeat shorthand the
             // other per-interface banks use doesn't apply here.
             iface_names: core::array::from_fn(|_| InterfaceName::new()),
+            ping: None,
+            next_ping_seq: 1,
+            next_probe_seqno: 0,
         }
     }
 
@@ -722,6 +751,12 @@ impl<
             Some(BatmanPacketType::NextHopChallenge) | Some(BatmanPacketType::NextHopResponse) => {
                 f.tx_data
             }
+            // A reachability probe rides the data gate for the plainest of
+            // reasons: it exists to prove the data path. On a link that carries
+            // no data it proves nothing, while still spending airtime an
+            // operator explicitly asked to keep quiet. Named rather than left
+            // to the catch-all below, so adding a packet type stays a decision.
+            Some(BatmanPacketType::EchoRequest) | Some(BatmanPacketType::EchoReply) => f.tx_data,
             _ => true,
         }
     }
@@ -1249,6 +1284,15 @@ impl<
                     Some(BatmanPacketType::Bcast)
                     | Some(BatmanPacketType::Unicast)
                     | Some(BatmanPacketType::Mcast)
+                    // A reachability probe is gated here for the same reason
+                    // `link_may_tx` gates it on the way out: it exists to prove
+                    // the data path, so on a link that carries no data it
+                    // proves nothing. Gating only one direction would be worse
+                    // than gating neither — a node would answer probes on a
+                    // link it will not carry data over, reporting a path that
+                    // does not exist.
+                    | Some(BatmanPacketType::EchoRequest)
+                    | Some(BatmanPacketType::EchoReply)
                         if !features.rx_data =>
                     {
                         trace!("drop: rx_data disabled on this link");
@@ -1663,6 +1707,99 @@ impl<
                             }
                             RxOutcome::empty()
                         }
+                        Some(BatmanPacketType::EchoRequest) => {
+                            // A peer is asking whether it can reach us.
+                            // Terminates here — never the host TAP: the answer
+                            // is a frame, not data for an application.
+                            //
+                            // Answering keeps no state at all, which is what
+                            // makes every node pingable rather than only the
+                            // ones running a session of their own. The reply
+                            // carries the request's own numbers back: `seqno`
+                            // so the pinger can match it, and the request's
+                            // `hops` frozen into `req_hops` so the pinger
+                            // learns the *forward* path length even though the
+                            // reply finds its own way home — which on an
+                            // asymmetric mesh is a different length.
+                            let Ok((req, pad)) = BatmanEchoPacket::read_from_prefix(&frame.payload)
+                            else {
+                                trace!("drop: malformed echo request");
+                                return RxOutcome::empty();
+                            };
+
+                            let hdr_len = core::mem::size_of::<BatmanEchoPacket>();
+                            // Echo at most what a conforming probe may carry.
+                            // `MAX_PING_PAYLOAD` bounds what *this* node emits;
+                            // without the same bound here a stranger's request
+                            // sets the size of a frame we put on the air, and
+                            // `orig` — which decides who receives it — is
+                            // theirs to choose too.
+                            let pad = &pad[..pad.len().min(crate::ping::MAX_PING_PAYLOAD as usize)];
+                            let total = hdr_len + pad.len();
+                            let Some(next) = self.resolve_next_hop(now, req.orig) else {
+                                trace!(pinger = ?req.orig, "drop: no route back to the pinger");
+                                return RxOutcome::empty();
+                            };
+                            if total > reply.payload.len() {
+                                trace!(total, "drop: echo reply does not fit the transmit buffer");
+                                return RxOutcome::empty();
+                            }
+
+                            let rsp = BatmanEchoPacket {
+                                packet_type: BatmanPacketType::EchoReply.as_u8(),
+                                version: 5,
+                                ttl: 50,
+                                dest: req.orig,
+                                orig: self.batman.self_ident,
+                                seqno: req.seqno,
+                                req_hops: req.hops,
+                                hops: 0,
+                            };
+                            reply.payload[..hdr_len].copy_from_slice(rsp.as_bytes());
+                            reply.payload[hdr_len..total].copy_from_slice(pad);
+                            trace!(pinger = ?req.orig, ?next, "ping: answering probe");
+                            RxOutcome {
+                                forward: Some(LinkFrameData {
+                                    dst: next,
+                                    protocol: ETH_P_BATMAN,
+                                    payload: &reply.payload[..total],
+                                }),
+                                deliver_local: None,
+                                pin_egress_iface: None,
+                            }
+                        }
+                        Some(BatmanPacketType::EchoReply) => {
+                            // The round trip closing on one of our own probes.
+                            // Terminates in the session, never the host TAP.
+                            // `record_reply` judges whether it answers anything
+                            // we actually asked — wrong peer, unknown sequence
+                            // number, or one already resolved are all dropped
+                            // there rather than being allowed to move a
+                            // measurement.
+                            if let Ok((rsp, _)) = BatmanEchoPacket::read_from_prefix(&frame.payload)
+                            {
+                                let seqno = u16::from_be(rsp.seqno);
+                                // `credited` is false for a duplicate, a
+                                // straggler past its timeout, a reply from a
+                                // node we are not pinging — and for one
+                                // arriving at a node running no session at all,
+                                // which is why this sits outside the
+                                // `Some(session)` test rather than inside it. A
+                                // node receiving unsolicited echo replies has
+                                // nothing else that would tell it so.
+                                let credited = self.ping.as_mut().is_some_and(|session| {
+                                    session.record_reply(
+                                        now,
+                                        rsp.orig,
+                                        seqno,
+                                        rsp.req_hops,
+                                        rsp.hops,
+                                    )
+                                });
+                                trace!(peer = ?rsp.orig, seqno, credited, "ping: reply received");
+                            }
+                            RxOutcome::empty()
+                        }
                         _ => {
                             // Hand the inner frame up to the local host, stripping
                             // the BATMAN header that carried it here.
@@ -1720,6 +1857,9 @@ impl<
             Some(BatmanPacketType::Bcast) => core::mem::size_of::<BatmanBroadcastPacket>(),
             Some(BatmanPacketType::CertReq) => core::mem::size_of::<BatmanCertReqPacket>(),
             Some(BatmanPacketType::CertReply) => core::mem::size_of::<BatmanCertReplyPacket>(),
+            Some(BatmanPacketType::EchoRequest) | Some(BatmanPacketType::EchoReply) => {
+                core::mem::size_of::<BatmanEchoPacket>()
+            }
             _ => 0,
         }
     }
@@ -2019,6 +2159,270 @@ impl<
                 payload: &tx_buf[..total],
             },
         ))
+    }
+
+    /// Start a reachability-probe session against `target`, replacing whatever
+    /// session was running, and return the handle a client presents to read it.
+    ///
+    /// Zero for any of `count`, `interval`, `timeout` or `payload_len` means
+    /// "use this node's default", so a caller can ask for a plain ping without
+    /// restating `ping(8)`'s conventions; `count` and `payload_len` are clamped
+    /// to [`MAX_PING_COUNT`] and [`MAX_PING_PAYLOAD`]. Clamping happens *here*,
+    /// at the one point a request becomes a session, rather than inside
+    /// [`PingSession`] — so there is one set of rules and one place to read
+    /// them, and the session type has no opinion about what a caller may ask
+    /// for.
+    ///
+    /// Returns the handle **and the session it installed**, so a caller reads
+    /// the settings actually in force off the session rather than re-deriving
+    /// the defaulting and clamping rules. Handing the session back rather than
+    /// making the caller look it up by handle is deliberate: a lookup would
+    /// have to assume this method always installs one, and the first early
+    /// return added here would turn that assumption into a panic on a
+    /// management path.
+    ///
+    /// The handle is never zero and never repeats within a node's uptime. See
+    /// [`ping_session`](Self::ping_session) for what it is for.
+    ///
+    /// [`MAX_PING_COUNT`]: crate::ping::MAX_PING_COUNT
+    /// [`MAX_PING_PAYLOAD`]: crate::ping::MAX_PING_PAYLOAD
+    /// [`PingSession`]: crate::ping::PingSession
+    pub fn start_ping(
+        &mut self,
+        now: core::time::Duration,
+        target: Mac,
+        count: u16,
+        interval: core::time::Duration,
+        timeout: core::time::Duration,
+        payload_len: u16,
+    ) -> (u32, &crate::ping::PingSession) {
+        use crate::ping;
+
+        let count = match count {
+            0 => ping::DEFAULT_PING_COUNT,
+            n => n.min(ping::MAX_PING_COUNT),
+        };
+        let interval = if interval.is_zero() {
+            ping::DEFAULT_PING_INTERVAL
+        } else {
+            interval.clamp(ping::MIN_PING_INTERVAL, ping::MAX_PING_INTERVAL)
+        };
+        let timeout = if timeout.is_zero() {
+            ping::DEFAULT_PING_TIMEOUT
+        } else {
+            timeout.clamp(ping::MIN_PING_INTERVAL, ping::MAX_PING_INTERVAL)
+        };
+        let payload_len = match payload_len {
+            0 => ping::DEFAULT_PING_PAYLOAD,
+            n => n.min(ping::MAX_PING_PAYLOAD),
+        };
+
+        let session_seq = self.next_ping_seq;
+        // Wrap back to 1, never 0: zero is reserved for "no session".
+        self.next_ping_seq = self.next_ping_seq.checked_add(1).unwrap_or(1);
+
+        // Hand this session its own block of probe sequence numbers rather than
+        // restarting at zero. See `next_probe_seqno` for why: a reply carries
+        // no session identifier, so reused numbers let a displaced session's
+        // late replies be credited to its replacement.
+        let first_seqno = self.next_probe_seqno;
+        self.next_probe_seqno = self.next_probe_seqno.wrapping_add(count);
+
+        debug!(?target, count, session_seq, "ping: starting session");
+        (
+            session_seq,
+            self.ping.insert(ping::PingSession::new(
+                session_seq,
+                target,
+                ping::PingConfig {
+                    count,
+                    interval,
+                    timeout,
+                    payload_len,
+                },
+                first_seqno,
+                now,
+            )),
+        )
+    }
+
+    /// The running probe session, if `session_seq` is the handle that started
+    /// it.
+    ///
+    /// A mismatched handle reads `None` rather than the current session, which
+    /// is the whole reason a handle is issued: a node runs one session at a
+    /// time, so a client whose session had been displaced would otherwise poll
+    /// on and silently report somebody else's round trips as its own.
+    pub fn ping_session(&self, session_seq: u32) -> Option<&crate::ping::PingSession> {
+        self.ping
+            .as_ref()
+            .filter(|s| s.session_seq() == session_seq)
+    }
+
+    /// Stop the running probe session, if `session_seq` is the handle that
+    /// started it, and return it so the caller can report its final statistics.
+    ///
+    /// Handle-guarded for the same reason [`ping_session`](Self::ping_session)
+    /// is, and the stakes are higher here: without the guard a client polling a
+    /// session that had already been displaced would cancel *somebody else's*
+    /// run on its way out.
+    ///
+    /// `None` means there was nothing of this client's to cancel — already
+    /// finished, already displaced, or never started. That is not an error, and
+    /// callers treat it as success: cancelling is what a client does while
+    /// leaving, and a session that has already stopped is the outcome it wanted.
+    pub fn cancel_ping(&mut self, session_seq: u32) -> Option<&crate::ping::PingSession> {
+        let session = self
+            .ping
+            .as_mut()
+            .filter(|s| s.session_seq() == session_seq)?;
+        session.cancel();
+        debug!(session_seq, "ping: session cancelled");
+        Some(session)
+    }
+
+    /// Drive the running probe session at `now`: age out whatever has stopped
+    /// waiting, then build the probe that has fallen due, if any.
+    ///
+    /// **At most one probe per call, paced from `now`.** A driver that slept
+    /// through several intervals — a quiet mesh, a busy board — must not wake
+    /// to a burst of back-to-back probes: that would measure the burst rather
+    /// than the path, and on a duty-cycle-limited radio it would spend the
+    /// budget the session was supposed to be measuring. Deliberately unlike
+    /// [`poll`](Self::poll) and [`poll_challenge`](Self::poll_challenge), whose
+    /// callers loop until `None`.
+    ///
+    /// Returns `None` when nothing is due, when the session is finished, or
+    /// when the target has no live route — that last case is not silence: it
+    /// records a [`ProbeState::NoRoute`] row, so an operator is told this node
+    /// could not even try rather than waiting out a timeout for an answer that
+    /// was never coming.
+    ///
+    /// Suppressed entirely while [`auth_locked`](Self::auth_locked), like every
+    /// other originator here.
+    ///
+    /// [`ProbeState::NoRoute`]: crate::ping::ProbeState::NoRoute
+    pub fn poll_ping<'tx>(
+        &mut self,
+        now: core::time::Duration,
+        tx_buf: &'tx mut [u8],
+    ) -> Option<LinkFrameData<'tx>> {
+        // Ageing runs first, and before the lock check below: a session that
+        // was running when this node went inert must still converge, or
+        // `next_ping_after` reports a deadline forever and the driver that
+        // folded it into its sleep spins.
+        self.ping.as_mut()?.expire(now);
+
+        let session = self.ping.as_ref()?;
+        if !session.due(now) {
+            return None;
+        }
+
+        // Fail closed, like every other originator here — but by *recording*
+        // the probe rather than returning without advancing it. Returning
+        // early would leave the probe due forever, and a shell that sleeps on
+        // `next_ping_after` would wake on a zero deadline it can never
+        // discharge. `NoRoute` is also the honest report: this node could not
+        // put the probe on a wire.
+        if self.auth_locked() {
+            trace!("drop: auth locked, suppressing probe emission");
+            if let Some(session) = self.ping.as_mut() {
+                session.record_no_route(now);
+            }
+            return None;
+        }
+        let target = session.target();
+        let payload_len = usize::from(session.payload_len());
+
+        let Some(next_hop) = self.resolve_next_hop(now, target) else {
+            trace!(?target, "ping: no live route to the target");
+            // Cannot fail: `self.ping` was `Some` two lines above and nothing
+            // between here and there can clear it.
+            if let Some(session) = self.ping.as_mut() {
+                session.record_no_route(now);
+            }
+            return None;
+        };
+
+        let hdr_len = core::mem::size_of::<BatmanEchoPacket>();
+        // Shrink the pad to what this node's transmit buffer can actually hold.
+        // A probe's pad is a *request* — "send one this big" — and honouring a
+        // smaller one still measures the path, where refusing outright would
+        // leave an operator with no answer at all because they named a size the
+        // link cannot carry.
+        //
+        // The reservation matters as much as the cap. A probe is a directed
+        // frame, so when auth is on the driver appends a pairwise tag *after*
+        // this body; filling the buffer exactly would leave no room for it and
+        // the shell would drop the frame on the way out — which reaches the
+        // operator as a timeout on a working path, the least useful answer
+        // available.
+        let reserved = if self.auth.is_some() {
+            crate::auth::DIRECTED_TRAILER_LEN
+        } else {
+            0
+        };
+        let room = tx_buf.len().saturating_sub(hdr_len + reserved);
+        let payload_len = payload_len.min(room);
+        let total = hdr_len + payload_len;
+        if total > tx_buf.len() {
+            // Only reachable when the buffer cannot hold even the 19-byte
+            // header — a node that cannot originate *any* mesh frame, an OGM
+            // being larger than that. Recorded rather than skipped: leaving the
+            // probe unadvanced would spin, since `next_ping_after` would go on
+            // reporting it due. `NoRoute` is also what an operator should read
+            // here — this node could not put the probe on a wire.
+            debug!(
+                total,
+                buf_len = tx_buf.len(),
+                "ping: transmit buffer cannot hold a probe header"
+            );
+            if let Some(session) = self.ping.as_mut() {
+                session.record_no_route(now);
+            }
+            return None;
+        }
+
+        // Cannot fail, as above. The emitted pad is recorded alongside, so what
+        // the session reports is what went on the wire rather than what was
+        // asked for — the difference is the whole point of an MTU probe.
+        let session = self.ping.as_mut()?;
+        session.note_payload_emitted(payload_len as u16);
+        let seqno = session.record_sent(now);
+
+        let hdr = BatmanEchoPacket {
+            packet_type: BatmanPacketType::EchoRequest.as_u8(),
+            version: 5,
+            ttl: 50,
+            dest: target,
+            orig: self.batman.self_ident,
+            seqno: seqno.to_be(),
+            req_hops: 0,
+            hops: 0,
+        };
+        tx_buf[..hdr_len].copy_from_slice(hdr.as_bytes());
+        // A recognisable, non-zero fill, so a probe's pad is distinguishable
+        // from a buffer that was never written when one turns up in a capture.
+        tx_buf[hdr_len..total].fill(0xa5);
+
+        trace!(?target, ?next_hop, seqno, "ping: emitting probe");
+        Some(LinkFrameData {
+            dst: next_hop,
+            protocol: ETH_P_BATMAN,
+            payload: &tx_buf[..total],
+        })
+    }
+
+    /// Time from `now` until the running probe session next needs servicing, or
+    /// `None` when there is no unfinished session.
+    ///
+    /// A shell that sleeps must fold this into the same `min` as
+    /// [`next_broadcast_after`](Self::next_broadcast_after) and its siblings.
+    /// Leaving it out welds probing to whatever else happens to wake the loop,
+    /// which on a settled mesh is a full Trickle `i_max` — long enough that
+    /// every probe in the session would time out before its turn came.
+    pub fn next_ping_after(&self, now: core::time::Duration) -> Option<core::time::Duration> {
+        self.ping.as_ref()?.next_due_after(now)
     }
 
     /// Install (or replace) the adaptive OGM schedule for mesh interface `idx`,
@@ -5583,6 +5987,601 @@ mod self_revocation {
         assert!(
             router.take_self_revocation().is_none(),
             "already persisted by whoever restored it; nothing to report back"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ping_router {
+    //! The router's half of reachability probing: originating probes on the
+    //! session's cadence, answering somebody else's probe, and crediting the
+    //! replies to our own.
+
+    use super::*;
+    use crate::ping::DEFAULT_PING_PAYLOAD;
+    use crate::ping::MAX_PING_COUNT;
+    use crate::ping::MAX_PING_PAYLOAD;
+    use crate::ping::ProbeState;
+    use batman::wire::BatmanEchoPacket;
+    use batman::wire::BatmanOgmPacket;
+    use interfaces::frame::LinkFrame;
+    use interfaces::frame::Mac;
+    use zerocopy::FromBytes;
+    use zerocopy::IntoBytes;
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    fn secs(n: u64) -> core::time::Duration {
+        core::time::Duration::from_secs(n)
+    }
+
+    fn link_frame_bytes(src: u8, dst: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(mac(dst).as_bytes());
+        v.extend_from_slice(mac(src).as_bytes());
+        v.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// An unsigned OGM originated by `orig`, enough to give the router under
+    /// test a route to it. Auth is off in these tests — what is being
+    /// exercised is probe mechanics, not the control plane.
+    fn ogm(orig: u8, seqno: u32, ttl: u8, tq: u8) -> Vec<u8> {
+        BatmanOgmPacket {
+            packet_type: BatmanPacketType::Ogm.as_u8(),
+            version: 5,
+            ttl,
+            flags: 0,
+            seqno: seqno.to_be(),
+            orig: mac(orig),
+            reserved: 0,
+            tq,
+            tvlv_len: 0,
+        }
+        .as_bytes()
+        .to_vec()
+    }
+
+    /// Give `router` a route to node `orig`, learned from neighbour `via`.
+    fn learn_route(router: &mut CentralRouter, orig: u8, via: u8) {
+        let bytes = link_frame_bytes(via, 0xff, &ogm(orig, 1, 50, 255));
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 512];
+        router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx);
+    }
+
+    /// Feed `payload` to `router` as if it arrived from `src`, returning what
+    /// the router wants forwarded.
+    fn receive(
+        router: &mut CentralRouter,
+        now: core::time::Duration,
+        src: u8,
+        payload: &[u8],
+    ) -> Option<Vec<u8>> {
+        let bytes = link_frame_bytes(src, 1, payload);
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 512];
+        let out = router.handle_frame(now, 0, frame, &mut tx);
+        out.forward.map(|f| f.payload.to_vec())
+    }
+
+    /// Build an `EchoRequest` addressed to `dest` from `orig`.
+    fn echo_request(dest: u8, orig: u8, seqno: u16, hops: u8, pad: &[u8]) -> Vec<u8> {
+        let hdr = BatmanEchoPacket {
+            packet_type: BatmanPacketType::EchoRequest.as_u8(),
+            version: 5,
+            ttl: 50,
+            dest: mac(dest),
+            orig: mac(orig),
+            seqno: seqno.to_be(),
+            req_hops: 0,
+            hops,
+        };
+        let mut v = hdr.as_bytes().to_vec();
+        v.extend_from_slice(pad);
+        v
+    }
+
+    // ---- originating ------------------------------------------------------
+
+    /// Starting a session hands back a non-zero handle, and a second session
+    /// gets a different one — which is the whole point of issuing them: a
+    /// client polling with a displaced handle must be able to tell.
+    #[test]
+    fn each_session_gets_a_fresh_non_zero_handle() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+
+        let (first, _) = router.start_ping(Duration::ZERO, mac(9), 3, secs(1), secs(5), 16);
+        assert_ne!(first, 0, "zero is how 'no session' is spelled");
+        assert!(router.ping_session(first).is_some());
+
+        let (second, _) = router.start_ping(Duration::ZERO, mac(8), 3, secs(1), secs(5), 16);
+        assert_ne!(second, first);
+        assert!(
+            router.ping_session(first).is_none(),
+            "the displaced session must not answer its old handle"
+        );
+        assert!(router.ping_session(second).is_some());
+    }
+
+    /// Zero means "use the node's default" for every optional setting, so a
+    /// client can ask for a plain ping without restating `ping(8)`'s
+    /// conventions, and outsized values are clamped rather than honoured.
+    #[test]
+    fn session_settings_are_defaulted_and_clamped() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+
+        let (seq, _) =
+            router.start_ping(Duration::ZERO, mac(9), 0, Duration::ZERO, Duration::ZERO, 0);
+        let s = router.ping_session(seq).expect("session");
+        assert_eq!(s.requested(), crate::ping::DEFAULT_PING_COUNT);
+        assert_eq!(s.interval(), crate::ping::DEFAULT_PING_INTERVAL);
+        assert_eq!(s.timeout(), crate::ping::DEFAULT_PING_TIMEOUT);
+        assert_eq!(s.payload_len(), DEFAULT_PING_PAYLOAD);
+
+        let (seq, _) =
+            router.start_ping(Duration::ZERO, mac(9), u16::MAX, secs(1), secs(5), u16::MAX);
+        let s = router.ping_session(seq).expect("session");
+        assert_eq!(s.requested(), MAX_PING_COUNT);
+        assert_eq!(s.payload_len(), MAX_PING_PAYLOAD);
+    }
+
+    /// The emission that makes a session real: a well-formed `EchoRequest`
+    /// addressed to the next hop toward the target, carrying the session's
+    /// pad, and paced so a second poll inside the interval emits nothing.
+    #[test]
+    fn poll_emits_one_paced_probe_toward_the_next_hop() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        learn_route(&mut router, 9, 2);
+
+        let (seq, _) = router.start_ping(Duration::ZERO, mac(9), 3, secs(1), secs(5), 8);
+
+        let mut tx = [0u8; 512];
+        let frame = router.poll_ping(Duration::ZERO, &mut tx).expect("a probe");
+        assert_eq!(
+            frame.dst,
+            mac(2),
+            "addressed to the next hop, not the target"
+        );
+        assert_eq!(frame.protocol, ETH_P_BATMAN);
+
+        let (hdr, pad) = BatmanEchoPacket::ref_from_prefix(frame.payload).unwrap();
+        assert_eq!(hdr.packet_type, BatmanPacketType::EchoRequest.as_u8());
+        assert_eq!(hdr.dest, mac(9), "the mesh routes it to the target");
+        assert_eq!(hdr.orig, mac(1), "and knows who to answer");
+        assert_eq!(u16::from_be(hdr.seqno), 0);
+        assert_eq!(hdr.hops, 0, "no relay has counted itself yet");
+        assert_eq!(pad.len(), 8);
+
+        let mut tx = [0u8; 512];
+        assert!(
+            router
+                .poll_ping(Duration::from_millis(500), &mut tx)
+                .is_none(),
+            "still inside the interval"
+        );
+        assert!(router.poll_ping(secs(1), &mut tx).is_some());
+        assert_eq!(router.ping_session(seq).expect("session").sent(), 2);
+    }
+
+    /// A pad larger than the node's own transmit buffer is shrunk to fit rather
+    /// than refusing the probe. An operator who names a size the link cannot
+    /// carry should learn what the path does, not get nothing back.
+    #[test]
+    fn an_oversized_pad_is_shrunk_to_what_the_buffer_holds() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        learn_route(&mut router, 9, 2);
+        let _ = router.start_ping(
+            Duration::ZERO,
+            mac(9),
+            1,
+            secs(1),
+            secs(5),
+            MAX_PING_PAYLOAD,
+        );
+
+        let hdr_len = core::mem::size_of::<BatmanEchoPacket>();
+        let mut tx = [0u8; 32];
+        let frame = router
+            .poll_ping(Duration::ZERO, &mut tx)
+            .expect("a probe still goes out");
+        assert_eq!(
+            frame.payload.len(),
+            32,
+            "the probe fills the buffer instead of being refused"
+        );
+        assert_eq!(frame.payload.len() - hdr_len, 32 - hdr_len);
+    }
+
+    /// A target with no route costs no airtime and is reported as such
+    /// immediately, rather than making the operator wait out a timeout for an
+    /// answer this node already knows is not coming.
+    #[test]
+    fn a_target_with_no_route_records_no_route_without_emitting() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        // Learn *of* node 9 without a live path to it, so `resolve_next_hop`
+        // reports the route as known-but-unreachable rather than falling back
+        // to addressing the target directly.
+        learn_route(&mut router, 9, 2);
+
+        let (seq, _) = router.start_ping(secs(3_600), mac(9), 1, secs(1), secs(5), 8);
+        let mut tx = [0u8; 512];
+        assert!(
+            router.poll_ping(secs(3_600), &mut tx).is_none(),
+            "nothing to send: the route has aged out"
+        );
+
+        let s = router.ping_session(seq).expect("session");
+        assert_eq!(s.sent(), 1);
+        assert_eq!(s.lost(), 1);
+        assert_eq!(s.probes().next().expect("row").state, ProbeState::NoRoute);
+    }
+
+    /// A locked node originates nothing at all, probes included — the same
+    /// fail-closed rule `poll` and `poll_challenge` follow.
+    ///
+    /// **And the session still converges.** Suppressing the emission without
+    /// advancing the probe would leave `next_ping_after` reporting a deadline
+    /// that can never be discharged, and every driver shell folds that into the
+    /// sleep it waits on — so the node would spin at full tilt for as long as
+    /// the lock lasted. Asserting only "nothing was emitted" is what let that
+    /// through the first time.
+    #[test]
+    fn an_auth_locked_node_emits_no_probes_and_still_converges() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        router.set_require_auth(true);
+        assert!(router.auth_locked());
+
+        let (seq, _) = router.start_ping(Duration::ZERO, mac(9), 3, secs(1), secs(5), 8);
+        let mut tx = [0u8; 512];
+
+        let mut now = Duration::ZERO;
+        for _ in 0..10 {
+            assert!(
+                router.poll_ping(now, &mut tx).is_none(),
+                "nothing on the wire"
+            );
+            now += secs(1);
+        }
+
+        let s = router.ping_session(seq).expect("session");
+        assert_eq!(s.sent(), 3, "every probe was accounted for");
+        assert_eq!(s.lost(), 3);
+        assert!(
+            !s.active(),
+            "the session finished rather than waiting forever"
+        );
+        assert_eq!(
+            router.next_ping_after(now),
+            None,
+            "and stops reporting a deadline the driver would spin on"
+        );
+    }
+
+    /// The deadline a sleeping driver folds into its `min`. Without it a probe
+    /// waits for whatever else happens to wake the loop, which on a settled
+    /// mesh is a full Trickle `i_max` — long enough for every probe to time
+    /// out.
+    #[test]
+    fn next_ping_after_reports_the_sessions_deadline() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        assert_eq!(router.next_ping_after(Duration::ZERO), None, "no session");
+
+        learn_route(&mut router, 9, 2);
+        let _ = router.start_ping(Duration::ZERO, mac(9), 2, secs(1), secs(5), 8);
+        assert_eq!(
+            router.next_ping_after(Duration::ZERO),
+            Some(Duration::ZERO),
+            "the first probe is due at once"
+        );
+
+        let mut tx = [0u8; 512];
+        router.poll_ping(Duration::ZERO, &mut tx).expect("a probe");
+        assert_eq!(router.next_ping_after(Duration::ZERO), Some(secs(1)));
+    }
+
+    // ---- answering somebody else's probe ---------------------------------
+
+    /// The responder half. A probe for us is answered with a reply addressed
+    /// back toward the pinger, echoing the sequence number and pad so it can be
+    /// matched, and freezing the request's hop count so the pinger learns the
+    /// forward path length even though the reply travels its own way home.
+    #[test]
+    fn a_probe_for_this_node_is_answered() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        learn_route(&mut router, 9, 2);
+
+        let probe = echo_request(1, 9, 42, 3, b"pad bytes");
+        let out = receive(&mut router, secs(1), 2, &probe).expect("a reply");
+
+        let (hdr, pad) = BatmanEchoPacket::ref_from_prefix(&out).unwrap();
+        assert_eq!(hdr.packet_type, BatmanPacketType::EchoReply.as_u8());
+        assert_eq!(hdr.dest, mac(9), "routed back to the pinger");
+        assert_eq!(hdr.orig, mac(1), "from us");
+        assert_eq!(u16::from_be(hdr.seqno), 42, "echoed so it can be matched");
+        assert_eq!(hdr.req_hops, 3, "the request's path length, frozen");
+        assert_eq!(hdr.hops, 0, "the reply's own path starts here");
+        assert_eq!(&pad[..b"pad bytes".len()], b"pad bytes");
+    }
+
+    /// Answering is stateless: a node with no session of its own still answers,
+    /// which is the ordinary case — the node being pinged is not the node
+    /// pinging.
+    #[test]
+    fn a_node_running_no_session_still_answers() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        learn_route(&mut router, 9, 2);
+        assert!(router.ping_session(1).is_none());
+
+        let probe = echo_request(1, 9, 0, 0, b"");
+        assert!(receive(&mut router, secs(1), 2, &probe).is_some());
+    }
+
+    /// A probe from a node we have no way to answer is dropped rather than
+    /// broadcast at the mesh in hope. The pinger times it out, which is the
+    /// truth: the path did not work in both directions.
+    #[test]
+    fn a_probe_from_an_unreachable_pinger_is_dropped() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        learn_route(&mut router, 9, 2);
+
+        // Node 7 is known-but-unreachable by the time the probe arrives.
+        learn_route(&mut router, 7, 2);
+        let probe = echo_request(1, 7, 0, 0, b"");
+        assert!(receive(&mut router, secs(3_600), 2, &probe).is_none());
+    }
+
+    // ---- crediting our own replies ---------------------------------------
+
+    /// The round trip closing: a reply to our own probe is credited to the
+    /// session with its RTT and both hop counts, and nothing is forwarded on.
+    #[test]
+    fn a_reply_to_our_probe_is_credited_to_the_session() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        learn_route(&mut router, 9, 2);
+        let (seq, _) = router.start_ping(Duration::ZERO, mac(9), 1, secs(1), secs(5), 8);
+
+        let mut tx = [0u8; 512];
+        router.poll_ping(Duration::ZERO, &mut tx).expect("a probe");
+
+        let reply = BatmanEchoPacket {
+            packet_type: BatmanPacketType::EchoReply.as_u8(),
+            version: 5,
+            ttl: 50,
+            dest: mac(1),
+            orig: mac(9),
+            seqno: 0u16.to_be(),
+            req_hops: 2,
+            hops: 3,
+        };
+        assert!(
+            receive(&mut router, Duration::from_millis(40), 2, reply.as_bytes()).is_none(),
+            "a reply for us terminates here"
+        );
+
+        let s = router.ping_session(seq).expect("session");
+        assert_eq!(s.received(), 1);
+        assert_eq!(s.rtt_avg_us(), Some(40_000));
+        let probe = s.probes().next().expect("row");
+        assert_eq!(probe.state, ProbeState::Replied);
+        assert_eq!(probe.fwd_hops, 2);
+        assert_eq!(probe.rev_hops, 3);
+        assert!(!s.active(), "the one probe asked for has been answered");
+    }
+
+    /// Polling also ages out probes whose answer never came, so a client sees
+    /// loss without having to send anything more.
+    #[test]
+    fn polling_expires_probes_whose_answer_never_came() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        learn_route(&mut router, 9, 2);
+        let (seq, _) = router.start_ping(Duration::ZERO, mac(9), 1, secs(1), secs(5), 8);
+
+        let mut tx = [0u8; 512];
+        router.poll_ping(Duration::ZERO, &mut tx).expect("a probe");
+        assert!(router.poll_ping(secs(6), &mut tx).is_none());
+
+        let s = router.ping_session(seq).expect("session");
+        assert_eq!(s.lost(), 1);
+        assert!(!s.active());
+    }
+
+    /// A reply for a session that has since been displaced is dropped rather
+    /// than credited to whatever session took its place.
+    #[test]
+    fn a_reply_for_a_displaced_session_is_dropped() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        learn_route(&mut router, 9, 2);
+        learn_route(&mut router, 8, 2);
+        let _ = router.start_ping(Duration::ZERO, mac(9), 1, secs(1), secs(5), 8);
+        let mut tx = [0u8; 512];
+        router.poll_ping(Duration::ZERO, &mut tx).expect("a probe");
+
+        // A new session, pinging somebody else, replaces the first.
+        let (second, _) = router.start_ping(Duration::ZERO, mac(8), 1, secs(1), secs(5), 8);
+        router.poll_ping(Duration::ZERO, &mut tx).expect("a probe");
+
+        let stale = BatmanEchoPacket {
+            packet_type: BatmanPacketType::EchoReply.as_u8(),
+            version: 5,
+            ttl: 50,
+            dest: mac(1),
+            orig: mac(9),
+            seqno: 0u16.to_be(),
+            req_hops: 1,
+            hops: 1,
+        };
+        receive(&mut router, secs(1), 2, stale.as_bytes());
+
+        let s = router.ping_session(second).expect("session");
+        assert_eq!(s.received(), 0, "another target's reply is not ours");
+    }
+
+    /// A restarted ping against the *same* target must not credit the previous
+    /// session's in-flight replies to the new one.
+    ///
+    /// The bug this pins: probe sequence numbers used to restart at zero per
+    /// session, and a reply carries only `(orig, seqno)` — nothing naming the
+    /// session that sent it. Ping a slow host, restart before its replies land,
+    /// and old seqno 0 would be credited to new seqno 0, stamping a round trip
+    /// measured from the *new* probe's send time onto an exchange that
+    /// answered the old one. The counters still balanced, which is what made it
+    /// quiet: only the timing an operator reads was wrong.
+    #[test]
+    fn a_stale_reply_is_not_credited_to_a_restarted_session() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        learn_route(&mut router, 9, 2);
+
+        let mut tx = [0u8; 512];
+        let _ = router.start_ping(Duration::ZERO, mac(9), 3, secs(1), secs(30), 0);
+        let first = router.poll_ping(Duration::ZERO, &mut tx).expect("a probe");
+        let (hdr, _) = BatmanEchoPacket::ref_from_prefix(first.payload).unwrap();
+        let stale_seqno = u16::from_be(hdr.seqno);
+
+        // Restart against the same target while the first session's probe is
+        // still outstanding — the operator pressing `p` twice.
+        let (second, _) = router.start_ping(secs(1), mac(9), 3, secs(1), secs(30), 0);
+        let mut tx = [0u8; 512];
+        let fresh = router.poll_ping(secs(1), &mut tx).expect("a probe");
+        let (hdr, _) = BatmanEchoPacket::ref_from_prefix(fresh.payload).unwrap();
+        assert_ne!(
+            u16::from_be(hdr.seqno),
+            stale_seqno,
+            "a new session must not reuse a sequence number that may still be in flight"
+        );
+
+        // The old session's reply arrives late.
+        let reply = BatmanEchoPacket {
+            packet_type: BatmanPacketType::EchoReply.as_u8(),
+            version: 5,
+            ttl: 50,
+            dest: mac(1),
+            orig: mac(9),
+            seqno: stale_seqno.to_be(),
+            req_hops: 9,
+            hops: 9,
+        };
+        receive(&mut router, secs(2), 2, reply.as_bytes());
+
+        let s = router.ping_session(second).expect("session");
+        assert_eq!(
+            s.received(),
+            0,
+            "the displaced session's reply is not this session's"
+        );
+    }
+
+    /// Cancelling stops the node emitting and leaves nothing for a driver to
+    /// wake on — the same convergence property the auth-lock case needs, by a
+    /// different route.
+    #[test]
+    fn a_cancelled_session_stops_the_node_emitting() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        learn_route(&mut router, 9, 2);
+        let (seq, _) = router.start_ping(Duration::ZERO, mac(9), 5, secs(1), secs(30), 0);
+
+        let mut tx = [0u8; 512];
+        assert!(router.poll_ping(Duration::ZERO, &mut tx).is_some());
+
+        let session = router.cancel_ping(seq).expect("our own session cancels");
+        assert!(!session.active());
+        assert_eq!(session.sent(), 1, "only what actually went out");
+
+        assert!(
+            router.poll_ping(secs(10), &mut tx).is_none(),
+            "no further probe is emitted"
+        );
+        assert_eq!(
+            router.next_ping_after(secs(10)),
+            None,
+            "and no deadline is left behind"
+        );
+    }
+
+    /// A cancelled session stays readable, so the client that stopped it can
+    /// render the summary of what it did measure.
+    #[test]
+    fn a_cancelled_session_is_still_readable() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        learn_route(&mut router, 9, 2);
+        let (seq, _) = router.start_ping(Duration::ZERO, mac(9), 5, secs(1), secs(30), 0);
+        router.cancel_ping(seq);
+
+        assert!(
+            router.ping_session(seq).is_some(),
+            "the handle still resolves — the operator has a summary to read"
+        );
+    }
+
+    /// A handle that is not ours cancels nothing. Without this guard, a client
+    /// polling a session that had already been displaced would stop somebody
+    /// else's run on its way out.
+    #[test]
+    fn cancelling_needs_the_handle_that_started_the_session() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        learn_route(&mut router, 9, 2);
+        let (seq, _) = router.start_ping(Duration::ZERO, mac(9), 5, secs(1), secs(30), 0);
+
+        assert!(
+            router.cancel_ping(seq.wrapping_add(1)).is_none(),
+            "a foreign handle cancels nothing"
+        );
+        assert!(
+            router.ping_session(seq).expect("session").active(),
+            "and leaves the real session running"
+        );
+    }
+
+    /// Cancelling when there is nothing to cancel is success, not an error: it
+    /// is what a client does while leaving, and a session that has already
+    /// stopped is the outcome it wanted.
+    #[test]
+    fn cancelling_nothing_is_not_an_error() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        assert!(router.cancel_ping(1).is_none());
+    }
+
+    // ---- gating -----------------------------------------------------------
+
+    /// Probes ride the data gate. A link an operator has told to carry no data
+    /// must not carry a probe either — a probe exists to prove the data path,
+    /// so on a link that has none it proves nothing and costs airtime.
+    #[test]
+    fn probes_ride_the_data_gate() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        router.set_link_features(
+            0,
+            crate::features::LinkFeatures {
+                tx_data: false,
+                ..Default::default()
+            },
+        );
+        assert!(!router.link_may_tx(0, Some(BatmanPacketType::EchoRequest)));
+        assert!(!router.link_may_tx(0, Some(BatmanPacketType::EchoReply)));
+    }
+
+    /// And they are gated on the way *in* as well. Gating one direction only
+    /// would be worse than gating neither: the node would answer probes on a
+    /// link it will not carry data over, reporting a path that does not exist.
+    #[test]
+    fn a_probe_arriving_on_an_rx_data_off_link_is_dropped() {
+        let mut router: CentralRouter = CentralRouter::new(mac(1));
+        learn_route(&mut router, 9, 2);
+        router.set_link_features(
+            0,
+            crate::features::LinkFeatures {
+                rx_data: false,
+                ..Default::default()
+            },
+        );
+
+        let probe = echo_request(1, 9, 0, 0, b"");
+        assert!(
+            receive(&mut router, secs(1), 2, &probe).is_none(),
+            "a link that carries no data must not answer probes on it"
         );
     }
 }

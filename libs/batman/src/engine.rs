@@ -17,6 +17,7 @@ use crate::TrickleTimer;
 use crate::wire::BatmanBroadcastPacket;
 use crate::wire::BatmanCertReplyPacket;
 use crate::wire::BatmanCertReqPacket;
+use crate::wire::BatmanEchoPacket;
 use crate::wire::BatmanMcastPacket;
 use crate::wire::BatmanOgmPacket;
 use crate::wire::BatmanPacketType;
@@ -1481,6 +1482,71 @@ impl<
         RoutingAction::Consumed // Route unknown, drop packet
     }
 
+    /// Route one half of the reachability-probe pair
+    /// ([`BatmanPacketType::EchoRequest`] / [`BatmanPacketType::EchoReply`]):
+    /// deliver locally when addressed to us — a request so the router can
+    /// answer it, a reply so the router can credit it against the probe it
+    /// answers — otherwise relay toward the next live hop for `dest`, exactly
+    /// like [`handle_unicast`](Self::handle_unicast).
+    ///
+    /// One thing sets it apart from every other relay here: it increments the
+    /// header's `hops`, so a probe carries its own path length to the far end
+    /// and back. Saturating rather than wrapping, since a rolled-over count
+    /// would report a two-hop path as a 258-hop one; `ttl` is what actually
+    /// bounds the relay, and it expires long before `hops` could saturate.
+    ///
+    /// Measurement-free at this layer, in the same spirit as
+    /// [`handle_cert_req`](Self::handle_cert_req) being crypto-free: the engine
+    /// counts hops and moves bytes, while what a probe *means* — a session, an
+    /// interval, a round-trip time — lives in the router.
+    fn handle_echo<'rx, 'tx>(
+        &mut self,
+        now: core::time::Duration,
+        frame: &'tx LinkFrame,
+        reply: &mut LinkFrameDataMut<'rx>,
+    ) -> RoutingAction {
+        let Ok((hdr, _)) = BatmanEchoPacket::read_from_prefix(&frame.payload) else {
+            trace!("drop: malformed echo packet");
+            return RoutingAction::Consumed;
+        };
+        trace!(echo = ?hdr, "rx echo packet");
+        let dst = hdr.dest;
+
+        if dst == self.self_ident {
+            return RoutingAction::DeliverLocal;
+        }
+        if hdr.ttl <= 1 {
+            return RoutingAction::Consumed; // Drop packet, expired
+        }
+        if let Some(next) = self.next_hop(now, dst) {
+            let mut updated_hdr = hdr;
+            updated_hdr.ttl -= 1;
+            updated_hdr.hops = hdr.hops.saturating_add(1);
+
+            let size = core::mem::size_of::<BatmanEchoPacket>();
+            let inner = frame.payload.get(size..).unwrap_or(&[]);
+            let total = size + inner.len();
+
+            if total <= reply.payload.len() {
+                reply.dst = next;
+                reply.protocol = ETH_P_BATMAN;
+                reply.payload[..size].copy_from_slice(updated_hdr.as_bytes());
+                reply.payload[size..total].copy_from_slice(inner);
+            } else {
+                self.note_relay_oversize_drop("echo_relay", total, reply.payload.len());
+            }
+        } else {
+            // Traced, unlike the equivalent drop in `handle_unicast`, because
+            // this is the one frame an operator is running *specifically* to
+            // find out where it dies. A probe that vanishes with no record on
+            // the relay leaves them with the one answer the tool exists to
+            // improve on: "somewhere".
+            trace!(?dst, "drop: no live route to relay this probe toward");
+        }
+
+        RoutingAction::Consumed // Route unknown, drop packet
+    }
+
     /// Route a BATMAN-protocol frame whose sub-type tag is none of the known
     /// packet types, treating it as a bare payload addressed by `frame.dst`:
     /// deliver locally when it is for us, forward toward the best live next hop
@@ -1539,6 +1605,9 @@ impl<
             Some(BatmanPacketType::CertReq) => self.handle_cert_req(now, frame, reply),
             Some(BatmanPacketType::CertReply) => self.handle_cert_reply(now, frame, reply),
             Some(BatmanPacketType::Keepalive) => self.handle_keepalive(now, frame),
+            Some(BatmanPacketType::EchoRequest) | Some(BatmanPacketType::EchoReply) => {
+                self.handle_echo(now, frame, reply)
+            }
             // Next-hop proof frames are consumed here and handled by the router,
             // which owns the pairwise key material they are checked against.
             // Consumed rather than routed by destination: they are link-local by

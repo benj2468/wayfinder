@@ -2390,3 +2390,268 @@ mod tq_clamp {
         assert_eq!(engine.originator_table[&mac(2)].max_tq, 245);
     }
 }
+
+#[cfg(test)]
+mod echo_forwarding {
+    //! The reachability-probe pair (`BatmanPacketType::EchoRequest` /
+    //! `BatmanPacketType::EchoReply`), routed like a unicast — delivered
+    //! locally on arrival at `dest`, relayed toward the next live hop
+    //! otherwise — with one addition no other packet type has: each relay
+    //! *counts itself*, so the probe carries its own path length home. What a
+    //! probe means (a session, an interval, a round-trip time) is the router's
+    //! business; the engine only moves bytes and counts hops.
+
+    use super::*;
+    use crate::wire::BatmanEchoPacket;
+
+    fn make_echo(
+        ty: BatmanPacketType,
+        dest: u8,
+        orig: u8,
+        ttl: u8,
+        hops: u8,
+        pad: &[u8],
+    ) -> Vec<u8> {
+        let hdr = BatmanEchoPacket {
+            packet_type: ty.as_u8(),
+            version: 5,
+            ttl,
+            dest: mac(dest),
+            orig: mac(orig),
+            seqno: 7u16.to_be(),
+            req_hops: 0,
+            hops,
+        };
+        let mut data = hdr.as_bytes().to_vec();
+        data.extend_from_slice(pad);
+        data
+    }
+
+    /// Teach `engine` a route to node 5 via node 2, so the relay tests below
+    /// have somewhere to forward to.
+    fn learn_route_to_5(engine: &mut BatmanEngine<8>) {
+        let ogm = make_ogm(5, 1, 255, 50);
+        let frame_ogm = make_link_frame(2, 0xff, ETH_P_BATMAN, ogm);
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_ogm),
+            None,
+            &mut reply,
+        );
+    }
+
+    /// An `EchoRequest` addressed to us is delivered locally, so the router can
+    /// answer it. Delivery, not consumption: answering is the whole point.
+    #[test]
+    fn echo_request_for_self_delivers_local() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        let payload = make_echo(BatmanPacketType::EchoRequest, 1, 9, 50, 0, b"pad");
+        let frame_bytes = make_link_frame(2, 1, ETH_P_BATMAN, payload);
+
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            None,
+            &mut reply,
+        );
+
+        assert!(matches!(action, RoutingAction::DeliverLocal));
+    }
+
+    /// An `EchoReply` addressed to us is delivered locally too, so the router
+    /// can credit it against the probe it answers.
+    #[test]
+    fn echo_reply_for_self_delivers_local() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        let payload = make_echo(BatmanPacketType::EchoReply, 1, 9, 50, 0, b"pad");
+        let frame_bytes = make_link_frame(2, 1, ETH_P_BATMAN, payload);
+
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            None,
+            &mut reply,
+        );
+
+        assert!(matches!(action, RoutingAction::DeliverLocal));
+    }
+
+    /// The relay behaviour that makes a probe a *measurement*: an intermediate
+    /// node forwards toward the next hop, decrements TTL like any unicast, and
+    /// increments `hops` so the count arriving at the far end is the number of
+    /// relays the probe actually crossed. The pad body rides along untouched —
+    /// it is what the responder echoes back.
+    #[test]
+    fn echo_request_relay_decrements_ttl_and_counts_the_hop() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        learn_route_to_5(&mut engine);
+
+        let payload = make_echo(BatmanPacketType::EchoRequest, 5, 9, 10, 3, b"pad bytes");
+        let frame_bytes = make_link_frame(3, 1, ETH_P_BATMAN, payload);
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            None,
+            &mut reply,
+        );
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.dst, mac(2), "relayed toward the next hop for node 5");
+        assert_eq!(reply.protocol, ETH_P_BATMAN);
+        let (fwd, rest) = BatmanEchoPacket::ref_from_prefix(reply.payload).unwrap();
+        assert_eq!(fwd.packet_type, BatmanPacketType::EchoRequest.as_u8());
+        assert_eq!(fwd.dest, mac(5), "final destination unchanged");
+        assert_eq!(fwd.orig, mac(9), "the pinger's identity is preserved");
+        assert_eq!(u16::from_be(fwd.seqno), 7, "sequence number is echoed on");
+        assert_eq!(fwd.ttl, 9, "TTL decremented from 10");
+        assert_eq!(fwd.hops, 4, "this relay counted itself");
+        assert_eq!(&rest[..b"pad bytes".len()], b"pad bytes");
+    }
+
+    /// A reply relays by the same rules, counting its own return path.
+    #[test]
+    fn echo_reply_relay_counts_the_hop() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        learn_route_to_5(&mut engine);
+
+        let payload = make_echo(BatmanPacketType::EchoReply, 5, 9, 10, 0, b"pad");
+        let frame_bytes = make_link_frame(3, 1, ETH_P_BATMAN, payload);
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            None,
+            &mut reply,
+        );
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        let (fwd, _) = BatmanEchoPacket::ref_from_prefix(reply.payload).unwrap();
+        assert_eq!(fwd.packet_type, BatmanPacketType::EchoReply.as_u8());
+        assert_eq!(fwd.hops, 1);
+    }
+
+    /// `hops` saturates rather than wrapping. A `hops` that rolled over would
+    /// report a two-hop path as a 258-hop one; TTL is what actually bounds the
+    /// relay, and it has already expired long before this matters.
+    #[test]
+    fn echo_hop_count_saturates() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        learn_route_to_5(&mut engine);
+
+        let payload = make_echo(BatmanPacketType::EchoRequest, 5, 9, 10, u8::MAX, b"");
+        let frame_bytes = make_link_frame(3, 1, ETH_P_BATMAN, payload);
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            None,
+            &mut reply,
+        );
+
+        let (fwd, _) = BatmanEchoPacket::ref_from_prefix(reply.payload).unwrap();
+        assert_eq!(fwd.hops, u8::MAX);
+    }
+
+    /// An expired TTL drops the probe rather than relaying it, exactly as for a
+    /// unicast — loop protection does not get an exemption for diagnostics.
+    #[test]
+    fn echo_request_ttl_expiration() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        learn_route_to_5(&mut engine);
+
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        let payload = make_echo(BatmanPacketType::EchoRequest, 5, 9, 1, 0, b"pad");
+        let frame_bytes = make_link_frame(3, 1, ETH_P_BATMAN, payload);
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            None,
+            &mut reply,
+        );
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.protocol, 0, "not forwarded, TTL expired");
+    }
+
+    /// A probe for a destination with no live route is dropped. The pinger
+    /// hears nothing back and times the probe out, which is the honest answer:
+    /// this node cannot reach the target either.
+    #[test]
+    fn echo_request_unknown_destination() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        let payload = make_echo(BatmanPacketType::EchoRequest, 99, 9, 50, 0, b"pad");
+        let frame_bytes = make_link_frame(2, 1, ETH_P_BATMAN, payload);
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            None,
+            &mut reply,
+        );
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.protocol, 0, "no route known");
+    }
+
+    /// A relay whose egress buffer cannot hold the header plus body drops the
+    /// probe and records it, rather than panicking or truncating a measurement
+    /// into a lie.
+    #[test]
+    fn echo_relay_skipped_when_reply_buffer_too_small() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+        learn_route_to_5(&mut engine);
+
+        let payload = make_echo(BatmanPacketType::EchoRequest, 5, 9, 10, 0, b"pad bytes");
+        let frame_bytes = make_link_frame(3, 1, ETH_P_BATMAN, payload);
+
+        // One byte short of the header plus the pad body.
+        let mut small = [0u8; core::mem::size_of::<BatmanEchoPacket>() + b"pad bytes".len() - 1];
+        let mut reply = LinkFrameDataMut::from(&mut small[..]);
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            None,
+            &mut reply,
+        );
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.protocol, 0, "not forwarded");
+        assert_eq!(engine.relay_oversize_drops(), 1);
+    }
+
+    /// A truncated header is dropped rather than parsed out of adjacent bytes —
+    /// this is remotely-supplied input on a hot path.
+    #[test]
+    fn malformed_echo_is_dropped() {
+        let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
+
+        let payload = vec![BatmanPacketType::EchoRequest.as_u8(), 5, 50];
+        let frame_bytes = make_link_frame(2, 1, ETH_P_BATMAN, payload);
+        let mut buf = [0u8; 256];
+        let mut reply = LinkFrameDataMut::from(&mut buf[..]);
+        let action = engine.handle_rx(
+            core::time::Duration::ZERO,
+            parse_link_frame(&frame_bytes),
+            None,
+            &mut reply,
+        );
+
+        assert!(matches!(action, RoutingAction::Consumed));
+        assert_eq!(reply.protocol, 0);
+    }
+}

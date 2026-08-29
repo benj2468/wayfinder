@@ -23,6 +23,7 @@ pub mod cert;
 pub mod csr;
 pub mod link;
 pub mod output;
+pub mod ping;
 pub mod provider;
 pub mod session;
 pub mod user;
@@ -125,6 +126,38 @@ pub enum Command {
     Resolve {
         /// Destination identifier: a MAC like `02:00:00:00:00:09`, or raw hex.
         dest: String,
+    },
+    /// Probe whether this node can actually reach another, and how fast.
+    ///
+    /// `resolve` above answers what the routing table *believes*; this answers
+    /// whether the path works. There are no IP addresses on a mesh, so this is
+    /// not ICMP: the node emits probes addressed to the target's identifier,
+    /// routed hop by hop like any data, and the target answers them.
+    ///
+    /// The node runs the session — this starts it and reports it. A node runs
+    /// one at a time, so starting a ping displaces another client's.
+    Ping {
+        /// Destination identifier: a MAC like `02:00:00:00:00:09`, or raw hex.
+        dest: String,
+        /// Probes to send. 0 uses the node's default.
+        #[arg(long, short = 'c', default_value_t = 0)]
+        count: u32,
+        /// Milliseconds between probes. 0 uses the node's default.
+        #[arg(long, short = 'i', default_value_t = 0)]
+        interval: u32,
+        /// Milliseconds a probe waits for its reply before counting as lost.
+        /// 0 uses the node's default, which is generous — a multi-hop LoRa
+        /// round trip is measured in seconds.
+        #[arg(long, short = 'W', default_value_t = 0)]
+        timeout: u32,
+        /// Pad bytes each probe carries, echoed back by the target — so a
+        /// probe can be sized against a link's MTU. 0 uses the node's default.
+        ///
+        /// Ctrl+C stops the node's session as well as this command, and prints
+        /// the statistics for what it measured — the node owns the session, so
+        /// merely exiting would leave it probing.
+        #[arg(long, short = 's', default_value_t = 0)]
+        size: u32,
     },
     /// Per-interface state: link quality, participation features, OGM schedule,
     /// and the runtime overrides for each.
@@ -541,6 +574,34 @@ pub async fn run(mut cli: Cli) -> anyhow::Result<()> {
     {
         return follow_logs(&mut client, since, max, cli.output).await;
     }
+    // A ping outlives a single response too, and an operator wants each probe
+    // as it resolves rather than a block at the end. `dispatch_query` runs the
+    // same session without the streaming, for an embedder calling `run_query`.
+    if let Command::Ping {
+        dest,
+        count,
+        interval,
+        timeout,
+        size,
+    } = &cli.command
+    {
+        let destination = parse_id(dest)?;
+        let args = ping::PingArgs {
+            count: *count,
+            interval_ms: *interval,
+            timeout_ms: *timeout,
+            payload_bytes: *size,
+        };
+        let rendered = ping::run(&mut client, destination, args, cli.output, true).await?;
+        // The human path has already streamed its lines and summary; printing
+        // the rendered form again would double every one of them. Empty means
+        // there was nothing to report — a cancel that found no session — and a
+        // blank line is not a JSON document.
+        if cli.output == OutputFormat::Json && !rendered.is_empty() {
+            println!("{rendered}");
+        }
+        return Ok(());
+    }
     println!(
         "{}",
         dispatch_query(cli.command, &mut client, cli.output, endpoint.as_ref()).await?
@@ -624,6 +685,25 @@ async fn dispatch_query(
         Command::Resolve { dest } => {
             let id = parse_id(&dest)?;
             output::resolve(&client.resolve_route(id).await?, output)?
+        }
+        // Runs the whole session and renders it once. `run` intercepts the CLI
+        // path above to stream instead; this is the shape `run_query`'s
+        // embedders need, which is one call returning one rendered answer.
+        Command::Ping {
+            dest,
+            count,
+            interval,
+            timeout,
+            size,
+        } => {
+            let destination = parse_id(&dest)?;
+            let args = ping::PingArgs {
+                count,
+                interval_ms: interval,
+                timeout_ms: timeout,
+                payload_bytes: size,
+            };
+            ping::run(client, destination, args, output, false).await?
         }
         Command::Link(cmd) => link::run(cmd, client, output).await?,
         Command::Auth(cmd) => auth::run(cmd, client, output, endpoint).await?,

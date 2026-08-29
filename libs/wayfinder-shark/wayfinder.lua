@@ -57,6 +57,8 @@ local DEFAULT_CARRIER_ETHERTYPE = 0xfafa
 -- BATMAN packet_type byte values (libs/batman/src/wire.rs's BatmanPacketType).
 local PKT_ORIGINATOR = 0x01
 local PKT_CERT_REQ = 0x05
+local PKT_ECHO_REQUEST = 0x0a
+local PKT_ECHO_REPLY = 0x0b
 local PKT_CERT_REPLY = 0x06
 local PACKET_TYPES = {
 	[PKT_ORIGINATOR] = "Originator",
@@ -68,6 +70,8 @@ local PACKET_TYPES = {
 	[0x07] = "Keep-Alive",
 	[0x08] = "Next-Hop Challenge",
 	[0x09] = "Next-Hop Response",
+	[PKT_ECHO_REQUEST] = "Echo Request",
+	[PKT_ECHO_REPLY] = "Echo Reply",
 }
 
 -- TVLV record type bytes carried in an Originator packet's tail (libs/batman/src/wire.rs).
@@ -142,6 +146,18 @@ f.cert_ctrl_version = ProtoField.uint8("wayfinder.cert_ctrl.version", "Version",
 f.cert_ctrl_ttl = ProtoField.uint8("wayfinder.cert_ctrl.ttl", "TTL", base.DEC)
 f.cert_ctrl_dest = ProtoField.ether("wayfinder.cert_ctrl.dest", "Destination")
 
+-- Reachability-probe fields (BatmanEchoPacket; libs/batman/src/wire.rs). One
+-- header serves both halves of the pair: a reply is the request with the
+-- addresses swapped and the hop counters carried forward.
+f.echo_version = ProtoField.uint8("wayfinder.echo.version", "Version", base.DEC)
+f.echo_ttl = ProtoField.uint8("wayfinder.echo.ttl", "TTL", base.DEC)
+f.echo_dest = ProtoField.ether("wayfinder.echo.dest", "Destination")
+f.echo_orig = ProtoField.ether("wayfinder.echo.orig", "Origin")
+f.echo_seqno = ProtoField.uint16("wayfinder.echo.seqno", "Probe Sequence", base.DEC)
+f.echo_req_hops = ProtoField.uint8("wayfinder.echo.req_hops", "Request Hops", base.DEC)
+f.echo_hops = ProtoField.uint8("wayfinder.echo.hops", "Hops", base.DEC)
+f.echo_pad = ProtoField.bytes("wayfinder.echo.pad", "Probe Payload")
+
 -- The requester's self-authenticating Ed25519 signature following its cert in
 -- a BatmanPacketType::CertReq body (see OgmAuth::build_cert_request in
 -- libs/wayfinder/src/auth.rs).
@@ -187,6 +203,20 @@ local CERT_CTRL = {
 	TTL = 2,
 	DEST = 3, -- 6 bytes
 	HEADER_LEN = 9,
+}
+
+-- Field offsets within a BatmanEchoPacket header — shared by EchoRequest and
+-- EchoReply. Kept in sync with libs/batman/src/wire.rs.
+local ECHO = {
+	PACKET_TYPE = 0,
+	VERSION = 1,
+	TTL = 2,
+	DEST = 3, -- 6 bytes
+	ORIG = 9, -- 6 bytes
+	SEQNO = 15, -- u16, big-endian
+	REQ_HOPS = 17,
+	HOPS = 18,
+	HEADER_LEN = 19,
 }
 
 -- Field offsets within a MembershipCert value (libs/wayfinder-auth/src/cert.rs).
@@ -337,6 +367,28 @@ function wayfinder.dissector(tvb, pinfo, root)
 		tree:add(f.cert_ctrl_ttl, tvb(CERT_CTRL.TTL, 1))
 		tree:add(f.cert_ctrl_dest, tvb(CERT_CTRL.DEST, 6))
 		decode_cert_ctrl(tree, tvb, ptype == PKT_CERT_REQ, CERT_CTRL.HEADER_LEN, len)
+		return len
+	end
+
+	-- Reachability probes: both halves share one header, and the two hop
+	-- counters are the interesting part of a capture — `req_hops` is the
+	-- forward path length frozen by the responder, `hops` the one this packet
+	-- has travelled, so a reply carries both legs of an asymmetric path.
+	if ptype == PKT_ECHO_REQUEST or ptype == PKT_ECHO_REPLY then
+		if len < ECHO.HEADER_LEN then
+			return len
+		end
+		tree:add(f.echo_version, tvb(ECHO.VERSION, 1))
+		tree:add(f.echo_ttl, tvb(ECHO.TTL, 1))
+		tree:add(f.echo_dest, tvb(ECHO.DEST, 6))
+		tree:add(f.echo_orig, tvb(ECHO.ORIG, 6))
+		tree:add(f.echo_seqno, tvb(ECHO.SEQNO, 2))
+		tree:add(f.echo_req_hops, tvb(ECHO.REQ_HOPS, 1))
+		tree:add(f.echo_hops, tvb(ECHO.HOPS, 1))
+		if len > ECHO.HEADER_LEN then
+			tree:add(f.echo_pad, tvb(ECHO.HEADER_LEN, len - ECHO.HEADER_LEN))
+		end
+		pinfo.cols.info = string.format("%s seq=%d hops=%d", label, tvb(ECHO.SEQNO, 2):uint(), tvb(ECHO.HOPS, 1):uint())
 		return len
 	end
 
