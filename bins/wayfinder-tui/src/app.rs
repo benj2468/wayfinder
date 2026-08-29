@@ -287,14 +287,38 @@ impl LogView {
 pub const THROUGHPUT_HISTORY: usize = 120;
 
 /// One time-ordered throughput sample: the node-wide receive and transmit rates
-/// (bytes/sec) captured at a single refresh. Samples are pushed in refresh order
-/// so the chart's x-axis is implicitly time.
+/// (bytes/sec) captured at a single refresh, together with the wall-clock
+/// instant it was captured at.
+///
+/// The timestamp is what makes a sample meaningful outside the session that
+/// took it. Sample *order* alone would place a history restored from disk
+/// immediately before this session's first refresh, drawing a session boundary
+/// — however long the TUI was closed for — as if it were one refresh interval.
+/// With a capture time each sample lands on the chart at its true age, and the
+/// stretch where nothing was recorded shows up as the gap it is.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ThroughputSample {
+    /// When the sample was taken, as milliseconds since the Unix epoch.
+    ///
+    /// Wall clock rather than a monotonic instant on purpose: the value has to
+    /// survive being written to disk and read back by a later process, which a
+    /// process-local monotonic clock cannot do. The cost is that a clock step
+    /// between sessions can misplace restored samples, which the load path
+    /// bounds by discarding anything outside the retained window.
+    pub at_ms: u64,
     /// Node-wide receive rate in bytes/sec at sample time.
     pub rx_bps: f64,
     /// Node-wide transmit rate in bytes/sec at sample time.
     pub tx_bps: f64,
+}
+
+/// The current wall-clock time in milliseconds since the Unix epoch, saturating
+/// at 0 if the system clock is set before the epoch.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl Snapshot {
@@ -737,15 +761,49 @@ impl App {
     }
 
     /// Append the latest node-wide throughput totals from the current snapshot
-    /// to the rolling history, evicting the oldest sample once
-    /// [`THROUGHPUT_HISTORY`] is exceeded. Call once per successful refresh so
-    /// the Metrics tab chart advances one step per refresh interval.
+    /// to the rolling history, stamped with the current wall-clock time. Call
+    /// once per successful refresh so the Metrics tab chart advances one step
+    /// per refresh interval.
     pub fn record_throughput(&mut self) {
+        self.record_throughput_at(now_ms());
+    }
+
+    /// [`App::record_throughput`] with the capture time supplied explicitly, so
+    /// tests can drive the history on a virtual clock.
+    pub fn record_throughput_at(&mut self, at_ms: u64) {
         let tp = &self.snapshot.throughput;
         self.throughput_history.push_back(ThroughputSample {
+            at_ms,
             rx_bps: tp.total_rx_bps,
             tx_bps: tp.total_tx_bps,
         });
+        self.prune_throughput_history(at_ms);
+    }
+
+    /// The span of time the throughput chart shows: [`THROUGHPUT_HISTORY`]
+    /// samples at the configured refresh interval, in milliseconds.
+    ///
+    /// This is the window a restored history is trimmed to, so what survives a
+    /// restart is exactly what the chart has room to draw.
+    pub fn throughput_window_ms(&self) -> u64 {
+        THROUGHPUT_HISTORY as u64 * self.interval_ms.max(1)
+    }
+
+    /// Retire samples that have aged out of [`App::throughput_window_ms`],
+    /// then any excess beyond [`THROUGHPUT_HISTORY`].
+    ///
+    /// Both bounds are needed: the count cap alone would keep a restored
+    /// history alive on screen long after it stopped describing the present,
+    /// since an idle session pushes no new samples to evict it.
+    fn prune_throughput_history(&mut self, now_ms: u64) {
+        let cutoff = now_ms.saturating_sub(self.throughput_window_ms());
+        while self
+            .throughput_history
+            .front()
+            .is_some_and(|s| s.at_ms < cutoff)
+        {
+            self.throughput_history.pop_front();
+        }
         while self.throughput_history.len() > THROUGHPUT_HISTORY {
             self.throughput_history.pop_front();
         }
@@ -1318,7 +1376,7 @@ mod tests {
         for i in 0..3 {
             app.snapshot.throughput.total_rx_bps = i as f64;
             app.snapshot.throughput.total_tx_bps = (i * 10) as f64;
-            app.record_throughput();
+            app.record_throughput_at(EPOCH + i as u64 * 1000);
         }
         assert_eq!(app.throughput_history.len(), 3);
         assert_eq!(app.throughput_history.front().unwrap().rx_bps, 0.0);
@@ -1329,13 +1387,55 @@ mod tests {
         // bounded and the newest sample is retained.
         for i in 0..THROUGHPUT_HISTORY {
             app.snapshot.throughput.total_rx_bps = (100 + i) as f64;
-            app.record_throughput();
+            app.record_throughput_at(EPOCH + (3 + i as u64) * 1000);
         }
         assert_eq!(app.throughput_history.len(), THROUGHPUT_HISTORY);
         assert_eq!(
             app.throughput_history.back().unwrap().rx_bps,
             (100 + THROUGHPUT_HISTORY - 1) as f64
         );
+    }
+
+    /// An arbitrary fixed wall-clock instant (2023-11-14T22:13:20Z) so the
+    /// timestamp assertions below are deterministic rather than clock-dependent.
+    const EPOCH: u64 = 1_700_000_000_000;
+
+    #[test]
+    fn throughput_samples_carry_their_capture_time() {
+        let mut app = App::new("test".to_string(), 1000);
+        app.snapshot.throughput.total_rx_bps = 7.0;
+        app.snapshot.throughput.total_tx_bps = 9.0;
+        app.record_throughput_at(EPOCH);
+
+        // The sample records *when* it was taken, not merely its position in
+        // the buffer — that is what lets a restored history be replayed onto
+        // the timeline at its true age instead of at "now".
+        let s = app.throughput_history.back().unwrap();
+        assert_eq!(s.at_ms, EPOCH);
+        assert_eq!(s.rx_bps, 7.0);
+        assert_eq!(s.tx_bps, 9.0);
+    }
+
+    #[test]
+    fn throughput_history_evicts_samples_older_than_the_window() {
+        let mut app = App::new("test".to_string(), 1000);
+        let window = app.throughput_window_ms();
+        assert_eq!(window, THROUGHPUT_HISTORY as u64 * 1000);
+
+        // Two samples an hour apart: recording the second must retire the first,
+        // which has fallen out of the retained window even though the buffer is
+        // nowhere near its capacity.
+        app.snapshot.throughput.total_rx_bps = 1.0;
+        app.record_throughput_at(EPOCH);
+        app.snapshot.throughput.total_rx_bps = 2.0;
+        app.record_throughput_at(EPOCH + 3_600_000);
+
+        assert_eq!(app.throughput_history.len(), 1);
+        assert_eq!(app.throughput_history.back().unwrap().rx_bps, 2.0);
+
+        // A sample exactly at the window edge is still inside it.
+        app.record_throughput_at(EPOCH + 3_600_000 + window);
+        assert_eq!(app.throughput_history.len(), 2);
     }
 
     #[test]

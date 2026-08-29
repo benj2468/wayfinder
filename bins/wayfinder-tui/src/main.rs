@@ -72,8 +72,10 @@ async fn run(
     let mut app = App::new(target.label(), args.interval);
 
     // Restore the throughput history from a previous session so the Metrics tab
-    // chart continues its trend rather than starting blank.
-    app.throughput_history = persist::load();
+    // chart continues its trend rather than starting blank. Samples keep their
+    // capture times, so they resume at their true age on the chart's timeline
+    // and anything older than the chart's window is dropped outright.
+    app.throughput_history = persist::load(app.throughput_window_ms());
 
     // Read blocking terminal events on a dedicated thread and bridge them into
     // the async loop over a channel, so input never stalls the refresh timer.
