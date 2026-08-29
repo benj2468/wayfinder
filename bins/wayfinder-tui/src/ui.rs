@@ -37,10 +37,14 @@ use wayfinder_protos::wayfinder::v1alpha::PingProbeState;
 use wayfinder_protos::wayfinder::v1alpha::PingSession;
 use wayfinder_protos::wayfinder::v1alpha::alarm::Subject as AlarmSubject;
 
+use std::collections::VecDeque;
+
 use crate::app::App;
 use crate::app::LogEntry;
 use crate::app::Tab;
+use crate::app::ThroughputSample;
 use crate::app::format_id;
+use crate::app::now_ms;
 
 /// Accent colour used for headings and the active tab.
 const ACCENT: Color = Color::Cyan;
@@ -1173,10 +1177,65 @@ fn render_keepalive_table(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(table, area);
 }
 
+/// One unbroken run of throughput samples, as chart points.
+///
+/// The x of each point is seconds relative to now — negative into the past, so
+/// the right edge of the chart is always the present moment. Splitting the
+/// history into runs is what keeps a stretch with no samples (the TUI was
+/// closed, or the node was unreachable) from being drawn as a straight line
+/// between the last sample before it and the first sample after: a line there
+/// would assert traffic levels nobody measured.
+struct ThroughputSegment {
+    /// Receive-rate points, oldest first.
+    rx: Vec<(f64, f64)>,
+    /// Transmit-rate points, oldest first.
+    tx: Vec<(f64, f64)>,
+}
+
+/// Project `history` onto a time axis anchored at `now_ms`, breaking it into
+/// contiguous runs wherever consecutive samples are more than two refresh
+/// intervals apart.
+///
+/// Two intervals is the threshold because a live session's samples land one
+/// interval apart give or take scheduling jitter and a slow round trip to the
+/// node; anything beyond that is a stretch that went unrecorded.
+fn throughput_segments(
+    history: &VecDeque<ThroughputSample>,
+    now_ms: u64,
+    interval_ms: u64,
+) -> Vec<ThroughputSegment> {
+    let max_step = interval_ms.max(1).saturating_mul(2);
+    let mut segments: Vec<ThroughputSegment> = Vec::new();
+    let mut prev_at: Option<u64> = None;
+
+    for s in history {
+        let contiguous = prev_at.is_some_and(|prev| s.at_ms.saturating_sub(prev) <= max_step);
+        if !contiguous {
+            segments.push(ThroughputSegment {
+                rx: Vec::new(),
+                tx: Vec::new(),
+            });
+        }
+        // The branch above guarantees a segment to push into.
+        if let Some(seg) = segments.last_mut() {
+            let x = (s.at_ms as f64 - now_ms as f64) / 1000.0;
+            seg.rx.push((x, s.rx_bps));
+            seg.tx.push((x, s.tx_bps));
+            prev_at = Some(s.at_ms);
+        }
+    }
+    segments
+}
+
 /// Draw the node-wide throughput history as a two-line chart: one line for the
-/// receive rate and one for the transmit rate, advancing one step per refresh.
-/// This turns the instantaneous totals into a visible trend so an operator can
-/// see bursts, ramps, and collapses in mesh traffic at a glance.
+/// receive rate and one for the transmit rate, plotted against the wall-clock
+/// time each sample was taken. This turns the instantaneous totals into a
+/// visible trend so an operator can see bursts, ramps, and collapses in mesh
+/// traffic at a glance.
+///
+/// Because the x-axis is real time and not sample index, a history restored
+/// from a previous session sits at its true age with the interruption visible
+/// as a gap, rather than being fused onto the present.
 fn render_throughput_chart(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1194,20 +1253,16 @@ fn render_throughput_chart(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // x is the sample index (implicitly time, one step per refresh interval);
-    // y is the rate in bytes/sec.
-    let rx: Vec<(f64, f64)> = history
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (i as f64, s.rx_bps))
-        .collect();
-    let tx: Vec<(f64, f64)> = history
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (i as f64, s.tx_bps))
-        .collect();
+    let now = now_ms();
+    let segments = throughput_segments(history, now, app.interval_ms);
 
-    let x_max = (history.len() - 1) as f64;
+    // The axis spans from the oldest retained sample to now. Floor the span at
+    // one refresh interval so a burst of same-millisecond samples still gets a
+    // non-degenerate axis.
+    let interval_secs = app.interval_ms.max(1) as f64 / 1000.0;
+    let oldest = history.front().map_or(0.0, |s| s.at_ms as f64);
+    let x_min = ((oldest - now as f64) / 1000.0).min(-interval_secs);
+
     // Scale the y-axis to the largest rate seen across both series, with a
     // little headroom, and never below 1 so an idle mesh still renders a flat
     // baseline rather than a degenerate zero-height axis.
@@ -1217,33 +1272,38 @@ fn render_throughput_chart(frame: &mut Frame, app: &App, area: Rect) {
         .fold(0.0_f64, f64::max);
     let y_max = (peak * 1.15).max(1.0);
 
-    // The x-axis spans the retained window; label its ends in seconds-ago so the
-    // chart reads as a timeline at whatever refresh interval is in effect.
-    let span_secs = x_max * app.interval_ms as f64 / 1000.0;
-
-    let datasets = vec![
-        Dataset::default()
-            .name("RX")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Green))
-            .data(&rx),
-        Dataset::default()
-            .name("TX")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Cyan))
-            .data(&tx),
-    ];
+    // Only the first run of each series is named, so a history broken by a gap
+    // still shows one "RX" and one "TX" entry in the legend rather than one per
+    // fragment.
+    let mut datasets = Vec::with_capacity(segments.len() * 2);
+    for (i, seg) in segments.iter().enumerate() {
+        let (rx_name, tx_name) = if i == 0 { ("RX", "TX") } else { ("", "") };
+        datasets.push(
+            Dataset::default()
+                .name(rx_name)
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::Green))
+                .data(&seg.rx),
+        );
+        datasets.push(
+            Dataset::default()
+                .name(tx_name)
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::Cyan))
+                .data(&seg.tx),
+        );
+    }
 
     let chart = Chart::new(datasets)
         .block(block)
         .x_axis(
             Axis::default()
                 .style(Style::default().fg(Color::DarkGray))
-                .bounds([0.0, x_max])
+                .bounds([x_min, 0.0])
                 .labels(vec![
-                    Span::raw(format!("-{span_secs:.0}s")),
+                    Span::raw(format!("-{:.0}s", -x_min)),
                     Span::raw("now"),
                 ]),
         )
@@ -1999,6 +2059,62 @@ mod tests {
         );
     }
 
+    /// A fixed wall-clock "now" (2023-11-14T22:13:20Z), so the chart's
+    /// time-axis assertions don't depend on the machine clock.
+    const NOW: u64 = 1_700_000_000_000;
+
+    /// Build a history from `(seconds-ago, rx, tx)` triples, oldest first.
+    fn history_ago(samples: &[(u64, f64, f64)]) -> VecDeque<ThroughputSample> {
+        samples
+            .iter()
+            .map(|&(ago, rx, tx)| ThroughputSample {
+                at_ms: NOW - ago * 1000,
+                rx_bps: rx,
+                tx_bps: tx,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn throughput_points_are_placed_by_capture_time() {
+        let history = history_ago(&[(3, 10.0, 1.0), (2, 20.0, 2.0), (1, 30.0, 3.0)]);
+        let segments = throughput_segments(&history, NOW, 1000);
+
+        // One unbroken run, plotted as seconds before "now" — so a sample taken
+        // three seconds ago sits three seconds back on the axis whether it came
+        // from this session or was restored from disk.
+        assert_eq!(segments.len(), 1);
+        assert_eq!(
+            segments[0].rx,
+            vec![(-3.0, 10.0), (-2.0, 20.0), (-1.0, 30.0)]
+        );
+        assert_eq!(segments[0].tx, vec![(-3.0, 1.0), (-2.0, 2.0), (-1.0, 3.0)]);
+    }
+
+    #[test]
+    fn throughput_series_breaks_across_a_recording_gap() {
+        // Two samples restored from a previous session, then a 30 s stretch
+        // where the TUI was not running, then this session's samples.
+        let history = history_ago(&[(40, 1.0, 0.0), (39, 2.0, 0.0), (2, 3.0, 0.0), (1, 4.0, 0.0)]);
+        let segments = throughput_segments(&history, NOW, 1000);
+
+        // The gap is a hole in the record, not a straight line down from the
+        // last restored sample: each contiguous run is its own series.
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].rx, vec![(-40.0, 1.0), (-39.0, 2.0)]);
+        assert_eq!(segments[1].rx, vec![(-2.0, 3.0), (-1.0, 4.0)]);
+    }
+
+    #[test]
+    fn throughput_series_tolerates_refresh_jitter() {
+        // Samples an interval apart give or take a little are one run: only a
+        // real interruption should break the line.
+        let history = history_ago(&[(3, 1.0, 0.0), (2, 2.0, 0.0), (1, 3.0, 0.0)]);
+        assert_eq!(throughput_segments(&history, NOW, 900).len(), 1);
+        // An empty history has no series at all.
+        assert!(throughput_segments(&VecDeque::new(), NOW, 1000).is_empty());
+    }
+
     /// Render the Metrics tab through a real `TestBackend` so the chart's axis
     /// bounds, label vectors, and layout split are exercised end to end — both
     /// before any history exists (placeholder path) and once two-plus samples
@@ -2017,11 +2133,13 @@ mod tests {
             .expect("draw empty");
 
         // Populate enough samples (including an all-idle pair) to force the
-        // line-drawing path and the y-axis peak/headroom computation.
+        // line-drawing path and the y-axis peak/headroom computation — with a
+        // gap partway through, so the segmented-chart path is drawn too.
         for i in 0..5 {
             app.snapshot.throughput.total_rx_bps = (i * 100) as f64;
             app.snapshot.throughput.total_tx_bps = (i * 50) as f64;
-            app.record_throughput();
+            let ago = if i < 2 { 60 - i } else { 5 - i };
+            app.record_throughput_at(now_ms().saturating_sub(ago as u64 * 1000));
         }
         terminal
             .draw(|frame| render(frame, &mut app))
