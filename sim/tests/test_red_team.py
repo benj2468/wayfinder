@@ -71,8 +71,8 @@ BASELINE = {
     "attack_degenerate_validity_window": red_team.HELD,
     "attack_fail_open_bridge_containment": red_team.HELD,
     # --- 2026-08 sweep: directed data plane / pairwise trailer ---
-    "attack_multicast_addressed_directed_delivery": red_team.GAP,
-    "attack_injected_directed_laundered_by_relay": red_team.GAP,
+    "attack_multicast_addressed_directed_delivery": red_team.HELD,
+    "attack_injected_directed_laundered_by_relay": red_team.HELD,
     "attack_directed_unicast_replay": red_team.HELD,
     "attack_cross_pair_tag_forgery": red_team.HELD,
     "attack_directed_frame_parsing_robustness": red_team.HELD,

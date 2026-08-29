@@ -19,12 +19,21 @@
 //! pairwise tag keyed off the neighbor keys this module caches.
 //!
 //! **Scope (read before trusting this boundary):** this authenticates *OGMs*
-//! and *directed* data-plane frames.  `BatmanPacketType::Unicast` and
-//! `BatmanPacketType::Mcast` carry the pairwise trailer (see
-//! [`DIRECTED_TRAILER_LEN`]), which `strip_directed` verifies on the way in.
-//! Flooded `BatmanPacketType::Bcast` frames (ARP etc.) are **not**
-//! authenticated — a pairwise tag cannot cover a one-to-many send — so an
-//! outsider can still inject a broadcast flood on an auth-enabled mesh.
+//! and *directed* data-plane frames.  Directed frames carry the pairwise
+//! trailer (see [`DIRECTED_TRAILER_LEN`]), which `strip_directed` verifies on
+//! the way in.  Which sub-types those are is
+//! `wayfinder_driver_core::requires_pairwise_tag`'s single decision — see its
+//! doc for the current list and the reasoning per type, rather than a copy
+//! here that can drift.  `BatmanPacketType::Bcast` is the notable exclusion:
+//! flooded frames (ARP etc.) are **not** authenticated at all — a pairwise tag
+//! cannot cover a one-to-many send — so an outsider can still inject a
+//! broadcast flood on an auth-enabled mesh.
+//!
+//! What separates the two is the **BATMAN sub-type**, and nothing else.  In
+//! particular it is not the link-layer destination: that field is chosen by
+//! whoever sent the frame, while local delivery and relaying are decided from
+//! the *inner* `dest`.  The rule is applied identically on ingress and egress
+//! so the two halves cannot drift apart.
 
 use batman::wire::BatmanOgmPacket;
 use batman::wire::BatmanTvlvHdr;
