@@ -10,6 +10,7 @@ use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
 use crate::BatmanEngine;
+use crate::BroadcastSeqnoEntry;
 use crate::KeepAliveStats;
 use crate::NeighborStats;
 use crate::OriginatorRecord;
@@ -1215,9 +1216,15 @@ impl<
     /// expires.  Returns [`DeliverLocalAndForward`] when it both delivers and
     /// re-floods (the re-flood is written into `reply`).
     ///
+    /// The dedup step is the security-relevant half: a `Bcast` reaches here
+    /// with no authenticator, keyed on fields inside that unauthenticated
+    /// payload.  [`BroadcastSeqnoEntry::admit`](crate::BroadcastSeqnoEntry::admit)
+    /// is what keeps that from being a denial of service.
+    ///
     /// [`DeliverLocalAndForward`]: RoutingAction::DeliverLocalAndForward
     fn handle_broadcast<'rx, 'tx>(
         &mut self,
+        now: core::time::Duration,
         frame: &'tx LinkFrame,
         reply: &mut LinkFrameDataMut<'rx>,
     ) -> RoutingAction {
@@ -1239,17 +1246,57 @@ impl<
         // Rule 2: deduplicate on (orig, seqno).  A broadcast arriving via several
         // paths must be flooded onward only once, or it would circulate forever
         // on a cyclic mesh.
-        if let Some(entry) = self.broadcast_seqno.iter_mut().find(|e| e.0 == orig_ident) {
-            if incoming_seqno <= entry.1 {
-                return RoutingAction::Consumed; // duplicate or stale
+        //
+        // Both halves of that key are read from inside the payload and nothing
+        // authenticated them, so an outsider chooses which entry to touch and
+        // what to write into it.  What makes that survivable is not a check on
+        // the frame — a keyless attacker passes every check available — but that
+        // `admit` makes any wrong high-water self-correcting, and that a full
+        // table evicts rather than refusing.  See `BroadcastSeqnoEntry`.
+        if let Some(entry) = self.broadcast_seqno.get_mut(&orig_ident) {
+            if !entry.admit(incoming_seqno, now) {
+                trace!(?orig_ident, incoming_seqno, "drop: broadcast not admitted");
+                return RoutingAction::Consumed;
             }
-            entry.1 = incoming_seqno;
-        } else if self
-            .broadcast_seqno
-            .push((orig_ident, incoming_seqno))
-            .is_err()
-        {
-            return RoutingAction::Consumed; // table full, drop packet
+        } else {
+            // A full table must make room rather than refuse the packet: refusing
+            // black-holes every originator not already present, for the life of
+            // the process, and the entries crowding it out need no credential to
+            // create.  Evicting costs at worst a duplicate re-flood, which the
+            // TTL bounds — per eviction, though a sustained flood sustains the
+            // churn.
+            //
+            // Least-recently-updated, matching `handle_ogm`'s originator-table
+            // eviction and `note_keepalive`'s.  Under a saturation flood no
+            // recency policy helps (the attacker's entries are always the
+            // freshest); the property that matters there is that the damage is
+            // transient, which `admit` provides, not which entry goes.
+            if self.broadcast_seqno.len() >= MAX_ORIGINATORS
+                && let Some(evicted) = self
+                    .broadcast_seqno
+                    .iter()
+                    .min_by_key(|(_, e)| e.last_updated)
+                    .map(|(m, _)| *m)
+            {
+                trace!(orig = ?evicted, "broadcast dedup table full, evicting least-recently-updated");
+                self.broadcast_seqno.remove(&evicted);
+            }
+            // Infallible: the eviction above guarantees a free slot, and
+            // `MAX_ORIGINATORS` is a non-zero power of two (a `heapless` map
+            // requirement, asserted at compile time).  Traced rather than
+            // ignored so that if a future edit breaks that reasoning it does not
+            // become a silent, self-sustaining re-flood loop.
+            if self
+                .broadcast_seqno
+                .insert(orig_ident, BroadcastSeqnoEntry::seeded(incoming_seqno, now))
+                .is_err()
+            {
+                trace!(
+                    ?orig_ident,
+                    "drop: broadcast dedup insert failed after eviction"
+                );
+                return RoutingAction::Consumed;
+            }
         }
 
         // Rule 3: TTL exhausted — deliver to the local node but do not re-flood
@@ -1533,7 +1580,7 @@ impl<
         // so it falls back to plain destination-based routing.
         match BatmanPacketType::from_u8(frame.payload[0]) {
             Some(BatmanPacketType::Ogm) => self.handle_ogm(now, frame, local_quality, reply),
-            Some(BatmanPacketType::Bcast) => self.handle_broadcast(frame, reply),
+            Some(BatmanPacketType::Bcast) => self.handle_broadcast(now, frame, reply),
             Some(BatmanPacketType::Unicast) => self.handle_unicast(now, frame, reply),
             Some(BatmanPacketType::Mcast) => self.handle_mcast(now, frame, reply),
             Some(BatmanPacketType::CertReq) => self.handle_cert_req(now, frame, reply),
@@ -2305,5 +2352,465 @@ mod tests {
         let engine = BatmanEngine::<4>::new(mac(1));
         let mut buf = [0u8; 1];
         assert_eq!(engine.produce_keepalive(&mut buf), None);
+    }
+
+    /// A flooded broadcast frame: `orig` is the node that generated it,
+    /// `src` the immediate relay putting it on the wire, addressed to the
+    /// link-layer broadcast address the way a real flood is.
+    fn bcast_frame(orig: u8, src: u8, seqno: u32, ttl: u8) -> Vec<u8> {
+        let pkt = BatmanBroadcastPacket {
+            packet_type: BatmanPacketType::Bcast.as_u8(),
+            version: 5,
+            ttl,
+            seqno: seqno.to_be(),
+            orig: mac(orig),
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(Mac::BROADCAST.as_bytes());
+        data.extend_from_slice(mac(src).as_bytes());
+        data.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
+        data.extend_from_slice(pkt.as_bytes());
+        // A token inner frame so the re-flood path has something to copy.
+        data.extend_from_slice(&[0xaa; 8]);
+        data
+    }
+
+    /// Every invariant the dedup table has that is not expressed in its types.
+    /// Called after each `rx_bcast` below, per the repo's convention for
+    /// stateful structures.
+    fn assert_invariants<const N: usize>(engine: &BatmanEngine<N>) {
+        assert!(
+            engine.broadcast_seqno.len() <= N,
+            "dedup table over capacity"
+        );
+        for (orig, entry) in engine.broadcast_seqno.iter() {
+            assert_ne!(*orig, engine.self_ident, "own ident must never be tracked");
+            if let Some(watch) = entry.resync_watch {
+                assert!(
+                    watch.since >= entry.last_updated,
+                    "a watch is opened by a refusal, which always postdates the \
+                     last acceptance"
+                );
+            }
+        }
+    }
+
+    /// Feed one broadcast into `engine` at `now` with the given TTL and report
+    /// what it decided.
+    fn rx_bcast_ttl<const N: usize>(
+        engine: &mut BatmanEngine<N>,
+        now: core::time::Duration,
+        orig: u8,
+        src: u8,
+        seqno: u32,
+        ttl: u8,
+    ) -> RoutingAction {
+        let frame = bcast_frame(orig, src, seqno, ttl);
+        let parsed = LinkFrame::ref_from_prefix(&frame).unwrap().0;
+        let mut tx = [0u8; 128];
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+        let action = engine.handle_rx(now, parsed, None, &mut reply);
+        assert_invariants(engine);
+        action
+    }
+
+    /// A broadcast with enough TTL to be re-flooded — the usual case.
+    fn rx_bcast<const N: usize>(
+        engine: &mut BatmanEngine<N>,
+        now: core::time::Duration,
+        orig: u8,
+        src: u8,
+        seqno: u32,
+    ) -> RoutingAction {
+        rx_bcast_ttl(engine, now, orig, src, seqno, 5)
+    }
+
+    /// Whether the broadcast was accepted for delivery *and* re-flooding.
+    fn flooded(action: RoutingAction) -> bool {
+        matches!(action, RoutingAction::DeliverLocalAndForward(_))
+    }
+
+    /// The high-water for `orig`, or `None` when it holds no dedup entry.
+    fn bcast_high_water<const N: usize>(engine: &BatmanEngine<N>, orig: u8) -> Option<u32> {
+        engine.broadcast_seqno.get(&mac(orig)).map(|e| e.last_seqno)
+    }
+
+    const PROTECTION: core::time::Duration = crate::BROADCAST_SEQNO_RESET_PROTECTION;
+    const WINDOW: u32 = crate::BROADCAST_SEQNO_WINDOW;
+    const TOLERANCE: u32 = crate::BROADCAST_SEQNO_REORDER_TOLERANCE;
+
+    /// Baseline dedup, which nothing below may weaken: a genuinely newer seqno
+    /// floods on, and a repeat or a slightly older copy of one already seen —
+    /// the same flood arriving by a second path — is consumed.
+    #[test]
+    fn broadcast_dedup_consumes_repeat_and_older_seqnos() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let t = core::time::Duration::ZERO;
+
+        assert!(flooded(rx_bcast(&mut engine, t, 2, 3, 5)));
+        assert!(!flooded(rx_bcast(&mut engine, t, 2, 4, 5)));
+        assert!(!flooded(rx_bcast(&mut engine, t, 2, 4, 4)));
+        assert!(flooded(rx_bcast(&mut engine, t, 2, 3, 6)));
+        assert_eq!(bcast_high_water(&engine, 2), Some(6));
+    }
+
+    /// The three bands `classify` sorts the 32-bit space into, checked at their
+    /// exact edges — the boundaries are one `<=` apart and a `RoutingAction`
+    /// alone cannot tell a `Duplicate` from an `Implausible`, so this asserts
+    /// on the verdict directly.
+    #[test]
+    fn broadcast_seqno_bands_are_exact_at_their_edges() {
+        let entry = BroadcastSeqnoEntry::seeded(10_000, core::time::Duration::ZERO);
+        use crate::SeqnoVerdict::*;
+
+        assert_eq!(entry.classify(10_001), Advance);
+        assert_eq!(entry.classify(10_000 + WINDOW), Advance);
+        assert_eq!(entry.classify(10_000 + WINDOW + 1), Implausible);
+
+        assert_eq!(entry.classify(10_000), Duplicate);
+        assert_eq!(entry.classify(10_000 - TOLERANCE), Duplicate);
+        assert_eq!(entry.classify(10_000 - TOLERANCE - 1), Implausible);
+    }
+
+    /// The wrapping comparison is direction-aware across the `u32` boundary: a
+    /// counter stepping off the end of the space reads as one ahead, and the
+    /// antipodal point — where a naive signed cast would misread the direction
+    /// — is refused rather than accepted.
+    #[test]
+    fn broadcast_seqno_bands_wrap_at_the_u32_boundary() {
+        use crate::SeqnoVerdict::*;
+        let at_max = BroadcastSeqnoEntry::seeded(u32::MAX, core::time::Duration::ZERO);
+        assert_eq!(at_max.classify(0), Advance);
+        assert_eq!(at_max.classify(u32::MAX), Duplicate);
+
+        let low = BroadcastSeqnoEntry::seeded(5, core::time::Duration::ZERO);
+        assert_eq!(low.classify(u32::MAX), Duplicate, "six behind, wrapped");
+        assert_eq!(low.classify(5u32.wrapping_add(1 << 31)), Implausible);
+    }
+
+    /// Failure mode A of issue #29: the dedup table is filled with fabricated
+    /// originators, which used to make every *subsequent* originator's
+    /// broadcasts undeliverable for the life of the process ("table full, drop
+    /// packet").  A full table must evict its least-recently-updated entry
+    /// instead, the way the originator and keep-alive tables already do.
+    #[test]
+    fn broadcast_dedup_table_evicts_least_recently_updated_when_full() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+
+        // Saturate the table (capacity 4) with ghost origs, each updated at a
+        // distinct, increasing time.
+        for (i, orig) in (10..14).enumerate() {
+            rx_bcast(
+                &mut engine,
+                core::time::Duration::from_secs(i as u64),
+                orig,
+                9,
+                1,
+            );
+        }
+        assert_eq!(engine.broadcast_seqno.len(), 4);
+        assert_eq!(bcast_high_water(&engine, 10), Some(1));
+
+        // A genuine originator not yet in the table must still be flooded.
+        let t = core::time::Duration::from_secs(100);
+        assert!(
+            flooded(rx_bcast(&mut engine, t, 20, 21, 1)),
+            "a saturated dedup table must not black-hole a new originator"
+        );
+        assert_eq!(engine.broadcast_seqno.len(), 4, "table stays at capacity");
+        assert_eq!(
+            bcast_high_water(&engine, 10),
+            None,
+            "the least-recently-updated entry must be the one evicted"
+        );
+        assert_eq!(bcast_high_water(&engine, 20), Some(1));
+    }
+
+    /// A stream of non-advancing frames must not keep a poisoned entry pinned
+    /// in the eviction order.  `last_updated` therefore tracks the last
+    /// *advance*, not the last frame seen — unlike the originator and
+    /// keep-alive tables, where every frame heard refreshes the key.
+    #[test]
+    fn broadcast_dedup_eviction_key_tracks_advances_not_arrivals() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let secs = core::time::Duration::from_secs;
+
+        rx_bcast(&mut engine, secs(0), 2, 2, 5);
+        // Duplicates of the same flood, arriving much later by other paths.
+        rx_bcast(&mut engine, secs(50), 2, 3, 5);
+        rx_bcast(&mut engine, secs(60), 2, 4, 5);
+
+        let entry = engine.broadcast_seqno.get(&mac(2)).expect("entry");
+        assert_eq!(
+            entry.last_updated,
+            secs(0),
+            "a duplicate must not refresh the eviction key"
+        );
+    }
+
+    /// Failure mode B of issue #29: one unauthenticated frame carrying a
+    /// victim's `orig` and `seqno = u32::MAX` used to pin that victim's
+    /// high-water at the maximum, silencing it forever.  Measured by wrapping
+    /// distance, `u32::MAX` sits six *behind* a high-water of five, so it is
+    /// discarded as a stale duplicate and the victim is untouched.
+    #[test]
+    fn broadcast_dedup_treats_a_forged_max_seqno_as_stale() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let secs = core::time::Duration::from_secs;
+
+        rx_bcast(&mut engine, secs(0), 2, 2, 5);
+        assert!(!flooded(rx_bcast(&mut engine, secs(1), 2, 9, u32::MAX)));
+        assert_eq!(
+            bcast_high_water(&engine, 2),
+            Some(5),
+            "a forged seqno behind the high-water must not become it"
+        );
+        assert!(
+            flooded(rx_bcast(&mut engine, secs(2), 2, 2, 6)),
+            "one forged frame must not durably silence a member"
+        );
+    }
+
+    /// The same forgery landing *before* the victim has ever broadcast, so it
+    /// seeds the entry rather than updating one.  The victim's low seqnos are
+    /// then a short wrapping distance *ahead* of `u32::MAX`, so they are
+    /// admitted — the wrap the old strict `<=` comparison could not see.
+    #[test]
+    fn broadcast_dedup_survives_a_forged_max_seqno_seeding_the_entry() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let secs = core::time::Duration::from_secs;
+
+        rx_bcast(&mut engine, secs(0), 2, 9, u32::MAX);
+        assert!(
+            flooded(rx_bcast(&mut engine, secs(1), 2, 2, 1)),
+            "a wrapped-around seqno must be read as newer, not stale"
+        );
+        assert_eq!(bcast_high_water(&engine, 2), Some(1));
+    }
+
+    /// The attack the first cut of this fix missed, and the reason the
+    /// *behind* band has to be narrow: a forgery does not need an implausible
+    /// leap, only one inside the window, which is accepted as a genuine
+    /// advance.  Every genuine broadcast the victim then emits sits behind the
+    /// poisoned high-water.  If that band were merely dropped as "duplicate",
+    /// the victim would stay silent until its own counter climbed past the
+    /// forged value — thousands of frames, hours at ARP rates, from one frame.
+    /// It must instead be read as evidence the high-water is wrong, and heal.
+    #[test]
+    fn broadcast_dedup_heals_a_forged_in_window_jump() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let secs = core::time::Duration::from_secs;
+
+        rx_bcast(&mut engine, secs(0), 2, 2, 5);
+        // Inside the window, so accepted — the attacker's best move.
+        assert!(flooded(rx_bcast(&mut engine, secs(1), 2, 9, 5 + WINDOW)));
+        assert_eq!(bcast_high_water(&engine, 2), Some(5 + WINDOW));
+
+        // The victim keeps broadcasting; these are refused for now, but they
+        // must open a watch rather than vanish.
+        assert!(!flooded(rx_bcast(&mut engine, secs(2), 2, 2, 6)));
+        assert!(!flooded(rx_bcast(&mut engine, secs(3), 2, 2, 7)));
+
+        // Once the run has persisted, the high-water snaps back to where the
+        // victim actually is and its broadcasts flow again.
+        let healed = secs(2) + PROTECTION;
+        assert!(
+            flooded(rx_bcast(&mut engine, healed, 2, 2, 8)),
+            "a forged in-window jump must heal within the protection window"
+        );
+        assert!(flooded(rx_bcast(&mut engine, healed, 2, 2, 9)));
+    }
+
+    /// Eviction must not become a way around the window: an attacker can force
+    /// a victim's entry out of a full table cheaply, and the re-seeded entry
+    /// takes its first seqno on trust.  That is deliberate — a check there
+    /// would buy nothing — and it is safe only because the victim's own next
+    /// frames correct it.
+    #[test]
+    fn broadcast_dedup_heals_after_eviction_reseeds_a_victim() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let secs = core::time::Duration::from_secs;
+
+        rx_bcast(&mut engine, secs(0), 2, 2, 5);
+        for (i, ghost) in (10..14).enumerate() {
+            rx_bcast(&mut engine, secs(1 + i as u64), ghost, 9, 1);
+        }
+        assert_eq!(bcast_high_water(&engine, 2), None, "victim evicted");
+
+        // Re-seeded under the victim's name with an unreachable value.
+        rx_bcast(&mut engine, secs(10), 2, 9, 1 << 31);
+        assert!(!flooded(rx_bcast(&mut engine, secs(11), 2, 2, 6)));
+
+        let healed = secs(11) + PROTECTION;
+        assert!(
+            flooded(rx_bcast(&mut engine, healed, 2, 2, 7)),
+            "an evicted-and-reseeded entry must heal like any other"
+        );
+        assert_eq!(bcast_high_water(&engine, 2), Some(7));
+    }
+
+    /// A genuine reboot, which is why refusing an implausible seqno cannot be
+    /// unconditional: the broadcast counter restarts at zero and is never
+    /// persisted, so a restarted originator's frames sit far below the
+    /// high-water its neighbours hold.
+    #[test]
+    fn broadcast_dedup_resyncs_a_rebooted_originator() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let secs = core::time::Duration::from_secs;
+
+        rx_bcast(&mut engine, secs(0), 2, 2, 5_000);
+
+        assert!(!flooded(rx_bcast(&mut engine, secs(10), 2, 2, 1)));
+        assert_eq!(bcast_high_water(&engine, 2), Some(5_000));
+
+        // One tick short of the deadline: still refused.
+        let almost = secs(10) + PROTECTION - core::time::Duration::from_millis(1);
+        assert!(!flooded(rx_bcast(&mut engine, almost, 2, 2, 2)));
+        assert_eq!(bcast_high_water(&engine, 2), Some(5_000));
+
+        // At the deadline: the entry snaps back to where the run started.
+        let later = secs(10) + PROTECTION;
+        assert!(
+            flooded(rx_bcast(&mut engine, later, 2, 2, 3)),
+            "a persistent restart must resynchronise the high-water"
+        );
+        assert_eq!(bcast_high_water(&engine, 2), Some(3));
+    }
+
+    /// The resync restores the seqno that *opened* the run, not whichever
+    /// frame trips the deadline — otherwise an attacker waits out a run an
+    /// honest, rebooting originator earned and substitutes its own number,
+    /// reconstructing failure mode B from two frames thirty seconds apart.
+    #[test]
+    fn broadcast_dedup_resync_does_not_admit_a_third_party_seqno() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let secs = core::time::Duration::from_secs;
+
+        rx_bcast(&mut engine, secs(0), 2, 2, 5_000);
+        // The victim reboots and opens the run with its own seqno.
+        rx_bcast(&mut engine, secs(10), 2, 2, 1);
+
+        // The attacker cashes it in at the deadline.
+        let deadline = secs(10) + PROTECTION;
+        assert!(!flooded(rx_bcast(&mut engine, deadline, 2, 9, 1 << 30)));
+        assert_eq!(
+            bcast_high_water(&engine, 2),
+            Some(1),
+            "the run must restore the seqno that opened it"
+        );
+        assert!(
+            flooded(rx_bcast(&mut engine, deadline, 2, 2, 2)),
+            "the victim keeps the run it earned"
+        );
+    }
+
+    /// A run has to *persist*: later implausible frames must not push the
+    /// deadline back, or an attacker could hold the correction off forever
+    /// simply by continuing to send.
+    #[test]
+    fn broadcast_dedup_watch_is_not_refreshed_by_a_continuing_run() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let secs = core::time::Duration::from_secs;
+
+        rx_bcast(&mut engine, secs(0), 2, 2, 5_000);
+        rx_bcast(&mut engine, secs(10), 2, 2, 1);
+        for i in 1..30 {
+            rx_bcast(&mut engine, secs(10 + i), 2, 2, 1 + i as u32);
+        }
+        let later = secs(10) + PROTECTION;
+        assert!(
+            flooded(rx_bcast(&mut engine, later, 2, 2, 40)),
+            "a continuing run must still complete on its original deadline"
+        );
+    }
+
+    /// An advance clears the watch, so a run only completes if it is genuinely
+    /// uninterrupted — an attacker cannot arm one and return later to a live,
+    /// advancing originator to collect it.
+    #[test]
+    fn broadcast_dedup_an_advance_clears_the_watch() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let secs = core::time::Duration::from_secs;
+
+        rx_bcast(&mut engine, secs(0), 2, 2, 5);
+        rx_bcast(&mut engine, secs(1), 2, 9, 5 + WINDOW + 1); // implausible: opens a watch
+        rx_bcast(&mut engine, secs(2), 2, 2, 6); // genuine advance: clears it
+        assert!(
+            engine
+                .broadcast_seqno
+                .get(&mac(2))
+                .expect("entry")
+                .resync_watch
+                .is_none()
+        );
+
+        let later = secs(2) + PROTECTION;
+        assert!(
+            !flooded(rx_bcast(&mut engine, later, 2, 9, 6 + WINDOW + 1)),
+            "a fresh run must start its own clock"
+        );
+        assert_eq!(bcast_high_water(&engine, 2), Some(6));
+    }
+
+    /// A clock that goes backwards must never complete a run early.
+    #[test]
+    fn broadcast_dedup_a_backwards_clock_never_resyncs_early() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let secs = core::time::Duration::from_secs;
+
+        rx_bcast(&mut engine, secs(100), 2, 2, 5_000);
+        rx_bcast(&mut engine, secs(100), 2, 2, 1);
+        assert!(!flooded(rx_bcast(&mut engine, secs(1), 2, 2, 2)));
+        assert_eq!(bcast_high_water(&engine, 2), Some(5_000));
+    }
+
+    /// A TTL-exhausted broadcast is delivered locally without being re-flooded
+    /// — and is still deduplicated, because Rule 2 runs before Rule 3.  A
+    /// second copy of it must not be delivered twice.
+    #[test]
+    fn broadcast_ttl_exhausted_delivers_locally_and_still_dedups() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let t = core::time::Duration::ZERO;
+
+        assert!(matches!(
+            rx_bcast_ttl(&mut engine, t, 2, 3, 7, 1),
+            RoutingAction::DeliverLocal
+        ));
+        assert_eq!(bcast_high_water(&engine, 2), Some(7));
+        assert!(matches!(
+            rx_bcast_ttl(&mut engine, t, 2, 4, 7, 1),
+            RoutingAction::Consumed
+        ));
+    }
+
+    /// This node's own broadcast looping back is dropped before the dedup
+    /// table is touched, so an echo cannot occupy a slot in it.
+    #[test]
+    fn broadcast_from_self_is_dropped_without_a_dedup_entry() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let t = core::time::Duration::ZERO;
+
+        assert!(matches!(
+            rx_bcast(&mut engine, t, 1, 3, 9),
+            RoutingAction::Consumed
+        ));
+        assert!(engine.broadcast_seqno.is_empty());
+    }
+
+    /// Re-anchoring auth drops the dedup table with the rest of the routing
+    /// state, so a peer's broadcasts are re-learned from whatever it sends
+    /// next rather than judged against a high-water from the old regime.
+    #[test]
+    fn reset_clears_the_broadcast_dedup_table() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        let t = core::time::Duration::ZERO;
+
+        rx_bcast(&mut engine, t, 2, 2, 5_000);
+        engine.reset();
+        assert!(engine.broadcast_seqno.is_empty());
+        assert!(
+            flooded(rx_bcast(&mut engine, t, 2, 2, 1)),
+            "a lower seqno is admitted once the old high-water is gone"
+        );
     }
 }

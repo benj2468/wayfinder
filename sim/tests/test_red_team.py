@@ -91,8 +91,11 @@ BASELINE = {
     "attack_stale_revocation_denies_readmission": red_team.HELD,
     # --- 2026-08 sweep: OGM semantics / routing engine ---
     "attack_ogm_seqno_highwater_jam": red_team.GAP,
-    "attack_broadcast_seqno_blackhole": red_team.GAP,
-    "attack_broadcast_dedup_table_exhaustion": red_team.GAP,
+    "attack_broadcast_seqno_blackhole": red_team.HELD,
+    "attack_broadcast_seqno_in_window_jump": red_team.HELD,
+    "attack_broadcast_resync_hijack": red_team.HELD,
+    "attack_broadcast_evict_then_reseed": red_team.HELD,
+    "attack_broadcast_dedup_table_exhaustion": red_team.HELD,
     "attack_relayed_tq_inflation": red_team.HELD,
 }
 """Expected verdict per attack — the baseline the ``09-mesh-auth-gaps.md`` design

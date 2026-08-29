@@ -153,8 +153,11 @@ fn is_cert_control(payload: &[u8]) -> bool {
 /// the same bytes with the trailer dropped, or `None` if the frame must be
 /// dropped (bad/missing tag from an unverified or foreign neighbor).
 fn strip_directed<'a, R: RouterOps>(router: &mut R, frame: &'a LinkFrame) -> Option<&'a LinkFrame> {
-    // Only directed (unicast/mcast) frames carry a tag; broadcasts/OGMs (a
-    // multicast dst) are signed, and with auth off nothing is tagged.
+    // Only directed (unicast/mcast) frames carry a tag; a multicast dst is
+    // exempt by construction, since a pairwise tag is not one-to-many. That
+    // exemption is not equally safe for both kinds that take it: an OGM carries
+    // its own signature, a `Bcast` carries nothing at all. With auth off
+    // nothing is tagged.
     let Some(auth) = router.auth_mut() else {
         return Some(frame);
     };

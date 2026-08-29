@@ -85,6 +85,224 @@ pub const MAX_MISSED_PROOFS: u32 = 3;
 /// Mirrors [`DEFAULT_OGM_INTERVAL`]'s role for the OGM path.
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How far ahead of an originator's broadcast high-water a sequence number may
+/// leap and still be accepted immediately as genuinely newer.
+///
+/// A flooded broadcast carries its `orig` and `seqno` inside the payload, and
+/// nothing on the ingress path authenticates either — only OGMs and keep-alives
+/// are gated — so both are attacker-chosen. The receive-side dedup table is
+/// therefore the one piece of routing state an outsider writes to directly, and
+/// what stops that being a denial of service is not any check on the frame (a
+/// keyless attacker passes every check available) but the guarantee in
+/// [`BROADCAST_SEQNO_RESET_PROTECTION`]: whatever the high-water holds, the
+/// originator's own traffic corrects it within a bounded time.
+///
+/// This window's job is narrower than it looks. It is *not* what bounds the
+/// damage — the reset protection is. It only decides how large a gap is
+/// accepted at once, without waiting for that correction: a receiver that
+/// missed this many consecutive broadcasts resumes instantly, a larger gap
+/// costs one reset-protection interval of delay. That asymmetry is why it is
+/// sized small rather than generously — being too small costs a bounded delay
+/// on a rare event, while being too large lets a forged frame be accepted and
+/// re-flooded rather than dropped.
+pub const BROADCAST_SEQNO_WINDOW: u32 = 1_024;
+
+/// How far *behind* an originator's broadcast high-water a sequence number may
+/// sit and still be treated as an ordinary duplicate rather than as evidence
+/// that the high-water itself is wrong.
+///
+/// The same flood reaches a node by several paths, and the later copies are the
+/// whole reason the table exists — they must be dropped quietly, without
+/// disturbing any state. But "behind the high-water" is *also* exactly what a
+/// victim's genuine broadcasts look like once an attacker has pushed that
+/// high-water forward, and those must not be dropped quietly, or the forgery is
+/// permanent. This constant is the line between the two: small enough that a
+/// poisoned high-water is noticed within a few of the victim's own frames,
+/// large enough to absorb real multi-path reordering. Mirrors the size of
+/// batman-adv's own backward reordering window.
+pub const BROADCAST_SEQNO_REORDER_TOLERANCE: u32 = 64;
+
+/// How long a run of broadcast sequence numbers that do not advance an
+/// originator's high-water must persist before the entry resynchronises to the
+/// run — the bound on how long *any* wrong high-water can suppress a node.
+///
+/// A window alone would trade one denial of service for another: a node's
+/// broadcast counter starts at zero on every boot and is never persisted, so a
+/// genuine reboot re-emits sequence numbers far below the high-water its
+/// neighbours still hold. Refusing those outright silences a restarted node
+/// exactly as durably as an attacker's forgery does.
+///
+/// Without a credential there is nothing in a frame that separates the two, so
+/// the separation has to come from time: a forgery is a one-shot, whereas an
+/// originator that is genuinely out of step keeps broadcasting. A run of
+/// non-advancing sequence numbers is therefore refused while it is short, and
+/// once it has persisted this long the entry resynchronises — **to the sequence
+/// number that started the run, not to whichever frame happens to arrive at the
+/// deadline**. That distinction is what stops a third party cashing in a run an
+/// honest originator earned.
+///
+/// The residual, which authentication is the only real answer to (see
+/// `docs/design/09-mesh-auth-gaps.md` §8 item 6): an attacker injecting
+/// *continuously*, faster than the victim broadcasts, keeps advancing the
+/// high-water and so keeps clearing the watch. That is a sustained flood, which
+/// an outsider can mount against this protocol anyway; what it can no longer be
+/// is a one-shot with permanent effect.
+///
+/// In the spirit of batman-adv's `BATADV_RESET_PROTECTION_MS`.
+pub const BROADCAST_SEQNO_RESET_PROTECTION: Duration = Duration::from_secs(30);
+
+// Both bands are compared as `i32` distances, so neither may reach the point
+// where that cast changes their sign.
+const _: () = assert!(BROADCAST_SEQNO_WINDOW < i32::MAX as u32);
+const _: () = assert!(BROADCAST_SEQNO_REORDER_TOLERANCE < i32::MAX as u32);
+
+/// What an incoming broadcast sequence number means relative to an originator's
+/// recorded high-water. The three arms partition the whole 32-bit space; see
+/// [`BroadcastSeqnoEntry::admit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeqnoVerdict {
+    /// Plausibly the next thing this originator sent: within
+    /// [`BROADCAST_SEQNO_WINDOW`] ahead of the high-water.
+    Advance,
+    /// A copy of something already seen, reaching us by another path: at or
+    /// within [`BROADCAST_SEQNO_REORDER_TOLERANCE`] behind the high-water.
+    Duplicate,
+    /// Neither — a leap too far forward, or far enough behind that the
+    /// high-water, rather than the frame, is what looks wrong.
+    Implausible,
+}
+
+/// An in-progress run of [`SeqnoVerdict::Implausible`] sequence numbers from one
+/// originator, and the evidence needed to act on it once it has persisted for
+/// [`BROADCAST_SEQNO_RESET_PROTECTION`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeqnoResyncWatch {
+    /// When the run began. Not refreshed by later frames in the same run — the
+    /// run has to *persist*, and refreshing it would let an attacker hold the
+    /// correction off indefinitely by continuing to send.
+    pub since: Duration,
+    /// The sequence number that started the run, and the value the entry
+    /// resynchronises to when it completes. Deliberately not the value carried
+    /// by the frame that trips the deadline: an attacker must not be able to
+    /// substitute its own number for the one an honest originator's run is
+    /// about to restore.
+    pub seqno: u32,
+}
+
+/// One originator's flooded-broadcast dedup state: the highest sequence number
+/// seen from it, plus the bookkeeping that keeps that high-water from being
+/// weaponised by an outsider who chooses it (see [`BROADCAST_SEQNO_WINDOW`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BroadcastSeqnoEntry {
+    /// Highest broadcast sequence number accepted from this originator.
+    /// Advanced only by a [`SeqnoVerdict::Advance`], compared with wrapping
+    /// arithmetic so the counter's wrap past `u32::MAX` reads as a small step
+    /// forward rather than a plunge backwards.
+    pub last_seqno: u32,
+    /// When `last_seqno` was last set — on creation, on an advance, or on a
+    /// resync. Purely the eviction key: nothing ages an entry out, so this is
+    /// never read as a staleness gate, only compared against its peers when a
+    /// full table has to make room.
+    ///
+    /// Deliberately *not* refreshed by a duplicate or an implausible frame,
+    /// unlike the originator and keep-alive tables' `last_heard`, which every
+    /// frame bumps. An attacker's stream of non-advancing frames must not be
+    /// able to pin a poisoned entry at the top of the eviction order.
+    pub last_updated: Duration,
+    /// The run of implausible sequence numbers currently being watched, or
+    /// `None` if the last frame from this originator advanced the high-water.
+    pub resync_watch: Option<SeqnoResyncWatch>,
+}
+
+impl BroadcastSeqnoEntry {
+    /// Create an entry for an originator seen for the first time, taking its
+    /// sequence number on trust.
+    ///
+    /// There is nothing else to do — a first sighting has no high-water to
+    /// judge against. That is safe *because* of [`Self::admit`]'s resync path
+    /// rather than in spite of it: an outsider can force a first sighting at
+    /// will by flooding the table until a live entry is evicted, so a check
+    /// here would buy nothing, and a wrong seed is corrected by the
+    /// originator's own next frames within
+    /// [`BROADCAST_SEQNO_RESET_PROTECTION`].
+    pub fn seeded(seqno: u32, now: Duration) -> Self {
+        Self {
+            last_seqno: seqno,
+            last_updated: now,
+            resync_watch: None,
+        }
+    }
+
+    /// Classify `seqno` against this entry's high-water.
+    ///
+    /// The comparison is a wrapping `i32` distance, so it is direction-aware
+    /// across the `u32` wrap: a counter stepping from `u32::MAX` to `0` reads as
+    /// one ahead, not four billion behind.
+    pub fn classify(&self, seqno: u32) -> SeqnoVerdict {
+        let ahead_by = seqno.wrapping_sub(self.last_seqno) as i32;
+        if ahead_by > 0 && ahead_by <= BROADCAST_SEQNO_WINDOW as i32 {
+            SeqnoVerdict::Advance
+        } else if ahead_by <= 0 && ahead_by >= -(BROADCAST_SEQNO_REORDER_TOLERANCE as i32) {
+            SeqnoVerdict::Duplicate
+        } else {
+            SeqnoVerdict::Implausible
+        }
+    }
+
+    /// Fold `seqno` into this entry and report whether the frame carrying it
+    /// should be flooded onward. `false` means drop it.
+    ///
+    /// This is the only writer of the entry's invariants, and the whole of the
+    /// poisoning defence lives here:
+    ///
+    /// - an [`Advance`](SeqnoVerdict::Advance) moves the high-water and clears
+    ///   any watch, because a high-water tracking real forward progress is not
+    ///   one that needs correcting;
+    /// - a [`Duplicate`](SeqnoVerdict::Duplicate) changes nothing at all — the
+    ///   common case, and the one that must stay free;
+    /// - an [`Implausible`](SeqnoVerdict::Implausible) opens (or continues) a
+    ///   [`SeqnoResyncWatch`], and once that run has persisted for
+    ///   [`BROADCAST_SEQNO_RESET_PROTECTION`] the high-water resynchronises to
+    ///   the number that *started* the run.
+    ///
+    /// The third arm is what makes every wrong high-water self-correcting,
+    /// whether it got there by an attacker's forgery, by a reseed after
+    /// eviction, or by the originator rebooting — none of which this code can
+    /// tell apart, and none of which it has to.
+    pub fn admit(&mut self, seqno: u32, now: Duration) -> bool {
+        match self.classify(seqno) {
+            SeqnoVerdict::Advance => {
+                self.last_seqno = seqno;
+                self.last_updated = now;
+                self.resync_watch = None;
+                true
+            }
+            SeqnoVerdict::Duplicate => false,
+            SeqnoVerdict::Implausible => {
+                let watch = *self
+                    .resync_watch
+                    .get_or_insert(SeqnoResyncWatch { since: now, seqno });
+                if now.saturating_sub(watch.since) < BROADCAST_SEQNO_RESET_PROTECTION {
+                    return false;
+                }
+                // The run has persisted. Restore the high-water to where the run
+                // started, then judge this frame afresh against it — so the
+                // frame that happens to trip the deadline is admitted only if it
+                // would have been admitted anyway.
+                self.last_seqno = watch.seqno;
+                self.last_updated = now;
+                self.resync_watch = None;
+                if matches!(self.classify(seqno), SeqnoVerdict::Advance) {
+                    self.last_seqno = seqno;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
 /// Per-neighbor keep-alive liveness, tracked only for neighbors this engine
 /// has actually heard a heartbeat from at least once — a neighbor with no
 /// entry here is never treated as having missed anything (see
@@ -247,10 +465,19 @@ pub struct BatmanEngine<
     /// Highest broadcast sequence number seen per originator, used to drop
     /// duplicate flooded broadcasts.  Broadcast and OGM sequence numbers are
     /// independent number spaces, so this is tracked separately from
-    /// [`OriginatorRecord::last_seqno`].  An entry is created on first sight
-    /// of an originator's broadcast; the table is bounded at `MAX_ORIGINATORS`
-    /// and further originators are dropped once it is full.
-    pub broadcast_seqno: HVec<(Mac, u32), MAX_ORIGINATORS>,
+    /// [`OriginatorRecord::last_seqno`].  Keyed by the `orig` named inside the
+    /// broadcast header — not by the immediate relay's `frame.src` — so the
+    /// same flood arriving by several paths collapses to one entry.
+    /// `MAX_ORIGINATORS` **must be a power of two** (a `heapless` map
+    /// requirement).  When full, a newly heard originator evicts the
+    /// least-recently-updated entry rather than being dropped.
+    ///
+    /// Both the key and the value are read from inside an unauthenticated
+    /// payload, so this is the one routing table an outsider writes to
+    /// directly, and neither its occupancy nor any high-water can be trusted.
+    /// [`BroadcastSeqnoEntry::admit`] is what keeps that from being a denial of
+    /// service; nothing about this field's contents is load-bearing on its own.
+    pub broadcast_seqno: FnvIndexMap<Mac, BroadcastSeqnoEntry, MAX_ORIGINATORS>,
     /// Multicast groups the local host currently listens to.  Announced to the
     /// mesh in the OGM's multicast TVLV; set via
     /// [`set_local_mcast_groups`](BatmanEngine::set_local_mcast_groups).
@@ -359,7 +586,7 @@ impl<
             sequence_number: 0,
             broadcast_sequence_number: 0,
             originator_table: FnvIndexMap::new(),
-            broadcast_seqno: HVec::new(),
+            broadcast_seqno: FnvIndexMap::new(),
             local_mcast: HVec::new(),
             mcast_members: HVec::new(),
             ogm_timers: HVec::new(),

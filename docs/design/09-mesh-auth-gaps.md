@@ -770,6 +770,58 @@ wall-clock question.
    project, not a change; see §4's closing subsection for what it does and does
    not subsume.
 
+   One consequence of that `Bcast` exemption was closed separately, because it
+   did not need authentication to fix and was far worse than the injection
+   nuisance this document had conceded (issue #29). A `Bcast`'s `orig` and
+   `seqno` are read from inside the payload, so the receiver's dedup table is
+   state an outsider writes to directly — and it neither evicted nor bounded a
+   seqno jump. One frame naming a member with `seqno = u32::MAX` silenced that
+   member's broadcasts *permanently* and mesh-wide; about `MAX_ORIGINATORS`
+   ghost origs did the same to every originator not already in the table. ARP
+   rides broadcast, so this was address-resolution denial, not just payload
+   loss.
+
+   The fix is worth stating as a property rather than as a list of checks,
+   because the first attempt at it was a list of checks and was still
+   exploitable. **No check on the frame can help**: a keyless attacker passes
+   every check available, since every field it is judged on is one the attacker
+   wrote. What the receiver can do instead is refuse to hold a wrong high-water
+   for long — `BroadcastSeqnoEntry::admit` treats a run of sequence numbers
+   that do not advance the high-water as evidence against the *high-water*
+   rather than against the frames, and resynchronises after
+   `BROADCAST_SEQNO_RESET_PROTECTION`. Whatever put a wrong value there — a
+   forgery, a re-seed after eviction, or the originator rebooting, which the
+   code cannot tell apart and does not have to — the originator's own traffic
+   corrects it within that bound.
+
+   Two details in that are load-bearing, and both are places the first attempt
+   went wrong:
+
+   - The band treated as an ordinary duplicate must be **narrow**. A forgery
+     needs no implausible leap; one *inside* the acceptance window is taken as
+     a genuine advance, and the victim's own broadcasts then sit behind it. A
+     wide "behind" band swallows exactly those, and the victim stays silent
+     until its counter climbs past the forged value — measured at 98.5%
+     suppression from 0.1 packets per second of injection.
+   - The resync must restore **the sequence number that opened the run**, not
+     whichever frame trips the deadline. Otherwise a third party waits out a
+     run an honest, rebooting originator earned and substitutes its own number,
+     reconstructing the original attack from two frames thirty seconds apart.
+
+   What this does *not* do is make a `Bcast` authentic, which is still this
+   item's job. The residual it leaves is a sustained one: an attacker injecting
+   continuously, faster than the victim broadcasts, keeps advancing the
+   high-water and so keeps clearing the correction. That is a flood, which an
+   outsider can mount against this protocol regardless; the change is that it
+   can no longer be a one-shot with permanent effect.
+
+   Note what is **not** the fix, since it has now been proposed twice: dropping
+   data-plane frames whose `frame.src` has no originator entry. §3's "What does
+   *not* fix it" already rejected the equivalent `live_neighbor(src)` lookup
+   because a member MAC is copied off the air; it is dead code for
+   `Unicast`/`Mcast` (which `strip_directed` pairwise-authenticates); and it
+   does not touch `orig`, which is the field the damage is keyed on.
+
 ## 9. Key file map for the implementer
 
 | File | Gaps | What changes |
@@ -782,6 +834,8 @@ wall-clock question.
 | `libs/wayfinder-driver-core/src/lib.rs` | §7 | `tag_directed_into` counter + `warn!` → `trace!` (line ~215) |
 | `libs/wayfinder-embedded-driver/src/lib.rs` | 2 | wall-clock source, once §2's question is settled (see line 467) — **not** needed for §4's fix |
 | `libs/wayfinder/src/auth.rs` | §4 | the challenge/response pair over `frame_tag` + the pairwise-key cache |
+| `libs/batman/src/engine.rs` | §8.6 | `handle_broadcast`'s dedup step — done (issue #29) |
+| `libs/batman/src/lib.rs` | §8.6 | `BroadcastSeqnoEntry::admit` and its three constants — done (issue #29) |
 | `libs/batman/src/engine.rs` | §4 | gate `best_next_hop` promotion (`handle_rx`'s incumbent/challenger comparison) and both selection paths (`next_hop`, `lookup_route`) on a proven next hop |
 | `libs/batman/src/wire.rs` | §4 | `BatmanPacketType` variants for the challenge and its response |
 | `sim/tests/test_security.py`, `sim/tests/test_adversary.py` | all | the gap tests flip from asserting the gap to asserting the fix |
