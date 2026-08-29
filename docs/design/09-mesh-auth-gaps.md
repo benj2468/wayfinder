@@ -822,6 +822,78 @@ wall-clock question.
    `Unicast`/`Mcast` (which `strip_directed` pairwise-authenticates); and it
    does not touch `orig`, which is the field the damage is keyed on.
 
+## 8.7 The pairwise trailer was required by link dst, not by sub-type — **fixed**
+
+Found by the 2026-08 directed-data-plane sweep, not by the original four-gap
+analysis. Shipped fixed; recorded here because the wrong design is the one a
+reader is most likely to re-derive as an optimization.
+
+### What happened
+
+`strip_directed` decided whether a frame had to carry a pairwise trailer from
+`frame.dst.is_multicast()` — the **link-layer** destination. The exemption was
+meant for floods (a pairwise key cannot cover a one-to-many send), and on
+honest traffic it was accidentally correct: a `Unicast` always *did* wear a
+unicast link dst.
+
+But the link dst and the inner `dest` are unrelated fields, and both are
+attacker-chosen on an injected frame. `handle_unicast`/`handle_mcast` decide
+local delivery and forwarding from the **inner** `dest`. So an outsider holding
+no credential could set the link dst to a group MAC (skipping the tag check)
+and the inner dest to a member (winning delivery) — an unauthenticated
+injection primitive into the directed data plane, exactly what the tag exists
+to prevent.
+
+The relay case is worse than the delivery case. `plan_dispatch` re-tags every
+directed frame it forwards, so a relay that accepted the injection stamped its
+own *genuine* pairwise tag onto content it had never authenticated. A node two
+hops from the attacker, sharing no medium with it, then accepted those bytes as
+authenticated member traffic. The forgery was laundered into legitimacy by an
+honest node.
+
+### The fix
+
+Decide the requirement from the BATMAN sub-type alone
+(`wayfinder_driver_core::requires_pairwise_tag`), and apply the same predicate
+on ingress (`strip_directed`) and egress (`tag_directed_into`) so the two halves
+cannot drift. Exempt exactly the packets for which a pairwise tag is impossible
+or redundant — `Ogm`, `Bcast`, `Keepalive` (one-to-many) and `CertReq`,
+`CertReply` (self-authenticating, and requiring a tag would stop lazy cert
+distribution bootstrapping the very keys the tag needs). Everything else
+requires one, **including an unrecognised sub-type**: the engine falls back to
+`route_by_dest`, so it is directed in every way that matters. The match is
+exhaustive over `BatmanPacketType`, so a new variant cannot be added without
+classifying it.
+
+Note the deliberate asymmetry: ingress stays *dst-blind*. A genuinely tagged
+frame is accepted under a group link dst, because `verify_directed` binds the
+tag to `(pairwise key, counter, src, frame)` and the key is per-(sender,
+receiver) — only the intended peer can verify it, so shouting buys the sender
+nothing. Re-adding a dst check on ingress would reintroduce a decision keyed on
+the attacker's own field.
+
+### Reproduced by
+
+`red_team.py::attack_multicast_addressed_directed_delivery` (delivery) and
+`::attack_injected_directed_laundered_by_relay` (relay laundering), both now
+`HELD`. Unit coverage in `libs/wayfinder-driver-core`:
+`strip_directed_drops_a_group_addressed_unicast_without_a_tag`,
+`a_group_addressed_unicast_is_never_laundered_by_a_relay` (with a live
+tagged-frame control, so an empty sink means *refused* rather than
+*unroutable*), and `a_tagged_unicast_is_accepted_even_under_a_group_link_dst`
+pinning the asymmetry above.
+
+### Residual
+
+`BatmanPacketType::from_u8` ends in a `_ => None` wildcard over `u8`, so adding
+an enum variant forces a classification in `requires_pairwise_tag` (a compile
+error) but **not** its byte mapping in `from_u8`. A variant added to the enum
+and forgotten in `from_u8` decodes as `None`, fails closed, and is dropped on
+every node — visible only as `untaggable_drop_rate`. Deriving both from one
+macro list would close it; out of scope for the fix itself.
+
+---
+
 ## 9. Key file map for the implementer
 
 | File | Gaps | What changes |
@@ -841,3 +913,4 @@ wall-clock question.
 | `sim/tests/test_security.py`, `sim/tests/test_adversary.py` | all | the gap tests flip from asserting the gap to asserting the fix |
 | `sim/scenarios/red_team.py` | all | verdicts flip `GAP` → `HELD` |
 | `sim/tests/test_red_team.py` | all | `BASELINE` flips with the verdicts it pins |
+| `libs/wayfinder-driver-core/src/lib.rs` | §8.7 | `requires_pairwise_tag` (replaces `is_cert_control`), applied by both `strip_directed` and `tag_directed_into` — done |

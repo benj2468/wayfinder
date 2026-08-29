@@ -1404,14 +1404,22 @@ impl<
                 // Both are also point-to-point: a challenger unicasts to the
                 // candidate and the candidate unicasts the answer back, so a
                 // destination that is not this node is malformed by
-                // construction. Checking it is load-bearing, not tidiness —
-                // `strip_directed` deliberately skips the pairwise-tag check
-                // for a multicast dst (broadcasts and OGMs carry their own
-                // signature instead), and the dst is attacker-chosen. Without
-                // this guard an outsider holding no credential at all can
-                // broadcast under any member MAC it has read off the air and
-                // have the arms below answer it, or credit a proof from a
-                // captured response that was never pairwise-authenticated.
+                // construction. Checking it is defense in depth, not tidiness.
+                // The primary check is now
+                // `wayfinder_driver_core::requires_pairwise_tag`: a proof
+                // sub-type is directed, so an outsider's forgery needs a valid
+                // pairwise trailer whatever link dst it wears, and is dropped
+                // before it ever reaches here. This guard is an independent
+                // second check on the same property, keyed on a *different*
+                // field, so a regression in that sub-type table cannot silently
+                // reopen the reflection primitive on its own.
+                //
+                // It is also the cheap early-out. Note it is not what protects
+                // an auth-*off* mesh: with no `auth`, both arms below are
+                // already inert — `answer_challenge` is never reached through
+                // `Option::and_then`, and `verify_challenge_response` through
+                // `is_some_and` credits nothing — so there is no reflection
+                // primitive to stop there in the first place.
                 if matches!(
                     packet_type,
                     Some(BatmanPacketType::NextHopChallenge)

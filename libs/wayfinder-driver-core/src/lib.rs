@@ -136,35 +136,73 @@ pub trait MeshSink {
     }
 }
 
-/// Whether `payload`'s BATMAN sub-type is a lazy-cert-distribution control
-/// packet ([`BatmanPacketType::CertReq`]/[`BatmanPacketType::CertReply`]) —
-/// addressed to a specific node like a directed data-plane frame, but
-/// self-authenticating (its own signature) rather than pairwise-tagged.
-fn is_cert_control(payload: &[u8]) -> bool {
-    matches!(
-        payload.first().copied().and_then(BatmanPacketType::from_u8),
-        Some(BatmanPacketType::CertReq) | Some(BatmanPacketType::CertReply)
-    )
+/// Whether `payload`'s BATMAN sub-type must carry the pairwise trailer when
+/// auth is on.
+///
+/// **This is decided by the sub-type, never by the link-layer destination.**
+/// The two are unrelated fields, both attacker-chosen on an injected frame, and
+/// keying the requirement on the link dst is what let a `Unicast`/`Mcast` wear
+/// a group MAC to skip the tag check while still being delivered or relayed by
+/// its *inner* `dest` — an unauthenticated injection primitive into the
+/// directed data plane, and (via a relay's own re-tagging on the forward) a way
+/// to launder outsider bytes onto a node that never shared a medium with the
+/// attacker.
+///
+/// The exemptions are the packets for which a pairwise tag is either impossible
+/// or redundant, and nothing else:
+///
+/// * [`Ogm`](BatmanPacketType::Ogm), [`Bcast`](BatmanPacketType::Bcast) and
+///   [`Keepalive`](BatmanPacketType::Keepalive) are one-to-many — a per-neighbor
+///   key cannot cover a flood. An OGM and a keep-alive carry the originator's
+///   own signature instead; a `Bcast` carries nothing, which is the documented
+///   scope limit in [`wayfinder::auth`].
+/// * [`CertReq`](BatmanPacketType::CertReq) and
+///   [`CertReply`](BatmanPacketType::CertReply) are addressed like directed
+///   frames but self-authenticating: each carries its own signature, and
+///   requiring a pairwise tag would make lazy cert distribution unable to
+///   bootstrap the very keys that tag needs.
+///
+/// Everything else requires one, including a sub-type this build does not
+/// recognise. `BatmanEngine::handle_rx` hands an unknown type to
+/// `route_by_dest`, which will deliver or forward it, so it is directed in
+/// every way that matters here — and a future sub-type this build has never
+/// seen may well be routed by an inner `dest` of its own. Failing closed costs
+/// nothing: no honest peer emits a sub-type we cannot classify.
+fn requires_pairwise_tag(payload: &[u8]) -> bool {
+    match payload.first().copied().and_then(BatmanPacketType::from_u8) {
+        Some(
+            BatmanPacketType::Ogm
+            | BatmanPacketType::Bcast
+            | BatmanPacketType::Keepalive
+            | BatmanPacketType::CertReq
+            | BatmanPacketType::CertReply,
+        ) => false,
+        Some(
+            BatmanPacketType::Unicast
+            | BatmanPacketType::Mcast
+            | BatmanPacketType::EchoRequest
+            | BatmanPacketType::EchoReply
+            | BatmanPacketType::NextHopChallenge
+            | BatmanPacketType::NextHopResponse,
+        ) => true,
+        // Unrecognised sub-type, or an empty payload: fail closed.
+        None => true,
+    }
 }
 
 /// Verify and strip the pairwise-tag trailer from a directed data-plane frame
 /// when auth is enabled, returning the frame to route on: the original frame
-/// (auth off, a broadcast/OGM, or a cert-control packet), a shorter *view* over
-/// the same bytes with the trailer dropped, or `None` if the frame must be
+/// (auth off, or a sub-type that carries no pairwise tag), a shorter *view*
+/// over the same bytes with the trailer dropped, or `None` if the frame must be
 /// dropped (bad/missing tag from an unverified or foreign neighbor).
 fn strip_directed<'a, R: RouterOps>(router: &mut R, frame: &'a LinkFrame) -> Option<&'a LinkFrame> {
-    // Only directed (unicast/mcast) frames carry a tag; a multicast dst is
-    // exempt by construction, since a pairwise tag is not one-to-many. That
-    // exemption is not equally safe for both kinds that take it: an OGM carries
-    // its own signature, a `Bcast` carries nothing at all. With auth off
-    // nothing is tagged.
+    // Tagged-or-not is `requires_pairwise_tag`'s call, from the sub-type alone
+    // and never from `frame.dst` — see its doc for why. With auth off nothing
+    // is tagged at all.
     let Some(auth) = router.auth_mut() else {
         return Some(frame);
     };
-    if frame.protocol.get() != DEFAULT_BATMAN_ETHER_TYPE
-        || frame.dst.is_multicast()
-        || is_cert_control(&frame.payload)
-    {
+    if frame.protocol.get() != DEFAULT_BATMAN_ETHER_TYPE || !requires_pairwise_tag(&frame.payload) {
         return Some(frame);
     }
 
@@ -177,7 +215,21 @@ fn strip_directed<'a, R: RouterOps>(router: &mut R, frame: &'a LinkFrame) -> Opt
     if !auth.verify_directed(frame.src, inner, trailer) {
         // Unverified/foreign neighbor or a replayed counter — drop rather than
         // route an unauthenticated directed frame.
-        trace!(src = ?frame.src, "drop: directed frame failed pairwise auth");
+        //
+        // `dst` and the sub-type are both recorded because together they are
+        // what distinguishes the two causes. A directed sub-type under a *group*
+        // link dst is structurally impossible from an honest sender — it is the
+        // group-MAC bypass being attempted — while the same record with a
+        // unicast dst is the far commoner "peer has not finished enrolling".
+        // Without these fields the two are byte-identical, and a node under
+        // attack reads as a node with a slow enrollment.
+        trace!(
+            src = ?frame.src,
+            dst = ?frame.dst,
+            sub_type = ?frame.payload.first().copied().and_then(BatmanPacketType::from_u8),
+            group_dst = frame.dst.is_multicast(),
+            "drop: directed frame failed pairwise auth"
+        );
         // And flag it, once per source however long the stream runs. Raised on
         // every frame on purpose: the board coalesces by `(kind, subject)`, so
         // a flood of these is one row with a count rather than one row each —
@@ -200,9 +252,35 @@ fn strip_directed<'a, R: RouterOps>(router: &mut R, frame: &'a LinkFrame) -> Opt
     // Reinterpret the frame's own bytes minus the trailer — a shorter view over
     // the same buffer (no copy) — so the engine sees only the real payload and
     // never forwards or delivers the tag bytes.
+    //
+    // Neither failure below uses `?`/`.ok()`: this frame *authenticated*, and
+    // `verify_directed` has already spent its replay counter, so a
+    // retransmission would be refused as a replay. Losing it here is
+    // unrecoverable and must never be silent. Both arms are this node's own
+    // invariant breaking rather than a peer's malformed input — but a member's
+    // tag had to verify first, which bounds the rate, so they stay `trace!`
+    // alongside every other drop on this path.
     let full = frame.as_bytes();
     let strip_len = full.len() - DIRECTED_TRAILER_LEN;
-    LinkFrame::ref_from_bytes(full.get(..strip_len)?).ok()
+    let Some(bytes) = full.get(..strip_len) else {
+        trace!(
+            src = ?frame.src,
+            full_len = full.len(),
+            "drop: authenticated frame too short to re-view without its trailer"
+        );
+        return None;
+    };
+    match LinkFrame::ref_from_bytes(bytes) {
+        Ok(stripped) => Some(stripped),
+        Err(_) => {
+            trace!(
+                src = ?frame.src,
+                len = bytes.len(),
+                "drop: authenticated frame failed to re-parse after stripping its trailer"
+            );
+            None
+        }
+    }
 }
 
 /// Finalize a directed data-plane frame for transmit, appending a pairwise auth
@@ -213,8 +291,9 @@ fn strip_directed<'a, R: RouterOps>(router: &mut R, frame: &'a LinkFrame) -> Opt
 /// DIRECTED_TRAILER_LEN`) for the tag to be written into; the caller owns the
 /// buffer, so reserving that space is its concern.  Returns:
 ///
-/// * `Some(body_len)` — send the body untagged: auth is disabled, or this is a
-///   broadcast/OGM/cert-control packet that carries its own signature instead.
+/// * `Some(body_len)` — send the body untagged: auth is disabled, or
+///   [`requires_pairwise_tag`] exempts this sub-type (see its doc for which
+///   ones, and why each either cannot carry a pairwise tag or need not).
 /// * `Some(body_len + DIRECTED_TRAILER_LEN)` — the tag was written; send the
 ///   body plus trailer.
 /// * `None` — auth is on but the frame can't be tagged (no verified key for
@@ -230,12 +309,11 @@ fn tag_directed_into<R: RouterOps>(
     body_len: usize,
     buf: &mut [u8],
 ) -> Option<usize> {
-    // Broadcasts/OGMs (a multicast dst) are signed instead, and cert-control
-    // packets (CertReq/CertReply) carry their own self-authenticating signature
-    // rather than a neighbor pairwise tag, so both send their body as-is.
-    let needs_tag = protocol == DEFAULT_BATMAN_ETHER_TYPE
-        && !dst.is_multicast()
-        && !is_cert_control(&buf[..body_len]);
+    // The same rule the receiver applies, read off the same field, so the two
+    // halves cannot drift: a sub-type `requires_pairwise_tag` would refuse
+    // untagged on ingress is never emitted untagged either.
+    let needs_tag =
+        protocol == DEFAULT_BATMAN_ETHER_TYPE && requires_pairwise_tag(&buf[..body_len]);
 
     let Some(auth) = router.auth_mut() else {
         // Auth disabled: send the body untagged.
@@ -260,7 +338,20 @@ fn tag_directed_into<R: RouterOps>(
         // (CLAUDE.md's logging rules). The counter below is what makes the drop
         // visible instead — a `warn!` nobody can afford to leave on is not
         // observability.
-        trace!(?dst, "drop: untaggable directed frame");
+        // The sub-type and `group_dst` separate the two causes this one counter
+        // now absorbs: no verified key for `dst` yet (transient, an enrolling
+        // peer) versus a directed sub-type staged against a group dst (a bug
+        // here, never transient). `untaggable_drop_rate` alone cannot tell them
+        // apart.
+        trace!(
+            ?dst,
+            sub_type = ?buf.get(..body_len)
+                .and_then(<[u8]>::first)
+                .copied()
+                .and_then(BatmanPacketType::from_u8),
+            group_dst = dst.is_multicast(),
+            "drop: untaggable directed frame"
+        );
         router.record_untaggable_drop(now);
         None
     }
@@ -867,19 +958,6 @@ mod tests {
         raw
     }
 
-    /// `is_cert_control` flags exactly the two lazy-cert control sub-types by
-    /// their leading byte, and nothing else (including the empty payload).
-    #[test]
-    fn is_cert_control_flags_cert_packets() {
-        assert!(is_cert_control(&[BatmanPacketType::CertReq.as_u8()]));
-        assert!(is_cert_control(&[
-            BatmanPacketType::CertReply.as_u8(),
-            0xff
-        ]));
-        assert!(!is_cert_control(&[0x01]));
-        assert!(!is_cert_control(&[]));
-    }
-
     /// With auth disabled (the default), `strip_directed` passes a directed
     /// unicast frame through unchanged — same bytes, nothing stripped.
     #[test]
@@ -1272,7 +1350,7 @@ mod tests {
         let mut router = CentralRouter::new(mac(1));
         router.set_auth(member_auth(&authority, 1, mac(1)));
 
-        let inner = [0x01u8, 0x02, 0x03];
+        let inner = [BatmanPacketType::Unicast.as_u8(), 0x02, 0x03];
         let mut payload = inner.to_vec();
         payload.resize(inner.len() + DIRECTED_TRAILER_LEN, 0); // bogus zero trailer
         let link = frame_bytes(mac(1), mac(9), DEFAULT_BATMAN_ETHER_TYPE, &payload);
@@ -1297,7 +1375,7 @@ mod tests {
         let mut router = CentralRouter::new(mac(1));
         router.set_auth(member_auth(&authority, 1, mac(1)));
 
-        let mut payload = [0x01u8, 0x02, 0x03].to_vec();
+        let mut payload = [BatmanPacketType::Unicast.as_u8(), 0x02, 0x03].to_vec();
         payload.resize(3 + DIRECTED_TRAILER_LEN, 0); // bogus zero trailer
         let link = frame_bytes(mac(1), mac(9), DEFAULT_BATMAN_ETHER_TYPE, &payload);
         let frame = LinkFrame::ref_from_bytes(&link).unwrap();
@@ -1332,7 +1410,7 @@ mod tests {
         let mut router = CentralRouter::new(mac(1));
         router.set_auth(member_auth(&authority, 1, mac(1)));
 
-        let mut payload = [0x01u8, 0x02, 0x03].to_vec();
+        let mut payload = [BatmanPacketType::Unicast.as_u8(), 0x02, 0x03].to_vec();
         payload.resize(3 + DIRECTED_TRAILER_LEN, 0);
         let link = frame_bytes(mac(1), mac(9), DEFAULT_BATMAN_ETHER_TYPE, &payload);
         let frame = LinkFrame::ref_from_bytes(&link).unwrap();
@@ -1361,7 +1439,7 @@ mod tests {
         let mut router = CentralRouter::new(mac(1));
         router.set_auth(member_auth(&authority, 1, mac(1)));
 
-        let mut payload = [0x01u8, 0x02, 0x03].to_vec();
+        let mut payload = [BatmanPacketType::Unicast.as_u8(), 0x02, 0x03].to_vec();
         payload.resize(3 + DIRECTED_TRAILER_LEN, 0);
 
         let board = std::sync::Arc::new(wayfinder_alarm::SharedBoard::new());
@@ -1733,15 +1811,14 @@ mod tests {
     /// candidate, and the candidate unicasts the answer back — so a multicast
     /// destination is malformed, never something a legitimate peer emits.
     ///
-    /// Load-bearing rather than tidy-mindedness: `strip_directed` deliberately
-    /// skips the pairwise-tag check whenever `frame.dst.is_multicast()`, since
-    /// broadcasts and OGMs carry their own signature instead. The destination
-    /// MAC is attacker-chosen, so without this guard an outsider holding *no
-    /// credential at all* can broadcast a challenge under any member MAC it has
-    /// read off the air and have this node answer it — an unauthenticated
-    /// reflection primitive that burns shared-medium airtime and a pairwise
-    /// counter per forged frame. Nothing else on this path authenticates a
-    /// multicast-addressed frame, so the check has to live here.
+    /// The *second* line of the defense, and deliberately kept as one.
+    /// `requires_pairwise_tag` refuses this frame a step earlier — a proof
+    /// sub-type is directed, so it needs a valid trailer whatever link dst it
+    /// wears — but that check and this one key on different fields, so a
+    /// regression in the sub-type table cannot reopen the reflection primitive
+    /// on its own. This test runs with auth **on**, which is the case where
+    /// both checks are live; it is asserting the second one still holds even
+    /// though the first would have caught the same frame.
     #[test]
     fn a_broadcast_addressed_challenge_is_never_answered() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
@@ -1798,11 +1875,11 @@ mod tests {
     /// A response's freshness rests on two things: the nonce inside it, and the
     /// pairwise trailer `strip_directed` checks on the way in — the trailer's
     /// replay counter is what stops a captured response being re-credited
-    /// later. A multicast destination skips that trailer check entirely, so
-    /// without this guard an attacker holding no key can take a genuine
-    /// response off the air and credit a proof with it, which is precisely the
-    /// replay `sim/tests/test_adversary.py::attack_challenge_response_replay`
-    /// covers on the directed path.
+    /// later, the replay `red_team.py::attack_challenge_response_replay` covers
+    /// on the directed path. `requires_pairwise_tag` now demands that trailer
+    /// by sub-type, so a group link dst no longer skips the check; this guard
+    /// is the independent second check keyed on the address instead, so
+    /// crediting a proof takes *both* to regress.
     #[test]
     fn a_broadcast_addressed_response_cannot_credit_a_proof() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
@@ -1916,6 +1993,564 @@ mod tests {
         assert!(
             sink.mesh.iter().all(|f| f.egress == Egress::Iface(0)),
             "no challenge may go out interface 1, whose data gate is closed"
+        );
+    }
+
+    // ── the pairwise trailer is required by sub-type, not by link dst ──────
+
+    /// A non-broadcast group MAC (I/G bit set), an IPv4-multicast-derived
+    /// address. Distinct from [`Mac::BROADCAST`] so a test can show the rule
+    /// turns on the *multicast bit*, not on the all-ones address specifically.
+    fn group_mac() -> Mac {
+        Mac([0x01, 0x00, 0x5E, 0x00, 0x00, 0x2A])
+    }
+
+    /// The bytes of a `Unicast` packet routed toward `dest`, carrying `body`.
+    fn unicast_bytes(dest: Mac, body: &[u8]) -> Vec<u8> {
+        let hdr = wayfinder::batman::wire::BatmanUnicastPacket {
+            packet_type: BatmanPacketType::Unicast.as_u8(),
+            version: 5,
+            ttl: 50,
+            dest,
+        };
+        let mut out = hdr.as_bytes().to_vec();
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// The bytes of an `Mcast` packet addressed to listener `dest`, carrying
+    /// `body`.
+    fn mcast_bytes(dest: Mac, body: &[u8]) -> Vec<u8> {
+        let hdr = wayfinder::batman::wire::BatmanMcastPacket {
+            packet_type: BatmanPacketType::Mcast.as_u8(),
+            version: 5,
+            ttl: 50,
+            dest,
+        };
+        let mut out = hdr.as_bytes().to_vec();
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A router at `mac(1)` with auth on that has verified `mac(2)` as a live
+    /// neighbor, plus that peer's own `OgmAuth`. Mutual, so either side can tag
+    /// a directed frame to the other — which is what makes an untagged frame in
+    /// these tests refused for want of a *tag* rather than for want of a key.
+    fn router_with_verified_peer(authority: &Authority) -> (CentralRouter, OgmAuth) {
+        let mut router = CentralRouter::new(mac(1));
+        router.set_auth(member_auth(authority, 1, mac(1)));
+        let mut peer = member_auth(authority, 2, mac(2));
+
+        // Through `handle_mesh_frame`, not straight into `verify_ogm`: the
+        // engine has to learn `mac(2)` as an originator too, or it is never a
+        // candidate next hop for the tests that go on to route through it.
+        let ogm = signed_ogm_bytes(&mut peer, mac(2), 1);
+        let link = frame_bytes(Mac::BROADCAST, mac(2), DEFAULT_BATMAN_ETHER_TYPE, &ogm);
+        let mut tx = [0u8; wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN];
+        let mut sink = CaptureSink::default();
+        handle_mesh_frame(
+            Duration::ZERO,
+            &mut router,
+            0,
+            LinkFrame::ref_from_bytes(&link).unwrap(),
+            LinkMetrics::default(),
+            &mut tx,
+            &mut sink,
+        );
+        assert!(
+            router.auth_mut().unwrap().neighbor_cert(mac(2)).is_some(),
+            "the peer's OGM verified, so its pairwise key is cached"
+        );
+
+        let router_ogm = signed_ogm_bytes(router.auth_mut().unwrap(), mac(1), 1);
+        assert_eq!(peer.verify_ogm(&router_ogm), OgmVerdict::Verified);
+        (router, peer)
+    }
+
+    /// Walk `peer` through a real next-hop challenge/response so the router
+    /// will actually *route* through it: with auth on, `next_hop` skips any
+    /// relay that has not proven itself, so a test about forwarding has to
+    /// clear that gate first.
+    ///
+    /// Driven end to end (rather than poked into the engine, which is private
+    /// to `wayfinder` anyway) because the response is itself one of the
+    /// directed sub-types this change now demands a trailer on — so this
+    /// doubles as coverage that an honest proof exchange still completes.
+    fn prove_peer(router: &mut CentralRouter, peer: &mut OgmAuth) {
+        use wayfinder::batman::wire::BatmanNextHopChallengePacket;
+        use wayfinder::batman::wire::BatmanNextHopResponsePacket;
+
+        let mut chal = [0u8; wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN];
+        let (target, challenge) = router
+            .poll_challenge(Duration::ZERO, &mut chal)
+            .expect("mac(2) is a live candidate next hop");
+        assert_eq!(target, mac(2));
+        let hdr_len = core::mem::size_of::<BatmanNextHopChallengePacket>();
+        let nonce = challenge.payload[hdr_len..].to_vec();
+        let tag = peer
+            .answer_challenge(mac(1), &nonce)
+            .expect("the router is a live neighbor of mac(2)");
+
+        let rsp = BatmanNextHopResponsePacket {
+            packet_type: BatmanPacketType::NextHopResponse.as_u8(),
+            version: 5,
+        };
+        let mut inner = rsp.as_bytes().to_vec();
+        inner.extend_from_slice(&tag);
+        let mut body = inner.clone();
+        body.resize(inner.len() + DIRECTED_TRAILER_LEN, 0);
+        let (f, trailer) = body.split_at_mut(inner.len());
+        peer.tag_directed(mac(1), f, trailer).expect("peer tags");
+
+        let link = frame_bytes(mac(1), mac(2), DEFAULT_BATMAN_ETHER_TYPE, &body);
+        let mut tx = [0u8; wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN];
+        let mut sink = CaptureSink::default();
+        handle_mesh_frame(
+            Duration::ZERO,
+            router,
+            0,
+            LinkFrame::ref_from_bytes(&link).unwrap(),
+            LinkMetrics::default(),
+            &mut tx,
+            &mut sink,
+        );
+        assert!(
+            router.proof_current(Duration::ZERO, mac(2)),
+            "a genuine, pairwise-tagged proof response must still be credited"
+        );
+    }
+
+    /// The trailer requirement is a property of the BATMAN sub-type: every
+    /// packet routed toward an inner `dest` needs one; every one-to-many or
+    /// self-authenticating packet cannot have one.
+    #[test]
+    fn requires_pairwise_tag_is_decided_by_sub_type() {
+        for t in [
+            BatmanPacketType::Unicast,
+            BatmanPacketType::Mcast,
+            BatmanPacketType::EchoRequest,
+            BatmanPacketType::EchoReply,
+            BatmanPacketType::NextHopChallenge,
+            BatmanPacketType::NextHopResponse,
+        ] {
+            assert!(
+                requires_pairwise_tag(&[t.as_u8(), 0xff]),
+                "{t:?} is point-to-point and must carry a pairwise trailer"
+            );
+        }
+        for t in [
+            BatmanPacketType::Ogm,
+            BatmanPacketType::Bcast,
+            BatmanPacketType::Keepalive,
+            BatmanPacketType::CertReq,
+            BatmanPacketType::CertReply,
+        ] {
+            assert!(
+                !requires_pairwise_tag(&[t.as_u8(), 0xff]),
+                "{t:?} carries its own signature, or none at all"
+            );
+        }
+        // Fail closed on what this build cannot classify: an unrecognised
+        // sub-type is routed by destination like a directed frame, and an empty
+        // payload is malformed either way.
+        assert!(requires_pairwise_tag(&[0xEE]));
+        assert!(requires_pairwise_tag(&[]));
+    }
+
+    /// A `Unicast` carried under a *group* link-layer dst still has to prove
+    /// itself.
+    ///
+    /// This is the ingress half of the group-link-dst bypass. `handle_unicast`
+    /// decides local delivery from the *inner* `BatmanUnicastPacket.dest`,
+    /// while the trailer check used to key on `frame.dst.is_multicast()` — so
+    /// an outsider could aim the inner dest at a member, wear a group MAC on
+    /// the link, and skip authentication entirely.
+    #[test]
+    fn strip_directed_drops_a_group_addressed_unicast_without_a_tag() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let (mut router, _peer) = router_with_verified_peer(&authority);
+
+        // Eve — `mac(9)`, no credential — aims the inner dest at the router.
+        let payload = unicast_bytes(mac(1), b"UNI-VIA-MCAST-DST");
+        for dst in [group_mac(), Mac::BROADCAST] {
+            let link = frame_bytes(dst, mac(9), DEFAULT_BATMAN_ETHER_TYPE, &payload);
+            assert!(
+                strip_directed(&mut router, LinkFrame::ref_from_bytes(&link).unwrap()).is_none(),
+                "an untagged unicast under link dst {dst:?} must be dropped"
+            );
+        }
+    }
+
+    /// The same for `Mcast`, which `handle_mcast` routes by its inner `dest`
+    /// exactly the way a unicast is routed.
+    #[test]
+    fn strip_directed_drops_a_group_addressed_mcast_without_a_tag() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let (mut router, _peer) = router_with_verified_peer(&authority);
+
+        let payload = mcast_bytes(mac(1), b"MCAST-VIA-BCAST-DST");
+        let link = frame_bytes(Mac::BROADCAST, mac(9), DEFAULT_BATMAN_ETHER_TYPE, &payload);
+        assert!(
+            strip_directed(&mut router, LinkFrame::ref_from_bytes(&link).unwrap()).is_none(),
+            "an untagged mcast under a broadcast link dst must be dropped"
+        );
+    }
+
+    /// The other half of the rule, and the one an over-eager fix would break: a
+    /// genuinely flooded `Bcast` *cannot* carry a pairwise tag — the key is
+    /// per-neighbor and the send is one-to-many — so it must still pass through
+    /// untouched, with nothing stripped off its tail.
+    #[test]
+    fn strip_directed_still_passes_a_flooded_broadcast() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let (mut router, _peer) = router_with_verified_peer(&authority);
+
+        let payload = [BatmanPacketType::Bcast.as_u8(), 5, 50, 0, 1, 2, 3];
+        let link = frame_bytes(Mac::BROADCAST, mac(2), DEFAULT_BATMAN_ETHER_TYPE, &payload);
+        let frame = LinkFrame::ref_from_bytes(&link).unwrap();
+        let out = strip_directed(&mut router, frame).expect("a flood is not pairwise-tagged");
+        assert_eq!(out.as_bytes(), frame.as_bytes(), "nothing stripped");
+    }
+
+    /// End to end through `handle_mesh_frame`: the injected unicast never
+    /// reaches the host device under *any* link dst, where before it did under
+    /// a group one and did not under an honest one. That contrast is the whole
+    /// finding — `red_team.py::attack_multicast_addressed_directed_delivery`
+    /// makes the same measurement against a live node.
+    #[test]
+    fn a_group_addressed_unicast_is_never_delivered_locally() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let (mut router, _peer) = router_with_verified_peer(&authority);
+
+        let payload = unicast_bytes(mac(1), b"INJECTED");
+        let mut tx = [0u8; wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN];
+        let mut sink = CaptureSink::default();
+        for dst in [group_mac(), Mac::BROADCAST, mac(1)] {
+            let link = frame_bytes(dst, mac(9), DEFAULT_BATMAN_ETHER_TYPE, &payload);
+            handle_mesh_frame(
+                Duration::ZERO,
+                &mut router,
+                0,
+                LinkFrame::ref_from_bytes(&link).unwrap(),
+                LinkMetrics::default(),
+                &mut tx,
+                &mut sink,
+            );
+        }
+        assert!(
+            sink.local.is_empty(),
+            "an outsider's untagged unicast must not reach the host device, \
+             whatever link dst it wears"
+        );
+        assert!(sink.mesh.is_empty(), "and nothing is relayed on its behalf");
+    }
+
+    /// The relay-laundering half, which is the worse one: a group-addressed
+    /// unicast whose inner dest is a *third* node must not be forwarded,
+    /// because forwarding is where this node stamps its own genuine pairwise
+    /// tag onto content it never authenticated (`plan_dispatch` re-tags every
+    /// directed frame it sends). A peer two hops from the attacker would
+    /// otherwise accept the injection as authenticated member traffic.
+    ///
+    /// The tagged frame relayed first is the control: it proves the route and
+    /// the forwarding path are live, so the attack's empty sink means *refused*
+    /// rather than *unroutable*. Mirrors
+    /// `red_team.py::attack_injected_directed_laundered_by_relay`.
+    #[test]
+    fn a_group_addressed_unicast_is_never_laundered_by_a_relay() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let (mut router, mut peer) = router_with_verified_peer(&authority);
+        let mut third = member_auth(&authority, 3, mac(3));
+        prove_peer(&mut router, &mut peer);
+
+        // `mac(3)`'s own signed OGM reaches the router over `mac(2)`, so the
+        // router holds a route to `mac(3)` whose next hop is `mac(2)`.
+        let ogm = signed_ogm_bytes(&mut third, mac(3), 7);
+        let relayed = frame_bytes(Mac::BROADCAST, mac(2), DEFAULT_BATMAN_ETHER_TYPE, &ogm);
+        let mut tx = [0u8; wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN];
+        let mut sink = CaptureSink::default();
+        handle_mesh_frame(
+            Duration::ZERO,
+            &mut router,
+            0,
+            LinkFrame::ref_from_bytes(&relayed).unwrap(),
+            LinkMetrics::default(),
+            &mut tx,
+            &mut sink,
+        );
+
+        // Control: the same packet, honestly addressed and genuinely tagged by
+        // `mac(2)`, *is* relayed toward `mac(3)`.
+        let inner = unicast_bytes(mac(3), b"HONEST");
+        let mut body = inner.clone();
+        body.resize(inner.len() + DIRECTED_TRAILER_LEN, 0);
+        let (f, trailer) = body.split_at_mut(inner.len());
+        peer.tag_directed(mac(1), f, trailer).expect("peer tags");
+        let honest = frame_bytes(mac(1), mac(2), DEFAULT_BATMAN_ETHER_TYPE, &body);
+        let mut sink = CaptureSink::default();
+        handle_mesh_frame(
+            Duration::ZERO,
+            &mut router,
+            0,
+            LinkFrame::ref_from_bytes(&honest).unwrap(),
+            LinkMetrics::default(),
+            &mut tx,
+            &mut sink,
+        );
+        assert_eq!(
+            sink.mesh.len(),
+            1,
+            "control: a tagged unicast toward mac(3) is relayed"
+        );
+
+        // The attack: Eve's untagged copy, aimed at `mac(3)`, under a broadcast
+        // link dst.
+        let payload = unicast_bytes(mac(3), b"LAUNDERED");
+        let link = frame_bytes(Mac::BROADCAST, mac(9), DEFAULT_BATMAN_ETHER_TYPE, &payload);
+        let mut sink = CaptureSink::default();
+        handle_mesh_frame(
+            Duration::ZERO,
+            &mut router,
+            0,
+            LinkFrame::ref_from_bytes(&link).unwrap(),
+            LinkMetrics::default(),
+            &mut tx,
+            &mut sink,
+        );
+        assert!(
+            sink.mesh.is_empty(),
+            "a relay must not re-tag content it never authenticated on ingress"
+        );
+    }
+
+    /// The transmit side reads the same rule, so the two halves cannot drift: a
+    /// `Unicast` staged against a group dst is *dropped* rather than emitted
+    /// untagged. No honest path stages one — the point is that "directed" means
+    /// the same thing on both sides, so a frame that would be refused on
+    /// ingress is never produced on egress either.
+    #[test]
+    fn tag_directed_into_refuses_a_group_addressed_unicast() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let (mut router, _peer) = router_with_verified_peer(&authority);
+
+        let body = unicast_bytes(mac(3), b"payload");
+        let mut buf = body.clone();
+        buf.resize(body.len() + DIRECTED_TRAILER_LEN, 0);
+        assert!(
+            tag_directed_into(
+                &mut router,
+                Duration::ZERO,
+                Mac::BROADCAST,
+                DEFAULT_BATMAN_ETHER_TYPE,
+                body.len(),
+                &mut buf,
+            )
+            .is_none(),
+            "a directed sub-type with no taggable next hop is dropped, not sent \
+             in the clear"
+        );
+    }
+
+    /// And the converse on transmit, which is what keeps the honest broadcast
+    /// paths working: a keep-alive addressed to the broadcast MAC goes out
+    /// as-is, with no trailer appended.
+    #[test]
+    fn tag_directed_into_leaves_a_keepalive_untagged() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let (mut router, _peer) = router_with_verified_peer(&authority);
+
+        let body = [BatmanPacketType::Keepalive.as_u8(), 5];
+        let mut buf = body.to_vec();
+        buf.resize(body.len() + DIRECTED_TRAILER_LEN, 0);
+        assert_eq!(
+            tag_directed_into(
+                &mut router,
+                Duration::ZERO,
+                Mac::BROADCAST,
+                DEFAULT_BATMAN_ETHER_TYPE,
+                body.len(),
+                &mut buf,
+            ),
+            Some(body.len()),
+            "a keep-alive carries its own signature, not a pairwise tag"
+        );
+    }
+
+    /// The bytes of an `EchoRequest` probe routed toward `dest`.
+    fn echo_request_bytes(dest: Mac, orig: Mac) -> Vec<u8> {
+        wayfinder::batman::wire::BatmanEchoPacket {
+            packet_type: BatmanPacketType::EchoRequest.as_u8(),
+            version: 5,
+            ttl: 50,
+            dest,
+            orig,
+            seqno: 1u16.to_be(),
+            req_hops: 0,
+            hops: 0,
+        }
+        .as_bytes()
+        .to_vec()
+    }
+
+    /// An untagged `EchoRequest` under a group link dst is refused, so the ping
+    /// data plane cannot be used as an unauthenticated reflection primitive.
+    ///
+    /// The ping suite in `wayfinder-test` runs entirely with auth *off*, where
+    /// `strip_directed` short-circuits before the sub-type is ever consulted —
+    /// so without this test the only thing standing behind
+    /// `requires_pairwise_tag`'s claim about `EchoRequest`/`EchoReply` is the
+    /// table test, and moving the pair to the exempt arm breaks nothing else in
+    /// the workspace. An outsider that could get an echo answered would have a
+    /// reflection primitive off any member MAC it has read off the air, which is
+    /// exactly what the `NextHopChallenge` address guard exists to deny on the
+    /// proof path.
+    #[test]
+    fn an_untagged_echo_request_is_never_answered() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let (mut router, _peer) = router_with_verified_peer(&authority);
+
+        let payload = echo_request_bytes(mac(1), mac(9));
+        let mut tx = [0u8; wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN];
+        let mut sink = CaptureSink::default();
+        for dst in [group_mac(), Mac::BROADCAST, mac(1)] {
+            let link = frame_bytes(dst, mac(9), DEFAULT_BATMAN_ETHER_TYPE, &payload);
+            handle_mesh_frame(
+                Duration::ZERO,
+                &mut router,
+                0,
+                LinkFrame::ref_from_bytes(&link).unwrap(),
+                LinkMetrics::default(),
+                &mut tx,
+                &mut sink,
+            );
+        }
+        assert!(
+            sink.mesh.is_empty(),
+            "an outsider's untagged echo request must not be answered, \
+             whatever link dst it wears"
+        );
+        assert!(sink.local.is_empty(), "and nothing is delivered locally");
+    }
+
+    /// A sub-type this build does not recognise is refused when untagged.
+    ///
+    /// Named for the behavior on purpose. The `None => true` fail-closed arm is
+    /// otherwise covered only by accident, through two tests that use
+    /// `[0xAA, ..]`/`[0xDE, ..]` as opaque filler and say nothing about
+    /// sub-types — and this very change shows how that coverage evaporates: the
+    /// four `[0x01, 0x02, 0x03]` payloads elsewhere in this file had to become
+    /// real `Unicast` bytes, because `0x01` is `Ogm` and silently became exempt.
+    /// The same tidying applied to `0xAA` would delete the fail-closed arm's
+    /// only behavioral coverage without failing a thing.
+    #[test]
+    fn an_unrecognised_sub_type_is_refused_when_untagged() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let (mut router, _peer) = router_with_verified_peer(&authority);
+
+        // 0xEE is not a `BatmanPacketType` this build knows.
+        let payload = [0xEEu8, 0x01, 0x02, 0x03];
+        assert!(
+            BatmanPacketType::from_u8(payload[0]).is_none(),
+            "this test is meaningless if 0xEE ever becomes a known sub-type"
+        );
+
+        let mut tx = [0u8; wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN];
+        let mut sink = CaptureSink::default();
+        for dst in [group_mac(), Mac::BROADCAST, mac(1)] {
+            let link = frame_bytes(dst, mac(9), DEFAULT_BATMAN_ETHER_TYPE, &payload);
+            assert!(
+                strip_directed(&mut router, LinkFrame::ref_from_bytes(&link).unwrap()).is_none(),
+                "an unrecognised sub-type must fail closed under link dst {dst:?}"
+            );
+            handle_mesh_frame(
+                Duration::ZERO,
+                &mut router,
+                0,
+                LinkFrame::ref_from_bytes(&link).unwrap(),
+                LinkMetrics::default(),
+                &mut tx,
+                &mut sink,
+            );
+        }
+        assert!(sink.local.is_empty(), "nothing delivered locally");
+        assert!(sink.mesh.is_empty(), "and nothing relayed on its behalf");
+    }
+
+    /// The positive control for [`a_group_addressed_unicast_is_never_delivered_locally`]:
+    /// a genuinely tagged unicast from a verified peer, aimed at this node, *is*
+    /// delivered to the host device.
+    ///
+    /// Without it every `sink.local` assertion in this file is `is_empty()`, so
+    /// a change that broke local delivery outright would leave the whole suite
+    /// green while the negative tests went on "passing" for the wrong reason.
+    #[test]
+    fn a_tagged_unicast_from_a_verified_peer_is_delivered_locally() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let (mut router, mut peer) = router_with_verified_peer(&authority);
+
+        let inner = unicast_bytes(mac(1), b"HONEST-PAYLOAD");
+        let mut body = inner.clone();
+        body.resize(inner.len() + DIRECTED_TRAILER_LEN, 0);
+        let (f, trailer) = body.split_at_mut(inner.len());
+        peer.tag_directed(mac(1), f, trailer).expect("peer tags");
+
+        let link = frame_bytes(mac(1), mac(2), DEFAULT_BATMAN_ETHER_TYPE, &body);
+        let mut tx = [0u8; wayfinder::interfaces::frame::MAX_LINK_FRAME_LEN];
+        let mut sink = CaptureSink::default();
+        handle_mesh_frame(
+            Duration::ZERO,
+            &mut router,
+            0,
+            LinkFrame::ref_from_bytes(&link).unwrap(),
+            LinkMetrics::default(),
+            &mut tx,
+            &mut sink,
+        );
+        assert_eq!(sink.local.len(), 1, "the honest unicast is delivered");
+        assert!(
+            sink.local[0].ends_with(b"HONEST-PAYLOAD"),
+            "and the trailer was stripped before delivery, not passed through"
+        );
+    }
+
+    /// A *genuinely tagged* unicast is accepted even under a group link dst —
+    /// the deliberate asymmetry with
+    /// [`tag_directed_into_refuses_a_group_addressed_unicast`], recorded here so
+    /// nobody "fixes" it.
+    ///
+    /// `strip_directed` is dst-blind by design, and `verify_directed` binds the
+    /// tag to `(pairwise key, counter, src, frame)` — the link dst is *not* in
+    /// the bound context. That is safe because the pairwise key is per-(sender,
+    /// receiver): only the intended peer can verify the tag, so the other N-1
+    /// nodes on the segment drop it and the sender gains nothing by shouting.
+    ///
+    /// The two obvious "fixes" are both worse. Rejecting on a group dst at
+    /// ingress re-introduces a decision keyed on the attacker-chosen field this
+    /// whole change exists to stop trusting; binding the dst into the tag is a
+    /// wire-format change that buys nothing. Egress refuses to *produce* one
+    /// only because no honest path stages one — that is a tightness check on
+    /// ourselves, not a claim about what a peer may send.
+    #[test]
+    fn a_tagged_unicast_is_accepted_even_under_a_group_link_dst() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let (mut router, mut peer) = router_with_verified_peer(&authority);
+
+        let inner = unicast_bytes(mac(1), b"TAGGED-UNDER-GROUP");
+        let mut body = inner.clone();
+        body.resize(inner.len() + DIRECTED_TRAILER_LEN, 0);
+        let (f, trailer) = body.split_at_mut(inner.len());
+        peer.tag_directed(mac(1), f, trailer).expect("peer tags");
+
+        let link = frame_bytes(Mac::BROADCAST, mac(2), DEFAULT_BATMAN_ETHER_TYPE, &body);
+        let out = strip_directed(&mut router, LinkFrame::ref_from_bytes(&link).unwrap());
+        assert!(
+            out.is_some(),
+            "the tag authenticates the frame; the link dst is not part of what it binds"
+        );
+        assert_eq!(
+            out.unwrap().payload.len(),
+            inner.len(),
+            "and the trailer is stripped exactly as under a unicast dst"
         );
     }
 }
