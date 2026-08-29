@@ -2796,7 +2796,13 @@ impl<
 
     /// `(used, capacity)` of the broadcast-deduplication table (one entry per
     /// originator whose flooded broadcasts we've seen).  Bounded by
-    /// [`ORIGINATOR_CAPACITY`]; further originators are dropped once full.
+    /// [`ORIGINATOR_CAPACITY`]; at capacity the least-recently-updated entry is
+    /// evicted to admit a new originator.
+    ///
+    /// Reads as a high-water mark rather than a live gauge: nothing ages an
+    /// entry out, so once this reaches capacity it stays there. In particular a
+    /// full table no longer means broadcasts are being dropped — it did before
+    /// eviction was added.
     pub fn broadcast_dedup_occupancy(&self) -> (usize, usize) {
         (self.batman.broadcast_seqno.len(), ORIGINATOR_CAPACITY)
     }

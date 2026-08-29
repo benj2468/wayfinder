@@ -2373,9 +2373,10 @@ def _bcast_packet(
     """A `BatmanBroadcastPacket`: `[type][version][ttl][seqno BE][orig][inner]`.
 
     Mirrors `batman::wire::BatmanBroadcastPacket`. `Bcast` frames carry no
-    signature and are gated by nothing on ingress (only OGMs are auth-gated),
-    so `orig` and `seqno` are entirely the attacker's to choose — which is the
-    whole point of the two attacks that use this.
+    signature and are gated by nothing on ingress (only OGMs and keep-alives
+    are, in `CentralRouter::handle_frame_with_metrics`), so `orig` and `seqno`
+    are entirely the attacker's to choose — which is the whole point of the
+    three attacks that use this.
     """
     return b"".join(
         (
@@ -2525,21 +2526,21 @@ def attack_ogm_seqno_highwater_jam() -> Finding:
 
 def attack_broadcast_seqno_blackhole() -> Finding:
     """One forged, unauthenticated `Bcast` frame carrying a member's address and
-    a maxed sequence number silences that member's genuine broadcasts mesh-wide.
+    a maxed sequence number must not silence that member's genuine broadcasts.
 
-    Broadcast dedup is a strict per-originator high-water: a `Bcast` with
-    `incoming_seqno <= entry` is dropped as a duplicate (engine.rs
-    `handle_broadcast`). `Bcast` frames are authenticated by nothing on ingress
-    (only OGMs are gated — auth.rs scope note), so the attacker chooses both the
-    `orig` field and the seqno freely. She injects `orig = hq, seqno = 0xFFFF_
-    FFFF`; hq's real broadcasts start at seqno 1 and are all `<=` the poisoned
-    high-water, so every one is dropped before local delivery or re-flood.
+    `Bcast` frames are authenticated by nothing on ingress — only OGMs and
+    keep-alives are gated (`CentralRouter::handle_frame_with_metrics`) — so the
+    attacker chooses both the `orig` field and the seqno freely. She injects
+    `orig = hq, seqno = 0xFFFF_FFFF` to pin field's dedup high-water above
+    anything hq will emit.
 
-    The auth scope note already concedes an outsider can *inject* a broadcast
-    flood on an auth mesh — a nuisance. This is the sharper, unstated
-    escalation: from injecting noise to silently and durably *suppressing* a
-    named member's legitimate broadcasts with a single frame. Measured by
-    whether `field` ever delivers hq's real broadcast payload to its local host.
+    It must fail because `handle_broadcast` no longer takes any `u32` as the new
+    high-water: the comparison is a wrapping distance, so the maxed value lands
+    *behind* hq's high-water rather than above it and is discarded (issue #29).
+    The auth scope note concedes an outsider can *inject* a broadcast flood on
+    an auth mesh — a nuisance. What it must not become is durable, targeted
+    suppression of a named member from a single frame. Measured by whether
+    `field` still delivers hq's real broadcast payload after the poison.
     """
     m = mesh()
     nodes = [*_members("hq", "field"), Node("eve")]
@@ -2581,49 +2582,335 @@ def attack_broadcast_seqno_blackhole() -> Finding:
     )
 
 
+def attack_broadcast_seqno_in_window_jump() -> Finding:
+    """The sharper form of the high-water blackhole: a forged jump the receiver
+    *accepts*, rather than one it can recognise as absurd.
+
+    `attack_broadcast_seqno_blackhole` uses `seqno = 0xFFFF_FFFF`, which the
+    wrapping comparison reads as behind the high-water and discards. An attacker
+    does not have to be that crude. A jump of `BROADCAST_SEQNO_WINDOW` is inside
+    the band the receiver treats as plausible forward progress, so it is
+    accepted as the new high-water — and every genuine broadcast the victim then
+    sends sits *behind* it.
+
+    This is the attack the first cut of the issue #29 fix missed, and it was
+    strictly better for the attacker than the one that fix blocked: the victim's
+    own frames were dropped as ordinary duplicates, touching no state, so it
+    stayed silent until its counter climbed past the forged value — thousands of
+    broadcasts, and at ARP rates the better part of a day, from one frame.
+
+    It must fail because a run of sequence numbers that do not advance the
+    high-water is now read as evidence against the *high-water*, not against the
+    frames: it opens a `SeqnoResyncWatch`, and once the run persists for
+    `BROADCAST_SEQNO_RESET_PROTECTION` the entry snaps back to where the victim
+    actually is. Measured by whether `field` delivers hq's broadcasts again
+    within that window, against a control with no poison.
+    """
+    # Must exceed batman's BROADCAST_SEQNO_REORDER_TOLERANCE and sit inside its
+    # BROADCAST_SEQNO_WINDOW; both are the receiver's, not on the wire.
+    jump = 1_024
+
+    def run(with_poison: bool) -> bool:
+        m = mesh()
+        nodes = [*_members("hq", "field"), Node("eve")]
+        sim = Simulation(
+            nodes, shared_lan(["hq", "field", "eve"], PerfectWire()), mesh=m
+        )
+        sim.run(until_s=15.0)
+
+        # hq broadcasts once so field holds a real high-water to jump from.
+        sim.send("hq", "*", b"SEED-BCAST", at_s=15.5)
+        sim.run(until_s=17.0)
+        _drain(sim, "field")
+
+        if with_poison:
+            frame = forge.link_frame(
+                wf.PyMac.BROADCAST,
+                sim.mac("eve"),
+                _bcast_packet(sim.mac("hq"), jump, ttl=1),
+            )
+            sim.inject("eve", frame, at_s=17.5)
+            sim.run(until_s=18.5)
+            _drain(sim, "field")
+
+        # hq keeps broadcasting across the reset-protection window. Under the
+        # old behaviour none of these ever arrive.
+        delivered = False
+        for i in range(9):
+            sim.send("hq", "*", b"HEAL-BCAST", at_s=19.0 + i * 5.0)
+            sim.run(until_s=21.0 + i * 5.0)
+            if _drain_contains(sim, "field", b"HEAL-BCAST"):
+                delivered = True
+        return delivered
+
+    healed_clean = run(with_poison=False)
+    healed_attack = run(with_poison=True)
+
+    silenced = healed_clean and not healed_attack
+    return Finding(
+        "Broadcast seqno in-window jump (accepted forgery)",
+        GAP if silenced else HELD,
+        (
+            f"one forged Bcast (orig=hq, seqno=+{jump}) is accepted as a "
+            "plausible advance and field never delivers hq's genuine "
+            "broadcasts again"
+            if silenced
+            else f"clean delivery: {healed_clean}; delivery after a +{jump} "
+            f"forged jump: {healed_attack} — a wrong high-water is corrected "
+            "by the victim's own traffic within the reset-protection window"
+        ),
+    )
+
+
+def attack_broadcast_resync_hijack() -> Finding:
+    """An outsider must not be able to cash in a resynchronisation run that an
+    honest originator earned.
+
+    The receiver cannot tell a forged sequence number from a rebooted node's, so
+    it separates them by persistence: a run of numbers that do not advance the
+    high-water is refused until it has lasted `BROADCAST_SEQNO_RESET_PROTECTION`,
+    then the entry resynchronises. That creates a window an attacker can aim at.
+    Eve first pushes field's high-water for hq forward with an in-window jump, so
+    hq's own next broadcast opens a run; she then waits out the protection
+    interval and fires one forged frame at the deadline, hoping the
+    resynchronisation lands on *her* number instead of hq's.
+
+    If it did, she would hold field's high-water at an unreachable value again
+    and could renew it every interval — issue #29's failure mode B rebuilt out
+    of the machinery meant to close it, for two frames per interval.
+
+    It must fail because the resynchronisation restores the sequence number that
+    *opened* the run, not the one carried by the frame that trips the deadline.
+    Eve's frame is judged against the restored value like any other and refused.
+    Measured by whether hq's broadcasts flow again in the interval immediately
+    after the hijack attempt, against a control that makes the same attempt with
+    no hijack frame.
+    """
+    poison = 1_024  # in-window relative to hq's high-water, so it is accepted
+
+    def run(with_hijack: bool) -> bool:
+        m = mesh()
+        nodes = [*_members("hq", "field"), Node("eve")]
+        sim = Simulation(
+            nodes, shared_lan(["hq", "field", "eve"], PerfectWire()), mesh=m
+        )
+        sim.run(until_s=15.0)
+
+        sim.send("hq", "*", b"SEED-BCAST", at_s=15.5)
+        sim.run(until_s=17.0)
+        _drain(sim, "field")
+
+        # Push the high-water forward so hq's own frames stop advancing it.
+        sim.inject(
+            "eve",
+            forge.link_frame(
+                wf.PyMac.BROADCAST,
+                sim.mac("eve"),
+                _bcast_packet(sim.mac("hq"), poison, ttl=1),
+            ),
+            at_s=17.5,
+        )
+        sim.run(until_s=18.5)
+        _drain(sim, "field")
+
+        # hq's next broadcast opens the resync run, at ~19 s.
+        sim.send("hq", "*", b"RUN-OPENER", at_s=19.0)
+        sim.run(until_s=20.0)
+        _drain(sim, "field")
+
+        if with_hijack:
+            # One forged frame at the deadline, bidding to own the resync.
+            sim.inject(
+                "eve",
+                forge.link_frame(
+                    wf.PyMac.BROADCAST,
+                    sim.mac("eve"),
+                    _bcast_packet(sim.mac("hq"), 0x4000_0000, ttl=1),
+                ),
+                at_s=50.0,
+            )
+            sim.run(until_s=51.0)
+            _drain(sim, "field")
+
+        # The interval after the deadline: hq must be heard again here.
+        delivered = False
+        for i in range(5):
+            sim.send("hq", "*", b"POST-RESYNC", at_s=52.0 + i * 5.0)
+            sim.run(until_s=54.0 + i * 5.0)
+            if _drain_contains(sim, "field", b"POST-RESYNC"):
+                delivered = True
+        return delivered
+
+    healed_clean = run(with_hijack=False)
+    healed_attack = run(with_hijack=True)
+
+    hijacked = healed_clean and not healed_attack
+    return Finding(
+        "Broadcast resync hijack (stealing an honest run)",
+        GAP if hijacked else HELD,
+        (
+            "one forged Bcast fired at the resynchronisation deadline takes "
+            "over the run hq earned, re-pinning field's high-water out of hq's "
+            "reach"
+            if hijacked
+            else f"resync without a hijack frame: {healed_clean}; with one: "
+            f"{healed_attack} — the run restores the seqno that opened it, not "
+            "the frame that trips the deadline"
+        ),
+    )
+
+
+def attack_broadcast_evict_then_reseed() -> Finding:
+    """Eviction must not become a way around the sequence-number window.
+
+    `attack_broadcast_dedup_table_exhaustion` establishes that a full table
+    evicts rather than refusing — necessary, or every not-yet-seen originator is
+    black-holed. But eviction hands the attacker something in return: she can
+    force a *live* member's entry out of the table cheaply, and the entry that
+    replaces it is a first sighting, which has no high-water to judge against
+    and so takes its sequence number on trust.
+
+    So eve floods ghost origs until hq's entry is evicted, then re-creates it
+    under hq's name at an unreachable number. If that stuck, the two halves of
+    the issue #29 fix would cancel out: the eviction added for failure mode A
+    would be a fresh route into failure mode B.
+
+    It must fail — but notably not because the seeding is checked. It is not,
+    deliberately: an attacker can force a first sighting whenever she likes, so
+    a check there buys nothing. It fails because hq's own broadcasts, which now
+    sit far behind the seeded value, are read as evidence against the high-water
+    and resynchronise it within `BROADCAST_SEQNO_RESET_PROTECTION`. Measured
+    against a control with no flood and no re-seed.
+    """
+    ghost_count = 400
+
+    def run(with_attack: bool) -> bool:
+        m = mesh()
+        nodes = [*_members("hq", "field"), Node("eve")]
+        sim = Simulation(
+            nodes, shared_lan(["hq", "field", "eve"], PerfectWire()), mesh=m
+        )
+        sim.run(until_s=15.0)
+
+        # hq is a live, already-tracked broadcast originator.
+        sim.send("hq", "*", b"SEED-BCAST", at_s=15.5)
+        sim.run(until_s=17.0)
+        _drain(sim, "field")
+
+        t = 17.5
+        if with_attack:
+            for i in range(ghost_count):
+                ghost = wf.PyMac(
+                    bytes((0x03, 0x00, (i >> 8) & 0xFF, i & 0xFF, 0x00, 0x01))
+                )
+                sim.inject(
+                    "eve",
+                    forge.link_frame(
+                        wf.PyMac.BROADCAST,
+                        sim.mac("eve"),
+                        _bcast_packet(ghost, 1, ttl=1),
+                    ),
+                    at_s=t,
+                )
+                t += 0.01
+            sim.run(until_s=t + 0.5)
+            # hq's entry is gone; re-create it out of hq's reach.
+            sim.inject(
+                "eve",
+                forge.link_frame(
+                    wf.PyMac.BROADCAST,
+                    sim.mac("eve"),
+                    _bcast_packet(sim.mac("hq"), 0x4000_0000, ttl=1),
+                ),
+                at_s=t + 1.0,
+            )
+        t += ghost_count * 0.0 + 2.0
+        sim.run(until_s=t)
+        _drain(sim, "field")
+
+        delivered = False
+        for i in range(9):
+            sim.send("hq", "*", b"POST-RESEED", at_s=t + 1.0 + i * 5.0)
+            sim.run(until_s=t + 3.0 + i * 5.0)
+            if _drain_contains(sim, "field", b"POST-RESEED"):
+                delivered = True
+        return delivered
+
+    delivered_clean = run(with_attack=False)
+    delivered_attack = run(with_attack=True)
+
+    pinned = delivered_clean and not delivered_attack
+    return Finding(
+        "Broadcast evict-then-reseed (eviction as a window bypass)",
+        GAP if pinned else HELD,
+        (
+            f"{ghost_count} ghost origs evict hq's live dedup entry, and the "
+            "re-seeded entry pins hq's high-water out of reach — eviction "
+            "reopens the seqno blackhole it was added to close"
+            if pinned
+            else f"clean delivery: {delivered_clean}; delivery after evict and "
+            f"re-seed: {delivered_attack} — a seeded high-water is corrected by "
+            "the originator's own traffic like any other"
+        ),
+    )
+
+
 def attack_broadcast_dedup_table_exhaustion() -> Finding:
     """Flood `Bcast` frames under many distinct ghost originators to fill the
-    receiver's fixed broadcast-dedup table, then a genuine member that has not
-    broadcast yet can never get its first broadcast delivered.
+    receiver's fixed broadcast-dedup table, then check a genuine member that has
+    not broadcast yet can still get its first broadcast delivered.
 
     The dedup table is bounded (one entry per originator, capacity
-    `MAX_ORIGINATORS`) and does *not* evict: once full, a `Bcast` from an
-    originator not already present hits `push().is_err()` and is dropped
-    (engine.rs `handle_broadcast`, "table full, drop packet"). Ghost-orig
-    `Bcast` frames are unauthenticated, so the attacker mints as many distinct
-    originators as she likes. After the table is saturated, `hq` — a real
-    member whose address was never entered — broadcasts, and its packet is
-    dropped for want of a table slot.
+    `MAX_ORIGINATORS`), and ghost-orig `Bcast` frames are unauthenticated, so
+    the attacker mints as many distinct originators as she likes and can always
+    saturate it. What matters is what a full table then does.
 
-    Distinct mechanism from the high-water blackhole: that suppresses one named
-    member; this denies broadcast to *every* originator not already in the
-    table. Measured by whether `field` delivers hq's real broadcast after the
-    table is flooded full, against a control with no flood.
+    It must fail because a full table evicts its least-recently-updated entry
+    rather than refusing the packet (issue #29), the way the originator and
+    keep-alive tables already do — so saturation costs at worst a duplicate
+    re-flood, which the TTL bounds, instead of black-holing every originator not
+    already present for the life of the process. Distinct mechanism from the
+    high-water blackhole: that targets one named member; this would have denied
+    broadcast to *all* of them. Measured against a control leg with no flood, so
+    a HELD verdict cannot be earned by an injection that simply never landed.
     """
-    m = mesh()
-    nodes = [*_members("hq", "field"), Node("eve")]
-    sim = Simulation(nodes, shared_lan(["hq", "field", "eve"], PerfectWire()), mesh=m)
-    sim.run(until_s=15.0)
-
     # How many distinct ghost origs to mint. Overshoot any plausible
     # MAX_ORIGINATORS so the table is certainly saturated.
     ghost_count = 400
-    t = 15.5
-    for i in range(ghost_count):
-        ghost = wf.PyMac(bytes((0x02, 0x00, (i >> 8) & 0xFF, i & 0xFF, 0x00, 0x01)))
-        frame = forge.link_frame(
-            wf.PyMac.BROADCAST, sim.mac("eve"), _bcast_packet(ghost, 1, ttl=1)
+
+    def run(with_flood: bool) -> bool:
+        m = mesh()
+        nodes = [*_members("hq", "field"), Node("eve")]
+        sim = Simulation(
+            nodes, shared_lan(["hq", "field", "eve"], PerfectWire()), mesh=m
         )
-        sim.inject("eve", frame, at_s=t)
-        t += 0.01
-    sim.run(until_s=t + 1.0)
-    _drain(sim, "field")
+        sim.run(until_s=15.0)
 
-    # hq (never previously a broadcast originator) now broadcasts.
-    sim.send("hq", "*", b"POST-EXHAUSTION", at_s=t + 1.5)
-    sim.run(until_s=t + 4.0)
-    denied = not _drain_contains(sim, "field", b"POST-EXHAUSTION")
+        t = 15.5
+        if with_flood:
+            for i in range(ghost_count):
+                ghost = wf.PyMac(
+                    bytes((0x02, 0x00, (i >> 8) & 0xFF, i & 0xFF, 0x00, 0x01))
+                )
+                frame = forge.link_frame(
+                    wf.PyMac.BROADCAST, sim.mac("eve"), _bcast_packet(ghost, 1, ttl=1)
+                )
+                sim.inject("eve", frame, at_s=t)
+                t += 0.01
+        else:
+            t += ghost_count * 0.01
+        sim.run(until_s=t + 1.0)
+        _drain(sim, "field")
 
+        # hq (never previously a broadcast originator) now broadcasts.
+        sim.send("hq", "*", b"POST-EXHAUSTION", at_s=t + 1.5)
+        sim.run(until_s=t + 4.0)
+        return _drain_contains(sim, "field", b"POST-EXHAUSTION")
+
+    delivered_clean = run(with_flood=False)
+    delivered_attack = run(with_flood=True)
+
+    denied = delivered_clean and not delivered_attack
     return Finding(
         "Broadcast dedup-table exhaustion",
         GAP if denied else HELD,
@@ -2633,8 +2920,9 @@ def attack_broadcast_dedup_table_exhaustion() -> Finding:
             "slot — a keyless outsider denies broadcast to every not-yet-seen "
             "originator"
             if denied
-            else f"hq's broadcast still delivered after {ghost_count} ghost "
-            "origs — the dedup table is not exhaustible this way"
+            else f"clean delivery: {delivered_clean}; delivery after "
+            f"{ghost_count} ghost origs: {delivered_attack} — the dedup table "
+            "is not exhaustible this way"
         ),
     )
 
@@ -2757,6 +3045,9 @@ ATTACKS: list[Callable[[], Finding]] = [
     attack_stale_revocation_denies_readmission,
     attack_ogm_seqno_highwater_jam,
     attack_broadcast_seqno_blackhole,
+    attack_broadcast_seqno_in_window_jump,
+    attack_broadcast_resync_hijack,
+    attack_broadcast_evict_then_reseed,
     attack_broadcast_dedup_table_exhaustion,
     attack_relayed_tq_inflation,
 ]

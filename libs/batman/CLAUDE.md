@@ -11,7 +11,9 @@ BATMAN-adv routing protocol implementation. `no_std`, heapless. Implements
   (`local_mcast` / `mcast_members`). All but the first parameter default to the
   crate constants of the same name, so `BatmanEngine<N>` keeps host sizing.
   A constrained node picks a smaller profile instead: `BatmanEngine<16, 2, 8, 4>`
-  is 5,416 bytes against the host profile's 41,520.
+  is roughly an eighth of the host profile's footprint (`capacity_tests.rs`
+  pins the ratio rather than the byte counts, which drift with every field
+  added).
 
   **Runtime bounds must read the generic parameters, not the crate constants.**
   `configure_interface_ogm` / `configure_interface_keepalive` reject
@@ -99,6 +101,73 @@ the engine itself is unchanged. See `libs/wayfinder` for `OgmAuth`.
 1. Drops own broadcasts (loop prevention).
 2. Deduplicates on `(orig, seqno)` via the engine's `broadcast_seqno` table —
    duplicates/stale are dropped.
+
+   **Both halves of that key come from inside the payload, and no ingress
+   check authenticates a `Bcast`** (only OGMs and keep-alives are gated; a
+   held revocation and a link's `rx_data` flag do drop frames at ingress, but
+   neither authenticates anything and neither looks at `orig`). So this is the
+   one routing table an outsider writes to directly, choosing both which entry
+   to touch and what goes in it.
+
+   What makes that survivable is *not* a check on the frame — a keyless
+   attacker passes every check available. It is that
+   `BroadcastSeqnoEntry::admit` makes any wrong high-water self-correcting,
+   whatever put it there. `admit` sorts an incoming seqno into three bands
+   (`SeqnoVerdict`), and the third is the whole defence:
+
+   - **Advance** — within `BROADCAST_SEQNO_WINDOW` ahead. Moves the high-water,
+     clears any watch.
+   - **Duplicate** — at or within `BROADCAST_SEQNO_REORDER_TOLERANCE` behind.
+     The same flood by a second path; dropped, touching nothing.
+   - **Implausible** — anything else. Opens a `SeqnoResyncWatch`, and once that
+     run has persisted for `BROADCAST_SEQNO_RESET_PROTECTION` the high-water
+     resynchronises **to the seqno that opened the run**, not to whichever
+     frame trips the deadline.
+
+   Three properties there are load-bearing, and issue #29's history is the
+   argument for each — the first cut of the fix had only the first of them and
+   was still exploitable:
+
+   - **The behind-band is narrow.** A forgery needs no implausible leap: one
+     *inside* the window is accepted as an advance, and every genuine broadcast
+     the victim then sends sits behind it. If that band were merely "duplicate,
+     drop", the victim would stay silent until its own counter climbed past the
+     forged value — thousands of frames, hours at ARP rates, from one frame.
+   - **The resync restores the seqno that opened the run.** Restoring whichever
+     frame arrives at the deadline lets a third party wait out a run an honest,
+     rebooting originator earned and substitute its own number — failure mode B
+     again, from two frames thirty seconds apart.
+   - **A full table evicts its least-recently-updated entry** rather than
+     refusing the packet, which used to deny broadcast to every originator not
+     already present for the life of the process. The re-seeded entry takes its
+     first seqno on trust; that is deliberate (an attacker can force a first
+     sighting at will, so a check would buy nothing) and safe only because of
+     the band above.
+
+   Note the asymmetry in what each failure mode costs an attacker: pinning one
+   named member took a *single* frame, saturating the table takes about
+   `MAX_ORIGINATORS` of them.
+
+   The residual, which only authentication closes (design 09 §8 item 6): an
+   attacker injecting *continuously*, faster than the victim broadcasts, keeps
+   advancing the high-water and so keeps clearing the watch. That is a
+   sustained flood, which an outsider can mount here anyway; what it can no
+   longer be is a one-shot with permanent effect.
+
+   Five `sim/scenarios/red_team.py` attacks pin this surface, and each was
+   checked to report `GAP` when the property it guards is removed rather than
+   merely passing: `attack_broadcast_seqno_blackhole` and
+   `attack_broadcast_dedup_table_exhaustion` for the two original failure
+   modes, and `attack_broadcast_seqno_in_window_jump`,
+   `attack_broadcast_resync_hijack` and `attack_broadcast_evict_then_reseed`
+   for the three ways the first cut of the fix was still exploitable.
+
+   The `frame.src`-based gate that keeps suggesting itself here is *not* the
+   answer and has been rejected twice (issue #29, and
+   `docs/design/09-mesh-auth-gaps.md` §3's "What does *not* fix it"): an
+   outsider copies a member MAC off the air, and the damage is keyed on `orig`
+   anyway.
+
 3. If TTL expired, returns `DeliverLocal` (deliver, no re-flood).
 4. Otherwise writes a re-flood (TTL−1, inner frame preserved) into the reply
    buffer and returns `DeliverLocalAndForward(BROADCAST)`. The caller delivers
