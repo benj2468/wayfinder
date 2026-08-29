@@ -241,10 +241,18 @@ impl TestHarness {
     /// [`run_trickle`](Self::run_trickle).
     fn trickle_step(&mut self) {
         let now = self.clock;
+        // The soonest thing any node has to do — an OGM, or a probe in a
+        // running ping session. Folding the probe deadline in mirrors what
+        // every real driver shell does with `next_ping_after`; leaving it out
+        // would pace probes off the Trickle timer, so a ping test would be
+        // measuring the OGM schedule instead.
         let dt = self
             .machines
             .values()
-            .map(|m| m.next_broadcast_after(now))
+            .map(|m| {
+                m.next_broadcast_after(now)
+                    .min(m.next_ping_after(now).unwrap_or(Duration::MAX))
+            })
             .min()
             .unwrap_or(Duration::from_secs(1))
             .max(Duration::from_nanos(1));

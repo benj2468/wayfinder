@@ -315,6 +315,31 @@ rpc_table! {
         access: [Admin, SelfKey],
         limit: Unmetered,
     }
+    /// Reading a probe session's status is an ordinary query — it discloses no
+    /// more than the routing table beside it, and "can this node reach that
+    /// one" is exactly the question the viewer tier exists to answer.
+    PingStatus(PingStatusRequest) {
+        owner: RouterRead, audit: Query,
+        access: [Admin, SelfKey, Viewer],
+        limit: Unmetered,
+    }
+    /// *Starting* one is not a query, which is why it sits over here. It puts
+    /// frames on the air at a caller-chosen cadence and displaces whatever
+    /// session was running — both things a read-only tier exists not to do.
+    Ping(PingRequest) {
+        owner: RouterWrite, audit: Mutation,
+        access: [Admin, SelfKey],
+        limit: Unmetered,
+    }
+    /// And stopping one is the same kind of act as starting it — it changes
+    /// what the node is doing — so it carries the same tier as `Ping` rather
+    /// than the softer one `PingStatus` gets. A viewer that could cancel could
+    /// silence any diagnostic an administrator was running.
+    CancelPing(CancelPingRequest) {
+        owner: RouterWrite, audit: Mutation,
+        access: [Admin, SelfKey],
+        limit: Unmetered,
+    }
     SetAuth(SetAuthRequest) {
         owner: RouterWrite, audit: Mutation,
         access: [Admin, SelfKey],

@@ -45,6 +45,8 @@ use wayfinder_protos::wayfinder::v1alpha::AuthenticateUserRequest;
 use wayfinder_protos::wayfinder::v1alpha::AuthenticateUserResponse;
 use wayfinder_protos::wayfinder::v1alpha::BeginUserRegistrationRequest;
 use wayfinder_protos::wayfinder::v1alpha::BeginUserRegistrationResponse;
+use wayfinder_protos::wayfinder::v1alpha::CancelPingRequest;
+use wayfinder_protos::wayfinder::v1alpha::CancelPingResponse;
 use wayfinder_protos::wayfinder::v1alpha::CompleteUserRegistrationRequest;
 use wayfinder_protos::wayfinder::v1alpha::CreateUserInviteRequest;
 use wayfinder_protos::wayfinder::v1alpha::CreateUserInviteResponse;
@@ -87,6 +89,10 @@ use wayfinder_protos::wayfinder::v1alpha::LogRecords;
 use wayfinder_protos::wayfinder::v1alpha::NodeInfo;
 use wayfinder_protos::wayfinder::v1alpha::NodeMetrics;
 use wayfinder_protos::wayfinder::v1alpha::OgmSchedule;
+use wayfinder_protos::wayfinder::v1alpha::PingRequest;
+use wayfinder_protos::wayfinder::v1alpha::PingResponse;
+use wayfinder_protos::wayfinder::v1alpha::PingStatusRequest;
+use wayfinder_protos::wayfinder::v1alpha::PingStatusResponse;
 use wayfinder_protos::wayfinder::v1alpha::RemoveUserRequest;
 use wayfinder_protos::wayfinder::v1alpha::ResolveRouteRequest;
 use wayfinder_protos::wayfinder::v1alpha::ResolveRouteResponse;
@@ -718,6 +724,74 @@ impl Client {
         {
             ResponseKind::ResolveRoute(resolution) => Ok(resolution),
             other => Err(unexpected("ResolveRoute", &other)),
+        }
+    }
+
+    /// Ask the node to start a reachability-probe session against
+    /// `destination` — the mesh's `ping`.
+    ///
+    /// The node runs the session; this returns straight away with the handle to
+    /// poll [`ping_status`](Self::ping_status) with, alongside the settings
+    /// actually in force after the node's defaults and caps. Pass 0 for any of
+    /// `count`, `interval_ms`, `timeout_ms` or `payload_bytes` to take the
+    /// node's default.
+    ///
+    /// A node runs one session at a time, so this displaces whatever was
+    /// running — which is why the handle matters: an earlier caller's poll then
+    /// reads as gone rather than as somebody else's numbers.
+    pub async fn ping(
+        &mut self,
+        destination: Vec<u8>,
+        count: u32,
+        interval_ms: u32,
+        timeout_ms: u32,
+        payload_bytes: u32,
+    ) -> anyhow::Result<PingResponse> {
+        match self
+            .request(RequestKind::Ping(PingRequest {
+                destination,
+                count,
+                interval_ms,
+                timeout_ms,
+                payload_bytes,
+            }))
+            .await?
+        {
+            ResponseKind::Ping(started) => Ok(started),
+            other => Err(unexpected("Ping", &other)),
+        }
+    }
+
+    /// Read the status of the ping session `session_seq` names.
+    ///
+    /// An unset [`PingStatusResponse::session`] means the node is no longer
+    /// running that session — it was displaced, or the node restarted — and is
+    /// the signal to stop polling, not an error.
+    pub async fn ping_status(&mut self, session_seq: u32) -> anyhow::Result<PingStatusResponse> {
+        match self
+            .request(RequestKind::PingStatus(PingStatusRequest { session_seq }))
+            .await?
+        {
+            ResponseKind::PingStatus(status) => Ok(status),
+            other => Err(unexpected("PingStatus", &other)),
+        }
+    }
+
+    /// Stop the ping session `session_seq` names, and read back what it
+    /// measured before it stopped.
+    ///
+    /// An unset [`CancelPingResponse::session`] means there was nothing of this
+    /// caller's to stop — it had already finished, it was displaced, or it
+    /// never started — and is success, not an error. Cancelling is what a
+    /// client does on its way out, and a session that has already stopped is
+    /// the outcome it wanted.
+    pub async fn cancel_ping(&mut self, session_seq: u32) -> anyhow::Result<CancelPingResponse> {
+        match self
+            .request(RequestKind::CancelPing(CancelPingRequest { session_seq }))
+            .await?
+        {
+            ResponseKind::CancelPing(cancelled) => Ok(cancelled),
+            other => Err(unexpected("CancelPing", &other)),
         }
     }
 
@@ -1401,6 +1475,9 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
         ResponseKind::LinkFeaturesTable(_) => "LinkFeaturesTable",
         ResponseKind::KeepaliveTable(_) => "KeepaliveTable",
         ResponseKind::ResolveRoute(_) => "ResolveRoute",
+        ResponseKind::Ping(_) => "Ping",
+        ResponseKind::PingStatus(_) => "PingStatus",
+        ResponseKind::CancelPing(_) => "CancelPing",
         ResponseKind::OgmSchedule(_) => "OgmSchedule",
         ResponseKind::Throughput(_) => "Throughput",
         ResponseKind::Metrics(_) => "Metrics",

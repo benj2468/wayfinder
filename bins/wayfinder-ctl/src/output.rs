@@ -20,6 +20,9 @@ use wayfinder_protos::wayfinder::v1alpha::NodeInfo;
 use wayfinder_protos::wayfinder::v1alpha::NodeMetrics;
 use wayfinder_protos::wayfinder::v1alpha::NodeSecurity;
 use wayfinder_protos::wayfinder::v1alpha::OgmSchedule;
+use wayfinder_protos::wayfinder::v1alpha::PingProbe;
+use wayfinder_protos::wayfinder::v1alpha::PingProbeState;
+use wayfinder_protos::wayfinder::v1alpha::PingSession;
 use wayfinder_protos::wayfinder::v1alpha::ResolveRouteResponse;
 use wayfinder_protos::wayfinder::v1alpha::RoutingTable;
 use wayfinder_protos::wayfinder::v1alpha::Throughput;
@@ -323,6 +326,98 @@ pub fn resolve(v: &ResolveRouteResponse, fmt: OutputFormat) -> anyhow::Result<St
         };
         format!("next_hop: {}\negress: {}", format_mac(&v.next_hop), egress)
     })
+}
+
+/// One resolved probe, as `ping(8)` would print it.
+///
+/// Only ever called for a probe that has stopped being pending, so the two
+/// arms below cover everything an operator can see; a still-pending row has no
+/// line yet, which is what makes the streaming output append-only.
+pub fn ping_probe(probe: &PingProbe, destination: &str, payload_bytes: u32) -> String {
+    match probe.state() {
+        PingProbeState::Replied => format!(
+            "{payload_bytes} bytes from {destination}: seq={} hops={}/{} time={}",
+            probe.seqno,
+            probe.forward_hops,
+            probe.return_hops,
+            format_rtt(probe.rtt_us),
+        ),
+        PingProbeState::NoRoute => {
+            format!("no route to {destination}: seq={}", probe.seqno)
+        }
+        // A timeout, and anything a newer node might report that this build
+        // does not know: both mean "no answer", which is the honest thing to
+        // print rather than dropping the row.
+        _ => format!("no answer from {destination}: seq={}", probe.seqno),
+    }
+}
+
+/// A round trip in milliseconds, at the precision the number deserves.
+///
+/// Sub-millisecond round trips are real on a local link and would all render
+/// as `0.0 ms`, which reads as a broken measurement rather than a fast one.
+fn format_rtt(rtt_us: u32) -> String {
+    let ms = f64::from(rtt_us) / 1000.0;
+    if ms < 1.0 {
+        format!("{ms:.3} ms")
+    } else {
+        format!("{ms:.1} ms")
+    }
+}
+
+/// Render a whole [`PingSession`] the way `ping` signs off: the per-probe lines,
+/// then the statistics block.
+pub fn ping(v: &PingSession, fmt: OutputFormat) -> anyhow::Result<String> {
+    render(v, fmt, |v| {
+        let destination = format_mac(&v.destination);
+        let mut out = String::new();
+        for probe in &v.probes {
+            if probe.state() == PingProbeState::Pending {
+                continue;
+            }
+            out.push_str(&ping_probe(probe, &destination, v.payload_bytes));
+            out.push('\n');
+        }
+        out.push_str(&ping_summary(v));
+        out
+    })
+}
+
+/// The statistics block `ping` prints when it stops.
+///
+/// The RTT line is omitted entirely when nothing was answered, rather than
+/// printed as zeros: `0.0/0.0/0.0` is a measurement, and "we measured nothing"
+/// is not one.
+pub fn ping_summary(v: &PingSession) -> String {
+    let destination = format_mac(&v.destination);
+    let loss = if v.sent == 0 {
+        0.0
+    } else {
+        f64::from(v.lost) * 100.0 / f64::from(v.sent)
+    };
+    let mut out = format!(
+        "\n--- {destination} ping statistics ---\n\
+         {} probes attempted, {} received, {loss:.0}% loss",
+        v.sent, v.received,
+    );
+    if v.received > 0 {
+        out.push_str(&format!(
+            "\nrtt min/avg/max/mdev = {}/{}/{}/{}",
+            format_rtt(v.rtt_min_us),
+            format_rtt(v.rtt_avg_us),
+            format_rtt(v.rtt_max_us),
+            format_rtt(v.rtt_mdev_us),
+        ));
+    }
+    out
+}
+
+/// The banner `ping` opens with, before any probe has resolved.
+pub fn ping_banner(destination: &[u8], payload_bytes: u32, count: u32) -> String {
+    format!(
+        "PING {} ({payload_bytes} data bytes, {count} probes)",
+        format_mac(destination)
+    )
 }
 
 /// Render a [`GetSecurityStatusResponse`]: the mesh header then a per-originator
@@ -728,5 +823,120 @@ mod tests {
         };
         let out = security(&v, OutputFormat::Json).unwrap();
         assert!(out.contains(&T.to_string()), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod ping_tests {
+    use super::*;
+
+    fn probe(seqno: u32, state: PingProbeState, rtt_us: u32) -> PingProbe {
+        PingProbe {
+            seqno,
+            state: state as i32,
+            rtt_us,
+            forward_hops: 2,
+            return_hops: 3,
+        }
+    }
+
+    fn session(probes: Vec<PingProbe>, sent: u32, received: u32, lost: u32) -> PingSession {
+        PingSession {
+            session_seq: 1,
+            destination: vec![0, 0, 0, 0, 0, 9],
+            active: false,
+            requested: sent,
+            sent,
+            received,
+            lost,
+            rtt_min_us: 10_000,
+            rtt_avg_us: 12_000,
+            rtt_max_us: 15_000,
+            rtt_mdev_us: 2_000,
+            payload_bytes: 16,
+            probes,
+        }
+    }
+
+    /// A replied probe reports both legs of the path separately, because they
+    /// are routinely different lengths on a mesh.
+    #[test]
+    fn a_replied_probe_reports_both_path_lengths() {
+        let line = ping_probe(
+            &probe(0, PingProbeState::Replied, 12_400),
+            "00:00:00:00:00:09",
+            16,
+        );
+        assert_eq!(
+            line,
+            "16 bytes from 00:00:00:00:00:09: seq=0 hops=2/3 time=12.4 ms"
+        );
+    }
+
+    /// A sub-millisecond round trip is a real measurement on a local link, and
+    /// must not round to `0.0 ms` — which reads as broken rather than fast.
+    #[test]
+    fn a_sub_millisecond_round_trip_keeps_its_precision() {
+        let line = ping_probe(&probe(0, PingProbeState::Replied, 420), "peer", 16);
+        assert!(line.ends_with("time=0.420 ms"), "got: {line}");
+    }
+
+    /// "I could not try" and "I tried and heard nothing" are different answers
+    /// and an operator acts on them differently, so they print differently.
+    #[test]
+    fn an_unreachable_target_reads_differently_from_a_silent_one() {
+        let no_route = ping_probe(&probe(1, PingProbeState::NoRoute, 0), "peer", 16);
+        let timed_out = ping_probe(&probe(2, PingProbeState::TimedOut, 0), "peer", 16);
+        assert_eq!(no_route, "no route to peer: seq=1");
+        assert_eq!(timed_out, "no answer from peer: seq=2");
+        assert_ne!(no_route, timed_out);
+    }
+
+    /// The statistics block, and the case that makes the loss arithmetic worth
+    /// testing: partial loss over a session where not every probe came back.
+    #[test]
+    fn the_summary_reports_loss_and_the_rtt_spread() {
+        let s = session(vec![], 4, 3, 1);
+        let out = ping_summary(&s);
+        assert!(
+            out.contains("4 probes attempted, 3 received, 25% loss"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("rtt min/avg/max/mdev = 10.0 ms/12.0 ms/15.0 ms/2.0 ms"),
+            "got: {out}"
+        );
+    }
+
+    /// With nothing answered there is no RTT line at all. Printing
+    /// `0.0/0.0/0.0` would be reporting a measurement that was never taken.
+    #[test]
+    fn a_session_with_no_replies_prints_no_rtt_line() {
+        let mut s = session(vec![], 3, 0, 3);
+        s.rtt_min_us = 0;
+        s.rtt_avg_us = 0;
+        s.rtt_max_us = 0;
+        s.rtt_mdev_us = 0;
+        let out = ping_summary(&s);
+        assert!(out.contains("3 probes attempted, 0 received, 100% loss"));
+        assert!(!out.contains("rtt min/avg/max"), "got: {out}");
+    }
+
+    /// A probe still in flight has no line yet — which is what lets the
+    /// streaming output be append-only rather than redrawn.
+    #[test]
+    fn a_pending_probe_contributes_no_line() {
+        let s = session(
+            vec![
+                probe(0, PingProbeState::Replied, 12_000),
+                probe(1, PingProbeState::Pending, 0),
+            ],
+            2,
+            1,
+            0,
+        );
+        let out = ping(&s, OutputFormat::Human).unwrap();
+        assert!(out.contains("seq=0"), "got: {out}");
+        assert!(!out.contains("seq=1"), "got: {out}");
     }
 }

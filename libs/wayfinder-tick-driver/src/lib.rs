@@ -46,6 +46,7 @@ use wayfinder_driver_core::plan_dispatch;
 use wayfinder_driver_core::poll_due_challenges;
 use wayfinder_driver_core::poll_due_keepalives;
 use wayfinder_driver_core::poll_due_ogms;
+use wayfinder_driver_core::poll_due_pings;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
@@ -324,6 +325,10 @@ impl Driver {
         // neighbours are currently unproven. The router spaces retries per
         // neighbour, so ticking often does not mean challenging often.
         poll_due_challenges(&mut self.router, now, &mut self.tx_buffer, &mut stage);
+        // Unconditional for the same reason: a probe is owed to a session the
+        // caller started, not to a schedule the caller steps. The router paces
+        // it from `now`, so ticking often does not mean probing often.
+        poll_due_pings(&mut self.router, now, &mut self.tx_buffer, &mut stage);
 
         for staged in stage.frames.drain(..) {
             self.dispatch_one(now, staged);

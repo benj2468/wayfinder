@@ -930,6 +930,15 @@ mod tests {
                 ReqKind::SetAuth(_)
                     | ReqKind::SetConfig(_)
                     | ReqKind::SetLogLevel(_)
+                    // Starting a ping is not the read its status is. It puts
+                    // frames on the air at a cadence the caller chooses, and
+                    // takes the node's one session slot away from whoever held
+                    // it — a read-only grant that could do either would be
+                    // read-only in name. `PingStatus` beside it is a genuine
+                    // query and stays open to a viewer: "can this node reach
+                    // that one" is the question the tier exists to answer.
+                    | ReqKind::Ping(_)
+                    | ReqKind::CancelPing(_)
                     | ReqKind::SubmitCsr(_)
                     | ReqKind::RevokeNode(_)
                     | ReqKind::ApproveCsr(_)

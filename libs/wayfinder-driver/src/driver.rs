@@ -667,6 +667,11 @@ impl<Local: FrameIo> Driver<Local> {
                         .next_challenge_after(now)
                         .unwrap_or(Duration::MAX),
                 )
+                // And a running ping session's, for the same reason: a probe
+                // that waits for the OGM deadline on a settled mesh has timed
+                // out before its turn comes, so a working path would read as
+                // totally lossy.
+                .min(guard.router.next_ping_after(now).unwrap_or(Duration::MAX))
         };
 
         // Cloned before the destructure below, which borrows `self`: an `Arc`
@@ -820,13 +825,20 @@ impl<Local: FrameIo> Driver<Local> {
                     // arm — which does *not* sleep — stamps proofs with, so the
                     // two would disagree about how old a proof is.
                     let now = start.elapsed();
-                    trace!("polling OGMs, keep-alives and next-hop challenges");
+                    trace!("polling OGMs, keep-alives, next-hop challenges and probes");
                     let mut out = LoopOutput::none();
                     let mut guard = shared.write().await;
                     let router = &mut guard.router;
+                    // Spelled out rather than `poll_due_all` because this arm
+                    // holds a write guard it must not give up between calls.
+                    // Every schedule the sleep above folded into `next_due`
+                    // must appear here: one left out is a deadline that wakes
+                    // the loop and is then not serviced, which for a probe
+                    // session is a busy-spin — its deadline stays due forever.
                     wayfinder_driver_core::poll_due_ogms(router, now, tx_buffer, &mut out);
                     wayfinder_driver_core::poll_due_keepalives(router, now, tx_buffer, &mut out);
                     wayfinder_driver_core::poll_due_challenges(router, now, tx_buffer, &mut out);
+                    wayfinder_driver_core::poll_due_pings(router, now, tx_buffer, &mut out);
                     drop(guard);
                     (now, out)
                 }

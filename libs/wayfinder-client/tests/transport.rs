@@ -27,6 +27,8 @@ use wayfinder_protos::service::LogsData;
 use wayfinder_protos::service::NeighborPathData;
 use wayfinder_protos::service::NodeMetricsData;
 use wayfinder_protos::service::OgmScheduleEntryData;
+use wayfinder_protos::service::PingSessionData;
+use wayfinder_protos::service::PingStartData;
 use wayfinder_protos::service::RegistrationStartedData;
 use wayfinder_protos::service::RouteResolutionData;
 use wayfinder_protos::service::RouterReads;
@@ -183,6 +185,13 @@ impl RouterReads for Mock {
         })
     }
 
+    /// This mock runs no ping session, and says so rather than
+    /// fabricating one — a handle that always resolved would hide exactly
+    /// the displaced-session case the handle exists to expose.
+    fn ping_session(&self, _session_seq: u32) -> Option<PingSessionData> {
+        None
+    }
+
     fn runtime_config_active(&self) -> bool {
         false
     }
@@ -235,6 +244,40 @@ impl RouterWrites for Mock {
 
     fn set_config(&mut self, _config: RuntimeConfigData) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Accepts a session and echoes back what was asked for, defaulting
+    /// zeroes the way a real node does, but never emits anything: there is
+    /// no mesh behind this mock to probe.
+    fn start_ping(
+        &mut self,
+        destination: &[u8],
+        count: u32,
+        interval_ms: u32,
+        timeout_ms: u32,
+        payload_bytes: u32,
+    ) -> Result<PingStartData, String> {
+        if destination.len() != 6 {
+            return Err("destination must be a 6-byte node identifier".into());
+        }
+        Ok(PingStartData {
+            session_seq: 1,
+            count: if count == 0 { 5 } else { count },
+            interval_ms: if interval_ms == 0 { 1_000 } else { interval_ms },
+            timeout_ms: if timeout_ms == 0 { 5_000 } else { timeout_ms },
+            payload_bytes: if payload_bytes == 0 {
+                16
+            } else {
+                payload_bytes
+            },
+        })
+    }
+
+    /// Nothing to cancel: these mocks run no session. Distinct from a mock
+    /// that cancelled anything asked of it, which would hide the wrong-handle
+    /// case the handle exists to catch.
+    fn cancel_ping(&mut self, _session_seq: u32) -> Option<PingSessionData> {
+        None
     }
 
     fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
@@ -366,6 +409,30 @@ async fn assert_full_roundtrip(client: &mut Client) {
     let route = client.resolve_route(vec![0, 0, 0, 0, 0, 2]).await.unwrap();
     assert_eq!(format_mac(&route.next_hop), "00:00:00:00:00:03");
     assert_eq!(route.egress, Some(Egress::InterfaceIndex(0)));
+
+    // Both halves of the ping surface round-trip: a write that hands back a
+    // handle, and the read that presents it. The mock runs no session, so
+    // polling that handle answers "gone" — which is not an error, and is the
+    // signal a client stops on rather than a failure it reports.
+    let started = client
+        .ping(vec![0, 0, 0, 0, 0, 2], 0, 0, 0, 0)
+        .await
+        .unwrap();
+    assert_ne!(started.session_seq, 0, "a handle is always issued");
+    assert_eq!(
+        started.count, 5,
+        "the node's defaults come back, not our zeros"
+    );
+    assert_eq!(started.interval_ms, 1_000);
+    assert_eq!(started.timeout_ms, 5_000);
+    assert_eq!(started.payload_bytes, 16);
+
+    let status = client.ping_status(started.session_seq).await.unwrap();
+    assert!(status.session.is_none());
+
+    // A destination that is not a node identifier is refused rather than
+    // silently probing a truncated address.
+    assert!(client.ping(vec![1, 2, 3], 0, 0, 0, 0).await.is_err());
 
     // A provider RPC also round-trips over this transport (exercises the new
     // GetTrustAnchor request/response framing).

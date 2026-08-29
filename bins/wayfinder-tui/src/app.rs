@@ -19,6 +19,7 @@ use wayfinder_protos::wayfinder::v1alpha::NodeInfo;
 use wayfinder_protos::wayfinder::v1alpha::NodeMetrics;
 use wayfinder_protos::wayfinder::v1alpha::NodeSecurity;
 use wayfinder_protos::wayfinder::v1alpha::OgmSchedule;
+use wayfinder_protos::wayfinder::v1alpha::PingSession;
 use wayfinder_protos::wayfinder::v1alpha::RoutingTable;
 use wayfinder_protos::wayfinder::v1alpha::Throughput;
 
@@ -142,6 +143,45 @@ pub enum SecurityFocus {
     PendingCsrs,
     /// The originator table (revoke).
     Originators,
+}
+
+/// What the TUI knows about a ping session it started.
+///
+/// The node runs the session; this is the handle plus the last status read.
+/// `destination` is kept alongside because the node's answer can go away —
+/// another client displacing our session, or the node restarting — and the
+/// panel still has to say *which* target the run it is reporting was against.
+pub struct PingView {
+    /// The handle the node issued, presented on every status poll.
+    pub session_seq: u32,
+    /// The node being pinged, as raw identifier bytes.
+    pub destination: Vec<u8>,
+    /// The last status read, or `None` before the first one lands.
+    pub session: Option<PingSession>,
+    /// Set once the node stops recognising our handle — it was displaced by
+    /// another client's ping, or the node restarted. Distinct from "no session
+    /// yet": the panel says so rather than showing a stale summary as though it
+    /// were still live.
+    pub displaced: bool,
+    /// The last error reading this session's status, if any.
+    ///
+    /// Kept on the view rather than surfaced as the app-wide `last_error`,
+    /// which is what the connection indicator reads: a diagnostic panel that
+    /// could report the node as *disconnected* — and, by aborting the refresh,
+    /// freeze every other tab — would be able to take the dashboard down. It is
+    /// a panel; it fails inside its own borders.
+    pub error: Option<String>,
+}
+
+impl PingView {
+    /// Whether this view still needs polling: it stops once the session
+    /// finishes or the node stops recognising the handle.
+    ///
+    /// Without this the TUI would issue a `PingStatus` every tick for the life
+    /// of the process, long after the run it was watching had ended.
+    pub fn needs_poll(&self) -> bool {
+        !self.displaced && self.session.as_ref().is_none_or(|s| s.active)
+    }
 }
 
 /// The latest successful snapshot of router state.
@@ -310,6 +350,20 @@ pub struct App {
     /// `pending_action` this is set (and executed) directly on keypress, with
     /// no confirmation step.
     pub pending_link_feature_toggle: Option<LinkFeatureToggle>,
+    /// A session handle to cancel, queued by [`App::cancel_ping`] and taken by
+    /// the event loop. Carries the handle rather than a flag because by the
+    /// time the loop acts, `ping` may already have been replaced by a newer
+    /// session — cancelling *that* one would stop a run the operator had just
+    /// started.
+    pub pending_ping_cancel: Option<u32>,
+    /// A destination to start pinging, queued by [`App::start_ping`] on the
+    /// Routing tab and taken by the event loop (only it owns the client).
+    /// Executed directly on keypress like the gate toggle above: a ping is
+    /// cheap, reversible by starting another, and asking an operator to confirm
+    /// a diagnostic would be friction with nothing behind it.
+    pub pending_ping: Option<Vec<u8>>,
+    /// The ping session this client has running, if any.
+    pub ping: Option<PingView>,
     /// Rolling history of node-wide throughput totals, oldest first, capped at
     /// [`THROUGHPUT_HISTORY`] samples. Drives the Metrics tab RX/TX line chart.
     pub throughput_history: VecDeque<ThroughputSample>,
@@ -344,6 +398,9 @@ impl App {
             confirm: None,
             pending_action: None,
             pending_link_feature_toggle: None,
+            pending_ping: None,
+            pending_ping_cancel: None,
+            ping: None,
             throughput_history: VecDeque::with_capacity(THROUGHPUT_HISTORY),
             last_error: None,
             last_update: None,
@@ -533,6 +590,62 @@ impl App {
         let security = self.snapshot.security.as_ref()?;
         let idx = self.security_state.selected()?;
         security.nodes.get(idx).map(|n| n.node_id.clone())
+    }
+
+    /// The destination of the currently-selected originator on the Routing tab,
+    /// if there is one.
+    pub fn selected_destination(&self) -> Option<Vec<u8>> {
+        let idx = self.routing_state.selected()?;
+        self.snapshot
+            .routing
+            .entries
+            .get(idx)
+            .map(|e| e.destination.clone())
+    }
+
+    /// Queue a ping against the currently-selected originator, for the event
+    /// loop to start. A no-op unless the Routing tab is focused with a row
+    /// selected.
+    ///
+    /// Deliberately reachable from the Routing tab rather than from a tab of
+    /// its own: "can I actually reach this?" is a question about a row an
+    /// operator is already looking at, and the answer belongs beside the
+    /// believed path it is checking.
+    pub fn start_ping(&mut self) {
+        if self.tab != Tab::Routing {
+            return;
+        }
+        let Some(destination) = self.selected_destination() else {
+            return;
+        };
+        self.pending_ping = Some(destination);
+    }
+
+    /// Queue a cancel for the running session, for the event loop to send.
+    ///
+    /// A no-op when there is nothing running: a session that has already
+    /// finished needs no stopping, and queueing one anyway would spend a
+    /// management round trip to be told so.
+    pub fn cancel_ping(&mut self) {
+        let Some(view) = self.ping.as_ref() else {
+            return;
+        };
+        if !view.needs_poll() {
+            return;
+        }
+        self.pending_ping_cancel = Some(view.session_seq);
+    }
+
+    /// Whether the ping panel is reporting on `destination` — i.e. the session
+    /// this client holds is against the row the operator is looking at.
+    ///
+    /// The panel shows a hint rather than a session when this is false, so
+    /// moving the selection never leaves another target's round trips sitting
+    /// under the wrong row.
+    pub fn ping_is_for(&self, destination: &[u8]) -> bool {
+        self.ping
+            .as_ref()
+            .is_some_and(|p| p.destination == destination)
     }
 
     /// Switch navigation focus between the two Security-tab panels.  A no-op
@@ -1232,5 +1345,155 @@ mod tests {
         app.move_selection(1);
         // Routing selection is untouched while on the overview tab.
         assert_eq!(app.routing_state.selected(), None);
+    }
+
+    /// `p` on the Routing tab queues a ping against the highlighted originator
+    /// — the one action reachable from that tab, and the whole of issue #25's
+    /// ask for the TUI.
+    #[test]
+    fn p_on_the_routing_tab_queues_a_ping_for_the_selection() {
+        let mut app = App::new("test".to_string(), 1000);
+        app.tab = Tab::Routing;
+        app.snapshot.routing = RoutingTable {
+            entries: vec![
+                routing_entry(vec![0, 0, 0, 0, 0, 8]),
+                routing_entry(vec![0, 0, 0, 0, 0, 9]),
+            ],
+        };
+        app.routing_state.select(Some(1));
+
+        app.start_ping();
+        assert_eq!(app.pending_ping, Some(vec![0, 0, 0, 0, 0, 9]));
+    }
+
+    /// Off the Routing tab it is inert, which is what lets `p` keep its other
+    /// meaning as the Links tab's rx-OGM toggle without the two colliding.
+    #[test]
+    fn starting_a_ping_is_inert_off_the_routing_tab() {
+        let mut app = App::new("test".to_string(), 1000);
+        app.tab = Tab::Links;
+        app.snapshot.routing = RoutingTable {
+            entries: vec![routing_entry(vec![0, 0, 0, 0, 0, 9])],
+        };
+        app.routing_state.select(Some(0));
+
+        app.start_ping();
+        assert_eq!(app.pending_ping, None);
+    }
+
+    /// And inert with nothing selected: there is no destination to ping.
+    #[test]
+    fn starting_a_ping_needs_a_selected_row() {
+        let mut app = App::new("test".to_string(), 1000);
+        app.tab = Tab::Routing;
+        app.start_ping();
+        assert_eq!(app.pending_ping, None);
+    }
+
+    /// The panel is only ever shown for the row it is about. This is the check
+    /// that keeps one target's round trips from being read as another's.
+    #[test]
+    fn a_session_belongs_only_to_its_own_destination() {
+        let mut app = App::new("test".to_string(), 1000);
+        assert!(!app.ping_is_for(&[0, 0, 0, 0, 0, 9]), "no session at all");
+
+        app.ping = Some(PingView {
+            session_seq: 1,
+            destination: vec![0, 0, 0, 0, 0, 9],
+            session: None,
+            displaced: false,
+            error: None,
+        });
+        assert!(app.ping_is_for(&[0, 0, 0, 0, 0, 9]));
+        assert!(!app.ping_is_for(&[0, 0, 0, 0, 0, 8]));
+    }
+
+    /// A minimal routing row for the tests above.
+    fn routing_entry(destination: Vec<u8>) -> wayfinder_protos::wayfinder::v1alpha::RoutingEntry {
+        wayfinder_protos::wayfinder::v1alpha::RoutingEntry {
+            destination,
+            next_hop: vec![0, 0, 0, 0, 0, 2],
+            tq: 200,
+            last_seqno: 1,
+            paths: vec![],
+        }
+    }
+
+    /// `c` on the Routing tab queues a cancel for the running session, carrying
+    /// the handle so a session started in the meantime cannot be stopped by it.
+    #[test]
+    fn c_on_the_routing_tab_queues_a_cancel_for_the_running_session() {
+        let mut app = App::new("test".to_string(), 1000);
+        app.tab = Tab::Routing;
+        app.ping = Some(PingView {
+            session_seq: 7,
+            destination: vec![0, 0, 0, 0, 0, 9],
+            session: None,
+            displaced: false,
+            error: None,
+        });
+
+        app.cancel_ping();
+        assert_eq!(app.pending_ping_cancel, Some(7));
+    }
+
+    /// Nothing running, nothing to cancel — queueing one anyway would spend a
+    /// management round trip to be told so.
+    #[test]
+    fn cancelling_with_no_session_is_inert() {
+        let mut app = App::new("test".to_string(), 1000);
+        app.tab = Tab::Routing;
+        app.cancel_ping();
+        assert_eq!(app.pending_ping_cancel, None);
+    }
+
+    /// A finished session needs no stopping either.
+    #[test]
+    fn cancelling_a_finished_session_is_inert() {
+        let mut app = App::new("test".to_string(), 1000);
+        app.tab = Tab::Routing;
+        app.ping = Some(PingView {
+            session_seq: 7,
+            destination: vec![0, 0, 0, 0, 0, 9],
+            session: Some(finished_session()),
+            displaced: false,
+            error: None,
+        });
+
+        app.cancel_ping();
+        assert_eq!(app.pending_ping_cancel, None);
+    }
+
+    /// A session the node no longer knows must not be polled — nor cancelled,
+    /// since the handle would name somebody else's run if it named anything.
+    #[test]
+    fn a_displaced_session_needs_no_further_polling() {
+        let view = PingView {
+            session_seq: 7,
+            destination: vec![0, 0, 0, 0, 0, 9],
+            session: None,
+            displaced: true,
+            error: None,
+        };
+        assert!(!view.needs_poll());
+    }
+
+    /// A minimal finished session for the tests above.
+    fn finished_session() -> PingSession {
+        PingSession {
+            session_seq: 7,
+            destination: vec![0, 0, 0, 0, 0, 9],
+            active: false,
+            requested: 1,
+            sent: 1,
+            received: 1,
+            lost: 0,
+            rtt_min_us: 1,
+            rtt_avg_us: 1,
+            rtt_max_us: 1,
+            rtt_mdev_us: 0,
+            payload_bytes: 16,
+            probes: Vec::new(),
+        }
     }
 }

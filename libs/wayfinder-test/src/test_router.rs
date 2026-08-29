@@ -209,6 +209,17 @@ impl TestRouter {
         self.router().next_broadcast_after(now)
     }
 
+    /// Time until this node's running probe session next needs servicing, as
+    /// of `now`, or `None` when it has no unfinished session.
+    ///
+    /// Folded into the harness's clock advance for the same reason the real
+    /// driver shells fold it into their sleep: without it a probe's cadence is
+    /// whatever the OGM schedule happens to be, so a test would be measuring
+    /// the Trickle timer rather than the ping.
+    pub fn next_ping_after(&self, now: Duration) -> Option<Duration> {
+        self.router().next_ping_after(now)
+    }
+
     /// Time until this node's soonest interface is next due to emit a
     /// keep-alive, as of `now`.
     pub fn next_keepalive_after(&self, now: Duration) -> Duration {

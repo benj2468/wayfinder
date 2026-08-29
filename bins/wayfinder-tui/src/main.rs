@@ -118,6 +118,14 @@ async fn run(
                         if app.logs.pending_filter.is_some() {
                             act_log_filter(&mut client, &target, &mut app).await;
                         }
+                        // And a ping queued from the Routing tab, or a cancel
+                        // for the one already running.
+                        if app.pending_ping.is_some() {
+                            act_ping(&mut client, &target, &mut app).await;
+                        }
+                        if app.pending_ping_cancel.is_some() {
+                            act_ping_cancel(&mut client, &target, &mut app).await;
+                        }
                     }
                     Some(_) => {}
                     None => app.running = false, // input thread died
@@ -232,6 +240,17 @@ fn handle_key(app: &mut App, code: KeyCode) {
         // tx/rx gates, t/u pair the data tx/rx gates. Inert off the Links tab
         // or without a selection (checked inside `toggle_link_feature`).
         KeyCode::Char('o') => app.toggle_link_feature(app::LinkFeatureGate::TxOgm),
+        // Routing tab: ping the selected originator — "the table believes this
+        // path exists; does it work?" — started immediately, like the gate
+        // toggles and for the same reason. `p` is the Links tab's rx-OGM
+        // toggle below; the two cannot collide, since each is a no-op off its
+        // own tab, but the guard says so rather than leaving it to be
+        // rediscovered by whoever next reads this list.
+        KeyCode::Char('p') if app.tab == app::Tab::Routing => app.start_ping(),
+        // And stop it. The node owns the session, so leaving the panel — or the
+        // dashboard — does not end it; without a key for this an operator can
+        // start a run they cannot call off.
+        KeyCode::Char('c') if app.tab == app::Tab::Routing => app.cancel_ping(),
         KeyCode::Char('p') => app.toggle_link_feature(app::LinkFeatureGate::RxOgm),
         KeyCode::Char('t') => app.toggle_link_feature(app::LinkFeatureGate::TxData),
         KeyCode::Char('u') => app.toggle_link_feature(app::LinkFeatureGate::RxData),
@@ -415,6 +434,113 @@ async fn act_link_feature(client: &mut Option<Client>, target: &ConnectTarget, a
     }
 }
 
+/// Start the ping queued by the Routing tab's `p`, keeping the handle the node
+/// issues so [`fetch`] can poll it.
+///
+/// The node runs the session; this only starts it and remembers the handle.
+/// Starting one displaces whatever session the node was running — including one
+/// this client started against a different target — so the previous view is
+/// dropped outright rather than left to look live.
+async fn act_ping(client: &mut Option<Client>, target: &ConnectTarget, app: &mut App) {
+    let Some(destination) = app.pending_ping.take() else {
+        return;
+    };
+    if client.is_none() {
+        match target.connect().await {
+            Ok(c) => *client = Some(c),
+            Err(e) => {
+                app.connected = false;
+                app.last_error = Some(format!("connect: {e}"));
+                return;
+            }
+        }
+    }
+
+    let result = {
+        #[expect(
+            clippy::expect_used,
+            reason = "the branch above just set client to Some(_) whenever it was None"
+        )]
+        let conn = client.as_mut().expect("client connected above");
+        // Zeros throughout: the node owns the defaults, and a dashboard that
+        // substituted its own would be answering a question the node has
+        // already answered — and answering it differently on every client.
+        conn.ping(destination.clone(), 0, 0, 0, 0).await
+    };
+
+    match result {
+        Ok(started) => {
+            app.last_error = None;
+            app.ping = Some(app::PingView {
+                session_seq: started.session_seq,
+                destination,
+                session: None,
+                displaced: false,
+                error: None,
+            });
+            refresh(client, target, app).await;
+        }
+        Err(e) => {
+            app.last_error = Some(format!("ping failed: {e}"));
+            *client = None; // force reconnect next tick
+        }
+    }
+}
+
+/// Stop the session queued by the Routing tab's `c`.
+///
+/// Failure is reported in the ping panel rather than as `last_error`, for the
+/// same reason the status poll is: this is a diagnostic the operator opted
+/// into, and it must not be able to report the node as disconnected or freeze
+/// the tabs beside it.
+async fn act_ping_cancel(client: &mut Option<Client>, target: &ConnectTarget, app: &mut App) {
+    let Some(session_seq) = app.pending_ping_cancel.take() else {
+        return;
+    };
+    if client.is_none() {
+        match target.connect().await {
+            Ok(c) => *client = Some(c),
+            Err(e) => {
+                app.connected = false;
+                app.last_error = Some(format!("connect: {e}"));
+                return;
+            }
+        }
+    }
+
+    let result = {
+        #[expect(
+            clippy::expect_used,
+            reason = "the branch above just set client to Some(_) whenever it was None"
+        )]
+        let conn = client.as_mut().expect("client connected above");
+        conn.cancel_ping(session_seq).await
+    };
+
+    match result {
+        Ok(cancelled) => {
+            // Only if the view is still the one that was cancelled: the
+            // operator may have started a fresh session in the meantime, and
+            // overwriting it with the stopped one's final state would show a
+            // running ping as finished.
+            if let Some(view) = app.ping.as_mut()
+                && view.session_seq == session_seq
+            {
+                view.error = None;
+                match cancelled.session {
+                    Some(session) => view.session = Some(session),
+                    None => view.displaced = true,
+                }
+            }
+        }
+        Err(e) => {
+            if let Some(view) = app.ping.as_mut() {
+                view.error = Some(format!("cancel failed: {e}"));
+            }
+        }
+    }
+}
+
 /// Issue all three queries and fold the results into the snapshot.
 async fn fetch(conn: &mut Client, app: &mut App) -> anyhow::Result<()> {
     app.snapshot.node_info = Some(conn.node_info().await?);
@@ -434,6 +560,34 @@ async fn fetch(conn: &mut Client, app: &mut App) -> anyhow::Result<()> {
     // badge that reports it is on screen whichever tab is showing, so a stale
     // board would be a node saying "all normal" from a tab that never asked.
     app.snapshot.alarms = conn.alarms().await?;
+
+    // Poll the ping session this client started, if it still holds one. An
+    // unset `session` means the node no longer recognises our handle — another
+    // client's ping displaced it, or the node restarted — which is reported as
+    // such rather than by clearing the panel: an operator who just watched a
+    // run half-finish needs to know it was taken away, not to see it vanish.
+    if let Some(view) = app.ping.as_mut()
+        && view.needs_poll()
+    {
+        // Deliberately not `?`. Every other read here aborts the refresh on
+        // error, which marks the node disconnected and freezes the remaining
+        // tabs — right for the node's own state, wrong for a diagnostic panel
+        // an operator opted into. A ping that cannot be read says so in its own
+        // pane and leaves the dashboard alone.
+        match conn.ping_status(view.session_seq).await {
+            Ok(status) => {
+                view.error = None;
+                match status.session {
+                    Some(session) => {
+                        view.session = Some(session);
+                        view.displaced = false;
+                    }
+                    None => view.displaced = true,
+                }
+            }
+            Err(e) => view.error = Some(e.to_string()),
+        }
+    }
 
     // Polled every tick regardless of which tab is showing, so switching to the
     // Logs tab presents the history that accumulated while it was hidden rather

@@ -30,6 +30,17 @@ BATMAN-adv routing protocol implementation. `no_std`, heapless. Implements
   listener), routed toward `dest` like a unicast.
 - `BatmanBroadcastPacket` — TTL-limited, seqno-deduplicated flooded broadcasts
   (e.g. ARP).
+- `BatmanEchoPacket` — the reachability-probe pair (`EchoRequest`/`EchoReply`),
+  the mesh's `ping`: no IP addresses here, so no ICMP. One header serves both
+  halves, since a reply is the request with the addresses swapped and the hop
+  counters carried forward. Routed toward `dest` like a unicast, with the one
+  thing no other packet type does — **each relay increments `hops`**, so a probe
+  carries its own path length home. `req_hops` is the forward count, frozen by
+  the responder into the reply, and `hops` counts the leg in hand; both are
+  reported because mesh paths are routinely asymmetric. No transmit timestamp on
+  the wire: the originating node owns the ping session and already knows when it
+  sent sequence *n*, so timing comes from local state rather than from bytes a
+  peer handed back.
 - `Trickle` (`trickle.rs`) — adaptive OGM emission timer (after RFC 6206). The
   interval doubles from `i_min` toward `i_max` while the topology is stable and
   snaps back to `i_min` on any inconsistency (new originator, changed next hop,
@@ -41,7 +52,8 @@ BATMAN-adv routing protocol implementation. `no_std`, heapless. Implements
 Protocol constants: `ETH_P_BATMAN` (0x4305) and the `BatmanPacketType`
 `#[repr(u8)]` enum — `Ogm` (0x01), `Bcast` (0x02), `Unicast` (0x03), `Mcast`
 (0x04), `CertReq` (0x05), `CertReply` (0x06), `Keepalive` (0x07),
-`NextHopChallenge` (0x08), `NextHopResponse` (0x09). Modelled as an
+`NextHopChallenge` (0x08), `NextHopResponse` (0x09), `EchoRequest` (0x0a),
+`EchoReply` (0x0b). Modelled as an
 enum (not free consts) so the compiler guarantees the type bytes are unique;
 `as_u8()` is the wire byte, `from_u8()` decodes a received one (`None` = a type
 this build doesn't know, routed by destination). Header structs keep
@@ -99,6 +111,16 @@ link-local by construction (`BatmanNextHopChallengePacket` /
 the pairwise key material the nonce and tag are checked against, keeping the
 engine free of any crypto dependency. See `libs/wayfinder`'s `OgmAuth` and
 `docs/design/09-mesh-auth-gaps.md` §4.
+
+**Reachability probes** (`handle_rx`, `EchoRequest`/`EchoReply` arms →
+`handle_echo`): the `handle_cert_req` twin — delivered locally at `dest` (a
+request so the router can answer it, a reply so the router can credit it),
+relayed toward the next live hop otherwise, dropped at `ttl <= 1`. The relay
+also increments `hops`, saturating rather than wrapping: a rolled-over count
+would report a two-hop path as a 258-hop one, and `ttl` is what actually bounds
+the relay. Measurement-free at this layer, in the same spirit as `handle_cert_req`
+being crypto-free — what a probe *means* (a session, an interval, a round-trip
+time) lives in `libs/wayfinder`'s `ping.rs`.
 
 **Unicast forwarding** (`handle_rx`, `BatmanPacketType::Unicast` arm):
 

@@ -566,6 +566,199 @@ message Alarms {
   uint64 now_ms = 3;
 }
 
+// Start a reachability-probe session against one node on the mesh — the mesh's
+// `ping`.  There are no IP addresses here, so ICMP is not available; a probe is
+// addressed to the target's node identifier and routed hop by hop like any
+// unicast, and the target answers it.
+//
+// The *node* runs the session: it paces the probes on its own timer, matches
+// the replies against its own clock, gives up on the ones that never come, and
+// keeps the statistics.  The answer to this request is a handle
+// (PingResponse.session_seq) that the caller presents to PingStatusRequest to
+// read those statistics as they accumulate.  A node runs one session at a time
+// and a new one replaces whatever was running, which is what the handle guards:
+// a caller whose session has been displaced is told so rather than shown
+// somebody else's round trips.
+//
+// Every optional setting takes 0 to mean "use the node's default", so a plain
+// ping need not restate ping(8)'s conventions.
+message PingRequest {
+  // The node to ping.  Raw identifier bytes, same encoding as NodeInfo.node_id.
+  bytes destination = 1;
+
+  // How many probes to send.  0 means the node's default; larger values are
+  // clamped to the node's cap.
+  uint32 count = 2;
+
+  // Milliseconds between probes.  0 means the node's default.
+  uint32 interval_ms = 3;
+
+  // Milliseconds a probe waits for its reply before counting as lost.  0 means
+  // the node's default, which is generous against ping(8)'s convention because
+  // the paths underneath can be: a multi-hop LoRa round trip is measured in
+  // seconds.
+  uint32 timeout_ms = 4;
+
+  // Pad bytes each probe carries, echoed back verbatim by the target — so a
+  // probe can be sized against a link's MTU.  0 means the node's default;
+  // larger values are clamped to the node's cap.
+  uint32 payload_bytes = 5;
+}
+
+// Answer to a PingRequest: the handle for the session just started, alongside
+// the settings actually in force after defaulting and clamping — so a caller
+// learns what it got rather than what it asked for.
+message PingResponse {
+  // The handle to present to PingStatusRequest.  Never zero.
+  uint32 session_seq = 1;
+
+  // Probes this session will send.
+  uint32 count = 2;
+
+  // Milliseconds between probes.
+  uint32 interval_ms = 3;
+
+  // Milliseconds a probe waits before counting as lost.
+  uint32 timeout_ms = 4;
+
+  // Pad bytes each probe carries.
+  uint32 payload_bytes = 5;
+}
+
+// Read the status of a running (or just-finished) ping session.
+message PingStatusRequest {
+  // The handle PingResponse issued.  A handle that does not match the session
+  // the node is currently running reads as unset in the response.
+  uint32 session_seq = 1;
+}
+
+// Answer to a PingStatusRequest.
+message PingStatusResponse {
+  // The session, or unset when session_seq names one this node is no longer
+  // running — it finished and was displaced by another, or the node restarted.
+  // Unset is not an error: it is how a client learns to stop polling a session
+  // that is gone, instead of reporting its successor's numbers as its own.
+  optional PingSession session = 1;
+}
+
+// Stop the running ping session.
+message CancelPingRequest {
+  // The handle PingResponse issued.  A handle that does not match the session
+  // the node is currently running cancels nothing — without that check a
+  // client whose own session had already been displaced would stop somebody
+  // else's run on its way out.
+  uint32 session_seq = 1;
+}
+
+// Answer to a CancelPingRequest.
+message CancelPingResponse {
+  // The session as it stood when it was stopped, so the client that stopped it
+  // can print the statistics for what it did measure — as ping(8) does on
+  // Ctrl+C, rather than discarding a run that already cost the airtime.
+  //
+  // Unset when session_seq names no session this node is running: it already
+  // finished, it was displaced, or it never existed.  Not an error — cancelling
+  // is what a client does while leaving, and a session that has already stopped
+  // is the outcome it wanted.
+  optional PingSession session = 1;
+}
+
+// What became of one probe.
+enum PingProbeState {
+  // Unset — never emitted by a node; present because proto3 enums must have a
+  // zero value.
+  PING_PROBE_STATE_UNSPECIFIED = 0;
+
+  // Sent, still waiting for its reply, not yet past its timeout.
+  PING_PROBE_STATE_PENDING = 1;
+
+  // Answered.  rtt_us and both hop counts are meaningful.
+  PING_PROBE_STATE_REPLIED = 2;
+
+  // Sent, and its timeout passed with no reply.  Counts as loss.
+  PING_PROBE_STATE_TIMED_OUT = 3;
+
+  // Never sent: when it fell due the node had no live route to the target.
+  // Counts as loss, and is reported apart from PING_PROBE_STATE_TIMED_OUT
+  // because the two mean different things to an operator — "I could not even
+  // try" against "I tried and heard nothing".
+  PING_PROBE_STATE_NO_ROUTE = 4;
+}
+
+// One probe's row: what was sent, and what came back.
+message PingProbe {
+  // This probe's sequence number within its session.
+  uint32 seqno = 1;
+
+  // What became of it.
+  PingProbeState state = 2;
+
+  // Round-trip time in microseconds.  Meaningful only when state is
+  // PING_PROBE_STATE_REPLIED.
+  uint32 rtt_us = 3;
+
+  // Relays the request crossed on the way out.  Meaningful only when replied.
+  uint32 forward_hops = 4;
+
+  // Relays the reply crossed on the way back.  Meaningful only when replied,
+  // and not necessarily equal to forward_hops — mesh paths are routinely
+  // asymmetric, which is why both are reported.
+  uint32 return_hops = 5;
+}
+
+// A node's ping session: what it was asked for, what has happened so far, and
+// the recent per-probe detail.
+//
+// The totals and RTT statistics cover the *whole* session; `probes` is a
+// bounded window of the most recent rows, so a long session reports exact loss
+// and timing while showing only recent detail.
+message PingSession {
+  // The handle this session was issued.
+  uint32 session_seq = 1;
+
+  // The node being pinged.  Raw identifier bytes.
+  bytes destination = 2;
+
+  // Whether the session still has work to do — probes left to send, or probes
+  // still outstanding.  A client polls until this goes false.
+  bool active = 3;
+
+  // Probes this session was asked for.
+  uint32 requested = 4;
+
+  // Probes emitted so far, including ones refused for want of a route.
+  uint32 sent = 5;
+
+  // Probes answered so far.
+  uint32 received = 6;
+
+  // Probes that timed out or had no route.
+  uint32 lost = 7;
+
+  // Smallest round trip seen, in microseconds.  0 when nothing has been
+  // answered yet, which `received == 0` distinguishes from a genuine zero.
+  uint32 rtt_min_us = 8;
+
+  // Mean round trip, in microseconds.  0 when nothing has been answered yet.
+  uint32 rtt_avg_us = 9;
+
+  // Largest round trip seen, in microseconds.  0 when nothing has been answered
+  // yet.
+  uint32 rtt_max_us = 10;
+
+  // Standard deviation of the round trips, in microseconds — ping(8)'s `mdev`.
+  // Covers the whole session, not just the rows in `probes`.  0 when nothing
+  // has been answered yet.
+  uint32 rtt_mdev_us = 11;
+
+  // Pad bytes each probe carries.
+  uint32 payload_bytes = 12;
+
+  // The recent probe rows, oldest first.  Bounded by the node's display window,
+  // which is smaller than a long session's probe count.
+  repeated PingProbe probes = 13;
+}
+
 // Request a routing decision for a hypothetical packet to `destination`,
 // mirroring what the router would compute on send.  Returns a
 // ResolveRouteResponse with the next-hop neighbor and the egress
@@ -1115,6 +1308,15 @@ message WayfinderRequest {
 
     // Read the membership certificate and trust anchor this node runs under.
     GetOwnCertRequest get_own_cert = 41;
+
+    // Start a reachability-probe session against a node on the mesh.
+    PingRequest ping = 42;
+
+    // Read the status of a running ping session.
+    PingStatusRequest ping_status = 43;
+
+    // Stop the running ping session.
+    CancelPingRequest cancel_ping = 44;
   }
 }
 
@@ -2360,5 +2562,14 @@ message WayfinderResponse {
 
     // Response to GetOwnCertRequest.
     GetOwnCertResponse own_cert = 32;
+
+    // Response to PingRequest.
+    PingResponse ping = 33;
+
+    // Response to PingStatusRequest.
+    PingStatusResponse ping_status = 34;
+
+    // Response to CancelPingRequest.
+    CancelPingResponse cancel_ping = 35;
   }
 }

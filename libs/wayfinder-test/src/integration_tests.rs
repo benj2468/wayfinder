@@ -23,6 +23,7 @@ use wayfinder::config::LinkConfig;
 use wayfinder::config::LinkFeatures;
 use wayfinder::config::LinkTransport;
 use wayfinder::config::TrickleConfig;
+use wayfinder::ping::ProbeState;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
@@ -2928,5 +2929,256 @@ fn two_fresh_lazy_nodes_converge_with_zero_certs_on_the_wire() {
             .neighbor_cert(m1)
             .is_some(),
         "machine2 must have fetched machine1's cert"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Reachability probing (`ping`) across a real multi-node fabric.
+//
+// The unit tests in `libs/wayfinder` prove a probe is built, answered and
+// credited correctly against hand-crafted frames. What only a fabric can prove
+// is the part that matters to an operator: that a probe survives being *routed*
+// — relayed by an intermediate node, answered by a target that had to find its
+// own way back, and credited with hop counts that describe the path it actually
+// took.
+// ---------------------------------------------------------------------------
+
+/// A chain `a — b — c`: `a` and `c` share no link, so anything between them is
+/// relayed by `b`.
+fn ping_chain() -> TestHarness {
+    let mut config = TestConfig::default();
+    for name in ["ab", "bc"] {
+        config.switches.push(TestSwitchConfig::shared(name));
+    }
+    let link = |switch_name: &str| LinkConfig {
+        name: None,
+        transport: LinkTransport::Test {
+            switch_name: switch_name.into(),
+        },
+        ogm: TrickleConfig {
+            i_min_ms: 100,
+            i_max_ms: 200,
+        },
+        features: LinkFeatures::default(),
+    };
+    config.machines.push(TestMachineConfig {
+        name: "a".into(),
+        wayfinder: Config {
+            links: vec![link("ab")],
+            ..Default::default()
+        },
+    });
+    config.machines.push(TestMachineConfig {
+        name: "b".into(),
+        wayfinder: Config {
+            links: vec![link("ab"), link("bc")],
+            ..Default::default()
+        },
+    });
+    config.machines.push(TestMachineConfig {
+        name: "c".into(),
+        wayfinder: Config {
+            links: vec![link("bc")],
+            ..Default::default()
+        },
+    });
+    config.validate().unwrap()
+}
+
+/// The whole feature, end to end over a real fabric: `a` pings `c` two hops
+/// away, every probe comes back, and the hop counts describe the path it took.
+///
+/// The hop assertion is the load-bearing one. A probe that reported `0/0` would
+/// still "work" — the round trip happened — while telling an operator that a
+/// relayed path is direct, which is precisely the thing they would be running
+/// this to find out.
+#[test]
+fn a_probe_reaches_a_node_two_hops_away_and_reports_the_path_it_took() {
+    setup();
+    let mut harness = ping_chain();
+    harness.advance_trickle(Duration::from_secs(2));
+
+    let target = harness.get_machine("c").ident;
+    let now = harness.clock;
+    let (session_seq, _) = harness.get_machine_mut("a").router_mut().start_ping(
+        now,
+        target,
+        3,
+        Duration::from_millis(100),
+        Duration::from_secs(5),
+        8,
+    );
+
+    harness.advance_trickle(now + Duration::from_secs(2));
+
+    let session = harness
+        .get_machine("a")
+        .router()
+        .ping_session(session_seq)
+        .expect("the session answers the handle that started it");
+
+    assert_eq!(session.sent(), 3, "every probe asked for went out");
+    assert_eq!(session.received(), 3, "and every one came back");
+    assert_eq!(session.lost(), 0);
+    assert!(!session.active(), "the session finished");
+
+    for probe in session.probes() {
+        assert_eq!(probe.state, ProbeState::Replied);
+        assert_eq!(probe.fwd_hops, 1, "one relay (b) on the way out");
+        assert_eq!(probe.rev_hops, 1, "and one on the way back");
+    }
+}
+
+/// A neighbour one hop away reports zero relays — the number that makes the
+/// count above mean something rather than being an off-by-one nobody could see.
+#[test]
+fn a_probe_to_a_direct_neighbour_reports_no_relays() {
+    setup();
+    let mut harness = ping_chain();
+    harness.advance_trickle(Duration::from_secs(2));
+
+    let target = harness.get_machine("b").ident;
+    let now = harness.clock;
+    let (session_seq, _) = harness.get_machine_mut("a").router_mut().start_ping(
+        now,
+        target,
+        1,
+        Duration::from_millis(100),
+        Duration::from_secs(5),
+        0,
+    );
+    harness.advance_trickle(now + Duration::from_secs(1));
+
+    let session = harness
+        .get_machine("a")
+        .router()
+        .ping_session(session_seq)
+        .expect("session");
+    assert_eq!(session.received(), 1);
+    let probe = session.probes().next().expect("one row");
+    assert_eq!((probe.fwd_hops, probe.rev_hops), (0, 0));
+}
+
+/// A destination nothing has ever announced is *tried*, addressed directly,
+/// and times out — it is not refused up front.
+///
+/// That is `resolve_next_hop`'s deliberate fallback rather than an oversight,
+/// and worth pinning: a MAC absent from the originator table may be a neighbour
+/// whose first OGM has not arrived yet, and refusing to probe it would make
+/// `ping` unable to answer the question it is best at — "is that thing on the
+/// wire?". `ProbeState::NoRoute` is the *narrower* case, a destination the
+/// table knows about and has no live path to.
+#[test]
+fn a_probe_to_a_never_announced_destination_is_tried_and_times_out() {
+    setup();
+    let mut harness = ping_chain();
+    harness.advance_trickle(Duration::from_secs(2));
+
+    let now = harness.clock;
+    let (session_seq, _) = harness.get_machine_mut("a").router_mut().start_ping(
+        now,
+        mac(200),
+        2,
+        Duration::from_millis(100),
+        Duration::from_millis(400),
+        0,
+    );
+    harness.advance_trickle(now + Duration::from_secs(2));
+
+    let session = harness
+        .get_machine("a")
+        .router()
+        .ping_session(session_seq)
+        .expect("session");
+    assert_eq!(session.sent(), 2, "both probes were attempted");
+    assert_eq!(session.received(), 0);
+    assert_eq!(session.lost(), 2);
+    assert!(
+        session.probes().all(|p| p.state == ProbeState::TimedOut),
+        "attempted-and-unanswered, not refused"
+    );
+    assert!(!session.active());
+}
+
+/// A target that goes away mid-session reads as loss rather than as a stall:
+/// the probes go out, nothing answers, and the session finishes.
+#[test]
+fn probes_to_a_departed_node_time_out() {
+    setup();
+    let mut harness = ping_chain();
+    harness.advance_trickle(Duration::from_secs(2));
+
+    let target = harness.get_machine("c").ident;
+    // `c` stops taking part entirely — the frames still reach its port, and it
+    // simply never answers.
+    harness.get_machine_mut("c").router_mut().set_link_features(
+        0,
+        LinkFeatures {
+            rx_data: false,
+            ..Default::default()
+        },
+    );
+
+    let now = harness.clock;
+    let (session_seq, _) = harness.get_machine_mut("a").router_mut().start_ping(
+        now,
+        target,
+        2,
+        Duration::from_millis(100),
+        Duration::from_millis(500),
+        0,
+    );
+    harness.advance_trickle(now + Duration::from_secs(2));
+
+    let session = harness
+        .get_machine("a")
+        .router()
+        .ping_session(session_seq)
+        .expect("session");
+    assert_eq!(session.received(), 0);
+    assert_eq!(session.lost(), 2, "both probes counted as lost");
+    assert!(!session.active(), "and the session stopped waiting");
+}
+
+/// Starting a second session displaces the first, and the first's handle stops
+/// resolving — the property the whole handle mechanism exists for. Without it a
+/// client polling a displaced session would silently report another target's
+/// round trips as its own.
+#[test]
+fn a_second_session_displaces_the_first_and_its_handle_stops_resolving() {
+    setup();
+    let mut harness = ping_chain();
+    harness.advance_trickle(Duration::from_secs(2));
+
+    let b = harness.get_machine("b").ident;
+    let c = harness.get_machine("c").ident;
+    let now = harness.clock;
+
+    let (first, _) = harness.get_machine_mut("a").router_mut().start_ping(
+        now,
+        c,
+        5,
+        Duration::from_millis(100),
+        Duration::from_secs(5),
+        0,
+    );
+    harness.advance_trickle(now + Duration::from_millis(300));
+
+    let now = harness.clock;
+    let (second, _) = harness.get_machine_mut("a").router_mut().start_ping(
+        now,
+        b,
+        1,
+        Duration::from_millis(100),
+        Duration::from_secs(5),
+        0,
+    );
+
+    let router = harness.get_machine("a").router();
+    assert!(router.ping_session(first).is_none(), "the first is gone");
+    assert_eq!(
+        router.ping_session(second).map(|s| s.target()),
+        Some(b),
+        "and the handle that answers is the new one's"
     );
 }

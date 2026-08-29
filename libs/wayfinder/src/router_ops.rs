@@ -159,6 +159,29 @@ pub trait RouterOps {
         tx_buf: &'tx mut [u8],
     ) -> Option<(Mac, LinkFrameData<'tx>)>;
 
+    /// Produce this node's due reachability probe into `tx_buf`, if one is due.
+    ///
+    /// **At most one probe per call** — deliberately unlike
+    /// [`poll`](Self::poll) and [`poll_challenge`](Self::poll_challenge), whose
+    /// callers loop until `None`. See
+    /// [`CentralRouter::poll_ping`](crate::CentralRouter::poll_ping) for why a
+    /// driver that slept through several intervals must not wake to a burst.
+    fn poll_ping<'tx>(
+        &mut self,
+        now: Duration,
+        tx_buf: &'tx mut [u8],
+    ) -> Option<LinkFrameData<'tx>>;
+
+    /// Time from `now` until the running probe session next needs servicing, or
+    /// `None` when there is no unfinished session.
+    ///
+    /// A shell that sleeps must fold this into the same `min` as
+    /// [`next_broadcast_after`](Self::next_broadcast_after) and its siblings,
+    /// for the same reason [`next_challenge_after`](Self::next_challenge_after)
+    /// documents: a probe left riding the OGM schedule waits up to a full
+    /// `i_max` on a settled mesh, by which time it has timed out.
+    fn next_ping_after(&self, now: Duration) -> Option<Duration>;
+
     /// Set interface `idx`'s Trickle bounds, so a fast LAN link and a slow LoRa
     /// link back off on their own schedules.
     fn configure_interface_ogm(
@@ -316,6 +339,18 @@ impl<
         tx_buf: &'tx mut [u8],
     ) -> Option<(Mac, LinkFrameData<'tx>)> {
         Self::poll_challenge(self, now, tx_buf)
+    }
+
+    fn poll_ping<'tx>(
+        &mut self,
+        now: Duration,
+        tx_buf: &'tx mut [u8],
+    ) -> Option<LinkFrameData<'tx>> {
+        Self::poll_ping(self, now, tx_buf)
+    }
+
+    fn next_ping_after(&self, now: Duration) -> Option<Duration> {
+        Self::next_ping_after(self, now)
     }
 
     fn configure_interface_ogm(

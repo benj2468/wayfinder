@@ -434,6 +434,41 @@ pub fn poll_due_challenges<R: RouterOps>(
     }
 }
 
+/// Emit the reachability probe the running ping session has due at `now`, if
+/// any, letting the router resolve its egress ([`Egress::Auto`]).
+///
+/// **One probe per call, not a loop.** The other `poll_due_*` functions here
+/// loop until their router runs out of work; this one deliberately does not.
+/// A probe's cadence *is* the measurement — a shell that slept through three
+/// intervals and then emitted three back-to-back probes would be timing its own
+/// burst rather than the path, and on a duty-cycle-limited radio it would spend
+/// the airtime budget the session exists to measure. The router paces from
+/// `now` for the same reason; see
+/// [`CentralRouter::poll_ping`](wayfinder::CentralRouter::poll_ping).
+///
+/// [`Egress::Auto`] rather than the per-interface fan-out
+/// [`poll_due_challenges`] uses: a probe is addressed to one next hop and
+/// exists to measure the path the router would actually pick, so asking the
+/// router to pick it is the point. That also means `plan_dispatch` applies the
+/// `tx_data` gate on the way out, which is where a probe's transmit gate is
+/// consulted.
+pub fn poll_due_pings<R: RouterOps>(
+    router: &mut R,
+    now: Duration,
+    tx_buffer: &mut [u8],
+    sink: &mut impl MeshSink,
+) {
+    if let Some(f) = router.poll_ping(now, tx_buffer) {
+        trace!(dst = ?f.dst, "emitting reachability probe");
+        sink.emit(OutgoingFrame {
+            dst: f.dst,
+            protocol: f.protocol,
+            payload: f.payload,
+            egress: Egress::Auto,
+        });
+    }
+}
+
 /// Plan one mesh link's `recv` outcome into `sink`: a received frame, or a drop
 /// on error.
 ///
@@ -492,7 +527,8 @@ pub fn handle_link_result<R: RouterOps>(
 }
 
 /// Plan the periodic work into `sink` — OGMs and keep-alives on their
-/// independent schedules, plus any next-hop proof that has fallen due.
+/// independent schedules, plus any next-hop proof or reachability probe that
+/// has fallen due.
 ///
 /// The timer arm of every shell's event loop, which sleeps until whichever
 /// schedule fires first and so must service them all on waking. The third
@@ -507,17 +543,25 @@ pub fn handle_link_result<R: RouterOps>(
 /// tests) call [`poll_due_ogms`], [`poll_due_keepalives`] and
 /// [`poll_due_challenges`] directly.
 ///
+/// A running ping session is a fourth deadline with the same requirement:
+/// [`RouterOps::next_ping_after`] must be in that `min` too, or probes go out
+/// on whatever cadence the mesh's other traffic happens to wake the loop at —
+/// which on a settled mesh is minutes, so every probe would time out and a
+/// working path would read as totally lossy.
+///
 /// [`RouterOps::next_challenge_after`]: wayfinder::router_ops::RouterOps::next_challenge_after
+/// [`RouterOps::next_ping_after`]: wayfinder::router_ops::RouterOps::next_ping_after
 pub fn poll_due_all<R: RouterOps>(
     router: &mut R,
     now: Duration,
     tx_buffer: &mut [u8],
     sink: &mut impl MeshSink,
 ) {
-    trace!("polling OGMs, keep-alives and next-hop challenges");
+    trace!("polling OGMs, keep-alives, next-hop challenges and probes");
     poll_due_ogms(router, now, tx_buffer, sink);
     poll_due_keepalives(router, now, tx_buffer, sink);
     poll_due_challenges(router, now, tx_buffer, sink);
+    poll_due_pings(router, now, tx_buffer, sink);
 }
 
 /// A set of mesh-interface indices, as a bitmask.

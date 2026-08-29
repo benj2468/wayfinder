@@ -5,6 +5,7 @@ use crate::wayfinder::v1alpha::Alarms;
 use crate::wayfinder::v1alpha::AllInterfacesEgress;
 use crate::wayfinder::v1alpha::AuthenticateUserResponse;
 use crate::wayfinder::v1alpha::BeginUserRegistrationResponse;
+use crate::wayfinder::v1alpha::CancelPingResponse;
 use crate::wayfinder::v1alpha::CreateUserInviteResponse;
 use crate::wayfinder::v1alpha::CreateUserResponse;
 use crate::wayfinder::v1alpha::CsrIssued;
@@ -40,6 +41,11 @@ use crate::wayfinder::v1alpha::NodeSecurity;
 use crate::wayfinder::v1alpha::OgmSchedule;
 use crate::wayfinder::v1alpha::OgmScheduleEntry;
 use crate::wayfinder::v1alpha::PendingCsr;
+use crate::wayfinder::v1alpha::PingProbe;
+use crate::wayfinder::v1alpha::PingProbeState;
+use crate::wayfinder::v1alpha::PingResponse;
+use crate::wayfinder::v1alpha::PingSession;
+use crate::wayfinder::v1alpha::PingStatusResponse;
 use crate::wayfinder::v1alpha::ResolveRouteResponse;
 use crate::wayfinder::v1alpha::RevealEnrollmentTokenResponse;
 use crate::wayfinder::v1alpha::RevokeUserSessionsResponse;
@@ -444,6 +450,92 @@ pub struct RouteResolutionData {
     pub egress: Option<EgressDecisionData>,
 }
 
+/// What became of one probe.  Mirrors the `PingProbeState` proto without
+/// coupling providers to the generated types.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProbeStateData {
+    /// Sent, still waiting for its reply, not yet past its timeout.
+    Pending,
+    /// Answered.  The round trip and both hop counts are meaningful.
+    Replied,
+    /// Sent, and its timeout passed with no reply.  Counts as loss.
+    TimedOut,
+    /// Never sent: the node had no live route to the target when it fell due.
+    /// Counts as loss, and kept apart from [`ProbeStateData::TimedOut`] because
+    /// an operator reads "could not try" differently from "heard nothing".
+    NoRoute,
+}
+
+/// One probe's row within a ping session.  Mirrors the `PingProbe` proto.
+#[derive(Clone, Copy)]
+pub struct ProbeData {
+    /// Sequence number within the session.
+    pub seqno: u32,
+    /// What became of it.
+    pub state: ProbeStateData,
+    /// Round-trip time in microseconds; meaningful only when replied.
+    pub rtt_us: u32,
+    /// Relays the request crossed outbound; meaningful only when replied.
+    pub forward_hops: u32,
+    /// Relays the reply crossed inbound; meaningful only when replied, and not
+    /// necessarily equal to `forward_hops`.
+    pub return_hops: u32,
+}
+
+/// A node's ping session.  Mirrors the `PingSession` proto.
+///
+/// The totals and RTT statistics cover the whole session; `probes` is a bounded
+/// window of the most recent rows.
+#[derive(Clone)]
+pub struct PingSessionData {
+    /// The handle this session was issued.
+    pub session_seq: u32,
+    /// The node being pinged (raw identifier bytes).
+    pub destination: Vec<u8>,
+    /// Whether probes remain to send or are still outstanding.
+    pub active: bool,
+    /// Probes asked for.
+    pub requested: u32,
+    /// Probes emitted, including ones refused for want of a route.
+    pub sent: u32,
+    /// Probes answered.
+    pub received: u32,
+    /// Probes that timed out or had no route.
+    pub lost: u32,
+    /// Smallest, mean, largest and standard-deviation round trip in
+    /// microseconds, each 0 until something has been answered — which
+    /// `received` distinguishes from a genuine zero.
+    pub rtt_min_us: u32,
+    /// Mean round trip in microseconds; see [`rtt_min_us`](Self::rtt_min_us).
+    pub rtt_avg_us: u32,
+    /// Largest round trip in microseconds; see [`rtt_min_us`](Self::rtt_min_us).
+    pub rtt_max_us: u32,
+    /// Standard deviation of the round trips in microseconds — `ping(8)`'s
+    /// `mdev`; see [`rtt_min_us`](Self::rtt_min_us).
+    pub rtt_mdev_us: u32,
+    /// Pad bytes each probe carries.
+    pub payload_bytes: u32,
+    /// The recent probe rows, oldest first.
+    pub probes: Vec<ProbeData>,
+}
+
+/// The settings a ping session actually runs under, after the node has applied
+/// its defaults and caps — handed back so a caller learns what it got rather
+/// than what it asked for.  Mirrors the `PingResponse` proto.
+#[derive(Clone, Copy)]
+pub struct PingStartData {
+    /// The handle to present when reading this session's status.  Never zero.
+    pub session_seq: u32,
+    /// Probes this session will send.
+    pub count: u32,
+    /// Milliseconds between probes.
+    pub interval_ms: u32,
+    /// Milliseconds a probe waits before counting as lost.
+    pub timeout_ms: u32,
+    /// Pad bytes each probe carries.
+    pub payload_bytes: u32,
+}
+
 /// The security posture of one originator, as the local node sees it.  Mirrors
 /// the `NodeSecurity` proto without coupling providers to the generated types.
 #[derive(Clone)]
@@ -732,6 +824,16 @@ pub trait RouterReads {
     /// `None` if the raw bytes can't be parsed as a valid identifier for
     /// this provider's address family.
     fn resolve_route(&self, destination: &[u8]) -> Option<RouteResolutionData>;
+    /// The reachability-probe session `session_seq` names, or `None` when it
+    /// names one this node is no longer running.
+    ///
+    /// `None` is not an error and a client is expected to hit it: a node runs
+    /// one session at a time and a new one displaces the last, so the handle is
+    /// what stops a stale poller from reporting its successor's round trips as
+    /// its own.  Answering the *current* session regardless of the handle would
+    /// defeat the only thing the handle is for.
+    fn ping_session(&self, session_seq: u32) -> Option<PingSessionData>;
+
     /// Whether this node currently has a runtime configuration override
     /// applied via [`set_config`](WayfinderDataProvider::set_config), as
     /// opposed to running purely off its startup configuration.
@@ -821,6 +923,42 @@ pub trait RouterWrites {
     /// The `Err` variant is a spec that failed to parse, and leaves the previous
     /// filter untouched: an operator typo must never blind a node.
     fn set_log_level(&mut self, directives: &str) -> Result<String, String>;
+
+    /// Start a reachability-probe session against `destination`, replacing
+    /// whatever session was running, and return the handle plus the settings
+    /// actually in force.
+    ///
+    /// A write rather than a read, and not because of the bookkeeping: it puts
+    /// frames on the air at a caller-chosen cadence and displaces another
+    /// caller's session.  Zero for any of `count`, `interval_ms`, `timeout_ms`
+    /// or `payload_bytes` means "use the node's default"; the node clamps what
+    /// it must and reports back what it settled on.
+    ///
+    /// The `Err` variant is `destination` not parsing as an identifier for this
+    /// provider's address family — a malformed request, as distinct from a
+    /// well-formed one against an unreachable node, which starts a session
+    /// perfectly well and reports the unreachability probe by probe.
+    fn start_ping(
+        &mut self,
+        destination: &[u8],
+        count: u32,
+        interval_ms: u32,
+        timeout_ms: u32,
+        payload_bytes: u32,
+    ) -> Result<PingStartData, String>;
+
+    /// Stop the running probe session, if `session_seq` is the handle that
+    /// started it, returning it so the caller can report what it measured.
+    ///
+    /// Handle-guarded like [`ping_session`](WayfinderDataProvider::ping_session)
+    /// and for a sharper reason: a client polling a session that had already
+    /// been displaced would otherwise stop *somebody else's* run while leaving.
+    ///
+    /// `None` means there was nothing of this caller's to stop — already
+    /// finished, already displaced, or never started. Not an error: cancelling
+    /// is what a client does on its way out, and a session that has already
+    /// stopped is the outcome it wanted.
+    fn cancel_ping(&mut self, session_seq: u32) -> Option<PingSessionData>;
 }
 
 /// Both halves of the router-facing surface, for an implementor that owns its
@@ -848,6 +986,40 @@ pub const NOT_A_PROVIDER: &str = "node is not a certificate-authority provider";
 /// enrolled" — a state an operator can fix, and can be told how to — apart from
 /// a transport failure, which is a different problem with a different remedy.
 pub const NO_MEMBERSHIP_CERT: &str = "node holds no membership certificate";
+
+/// Project a [`PingSessionData`] onto its proto shape.
+fn proto_ping_session(s: PingSessionData) -> PingSession {
+    PingSession {
+        session_seq: s.session_seq,
+        destination: s.destination,
+        active: s.active,
+        requested: s.requested,
+        sent: s.sent,
+        received: s.received,
+        lost: s.lost,
+        rtt_min_us: s.rtt_min_us,
+        rtt_avg_us: s.rtt_avg_us,
+        rtt_max_us: s.rtt_max_us,
+        rtt_mdev_us: s.rtt_mdev_us,
+        payload_bytes: s.payload_bytes,
+        probes: s
+            .probes
+            .into_iter()
+            .map(|p| PingProbe {
+                seqno: p.seqno,
+                state: match p.state {
+                    ProbeStateData::Pending => PingProbeState::Pending,
+                    ProbeStateData::Replied => PingProbeState::Replied,
+                    ProbeStateData::TimedOut => PingProbeState::TimedOut,
+                    ProbeStateData::NoRoute => PingProbeState::NoRoute,
+                } as i32,
+                rtt_us: p.rtt_us,
+                forward_hops: p.forward_hops,
+                return_hops: p.return_hops,
+            })
+            .collect(),
+    }
+}
 
 /// Build the response a node with no certificate authority gives to a request
 /// only one could serve.
@@ -1584,6 +1756,16 @@ pub fn handle_router_read<P: RouterReads + ?Sized>(
                 filter: batch.filter,
             })
         }
+        Some(RequestKind::PingStatus(req)) => {
+            // An unset `session` is the ordinary answer for a displaced or
+            // finished-and-replaced session, not an error — a client reads it
+            // as "stop polling", which is exactly what it should do.
+            ResponseKind::PingStatus(PingStatusResponse {
+                session: provider
+                    .ping_session(req.session_seq)
+                    .map(proto_ping_session),
+            })
+        }
         Some(RequestKind::GetAlarms(_)) => {
             let board = provider.alarms();
             ResponseKind::Alarms(Alarms {
@@ -1789,6 +1971,35 @@ pub fn handle_router_write<P: RouterWrites + ?Sized>(
                 Ok(_) => ResponseKind::Empty(Empty {}),
                 Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
             }
+        }
+        Some(RequestKind::Ping(ping)) => {
+            match provider.start_ping(
+                &ping.destination,
+                ping.count,
+                ping.interval_ms,
+                ping.timeout_ms,
+                ping.payload_bytes,
+            ) {
+                Ok(started) => ResponseKind::Ping(PingResponse {
+                    session_seq: started.session_seq,
+                    count: started.count,
+                    interval_ms: started.interval_ms,
+                    timeout_ms: started.timeout_ms,
+                    payload_bytes: started.payload_bytes,
+                }),
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            }
+        }
+        Some(RequestKind::CancelPing(req)) => {
+            // Like `PingStatus` above, an unset `session` is the ordinary
+            // answer rather than an error: there was nothing of this caller's
+            // to stop. Cancelling is what a client does on the way out, and a
+            // session that has already stopped is the outcome it wanted.
+            ResponseKind::CancelPing(CancelPingResponse {
+                session: provider
+                    .cancel_ping(req.session_seq)
+                    .map(proto_ping_session),
+            })
         }
         Some(RequestKind::SetConfig(set_config)) => {
             let raw_config = set_config.config.unwrap_or_default();
@@ -2332,6 +2543,13 @@ mod tests {
             self.route_resolution.clone()
         }
 
+        /// This mock runs no ping session, and says so rather than
+        /// fabricating one — a handle that always resolved would hide exactly
+        /// the displaced-session case the handle exists to expose.
+        fn ping_session(&self, _session_seq: u32) -> Option<PingSessionData> {
+            None
+        }
+
         fn runtime_config_active(&self) -> bool {
             self.runtime_config_active
         }
@@ -2378,6 +2596,54 @@ mod tests {
                 config.trickle.is_some() || config.lazy_cert_distribution.is_some();
             self.last_set_config = Some(config);
             Ok(())
+        }
+
+        /// Accepts a session and echoes back the settings a real node would
+        /// have settled on, but emits nothing: there is no mesh behind this
+        /// mock to probe.
+        fn start_ping(
+            &mut self,
+            destination: &[u8],
+            count: u32,
+            interval_ms: u32,
+            timeout_ms: u32,
+            payload_bytes: u32,
+        ) -> Result<PingStartData, String> {
+            if destination.len() != 6 {
+                return Err("destination must be a 6-byte node identifier".into());
+            }
+            Ok(PingStartData {
+                session_seq: 1,
+                count: if count == 0 { 5 } else { count },
+                interval_ms: if interval_ms == 0 { 1_000 } else { interval_ms },
+                timeout_ms: if timeout_ms == 0 { 5_000 } else { timeout_ms },
+                payload_bytes: if payload_bytes == 0 {
+                    16
+                } else {
+                    payload_bytes
+                },
+            })
+        }
+
+        /// Answers only the handle `start_ping` above issues, so the
+        /// wrong-handle case stays reachable rather than being papered over by
+        /// a mock that cancels anything it is asked to.
+        fn cancel_ping(&mut self, session_seq: u32) -> Option<PingSessionData> {
+            (session_seq == 1).then(|| PingSessionData {
+                session_seq: 1,
+                destination: vec![0, 0, 0, 0, 0, 2],
+                active: false,
+                requested: 5,
+                sent: 2,
+                received: 1,
+                lost: 1,
+                rtt_min_us: 12_000,
+                rtt_avg_us: 12_000,
+                rtt_max_us: 12_000,
+                rtt_mdev_us: 0,
+                payload_bytes: 16,
+                probes: Vec::new(),
+            })
         }
 
         fn set_log_level(&mut self, directives: &str) -> Result<String, String> {
@@ -3792,6 +4058,9 @@ mod tests {
             ResponseKind::LinkFeaturesTable(_) => "LinkFeaturesTable",
             ResponseKind::KeepaliveTable(_) => "KeepaliveTable",
             ResponseKind::ResolveRoute(_) => "ResolveRoute",
+            ResponseKind::Ping(_) => "Ping",
+            ResponseKind::PingStatus(_) => "PingStatus",
+            ResponseKind::CancelPing(_) => "CancelPing",
             ResponseKind::OgmSchedule(_) => "OgmSchedule",
             ResponseKind::Throughput(_) => "Throughput",
             ResponseKind::Metrics(_) => "Metrics",
