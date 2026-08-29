@@ -1208,6 +1208,76 @@ where
             .await?;
             continue;
         }
+        // Nor may it enroll itself, which is the same rule on the way in.
+        //
+        // The authority's MAC-lock — one MAC, one key, until the certificate
+        // expires — is read off the issued-cert log, and the CA's own
+        // membership certificate is not in it: that identity is minted offline
+        // with `wayfinderctl cert` and provisioned as a file the node's config
+        // points at (`nix/machines/wayfinder-ca/common.nix`), or installed over
+        // `SetAuth`; neither path records an enrollment. The one address on the
+        // mesh whose impersonation matters most is therefore the one address
+        // the lock has nothing on file to refuse against, and under
+        // `auto_approve` an anonymous enrollment-tier caller could have a
+        // root-signed certificate minted binding the CA's MAC to keys it chose:
+        // the member tier, OGM signatures the mesh verifies as the authority's,
+        // and the CA's own device registration on the tunnel via
+        // `GetVpnEnrollment`.
+        //
+        // With approval required this is "only" a pending CSR — but one whose
+        // queue entry is a bare MAC an operator has no reason to read as this
+        // node's own. Refusing outright is what makes it unnecessary to notice.
+        // `ApproveCsr` is guarded with it for that same reason and one more:
+        // the held-CSR store is persisted, so a queue entry submitted before
+        // this guard existed survives the upgrade that adds it, and
+        // `approve_csr` re-signs from the stored keys without re-running any of
+        // `submit_csr`'s checks.
+        //
+        // Here rather than in the authority, for the reason the revoke guard
+        // above gives: `own_mac` comes from the router, which the authority
+        // task cannot see. An *ordinary* node re-enrolling its own identity
+        // does not come through here: its CSR names its own MAC but arrives at
+        // the CA, whose `own_mac` is a different address.
+        //
+        // Gated on there being an authority, unlike the revoke guard above: on
+        // a node that is not a provider the honest answer is
+        // `not_a_provider_response`, and claiming to be the certificate
+        // authority would send an operator looking for CA state on a machine
+        // that has none.
+        //
+        // One request kind pair, because the enrollment tier has exactly one
+        // mutation. Anything added to that tier in `rpc_table!` that names a
+        // MAC needs a line here.
+        let names_own_mac = match &request.request {
+            Some(ReqKind::SubmitCsr(csr)) => csr.node_mac == own_mac.0,
+            Some(ReqKind::ApproveCsr(approve)) => approve.node_mac == own_mac.0,
+            _ => false,
+        };
+        if names_own_mac && authority_tx.is_some() {
+            // The keys the caller wanted signed are the useful artifact here,
+            // but they are also the thing not to write to a log ring; the MAC
+            // and who asked are what an operator can act on. Reachable by an
+            // anonymous enrollment-tier caller, so `warn!` rather than
+            // `error!` — and bounded by the `SubmitCsr` rate limiter above
+            // plus `PreAuthSlots`, so it is not a flooding vector.
+            tracing::warn!(
+                key = ?peer_key,
+                %peer_addr,
+                ?own_mac,
+                "drop: refusing a CSR naming this node, which is the authority"
+            );
+            send_response(
+                &mut responses,
+                RespKind::Error(ErrorResponse {
+                    message: "this node is the certificate authority; its own address is not \
+                              enrollable, and a certificate issued for it would let the holder \
+                              sign and route as the mesh's root of trust"
+                        .into(),
+                }),
+            )
+            .await?;
+            continue;
+        }
         let response =
             serve_by_facet(&request, &query_tx, authority_tx.as_ref(), router.as_ref()).await?;
         // Mesh revocation and VPN revocation are one operator action, so the
@@ -1954,6 +2024,47 @@ mod tests {
         tokio::task::JoinHandle<anyhow::Result<()>>,
     ) {
         spawn_gated_server_with_vpn(peer_key, gate, response, None)
+    }
+
+    /// As [`spawn_gated_server_answering`], but standing in for a node that is
+    /// **not** a provider — no authority channel at all.
+    ///
+    /// The other harnesses all wire a stub authority, because their subject is
+    /// the connection task's routing. A guard that must behave differently on a
+    /// plain routing node needs the case they deliberately do not cover.
+    fn spawn_gated_server_without_authority(
+        peer_key: [u8; 32],
+        gate: AuthGate,
+    ) -> (
+        Framed<tokio::io::DuplexStream, LengthDelimitedCodec>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let (query_tx, query_rx) = mpsc::channel(16);
+        spawn_echo_of(query_rx, canned_node_info());
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let peer_addr = std::net::Ipv4Addr::LOCALHOST.into();
+        let limits = std::sync::Arc::new(PreAuthLimits::new());
+        let guard = limits
+            .admit(peer_addr, std::time::Instant::now())
+            .expect("a fresh limiter admits the first connection");
+        let server = tokio::spawn(serve_authenticated_stream(
+            server_io,
+            peer_key,
+            peer_addr,
+            guard,
+            gate,
+            ServeContext {
+                limits,
+                query_tx,
+                vpn: None,
+                authority_tx: None,
+                router: None,
+            },
+        ));
+        (
+            LengthDelimitedCodec::builder().new_framed(client_io),
+            server,
+        )
     }
 
     /// As [`spawn_gated_server_answering`], with the VPN coordinator the
@@ -4115,6 +4226,207 @@ mod tests {
             coordinator.revoked.lock().unwrap().is_empty(),
             "and nothing was revoked anywhere"
         );
+    }
+
+    /// A certificate authority must not enroll itself, either.
+    ///
+    /// The sibling of `the_authority_refuses_to_revoke_itself`, and the reason
+    /// is sharper. The authority's own membership certificate is minted offline
+    /// (`wayfinderctl cert`) and never enters the issued-cert log, so the log's
+    /// MAC-lock — the guard that stops one MAC being claimed under a second key
+    /// — has nothing on file to refuse against. Under `auto_approve` that let
+    /// an anonymous enrollment-tier caller obtain a root-signed certificate
+    /// binding the CA's own MAC to keys of its choosing: the member tier, OGM
+    /// signatures accepted as the authority's, and the CA's own device
+    /// registration on the tunnel.
+    ///
+    /// Refused at this layer for the same reason the revoke guard is: `own_mac`
+    /// comes from the router, which the authority task cannot see.
+    #[tokio::test]
+    async fn the_authority_refuses_a_csr_naming_its_own_mac() {
+        let own = Mac([2, 0, 0, 0, 0, 1]);
+        let ctx = AuthContext {
+            own_key: Some([1u8; 32]), // un-enrolled ⇒ the peer key is GrantedEnrollment
+            anchor: None,
+            revoked: Vec::new(),
+            own_mac: own,
+            now_unix: 100,
+        };
+        let (mut client, server) = spawn_authenticated_server([2u8; 32], ctx);
+
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: Vec::new(),
+            })))
+            .await
+            .unwrap();
+        let ack = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(ack.response, Some(Response::Empty(_))));
+
+        client
+            .send(encode_request(Request::SubmitCsr(SubmitCsrRequest {
+                node_mac: own.0.to_vec(),
+                ed_pubkey: vec![7u8; 32],
+                x_pubkey: vec![8u8; 32],
+                enrollment_token: String::new(),
+            })))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+
+        let Some(Response::Error(err)) = resp.response else {
+            panic!("a CSR naming the authority's own MAC must be refused: {resp:?}");
+        };
+        assert!(
+            err.message.contains("certificate authority"),
+            "the reason names why: {}",
+            err.message
+        );
+
+        // Narrow, not blanket: every other MAC still enrolls. (The stub
+        // authority answers every forwarded request with `Empty`; what is under
+        // test is that the request reached the authority facet at all.)
+        client
+            .send(encode_request(Request::SubmitCsr(SubmitCsrRequest {
+                node_mac: Mac([2, 0, 0, 0, 0, 2]).0.to_vec(),
+                ed_pubkey: vec![7u8; 32],
+                x_pubkey: vec![8u8; 32],
+                enrollment_token: String::new(),
+            })))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(
+            !matches!(&resp.response, Some(Response::Error(_))),
+            "a CSR for another MAC was caught by the guard too: {resp:?}"
+        );
+
+        drop(client);
+        let _ = server.await;
+    }
+
+    /// The guard is unconditional on the tier, not a rule about anonymous
+    /// callers.
+    ///
+    /// Without this, narrowing the guard to `GrantedEnrollment` would keep
+    /// `the_authority_refuses_a_csr_naming_its_own_mac` green while leaving an
+    /// enrolled member — or an admin whose session certificate was stolen —
+    /// able to have the CA's own identity re-certified. The two things this
+    /// refuses to do are not the enrollment tier's to do, they are *nobody's*.
+    ///
+    /// Uses `enrolled_device` to reach a fully granted connection, the way
+    /// `the_authority_refuses_to_revoke_itself` does.
+    #[tokio::test]
+    async fn a_csr_naming_the_authoritys_own_mac_is_refused_at_every_tier() {
+        let own = Mac([2, 0, 0, 0, 0, 1]);
+        let (_node, _cert, anchor, ca_own) = enrolled_device(own);
+        let (mut client, server) = spawn_authenticated_server(
+            ca_own,
+            AuthContext {
+                own_key: Some(ca_own),
+                anchor: Some(anchor),
+                revoked: Vec::new(),
+                own_mac: own,
+                now_unix: 100,
+            },
+        );
+
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: Vec::new(),
+            })))
+            .await
+            .unwrap();
+        let _ack = client.next().await.unwrap().unwrap();
+
+        client
+            .send(encode_request(Request::SubmitCsr(SubmitCsrRequest {
+                node_mac: own.0.to_vec(),
+                ed_pubkey: vec![7u8; 32],
+                x_pubkey: vec![8u8; 32],
+                enrollment_token: String::new(),
+            })))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        let Some(Response::Error(err)) = resp.response else {
+            panic!("a fully granted connection enrolled the authority's own MAC: {resp:?}");
+        };
+        assert!(
+            err.message.contains("certificate authority"),
+            "the reason names why: {}",
+            err.message
+        );
+
+        // `ApproveCsr` is guarded with it: the held-CSR store is persisted, so
+        // an entry parked before this guard existed outlives the upgrade that
+        // adds it, and `approve_csr` re-signs from the stored keys without
+        // re-running `submit_csr`'s checks.
+        client
+            .send(encode_request(Request::ApproveCsr(
+                wayfinder_protos::wayfinder::v1alpha::ApproveCsrRequest {
+                    node_mac: own.0.to_vec(),
+                },
+            )))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        assert!(
+            matches!(&resp.response, Some(Response::Error(_))),
+            "approving a queued CSR for the authority's own MAC was allowed: {resp:?}"
+        );
+
+        drop(client);
+        let _ = server.await;
+    }
+
+    /// On a node that is not a provider the guard stays out of the way, so the
+    /// caller gets the honest `not a provider` answer instead of being told
+    /// this node is the certificate authority — which would send an operator
+    /// hunting for CA state on a machine that has none.
+    #[tokio::test]
+    async fn a_non_provider_node_does_not_claim_to_be_the_authority() {
+        let own = Mac([2, 0, 0, 0, 0, 1]);
+        let ctx = AuthContext {
+            own_key: Some([1u8; 32]),
+            anchor: None,
+            revoked: Vec::new(),
+            own_mac: own,
+            now_unix: 100,
+        };
+        // No authority channel: an ordinary routing node.
+        let (mut client, server) =
+            spawn_gated_server_without_authority([2u8; 32], gate_returning(ctx));
+
+        client
+            .send(encode_request(Request::Authenticate(AuthenticateRequest {
+                cert: Vec::new(),
+            })))
+            .await
+            .unwrap();
+        let _ack = client.next().await.unwrap().unwrap();
+
+        client
+            .send(encode_request(Request::SubmitCsr(SubmitCsrRequest {
+                node_mac: own.0.to_vec(),
+                ed_pubkey: vec![7u8; 32],
+                x_pubkey: vec![8u8; 32],
+                enrollment_token: String::new(),
+            })))
+            .await
+            .unwrap();
+        let resp = WayfinderResponse::decode(client.next().await.unwrap().unwrap()).unwrap();
+        let Some(Response::Error(err)) = resp.response else {
+            panic!("expected the not-a-provider refusal, got {resp:?}");
+        };
+        assert!(
+            !err.message.contains("certificate authority"),
+            "a node with no authority claimed to be one: {}",
+            err.message
+        );
+
+        drop(client);
+        let _ = server.await;
     }
 
     /// A revoke whose VPN half fails is reported as a failure, not as success.
