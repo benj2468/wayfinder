@@ -81,6 +81,41 @@ pub trait LinkT: Send {
         Ok(())
     }
 
+    /// This medium's **native fan-out threshold**: the number of distinct
+    /// multicast targets routed out this link at which one flood becomes
+    /// cheaper than one directed copy each.
+    ///
+    /// `None` — the default — means the link has no native fan-out to exploit:
+    /// one `send` reaches one neighbor, so N copies genuinely cost N and
+    /// flooding is never the cheaper option on this link's account.  Every
+    /// point-to-point carrier is this, and so is a multi-access one whose
+    /// "broadcast" is really a loop over known peers.
+    ///
+    /// `Some(n)` means one `send` already reaches every neighbor on this
+    /// medium.  `Some(1)` is the strongest form — a directed copy costs
+    /// exactly what a flood costs, so a single target already justifies
+    /// flooding — and fits any carrier that ignores `data.dst` when it
+    /// transmits: a LoRa module addressed to its broadcast address, a
+    /// non-connectable BLE advertisement, an 802.15.4 frame sent to `0xffff`.
+    /// A larger `n` fits a medium that fans out in one operation but where a
+    /// directed copy is still meaningfully cheaper than the mesh-wide cost of
+    /// a flood.
+    ///
+    /// This is a statement about the *medium*, which is why it belongs to the
+    /// link rather than to config: the driver is what knows whether its own
+    /// `send` is a broadcast.
+    ///
+    /// **Nothing reads this yet.** It is the seam design 17 (multi-destination
+    /// multicast) plugs into: a forwarding node with several next hops behind
+    /// one interface collapses them into a single `send_all` when, and only
+    /// when, the link declares that one send reaches them all. If that design
+    /// is abandoned, delete this method along with
+    /// [`send_all`](LinkT::send_all) — a declaration nothing reads is exactly
+    /// the dead weight `send_all` has been since it was introduced.
+    fn fan_out(&self) -> Option<core::num::NonZeroU8> {
+        None
+    }
+
     /// Await the next frame from the interface, with its physical-layer metrics.
     /// The returned [`Received`] borrows the interface's receive buffer and is
     /// invalidated by the next receive.
@@ -94,3 +129,62 @@ pub trait LinkT: Send {
 /// above runs.  Embedded `no_std` callers use [`LinkT`] directly.
 #[cfg(feature = "std")]
 pub type DynLinkT<'a> = DynLinkTInner<'a>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::num::NonZeroU8;
+
+    /// A carrier that declares nothing about its medium — the shape of every
+    /// point-to-point pipe.
+    struct Plain;
+
+    impl LinkT for Plain {
+        async fn send(&mut self, _: Mac, _: &LinkFrameData<'_>) -> Result<usize, LinkError> {
+            Ok(0)
+        }
+        async fn recv(&mut self) -> Result<Received<'_>, LinkError> {
+            Err(LinkError::Io)
+        }
+    }
+
+    /// A carrier whose every `send` already reaches every neighbor, so one
+    /// directed copy costs what a flood costs.
+    struct Broadcasting;
+
+    impl LinkT for Broadcasting {
+        fn fan_out(&self) -> Option<NonZeroU8> {
+            NonZeroU8::new(1)
+        }
+        async fn send(&mut self, _: Mac, _: &LinkFrameData<'_>) -> Result<usize, LinkError> {
+            Ok(0)
+        }
+        async fn recv(&mut self) -> Result<Received<'_>, LinkError> {
+            Err(LinkError::Io)
+        }
+    }
+
+    /// The default is "no native fan-out": a link says nothing unless it has
+    /// something to say, so adding the hint changes no existing carrier.
+    #[test]
+    fn a_link_declares_no_fan_out_by_default() {
+        assert_eq!(Plain.fan_out(), None);
+    }
+
+    #[test]
+    fn a_broadcast_medium_declares_its_threshold() {
+        assert_eq!(Broadcasting.fan_out(), NonZeroU8::new(1));
+    }
+
+    /// The declaration has to survive type erasure: the host driver holds its
+    /// interfaces as `DynLinkT`, so a hint the boxed wrapper dropped would be
+    /// a hint the host node never sees.
+    #[cfg(feature = "std")]
+    #[test]
+    fn the_boxed_wrapper_forwards_the_declaration() {
+        let plain = DynLinkT::new_box(Plain);
+        assert_eq!(plain.fan_out(), None);
+        let broadcasting = DynLinkT::new_box(Broadcasting);
+        assert_eq!(broadcasting.fan_out(), NonZeroU8::new(1));
+    }
+}

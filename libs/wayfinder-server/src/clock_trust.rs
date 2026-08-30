@@ -192,6 +192,7 @@ impl ClockSync {
 /// kernel derives — anything holding `CAP_SYS_TIME` can set it to zero while
 /// `STA_UNSYNC` is still set — so a narrow bound must never be able to vouch
 /// for a clock that nothing is disciplining.
+#[cfg(any(target_os = "linux", test))]
 fn classify(ret: i32, status: i32, maxerror_us: i64, bound_us: u64) -> ClockSync {
     /// The kernel's "clock is not synchronized" status bit.
     const STA_UNSYNC: i32 = 0x0040;

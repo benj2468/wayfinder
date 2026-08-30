@@ -1248,7 +1248,7 @@ mod mcast_membership {
     #[test]
     fn local_memberships_are_announced_in_ogm() {
         let mut engine: BatmanEngine<8> = BatmanEngine::new(mac(1));
-        engine.set_local_mcast_groups(&[group(0x2a), group(0x2b)]);
+        engine.set_local_mcast_groups(core::time::Duration::ZERO, &[group(0x2a), group(0x2b)]);
 
         let mut tx = [0u8; 256];
         let bytes = engine

@@ -32,6 +32,8 @@ coverage.xml
 __pycache__
 .pytest_cache
 .sim-compose.gen.yml
+# Mesh identities minted for the docker sim (scripts/topology.py).
+.sim-ca/
 
 # Training datasets generated from the simulator (ml/) — regenerable, and
 # large enough that they belong in object storage rather than git.

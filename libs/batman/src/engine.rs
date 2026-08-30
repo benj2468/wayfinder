@@ -622,12 +622,46 @@ impl<
     /// Replace the set of multicast groups the local host listens to.  These
     /// are announced to the mesh in the multicast TVLV of every OGM this node
     /// produces.  Groups beyond this engine's `MAX_LOCAL_MCAST` are dropped.
-    pub fn set_local_mcast_groups(&mut self, groups: &[Mac]) {
+    pub fn set_local_mcast_groups(&mut self, now: core::time::Duration, groups: &[Mac]) {
+        let before = self.local_mcast.clone();
         self.local_mcast.clear();
         for g in groups {
             if self.local_mcast.push(*g).is_err() {
                 break; // table full; drop the rest
             }
+        }
+        // A change to the groups *we* advertise is an inconsistency in the
+        // Trickle sense: our next OGM will say something new, so say it
+        // promptly rather than up to `i_max` from now. This is what the reset
+        // is for — see `handle_ogm`, which deliberately does *not* reset for
+        // another originator's membership change.
+        //
+        // Reset here and now rather than latching `topology_changed`, because
+        // the latch would not do what it looks like it does on this path.
+        // `apply_topology_change` is only reached from `produce_periodic_broadcast`
+        // (which the driver calls only once the timer is *already* due) and
+        // from `handle_ogm` (an inbound frame). A local IGMP join is neither,
+        // so a latch would leave the OGM that first carries the new group up
+        // to `i_max` away — exactly the delay this is meant to remove — and
+        // only bring forward the one after it.
+        //
+        // Safe to reset from here: the caller is the driver's local-frame arm,
+        // a different `select!` branch from `poll_due_ogms`, so this cannot
+        // land inside that loop's iteration.
+        //
+        // Guarded on an actual change so this is safe for *any* caller to
+        // invoke unconditionally. The shipping caller already filters —
+        // `plan_host_frame` only calls this when `McastSnooper::observe`
+        // reported a change, so a repeated IGMP report never reaches here —
+        // but this is `pub`, the filtering lives a crate away, and an
+        // unguarded latch would pin the node at `i_min` for as long as
+        // anything on the host is joined to a group.
+        //
+        // The comparison is element-wise (`heapless::Vec`), so it depends on
+        // the caller passing a stable order; `McastSnooper::groups` sorts for
+        // exactly this reason, and its doc comment carries the argument.
+        if self.local_mcast != before {
+            self.reset_ogm_timers(now);
         }
     }
 
@@ -649,13 +683,16 @@ impl<
     /// in `tail` (the TVLV region following an OGM header).  An OGM with no
     /// multicast TVLV prunes all of `orig`'s memberships.  Called when an OGM
     /// is accepted; keeps [`Self::mcast_members`] in sync with the latest
-    /// announcement from each originator.  Returns whether the set of groups
-    /// attributed to `orig` actually changed.
-    fn update_mcast_membership(&mut self, orig: Mac, frame: &LinkFrame) -> bool {
+    /// announcement from each originator.
+    ///
+    /// Deliberately reports nothing back. It used to return whether `orig`'s
+    /// group set had changed, so `handle_ogm` could treat that as a Trickle
+    /// inconsistency — which was backwards (see the reset comment there), and
+    /// cost a pair of sorted `heapless::Vec<Mac, MAX_MCAST_MEMBERS>` snapshots
+    /// on every accepted OGM to compute an answer nothing should have acted on.
+    fn update_mcast_membership(&mut self, orig: Mac, frame: &LinkFrame) {
         let header_size = core::mem::size_of::<BatmanOgmPacket>();
         let tail = frame.payload.get(header_size..).unwrap_or(&[]);
-        // Snapshot the prior membership so we can report whether it changed.
-        let before = self.mcast_groups_for(orig);
 
         // Drop every membership currently attributed to this originator;
         // the incoming announcement is authoritative for it.
@@ -676,25 +713,6 @@ impl<
                 }
             }
         }
-
-        // Report whether the membership set for this originator actually
-        // changed, so the caller can treat a membership change as an
-        // inconsistency that resets the Trickle backoff.
-        let after = self.mcast_groups_for(orig);
-        before != after
-    }
-
-    /// The sorted set of multicast group MACs currently attributed to `orig`.
-    /// Used to detect whether an OGM's membership announcement changed anything.
-    fn mcast_groups_for(&self, orig: Mac) -> heapless::Vec<Mac, MAX_MCAST_MEMBERS> {
-        let mut groups: heapless::Vec<Mac, MAX_MCAST_MEMBERS> = self
-            .mcast_members
-            .iter()
-            .filter(|(_, m)| *m == orig)
-            .map(|(g, _)| *g)
-            .collect();
-        groups.sort_unstable_by_key(|g| g.0);
-        groups
     }
 
     // ── per-interface Trickle (adaptive OGM emission) ─────────────────────────
@@ -1094,20 +1112,35 @@ impl<
             // Fold this originator's multicast memberships (carried in the OGM's
             // TVLV tail) into the membership table.  The `record` borrow has
             // ended above, so taking `&mut self` here is fine.
-            let mcast_changed = self.update_mcast_membership(orig_ident, frame);
+            self.update_mcast_membership(orig_ident, frame);
 
             // Reset the Trickle backoff only for changes to *our own advertised
-            // state* — gaining a neighbor (we are likely newly reachable too) or a
-            // change to the multicast groups we announce.  A change to our chosen
-            // next hop toward some *other* originator is deliberately NOT an
-            // inconsistency: our OGM advertises only ourselves, so re-announcing
-            // faster would tell neighbors nothing new — and in a dense mesh the
-            // per-seqno TQ jitter from varying flood paths would otherwise flip
-            // `best_next_hop` every round, pinning the whole mesh at `i_min` and
-            // never letting it quieten.  A genuinely lost route still resets via
-            // [`purge_stale`], and forwarding always follows the current best live
-            // path regardless.
-            if is_new_orig || mcast_changed {
+            // state* — which, on this path, means gaining a neighbor and
+            // nothing else: we are likely newly reachable too, so neighbors
+            // have something new to hear from us.
+            //
+            // Two things deliberately do NOT reset it, for the same reason.
+            // Our OGM advertises only ourselves, so re-announcing faster tells
+            // neighbors nothing they did not already have:
+            //
+            // * A change to our chosen next hop toward some *other*
+            //   originator. In a dense mesh the per-seqno TQ jitter from
+            //   varying flood paths would otherwise flip `best_next_hop` every
+            //   round, pinning the whole mesh at `i_min` and never letting it
+            //   quieten.
+            // * A change to *that originator's* multicast membership (folded
+            //   in by `update_mcast_membership` just above), rather than ours. Every neighbor of ours that cares about it received
+            //   the very same OGM we just did. Resetting on it meant any one
+            //   node's join pinned every other node near `i_min`, which is
+            //   exactly the pinning the backoff exists to prevent, and it grew
+            //   worse the denser the mesh got. Our *own* membership changing
+            //   is the case that genuinely warrants a reset, and that is
+            //   handled where it happens, in `set_local_mcast_groups`,
+            //   which resets the timers directly.
+            //
+            // A genuinely lost route still resets via [`purge_stale`], and
+            // forwarding always follows the current best live path regardless.
+            if is_new_orig {
                 self.topology_changed = true;
             }
 
@@ -1808,6 +1841,175 @@ mod tests {
         data.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
         data.extend_from_slice(ogm.as_bytes());
         data
+    }
+
+    // ── multicast membership and the Trickle backoff ──────────────────────────
+
+    /// An OGM from `neighbor` announcing interest in `groups`, so the engine
+    /// records it as a multicast listener for them.
+    fn ogm_frame_with_mcast(neighbor: u8, dst: u8, seqno: u32, groups: &[Mac]) -> Vec<u8> {
+        let mut value = Vec::new();
+        for g in groups {
+            value.extend_from_slice(g.as_bytes());
+        }
+        let tvlv_hdr = BatmanTvlvHdr {
+            tvlv_type: TvlvType::Mcast.as_u8(),
+            version: 1,
+            len: (value.len() as u16).to_be(),
+        };
+        let tvlv_total = core::mem::size_of::<BatmanTvlvHdr>() + value.len();
+        let ogm = BatmanOgmPacket {
+            packet_type: BatmanPacketType::Ogm.as_u8(),
+            version: 5,
+            ttl: 5,
+            flags: 0,
+            seqno: seqno.to_be(),
+            orig: mac(neighbor),
+            reserved: 0,
+            tq: 200,
+            tvlv_len: (tvlv_total as u16).to_be(),
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(mac(dst).as_bytes());
+        data.extend_from_slice(mac(neighbor).as_bytes());
+        data.extend_from_slice(&ETH_P_BATMAN.to_be_bytes());
+        data.extend_from_slice(ogm.as_bytes());
+        data.extend_from_slice(tvlv_hdr.as_bytes());
+        data.extend_from_slice(&value);
+        data
+    }
+
+    /// A multicast group MAC (`01:00:5e:00:00:NN`).
+    fn mcast_group(n: u8) -> Mac {
+        Mac([0x01, 0x00, 0x5e, 0x00, 0x00, n])
+    }
+
+    const I_MIN: core::time::Duration = core::time::Duration::from_millis(100);
+    const I_MAX: core::time::Duration = core::time::Duration::from_secs(10);
+
+    /// An engine with interface 0 on a Trickle schedule already backed off
+    /// well past `i_min`, so a reset is visible as the interval snapping back.
+    fn engine_with_backed_off_timer() -> BatmanEngine<4> {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        engine.configure_interface_ogm(0, I_MIN, I_MAX, core::time::Duration::ZERO);
+        for _ in 0..4 {
+            engine.ogm_timers[0].on_emit(core::time::Duration::ZERO);
+        }
+        assert!(
+            engine.ogm_timers[0].interval() > I_MIN,
+            "the timer must be backed off for the reset to be observable"
+        );
+        engine
+    }
+
+    /// Joining a local multicast group changes what *this node's* OGMs
+    /// advertise, so it is an inconsistency: the Trickle backoff resets and the
+    /// mesh learns the new membership promptly rather than up to `i_max` later.
+    ///
+    /// The reset lands **immediately**, not on the next emission. That
+    /// distinction is the whole point: latching `topology_changed` here would
+    /// do nothing until `produce_periodic_broadcast` ran, and that only runs
+    /// once the timer is *already* due — so the OGM that first carries the new
+    /// group would still be up to `i_max` away, exactly as before, and only
+    /// the one after it would come sooner. Asserted without calling
+    /// `produce_periodic_broadcast` for that reason: a test that calls it
+    /// bypasses the due-gate and passes either way.
+    #[test]
+    fn joining_a_local_group_resets_the_trickle_backoff_immediately() {
+        let mut engine = engine_with_backed_off_timer();
+
+        engine.set_local_mcast_groups(core::time::Duration::ZERO, &[mcast_group(5)]);
+
+        assert_eq!(
+            engine.ogm_timers[0].interval(),
+            I_MIN,
+            "a local join must snap the backoff back to i_min there and then"
+        );
+    }
+
+    /// The join is also reflected in the *next* OGM the node emits, which is
+    /// what the reset exists to bring forward.
+    #[test]
+    fn the_next_ogm_after_a_local_join_carries_the_group() {
+        let mut engine = engine_with_backed_off_timer();
+        let mut tx = [0u8; 256];
+
+        engine.set_local_mcast_groups(core::time::Duration::ZERO, &[mcast_group(5)]);
+        let ogm = engine
+            .produce_periodic_broadcast(core::time::Duration::ZERO, &mut tx)
+            .expect("an OGM is produced");
+
+        assert!(
+            ogm.windows(6).any(|w| w == mcast_group(5).as_bytes()),
+            "the joined group must appear in the OGM's multicast TVLV"
+        );
+    }
+
+    /// Re-announcing the *same* local groups changes nothing this node
+    /// advertises, so it is not an inconsistency — otherwise every IGMP report
+    /// the host repeats (they are periodic) would pin the mesh at `i_min`.
+    #[test]
+    fn re_announcing_the_same_local_groups_does_not_reset_the_backoff() {
+        let mut engine = engine_with_backed_off_timer();
+        engine.set_local_mcast_groups(core::time::Duration::ZERO, &[mcast_group(5)]);
+        for _ in 0..4 {
+            engine.ogm_timers[0].on_emit(core::time::Duration::ZERO);
+        }
+        let backed_off = engine.ogm_timers[0].interval();
+
+        engine.set_local_mcast_groups(core::time::Duration::ZERO, &[mcast_group(5)]);
+
+        assert_eq!(
+            engine.ogm_timers[0].interval(),
+            backed_off,
+            "an unchanged membership set must leave the backoff where it was"
+        );
+    }
+
+    /// A *remote* originator changing its multicast membership must NOT reset
+    /// our Trickle backoff.
+    ///
+    /// Our OGM advertises only our own groups, so re-announcing faster tells
+    /// our neighbors nothing they did not already get from that same
+    /// originator's OGM. Resetting on it means any node's join pins every
+    /// other node near `i_min` — the denser the mesh, the worse — which is
+    /// precisely the pinning the Trickle backoff exists to avoid.
+    #[test]
+    fn a_remote_membership_change_does_not_reset_our_trickle_backoff() {
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        engine.configure_interface_ogm(0, I_MIN, I_MAX, core::time::Duration::ZERO);
+        let mut tx = [0u8; 256];
+
+        // Learn the originator first: a *new* originator is a genuine
+        // inconsistency (we are likely newly reachable too), and that reset is
+        // not what this test is about.
+        let first = ogm_frame_with_mcast(2, 1, 1, &[mcast_group(5)]);
+        let parsed = LinkFrame::ref_from_prefix(&first).unwrap().0;
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+        engine.handle_rx(core::time::Duration::ZERO, parsed, None, &mut reply);
+
+        for _ in 0..4 {
+            engine.ogm_timers[0].on_emit(core::time::Duration::ZERO);
+        }
+        let backed_off = engine.ogm_timers[0].interval();
+        assert!(backed_off > I_MIN);
+
+        // Same originator, different groups: a real membership change, but
+        // one that says nothing about us.
+        let second = ogm_frame_with_mcast(2, 1, 2, &[mcast_group(6), mcast_group(7)]);
+        let parsed = LinkFrame::ref_from_prefix(&second).unwrap().0;
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+        engine.handle_rx(core::time::Duration::ZERO, parsed, None, &mut reply);
+
+        assert_eq!(
+            engine.ogm_timers[0].interval(),
+            backed_off,
+            "another node's membership change must not reset our backoff"
+        );
+        // The change is still recorded — this is about the timer, not about
+        // dropping the announcement.
+        let listeners: Vec<Mac> = engine.mcast_listeners(mcast_group(6)).collect();
+        assert_eq!(listeners, vec![mac(2)]);
     }
 
     /// One keep-alive from a neighbor arms `keepalive_missed` (no longer

@@ -141,9 +141,9 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -152,6 +152,29 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # Ephemeral, gitignored compose file the `up`/`down` subcommands operate on.
 # Kept at the repo root so `build.context: .` resolves like the committed one.
 EPHEMERAL = REPO_ROOT / ".sim-compose.gen.yml"
+# Where `make_identities` mints the mesh's secrets, and the source of every
+# `/secrets` bind mount in the generated compose.
+#
+# Repo-local and gitignored, deliberately *not* `tempfile.mkdtemp()`.
+#
+# Every path in a bind mount is resolved by the **Docker daemon**, not by this
+# script — and the two are not always looking at the same filesystem. Running
+# from a dev container that drives the host's daemon through a mounted
+# `/var/run/docker.sock` (docker-outside-of-docker) is the case that bites:
+# `$TMPDIR` is then `/tmp/nix-shell.XXXX` *inside that container*, a path the
+# daemon cannot see. It does not fail — a missing bind-mount source is created
+# as an empty directory — so every node comes up with `/secrets` mounted and
+# empty and dies on "No such file or directory (os error 2)", while the seed
+# sits exactly where this script wrote it. The tell is that only the
+# directories the compose file mounts get created; `operator/` and `open/`,
+# which nothing mounts, stay absent.
+#
+# The repo root is the one path already known to mean the same thing on both
+# sides: the generated compose bind-mounts it as `/workspace`, so if it did not
+# resolve identically the sim could never have worked at all. Minting inside it
+# inherits that property. (It is also shared by Docker Desktop on macOS by
+# default, which `/var/folders` is not guaranteed to be.)
+SIM_CA_DIR = REPO_ROOT / ".sim-ca"
 PROJECT = "wayfinder-sim"
 
 # Default verbosity for every node's RUST_LOG. "trace" is very chatty across a
@@ -402,10 +425,17 @@ def make_identities(
     admits exactly one client: one holding the node's own key). Minting it here
     and mounting it as ``identity_seed_path`` closes that circle.
 
-    The directory is intentionally *not* auto-deleted: it is mounted into the
-    sim containers for the lifetime of the compose project.
+    The directory ([`SIM_CA_DIR`]) is repo-local and lives for the lifetime of
+    the compose project, not of the shell that ran this — see the constant for
+    why that distinction is load-bearing. It is wiped and re-minted on each
+    render, because every identity here is generated fresh anyway.
     """
-    ca_dir = Path(tempfile.mkdtemp(prefix="wayfinder-ca-"))
+    ca_dir = SIM_CA_DIR
+    # Re-minting into a stale tree would leave a previous run's node
+    # directories (for nodes this topology no longer has) mounted into nothing,
+    # and their certificates are signed by a root this run has just replaced.
+    shutil.rmtree(ca_dir, ignore_errors=True)
+    ca_dir.mkdir(parents=True)
     root_seed = ca_dir / "seed"
     anchor = ca_dir / "root"
 
@@ -454,6 +484,20 @@ def make_identities(
     # admin capability to every router in the mesh, which is exactly what the
     # signed admin bit exists to prevent.
     issue_into(ca_dir / "operator", admin=True)
+
+    # Check the files are on disk rather than trusting three exit codes. An
+    # empty `/secrets` is the one failure mode this whole directory has ever
+    # had in practice, and it is invisible until a container dies with a bare
+    # ENOENT several steps later — so fail here, naming the file, instead.
+    for name in node_names:
+        for leaf in ("seed", "cert", "anchor"):
+            path = ca_dir / "nodes" / name / leaf
+            if not path.is_file():
+                sys.exit(f"minting {name} produced no {leaf} at {path}")
+    for name in open_names or []:
+        path = ca_dir / "open" / name / "seed"
+        if not path.is_file():
+            sys.exit(f"minting open node {name} produced no seed at {path}")
 
     print(f"minted mesh identities in {ca_dir}", file=sys.stderr)
     return ca_dir, node_keys
@@ -1246,7 +1290,13 @@ def main(argv: list[str]) -> int:
     if args.cmd == "down":
         if not EPHEMERAL.exists():
             write_compose(EPHEMERAL)
-        return compose("down")
+        rc = compose("down")
+        # The identities are scoped to the project that just went away — every
+        # one is re-minted by the next `up`. Removing them keeps a stale tree
+        # from being silently re-mounted by a container that outlives the
+        # teardown.
+        shutil.rmtree(SIM_CA_DIR, ignore_errors=True)
+        return rc
     if args.cmd == "restart":
         if not EPHEMERAL.exists():
             write_compose(EPHEMERAL)

@@ -75,7 +75,14 @@ pub struct Args {
 
 /// Load this node's persisted identity keypair from a 32-byte seed file.
 fn load_keypair(seed_path: &str) -> anyhow::Result<Keypair> {
-    let seed: [u8; 32] = std::fs::read(seed_path)?
+    // Named, unlike a bare `?`: this is the first file the node opens on the
+    // startup path, and an unwrapped `std::fs::read` here surfaces as nothing
+    // but "No such file or directory (os error 2)" after the welcome banner —
+    // no path, no clue which of the several configured paths was missing. Every
+    // other read on this path (`load_or_generate_mac`, the settings store)
+    // already names its file; this one did not.
+    let seed: [u8; 32] = std::fs::read(seed_path)
+        .with_context(|| format!("failed to read the identity seed at {seed_path}"))?
         .as_slice()
         .try_into()
         .map_err(|_| anyhow!("identity seed at {seed_path} must be 32 bytes"))?;
@@ -420,16 +427,14 @@ async fn main() -> anyhow::Result<()> {
                 discovery_addr,
                 multicast_interface,
             } => {
-                if discovery_addr.is_none() && multicast_interface.is_some() {
-                    bail!(
-                        "udpmulti link {:?}: multicast_interface is meaningless without a \
-                         discovery_addr to join a multicast group at",
-                        names.last()
-                    );
-                }
+                // The discovery_addr/multicast_interface combinations that
+                // cannot work are rejected inside the builder (`discovery_mode`),
+                // so every caller gets the check rather than only this one.
+                // All this adds is which link the operator has to go fix.
                 interfaces.push(
                     build_udp_multi_link(bind_addr, discovery_addr, multicast_interface.as_deref())
-                        .await?,
+                        .await
+                        .with_context(|| format!("udpmulti link {:?}", names.last()))?,
                 );
             }
             LinkTransport::RawIp {

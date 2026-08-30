@@ -40,9 +40,28 @@ impl McastSnooper {
         }
     }
 
-    /// The multicast group MACs the host currently listens to.
+    /// The multicast group MACs the host currently listens to, in a stable
+    /// (ascending) order.
+    ///
+    /// Sorted rather than handed back in `HashSet` order, because two callers
+    /// downstream treat this as a *sequence* and both break on an unstable
+    /// one:
+    ///
+    /// * `BatmanEngine::set_local_mcast_groups` compares the new list against
+    ///   the current one to decide whether this node's advertised state
+    ///   changed. `heapless::Vec` equality is element-wise, so an unordered
+    ///   source makes an unchanged set compare as changed and reset the
+    ///   Trickle backoff — pinning the node near `i_min`, the exact thing that
+    ///   comparison exists to prevent.
+    /// * That same setter truncates at `MAX_LOCAL_MCAST`. With more groups
+    ///   joined than fit, an unordered source means *which* groups get
+    ///   advertised is arbitrary and reshuffles on any unrelated join or
+    ///   leave, so a group the host still wants silently drops out of the OGM
+    ///   and back in again. Sorted, the surviving prefix is at least stable.
     pub fn groups(&self) -> Vec<Mac> {
-        self.groups.iter().copied().collect()
+        let mut groups: Vec<Mac> = self.groups.iter().copied().collect();
+        groups.sort_unstable_by_key(|m| m.0);
+        groups
     }
 
     /// Apply one parsed IGMP message body to the group set.
@@ -248,5 +267,35 @@ mod tests {
         arp.extend_from_slice(&[0u8; 28]);
         assert!(!s.observe(&arp));
         assert!(s.groups().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    /// `groups()` is a stable sequence, not a `HashSet` iteration order.
+    ///
+    /// The consumers treat it as one — see the method's doc comment for the
+    /// two things that break otherwise. Asserted by building the same set by
+    /// two different join orders and requiring identical output; a `HashSet`
+    /// of `Mac` does not guarantee that on its own.
+    #[test]
+    fn groups_are_returned_in_a_stable_order() {
+        let a = Mac([0x01, 0x00, 0x5e, 0x00, 0x00, 0x01]);
+        let b = Mac([0x01, 0x00, 0x5e, 0x00, 0x00, 0x02]);
+        let c = Mac([0x01, 0x00, 0x5e, 0x01, 0x02, 0x03]);
+
+        let mut forward = McastSnooper::new();
+        for g in [a, b, c] {
+            forward.groups.insert(g);
+        }
+        let mut backward = McastSnooper::new();
+        for g in [c, b, a] {
+            backward.groups.insert(g);
+        }
+
+        assert_eq!(forward.groups(), backward.groups());
+        assert_eq!(forward.groups(), vec![a, b, c], "ascending by MAC bytes");
     }
 }
