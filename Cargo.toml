@@ -23,6 +23,7 @@ members = [
     "libs/wayfinder-log",
     "libs/wayfinder-alarm",
     "libs/wayfinder-test",
+    "libs/wayfinder-bench",
     "libs/wayfinder-client",
     "bins/wayfinder-tap",
     "bins/wayfinder-tui",

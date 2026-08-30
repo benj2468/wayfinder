@@ -1,0 +1,90 @@
+[package]
+name = "wayfinder-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+# The packet-path benchmarks, in one crate rather than a `benches/` directory in
+# each of the four crates they measure.
+#
+# Two reasons. `criterion` and `divan` stay out of the dev-dependency graph of
+# `wayfinder-driver-core`, `wayfinder-tick-driver`, `wayfinder` and `batman` —
+# all `no_std`-first, and none of them should grow a host-only benchmark harness
+# just to be measured. And CI plus the justfile get one `cargo bench -p
+# wayfinder-bench` instead of four invocations to keep in sync.
+#
+# Nothing is lost by measuring from outside: every surface the benches drive
+# (`handle_mesh_frame`, `plan_dispatch`, `CentralRouter`, `BatmanOgmPacket`) is
+# already `pub`, because the driver shells are separate crates too.
+
+# The fixtures are a library, but not a benchmark. Without this, `cargo bench`
+# also runs the lib's own libtest harness as if it were a bench target, and
+# that harness rejects criterion's arguments — so `--save-baseline` fails the
+# whole run before a single measurement is taken. Its unit tests still run
+# under `cargo nextest run` as normal.
+[lib]
+bench = false
+
+[dependencies]
+wayfinder.workspace = true
+wayfinder-driver-core.workspace = true
+wayfinder-tick-driver = { path = "../wayfinder-tick-driver" }
+wayfinder-test = { path = "../wayfinder-test" }
+# The std certificate authority, to mint the membership certs the auth-on
+# fixtures need.
+wayfinder-auth = { workspace = true, features = ["std"] }
+batman.workspace = true
+interfaces.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+criterion = "0.8.2"
+divan = "0.1.21"
+
+# Every bench target sets `harness = false`: criterion and divan each supply
+# their own `main`. `cargo nextest run` skips bench targets entirely, so none of
+# these run as part of the test suite.
+
+[[bench]]
+name = "packet_path"
+harness = false
+
+[[bench]]
+name = "dispatch"
+harness = false
+
+[[bench]]
+name = "wire"
+harness = false
+
+[[bench]]
+name = "auth"
+harness = false
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[features]
+# Selects the allocation gate. Enables no code — it exists purely so the divan
+# target is *excluded* from a plain `cargo bench -p wayfinder-bench`.
+#
+# Without it the two harnesses collide on the command line: criterion's
+# `--save-baseline`/`--baseline` are the whole point of the timing workflow, and
+# divan's argument parser rejects them and exits non-zero, failing the run
+# before any measurement is reported. Splitting them by feature keeps
+# `cargo bench -p wayfinder-bench` meaning "the criterion timing suites" and
+# leaves adding another one a one-line manifest change, with no recipe to keep
+# in sync.
+alloc-gate = []
+
+# Divan rather than criterion: this one counts allocations instead of timing
+# them. `divan::AllocProfiler` installs a `#[global_allocator]`, which is why it
+# must be its own bench target (its own binary) and cannot be a criterion group.
+[[bench]]
+name = "alloc"
+harness = false
+required-features = ["alloc-gate"]
