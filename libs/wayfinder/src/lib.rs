@@ -1938,8 +1938,8 @@ impl<
     /// Set the multicast groups the local host listens to (typically from IGMP
     /// snooping).  They are announced to the mesh in this node's OGMs so other
     /// routers forward the corresponding multicast traffic toward us.
-    pub fn set_local_mcast_groups(&mut self, groups: &[Mac]) {
-        self.batman.set_local_mcast_groups(groups);
+    pub fn set_local_mcast_groups(&mut self, now: core::time::Duration, groups: &[Mac]) {
+        self.batman.set_local_mcast_groups(now, groups);
     }
 
     /// Wrap host data destined for the multicast listener `dest` in a
@@ -4106,7 +4106,7 @@ mod node_metrics {
     fn local_mcast_groups_fill_table() {
         let mut router = CentralRouter::new(mac(1));
         let groups = [Mac::from_ipv4_multicast("224.0.0.1".parse().unwrap())];
-        router.set_local_mcast_groups(&groups);
+        router.set_local_mcast_groups(Duration::ZERO, &groups);
         assert_eq!(router.local_mcast_occupancy().0, 1);
     }
 

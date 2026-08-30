@@ -85,7 +85,7 @@ fn local_mcast_groups_cap_at_generic_bound() {
     let mut engine = TinyEngine::new(mac(1));
     let groups: [Mac; 6] = core::array::from_fn(|i| mac(i as u8 + 10));
 
-    engine.set_local_mcast_groups(&groups);
+    engine.set_local_mcast_groups(core::time::Duration::ZERO, &groups);
 
     assert_eq!(engine.local_mcast_groups().len(), 4);
     // The first four survive; the overflow is dropped from the tail.
@@ -99,7 +99,7 @@ fn host_profile_keeps_todays_local_mcast_capacity() {
     let mut engine = HostEngine::new(mac(1));
     let groups: [Mac; 6] = core::array::from_fn(|i| mac(i as u8 + 10));
 
-    engine.set_local_mcast_groups(&groups);
+    engine.set_local_mcast_groups(core::time::Duration::ZERO, &groups);
 
     assert_eq!(engine.local_mcast_groups().len(), 6);
 }

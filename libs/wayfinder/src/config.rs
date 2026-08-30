@@ -74,12 +74,20 @@ pub enum LinkTransport {
         /// Local address the socket binds to.
         bind_addr: SocketAddr,
         /// Where a [`Mac::BROADCAST`](interfaces::frame::Mac::BROADCAST)/
-        /// multicast-destined frame is sent: an IPv4 broadcast address (the
-        /// socket enables `SO_BROADCAST`), or an IPv6 multicast group (the
-        /// socket joins it on `multicast_interface`). Every other destination
-        /// is reached once its transport address has been learned from a
-        /// received frame — in practice, the periodic OGM every mesh node
-        /// broadcasts — so there is nothing else to configure per peer.
+        /// multicast-destined frame is sent, in one of three shapes:
+        ///
+        /// - an **IPv4 broadcast** address (subnet or limited) — the socket
+        ///   enables `SO_BROADCAST` and sends there directly; no
+        ///   `multicast_interface`, since there is no group to join;
+        /// - an **IPv4 or IPv6 multicast group** — the socket joins it on
+        ///   `multicast_interface` (**required** for both families) and pins
+        ///   its outgoing multicast to that same NIC;
+        /// - `None` — the hub/star mode described below.
+        ///
+        /// Every other destination is reached once its transport address has
+        /// been learned from a received frame — in practice, the periodic OGM
+        /// every mesh node broadcasts — so there is nothing else to configure
+        /// per peer.
         ///
         /// `None` is the hub/star-topology mode: there is no real broadcast
         /// domain to send one datagram into (a Tailscale tunnel is exactly
@@ -92,11 +100,15 @@ pub enum LinkTransport {
         /// changing behavior when a field is omitted.
         #[serde(default)]
         discovery_addr: Option<SocketAddr>,
-        /// NIC to join the IPv6 multicast group on. Required when
-        /// `discovery_addr` is an IPv6 multicast address (IPv6 multicast is
-        /// scoped to an interface, unlike IPv4 broadcast); meaningless (and
-        /// rejected by validation) when `discovery_addr` is `None`, since
-        /// there is then no multicast group to join.
+        /// NIC to join the multicast group on, and to send this link's
+        /// multicast out of. **Required whenever `discovery_addr` is a
+        /// multicast group, IPv4 or IPv6 alike**: multicast is scoped to one
+        /// interface on both families — the membership is joined on a NIC and
+        /// datagrams leave by a NIC — and leaving either to the routing table
+        /// is how a link ends up listening on one NIC and transmitting out
+        /// another. Meaningless (and rejected by validation) when
+        /// `discovery_addr` is `None` or an IPv4 *broadcast* address, since
+        /// there is then no group to join.
         #[serde(default)]
         multicast_interface: Option<String>,
     },

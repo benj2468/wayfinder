@@ -1352,7 +1352,7 @@ fn plan_host_frame(
     tx_buffer: &mut [u8],
 ) -> Vec<OutgoingFrame> {
     if snooper.observe(eth) {
-        router.set_local_mcast_groups(&snooper.groups());
+        router.set_local_mcast_groups(now, &snooper.groups());
     }
 
     let mut mesh: Vec<OutgoingFrame> = Vec::new();

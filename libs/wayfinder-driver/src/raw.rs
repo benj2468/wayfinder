@@ -96,10 +96,13 @@ pub use tokio_impl::build_raw_l2_egress;
 #[cfg(feature = "tokio")]
 pub use tokio_impl::build_raw_l2_link;
 // Shared with the multi-access UDP link (`net::build_udp_multi_link`), which
-// needs the same NIC-name -> ifindex resolution to join an IPv6 multicast
-// group on a specific interface.
+// needs the same NIC-name resolution to join a multicast group on a specific
+// interface: by kernel index for IPv6, by interface address for IPv4 (see
+// `interface_ipv4` for why the two families differ).
 #[cfg(feature = "tokio")]
 pub(crate) use tokio_impl::interface_index;
+#[cfg(feature = "tokio")]
+pub(crate) use tokio_impl::interface_ipv4;
 
 #[cfg(feature = "tokio")]
 mod tokio_impl {
@@ -247,6 +250,89 @@ mod tokio_impl {
         // SAFETY: `storage` now holds a fully-formed `sockaddr_ll` of the given
         // length.
         unsafe { SockAddr::new(storage, size_of::<libc::sockaddr_ll>() as socklen_t) }
+    }
+
+    /// Resolve a NIC name (e.g. `"eth0"`) to the IPv4 address configured on
+    /// it.
+    ///
+    /// The IPv4 multicast socket options take an interface *address*, not the
+    /// index [`interface_index`] returns: `IP_ADD_MEMBERSHIP` and
+    /// `IP_MULTICAST_IF` both identify the NIC by one of its addresses on the
+    /// portable (BSD-derived) `ip_mreq`/`in_addr` forms that `socket2` exposes.
+    /// So a name has to be walked to an address, which is what `getifaddrs`
+    /// is for.
+    ///
+    /// An interface with several IPv4 addresses yields the first the kernel
+    /// lists; any of them identifies the same NIC to these options, so the
+    /// choice does not matter. An interface with none — a v6-only or unnumbered
+    /// NIC — is an error rather than a fall back to `INADDR_ANY`, because
+    /// `INADDR_ANY` is precisely the "let the routing table pick" behavior the
+    /// caller named an interface to avoid.
+    pub(crate) fn interface_ipv4(name: &str) -> anyhow::Result<std::net::Ipv4Addr> {
+        use std::net::Ipv4Addr;
+
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        // SAFETY: `head` is a valid out-pointer; on success the list it is set
+        // to is freed by the `freeifaddrs` below, on every path out.
+        if unsafe { libc::getifaddrs(&mut head) } != 0 {
+            return Err(anyhow::Error::from(std::io::Error::last_os_error())
+                .context(format!("getifaddrs while resolving interface {name}")));
+        }
+
+        let mut found = None;
+        // Tracked separately from `found` so a typo'd NIC name and a NIC with
+        // no IPv4 address get different messages. They are different mistakes
+        // with different fixes, and `interface_index` (the v6 path) already
+        // distinguishes them — telling an operator to add an address to an
+        // interface that does not exist sends them the wrong way entirely.
+        let mut name_seen = false;
+        let mut cur = head;
+        // SAFETY: `cur` walks the kernel-allocated list from `head` until the
+        // NUL terminator, and is only dereferenced while non-null. Every field
+        // read below is initialized by `getifaddrs`; `ifa_addr` is explicitly
+        // allowed to be null (an interface with no address for that family),
+        // which the guard covers.
+        while !cur.is_null() {
+            let ifa = unsafe { &*cur };
+            cur = ifa.ifa_next;
+
+            if ifa.ifa_addr.is_null() {
+                continue;
+            }
+            // SAFETY: `ifa_name` is a NUL-terminated C string owned by the
+            // list, valid until `freeifaddrs`.
+            let this = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) };
+            if this.to_bytes() != name.as_bytes() {
+                continue;
+            }
+            // Before the family test: an interface that exists but has only a
+            // v6 address must still count as *seen*.
+            name_seen = true;
+            // SAFETY: non-null per the guard above, and `sa_family` is the
+            // common prefix of every `sockaddr` variant, so reading it is
+            // valid whatever the concrete family turns out to be.
+            if unsafe { (*ifa.ifa_addr).sa_family } != libc::AF_INET as libc::sa_family_t {
+                continue;
+            }
+            // SAFETY: the family check above establishes that `ifa_addr` points
+            // at a `sockaddr_in`, which is what this reads.
+            let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+            found = Some(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)));
+            break;
+        }
+
+        // SAFETY: `head` is the list `getifaddrs` allocated above and has not
+        // been freed; nothing borrows it past this point (`found` is a copied
+        // address, not a pointer into the list).
+        unsafe { libc::freeifaddrs(head) };
+
+        match (found, name_seen) {
+            (Some(addr), _) => Ok(addr),
+            (None, true) => Err(anyhow::anyhow!(
+                "network interface {name} has no IPv4 address to join a group on"
+            )),
+            (None, false) => Err(anyhow::anyhow!("no such network interface: {name}")),
+        }
     }
 
     /// Resolve a NIC name (e.g. `"eth0"`) to its kernel interface index.

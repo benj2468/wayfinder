@@ -45,9 +45,16 @@ BATMAN-adv routing protocol implementation. `no_std`, heapless. Implements
   peer handed back.
 - `Trickle` (`trickle.rs`) — adaptive OGM emission timer (after RFC 6206). The
   interval doubles from `i_min` toward `i_max` while the topology is stable and
-  snaps back to `i_min` on any inconsistency (new originator, changed next hop,
-  lost route, membership change) — near-silence in steady state, fast
-  reconvergence on change.
+  snaps back to `i_min` on an inconsistency — near-silence in steady state,
+  fast reconvergence on change. "Inconsistency" is narrower than it looks, and
+  the boundary is deliberate: an OGM advertises **only this node's own state**,
+  so a reset is warranted exactly when *that* changed. A new originator (we are
+  likely newly reachable too), a route lost by `purge_stale`, and a change to
+  our **own** multicast groups (`set_local_mcast_groups`) all reset it. A
+  changed next hop toward some *other* originator does **not** — in a dense
+  mesh, per-seqno TQ jitter would flip it every round and pin everyone at
+  `i_min`. Neither does a *remote* originator's membership change: every
+  neighbour that cares got the same OGM we did.
 - `set_local_mcast_groups` / `mcast_listeners` — manage local memberships
   (announced in OGMs) and query learned `(group → originators)` memberships.
 
