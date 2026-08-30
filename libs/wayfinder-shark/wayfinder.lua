@@ -60,6 +60,7 @@ local PKT_CERT_REQ = 0x05
 local PKT_ECHO_REQUEST = 0x0a
 local PKT_ECHO_REPLY = 0x0b
 local PKT_CERT_REPLY = 0x06
+local PKT_MCAST = 0x04
 local PACKET_TYPES = {
 	[PKT_ORIGINATOR] = "Originator",
 	[0x02] = "Broadcast",
@@ -151,6 +152,20 @@ f.cert_ctrl_dest = ProtoField.ether("wayfinder.cert_ctrl.dest", "Destination")
 -- addresses swapped and the hop counters carried forward.
 f.echo_version = ProtoField.uint8("wayfinder.echo.version", "Version", base.DEC)
 f.echo_ttl = ProtoField.uint8("wayfinder.echo.ttl", "TTL", base.DEC)
+-- `McastAuthForm`: which proof the frame's auth trailer carries. Both values
+-- are proofs — the field selects *which* check a frame must pass, never
+-- whether it is checked.
+local MCAST_FORMS = {
+	[1] = "Pairwise tag (one next hop)",
+	[2] = "Sender signature (fan-out)",
+}
+
+f.mcast_version = ProtoField.uint8("wayfinder.mcast.version", "Version", base.DEC)
+f.mcast_ttl = ProtoField.uint8("wayfinder.mcast.ttl", "TTL", base.DEC)
+f.mcast_n_dests = ProtoField.uint8("wayfinder.mcast.n_dests", "Destination Count", base.DEC)
+f.mcast_form = ProtoField.uint8("wayfinder.mcast.form", "Auth Form", base.DEC, MCAST_FORMS)
+f.mcast_dest = ProtoField.ether("wayfinder.mcast.dest", "Destination")
+f.mcast_payload = ProtoField.bytes("wayfinder.mcast.payload", "Encapsulated Frame")
 f.echo_dest = ProtoField.ether("wayfinder.echo.dest", "Destination")
 f.echo_orig = ProtoField.ether("wayfinder.echo.orig", "Origin")
 f.echo_seqno = ProtoField.uint16("wayfinder.echo.seqno", "Probe Sequence", base.DEC)
@@ -203,6 +218,20 @@ local CERT_CTRL = {
 	TTL = 2,
 	DEST = 3, -- 6 bytes
 	HEADER_LEN = 9,
+}
+
+-- Field offsets within a BatmanMcastPacket header. Multicast is delivered as
+-- routed unicast to an *explicit destination list* (design 17), so the header
+-- is a fixed prefix followed by `n_dests` addresses and then the encapsulated
+-- frame — not a single `dest` like a unicast. Kept in sync with
+-- libs/batman/src/wire.rs.
+local MCAST = {
+	PACKET_TYPE = 0,
+	VERSION = 1,
+	TTL = 2,
+	N_DESTS = 3,
+	FORM = 4,
+	HEADER_LEN = 5, -- the fixed prefix; the destination list follows
 }
 
 -- Field offsets within a BatmanEchoPacket header — shared by EchoRequest and
@@ -357,8 +386,8 @@ function wayfinder.dissector(tvb, pinfo, root)
 	tree:add(f.packet_type, tvb(ORIGINATOR.PACKET_TYPE, 1))
 
 	-- Cert-control packets (CertReq/CertReply) get their own header/body
-	-- decode; Broadcast/Unicast/Multicast stop after the protocol/type are
-	-- labelled (not decoded in this cut).
+	-- decode; Broadcast/Unicast stop after the protocol/type are labelled
+	-- (not decoded in this cut).
 	if ptype == PKT_CERT_REQ or ptype == PKT_CERT_REPLY then
 		if len < CERT_CTRL.HEADER_LEN then
 			return len
@@ -367,6 +396,38 @@ function wayfinder.dissector(tvb, pinfo, root)
 		tree:add(f.cert_ctrl_ttl, tvb(CERT_CTRL.TTL, 1))
 		tree:add(f.cert_ctrl_dest, tvb(CERT_CTRL.DEST, 6))
 		decode_cert_ctrl(tree, tvb, ptype == PKT_CERT_REQ, CERT_CTRL.HEADER_LEN, len)
+		return len
+	end
+
+	-- Multicast: the destination list is the whole point of the packet, so it
+	-- is spelled out rather than summarised. A frame's list shrinks at every
+	-- hop (each removes itself and splits the rest by next hop), so the same
+	-- flood seen at two points in a capture legitimately names different sets.
+	if ptype == PKT_MCAST then
+		if len < MCAST.HEADER_LEN then
+			return len
+		end
+		local n = tvb(MCAST.N_DESTS, 1):uint()
+		tree:add(f.mcast_version, tvb(MCAST.VERSION, 1))
+		tree:add(f.mcast_ttl, tvb(MCAST.TTL, 1))
+		tree:add(f.mcast_n_dests, tvb(MCAST.N_DESTS, 1))
+		tree:add(f.mcast_form, tvb(MCAST.FORM, 1))
+
+		-- `n_dests` is remote input: believe it only as far as the bytes
+		-- actually present, or a truncated capture reads off the end.
+		local list_len = n * 6
+		if n == 0 or len < MCAST.HEADER_LEN + list_len then
+			pinfo.cols.info = string.format("%s (malformed, n_dests=%d)", label, n)
+			return len
+		end
+		for i = 0, n - 1 do
+			tree:add(f.mcast_dest, tvb(MCAST.HEADER_LEN + i * 6, 6))
+		end
+		local body = MCAST.HEADER_LEN + list_len
+		if len > body then
+			tree:add(f.mcast_payload, tvb(body, len - body))
+		end
+		pinfo.cols.info = string.format("%s -> %d dest%s", label, n, n == 1 and "" or "s")
 		return len
 	end
 

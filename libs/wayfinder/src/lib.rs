@@ -19,17 +19,21 @@ pub use interfaces;
 pub use wayfinder_auth;
 
 use batman::BatmanEngine;
+use batman::MAX_MCAST_DESTS;
 use batman::wire::BatmanBroadcastPacket;
 use batman::wire::BatmanCertReplyPacket;
 use batman::wire::BatmanCertReqPacket;
 use batman::wire::BatmanEchoPacket;
-use batman::wire::BatmanMcastPacket;
 use batman::wire::BatmanNextHopChallengePacket;
 use batman::wire::BatmanNextHopResponsePacket;
 use batman::wire::BatmanPacketType;
 use batman::wire::BatmanUnicastPacket;
 use batman::wire::ETH_P_BATMAN;
+use batman::wire::McastAuthForm;
+use batman::wire::McastPacketView;
+use batman::wire::write_mcast;
 use core::time::Duration;
+use interfaces::engine::FrameSink;
 use interfaces::engine::MeshRoutingEngine;
 use interfaces::engine::RoutingAction;
 use interfaces::frame::LinkFrame;
@@ -49,6 +53,7 @@ use crate::auth::OgmAuth;
 use crate::link_quality::LinkQualityTable;
 use crate::link_quality::normalize_quality;
 use crate::routing_table::IdentTable;
+use batman::wire::BATMAN_VERSION;
 
 pub use crate::link_quality::LinkQualityRecord;
 
@@ -158,6 +163,13 @@ pub const DEFAULT_BATMAN_ETHER_TYPE: u16 = 0x4305;
 /// of batman-adv's multicast fanout limit.  Beyond this count, flooding is
 /// cheaper than many point-to-point copies.
 pub const MCAST_FANOUT: usize = 16;
+
+/// The engine refuses a destination list longer than `batman::MAX_MCAST_DESTS`,
+/// and this is the cap the *sender* applies — so they must agree, or a
+/// forwarder would refuse a legitimate maximum-size frame whole and multicast
+/// would fail mesh-wide with nothing pointing at the mismatch. `batman` cannot
+/// depend on `wayfinder`, so the check lives here, where both are visible.
+const _: () = assert!(MCAST_FANOUT == batman::MAX_MCAST_DESTS);
 
 /// Error returned by [`CentralRouter::handle_local`] and
 /// [`CentralRouter::handle_local_mcast`] when the frame cannot be sent onto the
@@ -533,6 +545,12 @@ pub struct CentralRouter<
     /// bounded, here-and-now signal an operator can query; the first such drop
     /// also logs a single `warn!` so it is not entirely silent.
     oversize_drops: u32,
+    /// Multicast destinations lost with a group that could not be emitted —
+    /// see [`mcast_group_drops`](CentralRouter::mcast_group_drops).
+    mcast_group_drops: u32,
+    /// Listeners this node could not route to when *originating* a multicast —
+    /// see [`mcast_unroutable_local`](CentralRouter::mcast_unroutable_local).
+    mcast_unroutable_local: u32,
     /// Whether this node currently has a runtime configuration override
     /// successfully applied (via [`apply_runtime_trickle_config`](CentralRouter::apply_runtime_trickle_config)
     /// or any future method that installs one), as opposed to running purely
@@ -652,6 +670,8 @@ impl<
             pending_self_revocation: None,
             lazy_cert_distribution: false,
             oversize_drops: 0,
+            mcast_group_drops: 0,
+            mcast_unroutable_local: 0,
             runtime_config_active: false,
             cert_req_tx_rate: RateEstimator::default(),
             cert_reply_tx_rate: RateEstimator::default(),
@@ -812,6 +832,54 @@ impl<
     /// [`oversize_drops`]: CentralRouter::oversize_drops
     pub fn relay_oversize_drops(&self) -> u32 {
         self.batman.relay_oversize_drops()
+    }
+
+    /// Multicast destination groups this node routed but could not put on the
+    /// wire — the rebuilt frame did not fit the transmit scratchpad, or the
+    /// shell's staging refused it.
+    ///
+    /// Counts **destinations**, not groups: one refused group can be several
+    /// listeners, and the listener count is what an operator is trying to
+    /// account for. Distinct from the engine's
+    /// [`mcast_emit_overflows`](Self::mcast_emit_overflows), which is the
+    /// engine declining to plan a group at all; this is a group that was
+    /// planned and then lost on the way out.
+    pub fn mcast_group_drops(&self) -> u32 {
+        self.mcast_group_drops
+    }
+
+    /// Record `dests` multicast destinations lost with a group that could not
+    /// be emitted. Called by the driver, which owns the transmit buffers the
+    /// failure comes from; the count lives here so an embedded node has it too.
+    pub fn record_mcast_group_drop(&mut self, dests: usize) {
+        self.mcast_group_drops = self.mcast_group_drops.saturating_add(dests as u32);
+    }
+
+    /// Listeners dropped when this node *originated* a multicast — it held no
+    /// proven next hop for them, or the caller passed more than
+    /// [`MCAST_FANOUT`] of them.
+    ///
+    /// Worse than the relay-side [`mcast_unroutable_dests`](Self::mcast_unroutable_dests):
+    /// this node is the source, so the listener receives nothing at all rather
+    /// than losing one path among several.
+    pub fn mcast_unroutable_local(&self) -> u32 {
+        self.mcast_unroutable_local
+    }
+
+    /// Multicast frames refused whole for a destination list past capacity.
+    pub fn mcast_oversize_lists(&self) -> u32 {
+        self.batman.mcast_oversize_lists()
+    }
+
+    /// Multicast destinations dropped for want of a route — the quiet failure
+    /// of multi-destination multicast.
+    pub fn mcast_unroutable_dests(&self) -> u32 {
+        self.batman.mcast_unroutable_dests()
+    }
+
+    /// Destination groups the engine could not hand to the shell's sink.
+    pub fn mcast_emit_overflows(&self) -> u32 {
+        self.batman.mcast_emit_overflows()
     }
 
     /// Record one oversize-drop of a local host frame.  Emits a single `warn!`
@@ -1111,8 +1179,9 @@ impl<
         iface_idx: usize,
         frame: &'rx LinkFrame,
         tx_buf: &'tx mut [u8],
+        out: &mut dyn FrameSink,
     ) -> RxOutcome<'rx, 'tx> {
-        self.handle_frame_with_metrics(now, iface_idx, frame, LinkMetrics::default(), tx_buf)
+        self.handle_frame_with_metrics(now, iface_idx, frame, LinkMetrics::default(), tx_buf, out)
     }
 
     /// Process a received link-layer frame, folding the radio's
@@ -1143,6 +1212,7 @@ impl<
         frame: &'rx LinkFrame,
         metrics: LinkMetrics,
         tx_buf: &'tx mut [u8],
+        out: &mut dyn FrameSink,
     ) -> RxOutcome<'rx, 'tx> {
         let src = frame.src;
         let dst = frame.dst;
@@ -1354,7 +1424,7 @@ impl<
                                 ) {
                                 let req_hdr = BatmanCertReqPacket {
                                     packet_type: BatmanPacketType::CertReq.as_u8(),
-                                    version: 5,
+                                    version: BATMAN_VERSION,
                                     ttl: 50,
                                     dest: orig,
                                 };
@@ -1406,7 +1476,7 @@ impl<
                 // destination that is not this node is malformed by
                 // construction. Checking it is defense in depth, not tidiness.
                 // The primary check is now
-                // `wayfinder_driver_core::requires_pairwise_tag`: a proof
+                // `wayfinder_driver_core::required_proof`: a proof
                 // sub-type is directed, so an outsider's forgery needs a valid
                 // pairwise trailer whatever link dst it wears, and is dropped
                 // before it ever reaches here. This guard is an independent
@@ -1452,7 +1522,7 @@ impl<
                             } else {
                                 let hdr = BatmanNextHopResponsePacket {
                                     packet_type: BatmanPacketType::NextHopResponse.as_u8(),
-                                    version: 5,
+                                    version: BATMAN_VERSION,
                                 };
                                 tx_buf[..rsp_len].copy_from_slice(hdr.as_bytes());
                                 tx_buf[rsp_len..total].copy_from_slice(&tag);
@@ -1522,7 +1592,9 @@ impl<
                 let mut reply: LinkFrameDataMut<'_> = tx_buf.into();
 
                 // BATMAN-adv Protocol ID
-                let action = self.batman.handle_rx(now, frame, local_quality, &mut reply);
+                let action = self
+                    .batman
+                    .handle_rx(now, frame, local_quality, &mut reply, out);
                 trace!(
                     reply_dst = ?reply.dst,
                     reply_protocol = %format_args!("0x{:04x}", reply.protocol),
@@ -1669,7 +1741,7 @@ impl<
                                 Some(next) if total <= reply.payload.len() => {
                                     let reply_hdr = BatmanCertReplyPacket {
                                         packet_type: BatmanPacketType::CertReply.as_u8(),
-                                        version: 5,
+                                        version: BATMAN_VERSION,
                                         ttl: 50,
                                         dest: requester,
                                     };
@@ -1755,7 +1827,7 @@ impl<
 
                             let rsp = BatmanEchoPacket {
                                 packet_type: BatmanPacketType::EchoReply.as_u8(),
-                                version: 5,
+                                version: BATMAN_VERSION,
                                 ttl: 50,
                                 dest: req.orig,
                                 orig: self.batman.self_ident,
@@ -1861,7 +1933,16 @@ impl<
     fn inner_offset(payload: &[u8]) -> usize {
         match payload.first().copied().and_then(BatmanPacketType::from_u8) {
             Some(BatmanPacketType::Unicast) => core::mem::size_of::<BatmanUnicastPacket>(),
-            Some(BatmanPacketType::Mcast) => core::mem::size_of::<BatmanMcastPacket>(),
+            // **Not just the fixed header.** A multicast frame carries its
+            // destination list between the header and the encapsulated frame,
+            // so the inner payload starts past `n_dests` addresses too.
+            // Skipping only the header hands the host the listeners' MAC
+            // addresses prepended to its own frame. Parsed rather than
+            // arithmetic on a raw byte, so a malformed list yields the whole
+            // length (an empty inner frame) instead of an offset past the end.
+            Some(BatmanPacketType::Mcast) => McastPacketView::parse(payload)
+                .map(|v| payload.len() - v.inner.len())
+                .unwrap_or(payload.len()),
             Some(BatmanPacketType::Bcast) => core::mem::size_of::<BatmanBroadcastPacket>(),
             Some(BatmanPacketType::CertReq) => core::mem::size_of::<BatmanCertReqPacket>(),
             Some(BatmanPacketType::CertReply) => core::mem::size_of::<BatmanCertReplyPacket>(),
@@ -1905,7 +1986,7 @@ impl<
         }
         let hdr = BatmanCertReplyPacket {
             packet_type: BatmanPacketType::CertReply.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             dest: orig,
         };
@@ -1942,50 +2023,114 @@ impl<
         self.batman.set_local_mcast_groups(now, groups);
     }
 
-    /// Wrap host data destined for the multicast listener `dest` in a
-    /// [`BatmanPacketType::Mcast`] packet routed toward its best-known next hop.  Called
-    /// once per target of a [`McastPlan::Unicast`].  Returns
-    /// [`LocalSendError::BufferTooSmall`] if the header plus `payload` would
-    /// not fit in `tx_buf`, [`LocalSendError::AuthLocked`] while
-    /// [`auth_locked`](CentralRouter::auth_locked), or
-    /// [`LocalSendError::RouteUnproven`] if a route to `dest` exists but no
-    /// candidate next hop for it has proven itself.
-    pub fn handle_local_mcast<'a>(
+    /// Wrap host data for a whole set of multicast listeners, emitting one
+    /// frame per next hop into `out` (design 17 §4.2).
+    ///
+    /// Called **once with the entire target set**, not once per listener: the
+    /// router resolves each destination to its next hop and groups by it, so
+    /// listeners sharing a next hop travel in a single frame and every hop they
+    /// share is paid for once. **The sender excludes itself** — a member that
+    /// is also the originator already has the frame — which is why nothing is
+    /// ever addressed back toward the originator.
+    ///
+    /// A destination with no proven next hop is dropped from the list, counted
+    /// via [`mcast_unroutable_dests`](Self::mcast_unroutable_dests), and the
+    /// rest still sent. Returns [`LocalSendError::AuthLocked`] while
+    /// [`auth_locked`](Self::auth_locked), and
+    /// [`LocalSendError::RouteUnproven`] when *no* group could be emitted at
+    /// all — a partial send is `Ok`, so a caller that needs to know how much
+    /// went out reads the counters rather than the result.
+    pub fn handle_local_mcast(
         &mut self,
-        now: core::time::Duration,
-        dest: Mac,
+        now: Duration,
+        dests: &[Mac],
         payload: &[u8],
-        tx_buf: &'a mut [u8],
-    ) -> Result<LinkFrameData<'a>, LocalSendError> {
+        tx_buf: &mut [u8],
+        out: &mut dyn FrameSink,
+    ) -> Result<(), LocalSendError> {
         if self.auth_locked() {
             trace!("drop: auth locked, suppressing local multicast egress");
             return Err(LocalSendError::AuthLocked);
         }
-        let Some(next_hop) = self.resolve_next_hop(now, dest) else {
-            trace!(?dest, "drop: route known but no proven next hop");
+        if dests.is_empty() {
             return Err(LocalSendError::RouteUnproven);
-        };
-
-        let header = BatmanMcastPacket {
-            packet_type: BatmanPacketType::Mcast.as_u8(),
-            version: 5,
-            ttl: 50,
-            dest,
-        };
-        let header_size = core::mem::size_of::<BatmanMcastPacket>();
-        let total_size = header_size + payload.len();
-        if total_size > tx_buf.len() {
-            self.note_oversize_drop();
-            return Err(LocalSendError::BufferTooSmall);
         }
-        tx_buf[..header_size].copy_from_slice(header.as_bytes());
-        tx_buf[header_size..total_size].copy_from_slice(payload);
 
-        Ok(LinkFrameData {
-            dst: next_hop,
-            protocol: ETH_P_BATMAN,
-            payload: &tx_buf[..total_size],
-        })
+        // Resolve every listener to its next hop and group by that hop, so
+        // listeners sharing one travel in a single frame. **The sender excludes
+        // itself**: a member that is also the originator already has the frame,
+        // which is why nothing is ever sent back toward the originator.
+        let mut routed: heapless::Vec<(Mac, Mac), MAX_MCAST_DESTS> = heapless::Vec::new();
+        for &dest in dests {
+            if dest == self.self_ident() {
+                continue;
+            }
+            let Some(next) = self.resolve_next_hop(now, dest) else {
+                // The quiet failure of the whole scheme, and worse here than on
+                // a relay: this node is the source, so the loss is total rather
+                // than a missed forward. Counted, and the rest of the list
+                // still goes.
+                self.mcast_unroutable_local = self.mcast_unroutable_local.saturating_add(1);
+                trace!(?dest, "drop: route known but no proven next hop");
+                continue;
+            };
+            if routed.push((next, dest)).is_err() {
+                // Unreachable while `MCAST_FANOUT == MAX_MCAST_DESTS`, which a
+                // static assertion pins — but this is `pub`, so a caller may
+                // pass a list it did not get from `mcast_targets`. Never a
+                // silent truncation.
+                self.mcast_unroutable_local = self
+                    .mcast_unroutable_local
+                    .saturating_add((dests.len() - routed.len()) as u32);
+                trace!(
+                    dropped = dests.len() - routed.len(),
+                    "drop: listener set past capacity"
+                );
+                break;
+            }
+        }
+        if routed.is_empty() {
+            return Err(LocalSendError::RouteUnproven);
+        }
+
+        let mut done: heapless::Vec<Mac, MAX_MCAST_DESTS> = heapless::Vec::new();
+        let mut emitted = 0usize;
+        for &(next, _) in routed.iter() {
+            if done.contains(&next) {
+                continue;
+            }
+            let _ = done.push(next);
+
+            let mut group: heapless::Vec<Mac, MAX_MCAST_DESTS> = heapless::Vec::new();
+            for &(n, dest) in routed.iter() {
+                if n == next {
+                    let _ = group.push(dest);
+                }
+            }
+
+            let Some(len) = write_mcast(50, McastAuthForm::Tag, &group, payload, tx_buf) else {
+                self.note_oversize_drop();
+                return Err(LocalSendError::BufferTooSmall);
+            };
+            if out.push(LinkFrameData {
+                dst: next,
+                protocol: ETH_P_BATMAN,
+                payload: &tx_buf[..len],
+            }) {
+                emitted += 1;
+            } else {
+                // `trace!`, not `warn!`: a host application drives this at
+                // packet rate, and CLAUDE.md keeps hot paths off the bounded
+                // log ring. The counter is what makes it visible.
+                self.mcast_group_drops = self.mcast_group_drops.saturating_add(group.len() as u32);
+                trace!(?next, "drop: no room to emit a local multicast group");
+            }
+        }
+
+        if emitted == 0 {
+            return Err(LocalSendError::RouteUnproven);
+        }
+        Ok(())
     }
 
     /// Drive periodic router maintenance at time `now`, returning a
@@ -2147,7 +2292,7 @@ impl<
 
         let hdr = BatmanNextHopChallengePacket {
             packet_type: BatmanPacketType::NextHopChallenge.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
         };
         let hdr_len = core::mem::size_of::<BatmanNextHopChallengePacket>();
         let total = hdr_len + nonce.len();
@@ -2400,7 +2545,7 @@ impl<
 
         let hdr = BatmanEchoPacket {
             packet_type: BatmanPacketType::EchoRequest.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             dest: target,
             orig: self.batman.self_ident,
@@ -2658,7 +2803,7 @@ impl<
         if dest == Mac::BROADCAST {
             let header = BatmanBroadcastPacket {
                 packet_type: BatmanPacketType::Bcast.as_u8(),
-                version: 5,
+                version: BATMAN_VERSION,
                 ttl: 50,
                 seqno: self.batman.next_broadcast_seqno().to_be(),
                 orig: self.batman.self_ident,
@@ -2686,7 +2831,7 @@ impl<
         // 2. Build the Unicast Header
         let header = BatmanUnicastPacket {
             packet_type: BatmanPacketType::Unicast.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             dest,
         };
@@ -3026,7 +3171,7 @@ mod cp2_local_delivery {
         let mut payload = Vec::new();
         let hdr = BatmanUnicastPacket {
             packet_type: BatmanPacketType::Unicast.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             dest: mac(1),
         };
@@ -3037,7 +3182,7 @@ mod cp2_local_delivery {
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
 
         let mut tx = [0u8; 256];
-        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx);
+        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx, &mut ());
 
         assert_eq!(outcome.deliver_local, Some(INNER));
         assert!(outcome.forward.is_none());
@@ -3052,7 +3197,7 @@ mod cp2_local_delivery {
         let mut payload = Vec::new();
         let hdr = BatmanBroadcastPacket {
             packet_type: BatmanPacketType::Bcast.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             seqno: 7u32.to_be(),
             orig: mac(2),
@@ -3064,7 +3209,7 @@ mod cp2_local_delivery {
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
 
         let mut tx = [0u8; 256];
-        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx);
+        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx, &mut ());
 
         // Delivered to the local TAP ...
         assert_eq!(outcome.deliver_local, Some(INNER));
@@ -3090,7 +3235,7 @@ mod cp2_local_delivery {
         let mut payload = Vec::new();
         let hdr = BatmanBroadcastPacket {
             packet_type: BatmanPacketType::Bcast.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             seqno: 7u32.to_be(),
             orig: mac(2),
@@ -3104,7 +3249,7 @@ mod cp2_local_delivery {
         // Room for the fixed broadcast header only; no room for INNER.
         let header_size = core::mem::size_of::<BatmanBroadcastPacket>();
         let mut tx = vec![0u8; header_size];
-        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx);
+        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx, &mut ());
 
         assert_eq!(outcome.deliver_local, Some(INNER)); // still delivered locally
         assert!(outcome.forward.is_none()); // but not re-flooded
@@ -3174,7 +3319,7 @@ mod cert_control_delivery {
         let mut payload = Vec::new();
         let hdr = BatmanCertReqPacket {
             packet_type: BatmanPacketType::CertReq.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             dest: mac(1),
         };
@@ -3185,7 +3330,7 @@ mod cert_control_delivery {
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
 
         let mut tx = [0u8; 256];
-        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx);
+        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx, &mut ());
 
         assert!(
             outcome.deliver_local.is_none(),
@@ -3202,7 +3347,7 @@ mod cert_control_delivery {
         let mut payload = Vec::new();
         let hdr = BatmanCertReplyPacket {
             packet_type: BatmanPacketType::CertReply.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             dest: mac(1),
         };
@@ -3213,7 +3358,7 @@ mod cert_control_delivery {
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
 
         let mut tx = [0u8; 256];
-        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx);
+        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx, &mut ());
 
         assert!(outcome.deliver_local.is_none());
         assert!(outcome.forward.is_none());
@@ -3231,7 +3376,7 @@ mod cert_control_delivery {
         let mut ogm_payload = vec![0u8; ogm_hdr_len];
         let ogm = batman::wire::BatmanOgmPacket {
             packet_type: batman::wire::BatmanPacketType::Ogm.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             flags: 0,
             seqno: 1u32.to_be(),
@@ -3244,12 +3389,12 @@ mod cert_control_delivery {
         let ogm_bytes = link_frame_bytes(2, 0xff, &ogm_payload);
         let ogm_frame = LinkFrame::ref_from_bytes(&ogm_bytes).unwrap();
         let mut tx = [0u8; 256];
-        router.handle_frame(core::time::Duration::ZERO, 0, ogm_frame, &mut tx);
+        router.handle_frame(core::time::Duration::ZERO, 0, ogm_frame, &mut tx, &mut ());
 
         let mut payload = Vec::new();
         let hdr = BatmanCertReqPacket {
             packet_type: BatmanPacketType::CertReq.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 10,
             dest: mac(5),
         };
@@ -3260,7 +3405,7 @@ mod cert_control_delivery {
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
 
         let mut tx = [0u8; 256];
-        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx);
+        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx, &mut ());
 
         let fwd = outcome.forward.expect("expected a relay toward node 5");
         assert_eq!(fwd.dst, mac(2)); // next hop toward node 5
@@ -3359,7 +3504,7 @@ mod cert_responder {
         let mut buf = vec![0u8; 512];
         let ogm = BatmanOgmPacket {
             packet_type: BatmanPacketType::Ogm.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl,
             flags: 0,
             seqno: seqno.to_be(),
@@ -3413,7 +3558,7 @@ mod cert_responder {
         let ogm_frame_bytes = link_frame_bytes(3, 0xff, &ogm_bytes);
         let ogm_frame = LinkFrame::ref_from_bytes(&ogm_frame_bytes).unwrap();
         let mut tx = [0u8; 512];
-        router.handle_frame(core::time::Duration::ZERO, 0, ogm_frame, &mut tx);
+        router.handle_frame(core::time::Duration::ZERO, 0, ogm_frame, &mut tx, &mut ());
         assert_eq!(router.originator_table().count(), 1);
 
         // The requester asks for our (mac(1)'s) cert.
@@ -3424,7 +3569,7 @@ mod cert_responder {
         let mut payload = Vec::new();
         let hdr = BatmanCertReqPacket {
             packet_type: batman::wire::BatmanPacketType::CertReq.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             dest: mac(1),
         };
@@ -3434,7 +3579,8 @@ mod cert_responder {
         let req_frame = LinkFrame::ref_from_bytes(&req_frame_bytes).unwrap();
 
         let mut tx = [0u8; 512];
-        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, req_frame, &mut tx);
+        let outcome =
+            router.handle_frame(core::time::Duration::ZERO, 0, req_frame, &mut tx, &mut ());
 
         let fwd = outcome
             .forward
@@ -3492,7 +3638,7 @@ mod cert_responder {
         let mut payload = Vec::new();
         let hdr = BatmanCertReqPacket {
             packet_type: batman::wire::BatmanPacketType::CertReq.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             dest: mac(1),
         };
@@ -3502,7 +3648,8 @@ mod cert_responder {
         let req_frame = LinkFrame::ref_from_bytes(&req_frame_bytes).unwrap();
 
         let mut tx = [0u8; 512];
-        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, req_frame, &mut tx);
+        let outcome =
+            router.handle_frame(core::time::Duration::ZERO, 0, req_frame, &mut tx, &mut ());
         assert!(outcome.forward.is_none(), "no route yet: must not answer");
         assert!(
             router.auth().unwrap().has_pending_reply(mac(3)),
@@ -3516,7 +3663,8 @@ mod cert_responder {
         let ogm_frame_bytes = link_frame_bytes(3, 0xff, &ogm_bytes);
         let ogm_frame = LinkFrame::ref_from_bytes(&ogm_frame_bytes).unwrap();
         let mut tx = [0u8; 512];
-        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, ogm_frame, &mut tx);
+        let outcome =
+            router.handle_frame(core::time::Duration::ZERO, 0, ogm_frame, &mut tx, &mut ());
 
         let fwd = outcome
             .forward
@@ -3534,7 +3682,7 @@ mod cert_responder {
         let mut buf = vec![0u8; 512];
         let ogm = BatmanOgmPacket {
             packet_type: BatmanPacketType::Ogm.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl,
             flags: 0,
             seqno: seqno.to_be(),
@@ -3586,7 +3734,8 @@ mod cert_responder {
         let ogm_frame_bytes = link_frame_bytes(2, 0xff, &ogm_bytes);
         let ogm_frame = LinkFrame::ref_from_bytes(&ogm_frame_bytes).unwrap();
         let mut tx = [0u8; 512];
-        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, ogm_frame, &mut tx);
+        let outcome =
+            router.handle_frame(core::time::Duration::ZERO, 0, ogm_frame, &mut tx, &mut ());
         assert!(
             outcome.forward.is_some(),
             "an unresolved fingerprint must trigger a CertReq fetch"
@@ -3640,7 +3789,7 @@ mod cert_responder {
         let ogm_frame_bytes = link_frame_bytes(3, 0xff, &ogm_bytes);
         let ogm_frame = LinkFrame::ref_from_bytes(&ogm_frame_bytes).unwrap();
         let mut tx = [0u8; 512];
-        router.handle_frame(core::time::Duration::ZERO, 0, ogm_frame, &mut tx);
+        router.handle_frame(core::time::Duration::ZERO, 0, ogm_frame, &mut tx, &mut ());
 
         let mut req_buf = [0u8; 512];
         let req_len = requester_auth
@@ -3649,7 +3798,7 @@ mod cert_responder {
         let mut payload = Vec::new();
         let hdr = BatmanCertReqPacket {
             packet_type: batman::wire::BatmanPacketType::CertReq.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             dest: mac(1),
         };
@@ -3658,7 +3807,8 @@ mod cert_responder {
         let req_frame_bytes = link_frame_bytes(3, 1, &payload);
         let req_frame = LinkFrame::ref_from_bytes(&req_frame_bytes).unwrap();
         let mut tx = [0u8; 512];
-        let outcome = router.handle_frame(core::time::Duration::ZERO, 0, req_frame, &mut tx);
+        let outcome =
+            router.handle_frame(core::time::Duration::ZERO, 0, req_frame, &mut tx, &mut ());
         assert!(outcome.forward.is_some(), "must answer immediately");
 
         assert!(
@@ -3675,7 +3825,6 @@ mod mcast_forwarding {
     //! the listener count is within [`MCAST_FANOUT`], else flooded.
 
     use super::*;
-    use batman::wire::BatmanMcastPacket;
     use batman::wire::BatmanOgmPacket;
     use batman::wire::BatmanPacketType;
     use batman::wire::BatmanTvlvHdr;
@@ -3706,6 +3855,26 @@ mod mcast_forwarding {
         v
     }
 
+    /// Feed `router` an OGM originated by `orig` but relayed by `via`, so the
+    /// router learns `via` as the next hop toward `orig`.
+    fn learn_route_via(router: &mut CentralRouter, orig: Mac, via: Mac, seqno: u32) {
+        let ogm = BatmanOgmPacket {
+            packet_type: BatmanPacketType::Ogm.as_u8(),
+            version: BATMAN_VERSION,
+            ttl: 50,
+            flags: 0,
+            seqno: seqno.to_be(),
+            orig,
+            reserved: 0,
+            tq: 255,
+            tvlv_len: 0,
+        };
+        let bytes = link_frame_bytes(via, Mac::BROADCAST, ogm.as_bytes());
+        let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
+        let mut tx = [0u8; 256];
+        router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx, &mut ());
+    }
+
     /// Feed `router` an OGM from `orig` announcing interest in `groups`, so the
     /// router learns `orig` as a listener for them.
     fn learn_listener(router: &mut CentralRouter, orig: Mac, seqno: u32, groups: &[Mac]) {
@@ -3721,7 +3890,7 @@ mod mcast_forwarding {
         let tvlv_total = core::mem::size_of::<BatmanTvlvHdr>() + value.len();
         let ogm = BatmanOgmPacket {
             packet_type: BatmanPacketType::Ogm.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             flags: 0,
             seqno: seqno.to_be(),
@@ -3737,7 +3906,7 @@ mod mcast_forwarding {
         let bytes = link_frame_bytes(orig, Mac::BROADCAST, &payload);
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
         let mut tx = [0u8; 256];
-        router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx);
+        router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx, &mut ());
     }
 
     /// With no known listeners for a group, the plan is to flood.
@@ -3771,22 +3940,116 @@ mod mcast_forwarding {
         assert_eq!(router.mcast_plan(group(5)), McastPlan::Flood);
     }
 
-    /// `handle_local_mcast` wraps the frame in a BatmanPacketType::Mcast packet addressed
-    /// to the given listener, preserving the inner payload.
+    /// A frame sink that records what the router emitted.
+    #[derive(Default)]
+    pub(super) struct Collect(pub Vec<(Mac, Vec<u8>)>);
+
+    impl interfaces::engine::FrameSink for Collect {
+        fn push(&mut self, f: interfaces::frame::LinkFrameData<'_>) -> bool {
+            self.0.push((f.dst, f.payload.to_vec()));
+            true
+        }
+    }
+
+    /// `handle_local_mcast` wraps the frame in an `Mcast` packet naming the
+    /// listener, preserving the inner payload.
     #[test]
     fn handle_local_mcast_wraps_in_mcast_packet() {
+        use batman::wire::McastPacketView;
+
         let mut router = CentralRouter::new(mac(1));
         let mut tx = [0u8; 256];
-        let out = router
-            .handle_local_mcast(Duration::ZERO, mac(7), INNER, &mut tx)
+        let mut out = Collect::default();
+        router
+            .handle_local_mcast(Duration::ZERO, &[mac(7)], INNER, &mut tx, &mut out)
             .expect("mcast packet should build");
 
-        assert_eq!(out.protocol, ETH_P_BATMAN);
-        let (hdr, rest) = BatmanMcastPacket::ref_from_prefix(out.payload).unwrap();
-        assert_eq!(hdr.packet_type, BatmanPacketType::Mcast.as_u8());
-        assert_eq!(hdr.dest, mac(7));
-        assert!(hdr.ttl > 1);
-        assert_eq!(&rest[..INNER.len()], INNER);
+        assert_eq!(out.0.len(), 1);
+        let (dst, payload) = &out.0[0];
+        assert_eq!(*dst, mac(7));
+        let view = McastPacketView::parse(payload).unwrap();
+        assert_eq!(view.header.packet_type, BatmanPacketType::Mcast.as_u8());
+        assert_eq!(view.dests, &[mac(7)]);
+        assert!(view.header.ttl > 1);
+        assert_eq!(view.inner, INNER);
+    }
+
+    /// **The batching the design exists for, at the sender.** Listeners
+    /// sharing a next hop travel in one frame naming all of them, not one
+    /// frame each.
+    #[test]
+    fn local_mcast_batches_listeners_that_share_a_next_hop() {
+        use batman::wire::McastPacketView;
+
+        let mut router = CentralRouter::new(mac(1));
+        // Nothing is known about 4, 5 or 6, so each resolves to itself as a
+        // presumed direct neighbour — three distinct next hops, three frames.
+        let mut tx = [0u8; 256];
+        let mut split = Collect::default();
+        router
+            .handle_local_mcast(
+                Duration::ZERO,
+                &[mac(4), mac(5), mac(6)],
+                INNER,
+                &mut tx,
+                &mut split,
+            )
+            .unwrap();
+        assert_eq!(split.0.len(), 3, "distinct next hops do not merge");
+
+        // Learn that all three sit behind node 2, and the same call now costs
+        // one frame carrying all three destinations.
+        for (i, d) in [4u8, 5, 6].iter().enumerate() {
+            learn_route_via(&mut router, mac(*d), mac(2), i as u32 + 1);
+        }
+        let mut batched = Collect::default();
+        router
+            .handle_local_mcast(
+                Duration::ZERO,
+                &[mac(4), mac(5), mac(6)],
+                INNER,
+                &mut tx,
+                &mut batched,
+            )
+            .unwrap();
+
+        assert_eq!(batched.0.len(), 1, "one next hop is one frame");
+        assert_eq!(batched.0[0].0, mac(2));
+        let view = McastPacketView::parse(&batched.0[0].1).unwrap();
+        assert_eq!(view.dests, &[mac(4), mac(5), mac(6)]);
+    }
+
+    /// **The sender excludes itself** — a member that is also the originator
+    /// already has the frame, which is why nothing is ever sent back toward
+    /// the originator.
+    #[test]
+    fn local_mcast_never_addresses_the_sender() {
+        use batman::wire::McastPacketView;
+
+        let mut router = CentralRouter::new(mac(1));
+        let mut tx = [0u8; 256];
+        let mut out = Collect::default();
+        router
+            .handle_local_mcast(Duration::ZERO, &[mac(1), mac(7)], INNER, &mut tx, &mut out)
+            .unwrap();
+
+        assert_eq!(out.0.len(), 1);
+        let view = McastPacketView::parse(&out.0[0].1).unwrap();
+        assert_eq!(view.dests, &[mac(7)], "our own ident never appears");
+    }
+
+    /// A list that resolves to nothing routable is an error, not an empty
+    /// success — the caller asked for delivery that did not happen.
+    #[test]
+    fn local_mcast_with_no_routable_listener_is_an_error() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut tx = [0u8; 256];
+        let mut out = Collect::default();
+        assert!(matches!(
+            router.handle_local_mcast(Duration::ZERO, &[mac(1)], INNER, &mut tx, &mut out),
+            Err(LocalSendError::RouteUnproven)
+        ));
+        assert!(out.0.is_empty());
     }
 
     /// A host frame that does not fit the transmit buffer once wrapped is
@@ -4011,7 +4274,7 @@ mod throughput {
         let mut t = Duration::ZERO;
         for _ in 0..50 {
             let frame = LinkFrame::ref_from_bytes(&frame_bytes).unwrap();
-            router.handle_frame(t, 0, frame, &mut tx);
+            router.handle_frame(t, 0, frame, &mut tx, &mut ());
             t += Duration::from_millis(100);
         }
         let tp = router.interface_throughput(0, t).unwrap();
@@ -4075,7 +4338,7 @@ mod node_metrics {
     fn feed_direct_ogm(router: &mut CentralRouter, orig: Mac, seqno: u32, tq: u8) {
         let ogm = BatmanOgmPacket {
             packet_type: BatmanPacketType::Ogm.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             flags: 0,
             seqno: seqno.to_be(),
@@ -4087,7 +4350,7 @@ mod node_metrics {
         let bytes = link_frame_bytes(orig, Mac::BROADCAST, ogm.as_bytes());
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
         let mut tx = [0u8; 256];
-        router.handle_frame(Duration::ZERO, 0, frame, &mut tx);
+        router.handle_frame(Duration::ZERO, 0, frame, &mut tx, &mut ());
     }
 
     /// A fresh router reports empty, non-zero-capacity tables and no neighbours.
@@ -4160,7 +4423,7 @@ mod keepalive_route_selection {
     ) {
         let ogm = BatmanOgmPacket {
             packet_type: BatmanPacketType::Ogm.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             flags: 0,
             seqno: seqno.to_be(),
@@ -4172,7 +4435,7 @@ mod keepalive_route_selection {
         let bytes = link_frame_bytes(via, Mac::BROADCAST, ogm.as_bytes());
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
         let mut tx = [0u8; 256];
-        router.handle_frame(now, iface_idx, frame, &mut tx);
+        router.handle_frame(now, iface_idx, frame, &mut tx, &mut ());
     }
 
     /// Feed one keep-alive heartbeat from immediate neighbor `via` on
@@ -4180,12 +4443,12 @@ mod keepalive_route_selection {
     fn feed_keepalive_via(router: &mut CentralRouter, via: Mac, iface_idx: usize, now: Duration) {
         let pkt = BatmanKeepAlivePacket {
             packet_type: BatmanPacketType::Keepalive.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
         };
         let bytes = link_frame_bytes(via, Mac::BROADCAST, pkt.as_bytes());
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
         let mut tx = [0u8; 256];
-        router.handle_frame(now, iface_idx, frame, &mut tx);
+        router.handle_frame(now, iface_idx, frame, &mut tx, &mut ());
     }
 
     /// Set up two alternate paths to `dest`: a high-TQ path via neighbor 2 on
@@ -4330,7 +4593,7 @@ mod tq_clamp_integration {
     fn ogm_frame_bytes(orig: Mac, tq: u8) -> Vec<u8> {
         let ogm = BatmanOgmPacket {
             packet_type: BatmanPacketType::Ogm.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             flags: 0,
             seqno: 1u32.to_be(),
@@ -4357,7 +4620,7 @@ mod tq_clamp_integration {
         let bytes = ogm_frame_bytes(mac(2), 255);
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
         let mut tx = [0u8; 256];
-        router.handle_frame(Duration::ZERO, 0, frame, &mut tx);
+        router.handle_frame(Duration::ZERO, 0, frame, &mut tx, &mut ());
         assert_eq!(router.batman.originator_table[&mac(2)].max_tq, 245);
     }
 
@@ -4373,7 +4636,7 @@ mod tq_clamp_integration {
             snr_db: None,
             quality: Some(40),
         };
-        router.handle_frame_with_metrics(Duration::ZERO, 0, frame, metrics, &mut tx);
+        router.handle_frame_with_metrics(Duration::ZERO, 0, frame, metrics, &mut tx, &mut ());
         assert_eq!(router.batman.originator_table[&mac(2)].max_tq, 40);
     }
 }
@@ -4483,7 +4746,7 @@ mod ogm_auth_integration {
         let bytes = link_frame(src, ogm);
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
         let mut tx = [0u8; 1500];
-        b.handle_frame(Duration::ZERO, 0, frame, &mut tx);
+        b.handle_frame(Duration::ZERO, 0, frame, &mut tx, &mut ());
         b.originator_count()
     }
 
@@ -4494,7 +4757,7 @@ mod ogm_auth_integration {
         let bytes = link_frame(src, ogm);
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
         let mut tx = [0u8; 1500];
-        b.handle_frame(Duration::ZERO, iface, frame, &mut tx);
+        b.handle_frame(Duration::ZERO, iface, frame, &mut tx, &mut ());
         b.originator_count()
     }
 
@@ -4692,7 +4955,7 @@ mod ogm_auth_integration {
         assert!(node.auth_locked());
 
         let mut tx = [0u8; 1500];
-        let outcome = node.handle_frame(Duration::ZERO, 0, frame, &mut tx);
+        let outcome = node.handle_frame(Duration::ZERO, 0, frame, &mut tx, &mut ());
         assert!(outcome.forward.is_none(), "a locked node forwards nothing");
         assert!(
             outcome.deliver_local.is_none(),
@@ -4813,7 +5076,13 @@ mod ogm_auth_integration {
 
         let mut tx = [0u8; 256];
         assert!(matches!(
-            node.handle_local_mcast(Duration::ZERO, mac(9), b"payload", &mut tx),
+            node.handle_local_mcast(
+                Duration::ZERO,
+                &[mac(9)],
+                b"payload",
+                &mut tx,
+                &mut super::mcast_forwarding::Collect::default()
+            ),
             Err(LocalSendError::AuthLocked)
         ));
 
@@ -4826,8 +5095,14 @@ mod ogm_auth_integration {
         node.set_auth(auth);
         assert!(!node.auth_locked());
         assert!(
-            node.handle_local_mcast(Duration::ZERO, mac(9), b"payload", &mut tx)
-                .is_ok()
+            node.handle_local_mcast(
+                Duration::ZERO,
+                &[mac(9)],
+                b"payload",
+                &mut tx,
+                &mut super::mcast_forwarding::Collect::default()
+            )
+            .is_ok()
         );
     }
 
@@ -4842,7 +5117,7 @@ mod ogm_auth_integration {
         let mut payload = Vec::new();
         let hdr = BatmanBroadcastPacket {
             packet_type: BatmanPacketType::Bcast.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             seqno: 7u32.to_be(),
             orig: mac(1),
@@ -4862,7 +5137,7 @@ mod ogm_auth_integration {
         assert!(node.auth_locked());
 
         let mut tx = [0u8; 256];
-        let outcome = node.handle_frame(Duration::ZERO, 0, frame, &mut tx);
+        let outcome = node.handle_frame(Duration::ZERO, 0, frame, &mut tx, &mut ());
         assert!(
             outcome.forward.is_none(),
             "a locked node must not forward a data-plane frame"
@@ -4881,7 +5156,7 @@ mod ogm_auth_integration {
         let bytes = link_frame(src, payload);
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
         let mut tx = [0u8; 512];
-        b.handle_frame(now, iface_idx, frame, &mut tx);
+        b.handle_frame(now, iface_idx, frame, &mut tx, &mut ());
     }
 
     /// A single spoofed keep-alive can no longer resurrect a genuinely dead
@@ -5211,7 +5486,7 @@ mod ogm_auth_integration {
         let mut payload = Vec::new();
         let hdr = BatmanBroadcastPacket {
             packet_type: BatmanPacketType::Bcast.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             seqno: 7u32.to_be(),
             // Originated by an honest third party — only the relay is revoked.
@@ -5228,7 +5503,7 @@ mod ogm_auth_integration {
         assert!(node.ingest_revocation(&record, Duration::ZERO));
 
         let mut tx = [0u8; 256];
-        let outcome = node.handle_frame(Duration::ZERO, 0, frame, &mut tx);
+        let outcome = node.handle_frame(Duration::ZERO, 0, frame, &mut tx, &mut ());
         assert!(
             outcome.forward.is_none(),
             "a revoked node's relayed frame must not be re-flooded"
@@ -5416,7 +5691,7 @@ mod link_features_tests {
     fn ogm_payload(orig: Mac) -> Vec<u8> {
         batman::wire::BatmanOgmPacket {
             packet_type: BatmanPacketType::Ogm.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             flags: 0,
             seqno: 1u32.to_be(),
@@ -5433,7 +5708,7 @@ mod link_features_tests {
     fn bcast_payload(orig: Mac, inner: &[u8]) -> Vec<u8> {
         let mut v = BatmanBroadcastPacket {
             packet_type: BatmanPacketType::Bcast.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             seqno: 1u32.to_be(),
             orig,
@@ -5448,7 +5723,7 @@ mod link_features_tests {
     fn unicast_payload(dest: Mac, inner: &[u8]) -> Vec<u8> {
         let mut v = BatmanUnicastPacket {
             packet_type: BatmanPacketType::Unicast.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             dest,
         }
@@ -5467,7 +5742,7 @@ mod link_features_tests {
         tx: &'r mut [u8],
     ) -> RxOutcome<'r, 'r> {
         let frame = LinkFrame::ref_from_bytes(raw).unwrap();
-        r.handle_frame(Duration::ZERO, iface, frame, tx)
+        r.handle_frame(Duration::ZERO, iface, frame, tx, &mut ())
     }
 
     /// An unconfigured interface reports full participation; every flag is set.
@@ -5948,7 +6223,7 @@ mod self_revocation {
         // The peer's next OGM carries it.
         let ogm = BatmanOgmPacket {
             packet_type: batman::wire::BatmanPacketType::Ogm.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             flags: 0,
             seqno: 7u32.to_be(),
@@ -5971,7 +6246,13 @@ mod self_revocation {
         let frame = LinkFrame::ref_from_bytes(&frame_bytes).unwrap();
 
         let mut tx = [0u8; 1024];
-        let out = victim.handle_frame(core::time::Duration::from_secs(1), 0, frame, &mut tx);
+        let out = victim.handle_frame(
+            core::time::Duration::from_secs(1),
+            0,
+            frame,
+            &mut tx,
+            &mut (),
+        );
 
         assert!(victim.self_revoked(), "the flooded record took effect");
         assert!(victim.auth().is_none());
@@ -6046,7 +6327,7 @@ mod ping_router {
     fn ogm(orig: u8, seqno: u32, ttl: u8, tq: u8) -> Vec<u8> {
         BatmanOgmPacket {
             packet_type: BatmanPacketType::Ogm.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl,
             flags: 0,
             seqno: seqno.to_be(),
@@ -6064,7 +6345,7 @@ mod ping_router {
         let bytes = link_frame_bytes(via, 0xff, &ogm(orig, 1, 50, 255));
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
         let mut tx = [0u8; 512];
-        router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx);
+        router.handle_frame(core::time::Duration::ZERO, 0, frame, &mut tx, &mut ());
     }
 
     /// Feed `payload` to `router` as if it arrived from `src`, returning what
@@ -6078,7 +6359,7 @@ mod ping_router {
         let bytes = link_frame_bytes(src, 1, payload);
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
         let mut tx = [0u8; 512];
-        let out = router.handle_frame(now, 0, frame, &mut tx);
+        let out = router.handle_frame(now, 0, frame, &mut tx, &mut ());
         out.forward.map(|f| f.payload.to_vec())
     }
 
@@ -6086,7 +6367,7 @@ mod ping_router {
     fn echo_request(dest: u8, orig: u8, seqno: u16, hops: u8, pad: &[u8]) -> Vec<u8> {
         let hdr = BatmanEchoPacket {
             packet_type: BatmanPacketType::EchoRequest.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             dest: mac(dest),
             orig: mac(orig),
@@ -6363,7 +6644,7 @@ mod ping_router {
 
         let reply = BatmanEchoPacket {
             packet_type: BatmanPacketType::EchoReply.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             dest: mac(1),
             orig: mac(9),
@@ -6420,7 +6701,7 @@ mod ping_router {
 
         let stale = BatmanEchoPacket {
             packet_type: BatmanPacketType::EchoReply.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             dest: mac(1),
             orig: mac(9),
@@ -6470,7 +6751,7 @@ mod ping_router {
         // The old session's reply arrives late.
         let reply = BatmanEchoPacket {
             packet_type: BatmanPacketType::EchoReply.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             dest: mac(1),
             orig: mac(9),

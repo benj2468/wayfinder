@@ -282,7 +282,8 @@ impl LinkTestRouter {
         let mut buf = [0u8; MAX_LINK_FRAME_LEN];
         let frame = parse_frame(raw);
         self.with_router_mut(|router| {
-            let _ = router.handle_frame_with_metrics(now, iface_idx, frame, metrics, &mut buf);
+            let _ =
+                router.handle_frame_with_metrics(now, iface_idx, frame, metrics, &mut buf, &mut ());
         })
         .await;
     }

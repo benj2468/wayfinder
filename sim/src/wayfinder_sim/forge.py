@@ -33,9 +33,14 @@ PACKET_NEXT_HOP_RESPONSE = 0x09
 """`batman::wire::BatmanPacketType` discriminants, as the first payload
 byte."""
 
-OGM_VERSION = 5
-"""The BATMAN protocol version wayfinder emits; an OGM claiming another is
-dropped as unparseable rather than routed."""
+OGM_VERSION = wf.BATMAN_VERSION
+"""The BATMAN protocol version wayfinder emits, read from the router itself
+rather than repeated here.
+
+`handle_rx` checks this byte for exact equality and drops anything else, so a
+forge stamping a stale number sends frames that never reach the control being
+attacked — every attack then reports HELD because nothing it sent was parsed,
+which is the most dangerous way for a security suite to pass."""
 
 LINK_HEADER_LEN = 14
 """`[dst:6][src:6][protocol:2]` — the fixed link header every mesh frame

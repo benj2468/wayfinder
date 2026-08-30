@@ -50,6 +50,12 @@ fn wayfinder_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMembershipCert>()?;
     m.add_class::<PyRevocationRecord>()?;
     m.add_class::<PyAuthority>()?;
+    // The BATMAN protocol version this build speaks, so the simulator's frame
+    // forge stamps the same one the router accepts rather than duplicating the
+    // number. A version bump used to leave the forge behind, and every forged
+    // frame was then dropped on the ingress version check — the whole red-team
+    // battery reporting HELD because nothing it sent was ever parsed.
+    m.add("BATMAN_VERSION", wayfinder::batman::wire::BATMAN_VERSION)?;
     m.add_function(wrap_pyfunction!(init_tracing, m)?)?;
     m.add("WayfinderError", m.py().get_type::<WayfinderError>())?;
     m.add(

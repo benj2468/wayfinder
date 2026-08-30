@@ -130,6 +130,16 @@ impl TestRouter {
         }
     }
 
+    /// Declare interface `idx`'s native fan-out — the destination count at
+    /// which one send on that medium beats one directed copy each.
+    ///
+    /// Set from the topology: an interface on a shared switch reaches every
+    /// other machine on it in one send, so multicast destination groups behind
+    /// it collapse onto a single transmission (design 17 §4.5).
+    pub fn set_fan_out(&mut self, idx: usize, fan_out: Option<core::num::NonZeroU8>) {
+        self.driver.set_fan_out(idx, fan_out);
+    }
+
     /// The underlying router, for inspecting routing state (originator tables,
     /// route resolution).
     pub fn router(&self) -> &CentralRouter {
@@ -253,10 +263,14 @@ impl TestRouter {
     ) {
         let mut buf = [0u8; MAX_LINK_FRAME_LEN];
         let frame = parse_frame(raw);
-        let _ = self
-            .driver
-            .router_mut()
-            .handle_frame_with_metrics(now, iface_idx, frame, metrics, &mut buf);
+        let _ = self.driver.router_mut().handle_frame_with_metrics(
+            now,
+            iface_idx,
+            frame,
+            metrics,
+            &mut buf,
+            &mut (),
+        );
     }
 
     // ── port plumbing ────────────────────────────────────────────────────────

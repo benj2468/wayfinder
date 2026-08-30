@@ -22,7 +22,7 @@
 //! and *directed* data-plane frames.  Directed frames carry the pairwise
 //! trailer (see [`DIRECTED_TRAILER_LEN`]), which `strip_directed` verifies on
 //! the way in.  Which sub-types those are is
-//! `wayfinder_driver_core::requires_pairwise_tag`'s single decision — see its
+//! `wayfinder_driver_core::required_proof`'s single decision — see its
 //! doc for the current list and the reasoning per type, rather than a copy
 //! here that can drift.  `BatmanPacketType::Bcast` is the notable exclusion:
 //! flooded frames (ARP etc.) are **not** authenticated at all — a pairwise tag
@@ -76,6 +76,12 @@ const SIG_DOMAIN: &[u8] = b"wf-ogm-sig-v1";
 /// replayed as) an OGM signature over the same bytes.
 const KEEPALIVE_SIG_DOMAIN: &[u8] = b"wf-keepalive-sig-v1";
 
+/// Domain prefix for a fan-out multicast signature, distinct from every other
+/// so one can never stand in for another: a frame signed to fan out on a
+/// shared medium is not an OGM, a keep-alive, or a cert request, and none of
+/// those can be replayed as one.
+const FANOUT_SIG_DOMAIN: &[u8] = b"wf-mcast-fanout-sig-v1";
+
 /// Width, in seconds, of the coarse time bucket a keep-alive signs over.
 /// Keep-alives carry no sequence number ([`batman::wire::BatmanKeepAlivePacket`]
 /// is deliberately minimal), so this — together with
@@ -100,6 +106,33 @@ const KEEPALIVE_TRAILER_LEN: usize = 8 + SIG_LEN;
 /// multicast frames when auth is enabled: an 8-byte big-endian replay counter
 /// followed by the 16-byte pairwise tag.
 pub const DIRECTED_TRAILER_LEN: usize = 8 + TAG_LEN;
+
+/// Length of the **fan-out** authentication trailer, appended to a multicast
+/// frame that one transmission carries to several next hops: the same 8-byte
+/// big-endian replay counter followed by the sender's 64-byte Ed25519
+/// signature.
+///
+/// A single transmission reaching three neighbours cannot carry three pairwise
+/// tags, each derived from a different key — so the forwarding node signs with
+/// its own instead, and every receiver verifies against the cert it already
+/// holds for that hop. The counter is kept because `Mcast` already had a replay
+/// guard; being one-to-many is no reason to lose it.
+pub const FANOUT_TRAILER_LEN: usize = 8 + SIG_LEN;
+
+/// The largest auth trailer a directed frame can carry, and so the space a
+/// driver must reserve behind a staged frame before asking for it to be
+/// authenticated.
+///
+/// A caller cannot know which form a frame will take until its sub-type (and,
+/// for multicast, its `form` byte) has been classified, and reserving the
+/// *smaller* of the two would leave a fan-out signature writing past the end of
+/// the buffer. Reserving this always costs a multicast frame 48 bytes it may
+/// not use; that is cheaper than the alternative by every measure that matters.
+pub const MAX_TRAILER_LEN: usize = if FANOUT_TRAILER_LEN > DIRECTED_TRAILER_LEN {
+    FANOUT_TRAILER_LEN
+} else {
+    DIRECTED_TRAILER_LEN
+};
 
 /// Maximum number of revocation records held in the local revocation set.
 pub(crate) const MAX_REVOKED: usize = 32;
@@ -397,8 +430,21 @@ pub struct OgmAuth<
     /// Reused scratch buffer for assembling the OGM signed message, so signing
     /// and verifying do not stack-allocate it on every call.
     sign_scratch: [u8; SIGN_SCRATCH_LEN],
-    /// Per-neighbor outgoing replay counter for directed data-plane frames.
-    send_counters: HVec<(Mac, u64), MAX_NEIGHBOR_KEYS>,
+    /// The node's **single** outgoing directed-frame counter, shared by every
+    /// destination and by fan-out frames alike (design 17 §4.4).
+    ///
+    /// Per-destination counters worked while every directed frame had exactly
+    /// one destination. A fan-out frame has none, and drawing its counter from
+    /// any one recipient's space would hand the others a value below their own
+    /// high-water mark, dropping a legitimate frame as a replay. One sequence
+    /// avoids that with no receiver change at all: `accept_recv_counter` keys
+    /// on `src` alone, and any subsequence of a strictly increasing sequence is
+    /// strictly increasing.
+    ///
+    /// What it gives up is that a neighbour can infer this node's total
+    /// directed-frame volume rather than only its own share — already visible
+    /// to anyone on the medium.
+    send_counter: u64,
     /// Per-neighbor highest accepted incoming counter (monotonic replay guard).
     recv_counters: HVec<(Mac, u64), MAX_NEIGHBOR_KEYS>,
     /// A verified revocation naming **this** node, held until the router
@@ -466,7 +512,7 @@ impl<
             revocations: HVec::new(),
             neighbors: HVec::new(),
             sign_scratch: [0u8; SIGN_SCRATCH_LEN],
-            send_counters: HVec::new(),
+            send_counter: 0,
             recv_counters: HVec::new(),
             self_revocation: None,
             trickle_reset_hint: false,
@@ -748,9 +794,6 @@ impl<
         if let Some(i) = self.neighbors.iter().position(|n| n.cert.mac == mac) {
             self.neighbors.swap_remove(i);
         }
-        if let Some(i) = self.send_counters.iter().position(|(m, _)| *m == mac) {
-            self.send_counters.swap_remove(i);
-        }
         if let Some(i) = self.recv_counters.iter().position(|(m, _)| *m == mac) {
             self.recv_counters.swap_remove(i);
         }
@@ -916,11 +959,99 @@ impl<
         }
         let key = self.live_neighbor(dst).map(|n| n.pairwise_key)?;
         let src_mac = self.cert.node_mac;
-        let counter = self.next_send_counter(dst)?;
+        let counter = self.next_send_counter()?;
         let tag = frame_tag(&key, counter, &src_mac, frame);
         trailer[..8].copy_from_slice(&counter.to_be_bytes());
         trailer[8..DIRECTED_TRAILER_LEN].copy_from_slice(&tag);
         Some(DIRECTED_TRAILER_LEN)
+    }
+
+    /// Sign a multicast frame that one transmission will carry to **several**
+    /// next hops, writing the trailer `[counter:u64 BE][sig:64]` into `trailer`
+    /// and returning its length.
+    ///
+    /// This is the fan-out half of design 17 §4.4. A pairwise tag is derived
+    /// from one neighbour's key, so it cannot cover an audience of three; the
+    /// forwarding node vouches for the frame with its own signature instead,
+    /// and each receiver checks it against the cert it already holds. That is
+    /// the same trust model, not a weaker one — `plan_dispatch` already re-tags
+    /// every directed frame it forwards, so directed traffic is vouched for hop
+    /// by hop rather than end to end either way.
+    ///
+    /// The signature covers the whole frame, header and destination list
+    /// included, which is what makes routing on an in-band list safe: a hop
+    /// cannot rewrite the list without its successor rejecting the frame.
+    ///
+    /// Returns `None` (and the caller must not send the frame) if the trailer
+    /// is too small or no counter can be allocated — never an unsigned or
+    /// counter-reused fan-out frame.
+    pub fn sign_fanout(&mut self, frame: &[u8], trailer: &mut [u8]) -> Option<usize> {
+        if trailer.len() < FANOUT_TRAILER_LEN {
+            return None;
+        }
+        let counter = self.next_send_counter()?;
+        let msg = Self::fanout_message(counter, frame);
+        let sig = self.keypair.sign(&msg);
+        trailer[..8].copy_from_slice(&counter.to_be_bytes());
+        trailer[8..FANOUT_TRAILER_LEN].copy_from_slice(&sig);
+        Some(FANOUT_TRAILER_LEN)
+    }
+
+    /// Verify a fan-out multicast `trailer` from neighbor `src`.
+    ///
+    /// Goes through the same live-neighbour lookup as
+    /// [`verify_directed`](Self::verify_directed), so a node whose OGM has not
+    /// been accepted — and one whose keys `evict_neighbor` dropped on
+    /// revocation — cannot be believed. Returns `false` (drop) on a malformed
+    /// trailer, an unknown sender, a bad signature, or a replayed counter.
+    pub fn verify_fanout(&mut self, src: Mac, frame: &[u8], trailer: &[u8]) -> bool {
+        if trailer.len() != FANOUT_TRAILER_LEN {
+            tracing::trace!("auth: dropping fan-out frame with malformed trailer");
+            return false;
+        }
+        let Some(key) = self.live_neighbor(src).map(|n| n.cert.ed_pubkey) else {
+            tracing::trace!("auth: dropping fan-out frame from an unverified neighbor");
+            return false;
+        };
+        let mut counter_bytes = [0u8; 8];
+        counter_bytes.copy_from_slice(&trailer[..8]);
+        let counter = u64::from_be_bytes(counter_bytes);
+
+        let msg = Self::fanout_message(counter, frame);
+        let mut sig = [0u8; SIG_LEN];
+        sig.copy_from_slice(&trailer[8..FANOUT_TRAILER_LEN]);
+        if !wayfinder_auth::verify_signature(&key, &msg, &sig) {
+            tracing::trace!("auth: dropping fan-out frame with an invalid signature");
+            return false;
+        }
+        // The same monotonic guard the pairwise form uses, against the same
+        // per-source high-water mark — which is exactly why the send counter
+        // is one sequence rather than one per destination.
+        if !self.accept_recv_counter(src, counter) {
+            tracing::trace!("auth: dropping fan-out frame with a replayed/stale counter");
+            return false;
+        }
+        true
+    }
+
+    /// Build the canonical signed message for a fan-out multicast frame: the
+    /// domain prefix followed by a digest of the counter and the frame.
+    ///
+    /// **The frame is hashed, not copied.** An earlier cut built `domain ‖
+    /// counter ‖ frame` in a fixed 256-byte stack scratch, which silently
+    /// capped a signable frame at 226 bytes — and a multicast frame is a whole
+    /// encapsulated Ethernet frame, so every multicast that matters sat above
+    /// that cap. Signing failed, the frame was dropped, and because the merge
+    /// had already claimed those destination groups no directed copy went out
+    /// either: every listener behind the hop got nothing, silently. Hashing
+    /// makes the signed message a fixed size whatever the frame's length, and
+    /// removes the scratch buffer from the embedded stack along with it.
+    fn fanout_message(counter: u64, frame: &[u8]) -> [u8; FANOUT_SIG_DOMAIN.len() + 32] {
+        let mut msg = [0u8; FANOUT_SIG_DOMAIN.len() + 32];
+        msg[..FANOUT_SIG_DOMAIN.len()].copy_from_slice(FANOUT_SIG_DOMAIN);
+        msg[FANOUT_SIG_DOMAIN.len()..]
+            .copy_from_slice(&wayfinder_auth::fanout_digest(counter, frame));
+        msg
     }
 
     /// Verify a directed frame's `trailer` from neighbor `src`: check the
@@ -955,18 +1086,16 @@ impl<
         true
     }
 
-    /// Allocate the next outgoing directed-frame counter for `dst` (starting at
-    /// 1).  Fails closed — returns `None` rather than reusing a counter — if the
-    /// table is full ([`MAX_NEIGHBOR_KEYS`] neighbors) or the counter would wrap,
+    /// Allocate the next outgoing directed-frame counter (starting at 1).
+    ///
+    /// **One sequence for every destination and for fan-out frames alike** —
+    /// see [`send_counter`](Self::send_counter). Fails closed, returning `None`
+    /// rather than reusing a counter, if it would wrap,
     /// since a `(key, counter)` reuse with the static pairwise key would make
     /// tags replayable.
-    fn next_send_counter(&mut self, dst: Mac) -> Option<u64> {
-        if let Some(e) = self.send_counters.iter_mut().find(|(m, _)| *m == dst) {
-            e.1 = e.1.checked_add(1)?;
-            return Some(e.1);
-        }
-        self.send_counters.push((dst, 1)).ok()?;
-        Some(1)
+    fn next_send_counter(&mut self) -> Option<u64> {
+        self.send_counter = self.send_counter.checked_add(1)?;
+        Some(self.send_counter)
     }
 
     /// Accept `counter` from `src` only if strictly newer than the last accepted
@@ -1872,6 +2001,7 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use batman::wire::BATMAN_VERSION;
     use batman::wire::BatmanKeepAlivePacket;
     use batman::wire::BatmanOgmPacket;
     use batman::wire::BatmanPacketType;
@@ -1886,7 +2016,7 @@ mod tests {
     fn bare_ogm(orig: Mac, seqno: u32) -> ([u8; 512], usize) {
         let ogm = BatmanOgmPacket {
             packet_type: BatmanPacketType::Ogm.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             flags: 0,
             seqno: seqno.to_be(),
@@ -1906,7 +2036,7 @@ mod tests {
     fn bare_keepalive() -> ([u8; 128], usize) {
         let pkt = BatmanKeepAlivePacket {
             packet_type: BatmanPacketType::Keepalive.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
         };
         let mut buf = [0u8; 128];
         let len = core::mem::size_of::<BatmanKeepAlivePacket>();
@@ -2925,6 +3055,177 @@ mod tests {
         let n = a.tag_directed(mac(3), frame, &mut trailer).expect("tag");
         assert_eq!(n, DIRECTED_TRAILER_LEN);
         assert!(b.verify_directed(mac(2), frame, &trailer));
+    }
+
+    /// **One per-sender counter sequence, not one per destination**
+    /// (design 17 §4.4).
+    ///
+    /// A fan-out frame addresses several next hops with one transmission, so
+    /// it has no single destination whose counter space to draw from. Drawing
+    /// from any one recipient's would hand the others a value below their own
+    /// high-water mark and get a legitimate frame dropped as a replay.
+    ///
+    /// Receivers need no change for this: `accept_recv_counter` already keys
+    /// its high-water mark on `src` alone, and any subsequence of a strictly
+    /// increasing sequence is strictly increasing — so a neighbour sees
+    /// monotonic counters whether it received every frame or one in ten. This
+    /// test is the second half of that argument: each peer accepts its own
+    /// sparse subsequence without complaint.
+    #[test]
+    fn directed_counters_come_from_one_per_sender_sequence() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        let mut c = member(&authority, 4, mac(4), 1000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+        mutual_verify(&mut a, mac(2), &mut c, mac(4));
+
+        let counter_of = |t: &[u8]| u64::from_be_bytes(t[..8].try_into().unwrap());
+
+        // Alternate destinations; the counters must be one strictly increasing
+        // run across both, not two runs that restart.
+        let mut seen = Vec::new();
+        for dst in [mac(3), mac(4), mac(3), mac(4)] {
+            let mut trailer = [0u8; DIRECTED_TRAILER_LEN];
+            a.tag_directed(dst, b"frame", &mut trailer).expect("tag");
+            seen.push(counter_of(&trailer));
+        }
+        assert!(
+            seen.windows(2).all(|w| w[1] > w[0]),
+            "one sequence across every destination, got {seen:?}"
+        );
+
+        // And each peer accepts the sparse subsequence it actually receives.
+        for (i, dst) in [mac(3), mac(4), mac(3), mac(4)].iter().enumerate() {
+            let mut trailer = [0u8; DIRECTED_TRAILER_LEN];
+            a.tag_directed(*dst, b"frame", &mut trailer).unwrap();
+            let peer = if *dst == mac(3) { &mut b } else { &mut c };
+            assert!(
+                peer.verify_directed(mac(2), b"frame", &trailer),
+                "peer {i} must accept its own subsequence"
+            );
+        }
+    }
+
+    /// **The fan-out form** (design 17 §4.4): a single transmission reaching
+    /// several neighbours cannot carry one pairwise tag per recipient, each
+    /// derived from a different key, so the forwarding node signs with its own
+    /// key and each receiver verifies against the cert it already holds.
+    #[test]
+    fn fanout_signature_roundtrips_for_a_known_member() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+
+        let frame = b"an mcast frame naming three destinations";
+        let mut trailer = [0u8; FANOUT_TRAILER_LEN];
+        let n = a.sign_fanout(frame, &mut trailer).expect("sign");
+        assert_eq!(n, FANOUT_TRAILER_LEN);
+        assert!(b.verify_fanout(mac(2), frame, &trailer));
+    }
+
+    /// **A fan-out signature must work on a real frame, not just a tiny one.**
+    ///
+    /// The first cut built the signed message in a `SIGN_SCRATCH_LEN` (256 B)
+    /// stack buffer, which caps the frame at 226 bytes once the domain and
+    /// counter are accounted for. Every multicast that matters — mDNS, SSDP,
+    /// RTP, anything carrying a real Ethernet frame — is larger than that, so
+    /// signing returned `None`, the frame was dropped, and (because the merge
+    /// had already claimed those groups) no directed copy went out either.
+    /// Every listener behind that hop got nothing.
+    #[test]
+    fn fanout_signature_covers_a_full_size_frame() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+
+        // Comfortably past both the old 226-byte ceiling and a 1500-byte MTU.
+        let frame = [0xa5u8; 2000];
+        let mut trailer = [0u8; FANOUT_TRAILER_LEN];
+        a.sign_fanout(&frame, &mut trailer)
+            .expect("a full-size frame must be signable");
+        assert!(b.verify_fanout(mac(2), &frame, &trailer));
+
+        // And a single flipped byte anywhere in it still fails.
+        let mut tampered = frame;
+        tampered[1500] ^= 0x01;
+        assert!(!b.verify_fanout(mac(2), &tampered, &trailer));
+    }
+
+    /// An outsider's signature is rejected: verification goes through the same
+    /// neighbour-key lookup `verify_directed` uses, so a node with no accepted
+    /// OGM — and a revoked one, whose keys `evict_neighbor` drops — has no way
+    /// to be believed.
+    #[test]
+    fn fanout_signature_from_an_unknown_node_is_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        // Deliberately *no* mutual_verify: b has never accepted an OGM from a.
+
+        let frame = b"frame";
+        let mut trailer = [0u8; FANOUT_TRAILER_LEN];
+        a.sign_fanout(frame, &mut trailer).expect("sign");
+        assert!(!b.verify_fanout(mac(2), frame, &trailer));
+    }
+
+    /// A tampered frame fails the signature — which is what lets a
+    /// destination list be routed on in-band: the proof covers the whole
+    /// frame, header and list included, so a hop cannot rewrite the routing
+    /// without its successor noticing.
+    #[test]
+    fn a_tampered_frame_fails_the_fanout_signature() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+
+        let mut trailer = [0u8; FANOUT_TRAILER_LEN];
+        a.sign_fanout(b"original frame", &mut trailer).unwrap();
+        assert!(!b.verify_fanout(mac(2), b"tampered frame", &trailer));
+    }
+
+    /// The fan-out form keeps the replay guard the pairwise form has. Dropping
+    /// it because the frame is now one-to-many would regress a protection
+    /// `Mcast` already had.
+    #[test]
+    fn fanout_replay_is_rejected() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+
+        let mut trailer = [0u8; FANOUT_TRAILER_LEN];
+        a.sign_fanout(b"frame", &mut trailer).unwrap();
+        assert!(b.verify_fanout(mac(2), b"frame", &trailer));
+        assert!(
+            !b.verify_fanout(mac(2), b"frame", &trailer),
+            "the same counter must not be accepted twice"
+        );
+    }
+
+    /// **Domain separation.** A fan-out signature is over its own domain
+    /// prefix, so it can never be replayed as an OGM signature or a keep-alive
+    /// — and an OGM signature can never stand in for one here.
+    #[test]
+    fn a_fanout_signature_is_not_an_ogm_signature() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        mutual_verify(&mut a, mac(2), &mut b, mac(3));
+
+        let frame = b"frame";
+        let mut fanout = [0u8; FANOUT_TRAILER_LEN];
+        a.sign_fanout(frame, &mut fanout).unwrap();
+
+        // The signature half alone, pasted under a pairwise-tag trailer, is
+        // not a pairwise tag either.
+        let mut as_tag = [0u8; DIRECTED_TRAILER_LEN];
+        as_tag[..8].copy_from_slice(&fanout[..8]);
+        as_tag[8..].copy_from_slice(&fanout[8..8 + TAG_LEN]);
+        assert!(!b.verify_directed(mac(2), frame, &as_tag));
     }
 
     /// A tampered directed frame fails the tag check.

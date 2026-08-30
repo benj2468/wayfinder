@@ -42,6 +42,29 @@ pub fn frame_tag(key: &[u8; 32], counter: u64, context: &[u8], frame: &[u8]) -> 
     tag
 }
 
+/// Domain-separated digest of a fan-out multicast frame and its replay
+/// counter, for the signature that authenticates a multicast one transmission
+/// carries to several next hops at once.
+///
+/// The frame is **hashed rather than signed directly** so the signed message is
+/// a fixed 32 bytes however large the frame is. Building `domain ‖ counter ‖
+/// frame` in a fixed stack buffer instead would cap the frame at whatever that
+/// buffer holds — and a multicast frame is a whole encapsulated Ethernet frame,
+/// so any such cap is one real traffic sits above. Blake2s is collision
+/// resistant, so signing the digest binds the frame exactly as signing the
+/// bytes would.
+///
+/// The counter is inside the digest rather than beside it, so it cannot be
+/// edited to slip a frame past a receiver's high-water mark without
+/// invalidating the signature that carried it.
+pub fn fanout_digest(counter: u64, frame: &[u8]) -> [u8; 32] {
+    let mut h = Blake2s256::new();
+    h.update(b"wf-mcast-fanout-digest-v1");
+    h.update(counter.to_be_bytes());
+    h.update(frame);
+    h.finalize().into()
+}
+
 /// Verify a frame's authentication `tag` in constant time.  Returns `true` only
 /// if `tag` matches the tag recomputed from `key`, `counter`, `context`, and
 /// `frame`.  The caller is responsible for rejecting a `counter` that is not

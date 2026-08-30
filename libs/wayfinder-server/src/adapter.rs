@@ -1399,6 +1399,7 @@ mod tests {
     use super::*;
     use crate::provider::MeshAuthority as _;
     use wayfinder::CentralRouter;
+    use wayfinder::batman::wire::BATMAN_VERSION;
     use wayfinder::batman::wire::BatmanOgmPacket;
     use wayfinder::batman::wire::BatmanPacketType;
     use wayfinder::interfaces::frame::LinkFrame;
@@ -1449,7 +1450,7 @@ mod tests {
     fn feed_direct_ogm(router: &mut CentralRouter, orig: Mac, seqno: u32, tq: u8) {
         let ogm = BatmanOgmPacket {
             packet_type: BatmanPacketType::Ogm.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             flags: 0,
             seqno: seqno.to_be(),
@@ -1466,7 +1467,7 @@ mod tests {
         );
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
         let mut tx = [0u8; 256];
-        router.handle_frame(Duration::ZERO, 0, frame, &mut tx);
+        router.handle_frame(Duration::ZERO, 0, frame, &mut tx, &mut ());
     }
 
     /// Every per-interface table carries the interface's configured name
@@ -1979,7 +1980,7 @@ mod tests {
         peer_auth.set_time(100);
         let ogm = BatmanOgmPacket {
             packet_type: BatmanPacketType::Ogm.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             flags: 0,
             seqno: 1u32.to_be(),
@@ -2000,7 +2001,7 @@ mod tests {
         );
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
         let mut tx = [0u8; 512];
-        router.handle_frame(Duration::ZERO, 0, frame, &mut tx);
+        router.handle_frame(Duration::ZERO, 0, frame, &mut tx, &mut ());
 
         let m = RouterAdapter::new(&mut router, Duration::from_secs(5)).node_metrics();
         assert_eq!(m.cert_store.used, 1);
@@ -2186,7 +2187,7 @@ mod tests {
         peer_auth.set_time(100);
         let ogm = BatmanOgmPacket {
             packet_type: BatmanPacketType::Ogm.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             flags: 0,
             seqno: 1u32.to_be(),
@@ -2207,7 +2208,7 @@ mod tests {
         );
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
         let mut tx = [0u8; 512];
-        router.handle_frame(Duration::ZERO, 0, frame, &mut tx);
+        router.handle_frame(Duration::ZERO, 0, frame, &mut tx, &mut ());
         assert!(
             router
                 .auth()

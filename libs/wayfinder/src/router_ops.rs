@@ -48,6 +48,7 @@ use crate::EgressInterface;
 use crate::RxOutcome;
 use crate::auth::OgmAuth;
 use crate::features::LinkFeatures;
+use interfaces::engine::FrameSink;
 
 /// The operations generic code performs on a router's opt-in authentication
 /// state, with [`OgmAuth`]'s four table capacities erased.
@@ -71,6 +72,14 @@ pub trait OgmAuthOps {
     /// replayed counter — in every case the frame must be dropped rather than
     /// routed unauthenticated.
     fn verify_directed(&mut self, src: Mac, frame: &[u8], trailer: &[u8]) -> bool;
+
+    /// Sign a multicast frame one transmission carries to several next hops,
+    /// writing the fan-out trailer. See [`OgmAuth::sign_fanout`].
+    fn sign_fanout(&mut self, frame: &[u8], trailer: &mut [u8]) -> Option<usize>;
+
+    /// Verify a fan-out multicast trailer from neighbour `src`.
+    /// See [`OgmAuth::verify_fanout`].
+    fn verify_fanout(&mut self, src: Mac, frame: &[u8], trailer: &[u8]) -> bool;
 }
 
 impl<
@@ -86,6 +95,14 @@ impl<
 
     fn verify_directed(&mut self, src: Mac, frame: &[u8], trailer: &[u8]) -> bool {
         OgmAuth::verify_directed(self, src, frame, trailer)
+    }
+
+    fn sign_fanout(&mut self, frame: &[u8], trailer: &mut [u8]) -> Option<usize> {
+        OgmAuth::sign_fanout(self, frame, trailer)
+    }
+
+    fn verify_fanout(&mut self, src: Mac, frame: &[u8], trailer: &[u8]) -> bool {
+        OgmAuth::verify_fanout(self, src, frame, trailer)
     }
 }
 
@@ -128,6 +145,7 @@ pub trait RouterOps {
         frame: &'rx LinkFrame,
         metrics: LinkMetrics,
         tx_buf: &'tx mut [u8],
+        out: &mut dyn FrameSink,
     ) -> RxOutcome<'rx, 'tx>;
 
     // ---- periodic emission ------------------------------------------------
@@ -144,6 +162,10 @@ pub trait RouterOps {
     /// Record one directed frame dropped for want of a pairwise key with its
     /// next hop.
     fn record_untaggable_drop(&mut self, now: Duration);
+
+    /// Record `dests` multicast destinations lost with a group the driver
+    /// could not emit. See [`CentralRouter::record_mcast_group_drop`].
+    fn record_mcast_group_drop(&mut self, dests: usize);
 
     /// Produce a next-hop proof challenge for one neighbor awaiting one, with
     /// the neighbor it is addressed to. `None` when none is due.
@@ -313,8 +335,9 @@ impl<
         frame: &'rx LinkFrame,
         metrics: LinkMetrics,
         tx_buf: &'tx mut [u8],
+        out: &mut dyn FrameSink,
     ) -> RxOutcome<'rx, 'tx> {
-        Self::handle_frame_with_metrics(self, now, iface_idx, frame, metrics, tx_buf)
+        Self::handle_frame_with_metrics(self, now, iface_idx, frame, metrics, tx_buf, out)
     }
 
     fn poll<'tx>(&mut self, now: Duration, tx_buf: &'tx mut [u8]) -> Option<LinkFrameData<'tx>> {
@@ -331,6 +354,10 @@ impl<
 
     fn record_untaggable_drop(&mut self, now: Duration) {
         Self::record_untaggable_drop(self, now);
+    }
+
+    fn record_mcast_group_drop(&mut self, dests: usize) {
+        CentralRouter::record_mcast_group_drop(self, dests);
     }
 
     fn poll_challenge<'tx>(
@@ -562,6 +589,7 @@ mod tests {
                 frame,
                 LinkMetrics::default(),
                 &mut tx,
+                &mut (),
             );
             router.originator_count()
         }

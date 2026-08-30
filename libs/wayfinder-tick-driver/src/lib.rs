@@ -28,11 +28,15 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::time::Duration;
 
+use core::num::NonZeroU8;
+use interfaces::engine::FrameSink;
 use interfaces::link::LinkMetrics;
+use tracing::trace;
 use tracing::warn;
 use wayfinder::CentralRouter;
 use wayfinder::MAX_INTERFACES;
-use wayfinder::auth::DIRECTED_TRAILER_LEN;
+use wayfinder::McastPlan;
+use wayfinder::auth::MAX_TRAILER_LEN;
 use wayfinder::config::TrickleConfig;
 use wayfinder::features::LinkFeatures;
 use wayfinder::interfaces::frame::LinkFrame;
@@ -78,14 +82,37 @@ struct StageSink {
     local: Vec<Vec<u8>>,
 }
 
+/// Bridges the router's [`FrameSink`] onto this shell's staging buffer, so the
+/// destination groups a local multicast is split into are staged like any other
+/// outgoing frame.
+///
+/// Unbounded: the stage is a `Vec` here, so there is no capacity to run out of
+/// and no group to lose. The router still bounds how many groups it produces.
+struct StageFrameSink<'a>(&'a mut StageSink);
+
+impl FrameSink for StageFrameSink<'_> {
+    fn push(&mut self, f: wayfinder::interfaces::frame::LinkFrameData<'_>) -> bool {
+        let _ = self.0.emit(OutgoingFrame {
+            dst: f.dst,
+            protocol: f.protocol,
+            payload: f.payload,
+            egress: Egress::Auto,
+        });
+        true
+    }
+}
+
 impl MeshSink for StageSink {
-    fn emit(&mut self, frame: OutgoingFrame<'_>) {
+    /// Always accepts: the stage is a `Vec`, so there is no capacity to run
+    /// out of and no frame to lose.
+    fn emit(&mut self, frame: OutgoingFrame<'_>) -> bool {
         self.frames.push(StagedFrame {
             dst: frame.dst,
             protocol: frame.protocol,
             payload: frame.payload.to_vec(),
             egress: frame.egress,
         });
+        true
     }
 
     fn deliver_local(&mut self, inner: &[u8]) {
@@ -123,6 +150,17 @@ pub struct Driver {
     /// One outgoing queue per interface index.
     egress: Vec<VecDeque<Vec<u8>>>,
     local_rx: VecDeque<Vec<u8>>,
+    /// Each interface's declared native fan-out: the number of destinations
+    /// at which one send on that medium beats one directed copy each, or
+    /// `None` when a send reaches one peer and N copies genuinely cost N.
+    ///
+    /// There is no `LinkT` here to ask, so a caller modelling a shared medium
+    /// declares it with [`set_fan_out`](Self::set_fan_out). `None` everywhere
+    /// by default, which is the safe answer: over-claiming a fan-out is a
+    /// correctness bug, not a missed optimisation — a medium that says one send
+    /// reaches every neighbour when it does not drops every destination but
+    /// one.
+    fan_out: Vec<Option<NonZeroU8>>,
     /// Wall-clock unix time (seconds) that `now == 0` corresponds to.
     ///
     /// Certificate validity is judged against unix time, but a tick-driven
@@ -196,7 +234,21 @@ impl Driver {
             local_tx_queue: VecDeque::new(),
             egress: (0..n).map(|_| VecDeque::new()).collect(),
             local_rx: VecDeque::new(),
+            fan_out: (0..n).map(|_| None).collect(),
             epoch_unix: 0,
+        }
+    }
+
+    /// Declare interface `idx`'s native fan-out: the destination count at
+    /// which one send on that medium beats one directed copy each.
+    ///
+    /// The stand-in for `LinkT::fan_out` on a driver that has no links — a
+    /// simulated shared segment (one radio every neighbour hears) declares
+    /// `Some(2)`, a point-to-point queue leaves it `None`. Out-of-range indices
+    /// are ignored, like every other per-interface setter here.
+    pub fn set_fan_out(&mut self, idx: usize, fan_out: Option<NonZeroU8>) {
+        if let Some(slot) = self.fan_out.get_mut(idx) {
+            *slot = fan_out;
         }
     }
 
@@ -295,17 +347,63 @@ impl Driver {
                     frame,
                     queued.metrics,
                     &mut self.tx_buffer,
+                    &self.fan_out,
                     &mut stage,
                 );
             }
         }
 
         while let Some((dest, payload)) = self.local_tx_queue.pop_front() {
+            // A group destination gets the multicast plan, not the unicast
+            // path. Without this a group MAC went to `handle_local`, found no
+            // route (nothing ever originates a group address) and was dropped
+            // — so a tick-driven node could not send multicast at all.
+            if dest.is_multicast() && !dest.is_broadcast() {
+                match self.router.mcast_plan(dest) {
+                    McastPlan::Unicast => {
+                        let targets: Vec<Mac> = self.router.mcast_targets(dest).collect();
+                        // One call with the whole listener set: the router
+                        // groups them by next hop, so listeners sharing one
+                        // travel in a single frame.
+                        if let Err(e) = self.router.handle_local_mcast(
+                            now,
+                            &targets,
+                            &payload,
+                            &mut self.tx_buffer,
+                            &mut StageFrameSink(&mut stage),
+                        ) {
+                            // Nothing went out at all. The plan said unicast,
+                            // so there is no flood arm to fall back to here —
+                            // say so rather than let the host's frame vanish
+                            // without a record.
+                            trace!(?dest, ?e, "drop: local multicast unsendable");
+                        }
+                    }
+                    // Past the fan-out threshold, or no known listeners: flood
+                    // it, exactly as the tokio shell does.
+                    McastPlan::Flood => {
+                        if let Ok(f) = self.router.handle_local(
+                            now,
+                            Mac::BROADCAST,
+                            &payload,
+                            &mut self.tx_buffer,
+                        ) {
+                            let _ = stage.emit(OutgoingFrame {
+                                dst: f.dst,
+                                protocol: f.protocol,
+                                payload: f.payload,
+                                egress: Egress::Auto,
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
             if let Ok(f) = self
                 .router
                 .handle_local(now, dest, &payload, &mut self.tx_buffer)
             {
-                stage.emit(OutgoingFrame {
+                let _ = stage.emit(OutgoingFrame {
                     dst: f.dst,
                     protocol: f.protocol,
                     payload: f.payload,
@@ -342,7 +440,7 @@ impl Driver {
     /// drivers' `dispatch`, minus the actual link I/O.
     fn dispatch_one(&mut self, now: Duration, mut staged: StagedFrame) {
         let body_len = staged.payload.len();
-        staged.payload.resize(body_len + DIRECTED_TRAILER_LEN, 0);
+        staged.payload.resize(body_len + MAX_TRAILER_LEN, 0);
         let num_interfaces = self.egress.len();
         let Some(plan) = plan_dispatch(
             &mut self.router,
@@ -400,6 +498,7 @@ impl Driver {
 #[cfg(test)]
 mod tests {
     use wayfinder::DEFAULT_BATMAN_ETHER_TYPE;
+    use wayfinder::batman::wire::BATMAN_VERSION;
     use wayfinder::batman::wire::BatmanOgmPacket;
     use wayfinder::batman::wire::BatmanPacketType;
 
@@ -424,7 +523,7 @@ mod tests {
     fn bare_ogm_bytes(orig: Mac, seqno: u32, ttl: u8) -> Vec<u8> {
         let ogm = BatmanOgmPacket {
             packet_type: BatmanPacketType::Ogm.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl,
             flags: 0,
             seqno: seqno.to_be(),

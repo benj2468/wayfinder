@@ -1,6 +1,7 @@
 use core::time::Duration;
 
 use crate::frame::LinkFrame;
+use crate::frame::LinkFrameData;
 use crate::frame::LinkFrameDataMut;
 use crate::frame::Mac;
 
@@ -43,6 +44,42 @@ pub enum RoutingAction {
     DeliverLocalAndForward(Mac),
 }
 
+/// A bounded sink for frames an engine produces when one received frame yields
+/// **more than one** outgoing frame.
+///
+/// `reply` can hold exactly one, and its forward path in the central router
+/// trims the payload to the *incoming* frame's length — correct while a relay
+/// only decrements a TTL, and wrong the moment an outgoing frame is a different
+/// size from the one that caused it. Multi-destination multicast is exactly
+/// that case: each hop removes itself from the destination list and splits the
+/// rest by next hop, so every frame it emits is shorter than the one it
+/// received, and there may be several. Frames pushed here carry their own
+/// slice, so the length is exact and never inferred.
+///
+/// The sink is **bounded**, and [`push`](Self::push) says so by returning
+/// `false` rather than silently taking fewer frames than it was given: dropping
+/// a destination group without a trace is the failure multi-destination
+/// multicast exists to remove, so a refusal must be counted and surfaced by the
+/// caller.
+pub trait FrameSink {
+    /// Accept one outgoing frame, returning `false` if the sink is full.
+    ///
+    /// The implementation **must** copy `frame.payload` before returning — it
+    /// borrows a scratchpad the engine reuses for the next frame.
+    fn push(&mut self, frame: LinkFrameData<'_>) -> bool;
+}
+
+/// A sink with no room at all, for a caller that cannot take extra frames.
+///
+/// Every push is refused rather than quietly discarded, so an engine's overflow
+/// accounting sees a shell that never had capacity exactly as it sees one that
+/// ran out — there is no configuration in which frames vanish unrecorded.
+impl FrameSink for () {
+    fn push(&mut self, _frame: LinkFrameData<'_>) -> bool {
+        false
+    }
+}
+
 /// A mesh routing protocol's behaviour, independent of transport and identity
 /// crypto: it ingests received frames ([`handle_rx`](Self::handle_rx)) and
 /// emits periodic topology broadcasts
@@ -58,12 +95,17 @@ pub trait MeshRoutingEngine {
     /// engine may use it to bound a sender's advertised path metric by the link
     /// actually observed to it (see the BATMAN OGM TQ clamp); `None` applies no
     /// such bound.
+    ///
+    /// `out` takes any frame beyond the single one `reply` can hold — see
+    /// [`FrameSink`]. A handler that produces at most one frame ignores it
+    /// entirely; a caller that cannot accept extras passes `&mut ()`.
     fn handle_rx<'rx, 'tx>(
         &mut self,
         now: Duration,
         frame: &'rx LinkFrame,
         local_quality: Option<u8>,
         reply: &mut LinkFrameDataMut<'tx>,
+        out: &mut dyn FrameSink,
     ) -> RoutingAction;
 
     /// Force the engine to generate its regular periodic routing messages (OGMs).

@@ -12,6 +12,7 @@ use crate::switch::PortConfig;
 use crate::switch::PortId;
 use crate::switch::Switch;
 use crate::test_router::TestRouter;
+use core::num::NonZeroU8;
 
 /// Declarative description of a whole test topology: the switches to create and
 /// the machines to attach to them.
@@ -89,6 +90,16 @@ struct MachineSpec {
     /// Per-interface participation features, in the same interface order, so a
     /// reconnected node comes back with its original per-link gating.
     features: Vec<LinkFeatures>,
+    /// Each interface's native fan-out, in the same interface order — the
+    /// stand-in for `LinkT::fan_out` on a harness that has no links.
+    ///
+    /// `Some(2)` for an interface on a **shared** switch, where one
+    /// transmission reaches every other machine on it, exactly as one radio
+    /// transmission reaches every neighbour on a segment. `None` for a star,
+    /// where a spoke's send reaches only the hub — over-claiming here would be
+    /// a correctness bug, not a missed optimisation, since a merged frame that
+    /// does not actually reach everyone drops every destination but one.
+    fan_out: Vec<Option<NonZeroU8>>,
 }
 
 impl MachineSpec {
@@ -99,6 +110,9 @@ impl MachineSpec {
     fn apply_features(&self, router: &mut TestRouter) {
         for (idx, f) in self.features.iter().enumerate() {
             router.router_mut().set_link_features(idx, *f);
+        }
+        for (idx, f) in self.fan_out.iter().enumerate() {
+            router.set_fan_out(idx, *f);
         }
     }
 }
@@ -398,7 +412,14 @@ impl TestHarness {
             .get_mut(switch_name)
             .expect("switch not found");
 
-        let (router_comms, switch_comms) = PortComms::pair(10);
+        // Deep enough that a convergence round on a busy shared segment cannot
+        // overflow it. `Switch::tick` drops on a full queue with a `warn!`
+        // saying this is "a mis-sized harness, not a lossy medium" — at depth
+        // 10 a six-node topology with five ports on one switch genuinely did
+        // overflow, and the frame it dropped was whichever happened to arrive
+        // last. That surfaced as a multicast test failing about one run in
+        // five, nowhere near its cause.
+        let (router_comms, switch_comms) = PortComms::pair(256);
 
         #[expect(
             clippy::expect_used,
@@ -522,6 +543,19 @@ impl TestConfig {
                 .iter()
                 .map(|link| link.features)
                 .collect();
+            // A shared switch is a shared medium: one transmission reaches
+            // every other machine on it. A star's spokes reach only the hub, so
+            // they declare nothing.
+            let fan_out: Vec<Option<NonZeroU8>> = switches
+                .iter()
+                .map(|name| {
+                    self.switches
+                        .iter()
+                        .find(|s| &s.name == name)
+                        .filter(|s| s.hub.is_none())
+                        .and_then(|_| NonZeroU8::new(2))
+                })
+                .collect();
             let (interfaces, handles) = h.wire_links(&switches);
             let mut router = TestRouter::new(ident, interfaces, trickle.clone());
             let spec = MachineSpec {
@@ -529,6 +563,7 @@ impl TestConfig {
                 switches,
                 trickle,
                 features,
+                fan_out,
             };
             spec.apply_features(&mut router);
             h.specs.insert(machine.name.clone(), spec);

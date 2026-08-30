@@ -50,6 +50,7 @@ pub use key::verify_signature;
 pub use mac::derive_mac;
 pub use mac::force_locally_administered_unicast;
 pub use pairwise::TAG_LEN;
+pub use pairwise::fanout_digest;
 pub use pairwise::frame_tag;
 pub use pairwise::verify_frame_tag;
 pub use revoke::REVOKE_VERSION;

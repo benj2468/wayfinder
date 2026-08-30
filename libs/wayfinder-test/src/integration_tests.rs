@@ -30,6 +30,7 @@ use zerocopy::IntoBytes;
 use crate::Direction;
 use crate::prelude::*;
 use crate::switch::TapConfig;
+use wayfinder::batman::wire::BATMAN_VERSION;
 
 /// True if `frame` is an on-the-wire BATMAN OGM: a `LinkFrame` whose protocol
 /// is the BATMAN EtherType and whose first payload byte is the OGM packet type.
@@ -89,7 +90,7 @@ fn build_ogm_wire_frame(src: u8, tq: u8, seqno: u32) -> Vec<u8> {
 fn build_relayed_ogm_wire_frame(relay: u8, orig: u8, tq: u8, seqno: u32) -> Vec<u8> {
     let ogm = BatmanOgmPacket {
         packet_type: BatmanPacketType::Ogm.as_u8(),
-        version: 5,
+        version: BATMAN_VERSION,
         ttl: 50,
         flags: 0,
         seqno: seqno.to_be(),
@@ -114,7 +115,7 @@ fn build_relayed_ogm_wire_frame(relay: u8, orig: u8, tq: u8, seqno: u32) -> Vec<
 fn build_keepalive_wire_frame(src: u8) -> Vec<u8> {
     let pkt = BatmanKeepAlivePacket {
         packet_type: BatmanPacketType::Keepalive.as_u8(),
-        version: 5,
+        version: BATMAN_VERSION,
     };
     build_frame(
         mac(src),
@@ -674,7 +675,7 @@ fn cert_req_relays_across_the_mesh_and_does_not_reach_the_host() {
     let (raw_port, _port_id) = harness.add_switch_port("switch1");
     let cert_req_hdr = BatmanCertReqPacket {
         packet_type: BatmanPacketType::CertReq.as_u8(),
-        version: 5,
+        version: BATMAN_VERSION,
         ttl: 10,
         dest: m3,
     };
@@ -2597,7 +2598,7 @@ fn cert_fetch_round_trip_resolves_via_seeded_first_hop() {
     let mut ogm_buf = vec![0u8; 512];
     let ogm = BatmanOgmPacket {
         packet_type: BatmanPacketType::Ogm.as_u8(),
-        version: 5,
+        version: BATMAN_VERSION,
         ttl: 50,
         flags: 0,
         seqno: 1000u32.to_be(),
@@ -2651,7 +2652,7 @@ fn cert_fetch_round_trip_resolves_via_seeded_first_hop() {
     // relayed for real through X to B.
     let reply_hdr = BatmanCertReplyPacket {
         packet_type: BatmanPacketType::CertReply.as_u8(),
-        version: 5,
+        version: BATMAN_VERSION,
         ttl: 50,
         dest: m3,
     };
@@ -2734,7 +2735,7 @@ fn cert_fetch_round_trip_with_real_responder() {
     let mut b_ogm_buf = vec![0u8; 512];
     let b_ogm = BatmanOgmPacket {
         packet_type: BatmanPacketType::Ogm.as_u8(),
-        version: 5,
+        version: BATMAN_VERSION,
         ttl: 50,
         flags: 0,
         seqno: 1u32.to_be(),
@@ -2781,7 +2782,7 @@ fn cert_fetch_round_trip_with_real_responder() {
     let mut ogm_buf = vec![0u8; 512];
     let ogm = BatmanOgmPacket {
         packet_type: BatmanPacketType::Ogm.as_u8(),
-        version: 5,
+        version: BATMAN_VERSION,
         ttl: 50,
         flags: 0,
         seqno: 2000u32.to_be(),
@@ -3181,4 +3182,225 @@ fn a_second_session_displaces_the_first_and_its_handle_stops_resolving() {
         Some(b),
         "and the handle that answers is the new one's"
     );
+}
+
+// ── design 17: multicast across a wired/radio boundary ──────────────────────
+
+/// A multicast group MAC (`01:00:5e:00:00:NN`).
+fn mcast_group(n: u8) -> Mac {
+    Mac([0x01, 0x00, 0x5e, 0x00, 0x00, n])
+}
+
+/// True if `frame` is an on-the-wire BATMAN data-plane multicast frame.
+///
+/// One tag covers both shapes: design 17 changes `Mcast`'s *layout* rather than
+/// adding a sub-type, so this counts transmissions carrying the group's traffic
+/// before and after without caring which layout is on the wire — which is what
+/// makes the before/after comparison below meaningful.
+fn is_mcast_frame(frame: &[u8]) -> bool {
+    frame.len() > 14
+        && frame[12..14] == DEFAULT_BATMAN_ETHER_TYPE.to_be_bytes()
+        && frame[14] == BatmanPacketType::Mcast.as_u8()
+}
+
+/// Count multicast data frames entering one named switch's fabric, one count
+/// per transmission (`Direction::ToSwitch`), so a frame that fans out to four
+/// listeners on a shared medium still counts once — which is the entire
+/// quantity design 17 is about.
+fn count_mcast_on(harness: &mut TestHarness, switch: &str) -> Arc<AtomicUsize> {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let sw = harness
+        .switches
+        .get_mut(switch)
+        .expect("switch exists in this topology");
+    for port in sw.port_ids() {
+        let counter = counter.clone();
+        sw.add_tap(
+            port,
+            TapConfig::new(move |meta| {
+                if meta.direction == Direction::ToSwitch && is_mcast_frame(meta.data) {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+                // Keep the tap installed for the life of the test.
+                true
+            }),
+        )
+        .expect("port accepts a tap");
+    }
+    counter
+}
+
+/// `a —eth— b —radio— {c, d, e, f}`: one wired peer bridging onto a shared
+/// radio segment. `a`, `d`, `e` and `f` are in the group; `b` and `c` are not.
+fn wired_peer_onto_radio_segment() -> TestHarness {
+    let mut config = TestConfig::default();
+    config.switches.push(TestSwitchConfig::shared("eth"));
+    config.switches.push(TestSwitchConfig::shared("radio"));
+    let machine = |name: &str, links: &[&str]| TestMachineConfig {
+        name: name.into(),
+        wayfinder: Config {
+            links: links.iter().map(|s| LinkConfig::test(*s)).collect(),
+            ..Default::default()
+        },
+    };
+    config.machines.push(machine("a", &["eth"]));
+    config.machines.push(machine("b", &["eth", "radio"]));
+    for spoke in ["c", "d", "e", "f"] {
+        config.machines.push(machine(spoke, &["radio"]));
+    }
+    config.validate().unwrap()
+}
+
+/// **The topology design 17 exists for.** Three listeners sit behind one relay
+/// on a shared radio segment; the sender is on the far side of a wired link.
+///
+/// ```text
+///   a ──eth── b ──radio──┬── c        group: a, d, e, f
+///                        ├── d        (b and c are not members)
+///                        ├── e
+///                        └── f
+/// ```
+///
+/// One multicast frame from `a`'s host must cost **one** transmission on the
+/// radio: `b` transmits once and all three listeners hear it. The radio count
+/// is the one that matters, because that is the duty-cycle-limited medium.
+///
+/// `a` sends one frame to `b` listing `[d, e, f]`; `b` finds all three behind
+/// one radio interface and transmits once. `c` hears it, is in neither the
+/// destination list nor any route it serves, and ignores it — it does not
+/// forward, because nothing was routed through it.
+///
+/// The total is asserted as well as the per-medium counts, because a design can
+/// deliver correctly and still cost more than what it replaces: an earlier
+/// flood-based revision spent seven transmissions against today's six, and
+/// delivery assertions alone sailed straight through it.
+///
+/// Two different numbers are wrong today, depending on which driver shell runs:
+///
+/// * Through the **tokio** driver, three on each — `McastPlan::Unicast` builds
+///   one `Mcast` per listener and the relay forwards each individually.
+/// * Through the **tick** driver this harness uses, *zero*: it measures 0
+///   rather than 3 because `queue_local_send` goes straight to `handle_local`,
+///   which sends a group MAC down the unicast path, finds no route, and drops
+///   it. Multicast planning is reachable only from `plan_host_frame`.
+///
+/// That second number is why this test is worth having even before the packet
+/// exists: it pins a gap in the tick driver that no other test covers.
+///
+/// The radio assertion is the load-bearing one. The Ethernet count could be
+/// argued down to a nicety; three transmissions on a LoRa segment where one
+/// would do is the cost this design was written to remove.
+///
+/// Ignored until design 17 lands, since none of its prerequisites exists yet:
+/// the multi-destination `Mcast` layout, multi-frame emission from the engine,
+/// and a multicast plan in the tick driver at all.
+#[test]
+fn one_multicast_frame_crosses_the_wire_and_the_radio_once_each() {
+    let group = mcast_group(9);
+    let mut h = wired_peer_onto_radio_segment();
+
+    // Everyone but the relay and `c` joins the group, so membership propagates
+    // in OGMs and every node's `mcast_members` learns who is interested.
+    for member in ["a", "d", "e", "f"] {
+        h.machines
+            .get_mut(member)
+            .expect("machine exists")
+            .router_mut()
+            .set_local_mcast_groups(Duration::ZERO, &[group]);
+    }
+    // Converge until the *precondition* holds rather than until a fixed
+    // instant. `TestHarness::machines` is a `HashMap`, so `values_mut()` polls
+    // the nodes in a per-process order — which changes how many rounds
+    // membership takes to propagate, and left this test failing about one run
+    // in six on a fixed 30-second budget. Waiting on the state the test
+    // actually needs makes it deterministic, and names the missing
+    // precondition when it genuinely cannot be reached.
+    let mut at = Duration::from_secs(30);
+    for _ in 0..10 {
+        converge_at(&mut h, at);
+        let known = h.machines["a"].router().mcast_targets(group).count();
+        let relayed = ["d", "e", "f"].iter().all(|m| {
+            let ident = h.machines[*m].ident;
+            h.machines["b"]
+                .router()
+                .resolve_route(at, ident)
+                .1
+                .is_some()
+        });
+        if known == 3 && relayed {
+            break;
+        }
+        at += Duration::from_secs(30);
+    }
+    assert_eq!(
+        h.machines["a"].router().mcast_targets(group).count(),
+        3,
+        "the sender must have learned d, e and f as listeners before it sends"
+    );
+
+    let eth = count_mcast_on(&mut h, "eth");
+    let radio = count_mcast_on(&mut h, "radio");
+    let payload = host_frame(group, Mac([0, 0, 0, 0, 0, 0xaa]), b"multicast payload");
+    h.machines
+        .get_mut("a")
+        .expect("machine a exists")
+        .send_local(group, &payload);
+    // Converge *forward* of whatever instant the precondition loop reached: a
+    // fixed instant would run the virtual clock backwards once that loop
+    // needed more than one round.
+    h.converge(at + Duration::from_secs(5));
+
+    assert_eq!(
+        radio.load(Ordering::Relaxed),
+        1,
+        "one transmission must serve every listener on the shared radio segment; \
+         three means the relay sent one copy per listener"
+    );
+    // One, not two. `a` is itself a member, but the sender excludes itself from
+    // the destination list — its host already has the frame — so nothing is
+    // ever addressed back toward the originator. The "relay echoes at its
+    // sender" problem belonged to the flood design and does not exist here.
+    assert_eq!(
+        eth.load(Ordering::Relaxed),
+        1,
+        "the sender puts one frame on the wire listing all three destinations"
+    );
+
+    // The invariant an earlier revision violated: never more transmissions than
+    // the per-listener plan this replaces, which costs three on each medium
+    // here. Batching only ever merges frames, so this holds by construction —
+    // and the flood design held by construction too, right up until its
+    // re-broadcasts were counted.
+    assert!(
+        eth.load(Ordering::Relaxed) + radio.load(Ordering::Relaxed) < 6,
+        "this must not cost more transmissions than McastPlan::Unicast does today"
+    );
+
+    for member in ["d", "e", "f"] {
+        assert!(
+            !h.machines[member].local_deliveries().is_empty(),
+            "{member} joined the group and must receive the frame"
+        );
+    }
+    assert!(
+        h.machines["c"].local_deliveries().is_empty(),
+        "c is not in the group and must not be delivered to, even though it \
+         hears every frame on the shared radio segment"
+    );
+    // **The delivered bytes are the frame, not the routing envelope.** The
+    // destination list sits between the header and the encapsulated frame, so
+    // an `inner_offset` that skips only the fixed header hands the host the
+    // listeners' MAC addresses prepended to its payload. Asserting merely that
+    // *something* was delivered sails straight past that.
+    // `send_local` wraps the caller's bytes in `a`'s own host frame, so that
+    // is what every listener must receive — nothing more.
+    let sent = host_frame(group, h.machines["a"].ident, &payload);
+    for member in ["d", "e", "f"] {
+        let delivered = &h.machines[member].local_deliveries()[0];
+        assert_eq!(
+            delivered.as_slice(),
+            sent.as_slice(),
+            "{member} must receive the host frame verbatim, with no destination list attached"
+        );
+    }
 }

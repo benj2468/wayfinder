@@ -1192,7 +1192,13 @@ def attack_fail_open_bridge_containment() -> Finding:
 PACKET_UNICAST = 0x03  # BatmanPacketType::Unicast
 PACKET_MCAST = 0x04  # BatmanPacketType::Mcast
 PACKET_BCAST = 0x02  # BatmanPacketType::Bcast
-OGM_VERSION = 5
+OGM_VERSION = forge.OGM_VERSION
+
+# `McastAuthForm` on the wire. Both values are proofs; every other value is a
+# drop, which is the property that makes it safe for this attacker-chosen byte
+# to select between them (design 17 §4.4).
+MCAST_FORM_TAG = 1
+MCAST_FORM_SIGNATURE = 2
 
 
 def unicast_packet(dest: wf.PyMac, payload: bytes, *, ttl: int = 50) -> bytes:
@@ -1202,9 +1208,31 @@ def unicast_packet(dest: wf.PyMac, payload: bytes, *, ttl: int = 50) -> bytes:
     )
 
 
-def mcast_packet(dest: wf.PyMac, payload: bytes, *, ttl: int = 50) -> bytes:
-    """`BatmanMcastPacket` — structurally a unicast, one copy per listener."""
-    return bytes((PACKET_MCAST, OGM_VERSION, ttl & 0xFF)) + bytes(dest.bytes) + payload
+def mcast_packet(
+    dests: wf.PyMac | list[wf.PyMac],
+    payload: bytes,
+    *,
+    ttl: int = 50,
+    form: int = MCAST_FORM_TAG,
+) -> bytes:
+    """`BatmanMcastPacket` — `[type][version][ttl][n_dests][form][dest:6]*N` +
+    inner payload (design 17 §4.1).
+
+    Multicast is routed unicast to an explicit destination list, so a forged
+    frame names its victims directly. `form` selects which proof the trailer
+    must carry: an attacker holds neither, and the point of varying it is that
+    **neither value reaches an unauthenticated path** — the tag branch fails for
+    want of a pairwise key, the signature branch for want of a member key, and
+    every other value is refused before either is tried.
+    """
+    if isinstance(dests, wf.PyMac):
+        dests = [dests]
+    body = b"".join(bytes(d.bytes) for d in dests)
+    return (
+        bytes((PACKET_MCAST, OGM_VERSION, ttl & 0xFF, len(dests) & 0xFF, form & 0xFF))
+        + body
+        + payload
+    )
 
 
 def bcast_packet(
@@ -1270,17 +1298,29 @@ def attack_multicast_addressed_directed_delivery() -> Finding:
     #    both a non-broadcast group MAC and the all-ones broadcast.
     grp = a_multicast_mac()
     uni = forge.link_frame(grp, eve, unicast_packet(victim, b"UNI-VIA-MCAST-DST"))
-    mca = forge.link_frame(
-        wf.PyMac.BROADCAST, eve, mcast_packet(victim, b"MCAST-VIA-BCAST-DST")
-    )
     sim.inject("eve", uni, at_s=22.5)
     sim.run(until_s=24.0)
     uni_delivered = sim.poll_local("victim")
-    sim.inject("eve", mca, at_s=24.5)
-    sim.run(until_s=26.0)
-    mca_delivered = sim.poll_local("victim")
 
-    injected = [d for d in (uni_delivered, mca_delivered) if d is not None]
+    # Both multicast auth forms, since after design 17 an `Mcast` under a
+    # broadcast link dst is no longer a structurally impossible shape — it is
+    # the ordinary fan-out frame. The control is therefore no longer "no such
+    # frame exists" but "neither proof verifies", and it has to be made against
+    # both branches for that to mean anything.
+    mcast_delivered = []
+    at = 24.5
+    for form in (MCAST_FORM_TAG, MCAST_FORM_SIGNATURE):
+        mca = forge.link_frame(
+            wf.PyMac.BROADCAST,
+            eve,
+            mcast_packet([victim], b"MCAST-VIA-BCAST-DST", form=form),
+        )
+        sim.inject("eve", mca, at_s=at)
+        sim.run(until_s=at + 1.5)
+        mcast_delivered.append(sim.poll_local("victim"))
+        at += 2.0
+
+    injected = [d for d in ([uni_delivered] + mcast_delivered) if d is not None]
     if injected:
         verdict = GAP
         detail = (
@@ -1293,7 +1333,9 @@ def attack_multicast_addressed_directed_delivery() -> Finding:
         verdict = HELD
         detail = (
             "a directed packet body carried under a group link-dst was refused "
-            "before local delivery just as an honestly-addressed tagless one is"
+            "before local delivery just as an honestly-addressed tagless one is; "
+            "both multicast auth forms were refused, neither for want of a proof "
+            "the attacker could supply"
         )
     return Finding("Multicast-addressed directed delivery", verdict, detail)
 
@@ -2361,7 +2403,6 @@ def attack_stale_revocation_denies_readmission() -> Finding:
 # ======================================================================
 
 PACKET_BCAST = forge.PACKET_BCAST
-OGM_VERSION = forge.OGM_VERSION
 
 
 # --- extra forge primitives (would live in forge.py) --------------------
