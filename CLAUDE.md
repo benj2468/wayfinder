@@ -43,6 +43,37 @@ cargo run -p wayfinder-ctl -- <subcommand>            # CLI mgmt client / offlin
 else) before committing; the pre-commit hook also runs it. Prefer it over
 `cargo fmt`.
 
+**Benchmarks** live in `libs/wayfinder-bench` — one crate holding the packet-path
+measurements for every layer, rather than a `benches/` directory in each of the
+four crates they measure (which would put `criterion`/`divan` in four `no_std`
+crates' dev-dependency graphs):
+
+```bash
+just bench                  # every timing suite (minutes)
+just bench-save main        # snapshot a baseline before a change
+just bench-against main     # re-run and compare against it
+just bench-cmp main after   # side-by-side table (needs critcmp)
+just bench-alloc            # the allocation gate — fast, deterministic
+just bench-smoke            # run each bench once; checks fixtures still converge
+```
+
+Two rules about them, both easy to get wrong:
+
+- **Wall-clock benchmarks are never a CI gate.** A shared docker runner varies by
+  more than most real regressions, so a threshold there fires constantly or
+  catches nothing. The `bench` job is `when: manual` and uploads criterion's HTML
+  report as an artifact; comparing baselines locally is the real workflow.
+  `test:alloc-gate` is the one benchmark-derived job that fails, because an
+  *allocation count* is deterministic where a timing is not.
+- **A benchmark's fixture must assert the state it claims to measure.** Every path
+  worth timing is reachable only from a converged router, and an unconverged one
+  does not error — it takes the no-route drop path and reports a number that
+  looks plausible and is roughly an order of magnitude too fast. `WarmRouter::
+  assert_route_to` exists for this, and the OGM cadence a fixture feeds is
+  load-bearing: BATMAN learns each path's expected interval from the gaps between
+  sightings, so tightly-spaced setup OGMs teach it a millisecond-scale interval
+  and the route ages out before the measurement starts.
+
 **Disk space:** this repo spans multiple independent Cargo workspaces (root,
 `libs/wayfinder-py`, each embedded board, each `libs/*/fuzz`), each with its
 own `target/` directory that a plain `cargo clean` in the root won't touch. If
@@ -443,6 +474,15 @@ look at if a duty-cycle-limited radio segment gets crowded.
   id/frequency/mode, applying per-link signal quality). Its own crate rather
   than a `#[cfg(test)]` module or feature on `rylr998`, so the `no_std`-first
   driver never carries tokio test scaffolding in its dependency graph.
+- **libs/wayfinder-bench** — the packet-path benchmarks: how fast a node moves
+  frames, measured at every layer from a `zerocopy` parse up to a full
+  `push_rx`/`tick`/`poll_egress` cycle. Its own crate so `criterion`/`divan`
+  stay out of the `no_std` crates' graphs, and because everything it drives is
+  already `pub`. The load-bearing part is `src/lib.rs`'s fixtures, not the
+  benches: each converges a router into the state whose cost it claims to
+  measure and asserts it, since an unconverged router silently benchmarks the
+  drop path instead. Also carries the allocation gate that keeps
+  `wayfinder-driver-core` allocation-free.
 - **libs/wayfinder-shark** — `tshark` Lua dissector for on-air BATMAN frames +
   pytest tests.
 - **bins/wayfinder-tap** — the runnable node: assembles TAP + UDP links + mgmt-API

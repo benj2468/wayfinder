@@ -90,6 +90,60 @@ clippy-workspace:
 test-workspace:
     cargo nextest run --workspace {{ host_workspace_excludes }} --release
 
+# ---------------------------------------------------------------------------
+# Benchmarks (libs/wayfinder-bench)
+# ---------------------------------------------------------------------------
+#
+# Two kinds of measurement live in that crate, and they are used differently.
+#
+# The criterion suites (`bench`) are wall-clock timings. They are for *reading*
+# — comparing a baseline you took before a change against one you take after —
+# and are deliberately never gated in CI: a shared docker runner's timings vary
+# by more than most real regressions, so a threshold there would either fire
+# constantly or catch nothing.
+#
+# The alloc suite (`bench-alloc`) is an allocation *count*, which is identical
+# on a loaded runner and a quiet laptop. That one is asserted, and CI runs it
+# with the tests. See `libs/wayfinder-bench/benches/alloc.rs` for why the
+# allocation-free property is worth a gate of its own.
+
+[doc("Run every benchmark suite (wall-clock timings; several minutes).")]
+bench:
+    cargo bench -p wayfinder-bench
+
+# Criterion writes each baseline under `target/criterion/<bench>/<name>`, so the
+# usual loop is: save one on `main`, make the change, then compare against it.
+[doc("Run the benchmarks and save the results as a named baseline.")]
+bench-save name:
+    cargo bench -p wayfinder-bench -- --save-baseline {{ name }}
+
+[doc("Run the benchmarks and compare against a saved baseline.")]
+bench-against name:
+    cargo bench -p wayfinder-bench -- --baseline {{ name }}
+
+# `critcmp` renders two saved baselines side by side with the percentage delta,
+# which is far easier to scan than criterion's own per-benchmark output.
+# Install it with `cargo install critcmp` if it isn't on PATH.
+[doc("Compare two saved baselines as a table (needs critcmp).")]
+bench-cmp a b:
+    critcmp {{ a }} {{ b }}
+
+# Fast (a few seconds) and deterministic, which is why CI can gate on it.
+# Behind the `alloc-gate` feature so a plain `just bench` doesn't try to hand
+# criterion's arguments to divan's parser; see the feature's note in
+# libs/wayfinder-bench/Cargo.toml.
+[doc("Assert the packet-planning core allocates nothing per frame.")]
+bench-alloc:
+    cargo bench -p wayfinder-bench --features alloc-gate --bench alloc
+
+# `--test` runs every benchmark exactly once, asserting nothing about timing.
+# It is the cheap check that the fixtures still converge and the benches still
+# compile — worth running after touching routing, without paying for a full
+# measurement pass.
+[doc("Smoke-run every benchmark once, without measuring.")]
+bench-smoke:
+    cargo bench -p wayfinder-bench -- --test
+
 # The `test:run:rust` CI job reports this number for the coverage badge.
 [doc("Run the root workspace's tests with a coverage summary.")]
 coverage:

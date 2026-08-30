@@ -250,6 +250,59 @@ test:run:rust:
         path: coverage.xml
         coverage_format: cobertura
       junit: target/nextest/ci/junit.xml
+# The allocation gate from libs/wayfinder-bench: asserts that planning a
+# received frame and planning a transmit both allocate exactly zero times.
+#
+# A separate job rather than a step inside test:run:rust, because a failure here
+# means something very specific — the `no_std` routing core stopped being
+# allocation-free, which breaks the boards and nothing else — and that is worth
+# naming in the pipeline instead of surfacing as "the rust tests failed".
+#
+# This is the *only* benchmark-derived job that can fail. Allocation counts are
+# deterministic, so they mean the same thing on a busy shared runner as on a
+# laptop; the wall-clock benchmarks (`bench`, below) are not gated for exactly
+# the opposite reason.
+test:alloc-gate:
+  extends: .base-ci-docker
+  stage: test
+  needs:
+    - build
+    - job: image-tag
+      artifacts: true
+  script:
+    - cargo bench -p wayfinder-bench --features alloc-gate --bench alloc
+    - sccache --show-stats
+# The wall-clock packet-path benchmarks.
+#
+# `when: manual` and `allow_failure: true` on purpose. A full criterion pass is
+# minutes of runtime for numbers that nothing automatically compares, so making
+# it part of every pipeline would spend that on every push; and timings from a
+# shared runner are too noisy to gate on even if it did. Run it when you want
+# the numbers — before and after a change to the routing hot path — and read
+# the HTML report from the job's artifacts.
+#
+# For a local before/after comparison, `just bench-save <name>` and
+# `just bench-cmp <a> <b>` are the better loop; this job exists so a pipeline
+# run can produce a shareable report without anyone having the toolchain set up.
+bench:
+  extends: .base-ci-docker
+  stage: test
+  needs:
+    - build
+    - job: image-tag
+      artifacts: true
+  when: manual
+  allow_failure: true
+  script:
+    - cargo bench -p wayfinder-bench
+    - sccache --show-stats
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      # The browsable report, plus the raw estimates the report is built from —
+      # the latter is what `critcmp` and any future trend tracking would read.
+      - target/criterion/
 test:run:python:
   extends: .base-ci-docker
   stage: test
