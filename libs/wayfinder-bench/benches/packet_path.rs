@@ -33,6 +33,7 @@ use wayfinder::auth::DIRECTED_TRAILER_LEN;
 use wayfinder::interfaces::frame::LinkFrame;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder_bench::CountingSink;
+use wayfinder_bench::NO_FAN_OUT;
 use wayfinder_bench::ORIGINATOR_COUNTS;
 use wayfinder_bench::PAYLOAD_SIZES;
 use wayfinder_bench::PEER_MAC;
@@ -66,6 +67,7 @@ fn recv(warm: &mut WarmRouter, raw: &[u8], sink: &mut CountingSink) {
         frame,
         wayfinder_bench::GOOD_METRICS,
         &mut warm.tx,
+        NO_FAN_OUT,
         sink,
     );
 }
@@ -203,11 +205,12 @@ struct StagingSink {
 }
 
 impl MeshSink for StagingSink {
-    fn emit(&mut self, frame: OutgoingFrame<'_>) {
+    fn emit(&mut self, frame: OutgoingFrame<'_>) -> bool {
         self.payload.clear();
         self.payload.extend_from_slice(frame.payload);
         self.dst = frame.dst;
         self.emitted += 1;
+        true
     }
 }
 
@@ -264,6 +267,7 @@ fn unicast_forward_authed(c: &mut Criterion) {
                         frame,
                         wayfinder_bench::GOOD_METRICS,
                         &mut tx,
+                        NO_FAN_OUT,
                         &mut sink,
                     );
 

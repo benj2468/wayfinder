@@ -7,6 +7,16 @@ use zerocopy::KnownLayout;
 /// EtherType identifying BATMAN frames on the wire (batman-adv's `ETH_P_BATMAN`).
 pub const ETH_P_BATMAN: u16 = 0x4305;
 
+/// The BATMAN protocol version this build speaks, carried at byte 1 of every
+/// packet header and **checked on ingress** by
+/// [`handle_rx`](interfaces::engine::MeshRoutingEngine::handle_rx).
+///
+/// It is a hard equality test, not a floor: a node that does not speak exactly
+/// this version has a different idea of what the bytes after the header mean,
+/// and guessing is worse than dropping. Every emitter writes it from here, so
+/// changing a wire layout is one edit rather than a hunt for literals.
+pub const BATMAN_VERSION: u8 = 6;
+
 /// The BATMAN packet types this implementation produces and routes, each a
 /// distinct on-the-wire `packet_type` byte (the first byte of a BATMAN frame's
 /// payload).  Modelled as a `#[repr(u8)]` enum — rather than a set of free
@@ -122,7 +132,7 @@ impl BatmanPacketType {
 pub struct BatmanOgmPacket {
     /// Always [`BatmanPacketType::Ogm`] for this packet type.
     pub packet_type: u8,
-    /// Protocol version (typically 5).
+    /// Protocol version; see [`BATMAN_VERSION`].
     pub version: u8,
     /// Time-to-live, decremented at each hop to bound flood radius.
     pub ttl: u8,
@@ -291,7 +301,7 @@ impl<'a> Iterator for TvlvValues<'a> {
 pub struct BatmanBroadcastPacket {
     /// Always [`BatmanPacketType::Bcast`] for this packet type.
     pub packet_type: u8,
-    /// Protocol version (typically 5), matching the OGM/unicast convention.
+    /// Protocol version; see [`BATMAN_VERSION`].
     pub version: u8,
     /// Time-to-live, decremented at each hop to bound the flood radius and
     /// prevent broadcast storms on cyclic topologies.
@@ -306,10 +316,68 @@ pub struct BatmanBroadcastPacket {
     pub orig: Mac,
 }
 
-/// Header for a [`BatmanPacketType::Mcast`] packet.  Structurally a unicast
-/// header: the encapsulated multicast frame follows it, and the packet is routed hop by
-/// hop toward `dest` (the listener node this copy targets), TTL-limited to
-/// prevent loops, and delivered to the local host on arrival at `dest`.
+/// Which proof a [`BatmanPacketType::Mcast`] frame's auth trailer carries.
+///
+/// **No value of this field means "unauthenticated"** — it selects *which*
+/// check a frame must pass, never *whether* it is checked. That distinction is
+/// the whole of design 17 §4.4: the field is attacker-chosen like every other
+/// header byte, and the earlier bug it is written against (`8ab9285`) was not
+/// that an attacker picked the branch, but that one branch was no check at all.
+/// Both branches here are proofs, so flipping the byte only chooses the check
+/// the forger fails — and since each proof covers the header, flipping it also
+/// invalidates the proof that was there.
+///
+/// An unrecognised value is a **drop**, never a fallback to trying the other
+/// verifier: with the payload running to the end of the frame there is no way
+/// to tell where a 24- or 72-byte trailer begins without being told, so trying
+/// both would be an oracle rather than a fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum McastAuthForm {
+    /// One next hop: the ordinary pairwise tag every directed frame carries,
+    /// verified by the neighbour it was addressed to.
+    Tag = 1,
+    /// Several next hops reached by one transmission on a shared medium: the
+    /// forwarding node's own signature, which every receiver verifies against
+    /// the cert it already holds for that hop. A single transmission cannot
+    /// carry one pairwise tag per recipient, each derived from a different key.
+    Signature = 2,
+}
+
+impl McastAuthForm {
+    /// The on-wire byte for this form.
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Parse an on-wire form byte, returning `None` for a value this build
+    /// cannot demand a proof for (which the caller must treat as a drop).
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Tag),
+            2 => Some(Self::Signature),
+            _ => None,
+        }
+    }
+}
+
+/// Zero is reserved: an all-zero header must fail closed, so no form may claim
+/// it. Enforced here rather than left to convention — adding a `= 0` variant
+/// would silently make every zeroed header parse.
+const _: () = assert!(McastAuthForm::from_u8(0).is_none());
+
+/// Fixed prefix of a [`BatmanPacketType::Mcast`] packet, followed on the wire
+/// by `n_dests` destination addresses and then the encapsulated frame.
+///
+/// Multicast is delivered as routed unicast to an **explicit destination
+/// list**, batched so destinations sharing a next hop travel in one frame. Each
+/// hop delivers to itself if named, removes itself, splits the rest by next
+/// hop, and emits one frame per group — so the list strictly shrinks along any
+/// path and a destination traverses exactly one route.
+///
+/// The single-destination case is not special: it is `n_dests = 1`, an 11-byte
+/// header against the 9 of the single-`dest` shape this replaces. There is no
+/// fallback path and no second handler.
 #[derive(Debug, Clone, Copy, IntoBytes, FromBytes, Immutable, KnownLayout)]
 #[repr(C, packed)]
 pub struct BatmanMcastPacket {
@@ -317,10 +385,107 @@ pub struct BatmanMcastPacket {
     pub packet_type: u8,
     /// Protocol version.
     pub version: u8,
-    /// Time-to-live, decremented per hop to bound routing loops.
+    /// Time-to-live, decremented per hop.
+    ///
+    /// A **loop backstop, not a routing input** — the same 50 a unicast
+    /// carries, for the same reason. Routing follows next hops, so a loop needs
+    /// a transient inconsistency during reconvergence and the TTL bounds it.
+    /// Nothing sizes it to the topology.
     pub ttl: u8,
-    /// The listener node this copy is addressed to (final destination).
-    pub dest: Mac,
+    /// How many destination addresses follow this header. MUST be >= 1: a
+    /// frame naming nobody has nothing to be delivered to or routed toward.
+    pub n_dests: u8,
+    /// Which proof the auth trailer carries — see [`McastAuthForm`].
+    pub form: u8,
+}
+
+/// Length of the fixed [`BatmanMcastPacket`] prefix, before the destination
+/// list.
+pub const MCAST_HEADER_LEN: usize = core::mem::size_of::<BatmanMcastPacket>();
+
+/// A parsed multi-destination multicast packet: its header, the destination
+/// list, and the encapsulated frame behind it.
+///
+/// Produced by [`parse`](Self::parse), so holding one is evidence that
+/// `n_dests` is non-zero, that the destination list **fits the frame**, and
+/// that `form` names a proof this build can demand.
+///
+/// Note what it does *not* prove: the list may still be longer than
+/// [`MAX_MCAST_DESTS`](crate::MAX_MCAST_DESTS) — a 255-destination frame parses
+/// fine — because that bound is a routing-capacity decision, not a wire one.
+/// The engine applies it separately, and must.
+#[derive(Debug)]
+pub struct McastPacketView<'a> {
+    /// The fixed header, copied out (the wire struct is packed).
+    pub header: BatmanMcastPacket,
+    /// Which proof the trailer carries. Already validated: parsing rejects a
+    /// form byte this build does not recognise.
+    pub form: McastAuthForm,
+    /// The destinations this frame is still on the path to.
+    pub dests: &'a [Mac],
+    /// The encapsulated multicast frame.
+    pub inner: &'a [u8],
+}
+
+impl<'a> McastPacketView<'a> {
+    /// Parse a multicast packet from a BATMAN payload whose auth trailer has
+    /// already been stripped.
+    ///
+    /// Returns `None` — a drop, never a partial parse — for a frame shorter
+    /// than the header, a zero `n_dests`, a list that overruns the frame, or a
+    /// `form` byte naming no proof.
+    pub fn parse(payload: &'a [u8]) -> Option<Self> {
+        let (header, rest) = BatmanMcastPacket::read_from_prefix(payload).ok()?;
+        let form = McastAuthForm::from_u8(header.form)?;
+        let n = header.n_dests as usize;
+        if n == 0 {
+            return None;
+        }
+        let list_len = core::mem::size_of::<Mac>().checked_mul(n)?;
+        let (list, inner) = rest.split_at_checked(list_len)?;
+        let dests = <[Mac]>::ref_from_bytes(list).ok()?;
+        Some(Self {
+            header,
+            form,
+            dests,
+            inner,
+        })
+    }
+}
+
+/// Write a multicast packet into `out`, returning its total length.
+///
+/// Returns `None` rather than truncating: an empty `dests` (which would name
+/// nobody), a list longer than `u8::MAX`, or a buffer too small for the whole
+/// frame. Truncating a destination list would silently drop the listeners past
+/// the cut, which is exactly the failure this design exists to remove.
+pub fn write_mcast(
+    ttl: u8,
+    form: McastAuthForm,
+    dests: &[Mac],
+    inner: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    if dests.is_empty() || dests.len() > u8::MAX as usize {
+        return None;
+    }
+    let list_len = core::mem::size_of_val(dests);
+    let total = MCAST_HEADER_LEN + list_len + inner.len();
+    if total > out.len() {
+        return None;
+    }
+
+    let header = BatmanMcastPacket {
+        packet_type: BatmanPacketType::Mcast.as_u8(),
+        version: BATMAN_VERSION,
+        ttl,
+        n_dests: dests.len() as u8,
+        form: form.as_u8(),
+    };
+    out[..MCAST_HEADER_LEN].copy_from_slice(header.as_bytes());
+    out[MCAST_HEADER_LEN..MCAST_HEADER_LEN + list_len].copy_from_slice(dests.as_bytes());
+    out[MCAST_HEADER_LEN + list_len..total].copy_from_slice(inner);
+    Some(total)
 }
 
 /// Header for a [`BatmanPacketType::Unicast`] data packet.  The encapsulated
@@ -457,13 +622,114 @@ pub struct BatmanNextHopResponsePacket {
 pub struct BatmanKeepAlivePacket {
     /// Always [`BatmanPacketType::Keepalive`].
     pub packet_type: u8,
-    /// Protocol version (typically 5), matching every other BATMAN packet.
+    /// Protocol version; see [`BATMAN_VERSION`].
     pub version: u8,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mac(n: u8) -> Mac {
+        Mac([0, 0, 0, 0, 0, n])
+    }
+
+    /// The shape design 17 exists for: one frame naming several listeners.
+    #[test]
+    fn mcast_round_trips_a_multi_destination_list() {
+        let dests = [mac(4), mac(5), mac(6)];
+        let mut buf = [0u8; 128];
+        let n = write_mcast(50, McastAuthForm::Signature, &dests, b"PAYLOAD", &mut buf)
+            .expect("three destinations fit");
+
+        let view = McastPacketView::parse(&buf[..n]).expect("round trips");
+        assert_eq!(view.header.packet_type, BatmanPacketType::Mcast.as_u8());
+        assert_eq!(view.header.version, BATMAN_VERSION);
+        assert_eq!(view.header.ttl, 50);
+        assert_eq!(view.form, McastAuthForm::Signature);
+        assert_eq!(view.dests, &dests);
+        assert_eq!(view.inner, b"PAYLOAD");
+    }
+
+    /// The single-destination case is `n_dests = 1`, not a fallback — one code
+    /// path, so this parses through exactly the same route.
+    #[test]
+    fn mcast_round_trips_a_single_destination() {
+        let mut buf = [0u8; 64];
+        let n = write_mcast(50, McastAuthForm::Tag, &[mac(7)], b"X", &mut buf).unwrap();
+
+        let view = McastPacketView::parse(&buf[..n]).unwrap();
+        assert_eq!(view.dests, &[mac(7)]);
+        assert_eq!(view.form, McastAuthForm::Tag);
+        assert_eq!(view.inner, b"X");
+        assert_eq!(
+            n,
+            MCAST_HEADER_LEN + 6 + 1,
+            "an 11-byte header against the old 9"
+        );
+    }
+
+    /// `n_dests` MUST be >= 1 (§4.1). A zero-destination frame is malformed:
+    /// it names nobody, so there is nothing it could be delivered to or routed
+    /// toward.
+    #[test]
+    fn mcast_rejects_zero_destinations() {
+        let mut buf = [0u8; 64];
+        let n = write_mcast(50, McastAuthForm::Tag, &[mac(7)], b"X", &mut buf).unwrap();
+        buf[3] = 0;
+        assert!(McastPacketView::parse(&buf[..n]).is_none());
+
+        // And the writer refuses to build one in the first place.
+        assert!(write_mcast(50, McastAuthForm::Tag, &[], b"X", &mut buf).is_none());
+    }
+
+    /// A destination count larger than the bytes behind it. This is the bounds
+    /// check that stops a remote frame reading a list out of a payload that
+    /// has none.
+    #[test]
+    fn mcast_rejects_a_list_that_overruns_the_frame() {
+        let mut buf = [0u8; 64];
+        let n = write_mcast(50, McastAuthForm::Tag, &[mac(7)], b"", &mut buf).unwrap();
+        for claimed in [2u8, 3, 255] {
+            buf[3] = claimed;
+            assert!(
+                McastPacketView::parse(&buf[..n]).is_none(),
+                "a claimed count of {claimed} must not read past the frame"
+            );
+        }
+    }
+
+    /// **No value of `form` means "unauthenticated"** (§4.4). An unrecognised
+    /// one is a drop, never a fallback to trying the other verifier.
+    #[test]
+    fn mcast_rejects_an_unrecognised_auth_form() {
+        let mut buf = [0u8; 64];
+        let n = write_mcast(50, McastAuthForm::Tag, &[mac(7)], b"X", &mut buf).unwrap();
+        for form in [0u8, 3, 4, 255] {
+            buf[4] = form;
+            let view = McastPacketView::parse(&buf[..n]);
+            assert!(
+                view.is_none(),
+                "form {form} is not a proof this build can demand"
+            );
+        }
+    }
+
+    /// A truncated frame — shorter than the fixed header — is not a panic.
+    #[test]
+    fn mcast_rejects_a_frame_too_short_for_its_header() {
+        for len in 0..MCAST_HEADER_LEN {
+            assert!(McastPacketView::parse(&[0u8; MCAST_HEADER_LEN][..len]).is_none());
+        }
+    }
+
+    /// The writer reports the space it needs rather than truncating a list.
+    #[test]
+    fn mcast_refuses_a_buffer_it_does_not_fit() {
+        let dests = [mac(4), mac(5), mac(6)];
+        let mut tiny = [0u8; MCAST_HEADER_LEN + 6];
+        assert!(write_mcast(50, McastAuthForm::Tag, &dests, b"", &mut tiny).is_none());
+    }
 
     /// Build a TVLV region from `(type, value)` records packed back-to-back.
     fn tvlv_region(records: &[(TvlvType, &[u8])]) -> Vec<u8> {
@@ -583,11 +849,11 @@ mod tests {
     fn keepalive_packet_roundtrips() {
         let pkt = BatmanKeepAlivePacket {
             packet_type: BatmanPacketType::Keepalive.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
         };
         let (parsed, _) = BatmanKeepAlivePacket::ref_from_prefix(pkt.as_bytes()).unwrap();
         assert_eq!(parsed.packet_type, BatmanPacketType::Keepalive.as_u8());
-        assert_eq!(parsed.version, 5);
+        assert_eq!(parsed.version, BATMAN_VERSION);
         assert_eq!(core::mem::size_of::<BatmanKeepAlivePacket>(), 2);
     }
 
@@ -607,7 +873,7 @@ mod tests {
 
         let req = BatmanCertReqPacket {
             packet_type: BatmanPacketType::CertReq.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 10,
             dest: Mac([0, 0, 0, 0, 0, 9]),
         };
@@ -624,7 +890,7 @@ mod tests {
     fn echo_packet_roundtrips() {
         let pkt = BatmanEchoPacket {
             packet_type: BatmanPacketType::EchoRequest.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             dest: Mac([0, 0, 0, 0, 0, 9]),
             orig: Mac([0, 0, 0, 0, 0, 1]),
@@ -649,7 +915,7 @@ mod tests {
     fn next_hop_proof_packets_are_minimal_headers() {
         let challenge = BatmanNextHopChallengePacket {
             packet_type: BatmanPacketType::NextHopChallenge.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
         };
         let (parsed, rest) =
             BatmanNextHopChallengePacket::ref_from_prefix(challenge.as_bytes()).unwrap();
@@ -657,12 +923,12 @@ mod tests {
             parsed.packet_type,
             BatmanPacketType::NextHopChallenge.as_u8()
         );
-        assert_eq!(parsed.version, 5);
+        assert_eq!(parsed.version, BATMAN_VERSION);
         assert!(rest.is_empty(), "the nonce is the body, not a header field");
 
         let response = BatmanNextHopResponsePacket {
             packet_type: BatmanPacketType::NextHopResponse.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
         };
         let (parsed, _) =
             BatmanNextHopResponsePacket::ref_from_prefix(response.as_bytes()).unwrap();

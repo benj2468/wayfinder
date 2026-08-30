@@ -28,6 +28,7 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+use core::num::NonZeroU8;
 use core::time::Duration;
 
 use embassy_futures::select::Either;
@@ -38,7 +39,7 @@ use interfaces::link::LinkError;
 use tracing::trace;
 use tracing::warn;
 use wayfinder::CentralRouter;
-use wayfinder::auth::DIRECTED_TRAILER_LEN;
+use wayfinder::auth::MAX_TRAILER_LEN;
 use wayfinder::features::LinkFeatures;
 use wayfinder::interfaces::frame::LinkFrameData;
 use wayfinder::interfaces::frame::Mac;
@@ -170,14 +171,18 @@ impl<const STAGE: usize, const FRAME_LEN: usize> Default for StageSink<STAGE, FR
 }
 
 impl<const STAGE: usize, const FRAME_LEN: usize> MeshSink for StageSink<STAGE, FRAME_LEN> {
-    fn emit(&mut self, frame: OutgoingFrame<'_>) {
+    /// Reports refusals, because this is the shell whose staging is bounded:
+    /// a collapsed multicast is the largest frame the planner produces, so it
+    /// is the first to be refused here, and the caller has directed copies to
+    /// fall back to only if it is told.
+    fn emit(&mut self, frame: OutgoingFrame<'_>) -> bool {
         let mut payload = HVec::new();
         if payload.extend_from_slice(frame.payload).is_err() {
             warn!(
                 len = frame.payload.len(),
                 "drop: staged payload exceeds frame buffer"
             );
-            return;
+            return false;
         }
         let staged = Staged {
             dst: frame.dst,
@@ -187,7 +192,9 @@ impl<const STAGE: usize, const FRAME_LEN: usize> MeshSink for StageSink<STAGE, F
         };
         if self.frames.push(staged).is_err() {
             warn!("drop: staging buffer full");
+            return false;
         }
+        true
     }
     // `deliver_local` keeps its default no-op: a radio relay has no host device.
 }
@@ -211,6 +218,13 @@ pub struct Driver<
     mac: Mac,
     tx_buffer: [u8; FRAME_LEN],
     stage: StageSink<N, FRAME_LEN>,
+    /// Each link's declared native fan-out, cached at construction.
+    ///
+    /// Read here rather than at use: the receive arm holds a borrow of `links`
+    /// through its `recv` futures, so the medium cannot be asked about itself
+    /// while one of its frames is in hand. It is a property of the medium and
+    /// does not change once the link is built, so one read is enough.
+    fan_out: [Option<NonZeroU8>; N],
 }
 
 /// Constructor at the default (host) capacities.
@@ -296,6 +310,7 @@ impl<L: LinkT, C: Clock, const N: usize, const FRAME_LEN: usize, R: RouterOps>
                 Duration::ZERO,
             );
         }
+        let fan_out = core::array::from_fn(|i| links[i].fan_out());
         Self {
             router,
             links,
@@ -303,6 +318,7 @@ impl<L: LinkT, C: Clock, const N: usize, const FRAME_LEN: usize, R: RouterOps>
             mac,
             tx_buffer: [0u8; FRAME_LEN],
             stage: StageSink::default(),
+            fan_out,
         }
     }
 
@@ -365,6 +381,7 @@ impl<L: LinkT, C: Clock, const N: usize, const FRAME_LEN: usize, R: RouterOps>
         let Driver {
             router,
             links,
+            fan_out,
             clock,
             mac,
             tx_buffer,
@@ -378,7 +395,7 @@ impl<L: LinkT, C: Clock, const N: usize, const FRAME_LEN: usize, R: RouterOps>
         let recv_futs = links.each_mut().map(|link| link.recv());
         match select(select_array(recv_futs), clock.sleep(due)).await {
             Either::First((result, idx)) => {
-                handle_link_result(now, router, idx, result, tx_buffer, stage)
+                handle_link_result(now, router, idx, result, tx_buffer, fan_out, stage)
             }
             Either::Second(()) => poll_due_all(router, now, tx_buffer, stage),
         }
@@ -482,6 +499,7 @@ impl<
         let Driver {
             router,
             links,
+            fan_out,
             clock,
             mac,
             tx_buffer,
@@ -492,7 +510,7 @@ impl<
         let recv_futs = links.each_mut().map(|link| link.recv());
         match select3(select_array(recv_futs), clock.sleep(due), mgmt.recv()).await {
             Either3::First((result, idx)) => {
-                handle_link_result(now, router, idx, result, tx_buffer, stage)
+                handle_link_result(now, router, idx, result, tx_buffer, fan_out, stage)
             }
             Either3::Second(()) => poll_due_all(router, now, tx_buffer, stage),
             Either3::Third(request) => {
@@ -555,7 +573,7 @@ async fn dispatch<
         // tag into them when this directed frame needs one.
         if stage.frames[i]
             .payload
-            .resize(body_len + DIRECTED_TRAILER_LEN, 0)
+            .resize(body_len + MAX_TRAILER_LEN, 0)
             .is_err()
         {
             warn!("drop: no room for auth trailer");
@@ -621,6 +639,7 @@ mod tests {
     use super::*;
     use interfaces::link::LinkError;
     use interfaces::link::LinkMetrics;
+    use wayfinder::batman::wire::BATMAN_VERSION;
     use wayfinder::batman::wire::BatmanOgmPacket;
     use wayfinder::batman::wire::BatmanPacketType;
     use wayfinder::interfaces::frame::LinkFrame;
@@ -637,7 +656,7 @@ mod tests {
     fn bare_ogm_bytes(orig: Mac, seqno: u32, ttl: u8) -> Vec<u8> {
         let ogm = BatmanOgmPacket {
             packet_type: BatmanPacketType::Ogm.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl,
             flags: 0,
             seqno: seqno.to_be(),

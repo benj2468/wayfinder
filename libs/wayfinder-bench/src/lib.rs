@@ -25,8 +25,10 @@
 //! - **auth on/off** — the Ed25519 tax, which is large enough to hide
 //!   everything else and so is always a separate axis, never folded in.
 
+use core::num::NonZeroU8;
 use core::time::Duration;
 
+use batman::wire::BATMAN_VERSION;
 use batman::wire::BatmanOgmPacket;
 use batman::wire::BatmanPacketType;
 use batman::wire::BatmanUnicastPacket;
@@ -45,6 +47,21 @@ use wayfinder_test::driver::TestMachineConfig;
 use wayfinder_test::driver::TestSwitchConfig;
 use wayfinder_test::driver::mac;
 use zerocopy::IntoBytes;
+
+/// The per-interface multicast fan-out declarations handed to every benchmarked
+/// receive: none, on any interface.
+///
+/// Empty rather than a filled-in threshold because these benchmarks measure the
+/// unicast, broadcast and OGM paths, where the declaration is never consulted —
+/// a collapse only happens for a multicast with several next hops behind one
+/// medium. An empty slice reads identically to an all-`None` one at every index
+/// (`fan_out.get(idx)` yields `None` either way), and it is what a link that has
+/// not opted in actually declares, so it keeps these benchmarks on the same path
+/// a real node takes for them.
+///
+/// Timing the collapse itself needs a fixture that converges several multicast
+/// destinations behind one fan-out interface; there is no such benchmark yet.
+pub const NO_FAN_OUT: &[Option<NonZeroU8>] = &[];
 
 /// Physical-layer metrics attached to every benchmarked receive: a strong,
 /// noiseless link.
@@ -123,9 +140,10 @@ impl CountingSink {
 }
 
 impl MeshSink for CountingSink {
-    fn emit(&mut self, frame: OutgoingFrame<'_>) {
+    fn emit(&mut self, frame: OutgoingFrame<'_>) -> bool {
         self.emitted += 1;
         self.bytes += frame.payload.len() as u64;
+        true
     }
 
     fn deliver_local(&mut self, inner: &[u8]) {
@@ -156,7 +174,7 @@ pub fn link_frame(dst: Mac, src: Mac, protocol: u16, payload: &[u8]) -> Vec<u8> 
 pub fn ogm_payload(orig: Mac, seqno: u32, ttl: u8, tq: u8) -> Vec<u8> {
     let ogm = BatmanOgmPacket {
         packet_type: BatmanPacketType::Ogm.as_u8(),
-        version: 5,
+        version: BATMAN_VERSION,
         ttl,
         flags: 0,
         seqno: seqno.to_be(),
@@ -188,7 +206,7 @@ pub fn ogm_frame(orig: Mac, src: Mac, seqno: u32, ttl: u8, tq: u8) -> Vec<u8> {
 pub fn unicast_frame(src: Mac, link_dst: Mac, dest: Mac, payload_len: usize) -> Vec<u8> {
     let hdr = BatmanUnicastPacket {
         packet_type: BatmanPacketType::Unicast.as_u8(),
-        version: 5,
+        version: BATMAN_VERSION,
         ttl: 50,
         dest,
     };
@@ -366,7 +384,16 @@ fn feed_at(
     let Ok(frame) = wayfinder::interfaces::frame::LinkFrame::ref_from_bytes(raw) else {
         panic!("bench fixture built a malformed link frame");
     };
-    wayfinder_driver_core::handle_mesh_frame(now, router, idx, frame, GOOD_METRICS, tx, sink);
+    wayfinder_driver_core::handle_mesh_frame(
+        now,
+        router,
+        idx,
+        frame,
+        GOOD_METRICS,
+        tx,
+        NO_FAN_OUT,
+        sink,
+    );
 }
 
 // ── the authenticated fixture ────────────────────────────────────────────────
@@ -419,7 +446,7 @@ impl AuthedLine {
         let (b, c) = (self.b, self.c);
         let hdr = BatmanUnicastPacket {
             packet_type: BatmanPacketType::Unicast.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             dest: c,
         };

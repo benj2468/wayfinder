@@ -35,6 +35,7 @@ use wayfinder::auth::DIRECTED_TRAILER_LEN;
 use wayfinder::interfaces::frame::LinkFrame;
 use wayfinder_bench::CountingSink;
 use wayfinder_bench::GOOD_METRICS;
+use wayfinder_bench::NO_FAN_OUT;
 use wayfinder_bench::PEER_MAC;
 use wayfinder_bench::REMOTE_MAC;
 use wayfinder_bench::SELF_MAC;
@@ -135,6 +136,7 @@ fn rx_unicast_forward(bencher: Bencher) {
             frame,
             GOOD_METRICS,
             &mut warm.tx,
+            NO_FAN_OUT,
             &mut sink,
         );
     };
@@ -159,6 +161,7 @@ fn rx_local_deliver(bencher: Bencher) {
             frame,
             GOOD_METRICS,
             &mut warm.tx,
+            NO_FAN_OUT,
             &mut sink,
         );
     };

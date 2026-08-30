@@ -27,7 +27,7 @@ use tracing::trace;
 use tracing::warn;
 use wayfinder::CentralRouter;
 use wayfinder::McastPlan;
-use wayfinder::auth::DIRECTED_TRAILER_LEN;
+use wayfinder::auth::MAX_TRAILER_LEN;
 use wayfinder::config::TrickleConfig;
 use wayfinder::features::LinkFeatures;
 use wayfinder::interfaces::frame::LinkFrameData;
@@ -52,6 +52,8 @@ use wayfinder::link::LinkT;
 
 use crate::snoop::McastSnooper;
 use crate::transport::FrameIo;
+use core::num::NonZeroU8;
+use interfaces::engine::FrameSink;
 
 /// Where the driver's certificate-validity clock comes from.
 ///
@@ -212,13 +214,15 @@ impl LoopOutput {
 /// scratchpad, reused on the next planning call), and a local delivery into
 /// `local`.
 impl MeshSink for LoopOutput {
-    fn emit(&mut self, frame: wayfinder_driver_core::OutgoingFrame<'_>) {
+    /// Always accepts: the host shell stages into a `Vec`.
+    fn emit(&mut self, frame: wayfinder_driver_core::OutgoingFrame<'_>) -> bool {
         self.mesh.push(OutgoingFrame {
             dst: frame.dst,
             protocol: frame.protocol,
             payload: frame.payload.to_vec(),
             egress: frame.egress,
         });
+        true
     }
     fn deliver_local(&mut self, inner: &[u8]) {
         self.local = Some(inner.to_vec());
@@ -235,6 +239,13 @@ pub struct Driver<Local: FrameIo> {
     local: Local,
     /// The mesh interfaces, indexed by interface index.
     interfaces: Vec<Box<DynLinkT<'static>>>,
+    /// Each interface's declared native fan-out, cached at construction.
+    ///
+    /// Read here rather than at use: the receive arm holds a mutable borrow of
+    /// `interfaces` through its `recv` futures, so the medium cannot be asked
+    /// about itself while one of its frames is in hand. It is a property of the
+    /// medium and fixed once the link is built, so one read is enough.
+    fan_out: Vec<Option<NonZeroU8>>,
     /// The routing engine for this node, and the identity seed beside it,
     /// behind the lock the management reads share.
     ///
@@ -371,9 +382,11 @@ impl<Local: FrameIo> Driver<Local> {
                 Duration::ZERO,
             );
         }
+        let fan_out = interfaces.iter().map(|i| i.fan_out()).collect();
         Self {
             local,
             interfaces,
+            fan_out,
             shared: Arc::new(RwLock::new(SharedRouter::new(router))),
             query_rx,
             mac,
@@ -687,6 +700,7 @@ impl<Local: FrameIo> Driver<Local> {
         let Driver {
             local,
             interfaces,
+            fan_out,
             shared: _,
             query_rx,
             mac,
@@ -737,7 +751,7 @@ impl<Local: FrameIo> Driver<Local> {
                 }, if check_mesh => {
                     let mut out = LoopOutput::none();
                     wayfinder_driver_core::handle_link_result(
-                        now, &mut shared.write().await.router, idx, result, tx_buffer, &mut out,
+                        now, &mut shared.write().await.router, idx, result, tx_buffer, fan_out, &mut out,
                     );
                     (now, out)
                 },
@@ -979,6 +993,7 @@ impl<Local: FrameIo> Driver<Local> {
                     idx,
                     result,
                     &mut self.tx_buffer,
+                    &self.fan_out,
                     &mut output,
                 );
                 self.dispatch_output(self.start.elapsed(), output).await?;
@@ -1335,6 +1350,26 @@ fn build_auth_snapshot(router: &CentralRouter, identity_seed: Option<[u8; 32]>) 
     }
 }
 
+/// Collects the router's multicast destination groups into the owned
+/// `OutgoingFrame`s this shell dispatches.
+///
+/// Unbounded on purpose: on a host the frames go into a `Vec`, so there is no
+/// capacity to run out of and no group to lose. The engine still bounds how
+/// many groups it produces.
+struct OwnedFrameSink<'a>(&'a mut Vec<OutgoingFrame>);
+
+impl FrameSink for OwnedFrameSink<'_> {
+    fn push(&mut self, f: LinkFrameData<'_>) -> bool {
+        self.0.push(OutgoingFrame {
+            dst: f.dst,
+            protocol: f.protocol,
+            payload: f.payload.to_vec(),
+            egress: Egress::Auto,
+        });
+        true
+    }
+}
+
 /// Turn one host Ethernet frame into the mesh frames that carry it.
 ///
 /// The host hands us a full Ethernet frame `[dst MAC][src MAC][ethertype][..]`.
@@ -1381,16 +1416,22 @@ fn plan_host_frame(
     } else if dst.is_multicast() {
         match router.mcast_plan(dst) {
             McastPlan::Unicast => {
+                // One call with the whole listener set, not one call per
+                // listener: the router groups them by next hop, so listeners
+                // sharing one travel in a single frame and every hop they
+                // share is paid for once rather than once per listener.
                 let targets: Vec<Mac> = router.mcast_targets(dst).collect();
-                for target in targets {
-                    if let Ok(f) = router.handle_local_mcast(now, target, eth, tx_buffer) {
-                        mesh.push(OutgoingFrame {
-                            dst: f.dst,
-                            protocol: f.protocol,
-                            payload: f.payload.to_vec(),
-                            egress: Egress::Auto,
-                        });
-                    }
+                if let Err(e) = router.handle_local_mcast(
+                    now,
+                    &targets,
+                    eth,
+                    tx_buffer,
+                    &mut OwnedFrameSink(&mut mesh),
+                ) {
+                    // Nothing went out at all — no flood arm to fall back to
+                    // on this branch, so record it rather than lose the host's
+                    // frame silently.
+                    trace!(?dst, ?e, "drop: local multicast unsendable");
                 }
             }
             McastPlan::Flood => flood(router, &mut mesh, tx_buffer),
@@ -1442,7 +1483,7 @@ async fn dispatch<Local: FrameIo>(
         // `None` means auth is on but this directed frame cannot be tagged —
         // drop it rather than emit it in the clear.
         let body_len = payload.len();
-        payload.resize(body_len + DIRECTED_TRAILER_LEN, 0);
+        payload.resize(body_len + MAX_TRAILER_LEN, 0);
         let num_interfaces = interfaces.len();
         // Planning needs the router; sending does not. The guard is scoped to
         // the plan and dropped before any link I/O, because a link send is a

@@ -105,7 +105,7 @@ pub trait LinkT: Send {
     /// link rather than to config: the driver is what knows whether its own
     /// `send` is a broadcast.
     ///
-    /// **Nothing reads this yet.** It is the seam design 17 (multi-destination
+    /// **Read by the multicast fan-out collapse** (design 17 §4.5). It is the seam design 17 (multi-destination
     /// multicast) plugs into: a forwarding node with several next hops behind
     /// one interface collapses them into a single `send_all` when, and only
     /// when, the link declares that one send reaches them all. If that design

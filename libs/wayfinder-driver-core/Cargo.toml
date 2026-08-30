@@ -28,6 +28,10 @@ tracing = { version = "0.1.44", default-features = false }
 # `default-features = false` for the same reason as `tracing` above — the core
 # stays `no_std`.
 wayfinder-alarm = { path = "../wayfinder-alarm", default-features = false }
+# Fixed-capacity buffers for the multicast destination groups a received frame
+# is split into, held between the engine's emission and the fan-out collapse
+# that merges them (design 17 §4.5). `no_std` like everything else here.
+heapless = { workspace = true }
 
 [dev-dependencies]
 # The CA (`Authority`) used only in tests to mint membership certs and drive the

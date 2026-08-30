@@ -35,6 +35,18 @@ pub const MAX_LOCAL_MCAST: usize = 16;
 /// the whole mesh.  Bounds the footprint for embedded targets.
 pub const MAX_MCAST_MEMBERS: usize = 64;
 
+/// Most destinations one multicast frame may name, and so the most groups one
+/// hop can split it into.
+///
+/// Matches `wayfinder::MCAST_FANOUT`, which is the cap the *sender* already
+/// applies: past it a group is flooded instead of unicast, so no honest frame
+/// ever carries more. Bounding the list bounds the emitted groups too — groups
+/// are bounded by distinct next hops, which are bounded by destinations — which
+/// is why one constant covers both and why it is **not** the interface count.
+/// Several neighbours can sit behind one interface, and each is its own group
+/// until the driver collapses them onto a shared medium.
+pub const MAX_MCAST_DESTS: usize = 16;
+
 /// Maximum number of mesh interfaces whose OGM emission this engine paces with
 /// an independent [`TrickleTimer`].  Bounds the per-interface timer table for
 /// embedded targets.
@@ -569,6 +581,27 @@ pub struct BatmanEngine<
     /// through this node can cause it), so unlike that counter it never
     /// escalates to `warn!`, only `trace!`.
     relay_oversize_drops: u32,
+
+    /// Multicast frames refused whole because their destination list exceeded
+    /// [`MAX_MCAST_DESTS`]. Only reachable from a member forging a longer list
+    /// than `MCAST_FANOUT` ever produces, so — like `relay_oversize_drops` —
+    /// remotely triggerable and never escalated past `trace!`.
+    mcast_oversize_lists: u32,
+    /// Multicast destinations dropped from a list for want of a route, the
+    /// rest of the list still forwarded.
+    ///
+    /// **The quiet failure of multi-destination multicast**: delivery to one
+    /// listener stops while every other listener in the same frame is served,
+    /// so nothing else about the node looks wrong. Counted for exactly that
+    /// reason.
+    mcast_unroutable_dests: u32,
+    /// Destination groups that could not be emitted because the shell's frame
+    /// sink was full.
+    ///
+    /// Distinct from the two above: those are frames this node declined to
+    /// route, this one is routing this node *decided* on and then could not
+    /// carry out, which is why it is the one that warns.
+    mcast_emit_overflows: u32,
 }
 
 impl<
@@ -597,6 +630,9 @@ impl<
             keepalive_timers: HVec::new(),
             topology_changed: false,
             relay_oversize_drops: 0,
+            mcast_oversize_lists: 0,
+            mcast_unroutable_dests: 0,
+            mcast_emit_overflows: 0,
         }
     }
 
@@ -612,5 +648,23 @@ impl<
     /// between two of this node's links.
     pub fn relay_oversize_drops(&self) -> u32 {
         self.relay_oversize_drops
+    }
+
+    /// Multicast frames refused for a destination list past
+    /// [`MAX_MCAST_DESTS`]. See [`mcast_oversize_lists`](Self::mcast_oversize_lists).
+    pub fn mcast_oversize_lists(&self) -> u32 {
+        self.mcast_oversize_lists
+    }
+
+    /// Multicast destinations dropped for want of a route — the quiet failure
+    /// of multi-destination multicast.
+    pub fn mcast_unroutable_dests(&self) -> u32 {
+        self.mcast_unroutable_dests
+    }
+
+    /// Destination groups this node routed but could not emit, the shell's
+    /// frame sink being full.
+    pub fn mcast_emit_overflows(&self) -> u32 {
+        self.mcast_emit_overflows
     }
 }

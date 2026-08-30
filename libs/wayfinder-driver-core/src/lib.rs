@@ -45,13 +45,22 @@
 
 use core::time::Duration;
 
+use core::num::NonZeroU8;
+use heapless::Vec as HVec;
+use interfaces::engine::FrameSink;
+use interfaces::frame::LinkFrameData;
 use interfaces::link::LinkError;
 use interfaces::link::LinkMetrics;
 use tracing::trace;
 use wayfinder::DEFAULT_BATMAN_ETHER_TYPE;
 use wayfinder::EgressInterface;
 use wayfinder::auth::DIRECTED_TRAILER_LEN;
+use wayfinder::auth::FANOUT_TRAILER_LEN;
+use wayfinder::batman::MAX_MCAST_DESTS;
 use wayfinder::batman::wire::BatmanPacketType;
+use wayfinder::batman::wire::McastAuthForm;
+use wayfinder::batman::wire::McastPacketView;
+use wayfinder::batman::wire::write_mcast;
 use wayfinder::interfaces::frame::LinkFrame;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder::link::Received;
@@ -124,10 +133,17 @@ pub struct OutgoingFrame<'a> {
 /// the local host device.  A router-only node (no host device) leaves
 /// `deliver_local` at its default no-op.
 pub trait MeshSink {
-    /// Accept one frame bound for the mesh.  The implementation **must** copy
-    /// `frame.payload` before returning — it borrows a scratchpad reused on the
-    /// next planning call.
-    fn emit(&mut self, frame: OutgoingFrame<'_>);
+    /// Accept one frame bound for the mesh, returning `false` if it could not
+    /// be taken.  The implementation **must** copy `frame.payload` before
+    /// returning — it borrows a scratchpad reused on the next planning call.
+    ///
+    /// The return value exists for multicast: a collapsed fan-out frame is the
+    /// largest this path produces, so it is the one a bounded `heapless` stage
+    /// refuses first, and the caller must know in order to fall back to the
+    /// directed copies it would otherwise have skipped. A shell whose staging
+    /// cannot fail returns `true` unconditionally.
+    #[must_use = "a refused frame is lost; the caller must fall back or count it"]
+    fn emit(&mut self, frame: OutgoingFrame<'_>) -> bool;
 
     /// Accept one inner payload bound for the local host device.  Defaults to a
     /// no-op for nodes that route only and have no host device to deliver to.
@@ -136,17 +152,46 @@ pub trait MeshSink {
     }
 }
 
-/// Whether `payload`'s BATMAN sub-type must carry the pairwise trailer when
-/// auth is on.
+/// Which proof a BATMAN sub-type must carry when auth is on.
 ///
-/// **This is decided by the sub-type, never by the link-layer destination.**
-/// The two are unrelated fields, both attacker-chosen on an injected frame, and
-/// keying the requirement on the link dst is what let a `Unicast`/`Mcast` wear
-/// a group MAC to skip the tag check while still being delivered or relayed by
-/// its *inner* `dest` — an unauthenticated injection primitive into the
-/// directed data plane, and (via a relay's own re-tagging on the forward) a way
-/// to launder outsider bytes onto a node that never shared a medium with the
-/// attacker.
+/// **Decided by the sub-type, never by the link-layer destination.** The two
+/// are unrelated fields, both attacker-chosen on an injected frame, and keying
+/// the requirement on the link dst is what let a `Unicast`/`Mcast` wear a group
+/// MAC to skip the check while still being delivered or relayed by its *inner*
+/// `dest` — an unauthenticated injection primitive into the directed data
+/// plane, and (via a relay's own re-tagging on the forward) a way to launder
+/// outsider bytes onto a node that never shared a medium with the attacker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequiredProof {
+    /// No trailer: the packet is either one-to-many (a pairwise key cannot
+    /// cover a flood) or self-authenticating.
+    None,
+    /// The per-neighbour pairwise tag every directed frame carries.
+    Tag,
+    /// The sender's own signature, for a multicast frame one transmission
+    /// carries to several next hops at once (design 17 §4.4).
+    Fanout,
+    /// Drop the frame outright: it named a proof this build cannot demand.
+    Drop,
+}
+
+impl RequiredProof {
+    /// How many trailer bytes this proof occupies behind the frame body.
+    ///
+    /// The length is a *consequence* of the proof, never a substitute for it:
+    /// recovering "which verifier" by comparing a length back against a
+    /// constant is how a third site came to reach for the wrong one, leaving
+    /// 48 bytes of signature attached to a frame that had verified.
+    const fn trailer_len(self) -> usize {
+        match self {
+            Self::None | Self::Drop => 0,
+            Self::Tag => DIRECTED_TRAILER_LEN,
+            Self::Fanout => FANOUT_TRAILER_LEN,
+        }
+    }
+}
+
+/// Classify `payload`'s BATMAN sub-type.
 ///
 /// The exemptions are the packets for which a pairwise tag is either impossible
 /// or redundant, and nothing else:
@@ -162,13 +207,22 @@ pub trait MeshSink {
 ///   requiring a pairwise tag would make lazy cert distribution unable to
 ///   bootstrap the very keys that tag needs.
 ///
-/// Everything else requires one, including a sub-type this build does not
+/// [`Mcast`](BatmanPacketType::Mcast) is the one sub-type with a *choice* of
+/// proof, and the choice is read from its `form` header byte. That byte is
+/// attacker-chosen like every other, which is safe here for a reason worth
+/// stating precisely: **no value of it reaches an unauthenticated path.** Both
+/// defined values are proofs and every other value is
+/// [`Drop`](RequiredProof::Drop), so flipping the byte only chooses the check
+/// the forger fails — and since each proof covers the header, flipping it also
+/// invalidates the proof that was there. What `8ab9285` fixed was not that an
+/// attacker picked the branch, but that one branch was no check at all.
+///
+/// Everything else requires a tag, including a sub-type this build does not
 /// recognise. `BatmanEngine::handle_rx` hands an unknown type to
 /// `route_by_dest`, which will deliver or forward it, so it is directed in
-/// every way that matters here — and a future sub-type this build has never
-/// seen may well be routed by an inner `dest` of its own. Failing closed costs
-/// nothing: no honest peer emits a sub-type we cannot classify.
-fn requires_pairwise_tag(payload: &[u8]) -> bool {
+/// every way that matters here. Failing closed costs nothing: no honest peer
+/// emits a sub-type we cannot classify.
+fn required_proof(payload: &[u8]) -> RequiredProof {
     match payload.first().copied().and_then(BatmanPacketType::from_u8) {
         Some(
             BatmanPacketType::Ogm
@@ -176,43 +230,70 @@ fn requires_pairwise_tag(payload: &[u8]) -> bool {
             | BatmanPacketType::Keepalive
             | BatmanPacketType::CertReq
             | BatmanPacketType::CertReply,
-        ) => false,
+        ) => RequiredProof::None,
+        // The form byte sits at a fixed offset in the multicast header. A
+        // payload too short to hold it cannot name a proof, so it is dropped
+        // rather than guessed at.
+        Some(BatmanPacketType::Mcast) => {
+            match payload.get(4).copied().map(McastAuthForm::from_u8) {
+                Some(Some(McastAuthForm::Tag)) => RequiredProof::Tag,
+                Some(Some(McastAuthForm::Signature)) => RequiredProof::Fanout,
+                _ => RequiredProof::Drop,
+            }
+        }
         Some(
             BatmanPacketType::Unicast
-            | BatmanPacketType::Mcast
             | BatmanPacketType::EchoRequest
             | BatmanPacketType::EchoReply
             | BatmanPacketType::NextHopChallenge
             | BatmanPacketType::NextHopResponse,
-        ) => true,
+        ) => RequiredProof::Tag,
         // Unrecognised sub-type, or an empty payload: fail closed.
-        None => true,
+        None => RequiredProof::Tag,
     }
 }
 
-/// Verify and strip the pairwise-tag trailer from a directed data-plane frame
+/// Verify and strip the authentication trailer from a directed data-plane frame
 /// when auth is enabled, returning the frame to route on: the original frame
 /// (auth off, or a sub-type that carries no pairwise tag), a shorter *view*
 /// over the same bytes with the trailer dropped, or `None` if the frame must be
 /// dropped (bad/missing tag from an unverified or foreign neighbor).
 fn strip_directed<'a, R: RouterOps>(router: &mut R, frame: &'a LinkFrame) -> Option<&'a LinkFrame> {
-    // Tagged-or-not is `requires_pairwise_tag`'s call, from the sub-type alone
+    // Tagged-or-not is `required_proof`'s call, from the sub-type alone
     // and never from `frame.dst` — see its doc for why. With auth off nothing
     // is tagged at all.
     let Some(auth) = router.auth_mut() else {
         return Some(frame);
     };
-    if frame.protocol.get() != DEFAULT_BATMAN_ETHER_TYPE || !requires_pairwise_tag(&frame.payload) {
+    if frame.protocol.get() != DEFAULT_BATMAN_ETHER_TYPE {
         return Some(frame);
     }
+    let proof = required_proof(&frame.payload);
+    let trailer_len = proof.trailer_len();
+    match proof {
+        RequiredProof::None => return Some(frame),
+        RequiredProof::Tag | RequiredProof::Fanout => {}
+        RequiredProof::Drop => {
+            // A multicast frame naming a proof this build cannot demand. Never
+            // a fallback to trying the other verifier: with the payload running
+            // to the end of the frame there is no way to tell where a trailer
+            // begins without being told, so trying both would be an oracle.
+            trace!(src = ?frame.src, "drop: multicast naming an unknown auth form");
+            return None;
+        }
+    }
 
-    let Some(body_len) = frame.payload.len().checked_sub(DIRECTED_TRAILER_LEN) else {
-        // Too short to even hold a tag trailer — a malformed/foreign frame.
+    let Some(body_len) = frame.payload.len().checked_sub(trailer_len) else {
+        // Too short to even hold the trailer — a malformed/foreign frame.
         trace!(src = ?frame.src, len = frame.payload.len(), "drop: directed frame too short for auth trailer");
         return None;
     };
     let (inner, trailer) = frame.payload.split_at(body_len);
-    if !auth.verify_directed(frame.src, inner, trailer) {
+    let ok = match proof {
+        RequiredProof::Fanout => auth.verify_fanout(frame.src, inner, trailer),
+        _ => auth.verify_directed(frame.src, inner, trailer),
+    };
+    if !ok {
         // Unverified/foreign neighbor or a replayed counter — drop rather than
         // route an unauthenticated directed frame.
         //
@@ -261,7 +342,7 @@ fn strip_directed<'a, R: RouterOps>(router: &mut R, frame: &'a LinkFrame) -> Opt
     // tag had to verify first, which bounds the rate, so they stay `trace!`
     // alongside every other drop on this path.
     let full = frame.as_bytes();
-    let strip_len = full.len() - DIRECTED_TRAILER_LEN;
+    let strip_len = full.len() - trailer_len;
     let Some(bytes) = full.get(..strip_len) else {
         trace!(
             src = ?frame.src,
@@ -292,7 +373,7 @@ fn strip_directed<'a, R: RouterOps>(router: &mut R, frame: &'a LinkFrame) -> Opt
 /// buffer, so reserving that space is its concern.  Returns:
 ///
 /// * `Some(body_len)` — send the body untagged: auth is disabled, or
-///   [`requires_pairwise_tag`] exempts this sub-type (see its doc for which
+///   [`required_proof`] exempts this sub-type (see its doc for which
 ///   ones, and why each either cannot carry a pairwise tag or need not).
 /// * `Some(body_len + DIRECTED_TRAILER_LEN)` — the tag was written; send the
 ///   body plus trailer.
@@ -310,23 +391,50 @@ fn tag_directed_into<R: RouterOps>(
     buf: &mut [u8],
 ) -> Option<usize> {
     // The same rule the receiver applies, read off the same field, so the two
-    // halves cannot drift: a sub-type `requires_pairwise_tag` would refuse
+    // halves cannot drift: a sub-type `required_proof` would refuse
     // untagged on ingress is never emitted untagged either.
-    let needs_tag =
-        protocol == DEFAULT_BATMAN_ETHER_TYPE && requires_pairwise_tag(&buf[..body_len]);
+    let proof = if protocol == DEFAULT_BATMAN_ETHER_TYPE {
+        required_proof(&buf[..body_len])
+    } else {
+        RequiredProof::None
+    };
 
     let Some(auth) = router.auth_mut() else {
         // Auth disabled: send the body untagged.
         return Some(body_len);
     };
-    if !needs_tag {
-        return Some(body_len);
+    match proof {
+        RequiredProof::None => return Some(body_len),
+        RequiredProof::Tag | RequiredProof::Fanout => {}
+        // Unreachable from this node's own emitters, which only ever write a
+        // form they can prove — but staging one would put an unprovable frame
+        // on the wire, so it is refused here rather than trusted not to happen.
+        RequiredProof::Drop => return None,
     }
+    let trailer_len = proof.trailer_len();
 
-    // Write the tag straight into the reserved trailer bytes (no scratch buffer).
-    let (frame, trailer) = buf[..body_len + DIRECTED_TRAILER_LEN].split_at_mut(body_len);
-    if auth.tag_directed(dst, frame, trailer).is_some() {
-        Some(body_len + DIRECTED_TRAILER_LEN)
+    // Write the proof straight into the reserved trailer bytes (no scratch
+    // buffer). The caller reserves [`MAX_TRAILER_LEN`] rather than the length
+    // of the form this frame turned out to need — it cannot know that before
+    // the sub-type is classified — so a buffer too short is a caller bug rather
+    // than remote input, and is refused rather than indexed past.
+    let Some(region) = buf.get_mut(..body_len + trailer_len) else {
+        trace!(
+            ?dst,
+            body_len,
+            trailer_len,
+            buf_len = buf.len(),
+            "drop: no room reserved for the auth trailer"
+        );
+        return None;
+    };
+    let (frame, trailer) = region.split_at_mut(body_len);
+    let signed = match proof {
+        RequiredProof::Fanout => auth.sign_fanout(frame, trailer),
+        _ => auth.tag_directed(dst, frame, trailer),
+    };
+    if signed.is_some() {
+        Some(body_len + trailer_len)
     } else {
         // Auth on but we can't tag this directed frame (no verified key for dst
         // yet, or counter exhausted): the caller drops it rather than emit it in
@@ -357,10 +465,279 @@ fn tag_directed_into<R: RouterOps>(
     }
 }
 
+/// Collects the destination groups the engine split a multicast frame into, so
+/// they can be **merged onto a fan-out medium** once the router is free to be
+/// asked which interface reaches each next hop (design 17 §4.5).
+///
+/// The merge cannot happen inside `handle_rx`: resolving a next hop to an
+/// interface needs the router, which is already borrowed for that call. So the
+/// engine emits one group per next hop, this buffers them, and
+/// [`flush_mcast_groups`] does the collapse afterwards.
+///
+/// Only the *metadata* is buffered — a next hop and its destination list per
+/// group — never the payload. Every group from one multicast carries the same
+/// encapsulated frame, still sitting in the received frame, so copying it once
+/// per group would cost an embedded node kilobytes to say the same thing
+/// several times.
+///
+/// A frame that is not a parseable multicast passes straight through: this sits
+/// on the path every engine emission takes, and only multicast has groups to
+/// merge.
+struct McastCollector<'a, S: MeshSink> {
+    sink: &'a mut S,
+    groups: HVec<(Mac, HVec<Mac, MAX_MCAST_DESTS>), MAX_MCAST_DESTS>,
+    /// The TTL the engine stamped on the frames it emitted (already
+    /// decremented), carried so a merged frame is rebuilt with the same one.
+    ttl: u8,
+    /// A group that did not fit, so the caller can count what was lost rather
+    /// than let it vanish.
+    overflowed: bool,
+}
+
+impl<'a, S: MeshSink> McastCollector<'a, S> {
+    fn new(sink: &'a mut S) -> Self {
+        Self {
+            sink,
+            groups: HVec::new(),
+            ttl: 0,
+            overflowed: false,
+        }
+    }
+}
+
+impl<S: MeshSink> FrameSink for McastCollector<'_, S> {
+    fn push(&mut self, frame: LinkFrameData<'_>) -> bool {
+        let Some(view) = McastPacketView::parse(frame.payload) else {
+            // Not a multicast: nothing to merge, so it goes straight out, and
+            // the shell logs its own refusal if it cannot stage it.
+            return self.sink.emit(OutgoingFrame {
+                dst: frame.dst,
+                protocol: frame.protocol,
+                payload: frame.payload,
+                egress: Egress::Auto,
+            });
+        };
+        self.ttl = view.header.ttl;
+        let mut dests: HVec<Mac, MAX_MCAST_DESTS> = HVec::new();
+        for d in view.dests {
+            if dests.push(*d).is_err() {
+                self.overflowed = true;
+                return false;
+            }
+        }
+        if self.groups.push((frame.dst, dests)).is_err() {
+            self.overflowed = true;
+            return false;
+        }
+        true
+    }
+}
+
+/// Emit the collected destination groups, collapsing onto a shared medium where
+/// one transmission reaches every next hop in a group (design 17 §4.5).
+///
+/// Two next hops behind the same interface do not need two transmissions if
+/// that interface reaches both in one, which is what `LinkT::fan_out` declares:
+/// the count of destinations at which one send beats one directed copy each.
+/// Below that count the directed copies are emitted individually — they are
+/// cheaper *and* more precise, since they do not wake every other peer on the
+/// medium.
+///
+/// A merged frame differs from the per-next-hop ones in three ways, all of them
+/// following from there being one transmission for several recipients:
+///
+/// * its destination list is the **union** of the merged groups', so each
+///   receiver finds itself in the list and everyone else ignores it;
+/// * it is addressed to the medium's broadcast address, because there is no
+///   single next hop to name; and
+/// * it carries [`McastAuthForm::Signature`], because one transmission cannot
+///   carry one pairwise tag per recipient, each derived from a different key.
+///
+/// Over-claiming a fan-out is a **correctness** bug rather than a missed
+/// optimisation: a medium that says one send reaches every neighbour when it
+/// does not will drop every destination but one. That is why the declaration is
+/// the link's own and why it defaults to `None`.
+// Same as `handle_mesh_frame`, which it is a continuation of.
+#[allow(clippy::too_many_arguments)]
+fn flush_mcast_groups<R: RouterOps>(
+    router: &mut R,
+    now: Duration,
+    groups: &[(Mac, HVec<Mac, MAX_MCAST_DESTS>)],
+    ttl: u8,
+    inner: &[u8],
+    fan_out: &[Option<NonZeroU8>],
+    tx_buffer: &mut [u8],
+    sink: &mut impl MeshSink,
+) {
+    // Resolve each group's next hop to the interface that reaches it. Anything
+    // other than one concrete interface cannot be collapsed: a merge is a claim
+    // about one medium, so a destination the router would flood keeps its own
+    // directed frame.
+    let mut iface_of: HVec<Option<usize>, MAX_MCAST_DESTS> = HVec::new();
+    for (next, _) in groups {
+        let idx = match router.get_egress_interface(now, *next) {
+            Some(EgressInterface::Interface(i)) => Some(i),
+            _ => None,
+        };
+        let _ = iface_of.push(idx);
+    }
+
+    let mut merged: HVec<usize, MAX_MCAST_DESTS> = HVec::new();
+    for i in 0..groups.len() {
+        if merged.contains(&i) {
+            continue;
+        }
+        let Some(idx) = iface_of[i] else { continue };
+        let Some(threshold) = fan_out.get(idx).copied().flatten() else {
+            continue;
+        };
+        // The merged frame goes out `Egress::Iface`, which `plan_dispatch`
+        // deliberately does not re-gate. So the gate has to be consulted here,
+        // or a link with `tx_data` off would transmit a *merged* multicast
+        // while correctly suppressing an unmerged one — turning a link's
+        // fan-out declaration into a silent override of its transmit policy.
+        // Left unmerged instead, so the directed copies below take the
+        // `Egress::Auto` path and are dropped by the gate with its own trace.
+        if !router.link_may_tx(idx, Some(BatmanPacketType::Mcast)) {
+            trace!(
+                iface = idx,
+                "not collapsing onto a link that carries no data"
+            );
+            continue;
+        }
+
+        // Every group this interface carries that has not already merged —
+        // and that is **terminal on this medium**: its one destination is the
+        // next hop itself.
+        //
+        // That restriction is what makes a merged frame safe to not forward.
+        // Merging discards the per-next-hop grouping (there is one list for the
+        // whole audience), so a receiver that needed to forward could not tell
+        // which of the remaining destinations were *its* to carry and which
+        // were already delivered to a neighbour beside it. It would forward to
+        // all of them, and every other receiver would do the same — a storm on
+        // the very medium this exists to spare.
+        //
+        // A group whose destination sits *behind* its next hop therefore keeps
+        // its own directed frame, where the next hop is unambiguous.
+        let mut peers: HVec<usize, MAX_MCAST_DESTS> = HVec::new();
+        for (j, slot) in iface_of.iter().enumerate() {
+            let terminal = groups[j].1.len() == 1 && groups[j].1[0] == groups[j].0;
+            if *slot == Some(idx) && terminal && !merged.contains(&j) {
+                let _ = peers.push(j);
+            }
+        }
+        if peers.len() < threshold.get() as usize {
+            continue; // below the crossover: directed copies are cheaper
+        }
+
+        // The union cannot overflow while only terminal groups merge (each
+        // contributes exactly one destination, and there are at most
+        // `MAX_MCAST_DESTS` groups) — but that is a consequence of the
+        // *forwarding-safety* restriction above, not a capacity argument, so
+        // relaxing one would silently start eating destinations here. Abandon
+        // the collapse rather than send a short list: the directed copies below
+        // still carry everyone.
+        let mut union: HVec<Mac, MAX_MCAST_DESTS> = HVec::new();
+        let mut union_fits = true;
+        for &j in peers.iter() {
+            for d in groups[j].1.iter() {
+                if union.push(*d).is_err() {
+                    union_fits = false;
+                }
+            }
+        }
+        if !union_fits {
+            trace!(iface = idx, "abandoning collapse: union past capacity");
+            continue;
+        }
+        let Some(len) = write_mcast(ttl, McastAuthForm::Signature, &union, inner, tx_buffer) else {
+            // Abandoned, not lost — `merged` has not been marked, so every one
+            // of these groups still gets its directed copy below. Traced
+            // because on a duty-cycled radio it means paying N transmissions
+            // where the operator configured one.
+            trace!(
+                iface = idx,
+                dests = union.len(),
+                inner = inner.len(),
+                "abandoning collapse: merged frame does not fit"
+            );
+            continue;
+        };
+        trace!(
+            iface = idx,
+            groups = peers.len(),
+            dests = union.len(),
+            "collapsing multicast onto a fan-out medium"
+        );
+        // Marked merged **only if the sink took it**. The merged frame is the
+        // largest this path produces — its list is the union of every group's —
+        // so it is the one most likely to be refused by a `heapless` stage on
+        // an embedded node. Marking first and emitting second would skip the
+        // directed copies for groups whose merged frame never went anywhere,
+        // losing every listener behind that medium.
+        if sink.emit(OutgoingFrame {
+            dst: Mac::BROADCAST,
+            protocol: DEFAULT_BATMAN_ETHER_TYPE,
+            payload: &tx_buffer[..len],
+            egress: Egress::Iface(idx),
+        }) {
+            for j in peers {
+                let _ = merged.push(j);
+            }
+        } else {
+            trace!(
+                iface = idx,
+                groups = peers.len(),
+                "collapse refused by the sink; falling back to directed copies"
+            );
+        }
+    }
+
+    // Whatever did not collapse goes out as its own directed frame.
+    for (i, (next, dests)) in groups.iter().enumerate() {
+        if merged.contains(&i) {
+            continue;
+        }
+        let Some(len) = write_mcast(ttl, McastAuthForm::Tag, dests, inner, tx_buffer) else {
+            // The engine counts and traces the identical failure when it
+            // rebuilds a relay; this is the same loss one layer on, and every
+            // destination in the group dies here. Never silent.
+            router.record_mcast_group_drop(dests.len());
+            trace!(
+                ?next,
+                dests = dests.len(),
+                inner = inner.len(),
+                buf = tx_buffer.len(),
+                "drop: no room to rebuild a multicast destination group"
+            );
+            continue;
+        };
+        if !sink.emit(OutgoingFrame {
+            dst: *next,
+            protocol: DEFAULT_BATMAN_ETHER_TYPE,
+            payload: &tx_buffer[..len],
+            egress: Egress::Auto,
+        }) {
+            router.record_mcast_group_drop(dests.len());
+            trace!(
+                ?next,
+                dests = dests.len(),
+                "drop: sink refused a multicast group"
+            );
+        }
+    }
+}
+
 /// Process one received link-layer frame, folding the carrier's physical-layer
 /// `metrics` into the engine's link-quality table and planning any resulting
 /// re-flood/forward (to `sink.emit`) and local delivery (to
 /// `sink.deliver_local`).
+// The receive arm's whole context: which interface, the frame and its
+// radio metrics, the scratchpad, the media's fan-out declarations and the
+// sink. Grouping them into a struct would name the same eight things one
+// indirection further away, as `plan_dispatch` above already concluded.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_mesh_frame<R: RouterOps>(
     now: Duration,
     router: &mut R,
@@ -368,38 +745,79 @@ pub fn handle_mesh_frame<R: RouterOps>(
     frame: &LinkFrame,
     metrics: LinkMetrics,
     tx_buffer: &mut [u8],
+    fan_out: &[Option<NonZeroU8>],
     sink: &mut impl MeshSink,
 ) {
     let Some(frame) = strip_directed(router, frame) else {
         return; // directed frame failed authentication
     };
-    let rx = router.handle_frame_with_metrics(now, idx, frame, metrics, tx_buffer);
-    trace!(
-        forward = rx.forward.is_some(),
-        deliver_local = rx.deliver_local.is_some(),
-        "frame decoded"
+
+    // The engine can emit several frames for one received frame — a multicast
+    // splits into one destination group per next hop — so its extra output goes
+    // to a sink rather than into `reply`, whose forward path below trims to the
+    // *incoming* frame's length. That trim is right while a relay only
+    // decrements a TTL and wrong the moment an outgoing frame is a different
+    // size, which a shrinking destination list always is.
+    let (groups, ttl, overflowed) = {
+        let mut collector = McastCollector::new(sink);
+        let rx =
+            router.handle_frame_with_metrics(now, idx, frame, metrics, tx_buffer, &mut collector);
+        trace!(
+            forward = rx.forward.is_some(),
+            deliver_local = rx.deliver_local.is_some(),
+            "frame decoded"
+        );
+        if let Some(f) = rx.forward {
+            // The single forwarded frame, unchanged in size from the one that
+            // caused it; a staging refusal is the shell's to log.
+            let _ = collector.sink.emit(OutgoingFrame {
+                dst: f.dst,
+                protocol: f.protocol,
+                payload: f.payload,
+                egress: match rx.pin_egress_iface {
+                    // A next-hop proof response: link-local by construction, so
+                    // it must return out exactly the interface its challenge
+                    // arrived on rather than through routing state (see
+                    // `RxOutcome`'s `pin_egress_iface` doc).
+                    Some(pinned) => Egress::Iface(pinned),
+                    // Everything else — a re-flood included, which goes back out
+                    // the interface it arrived on too; see [`Egress::Auto`] for
+                    // why there is no split-horizon here.
+                    None => Egress::Auto,
+                },
+            });
+        }
+        if let Some(inner) = rx.deliver_local {
+            collector.sink.deliver_local(inner);
+        }
+        (collector.groups, collector.ttl, collector.overflowed)
+    };
+
+    if overflowed {
+        // Never silent: losing a destination group without a trace is the
+        // failure multi-destination multicast exists to remove.
+        // `trace!` for the same reason as the engine's twin: this is reachable
+        // from a received frame. Unreachable today (the collector's capacity is
+        // `MAX_MCAST_DESTS` and the engine refuses longer lists up front), and
+        // kept as a belt-and-braces record rather than an assertion.
+        trace!("drop: multicast destination groups past the collector's capacity");
+    }
+    if groups.is_empty() {
+        return;
+    }
+
+    // The encapsulated frame is read back out of the *received* frame rather
+    // than copied once per group: every group carries the same one, and an
+    // embedded node cannot spare a copy each.
+    let Some(view) = McastPacketView::parse(&frame.payload) else {
+        return;
+    };
+    // `view.inner` borrows the received frame, and `tx_buffer` is free again
+    // now the router's borrow of it has ended, so the merged frames are built
+    // there.
+    flush_mcast_groups(
+        router, now, &groups, ttl, view.inner, fan_out, tx_buffer, sink,
     );
-    if let Some(f) = rx.forward {
-        sink.emit(OutgoingFrame {
-            dst: f.dst,
-            protocol: f.protocol,
-            payload: f.payload,
-            egress: match rx.pin_egress_iface {
-                // A next-hop proof response: link-local by construction, so it
-                // must return out exactly the interface its challenge arrived
-                // on rather than through routing state (see `RxOutcome`'s
-                // `pin_egress_iface` doc).
-                Some(pinned) => Egress::Iface(pinned),
-                // Everything else — a re-flood included, which goes back out
-                // the interface it arrived on too; see [`Egress::Auto`] for why
-                // there is no split-horizon here.
-                None => Egress::Auto,
-            },
-        });
-    }
-    if let Some(inner) = rx.deliver_local {
-        sink.deliver_local(inner);
-    }
 }
 
 /// Emit an OGM for each interface whose Trickle timer is due as of `now`
@@ -424,7 +842,10 @@ pub fn poll_due_ogms<R: RouterOps>(
         if router.link_features(idx).tx_ogm
             && let Some(f) = router.poll(now, tx_buffer)
         {
-            sink.emit(OutgoingFrame {
+            // Fire-and-forget: a refusal here is the shell's own staging
+            // limit, which the shell logs. Only multicast has a fallback to
+            // take, and it checks the return value where it matters.
+            let _ = sink.emit(OutgoingFrame {
                 dst: f.dst,
                 protocol: f.protocol,
                 payload: f.payload,
@@ -451,7 +872,10 @@ pub fn poll_due_keepalives<R: RouterOps>(
     // interfaces shrinks every pass and the loop terminates.
     while let Some(idx) = router.due_keepalive_interface(now) {
         if let Some(f) = router.poll_keepalive(tx_buffer) {
-            sink.emit(OutgoingFrame {
+            // Fire-and-forget: a refusal here is the shell's own staging
+            // limit, which the shell logs. Only multicast has a fallback to
+            // take, and it checks the return value where it matters.
+            let _ = sink.emit(OutgoingFrame {
                 dst: f.dst,
                 protocol: f.protocol,
                 payload: f.payload,
@@ -518,7 +942,10 @@ pub fn poll_due_challenges<R: RouterOps>(
                 trace!(iface_idx = idx, "drop: tx gate disabled on this link");
                 continue;
             }
-            sink.emit(OutgoingFrame {
+            // Fire-and-forget: a refusal here is the shell's own staging
+            // limit, which the shell logs. Only multicast has a fallback to
+            // take, and it checks the return value where it matters.
+            let _ = sink.emit(OutgoingFrame {
                 dst: f.dst,
                 protocol: f.protocol,
                 payload: f.payload,
@@ -554,7 +981,10 @@ pub fn poll_due_pings<R: RouterOps>(
 ) {
     if let Some(f) = router.poll_ping(now, tx_buffer) {
         trace!(dst = ?f.dst, "emitting reachability probe");
-        sink.emit(OutgoingFrame {
+        // Fire-and-forget: a refusal here is the shell's own staging
+        // limit, which the shell logs. Only multicast has a fallback to
+        // take, and it checks the return value where it matters.
+        let _ = sink.emit(OutgoingFrame {
             dst: f.dst,
             protocol: f.protocol,
             payload: f.payload,
@@ -581,6 +1011,7 @@ pub fn handle_link_result<R: RouterOps>(
     idx: usize,
     result: Result<Received<'_>, LinkError>,
     tx_buffer: &mut [u8],
+    fan_out: &[Option<NonZeroU8>],
     sink: &mut impl MeshSink,
 ) {
     match result {
@@ -593,6 +1024,7 @@ pub fn handle_link_result<R: RouterOps>(
                 received.frame,
                 received.metrics,
                 tx_buffer,
+                fan_out,
                 sink,
             );
         }
@@ -861,6 +1293,7 @@ mod tests {
     use std::vec::Vec;
 
     use super::*;
+    use wayfinder::batman::wire::BATMAN_VERSION;
     // The planning functions are generic over `RouterOps` now; the tests still
     // instantiate a concrete host-profile router to drive them.
     use wayfinder::CentralRouter;
@@ -893,7 +1326,7 @@ mod tests {
     fn bare_ogm_bytes(orig: Mac, seqno: u32, ttl: u8) -> Vec<u8> {
         let ogm = BatmanOgmPacket {
             packet_type: BatmanPacketType::Ogm.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl,
             flags: 0,
             seqno: seqno.to_be(),
@@ -935,13 +1368,14 @@ mod tests {
     }
 
     impl MeshSink for CaptureSink {
-        fn emit(&mut self, frame: OutgoingFrame<'_>) {
+        fn emit(&mut self, frame: OutgoingFrame<'_>) -> bool {
             self.mesh.push(Captured {
                 dst: frame.dst,
                 protocol: frame.protocol,
                 payload: frame.payload.to_vec(),
                 egress: frame.egress,
             });
+            true
         }
         fn deliver_local(&mut self, inner: &[u8]) {
             self.local.push(inner.to_vec());
@@ -1113,6 +1547,7 @@ mod tests {
             frame,
             LinkMetrics::default(),
             &mut tx,
+            &[],
             &mut sink,
         );
 
@@ -1138,6 +1573,7 @@ mod tests {
             frame,
             LinkMetrics::default(),
             &mut tx,
+            &[],
             &mut sink,
         );
 
@@ -1276,6 +1712,7 @@ mod tests {
             LinkFrame::ref_from_bytes(&link).unwrap(),
             LinkMetrics::default(),
             &mut tx,
+            &[],
             &mut sink,
         );
         // mac(2) verifies the router right back, so it can tag a directed
@@ -1300,6 +1737,7 @@ mod tests {
             LinkFrame::ref_from_bytes(&link).unwrap(),
             metrics,
             &mut tx,
+            &[],
             &mut poison_sink,
         );
 
@@ -1308,7 +1746,7 @@ mod tests {
         // interface 0.
         let hdr = wayfinder::batman::wire::BatmanNextHopChallengePacket {
             packet_type: BatmanPacketType::NextHopChallenge.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
         };
         let mut inner = hdr.as_bytes().to_vec();
         inner.extend_from_slice(&[0xAB; wayfinder::auth::CHALLENGE_NONCE_LEN]);
@@ -1328,6 +1766,7 @@ mod tests {
             LinkFrame::ref_from_bytes(&challenge).unwrap(),
             LinkMetrics::default(),
             &mut tx,
+            &[],
             &mut sink,
         );
 
@@ -1490,6 +1929,7 @@ mod tests {
                 metrics: LinkMetrics::default(),
             }),
             &mut tx,
+            &[],
             &mut sink,
         );
 
@@ -1513,6 +1953,7 @@ mod tests {
             0,
             Err(interfaces::link::LinkError::Io),
             &mut tx,
+            &[],
             &mut sink,
         );
 
@@ -1543,6 +1984,7 @@ mod tests {
                     1,
                     Err(interfaces::link::LinkError::Io),
                     &mut tx,
+                    &[],
                     &mut sink,
                 );
             }
@@ -1812,7 +2254,7 @@ mod tests {
     /// destination is malformed, never something a legitimate peer emits.
     ///
     /// The *second* line of the defense, and deliberately kept as one.
-    /// `requires_pairwise_tag` refuses this frame a step earlier — a proof
+    /// `required_proof` refuses this frame a step earlier — a proof
     /// sub-type is directed, so it needs a valid trailer whatever link dst it
     /// wears — but that check and this one key on different fields, so a
     /// regression in the sub-type table cannot reopen the reflection primitive
@@ -1839,6 +2281,7 @@ mod tests {
             LinkFrame::ref_from_bytes(&link).unwrap(),
             LinkMetrics::default(),
             &mut tx,
+            &[],
             &mut sink,
         );
 
@@ -1847,7 +2290,7 @@ mod tests {
         // trailer whatsoever.
         let hdr = wayfinder::batman::wire::BatmanNextHopChallengePacket {
             packet_type: BatmanPacketType::NextHopChallenge.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
         };
         let mut body = hdr.as_bytes().to_vec();
         body.extend_from_slice(&[0xCD; wayfinder::auth::CHALLENGE_NONCE_LEN]);
@@ -1861,6 +2304,7 @@ mod tests {
             LinkFrame::ref_from_bytes(&forged).unwrap(),
             LinkMetrics::default(),
             &mut tx,
+            &[],
             &mut sink,
         );
         assert!(
@@ -1876,7 +2320,7 @@ mod tests {
     /// pairwise trailer `strip_directed` checks on the way in — the trailer's
     /// replay counter is what stops a captured response being re-credited
     /// later, the replay `red_team.py::attack_challenge_response_replay` covers
-    /// on the directed path. `requires_pairwise_tag` now demands that trailer
+    /// on the directed path. `required_proof` now demands that trailer
     /// by sub-type, so a group link dst no longer skips the check; this guard
     /// is the independent second check keyed on the address instead, so
     /// crediting a proof takes *both* to regress.
@@ -1899,6 +2343,7 @@ mod tests {
             LinkFrame::ref_from_bytes(&link).unwrap(),
             LinkMetrics::default(),
             &mut tx,
+            &[],
             &mut sink,
         );
         let router_ogm = signed_ogm_bytes(router.auth_mut().unwrap(), mac(1), 1);
@@ -1919,7 +2364,7 @@ mod tests {
         // broadcast destination, so no pairwise trailer is ever demanded.
         let rsp_hdr = wayfinder::batman::wire::BatmanNextHopResponsePacket {
             packet_type: BatmanPacketType::NextHopResponse.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
         };
         let mut body = rsp_hdr.as_bytes().to_vec();
         body.extend_from_slice(&tag);
@@ -1933,6 +2378,7 @@ mod tests {
             LinkFrame::ref_from_bytes(&forged).unwrap(),
             LinkMetrics::default(),
             &mut tx,
+            &[],
             &mut sink,
         );
         assert!(
@@ -1980,6 +2426,7 @@ mod tests {
             LinkFrame::ref_from_bytes(&link).unwrap(),
             LinkMetrics::default(),
             &mut tx,
+            &[],
             &mut sink,
         );
 
@@ -2009,7 +2456,7 @@ mod tests {
     fn unicast_bytes(dest: Mac, body: &[u8]) -> Vec<u8> {
         let hdr = wayfinder::batman::wire::BatmanUnicastPacket {
             packet_type: BatmanPacketType::Unicast.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             dest,
         };
@@ -2021,15 +2468,16 @@ mod tests {
     /// The bytes of an `Mcast` packet addressed to listener `dest`, carrying
     /// `body`.
     fn mcast_bytes(dest: Mac, body: &[u8]) -> Vec<u8> {
-        let hdr = wayfinder::batman::wire::BatmanMcastPacket {
-            packet_type: BatmanPacketType::Mcast.as_u8(),
-            version: 5,
-            ttl: 50,
-            dest,
-        };
-        let mut out = hdr.as_bytes().to_vec();
-        out.extend_from_slice(body);
-        out
+        let mut buf = [0u8; 512];
+        let n = wayfinder::batman::wire::write_mcast(
+            50,
+            wayfinder::batman::wire::McastAuthForm::Tag,
+            &[dest],
+            body,
+            &mut buf,
+        )
+        .expect("one destination fits");
+        buf[..n].to_vec()
     }
 
     /// A router at `mac(1)` with auth on that has verified `mac(2)` as a live
@@ -2055,6 +2503,7 @@ mod tests {
             LinkFrame::ref_from_bytes(&link).unwrap(),
             LinkMetrics::default(),
             &mut tx,
+            &[],
             &mut sink,
         );
         assert!(
@@ -2093,7 +2542,7 @@ mod tests {
 
         let rsp = BatmanNextHopResponsePacket {
             packet_type: BatmanPacketType::NextHopResponse.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
         };
         let mut inner = rsp.as_bytes().to_vec();
         inner.extend_from_slice(&tag);
@@ -2112,6 +2561,7 @@ mod tests {
             LinkFrame::ref_from_bytes(&link).unwrap(),
             LinkMetrics::default(),
             &mut tx,
+            &[],
             &mut sink,
         );
         assert!(
@@ -2120,21 +2570,21 @@ mod tests {
         );
     }
 
-    /// The trailer requirement is a property of the BATMAN sub-type: every
+    /// The proof requirement is a property of the BATMAN sub-type: every
     /// packet routed toward an inner `dest` needs one; every one-to-many or
     /// self-authenticating packet cannot have one.
     #[test]
-    fn requires_pairwise_tag_is_decided_by_sub_type() {
+    fn required_proof_is_decided_by_sub_type() {
         for t in [
             BatmanPacketType::Unicast,
-            BatmanPacketType::Mcast,
             BatmanPacketType::EchoRequest,
             BatmanPacketType::EchoReply,
             BatmanPacketType::NextHopChallenge,
             BatmanPacketType::NextHopResponse,
         ] {
-            assert!(
-                requires_pairwise_tag(&[t.as_u8(), 0xff]),
+            assert_eq!(
+                required_proof(&[t.as_u8(), 0xff]),
+                RequiredProof::Tag,
                 "{t:?} is point-to-point and must carry a pairwise trailer"
             );
         }
@@ -2145,16 +2595,260 @@ mod tests {
             BatmanPacketType::CertReq,
             BatmanPacketType::CertReply,
         ] {
-            assert!(
-                !requires_pairwise_tag(&[t.as_u8(), 0xff]),
+            assert_eq!(
+                required_proof(&[t.as_u8(), 0xff]),
+                RequiredProof::None,
                 "{t:?} carries its own signature, or none at all"
             );
         }
         // Fail closed on what this build cannot classify: an unrecognised
         // sub-type is routed by destination like a directed frame, and an empty
         // payload is malformed either way.
-        assert!(requires_pairwise_tag(&[0xEE]));
-        assert!(requires_pairwise_tag(&[]));
+        assert_eq!(required_proof(&[0xEE]), RequiredProof::Tag);
+        assert_eq!(required_proof(&[]), RequiredProof::Tag);
+    }
+
+    /// **`Mcast` is the one sub-type with a choice of proof, and no value of
+    /// the field that selects it reaches an unauthenticated path.**
+    ///
+    /// The `form` byte is attacker-chosen like every other header byte. That is
+    /// safe only because both defined values are proofs and everything else is
+    /// a drop — flipping it chooses the check a forger fails, never whether
+    /// there is one. `8ab9285`'s bug was not that an attacker picked the
+    /// branch, but that one branch was no check at all.
+    #[test]
+    fn every_multicast_auth_form_demands_a_proof() {
+        let mcast = |form: u8| {
+            let mut p = [BatmanPacketType::Mcast.as_u8(), 0, 50, 1, form];
+            p[4] = form;
+            required_proof(&p)
+        };
+
+        assert_eq!(mcast(McastAuthForm::Tag.as_u8()), RequiredProof::Tag);
+        assert_eq!(
+            mcast(McastAuthForm::Signature.as_u8()),
+            RequiredProof::Fanout
+        );
+        for form in [0u8, 3, 4, 128, 255] {
+            assert_eq!(
+                mcast(form),
+                RequiredProof::Drop,
+                "form {form} names no proof, so the frame is dropped"
+            );
+        }
+        // A multicast header too short to hold the form byte names no proof
+        // either, and is not guessed at.
+        assert_eq!(
+            required_proof(&[BatmanPacketType::Mcast.as_u8(), 0, 50, 1]),
+            RequiredProof::Drop
+        );
+    }
+
+    /// **A verified fan-out frame is stripped of its whole trailer.**
+    ///
+    /// The fan-out trailer is 72 bytes, not the pairwise 24. Stripping the
+    /// shorter of the two leaves 48 bytes of signature attached to the frame
+    /// the engine then routes — and since a fan-out frame is delivered locally
+    /// and never forwarded, those bytes go straight to the host device on the
+    /// end of its payload.
+    #[test]
+    fn strip_directed_removes_the_whole_fanout_trailer() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let (mut router, mut peer) = router_with_verified_peer(&authority);
+
+        // A fan-out multicast from the verified peer, signed the way the
+        // driver signs one.
+        let mut body = [0u8; 256];
+        let n = wayfinder::batman::wire::write_mcast(
+            50,
+            McastAuthForm::Signature,
+            &[mac(1)],
+            b"INNER-PAYLOAD",
+            &mut body,
+        )
+        .unwrap();
+        let mut trailer = [0u8; wayfinder::auth::FANOUT_TRAILER_LEN];
+        peer.sign_fanout(&body[..n], &mut trailer).expect("sign");
+
+        let mut payload = body[..n].to_vec();
+        payload.extend_from_slice(&trailer);
+        let link = frame_bytes(mac(1), mac(2), DEFAULT_BATMAN_ETHER_TYPE, &payload);
+
+        let stripped = strip_directed(&mut router, LinkFrame::ref_from_bytes(&link).unwrap())
+            .expect("a correctly signed fan-out frame must verify");
+
+        assert_eq!(
+            stripped.payload.len(),
+            n,
+            "the whole 72-byte fan-out trailer must come off, not the 24-byte one"
+        );
+        let view = wayfinder::batman::wire::McastPacketView::parse(&stripped.payload)
+            .expect("the stripped frame still parses");
+        assert_eq!(
+            view.inner, b"INNER-PAYLOAD",
+            "no signature bytes may survive on the end of the inner frame"
+        );
+    }
+
+    /// **Only groups whose destination *is* their next hop may merge.**
+    ///
+    /// Merging discards the per-next-hop grouping — one list serves the whole
+    /// audience — so a receiver that still had to forward could not tell which
+    /// remaining destinations were its to carry and which had already reached a
+    /// neighbour beside it. Since a merged frame is also never forwarded, a
+    /// destination sitting *behind* its next hop would simply never arrive.
+    ///
+    /// This is the rule that turned 2293 radio transmissions into one, and
+    /// deleting it left the whole suite green: the only topology that reached
+    /// the merge had every group terminal already, so the restriction was
+    /// vacuous there. This drives `flush_mcast_groups` directly with a mixed
+    /// set, which is the case that distinguishes them.
+    #[test]
+    fn only_terminal_groups_collapse_onto_a_fan_out_medium() {
+        let mut router = CentralRouter::new(mac(1));
+        // Two neighbours on interface 0: mac(2) reachable directly, and mac(3)
+        // which relays for mac(9) behind it.
+        for (orig, via) in [(mac(2), mac(2)), (mac(3), mac(3)), (mac(9), mac(3))] {
+            let ogm = bare_ogm_bytes(orig, 1, 50);
+            let link = frame_bytes(mac(1), via, DEFAULT_BATMAN_ETHER_TYPE, &ogm);
+            let mut tx = [0u8; 512];
+            let mut sink = CaptureSink::default();
+            handle_mesh_frame(
+                Duration::ZERO,
+                &mut router,
+                0,
+                LinkFrame::ref_from_bytes(&link).unwrap(),
+                LinkMetrics::default(),
+                &mut tx,
+                &[],
+                &mut sink,
+            );
+        }
+
+        // One terminal group (mac(2) is its own destination) and one that is
+        // not (mac(9) sits behind mac(3)).
+        let mut terminal: HVec<Mac, MAX_MCAST_DESTS> = HVec::new();
+        let _ = terminal.push(mac(2));
+        let mut behind: HVec<Mac, MAX_MCAST_DESTS> = HVec::new();
+        let _ = behind.push(mac(9));
+        let groups = [(mac(2), terminal), (mac(3), behind)];
+
+        let mut tx = [0u8; 512];
+        let mut sink = CaptureSink::default();
+        flush_mcast_groups(
+            &mut router,
+            Duration::ZERO,
+            &groups,
+            49,
+            b"INNER",
+            &[NonZeroU8::new(2)],
+            &mut tx,
+            &mut sink,
+        );
+
+        // Both groups go out as their own directed, tag-form frame. Merging
+        // them would produce a single broadcast `Signature` frame — which
+        // mac(3) would deliver-and-not-forward, so mac(9) would never receive.
+        assert_eq!(sink.mesh.len(), 2, "a non-terminal group must not merge");
+        for f in &sink.mesh {
+            assert_ne!(f.dst, Mac::BROADCAST, "no collapsed frame here");
+            let view = wayfinder::batman::wire::McastPacketView::parse(&f.payload).unwrap();
+            assert_eq!(view.form, McastAuthForm::Tag);
+        }
+    }
+
+    /// The companion: two *terminal* groups on the same fan-out interface do
+    /// collapse, into one broadcast signature-form frame naming both.
+    #[test]
+    fn two_terminal_groups_collapse_into_one_frame() {
+        let mut router = CentralRouter::new(mac(1));
+        for orig in [mac(2), mac(3)] {
+            let ogm = bare_ogm_bytes(orig, 1, 50);
+            let link = frame_bytes(mac(1), orig, DEFAULT_BATMAN_ETHER_TYPE, &ogm);
+            let mut tx = [0u8; 512];
+            let mut sink = CaptureSink::default();
+            handle_mesh_frame(
+                Duration::ZERO,
+                &mut router,
+                0,
+                LinkFrame::ref_from_bytes(&link).unwrap(),
+                LinkMetrics::default(),
+                &mut tx,
+                &[],
+                &mut sink,
+            );
+        }
+
+        let mut a: HVec<Mac, MAX_MCAST_DESTS> = HVec::new();
+        let _ = a.push(mac(2));
+        let mut b: HVec<Mac, MAX_MCAST_DESTS> = HVec::new();
+        let _ = b.push(mac(3));
+        let groups = [(mac(2), a), (mac(3), b)];
+
+        let mut tx = [0u8; 512];
+        let mut sink = CaptureSink::default();
+        flush_mcast_groups(
+            &mut router,
+            Duration::ZERO,
+            &groups,
+            49,
+            b"INNER",
+            &[NonZeroU8::new(2)],
+            &mut tx,
+            &mut sink,
+        );
+
+        assert_eq!(
+            sink.mesh.len(),
+            1,
+            "two terminal groups are one transmission"
+        );
+        assert_eq!(sink.mesh[0].dst, Mac::BROADCAST);
+        let view = wayfinder::batman::wire::McastPacketView::parse(&sink.mesh[0].payload).unwrap();
+        assert_eq!(view.form, McastAuthForm::Signature);
+        assert_eq!(view.dests.len(), 2);
+        assert_eq!(view.inner, b"INNER");
+    }
+
+    /// Below the medium's crossover a single group is *not* collapsed: one
+    /// directed copy is both cheaper and more precise than waking every peer.
+    #[test]
+    fn a_single_group_stays_directed_below_the_crossover() {
+        let mut router = CentralRouter::new(mac(1));
+        let ogm = bare_ogm_bytes(mac(2), 1, 50);
+        let link = frame_bytes(mac(1), mac(2), DEFAULT_BATMAN_ETHER_TYPE, &ogm);
+        let mut tx = [0u8; 512];
+        let mut sink = CaptureSink::default();
+        handle_mesh_frame(
+            Duration::ZERO,
+            &mut router,
+            0,
+            LinkFrame::ref_from_bytes(&link).unwrap(),
+            LinkMetrics::default(),
+            &mut tx,
+            &[],
+            &mut sink,
+        );
+
+        let mut only: HVec<Mac, MAX_MCAST_DESTS> = HVec::new();
+        let _ = only.push(mac(2));
+        let groups = [(mac(2), only)];
+
+        let mut tx = [0u8; 512];
+        let mut sink = CaptureSink::default();
+        flush_mcast_groups(
+            &mut router,
+            Duration::ZERO,
+            &groups,
+            49,
+            b"INNER",
+            &[NonZeroU8::new(2)],
+            &mut tx,
+            &mut sink,
+        );
+
+        assert_eq!(sink.mesh.len(), 1);
+        assert_eq!(sink.mesh[0].dst, mac(2), "addressed, not broadcast");
     }
 
     /// A `Unicast` carried under a *group* link-layer dst still has to prove
@@ -2234,6 +2928,7 @@ mod tests {
                 LinkFrame::ref_from_bytes(&link).unwrap(),
                 LinkMetrics::default(),
                 &mut tx,
+                &[],
                 &mut sink,
             );
         }
@@ -2276,6 +2971,7 @@ mod tests {
             LinkFrame::ref_from_bytes(&relayed).unwrap(),
             LinkMetrics::default(),
             &mut tx,
+            &[],
             &mut sink,
         );
 
@@ -2295,6 +2991,7 @@ mod tests {
             LinkFrame::ref_from_bytes(&honest).unwrap(),
             LinkMetrics::default(),
             &mut tx,
+            &[],
             &mut sink,
         );
         assert_eq!(
@@ -2315,6 +3012,7 @@ mod tests {
             LinkFrame::ref_from_bytes(&link).unwrap(),
             LinkMetrics::default(),
             &mut tx,
+            &[],
             &mut sink,
         );
         assert!(
@@ -2380,7 +3078,7 @@ mod tests {
     fn echo_request_bytes(dest: Mac, orig: Mac) -> Vec<u8> {
         wayfinder::batman::wire::BatmanEchoPacket {
             packet_type: BatmanPacketType::EchoRequest.as_u8(),
-            version: 5,
+            version: BATMAN_VERSION,
             ttl: 50,
             dest,
             orig,
@@ -2398,7 +3096,7 @@ mod tests {
     /// The ping suite in `wayfinder-test` runs entirely with auth *off*, where
     /// `strip_directed` short-circuits before the sub-type is ever consulted —
     /// so without this test the only thing standing behind
-    /// `requires_pairwise_tag`'s claim about `EchoRequest`/`EchoReply` is the
+    /// `required_proof`'s claim about `EchoRequest`/`EchoReply` is the
     /// table test, and moving the pair to the exempt arm breaks nothing else in
     /// the workspace. An outsider that could get an echo answered would have a
     /// reflection primitive off any member MAC it has read off the air, which is
@@ -2421,6 +3119,7 @@ mod tests {
                 LinkFrame::ref_from_bytes(&link).unwrap(),
                 LinkMetrics::default(),
                 &mut tx,
+                &[],
                 &mut sink,
             );
         }
@@ -2469,6 +3168,7 @@ mod tests {
                 LinkFrame::ref_from_bytes(&link).unwrap(),
                 LinkMetrics::default(),
                 &mut tx,
+                &[],
                 &mut sink,
             );
         }
@@ -2504,6 +3204,7 @@ mod tests {
             LinkFrame::ref_from_bytes(&link).unwrap(),
             LinkMetrics::default(),
             &mut tx,
+            &[],
             &mut sink,
         );
         assert_eq!(sink.local.len(), 1, "the honest unicast is delivered");
