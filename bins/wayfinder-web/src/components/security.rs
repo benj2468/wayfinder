@@ -21,6 +21,25 @@
 //! one matters as much: a dialog in front of every switch trains an operator to
 //! dismiss them.
 //!
+//! # Both ends of a join are on this page
+//!
+//! [`JoinMesh`] asks another mesh to take *this* node; [`JoinDetails`] is what
+//! this node's mesh has to be told to a device asking the same of it. They are
+//! one handover seen from each end, and having them on one page is the point:
+//! somebody enrolling a device reads one and fills in the other.
+//!
+//! The second used to live on the provider scope's Enrollment tab, beside the
+//! policy that produced it. It moved because it governs nothing — an address
+//! and a key are not secrets, and requiring an administrator to read 64
+//! characters of hex aloud was the whole cost of leaving it there. The one
+//! value on it that *is* a secret, the enrollment token, is gated on its own
+//! reveal button rather than on the tab.
+//!
+//! Note the two are gated differently, and deliberately. `JoinMesh` is
+//! omitted for a read-only viewer, because it changes which mesh this node
+//! belongs to and the node refuses the call anyway; `JoinDetails` is shown to
+//! everyone, because reading is all it does.
+//!
 //! # What persists
 //!
 //! Whether a change outlives a restart is the node's decision, not this
@@ -35,10 +54,12 @@ use leptos::prelude::*;
 use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
 
 use crate::api::request_enrollment;
+use crate::api::reveal_enrollment_token;
 use crate::api::set_lazy_cert_distribution;
 use crate::api::set_require_auth;
 use crate::components::dashboard::use_dashboard;
 use crate::components::widgets::ConfirmDialog;
+use crate::components::widgets::CopyField;
 use crate::components::widgets::Empty;
 use crate::components::widgets::Field;
 use crate::components::widgets::Panel;
@@ -166,6 +187,15 @@ pub fn Security() -> impl IntoView {
     // its own value changes, so the panels are rebuilt when the thing they are
     // about changes and at no other time. See [`membership_of`].
     let membership = Memo::new(move |_| security().as_ref().map(membership_of));
+    // Memoised for the same reason, and just as narrowly: [`JoinDetails`] holds
+    // a revealed token in a local signal, and rebuilding it once a second would
+    // drop that the moment it arrived.
+    let join_details = Memo::new(move |_| {
+        security().and_then(|s| {
+            s.enrollment
+                .map(|policy| (s.own_ed_pubkey.clone(), policy.enrollment_token_set))
+        })
+    });
 
     let confirm = move |kind: SecurityAction| {
         set_pending.set(None);
@@ -275,6 +305,22 @@ pub fn Security() -> impl IntoView {
                                 set_pending=set_pending
                             />
                         }
+                    })
+            }}
+
+            {move || {
+                // Only on a node that issues certificates. An enrollment
+                // policy is what says it is one, and it is the same field the
+                // provider scope gates on — a plain member has no address, key
+                // or token to hand anybody, and a panel here would be
+                // describing a mesh it cannot admit anyone to.
+                //
+                // Not gated on the viewer: see [`JoinDetails`]. The token's
+                // reveal asks that question for itself.
+                join_details
+                    .get()
+                    .map(|(node_key, token_set)| {
+                        view! { <JoinDetails node_key=node_key token_set=token_set /> }
                     })
             }}
 
@@ -672,5 +718,177 @@ mod tests {
         before.auth_enabled = true;
         before.mesh_id = 0xF00D;
         assert_ne!(membership_of(&before), membership_of(&after));
+    }
+}
+
+/// What a node needs in order to ask *this* provider to admit it.
+///
+/// The other end of the [`JoinMesh`] panel above: that panel has three fields
+/// to fill in, and this one is where the values come from. Handing them over is
+/// otherwise a job of reading 64 hex characters aloud, or — for the token — of
+/// replacing a working secret just to learn what it was, which kicks out every
+/// node still holding the old one.
+///
+/// # Why it is on this tab rather than the provider's
+///
+/// It used to sit beside the enrollment *policy*, in the administrators-only
+/// provider scope, as the other half of one question. But setting the policy
+/// and carrying a device to the mesh are two jobs done by two people, and
+/// nothing here decides anything about the mesh: it reports an address and a
+/// key, neither of which is a secret. Gating them on administration meant
+/// every device enrolment ran through somebody dictating hex.
+///
+/// The token is the one value here that is a secret, and it stays gated — on
+/// the reveal button below, which is where the check belongs. What a read-only
+/// viewer keeps is the *fact* that a token is required, since that is what
+/// explains a device in range that has not joined.
+///
+/// # Shown, hidden, and copied are three different things
+///
+/// Neither value is drawn in full. The key is abbreviated to its leading bytes,
+/// which is enough to tell two providers apart but not to retype; the token is
+/// masked outright. Both are copied to the clipboard in full. This is
+/// deliberate: a dashboard on a screen someone else can see, or in a
+/// screenshot pasted into a chat, must not be where the mesh's shared secret
+/// leaks — but an operator who is deliberately handing it on should not be
+/// fighting the UI to do it.
+///
+/// # The token is fetched, not polled
+///
+/// The snapshot behind this panel is refreshed once a second and says only
+/// *whether* a token is required. The value arrives on its own request, when
+/// the operator asks for it — which is the difference between a secret
+/// disclosed continuously to everything that touches the snapshot and one
+/// disclosed in a discrete act the node writes to its log.
+#[component]
+fn JoinDetails(
+    /// This provider's own Ed25519 public key — what the joining node pins so
+    /// nothing else can answer in this one's place.
+    ///
+    /// Taken as bytes so the abbreviation on screen and the hex on the
+    /// clipboard are two renderings of one value. Handing this panel hex and
+    /// decoding it back would let a key that failed to decode abbreviate to
+    /// something plausible.
+    node_key: Vec<u8>,
+    /// Whether a token is required at all.  The authoritative flag, and the
+    /// only part of the token that rides the poll.
+    token_set: bool,
+) -> impl IntoView {
+    let dash = use_dashboard();
+    let key_shown = format::key(&node_key);
+    let key_value = format::hex(&node_key);
+    // The revealed token, once asked for. Local to this panel and dropped when
+    // the operator navigates away.
+    let (revealed, set_revealed) = signal(None::<String>);
+    let reveal = move |_| {
+        leptos::task::spawn_local(async move {
+            match reveal_enrollment_token().await {
+                // `None` is "no token required" — but this button is only
+                // rendered when the poll says one is, so the two disagreeing
+                // means the policy changed under the operator. Say so rather
+                // than rendering an empty field.
+                Ok(Some(token)) => set_revealed.set(Some(token)),
+                Ok(None) => dash.error.set(Some(
+                    "This provider no longer requires a token — enrollment is open.".to_string(),
+                )),
+                Err(e) => dash
+                    .error
+                    .set(Some(format!("Reading the token failed: {e}"))),
+            }
+        });
+    };
+
+    view! {
+        <Panel title="What a node needs to join">
+            <p class="wf-note">
+                "These three go into the joining node's own \"Join a mesh\" panel, on its \
+                 Security tab. Copy them rather than reading them out — the key is 64 \
+                 characters and one wrong character reads as a provider that cannot be \
+                 reached."
+            </p>
+
+            // Where a *joining* node reaches this provider, which is not
+            // necessarily where this dashboard dials it: the two coincide only
+            // when the dashboard and the node are not on the same host. See
+            // `crate::api::provider_address`.
+            //
+            // Absent rather than blank when this process has no address to
+            // give — a serial target, or a fetch that failed. A `CopyField`
+            // over an empty string offers a button that reports "Copied"
+            // having put nothing on the clipboard.
+            {move || match dash.provider_address.get() {
+                Some(addr) => {
+                    view! { <CopyField label="Provider address" shown=addr.clone() value=addr /> }
+                        .into_any()
+                }
+                None => {
+                    view! {
+                        <Field
+                            label="Provider address"
+                            value="Not known — ask an operator for this mesh's public address"
+                        />
+                    }
+                        .into_any()
+                }
+            }}
+            <CopyField
+                label="Provider key"
+                shown=key_shown
+                value=key_value
+            />
+            {move || {
+                if !token_set {
+                    return view! {
+                        <Field
+                            label="Enrollment token"
+                            value="Not required — anyone in range may join"
+                        />
+                    }
+                        .into_any();
+                }
+                match revealed.get() {
+                    Some(token) => {
+                        view! {
+                            <CopyField label="Enrollment token" shown="••••••••" value=token />
+                        }
+                            .into_any()
+                    }
+                    // Required, and not asked for yet. The button is the ask:
+                    // until it is pressed the value has not left the node, and
+                    // pressing it is what the node records.
+                    //
+                    // Not offered to a read-only account: reading the mesh's
+                    // shared secret is an administrator's call, and the node
+                    // refuses it. That a token is required is a different fact,
+                    // already on the poll, and it stays — it is what explains a
+                    // node in range that has not joined.
+                    None if !dash.admin.get() => {
+                        view! {
+                            <Field
+                                label="Enrollment token"
+                                value="Required — an administrator can show it"
+                            />
+                        }
+                            .into_any()
+                    }
+                    None => {
+                        view! {
+                            <div class="wf-field">
+                                <span class="wf-field-label">"Enrollment token"</span>
+                                <button type="button" class="wf-button" on:click=reveal>
+                                    "Show token"
+                                </button>
+                            </div>
+                        }
+                            .into_any()
+                    }
+                }
+            }}
+
+            <p class="wf-note">
+                "A node on a different network may have to reach this one at a different \
+                 address; the key and the token do not change with it."
+            </p>
+        </Panel>
     }
 }

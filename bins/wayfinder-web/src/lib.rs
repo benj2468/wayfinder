@@ -46,6 +46,7 @@ pub mod format;
 /// The invitation flow's view models: what an administrator sees of the
 /// invitations they have minted, and what the person redeeming one sees.
 pub mod invite;
+pub mod qr;
 pub mod state;
 
 #[cfg(feature = "ssr")]

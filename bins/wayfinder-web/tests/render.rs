@@ -46,6 +46,7 @@ use wayfinder_web::components::provider::enrollment::Enrollment;
 use wayfinder_web::components::provider::members::Members;
 use wayfinder_web::components::provider::requests::Requests;
 use wayfinder_web::components::provider::vpn::Vpn;
+use wayfinder_web::components::register::TotpEnrolment;
 use wayfinder_web::components::routing::Routing;
 use wayfinder_web::components::security::Security;
 use wayfinder_web::snapshot::NodeSnapshot;
@@ -245,6 +246,12 @@ fn render_seeded<V: IntoView + 'static>(
                 dash.history.set(history);
             }
             dash.label.set("127.0.0.1:7700".to_string());
+            // Deliberately not the label. The two are different questions —
+            // where this process dials the node, and where a joining device
+            // has to reach the authority — and a fixture where they agree
+            // could not tell a panel reading the wrong one apart.
+            dash.provider_address
+                .set(Some("ca.example:7700".to_string()));
             dash.admin.set(admin);
             provide_context(dash);
             tab().to_html()
@@ -690,13 +697,17 @@ fn provider_enrollment_renders_the_policy() {
     );
 }
 
-/// A provider shows what a joining node has to be told: where it is, the key
-/// that pins it, and the token it will be asked for. This is the other end of
-/// the Security tab's "Join a mesh" panel, and the values have to be copyable
-/// because two of the three are not readable back off the screen.
+/// The Security tab shows what a joining node has to be told: where the
+/// authority is, the key that pins it, and the token it will be asked for.
+///
+/// It sits beside "Join a mesh" rather than on the administrators-only
+/// Enrollment tab, because the two are the same handover seen from each end and
+/// the person carrying a device to a mesh is not necessarily the person who
+/// governs it. The values have to be copyable: two of the three are not
+/// readable back off the screen.
 #[test]
-fn provider_enrollment_offers_the_details_a_joining_node_needs() {
-    let html = render_with(Some(provider_snapshot()), || view! { <Enrollment /> });
+fn security_offers_the_details_a_joining_node_needs() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Security /> });
 
     assert!(
         html.contains("What a node needs to join"),
@@ -711,13 +722,108 @@ fn provider_enrollment_offers_the_details_a_joining_node_needs() {
         2,
         "address and key are copyable: {html}"
     );
+    // Abbreviated on screen, and the whole key only on the clipboard. The
+    // fixture's key is 32 bytes of 0x11, and both renderings are formatted from
+    // those same bytes — `JoinDetails` takes the key as bytes precisely so the
+    // abbreviation cannot come to describe a different key from the copy.
+    assert!(
+        html.contains("11111111…"),
+        "the key is abbreviated on screen: {html}"
+    );
+    assert!(
+        !html.contains(&"11".repeat(32)),
+        "and the full 64 characters are not in the markup — the copy button \
+         carries them, so they are never on screen or in a screenshot: {html}"
+    );
     assert!(
         html.contains("Show token"),
         "and the token is fetched on request: {html}"
     );
+}
+
+/// A read-only account can read the address and the key, and cannot read the
+/// token.
+///
+/// The whole point of moving this panel: enrolling a device needs the address
+/// and the key, neither of which is a secret, and needing an administrator to
+/// read out 64 characters of hex is what the issue behind this was. The token
+/// is the one value that stays behind the capability check, and the *fact* that
+/// one is required stays visible — it is what explains a device in range that
+/// has not joined.
+#[test]
+fn security_shows_a_read_only_viewer_the_address_and_key_but_not_the_token() {
+    let html = render_as_viewer(Some(provider_snapshot()), || view! { <Security /> });
+
     assert!(
-        html.contains("127.0.0.1:7700"),
-        "the address this dashboard reaches the node at: {html}"
+        html.contains("Provider address") && html.contains("Provider key"),
+        "both non-secret values are readable: {html}"
+    );
+    assert_eq!(
+        html.matches("wf-copy-button").count(),
+        2,
+        "and both are copyable: {html}"
+    );
+    assert!(
+        html.contains("an administrator can show it"),
+        "the token is required, and says who can produce it: {html}"
+    );
+    assert!(
+        !html.contains("Show token"),
+        "but a read-only session is not offered the reveal the node would \
+         refuse anyway: {html}"
+    );
+}
+
+/// The address shown is the one a *joining node* has to reach, not the one this
+/// dashboard dials.
+///
+/// They differ on every deployment where the dashboard and the node share a
+/// host: the dashboard reaches it over loopback, and `127.0.0.1:7700` handed to
+/// somebody enrolling a device points them at their own machine.
+#[test]
+fn security_shows_the_advertised_provider_address_not_the_dialled_one() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Security /> });
+
+    assert!(
+        html.contains("ca.example:7700"),
+        "the address a device is told to use: {html}"
+    );
+    assert!(
+        !html.contains("127.0.0.1:7700"),
+        "and not the loopback address this process dials: {html}"
+    );
+}
+
+/// A node that issues no certificates has no join details to give, and an
+/// address-and-key panel on one would be describing a mesh it cannot admit
+/// anybody to.
+#[test]
+fn security_omits_the_join_details_on_a_node_that_is_not_an_authority() {
+    let html = render_with(Some(seeded_snapshot()), || view! { <Security /> });
+
+    assert!(
+        !html.contains("What a node needs to join"),
+        "no panel on a plain member: {html}"
+    );
+}
+
+/// The Enrollment tab keeps the policy and hands the join details off, rather
+/// than carrying a second copy of them.
+///
+/// Two tabs showing the same panel is two places to keep in step and a reader
+/// wondering which one is authoritative. The pointer stays, because an
+/// administrator setting a token is exactly who then goes looking for it.
+#[test]
+fn provider_enrollment_points_at_the_join_details_rather_than_repeating_them() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Enrollment /> });
+
+    assert!(
+        !html.contains("Provider key"),
+        "the values are not duplicated here: {html}"
+    );
+    assert!(
+        html.contains("Security tab"),
+        "and the reader is told where they are: {html}"
     );
 }
 
@@ -725,8 +831,8 @@ fn provider_enrollment_offers_the_details_a_joining_node_needs() {
 /// rendered from carries none — the polled status reports only that one is
 /// required, and the value comes back from `reveal_enrollment_token`.
 #[test]
-fn provider_enrollment_renders_no_token_because_the_poll_carries_none() {
-    let html = render_with(Some(provider_snapshot()), || view! { <Enrollment /> });
+fn security_renders_no_token_because_the_poll_carries_none() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Security /> });
 
     assert!(
         !html.contains(PROVIDER_TOKEN),
@@ -742,8 +848,8 @@ fn provider_enrollment_renders_no_token_because_the_poll_carries_none() {
 /// apart, not enough to retype — while the copy button carries all 64
 /// characters, which is what the far end actually parses.
 #[test]
-fn provider_enrollment_abbreviates_the_provider_key_it_shows() {
-    let html = render_with(Some(provider_snapshot()), || view! { <Enrollment /> });
+fn security_abbreviates_the_provider_key_it_shows() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Security /> });
 
     // The seed's own key is 32 bytes of 0x11.
     assert!(
@@ -759,12 +865,12 @@ fn provider_enrollment_abbreviates_the_provider_key_it_shows() {
 /// With no token required the row says so rather than offering a copy button
 /// for an empty string.
 #[test]
-fn provider_enrollment_says_when_there_is_no_token_to_hand_over() {
+fn security_says_when_there_is_no_token_to_hand_over() {
     let mut snap = provider_snapshot();
     if let Some(policy) = snap.security.as_mut().and_then(|s| s.enrollment.as_mut()) {
         policy.enrollment_token_set = false;
     }
-    let html = render_with(Some(snap), || view! { <Enrollment /> });
+    let html = render_with(Some(snap), || view! { <Security /> });
 
     assert!(
         html.contains("Not required"),
@@ -788,8 +894,8 @@ fn provider_enrollment_says_when_there_is_no_token_to_hand_over() {
 /// them stops an operator looking for the token they need. Inferring the mesh
 /// is open from the value's absence is a bug this once had.
 #[test]
-fn provider_enrollment_does_not_read_an_unfetched_token_as_an_open_mesh() {
-    let html = render_with(Some(provider_snapshot()), || view! { <Enrollment /> });
+fn security_does_not_read_an_unfetched_token_as_an_open_mesh() {
+    let html = render_with(Some(provider_snapshot()), || view! { <Security /> });
 
     assert!(
         !html.contains("Not required"),
@@ -1311,5 +1417,55 @@ fn links_shows_a_read_only_viewer_the_gates_without_letting_them_flip() {
         html.matches("disabled").count(),
         4,
         "and every one of them is inert: {html}"
+    );
+}
+
+/// A representative `otpauth://` URI, the shape the provider actually mints.
+const ENROLMENT_URI: &str = "otpauth://totp/Wayfinder:alice?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PX\
+                             P&issuer=Wayfinder&algorithm=SHA1&digits=6&period=30";
+
+/// The second factor is set up on a *phone*, and the page showing it is often
+/// on something else. A camera is the only route between the two that neither
+/// retypes 32 characters of base32 nor mails a shared secret to yourself, so
+/// the code is drawn into the page rather than left to the copy button.
+#[test]
+fn registration_draws_the_authenticator_secret_as_a_scannable_code() {
+    let html = render_with(None, || {
+        view! { <TotpEnrolment uri=ENROLMENT_URI.to_string() /> }
+    });
+
+    assert!(html.contains("<svg"), "a code is drawn: {html}");
+    assert!(html.contains("wf-qr"), "and it is the QR code: {html}");
+    assert!(
+        html.contains("<path d=\"M"),
+        "with modules in it, not an empty frame: {html}"
+    );
+}
+
+/// The code and the copy button carry the same URI. They are two routes to one
+/// secret, and a code encoding anything but what the button copies would send
+/// a registrant to an authenticator holding a different secret from the one
+/// the provider recorded.
+#[test]
+fn the_scannable_code_and_the_copy_button_carry_the_same_uri() {
+    let html = render_with(None, || {
+        view! { <TotpEnrolment uri=ENROLMENT_URI.to_string() /> }
+    });
+
+    let expected = wayfinder_web::qr::svg(ENROLMENT_URI, "Authenticator setup code")
+        .expect("a URI this short fits");
+    let modules = expected
+        .split_once("<path d=\"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .expect("the encoded modules")
+        .0;
+
+    assert!(
+        html.contains(modules),
+        "the drawn code is the encoding of the URI beside it: {html}"
+    );
+    assert!(
+        html.contains(&ENROLMENT_URI.replace('&', "&amp;")),
+        "which is also the text beside it, HTML-escaped as any text node is"
     );
 }

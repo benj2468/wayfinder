@@ -66,8 +66,10 @@ and the three cannot drift apart. Changing one of those six changes the CLI and
 the TUI with it.
 
 What *is* declared here is only what is genuinely the dashboard's own:
-`--listen`, `--allowed-host`, and the `--provider`/`--provider-key` pair that
-selects login mode.
+`--listen`, `--allowed-host`, the `--provider`/`--provider-key` pair that
+selects login mode, and `--public-provider-address`, which is display only —
+where a *joining node* reaches the authority, as against where this process
+dials it.
 
 ## Two builds from one crate
 
@@ -463,9 +465,37 @@ changing it:
   how a certificate is collected after approval, so the panel simply asks again
   on a timer while it waits.
 
-**The provider scope's Enrollment tab is the other end of that exchange**, and
-it shows what a joining node must be told — the provider's address, the key that pins it, and
-the enrollment token. Two rules govern that panel:
+**The Security tab also carries the other end of that exchange**, in its "What
+a node needs to join" panel: the provider's address, the key that pins it, and
+the enrollment token — the three values the "Join a mesh" panel above it asks
+for. Both ends on one page is the point; somebody enrolling a device reads one
+and fills in the other.
+
+That panel used to live on the provider scope's Enrollment tab, beside the
+policy that produces it. **It moved because it governs nothing.** An address
+and a key are not secrets, and gating them behind the administrators-only scope
+meant every device enrolment ran through somebody reading 64 characters of hex
+aloud. The token *is* a secret, and it stays gated — on its own reveal button,
+which is where the check belongs, and where the node's own refusal already sits.
+Enrollment keeps the policy and a pointer. **Do not add a second copy of the
+panel back to it**: two tabs showing the same values is two places to keep in
+step and a reader wondering which is authoritative.
+
+Three rules govern that panel:
+
+- **The address shown is the advertised one, not the dialled one.**
+  `dash.provider_address` (`api::provider_address` →
+  `SessionStore::advertised_provider_address`), never `dash.label`. The two
+  coincide only when the dashboard and the authority are not on the same host,
+  and the deployed provider is precisely the case where they are: the
+  dashboard reaches its node over loopback, so the label is `127.0.0.1:7700` —
+  correct for that process and useless to every device it would be shown to.
+  The public address is *configured* (`--public-provider-address`,
+  `services.wayfinder.web.publicProviderAddress`) because nothing can derive
+  it: the management endpoint's name is not the dashboard's `Host` (separate
+  DNS records — the dashboard is proxied and the management API cannot be), and
+  the node does not know the address the world reaches it at. It is display
+  only; nothing dials it.
 
 - **The token is fetched, never polled.** `GetSecurityStatus` reports only
   `enrollment_token_set`; the value comes back from `reveal_enrollment_token`
@@ -489,11 +519,11 @@ the enrollment token. Two rules govern that panel:
 replaced once a second, so a `move ||` closure over it constructs a *fresh*
 component every second — and a component's `signal(String::new())` fields are
 re-created empty, wiping whatever was half-typed and taking the focus with it.
-The Security tab's "Join a mesh" panel and the Enrollment tab's policy
-and join-details panels are therefore driven from `Memo`s over the narrowest
-projection they need (`security::membership_of`, and `provider::enrollment`'s
-`policy`/`join_details`), since a memo only notifies when its own value
-changes. Widening one of those projections to something that moves on its own —
+The Security tab's "Join a mesh" and "What a node needs to join" panels and the
+Enrollment tab's policy panel are therefore driven from `Memo`s over the
+narrowest projection they need (`security::membership_of` and `join_details`,
+and `provider::enrollment`'s `policy`), since a memo only notifies when its own
+value changes. Widening one of those projections to something that moves on its own —
 a node list, a timestamp — silently restores the bug, which no markup test can
 see; `membership_ignores_everything_that_changes_on_its_own` is what guards it.
 

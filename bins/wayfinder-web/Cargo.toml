@@ -28,6 +28,13 @@ required-features = ["mock-node"]
 # both the ssr and hydrate builds.
 wayfinder-protos = { workspace = true, features = ["serde"] }
 
+# Unconditional for the same reason `wayfinder-protos` above is: the
+# registration page's QR code is drawn by the server *and* by the hydration
+# bundle, and a code present in one render and absent from the other is a
+# hydration mismatch. No dependencies of its own, and it hands back modules
+# rather than an image — `src/qr.rs` writes the SVG.
+qrcodegen = { workspace = true }
+
 leptos = { workspace = true }
 leptos_router = { workspace = true }
 leptos_meta = { workspace = true }

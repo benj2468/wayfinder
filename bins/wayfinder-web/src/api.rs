@@ -246,6 +246,26 @@ pub async fn node_label() -> Result<String, ServerFnError> {
     Ok(access()?.label())
 }
 
+/// Where a node that wants to join this mesh should reach its certificate
+/// authority, or `None` when this process has no address worth handing over.
+///
+/// Fetched once when the dashboard mounts, alongside [`node_label`] and for the
+/// same reason: it is fixed for the life of the process. Not the same value as
+/// the label, though it usually looks like one — see
+/// `SessionStore::advertised_provider_address` for why the address this
+/// dashboard *dials* is the wrong thing to hand somebody enrolling a device.
+///
+/// `None` rather than a plausible wrong answer: over a serial port the only
+/// address this process has is a device path. See `Access::provider_address`.
+///
+/// Not a secret and not gated on a session: it is a hostname and a port, the
+/// mesh's front door, and a node has to be able to reach it before it holds
+/// anything this dashboard could authenticate.
+#[server(name = ProviderAddress, prefix = "/api", endpoint = "provider_address")]
+pub async fn provider_address() -> Result<Option<String>, ServerFnError> {
+    Ok(access()?.provider_address())
+}
+
 /// Which participation gate a [`set_link_gate`] call flips.
 ///
 /// A closed enum rather than a field name string, so an unknown gate is a

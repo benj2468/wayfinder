@@ -300,6 +300,12 @@ mod ssr {
         /// the certificate authority is one node and the dashboard may be
         /// pointed at any of them.
         provider: PinnedNode,
+        /// Where a node that is *not* this process should reach that provider,
+        /// when that is a different address from the one above.
+        ///
+        /// Display only, and never dialled: see
+        /// [`SessionStore::advertised_provider_address`].
+        advertised_provider: Option<String>,
         /// Live sessions by id.
         ///
         /// A plain `std` mutex: nothing here is held across an await — a login
@@ -315,8 +321,19 @@ mod ssr {
             Self {
                 node,
                 provider,
+                advertised_provider: None,
                 sessions: Mutex::new(HashMap::new()),
             }
+        }
+
+        /// Set the address this provider is *advertised* at, if it differs from
+        /// the one logins are sent to.
+        ///
+        /// `None` leaves the two the same, which is the ordinary case.
+        #[must_use]
+        pub fn advertising_provider_at(mut self, addr: Option<String>) -> Self {
+            self.advertised_provider = addr;
+            self
         }
 
         /// The node this dashboard is pointed at, for the header.
@@ -327,6 +344,31 @@ mod ssr {
         /// The provider a login goes to, for the login page and the startup log.
         pub fn provider(&self) -> &NodeAddr {
             &self.provider.addr
+        }
+
+        /// Where to tell a *joining node* this certificate authority is, which
+        /// is not necessarily where this dashboard dials it.
+        ///
+        /// The two diverge exactly when the dashboard and the node share a
+        /// host, and the deployed provider is that case: the dashboard reaches
+        /// it over loopback, while a device asking to join reaches it by its
+        /// public name. The dialled address is therefore correct for this
+        /// process and useless to anything else, and handing it to somebody
+        /// enrolling a new device sends them to their own machine. They
+        /// coincide only when the dashboard dials the authority by an address
+        /// that something other than this process could also reach.
+        ///
+        /// Configured rather than derived, because nothing here can derive it:
+        /// the management endpoint's name is not the dashboard's `Host` (they
+        /// are separate records on the deployed provider), and a node behind
+        /// NAT knows nothing about the address the world reaches it at.
+        ///
+        /// It is display only. Nothing dials this, so a wrong value misinforms
+        /// an operator rather than pointing a login somewhere unexpected.
+        pub fn advertised_provider_address(&self) -> String {
+            self.advertised_provider
+                .clone()
+                .unwrap_or_else(|| self.provider.addr.to_string())
         }
 
         /// Exchange credentials at the provider for a session.
@@ -729,6 +771,28 @@ mod ssr {
             }
         }
 
+        /// Where to tell a joining node this mesh's certificate authority is,
+        /// or `None` when this process has no answer worth giving.
+        ///
+        /// In login mode the store answers, and may have been given a public
+        /// address distinct from the one it dials — see
+        /// [`SessionStore::advertised_provider_address`].
+        ///
+        /// In static mode there is no `--public-provider-address` to consult
+        /// (it requires `--provider`), so the dialled address is the only
+        /// candidate — and over a serial port there is not even that: the
+        /// target's label is a device path and a baud rate, which rendered
+        /// under "Provider address" is a string no device could ever connect
+        /// to. `None` there rather than a plausible-looking wrong answer; a
+        /// TLS target still answers, and it is then the operator's job to
+        /// notice if what they dialled is loopback or otherwise private.
+        pub fn provider_address(&self) -> Option<String> {
+            match self {
+                Access::Static(conn) => conn.dialled_address(),
+                Access::Login(store) => Some(store.advertised_provider_address()),
+            }
+        }
+
         /// The connection for a request carrying session `id`, or `None` when
         /// login mode has no live session behind it.
         pub fn connection(&self, id: Option<&str>, now_unix: u64) -> Option<Arc<NodeConnection>> {
@@ -849,6 +913,90 @@ mod ssr {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The address shown to somebody who has to point *another* device at
+        /// this certificate authority is not the address this dashboard dials
+        /// it on.
+        ///
+        /// On the deployed provider they are two different things and the
+        /// difference is the whole bug: the dashboard reaches the node over
+        /// loopback, so the join details read `127.0.0.1:7700` — an address
+        /// that is correct for this process and useless to every device that
+        /// is not this process.
+        #[test]
+        fn the_advertised_provider_address_is_configurable_apart_from_the_dialled_one() {
+            let node = PinnedNode {
+                addr: "127.0.0.1:7700".parse().unwrap(),
+                key: [0x11; 32],
+            };
+            let store = SessionStore::new(node.clone(), node.clone());
+
+            assert_eq!(
+                store.advertised_provider_address(),
+                "127.0.0.1:7700",
+                "with nothing configured it is the address logins are sent to"
+            );
+
+            let store = SessionStore::new(node.clone(), node)
+                .advertising_provider_at(Some("ca.wayfndr.dev:7700".to_string()));
+            assert_eq!(store.advertised_provider_address(), "ca.wayfndr.dev:7700");
+            assert_eq!(
+                store.provider().to_string(),
+                "127.0.0.1:7700",
+                "and the dialled address is untouched: this is display only"
+            );
+        }
+
+        /// [`Access`] hands out the *advertised* address, not the dialled one.
+        ///
+        /// The test above pins [`SessionStore`]; this pins the seam above it,
+        /// which is the one the dashboard actually reads through. Without it,
+        /// wiring this arm back to `store.provider()` — the exact bug the
+        /// advertised address exists to fix — passes every other test in the
+        /// crate, because the render tests seed `dash.provider_address`
+        /// directly and never exercise this call.
+        #[test]
+        fn login_mode_advertises_the_public_address_rather_than_the_dialled_one() {
+            let node = PinnedNode {
+                addr: "127.0.0.1:7700".parse().unwrap(),
+                key: [0x11; 32],
+            };
+            let access = Access::Login(Arc::new(
+                SessionStore::new(node.clone(), node)
+                    .advertising_provider_at(Some("ca.wayfndr.dev:7700".to_string())),
+            ));
+
+            assert_eq!(
+                access.provider_address().as_deref(),
+                Some("ca.wayfndr.dev:7700"),
+                "the address a joining device is told, not the loopback one dialled"
+            );
+        }
+
+        /// A serial target has no address to advertise, and says so rather
+        /// than offering a device path.
+        ///
+        /// `NodeConnection::label` answers `/dev/ttyACM0 @ 115200 baud` for
+        /// this target — correct in the header and useless under "Provider
+        /// address", where it would be copied into another node's join form.
+        #[test]
+        fn a_serial_connection_advertises_no_provider_address() {
+            let serial = Access::Static(Arc::new(NodeConnection::new(Target::Serial {
+                path: "/dev/ttyACM0".to_string(),
+                baud: 115_200,
+            })));
+
+            assert_eq!(
+                serial.label(),
+                "/dev/ttyACM0 @ 115200 baud",
+                "the header still names what this process is pointed at"
+            );
+            assert_eq!(
+                serial.provider_address(),
+                None,
+                "but nothing else could dial it, so there is nothing to hand over"
+            );
+        }
 
         /// The session id is picked out of a cookie header carrying whatever
         /// else the browser has for this origin, and is absent rather than

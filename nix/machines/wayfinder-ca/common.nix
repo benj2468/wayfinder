@@ -140,6 +140,22 @@ let
   # answerable.
   vpnHostname = "vpn.wayfndr.dev";
 
+  # Public name of this node's *management API* — the address a device asking to
+  # join the mesh connects to, and the one the dashboard's "What a node needs to
+  # join" panel hands an operator.
+  #
+  # A third record, separate from both above, and each for its own reason. Not
+  # `dashboardHostname`: that one is proxied by Cloudflare, and the management
+  # API is a bespoke protocol over TLS on 7700 that no HTTP proxy carries — see
+  # `infra/oracle/dns.tf`, where this record is `proxied = false` for exactly
+  # that. Not `vpnHostname`: the tunnel control plane is independently movable.
+  #
+  # Display only. The dashboard still *dials* the node over loopback below; this
+  # is what it tells a device that is not on this host. Without it the panel
+  # reads `127.0.0.1:7700`, which is true of this process and useless to
+  # everyone it is shown to.
+  caHostname = "ca.wayfndr.dev";
+
   # The dashboard's loopback port, moved off 8080 because Headscale is there.
   # Nothing outside this file sees it: the dashboard is reached through the
   # Cloudflare Tunnel below, whose ingress is the one thing that names it.
@@ -157,6 +173,9 @@ in
       enable = true;
       listen = "127.0.0.1:${toString dashboardPort}";
       provider = "127.0.0.1:7700";
+      # Where a joining node reaches that same authority. See `caHostname`:
+      # loopback is how this dashboard gets there, and nothing else can.
+      publicProviderAddress = "${caHostname}:7700";
       allowedHosts = [ dashboardHostname ];
       inherit nodeKey;
     };

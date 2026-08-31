@@ -111,6 +111,25 @@ impl NodeConnection {
         self.target.label()
     }
 
+    /// The network address this connection dials, when it dials one at all.
+    ///
+    /// Distinct from [`label`] because a label is for a human reading the
+    /// header — it names *something* for every target — while this answers
+    /// "could another device connect here?", and over a serial port nothing
+    /// could. [`label`] returns `/dev/ttyACM0 @ 115200 baud` there, which is a
+    /// fine header and a wrong answer to hand somebody enrolling a device.
+    ///
+    /// Says nothing about whether the address is *reachable* from anywhere
+    /// else: a loopback dial answers with loopback.
+    ///
+    /// [`label`]: NodeConnection::label
+    pub fn dialled_address(&self) -> Option<String> {
+        match &self.target {
+            Target::Tls(endpoint) => Some(endpoint.addr.to_string()),
+            Target::Serial { .. } => None,
+        }
+    }
+
     /// Whether a connection is currently established.
     ///
     /// Intended for the status strip and for tests asserting the connection is
