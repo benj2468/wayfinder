@@ -894,6 +894,64 @@ macro list would close it; out of scope for the fix itself.
 
 ---
 
+## 8.8 A certificate could bind a member at a reserved address — **fixed**
+
+Found by the 2026-08 certificate-issuance sweep as one of two *measured*
+consequences of gap 4 (§5). Unlike gap 4 itself, this one is not blocked on the
+key↔address binding: it is a property of the address alone, so it shipped ahead
+of §5 and holds whichever path §5 eventually takes.
+
+### What happened
+
+`verify_cert` never inspected the subject MAC's bits. Since `submit_csr` takes
+`node_mac` from the client (§5), a misissuance could bind a key to
+`ff:ff:ff:ff:ff:ff`, to `00:00:00:00:00:00`, or to any multicast (group-bit)
+address — and the certificate verified perfectly. A victim then cached a
+pairwise key against that address and listed it as an admitted member.
+
+Admission was the whole of it: a route additionally needs a next-hop proof a
+bare injector cannot answer (§4). But admission is not nothing, because the
+pairwise key is what `verify_directed` consults — so a directed frame
+purporting to originate from "every node", or from the null address, would have
+passed. It is also an address-type confusion the routing and flooding logic was
+never written to expect as an *originator*.
+
+### The fix
+
+`verify_cert` rejects a reserved `node_mac` with `AuthError::ReservedAddress`:
+the group bit set on the first octet (which subsumes broadcast), or all-zeros.
+The check sits deliberately *after* the signature check — it rejects a cert the
+mesh root genuinely signed, so it is a misissuance rather than a forgery, and
+the error says so.
+
+It is deliberately narrower than the convention `derive_mac` stamps
+(`force_locally_administered_unicast`): it does **not** require the
+locally-administered bit, because a node may legitimately route under a
+globally-administered address its hardware came with. Only addresses that mean
+"not one node" are refused.
+
+Nothing is checked on the issuance side. A CA that signs such a cert now mints
+one no node will honour, which is the fail-closed direction; surfacing it at
+`submit_csr` as well is a small follow-up, not a correctness requirement.
+
+### Reproduced by
+
+`red_team.py::attack_reserved_address_originator`, now `HELD`. Unit coverage in
+`libs/wayfinder-auth/src/cert.rs`: `reserved_node_mac_rejected` over all four
+shapes, and `ordinary_unicast_node_mac_still_verifies` pinning the narrowness
+above (a derived MAC, a compact test MAC, and a globally-administered one).
+
+### Fallout worth recording
+
+`wayfinder-test`'s harness numbered machine identities from zero, so
+`machine1` held `00:00:00:00:00:00` — the null address — and every authed
+fixture was quietly certifying a node at it. Identities are now one-based. The
+symptom was the useful part: the fixture did not error, it simply failed to
+converge, which is the same shape as the benchmark hazard recorded in the root
+`CLAUDE.md`.
+
+---
+
 ## 9. Key file map for the implementer
 
 | File | Gaps | What changes |

@@ -518,7 +518,11 @@ impl TestConfig {
             }
         }
         for (i, machine) in self.machines.iter().enumerate() {
-            let ident = mac(i as u8);
+            // One-based: `mac(0)` is `00:00:00:00:00:00`, the null address, and
+            // no node may hold a membership certificate for it — an authed
+            // fixture whose first machine got it would silently fail to
+            // converge rather than fail loudly.
+            let ident = mac(i as u8 + 1);
             // Capture the wiring so the node can be churned offline/online or
             // have individual links failed later.
             let switches: Vec<String> = machine

@@ -21,6 +21,15 @@ pub enum AuthError {
     NotYetValid,
     /// The subject MAC has been revoked.
     Revoked,
+    /// The certificate binds its subject to a **reserved** MAC address —
+    /// broadcast, any multicast (group-bit) address, or the all-zeros null
+    /// address — none of which a node can route under.
+    ///
+    /// Distinct from [`BadSignature`](Self::BadSignature): the mesh root
+    /// really did sign it, so this is a *misissuance*, and the receiver
+    /// refusing it is what keeps one bad signature from admitting a member at
+    /// an address every node already treats specially.
+    ReservedAddress,
     /// A revocation record carries no revocation instant (`not_before == 0`).
     ///
     /// Structurally malformed rather than merely stale: `not_before` is also
@@ -41,6 +50,7 @@ impl core::fmt::Display for AuthError {
             AuthError::Expired => "certificate expired",
             AuthError::NotYetValid => "certificate not yet valid",
             AuthError::Revoked => "subject revoked",
+            AuthError::ReservedAddress => "certificate binds a reserved address",
             AuthError::NoRevocationInstant => "revocation carries no instant",
         };
         f.write_str(msg)

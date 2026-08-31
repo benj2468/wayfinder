@@ -220,6 +220,22 @@ pub struct VerifiedCert {
     pub member: bool,
 }
 
+/// Whether `mac` is an address **reserved** by ethernet addressing, and so one
+/// no node may hold a membership certificate for: any multicast address (the
+/// group bit, `0x01`, set on the first octet — which also covers broadcast,
+/// `ff:ff:ff:ff:ff:ff`), or the all-zeros null address.
+///
+/// This is the verifying counterpart to
+/// [`force_locally_administered_unicast`](crate::mac::force_locally_administered_unicast),
+/// which stamps the same convention on every address this crate hands out. It
+/// is deliberately *narrower* than that convention: it does not require the
+/// locally-administered bit, because a node may legitimately route under a
+/// globally-administered address its hardware came with — only addresses that
+/// mean "not one node" are refused.
+fn is_reserved_mac(mac: [u8; 6]) -> bool {
+    mac[0] & 0x01 != 0 || mac == [0u8; 6]
+}
+
 impl TrustAnchor {
     /// On-disk / on-wire size of a serialized trust anchor: a 4-byte big-endian
     /// mesh id followed by the 32-byte root public key.
@@ -253,9 +269,12 @@ impl TrustAnchor {
     /// Verify `cert` against this anchor as of `now_unix` (unix seconds).
     ///
     /// Checks, in order: the version byte, that the cert is for *this* mesh, the
-    /// root signature, and the validity window.  Returns the trusted facts on
-    /// success, or the first failing [`AuthError`].  Fail-closed: any error
-    /// means the cert (and the frame carrying it) must be rejected.
+    /// root signature, that the subject MAC is one a node can actually route
+    /// under (not broadcast, not multicast, not the null address), and the
+    /// validity window.  Returns the trusted facts on success, or the first
+    /// failing [`AuthError`].
+    /// Fail-closed: any error means the cert (and the frame carrying it) must
+    /// be rejected.
     pub fn verify_cert(
         &self,
         cert: &MembershipCert,
@@ -269,6 +288,14 @@ impl TrustAnchor {
         }
         if !verify_signature(&self.root_pubkey, cert.signed_body(), &cert.signature) {
             return Err(AuthError::BadSignature);
+        }
+        // Deliberately *after* the signature check: this rejects a cert the
+        // mesh root genuinely signed, so it is a misissuance and not a forgery,
+        // and the error should say so.  Nothing this verifier does can prevent
+        // the misissuance; refusing to admit its subject is what bounds it.
+        // Taken by value, like the window fields below — no refs into packed.
+        if is_reserved_mac(cert.node_mac) {
+            return Err(AuthError::ReservedAddress);
         }
         // Copy out of the packed struct before comparing (no refs into packed).
         let not_before = cert.not_before.get();
@@ -519,5 +546,55 @@ mod tests {
         assert_ne!(cert_a.fingerprint(), cert_b.fingerprint());
     }
 
+    /// A cert binding a member at a **reserved** address is rejected however
+    /// genuinely the mesh root signed it.  Nothing routes at broadcast, at a
+    /// multicast (group-bit) address or at the null address, so a certificate
+    /// naming one is a misissuance rather than a member — and admitting it
+    /// would let a directed frame purporting to originate from "every node",
+    /// or from no node at all, pass `verify_directed` at the receiver.
+    #[test]
+    fn reserved_node_mac_rejected() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let node = Keypair::from_seed(&[2u8; 32]);
+        let anchor = authority.trust_anchor();
+
+        for reserved in [
+            Mac([0xFF; 6]),                // broadcast
+            Mac([0x01, 0, 0, 0, 0, 1]),    // the group bit alone
+            Mac([0x33, 0x33, 0, 0, 0, 1]), // an IPv6 multicast address
+            Mac([0x00; 6]),                // the null address
+        ] {
+            let cert = authority.issue_cert(reserved, node.ed_pubkey(), node.x_pubkey(), 100, 200);
+            assert_eq!(
+                anchor.verify_cert(&cert, 150),
+                Err(AuthError::ReservedAddress),
+                "reserved address {reserved:?} must not verify",
+            );
+        }
+    }
+
+    /// The reserved-address check is narrow: it must not reject the addresses
+    /// nodes actually route under — a derived locally-administered unicast MAC,
+    /// or the globally-administered one an OS-assigned device carries.
+    #[test]
+    fn ordinary_unicast_node_mac_still_verifies() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let node = Keypair::from_seed(&[2u8; 32]);
+        let anchor = authority.trust_anchor();
+
+        for ordinary in [
+            derive_mac(&node.ed_pubkey()),
+            mac(5),
+            Mac([0x02, 0, 0, 0, 0, 1]),
+        ] {
+            let cert = authority.issue_cert(ordinary, node.ed_pubkey(), node.x_pubkey(), 100, 200);
+            assert!(
+                anchor.verify_cert(&cert, 150).is_ok(),
+                "ordinary address {ordinary:?} must verify",
+            );
+        }
+    }
+
     use crate::key::Keypair;
+    use crate::mac::derive_mac;
 }
