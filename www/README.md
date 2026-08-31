@@ -98,38 +98,59 @@ truth.
 
 ### One-time setup
 
-1. **Create the Pages project.** In the Cloudflare dashboard: _Workers & Pages →
-   Create → Pages → Direct Upload_. Name it **`wayfinder-site`** — the job and
-   the `just site-deploy` recipe both hard-code that name. Upload anything to
-   create it; the first real deploy replaces it.
+The Pages project, its production branch and both custom domains are
+**provisioned by OpenTofu**, in `infra/oracle/site.tf` — they used to be a
+click-through in the Cloudflare dashboard, which is the kind of state that is
+invisible until someone has to rebuild it. Two steps remain, and only one of
+them is on Cloudflare's website.
 
-2. **Set the production branch to `main`** (_Settings → Builds & deployments_).
-   `wayfinder-ca.sh` deploys under that branch name; a `just site-deploy
-   <branch>` lands as a preview on `<branch>.wayfinder-site.pages.dev` without
-   touching the live site.
+1. **Mint an API token.** _My Profile → API Tokens → Create Token → Custom_:
 
-3. **Mint an API token.** _My Profile → API Tokens → Create Token → Custom_:
+   |                   |                                                       |
+   | ----------------- | ----------------------------------------------------- |
+   | Permission        | `Account` → `Cloudflare Pages` → `Edit`               |
+   | Permission        | `Zone` → `DNS` → `Edit` (the two custom-domain CNAMEs) |
+   | Permission        | `Zone` → `Zone` → `Read` (to resolve the zone's name)  |
+   | Account resources | Include → your account                                |
+   | Zone resources    | Include → your zone                                   |
 
-   |                   |                                         |
-   | ----------------- | --------------------------------------- |
-   | Permission        | `Account` → `Cloudflare Pages` → `Edit` |
-   | Account resources | Include → your account                  |
+   `wayfinder-ca.sh` reuses **one** token for the publish, the DNS records, the
+   tunnel and the cache purge, so these are *added to* the scopes the rest of
+   that script already needs — see `infra/oracle/README.md` for the full list.
+   Put it in `~/.cf-token` (mode `0600`, the token and nothing else), or
+   wherever `CA_CF_TOKEN_FILE` points.
 
-   Attaching the domain (step 5) is a dashboard action, so no Zone or DNS
-   permission is needed for the publish itself. Note that `wayfinder-ca.sh`
-   reuses one token for this, the DNS records and the cache purge — so the
-   token it reads from `~/.cf-token` needs `Cloudflare Pages: Edit` *added to*
-   the scopes the rest of that script already needs.
+2. **Turn the site on and apply.** In `infra/oracle/terraform.tfvars`:
 
-4. **Put the token where the script looks for it** — `~/.cf-token`, or wherever
-   `CA_CF_TOKEN_FILE` points.
+   ```hcl
+   manage_site           = true
+   cloudflare_account_id = "..."
+   cloudflare_zone_id    = "..."
+   # site_project_name   = "wayfinder-site"   # the default
+   ```
 
-5. **Attach the domain.** _Pages project → Custom domains → Set up a custom
-   domain_ → `wayfndr.dev`, then again for `www.wayfndr.dev`. If the domain's
-   nameservers are already Cloudflare's, the `CNAME` records and the TLS
-   certificate are created automatically; if not, Cloudflare shows the record to
-   add at your registrar. `.dev` is on the HSTS preload list, so it is
-   HTTPS-only from the first request — there is no HTTP fallback to test.
+   ```bash
+   ./scripts/wayfinder-ca.sh provision   # tofu apply
+   ./scripts/wayfinder-ca.sh site        # the first real deployment
+   ```
+
+   The apply creates a **Direct Upload** project (no Git integration, for the
+   reason above), sets its production branch to `main`, and attaches `wayfndr.dev` and
+   `www.wayfndr.dev` along with the proxied `CNAME` for each. Between the two
+   commands the project exists and is empty, and the domain answers a Cloudflare
+   placeholder; that is the expected intermediate state. `.dev` is on the HSTS
+   preload list, so the name is HTTPS-only from the first request — there is no
+   HTTP fallback to test.
+
+   The project name lives in `terraform.tfvars` and `wayfinder-ca.sh` reads it
+   from there. The `just site-deploy` preview recipe hard-codes the default;
+   change it there too if you rename.
+
+**If the project already exists** — made by hand before `site.tf` did, or in
+another account — `manage_site = true` tries to create it a second time and
+fails on the name rather than adopting it. Import the four objects first;
+`infra/oracle/README.md`, "Adopting an existing Pages project", has the
+commands.
 
 ### Deploying
 

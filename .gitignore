@@ -63,3 +63,6 @@ var/conf/wayfinder0.state
 
 # Static site build output (scripts/build-site.sh)
 dist/
+
+# Cloudflare
+.wrangler

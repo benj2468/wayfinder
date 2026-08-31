@@ -13,3 +13,16 @@ ssh_public_key   = "ssh-ed25519 AAAA... you@example.org"
 # manage_dns         = true
 # cloudflare_zone_id = "REPLACE_ME"
 # dns_name           = "ca"
+
+# Optional: the Cloudflare Tunnel that fronts the web dashboard.
+# manage_tunnel         = true
+# cloudflare_account_id = "REPLACE_ME"
+# dashboard_name        = "dash"
+
+# Optional: the Cloudflare Pages project behind the wayfndr.dev landing page.
+# The page is uploaded by `scripts/wayfinder-ca.sh site`; this only creates the
+# project and its custom domains, so that upload has somewhere to land.
+# If the project already exists, import it rather than applying — see README.md.
+# manage_site           = true
+# cloudflare_account_id = "REPLACE_ME"
+# site_project_name     = "wayfinder-site"

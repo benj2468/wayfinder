@@ -440,6 +440,35 @@ in
       services.chrony.enable = lib.mkDefault true;
       services.timesyncd.enable = lib.mkDefault false;
 
+      # And chrony has to be told to publish that verdict. `chronyd` only calls
+      # `adjtimex` to *clear* the kernel's `STA_UNSYNC` bit when `rtcsync` is
+      # configured — the directive is named for the RTC, but clearing the bit
+      # is what enables the kernel's 11-minute mode, so chrony does it only
+      # here. Without it a perfectly disciplined node still answers
+      # `ntp_adjtime` with `TIME_ERROR`/`STA_UNSYNC`, and that status word is
+      # the *only* thing `clock_trust.rs` reads.
+      #
+      # The failure this prevents is silent from every side that an operator
+      # would think to look at: `chronyc tracking` reports `Leap status:
+      # Normal`, locked to a stratum-2 source, system time tens of microseconds
+      # out — while the node logs `state="unsynchronized"` once at startup and
+      # then refuses every issuing path for the rest of its life. That is
+      # exactly what `nix/machines/wayfinder-ca` was doing: a certificate
+      # authority that routed fine and could not sign.
+      #
+      # `enableRTCTrimming` is nixpkgs' default and renders `rtcfile` +
+      # `rtcautotrim`, which chrony refuses to run alongside `rtcsync` (there
+      # is an assertion in the chrony module to that effect), so it has to go
+      # off for this. What that gives up is chrony's own measurement of RTC
+      # drift, which buys a sub-second-accurate clock at boot on a device that
+      # spends time powered off; what replaces it is the kernel's 11-minute
+      # copy, good to about a second. The trade is the right way round here —
+      # every window this node decides is measured in hours, and a node that
+      # has not yet reached a time source refuses those decisions regardless of
+      # how good its RTC was.
+      services.chrony.enableRTCTrimming = lib.mkDefault false;
+      services.chrony.extraConfig = "rtcsync";
+
       systemd.tmpfiles.settings = {
         "10-wayfinder" = {
           "/var/lib/wayfinder" = {

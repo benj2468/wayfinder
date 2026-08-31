@@ -286,6 +286,10 @@ ca-dashboard:
 #
 # `site-deploy` here is the *preview* path. Production goes out with the node,
 # from `wayfinder-ca.sh update` (or `wayfinder-ca.sh site` on its own).
+#
+# The Pages project itself is provisioned in `infra/oracle/site.tf`, and that
+# script reads its name out of `terraform.tfvars`. The default is repeated here
+# because a `just` recipe has no business parsing tfvars; rename in both places.
 
 [doc("Assemble the wayfndr.dev landing page into dist/site.")]
 site-build:
