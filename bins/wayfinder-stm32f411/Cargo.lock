@@ -1347,6 +1347,7 @@ dependencies = [
  "serde",
  "thiserror",
  "tracing",
+ "wayfinder-alarm",
  "wayfinder-auth",
  "zerocopy",
 ]

@@ -952,6 +952,94 @@ converge, which is the same shape as the benchmark hazard recorded in the root
 
 ---
 
+## 8.9 A second certificate could displace a live member's cached key — **fixed**
+
+The other of the two *measured* consequences of gap 4 (§5) found by the 2026-08
+sweep, and like §8.8 it is not blocked on the key↔address binding — so it too
+shipped ahead of §5 and holds whichever path §5 eventually takes. Unlike §8.8
+it is an **availability** attack, which §4's next-hop proof does not touch.
+
+### What happened
+
+`cache_neighbor` found a neighbour entry by `cert.mac` and overwrote it
+unconditionally. A second CA-signed certificate for a live member's MAC, under
+an attacker's key, therefore replaced the victim's cached entry on the next
+accepted OGM — and with it the pairwise key derived from that certificate.
+
+The pairwise key is symmetric ECDH, so the damage runs **both ways at once**:
+once the victim's cache holds the attacker's key, a directed frame the real
+member tagged fails `verify_directed`, and so does one the victim tags back.
+Measured at **0/6 delivery** against a delivered baseline — a total, sustained
+denial of one named member's authenticated data plane from a single misissued
+certificate. Nothing here lets the attacker *read* that traffic; it needs to
+win the route and answer a proof for that. It only has to make the address
+contested.
+
+This supersedes §6's remark that "`cache_neighbor` only ever overwrites an
+entry", which was true when that section was written.
+
+### The fix
+
+`cache_neighbor` refuses to replace a **live** member's `ed_pubkey` with a
+different one; a same-key renewal still caches. That makes a receiver no more
+permissive than its own authority, which enforces exactly this at issuance
+(`libs/wayfinder-server/src/authority.rs`): same identity key + new window is
+re-issued, a different key while the held certificate is inside its window is
+rejected, and revocation deliberately does not lift the lock.
+
+No new flow was needed — three mechanisms that already existed compose into
+one:
+
+- ingesting a revocation calls `evict_neighbor`, so a revoked member leaves no
+  entry for the rule to collide with;
+- a lapsed certificate is dropped by `evict_expired_neighbors` and read as
+  absent by `live_neighbor` (§6's fix), so the address frees itself once the
+  window is out;
+- re-admission is already modelled by `RevocationRecord::cancels`.
+
+Two edges are decided rather than inherited:
+
+- **An unset clock admits the new key.** `live_neighbor` calls everything live
+  when `now_unix == 0`, so mirroring it would make an unclocked node — an
+  embedded one has no wall clock today — refuse a legitimate re-key forever.
+  Such a node cannot judge certificate validity at all, and the authority
+  itself fails closed on a zero clock rather than locking addresses on one.
+- **The comparison is on `ed_pubkey` alone**, matching the authority's lock. An
+  agreement-key-only rotation is something the CA will sign for a live member,
+  so a wider rule would reject a certificate this mesh's own authority had just
+  issued.
+
+The OGM's verdict is deliberately untouched. The certificate really is
+CA-signed and its signature really does check out, so this stays a decision
+about what the node *caches*; binding the address to the key at verification
+time is §5's job.
+
+### Observability
+
+Paired with a new `AlarmKind::IdentityConflict`, raised against the contested
+address. Nothing is broken by the time the refusal fires, which is precisely
+why it has to be reported: a silently dropped loser presents to an operator as
+unexplained route flapping, with the real cause — an authority that issued
+twice for one address, or an anchor no longer under sole control — nowhere in
+view. `derive_mac` yields 46 bits, so an accidental collision is negligible
+(7.1e-9 at 1,000 nodes) and a deliberate one is days of GPU time; this is a
+credential-issuance condition far more often than an address-space one.
+
+### Reproduced by
+
+`red_team.py::attack_misissued_cert_overwrites_live_member`, now `HELD` (key
+never flips; 6/6 delivery under a 40 Hz flood of the second certificate). Unit
+coverage in `libs/wayfinder/src/auth.rs`, covering both the refusal and the
+four edges it must not swallow.
+
+### Still open
+
+§5 itself. This is defense in depth over it, not a replacement: gap 4 removes
+the precondition, and at 46 bits of derived address space the layering still
+earns its keep afterwards.
+
+---
+
 ## 9. Key file map for the implementer
 
 | File | Gaps | What changes |

@@ -293,6 +293,7 @@ pub fn alarm_title(kind: i32) -> &'static str {
         Ok(AlarmKind::TableSaturation) => "A table is full",
         Ok(AlarmKind::ClockUnsynchronized) => "The system clock is not synchronized",
         Ok(AlarmKind::SelfRevoked) => "This node has been revoked from the mesh",
+        Ok(AlarmKind::IdentityConflict) => "Two keys are claiming one address",
         // A node newer than this build, holding a condition it has no name for.
         // Named as unrecognised rather than hidden: a dashboard that silently
         // dropped the alarms it did not understand would report a node under
@@ -318,6 +319,7 @@ pub fn alarm_code(kind: i32) -> &'static str {
         Ok(AlarmKind::TableSaturation) => "table_saturation",
         Ok(AlarmKind::ClockUnsynchronized) => "clock_unsynchronized",
         Ok(AlarmKind::SelfRevoked) => "self_revoked",
+        Ok(AlarmKind::IdentityConflict) => "identity_conflict",
         _ => "unknown",
     }
 }

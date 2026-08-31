@@ -17,6 +17,14 @@ interfaces.workspace = true
 zerocopy.workspace = true
 batman.workspace = true
 wayfinder-auth.workspace = true
+# The node's alarm board, for the one condition this crate detects that an
+# operator has to be told about: two identity keys claiming one mesh address.
+# `wayfinder-alarm` is unconditionally `no_std`-capable — it declares no
+# features at all, and pins `default-features = false` on its own `tracing` and
+# `wayfinder-log`. That, not the workspace entry's own `default-features =
+# false`, is what keeps this crate's `no_std` build intact; the workspace entry
+# is belt-and-braces against a `std` default appearing there later.
+wayfinder-alarm.workspace = true
 heapless.workspace = true
 embedded-io-async.workspace = true
 # Pinned directly (not workspace inheritance) so `default-features = false`

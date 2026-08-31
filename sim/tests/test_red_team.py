@@ -66,7 +66,7 @@ BASELINE = {
     "attack_proof_starvation_by_neighbour_count": red_team.HELD,
     # --- 2026-08 sweep: certificate issuance / identity / enrollment ---
     "attack_reserved_address_originator": red_team.HELD,
-    "attack_misissued_cert_overwrites_live_member": red_team.GAP,
+    "attack_misissued_cert_overwrites_live_member": red_team.HELD,
     "attack_unbounded_validity_window": red_team.BY_DESIGN,
     "attack_degenerate_validity_window": red_team.HELD,
     "attack_fail_open_bridge_containment": red_team.HELD,
