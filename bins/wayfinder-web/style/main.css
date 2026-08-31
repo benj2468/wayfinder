@@ -5,8 +5,10 @@
  * editing tokens here rather than hunting class names through the components:
  * no component hard-codes a colour, a radius, or a spacing step.
  *
- * Cyan accent to match the TUI's (`ui.rs`'s `ACCENT`), so an operator moving
- * between the two dashboards reads the same signal the same way.
+ * The palette is the product's own: paper and ink from wayfndr.dev, with the
+ * brand red as the accent. Note the divergence this creates — the TUI's
+ * `ui.rs` still uses `ACCENT = Color::Cyan`, so the two dashboards no longer
+ * signal with the same colour. Change both or neither.
  */
 
 /* ---------------------------------------------------------------- tokens -- */
@@ -37,30 +39,43 @@
   --wf-text-base: 0.9375rem;
   --wf-text-lg: 1.125rem;
 
-  /* Dark is the default: this sits alongside a terminal. */
-  --wf-bg: #0f1115;
-  --wf-surface: #171a21;
-  --wf-surface-raised: #1e222b;
-  --wf-border: #2a2f3a;
-  --wf-text: #e6e9ef;
-  --wf-text-muted: #949bab;
-  --wf-text-faint: #6b7280;
+  /* Dark is the default: this sits alongside a terminal. Ink rather than the
+   * blue-grey it used to be, so it is the same near-black as wayfndr.dev. */
+  --wf-bg: #0a0a0a;
+  --wf-surface: #131519;
+  --wf-surface-raised: #1c1f25;
+  --wf-border: #2c2d33;
+  --wf-text: #e9e7e2;
+  --wf-text-muted: #a6a199;
+  --wf-text-faint: #7c776e;
 
-  --wf-accent: #4cc2ff;
-  --wf-accent-dim: rgb(76 194 255 / 14%);
+  /* Brand red, lifted on the dark surface the way the logo dot is. */
+  --wf-accent: #e8483f;
+  --wf-accent-dim: rgb(232 72 63 / 16%);
 
-  /* The logo's dot. Brand red is `#d43735`; on the dark surface it is lifted to
-   * hold its own against `--wf-text`, which is near-white here. Not part of the
-   * status ramp above — it is identity, and never encodes a value. */
   --wf-logo-dot: #e8483f;
 
   /* Status ramp. Warm pulls the eye, cold recedes — the same reasoning as the
    * TUI's log-level colouring, so a screenful reads before any of the words
-   * do. */
-  --wf-ok: #4ade80;
-  --wf-warn: #fbbf24;
-  --wf-error: #f87171;
-  --wf-idle: #6b7280;
+   * do. Deliberately *not* built from --wf-accent: see the severity note by
+   * `.wf-sev-info` for why info is neutral rather than accent-coloured. */
+  --wf-ok: #5fbf84;
+  --wf-warn: #d9a441;
+  --wf-error: #f4685c;
+  --wf-idle: #7c776e;
+
+  /* Informational severity. Its own token rather than --wf-accent: the accent
+   * is brand red, and an info alarm that borrowed it would be the same colour
+   * as a critical one. The ramp has to stay neutral → amber → red. */
+  --wf-info: #8f99ad;
+
+  /* The fill on a committing button. Ink rather than the accent, for the same
+   * reason wayfndr.dev's own CTA is black: a solid red button reads as
+   * *destructive*, and `.wf-button-danger` below is deliberately only
+   * outlined — so an accent fill would make the safe action louder and redder
+   * than the dangerous one. */
+  --wf-primary: #e9e7e2;
+  --wf-primary-ink: #0a0a0a;
 
   --wf-shadow: 0 1px 2px rgb(0 0 0 / 30%);
 
@@ -74,23 +89,33 @@
 
 @media (prefers-color-scheme: light) {
   :root {
-    --wf-bg: #f6f7f9;
-    --wf-surface: #ffffff;
-    --wf-surface-raised: #f0f2f5;
-    --wf-border: #d8dce3;
-    --wf-text: #1a1d23;
-    --wf-text-muted: #5b6472;
-    --wf-text-faint: #8b93a1;
+    /* Paper, not white: the same warm ground as wayfndr.dev. */
+    --wf-bg: #e9e7e2;
+    --wf-surface: #f3f1ed;
+    --wf-surface-raised: #dedbd4;
+    --wf-border: #cbc7be;
+    --wf-text: #16171a;
+    --wf-text-muted: #55524c;
+    --wf-text-faint: #68655d;
 
-    --wf-accent: #0369a1;
-    --wf-accent-dim: rgb(3 105 161 / 10%);
+    /* One step darker than the brand's #d43735, which lands at 4.23:1 on this
+     * surface. The accent carries real text here (tab labels, links), not the
+     * ornament it is on wayfndr.dev, so it has to clear AA rather than look
+     * right beside a headline. The logo dot below keeps the exact brand value —
+     * it is identity, and never has to be read. */
+    --wf-accent: #c72f2d;
+    --wf-accent-dim: rgb(199 47 45 / 10%);
 
     --wf-logo-dot: #d43735;
 
-    --wf-ok: #15803d;
-    --wf-warn: #b45309;
-    --wf-error: #b91c1c;
-    --wf-idle: #8b93a1;
+    --wf-ok: #2a7047;
+    --wf-warn: #966016;
+    --wf-error: #b3211d;
+    --wf-idle: #8b8880;
+    --wf-info: #5c6472;
+
+    --wf-primary: #16171a;
+    --wf-primary-ink: #f3f1ed;
 
     --wf-shadow: 0 1px 2px rgb(0 0 0 / 8%);
 
@@ -99,7 +124,7 @@
      * keeps the card's own white and the shadow alone does the lifting. */
     --wf-hint-surface: var(--wf-surface);
     --wf-hint-shadow:
-      0 12px 28px rgb(15 17 21 / 16%), 0 2px 6px rgb(15 17 21 / 10%);
+      0 12px 28px rgb(10 10 10 / 16%), 0 2px 6px rgb(10 10 10 / 10%);
   }
 }
 
@@ -132,13 +157,16 @@ body {
   background: var(--wf-surface);
 }
 
+/* The wordmark is ink, not accent: on wayfndr.dev the word is text-coloured
+ * and only the dot carries the red. Now that the accent *is* the red, taking
+ * it here would paint the whole name. */
 .wf-brand {
   display: flex;
   align-items: center;
   gap: var(--wf-space-2);
   font-weight: 600;
   letter-spacing: 0.02em;
-  color: var(--wf-accent);
+  color: var(--wf-text);
 }
 
 /* The mark sizes off the text around it rather than a fixed pixel height, so it
@@ -341,7 +369,7 @@ body {
 
 .wf-sev-info .wf-alarm-mark,
 .wf-sev-info.wf-alarm-row .wf-alarm-row-mark {
-  color: var(--wf-accent);
+  color: var(--wf-info);
 }
 
 .wf-sev-warning .wf-alarm-mark,
@@ -431,7 +459,7 @@ body {
 }
 
 .wf-sev-info.wf-alarm-row {
-  border-left-color: var(--wf-accent);
+  border-left-color: var(--wf-info);
 }
 
 .wf-sev-warning.wf-alarm-row {
@@ -1261,15 +1289,15 @@ body {
  * unambiguous without reading both. */
 .wf-button-primary {
   border-color: transparent;
-  background: var(--wf-accent);
-  color: var(--wf-bg);
+  background: var(--wf-primary);
+  color: var(--wf-primary-ink);
   font-weight: 500;
 }
 
 .wf-button-primary:hover {
   border-color: transparent;
-  background: var(--wf-accent);
-  color: var(--wf-bg);
+  background: var(--wf-primary);
+  color: var(--wf-primary-ink);
   filter: brightness(1.1);
 }
 

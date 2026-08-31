@@ -25,6 +25,7 @@
 #   install     Install NixOS over the stock image          (DESTRUCTIVE, once)
 #   secrets     Copy the offline-minted trust material onto the node
 #   update      Roll out a config/code change               (nixos-rebuild)
+#   site        Publish the wayfndr.dev landing page        (Cloudflare Pages)
 #   purge       Drop the dashboard bundle from Cloudflare's cache
 #   verify      Prove the CA answers and the tunnel plane is serving
 #   status      Where it is and what it is doing
@@ -468,6 +469,59 @@ cmd_purge() {
     purge_dashboard_cache
 }
 
+# The landing page is static and shares no code with the node, so it used to
+# ship from its own CI job on every push to the default branch. It rides with
+# the rollout instead: the page describes what this deployment is running, and
+# a page that has already announced a change the box has not taken is the wrong
+# way round. Never fatal, for the same reason the cache purge is not — the node
+# is already updated by the time this runs.
+deploy_site() {
+    local code=0
+
+    if ! command -v npx >/dev/null 2>&1; then
+        warn "npx not found, so the landing page was not published.
+Install Node, then run '$0 site'."
+        return 0
+    fi
+
+    load_cf_token
+    if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+        warn "no Cloudflare API token, so the landing page was not published.
+Put the token in $CF_TOKEN_FILE and run '$0 site'."
+        return 0
+    fi
+
+    info "building the landing page"
+    if ! (cd "$REPO_ROOT" && ./scripts/build-site.sh dist/site); then
+        warn "the landing page did not build, so nothing was published.
+  ./scripts/build-site.sh dist/site"
+        return 0
+    fi
+
+    info "publishing to Cloudflare Pages (wayfinder-site)"
+    (cd "$REPO_ROOT" && npx --yes wrangler@4 pages deploy dist/site \
+        --project-name wayfinder-site \
+        --branch main \
+        --commit-dirty=true) || code=$?
+
+    if [[ "$code" == 0 ]]; then
+        info "landing page published"
+        return 0
+    fi
+
+    # The token this script already holds is scoped for DNS, Tunnel and cache
+    # purge; Pages is a separate permission and is implied by none of them.
+    warn "the publish was refused (exit $code), so wayfndr.dev still serves the previous build.
+Most likely the API token lacks Cloudflare Pages:Edit — add it at
+https://dash.cloudflare.com/profile/api-tokens and run '$0 site'."
+}
+
+# Standalone as well as part of `update`: a copy change under www/ is worth
+# shipping without rebuilding the node it sits in front of.
+cmd_site() {
+    deploy_site
+}
+
 cmd_update() {
     need nixos-rebuild
     local ip; ip="$(ca_ip)"
@@ -485,6 +539,7 @@ cmd_update() {
     # moment the switch returns, and until this runs Cloudflare goes on serving
     # the old one to everybody.
     purge_dashboard_cache
+    deploy_site
     info "rolled out; 'wayfinder-ca.sh verify' to confirm it still answers"
 }
 
@@ -912,6 +967,7 @@ main() {
         install)   cmd_install "$@" ;;
         secrets)   cmd_secrets "$@" ;;
         update)    cmd_update "$@" ;;
+        site)      cmd_site "$@" ;;
         purge)     cmd_purge "$@" ;;
         verify)    cmd_verify "$@" ;;
         status)    cmd_status "$@" ;;

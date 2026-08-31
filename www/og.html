@@ -1,0 +1,161 @@
+<!doctype html>
+<!--
+  Source for og.png, the 1200x630 social preview card.
+
+  It is a page rather than a hand-drawn SVG because Open Graph consumers
+  (Slack, iMessage, LinkedIn, X) will not render SVG — it has to be a raster —
+  and rendering this at exactly 1200x630 in a headless browser is a reliable
+  way to get one that stays in sync with the site's own type and palette.
+
+  Regenerate with (from the repo root):
+
+    just site-build
+    cp www/og.html dist/site/          # build-site.sh strips it from the output
+    npx --yes playwright screenshot \
+      --viewport-size=1200,630 --wait-for-timeout=1200 \
+      dist/site/og.html www/og.png
+
+  `scripts/build-site.sh` deletes this file from the output, so it is never
+  published as a page; only the committed og.png ships.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Wayfinder — social card</title>
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=JetBrains+Mono:wght@500&family=Space+Grotesk:wght@600;700&display=swap"
+    />
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+      }
+
+      body {
+        width: 1200px;
+        height: 630px;
+        overflow: hidden;
+        background-color: #e9e7e2;
+        /* The page's paper grain is deliberately NOT reproduced here. Fractal
+       noise is worst-case for PNG's predictive compression — it took this card
+       from ~60KB to over 500KB — and at social-card scale it is invisible. */
+        color: #16171a;
+        font-family: Inter, system-ui, sans-serif;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        padding: 72px 80px;
+        position: relative;
+      }
+
+      .bloom {
+        position: absolute;
+        inset: -20% -25% auto auto;
+        width: 780px;
+        height: 780px;
+        background: radial-gradient(
+          circle,
+          rgb(255 255 255 / 75%),
+          rgb(255 255 255 / 0%) 62%
+        );
+      }
+
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        position: relative;
+      }
+      .mark {
+        width: 52px;
+      }
+
+      .word {
+        font-family: "Space Grotesk", sans-serif;
+        font-weight: 600;
+        font-size: 30px;
+        letter-spacing: -0.02em;
+      }
+
+      h1 {
+        font-family: "Space Grotesk", sans-serif;
+        font-weight: 700;
+        font-size: 86px;
+        line-height: 0.99;
+        letter-spacing: -0.04em;
+        position: relative;
+        max-width: 16ch;
+      }
+
+      .sub {
+        font-size: 25px;
+        line-height: 1.45;
+        color: #55524c;
+        max-width: 40ch;
+        margin-top: 26px;
+        position: relative;
+      }
+
+      .foot {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        border-top: 1px solid #cbc7be;
+        padding-top: 26px;
+        position: relative;
+      }
+
+      .tags {
+        display: flex;
+        gap: 30px;
+      }
+
+      .tag {
+        font-family: "JetBrains Mono", monospace;
+        font-size: 16px;
+        letter-spacing: 0.13em;
+        text-transform: uppercase;
+        color: #55524c;
+      }
+
+      .url {
+        font-family: "JetBrains Mono", monospace;
+        font-size: 18px;
+        letter-spacing: 0.05em;
+      }
+
+      .url b {
+        color: #d43735;
+        font-weight: 500;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="bloom"></div>
+
+    <div class="row">
+      <img class="mark" src="/wayfinder-mark.svg" alt="" />
+      <span class="word">Wayfinder</span>
+    </div>
+
+    <div>
+      <h1>Networks that survive the field.</h1>
+      <p class="sub">
+        Mesh routing that unifies radio, wired and tunnelled links into one
+        self&#8209;healing network, from an IoT microcontroller to a
+        data&#8209;center server.
+      </p>
+    </div>
+
+    <div class="foot">
+      <div class="tags">
+        <span class="tag">Runs anywhere</span>
+        <span class="tag">Zero allocation</span>
+        <span class="tag">Signed membership</span>
+      </div>
+      <span class="url">wayfndr<b>.</b>dev</span>
+    </div>
+  </body>
+</html>

@@ -274,6 +274,36 @@ ca-dashboard:
     ./scripts/wayfinder-ca.sh dashboard
 
 # ---------------------------------------------------------------------------
+# wayfndr.dev landing page
+# ---------------------------------------------------------------------------
+#
+# `www/` is a hand-authored static site with no framework and no bundler, so
+# "building" it is assembling a directory: the page's own files plus the logo,
+# which is pulled in from `assets/logo/` rather than copied into `www/` so the
+# mark keeps one source of truth. `scripts/build-site.sh` does that, and
+# `wayfinder-ca.sh` calls the same script — a local `just site-deploy` and a CA
+# rollout upload byte-identical directories.
+#
+# `site-deploy` here is the *preview* path. Production goes out with the node,
+# from `wayfinder-ca.sh update` (or `wayfinder-ca.sh site` on its own).
+
+[doc("Assemble the wayfndr.dev landing page into dist/site.")]
+site-build:
+    ./scripts/build-site.sh
+
+[doc("Serve the built landing page at http://127.0.0.1:8899.")]
+site-serve: site-build
+    @echo "wayfndr.dev preview -> http://127.0.0.1:8899"
+    cd dist/site && python3 -m http.server 8899
+
+[doc("Deploy the landing page to Cloudflare Pages (needs CLOUDFLARE_API_TOKEN).")]
+site-deploy branch="main": site-build
+    npx --yes wrangler@4 pages deploy dist/site \
+        --project-name wayfinder-site \
+        --branch {{ branch }} \
+        --commit-dirty=true
+
+# ---------------------------------------------------------------------------
 # libs/wayfinder-py
 # ---------------------------------------------------------------------------
 #
