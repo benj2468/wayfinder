@@ -1,0 +1,26 @@
+# Cloudflare Pages reads this file from the deployed directory root.
+#
+# The site is static, first-party, and has no forms, no cookies and no
+# analytics — so the policy can be far tighter than a typical marketing page.
+# The only third party is Google Fonts (stylesheet from fonts.googleapis.com,
+# font files from fonts.gstatic.com); if the fonts are ever self-hosted, drop
+# both hosts from the CSP rather than leaving them in "just in case".
+/*
+  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: geolocation=(), microphone=(), camera=(), interest-cohort=()
+  Strict-Transport-Security: max-age=31536000; includeSubDomains
+
+# Content-addressed assets these are not, so they cannot be cached forever: a
+# deploy replaces styles.css in place. An hour is short enough that a fix is
+# live the same morning and long enough that a repeat visit costs nothing.
+/styles.css
+  Cache-Control: public, max-age=3600, must-revalidate
+
+/mesh.js
+  Cache-Control: public, max-age=3600, must-revalidate
+
+# The logo is versioned by the repo, not the URL, and changes about never.
+/*.svg
+  Cache-Control: public, max-age=86400

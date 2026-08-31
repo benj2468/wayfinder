@@ -340,6 +340,12 @@
                 # NixOS over the stock image the provider booted.
                 opentofu
                 nixos-anywhere
+                # The wayfndr.dev landing page (`www/`) has no build step, but
+                # its deploy does: `wrangler pages deploy` is npm-distributed,
+                # and `prettier` is what treefmt formats the page with. Node is
+                # here for those two and nothing else — the site itself ships
+                # no JavaScript toolchain.
+                nodejs_22
               ]
               ++ (pkgs.lib.optionals pkgs.stdenv.isLinux onlyLinuxPkgs);
 
@@ -437,7 +443,18 @@
               dockerfmt.enable = true;
               shellcheck.enable = true;
               stylua.enable = true;
+              # Scoped to `www/` below. Left unscoped, prettier's default
+              # includes sweep in every Markdown, YAML and JSON file in the
+              # repo and reformat them, which is a large unrelated diff and
+              # would fight `yamlfmt` over the YAML.
+              prettier.enable = true;
             };
+
+            settings.formatter.prettier.includes = pkgs.lib.mkForce [
+              "www/*.html"
+              "www/*.css"
+              "www/*.js"
+            ];
 
             settings.formatter.rustfmt =
               let

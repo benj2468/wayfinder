@@ -1,0 +1,1246 @@
+/* Wayfinder — wayfndr.dev landing page.
+ *
+ * The palette is the logo's, not a new one: warm paper (#E4E2DE was the
+ * artwork's reference ground), near-black ink, and the mark's red used only as
+ * an accent. That reads as a technical document rather than a SaaS gradient,
+ * which is the register this product should be sold in.
+ *
+ * The page commits to one light theme deliberately. A dashboard has to follow
+ * the operator's environment; a marketing page has one job and is better for
+ * choosing a look. Rhythm comes from alternating paper and ink SECTIONS, not
+ * from a colour-scheme toggle. See `.section--ink`, which re-points the same
+ * tokens rather than overriding every rule inside it.
+ */
+
+/* ---------------------------------------------------------------- tokens -- */
+
+:root {
+  --paper: #e9e7e2;
+  --paper-2: #f3f1ed;
+  --paper-3: #dedbd4;
+  --ink: #0a0a0a;
+  --ink-2: #131519;
+  --ink-3: #1c1f25;
+
+  --text: #16171a;
+  --muted: #55524c;
+  /* Darkened from the mark's mid-grey until it clears WCAG AA (4.5:1) on
+   * --paper at body sizes. This tier carries real copy — the hero note, the
+   * diagram caption — not just ornament, so "faint" here means recessive,
+   * not unreadable. */
+  --faint: #68655d;
+  --rule: #cbc7be;
+  --rule-soft: #dcd8d0;
+
+  --red: #d43735;
+  --red-ink: #e8483f;
+  --red-wash: rgb(212 55 53 / 8%);
+
+  --ok: #2f7d4f;
+  --warn: #a86718;
+
+  --f-ui:
+    Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    sans-serif;
+  --f-display: "Space Grotesk", Inter, ui-sans-serif, system-ui, sans-serif;
+  --f-mono:
+    "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --wrap: 1180px;
+  --gut: clamp(1.25rem, 4vw, 3rem);
+  --sec-y: clamp(3.25rem, 6vw, 5.5rem);
+  --r: 10px;
+  --r-lg: 16px;
+
+  --ease: cubic-bezier(0.2, 0.7, 0.25, 1);
+}
+
+/* ------------------------------------------------------------------ base -- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+  /* Anchored sections must clear the sticky header. */
+  scroll-padding-top: 5.5rem;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: var(--paper);
+  /* A very faint grain. Without it a flat warm field reads as "unfinished
+   * beige" at large sizes; with it, as paper. Kept low enough to be felt
+   * rather than seen, and it is a data URI so it costs no request. */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='0.055'/%3E%3C/svg%3E");
+  color: var(--text);
+  font-family: var(--f-ui);
+  font-size: 17px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden;
+}
+
+img,
+svg {
+  max-width: 100%;
+}
+
+a {
+  color: inherit;
+}
+
+p {
+  margin: 0 0 1em;
+}
+
+code {
+  font-family: var(--f-mono);
+  font-size: 0.88em;
+  background: var(--paper-3);
+  padding: 0.1em 0.36em;
+  border-radius: 4px;
+}
+
+.wrap {
+  width: 100%;
+  max-width: var(--wrap);
+  margin-inline: auto;
+  padding-inline: var(--gut);
+}
+
+.skip {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  background: var(--ink);
+  color: var(--paper-2);
+  padding: 0.75rem 1rem;
+  z-index: 100;
+}
+
+.skip:focus {
+  left: 0;
+}
+
+:focus-visible {
+  outline: 2px solid var(--red);
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+
+/* --------------------------------------------------------------- shared -- */
+
+.eyebrow {
+  font-family: var(--f-mono);
+  font-size: 0.7rem;
+  font-weight: 500;
+  letter-spacing: 0.17em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0 0 1.15rem;
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+}
+
+/* The short rule after the label is the page's one repeating ornament; it is
+ * what ties a section header to the terminal/spec-sheet register. */
+.eyebrow::after {
+  content: "";
+  flex: 0 0 2.5rem;
+  height: 1px;
+  background: var(--red);
+}
+
+.eyebrow--tight {
+  margin-bottom: 0.5rem;
+}
+
+.section__title,
+.pilot__title {
+  font-family: var(--f-display);
+  font-weight: 600;
+  font-size: clamp(1.95rem, 3.6vw, 2.9rem);
+  line-height: 1.08;
+  letter-spacing: -0.025em;
+  margin: 0 0 1.1rem;
+  max-width: 22ch;
+}
+
+.section__lede,
+.lede {
+  font-size: clamp(1.02rem, 1.35vw, 1.19rem);
+  line-height: 1.62;
+  color: var(--muted);
+  max-width: 62ch;
+  margin: 0 0 1.25em;
+}
+
+.section {
+  padding-block: var(--sec-y);
+  border-top: 1px solid var(--rule-soft);
+}
+
+.section--alt {
+  background: linear-gradient(
+    180deg,
+    rgb(255 255 255 / 45%),
+    rgb(255 255 255 / 0%)
+  );
+}
+
+/* ---------------------------------------------------------------- button -- */
+
+.btn {
+  --btn-bg: transparent;
+  --btn-fg: var(--text);
+  --btn-bd: var(--rule);
+
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.82rem 1.35rem;
+  border: 1px solid var(--btn-bd);
+  border-radius: var(--r);
+  background: var(--btn-bg);
+  color: var(--btn-fg);
+  font: 500 0.95rem/1 var(--f-ui);
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    transform 0.16s var(--ease),
+    background-color 0.16s var(--ease),
+    border-color 0.16s var(--ease),
+    box-shadow 0.16s var(--ease);
+}
+
+.btn:hover {
+  transform: translateY(-1px);
+}
+
+.btn:active {
+  transform: translateY(0);
+}
+
+.btn--primary {
+  --btn-bg: var(--ink);
+  --btn-fg: #f5f3ef;
+  --btn-bd: var(--ink);
+
+  box-shadow: 0 1px 2px rgb(10 10 10 / 18%);
+}
+
+.btn--primary:hover {
+  --btn-bg: #22242a;
+
+  box-shadow: 0 6px 18px rgb(10 10 10 / 20%);
+}
+
+.btn--ghost:hover {
+  --btn-bd: var(--ink);
+  --btn-bg: rgb(255 255 255 / 55%);
+}
+
+.btn--sm {
+  padding: 0.6rem 1rem;
+  font-size: 0.875rem;
+}
+
+.btn--block {
+  width: 100%;
+  margin-bottom: 0.6rem;
+}
+
+.btn__icon {
+  width: 15px;
+  height: 15px;
+  opacity: 0.65;
+}
+
+/* ------------------------------------------------------------------- nav -- */
+
+.nav {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  background: rgb(233 231 226 / 82%);
+  backdrop-filter: blur(12px) saturate(1.3);
+  border-bottom: 1px solid transparent;
+  transition:
+    border-color 0.2s var(--ease),
+    background-color 0.2s var(--ease);
+}
+
+.nav.is-stuck {
+  border-bottom-color: var(--rule);
+  background: rgb(233 231 226 / 94%);
+}
+
+.nav__inner {
+  display: flex;
+  align-items: center;
+  gap: 2rem;
+  height: 4.4rem;
+}
+
+.nav__brand {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  text-decoration: none;
+  margin-right: auto;
+}
+
+.nav__mark {
+  width: 34px;
+  height: auto;
+  display: block;
+}
+
+.nav__word {
+  font-family: var(--f-display);
+  font-weight: 600;
+  font-size: 1.06rem;
+  letter-spacing: -0.02em;
+}
+
+.nav__links {
+  display: flex;
+  gap: 1.75rem;
+}
+
+.nav__links a {
+  font-size: 0.92rem;
+  color: var(--muted);
+  text-decoration: none;
+  position: relative;
+  padding-block: 0.25rem;
+  transition: color 0.16s var(--ease);
+}
+
+.nav__links a::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -2px;
+  height: 1.5px;
+  background: var(--red);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 0.22s var(--ease);
+}
+
+.nav__links a:hover {
+  color: var(--text);
+}
+
+.nav__links a:hover::after {
+  transform: scaleX(1);
+}
+
+/* ------------------------------------------------------------------ hero -- */
+
+.hero {
+  padding-block: clamp(3rem, 6vw, 5rem) clamp(3.5rem, 7vw, 6rem);
+  position: relative;
+  overflow: hidden;
+}
+
+/* A single soft warm bloom behind the visual, so the hero has depth without a
+ * gradient that would fight the paper. */
+.hero::before {
+  content: "";
+  position: absolute;
+  top: -30%;
+  right: -10%;
+  width: 70vw;
+  height: 70vw;
+  max-width: 900px;
+  max-height: 900px;
+  background: radial-gradient(
+    circle,
+    rgb(255 255 255 / 70%) 0%,
+    rgb(255 255 255 / 0%) 62%
+  );
+  pointer-events: none;
+}
+
+.hero__grid {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.06fr);
+  gap: clamp(2.5rem, 5vw, 4.5rem);
+  align-items: center;
+}
+
+.hero__title {
+  font-family: var(--f-display);
+  font-weight: 700;
+  font-size: clamp(2.7rem, 5.6vw, 4.3rem);
+  line-height: 1.01;
+  letter-spacing: -0.038em;
+  margin: 0 0 1.3rem;
+}
+
+.hero__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 2rem;
+}
+
+.hero__note {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  max-width: 46ch;
+  margin: 1.75rem 0 0;
+  font-size: 0.875rem;
+  color: var(--faint);
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--red);
+  flex: none;
+  /* Aligns the dot to the first line's optical centre rather than the centre
+   * of a block that wraps to two. */
+  margin-top: 0.5em;
+  box-shadow: 0 0 0 0 rgb(212 55 53 / 45%);
+  animation: pulse 2.6s var(--ease) infinite;
+}
+
+@keyframes pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgb(212 55 53 / 45%);
+  }
+
+  70%,
+  100% {
+    box-shadow: 0 0 0 9px rgb(212 55 53 / 0%);
+  }
+}
+
+/* ------------------------------------------------------- hero visual -- */
+
+.viz {
+  margin: 0;
+}
+
+.viz__frame {
+  position: relative;
+  background: var(--paper-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-lg);
+  padding: 0.5rem;
+  box-shadow:
+    0 1px 2px rgb(10 10 10 / 5%),
+    0 18px 44px rgb(10 10 10 / 8%);
+  /* A faint engineering grid under the graph — the sheet the diagram is drawn
+   * on, and it makes the node motion legible against something fixed. */
+  background-image:
+    linear-gradient(rgb(10 10 10 / 4%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(10 10 10 / 4%) 1px, transparent 1px);
+  background-size: 26px 26px;
+}
+
+#mesh {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.viz__hud {
+  position: absolute;
+  left: 1.1rem;
+  bottom: 1.1rem;
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  font-family: var(--f-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  background: rgb(243 241 237 / 88%);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 0.3rem 0.6rem;
+}
+
+.viz__hud-label {
+  color: var(--faint);
+}
+
+.viz__hud-value {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.viz__hud-value.is-alarm {
+  color: var(--red);
+}
+
+.viz__cap {
+  margin-top: 0.9rem;
+  font-size: 0.83rem;
+  line-height: 1.5;
+  color: var(--faint);
+  max-width: 46ch;
+}
+
+/* mesh graph primitives (driven by mesh.js) */
+.mesh-link {
+  stroke: #b9b4a9;
+  stroke-width: 1.5;
+  transition:
+    stroke 0.4s var(--ease),
+    opacity 0.4s var(--ease);
+}
+
+.mesh-link.is-down {
+  stroke: var(--red);
+  stroke-dasharray: 4 5;
+  opacity: 0.5;
+}
+
+.mesh-route {
+  stroke: var(--ink);
+  stroke-width: 2.25;
+  stroke-linecap: round;
+  fill: none;
+}
+
+.mesh-node {
+  fill: var(--paper-2);
+  stroke: var(--ink);
+  stroke-width: 1.75;
+}
+
+.mesh-node.is-endpoint {
+  fill: var(--ink);
+}
+
+.mesh-halo {
+  fill: none;
+  stroke: var(--red);
+  stroke-width: 1.5;
+}
+
+.mesh-packet {
+  fill: var(--red);
+}
+
+.mesh-label {
+  font-family: var(--f-mono);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  fill: var(--faint);
+  text-transform: uppercase;
+  /* The endpoint labels sit where links pass. `paint-order: stroke` draws the
+   * halo *under* the glyphs, so a label crossing a link stays readable without
+   * needing a background rect that would have to be sized to the text. */
+  paint-order: stroke;
+  stroke: var(--paper-2);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
+/* ----------------------------------------------------------------- proof -- */
+
+.proof {
+  border-top: 1px solid var(--rule);
+  border-bottom: 1px solid var(--rule);
+  background: rgb(255 255 255 / 34%);
+}
+
+.proof__grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.proof__item {
+  padding: 2rem 1.6rem 2.1rem 0;
+  border-right: 1px solid var(--rule-soft);
+}
+
+.proof__item:first-child {
+  padding-left: 0;
+}
+
+.proof__item:last-child {
+  border-right: 0;
+  padding-right: 0;
+}
+
+.proof__item + .proof__item {
+  padding-left: 1.6rem;
+}
+
+.proof__k {
+  font-family: var(--f-mono);
+  font-size: 0.95rem;
+  font-weight: 500;
+  margin: 0 0 0.5rem;
+  color: var(--text);
+  /* Reserve two lines so a heading that wraps does not push its own body copy
+   * out of line with the three columns beside it. */
+  min-height: 3.2em;
+}
+
+.proof__v {
+  margin: 0;
+  font-size: 0.86rem;
+  line-height: 1.55;
+  color: var(--muted);
+}
+
+/* ------------------------------------------------------------- 3 columns -- */
+
+.cols {
+  display: grid;
+  gap: clamp(1.75rem, 3.5vw, 3rem);
+  margin-top: 3.25rem;
+}
+
+.cols--3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.col {
+  border-top: 2px solid var(--ink);
+  padding-top: 1.1rem;
+}
+
+.col__num {
+  font-family: var(--f-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  color: var(--red);
+  margin: 0 0 0.6rem;
+}
+
+.col__title {
+  font-family: var(--f-display);
+  font-size: 1.22rem;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  margin: 0 0 0.55rem;
+}
+
+.col p:last-child {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.94rem;
+}
+
+/* -------------------------------------------------------------- features -- */
+
+.feat {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.25rem;
+  margin-top: 3.25rem;
+}
+
+.feat__card {
+  background: var(--paper-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-lg);
+  padding: clamp(1.5rem, 2.5vw, 2.1rem);
+  transition:
+    border-color 0.2s var(--ease),
+    box-shadow 0.2s var(--ease),
+    transform 0.2s var(--ease);
+}
+
+/* Two of the four feature cards explain something inherently spatial — where
+ * the same routing runs, and how several links meet at one node. A drawing
+ * states either in a fraction of the words the paragraph needed, which is why
+ * these two cards carry one and the other two do not. */
+.dia {
+  display: block;
+  width: 100%;
+  /* The drawing is scaled by its container, so cap it: in a single-column card
+   * an uncapped viewBox would render these 11px labels at nearly 20px. */
+  max-width: 420px;
+  height: auto;
+  margin: 0 0 1.15rem;
+}
+
+.dia__box {
+  fill: var(--paper);
+  stroke: var(--rule);
+  stroke-width: 1;
+}
+
+.dia__link {
+  fill: none;
+  stroke: var(--rule);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+}
+
+.dia__node,
+.dia__bus {
+  fill: var(--ink);
+}
+
+.dia__t,
+.dia__bus-t,
+.dia__node-t {
+  font-family: var(--f-mono);
+  font-size: 11px;
+  text-anchor: middle;
+}
+
+.dia__t {
+  fill: var(--muted);
+}
+
+.dia__bus-t,
+.dia__node-t {
+  fill: var(--paper);
+}
+
+.dia__node-t {
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+}
+
+.feat__card:hover {
+  border-color: #b6b0a4;
+  transform: translateY(-2px);
+  box-shadow: 0 10px 30px rgb(10 10 10 / 7%);
+}
+
+.feat__icon {
+  width: 42px;
+  height: 42px;
+  border-radius: 9px;
+  background: var(--ink);
+  display: grid;
+  place-items: center;
+  margin-bottom: 1.15rem;
+}
+
+.feat__icon svg {
+  width: 24px;
+  height: 24px;
+  fill: none;
+  stroke: #f3f1ed;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* The encryption card is a menu rather than an argument: three tiers a buyer
+ * picks from, so it is set as a keyed list instead of the prose the other
+ * cards carry. */
+.tiers {
+  list-style: none;
+  /* `.feat__card p` zeroes paragraph margins, so the lede above this list has
+   * nothing holding it off the first tier label. */
+  margin: 1.25rem 0 0;
+  padding: 0;
+}
+
+.tiers li {
+  border-top: 1px solid var(--rule-soft);
+  padding: 0.85rem 0 0;
+  margin-top: 0.85rem;
+  /* Match the card's own paragraph register — these are body copy, not list
+   * items in a different voice. */
+  color: var(--muted);
+  font-size: 0.94rem;
+}
+
+.tiers li:first-child {
+  border-top: 0;
+  padding-top: 0;
+  margin-top: 0;
+}
+
+.tiers__k {
+  display: block;
+  font-family: var(--f-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--red);
+  margin-bottom: 0.3rem;
+}
+
+.feat__title {
+  font-family: var(--f-display);
+  font-size: 1.28rem;
+  font-weight: 600;
+  letter-spacing: -0.018em;
+  margin: 0 0 0.6rem;
+}
+
+.feat__card p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.94rem;
+}
+
+/* A card that carries a caveat as well as a claim (the encryption note, the
+ * no_std detail) runs to two paragraphs; the rule above zeroes every margin,
+ * so without this they set solid. */
+.feat__card p + p {
+  margin-top: 0.85rem;
+}
+
+/* ------------------------------------------------------------ ink section -- */
+
+.section--ink {
+  background: var(--ink-2);
+  color: #eceae5;
+  border-top: 0;
+
+  /* Re-point the shared tokens instead of overriding every descendant rule —
+   * the same trick the dashboard uses for its themes. */
+  --text: #f2f0eb;
+  --muted: #a6a29a;
+  --faint: #96918a;
+  --rule: #2b2e35;
+  --rule-soft: #23262c;
+  --paper-2: #1c1f25;
+  --paper-3: #262a31;
+  --red: var(--red-ink);
+}
+
+.section--ink .eyebrow::after {
+  background: var(--red-ink);
+}
+
+/* --------------------------------------------------------- deploy cards -- */
+
+.deploy {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1rem;
+  margin-top: 3rem;
+}
+
+.deploy__card {
+  border: 1px solid var(--rule);
+  border-radius: var(--r-lg);
+  background: var(--paper-2);
+  padding: 1.5rem 1.35rem 1.4rem;
+  display: flex;
+  flex-direction: column;
+  transition:
+    border-color 0.2s var(--ease),
+    background-color 0.2s var(--ease);
+}
+
+.deploy__card:hover {
+  border-color: #3c414b;
+  background: var(--paper-3);
+}
+
+.deploy__n {
+  font-family: var(--f-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  color: var(--red-ink);
+  margin: 0 0 0.9rem;
+}
+
+.deploy__title {
+  font-family: var(--f-display);
+  font-size: 1.15rem;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  margin: 0 0 0.6rem;
+}
+
+.deploy__card p {
+  font-size: 0.89rem;
+  color: var(--muted);
+  margin: 0;
+}
+
+.deploy__meta {
+  margin-top: auto !important;
+  padding-top: 1.1rem;
+  font-family: var(--f-mono);
+  font-size: 0.68rem !important;
+  letter-spacing: 0.06em;
+  color: var(--faint) !important;
+}
+
+/* The evidence line closing the deployment section. Sits below the cards, so
+ * it needs the gap the cards' own grid does not provide. */
+/* The evidence line. It sat at the page's faintest tier, which styled the one
+ * hard credibility claim on the page as though it were a disclaimer. Lift it to
+ * body copy: this is a statement of fact, not fine print. */
+.proven {
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+/* ------------------------------------------------------------- use cases -- */
+
+.uses {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: clamp(1.5rem, 3vw, 2.25rem);
+  margin-top: 3.25rem;
+}
+
+.use {
+  border-top: 2px solid var(--ink);
+  padding-top: 1.2rem;
+}
+
+/* The use cases are not peers: one is the segment the page leads with, and the
+ * other two are secondary. The lead spans the grid and sets larger, so the
+ * hierarchy is visible before any of it is read. */
+.use--lead {
+  grid-column: 1 / -1;
+}
+
+.use--lead .use__title {
+  font-size: 1.55rem;
+}
+
+.use--lead p {
+  font-size: 1.02rem;
+  max-width: 68ch;
+}
+
+.use__title {
+  font-family: var(--f-display);
+  font-size: 1.3rem;
+  font-weight: 600;
+  letter-spacing: -0.018em;
+  margin: 0 0 0.65rem;
+}
+
+.use p {
+  color: var(--muted);
+  font-size: 0.94rem;
+  margin: 0 0 1.1rem;
+}
+
+.use__pts {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.use__pts li {
+  font-family: var(--f-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  padding: 0.28rem 0.7rem;
+  background: rgb(255 255 255 / 45%);
+}
+
+/* ----------------------------------------------------------------- pilot -- */
+
+.pilot {
+  padding-block: var(--sec-y);
+  border-top: 1px solid var(--rule-soft);
+  background:
+    radial-gradient(
+      ellipse at 15% 0%,
+      var(--red-wash) 0%,
+      rgb(212 55 53 / 0%) 55%
+    ),
+    rgb(255 255 255 / 30%);
+}
+
+.pilot__inner {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 0.85fr);
+  gap: clamp(2rem, 5vw, 4rem);
+  align-items: start;
+}
+
+.steps {
+  list-style: none;
+  margin: 2.5rem 0 0;
+  padding: 0;
+  display: grid;
+  gap: 1.5rem;
+}
+
+/* What the pilot actually costs the partner in effort, set apart from the
+ * three steps it qualifies. */
+.pilot__shape {
+  margin: 2.25rem 0 0;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--rule);
+  font-size: 0.94rem;
+  color: var(--muted);
+  max-width: 60ch;
+}
+
+.step {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 1.1rem;
+  align-items: start;
+}
+
+.step__n {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 1.5px solid var(--ink);
+  display: grid;
+  place-items: center;
+  font-family: var(--f-mono);
+  font-size: 0.78rem;
+  font-weight: 500;
+  flex: none;
+}
+
+.step__title {
+  font-family: var(--f-display);
+  font-size: 1.05rem;
+  font-weight: 600;
+  margin: 0.15rem 0 0.35rem;
+}
+
+.step p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.pilot__card {
+  position: sticky;
+  top: 6rem;
+  background: var(--paper-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-lg);
+  padding: clamp(1.5rem, 2.5vw, 2rem);
+  box-shadow: 0 14px 40px rgb(10 10 10 / 7%);
+}
+
+.pilot__card-k {
+  font-family: var(--f-display);
+  font-size: 1.2rem;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  margin: 0 0 0.6rem;
+}
+
+.pilot__card-p {
+  font-size: 0.92rem;
+  color: var(--muted);
+  margin: 0 0 1.5rem;
+}
+
+.pilot__card-fine {
+  margin: 1rem 0 0;
+  font-size: 0.8rem;
+  color: var(--faint);
+  text-align: center;
+}
+
+.pilot__card-fine a {
+  color: var(--muted);
+  text-decoration-color: var(--rule);
+  text-underline-offset: 2px;
+}
+
+/* ---------------------------------------------------------------- footer -- */
+
+.foot {
+  background: var(--ink);
+  color: #b9b5ac;
+  padding-block: 3.25rem 2.5rem;
+}
+
+.foot__inner {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2rem;
+  align-items: start;
+}
+
+/* The mono mark is `fill="currentColor"`, which does NOT resolve through an
+ * `<img>` — the browser renders a referenced SVG in its own document context,
+ * so it would come out black on this black footer. A mask keys off the alpha
+ * channel instead and takes its colour from `background-color`, which is the
+ * fix assets/logo/README.md calls for. */
+.foot__mark {
+  display: block;
+  width: 46px;
+  height: 32px;
+  margin-bottom: 0.9rem;
+  background-color: #f3f1ed;
+  mask: url("/wayfinder-mark-mono.svg") no-repeat center / contain;
+}
+
+.foot__tag {
+  margin: 0;
+  font-size: 0.88rem;
+  color: #8f8b83;
+  max-width: 30ch;
+}
+
+.foot__links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.5rem;
+  justify-content: flex-end;
+}
+
+.foot__links a {
+  font-size: 0.88rem;
+  color: #b9b5ac;
+  text-decoration: none;
+  transition: color 0.16s var(--ease);
+}
+
+.foot__links a:hover {
+  color: #f3f1ed;
+}
+
+/* ------------------------------------------------------------ responsive -- */
+
+@media (width <= 1000px) {
+  .hero__grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .proof__grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .proof__item {
+    padding: 1.5rem 1.25rem;
+    border-bottom: 1px solid var(--rule-soft);
+  }
+
+  .proof__item:nth-child(2n) {
+    border-right: 0;
+    padding-right: 0;
+  }
+
+  .proof__item:nth-child(2n + 1) {
+    padding-left: 0;
+  }
+
+  .proof__item:nth-last-child(-n + 2) {
+    border-bottom: 0;
+  }
+
+  .deploy {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .pilot__inner {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pilot__card {
+    position: static;
+  }
+}
+
+/* Between these two widths the cards are still side by side but much narrower,
+ * which scales the diagram labels down to around 8px. Scale them back up. */
+@media (780px < width <= 1000px) {
+  .dia__t,
+  .dia__bus-t {
+    font-size: 13px;
+  }
+
+  .dia__node-t {
+    font-size: 11px;
+  }
+}
+
+@media (width <= 780px) {
+  .nav__links {
+    display: none;
+  }
+
+  .cols--3,
+  .feat,
+  .uses {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .foot__inner {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .foot__links {
+    justify-content: flex-start;
+  }
+}
+
+@media (width <= 560px) {
+  body {
+    font-size: 16px;
+  }
+
+  /* The eyebrow is a flex row of label + rule. Once the label wraps to two
+   * lines the rule lands alone at the end of the second, which reads as a
+   * stray mark rather than an ornament. Drop it at this width. */
+  .eyebrow::after {
+    display: none;
+  }
+
+  .proof__grid,
+  .deploy {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .proof__item {
+    border-right: 0;
+    padding-inline: 0;
+  }
+
+  /* Stacked in one column, there is nothing beside a heading to line up with,
+   * so drop the reserved second line. */
+  .proof__k {
+    min-height: 0;
+  }
+
+  .hero__actions .btn {
+    flex: 1 1 100%;
+  }
+}
+
+/* The mesh animation is the page's one moving part that could plausibly
+ * bother someone; mesh.js also checks this and renders a static converged
+ * graph instead of driving the packet. */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

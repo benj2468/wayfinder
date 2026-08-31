@@ -1,0 +1,597 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Wayfinder — Mesh networking for robots and field operations</title>
+    <meta
+      name="description"
+      content="Wayfinder is software that turns the radios, cables and tunnels a machine already has into one self-healing mesh. It re-routes around a dead link by itself, and your existing applications run over it unchanged."
+    />
+    <link rel="canonical" href="https://wayfndr.dev/" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Wayfinder" />
+    <meta property="og:url" content="https://wayfndr.dev/" />
+    <meta
+      property="og:title"
+      content="Wayfinder — Networks that survive the field"
+    />
+    <meta
+      property="og:description"
+      content="Software that turns the radios, cables and tunnels a machine already has into one self-healing mesh. It re-routes around a dead link by itself, and your existing applications run over it unchanged."
+    />
+    <meta property="og:image" content="https://wayfndr.dev/og.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta
+      name="twitter:title"
+      content="Wayfinder — Networks that survive the field"
+    />
+    <meta
+      name="twitter:description"
+      content="Software that turns the radios, cables and tunnels a machine already has into one self-healing mesh."
+    />
+    <meta name="twitter:image" content="https://wayfndr.dev/og.png" />
+    <meta name="theme-color" content="#E9E7E2" />
+
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+
+    <!-- ============================================================ nav -- -->
+    <header class="nav" id="nav">
+      <div class="wrap nav__inner">
+        <a class="nav__brand" href="/" aria-label="Wayfinder home">
+          <img
+            src="/wayfinder-mark.svg"
+            alt=""
+            width="66"
+            height="45"
+            class="nav__mark"
+          />
+          <span class="nav__word">Wayfinder</span>
+        </a>
+        <nav class="nav__links" aria-label="Primary">
+          <a href="#uses">Use cases</a>
+          <a href="#how">How it works</a>
+          <a href="#deploy">Deployment</a>
+          <a href="#operating">Operating it</a>
+        </nav>
+        <a class="btn btn--sm btn--primary nav__cta" href="#pilot"
+          >Start a pilot</a
+        >
+      </div>
+    </header>
+
+    <main id="main">
+      <!-- =========================================================== hero -- -->
+      <section class="hero">
+        <div class="wrap hero__grid">
+          <div class="hero__copy">
+            <p class="eyebrow">
+              Mesh networking for robots and field operations
+            </p>
+            <h1 class="hero__title">Networks that<br />survive the field.</h1>
+            <p class="lede">
+              Software you install on the machines you already own. It turns
+              their radios, cables and tunnels into one network that routes
+              around a dead link by itself &mdash; and your existing
+              applications run over it unchanged.
+            </p>
+            <div class="hero__actions">
+              <a class="btn btn--primary" href="#pilot">Start a pilot</a>
+              <a class="btn btn--ghost" href="#how">
+                How it works
+                <svg viewBox="0 0 16 16" class="btn__icon" aria-hidden="true">
+                  <path
+                    d="M8 3.5v9M8 12.5 4.6 9.1M8 12.5l3.4-3.4"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              </a>
+            </div>
+            <p class="hero__note proven">
+              <span class="dot" aria-hidden="true"></span>
+              Running today on Nordic and ST microcontrollers, on Linux
+              gateways, and in simulation. Taking a few design partners.
+            </p>
+          </div>
+
+          <div class="hero__viz">
+            <figure
+              class="viz"
+              aria-label="Animated diagram of a frame forwarded hop by hop across a mesh, each node choosing its own next hop and re-choosing when a link fails"
+            >
+              <div class="viz__frame">
+                <svg
+                  id="mesh"
+                  viewBox="16 40 488 336"
+                  role="img"
+                  aria-hidden="true"
+                ></svg>
+                <div class="viz__hud">
+                  <span class="viz__hud-label">state</span>
+                  <span class="viz__hud-value" id="mesh-status">converged</span>
+                </div>
+              </div>
+              <figcaption class="viz__cap">
+                A link drops mid&#8209;flight. The frame arrives anyway, by a
+                path no one had to choose in advance.
+              </figcaption>
+            </figure>
+          </div>
+        </div>
+      </section>
+
+      <!-- ======================================================== problem -- -->
+      <section class="section" id="problem">
+        <div class="wrap">
+          <p class="eyebrow">The problem</p>
+          <h2 class="section__title">
+            Infrastructure is the single point of failure.
+          </h2>
+          <p class="section__lede">
+            Most software assumes the network is simply there. Past the edge of
+            that assumption, three things break at once.
+          </p>
+
+          <div class="cols cols--3">
+            <article class="col">
+              <p class="col__num">01</p>
+              <h3 class="col__title">Coverage ends</h3>
+              <p>
+                A canyon, a hull, a tunnel, a hundred hectares of field, a grid
+                that has gone down. The network has to arrive with you or not at
+                all.
+              </p>
+            </article>
+            <article class="col">
+              <p class="col__num">02</p>
+              <h3 class="col__title">Fixed topology breaks</h3>
+              <p>
+                A star network dies with its hub. Nodes move and hardware fails,
+                so the network has to find another path on its own &mdash; in
+                seconds, not on the next maintenance visit.
+              </p>
+            </article>
+            <article class="col">
+              <p class="col__num">03</p>
+              <h3 class="col__title">The medium is public</h3>
+              <p>
+                A radio anyone can hear is a radio anyone can transmit on.
+                Without signed membership, a mesh takes routing claims from any
+                device in range.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- ========================================================== uses -- -->
+      <section class="section" id="uses">
+        <div class="wrap">
+          <p class="eyebrow">Where it fits</p>
+          <h2 class="section__title">
+            Built for the places the network does not reach.
+          </h2>
+
+          <div class="uses">
+            <article class="use use--lead">
+              <h3 class="use__title">Robotics &amp; autonomy</h3>
+              <p>
+                Fleets where the topology changes every second, and what strands
+                a machine is the link, not the battery. Routes re&#8209;form as
+                the fleet moves, and your autonomy stack can see a link going
+                before it has gone. Multicast is carried across the mesh &mdash;
+                the traffic DDS and ROS&nbsp;2 discovery run on, and where a
+                naive mesh falls over.
+              </p>
+              <ul class="use__pts">
+                <li>Mobility&#8209;tolerant routing</li>
+                <li>Multicast for DDS and ROS&nbsp;2 discovery</li>
+                <li>Link quality exposed to the application</li>
+                <li>No ground&#8209;station dependency</li>
+              </ul>
+            </article>
+
+            <article class="use">
+              <h3 class="use__title">
+                Industrial &amp; critical infrastructure
+              </h3>
+              <p>
+                Assets kilometres apart with no cellular coverage to lease. A
+                low&#8209;power radio carries the telemetry; the gateway hands
+                it to the systems you already run.
+              </p>
+              <ul class="use__pts">
+                <li>Runs on the radios you picked</li>
+                <li>No recurring connectivity contract</li>
+                <li>Bridges to the existing network</li>
+              </ul>
+            </article>
+
+            <article class="use">
+              <h3 class="use__title">Defence &amp; public safety</h3>
+              <p>
+                Comms that do not need a tower, a satellite window or a working
+                grid. People and vehicles carry the network with them, and only
+                signed hardware is part of it.
+              </p>
+              <ul class="use__pts">
+                <li>Infrastructure&#8209;independent</li>
+                <li>Cryptographically gated membership</li>
+                <li>Degrades gradually, not all at once</li>
+              </ul>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================================================ how -- -->
+      <section class="section section--alt" id="how">
+        <div class="wrap">
+          <p class="eyebrow">How it works</p>
+          <h2 class="section__title">
+            One network, from the fence post to the server in the van.
+          </h2>
+          <p class="section__lede">
+            Every node learns the next hop toward every other, and none of them
+            holds a map. No hub, so no single failure takes the network with it.
+          </p>
+
+          <div class="feat">
+            <article class="feat__card">
+              <div class="feat__icon" aria-hidden="true">
+                <svg viewBox="0 0 40 40">
+                  <rect x="4" y="5" width="32" height="9" rx="2" />
+                  <rect x="4" y="16" width="32" height="9" rx="2" />
+                  <path d="M9 30h5M18 30h5M27 30h5" />
+                  <path d="M11.5 25v5M20.5 25v5M29.5 25v5" />
+                </svg>
+              </div>
+              <h3 class="feat__title">One network, not two stacks</h3>
+              <svg
+                class="dia"
+                viewBox="0 0 400 132"
+                role="img"
+                aria-label="A relay on a fence post, a gateway in the vehicle and a cloud node with no radio all run the same routing."
+              >
+                <g class="dia__box">
+                  <rect x="1" y="1" width="120" height="48" rx="8" />
+                  <rect x="140" y="1" width="120" height="48" rx="8" />
+                  <rect x="279" y="1" width="120" height="48" rx="8" />
+                </g>
+                <g class="dia__t">
+                  <text x="61" y="21">relay on</text>
+                  <text x="61" y="36">a fence post</text>
+                  <text x="200" y="21">gateway</text>
+                  <text x="200" y="36">in the vehicle</text>
+                  <text x="339" y="21">cloud node</text>
+                  <text x="339" y="36">no radio</text>
+                </g>
+                <path
+                  class="dia__link"
+                  d="M61 49v21M200 49v21M339 49v21M61 70h278M200 70v12"
+                />
+                <rect
+                  class="dia__bus"
+                  x="1"
+                  y="82"
+                  width="398"
+                  height="34"
+                  rx="8"
+                />
+                <text class="dia__bus-t" x="200" y="104">
+                  the same routing on all three
+                </text>
+              </svg>
+              <p>
+                The identical code, from a microcontroller with no operating
+                system to a server. Memory is fixed at compile time, so a node
+                cannot quietly run out of it in week three.
+              </p>
+            </article>
+
+            <article class="feat__card">
+              <div class="feat__icon" aria-hidden="true">
+                <svg viewBox="0 0 40 40">
+                  <circle cx="20" cy="9" r="4" />
+                  <circle cx="7" cy="31" r="4" />
+                  <circle cx="20" cy="31" r="4" />
+                  <circle cx="33" cy="31" r="4" />
+                  <path d="M20 13v6M20 19 8.5 27.5M20 19v8M20 19l11.5 8.5" />
+                </svg>
+              </div>
+              <h3 class="feat__title">Any link, all at once</h3>
+              <svg
+                class="dia"
+                viewBox="0 0 400 148"
+                role="img"
+                aria-label="One node carrying LoRa, Bluetooth LE, Ethernet and a UDP tunnel at the same time."
+              >
+                <g class="dia__box">
+                  <rect x="1" y="17" width="100" height="28" rx="14" />
+                  <rect x="299" y="17" width="100" height="28" rx="14" />
+                  <rect x="1" y="103" width="100" height="28" rx="14" />
+                  <rect x="299" y="103" width="100" height="28" rx="14" />
+                </g>
+                <path
+                  class="dia__link"
+                  d="M101 31 170.6 61.2M299 31 229.4 61.2M101 117 170.6 86.8M299 117 229.4 86.8"
+                />
+                <circle class="dia__node" cx="200" cy="74" r="32" />
+                <g class="dia__t">
+                  <text x="51" y="35">LoRa</text>
+                  <text x="349" y="35">Ethernet</text>
+                  <text x="51" y="121">Bluetooth LE</text>
+                  <text x="349" y="121">UDP tunnel</text>
+                </g>
+                <text class="dia__node-t" x="200" y="78">ONE NODE</text>
+              </svg>
+              <p>
+                The router does not care which link a frame came in on, so a new
+                medium is a driver rather than a change to the routing.
+              </p>
+            </article>
+
+            <article class="feat__card">
+              <div class="feat__icon" aria-hidden="true">
+                <svg viewBox="0 0 40 40">
+                  <rect x="8" y="17" width="24" height="18" rx="3" />
+                  <path d="M13.5 17v-4.5a6.5 6.5 0 0 1 13 0V17" />
+                  <path d="M20 24v4" />
+                </svg>
+              </div>
+              <h3 class="feat__title">&Agrave; la carte encryption</h3>
+              <p>Turn on membership, then take as much secrecy as you need.</p>
+              <ul class="tiers">
+                <li>
+                  <span class="tiers__k">Signed membership</span>
+                  Only hardware you have signed can advertise a route or address
+                  a member. Broadcast traffic is not covered, which is why the
+                  tiers below exist.
+                </li>
+                <li>
+                  <span class="tiers__k">Bring your own</span>
+                  IPsec, WireGuard or your application&rsquo;s own, unchanged.
+                  We never hold a key to your data.
+                </li>
+                <li>
+                  <span class="tiers__k">Managed for you</span>
+                  Nodes with an internet path enrol themselves onto Tailscale,
+                  over a Headscale the mesh runs. Radio hops stay authenticated,
+                  not encrypted.
+                </li>
+              </ul>
+            </article>
+
+            <article class="feat__card">
+              <div class="feat__icon" aria-hidden="true">
+                <svg viewBox="0 0 40 40">
+                  <path d="M5 32h30" />
+                  <path d="M9 32V22M17 32V12M25 32V18M33 32V7" />
+                </svg>
+              </div>
+              <h3 class="feat__title">Your software can see the network</h3>
+              <p>
+                A mesh sits <em>underneath</em> the software running on it,
+                which otherwise cannot see the network it depends on. One API
+                publishes link quality, throughput and route stability &mdash;
+                enough for an autonomy stack to adapt, and it is what the
+                dashboard reads.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- ========================================================= deploy -- -->
+      <section class="section section--ink" id="deploy">
+        <div class="wrap">
+          <p class="eyebrow">Deployment</p>
+          <h2 class="section__title">Four ways to put a node in the field.</h2>
+          <p class="section__lede">
+            A node is one binary and one config file. What changes is the
+            machine underneath it, not the routing.
+          </p>
+
+          <div class="deploy">
+            <article class="deploy__card">
+              <p class="deploy__n">01</p>
+              <h3 class="deploy__title">Bare metal</h3>
+              <p>
+                Flash the firmware and it relays. No operating system, no host
+                &mdash; a board with a radio becomes a repeater. Range and
+                battery life are the radio&rsquo;s, not ours.
+              </p>
+              <p class="deploy__meta">
+                nRF52840 &middot; STM32F411 &middot; Cortex&#8209;M4F
+              </p>
+            </article>
+
+            <article class="deploy__card">
+              <p class="deploy__n">02</p>
+              <h3 class="deploy__title">Linux gateway</h3>
+              <p>
+                Ordinary IP applications route across the radios
+                <em>unmodified</em>. This is the machine that joins the mesh to
+                the network you already have.
+              </p>
+              <p class="deploy__meta">
+                systemd &middot; NixOS module &middot; x86&#8209;64 + arm64
+              </p>
+            </article>
+
+            <article class="deploy__card">
+              <p class="deploy__n">03</p>
+              <h3 class="deploy__title">Container</h3>
+              <p>
+                Images for every binary, plus a simulation of a full mesh on one
+                workstation &mdash; rehearse your topology and a failover before
+                buying any hardware.
+              </p>
+              <p class="deploy__meta">OCI images</p>
+            </article>
+
+            <article class="deploy__card">
+              <p class="deploy__n">04</p>
+              <h3 class="deploy__title">Cloud authority</h3>
+              <p>
+                The root of trust runs as a node with no radio: it signs
+                membership, handles enrolment and revocation, and runs the
+                Headscale the others tunnel over. Its root key is generated
+                offline and stays yours.
+              </p>
+              <p class="deploy__meta">
+                Headscale coordination &middot; offline root key
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================================================== operating -- -->
+      <section class="section" id="operating">
+        <div class="wrap">
+          <p class="eyebrow">Operating it</p>
+          <h2 class="section__title">It fails in a field at 2am. Now what?</h2>
+          <p class="section__lede">
+            Every node answers the same API, whether it is a server or a sealed
+            board in a field.
+          </p>
+
+          <div class="cols cols--3">
+            <article class="col">
+              <h3 class="col__title">It tells you what is wrong</h3>
+              <p>
+                A flood, a revoked peer still talking, a table filling up. The
+                node tells you, and repeats coalesce rather than pile up.
+              </p>
+            </article>
+            <article class="col">
+              <h3 class="col__title">Logs without a probe</h3>
+              <p>
+                Read them over the API and turn the detail up at runtime. No
+                cable, no reflash, no reboot.
+              </p>
+            </article>
+            <article class="col">
+              <h3 class="col__title">A window, not a command line</h3>
+              <p>
+                A browser dashboard, a terminal one and a CLI &mdash; because
+                whoever depends on the mesh rarely built it.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- ========================================================= pilot -- -->
+      <section class="pilot" id="pilot">
+        <div class="wrap pilot__inner">
+          <div class="pilot__copy">
+            <p class="eyebrow">Design partners</p>
+            <h2 class="pilot__title">
+              We are taking on a&nbsp;limited number of pilots.
+            </h2>
+            <p class="lede">
+              It runs today on real boards and real radios. What it has not done
+              yet is <em>your</em> deployment &mdash; and the teams we work with
+              now shape what gets built next.
+            </p>
+
+            <ol class="steps">
+              <li class="step">
+                <span class="step__n">1</span>
+                <div>
+                  <h3 class="step__title">Scoping call</h3>
+                  <p>
+                    We will tell you plainly whether a mesh is the right answer.
+                    Sometimes it is not.
+                  </p>
+                </div>
+              </li>
+              <li class="step">
+                <span class="step__n">2</span>
+                <div>
+                  <h3 class="step__title">Bench bring&#8209;up</h3>
+                  <p>
+                    Your hardware, your radios, a working mesh &mdash; simulated
+                    first, then on the real boards.
+                  </p>
+                </div>
+              </li>
+              <li class="step">
+                <span class="step__n">3</span>
+                <div>
+                  <h3 class="step__title">Field pilot</h3>
+                  <p>
+                    A real deployment, with the instrumentation to show what the
+                    network actually did.
+                  </p>
+                </div>
+              </li>
+            </ol>
+
+            <p class="pilot__shape">
+              Engineering work on both sides, not a procurement exercise. Bring
+              an environment and an engineer who knows it. Tens of nodes per
+              segment today; terms we settle on the call.
+            </p>
+          </div>
+
+          <aside class="pilot__card">
+            <p class="pilot__card-k">Get in touch</p>
+            <p class="pilot__card-p">
+              Two lines is enough: what you are trying to connect, where, and
+              what happens today when it fails.
+            </p>
+            <a
+              class="btn btn--primary btn--block"
+              href="mailto:info@wayfndr.dev?subject=Wayfinder%20pilot%20enquiry&body=What%20I%20am%20trying%20to%20connect%3A%0A%0AWhere%2C%20and%20over%20what%20distance%3A%0A%0AWhat%20happens%20today%20when%20it%20fails%3A%0A%0A"
+              >Start a pilot</a
+            >
+            <p class="pilot__card-fine">
+              Or email
+              <a href="mailto:info@wayfndr.dev">info@wayfndr.dev</a> directly.
+            </p>
+          </aside>
+        </div>
+      </section>
+    </main>
+
+    <!-- ========================================================= footer -- -->
+    <footer class="foot">
+      <div class="wrap foot__inner">
+        <div class="foot__brand">
+          <span class="foot__mark" role="img" aria-label="Wayfinder"></span>
+          <p class="foot__tag">Mesh routing for the edge of the network.</p>
+        </div>
+        <nav class="foot__links" aria-label="Footer">
+          <a href="#uses">Use cases</a>
+          <a href="#how">How it works</a>
+          <a href="#deploy">Deployment</a>
+          <a href="#operating">Operating it</a>
+          <a href="#pilot">Start a pilot</a>
+          <a href="mailto:info@wayfndr.dev">Contact</a>
+        </nav>
+      </div>
+    </footer>
+
+    <script src="/mesh.js" defer></script>
+  </body>
+</html>
