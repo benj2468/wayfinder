@@ -29,6 +29,15 @@
 //! dispersion at all, and `openntpd` never touches the status word — so the
 //! `max_error_us` half of the policy is only meaningful under the first two,
 //! while `STA_UNSYNC` is honoured by all but the last.
+//!
+//! And "maintains the status word" has to be checked, not assumed, per daemon:
+//! `chronyd` clears `STA_UNSYNC` only when its `rtcsync` directive is set. The
+//! directive reads as an RTC concern and is not one here — clearing the bit is
+//! what lets the kernel's 11-minute mode run, so that is where chrony does it —
+//! which makes it very easy to leave off. A chrony without it is *locked to a
+//! source and reporting microseconds of offset* while this module correctly
+//! reads `TIME_ERROR` and refuses every credential decision on the node. See
+//! `nix/modules/wayfinder.nix`, which sets it.
 
 /// Default bound on the kernel's estimated clock error, in microseconds, below
 /// which the clock is still considered trustworthy.

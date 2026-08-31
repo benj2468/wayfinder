@@ -84,12 +84,14 @@ You will also need:
   `OCI_*` environment variables.
 - Your compartment OCID — the tenancy root compartment is a fine answer.
 - An SSH keypair whose public half goes in `terraform.tfvars`.
-- A Cloudflare API token, if `manage_tunnel` or `manage_dns` is set — scoped
-  `Zone:DNS:Edit` on the zone and `Account:Cloudflare Tunnel:Edit`, plus
-  `Zone:Zone:Read` and `Zone:Cache Purge:Purge` so that
+- A Cloudflare API token, if `manage_tunnel`, `manage_dns` or `manage_site` is
+  set — scoped `Zone:DNS:Edit` on the zone and `Account:Cloudflare
+  Tunnel:Edit`, plus `Zone:Zone:Read` and `Zone:Cache Purge:Purge` so that
   `scripts/wayfinder-ca.sh update` can drop the previous dashboard bundle from
   the edge cache (without those two the rollout still succeeds and warns, and
-  viewers keep the old stylesheet for up to four hours). Put it in
+  viewers keep the old stylesheet for up to four hours), plus
+  `Account:Cloudflare Pages:Edit` for the landing page — which the same script
+  needs anyway to publish it. Put it in
   `~/.cf-token` (mode `0600`, the token and nothing else) and
   `scripts/wayfinder-ca.sh` reads it; override the path with
   `CA_CF_TOKEN_FILE`. A bare `tofu` does not read that file — it only ever
@@ -394,6 +396,67 @@ reusing the node's, which has no expiry anyone is watching:
 ```bash
 ssh root@<public_ip> headscale apikeys create --expiration 24h
 ```
+
+## The landing page
+
+`wayfndr.dev` is a hand-authored static site under `www/`, served by Cloudflare
+Pages. Two halves again, and the same split as the node:
+
+| | what it does | when you run it |
+|---|---|---|
+| `tofu apply` with `manage_site = true` | creates the Pages project, its production branch and the `wayfndr.dev` / `www.wayfndr.dev` custom domains | once, and when the *project* changes |
+| `./scripts/wayfinder-ca.sh site` | uploads `dist/site` into it with `wrangler` | on every copy change, and with every `update` |
+
+OpenTofu owns the container; `wrangler` fills it. A static upload is a deploy
+step rather than an infrastructure change, and it rides with the node rollout on
+purpose — see `www/README.md` for why the page ships with the box it describes.
+
+The project name lives in `terraform.tfvars` as `site_project_name` and the
+script reads it from there, so a rename is one edit. The `just site-deploy`
+preview recipe hard-codes the default; change it there too.
+
+Until the first upload the project exists and is empty, and `wayfndr.dev`
+answers a Cloudflare placeholder rather than the page. That is the expected
+intermediate state, not a failure:
+
+```bash
+cd infra/oracle && tofu apply     # or: ./scripts/wayfinder-ca.sh provision
+./scripts/wayfinder-ca.sh site    # the first real deployment
+```
+
+`.dev` is on the HSTS preload list, so the name is HTTPS-only from the first
+request — there is no HTTP fallback to test, and the certificate is
+Cloudflare's rather than an ACME client's on the instance.
+
+### Adopting an existing Pages project
+
+`manage_site` **creates** the project, so turning it on for a deployment whose
+project was made by hand in the dashboard fails with a name conflict rather
+than adopting it. Import the four objects instead, then apply:
+
+```bash
+cd infra/oracle
+ACCOUNT=<cloudflare_account_id>  ZONE=<cloudflare_zone_id>
+PROJECT=wayfinder-site           APEX=wayfndr.dev
+
+tofu import 'cloudflare_pages_project.site[0]'   "$ACCOUNT/$PROJECT"
+tofu import 'cloudflare_pages_domain.site_apex[0]' "$ACCOUNT/$PROJECT/$APEX"
+tofu import 'cloudflare_pages_domain.site_www[0]'  "$ACCOUNT/$PROJECT/www.$APEX"
+
+# The two CNAMEs import by record id, which has to be looked up:
+curl -s -H "Authorization: Bearer $(cat ~/.cf-token)" \
+    "https://api.cloudflare.com/client/v4/zones/$ZONE/dns_records?type=CNAME" \
+    | python3 -c 'import json,sys; [print(r["id"], r["name"]) for r in json.load(sys.stdin)["result"]]'
+
+tofu import 'cloudflare_dns_record.site_apex[0]' "$ZONE/<record-id>"
+tofu import 'cloudflare_dns_record.site_www[0]'  "$ZONE/<record-id>"
+
+tofu plan    # should be empty; a diff here is a real difference, so read it
+```
+
+Read that plan before applying it. A project OpenTofu believes it must replace
+is a project whose previous deployments — and with them the instant
+rollback — go away.
 
 ## Troubleshooting
 

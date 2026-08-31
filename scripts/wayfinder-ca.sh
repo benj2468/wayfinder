@@ -256,12 +256,13 @@ load_cf_token() {
     # No token anywhere. Only a problem if this deployment actually has
     # Cloudflare resources to reconcile — one reached over an SSH forward has
     # none, and must not be made to invent a credential it never uses.
-    if grep -Eq '^[[:space:]]*manage_(tunnel|dns)[[:space:]]*=[[:space:]]*true' \
+    if grep -Eq '^[[:space:]]*manage_(tunnel|dns|site)[[:space:]]*=[[:space:]]*true' \
         "$INFRA_DIR/terraform.tfvars" 2>/dev/null; then
         die "no Cloudflare API token, but terraform.tfvars manages Cloudflare resources.
 Put the token in $CF_TOKEN_FILE (or export CLOUDFLARE_API_TOKEN).
 It needs Zone:DNS:Edit on the zone and Account:Cloudflare Tunnel:Edit, plus
-Zone:Zone:Read and Zone:Cache Purge:Purge for the post-rollout cache purge."
+Zone:Zone:Read and Zone:Cache Purge:Purge for the post-rollout cache purge and
+Account:Cloudflare Pages:Edit for the landing page."
     fi
 }
 
@@ -478,10 +479,28 @@ cmd_purge() {
 deploy_site() {
     local code=0
 
-    if ! command -v npx >/dev/null 2>&1; then
-        warn "npx not found, so the landing page was not published.
-Install Node, then run '$0 site'."
-        return 0
+    need npx
+
+    # The project name lives in terraform.tfvars, where `site.tf` creates the
+    # project from it — so a rename is one edit rather than a hunt. The default
+    # is what `site_project_name` defaults to, for a deployment that made the
+    # project by hand and manages no Cloudflare resources here.
+    local project; project="$(tfvar site_project_name wayfinder-site)"
+
+    # Which account to publish into, taken from terraform.tfvars rather than
+    # left for wrangler to work out.
+    #
+    # It cannot work it out. With no `CLOUDFLARE_ACCOUNT_ID` set it calls
+    # `GET /client/v4/accounts` to enumerate the accounts the credential can
+    # see, and a *scoped* API token — which is the only kind this script ever
+    # holds — is forbidden from that endpoint. The failure is a 403 reported as
+    # "Failed to automatically retrieve account IDs for the logged in user…
+    # try running `wrangler login`", which points at the one fix that is wrong
+    # here: an interactive OAuth login is not what a rollout should depend on,
+    # and the token is not expired.
+    local account; account="$(tfvar cloudflare_account_id)"
+    if [[ -n "$account" ]]; then
+        export CLOUDFLARE_ACCOUNT_ID="$account"
     fi
 
     load_cf_token
@@ -498,9 +517,9 @@ Put the token in $CF_TOKEN_FILE and run '$0 site'."
         return 0
     fi
 
-    info "publishing to Cloudflare Pages (wayfinder-site)"
+    info "publishing to Cloudflare Pages ($project)"
     (cd "$REPO_ROOT" && npx --yes wrangler@4 pages deploy dist/site \
-        --project-name wayfinder-site \
+        --project-name "$project" \
         --branch main \
         --commit-dirty=true) || code=$?
 
@@ -513,7 +532,12 @@ Put the token in $CF_TOKEN_FILE and run '$0 site'."
     # purge; Pages is a separate permission and is implied by none of them.
     warn "the publish was refused (exit $code), so wayfndr.dev still serves the previous build.
 Most likely the API token lacks Cloudflare Pages:Edit — add it at
-https://dash.cloudflare.com/profile/api-tokens and run '$0 site'."
+https://dash.cloudflare.com/profile/api-tokens and run '$0 site'.
+If it says the project does not exist, it has not been provisioned: set
+manage_site in infra/oracle/terraform.tfvars and run '$0 provision'.
+If it says it could not retrieve account IDs, set cloudflare_account_id in
+infra/oracle/terraform.tfvars — a scoped token cannot list accounts, and
+'wrangler login', which it suggests instead, is not the fix."
 }
 
 # Standalone as well as part of `update`: a copy change under www/ is worth
