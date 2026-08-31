@@ -558,8 +558,21 @@ Deferred, each with the reason:
 - **No password reset and no TOTP re-enrolment**, as §2 already scoped out. Both
   are natural follow-ups on the same record, and the invitation machinery is
   most of what a re-enrolment would need.
-- **The registration page does not render a QR code**, only the `otpauth://`
-  URI with a copy button. Every authenticator app accepts a pasted setup link,
-  and a QR encoder is a dependency (and a wasm size cost) for a convenience.
-  Worth revisiting for phone-only users, who are the audience this whole flow is
-  for.
+
+No longer deferred:
+
+- **The registration page renders a QR code** beside the `otpauth://` URI, as
+  the revisit this list asked for. The objection was that a QR encoder is a
+  dependency and a wasm size cost for a convenience — but "a convenience" was
+  the wrong reading of it. Copying a setup link only helps where the
+  authenticator is on the same machine as the page; where it is on a phone and
+  the page is on a laptop, which is the ordinary shape of this flow, the copy
+  button leads nowhere and the alternatives are transcribing 32 characters of
+  base32 or mailing the second factor to yourself. Both are offered, because
+  the page cannot know which device the app is on and guessing wrong strands
+  somebody at the one step that cannot be retried. `qrcodegen` is one file with
+  no dependencies of its own and returns modules rather than an image, so
+  `wayfinder-web`'s `qr` module writes the SVG and nothing raster enters the
+  bundle. The code is drawn into the page's own markup — no image request, so
+  the secret reaches no access log — and it is black on white in both themes,
+  since an inverted code is legal and some scanners refuse it anyway.

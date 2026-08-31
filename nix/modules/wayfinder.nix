@@ -215,6 +215,35 @@ in
         '';
       };
 
+      publicProviderAddress = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "ca.wayfndr.dev:7700";
+        description = ''
+          Where a *joining node* should reach the certificate authority, when
+          that is not the address this dashboard dials it on.
+
+          Display only: it is what the dashboard's "What a node needs to join"
+          panel shows somebody enrolling a new device, and nothing connects to
+          it. Unset, the dialled address (`provider`) is shown — right when the
+          dashboard and the authority are not on the same host, and wrong on
+          the deployment this exists for, where a cloud provider's dashboard
+          reaches its node over loopback and the join details would otherwise
+          read `127.0.0.1:7700` to somebody standing in front of a device on
+          the other side of the internet.
+
+          Not derivable, which is why it is asked for. It is not
+          `allowedHosts`: on a tunnelled deployment the dashboard's public name
+          and the management API's are separate DNS records, because the
+          management API cannot pass through an HTTP proxy and the dashboard
+          does. And the node itself does not know the address the world reaches
+          it at.
+
+          Requires `provider` — in static-credential mode there is no
+          certificate authority configured for this to name.
+        '';
+      };
+
       identityPath = mkOption {
         type = types.str;
         default = "/var/lib/wayfinder/identity.seed";
@@ -343,6 +372,16 @@ in
           '';
         }
         {
+          assertion = wayfinderCfg.web.publicProviderAddress == null || wayfinderCfg.web.provider != null;
+          message = ''
+            services.wayfinder.web.publicProviderAddress needs .provider: it
+            names where a joining node reaches the certificate authority, and
+            without login mode there is no authority configured for it to be a
+            public address *of*. The binary refuses the pair for the same
+            reason.
+          '';
+        }
+        {
           assertion = wayfinderCfg.web.provider == null || wayfinderCfg.web.cert == null;
           message = ''
             services.wayfinder.web.provider (login mode) and .cert (the static
@@ -373,6 +412,9 @@ in
                 + lib.optionalString (
                   wayfinderCfg.web.providerKey != null
                 ) " --provider-key ${wayfinderCfg.web.providerKey}"
+                + lib.optionalString (
+                  wayfinderCfg.web.publicProviderAddress != null
+                ) " --public-provider-address ${wayfinderCfg.web.publicProviderAddress}"
               else
                 " --identity ${wayfinderCfg.web.identityPath}"
                 + lib.optionalString (wayfinderCfg.web.cert != null) " --cert ${wayfinderCfg.web.cert}"

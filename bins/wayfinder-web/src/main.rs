@@ -115,6 +115,30 @@ async fn main() -> anyhow::Result<()> {
         /// allowed to be.
         #[arg(long, env = "WAYFINDER_WEB_PROVIDER_KEY", requires = "provider")]
         provider_key: Option<String>,
+
+        /// Where a *joining node* should reach the certificate authority, when
+        /// that is not the address this dashboard dials it on.
+        ///
+        /// Display only: it is what the dashboard shows an operator who is
+        /// enrolling a new device, and nothing connects to it. Without it the
+        /// dialled address is shown — right when the dashboard and the
+        /// authority are not on the same host, and wrong on the deployment
+        /// this exists for, where a cloud provider's dashboard reaches its
+        /// node over loopback and the join details would otherwise read
+        /// `127.0.0.1:7700` to somebody standing in front of a device on the
+        /// other side of the internet.
+        ///
+        /// Not derivable, which is why it is asked for: the management
+        /// endpoint's name is not `--allowed-host` (they are separate DNS
+        /// records on the deployed provider — the dashboard is proxied and the
+        /// management API cannot be), and the node itself does not know the
+        /// address the world reaches it at.
+        #[arg(
+            long,
+            env = "WAYFINDER_WEB_PUBLIC_PROVIDER_ADDRESS",
+            requires = "provider"
+        )]
+        public_provider_address: Option<String>,
     }
 
     let args = Args::parse();
@@ -177,16 +201,19 @@ async fn main() -> anyhow::Result<()> {
                 provider = %provider_addr,
                 "login mode: viewers sign in for their own short-lived session certificate"
             );
-            Access::Login(Arc::new(SessionStore::new(
-                PinnedNode {
-                    addr: args.connection.connect.clone(),
-                    key: node_key,
-                },
-                PinnedNode {
-                    addr: provider_addr,
-                    key: provider_key,
-                },
-            )))
+            Access::Login(Arc::new(
+                SessionStore::new(
+                    PinnedNode {
+                        addr: args.connection.connect.clone(),
+                        key: node_key,
+                    },
+                    PinnedNode {
+                        addr: provider_addr,
+                        key: provider_key,
+                    },
+                )
+                .advertising_provider_at(args.public_provider_address.clone()),
+            ))
         }
 
         // Static credential: one identity for the whole process.

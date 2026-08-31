@@ -523,6 +523,86 @@ fn Enrol(
     }
 }
 
+/// The second factor, offered as a code to scan and as text to copy.
+///
+/// # Two routes to one secret, because there are two shapes of registrant
+///
+/// The `otpauth://` URI has to reach an authenticator app. Where that app is on
+/// the same machine as this page, the copy button is the whole answer. Where it
+/// is on a phone and the page is on a laptop — which is the ordinary case, and
+/// the audience design 12 was written for — copying is useless and the
+/// alternatives are transcribing 32 characters of base32 by hand or sending the
+/// mesh's second factor to yourself over something. The camera is the only
+/// route between the two devices that does neither.
+///
+/// Both are offered rather than one being chosen for the reader: the page has
+/// no way to know which device the authenticator is on, and guessing wrong
+/// strands somebody at the one step of this flow that cannot be retried.
+///
+/// # The code is drawn, not fetched
+///
+/// The SVG is written into this markup. No image request, so the secret does
+/// not appear in an access log or a proxy's, and nothing is asked for a second
+/// time — see [`crate::qr`], which also has why the code ignores the page's
+/// theme.
+#[component]
+pub fn TotpEnrolment(
+    /// The `otpauth://` URI the provider minted. Shown once and never again.
+    uri: String,
+) -> impl IntoView {
+    // `None` until the button is pressed; then what the browser actually did.
+    let copied = RwSignal::new(Option::<bool>::None);
+    // Encoded once, not per render: the input cannot change for the life of
+    // this component, and the encoder is the expensive part of drawing it.
+    //
+    // `None` only if the URI will not fit in a QR code at all, which a real
+    // `otpauth://` URI never does. The copy button is then the whole panel
+    // rather than a broken frame sitting above it.
+    let code = crate::qr::svg(&uri, "Authenticator setup code");
+    let to_copy = uri.clone();
+
+    view! {
+        <div class="wf-register-enrol">
+            <p class="wf-panel-sub">
+                "Add this to an authenticator app now. It is shown once and cannot be shown again — if you lose it, ask for a new invitation."
+            </p>
+            {code
+                .map(|svg| {
+                    view! {
+                        <div class="wf-qr-frame">
+                            // The encoder's own output, injected rather than
+                            // rebuilt as leptos nodes: it is a few hundred
+                            // modules in one `<path>`, and the string this
+                            // crate generated is not untrusted input.
+                            <div inner_html=svg></div>
+                            <p class="wf-note">
+                                "Scan this with your authenticator app. Use the link below instead if the app is on this device."
+                            </p>
+                        </div>
+                    }
+                })}
+            <code class="wf-register-uri wf-mono">{uri}</code>
+            <button
+                type="button"
+                class="wf-button"
+                on:click=move |_| {
+                    // The answer is reported, never assumed: `copy` returns
+                    // false for a refusal, and a registrant who believes a copy
+                    // that did not happen pastes the previous clipboard into
+                    // their authenticator and loses a secret shown once.
+                    copied.set(Some(crate::clipboard::copy(&to_copy)));
+                }
+            >
+                {move || match copied.get() {
+                    Some(true) => "Copied",
+                    Some(false) => "Could not copy — select it and copy by hand",
+                    None => "Copy setup link",
+                }}
+            </button>
+        </div>
+    }
+}
+
 /// The form that creates the account, with or without the enrolment URI beside
 /// it.
 ///
@@ -552,8 +632,6 @@ fn Finish(
     let password = RwSignal::new(String::new());
     let repeat = RwSignal::new(String::new());
     let code = RwSignal::new(String::new());
-    // `None` until the button is pressed; then what the browser actually did.
-    let copied = RwSignal::new(Option::<bool>::None);
 
     let name_for_submit = username.clone();
     let submit = move |ev: SubmitEvent| {
@@ -650,38 +728,7 @@ fn Finish(
                     }
                 })}
 
-            {uri
-                .map(|uri| {
-                    view! {
-                        <div class="wf-register-enrol">
-                            <p class="wf-panel-sub">
-                                "Add this to an authenticator app now. It is shown once and cannot be shown again — if you lose it, ask for a new invitation."
-                            </p>
-                            <code class="wf-register-uri wf-mono">{uri.clone()}</code>
-                            <button
-                                type="button"
-                                class="wf-button"
-                                on:click=move |_| {
-                                    // The answer is reported, never assumed:
-                                    // `copy` returns false for a refusal, and
-                                    // a registrant who believes a copy that did
-                                    // not happen pastes the previous clipboard
-                                    // into their authenticator and loses a
-                                    // secret shown once. There is no QR code
-                                    // here, so on a desktop this button is the
-                                    // only practical route to a phone.
-                                    copied.set(Some(crate::clipboard::copy(&uri)));
-                                }
-                            >
-                                {move || match copied.get() {
-                                    Some(true) => "Copied",
-                                    Some(false) => "Could not copy — select it and copy by hand",
-                                    None => "Copy setup link",
-                                }}
-                            </button>
-                        </div>
-                    }
-                })}
+            {uri.map(|uri| view! { <TotpEnrolment uri=uri /> })}
 
             <label class="wf-login-field">
                 "Password"

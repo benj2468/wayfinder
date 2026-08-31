@@ -1892,6 +1892,36 @@ body {
   border-bottom: 1px solid var(--wf-border);
 }
 
+/* The QR code and the line telling the reader what to do with it, stacked and
+ * centred. The white card is on `.wf-qr` below. */
+.wf-qr-frame {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--wf-space-2);
+}
+
+/* Capped rather than stretched. A QR code is scale-free, so the only thing a
+ * size decides is how far away a phone can focus on it — around 220px is
+ * comfortable at arm's length, and any wider is a code somebody has to lean
+ * back from. `min()` so it still fits a narrow phone held in portrait, which
+ * is the other device this page is read on.
+ *
+ * The white card is not the quiet zone: `src/qr.rs` paints its own white
+ * ground across the full viewBox and reserves the spec's four modules inside
+ * it, so the code is scannable with no stylesheet at all. This widens that
+ * margin and keeps a black-on-white code from sitting flush against a dark
+ * page's border. Do not drop `QUIET_ZONE` on the strength of this rule. */
+.wf-qr {
+  display: block;
+  width: min(220px, 60vw);
+  height: auto;
+  padding: var(--wf-space-2);
+  background: #ffffff;
+  border: 1px solid var(--wf-border);
+  border-radius: var(--wf-radius);
+}
+
 /* The `otpauth://` URI, for an authenticator app that takes a pasted link.
  *
  * Wrapped rather than truncated: this is a secret shown exactly once, and a

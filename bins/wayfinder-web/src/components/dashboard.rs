@@ -56,6 +56,20 @@ pub struct Dashboard {
     pub connected: RwSignal<bool>,
     /// What the server is pointed at, for the header.
     pub label: RwSignal<String>,
+    /// Where a joining node should reach this mesh's certificate authority.
+    ///
+    /// A separate field from [`Dashboard::label`] rather than a re-use of it,
+    /// because the two answer different questions and coincide only when the
+    /// dashboard and the authority are *not* on the same host: the label is how
+    /// *this process* dials the node, and this is the address somebody
+    /// enrolling a device has to type into it. See
+    /// `crate::api::provider_address`.
+    ///
+    /// `None` until it has been fetched, and permanently `None` when there is
+    /// no answer (a serial target) or the fetch failed. Distinguished from
+    /// `Some(String::new())` on purpose: a panel that rendered an empty string
+    /// would offer a copy button that reports success having copied nothing.
+    pub provider_address: RwSignal<Option<String>>,
     /// Whether the viewer may change the node, rather than only read it.
     ///
     /// Mirrored out of the session resource by [`provide_dashboard`], for the
@@ -83,6 +97,7 @@ impl Dashboard {
             error: RwSignal::new(None),
             connected: RwSignal::new(false),
             label: RwSignal::new(String::new()),
+            provider_address: RwSignal::new(None),
             admin: RwSignal::new(false),
         }
     }
@@ -127,11 +142,21 @@ pub fn provide_dashboard() -> Dashboard {
     });
 
     Effect::new(move |_| {
-        // The label cannot change while the server runs, so it is fetched once
-        // rather than riding along on every poll.
+        // Neither of these can change while the server runs, so they are
+        // fetched once rather than riding along on every poll.
         leptos::task::spawn_local(async move {
             if let Ok(label) = crate::api::node_label().await {
                 dash.label.set(label);
+            }
+        });
+        // A failed fetch leaves this `None`, which the join-details panel
+        // renders as "not known" rather than as a blank field. It is not
+        // raised as a dashboard error: the node itself is fine, and a banner
+        // over every tab would be reporting a missing display value as an
+        // outage.
+        leptos::task::spawn_local(async move {
+            if let Ok(addr) = crate::api::provider_address().await {
+                dash.provider_address.set(addr);
             }
         });
 

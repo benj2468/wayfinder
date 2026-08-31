@@ -4,6 +4,8 @@
 //! markup. Anything that decides *what* a value should say belongs in
 //! [`crate::format`], where it can be tested.
 
+use std::time::Duration;
+
 use leptos::prelude::*;
 
 /// A titled card. The standard container for a table or a group of fields.
@@ -297,6 +299,70 @@ pub fn ConfirmDialog(
                     </button>
                 </div>
             </div>
+        </div>
+    }
+}
+
+/// How long a copy button's "Copied" confirmation stays on screen.
+///
+/// Long enough to be read after the eye moves back from the button, short
+/// enough that it is gone before it could be mistaken for a statement about a
+/// *later* click.
+const COPY_FLASH_FOR: Duration = Duration::from_secs(3);
+
+/// A value an operator has to carry somewhere else: shown abbreviated or
+/// masked, copied in full.
+///
+/// The copy button is the only way out of a masked field, so it reports what
+/// actually happened — [`crate::clipboard::copy`] answers `false` when the
+/// browser refused, and this says so rather than claiming a copy that did not
+/// happen and leaving someone to paste whatever was on the clipboard before.
+#[component]
+pub fn CopyField(
+    /// The field name.
+    label: &'static str,
+    /// What is drawn on screen. Never the full value when that is a secret.
+    #[prop(into)]
+    shown: Signal<String>,
+    /// What the copy button puts on the clipboard, in full.
+    #[prop(into)]
+    value: Signal<String>,
+) -> impl IntoView {
+    // `None` until a copy is attempted, then the outcome for a few seconds.
+    // Transient rather than sticky: it is feedback on one click, and a "Copied"
+    // still sitting there a minute later says nothing true about the clipboard.
+    let (flash, set_flash) = signal::<Option<&'static str>>(None);
+
+    let copy = move |_| {
+        let copied = crate::clipboard::copy(&value.get());
+        set_flash.set(Some(if copied {
+            "Copied"
+        } else {
+            "Could not copy — this browser refused clipboard access"
+        }));
+        leptos::leptos_dom::helpers::set_timeout(move || set_flash.set(None), COPY_FLASH_FOR);
+    };
+
+    view! {
+        <div class="wf-copy-row">
+            <span class="wf-copy-label">{label}</span>
+            <span class="wf-copy-value wf-mono">{move || shown.get()}</span>
+            <button
+                type="button"
+                class="wf-button wf-copy-button"
+                aria-label=format!("Copy the {label} to the clipboard")
+                title=format!("Copy the {label} to the clipboard")
+                on:click=copy
+            >
+                // The word, not a clipboard emoji: this dashboard ships in a
+                // container, and a minimal image has no emoji font — the glyph
+                // renders as a tofu box there, leaving a row of unlabelled
+                // buttons. Verified as exactly that in a headless browser.
+                "Copy"
+            </button>
+            <span class="wf-copy-flash" aria-live="polite">
+                {move || flash.get().unwrap_or_default()}
+            </span>
         </div>
     }
 }
