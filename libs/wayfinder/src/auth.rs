@@ -42,6 +42,11 @@ use batman::wire::find_tvlv;
 use batman::wire::iter_tvlv;
 use heapless::Vec as HVec;
 use interfaces::frame::Mac;
+use wayfinder_alarm::AlarmKind;
+use wayfinder_alarm::NodeId;
+use wayfinder_alarm::Severity;
+use wayfinder_alarm::Subject;
+use wayfinder_alarm::alarm;
 use wayfinder_auth::Keypair;
 use wayfinder_auth::MembershipCert;
 use wayfinder_auth::RevocationRecord;
@@ -290,7 +295,30 @@ const SIGN_SCRATCH_LEN: usize = 256;
 const _: () =
     assert!(SIGN_SCRATCH_LEN >= SIG_DOMAIN.len() + 6 + 4 + core::mem::size_of::<MembershipCert>());
 
+/// What [`OgmAuth::cache_neighbor`] did with a verified certificate.
+///
+/// Returned rather than swallowed because a refusal is not a no-op for every
+/// caller: one of them has already consumed an outstanding request by the time
+/// it asks, and reporting success there would clear a retry that is still
+/// needed. `#[must_use]` so a new call site has to make that decision rather
+/// than inherit it.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cached {
+    /// The keys are now in the neighbour table.
+    Stored,
+    /// Refused: a live member already holds that address under a different
+    /// identity key. See [`OgmAuth::cache_neighbor`].
+    RefusedLiveIdentity,
+}
+
 /// One verified neighbor's keys, learned from its authenticated OGM cert.
+///
+/// At most one entry per MAC, and while an entry's certificate is live its
+/// `cert.ed_pubkey` is pinned: a second certificate binding that address to a
+/// different identity key is refused rather than admitted. See
+/// [`cache_neighbor`](OgmAuth::cache_neighbor) for why, and for the two edges
+/// that release the pin.
 #[derive(Debug, Clone, Copy)]
 pub struct NeighborKeys {
     /// The trusted facts from the neighbor's verified membership cert — its MAC,
@@ -1436,7 +1464,12 @@ impl<
             }
         }
 
-        self.cache_neighbor(NeighborKeys {
+        // Deliberately discarded: a refusal does not change this OGM's verdict.
+        // The certificate really is CA-signed and its signature really does
+        // check out, so this stays a decision about what the node *caches*;
+        // binding the address to the key at verification time is issue #16's
+        // fix, not this one.
+        let _ = self.cache_neighbor(NeighborKeys {
             cert: verified,
             pairwise_key,
             raw_cert: *cert,
@@ -1640,16 +1673,25 @@ impl<
             tracing::trace!("auth: dropping cert reply that answers no outstanding request");
             return false;
         };
-        self.in_flight.swap_remove(pos);
-
+        // Cache *before* clearing the in-flight entry, and only clear it if the
+        // cache took the certificate. A refused reply has not answered the
+        // request — so dropping the entry here would both report success and
+        // delete the retry backstop this function's contract promises, letting
+        // whoever raced the reply in consume every fetch attempt for that MAC.
         let pairwise_key = self.keypair.pairwise_key(&verified.x_pubkey);
-        self.cache_neighbor(NeighborKeys {
+        let mac = verified.mac;
+        if self.cache_neighbor(NeighborKeys {
             cert: verified,
             pairwise_key,
             raw_cert: *cert,
             // No OGM of theirs has been verified through this cert yet.
             last_ogm: None,
-        });
+        }) == Cached::RefusedLiveIdentity
+        {
+            tracing::trace!(?mac, "auth: dropping cert reply for a contested address");
+            return false;
+        }
+        self.in_flight.swap_remove(pos);
         true
     }
 
@@ -1713,13 +1755,27 @@ impl<
             return None;
         }
 
+        // The identity check goes *before* the rate limiter, for the same
+        // reason proof-of-possession does. `requester` is taken from the
+        // presented certificate, so a second CA-signed certificate for a live
+        // member's address arrives here naming *that member* — and a limiter
+        // spent on it is the real member's slot, denying their genuine
+        // requests for `CERT_REQ_RATE_LIMIT_SECS` at a time. Checking first
+        // means a contested address costs the member nothing.
+        if self.identity_conflict(requester, &verified.ed_pubkey) {
+            Self::report_identity_conflict(requester, &verified.ed_pubkey);
+            return None;
+        }
+
         if !self.accept_cert_request_rate(requester) {
             tracing::trace!(?requester, "auth: rate-limiting repeated cert request");
             return None;
         }
 
         let pairwise_key = self.keypair.pairwise_key(&verified.x_pubkey);
-        self.cache_neighbor(NeighborKeys {
+        // Cannot be refused: `identity_conflict` was just checked above, and
+        // nothing between here and there mutates the neighbour table.
+        let _ = self.cache_neighbor(NeighborKeys {
             cert: verified,
             pairwise_key,
             raw_cert: *cert,
@@ -1744,7 +1800,7 @@ impl<
         if self.cert_req_rate.push((requester, self.now_unix)).is_err() {
             // Table full: overwrite the first entry rather than refusing a
             // legitimate new requester outright (bounded, simple eviction —
-            // mirrors `cache_neighbor`'s policy).
+            // mirrors `cache_neighbor`'s table-full policy).
             tracing::debug!("auth: cert-request rate-limit table full; evicting an entry");
             if let Some(first) = self.cert_req_rate.first_mut() {
                 *first = (requester, self.now_unix);
@@ -1814,13 +1870,13 @@ impl<
         }
     }
 
-    /// Insert or refresh a verified neighbor's keys.
     /// The cached keys for `mac`, treating an expired certificate as absent.
     ///
     /// Every neighbor lookup goes through this rather than scanning
     /// `self.neighbors` directly. Verifying an OGM caches the peer's
-    /// certificate *and* the pairwise key derived from it, and that cache is
-    /// only ever overwritten — so without an expiry check here, a peer whose
+    /// certificate *and* the pairwise key derived from it, and nothing on that
+    /// path prunes a lapsed entry (`cache_neighbor` overwrites in place or
+    /// refuses; it never expires) — so without an expiry check here, a peer whose
     /// enrollment has lapsed keeps a working link-local data plane long after
     /// its route is gone. Certificate expiry is this mesh's passive
     /// revocation mechanism; it has to actually revoke something.
@@ -1981,7 +2037,95 @@ impl<
         self.neighbors.retain(|n| n.cert.not_after >= now);
     }
 
-    fn cache_neighbor(&mut self, keys: NeighborKeys) {
+    /// Insert or refresh a verified neighbor's keys.
+    ///
+    /// One address, one identity, for as long as that identity's certificate
+    /// is live. A second CA-signed certificate for a MAC this node already
+    /// holds a *live* entry for, under a different `ed_pubkey`, is refused
+    /// rather than allowed to overwrite it — the entry carries the pairwise
+    /// key, that key is symmetric ECDH, and replacing it severs the real
+    /// member's directed data plane in both directions at once. One misissued
+    /// certificate would otherwise be a total, sustained denial of a named
+    /// member's authenticated traffic (gap-4A).
+    ///
+    /// While the held certificate is live and unrevoked this makes the receiver
+    /// no more permissive than its own authority, which enforces the same rule
+    /// at issuance (`wayfinder-server`'s `authority.rs`): the same identity key
+    /// with a new window is re-issued, a different one is rejected while the
+    /// authority's *issued record* for that MAC has not lapsed — a narrower
+    /// window than the certificate's, see `submit_csr` and issue #37.
+    ///
+    /// **Revocation is where the two deliberately diverge.** The authority
+    /// keeps a revoked MAC locked (its `find` matches on the validity window
+    /// and pointedly not on the `revoked` flag, because reading the flag there
+    /// once handed a revoked node's address to whoever asked next). This node
+    /// does the opposite and frees the address on `evict_neighbor` — because a
+    /// receiver that kept the lock would refuse the re-admission its own
+    /// authority had deliberately signed. So a certificate accepted here in
+    /// that window is one `submit_csr` would have refused; it has to come from
+    /// the offline root, which is the authority above `submit_csr` rather than
+    /// a way around it.
+    ///
+    /// No new bookkeeping is needed to let a legitimate re-key through, and
+    /// deliberately so — three mechanisms that already exist compose into it:
+    ///
+    /// - ingesting a revocation calls [`evict_neighbor`](Self::evict_neighbor),
+    ///   so a revoked member leaves no entry for this rule to collide with;
+    /// - a lapsed certificate is dropped by
+    ///   [`evict_expired_neighbors`](Self::evict_expired_neighbors) and treated
+    ///   as absent by [`live_neighbor`](Self::live_neighbor), so the address is
+    ///   free once the window is out;
+    /// - re-admission after a revocation is already modelled by
+    ///   [`RevocationRecord::cancels`].
+    ///
+    /// Two edges are decided here rather than inherited:
+    ///
+    /// - **An unset clock admits the new key.** `live_neighbor` calls
+    ///   everything live when `now_unix == 0`, so mirroring it would make an
+    ///   unclocked node refuse a legitimate re-key *forever*. Such a node
+    ///   cannot judge certificate validity in the first place, and the
+    ///   authority itself fails closed on a zero clock rather than locking
+    ///   addresses on one.
+    ///
+    ///   **The cost is that this rule does not protect an unclocked node at
+    ///   all**, and no embedded target sets the clock today — no board path
+    ///   calls [`set_time`](Self::set_time) — so an nRF52840 or STM32 still
+    ///   takes the overwrite this refuses on a host. That is a deliberate
+    ///   choice recorded in issue #48 rather than an oversight, but it means
+    ///   the measured denial is closed for host nodes and open for boards. A
+    ///   rule keyed on *recency* (the shared uptime clock, which every target
+    ///   has) rather than on wall-clock validity would carry it onto a board;
+    ///   it needs a per-entry timestamp `NeighborKeys` does not have, and at
+    ///   64 × 272 bytes that is a real cost on the node it would protect.
+    /// - **The comparison is on `ed_pubkey` alone**, matching the authority's
+    ///   issued-certificate lock. An agreement-key-only rotation is something
+    ///   the CA will sign for a live member, so a rule keyed on anything wider
+    ///   would reject a certificate this mesh's own authority had just issued.
+    ///   Note what that leaves: such a rotation *does* move the pairwise key,
+    ///   so it is the identity that is pinned here, not the data-plane key.
+    ///
+    /// Two residuals worth naming, because the rule narrows this denial rather
+    /// than removing it:
+    ///
+    /// - **It is first-writer-wins.** Whoever is cached first owns the address
+    ///   for the life of its certificate. Once a member is established that is
+    ///   the member — but at each release point (expiry, a revocation, a
+    ///   reboot, or the table-full eviction below) the address is briefly open,
+    ///   and an attacker flooding beats a member advertising on a Trickle
+    ///   cadence. The exposure moves from "always" to "at a boundary", and the
+    ///   alarm is what makes the boundary visible.
+    /// - **A refused certificate is never cached, so it never enters
+    ///   `verify_ogm`'s `known` memo**, and every flooded copy of it pays a
+    ///   full `verify_cert` + agreement + signature check instead of the one
+    ///   signature check a cached-but-losing certificate used to cost. That is
+    ///   a real per-frame cost increase against an attacker who holds one, and
+    ///   it buys not handing them the victim's data plane.
+    fn cache_neighbor(&mut self, keys: NeighborKeys) -> Cached {
+        if self.identity_conflict(keys.cert.mac, &keys.cert.ed_pubkey) {
+            Self::report_identity_conflict(keys.cert.mac, &keys.cert.ed_pubkey);
+            return Cached::RefusedLiveIdentity;
+        }
+
         if let Some(slot) = self
             .neighbors
             .iter_mut()
@@ -1991,10 +2135,80 @@ impl<
         } else if self.neighbors.push(keys).is_err() {
             // Table full: overwrite the first entry rather than dropping the
             // freshly verified neighbor (bounded, simple eviction).
+            //
+            // Note what this does *not* do: the slot it takes may hold a live
+            // member, and replacing that entry severs its data plane exactly
+            // the way the refusal above exists to prevent. An adversary who
+            // can fill the table — which costs a certificate per slot, so a
+            // mass misissuance rather than the single one this rule is scoped
+            // to — can therefore still push a live member out and then take
+            // its address. Left as it is deliberately: refusing to evict a
+            // live entry instead would mean a full table could never admit a
+            // new neighbor, which is a worse and more easily reached denial.
+            // See the MR for #48 and the follow-up it names.
             if let Some(first) = self.neighbors.first_mut() {
                 *first = keys;
             }
         }
+        Cached::Stored
+    }
+
+    /// Whether caching a certificate binding `mac` to `ed_pubkey` would be
+    /// refused because a **live** cached member already holds that address
+    /// under a different identity key.
+    ///
+    /// Split out from [`cache_neighbor`](Self::cache_neighbor) because
+    /// [`verify_cert_request`](Self::verify_cert_request) has to ask the
+    /// question *before* it spends the requester's rate-limit slot — see the
+    /// note there.
+    ///
+    /// `now_unix == 0` answers `false`: an unclocked node cannot judge
+    /// validity at all. [`cache_neighbor`](Self::cache_neighbor)'s doc has the
+    /// argument, and the security cost that comes with it.
+    fn identity_conflict(&self, mac: Mac, ed_pubkey: &[u8; 32]) -> bool {
+        let now = self.now_unix;
+        if now == 0 {
+            return false;
+        }
+        self.neighbors
+            .iter()
+            .any(|n| n.cert.mac == mac && n.cert.not_after >= now && n.cert.ed_pubkey != *ed_pubkey)
+    }
+
+    /// Record a refused second identity for `mac`, on both channels.
+    ///
+    /// Nothing is broken by the time this fires, which is exactly why it needs
+    /// saying: an operator seeing only the dropped certificate would be looking
+    /// at what presents as unexplained route flapping, with the real
+    /// explanation — an authority that issued twice for one address — nowhere
+    /// in view.
+    ///
+    /// `trace!` for the log line, not `debug!`: an attacker holding the losing
+    /// certificate drives this once per frame at whatever rate it sends, and
+    /// the refused certificate never enters the `known` memo, so *every* copy
+    /// arrives here. A `debug!` would mean that raising the runtime filter to
+    /// investigate the alarm fills the bounded `GetLogs` ring with this one
+    /// line and evicts the context the operator went looking for.
+    ///
+    /// The alarm is the operator-facing half and is storm-safe where the log
+    /// line is not: the board coalesces on `(kind, subject)`, and
+    /// `SharedBoard` mirrors only a new or escalated raise into the log — so a
+    /// flood is one row with a count and exactly one `warn!`.
+    ///
+    /// `Warning`, not `Critical`: the mesh is carrying traffic exactly as
+    /// configured, and the refusal is why.
+    fn report_identity_conflict(mac: Mac, refused: &[u8; 32]) {
+        tracing::trace!(
+            ?mac,
+            "auth: dropping a second identity key for a live member's address"
+        );
+        alarm!(
+            Severity::Warning,
+            AlarmKind::IdentityConflict,
+            Subject::Node(NodeId::new(&mac.0)),
+            "refused_key={}",
+            NodeId::new(refused)
+        );
     }
 }
 
@@ -2102,7 +2316,8 @@ mod tests {
     /// network involved. It has to actually revoke something.
     ///
     /// Verifying an OGM caches the peer's `VerifiedCert` *and* the pairwise
-    /// key derived from it, and `cache_neighbor` only ever overwrites. Without
+    /// key derived from it, and nothing on that path prunes a lapsed entry
+    /// (`cache_neighbor` refuses or overwrites, it never expires). Without
     /// an expiry check on the lookup path, a peer whose enrollment has lapsed
     /// keeps a working link-local data plane indefinitely: its route ages out,
     /// but any neighbor that already admitted it goes on tagging and accepting
@@ -3485,11 +3700,16 @@ mod tests {
         assert!(b.neighbor_cert(mac(2)).is_none());
     }
 
-    /// A rotated cert for an already-known MAC (same node, new keys) overwrites
-    /// the stored bytes and fingerprint in place, rather than leaving the old
-    /// cert cached alongside the new one.
+    /// A renewed cert for an already-known MAC (the same identity key, a fresh
+    /// validity window) overwrites the stored bytes and fingerprint in place,
+    /// rather than leaving the old cert cached alongside the new one.
+    ///
+    /// A renewal rather than a re-key, because a re-key is what the authority
+    /// refuses to issue while the held certificate is live, and what
+    /// `cache_neighbor` correspondingly refuses to cache — see
+    /// `a_second_key_cannot_displace_a_live_member`.
     #[test]
-    fn neighbor_cert_rotation_updates_stored_bytes_and_fingerprint() {
+    fn neighbor_cert_renewal_updates_stored_bytes_and_fingerprint() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
         let mut b = member(&authority, 3, mac(3), 1000);
 
@@ -3499,16 +3719,14 @@ mod tests {
         assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
         let (_, fp1) = b.neighbor_cert(mac(2)).expect("cached after first verify");
 
-        // Same MAC, freshly issued cert with different keys — a rotation.
-        let mut a2 = member(&authority, 9, mac(2), 1000);
+        // Same MAC and same key, a longer window — a renewal.
+        let mut a2 = member(&authority, 2, mac(2), 5000);
         let (mut buf, len) = bare_ogm(mac(2), 8);
         let len = a2.augment_ogm(&mut buf, len).unwrap();
         assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
 
-        let (cached_cert, fp2) = b
-            .neighbor_cert(mac(2))
-            .expect("still cached after rotation");
-        assert_ne!(fp1, fp2, "rotation must change the fingerprint");
+        let (cached_cert, fp2) = b.neighbor_cert(mac(2)).expect("still cached after renewal");
+        assert_ne!(fp1, fp2, "renewal must change the fingerprint");
         assert_eq!(cached_cert.as_bytes(), a2.cert.as_bytes());
     }
 
@@ -3544,6 +3762,410 @@ mod tests {
             "evicted neighbor's cert must be gone, not just its VerifiedCert"
         );
         assert!(b.neighbor_cert(mac(200)).is_some());
+    }
+
+    /// gap-4A: a second certificate for a **live** member's MAC, under a
+    /// different identity key, must not displace the entry the member is
+    /// using.
+    ///
+    /// The cached pairwise key is symmetric ECDH, so flipping it breaks the
+    /// member's directed data plane in *both* directions — a total, sustained
+    /// denial of one member's authenticated traffic from a single misissued
+    /// certificate, which is what the red-team sweep measured at 0/6 delivery.
+    /// The receiver is here made no more permissive than its own authority,
+    /// which already refuses to issue a second key for a MAC whose certificate
+    /// is still inside its window.
+    #[test]
+    fn a_second_key_cannot_displace_a_live_member() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let mut hq = member(&authority, 2, mac(2), 1000);
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = hq.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+        let pairwise_for = |b: &OgmAuth| {
+            b.neighbors()
+                .iter()
+                .find(|n| n.cert.mac == mac(2))
+                .map(|n| n.pairwise_key)
+        };
+        let held_key = pairwise_for(&b).expect("hq cached");
+
+        // A second CA-signed cert for hq's live MAC, under the attacker's key.
+        let mut eve = member(&authority, 9, mac(2), 1000);
+        let (mut buf, len) = bare_ogm(mac(2), 8);
+        let len = eve.augment_ogm(&mut buf, len).unwrap();
+        // The verdict is deliberately untouched: the certificate really is
+        // CA-signed and the signature really does check out, so this stays a
+        // decision about *what this node caches*. Refusing the advertisement
+        // itself would mean binding the address to the key at verification
+        // time, which is #16's fix, not this one.
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        let (cached, _) = b.neighbor_cert(mac(2)).expect("hq's entry survives");
+        assert_eq!(
+            cached.as_bytes(),
+            hq.cert.as_bytes(),
+            "the live member's certificate must not be replaced"
+        );
+        assert_eq!(
+            pairwise_for(&b),
+            Some(held_key),
+            "nor the pairwise key derived from it"
+        );
+        assert_eq!(b.neighbors().len(), 1, "and no second entry for that MAC");
+    }
+
+    /// The point of the refusal, stated as the property it protects: the real
+    /// member's genuinely-tagged directed frames keep verifying while the
+    /// second certificate is being flooded.
+    #[test]
+    fn a_live_member_keeps_its_data_plane_under_a_second_key() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let mut hq = member(&authority, 2, mac(2), 1000);
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = hq.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        // hq learns b's keys too, so it can tag a frame at b.
+        let (mut buf, len) = bare_ogm(mac(3), 7);
+        let len = b.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(hq.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        let mut eve = member(&authority, 9, mac(2), 1000);
+        let (mut buf, len) = bare_ogm(mac(2), 8);
+        let len = eve.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        let mut trailer = [0u8; DIRECTED_TRAILER_LEN];
+        hq.tag_directed(mac(3), b"frame", &mut trailer)
+            .expect("the real member can still tag");
+        assert!(
+            b.verify_directed(mac(2), b"frame", &trailer),
+            "a frame the real member tagged must still verify"
+        );
+    }
+
+    /// The refusal is keyed on the **identity** key, not the certificate: an
+    /// agreement-key-only rotation is something the authority will sign for a
+    /// live member (its lock compares `ed_pubkey` alone), so the receiver has
+    /// to admit it or it would reject a certificate its own CA just issued.
+    #[test]
+    fn an_agreement_key_rotation_is_admitted_for_a_live_member() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let mut a1 = member(&authority, 2, mac(2), 1000);
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a1.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        // Same identity key, a fresh agreement key: signed by the seed-2
+        // keypair, carrying the seed-9 keypair's `x_pubkey`.
+        let kp = Keypair::from_seed(&[2; 32]);
+        let rotated_x = Keypair::from_seed(&[9; 32]).x_pubkey();
+        let cert = authority.issue_cert(mac(2), kp.ed_pubkey(), rotated_x, 0, 1000);
+        let mut a2 = OgmAuth::new(kp, cert, authority.trust_anchor());
+        a2.set_time(100);
+
+        let (mut buf, len) = bare_ogm(mac(2), 8);
+        let len = a2.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        let (cached, _) = b.neighbor_cert(mac(2)).expect("still cached");
+        assert_eq!(
+            cached.as_bytes(),
+            a2.cert.as_bytes(),
+            "an x-only rotation must replace the entry"
+        );
+    }
+
+    /// Once the held certificate has lapsed, its MAC is free again: the entry
+    /// is not live, so a new key caches normally. Without this the refusal
+    /// would be permanent rather than scoped to the window the authority's own
+    /// lock is scoped to.
+    #[test]
+    fn a_lapsed_members_mac_admits_a_new_key() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 100_000);
+
+        let mut a1 = member(&authority, 2, mac(2), 1000);
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a1.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        // Past a1's `not_after`: the entry is gone, and a different key may
+        // take the address.
+        b.set_time(2000);
+        let mut a2 = member(&authority, 9, mac(2), 100_000);
+        a2.set_time(2000);
+        let (mut buf, len) = bare_ogm(mac(2), 8);
+        let len = a2.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        let (cached, _) = b.neighbor_cert(mac(2)).expect("the new key is cached");
+        assert_eq!(cached.as_bytes(), a2.cert.as_bytes());
+    }
+
+    /// A revocation lifts the lock the same way: ingesting one calls
+    /// `evict_neighbor`, so there is no held entry left for the rule to
+    /// collide with and a re-admitted node (a certificate issued *after* the
+    /// revocation instant) caches under its new key.
+    #[test]
+    fn a_revoked_members_mac_admits_a_new_key() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 100_000);
+
+        let mut a1 = member(&authority, 2, mac(2), 100_000);
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a1.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        assert!(b.ingest_revocation(&authority.revoke(mac(2), 500, 100_000)));
+        assert!(
+            b.neighbor_cert(mac(2)).is_none(),
+            "the revocation evicted the entry"
+        );
+
+        // Re-admission: a certificate issued after the revocation instant.
+        b.set_time(700);
+        let kp = Keypair::from_seed(&[9; 32]);
+        let cert = authority.issue_cert(mac(2), kp.ed_pubkey(), kp.x_pubkey(), 600, 100_000);
+        let mut a2 = OgmAuth::new(kp, cert, authority.trust_anchor());
+        a2.set_time(700);
+
+        let (mut buf, len) = bare_ogm(mac(2), 8);
+        let len = a2.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        let (cached, _) = b
+            .neighbor_cert(mac(2))
+            .expect("the re-admitted key is cached");
+        assert_eq!(cached.as_bytes(), a2.cert.as_bytes());
+    }
+
+    /// An unclocked node (`now_unix == 0`) cannot judge whether the entry it
+    /// holds is still live, and `live_neighbor` calls everything live then —
+    /// so mirroring that here would make such a node refuse a legitimate
+    /// re-key *forever*. It admits the new key instead, matching the authority,
+    /// which fails closed on a zero clock rather than locking an address on one.
+    #[test]
+    fn an_unclocked_node_admits_a_new_key() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        b.set_time(0);
+
+        let mut a1 = member(&authority, 2, mac(2), 1000);
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a1.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        let mut a2 = member(&authority, 9, mac(2), 1000);
+        let (mut buf, len) = bare_ogm(mac(2), 8);
+        let len = a2.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        let (cached, _) = b.neighbor_cert(mac(2)).expect("cached");
+        assert_eq!(cached.as_bytes(), a2.cert.as_bytes());
+    }
+
+    /// The refusal is also *reported*. `derive_mac` yields 46 bits, so an
+    /// accidental collision is negligible and two identity keys claiming one
+    /// address means a misissuance or a compromised anchor — but silently
+    /// dropping the second certificate would present to an operator as
+    /// unexplained route flapping with nothing to grep for.
+    ///
+    /// Raised onto a scoped board rather than the process-global one, so
+    /// `alarms.len() == 1` is an assertion about *this* raise rather than about
+    /// whatever else has landed on the global board.
+    #[test]
+    fn a_second_key_for_a_live_member_raises_an_alarm() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let mut hq = member(&authority, 2, mac(2), 1000);
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = hq.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        let mut eve = member(&authority, 9, mac(2), 1000);
+        let (mut buf, len) = bare_ogm(mac(2), 8);
+        let len = eve.augment_ogm(&mut buf, len).unwrap();
+
+        let board = std::sync::Arc::new(wayfinder_alarm::SharedBoard::new());
+        wayfinder_alarm::with_board(&board, || {
+            assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+        });
+
+        let snapshot = board.snapshot();
+        assert_eq!(snapshot.alarms.len(), 1);
+        let raised = &snapshot.alarms[0];
+        assert_eq!(raised.kind, wayfinder_alarm::AlarmKind::IdentityConflict);
+        assert_eq!(raised.severity, wayfinder_alarm::Severity::Warning);
+        assert_eq!(
+            raised.subject,
+            wayfinder_alarm::Subject::Node(wayfinder_alarm::NodeId::new(&mac(2).0)),
+            "attributed to the contested address"
+        );
+    }
+
+    /// A flooded losing certificate is one alarm row with a count, not one row
+    /// per frame. Load-bearing rather than incidental: the refused certificate
+    /// never enters `verify_ogm`'s `known` memo, so *every* copy reaches the
+    /// refusal, and an alarm board that grew a row per copy would become the
+    /// flood it exists to report.
+    #[test]
+    fn a_flood_of_a_second_key_is_one_alarm_row_with_a_count() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let mut hq = member(&authority, 2, mac(2), 1000);
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = hq.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        let mut eve = member(&authority, 9, mac(2), 1000);
+        let board = std::sync::Arc::new(wayfinder_alarm::SharedBoard::new());
+        wayfinder_alarm::with_board(&board, || {
+            for seqno in 100..110 {
+                let (mut buf, len) = bare_ogm(mac(2), seqno);
+                let len = eve.augment_ogm(&mut buf, len).unwrap();
+                assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+            }
+        });
+
+        let snapshot = board.snapshot();
+        assert_eq!(snapshot.alarms.len(), 1, "one row, however long the flood");
+        assert_eq!(snapshot.alarms[0].count, 10, "the count carries the volume");
+        assert!(
+            snapshot.alarms[0].detail.starts_with("refused_key="),
+            "the detail names the key that was turned away: {}",
+            snapshot.alarms[0].detail
+        );
+    }
+
+    /// The legitimate paths must stay *silent*. An alarm on every ordinary
+    /// certificate renewal would train an operator to ignore the one row that
+    /// means their authority issued twice for one address.
+    #[test]
+    fn a_renewal_and_an_agreement_key_rotation_raise_no_alarm() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let mut a1 = member(&authority, 2, mac(2), 1000);
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a1.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        let board = std::sync::Arc::new(wayfinder_alarm::SharedBoard::new());
+        wayfinder_alarm::with_board(&board, || {
+            // A renewal: same identity key, longer window.
+            let mut a2 = member(&authority, 2, mac(2), 5000);
+            let (mut buf, len) = bare_ogm(mac(2), 8);
+            let len = a2.augment_ogm(&mut buf, len).unwrap();
+            assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+            // An agreement-key-only rotation: same identity key, fresh x key.
+            let kp = Keypair::from_seed(&[2; 32]);
+            let rotated_x = Keypair::from_seed(&[9; 32]).x_pubkey();
+            let cert = authority.issue_cert(mac(2), kp.ed_pubkey(), rotated_x, 0, 5000);
+            let mut a3 = OgmAuth::new(kp, cert, authority.trust_anchor());
+            a3.set_time(100);
+            let (mut buf, len) = bare_ogm(mac(2), 9);
+            let len = a3.augment_ogm(&mut buf, len).unwrap();
+            assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+        });
+
+        assert!(
+            board.snapshot().alarms.is_empty(),
+            "an identity that never changed is not a conflict"
+        );
+    }
+
+    /// A `CertReply` carrying a second identity for a live member's address is
+    /// refused — and, critically, the outstanding request it failed to answer
+    /// **survives**.
+    ///
+    /// The ordering inside `ingest_cert_reply` is what this pins. Clearing the
+    /// in-flight entry before knowing whether the cache took the certificate
+    /// would let whoever raced a reply in consume the fetch attempt for that
+    /// MAC and report success doing it, deleting the retry backstop the
+    /// function's contract promises.
+    #[test]
+    fn a_cert_reply_for_a_contested_address_keeps_the_request_outstanding() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut b = member(&authority, 3, mac(3), 1000);
+
+        let mut hq = member(&authority, 2, mac(2), 1000);
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = hq.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(b.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        let mut req = [0u8; 512];
+        b.build_cert_request(mac(2), [0xAA; 8], mac(9), &mut req)
+            .unwrap();
+
+        let eve = member(&authority, 9, mac(2), 1000);
+        assert!(
+            !b.ingest_cert_reply(eve.cert.as_bytes()),
+            "a reply for a contested address is not a cached cert"
+        );
+        let (cached, _) = b.neighbor_cert(mac(2)).expect("hq's entry survives");
+        assert_eq!(cached.as_bytes(), hq.cert.as_bytes());
+
+        // The request is still outstanding, so a genuine reply still lands —
+        // which it could not do had the refused one consumed the entry.
+        assert!(
+            b.ingest_cert_reply(hq.cert.as_bytes()),
+            "the refused reply must not have consumed the outstanding request"
+        );
+    }
+
+    /// A `CertReq` presenting a second identity for a live member's address is
+    /// refused *before* the rate limiter, so it cannot spend the real member's
+    /// slot.
+    ///
+    /// `requester` is read off the presented certificate, so such a request
+    /// arrives naming the member it is impersonating. Checking after the
+    /// limiter would let an attacker keep that member's slot permanently hot
+    /// and deny their genuine requests — the same inversion the
+    /// proof-of-possession ordering above it exists to prevent, reached by a
+    /// party who holds a real key and so passes that check cleanly.
+    #[test]
+    fn a_cert_request_for_a_contested_address_costs_the_member_nothing() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut responder = member(&authority, 1, mac(1), 1000);
+
+        let mut hq = member(&authority, 2, mac(2), 1000);
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = hq.augment_ogm(&mut buf, len).unwrap();
+        assert_eq!(responder.verify_ogm(&buf[..len]), OgmVerdict::Verified);
+
+        let mut eve = member(&authority, 9, mac(2), 1000);
+        let mut forged = [0u8; 512];
+        let forged_len = eve
+            .build_cert_request(mac(1), [0; 8], mac(9), &mut forged)
+            .unwrap();
+        assert_eq!(
+            responder.verify_cert_request(&forged[..forged_len]),
+            None,
+            "a request under a second identity for a live address is refused"
+        );
+
+        // The real member's own request, immediately after and well inside the
+        // rate-limit window, must still be answered.
+        let mut genuine = [0u8; 512];
+        let genuine_len = hq
+            .build_cert_request(mac(1), [0; 8], mac(9), &mut genuine)
+            .unwrap();
+        assert_eq!(
+            responder.verify_cert_request(&genuine[..genuine_len]),
+            Some(mac(2)),
+            "the refused request must not have consumed the member's slot"
+        );
     }
 
     /// Build a "lazy" OGM: header + `CertFp` (not `Cert`) + `OgmSig`, signed

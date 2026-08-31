@@ -338,6 +338,7 @@ fn alarm_kind_data(kind: wayfinder_alarm::AlarmKind) -> AlarmKindData {
         wayfinder_alarm::AlarmKind::TableSaturation => AlarmKindData::TableSaturation,
         wayfinder_alarm::AlarmKind::ClockUnsynchronized => AlarmKindData::ClockUnsynchronized,
         wayfinder_alarm::AlarmKind::SelfRevoked => AlarmKindData::SelfRevoked,
+        wayfinder_alarm::AlarmKind::IdentityConflict => AlarmKindData::IdentityConflict,
     }
 }
 

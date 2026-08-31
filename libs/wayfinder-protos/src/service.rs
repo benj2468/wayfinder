@@ -713,6 +713,9 @@ pub enum AlarmKindData {
     /// This node's own membership has been revoked; it is inert until
     /// re-admitted.
     SelfRevoked,
+    /// Two distinct identity keys claiming one mesh address; the second
+    /// certificate was refused.
+    IdentityConflict,
 }
 
 /// Who or what an alarm is about.
@@ -1560,6 +1563,7 @@ fn proto_alarm_kind(kind: AlarmKindData) -> AlarmKind {
         AlarmKindData::TableSaturation => AlarmKind::TableSaturation,
         AlarmKindData::ClockUnsynchronized => AlarmKind::ClockUnsynchronized,
         AlarmKindData::SelfRevoked => AlarmKind::SelfRevoked,
+        AlarmKindData::IdentityConflict => AlarmKind::IdentityConflict,
     }
 }
 

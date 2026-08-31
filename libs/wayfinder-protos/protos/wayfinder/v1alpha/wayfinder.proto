@@ -490,6 +490,13 @@ enum AlarmKind {
   // until an authority re-admits it.  Distinct from ALARM_KIND_REVOKED_PEER,
   // which is about somebody else.
   ALARM_KIND_SELF_REVOKED = 9;
+
+  // Two distinct identity keys are claiming one mesh address: a second
+  // CA-signed certificate arrived for a MAC whose held certificate is still
+  // live, under a different identity key, and was refused.  Nothing is broken
+  // by the time this is raised, which is why it is reported: the explanation
+  // is an authority that issued twice for one address, not a flapping radio.
+  ALARM_KIND_IDENTITY_CONFLICT = 10;
 }
 
 // One latched condition the node is holding.

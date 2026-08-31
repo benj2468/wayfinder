@@ -190,6 +190,22 @@ pub enum AlarmKind {
     /// is the only record of *why* the node went silent — so it is the alarm
     /// that has to survive the burst of frames that carried it.
     SelfRevoked,
+    /// Two distinct identity keys are claiming one mesh address: a second
+    /// CA-signed certificate arrived for a MAC whose held certificate is still
+    /// live, under a different `ed_pubkey`, and was refused.
+    ///
+    /// Refused rather than honoured, so nothing is broken by the time this is
+    /// raised — which is exactly why it has to be said out loud. A node that
+    /// silently dropped the loser would present the same way as one with an
+    /// intermittent radio, and the actual explanation (an authority that
+    /// issued twice for one address, or an anchor no longer under the
+    /// operator's sole control) is not something route flapping ever suggests.
+    ///
+    /// Addresses derived from an identity key carry 46 bits, so an accidental
+    /// collision is negligible and a deliberate one is days of GPU time; this
+    /// is a credential-issuance condition far more often than an address-space
+    /// one.
+    IdentityConflict,
 }
 
 impl AlarmKind {
@@ -207,6 +223,7 @@ impl AlarmKind {
             Self::TableSaturation => 7,
             Self::ClockUnsynchronized => 8,
             Self::SelfRevoked => 9,
+            Self::IdentityConflict => 10,
         }
     }
 
@@ -224,6 +241,7 @@ impl AlarmKind {
             Self::TableSaturation => "table_saturation",
             Self::ClockUnsynchronized => "clock_unsynchronized",
             Self::SelfRevoked => "self_revoked",
+            Self::IdentityConflict => "identity_conflict",
         }
     }
 }

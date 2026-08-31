@@ -525,6 +525,7 @@ fn alarm_kind_name(kind: i32) -> &'static str {
         Ok(AlarmKind::TableSaturation) => "table_saturation",
         Ok(AlarmKind::ClockUnsynchronized) => "clock_unsynchronized",
         Ok(AlarmKind::SelfRevoked) => "self_revoked",
+        Ok(AlarmKind::IdentityConflict) => "identity_conflict",
         // A node newer than this build, holding a condition it has no name for.
         // Shown as unknown rather than dropped: an alarm this client cannot name
         // is still an alarm.
