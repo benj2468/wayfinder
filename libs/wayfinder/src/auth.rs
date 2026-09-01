@@ -2089,14 +2089,21 @@ impl<
     ///
     ///   **The cost is that this rule does not protect an unclocked node at
     ///   all**, and no embedded target sets the clock today — no board path
-    ///   calls [`set_time`](Self::set_time) — so an nRF52840 or STM32 still
-    ///   takes the overwrite this refuses on a host. That is a deliberate
-    ///   choice recorded in issue #48 rather than an oversight, but it means
-    ///   the measured denial is closed for host nodes and open for boards. A
-    ///   rule keyed on *recency* (the shared uptime clock, which every target
-    ///   has) rather than on wall-clock validity would carry it onto a board;
-    ///   it needs a per-entry timestamp `NeighborKeys` does not have, and at
-    ///   64 × 272 bytes that is a real cost on the node it would protect.
+    ///   calls [`set_time`](Self::set_time). That is latent rather than
+    ///   exploitable, because no board constructs an `OgmAuth` in the first
+    ///   place: a bare-metal node cannot hold a membership credential yet, and
+    ///   at `now_unix == 0` `verify_cert` would refuse every certificate a real
+    ///   authority issues (`not_before` is stamped from the CA's clock, and the
+    ///   window check has no zero-clock bypass). So this is a blocker to
+    ///   *enabling* embedded auth rather than a hole in a shipped one — see the
+    ///   "Auth on Embedded" epic, which tracks it.
+    ///
+    ///   It does mean the rule has to be revisited when that epic lands. If
+    ///   boards gain a usable wall clock it closes for free; if they do not, the
+    ///   candidate is a rule keyed on *recency* — the shared uptime clock every
+    ///   target already has — which needs a per-entry timestamp `NeighborKeys`
+    ///   does not carry, and at 64 × 272 bytes that is a real budget on exactly
+    ///   the node it would protect.
     /// - **The comparison is on `ed_pubkey` alone**, matching the authority's
     ///   issued-certificate lock. An agreement-key-only rotation is something
     ///   the CA will sign for a live member, so a rule keyed on anything wider

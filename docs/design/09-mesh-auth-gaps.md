@@ -1004,6 +1004,12 @@ Two edges are decided rather than inherited:
   embedded one has no wall clock today — refuse a legitimate re-key forever.
   Such a node cannot judge certificate validity at all, and the authority
   itself fails closed on a zero clock rather than locking addresses on one.
+
+  This leaves the rule inert on a board, which is latent rather than
+  exploitable: no board constructs an `OgmAuth` at all today, and at
+  `now_unix == 0` `verify_cert` would refuse every certificate a real authority
+  issues anyway. It is a blocker to *enabling* embedded auth, not a hole in a
+  shipped one — tracked by the "Auth on Embedded" epic.
 - **The comparison is on `ed_pubkey` alone**, matching the authority's lock. An
   agreement-key-only rotation is something the CA will sign for a live member,
   so a wider rule would reject a certificate this mesh's own authority had just
