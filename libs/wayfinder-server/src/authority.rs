@@ -3145,6 +3145,36 @@ mod tests {
         );
     }
 
+    /// An issued certificate's `not_before` is the issuing clock — so in any
+    /// real deployment it is a Unix timestamp, never zero.
+    ///
+    /// The other half of the pair with
+    /// `an_unclocked_verifier_refuses_a_certificate_from_a_real_authority` in
+    /// `wayfinder-auth`: that one shows a verifier at `now_unix == 0` refuses a
+    /// certificate whose `not_before` is real, and this one shows that is the
+    /// only kind an authority produces. Together they are why a bare-metal node
+    /// cannot hold a membership credential today.
+    #[test]
+    fn an_issued_certificates_not_before_is_the_issuing_clock() {
+        const ISSUED_AT: u64 = 1_700_000_000;
+
+        let mut ca = open_ca();
+        let (ed, x) = node_keys(2);
+        ca.set_now_unix(ISSUED_AT);
+        issued_cert(&mut ca, &[0, 0, 0, 0, 0, 9], &ed, &x, "");
+
+        let certs = ca.list_certs();
+        let issued = certs.iter().find(|c| c.node_mac[5] == 9).expect("issued");
+        assert_eq!(
+            issued.not_before, ISSUED_AT,
+            "the window opens at the moment of issuance, not at zero"
+        );
+        assert_ne!(
+            issued.not_before, 0,
+            "a zero `not_before` is a test-fixture shape, not one an authority mints"
+        );
+    }
+
     #[test]
     fn list_certs_records_issued_and_dedups_by_mac() {
         let mut ca = open_ca();

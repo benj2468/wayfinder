@@ -487,6 +487,72 @@ mod tests {
         assert!(anchor.verify_cert(&cert, 200).is_ok());
     }
 
+    /// **A verifier with no clock refuses every certificate a real authority
+    /// issues.**
+    ///
+    /// Not a corner case. `CertAuthority` stamps `not_before` from its own
+    /// clock and refuses to issue at all without one, so every genuine
+    /// certificate carries a real Unix timestamp — and the window check above
+    /// has no zero-clock bypass, so `0 < not_before` is `NotYetValid`.
+    ///
+    /// Pinned because nothing else did: every other fixture in this workspace
+    /// issues with `not_before = 0` (see the test below), which is why a
+    /// bare-metal node — permanently at `now_unix == 0`, since no board calls
+    /// `OgmAuth::set_time` — being unable to admit *anyone* went unnoticed.
+    ///
+    /// This characterises today's behaviour rather than asserting a fix. The
+    /// "Auth on Embedded" epic owns choosing what an unclocked node should do
+    /// instead, and this is the test that has to change when it does.
+    #[test]
+    fn an_unclocked_verifier_refuses_a_certificate_from_a_real_authority() {
+        const ISSUED_AT: u64 = 1_700_000_000;
+        const A_YEAR: u64 = 365 * 24 * 60 * 60;
+
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let node = Keypair::from_seed(&[2u8; 32]);
+        let cert = authority.issue_cert(
+            mac(5),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            ISSUED_AT,
+            ISSUED_AT + A_YEAR,
+        );
+        let anchor = authority.trust_anchor();
+
+        assert_eq!(
+            anchor.verify_cert(&cert, 0),
+            Err(AuthError::NotYetValid),
+            "an unclocked verifier refuses a certificate that is valid right now"
+        );
+
+        // The control: the certificate is fine and the anchor is fine. The
+        // clock is the whole difference.
+        assert!(
+            anchor.verify_cert(&cert, ISSUED_AT + 1).is_ok(),
+            "the same certificate verifies the moment the verifier knows the time"
+        );
+    }
+
+    /// The contrast that explains the blind spot: a certificate issued with
+    /// `not_before = 0` verifies happily on an unclocked verifier, because zero
+    /// is not below zero.
+    ///
+    /// That is the shape every test fixture in this workspace uses, and no
+    /// authority ever produces it — `CertAuthority` refuses to issue without a
+    /// clock. So the fixtures agreed with each other and with nothing that
+    /// ships.
+    #[test]
+    fn a_zero_not_before_is_what_hid_the_unclocked_gap() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let node = Keypair::from_seed(&[2u8; 32]);
+        let cert = authority.issue_cert(mac(5), node.ed_pubkey(), node.x_pubkey(), 0, 200);
+
+        assert!(
+            authority.trust_anchor().verify_cert(&cert, 0).is_ok(),
+            "the fixture shape verifies at time zero, which a real one does not"
+        );
+    }
+
     /// Tampering with any signed field invalidates the signature.
     #[test]
     fn tampered_cert_rejected() {
