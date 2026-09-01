@@ -2408,6 +2408,64 @@ mod tests {
         assert!(b.neighbor_cert(mac(2)).is_some());
     }
 
+    /// The node-level consequence of the unclocked verifier: **a node with no
+    /// clock admits nobody at all.**
+    ///
+    /// Both nodes here hold certificates shaped the way a real authority issues
+    /// them — a `not_before` of a real Unix timestamp — and the receiver simply
+    /// never had its clock set, which is the permanent condition of every board
+    /// today (no target calls [`set_time`](OgmAuth::set_time); only the host
+    /// tokio driver does). Every OGM is `Rejected` at the certificate's window
+    /// check before anything else is considered.
+    ///
+    /// So membership auth cannot be switched on for a bare-metal node until it
+    /// has a usable clock — which is the blocker the "Auth on Embedded" epic
+    /// exists for, and the reason the identity lock in `cache_neighbor` being
+    /// inert at `now_unix == 0` is latent rather than exploitable: there is no
+    /// embedded auth for it to fail to protect.
+    ///
+    /// Characterises today's behaviour; the epic owns changing it.
+    #[test]
+    fn an_unclocked_node_cannot_admit_a_member_certified_by_a_real_authority() {
+        const ISSUED_AT: u64 = 1_700_000_000;
+        const A_YEAR: u64 = 365 * 24 * 60 * 60;
+
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member_issued_at(
+            &authority,
+            2,
+            mac(2),
+            ISSUED_AT,
+            ISSUED_AT + A_YEAR,
+            ISSUED_AT,
+        );
+        // The receiver: same mesh, same shape of certificate, no clock.
+        let mut b = member_issued_at(&authority, 3, mac(3), ISSUED_AT, ISSUED_AT + A_YEAR, 0);
+
+        let (mut buf, len) = bare_ogm(mac(2), 7);
+        let len = a.augment_ogm(&mut buf, len).expect("augment");
+
+        assert_eq!(
+            b.verify_ogm(&buf[..len]),
+            OgmVerdict::Rejected,
+            "an unclocked node rejects a member whose certificate is valid right now"
+        );
+        assert!(
+            b.neighbors().is_empty(),
+            "and learns nothing from it — no keys, no route, no data plane"
+        );
+
+        // The control: the same OGM and the same certificates, once the
+        // receiver knows the time.
+        b.set_time(ISSUED_AT + 1);
+        assert_eq!(
+            b.verify_ogm(&buf[..len]),
+            OgmVerdict::Verified,
+            "the clock is the only difference"
+        );
+        assert_eq!(b.neighbors().len(), 1);
+    }
+
     /// A node augments its OGM; a peer on the same mesh accepts it and learns
     /// the originator's keys.
     #[test]
