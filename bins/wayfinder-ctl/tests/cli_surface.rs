@@ -19,7 +19,6 @@ use wayfinderctl::link::LinkCommand;
 use wayfinderctl::provider::ProviderCommand;
 use wayfinderctl::provider::RequestsCommand;
 use wayfinderctl::user::UserCommand;
-use wayfinderctl::vpn::VpnCommand;
 
 /// Parse an argv tail into the [`Command`] it reaches, panicking if clap
 /// rejects it.
@@ -237,18 +236,6 @@ fn provider_requests_parse() {
     ));
 }
 
-#[test]
-fn provider_nests_user_and_vpn() {
-    assert!(matches!(
-        parse(&["provider", "user", "list"]),
-        Command::Provider(ProviderCommand::User(UserCommand::List))
-    ));
-    assert!(matches!(
-        parse(&["provider", "vpn", "list"]),
-        Command::Provider(ProviderCommand::Vpn(VpnCommand::List))
-    ));
-}
-
 /// `ca` is the short spelling, so the extra nesting costs two characters rather
 /// than eight on the commands an operator runs most.
 #[test]
@@ -313,33 +300,10 @@ fn csr_install_cannot_reidentify_a_node() {
 
 // ── compatibility: the spellings with call sites across the repo ────────────
 
-/// `user`, `vpn` and `enroll` account for ~70 call sites in docs, nix modules
-/// and CI. They keep working as top-level shortcuts rather than being rewritten
-/// — `docs/design/implemented/**` in particular is a record of what shipped and
-/// should not be edited to match a later rename.
-#[test]
-fn legacy_top_level_spellings_still_work() {
-    assert!(matches!(
-        parse(&["user", "list"]),
-        Command::Provider(ProviderCommand::User(UserCommand::List))
-    ));
-    assert!(matches!(
-        parse(&["vpn", "list"]),
-        Command::Provider(ProviderCommand::Vpn(VpnCommand::List))
-    ));
-    assert!(matches!(
-        parse(&[
-            "enroll",
-            "--out-seed",
-            "/s",
-            "--out-cert",
-            "/c",
-            "--out-anchor",
-            "/a"
-        ]),
-        Command::Auth(AuthCommand::Enroll { .. })
-    ));
-}
+// `user` and `enroll` keep working as top-level shortcuts rather than being
+// rewritten — `docs/design/implemented/**` in particular is a record of what
+// shipped and should not be edited to match a later rename. (`vpn` was a third
+// such alias until design 18 removed the subject entirely.)
 
 /// `security` is the name the TUI tab and the web tab both use, so it stays
 /// reachable even though the subject now lives under `auth`.

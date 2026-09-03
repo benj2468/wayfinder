@@ -65,7 +65,47 @@ such carrier stamps identical bytes.
 
 Carriers available: `build_udp_link` / `build_udp_multi_link` / `UdpMultiLink`
 (`net.rs`), `build_raw_ip_link` / `build_raw_l2_link` / `RawL2Link` (`raw.rs`),
-`build_rylr998_link` (`rylr998.rs`), `build_ble_link` (`blue.rs`).
+`build_rylr998_link` (`rylr998.rs`), `build_ble_link` (`blue.rs`),
+`build_iroh_link` / `IrohLink` (`iroh.rs`).
+
+`IrohLink` is the internet carrier: BATMAN frames as QUIC datagrams over
+[iroh](https://docs.iroh.computer), dialed by the node's own Ed25519 identity
+key instead of an IP address, so it reaches a CGNAT'd peer without a tunnel
+daemon or a coordination server. It is structurally `UdpMultiLink` with an
+`EndpointId` where that link keeps a `SocketAddr` — the same learn-from-received
+-frames peer table with the same bound and TTL — and two differences worth
+knowing before changing it:
+
+- **A broadcast fans out over the live *connection* set, not the peer table.**
+  A bootstrapped connection has taught us nothing yet, so a table-driven
+  fan-out would never send it the first OGM, the peer would never reply, and
+  nothing would ever be learned. The table is for unicast resolution only.
+- **`send` never dials.** A QUIC handshake plus a hole punch is far longer than
+  the driver's event loop can be held, so an unconnected destination gets a
+  deduped background dial and a dropped frame; Trickle's next emission uses the
+  connection. See `docs/design/18-iroh-mesh-links.md` §3.5.
+- **Revocation reaches the transport through `AuthView`, not through `LinkT`.**
+  `peers.rs` publishes `Mac → key` plus a *stale* set (revoked ∪ superseded)
+  and a generation counter; `IrohLink::reconcile` closes any connection whose
+  key went stale, and `recv` races the watch so an idle link reacts too. Without
+  it revocation stopped at the router: the engine refused a revoked peer's
+  frames while the carrier held the socket open and kept it in the broadcast
+  fan-out set.
+
+  A revocation names a **MAC, not a key**, and the router evicts the cached
+  certificate as it ingests one — so `AuthView` remembers the last key each MAC
+  was known by. That memory is what makes a revoked connection closable at all.
+
+  The same mechanism is what rotates a re-keyed peer (including the CA) without
+  touching config, but only while the node is *connected* when the rotation
+  happens. A node offline across a rotation restarts with an empty view and a
+  stale `bootstrap_peers`; recovering needs the key out of band.
+
+It cannot ever run on a board — iroh is `std`-only, and an MCU has no IP stack
+and no NAT to traverse (design 18 §2). Host-only, like the BlueZ and raw-L2
+carriers, and gated the same way: the constructor exists unconditionally and
+fails with a stated reason, so a config naming an iroh link is a startup error
+rather than a compile error.
 
 ## Features
 
@@ -74,6 +114,13 @@ the link builders; without it the crate is just `FrameIo` + `McastSnooper`.
 `ble` is split out of `tokio`/`std` deliberately so a consumer can take the
 `Driver` without dragging in BlueZ/D-Bus — note the `blue?/std` (optional-dep)
 syntax in `Cargo.toml`, which is what keeps `std` alone from pulling it.
+
+`iroh` is split out for the same reason and goes further: it is **not in
+`default`**, because it pulls 112 crates (quinn/noq, hickory-resolver,
+portmapper) that core work should not pay for. `bins/wayfinder-tap` turns it on,
+so a real node and a workspace build both cover it — but
+`cargo check -p wayfinder-driver` alone does *not* compile `iroh.rs`'s
+implementation. Use `--features iroh` when changing it.
 
 ## Re-exports are the public seam
 

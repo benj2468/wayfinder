@@ -19,7 +19,6 @@ use wayfinder_protos::wayfinder::v1alpha::KeepAliveTable;
 use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesTable;
 use wayfinder_protos::wayfinder::v1alpha::LinkQualityTable;
 use wayfinder_protos::wayfinder::v1alpha::ListPendingCsrsResponse;
-use wayfinder_protos::wayfinder::v1alpha::ListVpnPeersResponse;
 use wayfinder_protos::wayfinder::v1alpha::LogRecords;
 use wayfinder_protos::wayfinder::v1alpha::NodeInfo;
 use wayfinder_protos::wayfinder::v1alpha::NodeMetrics;
@@ -67,14 +66,6 @@ pub struct NodeSnapshot {
     /// CSRs awaiting operator approval. `None` when the node is not a
     /// certificate-authority provider — see [`build_snapshot`].
     pub pending_csrs: Option<ListPendingCsrsResponse>,
-    /// VPN peers registered with the provider's coordination server. `None`
-    /// when this node is not a provider *or* has no VPN configured — the
-    /// common case, since VPN links are additive — *or* when the poll was made
-    /// on a read-only connection, which the node does not serve this table to
-    /// and whose viewer never sees the Provider tab it feeds. Distinguishing
-    /// them would need a different answer from the node; the panel simply does
-    /// not appear, which is right for all three.
-    pub vpn_peers: Option<ListVpnPeersResponse>,
     /// Log records since the cursor the poll asked from, plus the next cursor.
     pub logs: LogRecords,
     /// The node's alarm board: the conditions it currently believes are wrong.
@@ -85,21 +76,6 @@ pub struct NodeSnapshot {
     /// node has been *reached* is `Dashboard::connected`'s question, and it is
     /// answered an inch away in the same header.
     pub alarms: Alarms,
-}
-
-/// What the credential behind a poll may ask the node for.
-///
-/// A closed enum rather than a bare `bool`, so a call site says which it means
-/// and a third tier — should one ever gain its own visible tables — is a
-/// compile error at every poll instead of a silent misread.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PollScope {
-    /// An administrator's connection: every table, including the ones the node
-    /// serves only to a full grant.
-    Administrator,
-    /// A read-only connection: the queries a viewer certificate may make, and
-    /// none of the admin-gated ones.
-    ReadOnly,
 }
 
 /// Poll a node for one [`NodeSnapshot`], resuming the log stream at `since_seq`.
@@ -129,11 +105,7 @@ pub enum PollScope {
 /// whole snapshot and write a security `warn!` into the node's log once a
 /// second for as long as anyone left the dashboard open.
 #[cfg(feature = "ssr")]
-pub async fn build_snapshot(
-    conn: &NodeConnection,
-    since_seq: u64,
-    scope: PollScope,
-) -> anyhow::Result<NodeSnapshot> {
+pub async fn build_snapshot(conn: &NodeConnection, since_seq: u64) -> anyhow::Result<NodeSnapshot> {
     conn.run(async |client| {
         Ok(NodeSnapshot {
             node_info: Some(client.node_info().await?),
@@ -149,23 +121,6 @@ pub async fn build_snapshot(
                 Ok(resp) => Some(resp),
                 Err(e) if is_missing_provider(&e) => None,
                 Err(e) => return Err(e),
-            },
-            // Same treatment as `pending_csrs`, plus one more expected answer:
-            // a provider with no VPN configured. Both are facts about the
-            // node rather than faults, and neither should cost the operator
-            // the other nine tables.
-            //
-            // A coordination server that is *configured but unreachable* is
-            // deliberately not in that set: it fails the poll, because an
-            // empty peer list and a broken tunnel control plane look identical
-            // on screen and mean opposite things.
-            vpn_peers: match scope {
-                PollScope::ReadOnly => None,
-                PollScope::Administrator => match client.list_vpn_peers().await {
-                    Ok(resp) => Some(resp),
-                    Err(e) if is_missing_provider(&e) || is_vpn_unconfigured(&e) => None,
-                    Err(e) => return Err(e),
-                },
             },
             logs: client.logs(since_seq, LOG_BATCH).await?,
             // Fetched on every poll, and failing the poll if it fails, like
@@ -189,22 +144,9 @@ fn is_missing_provider(err: &anyhow::Error) -> bool {
         .contains("not a certificate-authority provider")
 }
 
-/// True for the "this provider has no VPN coordination configured" answer
-/// (`wayfinder_server::vpn::VpnError::NotConfigured`'s wording), which is the
-/// normal state of every deployment that does not run a tunnel.
-///
-/// Deliberately narrow: an unreachable or erroring coordination server is a
-/// different `VpnError` with different wording, and must fail the poll rather
-/// than render as "no VPN here".
-#[cfg(feature = "ssr")]
-fn is_vpn_unconfigured(err: &anyhow::Error) -> bool {
-    err.to_string().contains("no VPN coordination configured")
-}
-
 #[cfg(all(test, feature = "ssr"))]
 mod tests {
     use super::is_missing_provider;
-    use super::is_vpn_unconfigured;
 
     #[test]
     fn recognizes_the_not_a_provider_server_error() {
@@ -222,22 +164,5 @@ mod tests {
     fn does_not_recognize_an_unrelated_server_error() {
         let err = anyhow::anyhow!("server error: node is not enrolled");
         assert!(!is_missing_provider(&err));
-    }
-
-    /// A provider with no tunnel is a fact about the deployment; a tunnel
-    /// control plane that is down is a fault. They must not be confused, since
-    /// treating the second as the first renders an empty peer list on a mesh
-    /// whose VPN is broken.
-    #[test]
-    fn tells_an_unconfigured_vpn_apart_from_a_broken_one() {
-        assert!(is_vpn_unconfigured(&anyhow::anyhow!(
-            "server error: this provider has no VPN coordination configured"
-        )));
-        assert!(!is_vpn_unconfigured(&anyhow::anyhow!(
-            "server error: VPN coordination server unreachable: connection refused"
-        )));
-        assert!(!is_vpn_unconfigured(&anyhow::anyhow!(
-            "server error: VPN coordination server returned an unexpected response: bad json"
-        )));
     }
 }

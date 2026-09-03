@@ -146,7 +146,7 @@ mod ssr {
                 let mesh_id = mesh_id_of(&issued.trust_anchor)?;
                 conn.run(async |client| {
                     client
-                        .install_cert(&issued.cert, &issued.trust_anchor)
+                        .install_cert(&issued.cert, &issued.trust_anchor, "")
                         .await
                 })
                 .await

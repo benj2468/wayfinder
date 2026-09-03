@@ -42,22 +42,25 @@ use wayfinder::wayfinder_auth::Keypair;
 use wayfinder::wayfinder_auth::MembershipCert;
 use wayfinder_driver::AuthSnapshotRx;
 use wayfinder_driver::AuthSnapshotTx;
+use wayfinder_driver::AuthView;
 use wayfinder_driver::BleLinkParams;
 use wayfinder_driver::Driver;
 use wayfinder_driver::FrameIo;
+use wayfinder_driver::IrohLinkParams;
 use wayfinder_driver::NullEgress;
 use wayfinder_driver::QueryRx;
 use wayfinder_driver::QueryTx;
 use wayfinder_driver::Rylr998LinkParams;
 use wayfinder_driver::bind_tcp_server;
 use wayfinder_driver::build_ble_link;
+use wayfinder_driver::build_iroh_link;
 use wayfinder_driver::build_raw_ip_link;
 use wayfinder_driver::build_raw_l2_egress;
 use wayfinder_driver::build_raw_l2_link;
 use wayfinder_driver::build_rylr998_link;
 use wayfinder_driver::build_udp_link;
 use wayfinder_driver::build_udp_multi_link;
-use wayfinder_driver::serve_tls_server_with_vpn;
+use wayfinder_driver::serve_tls_server_with_services;
 use wayfinder_server::AuthorityRx;
 use wayfinder_server::AuthorityTx;
 use wayfinder_server::SettingsFile;
@@ -404,6 +407,55 @@ async fn main() -> anyhow::Result<()> {
         pretty_hex::simple_hex(&mac_addr)
     );
 
+    // One directory shared by every iroh link and the driver that republishes
+    // it. Created unconditionally (it is an empty map until something
+    // publishes) so the wiring below has nothing to branch on; only a node
+    // that actually configured an iroh link hands it to the driver.
+    let auth_view = AuthView::new();
+    let mut uses_auth_view = false;
+    // This node's identity seed, resolved once and used by everything that
+    // needs it: the management TLS server presents it, and an `Iroh` link
+    // binds its QUIC endpoint to it.
+    //
+    // Same precedence as the MAC above, for the same reason — an identity
+    // installed at runtime is the operator's more recent intent — then the
+    // configured mesh membership seed, then the dedicated management identity
+    // generated and persisted on first boot.
+    //
+    // That last case is what lets a node carry an iroh link *before* it has
+    // joined anything: a mesh with authentication switched off has no `auth:`
+    // block at all, and a node that enrols online has none either until
+    // `SetAuth` installs one. Both still need an endpoint key, and it must be
+    // the same key the certificate will later bind — which is exactly this
+    // one, since `csr request` signs with it.
+    //
+    // Resolved only when a management API needs one, so a node without one does
+    // not start persisting a seed it will never present. An `Iroh` link does
+    // *not* force it: that link reads its endpoint key from the `AuthView` the
+    // driver publishes, so it can be dormant now and bind later.
+    let needs_identity = matches!(config.server, Some(ServerConfig::Tls { .. }));
+    let node_identity_seed: Option<[u8; 32]> = if !needs_identity {
+        None
+    } else {
+        Some(match (&settings.identity, &config.auth) {
+            (Some(identity), _) => {
+                seed_bytes(&identity.seed).context("runtime-installed identity seed")?
+            }
+            (None, Some(auth_cfg)) => read_seed(&auth_cfg.seed_path)?,
+            (None, None) => {
+                let path = match &config.server {
+                    Some(ServerConfig::Tls {
+                        identity_seed_path, ..
+                    }) => identity_seed_path
+                        .clone()
+                        .unwrap_or_else(ServerConfig::default_identity_seed_path),
+                    _ => ServerConfig::default_identity_seed_path(),
+                };
+                load_or_generate_seed(&path)?
+            }
+        })
+    };
+
     let mut interfaces = Vec::new();
     // Per-interface OGM backoff bounds, participation features and display
     // names, collected in interface order alongside the transports so the
@@ -488,6 +540,28 @@ async fn main() -> anyhow::Result<()> {
                     .await?,
                 );
             }
+            LinkTransport::Iroh {
+                bind_port,
+                relay_url,
+                bootstrap_peers,
+            } => {
+                // No seed here: the link takes its endpoint key from the
+                // `AuthView` the driver publishes, and stays dormant until this
+                // node actually has an identity. A node that has not enrolled
+                // has no address to take, and the seed it generated at boot may
+                // not be the one it ends up certified under — see `IrohLink`.
+                uses_auth_view = true;
+                interfaces.push(
+                    build_iroh_link(IrohLinkParams {
+                        bind_port,
+                        relay_url,
+                        bootstrap_peers,
+                        directory: auth_view.clone(),
+                    })
+                    .await
+                    .with_context(|| format!("iroh link {:?}", names.last()))?,
+                );
+            }
             LinkTransport::Test { .. } => {
                 bail!("test links are only valid in the test harness, not the wayfinder-tap node")
             }
@@ -527,7 +601,6 @@ async fn main() -> anyhow::Result<()> {
     // so the management API can report its public half and certify it on
     // enrollment — the same key the TLS server presents, so a client that
     // enrolls this node certifies the identity it was already talking to.
-    let mut node_identity_seed: Option<[u8; 32]> = None;
 
     /// A management listener that is bound but not yet served.
     ///
@@ -540,30 +613,9 @@ async fn main() -> anyhow::Result<()> {
         identity_seed: [u8; 32],
         snapshot_tx: AuthSnapshotTx,
         query_tx: QueryTx,
-        vpn: Option<wayfinder_server::vpn::SharedCoordinator>,
         authority: Option<wayfinder_server::AuthorityTx>,
     }
     let mut pending_tls_listener: Option<PendingTlsListener> = None;
-
-    // Built here, before the listener spawns, because the listener is what
-    // answers the VPN requests — the router loop is never told who is calling,
-    // and `GetVpnEnrollment` mints a credential for the caller's own identity.
-    // Constructing it now also means a bad URL or an unreadable API key file is
-    // a startup failure an operator sees immediately, rather than an enrollment
-    // that fails later against a node they have walked away from.
-    let vpn_coordinator: Option<wayfinder_server::vpn::SharedCoordinator> =
-        match config.provider.as_ref().and_then(|p| p.headscale.as_ref()) {
-            Some(headscale_cfg) => {
-                let coordinator = wayfinder_server::vpn::HeadscaleCoordinator::new(headscale_cfg)
-                    .map_err(|e| anyhow::anyhow!("VPN coordination: {e}"))?;
-                tracing::info!(
-                    api_url = %headscale_cfg.api_url,
-                    "VPN coordination enabled (Headscale)"
-                );
-                Some(std::sync::Arc::new(coordinator) as wayfinder_server::vpn::SharedCoordinator)
-            }
-            None => None,
-        };
 
     if let Some(server_cfg) = config.server {
         let tx = query_tx.clone();
@@ -572,25 +624,14 @@ async fn main() -> anyhow::Result<()> {
                 addr,
                 identity_seed_path,
             } => {
-                // The TLS server identity: an identity installed at runtime
-                // wins (the operator's more recent intent, and the same
-                // precedence the MAC above follows), else the mesh membership
-                // seed when one is configured, else a dedicated persistent
-                // identity seed generated on first boot. It must exist even
-                // before enrollment, since a client with no certificate yet
-                // authenticates by proving this key.
-                let identity_seed = match (&settings.identity, &config.auth) {
-                    (Some(identity), _) => {
-                        seed_bytes(&identity.seed).context("runtime-installed identity seed")?
-                    }
-                    (None, Some(auth_cfg)) => read_seed(&auth_cfg.seed_path)?,
-                    (None, None) => {
-                        let path = identity_seed_path
-                            .unwrap_or_else(ServerConfig::default_identity_seed_path);
-                        load_or_generate_seed(&path)?
-                    }
-                };
-                node_identity_seed = Some(identity_seed);
+                // The same seed resolved above the link loop — the TLS server
+                // presents exactly the key an `Iroh` link binds, so a client
+                // that enrols this node certifies the identity it was already
+                // talking to.
+                let _ = identity_seed_path;
+                // Always `Some` here, for the same reason.
+                let identity_seed = node_identity_seed
+                    .context("internal: a TLS server without a resolved identity seed")?;
                 // Bound here, so an address already in use is a startup error
                 // an operator sees immediately — but *served* below, once the
                 // driver exists to hand out the read handle the connection
@@ -604,7 +645,6 @@ async fn main() -> anyhow::Result<()> {
                     identity_seed,
                     snapshot_tx,
                     query_tx: tx,
-                    vpn: vpn_coordinator.clone(),
                     authority: authority_tx.clone(),
                 });
             }
@@ -630,6 +670,12 @@ async fn main() -> anyhow::Result<()> {
         config.max_clock_error_us,
     );
     driver.set_clock_trust(clock_trust);
+    // Only a node with an iroh link needs the certificate-derived peer
+    // directory republished; attaching it unconditionally would make every
+    // other node copy its neighbor cache on every poll for nobody's benefit.
+    if uses_auth_view {
+        driver.set_auth_view(auth_view);
+    }
     report_clock_posture(config.require_time_sync, driver.clock_sync());
 
     // Give the driver the receiver the TLS server snapshots authorization state
@@ -929,18 +975,16 @@ async fn main() -> anyhow::Result<()> {
             identity_seed,
             snapshot_tx,
             query_tx,
-            vpn,
             authority,
         } = pending;
         let router_handle = driver.router_handle();
         join_set.spawn(async move {
-            serve_tls_server_with_vpn(
+            serve_tls_server_with_services(
                 listener,
                 identity_seed,
                 snapshot_tx,
                 query_tx,
                 wayfinder_server::ServerServices {
-                    vpn,
                     authority_tx: authority,
                     router: Some(router_handle),
                 },

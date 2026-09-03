@@ -9,7 +9,10 @@ workspace = true
 [dependencies]
 wayfinder.workspace = true
 wayfinder-alarm.workspace = true
-wayfinder-driver.workspace = true
+# `iroh` is not in `wayfinder-driver`'s default features (it is a heavy
+# backend — see that crate's Cargo.toml). The node turns it on, so a real
+# deployment and a workspace build both carry the `Iroh` link.
+wayfinder-driver = { workspace = true, features = ["iroh"] }
 wayfinder-server.workspace = true
 
 # The node's logging stack: installs the console + log-ring subscriber and owns

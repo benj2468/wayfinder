@@ -7,11 +7,11 @@ from this one crate.
 
 ## Two scopes, because a node does two jobs
 
-The twelve tabs are not one bar. `Scope` (in `lib.rs`) splits them:
+The eleven tabs are not one bar. `Scope` (in `lib.rs`) splits them:
 
 - **Router** — the seven views the TUI has. What this node can reach, over
   which links, how well. Generally available.
-- **Provider** — Requests, Members, Enrollment, Accounts, VPN. What this node
+- **Provider** — Requests, Members, Enrollment, Accounts. What this node
   governs as the mesh's *certificate authority*: who is admitted, who is
   ejected, and who holds an account that decides either. **Administrators
   only**, and only on a node that issues certificates at all.

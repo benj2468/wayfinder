@@ -11,10 +11,12 @@
 # the unit runs with an empty capability set under systemd's sandbox (see
 # `nix/modules/wayfinder.nix`).
 #
-# It runs the *tunnel* control plane beside the mesh one — see
-# `nix/modules/wayfinder-headscale.nix` and design 08. That is the same
+# It runs the mesh's *iroh relay* beside the CA — see
+# `nix/modules/wayfinder-iroh-relay.nix` and design 18. That is the same
 # argument as the CA itself: this is the one box with a stable public address,
-# so it is where two CGNAT'd nodes have to meet.
+# so it is where two CGNAT'd nodes have to meet. It replaced the Headscale
+# tunnel control plane design 08 put here, along with the second credential
+# every node used to collect at enrollment.
 #
 # And, since design 08 landed, it is a mesh **participant** rather than only a
 # coordinator. It joins the tunnel it serves (`selfJoin` below) and carries a
@@ -79,13 +81,6 @@ let
     "cloudflared.json"
   ];
 
-  # Mesh link port. Bound on every address but reachable only over the tunnel:
-  # `services.wayfinder-tailscale` trusts `tailscale0` wholesale, and nothing
-  # opens this port on the public NIC — neither the NixOS firewall below nor
-  # the Oracle security list in `infra/oracle/main.tf`. The public address
-  # hears TCP/22, TCP/443, TCP/7700, UDP/3478 and UDP/41641, and nothing else.
-  meshPort = 6000;
-
   # This node's Ed25519 public key, as 64 hex characters — the public half of
   # `identity.seed` in `secretsDir`, printed by `wayfinderctl cert issue` when
   # the identity was minted (see infra/oracle/README.md step 1).
@@ -125,20 +120,29 @@ let
   # was chosen deliberately rather than inherited. The alternative, if that
   # trade stops being acceptable for the TOTP secret specifically, is a
   # registration-only vhost on a DNS-only name with its own ACME certificate,
-  # the way `vpnHostname` below already works. See
+  # the way `irohRelayHostname` below already works. See
   # `docs/design/implemented/12-self-service-user-registration.md` §5.1.
   dashboardHostname = "dash.wayfndr.dev";
 
-  # Public name nodes register their tunnel against. A separate record from the
-  # CA's own `ca.wayfndr.dev` even though both resolve to this instance: the two
-  # planes are independently movable, and a node's `--login-server` is baked
-  # into its tunnel registration in a way the management endpoint is not.
+  # Public name of this box's iroh relay — the hole-punch coordination point
+  # and fallback path for `LinkTransport::Iroh` links (design 18).
   #
-  # DNS-only, never proxied — the same constraint as the management API, for two
-  # stronger reasons. STUN is UDP, which no HTTP proxy carries at all; and the
-  # name has to resolve to *this* host for the ACME challenge below to be
-  # answerable.
-  vpnHostname = "vpn.wayfndr.dev";
+  # A separate record from the management API's, because the relay and the CA
+  # are independently movable: a mesh could point its links at somebody else's
+  # relay without moving its root of trust. DNS-only and never proxied — QUIC
+  # address discovery is UDP, which no HTTP proxy carries, and the name has to
+  # resolve here for the relay's own ACME challenge.
+  irohRelayHostname = "relay.wayfndr.dev";
+
+  # UDP port the relay answers QUIC address discovery on. Needs a matching
+  # Oracle security-list rule, like UDP/3478 does for STUN.
+  irohQuicPort = 7842;
+
+  # UDP port this node's own iroh link binds. Pinned rather than ephemeral so
+  # the NAT mapping survives a restart and a peer can hole-punch back to a
+  # stable address. The Tailscale port this replaces was pinned for the same
+  # reason.
+  irohMeshPort = 6001;
 
   # Public name of this node's *management API* — the address a device asking to
   # join the mesh connects to, and the one the dashboard's "What a node needs to
@@ -148,7 +152,7 @@ let
   # `dashboardHostname`: that one is proxied by Cloudflare, and the management
   # API is a bespoke protocol over TLS on 7700 that no HTTP proxy carries — see
   # `infra/oracle/dns.tf`, where this record is `proxied = false` for exactly
-  # that. Not `vpnHostname`: the tunnel control plane is independently movable.
+  # that. Not `irohRelayHostname`: the relay is independently movable.
   #
   # Display only. The dashboard still *dials* the node over loopback below; this
   # is what it tells a device that is not on this host. Without it the panel
@@ -156,7 +160,8 @@ let
   # everyone it is shown to.
   caHostname = "ca.wayfndr.dev";
 
-  # The dashboard's loopback port, moved off 8080 because Headscale is there.
+  # The dashboard's loopback port. Off 8080 historically (Headscale held it);
+  # kept there because the Cloudflare ingress below names it.
   # Nothing outside this file sees it: the dashboard is reached through the
   # Cloudflare Tunnel below, whose ingress is the one thing that names it.
   dashboardPort = 8081;
@@ -193,32 +198,39 @@ in
         addr = "0.0.0.0:7700";
       };
 
-      # The one mesh link, riding the tunnel this box coordinates.
-      #
-      # **Hub/fan-out mode** — `discovery_addr` deliberately absent. A Tailscale
-      # tunnel is a set of point-to-point WireGuard links, not a shared
-      # segment, so there is no broadcast address to put one datagram into; a
-      # broadcast-destined frame is fanned out to every peer this node has
-      # learned from a received datagram instead. Every spoke is learned from
-      # the OGMs it sends here, so there is nothing to configure per peer —
-      # which is also what makes this the one link config on the fleet that
-      # needs no runtime-known address and can be fully rendered at build time.
-      # A spoke's link is the mirror image: it *does* set `discovery_addr`, to
-      # this node's tunnel address.
-      #
-      # `0.0.0.0`, not the tunnel address, for the same reason: `tailscale0`
-      # does not exist at boot and its address is not known when this is
-      # evaluated. The firewall is what confines the link to the tunnel — see
-      # `meshPort` above.
+      # The one mesh link, and it is the iroh one (design 18). What used to sit beside
+      # it was a `UdpMulti` riding a Tailscale tunnel this box also coordinated;
+      # retiring that took a Headscale, a Headplane, a `tailscaled`, an API key
+      # this host minted for itself, and a second credential every node had to
+      # collect at enrollment — all replaced by a link that dials peers by the
+      # key their `MembershipCert` already binds.
       links = [
         {
-          # Named rather than left to synthesize `udpm0`: this is the name an
-          # operator reads in `wayfinderctl link list`, the dashboard and the TUI,
-          # and "which tunnel link" is more useful there than "which carrier
-          # kind". `scripts/wayfinder-ca.sh verify` looks for it too.
-          name = "vpn0";
-          type = "UdpMulti";
-          bind_addr = "0.0.0.0:${toString meshPort}";
+          # Hole punching to a spoke where possible, relaying through this
+          # box's own relay when not — the same two-tier reach the Tailscale
+          # path had, with the coordination server deleted.
+          #
+          # The question design 18 §5 raised — does hole punching hold between
+          # two *real* CGNAT'd hosts — is not answerable in a VM or in CI, and
+          # is not answered here. What is answered is what happens when it
+          # fails: the connection relays through this node, which is exactly
+          # where a DERP-relayed Tailscale path went too. The failure mode is a
+          # wash; only the machinery is gone.
+          name = "iroh0";
+          type = "Iroh";
+          bind_port = irohMeshPort;
+
+          # This box's own relay, started below. Never iroh's public default
+          # relays: an isolated mesh's coordination metadata must not reach a
+          # third party. The pinned `--login-server` this replaces existed for
+          # the same reason.
+          relay_url = "https://${irohRelayHostname}";
+
+          # Empty, and correct: this is the hub. Every spoke names *this* node
+          # in its own `bootstrap_peers` (its `nodeKey` above, which is exactly
+          # the endpoint peers dial) and connects inbound; a hub that dialled
+          # back would need the peer list that adopting iroh exists to delete.
+          bootstrap_peers = [ ];
         }
       ];
 
@@ -260,26 +272,6 @@ in
         # (`wayfinder-ctl provider requests approve`, or the dashboard's Security tab).
         auto_approve = false;
 
-        # VPN coordination, pointed at the Headscale started below.
-        #
-        # The API is reached over loopback (nothing crosses a network to get
-        # there) while nodes are handed the public name, because a
-        # `--login-server` of `127.0.0.1` is one every node would resolve to
-        # itself. `login_server` is what makes those two able to differ.
-        #
-        # The key is minted on this box by
-        # `wayfinder-headscale-apikey.service`, not carried here with the mesh
-        # trust material: it can only be issued by a running Headscale, and
-        # this host can reissue it at will.
-        headscale = {
-          # One URL for both halves: under TLS the certificate names the host,
-          # so the loopback call and the node's `--login-server` have to be the
-          # same string. The module resolves that name to 127.0.0.1 on this box
-          # so the request does not depend on Oracle hairpinning it back.
-          api_url = config.services.wayfinder-headscale.endpoint;
-          api_key_path = config.services.wayfinder-headscale.apiKey.path;
-        };
-
         # The issued-certificate log, its revocation status, and held CSRs.
         # Without this a restart forgets every revocation and every pending
         # approval, and the impersonation guard starts empty — so it is not
@@ -294,57 +286,39 @@ in
     };
   };
 
-  # The tunnel control plane. Nodes register against `vpnHostname`, and the
-  # DERP relay they fall back to when hole-punching fails is the one this box
-  # runs — not Tailscale Inc.'s, which is what "isolated mesh" has to mean if
-  # it means anything. The security list in `infra/oracle/main.tf` carries the
-  # matching rules: TCP/443 for the API and the relay, UDP/3478 for STUN, and
-  # UDP/41641 so this box's own `tailscaled` can be hole-punched to directly
-  # rather than relaying its mesh link through itself.
-  services.wayfinder-headscale = {
-    enable = true;
-    domain = vpnHostname;
-
-    # Put this box on the tunnel it serves, so the `UdpMulti` link above has a
-    # tunnel address to be reached on. It goes through the same enrollment RPC
-    # every other node uses — connecting to its own management API over
-    # loopback with the identity seed above — so it registers under the
-    # Headscale user named after its own MAC, minted by the same code, and
-    # `wayfinderctl provider vpn list` names this peer like any other.
-    #
-    # A unit rather than an operator step: a preauth key can only be issued by
-    # a running Headscale, so it cannot be provisioned alongside the
-    # offline-minted trust material in `secretsDir`.
-    selfJoin.enable = true;
-
-    # Real TLS, from Let's Encrypt, on 443. Not a hardening preference: a
-    # `tailscaled` refuses a plaintext DERP connection and takes STUN probing
-    # down with it, so a plain-HTTP coordination server registers nodes
-    # perfectly and then leaves them unable to reach each other. The
-    # TLS-ALPN-01 challenge is answered on the 443 listener headscale already
-    # has, so the security list needs no HTTP rule — see
-    # `nix/modules/wayfinder-headscale.nix` and `nix/tests/vpn-data-plane.nix`.
-    tls.mode = "acme";
-
-    # Break-glass only: loopback-bound, reached with
-    # `ssh -L 3000:localhost:3000 root@<ca>` and then http://localhost:3000/admin.
-    # Sign in by pasting a throwaway Headscale API key
-    # (`headscale apikeys create --expiration 24h` over that same SSH session).
-    # The day-to-day surface is the dashboard's VPN panel; this is for the day
-    # wayfinder-server is down and the tunnel is not.
-    headplane.enable = true;
-  };
-
-  # The tunnel daemon this box's own mesh link rides. Pinned at the Headscale
-  # started above rather than at a literal, so the two cannot drift — the
-  # module asserts they agree before `selfJoin` will build.
+  # The iroh relay serving this mesh's `Iroh` links (design 18): hole-punch
+  # coordination via QUIC address discovery, plus the fallback path when two
+  # peers cannot punch through to each other.
   #
-  # `networking.hosts` (set by the headscale module under TLS) resolves that
-  # name to 127.0.0.1 here, so this registration never leaves the box and does
-  # not depend on Oracle hairpinning the public address back.
-  services.wayfinder-tailscale = {
+  # Smaller than the Headscale it replaced in every sense — no user database,
+  # no address allocation, no preauth keys, no admin UI — because an iroh peer
+  # is named by its own public key and there is nothing to hand out. This box
+  # already holds the one thing that cannot be decentralised: a stable public
+  # address.
+  services.wayfinder-iroh-relay = {
     enable = true;
-    loginServer = config.services.wayfinder-headscale.endpoint;
+    hostname = irohRelayHostname;
+    quicBindAddr = "[::]:${toString irohQuicPort}";
+
+    # Real TLS, for exactly the reason the Headscale before it needed it: QUIC
+    # address discovery requires TLS, and without QAD a node never learns its
+    # own public address and so can never hole-punch. A plaintext relay would
+    # register every node correctly and quietly leave them all relaying.
+    tls = {
+      mode = "acme";
+      contact = "admin@wayfndr.dev";
+    };
+
+    # Open, deliberately, and worth being precise about. A relay carries opaque
+    # end-to-end-encrypted QUIC between two endpoints: it is not a mesh member,
+    # cannot read what it forwards, and admitting a stranger grants no mesh
+    # membership — that is still gated by a root-signed `MembershipCert` one
+    # layer up. The exposure is bandwidth on a metered instance, not trust.
+    #
+    # An allowlist would close that but reintroduces the per-node list this
+    # design exists to delete. The right answer is the relay's HTTP admission
+    # hook pointed at this node's own certificate log; see design 18 §6.4.
+    access.mode = "everyone";
   };
 
   # `/var/lib/wayfinder` holds both the node's own state and the trust material

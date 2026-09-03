@@ -13,7 +13,6 @@
 //! [`members`] is the roster and the one control that removes from it,
 //! [`enrollment`] is the front door's policy and the details a joining node
 //! must be told, [`accounts`] is who may make any of these decisions, and
-//! [`vpn`] is the tunnel registration that rides alongside mesh membership.
 //!
 //! # Every tab is behind the same two gates
 //!
@@ -47,7 +46,6 @@ pub mod accounts;
 pub mod enrollment;
 pub mod members;
 pub mod requests;
-pub mod vpn;
 
 use leptos::prelude::*;
 

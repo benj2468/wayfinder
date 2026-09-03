@@ -238,7 +238,13 @@ impl RouterReads for Mock {
 }
 
 impl RouterWrites for Mock {
-    fn set_auth(&mut self, _seed: &[u8], _cert: &[u8], _trust_anchor: &[u8]) -> Result<(), String> {
+    fn set_auth(
+        &mut self,
+        _seed: &[u8],
+        _cert: &[u8],
+        _trust_anchor: &[u8],
+        _ca_endpoint: &str,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -565,7 +571,7 @@ async fn client_roundtrips_against_real_tls_server() {
         }
     });
     tokio::spawn(async move {
-        let _ = wayfinder_server::serve_tls_server_with_vpn(
+        let _ = wayfinder_server::serve_tls_server_with_services(
             listener,
             node_seed,
             snapshot_tx,

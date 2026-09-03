@@ -20,7 +20,6 @@ use wayfinder_protos::wayfinder::v1alpha::KeepAliveEntry;
 use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesEntry;
 use wayfinder_protos::wayfinder::v1alpha::LinkQualityEntry;
 use wayfinder_protos::wayfinder::v1alpha::ListPendingCsrsResponse;
-use wayfinder_protos::wayfinder::v1alpha::ListVpnPeersResponse;
 use wayfinder_protos::wayfinder::v1alpha::LogLevel;
 use wayfinder_protos::wayfinder::v1alpha::LogRecord;
 use wayfinder_protos::wayfinder::v1alpha::LogRecords;
@@ -33,7 +32,6 @@ use wayfinder_protos::wayfinder::v1alpha::PendingCsr;
 use wayfinder_protos::wayfinder::v1alpha::RoutingEntry;
 use wayfinder_protos::wayfinder::v1alpha::TableOccupancy;
 use wayfinder_protos::wayfinder::v1alpha::UserAccount;
-use wayfinder_protos::wayfinder::v1alpha::VpnPeerStatus;
 use wayfinder_web::components::dashboard::Dashboard;
 use wayfinder_web::components::link_quality::LinkQuality;
 use wayfinder_web::components::links::Links;
@@ -45,7 +43,6 @@ use wayfinder_web::components::provider::accounts::UserTable;
 use wayfinder_web::components::provider::enrollment::Enrollment;
 use wayfinder_web::components::provider::members::Members;
 use wayfinder_web::components::provider::requests::Requests;
-use wayfinder_web::components::provider::vpn::Vpn;
 use wayfinder_web::components::register::TotpEnrolment;
 use wayfinder_web::components::routing::Routing;
 use wayfinder_web::components::security::Security;
@@ -554,14 +551,8 @@ fn each_provider_tab(snapshot: NodeSnapshot, admin: bool) -> Vec<(&'static str, 
         ),
         (
             "Accounts",
-            render_seeded(Some(snapshot.clone()), None, admin, || {
-                view! { <Accounts /> }
-            }),
-        ),
-        (
-            "VPN",
             render_seeded(Some(snapshot), None, admin, || {
-                view! { <Vpn /> }
+                view! { <Accounts /> }
             }),
         ),
     ]
@@ -995,61 +986,6 @@ fn provider_accounts_offers_revoke_and_remove_and_explains_the_difference() {
             && html.contains("position-anchor: --wf-hint-account-actions"),
         "and its anchor is derived from the hint's own id, so a second hint on \
          the page would not steal its placement: {html}"
-    );
-}
-
-/// Registered tunnel peers are listed with the address the coordination server
-/// gave them, which is what a UDP mesh link on that host points at.
-#[test]
-fn provider_vpn_lists_registered_peers() {
-    let mut snap = provider_snapshot();
-    snap.vpn_peers = Some(ListVpnPeersResponse {
-        peers: vec![VpnPeerStatus {
-            node_mac: vec![0, 0, 0, 0, 0, 2],
-            raw_hostname: "000000000002".into(),
-            tailscale_ip: "100.64.0.7".into(),
-            online: true,
-            last_seen_unix: 1_700_000_000,
-            key_expiry_unix: 0,
-        }],
-    });
-    let html = render_with(Some(snap), || view! { <Vpn /> });
-
-    assert!(html.contains("00:00:00:00:00:02"), "the peer: {html}");
-    assert!(html.contains("100.64.0.7"), "its tunnel address: {html}");
-    assert!(
-        html.contains("online"),
-        "and whether it is connected: {html}"
-    );
-}
-
-/// A provider that coordinates a tunnel nobody has joined says so, rather than
-/// rendering the same blank table as a provider with no tunnel at all.
-#[test]
-fn provider_vpn_says_when_no_peer_has_joined() {
-    let mut snap = provider_snapshot();
-    snap.vpn_peers = Some(ListVpnPeersResponse { peers: Vec::new() });
-    let html = render_with(Some(snap), || view! { <Vpn /> });
-
-    assert!(
-        html.contains("No nodes have joined the tunnel yet"),
-        "the empty state says why: {html}"
-    );
-}
-
-/// A provider with no tunnel configured is a different state again, and must
-/// not read as one whose peers have all left.
-#[test]
-fn provider_vpn_distinguishes_no_tunnel_from_an_empty_one() {
-    let html = render_with(Some(provider_snapshot()), || view! { <Vpn /> });
-
-    assert!(
-        html.contains("does not coordinate a tunnel"),
-        "no tunnel is configured: {html}"
-    );
-    assert!(
-        !html.contains("No nodes have joined the tunnel yet"),
-        "which is not the same as an empty one: {html}"
     );
 }
 

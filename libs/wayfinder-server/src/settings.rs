@@ -64,6 +64,20 @@ pub struct NodeSettings {
     pub lazy_cert_distribution: Option<bool>,
     /// The mesh identity installed over the management API.
     pub identity: Option<NodeIdentity>,
+    /// Where the authority is reachable on the *mesh*, as
+    /// `<64 hex chars>[@ip:port]` — its Ed25519 identity, and optionally an
+    /// address for a carrier that cannot otherwise turn a key into a route.
+    ///
+    /// Recorded at enrolment, because it is otherwise unlearnable: a
+    /// key-addressed link needs one peer to dial before it can hear anything,
+    /// and the only moment a node is told who the authority *is* happens over
+    /// the management API. Carrying it here is what lets such a link find its
+    /// way onto the mesh without an operator writing the key into a config
+    /// file — which a node with no filesystem cannot have.
+    ///
+    /// Not a credential: it names a public key and grants nothing. What admits
+    /// the node is the certificate installed beside it.
+    pub ca_endpoint: Option<String>,
     /// The root-signed revocation naming this node, if it has heard one: raw
     /// `RevocationRecord` bytes.
     ///
@@ -96,6 +110,9 @@ impl NodeSettings {
         if let Some(identity) = update.identity {
             self.identity = Some(identity);
         }
+        if let Some(endpoint) = update.ca_endpoint {
+            self.ca_endpoint = Some(endpoint);
+        }
         if let Some(record) = update.self_revocation {
             // An **empty** record clears the field. `merge` reads `None` as
             // "leave this alone", so re-admission — which must remove the
@@ -112,6 +129,7 @@ impl NodeSettings {
         self.require_auth.is_none()
             && self.lazy_cert_distribution.is_none()
             && self.identity.is_none()
+            && self.ca_endpoint.is_none()
             && self.self_revocation.is_none()
     }
 }
@@ -202,6 +220,11 @@ mod file {
         /// there.
         #[serde(default)]
         self_revocation: Option<Vec<u8>>,
+        /// Where the authority is reachable on the mesh; see
+        /// [`NodeSettings::ca_endpoint`]. `#[serde(default)]` for the same
+        /// reason as the field above it.
+        #[serde(default)]
+        ca_endpoint: Option<String>,
     }
 
     /// One installed identity in the on-disk blob. Byte vectors are stored as
@@ -274,6 +297,7 @@ mod file {
                 require_auth: value.require_auth,
                 lazy_cert_distribution: value.lazy_cert_distribution,
                 self_revocation: value.self_revocation.clone(),
+                ca_endpoint: value.ca_endpoint.clone(),
                 identity: value.identity.as_ref().map(|i| IdentityRecord {
                     seed: i.seed.clone(),
                     cert: i.cert.clone(),
@@ -292,6 +316,7 @@ mod file {
                 require_auth: state.require_auth,
                 lazy_cert_distribution: state.lazy_cert_distribution,
                 self_revocation: state.self_revocation,
+                ca_endpoint: state.ca_endpoint,
                 identity: state.identity.map(|i| NodeIdentity {
                     seed: i.seed,
                     cert: i.cert,
@@ -346,6 +371,19 @@ mod file {
                 None => Persisted::new(NodeSettings::default(), None, codec),
             };
             Ok(Self { persisted, path })
+        }
+
+        /// Whether this store actually writes anywhere. A node without a
+        /// runtime state path still accepts settings changes — it just cannot
+        /// carry them across a restart, which is worth saying out loud at
+        /// startup rather than discovering after a reboot.
+        /// The settings as they currently stand, including anything `SetAuth`
+        /// has installed since startup.
+        ///
+        /// Read by the driver to publish the authority's mesh endpoint, so
+        /// there is one copy of that value rather than two that can disagree.
+        pub fn current(&self) -> &NodeSettings {
+            self.persisted.get()
         }
 
         /// Whether this store actually writes anywhere. A node without a

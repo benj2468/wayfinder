@@ -24,8 +24,10 @@ pub use transport::NullEgress;
 mod blue;
 #[cfg(feature = "tokio")]
 mod driver;
+mod iroh;
 #[cfg(feature = "tokio")]
 mod net;
+mod peers;
 #[cfg(feature = "tokio")]
 mod rylr998;
 
@@ -33,12 +35,17 @@ mod rylr998;
 pub use blue::build_ble_link;
 #[cfg(feature = "tokio")]
 pub use driver::Driver;
+#[cfg(feature = "iroh")]
+pub use iroh::IrohLink;
+pub use iroh::IrohLinkParams;
+pub use iroh::build_iroh_link;
 #[cfg(feature = "tokio")]
 pub use net::UdpMultiLink;
 #[cfg(feature = "tokio")]
 pub use net::build_udp_link;
 #[cfg(feature = "tokio")]
 pub use net::build_udp_multi_link;
+pub use peers::AuthView;
 // Re-exported so a node assembling a BLE link configures it without taking a
 // direct `blue` dependency, matching how `Rylr998LinkParams` is surfaced.
 #[cfg(feature = "ble")]
@@ -89,4 +96,4 @@ pub use wayfinder_server::bind_tcp_server;
 pub use wayfinder_server::run_channel_server;
 #[cfg(feature = "tokio")]
 pub use wayfinder_server::serve_tls_server;
-pub use wayfinder_server::serve_tls_server_with_vpn;
+pub use wayfinder_server::serve_tls_server_with_services;

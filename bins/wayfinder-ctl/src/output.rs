@@ -13,7 +13,6 @@ use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesTable;
 use wayfinder_protos::wayfinder::v1alpha::LinkQualityTable;
 use wayfinder_protos::wayfinder::v1alpha::ListCertsResponse;
 use wayfinder_protos::wayfinder::v1alpha::ListPendingCsrsResponse;
-use wayfinder_protos::wayfinder::v1alpha::ListVpnPeersResponse;
 use wayfinder_protos::wayfinder::v1alpha::LogLevel;
 use wayfinder_protos::wayfinder::v1alpha::LogRecords;
 use wayfinder_protos::wayfinder::v1alpha::NodeInfo;
@@ -468,45 +467,6 @@ fn revocation_status(n: &NodeSecurity) -> String {
     }
 }
 
-/// Render the provider's [`ListVpnPeersResponse`] (registered VPN peers).
-///
-/// A peer whose hostname is not one wayfinder registered shows its raw hostname
-/// in the MAC column rather than being hidden: it is still a peer with tunnel
-/// reachability, and an operator auditing who can reach the network needs to
-/// see it precisely *because* it does not correspond to an enrolled node.
-pub fn vpn_peers(v: &ListVpnPeersResponse, fmt: OutputFormat) -> anyhow::Result<String> {
-    render(v, fmt, |v| {
-        if v.peers.is_empty() {
-            return "no VPN peers registered".to_string();
-        }
-        let mut out = String::from(
-            "NODE               ADDRESS          STATE    LAST_SEEN             KEY_EXPIRY",
-        );
-        for p in &v.peers {
-            out.push_str(&format!(
-                "\n{:<18} {:<16} {:<8} {:<21} {}",
-                if p.node_mac.is_empty() {
-                    format!("({})", p.raw_hostname)
-                } else {
-                    format_mac(&p.node_mac)
-                },
-                p.tailscale_ip,
-                if p.online { "online" } else { "offline" },
-                // Signed on the wire, and Headscale reports an unknown
-                // instant as an epoch-or-earlier value rather than exactly
-                // zero, so anything not in the future of 1970 is "no date".
-                if p.last_seen_unix <= 0 {
-                    "never".to_string()
-                } else {
-                    format_timestamp(p.last_seen_unix as u64)
-                },
-                format_timestamp(p.key_expiry_unix.max(0) as u64),
-            ));
-        }
-        out
-    })
-}
-
 /// Render the provider's [`ListCertsResponse`] (issued certificates).
 pub fn list_certs(v: &ListCertsResponse, fmt: OutputFormat) -> anyhow::Result<String> {
     render(v, fmt, |v| {
@@ -658,7 +618,6 @@ fn fingerprint(key: &[u8]) -> String {
 mod tests {
     use super::*;
     use wayfinder_protos::wayfinder::v1alpha::PendingCsr;
-    use wayfinder_protos::wayfinder::v1alpha::VpnPeerStatus;
 
     /// 2023-11-14 22:13:20 UTC, the instant every date test below is anchored
     /// to.
@@ -777,39 +736,6 @@ mod tests {
         };
         let out = list_pending_csrs(&v, OutputFormat::Human).unwrap();
         assert!(out.contains(T_ISO), "{out}");
-    }
-
-    /// VPN peers date last-seen and key expiry, keeping the "never"/"-"
-    /// wording for a peer that has neither.
-    #[test]
-    fn vpn_peers_renders_iso_dates() {
-        let v = ListVpnPeersResponse {
-            peers: vec![
-                VpnPeerStatus {
-                    node_mac: vec![0, 0, 0, 0, 0, 2],
-                    raw_hostname: "node-2".to_string(),
-                    tailscale_ip: "100.64.0.2".to_string(),
-                    online: true,
-                    last_seen_unix: T as i64,
-                    key_expiry_unix: T as i64,
-                },
-                VpnPeerStatus {
-                    node_mac: vec![0, 0, 0, 0, 0, 3],
-                    raw_hostname: "node-3".to_string(),
-                    tailscale_ip: "100.64.0.3".to_string(),
-                    online: false,
-                    last_seen_unix: 0,
-                    key_expiry_unix: 0,
-                },
-            ],
-        };
-        let out = vpn_peers(&v, OutputFormat::Human).unwrap();
-        assert!(out.contains(T_ISO), "{out}");
-        assert!(out.contains("never"), "{out}");
-        assert!(
-            !out.contains(&T.to_string()),
-            "raw unix seconds left in: {out}"
-        );
     }
 
     /// JSON is the machine-readable half and must keep the raw unix seconds:

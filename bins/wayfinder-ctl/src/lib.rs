@@ -39,8 +39,6 @@ use wayfinder_client::Client;
 // endpoint the same way `run` does.
 pub use wayfinder_client::Endpoint;
 
-pub mod vpn;
-pub use vpn::VpnCommand;
 use wayfinder_protos::wayfinder::v1alpha::authenticate_user_response::Outcome as UserOutcome;
 
 use wayfinder_client::ConnectArgs;
@@ -219,9 +217,6 @@ pub enum Command {
     /// Alias for `provider user`.
     #[command(hide = true, subcommand)]
     User(user::UserCommand),
-    /// Alias for `provider vpn`.
-    #[command(hide = true, subcommand)]
-    Vpn(vpn::VpnCommand),
     /// Alias for `auth enroll`.
     #[command(hide = true)]
     Enroll(auth::EnrollArgs),
@@ -248,7 +243,6 @@ impl Command {
     pub fn canonical(self) -> Self {
         match self {
             Command::User(cmd) => Command::Provider(provider::ProviderCommand::User(cmd)),
-            Command::Vpn(cmd) => Command::Provider(provider::ProviderCommand::Vpn(cmd)),
             Command::Security => Command::Auth(auth::AuthCommand::Status),
             Command::Enroll(args) => Command::Auth(auth::AuthCommand::Enroll(args)),
             other => other,
@@ -604,7 +598,7 @@ pub async fn run(mut cli: Cli) -> anyhow::Result<()> {
     }
     println!(
         "{}",
-        dispatch_query(cli.command, &mut client, cli.output, endpoint.as_ref()).await?
+        dispatch_query(cli.command, &mut client, cli.output).await?
     );
     Ok(())
 }
@@ -652,7 +646,7 @@ pub async fn run_query(
 ) -> anyhow::Result<String> {
     let mut client =
         Client::connect_tls(&endpoint.addr, &endpoint.node_key, &endpoint.identity).await?;
-    dispatch_query(command, &mut client, output, Some(endpoint)).await
+    dispatch_query(command, &mut client, output).await
 }
 
 /// Dispatch one query `command` against an already-connected `client`, returning
@@ -669,7 +663,6 @@ async fn dispatch_query(
     command: Command,
     client: &mut Client,
     output: OutputFormat,
-    endpoint: Option<&Endpoint>,
 ) -> anyhow::Result<String> {
     let command = command.canonical();
     Ok(match command {
@@ -706,7 +699,7 @@ async fn dispatch_query(
             ping::run(client, destination, args, output, false).await?
         }
         Command::Link(cmd) => link::run(cmd, client, output).await?,
-        Command::Auth(cmd) => auth::run(cmd, client, output, endpoint).await?,
+        Command::Auth(cmd) => auth::run(cmd, client, output).await?,
         Command::Csr(cmd) => csr::run(cmd, client).await?,
         Command::Provider(cmd) => provider::run(cmd, client, output).await?,
         // Every command that needs no node connection is dispatched by `run`
@@ -725,7 +718,7 @@ async fn dispatch_query(
             bail!("internal: this command needs no connection and cannot be dispatched as a query")
         }
         // Rewritten by `canonical` above, so they cannot appear here.
-        Command::User(_) | Command::Vpn(_) | Command::Enroll(_) | Command::Security => {
+        Command::User(_) | Command::Enroll(_) | Command::Security => {
             bail!("internal: a compatibility spelling survived canonicalization")
         }
     })

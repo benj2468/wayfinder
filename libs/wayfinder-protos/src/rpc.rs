@@ -104,12 +104,6 @@ pub enum AccessTier {
     /// A verified, non-revoked certificate carrying the viewer capability:
     /// read-only.
     Viewer,
-    /// A verified, non-revoked certificate carrying the member capability — an
-    /// enrolled *device*, which is what every node on the mesh holds.
-    ///
-    /// Anything granted to this tier is granted to the entire mesh at once,
-    /// which is why exactly one request names it.
-    Member,
     /// The client presented no certificate at all. Admitted so that enrollment
     /// and first login are possible, and confined to the requests that hand
     /// out a credential to somebody who holds none.
@@ -492,38 +486,6 @@ rpc_table! {
     /// not silently re-tier it.
     Authenticate(AuthenticateRequest) {
         owner: Transport, audit: Query,
-        access: [Admin, SelfKey],
-        limit: Unmetered,
-    }
-    /// The one request decided by the request ahead of the tier, and the one an
-    /// *admin* is refused. It does not grant its caller a capability — it mints
-    /// a credential *for the caller's device identity*, so the question is not
-    /// how privileged a tier is but whether it names a node the coordination
-    /// server can register.
-    ///
-    /// Two tiers do. The member tier is an enrolled device presenting the
-    /// certificate this mesh's CA issued it, and the transport takes the MAC
-    /// from that verified certificate. The self-key tier is the node itself,
-    /// and the transport takes the MAC from the router. An operator's session
-    /// certificate is a person, not a device, so for admin the request has no
-    /// meaning rather than being a privilege it lacks — which is also what
-    /// makes design 08's two gates independent.
-    GetVpnEnrollment(GetVpnEnrollmentRequest) {
-        owner: Transport, audit: Mutation,
-        access: [SelfKey, Member],
-        limit: Unmetered,
-    }
-    /// A query, and *not* on the viewer's list unlike the `List*` requests
-    /// beside it: it is answered by calling out to the coordination server, so
-    /// admitting it on a read-only tier would let a viewer drive outbound
-    /// requests from the CA at whatever rate it polls.
-    ListVpnPeers(ListVpnPeersRequest) {
-        owner: Transport, audit: Query,
-        access: [Admin, SelfKey],
-        limit: Unmetered,
-    }
-    RevokeVpnPeer(RevokeVpnPeerRequest) {
-        owner: Transport, audit: Mutation,
         access: [Admin, SelfKey],
         limit: Unmetered,
     }

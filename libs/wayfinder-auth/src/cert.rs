@@ -74,9 +74,21 @@ pub const CERT_FLAG_VIEWER: u8 = 0x04;
 /// under an older verifier. Issued explicitly, the classification is the
 /// issuer's decision and travels inside the signature.
 ///
-/// It grants no management capability. What it earns is the management API's
-/// member tier, which is exactly one request wide — see
-/// `wayfinder_server::MgmtAccess::GrantedMember`.
+/// It grants no management capability, and since design 18 it earns no
+/// management tier either. The `GrantedMember` tier it used to earn existed to
+/// admit exactly one request — `GetVpnEnrollment` — and both went with the
+/// Headscale/Tailscale control plane that request served.
+///
+/// **The bit is kept, and must never be reassigned.** Two reasons, and either
+/// alone is sufficient:
+///
+/// * Certificates in the field carry it, inside a signature that cannot be
+///   rewritten. Reusing 0x08 for a future capability would silently grant that
+///   capability to every device certificate this mesh has ever issued.
+/// * It still means what it says — "the holder is an enrolled device that
+///   routes" — and `VerifiedCert::member` still reports it. That is a true and
+///   useful fact about a certificate; what changed is that nothing in the
+///   management API's access control consults it.
 pub const CERT_FLAG_MEMBER: u8 = 0x08;
 
 /// Domain-separation label folded into the fingerprint hash, so it can never

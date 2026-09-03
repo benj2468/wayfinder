@@ -193,7 +193,13 @@ impl RouterReads for ProviderMock {
 }
 
 impl RouterWrites for ProviderMock {
-    fn set_auth(&mut self, _seed: &[u8], _cert: &[u8], _trust_anchor: &[u8]) -> Result<(), String> {
+    fn set_auth(
+        &mut self,
+        _seed: &[u8],
+        _cert: &[u8],
+        _trust_anchor: &[u8],
+        _ca_endpoint: &str,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -435,7 +441,7 @@ pub async fn spawn_provider_full(
     let (authority_tx, mut authority_rx) =
         tokio::sync::mpsc::channel::<wayfinder_server::AuthorityCommand>(8);
     tokio::spawn(async move {
-        let _ = wayfinder_server::serve_tls_server_with_vpn(
+        let _ = wayfinder_server::serve_tls_server_with_services(
             listener,
             seed,
             snapshot_tx,

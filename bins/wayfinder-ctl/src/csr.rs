@@ -126,6 +126,21 @@ pub enum CsrCommand {
         /// The mesh trust anchor the certificate chains to.
         #[arg(long)]
         trust_anchor: PathBuf,
+        /// Where the authority is reachable on the *mesh*, as
+        /// `<64 hex chars>[@ip:port]` — its Ed25519 identity, optionally with
+        /// an address for a carrier that cannot otherwise turn a key into a
+        /// route (an `Iroh` link with no relay).
+        ///
+        /// This is the same key already pinned with `--node-key` to reach the
+        /// authority's management API; the address is its mesh port rather than
+        /// its management one. Recorded on the node so a key-addressed link
+        /// knows who to dial first — the alternative is an operator writing it
+        /// into the node's config file, which a node with no filesystem cannot
+        /// have.
+        ///
+        /// Omit to leave whatever the node already knows.
+        #[arg(long)]
+        ca_endpoint: Option<String>,
     },
 }
 
@@ -214,13 +229,21 @@ pub async fn run(cmd: CsrCommand, client: &mut Client) -> anyhow::Result<String>
                 out_anchor.display()
             )
         }
-        CsrCommand::Install { cert, trust_anchor } => {
+        CsrCommand::Install {
+            cert,
+            trust_anchor,
+            ca_endpoint,
+        } => {
             // Validated here rather than trusted to the node: the node's own
             // checks are the backstop, but a swapped pair of filenames is worth
             // naming as such instead of surfacing as a remote rejection.
             let credential = cert::read_credential(&cert, &trust_anchor)?;
             client
-                .install_cert(&credential.cert_bytes, &credential.anchor_bytes)
+                .install_cert(
+                    &credential.cert_bytes,
+                    &credential.anchor_bytes,
+                    ca_endpoint.as_deref().unwrap_or_default(),
+                )
                 .await
                 .context("installing the certificate on the node failed")?;
             format!(

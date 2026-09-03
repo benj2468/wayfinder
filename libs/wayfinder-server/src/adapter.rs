@@ -1169,7 +1169,13 @@ impl<
         PENDING_REPLIES,
     >
 {
-    fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String> {
+    fn set_auth(
+        &mut self,
+        seed: &[u8],
+        cert: &[u8],
+        trust_anchor: &[u8],
+        ca_endpoint: &str,
+    ) -> Result<(), String> {
         // An empty seed means "certify the identity I already have" — the
         // enrollment case, where the point is that the node's key (and so its
         // MAC) does not change. Anything else is a new identity being installed
@@ -1238,6 +1244,10 @@ impl<
                 cert: cert.to_vec(),
                 trust_anchor: trust_anchor.to_vec(),
             }),
+            // Empty means "leave whatever is there", so certifying an
+            // identity in place does not silently drop the authority a node
+            // already knows how to reach.
+            ca_endpoint: (!ca_endpoint.is_empty()).then(|| ca_endpoint.to_string()),
             // Cleared in the same durable write that installs the identity:
             // this certificate has just been checked against the record above,
             // so leaving the record behind would only re-lock the node on its
@@ -2443,7 +2453,7 @@ mod tests {
         RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &anchor)
+            .set_auth(&[3; 32], &cert, &anchor, "")
             .unwrap();
 
         let identity = store
@@ -2492,7 +2502,7 @@ mod tests {
         let err = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(2_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], stale.as_bytes(), &anchor_bytes)
+            .set_auth(&[3; 32], stale.as_bytes(), &anchor_bytes, "")
             .expect_err("a cancelled certificate is refused");
         assert!(err.contains("revoked"), "the reason names the cause: {err}");
         assert!(router.auth_locked(), "and the node stays inert");
@@ -2503,7 +2513,7 @@ mod tests {
         RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(2_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], fresh.as_bytes(), &anchor_bytes)
+            .set_auth(&[3; 32], fresh.as_bytes(), &anchor_bytes, "")
             .expect("a certificate issued after the revocation re-admits the node");
         assert!(!router.self_revoked());
         assert!(!router.auth_locked());
@@ -2558,7 +2568,7 @@ mod tests {
         let mut adapter = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store);
-        adapter.set_auth(&[3; 32], &cert, &anchor).unwrap();
+        adapter.set_auth(&[3; 32], &cert, &anchor, "").unwrap();
 
         let pair = adapter.own_cert().expect("the node is certified");
 
@@ -2617,7 +2627,7 @@ mod tests {
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_identity(&mut identity_seed)
             .with_settings(&mut store)
-            .set_auth(&[], &cert, &anchor)
+            .set_auth(&[], &cert, &anchor, "")
             .unwrap();
 
         assert!(router.auth().is_some(), "the node is now authenticated");
@@ -2672,7 +2682,7 @@ mod tests {
             RouterAdapter::new(&mut router, Duration::ZERO)
                 .with_epoch_unix(Duration::from_secs(1_000))
                 .with_identity(&mut identity_seed)
-                .set_auth(&new_seed, &cert, &anchor)
+                .set_auth(&new_seed, &cert, &anchor, "")
                 .unwrap();
 
             assert_eq!(
@@ -2698,7 +2708,7 @@ mod tests {
             RouterAdapter::new(&mut router, Duration::ZERO)
                 .with_epoch_unix(Duration::from_secs(1_000))
                 .with_identity(&mut identity_seed)
-                .set_auth(&[], &cert, &anchor)
+                .set_auth(&[], &cert, &anchor, "")
                 .unwrap();
 
             assert_eq!(identity_seed, Some(old_seed));
@@ -2718,7 +2728,7 @@ mod tests {
         let anchor = ca.trust_anchor_bytes();
 
         let err = RouterAdapter::new(&mut router, Duration::ZERO)
-            .set_auth(&[], &cert, &anchor)
+            .set_auth(&[], &cert, &anchor, "")
             .expect_err("no identity to certify");
 
         assert!(err.contains("identity"), "got: {err}");
@@ -2735,7 +2745,7 @@ mod tests {
 
         let result = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_settings(&mut store)
-            .set_auth(&[3; 32], b"not a cert", b"not an anchor");
+            .set_auth(&[3; 32], b"not a cert", b"not an anchor", "");
 
         assert!(result.is_err());
         assert!(store.writes.is_empty());
@@ -2762,7 +2772,7 @@ mod tests {
         let err = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &foreign_anchor)
+            .set_auth(&[3; 32], &cert, &foreign_anchor, "")
             .expect_err("cert does not chain to this anchor");
 
         assert!(err.contains("signature"), "got: {err}");
@@ -2791,7 +2801,7 @@ mod tests {
         let err = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &wrong_mesh_anchor)
+            .set_auth(&[3; 32], &cert, &wrong_mesh_anchor, "")
             .expect_err("cert is for a different mesh");
 
         assert!(err.contains("mesh"), "got: {err}");
@@ -2817,7 +2827,7 @@ mod tests {
             // Well past not_after.
             .with_epoch_unix(Duration::from_secs(2_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &anchor)
+            .set_auth(&[3; 32], &cert, &anchor, "")
             .expect_err("cert has expired");
 
         assert!(err.contains("expired"), "got: {err}");
@@ -2842,7 +2852,7 @@ mod tests {
         let err = RouterAdapter::new(&mut router, Duration::ZERO)
             // Adapter clock defaults to unix time 0, well before not_before.
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &anchor)
+            .set_auth(&[3; 32], &cert, &anchor, "")
             .expect_err("cert is not yet valid");
 
         assert!(err.contains("not yet valid"), "got: {err}");
@@ -2876,7 +2886,7 @@ mod tests {
         let err = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &anchor)
+            .set_auth(&[3; 32], &cert, &anchor, "")
             .expect_err("cert names a different key than the seed being installed");
 
         assert!(err.contains("key"), "got: {err}");
@@ -2906,7 +2916,7 @@ mod tests {
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_identity(&mut identity_seed)
             .with_settings(&mut store)
-            .set_auth(&[], &cert, &anchor)
+            .set_auth(&[], &cert, &anchor, "")
             .expect_err("cert is bound to a MAC other than the one this router runs under");
 
         assert!(err.to_lowercase().contains("mac"), "got: {err}");
@@ -2933,7 +2943,7 @@ mod tests {
         RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &anchor)
+            .set_auth(&[3; 32], &cert, &anchor, "")
             .unwrap();
 
         assert!(router.auth().is_some());

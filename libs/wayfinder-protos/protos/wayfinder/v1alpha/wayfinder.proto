@@ -806,6 +806,23 @@ message SetAuthRequest {
   // The mesh trust anchor, as raw `TrustAnchor` bytes (the mesh id and root
   // public key the node verifies certificates against).
   bytes trust_anchor = 3;
+
+  // Where this node can reach the authority on the *mesh*, for a carrier whose
+  // transport address is a public key: `<64 hex chars>` naming the authority's
+  // Ed25519 identity, optionally `@ip:port` when nothing else can turn that key
+  // into a route (see LinkTransport::Iroh's bootstrap_peers).
+  //
+  // Empty leaves whatever the node already had, so certifying an identity in
+  // place does not silently drop it.
+  //
+  // This exists because the key is otherwise unlearnable.  A node joins the
+  // mesh by reaching the authority's *management* API, where the operator
+  // already pins this exact key; without carrying it across, the only way a
+  // key-addressed link learns who to dial first is an operator writing it into
+  // the node's config file — which a node with no filesystem cannot have.  It
+  // is not a second credential: it names a public key and grants nothing, and
+  // the certificate this request installs is what actually admits the node.
+  string ca_endpoint = 4;
 }
 
 // The first message a client sends on a management connection, presenting its
@@ -1066,102 +1083,6 @@ message DenyCsrRequest {
   bytes node_mac = 1;
 }
 
-// Ask the provider for what this node needs to join the coordination-server
-// managed VPN: the login server to register against, and a freshly minted
-// single-use pre-authentication key.
-//
-// Carries no fields on purpose.  The credential is minted *for the identity
-// that asked*, which the management transport already knows from the
-// TLS-authenticated membership certificate on the connection — so there is
-// nothing here for a caller to assert, and no MAC it could name but not hold.
-// That is the whole reason this is a second request rather than extra fields on
-// CsrIssued: SubmitCsr runs on the enrollment tier, where every field is
-// self-asserted and bound to nothing about the connection.
-//
-// Reachable only by an enrolled device (a certificate carrying the member
-// capability, bound to this connection's handshake key).  Not by an operator's
-// session certificate, however privileged: the response is a credential scoped
-// to a device identity, and a person's session is not one.
-message GetVpnEnrollmentRequest {}
-
-// Answer to a GetVpnEnrollmentRequest: everything needed for an unattended
-// `tailscale up`, and nothing that outlives its single use.
-message GetVpnEnrollmentResponse {
-  // Base URL of the self-hosted coordination server to register against,
-  // passed as --login-server.  Always the mesh's own instance, never a public
-  // default: pointing it elsewhere would leak an isolated network's
-  // coordination metadata to third-party infrastructure.
-  string vpn_login_server = 1;
-
-  // A single-use, short-TTL pre-authentication key, minted during this call and
-  // never persisted by the provider.  Grants network reachability on the
-  // tunnel, not mesh membership — a holder still cannot originate or forward
-  // frames the mesh accepts without a valid membership certificate.
-  string vpn_preauth_key = 2;
-}
-
-// List the VPN peers registered with the coordination server, for operator
-// visibility.  Served only by a provider node with VPN integration configured;
-// answered from the coordination server's own node list at request time, so
-// there is nothing stale for the provider to keep in sync.
-message ListVpnPeersRequest {}
-
-// One VPN peer as the coordination server reports it, joined back to the mesh
-// identity that enrolled it.
-message VpnPeerStatus {
-  // The mesh MAC this peer enrolled under, as raw bytes.  Recovered primarily
-  // from the name of the Headscale user that owns this node — set once at
-  // enrollment as the MAC in lowercase hex, and immune to an operator later
-  // renaming the node's display name — falling back to raw_hostname only for
-  // a peer with no owning user (registered by hand).  This join is what makes
-  // the mapping possible without the provider persisting a table of its own.
-  // Empty when neither is a MAC, in which case raw_hostname carries what was
-  // actually found.
-  bytes node_mac = 1;
-
-  // The hostname as registered with the coordination server, verbatim.  Kept
-  // alongside the parsed MAC so a peer that does not follow the naming
-  // convention is still listed and still revocable, rather than silently
-  // dropped from the operator's view.
-  string raw_hostname = 2;
-
-  // The address the coordination server assigned this peer, as a string
-  // (the tunnel's own address family, not a mesh address).  This is what a
-  // UDP mesh link on that host binds to or points at.
-  string tailscale_ip = 3;
-
-  // Whether the coordination server currently considers this peer connected.
-  bool online = 4;
-
-  // When this peer was last seen by the coordination server (unix seconds), or
-  // 0 if it never has been.
-  int64 last_seen_unix = 5;
-
-  // When this peer's node key expires (unix seconds), or 0 if it does not
-  // expire.
-  int64 key_expiry_unix = 6;
-}
-
-// Answer to a ListVpnPeersRequest.
-message ListVpnPeersResponse {
-  // One entry per registered peer, in the order the coordination server
-  // reports them.  Empty if none are registered.
-  repeated VpnPeerStatus peers = 1;
-}
-
-// Remove a node's VPN registration, revoking its tunnel reachability without
-// touching its mesh membership.  Served only by a provider node with VPN
-// integration configured; answered with an Empty response on success.
-//
-// Mesh revocation (RevokeNodeRequest) already performs this as part of removing
-// a node, so this exists for the case where that half failed: it is the retry,
-// and it is idempotent — a MAC with no VPN registration is a success, not an
-// error, so a retry after a partial failure always converges.
-message RevokeVpnPeerRequest {
-  // The MAC of the node whose VPN registration to remove, as raw bytes.
-  bytes node_mac = 1;
-}
-
 // Top-level request envelope.  Exactly one variant must be set; an empty
 // request (no variant) is treated as a protocol error and returns an
 // ErrorResponse.
@@ -1259,19 +1180,9 @@ message WayfinderRequest {
     // Remove a user account (provider mode).  Requires a full management grant.
     RemoveUserRequest remove_user = 27;
 
-    // Obtain this device's VPN join credential (provider mode).  Requires the
-    // member tier — an enrolled device's own certificate — and is the one
-    // request a full management grant may *not* invoke, because the response is
-    // scoped to the calling device's identity.
-    GetVpnEnrollmentRequest get_vpn_enrollment = 28;
-
-    // List the registered VPN peers (provider mode).  Requires a full
-    // management grant.
-    ListVpnPeersRequest list_vpn_peers = 29;
-
-    // Remove a node's VPN registration (provider mode).  Requires a full
-    // management grant.
-    RevokeVpnPeerRequest revoke_vpn_peer = 30;
+    // 28, 29, 30 were get_vpn_enrollment / list_vpn_peers / revoke_vpn_peer,
+    // retired with the VPN control plane in design 18; reserved on the message
+    // below.
 
     // Read the node's alarm board: the conditions it currently believes are
     // wrong.
@@ -1325,6 +1236,13 @@ message WayfinderRequest {
     // Stop the running ping session.
     CancelPingRequest cancel_ping = 44;
   }
+
+  // Retired with the Headscale/Tailscale VPN control plane in design 18,
+  // whose job (get_vpn_enrollment / list_vpn_peers / revoke_vpn_peer) an `Iroh` mesh link now
+  // does with no second credential to mint, list or revoke. Reserved rather
+  // than reused, so an older peer's message decodes as an unknown field
+  // instead of silently landing on whatever takes the number next.
+  reserved 28, 29, 30;
 }
 
 // ── Responses ─────────────────────────────────────────────────────────────────
@@ -2537,12 +2455,8 @@ message WayfinderResponse {
     // Response to CreateUserRequest.
     CreateUserResponse create_user = 22;
 
-    // Response to GetVpnEnrollmentRequest.
-    GetVpnEnrollmentResponse vpn_enrollment = 23;
-
-    // Response to ListVpnPeersRequest.  (RevokeVpnPeer answers with the Empty
-    // response above.)
-    ListVpnPeersResponse list_vpn_peers = 24;
+    // 23 and 24 were vpn_enrollment / list_vpn_peers, retired with the VPN
+    // control plane in design 18; reserved on the message below.
 
     // Response to GetAlarmsRequest: the node's whole alarm board.
     Alarms alarms = 25;
@@ -2579,4 +2493,11 @@ message WayfinderResponse {
     // Response to CancelPingRequest.
     CancelPingResponse cancel_ping = 35;
   }
+
+  // Retired with the Headscale/Tailscale VPN control plane in design 18,
+  // whose job (vpn_enrollment / list_vpn_peers) an `Iroh` mesh link now
+  // does with no second credential to mint, list or revoke. Reserved rather
+  // than reused, so an older peer's message decodes as an unknown field
+  // instead of silently landing on whatever takes the number next.
+  reserved 23, 24;
 }

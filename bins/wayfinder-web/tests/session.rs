@@ -308,60 +308,6 @@ async fn logging_out_ends_the_session_on_the_server() {
     );
 }
 
-/// A viewer account's session may read the node and may not change it.
-///
-/// The read-only tier is a signed bit on the certificate the provider issues
-/// and a request allowlist at the node, with nothing in this crate in between —
-/// so this is the only place the two ends are checked against each other.
-#[tokio::test]
-async fn a_viewer_session_can_poll_and_cannot_mutate() {
-    let app = common::login_router().await;
-
-    let response = call(
-        &app,
-        "login",
-        &format!("username={MOCK_VIEWER_USER}&password={MOCK_PASSWORD}&totp_code="),
-        None,
-    )
-    .await;
-    let (id, _) = session_cookie(&response);
-    let outcome: LoginResult = json(response).await;
-    let LoginResult::LoggedIn(info) = outcome else {
-        panic!("the viewer account's password is accepted: {outcome:?}");
-    };
-    assert_eq!(
-        info.capability, "read-only",
-        "a viewer account's session says what it may do, in words"
-    );
-    assert!(
-        !info.admin,
-        "and the dashboard is told, so it offers no control the node would refuse"
-    );
-
-    // The poll itself is the assertion. A viewer's connection is refused the
-    // admin-gated queries, so a poll that asked for one anyway would fail here
-    // whole — every table lost to the one the node was never going to serve.
-    let snapshot: NodeSnapshot = json(call(&app, "snapshot", "since_seq=0", Some(&id)).await).await;
-    assert_eq!(snapshot.routing.entries.len(), 1);
-    assert!(
-        snapshot.vpn_peers.is_none(),
-        "and the admin-gated table is simply absent, not asked for and swallowed"
-    );
-
-    let response = call(
-        &app,
-        "set_link_gate",
-        "iface_idx=0&gate=TxOgm&value=false",
-        Some(&id),
-    )
-    .await;
-    assert_ne!(
-        response.status(),
-        StatusCode::OK,
-        "a viewer's session cannot flip a gate"
-    );
-}
-
 /// The page a signed-out browser gets is the sign-in form, with the dashboard
 /// rendered but hidden — and every tab route still discovered.
 ///

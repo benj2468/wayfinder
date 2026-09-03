@@ -24,7 +24,6 @@ use crate::output;
 use crate::output::OutputFormat;
 use crate::parse_mac6;
 use crate::user;
-use crate::vpn;
 
 /// The provider-side operator actions.
 #[derive(Subcommand, Debug)]
@@ -57,9 +56,6 @@ pub enum ProviderCommand {
     /// authenticates as the node itself.
     #[command(subcommand)]
     User(user::UserCommand),
-    /// The VPN peers registered with this provider's coordination server.
-    #[command(subcommand)]
-    Vpn(vpn::VpnCommand),
 }
 
 /// Acting on the CSRs a provider is holding for approval.
@@ -100,7 +96,6 @@ pub async fn run(
         }
         ProviderCommand::Requests(cmd) => requests(cmd, client, fmt).await?,
         ProviderCommand::User(cmd) => user::run(cmd, client).await?,
-        ProviderCommand::Vpn(cmd) => vpn::run(cmd, client, fmt).await?,
     })
 }
 

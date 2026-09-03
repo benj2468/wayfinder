@@ -913,7 +913,13 @@ pub trait RouterReads {
 /// through the caller's own identity-seed slot, which only the loop holds.
 pub trait RouterWrites {
     /// Set the auth state on the node.
-    fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String>;
+    fn set_auth(
+        &mut self,
+        seed: &[u8],
+        cert: &[u8],
+        trust_anchor: &[u8],
+        ca_endpoint: &str,
+    ) -> Result<(), String>;
 
     /// Apply a partial update to the node's runtime configuration. Only the
     /// fields present in `config` are changed; unset fields are left as they
@@ -1971,7 +1977,12 @@ pub fn handle_router_write<P: RouterWrites + ?Sized>(
 ) -> Result<WayfinderResponse, WayfinderRequest> {
     let response = match request.request {
         Some(RequestKind::SetAuth(set_auth)) => {
-            match provider.set_auth(&set_auth.seed, &set_auth.cert, &set_auth.trust_anchor) {
+            match provider.set_auth(
+                &set_auth.seed,
+                &set_auth.cert,
+                &set_auth.trust_anchor,
+                &set_auth.ca_endpoint,
+            ) {
                 Ok(_) => ResponseKind::Empty(Empty {}),
                 Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
             }
@@ -2347,19 +2358,6 @@ pub fn handle_authority<P: AuthorityDataProvider>(
 /// and pointed at the wrong subsystem.
 pub fn handle_unowned(request: WayfinderRequest) -> WayfinderResponse {
     let response = match request.request {
-        // The VPN requests are answered by the management *transport*, which
-        // is the only layer that holds the caller's verified certificate —
-        // `GetVpnEnrollment` carries no fields because the identity it
-        // mints for is the connection's, and a provider here has no
-        // connection to read it from. Reaching this arm means a transport
-        // forwarded one instead of handling it, so it fails closed and
-        // says so rather than answering with something plausible.
-        Some(RequestKind::GetVpnEnrollment(_))
-        | Some(RequestKind::ListVpnPeers(_))
-        | Some(RequestKind::RevokeVpnPeer(_)) => ResponseKind::Error(ErrorResponse {
-            message: "VPN coordination is not served on this transport".into(),
-        }),
-
         // Authentication is handled by the transport before any request
         // reaches this dispatcher (it needs the TLS-authenticated key, which
         // the router-facing provider has no access to). Seeing one here means
@@ -2439,7 +2437,6 @@ mod tests {
     use crate::wayfinder::v1alpha::GetThroughputRequest;
     use crate::wayfinder::v1alpha::GetTrustAnchorRequest;
     use crate::wayfinder::v1alpha::ListUsersRequest;
-    use crate::wayfinder::v1alpha::ListVpnPeersRequest;
     use crate::wayfinder::v1alpha::ResolveRouteRequest;
     use crate::wayfinder::v1alpha::RevealEnrollmentTokenRequest;
     use crate::wayfinder::v1alpha::RuntimeConfig;
@@ -2586,6 +2583,7 @@ mod tests {
             _seed: &[u8],
             _cert: &[u8],
             _trust_anchor: &[u8],
+            _ca_endpoint: &str,
         ) -> Result<(), String> {
             Ok(())
         }
@@ -3918,6 +3916,7 @@ mod tests {
         assert_eq!(
             Audited::Mutation,
             audited(&RequestKind::SetAuth(SetAuthRequest {
+                ca_endpoint: String::new(),
                 seed: Vec::new(),
                 cert: Vec::new(),
                 trust_anchor: Vec::new(),
@@ -4075,8 +4074,6 @@ mod tests {
             ResponseKind::ListPendingCsrs(_) => "ListPendingCsrs",
             ResponseKind::TrustAnchor(_) => "TrustAnchor",
             ResponseKind::SubmitCsr(_) => "SubmitCsr",
-            ResponseKind::VpnEnrollment(_) => "VpnEnrollment",
-            ResponseKind::ListVpnPeers(_) => "ListVpnPeers",
             ResponseKind::SecurityStatus(_) => "SecurityStatus",
             ResponseKind::Logs(_) => "Logs",
             ResponseKind::LogFilter(_) => "LogFilter",
@@ -4135,12 +4132,8 @@ mod tests {
             request_facet(&RequestKind::ListUsers(ListUsersRequest {})),
             RequestFacet::Authority
         );
-        // Answered before dispatch is reached: the VPN requests in the
-        // connection task, `Authenticate` by the transport's own first frame.
-        assert_eq!(
-            request_facet(&RequestKind::ListVpnPeers(ListVpnPeersRequest {})),
-            RequestFacet::Transport
-        );
+        // Answered before dispatch is reached: `Authenticate` is the
+        // transport's own first frame.
         assert_eq!(
             request_facet(&RequestKind::Authenticate(AuthenticateRequest::default())),
             RequestFacet::Transport

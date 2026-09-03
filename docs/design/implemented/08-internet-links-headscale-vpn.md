@@ -1,7 +1,39 @@
 # Design: Internet-connected mesh links via a Headscale-managed tunnel, managed from the wayfinder UI
 
-**Status:** Implemented and deployed. The control plane, the CLI, the dashboard
-panel and the Nix modules are in; `nix/tests/ca-provider.nix` exercises the
+**Status:** Implemented, then **superseded by
+`docs/design/18-iroh-mesh-links.md`**. Everything below shipped and ran; none
+of it is in the tree any more.
+
+> **Superseded, and what that means for this file.** Design 18 replaced the
+> Headscale/Tailscale control plane with an `Iroh` mesh link — peer-to-peer QUIC
+> dialed by the Ed25519 key a node's `MembershipCert` already binds. Deleted
+> with it: `libs/wayfinder-server/src/vpn.rs`, `GetVpnEnrollment` /
+> `ListVpnPeers` / `RevokeVpnPeer` (their field numbers reserved, never
+> reused), the `GrantedMember` authorization tier, `nix/modules/wayfinder-{headscale,tailscale}.nix`,
+> `nix/tests/vpn-data-plane.nix`, `wayfinderctl vpn`, and the dashboard's VPN
+> panel. `CERT_FLAG_MEMBER` (0x08) survives as a **reserved** bit — certificates
+> in the field carry it inside a signature that cannot be rewritten — but no
+> longer earns any management tier.
+>
+> Per this folder's own rule, the document is **not** rewritten to match. It is
+> the record of why the tunnel was built the way it was, and three of its
+> findings outlived it:
+>
+> * **Correction 1** — the `GrantedMember` tier it had to invent mid-implementation
+>   is precisely what design 18 §1 cites as the cost of a second credential.
+>   An entire tier in a `SECURITY ALERT` file, one request wide, for one RPC.
+> * **Correction 6** — a plaintext coordination server that registers every node
+>   and then leaves them unable to reach each other. Design 18's relay inherits
+>   the hazard exactly (QUIC address discovery needs TLS), which is why
+>   `wayfinder-iroh-relay.nix` warns rather than silently degrading.
+> * **Correction 7 / §9 answer 7** — the split-horizon removal is *unaffected*
+>   and still load-bearing; the hub-transit limitation it describes is what
+>   design 18 §3.2's certificate directory finally fixes, without the OGM TVLV
+>   this document said it would need.
+>
+> What neither design ever verified is the thing both rest on: whether hole
+> punching holds between two real CGNAT'd hosts. This document says so plainly
+> below, and it is still true.
 control-plane flow against a real Headscale in a VM, and
 `nix/tests/vpn-data-plane.nix` covers the data plane with real `tailscaled`
 clients in containers. The cloud CA (`nix/machines/wayfinder-ca`) runs the

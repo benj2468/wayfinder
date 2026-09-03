@@ -17,7 +17,6 @@ use anyhow::bail;
 use clap::Subcommand;
 use wayfinder_auth::Keypair;
 use wayfinder_client::Client;
-use wayfinder_client::Endpoint;
 use wayfinder_protos::wayfinder::v1alpha::CsrIssued;
 use wayfinder_protos::wayfinder::v1alpha::submit_csr_response::Outcome as CsrOutcome;
 
@@ -25,7 +24,6 @@ use crate::cert;
 use crate::output;
 use crate::output::OutputFormat;
 use crate::parse_mac6;
-use crate::vpn;
 
 /// The node's credential: read it, replace it, obtain one, or change how it is
 /// advertised.
@@ -106,33 +104,14 @@ pub struct EnrollArgs {
     /// Where to write the mesh trust anchor.
     #[arg(long)]
     pub out_anchor: PathBuf,
-    /// Do not join the VPN, even if the provider offers a tunnel.
-    ///
-    /// Enrollment otherwise asks for a tunnel credential once the certificate
-    /// is in hand and runs `tailscale up` with it. A provider with no VPN
-    /// configured answers "not configured" and enrollment finishes normally
-    /// either way, so this is for a host that reaches the mesh some other way
-    /// rather than for talking to a CA without one.
-    #[arg(long)]
-    pub no_vpn: bool,
-    /// Print the `tailscale up` command instead of running it.
-    ///
-    /// For a host where the tunnel daemon is managed elsewhere (a NixOS
-    /// module, a container entrypoint). The preauth key is single-use and
-    /// short-lived, so a printed command has minutes to be used, not days.
-    #[arg(long)]
-    pub print_vpn_command: bool,
 }
 
 /// Dispatch one `auth` subcommand against an already-connected `client`.
 ///
-/// `endpoint` is `None` for a serial target, which has no TLS endpoint to
-/// reconnect over and so cannot take enrollment's VPN step.
 pub async fn run(
     cmd: AuthCommand,
     client: &mut Client,
     fmt: OutputFormat,
-    endpoint: Option<&Endpoint>,
 ) -> anyhow::Result<String> {
     Ok(match cmd {
         AuthCommand::Status => output::security(&client.security_status().await?, fmt)?,
@@ -152,6 +131,7 @@ pub async fn run(
                     &seed_bytes,
                     &credential.cert_bytes,
                     &credential.anchor_bytes,
+                    "",
                 )
                 .await
                 .context("failed to set auth")?;
@@ -178,8 +158,6 @@ pub async fn run(
             out_seed,
             out_cert,
             out_anchor,
-            no_vpn,
-            print_vpn_command,
         }) => {
             // Enrollment can be retried against the same `out_seed` path (e.g. a
             // provider that holds requests for operator approval, polled across
@@ -209,56 +187,17 @@ pub async fn run(
                 .with_context(|| format!("writing certificate to {}", out_cert.display()))?;
             std::fs::write(&out_anchor, &issued.trust_anchor)
                 .with_context(|| format!("writing trust anchor to {}", out_anchor.display()))?;
-            // Enrollment is complete and durable at this point. The VPN step
-            // below is additive: it reconnects presenting the certificate just
-            // issued, which earns the member tier `GetVpnEnrollment` needs —
-            // the connection enrollment ran over was a stranger's and cannot
-            // mint anything. Anything that goes wrong there is reported in the
-            // summary rather than failing the command, since failing would
-            // discard an enrollment that already succeeded.
-            let vpn_note = match (no_vpn, endpoint) {
-                (true, _) | (false, None) => String::new(),
-                (false, Some(endpoint)) => {
-                    join_vpn_as_enrolled_node(endpoint, &seed, &issued.cert, print_vpn_command)
-                        .await
-                        .enrollment_note()
-                }
-            };
+            // Enrollment is complete and durable at this point, and — since
+            // design 18 retired the VPN control plane — that is the whole of
+            // it. There is no second credential to collect: an `Iroh` mesh
+            // link dials peers by the very key this certificate binds, so the
+            // artifacts written above are everything the node needs.
             format!(
-                "enrolled {}: wrote seed, certificate, and trust anchor{vpn_note}",
+                "enrolled {}: wrote seed, certificate, and trust anchor",
                 output::format_mac(&mac_bytes)
             )
         }
     })
-}
-
-/// Open a second connection to `endpoint` as the freshly-enrolled node and ask
-/// for a tunnel credential.
-///
-/// A *second* connection, not the one enrollment ran over: that one was opened
-/// as a stranger (no certificate), which is the enrollment tier and cannot mint
-/// a tunnel credential — deliberately, since every field of a CSR is
-/// self-asserted. Presenting the issued certificate here is what proves
-/// possession of the key that was certified.
-///
-/// Never fails the caller: it returns the outcome, whatever happened, for the
-/// caller to render into the enrollment summary.
-async fn join_vpn_as_enrolled_node(
-    endpoint: &Endpoint,
-    seed: &[u8; 32],
-    cert: &[u8],
-    print_only: bool,
-) -> vpn::VpnJoinOutcome {
-    let identity = wayfinder_client::Identity {
-        seed: *seed,
-        cert: cert.to_vec(),
-    };
-    match Client::connect_tls(&endpoint.addr, &endpoint.node_key, &identity).await {
-        Ok(mut client) => vpn::join(&mut client, print_only).await,
-        Err(e) => vpn::VpnJoinOutcome::NotConfigured(format!(
-            "reconnecting as the enrolled node failed: {e}"
-        )),
-    }
 }
 
 /// Submit one CSR and interpret the outcome.

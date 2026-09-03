@@ -157,6 +157,37 @@ resource "oci_core_security_list" "ca" {
       max = 41641
     }
   }
+
+  # The iroh relay's QUIC address discovery (design 18) — what replaced STUN in
+  # iroh, and the exact analogue of the UDP/3478 rule above. A node asks this
+  # port what its own public address is; without an answer it cannot hole-punch
+  # at all and every `Iroh` link falls back to relaying through this box.
+  #
+  # Same silent-degradation shape as the STUN rule: losing it breaks nothing
+  # visibly, it just quietly routes every spoke-to-spoke frame through here.
+  ingress_security_rules {
+    protocol    = "17" # UDP
+    source      = "0.0.0.0/0"
+    description = "iroh relay QUIC address discovery (design 18)"
+    udp_options {
+      min = 7842
+      max = 7842
+    }
+  }
+
+  # This box's own iroh mesh link, so a spoke can hole-punch a direct QUIC path
+  # to it rather than relaying. The counterpart of the UDP/41641 rule above,
+  # and pinned for the same reason: an ephemeral port would give the NAT a
+  # fresh mapping on every restart.
+  ingress_security_rules {
+    protocol    = "17" # UDP
+    source      = "0.0.0.0/0"
+    description = "iroh mesh link direct connections (design 18)"
+    udp_options {
+      min = 6001
+      max = 6001
+    }
+  }
 }
 
 resource "oci_core_subnet" "ca" {

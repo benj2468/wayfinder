@@ -69,8 +69,6 @@ use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusResponse;
 use wayfinder_protos::wayfinder::v1alpha::GetThroughputRequest;
 use wayfinder_protos::wayfinder::v1alpha::GetTrustAnchorRequest;
 use wayfinder_protos::wayfinder::v1alpha::GetTrustAnchorResponse;
-use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentRequest;
-use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentResponse;
 use wayfinder_protos::wayfinder::v1alpha::KeepAliveTable;
 use wayfinder_protos::wayfinder::v1alpha::LinkFeatures;
 use wayfinder_protos::wayfinder::v1alpha::LinkFeaturesTable;
@@ -83,8 +81,6 @@ use wayfinder_protos::wayfinder::v1alpha::ListUserInvitesRequest;
 use wayfinder_protos::wayfinder::v1alpha::ListUserInvitesResponse;
 use wayfinder_protos::wayfinder::v1alpha::ListUsersRequest;
 use wayfinder_protos::wayfinder::v1alpha::ListUsersResponse;
-use wayfinder_protos::wayfinder::v1alpha::ListVpnPeersRequest;
-use wayfinder_protos::wayfinder::v1alpha::ListVpnPeersResponse;
 use wayfinder_protos::wayfinder::v1alpha::LogRecords;
 use wayfinder_protos::wayfinder::v1alpha::NodeInfo;
 use wayfinder_protos::wayfinder::v1alpha::NodeMetrics;
@@ -99,7 +95,6 @@ use wayfinder_protos::wayfinder::v1alpha::ResolveRouteResponse;
 use wayfinder_protos::wayfinder::v1alpha::RevokeNodeRequest;
 use wayfinder_protos::wayfinder::v1alpha::RevokeUserInviteRequest;
 use wayfinder_protos::wayfinder::v1alpha::RevokeUserSessionsRequest;
-use wayfinder_protos::wayfinder::v1alpha::RevokeVpnPeerRequest;
 use wayfinder_protos::wayfinder::v1alpha::RoutingTable;
 use wayfinder_protos::wayfinder::v1alpha::RuntimeConfig;
 use wayfinder_protos::wayfinder::v1alpha::SetAuthRequest;
@@ -801,17 +796,23 @@ impl Client {
     /// Pass an empty `seed` to certify the identity the node already has — see
     /// [`install_cert`](Self::install_cert), which is that call named for what
     /// it does.
+    /// `ca_endpoint` records where the authority is reachable on the *mesh*
+    /// (`<64 hex chars>[@ip:port]`); empty leaves whatever the node already
+    /// had. It is what lets a key-addressed link find its first peer without an
+    /// operator writing that key into the node's config.
     pub async fn set_auth(
         &mut self,
         seed: &[u8],
         cert: &[u8],
         trust_anchor: &[u8],
+        ca_endpoint: &str,
     ) -> anyhow::Result<()> {
         match self
             .request(RequestKind::SetAuth(SetAuthRequest {
                 seed: seed.to_vec(),
                 cert: cert.to_vec(),
                 trust_anchor: trust_anchor.to_vec(),
+                ca_endpoint: ca_endpoint.to_string(),
             }))
             .await?
         {
@@ -828,8 +829,13 @@ impl Client {
     /// change, so the node becomes a member of the mesh without moving on it.
     /// The certificate must of course be bound to that same key, or the node
     /// will hold a certificate it cannot sign for.
-    pub async fn install_cert(&mut self, cert: &[u8], trust_anchor: &[u8]) -> anyhow::Result<()> {
-        self.set_auth(&[], cert, trust_anchor).await
+    pub async fn install_cert(
+        &mut self,
+        cert: &[u8],
+        trust_anchor: &[u8],
+        ca_endpoint: &str,
+    ) -> anyhow::Result<()> {
+        self.set_auth(&[], cert, trust_anchor, ca_endpoint).await
     }
 
     /// Set the Trickle/OGM emission bounds for one mesh interface at runtime.
@@ -1153,55 +1159,6 @@ impl Client {
         }
     }
 
-    /// Provider mode: ask for this device's VPN join credential.
-    ///
-    /// Answered only for a connection carrying *this device's own* membership
-    /// certificate — the request has no fields because the identity it mints
-    /// for is the connection's. A management session (an operator's login, or
-    /// the node's own key) is refused: neither is a device the coordination
-    /// server can register.
-    ///
-    /// A provider with no VPN configured answers with an error saying so, which
-    /// is the expected result on every deployment that does not run a tunnel —
-    /// callers should treat it as "no VPN here", not as a failure.
-    pub async fn get_vpn_enrollment(&mut self) -> anyhow::Result<GetVpnEnrollmentResponse> {
-        match self
-            .request(RequestKind::GetVpnEnrollment(GetVpnEnrollmentRequest {}))
-            .await?
-        {
-            ResponseKind::VpnEnrollment(resp) => Ok(resp),
-            other => Err(unexpected("GetVpnEnrollment", &other)),
-        }
-    }
-
-    /// Provider mode: list the VPN peers the coordination server knows.
-    pub async fn list_vpn_peers(&mut self) -> anyhow::Result<ListVpnPeersResponse> {
-        match self
-            .request(RequestKind::ListVpnPeers(ListVpnPeersRequest {}))
-            .await?
-        {
-            ResponseKind::ListVpnPeers(resp) => Ok(resp),
-            other => Err(unexpected("ListVpnPeers", &other)),
-        }
-    }
-
-    /// Provider mode: remove a node's VPN registration, leaving its mesh
-    /// membership alone.
-    ///
-    /// Idempotent: a MAC with no registration succeeds. This is the retry for a
-    /// `revoke_node` whose VPN half failed.
-    pub async fn revoke_vpn_peer(&mut self, node_mac: &[u8]) -> anyhow::Result<()> {
-        match self
-            .request(RequestKind::RevokeVpnPeer(RevokeVpnPeerRequest {
-                node_mac: node_mac.to_vec(),
-            }))
-            .await?
-        {
-            ResponseKind::Empty(_) => Ok(()),
-            other => Err(unexpected("RevokeVpnPeer", &other)),
-        }
-    }
-
     /// Provider mode: list the certificates this provider has issued.
     pub async fn list_certs(&mut self) -> anyhow::Result<ListCertsResponse> {
         match self
@@ -1494,8 +1451,6 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
         ResponseKind::AuthenticateUser(_) => "AuthenticateUser",
         ResponseKind::ListUsers(_) => "ListUsers",
         ResponseKind::CreateUser(_) => "CreateUser",
-        ResponseKind::VpnEnrollment(_) => "VpnEnrollment",
-        ResponseKind::ListVpnPeers(_) => "ListVpnPeers",
         ResponseKind::CreateUserInvite(_) => "CreateUserInvite",
         ResponseKind::ListUserInvites(_) => "ListUserInvites",
         ResponseKind::RevokeUserSessions(_) => "RevokeUserSessions",

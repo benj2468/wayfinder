@@ -182,6 +182,66 @@ pub enum LinkTransport {
         #[serde(default = "LinkTransport::default_ble_advertise_dwell_ms")]
         advertise_dwell_ms: u64,
     },
+    /// Carry the link over [iroh](https://docs.iroh.computer) peer-to-peer
+    /// QUIC, dialing peers by their Ed25519 identity key rather than by an IP
+    /// address (see `docs/design/18-iroh-mesh-links.md`).
+    ///
+    /// The internet-link counterpart to
+    /// [`UdpMulti`](LinkTransport::UdpMulti)-over-Tailscale: it reaches a peer
+    /// behind CGNAT by hole punching, falling back to a relay. Unlike that
+    /// path it needs no tunnel daemon, no coordination server and no second
+    /// credential — this node's own identity seed *is* its network address, so
+    /// the key already bound to its `MembershipCert` is what peers dial.
+    ///
+    /// Host-only, and deliberately so: an embedded board has no IP stack to
+    /// put a QUIC endpoint on and no NAT to traverse — it reaches the mesh
+    /// over a radio. See design 18 §2.
+    Iroh {
+        /// UDP port the QUIC endpoint binds. `None` (the default) binds an
+        /// ephemeral port, which works but gives a NAT a fresh mapping on
+        /// every restart; pinning one and opening it is what lets two peers
+        /// hole-punch to a direct path, exactly as
+        /// `services.wayfinder-tailscale.port` does today.
+        #[serde(default)]
+        bind_port: Option<u16>,
+        /// A self-hosted [`iroh-relay`](https://docs.rs/iroh-relay) to use for
+        /// hole-punch coordination and as a fallback path.
+        ///
+        /// `None` disables relaying entirely (`RelayMode::Disabled`) — direct
+        /// paths only, which is right for a LAN or an air-gapped mesh.
+        ///
+        /// There is **no setting that reaches iroh's public default relays.**
+        /// An isolated mesh must not route its traffic through a third party
+        /// because a field was left out; the same reasoning pins
+        /// `services.wayfinder-tailscale.loginServer` today.
+        #[serde(default)]
+        relay_url: Option<String>,
+        /// Peers to dial at startup, in either of two forms:
+        ///
+        /// * `<64 hex chars>` — a node's `ed_pubkey`, the same value its
+        ///   `MembershipCert` binds to its MAC. Dialable only when something
+        ///   can turn a key into a route: a configured `relay_url`, or an
+        ///   address-lookup service. This is the internet case, where the
+        ///   peer's address is not knowable in advance anyway.
+        /// * `<64 hex chars>@<ip:port>[,<ip:port>…]` — the key plus direct
+        ///   addresses, needing neither relay nor discovery. This is what
+        ///   makes a LAN or air-gapped mesh work with `relay_url` unset.
+        ///
+        /// The bootstrap analog of `UdpMulti`'s `discovery_addr`: a QUIC mesh
+        /// has no broadcast domain, so a node needs one peer named up front to
+        /// hear its first OGM from. In the deployed hub/spoke topology that is
+        /// the CA, and it is the only entry a spoke needs — every other peer is
+        /// learned from the frames that follow.
+        ///
+        /// Neither half is a new secret to go find. Reaching the CA to enroll
+        /// already requires pinning its identity key (`connect_tls`'s
+        /// `node_key`) and knowing its address; a bootstrap peer is those two
+        /// values joined by an `@`. Note it is **not** the trust anchor — that
+        /// is the mesh *root* signing key, a different key kept in a different
+        /// file, and no endpoint listens on it. See design 18 §3.3b.
+        #[serde(default)]
+        bootstrap_peers: Vec<String>,
+    },
     /// Test Link, used for testing only, will fail validation in real mode
     Test {
         /// Name of the in-process test `Switch` this link attaches to.
@@ -207,6 +267,7 @@ impl LinkTransport {
             LinkTransport::RawL2 { .. } => "rawl2",
             LinkTransport::Rylr998 { .. } => "lora",
             LinkTransport::Ble { .. } => "ble",
+            LinkTransport::Iroh { .. } => "iroh",
             LinkTransport::Test { .. } => "test",
         }
     }
@@ -1350,6 +1411,57 @@ name: rooftop-ble
         assert_eq!(link.interface_name(2), "ble2");
     }
 
+    /// An iroh link needs nothing configured: an ephemeral port, no relay and
+    /// no bootstrap peer is a valid (LAN-only) node. Every field is additive,
+    /// so an operator opts into reachability rather than opting out of a
+    /// default that reaches a third party.
+    #[test]
+    fn iroh_link_defaults_to_no_relay_and_no_peers() {
+        let link: LinkConfig = serde_yaml::from_str("type: Iroh\n").unwrap();
+        assert_eq!(link.interface_name(0), "iroh0");
+        let LinkTransport::Iroh {
+            bind_port,
+            relay_url,
+            bootstrap_peers,
+        } = link.transport
+        else {
+            panic!("expected an iroh transport");
+        };
+        assert_eq!(bind_port, None, "an unpinned port is ephemeral");
+        assert_eq!(
+            relay_url, None,
+            "no relay by default: RelayMode::Disabled, never iroh's public relays"
+        );
+        assert!(bootstrap_peers.is_empty());
+    }
+
+    /// The fields an internet-facing spoke actually sets: a pinned port to
+    /// hole-punch on, a self-hosted relay, and the CA's identity key to
+    /// bootstrap from.
+    #[test]
+    fn iroh_link_parses_a_configured_spoke() {
+        let link: LinkConfig = serde_yaml::from_str(
+            "type: Iroh\n\
+             bind_port: 41999\n\
+             relay_url: https://relay.example.net\n\
+             bootstrap_peers:\n  \
+             - 8f1b3c2d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9\n",
+        )
+        .unwrap();
+        let LinkTransport::Iroh {
+            bind_port,
+            relay_url,
+            bootstrap_peers,
+        } = link.transport
+        else {
+            panic!("expected an iroh transport");
+        };
+        assert_eq!(bind_port, Some(41999));
+        assert_eq!(relay_url.as_deref(), Some("https://relay.example.net"));
+        assert_eq!(bootstrap_peers.len(), 1);
+        assert_eq!(bootstrap_peers[0].len(), 64, "a hex-encoded Ed25519 pubkey");
+    }
+
     /// Every transport kind has a distinct short label; a fallback name must not
     /// collide between two links of different kinds at different indices.
     #[test]
@@ -1380,6 +1492,12 @@ name: rooftop-ble
             LinkTransport::Ble {
                 adapter: None,
                 advertise_dwell_ms: 150,
+            }
+            .kind(),
+            LinkTransport::Iroh {
+                bind_port: None,
+                relay_url: None,
+                bootstrap_peers: Vec::new(),
             }
             .kind(),
             LinkTransport::Test {

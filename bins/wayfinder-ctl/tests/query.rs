@@ -249,7 +249,13 @@ impl RouterReads for Mock {
 }
 
 impl RouterWrites for Mock {
-    fn set_auth(&mut self, _seed: &[u8], _cert: &[u8], _trust_anchor: &[u8]) -> Result<(), String> {
+    fn set_auth(
+        &mut self,
+        _seed: &[u8],
+        _cert: &[u8],
+        _trust_anchor: &[u8],
+        _ca_endpoint: &str,
+    ) -> Result<(), String> {
         Ok(())
     }
 

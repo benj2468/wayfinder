@@ -495,7 +495,7 @@ look at if a duty-cycle-limited radio segment gets crowded.
   axum server that holds the node connection and a wasm bundle that hydrates its
   markup. The browser never speaks the management protocol —
   `wayfinder-client` is tokio/rustls and does not build for wasm — so every node
-  interaction is a `#[server]` function. The twelve tabs sit in **two scopes**:
+  interaction is a `#[server]` function. The eleven tabs sit in **two scopes**:
   a generally-available *Router* scope (the TUI's seven) and an
   administrators-only *Provider* scope for what the node governs as the mesh's
   certificate authority. A node's two jobs, kept apart.
@@ -503,12 +503,12 @@ look at if a duty-cycle-limited radio segment gets crowded.
   tooling. Subcommands are grouped by subject, and the groups mirror the two
   scopes `wayfinder-web` splits on: the node you name (`link`, `auth`, and the
   bare reads), versus `provider` (alias `ca`) — members, revocation, the
-  enrollment queue, accounts and VPN peers — which is pointed at the CA and so
+  enrollment queue and accounts — which is pointed at the CA and so
   needs its own `--connect`. `csr` carries an out-of-band enrollment; `cert` is
   the only offline half that touches authority state, and it operates on the
-  mesh root seed, never on a provider's `ca-state.json`. `user`, `vpn` and
-  `enroll` survive as hidden top-level aliases and `security` as a visible one,
-  all folded into their grouped form by `Command::canonical`.
+  mesh root seed, never on a provider's `ca-state.json`. `user` and `enroll`
+  survive as hidden top-level aliases and `security` as a visible one, all
+  folded into their grouped form by `Command::canonical`.
 - **bins/rylr998-cli** — a small host CLI for driving a RYLR998/498 module over
   a real serial port, for bringing up and debugging a LoRa link outside a full
   node. Split lib (`rylr998_cli::run_command`) + thin `clap` binary on purpose,
@@ -542,9 +542,12 @@ the root workspace" above)
   it installs).
 - **nix/machines/wayfinder-ca** → the cloud certificate authority: a node with
   **no local egress**, holding the mesh root of trust and serving enrollment
-  over the management API. It also runs the tunnel control plane (design 08),
-  joins that tunnel itself, and carries one `UdpMulti` mesh link over it — so
-  it routes as well as signs. Built by `mkCloudSystem` (no
+  over the management API. It also runs the mesh's `iroh-relay` (design 18) and
+  carries one `Iroh` mesh link of its own — so it routes as well as signs. That
+  relay replaced the Headscale tunnel control plane design 08 put here: an iroh
+  peer is dialed by the Ed25519 key its `MembershipCert` already binds, so
+  there is no coordination server, no address allocator, no tunnel daemon on
+  any node, and no second credential to mint or revoke. Built by `mkCloudSystem` (no
   installer half — a cloud VM is installed by `nixos-anywhere` kexec-ing over
   the provider's stock image) and provisioned by `infra/oracle/`. Its four
   secret files are minted offline with `wayfinderctl cert` and never enter this

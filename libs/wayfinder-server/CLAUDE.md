@@ -141,12 +141,6 @@ Five grant tiers:
   the admin bit** — every device on the mesh holds a verified non-admin
   certificate, so a tier granted by absence would be a tier the whole mesh
   already had.
-- `GrantedMember` — a verified, non-revoked cert carrying `CERT_FLAG_MEMBER`
-  and no management capability: an enrolled *device*, which is what every node
-  on the mesh holds. Exactly one request wide (`GetVpnEnrollment`), and that
-  narrowness is the whole point — anything added to this tier is added to the
-  entire mesh at once. Earned by the bit, never by the absence of the others,
-  for the same reason the viewer tier is.
 - `GrantedEnrollment` — the client presented no cert at all. Admitted, but
   `permits` confines it to `SubmitCsr`, `GetTrustAnchor`, `AuthenticateUser`,
   and the two invitation-redemption requests (`BeginUserRegistration`,
@@ -163,18 +157,17 @@ reissued), or one whose bits this build does not recognise, since unknown flags
 are masked rather than guessed at.
 
 **Admission is per-connection; what an admitted client may invoke is
-per-request.** The two full grants may invoke everything *except one request*,
-so `permits` is really the definition of the three confined tiers.
+per-request.** The two full grants may invoke everything without exception, so
+`permits` is really the definition of the confined tiers.
 
-That one exception is `GetVpnEnrollment`, gated on the **request** ahead of the
-tier match. It is not a management capability being exercised: it mints a
-tunnel credential bound to the calling *device's* identity, read from the
-verified certificate on the connection. An operator's session certificate and
-the node's own seed are both fully privileged and neither is a device, so for
-them the request has no meaning rather than being a privilege they lack. This
-is also what makes design 08's two gates independent — a party holding only the
-shared enrollment token can have a certificate issued for keys it names, but
-cannot separately prove possession of that key to reach this request.
+There used to be one exception, gated on the **request** ahead of the tier
+match: `GetVpnEnrollment`, which minted a tunnel credential for the calling
+*device*, and which an admin was therefore refused for having a person's
+session rather than a device identity. Design 18 retired it along with the
+`GrantedMember` tier it was the sole occupant of, and with the whole
+Headscale/Tailscale control plane behind it.
+`the_singular_classifications_are_singular` now asserts that exception set is
+**empty**, so a future request carving one out has to say why, there.
 
 The enrollment tier exists because enrollment is otherwise impossible: a
 provider worth enrolling with is itself an enrolled member, so a node with no
@@ -238,12 +231,14 @@ returns a `RevocationRecord`), so it carries no key types and stays
 `no_std + alloc`; the concrete `CertAuthority` holding the mesh root key is
 `std`-only (`authority.rs`).
 
-`RevokeNode` is no longer one delegation but four hops, and that is the most
+`RevokeNode` is no longer one delegation but three hops, and that is the most
 surprising thing in this crate: the connection task forwards it, the authority
-signs *and durably persists*, the router ingests and floods it on its OGMs, and
-the connection task then revokes the VPN peer. The middle two are owned by
-different tasks, which is why a revocation can be recorded and never announced —
-and why every step reports whether it actually happened.
+signs *and durably persists*, and the router ingests and floods it on its OGMs.
+The last two are owned by different tasks, which is why a revocation can be
+recorded and never announced — and why every step reports whether it actually
+happened. (There was a fourth hop, revoking the VPN peer, until design 18
+removed the tunnel that needed revoking; the half-completed-revoke reporting
+that existed for it is gone with it.)
 
 **The authority runs on its own task, never on the router's event loop**
 (`authority_task.rs`, design 13). A login spends Argon2id at 64 MiB and then

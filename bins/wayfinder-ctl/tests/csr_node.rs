@@ -225,7 +225,13 @@ impl RouterReads for NodeMock {
 }
 
 impl RouterWrites for NodeMock {
-    fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String> {
+    fn set_auth(
+        &mut self,
+        seed: &[u8],
+        cert: &[u8],
+        trust_anchor: &[u8],
+        _ca_endpoint: &str,
+    ) -> Result<(), String> {
         #[allow(clippy::unwrap_used)]
         self.set_auth_calls.lock().unwrap().push(SetAuthCall {
             seed: seed.to_vec(),
@@ -340,7 +346,7 @@ async fn spawn_node(has_identity: bool) -> (Endpoint, Arc<Mutex<Vec<SetAuthCall>
     let (authority_tx, mut authority_rx) =
         tokio::sync::mpsc::channel::<wayfinder_server::AuthorityCommand>(8);
     tokio::spawn(async move {
-        let _ = wayfinder_server::serve_tls_server_with_vpn(
+        let _ = wayfinder_server::serve_tls_server_with_services(
             listener,
             seed,
             snapshot_tx,
@@ -424,7 +430,7 @@ async fn spawn_provider_node() -> Endpoint {
     let (authority_tx, mut authority_rx) =
         tokio::sync::mpsc::channel::<wayfinder_server::AuthorityCommand>(8);
     tokio::spawn(async move {
-        let _ = wayfinder_server::serve_tls_server_with_vpn(
+        let _ = wayfinder_server::serve_tls_server_with_services(
             listener,
             seed,
             snapshot_tx,
@@ -622,6 +628,7 @@ async fn csr_install_certifies_the_identity_the_node_already_holds() {
 
     run_query(
         Command::Csr(CsrCommand::Install {
+            ca_endpoint: None,
             cert: cert_path.clone(),
             trust_anchor: anchor_path.clone(),
         }),
@@ -806,6 +813,7 @@ async fn an_operator_without_the_seed_can_enroll_a_node_offline() {
     // 3. Hand the result back to the node.
     run_query(
         Command::Csr(CsrCommand::Install {
+            ca_endpoint: None,
             cert: cert_path.clone(),
             trust_anchor: anchor_path.clone(),
         }),

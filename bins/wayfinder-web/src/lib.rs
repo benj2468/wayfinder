@@ -94,7 +94,6 @@ use crate::components::provider::accounts::Accounts;
 use crate::components::provider::enrollment::Enrollment;
 use crate::components::provider::members::Members;
 use crate::components::provider::requests::Requests;
-use crate::components::provider::vpn::Vpn;
 use crate::components::register::Register;
 use crate::components::routing::Routing;
 use crate::components::security::Security;
@@ -274,7 +273,7 @@ pub const ROUTER_TABS: [TabDef; 7] = [
 /// Ordered by how often an operator has a reason to be there: the queue of
 /// nodes waiting on a decision leads, and the accounts that make those
 /// decisions — changed perhaps twice in the life of a mesh — come last.
-pub const PROVIDER_TABS: [TabDef; 5] = [
+pub const PROVIDER_TABS: [TabDef; 4] = [
     TabDef {
         path: Scope::PROVIDER_PREFIX,
         title: "Requests",
@@ -295,16 +294,7 @@ pub const PROVIDER_TABS: [TabDef; 5] = [
         title: "Accounts",
         scope: Scope::Provider,
     },
-    TabDef {
-        path: VPN_TAB_PATH,
-        title: "VPN",
-        scope: Scope::Provider,
-    },
 ];
-
-/// The VPN tab's route, named so the tab bar can drop it on a provider that
-/// coordinates no tunnel without matching on a title.
-const VPN_TAB_PATH: &str = "provider/vpn";
 
 /// The application root: who is looking, and therefore what they get.
 ///
@@ -403,7 +393,7 @@ fn RegistrationAware(
             <div class="wf-shell" class:wf-shell-bare=registering>
                 <Show when=move || !registering() fallback=|| ()>
                     <Header dash=dash />
-                    <TabBar viewer=viewer dash=dash />
+                    <TabBar viewer=viewer />
                     <StatusStrip dash=dash />
                 </Show>
                 <main class="wf-main">
@@ -434,7 +424,6 @@ fn RegistrationAware(
                             path=(StaticSegment("provider"), StaticSegment("accounts"))
                             view=Accounts
                         />
-                        <Route path=(StaticSegment("provider"), StaticSegment("vpn")) view=Vpn />
                         // In neither scope, and rendered without the chrome
                         // above: whoever opens this has no account yet, so a
                         // tab bar for either scope would be navigation to
@@ -757,31 +746,20 @@ fn StatusStrip(
 /// The `<Suspense>` is not decoration — see [`ScopeSwitch`] for why reading the
 /// viewer resource outside one is a wasm panic in this crate.
 #[component]
-fn TabBar(viewer: ViewerResource, dash: Dashboard) -> impl IntoView {
+fn TabBar(viewer: ViewerResource) -> impl IntoView {
     let location = use_location();
     let scope = Memo::new(move |_| Scope::of_path(&location.pathname.get()));
-
-    // Absent on a provider that coordinates no tunnel, which is every
-    // deployment reaching the mesh over radio alone. `vpn_peers` is `None` for
-    // that and for a node that is not a provider at all; both mean there is no
-    // tunnel to administer, and neither is an empty list of peers.
-    let has_tunnel = Memo::new(move |_| {
-        dash.snapshot
-            .with(|s| s.as_ref().is_some_and(|s| s.vpn_peers.is_some()))
-    });
 
     view! {
         <nav class="wf-tabs">
             <Suspense>
                 {move || {
                     let current_viewer = viewer.get();
-                    let has_tunnel = has_tunnel.get();
 
                     scope
                         .get()
                         .tabs()
                         .iter()
-                        .filter(|tab| tab.path != VPN_TAB_PATH || has_tunnel)
                         .filter(|tab| {
                             current_viewer
                                 .as_ref()

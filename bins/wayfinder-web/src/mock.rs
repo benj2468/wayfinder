@@ -992,7 +992,7 @@ pub async fn serve_mock_node_with(mock: Mock) -> (SocketAddr, [u8; 32]) {
         .unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = wayfinder_server::serve_tls_server_with_vpn(
+        let _ = wayfinder_server::serve_tls_server_with_services(
             listener,
             NODE_SEED,
             snapshot_tx,

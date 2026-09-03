@@ -264,6 +264,16 @@ pub struct Driver<Local: FrameIo> {
     /// management server is attached; set via
     /// [`set_auth_snapshot_rx`](Self::set_auth_snapshot_rx).
     auth_snapshot_rx: Option<AuthSnapshotRx>,
+    /// The certificate-derived `Mac → key` directory a carrier resolves peers
+    /// through, republished from the router's verified certificate store on
+    /// every periodic poll. `None` when no carrier asked for one.
+    ///
+    /// Republishing on the poll timer, rather than on every certificate the
+    /// router verifies, keeps this off the receive path: a directory that is
+    /// one Trickle interval stale costs at most one frame taking the learned
+    /// (relayed) path instead of the direct one, which is exactly what would
+    /// have happened without a directory at all.
+    auth_view: Option<crate::AuthView>,
     /// This node's mesh identifier (its host device's MAC address).
     mac: Mac,
     /// Snoops IGMP on the host link to learn which multicast groups the local
@@ -387,6 +397,7 @@ impl<Local: FrameIo> Driver<Local> {
             local,
             interfaces,
             fan_out,
+            auth_view: None,
             shared: Arc::new(RwLock::new(SharedRouter::new(router))),
             query_rx,
             mac,
@@ -446,6 +457,82 @@ impl<Local: FrameIo> Driver<Local> {
     /// them in memory and forgets them on restart.
     pub fn set_settings_store(&mut self, settings: SettingsFile) {
         self.settings = Some(settings);
+    }
+
+    /// Attach the receiver the TLS management server uses to request
+    /// authorization snapshots.  The driver answers each request with the
+    /// router's current trust anchor and revocation set, which the server task
+    /// evaluates a connection against.  Without this, a TLS management server has
+    /// no way to authorize connections.
+    /// Attach the peer directory this driver republishes into.
+    ///
+    /// Set by a node that configured a carrier resolving through one (today,
+    /// an iroh mesh link). Without it the driver does no such bookkeeping.
+    pub fn set_auth_view(&mut self, directory: crate::AuthView) {
+        self.auth_view = Some(directory);
+    }
+
+    /// Republish the certificate-derived peer directory, if one is attached.
+    ///
+    /// The source is `OgmAuth`'s verified-neighbor cache: every entry there is
+    /// a certificate this node checked against the mesh trust anchor, so the
+    /// `Mac → ed_pubkey` binding is the mesh's own claim about who owns that
+    /// address — not an inference from which endpoint happened to relay a
+    /// frame.
+    async fn refresh_auth_view(&mut self) {
+        let Some(view) = self.auth_view.as_ref() else {
+            return;
+        };
+        // A short read guard: this copies a bounded cache (at most
+        // `MAX_NEIGHBOR_KEYS` entries) and holds no lock while publishing.
+        let guard = self.shared.read().await;
+        // The seed `SetAuth` writes live, so a carrier that stayed dormant for
+        // want of an identity comes up on the next poll after enrolment rather
+        // than on the next boot.
+        let identity = guard.identity_seed;
+        let (entries, revoked): (Vec<(Mac, [u8; 32])>, Vec<Mac>) = match guard.router.auth() {
+            Some(auth) => {
+                let now = auth.now_unix();
+                let live: Vec<(Mac, [u8; 32])> = auth
+                    .neighbors()
+                    .iter()
+                    // `neighbors()` is the *raw* cache: it holds entries whose
+                    // certificate has expired, and entries for nodes since
+                    // revoked (a revocation is recorded separately and does not
+                    // evict). Publishing either would make the directory the one
+                    // place a withdrawn node stays reachable from — and worse
+                    // than the learned table it outranks, which at least ages
+                    // out on its own TTL.
+                    //
+                    // `now == 0` is the undisciplined-clock case, where the
+                    // router declines to judge any validity window; the
+                    // directory follows it rather than second-guessing, exactly
+                    // as `live_neighbor` does.
+                    .filter(|n| now == 0 || n.cert.not_after >= now)
+                    .filter(|n| !auth.is_shunned(n.cert.mac))
+                    .map(|n| (n.cert.mac, n.cert.ed_pubkey))
+                    .collect();
+                // The revoked half is a list of *MACs*: a revocation names an
+                // address, and the router evicts the neighbour's cached
+                // certificate as it ingests one — so the key being condemned is
+                // already gone from the store here. `AuthView` is what
+                // remembers it.
+                (live, auth.revoked_macs().collect())
+            }
+            // Authentication is off: there are no certificates, so the
+            // view must be *empty* rather than left stale — a carrier reads an
+            // empty view as "no information" and falls back.
+            None => (Vec::new(), Vec::new()),
+        };
+        drop(guard);
+        // Read from the settings store rather than kept in a field: `SetAuth`
+        // writes it there, and this is the same handle that write goes through,
+        // so there is one copy rather than two that can disagree.
+        let ca_endpoint = self
+            .settings
+            .as_ref()
+            .and_then(|s| s.current().ca_endpoint.clone());
+        view.publish(identity, ca_endpoint, entries, revoked);
     }
 
     /// Attach the receiver the TLS management server uses to request
@@ -717,6 +804,9 @@ impl<Local: FrameIo> Driver<Local> {
             settings,
             auth_snapshot_rx,
             authority,
+            // Republished by `refresh_auth_view` on the periodic poll; no
+            // arm below reads or writes it.
+            auth_view: _,
         } = self;
         let mac = *mac;
         // Two disjoint borrows in one call: `select!` builds every branch's
@@ -902,6 +992,7 @@ impl<Local: FrameIo> Driver<Local> {
     /// [`run_once`]: Driver::run_once
     pub async fn poll_due(&mut self, now: Duration) -> anyhow::Result<()> {
         self.refresh_auth_clock(now).await;
+        self.refresh_auth_view().await;
         let mesh = poll_due_ogms(
             &mut self.shared.write().await.router,
             now,
@@ -2107,6 +2198,7 @@ mod tests {
             request: Some(
                 wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request::SetAuth(
                     wayfinder_protos::wayfinder::v1alpha::SetAuthRequest {
+                        ca_endpoint: String::new(),
                         seed: Vec::new(),
                         cert,
                         trust_anchor: anchor,

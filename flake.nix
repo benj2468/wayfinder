@@ -424,11 +424,12 @@
             # links, provider mode, unprivileged. Covers what
             # `nix/machines/wayfinder-ca` deploys, without a cloud account.
             wayfinder-ca-provider = nixpkgs.callPackage ./nix/tests/ca-provider.nix { };
-            # The VPN data plane: real mesh traffic over a real Tailscale
-            # tunnel between two nodes with no other path to each other. See
-            # docs/design/implemented/08-internet-links-headscale-vpn.md's own
-            # stated gap.
-            wayfinder-vpn-data-plane = nixpkgs.callPackage ./nix/tests/vpn-data-plane.nix { };
+            # The iroh data plane: three real nodes, three real QUIC endpoints,
+            # and mesh frames crossing them — plus revocation reaching the
+            # transport. Replaces the Tailscale-era `vpn-data-plane` test that
+            # design 18 retired. Notably does *not* cover NAT traversal; see
+            # the test's own header and design 18 §6.1.
+            wayfinder-iroh-data-plane = nixpkgs.callPackage ./nix/tests/iroh-data-plane.nix { };
           };
 
           treefmt = {

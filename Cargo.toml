@@ -81,6 +81,11 @@ expect_used = "deny"
 all = "deny"
 
 [workspace.dependencies]
+# Peer-to-peer QUIC for the `Iroh` mesh link (design 18). Heavy (112 crates
+# this workspace does not otherwise have), so it is behind a non-default
+# `iroh` feature on `wayfinder-driver` that `wayfinder-tap` turns on.
+iroh = "1.1"
+bytes = "1"
 # Local Dependencies
 interfaces = { path = "./libs/interfaces" }
 batman = { path = "./libs/batman" }

@@ -55,8 +55,7 @@ in
 {
 
   imports = [
-    ./wayfinder-tailscale.nix
-    ./wayfinder-headscale.nix
+    ./wayfinder-iroh-relay.nix
   ];
 
   options.services.wayfinder = with lib; {

@@ -32,6 +32,13 @@ std = ["dep:async-trait", "wayfinder/std"]
 # (not folded into `tokio`) so every consumer (`wayfinder-tap`) keeps today's
 # zero-config behavior.
 ble = ["dep:blue", "blue?/std"]
+# The `Iroh` mesh link: peer-to-peer QUIC dialed by the node's identity key
+# (design 18). Split out of `tokio`/`std` and left **out of `default`** for the
+# same reason `ble` is split out — it is a heavy backend (112 crates) that a
+# consumer working on the core, or building for a target that will never carry
+# an internet link, should not pay for. `wayfinder-tap` enables it, so a real
+# node and a `--workspace` build both cover it.
+iroh = ["dep:iroh", "dep:bytes", "dep:wayfinder-link-utils", "tokio"]
 
 [dependencies]
 wayfinder.workspace = true
@@ -56,6 +63,11 @@ libc = { workspace = true, optional = true }
 # `tokio`-only: builds the `Rylr998` link transport over a real serial port.
 rylr998 = { workspace = true, features = ["link"], optional = true }
 blue = { workspace = true, optional = true }
+iroh = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+# Shared small-MTU fragmentation, instantiated in `iroh.rs` for a QUIC
+# datagram budget — the same crate `rylr998` and `blue` fragment through.
+wayfinder-link-utils = { path = "../wayfinder-link-utils", optional = true }
 tokio-serial = { workspace = true, optional = true }
 embedded-io-adapters = { workspace = true, optional = true }
 embedded-io-async = { workspace = true, optional = true }

@@ -51,24 +51,6 @@ pub enum MgmtAccess {
     /// but not the admin capability. What it may invoke is [`permits`]: the
     /// queries, and nothing that mutates or discloses a secret.
     GrantedViewer,
-    /// Granted to an enrolled device: a verified, non-revoked certificate
-    /// carrying
-    /// [`CERT_FLAG_MEMBER`](wayfinder::wayfinder_auth::CERT_FLAG_MEMBER) and
-    /// bound to the handshake key, but no management capability.
-    ///
-    /// Every node on the mesh holds such a certificate, so this tier is
-    /// deliberately the narrowest in the enum: [`permits`] confines it to
-    /// `GetVpnEnrollment` and nothing else. Anything admitted here is admitted
-    /// to the whole mesh at once. (It is not the *only* tier admitted to that
-    /// request — [`MgmtAccess::GrantedSelfKey`] is too — but it is the only
-    /// one for which the request is the whole of what the tier can do.)
-    ///
-    /// It is earned by a *signed bit*, never by the absence of the others — see
-    /// [`CERT_FLAG_MEMBER`](wayfinder::wayfinder_auth::CERT_FLAG_MEMBER). A
-    /// certificate carrying no capability at all remains
-    /// [`MgmtDenied::NoCapability`], which is also where every certificate
-    /// issued before that bit existed still lands.
-    GrantedMember,
     /// Granted via the self-key path: the client proved possession of the node's
     /// *own* identity key.
     ///
@@ -101,24 +83,19 @@ pub enum MgmtDenied {
     /// handshake key, so it was not bound to this session (e.g. a cert replayed
     /// by someone who does not hold its private key).
     KeyMismatch,
-    /// Enrolled path: the verified cert carries no capability bit at all —
-    /// none of
-    /// [`CERT_FLAG_ADMIN`](wayfinder::wayfinder_auth::CERT_FLAG_ADMIN),
-    /// [`CERT_FLAG_VIEWER`](wayfinder::wayfinder_auth::CERT_FLAG_VIEWER) or
-    /// [`CERT_FLAG_MEMBER`](wayfinder::wayfinder_auth::CERT_FLAG_MEMBER).
+    /// Enrolled path: the verified cert carries no *management* capability —
+    /// neither [`CERT_FLAG_ADMIN`](wayfinder::wayfinder_auth::CERT_FLAG_ADMIN)
+    /// nor [`CERT_FLAG_VIEWER`](wayfinder::wayfinder_auth::CERT_FLAG_VIEWER).
     ///
-    /// Two things land here. A certificate issued before `CERT_FLAG_MEMBER`
-    /// existed, which is why adding that bit was not a flag day: such a
-    /// certificate keeps the access it always had (none) until it is reissued.
-    /// And a certificate whose bits this build does not recognise, since
-    /// unknown flags are masked off rather than guessed at.
+    /// This is where an ordinary *device* certificate lands, and where it
+    /// belongs: a node routes over the mesh, it does not manage the node it
+    /// connects to. Design 18 retired the one tier that sat between here and
+    /// the viewer tier — a device-scoped grant that existed solely to hand out
+    /// a VPN credential — so the rule is once again the simple one: management
+    /// access takes a signed management bit, and everything else is denied.
     ///
-    /// What no longer lands here is an ordinary *device* certificate: it
-    /// carries `CERT_FLAG_MEMBER` and earns [`MgmtAccess::GrantedMember`],
-    /// which is one request wide. That tier is granted by the bit being
-    /// present, never by the management bits being absent — a tier granted by
-    /// absence would be a tier every node on the mesh already had, and would
-    /// silently widen every time a capability was added.
+    /// A certificate whose bits this build does not recognise also lands here,
+    /// since unknown flags are masked off rather than guessed at.
     NoCapability,
     /// Enrolled path: the verified admin's node has been revoked.
     Revoked,
@@ -162,11 +139,6 @@ pub enum MgmtDenied {
 ///   Every device on the mesh holds a verified non-admin cert, so granting the
 ///   tier by absence would be granting it to the whole mesh; it takes a signed
 ///   bit, and a cert with neither bit is [`MgmtDenied::NoCapability`].
-/// * **Member** ([`MgmtAccess::GrantedMember`]): as the admin tier, but the
-///   verified cert carries
-///   [`CERT_FLAG_MEMBER`](wayfinder::wayfinder_auth::CERT_FLAG_MEMBER) and no
-///   management capability — an enrolled device proving possession of the key
-///   this mesh's CA certified. One request wide; see [`permits`].
 /// * **Enrollment** ([`MgmtAccess::GrantedEnrollment`]): no cert was presented
 ///   at all, so the client is a stranger and may only enroll — see [`permits`]
 ///   and this module's header for why that door is open.
@@ -245,11 +217,13 @@ pub fn decide_access(
 ///   connection can redeem an invitation it already holds and cannot mint one,
 ///   list one, or revoke one.
 ///
-/// * **The viewer and member tiers are earned by a signed bit, never by the
-///   absence of another.** Every device on the mesh holds a verified non-admin
+/// * **The viewer tier is earned by a signed bit, never by the absence of
+///   another.** Every device on the mesh holds a verified non-admin
 ///   certificate, so a tier granted by absence would be a tier the whole mesh
-///   already had. That is why [`MgmtAccess::GrantedMember`] names exactly one
-///   request: anything added to it is added to the entire mesh at once.
+///   already had, silently widening every time a capability was added. Design
+///   18 removed the tier that tested this rule hardest — a device-scoped grant
+///   exactly one request wide, existing only to mint a VPN credential — and
+///   the rule is what remains: a new tier needs a new bit, never a new gap.
 ///
 /// SECURITY ALERT: this function and the `access` lists it reads hold
 /// security-critical access-control logic. Changing either requires careful
@@ -262,7 +236,6 @@ pub fn permits(access: MgmtAccess, request: &ReqKind) -> bool {
         MgmtAccess::GrantedAdmin => AccessTier::Admin,
         MgmtAccess::GrantedSelfKey => AccessTier::SelfKey,
         MgmtAccess::GrantedViewer => AccessTier::Viewer,
-        MgmtAccess::GrantedMember => AccessTier::Member,
         MgmtAccess::GrantedEnrollment => AccessTier::Enrollment,
         MgmtAccess::Denied(_) => return false,
     };
@@ -306,15 +279,6 @@ pub fn authorize_capability(
         Ok(MgmtAccess::GrantedAdmin)
     } else if cert.viewer {
         Ok(MgmtAccess::GrantedViewer)
-    } else if cert.member && !cert.user {
-        // `member` and `user` are documented as mutually exclusive in
-        // everything the CA issues (`VerifiedCert::member`), but that
-        // exclusivity is an issuer convention, not a wire invariant — nothing
-        // stops a future same-crate caller of `issue_with_flags` (widened to
-        // `pub(crate)` for tests) from setting both. The member tier mints a
-        // device-scoped VPN credential, so a person's session certificate
-        // must never earn it regardless of which other bits it carries.
-        Ok(MgmtAccess::GrantedMember)
     } else {
         Err(MgmtDenied::NoCapability)
     }
@@ -345,15 +309,6 @@ mod tests {
             viewer: false,
             user: false,
             member: false,
-        }
-    }
-
-    /// A verified certificate for an enrolled device: the member bit and
-    /// nothing else, which is what `issue_cert` produces.
-    fn verified_member(m: Mac) -> VerifiedCert {
-        VerifiedCert {
-            member: true,
-            ..verified(m, false)
         }
     }
 
@@ -625,7 +580,10 @@ mod tests {
             100,
             |_| false,
         );
-        assert_eq!(decision, MgmtAccess::GrantedMember);
+        // A device certificate carries no management capability, so it is
+        // denied outright — the tier that used to sit here existed only to
+        // mint a VPN credential and went with it (design 18).
+        assert_eq!(decision, MgmtAccess::Denied(MgmtDenied::NoCapability));
         assert!(!permits(
             decision,
             &ReqKind::SetAuth(wayfinder_protos::wayfinder::v1alpha::SetAuthRequest::default())
@@ -765,6 +723,15 @@ mod tests {
             "the set of requests classified as a secret disclosure changed"
         );
 
+        // Empty, and that is the point. There used to be exactly one request
+        // an admin was refused — `GetVpnEnrollment`, refused for not naming a
+        // *device* rather than for want of privilege — and it went with the
+        // VPN control plane in design 18. An admin grant is now unqualified.
+        //
+        // Asserted rather than deleted: "no exceptions" is a property worth
+        // holding, and a future request that carves one out should have to say
+        // so here, where the reasoning is, instead of appearing quietly in a
+        // table.
         let admin_refused: Vec<_> = all
             .iter()
             .filter(|k| !access_tiers(k).contains(&AccessTier::Admin))
@@ -772,19 +739,8 @@ mod tests {
             .collect();
         assert_eq!(
             admin_refused,
-            ["GetVpnEnrollment"],
-            "the set of requests the admin tier may not invoke changed"
-        );
-
-        let member_granted: Vec<_> = all
-            .iter()
-            .filter(|k| access_tiers(k).contains(&AccessTier::Member))
-            .map(request_kind_name)
-            .collect();
-        assert_eq!(
-            member_granted,
-            ["GetVpnEnrollment"],
-            "the member tier is every device on the mesh; widening it widens the mesh"
+            Vec::<&str>::new(),
+            "the admin tier gained a request it may not invoke"
         );
     }
 
@@ -893,9 +849,11 @@ mod tests {
             // scoped to a device identity an operator's session certificate
             // is not. Asserted over the same closed set so the two cannot
             // drift.
-            assert_eq!(
+            // No exceptions remain: design 18 retired the one request an
+            // admin could be refused, which was refused for not naming a
+            // device rather than for want of privilege.
+            assert!(
                 permits(MgmtAccess::GrantedAdmin, request),
-                !matches!(request, ReqKind::GetVpnEnrollment(_)),
                 "admin tier verdict for {request:?}"
             );
             // The self-key tier is the one grant with no exception at all: it
@@ -961,15 +919,6 @@ mod tests {
                     // Widening this later is one line; narrowing it after
                     // somebody has relied on it is not.
                     | ReqKind::ListUsers(_)
-                    // Mints a credential scoped to a *device* identity a viewer
-                    // does not hold — see the `GetVpnEnrollment` gate in
-                    // `permits` itself.
-                    | ReqKind::GetVpnEnrollment(_)
-                    // Managing peers is ordinary administration: it drives
-                    // outbound requests to the coordination server and must
-                    // not be reachable from a read-only grant.
-                    | ReqKind::ListVpnPeers(_)
-                    | ReqKind::RevokeVpnPeer(_)
                     // Deciding that an account will exist, with a role, is the
                     // same administration `CreateUser` beside it is — taken one
                     // step earlier in time. And revoking one is how an admin
@@ -1070,7 +1019,7 @@ mod tests {
             100,
             |_| false,
         );
-        assert_eq!(decision, MgmtAccess::GrantedMember);
+        assert_eq!(decision, MgmtAccess::Denied(MgmtDenied::NoCapability));
         assert!(!permits(
             decision,
             &ReqKind::GetRoutingTable(
@@ -1208,28 +1157,6 @@ mod tests {
         );
     }
 
-    /// The member capability is its own signed bit, dominated by revocation
-    /// like every other capability. A device's certificate earns it; a
-    /// certificate carrying no bits at all still earns nothing, which is what
-    /// keeps "device" from being inferable from absence.
-    #[test]
-    fn the_member_capability_is_its_own_bit() {
-        assert_eq!(
-            authorize_capability(&verified_member(mac(1)), |_| false),
-            Ok(MgmtAccess::GrantedMember)
-        );
-        assert_eq!(
-            authorize_capability(&verified_member(mac(1)), |c: &VerifiedCert| c.mac == mac(1)),
-            Err(MgmtDenied::Revoked),
-            "revocation dominates the member capability too"
-        );
-        assert_eq!(
-            authorize_capability(&verified(mac(1), false), |_| false),
-            Err(MgmtDenied::NoCapability),
-            "a certificate with no capability bit at all earns no tier"
-        );
-    }
-
     /// `member` and `user` are documented as mutually exclusive in everything
     /// the CA issues, but that is an issuer convention, not something the wire
     /// format or this function's callers can rely on unchecked. A cert
@@ -1277,164 +1204,6 @@ mod tests {
                 |_| false
             ),
             Ok(MgmtAccess::GrantedViewer)
-        );
-    }
-
-    /// The member tier is exactly one request wide: an enrolled device may ask
-    /// for its own VPN credential and nothing else. Not the queries a viewer
-    /// gets, not the trust anchor, and above all none of the provider actions —
-    /// every node on the mesh holds a member certificate, so anything this tier
-    /// admits is admitted to the entire mesh.
-    ///
-    /// Swept over `every_request_kind()`, not a hand-picked sample: the same
-    /// forgotten-variant risk `permits_confines_the_enrollment_tier_to_a_closed_allowlist`
-    /// guards against applies here too, and "one request wide" is only true if
-    /// nothing outside that sample was missed.
-    #[test]
-    fn a_member_connection_may_only_fetch_its_vpn_credential() {
-        use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentRequest;
-
-        let vpn_enrollment = ReqKind::GetVpnEnrollment(GetVpnEnrollmentRequest {});
-        let member = MgmtAccess::GrantedMember;
-
-        assert!(permits(member, &vpn_enrollment));
-
-        for request in &every_request_kind() {
-            let expected = matches!(request, ReqKind::GetVpnEnrollment(_));
-            assert_eq!(
-                permits(member, request),
-                expected,
-                "member tier verdict for {request:?}"
-            );
-        }
-    }
-
-    /// The VPN credential is minted for a *device*, so a tier that holds no
-    /// device identity may not ask for one however privileged it is. An
-    /// operator's session certificate is a person and a stranger holds nothing
-    /// at all — for both the request has no meaning rather than being a
-    /// privilege they lack. Refusing it here is what makes the design's "two
-    /// gates in series" literal: the credential is reachable only by proving
-    /// possession of a key that names a node.
-    #[test]
-    fn a_tier_holding_no_device_identity_cannot_mint_a_credential() {
-        use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentRequest;
-
-        let vpn_enrollment = ReqKind::GetVpnEnrollment(GetVpnEnrollmentRequest {});
-
-        for tier in [
-            MgmtAccess::GrantedAdmin,
-            MgmtAccess::GrantedViewer,
-            MgmtAccess::GrantedEnrollment,
-            MgmtAccess::Denied(MgmtDenied::NoCapability),
-        ] {
-            assert!(
-                !permits(tier, &vpn_enrollment),
-                "{tier:?} must not mint a device's VPN credential"
-            );
-        }
-    }
-
-    /// The self-key tier *is* a device identity — the node itself — so it may
-    /// mint its own credential.
-    ///
-    /// This is the certificate authority's own case. It coordinates the tunnel
-    /// and is also a node on it, and the only credential it can present to
-    /// itself is its own seed. The tier was refused here for as long as the
-    /// MAC came off the presented certificate, which the self-key path never
-    /// verifies; the transport now takes it from the router instead
-    /// (`AuthSnapshot::own_mac`), so there is a device identity to mint for
-    /// and no client-supplied value anywhere in it.
-    ///
-    /// It gives its holder nothing new. Whoever holds the node's seed already
-    /// signs that node's OGMs and terminates its TLS, and on a provider can
-    /// reveal the enrollment token and approve its own CSR — so the long way
-    /// round to the same credential was always open.
-    #[test]
-    fn the_self_key_tier_may_mint_its_own_nodes_credential() {
-        use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentRequest;
-
-        let vpn_enrollment = ReqKind::GetVpnEnrollment(GetVpnEnrollmentRequest {});
-
-        assert!(permits(MgmtAccess::GrantedSelfKey, &vpn_enrollment));
-    }
-
-    /// Managing *other* peers' VPN registrations is ordinary administration, so
-    /// it sits where every other provider action does: the full grants, and
-    /// nothing less. In particular a member may not revoke a peer — that would
-    /// let any node on the mesh cut any other node's tunnel.
-    #[test]
-    fn managing_vpn_peers_needs_a_full_grant() {
-        use wayfinder_protos::wayfinder::v1alpha::ListVpnPeersRequest;
-        use wayfinder_protos::wayfinder::v1alpha::RevokeVpnPeerRequest;
-
-        let list = ReqKind::ListVpnPeers(ListVpnPeersRequest {});
-        let revoke = ReqKind::RevokeVpnPeer(RevokeVpnPeerRequest::default());
-
-        for full in [MgmtAccess::GrantedAdmin, MgmtAccess::GrantedSelfKey] {
-            assert!(permits(full, &list));
-            assert!(permits(full, &revoke));
-        }
-        for lesser in [
-            MgmtAccess::GrantedViewer,
-            MgmtAccess::GrantedMember,
-            MgmtAccess::GrantedEnrollment,
-        ] {
-            assert!(!permits(lesser, &list));
-            assert!(!permits(lesser, &revoke));
-        }
-    }
-
-    /// An enrolled device reaching the CA with its own certificate lands on the
-    /// member tier — the end-to-end path the VPN enrollment step depends on.
-    /// Before the member bit existed this was `Denied(NoCapability)` and the
-    /// connection was closed before a request could be sent at all.
-    #[test]
-    fn an_enrolled_device_presenting_its_own_cert_is_a_member() {
-        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
-        let anchor = authority.trust_anchor();
-        let node = Keypair::from_seed(&[2u8; 32]);
-        let ca_own = Keypair::from_seed(&[7u8; 32]);
-        let cert = authority.issue_cert(mac(3), node.ed_pubkey(), node.x_pubkey(), 100, 200);
-
-        assert_eq!(
-            decide_access(
-                &node.ed_pubkey(),
-                Some(&cert),
-                Some(&anchor),
-                Some(&ca_own.ed_pubkey()),
-                150,
-                |_| false
-            ),
-            MgmtAccess::GrantedMember
-        );
-
-        // Revoked: the tier goes away, so a revoked node cannot renew a tunnel
-        // credential even though its certificate has not yet expired.
-        assert_eq!(
-            decide_access(
-                &node.ed_pubkey(),
-                Some(&cert),
-                Some(&anchor),
-                Some(&ca_own.ed_pubkey()),
-                150,
-                |c: &VerifiedCert| c.mac == mac(3)
-            ),
-            MgmtAccess::Denied(MgmtDenied::Revoked)
-        );
-
-        // A cert replayed by a party that does not hold its key stays bound to
-        // the handshake, member bit or not.
-        assert_eq!(
-            decide_access(
-                &Keypair::from_seed(&[9u8; 32]).ed_pubkey(),
-                Some(&cert),
-                Some(&anchor),
-                Some(&ca_own.ed_pubkey()),
-                150,
-                |_| false
-            ),
-            MgmtAccess::Denied(MgmtDenied::KeyMismatch)
         );
     }
 }
