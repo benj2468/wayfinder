@@ -284,14 +284,24 @@ things about it:
   back in memory if the persist failed. Do not add ad-hoc `persist()` calls
   alongside a direct field write; that ordering is the whole point of the type.
 
+**A CSR's subject is not the client's to choose.** `check_mac_derives_from`
+refuses a `node_mac` that is not the address the presented `ed_pubkey` derives,
+in `submit_csr` (as a `CsrOutcome::Rejected`, since the request is well formed
+and the caller is answered) and again in `approve_csr` (as an `Err`, because the
+held store is durable and may hold rows parked by a build that predates the
+rule). This — not the live-certificate lock beside it — is what stops
+impersonation: the lock is first-come, so it only ever protected an address that
+already held a certificate. Keep the lock, but do not reason about impersonation
+from it. See `docs/design/09-mesh-auth-gaps.md` §5.
+
 **A provider's enrollment posture is one field, spelled so that silence is
 closed.** `ProviderConfig::auto_approve` (`#[serde(default)]` → `false`)
 decides whether a submitted CSR is signed on the spot or parked as pending for
 an operator; omitting it gets the queue. That direction is the whole reason it
-is not spelled `require_approval`: signing a certificate for whatever MAC and
-keys an anonymous client names is a legitimate configuration for a closed lab
-or the simulation, and not one anybody should reach by leaving a field out of a
-YAML file. There is deliberately **no** startup guard to add here — the default
+is not spelled `require_approval`: signing a certificate for whatever keys an
+anonymous client presents is a legitimate configuration for a closed lab or the
+simulation, and not one anybody should reach by leaving a field out of a YAML
+file. There is deliberately **no** startup guard to add here — the default
 *is* the guard, and a second acknowledgement flag beside it was the redundancy
 this replaced. `enrollment_token` composes with the posture rather than
 substituting for it: the token says who may ask, `auto_approve` says whether

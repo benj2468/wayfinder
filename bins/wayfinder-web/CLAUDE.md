@@ -451,12 +451,20 @@ provider to certify the node and installs what comes back (`enroll.rs`, and
 changing it:
 
 - **It certifies the node's existing identity, and never handles a key.** The
-  CSR names the keys and MAC the node reports, and the certificate is installed
-  against the seed the node keeps (`Client::install_cert` — a `SetAuth` with an
-  empty seed). Minting a fresh keypair here, as the offline `wayfinderctl
-  enroll` does, would change the node's MAC — read once at startup — leaving it
-  signing frames under a certificate its peers cannot attribute to it until
-  someone restarts it.
+  CSR names the keys the node reports and the address *those keys derive*, and
+  the certificate is installed against the seed the node keeps
+  (`Client::install_cert` — a `SetAuth` with an empty seed). Minting a fresh
+  keypair here, as the offline `wayfinderctl enroll` does, would enroll a
+  different node.
+
+  The subject is derived rather than read from `GetNodeInfo`'s `node_id`, and
+  that is deliberate: since design 09 §5's key↔address binding a certificate may
+  name only the address its key derives, so a CSR built from the node's
+  *reported* address is one no authority will sign. The two agree for a node
+  that already has an identity, because `wayfinder-tap` routes under the address
+  its identity key derives. Where they differ the node is on a provisional
+  address it held before it had an identity, enrolling moves it once, and the
+  panel logs that it is about to.
 - **The connection to the provider is anonymous by design.** A throwaway key,
   no certificate: a node with nothing to present is exactly what is asking. The
   provider admits it for enrollment alone (`wayfinder_server::authz`), and

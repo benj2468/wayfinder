@@ -530,8 +530,7 @@ pub fn authed_line() -> AuthedLine {
 
     let authority = wayfinder_auth::Authority::from_seed(&[1; 32], 0xABCD);
     for (i, name) in ["machine1", "machine2", "machine3"].iter().enumerate() {
-        let ident = harness.get_machine(name).ident;
-        enable_auth(&mut harness, name, &authority, ident, 2 + i as u8);
+        enable_auth(&mut harness, name, &authority, i);
     }
 
     // Signed OGMs exchange (each node learns its neighbours' pairwise keys,
@@ -564,16 +563,24 @@ pub fn authed_line() -> AuthedLine {
     line
 }
 
-/// Enable mesh authentication on one harness node, with a cert minted by
-/// `authority` and the auth clock pinned inside the cert's validity window.
+/// Enable mesh authentication on harness machine `index` (zero-based, in config
+/// order), with a cert minted by `authority` and the auth clock pinned inside
+/// the cert's validity window.
+///
+/// The identity comes from `wayfinder_test::machine_keypair`, the same key the
+/// harness took the machine's address from: a certificate's subject is the
+/// address its key derives (design 09 §5), so a fixture that minted a fresh key
+/// here would produce a credential for an address this node does not answer to
+/// — and the benchmark would silently measure the drop path, which is the
+/// hazard the root `CLAUDE.md` records for exactly these fixtures.
 fn enable_auth(
     harness: &mut TestHarness,
     name: &str,
     authority: &wayfinder_auth::Authority,
-    ident: Mac,
-    seed: u8,
+    index: usize,
 ) {
-    let kp = wayfinder_auth::Keypair::from_seed(&[seed; 32]);
+    let kp = wayfinder_test::driver::machine_keypair(index);
+    let ident = kp.derived_mac();
     let cert = authority.issue_cert(ident, kp.ed_pubkey(), kp.x_pubkey(), 0, 1_000_000);
     let node = harness.get_machine_mut(name);
     node.router_mut().set_auth(wayfinder::auth::OgmAuth::new(

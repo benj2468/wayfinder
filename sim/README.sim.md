@@ -185,6 +185,14 @@ two). The `Credential` fields exist mostly to be got wrong on purpose —
 enrollment that lapses mid-run, `enrolled=False` for the fail-closed state,
 `claim_mac` for a certificate naming an address its key does not own.
 
+`claim_mac` still *mints* such a certificate — the authority signs whatever it
+is asked to, and a misissuance the CA refuses to make is not an attack anyone
+can measure. What changed with design 09 §5's key↔address binding is what a
+router does with the result: `verify_cert` refuses it, so a scenario using
+`claim_mac` is now measuring a refusal rather than an admission. A fixture that
+also runs the victim node will see the victim's address cached legitimately and
+prove nothing either way — leave the victim off the partition.
+
 ```python
 mesh = Mesh(mesh_id=0xABCD, root_seed=bytes([1]) * 32)
 nodes = [
@@ -284,6 +292,7 @@ write_red_team_report(
             name="CA misissuance",
             verdict=GAP,               # ranks, colours and tallies by this
             detail="a cert binding a key to a MAC it does not derive is accepted",
+            # (illustrative: this one now reports HELD — see design 09 §5)
             description=inspect.getdoc(attack),   # what was attempted, and why
         ),
         ...

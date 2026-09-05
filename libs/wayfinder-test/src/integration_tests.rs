@@ -444,11 +444,23 @@ fn test_simple_pair_send_data() {
     );
 }
 
-/// Enable opt-in mesh authentication on `node` for `ident`, with a cert minted
-/// by `authority`, and pin the auth clock so certs are within their window.
-fn enable_auth(node: &mut TestRouter, authority: &wayfinder_auth::Authority, ident: Mac, seed: u8) {
-    let kp = wayfinder_auth::Keypair::from_seed(&[seed; 32]);
-    let cert = authority.issue_cert(ident, kp.ed_pubkey(), kp.x_pubkey(), 0, 1_000_000);
+/// Enable opt-in mesh authentication on machine `index` (zero-based, in config
+/// order), with a cert minted by `authority`, and pin the auth clock so certs
+/// are within their window.
+///
+/// Takes the machine's index rather than an address and a seed: the two are one
+/// thing now (design 09 §5 — a certificate's subject is the address its key
+/// derives), so `machine_keypair` is the single place both come from and a
+/// fixture cannot pair the wrong ones.
+fn enable_auth(node: &mut TestRouter, authority: &wayfinder_auth::Authority, index: usize) {
+    let kp = crate::driver::machine_keypair(index);
+    let cert = authority.issue_cert(
+        kp.derived_mac(),
+        kp.ed_pubkey(),
+        kp.x_pubkey(),
+        0,
+        1_000_000,
+    );
     node.router_mut().set_auth(wayfinder::auth::OgmAuth::new(
         kp,
         cert,
@@ -469,8 +481,8 @@ fn test_authenticated_unicast_delivers_and_strips_tag() {
     let m2 = harness.get_machine("machine2").ident;
 
     let authority = wayfinder_auth::Authority::from_seed(&[1; 32], 0xABCD);
-    enable_auth(harness.get_machine_mut("machine1"), &authority, m1, 2);
-    enable_auth(harness.get_machine_mut("machine2"), &authority, m2, 3);
+    enable_auth(harness.get_machine_mut("machine1"), &authority, 0);
+    enable_auth(harness.get_machine_mut("machine2"), &authority, 1);
 
     // Converge: signed OGMs exchange, so each node learns the other's pairwise
     // key (required to tag/verify directed frames), and settle so the
@@ -506,14 +518,13 @@ fn test_authenticated_unicast_delivers_and_strips_tag() {
 fn test_revocation_floods_and_shuns_node() {
     setup();
     let mut harness = line_of_three();
-    let m1 = harness.get_machine("machine1").ident;
     let m2 = harness.get_machine("machine2").ident;
     let m3 = harness.get_machine("machine3").ident;
 
     let authority = wayfinder_auth::Authority::from_seed(&[1; 32], 0xABCD);
-    enable_auth(harness.get_machine_mut("machine1"), &authority, m1, 2);
-    enable_auth(harness.get_machine_mut("machine2"), &authority, m2, 3);
-    enable_auth(harness.get_machine_mut("machine3"), &authority, m3, 4);
+    enable_auth(harness.get_machine_mut("machine1"), &authority, 0);
+    enable_auth(harness.get_machine_mut("machine2"), &authority, 1);
+    enable_auth(harness.get_machine_mut("machine3"), &authority, 2);
 
     // Converge: every node learns the other two over signed OGMs.
     converge_at(&mut harness, Duration::from_secs(1));
@@ -2558,7 +2569,11 @@ fn cert_fetch_round_trip_resolves_via_seeded_first_hop() {
     // requester-side (B's) correctness from responder-side correctness.
     // Only A's identity/signature is needed to build the frames a real
     // lazy-cert-distribution-enabled node would send/receive.
-    let a_kp = wayfinder_auth::Keypair::from_seed(&[2; 32]);
+    // The machine's own key, not a fresh one: a certificate names the address
+    // its key derives, so a cert that is to bind `m1` can only be minted under
+    // machine1's identity.
+    let a_kp = crate::driver::machine_keypair(0);
+    debug_assert_eq!(a_kp.derived_mac(), m1);
     let a_cert = authority.issue_cert(m1, a_kp.ed_pubkey(), a_kp.x_pubkey(), 0, 1_000_000);
     let mut a_auth = wayfinder::auth::OgmAuth::new(a_kp, a_cert, authority.trust_anchor());
     a_auth.set_time(1_000);
@@ -2566,7 +2581,7 @@ fn cert_fetch_round_trip_resolves_via_seeded_first_hop() {
     // B is a real authenticated node: this is what actually runs the
     // requester logic under test. `set_auth` resets machine3's own learned
     // routing state, so it genuinely has no route to A afterward.
-    enable_auth(harness.get_machine_mut("machine3"), &authority, m3, 3);
+    enable_auth(harness.get_machine_mut("machine3"), &authority, 2);
 
     // Tap switch1 (A<->X) to observe the real CertReq X relays onward.
     let cert_req_seen = Arc::new(AtomicUsize::new(0));
@@ -2723,8 +2738,8 @@ fn cert_fetch_round_trip_with_real_responder() {
     let m3 = harness.get_machine("machine3").ident; // B, the requester
 
     let authority = wayfinder_auth::Authority::from_seed(&[1; 32], 0xABCD);
-    enable_auth(harness.get_machine_mut("machine1"), &authority, m1, 2);
-    enable_auth(harness.get_machine_mut("machine3"), &authority, m3, 3);
+    enable_auth(harness.get_machine_mut("machine1"), &authority, 0);
+    enable_auth(harness.get_machine_mut("machine3"), &authority, 2);
 
     // Prime A's route + cert cache for B directly (bypassing Trickle
     // timing): a signed OGM from B, fed straight to A's router. This node
@@ -2846,8 +2861,8 @@ fn two_fresh_lazy_nodes_converge_with_zero_certs_on_the_wire() {
     let m1 = harness.get_machine("machine1").ident;
     let m2 = harness.get_machine("machine2").ident;
     let authority = wayfinder_auth::Authority::from_seed(&[1; 32], 0xABCD);
-    enable_auth(harness.get_machine_mut("machine1"), &authority, m1, 2);
-    enable_auth(harness.get_machine_mut("machine2"), &authority, m2, 3);
+    enable_auth(harness.get_machine_mut("machine1"), &authority, 0);
+    enable_auth(harness.get_machine_mut("machine2"), &authority, 1);
     harness
         .get_machine_mut("machine1")
         .router_mut()

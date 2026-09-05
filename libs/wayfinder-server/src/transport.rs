@@ -2597,7 +2597,7 @@ mod tests {
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
         let admin_kp = Keypair::from_seed(&[2u8; 32]);
         let admin_cert = authority.issue_user_cert(
-            Mac([0, 0, 0, 0, 0, 5]),
+            admin_kp.derived_mac(),
             admin_kp.ed_pubkey(),
             admin_kp.x_pubkey(),
             0,
@@ -3104,7 +3104,7 @@ mod tests {
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
         let admin_kp = Keypair::from_seed(&[2u8; 32]);
         let admin_cert = authority.issue_user_cert(
-            Mac([0, 0, 0, 0, 0, 5]),
+            admin_kp.derived_mac(),
             admin_kp.ed_pubkey(),
             admin_kp.x_pubkey(),
             0,
@@ -3657,13 +3657,17 @@ mod tests {
     /// The authority comes back because revoking this certificate now needs a
     /// record signed by the same root — a MAC on its own no longer says
     /// whether a given certificate is cancelled.
-    fn admin_credentials(mac: Mac, not_after: u64) -> (TrustAnchor, Keypair, Vec<u8>, Authority) {
+    ///
+    /// Takes no address: a certificate's subject is the address its key derives
+    /// (design 09 §5), so the caller reads the MAC back off the returned
+    /// keypair rather than choosing one.
+    fn admin_credentials(not_after: u64) -> (TrustAnchor, Keypair, Vec<u8>, Authority) {
         use zerocopy::IntoBytes;
 
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
         let admin_kp = Keypair::from_seed(&[2u8; 32]);
         let cert = authority.issue_user_cert(
-            mac,
+            admin_kp.derived_mac(),
             admin_kp.ed_pubkey(),
             admin_kp.x_pubkey(),
             0,
@@ -3683,8 +3687,8 @@ mod tests {
     /// revocation lever had been pulled.
     #[tokio::test]
     async fn a_revocation_ends_an_open_session() {
-        let mac = Mac([0, 0, 0, 0, 0, 5]);
-        let (anchor, admin_kp, cert, authority) = admin_credentials(mac, 200);
+        let (anchor, admin_kp, cert, authority) = admin_credentials(200);
+        let mac = admin_kp.derived_mac();
         let (state, gate) = MovableState::new(
             AuthSnapshot {
                 own_key: Some([9u8; 32]),
@@ -3744,8 +3748,7 @@ mod tests {
     /// where a short certificate lifetime buys nothing.
     #[tokio::test]
     async fn a_certificate_that_expires_mid_session_stops_being_honoured() {
-        let mac = Mac([0, 0, 0, 0, 0, 5]);
-        let (anchor, admin_kp, cert, _authority) = admin_credentials(mac, 200);
+        let (anchor, admin_kp, cert, _authority) = admin_credentials(200);
         let (state, gate) = MovableState::new(
             AuthSnapshot {
                 own_key: Some([9u8; 32]),
@@ -3789,8 +3792,7 @@ mod tests {
     /// which is the failure mode nobody would look for.
     #[tokio::test]
     async fn revalidation_leaves_an_unchanged_verdict_alone() {
-        let mac = Mac([0, 0, 0, 0, 0, 5]);
-        let (anchor, admin_kp, cert, _authority) = admin_credentials(mac, 200);
+        let (anchor, admin_kp, cert, _authority) = admin_credentials(200);
         let (_state, gate) = MovableState::new(
             AuthSnapshot {
                 own_key: Some([9u8; 32]),
@@ -3883,8 +3885,14 @@ mod tests {
 
     /// An enrolled device, its certificate, and the anchor that verifies it —
     /// the fixture the VPN tests share.
+    ///
+    /// Takes no address: since the key↔address binding landed (design 09 §5) a
+    /// device's MAC is a function of its key, so the caller reads it back off
+    /// the returned keypair (`node.derived_mac()`) rather than choosing one.
+    /// `seed` is what distinguishes one device from another, and so what
+    /// distinguishes their addresses.
     fn enrolled_device(
-        node_mac: Mac,
+        seed: u8,
     ) -> (
         wayfinder::wayfinder_auth::Keypair,
         MembershipCert,
@@ -3895,8 +3903,14 @@ mod tests {
         use wayfinder::wayfinder_auth::Keypair;
 
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
-        let node = Keypair::from_seed(&[2u8; 32]);
-        let cert = authority.issue_cert(node_mac, node.ed_pubkey(), node.x_pubkey(), 0, 10_000);
+        let node = Keypair::from_seed(&[seed; 32]);
+        let cert = authority.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            0,
+            10_000,
+        );
         let ca_own = Keypair::from_seed(&[7u8; 32]).ed_pubkey();
         (node, cert, authority.trust_anchor(), ca_own)
     }
@@ -3928,8 +3942,8 @@ mod tests {
     async fn a_member_gets_a_credential_minted_for_its_certified_mac() {
         use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentRequest;
 
-        let node_mac = Mac([2, 0, 0, 0, 0, 9]);
-        let (node, cert, anchor, ca_own) = enrolled_device(node_mac);
+        let (node, cert, anchor, ca_own) = enrolled_device(2);
+        let node_mac = node.derived_mac();
         let coordinator = std::sync::Arc::new(FakeCoordinator::default());
         let (mut client, _server) = spawn_gated_server_with_vpn(
             node.ed_pubkey(),
@@ -3957,7 +3971,10 @@ mod tests {
             panic!("expected a VPN enrollment, got {:?}", resp.response);
         };
         assert_eq!(enrollment.vpn_login_server, "https://vpn.example.net");
-        assert_eq!(enrollment.vpn_preauth_key, "key-for-020000000009");
+        assert_eq!(
+            enrollment.vpn_preauth_key,
+            format!("key-for-{}", crate::vpn::hostname_for(node_mac))
+        );
         assert_eq!(
             *coordinator.enrolled.lock().unwrap(),
             vec![node_mac],
@@ -4065,7 +4082,10 @@ mod tests {
         let Some(Response::VpnEnrollment(enrollment)) = resp.response else {
             panic!("expected a VPN enrollment, got {:?}", resp.response);
         };
-        assert_eq!(enrollment.vpn_preauth_key, "key-for-020000000001");
+        assert_eq!(
+            enrollment.vpn_preauth_key,
+            format!("key-for-{}", crate::vpn::hostname_for(own_mac))
+        );
         assert_eq!(
             *coordinator.enrolled.lock().unwrap(),
             vec![own_mac],
@@ -4083,8 +4103,7 @@ mod tests {
     async fn a_self_key_connection_cannot_mint_for_another_nodes_mac() {
         use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentRequest;
 
-        let victim = Mac([2, 0, 0, 0, 0, 42]);
-        let (_node, victim_cert, _anchor, _ca_own) = enrolled_device(victim);
+        let (_victim_node, victim_cert, _anchor, _ca_own) = enrolled_device(42);
         let own_mac = Mac([2, 0, 0, 0, 0, 1]);
         let own_key = [7u8; 32];
         let coordinator = std::sync::Arc::new(FakeCoordinator::default());
@@ -4129,7 +4148,7 @@ mod tests {
         use wayfinder_protos::wayfinder::v1alpha::RevokeNodeRequest;
 
         let target = Mac([2, 0, 0, 0, 0, 42]);
-        let (_node, cert, anchor, ca_own) = enrolled_device(Mac([2, 0, 0, 0, 0, 1]));
+        let (_node, cert, anchor, ca_own) = enrolled_device(1);
         let coordinator = std::sync::Arc::new(FakeCoordinator::default());
         // An admin connection: the node's own key earns the full grant.
         let (mut client, _server) = spawn_gated_server_with_vpn(
@@ -4182,8 +4201,8 @@ mod tests {
     async fn the_authority_refuses_to_revoke_itself() {
         use wayfinder_protos::wayfinder::v1alpha::RevokeNodeRequest;
 
-        let own = Mac([2, 0, 0, 0, 0, 1]);
-        let (_node, _cert, anchor, ca_own) = enrolled_device(own);
+        let (own_node, _cert, anchor, ca_own) = enrolled_device(1);
+        let own = own_node.derived_mac();
         let coordinator = std::sync::Arc::new(FakeCoordinator::default());
         let (mut client, _server) = spawn_gated_server_with_vpn(
             ca_own,
@@ -4318,8 +4337,8 @@ mod tests {
     /// `the_authority_refuses_to_revoke_itself` does.
     #[tokio::test]
     async fn a_csr_naming_the_authoritys_own_mac_is_refused_at_every_tier() {
-        let own = Mac([2, 0, 0, 0, 0, 1]);
-        let (_node, _cert, anchor, ca_own) = enrolled_device(own);
+        let (own_node, _cert, anchor, ca_own) = enrolled_device(1);
+        let own = own_node.derived_mac();
         let (mut client, server) = spawn_authenticated_server(
             ca_own,
             AuthContext {
@@ -4436,7 +4455,7 @@ mod tests {
     async fn a_half_completed_revoke_is_not_reported_as_success() {
         use wayfinder_protos::wayfinder::v1alpha::RevokeNodeRequest;
 
-        let (_node, _cert, anchor, ca_own) = enrolled_device(Mac([2, 0, 0, 0, 0, 1]));
+        let (_node, _cert, anchor, ca_own) = enrolled_device(1);
         let coordinator = std::sync::Arc::new(FakeCoordinator {
             fail_revoke: true,
             ..Default::default()
@@ -4491,8 +4510,7 @@ mod tests {
     async fn a_provider_without_vpn_says_so() {
         use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentRequest;
 
-        let node_mac = Mac([2, 0, 0, 0, 0, 9]);
-        let (node, cert, anchor, ca_own) = enrolled_device(node_mac);
+        let (node, cert, anchor, ca_own) = enrolled_device(2);
         let (mut client, _server) = spawn_gated_server_with_vpn(
             node.ed_pubkey(),
             gate_returning(AuthContext {
@@ -4539,8 +4557,7 @@ mod tests {
         use wayfinder_protos::wayfinder::v1alpha::GetRoutingTableRequest;
         use wayfinder_protos::wayfinder::v1alpha::GetVpnEnrollmentRequest;
 
-        let node_mac = Mac([2, 0, 0, 0, 0, 9]);
-        let (node, cert, anchor, ca_own) = enrolled_device(node_mac);
+        let (node, cert, anchor, ca_own) = enrolled_device(2);
 
         // A real *admin* refused the device-scoped request: an operator's
         // session certificate, whose key is not this node's own key — a
@@ -4550,7 +4567,7 @@ mod tests {
         let operator = Authority::from_seed(&[1u8; 32], 0xABCD);
         let admin_kp = Keypair::from_seed(&[3u8; 32]);
         let admin_cert = operator.issue_user_cert(
-            Mac([0, 0, 0, 0, 0, 5]),
+            admin_kp.derived_mac(),
             admin_kp.ed_pubkey(),
             admin_kp.x_pubkey(),
             0,

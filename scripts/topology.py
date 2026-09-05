@@ -415,15 +415,20 @@ def make_identities(
 
     Pre-issuing rather than enrolling at runtime is what makes each node's MAC
     reproducible: the node derives its MAC from this seed, and ``cert issue``
-    defaults to that same derivation, so a certificate minted before the
-    container exists still binds the MAC the node comes up with.
+    *requires* that same derivation, so a certificate minted before the
+    container exists still binds the MAC the node comes up with. (Since design
+    09 §5's key↔address binding this is no longer merely a convenient default —
+    ``cert issue --mac`` is a cross-check now, and an authority will certify no
+    other address.)
 
     An open node's seed is minted here for a different reason. With no ``auth:``
     block the node has no membership seed for its TLS server to reuse, so it
     would generate one on first boot — and nothing on the host could know the
     key to pin, nor the key its dashboard has to *prove* (an un-enrolled node
     admits exactly one client: one holding the node's own key). Minting it here
-    and mounting it as ``identity_seed_path`` closes that circle.
+    and mounting it as ``identity_seed_path`` closes that circle — and, since a
+    node now routes under the address its identity key derives whether or not it
+    is enrolled, it makes an open node's MAC reproducible too.
 
     The directory ([`SIM_CA_DIR`]) is repo-local and lives for the lifetime of
     the compose project, not of the shell that ran this — see the constant for

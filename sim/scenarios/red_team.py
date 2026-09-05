@@ -602,21 +602,32 @@ def attack_revocation() -> Finding:
 def attack_ca_misissuance() -> Finding:
     """A certificate naming one node's MAC over another's key.
 
-    Verification checks the root's signature, not that the MAC derives from
-    the key — so an authority that will sign this hands out impersonation.
-    The router is not the control here; issuance policy is.
+    Gap 4, now closed (design 09 §5): `verify_cert` binds a certificate's
+    subject to the address its `ed_pubkey` derives, so a misissuance naming
+    somebody else's address is refused by every node that sees it rather than
+    only by an authority that declines to sign it.
+
+    The CA in this fixture *will* sign it — that is the point. What the router
+    now does with it is the measurement.
     """
     m = mesh()
+    # An address the mesh knows but no node in this run holds. hq is
+    # deliberately absent: with hq present its address is cached legitimately,
+    # and `fooled` below reads true whether or not the misissuance was admitted
+    # — which is what an earlier version of this fixture measured.
     victim_mac = m.keypair("hq").derived_mac
     nodes = [
-        Node("hq", credential=Credential()),
         Node("field", credential=Credential()),
         # An attacker whose cert claims hq's address over the attacker's key.
         Node("imposter", credential=Credential(claim_mac=victim_mac)),
+        # The positive control. `fooled` is an *absence*, which is also what a
+        # run that never converged produces — so a HELD verdict without this
+        # would be indistinguishable from a broken fixture.
+        Node("control", credential=Credential()),
     ]
     links = [
-        pair("hq", "field", PerfectWire()),
         pair("field", "imposter", PerfectWire()),
+        pair("field", "control", PerfectWire()),
     ]
     try:
         sim = Simulation(nodes, links, mesh=m)
@@ -624,7 +635,15 @@ def attack_ca_misissuance() -> Finding:
         return Finding("CA misissuance (impersonation)", HELD, str(exc))
     sim.run(until_s=30.0)
 
-    fooled = victim_mac in sim.driver("field").neighbor_macs()
+    admitted = sim.driver("field").neighbor_macs()
+    if sim.mac("control") not in admitted:
+        return Finding(
+            "CA misissuance (impersonation)",
+            GAP,
+            "inconclusive: the control member was not admitted either, so the "
+            "refusal below is not evidence about the binding",
+        )
+    fooled = victim_mac in admitted
     return Finding(
         "CA misissuance (impersonation)",
         GAP if fooled else HELD,
@@ -633,9 +652,205 @@ def attack_ca_misissuance() -> Finding:
             "impersonation resistance rests entirely on the CA refusing to "
             "issue one, not on the router"
             if fooled
-            else "router rejected a MAC/key mismatch on its own"
+            else "the router refused a MAC/key mismatch on its own, so even a "
+            "compromised authority cannot mint an impersonation credential"
         ),
     )
+
+
+def attack_compromised_root_takes_a_live_members_address() -> Finding:
+    """The mesh root key itself in the attacker's hands, aimed at one address.
+
+    The strongest form of `attack_ca_misissuance`, and the one that says what
+    the binding is actually worth: the attacker is not persuading an authority
+    to misissue, it *is* the authority. Minting a credential for hq's address
+    still fails, because it would need a `derive_mac` preimage and a signing
+    key is not one (design 09 §5).
+
+    What it deliberately does *not* buy is anything about membership: a root
+    compromise still admits new members freely, at the addresses their own
+    keys derive. The control run measures that half too, so the finding says
+    precisely what the binding does and does not cover rather than implying a
+    root compromise is survivable in general.
+    """
+    m = mesh()
+    # hq is a member of this mesh but is *not* on this partition — which is
+    # exactly when impersonating it is worth doing, and what makes the
+    # measurement clean: its address can reach `field` only through the
+    # imposter's certificate.
+    victim_mac = m.keypair("hq").derived_mac
+    nodes = [
+        Node("field", credential=Credential()),
+        # The attacker holds the root key, so both of these are genuinely
+        # CA-signed. Only the address differs.
+        Node("imposter", credential=Credential(claim_mac=victim_mac)),
+        Node("newcomer", credential=Credential()),
+    ]
+    links = [
+        pair("field", "imposter", PerfectWire()),
+        pair("field", "newcomer", PerfectWire()),
+    ]
+    sim = Simulation(nodes, links, mesh=m)
+    sim.run(until_s=30.0)
+
+    neighbours = sim.driver("field").neighbor_macs()
+    stole_the_address = victim_mac in neighbours
+    # The control: a member the same compromised root admitted at its *own*
+    # address is accepted, which is what makes the first result a statement
+    # about the binding rather than about the fixture failing to converge.
+    admitted_a_newcomer = sim.mac("newcomer") in neighbours
+
+    if stole_the_address:
+        verdict = GAP
+        detail = (
+            "a compromised root minted a credential for a live member's "
+            "address and it was admitted — the address is not bound to the key"
+        )
+    elif not admitted_a_newcomer:
+        verdict = GAP
+        detail = (
+            "inconclusive: the control newcomer was not admitted either, so "
+            "the refusal above is not evidence about the binding"
+        )
+    else:
+        verdict = HELD
+        detail = (
+            "a compromised root still cannot take an existing member's "
+            "address (it would need a derive_mac preimage), though it does "
+            "still admit new members at their own addresses — the binding "
+            "bounds impersonation, not root compromise"
+        )
+    return Finding("Compromised root takes a live address", verdict, detail)
+
+
+def attack_squat_a_lapsed_members_address() -> Finding:
+    """An attacker claiming an address whose certificate has expired.
+
+    The authority's own lock on an address was read off the *issued record*
+    and so expired with it — issue #37's window, in which a stranger could be
+    issued a certificate for a departed member's address and have it honoured
+    mesh-wide. The address was, briefly, first-come again.
+
+    The binding closes it from the other end and closes it permanently: the
+    address is not this key's to claim at any time, expired incumbent or not.
+    Measured at the router, so it holds whatever the authority's policy is.
+    """
+    m = mesh()
+    # hq is *off this partition*: it is a member whose enrollment has lapsed
+    # elsewhere. Running it here would have `field` cache its address
+    # legitimately first, and the assertion at 60 s could then not tell "the
+    # squatter was refused" from "hq's own entry aged out".
+    departed_mac = m.keypair("hq").derived_mac
+    nodes = [
+        Node("field", credential=Credential()),
+        Node("squatter", credential=Credential(claim_mac=departed_mac)),
+        # The positive control, for the same reason as `attack_ca_misissuance`:
+        # the finding below is an absence, and so is a run that never converged.
+        Node("control", credential=Credential()),
+    ]
+    links = [
+        pair("field", "squatter", PerfectWire()),
+        pair("field", "control", PerfectWire()),
+    ]
+    sim = Simulation(nodes, links, mesh=m)
+    sim.run(until_s=60.0)
+
+    admitted = sim.driver("field").neighbor_macs()
+    if sim.mac("control") not in admitted:
+        return Finding(
+            "Squat a lapsed member's address",
+            GAP,
+            "inconclusive: the control member was not admitted either, so the "
+            "refusal below is not evidence about the binding",
+        )
+    took_it = departed_mac in admitted
+    return Finding(
+        "Squat a lapsed member's address",
+        GAP if took_it else HELD,
+        (
+            "a departed member's address was claimable by another key once "
+            "its certificate lapsed"
+            if took_it
+            else "a lapsed address stays unclaimable by any other key: it is "
+            "a function of the departed member's key, not a lease (control "
+            "member admitted, so the refusal is real)"
+        ),
+    )
+
+
+def attack_agreement_key_theft_via_address_binding() -> Finding:
+    """A certificate carrying a victim's *agreement* key at the attacker's
+    own address.
+
+    The binding is deliberately on `ed_pubkey` alone (design 09 §5, matching
+    §8.9's live-member identity lock), because the CA will sign an
+    agreement-key-only rotation for a live member and a wider rule would
+    reject a certificate this mesh's own authority had just issued.
+
+    This probes what that narrowness costs. The attacker mints itself a
+    certificate — at its own, correctly derived address, so the binding is
+    satisfied — but naming hq's x25519 key. If a pairwise key were somehow
+    reachable from that, the attacker would read directed traffic addressed
+    to itself as though it were hq. It is not: agreement needs the *private*
+    half, which the certificate does not carry, so peers deriving a key
+    "with the attacker" derive one only hq could complete, and the attacker
+    can neither tag nor verify.
+    """
+    m = mesh()
+    eve_kp = wf.PyKeypair.from_seed(EVE_SEED)
+    hq_kp = m.keypair("hq")
+    nodes = [
+        Node("hq", credential=Credential()),
+        Node("field", credential=Credential()),
+        Node("eve", credential=Credential(enrolled=False)),
+    ]
+    links = [
+        pair("hq", "field", PerfectWire()),
+        pair("field", "eve", PerfectWire()),
+    ]
+    sim = Simulation(nodes, links, mesh=m)
+
+    # Eve's own address (so the binding is satisfied), hq's agreement key.
+    # Signed directly rather than through `Mesh.enroll`, which has no way to
+    # express "somebody else's agreement key" — and should not grow one for a
+    # single attack.
+    root = wf.PyAuthority.from_seed(MESH_ROOT_SEED, MESH_ID)
+    stolen = root.issue_cert(
+        eve_kp.derived_mac,
+        eve_kp.ed_pubkey,
+        hq_kp.x_pubkey,
+        m.epoch_unix - 1000,
+        m.epoch_unix + 100_000,
+    )
+    sim.driver("eve").set_auth(eve_kp, stolen, m.trust_anchor)
+    sim.run(until_s=40.0)
+
+    # Admission is expected and is not the question — the certificate is
+    # well-formed and names eve's own address. What must not follow is eve
+    # being able to complete a pairwise exchange it does not hold the private
+    # half of.
+    admitted = eve_kp.derived_mac in sim.driver("field").neighbor_macs()
+    field_mac = sim.mac("field")
+    sim.driver("field").queue_local_send(eve_kp.derived_mac, b"PAIRWISE-PROBE")
+    sim.run(until_s=45.0)
+    read_it = sim.poll_local("eve") == b"PAIRWISE-PROBE"
+
+    if read_it:
+        verdict = GAP
+        detail = (
+            "carrying another member's agreement key in a certificate let the "
+            "holder complete that member's pairwise exchange — the binding "
+            "must cover x_pubkey too"
+        )
+    else:
+        verdict = HELD
+        detail = (
+            f"admitted={admitted} at its own address (as designed), but could "
+            f"not read a frame tagged to it from {field_mac}: an agreement key "
+            "in a certificate is a public half, and naming somebody else's "
+            "buys nothing without their private one"
+        )
+    return Finding("Agreement key named in another's cert", verdict, detail)
 
 
 def attack_proof_starvation_by_neighbour_count() -> Finding:
@@ -3061,6 +3276,9 @@ ATTACKS: list[Callable[[], Finding]] = [
     attack_broadcast_addressed_challenge,
     attack_unauthenticated_relay,
     attack_ca_misissuance,
+    attack_compromised_root_takes_a_live_members_address,
+    attack_squat_a_lapsed_members_address,
+    attack_agreement_key_theft_via_address_binding,
     attack_proof_starvation_by_neighbour_count,
     # --- 2026-08 sweep ---
     attack_reserved_address_originator,

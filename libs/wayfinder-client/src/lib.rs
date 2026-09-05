@@ -1525,7 +1525,8 @@ fn unexpected(want: &str, got: &ResponseKind) -> anyhow::Error {
 fn explain_auth_denial(server_message: &str, presented_cert: bool) -> String {
     let cause = if presented_cert {
         "the certificate presented is not an admin certificate, has expired, has been revoked, \
-         or was issued by a different mesh root"
+         was issued by a different mesh root, or binds a MAC that is not the address its own \
+         identity key derives (a credential minted before that rule, which must be re-issued)"
     } else {
         "no membership certificate was presented, so this connection is limited to \
          enrollment; anything else needs an admin certificate or the node's own key"

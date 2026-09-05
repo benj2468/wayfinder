@@ -237,16 +237,25 @@ pub async fn run(cmd: CsrCommand, client: &mut Client) -> anyhow::Result<String>
 /// already running under, so a certificate can be issued for a node whose seed
 /// the operator does not hold.
 ///
-/// Every field comes from the node itself, which is the point: the MAC is the
-/// one the router answers to (`GetNodeInfo`), and the public keys are the ones
-/// it signs and derives with (`GetSecurityStatus`). Nothing here is the
-/// operator's to choose except `token`, which is a secret the *provider*
-/// checks and the enrolling node never learns.
+/// Every field comes from the node itself, which is the point: the public keys
+/// are the ones it signs and derives with (`GetSecurityStatus`), and the MAC is
+/// the address those keys derive. Nothing here is the operator's to choose
+/// except `token`, which is a secret the *provider* checks and the enrolling
+/// node never learns.
 ///
-/// The MAC in particular must not be guessed or overridden. A node certifying
-/// the identity it already holds refuses a certificate naming any other MAC
-/// (see `RouterAdapter::set_auth`), so a CSR built from anything but what the
-/// node reports produces a certificate that node cannot install.
+/// The MAC in particular must not be guessed or overridden. Since the
+/// key↔address binding landed (design 09 §5) an authority refuses to certify
+/// any address but the one the presented key derives, and every node refuses to
+/// verify such a certificate — so a CSR built from anything else produces
+/// nothing installable.
+///
+/// It is deliberately derived here rather than read from `GetNodeInfo`. The two
+/// agree for any node that has an identity, because `wayfinder-tap` routes
+/// under the address its identity key derives; where they disagree the node is
+/// running under a provisional address (one persisted before it had an
+/// identity), and the certificate has to name the derived one — the address
+/// that node will answer to once enrolled. Taking `node_id` instead would build
+/// a CSR the authority rejects.
 async fn csr_for_connected_node(
     client: &mut Client,
     token: String,
@@ -294,6 +303,10 @@ async fn csr_for_connected_node(
     }
     // A `MembershipCert` binds a six-octet MAC, so a node addressed any other
     // way (a short-address mesh) cannot be certified through this path at all.
+    // Checked against what the node *reports* even though the subject is
+    // derived below: a short-address node is one this path cannot serve at all,
+    // and saying so beats handing it a certificate for an address it does not
+    // use.
     if info.node_id.len() != 6 {
         bail!(
             "the node identifies itself with {} bytes, and a membership certificate \
@@ -302,8 +315,37 @@ async fn csr_for_connected_node(
         );
     }
 
+    let ed: [u8; 32] = status
+        .own_ed_pubkey
+        .clone()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("the node reported a malformed ed25519 key"))?;
+    let node_mac = wayfinder_auth::derive_mac(&ed);
+    if node_mac.0.as_slice() != info.node_id.as_slice() {
+        // Refused, not warned about. A node running this build always answers
+        // to the address its identity key derives, so a disagreement means the
+        // node is on an *older* build — and for that node the whole chain is
+        // already doomed: `csr submit` would durably spend the derived address
+        // at the CA, and `csr install` would then be refused by the node's own
+        // `set_auth`, which requires a certificate certifying an existing
+        // identity to name the address that node currently runs under.
+        //
+        // Printing a note and proceeding would hand the operator a certificate
+        // they cannot install, with the explanation two commands behind them.
+        bail!(
+            "this node answers to {} but its identity key derives {}, so it is \
+             running a build from before a node's address became a function of \
+             its key. A certificate can only name the derived address, and this \
+             node would refuse one — upgrade and restart it first, so it comes \
+             up under {}, then re-run this command.",
+            output::format_mac(&info.node_id),
+            output::format_mac(&node_mac.0),
+            output::format_mac(&node_mac.0),
+        );
+    }
+
     Ok(SubmitCsrRequest {
-        node_mac: info.node_id,
+        node_mac: node_mac.0.to_vec(),
         ed_pubkey: status.own_ed_pubkey,
         x_pubkey: status.own_x_pubkey,
         enrollment_token: token,

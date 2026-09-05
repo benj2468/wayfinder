@@ -7,16 +7,22 @@
 //!
 //! # Whose keys are being certified
 //!
-//! The node's own. The request names the identity and MAC the node is already
-//! running under, read from the node itself rather than taken from the browser,
-//! and the certificate that comes back is installed against the seed the node
-//! keeps ([`Client::install_cert`]). Nothing about the node's identity changes;
-//! it simply acquires a certificate for the one it had. The alternative — mint a
-//! fresh keypair here, as the offline `wayfinderctl enroll` does — would change
-//! the node's MAC, which is read once at startup, leaving it signing frames
-//! under a certificate its peers cannot attribute to it until someone restarts
-//! it. It would also mean this process handling a private key, which it
-//! otherwise never does.
+//! The node's own. The request names the identity keys the node reports, read
+//! from the node itself rather than taken from the browser, and the certificate
+//! that comes back is installed against the seed the node keeps
+//! ([`Client::install_cert`]). Nothing about the node's identity changes; it
+//! simply acquires a certificate for the one it had. The alternative — mint a
+//! fresh keypair here, as the offline `wayfinderctl enroll` does — would enrol
+//! a different node, and would mean this process handling a private key, which
+//! it otherwise never does.
+//!
+//! The *address* in the request is derived from those keys rather than read
+//! from `GetNodeInfo`: since design 09 §5 a certificate may name only the
+//! address its key derives, so a request built from the node's reported address
+//! is one no authority will sign. The two agree for any node running a build
+//! that derives its own MAC. Where they disagree the node predates that rule,
+//! and enrolling it would spend an address its own `SetAuth` then refuses — so
+//! this refuses first, and says to update the node.
 //!
 //! # What this connection is
 //!
@@ -119,11 +125,45 @@ mod ssr {
             })
             .await
             .context("asking the node for its identity")?;
-        let (ed_pubkey, x_pubkey, node_mac) = identity;
+        let (ed_pubkey, x_pubkey, reported_mac) = identity;
         if ed_pubkey.is_empty() || x_pubkey.is_empty() {
             bail!(
                 "this node reports no identity of its own, so there is nothing to \
                  certify; it needs a management-API identity seed configured"
+            );
+        }
+        // The subject is *derived*, not the address the node currently reports.
+        // A certificate's MAC is the address its identity key derives (design
+        // 09 §5) — an authority will certify no other, and no node will verify
+        // one that names another. The two agree for a node that already has an
+        // identity; where they differ the node is on a provisional address it
+        // held before it had one, and enrolling is what moves it.
+        let ed: [u8; 32] = ed_pubkey
+            .clone()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("this node reported a malformed ed25519 identity key"))?;
+        let node_mac = wayfinder_auth::derive_mac(&ed).0.to_vec();
+        if node_mac != reported_mac {
+            // Refused rather than noted, for the same reason `wayfinderctl csr
+            // request` refuses it: a node running this build always answers to
+            // the address its key derives, so a disagreement means an older
+            // build — and that node's own `set_auth` will refuse the
+            // certificate this would spend at the CA. A green "Enrolled"
+            // confirmation for a certificate that cannot be installed is the
+            // worst outcome available here, and this crate's audience is
+            // explicitly the person least equipped to debug it.
+            tracing::warn!(
+                reported = ?reported_mac,
+                derived = ?node_mac,
+                "refusing to enrol a node that is not running under the address its \
+                 identity key derives"
+            );
+            bail!(
+                "this node answers to an address its own identity key does not \
+                 derive, so it is running a build from before a node's address \
+                 became a function of its key. A certificate can only name the \
+                 derived address, and this node would refuse one — update and \
+                 restart the node first, then try again."
             );
         }
 

@@ -137,7 +137,10 @@ impl Default for Mock {
             security: SecurityStatusData {
                 auth_enabled: true,
                 mesh_id: 0xABCD,
-                node_mac: vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01],
+                // The address this node's own key derives — the same value
+                // `node_id` reports, because a node has one address and it is a
+                // function of its key (design 09 §5).
+                node_mac: wayfinder_auth::derive_mac(&MOCK_ED_PUBKEY).0.to_vec(),
                 cert_not_after: 1_800_000_000,
                 revocation_count: 0,
                 nodes: vec![NodeSecurityData {
@@ -436,8 +439,15 @@ impl Mock {
 }
 
 impl RouterReads for Mock {
+    /// The address [`MOCK_ED_PUBKEY`] derives, not an invented constant.
+    ///
+    /// A real node routes under the address its identity key derives (design 09
+    /// §5), so a mock that reported anything else would be modelling a node from
+    /// before that rule — and would make every enrollment test pass or fail for
+    /// reasons no live node shares. `enroll::request` refuses such a node
+    /// outright, which is how this was found.
     fn node_id(&self) -> Vec<u8> {
-        vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]
+        wayfinder_auth::derive_mac(&MOCK_ED_PUBKEY).0.to_vec()
     }
 
     fn num_originators(&self) -> u32 {
@@ -698,6 +708,15 @@ impl RouterWrites for Mock {
             let kp = wayfinder_auth::Keypair::from_seed(&seed);
             self.security.own_ed_pubkey = kp.ed_pubkey().to_vec();
             self.security.own_x_pubkey = kp.x_pubkey().to_vec();
+        }
+        // Certifying the identity already held (an empty seed) must keep the
+        // address that identity runs under, exactly as `RouterAdapter::set_auth`
+        // requires. Enforced here rather than assumed: a mock that silently
+        // adopted whatever MAC a certificate named would let an enrollment test
+        // pass against a certificate a real node refuses, which is precisely the
+        // failure this mock exists to catch early.
+        if seed.is_empty() && cert.node_mac.to_vec() != self.node_id() {
+            return Err("certificate MAC does not match the MAC this node runs under".to_string());
         }
         self.security.auth_enabled = true;
         self.security.mesh_id = anchor.mesh_id;

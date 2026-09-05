@@ -1636,6 +1636,57 @@ fn node_mac_of(bytes: &[u8]) -> Result<Mac, String> {
     Mac::try_from(bytes).map_err(|_| "node_mac must be 6 bytes".to_string())
 }
 
+/// Refuse a subject address that is not the one `ed_pubkey` derives.
+///
+/// The issuance-side half of the key↔address binding `TrustAnchor::verify_cert`
+/// enforces (design 09 §5). Verification is the half that holds even against a
+/// compromised authority; this half exists so an honest one reports the mistake
+/// at the point it is made, and so no certificate this CA has issued is one no
+/// node will honour.
+///
+/// The message names the derived address rather than only the rejected one: an
+/// operator who reaches for `--mac` needs to be told what to use instead, and
+/// the derived MAC is public (it is on every OGM) so naming it leaks nothing.
+///
+/// `operator_initiated` picks the log level, and the two callers genuinely
+/// differ. `approve_csr` is an authenticated operator being refused against
+/// durable state — something they must see, so `warn!`. `submit_csr` is
+/// admitted at the *anonymous* enrollment tier, so any client that can reach
+/// the port drives this line; the root `CLAUDE.md` puts a drop reachable by
+/// arbitrary remote input at `trace!`, and the rate-limit bucket bounds it per
+/// source rather than making it free. Logging both at `warn!` also made the two
+/// indistinguishable in the record: "somebody probed the enrollment endpoint"
+/// and "an operator's approval hit a corrupt row" read identically.
+fn check_mac_derives_from(
+    mac: Mac,
+    ed_pubkey: &[u8; 32],
+    operator_initiated: bool,
+) -> Result<(), String> {
+    let derived = wayfinder_auth::derive_mac(ed_pubkey);
+    if derived == mac {
+        return Ok(());
+    }
+    if operator_initiated {
+        tracing::warn!(
+            named = ?mac,
+            ?derived,
+            "refusing to approve a held CSR whose MAC its identity key does not derive"
+        );
+    } else {
+        tracing::trace!(
+            named = ?mac,
+            ?derived,
+            "drop: CSR names a MAC its identity key does not derive"
+        );
+    }
+    Err(alloc::format!(
+        "a certificate's MAC must be the address its identity key derives: this \
+         request names {:02x?} but the key derives {:02x?}",
+        mac.0,
+        derived.0,
+    ))
+}
+
 /// A freshly minted invitation, as its caller sees it once.
 ///
 /// [`token`](Self::token) is the whole reason this type is returned rather than
@@ -1877,6 +1928,26 @@ impl MeshAuthority for CertAuthority {
         let mac = node_mac_of(node_mac)?;
         let ed = fixed::<32>(ed_pubkey, "ed_pubkey")?;
         let x = fixed::<32>(x_pubkey, "x_pubkey")?;
+        // The address must be the one this key derives. Checked here as well as
+        // in `verify_cert` so the failure surfaces where the mistake is made,
+        // rather than as a certificate that issues cleanly and is then refused
+        // by every node on the mesh.
+        //
+        // This — not the live-cert lock below — is what now stops
+        // impersonation. The lock was first-come, so it only ever protected an
+        // address that already held a certificate; an attacker could still
+        // claim any address whose cert had lapsed or never existed. Naming an
+        // address is no longer something a client can do at all: the address is
+        // a function of the key it is presenting.
+        //
+        // A *rejection*, not an `Err`: the CSR is well formed and the caller is
+        // answered, exactly as it is for a bad token or for the sibling
+        // impersonation refusal below. It must also not touch the held store,
+        // for the same reason a bad token must not — a rejected request cannot
+        // be allowed to clobber a legitimate pending one for that MAC.
+        if let Err(why) = check_mac_derives_from(mac, &ed, false) {
+            return Ok(CsrOutcome::Rejected(why));
+        }
 
         // A MAC that already holds a certificate inside its validity window is handled off
         // `issued` (not `held`, which is evicted at pending_ttl) so protection outlives the
@@ -1897,14 +1968,21 @@ impl MeshAuthority for CertAuthority {
         // date, the certificate that yielded post-dated the record and was
         // honoured mesh-wide: revocation defeated by the act of revoking.
         //
-        // The lock this builds is only as long-lived as the *issued record*,
-        // which is a narrower thing than the revocation: `revoke` stamps its
+        // This lock used to be only as long-lived as the *issued record*, which
+        // is a narrower thing than the revocation: `revoke` stamps its
         // `RevocationRecord` `not_after` at `now + cert_ttl_secs`, so it
         // outlives the certificate it cancels, and this log row does not.
-        // Between the row expiring and the revocation expiring the MAC is
-        // free again. See `a_revoked_mac_is_only_locked_while_its_record_lives`
-        // for the exact window, and issue #37 for closing it — the fix is to
-        // consult persisted revocations rather than to widen this predicate.
+        // Between the row expiring and the revocation expiring the MAC was free
+        // again — issue #37, and a stranger issued in that window got a
+        // certificate post-dating the revocation and honoured mesh-wide.
+        //
+        // **Closed**, and closed more completely than #37's planned fix
+        // (consulting persisted revocations): since design 09 §5's key↔address
+        // binding, `check_mac_derives_from` above has already refused any key
+        // but the one that derives this address, at any time, expired record or
+        // not. There is no window left to be inside. Pinned by
+        // `a_different_key_cannot_reclaim_a_revoked_mac`, which absorbed the
+        // test that used to hold the window open.
         //
         // Read the two facts out rather than keeping the record borrowed:
         // `issue` below takes `&mut self`.
@@ -1930,6 +2008,16 @@ impl MeshAuthority for CertAuthority {
                 // to tell it from a node that is merely stuck. The MAC is not
                 // a secret — every OGM carries one — and the keys are not
                 // logged.
+                //
+                // Reachable only through the durable `issued` log now:
+                // `check_mac_derives_from` above refuses any request whose key
+                // does not derive `mac`, so for a request that reaches here the
+                // key *does* derive it — and a row holding that address under a
+                // different key can only have been written by a build that
+                // predates the binding, or restored from a snapshot one wrote.
+                // That is exactly why this is not dead code, and why
+                // `a_legacy_issued_row_still_locks_its_mac` builds that row by
+                // hand to keep it covered.
                 tracing::warn!(
                     node_mac = ?mac,
                     "drop: CSR for a MAC already certified under a different key"
@@ -2068,6 +2156,12 @@ impl MeshAuthority for CertAuthority {
             self.log.held()[idx].ed_pubkey,
             self.log.held()[idx].x_pubkey,
         );
+        // Re-check the binding at approval, not only at submission. The held
+        // store is durable and predates this rule, so a row parked by an
+        // earlier build — or restored from a snapshot written by one — would
+        // otherwise be signed on an operator's say-so without ever passing the
+        // guard `submit_csr` applies.
+        check_mac_derives_from(mac, &ed, true)?;
         // Sign now (stamping the current clock) and stash the bytes; the node
         // collects them on its next poll.  Restart the entry's TTL clock so the
         // node gets a full pending-TTL window to collect from the approval.
@@ -2288,6 +2382,16 @@ mod tests {
     fn node_keys(seed: u8) -> ([u8; 32], [u8; 32]) {
         let kp = Keypair::from_seed(&[seed; 32]);
         (kp.ed_pubkey(), kp.x_pubkey())
+    }
+
+    /// The MAC that `node_keys(seed)` derives — the only address a CSR under
+    /// those keys may name, since the key↔address binding landed.
+    ///
+    /// Paired with `node_keys` on purpose: a test that invents an address
+    /// independently of the key it presents is testing a request no honest
+    /// client can build and no authority will answer.
+    fn node_mac(seed: u8) -> [u8; 6] {
+        Keypair::from_seed(&[seed; 32]).derived_mac().0
     }
 
     /// A CA with an already-set clock and no approval gate (the common setup).
@@ -2518,7 +2622,7 @@ mod tests {
     fn a_login_does_not_reclaim_a_device_record() {
         let (mut ca, secret) = ca_with_user(UserRole::Admin, 900);
         let (dev_ed, dev_x) = node_keys(4);
-        issued_cert(&mut ca, &[0, 0, 0, 0, 0, 9], &dev_ed, &dev_x, "");
+        issued_cert(&mut ca, &node_mac(4), &dev_ed, &dev_x, "");
 
         ca.set_now_unix(10_000_000);
         let (ed, x) = node_keys(2);
@@ -2863,10 +2967,10 @@ mod tests {
     fn a_device_certificate_names_no_account() {
         let mut ca = open_ca();
         let (ed, x) = node_keys(2);
-        issued_cert(&mut ca, &[0, 0, 0, 0, 0, 9], &ed, &x, "");
+        issued_cert(&mut ca, &node_mac(2), &ed, &x, "");
 
         assert!(
-            entry(&ca, &[0, 0, 0, 0, 0, 9]).account_id.is_empty(),
+            entry(&ca, &node_mac(2)).account_id.is_empty(),
             "an enrolled device belongs to no user account"
         );
     }
@@ -3088,12 +3192,12 @@ mod tests {
     fn issued_cert_verifies_against_the_anchor() {
         let mut ca = open_ca();
         let (ed, x) = node_keys(2);
-        let cert_bytes = issued_cert(&mut ca, &[0, 0, 0, 0, 0, 9], &ed, &x, "");
+        let cert_bytes = issued_cert(&mut ca, &node_mac(2), &ed, &x, "");
 
         let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
         let cert = MembershipCert::from_bytes(&cert_bytes).unwrap();
         let verified = anchor.verify_cert(&cert, 500).expect("verifies in window");
-        assert_eq!(verified.mac.0, [0, 0, 0, 0, 0, 9]);
+        assert_eq!(verified.mac.0, node_mac(2));
         assert_eq!(verified.ed_pubkey, ed);
     }
 
@@ -3102,7 +3206,7 @@ mod tests {
         let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, Some("s3cret".to_string()), true);
         ca.set_now_unix(100);
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
         // A well-formed CSR with a bad/missing token is *rejected* (a CSR-domain
         // outcome), not an `Err` (which is for unserviceable requests).
         assert!(matches!(
@@ -3161,10 +3265,13 @@ mod tests {
         let mut ca = open_ca();
         let (ed, x) = node_keys(2);
         ca.set_now_unix(ISSUED_AT);
-        issued_cert(&mut ca, &[0, 0, 0, 0, 0, 9], &ed, &x, "");
+        issued_cert(&mut ca, &node_mac(2), &ed, &x, "");
 
         let certs = ca.list_certs();
-        let issued = certs.iter().find(|c| c.node_mac[5] == 9).expect("issued");
+        let issued = certs
+            .iter()
+            .find(|c| c.node_mac == node_mac(2))
+            .expect("issued");
         assert_eq!(
             issued.not_before, ISSUED_AT,
             "the window opens at the moment of issuance, not at zero"
@@ -3181,27 +3288,31 @@ mod tests {
         let (ed, x) = node_keys(2);
         assert!(ca.list_certs().is_empty());
 
-        issued_cert(&mut ca, &[0, 0, 0, 0, 0, 9], &ed, &x, "");
-        issued_cert(&mut ca, &[0, 0, 0, 0, 0, 7], &ed, &x, "");
+        // Two rows means two *identities*: one MAC per key is now the whole
+        // point, so a second row needs a second key rather than a second
+        // address invented for the same one.
+        let (ed_b, x_b) = node_keys(7);
+        issued_cert(&mut ca, &node_mac(2), &ed, &x, "");
+        issued_cert(&mut ca, &node_mac(7), &ed_b, &x_b, "");
         assert_eq!(ca.list_certs().len(), 2);
 
         // Re-issuing for an existing MAC updates in place (no duplicate).
         ca.set_now_unix(200);
-        issued_cert(&mut ca, &[0, 0, 0, 0, 0, 9], &ed, &x, "");
+        issued_cert(&mut ca, &node_mac(2), &ed, &x, "");
         let certs = ca.list_certs();
         assert_eq!(certs.len(), 2);
-        let nine = certs.iter().find(|c| c.node_mac[5] == 9).unwrap();
-        assert_eq!(nine.not_before, 200, "re-issue updated the window");
+        let reissued = certs.iter().find(|c| c.node_mac == node_mac(2)).unwrap();
+        assert_eq!(reissued.not_before, 200, "re-issue updated the window");
     }
 
     #[test]
     fn revoke_marks_the_issued_cert_revoked_but_keeps_it_listed() {
         let mut ca = open_ca();
         let (ed, x) = node_keys(2);
-        issued_cert(&mut ca, &[0, 0, 0, 0, 0, 9], &ed, &x, "");
+        issued_cert(&mut ca, &node_mac(2), &ed, &x, "");
         assert!(!ca.list_certs()[0].revoked);
 
-        ca.revoke(&[0, 0, 0, 0, 0, 9]).unwrap();
+        ca.revoke(&node_mac(2)).unwrap();
         let certs = ca.list_certs();
         assert_eq!(certs.len(), 1, "the entry is retained after revoke");
         assert!(certs[0].revoked, "and marked revoked");
@@ -3210,12 +3321,9 @@ mod tests {
     #[test]
     fn revoke_produces_a_verifiable_record() {
         let mut ca = open_ca();
-        let record = ca.revoke(&[0, 0, 0, 0, 0, 9]).unwrap();
+        let record = ca.revoke(&node_mac(2)).unwrap();
         let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
-        assert_eq!(
-            anchor.verify_revocation(&record, 0).unwrap().0,
-            [0, 0, 0, 0, 0, 9]
-        );
+        assert_eq!(anchor.verify_revocation(&record, 0).unwrap().0, node_mac(2));
     }
 
     // ── Enrollment posture at construction ─────────────────────────────────────
@@ -3240,7 +3348,7 @@ mod tests {
     /// with it, for the posture tests below.
     fn submit(ca: &mut CertAuthority, token: &str) -> CsrOutcome {
         let (ed, x) = node_keys(2);
-        ca.submit_csr(&[0, 0, 0, 0, 0, 9], &ed, &x, token).unwrap()
+        ca.submit_csr(&node_mac(2), &ed, &x, token).unwrap()
     }
 
     /// A config that says nothing about who may join gets the closed posture.
@@ -3400,11 +3508,149 @@ mod tests {
         ca
     }
 
+    /// The live-cert lock still fires for a row a *pre-binding* build wrote.
+    ///
+    /// `check_mac_derives_from` refuses any request whose key does not derive
+    /// the address it names, which makes the `!same_key` branch below it
+    /// unreachable for every well-formed request — so the three tests that used
+    /// to cover it now short-circuit at the guard, and deleting the branch
+    /// would leave them all green.
+    ///
+    /// It is not dead code. `issued` is a durable JSON log restored across
+    /// restarts, and a row written before the binding can hold `node_mac !=
+    /// derive_mac(row.ed_pubkey)`. The *legitimate* holder of that address then
+    /// passes the guard and lands on the branch. Built by hand here for the
+    /// same reason `approving_a_held_csr_still_enforces_the_binding` builds its
+    /// row by hand: this state can no longer be reached by asking.
+    #[test]
+    fn a_legacy_issued_row_still_locks_its_mac() {
+        let mut ca = open_ca();
+        let (ed, x) = node_keys(2);
+
+        // A row a pre-binding build could have written: seed 2's address, held
+        // under seed 3's key.
+        let (other_ed, _) = node_keys(3);
+        let (_, persisted) = ca.log.mutate_issued(|issued| {
+            issued.push(IssuedCertData {
+                node_mac: node_mac(2).to_vec(),
+                ed_pubkey: other_ed.to_vec(),
+                not_before: 0,
+                not_after: 10_000,
+                revoked: false,
+                user: false,
+                admin: false,
+                viewer: false,
+                account_id: Vec::new(),
+            });
+        });
+        persisted.unwrap();
+
+        // Seed 2 legitimately owns that address — it derives it — so the
+        // derivation guard admits the request and the lock is what answers.
+        let outcome = ca.submit_csr(&node_mac(2), &ed, &x, "").unwrap();
+        let CsrOutcome::Rejected(why) = outcome else {
+            panic!("a legacy row must still lock its MAC, got {outcome:?}");
+        };
+        assert!(
+            why.contains("already has a certificate under a different key"),
+            "the lock must be what refused this, not the derivation guard: {why}"
+        );
+        // The lock is not a revocation oracle either — the branch deliberately
+        // does not distinguish a revoked holder from a live one, and this is the
+        // only path left that reaches its wording.
+        assert!(
+            !why.to_lowercase().contains("revok"),
+            "the lock's refusal disclosed revocation status: {why}"
+        );
+    }
+
+    /// A CSR must name the address its own identity key derives.
+    ///
+    /// `node_mac` arrives from the client, so before the binding this was the
+    /// whole of gap 4's issuance half: passing the enrollment-token check let a
+    /// caller claim any address not currently covered by a live certificate.
+    /// Rejected rather than silently corrected, so the mistake surfaces where
+    /// it is made.
+    #[test]
+    fn a_csr_naming_an_address_its_key_does_not_derive_is_rejected() {
+        let mut ca = open_ca();
+        let (ed, x) = node_keys(2);
+
+        // The victim's address, claimed under the attacker's keys.
+        let outcome = ca.submit_csr(&node_mac(3), &ed, &x, "").unwrap();
+        assert!(
+            matches!(outcome, CsrOutcome::Rejected(_)),
+            "expected a rejection, got {outcome:?}"
+        );
+        assert!(ca.list_certs().is_empty(), "nothing may be issued");
+        assert!(ca.list_pending().is_empty(), "and nothing may be parked");
+
+        // An address belonging to nobody is refused by the same rule.
+        assert!(matches!(
+            ca.submit_csr(&[0, 0, 0, 0, 0, 9], &ed, &x, "").unwrap(),
+            CsrOutcome::Rejected(_)
+        ));
+
+        // The address the key does derive is issued.
+        assert!(matches!(
+            ca.submit_csr(&node_mac(2), &ed, &x, "").unwrap(),
+            CsrOutcome::Issued(_)
+        ));
+    }
+
+    /// The derivation guard sits *behind* the enrollment token: a caller
+    /// without the token learns nothing about which addresses are claimable.
+    #[test]
+    fn a_bad_token_outranks_the_derivation_guard() {
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, Some("s3cret".into()), true);
+        ca.set_now_unix(100);
+        let (ed, x) = node_keys(2);
+
+        let outcome = ca.submit_csr(&node_mac(3), &ed, &x, "wrong").unwrap();
+        match outcome {
+            CsrOutcome::Rejected(why) => assert!(
+                why.contains("token"),
+                "a tokenless caller must be told about the token, got: {why}"
+            ),
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    /// A CSR parked for approval is re-checked against the binding when it is
+    /// approved, not only when it is submitted.
+    ///
+    /// The held store is written before an operator ever sees the row, so a
+    /// guard that only ran on the way in would leave `approve` signing whatever
+    /// a client had queued under an earlier build.
+    #[test]
+    fn approving_a_held_csr_still_enforces_the_binding() {
+        let mut ca = approval_ca();
+        let (ed, x) = node_keys(2);
+
+        // Park a legitimate request, then corrupt the held row the way a
+        // pre-binding build could have written it.
+        assert!(matches!(
+            ca.submit_csr(&node_mac(2), &ed, &x, "").unwrap(),
+            CsrOutcome::Pending
+        ));
+        let (_, persisted) = ca.log.mutate_held(|held| {
+            for row in held.iter_mut() {
+                row.node_mac = node_mac(3);
+            }
+        });
+        persisted.unwrap();
+
+        assert!(
+            ca.approve_csr(&node_mac(3)).is_err(),
+            "approval must refuse a held row whose MAC its key does not derive"
+        );
+    }
+
     #[test]
     fn csr_is_pending_until_approved_then_issues_the_same_cert() {
         let mut ca = approval_ca();
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         // First submit parks the CSR: pending, and visible to the operator.
         assert!(matches!(
@@ -3449,7 +3695,7 @@ mod tests {
     fn denied_csr_reports_rejected_to_a_polling_node() {
         let mut ca = approval_ca();
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         ca.submit_csr(&mac, &ed, &x, "").unwrap();
         ca.deny_csr(&mac).expect("deny succeeds");
@@ -3479,7 +3725,7 @@ mod tests {
         let mut ca = approval_ca();
         let (ed1, x1) = node_keys(2);
         let (ed2, x2) = node_keys(3);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         assert!(matches!(
             ca.submit_csr(&mac, &ed1, &x1, "").unwrap(),
@@ -3505,7 +3751,7 @@ mod tests {
         let mut ca = approval_ca();
         let (ed1, x1) = node_keys(2);
         let (ed2, x2) = node_keys(3);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         ca.submit_csr(&mac, &ed1, &x1, "").unwrap();
         ca.approve_csr(&mac).unwrap();
@@ -3542,7 +3788,7 @@ mod tests {
         ca.set_now_unix(100);
         let (ed1, x1) = node_keys(2);
         let (ed2, x2) = node_keys(3);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         ca.submit_csr(&mac, &ed1, &x1, "").unwrap();
         ca.approve_csr(&mac).unwrap();
@@ -3558,10 +3804,23 @@ mod tests {
         ));
         assert!(ca.log.held().is_empty(), "no new pending entry was parked");
 
-        // Once the certificate passively expires, the MAC is free to re-key.
+        // ...and it stays rejected once the certificate passively expires,
+        // which is what the key↔address binding changed here. This used to be
+        // the point at which "the MAC is free to re-key": the lock was read off
+        // the *issued record*, so an address freed itself when its certificate
+        // lapsed. Now the address is a function of the key, so a different key
+        // has no claim on it at any time, expired record or not.
         ca.set_now_unix(100 + 100_001);
         assert!(matches!(
             ca.submit_csr(&mac, &ed2, &x2, "").unwrap(),
+            CsrOutcome::Rejected(_)
+        ));
+
+        // The holder itself still re-enrols freely — renewal (same key, new
+        // window) is what survives the binding, and is the only shape of
+        // "re-keying" left.
+        assert!(matches!(
+            ca.submit_csr(&mac, &ed1, &x1, "").unwrap(),
             CsrOutcome::Pending
         ));
     }
@@ -3588,7 +3847,7 @@ mod tests {
         let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
         ca.set_now_unix(100);
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         ca.submit_csr(&mac, &ed, &x, "").unwrap();
         ca.approve_csr(&mac).unwrap();
@@ -3637,7 +3896,7 @@ mod tests {
         let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
         ca.set_now_unix(100);
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         ca.submit_csr(&mac, &ed, &x, "").unwrap();
         ca.approve_csr(&mac).unwrap();
@@ -3674,7 +3933,7 @@ mod tests {
         let mut ca = open_ca();
         let (ed1, x1) = node_keys(2);
         let (ed2, x2) = node_keys(3);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         assert!(matches!(
             ca.submit_csr(&mac, &ed1, &x1, "").unwrap(),
@@ -3685,19 +3944,28 @@ mod tests {
         // out-date it. Still well inside the issued record's window.
         ca.set_now_unix(101);
 
-        // The MAC stays bound to the key it was issued to. Re-keying waits for
-        // that certificate to passively expire, exactly as it does for a MAC
-        // that was never revoked.
+        // The MAC stays bound to the key that derives it, revoked or not — a
+        // different key has no claim on it at any time.
         let outcome = ca.submit_csr(&mac, &ed2, &x2, "").unwrap();
         let CsrOutcome::Rejected(why) = outcome else {
             panic!("a revoked MAC was claimable by a key that never held it: {outcome:?}");
         };
         // The refusal must not be a revocation oracle. An anonymous caller
-        // learns that the MAC is taken — which it could infer by asking — and
-        // not that this node was ejected from the mesh.
+        // learns that the address is not its key's to claim — which it could
+        // compute for itself — and not that this node was ejected from the mesh.
+        //
+        // Note which message this now checks: since the key↔address binding it
+        // is `check_mac_derives_from`'s, not the live-cert lock's, because the
+        // guard answers first. That makes the assertion *weaker* than it looks
+        // — the derivation message could never contain "revok" — so the lock's
+        // own wording is pinned separately, on the path that still reaches it.
         assert!(
             !why.to_lowercase().contains("revok"),
             "the refusal told a stranger this MAC was revoked: {why}"
+        );
+        assert!(
+            why.contains("derives"),
+            "the derivation guard is what answers a stranger now: {why}"
         );
         assert_eq!(ca.list_certs().len(), 1, "no second cert for the MAC");
         assert!(
@@ -3711,49 +3979,26 @@ mod tests {
             ca.log.held().is_empty(),
             "a rejected claim parked a held entry for the MAC"
         );
-    }
 
-    /// The lock above lasts exactly as long as the *issued record*, which is
-    /// strictly shorter than the revocation that made it matter. This pins the
-    /// gap so it is a known, measured limitation rather than a surprise.
-    ///
-    /// `revoke` stamps `RevocationRecord::not_after` at `now + cert_ttl_secs`,
-    /// deliberately outliving the certificate it cancels — but the issued row
-    /// this guard reads keeps the *original* `not_after`. Between the two the
-    /// MAC is unlocked while still revoked, so a stranger can be issued a
-    /// certificate that post-dates the revocation and is honoured mesh-wide.
-    /// The window is as long as the node was enrolled before being revoked.
-    ///
-    /// Closing it means consulting persisted revocations instead of inferring
-    /// them from the issued log — a new persisted collection and a state-schema
-    /// bump, tracked as issue #37. **When that lands this test should start
-    /// failing**, and its assertion is written to say so.
-    #[test]
-    fn a_revoked_mac_is_only_locked_while_its_record_lives() {
-        let mut ca = open_ca(); // auto_approve, cert_ttl_secs = 1000
-        let (ed1, x1) = node_keys(2);
-        let (ed2, x2) = node_keys(3);
-        let mac = [0, 0, 0, 0, 0, 9];
-
-        // Enrolled at 100, so the issued row expires at 1100.
-        assert!(matches!(
-            ca.submit_csr(&mac, &ed1, &x1, "").unwrap(),
-            CsrOutcome::Issued(_)
-        ));
-        // Revoked at 600, so the revocation runs to 1600.
-        ca.set_now_unix(600);
-        let record = ca.revoke(&mac).unwrap();
-        assert_eq!(record.not_after, 1600, "the revocation outlives the cert");
-
-        // 1101: the issued row has expired, the revocation has not.
-        ca.set_now_unix(1101);
+        // Issue #37's window, folded in from the test that used to pin it open.
+        //
+        // The lock read off the issued record was strictly shorter than the
+        // revocation that made it matter: `revoke` stamps the record's
+        // `not_after` at `now + cert_ttl_secs`, outliving the certificate it
+        // cancels, while the issued row keeps the original one. Between the two
+        // the MAC was unlocked while still revoked, so a stranger could be
+        // issued a certificate that post-dated the revocation and was honoured
+        // mesh-wide.
+        //
+        // The key↔address binding closes it, and closes it more completely than
+        // the fix #37 anticipated (consulting persisted revocations): the
+        // address is not this key's to claim at *any* time, so there is no
+        // window to be inside.
+        ca.set_now_unix(1101); // past the issued row's `not_after` of 1100
         let outcome = ca.submit_csr(&mac, &ed2, &x2, "").unwrap();
         assert!(
-            matches!(outcome, CsrOutcome::Issued(_)),
-            "issue #37 appears to be fixed — a stranger can no longer claim a \
-             revoked MAC once its issued row expires. Delete this test and \
-             fold the case into a_different_key_cannot_reclaim_a_revoked_mac. \
-             Got: {outcome:?}"
+            matches!(outcome, CsrOutcome::Rejected(_)),
+            "a stranger claimed a revoked MAC once its issued row expired, got: {outcome:?}"
         );
     }
 
@@ -3770,7 +4015,7 @@ mod tests {
     fn auto_approve_does_not_re_admit_a_revoked_holder() {
         let mut ca = open_ca();
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         assert!(matches!(
             ca.submit_csr(&mac, &ed, &x, "").unwrap(),
@@ -3805,7 +4050,7 @@ mod tests {
     fn an_operator_can_re_admit_a_revoked_holder_by_approving_its_parked_csr() {
         let mut ca = open_ca();
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         ca.submit_csr(&mac, &ed, &x, "").unwrap();
         ca.revoke(&mac).unwrap();
@@ -3835,7 +4080,7 @@ mod tests {
     fn denying_a_revoked_holders_csr_leaves_the_revocation_standing() {
         let mut ca = open_ca();
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         ca.submit_csr(&mac, &ed, &x, "").unwrap();
         ca.revoke(&mac).unwrap();
@@ -3875,7 +4120,7 @@ mod tests {
         let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
         ca.set_now_unix(100);
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         ca.submit_csr(&mac, &ed, &x, "").unwrap();
         ca.approve_csr(&mac).unwrap();
@@ -3902,7 +4147,7 @@ mod tests {
         // approval.
         let mut ca = approval_ca();
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         assert!(matches!(
             ca.submit_csr(&mac, &ed, &x, "").unwrap(),
@@ -3933,7 +4178,9 @@ mod tests {
     #[test]
     fn a_full_held_csr_queue_refuses_new_requests_rather_than_evicting() {
         let mut ca = approval_ca();
-        let held_mac = |n: usize| [0, 0, 0, 0, (n >> 8) as u8, n as u8];
+        // One address per key: the queue is filled by distinct identities,
+        // which is what it is bounded against.
+        let held_mac = |n: usize| node_mac(n as u8);
 
         for n in 0..MAX_HELD_CSRS {
             let (ed, x) = node_keys(n as u8);
@@ -3950,9 +4197,7 @@ mod tests {
         // One more, from a MAC and key the store has never seen: refused, with
         // a reason that names the queue rather than blaming the requester.
         let (ed, x) = node_keys(200);
-        let outcome = ca
-            .submit_csr(&held_mac(MAX_HELD_CSRS), &ed, &x, "")
-            .unwrap();
+        let outcome = ca.submit_csr(&node_mac(200), &ed, &x, "").unwrap();
         match outcome {
             CsrOutcome::Rejected(reason) => {
                 assert!(reason.contains("full"), "got: {reason}");
@@ -3983,7 +4228,7 @@ mod tests {
     fn a_held_csr_is_evicted_after_the_pending_ttl() {
         let mut ca = approval_ca(); // pending TTL = DEFAULT_PENDING_TTL_SECS, clock = 100
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         ca.submit_csr(&mac, &ed, &x, "").unwrap();
         assert_eq!(ca.list_pending().len(), 1);
@@ -3996,7 +4241,7 @@ mod tests {
         // A fresh identity can now claim the freed MAC.
         let (ed2, x2) = node_keys(3);
         assert!(matches!(
-            ca.submit_csr(&mac, &ed2, &x2, "").unwrap(),
+            ca.submit_csr(&node_mac(3), &ed2, &x2, "").unwrap(),
             CsrOutcome::Pending
         ));
         assert_eq!(ca.log.held().len(), 1, "the timed-out entry was evicted");
@@ -4008,7 +4253,7 @@ mod tests {
         let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, Some("s3cret".to_string()), false);
         ca.set_now_unix(100);
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         // Legitimate node parks a pending CSR.
         assert!(matches!(
@@ -4104,7 +4349,7 @@ mod tests {
     fn issued_certs_persist_across_a_restart() {
         let path = unique_state_path("restart");
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         {
             let cfg = persisted_cfg(&path);
@@ -4215,7 +4460,7 @@ mod tests {
     fn held_csrs_persist_across_a_restart() {
         let path = unique_state_path("held-restart");
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         {
             let cfg = approval_persisted_cfg(&path);
@@ -4250,7 +4495,7 @@ mod tests {
     fn denied_csr_tombstone_persists_across_a_restart() {
         let path = unique_state_path("held-denied-restart");
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         {
             let cfg = approval_persisted_cfg(&path);
@@ -4278,7 +4523,7 @@ mod tests {
     fn v1_state_file_migrates_forward_with_empty_held() {
         let path = unique_state_path("v1-migration");
         let (ed, _x) = node_keys(2);
-        let mac = [0u8, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         // The version-1 on-disk shape: issued log only, no `held` section
         // at all.
@@ -4309,7 +4554,7 @@ mod tests {
         // A subsequent mutation rewrites the file under the current version,
         // with a `held` section now present.
         let (ed2, x2) = node_keys(3);
-        ca.submit_csr(&[0, 0, 0, 0, 0, 10], &ed2, &x2, "").unwrap();
+        ca.submit_csr(&node_mac(3), &ed2, &x2, "").unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         let on_disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(
@@ -4329,7 +4574,7 @@ mod tests {
         // hasn't collected its cert yet, and the process restarts in between.
         let path = unique_state_path("approved-restart");
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         {
             let cfg = approval_persisted_cfg(&path);
@@ -4360,7 +4605,7 @@ mod tests {
         let path = unique_state_path("evicted-restart");
         let (ed, x) = node_keys(2);
         let (ed2, x2) = node_keys(3);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         {
             let cfg = ProviderConfig {
@@ -4378,7 +4623,7 @@ mod tests {
             ca.set_now_unix(100 + 20);
             assert!(ca.list_pending().is_empty());
             assert!(matches!(
-                ca.submit_csr(&mac, &ed2, &x2, "").unwrap(),
+                ca.submit_csr(&node_mac(3), &ed2, &x2, "").unwrap(),
                 CsrOutcome::Pending
             ));
         } // Dropped here, simulating a restart.
@@ -4419,7 +4664,7 @@ mod tests {
         let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
         ca.set_now_unix(100);
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         // The doomed write surfaces as an error to the caller — an operator
         // must not be told an action durably succeeded when it didn't.
@@ -4445,7 +4690,7 @@ mod tests {
         // failing — a second, independent submission still gets exactly the
         // same fail-closed treatment as the first.
         let (ed2, x2) = node_keys(3);
-        let mac2 = [0, 0, 0, 0, 0, 10];
+        let mac2 = node_mac(3);
         let err2 = ca.submit_csr(&mac2, &ed2, &x2, "").unwrap_err();
         assert!(
             err2.contains("could not record"),
@@ -4475,7 +4720,7 @@ mod tests {
         let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
         ca.set_now_unix(100);
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         assert!(matches!(
             ca.submit_csr(&mac, &ed, &x, "").unwrap(),
@@ -4545,7 +4790,7 @@ mod tests {
         let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
         ca.set_now_unix(100);
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         assert!(matches!(
             ca.submit_csr(&mac, &ed, &x, "").unwrap(),
@@ -4664,7 +4909,7 @@ mod tests {
     fn enabling_approval_parks_the_next_csr() {
         let mut ca = open_ca();
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         ca.set_enrollment_policy(&EnrollmentPolicyData {
             auto_approve: Some(false),
@@ -4685,7 +4930,7 @@ mod tests {
     fn setting_a_token_gates_the_next_csr() {
         let mut ca = open_ca();
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         ca.set_enrollment_policy(&EnrollmentPolicyData {
             enrollment_token: Some(TokenUpdate::Set(SharedSecret::new("hunter2"))),
@@ -4710,7 +4955,7 @@ mod tests {
         let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, Some("hunter2".into()), true);
         ca.set_now_unix(100);
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
         assert!(matches!(
             ca.submit_csr(&mac, &ed, &x, "").unwrap(),
             CsrOutcome::Rejected(_)
@@ -4736,7 +4981,7 @@ mod tests {
     fn a_new_cert_ttl_applies_to_the_next_issued_cert() {
         let mut ca = open_ca();
         let (ed, x) = node_keys(2);
-        let mac = [0, 0, 0, 0, 0, 9];
+        let mac = node_mac(2);
 
         ca.set_enrollment_policy(&EnrollmentPolicyData {
             cert_ttl_secs: Some(50_000),

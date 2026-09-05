@@ -87,11 +87,12 @@ pub enum AuthCommand {
 /// Flattened into both, the docs exist once and cannot disagree.
 #[derive(clap::Args, Debug)]
 pub struct EnrollArgs {
-    /// This node's MAC, bound into the issued certificate. Defaults to the
-    /// MAC deterministically derived from the enrolling keypair (the same
-    /// derivation `wayfinder-tap` applies at startup), so the enrolled
-    /// cert matches the MAC the node will actually run under; pass this to
-    /// override that default.
+    /// This node's MAC, bound into the issued certificate. A certificate's MAC
+    /// *is* the address its identity key derives (the same derivation
+    /// `wayfinder-tap` applies at startup), so this is a cross-check on the
+    /// keypair being enrolled rather than an override: naming any other address
+    /// is refused, because the provider would refuse it and no node would
+    /// honour the result. Leave it out unless you want the check.
     #[arg(long)]
     pub mac: Option<String>,
     /// Enrollment token, if the provider requires one.
@@ -198,10 +199,25 @@ pub async fn run(
                 seed
             };
             let kp = Keypair::from_seed(&seed);
-            let mac_bytes = match &mac {
-                Some(mac) => parse_mac6(mac)?,
-                None => kp.derived_mac().0,
-            };
+            // A cross-check, not an override — see the `--mac` doc. Caught here
+            // rather than left to the provider so the operator is told which
+            // half is wrong (usually a reused `--out-seed` from another node)
+            // instead of reading a rejection about an address they did not
+            // realise they had changed.
+            let derived = kp.derived_mac();
+            if let Some(spelled) = &mac {
+                let named = parse_mac6(spelled)?;
+                if named != derived.0 {
+                    anyhow::bail!(
+                        "--mac {} is not the address this identity derives ({}); a \
+                         certificate's MAC must be the address its key derives, so \
+                         either drop --mac or check --out-seed names the right identity",
+                        output::format_mac(&named),
+                        output::format_mac(&derived.0),
+                    );
+                }
+            }
+            let mac_bytes = derived.0;
             let issued = poll_enroll(client, &mac_bytes, &kp, &token).await?;
             // The seed is already on disk (reused from `out_seed`, or written
             // above before polling), so it needs no second write here.
