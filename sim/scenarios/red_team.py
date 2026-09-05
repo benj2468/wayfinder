@@ -2693,9 +2693,10 @@ def attack_ogm_seqno_highwater_jam() -> Finding:
     that member emits afterwards is discarded as stale — a keyless outsider
     denies a present member's route without ever forging a signature.
 
-    The engine tracks one `last_seqno` per originator and treats an OGM as
-    fresh only when `incoming_seqno >= last_seqno` (engine.rs) — a strict,
+    The engine used to track one `last_seqno` per originator and treat an OGM
+    as fresh only when `incoming_seqno >= last_seqno` (engine.rs) — a strict,
     persistent high-water with no wraparound handling and no reordering window.
+    That is the state this attack was built against.
     The OGM signature covers `orig + seqno + cert` (auth.rs `signed_message`),
     so seqno cannot be *forged* to an arbitrary value... but it need not be:
     the attacker replays a real, higher seqno she captured earlier (from before
@@ -2704,10 +2705,22 @@ def attack_ogm_seqno_highwater_jam() -> Finding:
     persisted, so a rebooted `hq` re-emits low seqnos that now sit *below* the
     replayed high-water.
 
-    Should fail because the routing table must keep learning a live member's
-    current topology. If it does not, an outsider gets a silent, targeted route
-    denial on any member whose OGMs she once recorded — one forged frame, no
-    credential.
+    It must fail because the high-water no longer decides whether a path is
+    learned — only whether the OGM carrying it is re-flooded
+    (`docs/design/09-mesh-auth-gaps.md` §8.11). A value any repeatable frame can
+    write must not be able to deny a *proven* neighbour its route; path
+    freshness lives per-path in `NeighborStats`, and next-hop liveness is the
+    challenge's job.
+
+    Note what this scenario does *not* cover: the high-water stays pinned for
+    its whole length, because 25 s is shorter than `OGM_SEQNO_RESET_PROTECTION`
+    and the resync never comes due. (Eve's refreshes cannot hold the correction
+    off — they carry the number she already pinned, so they classify as
+    duplicates and never touch the watch, whose `since` is deliberately not
+    refreshed by a continuing run.) So this measures the decoupling and nothing
+    else; the correction is pinned by unit tests in `libs/batman/src/engine.rs`
+    instead, where a virtual clock makes it deterministic. That split is the
+    point: the route must survive a pin that is *never* corrected.
 
     Construction: `hq` is given a slow initial Trickle so its first genuine OGM
     is not emitted until ~3 s, and the attacker pins the high-water during the
@@ -2763,6 +2776,21 @@ def attack_ogm_seqno_highwater_jam() -> Finding:
     # The gap: hq is genuinely adjacent and present (control acquires a route),
     # yet the attack denies acquisition while pinning last_seqno at the replayed
     # value so hq's genuine current OGMs are all discarded as stale.
+    #
+    # The pin has to be confirmed, not assumed. Without this the measurement
+    # reports HELD whenever the pin fails to land at all — a shifted Trickle
+    # cadence, a different captured seqno, a replay that lands outside
+    # `OGM_SEQNO_WINDOW` against an already-seeded record — turning "no jam
+    # observed" into "no jam possible", which is the wrong-reason pass this
+    # whole file exists to avoid.
+    if seq_attack != replayed:
+        return Finding(
+            "OGM seqno high-water jam (stale replay denies route acquisition)",
+            GAP,
+            f"inconclusive: the replayed seqno {replayed} never became victim's "
+            f"high-water (it reads {seq_attack}), so this run proves nothing "
+            f"either way — fix the scenario before trusting the verdict",
+        )
     jammed = routed_clean and not routed_attack
     return Finding(
         "OGM seqno high-water jam (stale replay denies route acquisition)",

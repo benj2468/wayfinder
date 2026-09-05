@@ -4,9 +4,10 @@
 `implemented/` until the last gap below closes. Each gap is a separate,
 independently landable change; this document exists so they can be taken one at
 a time without re-deriving the analysis. Gaps 1, 2, 3 and **4** have shipped, as
-have §7's observability and the three later findings logged in §8.7–§8.9. Two
-gaps found by the 2026-08 sweep (§8.10, §8.11) remain open and unscheduled. The
-instrument that found them all shipped in MR !113 (`sim/scenarios/red_team.py`).
+have §7's observability, the three later findings logged in §8.7–§8.9, and
+§8.11. One gap found by the 2026-08 sweep (§8.10) remains open and unscheduled.
+The instrument that found them all shipped in MR !113
+(`sim/scenarios/red_team.py`).
 
 > **§4 supersedes part of §2 and §3.** A second round of measurement showed
 > gaps 1 and 2 to be one bug, and neither section's proposed fix closes it.
@@ -17,13 +18,12 @@ instrument that found them all shipped in MR !113 (`sim/scenarios/red_team.py`).
 > did not predict; the fourth is the proof-starvation scare, which was a
 > mismeasurement rather than a gap.
 
-**Where the red team stands.** It runs 46 attacks and reports **41 held, 3 by
-design, 2 gaps**. The two gaps are the open work this document tracks:
+**Where the red team stands.** It runs 46 attacks and reports **42 held, 3 by
+design, 1 gap**. That gap is the open work this document tracks:
 
 | Attack | Section | What it is |
 |--------|---------|------------|
 | `attack_proof_survives_key_eviction_window` | §8.10 | the engine's `proven` table is not swept when a neighbor's key is evicted |
-| `attack_ogm_seqno_highwater_jam` | §8.11 | a replayed high seqno pins an originator's high-water and denies route acquisition |
 
 `sim/tests/test_red_team.py`'s `BASELINE` is the authority on that count; this
 table follows it. A fix flips the verdict in `red_team.py`, in `BASELINE`, and
@@ -308,10 +308,10 @@ Measured, deterministically, on a victim whose route is live and converged:
 Three consequences that contradict what §2 and §3 assume:
 
 1. **Replay is not confined to a receiver with no prior state.** The engine
-   accepts `incoming_seqno >= record.last_seqno` (`libs/batman/src/engine.rs:925`
-   — equal, not just greater, so a same-seqno copy via a second neighbour
-   registers as an alternate path; that is how a redundant mesh learns its
-   backup route). An attacker therefore never needs to advance the seqno she
+   accepts a same-seqno copy as well as a newer one
+   (`libs/batman/src/engine.rs`, `handle_ogm`'s seqno banding — equal, not just
+   greater, so a same-seqno copy via a second neighbour registers as an
+   alternate path; that is how a redundant mesh learns its backup route). An attacker therefore never needs to advance the seqno she
    cannot sign — she replays the *current* one, heard for free off the same
    flood.
 2. **She needs no field manipulation at all.** The `verbatim` parametrisation
@@ -1260,10 +1260,11 @@ so it needs a test that holds both.
 
 ---
 
-## 8.11 A replayed OGM pins an originator's seqno high-water — **open**
+## 8.11 A replayed OGM pins an originator's seqno high-water — **fixed**
 
 Found by the 2026-08 OGM-semantics sweep. The OGM-path twin of §8.6's `Bcast`
-high-water blackhole, which was fixed; this path got no equivalent.
+high-water blackhole, which was fixed first; this path now shares its
+machinery.
 
 ### What happens
 
@@ -1274,7 +1275,7 @@ things follow, and only the first is intended:
 - The forged path "hq via eve" never becomes a usable route. Eve holds no
   credential and cannot answer a next-hop challenge, so §4's fix holds exactly
   as designed.
-- The victim's `OgmRecord` for **hq** — keyed on the originator inside the OGM,
+- The victim's `OriginatorRecord` for **hq** — keyed on the originator inside the OGM,
   not on the forwarder — takes the replayed sequence number as its high-water
   anyway. Every genuine OGM hq subsequently emits sits *below* it and is
   discarded as stale, so the victim never acquires a route to a genuinely
@@ -1290,37 +1291,174 @@ path is wrong. The OGM really is hq's and really does verify against hq's key.
 bookkeeping runs on the first claim — correctly, since that is the claim the
 originator actually signed. The attack spends a true statement, replayed.
 
-### Direction
+### Why refusing the frame outright was not the fix
 
-Two candidates, and §8.6's hard-won lesson applies to both: **no check on the
-frame can help**, because every field the frame is judged on is one a genuine
-originator wrote.
+The first instinct here is to admit nothing at all from a neighbour that has not
+proven itself. It does not survive contact with §4's own measurement.
 
-- **An `admit`-shaped resync on `OgmRecord`**, mirroring
-  `BroadcastSeqnoEntry::admit`: treat a run of sequence numbers that do not
-  advance the high-water as evidence against the *high-water*, and resynchronise
-  to the number that opened the run. Needs no clock, so it works on an unclocked
-  embedded node. Both details §8.6 records as load-bearing — a narrow "behind"
-  band, and restoring the number that *opened* the run rather than the one that
-  trips the deadline — carry over unchanged, and both are places the `Bcast`
-  attempt went wrong first.
-- **§2's time bucket** (sequencing item 5), which bounds replay of a stale OGM
-  at a fresh receiver. This is precisely the case it was designed for, and is
-  the strongest argument yet for landing it. It does not remove the need for the
-  first candidate on a node with no wall clock.
+`verify_ogm` (`libs/wayfinder/src/auth.rs`) takes the payload and nothing else;
+the signature covers `orig ‖ seqno ‖ cert`. **`frame.src` is not an input to any
+check**, which is exactly what §4 established, and the attack it measured is
+Eve replaying *under hq's spoofed link-layer source*. In §8.11's scenario hq is
+genuinely adjacent and proven — the control run acquires a route through it —
+so `proof_current(frame.src)` reads true for a replay carrying `src = hq`. The
+gate costs one challenge round-trip at cold start and the attacker's answer is a
+one-line change to the injection.
 
-Ruled out without measurement: refusing to advance the high-water from an OGM
-arriving via an unproven next hop. A legitimate neighbor is unproven during
-ordinary acquisition, so that gate would refuse exactly the OGMs a cold node
-needs.
+The reason recorded above ("a legitimate neighbour is unproven during ordinary
+acquisition") is the weaker of the two objections and was not quite right:
+recording a path and advancing a high-water are separable, so the bootstrap
+deadlock is avoidable. The spoofing bypass is the one that rules the gate out,
+and it is §8.6's lesson again — no check on a frame field helps when the
+attacker writes that field.
+
+What the instinct *is* right about is the shape of the defect: a value any
+frame can write was deciding whether a **proven** neighbour's path got learned
+at all. The fix follows from taking that seriously — narrow what the value
+governs, rather than trying to trust who wrote it.
+
+### The fix — shipped 2026-09-05
+
+Two changes. The first closes the measured attack; the second bounds what it
+could still do to nodes behind the victim.
+
+**1. The high-water governs re-flooding and content freshness — not path
+learning.** `handle_ogm` used two comparisons against one field —
+`incoming_seqno > record.last_seqno` for re-flooding and `>=` for everything
+else — to answer three unrelated questions: may this OGM be re-flooded, may this
+node learn the path it arrived on, and may its advertised multicast memberships
+be believed. Only the first two are the high-water's business. Loop protection needs a per-originator high-water;
+*path learning* needs nothing of the sort, because a path's own freshness
+already lives in `NeighborStats::last_seqno`, and its liveness is the next-hop
+challenge's job — which §4 settled, and which the seqno never could do
+("possession of a public authenticator over static content proves nothing about
+the possessor"). Membership stays gated on freshness, because that is content
+the originator asserts rather than an observation this node made: a replayed old
+OGM must not be able to revert a live member's groups.
+
+So a jammed high-water now costs re-flooding, plus the memberships that
+originator's OGMs assert — content it claims, rather than anything this node
+observed. The victim learns the path, challenges the neighbour, and routes.
+
+**2. An `admit`-shaped resync, shared with the broadcast table.** The
+three-arm decision §8's sequencing item 6 arrived at is now one implementation
+— `SeqnoBands` + `admit_seqno` in `libs/batman/src/lib.rs` — parameterised by
+band widths, with `BroadcastSeqnoEntry::admit` delegating to it and
+`OriginatorRecord` carrying its own `resync_watch`. Both of that item's
+load-bearing details carry over untouched: the run must *persist* before it is
+believed, and the high-water resynchronises to the number that **opened** the
+run rather than to whichever frame trips the deadline. Writing it twice was the
+obvious way for the two copies to drift, and the second copy is the one nobody
+would have re-derived the reasoning for.
+
+**Why this half is load-bearing, and why the obvious argument for it is wrong.**
+The tempting justification — "it bounds how long an attacker can suppress
+re-flooding" — is weak on its own, and the red-team scenario does not support
+it: that run is 25 s against a 30 s reset protection, so the correction never
+comes due and `HELD` there measures the decoupling alone. (Nor can a fast
+attacker hold the correction off; her refreshes carry the number she already
+pinned, so they read as duplicates and never touch the watch, whose `since` is
+deliberately not refreshed by a continuing run.)
+
+The real argument is a **regression the decoupling would otherwise introduce**,
+with no attacker in it at all. Before it, an originator that restarted its
+counter — a reboot, or a `u32` wrap — had its OGMs refused outright, so
+`NeighborStats::last_heard` was never refreshed, its paths aged out, and
+`purge_stale` dropped the record; the next OGM then re-seeded a correct
+high-water. **Eviction was the self-healing path.** Decoupling deliberately
+refreshes those paths, which removes it: without the resync a restarted
+originator's high-water would stand forever, and every relay in the mesh would
+stop forwarding that member's OGMs permanently while the route to it looked
+healthy one hop away. The two halves are not independent — the first needs the
+second to stay safe.
+
+Pinned by `a_restarted_originator_is_reflooded_again_within_the_reset_protection`,
+which asserts the record survives `purge_stale` precisely to show the old
+recovery is gone.
+
+### Implementation notes — what the build surfaced
+
+**1. The broadcast reorder tolerance could not be inherited.** At
+`BROADCAST_SEQNO_REORDER_TOLERANCE = 64`, a rebooted hq re-emitting from 1
+against a high-water pinned at 56 sits *inside* the band — every one of its OGMs
+would read as an ordinary duplicate, no run would ever be watched, and the
+correction would never fire. The band is the line between disbelieving the
+*frame* and disbelieving the *high-water*, so it has to be sized to the space it
+judges: OGM reordering is bounded by hop-by-hop re-flooding under a draining
+TTL, which spreads a flood's copies across a few sequence numbers rather than
+tens. `OGM_SEQNO_REORDER_TOLERANCE` is 16.
+
+**2. A first sighting has to seed the high-water, not be judged against zero.**
+With `OGM_SEQNO_WINDOW` narrower than the broadcast one (256), any originator
+already past that when first heard would read as out of band *on contact* — no
+re-flood for a reset-protection interval, on every cold join to a running mesh.
+`BroadcastSeqnoEntry::seeded` had already met this and answered it; the OGM path
+now seeds identically, and is safe for the same reason rather than in spite of
+it — a wrong seed is corrected by the originator's own next OGMs.
+
+**3. The narrow window is the first line, not a redundant one.** It is tempting
+to widen it on the grounds that the resync corrects a wrong high-water anyway.
+It should not be: a far-ahead replay landing *outside* the window is refused
+outright and never pins anything, where one inside the window is accepted and
+costs a reset-protection interval to undo. The resync is the fallback for the
+case the window cannot see — a replay close enough to be plausible, or a
+first sighting that had nothing to judge against.
+
+**4. The record's eviction stamp had to keep the rule its broadcast twin
+states.** `BroadcastSeqnoEntry::last_updated` is documented as deliberately not
+refreshed by a non-advancing frame, "so an attacker's stream of non-advancing
+frames must not be able to pin a poisoned entry at the top of the eviction
+order". The first cut of the decoupling refreshed `OriginatorRecord::last_heard`
+on every frame it learned from, quietly dropping that rule for the originator
+table. It is restored — and it is the *useful* direction as well as the safe
+one, because a jammed record that sorts old and gets evicted has its high-water
+reseeded, which cures the jam outright. Path liveness is unaffected: routing
+reads `NeighborStats::last_heard`, which is refreshed regardless.
+
+**5. Two integration tests were injecting sequence numbers no live originator
+could have emitted.** `cert_fetch_round_trip_resolves_via_seeded_first_hop` and
+`cert_fetch_round_trip_with_real_responder` (`libs/wayfinder-test`) hand-built
+OGMs at seqno 1000/2000 as a shorthand for "unambiguously the newest", against
+a relay whose high-water for that node was in single digits. They now derive the
+number from the relay's own table. Worth recording because the failure is the
+honest kind: the tests were relying on a leap being accepted, which is precisely
+what stopped being true.
+
+### Deliberately not done here
+
+- **No counter for a resync firing, or for re-flood suppressed under a
+  correction.** Both are things §7's argument says an operator should be able to
+  see — a node concluding its own record was wrong is exactly the kind of event
+  a metric exists for — and neither is observable today beyond a `trace!`. It is
+  a separable change (`add-metric`'s proto → adapter → client → TUI path) rather
+  than part of this one, and it should cover the broadcast space too, which has
+  been equally silent since §8's item 6.
+- **`SeqnoBands` and `admit_seqno` are crate-private rather than wrapped in a
+  per-space gate type.** A `OgmSeqnoGate`/`BroadcastSeqnoEntry` pair owning the
+  `(high-water, watch)` couple would make "judged by the wrong bands" a compile
+  error instead of a convention. Keeping the two callers in one crate and the
+  machinery private buys most of that for none of the churn across the
+  management-API projection and the Python bindings; the wrapper is the right
+  move if a third space ever appears.
 
 ### Reproduced by
 
-`red_team.py::attack_ogm_seqno_highwater_jam`, currently `GAP` in
-`sim/tests/test_red_team.py`'s `BASELINE`. The measurement runs with and without
-the attacker, so an empty route table reads as *denied* rather than
-*never-converged* — the same control the §8.7 unit tests use and the same hazard
-the root `CLAUDE.md` records for benchmark fixtures.
+`red_team.py::attack_ogm_seqno_highwater_jam`, which flips `GAP` → `HELD`, with
+its `BASELINE` entry in `sim/tests/test_red_team.py`. Unit-level coverage in
+`libs/batman/src/engine.rs`:
+`a_replayed_high_seqno_does_not_deny_a_live_originator_a_route` pins the
+decoupling and `a_pinned_ogm_high_water_resynchronises_to_the_run_that_opened`
+pins the correction, alongside the band edges, the `u32` wrap, a third party
+attempting to cash in an honest run, the membership freshness gate, the eviction
+stamp, and the restart recovery above. Note which of those the simulator can and
+cannot reach: the scenario runs shorter than `OGM_SEQNO_RESET_PROTECTION`, so it
+measures the decoupling only, and it now refuses to report `HELD` unless the pin
+it depends on actually landed. The correction is pinned on a virtual clock
+instead, where it is deterministic. The measurement runs with and without the attacker, so an
+empty route table reads as *denied* rather than *never-converged* — the same
+control the §8.7 unit tests use and the same hazard the root `CLAUDE.md` records
+for benchmark fixtures.
+
 
 ---
 
@@ -1350,4 +1488,6 @@ the root `CLAUDE.md` records for benchmark fixtures.
 | `sim/tests/test_red_team.py` | all | `BASELINE` flips with the verdicts it pins |
 | `libs/wayfinder-driver-core/src/lib.rs` | §8.7 | `required_proof` (named `requires_pairwise_tag` when §8.7 was written; replaced `is_cert_control`), applied by both `strip_directed` and `tag_directed_into` — done |
 | `libs/wayfinder/src/auth.rs`, `libs/batman/src/engine.rs` | §8.10 | sweep the engine's `proven` table when `evict_expired_neighbors` drops a key |
-| `libs/batman/src/lib.rs`, `libs/batman/src/engine.rs` | §8.11 | an `admit`-shaped resync on `OgmRecord`'s seqno high-water, mirroring `BroadcastSeqnoEntry::admit` |
+| `libs/batman/src/lib.rs` | §8.11 | `SeqnoBands`/`admit_seqno` (the shared three-arm decision, `BroadcastSeqnoEntry::admit` delegating to it), the `OGM_SEQNO_*` bands, `OriginatorRecord::resync_watch` — done |
+| `libs/batman/src/engine.rs` | §8.11 | `handle_ogm`: the high-water gates re-flooding and membership freshness; path learning and selection are judged separately; a first sighting seeds — done |
+| `libs/wayfinder-test/src/integration_tests.rs` | §8.11 | the two `cert_fetch_round_trip_*` tests derive their injected seqno from the relay's high-water — done |

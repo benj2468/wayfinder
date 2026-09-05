@@ -2530,6 +2530,23 @@ fn to_lazy_ogm(buf: &[u8], hdr_len: usize) -> Vec<u8> {
     out
 }
 
+/// A sequence number the relay X will read as genuinely A's next one: just past
+/// the high-water X already holds for A.
+///
+/// A far-ahead literal would land outside [`batman::OGM_SEQNO_WINDOW`] and be
+/// treated as evidence against the *high-water* rather than as a fresh OGM, so
+/// X would not re-flood it — see `docs/design/09-mesh-auth-gaps.md` §8.11 for
+/// why a leap a live originator could not have made is refused.
+fn next_seqno_after_relay(harness: &TestHarness, relay: &str, orig: Mac) -> u32 {
+    harness
+        .get_machine(relay)
+        .router()
+        .originator_table()
+        .find(|r| r.neighbor_ident == orig)
+        .map_or(0, |r| r.last_seqno)
+        + 1
+}
+
 /// The requester-side round trip end to end, over a real multi-hop mesh
 /// (machine1 = A, machine2 = X the relay, machine3 = B the requester): B has
 /// no route to A (per design doc §3.2), hears a fingerprint-only OGM
@@ -2616,7 +2633,7 @@ fn cert_fetch_round_trip_resolves_via_seeded_first_hop() {
         version: BATMAN_VERSION,
         ttl: 50,
         flags: 0,
-        seqno: 1000u32.to_be(),
+        seqno: next_seqno_after_relay(&harness, "machine2", m1).to_be(),
         orig: m1,
         reserved: 0,
         tq: 255,
@@ -2694,7 +2711,7 @@ fn cert_fetch_round_trip_resolves_via_seeded_first_hop() {
     // second CertReq is sent.
     let mut ogm_buf2 = vec![0u8; 512];
     let ogm2 = BatmanOgmPacket {
-        seqno: 1001u32.to_be(),
+        seqno: next_seqno_after_relay(&harness, "machine2", m1).to_be(),
         ..ogm
     };
     ogm_buf2[..ogm_hdr_len].copy_from_slice(ogm2.as_bytes());
@@ -2800,7 +2817,7 @@ fn cert_fetch_round_trip_with_real_responder() {
         version: BATMAN_VERSION,
         ttl: 50,
         flags: 0,
-        seqno: 2000u32.to_be(),
+        seqno: next_seqno_after_relay(&harness, "machine2", m1).to_be(),
         orig: m1,
         reserved: 0,
         tq: 255,

@@ -163,21 +163,70 @@ pub const BROADCAST_SEQNO_REORDER_TOLERANCE: u32 = 64;
 /// In the spirit of batman-adv's `BATADV_RESET_PROTECTION_MS`.
 pub const BROADCAST_SEQNO_RESET_PROTECTION: Duration = Duration::from_secs(30);
 
-// Both bands are compared as `i32` distances, so neither may reach the point
-// where that cast changes their sign.
+/// How far ahead of an originator's OGM high-water a sequence number may leap
+/// and still be accepted immediately as genuinely newer.
+///
+/// Narrower than [`BROADCAST_SEQNO_WINDOW`] because the two spaces are refilled
+/// at different rates: a node emits an OGM on a Trickle interval measured in
+/// seconds, so this many missed OGMs is already a long absence, while a
+/// broadcast counter advances with application traffic. The asymmetry that
+/// governs the size is the same one — too small costs a bounded delay on a rare
+/// event, too large lets a replayed number be taken as current and re-flooded.
+pub const OGM_SEQNO_WINDOW: u32 = 256;
+
+/// How far *behind* an originator's OGM high-water a sequence number may sit
+/// and still be judged a stale copy of something already seen, rather than
+/// evidence that the high-water itself is wrong.
+///
+/// This is the line between disbelieving the *frame* and disbelieving the
+/// *high-water*, and it is set much tighter than
+/// [`BROADCAST_SEQNO_REORDER_TOLERANCE`] because OGM reordering is bounded by
+/// something broadcast reordering is not: an OGM is re-flooded hop by hop under
+/// a draining TTL, so a delayed copy arrives at most a few OGM intervals — and
+/// therefore a few sequence numbers — behind the high-water, not tens.
+///
+/// Sizing it wide would be the quiet way to reintroduce the jam this banding
+/// exists to close (`docs/design/09-mesh-auth-gaps.md` §8.11): a rebooted
+/// originator re-emitting from 1 against a high-water an attacker pinned at 56
+/// sits *inside* a tolerance of 64, so every one of its OGMs would read as an
+/// ordinary duplicate, no run would ever be watched, and the correction would
+/// never fire.
+pub const OGM_SEQNO_REORDER_TOLERANCE: u32 = 16;
+
+/// How long a run of OGM sequence numbers that do not advance an originator's
+/// high-water must persist before the record resynchronises to the run.
+///
+/// The same value and the same argument as
+/// [`BROADCAST_SEQNO_RESET_PROTECTION`] — a forgery is a one-shot while a
+/// genuinely out-of-step originator keeps transmitting, so the separation comes
+/// from time rather than from anything in the frame. Named separately because
+/// the two spaces are free to diverge: this one bounds how long a wrong
+/// high-water may suppress *re-flooding* of a member's OGMs, where the
+/// broadcast constant bounds suppression of its payloads.
+pub const OGM_SEQNO_RESET_PROTECTION: Duration = Duration::from_secs(30);
+
+// Every band is compared as an `i32` distance, so none may reach the point
+// where that cast changes its sign.
 const _: () = assert!(BROADCAST_SEQNO_WINDOW < i32::MAX as u32);
 const _: () = assert!(BROADCAST_SEQNO_REORDER_TOLERANCE < i32::MAX as u32);
+const _: () = assert!(OGM_SEQNO_WINDOW < i32::MAX as u32);
+const _: () = assert!(OGM_SEQNO_REORDER_TOLERANCE < i32::MAX as u32);
 
-/// What an incoming broadcast sequence number means relative to an originator's
-/// recorded high-water. The three arms partition the whole 32-bit space; see
-/// [`BroadcastSeqnoEntry::admit`].
+/// What an incoming sequence number means relative to a recorded high-water,
+/// under one set of [`SeqnoBands`]. The three arms partition the whole 32-bit
+/// space; see [`admit_seqno`], which is the single implementation both
+/// sequence-number spaces are judged by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeqnoVerdict {
-    /// Plausibly the next thing this originator sent: within
-    /// [`BROADCAST_SEQNO_WINDOW`] ahead of the high-water.
+    /// Plausibly the next thing this originator sent: within the bands'
+    /// window ahead of the high-water ([`BROADCAST_SEQNO_WINDOW`] for a flooded
+    /// broadcast, the narrower [`OGM_SEQNO_WINDOW`] for an OGM).
     Advance,
     /// A copy of something already seen, reaching us by another path: at or
-    /// within [`BROADCAST_SEQNO_REORDER_TOLERANCE`] behind the high-water.
+    /// within the bands' reorder tolerance behind the high-water
+    /// ([`BROADCAST_SEQNO_REORDER_TOLERANCE`], or the much tighter
+    /// [`OGM_SEQNO_REORDER_TOLERANCE`] — the difference is load-bearing, see
+    /// that constant).
     Duplicate,
     /// Neither — a leap too far forward, or far enough behind that the
     /// high-water, rather than the frame, is what looks wrong.
@@ -186,14 +235,14 @@ pub enum SeqnoVerdict {
 
 /// An in-progress run of [`SeqnoVerdict::Implausible`] sequence numbers from one
 /// originator, and the evidence needed to act on it once it has persisted for
-/// [`BROADCAST_SEQNO_RESET_PROTECTION`].
+/// the bands' reset protection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SeqnoResyncWatch {
     /// When the run began. Not refreshed by later frames in the same run — the
     /// run has to *persist*, and refreshing it would let an attacker hold the
     /// correction off indefinitely by continuing to send.
     pub since: Duration,
-    /// The sequence number that started the run, and the value the entry
+    /// The sequence number that started the run, and the value the high-water
     /// resynchronises to when it completes. Deliberately not the value carried
     /// by the frame that trips the deadline: an attacker must not be able to
     /// substitute its own number for the one an honest originator's run is
@@ -226,6 +275,218 @@ pub struct BroadcastSeqnoEntry {
     pub resync_watch: Option<SeqnoResyncWatch>,
 }
 
+/// The band widths and dwell time one sequence-number space is judged by.
+///
+/// Two spaces need the same three-arm decision on different numbers — flooded
+/// broadcasts ([`BROADCAST`](Self::BROADCAST)) and OGMs ([`OGM`](Self::OGM)) —
+/// and the decision, not the numbers, is the part that was hard to get right.
+/// Parameterising it keeps [`admit_seqno`] the single implementation of the
+/// poisoning defence rather than two copies free to drift apart.
+///
+/// Deliberately crate-private, with only the two values that exist reachable as
+/// associated constants: judging one space by the other's bands compiles fine
+/// and is exactly the mistake [`OGM_SEQNO_REORDER_TOLERANCE`] documents as
+/// fatal, so no caller is given the chance to make it. The widths themselves
+/// stay public as plain constants for tests and prose to name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SeqnoBands {
+    /// How far ahead of the high-water a number may leap and still be taken as
+    /// genuinely newer. Held pre-cast so the comparison never casts.
+    window: i32,
+    /// How far behind the high-water a number may sit and still be read as a
+    /// stale copy rather than as evidence against the high-water.
+    reorder_tolerance: i32,
+    /// How long a run of non-advancing numbers must persist before the
+    /// high-water resynchronises to it.
+    reset_protection: Duration,
+}
+
+impl SeqnoBands {
+    /// Build a band set, rejecting a width that would change sign under the
+    /// `i32` comparison in [`classify`](Self::classify).
+    ///
+    /// Both associated constants below are `const`, so these assertions are
+    /// evaluated at compile time exactly as a `const _: () = assert!(..)` would
+    /// be — but they cover *every* band set rather than only the two spelled
+    /// out here. The hazard is worth an assertion rather than a comment: a
+    /// width past `i32::MAX` casts to a negative number, and the failure is
+    /// silent in the direction that matters — every frame would classify as
+    /// `Duplicate` or `Implausible`, which is the dedup table failing into a
+    /// route denial.
+    const fn new(window: u32, reorder_tolerance: u32, reset_protection: Duration) -> Self {
+        assert!(
+            window < i32::MAX as u32,
+            "seqno window must survive the i32 comparison"
+        );
+        assert!(
+            reorder_tolerance < i32::MAX as u32,
+            "seqno reorder tolerance must survive negation in the i32 comparison"
+        );
+        Self {
+            window: window as i32,
+            reorder_tolerance: reorder_tolerance as i32,
+            reset_protection,
+        }
+    }
+
+    /// The bands a flooded broadcast's dedup high-water is judged by.
+    pub(crate) const BROADCAST: Self = Self::new(
+        BROADCAST_SEQNO_WINDOW,
+        BROADCAST_SEQNO_REORDER_TOLERANCE,
+        BROADCAST_SEQNO_RESET_PROTECTION,
+    );
+
+    /// The bands an originator's OGM high-water is judged by.
+    pub(crate) const OGM: Self = Self::new(
+        OGM_SEQNO_WINDOW,
+        OGM_SEQNO_REORDER_TOLERANCE,
+        OGM_SEQNO_RESET_PROTECTION,
+    );
+
+    /// Classify `seqno` against `high_water` under these bands.
+    ///
+    /// The comparison is a wrapping `i32` distance, so it is direction-aware
+    /// across the `u32` wrap: a counter stepping from `u32::MAX` to `0` reads as
+    /// one ahead, not four billion behind.
+    pub(crate) fn classify(&self, high_water: u32, seqno: u32) -> SeqnoVerdict {
+        let ahead_by = seqno.wrapping_sub(high_water) as i32;
+        if ahead_by > 0 && ahead_by <= self.window {
+            SeqnoVerdict::Advance
+        } else if ahead_by <= 0 && ahead_by >= -self.reorder_tolerance {
+            SeqnoVerdict::Duplicate
+        } else {
+            SeqnoVerdict::Implausible
+        }
+    }
+}
+
+/// What [`admit_seqno`] did with a sequence number.
+///
+/// A sum rather than a verdict plus flags, because the combinations that do not
+/// occur must not be representable: a caller that could build "a duplicate that
+/// wrote the high-water" would be describing a state this machine never enters.
+/// Each variant also carries exactly what a caller needs to act without
+/// re-deriving the classification for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeqnoAdmission {
+    /// The high-water advanced to this number: genuinely newer than anything
+    /// seen from this originator.
+    Advanced,
+    /// At or behind the high-water, near enough that a stale copy of something
+    /// already seen is the likelier explanation than a wrong high-water.
+    /// Nothing was written.
+    Duplicate {
+        /// True when the number *is* the high-water — the same flood reaching
+        /// us by a second neighbor, which is how a redundant mesh learns its
+        /// backup path, and whose contents are still current. False when it
+        /// sits behind: a straggler, and the frame is what to disbelieve.
+        exact: bool,
+    },
+    /// Out of band against the high-water, with a resync watch now open or
+    /// continuing. Nothing was written — the run has not yet persisted long
+    /// enough to be believed over the high-water it contradicts.
+    Watching,
+    /// The watch completed: the high-water was rewound to the number that
+    /// *opened* the run — never to whichever frame tripped the deadline, or a
+    /// third party could substitute its own number for the one an honest
+    /// originator earned — and this frame was then judged afresh against it.
+    Resynchronised {
+        /// That second judgement. `Advance` means the high-water moved on to
+        /// this frame's number after the rewind.
+        verdict: SeqnoVerdict,
+    },
+}
+
+impl SeqnoAdmission {
+    /// Whether the high-water now holds this frame's number.
+    pub(crate) fn advanced(&self) -> bool {
+        matches!(
+            self,
+            Self::Advanced
+                | Self::Resynchronised {
+                    verdict: SeqnoVerdict::Advance
+                }
+        )
+    }
+
+    /// Whether the high-water was written at all — by an advance, or by a
+    /// resynchronisation, whether or not the frame that tripped it was then
+    /// admitted. Callers keeping an eviction stamp beside the high-water use
+    /// this to decide whether to restamp it.
+    pub(crate) fn high_water_written(&self) -> bool {
+        matches!(self, Self::Advanced | Self::Resynchronised { .. })
+    }
+
+    /// Whether the state this frame *asserts* — as opposed to what its arrival
+    /// merely observes — may be believed: it is either the newest thing this
+    /// originator has sent or an exact copy of it. False for a straggler and
+    /// for anything judged against a high-water still under correction.
+    pub(crate) fn contents_are_current(&self) -> bool {
+        self.advanced() || matches!(self, Self::Duplicate { exact: true })
+    }
+
+    /// Whether this frame is a stale copy of something already seen, and so
+    /// carries no evidence about the topology worth acting on.
+    pub(crate) fn is_stale_copy(&self) -> bool {
+        matches!(self, Self::Duplicate { exact: false })
+    }
+}
+
+/// Fold `seqno` into a high-water and its resync watch, and report what was
+/// done. The single implementation of the seqno-poisoning defence, shared by
+/// every space that keeps one (see [`SeqnoBands`]).
+///
+/// - an [`Advance`](SeqnoVerdict::Advance) moves the high-water and clears any
+///   watch, because a high-water tracking real forward progress is not one that
+///   needs correcting;
+/// - a [`Duplicate`](SeqnoVerdict::Duplicate) changes nothing at all — the
+///   common case, and the one that must stay free;
+/// - an [`Implausible`](SeqnoVerdict::Implausible) opens (or continues) a
+///   [`SeqnoResyncWatch`], and once that run has persisted for the bands'
+///   `reset_protection` the high-water resynchronises to the number that
+///   *started* the run, after which the frame that tripped the deadline is
+///   judged afresh against the restored value and may itself advance it.
+///
+/// The third arm is what makes every wrong high-water self-correcting, whether
+/// it got there by an attacker's forgery, by a reseed after eviction, or by the
+/// originator rebooting — none of which this code can tell apart, and none of
+/// which it has to.
+pub(crate) fn admit_seqno(
+    last_seqno: &mut u32,
+    resync_watch: &mut Option<SeqnoResyncWatch>,
+    seqno: u32,
+    now: Duration,
+    bands: &SeqnoBands,
+) -> SeqnoAdmission {
+    match bands.classify(*last_seqno, seqno) {
+        SeqnoVerdict::Advance => {
+            *last_seqno = seqno;
+            *resync_watch = None;
+            SeqnoAdmission::Advanced
+        }
+        SeqnoVerdict::Duplicate => SeqnoAdmission::Duplicate {
+            exact: seqno == *last_seqno,
+        },
+        SeqnoVerdict::Implausible => {
+            let watch = *resync_watch.get_or_insert(SeqnoResyncWatch { since: now, seqno });
+            if now.saturating_sub(watch.since) < bands.reset_protection {
+                return SeqnoAdmission::Watching;
+            }
+            // The run has persisted. Restore the high-water to where the run
+            // started, then judge this frame afresh against it — so the frame
+            // that happens to trip the deadline is admitted only if it would
+            // have been admitted anyway.
+            *last_seqno = watch.seqno;
+            *resync_watch = None;
+            let verdict = bands.classify(*last_seqno, seqno);
+            if verdict == SeqnoVerdict::Advance {
+                *last_seqno = seqno;
+            }
+            SeqnoAdmission::Resynchronised { verdict }
+        }
+    }
+}
+
 impl BroadcastSeqnoEntry {
     /// Create an entry for an originator seen for the first time, taking its
     /// sequence number on trust.
@@ -245,73 +506,32 @@ impl BroadcastSeqnoEntry {
         }
     }
 
-    /// Classify `seqno` against this entry's high-water.
-    ///
-    /// The comparison is a wrapping `i32` distance, so it is direction-aware
-    /// across the `u32` wrap: a counter stepping from `u32::MAX` to `0` reads as
-    /// one ahead, not four billion behind.
+    /// Classify `seqno` against this entry's high-water, under
+    /// [`SeqnoBands::BROADCAST`].
     pub fn classify(&self, seqno: u32) -> SeqnoVerdict {
-        let ahead_by = seqno.wrapping_sub(self.last_seqno) as i32;
-        if ahead_by > 0 && ahead_by <= BROADCAST_SEQNO_WINDOW as i32 {
-            SeqnoVerdict::Advance
-        } else if ahead_by <= 0 && ahead_by >= -(BROADCAST_SEQNO_REORDER_TOLERANCE as i32) {
-            SeqnoVerdict::Duplicate
-        } else {
-            SeqnoVerdict::Implausible
-        }
+        SeqnoBands::BROADCAST.classify(self.last_seqno, seqno)
     }
 
     /// Fold `seqno` into this entry and report whether the frame carrying it
     /// should be flooded onward. `false` means drop it.
     ///
-    /// This is the only writer of the entry's invariants, and the whole of the
-    /// poisoning defence lives here:
-    ///
-    /// - an [`Advance`](SeqnoVerdict::Advance) moves the high-water and clears
-    ///   any watch, because a high-water tracking real forward progress is not
-    ///   one that needs correcting;
-    /// - a [`Duplicate`](SeqnoVerdict::Duplicate) changes nothing at all — the
-    ///   common case, and the one that must stay free;
-    /// - an [`Implausible`](SeqnoVerdict::Implausible) opens (or continues) a
-    ///   [`SeqnoResyncWatch`], and once that run has persisted for
-    ///   [`BROADCAST_SEQNO_RESET_PROTECTION`] the high-water resynchronises to
-    ///   the number that *started* the run.
-    ///
-    /// The third arm is what makes every wrong high-water self-correcting,
-    /// whether it got there by an attacker's forgery, by a reseed after
-    /// eviction, or by the originator rebooting — none of which this code can
-    /// tell apart, and none of which it has to.
+    /// The decision itself is [`admit_seqno`], shared with the OGM high-water;
+    /// what this adds is the eviction stamp, which is restamped whenever the
+    /// high-water is *written* and left alone otherwise — see
+    /// [`last_updated`](Self::last_updated) for why a non-advancing frame must
+    /// not be able to touch it.
     pub fn admit(&mut self, seqno: u32, now: Duration) -> bool {
-        match self.classify(seqno) {
-            SeqnoVerdict::Advance => {
-                self.last_seqno = seqno;
-                self.last_updated = now;
-                self.resync_watch = None;
-                true
-            }
-            SeqnoVerdict::Duplicate => false,
-            SeqnoVerdict::Implausible => {
-                let watch = *self
-                    .resync_watch
-                    .get_or_insert(SeqnoResyncWatch { since: now, seqno });
-                if now.saturating_sub(watch.since) < BROADCAST_SEQNO_RESET_PROTECTION {
-                    return false;
-                }
-                // The run has persisted. Restore the high-water to where the run
-                // started, then judge this frame afresh against it — so the
-                // frame that happens to trip the deadline is admitted only if it
-                // would have been admitted anyway.
-                self.last_seqno = watch.seqno;
-                self.last_updated = now;
-                self.resync_watch = None;
-                if matches!(self.classify(seqno), SeqnoVerdict::Advance) {
-                    self.last_seqno = seqno;
-                    true
-                } else {
-                    false
-                }
-            }
+        let admission = admit_seqno(
+            &mut self.last_seqno,
+            &mut self.resync_watch,
+            seqno,
+            now,
+            &SeqnoBands::BROADCAST,
+        );
+        if admission.high_water_written() {
+            self.last_updated = now;
         }
+        admission.advanced()
     }
 }
 
@@ -406,9 +626,23 @@ pub struct OriginatorRecord {
     /// alongside populated `paths` reads as "being challenged", not "dead
     /// link".
     pub max_tq: u8,
-    /// Sequence number of the most recent OGM accepted for this originator via
-    /// any path.
+    /// Highest OGM sequence number seen from this originator, compared under
+    /// [`SeqnoBands::OGM`] so the counter's wrap past `u32::MAX` reads as a
+    /// small step forward rather than a plunge backwards.
+    ///
+    /// Its job is re-flood dedup — this node forwards each
+    /// `(originator, seqno)` once — plus the freshness gate on the state an OGM
+    /// *asserts*, currently its multicast memberships. It deliberately does
+    /// **not** decide whether a path is learned or selected: it is keyed on the
+    /// originator named *inside* the OGM rather than on the forwarder, so anyone
+    /// able to repeat a member's signed OGM can write it, and a high-water that
+    /// also decided whether a path was learned would turn that into a targeted
+    /// route denial — see `docs/design/09-mesh-auth-gaps.md` §8.11.
     pub last_seqno: u32,
+    /// The run of OGM sequence numbers currently being watched as evidence
+    /// against [`last_seqno`](Self::last_seqno), or `None` if the last OGM from
+    /// this originator advanced it. See [`admit_seqno`].
+    pub resync_watch: Option<SeqnoResyncWatch>,
     // Track stats per neighbor routing path to this originator
     /// Up to four alternate paths to this originator via different neighbors,
     /// each with its own [`NeighborStats`]; the best-TQ entry backs the fields
