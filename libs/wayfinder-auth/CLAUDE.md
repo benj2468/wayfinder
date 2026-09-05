@@ -25,6 +25,27 @@ A node's mesh `Mac` is *derived from its key*, not assigned by the OS
 re-creation. A `MembershipCert` then attests `Ed25519 pubkey ↔ Mac ↔ mesh`, so
 identity is additive over the existing addressing rather than replacing it.
 
+**The derivation is enforced, not merely conventional.** `verify_cert` refuses a
+certificate whose `node_mac` is not the address its `ed_pubkey` derives
+(`AuthError::MacKeyMismatch`), and the three issuance paths — `submit_csr`,
+`wayfinderctl cert issue`, `cert approve` — refuse to mint one. Two consequences
+worth knowing before you design against this:
+
+- **Impersonation is impossible rather than merely against policy.** Even a
+  compromised authority cannot mint a credential for somebody else's address:
+  it would need a `derive_mac` preimage, which a signing key is not. This is
+  why the check sits *after* the signature check — it rejects a certificate the
+  root genuinely signed, so it is a misissuance and the error says so.
+- **An address cannot outlive its key.** Re-keying renumbers the node; a
+  re-keyed node is a new originator. Certificate *renewal* (same key, new
+  window) is the only shape that keeps an address, and it still changes the
+  fingerprint, so the `CertFp` → `NeedCert` refetch path is still exercised.
+  `issue_cert` itself stays permissive — it is the primitive a test uses to
+  build a misissuance on purpose — so "the CA will sign it" and "a node will
+  honour it" are deliberately different questions.
+
+See `docs/design/09-mesh-auth-gaps.md` §5.
+
 ## Two mechanisms, chosen by fan-out
 
 The split is not stylistic — it falls out of one-to-many vs. hop-by-hop:

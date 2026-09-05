@@ -62,7 +62,10 @@ BASELINE = {
     "attack_challenge_response_replay": red_team.HELD,
     "attack_broadcast_addressed_challenge": red_team.HELD,
     "attack_unauthenticated_relay": red_team.HELD,
-    "attack_ca_misissuance": red_team.GAP,
+    "attack_ca_misissuance": red_team.HELD,
+    "attack_compromised_root_takes_a_live_members_address": red_team.HELD,
+    "attack_squat_a_lapsed_members_address": red_team.HELD,
+    "attack_agreement_key_theft_via_address_binding": red_team.HELD,
     "attack_proof_starvation_by_neighbour_count": red_team.HELD,
     # --- 2026-08 sweep: certificate issuance / identity / enrollment ---
     "attack_reserved_address_originator": red_team.HELD,

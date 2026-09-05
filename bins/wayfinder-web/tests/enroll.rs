@@ -136,11 +136,6 @@ async fn joining_certifies_the_identity_the_node_already_had() {
     let provider = serve_authority().await;
 
     let before = posture(&node).await;
-    let node_mac = node
-        .run(async |client| client.node_info().await)
-        .await
-        .unwrap()
-        .node_id;
 
     request(&node, &provider).await.unwrap();
 
@@ -150,9 +145,21 @@ async fn joining_certifies_the_identity_the_node_already_had() {
         "the node kept its own identity key"
     );
     assert_eq!(after.own_x_pubkey, before.own_x_pubkey);
+
+    // The certificate is bound to the address that key *derives*, which since
+    // design 09 §5's key↔address binding is the only address any certificate
+    // may name — not whatever address the node happened to be running under.
+    // The two agree for a node that already had an identity; an unenrolled node
+    // on a provisional address is renumbered by enrolling, once.
+    let ed: [u8; 32] = before
+        .own_ed_pubkey
+        .clone()
+        .try_into()
+        .expect("the mock node reports a 32-byte identity key");
     assert_eq!(
-        after.node_mac, node_mac,
-        "the certificate is bound to the address the node was already running under"
+        after.node_mac,
+        wayfinder_auth::derive_mac(&ed).0.to_vec(),
+        "the certificate is bound to the address the node's identity key derives"
     );
 }
 

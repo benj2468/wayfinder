@@ -30,6 +30,21 @@ pub enum AuthError {
     /// refusing it is what keeps one bad signature from admitting a member at
     /// an address every node already treats specially.
     ReservedAddress,
+    /// The certificate's `node_mac` is not the address its `ed_pubkey` derives
+    /// (see [`derive_mac`](crate::derive_mac)).
+    ///
+    /// Like [`ReservedAddress`](Self::ReservedAddress) this is a *misissuance*,
+    /// not a forgery — the mesh root really did sign it — and it is the one
+    /// check that binds an identity key to the address it routes under.
+    /// Refusing it here is what makes impersonation impossible rather than
+    /// merely against policy: a certificate naming somebody else's address
+    /// would need a preimage of `derive_mac`, which even a *compromised
+    /// authority's* signing key does not provide.
+    ///
+    /// The consequence accepted in exchange is that an address cannot outlive
+    /// its key: re-keying necessarily renumbers the node, and only certificate
+    /// *renewal* (same key, new window) keeps an address.
+    MacKeyMismatch,
     /// A revocation record carries no revocation instant (`not_before == 0`).
     ///
     /// Structurally malformed rather than merely stale: `not_before` is also
@@ -51,6 +66,7 @@ impl core::fmt::Display for AuthError {
             AuthError::NotYetValid => "certificate not yet valid",
             AuthError::Revoked => "subject revoked",
             AuthError::ReservedAddress => "certificate binds a reserved address",
+            AuthError::MacKeyMismatch => "certificate MAC is not derived from its identity key",
             AuthError::NoRevocationInstant => "revocation carries no instant",
         };
         f.write_str(msg)

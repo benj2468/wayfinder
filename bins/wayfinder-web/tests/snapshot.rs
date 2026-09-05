@@ -28,7 +28,12 @@ async fn snapshot_reads_every_table_from_a_real_node() {
         .unwrap();
 
     let info = snap.node_info.expect("node info was fetched");
-    assert_eq!(info.node_id, vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]);
+    // The mock answers to the address its own identity key derives, like any
+    // real node — not an invented constant.
+    assert_eq!(
+        info.node_id,
+        wayfinder_auth::derive_mac(&[0x11; 32]).0.to_vec()
+    );
     assert_eq!(info.num_originators, 2);
     assert!(info.auth_locked);
 

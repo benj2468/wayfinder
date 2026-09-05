@@ -1209,10 +1209,22 @@ impl<
         // path (`SetAuth` with no seed), so a certificate for a *different*
         // MAC is a provider-side mismatch, not a legitimate answer. A
         // wholesale identity install is exempt: naming a new MAC is exactly
-        // what it is for, and `wayfinder-tap` re-derives the router's MAC
-        // from the installed certificate on the next boot.
+        // what it is for, and `wayfinder-tap` comes up under the new address on
+        // the next boot — from the *seed* it derives it from, not from this
+        // certificate, since design 09 §5 made the two the same value by
+        // construction.
         if certifying_existing_identity && Mac(parsed_cert.node_mac) != self.router.self_ident() {
-            return Err("certificate MAC does not match the MAC this node runs under".to_string());
+            // Name the remedy, not just the symptom. Since design 09 §5 the
+            // certificate's MAC *is* the address its key derives, and this node
+            // holds that key — so reaching here means the node is still running
+            // under an address it persisted before it had an identity, which
+            // only a build predating that rule does. An operator otherwise reads
+            // this as a provider bug and re-mints a certificate that will be
+            // refused exactly the same way.
+            return Err(
+                "certificate MAC does not match the MAC this node runs under: a                  certificate's MAC is the address its identity key derives, and this                  node is still running under an address it persisted before it had an                  identity. Restart it on a build that derives its MAC from its seed,                  so it comes up under the certified address, then install this again."
+                    .to_string(),
+            );
         }
 
         // A node under a revocation may only be re-admitted with a certificate
@@ -1416,6 +1428,19 @@ mod tests {
         Mac([0, 0, 0, 0, 0, n])
     }
 
+    /// The keypair seeded with `n`, and the address it derives.
+    ///
+    /// Since the key↔address binding landed (design 09 §5) a certificate's
+    /// subject is a *function* of its key, so any fixture that certifies an
+    /// identity has to take its MAC from the key rather than invent one — and
+    /// the router the certificate is installed on has to be running under that
+    /// same address.
+    fn node(seed: u8) -> (wayfinder::wayfinder_auth::Keypair, Mac) {
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[seed; 32]);
+        let mac = kp.derived_mac();
+        (kp, mac)
+    }
+
     /// Mint a cert directly from the CA, returning the raw cert bytes — the
     /// setup shorthand these tests need.  Issues straight through `issue` rather
     /// than round-tripping the client-facing `submit_csr` path (which is about
@@ -1433,6 +1458,25 @@ mod tests {
         )
         .unwrap()
         .cert
+    }
+
+    /// Issue a certificate for the address `kp` derives — the only address the
+    /// binding lets a certificate name (design 09 §5).
+    ///
+    /// Prefer this over `ca_issue` in any fixture that just needs a *valid*
+    /// certificate: it cannot produce one that `verify_cert` will refuse.
+    /// `ca_issue` survives for the handful of tests that deliberately mint a
+    /// mismatched subject.
+    fn ca_issue_for(
+        ca: &mut crate::CertAuthority,
+        kp: &wayfinder::wayfinder_auth::Keypair,
+    ) -> alloc::vec::Vec<u8> {
+        ca_issue(
+            ca,
+            kp.derived_mac().as_bytes(),
+            &kp.ed_pubkey(),
+            &kp.x_pubkey(),
+        )
     }
 
     /// Serialise a link frame carrying `payload` from `src` to `dst`.
@@ -1955,28 +1999,18 @@ mod tests {
         ca.set_now_unix(100);
         let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
 
-        let me = mac(1);
         let kp1 = Keypair::from_seed(&[2; 32]);
-        let cert1 = MembershipCert::from_bytes(&ca_issue(
-            &mut ca,
-            &me.0,
-            &kp1.ed_pubkey(),
-            &kp1.x_pubkey(),
-        ))
-        .unwrap();
+        // A node routes under the address its key derives — the certificate
+        // cannot name any other, so the router cannot either.
+        let me = kp1.derived_mac();
+        let cert1 = MembershipCert::from_bytes(&ca_issue_for(&mut ca, &kp1)).unwrap();
         let mut router = CentralRouter::new(me);
         router.set_auth(OgmAuth::new(kp1, cert1, anchor));
         router.auth_mut().unwrap().set_time(100);
 
-        let peer = mac(2);
         let kp2 = Keypair::from_seed(&[3; 32]);
-        let cert2 = MembershipCert::from_bytes(&ca_issue(
-            &mut ca,
-            &peer.0,
-            &kp2.ed_pubkey(),
-            &kp2.x_pubkey(),
-        ))
-        .unwrap();
+        let peer = kp2.derived_mac();
+        let cert2 = MembershipCert::from_bytes(&ca_issue_for(&mut ca, &kp2)).unwrap();
         let mut peer_auth = OgmAuth::new(kp2, cert2, anchor);
         peer_auth.set_time(100);
         let ogm = BatmanOgmPacket {
@@ -2160,30 +2194,20 @@ mod tests {
         let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
 
         // Self node mac(1), authenticated by the CA (cert not_after = 100 + 1000).
-        let me = mac(1);
         let kp1 = Keypair::from_seed(&[2; 32]);
-        let cert1 = MembershipCert::from_bytes(&ca_issue(
-            &mut ca,
-            &me.0,
-            &kp1.ed_pubkey(),
-            &kp1.x_pubkey(),
-        ))
-        .unwrap();
+        // A node routes under the address its key derives — the certificate
+        // cannot name any other, so the router cannot either.
+        let me = kp1.derived_mac();
+        let cert1 = MembershipCert::from_bytes(&ca_issue_for(&mut ca, &kp1)).unwrap();
         let mut router = CentralRouter::new(me);
         router.set_auth(OgmAuth::new(kp1, cert1, anchor));
         router.auth_mut().unwrap().set_time(100);
 
         // Peer mac(2) emits a signed OGM; feed it so the router verifies + caches
         // it as an originator carrying its cert expiry.
-        let peer = mac(2);
         let kp2 = Keypair::from_seed(&[3; 32]);
-        let cert2 = MembershipCert::from_bytes(&ca_issue(
-            &mut ca,
-            &peer.0,
-            &kp2.ed_pubkey(),
-            &kp2.x_pubkey(),
-        ))
-        .unwrap();
+        let peer = kp2.derived_mac();
+        let cert2 = MembershipCert::from_bytes(&ca_issue_for(&mut ca, &kp2)).unwrap();
         let mut peer_auth = OgmAuth::new(kp2, cert2, anchor);
         peer_auth.set_time(100);
         let ogm = BatmanOgmPacket {
@@ -2601,14 +2625,19 @@ mod tests {
     /// its MAC, which is derived from it — and simply becomes authenticated.
     #[test]
     fn set_auth_without_a_seed_certifies_the_existing_identity() {
-        let mut router = CentralRouter::new(mac(1));
+        let mut router = CentralRouter::new(node(3).1);
         let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
         ca.set_now_unix(1_000);
-        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
-        // Bound to the MAC the node is *running* under, not the one its key
-        // derives to: that is what an enrolling node asks for, since its
-        // address on the mesh must not change underneath it.
-        let cert = ca_issue(&mut ca, mac(1).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
+        let (kp, node_mac) = node(3);
+        // Bound to the address the node's key derives, which since the binding
+        // landed is the only address a certificate may name — and the address
+        // the node is therefore already running under.
+        let cert = ca_issue(
+            &mut ca,
+            node_mac.as_bytes(),
+            &kp.ed_pubkey(),
+            &kp.x_pubkey(),
+        );
         let anchor = ca.trust_anchor_bytes();
         let mut store = RecordingStore::default();
         let mut identity_seed = Some([3u8; 32]);
@@ -2687,11 +2716,14 @@ mod tests {
         // Certifying the existing identity in place (empty seed): the slot
         // still reads back the same seed, and the write-back path still runs.
         {
-            let mut router = CentralRouter::new(mac(1));
+            let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&old_seed);
+            // Certifying in place keeps the node's address, so the node has to
+            // already be running under the one its key derives — which since
+            // the binding landed is the only address its certificate can name.
+            let mut router = CentralRouter::new(kp.derived_mac());
             let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
             ca.set_now_unix(1_000);
-            let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&old_seed);
-            let cert = ca_issue(&mut ca, mac(1).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
+            let cert = ca_issue_for(&mut ca, &kp);
             let anchor = ca.trust_anchor_bytes();
             let mut identity_seed = Some(old_seed);
 
@@ -2714,7 +2746,7 @@ mod tests {
         let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
         ca.set_now_unix(1_000);
         let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
-        let cert = ca_issue(&mut ca, mac(1).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
+        let cert = ca_issue_for(&mut ca, &kp);
         let anchor = ca.trust_anchor_bytes();
 
         let err = RouterAdapter::new(&mut router, Duration::ZERO)
@@ -2751,7 +2783,7 @@ mod tests {
         let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
         ca.set_now_unix(1_000);
         let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
-        let cert = ca_issue(&mut ca, mac(1).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
+        let cert = ca_issue_for(&mut ca, &kp);
 
         // A different root key, same mesh id: the anchor a node would hold if
         // it belonged to a *different* mesh that happened to share an id.
@@ -2779,7 +2811,7 @@ mod tests {
         let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
         ca.set_now_unix(1_000);
         let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
-        let cert = ca_issue(&mut ca, mac(1).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
+        let cert = ca_issue_for(&mut ca, &kp);
 
         // Same root key, a different mesh id — a client presenting the wrong
         // anchor for the cert it holds.
@@ -2809,7 +2841,7 @@ mod tests {
         ca.set_now_unix(1_000);
         let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
         // not_before = 1_000, not_after = 1_010.
-        let cert = ca_issue(&mut ca, mac(1).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
+        let cert = ca_issue_for(&mut ca, &kp);
         let anchor = ca.trust_anchor_bytes();
         let mut store = RecordingStore::default();
 
@@ -2835,7 +2867,7 @@ mod tests {
         ca.set_now_unix(1_000);
         let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
         // not_before = 1_000.
-        let cert = ca_issue(&mut ca, mac(1).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
+        let cert = ca_issue_for(&mut ca, &kp);
         let anchor = ca.trust_anchor_bytes();
         let mut store = RecordingStore::default();
 
@@ -2862,14 +2894,14 @@ mod tests {
         let mut router = CentralRouter::new(mac(1));
         let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
         ca.set_now_unix(1_000);
-        // The cert names a key other than the one the request is installing.
+        // The cert names a key other than the one the request is installing —
+        // and is otherwise *valid*, bound to the address that other key derives.
+        // That matters: `verify_cert` runs before this check, so a certificate
+        // with a mismatched subject would be refused as `MacKeyMismatch` first,
+        // whose message also contains "key", and this test would pass without
+        // ever reaching the guard it is named for.
         let other_kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[4; 32]);
-        let cert = ca_issue(
-            &mut ca,
-            mac(1).as_bytes(),
-            &other_kp.ed_pubkey(),
-            &other_kp.x_pubkey(),
-        );
+        let cert = ca_issue_for(&mut ca, &other_kp);
         let anchor = ca.trust_anchor_bytes();
         let mut store = RecordingStore::default();
 
@@ -2879,7 +2911,10 @@ mod tests {
             .set_auth(&[3; 32], &cert, &anchor)
             .expect_err("cert names a different key than the seed being installed");
 
-        assert!(err.contains("key"), "got: {err}");
+        assert!(
+            err.contains("does not match the identity being installed"),
+            "the key check must be what refused this, not verify_cert: {err}"
+        );
         assert!(router.auth().is_none(), "never installed");
         assert!(store.writes.is_empty(), "never persisted");
     }
@@ -2895,9 +2930,23 @@ mod tests {
         let mut router = CentralRouter::new(mac(1));
         let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
         ca.set_now_unix(1_000);
+        // A *valid* certificate for this node's own key — so `verify_cert` and
+        // the key check both pass and the router-MAC check is the one that
+        // fires. Issuing at a mismatched subject instead would be refused as
+        // `MacKeyMismatch`, whose message also contains "mac", and this test
+        // would pass without reaching the guard it is named for.
+        //
+        // The router is left on `mac(1)`, a provisional address it persisted
+        // before it had an identity — which since the key↔address binding is
+        // the only way this state arises, and is exactly the pre-upgrade node
+        // `csr request` now refuses to build a request for.
         let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
-        // Bound to a MAC other than the one the router actually runs under.
-        let cert = ca_issue(&mut ca, mac(2).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
+        assert_ne!(
+            kp.derived_mac(),
+            mac(1),
+            "the router must be off its key's address"
+        );
+        let cert = ca_issue_for(&mut ca, &kp);
         let anchor = ca.trust_anchor_bytes();
         let mut store = RecordingStore::default();
         let mut identity_seed = Some([3u8; 32]);
@@ -2909,7 +2958,10 @@ mod tests {
             .set_auth(&[], &cert, &anchor)
             .expect_err("cert is bound to a MAC other than the one this router runs under");
 
-        assert!(err.to_lowercase().contains("mac"), "got: {err}");
+        assert!(
+            err.contains("does not match the MAC this node runs under"),
+            "the router-MAC check must be what refused this: {err}"
+        );
         assert!(router.auth().is_none(), "never installed");
         assert!(store.writes.is_empty(), "never persisted");
     }
@@ -2923,10 +2975,13 @@ mod tests {
         let mut router = CentralRouter::new(mac(1));
         let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
         ca.set_now_unix(1_000);
-        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
-        // Bound to a MAC different from the router's current identity —
-        // exactly what a fresh re-key looks like.
-        let cert = ca_issue(&mut ca, mac(2).as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
+        let (kp, new_mac) = node(3);
+        // Bound to the address the *new* key derives, which differs from the
+        // router's current identity — exactly what a fresh re-key looks like,
+        // and the only shape of re-key the binding leaves: a new key is a new
+        // address, so a wholesale install always renumbers.
+        assert_ne!(new_mac, mac(1), "the re-key must actually move the address");
+        let cert = ca_issue(&mut ca, new_mac.as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey());
         let anchor = ca.trust_anchor_bytes();
         let mut store = RecordingStore::default();
 

@@ -1,20 +1,33 @@
 # Design: Four gaps in mesh authentication, found by adversarial simulation
 
-**Status:** Proposed. Each gap is a separate, independently landable change;
-this document exists so they can be taken one at a time without re-deriving the
-analysis. Gaps 1, 2 and 3 have since shipped — 1 and 2 together, via §4. Gap 4
-remains open. The instrument that found them shipped in MR !113
-(`sim/scenarios/red_team.py`).
+**Status:** Proposed — partly shipped, so the doc stays here rather than in
+`implemented/` until the last gap below closes. Each gap is a separate,
+independently landable change; this document exists so they can be taken one at
+a time without re-deriving the analysis. Gaps 1, 2, 3 and **4** have shipped, as
+have §7's observability and the three later findings logged in §8.7–§8.9. Two
+gaps found by the 2026-08 sweep (§8.10, §8.11) remain open and unscheduled. The
+instrument that found them all shipped in MR !113 (`sim/scenarios/red_team.py`).
 
 > **§4 supersedes part of §2 and §3.** A second round of measurement showed
 > gaps 1 and 2 to be one bug, and neither section's proposed fix closes it.
 > Read §4 before implementing either.
 >
-> **§4's fix has since shipped**, closing gaps 1 and 2 together. The red team
-> now runs 15 attacks and reports 13 held, 1 by design, 1 gap — §5 (CA
-> misissuance). §4's "Implementation notes" record four things the build
-> surfaced that the design did not predict; the fourth is the proof-starvation
-> scare, which was a mismeasurement rather than a gap.
+> **§4's fix has since shipped**, closing gaps 1 and 2 together. §4's
+> "Implementation notes" record four things the build surfaced that the design
+> did not predict; the fourth is the proof-starvation scare, which was a
+> mismeasurement rather than a gap.
+
+**Where the red team stands.** It runs 46 attacks and reports **41 held, 3 by
+design, 2 gaps**. The two gaps are the open work this document tracks:
+
+| Attack | Section | What it is |
+|--------|---------|------------|
+| `attack_proof_survives_key_eviction_window` | §8.10 | the engine's `proven` table is not swept when a neighbor's key is evicted |
+| `attack_ogm_seqno_highwater_jam` | §8.11 | a replayed high seqno pins an originator's high-water and denies route acquisition |
+
+`sim/tests/test_red_team.py`'s `BASELINE` is the authority on that count; this
+table follows it. A fix flips the verdict in `red_team.py`, in `BASELINE`, and
+here, together.
 
 **Scope:** `libs/wayfinder/src/auth.rs` (`OgmAuth`: OGM verification, the
 neighbor-key cache, the directed-frame tag path), `libs/wayfinder-auth`
@@ -631,7 +644,7 @@ therefore verifies perfectly.
 
 This is worse than "a misissuing CA could hand out impersonation", because the
 shipped CA *will*: `CertAuthority::submit_csr`
-(`libs/wayfinder-server/src/authority.rs:722`) takes `node_mac` **from the
+(`libs/wayfinder-server/src/authority.rs`, `submit_csr`) takes `node_mac` **from the
 client**. Its only guard is that the MAC does not already hold a valid,
 non-revoked certificate under a different key — which is first-come, not
 proof-of-ownership. An attacker that passes the enrollment-token check can
@@ -639,13 +652,33 @@ claim any address not currently covered by a live cert, including one whose
 cert has lapsed.
 
 `wayfinderctl cert issue --mac` and `cert approve` have the same shape offline.
-(`issue_user_cert`'s callers already derive the MAC — `authority.rs:665` — so
+(`issue_user_cert`'s callers already derive the MAC — `authenticate_user` — so
 user session certs are unaffected.)
 
-Reproduced by `test_a_certificate_may_name_a_mac_its_key_does_not_derive`
-(`sim/tests/test_security.py`).
+Reproduced by
+`test_a_certificate_naming_a_mac_its_key_does_not_derive_is_refused`
+(`sim/tests/test_security.py`) and `red_team.py::attack_ca_misissuance`, both
+now asserting the fix. Two red-team attacks were added alongside them for
+surface this change created rather than closed —
+`attack_compromised_root_takes_a_live_members_address` (what the binding is
+worth when the attacker *is* the authority, and what it still does not buy) and
+`attack_agreement_key_theft_via_address_binding` (what the deliberate narrowness
+of binding `ed_pubkey` alone costs) — plus
+`attack_squat_a_lapsed_members_address` for issue #37's closed window.
 
-### Proposed fix
+Both of the older fixtures had to be rebuilt before they measured anything: each
+ran the victim node alongside the imposter, so the victim's address was in the
+observer's neighbour cache legitimately and the assertion read the same either
+way. The victim is now absent from the partition, which is both the honest
+measurement and the case where impersonating it is worth doing.
+
+### The fix — shipped 2026-09-05
+
+**The key↔address binding is adopted, and the fixed-MAC re-key it forecloses is
+accepted as the price.** That was the open question this section left standing;
+it is now answered, and built. See "Accepted consequences" below for what
+changed as a result, and "Implementation notes" for the four things the build
+surfaced that this design did not predict.
 
 Two layers:
 
@@ -660,14 +693,111 @@ Two layers:
    `cert approve`, so the failure surfaces where the mistake is made rather
    than as "issued fine, rejected by every node".
 
-### Consequences to accept before implementing
+Verify it *everywhere* a certificate's subject is chosen or trusted, not only
+at the two ends: `verify_cert` is the invariant, the three issuance paths are
+where the mistake is caught early, and §8.9's `cache_neighbor` identity lock
+becomes defense in depth over the binding rather than the only thing holding
+the address.
 
-- **Key rotation at a fixed MAC becomes impossible.** If the address is derived
-  from the key, re-keying necessarily changes the address; a re-keyed node is a
-  new originator. Certificate *renewal* (same key, new window) still works, and
-  still changes the fingerprint, so the existing `CertFp` → `NeedCert` refetch
-  path is still needed and still exercised. Two existing tests assert rotation
-  at a fixed MAC and must be converted to renewal.
+### Implementation notes — what the build surfaced
+
+Four things, none of them predicted by the design above, and the first is the
+one that would have shipped a broken product.
+
+1. **Enrollment had to start renumbering the node, and the whole flow moved with
+   it.** `wayfinder-tap` derived a node's MAC from its identity key *only* when
+   an `auth:` block was configured; an un-enrolled node ran under a MAC
+   generated once from a discarded throwaway key and persisted to
+   `mac_state_path`. Enrollment then bound the certificate to *that* address —
+   deliberately, so joining a mesh did not move a node, and the comment in
+   `main.rs` argued for it at length.
+
+   That is no longer expressible: an authority will certify only the address the
+   presented key derives. So the identity seed is now resolved **once** at the
+   top of startup and both the MAC and the management-TLS server identity are
+   derived from it, which collapses two parallel three-way matches into one and
+   makes "a node routes under the address its identity key derives" structural
+   rather than conditional. The persisted-MAC fallback survives for the one node
+   that has no identity key at all — no `auth:` block, no runtime identity, and
+   no management server to have generated a seed for — which cannot be enrolled
+   over the wire anyway.
+
+   The consequence to state plainly: **an existing unauthenticated node
+   renumbers on upgrade**, once. It is a one-time move for a node holding no
+   certificate, against a permanent alternative — every online enrollment
+   leaving the node signing OGMs under a certificate naming an address it does
+   not answer to until someone restarts it.
+
+2. **Three CSR builders were naming the wrong field.** `csr request`
+   (`wayfinder-ctl`) and the web dashboard's `enroll::request` both built the
+   request from `GetNodeInfo`'s `node_id` — the address the node *currently*
+   answers to. Both now derive it from the `own_ed_pubkey` the node reports, and
+   both say so out loud when the two differ, because a silent renumber
+   discovered when peers stop answering is the worst way to learn about one.
+   `auth enroll`'s `--mac` and `cert issue`'s `--mac` became *cross-checks*
+   rather than overrides: an operator who passes the right one is confirming
+   which seed they meant, and one who passes the wrong one is told which half is
+   wrong.
+
+3. **`submit_csr`'s live-cert lock stopped being load-bearing, and issue #37
+   closed with it.** The lock was read off the *issued record*, whose window is
+   strictly shorter than the revocation that makes it matter — so between a
+   record expiring and its revocation expiring, a stranger could be issued a
+   certificate for a departed member's address and have it honoured mesh-wide.
+   The binding closes that more completely than #37's own planned fix
+   (consulting persisted revocations): the address is not another key's to claim
+   at *any* time, so there is no window to be inside. The test that pinned the
+   window open said in its own assertion message what to do when it started
+   failing, and that is what was done — folded into
+   `a_different_key_cannot_reclaim_a_revoked_mac`.
+
+4. **§8.9's identity lock became unreachable through a certificate, and its
+   tests had to be rebuilt on what it can still reach.** `cache_neighbor`
+   refuses to replace a live member's `ed_pubkey`; with the binding, two
+   different keys cannot both derive one address, so `verify_cert` refuses the
+   second certificate long before the cache sees it. The rule is kept — §8.9
+   already called it defense in depth — but what it now guards is a `derive_mac`
+   collision: 46 bits, negligible by accident and days of GPU time on purpose.
+   Its seven tests could no longer *mint* the state they were testing, so they
+   now build it directly (a genuine verified certificate with its subject
+   rewritten, which is what a collision would produce) and drive
+   `cache_neighbor` rather than `verify_ogm`. A new test pins the outer refusal
+   that displaced them.
+
+Two notes on the test churn, for anyone repeating this shape of change. It came
+to **~130 tests**, not the 67 this section estimated — the codebase grew. But
+the prescription held exactly: in `libs/wayfinder/src/auth.rs`, 223 of 225
+fixture sites already paired seed *n* with `mac(n)`, so redefining that single
+helper to `Keypair::from_seed(&[n; 32]).derived_mac()` fixed 328 of the crate's 347 tests in
+one edit. The residue was worth reading rather than mechanising — every one of
+those sites was a fixture asserting something the binding has since made
+impossible.
+
+`wayfinder-test` was the exception this section predicted, and it was *smaller*
+than feared: machine identities now come from `machine_keypair(index)` rather
+than a topology counter, and only the five auth-using suites cared. The 63
+routing tests were indifferent to the MAC values changing under them.
+
+### Accepted consequences
+
+- **Key rotation at a fixed MAC becomes impossible — accepted.** If the address
+  is derived from the key, re-keying necessarily changes the address; a re-keyed
+  node is a new originator, and callers that assumed an address survives a
+  re-key must be changed to expect a new one. This is the trade the decision
+  above makes deliberately: an address that cannot outlive its key is what makes
+  the binding an invariant a node can check for itself, and a mesh that needs a
+  node back under its old address re-keys to the old key or renumbers.
+  Certificate *renewal* (same key, new window) still works, and still changes
+  the fingerprint, so the existing `CertFp` → `NeedCert` refetch path is still
+  needed and still exercised. Two existing tests assert rotation at a fixed MAC
+  and must be converted to renewal.
+- **`submit_csr`'s live-cert lock stops being the load-bearing guard.** It was
+  first-come proof-of-nothing; once the MAC is derived, a different key claiming
+  a live member's address is refused because the address is not that key's to
+  claim. Keep the lock — it is still what refuses a second *live* certificate
+  for one key — but it is no longer the thing preventing impersonation, and the
+  comment at `authority.rs` that says so should be corrected rather than left to
+  mislead the next reader.
 - **Test churn is wide but mechanical.** Enforcing this broke 67 tests across
   `wayfinder-server`, `wayfinder-test` and `wayfinder-ctl` — every fixture that
   mints a cert for an invented MAC. The fix is for test helpers to derive MACs
@@ -758,8 +888,10 @@ wall-clock question.
    both. No wire-format change to the OGM, no per-hop signature, and it did not
    need §2's wall clock, because the freshness is a receiver-chosen nonce
    rather than a shared clock.
-4. **Gap 4** — the only gap still open. Independent of the rest, but the widest
-   test churn; best done when nothing else is in flight to avoid conflicts.
+4. ~~**Gap 4**~~ — done (2026-09-05). The widest test churn of any change in
+   this document (~130 tests), and it moved the enrollment flow with it: see
+   §5's "Implementation notes". §8.10 and §8.11 do not depend on it and are what
+   is left.
 5. **§2's time bucket** — still worth landing on its own merits (it bounds
    replay of a *stale* OGM at a fresh receiver, which the challenge does not
    address), but it is no longer on the critical path and it still owns the
@@ -854,7 +986,9 @@ honest node.
 ### The fix
 
 Decide the requirement from the BATMAN sub-type alone
-(`wayfinder_driver_core::requires_pairwise_tag`), and apply the same predicate
+(`wayfinder_driver_core::requires_pairwise_tag`, since renamed to
+`required_proof` and widened by design 17 to return a `RequiredProof` rather
+than a bool — the reasoning below is unchanged), and apply the same predicate
 on ingress (`strip_directed`) and egress (`tag_directed_into`) so the two halves
 cannot drift. Exempt exactly the packets for which a pairwise tag is impossible
 or redundant — `Ogm`, `Bcast`, `Keepalive` (one-to-many) and `CertReq`,
@@ -886,11 +1020,12 @@ pinning the asymmetry above.
 ### Residual
 
 `BatmanPacketType::from_u8` ends in a `_ => None` wildcard over `u8`, so adding
-an enum variant forces a classification in `requires_pairwise_tag` (a compile
-error) but **not** its byte mapping in `from_u8`. A variant added to the enum
-and forgotten in `from_u8` decodes as `None`, fails closed, and is dropped on
-every node — visible only as `untaggable_drop_rate`. Deriving both from one
-macro list would close it; out of scope for the fix itself.
+an enum variant forces a classification in `required_proof` (a compile error)
+but **not** its byte mapping in `from_u8`. A variant added to the enum and
+forgotten in `from_u8` decodes as `None`, fails closed, and is dropped on every
+node — visible only as `untaggable_drop_rate`. Deriving both from one macro list
+would close it; out of scope for the fix itself. Still open as of 2026-09-05:
+`from_u8` is eleven hand-written arms ending in `_ => None`.
 
 ---
 
@@ -1038,11 +1173,154 @@ never flips; 6/6 delivery under a 40 Hz flood of the second certificate). Unit
 coverage in `libs/wayfinder/src/auth.rs`, covering both the refusal and the
 four edges it must not swallow.
 
-### Still open
+### What §5 changed here
 
-§5 itself. This is defense in depth over it, not a replacement: gap 4 removes
-the precondition, and at 46 bits of derived address space the layering still
-earns its keep afterwards.
+Nothing is still open. §5 shipped on 2026-09-05, and this rule became defense in
+depth over it rather than the thing holding the address: the binding removed the
+precondition, so a second *certified* key for one address can no longer exist.
+What the rule now guards is a `derive_mac` collision, which at 46 bits still
+earns its few lines.
+
+Two things moved with it, both recorded in §5's implementation notes. The
+`IdentityConflict` alarm is raised from `verify_ogm`'s refusal now rather than
+from `cache_neighbor`'s, because that is where the condition is caught — leaving
+it where it was would have made the mesh's most serious credential fault silent
+while the same attacker's directed frames raised `UnauthenticatedTraffic`
+against the *victim*. And the rule's tests build their colliding entry by hand,
+because it can no longer be minted.
+
+The "unset clock admits the new key" edge survives, and is now the only place
+where an unclocked node is *more* capable than before: it still cannot judge
+validity, but it *can* check the binding, which is the first thing in this area
+that works without a wall clock.
+
+---
+
+## 8.10 A proof outlives the key it needs — **open**
+
+Found by the 2026-08 next-hop-proof sweep. Not a consequence of gap 4, and not
+closed by anything above: it is an interaction *between* §6's fix and §4's, each
+of which is correct alone.
+
+### What happens
+
+§6's `evict_expired_neighbors` drops a lapsed member's pairwise key from
+`OgmAuth` at `set_time`. §4's next-hop `proven` table lives in the routing
+engine and is **not** swept when that happens, so `proof_current(mac)` keeps
+reading true for up to `MAX_MISSED_PROOFS` intervals afterwards.
+
+The two halves then disagree. Path selection gates on `proof_current`, so the
+engine goes on choosing the lapsed neighbor as a next hop; the data plane
+resolves its key through `live_neighbor`, gets `None`, and drops the frame at
+dispatch. **The route reports healthy and every directed frame over it
+vanishes.** Renewal cannot rescue it from inside the window either —
+`issue_challenge` fails closed for a neighbor with no key, so the proof cannot
+be refreshed, only allowed to lapse.
+
+Measured directly: after the peer's certificate expires there is a run of
+sampled instants where the victim reports a route to it *and* reads its proof as
+current *and* has already evicted its key; a real payload queued in that window
+was dropped at dispatch while `has_route` stayed true.
+
+### Why it is bounded, and why it still matters
+
+It is transient (the route purges once the proof itself lapses), confined to one
+neighbor, and the drop is metered — §7's `untaggable_drop_rate` is exactly the
+counter that fires. What is not acceptable is that the route table *lies* for
+the width of the window: an application on top of the mesh is told it has a
+usable path, which is the thing §7 was added because operators could not
+otherwise see.
+
+### Direction
+
+Not yet a design. The shape is that key eviction and proof invalidation should
+be one event rather than two, and the engine already does this everywhere else:
+`BatmanEngine::reset` clears `proven` and `challenged` on re-anchoring, and
+`revoke_originators` removes a revoked MAC from both — each with a comment
+saying in as many words that a proof answered under stale key material must not
+keep
+carrying data for `MAX_MISSED_PROOFS` more cycles. **Expiry is the one path that
+drops the key and leaves the proof standing**, which is the whole bug; it is a
+missing call rather than a new mechanism, and `evict_expired_neighbors` already
+knows exactly which MACs it dropped.
+
+The awkward part is direction: the eviction happens in `OgmAuth`
+(`libs/wayfinder`) and the table lives in `BatmanEngine` (`libs/batman`), which
+does not depend on it — so the sweep has to be driven from whoever holds both,
+i.e. `CentralRouter`. Worth settling at the same time: whether the reverse
+direction needs anything, i.e. a proof lapsing while the key is still live (it
+does not blackhole — selection simply stops choosing the hop — so probably not).
+
+### Reproduced by
+
+`red_team.py::attack_proof_survives_key_eviction_window`, currently `GAP` in
+`sim/tests/test_red_team.py`'s `BASELINE`. No unit-level coverage yet; the
+interaction spans `libs/wayfinder/src/auth.rs` and `libs/batman/src/engine.rs`,
+so it needs a test that holds both.
+
+---
+
+## 8.11 A replayed OGM pins an originator's seqno high-water — **open**
+
+Found by the 2026-08 OGM-semantics sweep. The OGM-path twin of §8.6's `Bcast`
+high-water blackhole, which was fixed; this path got no equivalent.
+
+### What happens
+
+The attacker captures a **genuine, correctly signed** OGM from a member at a
+high sequence number and replays it under its *own* link-layer source. Two
+things follow, and only the first is intended:
+
+- The forged path "hq via eve" never becomes a usable route. Eve holds no
+  credential and cannot answer a next-hop challenge, so §4's fix holds exactly
+  as designed.
+- The victim's `OgmRecord` for **hq** — keyed on the originator inside the OGM,
+  not on the forwarder — takes the replayed sequence number as its high-water
+  anyway. Every genuine OGM hq subsequently emits sits *below* it and is
+  discarded as stale, so the victim never acquires a route to a genuinely
+  adjacent hq at all. A control run without the attacker acquires one.
+
+Refreshing the replay (measured at 5 Hz) keeps `last_heard` live so the record
+never ages out, holding the pin for as long as the attacker keeps transmitting.
+
+Note what this is *not*: nothing here is forged, so nothing on the verification
+path is wrong. The OGM really is hq's and really does verify against hq's key.
+§4 deliberately separated "this OGM originated with hq" (which is true) from
+"hq is reachable via this sender" (which the proof refuses), and the seqno
+bookkeeping runs on the first claim — correctly, since that is the claim the
+originator actually signed. The attack spends a true statement, replayed.
+
+### Direction
+
+Two candidates, and §8.6's hard-won lesson applies to both: **no check on the
+frame can help**, because every field the frame is judged on is one a genuine
+originator wrote.
+
+- **An `admit`-shaped resync on `OgmRecord`**, mirroring
+  `BroadcastSeqnoEntry::admit`: treat a run of sequence numbers that do not
+  advance the high-water as evidence against the *high-water*, and resynchronise
+  to the number that opened the run. Needs no clock, so it works on an unclocked
+  embedded node. Both details §8.6 records as load-bearing — a narrow "behind"
+  band, and restoring the number that *opened* the run rather than the one that
+  trips the deadline — carry over unchanged, and both are places the `Bcast`
+  attempt went wrong first.
+- **§2's time bucket** (sequencing item 5), which bounds replay of a stale OGM
+  at a fresh receiver. This is precisely the case it was designed for, and is
+  the strongest argument yet for landing it. It does not remove the need for the
+  first candidate on a node with no wall clock.
+
+Ruled out without measurement: refusing to advance the high-water from an OGM
+arriving via an unproven next hop. A legitimate neighbor is unproven during
+ordinary acquisition, so that gate would refuse exactly the OGMs a cold node
+needs.
+
+### Reproduced by
+
+`red_team.py::attack_ogm_seqno_highwater_jam`, currently `GAP` in
+`sim/tests/test_red_team.py`'s `BASELINE`. The measurement runs with and without
+the attacker, so an empty route table reads as *denied* rather than
+*never-converged* — the same control the §8.7 unit tests use and the same hazard
+the root `CLAUDE.md` records for benchmark fixtures.
 
 ---
 
@@ -1051,10 +1329,15 @@ earns its keep afterwards.
 | File | Gaps | What changes |
 |------|------|--------------|
 | `libs/wayfinder/src/auth.rs` | 3 | `cache_neighbor`, `live_neighbor`/`evict_expired_neighbors`, `set_time`, `tag_directed`, `verify_directed`, `neighbor_cert`, `neighbor_x_pubkey` |
-| `libs/wayfinder-auth/src/cert.rs` | 4 | `verify_cert` MAC/key check |
-| `libs/wayfinder-auth/src/error.rs` | 4 | `AuthError::MacKeyMismatch` |
-| `libs/wayfinder-server/src/authority.rs` | 4 | `submit_csr` derivation guard (~line 722) |
-| `bins/wayfinder-ctl/src/cert.rs` | 4 | `issue` (`--mac` validation), `approve` (CSR MAC check) |
+| `libs/wayfinder-auth/src/cert.rs` | 4 | `verify_cert` MAC/key check — done |
+| `libs/wayfinder-auth/src/error.rs` | 4 | `AuthError::MacKeyMismatch` — done |
+| `libs/wayfinder-server/src/authority.rs` | 4 | `check_mac_derives_from`, applied by `submit_csr` (a `Rejected` outcome) and `approve_csr` (an `Err`) — done |
+| `bins/wayfinder-ctl/src/cert.rs` | 4 | `issue` (`--mac` cross-check), `approve` (CSR MAC check) — done |
+| `bins/wayfinder-ctl/src/auth.rs` | 4 | `auth enroll`'s `--mac` becomes a cross-check — done |
+| `bins/wayfinder-ctl/src/csr.rs` | 4 | `csr request` derives the subject instead of reading `node_id` — done |
+| `bins/wayfinder-web/src/enroll.rs` | 4 | the same derivation, for the dashboard's enrollment — done |
+| `bins/wayfinder-tap/src/main.rs` | 4 | one up-front identity-seed resolution; the MAC and the mgmt-TLS identity both derive from it — done |
+| `libs/wayfinder-server/src/adapter.rs` | 4 | `set_auth`'s in-place MAC check is now subsumed by the binding; kept as the guard against a cert for another key — done |
 | `libs/wayfinder-driver-core/src/lib.rs` | §7 | `tag_directed_into` counter + `warn!` → `trace!` (line ~215) |
 | `libs/wayfinder-embedded-driver/src/lib.rs` | 2 | wall-clock source, once §2's question is settled (see line 467) — **not** needed for §4's fix |
 | `libs/wayfinder/src/auth.rs` | §4 | the challenge/response pair over `frame_tag` + the pairwise-key cache |
@@ -1065,4 +1348,6 @@ earns its keep afterwards.
 | `sim/tests/test_security.py`, `sim/tests/test_adversary.py` | all | the gap tests flip from asserting the gap to asserting the fix |
 | `sim/scenarios/red_team.py` | all | verdicts flip `GAP` → `HELD` |
 | `sim/tests/test_red_team.py` | all | `BASELINE` flips with the verdicts it pins |
-| `libs/wayfinder-driver-core/src/lib.rs` | §8.7 | `requires_pairwise_tag` (replaces `is_cert_control`), applied by both `strip_directed` and `tag_directed_into` — done |
+| `libs/wayfinder-driver-core/src/lib.rs` | §8.7 | `required_proof` (named `requires_pairwise_tag` when §8.7 was written; replaced `is_cert_control`), applied by both `strip_directed` and `tag_directed_into` — done |
+| `libs/wayfinder/src/auth.rs`, `libs/batman/src/engine.rs` | §8.10 | sweep the engine's `proven` table when `evict_expired_neighbors` drops a key |
+| `libs/batman/src/lib.rs`, `libs/batman/src/engine.rs` | §8.11 | an `admit`-shaped resync on `OgmRecord`'s seqno high-water, mirroring `BroadcastSeqnoEntry::admit` |

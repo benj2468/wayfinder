@@ -31,6 +31,8 @@ pub mod prelude {
     pub use super::driver::TestMachineConfig;
     pub use super::driver::TestSwitchConfig;
     pub use super::driver::mac;
+    pub use super::driver::machine_ident;
+    pub use super::driver::machine_keypair;
     pub use super::test_router::TestRouter;
     pub use super::test_router::build_frame;
     pub use super::test_router::host_frame;

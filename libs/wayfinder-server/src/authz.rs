@@ -571,7 +571,7 @@ mod tests {
 
         let admin_kp = Keypair::from_seed(&[2u8; 32]);
         let admin_cert = authority.issue_user_cert(
-            mac(5),
+            admin_kp.derived_mac(),
             admin_kp.ed_pubkey(),
             admin_kp.x_pubkey(),
             0,
@@ -615,8 +615,13 @@ mod tests {
         // rather than on the tier name alone, since the property that matters
         // is what the tier can *do*.
         let member_kp = Keypair::from_seed(&[3u8; 32]);
-        let member_cert =
-            authority.issue_cert(mac(6), member_kp.ed_pubkey(), member_kp.x_pubkey(), 0, 200);
+        let member_cert = authority.issue_cert(
+            member_kp.derived_mac(),
+            member_kp.ed_pubkey(),
+            member_kp.x_pubkey(),
+            0,
+            200,
+        );
         let decision = decide_access(
             &member_kp.ed_pubkey(),
             Some(&member_cert),
@@ -645,7 +650,7 @@ mod tests {
                 Some(&anchor),
                 Some(&own.ed_pubkey()),
                 100,
-                |c: &VerifiedCert| c.mac == mac(5)
+                |c: &VerifiedCert| c.mac == admin_kp.derived_mac()
             ),
             MgmtAccess::Denied(MgmtDenied::Revoked)
         );
@@ -679,8 +684,13 @@ mod tests {
         let anchor = authority.trust_anchor();
         let own = Keypair::from_seed(&[7u8; 32]);
         let stranger = Keypair::from_seed(&[8u8; 32]);
-        let member_cert =
-            authority.issue_cert(mac(6), stranger.ed_pubkey(), stranger.x_pubkey(), 0, 200);
+        let member_cert = authority.issue_cert(
+            stranger.derived_mac(),
+            stranger.ed_pubkey(),
+            stranger.x_pubkey(),
+            0,
+            200,
+        );
 
         // With a device's member cert: admitted to the member tier, which
         // manages nothing — the security-status read this test names is
@@ -1037,7 +1047,7 @@ mod tests {
         let operator = Keypair::from_seed(&[8u8; 32]);
 
         let viewer_cert = authority.issue_user_cert(
-            mac(5),
+            operator.derived_mac(),
             operator.ed_pubkey(),
             operator.x_pubkey(),
             0,
@@ -1060,8 +1070,13 @@ mod tests {
         // earns no *read* access. This is the property that makes the viewer
         // tier safe: it is granted by a bit, never by the absence of one. The
         // device lands on the member tier instead, which reads nothing.
-        let device_cert =
-            authority.issue_cert(mac(6), operator.ed_pubkey(), operator.x_pubkey(), 0, 200);
+        let device_cert = authority.issue_cert(
+            operator.derived_mac(),
+            operator.ed_pubkey(),
+            operator.x_pubkey(),
+            0,
+            200,
+        );
         let decision = decide_access(
             &operator.ed_pubkey(),
             Some(&device_cert),
@@ -1098,7 +1113,7 @@ mod tests {
         // An admin cert bound to the presenting key — the strongest thing a
         // client could offer — and one already expired at `now`.
         let admin_cert = foreign.issue_user_cert(
-            mac(5),
+            stranger.derived_mac(),
             stranger.ed_pubkey(),
             stranger.x_pubkey(),
             0,
@@ -1106,11 +1121,22 @@ mod tests {
             true,
         );
         // A plain member cert, and one issued to somebody else's key entirely.
-        let member_cert =
-            foreign.issue_cert(mac(6), stranger.ed_pubkey(), stranger.x_pubkey(), 0, 200);
+        let member_cert = foreign.issue_cert(
+            stranger.derived_mac(),
+            stranger.ed_pubkey(),
+            stranger.x_pubkey(),
+            0,
+            200,
+        );
         let other = Keypair::from_seed(&[9u8; 32]);
-        let other_cert =
-            foreign.issue_user_cert(mac(7), other.ed_pubkey(), other.x_pubkey(), 0, 200, true);
+        let other_cert = foreign.issue_user_cert(
+            other.derived_mac(),
+            other.ed_pubkey(),
+            other.x_pubkey(),
+            0,
+            200,
+            true,
+        );
 
         for (label, cert, now) in [
             ("no cert", None, 100),
@@ -1165,7 +1191,7 @@ mod tests {
         // A different root, a different mesh: rejected on the mesh id.
         let other_mesh = Authority::from_seed(&[42u8; 32], 0xBEEF);
         let cert = other_mesh.issue_user_cert(
-            mac(5),
+            attacker.derived_mac(),
             attacker.ed_pubkey(),
             attacker.x_pubkey(),
             0,
@@ -1188,7 +1214,7 @@ mod tests {
         // this from a genuine admin cert.
         let impostor = Authority::from_seed(&[42u8; 32], 0xABCD);
         let cert = impostor.issue_user_cert(
-            mac(5),
+            attacker.derived_mac(),
             attacker.ed_pubkey(),
             attacker.x_pubkey(),
             0,
@@ -1395,7 +1421,13 @@ mod tests {
         let anchor = authority.trust_anchor();
         let node = Keypair::from_seed(&[2u8; 32]);
         let ca_own = Keypair::from_seed(&[7u8; 32]);
-        let cert = authority.issue_cert(mac(3), node.ed_pubkey(), node.x_pubkey(), 100, 200);
+        let cert = authority.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            100,
+            200,
+        );
 
         assert_eq!(
             decide_access(
@@ -1418,7 +1450,7 @@ mod tests {
                 Some(&anchor),
                 Some(&ca_own.ed_pubkey()),
                 150,
-                |c: &VerifiedCert| c.mac == mac(3)
+                |c: &VerifiedCert| c.mac == node.derived_mac()
             ),
             MgmtAccess::Denied(MgmtDenied::Revoked)
         );

@@ -1308,8 +1308,14 @@ mod tests {
     use zerocopy::FromBytes;
     use zerocopy::IntoBytes;
 
+    /// The address the identity seeded with `n` derives.
+    ///
+    /// Since the key↔address binding (design 09 §5) a certificate's subject is
+    /// the address its key derives, so this module pairs `mac(n)` with the
+    /// keypair seeded `n` — as `member_auth` already did at every call site —
+    /// rather than numbering addresses independently of the keys it mints.
     fn mac(n: u8) -> Mac {
-        Mac([0, 0, 0, 0, 0, n])
+        Keypair::from_seed(&[n; 32]).derived_mac()
     }
 
     /// An `OgmAuth` for member `m`, seeded deterministically under `authority`,

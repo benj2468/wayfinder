@@ -938,11 +938,16 @@ mod tests {
         }
     }
 
-    fn submit_csr(mac: [u8; 6]) -> WayfinderRequest {
+    /// A CSR from the identity `seed` names, addressed to the MAC that
+    /// identity derives — the only address the authority will certify since the
+    /// key↔address binding landed (design 09 §5). `seed` is what makes one
+    /// request distinguishable from another.
+    fn submit_csr(seed: u8) -> WayfinderRequest {
+        let ed = [seed; 32];
         WayfinderRequest {
             request: Some(ReqKind::SubmitCsr(SubmitCsrRequest {
-                node_mac: mac.to_vec(),
-                ed_pubkey: [1u8; 32].to_vec(),
+                node_mac: wayfinder_auth::derive_mac(&ed).0.to_vec(),
+                ed_pubkey: ed.to_vec(),
                 x_pubkey: [2u8; 32].to_vec(),
                 enrollment_token: String::new(),
             })),
@@ -976,7 +981,12 @@ mod tests {
         let mut adapter = AuthorityAdapter::new(&mut ca, facts(true));
         assert!(
             adapter
-                .submit_csr(&mac(2), &[1u8; 32], &[2u8; 32], "")
+                .submit_csr(
+                    &wayfinder_auth::derive_mac(&[1u8; 32]).0,
+                    &[1u8; 32],
+                    &[2u8; 32],
+                    ""
+                )
                 .is_err(),
             "an authority with no clock must refuse to issue, not issue badly"
         );
@@ -987,7 +997,12 @@ mod tests {
         ca.set_now_unix(NOW_UNIX);
         let mut adapter = AuthorityAdapter::new(&mut ca, facts(true));
         let outcome = adapter
-            .submit_csr(&mac(2), &[1u8; 32], &[2u8; 32], "")
+            .submit_csr(
+                &wayfinder_auth::derive_mac(&[1u8; 32]).0,
+                &[1u8; 32],
+                &[2u8; 32],
+                "",
+            )
             .expect("a clocked authority issues");
         assert!(matches!(outcome, CsrOutcome::Issued(_)));
     }
@@ -1021,7 +1036,7 @@ mod tests {
         // below will tolerate.
         authority.comms.set_clock(NOW_UNIX + 999_999);
 
-        let response = authority.request(submit_csr(mac(3))).await;
+        let response = authority.request(submit_csr(3)).await;
 
         let Some(RespKind::SubmitCsr(csr)) = &response.response else {
             panic!(
@@ -1425,7 +1440,7 @@ mod tests {
         // A time from the router that no assertion below will tolerate.
         authority.comms.set_clock(NOW_UNIX);
 
-        let response = authority.request(submit_csr(mac(4))).await;
+        let response = authority.request(submit_csr(4)).await;
 
         let Some(RespKind::SubmitCsr(csr)) = &response.response else {
             panic!(
@@ -1478,7 +1493,7 @@ mod tests {
 
         let (reply_tx, reply_rx) = oneshot::channel();
         commands
-            .send(AuthorityCommand::Request(submit_csr(mac(4)), reply_tx))
+            .send(AuthorityCommand::Request(submit_csr(4), reply_tx))
             .await
             .expect("the authority task is running");
 

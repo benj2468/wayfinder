@@ -494,8 +494,34 @@ impl TestHarness {
 
 /// Build a [`Mac`] from a single compact byte, `00:00:00:00:00:n` — the address
 /// helper used throughout the mesh integration tests.
+///
+/// For *synthetic* originators a test invents (a destination three hops away
+/// that no machine in the harness plays), which is what it is for. A harness
+/// machine's own address is not the harness's to invent — see
+/// [`machine_keypair`].
 pub fn mac(n: u8) -> Mac {
     Mac([0, 0, 0, 0, 0, n])
+}
+
+/// The identity keypair machine `index` (zero-based, in config order) runs
+/// under.
+///
+/// A node's mesh address *is* the address its identity key derives (design 09
+/// §5, `derive_mac`), so the harness mints a key per machine and takes the
+/// address from it rather than numbering addresses independently. Exposed so a
+/// fixture enabling mesh auth mints its certificate under the same key the
+/// machine routes with — a certificate for any other address does not verify,
+/// and the symptom is a fixture that quietly fails to converge rather than one
+/// that fails loudly.
+pub fn machine_keypair(index: usize) -> wayfinder_auth::Keypair {
+    // Seeded from a one-based index so the seed and the machine's display name
+    // (`machine1`) stay in step, which is what makes a failing fixture legible.
+    wayfinder_auth::Keypair::from_seed(&[index as u8 + 1; 32])
+}
+
+/// The address machine `index` routes under: [`machine_keypair`]'s derived MAC.
+pub fn machine_ident(index: usize) -> Mac {
+    machine_keypair(index).derived_mac()
 }
 
 impl TestConfig {
@@ -518,11 +544,15 @@ impl TestConfig {
             }
         }
         for (i, machine) in self.machines.iter().enumerate() {
-            // One-based: `mac(0)` is `00:00:00:00:00:00`, the null address, and
-            // no node may hold a membership certificate for it — an authed
-            // fixture whose first machine got it would silently fail to
-            // converge rather than fail loudly.
-            let ident = mac(i as u8 + 1);
+            // Derived, not numbered: a node's address is the one its identity
+            // key derives, and a certificate may name no other (design 09 §5),
+            // so a harness that numbered addresses independently could not mint
+            // a working credential for its own machines.
+            //
+            // This also subsumes the reason the old numbering was one-based —
+            // `mac(0)` is the null address, which `verify_cert` refuses — since
+            // `derive_mac` never produces a reserved address at all.
+            let ident = machine_ident(i);
             // Capture the wiring so the node can be churned offline/online or
             // have individual links failed later.
             let switches: Vec<String> = machine

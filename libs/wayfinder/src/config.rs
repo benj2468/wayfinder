@@ -358,12 +358,23 @@ pub struct TapConfig {
     /// (e.g. `RawL2`) or a jumbo-frame underlay.
     #[serde(default)]
     pub mtu: Option<u16>,
-    /// Path persisting this node's TAP MAC address across restarts when mesh
-    /// auth (and its stable, seed-derived identity — see
-    /// [`Keypair::derived_mac`](wayfinder_auth::Keypair::derived_mac)) is not
-    /// configured. On first boot a fresh MAC is generated and written here; on
-    /// every subsequent boot it is read back and reused, so this node's mesh
-    /// identity does not silently change on restart.
+    /// Path persisting this node's TAP MAC address across restarts, for a node
+    /// that has **no identity key at all** to derive one from.
+    ///
+    /// Narrower than it used to be. A node routes under the address its
+    /// identity key derives whenever it has one (design 09 §5 — see
+    /// [`Keypair::derived_mac`](wayfinder_auth::Keypair::derived_mac)), and
+    /// that now includes a node with only a management server configured, since
+    /// its TLS server identity is an identity key like any other. So this file
+    /// is read only when there is no `[auth]` block, no runtime-installed
+    /// identity, *and* no management server — a node that cannot be enrolled
+    /// over the wire in any case.
+    ///
+    /// On first boot a fresh MAC is generated and written here; on every
+    /// subsequent boot it is read back and reused, so such a node's mesh
+    /// identity does not silently change on restart. A node that *does* have an
+    /// identity key logs a warning if this file disagrees with its derived
+    /// address, which is the one-time renumber that rule caused.
     ///
     /// Defaults to [`TapConfig::default_mac_state_path`] when unset — the
     /// operator normally never needs to set this.

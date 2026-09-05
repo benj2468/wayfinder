@@ -74,19 +74,14 @@ pub struct Args {
 }
 
 /// Load this node's persisted identity keypair from a 32-byte seed file.
+///
+/// Delegates to [`read_seed`] so there is exactly one place that opens a seed
+/// file and one shape of error from it: the `auth:` seed is now read twice on
+/// the startup path (once to resolve the node's identity and MAC, once here to
+/// build the keypair), and two reads of one secret with two error shapes is a
+/// seam that drifts.
 fn load_keypair(seed_path: &str) -> anyhow::Result<Keypair> {
-    // Named, unlike a bare `?`: this is the first file the node opens on the
-    // startup path, and an unwrapped `std::fs::read` here surfaces as nothing
-    // but "No such file or directory (os error 2)" after the welcome banner —
-    // no path, no clue which of the several configured paths was missing. Every
-    // other read on this path (`load_or_generate_mac`, the settings store)
-    // already names its file; this one did not.
-    let seed: [u8; 32] = std::fs::read(seed_path)
-        .with_context(|| format!("failed to read the identity seed at {seed_path}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("identity seed at {seed_path} must be 32 bytes"))?;
-    Ok(Keypair::from_seed(&seed))
+    Ok(Keypair::from_seed(&read_seed(seed_path)?))
 }
 
 /// Narrow raw seed bytes to the fixed-size seed, for a seed that came from
@@ -139,7 +134,15 @@ fn load_or_generate_mac(state_path: &str) -> anyhow::Result<[u8; 6]> {
 
 /// Read a 32-byte identity seed from `path`.
 fn read_seed(path: &str) -> anyhow::Result<[u8; 32]> {
-    std::fs::read(path)?
+    // Named, unlike a bare `?`: this is now the first file the node opens on
+    // the startup path (the identity seed is resolved before anything else), and
+    // an unwrapped `std::fs::read` here surfaces as nothing but "No such file or
+    // directory (os error 2)" after the welcome banner — no path, no clue which
+    // of the several configured paths was missing. `load_keypair` carried this
+    // context and was the first reader until the seed resolution moved above it;
+    // the context has to move too, or the diagnostic is lost.
+    std::fs::read(path)
+        .with_context(|| format!("failed to read the identity seed at {path}"))?
         .as_slice()
         .try_into()
         .map_err(|_| anyhow!("identity seed at {path} must be 32 bytes"))
@@ -328,37 +331,92 @@ async fn main() -> anyhow::Result<()> {
     // mode — is unchanged; only the local device differs.
     let local_egress = config.local_egress;
 
+    // Resolve this node's identity seed *once*, up front. Everything below is a
+    // function of it: the MAC the router answers to, and the management-TLS
+    // server identity a client pins. They used to be resolved by two separate
+    // matches of the same three-way shape, which is one match too many for two
+    // things that must never disagree.
+    //
+    // The precedence is the same one that applies everywhere else — an identity
+    // installed at runtime is the operator's more recent intent, so it wins over
+    // the `auth:` block, which in turn wins over a seed generated for the
+    // management port on first boot.
+    let mgmt_identity_seed_path = config.server.as_ref().map(|server| match server {
+        ServerConfig::Tls {
+            identity_seed_path, ..
+        } => identity_seed_path
+            .clone()
+            .unwrap_or_else(ServerConfig::default_identity_seed_path),
+    });
+    let node_identity_seed: Option<[u8; 32]> = match (&settings.identity, &config.auth) {
+        (Some(identity), _) => {
+            Some(seed_bytes(&identity.seed).context("runtime-installed identity seed")?)
+        }
+        (None, Some(auth_cfg)) => Some(read_seed(&auth_cfg.seed_path)?),
+        // No mesh identity yet. The management port still needs a stable server
+        // key, and generating it here rather than inside the server block is
+        // what lets the MAC below derive from it.
+        (None, None) => match &mgmt_identity_seed_path {
+            Some(path) => Some(load_or_generate_seed(path)?),
+            None => None,
+        },
+    };
+
     // Decide this node's MAC *before* creating the TAP device, rather than
     // trusting whatever the kernel assigns a freshly-created device — that is
     // random on every restart and would silently change this node's mesh
-    // identity (and, with auth enabled, its cert would stop matching) each
-    // time it starts. When mesh auth is configured, derive the MAC from the
-    // persisted identity keypair, so it is stable across restarts and
-    // self-consistent with the MAC the membership cert is bound to. Otherwise
-    // fall back to a MAC generated once and persisted to `tap.mac_state_path`.
+    // identity each time it starts.
     //
-    // An identity installed at runtime wins over the `auth:` block, for the
-    // same reason it does everywhere else: it is the operator's more recent
-    // intent. It has to be consulted *here*, not only where auth is enabled
-    // below — the MAC is what a certificate is bound to, so reading it later
-    // would give this node an address its own certificate is not.
+    // **A node routes under the address its identity key derives**, whenever it
+    // has an identity key at all. Since design 09 §5's key↔address binding a
+    // certificate may name no other address, so any other choice here would give
+    // this node an address it cannot be certified for — and would break
+    // enrollment rather than merely look untidy.
     //
-    // For that identity the *certificate* names the MAC, rather than the seed
-    // deriving it. The two agree when the identity was minted whole (offline
-    // `enroll` picks the MAC its keypair derives to), and they deliberately do
-    // not when a node enrolled online: there the node already had an address
-    // its peers knew it by, and the certificate was issued for that address
-    // precisely so joining a mesh does not move it. Deriving here instead would
-    // rename the node on its first restart after enrolling and orphan the
-    // certificate it just obtained.
-    let mac_addr = match (&settings.identity, &config.auth) {
-        (Some(identity), _) => {
-            MembershipCert::from_bytes(&identity.cert)
-                .ok_or_else(|| anyhow!("invalid membership cert in the runtime settings store"))?
-                .node_mac
+    // This is a change from the behaviour that preceded the binding, and worth
+    // stating because the old comment argued the opposite: a node enrolling
+    // online used to keep the address its peers already knew it by, and the
+    // certificate was issued for *that* address so joining a mesh did not move
+    // it. That is no longer expressible. An un-enrolled node runs under a
+    // provisional address until it has an identity to derive one from, and
+    // enrolling is what moves it — once, to the address it keeps. `csr request`
+    // says so out loud when it builds the request.
+    //
+    // The fallback survives for the one node that has no identity key at all:
+    // no `auth:` block, no runtime identity, and no management server to have
+    // generated a seed for. Such a node cannot be enrolled over the wire
+    // anyway, so a MAC generated once and persisted is exactly right for it.
+    let mac_addr = match node_identity_seed {
+        Some(seed) => {
+            let derived = Keypair::from_seed(&seed).derived_mac().0;
+            // A persisted MAC that disagrees is this node's *previous* address:
+            // it ran under a randomly-generated one before the binding made the
+            // address a function of the identity key. Said out loud, once,
+            // because this is the only place in the flow where the renumber
+            // actually happens — `csr request` and the dashboard warn about a
+            // renumber they are *about* to cause, and this one has no such
+            // warning attached to it at all.
+            //
+            // `warn!`, not `info!`: it is not reachable by remote input (it is a
+            // local file read at startup), it happens at most once in a node's
+            // life, and an operator who learns about it from peers going quiet
+            // learns about it the worst way.
+            if let Ok(previous) = std::fs::read(&mac_state_path)
+                && previous.as_slice() != derived
+            {
+                tracing::warn!(
+                    previous = %pretty_hex::simple_hex(&previous),
+                    now = %pretty_hex::simple_hex(&derived),
+                    state_path = %mac_state_path,
+                    "this node has renumbered: its address is now the one its \
+                     identity key derives. Peers will relearn it; anything pinned \
+                     to the old address needs updating, and the state file is now \
+                     stale and unread."
+                );
+            }
+            derived
         }
-        (None, Some(auth_cfg)) => load_keypair(&auth_cfg.seed_path)?.derived_mac().0,
-        (None, None) => load_or_generate_mac(&mac_state_path)?,
+        None => load_or_generate_mac(&mac_state_path)?,
     };
 
     let local: Box<dyn FrameIo> = match local_egress {
@@ -523,11 +581,6 @@ async fn main() -> anyhow::Result<()> {
     // giving the server task direct access to the router. Installed on the
     // driver below, after it's built.
     let mut auth_snapshot_rx: Option<AuthSnapshotRx> = None;
-    // The identity this node runs as, once resolved below. Handed to the driver
-    // so the management API can report its public half and certify it on
-    // enrollment — the same key the TLS server presents, so a client that
-    // enrolls this node certifies the identity it was already talking to.
-    let mut node_identity_seed: Option<[u8; 32]> = None;
 
     /// A management listener that is bound but not yet served.
     ///
@@ -568,29 +621,24 @@ async fn main() -> anyhow::Result<()> {
     if let Some(server_cfg) = config.server {
         let tx = query_tx.clone();
         match server_cfg {
-            ServerConfig::Tls {
-                addr,
-                identity_seed_path,
-            } => {
-                // The TLS server identity: an identity installed at runtime
-                // wins (the operator's more recent intent, and the same
-                // precedence the MAC above follows), else the mesh membership
-                // seed when one is configured, else a dedicated persistent
-                // identity seed generated on first boot. It must exist even
-                // before enrollment, since a client with no certificate yet
-                // authenticates by proving this key.
-                let identity_seed = match (&settings.identity, &config.auth) {
-                    (Some(identity), _) => {
-                        seed_bytes(&identity.seed).context("runtime-installed identity seed")?
-                    }
-                    (None, Some(auth_cfg)) => read_seed(&auth_cfg.seed_path)?,
-                    (None, None) => {
-                        let path = identity_seed_path
-                            .unwrap_or_else(ServerConfig::default_identity_seed_path);
-                        load_or_generate_seed(&path)?
-                    }
-                };
-                node_identity_seed = Some(identity_seed);
+            // `identity_seed_path` is consumed at the top of startup, where the
+            // node's one identity seed is resolved; only the bind address is
+            // this block's business.
+            ServerConfig::Tls { addr, .. } => {
+                // The TLS server identity is the node's identity, resolved
+                // once at the top of startup — the same key the MAC derives
+                // from, so a client that enrolls this node certifies the
+                // identity it was already talking to, at the address that
+                // identity gives it. It must exist even before enrollment,
+                // since a client with no certificate yet authenticates by
+                // proving this key.
+                //
+                let identity_seed = node_identity_seed.ok_or_else(|| {
+                    anyhow!(
+                        "the management server needs an identity seed, and none was \
+                         resolved at startup"
+                    )
+                })?;
                 // Bound here, so an address already in use is a startup error
                 // an operator sees immediately — but *served* below, once the
                 // driver exists to hand out the read handle the connection
@@ -731,9 +779,30 @@ async fn main() -> anyhow::Result<()> {
 
         // The cert must bind this node's MAC, or it would sign OGMs no peer
         // attributes to us.
+        //
+        // Load-bearing, and *more* so since the key↔address binding (design 09
+        // §5) rather than less. Note what this path does **not** do: it hands
+        // the certificate straight to `OgmAuth::new` without calling
+        // `verify_cert` on it, so for material read from an operator's `auth:`
+        // files this comparison is the only structural check standing between a
+        // wrong cert and a node that boots happily while every peer drops its
+        // OGMs. (It is the certificate's own subject against a MAC derived from
+        // the seed beside it, so it catches a cert/seed pair copied from
+        // different nodes — the likeliest way to get here.)
+        //
+        // The binding also made this reachable on the runtime-identity path,
+        // where it previously could not fire at all: `mac_addr` used to be read
+        // *out of this very certificate*, making the comparison tautological.
+        // Deriving it from the seed is what gives the two sides independent
+        // provenance and so something to disagree about.
+        //
+        // A misattributed OGM is a silent fault; refusing to start is not.
         if cert.node_mac != mac_addr {
             bail!(
-                "membership cert is bound to MAC {:?}, but this node's MAC is {:?}",
+                "membership cert is bound to MAC {:?}, but this node's MAC is {:?} — \
+                 a certificate's MAC must be the address its identity key derives, so \
+                 this certificate belongs to a different key (or predates that rule \
+                 and must be re-issued)",
                 cert.node_mac,
                 mac_addr
             );

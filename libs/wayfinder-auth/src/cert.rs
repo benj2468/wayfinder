@@ -13,6 +13,7 @@ use zerocopy::byteorder::network_endian::U64;
 
 use crate::error::AuthError;
 use crate::key::verify_signature;
+use crate::mac::derive_mac;
 
 /// Version byte stamped on every [`MembershipCert`] this build produces and the
 /// only version it accepts.  Bump when the signed layout changes.
@@ -229,9 +230,11 @@ pub struct VerifiedCert {
 /// [`force_locally_administered_unicast`](crate::mac::force_locally_administered_unicast),
 /// which stamps the same convention on every address this crate hands out. It
 /// is deliberately *narrower* than that convention: it does not require the
-/// locally-administered bit, because a node may legitimately route under a
-/// globally-administered address its hardware came with — only addresses that
-/// mean "not one node" are refused.
+/// locally-administered bit. Only addresses that mean "not one node" are
+/// refused; whether an address follows this crate's derivation convention is a
+/// separate question, answered by the key↔address binding in `verify_cert`
+/// rather than folded in here. Keeping the two apart is what lets each error
+/// name its own mistake.
 fn is_reserved_mac(mac: [u8; 6]) -> bool {
     mac[0] & 0x01 != 0 || mac == [0u8; 6]
 }
@@ -270,11 +273,20 @@ impl TrustAnchor {
     ///
     /// Checks, in order: the version byte, that the cert is for *this* mesh, the
     /// root signature, that the subject MAC is one a node can actually route
-    /// under (not broadcast, not multicast, not the null address), and the
-    /// validity window.  Returns the trusted facts on success, or the first
-    /// failing [`AuthError`].
+    /// under (not broadcast, not multicast, not the null address), that the
+    /// subject MAC is the address its `ed_pubkey` derives, and the validity
+    /// window.  Returns the trusted facts on success, or the first failing
+    /// [`AuthError`].
     /// Fail-closed: any error means the cert (and the frame carrying it) must
     /// be rejected.
+    ///
+    /// The order of the last three is deliberate and tested. Both address
+    /// checks sit *after* the signature, so a forgery is reported as one rather
+    /// than as a misissuance; and the reserved-address check sits before the
+    /// derivation check, because every reserved subject fails both — a derived
+    /// address is never reserved — and "the CA bound a broadcast address" names
+    /// the mistake where "the MAC does not match the key" describes a symptom
+    /// of it.
     pub fn verify_cert(
         &self,
         cert: &MembershipCert,
@@ -296,6 +308,15 @@ impl TrustAnchor {
         // Taken by value, like the window fields below — no refs into packed.
         if is_reserved_mac(cert.node_mac) {
             return Err(AuthError::ReservedAddress);
+        }
+        // The key↔address binding, and the reason a *compromised* authority
+        // still cannot mint an impersonation credential: producing a cert for
+        // an address some other key derives would need a `derive_mac` preimage,
+        // which signing does not provide.  Ordered after `is_reserved_mac`
+        // because a reserved subject fails both and the reserved diagnosis is
+        // the one that names the mistake.
+        if derive_mac(&cert.ed_pubkey) != Mac(cert.node_mac) {
+            return Err(AuthError::MacKeyMismatch);
         }
         // Copy out of the packed struct before comparing (no refs into packed).
         let not_before = cert.not_before.get();
@@ -350,7 +371,13 @@ mod tests {
     fn issued_member_cert_carries_the_member_capability() {
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
         let node = Keypair::from_seed(&[2u8; 32]);
-        let cert = authority.issue_cert(mac(5), node.ed_pubkey(), node.x_pubkey(), 100, 200);
+        let cert = authority.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            100,
+            200,
+        );
 
         let verified = authority.trust_anchor().verify_cert(&cert, 150).unwrap();
         assert!(verified.member, "an enrolled device is a member");
@@ -370,7 +397,7 @@ mod tests {
 
         for admin in [true, false] {
             let cert = authority.issue_user_cert(
-                mac(6),
+                session.derived_mac(),
                 session.ed_pubkey(),
                 session.x_pubkey(),
                 100,
@@ -395,8 +422,14 @@ mod tests {
         let node = Keypair::from_seed(&[2u8; 32]);
         // Signed with no flags at all, standing in for a cert issued before the
         // member bit existed.
-        let legacy =
-            authority.issue_with_flags(mac(5), node.ed_pubkey(), node.x_pubkey(), 100, 200, 0);
+        let legacy = authority.issue_with_flags(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            100,
+            200,
+            0,
+        );
 
         let verified = authority.trust_anchor().verify_cert(&legacy, 150).unwrap();
         assert!(!verified.member);
@@ -411,10 +444,16 @@ mod tests {
     fn issued_cert_verifies() {
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
         let node = Keypair::from_seed(&[2u8; 32]);
-        let cert = authority.issue_cert(mac(5), node.ed_pubkey(), node.x_pubkey(), 100, 200);
+        let cert = authority.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            100,
+            200,
+        );
 
         let verified = authority.trust_anchor().verify_cert(&cert, 150).unwrap();
-        assert_eq!(verified.mac, mac(5));
+        assert_eq!(verified.mac, node.derived_mac());
         assert_eq!(verified.ed_pubkey, node.ed_pubkey());
         assert_eq!(verified.x_pubkey, node.x_pubkey());
         assert_eq!(verified.not_after, 200);
@@ -434,15 +473,27 @@ mod tests {
         let anchor = authority.trust_anchor();
 
         // A plain membership cert carries no admin capability.
-        let member = authority.issue_cert(mac(5), node.ed_pubkey(), node.x_pubkey(), 100, 200);
+        let member = authority.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            100,
+            200,
+        );
         assert!(
             !anchor.verify_cert(&member, 150).unwrap().admin,
             "a plain membership cert must not be an admin"
         );
 
         // A cert the CA issued with the admin capability verifies as admin.
-        let admin =
-            authority.issue_user_cert(mac(6), node.ed_pubkey(), node.x_pubkey(), 100, 200, true);
+        let admin = authority.issue_user_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            100,
+            200,
+            true,
+        );
         assert!(
             anchor.verify_cert(&admin, 150).unwrap().admin,
             "an admin-issued cert must carry the admin capability once verified"
@@ -456,7 +507,13 @@ mod tests {
         let ours = Authority::from_seed(&[1u8; 32], 0xABCD);
         let theirs = Authority::from_seed(&[9u8; 32], 0xABCD);
         let node = Keypair::from_seed(&[2u8; 32]);
-        let cert = theirs.issue_cert(mac(5), node.ed_pubkey(), node.x_pubkey(), 100, 200);
+        let cert = theirs.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            100,
+            200,
+        );
         assert_eq!(
             ours.trust_anchor().verify_cert(&cert, 150),
             Err(AuthError::BadSignature)
@@ -468,7 +525,13 @@ mod tests {
     fn wrong_mesh_rejected() {
         let authority = Authority::from_seed(&[1u8; 32], 0x1111);
         let node = Keypair::from_seed(&[2u8; 32]);
-        let cert = authority.issue_cert(mac(5), node.ed_pubkey(), node.x_pubkey(), 100, 200);
+        let cert = authority.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            100,
+            200,
+        );
         let mut anchor = authority.trust_anchor();
         anchor.mesh_id = 0x2222;
         assert_eq!(anchor.verify_cert(&cert, 150), Err(AuthError::WrongMesh));
@@ -479,7 +542,13 @@ mod tests {
     fn expiry_window_enforced() {
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
         let node = Keypair::from_seed(&[2u8; 32]);
-        let cert = authority.issue_cert(mac(5), node.ed_pubkey(), node.x_pubkey(), 100, 200);
+        let cert = authority.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            100,
+            200,
+        );
         let anchor = authority.trust_anchor();
         assert_eq!(anchor.verify_cert(&cert, 99), Err(AuthError::NotYetValid));
         assert_eq!(anchor.verify_cert(&cert, 201), Err(AuthError::Expired));
@@ -511,7 +580,7 @@ mod tests {
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
         let node = Keypair::from_seed(&[2u8; 32]);
         let cert = authority.issue_cert(
-            mac(5),
+            node.derived_mac(),
             node.ed_pubkey(),
             node.x_pubkey(),
             ISSUED_AT,
@@ -545,7 +614,13 @@ mod tests {
     fn a_zero_not_before_is_what_hid_the_unclocked_gap() {
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
         let node = Keypair::from_seed(&[2u8; 32]);
-        let cert = authority.issue_cert(mac(5), node.ed_pubkey(), node.x_pubkey(), 0, 200);
+        let cert = authority.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            0,
+            200,
+        );
 
         assert!(
             authority.trust_anchor().verify_cert(&cert, 0).is_ok(),
@@ -558,7 +633,13 @@ mod tests {
     fn tampered_cert_rejected() {
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
         let node = Keypair::from_seed(&[2u8; 32]);
-        let mut cert = authority.issue_cert(mac(5), node.ed_pubkey(), node.x_pubkey(), 100, 200);
+        let mut cert = authority.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            100,
+            200,
+        );
         // Flip the bound MAC; the signature no longer covers these bytes.
         cert.node_mac = mac(6).0;
         assert_eq!(
@@ -572,7 +653,13 @@ mod tests {
     fn cert_roundtrips_through_bytes() {
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
         let node = Keypair::from_seed(&[2u8; 32]);
-        let cert = authority.issue_cert(mac(5), node.ed_pubkey(), node.x_pubkey(), 100, 200);
+        let cert = authority.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            100,
+            200,
+        );
         let bytes = cert.as_bytes().to_vec();
         let (parsed, _) = MembershipCert::ref_from_prefix(&bytes).unwrap();
         assert!(authority.trust_anchor().verify_cert(parsed, 150).is_ok());
@@ -584,7 +671,13 @@ mod tests {
     fn fingerprint_is_deterministic() {
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
         let node = Keypair::from_seed(&[2u8; 32]);
-        let cert = authority.issue_cert(mac(5), node.ed_pubkey(), node.x_pubkey(), 100, 200);
+        let cert = authority.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            100,
+            200,
+        );
         assert_eq!(cert.fingerprint(), cert.fingerprint());
     }
 
@@ -595,7 +688,13 @@ mod tests {
     fn fingerprint_changes_when_cert_changes() {
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
         let node = Keypair::from_seed(&[2u8; 32]);
-        let cert_a = authority.issue_cert(mac(5), node.ed_pubkey(), node.x_pubkey(), 100, 200);
+        let cert_a = authority.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            100,
+            200,
+        );
         let mut cert_b = cert_a;
         cert_b.node_mac = mac(6).0;
         assert_ne!(cert_a.fingerprint(), cert_b.fingerprint());
@@ -607,8 +706,20 @@ mod tests {
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
         let node_a = Keypair::from_seed(&[2u8; 32]);
         let node_b = Keypair::from_seed(&[3u8; 32]);
-        let cert_a = authority.issue_cert(mac(5), node_a.ed_pubkey(), node_a.x_pubkey(), 100, 200);
-        let cert_b = authority.issue_cert(mac(6), node_b.ed_pubkey(), node_b.x_pubkey(), 100, 200);
+        let cert_a = authority.issue_cert(
+            node_a.derived_mac(),
+            node_a.ed_pubkey(),
+            node_a.x_pubkey(),
+            100,
+            200,
+        );
+        let cert_b = authority.issue_cert(
+            node_b.derived_mac(),
+            node_b.ed_pubkey(),
+            node_b.x_pubkey(),
+            100,
+            200,
+        );
         assert_ne!(cert_a.fingerprint(), cert_b.fingerprint());
     }
 
@@ -639,28 +750,158 @@ mod tests {
         }
     }
 
-    /// The reserved-address check is narrow: it must not reject the addresses
-    /// nodes actually route under — a derived locally-administered unicast MAC,
-    /// or the globally-administered one an OS-assigned device carries.
+    /// The reserved-address check is narrow: it must not reject the address a
+    /// node actually routes under, which since the key↔address binding landed
+    /// is the derived one and only that.
+    ///
+    /// Narrowness is now pinned on [`is_reserved_mac`] directly
+    /// (`reserved_check_admits_a_globally_administered_address`) rather than
+    /// through `verify_cert`, because `verify_cert` no longer admits *any*
+    /// address a key does not derive — there is no globally-administered MAC
+    /// left to feed it.
     #[test]
     fn ordinary_unicast_node_mac_still_verifies() {
         let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
-        let node = Keypair::from_seed(&[2u8; 32]);
         let anchor = authority.trust_anchor();
 
-        for ordinary in [
-            derive_mac(&node.ed_pubkey()),
-            mac(5),
-            Mac([0x02, 0, 0, 0, 0, 1]),
-        ] {
-            let cert = authority.issue_cert(ordinary, node.ed_pubkey(), node.x_pubkey(), 100, 200);
+        for seed in [2u8, 9, 200] {
+            let node = Keypair::from_seed(&[seed; 32]);
+            let cert = authority.issue_cert(
+                node.derived_mac(),
+                node.ed_pubkey(),
+                node.x_pubkey(),
+                100,
+                200,
+            );
             assert!(
                 anchor.verify_cert(&cert, 150).is_ok(),
-                "ordinary address {ordinary:?} must verify",
+                "a derived address from seed {seed} must verify",
             );
         }
     }
 
+    /// `is_reserved_mac` stays narrower than the convention `derive_mac`
+    /// stamps: it refuses only addresses meaning "not one node", never a
+    /// globally-administered address a node's hardware came with.
+    ///
+    /// Tested on the predicate rather than through `verify_cert` — see
+    /// `ordinary_unicast_node_mac_still_verifies` for why that route is closed.
+    #[test]
+    fn reserved_check_admits_a_globally_administered_address() {
+        // Locally-administered bit clear, group bit clear: not this crate's
+        // convention, but a real unicast address all the same.
+        assert!(!is_reserved_mac([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]));
+        assert!(!is_reserved_mac([0x02, 0, 0, 0, 0, 1]));
+        assert!(is_reserved_mac([0xFF; 6]));
+        assert!(is_reserved_mac([0x01, 0, 0, 0, 0, 1]));
+        assert!(is_reserved_mac([0u8; 6]));
+    }
+
+    /// A certificate's `node_mac` must be the address its `ed_pubkey` derives.
+    ///
+    /// This is the half of gap 4 that holds even against a *compromised*
+    /// authority: minting a credential that binds an attacker's key to a
+    /// victim's address would need a `derive_mac` preimage, which a signing key
+    /// does not provide. Every node enforces it for itself, so the key↔address
+    /// binding stops being a policy no node can audit.
+    #[test]
+    fn node_mac_must_derive_from_its_ed_pubkey() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let victim = Keypair::from_seed(&[2u8; 32]);
+        let attacker = Keypair::from_seed(&[3u8; 32]);
+        let anchor = authority.trust_anchor();
+
+        // Genuinely CA-signed, and binding the attacker's key to the victim's
+        // address: exactly the misissuance `submit_csr` used to accept.
+        let impersonation = authority.issue_cert(
+            victim.derived_mac(),
+            attacker.ed_pubkey(),
+            attacker.x_pubkey(),
+            100,
+            200,
+        );
+        assert_eq!(
+            anchor.verify_cert(&impersonation, 150),
+            Err(AuthError::MacKeyMismatch),
+            "a cert naming another key's address must not verify",
+        );
+
+        // An invented address belonging to nobody is refused by the same rule.
+        let invented =
+            authority.issue_cert(mac(5), attacker.ed_pubkey(), attacker.x_pubkey(), 100, 200);
+        assert_eq!(
+            anchor.verify_cert(&invented, 150),
+            Err(AuthError::MacKeyMismatch),
+            "a cert naming an address no key derives must not verify",
+        );
+    }
+
+    /// The agreement key is deliberately *not* part of the binding: only
+    /// `ed_pubkey` derives the address, so a certificate that rotates x25519
+    /// material alone still verifies.
+    ///
+    /// This matches the authority's own live-member identity lock (§8.9),
+    /// which compares `ed_pubkey` alone for the same reason — a wider rule here
+    /// would reject a certificate this mesh's authority had just issued.
+    #[test]
+    fn x_pubkey_is_not_part_of_the_mac_binding() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let node = Keypair::from_seed(&[2u8; 32]);
+        let rekeyed_agreement = Keypair::from_seed(&[3u8; 32]);
+        let anchor = authority.trust_anchor();
+
+        let cert = authority.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            rekeyed_agreement.x_pubkey(),
+            100,
+            200,
+        );
+        assert!(anchor.verify_cert(&cert, 150).is_ok());
+    }
+
+    /// A reserved address is reported as reserved, not as a key mismatch.
+    ///
+    /// Both faults hold at once — `derive_mac` can never produce a reserved
+    /// address, so every reserved subject also mismatches — and the order is
+    /// load-bearing for the operator reading the error: "the CA bound a
+    /// broadcast address" names the mistake, where "the MAC does not match the
+    /// key" describes a symptom of it.
+    #[test]
+    fn reserved_address_outranks_the_mac_key_mismatch() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let node = Keypair::from_seed(&[2u8; 32]);
+        let anchor = authority.trust_anchor();
+
+        let cert =
+            authority.issue_cert(Mac([0xFF; 6]), node.ed_pubkey(), node.x_pubkey(), 100, 200);
+        assert_eq!(
+            anchor.verify_cert(&cert, 150),
+            Err(AuthError::ReservedAddress),
+        );
+    }
+
+    /// A forgery is reported as a bad signature, not as a key mismatch: the
+    /// binding check sits after the signature check so an unsigned cert is
+    /// never described as a misissuance.
+    #[test]
+    fn bad_signature_outranks_the_mac_key_mismatch() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let node = Keypair::from_seed(&[2u8; 32]);
+        let anchor = authority.trust_anchor();
+
+        let mut cert = authority.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            100,
+            200,
+        );
+        // Repoint the subject at an address the key does not derive, which also
+        // invalidates the signature over the body.
+        cert.node_mac = mac(6).0;
+        assert_eq!(anchor.verify_cert(&cert, 150), Err(AuthError::BadSignature));
+    }
+
     use crate::key::Keypair;
-    use crate::mac::derive_mac;
 }

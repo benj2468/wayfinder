@@ -3483,8 +3483,13 @@ mod cert_responder {
     use zerocopy::FromBytes;
     use zerocopy::IntoBytes;
 
+    /// The address the identity seeded with `n` derives.
+    ///
+    /// Since the key↔address binding (design 09 §5) a certificate's subject is
+    /// the address its key derives, so this module pairs `mac(n)` with the
+    /// keypair seeded `n` rather than numbering addresses independently.
     fn mac(n: u8) -> Mac {
-        Mac([0, 0, 0, 0, 0, n])
+        wayfinder_auth::Keypair::from_seed(&[n; 32]).derived_mac()
     }
 
     fn link_frame_bytes(src: u8, dst: u8, payload: &[u8]) -> Vec<u8> {
@@ -4694,13 +4699,25 @@ mod ogm_auth_integration {
     use wayfinder_auth::Keypair;
     use zerocopy::FromBytes;
 
+    /// The address the identity seeded with `n` derives.
+    ///
+    /// Since the key↔address binding (design 09 §5) a certificate's subject is
+    /// the address its key derives, so this module pairs `mac(n)` with the
+    /// keypair seeded `n` rather than numbering addresses independently.
     fn mac(n: u8) -> Mac {
-        Mac([0, 0, 0, 0, 0, n])
+        wayfinder_auth::Keypair::from_seed(&[n; 32]).derived_mac()
     }
 
-    /// A router for node `m` with auth enabled against `authority`'s mesh.
-    fn router_with_auth(authority: &Authority, m: Mac, seed: u8) -> CentralRouter {
-        let kp = Keypair::from_seed(&[seed; 32]);
+    /// A router for the node whose identity is seeded with `n`, with auth
+    /// enabled against `authority`'s mesh.
+    ///
+    /// Takes one number, not an address and a seed: the address *is* `mac(n)`
+    /// (design 09 §5 — a certificate's subject is the address its key derives),
+    /// so passing them separately only created the chance to pair the wrong
+    /// ones, which is what the fixtures here used to do.
+    fn router_with_auth(authority: &Authority, n: u8) -> CentralRouter {
+        let m = mac(n);
+        let kp = Keypair::from_seed(&[n; 32]);
         let cert = authority.issue_cert(m, kp.ed_pubkey(), kp.x_pubkey(), 0, 1000);
         let mut r = CentralRouter::new(m);
         let mut auth = crate::auth::OgmAuth::new(kp, cert, authority.trust_anchor());
@@ -4789,7 +4806,7 @@ mod ogm_auth_integration {
     fn authentication_never_varies_by_link() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
 
-        let mut signer = router_with_auth(&authority, mac(1), 2);
+        let mut signer = router_with_auth(&authority, 1);
         let signed = poll_ogm_bytes(&mut signer);
         let mut plain = CentralRouter::new(mac(1));
         let unsigned = poll_ogm_bytes(&mut plain);
@@ -4797,14 +4814,14 @@ mod ogm_auth_integration {
         // Every interface the router has, not just a sample: a per-link escape
         // hatch would most plausibly be added for one specific index.
         for iface in 0..MAX_INTERFACES {
-            let mut node = router_with_auth(&authority, mac(2), 3);
+            let mut node = router_with_auth(&authority, 2);
             assert_eq!(
                 feed_on(&mut node, mac(1), &signed, iface),
                 1,
                 "a signed OGM must be accepted on interface {iface}"
             );
 
-            let mut node = router_with_auth(&authority, mac(2), 3);
+            let mut node = router_with_auth(&authority, 2);
             assert_eq!(
                 feed_on(&mut node, mac(1), &unsigned, iface),
                 0,
@@ -4818,9 +4835,9 @@ mod ogm_auth_integration {
     #[test]
     fn signed_ogm_accepted_by_same_mesh() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut a = router_with_auth(&authority, mac(1), 2);
+        let mut a = router_with_auth(&authority, 1);
         let ogm = poll_ogm_bytes(&mut a);
-        let mut b = router_with_auth(&authority, mac(2), 3);
+        let mut b = router_with_auth(&authority, 2);
         assert_eq!(feed(&mut b, mac(1), &ogm), 1);
     }
 
@@ -4830,7 +4847,7 @@ mod ogm_auth_integration {
         let mut plain = CentralRouter::new(mac(1));
         let ogm = poll_ogm_bytes(&mut plain);
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut b = router_with_auth(&authority, mac(2), 3);
+        let mut b = router_with_auth(&authority, 2);
         assert_eq!(
             feed(&mut b, mac(1), &ogm),
             0,
@@ -4914,10 +4931,10 @@ mod ogm_auth_integration {
     #[test]
     fn foreign_mesh_ogm_dropped() {
         let theirs = Authority::from_seed(&[9; 32], 0xABCD);
-        let mut foreign = router_with_auth(&theirs, mac(1), 2);
+        let mut foreign = router_with_auth(&theirs, 1);
         let ogm = poll_ogm_bytes(&mut foreign);
         let ours = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut b = router_with_auth(&ours, mac(2), 3);
+        let mut b = router_with_auth(&ours, 2);
         assert_eq!(
             feed(&mut b, mac(1), &ogm),
             0,
@@ -5011,7 +5028,7 @@ mod ogm_auth_integration {
         assert!(!node.auth_locked(), "a valid cert unlocks the router");
 
         // A signed OGM from a same-mesh peer is now processed normally.
-        let mut authed_peer = router_with_auth(&authority, mac(1), 2);
+        let mut authed_peer = router_with_auth(&authority, 1);
         let signed_ogm = poll_ogm_bytes(&mut authed_peer);
         assert_eq!(
             feed(&mut node, mac(1), &signed_ogm),
@@ -5173,9 +5190,9 @@ mod ogm_auth_integration {
     #[test]
     fn forged_keepalive_cannot_resurrect_a_dead_route() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut dest = router_with_auth(&authority, mac(9), 9);
-        let mut neighbor_a = router_with_auth(&authority, mac(2), 2);
-        let mut router = router_with_auth(&authority, mac(1), 1);
+        let mut dest = router_with_auth(&authority, 9);
+        let mut neighbor_a = router_with_auth(&authority, 2);
+        let mut router = router_with_auth(&authority, 1);
 
         // `dest` originates one signed OGM; the same signed bytes are
         // relayed to `router` via two different neighbors with different
@@ -5264,8 +5281,8 @@ mod ogm_auth_integration {
     #[test]
     fn handle_local_refuses_a_route_with_no_proven_next_hop() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut dest = router_with_auth(&authority, mac(9), 9);
-        let mut router = router_with_auth(&authority, mac(1), 1);
+        let mut dest = router_with_auth(&authority, 9);
+        let mut router = router_with_auth(&authority, 1);
 
         // `dest`'s own signed OGM, relayed by mac(2) — a route is learned,
         // but nothing about the relay is trusted: `router` has never even
@@ -5289,7 +5306,7 @@ mod ogm_auth_integration {
     #[test]
     fn handle_local_still_falls_back_to_an_unrouted_destination() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut router = router_with_auth(&authority, mac(1), 1);
+        let mut router = router_with_auth(&authority, 1);
 
         let mut tx = [0u8; 256];
         let out = router
@@ -5317,9 +5334,9 @@ mod ogm_auth_integration {
     #[test]
     fn an_uncredentialed_candidate_does_not_starve_a_legitimate_ones_proof() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut router = router_with_auth(&authority, mac(1), 1);
-        let mut orig = router_with_auth(&authority, mac(9), 9);
-        let mut real_neighbor = router_with_auth(&authority, mac(2), 2);
+        let mut router = router_with_auth(&authority, 1);
+        let mut orig = router_with_auth(&authority, 9);
+        let mut real_neighbor = router_with_auth(&authority, 2);
 
         // An outsider (mac 3, no credential at all) relays `orig`'s genuine
         // signed OGM under its own link-layer source. `router` verifies
@@ -5377,11 +5394,11 @@ mod ogm_auth_integration {
     #[test]
     fn a_revoked_sender_stops_populating_the_link_quality_table() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut node = router_with_auth(&authority, mac(1), 2);
+        let mut node = router_with_auth(&authority, 1);
         let revoked = mac(9);
 
         // Baseline: an ordinary member's OGM builds the row this is about.
-        let mut peer = router_with_auth(&authority, revoked, 3);
+        let mut peer = router_with_auth(&authority, 9);
         let ogm = poll_ogm_bytes(&mut peer);
         assert_eq!(feed(&mut node, revoked, &ogm), 1);
         assert!(
@@ -5426,15 +5443,18 @@ mod ogm_auth_integration {
     #[test]
     fn a_readmitted_node_is_not_locked_out_by_the_revoked_sender_gate() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut node = router_with_auth(&authority, mac(1), 2);
+        let mut node = router_with_auth(&authority, 1);
         let readmitted = mac(9);
 
         let record = authority.revoke(readmitted, 50, 1_000_000);
         assert!(node.ingest_revocation(&record, Duration::ZERO));
 
         // Re-issued *after* the revocation instant: a deliberate re-admission,
-        // which `RevocationRecord::cancels` spares.
-        let kp = Keypair::from_seed(&[3; 32]);
+        // which `RevocationRecord::cancels` spares. Under the *same* key, which
+        // is the only shape re-admission can take now — a certificate names the
+        // address its key derives, so a re-keyed node is a different address and
+        // a different originator (design 09 §5).
+        let kp = Keypair::from_seed(&[9; 32]);
         let cert = authority.issue_cert(readmitted, kp.ed_pubkey(), kp.x_pubkey(), 60, 1000);
         let mut peer = CentralRouter::new(readmitted);
         let mut auth = crate::auth::OgmAuth::new(kp, cert, authority.trust_anchor());
@@ -5498,7 +5518,7 @@ mod ogm_auth_integration {
         let frame = LinkFrame::ref_from_bytes(&bytes).unwrap();
 
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut node = router_with_auth(&authority, mac(1), 2);
+        let mut node = router_with_auth(&authority, 1);
         let record = authority.revoke(relay, 50, 1_000_000);
         assert!(node.ingest_revocation(&record, Duration::ZERO));
 
@@ -5532,12 +5552,20 @@ mod lazy_cert_distribution_switchover {
     use wayfinder_auth::Authority;
     use wayfinder_auth::Keypair;
 
+    /// The address the identity seeded with `n` derives.
+    ///
+    /// Since the key↔address binding (design 09 §5) a certificate's subject is
+    /// the address its key derives, so this module pairs `mac(n)` with the
+    /// keypair seeded `n` rather than numbering addresses independently.
     fn mac(n: u8) -> Mac {
-        Mac([0, 0, 0, 0, 0, n])
+        wayfinder_auth::Keypair::from_seed(&[n; 32]).derived_mac()
     }
 
-    fn router_with_auth(authority: &Authority, m: Mac, seed: u8) -> CentralRouter {
-        let kp = Keypair::from_seed(&[seed; 32]);
+    /// A router for the node seeded with `n`; its address is `mac(n)`, because
+    /// a certificate's subject is the address its key derives (design 09 §5).
+    fn router_with_auth(authority: &Authority, n: u8) -> CentralRouter {
+        let m = mac(n);
+        let kp = Keypair::from_seed(&[n; 32]);
         let cert = authority.issue_cert(m, kp.ed_pubkey(), kp.x_pubkey(), 0, 1000);
         let mut r = CentralRouter::new(m);
         let mut auth = crate::auth::OgmAuth::new(kp, cert, authority.trust_anchor());
@@ -5551,7 +5579,7 @@ mod lazy_cert_distribution_switchover {
     #[test]
     fn flag_off_emits_full_cert() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut a = router_with_auth(&authority, mac(1), 2);
+        let mut a = router_with_auth(&authority, 1);
         let mut tx = [0u8; 1500];
         let ogm = a.poll(core::time::Duration::ZERO, &mut tx).unwrap().payload;
         let hdr_len = core::mem::size_of::<batman::wire::BatmanOgmPacket>();
@@ -5564,7 +5592,7 @@ mod lazy_cert_distribution_switchover {
     #[test]
     fn flag_on_emits_fingerprint_only() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut a = router_with_auth(&authority, mac(1), 2);
+        let mut a = router_with_auth(&authority, 1);
         a.set_lazy_cert_distribution(true);
         let mut tx = [0u8; 1500];
         let ogm = a.poll(core::time::Duration::ZERO, &mut tx).unwrap().payload;
@@ -5580,7 +5608,7 @@ mod lazy_cert_distribution_switchover {
     #[test]
     fn apply_runtime_lazy_cert_distribution_marks_active_and_switches_emission() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut a = router_with_auth(&authority, mac(1), 2);
+        let mut a = router_with_auth(&authority, 1);
         assert!(!a.runtime_config_active());
 
         a.apply_runtime_lazy_cert_distribution(true);
@@ -5598,7 +5626,7 @@ mod lazy_cert_distribution_switchover {
     #[test]
     fn posture_flags_read_back_what_was_set() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut a = router_with_auth(&authority, mac(1), 2);
+        let mut a = router_with_auth(&authority, 1);
         assert!(!a.require_auth());
         assert!(!a.lazy_cert_distribution());
 
@@ -5615,7 +5643,7 @@ mod lazy_cert_distribution_switchover {
     #[test]
     fn apply_runtime_require_auth_marks_active() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut a = router_with_auth(&authority, mac(1), 2);
+        let mut a = router_with_auth(&authority, 1);
         assert!(!a.runtime_config_active());
 
         a.apply_runtime_require_auth(true);
@@ -5630,7 +5658,7 @@ mod lazy_cert_distribution_switchover {
     #[test]
     fn requiring_auth_does_not_lock_a_node_that_holds_a_cert() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut a = router_with_auth(&authority, mac(1), 2);
+        let mut a = router_with_auth(&authority, 1);
 
         a.apply_runtime_require_auth(true);
 
@@ -5644,7 +5672,7 @@ mod lazy_cert_distribution_switchover {
     #[test]
     fn augmentation_failure_suppresses_emission_rather_than_broadcasting_unsigned() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
-        let mut a = router_with_auth(&authority, mac(1), 2);
+        let mut a = router_with_auth(&authority, 1);
         let hdr_len = core::mem::size_of::<batman::wire::BatmanOgmPacket>();
         // Room for the bare OGM header only — nowhere near enough for a
         // cert/fingerprint plus a 64-byte signature.
@@ -6068,8 +6096,13 @@ mod self_revocation {
     use wayfinder_auth::Authority;
     use wayfinder_auth::Keypair;
 
+    /// The address the identity seeded with `n` derives.
+    ///
+    /// Since the key↔address binding (design 09 §5) a certificate's subject is
+    /// the address its key derives, so this module pairs `mac(n)` with the
+    /// keypair seeded `n` rather than numbering addresses independently.
     fn mac(n: u8) -> Mac {
-        Mac([0, 0, 0, 0, 0, n])
+        wayfinder_auth::Keypair::from_seed(&[n; 32]).derived_mac()
     }
 
     /// A router enrolled under `authority`, holding a certificate for `m`

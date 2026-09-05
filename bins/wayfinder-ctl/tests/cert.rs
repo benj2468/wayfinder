@@ -4,6 +4,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use interfaces::frame::Mac;
 use wayfinder_auth::Keypair;
 use wayfinder_auth::MembershipCert;
 use wayfinder_auth::TrustAnchor;
@@ -12,7 +13,7 @@ use wayfinderctl::cert::{self};
 
 /// Run the full init-ca → keygen → issue flow into a temp dir and return the
 /// written (anchor, cert) paths' bytes plus the temp dir guard.
-fn issue_into_tmp(mesh_id: u32) -> (tempfile::TempDir, Vec<u8>, Vec<u8>) {
+fn issue_into_tmp(mesh_id: u32) -> (tempfile::TempDir, Vec<u8>, Vec<u8>, Mac) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("root.seed");
     let anchor = dir.path().join("anchor.bin");
@@ -34,7 +35,10 @@ fn issue_into_tmp(mesh_id: u32) -> (tempfile::TempDir, Vec<u8>, Vec<u8>) {
     cert::run(CertCommand::Issue {
         ca_seed: root.clone(),
         mesh_id,
-        mac: Some("02:00:00:00:00:09".into()),
+        // No `--mac`: a certificate's subject is the address its key derives,
+        // and `keygen` above minted that key, so the address is not the
+        // operator's (or this fixture's) to choose.
+        mac: None,
         node_seed: node.clone(),
         not_before: 0,
         not_after: 1_000_000,
@@ -51,12 +55,14 @@ fn issue_into_tmp(mesh_id: u32) -> (tempfile::TempDir, Vec<u8>, Vec<u8>) {
 
     let anchor_bytes = std::fs::read(&anchor).unwrap();
     let cert_bytes = std::fs::read(&cert).unwrap();
-    (dir, anchor_bytes, cert_bytes)
+    let node_mac =
+        Keypair::from_seed(&std::fs::read(&node).unwrap().try_into().unwrap()).derived_mac();
+    (dir, anchor_bytes, cert_bytes, node_mac)
 }
 
 #[test]
 fn issued_cert_verifies_against_written_anchor() {
-    let (_dir, anchor_bytes, cert_bytes) = issue_into_tmp(0xABCD);
+    let (_dir, anchor_bytes, cert_bytes, node_mac) = issue_into_tmp(0xABCD);
 
     // Reload via the same `from_bytes` the node uses.
     let anchor = TrustAnchor::from_bytes(&anchor_bytes).expect("anchor reloads");
@@ -65,7 +71,7 @@ fn issued_cert_verifies_against_written_anchor() {
     let verified = anchor
         .verify_cert(&cert, 500)
         .expect("issued cert verifies within its window against its own anchor");
-    assert_eq!(verified.mac.0, [0x02, 0, 0, 0, 0, 9]);
+    assert_eq!(verified.mac, node_mac);
 }
 
 /// Omitting `--mac` must derive the issued cert's MAC from `--node-seed`'s
@@ -117,8 +123,8 @@ fn issue_without_mac_derives_it_from_the_node_seed() {
 #[test]
 fn cert_is_rejected_by_a_foreign_mesh_anchor() {
     // A cert from one mesh must not verify against another mesh's anchor.
-    let (_dir_a, anchor_a, _cert_a) = issue_into_tmp(0x1111);
-    let (_dir_b, _anchor_b, cert_b) = issue_into_tmp(0x2222);
+    let (_dir_a, anchor_a, _cert_a, _) = issue_into_tmp(0x1111);
+    let (_dir_b, _anchor_b, cert_b, _) = issue_into_tmp(0x2222);
 
     let anchor_a = TrustAnchor::from_bytes(&anchor_a).unwrap();
     let cert_b = MembershipCert::from_bytes(&cert_b).unwrap();
@@ -130,7 +136,7 @@ fn cert_is_rejected_by_a_foreign_mesh_anchor() {
 
 #[test]
 fn tampered_cert_fails_verification() {
-    let (_dir, anchor_bytes, mut cert_bytes) = issue_into_tmp(0xABCD);
+    let (_dir, anchor_bytes, mut cert_bytes, _) = issue_into_tmp(0xABCD);
     let anchor = TrustAnchor::from_bytes(&anchor_bytes).unwrap();
     // Flip a byte in the signed body (the node MAC).
     cert_bytes[6] ^= 0xff;
@@ -143,7 +149,7 @@ fn tampered_cert_fails_verification() {
 /// operations just by holding a valid membership cert.
 #[test]
 fn an_ordinary_issued_cert_is_not_an_admin() {
-    let (_dir, anchor_bytes, cert_bytes) = issue_into_tmp(0xABCD);
+    let (_dir, anchor_bytes, cert_bytes, _node_mac) = issue_into_tmp(0xABCD);
 
     let anchor = TrustAnchor::from_bytes(&anchor_bytes).expect("anchor reloads");
     let cert = MembershipCert::from_bytes(&cert_bytes).expect("cert reloads");

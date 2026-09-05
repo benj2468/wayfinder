@@ -76,11 +76,14 @@ pub enum CertCommand {
         /// Mesh id (decimal, or `0x`-prefixed hex); must match the CA's mesh.
         #[arg(long, value_parser = parse_u32)]
         mesh_id: u32,
-        /// The node's MAC, e.g. `02:00:00:00:00:09`. Defaults to the MAC
-        /// deterministically derived from `--node-seed` (the same derivation
-        /// `wayfinder-tap` applies at startup), so the cert matches the MAC
-        /// the node will actually run under; pass this to override that
-        /// default.
+        /// The node's MAC, e.g. `02:00:00:00:00:09`. A certificate's MAC *is*
+        /// the address its identity key derives (the same derivation
+        /// `wayfinder-tap` applies at startup), so this is a cross-check on
+        /// `--node-seed` rather than an override: naming any other address is
+        /// refused, because no node would honour the result. Leave it out
+        /// unless you want the check — passing it asserts "this seed belongs to
+        /// the node at that address", which is the one thing the tool cannot
+        /// work out for itself.
         #[arg(long)]
         mac: Option<String>,
         /// The node's 32-byte identity seed file (its public keys are bound).
@@ -282,10 +285,24 @@ fn issue(
     }
     let authority = Authority::from_seed(&read_seed(ca_seed)?, mesh_id);
     let node = Keypair::from_seed(&read_seed(node_seed)?);
-    let mac = match mac {
-        Some(mac) => Mac(parse_mac6(mac)?),
-        None => node.derived_mac(),
-    };
+    // The subject is a *function* of the key (design 09 §5), so `--mac` is a
+    // cross-check on `--node-seed` rather than an override: a mismatch means
+    // one of the two is wrong, and honouring it would mint a certificate every
+    // node on the mesh refuses.
+    let derived = node.derived_mac();
+    if let Some(spelled) = mac {
+        let named = Mac(parse_mac6(spelled)?);
+        if named != derived {
+            bail!(
+                "--mac {} is not the address --node-seed derives ({}); a certificate's \
+                 MAC must be the address its identity key derives, so either drop --mac \
+                 or check you named the right seed",
+                crate::output::format_mac(&named.0),
+                crate::output::format_mac(&derived.0),
+            );
+        }
+    }
+    let mac = derived;
 
     let cert = issue_with_flags(
         &authority,
@@ -413,6 +430,20 @@ fn approve(
         .try_into()
         .map_err(|_| anyhow::anyhow!("request x_pubkey must be exactly 32 bytes"))?;
     let mac = Mac(mac);
+    // The same binding `issue` cross-checks, applied to a request this operator
+    // did not build. Nothing else checks this file — running `approve` *is* the
+    // authorization — so a request from an older client, or one edited on its
+    // way through email or a USB stick, is caught only here.
+    let derived = wayfinder_auth::derive_mac(&ed_pubkey);
+    if mac != derived {
+        bail!(
+            "this request names {} but its identity key derives {}; a certificate's \
+             MAC must be the address its key derives, so this request cannot be \
+             approved as it stands",
+            crate::output::format_mac(&mac.0),
+            crate::output::format_mac(&derived.0),
+        );
+    }
 
     let authority = Authority::from_seed(&read_seed(ca_seed)?, mesh_id);
     let cert = issue_with_flags(
@@ -769,8 +800,10 @@ mod tests {
         let ca_seed_path = dir.path().join("ca.seed");
         write_secret(&ca_seed_path, &[1u8; 32]).unwrap();
 
+        // A well-formed request, so the admin/viewer clash is what gets blamed
+        // rather than the key↔address binding.
         let request = SubmitCsrRequest {
-            node_mac: vec![0, 0, 0, 0, 0, 5],
+            node_mac: wayfinder_auth::derive_mac(&[0u8; 32]).0.to_vec(),
             ed_pubkey: vec![0u8; 32],
             x_pubkey: vec![0u8; 32],
             enrollment_token: String::new(),
@@ -790,6 +823,110 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
+    }
+
+    /// An explicit `--mac` that is not the address `--node-seed` derives is
+    /// refused rather than honoured.
+    ///
+    /// The offline half of design 09 §5: before the key↔address binding this
+    /// flag silently minted a certificate for any address an operator typed,
+    /// which is the same misissuance `submit_csr` allowed over the wire.
+    /// Refused here so the mistake surfaces at the operator's terminal, instead
+    /// of as a certificate every node on the mesh rejects.
+    #[test]
+    fn issue_rejects_a_mac_the_node_seed_does_not_derive() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_seed_path = dir.path().join("ca.seed");
+        let node_seed_path = dir.path().join("node.seed");
+        write_secret(&ca_seed_path, &[1u8; 32]).unwrap();
+        write_secret(&node_seed_path, &[2u8; 32]).unwrap();
+
+        let err = issue(
+            &ca_seed_path,
+            42,
+            &Some("02:00:00:00:00:09".to_string()),
+            &node_seed_path,
+            0,
+            1000,
+            &dir.path().join("out.cert"),
+            false,
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("derives"), "got: {msg}");
+        assert!(
+            !dir.path().join("out.cert").exists(),
+            "nothing may be written for a refused issuance"
+        );
+    }
+
+    /// Passing the *right* `--mac` still works: the flag survives as a
+    /// cross-check on the seed, so a wrong `--node-seed` is caught.
+    #[test]
+    fn issue_accepts_an_explicit_mac_that_matches_the_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_seed_path = dir.path().join("ca.seed");
+        let node_seed_path = dir.path().join("node.seed");
+        write_secret(&ca_seed_path, &[1u8; 32]).unwrap();
+        write_secret(&node_seed_path, &[2u8; 32]).unwrap();
+
+        let derived = Keypair::from_seed(&[2u8; 32]).derived_mac();
+        let spelled = crate::output::format_mac(&derived.0);
+
+        issue(
+            &ca_seed_path,
+            42,
+            &Some(spelled),
+            &node_seed_path,
+            0,
+            1000,
+            &dir.path().join("out.cert"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(dir.path().join("out.cert").exists());
+    }
+
+    /// `approve` applies the same rule to the CSR it is handed: a request whose
+    /// `node_mac` its own `ed_pubkey` does not derive is refused.
+    ///
+    /// The operator running `approve` is the authorization, so nothing else
+    /// checks this file — and a request built by an older client, or edited in
+    /// transit on its way through email or a USB stick, is exactly the shape
+    /// this catches.
+    #[test]
+    fn approve_rejects_a_request_whose_mac_its_key_does_not_derive() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_seed_path = dir.path().join("ca.seed");
+        write_secret(&ca_seed_path, &[1u8; 32]).unwrap();
+
+        let node = Keypair::from_seed(&[2u8; 32]);
+        let request = SubmitCsrRequest {
+            // A victim's address, under the requester's own keys.
+            node_mac: Keypair::from_seed(&[3u8; 32]).derived_mac().0.to_vec(),
+            ed_pubkey: node.ed_pubkey().to_vec(),
+            x_pubkey: node.x_pubkey().to_vec(),
+            enrollment_token: String::new(),
+        };
+        let req_path = dir.path().join("req.json");
+        std::fs::write(&req_path, serde_json::to_vec(&request).unwrap()).unwrap();
+
+        let out_cert = dir.path().join("out.cert");
+        let err = approve(
+            &ca_seed_path,
+            42,
+            &req_path,
+            0,
+            1000,
+            &out_cert,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("derives"), "got: {err}");
+        assert!(!out_cert.exists(), "nothing may be written for a refusal");
     }
 
     /// A CSR file with a malformed (wrong-length) field is rejected with a

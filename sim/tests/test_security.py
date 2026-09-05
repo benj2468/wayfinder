@@ -193,29 +193,52 @@ def test_a_mesh_is_optional_and_absent_leaves_every_node_open():
     assert sim.has_route("a", "b")
 
 
-def test_a_certificate_may_name_a_mac_its_key_does_not_derive():
-    """A gap, asserted so the dependency stays visible.
+def test_a_certificate_naming_a_mac_its_key_does_not_derive_is_refused():
+    """`verify_cert` binds a certificate's subject to its identity key.
 
-    `verify_cert` checks the root's signature, the mesh id, and the validity
-    window — but never that `node_mac` is derived from `ed_pubkey`. A
-    certificate binding a key to somebody else's address therefore verifies
-    perfectly. Impersonation resistance rests entirely on the authority
-    refusing to issue one; the router is not a second line of defence here.
+    This was gap 4 (design 09 §5), and the assertion below used to run the
+    other way: verification checked the root's signature, the mesh id and the
+    validity window, but never that `node_mac` was the address `ed_pubkey`
+    derives — so a certificate binding a key to somebody else's address
+    verified perfectly, and impersonation resistance rested entirely on the
+    authority refusing to issue one.
+
+    Now every node enforces it for itself. That is the half that holds even
+    against a *compromised* authority: minting such a credential would need a
+    `derive_mac` preimage, which a signing key does not provide.
     """
     mesh = _mesh()
+    # An address the mesh knows but that no node in this run holds, so the
+    # *only* way it can reach `field`'s neighbour cache is the misissuance.
+    # (An earlier version of this fixture also ran hq, which cached the address
+    # legitimately and made the assertion vacuous either way.)
     victim_mac = mesh.keypair("hq").derived_mac
     nodes = [
-        Node("hq", credential=Credential()),
         Node("field", credential=Credential()),
         Node("imposter", credential=Credential(claim_mac=victim_mac)),
+        # The positive control. Every other assertion here is an *absence*, and
+        # an absence is also what a simulation that never converged produces —
+        # so without a neighbour that must be present, this test would pass just
+        # as happily if nothing ran at all.
+        Node("neighbour", credential=Credential()),
     ]
     links = [
-        pair("hq", "field", PerfectWire()),
         pair("field", "imposter", PerfectWire()),
+        pair("field", "neighbour", PerfectWire()),
     ]
     sim = Simulation(nodes, links, mesh=mesh)
     sim.run(until_s=30.0)
 
-    assert victim_mac in sim.driver("field").neighbor_macs(), (
-        "a misissued certificate is accepted — CA policy is the only control"
+    admitted = sim.driver("field").neighbor_macs()
+    assert sim.mac("neighbour") in admitted, (
+        "the control was not admitted, so this run proves nothing about the "
+        "refusals below"
+    )
+    assert victim_mac not in admitted, (
+        "a certificate naming an address its key does not derive was admitted"
+    )
+    # The imposter holds *only* the misissued certificate, so being refused the
+    # address it claimed leaves it with no address at all.
+    assert sim.mac("imposter") not in admitted, (
+        "the imposter should be admitted at no address at all"
     )

@@ -2073,7 +2073,10 @@ mod tests {
 
         let seed = [3u8; 32];
         let kp = Keypair::from_seed(&seed);
-        let mac_addr = mac(1);
+        // The node routes under the address its identity key derives — a
+        // certificate can name no other (design 09 §5), and `set_auth` refuses
+        // one that does not match the address this router answers to.
+        let mac_addr = kp.derived_mac();
 
         let mut ca = CertAuthority::new(&[9u8; 32], 0xABCD, 10_000, None, true);
         ca.set_now_unix(1_700_000_000);

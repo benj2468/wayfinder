@@ -11,6 +11,7 @@
 
 mod provider;
 
+use std::path::Path;
 use std::path::PathBuf;
 
 use wayfinder_auth::Keypair;
@@ -40,6 +41,30 @@ use provider::spawn_provider_full;
 /// enrollment grant it could not happen: the provider's management API admitted
 /// only admins, so a node with no certificate could never open the connection
 /// that would have got it one.
+/// The address the identity in `seed_path` derives, spelled the way the CLI
+/// takes it.
+///
+/// Since the key↔address binding landed (design 09 §5) a node enrols under the
+/// address its key derives and under no other, so an operator approving,
+/// denying or revoking its request has to name *that* address — and a test
+/// cannot pick one in advance when `enroll` mints the identity itself.
+fn seed_derived_mac(seed_path: &Path) -> interfaces::frame::Mac {
+    let seed: [u8; 32] = std::fs::read(seed_path)
+        .expect("enroll wrote its seed")
+        .try_into()
+        .expect("an identity seed is 32 bytes");
+    Keypair::from_seed(&seed).derived_mac()
+}
+
+fn enrolled_mac(seed_path: &Path) -> String {
+    seed_derived_mac(seed_path)
+        .0
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 #[tokio::test]
 async fn a_node_with_no_certificate_can_enroll_with_an_enrolled_provider() {
     let endpoint = spawn_provider_full(None, true, true).await;
@@ -49,7 +74,9 @@ async fn a_node_with_no_certificate_can_enroll_with_an_enrolled_provider() {
 
     run_query(
         Command::Auth(AuthCommand::Enroll(EnrollArgs {
-            mac: Some("02:00:00:00:00:09".into()),
+            // The address is the identity key's to decide, not the
+            // operator's; `--mac` is only a cross-check now.
+            mac: None,
             token: String::new(),
             out_seed: dir.path().join("seed"),
             out_cert: cert_path.clone(),
@@ -111,7 +138,9 @@ async fn enroll_yields_a_cert_that_verifies_against_the_anchor() {
 
     let out = run_query(
         Command::Auth(AuthCommand::Enroll(EnrollArgs {
-            mac: Some("02:00:00:00:00:09".into()),
+            // The address is the identity key's to decide, not the
+            // operator's; `--mac` is only a cross-check now.
+            mac: None,
             token: String::new(),
             out_seed: seed.clone(),
             out_cert: cert.clone(),
@@ -132,7 +161,7 @@ async fn enroll_yields_a_cert_that_verifies_against_the_anchor() {
     let anchor = TrustAnchor::from_bytes(&std::fs::read(&anchor).unwrap()).unwrap();
     let cert = MembershipCert::from_bytes(&std::fs::read(&cert).unwrap()).unwrap();
     let verified = anchor.verify_cert(&cert, 500).expect("cert verifies");
-    assert_eq!(verified.mac.0, [0x02, 0, 0, 0, 0, 9]);
+    assert_eq!(verified.mac, seed_derived_mac(&seed));
 }
 
 /// Omitting `--mac` must derive the enrolled MAC from the freshly-generated
@@ -187,7 +216,9 @@ async fn enroll_reuses_an_existing_seed_file_instead_of_minting_a_new_identity()
 
     let enroll_cmd = |seed: PathBuf, cert: PathBuf, anchor: PathBuf| {
         Command::Auth(AuthCommand::Enroll(EnrollArgs {
-            mac: Some("02:00:00:00:00:09".into()),
+            // The address is the identity key's to decide, not the
+            // operator's; `--mac` is only a cross-check now.
+            mac: None,
             token: String::new(),
             out_seed: seed,
             out_cert: cert,
@@ -238,7 +269,9 @@ async fn enroll_rejected_without_required_token() {
     let dir = tempfile::tempdir().unwrap();
     let err = run_query(
         Command::Auth(AuthCommand::Enroll(EnrollArgs {
-            mac: Some("02:00:00:00:00:09".into()),
+            // The address is the identity key's to decide, not the
+            // operator's; `--mac` is only a cross-check now.
+            mac: None,
             token: String::new(), // missing
             out_seed: dir.path().join("seed"),
             out_cert: dir.path().join("cert"),
@@ -263,7 +296,9 @@ async fn list_certs_shows_an_enrolled_node() {
     let dir = tempfile::tempdir().unwrap();
     run_query(
         Command::Auth(AuthCommand::Enroll(EnrollArgs {
-            mac: Some("02:00:00:00:00:09".into()),
+            // The address is the identity key's to decide, not the
+            // operator's; `--mac` is only a cross-check now.
+            mac: None,
             token: String::new(),
             out_seed: dir.path().join("seed"),
             out_cert: dir.path().join("cert"),
@@ -287,9 +322,11 @@ async fn list_certs_shows_an_enrolled_node() {
     let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
     let certs = parsed["certs"].as_array().unwrap();
     assert_eq!(certs.len(), 1, "the provider lists the enrolled node");
-    // node_mac is the raw bytes of 02:00:00:00:00:09.
-    assert_eq!(certs[0]["node_mac"][0], 2);
-    assert_eq!(certs[0]["node_mac"][5], 9);
+    // node_mac is the raw bytes of the address the enrolled key derives.
+    let expected = seed_derived_mac(&dir.path().join("seed")).0;
+    for (i, byte) in expected.iter().enumerate() {
+        assert_eq!(certs[0]["node_mac"][i], *byte);
+    }
 }
 
 #[tokio::test]
@@ -356,7 +393,9 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
     // Enrolling node: fails at first, responds with pending
     let err = run_query(
         Command::Auth(AuthCommand::Enroll(EnrollArgs {
-            mac: Some("02:00:00:00:00:09".into()),
+            // The address is the identity key's to decide, not the
+            // operator's; `--mac` is only a cross-check now.
+            mac: None,
             token: String::new(),
             out_seed: dir.path().join("seed"),
             out_cert: cert_path.clone(),
@@ -376,7 +415,7 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
 
     run_query(
         Command::Provider(ProviderCommand::Requests(RequestsCommand::Approve {
-            mac: "02:00:00:00:00:09".into(),
+            mac: enrolled_mac(&dir.path().join("seed")),
         })),
         &endpoint,
         OutputFormat::Human,
@@ -387,7 +426,9 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
     // Enrolling node: once approved, collects the cert
     let out = run_query(
         Command::Auth(AuthCommand::Enroll(EnrollArgs {
-            mac: Some("02:00:00:00:00:09".into()),
+            // The address is the identity key's to decide, not the
+            // operator's; `--mac` is only a cross-check now.
+            mac: None,
             token: String::new(),
             out_seed: dir.path().join("seed"),
             out_cert: cert_path.clone(),
@@ -406,8 +447,8 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
     let anchor = TrustAnchor::from_bytes(&std::fs::read(&anchor_path).unwrap()).unwrap();
     let cert = MembershipCert::from_bytes(&std::fs::read(&cert_path).unwrap()).unwrap();
     assert_eq!(
-        anchor.verify_cert(&cert, 500).unwrap().mac.0,
-        [0x02, 0, 0, 0, 0, 9]
+        anchor.verify_cert(&cert, 500).unwrap().mac,
+        seed_derived_mac(&dir.path().join("seed"))
     );
 }
 
@@ -418,7 +459,9 @@ async fn enroll_fails_when_operator_denies() {
 
     let err = run_query(
         Command::Auth(AuthCommand::Enroll(EnrollArgs {
-            mac: Some("02:00:00:00:00:09".into()),
+            // The address is the identity key's to decide, not the
+            // operator's; `--mac` is only a cross-check now.
+            mac: None,
             token: String::new(),
             out_seed: dir.path().join("seed"),
             out_cert: dir.path().join("cert"),
@@ -438,7 +481,7 @@ async fn enroll_fails_when_operator_denies() {
 
     run_query(
         Command::Provider(ProviderCommand::Requests(RequestsCommand::Deny {
-            mac: "02:00:00:00:00:09".into(),
+            mac: enrolled_mac(&dir.path().join("seed")),
         })),
         &endpoint,
         OutputFormat::Human,
@@ -448,7 +491,9 @@ async fn enroll_fails_when_operator_denies() {
 
     let err = run_query(
         Command::Auth(AuthCommand::Enroll(EnrollArgs {
-            mac: Some("02:00:00:00:00:09".into()),
+            // The address is the identity key's to decide, not the
+            // operator's; `--mac` is only a cross-check now.
+            mac: None,
             token: String::new(),
             out_seed: dir.path().join("seed"),
             out_cert: dir.path().join("cert"),

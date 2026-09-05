@@ -344,8 +344,9 @@ identity material behind").
    promise — the identity, and so the MAC, does not change — so a cert for a
    different MAC there is a provider-side mismatch. A wholesale identity
    install is exempt on purpose: naming a new MAC is exactly what that path
-   is for, and `wayfinder-tap` re-derives the router's MAC from the installed
-   certificate on the next boot. Covered by
+   is for, and `wayfinder-tap` comes up under the new address on the next
+   boot — derived from the *seed*, not read from this certificate, since design
+   09 §5's key↔address binding made the two the same value by construction. Covered by
    `set_auth_rejects_a_cert_for_the_wrong_mac_when_certifying_in_place` and
    `set_auth_with_a_seed_allows_a_new_mac` (the exemption, asserted
    positively so a future change to the scoping shows up as a failure here
