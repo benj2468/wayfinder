@@ -1001,6 +1001,7 @@ impl<
                     .min_by_key(|r| r.last_heard)
                     .map(|r| r.neighbor_ident)
             {
+                trace!(orig = ?oldest, "originator table full, evicting least-recently-heard");
                 self.originator_table.remove(&oldest);
             }
             let new_record = OriginatorRecord {
@@ -1012,7 +1013,10 @@ impl<
                 // if — and only if — the path is selectable.
                 best_next_hop: None,
                 max_tq: 0,
+                // Seeded from this OGM's own sequence number below; a first
+                // sighting has no high-water to judge against.
                 last_seqno: 0,
+                resync_watch: None,
                 paths: heapless::Vec::new(),
             };
             info!(orig = ?orig_ident, "discovered new originator");
@@ -1032,24 +1036,77 @@ impl<
             .get_mut(&orig_ident)
             .expect("orig_ident was just looked up or inserted above");
 
-        // Whether this OGM carries a *strictly newer* sequence number than any
-        // we've already processed from this originator.  Captured before
-        // `last_seqno` is advanced below, because it gates re-forwarding: a copy
-        // of a seqno we have already forwarded (`==`, e.g. the same OGM reaching
-        // us via a second neighbor) must update our path metrics but must NOT be
-        // re-flooded — otherwise it circulates until its TTL drains, flooding the
-        // mesh.  A new record starts at `last_seqno == 0`, below the first real
-        // seqno (1), so an originator's first OGM is always treated as new.
-        let is_new_seqno = incoming_seqno > record.last_seqno;
-
-        // Rule 2: accept this OGM for path/metric learning when it is at least as
-        // fresh as the newest seen.  Same-seqno copies via other neighbors are
-        // still recorded as alternate paths.
-        if incoming_seqno >= record.last_seqno {
+        // Rule 2: judge this sequence number against the originator's
+        // high-water, which decides three separate things.
+        //
+        // *Whether to re-flood.* Only a number that advances the high-water is
+        // forwarded, so this node repeats each `(originator, seqno)` once and a
+        // copy reaching us by a second neighbor does not circulate until its TTL
+        // drains. A first sighting has no high-water to judge against, so it
+        // seeds one from the OGM's own number rather than being classified
+        // against zero: a member already far past `OGM_SEQNO_WINDOW` when first
+        // heard would otherwise read as out of band on contact.
+        //
+        // *Whether to learn the path it arrived on.* Almost always yes — and
+        // deliberately **not** conditioned on the high-water advancing. The
+        // high-water is keyed on the originator named inside the OGM, not on the
+        // forwarder, so anyone who can repeat a member's signed OGM writes it;
+        // letting it decide path learning is what turned one replayed frame into
+        // a targeted route denial (`docs/design/09-mesh-auth-gaps.md` §8.11).
+        // The one exception is a number strictly behind the high-water but
+        // inside the reorder tolerance: that band is where a stale copy of
+        // something already seen is the likelier explanation, so the *frame* is
+        // what is disbelieved. Outside it — a leap too far forward, or far
+        // enough behind — the frame is admitted for topology purposes and
+        // `admit_seqno` opens a run against the high-water; the run, not this
+        // frame, is what eventually decides which of the two was wrong.
+        //
+        // *Whether to believe what it asserts.* Multicast memberships are state
+        // the originator claims rather than something this node observed, so
+        // they follow the freshest OGM and no other: an out-of-date copy must
+        // not be able to revert a live member's groups.
+        let admission = if is_new_orig {
+            // Taken on trust, exactly as `BroadcastSeqnoEntry::seeded` takes a
+            // first broadcast, and safe for the same reason rather than in
+            // spite of it: a wrong seed — including one an outsider forced by
+            // evicting the live record — is corrected by the originator's own
+            // next OGMs within `OGM_SEQNO_RESET_PROTECTION`.
             record.last_seqno = incoming_seqno;
-            // Hearing this originator on any path keeps the whole record alive;
-            // `last_heard` tracks the freshest path.
-            record.last_heard = now;
+            crate::SeqnoAdmission::Advanced
+        } else {
+            crate::admit_seqno(
+                &mut record.last_seqno,
+                &mut record.resync_watch,
+                incoming_seqno,
+                now,
+                &crate::SeqnoBands::OGM,
+            )
+        };
+        let is_new_seqno = admission.advanced();
+
+        if admission.is_stale_copy() {
+            trace!(
+                orig = ?orig_ident,
+                incoming_seqno,
+                high_water = record.last_seqno,
+                "drop: stale OGM copy"
+            );
+        }
+
+        if !admission.is_stale_copy() {
+            // Hearing this originator keeps the whole record alive — but only
+            // on a *current* OGM. This field is purely the eviction key
+            // (`min_by_key` when a new originator needs a slot), and the rule
+            // its broadcast counterpart states applies unchanged here: an
+            // attacker's stream of non-advancing frames must not be able to pin
+            // a record at the top of the eviction order. Leaving it alone while
+            // a high-water is under correction is also the useful direction —
+            // a jammed record then sorts old, and being evicted reseeds it,
+            // which cures the jam outright. Path liveness is tracked separately
+            // in `NeighborStats::last_heard` below and is what routing reads.
+            if admission.contents_are_current() {
+                record.last_heard = now;
+            }
 
             // Attenuate the advertised path TQ by one hop, then clamp it by our
             // locally-measured link quality to the relaying neighbor: a node
@@ -1072,6 +1129,10 @@ impl<
                 .iter_mut()
                 .find(|p| p.neighbor_ident == frame.src)
             {
+                // Only a genuinely newer number on *this* path measures a
+                // cadence: an originator that has restarted its counter is
+                // still heard, but the gap across the restart is not an
+                // interval it will ever emit at again.
                 if incoming_seqno > path.last_seqno {
                     let gap = now.saturating_sub(path.last_heard);
                     path.interval_estimate = Self::blend_interval(path.interval_estimate, gap);
@@ -1120,7 +1181,22 @@ impl<
             // Fold this originator's multicast memberships (carried in the OGM's
             // TVLV tail) into the membership table.  The `record` borrow has
             // ended above, so taking `&mut self` here is fine.
-            self.update_mcast_membership(orig_ident, frame);
+            //
+            // Gated on the OGM being current, unlike the path learning above,
+            // because this is *content* the originator asserts rather than an
+            // observation this node made: a replayed old OGM would otherwise
+            // revert a live member's groups to whatever they were when it was
+            // captured. While a wrong high-water is being corrected the groups
+            // simply hold, which is the conservative direction.
+            if admission.contents_are_current() {
+                self.update_mcast_membership(orig_ident, frame);
+            } else {
+                trace!(
+                    orig = ?orig_ident,
+                    incoming_seqno,
+                    "drop: OGM memberships not current, holding groups"
+                );
+            }
 
             // Reset the Trickle backoff only for changes to *our own advertised
             // state* — which, on this path, means gaining a neighbor and
@@ -2033,6 +2109,15 @@ mod tests {
     }
 
     /// A multicast group MAC (`01:00:5e:00:00:NN`).
+    /// [`ogm_frame_with_mcast`] with the link-layer source split from the
+    /// originator, so a relayed — or replayed — membership announcement can be
+    /// built.
+    fn ogm_mcast_via(orig: u8, src: u8, seqno: u32, groups: &[Mac]) -> Vec<u8> {
+        let mut frame = ogm_frame_with_mcast(orig, 1, seqno, groups);
+        frame[6..12].copy_from_slice(mac(src).as_bytes());
+        frame
+    }
+
     fn mcast_group(n: u8) -> Mac {
         Mac([0x01, 0x00, 0x5e, 0x00, 0x00, n])
     }
@@ -2358,6 +2443,30 @@ mod tests {
         data
     }
 
+    /// Every invariant the originator table has that its types do not express.
+    /// Called after each `feed` below, per the repo's convention for stateful
+    /// structures.
+    fn assert_originator_invariants<const N: usize>(engine: &BatmanEngine<N>) {
+        for (orig, record) in engine.originator_table.iter() {
+            assert_ne!(*orig, engine.self_ident, "own ident must never be tracked");
+            if let Some(watch) = record.resync_watch {
+                assert_eq!(
+                    crate::SeqnoBands::OGM.classify(record.last_seqno, watch.seqno),
+                    crate::SeqnoVerdict::Implausible,
+                    "a watch only ever holds a number out of band against the \
+                     high-water it is evidence against: anything else would have \
+                     advanced it or been dropped as a stale copy"
+                );
+            }
+            if let Some(hop) = record.best_next_hop {
+                assert!(
+                    record.paths.iter().any(|p| p.neighbor_ident == hop),
+                    "the selected next hop must be one of the known paths"
+                );
+            }
+        }
+    }
+
     fn feed(engine: &mut BatmanEngine<4>, now: u64, frame: &[u8]) {
         let mut tx = [0u8; 128];
         let parsed = LinkFrame::ref_from_prefix(frame).unwrap().0;
@@ -2369,6 +2478,32 @@ mod tests {
             &mut reply,
             &mut (),
         );
+        assert_originator_invariants(engine);
+    }
+
+    /// [`feed`], reporting whether the OGM was re-flooded: the caller forwards
+    /// `reply` only when its protocol was filled in.
+    fn feed_reflooded(engine: &mut BatmanEngine<4>, now: u64, frame: &[u8]) -> bool {
+        let mut tx = [0u8; 128];
+        let parsed = LinkFrame::ref_from_prefix(frame).unwrap().0;
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+        engine.handle_rx(
+            core::time::Duration::from_secs(now),
+            parsed,
+            None,
+            &mut reply,
+            &mut (),
+        );
+        assert_originator_invariants(engine);
+        reply.protocol != 0
+    }
+
+    /// The high-water an originator's OGMs are judged against.
+    fn ogm_high_water(engine: &BatmanEngine<4>, orig: u8) -> Option<u32> {
+        engine
+            .originator_table
+            .get(&mac(orig))
+            .map(|r| r.last_seqno)
     }
 
     /// An engine on an authenticated mesh, where a next hop must prove itself.
@@ -2410,6 +2545,427 @@ mod tests {
                 .any(|m| m == mac(2)),
             "and it is offered to the driver as a candidate to challenge"
         );
+    }
+
+    /// A replayed high sequence number must not deny a live originator its
+    /// route (`docs/design/09-mesh-auth-gaps.md` §8.11).
+    ///
+    /// Eve holds no credential, so she cannot forge a sequence number — but she
+    /// does not need to. She replays a *genuine* signed OGM she captured from
+    /// hq at a high seqno, under her own link-layer source. The forged path "hq
+    /// via eve" is correctly refused (she can never answer a challenge), yet the
+    /// high-water is keyed on the originator inside the OGM rather than on the
+    /// forwarder, so it takes the replayed number anyway. Every OGM the
+    /// genuinely-adjacent hq emits afterwards then sits below it.
+    ///
+    /// The high-water's job is re-flood dedup, and nothing else: it must not be
+    /// able to decide whether this node learns a path at all, or the one piece
+    /// of per-originator state a keyless outsider can write becomes a targeted
+    /// route denial against any member whose OGMs she once recorded.
+    #[test]
+    fn a_replayed_high_seqno_does_not_deny_a_live_originator_a_route() {
+        let mut engine = proving_engine();
+
+        // Eve (3) pins hq's (2) high-water with a captured high-seqno OGM.
+        feed(&mut engine, 0, &ogm_via(2, 3, 5_000, 255));
+        assert_eq!(
+            engine.lookup_route(mac(2)),
+            None,
+            "the forged path via eve is refused: she cannot prove herself"
+        );
+
+        // hq is genuinely adjacent, has proven itself, and — having rebooted —
+        // emits from a low sequence number again.
+        engine.note_proven(core::time::Duration::from_secs(1), mac(2), 0);
+        for seqno in 1..=3u32 {
+            feed(
+                &mut engine,
+                1 + u64::from(seqno),
+                &ogm_via(2, 2, seqno, 255),
+            );
+        }
+
+        let at = core::time::Duration::from_secs(4);
+        assert_eq!(
+            engine.lookup_route(mac(2)),
+            Some(mac(2)),
+            "hq is present and proven, so the route must be acquired"
+        );
+        assert_eq!(
+            engine.next_hop(at, mac(2)),
+            Some(mac(2)),
+            "and the recomputing selection path must agree"
+        );
+    }
+
+    /// ...and the pinned high-water itself is corrected, so a relay resumes
+    /// re-flooding the jammed member's OGMs to the nodes behind it.
+    ///
+    /// The route-denial half above is what the victim suffers directly; this is
+    /// what it would otherwise inflict on everyone downstream of it, which no
+    /// amount of local path learning reaches. Mirrors
+    /// [`BroadcastSeqnoEntry::admit`](crate::BroadcastSeqnoEntry::admit), whose
+    /// two load-bearing details carry over unchanged: a run of out-of-band
+    /// numbers must *persist* before it is believed, and the high-water
+    /// resynchronises to the number that **opened** the run rather than to
+    /// whichever frame happens to trip the deadline — or a third party could
+    /// substitute its own number for the one an honest originator earned.
+    #[test]
+    fn a_pinned_ogm_high_water_resynchronises_to_the_run_that_opened() {
+        let mut engine = proving_engine();
+
+        // Eve's captured OGM is the first sighting, so it seeds the high-water
+        // — there is nothing yet to judge it against.
+        assert!(feed_reflooded(&mut engine, 0, &ogm_via(2, 3, 5_000, 255)));
+        assert_eq!(ogm_high_water(&engine, 2), Some(5_000));
+
+        // hq, restarted, emits from 1 again. A short run is not yet evidence
+        // against the high-water, and is not re-flooded.
+        assert!(!feed_reflooded(&mut engine, 1, &ogm_via(2, 2, 1, 255)));
+        assert!(!feed_reflooded(&mut engine, 2, &ogm_via(2, 2, 2, 255)));
+        assert_eq!(
+            ogm_high_water(&engine, 2),
+            Some(5_000),
+            "a run that has not persisted must not move the high-water"
+        );
+
+        // Once it has persisted for `OGM_SEQNO_RESET_PROTECTION` the high-water
+        // snaps back to the number the run opened at (1), and the frame that
+        // tripped the deadline is then judged afresh against it.
+        let deadline = 1 + crate::OGM_SEQNO_RESET_PROTECTION.as_secs();
+        assert!(feed_reflooded(
+            &mut engine,
+            deadline,
+            &ogm_via(2, 2, 3, 255)
+        ));
+        assert_eq!(
+            ogm_high_water(&engine, 2),
+            Some(3),
+            "resynchronised to the run, not to the replayed number"
+        );
+
+        // And hq's subsequent OGMs flow normally again.
+        assert!(feed_reflooded(
+            &mut engine,
+            deadline + 1,
+            &ogm_via(2, 2, 4, 255)
+        ));
+    }
+
+    /// The OGM bands are exact at their edges, and are *not* the broadcast ones.
+    ///
+    /// Pins the *shape* — that each band is inclusive at its edge and exclusive
+    /// one past it — not the widths, which it names symbolically and therefore
+    /// cannot guard. The widths are pinned behaviourally by
+    /// [`a_low_pin_does_not_read_a_restarted_originator_as_stale_copies`], which
+    /// is the test that fails if the broadcast tolerance is inherited.
+    #[test]
+    fn ogm_seqno_bands_are_exact_at_their_edges() {
+        use crate::SeqnoVerdict::Advance;
+        use crate::SeqnoVerdict::Duplicate;
+        use crate::SeqnoVerdict::Implausible;
+        let b = crate::SeqnoBands::OGM;
+        assert_eq!(b.classify(10_000, 10_001), Advance);
+        assert_eq!(
+            b.classify(10_000, 10_000 + crate::OGM_SEQNO_WINDOW),
+            Advance
+        );
+        assert_eq!(
+            b.classify(10_000, 10_000 + crate::OGM_SEQNO_WINDOW + 1),
+            Implausible,
+            "a leap past the window is evidence to be weighed, not a fresh number"
+        );
+        assert_eq!(b.classify(10_000, 10_000), Duplicate);
+        assert_eq!(
+            b.classify(10_000, 10_000 - crate::OGM_SEQNO_REORDER_TOLERANCE),
+            Duplicate
+        );
+        assert_eq!(
+            b.classify(10_000, 10_000 - crate::OGM_SEQNO_REORDER_TOLERANCE - 1),
+            Implausible,
+            "past the tolerance the high-water, not the frame, is what looks wrong"
+        );
+    }
+
+    /// The bands are direction-aware across the `u32` wrap, so an originator
+    /// whose counter crosses `u32::MAX` is not pinned by its own arithmetic —
+    /// the latent non-attack bug the old plain `>=` comparison carried.
+    #[test]
+    fn ogm_seqno_bands_wrap_at_the_u32_boundary() {
+        use crate::SeqnoVerdict::Advance;
+        use crate::SeqnoVerdict::Duplicate;
+        let b = crate::SeqnoBands::OGM;
+        assert_eq!(
+            b.classify(u32::MAX, 0),
+            Advance,
+            "one past the wrap is newer"
+        );
+        assert_eq!(b.classify(u32::MAX, 1), Advance);
+        assert_eq!(
+            b.classify(5, u32::MAX),
+            Duplicate,
+            "and a maxed number lands just *behind* a low high-water rather than \
+             far ahead of it — near enough to read as a stale copy, which is the \
+             arm that discards it outright"
+        );
+    }
+
+    /// End to end over the engine: an originator whose counter wraps keeps being
+    /// re-flooded across the boundary.
+    #[test]
+    fn an_ogm_seqno_wrapping_past_u32_max_keeps_reflooding() {
+        let mut engine = proving_engine();
+        assert!(feed_reflooded(
+            &mut engine,
+            0,
+            &ogm_via(2, 2, u32::MAX - 1, 255)
+        ));
+        assert!(feed_reflooded(
+            &mut engine,
+            1,
+            &ogm_via(2, 2, u32::MAX, 255)
+        ));
+        assert!(
+            feed_reflooded(&mut engine, 2, &ogm_via(2, 2, 0, 255)),
+            "the wrap is one step forward, not a plunge backwards"
+        );
+        assert_eq!(ogm_high_water(&engine, 2), Some(0));
+        assert!(feed_reflooded(&mut engine, 3, &ogm_via(2, 2, 1, 255)));
+    }
+
+    /// A third party's maxed sequence number is not a new high-water — the OGM
+    /// twin of the `Bcast` fix: it lands *behind* a live high-water under the
+    /// wrapping comparison, so the member's own next OGM still re-floods.
+    #[test]
+    fn a_replayed_max_ogm_seqno_does_not_become_the_high_water() {
+        let mut engine = proving_engine();
+        feed(&mut engine, 0, &ogm_via(2, 2, 5, 255));
+        feed(&mut engine, 1, &ogm_via(2, 3, u32::MAX, 255));
+        assert_eq!(
+            ogm_high_water(&engine, 2),
+            Some(5),
+            "the maxed number is behind, not ahead"
+        );
+        assert!(feed_reflooded(&mut engine, 2, &ogm_via(2, 2, 6, 255)));
+    }
+
+    /// Implementation note 1 of §8.11, as a behaviour rather than a comment: a
+    /// pin only *tens* above a restarted originator must still be corrected.
+    ///
+    /// This is the case that fails if the broadcast reorder tolerance (64) is
+    /// inherited — the restarted originator's numbers land inside the band,
+    /// every one reads as an ordinary duplicate, no run is ever watched, and the
+    /// correction never fires. It is also the shape the red-team scenario
+    /// actually produces (a pin in the fifties), so the margin is pinned here
+    /// rather than left to an emergent number in a simulation.
+    #[test]
+    fn a_low_pin_does_not_read_a_restarted_originator_as_stale_copies() {
+        let mut engine = proving_engine();
+        feed(&mut engine, 0, &ogm_via(2, 3, 56, 255));
+
+        engine.note_proven(core::time::Duration::from_secs(1), mac(2), 0);
+        for seqno in 1..=3u32 {
+            feed(
+                &mut engine,
+                1 + u64::from(seqno),
+                &ogm_via(2, 2, seqno, 255),
+            );
+        }
+        assert_eq!(
+            engine.lookup_route(mac(2)),
+            Some(mac(2)),
+            "a pin inside a too-wide tolerance would swallow these as duplicates"
+        );
+
+        // The run opened on hq's first genuine OGM, at t=2.
+        let deadline = 2 + crate::OGM_SEQNO_RESET_PROTECTION.as_secs();
+        assert!(feed_reflooded(
+            &mut engine,
+            deadline,
+            &ogm_via(2, 2, 4, 255)
+        ));
+        assert_eq!(ogm_high_water(&engine, 2), Some(4));
+    }
+
+    /// A third party must not cash in the run an honest originator earned.
+    ///
+    /// The claim the resync test's prose makes and could not itself show: the
+    /// high-water snaps to the number that *opened* the run, so a frame an
+    /// attacker times to arrive at the deadline is judged against that rather
+    /// than installed as the new high-water.
+    #[test]
+    fn a_resync_does_not_admit_a_third_partys_seqno() {
+        let mut engine = proving_engine();
+        feed(&mut engine, 0, &ogm_via(2, 3, 5_000, 255));
+        feed(&mut engine, 1, &ogm_via(2, 2, 1, 255));
+
+        let deadline = 1 + crate::OGM_SEQNO_RESET_PROTECTION.as_secs();
+        feed(&mut engine, deadline, &ogm_via(2, 3, 4_000, 255));
+        assert_eq!(
+            ogm_high_water(&engine, 2),
+            Some(1),
+            "restored to the run's opening number, with eve's own number judged \
+             against it and refused rather than installed"
+        );
+    }
+
+    /// A run must *persist* before it is believed: one tick short of the
+    /// deadline the high-water still stands, or a single well-timed frame would
+    /// be enough to force a correction.
+    #[test]
+    fn an_ogm_resync_waits_out_the_full_reset_protection() {
+        let mut engine = proving_engine();
+        feed(&mut engine, 0, &ogm_via(2, 3, 5_000, 255));
+        feed(&mut engine, 1, &ogm_via(2, 2, 1, 255));
+
+        let just_short = core::time::Duration::from_secs(1) + crate::OGM_SEQNO_RESET_PROTECTION
+            - core::time::Duration::from_millis(1);
+        let frame = ogm_via(2, 2, 2, 255);
+        let parsed = LinkFrame::ref_from_prefix(&frame).unwrap().0;
+        let mut tx = [0u8; 128];
+        let mut reply: LinkFrameDataMut<'_> = (&mut tx[..]).into();
+        engine.handle_rx(just_short, parsed, None, &mut reply, &mut ());
+        assert_eq!(
+            ogm_high_water(&engine, 2),
+            Some(5_000),
+            "one millisecond short of the deadline, the high-water still stands"
+        );
+    }
+
+    /// A record whose high-water is under correction must not be pinned at the
+    /// top of the eviction order by the very frames doing the pinning.
+    ///
+    /// The rule `BroadcastSeqnoEntry::last_updated` states, applied to the
+    /// originator table: eviction is keyed on `last_heard`, and being evicted
+    /// *reseeds* a jammed high-water — so holding a poisoned record in place
+    /// with a stream of non-advancing frames must not be possible.
+    #[test]
+    fn an_out_of_band_ogm_does_not_refresh_the_eviction_key() {
+        let mut engine = proving_engine();
+        feed(&mut engine, 0, &ogm_via(2, 3, 5_000, 255));
+        let seeded = engine
+            .originator_table
+            .get(&mac(2))
+            .expect("seeded")
+            .last_heard;
+
+        feed(&mut engine, 10, &ogm_via(2, 2, 1, 255));
+        let record = engine.originator_table.get(&mac(2)).expect("kept");
+        assert_eq!(
+            record.last_heard, seeded,
+            "an OGM judged against a high-water under correction is heard, and \
+             its path learned, but it does not restamp the eviction key"
+        );
+        assert_eq!(
+            record.paths.len(),
+            2,
+            "the path really was learned — this is not the stale-copy path"
+        );
+    }
+
+    /// A stale replayed OGM must not revert a live member's multicast groups.
+    ///
+    /// Memberships are state the originator *asserts*, unlike the arrival of a
+    /// frame, which this node observes for itself — so they follow the freshest
+    /// OGM and no other. Both refusal paths are covered: a straggler inside the
+    /// reorder tolerance, dropped whole as a stale copy, and an out-of-band
+    /// replay, which *is* believed about the topology and must still not be
+    /// believed about the groups.
+    #[test]
+    fn a_stale_replayed_ogm_does_not_revert_a_live_members_mcast_groups() {
+        let mut engine = proving_engine();
+        let joined_g5 = ogm_mcast_via(2, 2, 100, &[mcast_group(5)]);
+
+        feed(&mut engine, 0, &joined_g5);
+        feed(&mut engine, 1, &ogm_mcast_via(2, 2, 101, &[mcast_group(6)]));
+        assert_eq!(
+            engine.mcast_listeners(mcast_group(6)).collect::<Vec<_>>(),
+            vec![mac(2)],
+            "the newer announcement landed"
+        );
+        assert_eq!(
+            engine.mcast_listeners(mcast_group(5)).count(),
+            0,
+            "and replaced the older one"
+        );
+
+        // A straggler inside the reorder tolerance: dropped as a stale copy.
+        feed(&mut engine, 2, &joined_g5);
+        assert_eq!(
+            engine.mcast_listeners(mcast_group(6)).collect::<Vec<_>>(),
+            vec![mac(2)],
+            "a stale copy must not revert the groups"
+        );
+
+        // Far out of band, under eve's own source: learned as topology
+        // evidence, refused as content.
+        feed(&mut engine, 3, &ogm_mcast_via(2, 3, 1, &[mcast_group(5)]));
+        assert_eq!(
+            engine.mcast_listeners(mcast_group(6)).collect::<Vec<_>>(),
+            vec![mac(2)],
+            "nor may a replay judged against a high-water under correction"
+        );
+    }
+
+    /// The converse, so the freshness gate cannot be tightened into refusing
+    /// current state: a copy *at* the high-water, arriving via a second
+    /// neighbor, still carries current contents and must still be folded in.
+    ///
+    /// The two copies are given different group sets only to make the branch
+    /// observable — a genuine second copy of one flood carries the same TVLV,
+    /// so applying it is a no-op and nothing would distinguish the arms.
+    #[test]
+    fn an_equal_seqno_ogm_copy_still_refreshes_membership() {
+        let mut engine = proving_engine();
+        feed(&mut engine, 0, &ogm_mcast_via(2, 2, 100, &[mcast_group(5)]));
+        feed(
+            &mut engine,
+            1,
+            &ogm_mcast_via(2, 4, 100, &[mcast_group(5), mcast_group(6)]),
+        );
+        assert_eq!(
+            engine.mcast_listeners(mcast_group(6)).collect::<Vec<_>>(),
+            vec![mac(2)],
+            "an equal-seqno copy is current, not stale"
+        );
+    }
+
+    /// A restarted originator's OGMs are re-flooded again within one
+    /// reset-protection interval — the reason the correction exists at all.
+    ///
+    /// This, not the replay attack, is what makes the resync load-bearing, and
+    /// the argument is easy to get backwards. Before the high-water was
+    /// decoupled from path learning, an originator that restarted its counter
+    /// had its OGMs refused outright, so `NeighborStats::last_heard` was never
+    /// refreshed, its paths aged out, and `purge_stale` dropped the record —
+    /// whereupon the next OGM re-seeded a correct high-water. **Eviction was
+    /// the self-healing path.** Decoupling deliberately refreshes those paths,
+    /// which removes it: without the resync a restarted originator's
+    /// high-water would stand forever and every relay in the mesh would stop
+    /// forwarding its OGMs, permanently, with the route to it looking healthy
+    /// one hop away. No attacker is involved.
+    #[test]
+    fn a_restarted_originator_is_reflooded_again_within_the_reset_protection() {
+        let mut engine = proving_engine();
+
+        // A long-lived originator, then a restart back to a low counter.
+        assert!(feed_reflooded(&mut engine, 0, &ogm_via(2, 2, 9_000, 255)));
+        assert!(!feed_reflooded(&mut engine, 1, &ogm_via(2, 2, 1, 255)));
+
+        // Its paths stay live throughout — which is precisely why eviction can
+        // no longer be relied on to clear the stale high-water.
+        engine.purge_stale(core::time::Duration::from_secs(2));
+        assert!(
+            engine.originator_table.contains_key(&mac(2)),
+            "the record survives, so nothing evicts the wrong high-water"
+        );
+
+        let deadline = 1 + crate::OGM_SEQNO_RESET_PROTECTION.as_secs();
+        assert!(
+            feed_reflooded(&mut engine, deadline, &ogm_via(2, 2, 2, 255)),
+            "re-flooding must resume once the run has persisted"
+        );
+        assert_eq!(ogm_high_water(&engine, 2), Some(2));
     }
 
     /// An unanswered challenge must be retried promptly, and only slow down if
@@ -3151,6 +3707,17 @@ mod tests {
             "a persistent restart must resynchronise the high-water"
         );
         assert_eq!(bcast_high_water(&engine, 2), Some(3));
+        assert_eq!(
+            engine
+                .broadcast_seqno
+                .get(&mac(2))
+                .expect("entry")
+                .last_updated,
+            later,
+            "a resync writes the high-water, so it must restamp the eviction key \
+             too — the one thing `SeqnoAdmission::high_water_written` is for, and \
+             not something the verdict alone can tell a caller"
+        );
     }
 
     /// The resync restores the seqno that *opened* the run, not whichever

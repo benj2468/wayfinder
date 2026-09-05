@@ -93,7 +93,7 @@ BASELINE = {
     "attack_forged_revocation_flood_evicts_genuine": red_team.HELD,
     "attack_stale_revocation_denies_readmission": red_team.HELD,
     # --- 2026-08 sweep: OGM semantics / routing engine ---
-    "attack_ogm_seqno_highwater_jam": red_team.GAP,
+    "attack_ogm_seqno_highwater_jam": red_team.HELD,
     "attack_broadcast_seqno_blackhole": red_team.HELD,
     "attack_broadcast_seqno_in_window_jump": red_team.HELD,
     "attack_broadcast_resync_hijack": red_team.HELD,

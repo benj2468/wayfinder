@@ -109,6 +109,8 @@ impl From<&OriginatorRecord> for PyOriginatorRecord {
             best_next_hop,
             max_tq,
             last_seqno,
+            // Re-flood dedup bookkeeping, not routing state a sim inspects.
+            resync_watch: _,
             paths,
         } = record;
         Self {
