@@ -171,9 +171,9 @@ the engine itself is unchanged. See `libs/wayfinder` for `OgmAuth`.
 
    The `frame.src`-based gate that keeps suggesting itself here is *not* the
    answer and has been rejected twice (issue #29, and
-   `docs/design/09-mesh-auth-gaps.md` §3's "What does *not* fix it"): an
-   outsider copies a member MAC off the air, and the damage is keyed on `orig`
-   anyway.
+   `docs/design/implemented/09-mesh-auth-gaps.md` §3's "What does *not* fix
+   it"): an outsider copies a member MAC off the air, and the damage is keyed
+   on `orig` anyway.
 
 3. If TTL expired, returns `DeliverLocal` (deliver, no re-flood).
 4. Otherwise writes a re-flood (TTL−1, inner frame preserved) into the reply
@@ -186,7 +186,7 @@ link-local by construction (`BatmanNextHopChallengePacket` /
 `BatmanNextHopResponsePacket` carry no `dest` and no `ttl`), and the router owns
 the pairwise key material the nonce and tag are checked against, keeping the
 engine free of any crypto dependency. See `libs/wayfinder`'s `OgmAuth` and
-`docs/design/09-mesh-auth-gaps.md` §4.
+`docs/design/implemented/09-mesh-auth-gaps.md` §4.
 
 **Reachability probes** (`handle_rx`, `EchoRequest`/`EchoReply` arms →
 `handle_echo`): the `handle_cert_req` twin — delivered locally at `dest` (a

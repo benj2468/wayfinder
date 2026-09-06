@@ -908,7 +908,7 @@ pub fn poll_due_keepalives<R: RouterOps>(
 /// `i_max` for that lost frame left a settled mesh unable to route for over
 /// two minutes. The handful of extra frames a doubling retry spends are
 /// bounded by the cap, which is the rate the duty-cycle budget in
-/// `docs/design/09-mesh-auth-gaps.md` was written against.
+/// `docs/design/implemented/09-mesh-auth-gaps.md` was written against.
 ///
 /// Emitted on **every** interface rather than the router's metric-chosen one,
 /// which is the security-relevant part. `get_egress_interface` resolves through

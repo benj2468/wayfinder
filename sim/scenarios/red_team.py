@@ -227,7 +227,7 @@ def attack_ogm_replay() -> Finding:
     verifies and is still learned as a path. It simply cannot be *selected*,
     because the address it spoofs would have to answer a challenge with a
     pairwise key the attacker does not hold. See
-    ``docs/design/09-mesh-auth-gaps.md`` §4.
+    ``docs/design/implemented/09-mesh-auth-gaps.md`` §4.
     """
     body, hq_mac = _capture_signed_ogm()
     m = mesh()
@@ -2158,6 +2158,14 @@ def attack_proof_survives_key_eviction_window() -> Finding:
     where victim still reports a route to bob *and* still reads his proof as
     current while his key is already gone from the neighbour cache? That triple
     is the untaggable-blackhole window; its width is the finding.
+
+    It must now fail, because a proof and the key it was answered with go
+    together: `CentralRouter::set_auth_time` reconciles the engine's `proven`
+    table against `OgmAuth::has_live_key` in the same call that advances the
+    clock, so the window never opens
+    (`docs/design/implemented/09-mesh-auth-gaps.md` §8.10). The paragraph above
+    describes the behaviour this attack was built against, not current
+    behaviour.
     """
     m = mesh()
     sim = Simulation(
@@ -2707,8 +2715,9 @@ def attack_ogm_seqno_highwater_jam() -> Finding:
 
     It must fail because the high-water no longer decides whether a path is
     learned — only whether the OGM carrying it is re-flooded
-    (`docs/design/09-mesh-auth-gaps.md` §8.11). A value any repeatable frame can
-    write must not be able to deny a *proven* neighbour its route; path
+    (`docs/design/implemented/09-mesh-auth-gaps.md` §8.11). A value any
+    repeatable frame can write must not be able to deny a *proven* neighbour
+    its route; path
     freshness lives per-path in `NeighborStats`, and next-hop liveness is the
     challenge's job.
 

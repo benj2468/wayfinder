@@ -292,7 +292,7 @@ held store is durable and may hold rows parked by a build that predates the
 rule). This — not the live-certificate lock beside it — is what stops
 impersonation: the lock is first-come, so it only ever protected an address that
 already held a certificate. Keep the lock, but do not reason about impersonation
-from it. See `docs/design/09-mesh-auth-gaps.md` §5.
+from it. See `docs/design/implemented/09-mesh-auth-gaps.md` §5.
 
 **A provider's enrollment posture is one field, spelled so that silence is
 closed.** `ProviderConfig::auto_approve` (`#[serde(default)]` → `false`)

@@ -196,7 +196,7 @@ pub enum LocalSendError {
     /// away, over whatever egress the link-quality table picks — writable by
     /// a spoofed source before any authentication verdict. That is exactly
     /// the interception the next-hop proof gate exists to close. See
-    /// `docs/design/09-mesh-auth-gaps.md` §4.
+    /// `docs/design/implemented/09-mesh-auth-gaps.md` §4.
     RouteUnproven,
 }
 
@@ -443,7 +443,7 @@ pub struct RxOutcome<'rx, 'tx> {
     /// challenger itself, and that table is writable by a spoofed source on a
     /// *different* interface before any authentication verdict — exactly the
     /// misdirection this proof exists to rule out. See
-    /// `docs/design/09-mesh-auth-gaps.md` §4.
+    /// `docs/design/implemented/09-mesh-auth-gaps.md` §4.
     pub pin_egress_iface: Option<usize>,
 }
 
@@ -500,6 +500,18 @@ pub struct CentralRouter<
     /// it emits and drops incoming OGMs that do not verify against the mesh
     /// trust anchor — segregating this mesh from others sharing the medium.
     auth: Option<OgmAuth<NEIGHBOR_KEYS, REVOKED, IN_FLIGHT_CERT_REQUESTS, PENDING_REPLIES>>,
+    /// The [`key_generation`](auth::OgmAuth::key_generation) this router last
+    /// reconciled the engine's next-hop proofs against.
+    ///
+    /// Purely a skip: [`set_auth_time`](Self::set_auth_time) runs on every pass
+    /// of a driver loop, and the sweep it guards has nothing to do unless a
+    /// key has actually stopped being reachable since the last one. Starts at
+    /// zero, which is also a fresh `OgmAuth`'s generation, so a router that has
+    /// evicted nothing never sweeps — correct, since it has no stale proof to
+    /// find. `set_auth` installs a *new* `OgmAuth` whose generation restarts at
+    /// zero, but that path clears `proven` outright, so there is nothing for a
+    /// missed sweep to leave behind.
+    swept_key_generation: u32,
     /// Fail-closed policy: when `true`, this node must not act as a mesh router
     /// (process, forward, deliver, or originate any mesh traffic) until a valid
     /// membership cert is installed via [`set_auth`](CentralRouter::set_auth).
@@ -665,6 +677,7 @@ impl<
             tx_rates: [RateEstimator::default(); INTERFACES],
             iface_count: 0,
             auth: None,
+            swept_key_generation: 0,
             require_auth: false,
             self_revocation: None,
             pending_self_revocation: None,
@@ -900,12 +913,12 @@ impl<
     ///
     /// Also turns on the next-hop proof gate (a candidate next hop must
     /// answer a pairwise challenge before it can be selected — see
-    /// `docs/design/09-mesh-auth-gaps.md` §4) and resets all learned routing,
-    /// link-quality, and next-hop-proof state, since it was learned under the
-    /// previous (or no) auth regime and is stale the instant this node's
-    /// identity/anchor changes. A route can therefore sit unusable for one
-    /// challenge/response round trip immediately after this call, even to an
-    /// already-known neighbor.
+    /// `docs/design/implemented/09-mesh-auth-gaps.md` §4) and resets all
+    /// learned routing, link-quality, and next-hop-proof state, since it was
+    /// learned under the previous (or no) auth regime and is stale the instant
+    /// this node's identity/anchor changes. A route can therefore sit unusable
+    /// for one challenge/response round trip immediately after this call, even
+    /// to an already-known neighbor.
     pub fn set_auth(
         &mut self,
         auth: OgmAuth<NEIGHBOR_KEYS, REVOKED, IN_FLIGHT_CERT_REQUESTS, PENDING_REPLIES>,
@@ -927,7 +940,8 @@ impl<
         // A next hop must now prove itself before it can be selected. Gated on
         // auth being enabled because proof rests on pairwise keys: requiring it
         // on an unauthenticated mesh would break every route rather than
-        // securing anything. See `docs/design/09-mesh-auth-gaps.md` §4.
+        // securing anything. See `docs/design/implemented/09-mesh-auth-gaps.md`
+        // §4.
         self.batman.set_require_proof(true);
         // Routes, link-quality, ident mappings, and broadcast-dedup state were
         // all learned under the previous (or no) auth regime and are stale the
@@ -1380,10 +1394,11 @@ impl<
                 // `strip_directed` (`wayfinder-driver-core`) verifies a pairwise
                 // tag on every *directed* frame — unicast and mcast — before
                 // this function is reached, on every driver shell, and drops
-                // one that fails. `docs/design/09-mesh-auth-gaps.md` §4 has the
-                // detail; it is a receiver-bound authenticator with a
-                // monotonic per-neighbour counter, so an outsider holding no
-                // pairwise key cannot produce or replay one.
+                // one that fails.
+                // `docs/design/implemented/09-mesh-auth-gaps.md` §4 has the
+                // detail; it is a receiver-bound authenticator with a monotonic
+                // per-neighbour counter, so an outsider holding no pairwise key
+                // cannot produce or replay one.
                 //
                 // What genuinely has no authenticator is **broadcast**, which
                 // `strip_directed` exempts by construction: a pairwise tag is
@@ -2765,7 +2780,7 @@ impl<
     /// directly to a destination that is not actually one hop away over
     /// whatever egress the (attacker-poisonable) link-quality table picks —
     /// exactly the interception the next-hop proof gate exists to close. See
-    /// `docs/design/09-mesh-auth-gaps.md` §4.
+    /// `docs/design/implemented/09-mesh-auth-gaps.md` §4.
     fn resolve_next_hop(&self, now: core::time::Duration, dest: Mac) -> Option<Mac> {
         if let Some(hop) = self.batman.next_hop(now, dest) {
             return Some(hop);
@@ -2917,6 +2932,51 @@ impl<
     /// This node's own mesh address.
     pub fn self_ident(&self) -> Mac {
         self.batman.self_ident
+    }
+
+    /// Advance the certificate-validity clock, and keep the routing engine's
+    /// next-hop proofs in step with the key material that backs them.
+    ///
+    /// **The only correct way for a driver to set the auth clock.** Advancing
+    /// it can evict a lapsed member's pairwise key, and a proof answered with
+    /// that key must not outlive it: selection gates on the proof while the
+    /// data plane gates on the key, so a disagreement between them is a route
+    /// that reports healthy and drops every directed frame at dispatch
+    /// (`docs/design/implemented/09-mesh-auth-gaps.md` §8.10). Reaching past
+    /// this to `auth_mut().set_time(..)` advances one half and not the other,
+    /// which is exactly how the defect arose.
+    ///
+    /// This is the seam the sweep has to be driven from: eviction happens in
+    /// [`OgmAuth`](auth::OgmAuth) and the proofs live in the routing engine,
+    /// whose crate does not depend on it — so the router, holding both, is the
+    /// only place the two can be reconciled.
+    ///
+    /// A no-op when authentication is disabled: there is no clock to advance,
+    /// and no key material to reconcile against. (A node that never enabled
+    /// auth has the proof gate off; one that *dropped* auth on a
+    /// self-revocation had `proven` cleared by the reset that came with it —
+    /// the gate itself is never turned back off, so "the gate is off" would be
+    /// the wrong reason to give.)
+    ///
+    /// Called on every pass of a driver loop — which on the tokio shell means
+    /// every frame — so the reconciliation is gated on
+    /// [`OgmAuth::key_generation`](auth::OgmAuth::key_generation) changing.
+    /// Without that it would scan the proof table, with a neighbor-cache lookup
+    /// per entry, on a hot path, to discover that nothing had been evicted.
+    pub fn set_auth_time(&mut self, now: core::time::Duration, now_unix: u64) {
+        let Some(auth) = self.auth.as_mut() else {
+            return;
+        };
+        auth.set_time(now_unix);
+        // Re-borrowed immutably: the sweep reads the key cache while writing
+        // the engine, and they are disjoint fields.
+        let auth = &*auth;
+        let generation = auth.key_generation();
+        if generation == self.swept_key_generation {
+            return;
+        }
+        self.batman.retain_proven(now, |mac| auth.has_live_key(mac));
+        self.swept_key_generation = generation;
     }
 
     /// Whether `neighbor` currently holds a valid next-hop proof as of `now`.
@@ -3420,7 +3480,7 @@ mod cert_control_delivery {
 mod untaggable_drop_metric {
     //! The drop this counts is invisible from anywhere else: the route
     //! resolved, the frame was planned, and then it simply never went out. See
-    //! `docs/design/09-mesh-auth-gaps.md` §7.
+    //! `docs/design/implemented/09-mesh-auth-gaps.md` §7.
 
     use super::*;
 
@@ -4926,6 +4986,164 @@ mod ogm_auth_integration {
         );
     }
 
+    /// A next-hop proof must not outlive the pairwise key it was answered
+    /// with (`docs/design/implemented/09-mesh-auth-gaps.md` §8.10).
+    ///
+    /// Certificate expiry drops a lapsed member's keys from `OgmAuth`, which is
+    /// §6's fix and correct on its own. The engine's `proven` table is separate
+    /// state and was not swept when that happened, so the two halves disagreed
+    /// for up to `MAX_MISSED_PROOFS` intervals: selection kept choosing the
+    /// lapsed neighbour because its proof still read current, while the data
+    /// plane had no key to tag a frame to it and dropped every one at dispatch.
+    /// **The route reported healthy and the traffic over it vanished** — and
+    /// renewal could not rescue it from inside the window either, because
+    /// `issue_challenge` fails closed for a neighbour with no key.
+    ///
+    /// The two are one event, as they already are for revocation and for
+    /// re-anchoring: expiry was the *measured* path that dropped the key and
+    /// left the proof standing. A full-cache eviction does the same with no
+    /// clock involved, which is why the sweep is written against a predicate
+    /// rather than an eviction event — see
+    /// [`a_key_evicted_by_cache_pressure_takes_its_proof_too`].
+    #[test]
+    fn an_expired_neighbours_key_takes_its_next_hop_proof_with_it() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut victim = router_with_auth(&authority, 1);
+
+        // Bob's certificate lapses at t=200, inside victim's clock's reach.
+        let bob_kp = Keypair::from_seed(&[2; 32]);
+        let bob_cert = authority.issue_cert(mac(2), bob_kp.ed_pubkey(), bob_kp.x_pubkey(), 0, 200);
+        let mut bob = CentralRouter::new(mac(2));
+        let mut bob_auth = crate::auth::OgmAuth::new(bob_kp, bob_cert, authority.trust_anchor());
+        bob_auth.set_time(100);
+        bob.set_auth(bob_auth);
+
+        // Prove bob first, so his OGM installs him as the selected next hop
+        // rather than sitting as an unproven path.
+        prove(&mut victim, &[mac(2)], Duration::ZERO);
+        let ogm = poll_ogm_bytes(&mut bob);
+        feed(&mut victim, mac(2), &ogm);
+
+        assert_eq!(
+            victim
+                .batman
+                .originator_table
+                .get(&mac(2))
+                .and_then(|r| r.best_next_hop),
+            Some(mac(2)),
+            "setup: victim selected bob as its next hop"
+        );
+        assert!(
+            victim.proof_current(Duration::ZERO, mac(2)),
+            "setup: and reads his proof as current"
+        );
+        assert!(
+            victim
+                .auth()
+                .expect("auth")
+                .neighbor_x_pubkey(mac(2))
+                .is_some(),
+            "setup: while still holding the key that proof was answered with"
+        );
+
+        // Walk the certificate-validity clock past bob's expiry, the way a
+        // driver does on every pass of its loop.
+        victim.set_auth_time(Duration::ZERO, 300);
+
+        assert!(
+            victim
+                .auth()
+                .expect("auth")
+                .neighbor_x_pubkey(mac(2))
+                .is_none(),
+            "the lapsed member's key is evicted"
+        );
+        assert!(
+            !victim.proof_current(Duration::ZERO, mac(2)),
+            "and the proof it was answered with must go with it, or selection \
+             keeps choosing a hop the data plane cannot tag for"
+        );
+        assert_eq!(
+            victim
+                .batman
+                .originator_table
+                .get(&mac(2))
+                .and_then(|r| r.best_next_hop),
+            None,
+            "so the route table stops reporting a usable path it does not have"
+        );
+    }
+
+    /// The same blackhole, reached without a clock at all: a live member pushed
+    /// out of a **full** neighbour-key cache.
+    ///
+    /// This is the case that decided the shape of the fix. §8.10's first draft
+    /// proposed handing the engine the MACs `evict_expired_neighbors` dropped,
+    /// which would have closed the measured path and left this one open —
+    /// `cache_neighbor` overwrites a slot when the table is full, that slot may
+    /// hold a live member (it says so in as many words), and no expiry is
+    /// involved, so an expiry handler never sees it. Sweeping on the predicate
+    /// "can the data plane still tag for this peer" covers both without having
+    /// to enumerate the ways a key can go.
+    ///
+    /// Note the clock never moves here.
+    #[test]
+    fn a_key_evicted_by_cache_pressure_takes_its_proof_too() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut victim = router_with_auth(&authority, 1);
+
+        // Bob is proven and selected, and is the *first* entry in the key cache
+        // — which is the slot `cache_neighbor` overwrites when full.
+        prove(&mut victim, &[mac(2)], Duration::ZERO);
+        let mut bob = router_with_auth(&authority, 2);
+        let bob_ogm = poll_ogm_bytes(&mut bob);
+        feed(&mut victim, mac(2), &bob_ogm);
+        assert_eq!(
+            victim
+                .batman
+                .originator_table
+                .get(&mac(2))
+                .and_then(|r| r.best_next_hop),
+            Some(mac(2)),
+            "setup: bob is the selected next hop"
+        );
+
+        // Fill the cache to capacity, then one past it. Every certificate here
+        // is valid for the same window bob's is; nothing expires.
+        for n in 3..=(crate::auth::MAX_NEIGHBOR_KEYS as u8 + 2) {
+            let mut other = router_with_auth(&authority, n);
+            let ogm = poll_ogm_bytes(&mut other);
+            feed(&mut victim, mac(n), &ogm);
+        }
+        assert!(
+            victim
+                .auth()
+                .expect("auth")
+                .neighbor_x_pubkey(mac(2))
+                .is_none(),
+            "setup: bob was pushed out of the full cache"
+        );
+
+        // The same clock value as the router was built with: this reconciliation
+        // is not driven by time passing.
+        victim.set_auth_time(Duration::ZERO, 100);
+
+        assert!(
+            !victim.proof_current(Duration::ZERO, mac(2)),
+            "a proof is worth no more than this node's ability to use the key it \
+             was answered with, however that key went"
+        );
+        assert_eq!(
+            victim
+                .batman
+                .originator_table
+                .get(&mac(2))
+                .and_then(|r| r.best_next_hop),
+            None,
+            "so the route stops reporting a path the data plane cannot tag for"
+        );
+    }
+
     /// An OGM signed for another mesh (different trust anchor) is dropped — the
     /// segregation property end to end.
     #[test]
@@ -5277,7 +5495,7 @@ mod ogm_auth_integration {
     /// the attacker-poisonable link-quality table picks — silently
     /// reintroducing the interception this feature exists to close, for
     /// every locally-originated frame sent before the real relay proves
-    /// itself. See `docs/design/09-mesh-auth-gaps.md` §4.
+    /// itself. See `docs/design/implemented/09-mesh-auth-gaps.md` §4.
     #[test]
     fn handle_local_refuses_a_route_with_no_proven_next_hop() {
         let authority = Authority::from_seed(&[1; 32], 0xABCD);
@@ -5496,8 +5714,9 @@ mod ogm_auth_integration {
     ///
     /// Not a claim that the data plane is authenticated: it is not, and an
     /// outsider spoofing `frame.src` still gets through until the pairwise tag
-    /// lands (§4 of `docs/design/09-mesh-auth-gaps.md`). This closes the case
-    /// where the node is *known*, which is the one revocation is about.
+    /// lands (§4 of `docs/design/implemented/09-mesh-auth-gaps.md`). This
+    /// closes the case where the node is *known*, which is the one revocation
+    /// is about.
     #[test]
     fn a_revoked_relay_carries_no_data_frame() {
         const INNER: &[u8] = &[0x45, 0x00, 0x00, 0x1c, 0xde, 0xad];

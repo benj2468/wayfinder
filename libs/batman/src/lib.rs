@@ -88,7 +88,7 @@ pub const MAX_MISSED_KEEPALIVES: u32 = 3;
 /// Smaller than [`MAX_MISSED_OGMS`] on purpose: an OGM path aging out costs a
 /// route, but a *proof* aging out is the only thing standing between a spoofed
 /// next hop and the traffic aimed at it, so it should lapse well before the
-/// path it guards does. See `docs/design/09-mesh-auth-gaps.md` §4.
+/// path it guards does. See `docs/design/implemented/09-mesh-auth-gaps.md` §4.
 pub const MAX_MISSED_PROOFS: u32 = 3;
 
 /// Fallback expected keep-alive interval used to seed a freshly-heard
@@ -154,11 +154,11 @@ pub const BROADCAST_SEQNO_REORDER_TOLERANCE: u32 = 64;
 /// honest originator earned.
 ///
 /// The residual, which authentication is the only real answer to (see
-/// `docs/design/09-mesh-auth-gaps.md` §8 item 6): an attacker injecting
-/// *continuously*, faster than the victim broadcasts, keeps advancing the
-/// high-water and so keeps clearing the watch. That is a sustained flood, which
-/// an outsider can mount against this protocol anyway; what it can no longer be
-/// is a one-shot with permanent effect.
+/// `docs/design/implemented/09-mesh-auth-gaps.md` §8 item 6): an attacker
+/// injecting *continuously*, faster than the victim broadcasts, keeps advancing
+/// the high-water and so keeps clearing the watch. That is a sustained flood,
+/// which an outsider can mount against this protocol anyway; what it can no
+/// longer be is a one-shot with permanent effect.
 ///
 /// In the spirit of batman-adv's `BATADV_RESET_PROTECTION_MS`.
 pub const BROADCAST_SEQNO_RESET_PROTECTION: Duration = Duration::from_secs(30);
@@ -186,11 +186,11 @@ pub const OGM_SEQNO_WINDOW: u32 = 256;
 /// therefore a few sequence numbers — behind the high-water, not tens.
 ///
 /// Sizing it wide would be the quiet way to reintroduce the jam this banding
-/// exists to close (`docs/design/09-mesh-auth-gaps.md` §8.11): a rebooted
-/// originator re-emitting from 1 against a high-water an attacker pinned at 56
-/// sits *inside* a tolerance of 64, so every one of its OGMs would read as an
-/// ordinary duplicate, no run would ever be watched, and the correction would
-/// never fire.
+/// exists to close (`docs/design/implemented/09-mesh-auth-gaps.md` §8.11): a
+/// rebooted originator re-emitting from 1 against a high-water an attacker
+/// pinned at 56 sits *inside* a tolerance of 64, so every one of its OGMs would
+/// read as an ordinary duplicate, no run would ever be watched, and the
+/// correction would never fire.
 pub const OGM_SEQNO_REORDER_TOLERANCE: u32 = 16;
 
 /// How long a run of OGM sequence numbers that do not advance an originator's
@@ -637,7 +637,7 @@ pub struct OriginatorRecord {
     /// originator named *inside* the OGM rather than on the forwarder, so anyone
     /// able to repeat a member's signed OGM can write it, and a high-water that
     /// also decided whether a path was learned would turn that into a targeted
-    /// route denial — see `docs/design/09-mesh-auth-gaps.md` §8.11.
+    /// route denial — see `docs/design/implemented/09-mesh-auth-gaps.md` §8.11.
     pub last_seqno: u32,
     /// The run of OGM sequence numbers currently being watched as evidence
     /// against [`last_seqno`](Self::last_seqno), or `None` if the last OGM from
@@ -757,7 +757,7 @@ pub struct BatmanEngine<
     /// is what egress pins to. Note the narrower guarantee: the tag is
     /// unforgeable, but the interface is whichever link delivered the answer
     /// first, which a wormhole relaying the genuine answer can be (see
-    /// "Residual: wormhole" in `docs/design/09-mesh-auth-gaps.md`).
+    /// "Residual: wormhole" in `docs/design/implemented/09-mesh-auth-gaps.md`).
     pub(crate) proven: FnvIndexMap<Mac, (Duration, usize), MAX_ORIGINATORS>,
     /// When each neighbor was last *challenged*, and how many attempts have
     /// gone unanswered since it last proved itself — so a candidate is
@@ -777,7 +777,7 @@ pub struct BatmanEngine<
     /// Doubling from `i_min` instead recovers in about a second and still
     /// settles at one frame per `seed_interval` for a peer that genuinely
     /// never answers, so the duty-cycle budget in
-    /// `docs/design/09-mesh-auth-gaps.md` is unchanged.
+    /// `docs/design/implemented/09-mesh-auth-gaps.md` is unchanged.
     pub(crate) challenged: FnvIndexMap<Mac, (Duration, u32), MAX_ORIGINATORS>,
     /// Whether a next hop must have proven itself to be selectable.
     ///
