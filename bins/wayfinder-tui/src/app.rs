@@ -269,6 +269,31 @@ pub struct LogView {
     /// A submitted filter awaiting execution by the event loop, which owns the
     /// client. Set by [`App::submit_filter_edit`] and taken by the loop.
     pub pending_filter: Option<String>,
+    /// Why the last log poll failed, if it did; cleared by the next success.
+    ///
+    /// Its own slot rather than the dashboard-wide error, because the node
+    /// serves the log ring to a full grant only: a viewer-tier credential is
+    /// refused this one read and every other table on the refresh is fine, so
+    /// failing the whole refresh would blank six working tabs over one the
+    /// operator was never entitled to. Same treatment the ping panel gets, and
+    /// for the same reason.
+    pub error: Option<String>,
+    /// Whether the node has refused this credential the log ring, so the poll
+    /// has stopped asking.
+    ///
+    /// A refusal is a property of the credential, not of this tick: the node
+    /// gives the same answer every second for the life of the connection. Left
+    /// asking, a viewer's TUI would spend one security `warn!` per tick in the
+    /// node's ring — 512 entries on a host, 64 on a board — and evict the
+    /// records an admin later needs, which is the ring this whole change exists
+    /// to keep readable. It is also the hazard `wayfinder-web`'s `PollScope`
+    /// names as the reason the dashboard does not ask either; the TUI cannot
+    /// read its own tier up front the way that does, so it learns from the
+    /// first answer instead.
+    ///
+    /// Cleared on reconnect ([`LogView::reset_for_new_connection`]), where the
+    /// credential may differ.
+    pub refused: bool,
 }
 
 impl LogView {
@@ -278,6 +303,17 @@ impl LogView {
             follow: true,
             ..Default::default()
         }
+    }
+
+    /// Forget what the last connection's credential was told.
+    ///
+    /// The scrollback and the operator's filter/scroll position deliberately
+    /// survive — a reconnect is not a new session from the reader's point of
+    /// view — but a refusal and its message belong to the credential that
+    /// earned them, and the next connection may present a different one.
+    pub fn reset_for_new_connection(&mut self) {
+        self.refused = false;
+        self.error = None;
     }
 }
 

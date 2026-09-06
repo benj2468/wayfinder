@@ -284,9 +284,41 @@ rpc_table! {
         access: [Admin, SelfKey, Viewer],
         limit: Unmetered,
     }
+    /// The node's bounded log ring. A read, and one of the few on this table a
+    /// viewer is *not* the audience for — see `GetOwnCert` and `ListUsers`
+    /// below for the others.
+    ///
+    /// Every other query here returns a typed projection of router state whose
+    /// each field was decided on. This one returns whatever any crate in the
+    /// process emitted at whatever level the runtime filter is set to — a
+    /// firehose rather than a shape. On a node in provider mode that includes
+    /// `authority.rs`'s account-administration records, which name the
+    /// username and role they act on, so a viewer reading the ring recovers
+    /// the roster, each account's role and every denied sign-in: precisely the
+    /// enumeration `ListUsers` below is admin-gated to protect.
+    ///
+    /// Narrowed here rather than at the log sites. Sanitizing those fixes
+    /// today's leak and nothing about the next `info!` somebody adds, and the
+    /// alternative of demoting them to `debug!` is not an authorization
+    /// boundary at all — `SetLogLevel` is a supported operation with a global
+    /// effect, so an admin raising the level to troubleshoot would hand the
+    /// roster back to every viewer session on the node.
+    ///
+    /// The cost is stated plainly because it is real and it is paid everywhere:
+    /// the leak only exists in provider mode, since those records come from
+    /// `authority.rs`, but the tier is a property of the request and not of the
+    /// node, so a viewer loses the log tab on an ordinary mesh node too.
+    /// Threading provider-mode awareness into `decide_access` would buy that
+    /// back at the price of making authorization depend on node role, which
+    /// this crate deliberately keeps it free of.
+    ///
+    /// `SelfKey` keeps it, which is what makes this affordable: whoever holds
+    /// a node's own seed authenticates at that tier, and that is the operator
+    /// of a board with no debug probe, for whom this ring is the only
+    /// observability there is.
     GetLogs(GetLogsRequest) {
         owner: RouterRead, audit: Query,
-        access: [Admin, SelfKey, Viewer],
+        access: [Admin, SelfKey],
         limit: Unmetered,
     }
     /// What the node believes is wrong with itself. A read, and one a viewer is

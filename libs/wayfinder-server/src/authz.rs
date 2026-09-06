@@ -49,7 +49,9 @@ pub enum MgmtAccess {
     /// Granted read-only: a verified, non-revoked cert bound to the handshake
     /// key carrying [`CERT_FLAG_VIEWER`](wayfinder::wayfinder_auth::CERT_FLAG_VIEWER)
     /// but not the admin capability. What it may invoke is [`permits`]: the
-    /// queries, and nothing that mutates or discloses a secret.
+    /// queries, less the few whose *content* is administrative — the log ring
+    /// and the account roster — and nothing that mutates or discloses a
+    /// secret.
     GrantedViewer,
     /// Granted to an enrolled device: a verified, non-revoked certificate
     /// carrying
@@ -923,7 +925,8 @@ mod tests {
     }
 
     /// The viewer tier is a closed allowlist over the same whole request
-    /// surface: every query, and not one mutation or disclosure.
+    /// surface: the queries, less the handful whose content is an
+    /// administrator's, and not one mutation or disclosure.
     ///
     /// Written as an explicit *refusal* list rather than as "everything that
     /// isn't a `Get`", so that a request named like a read but shaped like
@@ -1026,6 +1029,13 @@ mod tests {
                     // verification material rather than a secret. Grant it the
                     // day something needs it.
                     | ReqKind::GetOwnCert(_)
+                    // A read by shape, refused for the reason `ListUsers`
+                    // above is — the ring carries whatever the process logged,
+                    // which on a provider names the accounts that administer
+                    // the mesh. The full argument lives on the `GetLogs`
+                    // declaration in `wayfinder-protos`' `rpc_table!`, which is
+                    // where the tier is decided; it is not repeated here.
+                    | ReqKind::GetLogs(_)
             );
             assert_eq!(
                 permits(MgmtAccess::GrantedViewer, request),
@@ -1033,6 +1043,45 @@ mod tests {
                 "viewer tier verdict for {request:?}"
             );
         }
+    }
+
+    /// The account roster is admin-gated at `ListUsers`, and must not be
+    /// readable around that gate through the log ring.
+    ///
+    /// Stated as its own test rather than left to the sweep above. The sweep
+    /// asserts `permits(...) == !refused` over every variant, so removing
+    /// `GetLogs` from its list *alone* fails it — what slips through is the
+    /// paired edit, widening the tier and updating the list to match in one
+    /// go, which reads as tidy and is the whole regression. This one names the
+    /// property, so it fails on the pair and its message says what broke
+    /// rather than that a list changed. The tiers that legitimately read logs
+    /// are asserted here too: the fix is a narrowing of one tier, not a
+    /// removal of the request.
+    #[test]
+    fn the_log_ring_is_not_readable_from_the_viewer_tier() {
+        let logs = ReqKind::GetLogs(Default::default());
+
+        assert!(
+            !permits(MgmtAccess::GrantedViewer, &logs),
+            "a viewer reading the log ring reconstructs the account roster, \
+             each account's role and every denied sign-in — the enumeration \
+             the admin gate on ListUsers exists to prevent"
+        );
+
+        assert!(
+            permits(MgmtAccess::GrantedAdmin, &logs),
+            "an admin still reads logs"
+        );
+        assert!(
+            permits(MgmtAccess::GrantedSelfKey, &logs),
+            "so does whoever holds the node's own seed — the operator of a \
+             board with no debug probe, for whom this ring is the only way to \
+             see anything at all"
+        );
+        assert!(
+            !permits(MgmtAccess::GrantedEnrollment, &logs),
+            "and a stranger still does not"
+        );
     }
 
     /// A viewer certificate is admitted as a viewer through the whole

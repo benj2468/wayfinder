@@ -123,6 +123,26 @@ fn render_logs(frame: &mut Frame, app: &mut App, area: Rect) {
 
 /// Draw the record view, honouring the app's scroll offset.
 fn render_log_records(frame: &mut Frame, app: &mut App, area: Rect) {
+    // A poll that failed with nothing ever ingested says so here, rather than
+    // presenting an empty scrollback that reads as a quiet node. The usual case
+    // is a credential the node does not serve the log ring to; once any batch
+    // has arrived the scrollback is shown and a later failure is left to the
+    // next successful poll to correct.
+    if let Some(error) = &app.logs.error
+        && app.logs.entries.is_empty()
+    {
+        // Nothing has ever arrived, so the error is the whole content of the
+        // pane. When records *have* arrived the scrollback is worth more than
+        // the message, and the staleness is reported in the block title
+        // instead — see `render_log_records`'s caller below.
+        let message = Paragraph::new(error.as_str())
+            .style(Style::default().fg(Color::Yellow))
+            .wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::ALL).title(" Records "));
+        frame.render_widget(message, area);
+        return;
+    }
+
     // Two border rows are not text.
     let height = area.height.saturating_sub(2) as usize;
     let total = app.logs.entries.len();
@@ -170,6 +190,20 @@ fn render_log_records(frame: &mut Frame, app: &mut App, area: Rect) {
             )),
         })
         .collect();
+
+    // A failing poll is named in the title whenever any record is on screen:
+    // the full-pane message only shows while the scrollback is empty, so
+    // without this a session whose log reads start failing mid-way would sit
+    // on a frozen buffer still captioned "following".
+    if app.logs.error.is_some() && !app.logs.entries.is_empty() {
+        let title = " Logs (STALE — log poll failing) ".to_string();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(title);
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
 
     let title = if app.logs.follow {
         " Logs (following) ".to_string()
@@ -1895,6 +1929,9 @@ mod tests {
     use crate::app::Tab;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use wayfinder_protos::wayfinder::v1alpha::LogLevel;
+    use wayfinder_protos::wayfinder::v1alpha::LogRecord;
+    use wayfinder_protos::wayfinder::v1alpha::LogRecords;
 
     /// A board with three rows on it, straddling their hold windows: one
     /// critical still firing, one warning still firing, one info that has gone
@@ -1952,6 +1989,75 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    /// A viewer credential is told why the Logs pane is empty, rather than
+    /// being shown a blank scrollback that reads as a quiet node.
+    ///
+    /// The Logs tab had no render coverage at all before this; these three
+    /// cover the branch the tier narrowing added and the two either side of it.
+    #[test]
+    fn a_refused_log_poll_says_so_instead_of_showing_an_empty_scrollback() {
+        let mut app = App::new("node".into(), 1000);
+        app.tab = Tab::Logs;
+        app.logs.error = Some(
+            "server error: the node's log ring is served to an \
+                               admin certificate or the node's own key"
+                .to_string(),
+        );
+
+        let text = rendered(&mut app);
+        assert!(
+            text.contains("log ring is served"),
+            "the node's own explanation is what the operator sees: {text}"
+        );
+    }
+
+    /// A failure *after* records have arrived must not blank them — but it must
+    /// not be silent either, or a frozen buffer reads as a node with nothing to
+    /// say. The scrollback stays and the title carries the staleness.
+    #[test]
+    fn a_log_error_does_not_displace_records_already_received() {
+        let mut app = App::new("node".into(), 1000);
+        app.tab = Tab::Logs;
+        app.ingest_logs(LogRecords {
+            records: vec![LogRecord {
+                seq: 1,
+                uptime_ms: 10,
+                level: LogLevel::Info as i32,
+                target: "wayfinder::router".into(),
+                message: "a recorded line".into(),
+            }],
+            next_seq: 2,
+            dropped: 0,
+            filter: "info".into(),
+        });
+        app.logs.error = Some("transport gone".to_string());
+
+        let text = rendered(&mut app);
+        assert!(
+            text.contains("a recorded line"),
+            "records that did arrive are still shown: {text}"
+        );
+        assert!(
+            text.contains("STALE"),
+            "and the pane says the poll is failing rather than captioning \
+             itself as following: {text}"
+        );
+    }
+
+    /// A fresh connection forgets what the last credential was refused, so a
+    /// reconnect that presents a better one starts polling again.
+    #[test]
+    fn a_new_connection_clears_a_previous_refusal() {
+        let mut app = App::new("node".into(), 1000);
+        app.logs.refused = true;
+        app.logs.error = Some("refused".to_string());
+
+        app.logs.reset_for_new_connection();
+
+        assert!(!app.logs.refused, "the latch is released");
+        assert!(app.logs.error.is_none(), "and its message with it");
     }
 
     /// A node holding nothing says so, in the chrome and in the Overview alike.

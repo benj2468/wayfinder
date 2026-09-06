@@ -77,11 +77,25 @@ pub const BUNDLE_VERSION: u32 = 1;
 
 /// The longest account name a bundle may carry.
 ///
-/// The authority puts no limit on a user name, so this is not a mirror of one
-/// — it is a bound on what an *uploaded file* can push into places that are
-/// not sized for it: a log line, a `Content-Disposition` header, and the page
-/// header it is rendered into. Generous enough that no plausible account name
-/// meets it, which is the point: it is a guard, not a policy.
+/// A bound on what an *uploaded file* can push into places that are not sized
+/// for it: a log line, a `Content-Disposition` header, and the page header it
+/// is rendered into. Generous enough that no plausible account name meets it,
+/// which is the point: it is a guard, not a policy.
+///
+/// Deliberately its own constant rather than an import of the authority's
+/// `MAX_USERNAME_LEN`, even though the two are the same number and mean the
+/// same thing. `wayfinder-server` is not an `ssr` dependency of this crate —
+/// only the `mock-node` test feature pulls it — and taking the whole management
+/// server, its TLS stack and its password hasher into the dashboard's
+/// production build to share one `usize` is not a trade worth making. A bundle
+/// is an untrusted file that may have been written by another build, so this
+/// check has to stand on its own regardless.
+///
+/// **Measured in bytes, and that is the part to keep in step.** It counted
+/// `chars()` until the authority gained a bound at all, which was the laxer of
+/// the two (128 CJK characters is 384 bytes) and so admitted names the
+/// authority would refuse. The units matter more than the number: if these ever
+/// diverge, diverge on the value, not on what is being counted.
 #[cfg(feature = "ssr")]
 const MAX_USERNAME_LEN: usize = 128;
 
@@ -211,7 +225,7 @@ impl AuthBundle {
         // the one field an edited file can put anything at all into — and it
         // goes on to a log line, a download header and a page. Bounded here,
         // once, rather than defended against at each of those.
-        if bundle.username.is_empty() || bundle.username.chars().count() > MAX_USERNAME_LEN {
+        if bundle.username.is_empty() || bundle.username.len() > MAX_USERNAME_LEN {
             bail!("this credential file's account name is empty or implausibly long");
         }
         if bundle.username.chars().any(char::is_control) {

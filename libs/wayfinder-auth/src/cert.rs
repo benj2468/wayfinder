@@ -48,8 +48,15 @@ pub const CERT_FLAG_USER: u8 = 0x02;
 
 /// [`MembershipCert::flags`] bit granting the **read-only management
 /// capability**: the holder may invoke the management API's queries (routing
-/// table, link quality, metrics, logs) but none of its mutations and none of
-/// its secrets.
+/// table, link quality, metrics) but none of its mutations and none of its
+/// secrets.
+///
+/// Not quite every query: a few reads are an administrator's too, because what
+/// they disclose is administrative rather than because they change anything.
+/// The node's log ring is the one to know about — it carries whatever the
+/// process emitted, which on a certificate authority names the accounts that
+/// administer the mesh. `wayfinder-protos`' `rpc_table!` is the authority on
+/// which are which.
 ///
 /// Deliberately a bit of its own rather than "a verified certificate that is
 /// not an admin". Every device on the mesh already holds a verified non-admin

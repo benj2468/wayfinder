@@ -76,7 +76,19 @@ pub struct NodeSnapshot {
     /// not appear, which is right for all three.
     pub vpn_peers: Option<ListVpnPeersResponse>,
     /// Log records since the cursor the poll asked from, plus the next cursor.
-    pub logs: LogRecords,
+    ///
+    /// `None` on a read-only poll. The node serves its log ring to a full grant
+    /// only: the ring carries whatever the process logged, which on a provider
+    /// includes the account-administration records naming each username and
+    /// role, and a viewer reading those recovers the roster `ListUsers` is
+    /// admin-gated to protect. Same treatment as `vpn_peers` above — the query
+    /// is skipped rather than sent and refused.
+    ///
+    /// Note the one place this reads oddly: `NodeSnapshot::default()` yields
+    /// `None` too, and a default snapshot is not a poll at all. Nothing
+    /// consults it before the first poll lands, but a *fixture* built from
+    /// `Default` is asserting "withheld" whether it means to or not.
+    pub logs: Option<LogRecords>,
     /// The node's alarm board: the conditions it currently believes are wrong.
     ///
     /// Not `Option`, unlike `metrics` and `security` beside it: an empty board
@@ -121,13 +133,19 @@ pub enum PollScope {
 /// whole poll like every other table here.
 ///
 /// `scope` says what the connection's certificate is allowed to ask for, and
-/// [`PollScope::ReadOnly`] *skips* `ListVpnPeers` rather than sending it and
-/// tolerating the refusal. The node deliberately keeps that one query off the
-/// viewer tier (it is answered by calling out to the coordination server, so a
-/// read-only client must not be able to drive outbound requests from the CA at
-/// whatever rate it polls), and a poll that asked anyway would both fail the
-/// whole snapshot and write a security `warn!` into the node's log once a
-/// second for as long as anyone left the dashboard open.
+/// [`PollScope::ReadOnly`] *skips* the two admin-gated queries rather than
+/// sending them and tolerating the refusal. A poll that asked anyway would both
+/// fail the whole snapshot and write a security `warn!` into the node's log once
+/// a second for as long as anyone left the dashboard open.
+///
+/// The two, and why the node keeps each off the viewer tier:
+///
+/// - `ListVpnPeers` is answered by calling out to the coordination server, so a
+///   read-only client must not be able to drive outbound requests from the CA
+///   at whatever rate it polls.
+/// - `GetLogs` returns the process's whole log ring, which on a provider carries
+///   the account-administration records naming each username and role — the
+///   roster `ListUsers` is admin-gated to protect. Narrowed for issue #32.
 #[cfg(feature = "ssr")]
 pub async fn build_snapshot(
     conn: &NodeConnection,
@@ -167,7 +185,10 @@ pub async fn build_snapshot(
                     Err(e) => return Err(e),
                 },
             },
-            logs: client.logs(since_seq, LOG_BATCH).await?,
+            logs: match scope {
+                PollScope::ReadOnly => None,
+                PollScope::Administrator => Some(client.logs(since_seq, LOG_BATCH).await?),
+            },
             // Fetched on every poll, and failing the poll if it fails, like
             // every other table here: a header that kept claiming "all systems
             // normal" from a board it stopped being able to read would be

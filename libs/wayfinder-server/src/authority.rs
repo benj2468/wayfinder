@@ -39,6 +39,7 @@ use crate::users::AccountId;
 use crate::users::AuthOutcome;
 use crate::users::DEFAULT_SESSION_TTL_SECS;
 use crate::users::InviteStatus;
+use crate::users::MAX_USERNAME_LEN;
 use crate::users::UserInvite;
 use crate::users::UserRecord;
 use crate::users::UserRole;
@@ -708,8 +709,8 @@ impl CertAuthority {
         persisted
     }
 
-    /// Refuse `username` if it is empty, already an account, or already
-    /// invited.
+    /// Refuse `username` if it is empty, longer than [`MAX_USERNAME_LEN`],
+    /// already an account, or already invited.
     ///
     /// The invite half is the one that is easy to leave out, and leaving it out
     /// is not merely untidy: an admin creating an account for a name that has a
@@ -719,6 +720,16 @@ impl CertAuthority {
     fn check_name_available(&self, username: &str) -> Result<(), String> {
         if username.is_empty() {
             return Err("username must not be empty".to_string());
+        }
+        // Bounded because the name is persisted in the state snapshot, repeated
+        // in every audit record about the account, and carried in the
+        // `otpauth://` enrolment URI — see `MAX_USERNAME_LEN`. Checked here, in
+        // the one predicate every creating path already consults, rather than
+        // in each of `add_user`/`create_user`/`create_user_invite`.
+        if username.len() > MAX_USERNAME_LEN {
+            return Err(alloc::format!(
+                "username must be at most {MAX_USERNAME_LEN} bytes"
+            ));
         }
         if self.log.users().iter().any(|u| u.username == username) {
             return Err(alloc::format!("user {username} already exists"));
@@ -1492,6 +1503,17 @@ impl CertAuthority {
         } else {
             MAX_CERT_TTL_SECS
         };
+        // Re-checked here, not only where the invitation was minted. The
+        // invite store is durable, so a row may have been parked by a build
+        // that predates `MAX_USERNAME_LEN` — the same reason
+        // `check_mac_derives_from` runs again in `approve_csr` rather than
+        // trusting `submit_csr` to have run it. Refused rather than truncated:
+        // a name is an identifier, and half of one belongs to nobody.
+        if username.len() > MAX_USERNAME_LEN {
+            return Err(alloc::format!(
+                "this invitation names a username longer than the {MAX_USERNAME_LEN}-byte limit                  and can no longer be redeemed; ask an administrator for a new one"
+            ));
+        }
         let secret = invite.totp_secret.clone();
         let user = UserRecord::from_registration(&username, password, secret, step, role, ttl)?;
 
@@ -5552,6 +5574,60 @@ mod tests {
             ca.create_user_invite("rowan", UserRole::Admin, 900, 0)
                 .is_err(),
             "a second invite for the same name would strand the first"
+        );
+    }
+
+    /// A username is bounded on the way in, and the bound has to hold on every
+    /// path that claims a name — it is carried in the provider's state file, in
+    /// every audit line, and in an `otpauth://` URI.
+    ///
+    /// In bytes rather than characters, because bytes are what the state file
+    /// and the wire pay for. `bins/wayfinder-web/src/bundle.rs` keeps its own
+    /// constant of the same value against an *uploaded* name — that crate does
+    /// not depend on this one outside its test feature — and now counts the same
+    /// units, where it previously counted characters beside a note that the
+    /// authority bounded nothing at all.
+    #[test]
+    fn a_username_is_bounded_in_length_on_every_path_that_creates_one() {
+        let mut ca = open_ca();
+        let too_long = "r".repeat(MAX_USERNAME_LEN + 1);
+        let longest = "r".repeat(MAX_USERNAME_LEN);
+
+        assert!(
+            ca.add_user(UserRecord::new(&too_long, "hunter2", UserRole::Viewer, 900).unwrap())
+                .is_err(),
+            "the offline path must bound the name"
+        );
+        assert!(
+            MeshAuthority::create_user(&mut ca, &too_long, "hunter2", false, 900, false).is_err(),
+            "and so must the management API"
+        );
+        assert!(
+            ca.create_user_invite(&too_long, UserRole::Viewer, 900, 0)
+                .is_err(),
+            "and so must an invitation, which reserves the name before any \
+             account exists to be bounded"
+        );
+
+        // The boundary itself is admitted, so the limit is off-by-one-proof and
+        // is a refusal of the excessive rather than of the merely long.
+        assert!(
+            ca.add_user(UserRecord::new(&longest, "hunter2", UserRole::Viewer, 900).unwrap())
+                .is_ok(),
+            "a name of exactly the maximum length is accepted"
+        );
+
+        // Bytes, not characters — the half of the rule that an ASCII-only test
+        // cannot see, and the half `bins/wayfinder-web/src/bundle.rs` counted
+        // differently until it took this same constant. 65 two-byte characters
+        // is 130 bytes and is over the line.
+        let multibyte = "é".repeat(MAX_USERNAME_LEN / 2 + 1);
+        assert!(multibyte.chars().count() < MAX_USERNAME_LEN, "setup");
+        assert!(multibyte.len() > MAX_USERNAME_LEN, "setup");
+        assert!(
+            ca.add_user(UserRecord::new(&multibyte, "hunter2", UserRole::Viewer, 900).unwrap())
+                .is_err(),
+            "the bound counts bytes, so a short-but-wide name is still refused"
         );
     }
 

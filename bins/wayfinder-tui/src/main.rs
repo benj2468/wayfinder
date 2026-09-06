@@ -21,6 +21,7 @@ use tokio::sync::mpsc;
 use wayfinder_client::Client;
 use wayfinder_client::ConnectArgs;
 use wayfinder_client::ConnectTarget;
+use wayfinder_client::ServerError;
 use wayfinder_tui::app::App;
 use wayfinder_tui::app::{self};
 use wayfinder_tui::persist;
@@ -268,7 +269,12 @@ fn handle_key(app: &mut App, code: KeyCode) {
 async fn refresh(client: &mut Option<Client>, target: &ConnectTarget, app: &mut App) {
     if client.is_none() {
         match target.connect().await {
-            Ok(c) => *client = Some(c),
+            Ok(c) => {
+                // A new connection may carry a different credential, so what
+                // the last one was refused says nothing about this one.
+                app.logs.reset_for_new_connection();
+                *client = Some(c);
+            }
             Err(e) => {
                 app.connected = false;
                 app.last_error = Some(format!("connect: {e}"));
@@ -543,7 +549,8 @@ async fn act_ping_cancel(client: &mut Option<Client>, target: &ConnectTarget, ap
     }
 }
 
-/// Issue all three queries and fold the results into the snapshot.
+/// Issue every query the dashboard needs and fold the results into the
+/// snapshot.
 async fn fetch(conn: &mut Client, app: &mut App) -> anyhow::Result<()> {
     app.snapshot.node_info = Some(conn.node_info().await?);
     app.snapshot.routing = conn.routing_table().await?;
@@ -593,9 +600,39 @@ async fn fetch(conn: &mut Client, app: &mut App) -> anyhow::Result<()> {
 
     // Polled every tick regardless of which tab is showing, so switching to the
     // Logs tab presents the history that accumulated while it was hidden rather
-    // than starting from blank.
-    let batch = conn.logs(app.logs.next_seq, LOG_BATCH).await?;
-    app.ingest_logs(batch);
+    // than starting from blank — but only until the node refuses it, after
+    // which asking again every second would flood the very ring being read
+    // (see `LogView::refused`).
+    if !app.logs.refused {
+        match conn.logs(app.logs.next_seq, LOG_BATCH).await {
+            Ok(batch) => {
+                app.logs.error = None;
+                app.ingest_logs(batch);
+            }
+            // A `ServerError` is the node's considered answer on a healthy
+            // stream: the frame went out, a reply came back, and it said no.
+            // Swallowed rather than propagated for the reason the ping poll
+            // above is not `?` — the node serves its log ring to a full grant
+            // only, so a viewer-tier credential is refused this one read while
+            // every other table on this refresh is fine, and aborting would
+            // blank six working tabs over the one that credential was never
+            // entitled to.
+            //
+            // Anything else — a send or recv failure, a decode failure, an
+            // empty envelope — means the stream itself is suspect and must take
+            // the reconnect every other poll here gets. This is the *last* call
+            // in `fetch`, so swallowing a transport failure would have `refresh`
+            // report a freshly-stamped, connected node on the strength of a call
+            // that never reached it.
+            Err(e) => match e.downcast::<ServerError>() {
+                Ok(refusal) => {
+                    app.logs.error = Some(refusal.to_string());
+                    app.logs.refused = true;
+                }
+                Err(transport) => return Err(transport),
+            },
+        }
+    }
     Ok(())
 }
 

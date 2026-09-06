@@ -135,9 +135,12 @@ Five grant tiers:
   it) rather than cached at listener startup, so a seed a `SetAuth` rotates
   away from stops earning this grant on the very next connection.
 - `GrantedViewer` — a verified, non-revoked cert carrying `CERT_FLAG_VIEWER`.
-  Read-only: `permits` confines it to the queries and refuses every mutation
-  plus `RevealEnrollmentToken`, which is a read by shape and the mesh's
-  admission credential by content. **Earned by the bit, never by the absence of
+  Read-only: `permits` confines it to the queries and refuses every mutation,
+  plus the three reads whose *content* is an administrator's rather than the
+  network's — `RevealEnrollmentToken` (a read by shape, the mesh's admission
+  credential by content), `GetLogs` (the ring carries whatever the process
+  emitted, which on a provider names the accounts that administer the mesh),
+  and `GetOwnCert`. **Earned by the bit, never by the absence of
   the admin bit** — every device on the mesh holds a verified non-admin
   certificate, so a tier granted by absence would be a tier the whole mesh
   already had.
