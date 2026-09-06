@@ -252,6 +252,14 @@ impl AuthorityComms {
     /// `policy` is not an `Option` — see its field doc. A node with no
     /// authority simply never publishes, and the receiver keeps reading `None`,
     /// which `GetSecurityStatus` reports as "not reported".
+    ///
+    /// The other order holds too, and is the one production actually uses:
+    /// `wayfinder-tap` spawns the authority task and builds the `RouterHandle`
+    /// that calls this afterwards. What makes it hold is that
+    /// [`serve_authority`] publishes with `send_replace` — a plain `watch`
+    /// send discards the value when nobody is subscribed yet, which left a
+    /// certificate authority reporting no enrollment policy for the life of
+    /// the process.
     pub fn enrollment_policy_rx(&self) -> EnrollmentPolicyRx {
         self.policy.subscribe()
     }
@@ -634,16 +642,16 @@ pub async fn serve_authority(mut ca: CertAuthority, ports: AuthorityPorts) {
     // `apply_policy_overrides` runs at construction, so a persisted runtime
     // override wins over the configured value — a first `GetSecurityStatus`
     // that raced this would report the config's policy, not the one in force.
-    if policy.send(Some(ca.enrollment_policy())).is_err() {
-        // No receiver means the router loop that reports `GetSecurityStatus`
-        // has already ended. Not fatal to the authority, but it means the
-        // reported policy can never track the real one — the same permanent
-        // divergence the mid-run publication failure below reports, so the same
-        // level.
-        tracing::error!(
-            "no reader for the enrollment policy; GetSecurityStatus will not report it"
-        );
-    }
+    //
+    // `send_replace`, never `send`: a `watch` send fails when the channel has
+    // no receivers *and does not store the value*, and having no receiver here
+    // is the ordinary case rather than the broken one. `wayfinder-tap` spawns
+    // this task and only then builds the `RouterHandle` that subscribes, so the
+    // one publication a provider ever makes on its own was dropped on the floor
+    // and `GetSecurityStatus` answered "no enrollment policy" for the life of
+    // the process — the answer a dashboard reads as "this node is not a
+    // certificate authority".
+    policy.send_replace(Some(ca.enrollment_policy()));
     tracing::info!("certificate-authority task started");
 
     // No clock is pushed in here, and that absence is the fix rather than an
@@ -673,17 +681,16 @@ pub async fn serve_authority(mut ca: CertAuthority, ports: AuthorityPorts) {
             }
             AuthorityCommand::SetEnrollmentPolicy(update, reply) => {
                 let outcome = ca.set_enrollment_policy(&update);
-                if outcome.is_ok() && policy.send(Some(ca.enrollment_policy())).is_err() {
+                if outcome.is_ok() {
                     // Published before the reply, so a client that sets a policy
                     // and immediately reads it back cannot observe the old one.
-                    // A failure here means the change is live and durable but
-                    // `GetSecurityStatus` will keep reporting the previous value
-                    // for the life of the process — silent divergence, so it is
-                    // logged rather than discarded.
-                    tracing::error!(
-                        "enrollment policy applied but could not be published; \
-                         GetSecurityStatus will report a stale policy"
-                    );
+                    // `send_replace` for the same reason as the start-up
+                    // publication above: whether a reader is subscribed at this
+                    // instant is not the authority's business, and a policy
+                    // change that a plain `send` declined to store would leave
+                    // `GetSecurityStatus` reporting the previous value until the
+                    // next change.
+                    policy.send_replace(Some(ca.enrollment_policy()));
                 }
                 let _ = reply.send(outcome);
             }
@@ -1074,6 +1081,40 @@ mod tests {
         assert!(
             authority.policy.borrow().is_some(),
             "the authority publishes its policy on start-up"
+        );
+    }
+
+    /// The start-up publication survives having had no subscriber at the time.
+    ///
+    /// The ordering `wayfinder-tap` actually uses: `attach_authority` spawns
+    /// the task, and the `RouterHandle` whose `enrollment_policy_rx` is the
+    /// channel's *first* receiver is built afterwards. Nothing is holding a
+    /// receiver at the moment the task publishes, and a `watch` send with no
+    /// receivers fails without storing the value — so the policy was dropped on
+    /// the floor and `GetSecurityStatus` reported "no enrollment policy" for the
+    /// life of the process. That answer is the dashboard's whole test for
+    /// "this node is a certificate authority", so the provider scope vanished
+    /// from a node that is one.
+    #[tokio::test]
+    async fn the_policy_survives_being_published_before_anyone_subscribes() {
+        let mut comms = AuthorityComms::new(NOW_UNIX);
+        comms.publish(RouterFacts {
+            unix_secs: NOW_UNIX,
+            auth_present: true,
+        });
+        let (commands, commands_rx) = mpsc::channel(4);
+        let ports = comms.attach(commands_rx);
+
+        // Dropped before the task runs, so it publishes and then returns rather
+        // than parking on `recv` — which makes the publication observable at a
+        // fixed point instead of at whatever a `yield_now` happened to reach.
+        // No receiver has ever existed on the policy channel at this instant.
+        drop(commands);
+        serve_authority(clocked_authority(), ports).await;
+
+        assert!(
+            comms.enrollment_policy_rx().borrow().is_some(),
+            "a reader that subscribes after start-up still sees the policy"
         );
     }
 
