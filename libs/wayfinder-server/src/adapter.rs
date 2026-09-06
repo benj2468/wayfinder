@@ -1461,6 +1461,7 @@ mod tests {
             Mac::try_from(mac).unwrap(),
             ed.try_into().unwrap(),
             x.try_into().unwrap(),
+            None,
         )
         .unwrap()
         .cert

@@ -1406,10 +1406,20 @@ impl Client {
 
     /// Provider mode: approve the pending CSR bound to `node_mac`, so the
     /// enrolling node collects its certificate on its next poll.
-    pub async fn approve_csr(&mut self, node_mac: &[u8]) -> anyhow::Result<()> {
+    ///
+    /// `cert_ttl_secs` is how long that certificate should be valid for, in
+    /// seconds; `None` takes the provider's enrollment-policy default. The
+    /// provider refuses a lifetime of zero or one past its cap, and leaves the
+    /// request pending when it does.
+    pub async fn approve_csr(
+        &mut self,
+        node_mac: &[u8],
+        cert_ttl_secs: Option<u64>,
+    ) -> anyhow::Result<()> {
         match self
             .request(RequestKind::ApproveCsr(ApproveCsrRequest {
                 node_mac: node_mac.to_vec(),
+                cert_ttl_secs,
             }))
             .await?
         {

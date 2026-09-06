@@ -1361,7 +1361,9 @@ body {
 
 .wf-csr-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--wf-space-2);
+  align-items: center;
 }
 
 /* ---------------------------------------------------------------- modal -- */

@@ -594,8 +594,8 @@ impl AuthorityDataProvider for AuthorityAdapter<'_> {
         Ok(self.ca.list_pending())
     }
 
-    fn approve_csr(&mut self, node_mac: &[u8]) -> Result<(), String> {
-        self.ca.approve_csr(node_mac)
+    fn approve_csr(&mut self, node_mac: &[u8], cert_ttl_secs: Option<u64>) -> Result<(), String> {
+        self.ca.approve_csr(node_mac, cert_ttl_secs)
     }
 
     fn deny_csr(&mut self, node_mac: &[u8]) -> Result<(), String> {

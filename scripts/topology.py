@@ -207,9 +207,9 @@ SIM_PASSWORD = "wayfinder"
 
 # How long a session certificate the sim's accounts obtain stays valid. A week:
 # long enough that a sim left running over a weekend does not sign everyone out,
-# short enough to stay under the provider's own 90-day cap rather than relying
-# on the `allow_unbounded_cert_ttl` escape the node config sets for device
-# certificates.
+# short enough to stay under the provider's own 90-day session cap rather than
+# relying on the `allow_unbounded_cert_ttl` escape the node config sets for
+# device certificates.
 SIM_SESSION_TTL_SECS = 7 * 24 * 60 * 60
 
 # Host port for the first node's dashboard; each subsequent node takes the next

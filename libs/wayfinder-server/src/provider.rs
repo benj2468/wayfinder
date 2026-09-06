@@ -242,7 +242,13 @@ pub trait MeshAuthority {
     /// Approve the pending CSR bound to `node_mac`: sign its certificate now so a
     /// polling client collects it on its next `submit_csr`.  Returns an error if
     /// no CSR for that MAC is pending.
-    fn approve_csr(&mut self, node_mac: &[u8]) -> Result<(), String>;
+    ///
+    /// `cert_ttl_secs` is the validity window to give *this* certificate, in
+    /// seconds, and `None` takes the authority's policy default — the operator
+    /// admitting a device is the one who knows how long it should stay a
+    /// member. A lifetime outside what the authority will issue for is refused
+    /// and the request stays pending.
+    fn approve_csr(&mut self, node_mac: &[u8], cert_ttl_secs: Option<u64>) -> Result<(), String>;
 
     /// Deny the pending CSR bound to `node_mac`: it will not be issued and a
     /// polling client observes a [`CsrOutcome::Rejected`].  Returns an error if

@@ -305,7 +305,7 @@ impl AuthorityDataProvider for NodeMock {
     fn list_pending_csrs(&self) -> Result<Vec<PendingCsrData>, String> {
         Err("not a provider".to_string())
     }
-    fn approve_csr(&mut self, _node_mac: &[u8]) -> Result<(), String> {
+    fn approve_csr(&mut self, _node_mac: &[u8], _cert_ttl_secs: Option<u64>) -> Result<(), String> {
         Err("not a provider".to_string())
     }
     fn deny_csr(&mut self, _node_mac: &[u8]) -> Result<(), String> {

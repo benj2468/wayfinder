@@ -89,7 +89,7 @@ async fn approve_the_pending_request(target: &ProviderTarget) {
     let pending = admin.list_pending_csrs().await.unwrap();
     assert_eq!(pending.pending.len(), 1, "one node is waiting to join");
     admin
-        .approve_csr(&pending.pending[0].node_mac)
+        .approve_csr(&pending.pending[0].node_mac, None)
         .await
         .unwrap();
 }

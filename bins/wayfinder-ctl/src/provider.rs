@@ -22,6 +22,7 @@ use wayfinder_client::Client;
 
 use crate::output;
 use crate::output::OutputFormat;
+use crate::parse_duration_secs;
 use crate::parse_mac6;
 use crate::user;
 use crate::vpn;
@@ -72,6 +73,11 @@ pub enum RequestsCommand {
         /// MAC of the pending CSR to approve.
         #[arg(long)]
         mac: String,
+        /// How long this device's certificate should be valid for — a count
+        /// with a unit (`90d`, `12h`, `1y`) or a bare number of seconds.
+        /// Defaults to the provider's configured certificate lifetime.
+        #[arg(long, value_name = "DURATION")]
+        valid_for: Option<String>,
     },
     /// Deny a pending CSR; the enrolling node observes a rejection.
     Deny {
@@ -114,13 +120,17 @@ async fn requests(
         RequestsCommand::List => {
             output::list_pending_csrs(&client.list_pending_csrs().await?, fmt)?
         }
-        RequestsCommand::Approve { mac } => {
+        RequestsCommand::Approve { mac, valid_for } => {
             let mac_bytes = parse_mac6(&mac)?;
+            let ttl_secs = valid_for.as_deref().map(parse_duration_secs).transpose()?;
             client
-                .approve_csr(&mac_bytes)
+                .approve_csr(&mac_bytes, ttl_secs)
                 .await
                 .context("approving CSR failed")?;
-            format!("approved CSR for {mac}")
+            match ttl_secs {
+                Some(secs) => format!("approved CSR for {mac}, valid for {secs}s"),
+                None => format!("approved CSR for {mac}"),
+            }
         }
         RequestsCommand::Deny { mac } => {
             let mac_bytes = parse_mac6(&mac)?;

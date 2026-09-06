@@ -321,11 +321,32 @@ from an upgrade signing for whoever asks). The dashboard inverts on purpose:
 its switch is "Approve each request by hand", because a control you turn *on*
 to add a check reads right.
 
-`from_config` does refuse a `cert_ttl_secs` past `MAX_CERT_TTL_SECS` (90 days)
+`from_config` does refuse a `cert_ttl_secs` past `MAX_CERT_TTL_SECS` (10 years)
 without `allow_unbounded_cert_ttl` — passive expiry is this design's *primary*
 revocation mechanism, so a certificate that outlives the deployment cannot be
 recalled without reaching every node. That cap is enforced on the runtime path
-(`set_enrollment_policy`) too.
+(`set_enrollment_policy`) too, and on the per-approval lifetime `ApproveCsr`
+carries.
+
+**The policy value is a default, not the lifetime.** `ApproveCsrRequest`
+carries an optional `cert_ttl_secs`, so the operator admitting a device decides
+how long it stays a member — a sensor bolted to a structure and a laptop
+borrowed for an afternoon come through the same queue. An absent field takes
+the policy value, which is what every approval did before. Two consequences
+that are easy to lose:
+
+- **`submit_csr`'s re-issue path preserves the holder's lifetime**, read back
+  off the issued row, rather than re-stamping the policy default. That path is
+  how an approved node *collects* its certificate, so taking the default there
+  would throw the operator's choice away between approving and the node
+  hearing about it — and it is the renewal path afterwards, where the same
+  argument holds.
+- **An account's sessions answer to a different cap**, `MAX_SESSION_TTL_SECS`
+  (90 days, what both used to share) through `check_session_ttl`. A device may
+  outlive a session because nobody can reach the device; an administrator's
+  browser is not in that position. Collapsing the two checks back together is
+  how raising a device lifetime silently grants a decade-long admin
+  credential.
 
 **The enrollment token is handed out by request, not by poll.**
 `enrollment_policy()` reports only *whether* a token is set; `admission()`
@@ -380,7 +401,7 @@ Four rules to keep when touching it:
   being reused.
 - **The session lifetime is the account's**, chosen by the admin who granted it
   (`UserRecord::session_ttl_secs`), not a constant here — still bounded by
-  `MAX_CERT_TTL_SECS`.
+  `MAX_SESSION_TTL_SECS`.
 
 Accounts are administered over the management API, by `wayfinderctl provider
 user` — and nothing administers them through the state file. A provider rewrites

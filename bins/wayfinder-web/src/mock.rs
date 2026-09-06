@@ -829,11 +829,11 @@ impl AuthorityDataProvider for Mock {
         )
         .map(|records| records.len() as u32)
     }
-    fn approve_csr(&mut self, node_mac: &[u8]) -> Result<(), String> {
+    fn approve_csr(&mut self, node_mac: &[u8], cert_ttl_secs: Option<u64>) -> Result<(), String> {
         self.ca
             .as_mut()
             .ok_or_else(|| "node is not a certificate-authority provider".to_string())?
-            .approve_csr(node_mac)
+            .approve_csr(node_mac, cert_ttl_secs)
     }
     fn create_user_invite(
         &mut self,
