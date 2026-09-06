@@ -161,6 +161,12 @@ in
       '';
     };
 
+    logLevel = mkOption {
+      type = types.str;
+      default = "info";
+      description = "`RUST_LOG` filter for the dashboard service.";
+    };
+
     web = {
       enable = mkEnableOption "the wayfinder web dashboard";
 
@@ -315,7 +321,7 @@ in
 
       logLevel = mkOption {
         type = types.str;
-        default = "debug";
+        default = wayfinderCfg.logLevel;
         description = "`RUST_LOG` filter for the dashboard service.";
       };
     };
@@ -577,7 +583,7 @@ in
           Group = "wayfinder";
 
           Environment = [
-            "RUST_LOG=debug"
+            "RUST_LOG=${wayfinderCfg.logLevel}"
           ];
         }
         // (

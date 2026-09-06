@@ -236,7 +236,7 @@ YAML
     cat >> "$CFG" <<YAML
     ogm:
       i_min_ms: ${OGM_I_MIN_MS:-1000}
-      i_max_ms: ${OGM_I_MAX_MS:-128000}
+      i_max_ms: ${OGM_I_MAX_MS:-32000}
 YAML
   fi
 done

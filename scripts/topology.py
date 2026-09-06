@@ -668,7 +668,7 @@ def build_nodes(links: list[list[str]]) -> dict[str, dict]:
     Edit here to give a node a different RUST_LOG, or to set the per-link OGM
     backoff bounds the sim image honours: ``OGM_I_MIN_MS`` / ``OGM_I_MAX_MS``
     (added to every RawL2 link's ``ogm:`` block by the entrypoint).  For example
-    a slow-radio node could carry ``{"OGM_I_MIN_MS": "2000", "OGM_I_MAX_MS": "120000"}``.
+    a slow-radio node could carry ``{"OGM_I_MIN_MS": "2000", "OGM_I_MAX_MS": "32000"}``.
     """
     nodes: dict[str, dict] = {}
     for idx, name in enumerate(node_order(links), start=1):

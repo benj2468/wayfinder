@@ -202,14 +202,36 @@ fn converge_at(h: &mut TestHarness, at: Duration) {
 /// keeps the clock jump small after a brief convergence (so later absolute-time
 /// reconnect convergences still move forward).
 fn age_out(h: &mut TestHarness) {
-    let slowest = h
-        .machines
+    h.advance_trickle(h.clock + slowest_ogm_interval(h) * (MAX_MISSED_OGMS + 2));
+}
+
+/// The slowest OGM interval any interface in the mesh has currently backed off
+/// to — the unit both [`age_out`] and [`reconverge`] measure their clock jumps
+/// in, so neither depends on what `i_max` happens to default to.
+fn slowest_ogm_interval(h: &TestHarness) -> Duration {
+    h.machines
         .values()
         .flat_map(|m| m.router().ogm_schedule())
         .map(|e| e.current_interval)
         .max()
-        .unwrap_or(Duration::from_secs(1));
-    h.advance_trickle(h.clock + slowest * (MAX_MISSED_OGMS + 2));
+        .unwrap_or(Duration::from_secs(1))
+}
+
+/// Let a mesh that has just changed shape — typically a node brought back by
+/// [`TestHarness::reconnect_machine`] — re-converge on the production Trickle
+/// drive, by advancing far enough for every interface to emit at least once
+/// even if it had backed off all the way to `i_max`.
+///
+/// A single [`converge_at`] round is not enough after a reconnect: `poll_due`
+/// only fires the interfaces that are *due* at the instant it is given, and the
+/// survivors of a long silence are mid-way through an `i_max`-long interval, so
+/// a poll one second later fires nobody.  The returning node is then heard (it
+/// starts at `i_min`) while its neighbours' own OGMs — the ones carrying the
+/// routes *through* it — are still minutes away.  Keying off the current
+/// backoff rather than a fixed number of seconds keeps this correct whatever
+/// `TrickleConfig`'s defaults are.
+fn reconverge(h: &mut TestHarness) {
+    h.advance_trickle(h.clock + slowest_ogm_interval(h) * 2);
 }
 
 fn simple_pair() -> TestHarness {
@@ -1527,19 +1549,20 @@ fn flapping_relay_reconverges() {
     converge_at(&mut harness, Duration::from_secs(1));
 
     // Flap the relay three times.  Each down leg drives enough OGM rounds for the
-    // relay's routes to fully age out before it returns on the up leg.
+    // relay's routes to fully age out before it returns on the up leg, and each
+    // up leg gives the survivors a full backed-off interval to emit again, so
+    // the relearning is driven by the mesh's own schedule rather than by a poll
+    // that happens to land on a due instant.
     for _ in 0..3 {
         harness.disconnect_machine("machine2");
         age_out(&mut harness);
 
         harness.reconnect_machine("machine2");
-        let clock = harness.clock + Duration::from_secs(1);
-        converge_at(&mut harness, clock);
+        reconverge(&mut harness);
     }
 
     // After the churn settles the line must be fully converged again...
-    let clock = harness.clock + Duration::from_secs(1);
-    converge_at(&mut harness, clock);
+    reconverge(&mut harness);
     for name in ["machine1", "machine2", "machine3"] {
         assert_eq!(
             harness.get_machine(name).router().originator_count(),
