@@ -7,7 +7,7 @@ from wayfinder_sim.channel import ChannelSample, PerfectWire
 from wayfinder_sim.link import Link
 from wayfinder_sim.node import Node
 from wayfinder_sim.scenario import Simulation
-from wayfinder_sim.topology import diamond, pair
+from wayfinder_sim.topology import diamond, pair, path
 
 
 def test_two_node_route_converges():
@@ -377,3 +377,51 @@ def test_link_quality_ignores_unmeasurable_rows_beside_measurable_ones():
     sim.run(until_s=5.0)
 
     assert sim.link_quality("a", "b") == 200
+
+
+def test_tq_to_reports_the_end_to_end_path_metric():
+    """`tq_to` is the end-to-end routing metric, as distinct from
+    `link_quality`'s single-hop measurement: over a two-hop chain of perfect
+    links it is strictly below the direct-neighbor value, because BATMAN
+    charges every hop 10 TQ."""
+    nodes = [Node(n, trickle=(50, 500)) for n in ("a", "b", "c")]
+    sim = Simulation(nodes, path(("a", "b", "c"), PerfectWire()), seed=0)
+
+    sim.run(until_s=10.0)
+
+    one_hop = sim.tq_to("a", "b")
+    two_hop = sim.tq_to("a", "c")
+    assert one_hop is not None and two_hop is not None
+    assert two_hop < one_hop
+
+
+def test_tq_to_decays_by_ten_per_hop():
+    """The decay is `saturating_sub(10)` per hop (`batman::engine`), so on
+    links good enough not to clamp it, each extra hop costs exactly 10 — the
+    property that bounds a chain's usable depth."""
+    names = ("a", "b", "c", "d")
+    nodes = [Node(n, trickle=(50, 500)) for n in names]
+    sim = Simulation(nodes, path(names, PerfectWire()), seed=0)
+
+    sim.run(until_s=10.0)
+
+    tqs = [sim.tq_to("a", dest) for dest in ("b", "c", "d")]
+    assert tqs == [tqs[0], tqs[0] - 10, tqs[0] - 20]
+
+
+def test_tq_to_is_none_without_a_route():
+    """`None` is "no usable path", not zero — a TQ of 0 is a real reading a
+    deep chain produces, and conflating the two would hide exactly the
+    saturation a depth study is looking for."""
+    nodes = [Node("a"), Node("b")]
+    links = [pair("a", "b", PerfectWire())]
+    sim = Simulation(nodes, links, seed=0)
+
+    assert sim.tq_to("a", "b") is None
+
+
+def test_tq_to_rejects_an_unknown_node():
+    nodes = [Node("a"), Node("b")]
+    sim = Simulation(nodes, [pair("a", "b", PerfectWire())], seed=0)
+    with pytest.raises(KeyError):
+        sim.tq_to("a", "ghost")

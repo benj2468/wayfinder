@@ -314,6 +314,30 @@ class Simulation:
             for record in self._states[src].driver.originator_table()
         )
 
+    def tq_to(self, src: str, dest: str) -> int | None:
+        """`src`'s end-to-end transmission quality (0..=255) toward `dest` —
+        the metric its route was selected by — or `None` when it has no
+        usable path.
+
+        The multi-hop counterpart to `link_quality`, which measures one
+        physical hop. BATMAN charges every hop `saturating_sub(10)` and then
+        clamps the result by the receiving node's own measurement of the link
+        it arrived over (`batman::engine`), so this falls with both distance
+        in hops and the worst link along the way — and a chain deeper than
+        ~25 perfect hops reads 0 however good every link in it is.
+
+        `None` and `0` are different answers, and a depth study needs both
+        kept apart: `None` is "no route", while `0` is a route whose metric
+        has bottomed out. A saturated path still forwards traffic; what it
+        has lost is the ability to be compared against another one, since
+        every path past the floor reads the same.
+        """
+        mac = self._states[dest].mac
+        for record in self._states[src].driver.originator_table():
+            if record.originator == mac and record.best_next_hop is not None:
+                return record.max_tq
+        return None
+
     # --- red team ---------------------------------------------------------
 
     def wiretap(self, link: str) -> Wiretap:
