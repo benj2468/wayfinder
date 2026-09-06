@@ -115,6 +115,7 @@ async fn an_enrolling_node_cannot_do_anything_but_enroll() {
     let err = run_query(
         Command::Provider(ProviderCommand::Requests(RequestsCommand::Approve {
             mac: "02:00:00:00:00:09".into(),
+            valid_for: None,
         })),
         &endpoint,
         OutputFormat::Human,
@@ -416,6 +417,7 @@ async fn enroll_waits_for_operator_approval_then_succeeds() {
     run_query(
         Command::Provider(ProviderCommand::Requests(RequestsCommand::Approve {
             mac: enrolled_mac(&dir.path().join("seed")),
+            valid_for: None,
         })),
         &endpoint,
         OutputFormat::Human,
@@ -612,6 +614,7 @@ async fn csr_submit_collects_the_certificate_after_an_operator_approves() {
                 .map(|b| format!("{b:02x}"))
                 .collect::<Vec<_>>()
                 .join(":"),
+            valid_for: None,
         })),
         &endpoint,
         OutputFormat::Human,
@@ -635,6 +638,69 @@ async fn csr_submit_collects_the_certificate_after_an_operator_approves() {
     let anchor = TrustAnchor::from_bytes(&std::fs::read(&out_anchor).unwrap()).unwrap();
     let cert = MembershipCert::from_bytes(&std::fs::read(&out_cert).unwrap()).unwrap();
     anchor.verify_cert(&cert, 500).expect("cert verifies");
+}
+
+/// The lifetime the operator typed at approval is the one the certificate
+/// carries — over the wire, not just inside the authority.
+///
+/// This is the assertion that a proto field dropped anywhere between `clap` and
+/// the signature would fail: the provider's own policy is 1000 seconds, so a
+/// certificate valid for two years can only have come from the approval.
+#[tokio::test]
+async fn an_approval_can_name_how_long_the_certificate_lasts() {
+    let endpoint = spawn_approval_gated_provider().await;
+    let dir = tempfile::tempdir().unwrap();
+    let request = dir.path().join("request.json");
+    let out_cert = dir.path().join("node.cert");
+    let out_anchor = dir.path().join("anchor.bin");
+
+    let node = Keypair::from_seed(&[46u8; 32]);
+    write_csr(&request, &node, "");
+    let submit = || {
+        Command::Csr(CsrCommand::Submit {
+            request: request.clone(),
+            out_cert: out_cert.clone(),
+            out_anchor: out_anchor.clone(),
+        })
+    };
+
+    run_query(submit(), &endpoint, OutputFormat::Human)
+        .await
+        .expect_err("a gated provider parks the first submission");
+
+    let out = run_query(
+        Command::Provider(ProviderCommand::Requests(RequestsCommand::Approve {
+            mac: node
+                .derived_mac()
+                .0
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(":"),
+            valid_for: Some("2y".to_string()),
+        })),
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .expect("approving with a lifetime succeeds");
+    assert!(
+        out.contains("63072000s"),
+        "the approval reports the lifetime it applied: {out}"
+    );
+
+    run_query(submit(), &endpoint, OutputFormat::Human)
+        .await
+        .expect("re-submitting an approved CSR collects the certificate");
+
+    let anchor = TrustAnchor::from_bytes(&std::fs::read(&out_anchor).unwrap()).unwrap();
+    let cert = MembershipCert::from_bytes(&std::fs::read(&out_cert).unwrap()).unwrap();
+    let verified = anchor.verify_cert(&cert, 500).expect("cert verifies");
+    assert_eq!(
+        verified.not_after - verified.not_before,
+        2 * 365 * 86_400,
+        "two years, not the provider's 1000-second policy default"
+    );
 }
 
 /// A refusal must name why. The operator holding the file is not the person who

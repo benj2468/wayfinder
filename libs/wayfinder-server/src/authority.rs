@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use serde::Serialize;
 use wayfinder::config::MAX_CERT_TTL_SECS;
+use wayfinder::config::MAX_SESSION_TTL_SECS;
 use wayfinder::config::ProviderConfig;
 use wayfinder::interfaces::frame::Mac;
 use wayfinder_auth::Authority;
@@ -233,6 +234,46 @@ fn check_cert_ttl(cert_ttl_secs: u64, allow_unbounded: bool) -> Result<(), Strin
          Shorten it, or set `allow_unbounded_cert_ttl: true` to say the long lifetime \
          is deliberate"
     ))
+}
+
+/// Refuse an account's session lifetime past [`MAX_SESSION_TTL_SECS`], unless
+/// the operator took the escape.
+///
+/// Separate from [`check_cert_ttl`] because a session and a device certificate
+/// are bounded by different arguments — see [`MAX_SESSION_TTL_SECS`] — and
+/// collapsing them back into one check is how raising a device's lifetime
+/// quietly grants a decade-long administrator credential.
+fn check_session_ttl(session_ttl_secs: u64, allow_unbounded: bool) -> Result<(), String> {
+    if allow_unbounded || session_ttl_secs <= MAX_SESSION_TTL_SECS {
+        return Ok(());
+    }
+    Err(alloc::format!(
+        "session_ttl_secs is {session_ttl_secs}s, past the {MAX_SESSION_TTL_SECS}s cap \
+         on how long an account's sign-in may last: a session is a person at a \
+         keyboard, and a credential that outlives the reason it was granted is what \
+         revocation exists to avoid. Shorten it, or set `allow_unbounded_cert_ttl: \
+         true` to say the long lifetime is deliberate"
+    ))
+}
+
+/// Refuse a per-approval certificate lifetime no certificate could usefully
+/// carry.
+///
+/// Zero is its own rejection rather than a case of the cap: a zero-second
+/// lifetime issues a certificate that expired before the enrolling node could
+/// collect it, taking the node off the mesh on arrival — the opposite of what
+/// approving its request meant. Past that it is the same [`check_cert_ttl`]
+/// the policy value answers to, since an operator picking a lifetime per
+/// device is not a way around passive expiry.
+fn check_approval_ttl(cert_ttl_secs: u64, allow_unbounded: bool) -> Result<(), String> {
+    if cert_ttl_secs == 0 {
+        return Err(
+            "cert_ttl_secs must be greater than zero: a zero-second certificate \
+             lifetime issues certificates that are already expired"
+                .to_string(),
+        );
+    }
+    check_cert_ttl(cert_ttl_secs, allow_unbounded)
 }
 
 /// Whether an invitation is still capable of producing an account.
@@ -596,13 +637,21 @@ impl CertAuthority {
     /// *record* of it never took effect (see `CaLog::mutate_issued`'s
     /// rollback guarantee), so a caller must not tell its own caller this
     /// succeeded when the durability guarantee it implies did not hold.
+    ///
+    /// `ttl_secs` is the validity window to sign for; `None` takes the
+    /// authority's policy default. A renewal passes the lifetime the holder's
+    /// existing record carries, so a device an operator admitted for its own
+    /// length keeps that length instead of quietly reverting to the default on
+    /// its next poll.
     pub(crate) fn issue(
         &mut self,
         mac: Mac,
         ed: [u8; 32],
         x: [u8; 32],
+        ttl_secs: Option<u64>,
     ) -> Result<EnrollData, String> {
-        let (cert, record) = self.sign(mac, ed, x);
+        let ttl_secs = ttl_secs.unwrap_or(self.cert_ttl_secs);
+        let (cert, record) = self.sign(mac, ed, x, ttl_secs);
 
         // Record (or refresh, by MAC) the issued cert for the ListCerts RPC.
         // A re-issue clears any prior revoked flag (it is a fresh certificate).
@@ -630,9 +679,15 @@ impl CertAuthority {
     /// one atomic write via `CaLog::mutate_issued_and_held`, so the two
     /// halves of an approval can never durably split (see that method's own
     /// doc for the impersonation-guard gap this closes).
-    fn sign(&self, mac: Mac, ed: [u8; 32], x: [u8; 32]) -> (MembershipCert, IssuedCertData) {
+    fn sign(
+        &self,
+        mac: Mac,
+        ed: [u8; 32],
+        x: [u8; 32],
+        ttl_secs: u64,
+    ) -> (MembershipCert, IssuedCertData) {
         let not_before = self.now_unix();
-        let not_after = self.now_unix().saturating_add(self.cert_ttl_secs);
+        let not_after = self.now_unix().saturating_add(ttl_secs);
         let cert = self.authority.issue_cert(mac, ed, x, not_before, not_after);
         let record = IssuedCertData {
             node_mac: mac.0.to_vec(),
@@ -1230,7 +1285,7 @@ impl CertAuthority {
         // impossible: an invitation whose account the provider will not sign
         // sessions for is one that looks issued and is not usable, and the
         // admin finds out from the person they invited.
-        check_cert_ttl(ttl, self.allow_unbounded_cert_ttl)?;
+        check_session_ttl(ttl, self.allow_unbounded_cert_ttl)?;
         // The same rule for the *invitation's* own lifetime, which was
         // previously taken verbatim however long the caller asked for.
         if invite_ttl_secs > MAX_INVITE_TTL_SECS {
@@ -1497,12 +1552,12 @@ impl CertAuthority {
         // `allow_unbounded_cert_ttl` is the reachable way), and the person on
         // this end of the call can do nothing about it — refusing them would
         // burn their invitation for somebody else's decision.
-        let ttl = if check_cert_ttl(invite.session_ttl_secs, self.allow_unbounded_cert_ttl).is_ok()
-        {
-            invite.session_ttl_secs
-        } else {
-            MAX_CERT_TTL_SECS
-        };
+        let ttl =
+            if check_session_ttl(invite.session_ttl_secs, self.allow_unbounded_cert_ttl).is_ok() {
+                invite.session_ttl_secs
+            } else {
+                MAX_SESSION_TTL_SECS
+            };
         // Re-checked here, not only where the invitation was minted. The
         // invite store is durable, so a row may have been parked by a build
         // that predates `MAX_USERNAME_LEN` — the same reason
@@ -1873,9 +1928,10 @@ impl MeshAuthority for CertAuthority {
             return Ok(UserAuthOutcome::Rejected);
         }
 
-        // The account's lifetime, still bounded by the cap the config path
-        // applies — an admin may grant a shift or a minute, but not a decade.
-        check_cert_ttl(ttl_secs, self.allow_unbounded_cert_ttl)?;
+        // The account's lifetime, still bounded by the session cap — an admin
+        // may grant a shift or a minute, but not a decade, whatever lifetime
+        // the mesh's *devices* are admitted for.
+        check_session_ttl(ttl_secs, self.allow_unbounded_cert_ttl)?;
         // A user's MAC is derived from the session key it just presented, so it
         // is fresh on every login and can never contend with a device's:
         // `submit_csr`'s impersonation guard is about MACs a client *names*,
@@ -2013,12 +2069,18 @@ impl MeshAuthority for CertAuthority {
             .issued()
             .iter()
             .find(|c| c.node_mac == mac.0 && self.now_unix() <= c.not_after)
-            .map(|c| (c.ed_pubkey == ed, c.revoked));
+            .map(|c| {
+                (
+                    c.ed_pubkey == ed,
+                    c.revoked,
+                    c.not_after.saturating_sub(c.not_before),
+                )
+            });
         // Named here because the case it describes is the one that *falls
         // through* the block below, and so is read again past it.
-        let revoked_holder = matches!(holder, Some((_, true)));
+        let revoked_holder = matches!(holder, Some((_, true, _)));
 
-        if let Some((same_key, revoked)) = holder {
+        if let Some((same_key, revoked, held_ttl_secs)) = holder {
             if !same_key {
                 // Someone else's address. The wording does not distinguish a
                 // revoked record from a live one: the caller holds no
@@ -2049,8 +2111,26 @@ impl MeshAuthority for CertAuthority {
                 ));
             }
             if !revoked {
-                // The holder, still in good standing: re-issue on the spot.
-                return Ok(CsrOutcome::Issued(self.issue(mac, ed, x)?));
+                // The holder, still in good standing: re-issue on the spot —
+                // for the window this holder's record already carries, not the
+                // authority's current default.
+                //
+                // This is the path an approved node collects its certificate
+                // through (the row is written by the approval, and the poll
+                // that follows lands here), so taking the default would throw
+                // away the lifetime the operator picked for this device
+                // between approving it and the node hearing about it. It is
+                // also the renewal path for a node whose certificate is still
+                // valid, and the same argument holds there: a device admitted
+                // for its own length keeps it until an operator decides
+                // otherwise, rather than drifting back to the default on a
+                // poll nobody watched.
+                return Ok(CsrOutcome::Issued(self.issue(
+                    mac,
+                    ed,
+                    x,
+                    Some(held_ttl_secs),
+                )?));
             }
             // The holder, revoked: fall through to the approval path below —
             // never to `issue`, which would clear the `revoked` flag it is
@@ -2073,7 +2153,7 @@ impl MeshAuthority for CertAuthority {
         // approval rather than granted on the spot. Without this, `auto_approve`
         // let a revoked node re-enroll itself the moment it was ejected.
         if self.auto_approve && !revoked_holder {
-            return Ok(CsrOutcome::Issued(self.issue(mac, ed, x)?));
+            return Ok(CsrOutcome::Issued(self.issue(mac, ed, x, None)?));
         }
 
         // Approval required: consult the held-CSR store, keyed by MAC.  The
@@ -2157,7 +2237,17 @@ impl MeshAuthority for CertAuthority {
             .collect()
     }
 
-    fn approve_csr(&mut self, node_mac: &[u8]) -> Result<(), String> {
+    fn approve_csr(&mut self, node_mac: &[u8], cert_ttl_secs: Option<u64>) -> Result<(), String> {
+        // Validated before anything is looked up, so a lifetime this authority
+        // will not issue for leaves the request exactly where the operator
+        // found it: still pending, still approvable with a lifetime that fits.
+        let cert_ttl_secs = match cert_ttl_secs {
+            Some(ttl) => {
+                check_approval_ttl(ttl, self.allow_unbounded_cert_ttl)?;
+                ttl
+            }
+            None => self.cert_ttl_secs,
+        };
         if self.now_unix() == 0 {
             return Err(
                 "the authority has no usable clock (never set, a host clock reading \
@@ -2187,7 +2277,7 @@ impl MeshAuthority for CertAuthority {
         // Sign now (stamping the current clock) and stash the bytes; the node
         // collects them on its next poll.  Restart the entry's TTL clock so the
         // node gets a full pending-TTL window to collect from the approval.
-        let (cert, record) = self.sign(mac, ed, x);
+        let (cert, record) = self.sign(mac, ed, x, cert_ttl_secs);
         let cert_bytes = cert.as_bytes().to_vec();
         let now = self.now_unix();
         // Record the issued cert *and* flip the held entry to Approved as one
@@ -2269,7 +2359,7 @@ impl MeshAuthority for CertAuthority {
         // account whose sessions the provider will not sign is an account that
         // looks created and is not usable, and the operator finds out from
         // somebody else's failed sign-in.
-        check_cert_ttl(ttl, self.allow_unbounded_cert_ttl)?;
+        check_session_ttl(ttl, self.allow_unbounded_cert_ttl)?;
 
         let mut user = UserRecord::new(username, password, role, ttl)?;
         if no_totp {
@@ -3530,6 +3620,183 @@ mod tests {
         ca
     }
 
+    /// A *person's* session is capped where a *device's* certificate is not.
+    ///
+    /// The two lifetimes are the same field on the same certificate and answer
+    /// to different caps on purpose. A device certificate may run for years
+    /// because the alternative is re-enrolling hardware nobody can reach; a
+    /// session is somebody signed in at a keyboard, and a decade-long admin
+    /// credential is the thing revocation exists to avoid. An operator raising
+    /// one must not silently raise the other.
+    #[test]
+    fn a_session_lifetime_is_capped_where_a_device_lifetime_is_not() {
+        let mut ca = approval_ca();
+        let (ed, x) = node_keys(2);
+        let mac = node_mac(2);
+        let long = MAX_SESSION_TTL_SECS + 86_400;
+
+        // Fine for a device: this is the lifetime an operator picks for a
+        // sensor they are not going to visit again.
+        ca.submit_csr(&mac, &ed, &x, "").unwrap();
+        ca.approve_csr(&mac, Some(long))
+            .expect("a device may outlive a session");
+
+        // Refused for an account, at every door that grants one.
+        let err = ca
+            .create_user("rowan", "hunter2", false, long, false)
+            .expect_err("an account's sessions are capped");
+        assert!(err.contains("session_ttl_secs"), "{err}");
+        assert!(
+            ca.create_user_invite("wren", UserRole::Viewer, long, 0)
+                .is_err(),
+            "an invitation cannot grant what creating the account could not"
+        );
+    }
+
+    /// An approval may name the lifetime for *this* device's certificate,
+    /// rather than every device taking the authority's policy default.
+    ///
+    /// The policy value is the fallback, not the rule: a fixed installation and
+    /// a contractor's laptop come through the same queue in front of the same
+    /// operator, and the lifetime is the only thing that separates them.
+    #[test]
+    fn approval_may_name_this_certificates_lifetime() {
+        let mut ca = approval_ca();
+        let (ed, x) = node_keys(2);
+        let mac = node_mac(2);
+
+        ca.submit_csr(&mac, &ed, &x, "").unwrap();
+        ca.approve_csr(&mac, Some(50_000))
+            .expect("approve succeeds");
+
+        let issued = ca.list_certs();
+        assert_eq!(issued.len(), 1);
+        assert_eq!(
+            issued[0].not_after - issued[0].not_before,
+            50_000,
+            "the lifetime the approval named, not the authority's 1000s default"
+        );
+
+        // The collected certificate carries it too — the log and the signed
+        // bytes must not disagree about when this node stops being a member.
+        let cert = match ca.submit_csr(&mac, &ed, &x, "").unwrap() {
+            CsrOutcome::Issued(d) => d.cert,
+            other => panic!("expected Issued, got {other:?}"),
+        };
+        let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
+        let cert = MembershipCert::from_bytes(&cert).unwrap();
+        let verified = anchor.verify_cert(&cert, 500).unwrap();
+        assert_eq!(verified.not_after, 100 + 50_000);
+    }
+
+    /// A node re-polling once its certificate is in hand renews at *its own*
+    /// length, not the authority's default.
+    ///
+    /// The same code path serves the collection right after an approval and a
+    /// renewal weeks later, and both used to re-issue at whatever the policy
+    /// said at that moment — which would hand the operator's per-device
+    /// decision a lifetime measured in however long the node took to poll.
+    #[test]
+    fn a_renewal_keeps_the_lifetime_the_device_was_admitted_for() {
+        let mut ca = approval_ca();
+        let (ed, x) = node_keys(2);
+        let mac = node_mac(2);
+
+        ca.submit_csr(&mac, &ed, &x, "").unwrap();
+        ca.approve_csr(&mac, Some(50_000))
+            .expect("approve succeeds");
+        ca.submit_csr(&mac, &ed, &x, "").unwrap();
+
+        // Later, still inside the window: the node asks again, as a node whose
+        // certificate is approaching expiry does.
+        ca.set_now_unix(40_000);
+        let cert = match ca.submit_csr(&mac, &ed, &x, "").unwrap() {
+            CsrOutcome::Issued(d) => d.cert,
+            other => panic!("expected Issued, got {other:?}"),
+        };
+        let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
+        let cert = MembershipCert::from_bytes(&cert).unwrap();
+        let verified = anchor.verify_cert(&cert, 40_000).unwrap();
+        assert_eq!(
+            verified.not_after, 90_000,
+            "renewed for the 50000s this device was admitted for, from now"
+        );
+    }
+
+    /// An approval that names no lifetime still gets the policy default, so an
+    /// operator who never picks one sees exactly the behaviour that predates
+    /// the choice.
+    #[test]
+    fn approval_without_a_lifetime_uses_the_policy_default() {
+        let mut ca = approval_ca();
+        let (ed, x) = node_keys(2);
+        let mac = node_mac(2);
+
+        ca.submit_csr(&mac, &ed, &x, "").unwrap();
+        ca.approve_csr(&mac, None).expect("approve succeeds");
+
+        let issued = ca.list_certs();
+        assert_eq!(issued[0].not_after - issued[0].not_before, 1000);
+    }
+
+    /// A per-approval lifetime is held to the same cap the policy value is:
+    /// choosing it per device is not a way around passive expiry.
+    ///
+    /// And a refused approval must issue *nothing* — the request stays in the
+    /// queue, so the operator can approve it again with a lifetime that fits
+    /// rather than finding it silently gone.
+    #[test]
+    fn approval_lifetime_is_held_to_the_cap() {
+        let mut ca = approval_ca();
+        let (ed, x) = node_keys(2);
+        let mac = node_mac(2);
+
+        ca.submit_csr(&mac, &ed, &x, "").unwrap();
+        let err = ca
+            .approve_csr(&mac, Some(MAX_CERT_TTL_SECS + 1))
+            .expect_err("a lifetime past the cap is refused");
+        assert!(err.contains("cert_ttl_secs"), "{err}");
+
+        assert!(ca.list_certs().is_empty(), "nothing was issued");
+        assert_eq!(ca.list_pending().len(), 1, "the request is still waiting");
+    }
+
+    /// Zero is refused for the same reason the policy value refuses it: it
+    /// issues a certificate that expired before the node could collect it.
+    #[test]
+    fn approval_lifetime_of_zero_is_refused() {
+        let mut ca = approval_ca();
+        let (ed, x) = node_keys(2);
+        let mac = node_mac(2);
+
+        ca.submit_csr(&mac, &ed, &x, "").unwrap();
+        let err = ca
+            .approve_csr(&mac, Some(0))
+            .expect_err("a zero-second lifetime is refused");
+        assert!(err.contains("greater than zero"), "{err}");
+        assert!(ca.list_certs().is_empty(), "nothing was issued");
+        assert_eq!(ca.list_pending().len(), 1, "the request is still waiting");
+    }
+
+    /// An authority that took the `allow_unbounded_cert_ttl` escape takes it
+    /// for a per-approval lifetime too, rather than the escape covering only
+    /// the value in the config file.
+    #[test]
+    fn an_unbounded_authority_accepts_an_unbounded_approval() {
+        let mut ca = approval_ca();
+        ca.allow_unbounded_cert_ttl = true;
+        let (ed, x) = node_keys(2);
+        let mac = node_mac(2);
+
+        ca.submit_csr(&mac, &ed, &x, "").unwrap();
+        ca.approve_csr(&mac, Some(MAX_CERT_TTL_SECS + 1))
+            .expect("the escape covers a per-approval lifetime");
+        assert_eq!(
+            ca.list_certs()[0].not_after - ca.list_certs()[0].not_before,
+            MAX_CERT_TTL_SECS + 1
+        );
+    }
+
     /// The live-cert lock still fires for a row a *pre-binding* build wrote.
     ///
     /// `check_mac_derives_from` refuses any request whose key does not derive
@@ -3663,7 +3930,7 @@ mod tests {
         persisted.unwrap();
 
         assert!(
-            ca.approve_csr(&node_mac(3)).is_err(),
+            ca.approve_csr(&node_mac(3), None).is_err(),
             "approval must refuse a held row whose MAC its key does not derive"
         );
     }
@@ -3693,7 +3960,7 @@ mod tests {
 
         // Operator approves; the next poll collects the cert, and the request
         // leaves the pending list.
-        ca.approve_csr(&mac).expect("approve succeeds");
+        ca.approve_csr(&mac, None).expect("approve succeeds");
         assert!(ca.list_pending().is_empty(), "no longer awaiting approval");
         let first = match ca.submit_csr(&mac, &ed, &x, "").unwrap() {
             CsrOutcome::Issued(d) => d.cert,
@@ -3738,7 +4005,7 @@ mod tests {
     #[test]
     fn approve_or_deny_unknown_mac_errors() {
         let mut ca = approval_ca();
-        assert!(ca.approve_csr(&[0, 0, 0, 0, 0, 9]).is_err());
+        assert!(ca.approve_csr(&[0, 0, 0, 0, 0, 9], None).is_err());
         assert!(ca.deny_csr(&[0, 0, 0, 0, 0, 9]).is_err());
     }
 
@@ -3776,7 +4043,7 @@ mod tests {
         let mac = node_mac(2);
 
         ca.submit_csr(&mac, &ed1, &x1, "").unwrap();
-        ca.approve_csr(&mac).unwrap();
+        ca.approve_csr(&mac, None).unwrap();
         // The MAC now has an issued certificate.  A different identity claiming
         // it is rejected rather than re-opening enrollment for that MAC.
         assert!(matches!(
@@ -3813,7 +4080,7 @@ mod tests {
         let mac = node_mac(2);
 
         ca.submit_csr(&mac, &ed1, &x1, "").unwrap();
-        ca.approve_csr(&mac).unwrap();
+        ca.approve_csr(&mac, None).unwrap();
 
         // Age past the pending TTL: the held Approved entry is gone, but the
         // certificate it issued is still valid.
@@ -3872,7 +4139,7 @@ mod tests {
         let mac = node_mac(2);
 
         ca.submit_csr(&mac, &ed, &x, "").unwrap();
-        ca.approve_csr(&mac).unwrap();
+        ca.approve_csr(&mac, None).unwrap();
 
         // Age past the pending TTL: the held Approved entry is now stale (it is
         // physically evicted on the next call that touches the store, below).
@@ -3921,7 +4188,7 @@ mod tests {
         let mac = node_mac(2);
 
         ca.submit_csr(&mac, &ed, &x, "").unwrap();
-        ca.approve_csr(&mac).unwrap();
+        ca.approve_csr(&mac, None).unwrap();
 
         // Age past the pending TTL: the held Approved entry ages out, leaving
         // the still-valid `issued` record as the only thing protecting the MAC.
@@ -4081,7 +4348,7 @@ mod tests {
             CsrOutcome::Pending
         ));
 
-        ca.approve_csr(&mac)
+        ca.approve_csr(&mac, None)
             .expect("the parked request is approvable");
         assert!(
             matches!(
@@ -4145,7 +4412,7 @@ mod tests {
         let mac = node_mac(2);
 
         ca.submit_csr(&mac, &ed, &x, "").unwrap();
-        ca.approve_csr(&mac).unwrap();
+        ca.approve_csr(&mac, None).unwrap();
         assert!(matches!(
             ca.submit_csr(&mac, &ed, &x, "").unwrap(),
             CsrOutcome::Issued(_)
@@ -4239,7 +4506,8 @@ mod tests {
             ca.submit_csr(&held_mac(0), &ed0, &x0, "").unwrap(),
             CsrOutcome::Pending
         ));
-        ca.approve_csr(&held_mac(0)).expect("approve succeeds");
+        ca.approve_csr(&held_mac(0), None)
+            .expect("approve succeeds");
         assert!(matches!(
             ca.submit_csr(&held_mac(0), &ed0, &x0, "").unwrap(),
             CsrOutcome::Issued(_)
@@ -4503,7 +4771,7 @@ mod tests {
         assert_eq!(pending[0].ed_pubkey, ed);
 
         // The operator can act on the reloaded request as if nothing happened.
-        ca.approve_csr(&mac)
+        ca.approve_csr(&mac, None)
             .expect("approve succeeds on the reloaded entry");
         assert!(matches!(
             ca.submit_csr(&mac, &ed, &x, "").unwrap(),
@@ -4603,7 +4871,7 @@ mod tests {
             let mut ca = CertAuthority::from_config(&[1; 32], &cfg).unwrap();
             ca.set_now_unix(100);
             ca.submit_csr(&mac, &ed, &x, "").unwrap();
-            ca.approve_csr(&mac).expect("approve succeeds");
+            ca.approve_csr(&mac, None).expect("approve succeeds");
             // No collection poll here — the node hasn't picked up its cert
             // when the process "restarts" below.
         }
@@ -4752,7 +5020,7 @@ mod tests {
         // Now doom every subsequent write.
         std::fs::remove_dir_all(&dir).ok();
 
-        let err = ca.approve_csr(&mac).unwrap_err();
+        let err = ca.approve_csr(&mac, None).unwrap_err();
         assert!(
             err.contains("could not record"),
             "the caller must be told the write did not land, got: {err}"
@@ -5801,7 +6069,7 @@ mod tests {
     #[test]
     fn completion_clamps_a_lifetime_the_policy_no_longer_allows() {
         let path = unique_state_path("invite-ttl-clamp");
-        let overlong = MAX_CERT_TTL_SECS + 86_400;
+        let overlong = MAX_SESSION_TTL_SECS + 86_400;
 
         let (handle, secret) = {
             let cfg = ProviderConfig {
@@ -5825,7 +6093,7 @@ mod tests {
 
         assert_eq!(
             ca.list_users()[0].session_ttl_secs,
-            MAX_CERT_TTL_SECS,
+            MAX_SESSION_TTL_SECS,
             "the created account's lifetime is clamped to the cap now in force, \
              not the one the invite was minted under"
         );

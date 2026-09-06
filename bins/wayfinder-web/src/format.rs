@@ -157,6 +157,62 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Convert a civil (year, month, day) to days since the Unix epoch.
+///
+/// Howard Hinnant's `days_from_civil`, the exact inverse of
+/// [`civil_from_days`]. Same reasoning: one arithmetic function rather than a
+/// calendar crate in the wasm bundle.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = i64::from(if m > 2 { m - 3 } else { m + 9 });
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The Unix instant a `YYYY-MM-DD` date *ends* at: midnight UTC on the day
+/// after it. `None` if `date` is not a real date in that exact form.
+///
+/// Ending rather than starting because of what the caller is choosing. An
+/// operator picking an expiry date means "through that day" — a certificate
+/// that stopped working at midnight on the morning of the date they typed
+/// would be off by a day in the direction that strands a device, and picking
+/// *today* would yield no lifetime at all.
+///
+/// `None` also for a date that ends at or before the epoch — see the comment
+/// on that check.
+///
+/// Only the zero-padded form is accepted, which is what an `<input type=date>`
+/// produces. Guessing at anything looser would mean guessing at what an
+/// ambiguous date meant, and this one decides when a node stops being a member.
+pub fn unix_end_of_day(date: &str) -> Option<u64> {
+    let (y, rest) = date.split_once('-')?;
+    let (m, d) = rest.split_once('-')?;
+    if (y.len(), m.len(), d.len()) != (4, 2, 2) {
+        return None;
+    }
+    let (y, m, d): (i64, u32, u32) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
+    if !(1..=12).contains(&m) || d == 0 {
+        return None;
+    }
+    let days = days_from_civil(y, m, d);
+    // The only check that catches a day past the end of its month, and it
+    // catches every one: a date that normalises to some *other* date was never
+    // the date it was written as.
+    if civil_from_days(days) != (y, m, d) {
+        return None;
+    }
+    // A date before the epoch has no unsigned instant to name, and the one
+    // that ends exactly *at* the epoch is refused with it: zero is this
+    // module's "no time known" (see [`timestamp`]), and handing a caller a
+    // sentinel dressed as an answer is how it gets treated as one.
+    u64::try_from((days + 1) * 86_400)
+        .ok()
+        .filter(|end| *end > 0)
+}
+
 /// Abbreviate a public key to its leading bytes.
 ///
 /// A 32-byte key is 64 hex characters — too long to scan and too long to lay out
@@ -681,6 +737,50 @@ mod tests {
             log_uptime(0).len(),
             "every stamp is the same width"
         );
+    }
+
+    /// A date names the whole day, so the instant it yields is the one that
+    /// day ends at — midnight UTC on the day after.
+    #[test]
+    fn a_date_becomes_the_instant_that_day_ends() {
+        assert_eq!(unix_end_of_day("2026-01-01"), Some(1_767_312_000));
+        assert_eq!(unix_end_of_day("2027-02-28"), Some(1_803_859_200));
+        assert_eq!(unix_end_of_day("1970-01-01"), Some(86_400));
+        // A leap day is a day like any other.
+        assert_eq!(
+            unix_end_of_day("2028-02-29").map(|end| end - 86_400),
+            unix_end_of_day("2028-02-28")
+        );
+    }
+
+    /// The instant a date yields reads back as that same date, one second
+    /// before it ends — the round trip a reader performs when they check what
+    /// they picked.
+    #[test]
+    fn a_date_round_trips_through_the_timestamp_it_names() {
+        for date in ["2026-01-01", "2027-02-28", "2028-02-29", "2036-09-07"] {
+            let end = unix_end_of_day(date).expect("a real date");
+            assert!(
+                timestamp(end - 1).starts_with(date),
+                "{date} ends on {date}, got {}",
+                timestamp(end - 1)
+            );
+        }
+    }
+
+    /// Only the zero-padded form a date input emits is accepted; anything else
+    /// is undecidable rather than guessed at.
+    #[test]
+    fn a_malformed_date_is_refused() {
+        assert_eq!(unix_end_of_day(""), None);
+        assert_eq!(unix_end_of_day("2026-1-1"), None);
+        assert_eq!(unix_end_of_day("2026-13-01"), None);
+        assert_eq!(unix_end_of_day("2026-02-30"), None);
+        assert_eq!(unix_end_of_day("2026-00-01"), None);
+        assert_eq!(unix_end_of_day("2026-01-00"), None);
+        assert_eq!(unix_end_of_day("not-a-date"), None);
+        // Before the epoch there is no unsigned instant to name.
+        assert_eq!(unix_end_of_day("1969-12-31"), None);
     }
 
     /// A certificate lifetime reads in the unit an operator would have typed

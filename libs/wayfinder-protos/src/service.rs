@@ -1351,8 +1351,13 @@ pub trait AuthorityDataProvider {
     /// enrolling node collects its certificate on the next `submit_csr` poll.
     /// Errors if no CSR for that MAC is pending.  Default errors (not a
     /// provider).
-    fn approve_csr(&mut self, node_mac: &[u8]) -> Result<(), String> {
-        let _ = node_mac;
+    ///
+    /// `cert_ttl_secs` is the lifetime to give *this* device's certificate, in
+    /// seconds; `None` takes the authority's enrollment-policy default.  A
+    /// lifetime the authority will not issue for is an error that leaves the
+    /// request pending, rather than a request approved at some other length.
+    fn approve_csr(&mut self, node_mac: &[u8], cert_ttl_secs: Option<u64>) -> Result<(), String> {
+        let _ = (node_mac, cert_ttl_secs);
         Err(NOT_A_PROVIDER.into())
     }
 
@@ -2337,10 +2342,12 @@ pub fn handle_authority<P: AuthorityDataProvider>(
             }),
             Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
         },
-        Some(RequestKind::ApproveCsr(req)) => match provider.approve_csr(&req.node_mac) {
-            Ok(()) => ResponseKind::Empty(Empty {}),
-            Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
-        },
+        Some(RequestKind::ApproveCsr(req)) => {
+            match provider.approve_csr(&req.node_mac, req.cert_ttl_secs) {
+                Ok(()) => ResponseKind::Empty(Empty {}),
+                Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
+            }
+        }
         Some(RequestKind::DenyCsr(req)) => match provider.deny_csr(&req.node_mac) {
             Ok(()) => ResponseKind::Empty(Empty {}),
             Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
@@ -3970,6 +3977,7 @@ mod tests {
             Audited::Mutation,
             audited(&RequestKind::ApproveCsr(ApproveCsrRequest {
                 node_mac: Vec::new(),
+                cert_ttl_secs: None,
             }))
         );
         assert_eq!(

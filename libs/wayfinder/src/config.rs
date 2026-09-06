@@ -819,15 +819,47 @@ fn default_preauth_ttl_secs() -> u64 {
 }
 
 /// The longest certificate lifetime a provider will issue for without
+/// [`ProviderConfig::allow_unbounded_cert_ttl`]: 10 years.
+///
+/// Was 90 days, chosen against how the two revocation paths compose: passive
+/// expiry is the primary one and the only one that needs no reachability, so
+/// the cap is the worst-case delay before a node that must be removed is
+/// removed by nothing happening. That reasoning has not changed, and it is
+/// still the reason to pick a *short* lifetime — it is now guidance the
+/// operator applies per device (`ApproveCsrRequest::cert_ttl_secs`) rather
+/// than a ceiling the code imposes on every one of them.
+///
+/// The ceiling moved because the fleet is not uniform. A sensor bolted to a
+/// structure for its service life and a laptop borrowed for an afternoon are
+/// admitted through the same queue, and holding the first to a quarter meant
+/// re-enrolling hardware that nobody can reach in order to preserve a recall
+/// path that, for that hardware, was never going to be exercised either.
+/// Ten years is long enough to cover a fixed installation and short enough to
+/// still be a bound rather than a formality; past it, `allow_unbounded_cert_ttl`
+/// remains the deliberate sentence in the config.
+///
+/// **Choosing a long lifetime is choosing to depend on the active flood.** A
+/// certificate issued for years cannot be recalled by waiting, only by a
+/// `RevokeNode` record reaching every node — which needs each of them
+/// reachable. Prefer the shortest lifetime the device's access pattern
+/// tolerates.
+pub const MAX_CERT_TTL_SECS: u64 = 10 * 365 * 24 * 60 * 60;
+
+/// The longest *session* certificate a provider will issue for without
 /// [`ProviderConfig::allow_unbounded_cert_ttl`]: 90 days.
 ///
-/// Chosen against how the two revocation paths compose. Passive expiry is the
-/// primary one and the only one that needs no reachability, so the cap is the
-/// worst-case delay before a node that must be removed is removed by nothing
-/// happening. A quarter is long enough that renewal is not an operational
-/// burden and short enough that a lost or compromised node is not a permanent
-/// member.
-pub const MAX_CERT_TTL_SECS: u64 = 90 * 24 * 60 * 60;
+/// The same field on the same kind of certificate as [`MAX_CERT_TTL_SECS`],
+/// held to a tighter bound because of who is on the other end of it. A device
+/// certificate is long because the alternative is re-enrolling hardware nobody
+/// can reach; a session belongs to a person signed in at a keyboard, where
+/// nothing about the credential's usefulness argues for years and everything
+/// about a lost laptop argues against it. An operator lengthening what a fixed
+/// installation gets must not thereby lengthen what an administrator's browser
+/// gets.
+///
+/// 90 days was the single cap both answered to before device lifetimes became
+/// per-approval, so an account's lifetime is bounded exactly as it always was.
+pub const MAX_SESSION_TTL_SECS: u64 = 90 * 24 * 60 * 60;
 
 /// Default [`ProviderConfig::pending_ttl_secs`]: one hour.
 fn default_pending_ttl_secs() -> u64 {

@@ -761,9 +761,95 @@ pub fn parse_mac6(s: &str) -> anyhow::Result<[u8; 6]> {
         .map_err(|_| anyhow::anyhow!("'{s}' must be a 6-byte MAC, got {} bytes", bytes.len()))
 }
 
+/// Parse a duration an operator typed into a number of seconds: a count with
+/// an optional unit suffix (`s`, `m`, `h`, `d`, `w`, `y`), or a bare count of
+/// seconds.
+///
+/// A certificate lifetime is the one number in this CLI that is naturally
+/// written in days or years and passed over the wire in seconds, and asking an
+/// operator to convert a year by hand is asking for the wrong number of zeros.
+/// Zero is refused here rather than left to the node: it is the one value whose
+/// only possible effect — a certificate that expired before it was collected —
+/// is never what anyone meant, and refusing locally says so without a round
+/// trip.
+///
+/// A year is 365 days and a month is not a unit at all: a lifetime is compared
+/// against a wall clock, and a unit whose length depends on which month it
+/// started in cannot be checked against a cap.
+pub fn parse_duration_secs(s: &str) -> anyhow::Result<u64> {
+    let s = s.trim();
+    let (count, unit_secs) = match s.strip_suffix(|c: char| c.is_ascii_alphabetic()) {
+        Some(count) => {
+            let unit = match s.as_bytes()[s.len() - 1] {
+                b's' => 1,
+                b'm' => 60,
+                b'h' => 3_600,
+                b'd' => 86_400,
+                b'w' => 7 * 86_400,
+                b'y' => 365 * 86_400,
+                _ => {
+                    anyhow::bail!(
+                        "'{s}' has an unknown unit; use s, m, h, d, w, y, or a bare \
+                         number of seconds"
+                    )
+                }
+            };
+            (count, unit)
+        }
+        None => (s, 1),
+    };
+    let count: u64 = count
+        .parse()
+        .with_context(|| format!("'{s}' is not a duration like 90d, 12h, or 3600"))?;
+    let secs = count
+        .checked_mul(unit_secs)
+        .with_context(|| format!("'{s}' is too long to express in seconds"))?;
+    anyhow::ensure!(
+        secs > 0,
+        "a lifetime of zero would issue a certificate that has already expired"
+    );
+    Ok(secs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The suffixed forms an operator reaches for, and the bare one the
+    /// management API speaks.
+    #[test]
+    fn parse_duration_secs_accepts_each_unit() {
+        assert_eq!(parse_duration_secs("3600").unwrap(), 3600);
+        assert_eq!(parse_duration_secs("90s").unwrap(), 90);
+        assert_eq!(parse_duration_secs("30m").unwrap(), 1_800);
+        assert_eq!(parse_duration_secs("12h").unwrap(), 43_200);
+        assert_eq!(parse_duration_secs("30d").unwrap(), 2_592_000);
+        assert_eq!(parse_duration_secs("2w").unwrap(), 1_209_600);
+        assert_eq!(parse_duration_secs("1y").unwrap(), 31_536_000);
+        // Surrounding space is an artifact of shell quoting, not a mistake.
+        assert_eq!(parse_duration_secs(" 7d ").unwrap(), 604_800);
+    }
+
+    /// Zero is refused here rather than at the node, because the node's answer
+    /// arrives after a round trip and says the same thing.
+    #[test]
+    fn parse_duration_secs_rejects_zero_and_nonsense() {
+        assert!(parse_duration_secs("0").is_err());
+        assert!(parse_duration_secs("0d").is_err());
+        assert!(parse_duration_secs("").is_err());
+        assert!(parse_duration_secs("d").is_err());
+        assert!(parse_duration_secs("forever").is_err());
+        assert!(parse_duration_secs("-1").is_err());
+        assert!(parse_duration_secs("7 days").is_err());
+    }
+
+    /// A count large enough to overflow the seconds it names is an error, not
+    /// a wrapped-around lifetime.
+    #[test]
+    fn parse_duration_secs_rejects_an_overflowing_count() {
+        assert!(parse_duration_secs("99999999999999999999y").is_err());
+        assert!(parse_duration_secs(&format!("{}d", u64::MAX)).is_err());
+    }
 
     #[test]
     fn parse_id_colon_mac() {

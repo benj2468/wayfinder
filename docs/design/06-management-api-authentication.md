@@ -632,7 +632,8 @@ resulted.
    not a constant.** `UserRecord::session_ttl_secs` is chosen by the admin who
    grants the account, so an automation account can be minutes and a field
    operator a shift, and neither is a code change — still bounded by
-   `MAX_CERT_TTL_SECS`. Phase 1's revalidation fix (F4) is what makes a short
+   `MAX_SESSION_TTL_SECS`, which is a session's own cap and not the (longer)
+   one a device certificate answers to. Phase 1's revalidation fix (F4) is what makes a short
    TTL actually mean something: before it, expiry stopped a *new* connection
    but not one already open.
 4. **Where does the CA live in a multi-provider mesh?** This design assumes

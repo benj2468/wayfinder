@@ -46,6 +46,8 @@
 use leptos::ev::SubmitEvent;
 use leptos::prelude::*;
 
+use crate::clock::now_unix;
+
 use crate::components::logo::Logo;
 use crate::invite::RegistrationStart;
 
@@ -351,21 +353,6 @@ fn clear_fragment() {
 /// Server rendering has no address bar.
 #[cfg(not(feature = "hydrate"))]
 fn clear_fragment() {}
-
-/// The browser's wall clock in Unix seconds, or zero when there is none.
-///
-/// Zero is "undecidable", not "the epoch": every caller treats it as a reason
-/// to defer to the provider rather than to judge a deadline itself.
-#[cfg(feature = "hydrate")]
-fn now_unix() -> u64 {
-    (js_sys::Date::now() / 1000.0) as u64
-}
-
-/// Server rendering decides no deadlines.
-#[cfg(not(feature = "hydrate"))]
-fn now_unix() -> u64 {
-    0
-}
 
 /// Whether this error means the provider was never reached.
 ///

@@ -38,6 +38,10 @@ pub mod bundle;
 // Browser-only in effect (the `ssr` build compiles a stub that copies nothing),
 // but not gated: the click handlers that call it are compiled into both builds.
 pub mod clipboard;
+// Browser-only in effect (the `ssr` build compiles a stub that answers zero),
+// and not gated for the same reason `clipboard` is not: the click handlers
+// that call it are compiled into both builds.
+pub mod clock;
 pub mod components;
 // Browser-only in effect, and not gated for the same reason `clipboard` is not:
 // the `on:change` handler that calls it is compiled into both builds.

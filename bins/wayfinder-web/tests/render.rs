@@ -629,6 +629,42 @@ fn provider_requests_lists_what_is_waiting() {
     assert!(!html.contains("wf-modal"), "nothing armed yet: {html}");
 }
 
+/// A waiting request carries its own lifetime chooser: how long a device stays
+/// a member is decided when it is admitted, not by whatever the policy happened
+/// to say that week.
+///
+/// The default option names the policy value rather than saying "default", so
+/// an operator who just takes it still knows what they took.
+#[test]
+fn provider_requests_offers_a_certificate_lifetime() {
+    let mut snap = provider_snapshot();
+    snap.pending_csrs = Some(ListPendingCsrsResponse {
+        pending: vec![PendingCsr {
+            node_mac: vec![0, 0, 0, 0, 0, 9],
+            ed_pubkey: vec![0xab; 32],
+            x_pubkey: vec![0xcd; 32],
+            requested_at: 1_700_000_000,
+        }],
+    });
+    let html = render_with(Some(snap), || view! { <Requests /> });
+
+    assert!(
+        html.contains("Valid for"),
+        "the lifetime is labelled: {html}"
+    );
+    assert!(
+        html.contains("This mesh's default (1 day)"),
+        "the default names the policy value: {html}"
+    );
+    for preset in ["1 month", "3 months", "1 year", "10 years"] {
+        assert!(html.contains(preset), "the {preset} preset: {html}");
+    }
+    assert!(
+        html.contains("Until a date"),
+        "a date can be picked instead of a preset: {html}"
+    );
+}
+
 /// An empty queue says nobody is waiting, which is not the same claim as a
 /// node that has no queue at all.
 #[test]

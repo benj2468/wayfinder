@@ -330,7 +330,12 @@ async fn act(client: &mut Option<Client>, target: &ConnectTarget, app: &mut App)
         )]
         let conn = client.as_mut().expect("client connected above");
         match &action {
-            app::OperatorAction::ApproveCsr(mac) => conn.approve_csr(mac).await,
+            // No lifetime: the TUI has no picker for one, so an approval from
+            // here takes the provider's policy default — the behaviour it had
+            // before per-device lifetimes existed. Choosing one is the
+            // dashboard's job (`wayfinder-web`), or `wayfinderctl provider
+            // requests approve --valid-for`.
+            app::OperatorAction::ApproveCsr(mac) => conn.approve_csr(mac, None).await,
             app::OperatorAction::DenyCsr(mac) => conn.deny_csr(mac).await,
             app::OperatorAction::RevokeNode(mac) => conn.revoke_node(mac).await,
         }

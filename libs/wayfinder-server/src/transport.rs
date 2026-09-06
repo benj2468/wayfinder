@@ -4397,6 +4397,7 @@ mod tests {
             .send(encode_request(Request::ApproveCsr(
                 wayfinder_protos::wayfinder::v1alpha::ApproveCsrRequest {
                     node_mac: own.0.to_vec(),
+                    cert_ttl_secs: None,
                 },
             )))
             .await

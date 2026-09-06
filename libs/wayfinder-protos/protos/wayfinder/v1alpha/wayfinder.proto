@@ -1054,6 +1054,19 @@ message ListPendingCsrsRequest {}
 message ApproveCsrRequest {
   // The MAC of the pending CSR to approve, as raw bytes.
   bytes node_mac = 1;
+
+  // How long this device's certificate should be valid for, in seconds.  Absent
+  // means the provider's own EnrollmentPolicy.cert_ttl_secs, which is what
+  // every approval used before this field existed.
+  //
+  // Per-approval rather than only per-policy because a fleet is not uniform: a
+  // sensor bolted to a structure and a laptop borrowed for an afternoon reach
+  // the operator through the same queue, and the lifetime is the one thing
+  // that should differ between admitting them.  Rejected if zero (a
+  // certificate that has already expired) or past the provider's cap, and a
+  // rejected approval leaves the request pending rather than issuing at some
+  // other length.
+  optional uint64 cert_ttl_secs = 2;
 }
 
 // Deny (drop) a pending certificate-signing request, identified by the enrolling
