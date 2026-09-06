@@ -330,6 +330,52 @@ It writes per-placement coverage maps and timelines, a comparison chart, a
 terrain cross-section explaining the worst outage, a rotatable scene per
 placement, and `mountain_relay_report.html` tying the whole sweep together.
 
+### Depth scenario
+
+`sim/scenarios/convoy_relay.py` asks the question a chain topology is the
+only clean instrument for: **how deep can a mesh get before it stops
+working?** A column of vehicles, each in contact only with the one ahead and
+the one behind, run at spacings from close order to strung out.
+
+```bash
+uv run --group sim python sim/scenarios/convoy_relay.py
+```
+
+Three limits sit in the path, and they do not bound the same thing — two
+stop a route from reaching, and the third leaves it working while making it
+unrankable:
+
+* **The TTL wall, at hop 50.** An originated OGM leaves with `ttl: 50`
+  (`batman::engine`'s `produce_periodic_broadcast`), decremented per hop.
+  The hard limit on reach, and a reachable one: a 60-vehicle column at 100 m
+  holds all 50 hops without flickering. The sweep's own columns are 30
+  vehicles — 29 hops — so they run out before this wall rather than hitting
+  it, which is what `unconstrained` means in the table it prints.
+* **The loss wall**, wherever compounding per-hop delivery puts it — here
+  past about 350 m, where a column that reached 19 hops reaches 9. The only
+  one of the three anybody can actually move.
+* **The metric floor, at hop 26 and closer on real links.** Each hop charges
+  `tq.saturating_sub(10)` and clamps by the receiver's own measured link
+  quality, so from 255 the metric is exhausted at hop 26 — near `Q/10 + 1`
+  once a per-hop quality `Q` clamps it. This one stops nothing: frames
+  forward past it all the way to the horizon. What is lost is the ability to
+  rank two paths, since everything past the floor scores the same zero. It
+  also always arrives first, so *any* column deep enough to reach the TTL
+  wall spent its last two dozen hops routing on an exhausted metric — 27 of
+  them, in the 100 m column above.
+
+The practical finding is that the loss wall is a fraying edge rather than a
+cliff. Well before a column stops reaching its tail, the tail starts
+flickering: at 250 m the head reaches hop 29 at its best and holds 23,
+oscillating between the two indefinitely. Depth is reported as a
+reliable/best pair for that reason, and a single converged snapshot is not a
+safe way to measure one of these runs — `DepthProfile` reads its depths
+across the settled window instead.
+
+`sim/tests/test_convoy.py` pins the parts that are engine facts rather than
+scenario prose (both constants an ideal chain exposes, and `None`-vs-`0`),
+the way `test_red_team.py` pins that script's verdicts.
+
 ## Topology
 
 The default is a **4-node diamond bolted onto a 5-node complete-graph mesh**,
