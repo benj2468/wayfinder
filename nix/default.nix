@@ -43,6 +43,91 @@ let
   wayfinder-tui = mkWayfinderPkg "wayfinder-tui";
   wayfinder-ctl = mkWayfinderPkg "wayfinder-ctl";
 
+  # The Wireshark/tshark Lua dissector (`libs/wayfinder-shark`), packaged as a
+  # plugin *directory* rather than a bare file, so anything that scans one
+  # finds it. Nothing but the `.lua` lands in the output; the build input is
+  # the whole filtered source, so this re-copies its one file on any repo
+  # change, which costs a second.
+  wayfinder-shark = pkgs.runCommandLocal "wayfinder-shark" { } ''
+    install -Dm444 ${src}/libs/wayfinder-shark/wayfinder.lua \
+      $out/lib/wireshark/plugins/wayfinder.lua
+  '';
+
+  # `tshark` and `termshark` with the dissector already loaded.
+  #
+  # Wireshark finds its global plugin directory by walking up from the *real*
+  # path of the running executable (`PLUGIN_DIR` is compiled in relative to an
+  # install prefix, and the prefix is derived from `/proc/self/exe`), so this
+  # copies the tshark binary into a prefix of our own whose
+  # `lib/wireshark/plugins` holds Wireshark's plugins *and* ours. A copy, not a
+  # symlink and not a wrapper: a symlink resolves back to Wireshark's own
+  # prefix, which is the one place we cannot add a file to.
+  #
+  # The tidier-looking `WIRESHARK_PLUGIN_DIR` does not work here, and fails in
+  # the case this exists for. Wireshark ignores every path environment variable
+  # when it starts with special privileges, and `started_with_special_privs()`
+  # counts a real uid of 0 (`wsutil/privileges.c`) — so the variable is honoured
+  # for an ordinary user and silently dropped for the root shell an operator
+  # debugging a node is usually sitting in. `nix/tests/simple.nix` asserts the
+  # root case for that reason.
+  #
+  # `-X lua_script:` is out for the same reason, one level up: user scripts sit
+  # behind the same privilege gate (`epan/wslua/init_wslua.c`), while the global
+  # plugin directory is loaded unconditionally.
+  #
+  # Both are `hiPrio` because they install binaries under the stock names: a
+  # system that also pulls in plain `wireshark-cli`
+  # (`programs.wireshark.enable`) or `termshark` would otherwise resolve the
+  # collision by whichever landed in `environment.systemPackages` first, and
+  # silently hand the operator a tshark that decodes mesh frames as an
+  # unstructured `eth` payload.
+  wayfinder-tshark = pkgs.lib.hiPrio (
+    pkgs.runCommandLocal "wayfinder-tshark" { } ''
+      mkdir -p $out/bin $out/lib/wireshark/plugins
+
+      # The whole CLI suite, so this package stands in for `wireshark-cli`
+      # rather than beside it. `dumpcap` is not optional company: tshark spawns
+      # it for every live capture and nixpkgs patches the lookup to go through
+      # `PATH` first (`lookup-dumpcap-in-path.patch`, so a setcap wrapper can
+      # win), falling back to this prefix. A node that installs a lone tshark
+      # has it in neither place, and every `tshark -i` there dies with
+      # "Couldn't run dumpcap in child process: No such file or directory".
+      #
+      # These stay symlinks and so resolve against Wireshark's own prefix,
+      # which is right for all of them: `dumpcap` and friends do not dissect.
+      # `rawshark`/`sharkd` do, and do not see the dissector for the same
+      # reason — nothing here drives them.
+      ln -s ${pkgs.wireshark-cli}/bin/* $out/bin/
+
+      # tshark itself has to be a real copy living in *this* prefix. Removed
+      # first because `cp` over the symlink would write through it, into a
+      # read-only store path.
+      rm $out/bin/tshark
+      cp ${pkgs.wireshark-cli}/bin/tshark $out/bin/tshark
+
+      # The rest of the prefix tshark resolves against — its data files and its
+      # extcap helpers — is shared with the package the binary came from.
+      ln -s ${pkgs.wireshark-cli}/share $out/share
+      ln -s ${pkgs.wireshark-cli}/libexec $out/libexec
+
+      # Wireshark's own plugins (the versioned subdirectory of dissector,
+      # codec and wiretap `.so`s) alongside the dissector. Linking only ours
+      # would take Wireshark's off the search path with it.
+      ln -s ${pkgs.wireshark-cli}/lib/wireshark/plugins/* $out/lib/wireshark/plugins/
+      ln -s ${wayfinder-shark}/lib/wireshark/plugins/wayfinder.lua $out/lib/wireshark/plugins/
+    ''
+  );
+
+  # termshark shells out to `tshark` for every decode and finds it on `PATH`,
+  # so it needs no plugin knowledge of its own — only ours ahead of the plain
+  # one its own nixpkgs wrapper appends.
+  wayfinder-termshark = pkgs.lib.hiPrio (
+    pkgs.runCommandLocal "wayfinder-termshark" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
+      makeWrapper ${pkgs.termshark}/bin/termshark $out/bin/termshark \
+        --prefix PATH : ${wayfinder-tshark}/bin
+    ''
+  );
+
   # The web dashboard is built by `cargo-leptos`, not plain `cargo`, because it
   # compiles the crate twice: the axum server for the host and a hydration
   # bundle for wasm32. That needs a toolchain carrying wasm32's `rust-std`,
@@ -125,5 +210,8 @@ in
     wayfinder-tui
     wayfinder-ctl
     wayfinder-web
+    wayfinder-shark
+    wayfinder-tshark
+    wayfinder-termshark
     ;
 }

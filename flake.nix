@@ -51,6 +51,9 @@
           wayfinder-tui
           wayfinder-ctl
           wayfinder-web
+          wayfinder-shark
+          wayfinder-tshark
+          wayfinder-termshark
           ;
       };
 
@@ -417,6 +420,9 @@
               wayfinder-tui
               wayfinder-ctl
               wayfinder-web
+              wayfinder-shark
+              wayfinder-tshark
+              wayfinder-termshark
               ;
             wayfinder-simple = nixpkgs.callPackage ./nix/tests/simple.nix { };
             wayfinder-ethernet-egress = nixpkgs.callPackage ./nix/tests/ethernet-egress.nix { };
