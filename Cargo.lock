@@ -5423,6 +5423,7 @@ dependencies = [
  "futures",
  "hmac",
  "libc",
+ "percent-encoding",
  "prost",
  "rand 0.10.2",
  "reqwest",

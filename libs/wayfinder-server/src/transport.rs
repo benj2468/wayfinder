@@ -1089,6 +1089,18 @@ where
                      member capability, not a management one); it may fetch its own VPN \
                      credential and nothing else"
                 }
+                // Ahead of the general viewer arm below, which speaks of
+                // "mutations and the enrollment token" — exhaustive until
+                // `GetLogs` became the first *read* a viewer is refused, and
+                // actively misleading now: it points somebody whose read failed
+                // at a fix for a write. Same reason `GetVpnEnrollment` has an
+                // arm of its own above.
+                (MgmtAccess::GrantedViewer, ReqKind::GetLogs(_)) => {
+                    "the node's log ring is served to an admin certificate or the node's own \
+                     key. It carries whatever the process logged rather than a chosen set of \
+                     fields, which on a certificate authority includes the account records \
+                     that name who may administer this mesh"
+                }
                 (MgmtAccess::GrantedViewer, _) => {
                     "this connection is read-only (its certificate carries the viewer \
                      capability, not the admin one); mutations and the enrollment token \

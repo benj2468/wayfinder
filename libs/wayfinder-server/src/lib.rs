@@ -133,6 +133,8 @@ pub use users::AuthOutcome;
 #[cfg(feature = "std")]
 pub use users::DEFAULT_SESSION_TTL_SECS;
 #[cfg(feature = "std")]
+pub use users::MAX_USERNAME_LEN;
+#[cfg(feature = "std")]
 pub use users::UserRecord;
 pub use users::UserRole;
 

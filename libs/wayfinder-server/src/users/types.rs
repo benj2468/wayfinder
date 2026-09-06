@@ -23,7 +23,9 @@
 pub enum UserRole {
     /// Session certificates carry `CERT_FLAG_ADMIN`: full management.
     Admin,
-    /// Session certificates carry `CERT_FLAG_VIEWER`: the queries only.
+    /// Session certificates carry `CERT_FLAG_VIEWER`: the queries, less the
+    /// few that are an administrator's read (the log ring, the account
+    /// roster).
     ///
     /// The default, so an account created without a role stated is the one
     /// that can do less.

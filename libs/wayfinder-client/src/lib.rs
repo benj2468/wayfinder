@@ -27,6 +27,7 @@ use anyhow::Context;
 use anyhow::anyhow;
 use anyhow::bail;
 use bytes::Bytes;
+use core::fmt;
 use futures::SinkExt;
 use futures::StreamExt;
 use prost::Message;
@@ -457,6 +458,12 @@ impl Client {
     }
 
     /// Encode and send one request, then await and decode the single response.
+    ///
+    /// A well-formed error *response* comes back as a [`ServerError`] inside the
+    /// `anyhow::Error`, so a caller can tell the node's considered "no" from the
+    /// stream having broken underneath it. Everything else — an I/O failure on
+    /// send or recv, a decode failure, an empty envelope — is an ordinary
+    /// `anyhow` error and means the connection is suspect.
     async fn request(&mut self, request: RequestKind) -> anyhow::Result<ResponseKind> {
         let envelope = WayfinderRequest {
             request: Some(request),
@@ -470,8 +477,11 @@ impl Client {
         let response = WayfinderResponse::decode(frame)?;
         match response.response {
             // Surface a server-side error as the call's error rather than an
-            // "unexpected variant" mismatch in every typed method.
-            Some(ResponseKind::Error(e)) => Err(anyhow!("server error: {}", e.message)),
+            // "unexpected variant" mismatch in every typed method. Typed rather
+            // than a bare `anyhow!` so a caller can distinguish it by
+            // `downcast_ref` instead of by matching on the rendered string —
+            // see `ServerError`.
+            Some(ResponseKind::Error(e)) => Err(ServerError { message: e.message }.into()),
             Some(other) => Ok(other),
             None => Err(anyhow!("server returned an empty response envelope")),
         }
@@ -1601,3 +1611,32 @@ mod tests {
         );
     }
 }
+
+/// A node's well-formed refusal of a request, as distinct from a transport or
+/// decode failure.
+///
+/// The two need telling apart by anything that reacts to an error by dropping
+/// the connection. A `ServerError` arrives *on a healthy stream* — the frame was
+/// sent, a reply was read, and it said no — so the connection is fine and
+/// reconnecting would achieve nothing. Anything else means the stream is
+/// suspect and the client should be rebuilt.
+///
+/// That distinction used to be drawn by testing the rendered message for a
+/// `"server error: "` prefix, which is a contract nothing enforced. The
+/// [`Display`](fmt::Display) impl still renders exactly that prefix, so existing
+/// message-matching callers are unaffected, but new code should
+/// `downcast_ref::<ServerError>()` instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerError {
+    /// The message the node sent. Deliberately the node's own wording: a
+    /// refusal explains itself, and rephrasing it here would lose that.
+    pub message: String,
+}
+
+impl fmt::Display for ServerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "server error: {}", self.message)
+    }
+}
+
+impl std::error::Error for ServerError {}

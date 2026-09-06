@@ -189,7 +189,12 @@ fn poll_once(dash: Dashboard, signed_out: RwSignal<bool>) {
         match fetch_snapshot(since_seq).await {
             Ok(snapshot) => {
                 dash.history.update(|h| {
-                    h.ingest_logs(snapshot.logs.clone());
+                    // Absent on a read-only session, which the node does not
+                    // serve the log ring to. Nothing to fold in, and the
+                    // cursor must not advance past records never received.
+                    if let Some(logs) = snapshot.logs.clone() {
+                        h.ingest_logs(logs);
+                    }
                     h.record_throughput(&snapshot);
                 });
                 dash.snapshot.set(Some(snapshot));

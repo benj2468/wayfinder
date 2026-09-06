@@ -118,7 +118,8 @@ pub enum CertCommand {
         admin: bool,
         /// Instead grant the read-only management capability: the holder may
         /// invoke the management API's queries (routing table, link quality,
-        /// metrics, logs) and none of its mutations or secrets.
+        /// metrics) and none of its mutations or secrets. The node's log ring
+        /// is an administrator's read, not a viewer's.
         ///
         /// A capability of its own, not the absence of `--admin`: an ordinary
         /// membership cert reaches nothing on an enrolled node's management

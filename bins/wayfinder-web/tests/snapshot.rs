@@ -88,6 +88,39 @@ async fn snapshot_survives_a_node_that_is_not_a_certificate_authority() {
     );
 }
 
+/// A read-only poll skips both admin-gated queries and still returns every
+/// table a viewer is entitled to.
+///
+/// The node refuses `GetLogs` and `ListVpnPeers` to the viewer tier, and this
+/// poll fails whole if any request in it fails — so asking for either would
+/// cost a viewer the entire dashboard, not just the pane they cannot see. That
+/// is the regression this guards: the fix for issue #32 narrowed the tier, and
+/// the client half has to stop asking in the same change.
+#[tokio::test]
+async fn a_read_only_poll_skips_the_admin_gated_queries() {
+    let conn = serve_mock_node().await;
+
+    let snapshot = build_snapshot(&conn, 0, PollScope::ReadOnly)
+        .await
+        .expect("a read-only poll succeeds rather than failing on a refusal");
+
+    assert!(
+        snapshot.logs.is_none(),
+        "the log ring is not asked for on a read-only connection"
+    );
+    assert!(
+        snapshot.vpn_peers.is_none(),
+        "and neither is the VPN peer table"
+    );
+
+    // The tables a viewer *is* entitled to still arrive, so the narrowing cost
+    // exactly the two panes it was supposed to and not the dashboard.
+    assert!(snapshot.node_info.is_some());
+    assert!(snapshot.metrics.is_some());
+    assert!(snapshot.security.is_some());
+    assert_eq!(snapshot.routing.entries.len(), 1);
+}
+
 /// The log cursor advances across polls, so a browser that passes `next_seq`
 /// back reads each record once instead of re-reading the ring every second.
 #[tokio::test]
@@ -97,7 +130,11 @@ async fn snapshot_log_cursor_advances_across_polls() {
     let first = build_snapshot(&conn, 0, PollScope::Administrator)
         .await
         .unwrap();
-    let cursor = first.logs.next_seq;
+    let cursor = first
+        .logs
+        .as_ref()
+        .expect("an administrator's poll carries the log ring")
+        .next_seq;
 
     wayfinder_log::record(
         wayfinder_log::Level::Warn,
@@ -108,18 +145,17 @@ async fn snapshot_log_cursor_advances_across_polls() {
     let second = build_snapshot(&conn, cursor, PollScope::Administrator)
         .await
         .unwrap();
+    let logs = second
+        .logs
+        .as_ref()
+        .expect("an administrator's poll carries the log ring");
     assert!(
-        second
-            .logs
-            .records
+        logs.records
             .iter()
             .any(|r| r.target == "wayfinder_web::snapshot_test"),
         "a record emitted between polls is delivered on the next one"
     );
-    assert!(
-        second.logs.next_seq > cursor,
-        "the resume point moved forward"
-    );
+    assert!(logs.next_seq > cursor, "the resume point moved forward");
 }
 
 /// Consecutive polls reuse one connection rather than reconnecting each time —

@@ -35,6 +35,7 @@ std = [
     "dep:rand",
     "dep:reqwest",
     "dep:url",
+    "dep:percent-encoding",
     # Linux-only in practice: the dependency is target-gated, so this is a no-op
     # on every other host and `clock_trust` reports `Unsupported` there.
     "dep:libc",
@@ -118,6 +119,11 @@ reqwest = { workspace = true, optional = true }
 # than at first use, so a typo is a startup error instead of an enrollment that
 # fails hours later.
 url = { version = "2", optional = true }
+# Percent-encoding for the `otpauth://` enrolment URI's label and query. Already
+# in this crate's graph via `url` and `reqwest`, so this is a direct edge on an
+# already-compiled crate rather than a new dependency — and encoding that closes
+# an injection is worth an audited implementation over a hand-rolled one.
+percent-encoding = { version = "2", optional = true }
 
 # The embedded management transport (`embedded` feature): the byte-stream I/O
 # trait the framing reads/writes over, and the SPSC channel the `serve` loop

@@ -63,6 +63,10 @@ fn seeded_snapshot() -> NodeSnapshot {
             runtime_config_active: false,
             clock_trusted: true,
         }),
+        // Explicit, because `Default` gives `logs: None` — which now means "a
+        // read-only poll withheld the ring", not "an empty batch". A fixture
+        // standing in for an administrator's poll has to say which it is.
+        logs: Some(Default::default()),
         ..Default::default()
     };
     snap.routing.entries.push(RoutingEntry {
@@ -1375,7 +1379,46 @@ fn security_still_offers_an_administrator_every_control() {
     assert!(!html.contains("disabled"), "and nothing is inert: {html}");
 }
 
-/// A read-only account reads the logs and does not re-aim them.
+/// The Logs pane distinguishes its three empty states, and the one it shows an
+/// administrator before the first poll is not the viewer's.
+///
+/// `dash.admin` defaults to `false` and is corrected only by a client-side
+/// effect, so keying the message on it rendered "administrators only" into
+/// server-rendered markup for an administrator — a false statement to the one
+/// person it is false about. The message is keyed on `snapshot.logs.is_none()`
+/// instead, which is what the poll actually did, and this pins all three arms.
+#[test]
+fn logs_say_why_they_are_empty_to_a_read_only_session() {
+    // Before any poll: neither claim is available yet, so neither is made.
+    let waiting = render_with(None, || view! { <Logs /> });
+    assert!(waiting.contains("Waiting for the node"), "{waiting}");
+    assert!(!waiting.contains("administrator"), "{waiting}");
+
+    // An administrator polled and the node had nothing at the current filter.
+    let quiet = render_with(Some(seeded_snapshot()), || view! { <Logs /> });
+    assert!(quiet.contains("Nothing recorded yet"), "{quiet}");
+
+    // A read-only poll never asked, and says so rather than reporting silence.
+    let mut withheld = seeded_snapshot();
+    withheld.logs = None;
+    let viewer = render_as_viewer(Some(withheld), || view! { <Logs /> });
+    assert!(
+        viewer.contains("administrator"),
+        "a viewer is told the ring is not theirs to read: {viewer}"
+    );
+    assert!(
+        !viewer.contains("Nothing recorded yet"),
+        "and not that the node was quiet: {viewer}"
+    );
+}
+
+/// A read-only account is told why the log pane is empty, and does not re-aim
+/// what the node records.
+///
+/// It cannot read the ring at all — `GetLogs` is an administrator's read — so
+/// this seeds the scrollback directly to exercise the *controls*, which is what
+/// the test is about. `logs_say_why_they_are_empty_to_a_read_only_session`
+/// covers what a viewer actually sees.
 ///
 /// `SetLogLevel` changes what the node records for *everyone*, so it is an
 /// administrator's call. The filter in force is still shown: it is the

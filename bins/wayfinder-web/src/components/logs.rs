@@ -36,6 +36,13 @@ pub fn Logs() -> impl IntoView {
 
     let filter = move || dash.history.with(|h| h.filter.clone());
     let entries = move || dash.history.with(|h| h.entries.clone());
+    // Whether the last poll declined to ask for the ring at all, read from the
+    // snapshot rather than inferred from the viewer's capability — see the
+    // empty state below for why the two are not interchangeable.
+    let logs_withheld = move || {
+        dash.snapshot
+            .with(|s| s.as_ref().is_some_and(|s| s.logs.is_none()))
+    };
 
     let submit = move || {
         let Some(spec) = draft.get() else { return };
@@ -68,11 +75,21 @@ pub fn Logs() -> impl IntoView {
                                     </code>
                                     // `SetLogLevel` re-aims what the node
                                     // records for everyone reading it, so it is
-                                    // an administrator's call. The filter in
-                                    // force is still shown to everybody: it is
-                                    // the difference between "nothing is
-                                    // happening" and "nothing is being
-                                    // recorded".
+                                    // an administrator's call.
+                                    //
+                                    // The filter line above used to be shown to
+                                    // everybody on the argument that it
+                                    // separates "nothing is happening" from
+                                    // "nothing is being recorded". It no longer
+                                    // can be: the node reports the filter in
+                                    // force on the `GetLogs` *response*, and a
+                                    // read-only session does not make that call,
+                                    // so the line reads "—" for a viewer no
+                                    // matter what the node is doing. The empty
+                                    // state below is what answers the question
+                                    // for them instead. Carrying the filter on a
+                                    // read a viewer does hold — `GetNodeInfo` —
+                                    // would restore it for one string.
                                     {move || {
                                         dash.admin
                                             .get()
@@ -140,10 +157,27 @@ pub fn Logs() -> impl IntoView {
                     let rows = entries();
                     if rows.is_empty() {
                         return view! {
-                            <Empty message=if dash.has_data() {
-                                "Nothing recorded yet at the current filter."
-                            } else {
+                            // Keyed on what the poll actually did, not on
+                            // `dash.admin`. That signal defaults to `false` and
+                            // is corrected only by a client-side `Effect`, so
+                            // reading it first told an *administrator*, in
+                            // server-rendered markup and every frame before
+                            // hydration, that the ring was not theirs to read —
+                            // a false statement to the one person it is false
+                            // about. It also lags a mid-session demotion, where
+                            // the poll is already being withheld.
+                            //
+                            // `logs.is_none()` is the poll's own answer, from
+                            // the snapshot in front of us. "Waiting" comes
+                            // first because before any snapshot there is
+                            // nothing to have withheld.
+                            <Empty message=if !dash.has_data() {
                                 "Waiting for the node…"
+                            } else if logs_withheld() {
+                                "The node serves its log ring to an administrator, \
+                                 or to a client holding the node's own key."
+                            } else {
+                                "Nothing recorded yet at the current filter."
                             } />
                         }
                             .into_any();

@@ -618,6 +618,12 @@ resulted.
    a query and the second like a debugging convenience: the first is a read by
    shape but the mesh's admission credential by content, and the second
    changes what every sink on the node emits rather than merely observing one.
+   `GetLogs` joined them later (issue #32) as the clearest member of that
+   class: it is an unambiguous read that returns whatever the process logged
+   rather than a chosen set of fields, and on a provider that includes the
+   account-administration records naming who may administer the mesh — so a
+   viewer reading the ring recovered the roster `ListUsers` is admin-gated to
+   protect.
    `authz.rs`'s viewer allowlist is written as an explicit refusal set over
    the admin allowlist, not as "everything that isn't a mutation", so a
    request that merely looks like a read still has to be classified on

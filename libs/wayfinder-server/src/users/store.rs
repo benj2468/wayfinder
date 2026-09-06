@@ -141,6 +141,40 @@ pub(crate) const LOCKOUT_SECS: u64 = 900;
 /// field operator a shift, without either being a code change.
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 8 * 3600;
 
+/// The longest username this authority will accept, in bytes.
+///
+/// A username is not just a lookup key: it is persisted in the provider's state
+/// snapshot, repeated in every audit line about the account, and interpolated
+/// into the `otpauth://` enrolment URI an authenticator app parses. Nothing
+/// bounded it, while `bins/wayfinder-web/src/bundle.rs` already bounded an
+/// *uploaded* name at 128 and observed in its own doc comment that the
+/// authority put no limit on one. This is the missing half of that pair. The
+/// two stay separate constants — that crate does not depend on this one outside
+/// its test feature — so what has to be kept in step is the *unit*: both count
+/// bytes, and it is the counting rather than the number that made the older
+/// pairing meaningless.
+///
+/// Bytes rather than characters because bytes are what the snapshot and the
+/// wire actually pay for; a name of 128 multi-byte characters is not the case
+/// this bound exists for.
+///
+/// **A bound on creation, not an invariant of stored state.** It is enforced by
+/// `check_name_available`, which every path that claims a name goes through, and
+/// again where an invitation is redeemed — but a `ca-state.json` written by a
+/// build older than this rule is loaded as it stands. Refusing to load it would
+/// turn a long username into a provider that will not start while holding the
+/// mesh root of trust, which is a far worse failure than the one this prevents.
+/// So `UserRecord::username` may still be longer than this; nothing downstream
+/// depends on it not being.
+///
+/// Deliberately *only* a length bound. The charset is left open — an operator
+/// may reasonably want an email address, a display name, or a non-Latin script
+/// as a username, and the injection this pairs with is closed at the point of
+/// use by [`percent_encode`], which is where an encoding problem belongs. A
+/// charset allowlist here would be a second, weaker answer to a question already
+/// answered correctly downstream.
+pub const MAX_USERNAME_LEN: usize = 128;
+
 /// How many bytes an [`AccountId`] carries.
 ///
 /// 128 bits from the OS CSPRNG. The value is never presented to a person and
@@ -680,12 +714,54 @@ pub(crate) fn generate_totp_secret() -> Vec<u8> {
 /// clear by construction — that is what enrolment *is* — so the question that
 /// matters at every call site is who is about to read it.
 fn totp_enrolment_uri(issuer: &str, username: &str, secret: &[u8]) -> String {
+    let issuer = percent_encode(issuer);
+    let username = percent_encode(username);
     format!(
         "otpauth://totp/{issuer}:{username}?secret={}&issuer={issuer}&algorithm=SHA1&digits={}&period={}",
         base32_encode(secret),
         TOTP_DIGITS,
         TOTP_STEP_SECS,
     )
+}
+
+/// Everything outside RFC 3986's *unreserved* set (`A-Za-z0-9-._~`).
+///
+/// The conservative direction: over-encoding a character that would have been
+/// safe costs two bytes in a URI nobody reads by hand, while under-encoding one
+/// is a parameter-injection bug. `:` is therefore encoded too — the one
+/// structural separator between issuer and account is written by
+/// [`totp_enrolment_uri`]'s own format string, outside the encoded components,
+/// so a `:` *inside* either of them cannot be mistaken for it.
+const URI_COMPONENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// Percent-encode `s` for use in a URI path segment or query value.
+///
+/// The account name is operator-chosen text that lands in the *label* (a path
+/// segment) and again in the query, and the Key URI Format requires the label
+/// to be percent-encoded. Without it a name carrying `?`, `&` or `=` appends
+/// parameters of its own: `x?secret=…&issuer=…` produces a URI with two
+/// `secret=` and two `issuer=` values, and an authenticator that takes the
+/// first enrols against the attacker's secret and attributes it to the
+/// attacker's issuer.
+///
+/// The issuer is a compile-time constant today (`TOTP_ISSUER`, the only value
+/// either production call site passes) and is encoded anyway, so it stays safe
+/// if it ever becomes configurable.
+///
+/// Unlike [`base32_encode`] beside it this is *not* hand-rolled, and the
+/// difference is worth stating because the two look like the same kind of
+/// problem. No base32 crate is in this build graph, whereas `percent-encoding`
+/// already is — `url` and `reqwest` both pull it, and this module is
+/// `std`-gated, so every target that can reach this function has already
+/// compiled it. There is no dependency edge to save, and this one closes an
+/// injection: an audited implementation is the conservative choice, not the
+/// indulgent one.
+fn percent_encode(s: &str) -> String {
+    percent_encoding::utf8_percent_encode(s, URI_COMPONENT).to_string()
 }
 
 /// A fresh invite token or registration handle: [`INVITE_SECRET_LEN`] bytes
@@ -1043,6 +1119,133 @@ mod tests {
         assert!(uri.contains(&format!("secret={secret}")));
 
         assert_eq!(user.without_totp().totp_enrolment_uri("wayfinder"), None);
+    }
+
+    /// A username is operator-chosen text that lands in both the *label* and
+    /// the *query* of an `otpauth://` URI. The Key URI Format requires the
+    /// label to be percent-encoded, and the query obviously cannot carry a raw
+    /// `&` or `=` — a name like `x?secret=…&issuer=…` would otherwise append
+    /// duplicate parameters, and an authenticator that takes first-wins enrols
+    /// against the attacker's secret and issuer rather than this node's.
+    ///
+    /// The assertion is on the *count* of each parameter, not on the presence
+    /// of the genuine one: the injected copies are what makes the URI
+    /// ambiguous, so a fix that merely appends the real values after the
+    /// forged ones would still be broken.
+    #[test]
+    fn the_enrolment_uri_percent_encodes_a_username_that_forges_parameters() {
+        let hostile = "x?secret=AAAAAAAA&issuer=Evil&";
+        let user = UserRecord::new(hostile, "hunter2", UserRole::Admin, 3600).unwrap();
+        let uri = user.totp_enrolment_uri("wayfinder").unwrap();
+
+        assert_eq!(
+            uri.matches("secret=").count(),
+            1,
+            "exactly one secret= parameter, not the injected one too: {uri}"
+        );
+        assert_eq!(
+            uri.matches("issuer=").count(),
+            1,
+            "exactly one issuer= parameter: {uri}"
+        );
+        assert!(
+            !uri.contains("issuer=Evil"),
+            "the injected issuer must not survive encoding: {uri}"
+        );
+
+        // The genuine values are still the ones present, and still readable.
+        let secret = base32_encode(user.totp_secret.as_ref().unwrap());
+        assert!(uri.contains(&format!("secret={secret}")), "{uri}");
+        assert!(uri.contains("issuer=wayfinder"), "{uri}");
+
+        // The label keeps its one structural `:` between issuer and account,
+        // and the name's own delimiters are encoded rather than dropped.
+        let label = uri
+            .strip_prefix("otpauth://totp/")
+            .and_then(|rest| rest.split('?').next())
+            .expect("a label before the query");
+        assert_eq!(
+            label.matches(':').count(),
+            1,
+            "one issuer:account separator: {label}"
+        );
+        assert!(label.starts_with("wayfinder:"), "{label}");
+        assert_eq!(
+            label, "wayfinder:x%3Fsecret%3DAAAAAAAA%26issuer%3DEvil%26",
+            "the label is the encoded name, exactly — an encoder that dropped \
+             the offending bytes rather than encoding them would satisfy every \
+             assertion above and lose the account's name"
+        );
+    }
+
+    /// The encoder itself, against the vectors its doc comment claims.
+    ///
+    /// Reached directly rather than only through a URI, for the reason
+    /// `base32_matches_the_rfc_4648_vectors` beside it exists: the two tests
+    /// above assert that forged parameters do not *survive*, which a mangling
+    /// encoder also satisfies. This pins the output, so an encoder that dropped
+    /// bytes or iterated `chars()` and cast to `u8` — which would garble every
+    /// non-ASCII name while leaving both those tests green — fails here.
+    #[test]
+    fn percent_encode_matches_rfc_3986_unreserved() {
+        for (input, expected) in [
+            ("", ""),
+            // The unreserved set passes through untouched. An over-broad
+            // catch-all arm shows up here and nowhere else.
+            ("plain-name_1.0~", "plain-name_1.0~"),
+            ("AZaz09", "AZaz09"),
+            // Bytes, not chars: é is two bytes and encodes as two triplets.
+            ("rené", "ren%C3%A9"),
+            ("日本", "%E6%97%A5%E6%9C%AC"),
+            // The deliberate one: `:` is encoded even though the URI's own
+            // separator is a colon, because that separator is written outside
+            // the encoded components.
+            ("a:b", "a%3Ab"),
+            ("?&=/#", "%3F%26%3D%2F%23"),
+            (" ", "%20"),
+        ] {
+            assert_eq!(percent_encode(input), expected, "encoding {input:?}");
+        }
+    }
+
+    /// The issuer is encoded too, not just the account name.
+    ///
+    /// It is a compile-time constant at both production call sites today, but
+    /// `totp_enrolment_uri` is `pub` and takes any `&str`, so the injection is
+    /// one future caller away. Cheaper to pin now than to rediscover.
+    #[test]
+    fn the_enrolment_uri_percent_encodes_the_issuer_too() {
+        let user = UserRecord::new("ops", "hunter2", UserRole::Admin, 3600).unwrap();
+        let uri = user
+            .totp_enrolment_uri("evil?secret=BBBBBBBB&issuer=Nope")
+            .unwrap();
+
+        assert_eq!(uri.matches("secret=").count(), 1, "{uri}");
+        assert_eq!(uri.matches("issuer=").count(), 1, "{uri}");
+        assert!(!uri.contains("issuer=Nope"), "{uri}");
+    }
+
+    /// The same encoding, reached through the other constructor: an invite
+    /// carries a second factor before any account exists, so its URI is built
+    /// from a name that has passed exactly the same (absent) validation.
+    #[test]
+    fn an_invite_uri_percent_encodes_its_username_too() {
+        let invite = UserInvite::new(
+            "a&b=c",
+            UserRole::Viewer,
+            3600,
+            invite_token_hash(&generate_invite_secret()),
+            1_700_000_000,
+            1_700_086_400,
+        );
+        let uri = invite.totp_enrolment_uri("wayfinder");
+
+        assert_eq!(uri.matches("issuer=").count(), 1, "{uri}");
+        assert_eq!(uri.matches("secret=").count(), 1, "{uri}");
+        assert!(
+            !uri.contains("a&b=c"),
+            "the raw name must not survive: {uri}"
+        );
     }
 
     /// RFC 4648 base32 vectors, unpadded.
