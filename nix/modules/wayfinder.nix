@@ -9,6 +9,11 @@
 # same flake's `overlays.default`; pull them in separately if you want the
 # packages without the module.
 #
+# `services.wayfinder.packetCapture` puts `tshark` and `termshark` on the node
+# with the repo's own dissector (`libs/wayfinder-shark`) already loaded, so a
+# capture decodes as OGMs and TVLVs. On by default; see the option for what it
+# costs and for the privilege it deliberately does not grant.
+#
 # `services.wayfinder.web` runs the browser dashboard. It is independent of
 # `services.wayfinder.enable` — it speaks to a node over the management API, so
 # it can equally be pointed at a node on another host — but the common case is
@@ -96,6 +101,36 @@ in
         added at runtime through `SetConfig` that the startup config does not
         name. Turning it off for a node that does need it fails at startup, when
         the device or socket cannot be created.
+      '';
+    };
+
+    packetCapture = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Whether to install `tshark` and `termshark` carrying the Wayfinder
+        dissector (`libs/wayfinder-shark`), so a capture taken on a node
+        decodes as OGMs, TVLVs and cert-control packets rather than as an
+        unstructured Ethernet payload.
+
+        On by default because a node is where the frames are, and a mesh
+        problem is usually only visible on the wire. Turn it off where the
+        ~380MB the two closures add to the system matters more than being able
+        to look — a cloud certificate authority, say, whose only socket is a
+        TCP listener.
+
+        The two binaries carry the stock names and take precedence over the
+        plain `wireshark-cli`/`termshark` packages if a system installs those
+        as well, so `tshark` means the one with the dissector either way. The
+        rest of the Wireshark CLI suite comes with them — `dumpcap`, which
+        tshark spawns for every live capture, plus `editcap`, `capinfos`,
+        `mergecap` and the others.
+
+        Reading a capture needs no privilege; taking one live does. This
+        module deliberately does not grant it — set
+        `programs.wireshark.enable = true` (a setcap `dumpcap` wrapper and a
+        `wireshark` group to join) where an operator captures on the node
+        itself.
       '';
     };
 
@@ -450,6 +485,10 @@ in
       environment.systemPackages = [
         wayfinder-tui
         wayfinder-ctl
+      ]
+      ++ lib.optionals wayfinderCfg.packetCapture [
+        wayfinder-tshark
+        wayfinder-termshark
       ];
 
       # Only a node that creates a kernel TAP needs the character device to be

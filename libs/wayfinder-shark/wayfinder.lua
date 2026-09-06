@@ -22,6 +22,19 @@
 --       tshark -o wayfinder.carrier_ethertype:0x88b5 ...
 --     Set it empty to claim only 0x4305.
 --
+-- A third case reaches a capture with no EtherType of its own at all. The `Udp`
+-- and `UdpMulti` link transports (libs/wayfinder-driver/src/net.rs) carry the
+-- whole LinkFrame — the same 14-byte [dst][src][protocol] header
+-- `frame_into_buf` writes for every carrier — inside a UDP *payload*, so the
+-- frame arrives wrapped in Ethernet/IP/UDP and nothing in the ethertype table
+-- can reach it. Those are claimed by a heuristic on the datagram's own shape
+-- rather than by port, because there is no canonical mesh UDP port: this repo
+-- alone uses 6000 (nix/machines/wayfinder-ca) and 9191/9192
+-- (var/conf/peer.yml), and it is a per-link config value everywhere else. The
+-- heuristic requires the mesh protocol at the header's protocol offset *and* a
+-- known packet type after it, which is specific enough to leave unrelated UDP
+-- traffic alone.
+--
 -- Decodes the BatmanOgmPacket fixed header (see libs/batman/src/wire.rs) and
 -- walks the TVLV tail into individual records: multicast membership, the
 -- Wayfinder membership certificate (WF_TVLV_CERT), the originator signature
@@ -41,6 +54,18 @@
 --     per-version subdirectory under it:
 --       ln -s "$PWD/wayfinder.lua" ~/.local/lib/wireshark/plugins/4.6/
 --   * Ad hoc, for a one-off capture:  tshark -X lua_script:wayfinder.lua ...
+--
+-- Neither of those works as root, and both fail quietly. tshark treats a real
+-- uid of 0 as "started with special privileges", which skips the personal
+-- plugin folder and every `-X lua_script:`, and makes it ignore
+-- `WIRESHARK_PLUGIN_DIR` as well. What still loads is the plugin directory of
+-- tshark's own install prefix — so a privileged capture needs the dissector to
+-- sit beside the binary rather than beside the user.
+--
+-- On NixOS that is already arranged: `services.wayfinder.enable` installs a
+-- `tshark` and a `termshark` carrying this file (see `packetCapture` in
+-- `nix/modules/wayfinder.nix`, and `wayfinder-tshark` in `nix/default.nix` for
+-- how the prefix is built).
 --
 -- Capturing live needs CAP_NET_RAW on `dumpcap`, which a read-only Nix store
 -- can't be granted with `setcap`; on NixOS set `programs.wireshark.enable =
@@ -111,6 +136,15 @@ f.reserved = ProtoField.uint8("wayfinder.originator.reserved", "Reserved", base.
 f.tq = ProtoField.uint8("wayfinder.originator.tq", "Transmission Quality", base.DEC)
 f.tvlv_len = ProtoField.uint16("wayfinder.originator.tvlv_len", "TVLV Length", base.DEC)
 f.tvlv = ProtoField.bytes("wayfinder.originator.tvlv", "TVLV Data")
+
+-- The encapsulating LinkFrame header, decoded only on the UDP-carried path.
+-- Over an EtherType these three fields are Wireshark's own `eth` dissector's
+-- job; inside a UDP datagram nothing else decodes them, and they are the only
+-- record of which mesh node sent the frame — the address columns show the
+-- transport endpoints instead.
+f.link_dst = ProtoField.ether("wayfinder.link.dst", "Link Destination")
+f.link_src = ProtoField.ether("wayfinder.link.src", "Link Source")
+f.link_protocol = ProtoField.uint16("wayfinder.link.protocol", "Mesh Protocol", base.HEX)
 
 -- Per-record TVLV fields (the tail walked into individual records).
 f.tvlv_record = ProtoField.bytes("wayfinder.tvlv.record", "TVLV Record")
@@ -193,6 +227,17 @@ f.revoke_mac = ProtoField.ether("wayfinder.tvlv.revoke.node_mac", "Revoked Node 
 f.revoke_nb = ProtoField.uint64("wayfinder.tvlv.revoke.not_before", "Effective / Issuance Cut-off", base.DEC)
 f.revoke_na = ProtoField.uint64("wayfinder.tvlv.revoke.not_after", "Not After", base.DEC)
 f.revoke_sig = ProtoField.bytes("wayfinder.tvlv.revoke.signature", "Root Signature")
+
+-- Offsets within the LinkFrame header that a UDP datagram encapsulates. Byte
+-- for byte an Ethernet header, because that is what `frame_into_buf` writes
+-- (libs/interfaces/src/wire.rs) — the mesh protocol sits where an EtherType
+-- would.
+local LINK_FRAME = {
+	DST = 0, -- 6 bytes
+	SRC = 6, -- 6 bytes
+	PROTOCOL = 12, -- u16, big-endian
+	HEADER_LEN = 14,
+}
 
 -- Offsets of the fixed BatmanOgmPacket fields (the wire form of an Originator
 -- packet) within the BATMAN body. Kept in sync with libs/batman/src/wire.rs.
@@ -481,6 +526,51 @@ function wayfinder.dissector(tvb, pinfo, root)
 
 	return len
 end
+
+-- Decode a UDP datagram carrying an encapsulated LinkFrame, if it is one.
+--
+-- Registered as a heuristic rather than on a port (see the module header for
+-- why), so this runs against every UDP datagram in a capture and its job is as
+-- much to *decline* as to claim. Two things have to hold: the protocol field
+-- of the encapsulated header is the mesh protocol, and the byte after that
+-- header is a packet type this dissector knows. The carrier EtherType is
+-- deliberately not accepted here — a UDP port is already the demux, so these
+-- transports have no wire-vs-mesh protocol split and always write
+-- `data.protocol` itself (`UdpMultiLink::send`, `Link::send`).
+--
+-- Returns true when the datagram was claimed, so Wireshark stops offering it
+-- to further heuristics.
+local function dissect_udp_frame(tvb, pinfo, root)
+	local len = tvb:len()
+	if len <= LINK_FRAME.HEADER_LEN then
+		return false
+	end
+	if tvb(LINK_FRAME.PROTOCOL, 2):uint() ~= ETH_P_BATMAN then
+		return false
+	end
+	if not PACKET_TYPES[tvb(LINK_FRAME.HEADER_LEN, 1):uint()] then
+		return false
+	end
+
+	local tree = root:add(wayfinder, tvb(0, LINK_FRAME.HEADER_LEN), "Wayfinder Link Frame")
+	tree:add(f.link_dst, tvb(LINK_FRAME.DST, 6))
+	tree:add(f.link_src, tvb(LINK_FRAME.SRC, 6))
+	tree:add(f.link_protocol, tvb(LINK_FRAME.PROTOCOL, 2))
+
+	-- The body is the same bytes an EtherType-carried frame hands over, so it
+	-- goes through the one dissector rather than a second partial copy of it.
+	wayfinder.dissector(tvb(LINK_FRAME.HEADER_LEN):tvb(), pinfo, root)
+
+	-- The address columns hold the IP endpoints on this path, so the mesh
+	-- addresses — which are what a reader is actually following through the
+	-- capture — are appended to the info the body dissector just set.
+	pinfo.cols.info:append(
+		string.format("  %s > %s", tostring(tvb(LINK_FRAME.SRC, 6):ether()), tostring(tvb(LINK_FRAME.DST, 6):ether()))
+	)
+	return true
+end
+
+wayfinder:register_heuristic("udp", dissect_udp_frame)
 
 -- Registration. The mesh protocol is claimed unconditionally; the configurable
 -- carrier label is claimed on top of it, and re-claimed whenever the preference
