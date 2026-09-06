@@ -1750,6 +1750,43 @@ message NodeMetrics {
   // hop this node cannot authenticate to — a peer whose certificate lapsed, or
   // an outsider that got itself into the path. Zero when auth is disabled.
   double untaggable_drop_rate = 19;
+
+  // Count of sequence-number high-waters this node has resynchronised —
+  // occasions it concluded that its own recorded state, rather than the frame
+  // in front of it, was what was wrong. Covers both the flooded-broadcast dedup
+  // high-water and an originator's OGM high-water.
+  //
+  // A count rather than a rate, unlike the throughput figures above: a
+  // correction cannot fire more often than a 30-second protection window, so a
+  // smoothed rate would read zero at nearly every poll. A slow climb is
+  // ordinary — a member that rebooted re-emits low sequence numbers, and this
+  // is the mechanism that lets it back in. A fast climb means something is
+  // repeatedly pushing a high-water out of band, which an outsider can do by
+  // replaying one captured frame.
+  uint32 seqno_resyncs = 20;
+
+  // Count of OGMs this node declined to re-flood because the originator's
+  // high-water was under correction at the time.
+  //
+  // The one figure here that names a harm this node does to *others* rather
+  // than suffers itself: while it is climbing, this node still routes to that
+  // member but stops passing the member's OGMs on, so every node behind this
+  // one loses the route with nothing on their own side to explain it. Ordinary
+  // duplicates are not counted — only frames refused while a correction is in
+  // flight.
+  uint32 ogm_refloods_suppressed = 21;
+
+  // Count of next-hop proofs dropped because the pairwise key they were
+  // answered with stopped being usable — a neighbor's certificate lapsing, a
+  // revocation, or its entry being pushed out of a full key cache.
+  //
+  // A proof is worth no more than this node's ability to still use the key
+  // behind it. When the two disagree, route selection keeps choosing a next hop
+  // the data plane cannot authenticate to, and the route reports healthy while
+  // every frame over it is dropped. A steady climb means neighbor certificates
+  // are lapsing without renewal, or the key cache is churning under pressure.
+  // Zero when auth is disabled, which has no proofs to sweep.
+  uint32 proofs_swept = 22;
 }
 
 // Marker payload indicating the router would flood a packet out of every

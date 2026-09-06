@@ -1481,13 +1481,9 @@ what stopped being true.
 
 ### Deliberately not done here
 
-- **No counter for a resync firing, or for re-flood suppressed under a
-  correction.** Both are things §7's argument says an operator should be able to
-  see — a node concluding its own record was wrong is exactly the kind of event
-  a metric exists for — and neither is observable today beyond a `trace!`. It is
-  a separable change (`add-metric`'s proto → adapter → client → TUI path) rather
-  than part of this one, and it should cover the broadcast space too, which has
-  been equally silent since §8's item 6.
+- ~~**No counter for a resync firing, or for re-flood suppressed under a
+  correction.**~~ **Shipped since**, as `seqno_resyncs` and
+  `ogm_refloods_suppressed` on `NodeMetrics` — see §10.
 - **`SeqnoBands` and `admit_seqno` are crate-private rather than wrapped in a
   per-space gate type.** A `OgmSeqnoGate`/`BroadcastSeqnoEntry` pair owning the
   `(high-water, watch)` couple would make "judged by the wrong bands" a compile
@@ -1549,3 +1545,54 @@ for benchmark fixtures.
 | `libs/batman/src/lib.rs` | §8.11 | `SeqnoBands`/`admit_seqno` (the shared three-arm decision, `BroadcastSeqnoEntry::admit` delegating to it), the `OGM_SEQNO_*` bands, `OriginatorRecord::resync_watch` — done |
 | `libs/batman/src/engine.rs` | §8.11 | `handle_ogm`: the high-water gates re-flooding and membership freshness; path learning and selection are judged separately; a first sighting seeds — done |
 | `libs/wayfinder-test/src/integration_tests.rs` | §8.11 | the two `cert_fetch_round_trip_*` tests derive their injected seqno from the relay's high-water — done |
+| `libs/batman/src/lib.rs`, `libs/batman/src/engine.rs` | §10 | the three counters, their accessors, and the recording sites; `BroadcastSeqnoEntry::admit` returns its admission so both seqno spaces count alike — done |
+| `libs/wayfinder-protos` | §10 | `NodeMetrics` fields 20–22 and the `NodeMetricsData` dispatch — done |
+| `libs/wayfinder-server/src/adapter.rs` | §10 | the projection, and the test for it — the smoke test answers from a `Mock`, so it cannot reach this layer — done |
+| `bins/wayfinder-ctl/src/output.rs`, `bins/wayfinder-tui/src/ui.rs` | §10 | CLI and TUI rendering — done |
+
+---
+
+## 10. Observability for the three residuals
+
+Added after §8.10 and §8.11 shipped, because both closed their gap while leaving
+a *residual* an operator could not see — and each review of those changes asked
+for the same thing independently, which is usually the signal that the answer is
+one piece of work rather than three afterthoughts.
+
+Three counters on `NodeMetrics`, all fed from state in the `no_std` core so an
+embedded node reports them with no host-side tally:
+
+| Field | What it names | Whose problem it is |
+|---|---|---|
+| `seqno_resyncs` | this node concluded its *own* record was wrong and threw it away | its own — usually benign (a member rebooted), fast-growing only under a sustained replay |
+| `ogm_refloods_suppressed` | OGMs it declined to pass on while a high-water was under correction | **everyone behind it** — they lose the route with nothing on their side to explain it |
+| `proofs_swept` | proofs dropped because the key behind them went | its own — lapsing certificates, or a key cache churning under pressure |
+
+`seqno_resyncs` counts **both** sequence-number spaces. The broadcast one has
+been equally silent since §8's item 6, and since both are judged by one
+`admit_seqno` there is no honest way to instrument one and not the other. That
+is what made `BroadcastSeqnoEntry::admit` return its `SeqnoAdmission` instead of
+a bare "flood it": the resync fact was being discarded at the one place the two
+spaces can be counted alike.
+
+**Counts, not rates, against this repo's default.** `RateEstimator`'s memory is
+five seconds (`RATE_TAU_SECS`), and these events are bounded by a thirty-second
+protection window or by key evictions minutes apart — a smoothed rate would read
+zero at nearly every poll, so an operator would see nothing at all unless they
+sampled within a few seconds of the event. The existing `oversize_drops`
+counters already make this distinction: rates for traffic, counts for rare
+faults. The reasoning is repeated at the accessor, the proto field and the TUI
+row, because it reads as an oversight otherwise.
+
+**What is still not covered.** The two eviction paths that *cause* a swept proof
+— `evict_expired_neighbors` and `cache_neighbor`'s full-table overwrite — are
+reported at their branch point only as a `debug!` and, for the saturation case,
+not at all. `AlarmKind::TableSaturation` exists and is the right instrument for
+the second, since the alarm board coalesces where a log line floods; that is a
+change to `auth.rs`'s eviction policy reporting rather than to this metric path,
+and it is not done here.
+
+Not surfaced on the web dashboard's metrics tab, which shows a curated subset
+that already excludes the sibling drop counters (`untaggable_drop_rate`,
+`oversize_drops`) — three fault counters do not belong on the view built for
+non-technical users while their siblings are absent from it.

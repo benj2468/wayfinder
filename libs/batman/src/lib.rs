@@ -367,8 +367,13 @@ impl SeqnoBands {
 /// wrote the high-water" would be describing a state this machine never enters.
 /// Each variant also carries exactly what a caller needs to act without
 /// re-deriving the classification for itself.
+///
+/// Public, unlike the [`SeqnoBands`] and [`admit_seqno`] that produce it: this
+/// is a verdict a caller *reads*, so it carries none of the misuse risk that
+/// keeps those crate-private, and both sequence-number spaces report their
+/// [`Resynchronised`](Self::Resynchronised) outcome through it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SeqnoAdmission {
+pub enum SeqnoAdmission {
     /// The high-water advanced to this number: genuinely newer than anything
     /// seen from this originator.
     Advanced,
@@ -399,7 +404,7 @@ pub(crate) enum SeqnoAdmission {
 
 impl SeqnoAdmission {
     /// Whether the high-water now holds this frame's number.
-    pub(crate) fn advanced(&self) -> bool {
+    pub fn advanced(&self) -> bool {
         matches!(
             self,
             Self::Advanced
@@ -413,7 +418,7 @@ impl SeqnoAdmission {
     /// resynchronisation, whether or not the frame that tripped it was then
     /// admitted. Callers keeping an eviction stamp beside the high-water use
     /// this to decide whether to restamp it.
-    pub(crate) fn high_water_written(&self) -> bool {
+    pub fn high_water_written(&self) -> bool {
         matches!(self, Self::Advanced | Self::Resynchronised { .. })
     }
 
@@ -421,13 +426,13 @@ impl SeqnoAdmission {
     /// merely observes — may be believed: it is either the newest thing this
     /// originator has sent or an exact copy of it. False for a straggler and
     /// for anything judged against a high-water still under correction.
-    pub(crate) fn contents_are_current(&self) -> bool {
+    pub fn contents_are_current(&self) -> bool {
         self.advanced() || matches!(self, Self::Duplicate { exact: true })
     }
 
     /// Whether this frame is a stale copy of something already seen, and so
     /// carries no evidence about the topology worth acting on.
-    pub(crate) fn is_stale_copy(&self) -> bool {
+    pub fn is_stale_copy(&self) -> bool {
         matches!(self, Self::Duplicate { exact: false })
     }
 }
@@ -512,15 +517,20 @@ impl BroadcastSeqnoEntry {
         SeqnoBands::BROADCAST.classify(self.last_seqno, seqno)
     }
 
-    /// Fold `seqno` into this entry and report whether the frame carrying it
-    /// should be flooded onward. `false` means drop it.
+    /// Fold `seqno` into this entry and report what was done — flood the frame
+    /// onward only when the result [`advanced`](SeqnoAdmission::advanced).
     ///
     /// The decision itself is [`admit_seqno`], shared with the OGM high-water;
     /// what this adds is the eviction stamp, which is restamped whenever the
     /// high-water is *written* and left alone otherwise — see
     /// [`last_updated`](Self::last_updated) for why a non-advancing frame must
     /// not be able to touch it.
-    pub fn admit(&mut self, seqno: u32, now: Duration) -> bool {
+    ///
+    /// Returns the whole admission rather than a bare "flood it": a
+    /// resynchronisation is this node concluding its own recorded state was
+    /// wrong, which is worth counting, and a `bool` would throw that away at
+    /// the one place both spaces can be counted alike.
+    pub fn admit(&mut self, seqno: u32, now: Duration) -> SeqnoAdmission {
         let admission = admit_seqno(
             &mut self.last_seqno,
             &mut self.resync_watch,
@@ -531,7 +541,7 @@ impl BroadcastSeqnoEntry {
         if admission.high_water_written() {
             self.last_updated = now;
         }
-        admission.advanced()
+        admission
     }
 }
 
@@ -779,6 +789,44 @@ pub struct BatmanEngine<
     /// never answers, so the duty-cycle budget in
     /// `docs/design/implemented/09-mesh-auth-gaps.md` is unchanged.
     pub(crate) challenged: FnvIndexMap<Mac, (Duration, u32), MAX_ORIGINATORS>,
+    /// How many times this node has resynchronised a sequence-number
+    /// high-water — concluded that its own recorded state, not the frame in
+    /// front of it, was the thing that was wrong.
+    ///
+    /// Counts both spaces: a flooded broadcast's dedup high-water and an
+    /// originator's OGM high-water, which share one decision
+    /// ([`admit_seqno`]) and one failure mode. A correction is bounded by the
+    /// bands' reset protection, so this is a slow counter by construction; a
+    /// *fast*-growing one means something is repeatedly pushing a high-water
+    /// out of band — an originator flapping, or an outsider replaying a
+    /// captured frame to hold it there (`docs/design/implemented/`
+    /// `09-mesh-auth-gaps.md` §8.11).
+    ///
+    /// A count rather than a [`RateEstimator`](crate::) — see the accessor.
+    pub(crate) seqno_resyncs: u32,
+    /// How many OGMs this node declined to re-flood because the originator's
+    /// high-water was under correction at the time.
+    ///
+    /// The residual §8.11 leaves standing, made visible: while a wrong
+    /// high-water is being corrected, this node keeps routing to that member
+    /// itself but stops propagating its OGMs, so nodes *behind* this one lose
+    /// the route and nothing on their side can say why. This is the counter
+    /// that names it on the node actually doing the suppressing.
+    ///
+    /// Deliberately not incremented for an ordinary duplicate, which is the
+    /// common case and carries no information — only for a frame refused while
+    /// a resync watch is open.
+    pub(crate) ogm_refloods_suppressed: u32,
+    /// How many next-hop proofs this node has dropped because the pairwise key
+    /// they were answered with is no longer usable.
+    ///
+    /// The event `docs/design/implemented/09-mesh-auth-gaps.md` §8.10 exists
+    /// for: a proof is worth no more than this node's ability to still use the
+    /// key behind it, and when the two disagree the route reports healthy while
+    /// the traffic over it vanishes. A steady climb means neighbour
+    /// certificates are lapsing without renewal, or the neighbour key cache is
+    /// churning under pressure — different remedies, but both start here.
+    pub(crate) proofs_swept: u32,
     /// Whether a next hop must have proven itself to be selectable.
     ///
     /// Off by default and set by the router when mesh authentication is
@@ -859,6 +907,9 @@ impl<
             ogm_timers: HVec::new(),
             keepalive: FnvIndexMap::new(),
             proven: FnvIndexMap::new(),
+            seqno_resyncs: 0,
+            ogm_refloods_suppressed: 0,
+            proofs_swept: 0,
             challenged: FnvIndexMap::new(),
             require_proof: false,
             keepalive_timers: HVec::new(),

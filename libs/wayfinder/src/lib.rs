@@ -847,6 +847,42 @@ impl<
         self.batman.relay_oversize_drops()
     }
 
+    /// How many sequence-number high-waters this node has resynchronised —
+    /// concluded its own recorded state, rather than the frame in front of it,
+    /// was what was wrong. Covers both the broadcast and OGM spaces.
+    ///
+    /// A correction is bounded by a 30-second protection window, so a slow
+    /// climb is ordinary (a member rebooting re-emits low sequence numbers). A
+    /// *fast* climb means something is repeatedly pushing a high-water out of
+    /// band — see `docs/design/implemented/09-mesh-auth-gaps.md` §8.11.
+    pub fn seqno_resyncs(&self) -> u32 {
+        self.batman.seqno_resyncs()
+    }
+
+    /// How many OGMs this node declined to re-flood while an originator's
+    /// high-water was under correction.
+    ///
+    /// The one signal that names a harm this node inflicts on *other* nodes
+    /// rather than suffers itself: while it is true, this node keeps its own
+    /// route to that member and stops propagating the member's OGMs, so
+    /// everything behind this node loses the route with nothing on their side
+    /// to explain it.
+    pub fn ogm_refloods_suppressed(&self) -> u32 {
+        self.batman.ogm_refloods_suppressed()
+    }
+
+    /// How many next-hop proofs this node has dropped because the pairwise key
+    /// they were answered with stopped being usable.
+    ///
+    /// A steady climb means neighbour certificates are lapsing without renewal,
+    /// or the neighbour key cache is churning under pressure — different
+    /// remedies, but both begin here. Zero when auth is disabled, which has no
+    /// proofs to sweep. See `docs/design/implemented/09-mesh-auth-gaps.md`
+    /// §8.10.
+    pub fn proofs_swept(&self) -> u32 {
+        self.batman.proofs_swept()
+    }
+
     /// Multicast destination groups this node routed but could not put on the
     /// wire — the rebuilt frame did not fit the transmit scratchpad, or the
     /// shell's staging refused it.

@@ -1644,6 +1644,15 @@ fn render_node_metrics(frame: &mut Frame, app: &App, area: Rect) {
                     "Untaggable drops",
                     &format!("{:.2}/s", m.untaggable_drop_rate),
                 ),
+                // Counts, not rates — a correction bounded by a 30s window
+                // cannot be read off a 5s-memory rate. Rendered bare so a
+                // reader is not invited to compare them with the rates above.
+                field("Seqno resyncs", &m.seqno_resyncs.to_string()),
+                field(
+                    "OGM refloods suppressed",
+                    &m.ogm_refloods_suppressed.to_string(),
+                ),
+                field("Proofs swept", &m.proofs_swept.to_string()),
             ]
         }
     };
@@ -2158,6 +2167,9 @@ mod tests {
             cert_req_rate: 0.5,
             cert_reply_rate: 1.5,
             untaggable_drop_rate: 0.0,
+            seqno_resyncs: 0,
+            ogm_refloods_suppressed: 0,
+            proofs_swept: 0,
             ..Default::default()
         });
         app.snapshot.keepalive = wayfinder_protos::wayfinder::v1alpha::KeepAliveTable {

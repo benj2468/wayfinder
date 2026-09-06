@@ -424,6 +424,21 @@ pub struct NodeMetricsData {
     /// pairwise key with their next hop — a silent drop from the sender's
     /// point of view, and the only signal it is happening.
     pub untaggable_drop_rate: f64,
+    /// Count of sequence-number high-waters this node has resynchronised, over
+    /// both the broadcast and OGM spaces — occasions it concluded its own
+    /// recorded state, not the frame in front of it, was what was wrong.
+    ///
+    /// A count rather than a rate because a correction is bounded by a
+    /// 30-second protection window, which a five-second smoothing memory cannot
+    /// represent.
+    pub seqno_resyncs: u32,
+    /// Count of OGMs not re-flooded because the originator's high-water was
+    /// under correction — the harm this node does to the nodes behind it while
+    /// it keeps routing to that member itself.
+    pub ogm_refloods_suppressed: u32,
+    /// Count of next-hop proofs dropped because the pairwise key they were
+    /// answered with stopped being usable. Zero when auth is disabled.
+    pub proofs_swept: u32,
 }
 
 /// Egress decision a router would make for a destination.  Mirrors
@@ -1872,6 +1887,9 @@ pub fn handle_router_read<P: RouterReads + ?Sized>(
                 cert_req_rate: m.cert_req_rate,
                 cert_reply_rate: m.cert_reply_rate,
                 untaggable_drop_rate: m.untaggable_drop_rate,
+                seqno_resyncs: m.seqno_resyncs,
+                ogm_refloods_suppressed: m.ogm_refloods_suppressed,
+                proofs_swept: m.proofs_swept,
             })
         }
         Some(RequestKind::GetSecurityStatus(_)) => {
@@ -3846,6 +3864,9 @@ mod tests {
                 cert_req_rate: 0.5,
                 cert_reply_rate: 1.25,
                 untaggable_drop_rate: 0.75,
+                seqno_resyncs: 7,
+                ogm_refloods_suppressed: 11,
+                proofs_swept: 3,
             },
             ..Default::default()
         };
@@ -3870,6 +3891,9 @@ mod tests {
                 assert_eq!(m.cert_req_rate, 0.5);
                 assert_eq!(m.cert_reply_rate, 1.25);
                 assert_eq!(m.untaggable_drop_rate, 0.75);
+                assert_eq!(m.seqno_resyncs, 7);
+                assert_eq!(m.ogm_refloods_suppressed, 11);
+                assert_eq!(m.proofs_swept, 3);
             }
             other => panic!("expected Metrics, got {:?}", proto_kind_name(&other)),
         }
