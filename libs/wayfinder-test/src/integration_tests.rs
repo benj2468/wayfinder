@@ -2535,8 +2535,8 @@ fn to_lazy_ogm(buf: &[u8], hdr_len: usize) -> Vec<u8> {
 ///
 /// A far-ahead literal would land outside [`batman::OGM_SEQNO_WINDOW`] and be
 /// treated as evidence against the *high-water* rather than as a fresh OGM, so
-/// X would not re-flood it — see `docs/design/09-mesh-auth-gaps.md` §8.11 for
-/// why a leap a live originator could not have made is refused.
+/// X would not re-flood it — see `docs/design/implemented/09-mesh-auth-gaps.md`
+/// §8.11 for why a leap a live originator could not have made is refused.
 fn next_seqno_after_relay(harness: &TestHarness, relay: &str, orig: Mac) -> u32 {
     harness
         .get_machine(relay)

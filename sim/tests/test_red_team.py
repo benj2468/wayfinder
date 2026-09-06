@@ -10,7 +10,7 @@ when that API moves, and nothing would notice until someone ran it by hand.
 
 What is asserted here is the *report*: that every attack still runs to a
 verdict, and that each verdict matches the baseline recorded in
-``docs/design/09-mesh-auth-gaps.md``. A newly-succeeding attack fails the
+``docs/design/implemented/09-mesh-auth-gaps.md``. A newly-succeeding attack fails the
 suite — and so does a fix, which is the point: closing a gap should flip the
 verdict, the doc and this baseline in one change.
 
@@ -84,7 +84,7 @@ BASELINE = {
     "attack_forged_response_reaches_proof_handler": red_team.HELD,
     "attack_challenge_nonce_is_unpredictable": red_team.HELD,
     "attack_captured_challenge_replayed": red_team.HELD,
-    "attack_proof_survives_key_eviction_window": red_team.GAP,
+    "attack_proof_survives_key_eviction_window": red_team.HELD,
     # --- 2026-08 sweep: revocation as a weapon ---
     "attack_forged_self_revocation_killswitch": red_team.HELD,
     "attack_self_revocation_replay_after_reenrollment": red_team.HELD,

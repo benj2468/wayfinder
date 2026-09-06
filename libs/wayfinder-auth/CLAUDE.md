@@ -44,7 +44,7 @@ worth knowing before you design against this:
   build a misissuance on purpose — so "the CA will sign it" and "a node will
   honour it" are deliberately different questions.
 
-See `docs/design/09-mesh-auth-gaps.md` §5.
+See `docs/design/implemented/09-mesh-auth-gaps.md` §5.
 
 ## Two mechanisms, chosen by fan-out
 

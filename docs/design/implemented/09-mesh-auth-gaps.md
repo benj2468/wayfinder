@@ -1,13 +1,16 @@
 # Design: Four gaps in mesh authentication, found by adversarial simulation
 
-**Status:** Proposed — partly shipped, so the doc stays here rather than in
-`implemented/` until the last gap below closes. Each gap is a separate,
-independently landable change; this document exists so they can be taken one at
-a time without re-deriving the analysis. Gaps 1, 2, 3 and **4** have shipped, as
-have §7's observability, the three later findings logged in §8.7–§8.9, and
-§8.11. One gap found by the 2026-08 sweep (§8.10) remains open and unscheduled.
-The instrument that found them all shipped in MR !113
-(`sim/scenarios/red_team.py`).
+**Status:** Implemented — every gap this document tracks has shipped. Each was
+a separate, independently landable change; the document exists so they could be
+taken one at a time without re-deriving the analysis, and it is kept as the
+record of *why* each was fixed the way it was. Gaps 1, 2, 3 and **4** shipped,
+as did §7's observability, the three later findings logged in §8.7–§8.9, and
+both findings from the 2026-08 sweep (§8.10, §8.11). The instrument that found
+them all shipped in MR !113 (`sim/scenarios/red_team.py`).
+
+Read the per-section notes before changing any of this code: several of the
+fixes have an obvious-looking simplification that was measured and rejected, and
+each says which.
 
 > **§4 supersedes part of §2 and §3.** A second round of measurement showed
 > gaps 1 and 2 to be one bug, and neither section's proposed fix closes it.
@@ -18,16 +21,16 @@ The instrument that found them all shipped in MR !113
 > did not predict; the fourth is the proof-starvation scare, which was a
 > mismeasurement rather than a gap.
 
-**Where the red team stands.** It runs 46 attacks and reports **42 held, 3 by
-design, 1 gap**. That gap is the open work this document tracks:
+**Where the red team stands.** It runs 46 attacks and reports **43 held, 3 by
+design, 0 gaps**. The three "by design" verdicts are not gaps in waiting: they
+are properties this mesh deliberately does not claim (no confidentiality, a
+revocation stamped in the same second as the certificate it cancels resolving
+toward revoked, and an unbounded certificate lifetime being accepted while
+active revocation remains the backstop). Each is argued where it is reported.
 
-| Attack | Section | What it is |
-|--------|---------|------------|
-| `attack_proof_survives_key_eviction_window` | §8.10 | the engine's `proven` table is not swept when a neighbor's key is evicted |
-
-`sim/tests/test_red_team.py`'s `BASELINE` is the authority on that count; this
-table follows it. A fix flips the verdict in `red_team.py`, in `BASELINE`, and
-here, together.
+`sim/tests/test_red_team.py`'s `BASELINE` is the authority on that count. A
+regression flips a verdict in `red_team.py` and fails `BASELINE`; a new finding
+is added to both and gets a section here.
 
 **Scope:** `libs/wayfinder/src/auth.rs` (`OgmAuth`: OGM verification, the
 neighbor-key cache, the directed-frame tag path), `libs/wayfinder-auth`
@@ -1196,7 +1199,7 @@ that works without a wall clock.
 
 ---
 
-## 8.10 A proof outlives the key it needs — **open**
+## 8.10 A proof outlives the key it needs — **fixed**
 
 Found by the 2026-08 next-hop-proof sweep. Not a consequence of gap 4, and not
 closed by anything above: it is an interaction *between* §6's fix and §4's, each
@@ -1231,32 +1234,84 @@ the width of the window: an application on top of the mesh is told it has a
 usable path, which is the thing §7 was added because operators could not
 otherwise see.
 
-### Direction
+### The fix — shipped 2026-09-05
 
-Not yet a design. The shape is that key eviction and proof invalidation should
-be one event rather than two, and the engine already does this everywhere else:
-`BatmanEngine::reset` clears `proven` and `challenged` on re-anchoring, and
-`revoke_originators` removes a revoked MAC from both — each with a comment
-saying in as many words that a proof answered under stale key material must not
-keep
-carrying data for `MAX_MISSED_PROOFS` more cycles. **Expiry is the one path that
-drops the key and leaves the proof standing**, which is the whole bug; it is a
-missing call rather than a new mechanism, and `evict_expired_neighbors` already
-knows exactly which MACs it dropped.
+Key eviction and proof invalidation are now one event, driven from the only
+place that can see both: `CentralRouter::set_auth_time`, which advances the
+certificate-validity clock and then reconciles the engine's `proven` table
+against what key material survived. Both driver shells that set that clock go
+through it; reaching past it to `auth_mut().set_time(..)` advances one half and
+not the other, which is precisely how the defect arose, and the method's doc
+says so.
 
-The awkward part is direction: the eviction happens in `OgmAuth`
-(`libs/wayfinder`) and the table lives in `BatmanEngine` (`libs/batman`), which
-does not depend on it — so the sweep has to be driven from whoever holds both,
-i.e. `CentralRouter`. Worth settling at the same time: whether the reverse
-direction needs anything, i.e. a proof lapsing while the key is still live (it
-does not blackhole — selection simply stops choosing the hop — so probably not).
+**Written as a reconciliation, not as an eviction handler.** The first cut of
+this design proposed passing the MACs `evict_expired_neighbors` dropped, on the
+grounds that it already knows exactly which ones it dropped. Sweeping instead on the *predicate* —
+`BatmanEngine::retain_proven(now, |mac| auth.has_live_key(mac))` — is both
+simpler and strictly stronger, because expiry turns out not to be the only way
+a key can go. A neighbour evicted from a full key cache loses its pairwise key
+with no expiry involved and produces the identical blackhole; an event-shaped
+fix would have closed the measured path and left that one open.
+`a_key_evicted_by_cache_pressure_takes_its_proof_too` pins that case, and fails
+if only expiry drives the sweep. It also needs no bounded buffer of pending
+evictions (which could overflow and lose one), and it is idempotent.
+
+Its cost is not free, though, and the first draft understated it: the outer pass
+is over `proven` (bounded by `MAX_ORIGINATORS`), but each entry costs a scan of
+`neighbors` (`MAX_NEIGHBOR_KEYS`), and on the tokio shell this runs per *frame*
+rather than per timer tick. So the sweep is gated on `OgmAuth::key_generation`,
+a counter bumped wherever a cached key stops being reachable — expiry,
+revocation, or the full-table overwrite. Steady state is one integer comparison;
+the scan happens only when something actually went. Note which paths bump it:
+gating on "did `set_time` evict anything" instead would have reopened the
+capacity-eviction hole this design exists to cover, since that eviction never
+runs through the clock at all.
+
+One limit on "strictly stronger", since it is easy to over-read: the
+reconciliation covers every way a key can go, but its only *trigger* is
+`set_auth_time`. A shell that never advances the auth clock never sweeps.
+`wayfinder-embedded-driver` is such a shell today — it wires no auth clock at
+all — so a board that enabled auth through `Driver::router_mut` would still hold
+the stale proof. No board wires mesh auth yet, so this does not bite; wiring the
+clock is what closes it, and is the same call the two host shells make.
+
+Two smaller decisions, both places the obvious move is wrong:
+
+- **The path survives; only the proof goes.** Unlike `revoke_originators`, this
+  does not delete the originator record. A lapsed member is not a shunned one —
+  it may renew — and keeping the path means renewal is one challenge away rather
+  than a rediscovery. What it must not keep is the *cached* `best_next_hop`, so
+  the sweep recomputes selection in the same call: that cache is what the
+  management API and the forwarding fast path read, and leaving it to the next
+  OGM or periodic sweep is the whole of the defect.
+- **`challenged` is deliberately left alone.** `revoke_originators` clears it,
+  but it can afford to — it deletes the record, so the MAC stops being a
+  challenge candidate at all. Here the neighbour stays a candidate, and
+  `challenged` is the retry *backoff*; a keyless neighbour is exactly one whose
+  challenges keep failing closed, so clearing it would un-throttle the retries
+  rather than tidy anything up. It clears itself the moment the neighbour proves
+  itself again.
+
+**The reverse direction needs nothing.** A proof lapsing while the key is still
+live does not blackhole: selection simply stops
+choosing the hop, the data plane never gets a frame to drop, and the next
+challenge renews it.
 
 ### Reproduced by
 
-`red_team.py::attack_proof_survives_key_eviction_window`, currently `GAP` in
-`sim/tests/test_red_team.py`'s `BASELINE`. No unit-level coverage yet; the
-interaction spans `libs/wayfinder/src/auth.rs` and `libs/batman/src/engine.rs`,
-so it needs a test that holds both.
+`red_team.py::attack_proof_survives_key_eviction_window`, which flips `GAP` →
+`HELD` (the route to the lapsed peer now clears within a second of its
+certificate expiring, and no sampled instant shows a current proof over an
+evicted key), with its `BASELINE` entry in `sim/tests/test_red_team.py`.
+
+Unit coverage holds both halves, as the interaction demands:
+`an_expired_neighbours_key_takes_its_next_hop_proof_with_it`
+(`libs/wayfinder/src/lib.rs`) drives a real certificate to expiry through
+`set_auth_time` and asserts the key, the proof and the cached next hop all go
+together. Three engine-level tests (`libs/batman/src/engine.rs`) pin the sweep
+itself: that it recomputes selection in the same call, that it falls back to a
+path whose key is still live rather than dropping the destination, and that it
+leaves the challenge backoff standing.
 
 ---
 
@@ -1487,7 +1542,10 @@ for benchmark fixtures.
 | `sim/scenarios/red_team.py` | all | verdicts flip `GAP` → `HELD` |
 | `sim/tests/test_red_team.py` | all | `BASELINE` flips with the verdicts it pins |
 | `libs/wayfinder-driver-core/src/lib.rs` | §8.7 | `required_proof` (named `requires_pairwise_tag` when §8.7 was written; replaced `is_cert_control`), applied by both `strip_directed` and `tag_directed_into` — done |
-| `libs/wayfinder/src/auth.rs`, `libs/batman/src/engine.rs` | §8.10 | sweep the engine's `proven` table when `evict_expired_neighbors` drops a key |
+| `libs/wayfinder/src/auth.rs` | §8.10 | `has_live_key` — the predicate the engine reconciles proofs against — done |
+| `libs/batman/src/engine.rs` | §8.10 | `retain_proven`: drop proofs whose key is gone and recompute selection in the same call — done |
+| `libs/wayfinder/src/lib.rs` | §8.10 | `set_auth_time` — the seam holding both halves, and the only correct way for a shell to set the auth clock — done |
+| `libs/wayfinder-driver/src/driver.rs`, `libs/wayfinder-tick-driver/src/lib.rs` | §8.10 | both shells that set the clock go through the router (the embedded shell sets none); each also records the local-send failure the sweep made reachable — done |
 | `libs/batman/src/lib.rs` | §8.11 | `SeqnoBands`/`admit_seqno` (the shared three-arm decision, `BroadcastSeqnoEntry::admit` delegating to it), the `OGM_SEQNO_*` bands, `OriginatorRecord::resync_watch` — done |
 | `libs/batman/src/engine.rs` | §8.11 | `handle_ogm`: the high-water gates re-flooding and membership freshness; path learning and selection are judged separately; a first sighting seeds — done |
 | `libs/wayfinder-test/src/integration_tests.rs` | §8.11 | the two `cert_fetch_round_trip_*` tests derive their injected seqno from the relay's high-water — done |

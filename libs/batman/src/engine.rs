@@ -920,6 +920,60 @@ impl<
         self.challenged.clear();
     }
 
+    /// Drop every next-hop proof whose neighbor `usable` no longer admits, and
+    /// recompute route selection against what is left.
+    ///
+    /// A proof is a claim about a neighbor that was answered *with a pairwise
+    /// key*, so it is only worth as much as this node's ability to still use
+    /// that key. When the key goes — a certificate lapsing, most often, but
+    /// equally an entry evicted from a full neighbor cache — the proof it
+    /// backed becomes a statement the data plane cannot act on, and leaving it
+    /// standing is worse than having no proof at all: selection keeps choosing
+    /// the hop while every directed frame over it is dropped at dispatch for
+    /// want of a key to tag it with. The route reports healthy and the traffic
+    /// vanishes (`docs/design/implemented/09-mesh-auth-gaps.md` §8.10).
+    ///
+    /// Written as a reconciliation against the key material rather than as a
+    /// handler for one eviction event, because the ways a key can go are not a
+    /// closed set and the two states must agree however it went. The engine
+    /// cannot judge `usable` itself — key material lives in `wayfinder`'s
+    /// `OgmAuth`, a crate this one does not depend on — so whoever holds both
+    /// supplies it; see `CentralRouter::set_auth_time`.
+    ///
+    /// `challenged` is deliberately left alone — unlike
+    /// [`revoke_originators`](Self::revoke_originators), which clears it and
+    /// can afford to, because it deletes the record and the MAC stops being a
+    /// challenge candidate at all. Here the neighbor stays a candidate, and
+    /// `challenged` is the retry *backoff*: a neighbor with no key is exactly
+    /// one whose challenges will keep failing closed, so clearing it would
+    /// un-throttle the retries rather than tidy anything up. It clears on its
+    /// own the moment the neighbor proves itself again
+    /// ([`note_proven`](Self::note_proven)).
+    pub fn retain_proven(&mut self, now: core::time::Duration, usable: impl Fn(Mac) -> bool) {
+        // Capacity matched to `proven`'s own, so the collect can never
+        // truncate. `heapless` truncates *silently*, and a truncated sweep
+        // would leave exactly the stale proofs this exists to remove — so if
+        // the two capacities are ever decoupled, this needs a different shape,
+        // not a bigger number.
+        let doomed: heapless::Vec<Mac, MAX_ORIGINATORS> = self
+            .proven
+            .keys()
+            .filter(|m| !usable(**m))
+            .copied()
+            .collect();
+        if doomed.is_empty() {
+            return;
+        }
+        for mac in &doomed {
+            debug!(neighbor = ?mac, "dropping next-hop proof: its key is gone");
+            self.proven.remove(mac);
+        }
+        // The cached next hop is what the management API and the forwarding
+        // fast path read, so it has to be re-derived here rather than left to
+        // the next OGM or periodic sweep — that gap is the whole defect.
+        self.recompute_all_best(now);
+    }
+
     /// Revoke all originators that have been marked as stale.
     pub fn revoke_originators(&mut self, revoked: impl Iterator<Item = Mac>) {
         for revoked_mac in revoked {
@@ -1052,12 +1106,13 @@ impl<
         // high-water is keyed on the originator named inside the OGM, not on the
         // forwarder, so anyone who can repeat a member's signed OGM writes it;
         // letting it decide path learning is what turned one replayed frame into
-        // a targeted route denial (`docs/design/09-mesh-auth-gaps.md` §8.11).
-        // The one exception is a number strictly behind the high-water but
-        // inside the reorder tolerance: that band is where a stale copy of
-        // something already seen is the likelier explanation, so the *frame* is
-        // what is disbelieved. Outside it — a leap too far forward, or far
-        // enough behind — the frame is admitted for topology purposes and
+        // a targeted route denial
+        // (`docs/design/implemented/09-mesh-auth-gaps.md` §8.11). The one
+        // exception is a number strictly behind the high-water but inside the
+        // reorder tolerance: that band is where a stale copy of something
+        // already seen is the likelier explanation, so the *frame* is what is
+        // disbelieved. Outside it — a leap too far forward, or far enough
+        // behind — the frame is admitted for topology purposes and
         // `admit_seqno` opens a run against the high-water; the run, not this
         // frame, is what eventually decides which of the two was wrong.
         //
@@ -2529,6 +2584,79 @@ mod tests {
         assert_eq!(engine.lookup_route(mac(2)), None);
     }
 
+    /// A proof whose key is gone is dropped, and the route it was holding up
+    /// is re-derived on the spot rather than at the next sweep.
+    ///
+    /// The cached `best_next_hop` is what the management API and the
+    /// forwarding fast path read, so leaving it standing until the next OGM is
+    /// the whole of §8.10: the route reports healthy while every directed frame
+    /// over it is dropped at dispatch for want of a key to tag it with.
+    #[test]
+    fn a_proof_whose_key_is_gone_is_dropped_and_the_route_recomputed() {
+        let mut engine = proving_engine();
+        engine.note_proven(core::time::Duration::ZERO, mac(2), 0);
+        feed(&mut engine, 0, &ogm_via(2, 2, 1, 255));
+        assert_eq!(engine.lookup_route(mac(2)), Some(mac(2)), "setup: routed");
+
+        engine.retain_proven(core::time::Duration::from_secs(1), |m| m != mac(2));
+
+        assert!(!engine.proof_current(core::time::Duration::from_secs(1), mac(2)));
+        assert_eq!(
+            engine.lookup_route(mac(2)),
+            None,
+            "the cached next hop must go in the same call, not at the next sweep"
+        );
+        assert!(
+            engine.originator_table.contains_key(&mac(2)),
+            "the path itself survives, so a renewed neighbor is re-challenged \
+             rather than rediscovered"
+        );
+    }
+
+    /// The sweep keeps a still-usable alternative rather than dropping the
+    /// destination outright.
+    #[test]
+    fn a_sweep_falls_back_to_a_path_whose_key_is_still_live() {
+        let mut engine = proving_engine();
+        engine.note_proven(core::time::Duration::ZERO, mac(2), 0);
+        engine.note_proven(core::time::Duration::ZERO, mac(3), 0);
+        // Two paths to originator 4, the one via 2 preferred on TQ.
+        feed(&mut engine, 0, &ogm_via(4, 2, 1, 255));
+        feed(&mut engine, 0, &ogm_via(4, 3, 1, 200));
+        assert_eq!(
+            engine.lookup_route(mac(4)),
+            Some(mac(2)),
+            "setup: best path"
+        );
+
+        engine.retain_proven(core::time::Duration::from_secs(1), |m| m != mac(2));
+
+        assert_eq!(
+            engine.lookup_route(mac(4)),
+            Some(mac(3)),
+            "the surviving proven path takes over immediately"
+        );
+    }
+
+    /// The sweep leaves the retry backoff alone.
+    ///
+    /// `challenged` is the throttle on re-probing, and a neighbor with no key
+    /// is exactly one whose challenges keep failing closed — clearing it would
+    /// un-throttle the retries rather than tidy anything up.
+    #[test]
+    fn a_sweep_does_not_reset_the_challenge_backoff() {
+        let mut engine = proving_engine();
+        engine.note_proven(core::time::Duration::ZERO, mac(2), 0);
+        engine.note_challenged(core::time::Duration::ZERO, mac(2));
+
+        engine.retain_proven(core::time::Duration::from_secs(1), |_| false);
+
+        assert!(
+            engine.challenged.contains_key(&mac(2)),
+            "the backoff survives the proof it outlived"
+        );
+    }
+
     /// Discovery still has to work, or there would be nobody to challenge:
     /// the record and its path are recorded, they are simply not selectable.
     #[test]
@@ -2548,7 +2676,7 @@ mod tests {
     }
 
     /// A replayed high sequence number must not deny a live originator its
-    /// route (`docs/design/09-mesh-auth-gaps.md` §8.11).
+    /// route (`docs/design/implemented/09-mesh-auth-gaps.md` §8.11).
     ///
     /// Eve holds no credential, so she cannot forge a sequence number — but she
     /// does not need to. She replays a *genuine* signed OGM she captured from
@@ -2985,7 +3113,7 @@ mod tests {
     /// Retrying from `i_min` and doubling keeps the steady-state cost
     /// unchanged — a neighbor that never answers still settles at one frame
     /// per `seed_interval`, the rate the duty-cycle budget in
-    /// `docs/design/09-mesh-auth-gaps.md` was written against.
+    /// `docs/design/implemented/09-mesh-auth-gaps.md` was written against.
     #[test]
     fn an_unanswered_challenge_is_retried_on_an_exponential_backoff() {
         let mut engine = proving_engine();

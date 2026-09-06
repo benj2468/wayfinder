@@ -495,6 +495,25 @@ pub struct OgmAuth<
     /// backed-off emission interval.  Drained by
     /// [`take_trickle_reset_hint`](Self::take_trickle_reset_hint).
     trickle_reset_hint: bool,
+    /// Bumped whenever a cached neighbor's keys stop being reachable under the
+    /// address they were reachable under — expiry, revocation, or a full-table
+    /// overwrite taking a live slot.
+    ///
+    /// Exists purely so a caller can skip work when nothing changed:
+    /// `CentralRouter::set_auth_time` reconciles the routing engine's next-hop
+    /// proofs against this cache on *every* pass of a driver loop (which on the
+    /// tokio shell is every frame), and that reconciliation is a scan of the
+    /// proof table with a `neighbors` lookup per entry. Comparing one integer
+    /// instead is the difference between paying that per frame and paying it
+    /// per actual eviction.
+    ///
+    /// Deliberately a counter rather than a `take`-style boolean hint like
+    /// [`trickle_reset_hint`](Self::trickle_reset_hint): a hint that the first
+    /// reader clears silently starves a second one, and this is not a fact that
+    /// belongs to whoever asks first. Wrapping is harmless — a caller compares
+    /// for equality, and `u32` evictions between two passes of one loop is not
+    /// reachable.
+    key_generation: u32,
     /// Outstanding lazy-cert-distribution fetches this node has requested but
     /// not yet resolved, keyed by originator MAC (one entry per originator).
     in_flight: HVec<InFlightCertRequest, MAX_IN_FLIGHT_CERT_REQUESTS>,
@@ -545,6 +564,7 @@ impl<
             recv_counters: HVec::new(),
             self_revocation: None,
             trickle_reset_hint: false,
+            key_generation: 0,
             in_flight: HVec::new(),
             pending_replies: HVec::new(),
             cert_req_rate: HVec::new(),
@@ -597,6 +617,17 @@ impl<
         Some(record)
     }
 
+    /// A counter that changes whenever a cached neighbor's keys stop being
+    /// reachable — see [`key_generation`](Self::key_generation).
+    ///
+    /// Read it, do the work, and remember the value; when it is unchanged on a
+    /// later pass, nothing has been evicted in between and there is nothing to
+    /// reconcile. Never read it as a *count* of evictions: it wraps, and
+    /// several removals can share one bump.
+    pub fn key_generation(&self) -> u32 {
+        self.key_generation
+    }
+
     /// Take and clear the pending Trickle-reset hint: `true` if a new revocation
     /// was ingested since the last call, meaning the router should reset the
     /// engine's OGM timers so the purge re-floods at `i_min` without waiting for
@@ -610,6 +641,15 @@ impl<
     /// collects revocations whose `not_after` has passed: the cancelled cert has
     /// expired too, so passive expiry now covers the node and the record can be
     /// forgotten, freeing a slot in the bounded revocation set.
+    ///
+    /// **A router's clock is advanced through
+    /// `CentralRouter::set_auth_time`, not here.** Evicting a lapsed member's
+    /// keys is half an event: the routing engine's next-hop proofs were
+    /// answered *with* those keys and have to go in the same breath, or
+    /// selection keeps choosing a hop the data plane can no longer tag for
+    /// (`docs/design/implemented/09-mesh-auth-gaps.md` §8.10). This stays
+    /// public for tests and benches that drive an `OgmAuth` with no router
+    /// around it.
     pub fn set_time(&mut self, now_unix: u64) {
         self.now_unix = now_unix;
         self.prune_expired();
@@ -822,6 +862,7 @@ impl<
         tracing::trace!("auth: evicting neighbor: {:?}", mac);
         if let Some(i) = self.neighbors.iter().position(|n| n.cert.mac == mac) {
             self.neighbors.swap_remove(i);
+            self.key_generation = self.key_generation.wrapping_add(1);
         }
         if let Some(i) = self.recv_counters.iter().position(|(m, _)| *m == mac) {
             self.recv_counters.swap_remove(i);
@@ -964,6 +1005,35 @@ impl<
     /// computing "expires in" in the security view.  Zero until first set.
     pub fn now_unix(&self) -> u64 {
         self.now_unix
+    }
+
+    /// Whether a *usable* pairwise key is held for `mac` — the precondition
+    /// every directed frame to it depends on.
+    ///
+    /// "Usable" is [`live_neighbor`](Self::live_neighbor)'s judgement, so this
+    /// answers `false` for a neighbor never cached, one whose certificate has
+    /// lapsed, one dropped by a revocation, and one evicted from a full cache
+    /// alike — *however* the key went, which is the point: nothing reconciling
+    /// against this has to enumerate the ways, and the ways are not a closed
+    /// set.
+    ///
+    /// An unclocked node (`now_unix == 0`) judges no validity window at all, so
+    /// a lapsed certificate still reads live there —
+    /// [`live_neighbor`](Self::live_neighbor)'s escape hatch. That is right for
+    /// this caller too: a node that cannot tell the time must not tear down its
+    /// own routes on a guess.
+    ///
+    /// Spelled as its own predicate rather than
+    /// `neighbor_x_pubkey(mac).is_some()`, which is exactly equivalent today:
+    /// that phrasing asks about one *field* that happens to sit beside the
+    /// pairwise key, where what is being asked is whether the data plane can
+    /// still tag at all — the same question
+    /// [`tag_directed`](Self::tag_directed) asks. Exists so the routing engine
+    /// can keep its next-hop proofs in step with this cache without depending
+    /// on it — see `BatmanEngine::retain_proven` and
+    /// `docs/design/implemented/09-mesh-auth-gaps.md` §8.10.
+    pub fn has_live_key(&self, mac: Mac) -> bool {
+        self.live_neighbor(mac).is_some()
     }
 
     /// The X25519 key of a verified neighbor, for pairwise data-plane keying.
@@ -1931,7 +2001,7 @@ impl<
     // of possessing bytes anyone can copy off the air. These three calls are
     // how a candidate next hop proves it is really there: the challenger picks
     // a fresh nonce, and only a node holding the pairwise key for the MAC it
-    // claims can answer. See `docs/design/09-mesh-auth-gaps.md` §4.
+    // claims can answer. See `docs/design/implemented/09-mesh-auth-gaps.md` §4.
 
     /// The PRF key for nonce derivation: this node's pairwise key *with
     /// itself*.
@@ -2067,7 +2137,21 @@ impl<
             return;
         }
         let now = self.now_unix;
+        let before = self.neighbors.len();
         self.neighbors.retain(|n| n.cert.not_after >= now);
+        if self.neighbors.len() != before {
+            self.key_generation = self.key_generation.wrapping_add(1);
+            // Reported here, at the branch point, because this is the only
+            // place that still knows *why* a key went. Whatever reconciles
+            // against the result (`BatmanEngine::retain_proven`) deliberately
+            // cannot tell expiry from a cache eviction, so its own record
+            // cannot say "renew this member's certificate" — and that is the
+            // actionable half. Bounded: once per member per validity period.
+            tracing::debug!(
+                dropped = before - self.neighbors.len(),
+                "auth: evicted neighbor keys whose certificates have lapsed"
+            );
+        }
     }
 
     /// Insert or refresh a verified neighbor's keys.
@@ -2192,6 +2276,12 @@ impl<
             // See the MR for #48 and the follow-up it names.
             if let Some(first) = self.neighbors.first_mut() {
                 *first = keys;
+                // The displaced member's keys are gone under its own address —
+                // the same loss expiry inflicts, to be reconciled the same way
+                // (see `key_generation`). This is the path that makes that
+                // counter's consumer a *reconciliation* rather than an expiry
+                // handler: no clock is involved here at all.
+                self.key_generation = self.key_generation.wrapping_add(1);
             }
         }
         Cached::Stored
@@ -5172,12 +5262,12 @@ mod tests {
 
     // --- next-hop proof: challenge/response (gaps 1 + 2) -----------------
     //
-    // See `docs/design/09-mesh-auth-gaps.md` §4. An OGM's signature attests
-    // its *originator*; nothing attests the *forwarder*, so a next hop is
-    // installed on the strength of possessing bytes anyone can copy. These
+    // See `docs/design/implemented/09-mesh-auth-gaps.md` §4. An OGM's signature
+    // attests its *originator*; nothing attests the *forwarder*, so a next hop
+    // is installed on the strength of possessing bytes anyone can copy. These
     // primitives are the proof that possession is not enough: the challenger
-    // picks a fresh nonce, and only a node holding the pairwise key for the
-    // MAC it claims can answer.
+    // picks a fresh nonce, and only a node holding the pairwise key for the MAC
+    // it claims can answer.
 
     /// The round trip a proven next hop rests on: `b` challenges `a`, `a`
     /// answers with the pairwise key both derived from each other's certs,

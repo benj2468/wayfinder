@@ -332,9 +332,12 @@ impl Driver {
         // Advance the auth clock before anything reads it: cert validity is
         // judged in unix seconds, and this is the only place the monotonic
         // `now` is mapped onto that clock.
-        if let Some(auth) = self.router.auth_mut() {
-            auth.set_time(self.epoch_unix.saturating_add(now.as_secs()));
-        }
+        // Through the router rather than straight at the auth state: setting
+        // the clock can evict a lapsed peer's key, and the engine's next-hop
+        // proofs must be reconciled with that in the same call (design 09
+        // §8.10).
+        self.router
+            .set_auth_time(now, self.epoch_unix.saturating_add(now.as_secs()));
 
         let mut stage = StageSink::default();
 
@@ -399,16 +402,23 @@ impl Driver {
                 }
                 continue;
             }
-            if let Ok(f) = self
+            match self
                 .router
                 .handle_local(now, dest, &payload, &mut self.tx_buffer)
             {
-                let _ = stage.emit(OutgoingFrame {
-                    dst: f.dst,
-                    protocol: f.protocol,
-                    payload: f.payload,
-                    egress: Egress::Auto,
-                });
+                Ok(f) => {
+                    let _ = stage.emit(OutgoingFrame {
+                        dst: f.dst,
+                        protocol: f.protocol,
+                        payload: f.payload,
+                        egress: Egress::Auto,
+                    });
+                }
+                // As in the multicast arm above, and for the same reason the
+                // tokio shell records it: the host's frame is gone and nothing
+                // downstream will say so. See design 09 §8.10 for why this arm
+                // became reachable where §7's counter used to catch it.
+                Err(e) => trace!(?dest, ?e, "drop: local unicast unsendable"),
             }
         }
 

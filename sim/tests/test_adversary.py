@@ -314,7 +314,7 @@ def test_a_replayed_ogm_cannot_take_an_established_route(
     `tq_maxed` the most forceful (the unsigned TQ field maxed). Neither moves
     the route now.
 
-    See `docs/design/09-mesh-auth-gaps.md` §4.
+    See `docs/design/implemented/09-mesh-auth-gaps.md` §4.
     """
     mesh = Mesh(mesh_id=0xABCD, root_seed=bytes([1]) * 32)
     sim = Simulation(

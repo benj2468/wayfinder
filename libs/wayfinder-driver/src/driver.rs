@@ -545,9 +545,10 @@ impl<Local: FrameIo> Driver<Local> {
     /// republish this node's auth-present state for the certificate authority.
     ///
     /// Called from every entry point that processes frames, so cert expiry
-    /// tracks the loop's `now` consistently. Only the router's own `set_time` is
-    /// skipped when auth is disabled — both publications happen either way, and
-    /// the auth-disabled case is precisely the one the authority needs told.
+    /// tracks the loop's `now` consistently. Only `set_auth_time`'s work is
+    /// skipped when auth is disabled — it no-ops on its own — while both
+    /// publications happen either way, and the auth-disabled case is precisely
+    /// the one the authority needs told.
     async fn refresh_auth_clock(&mut self, now: Duration) {
         // Refresh the verdict for the alarm and the reported status, but do
         // *not* let it gate the value: the router judges every peer
@@ -561,15 +562,21 @@ impl<Local: FrameIo> Driver<Local> {
         self.refresh_clock_trust(now);
         self.publish_clock_trust();
         let unix = Duration::from_secs(self.clock.now_unix(now));
-        // A short write guard: setting the clock is a field store, and holding
-        // the lock any longer than this would stall every management read for
-        // no reason.
-        let auth_present = match self.shared.write().await.router.auth_mut() {
-            Some(auth) => {
-                auth.set_time(unix.as_secs());
-                true
-            }
-            None => false,
+        // A short write guard, but no longer a free one: `set_auth_time`
+        // reconciles the engine's next-hop proofs against the key cache as well
+        // as storing the clock, and this runs on every frame. The reconciliation
+        // is gated on a generation counter, so the steady-state cost is one
+        // integer comparison and the scan happens only when a key was actually
+        // evicted.
+        let auth_present = {
+            let mut guard = self.shared.write().await;
+            // Through the router, never `auth_mut().set_time` — advancing the
+            // clock can evict a lapsed peer's key, and the engine's next-hop
+            // proofs have to be swept in the same breath or a route reports
+            // healthy while every frame over it is dropped for want of that
+            // key (design 09 §8.10).
+            guard.router.set_auth_time(now, unix.as_secs());
+            guard.router.auth().is_some()
         };
         // Published to whatever holds the other half — an authority task that
         // no longer shares this loop reads its issuance clock from here.  Both
@@ -1436,13 +1443,26 @@ fn plan_host_frame(
             }
             McastPlan::Flood => flood(router, &mut mesh, tx_buffer),
         }
-    } else if let Ok(f) = router.handle_local(now, dst, eth, tx_buffer) {
-        mesh.push(OutgoingFrame {
-            dst: f.dst,
-            protocol: f.protocol,
-            payload: f.payload.to_vec(),
-            egress: Egress::Auto,
-        });
+    } else {
+        match router.handle_local(now, dst, eth, tx_buffer) {
+            Ok(f) => mesh.push(OutgoingFrame {
+                dst: f.dst,
+                protocol: f.protocol,
+                payload: f.payload.to_vec(),
+                egress: Egress::Auto,
+            }),
+            // Recorded for the same reason the multicast arm above records
+            // its failure: the host's frame is gone and nothing else says so.
+            //
+            // This got sharper when next-hop proofs began being swept with the
+            // keys they were answered with (design 09 §8.10). Before that, a
+            // frame aimed at a lapsed neighbour was planned, reached
+            // `tag_directed_into`, and was counted there by §7's
+            // `untaggable_drop_rate`. Now the route is correctly gone first, so
+            // it fails earlier and that counter never sees it — an improvement
+            // in behaviour that was a regression in visibility until here.
+            Err(e) => trace!(?dst, ?e, "drop: local unicast unsendable"),
+        }
     }
 
     mesh
