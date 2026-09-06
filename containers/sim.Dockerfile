@@ -15,23 +15,34 @@
 # a RawL2 link for each, so the topology is driven entirely by which networks a
 # service is wired to in docker-compose.yml — no hard-coded interface names.
 #
-# Identity, by contrast, is *not* generated here. Each node's seed and
-# membership certificate are minted on the host by scripts/topology.py before
-# the stack comes up and mounted read-only at /secrets, so a node is a mesh
-# member from its first instant and its MAC (derived from that seed) is
-# reproducible across runs.
+# Identity, by contrast, is *not* generated here: every node's seed is minted on
+# the host by scripts/topology.py and mounted read-only at /secrets, which is
+# what makes a node's MAC reproducible across runs (a node routes under the
+# address its identity key derives). What is in /secrets beside that seed
+# decides which of three postures this entrypoint brings the node up in:
 #
-# Unless SECURE=0, that is: an *open* node (scripts/topology.py --open N) runs
-# with mesh authentication switched off, and /secrets then holds only a bare
-# seed for its management-TLS server. See the entrypoint's SECURE branch.
+#   seed + cert + anchor  the certificate authority, certified on the host from
+#                         the root key it also mounts. Routes from its first
+#                         instant, because it is what everything else enrols
+#                         against.
+#   seed alone, SECURE=1  a member awaiting enrollment: `require_auth: true`
+#                         with no certificate, so it is inert — no routing, no
+#                         OGMs — until `topology.py enroll` gets it one over the
+#                         management API. That is the normal state for a member
+#                         node for the first few seconds of a stack's life, and
+#                         for as long as an operator takes to work a queue when
+#                         the provider is `--require-approval`.
+#   seed alone, SECURE=0  an *open* node (scripts/topology.py --open N): mesh
+#                         authentication switched off entirely, the seed used
+#                         only for the management-TLS server's key.
 #
-# That replaced an earlier flow where each node generated a key at startup and
-# enrolled against the provider over the management API. Once that API required
-# an authenticated TLS handshake, the flow could not work: a node with no
-# certificate yet is refused the connection it would have used to request one.
-# Pre-issuing sidesteps the bootstrap circularity entirely — at the cost of the
-# sim no longer exercising online enrollment, which is worth knowing when
-# reading the CSR/approval surfaces it still exposes.
+# The middle posture used to be impossible, and the sim pre-issued every
+# certificate on the host because of it: once the management API required an
+# authenticated handshake, a node with no certificate was refused the very
+# connection it would have used to request one. Two access tiers resolve that
+# now, and enrollment drives both — a node with no trust anchor admits proof of
+# its own key (self-key), and a provider admits a stranger to `SubmitCsr`
+# (enrollment). Neither needs a certificate the mesh has not issued yet.
 
 FROM debian:bookworm-slim
 
@@ -128,13 +139,13 @@ server:
   addr: ${SERVER_ADDR}
 YAML
 
-if [ "$SECURE" = "1" ]; then
+if [ "$SECURE" = "1" ] && [ -f /secrets/cert ]; then
+  # Certified on the host: the certificate authority. A CA's own membership
+  # certificate comes from the root key it holds rather than from a request it
+  # would be answering itself, so it is minted beside that root and mounted
+  # here — the same shape as the real cloud provider, whose secrets are minted
+  # offline with \`wayfinderctl cert\`.
   cat >> "$CFG" <<YAML
-# The identity this node runs under, pre-issued on the host by
-# scripts/topology.py and mounted read-only at /secrets. Configured here rather
-# than pushed in at runtime because the node's MAC is *derived from this seed*:
-# supplying it up front is what lets the host mint a certificate bound to the
-# right MAC before the container exists.
 auth:
   seed_path: /secrets/seed
   cert_path: /secrets/cert
@@ -142,6 +153,23 @@ auth:
 # Fail closed: stay inert on the mesh (no routing, no OGM emission) without a
 # valid membership cert. With \`auth:\` above that cert is present from the
 # first instant, so this is an assertion rather than a waiting state.
+require_auth: true
+lazy_cert_distribution: true
+YAML
+elif [ "$SECURE" = "1" ]; then
+  # A member awaiting enrollment. No \`auth:\` block, because there is no
+  # certificate to name in one yet — but the seed still goes in, as the
+  # management server's key, and the node's MAC derives from *that* when there
+  # is no mesh identity. So this node comes up at the address its certificate
+  # will be issued for, which is what lets the enrollment below be a single
+  # round trip rather than a renumber.
+  #
+  # \`require_auth\` is the point of the posture, not an oversight: true with no
+  # certificate is exactly the inert state, and watching it end is what the
+  # sim's runtime enrollment exists to show. \`topology.py up\` ends it within
+  # seconds; \`--require-approval\` holds it until an operator approves.
+  cat >> "$CFG" <<YAML
+  identity_seed_path: /secrets/seed
 require_auth: true
 lazy_cert_distribution: true
 YAML

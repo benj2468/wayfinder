@@ -19,12 +19,13 @@ Usage
     python scripts/topology.py print              # print the generated compose YAML
     python scripts/topology.py write [PATH]       # write it (default: docker-compose-sim.yml)
     python scripts/topology.py up [-- ARGS...]    # generate ephemeral file + compose up --build -d
-        (add --require-approval so the provider parks hand-submitted CSRs for
-        operator approval instead of auto-signing; also accepted by
+        (add --require-approval to make the provider park each node's CSR for
+        operator approval instead of signing it on submission; also accepted by
         `print`/`write`)
         (add --open N for N nodes with mesh authentication switched off; see
         "Open nodes" below.  Accepted by every subcommand, since they all
         re-derive the topology)
+    python scripts/topology.py enroll             # enroll any node still without a certificate
     python scripts/topology.py restart [NODE...]  # re-run the entrypoint (pick up a host rebuild)
     python scripts/topology.py down               # tear the ephemeral stack down
     python scripts/topology.py logs [NODE...]     # follow logs
@@ -132,15 +133,16 @@ so an open node is heard and dropped rather than routed to.
 An open node's dashboard authenticates the *opposite* way to a secured one: the
 node is un-enrolled, so it admits only a client proving the node's own key, and
 its dashboard is given that seed as a static credential rather than a sign-in.
-Its MAC is the one thing that is not reproducible across ``up``, since it has no
-identity seed to derive one from — the node generates and persists a MAC on
-first boot instead.
+Its MAC is reproducible across ``up`` like every other node's: the seed that
+gives its management port a stable key is also the key its address derives from,
+which is true of a node with no mesh identity at all.
 """
 
 from __future__ import annotations
 
 import argparse
 import itertools
+import json
 import shutil
 import subprocess
 import sys
@@ -179,6 +181,10 @@ PROJECT = "wayfinder-sim"
 
 # Default verbosity for every node's RUST_LOG. "trace" is very chatty across a
 # 9-node mesh; "info" is a sane default — bump a specific node in build_nodes().
+# Where `make_identities` records each node's ed25519 public key, inside
+# `SIM_CA_DIR`. See the write for why it has to be on disk at all.
+NODE_KEYS_FILE = "node-keys.json"
+
 DEFAULT_RUST_LOG = "info"
 
 # The mesh every node in this sim belongs to. One value, used both when minting
@@ -363,6 +369,10 @@ def _ctl(*args: str, stdin: str | None = None, check: bool = True) -> str:
             f"wayfinderctl {' '.join(args)} failed (exit {result.returncode}):\n"
             f"{result.stderr.strip()}"
         )
+    # Cleared on the way out, not only set on the way in: a `check=False` caller
+    # reads this attribute to decide *why* a command failed, and a value left
+    # behind by an earlier failure would be read as this call's.
+    _ctl.last_error = ""
     return result.stdout
 
 
@@ -380,7 +390,9 @@ def _ed_pubkey(ctl_output: str) -> str:
 
 
 def make_identities(
-    node_names: list[str], open_names: list[str] | None = None
+    node_names: list[str],
+    open_names: list[str] | None = None,
+    provider_name: str | None = None,
 ) -> tuple[Path, dict[str, str]]:
     """Mint the whole mesh's cryptographic identity on the host, up front.
 
@@ -393,8 +405,18 @@ def make_identities(
 
     * ``seed`` / ``root``     — the mesh root seed and its public trust anchor.
       Only the provider node mounts these.
-    * ``nodes/<name>/``       — one node's ``seed``/``cert``/``anchor``. A plain
-      *member* certificate: enough to route, deliberately not enough to
+    * ``nodes/<name>/``       — one secured node's identity.  For every node
+      but the provider this is a ``seed`` and nothing else: the node comes up
+      holding a key and no certificate, and `enroll_members` gets it one at
+      runtime over the management API.  The ``cert``/``anchor`` beside it are
+      written by that enrollment, not by this function.
+
+      ``provider_name`` is the exception, and mints ``seed``/``cert``/``anchor``
+      here: that node *is* the certificate authority, so its certificate comes
+      from the root key this host holds rather than from a request it would be
+      answering itself.  It is also what every other node enrolls against, so it
+      has to be a routing member of the mesh before any of them are.  A plain
+      *member* certificate even so — enough to route, deliberately not enough to
       administer, so the sim reflects the real split.
     * ``open/<name>/``        — an open node's ``seed`` and nothing else. It has
       no mesh identity to certify; the seed exists only so its *management-TLS*
@@ -413,13 +435,14 @@ def make_identities(
       discarded by the next thing it persists — or discards that, in the other
       order.
 
-    Pre-issuing rather than enrolling at runtime is what makes each node's MAC
-    reproducible: the node derives its MAC from this seed, and ``cert issue``
-    *requires* that same derivation, so a certificate minted before the
-    container exists still binds the MAC the node comes up with. (Since design
-    09 §5's key↔address binding this is no longer merely a convenient default —
-    ``cert issue --mac`` is a cross-check now, and an authority will certify no
-    other address.)
+    Minting the *seed* here — rather than letting each node generate its own on
+    first boot — is what makes a node's MAC reproducible across runs: a node
+    routes under the address its identity key derives (design 09 §5's key↔address
+    binding), so a seed that is stable across runs is an address that is too.
+    Minting the *certificate* here is a separate question, and for a member node
+    the answer is no: enrollment is a live surface the sim is worth exercising,
+    and nothing about it moves the address, precisely because the address was
+    already a function of the key.
 
     An open node's seed is minted here for a different reason. With no ``auth:``
     block the node has no membership seed for its TLS server to reuse, so it
@@ -479,8 +502,15 @@ def make_identities(
         dest.mkdir(parents=True, exist_ok=True)
         return _ed_pubkey(_ctl("cert", "keygen", "--out-seed", str(dest / "seed")))
 
+    # The provider is certified here; every other secured node gets a bare
+    # keypair and enrolls itself against that provider once the stack is up.
     node_keys = {
-        name: issue_into(ca_dir / "nodes" / name, admin=False) for name in node_names
+        name: (
+            issue_into(ca_dir / "nodes" / name, admin=False)
+            if name == provider_name
+            else keygen_into(ca_dir / "nodes" / name)
+        )
+        for name in node_names
     }
     for name in open_names or []:
         node_keys[name] = keygen_into(ca_dir / "open" / name)
@@ -495,7 +525,10 @@ def make_identities(
     # had in practice, and it is invisible until a container dies with a bare
     # ENOENT several steps later — so fail here, naming the file, instead.
     for name in node_names:
-        for leaf in ("seed", "cert", "anchor"):
+        # A member has only a seed at this point — the rest arrives with its
+        # certificate, which is a later step and has its own error path.
+        leaves = ("seed", "cert", "anchor") if name == provider_name else ("seed",)
+        for leaf in leaves:
             path = ca_dir / "nodes" / name / leaf
             if not path.is_file():
                 sys.exit(f"minting {name} produced no {leaf} at {path}")
@@ -503,6 +536,12 @@ def make_identities(
         path = ca_dir / "open" / name / "seed"
         if not path.is_file():
             sys.exit(f"minting open node {name} produced no seed at {path}")
+
+    # Recorded on disk because a later subcommand needs it and cannot re-derive
+    # it: these keys are random, so `enroll` cannot recompute the provider's
+    # pin from the topology the way it recomputes ports and names, and
+    # re-minting to learn it would replace the identities the stack is running.
+    (ca_dir / NODE_KEYS_FILE).write_text(json.dumps(node_keys, indent=2) + "\n")
 
     print(f"minted mesh identities in {ca_dir}", file=sys.stderr)
     return ca_dir, node_keys
@@ -555,7 +594,7 @@ def make_accounts(dev: DevInfo) -> None:
         "--node-key", dev.node_keys[dev.provider_name],
     ]  # fmt: skip
 
-    if not _wait_for_provider(connect):
+    if not _wait_for_api(connect):
         # The last failure verbatim, rather than asserting a cause. Polling
         # cannot tell "not bound yet" from a rejected certificate, a wrong pin,
         # or `cargo` failing to build `wayfinder-ctl` at all — and a message
@@ -591,8 +630,8 @@ def make_accounts(dev: DevInfo) -> None:
     return True
 
 
-def _wait_for_provider(connect: list[str], attempts: int = 30) -> bool:
-    """Poll the provider's management API until it answers, or give up.
+def _wait_for_api(connect: list[str], attempts: int = 30) -> bool:
+    """Poll a node's management API until it answers, or give up.
 
     `docker compose up -d` returns when the containers are *started*, which is
     before the node inside one has bound its listener — so the first request
@@ -603,6 +642,139 @@ def _wait_for_provider(connect: list[str], attempts: int = 30) -> bool:
             return True
         time.sleep(1)
     return False
+
+
+def enroll_members(dev: DevInfo) -> bool:
+    """Enroll every member node against the provider, over the management API.
+
+    The three steps are the ones an operator would run by hand — `csr request`
+    at the node, `csr submit` at the provider, `csr install` back at the node —
+    and they are driven from the host over each node's published loopback port,
+    so nothing here writes into a node's filesystem and nothing depends on the
+    mesh routing yet (which it does not: an un-enrolled member is inert).
+
+    **The bootstrap that used to make this impossible is two access tiers, not
+    an exception to either.** A node with no trust anchor has nothing to verify
+    a client certificate against, so it admits exactly one credential: proof of
+    its *own* key (`authz::decide_access`'s `GrantedSelfKey`). That is what the
+    `--identity <the node's seed>` connections below present — no `--cert`, and
+    `--node-key` left to default to that identity's own public key, which is
+    the node being reached. The provider connection is the other tier: the same
+    seed is a stranger's key *there*, which earns `GrantedEnrollment`, and
+    `SubmitCsr` is on it. So neither call needs a certificate the mesh has not
+    issued yet, which is precisely the circularity that sank the sim's earlier
+    runtime enrollment and sent it to pre-issued certificates instead.
+
+    Idempotent, and re-running it is the documented way to finish a held
+    enrollment: re-submitting an identical CSR is how a certificate is
+    collected once an operator approves it, so `enroll` after an approval picks
+    up exactly where `up` stopped. Returns False only for a failure that leaves
+    the stack unusable; a node the provider is *holding* is reported and is not
+    an error, because that is what `--require-approval` was asked for.
+    """
+    ports = mgmt_ports()
+    provider_port = ports[dev.provider_name]
+    members = [n for n in ports if n != dev.provider_name and n not in dev.open_names]
+    if not members:
+        return True
+
+    enrolled: list[str] = []
+    pending: list[str] = []
+    for name in members:
+        node_dir = dev.ca_dir / "nodes" / name
+        seed = str(node_dir / "seed")
+        request, cert, anchor = (
+            node_dir / f for f in ("request.json", "cert", "anchor")
+        )
+        at_node = ["--connect", f"127.0.0.1:{ports[name]}", "--identity", seed]
+        if not _wait_for_api(at_node):
+            print(
+                f"could not reach {name}'s management API; enrolment stopped. "
+                f"Last error:\n{_ctl.last_error or '(no output)'}",
+                file=sys.stderr,
+            )
+            return False
+        _ctl(*at_node, "csr", "request", "--out-request", str(request))
+        # Pinning the *provider's* key, not our own: this is the one connection
+        # here that is not to the node whose seed we are presenting.
+        at_provider = [
+            "--connect", f"127.0.0.1:{provider_port}",
+            "--identity", seed,
+            "--node-key", dev.node_keys[dev.provider_name],
+        ]  # fmt: skip
+        _ctl(
+            *at_provider,
+            "csr", "submit",
+            "--request", str(request),
+            "--out-cert", str(cert),
+            "--out-anchor", str(anchor),
+            check=False,
+        )  # fmt: skip
+        if err := _ctl.last_error:
+            # Matched on the message rather than on the exit status because
+            # `csr submit` has one of those and three outcomes: issued, held for
+            # approval, and refused. Only the middle one is a state to report
+            # and re-run from — a refusal is a real failure and must not be
+            # dressed up as one an approval would clear.
+            if "awaiting operator approval" not in err:
+                raise RuntimeError(f"enrolling {name} failed:\n{err}")
+            pending.append(name)
+            continue
+        _ctl(
+            *at_node,
+            "csr", "install",
+            "--cert", str(cert),
+            "--trust-anchor", str(anchor),
+        )  # fmt: skip
+        enrolled.append(name)
+
+    if enrolled:
+        print(
+            f"enrolled {len(enrolled)} node(s) at runtime: {', '.join(enrolled)}",
+            file=sys.stderr,
+        )
+    if pending:
+        print(
+            f"\n{len(pending)} node(s) awaiting operator approval: "
+            f"{', '.join(pending)}\n"
+            f"  Each holds a key and no certificate, so it stays inert — no routing, no\n"
+            f"  OGMs — until the provider signs for it. Approve them in {dev.provider_name}'s\n"
+            f"  dashboard (Provider -> Enrollment), or with\n"
+            f"    wayfinderctl --connect 127.0.0.1:{provider_port} "
+            f"--identity {dev.ca_dir / 'operator' / 'seed'} "
+            f"--cert {dev.ca_dir / 'operator' / 'cert'} \\\n"
+            f"      --node-key {dev.node_keys[dev.provider_name]} provider requests approve --mac <mac>\n"
+            f"  then collect the certificates with:  python scripts/topology.py enroll\n",
+            file=sys.stderr,
+        )
+    return True
+
+
+def load_dev_info() -> DevInfo | None:
+    """Reconstruct what the last `render_compose` minted, without re-minting.
+
+    `enroll` runs against a stack that is already up, so it must not call
+    `render_compose`: that re-mints every identity, which would hand back keys
+    no running container holds. Everything but the keys is a function of the
+    topology and is recomputed the way `mgmt_ports` recomputes ports; the keys
+    themselves come off disk (`NODE_KEYS_FILE`), because they are random.
+
+    Returns None when no identities have been minted at all — which is the "you
+    have not run `up`" case, and is the caller's to report.
+    """
+    keys_file = SIM_CA_DIR / NODE_KEYS_FILE
+    if not keys_file.is_file():
+        return None
+    node_keys: dict[str, str] = json.loads(keys_file.read_text())
+    nodes = node_order(dedup_links(build_links()))
+    open_names = [name for name in open_node_names() if name in nodes]
+    secured_names = [name for name in nodes if name not in open_names]
+    return DevInfo(
+        ca_dir=SIM_CA_DIR,
+        provider_name=secured_names[0],
+        node_keys=node_keys,
+        open_names=open_names,
+    )
 
 
 # ── the topology (edit me) ────────────────────────────────────────────────────
@@ -703,10 +875,13 @@ def render_compose(require_approval: bool = False) -> tuple[str, DevInfo]:
     """Render the full docker-compose YAML for the current topology.
 
     When ``require_approval`` is set, the provider parks incoming CSRs as
-    pending until an operator approves them (``wayfinderctl provider requests approve`` / the
-    Security tab) instead of auto-signing on submission. Nothing in this sim
-    enrols at runtime — every node is minted a certificate up front — so this
-    only affects a CSR you submit yourself, by hand.
+    pending until an operator approves them (``wayfinderctl provider requests
+    approve`` / the dashboard's enrollment queue) instead of signing them on
+    submission. Every member node enrols at runtime, so this gates the whole
+    mesh: `up` submits each node's request, the provider holds them all, and
+    until they are approved every member sits `require_auth: true` with no
+    certificate — inert, routing nothing. Approve them and run
+    ``topology.py enroll`` to collect.
 
     The flag keeps the operator's imperative ("make me approve"); the node's own
     field says whether approval is automatic, so this renders as
@@ -719,7 +894,16 @@ def render_compose(require_approval: bool = False) -> tuple[str, DevInfo]:
     # attached is not silently given a service definition.
     open_names = [name for name in open_node_names() if name in nodes]
     secured_names = [name for name in nodes if name not in open_names]
-    ca_dir, node_keys = make_identities(secured_names, open_names)
+    # The first *secured* node is the certificate-authority *provider*: it alone
+    # mounts the mesh root seed, so the root key lives on exactly one node.
+    # Every other secured node comes up with a key and no certificate and
+    # enrols against this one; the open nodes hold nothing to enrol with.
+    #
+    # Decided here rather than beside the service definitions below because
+    # `make_identities` needs it: which node is the provider is what decides
+    # which node is certified on the host.
+    provider_name = secured_names[0]
+    ca_dir, node_keys = make_identities(secured_names, open_names, provider_name)
     # node -> the networks it is attached to, in deterministic order.
     attached: dict[str, list[str]] = {name: [] for name in nodes}
     for members in links:
@@ -741,11 +925,6 @@ def render_compose(require_approval: bool = False) -> tuple[str, DevInfo]:
     e("# frames; the sim image emits one mesh link per attached NIC, so this wiring")
     e("# *is* the topology.  Bring it up with:  python scripts/topology.py up")
     e("")
-    # The first *secured* node is the certificate-authority *provider*: it alone
-    # mounts the mesh root seed, so the root key lives on exactly one node.
-    # Every other secured node is a plain member holding a certificate this CA
-    # already signed; the open nodes hold nothing.
-    provider_name = secured_names[0]
     # The provider's own management address, so every dashboard knows where to
     # send a sign-in. Derived from the same enumeration that assigns the
     # addresses below rather than recomputed, so the two cannot drift.
@@ -782,17 +961,20 @@ def render_compose(require_approval: bool = False) -> tuple[str, DevInfo]:
         mgmt_ip = f"10.99.0.{idx + 2}"
         is_provider = name == provider_name
         is_open = name in open_names
-        # A secured node mounts seed + cert + anchor; an open one mounts a
-        # directory holding only a seed, which the entrypoint hands to the
+        # The provider mounts seed + cert + anchor; a member mounts a
+        # directory that holds only a seed until it enrols; an open node mounts
+        # one that only ever holds a seed, which the entrypoint hands to the
         # management-TLS server rather than to the mesh.
         secrets_dir = ca_dir / ("open" if is_open else "nodes") / name
         e(f"  {name}:")
         e("    !!merge <<: *node")
         e(f"    container_name: wf-{name}")
         e(f"    hostname: {name}")
-        # Every node mounts its own pre-issued identity; only the provider also
+        # Every node mounts its own identity directory; only the provider also
         # mounts the mesh root seed, so the key that can mint certificates lives
-        # on exactly one node.
+        # on exactly one node. A member's directory holds only a seed until
+        # `enroll_members` puts a certificate in it — which is the entrypoint's
+        # cue to bring that node up awaiting enrollment.
         e("    volumes:")
         e(f"      - {secrets_dir!s}:/secrets:ro")
         e(f"      - {REPO_ROOT!s}:/workspace:ro")
@@ -819,11 +1001,11 @@ def render_compose(require_approval: bool = False) -> tuple[str, DevInfo]:
         if is_provider:
             e('      PROVIDER: "1"')
             e('      CA_STATE_PATH: "/ca-state/ca-state.json"')
-            # Gate hand-submitted CSRs on operator approval instead of
-            # auto-signing. Nothing enrols on its own here — every node is
-            # already certified — so this only affects a CSR you submit
-            # yourself. The node's own field says whether approval is
-            # automatic, so requiring approval means switching that off.
+            # Gate enrolment on operator approval instead of auto-signing.
+            # Every member node enrols at runtime, so this holds the whole mesh
+            # at the queue until an operator works through it. The node's own
+            # field says whether approval is automatic, so requiring approval
+            # means switching that off.
             e(f'      AUTO_APPROVE: "{str(not require_approval).lower()}"')
         for key, value in cfg["env"].items():
             e(f"      {key}: {value}")
@@ -1167,8 +1349,10 @@ def main(argv: list[str]) -> int:
         p.add_argument(
             "--require-approval",
             action="store_true",
-            help="provider parks CSRs as pending until an operator approves them "
-            "(`wayfinderctl provider requests approve` / TUI Security tab) instead of auto-signing",
+            help="provider parks each node's CSR as pending until an operator approves "
+            "it (`wayfinderctl provider requests approve` / the dashboard's enrollment "
+            "queue) instead of signing on submission; the mesh stays inert until then, "
+            "and `topology.py enroll` collects the certificates afterwards",
         )
 
     # Shared flag: how many unauthenticated nodes to add. Accepted by every
@@ -1201,6 +1385,12 @@ def main(argv: list[str]) -> int:
     up.add_argument("extra", nargs="*", help="extra args passed to `docker compose up`")
     add_require_approval(up)
     add_open(up)
+    en = sub.add_parser(
+        "enroll",
+        help="enroll any node still without a certificate against the provider "
+        "— re-run this after approving a held request",
+    )
+    add_open(en)
     dn = sub.add_parser(
         "down", help="`docker compose down` the ephemeral stack (removes networks)"
     )
@@ -1289,9 +1479,23 @@ def main(argv: list[str]) -> int:
                 # over the top of it: every one of those dashboards shows a
                 # sign-in page, and there is nothing to sign in with.
                 return 1
+            # After the accounts, because a held enrolment sends the operator to
+            # the provider's dashboard to approve it, and that needs a sign-in.
+            if not enroll_members(dev):
+                return 1
             print_web_urls()
             print_dev_watch_commands(dev)
         return rc
+    if args.cmd == "enroll":
+        dev = load_dev_info()
+        if dev is None:
+            print(
+                f"no minted identities under {SIM_CA_DIR}; there is no stack to "
+                f"enrol into. Run `python scripts/topology.py up` first.",
+                file=sys.stderr,
+            )
+            return 1
+        return 0 if enroll_members(dev) else 1
     if args.cmd == "down":
         if not EPHEMERAL.exists():
             write_compose(EPHEMERAL)
