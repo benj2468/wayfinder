@@ -134,6 +134,9 @@ impl RouterReads for Mock {
             cert_req_rate: 0.5,
             cert_reply_rate: 1.5,
             untaggable_drop_rate: 2.25,
+            seqno_resyncs: 7,
+            ogm_refloods_suppressed: 11,
+            proofs_swept: 3,
         }
     }
 
@@ -517,6 +520,11 @@ async fn metrics_query_renders_json_from_server() {
     assert_eq!(parsed["cert_req_rate"], 0.5);
     assert_eq!(parsed["cert_reply_rate"], 1.5);
     assert_eq!(parsed["untaggable_drop_rate"], 2.25);
+    // Counts, so they must survive the wire as integers rather than being
+    // rendered like the rates beside them.
+    assert_eq!(parsed["seqno_resyncs"], 7);
+    assert_eq!(parsed["ogm_refloods_suppressed"], 11);
+    assert_eq!(parsed["proofs_swept"], 3);
 }
 
 #[tokio::test]
@@ -533,6 +541,9 @@ async fn metrics_query_renders_human_from_server() {
     assert!(out.contains("cert_req_rate: 0.50"), "got: {out}");
     assert!(out.contains("cert_reply_rate: 1.50"), "got: {out}");
     assert!(out.contains("untaggable_drop_rate: 2.25"), "got: {out}");
+    assert!(out.contains("seqno_resyncs: 7"), "got: {out}");
+    assert!(out.contains("ogm_refloods_suppressed: 11"), "got: {out}");
+    assert!(out.contains("proofs_swept: 3"), "got: {out}");
 }
 
 #[tokio::test]

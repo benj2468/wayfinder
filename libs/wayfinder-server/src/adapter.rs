@@ -867,6 +867,12 @@ impl<
             cert_req_rate: self.router.cert_req_tx_rate(self.now),
             cert_reply_rate: self.router.cert_reply_tx_rate(self.now),
             untaggable_drop_rate: self.router.untaggable_drop_rate(self.now),
+            // Counts, not rates, so they are read as-is rather than evaluated
+            // at `self.now` — see `CentralRouter::seqno_resyncs` for why a
+            // smoothed rate is the wrong instrument for these three.
+            seqno_resyncs: self.router.seqno_resyncs(),
+            ogm_refloods_suppressed: self.router.ogm_refloods_suppressed(),
+            proofs_swept: self.router.proofs_swept(),
         }
     }
 
@@ -1933,6 +1939,46 @@ mod tests {
         assert_eq!(m.paths_mean, 0.0);
         assert_eq!(m.uptime_secs, 5);
         assert_eq!((m.originators.used, m.originators.capacity), (0, 128));
+    }
+
+    /// The three fault counters are projected from the router rather than
+    /// defaulted, and each from its *own* accessor.
+    ///
+    /// This is the layer the end-to-end smoke test cannot reach: that one
+    /// answers from a `Mock` provider, so a projection hardcoded to `0` — or
+    /// wired to the wrong accessor — would pass it. Driving one counter and
+    /// asserting the other two stay put catches both mistakes.
+    ///
+    /// Zero on an untroubled node is half the assertion. These name faults, so
+    /// one that reads non-zero out of the box would be noise an operator learns
+    /// to ignore.
+    #[test]
+    fn node_metrics_projects_each_fault_counter_from_its_own_accessor() {
+        let mut router = CentralRouter::new(mac(1));
+        let m = RouterAdapter::new(&mut router, Duration::from_secs(5)).node_metrics();
+        assert_eq!(
+            (m.seqno_resyncs, m.ogm_refloods_suppressed, m.proofs_swept),
+            (0, 0, 0),
+            "an untroubled node reports no faults"
+        );
+
+        // Pin the originator's high-water, then offer a genuine low sequence
+        // number: refused while the correction is still short, which is exactly
+        // the interval in which this node stops passing that member's OGMs on.
+        feed_direct_ogm(&mut router, mac(2), 5_000, 255);
+        feed_direct_ogm(&mut router, mac(2), 1, 255);
+
+        let m = RouterAdapter::new(&mut router, Duration::from_secs(5)).node_metrics();
+        assert_eq!(
+            m.ogm_refloods_suppressed, 1,
+            "the router's count has to reach the wire, not a default"
+        );
+        assert_eq!(
+            (m.seqno_resyncs, m.proofs_swept),
+            (0, 0),
+            "and each field from its own accessor: nothing here resynchronised \
+             a high-water or swept a proof"
+        );
     }
 
     /// The TQ / path-diversity fold reports the true min / mean / max across

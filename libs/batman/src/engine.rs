@@ -614,6 +614,35 @@ impl<
         }
     }
 
+    /// How many sequence-number high-waters this node has resynchronised,
+    /// across both the broadcast and OGM spaces — see
+    /// [`seqno_resyncs`](Self::seqno_resyncs).
+    ///
+    /// A count rather than a rate, unlike most of this router's observability.
+    /// A correction cannot fire more often than the bands' reset protection
+    /// (30s), while `RateEstimator`'s memory is five seconds — so a rate would
+    /// read zero at almost every poll and an operator would see nothing at all
+    /// unless they happened to sample within a few seconds of the event. The
+    /// same reasoning the existing `oversize_drops` counters were built on: for
+    /// a rare fault, "how many so far" is the readable signal and "per second"
+    /// is not.
+    pub fn seqno_resyncs(&self) -> u32 {
+        self.seqno_resyncs
+    }
+
+    /// How many OGMs this node declined to re-flood while an originator's
+    /// high-water was under correction — see
+    /// [`ogm_refloods_suppressed`](Self::ogm_refloods_suppressed).
+    pub fn ogm_refloods_suppressed(&self) -> u32 {
+        self.ogm_refloods_suppressed
+    }
+
+    /// How many next-hop proofs this node has dropped because the key behind
+    /// them was no longer usable — see [`proofs_swept`](Self::proofs_swept).
+    pub fn proofs_swept(&self) -> u32 {
+        self.proofs_swept
+    }
+
     /// Record one relayed frame dropped because it didn't fit the caller's
     /// `reply` scratchpad (e.g. relaying across a smaller-MTU link).  `trace!`
     /// only — never `warn!` — because unlike a locally originated oversize
@@ -964,6 +993,7 @@ impl<
         if doomed.is_empty() {
             return;
         }
+        self.proofs_swept = self.proofs_swept.saturating_add(doomed.len() as u32);
         for mac in &doomed {
             debug!(neighbor = ?mac, "dropping next-hop proof: its key is gone");
             self.proven.remove(mac);
@@ -1138,6 +1168,17 @@ impl<
             )
         };
         let is_new_seqno = admission.advanced();
+        if matches!(admission, crate::SeqnoAdmission::Resynchronised { .. }) {
+            self.seqno_resyncs = self.seqno_resyncs.saturating_add(1);
+        }
+        // Counted only while a correction is actually in flight: an ordinary
+        // duplicate is not re-flooded either, and is the common case carrying
+        // no information at all. What this names is the interval in which this
+        // node keeps a route to a member for itself while silently declining to
+        // pass its OGMs on — which no node behind this one can observe.
+        if matches!(admission, crate::SeqnoAdmission::Watching) && ogm.ttl > 1 {
+            self.ogm_refloods_suppressed = self.ogm_refloods_suppressed.saturating_add(1);
+        }
 
         if admission.is_stale_copy() {
             trace!(
@@ -1427,7 +1468,11 @@ impl<
         // `admit` makes any wrong high-water self-correcting, and that a full
         // table evicts rather than refusing.  See `BroadcastSeqnoEntry`.
         if let Some(entry) = self.broadcast_seqno.get_mut(&orig_ident) {
-            if !entry.admit(incoming_seqno, now) {
+            let admission = entry.admit(incoming_seqno, now);
+            if matches!(admission, crate::SeqnoAdmission::Resynchronised { .. }) {
+                self.seqno_resyncs = self.seqno_resyncs.saturating_add(1);
+            }
+            if !admission.advanced() {
                 trace!(?orig_ident, incoming_seqno, "drop: broadcast not admitted");
                 return RoutingAction::Consumed;
             }
@@ -2778,6 +2823,101 @@ mod tests {
             deadline + 1,
             &ogm_via(2, 2, 4, 255)
         ));
+    }
+
+    /// The three observability counters, at the edges that matter: zero when
+    /// nothing has gone wrong, and counting the event rather than the frames
+    /// around it.
+    ///
+    /// Zero is the load-bearing case. Each of these names a fault, so a healthy
+    /// node must read `0` on all three — a counter that ticks during ordinary
+    /// operation is one an operator learns to ignore.
+    #[test]
+    fn the_fault_counters_stay_at_zero_on_an_untroubled_node() {
+        let mut engine = proving_engine();
+        engine.note_proven(core::time::Duration::ZERO, mac(2), 0);
+        for seqno in 1..=4u32 {
+            feed(&mut engine, u64::from(seqno), &ogm_via(2, 2, seqno, 255));
+        }
+        // A same-seqno copy via a second neighbor: not re-flooded, but nothing
+        // is wrong and nothing must be counted.
+        feed(&mut engine, 5, &ogm_via(2, 3, 4, 255));
+
+        assert_eq!(engine.seqno_resyncs(), 0);
+        assert_eq!(
+            engine.ogm_refloods_suppressed(),
+            0,
+            "an ordinary duplicate is not a suppressed re-flood"
+        );
+        assert_eq!(engine.proofs_swept(), 0);
+    }
+
+    /// A pinned high-water counts the OGMs it suppresses, then counts the
+    /// correction that ends it.
+    #[test]
+    fn a_pinned_high_water_counts_its_suppression_and_its_correction() {
+        let mut engine = proving_engine();
+        feed(&mut engine, 0, &ogm_via(2, 3, 5_000, 255));
+
+        // Three genuine OGMs refused while the run is still short.
+        for seqno in 1..=3u32 {
+            feed(&mut engine, u64::from(seqno), &ogm_via(2, 2, seqno, 255));
+        }
+        assert_eq!(
+            engine.ogm_refloods_suppressed(),
+            3,
+            "each OGM this node declined to pass on is one nodes behind it lost"
+        );
+        assert_eq!(engine.seqno_resyncs(), 0, "no correction has fired yet");
+
+        // Past the deadline the correction fires, and is counted once.
+        let deadline = 1 + crate::OGM_SEQNO_RESET_PROTECTION.as_secs();
+        feed(&mut engine, deadline, &ogm_via(2, 2, 4, 255));
+        assert_eq!(engine.seqno_resyncs(), 1);
+        assert_eq!(
+            engine.ogm_refloods_suppressed(),
+            3,
+            "the frame that trips the correction is re-flooded, not suppressed"
+        );
+    }
+
+    /// The counter spans both sequence-number spaces, because the failure and
+    /// the machinery behind it are the same in each.
+    #[test]
+    fn a_broadcast_resync_counts_on_the_same_tally_as_an_ogm_one() {
+        let secs = core::time::Duration::from_secs;
+        let mut engine = BatmanEngine::<4>::new(mac(1));
+        // Seed a high-water, then open a run far below it.
+        assert!(flooded(rx_bcast(&mut engine, secs(0), 2, 2, 5_000)));
+        assert!(!flooded(rx_bcast(&mut engine, secs(1), 2, 2, 1)));
+        assert_eq!(engine.seqno_resyncs(), 0);
+
+        let deadline = secs(1) + crate::BROADCAST_SEQNO_RESET_PROTECTION;
+        assert!(flooded(rx_bcast(&mut engine, deadline, 2, 2, 3)));
+        assert_eq!(
+            engine.seqno_resyncs(),
+            1,
+            "the broadcast space has been equally silent since its own fix; one \
+             tally covers both"
+        );
+    }
+
+    /// A swept proof is counted per neighbor, not per sweep.
+    #[test]
+    fn proofs_swept_counts_neighbors_not_sweeps() {
+        let mut engine = proving_engine();
+        engine.note_proven(core::time::Duration::ZERO, mac(2), 0);
+        engine.note_proven(core::time::Duration::ZERO, mac(3), 0);
+
+        engine.retain_proven(core::time::Duration::from_secs(1), |_| true);
+        assert_eq!(
+            engine.proofs_swept(),
+            0,
+            "a sweep that drops nothing counts nothing"
+        );
+
+        engine.retain_proven(core::time::Duration::from_secs(2), |_| false);
+        assert_eq!(engine.proofs_swept(), 2, "both neighbors, one sweep");
     }
 
     /// The OGM bands are exact at their edges, and are *not* the broadcast ones.

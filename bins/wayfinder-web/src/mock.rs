@@ -567,6 +567,9 @@ impl RouterReads for Mock {
             cert_req_rate: 0.25,
             cert_reply_rate: 0.75,
             untaggable_drop_rate: 0.0,
+            seqno_resyncs: 0,
+            ogm_refloods_suppressed: 0,
+            proofs_swept: 0,
         }
     }
 
