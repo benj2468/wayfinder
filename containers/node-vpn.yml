@@ -1,0 +1,144 @@
+# Node configuration for the tunnel posture — ../docker-compose.vpn.yml mounts
+# this in place of ./node.yml, and its header carries the operator recipe.
+#
+# The difference from ./node.yml is one link. This node reaches the mesh over
+# the Headscale-managed tunnel the certificate authority coordinates, rather
+# than over a NIC it shares an L2 segment with — the posture
+# `docs/design/implemented/08-internet-links-headscale-vpn.md` exists for, for a
+# host that is behind CGNAT, on someone else's network, or simply nowhere near
+# another node.
+#
+# The tunnel itself is not this file's business: `tailscaled` runs in the
+# `tailscale` container, and the node shares that container's network
+# namespace, so `tailscale0` and its 100.64.0.0/10 address are already in this
+# process's view of the network by the time a datagram is sent.
+local_egress:
+  # A kernel TAP, created *in the container's network namespace* rather than on
+  # the host — that namespace belongs to the `tailscale` container, and the node
+  # only borrows it. So this bridges the compose stack's traffic onto the mesh,
+  # not this machine's. Remove the whole `local_egress` block for a node that is
+  # honest about bridging nothing: the driver then runs a `NullEgress` and the
+  # node routes for the mesh without a local device at all, which is the
+  # certificate authority's own posture.
+  type: Tap
+  device_name: wayfinder0
+  # Sized for the tunnel, and the one number here that is not a default.
+  #
+  # A Tailscale interface has a 1280-byte MTU (WireGuard's, chosen to survive
+  # every path), while `TapConfig::DEFAULT_MTU` is 1411 — derived from a
+  # 1500-byte carrier. Left at the default, a full-size host frame becomes a
+  # ~1500-byte UDP datagram sent out a 1280-byte interface: Linux sets DF on UDP
+  # by default, so that is an `EMSGSIZE` on send, i.e. a link error for exactly
+  # the largest frames, while every small one goes through.
+  #
+  # 1191 = 1280 - TAP_ENCAP_OVERHEAD (89: the host Ethernet header carried
+  # verbatim, the Wayfinder link header, the BATMAN unicast header, the pairwise
+  # auth trailer, and a UDP/IPv4 underlay allowance). Raise it only alongside a
+  # tunnel MTU that justifies it.
+  mtu: 1191
+server:
+  # Same authenticated management API as ./node.yml, reached two ways here:
+  # ../docker-compose.vpn.yml publishes this port to the host's 127.0.0.1 for
+  # the dashboard, and — since 0.0.0.0 inside this namespace now includes
+  # `tailscale0` — it also answers on the tailnet, as a NixOS spoke's does. That
+  # is TLS with raw-public-key client authentication either way, so it widens
+  # who may *attempt* a handshake rather than who is admitted. Bind
+  # 127.0.0.1:7700 if this node should answer only its own dashboard.
+  type: Tls
+  addr: 0.0.0.0:7700
+links:
+  # The one mesh link, riding the tunnel.
+  #
+  # **Spoke mode**, the mirror image of the certificate authority's link in
+  # `nix/machines/wayfinder-ca/common.nix`: that node runs `UdpMulti` with no
+  # `discovery_addr` (hub/fan-out, learning every spoke from the OGMs it
+  # receives), and a spoke sets `discovery_addr` to the hub's tunnel address so
+  # its own broadcast-destined frames — its OGMs, before any peer is known —
+  # have somewhere to go. Once the hub has heard one, the two are learned peers
+  # and unicast flows both ways; other spokes converge *through* the hub, which
+  # is what `driver_core::Egress::Auto` re-flooding out the arrival interface
+  # buys (see `nix/tests/vpn-data-plane.nix`, which tests exactly this shape).
+  #
+  # 100.64.0.3 is the CA's Tailscale address on the tailnet run for
+  # wayfndr.dev, and 6000 is the `meshPort` its config binds. Confirm the
+  # address before trusting it — a tailnet address is assigned by the
+  # coordination server, not chosen: `tailscale ip -4` on the CA, or the
+  # dashboard's VPN tab against it, both name it.
+  #
+  # `bind_addr` is 0.0.0.0, deliberately not the tunnel address: `tailscale0`
+  # has no address until the tunnel is joined, which on a fresh stack happens
+  # after this node has already started, and a link bound to an address that
+  # does not exist yet fails at startup. Binding the wildcard means the link
+  # comes up regardless and simply cannot reach its peer yet — a `LinkErrors`
+  # alarm against this interface, not a dead node.
+  - name: vpn0
+    type: UdpMulti
+    bind_addr: 0.0.0.0:6000
+    discovery_addr: 100.64.0.3:6000
+# There is deliberately no raw-L2 link, unlike ./node.yml: sharing the tunnel
+# container's network namespace means there is no host NIC in scope to bind an
+# AF_PACKET socket to. A node that wants both a tunnel link and a link on its
+# host's own segment needs host networking, and therefore the host's own
+# tailscaled — see ../docker-compose.vpn.yml's header for why that is the trade
+# this deployment declines.
+#
+# Refuse to route until this node holds a valid membership certificate, rather
+# than falling back to the open, unauthenticated mesh.
+#
+# Left off deliberately, and only for the first boot: this node is enrolled from
+# its own dashboard, and it has to be reachable and running to be enrolled at
+# all. Turn it on afterwards — the Security tab's "Refuse to run
+# unauthenticated" switch does it over the management API and persists it below,
+# so it needs no edit here. What it then buys is that a node which somehow loses
+# its certificate goes silent instead of rejoining the mesh in the open.
+# require_auth: true
+
+# Accept this node's clock without a machine-readable second opinion.
+#
+# Unlike ./node.yml — where the gate is off because a node with no `auth:` and
+# no `provider:` has no credential decision to protect — this node does make
+# them: it holds a membership certificate and checks the validity window of
+# every one it is handed. The gate is off anyway, because under Docker Desktop
+# (macOS/Windows) it cannot be satisfied at all:
+#
+#   - The kernel whose NTP status word `clock_trust.rs` reads is the LinuxKit
+#     VM's, and that clock is *stepped* by the hypervisor's timesync rather
+#     than disciplined by a daemon. Each step sets `STA_UNSYNC` and pins
+#     `maxerror` at its 16 s ceiling, so `ntp_adjtime` answers `TIME_ERROR`
+#     forever. Measured identical under the default seccomp profile, under
+#     `--cap-add SYS_TIME`, and under `seccomp=unconfined`: it is not a
+#     permission problem and no capability moves it.
+#   - That status word is per-kernel and is not namespaced — time namespaces
+#     virtualize the monotonic/boottime offsets only — so no container can fix
+#     it from the inside. A chronyd in here would need CAP_SYS_TIME and would
+#     be disciplining the whole VM out from under Docker Desktop's timesync.
+#
+# So leaving it on is not the stricter posture here, it is the broken one, and
+# it breaks the one thing this compose file exists to do. An untrusted clock
+# makes the driver hand the adapter a zero epoch offset (`epoch_offset` in
+# wayfinder-driver), so the certificate a `SetAuth` install carries is verified
+# against a few seconds past 1970 and refused as not-yet-valid — enrollment
+# from the Security tab fails, and the only clue is one startup line about NTP.
+#
+# **Delete this line on a Linux Docker host.** There the container reads the
+# host kernel's status word, so a host running chrony with `rtcsync` (what
+# ../nix/modules/wayfinder.nix sets, and why) satisfies the gate for every
+# container on the box — and the enforcing default is the one you want, since
+# this node's clock decides whether its peers' certificates are still valid.
+require_time_sync: false
+# Where the identity installed over the management API is persisted, so this
+# node comes back up enrolled.
+#
+# Not optional here, unlike in ./node.yml — it is the whole enrollment story.
+# This node has no certificate at first boot and no `auth:` block naming files
+# to load one from; it acquires one from the dashboard's Security tab, which
+# sends it over the management API. Without this path that certificate would
+# live in memory only, and the node would come back from the next `docker
+# compose restart` un-enrolled: its OGMs unsigned, and dropped by every node
+# that has a trust anchor.
+#
+# The node writes it owner-only, because it carries the identity seed as well as
+# the certificate. That also makes it the file to copy if this node's identity
+# is ever needed as *files* — see ../docker-compose.vpn.yml's header, where
+# minting a tunnel credential needs exactly that.
+runtime_state_path: /var/lib/wayfinder/settings.json

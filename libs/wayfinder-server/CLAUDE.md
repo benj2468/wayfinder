@@ -379,10 +379,11 @@ Four rules to keep when touching it:
   (`UserRecord::session_ttl_secs`), not a constant here — still bounded by
   `MAX_CERT_TTL_SECS`.
 
-Accounts are administered over the management API, by `wayfinderctl user` — and
-nothing administers them through the state file. A provider rewrites that whole
-snapshot from memory on every write, so a second writer beside it raced those
-writes and silently discarded one side or the other; design 15 has the detail.
+Accounts are administered over the management API, by `wayfinderctl provider
+user` — and nothing administers them through the state file. A provider rewrites
+that whole snapshot from memory on every write, so a second writer beside it
+raced those writes and silently discarded one side or the other; design 15 has
+the detail.
 
 The first account is the case that looks like it needs a file: it cannot be
 created *by* an account, because creating one needs the credential it creates.

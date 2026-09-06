@@ -564,7 +564,7 @@ def make_accounts(dev: DevInfo) -> None:
         print(
             f"could not reach the provider's management API on {dev.provider_name}; "
             f"accounts NOT created. Last error:\n{reason}\n"
-            f"Retry with: wayfinderctl {' '.join(connect)} user add --username "
+            f"Retry with: wayfinderctl {' '.join(connect)} provider user add --username "
             f"{SIM_ADMIN_USER} --admin --no-totp --password-stdin",
             file=sys.stderr,
         )
