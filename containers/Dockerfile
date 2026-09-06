@@ -302,6 +302,45 @@ COPY --from=builder /out/wayfinder-ctl /usr/local/bin/wayfinder-ctl
 ENTRYPOINT ["/usr/local/bin/wayfinder-ctl"]
 
 # ---------------------------------------------------------------------------
+# wayfinder-ctl-vpn: the same CLI, plus the tunnel client it shells out to.
+# ---------------------------------------------------------------------------
+#
+# `wayfinderctl auth enroll` and `wayfinderctl provider vpn enrollment` ask the
+# authority for a single-use, minutes-lived tunnel preauth key and then exec
+# `tailscale up` with it (`bins/wayfinder-ctl/src/vpn.rs::run_tailscale_up`).
+# Wherever that binary is missing, the tunnel half degrades to
+# `--print-command` and a line somebody else has to run before the key expires.
+#
+# A separate stage rather than adding this to `ctl`, because it is only ever
+# right where a tunnel exists: `ctl` stays the minimal image every other
+# deployment pulls, and this one is what docker-compose.vpn.yml's `ctl` service
+# switches to. The two share the same binary, so a command that works against
+# one works against the other.
+#
+# The tailscale binary is copied from the upstream image rather than
+# apt-installed: `COPY --from=<image>` resolves that image for TARGETPLATFORM
+# just as the base does, which keeps this stage multi-arch with one source of
+# truth for the version — the same tag docker-compose.vpn.yml runs the daemon
+# from, so client and daemon cannot drift. Only the client goes in; `tailscaled`
+# belongs to the `tailscale` service, which owns the TUN device and the state.
+#
+# Distroless still: `wayfinder-ctl` execs `tailscale` directly, which needs no
+# shell, and the tailscale binary is a static Go build that needs nothing this
+# base lacks (verified by running it here, not assumed).
+#
+# It reaches the daemon over `/var/run/tailscale/tailscaled.sock` — the CLI's
+# compiled-in default, which `run_tailscale_up` passes no override for. That
+# path is a contract with the compose file, which shares the daemon's socket
+# volume at exactly that mount point.
+FROM gcr.io/distroless/cc-debian12 AS ctl-vpn
+
+COPY --from=builder /out/wayfinder-ctl /usr/local/bin/wayfinder-ctl
+COPY --from=docker.io/tailscale/tailscale:v1.102 \
+    /usr/local/bin/tailscale /usr/local/bin/tailscale
+
+ENTRYPOINT ["/usr/local/bin/wayfinder-ctl"]
+
+# ---------------------------------------------------------------------------
 # wayfinder-web: management-API dashboard in a browser.
 # ---------------------------------------------------------------------------
 #

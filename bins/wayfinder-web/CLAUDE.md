@@ -545,9 +545,9 @@ whole mesh honours. Four things govern it:
   once-a-second snapshot. That is also what keeps the create form from being
   rebuilt mid-keystroke — the same failure the memoised panels above avoid.
 - **The first account cannot be created here.** Creating one over the API needs
-  the credential it creates, so `wayfinderctl user add` on the provider host
-  remains the only way to bootstrap. What this tab adds is every account after
-  that, and it is a real widening: an admin session can now mint another
+  the credential it creates, so `wayfinderctl provider user add` on the provider
+  host remains the only way to bootstrap. What this tab adds is every account
+  after that, and it is a real widening: an admin session can now mint another
   account. The trade is stated in the proto (`CreateUserRequest`) — an admin can
   already revoke nodes and rewrite the enrollment policy, so it grants no new
   class of power, but it does put the user store on the network.
@@ -573,8 +573,8 @@ whole mesh honours. Four things govern it:
   still administer the mesh — both it and `CreateUser` need a full management
   grant, so an authority with no enabled administrator has a user store that no
   dashboard can change again. The *inherent* `CertAuthority::remove_user` has no
-  such guard on purpose: it is what `wayfinderctl user remove` calls on the
-  provider host, and it is the recovery path that refusal points at. The tab
+  such guard on purpose: it is what `wayfinderctl provider user remove` calls on
+  the provider host, and it is the recovery path that refusal points at. The tab
   shows the refusal as an error rather than pre-computing "is this the last
   admin?" in the browser, per "the node is the authority" above.
 

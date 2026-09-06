@@ -286,6 +286,14 @@ on disk and assuming the node picks it up on its next restart. `wayfinderctl
 cert install` did the former and was deleted for it — `csr install` replaces it
 with `SetAuth` over the wire, which works against a board and a host alike.
 
+The same rule runs in the read direction: to learn what a node holds, ask the
+node. `--cert-from <addr>` fetches the membership certificate a node is running
+under over `GetOwnCert` and presents *that* as the client credential, instead of
+going looking for a `cert_path` on its disk or making the operator mint a second
+copy through `csr request`/`csr submit`. The node it reads from is pinned to the
+public half of `--identity`, since a certificate is useful only to the holder of
+the key it names.
+
 The rule extends to state a node *owns* on its own disk, not only to state it
 reads. `wayfinderctl provider user` administered a provider's accounts by
 editing its `ca-state.json`, and was rewritten as pure RPC for it (design 15):
@@ -554,7 +562,27 @@ the root workspace" above)
   Cloudflare (no TCP/UDP ingress) and GCP (external IPv4 is billed) were
   evaluated and rejected, so that is not re-litigated.
 - **containers/Dockerfile + docker-compose.yml** — the container path, for a
-  host that is not NixOS.
+  host that is not NixOS. `docker-compose.vpn.yml` is the optional second half:
+  a `tailscaled` container plus `containers/node-vpn.yml`'s `UdpMulti` link to
+  the CA's tunnel address, the container equivalent of what `mkCloudSystem`
+  gives a NixOS spoke. An *override* file rather than a profile because the node
+  has to move into the tunnel container's network namespace
+  (`network_mode: service:tailscale`) — most hosts already run a tailscaled of
+  their own, and one daemon cannot hold two tailnets. The two admissions a node
+  needs — mesh membership and a tunnel registration — are taken separately and
+  neither is a file an operator places: the mesh half from the dashboard's
+  Security tab (the node's own seed, off the shared `state` volume, is full
+  management access while it has no trust anchor), persisted to
+  `runtime_state_path` so it survives a restart; the tunnel half from the
+  `ctl-vpn` sidecar, as `wayfinderctl --connect <ca> --cert-from 127.0.0.1:7700
+  provider vpn enrollment`, which reads back the certificate the node is
+  already running under rather than making the operator mint a second copy of
+  it, and execs `tailscale up` against the daemon's shared socket
+  (`--print-command` to see the line instead). That preauth key is minted for
+  this node's MAC, which is the only record correlating a tunnel peer with a
+  mesh node (`wayfinder_server::vpn::hostname_for`). Which authority the node
+  answers to stays a runtime choice throughout: the same Security tab moves it
+  to another mesh over `SetAuth`.
 
 A node needs neither a local egress nor links: `local_egress` absent gives the
 driver a `NullEgress` local device, which is the certificate-authority posture.

@@ -61,6 +61,13 @@ local.properties
 # Wayfinder specifics
 var/conf/wayfinder0.state
 
+# A containerised node's mesh identity, membership certificate and trust
+# anchor, for a deployment that boots them from a static `auth:` block rather
+# than enrolling over the management API the way the compose stack does. The
+# seed *is* the node's identity on the mesh; it is minted per deployment and
+# belongs wherever that host's secrets live, never in this repo.
+containers/secrets/
+
 # Static site build output (scripts/build-site.sh)
 dist/
 

@@ -400,8 +400,8 @@ deploy:
           EXTRA_TAG="nightly"
         fi
       fi
-      echo "Building wayfinder-tap, wayfinder-tui, wayfinder-ctl and wayfinder-web images (linux/amd64, linux/arm64) tagged '$IMAGE_TAG'${EXTRA_TAG:+ and '$EXTRA_TAG'}"
-      for app in tap tui ctl web; do
+      echo "Building wayfinder-tap, wayfinder-tui, wayfinder-ctl, wayfinder-ctl-vpn and wayfinder-web images (linux/amd64, linux/arm64) tagged '$IMAGE_TAG'${EXTRA_TAG:+ and '$EXTRA_TAG'}"
+      for app in tap tui ctl ctl-vpn web; do
         image="$CI_REGISTRY_IMAGE/wayfinder-$app:$IMAGE_TAG"
         # Both tags name the same manifest, so buildx builds once and pushes it
         # under each name — no second build for the nightly tag.

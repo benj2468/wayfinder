@@ -264,7 +264,7 @@ run on the node's own host:
 
 ```bash
 nix run .#wayfinder-ctl -- --connect <public_ip>:7700 --node-key <ca-pubkey> \
-    --cert-from 127.0.0.1:7700 vpn enrollment
+    --cert-from 127.0.0.1:7700 provider vpn enrollment
 ```
 
 `--cert-from` asks the node at that address for the certificate it is running
@@ -303,18 +303,22 @@ the API key the CA mints tunnel credentials with
 expires) and the TLS certificate, which Headscale obtains from Let's Encrypt
 itself.
 
-**The CA is on that tunnel too.** `wayfinder-headscale-selfjoin.service` mints
-a preauth key against the local Headscale at first boot and spends it, so this
-box holds a `100.64.0.0/10` address like any other node — which is what its own
+**The CA is on that tunnel too.** `wayfinder-headscale-selfjoin.service` asks
+this node for its own tunnel credential at first boot and spends it, so the box
+holds a `100.64.0.0/10` address like any other node — which is what its own
 `UdpMulti` mesh link is reached on, and what every spoke's `discovery_addr`
 points at. It registers under the Headscale user named after its own MAC, the
 same convention an enrolled node's credential is scoped to, so `wayfinderctl
-vpn list` names this peer like the rest.
+provider vpn list` names this peer like the rest.
 
-It cannot use the `vpn enrollment` RPC every other node uses: that credential is
-scoped to a *device* identity and a node connecting to itself with its own key
-is refused by design. It does not need to — the coordination server is on the
-same box.
+It takes the same `provider vpn enrollment` path every other node does, and
+differs only in what it presents for it. That credential is scoped to a
+*device*, and there are two ways to prove one: an enrolled node's membership
+certificate, or — connecting to a node over loopback from the host it runs on —
+that node's own identity seed with no certificate at all, which is the self-key
+tier and is the node asking on its own behalf. This unit takes the second. An
+operator's session certificate proves a person rather than a device and is
+refused here however privileged it is.
 
 `UDP/41641` is `tailscaled`'s own port, so a spoke can hole-punch a direct
 WireGuard path here. The mesh link's port is *not* opened: it binds `0.0.0.0`

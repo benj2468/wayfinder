@@ -1,0 +1,243 @@
+# The optional half of ./docker-compose.yml: a tunnel this node reaches the
+# mesh over, when its mesh neighbors are not on this host's own network.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.vpn.yml up -d
+#   open http://127.0.0.1:8080
+#
+# An override file rather than a profile, because what it adds is not only a
+# container: it moves the `node` container into a network namespace of its own
+# and points it at a different config. A profile can add a service but cannot
+# change one, so expressing this as `--profile vpn` would have meant one
+# `docker-compose.yml` whose default posture was half-configured for the other.
+#
+#
+# ## Why a separate network namespace
+#
+# ./docker-compose.yml runs the node with `network_mode: host`, which is right
+# there — a raw-L2 link needs to see a real host NIC. Here it is wrong, for a
+# reason that has nothing to do with the mesh: a `tailscaled` owns the whole
+# network namespace it runs in (one `tailscale0`, one set of routes, one state
+# file), and most hosts you would want to do this on are already running one for
+# their own tailnet. A daemon cannot be registered with two coordination servers
+# at once, so this one has to live somewhere else.
+#
+# So `tailscale` here gets Compose's ordinary bridge network, and `node` joins
+# *its* namespace with `network_mode: service:tailscale`. The two share one
+# stack: the node's `UdpMulti` link sends out the `tailscale0` that its
+# namespace-mate created, and the host's own Tailscale is untouched — different
+# namespace, different daemon, different state.
+#
+# Three consequences worth stating, because each is a real trade rather than an
+# implementation detail:
+#
+#   * **The node's TAP is not on your host.** `wayfinder0` is created inside the
+#     container namespace, so what it bridges onto the mesh is that namespace's
+#     traffic, not this machine's. This node routes for the mesh and the
+#     dashboard shows it all; your laptop does not gain a mesh interface. Making
+#     it one means host networking, which means the host's tailscaled — see
+#     above. Drop `local_egress` from containers/node-vpn.yml if you would
+#     rather the node be honest about bridging nothing.
+#   * **The management API is published, not shared.** `web` stays on the host
+#     network (its port must be reachable from your browser, and it must *not*
+#     be reachable from the tailnet), so it can no longer see the node on the
+#     host's loopback. The `ports:` line below carries 7700 back to
+#     127.0.0.1, which is the address ./docker-compose.yml already tells the
+#     dashboard to use — so `web` needs no override at all.
+#   * **The node's mgmt API is on the tunnel too**, since it binds 0.0.0.0
+#     inside a namespace that now has a tailnet address. That is authenticated
+#     TLS with raw-public-key client auth either way, and it is the same posture
+#     a NixOS spoke runs in; bind it to 127.0.0.1:7700 in
+#     containers/node-vpn.yml if this node should answer only its own dashboard.
+#
+#
+# ## Admitting this node: two credentials, neither of them a file you place
+#
+# A node here needs a mesh membership *and* a tunnel registration, and they are
+# deliberately separate gates (design 08: two gates in series, not one gate
+# producing two artifacts). Both are once-per-node.
+#
+# **1. The mesh, from the dashboard.** http://127.0.0.1:8080 → Security → "Join
+# a mesh":
+#
+#     Provider address   ca.wayfndr.dev:7700
+#     Provider key       21eca19792e0c231a790d86b0353e7625560f9139d32fff062a091be5fa49707
+#     Enrollment token   (blank — that authority requires none)
+#
+# The key pins the authority, so nothing else can answer in its place and
+# certify this node into the wrong mesh. What makes this work on a node that
+# holds nothing yet is the seed it generated on first boot: proving the node's
+# own key is full management access while it has no trust anchor to check a
+# certificate against (`authz::decide_access`, the self-key tier), and the `web`
+# container reads that seed off the shared `state` volume. So the dashboard is
+# an administrator of an un-enrolled node without any certificate existing.
+#
+# The request names the identity the node already runs under, so its MAC does
+# not change and the dashboard keeps working across the moment of enrollment.
+# wayfndr.dev holds requests for a human: the panel sits on "waiting for an
+# operator to approve" — leave it open, approve at dash.wayfndr.dev (Security →
+# Requests), and it collects the certificate itself. The node persists it to the
+# `runtime_state_path` its config names, so it comes back up enrolled.
+#
+# **2. The tunnel, with one `tailscale up`.** The daemon below starts logged
+# out and stays that way — `tailscale status` says "Logged out", and the node
+# meanwhile logs `udp-multi send failed … NetworkUnreachable`, because there is
+# no 100.64.0.0/10 route to send down yet. That is the expected intermediate
+# state, not a fault.
+#
+# It needs a preauth key from the authority, and the RPC that mints one
+# (`GetVpnEnrollment`) requires the caller to prove it is *this device*: the
+# node's seed **and its membership certificate**, presented on the connection.
+# The seed the `ctl` sidecar already has, off the shared volume. The certificate
+# it does not: a dashboard enrollment installs that over the management API, so
+# it exists inside the node and never as a file. `--cert-from` reads it back the
+# same way — ask the node for the certificate it is already running under and
+# present *that* to the authority — so the join is one command:
+#
+#     docker compose … run --rm ctl \
+#         --connect ca.wayfndr.dev:7700 \
+#         --node-key 21eca19792e0c231a790d86b0353e7625560f9139d32fff062a091be5fa49707 \
+#         --cert-from 127.0.0.1:7700 \
+#         provider vpn enrollment
+#
+# (`…` being this file's two `-f` flags.) `--connect` still names the authority
+# and `--node-key` still pins it; `--cert-from` changes only the credential
+# presented, and the node it reads that credential from is pinned to the public
+# half of `--identity` — which defaults to the seed on the shared volume, i.e.
+# this node's own key. 127.0.0.1:7700 is the node because the sidecar shares its
+# namespace (see `network_mode` below).
+#
+# There is deliberately no `csr request` → `csr submit` round trip here any more:
+# those two steps existed only to obtain a second copy of a certificate the node
+# was already holding, and they put it on an operator's disk to do it. A node
+# that holds *no* certificate is told to enroll — step 1 above — rather than
+# handed an empty one.
+#
+# The same command completes the join: the sidecar's `ctl-vpn` image carries the
+# `tailscale` client, and `wayfinderctl` execs it against the daemon's socket —
+# which is why the two share `tailscale-sock` below. Add `--print-command` to
+# see the line instead of running it.
+#
+# Nothing secret leaves the node in any of this. The seed stays in its volume,
+# read inside the sidecar; the certificate comes from the node that holds it,
+# over a connection pinned to that node's own key.
+#
+# The preauth key is minted for this node's identity, so the registration lands
+# under the Headscale user named by its MAC — the only record correlating a
+# tunnel peer with a mesh node (`wayfinder_server::vpn::hostname_for`), and what
+# makes the authority's VPN tab name this peer and `wayfinderctl provider
+# revoke` take its tunnel down along with its membership. A key minted by hand
+# on the CA works and loses exactly that, unless created under that same
+# MAC-named user.
+#
+# **Changing authority later is a runtime action, not a re-provisioning.** The
+# same Security panel moves this node to another mesh, keeping its identity and
+# MAC, and what it installs takes precedence from the next boot.
+#
+# **Checking it worked**, in order of what fails first:
+#
+#     … exec tailscale tailscale ip -4          # a 100.64.x.x address here
+#     … exec tailscale tailscale ping 100.64.0.3
+#     dashboard → Security                       # enrolled, with the mesh id
+#     dashboard → Links                          # vpn0, and the CA as a neighbor
+#     dashboard → Routing                        # the rest of the mesh, via it
+services:
+  # The tunnel daemon, and the owner of the network namespace `node` joins.
+  tailscale:
+    # Upstream's image, pinned to a minor version the way containers/Dockerfile
+    # pins Rust.
+    image: tailscale/tailscale:v1.102
+    pull_policy: always
+    # NET_ADMIN to create the TUN device and program routes; NET_RAW for the
+    # netfilter rules tailscaled installs alongside them. Both apply to this
+    # container's own namespace, which is the entire point.
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    # `tailscaled` directly, rather than the image's `containerboot` entrypoint.
+    # containerboot's job is to authenticate the tunnel from TS_AUTHKEY, and
+    # with no key it sits in an interactive `tailscale up` waiting for someone
+    # to open a login URL — which would race the one-time `tailscale up` above
+    # and, worse, could register this node under a Headscale user that is not
+    # its MAC. Authentication is a step this file deliberately leaves to the
+    # operator; the daemon's job here is only to be running when they take it.
+    #
+    # The flags are the defaults spelled out, because `--state` is a contract
+    # rather than a preference: it is what makes a completed join survive a
+    # `docker compose down`, and re-registering instead would mint a second
+    # Headscale node for the same mesh identity every time.
+    entrypoint:
+      - /usr/local/bin/tailscaled
+      - --state=/var/lib/tailscale/tailscaled.state
+      - --socket=/var/run/tailscale/tailscaled.sock
+      - --port=41641
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      # The daemon's control socket, shared with the `ctl` sidecar below — how
+      # `wayfinderctl` completes a tunnel join from the container that holds the
+      # mesh credential but not the daemon. Anything that can open this socket
+      # can reconfigure the tunnel, so it is a named volume shared with exactly
+      # one other service rather than a path on the host.
+      - tailscale-sock:/var/run/tailscale
+    # The node's management API, carried back to the host loopback for the
+    # dashboard. Declared here rather than on `node` because a container using
+    # `network_mode: service:` has no ports of its own — this namespace's owner
+    # publishes for both.
+    #
+    # 127.0.0.1 explicitly: on a Linux host a bare `7700:7700` binds every
+    # interface, and this port answers `SetAuth`.
+    ports:
+      - "127.0.0.1:7700:7700"
+    restart: unless-stopped
+  node:
+    # Join the tunnel container's namespace. This replaces the base file's
+    # `network_mode: host`, and with it the node's view of the world: no host
+    # NIC (so no raw-L2 link — containers/node-vpn.yml has none), and
+    # `tailscale0` present as soon as the daemon brings it up.
+    network_mode: service:tailscale
+    volumes:
+      # Same container path as the base file's mount, so this replaces it
+      # rather than adding a second config.
+      - ./containers/node-vpn.yml:/etc/wayfinder/node.yml:ro
+    # `network_mode: service:` already implies this ordering; stated so the
+    # dependency is visible to a reader rather than only to Compose.
+    depends_on:
+      - tailscale
+  # The base file's CLI sidecar, made tunnel-capable. Same binary, same
+  # credential, same commands — two additions:
+  #
+  #   * the `ctl-vpn` image, which carries the `tailscale` client
+  #     `wayfinderctl` execs once an authority hands it a preauth key, so
+  #     `provider vpn enrollment` finishes the join instead of printing a
+  #     command; and
+  #   * that daemon's control socket, which is what it execs against.
+  #
+  # `network_mode` follows `node` into the tunnel namespace rather than staying
+  # on the host: it puts the CLI on the same loopback as the node's management
+  # API (so `WAYFINDER_CONNECT` from the base file is still right), and gives it
+  # the tunnel's own routes — which is what lets it reach a mesh node *through*
+  # the tunnel once this one has joined.
+  #
+  # No `pull_policy: always` here, unlike the services the base file starts:
+  # this tag only exists once CI has built it, and until then the image is the
+  # local one from
+  #
+  #   docker compose -f docker-compose.yml -f docker-compose.vpn.yml build ctl
+  #
+  # which an unconditional pull would discard in favour of a registry miss.
+  ctl:
+    build:
+      target: ctl-vpn
+    image: registry.haganah.net/wayfinder-ctl-vpn:nightly
+    network_mode: service:tailscale
+    volumes:
+      - tailscale-sock:/var/run/tailscale
+    depends_on:
+      - tailscale
+volumes:
+  tailscale-sock:
+  # The tunnel's own identity. Losing it means re-registering, which mints a
+  # *new* Headscale node for the same mesh identity and leaves the old one in
+  # the authority's peer list — see the enrollment note above.
+  tailscale-state:

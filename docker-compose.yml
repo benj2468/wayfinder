@@ -3,14 +3,17 @@
 #   docker compose up --build      # first run also compiles the workspace
 #   open http://127.0.0.1:8080
 #
-# Two containers, both built from containers/Dockerfile (which see for how the
-# images are assembled):
+# Three services, all built from containers/Dockerfile (which see for how the
+# images are assembled) — two that run, and one that is only ever `run`:
 #
 #   node  — wayfinder-tap: the mesh node. Creates a kernel TAP, carries a raw-L2
 #           mesh link on a host NIC, and serves the management API.
 #   web   — wayfinder-web: the axum/Leptos dashboard. It is the only party that
 #           speaks the management protocol (the browser never does), so it
 #           holds a mesh identity and connects out to `node`.
+#   ctl   — wayfinderctl, one command at a time (`docker compose run --rm ctl
+#           …`). Not started by `up`: it is a CLI, given the node's identity
+#           volume so it authenticates as the node with no flags.
 #
 # The two share the `state` volume, which is how the dashboard gets an identity:
 # the node writes /var/lib/wayfinder/identity.seed on first boot, and the
@@ -30,6 +33,7 @@ services:
       dockerfile: containers/Dockerfile
       target: tap
     image: registry.haganah.net/wayfinder-tap:nightly
+    pull_policy: always
     command: ["--config", "/etc/wayfinder/node.yml"]
     network_mode: host
     # NET_ADMIN + /dev/net/tun to create and configure the kernel TAP device;
@@ -67,6 +71,7 @@ services:
       dockerfile: containers/Dockerfile
       target: web
     image: registry.haganah.net/wayfinder-web:nightly
+    pull_policy: always
     # Host networking, same as `node`. `--listen` (the dashboard's own bind
     # address, distinct from `--connect` below) is passed explicitly rather than
     # left to a default, because under host networking loopback is the *host's*
@@ -99,5 +104,71 @@ services:
     depends_on:
       - node
     restart: unless-stopped
+  # `wayfinderctl` against this node, one invocation at a time:
+  #
+  #   docker compose run --rm ctl --identity /var/lib/wayfinder/identity.seed node-info
+  #   docker compose run --rm ctl --identity /var/lib/wayfinder/identity.seed auth status
+  #   docker compose run --rm ctl --identity /var/lib/wayfinder/identity.seed link list
+  #
+  # A service rather than a documented `docker run` line because of the volume:
+  # the node's identity seed lives in `state`, which is a named volume with no
+  # path on this host, and that seed is the credential. Proving the node's own
+  # key *is* full management access on a node with no trust anchor yet (the
+  # self-key tier in `wayfinder_server::authz`), and remains valid after
+  # enrollment — so this is the one credential that works at every stage of a
+  # node's life.
+  #
+  # `--identity` is spelled out rather than left to its default, and this is the
+  # one place that distinction bites. The path *is*
+  # `ConnectArgs::DEFAULT_IDENTITY_PATH`, which is exactly where the volume is
+  # mounted — but `wayfinderctl` only falls back to it once something else has
+  # already decided the credential (the `--cert-from` branch of
+  # `build_endpoint`). An absent `--identity` on a plain query means "use the
+  # stored login session" instead, so these commands fail with "no credential"
+  # without it. Setting `WAYFINDER_IDENTITY` in the environment below would fix
+  # the flag away, at the cost of making `wayfinderctl login` unreachable from
+  # this service — the session that volume exists to keep would never be
+  # consulted again. The flag is the cheaper half of that trade.
+  #
+  # In its own profile so `up` never starts it. It is a CLI with no default
+  # subcommand, and `docker compose run` enables a service's profile implicitly,
+  # so the commands above need no `--profile`.
+  ctl:
+    profiles: ["cli"]
+    build:
+      context: .
+      dockerfile: containers/Dockerfile
+      target: ctl
+    image: registry.haganah.net/wayfinder-ctl:nightly
+    # Host networking, like everything else here: the node's management API is
+    # on the host's loopback, and an offline `cert` subcommand opens no
+    # connection at all (`provider user` is not one of those any more — accounts
+    # are administered over the management API).
+    network_mode: host
+    volumes:
+      # Read-only, and that is the whole posture: this container reads the
+      # node's identity to authenticate as it, and must never be the thing that
+      # rewrites it. Everything that changes the node goes over the management
+      # API instead.
+      - state:/var/lib/wayfinder:ro
+      # Somewhere durable for the operator-side files a command produces — a
+      # CSR carried to an offline CA, a certificate collected from one, the
+      # session `wayfinderctl login` stores. Durable because these outlive a
+      # single `run`: a provider that holds requests for approval is answered
+      # hours later, by a second invocation that has to find the first one's
+      # output.
+      - ctl-work:/work
+    environment:
+      # The node this CLI talks to unless `--connect` says otherwise, so
+      # commands aimed at *this* node need no flags and the ones aimed at an
+      # authority say so explicitly.
+      WAYFINDER_CONNECT: "127.0.0.1:7700"
+      # Keep `wayfinderctl login`'s stored session on the durable volume rather
+      # than in a container-lifetime $HOME.
+      WAYFINDER_CONFIG_HOME: "/work/config"
+    # A one-shot: `run` must not resurrect it, and a non-zero exit (a CSR still
+    # awaiting approval, say) is a result to read rather than a crash to retry.
+    restart: "no"
 volumes:
   state:
+  ctl-work:
