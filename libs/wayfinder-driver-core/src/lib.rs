@@ -168,6 +168,21 @@ enum RequiredProof {
     None,
     /// The per-neighbour pairwise tag every directed frame carries.
     Tag,
+    /// The same pairwise tag as [`Tag`](Self::Tag), with freshness taken from
+    /// a challenge nonce instead of the replay counter — the next-hop proof
+    /// *response*, and nothing else.
+    ///
+    /// Same trailer, same tag, same forgery resistance; the only difference is
+    /// that a counter behind our high-water for the sender is held pending its
+    /// nonce rather than refused outright. It exists because the counter is a
+    /// peer's in-memory sequence that restarts at zero on reboot, which would
+    /// otherwise leave a returning member unable to prove itself — the proof
+    /// frames being directed frames themselves — and so permanently unroutable
+    /// while its OGMs kept it visible. See
+    /// [`OgmAuth::verify_directed_nonce_fresh`] for the full argument.
+    ///
+    /// [`OgmAuth::verify_directed_nonce_fresh`]: wayfinder::auth::OgmAuth::verify_directed_nonce_fresh
+    NonceTag,
     /// The sender's own signature, for a multicast frame one transmission
     /// carries to several next hops at once (design 17 §4.4).
     Fanout,
@@ -181,11 +196,15 @@ impl RequiredProof {
     /// The length is a *consequence* of the proof, never a substitute for it:
     /// recovering "which verifier" by comparing a length back against a
     /// constant is how a third site came to reach for the wrong one, leaving
-    /// 48 bytes of signature attached to a frame that had verified.
+    /// 48 bytes of signature attached to a frame that had verified. Since
+    /// [`NonceTag`](Self::NonceTag) joined [`Tag`](Self::Tag) at the same
+    /// length that is no longer merely unwise but impossible: the two directed
+    /// forms are indistinguishable by length and differ only in the freshness
+    /// rule, so a length can no longer name a verifier even in principle.
     const fn trailer_len(self) -> usize {
         match self {
             Self::None | Self::Drop => 0,
-            Self::Tag => DIRECTED_TRAILER_LEN,
+            Self::Tag | Self::NonceTag => DIRECTED_TRAILER_LEN,
             Self::Fanout => FANOUT_TRAILER_LEN,
         }
     }
@@ -245,9 +264,22 @@ fn required_proof(payload: &[u8]) -> RequiredProof {
             BatmanPacketType::Unicast
             | BatmanPacketType::EchoRequest
             | BatmanPacketType::EchoReply
-            | BatmanPacketType::NextHopChallenge
-            | BatmanPacketType::NextHopResponse,
+            | BatmanPacketType::NextHopChallenge,
         ) => RequiredProof::Tag,
+        // The one sub-type carrying its own freshness. A response answers a
+        // nonce its receiver issued and consumes on use, so replaying one
+        // proves nothing; the *challenge* stays on the full guard above,
+        // because its nonce is checked by nobody and a replay of it would buy
+        // an attacker a tag and a transmission from the victim.
+        //
+        // That asymmetry is load-bearing and easy to "tidy" away. It means a
+        // rebooted node's own challenges are still refused by the peer that
+        // stayed up, so recovery only ever starts from the peer that did *not*
+        // reboot: it challenges, the reborn node's response takes this path,
+        // the high-water re-anchors, and only then can the reborn node's own
+        // challenges get through. Symmetrising the two sub-types would restore
+        // the replay primitive above and buy nothing.
+        Some(BatmanPacketType::NextHopResponse) => RequiredProof::NonceTag,
         // Unrecognised sub-type, or an empty payload: fail closed.
         None => RequiredProof::Tag,
     }
@@ -272,7 +304,7 @@ fn strip_directed<'a, R: RouterOps>(router: &mut R, frame: &'a LinkFrame) -> Opt
     let trailer_len = proof.trailer_len();
     match proof {
         RequiredProof::None => return Some(frame),
-        RequiredProof::Tag | RequiredProof::Fanout => {}
+        RequiredProof::Tag | RequiredProof::NonceTag | RequiredProof::Fanout => {}
         RequiredProof::Drop => {
             // A multicast frame naming a proof this build cannot demand. Never
             // a fallback to trying the other verifier: with the payload running
@@ -289,9 +321,17 @@ fn strip_directed<'a, R: RouterOps>(router: &mut R, frame: &'a LinkFrame) -> Opt
         return None;
     };
     let (inner, trailer) = frame.payload.split_at(body_len);
+    // Exhaustive on purpose — no `_` arm. This is one of the two sites that
+    // choose a *verifier*, and the dangerous direction is a future variant
+    // silently inheriting `NonceTag`'s counter exemption. Naming every variant
+    // makes adding one a compile error here rather than a security decision
+    // made by omission.
     let ok = match proof {
         RequiredProof::Fanout => auth.verify_fanout(frame.src, inner, trailer),
-        _ => auth.verify_directed(frame.src, inner, trailer),
+        RequiredProof::NonceTag => auth.verify_directed_nonce_fresh(frame.src, inner, trailer),
+        RequiredProof::Tag => auth.verify_directed(frame.src, inner, trailer),
+        // Both returned above.
+        RequiredProof::None | RequiredProof::Drop => return None,
     };
     if !ok {
         // Unverified/foreign neighbor or a replayed counter — drop rather than
@@ -335,8 +375,10 @@ fn strip_directed<'a, R: RouterOps>(router: &mut R, frame: &'a LinkFrame) -> Opt
     // never forwards or delivers the tag bytes.
     //
     // Neither failure below uses `?`/`.ok()`: this frame *authenticated*, and
-    // `verify_directed` has already spent its replay counter, so a
-    // retransmission would be refused as a replay. Losing it here is
+    // the verifier above has already spent its replay counter, so a
+    // retransmission would be refused as a replay. (A `NonceTag` frame behind
+    // the high-water is the one exception, and it is a proof response — losing
+    // it costs one challenge round, not the frame.) Losing it here is
     // unrecoverable and must never be silent. Both arms are this node's own
     // invariant breaking rather than a peer's malformed input — but a member's
     // tag had to verify first, which bounds the rate, so they stay `trace!`
@@ -405,7 +447,7 @@ fn tag_directed_into<R: RouterOps>(
     };
     match proof {
         RequiredProof::None => return Some(body_len),
-        RequiredProof::Tag | RequiredProof::Fanout => {}
+        RequiredProof::Tag | RequiredProof::NonceTag | RequiredProof::Fanout => {}
         // Unreachable from this node's own emitters, which only ever write a
         // form they can prove — but staging one would put an unprovable frame
         // on the wire, so it is refused here rather than trusted not to happen.
@@ -429,9 +471,14 @@ fn tag_directed_into<R: RouterOps>(
         return None;
     };
     let (frame, trailer) = region.split_at_mut(body_len);
+    // Exhaustive for the same reason as `strip_directed`'s verifier match: the
+    // emit side must never quietly acquire a new proof form it does not
+    // actually produce.
     let signed = match proof {
         RequiredProof::Fanout => auth.sign_fanout(frame, trailer),
-        _ => auth.tag_directed(dst, frame, trailer),
+        RequiredProof::Tag | RequiredProof::NonceTag => auth.tag_directed(dst, frame, trailer),
+        // Both returned above.
+        RequiredProof::None | RequiredProof::Drop => return None,
     };
     if signed.is_some() {
         Some(body_len + trailer_len)
@@ -2579,6 +2626,12 @@ mod tests {
     /// The proof requirement is a property of the BATMAN sub-type: every
     /// packet routed toward an inner `dest` needs one; every one-to-many or
     /// self-authenticating packet cannot have one.
+    ///
+    /// `NextHopResponse` is the one point-to-point sub-type that is not
+    /// [`Tag`](RequiredProof::Tag), and the difference is *only* in how
+    /// freshness is judged — it carries the same pairwise trailer, which is
+    /// asserted here rather than left to the reader, since a sub-type that
+    /// stopped carrying one would be an unauthenticated hole.
     #[test]
     fn required_proof_is_decided_by_sub_type() {
         for t in [
@@ -2586,7 +2639,6 @@ mod tests {
             BatmanPacketType::EchoRequest,
             BatmanPacketType::EchoReply,
             BatmanPacketType::NextHopChallenge,
-            BatmanPacketType::NextHopResponse,
         ] {
             assert_eq!(
                 required_proof(&[t.as_u8(), 0xff]),
@@ -2594,6 +2646,17 @@ mod tests {
                 "{t:?} is point-to-point and must carry a pairwise trailer"
             );
         }
+        let response = required_proof(&[BatmanPacketType::NextHopResponse.as_u8(), 0xff]);
+        assert_eq!(
+            response,
+            RequiredProof::NonceTag,
+            "a proof response takes its freshness from the nonce it answers"
+        );
+        assert_eq!(
+            response.trailer_len(),
+            RequiredProof::Tag.trailer_len(),
+            "it is still pairwise-tagged: same trailer, only the replay rule differs"
+        );
         for t in [
             BatmanPacketType::Ogm,
             BatmanPacketType::Bcast,

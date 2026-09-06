@@ -73,6 +73,15 @@ pub trait OgmAuthOps {
     /// routed unauthenticated.
     fn verify_directed(&mut self, src: Mac, frame: &[u8], trailer: &[u8]) -> bool;
 
+    /// Whether `trailer` is a valid pairwise tag from `src` over `frame`, for
+    /// the one sub-type whose freshness comes from a challenge nonce rather
+    /// than the replay counter — a next-hop proof response.
+    ///
+    /// Same tag check as [`verify_directed`](Self::verify_directed); it differs
+    /// only in holding a counter behind our high-water pending that nonce
+    /// instead of refusing it. See [`OgmAuth::verify_directed_nonce_fresh`].
+    fn verify_directed_nonce_fresh(&mut self, src: Mac, frame: &[u8], trailer: &[u8]) -> bool;
+
     /// Sign a multicast frame one transmission carries to several next hops,
     /// writing the fan-out trailer. See [`OgmAuth::sign_fanout`].
     fn sign_fanout(&mut self, frame: &[u8], trailer: &mut [u8]) -> Option<usize>;
@@ -95,6 +104,10 @@ impl<
 
     fn verify_directed(&mut self, src: Mac, frame: &[u8], trailer: &[u8]) -> bool {
         OgmAuth::verify_directed(self, src, frame, trailer)
+    }
+
+    fn verify_directed_nonce_fresh(&mut self, src: Mac, frame: &[u8], trailer: &[u8]) -> bool {
+        OgmAuth::verify_directed_nonce_fresh(self, src, frame, trailer)
     }
 
     fn sign_fanout(&mut self, frame: &[u8], trailer: &mut [u8]) -> Option<usize> {

@@ -36,6 +36,7 @@
 //! so the two halves cannot drift apart.
 
 use batman::wire::BatmanOgmPacket;
+use batman::wire::BatmanPacketType;
 use batman::wire::BatmanTvlvHdr;
 use batman::wire::TvlvType;
 use batman::wire::find_tvlv;
@@ -313,6 +314,29 @@ enum Cached {
     RefusedLiveIdentity,
 }
 
+/// What the pairwise replay guard made of one frame's counter.
+///
+/// Three outcomes, not two, because [`Stale`](Self::Stale) and
+/// [`NoSlot`](Self::NoSlot) are the same *verdict* (drop, for
+/// [`verify_directed`](OgmAuth::verify_directed)) but completely different
+/// *facts*, and the restart path acts on one and must not act on the other. A
+/// `bool` collapsed them, so a first-ever frame from a new neighbour arriving
+/// at a node whose table was full read as a peer replaying its own counters.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CounterVerdict {
+    /// Strictly newer than the last accepted from this source, and recorded.
+    Accepted,
+    /// At or behind the high-water this node holds for the source: a replay,
+    /// or a peer whose counter restarted. Which of the two it is cannot be told
+    /// from the counter alone — that is what the next-hop proof nonce decides.
+    Stale,
+    /// No high-water is held for this source and none could be recorded:
+    /// `recv_counters` is full. Says nothing about the counter itself, so it is
+    /// never evidence of a restart.
+    NoSlot,
+}
+
 /// One verified neighbor's keys, learned from its authenticated OGM cert.
 ///
 /// At most one entry per MAC, and while an entry's certificate is live its
@@ -528,6 +552,41 @@ pub struct OgmAuth<
     challenge_counter: u64,
     /// Next-hop proof challenges issued and not yet answered.
     in_progress: HVec<OutstandingChallenge, MAX_IN_PROGRESS_PROOF>,
+    /// The `(sender, counter)` of the last next-hop proof response whose
+    /// pairwise tag verified while its replay counter was *behind* this node's
+    /// high-water for that sender — held between the tag check that tolerated
+    /// it ([`verify_directed_nonce_fresh`](Self::verify_directed_nonce_fresh))
+    /// and the nonce check that decides whether to believe it
+    /// ([`verify_challenge_response`](Self::verify_challenge_response)).
+    ///
+    /// A peer that reboots keeps its identity — the seed is persisted — but not
+    /// its [`send_counter`](Self::send_counter), which is memory only and
+    /// restarts at zero. Its whole directed data plane is then behind this
+    /// node's high-water and refused, and because a next-hop challenge and its
+    /// response are themselves directed frames, the proof that would clear the
+    /// state cannot get through either. That is the deadlock this field exists
+    /// to break: the response is tolerated past the counter, and only a nonce
+    /// this node issued and has never issued before decides whether the
+    /// sequence is re-anchored.
+    ///
+    /// **One slot node-wide**, not one per neighbour, and safe at that size
+    /// only because of how narrowly it lives: it is written by a
+    /// nonce-fresh verification whose tag checked out (`None` when the counter
+    /// was in sequence) and taken unconditionally by the very next
+    /// [`verify_challenge_response`](Self::verify_challenge_response),
+    /// whatever that call then decides. A frame whose tag does *not* verify
+    /// leaves it alone, having proved nothing either way.
+    ///
+    /// What holds the two together is the caller: `strip_directed` →
+    /// `CentralRouter::handle_rx` → `verify_challenge_response` is one frame's
+    /// synchronous processing and the only path that reaches either function.
+    /// Keep that pairing if this ever moves off the single-frame path — the
+    /// slot is a return value wearing a field's clothes.
+    ///
+    /// In steady state the counter is in sequence, this is `None`, and the
+    /// replay guard is untouched — a proof round must never become a periodic
+    /// hole in it.
+    restart_candidate: Option<(Mac, u64)>,
     /// Public-key operations (Ed25519 verifications, X25519 agreements) spent
     /// on the OGM verification path since boot.
     ///
@@ -569,6 +628,7 @@ impl<
             pending_replies: HVec::new(),
             cert_req_rate: HVec::new(),
             challenge_counter: 0,
+            restart_candidate: None,
             in_progress: HVec::new(),
             ogm_crypto_ops: 0,
         }
@@ -867,6 +927,13 @@ impl<
         if let Some(i) = self.recv_counters.iter().position(|(m, _)| *m == mac) {
             self.recv_counters.swap_remove(i);
         }
+        // Same reason the counter row goes: a pending restart claim is
+        // per-neighbour state about the address being evicted, and state that
+        // outlives its subject is how a re-admitted peer gets anchored on a
+        // pre-revocation counter.
+        if matches!(self.restart_candidate, Some((m, _)) if m == mac) {
+            self.restart_candidate = None;
+        }
     }
 
     /// The MACs this node currently holds revocations for (for the security
@@ -1126,7 +1193,7 @@ impl<
         // The same monotonic guard the pairwise form uses, against the same
         // per-source high-water mark — which is exactly why the send counter
         // is one sequence rather than one per destination.
-        if !self.accept_recv_counter(src, counter) {
+        if self.accept_recv_counter(src, counter) != CounterVerdict::Accepted {
             tracing::trace!("auth: dropping fan-out frame with a replayed/stale counter");
             return false;
         }
@@ -1159,13 +1226,123 @@ impl<
     /// Returns `false` (drop) if we have no key for `src`, the trailer is
     /// malformed, the tag is invalid, or the counter is a replay.
     pub fn verify_directed(&mut self, src: Mac, frame: &[u8], trailer: &[u8]) -> bool {
+        let Some(counter) = self.verify_directed_tag(src, frame, trailer) else {
+            return false;
+        };
+        match self.accept_recv_counter(src, counter) {
+            CounterVerdict::Accepted => true,
+            CounterVerdict::Stale => {
+                tracing::trace!("auth: dropping directed frame with a replayed/stale counter");
+                false
+            }
+            CounterVerdict::NoSlot => {
+                tracing::trace!("auth: dropping directed frame, replay-counter table full");
+                false
+            }
+        }
+    }
+
+    /// [`verify_directed`](Self::verify_directed) for the one directed frame
+    /// whose freshness does not come from the replay counter: a **next-hop
+    /// proof response**, which is bound to a nonce this node issued, has never
+    /// issued before, and consumes on use.
+    ///
+    /// The tag is checked exactly as it is for any other directed frame — this
+    /// is not a weaker verifier, and an outsider still cannot produce one. What
+    /// it does not do is *refuse* a counter that is behind this node's
+    /// high-water for `src`. It notes it instead, as a
+    /// `restart_candidate`, and leaves the verdict to
+    /// [`verify_challenge_response`](Self::verify_challenge_response), which
+    /// re-anchors the sequence only if the nonce checks out.
+    ///
+    /// Why the exemption is safe here and nowhere else: a captured response is
+    /// worthless against the next challenge (the nonce is fresh and this node
+    /// chose it, and `issue_challenge` replaces any nonce still outstanding),
+    /// so replaying one buys an attacker a tag verification and nothing more.
+    /// A captured *unicast* has no such binding, which is why
+    /// `wayfinder_driver_core`'s `required_proof` keeps every other directed
+    /// sub-type — the challenge included, since its nonce proves nothing to its
+    /// receiver — on the full guard.
+    ///
+    /// An **in-sequence** counter is still spent, exactly as
+    /// [`verify_directed`](Self::verify_directed) would spend it. A settled
+    /// mesh re-proves every path neighbour about once per emission interval, so
+    /// a proof round that reset the guard would be a hole in it that reopened
+    /// on a timer.
+    ///
+    /// **Enforces its own precondition** rather than trusting the caller. It is
+    /// `pub`, its safety rests entirely on `frame` really being a proof
+    /// response, and the classifier that guarantees that lives in another
+    /// crate. So the sub-type is re-read here and anything else is handed
+    /// straight to [`verify_directed`](Self::verify_directed): a
+    /// misclassification, a widened match arm, or a third-party
+    /// `OgmAuthOps` implementation then cannot open the replay guard on the
+    /// unicast data plane.
+    pub fn verify_directed_nonce_fresh(&mut self, src: Mac, frame: &[u8], trailer: &[u8]) -> bool {
+        if frame.first().copied() != Some(BatmanPacketType::NextHopResponse.as_u8()) {
+            tracing::trace!(?src, "auth: nonce-fresh verify asked for a non-proof frame");
+            return self.verify_directed(src, frame, trailer);
+        }
+        let Some(counter) = self.verify_directed_tag(src, frame, trailer) else {
+            // Deliberately leaves any standing candidate alone: this frame
+            // never authenticated, so it is not evidence about anything,
+            // including about whether an earlier claim is still current.
+            return false;
+        };
+        match self.accept_recv_counter(src, counter) {
+            CounterVerdict::Accepted => {
+                self.restart_candidate = None;
+                true
+            }
+            // The only state a restart can present as. Recorded only while a
+            // challenge to `src` is actually outstanding: a candidate that
+            // could never be redeemed is a slot an attacker occupies for free
+            // by replaying any captured response.
+            CounterVerdict::Stale => {
+                if self.in_progress.iter().any(|c| c.neighbor == src) {
+                    tracing::trace!(
+                        ?src,
+                        counter,
+                        "auth: proof response behind the replay high-water; awaiting its nonce"
+                    );
+                    self.restart_candidate = Some((src, counter));
+                } else {
+                    tracing::trace!(
+                        ?src,
+                        counter,
+                        "drop: stale-counter proof response with no challenge outstanding"
+                    );
+                    self.restart_candidate = None;
+                    return false;
+                }
+                true
+            }
+            // Not evidence of a restart — there is no high-water to be behind.
+            // Fails closed exactly as `verify_directed` does, because a frame
+            // whose counter cannot be recorded cannot be re-anchored either.
+            CounterVerdict::NoSlot => {
+                tracing::trace!(?src, "drop: proof response, replay-counter table full");
+                false
+            }
+        }
+    }
+
+    /// The half of [`verify_directed`](Self::verify_directed) that both
+    /// verifiers share: check the trailer's shape and its pairwise tag over
+    /// `frame`, returning the counter it carried.
+    ///
+    /// `None` — drop the frame — when we hold no live key for `src`, the
+    /// trailer is malformed, or the tag does not verify. Deliberately says
+    /// nothing about replay: that is the one decision the two callers make
+    /// differently, so it is the one thing this does not decide for them.
+    fn verify_directed_tag(&mut self, src: Mac, frame: &[u8], trailer: &[u8]) -> Option<u64> {
         if trailer.len() != DIRECTED_TRAILER_LEN {
             tracing::trace!("auth: dropping directed frame with malformed tag trailer");
-            return false;
+            return None;
         }
         let Some(key) = self.live_neighbor(src).map(|n| n.pairwise_key) else {
             tracing::trace!("auth: dropping directed frame from an unverified neighbor");
-            return false;
+            return None;
         };
         let mut counter_bytes = [0u8; 8];
         counter_bytes.copy_from_slice(&trailer[..8]);
@@ -1176,13 +1353,9 @@ impl<
         // cannot be reflected back to it as if from `src`.
         if !verify_frame_tag(&key, counter, &src.0, frame, &tag) {
             tracing::trace!("auth: dropping directed frame with an invalid tag");
-            return false;
+            return None;
         }
-        if !self.accept_recv_counter(src, counter) {
-            tracing::trace!("auth: dropping directed frame with a replayed/stale counter");
-            return false;
-        }
-        true
+        Some(counter)
     }
 
     /// Allocate the next outgoing directed-frame counter (starting at 1).
@@ -1200,15 +1373,24 @@ impl<
     /// Accept `counter` from `src` only if strictly newer than the last accepted
     /// (monotonic replay guard), recording it on success.  The first frame from
     /// a neighbor is accepted and recorded.
-    fn accept_recv_counter(&mut self, src: Mac, counter: u64) -> bool {
+    ///
+    /// Returns *which* of the two refusals applies, not just that one did — see
+    /// [`CounterVerdict`]. Only [`Accepted`](CounterVerdict::Accepted) admits a
+    /// frame; a caller that treats the other two alike is free to, and
+    /// [`verify_directed`](Self::verify_directed) does.
+    fn accept_recv_counter(&mut self, src: Mac, counter: u64) -> CounterVerdict {
         if let Some(e) = self.recv_counters.iter_mut().find(|(m, _)| *m == src) {
             if counter <= e.1 {
-                return false;
+                return CounterVerdict::Stale;
             }
             e.1 = counter;
-            return true;
+            return CounterVerdict::Accepted;
         }
-        self.recv_counters.push((src, counter)).is_ok()
+        if self.recv_counters.push((src, counter)).is_ok() {
+            CounterVerdict::Accepted
+        } else {
+            CounterVerdict::NoSlot
+        }
     }
 
     /// Build the canonical signed message for an OGM: a domain prefix followed
@@ -2102,6 +2284,12 @@ impl<
     /// observed a single exchange keep a route alive without the neighbor ever
     /// participating again.
     pub fn verify_challenge_response(&mut self, neighbor: Mac, tag: &[u8]) -> bool {
+        // Taken up front, before any early return, so a claim can never outlive
+        // the frame that raised it. The alternative — taking it beside the
+        // re-anchor below — leaves a stale `(mac, counter)` standing on every
+        // failure path, to be redeemed later against a counter that is no
+        // longer current.
+        let claim = self.restart_candidate.take();
         let Ok(tag) = <[u8; TAG_LEN]>::try_from(tag) else {
             tracing::trace!("auth: dropping challenge response with a malformed tag");
             return false;
@@ -2122,7 +2310,91 @@ impl<
             return false;
         }
         self.in_progress.swap_remove(idx);
+        // `neighbor` has just proved it is live *now* and holds the pairwise
+        // key, against a nonce nobody could have predicted. That is the only
+        // evidence this node ever gets that a peer restarted rather than that
+        // its frames are being replayed, so it is where a stale replay
+        // high-water is re-anchored — to the counter the proving frame actually
+        // carried, so the sequence resumes at the peer's real position rather
+        // than being opened from zero.
+        //
+        // A claim naming anyone else belongs to a frame this exchange is not
+        // about; it was consumed above and is discarded here.
+        if let Some((mac, counter)) = claim
+            && mac == neighbor
+        {
+            // `warn!`, not `debug!`: rewinding a replay guard is a
+            // security-relevant weakening of this node's own defences (see
+            // `anchor_recv_counter`), and `debug!` is off in normal operation.
+            // It clears CLAUDE.md's bar for the level — an outsider cannot
+            // reach it (a valid pairwise tag *and* an unpredictable nonce are
+            // needed) and it is paced by this node's own challenge cadence, so
+            // it is neither remote-driven nor hot-path. A peer that produces
+            // one every round is not a reboot, and that is exactly what an
+            // operator should be able to see.
+            if self.anchor_recv_counter(neighbor, counter) {
+                tracing::warn!(
+                    ?neighbor,
+                    counter,
+                    "auth: replay high-water rewound for a peer that proved a restart"
+                );
+            } else {
+                tracing::warn!(
+                    ?neighbor,
+                    counter,
+                    "auth: no replay-counter slot to re-anchor a restarted peer; its directed traffic stays refused"
+                );
+            }
+        }
         true
+    }
+
+    /// Force `src`'s replay high-water to `counter`, whether that moves it
+    /// forward or back.
+    ///
+    /// The deliberate opposite of [`accept_recv_counter`](Self::accept_recv_counter),
+    /// which only ever advances. Reachable from one place —
+    /// [`verify_challenge_response`](Self::verify_challenge_response), after a
+    /// peer has proved liveness against a fresh nonce — because moving a
+    /// high-water backwards is exactly what an attacker replaying a captured
+    /// frame would want, and a nonce it cannot predict is the only thing that
+    /// distinguishes the two.
+    ///
+    /// Re-anchoring does mean the frames captured from `src`'s **previous** boot
+    /// session become replayable again: their counters sit above the restarted
+    /// peer's, so the guard admits them. And the cost does not stop at the
+    /// replay — injecting one *advances* the high-water back past the restarted
+    /// peer's real position, so the genuine peer is refused again until the next
+    /// proof round re-anchors it. A captured frame is therefore a repeatable
+    /// denial of service against a member that has just rebooted, for as long as
+    /// an attacker holds one and stays on the medium.
+    ///
+    /// That is inherent to a counter the peer keeps in memory under a pairwise
+    /// key that outlives its reboot — the same `(key, counter)` reuse
+    /// [`next_send_counter`](Self::next_send_counter) refuses to *create* by
+    /// wrapping, though note it cannot detect this case, which is a different
+    /// mechanism for the same class of problem. Two things would close it, and
+    /// neither belongs in this change: a per-boot epoch bound into the tag (a
+    /// wire change), or a `send_counter` persisted beside the identity seed (a
+    /// flash write per directed frame or per batch, on a board that has to
+    /// survive an unclean power cut). What is bought in the meantime is a peer
+    /// that can rejoin at all: without this the guard refuses a rebooted
+    /// member's every directed frame until it has re-spent every counter it
+    /// spent before, which is not a recovery.
+    ///
+    /// Returns whether the anchor was actually stored. `false` means `src` had
+    /// no row and `recv_counters` is full, so nothing changed and the peer stays
+    /// refused — the caller must say so rather than report a re-anchor that did
+    /// not happen. Not reachable through the restart path as written (a
+    /// [`Stale`](CounterVerdict::Stale) verdict means the row exists), which is
+    /// why it is reported rather than handled.
+    #[must_use]
+    fn anchor_recv_counter(&mut self, src: Mac, counter: u64) -> bool {
+        if let Some(e) = self.recv_counters.iter_mut().find(|(m, _)| *m == src) {
+            e.1 = counter;
+            return true;
+        }
+        self.recv_counters.push((src, counter)).is_ok()
     }
 
     /// Drop every cached neighbor whose certificate has expired.
@@ -5285,6 +5557,351 @@ mod tests {
         assert!(
             b.verify_challenge_response(mac(2), &response),
             "the holder of a's key answered b's own nonce"
+        );
+    }
+
+    /// Tag `frame` for `dst` as `sender` would put it on the wire, returning
+    /// the directed trailer. Panics if `sender` cannot tag — every caller here
+    /// has already admitted `dst`.
+    fn directed_trailer(
+        sender: &mut OgmAuth,
+        dst: Mac,
+        frame: &[u8],
+    ) -> [u8; DIRECTED_TRAILER_LEN] {
+        let mut trailer = [0u8; DIRECTED_TRAILER_LEN];
+        let len = sender
+            .tag_directed(dst, frame, &mut trailer)
+            .expect("dst is an admitted neighbour");
+        assert_eq!(len, DIRECTED_TRAILER_LEN);
+        trailer
+    }
+
+    /// A next-hop proof response as it appears on the wire: the sub-type byte
+    /// the classifier reads, then the tag answering the nonce. Built here
+    /// rather than passing the bare tag, because the sub-type is what earns
+    /// the frame its counter exemption — a test that omits it is not
+    /// exercising the path the router takes.
+    fn proof_response_frame(tag: &[u8; TAG_LEN]) -> Vec<u8> {
+        let mut frame = vec![BatmanPacketType::NextHopResponse.as_u8()];
+        frame.extend_from_slice(tag);
+        frame
+    }
+
+    /// Run `sender`'s directed send counter up, accepting each frame at
+    /// `receiver`, so the receiver's replay high-water is where a long-running
+    /// peer's would be rather than where a freshly converged fixture leaves it.
+    fn run_up_counter(sender: &mut OgmAuth, sender_mac: Mac, receiver: &mut OgmAuth, dst: Mac) {
+        for _ in 0..64 {
+            let trailer = directed_trailer(sender, dst, b"traffic");
+            assert!(receiver.verify_directed(sender_mac, b"traffic", &trailer));
+        }
+    }
+
+    /// A peer that reboots keeps its identity but not its send counter, so its
+    /// whole directed data plane lands behind the high-water a peer that stayed
+    /// up still holds for it. The next-hop proof is what gets it out — and the
+    /// proof frames are directed frames themselves, so before this the guard
+    /// refused the very exchange that would have cleared it, leaving a member
+    /// visible in the routing table (OGMs carry no pairwise tag) and permanently
+    /// unroutable.
+    #[test]
+    fn a_rebooted_peer_regains_its_directed_data_plane_by_proving_itself() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+        run_up_counter(&mut a, mac(2), &mut b, mac(3));
+
+        // `a` reboots: same seed, same certificate, a send counter back at zero.
+        let mut a = member(&authority, 2, mac(2), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+
+        let trailer = directed_trailer(&mut a, mac(3), b"morning");
+        assert!(
+            !b.verify_directed(mac(2), b"morning", &trailer),
+            "the guard cannot tell a restart from a replay, and refuses on purpose"
+        );
+
+        // The proof exchange is the way out: its freshness is b's own nonce.
+        let nonce = b.issue_challenge(mac(2)).expect("a is a live neighbour");
+        let response = a.answer_challenge(mac(3), &nonce).expect("b is live too");
+        let frame = proof_response_frame(&response);
+        let trailer = directed_trailer(&mut a, mac(3), &frame);
+        assert!(
+            b.verify_directed_nonce_fresh(mac(2), &frame, &trailer),
+            "a proof response behind the high-water is held for its nonce, not dropped"
+        );
+        assert!(
+            b.verify_challenge_response(mac(2), &response),
+            "the nonce b issued is answered under the pairwise key"
+        );
+
+        let trailer = directed_trailer(&mut a, mac(3), b"morning");
+        assert!(
+            b.verify_directed(mac(2), b"morning", &trailer),
+            "proving liveness re-anchors the sequence, so ordinary traffic flows again"
+        );
+    }
+
+    /// The exemption is scoped by the *sub-type*, and this method is `pub`, so
+    /// it must refuse to apply that scope to anything else — whatever its
+    /// caller believes. A `Unicast` handed to it takes the ordinary guard and
+    /// its stale counter is refused, even with a challenge outstanding (which
+    /// is the only other thing that gates the restart path).
+    #[test]
+    fn the_nonce_exemption_does_not_extend_to_a_non_proof_frame() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+
+        let unicast = [BatmanPacketType::Unicast.as_u8(), 0xff];
+        let captured = directed_trailer(&mut a, mac(3), &unicast);
+        run_up_counter(&mut a, mac(2), &mut b, mac(3));
+        // Outstanding, so the restart gate is open and the sub-type is the only
+        // thing left standing between this frame and the exemption.
+        let _ = b.issue_challenge(mac(2)).expect("live neighbour");
+
+        assert!(
+            !b.verify_directed_nonce_fresh(mac(2), &unicast, &captured),
+            "only a next-hop proof response may skip the replay counter"
+        );
+    }
+
+    /// A restart claim is evidence, and evidence has to be authenticated. A
+    /// forged or corrupted tag must neither create a claim nor disturb one
+    /// already standing — otherwise an attacker with no pairwise key could name
+    /// the counter the guard is rewound to.
+    #[test]
+    fn a_forged_tag_neither_creates_nor_disturbs_a_restart_claim() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+        run_up_counter(&mut a, mac(2), &mut b, mac(3));
+
+        let mut a = member(&authority, 2, mac(2), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+        let nonce = b.issue_challenge(mac(2)).expect("live neighbour");
+        let response = a.answer_challenge(mac(3), &nonce).expect("live neighbour");
+        let frame = proof_response_frame(&response);
+
+        let mut forged = directed_trailer(&mut a, mac(3), &frame);
+        forged[DIRECTED_TRAILER_LEN - 1] ^= 0xFF;
+        assert!(
+            !b.verify_directed_nonce_fresh(mac(2), &frame, &forged),
+            "a tag that does not verify proves nothing about a restart"
+        );
+
+        // The nonce answer inside is genuine, so the proof itself still
+        // succeeds — `verify_challenge_response` judges the nonce, not the
+        // frame that carried it. What must not follow is a re-anchor: the
+        // forged frame raised no claim, so there is nothing to redeem.
+        assert!(
+            b.verify_challenge_response(mac(2), &response),
+            "the nonce was answered under the pairwise key"
+        );
+
+        let trailer = directed_trailer(&mut a, mac(3), b"data");
+        assert!(
+            !b.verify_directed(mac(2), b"data", &trailer),
+            "no authenticated frame ever named a restart, so the guard is \
+             exactly where it was and the peer must answer properly to recover"
+        );
+    }
+
+    /// A stale counter is only evidence of a restart while this node is
+    /// actually mid-exchange with that peer. Outside one there is nothing the
+    /// claim could ever be redeemed against, so recording it would just let any
+    /// admitted member park a value in the single claim slot by replaying a
+    /// captured response.
+    #[test]
+    fn a_stale_counter_response_with_no_challenge_outstanding_is_refused() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+
+        let nonce = b.issue_challenge(mac(2)).expect("live neighbour");
+        let response = a.answer_challenge(mac(3), &nonce).expect("live neighbour");
+        let frame = proof_response_frame(&response);
+        let captured = directed_trailer(&mut a, mac(3), &frame);
+        // Consume the outstanding challenge, then outrun the captured frame.
+        assert!(b.verify_directed_nonce_fresh(mac(2), &frame, &captured));
+        assert!(b.verify_challenge_response(mac(2), &response));
+        run_up_counter(&mut a, mac(2), &mut b, mac(3));
+
+        assert!(
+            !b.verify_directed_nonce_fresh(mac(2), &frame, &captured),
+            "nothing is outstanding, so a stale-counter response is just a replay"
+        );
+    }
+
+    /// The recovery is deliberately **asymmetric** and it is easy to "tidy" the
+    /// asymmetry away. `NextHopChallenge` keeps the full replay guard, so a
+    /// rebooted node cannot challenge its way back in — the peer that stayed up
+    /// has to challenge *it* first. This pins that direction: symmetrising the
+    /// two sub-types would restore the replay-a-captured-challenge primitive
+    /// and every other test here would stay green.
+    #[test]
+    fn a_rebooted_peer_cannot_challenge_its_way_out_only_answer() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+        run_up_counter(&mut a, mac(2), &mut b, mac(3));
+
+        let mut a = member(&authority, 2, mac(2), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+
+        let nonce = a.issue_challenge(mac(3)).expect("b is a live neighbour");
+        let mut challenge = vec![BatmanPacketType::NextHopChallenge.as_u8()];
+        challenge.extend_from_slice(&nonce);
+        let trailer = directed_trailer(&mut a, mac(3), &challenge);
+        assert!(
+            !b.verify_directed(mac(2), &challenge, &trailer),
+            "the reborn node's own challenge stays behind the replay guard"
+        );
+
+        // Recovery therefore has to start from `b`, and once it does the
+        // reborn node's challenges get through on the re-anchored sequence.
+        let nonce = b.issue_challenge(mac(2)).expect("live neighbour");
+        let response = a.answer_challenge(mac(3), &nonce).expect("live neighbour");
+        let frame = proof_response_frame(&response);
+        let rsp_trailer = directed_trailer(&mut a, mac(3), &frame);
+        assert!(b.verify_directed_nonce_fresh(mac(2), &frame, &rsp_trailer));
+        assert!(b.verify_challenge_response(mac(2), &response));
+
+        let trailer = directed_trailer(&mut a, mac(3), &challenge);
+        assert!(
+            b.verify_directed(mac(2), &challenge, &trailer),
+            "after the re-anchor the reborn node can challenge in its turn"
+        );
+    }
+
+    /// A claim is consumed by the next `verify_challenge_response` whatever that
+    /// call decides, so a response that fails its nonce cannot leave one
+    /// standing to be redeemed by a *later*, unrelated round — which would
+    /// rewind the guard to a counter an attacker chose, long after the frame
+    /// that named it.
+    #[test]
+    fn a_failed_nonce_leaves_no_claim_for_a_later_round_to_redeem() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+        run_up_counter(&mut a, mac(2), &mut b, mac(3));
+
+        // A reboot, and a response to a challenge that is outstanding — but
+        // answered under the wrong nonce, so the proof fails. Its frame spends
+        // the reborn peer's counter 1, which is what a leaked claim would
+        // later rewind the guard to.
+        let mut a = member(&authority, 2, mac(2), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+        let _ = b.issue_challenge(mac(2)).expect("live neighbour");
+        let wrong = a
+            .answer_challenge(mac(3), &[0xAA; CHALLENGE_NONCE_LEN])
+            .expect("live neighbour");
+        let frame = proof_response_frame(&wrong);
+        let trailer = directed_trailer(&mut a, mac(3), &frame);
+        assert!(b.verify_directed_nonce_fresh(mac(2), &frame, &trailer));
+        assert!(
+            !b.verify_challenge_response(mac(2), &wrong),
+            "the nonce does not match the outstanding challenge"
+        );
+
+        // Counter 2, tagged after the failed round and before the genuine one.
+        // It is the probe: it sits above the counter the failed round named and
+        // below the counter the genuine one will anchor to.
+        let between = directed_trailer(&mut a, mac(3), b"between");
+
+        // A genuine round now completes, on counter 3. It must anchor on its
+        // *own* counter, not on the claim the failed round raised.
+        let nonce = b.issue_challenge(mac(2)).expect("live neighbour");
+        let response = a.answer_challenge(mac(3), &nonce).expect("live neighbour");
+        let frame = proof_response_frame(&response);
+        let trailer = directed_trailer(&mut a, mac(3), &frame);
+        assert!(b.verify_directed_nonce_fresh(mac(2), &frame, &trailer));
+        assert!(b.verify_challenge_response(mac(2), &response));
+
+        assert!(
+            !b.verify_directed(mac(2), b"between", &between),
+            "the guard anchored to the proving frame's own counter; had the \
+             failed round's claim been redeemed instead it would sit lower and \
+             admit this"
+        );
+    }
+
+    /// The re-anchor is not a periodic hole. A settled mesh re-proves every path
+    /// neighbour about once per emission interval, so if a successful proof
+    /// round reset the guard, every neighbour's replay window would reopen on a
+    /// timer. An in-sequence proof response spends its counter like any other
+    /// directed frame and leaves the high-water where it found it.
+    #[test]
+    fn a_steady_state_proof_round_does_not_reset_the_replay_guard() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+
+        // A frame an attacker captures off the medium, then lets `a` outrun.
+        let captured = directed_trailer(&mut a, mac(3), b"captured");
+        run_up_counter(&mut a, mac(2), &mut b, mac(3));
+
+        let nonce = b.issue_challenge(mac(2)).expect("live neighbour");
+        let response = a.answer_challenge(mac(3), &nonce).expect("live neighbour");
+        let frame = proof_response_frame(&response);
+        let trailer = directed_trailer(&mut a, mac(3), &frame);
+        assert!(b.verify_directed_nonce_fresh(mac(2), &frame, &trailer));
+        assert!(b.verify_challenge_response(mac(2), &response));
+
+        assert!(
+            !b.verify_directed(mac(2), b"captured", &captured),
+            "an ordinary proof round must leave the replay high-water alone"
+        );
+    }
+
+    /// The nonce is what authorises the re-anchor, so a response that fails it
+    /// must not move the high-water — otherwise tolerating the stale counter at
+    /// the tag layer would hand back exactly the reset it exists to gate.
+    #[test]
+    fn a_proof_response_that_fails_its_nonce_does_not_re_anchor() {
+        let authority = Authority::from_seed(&[1; 32], 0xABCD);
+        let mut a = member(&authority, 2, mac(2), 1000);
+        let mut b = member(&authority, 3, mac(3), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+        run_up_counter(&mut a, mac(2), &mut b, mac(3));
+
+        // One genuine round, which consumes b's outstanding challenge.
+        let nonce = b.issue_challenge(mac(2)).expect("live neighbour");
+        let spent = a.answer_challenge(mac(3), &nonce).expect("live neighbour");
+        let frame = proof_response_frame(&spent);
+        let trailer = directed_trailer(&mut a, mac(3), &frame);
+        assert!(b.verify_directed_nonce_fresh(mac(2), &frame, &trailer));
+        assert!(b.verify_challenge_response(mac(2), &spent));
+
+        // `a` reboots, then answers the nonce that is already spent.
+        let mut a = member(&authority, 2, mac(2), 1000);
+        admit_each_other(&mut a, mac(2), &mut b, mac(3));
+        let stale = a.answer_challenge(mac(3), &nonce).expect("live neighbour");
+        let frame = proof_response_frame(&stale);
+        let trailer = directed_trailer(&mut a, mac(3), &frame);
+        // Refused at the tag layer now, not merely unredeemed: with the spent
+        // nonce there is no challenge outstanding, so a stale-counter response
+        // is indistinguishable from a replay and raises no claim at all.
+        assert!(
+            !b.verify_directed_nonce_fresh(mac(2), &frame, &trailer),
+            "a stale-counter response with nothing outstanding is just a replay"
+        );
+        assert!(
+            !b.verify_challenge_response(mac(2), &stale),
+            "nothing is outstanding: that nonce was already answered"
+        );
+
+        let trailer = directed_trailer(&mut a, mac(3), b"data");
+        assert!(
+            !b.verify_directed(mac(2), b"data", &trailer),
+            "an unproven restart claim must leave the guard exactly where it was"
         );
     }
 
