@@ -3459,3 +3459,132 @@ fn one_multicast_frame_crosses_the_wire_and_the_radio_once_each() {
         );
     }
 }
+
+/// The `best_next_hop` machine `name` currently holds for `dest`, or `None`
+/// when it has no record for `dest` or no selectable path to it.
+fn best_hop_to(h: &TestHarness, name: &str, dest: Mac) -> Option<Mac> {
+    h.get_machine(name)
+        .router()
+        .originator_table()
+        .find(|r| r.neighbor_ident == dest)
+        .and_then(|r| r.best_next_hop)
+}
+
+/// On an **authenticated** mesh, a neighbor that goes away for a long time and
+/// then returns must regain a usable next hop, not merely a path.
+///
+/// The unauthenticated version of this
+/// ([`route_restored_after_neighbor_reconnects`]) passes, because with
+/// `require_proof` off every live path is selectable the moment it is learned.
+/// With proof required, relearning the path is only half the job: the returning
+/// neighbor also has to answer a next-hop challenge before `best_next_hop` is
+/// filled in, and that exchange has to survive the state both sides carried
+/// across the outage.
+///
+/// This is the regression test for the deadlock that used to make that
+/// impossible. `OgmAuth`'s pairwise replay guard (`accept_recv_counter`) is a
+/// strict per-source high-water over a counter the *sender* keeps in memory and
+/// starts from zero on boot, and nothing but a revocation resets it. A node
+/// that had been up long enough to spend a few thousand counters therefore came
+/// back with every *directed* frame refused by peers that stayed up — including
+/// the challenge responses that would have cleared the state. OGMs carry no
+/// pairwise tag (`RequiredProof::None`), so the path was still learned and the
+/// node still showed up in the routing table, with `best_next_hop: None` and
+/// `max_tq: 0` — exactly the originator with an empty "via" and no quality that
+/// the management API reports.
+///
+/// `verify_directed_nonce_fresh` breaks it by holding a proof response's stale
+/// counter pending the nonce it answers. Recovery is asymmetric: the challenge
+/// stays on the full replay guard, so it is always the node that did *not*
+/// reboot that must challenge first — which is why both directions are asserted
+/// below.
+#[test]
+fn an_authenticated_neighbor_regains_a_next_hop_after_a_long_outage() {
+    setup();
+    let mut harness = simple_pair();
+    let m1 = harness.get_machine("machine1").ident;
+    let m2 = harness.get_machine("machine2").ident;
+
+    let authority = wayfinder_auth::Authority::from_seed(&[1; 32], 0xABCD);
+    enable_auth(harness.get_machine_mut("machine1"), &authority, 0);
+    enable_auth(harness.get_machine_mut("machine2"), &authority, 1);
+
+    for round in 1..=3 {
+        converge_at(&mut harness, Duration::from_secs(round));
+    }
+    assert_eq!(
+        best_hop_to(&harness, "machine1", m2),
+        Some(m2),
+        "baseline: machine1 must hold a proven next hop to machine2"
+    );
+
+    // A node that has been up for a while has sent a good many *directed*
+    // (pairwise-tagged) frames, each spending one counter from its send
+    // sequence. This is the state a long-running node is in when it goes down
+    // — not the two or three frames a freshly converged fixture has spent.
+    for i in 0..64 {
+        harness
+            .get_machine_mut("machine2")
+            .send_local(m1, format!("frame {i}").as_bytes());
+        harness.settle();
+    }
+    harness.get_machine_mut("machine1").local_deliveries();
+
+    // machine2 powers off for the night. machine1 keeps running: its path to
+    // machine2 ages out, and its proof of machine2 lapses.
+    harness.disconnect_machine("machine2");
+    age_out(&mut harness);
+    assert_eq!(
+        harness.get_machine("machine1").router().originator_count(),
+        0,
+        "machine1 must drop the stale route once machine2 stops refreshing it"
+    );
+    let overnight = harness.clock + Duration::from_secs(8 * 60 * 60);
+    harness.advance_trickle(overnight);
+
+    // Morning: machine2 comes back with its original identity and empty tables.
+    harness.reconnect_machine("machine2");
+    enable_auth(harness.get_machine_mut("machine2"), &authority, 1);
+
+    // Give the mesh many OGM rounds — far more than the challenge backoff cap
+    // — to complete the lazy-cert exchange and the proof round trip.
+    let mut at = harness.clock;
+    at += Duration::from_secs(30);
+    converge_at(&mut harness, at);
+    assert_eq!(
+        best_hop_to(&harness, "machine1", m2),
+        None,
+        "the path is relearned from OGMs before any proof lands; if this is \
+         already Some, the fixture stopped exercising the proof gate and the \
+         recovery assertions below have gone trivially green"
+    );
+    for _ in 0..40 {
+        at += Duration::from_secs(30);
+        converge_at(&mut harness, at);
+    }
+
+    assert_eq!(
+        best_hop_to(&harness, "machine1", m2),
+        Some(m2),
+        "machine1 must resolve a next hop to machine2 again, not just a path"
+    );
+    assert_eq!(
+        best_hop_to(&harness, "machine2", m1),
+        Some(m1),
+        "the reborn machine2 must resolve a next hop to machine1"
+    );
+
+    // The routing table is one step short of the property that matters: the
+    // reborn node's directed frames were the ones being refused, so assert one
+    // actually arrives.
+    let before = harness.get_machine("machine1").local_deliveries().len();
+    harness
+        .get_machine_mut("machine2")
+        .send_local(m1, b"good morning");
+    harness.settle();
+    assert_eq!(
+        harness.get_machine("machine1").local_deliveries().len(),
+        before + 1,
+        "the reborn machine2's unicast data must reach machine1 again"
+    );
+}
