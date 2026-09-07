@@ -25,6 +25,11 @@ serde.workspace = true
 serde_yaml = "0.9.34"
 pretty-hex.workspace = true
 async-trait.workspace = true
+
+# `MembershipCert` is a `#[repr(C, packed)]` wire struct with no bespoke
+# serializer: its bytes come from `IntoBytes::as_bytes`, which is how a
+# self-issued certificate reaches the same code path as one read from a file.
+zerocopy.workspace = true
 sd-notify = "0.5.0"
 
 [dev-dependencies]

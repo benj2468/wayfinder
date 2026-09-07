@@ -158,6 +158,12 @@ in
         `wayfinder-ctl auth set --seed <seed> --cert <cert> --trust-anchor
         <anchor>` (a oneshot service or activation script gated on
         `wayfinder.service` being up).
+
+        A node that also sets `provider` may give `auth` only its `seed_path`:
+        holding the mesh root key, it derives its own certificate and the trust
+        anchor at startup rather than being provisioned copies of what it can
+        compute. Every other node needs both files, since a certificate it
+        issued to itself would attest to nothing.
       '';
     };
 

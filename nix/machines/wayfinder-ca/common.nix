@@ -28,17 +28,26 @@
 # **The files under `secretsDir` are not in this repo and not in the Nix
 # store.** They are minted offline and copied to the box before first start —
 # see `infra/oracle/README.md`. The mesh root seed in particular *is* the mesh:
-# whoever holds it can issue membership certificates for it.
+# whoever holds it can issue membership certificates for it, which is also why
+# it stays offline-minted rather than generated here on first boot.
 #
 # This is one deployment, not a reusable module: the values below are stated
 # directly rather than exposed as options, because nothing else imports this
 # file to set them.
 { config, lib, ... }:
 let
-  # Where this node's four provisioned files live, all mode 0400 owned by
-  # `wayfinder`: `root.seed` (the mesh root of trust), `identity.seed`,
-  # `node.cert` and `trust-anchor` (this node's own membership in the mesh it
-  # signs for).
+  # Where this node's two provisioned secrets live, both mode 0400 owned by
+  # `wayfinder`: `root.seed` (the mesh root of trust) and `identity.seed`
+  # (this node's own key, whose public half the fleet pins).
+  #
+  # Two, not the four this once carried. `node.cert` and `trust-anchor` were
+  # the other two, and both are *functions* of `root.seed` — the anchor of the
+  # root key and the mesh id, the certificate of the root key signing this
+  # node's own identity. A node holding the root can compute them, so carrying
+  # them as files made an operator mint and copy bytes the node derives at
+  # startup, and gave two more chances for a stale copy to disagree with the
+  # root it was supposed to match. `auth.cert_path`/`auth.trust_anchor_path`
+  # are omitted below, which is what asks for that derivation.
   #
   # The node's own state directory, deliberately — the same one it writes
   # `ca-state.json` and `settings.json` into. An earlier revision kept these in
@@ -61,9 +70,17 @@ let
   # is re-mounted read-only inside the unit's namespace, which restores exactly
   # what the separate directory used to give.
   #
-  # Nothing legitimate is lost: `wayfinder-tap` only ever *reads* all of these.
-  # An identity installed at runtime by `SetAuth` is persisted to
-  # `runtime_state_path`, not written back over `cert_path`.
+  # Nothing legitimate is lost: `wayfinder-tap` only ever *reads* both of
+  # these. An identity installed at runtime by `SetAuth` is persisted to
+  # `runtime_state_path`, not written back over the provisioned files.
+  #
+  # This is also why the *root seed* stays a provisioned file rather than
+  # something the node mints for itself on first boot. Deriving a certificate
+  # from a root the operator supplied is the node exercising authority it was
+  # given; generating the root would be the node granting itself that
+  # authority, and would need exactly the write access this re-mount exists to
+  # take away. A lost or mistyped path would then start a *new* mesh and look
+  # like a clean boot, where today it is a startup error.
   #
   # `-`-prefixed: these are operator-provisioned and legitimately absent on a
   # box that has been installed but not yet given its secrets, and a unit that
@@ -74,8 +91,6 @@ let
   nodeReadOnly = map (f: "-${secretsDir}/${f}") [
     "root.seed"
     "identity.seed"
-    "node.cert"
-    "trust-anchor"
     "cloudflared.json"
   ];
 
@@ -228,17 +243,30 @@ in
       # than a bare bootstrap key.
       auth = {
         seed_path = "${secretsDir}/identity.seed";
-        cert_path = "${secretsDir}/node.cert";
-        trust_anchor_path = "${secretsDir}/trust-anchor";
+
+        # No `cert_path` and no `trust_anchor_path`, deliberately. This node is
+        # the authority for the mesh named below, so it derives both from
+        # `root_seed_path` at startup: the anchor is that root key plus
+        # `mesh_id`, and the certificate is the root signing the identity seed
+        # above with the administration capability — the same bytes
+        # `wayfinderctl cert issue --admin` used to mint by hand, re-issued on
+        # every start so they cannot age out from under a long-lived CA.
+        #
+        # Only a provider may omit these. Every spoke still names both files,
+        # because a certificate it issued to *itself* would attest to nothing.
       };
 
       provider = {
         root_seed_path = "${secretsDir}/root.seed";
 
         # The mesh this authority signs for: 0x5741594e. Must equal the
-        # `--mesh-id` the trust anchor in `secretsDir` was created with
-        # (`wayfinder-ctl cert init-ca`) — `wayfinder-tap` refuses to start on
-        # a mismatch rather than signing for the wrong mesh.
+        # `--mesh-id` `root.seed` was created under (`wayfinder-ctl cert
+        # init-ca`), because the trust anchor every member verifies against is
+        # derived from exactly this pair — change it and this node quietly
+        # becomes the authority for a *different* mesh that no existing member
+        # recognises. Nothing on the box can catch that for you now that the
+        # anchor is derived rather than provisioned: the file that used to
+        # disagree was the check.
         mesh_id = 1463900494;
 
         # Validity window applied to issued membership certificates.

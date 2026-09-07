@@ -59,7 +59,7 @@ mesh links at all is a complete, useful deployment: it serves `SubmitCsr`,
   one; that is design 08. Everything here is arranged so adding one later is a
   config change plus a firewall rule, not a redesign. (§12: that turned out to
   be true — a config block and one ingress rule, no redesign.)
-- Not managing the four secret files declaratively. `sops-nix`/`agenix` is the
+- Not managing the provisioned secret files declaratively. `sops-nix`/`agenix` is the
   natural follow-up; v1 copies them once, by hand, per `infra/oracle/README.md`.
 - Not deploying from CI. That needs cloud credentials in GitLab CI and is a
   separate decision.
@@ -183,16 +183,53 @@ membership.
 
 ### 4.4 Trust material
 
-Four files, minted offline with tooling that already exists
-(`wayfinder-ctl cert init-ca` / `keygen` / `issue`) and copied to
-`/var/lib/wayfinder` (mode 0400, owner `wayfinder`):
+Two files, minted offline with tooling that already exists
+(`wayfinder-ctl cert init-ca` / `keygen`) and copied to `/var/lib/wayfinder`
+(mode 0400, owner `wayfinder`):
 
 | file | what it is |
 |---|---|
 | `root.seed` | the mesh root of trust — **this file is the mesh** |
 | `identity.seed` | this node's own Ed25519 identity; its public half is what clients pin |
-| `node.cert` | this node's admin membership in the mesh it signs for |
-| `trust-anchor` | the public anchor every member verifies against |
+
+**This was four files, and two of them were derivable.** `node.cert` (this
+node's admin membership in the mesh it signs for) and `trust-anchor` (the
+public anchor every member verifies against) are both *functions* of
+`root.seed`: the anchor of the root key and the mesh id, the certificate of the
+root key signing `identity.seed`. A node holding the root can compute both, so
+provisioning them made an operator mint and copy bytes the node already had the
+means to produce, and gave two more chances for a stale copy to disagree with
+the root it was supposed to match. The node now derives both at startup — the
+`auth:` block names only `seed_path` — and re-derives them on every start, so
+the certificate cannot age out from under a long-lived authority.
+
+This grants the provider nothing it did not have. Custody of the root key *is*
+the ability to mint any certificate on this mesh, this one included; the file
+was a copy of a decision the node was already trusted to make. Every other node
+still needs a certificate issued *to* it, which is why `auth.cert_path` and
+`auth.trust_anchor_path` are optional only in provider mode.
+
+Two consequences worth stating:
+
+- **The operator reads the pinning key off the seed, not off a certificate.**
+  `wayfinder-ctl cert show` takes a 32-byte seed as well as a cert or an
+  anchor, and summarises it by the public keys and MAC it derives — never by
+  its own bytes.
+- **Clients authenticate to the CA with `--cert-from`, not a local `--cert`.**
+  The CA's certificate now exists only on the CA, so `scripts/wayfinder-ca.sh`
+  and the runbook read back the one it is running under, which is the
+  `CLAUDE.md` rule (ask the node what it holds) arriving where it always
+  applied.
+
+**The root seed stays offline-minted, and that asymmetry is the point.**
+Deriving a certificate from a root the operator supplied is the node exercising
+authority it was given; generating the root would be the node granting itself
+that authority — and would need exactly the write access `ReadOnlyPaths` below
+exists to take away. It would also convert a missing or mistyped
+`root_seed_path` from a startup error into a silently-started *new mesh* that
+no existing member recognises. `wayfinderctl cert init-ca` therefore survives
+this change; what it stops being is a step whose output the CA needs handed
+back to it.
 
 The node must not be able to rewrite its own root of trust. The first
 implementation bought that with a separate `/var/lib/wayfinder-secrets`, outside
@@ -215,7 +252,7 @@ Two consequences worth stating, because both fail quietly:
 - **Never `chmod 0400 /var/lib/wayfinder/*`.** That directory also holds
   `ca-state.json`, `settings.json` and `node.mac`, which the node writes; a glob
   takes them with it and leaves an authority that cannot record what it issues.
-  The script and both VM tests name the four files one by one for this reason.
+  The script and both VM tests name the provisioned files one by one for this reason.
 
 This does not conflict with the root `CLAUDE.md`'s "nodes are reached over RPC,
 never through their filesystem". That rule forbids host tooling provisioning
@@ -362,7 +399,7 @@ Headscale.
   instead of NixOS.** Rejected: `nix/modules/wayfinder.nix` already models this
   service properly, and the capability derivation in §4.3 belongs there rather
   than in a `docker run` invocation nobody reviews.
-- **`sops-nix` for the four secrets.** Deferred, not rejected — it is the right
+- **`sops-nix` for the provisioned secrets.** Deferred, not rejected — it is the right
   answer and is a follow-up rather than a v1 blocker.
 
 ## 10. Key file map
@@ -388,7 +425,7 @@ Headscale.
   same box rather than the second Always Free one (`mkCloudSystem` builds one
   system; a second box would have been a second deployment to keep alive for a
   service that idles). The CA then stopped being link-less: see §12.
-- **`sops-nix`** for the four secret files.
+- **`sops-nix`** for the provisioned secret files.
 - **A held-CSR occupancy metric** (§7).
 - **CI deploys**, once there is somewhere safe to keep OCI credentials.
 - **Hold a GC root on a long emulated build.** The x86_64 system takes ~90
