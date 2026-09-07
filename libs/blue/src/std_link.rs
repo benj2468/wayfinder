@@ -7,7 +7,8 @@
 //! [`crate::BleReportSink`] submissions.
 //!
 //! BlueZ assembles the Manufacturer Specific Data AD structure itself, so this
-//! side passes the bare `[frag_header][body]` blob (`frame::build_fragment`)
+//! side passes the bare `[mode][frag_header][origin][body]` blob
+//! (`frame::build_fragment`)
 //! rather than self-framing it as [`crate::NrfBleLink`] does — the asymmetry
 //! `libs/blue/CLAUDE.md` warns about.
 
@@ -25,6 +26,7 @@ use bluer::DiscoveryTransport;
 use bluer::ErrorKind;
 use bluer::Session;
 use bluer::adv::Advertisement;
+use bluer::adv::SecondaryChannel;
 use bluer::adv::Type as AdvertisementType;
 use bluer::monitor::Monitor;
 use bluer::monitor::MonitorEvent;
@@ -47,11 +49,14 @@ use wayfinder::interfaces::link::LinkError;
 use wayfinder::link::LinkT;
 use wayfinder::link::Received;
 
+use crate::BleAdvFormat;
 use crate::BleAdvertiser;
 use crate::BleLink;
 use crate::BleLinkParams;
 use crate::BleReportSink;
+use crate::BleSendMode;
 use crate::ad::MESH_COMPANY_ID;
+use crate::ad::{self};
 use crate::addr::BleAddr;
 
 /// The [`BleAdvertiser`] backing [`StdBleLink`]: registers one fragment as a
@@ -75,6 +80,19 @@ struct BluerAdvertiser {
     advertise_dwell: Duration,
 }
 
+/// Secondary-channel PHY requested for an *extended* registration.
+///
+/// Setting `secondary_channel` at all is what makes BlueZ register an
+/// extended rather than a legacy advertising set — there is no separate "use
+/// extended" knob — so this constant is the entire mechanism on this backend.
+///
+/// `OneM` matches `nrf_link.rs`'s `AdvConfig::secondary_phy`, which is left at
+/// `Phy::M1`. The two backends must agree here the way they already agree on
+/// the advertising interval; `TwoM` would buy throughput at the cost of
+/// requiring 2M support on everything listening, which is a joint decision,
+/// not a per-backend one (design 07 §9.2).
+const SECONDARY_CHANNEL: SecondaryChannel = SecondaryChannel::OneM;
+
 /// On-air advertising interval requested for each fragment's advertising set,
 /// in both `MinInterval` and `MaxInterval` — BlueZ's own protocol minimum
 /// (`bluer::adv::Advertisement::min_interval`'s valid range starts at 20ms)
@@ -95,7 +113,16 @@ const ADVERTISING_INTERVAL: Duration = Duration::from_millis(20);
 /// data carrying `fragment`, torn down no later than `advertise_dwell`, and
 /// repeated on-air every [`ADVERTISING_INTERVAL`] for as long as it stays
 /// registered.
-fn build_advertisement(fragment: &[u8], advertise_dwell: Duration) -> Advertisement {
+///
+/// `format` decides only whether [`SECONDARY_CHANNEL`] is requested — that
+/// one field is what selects an extended advertising set over a legacy one.
+/// Everything else is identical between the two, including the interval, so a
+/// mixed-format sender's fragments keep the same on-air cadence.
+fn build_advertisement(
+    fragment: &[u8],
+    advertise_dwell: Duration,
+    format: BleAdvFormat,
+) -> Advertisement {
     Advertisement {
         // Broadcast, not the `Peripheral` default: nothing here would
         // answer a connection attempt. BlueZ forbids `discoverable` on a
@@ -106,19 +133,30 @@ fn build_advertisement(fragment: &[u8], advertise_dwell: Duration) -> Advertisem
         timeout: Some(advertise_dwell),
         min_interval: Some(ADVERTISING_INTERVAL),
         max_interval: Some(ADVERTISING_INTERVAL),
+        secondary_channel: match format {
+            BleAdvFormat::Legacy => None,
+            BleAdvFormat::Extended => Some(SECONDARY_CHANNEL),
+        },
         ..Default::default()
     }
 }
 
 impl BleAdvertiser for BluerAdvertiser {
-    async fn advertise(&self, fragment: &[u8]) -> Result<(), LinkError> {
-        let advertisement = build_advertisement(fragment, self.advertise_dwell);
+    async fn advertise(&self, format: BleAdvFormat, fragment: &[u8]) -> Result<(), LinkError> {
+        let advertisement = build_advertisement(fragment, self.advertise_dwell, format);
 
         let handle = self.adapter.advertise(advertisement).await.map_err(|e| {
-            trace!(?e, "drop: BLE advertise failed");
+            // The expected failure for an extended registration on a
+            // controller that cannot do extended advertising, or whose
+            // `MaxAdvLen` is below `ad::MAX_EXTENDED_ADV_DATA_LEN`. Kept at
+            // `trace!` like every other per-frame drop — the once-per-startup
+            // capability log in `StdBleLink::new` is where an operator sees
+            // the cause, rather than one line per fragment forever.
+            trace!(?e, ?format, "drop: BLE advertise failed");
             LinkError::TransmitFailed
         })?;
         trace!(
+            ?format,
             dwell_ms = self.advertise_dwell.as_millis(),
             "BLE advertisement registered"
         );
@@ -169,19 +207,120 @@ impl StdBleLink {
         info!(
             adapter = adapter.name(),
             dwell_ms = params.advertise_dwell.as_millis(),
+            send_mode = ?params.send_mode,
             address = ?adapter.address().await,
             address_type = ?adapter.address_type().await,
             "BLE mesh link bound to BlueZ adapter"
         );
 
-        let (inner, sink) = BleLink::new(BluerAdvertiser {
-            adapter: adapter.clone(),
-            advertise_dwell: params.advertise_dwell,
-        });
+        log_extended_advertising_capability(&adapter, params.send_mode).await;
+
+        let (inner, sink) = BleLink::new(
+            BluerAdvertiser {
+                adapter: adapter.clone(),
+                advertise_dwell: params.advertise_dwell,
+            },
+            params.send_mode,
+        );
         tokio::spawn(run_scanner(adapter, sink));
 
         Ok(Self { inner })
     }
+}
+
+/// Report, once at startup, whether this host's controller can actually do
+/// what `send_mode` asks of it.
+///
+/// Extended advertising needs a Bluetooth 5-capable controller, and even one
+/// that has it caps advertising data at its own `MaxAdvLen` — which
+/// `crate::ad::MAX_EXTENDED_ADV_DATA_LEN` is chosen to sit under but cannot
+/// verify from a constant. Both facts are only knowable at runtime, from
+/// BlueZ, and both are **optional** D-Bus properties on
+/// `LEAdvertisingManager1`: a controller with no extended-advertising support
+/// simply does not publish them, so their absence is the capability answer
+/// rather than an error to interpret.
+///
+/// Logged, never enforced. A refusal must come from the controller at
+/// registration time, not from a pre-flight check here that could disagree
+/// with it — and a node configured `Both` still has a working legacy half
+/// even where the extended half never reaches the air, so this is not a
+/// reason to fail startup. It exists because the alternative diagnostic is a
+/// silent per-fragment `trace!` in `BluerAdvertiser::advertise`, which is the
+/// exact shape of every BLE bug this crate has already had: a link that looks
+/// alive and moves no traffic.
+///
+/// The equivalent by hand, when a node's logs are not to hand:
+///
+/// ```console
+/// $ busctl get-property org.bluez /org/bluez/hci0 \
+///     org.bluez.LEAdvertisingManager1 SupportedCapabilities
+/// ```
+async fn log_extended_advertising_capability(adapter: &Adapter, send_mode: BleSendMode) {
+    let wants_extended = send_mode.formats().contains(&BleAdvFormat::Extended);
+    let capabilities = adapter.supported_advertising_capabilities().await;
+    let secondary_channels = adapter.supported_advertising_secondary_channels().await;
+
+    // `Ok(None)` and `Err` both end up as "not capable" below, but they are
+    // not the same thing and the difference matters to whoever reads this
+    // line: `Ok(None)` is the controller's *answer* (an optional property a
+    // pre-Bluetooth-5 controller simply does not publish), while `Err` means
+    // the question could not be asked. Reporting an unmeasured value as
+    // though it were measured would corrupt the very decision this log exists
+    // to inform — an operator on a capable host reading `extended_capable =
+    // false` would never enable extended advertising. So say which it was.
+    let probed = capabilities.is_ok() && secondary_channels.is_ok();
+    for (property, err) in [
+        ("SupportedCapabilities", capabilities.as_ref().err()),
+        (
+            "SupportedSecondaryChannels",
+            secondary_channels.as_ref().err(),
+        ),
+    ] {
+        if let Some(e) = err {
+            warn!(
+                adapter = adapter.name(),
+                property,
+                error = %e,
+                "could not read BLE advertising capability from BlueZ; treating extended as unsupported for this log line only"
+            );
+        }
+    }
+
+    let max_adv_len = match &capabilities {
+        Ok(Some(caps)) => Some(caps.max_advertisement_length),
+        _ => None,
+    };
+    let extended_capable = match &secondary_channels {
+        Ok(Some(channels)) => channels.contains(&SECONDARY_CHANNEL),
+        _ => false,
+    };
+    let budget_fits =
+        max_adv_len.is_some_and(|max| usize::from(max) >= ad::MAX_EXTENDED_ADV_DATA_LEN);
+
+    if wants_extended && !(extended_capable && budget_fits) {
+        // Warn, not error: handled (the registration will fail per fragment
+        // and, under `Both`, the legacy half still carries the mesh) but it
+        // needs an operator to either fix the host or set `send_mode` back.
+        warn!(
+            adapter = adapter.name(),
+            ?send_mode,
+            extended_capable,
+            ?max_adv_len,
+            probed,
+            needed = ad::MAX_EXTENDED_ADV_DATA_LEN,
+            "BLE controller cannot serve the configured extended send mode; extended fragments will not reach the air"
+        );
+        return;
+    }
+
+    info!(
+        adapter = adapter.name(),
+        ?send_mode,
+        extended_capable,
+        ?max_adv_len,
+        probed,
+        "BLE controller advertising capabilities"
+    );
 }
 
 /// Watch `adapter` for advertisements carrying this mesh's marker, submitting
@@ -538,15 +677,42 @@ mod tests {
     /// whatever BlueZ defaults to.
     #[test]
     fn build_advertisement_sets_explicit_advertising_interval() {
-        let advertisement = build_advertisement(&[1, 2, 3], Duration::from_millis(150));
+        let advertisement =
+            build_advertisement(&[1, 2, 3], Duration::from_millis(150), BleAdvFormat::Legacy);
         assert_eq!(advertisement.min_interval, Some(ADVERTISING_INTERVAL));
         assert_eq!(advertisement.max_interval, Some(ADVERTISING_INTERVAL));
+    }
+
+    /// `secondary_channel` is the *only* thing distinguishing an extended
+    /// registration from a legacy one on this backend — BlueZ picks the PDU
+    /// type from its presence. Setting it on a legacy fragment would put a
+    /// 31-byte-budget fragment into an extended advertisement (harmless but
+    /// pointless); omitting it on an extended one silently truncates or
+    /// rejects the registration, which is the failure worth a test.
+    #[test]
+    fn build_advertisement_requests_a_secondary_channel_only_for_extended() {
+        let dwell = Duration::from_millis(150);
+
+        let legacy = build_advertisement(&[1, 2, 3], dwell, BleAdvFormat::Legacy);
+        assert_eq!(legacy.secondary_channel, None);
+
+        let extended = build_advertisement(&[1, 2, 3], dwell, BleAdvFormat::Extended);
+        assert_eq!(extended.secondary_channel, Some(SECONDARY_CHANNEL));
+    }
+
+    /// Both backends must agree on the secondary PHY the way they already
+    /// agree on the advertising interval: `nrf_link.rs` leaves
+    /// `AdvConfig::secondary_phy` at `Phy::M1`, so this side must not drift
+    /// to `TwoM`/`Coded` without that side moving too.
+    #[test]
+    fn secondary_channel_matches_the_nrf_backends_secondary_phy() {
+        assert_eq!(SECONDARY_CHANNEL, SecondaryChannel::OneM);
     }
 
     #[test]
     fn build_advertisement_carries_fragment_as_manufacturer_data_and_dwell_as_timeout() {
         let dwell = Duration::from_millis(150);
-        let advertisement = build_advertisement(&[1, 2, 3], dwell);
+        let advertisement = build_advertisement(&[1, 2, 3], dwell, BleAdvFormat::Legacy);
         assert_eq!(
             advertisement.advertisement_type,
             AdvertisementType::Broadcast

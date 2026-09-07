@@ -43,6 +43,8 @@ pub use net::build_udp_multi_link;
 // direct `blue` dependency, matching how `Rylr998LinkParams` is surfaced.
 #[cfg(feature = "ble")]
 pub use ::blue::BleLinkParams;
+#[cfg(feature = "ble")]
+pub use ::blue::BleSendMode;
 #[cfg(feature = "tokio")]
 pub use raw::RawL2Egress;
 #[cfg(all(feature = "tokio", target_os = "linux"))]

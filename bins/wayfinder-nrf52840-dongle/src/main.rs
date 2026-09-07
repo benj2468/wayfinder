@@ -11,7 +11,6 @@
 #![no_main]
 
 use embassy_executor::Spawner;
-use embassy_nrf::Peri;
 use embassy_nrf::bind_interrupts;
 use embassy_nrf::buffered_uarte;
 use embassy_nrf::buffered_uarte::BufferedUarte;
@@ -23,7 +22,6 @@ use embassy_nrf::peripherals;
 use embassy_nrf::usb;
 use tracing::error;
 use tracing::info;
-use wayfinder::interfaces::frame::Mac;
 
 /// Base flash offset of the durable identity store: the two 4 KiB pages
 /// `memory.x` carves out just below the region reserved for the Open
@@ -74,7 +72,22 @@ async fn main(spawner: Spawner) {
         tx_buffer,
     );
 
-    let Ok(task) = node(node_mac, uarte, p.USBD, spawner, led) else {
+    // `wayfinder_nrf::node::run` is spawned directly, not wrapped in a local
+    // `#[task]` that awaits it: the wrapper would `memcpy` that ~62 KB future
+    // through a stack buffer its poll frame then held for the life of the node,
+    // which overflowed into the SoftDevice's RAM. See `run`'s docs.
+    //
+    // The closure is non-capturing and so coerces to the `fn` pointer
+    // `UsbDriverFactory`; it exists to keep `Irqs` — and with it the linked
+    // `USBD` interrupt handler — in this binary rather than in the library.
+    let Ok(task) = wayfinder_nrf::node::run(
+        node_mac,
+        uarte,
+        p.USBD,
+        |usbd, vbus| usb::Driver::new(usbd, Irqs, vbus),
+        spawner,
+        led,
+    ) else {
         error!("failed to spawn node task; halting");
         loop {
             cortex_m::asm::wfe();
@@ -82,17 +95,4 @@ async fn main(spawner: Spawner) {
     };
     info!("spawning node task");
     spawner.spawn(task);
-}
-
-/// The board's one long-lived task: bring up the radios and the management port,
-/// then run the router loop forever.
-#[embassy_executor::task]
-async fn node(
-    node_mac: Mac,
-    uarte: BufferedUarte<'static>,
-    usbd: Peri<'static, peripherals::USBD>,
-    spawner: Spawner,
-    led: Output<'static>,
-) -> ! {
-    wayfinder_nrf::node::run(node_mac, uarte, usbd, Irqs, spawner, led).await
 }

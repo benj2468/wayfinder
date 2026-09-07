@@ -1,9 +1,12 @@
 # Design: Extended BLE advertising for `libs/blue`
 
-**Status:** Proposed. Scoping only — grew out of a question about whether
-Bluetooth 5's larger advertising-data budget could shrink this link's
-fragmentation, not from an issue or a review thread. Not yet reviewed or
-sequenced against other work.
+**Status:** Implemented (2026-09-06), with the deviations recorded in §11 —
+one of which contradicts a non-goal in §2 and is not optional, so read that
+section before trusting §2 or §3.1's arithmetic. The *mechanism* shipped in
+full; the *validation* did not, and cannot without hardware: every timing
+constant and the `MAX_EXTENDED_ADV_DATA_LEN` value remain unmeasured
+(§7.1–7.3), which is why `BleSendMode` defaults to `Legacy` and why a real
+node's first extended send is still an experiment.
 
 **Scope:** `libs/blue` only (`src/ad.rs`, `src/frame.rs`,
 `src/generic_link.rs`, `src/nrf_link.rs`, `src/std_link.rs`). No change to
@@ -461,19 +464,93 @@ PDU type carried the bytes.
 
 ## 7. Feasibility unknowns (why this is scoped, not implemented, yet)
 
-These are the open questions that make this a design doc rather than an
-implementation, in order of how much they could change the design above:
+**Update (2026-09-06): §7.0 below records an API-level verification pass done
+against the exact pinned dependency revisions. It closes the parts of items
+1–3 that could be settled by reading the libraries, and leaves standing only
+the parts that genuinely need hardware.**
 
-1. **Real controller support is unconfirmed on both ends.** SoftDevice S140
-   supporting extended advertising in principle doesn't mean the specific
-   nRF52840 boards this repo targets have been run with it — and on the
-   BlueZ side, not every Linux host's Bluetooth controller supports LE
-   extended advertising at all (needs a BT5-capable controller and a recent
-   enough kernel/BlueZ). `bluer`'s adapter exposes
-   `max_advertisement_length`/`max_scan_response_length` (`adv.rs`) —
-   querying and logging these at `StdBleLink::new` startup, on the actual
-   host `bins/wayfinder-tap` deploys to, is the first concrete step before
-   writing any of §3's code, not an afterthought.
+### 7.0 What an API-level pass confirmed
+
+Read against the versions this workspace actually pins — `nrf-softdevice` at
+git rev `b0ac850` (`Cargo.lock`) with the `s140` feature, and `bluer` 0.17.4 —
+in the same "confirmed by reading the API, not assumed" spirit
+`libs/blue/CLAUDE.md` applies to the legacy 31-byte figure:
+
+- **The nRF transmit variant §3.2 names exists and is reachable.**
+  `NonconnectableAdvertisement::ExtendedNonscannableUndirected { set_id,
+  anonymous, adv_data }` is defined in `nrf-softdevice`'s `ble/peripheral.rs`
+  behind `#[cfg(any(feature = "s132", feature = "s140"))]`, and maps to
+  `BLE_GAP_ADV_TYPE_EXTENDED_NONCONNECTABLE_NONSCANNABLE_UNDIRECTED`. `s140`
+  is already enabled in `libs/blue/Cargo.toml`, so §3.2's snippet compiles as
+  written — no feature change, no dependency bump.
+- **The nRF receive path is already sized for extended reports.**
+  `central::scan`'s static scan buffer is `BUF_LEN = 256` bytes, and
+  `ScanConfig::default()` sets `extended: true` (both in
+  `nrf-softdevice`'s `ble/central.rs`). S140's own
+  `BLE_GAP_SCAN_BUFFER_EXTENDED_MIN` is 255, so the buffer clears the
+  minimum. This is a stronger version of what §3.2 already claimed: the
+  receive side is not merely willing to accept extended PDUs, it has room for
+  a full-size one.
+- **255 bytes is a hard ceiling on both halves, and chaining is not on the
+  table.** S140's bindings give
+  `BLE_GAP_ADV_SET_DATA_SIZE_EXTENDED_MAX_SUPPORTED = 255` on transmit and
+  `BLE_GAP_SCAN_BUFFER_EXTENDED_MAX_SUPPORTED = 255` on receive — the latter
+  against a spec maximum (`BLE_GAP_SCAN_BUFFER_EXTENDED_MAX`) of 1650. The
+  SoftDevice does not support chained `AUX_CHAIN_IND` reassembly at all, so
+  §2's "not chasing the 1650-byte theoretical maximum" non-goal is not merely
+  conservative — it is the only option on this radio, and no
+  reassembly-of-reassembly logic can ever be needed at this layer because
+  the stack will never deliver more than one buffer's worth.
+- **The BlueZ side's fields and probes exist as §3.3/§9.1 assume.**
+  `bluer::adv::Advertisement::secondary_channel:
+  Option<SecondaryChannel>` (`OneM`/`TwoM`/`Coded`) is a real field, and the
+  runtime probe §9.1 calls for is
+  `Adapter::supported_advertising_capabilities()` →
+  `Capabilities::max_advertisement_length`, alongside
+  `Adapter::supported_advertising_secondary_channels()`. Both back
+  **optional** D-Bus properties on `LEAdvertisingManager1`, which is itself
+  the useful signal: a controller with no extended-advertising support
+  reports neither, so `None` is the capability answer rather than an error to
+  interpret.
+- **`set_id: 0` is not merely safe, it is the only legal value.**
+  S140 defines `BLE_GAP_ADV_SET_COUNT_MAX = 1` — one advertising set, full
+  stop. This confirms §3.2's hard-coded `set_id: 0` and, more importantly,
+  pins down what `BleSendMode::Both` can mean on the nRF backend: the legacy
+  and extended passes must run **sequentially through the one set**, never
+  concurrently. That is what §3.2's per-mode loop already does, so no design
+  change follows — but an implementer must not "optimize" it into two
+  parallel advertising sets, which this radio cannot do.
+
+**A structural airtime win §1 does not claim.** Legacy advertising repeats the
+whole 31-byte payload on all three primary channels every advertising event.
+Extended advertising puts only a small `ADV_EXT_IND` pointer on the three
+primary channels and carries the payload once, on a secondary channel, in
+`AUX_ADV_IND`. So the larger payload is not just fragmented less — the bytes
+themselves stop being transmitted three times. The per-frame airtime
+improvement is therefore better than the fragment-count ratio in §1's table
+alone suggests. This cuts the other way for reception, though, and is part of
+why item 2 below still stands: a scanner now has to catch the primary-channel
+pointer *and* follow it to the secondary channel, which is a different
+capture probability than catching one self-contained legacy PDU.
+
+### 7.1–7.4 What still needs hardware
+
+1. **Real controller support on the *BlueZ* end is still unconfirmed**, and
+   is the only capability question §7.0 could not close: not every Linux
+   host's controller supports LE extended advertising (needs a BT5-capable
+   controller plus a recent enough kernel/BlueZ). The nRF end's capability is
+   now settled at the API level (§7.0) but still unexercised on a board.
+   Querying and logging `supported_advertising_capabilities()` /
+   `supported_advertising_secondary_channels()` at `StdBleLink::new`
+   startup, on the actual host `bins/wayfinder-tap` deploys to, remains the
+   first concrete step before writing any of §3's code. As a pre-code
+   one-liner on a deployment-target host:
+
+   ```console
+   $ busctl get-property org.bluez /org/bluez/hci0 \
+       org.bluez.LEAdvertisingManager1 SupportedCapabilities
+   ```
+
 2. **No `btmon`/hardware validation exists for extended advertising's
    timing behavior on this project's radios**, unlike legacy advertising,
    which already had two real bugs found and fixed this way (the 1280 ms
@@ -483,13 +560,20 @@ implementation, in order of how much they could change the design above:
    legacy advertising's timing; nothing here says they carry over unchanged
    to extended PDUs, which have materially different air-interface timing
    (a primary-channel PDU pointing at a secondary-channel `AUX_ADV_IND`
-   rather than one immediate broadcast).
-3. **The `MAX_EXTENDED_ADV_DATA_LEN = 200` proposed in §3.1 is a guess, not
-   a measurement.** It should be validated as the safe floor across whatever
-   real BlueZ-controller and nRF52840 combination this project actually
-   deploys, not assumed from the SoftDevice/BlueZ struct definitions alone —
-   the same "confirmed by reading the API, not assumed" discipline
-   `libs/blue/CLAUDE.md` already applies to the legacy 31-byte figure.
+   rather than one immediate broadcast). **This is now the largest remaining
+   unknown in this document** — §7.0 removed the capability questions but
+   changes nothing about timing, and the two bugs cited above are the
+   precedent for why that matters.
+3. **The `MAX_EXTENDED_ADV_DATA_LEN = 200` proposed in §3.1 is still a
+   guess** — but a better-bounded one after §7.0. The nRF ceiling is now a
+   known 255, so 200 is confirmed safe on that end with headroom; what
+   remains unmeasured is the *BlueZ host controller's*
+   `max_advertisement_length`, which is the binding constraint and could in
+   principle come back below 200. Measure it (item 1's `busctl` line) before
+   fixing the constant. Note that if the measurement comes back at 255 on
+   both ends, the value is still worth leaving below the ceiling rather than
+   at it, so a future third mode tag or a scan-response byte has somewhere
+   to go.
 4. **Phase 1 (§5) is still a coordinated fleet-wide update, even though it
    doesn't touch PDU type.** It's lower-risk than a full flag day, but it's
    not zero-risk: every node's parser must agree on the tagged layout before
@@ -608,3 +692,102 @@ implementation, in order of how much they could change the design above:
   is implemented: its "On-air format" section currently states extended
   advertising has "no path... without deeper, harder-to-verify-without-
   hardware changes," which this document's §1/§3 supersede.
+
+## 11. Deviations taken during implementation
+
+Recorded per `docs/design/README.md`: a design doc is not a spec to follow to
+the letter, but where the implementation departed from it, the departure and
+its reason belong here rather than only in a diff.
+
+1. **`MAX_REASSEMBLED_LEN` had to drop from 280 to 270 — §2's non-goal was
+   wrong.** §2 lists "not required to change `MAX_REASSEMBLED_LEN` (280)" and
+   §3.1 works through `FRAG_PAYLOAD_LEGACY` 19 → 18 without noticing the
+   consequence: `wayfinder_link_utils::Reassembler::new()` asserts
+   `MAX_REASSEMBLED_LEN <= MAX_FRAGMENTS * FRAG_PAYLOAD` at compile time, and
+   `15 * 18 = 270`. Keeping 280 does not degrade, it fails to build. The
+   ceiling is now 270, shared by both formats rather than per-format, which is
+   also what keeps `BleSendMode::Both` coherent: every frame the link accepts
+   is sendable in *both* formats, so a `Both` sender can never emit an extended
+   copy whose legacy counterpart silently failed to fragment. 270 still clears
+   a full-cert OGM (~250 B) with headroom. `frame.rs` restates the assertion
+   beside the constants so a future edit fails there, next to the arithmetic
+   that caused it, rather than inside a link's constructor.
+2. **The mode tag lives in `frame.rs`, not `ad.rs`.** §3.1/§3.5 proposed an
+   `ad::split_mode_tag`-style helper called before `parse_fragment_with_origin`.
+   `ad.rs`'s subject is AD-*structure* framing (length/type/company-id), while
+   the tag is part of this crate's own payload — the same thing
+   `[frag_header][origin][body]` is, and that lives in `frame.rs`. Folding it
+   into `parse_fragment_with_origin`'s return (`(BleAdvFormat, FragHeader, Mac,
+   &[u8])`) also gives both backends one call site to change instead of two,
+   and makes it impossible to parse a fragment without learning its format.
+3. **`BleAdvFormat` and `BleSendMode` are two types, in a new `src/mode.rs`.**
+   §3.5 named only `BleSendMode`. A wire tag (`Legacy`/`Extended`) and a send
+   policy (`Legacy`/`Extended`/`Both`) are different things — `Both` is not a
+   value any fragment can carry — so collapsing them would make an
+   unrepresentable state representable. `mode.rs` is ungated because
+   `BleSendMode` is read by both backends and `BleAdvFormat` appears in
+   `BleAdvertiser::advertise`'s signature, so `params.rs` (`std`-only) was the
+   wrong home for it.
+4. **`build_fragment`/`build_fragment_ad` take a `FragmentSpec` instead of
+   positional arguments.** Adding `format` pushed both to 8 parameters, which
+   `clippy::too_many_arguments` rejects — correctly, since `msg_id`, `index`
+   and `count` are adjacent small integers that transpose silently. `frame` and
+   `frame_len` also collapsed into one already-truncated slice, removing a
+   second class of mismatch.
+5. **`build_fragment_ad` enforces the per-format budget at runtime.** Its
+   output buffer is now sized for `MAX_EXTENDED_ADV_DATA_LEN` so one buffer
+   serves both formats, which means the *type* no longer bounds a legacy
+   advertisement to 31 bytes the way `[u8; MAX_LEGACY_ADV_DATA_LEN]` did.
+   Nothing below this crate enforces it either — the SoftDevice firmware
+   rejects an oversized legacy advertisement, BlueZ its own way — so the check
+   moved into the one function both backends build advertising data through,
+   with a test per format.
+6. **§7.1/§9.1's capability probe shipped as part of this change, not before
+   it.** `log_extended_advertising_capability` queries BlueZ's `MaxAdvLen` and
+   supported secondary channels at `StdBleLink::new` and `warn!`s when
+   `send_mode` asks for extended on a controller that cannot serve it. It is
+   logged, never enforced: a pre-flight check that disagreed with the
+   controller would be worse than the controller's own refusal, and a `Both`
+   node still has a working legacy half. This does **not** close §9.1 — the
+   constant is still a guess; it makes the guess observable on a real host.
+
+7. **A `Both` send succeeds if *any* format reached the air, not if every one
+   did.** §3.5 does not say what `Both` should do when one format's
+   registrations fail, and the obvious implementation — `?` on each
+   `advertise` — gets it wrong. Found immediately on real hardware: against a
+   Bluetooth 4.2 controller (extended advertising is a 5.0 feature), the
+   legacy copy went out fine and BlueZ then rejected the extended one, and
+   the driver logged **every frame as dropped** while the mesh worked. That
+   would make `Both` strictly worse than `Legacy` on exactly the hardware it
+   exists to tolerate, contradicting §3.5's "safe net-positive ... loses
+   nothing". Now a format that fails abandons its own remaining fragments (a
+   half-advertised frame is bytes no peer can reassemble) but not the other
+   format's pass, and only a frame where *no* format reached the air is a
+   `TransmitFailed`. Both backends implement the same rule — they must, or a
+   `Both` node's behaviour would depend on which one it runs.
+8. **`recv` gained a per-frame `"rx frame"` trace carrying the format.** Not
+   in the design at all, and needed before any of it can be validated: with
+   `send_mode` governing only transmission, "are this peer's *extended*
+   advertisements being heard and reassembled" is otherwise unanswerable from
+   a node's logs — and every failure this link has had presented as a link
+   that looked alive and moved no traffic. Logged per completed frame rather
+   than per fragment. A proper per-format counter belongs in `CentralRouter`
+   via the `add-metric` skill; this is the cheap version that makes bring-up
+   possible.
+
+**Open decisions (§9) as resolved:** §9.1 — `MAX_EXTENDED_ADV_DATA_LEN`
+set to **244**, not the 200 §3.1 proposed: 244 is the largest value that
+certainly fits a single `AUX_ADV_IND` PDU once its ~11-byte extended header is
+subtracted from that PDU's 255-octet payload, so this crate never depends on
+`AUX_CHAIN_IND` chaining — which the nRF scanner cannot reassemble anyway. 200
+had no derivation behind it, and below ~244 nothing is gained: a controller
+reports either a few hundred bytes of `MaxAdvLen` or 31, with no middle ground
+to hedge against. Still unmeasured against a BlueZ controller, now reported at
+startup (deviation 6). §9.2 — stayed
+at `M1` on both backends, pinned by a test so the two cannot drift apart.
+§9.3 — Phase 1 ships as a single required update with no tagged/untagged
+straddle, the doc's own "simplest option". §9.4 — `MAX_REASSEMBLED_LEN` moved,
+but *down* and under compulsion (deviation 1), not up as §9.4 contemplated;
+raising it remains a separate decision. §9.5 — timing constants untouched and
+still legacy-tuned; this is the largest live risk. §9.6 — default is `Legacy`,
+as recommended.

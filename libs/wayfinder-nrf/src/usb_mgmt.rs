@@ -29,9 +29,7 @@
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_nrf::Peri;
-use embassy_nrf::interrupt::typelevel::Binding;
 use embassy_nrf::peripherals::USBD;
-use embassy_nrf::usb::InterruptHandler;
 use embassy_nrf::usb::vbus_detect::SoftwareVbusDetect;
 use embassy_sync::once_lock::OnceLock;
 use embassy_time::Duration;
@@ -65,7 +63,27 @@ use crate::usb_link::UsbNcmLink;
 /// The USB driver this board instantiates: the nRF USBD peripheral, with VBUS
 /// state supplied by software rather than read off the SoftDevice-reserved
 /// `POWER` peripheral.
-pub(crate) type UsbDriver = embassy_nrf::usb::Driver<'static, &'static SoftwareVbusDetect>;
+pub type UsbDriver = embassy_nrf::usb::Driver<'static, &'static SoftwareVbusDetect>;
+
+/// How a board hands this crate its `USBD` interrupt binding: a constructor
+/// for [`UsbDriver`], called by [`init`] once the SoftDevice is up and VBUS
+/// detection exists. A board supplies
+/// `|usbd, vbus| embassy_nrf::usb::Driver::new(usbd, Irqs, vbus)`.
+///
+/// A plain `fn` pointer rather than the `impl Binding<USBD, _>` parameter this
+/// replaces, for two reasons that both live outside this module:
+///
+/// - [`crate::node::run`] is an `#[embassy_executor::task]`, and a task
+///   cannot be generic. Threading the binding as a type parameter made `run`
+///   generic, which forced the board to wrap it in a second `async fn` — and
+///   that wrapper cost 62 KB of the node's stack for the whole run. See
+///   `run`'s own comment for the failure it caused.
+/// - `bind_interrupts!` stays in the board binary, where the linker is certain
+///   to pull the generated `USBD` handler into the vector table. A handler
+///   defined in a library rlib is only linked if something in its object is
+///   referenced, and a `Binding` impl is not a symbol — so moving the binding
+///   here to erase the generic would risk a device that enumerates nothing.
+pub type UsbDriverFactory = fn(Peri<'static, USBD>, &'static SoftwareVbusDetect) -> UsbDriver;
 
 /// USB vendor id. `1209:0001` is pid.codes' *unallocated* test pair, never
 /// assigned to a shipping product — right for research firmware, but it must be
@@ -299,7 +317,8 @@ pub struct UsbMgmt {
 /// state it needs is reachable only through SoftDevice syscalls, which return
 /// [`RawError::SoftdeviceNotEnabled`] otherwise. `node_mac` becomes the device's
 /// USB serial number and seeds the mesh interface's host-side address, and
-/// `irqs` is the board's `bind_interrupts!` struct, which must bind `USBD`.
+/// `make_driver` builds the driver from the board's `bind_interrupts!` struct
+/// — see [`UsbDriverFactory`].
 ///
 /// Neither returned half does anything until it is polled: the [`UsbMgmt`] via
 /// [`run`](UsbMgmt::run) — which is also what drives the shared device stack,
@@ -307,14 +326,14 @@ pub struct UsbMgmt {
 /// driver's event loop.
 pub async fn init(
     usbd: Peri<'static, USBD>,
-    irqs: impl Binding<embassy_nrf::interrupt::typelevel::USBD, InterruptHandler<USBD>> + 'static,
+    make_driver: UsbDriverFactory,
     node_mac: Mac,
     spawner: Spawner,
 ) -> Result<(UsbMgmt, UsbNcmLink), UsbInitError> {
     let vbus = init_vbus()?;
     request_hfclk().await?;
 
-    let driver = embassy_nrf::usb::Driver::new(usbd, irqs, vbus);
+    let driver = make_driver(usbd, vbus);
 
     let mut config = Config::new(USB_VID, USB_PID);
     config.manufacturer = Some("Wayfinder");

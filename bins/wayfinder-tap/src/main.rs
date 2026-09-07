@@ -43,6 +43,7 @@ use wayfinder::wayfinder_auth::MembershipCert;
 use wayfinder_driver::AuthSnapshotRx;
 use wayfinder_driver::AuthSnapshotTx;
 use wayfinder_driver::BleLinkParams;
+use wayfinder_driver::BleSendMode;
 use wayfinder_driver::Driver;
 use wayfinder_driver::FrameIo;
 use wayfinder_driver::NullEgress;
@@ -211,6 +212,39 @@ fn load_or_generate_seed(path: &str) -> anyhow::Result<[u8; 32]> {
 /// capacity the connection task answers "busy" immediately instead, which is
 /// the failure a client can act on.
 const AUTHORITY_QUEUE_DEPTH: usize = 16;
+
+/// Map the config layer's [`wayfinder::config::BleSendMode`] onto `blue`'s own
+/// [`BleSendMode`].
+///
+/// Two enums exist for two reasons, and only the first is the obvious one.
+/// `blue` depends on `wayfinder`, so the config crate cannot name the link
+/// crate's type — the same reason
+/// `LinkTransport::default_ble_advertise_dwell_ms` restates a constant instead
+/// of referencing it. But that alone would leave the reverse open, and the
+/// reverse is blocked separately: `wayfinder::config` sits behind that crate's
+/// `alloc` feature (`alloc = ["dep:serde"]`), and `blue` pins `wayfinder` with
+/// `default-features = false` precisely to keep serde out of the SoftDevice
+/// image. Since `BleSendMode` is read on the firmware side too
+/// (`blue::NrfBleLink::new`), naming the config type from `blue` would drag
+/// alloc+serde into a `thumbv7em` build. Worth stating, because the dependency
+/// direction on its own invites a refactor that fails at link time.
+fn ble_send_mode(configured: wayfinder::config::BleSendMode) -> BleSendMode {
+    let mapped = match configured {
+        wayfinder::config::BleSendMode::Legacy => BleSendMode::Legacy,
+        wayfinder::config::BleSendMode::Extended => BleSendMode::Extended,
+        wayfinder::config::BleSendMode::Both => BleSendMode::Both,
+    };
+
+    // Exhaustive in the *other* direction too. The match above only forces a
+    // variant added to `wayfinder::config::BleSendMode` to be handled; one
+    // added to `blue::BleSendMode` would otherwise compile fine here and be
+    // silently unconfigurable from YAML — the mode would exist in the link
+    // crate with no way for an operator to select it. This guard costs nothing
+    // and turns that into a compile error at the one place that could fix it.
+    match mapped {
+        BleSendMode::Legacy | BleSendMode::Extended | BleSendMode::Both => mapped,
+    }
+}
 
 /// Say, at startup, whether this node's clock is trusted and what follows from
 /// it.
@@ -537,11 +571,13 @@ async fn main() -> anyhow::Result<()> {
             LinkTransport::Ble {
                 adapter,
                 advertise_dwell_ms,
+                send_mode,
             } => {
                 interfaces.push(
                     build_ble_link(BleLinkParams {
                         adapter,
                         advertise_dwell: std::time::Duration::from_millis(advertise_dwell_ms),
+                        send_mode: ble_send_mode(send_mode),
                     })
                     .await?,
                 );

@@ -8,6 +8,8 @@
 
 use core::time::Duration;
 
+use crate::mode::BleSendMode;
+
 /// Deployment parameters for a `StdBleLink`.
 ///
 /// Not intra-doc-linked to that type on purpose: it only exists on Linux, so
@@ -26,8 +28,24 @@ pub struct BleLinkParams {
     /// cover several repeats, not just one — a single on-air transmission is
     /// one coin flip against a scanner that isn't listening at that exact
     /// moment. Raising it costs latency directly: a frame takes
-    /// `dwell × fragment_count`, up to 14 fragments.
+    /// `dwell × fragment_count` — up to 15 fragments in legacy format, but
+    /// only 2 for the same frame in extended (see [`Self::send_mode`]).
     pub advertise_dwell: Duration,
+    /// Which on-air advertising format(s) this node transmits.
+    ///
+    /// Receiving is unaffected — a node always reassembles both formats — so
+    /// this only chooses what the node costs the air and which peers can hear
+    /// it. [`BleSendMode::Legacy`] (the default) is heard by every peer;
+    /// [`BleSendMode::Extended`] is far cheaper but inaudible to a peer whose
+    /// controller has no Bluetooth 5 extended advertising;
+    /// [`BleSendMode::Both`] pays for both during a rollout.
+    ///
+    /// A deployment-time decision an operator makes, not something negotiated
+    /// with peers: this medium is connectionless and fire-and-forget, with no
+    /// round trip to ask a peer what it can receive over. `StdBleLink::new`
+    /// logs the local controller's reported extended-advertising capability at
+    /// startup, which is the evidence for making this choice.
+    pub send_mode: BleSendMode,
 }
 
 impl BleLinkParams {
@@ -43,6 +61,7 @@ impl Default for BleLinkParams {
         Self {
             adapter: None,
             advertise_dwell: Self::DEFAULT_ADVERTISE_DWELL,
+            send_mode: BleSendMode::default(),
         }
     }
 }

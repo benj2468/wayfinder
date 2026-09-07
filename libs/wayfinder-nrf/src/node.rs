@@ -10,9 +10,7 @@ use embassy_futures::join::join;
 use embassy_nrf::Peri;
 use embassy_nrf::buffered_uarte::BufferedUarte;
 use embassy_nrf::gpio::Output;
-use embassy_nrf::interrupt::typelevel::Binding;
 use embassy_nrf::peripherals::USBD;
-use embassy_nrf::usb::InterruptHandler;
 use embassy_time::Duration;
 use embassy_time::Timer;
 use embassy_time::with_timeout;
@@ -197,23 +195,47 @@ async fn bring_up_rylr(uarte: Serial, lora_address: u16) -> MeshLink<Serial> {
 ///
 /// `led` is the board's liveness indicator, lit once the run loop is reached and
 /// held for the task's lifetime — dropping an `Output` disconnects the pin.
-/// `irqs` is the board's `bind_interrupts!` struct, which must bind `USBD`.
+/// `make_usb_driver` carries the board's `USBD` interrupt binding — see
+/// [`usb_mgmt::UsbDriverFactory`].
 ///
 /// A radio failing is fatal, since a relay with only its optional interface
 /// working looks healthy and is not; USB failing is not, since a node that
 /// routes over its radios but cannot be watched — and cannot carry the wired
 /// link — is degraded rather than dead.
-pub async fn run<I>(
+///
+/// # This is the spawned task, deliberately
+///
+/// A board spawns *this* function rather than its own `#[task]` that awaits
+/// it, and the difference is not cosmetic — it is ~62 KB of stack.
+///
+/// `.await`ing this future from another `async fn` makes it a field of that
+/// outer coroutine, and rustc builds it in a stack temporary and `memcpy`s it
+/// in. The temporary is reserved by the outer task's poll prologue, so it is
+/// held for as long as the node runs rather than freed after the copy. This
+/// future is ~62 KB (it owns the ~43 KB [`Driver`]), and under `flip-link` the
+/// stack is only what `memory.x` leaves over after the statics — 112,600 bytes
+/// on the DK. That copy, plus this function's own frame (~28 KB) and
+/// `Driver::with_capacities`' (~26 KB), came to 117,376 and ran off the bottom
+/// of RAM into the SoftDevice's reserved region. The SoftDevice traps that as
+/// `NRF_FAULT_ID_APP_MEMACC` and `nrf-softdevice`'s fault handler panics, which
+/// presented as a silent stop right after "BLE link brought up" — the bring-up
+/// log of a node that had, in fact, already died.
+///
+/// Spawning this directly removes the wrapper coroutine and so the copy: the
+/// future is written into the task pool from the caller's (shallow) frame at
+/// boot, and only the ~28 KB + ~26 KB remain at the deepest point.
+///
+/// An `#[embassy_executor::task]` cannot be generic, which is why the `USBD`
+/// binding arrives as a `fn` pointer instead of an `impl Binding<..>`.
+#[embassy_executor::task]
+pub async fn run(
     node_mac: Mac,
     uarte: Serial,
     usbd: Peri<'static, USBD>,
-    irqs: I,
+    make_usb_driver: usb_mgmt::UsbDriverFactory,
     spawner: Spawner,
     mut led: Output<'static>,
-) -> !
-where
-    I: Binding<embassy_nrf::interrupt::typelevel::USBD, InterruptHandler<USBD>> + 'static,
-{
+) -> ! {
     let lora_address = u16::from_be_bytes([node_mac.0[4], node_mac.0[5]]);
     let rylr_link = bring_up_rylr(uarte, lora_address).await;
 
@@ -235,7 +257,21 @@ where
         }
     }
 
-    let ble_link = match crate::link::NrfBleLink::new(spawner, sd) {
+    // `Both` rather than `Extended`, deliberately, because no part of the
+    // extended path has run on this silicon yet (design 07 §7.2). Under
+    // `Extended` alone the failure mode is total silence, which is
+    // indistinguishable from BLE being broken for any of the other reasons
+    // this crate has already had — and every one of those presented as a link
+    // that looked alive and moved no traffic. `Both` keeps the legacy copy as
+    // the control: if a peer hears the legacy fragments and not the extended
+    // ones, the extended path is what is broken, and if it hears neither the
+    // fault is somewhere else entirely. `blue`'s `"rx frame"` trace carries
+    // the format, which is where that comparison is read off.
+    //
+    // The airtime cost is real (roughly the sum of both formats per frame) and
+    // is the price of a diagnosable bring-up. Move to `Extended` once a real
+    // peer is confirmed reassembling the extended copies.
+    let ble_link = match crate::link::NrfBleLink::new(spawner, sd, blue::BleSendMode::Both) {
         Ok(link) => link,
         Err(e) => {
             error!(?e, "BLE bring-up failed; halting");
@@ -246,7 +282,7 @@ where
 
     // Both USB functions come from one device, so this either yields the
     // management port *and* the mesh link or neither.
-    let (usb, usb_link) = match usb_mgmt::init(usbd, irqs, node_mac, spawner).await {
+    let (usb, usb_link) = match usb_mgmt::init(usbd, make_usb_driver, node_mac, spawner).await {
         Ok((usb, link)) => (Some(usb), MeshLink::Usb(link)),
         Err(e) => {
             error!(?e, "USB unavailable; continuing without port or mesh link");

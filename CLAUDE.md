@@ -96,9 +96,17 @@ invocation from its own directory:
   firmware binaries with `test = false`; a host test harness can't link against
   them at all. Their logic is exercised indirectly through the `libs/*` crates
   they wire together (tested in the root workspace) plus CI's `build:embedded`
-  job (cross-compile + clippy for the real target). Only real/simulated
-  hardware-in-the-loop (e.g. `defmt-test` + `probe-rs`) could add genuine test
-  coverage here — not set up in this repo.
+  job (cross-compile + clippy for the real target). Behaviour still needs
+  real/simulated hardware-in-the-loop (e.g. `defmt-test` + `probe-rs`), which is
+  not set up in this repo — but not every board-only property does. Anything
+  decidable from the linked image is gatable without a board, and
+  `build:stack-budget` (`just stack-budget`) is the one that exists: it reads
+  each board's ELF and fails if a task's poll frame reserves more of the stack
+  than `memory.x` can spare. That class of bug is invisible here otherwise — it
+  reproduces identically in `--release`, draws no clippy diagnostic, and the
+  types involved are board-only, so nothing in the host suite can even name
+  them. Reach for the same trick before concluding a firmware property needs
+  hardware.
 - `libs/wayfinder-nrf` — the nRF board-support crate the two nRF firmwares
   share. Not a workspace member (it depends on `nrf-softdevice`, which only
   links for a real embedded target) and not its own `[workspace]` either — a
