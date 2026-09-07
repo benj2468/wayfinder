@@ -46,6 +46,7 @@ use crate::wayfinder::v1alpha::PingProbeState;
 use crate::wayfinder::v1alpha::PingResponse;
 use crate::wayfinder::v1alpha::PingSession;
 use crate::wayfinder::v1alpha::PingStatusResponse;
+use crate::wayfinder::v1alpha::RenewalProviderStatus;
 use crate::wayfinder::v1alpha::ResolveRouteResponse;
 use crate::wayfinder::v1alpha::RevealEnrollmentTokenResponse;
 use crate::wayfinder::v1alpha::RevokeUserSessionsResponse;
@@ -570,6 +571,46 @@ pub struct NodeSecurityData {
     pub revocation_not_after: u64,
 }
 
+/// Where a node renews the membership certificate it currently holds: the
+/// provider that issued it, pinned by key.  Mirrors the `RenewalProvider`
+/// proto.
+///
+/// Installed by [`RouterWrites::set_auth`] alongside the credential itself, and
+/// replaced by every install — a node's renewal target is a property of the
+/// certificate it is running under, not a standing setting.  See the trait
+/// method for why omitting it clears the record rather than leaving the last
+/// one in place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenewalProviderData {
+    /// Where the provider is and which key answers for it.
+    pub target: RenewalTargetData,
+    /// The shared enrollment token the provider requires, or empty.  Secret:
+    /// this is the value a provider checks before it looks a holder up, so a
+    /// renewal is gated on it exactly as a first enrollment is.
+    ///
+    /// A [`SharedSecret`] rather than a `String`, so a `{:?}` of this record —
+    /// which is a thing a future log line will eventually do — cannot put a
+    /// mesh-wide admission credential into the log ring `GetLogs` serves.
+    pub enrollment_token: SharedSecret,
+}
+
+/// Where a node renews, without what it will present when it gets there:
+/// the address and the pinned key, and no secret.  Mirrors the
+/// `RenewalProviderStatus` proto.
+///
+/// Its own type rather than a token-less use of [`RenewalProviderData`] because
+/// it is what [`SecurityStatusData`] carries, and that is answered on a *polled*
+/// read — a dashboard asks for it once a second. A secret that cannot be in the
+/// value cannot be forgotten at one mapping site.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenewalTargetData {
+    /// The provider's management-API listener, as `host:port`.
+    pub address: String,
+    /// The provider's Ed25519 public key, pinned so a hijacked address cannot
+    /// collect this node's keys or hand back another mesh's certificate.
+    pub node_key: [u8; 32],
+}
+
 /// This node's mesh authentication / security posture.  Mirrors the
 /// `GetSecurityStatusResponse` proto.  The [`Default`] (all-zero / `nodes`
 /// empty) represents auth being disabled.
@@ -611,6 +652,25 @@ pub struct SecurityStatusData {
     /// When the revocation naming this node stops being enforced (unix
     /// seconds); zero unless [`self_revoked`](Self::self_revoked).
     pub self_revocation_not_after: u64,
+    /// Whether this node's own certificate has entered the last quarter of its
+    /// validity window and should be renewed now.
+    ///
+    /// False when auth is disabled, when no certificate is held, and — the case
+    /// worth stating — once the certificate has already **expired**. An expired
+    /// certificate is not renewable: the authority matches a renewing holder on
+    /// `now <= not_after`, so past that instant the node is a fresh enrollment
+    /// awaiting approval instead. Collapsing the two into one flag would point
+    /// an operator at the wrong remedy.
+    pub cert_due_renewal: bool,
+    /// Where this node renews the certificate it holds, as its last install
+    /// recorded it; `None` on a node that has not been told one — never, or
+    /// because a later install named none — and whose certificate an operator
+    /// therefore has to renew by hand.
+    ///
+    /// A [`RenewalTargetData`], so the enrollment token is absent from this
+    /// response by construction rather than by a mapping that remembers to drop
+    /// it: this is the answer to a request a dashboard polls once a second.
+    pub renewal_provider: Option<RenewalTargetData>,
 }
 
 /// The membership credential a node is running under: its certificate and the
@@ -731,6 +791,9 @@ pub enum AlarmKindData {
     /// Two distinct identity keys claiming one mesh address; the second
     /// certificate was refused.
     IdentityConflict,
+    /// This node's own membership certificate is inside the last quarter of its
+    /// validity window and has not been renewed.
+    CertExpiring,
 }
 
 /// Who or what an alarm is about.
@@ -927,8 +990,23 @@ pub trait RouterReads {
 /// the loop, and a real invariant to keep by not — `set_auth` writes back
 /// through the caller's own identity-seed slot, which only the loop holds.
 pub trait RouterWrites {
-    /// Set the auth state on the node.
-    fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String>;
+    /// Set the auth state on the node: its identity seed, the membership
+    /// certificate that certifies it, and the trust anchor that certificate
+    /// chains to.
+    ///
+    /// `provider` is where the node renews this certificate before it lapses,
+    /// and it is installed *with* the credential rather than configured beside
+    /// it. Passing `None` clears whatever was recorded: a node handed a new
+    /// credential has been enrolled by whoever handed it over, and continuing to
+    /// renew against the previous authority — which may be one this node has
+    /// just left — is the one outcome worse than not renewing at all.
+    fn set_auth(
+        &mut self,
+        seed: &[u8],
+        cert: &[u8],
+        trust_anchor: &[u8],
+        provider: Option<RenewalProviderData>,
+    ) -> Result<(), String>;
 
     /// Apply a partial update to the node's runtime configuration. Only the
     /// fields present in `config` are changed; unset fields are left as they
@@ -1584,6 +1662,7 @@ fn proto_alarm_kind(kind: AlarmKindData) -> AlarmKind {
         AlarmKindData::ClockUnsynchronized => AlarmKind::ClockUnsynchronized,
         AlarmKindData::SelfRevoked => AlarmKind::SelfRevoked,
         AlarmKindData::IdentityConflict => AlarmKind::IdentityConflict,
+        AlarmKindData::CertExpiring => AlarmKind::CertExpiring,
     }
 }
 
@@ -1927,6 +2006,11 @@ pub fn handle_router_read<P: RouterReads + ?Sized>(
                 own_x_pubkey: s.own_x_pubkey,
                 self_revoked: s.self_revoked,
                 self_revocation_not_after: s.self_revocation_not_after,
+                cert_due_renewal: s.cert_due_renewal,
+                renewal_provider: s.renewal_provider.map(|t| RenewalProviderStatus {
+                    address: t.address,
+                    node_key: t.node_key.to_vec(),
+                }),
             })
         }
         Some(RequestKind::GetOwnCert(_)) => match provider.own_cert() {
@@ -1994,7 +2078,39 @@ pub fn handle_router_write<P: RouterWrites + ?Sized>(
 ) -> Result<WayfinderResponse, WayfinderRequest> {
     let response = match request.request {
         Some(RequestKind::SetAuth(set_auth)) => {
-            match provider.set_auth(&set_auth.seed, &set_auth.cert, &set_auth.trust_anchor) {
+            // The key's length is checked here rather than in each provider:
+            // "32 bytes" is a property of the request, not of the node's state,
+            // and a pin that is not a key can never be satisfied by anything the
+            // node does later.
+            let renewal = set_auth
+                .provider
+                .map(|p| {
+                    let node_key: [u8; 32] = p.node_key.as_slice().try_into().map_err(|_| {
+                        String::from("the renewal provider's node_key must be exactly 32 bytes")
+                    })?;
+                    Ok(RenewalProviderData {
+                        target: RenewalTargetData {
+                            address: p.address,
+                            node_key,
+                        },
+                        enrollment_token: SharedSecret::new(p.enrollment_token),
+                    })
+                })
+                .transpose();
+            let renewal = match renewal {
+                Ok(renewal) => renewal,
+                Err(message) => {
+                    return Ok(WayfinderResponse {
+                        response: Some(ResponseKind::Error(ErrorResponse { message })),
+                    });
+                }
+            };
+            match provider.set_auth(
+                &set_auth.seed,
+                &set_auth.cert,
+                &set_auth.trust_anchor,
+                renewal,
+            ) {
                 Ok(_) => ResponseKind::Empty(Empty {}),
                 Err(e) => ResponseKind::Error(ErrorResponse { message: e }),
             }
@@ -2471,6 +2587,7 @@ mod tests {
     use crate::wayfinder::v1alpha::SetConfigRequest;
     use crate::wayfinder::v1alpha::TrickleConfig;
     use crate::wayfinder::v1alpha::enrollment_policy;
+    use alloc::boxed::Box;
     use alloc::vec;
 
     /// Test double that returns canned responses and records the last
@@ -2489,6 +2606,11 @@ mod tests {
         // resolution as a single fixed answer per test.
         runtime_config_active: bool,
         last_set_config: Option<RuntimeConfigData>,
+        /// The renewal provider the last `set_auth` carried, so a test can
+        /// prove the request's field reaches the provider — including the
+        /// `None` that clears a recorded one, which is why this is a nested
+        /// option rather than a flat one.
+        last_set_auth_provider: Option<Option<RenewalProviderData>>,
         /// What `logs` reports back.
         logs: LogsData,
         /// The `(since_seq, max_records)` the last `logs` call was given, so a
@@ -2611,7 +2733,9 @@ mod tests {
             _seed: &[u8],
             _cert: &[u8],
             _trust_anchor: &[u8],
+            provider: Option<RenewalProviderData>,
         ) -> Result<(), String> {
+            self.last_set_auth_provider = Some(provider);
             Ok(())
         }
 
@@ -3373,6 +3497,94 @@ mod tests {
         );
     }
 
+    /// A `SetAuth` carrying a renewal provider hands it to the node whole: the
+    /// address, the pinned key and the token a provider will ask for.  Without
+    /// this the node installs a certificate it has no way to renew, which is
+    /// invisible until the certificate is most of the way through its life.
+    #[test]
+    fn set_auth_forwards_the_renewal_provider_to_the_node() {
+        use crate::wayfinder::v1alpha::RenewalProvider;
+        use crate::wayfinder::v1alpha::SetAuthRequest;
+
+        let mut service = WayfinderService::new(MockProvider::default());
+        service.handle(WayfinderRequest {
+            request: Some(RequestKind::SetAuth(SetAuthRequest {
+                seed: Vec::new(),
+                cert: vec![1, 2, 3],
+                trust_anchor: vec![4, 5, 6],
+                provider: Some(Box::new(RenewalProvider {
+                    address: "ca.example:7700".into(),
+                    node_key: vec![7u8; 32],
+                    enrollment_token: "s3cret".into(),
+                })),
+            })),
+        });
+
+        assert_eq!(
+            service.provider.last_set_auth_provider,
+            Some(Some(RenewalProviderData {
+                target: RenewalTargetData {
+                    address: "ca.example:7700".into(),
+                    node_key: [7u8; 32],
+                },
+                enrollment_token: SharedSecret::new("s3cret"),
+            }))
+        );
+    }
+
+    /// A `SetAuth` with no provider reaches the node as an explicit `None`,
+    /// which is what clears a record left by an earlier enrollment.  The
+    /// alternative — reading "absent" as "leave it alone" — is a node that keeps
+    /// renewing against the authority it was just moved off.
+    #[test]
+    fn set_auth_without_a_provider_forwards_the_absence() {
+        use crate::wayfinder::v1alpha::SetAuthRequest;
+
+        let mut service = WayfinderService::new(MockProvider::default());
+        service.handle(WayfinderRequest {
+            request: Some(RequestKind::SetAuth(SetAuthRequest {
+                seed: Vec::new(),
+                cert: vec![1, 2, 3],
+                trust_anchor: vec![4, 5, 6],
+                provider: None,
+            })),
+        });
+
+        assert_eq!(service.provider.last_set_auth_provider, Some(None));
+    }
+
+    /// A pinned key that is not 32 bytes is refused here, before any of the
+    /// credential is installed: it is a malformed *request*, and no state the
+    /// node reaches later could make it satisfiable.
+    #[test]
+    fn set_auth_rejects_a_renewal_key_that_is_not_32_bytes() {
+        use crate::wayfinder::v1alpha::RenewalProvider;
+        use crate::wayfinder::v1alpha::SetAuthRequest;
+
+        let mut service = WayfinderService::new(MockProvider::default());
+        let response = service.handle(WayfinderRequest {
+            request: Some(RequestKind::SetAuth(SetAuthRequest {
+                seed: Vec::new(),
+                cert: vec![1, 2, 3],
+                trust_anchor: vec![4, 5, 6],
+                provider: Some(Box::new(RenewalProvider {
+                    address: "ca.example:7700".into(),
+                    node_key: vec![7u8; 31],
+                    enrollment_token: String::new(),
+                })),
+            })),
+        });
+
+        match response.response.expect("service always sets response") {
+            ResponseKind::Error(err) => assert!(err.message.contains("32 bytes")),
+            other => panic!("expected Error, got {:?}", proto_kind_name(&other)),
+        }
+        assert!(
+            service.provider.last_set_auth_provider.is_none(),
+            "the credential must not be installed when the request is malformed"
+        );
+    }
+
     /// An enrollment-policy update reaches the provider field by field, with
     /// the token's `oneof` resolved into the closed [`TokenUpdate`].
     #[test]
@@ -3952,6 +4164,7 @@ mod tests {
                 seed: Vec::new(),
                 cert: Vec::new(),
                 trust_anchor: Vec::new(),
+                provider: None,
             }))
         );
         assert_eq!(

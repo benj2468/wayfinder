@@ -95,6 +95,7 @@ use wayfinder_protos::wayfinder::v1alpha::PingResponse;
 use wayfinder_protos::wayfinder::v1alpha::PingStatusRequest;
 use wayfinder_protos::wayfinder::v1alpha::PingStatusResponse;
 use wayfinder_protos::wayfinder::v1alpha::RemoveUserRequest;
+use wayfinder_protos::wayfinder::v1alpha::RenewalProvider;
 use wayfinder_protos::wayfinder::v1alpha::ResolveRouteRequest;
 use wayfinder_protos::wayfinder::v1alpha::ResolveRouteResponse;
 use wayfinder_protos::wayfinder::v1alpha::RevokeNodeRequest;
@@ -811,17 +812,31 @@ impl Client {
     /// Pass an empty `seed` to certify the identity the node already has — see
     /// [`install_cert`](Self::install_cert), which is that call named for what
     /// it does.
+    ///
+    /// `provider` is where the node renews this certificate before it lapses,
+    /// and it is installed with the credential rather than configured on the
+    /// node. **`None` clears whatever the node had recorded**, which is the
+    /// right default for a caller that does not know the authority behind these
+    /// bytes: a node that keeps renewing against the provider of a credential it
+    /// no longer holds is worse off than one that waits for an operator. A
+    /// caller that *does* know — anything that just talked to the provider —
+    /// should say so.
     pub async fn set_auth(
         &mut self,
         seed: &[u8],
         cert: &[u8],
         trust_anchor: &[u8],
+        provider: Option<RenewalProvider>,
     ) -> anyhow::Result<()> {
         match self
             .request(RequestKind::SetAuth(SetAuthRequest {
                 seed: seed.to_vec(),
                 cert: cert.to_vec(),
                 trust_anchor: trust_anchor.to_vec(),
+                // Boxed on the wire type (see the protos build script), so the
+                // request enum stays small; the box is an encoding detail and
+                // does not belong in this signature.
+                provider: provider.map(Box::new),
             }))
             .await?
         {
@@ -831,15 +846,25 @@ impl Client {
     }
 
     /// Certify the identity the node already holds: install `cert` and
-    /// `trust_anchor` against the node's existing seed, which it keeps.
+    /// `trust_anchor` against the node's existing seed, which it keeps, and
+    /// record `provider` as where the node renews them.
     ///
     /// This is how a node that enrolled online adopts the certificate it was
     /// issued. Its key — and therefore the MAC its peers know it by — does not
     /// change, so the node becomes a member of the mesh without moving on it.
     /// The certificate must of course be bound to that same key, or the node
     /// will hold a certificate it cannot sign for.
-    pub async fn install_cert(&mut self, cert: &[u8], trust_anchor: &[u8]) -> anyhow::Result<()> {
-        self.set_auth(&[], cert, trust_anchor).await
+    ///
+    /// See [`set_auth`](Self::set_auth) for what a `None` provider means. An
+    /// enroller has just spoken to the authority that issued these bytes and is
+    /// exactly the caller that can name it.
+    pub async fn install_cert(
+        &mut self,
+        cert: &[u8],
+        trust_anchor: &[u8],
+        provider: Option<RenewalProvider>,
+    ) -> anyhow::Result<()> {
+        self.set_auth(&[], cert, trust_anchor, provider).await
     }
 
     /// Set the Trickle/OGM emission bounds for one mesh interface at runtime.

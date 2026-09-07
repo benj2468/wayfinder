@@ -39,6 +39,7 @@ use wayfinder_protos::service::OgmScheduleEntryData;
 use wayfinder_protos::service::PendingCsrData;
 use wayfinder_protos::service::PingSessionData;
 use wayfinder_protos::service::PingStartData;
+use wayfinder_protos::service::RenewalTargetData;
 use wayfinder_protos::service::RouteResolutionData;
 use wayfinder_protos::service::RouterReads;
 use wayfinder_protos::service::RouterWrites;
@@ -142,6 +143,10 @@ impl Default for Mock {
                 // function of its key (design 09 §5).
                 node_mac: wayfinder_auth::derive_mac(&MOCK_ED_PUBKEY).0.to_vec(),
                 cert_not_after: 1_800_000_000,
+                // A healthy node: its certificate has most of its life left, so
+                // the Security tab's default flavor renders the expiry plainly
+                // rather than the renewal-due wording.
+                cert_due_renewal: false,
                 revocation_count: 0,
                 nodes: vec![NodeSecurityData {
                     node_id: vec![0, 0, 0, 0, 0, 2],
@@ -157,6 +162,13 @@ impl Default for Mock {
                 own_x_pubkey: MOCK_X_PUBKEY.to_vec(),
                 self_revoked: false,
                 self_revocation_not_after: 0,
+                // Enrolled online, so the node knows where it renews — the
+                // ordinary state for a node the dashboard enrolled, and the one
+                // whose Security tab has a target to render.
+                renewal_provider: Some(RenewalTargetData {
+                    address: "ca.example:7700".into(),
+                    node_key: [9u8; 32],
+                }),
             },
             enrollment_token: None,
             pending_csrs: None,
@@ -182,6 +194,8 @@ impl Mock {
                 mesh_id: 0,
                 node_mac: Vec::new(),
                 cert_not_after: 0,
+                // No certificate at all, so nothing to renew.
+                cert_due_renewal: false,
                 revocation_count: 0,
                 nodes: Vec::new(),
                 require_auth: false,
@@ -194,6 +208,9 @@ impl Mock {
                 own_x_pubkey: MOCK_X_PUBKEY.to_vec(),
                 self_revoked: false,
                 self_revocation_not_after: 0,
+                // Never enrolled, so nowhere to renew: the credential and the
+                // provider that issued it arrive together or not at all.
+                renewal_provider: None,
             },
             enrollment_token: None,
             pending_csrs: None,
@@ -699,7 +716,13 @@ impl RouterWrites for Mock {
     /// keys are left alone; a seed that *is* supplied replaces them, exactly as
     /// a real node's would be re-derived. Reporting that faithfully is the
     /// point — it is how a test can tell which of the two happened.
-    fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String> {
+    fn set_auth(
+        &mut self,
+        seed: &[u8],
+        cert: &[u8],
+        trust_anchor: &[u8],
+        provider: Option<wayfinder_protos::service::RenewalProviderData>,
+    ) -> Result<(), String> {
         let anchor = wayfinder_auth::TrustAnchor::from_bytes(trust_anchor)
             .ok_or_else(|| "unable to parse trust anchor".to_string())?;
         let cert = wayfinder_auth::MembershipCert::from_bytes(cert)
@@ -725,6 +748,11 @@ impl RouterWrites for Mock {
         self.security.mesh_id = anchor.mesh_id;
         self.security.node_mac = cert.node_mac.to_vec();
         self.security.cert_not_after = cert.not_after.get();
+        // Replaced with the credential, never merged — the rule a real node
+        // applies, so an enrollment test here fails the same way one would
+        // against a node. The token half is dropped rather than stored: what a
+        // read reports is the target, and this mock answers reads.
+        self.security.renewal_provider = provider.map(|p| p.target);
         Ok(())
     }
 }

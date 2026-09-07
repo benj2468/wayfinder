@@ -3546,11 +3546,29 @@ fn an_authenticated_neighbor_regains_a_next_hop_after_a_long_outage() {
     harness.reconnect_machine("machine2");
     enable_auth(harness.get_machine_mut("machine2"), &authority, 1);
 
-    // Give the mesh many OGM rounds — far more than the challenge backoff cap
-    // — to complete the lazy-cert exchange and the proof round trip.
-    let mut at = harness.clock;
-    at += Duration::from_secs(30);
+    // One round in which the returning node is heard and the survivor is not.
+    // `advance_trickle` stops on an emission instant, so every interface is at
+    // the head of a fresh interval; a step shorter than the slowest of them
+    // fires only machine2, which came back at `i_min`. machine1 therefore
+    // learns the path while machine2 still holds no certificate for machine1
+    // and so cannot answer a challenge — which is what makes the assertion
+    // below a gate on the proof rather than a race against the OGM cadence.
+    //
+    // Keyed off the current backoff, never a literal number of seconds: this
+    // step must stay shorter than a survivor's emission interval, and a fixed
+    // 30 s silently stopped being that when `TrickleConfig`'s `i_max` default
+    // dropped from 128 s to 32 s — with the survivor now due inside the step,
+    // the whole cert exchange and proof round trip landed in this first round
+    // and the assertion failed.
+    let at = harness.clock + slowest_ogm_interval(&harness) / 2;
     converge_at(&mut harness, at);
+    assert_eq!(
+        harness.get_machine("machine1").router().originator_count(),
+        1,
+        "machine1 must have relearned the path to machine2 from its OGM — \
+         without it the next assertion holds for the wrong reason, since a \
+         missing originator has no next hop either"
+    );
     assert_eq!(
         best_hop_to(&harness, "machine1", m2),
         None,
@@ -3558,9 +3576,12 @@ fn an_authenticated_neighbor_regains_a_next_hop_after_a_long_outage() {
          already Some, the fixture stopped exercising the proof gate and the \
          recovery assertions below have gone trivially green"
     );
+
+    // Now give the mesh many full rounds on its own Trickle drive — far more
+    // than the challenge backoff cap — to complete the lazy-cert exchange and
+    // the proof round trip.
     for _ in 0..40 {
-        at += Duration::from_secs(30);
-        converge_at(&mut harness, at);
+        reconverge(&mut harness);
     }
 
     assert_eq!(

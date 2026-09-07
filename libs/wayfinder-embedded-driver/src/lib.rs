@@ -532,6 +532,12 @@ impl<
                 // `WayfinderService::handle` used to emit it and no longer runs
                 // on this path.
                 audit_request(&request);
+                // No renewal-provider slot, and none is wanted: a board cannot
+                // renew its own certificate — that path is the host driver's
+                // tokio loop — so a `SetAuth` carrying a provider installs the
+                // credential and drops the target, and `GetSecurityStatus` here
+                // reports none. Wire one through if an embedded node ever grows
+                // the ability to renew itself.
                 let response = handle_router(&mut RouterAdapter::new(&mut *router, now), request)
                     // `handle_unowned`, not the not-a-provider message: an
                     // embedded node genuinely is not a provider, but a repeated

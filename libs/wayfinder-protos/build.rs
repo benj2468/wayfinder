@@ -20,6 +20,14 @@ fn main() {
         "#[cfg_attr(feature = \"serde\", derive(serde::Serialize, serde::Deserialize))]",
     );
 
+    // The renewal provider rides in a box, so `SetAuthRequest` — and through it
+    // the `WayfinderRequest` enum every dispatcher returns by value — does not
+    // grow by the size of a `String`, a `Vec` and a `String` for a field only
+    // an enrollment sets. Without it the request enum crosses clippy's
+    // `result_large_err` threshold and every `Result<_, WayfinderRequest>` in
+    // `service.rs` becomes a lint error.
+    config.boxed(".wayfinder.v1alpha.SetAuthRequest.provider");
+
     config
         .include_file("_includes.rs")
         .compile_protos(&["protos/wayfinder/v1alpha/wayfinder.proto"], &["protos/"])

@@ -29,6 +29,10 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use wayfinder_protos::service::RenewalProviderData;
+use wayfinder_protos::service::RenewalTargetData;
+use wayfinder_protos::service::SharedSecret;
+
 /// The mesh identity material a node was handed at runtime: the same three
 /// blobs `wayfinder-tap` otherwise loads from the files an `auth:` config block
 /// points at.
@@ -46,6 +50,15 @@ pub struct NodeIdentity {
     pub cert: Vec<u8>,
     /// The mesh trust anchor (raw `TrustAnchor` bytes) the cert chains to.
     pub trust_anchor: Vec<u8>,
+    /// Where this certificate is renewed before it lapses: the provider that
+    /// issued it, pinned by key. `None` on a credential installed without one,
+    /// which is a node an operator must renew by hand.
+    ///
+    /// Inside [`NodeIdentity`] rather than beside it because it is scoped to
+    /// this certificate: a node moved to a second authority takes a whole new
+    /// identity record, and a renewal target that outlived it would point the
+    /// node back at the mesh it just left.
+    pub provider: Option<RenewalProviderData>,
 }
 
 /// A node's persisted runtime settings, as a set of overrides over the startup
@@ -142,7 +155,10 @@ pub use file::SettingsFile;
 mod file {
     use super::NodeIdentity;
     use super::NodeSettings;
+    use super::RenewalProviderData;
+    use super::RenewalTargetData;
     use super::SettingsStore;
+    use super::SharedSecret;
 
     use alloc::format;
     use alloc::string::String;
@@ -213,6 +229,28 @@ mod file {
         seed: Vec<u8>,
         cert: Vec<u8>,
         trust_anchor: Vec<u8>,
+        /// Where this certificate is renewed, when the enrollment that
+        /// installed it said. `#[serde(default)]` for the same reason
+        /// `self_revocation` above carries one: a blob written before this
+        /// field existed must still parse, and read as "no renewal target"
+        /// rather than as an unreadable file.
+        #[serde(default)]
+        provider: Option<ProviderRecord>,
+    }
+
+    /// One renewal target in the on-disk blob.
+    ///
+    /// Its own shape rather than the wire type, on the same terms as
+    /// [`SettingsState`]: this file's schema and the management API's evolve on
+    /// separate schedules. The token is stored in the clear, which is why the
+    /// file is written owner-only — it sits beside the identity seed, and a node
+    /// that renews unattended must hold what its provider will ask it for.
+    #[derive(Serialize, Deserialize, Clone)]
+    struct ProviderRecord {
+        address: String,
+        node_key: Vec<u8>,
+        #[serde(default)]
+        enrollment_token: String,
     }
 
     /// Just enough of the blob to read `version` before committing to a full
@@ -278,6 +316,11 @@ mod file {
                     seed: i.seed.clone(),
                     cert: i.cert.clone(),
                     trust_anchor: i.trust_anchor.clone(),
+                    provider: i.provider.as_ref().map(|p| ProviderRecord {
+                        address: p.target.address.clone(),
+                        node_key: p.target.node_key.to_vec(),
+                        enrollment_token: p.enrollment_token.expose().into(),
+                    }),
                 }),
             };
             // Compact rather than pretty, unlike the CA log: this blob carries
@@ -296,6 +339,39 @@ mod file {
                     seed: i.seed,
                     cert: i.cert,
                     trust_anchor: i.trust_anchor,
+                    // A stored key that is not 32 bytes is dropped rather than
+                    // failing the load: the rest of the identity is still
+                    // usable, and a node that comes up routing with no renewal
+                    // target is a far better outcome than one that refuses to
+                    // come up at all over a field it could not pin anyway.
+                    //
+                    // Dropped loudly, though. Losing a renewal target is losing
+                    // the node on a delay fuse — it routes normally until the
+                    // certificate lapses — so the one moment anybody could
+                    // notice is this one. `error!` because it is this node's own
+                    // state file that is wrong, and only an operator can fix it.
+                    provider: i.provider.and_then(|p| {
+                        let node_key: [u8; 32] = match p.node_key.as_slice().try_into() {
+                            Ok(key) => key,
+                            Err(_) => {
+                                tracing::error!(
+                                    bytes = p.node_key.len(),
+                                    address = %p.address,
+                                    "discarding the recorded renewal provider: its pinned \
+                                     key is not 32 bytes, so this node will not renew \
+                                     itself until one is installed again"
+                                );
+                                return None;
+                            }
+                        };
+                        Some(RenewalProviderData {
+                            target: RenewalTargetData {
+                                address: p.address,
+                                node_key,
+                            },
+                            enrollment_token: SharedSecret::new(p.enrollment_token),
+                        })
+                    }),
                 }),
             })
         }
@@ -425,7 +501,104 @@ mod tests {
             seed: vec![7; 32],
             cert: vec![1, 2, 3],
             trust_anchor: vec![4, 5, 6],
+            provider: None,
         }
+    }
+
+    /// An identity that also records where its certificate is renewed.
+    fn identity_with_provider() -> NodeIdentity {
+        NodeIdentity {
+            provider: Some(RenewalProviderData {
+                target: RenewalTargetData {
+                    address: "ca.example:7700".into(),
+                    node_key: [9u8; 32],
+                },
+                enrollment_token: SharedSecret::new("s3cret"),
+            }),
+            ..identity()
+        }
+    }
+
+    /// The renewal target survives a write and a re-read, token and all — a
+    /// node that forgot it on restart would come back up unable to renew, which
+    /// is invisible until the certificate is nearly expired.
+    #[test]
+    fn the_renewal_provider_round_trips_through_the_file() {
+        let path = unique_path("renewal-provider");
+        let mut store = SettingsFile::load(Some(path.clone())).unwrap();
+        store
+            .persist(NodeSettings {
+                identity: Some(identity_with_provider()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let reloaded = SettingsFile::load(Some(path.clone())).unwrap();
+        assert_eq!(
+            reloaded.settings().identity.as_ref().unwrap().provider,
+            identity_with_provider().provider
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A stored provider whose pinned key is not 32 bytes is dropped, and the
+    /// rest of the identity still loads.
+    ///
+    /// The trade-off is deliberate — a node that comes up routing with no
+    /// renewal target beats one that refuses to boot over a field it could not
+    /// pin anyway — but it is exactly the shape of silent failure this feature
+    /// exists to prevent, which is why the loader says so on the way past and
+    /// why the identity beside it must survive intact.
+    #[test]
+    fn a_provider_with_an_unusable_key_is_dropped_and_the_identity_survives() {
+        let path = unique_path("bad-provider-key");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"identity":{"seed":[7],"cert":[1],"trust_anchor":[4],
+                 "provider":{"address":"ca.example:7700","node_key":[1,2,3],
+                 "enrollment_token":"s3cret"}}}"#,
+        )
+        .unwrap();
+
+        let loaded = SettingsFile::load(Some(path.clone())).expect("the blob still loads");
+        let identity = loaded
+            .settings()
+            .identity
+            .as_ref()
+            .expect("the identity survives a provider that does not");
+        assert_eq!(identity.cert, vec![1]);
+        assert!(
+            identity.provider.is_none(),
+            "an unpinnable target is no target: it must not load as one"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A settings file written before renewal targets existed still loads, with
+    /// no provider recorded. The field is additive, so an upgrade must not turn
+    /// a node's own state file into an unreadable one — which for this file
+    /// means a node that refuses to start.
+    #[test]
+    fn a_settings_file_written_without_a_provider_still_loads() {
+        let path = unique_path("no-provider");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"identity":{"seed":[7],"cert":[1],"trust_anchor":[4]}}"#,
+        )
+        .unwrap();
+
+        let loaded = SettingsFile::load(Some(path.clone())).expect("an older blob still parses");
+        let identity = loaded
+            .settings()
+            .identity
+            .as_ref()
+            .expect("the identity survives");
+        assert_eq!(identity.seed, vec![7]);
+        assert!(
+            identity.provider.is_none(),
+            "no provider recorded, rather than a load failure"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The self-revocation field's three-way update: absent leaves it alone,

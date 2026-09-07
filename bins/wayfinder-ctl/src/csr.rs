@@ -37,6 +37,8 @@ use wayfinder_protos::wayfinder::v1alpha::submit_csr_response::Outcome as CsrOut
 
 use crate::cert;
 use crate::output;
+use crate::renewal::RenewalArgs;
+use crate::renewal::renewal_note;
 
 /// The node-side certificate-signing-request steps: carry a request out, and a
 /// certificate back.  See the module header for how they chain.
@@ -126,6 +128,12 @@ pub enum CsrCommand {
         /// The mesh trust anchor the certificate chains to.
         #[arg(long)]
         trust_anchor: PathBuf,
+        /// Where the node renews this certificate before it lapses. Naming
+        /// none clears whatever an earlier enrollment recorded, which is the
+        /// right answer for a node whose authority is genuinely unreachable —
+        /// see [`RenewalArgs`].
+        #[command(flatten)]
+        renewal: RenewalArgs,
     },
 }
 
@@ -214,17 +222,25 @@ pub async fn run(cmd: CsrCommand, client: &mut Client) -> anyhow::Result<String>
                 out_anchor.display()
             )
         }
-        CsrCommand::Install { cert, trust_anchor } => {
+        CsrCommand::Install {
+            cert,
+            trust_anchor,
+            renewal,
+        } => {
             // Validated here rather than trusted to the node: the node's own
             // checks are the backstop, but a swapped pair of filenames is worth
             // naming as such instead of surfacing as a remote rejection.
             let credential = cert::read_credential(&cert, &trust_anchor)?;
+            // Resolved before the call, so a malformed pin is refused while the
+            // node still holds the credential it had.
+            let provider = renewal.provider()?;
+            let renewal_note = renewal_note(provider.as_ref());
             client
-                .install_cert(&credential.cert_bytes, &credential.anchor_bytes)
+                .install_cert(&credential.cert_bytes, &credential.anchor_bytes, provider)
                 .await
                 .context("installing the certificate on the node failed")?;
             format!(
-                "installed certificate for {} (mesh {:#x}), valid until {}",
+                "installed certificate for {} (mesh {:#x}), valid until {}{renewal_note}",
                 output::format_mac(&credential.cert.node_mac),
                 credential.anchor.mesh_id,
                 credential.cert.not_after.get()

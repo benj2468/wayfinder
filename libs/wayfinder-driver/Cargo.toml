@@ -20,6 +20,7 @@ tokio = [
     "dep:tokio-serial",
     "dep:embedded-io-adapters",
     "dep:embedded-io-async",
+    "dep:wayfinder-client",
     "std",
 ]
 # `blue?/std` (not `blue/std`): enabling `std` alone must not drag in the BLE
@@ -56,6 +57,11 @@ libc = { workspace = true, optional = true }
 # `tokio`-only: builds the `Rylr998` link transport over a real serial port.
 rylr998 = { workspace = true, features = ["link"], optional = true }
 blue = { workspace = true, optional = true }
+# `tokio`-only: the management-API client this node uses to reach its authority
+# when renewing its own membership certificate.  A node is ordinarily only a
+# management *server*; renewal is the one exchange it has to initiate, because
+# an authority answers a CSR and cannot push.
+wayfinder-client = { workspace = true, optional = true }
 tokio-serial = { workspace = true, optional = true }
 embedded-io-adapters = { workspace = true, optional = true }
 embedded-io-async = { workspace = true, optional = true }

@@ -87,6 +87,23 @@ pub const CERT_FLAG_VIEWER: u8 = 0x04;
 /// `wayfinder_server::MgmtAccess::GrantedMember`.
 pub const CERT_FLAG_MEMBER: u8 = 0x08;
 
+/// What fraction of a membership certificate's life must remain for it to still
+/// count as fresh: renewal is due once the last `1/CERT_RENEWAL_FRACTION` of the
+/// window has been entered.
+///
+/// A quarter, matching `wayfinderctl`'s session rule, and for the same reason:
+/// long enough that a failed renewal leaves time to notice and retry before the
+/// certificate lapses, short enough that a node is not re-enrolling constantly.
+/// Expressed as a divisor rather than a fixed number of seconds so it scales
+/// with whatever lifetime the operator approved this device for — a fixed margin
+/// would mean "always" for a one-hour cert and "never" for a one-year one.
+///
+/// The margin matters more here than it does for a person's session, because
+/// lapsing is not recoverable by the node alone: past `not_after` the authority
+/// no longer finds a holder record to renew against, so the node falls back into
+/// the approval queue and needs an operator.
+pub const CERT_RENEWAL_FRACTION: u64 = 4;
+
 /// Domain-separation label folded into the fingerprint hash, so it can never
 /// collide with another `Blake2s256` use over the same or overlapping bytes
 /// elsewhere in the crate (e.g. [`crate::key::Keypair::pairwise_key`]).
@@ -168,6 +185,48 @@ impl MembershipCert {
         let mut fp = [0u8; 8];
         fp.copy_from_slice(&digest[..8]);
         fp
+    }
+
+    /// The unix-seconds instant at which this certificate enters its renewal
+    /// window: the start of the last [`CERT_RENEWAL_FRACTION`] of its life.
+    ///
+    /// Saturating throughout, so a certificate with a reversed or zero-length
+    /// window yields `not_after` rather than dividing by zero or wrapping.
+    pub fn renew_from(&self) -> u64 {
+        // Copy out of the packed struct before use (no refs into packed).
+        let not_before = self.not_before.get();
+        let not_after = self.not_after.get();
+        let window = not_after.saturating_sub(not_before);
+        not_after.saturating_sub(window / CERT_RENEWAL_FRACTION)
+    }
+
+    /// Whether this certificate has expired as of `now_unix`.
+    ///
+    /// The boundary is deliberately `now_unix > not_after`, identical to
+    /// [`TrustAnchor::verify_cert`]'s: `not_after` itself still verifies. A
+    /// looser predicate here would give a node one second in which it believed
+    /// itself lapsed while every peer still accepted its OGMs.
+    ///
+    /// Says nothing about `not_before`: a certificate that is not yet valid is
+    /// not expired, and the two need different remedies.
+    pub fn expired(&self, now_unix: u64) -> bool {
+        let not_after = self.not_after.get();
+        now_unix > not_after
+    }
+
+    /// Whether this certificate should be renewed now: still valid, but inside
+    /// the last [`CERT_RENEWAL_FRACTION`] of its window.
+    ///
+    /// An expired certificate is **not** due renewal. The distinction is the
+    /// whole point of the predicate rather than a nicety: an authority matches a
+    /// renewing holder on `now_unix <= not_after`, so once that instant passes
+    /// there is no holder record left to renew against and the node is a fresh
+    /// enrollment — parked for an operator's approval, not re-issued on the
+    /// spot. A renewer driven by "expired" would poll a provider that can only
+    /// ever answer "pending"; one driven by this reaches the provider while
+    /// re-issuance is still automatic.
+    pub fn due_renewal(&self, now_unix: u64) -> bool {
+        !self.expired(now_unix) && now_unix >= self.renew_from()
     }
 }
 
@@ -911,4 +970,90 @@ mod tests {
     }
 
     use crate::key::Keypair;
+
+    /// Renewal is due inside the last [`CERT_RENEWAL_FRACTION`] of the window,
+    /// and not before it.  The boundary instant itself counts as due: a node
+    /// that checks exactly on the quarter mark must not have to wait a whole
+    /// poll interval to notice.
+    #[test]
+    fn renewal_is_due_in_the_last_quarter_of_the_window() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let node = Keypair::from_seed(&[2u8; 32]);
+        // A 400-second window, so the last quarter opens at 1300.
+        let cert = authority.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            1000,
+            1400,
+        );
+
+        assert_eq!(cert.renew_from(), 1300, "the last quarter of 1000..1400");
+        assert!(!cert.due_renewal(1000), "fresh at issuance");
+        assert!(
+            !cert.due_renewal(1299),
+            "the instant before the window opens"
+        );
+        assert!(cert.due_renewal(1300), "the boundary instant is due");
+        assert!(cert.due_renewal(1399), "still due just before expiry");
+    }
+
+    /// An *expired* certificate is not "due renewal" — it is expired, and the
+    /// difference is load-bearing rather than cosmetic: the authority matches a
+    /// renewing holder on `now_unix <= not_after`, so past that instant there is
+    /// no record left to renew against and the node is a fresh enrollment
+    /// needing an operator's approval.  A renewer that treated expiry as "due"
+    /// would poll forever against a provider that can only park the request.
+    ///
+    /// The boundary is `now > not_after`, matching [`TrustAnchor::verify_cert`]
+    /// exactly.  Deliberately *not* the `>=` that `wayfinderctl`'s session
+    /// metadata uses: a cert this predicate called expired while verification
+    /// still accepted it would have a one-second window in which the node
+    /// declared itself lapsed and every peer disagreed.
+    #[test]
+    fn an_expired_cert_is_expired_rather_than_due_renewal() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let node = Keypair::from_seed(&[2u8; 32]);
+        let cert = authority.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            1000,
+            1400,
+        );
+
+        assert!(
+            cert.due_renewal(1400),
+            "the last valid instant is still due"
+        );
+        assert!(!cert.due_renewal(1401), "one second later it has expired");
+        assert!(!cert.due_renewal(9999), "and long past it");
+        assert!(!cert.expired(1400), "not_after itself still verifies");
+        assert!(cert.expired(1401));
+        // The two predicates agree with verification on the same instants.
+        let anchor = authority.trust_anchor();
+        assert!(anchor.verify_cert(&cert, 1400).is_ok());
+        assert!(anchor.verify_cert(&cert, 1401).is_err());
+    }
+
+    /// A zero-length window (`not_before == not_after`) must not divide by zero.
+    /// It is valid for exactly one instant, which is also the whole of its last
+    /// quarter — so it is due at that instant and expired immediately after.
+    #[test]
+    fn a_zero_length_window_does_not_divide_by_zero() {
+        let authority = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let node = Keypair::from_seed(&[2u8; 32]);
+        let cert = authority.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            1000,
+            1000,
+        );
+
+        assert_eq!(cert.renew_from(), 1000);
+        assert!(cert.due_renewal(1000));
+        assert!(!cert.expired(1000));
+        assert!(cert.expired(1001));
+    }
 }

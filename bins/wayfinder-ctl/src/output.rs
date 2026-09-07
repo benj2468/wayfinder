@@ -432,10 +432,17 @@ pub fn security(v: &GetSecurityStatusResponse, fmt: OutputFormat) -> anyhow::Res
             return "authentication: disabled".to_string();
         }
         let mut out = format!(
-            "authentication: enabled\nmesh_id: {:#x}\nnode: {}\nown cert expires: {}\nrevocations: {}",
+            "authentication: enabled\nmesh_id: {:#x}\nnode: {}\nown cert expires: {}\nrenews against: {}\nrevocations: {}",
             v.mesh_id,
             format_mac(&v.node_mac),
             format_timestamp(v.cert_not_after),
+            // Both answers are worth a line. Renewal is unattended, so a node
+            // that will do nothing when this certificate expires is something an
+            // operator learns here or by losing the node off the mesh.
+            match v.renewal_provider.as_ref() {
+                Some(p) => p.address.clone(),
+                None => "not set (renew by hand)".to_string(),
+            },
             v.revocation_count,
         );
         if v.nodes.is_empty() {

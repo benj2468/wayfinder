@@ -50,6 +50,7 @@ use tokio::sync::RwLock;
 use tokio::sync::watch;
 use wayfinder::CentralRouter;
 use wayfinder_protos::service::EnrollmentPolicyStatusData;
+use wayfinder_protos::service::RenewalProviderData;
 use wayfinder_protos::service::handle_router_read;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
 use wayfinder_protos::wayfinder::v1alpha::WayfinderResponse;
@@ -74,6 +75,15 @@ pub struct SharedRouter {
     /// loop's per-connection authorization snapshot — which is what makes a
     /// rotated seed stop earning the self-key tier on the very next connection.
     pub identity_seed: Option<[u8; 32]>,
+    /// Where this node renews the certificate it holds: the provider its last
+    /// enrollment named, or `None` on a node that was never told one.
+    ///
+    /// Beside the seed for the same reason the seed is beside the router: the
+    /// driver's renewal check reads it under this one lock, together with the
+    /// certificate it is deciding about, so the two cannot be observed out of
+    /// step — a node cannot renew the credential it holds now against the
+    /// authority that issued the one before it.
+    pub renewal_provider: Option<RenewalProviderData>,
 }
 
 impl SharedRouter {
@@ -82,6 +92,7 @@ impl SharedRouter {
         Self {
             router,
             identity_seed: None,
+            renewal_provider: None,
         }
     }
 }
@@ -198,7 +209,9 @@ impl RouterHandle {
         let view = RouterView::new(&guard.router, now)
             .with_clock_trusted(clock_trusted)
             .with_enrollment_policy(enrollment)
-            .with_identity(guard.identity_seed);
+            .with_identity(guard.identity_seed)
+            // The token-less half: this answer is polled.
+            .with_renewal_provider(guard.renewal_provider.as_ref().map(|p| p.target.clone()));
         handle_router_read(&view, request)
     }
 

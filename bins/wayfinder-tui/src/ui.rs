@@ -560,6 +560,7 @@ fn alarm_kind_name(kind: i32) -> &'static str {
         Ok(AlarmKind::ClockUnsynchronized) => "clock_unsynchronized",
         Ok(AlarmKind::SelfRevoked) => "self_revoked",
         Ok(AlarmKind::IdentityConflict) => "identity_conflict",
+        Ok(AlarmKind::CertExpiring) => "cert_expiring",
         // A node newer than this build, holding a condition it has no name for.
         // Shown as unknown rather than dropped: an alarm this client cannot name
         // is still an alarm.
@@ -1499,8 +1500,30 @@ fn render_security_header(frame: &mut Frame, app: &App, area: Rect) {
             field("Authentication", "enabled"),
             field("Mesh id", &format!("{:#x}", s.mesh_id)),
             field("This node", &format_id(&s.node_mac)),
-            field("Own cert expires", &s.cert_not_after.to_string()),
+            field(
+                "Own cert expires",
+                &if s.cert_due_renewal {
+                    // Said on the same line as the date rather than as a
+                    // separate row: the date alone is a number an operator has
+                    // to convert and compare against now before it means
+                    // anything, and this is the whole of what it means.
+                    format!("{} — renewal due", s.cert_not_after)
+                } else {
+                    s.cert_not_after.to_string()
+                },
+            ),
             field("Revocations held", &s.revocation_count.to_string()),
+            // Where the node will renew, or that it will not. Worth a row of
+            // its own on both answers: renewal is unattended, so "nothing will
+            // happen when this expires" is a state an operator finds out about
+            // here or by losing the node.
+            field(
+                "Renews against",
+                &match &s.renewal_provider {
+                    Some(p) => p.address.clone(),
+                    None => "not set — renew by hand".to_string(),
+                },
+            ),
         ],
     };
 

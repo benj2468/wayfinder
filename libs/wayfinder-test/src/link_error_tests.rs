@@ -231,7 +231,13 @@ async fn send_error_on_one_link_does_not_block_others() {
     // frame carries a header and an auth trailer whose sizes are not this
     // test's business — what is being pinned is that the recording happens at
     // all, and that a failed send records nothing.
-    let now = std::time::Duration::from_millis(1);
+    // Evaluated against the driver's own clock, a second on from the send it
+    // stamped. A fixed instant of this test's choosing does not work: the
+    // driver stamps `record_tx` with `start.elapsed()` — real time — so a
+    // literal like `1ms` is *behind* the send on any run where startup and
+    // dispatch took longer than that, and `RateEstimator::rate` then reports
+    // the un-blended (zero) EWMA for a link that did transmit.
+    let now = tr.driver().elapsed() + Duration::from_secs(1);
     let (failed_iface, healthy_iface) = tr
         .with_router(|router| {
             (

@@ -3,7 +3,11 @@
 //! The dashboard's one operation that talks to a node *other* than its own: it
 //! opens a second, short-lived connection to the provider, submits a
 //! certificate-signing request on this node's behalf, and — if a certificate
-//! comes back — installs it.
+//! comes back — installs it, together with the provider it came from, so the
+//! node can renew it before it lapses. This is the only point in the system
+//! where the provider's address, its pinned key and the enrollment token are all
+//! in one place; a certificate names only the mesh root that signed it, so a
+//! node that is not told here has no way to find its authority later.
 //!
 //! # Whose keys are being certified
 //!
@@ -89,6 +93,7 @@ mod ssr {
     use wayfinder_client::Client;
     use wayfinder_client::Identity;
     use wayfinder_client::NodeAddr;
+    use wayfinder_protos::wayfinder::v1alpha::RenewalProvider;
     use wayfinder_protos::wayfinder::v1alpha::submit_csr_response::Outcome;
 
     use super::EnrollmentOutcome;
@@ -184,9 +189,20 @@ mod ssr {
         match response.outcome {
             Some(Outcome::Issued(issued)) => {
                 let mesh_id = mesh_id_of(&issued.trust_anchor)?;
+                // The certificate is installed together with where it came
+                // from, so the node can renew it before it lapses without
+                // anyone coming back to this page. This is the only moment the
+                // address, the pinned key and the token are all in one place —
+                // the node never learns them otherwise, and a certificate names
+                // only the mesh root that signed it.
+                let renewal = RenewalProvider {
+                    address: provider.address.clone(),
+                    node_key: node_key.to_vec(),
+                    enrollment_token: provider.token.clone(),
+                };
                 conn.run(async |client| {
                     client
-                        .install_cert(&issued.cert, &issued.trust_anchor)
+                        .install_cert(&issued.cert, &issued.trust_anchor, Some(renewal.clone()))
                         .await
                 })
                 .await

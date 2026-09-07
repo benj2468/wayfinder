@@ -30,6 +30,7 @@ use wayfinder_protos::wayfinder::v1alpha::NodeMetrics;
 use wayfinder_protos::wayfinder::v1alpha::NodeSecurity;
 use wayfinder_protos::wayfinder::v1alpha::OgmScheduleEntry;
 use wayfinder_protos::wayfinder::v1alpha::PendingCsr;
+use wayfinder_protos::wayfinder::v1alpha::RenewalProviderStatus;
 use wayfinder_protos::wayfinder::v1alpha::RoutingEntry;
 use wayfinder_protos::wayfinder::v1alpha::TableOccupancy;
 use wayfinder_protos::wayfinder::v1alpha::UserAccount;
@@ -125,9 +126,18 @@ fn seeded_snapshot() -> NodeSnapshot {
         mesh_id: 42,
         node_mac: vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01],
         cert_not_after: 1_800_000_000,
+        // A healthy certificate: the Security tab renders the expiry plainly
+        // rather than the renewal-due wording.
+        cert_due_renewal: false,
         revocation_count: 1,
         self_revoked: false,
         self_revocation_not_after: 0,
+        // Enrolled online, so the node knows where it renews and the Security
+        // tab has a target to render rather than the by-hand wording.
+        renewal_provider: Some(RenewalProviderStatus {
+            address: "ca.example:7700".into(),
+            node_key: vec![9u8; 32],
+        }),
         nodes: vec![
             NodeSecurity {
                 node_id: vec![0, 0, 0, 0, 0, 2],

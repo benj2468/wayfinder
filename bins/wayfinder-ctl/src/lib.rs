@@ -25,6 +25,7 @@ pub mod link;
 pub mod output;
 pub mod ping;
 pub mod provider;
+pub mod renewal;
 pub mod session;
 pub mod user;
 

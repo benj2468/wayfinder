@@ -251,12 +251,35 @@ pub fn Security() -> impl IntoView {
                         />
                         <Field
                             label="Certificate expires"
-                            value=format::timestamp(sec.cert_not_after)
+                            value=if sec.cert_due_renewal {
+                                // On the expiry line rather than as a row of its
+                                // own: a timestamp alone is something the reader
+                                // has to compare against now before it says
+                                // anything, and this is what that comparison
+                                // would tell them.
+                                format!("{} — renewal due", format::timestamp(sec.cert_not_after))
+                            } else {
+                                format::timestamp(sec.cert_not_after)
+                            }
                             mono=true
                         />
                         <Field
                             label="Revocations held"
                             value=sec.revocation_count.to_string()
+                        />
+                        // Where this node renews, or that it does not. Rendered
+                        // on both answers because renewal happens unattended:
+                        // "nothing will happen when this certificate expires"
+                        // is something an operator learns here or by losing the
+                        // node off the mesh.
+                        <Field
+                            label="Renews against"
+                            value=match sec.renewal_provider.as_ref() {
+                                Some(p) => p.address.clone(),
+                                None => "Not set — this certificate must be renewed by hand"
+                                    .to_string(),
+                            }
+                            mono=true
                         />
                         // Shown only when it applies, and phrased as what the
                         // operator has to do. A revoked node otherwise reads as

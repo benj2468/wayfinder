@@ -187,7 +187,13 @@ impl RouterReads for NodeMock {
 }
 
 impl RouterWrites for NodeMock {
-    fn set_auth(&mut self, _seed: &[u8], _cert: &[u8], _anchor: &[u8]) -> Result<(), String> {
+    fn set_auth(
+        &mut self,
+        _seed: &[u8],
+        _cert: &[u8],
+        _anchor: &[u8],
+        _provider: Option<wayfinder_protos::service::RenewalProviderData>,
+    ) -> Result<(), String> {
         Ok(())
     }
 

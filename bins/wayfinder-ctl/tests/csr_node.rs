@@ -42,6 +42,7 @@ use wayfinder_protos::service::OgmScheduleEntryData;
 use wayfinder_protos::service::PendingCsrData;
 use wayfinder_protos::service::PingSessionData;
 use wayfinder_protos::service::PingStartData;
+use wayfinder_protos::service::RenewalProviderData;
 use wayfinder_protos::service::RouteResolutionData;
 use wayfinder_protos::service::RouterReads;
 use wayfinder_protos::service::RouterWrites;
@@ -69,6 +70,10 @@ struct SetAuthCall {
     seed: Vec<u8>,
     cert: Vec<u8>,
     trust_anchor: Vec<u8>,
+    /// Where the install told the node to renew, if anywhere. Captured because
+    /// an absent provider is a meaningful instruction — it clears whatever the
+    /// node had — and not merely a field the command left unset.
+    provider: Option<RenewalProviderData>,
 }
 
 /// A plain member node — no certificate authority behind it, which is the whole
@@ -210,6 +215,9 @@ impl RouterReads for NodeMock {
             mesh_id: 0,
             node_mac: Vec::new(),
             cert_not_after: 0,
+            // This fixture's node holds no certificate at all, so there is
+            // nothing to renew.
+            cert_due_renewal: false,
             revocation_count: 0,
             nodes: vec![],
             require_auth: true,
@@ -223,17 +231,25 @@ impl RouterReads for NodeMock {
             own_x_pubkey: x,
             self_revoked: false,
             self_revocation_not_after: 0,
+            renewal_provider: None,
         }
     }
 }
 
 impl RouterWrites for NodeMock {
-    fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String> {
+    fn set_auth(
+        &mut self,
+        seed: &[u8],
+        cert: &[u8],
+        trust_anchor: &[u8],
+        provider: Option<RenewalProviderData>,
+    ) -> Result<(), String> {
         #[allow(clippy::unwrap_used)]
         self.set_auth_calls.lock().unwrap().push(SetAuthCall {
             seed: seed.to_vec(),
             cert: cert.to_vec(),
             trust_anchor: trust_anchor.to_vec(),
+            provider,
         });
         Ok(())
     }
@@ -617,6 +633,55 @@ async fn csr_request_refuses_a_provider_endpoint() {
 /// while it runs leaves it signing frames under a certificate bound to a MAC
 /// its peers do not know it by, until it restarts — so an install that reaches
 /// a node whose seed the operator never held must never be able to replace it.
+/// `csr install --renew-from` carries the renewal target all the way to the
+/// node: the address, the *pinned key*, and the token a provider will ask for.
+///
+/// Proved end to end, over the real transport, because the three halves are
+/// assembled in three different crates — clap flags here, a proto message on the
+/// wire, a stored record on the node — and each is separately plausible while
+/// the whole is broken. A token that arrives empty, or a key that arrives as the
+/// wrong 32 bytes, produces a node that looks configured for renewal and is
+/// refused by its authority months later, unattended.
+#[tokio::test]
+async fn csr_install_carries_the_renewal_target_to_the_node() {
+    let (endpoint, calls) = spawn_node(true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (cert_path, anchor_path) = issue_for_node(dir.path(), &Keypair::from_seed(&[9u8; 32]));
+
+    run_query(
+        Command::Csr(CsrCommand::Install {
+            cert: cert_path,
+            trust_anchor: anchor_path,
+            renewal: wayfinderctl::renewal::RenewalArgs {
+                renew_from: Some("ca.example:7700".into()),
+                renew_provider_key: Some("0a".repeat(32)),
+                renew_token: Some("s3cret".into()),
+            },
+        }),
+        &endpoint,
+        OutputFormat::Human,
+    )
+    .await
+    .unwrap();
+
+    let calls = calls.lock().unwrap();
+    let provider = calls[0]
+        .provider
+        .as_ref()
+        .expect("the install carried a renewal target");
+    assert_eq!(provider.target.address, "ca.example:7700");
+    assert_eq!(
+        provider.target.node_key, [0x0au8; 32],
+        "the pin is what stops an unattended renewal trusting whatever answers"
+    );
+    assert_eq!(
+        provider.enrollment_token.expose(),
+        "s3cret",
+        "a provider checks its token before it looks up the holder, so a renewal that \
+         arrives without one is refused"
+    );
+}
+
 #[tokio::test]
 async fn csr_install_certifies_the_identity_the_node_already_holds() {
     let (endpoint, calls) = spawn_node(true).await;
@@ -627,6 +692,7 @@ async fn csr_install_certifies_the_identity_the_node_already_holds() {
         Command::Csr(CsrCommand::Install {
             cert: cert_path.clone(),
             trust_anchor: anchor_path.clone(),
+            renewal: Default::default(),
         }),
         &endpoint,
         OutputFormat::Human,
@@ -643,6 +709,11 @@ async fn csr_install_certifies_the_identity_the_node_already_holds() {
     );
     assert_eq!(calls[0].cert, std::fs::read(&cert_path).unwrap());
     assert_eq!(calls[0].trust_anchor, std::fs::read(&anchor_path).unwrap());
+    assert!(
+        calls[0].provider.is_none(),
+        "an install naming no provider carries none, which is what clears whatever the \
+         node had recorded"
+    );
 }
 
 /// `auth set` is the same `SetAuth` with the opposite intent: it carries a
@@ -666,6 +737,7 @@ async fn auth_set_replaces_the_nodes_identity() {
             seed: seed_path,
             cert: cert_path.clone(),
             trust_anchor: anchor_path.clone(),
+            renewal: Default::default(),
         }),
         &endpoint,
         OutputFormat::Human,
@@ -708,6 +780,7 @@ async fn auth_set_refuses_a_cross_mesh_pair_without_transmitting() {
             seed: seed_path,
             cert: cert_path,
             trust_anchor: anchor_path,
+            renewal: Default::default(),
         }),
         &endpoint,
         OutputFormat::Human,
@@ -742,6 +815,7 @@ async fn auth_set_refuses_a_short_seed() {
             seed: seed_path,
             cert: cert_path,
             trust_anchor: anchor_path,
+            renewal: Default::default(),
         }),
         &endpoint,
         OutputFormat::Human,
@@ -811,6 +885,7 @@ async fn an_operator_without_the_seed_can_enroll_a_node_offline() {
         Command::Csr(CsrCommand::Install {
             cert: cert_path.clone(),
             trust_anchor: anchor_path.clone(),
+            renewal: Default::default(),
         }),
         &endpoint,
         OutputFormat::Human,

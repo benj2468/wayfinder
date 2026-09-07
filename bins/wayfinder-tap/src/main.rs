@@ -1196,6 +1196,39 @@ async fn main() -> anyhow::Result<()> {
     // settings above is done before anything can write to it.
     driver.set_settings_store(settings_store);
 
+    // Where this node renews the certificate it is holding, as the enrollment
+    // that installed it recorded — never a value from this file. The two travel
+    // together: a node moved to another authority is handed a new credential,
+    // and the provider it renews against is replaced in the same act, which no
+    // configured value could follow.
+    //
+    // Restored from the settings store rather than re-derived, so a node that
+    // enrolled on a previous run comes back up still knowing where to renew;
+    // a node with no store forgets both halves together, which is what the
+    // warning beside `runtime_state_path` is about.
+    match settings.identity.as_ref().and_then(|i| i.provider.clone()) {
+        Some(provider) => {
+            tracing::info!(
+                provider = %provider.target.address,
+                "automatic membership-certificate renewal enabled"
+            );
+            driver.set_renewal_provider(Some(provider)).await;
+        }
+        // Said out loud, because this is the quiet way a node dies. One holding
+        // a certificate with no renewal target routes perfectly until that
+        // certificate lapses, at which point every peer drops it while it still
+        // reports itself healthy — and until then nothing in its logs
+        // distinguishes it from a node that renews itself. It is also what a
+        // settings file whose provider record failed to load looks like from
+        // here, which is the case nobody would otherwise notice.
+        None if settings.identity.is_some() => tracing::warn!(
+            "this node holds a membership certificate but no renewal provider: it will \
+             not renew itself, and must be re-issued by hand before that certificate \
+             expires (record one with `wayfinderctl csr install --renew-from`)"
+        ),
+        None => {}
+    }
+
     // Serve the management listener now that the driver exists to hand out a
     // read handle. Every router *read* is then answered on the connection's own
     // task under a shared borrow, instead of being forwarded to the loop that
