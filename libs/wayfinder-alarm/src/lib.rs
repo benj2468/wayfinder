@@ -85,6 +85,7 @@ pub use board::AlarmBoard;
 pub use board::AlarmSnapshot;
 pub use board::DETAIL_CAP;
 pub use global::SharedBoard;
+pub use global::clear;
 pub use global::process_board;
 pub use global::raise;
 pub use global::raise_at;
@@ -206,6 +207,22 @@ pub enum AlarmKind {
     /// is a credential-issuance condition far more often than an address-space
     /// one.
     IdentityConflict,
+    /// This node's own membership certificate is inside the last quarter of its
+    /// validity window and has not been renewed yet.
+    ///
+    /// A *warning* condition, not a critical one: the node is fully working and
+    /// routing normally while this is raised. That is precisely why it needs
+    /// saying out loud — the failure it precedes is silent and total. When
+    /// `not_after` passes, peers stop accepting this node's OGMs and the
+    /// authority stops recognising it as a renewing holder, so recovery is no
+    /// longer something the node can do alone: it re-enters the enrollment queue
+    /// and waits for an operator.
+    ///
+    /// Distinct from [`SelfRevoked`](Self::SelfRevoked), which is the same
+    /// outcome arrived at deliberately and already complete. This one is a
+    /// deadline with time still on it, and it is latched so that a node nobody
+    /// watched for a week still says why it is about to go quiet.
+    CertExpiring,
 }
 
 impl AlarmKind {
@@ -224,6 +241,7 @@ impl AlarmKind {
             Self::ClockUnsynchronized => 8,
             Self::SelfRevoked => 9,
             Self::IdentityConflict => 10,
+            Self::CertExpiring => 11,
         }
     }
 
@@ -242,6 +260,7 @@ impl AlarmKind {
             Self::ClockUnsynchronized => "clock_unsynchronized",
             Self::SelfRevoked => "self_revoked",
             Self::IdentityConflict => "identity_conflict",
+            Self::CertExpiring => "cert_expiring",
         }
     }
 }
@@ -348,4 +367,52 @@ pub enum Raised {
     /// The board was full of conditions at least this severe, so this one was
     /// counted (see [`AlarmBoard::dropped`]) but not recorded.
     Dropped,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every kind this build knows about.  Spelled out rather than derived so
+    /// that adding a variant is a deliberate edit here too — which is what makes
+    /// the uniqueness check below a real guard rather than a tautology.
+    const ALL: &[AlarmKind] = &[
+        AlarmKind::UnauthenticatedTraffic,
+        AlarmKind::TrafficFlood,
+        AlarmKind::ManagementAuthFailures,
+        AlarmKind::OgmReplay,
+        AlarmKind::RevokedPeer,
+        AlarmKind::LinkErrors,
+        AlarmKind::TableSaturation,
+        AlarmKind::ClockUnsynchronized,
+        AlarmKind::SelfRevoked,
+        AlarmKind::IdentityConflict,
+        AlarmKind::CertExpiring,
+    ];
+
+    /// Codes and names are a wire contract: a client renders a row by them, so
+    /// two kinds sharing either would make one condition indistinguishable from
+    /// another on every dashboard at once.
+    #[test]
+    fn every_kind_has_a_unique_code_and_name() {
+        for (i, a) in ALL.iter().enumerate() {
+            for b in &ALL[i + 1..] {
+                assert_ne!(a.code(), b.code(), "{a:?} and {b:?} share a code");
+                assert_ne!(a.as_str(), b.as_str(), "{a:?} and {b:?} share a name");
+            }
+            assert_ne!(a.code(), 0, "0 is reserved for the unspecified wire value");
+        }
+    }
+
+    /// The condition this node reports about its *own* certificate, distinct
+    /// from [`AlarmKind::SelfRevoked`]: an expiring cert is still working and
+    /// still renewable, where a revoked one has already gone inert.  Pinned
+    /// because the remedies differ — wait for (or trigger) a renewal, versus
+    /// re-enroll from scratch.
+    #[test]
+    fn cert_expiring_is_its_own_condition() {
+        assert_eq!(AlarmKind::CertExpiring.code(), 11);
+        assert_eq!(AlarmKind::CertExpiring.as_str(), "cert_expiring");
+        assert_ne!(AlarmKind::CertExpiring, AlarmKind::SelfRevoked);
+    }
 }

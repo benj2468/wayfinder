@@ -176,6 +176,49 @@ message GetSecurityStatusResponse {
   // expiry would otherwise be reported, and this is what tells an operator how
   // long peers will keep dropping this MAC.
   uint64 self_revocation_not_after = 13;
+
+  // Whether this node's own certificate is inside the last quarter of its
+  // validity window, and so should be renewed now.  False when auth is
+  // disabled, when no certificate is held, and when the certificate has already
+  // expired.
+  //
+  // Reported as a computed verdict rather than left to the client to derive
+  // from cert_not_after, because the derivation needs the issuance instant too
+  // (the window is a fraction of the whole life, not a fixed margin) and that
+  // is not otherwise on the wire.  Every client would need the same rule, and
+  // one of them would get it wrong.
+  //
+  // Deliberately false once expired: an expired certificate is not renewable —
+  // the authority no longer finds a holder record for it, so the node is a
+  // fresh enrollment.  The two states need different remedies, so they must not
+  // collapse into one flag.
+  bool cert_due_renewal = 14;
+
+  // Where this node renews the certificate it holds, as its last install
+  // recorded it.  Absent on a node that has not been told one — never, or
+  // because a later install named none, which clears the record — and whose
+  // certificate an operator must therefore renew by hand.
+  //
+  // Carries no enrollment token, and the wire message it is typed as has no
+  // field for one.  This response is polled — a dashboard asks for it once a second —
+  // and a shared secret that rides a polled message is a shared secret in every
+  // log, browser and cache on the way; the same reason EnrollmentPolicyStatus
+  // stopped reporting the token it used to.
+  RenewalProviderStatus renewal_provider = 15;
+}
+
+// Where a node renews the membership certificate it currently holds: the
+// provider that issued it, pinned by key.  Reported by GetSecurityStatus.
+//
+// The read counterpart of the RenewalProvider a SetAuth installs, minus the
+// enrollment token — see the field that carries this.
+message RenewalProviderStatus {
+  // The provider's management-API listener, as `host:port`.
+  string address = 1;
+
+  // The provider's Ed25519 public key (32 bytes), pinned: a renewal reaches
+  // this key or it reaches nothing.
+  bytes node_key = 2;
 }
 
 // Ask a node for the membership certificate it is currently running under,
@@ -497,6 +540,15 @@ enum AlarmKind {
   // by the time this is raised, which is why it is reported: the explanation
   // is an authority that issued twice for one address, not a flapping radio.
   ALARM_KIND_IDENTITY_CONFLICT = 10;
+
+  // This node's own membership certificate is inside the last quarter of its
+  // validity window and has not been renewed.  A warning, not a failure: the
+  // node is routing normally while this is held.  What follows if it is ignored
+  // is total and silent — past not_after peers stop accepting this node's OGMs,
+  // and the authority stops treating it as a renewing holder, so it re-enters
+  // the enrollment queue and needs an operator.  Distinct from
+  // ALARM_KIND_SELF_REVOKED, which is that outcome already arrived at.
+  ALARM_KIND_CERT_EXPIRING = 11;
 }
 
 // One latched condition the node is holding.
@@ -806,6 +858,56 @@ message SetAuthRequest {
   // The mesh trust anchor, as raw `TrustAnchor` bytes (the mesh id and root
   // public key the node verifies certificates against).
   bytes trust_anchor = 3;
+
+  // Where this credential came from, so the node can renew it there before it
+  // lapses — the authority that issued `cert`, pinned by key.
+  //
+  // The node holds no other record of who certified it: a membership
+  // certificate names the mesh root that signed it, never the address the
+  // provider answers on, so unless an installer says, a node cannot ask for a
+  // fresh certificate without an operator carrying the request.
+  //
+  // **Every SetAuth replaces this record, and one that omits it clears it.**
+  // The provider is part of the credential being installed, not a setting that
+  // outlives it: a node moved to a second authority would otherwise keep
+  // renewing against the first — which is either a stranger to it now or, worse,
+  // an authority still willing to answer for a mesh it has left.  An install
+  // that names no provider therefore turns automatic renewal off, and says so
+  // rather than renewing somewhere stale.
+  RenewalProvider provider = 4;
+}
+
+// Where a node renews the membership certificate it holds, as installed
+// alongside that certificate by SetAuth.
+message RenewalProvider {
+  // The provider's management-API listener, as `host:port`.  The address a
+  // client would pass to `wayfinderctl --connect`.
+  string address = 1;
+
+  // The provider's Ed25519 public key (32 bytes), pinned so a hijacked address
+  // cannot collect this node's keys or hand back a certificate from a mesh it
+  // does not belong to.
+  //
+  // Required, with no trust-on-first-use fallback: unlike an operator running
+  // an enrollment at a terminal, nobody watches a renewal happen, so there is
+  // nobody to notice the far end changed.
+  bytes node_key = 2;
+
+  // The shared enrollment token, when the provider requires one; empty
+  // otherwise.
+  //
+  // Needed because a provider checks the token before it looks up the holder,
+  // so a renewal is gated on it exactly as a first enrollment is.  It is stored
+  // on the node, beside the identity seed and under the same owner-only
+  // permissions — a node that must renew unattended has to hold what the
+  // provider will ask it for.
+  //
+  // A consequence worth knowing before rotating one: because the check precedes
+  // the holder lookup, changing a provider's enrollment token invalidates the
+  // copy every already-enrolled node is holding, and each will have its next
+  // renewal refused until it is given the new value.  Rotating a token is
+  // therefore a mesh-wide act, not a provider-local one.
+  string enrollment_token = 3;
 }
 
 // The first message a client sends on a management connection, presenting its

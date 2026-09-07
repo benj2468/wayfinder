@@ -43,6 +43,8 @@ use wayfinder_protos::service::PingSessionData;
 use wayfinder_protos::service::PingStartData;
 use wayfinder_protos::service::ProbeData;
 use wayfinder_protos::service::ProbeStateData;
+use wayfinder_protos::service::RenewalProviderData;
+use wayfinder_protos::service::RenewalTargetData;
 use wayfinder_protos::service::RouteResolutionData;
 use wayfinder_protos::service::RouterReads;
 use wayfinder_protos::service::RouterWrites;
@@ -57,6 +59,7 @@ use crate::settings::NodeIdentity;
 use crate::settings::NodeSettings;
 use crate::settings::SettingsStore;
 
+use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
 
@@ -144,6 +147,18 @@ pub struct RouterAdapter<
     /// known. Absent (either way) makes both operations above report "no
     /// identity" rather than guess at one.
     identity_seed: Option<&'a mut Option<[u8; 32]>>,
+    /// Where this node renews the certificate it holds, as the enrollment that
+    /// installed it recorded — the caller's own slot, written through on every
+    /// [`set_auth`](Self::set_auth).
+    ///
+    /// A mutable reference for exactly the reason
+    /// [`identity_seed`](Self::identity_seed) is one: the driver's renewal
+    /// check reads this slot on its next turn of the loop, so an install has to
+    /// change what that check sees now rather than after a restart. It is also
+    /// how the record survives on a node with no settings store at all, which
+    /// installs its credential in memory and would otherwise have a renewal
+    /// target it could not remember for the length of one certificate.
+    renewal_provider: Option<&'a mut Option<RenewalProviderData>>,
 }
 
 impl<
@@ -204,6 +219,7 @@ impl<
             clock_trusted: true,
             settings: None,
             identity_seed: None,
+            renewal_provider: None,
         }
     }
 
@@ -260,6 +276,25 @@ impl<
     /// never called) and when one was offered but is still empty.
     fn current_identity_seed(&self) -> Option<[u8; 32]> {
         self.identity_seed.as_deref().copied().flatten()
+    }
+
+    /// The renewal provider currently held in the caller's slot, if any — on
+    /// the same terms as [`current_identity_seed`](Self::current_identity_seed).
+    fn current_renewal_provider(&self) -> Option<RenewalProviderData> {
+        self.renewal_provider.as_deref().cloned().flatten()
+    }
+
+    /// Tell the adapter which renewal-provider slot this node's driver reads,
+    /// so [`set_auth`](Self::set_auth) can write the installed credential's
+    /// provider straight back into it.
+    ///
+    /// Without it an install still records the provider durably (where a store
+    /// is wired) but the running node keeps renewing against the previous one
+    /// until it restarts — which for a node that has just been moved to another
+    /// authority is the whole of the bug.
+    pub fn with_renewal_provider(mut self, provider: &'a mut Option<RenewalProviderData>) -> Self {
+        self.renewal_provider = Some(provider);
+        self
     }
 
     /// Report `enrollment` as the enrollment policy in force.
@@ -339,6 +374,7 @@ fn alarm_kind_data(kind: wayfinder_alarm::AlarmKind) -> AlarmKindData {
         wayfinder_alarm::AlarmKind::ClockUnsynchronized => AlarmKindData::ClockUnsynchronized,
         wayfinder_alarm::AlarmKind::SelfRevoked => AlarmKindData::SelfRevoked,
         wayfinder_alarm::AlarmKind::IdentityConflict => AlarmKindData::IdentityConflict,
+        wayfinder_alarm::AlarmKind::CertExpiring => AlarmKindData::CertExpiring,
     }
 }
 
@@ -419,6 +455,12 @@ pub struct RouterView<
     /// This node's identity seed, if it has one — reported by
     /// `security_status`, and by nothing else here.
     identity_seed: Option<[u8; 32]>,
+    /// Where this node renews the certificate it holds, if an install has
+    /// recorded one — reported by `security_status`, and by nothing else here.
+    ///
+    /// The token-less half: a read served from this view is polled, and the
+    /// enrollment token has no business in its answer.
+    renewal_provider: Option<RenewalTargetData>,
 }
 
 impl<
@@ -487,6 +529,7 @@ impl<
             clock_trusted: true,
             enrollment: None,
             identity_seed: None,
+            renewal_provider: None,
         }
     }
 
@@ -515,6 +558,20 @@ impl<
     #[must_use]
     pub fn with_identity(mut self, seed: Option<[u8; 32]>) -> Self {
         self.identity_seed = seed;
+        self
+    }
+
+    /// Report `target` as where this node renews its certificate, so an
+    /// operator can see the address their node will actually reach for — the
+    /// only place it is visible, now that it is installed with the credential
+    /// rather than written in the node's configuration file.
+    ///
+    /// Takes the token-less [`RenewalTargetData`]: what this view answers is
+    /// polled, so the secret half of the record must not be reachable from here
+    /// at all.
+    #[must_use]
+    pub fn with_renewal_provider(mut self, target: Option<RenewalTargetData>) -> Self {
+        self.renewal_provider = target;
         self
     }
 
@@ -743,6 +800,12 @@ impl<
             // view could not describe.
             self_revoked: self.router.self_revoked(),
             self_revocation_not_after: self.router.self_revocation_not_after().unwrap_or(0),
+            // Reported with the posture, like the identity above: a node that
+            // holds no certificate can still have been told where to get one.
+            // Note that the three renderers in this repo all stop at
+            // "authentication: disabled" before reaching it, so today this is
+            // carried on the wire for a client that asks rather than shown.
+            renewal_provider: self.renewal_provider.clone(),
             ..SecurityStatusData::default()
         };
 
@@ -794,6 +857,12 @@ impl<
             mesh_id: auth.anchor().mesh_id,
             node_mac: cert.node_mac.to_vec(),
             cert_not_after: cert.not_after.get(),
+            // Answered against the router's own credential clock — the one
+            // every peer certificate is verified against — so the node's
+            // published verdict and its actual behavior cannot disagree. Not
+            // the adapter's `unix_now()`, which is a different value and is not
+            // reachable from this view at all.
+            cert_due_renewal: cert.due_renewal(auth.now_unix()),
             revocation_count: auth.macs_to_purge().count() as u32,
             nodes,
             ..posture
@@ -1043,6 +1112,7 @@ impl<
             .with_clock_trusted(self.clock_trusted)
             .with_enrollment_policy(self.enrollment.clone())
             .with_identity(self.current_identity_seed())
+            .with_renewal_provider(self.current_renewal_provider().map(|p| p.target))
     }
 }
 
@@ -1147,6 +1217,56 @@ impl<
     }
 }
 
+/// Check that `address` is a `host:port` a node could dial, rejecting it with
+/// the reason otherwise.
+///
+/// Not a full parse — resolving a host needs `std`, which this half does not
+/// have. What it catches is the class of mistake that would otherwise go
+/// unnoticed until the certificate is nearly expired: a hostname with no port,
+/// a path where the port should be, an empty string, an unbracketed IPv6
+/// literal. The check lives with the install because that is where a person is
+/// present to read the answer.
+///
+/// **It must stay at least as strict as `NodeAddr::from_str`**, which is what
+/// actually dials this record months later (`wayfinder_driver::renew`). An
+/// address accepted here and refused there is precisely the failure this
+/// function exists to prevent, only with the error arriving where nobody is
+/// watching — which is what an unbracketed IPv6 literal used to do: `::1:7700`
+/// splits into a host and a port here and is ambiguous there. Every rule below
+/// mirrors one of that parser's, except the refusal of port 0, which is
+/// stricter on purpose: nothing listens there, so a record naming it can only
+/// ever dial nowhere.
+fn validate_provider_address(address: &str) -> Result<(), String> {
+    let Some((host, port)) = address.rsplit_once(':') else {
+        return Err(format!(
+            "the renewal provider's address must be host:port, but '{address}' names no port"
+        ));
+    };
+    if host.is_empty() {
+        return Err(format!(
+            "the renewal provider's address must be host:port, but '{address}' names no host"
+        ));
+    }
+    // A host still holding a colon is an unbracketed IPv6 literal — which
+    // cannot be split into address and port without guessing, and which the
+    // dialing parser refuses for that reason. A bracketed one has already had
+    // its port taken off above, so what remains ends in `]`.
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        return Err(format!(
+            "the renewal provider's address '{address}' is ambiguous; bracket an IPv6 \
+             literal as [addr]:port"
+        ));
+    }
+    // Zero is refused with everything unparseable: it is a valid `u16` and not
+    // a port anything listens on, so a node given one would dial nowhere.
+    match port.parse::<u16>() {
+        Ok(0) | Err(_) => Err(format!(
+            "the renewal provider's address must be host:port, but '{port}' is not a port number"
+        )),
+        Ok(_) => Ok(()),
+    }
+}
+
 impl<
     const ORIGINATORS: usize,
     const INTERFACES: usize,
@@ -1175,7 +1295,24 @@ impl<
         PENDING_REPLIES,
     >
 {
-    fn set_auth(&mut self, seed: &[u8], cert: &[u8], trust_anchor: &[u8]) -> Result<(), String> {
+    fn set_auth(
+        &mut self,
+        seed: &[u8],
+        cert: &[u8],
+        trust_anchor: &[u8],
+        provider: Option<RenewalProviderData>,
+    ) -> Result<(), String> {
+        // Checked before anything is installed, so an address that can never be
+        // dialled is an error the operator sees while they are standing at the
+        // terminal — not a renewal that fails for the first time months later,
+        // silently, with the certificate most of the way through its life. The
+        // node cannot resolve a host here (this half is `no_std` + `alloc`), so
+        // it checks the one thing that is a property of the string itself: that
+        // there is a host and a numeric port to dial.
+        if let Some(p) = &provider {
+            validate_provider_address(&p.target.address)?;
+        }
+
         // An empty seed means "certify the identity I already have" — the
         // enrollment case, where the point is that the node's key (and so its
         // MAC) does not change. Anything else is a new identity being installed
@@ -1255,6 +1392,12 @@ impl<
                 seed: seed.to_vec(),
                 cert: cert.to_vec(),
                 trust_anchor: trust_anchor.to_vec(),
+                // Recorded inside the identity, so it is replaced wholesale
+                // with it: an install that names no provider leaves none
+                // behind. See `RouterWrites::set_auth` for why the alternative
+                // — keeping the last one — points a re-enrolled node back at an
+                // authority it may have just left.
+                provider: provider.clone(),
             }),
             // Cleared in the same durable write that installs the identity:
             // this certificate has just been checked against the record above,
@@ -1275,6 +1418,14 @@ impl<
         // copy.
         if let Some(slot) = self.identity_seed.as_deref_mut() {
             *slot = Some(seed);
+        }
+        // Written on the same terms and for the same reason: the driver's
+        // renewal check reads this slot on its next turn of the loop, so a node
+        // moved to another authority must stop renewing against the old one
+        // now rather than at its next restart. An absent provider writes the
+        // absence — this is not a merge.
+        if let Some(slot) = self.renewal_provider.as_deref_mut() {
+            *slot = provider;
         }
         Ok(())
     }
@@ -2225,6 +2376,67 @@ mod tests {
         assert!(s.nodes.is_empty());
     }
 
+    /// The security view answers "should this certificate be renewed now?"
+    /// itself, rather than leaving every client to re-derive it: the rule is a
+    /// fraction of the certificate's whole life, and the issuance instant that
+    /// fraction is measured against is not otherwise on the wire.
+    ///
+    /// Driven through the router's own credential clock (`set_time`) — the one
+    /// the driver loop advances and `verify_cert` is called with — rather than
+    /// through a clock of the view's own. A verdict computed against a different
+    /// clock than the node verifies with could tell an operator the certificate
+    /// was fine on the very tick peers began rejecting it.
+    #[test]
+    fn security_status_reports_when_the_own_cert_is_due_renewal() {
+        use crate::CertAuthority;
+        use wayfinder::auth::OgmAuth;
+        use wayfinder::wayfinder_auth::Keypair;
+        use wayfinder::wayfinder_auth::MembershipCert;
+        use wayfinder::wayfinder_auth::TrustAnchor;
+
+        // Issued at 100 for 1000s: valid 100..1100, last quarter opens at 850.
+        let mut ca = CertAuthority::new(&[1; 32], 0xABCD, 1000, None, true);
+        ca.set_now_unix(100);
+        let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
+        let kp = Keypair::from_seed(&[2; 32]);
+        let cert = MembershipCert::from_bytes(&ca_issue_for(&mut ca, &kp)).unwrap();
+        let mut router = CentralRouter::new(kp.derived_mac());
+        router.set_auth(OgmAuth::new(kp, cert, anchor));
+
+        let due_at = |router: &mut CentralRouter, now: u64| {
+            router.auth_mut().unwrap().set_time(now);
+            RouterAdapter::new(router, Duration::ZERO).security_status()
+        };
+
+        let fresh = due_at(&mut router, 849);
+        assert!(!fresh.cert_due_renewal, "still in the first three quarters");
+        assert_eq!(fresh.cert_not_after, 1100);
+
+        assert!(
+            due_at(&mut router, 850).cert_due_renewal,
+            "the last quarter has opened"
+        );
+        assert!(
+            due_at(&mut router, 1100).cert_due_renewal,
+            "still renewable"
+        );
+        assert!(
+            !due_at(&mut router, 1101).cert_due_renewal,
+            "expired is not due renewal: there is no holder record left to renew \
+             against, so this node is a fresh enrollment rather than a renewal"
+        );
+    }
+
+    /// A node with no certificate at all has nothing to renew, and must not
+    /// report a renewal an operator would go looking for.
+    #[test]
+    fn security_status_reports_no_renewal_due_without_auth() {
+        let mut router = CentralRouter::new(mac(1));
+        let s = RouterAdapter::new(&mut router, Duration::from_secs(0)).security_status();
+        assert!(!s.auth_enabled);
+        assert!(!s.cert_due_renewal);
+    }
+
     /// With auth on, the view reports the mesh header and, per originator,
     /// whether its signed OGM verified (with cert expiry) and whether it is
     /// revoked — the revoked node staying visible even after routing purges it.
@@ -2514,7 +2726,7 @@ mod tests {
         RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &anchor)
+            .set_auth(&[3; 32], &cert, &anchor, None)
             .unwrap();
 
         let identity = store
@@ -2525,6 +2737,209 @@ mod tests {
         assert_eq!(identity.seed, [3u8; 32].to_vec());
         assert_eq!(identity.cert, cert);
         assert_eq!(identity.trust_anchor, anchor);
+    }
+
+    /// A helper renewal target, so the tests below read as being about *which*
+    /// provider is recorded rather than about building one.
+    fn provider(address: &str) -> RenewalProviderData {
+        RenewalProviderData {
+            target: target(address),
+            enrollment_token: wayfinder_protos::service::SharedSecret::new("s3cret"),
+        }
+    }
+
+    /// The token-less half of [`provider`], which is what a read reports.
+    fn target(address: &str) -> RenewalTargetData {
+        RenewalTargetData {
+            address: address.into(),
+            node_key: [9u8; 32],
+        }
+    }
+
+    /// Installing a credential records where it is renewed — durably, and in the
+    /// caller's live slot, because the driver reads that slot on its next turn
+    /// of the loop rather than after a restart.
+    #[test]
+    fn set_auth_records_the_provider_the_credential_came_from() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
+        ca.set_now_unix(1_000);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let cert = ca_issue(
+            &mut ca,
+            &kp.derived_mac().0,
+            &kp.ed_pubkey(),
+            &kp.x_pubkey(),
+        );
+        let anchor = ca.trust_anchor_bytes();
+        let mut store = RecordingStore::default();
+        let mut live: Option<RenewalProviderData> = None;
+
+        RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_epoch_unix(Duration::from_secs(1_000))
+            .with_settings(&mut store)
+            .with_renewal_provider(&mut live)
+            .set_auth(&[3; 32], &cert, &anchor, Some(provider("ca.example:7700")))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .settings()
+                .identity
+                .as_ref()
+                .expect("the identity was recorded")
+                .provider
+                .as_ref(),
+            Some(&provider("ca.example:7700")),
+            "recorded with the credential it belongs to, so a restart keeps it"
+        );
+        assert_eq!(
+            live.as_ref(),
+            Some(&provider("ca.example:7700")),
+            "and visible to the running driver now, not only after a restart"
+        );
+    }
+
+    /// A second install re-points renewal at the authority that issued *this*
+    /// credential — the whole point of recording it with the certificate rather
+    /// than configuring it on the node.
+    ///
+    /// This is the un-register-and-re-register case: a node moved from one
+    /// provider to another must stop asking the first one for certificates.
+    #[test]
+    fn a_second_install_re_points_renewal_at_the_new_provider() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
+        ca.set_now_unix(1_000);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let cert = ca_issue(
+            &mut ca,
+            &kp.derived_mac().0,
+            &kp.ed_pubkey(),
+            &kp.x_pubkey(),
+        );
+        let anchor = ca.trust_anchor_bytes();
+        let mut store = RecordingStore::default();
+        let mut live: Option<RenewalProviderData> = None;
+
+        for address in ["first.example:7700", "second.example:7700"] {
+            RouterAdapter::new(&mut router, Duration::ZERO)
+                .with_epoch_unix(Duration::from_secs(1_000))
+                .with_settings(&mut store)
+                .with_renewal_provider(&mut live)
+                .set_auth(&[3; 32], &cert, &anchor, Some(provider(address)))
+                .unwrap();
+        }
+
+        assert_eq!(live.as_ref(), Some(&provider("second.example:7700")));
+        assert_eq!(
+            store
+                .settings()
+                .identity
+                .as_ref()
+                .unwrap()
+                .provider
+                .as_ref(),
+            Some(&provider("second.example:7700")),
+            "the durable record follows the credential too"
+        );
+    }
+
+    /// An install naming no provider *clears* the one recorded before it.
+    ///
+    /// Reading an absent provider as "leave the last one alone" would leave a
+    /// re-enrolled node asking its previous authority to certify keys it has
+    /// since moved away from — an authority that either refuses (renewal
+    /// silently never happens) or answers for a mesh this node has left.
+    #[test]
+    fn an_install_with_no_provider_clears_the_recorded_one() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
+        ca.set_now_unix(1_000);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let cert = ca_issue(
+            &mut ca,
+            &kp.derived_mac().0,
+            &kp.ed_pubkey(),
+            &kp.x_pubkey(),
+        );
+        let anchor = ca.trust_anchor_bytes();
+        let mut store = RecordingStore::default();
+        let mut live = Some(provider("first.example:7700"));
+
+        RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_epoch_unix(Duration::from_secs(1_000))
+            .with_settings(&mut store)
+            .with_renewal_provider(&mut live)
+            .set_auth(&[3; 32], &cert, &anchor, None)
+            .unwrap();
+
+        assert_eq!(live, None, "the live slot is cleared, not merged");
+        assert!(
+            store
+                .settings()
+                .identity
+                .as_ref()
+                .unwrap()
+                .provider
+                .is_none(),
+            "and so is the durable record"
+        );
+    }
+
+    /// A renewal address with no port is refused, and nothing is installed.
+    ///
+    /// Caught while the operator is present: the alternative is a record that
+    /// looks installed and fails for the first time months later, when the
+    /// certificate is nearly expired and nobody is watching.
+    #[test]
+    fn set_auth_refuses_an_unusable_provider_address() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut ca = crate::CertAuthority::new(&[9; 32], 0xABCD, 10_000, None, true);
+        ca.set_now_unix(1_000);
+        let kp = wayfinder::wayfinder_auth::Keypair::from_seed(&[3; 32]);
+        let cert = ca_issue(
+            &mut ca,
+            &kp.derived_mac().0,
+            &kp.ed_pubkey(),
+            &kp.x_pubkey(),
+        );
+        let anchor = ca.trust_anchor_bytes();
+        let mut store = RecordingStore::default();
+
+        let err = RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_epoch_unix(Duration::from_secs(1_000))
+            .with_settings(&mut store)
+            .set_auth(&[3; 32], &cert, &anchor, Some(provider("ca.example")))
+            .unwrap_err();
+
+        assert!(
+            err.contains("host:port"),
+            "the error names the shape: {err}"
+        );
+        assert!(
+            store.settings().identity.is_none(),
+            "the credential is not installed on the strength of an unusable record"
+        );
+    }
+
+    /// The recorded target is reported back, so an operator can see where their
+    /// node will actually renew — the only place it is visible, now that it
+    /// travels with the credential rather than sitting in a config file.
+    #[test]
+    fn security_status_reports_the_recorded_renewal_provider() {
+        let mut router = CentralRouter::new(mac(1));
+        let mut live = Some(provider("ca.example:7700"));
+
+        let status = RouterAdapter::new(&mut router, Duration::ZERO)
+            .with_renewal_provider(&mut live)
+            .security_status();
+
+        assert_eq!(
+            status.renewal_provider.as_ref(),
+            Some(&target("ca.example:7700")),
+            "the address and the pin are reported"
+        );
     }
 
     /// A node under a revocation refuses a certificate that revocation still
@@ -2563,7 +2978,7 @@ mod tests {
         let err = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(2_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], stale.as_bytes(), &anchor_bytes)
+            .set_auth(&[3; 32], stale.as_bytes(), &anchor_bytes, None)
             .expect_err("a cancelled certificate is refused");
         assert!(err.contains("revoked"), "the reason names the cause: {err}");
         assert!(router.auth_locked(), "and the node stays inert");
@@ -2574,7 +2989,7 @@ mod tests {
         RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(2_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], fresh.as_bytes(), &anchor_bytes)
+            .set_auth(&[3; 32], fresh.as_bytes(), &anchor_bytes, None)
             .expect("a certificate issued after the revocation re-admits the node");
         assert!(!router.self_revoked());
         assert!(!router.auth_locked());
@@ -2629,7 +3044,7 @@ mod tests {
         let mut adapter = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store);
-        adapter.set_auth(&[3; 32], &cert, &anchor).unwrap();
+        adapter.set_auth(&[3; 32], &cert, &anchor, None).unwrap();
 
         let pair = adapter.own_cert().expect("the node is certified");
 
@@ -2693,7 +3108,7 @@ mod tests {
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_identity(&mut identity_seed)
             .with_settings(&mut store)
-            .set_auth(&[], &cert, &anchor)
+            .set_auth(&[], &cert, &anchor, None)
             .unwrap();
 
         assert!(router.auth().is_some(), "the node is now authenticated");
@@ -2748,7 +3163,7 @@ mod tests {
             RouterAdapter::new(&mut router, Duration::ZERO)
                 .with_epoch_unix(Duration::from_secs(1_000))
                 .with_identity(&mut identity_seed)
-                .set_auth(&new_seed, &cert, &anchor)
+                .set_auth(&new_seed, &cert, &anchor, None)
                 .unwrap();
 
             assert_eq!(
@@ -2777,7 +3192,7 @@ mod tests {
             RouterAdapter::new(&mut router, Duration::ZERO)
                 .with_epoch_unix(Duration::from_secs(1_000))
                 .with_identity(&mut identity_seed)
-                .set_auth(&[], &cert, &anchor)
+                .set_auth(&[], &cert, &anchor, None)
                 .unwrap();
 
             assert_eq!(identity_seed, Some(old_seed));
@@ -2797,7 +3212,7 @@ mod tests {
         let anchor = ca.trust_anchor_bytes();
 
         let err = RouterAdapter::new(&mut router, Duration::ZERO)
-            .set_auth(&[], &cert, &anchor)
+            .set_auth(&[], &cert, &anchor, None)
             .expect_err("no identity to certify");
 
         assert!(err.contains("identity"), "got: {err}");
@@ -2814,7 +3229,7 @@ mod tests {
 
         let result = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_settings(&mut store)
-            .set_auth(&[3; 32], b"not a cert", b"not an anchor");
+            .set_auth(&[3; 32], b"not a cert", b"not an anchor", None);
 
         assert!(result.is_err());
         assert!(store.writes.is_empty());
@@ -2841,7 +3256,7 @@ mod tests {
         let err = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &foreign_anchor)
+            .set_auth(&[3; 32], &cert, &foreign_anchor, None)
             .expect_err("cert does not chain to this anchor");
 
         assert!(err.contains("signature"), "got: {err}");
@@ -2870,7 +3285,7 @@ mod tests {
         let err = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &wrong_mesh_anchor)
+            .set_auth(&[3; 32], &cert, &wrong_mesh_anchor, None)
             .expect_err("cert is for a different mesh");
 
         assert!(err.contains("mesh"), "got: {err}");
@@ -2896,7 +3311,7 @@ mod tests {
             // Well past not_after.
             .with_epoch_unix(Duration::from_secs(2_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &anchor)
+            .set_auth(&[3; 32], &cert, &anchor, None)
             .expect_err("cert has expired");
 
         assert!(err.contains("expired"), "got: {err}");
@@ -2921,7 +3336,7 @@ mod tests {
         let err = RouterAdapter::new(&mut router, Duration::ZERO)
             // Adapter clock defaults to unix time 0, well before not_before.
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &anchor)
+            .set_auth(&[3; 32], &cert, &anchor, None)
             .expect_err("cert is not yet valid");
 
         assert!(err.contains("not yet valid"), "got: {err}");
@@ -2955,7 +3370,7 @@ mod tests {
         let err = RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &anchor)
+            .set_auth(&[3; 32], &cert, &anchor, None)
             .expect_err("cert names a different key than the seed being installed");
 
         assert!(
@@ -3002,7 +3417,7 @@ mod tests {
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_identity(&mut identity_seed)
             .with_settings(&mut store)
-            .set_auth(&[], &cert, &anchor)
+            .set_auth(&[], &cert, &anchor, None)
             .expect_err("cert is bound to a MAC other than the one this router runs under");
 
         assert!(
@@ -3035,7 +3450,7 @@ mod tests {
         RouterAdapter::new(&mut router, Duration::ZERO)
             .with_epoch_unix(Duration::from_secs(1_000))
             .with_settings(&mut store)
-            .set_auth(&[3; 32], &cert, &anchor)
+            .set_auth(&[3; 32], &cert, &anchor, None)
             .unwrap();
 
         assert!(router.auth().is_some());

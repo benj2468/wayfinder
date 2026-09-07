@@ -226,6 +226,24 @@ pub fn raise_at(
     with_current(|board| board.raise_at(kind, subject, severity, detail, now_ms))
 }
 
+/// Retire the latched row for `(kind, subject)` on whichever board is current,
+/// returning whether one was actually holding.
+///
+/// The counterpart to [`raise`], and reached the same way — no handle, no clock.
+/// A latched alarm otherwise stays on the board for the life of the process,
+/// which is right for a condition nobody has resolved and wrong for one the node
+/// has since fixed by itself: a certificate that has been renewed, say. Without
+/// this, the first such fix would leave a permanent row saying the node is about
+/// to go silent, and an operator who learned to ignore it would then ignore the
+/// real one.
+///
+/// Only the raise site can know a condition has lifted, which is why this is not
+/// a timeout: staleness is not resolution, and a board that expired its own rows
+/// would quietly discard exactly the conditions nobody has got to yet.
+pub fn clear(kind: AlarmKind, subject: &Subject) -> bool {
+    with_current(|board| board.clear(kind, subject))
+}
+
 /// The current board as a reader sees it.
 #[must_use]
 pub fn snapshot() -> AlarmSnapshot {
@@ -324,6 +342,66 @@ mod tests {
 
     fn board() -> Arc<SharedBoard> {
         Arc::new(SharedBoard::new())
+    }
+
+    /// An ambient clear retires the row an ambient raise put up, and reports
+    /// whether it found one.  A raise site that fixes its own condition — a
+    /// renewed certificate, say — has to be able to say so, or the row outlives
+    /// the problem for the life of the process.
+    #[test]
+    fn an_ambient_clear_retires_an_ambient_raise() {
+        let board = board();
+        with_board(&board, || {
+            assert!(
+                !clear(AlarmKind::CertExpiring, &node(71)),
+                "nothing to retire yet"
+            );
+            alarm!(
+                Severity::Warning,
+                AlarmKind::CertExpiring,
+                node(71),
+                "due for renewal"
+            );
+            assert!(holds(&board, AlarmKind::CertExpiring, &node(71)));
+
+            assert!(clear(AlarmKind::CertExpiring, &node(71)), "it was holding");
+            assert!(!holds(&board, AlarmKind::CertExpiring, &node(71)));
+            assert!(
+                !clear(AlarmKind::CertExpiring, &node(71)),
+                "and clearing twice is harmless"
+            );
+        });
+    }
+
+    /// A clear lands on the *current* board, exactly as a raise does — so one
+    /// node resolving a condition in the simulator cannot retire another node's
+    /// identical row.
+    #[test]
+    fn a_clear_is_scoped_to_the_current_board() {
+        let (first, second) = (board(), board());
+        with_board(&first, || {
+            alarm!(
+                Severity::Warning,
+                AlarmKind::CertExpiring,
+                node(72),
+                "due for renewal"
+            );
+        });
+        with_board(&second, || {
+            alarm!(
+                Severity::Warning,
+                AlarmKind::CertExpiring,
+                node(72),
+                "due for renewal"
+            );
+            assert!(clear(AlarmKind::CertExpiring, &node(72)));
+        });
+
+        assert!(
+            holds(&first, AlarmKind::CertExpiring, &node(72)),
+            "the other board's row is untouched"
+        );
+        assert!(!holds(&second, AlarmKind::CertExpiring, &node(72)));
     }
 
     /// Whether `board` holds a row for this condition.

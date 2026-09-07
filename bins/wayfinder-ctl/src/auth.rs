@@ -25,6 +25,8 @@ use crate::cert;
 use crate::output;
 use crate::output::OutputFormat;
 use crate::parse_mac6;
+use crate::renewal::RenewalArgs;
+use crate::renewal::renewal_note;
 use crate::vpn;
 
 /// The node's credential: read it, replace it, obtain one, or change how it is
@@ -51,6 +53,10 @@ pub enum AuthCommand {
         /// The mesh trust anchor the certificate chains to.
         #[arg(long)]
         trust_anchor: PathBuf,
+        /// Where the node renews this certificate. Naming none clears whatever
+        /// the node had recorded — see [`RenewalArgs`].
+        #[command(flatten)]
+        renewal: RenewalArgs,
     },
     /// Enroll with a provider: generate a keypair, submit a CSR, and write the
     /// returned certificate and trust anchor (online enrollment).
@@ -141,6 +147,7 @@ pub async fn run(
             seed,
             cert,
             trust_anchor,
+            renewal,
         } => {
             let credential = cert::read_credential(&cert, &trust_anchor)?;
             // Length-checked like the other two inputs rather than read raw: a
@@ -148,16 +155,21 @@ pub async fn run(
             // cannot sign, and the file is the one input here whose contents
             // are otherwise unexaminable.
             let seed_bytes = cert::read_seed(&seed)?;
+            // Resolved before the call, so a malformed pin is refused while
+            // the node still holds the identity it had.
+            let provider = renewal.provider()?;
+            let renewal_note = renewal_note(provider.as_ref());
             client
                 .set_auth(
                     &seed_bytes,
                     &credential.cert_bytes,
                     &credential.anchor_bytes,
+                    provider,
                 )
                 .await
                 .context("failed to set auth")?;
             format!(
-                "identity replaced; installed certificate for {} (mesh {:#x}), valid until {}",
+                "identity replaced; installed certificate for {} (mesh {:#x}), valid until {}{renewal_note}",
                 output::format_mac(&credential.cert.node_mac),
                 credential.anchor.mesh_id,
                 credential.cert.not_after.get(),

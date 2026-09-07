@@ -124,6 +124,20 @@ async fn an_open_node_joins_a_mesh_and_reports_itself_a_member() {
     let after = posture(&node).await;
     assert!(after.auth_enabled, "the certificate was installed");
     assert_eq!(after.mesh_id, MOCK_MESH_ID);
+    // And the node now knows where that certificate came from. This flow is the
+    // main way a node ever gets a renewal target — the dashboard is how a
+    // containerised node takes its mesh admission — and a certificate names only
+    // the mesh root that signed it, so a node not told here has no way to find
+    // its authority again before the certificate lapses.
+    let target = after
+        .renewal_provider
+        .expect("enrolling records where the node renews");
+    assert_eq!(target.address, provider.address);
+    assert_eq!(
+        target.node_key,
+        hex(&provider.node_key).to_vec(),
+        "pinned to the provider that issued it, not merely pointed at its address"
+    );
 }
 
 /// The property the whole design turns on: enrolling certifies the identity the

@@ -18,11 +18,17 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::renew::CertCondition;
+use crate::renew::RENEWAL_ATTEMPT_TIMEOUT;
+use crate::renew::RenewalGate;
+use crate::renew::Renewed;
 use futures::FutureExt;
 use futures::future::select_all;
 use tokio::sync::RwLock;
 use tokio::sync::watch;
 use tokio::time::sleep;
+use tracing::error;
+use tracing::info;
 use tracing::trace;
 use tracing::warn;
 use wayfinder::CentralRouter;
@@ -36,6 +42,8 @@ use wayfinder::interfaces::frame::Mac;
 use wayfinder::wayfinder_auth::Keypair;
 use wayfinder_driver_core::Egress;
 use wayfinder_driver_core::MeshSink;
+use wayfinder_protos::service::RenewalProviderData;
+use wayfinder_protos::service::RouterWrites;
 use wayfinder_protos::service::handle_router;
 use wayfinder_protos::service::handle_unowned;
 use wayfinder_server::AuthSnapshot;
@@ -319,6 +327,25 @@ pub struct Driver<Local: FrameIo> {
     /// restart (set via [`set_settings_store`](Self::set_settings_store)).
     /// Absent ⇒ a runtime change applies in memory only.
     settings: Option<SettingsFile>,
+    /// Paces the renewal check and holds the single in-flight slot.
+    ///
+    /// *Where* this node renews is not here: it is the provider its last
+    /// enrollment recorded, held beside the router in
+    /// [`SharedRouter::renewal_provider`] and read under the same guard as the
+    /// certificate it is deciding about. A node that has never been told one
+    /// reports its certificate as due and renews nothing, which is what every
+    /// node did before renewal existed.
+    renewal_gate: RenewalGate,
+    /// Where a spawned renewal attempt reports back.
+    ///
+    /// Kept as a pair on the driver rather than plumbed through a `select!` arm
+    /// because a renewal is not latency-sensitive: the result is applied on the
+    /// next turn of the loop — at worst an hour away, on a node with no
+    /// interfaces whose loop timer has nothing else to wake for, against a
+    /// window that is a quarter of a certificate's life.
+    renewal_tx: tokio::sync::mpsc::Sender<anyhow::Result<Renewed>>,
+    /// The receiving half of [`renewal_tx`](Self::renewal_tx).
+    renewal_rx: tokio::sync::mpsc::Receiver<anyhow::Result<Renewed>>,
 }
 
 impl<Local: FrameIo> Driver<Local> {
@@ -383,6 +410,9 @@ impl<Local: FrameIo> Driver<Local> {
             );
         }
         let fan_out = interfaces.iter().map(|i| i.fan_out()).collect();
+        // Depth one: at most one renewal attempt is ever outstanding, so a
+        // second result cannot exist to be queued behind the first.
+        let (renewal_tx, renewal_rx) = tokio::sync::mpsc::channel(1);
         Self {
             local,
             interfaces,
@@ -404,6 +434,9 @@ impl<Local: FrameIo> Driver<Local> {
             rx_buffer: [0u8; MAX_LINK_FRAME_LEN],
             tx_buffer: [0u8; MAX_LINK_FRAME_LEN],
             settings: None,
+            renewal_gate: RenewalGate::default(),
+            renewal_tx,
+            renewal_rx,
             auth_snapshot_rx: None,
         }
     }
@@ -446,6 +479,21 @@ impl<Local: FrameIo> Driver<Local> {
     /// them in memory and forgets them on restart.
     pub fn set_settings_store(&mut self, settings: SettingsFile) {
         self.settings = Some(settings);
+    }
+
+    /// Record `provider` as where this node renews the certificate it is
+    /// already holding, as its last enrollment left it.
+    ///
+    /// For startup only: `wayfinder-tap` calls this with what it read out of the
+    /// runtime settings store, so a node that enrolled on a previous run comes
+    /// back up still knowing where to renew. Every *runtime* change to this
+    /// record arrives with the credential it belongs to, through `SetAuth`.
+    ///
+    /// Pair it with [`set_settings_store`](Self::set_settings_store): without a
+    /// store, an enrollment's provider — like the certificate it came with — is
+    /// forgotten on restart, and the node comes back up with neither.
+    pub async fn set_renewal_provider(&mut self, provider: Option<RenewalProviderData>) {
+        self.shared.write().await.renewal_provider = provider;
     }
 
     /// Attach the receiver the TLS management server uses to request
@@ -622,6 +670,19 @@ impl<Local: FrameIo> Driver<Local> {
             .with_clock_trust(Some(self.clock_trusted_tx.subscribe()))
     }
 
+    /// How long since this driver's reference instant — the same monotonic
+    /// clock `run()` stamps every received record, emitted OGM and `record_tx`
+    /// with, and the one [`router_handle`](Self::router_handle) hands the
+    /// management transport.
+    ///
+    /// Exposed because a caller that reads the router's time-evaluated state
+    /// (throughput rates, route ages) has to evaluate it against *this* clock;
+    /// picking an instant of its own reads a decayed — often zero — value for
+    /// state the driver stamped later than the instant asked about.
+    pub fn elapsed(&self) -> Duration {
+        self.start.elapsed()
+    }
+
     /// Run the event loop forever.
     pub async fn run(&mut self) -> anyhow::Result<()> {
         loop {
@@ -724,6 +785,12 @@ impl<Local: FrameIo> Driver<Local> {
             settings,
             auth_snapshot_rx,
             authority,
+            // Serviced by `poll_cert_renewal` after `dispatch`, off this
+            // destructure: a renewal is a network round trip, so it must not be
+            // an arm that holds the loop.
+            renewal_gate: _,
+            renewal_tx: _,
+            renewal_rx: _,
         } = self;
         let mac = *mac;
         // Two disjoint borrows in one call: `select!` builds every branch's
@@ -787,11 +854,12 @@ impl<Local: FrameIo> Driver<Local> {
                     let clock_trusted = clock_trusted(*clock, *clock_checked);
                     let epoch_offset = epoch_offset(*clock, clock_trusted, now);
                     let mut guard = shared.write().await;
-                    let SharedRouter { router, identity_seed } = &mut *guard;
+                    let SharedRouter { router, identity_seed, renewal_provider } = &mut *guard;
                     let mut adapter = RouterAdapter::new(router, now)
                         .with_epoch_unix(epoch_offset)
                         .with_clock_trusted(clock_trusted)
                         .with_identity(identity_seed)
+                        .with_renewal_provider(renewal_provider)
                         .with_enrollment_policy(read_enrollment_policy(enrollment_policy_rx));
                     if let Some(store) = settings.as_mut() {
                         adapter = adapter.with_settings(store as &mut dyn SettingsStore);
@@ -874,7 +942,297 @@ impl<Local: FrameIo> Driver<Local> {
         // the failure `record_self_revocation`'s own doc warns a missed call
         // site would cause.
         self.record_self_revocation().await;
+        // Same call-site argument as `record_self_revocation` above: `run()` is
+        // what a real node runs and never goes through `process_pending`, so a
+        // check wired only there would leave a production node lapsing silently.
+        self.poll_cert_renewal(now).await;
         Ok(())
+    }
+
+    /// Apply a finished renewal, and start a new one if this node's certificate
+    /// has entered its renewal window.
+    ///
+    /// Both halves in one place because they are one cycle, and because the
+    /// in-flight slot is released by the first and claimed by the second — split
+    /// across two call sites, one of them eventually would not run.
+    async fn poll_cert_renewal(&mut self, now: Duration) {
+        self.apply_finished_renewal(now).await;
+
+        if !self.renewal_gate.should_check(now) {
+            return;
+        }
+
+        // Nothing below is decidable on a clock a credential may not be decided
+        // against, and both halves of the cycle would get it wrong in opposite
+        // directions. The *verdict* is taken from the router's own clock, which
+        // is deliberately never gated (see `AuthClock::Host`) — an unset host
+        // clock floors to a plausible-looking past, where a live certificate
+        // reads `Fresh` and the arm below would *clear* a `CertExpiring` row
+        // that is more true than ever. The *install* is gated: `epoch_offset`
+        // fails closed to zero, so a certificate this node fetched would be
+        // refused as not-yet-valid — a node that renews every interval, is
+        // issued a certificate every interval, and throws each one away.
+        //
+        // So the answer to an untrusted clock is to make no judgement at all:
+        // any alarm already standing stays standing, and nothing is spent at the
+        // authority. At most four of these an hour, which is what makes it a
+        // `warn!` rather than a `trace!`.
+        if !clock_trusted(self.clock, self.clock_checked) {
+            warn!(
+                "not judging this node's certificate: the host clock is not \
+                 synchronized, so neither its expiry nor a renewal issued against \
+                 it can be trusted"
+            );
+            return;
+        }
+
+        // Everything the attempt needs, read once under a *read* guard: the
+        // round trip below must not hold any guard, and a management read must
+        // not be excluded to ask a question whose answer is almost always no.
+        let Some((mac, ed_pubkey, x_pubkey, seed, provider, condition)) = ({
+            let guard = self.shared.read().await;
+            let seed = guard.identity_seed;
+            // Read under the same guard as the certificate, so the authority
+            // this node renews against is always the one that issued what it is
+            // holding — the pairing an enrollment installs and every subsequent
+            // one replaces.
+            let provider = guard.renewal_provider.clone();
+            guard.router.auth().map(|auth| {
+                let cert = auth.own_cert();
+                (
+                    cert.node_mac,
+                    cert.ed_pubkey,
+                    cert.x_pubkey,
+                    seed,
+                    provider,
+                    // Judged against the router's own credential clock — the one
+                    // it verifies every peer certificate with — so this node
+                    // cannot believe itself fresh on the tick its peers begin
+                    // rejecting it.
+                    crate::renew::cert_condition(cert, auth.now_unix()),
+                )
+            })
+        }) else {
+            // No certificate at all. Not a renewal question: an un-enrolled node
+            // needs enrolling, which is an operator's act.
+            return;
+        };
+
+        let subject = wayfinder_alarm::Subject::Node(wayfinder_alarm::NodeId::new(&mac));
+        match condition {
+            CertCondition::Fresh => {
+                // Retired here rather than at the moment a renewal succeeds, so
+                // the one place that decides the condition holds is also the one
+                // that decides it has lifted. This covers every way a node can
+                // leave the window — its own renewal, an operator's `csr
+                // install`, a wholesale new identity — not only the one this
+                // loop drove.
+                wayfinder_alarm::clear(wayfinder_alarm::AlarmKind::CertExpiring, &subject);
+                return;
+            }
+            CertCondition::DueRenewal => {
+                // Raised whether or not this node can do anything about it, and
+                // the two cases say different things. A node with no renewal
+                // provider recorded will *never* act on this row, and an operator reading
+                // "renewal due" beside a node that renews itself has no way to
+                // tell the two apart — so the row says which one this is.
+                if provider.is_some() {
+                    wayfinder_alarm::alarm!(
+                        wayfinder_alarm::Severity::Warning,
+                        wayfinder_alarm::AlarmKind::CertExpiring,
+                        subject,
+                        "membership certificate is in the last quarter of its validity window"
+                    );
+                } else {
+                    wayfinder_alarm::alarm!(
+                        wayfinder_alarm::Severity::Warning,
+                        wayfinder_alarm::AlarmKind::CertExpiring,
+                        subject,
+                        "membership certificate is in the last quarter of its validity \
+                         window and no renewal provider is recorded: this node will not \
+                         renew itself and must be re-issued by hand"
+                    );
+                }
+            }
+            CertCondition::Expired => {
+                // Escalated, never cleared. This is the state the warning above
+                // exists to prevent, and it is invisible from outside: the node
+                // keeps running, keeps its links up, and is refused by every
+                // peer. Clearing the alarm here — which treating "not due
+                // renewal" as one condition would do — would retire the only
+                // record of why the node went quiet at the exact moment it
+                // became true.
+                wayfinder_alarm::alarm!(
+                    wayfinder_alarm::Severity::Critical,
+                    wayfinder_alarm::AlarmKind::CertExpiring,
+                    subject,
+                    "membership certificate has expired; peers no longer accept this \
+                     node's OGMs and the authority no longer treats it as a renewing \
+                     holder, so it must be re-enrolled and approved"
+                );
+                // Deliberately no attempt: past `not_after` a CSR is parked for
+                // an operator's approval rather than re-issued, so retrying it
+                // every interval would queue nothing and fix nothing.
+                return;
+            }
+        }
+
+        let Some(provider) = provider else {
+            // Reported, not renewed. A node whose credential was installed
+            // without a provider — an offline `csr install`, or an enrollment
+            // that named none — has nowhere to ask, and reaching back to an
+            // authority a previous credential came from is the one thing worse
+            // than waiting for an operator. The `CertExpiring` alarm above is
+            // how they find out.
+            return;
+        };
+        let Some(seed) = seed else {
+            // A node holding a certificate but no seed cannot prove possession
+            // of the key that certificate names, so it could not complete the
+            // handshake. An `error!` because it is a violated invariant of this
+            // node's own identity state, not something a peer can cause.
+            error!(
+                "cannot renew this node's certificate: it holds a certificate but no \
+                 identity seed to authenticate the renewal with"
+            );
+            return;
+        };
+        // An attempt that never came back has to be given up on, or the single
+        // in-flight slot is held for the life of the process and this node never
+        // renews again — silently, since every later check would take the early
+        // return below. The attempt itself is bounded (see the `timeout` in the
+        // task), so reaching here means something the timeout could not reach:
+        // a panicked task whose result never arrives.
+        if let Some(held) = self.renewal_gate.stuck_for(now) {
+            error!(
+                held_secs = held.as_secs(),
+                "a renewal attempt never reported back; abandoning it and retrying"
+            );
+            self.renewal_gate.finish();
+        }
+        if !self.renewal_gate.begin(now) {
+            // An attempt from a previous interval is still running, inside its
+            // budget. Nothing to say: the next check picks it up.
+            return;
+        }
+
+        let tx = self.renewal_tx.clone();
+        tokio::spawn(async move {
+            let address = provider.target.address.clone();
+            // Bounded, because none of the client's stages has a deadline of its
+            // own: a peer that completes the TCP handshake and then goes silent
+            // — a black-holing firewall, a wedged provider — would otherwise
+            // park this task forever holding the in-flight slot. The budget is
+            // far under `RENEWAL_CHECK_INTERVAL`, so a timed-out attempt is
+            // retried on the very next check rather than costing a whole cycle.
+            let attempt = crate::renew::request_renewal(&provider, seed, mac, ed_pubkey, x_pubkey);
+            let outcome = match tokio::time::timeout(RENEWAL_ATTEMPT_TIMEOUT, attempt).await {
+                Ok(outcome) => {
+                    outcome.map_err(|e| e.context(format!("renewing against {address}")))
+                }
+                Err(_) => Err(anyhow::anyhow!(
+                    "the renewal provider at {address} did not answer within {}s; the \
+                     attempt was abandoned and will be retried",
+                    RENEWAL_ATTEMPT_TIMEOUT.as_secs()
+                )),
+            };
+            // The receiver lives as long as the driver; a send that fails means
+            // the node is shutting down, and there is nothing to report it to.
+            let _ = tx.send(outcome).await;
+        });
+    }
+
+    /// Install a renewed certificate, if an attempt has come back since the last
+    /// turn of the loop.
+    ///
+    /// Non-blocking on purpose: this runs on the driver loop, and a renewal that
+    /// is still outstanding must not stall the mesh waiting for it.
+    async fn apply_finished_renewal(&mut self, now: Duration) {
+        let Ok(outcome) = self.renewal_rx.try_recv() else {
+            return;
+        };
+        // Before anything can fail below: the slot is released however the
+        // attempt ended, or one unreachable provider wedges renewal for the life
+        // of the process and the node lapses without ever retrying again.
+        self.renewal_gate.finish();
+
+        let renewed = match outcome {
+            Ok(renewed) => renewed,
+            Err(e) => {
+                // `warn!`, not `error!`: an authority that is unreachable right
+                // now is handled and retried on the next interval, and the
+                // condition an operator has to act on is already latched as the
+                // `CertExpiring` alarm.
+                warn!(error = %e, "certificate renewal failed; will retry");
+                return;
+            }
+        };
+
+        // The node must still belong where this attempt started. An operator
+        // moving it to another authority while a renewal was outstanding is the
+        // one window in which the answer that comes back is worse than no
+        // answer: it verifies (against its own mesh's anchor, which arrives with
+        // it), it installs against the unchanged seed, and it would silently
+        // return the node to the mesh it was just moved off — re-recording the
+        // old provider over the operator's action. Discarded rather than
+        // installed, and the next check renews against the authority the node
+        // now belongs to.
+        if self.shared.read().await.renewal_provider.as_ref() != Some(&renewed.provider) {
+            warn!(
+                provider = %renewed.provider.target.address,
+                "discarding a renewal that landed after this node was re-enrolled elsewhere"
+            );
+            return;
+        }
+
+        // Installed through exactly the path `csr install` uses — `SetAuth` with
+        // an empty seed — so a renewal certifies the identity this node already
+        // holds and can never re-identify it. Every check that guards an
+        // operator's install guards this one: the anchor verifies the
+        // certificate, the certificate must name this node's key, and it must
+        // name the address that key derives.
+        let clock_trusted = clock_trusted(self.clock, self.clock_checked);
+        let epoch_offset = epoch_offset(self.clock, clock_trusted, now);
+        let mut guard = self.shared.write().await;
+        let SharedRouter {
+            router,
+            identity_seed,
+            renewal_provider,
+        } = &mut *guard;
+        let mut adapter = RouterAdapter::new(router, now)
+            .with_epoch_unix(epoch_offset)
+            .with_clock_trusted(clock_trusted)
+            .with_identity(identity_seed)
+            .with_renewal_provider(renewal_provider);
+        if let Some(store) = self.settings.as_mut() {
+            adapter = adapter.with_settings(store as &mut dyn SettingsStore);
+        }
+        // Re-installed with the certificate, not left standing beside it: an
+        // install replaces the record, so passing the provider this renewal
+        // came from is what keeps the node renewing where it just renewed.
+        match adapter.set_auth(
+            &[],
+            &renewed.cert,
+            &renewed.trust_anchor,
+            Some(renewed.provider),
+        ) {
+            // `info!`: a lifecycle event an observer wants, once per certificate
+            // lifetime rather than per frame.
+            Ok(()) => info!("renewed this node's membership certificate"),
+            // The certificate came back and could not be installed. The cause
+            // is deliberately not attributed here: `set_auth` fails both for a
+            // certificate this node refuses (not retryable — the next attempt
+            // gets the same answer) and for a node that could not write its own
+            // state file (retryable, and nothing to do with the authority).
+            // Naming the authority in both cases sent an operator to audit a CA
+            // when the fix was `df -h`.
+            Err(e) => error!(
+                error = %e,
+                "a renewed certificate could not be installed; this node keeps retrying, \
+                 but if the certificate itself is the cause the retries cannot help and \
+                 an operator must re-issue it"
+            ),
+        }
     }
 
     /// Inject one host Ethernet frame as if it had arrived from the local
@@ -1018,11 +1376,13 @@ impl<Local: FrameIo> Driver<Local> {
                 let SharedRouter {
                     router,
                     identity_seed,
+                    renewal_provider,
                 } = &mut *guard;
                 let mut adapter = RouterAdapter::new(router, now)
                     .with_epoch_unix(epoch_offset)
                     .with_clock_trusted(clock_trusted)
                     .with_identity(identity_seed)
+                    .with_renewal_provider(renewal_provider)
                     .with_enrollment_policy(policy);
                 if let Some(store) = self.settings.as_mut() {
                     adapter = adapter.with_settings(store as &mut dyn SettingsStore);
@@ -1106,7 +1466,7 @@ impl<Local: FrameIo> Driver<Local> {
             "mesh membership revoked; re-enroll this node to bring it back"
         );
         let Some(store) = self.settings.as_mut() else {
-            tracing::error!(
+            error!(
                 "this node's membership was revoked, but it has no settings store to \
                  record that in — a restart will bring it back under the revoked \
                  certificate"
@@ -1118,7 +1478,7 @@ impl<Local: FrameIo> Driver<Local> {
             self_revocation: Some(record.as_bytes().to_vec()),
             ..Default::default()
         }) {
-            tracing::error!(
+            error!(
                 error = %e,
                 "this node's membership was revoked, but the record could not be made \
                  durable — a restart will bring it back under the revoked certificate"
@@ -1255,14 +1615,14 @@ fn ingest_and_report(
 ) {
     let outcome = ingest_signed_revocation(router, record, now, now_unix);
     if let Err(reason) = &outcome {
-        tracing::error!(
+        error!(
             reason,
             node_mac = ?record.node_mac,
             "revocation signed and durably recorded, but this node could not flood it"
         );
     }
     if ack.send(outcome).is_err() {
-        tracing::warn!(
+        warn!(
             node_mac = ?record.node_mac,
             "no reader for the revocation verdict; the certificate-authority task is gone"
         );
@@ -2133,6 +2493,7 @@ mod tests {
                         seed: Vec::new(),
                         cert,
                         trust_anchor: anchor,
+                        provider: None,
                     },
                 ),
             ),
@@ -2152,6 +2513,548 @@ mod tests {
         assert!(
             driver.with_router(|r| r.auth().is_some()).await,
             "the certificate was actually installed"
+        );
+    }
+
+    /// An enrollment reaching the node over the management API records where
+    /// that credential is renewed, and a later one re-points it — which is the
+    /// whole reason the target travels with the credential instead of sitting in
+    /// the node's configuration file.
+    ///
+    /// Asserted through `GetSecurityStatus` rather than by reaching into the
+    /// driver, because the read path is the same one the renewal check uses: the
+    /// slot beside the router. A record that persisted but never reached that
+    /// slot would leave the running node renewing against its previous authority
+    /// until it restarted.
+    #[tokio::test]
+    async fn an_enrollment_records_where_the_node_renews_and_a_later_one_re_points_it() {
+        use zerocopy::IntoBytes;
+
+        use wayfinder_protos::wayfinder::v1alpha::GetSecurityStatusRequest;
+        use wayfinder_protos::wayfinder::v1alpha::RenewalProvider;
+        use wayfinder_protos::wayfinder::v1alpha::SetAuthRequest;
+        use wayfinder_protos::wayfinder::v1alpha::WayfinderRequest;
+        use wayfinder_protos::wayfinder::v1alpha::wayfinder_request::Request as ReqKind;
+        use wayfinder_protos::wayfinder::v1alpha::wayfinder_response::Response as RespKind;
+
+        let seed = [3u8; 32];
+        let kp = Keypair::from_seed(&seed);
+        let mac_addr = kp.derived_mac();
+        let mut ca = CertAuthority::new(&[9u8; 32], 0xABCD, 10_000, None, true);
+        ca.set_now_unix(1_700_000_000);
+        let cert = match ca
+            .submit_csr(mac_addr.as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey(), "")
+            .unwrap()
+        {
+            wayfinder_protos::service::CsrOutcome::Issued(issued) => issued.cert,
+            other => panic!("expected the CSR to be issued outright, got {other:?}"),
+        };
+        let anchor = ca.trust_anchor_bytes();
+
+        let (query_tx, query_rx) = tokio::sync::mpsc::channel(1);
+        let mut driver = Driver::new(
+            mac_addr,
+            NeverIo,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            query_rx,
+        );
+        driver.set_identity_seed(seed).await;
+        driver.set_epoch_unix(Duration::from_secs(1_700_000_000));
+
+        // One helper for both requests: every one of them goes down the same
+        // channel and is answered on the same `process_pending` sweep.
+        async fn ask(
+            driver: &mut Driver<NeverIo>,
+            query_tx: &tokio::sync::mpsc::Sender<(
+                WayfinderRequest,
+                tokio::sync::oneshot::Sender<
+                    wayfinder_protos::wayfinder::v1alpha::WayfinderResponse,
+                >,
+            )>,
+            request: ReqKind,
+        ) -> RespKind {
+            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+            query_tx
+                .send((
+                    WayfinderRequest {
+                        request: Some(request),
+                    },
+                    resp_tx,
+                ))
+                .await
+                .unwrap();
+            driver.process_pending().await.unwrap();
+            resp_rx.await.unwrap().response.unwrap()
+        }
+
+        let enroll_with = |address: &str| {
+            ReqKind::SetAuth(SetAuthRequest {
+                seed: Vec::new(),
+                cert: cert.clone(),
+                trust_anchor: anchor.clone(),
+                provider: Some(Box::new(RenewalProvider {
+                    address: address.into(),
+                    node_key: vec![9u8; 32],
+                    enrollment_token: "s3cret".into(),
+                })),
+            })
+        };
+
+        match ask(&mut driver, &query_tx, enroll_with("first.example:7700")).await {
+            RespKind::Empty(_) => {}
+            other => panic!("expected the enrollment to be accepted, got {other:?}"),
+        }
+        let status = match ask(
+            &mut driver,
+            &query_tx,
+            ReqKind::GetSecurityStatus(GetSecurityStatusRequest {}),
+        )
+        .await
+        {
+            RespKind::SecurityStatus(status) => status,
+            other => panic!("expected a security status, got {other:?}"),
+        };
+        assert_eq!(
+            status.renewal_provider.map(|p| p.address),
+            Some("first.example:7700".to_string()),
+            "the node renews where the enrollment that certified it said"
+        );
+
+        // The un-register / re-register case: a second authority certifies this
+        // node, and the first must stop being the one it asks.
+        match ask(&mut driver, &query_tx, enroll_with("second.example:7700")).await {
+            RespKind::Empty(_) => {}
+            other => panic!("expected the re-enrollment to be accepted, got {other:?}"),
+        }
+        let status = match ask(
+            &mut driver,
+            &query_tx,
+            ReqKind::GetSecurityStatus(GetSecurityStatusRequest {}),
+        )
+        .await
+        {
+            RespKind::SecurityStatus(status) => status,
+            other => panic!("expected a security status, got {other:?}"),
+        };
+        assert_eq!(
+            status.renewal_provider.map(|p| p.address),
+            Some("second.example:7700".to_string()),
+            "and follows the credential when the node is moved to another authority"
+        );
+    }
+
+    /// A node whose certificate has entered its renewal window renews it
+    /// against the provider its own record names, over real TLS, and comes out
+    /// holding a later certificate — **with that provider still recorded**.
+    ///
+    /// The one end-to-end pass over the whole cycle: the condition verdict, the
+    /// pinned connection, the empty credential the enrollment tier requires, the
+    /// authority's holder match, and the install. Every piece of it is claimed in
+    /// prose somewhere and each is a silent failure if wrong — a node that does
+    /// not renew keeps routing, keeps its links up, reports itself healthy, and
+    /// is dropped by every peer weeks later.
+    ///
+    /// The provider record surviving the install is worth its own assertion: the
+    /// install path is `set_auth`, where an absent provider *clears* the record,
+    /// so passing `None` there would make the first renewal succeed and every
+    /// later one impossible, permanently and silently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_due_certificate_is_renewed_against_the_recorded_provider() {
+        use zerocopy::IntoBytes;
+
+        use wayfinder::wayfinder_auth::MembershipCert;
+        use wayfinder_protos::service::RenewalProviderData;
+        use wayfinder_protos::service::RenewalTargetData;
+        use wayfinder_protos::service::SharedSecret;
+
+        // The node's certificate is issued at T0 for 10_000s, so its last
+        // quarter opens at T0+7_500. Everything below runs at T0+8_000: inside
+        // the window, and still a live holder as far as the authority is
+        // concerned (`now <= not_after`), which is the state renewal exists to
+        // act in.
+        const T0: u64 = 1_700_000_000;
+        const TTL: u64 = 10_000;
+        const NOW: u64 = T0 + 8_000;
+        const TOKEN: &str = "s3cret";
+
+        let seed = [3u8; 32];
+        let kp = Keypair::from_seed(&seed);
+        let mac_addr = kp.derived_mac();
+
+        // The authority, and the node's *first* certificate from it — issued
+        // directly, so the holder record the renewal will match against exists.
+        let mut ca = CertAuthority::new(&[9u8; 32], 0xABCD, TTL, Some(TOKEN.into()), true);
+        ca.set_now_unix(T0);
+        let first = match ca
+            .submit_csr(mac_addr.as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey(), TOKEN)
+            .unwrap()
+        {
+            wayfinder_protos::service::CsrOutcome::Issued(issued) => issued,
+            other => panic!("expected the first certificate to be issued, got {other:?}"),
+        };
+        // The authority moves on to `NOW` before it serves anything, so what a
+        // renewal is issued differs from what the node holds and the renewal is
+        // observable at all. Its clock is its own — since the authority moved
+        // off the router loop it takes none from the router — so this is the
+        // only thing that sets it.
+        ca.set_now_unix(NOW);
+        let anchor_bytes = ca.trust_anchor_bytes();
+        let first_cert = MembershipCert::from_bytes(&first.cert).unwrap();
+        assert!(
+            first_cert.due_renewal(NOW) && !first_cert.expired(NOW),
+            "the fixture must start inside the renewal window, or this test measures nothing"
+        );
+
+        // The provider, reachable over real TLS on a loopback port. Its own
+        // identity key is what the node pins; nothing here is trusted on the
+        // strength of the address.
+        let provider_seed = [11u8; 32];
+        let provider_key = Keypair::from_seed(&provider_seed).ed_pubkey();
+        let mut comms = wayfinder_server::AuthorityComms::new(NOW);
+        let (authority_tx, authority_rx) = tokio::sync::mpsc::channel(8);
+        let ports = comms.attach(authority_rx);
+        // Published *after* the attach, so the authority observes it as a
+        // change: this is the router loop's certificate-validity clock, and an
+        // authority that never sees one keeps the instant it was built with —
+        // here, the instant the node's first certificate was issued, which
+        // would re-issue an identical window and make a renewal indetectable.
+        comms.publish(wayfinder_server::RouterFacts {
+            unix_secs: NOW,
+            auth_present: true,
+        });
+        tokio::spawn(wayfinder_server::serve_authority(ca, ports));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider_addr = listener.local_addr().unwrap().to_string();
+        let (snapshot_tx, mut snapshot_rx) =
+            tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<AuthSnapshot>>(4);
+        tokio::spawn(async move {
+            // An un-enrolled provider: no anchor, so the transport admits a
+            // stranger at the enrollment tier — which is exactly what a node
+            // presenting no certificate is.
+            while let Some(reply) = snapshot_rx.recv().await {
+                let _ = reply.send(AuthSnapshot {
+                    own_key: Some(provider_key),
+                    anchor: None,
+                    revoked: Vec::new(),
+                    own_mac: wayfinder_server::Mac([2, 0, 0, 0, 0, 1]),
+                });
+            }
+        });
+        // Router requests have nowhere to go on this listener and none are sent;
+        // the receiver is held so the channel does not close under the server.
+        let (query_tx, _provider_query_rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(wayfinder_server::serve_tls_server_with_vpn(
+            listener,
+            provider_seed,
+            snapshot_tx,
+            query_tx,
+            wayfinder_server::ServerServices {
+                authority_tx: Some(authority_tx),
+                ..Default::default()
+            },
+        ));
+
+        // The node: running under that first certificate, and told where it
+        // came from.
+        let (_query_tx, query_rx) = tokio::sync::mpsc::channel(4);
+        let mut driver = Driver::new(
+            mac_addr,
+            NeverIo,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            query_rx,
+        );
+        driver.set_identity_seed(seed).await;
+        driver.set_epoch_unix(Duration::from_secs(NOW));
+        let anchor = wayfinder::wayfinder_auth::TrustAnchor::from_bytes(&anchor_bytes).unwrap();
+        driver
+            .with_router_mut(|r| {
+                r.set_auth(wayfinder::auth::OgmAuth::new(
+                    Keypair::from_seed(&seed),
+                    first_cert,
+                    anchor,
+                ));
+                // After `set_auth`, not before: installing auth brings its own
+                // clock, so a time set first is discarded and the certificate
+                // reads as fresh against a zero clock.
+                r.set_auth_time(Duration::ZERO, NOW);
+            })
+            .await;
+        let recorded = RenewalProviderData {
+            target: RenewalTargetData {
+                address: provider_addr.clone(),
+                node_key: provider_key,
+            },
+            enrollment_token: SharedSecret::new(TOKEN),
+        };
+        driver.set_renewal_provider(Some(recorded.clone())).await;
+
+        // Drive the cycle: one pass starts the attempt, later passes apply
+        // whatever has come back. Polled rather than slept on, so the test is
+        // bounded by the work rather than by a guessed duration.
+        let mut renewed_not_after = None;
+        for _ in 0..500 {
+            driver.poll_cert_renewal(Duration::ZERO).await;
+            let not_after = driver
+                .with_router(|r| r.auth().map(|a| a.own_cert().not_after.get()))
+                .await;
+            if not_after != Some(first_cert.not_after.get()) {
+                renewed_not_after = not_after;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(
+            renewed_not_after,
+            Some(NOW + TTL),
+            "the node installed a certificate re-issued for the lifetime it was admitted for"
+        );
+        assert_eq!(
+            driver.shared.read().await.renewal_provider.as_ref(),
+            Some(&recorded),
+            "and still knows where to renew: an install that dropped the provider would \
+             make this the last renewal this node ever performs"
+        );
+        assert_eq!(
+            driver.with_router(|r| r.self_ident()).await,
+            mac_addr,
+            "a renewal certifies the identity the node already had; it never re-identifies it"
+        );
+    }
+
+    /// Build a driver holding a certificate valid `[issued, issued + ttl]`, with
+    /// `provider` recorded as where it renews.
+    ///
+    /// Shared by the condition tests below, which differ only in the instant
+    /// they judge that certificate at.
+    async fn driver_holding_cert(
+        issued: u64,
+        ttl: u64,
+        judged_at: u64,
+        provider: Option<wayfinder_protos::service::RenewalProviderData>,
+    ) -> Driver<NeverIo> {
+        use zerocopy::IntoBytes;
+
+        use wayfinder::wayfinder_auth::MembershipCert;
+        use wayfinder::wayfinder_auth::TrustAnchor;
+
+        let seed = [3u8; 32];
+        let kp = Keypair::from_seed(&seed);
+        let mac_addr = kp.derived_mac();
+        let mut ca = CertAuthority::new(&[9u8; 32], 0xABCD, ttl, None, true);
+        ca.set_now_unix(issued);
+        let cert = match ca
+            .submit_csr(mac_addr.as_bytes(), &kp.ed_pubkey(), &kp.x_pubkey(), "")
+            .unwrap()
+        {
+            wayfinder_protos::service::CsrOutcome::Issued(issued) => issued.cert,
+            other => panic!("expected the certificate to be issued, got {other:?}"),
+        };
+        let anchor = TrustAnchor::from_bytes(&ca.trust_anchor_bytes()).unwrap();
+
+        let (_query_tx, query_rx) = tokio::sync::mpsc::channel(4);
+        let mut driver = Driver::new(
+            mac_addr,
+            NeverIo,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            query_rx,
+        );
+        driver.set_identity_seed(seed).await;
+        driver.set_epoch_unix(Duration::from_secs(judged_at));
+        driver
+            .with_router_mut(|r| {
+                r.set_auth(wayfinder::auth::OgmAuth::new(
+                    Keypair::from_seed(&seed),
+                    MembershipCert::from_bytes(&cert).unwrap(),
+                    anchor,
+                ));
+                // After `set_auth`: installing auth brings its own clock, so a
+                // time set before it is discarded and every certificate reads
+                // fresh against a zero clock.
+                r.set_auth_time(Duration::ZERO, judged_at);
+            })
+            .await;
+        driver.set_renewal_provider(provider).await;
+        driver
+    }
+
+    /// A certificate past `not_after` escalates to a critical alarm, and no
+    /// renewal is attempted.
+    ///
+    /// Both halves matter. The alarm is the *only* outward sign of this state —
+    /// the node keeps running and keeps its links up while every peer rejects it
+    /// — so folding `Expired` in with `Fresh`, which is what a two-way "is it
+    /// due?" would do, retires the warning at the instant it becomes true. And
+    /// an attempt here would be spent for nothing: past `not_after` the
+    /// authority no longer matches a live holder, so it parks the request rather
+    /// than issuing.
+    #[tokio::test]
+    async fn an_expired_certificate_escalates_and_is_not_renewed() {
+        let board = Arc::new(wayfinder_alarm::SharedBoard::new());
+        let provider = wayfinder_protos::service::RenewalProviderData {
+            target: wayfinder_protos::service::RenewalTargetData {
+                address: "ca.example:7700".into(),
+                node_key: [9u8; 32],
+            },
+            enrollment_token: wayfinder_protos::service::SharedSecret::new(""),
+        };
+        // Judged an hour past a certificate that expired at 1_000_000 + 100.
+        let mut driver =
+            driver_holding_cert(1_000_000, 100, 1_000_000 + 3_600, Some(provider)).await;
+
+        wayfinder_alarm::with_board(&board, || {
+            futures::executor::block_on(driver.poll_cert_renewal(Duration::ZERO));
+        });
+
+        let snapshot = board.snapshot();
+        let row = snapshot
+            .alarms
+            .iter()
+            .find(|a| a.kind == wayfinder_alarm::AlarmKind::CertExpiring)
+            .expect("an expired certificate is on the board, not silently absent");
+        assert_eq!(
+            row.severity,
+            wayfinder_alarm::Severity::Critical,
+            "expired is not the same condition as due, and must not read as one"
+        );
+        assert!(
+            driver.renewal_gate.begin(Duration::ZERO),
+            "the in-flight slot is untouched: no attempt is spent on a certificate the \
+             authority can only park"
+        );
+    }
+
+    /// On a clock this node may not make a credential decision against, it
+    /// judges nothing: no alarm is retired, and no attempt is made.
+    ///
+    /// The hazard is specific. The verdict is taken from the router's own clock,
+    /// which is deliberately never gated, so an unsynchronized host — one whose
+    /// clock floors to a plausible-looking past — reads a live certificate as
+    /// `Fresh` and would *clear* a `CertExpiring` row that is more true than
+    /// ever. The install is gated the other way, so a certificate fetched on
+    /// such a clock would be refused as not-yet-valid: the node would renew
+    /// every interval and throw every answer away.
+    #[tokio::test]
+    async fn nothing_is_judged_on_an_untrusted_clock() {
+        let board = Arc::new(wayfinder_alarm::SharedBoard::new());
+        let mut driver = driver_holding_cert(1_000_000, 10_000, 1_000_000 + 9_000, None).await;
+        // The default host clock with no check behind it — what a node has
+        // before NTP has been established, and what `clock_trusted` reports as
+        // untrusted.
+        driver.clock = AuthClock::Host;
+        driver.clock_checked = None;
+        let subject = wayfinder_alarm::Subject::Node(wayfinder_alarm::NodeId::new(&driver.mac.0));
+
+        wayfinder_alarm::with_board(&board, || {
+            // A row already standing, exactly as a previous check would have
+            // left it while the clock was still good.
+            wayfinder_alarm::alarm!(
+                wayfinder_alarm::Severity::Warning,
+                wayfinder_alarm::AlarmKind::CertExpiring,
+                subject,
+                "raised while the clock was still trustworthy"
+            );
+            futures::executor::block_on(driver.poll_cert_renewal(Duration::ZERO));
+        });
+
+        assert!(
+            board
+                .snapshot()
+                .alarms
+                .iter()
+                .any(|a| a.kind == wayfinder_alarm::AlarmKind::CertExpiring),
+            "the standing row survives: a clock that cannot be trusted cannot retire it"
+        );
+    }
+
+    /// A failed attempt releases the in-flight slot, so the next check tries
+    /// again.
+    ///
+    /// The slot is the whole of this feature's backpressure, and nothing but the
+    /// attempt's result releases it — so an early return on the failure path
+    /// would wedge renewal for the life of the process, and the node would lapse
+    /// without ever retrying. Driven through the real channel rather than by
+    /// calling the gate, because the gate's own test cannot see that call site.
+    #[tokio::test]
+    async fn a_failed_attempt_releases_the_slot_for_the_next_check() {
+        let mut driver = driver_holding_cert(1_000_000, 10_000, 1_000_000 + 9_000, None).await;
+        assert!(driver.renewal_gate.begin(Duration::ZERO), "claim the slot");
+
+        driver
+            .renewal_tx
+            .send(Err(anyhow::anyhow!("the provider was unreachable")))
+            .await
+            .unwrap();
+        driver.apply_finished_renewal(Duration::ZERO).await;
+
+        assert!(
+            driver.renewal_gate.begin(Duration::ZERO),
+            "the slot is free again after a failure, so renewal is retried rather than \
+             wedged for the life of the process"
+        );
+    }
+
+    /// A renewal that lands after the node has been re-enrolled elsewhere is
+    /// discarded rather than installed.
+    ///
+    /// The window is small and the consequence is not: the answer verifies
+    /// against its own mesh's anchor and installs against an unchanged seed, so
+    /// installing it would return the node to the authority an operator has just
+    /// moved it off — and re-record that authority over their action.
+    #[tokio::test]
+    async fn a_renewal_that_lands_after_a_re_enrollment_is_discarded() {
+        use wayfinder_protos::service::RenewalProviderData;
+        use wayfinder_protos::service::RenewalTargetData;
+        use wayfinder_protos::service::SharedSecret;
+
+        let second = RenewalProviderData {
+            target: RenewalTargetData {
+                address: "second.example:7700".into(),
+                node_key: [2u8; 32],
+            },
+            enrollment_token: SharedSecret::new(""),
+        };
+        let mut driver =
+            driver_holding_cert(1_000_000, 10_000, 1_000_000 + 9_000, Some(second)).await;
+        let held = driver
+            .with_router(|r| r.auth().map(|a| a.own_cert().not_after.get()))
+            .await;
+
+        // An answer from the authority the node used to belong to, carrying a
+        // certificate that is perfectly valid — for the mesh it has left.
+        driver
+            .renewal_tx
+            .send(Ok(Renewed {
+                cert: Vec::new(),
+                trust_anchor: Vec::new(),
+                provider: RenewalProviderData {
+                    target: RenewalTargetData {
+                        address: "first.example:7700".into(),
+                        node_key: [1u8; 32],
+                    },
+                    enrollment_token: SharedSecret::new(""),
+                },
+            }))
+            .await
+            .unwrap();
+        driver.apply_finished_renewal(Duration::ZERO).await;
+
+        assert_eq!(
+            driver
+                .with_router(|r| r.auth().map(|a| a.own_cert().not_after.get()))
+                .await,
+            held,
+            "the node keeps the credential its current authority gave it"
         );
     }
 

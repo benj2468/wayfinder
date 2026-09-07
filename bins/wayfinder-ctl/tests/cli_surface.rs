@@ -116,6 +116,7 @@ fn auth_set_takes_named_paths() {
         seed,
         cert,
         trust_anchor,
+        renewal,
     }) = parse(&[
         "auth",
         "set",
@@ -132,6 +133,56 @@ fn auth_set_takes_named_paths() {
     assert_eq!(seed.to_str(), Some("/s"));
     assert_eq!(cert.to_str(), Some("/c"));
     assert_eq!(trust_anchor.to_str(), Some("/a"));
+    assert!(
+        renewal.provider().unwrap().is_none(),
+        "an install that names no provider records none"
+    );
+}
+
+/// The renewal flags are optional, travel together, and reach the command as
+/// one pinned record — the address alone is refused at parse time, since an
+/// unattended renewal that trusts whatever answers is worse than none.
+#[test]
+fn auth_set_takes_a_renewal_target() {
+    let key = "01".repeat(32);
+    let Command::Auth(AuthCommand::Set { renewal, .. }) = parse(&[
+        "auth",
+        "set",
+        "--seed",
+        "/s",
+        "--cert",
+        "/c",
+        "--trust-anchor",
+        "/a",
+        "--renew-from",
+        "ca.example:7700",
+        "--renew-provider-key",
+        &key,
+        "--renew-token",
+        "s3cret",
+    ]) else {
+        panic!("expected auth set");
+    };
+    let provider = renewal.provider().unwrap().expect("a provider was named");
+    assert_eq!(provider.address, "ca.example:7700");
+    assert_eq!(provider.node_key, vec![1u8; 32]);
+    assert_eq!(provider.enrollment_token, "s3cret");
+
+    assert!(
+        !accepts(&[
+            "auth",
+            "set",
+            "--seed",
+            "/s",
+            "--cert",
+            "/c",
+            "--trust-anchor",
+            "/a",
+            "--renew-provider-key",
+            &key,
+        ]),
+        "a key with no address names no target"
+    );
 }
 
 /// `--seed` is required. `auth set` re-identifies a node, and the operation

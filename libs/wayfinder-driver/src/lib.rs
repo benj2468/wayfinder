@@ -27,6 +27,8 @@ mod driver;
 #[cfg(feature = "tokio")]
 mod net;
 #[cfg(feature = "tokio")]
+mod renew;
+#[cfg(feature = "tokio")]
 mod rylr998;
 
 #[cfg(feature = "ble")]
