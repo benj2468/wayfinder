@@ -63,6 +63,7 @@ use wayfinder_server::AuthorityRx;
 use wayfinder_server::AuthorityTx;
 use wayfinder_server::SettingsFile;
 use wayfinder_server::SettingsStore;
+use zerocopy::IntoBytes;
 
 use crate::tap::TapDevice;
 
@@ -83,6 +84,81 @@ pub struct Args {
 /// seam that drifts.
 fn load_keypair(seed_path: &str) -> anyhow::Result<Keypair> {
     Ok(Keypair::from_seed(&read_seed(seed_path)?))
+}
+
+/// The lifetime a provider stamps on the membership certificate it issues to
+/// *itself*: one year, deliberately far longer than the week-scale
+/// `cert_ttl_secs` it hands to members.
+///
+/// The asymmetry predates this function — it is the window the offline runbook
+/// minted by hand — and the reason is unchanged: a member certificate is short
+/// *because* passive expiry is the only revocation that reaches every member,
+/// while the authority's own identity is what the fleet pins and should be
+/// stable. What self-issuing changes is that the window is also refreshed on
+/// every start, so the failure this constant guards against — an authority that
+/// outlives its own certificate and silently stops being a member of the mesh
+/// it signs for — needs a year of uninterrupted uptime to reach rather than a
+/// week.
+const OWN_CERT_TTL_SECS: u64 = 365 * 24 * 60 * 60;
+
+/// Derive the membership material a provider-mode node need not be handed:
+/// its own administrator certificate, and the mesh trust anchor.
+///
+/// Both are functions of the mesh root key this node already holds, so the
+/// files that used to carry them (`wayfinderctl cert init-ca --out-anchor` and
+/// `cert issue --admin`) were copies of a computation rather than independent
+/// inputs. Only a provider may call this: on any other node the root seed is
+/// absent, which is exactly the property that makes a certificate mean
+/// something.
+///
+/// Fails rather than signing when `now_unix` is zero. That is
+/// [`wayfinder_server::host_unix_now`]'s report of a clock it will not vouch
+/// for, and a certificate stamped from the epoch is not a lesser certificate —
+/// it is one every peer rejects, on a node that started cleanly and says
+/// nothing. The authority's issuing paths already fail closed on the same
+/// reading; this is the same rule applied to the first certificate it issues.
+///
+/// One consequence to state plainly, because it looks alarming and is not: the
+/// window opens at *this* start, so a stored self-revocation naming this node
+/// no longer cancels the certificate derived here, and a restart re-admits the
+/// authority to its own mesh. That is not a hole this opens. A revocation
+/// cancels certificates issued at or before its instant, and the holder of the
+/// mesh root key could always mint a later one — offline, in seconds. Revoking
+/// a certificate authority to itself was never the mechanism that stops it;
+/// taking custody of `root.seed` away is.
+fn derive_own_membership(
+    root_seed: &[u8; 32],
+    mesh_id: u32,
+    keypair: &Keypair,
+    now_unix: u64,
+    cert_ttl_secs: u64,
+) -> anyhow::Result<(MembershipCert, wayfinder::wayfinder_auth::TrustAnchor)> {
+    if now_unix == 0 {
+        bail!(
+            "this node has no trusted clock, so it cannot self-issue the membership \
+             certificate its [auth] block leaves out; set auth.cert_path to a \
+             certificate minted offline, or fix time sync before starting"
+        );
+    }
+
+    let authority = wayfinder::wayfinder_auth::Authority::from_seed(root_seed, mesh_id);
+    // `issue_user_cert(.., admin = true)`, matching byte for byte what
+    // `wayfinderctl cert issue --admin` minted for this node before: the
+    // capability an operator reaches the authority's own management API with,
+    // and what `--cert-from` hands back to a client. Chosen to keep this a
+    // change of *where the bytes come from* and not a change of posture —
+    // adding `CERT_FLAG_MEMBER` here would look tidier and would silently
+    // reclassify the authority from a session to a device in every reader that
+    // distinguishes them.
+    let cert = authority.issue_user_cert(
+        keypair.derived_mac(),
+        keypair.ed_pubkey(),
+        keypair.x_pubkey(),
+        now_unix,
+        now_unix.saturating_add(cert_ttl_secs),
+        true,
+    );
+    Ok((cert, authority.trust_anchor()))
 }
 
 /// Narrow raw seed bytes to the fixed-size seed, for a seed that came from
@@ -777,7 +853,40 @@ async fn main() -> anyhow::Result<()> {
     // files. Whichever supplies them, everything below — the MAC binding
     // check, the mesh id, enabling auth — is the same, so the two sources
     // differ only in where the bytes are read from.
+    //
+    // A third possibility joins those two below: a node in provider mode may
+    // leave the certificate and the anchor out of its `auth:` block entirely
+    // and have them *derived* from the mesh root key it holds anyway. That is a
+    // third source of the same three blobs, not a third code path — it lands in
+    // the same tuple and is checked by the same code.
     let mut auth_mesh_id: Option<u32> = None;
+
+    // Read once, here, rather than where provider mode is enabled further down:
+    // the `auth:` resolution below may need it to derive this node's own
+    // membership, and provider startup needs the same 32 bytes. Two reads of
+    // the mesh root of trust with two error shapes is the seam `read_seed`'s
+    // own doc comment warns about, one file up.
+    let provider_root_seed: Option<[u8; 32]> = match &config.provider {
+        Some(provider_cfg) => Some(
+            std::fs::read(&provider_cfg.root_seed_path)
+                .with_context(|| {
+                    format!(
+                        "failed to read the mesh root seed at {}",
+                        provider_cfg.root_seed_path
+                    )
+                })?
+                .as_slice()
+                .try_into()
+                .map_err(|_| {
+                    anyhow!(
+                        "mesh root seed at {} must be 32 bytes",
+                        provider_cfg.root_seed_path
+                    )
+                })?,
+        ),
+        None => None,
+    };
+
     let identity_material = match (&settings.identity, &config.auth) {
         (Some(identity), _) => {
             if config.auth.is_some() {
@@ -793,12 +902,77 @@ async fn main() -> anyhow::Result<()> {
                 "the runtime settings store".to_string(),
             ))
         }
-        (None, Some(auth_cfg)) => Some((
-            load_keypair(&auth_cfg.seed_path)?,
-            std::fs::read(&auth_cfg.cert_path)?,
-            std::fs::read(&auth_cfg.trust_anchor_path)?,
-            auth_cfg.cert_path.clone(),
-        )),
+        (None, Some(auth_cfg)) => {
+            let keypair = load_keypair(&auth_cfg.seed_path)?;
+
+            // Derived once, and only when a half is actually missing: a node
+            // handed both files must not sign a certificate it throws away,
+            // and the clock requirement inside must only bite the
+            // configuration that depends on it.
+            let derived = match (&config.provider, &provider_root_seed) {
+                (Some(provider_cfg), Some(root_seed))
+                    if auth_cfg.cert_path.is_none() || auth_cfg.trust_anchor_path.is_none() =>
+                {
+                    let material = derive_own_membership(
+                        root_seed,
+                        provider_cfg.mesh_id,
+                        &keypair,
+                        wayfinder_server::host_unix_now(),
+                        OWN_CERT_TTL_SECS,
+                    )?;
+                    // Worth an operator's attention at `info!`: this is the
+                    // node minting its own mesh membership, which on any other
+                    // node would be the thing certificates exist to prevent.
+                    // Saying so at startup is what keeps it a deliberate
+                    // property of provider mode rather than a quiet one.
+                    tracing::info!(
+                        mesh_id = format!("{:#x}", provider_cfg.mesh_id),
+                        cert = auth_cfg.cert_path.is_none(),
+                        trust_anchor = auth_cfg.trust_anchor_path.is_none(),
+                        "deriving this provider's own membership material from the mesh root seed"
+                    );
+                    Some(material)
+                }
+                _ => None,
+            };
+
+            // Each half resolves the same way: the configured file if there is
+            // one, the derived value if this node could compute it, and
+            // otherwise an error naming the field. A named path always wins —
+            // an operator who wrote one meant that file, and quietly preferring
+            // a derived copy would paper over a stale one instead of letting
+            // the certificate checks below catch it.
+            let cert_bytes = match (&auth_cfg.cert_path, &derived) {
+                (Some(path), _) => std::fs::read(path)
+                    .with_context(|| format!("failed to read the membership cert at {path}"))?,
+                (None, Some((cert, _))) => cert.as_bytes().to_vec(),
+                (None, None) => bail!(
+                    "auth.cert_path must be set: only a node in provider mode may leave it \
+                     out, because only a provider holds the mesh root key that would sign \
+                     its certificate"
+                ),
+            };
+            let anchor_bytes = match (&auth_cfg.trust_anchor_path, &derived) {
+                (Some(path), _) => std::fs::read(path)
+                    .with_context(|| format!("failed to read the trust anchor at {path}"))?,
+                (None, Some((_, anchor))) => anchor.to_bytes().to_vec(),
+                (None, None) => bail!(
+                    "auth.trust_anchor_path must be set: only a node in provider mode may \
+                     leave it out, because only a provider holds the mesh root key the \
+                     anchor is derived from"
+                ),
+            };
+
+            // Names where the bytes came from, for the errors the checks below
+            // raise against them: a path when a file supplied them, and the
+            // root seed when this node computed them.
+            let source = auth_cfg
+                .cert_path
+                .clone()
+                .unwrap_or_else(|| "this provider's own mesh root seed".to_string());
+
+            Some((keypair, cert_bytes, anchor_bytes, source))
+        }
         (None, None) => None,
     };
 
@@ -940,7 +1114,7 @@ async fn main() -> anyhow::Result<()> {
     // Opt-in provider (certificate-authority) mode: load the mesh root seed and
     // serve enrollment over the management API.  Only the provider holds the
     // root key.
-    if let Some(provider_cfg) = config.provider {
+    if let Some(provider_cfg) = &config.provider {
         use wayfinder_server::CertAuthority;
 
         // A provider should also be an authenticated member of the *same* mesh:
@@ -961,16 +1135,14 @@ async fn main() -> anyhow::Result<()> {
             Some(_) => {}
         }
 
-        let root_seed: [u8; 32] = std::fs::read(&provider_cfg.root_seed_path)?
-            .as_slice()
-            .try_into()
-            .map_err(|_| {
-                anyhow!(
-                    "mesh root seed at {} must be 32 bytes",
-                    provider_cfg.root_seed_path
-                )
-            })?;
-        let mut ca = CertAuthority::from_config(&root_seed, &provider_cfg)
+        // Read at the top of auth resolution, because the `auth:` block may
+        // have needed the same bytes to derive this node's own membership.
+        // Matched rather than unwrapped so the compiler ties it to the branch
+        // that filled it: both are conditioned on `config.provider`.
+        let Some(root_seed) = provider_root_seed else {
+            bail!("internal: provider configured but its root seed was never read");
+        };
+        let mut ca = CertAuthority::from_config(&root_seed, provider_cfg)
             .map_err(|e| anyhow!("failed to load certificate-authority state: {e}"))?;
         // The authority reads the same clock under the same policy as the
         // router. Two components disagreeing about whether time is trustworthy
@@ -1072,4 +1244,105 @@ async fn main() -> anyhow::Result<()> {
     }
     join_set.shutdown().await;
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wayfinder::wayfinder_auth::Authority;
+    use wayfinder::wayfinder_auth::TrustAnchor;
+
+    /// The mesh this node's tests sign for.
+    const MESH: u32 = 0x5741_594e;
+
+    /// A root seed, and the node identity seed beside it. Distinct constants
+    /// because the whole point of the derivation is that the two are separate
+    /// keys held by one process.
+    const ROOT_SEED: [u8; 32] = [7u8; 32];
+    const NODE_SEED: [u8; 32] = [9u8; 32];
+
+    /// The trust anchor a provider derives is the one its root seed defines —
+    /// the same 36 bytes `wayfinderctl cert init-ca --out-anchor` would have
+    /// written, which is why the file is redundant on a node holding the root.
+    #[test]
+    fn derived_anchor_matches_the_root_seed() {
+        let node = Keypair::from_seed(&NODE_SEED);
+        let (_, anchor) = derive_own_membership(&ROOT_SEED, MESH, &node, 1_000, 3_600)
+            .expect("a trusted clock and a valid root seed");
+
+        let expected = Authority::from_seed(&ROOT_SEED, MESH).trust_anchor();
+        assert_eq!(anchor.mesh_id, expected.mesh_id);
+        assert_eq!(anchor.root_pubkey, expected.root_pubkey);
+        assert_eq!(anchor.mesh_id, MESH);
+    }
+
+    /// The self-issued certificate verifies against the anchor derived beside
+    /// it, and binds the address this node's identity key derives — the same
+    /// two properties `main` checks on a certificate read from a file.
+    #[test]
+    fn self_issued_cert_verifies_and_binds_the_derived_mac() {
+        let node = Keypair::from_seed(&NODE_SEED);
+        let now = 1_000;
+        let (cert, anchor) = derive_own_membership(&ROOT_SEED, MESH, &node, now, 3_600)
+            .expect("a trusted clock and a valid root seed");
+
+        assert_eq!(cert.node_mac, node.derived_mac().0);
+        let verified = anchor
+            .verify_cert(&cert, now + 1)
+            .expect("a certificate signed by the anchor's own root");
+        assert!(
+            verified.admin,
+            "a provider's own certificate carries the administration capability, or the \
+             operator loses management access to the node holding the mesh root"
+        );
+    }
+
+    /// The window opens at the instant of issue and runs for the requested
+    /// lifetime, so a freshly self-issued certificate is valid now and expires
+    /// on schedule.
+    #[test]
+    fn self_issued_cert_window_starts_now_and_runs_for_the_ttl() {
+        let node = Keypair::from_seed(&NODE_SEED);
+        let now = 2_000_000;
+        let ttl = 31_536_000;
+        let (cert, anchor) = derive_own_membership(&ROOT_SEED, MESH, &node, now, ttl)
+            .expect("a trusted clock and a valid root seed");
+
+        assert_eq!(cert.not_before.get(), now);
+        assert_eq!(cert.not_after.get(), now + ttl);
+        assert!(anchor.verify_cert(&cert, now + ttl - 1).is_ok());
+        assert!(
+            anchor.verify_cert(&cert, now + ttl + 1).is_err(),
+            "the certificate must age out at its stated expiry"
+        );
+    }
+
+    /// Without a usable wall clock there is no honest validity window to sign,
+    /// so the node refuses to mint one rather than stamping a window starting
+    /// at the epoch that every peer would reject.
+    #[test]
+    fn refuses_to_self_issue_without_a_trusted_clock() {
+        let node = Keypair::from_seed(&NODE_SEED);
+        let err = derive_own_membership(&ROOT_SEED, MESH, &node, 0, 3_600)
+            .expect_err("an untrusted clock must not yield a certificate");
+        assert!(
+            err.to_string().contains("clock"),
+            "the error must name the clock as the cause, got: {err}"
+        );
+    }
+
+    /// A derived anchor and a derived certificate are consistent with what the
+    /// *rest* of startup expects: `TrustAnchor::from_bytes` round-trips the
+    /// anchor, since the same bytes reach `OgmAuth` either way.
+    #[test]
+    fn derived_anchor_round_trips_through_its_wire_bytes() {
+        let node = Keypair::from_seed(&NODE_SEED);
+        let (_, anchor) = derive_own_membership(&ROOT_SEED, MESH, &node, 1_000, 3_600)
+            .expect("a trusted clock and a valid root seed");
+
+        let reparsed =
+            TrustAnchor::from_bytes(&anchor.to_bytes()).expect("a derived anchor is well-formed");
+        assert_eq!(reparsed.mesh_id, MESH);
+        assert_eq!(reparsed.root_pubkey, anchor.root_pubkey);
+    }
 }

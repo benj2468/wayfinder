@@ -126,8 +126,11 @@ testers.nixosTest {
             ];
             auth = {
               seed_path = "/var/lib/wayfinder/identity.seed";
-              cert_path = "/var/lib/wayfinder/node.cert";
-              trust_anchor_path = "/var/lib/wayfinder/trust-anchor";
+              # No cert_path, no trust_anchor_path: this node is the authority
+              # for `mesh_id` below, so it derives both from `root_seed_path`
+              # at startup. Asserted further down — the node must come up
+              # authenticated with nothing but a root seed and an identity
+              # seed on disk.
             };
             provider = {
               root_seed_path = "/var/lib/wayfinder/root.seed";
@@ -148,7 +151,7 @@ testers.nixosTest {
                 # provisioned out of band with the mesh trust material: an API
                 # key is machine-generated state this host can recreate at
                 # will, so it lives in headscale's own state directory rather
-                # than beside the four files an operator carries here.
+                # than beside the secrets an operator carries here.
                 api_key_path = "/var/lib/wayfinder-headscale/api.key";
                 login_server = "http://ca:8080";
                 preauth_ttl_secs = 300;
@@ -208,21 +211,22 @@ testers.nixosTest {
         # read-only inside the unit — which is the property the directory used
         # to carry. The directory itself is the `wayfinder.nix` module's, made
         # by its tmpfiles rule, so nothing creates it here.
+        # Two files, not four. The anchor and this node's own certificate are
+        # both functions of the root seed, and a node in provider mode holds
+        # that root — so it derives them at startup instead of being handed
+        # copies. `--out-anchor` is still a required argument (an ordinary
+        # member does need the file, and gets it from an operator or from
+        # enrollment), so it is written to /tmp and left there: nothing on this
+        # box reads it, and putting it in the state directory would re-create
+        # exactly the provisioned copy this change removes. The enrolling node
+        # below collects its anchor from the CA over the wire instead.
         ca.succeed(
             "wayfinder-ctl cert init-ca --mesh-id 0x5741594e --generate "
             "--out-seed /var/lib/wayfinder/root.seed "
-            "--out-anchor /var/lib/wayfinder/trust-anchor"
+            "--out-anchor /tmp/trust-anchor"
         )
         ca.succeed(
             "wayfinder-ctl cert keygen --out-seed /var/lib/wayfinder/identity.seed"
-        )
-        now = int(ca.succeed("date +%s").strip())
-        ca.succeed(
-            "wayfinder-ctl cert issue "
-            "--ca-seed /var/lib/wayfinder/root.seed --mesh-id 0x5741594e "
-            "--node-seed /var/lib/wayfinder/identity.seed "
-            f"--not-before {now - 60} --not-after {now + 31536000} "
-            "--admin --out-cert /var/lib/wayfinder/node.cert"
         )
 
         # A *second* admin identity, belonging to nobody on the mesh: a person's
@@ -361,10 +365,14 @@ testers.nixosTest {
         # on first sight, and with no terminal to confirm on it refuses rather
         # than trusting whatever answered. Every other step here connects a
         # machine to itself, which is why this has not come up before.
+        # Read off the identity *seed*, because there is no certificate on
+        # this box to read it off any more. `cert show` summarises a seed by
+        # the public keys it derives and never by its own bytes, which is what
+        # makes this safe to run on a secret.
         ca_key = [
             l.split()[-1]
             for l in ca.succeed(
-                "wayfinder-ctl cert show /var/lib/wayfinder/node.cert"
+                "wayfinder-ctl cert show /var/lib/wayfinder/identity.seed"
             ).splitlines()
             if l.strip().startswith("ed25519:")
         ][0]
@@ -376,7 +384,7 @@ testers.nixosTest {
         # the same constraint for the same reason.
         secrets = " ".join(
             f"/var/lib/wayfinder/{f}"
-            for f in ("root.seed", "identity.seed", "node.cert", "trust-anchor")
+            for f in ("root.seed", "identity.seed")
         )
         ca.succeed(f"chown wayfinder:wayfinder {secrets}")
         ca.succeed(f"chmod 0400 {secrets}")
@@ -389,6 +397,23 @@ testers.nixosTest {
         ca.succeed(
             "journalctl -u wayfinder | grep -q 'certificate-authority (provider) mode enabled'"
         )
+        # The point of the two-file provisioning above: the node computed the
+        # certificate and the anchor its `auth:` block does not name, and came
+        # up an authenticated member of the mesh it signs for. Both lines
+        # matter — deriving without enabling auth would be a silent
+        # unauthenticated CA, which is the failure this asserts against.
+        ca.succeed(
+            "journalctl -u wayfinder | "
+            "grep -q \"deriving this provider's own membership material\""
+        )
+        ca.succeed(
+            "journalctl -u wayfinder | "
+            "grep -q 'mesh authentication enabled (mesh_id = 0x5741594e)'"
+        )
+        # And nothing wrote them down: the derivation happens every start, so a
+        # stale copy on disk cannot come to disagree with the root seed.
+        ca.succeed("test ! -e /var/lib/wayfinder/node.cert")
+        ca.succeed("test ! -e /var/lib/wayfinder/trust-anchor")
         # The coordinator is built at startup, so a bad URL or an unreadable key
         # file fails here rather than at some node's enrollment hours later.
         ca.succeed("journalctl -u wayfinder | grep -q 'VPN coordination enabled'")
@@ -425,7 +450,7 @@ testers.nixosTest {
         info = ca.succeed(
             "wayfinder-ctl --connect 127.0.0.1:7700 "
             "--identity /var/lib/wayfinder/identity.seed "
-            "--cert /var/lib/wayfinder/node.cert node-info"
+            "--cert-from 127.0.0.1:7700 node-info"
         )
         assert "node" in info, info
 
@@ -460,7 +485,7 @@ testers.nixosTest {
         ca.succeed(
             "wayfinder-ctl --connect 127.0.0.1:7700 "
             "--identity /var/lib/wayfinder/identity.seed "
-            "--cert /var/lib/wayfinder/node.cert "
+            "--cert-from 127.0.0.1:7700 "
             f"provider requests approve --mac {node_mac}"
         )
 
@@ -570,7 +595,7 @@ testers.nixosTest {
         peers = ca.succeed(
             "wayfinder-ctl --connect 127.0.0.1:7700 "
             "--identity /var/lib/wayfinder/identity.seed "
-            "--cert /var/lib/wayfinder/node.cert provider vpn list"
+            "--cert-from 127.0.0.1:7700 provider vpn list"
         )
         # No tailscaled has registered, so there is no *node* yet — the
         # assertion is that the call round-trips against the real API, which is
@@ -592,7 +617,7 @@ testers.nixosTest {
         ca.succeed(
             "wayfinder-ctl --connect 127.0.0.1:7700 "
             "--identity /var/lib/wayfinder/identity.seed "
-            "--cert /var/lib/wayfinder/node.cert "
+            "--cert-from 127.0.0.1:7700 "
             f"provider revoke --mac {node_mac}"
         )
         users = json.loads(ca.succeed("headscale users list -o json")) or []
@@ -614,7 +639,7 @@ testers.nixosTest {
         ca.succeed(
             "wayfinder-ctl --connect 127.0.0.1:7700 "
             "--identity /var/lib/wayfinder/identity.seed "
-            "--cert /var/lib/wayfinder/node.cert "
+            "--cert-from 127.0.0.1:7700 "
             f"provider vpn revoke --mac {node_mac}"
         )
 
@@ -624,7 +649,7 @@ testers.nixosTest {
         certs = ca.succeed(
             "wayfinder-ctl --connect 127.0.0.1:7700 "
             "--identity /var/lib/wayfinder/identity.seed "
-            "--cert /var/lib/wayfinder/node.cert provider members"
+            "--cert-from 127.0.0.1:7700 provider members"
         )
         assert node_mac in certs, f"{node_mac} missing from the restarted CA's log:\n{certs}"
   '';

@@ -49,9 +49,16 @@ SSH_USER="${CA_SSH_USER:-ubuntu}"
 FLAKE_ATTR=".#wayfinder-ca"
 CF_TOKEN_FILE="${CA_CF_TOKEN_FILE:-$HOME/.cf-token}"
 
-# The four files the node is provisioned with. Named here rather than inline so
+# The two files the node is provisioned with. Named here rather than inline so
 # `secrets` and the preflight check cannot disagree about what is required.
-SECRET_FILES=(root.seed identity.seed node.cert trust-anchor)
+#
+# `node.cert` and `trust-anchor` were once here too and are not provisioned any
+# more: the node derives both from `root.seed` at startup, being the authority
+# that would have signed them. Which also means there is no local copy of the
+# CA's certificate to authenticate *with* — `--cert-from` reads back the one
+# the node is running under instead, which is the credential that is by
+# definition current.
+SECRET_FILES=(root.seed identity.seed)
 
 die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
@@ -311,7 +318,7 @@ cmd_secrets() {
     # directory of their own, because `wayfinder-ctl` defaults `--identity` to
     # /var/lib/wayfinder/identity.seed and an operator on this box types that
     # path more than any other. The node still cannot rewrite its own root of
-    # trust: `nix/machines/wayfinder-ca/common.nix` re-mounts these four files
+    # trust: `nix/machines/wayfinder-ca/common.nix` re-mounts these files
     # read-only inside the unit's namespace (`ReadOnlyPaths`).
     ssh "root@$ip" 'install -d -m 0700 -o wayfinder -g wayfinder /var/lib/wayfinder'
     local provisioned=("${SECRET_FILES[@]}")
@@ -738,7 +745,7 @@ cmd_verify() {
     info "management API at $ip:7700"
     if ctl --connect "$ip:7700" \
         --identity "$SECRETS_DIR/identity.seed" \
-        --cert "$SECRETS_DIR/node.cert" \
+        --cert-from "$ip:7700" \
         node-info
     then
         check_ok "the management API answers and accepted this identity"
@@ -756,7 +763,7 @@ cmd_verify() {
 
     if ctl --connect "$ip:7700" \
         --identity "$SECRETS_DIR/identity.seed" \
-        --cert "$SECRETS_DIR/node.cert" \
+        --cert-from "$ip:7700" \
         security
     then
         check_ok "the security state reads back"
@@ -810,11 +817,17 @@ cmd_status() {
     local ip; ip="$(ca_ip)"
     printf 'address:   %s\n' "$ip"
     printf 'mgmt API:  %s:7700\n' "$ip"
-    # The identity clients pin with --node-key, read back off the certificate
-    # rather than kept in a note that can drift from what is deployed.
-    if [[ -f "$SECRETS_DIR/node.cert" ]]; then
+    # The identity clients pin with --node-key, read off the running node
+    # rather than kept in a note that can drift from what is deployed. Asked of
+    # the node because that is now the only place the certificate exists: this
+    # box derives it at startup and never writes it down.
+    if [[ -f "$SECRETS_DIR/identity.seed" ]]; then
         printf 'identity:\n'
-        ctl cert show "$SECRETS_DIR/node.cert" | sed 's/^/  /'
+        ctl --connect "$ip:7700" \
+            --identity "$SECRETS_DIR/identity.seed" \
+            --cert-from "$ip:7700" \
+            auth status 2>/dev/null | sed 's/^/  /' \
+            || printf '  (the node did not answer; %s verify)\n' "$0"
     fi
     printf 'VPN:       %s:443 (headscale, TLS), STUN on udp/3478\n' "$ip"
     # The CA is a mesh participant too, over the tunnel it coordinates. Its

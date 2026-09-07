@@ -5476,6 +5476,7 @@ dependencies = [
  "wayfinder-driver",
  "wayfinder-log",
  "wayfinder-server",
+ "zerocopy",
 ]
 
 [[package]]

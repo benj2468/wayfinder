@@ -109,32 +109,46 @@ holds it can issue membership certificates that every node accepts.
 mkdir -p ca-secrets && cd ca-secrets
 MESH_ID=0x5741594e          # any 32-bit id; it identifies this mesh
 
-# The mesh root of trust, and the public anchor every member verifies against.
+# The mesh root of trust. `--out-anchor` writes the public anchor every
+# *member* verifies against — the CA itself does not need the file, and it is
+# not provisioned onto the box, but you will hand it to nodes you enroll
+# out-of-band.
 nix run .#wayfinder-ctl -- cert init-ca --mesh-id $MESH_ID \
     --generate --out-seed root.seed --out-anchor trust-anchor
 
-# This node's own identity, and its membership in the mesh it signs for.
+# This node's own identity.
 nix run .#wayfinder-ctl -- cert keygen --out-seed identity.seed
 
-NOW=$(date +%s)
-nix run .#wayfinder-ctl -- cert issue \
-    --ca-seed root.seed --mesh-id $MESH_ID \
-    --node-seed identity.seed \
-    --not-before "$NOW" --not-after "$((NOW + 31536000))" \
-    --admin --out-cert node.cert
+# The key every client pins with --node-key.
+nix run .#wayfinder-ctl -- cert show identity.seed
 ```
 
-`cert issue` prints the node's **Ed25519 public key** and **MAC**. Keep the
-public key: it is what every client pins with `--node-key`, and pinning is what
-stops a man-in-the-middle impersonating your CA.
+Two files go to the box: **`root.seed`** and **`identity.seed`**. There is no
+`cert issue` step for the CA itself — it holds the root key that would sign its
+own certificate, so it derives that certificate and the trust anchor at every
+startup instead. Nothing is lost by removing the file: custody of the root key
+*is* the ability to mint any certificate on this mesh, including this one.
 
-The CA's own certificate is issued for a year while the certificates it hands
-out live a week (`certTtlSecs`). That asymmetry is intended — the CA's identity
-is what the fleet pins and should be stable, while member certificates expire
-often *because* passive expiry is the only revocation mechanism that reaches
-*every* member. The CA's mesh link means a node that is up and on the tunnel
-learns of a revocation in seconds; a node that is offline when it goes out
-still only finds out by ageing out, which is what the week bounds.
+Keep the **Ed25519 public key** `cert show` prints. It is what every client
+pins with `--node-key`, and pinning is what stops a man-in-the-middle
+impersonating your CA. It is a function of `identity.seed`, so you can always
+read it back with the same command.
+
+The CA's self-issued certificate carries a year, while the certificates it
+hands out live a week (`certTtlSecs`). That asymmetry is intended — the CA's
+identity is what the fleet pins and should be stable, while member certificates
+expire often *because* passive expiry is the only revocation mechanism that
+reaches *every* member. The CA's mesh link means a node that is up and on the
+tunnel learns of a revocation in seconds; a node that is offline when it goes
+out still only finds out by ageing out, which is what the week bounds. Because
+the CA re-issues its own certificate on every start, that year is a bound on
+uninterrupted uptime rather than something an operator has to diarise.
+
+**The root seed stays offline-minted.** Deriving a certificate from a root the
+operator supplied is the node exercising authority it was given; generating the
+root would be the node granting itself that authority. It would also mean a
+lost volume or a mistyped path silently starts a *brand-new mesh* that no
+existing member recognises, where today it is a startup error.
 
 ## 2. Provision the instance
 
@@ -194,7 +208,7 @@ missing seed rather than coming up as a CA with no root of trust.
 
 ```bash
 cd ca-secrets
-files='root.seed identity.seed node.cert trust-anchor'
+files='root.seed identity.seed'
 ssh root@<public_ip> 'install -d -m 0700 -o wayfinder -g wayfinder /var/lib/wayfinder'
 scp $files root@<public_ip>:/var/lib/wayfinder/
 # One by one, never `/var/lib/wayfinder/*` — see the warning below.
@@ -208,16 +222,17 @@ it also carries `cloudflared.json` when the deployment has a dashboard tunnel.
 They go in `/var/lib/wayfinder`, beside the state the node writes, because
 `wayfinder-ctl` defaults `--identity` to `/var/lib/wayfinder/identity.seed` and
 the CA is the box you type the most commands on. The node still cannot rewrite
-its own root of trust: `nix/machines/wayfinder-ca/common.nix` re-mounts these
-four files read-only inside the unit's namespace, which is what a separate
-directory used to buy.
+its own root of trust: `nix/machines/wayfinder-ca/common.nix` re-mounts both
+files read-only inside the unit's namespace, which is what a separate directory
+used to buy — and it is why the root is minted offline rather than generated
+here, since generating it needs exactly the write access this removes.
 
 > **Never `chmod 0400 /var/lib/wayfinder/*`.** That directory also holds
 > `ca-state.json`, `settings.json` and `node.mac`, which the node writes. A
 > glob takes them with it and leaves a certificate authority that cannot record
 > what it issues.
 
-These four files are the one thing this deployment does *not* manage
+These two files are the one thing this deployment does *not* manage
 declaratively. `sops-nix` or `agenix` is the natural next step; until then they
 are copied by hand and live only on the box and in your offline backup.
 
@@ -230,9 +245,15 @@ are copied by hand and live only on the box and in your offline backup.
 
 ```bash
 nix run .#wayfinder-ctl -- --connect <public_ip>:7700 \
-    --identity ca-secrets/identity.seed --cert ca-secrets/node.cert \
+    --identity ca-secrets/identity.seed --cert-from <public_ip>:7700 \
     node-info
 ```
+
+`--cert-from` rather than a local `--cert`: the CA's certificate now exists only
+on the CA, which re-derives it at each start, so the client reads back the one
+the node is actually running under. The node it reads from is pinned to the
+public half of `--identity`, so this is not a credential anyone else can
+collect.
 
 Then enrol a node against it, end to end:
 
@@ -248,7 +269,7 @@ nix run .#wayfinder-ctl -- --connect <public_ip>:7700 --identity <any-seed> --no
 # `autoApprove` is false, so approve it as an operator, then re-run the submit
 # above to collect — re-submitting the same CSR is how a certificate is fetched.
 nix run .#wayfinder-ctl -- --connect <public_ip>:7700 \
-    --identity ca-secrets/identity.seed --cert ca-secrets/node.cert \
+    --identity ca-secrets/identity.seed --cert-from <public_ip>:7700 \
     provider requests approve --mac <node-mac>
 
 # Back on the node:

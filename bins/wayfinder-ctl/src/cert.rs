@@ -32,6 +32,9 @@ use crate::parse_mac6;
 /// Length of a serialized [`MembershipCert`] on disk.
 const CERT_LEN: usize = core::mem::size_of::<MembershipCert>();
 
+/// Length of a raw Ed25519 identity or mesh-root seed on disk.
+const SEED_LEN: usize = 32;
+
 /// Offline certificate-authority and node-identity operations.
 #[derive(Subcommand, Debug)]
 pub enum CertCommand {
@@ -129,9 +132,18 @@ pub enum CertCommand {
         viewer: bool,
     },
 
-    /// Decode and print a certificate or trust-anchor file.
+    /// Decode and print a seed, certificate, or trust-anchor file.
+    ///
+    /// The file's length decides how it is read, so the three artifacts this
+    /// tooling writes are all readable with one command and none of them needs
+    /// an extension to say what it is.
     Show {
-        /// A cert (156 bytes) or trust-anchor (36 bytes) file.
+        /// A seed (32 bytes), cert (156 bytes) or trust-anchor (36 bytes) file.
+        ///
+        /// A seed is summarised by the public keys and MAC it derives, never
+        /// by its own bytes — which is what makes running this on a secret
+        /// safe, and is how an operator reads the `--node-key` of a provider
+        /// that derives its own certificate and so has none on disk.
         file: PathBuf,
     },
 
@@ -455,37 +467,85 @@ fn approve(
     )
 }
 
-/// Decode a cert or trust-anchor file by length and print its fields.
+/// Decode a seed, cert or trust-anchor file by length and print its fields.
 fn show(file: &Path) -> anyhow::Result<()> {
     let bytes = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+    print!(
+        "{}",
+        describe(&bytes).with_context(|| format!("reading {}", file.display()))?
+    );
+    Ok(())
+}
+
+/// Render the human-readable summary of one of the three raw-byte files this
+/// tooling produces, dispatching on length.
+///
+/// Split from [`show`] so the formatting is testable without capturing the
+/// process's stdout — the seed case in particular carries an assertion worth
+/// having in the suite rather than in a reviewer's head: that it prints the
+/// public halves and never the secret one.
+fn describe(bytes: &[u8]) -> anyhow::Result<String> {
+    use core::fmt::Write as _;
+
+    let mut out = String::new();
     match bytes.len() {
         CERT_LEN => {
-            let cert = MembershipCert::from_bytes(&bytes)
-                .context("file is not a valid membership cert")?;
-            println!("membership certificate ({} bytes)", bytes.len());
-            println!("  mesh_id:    {:#x}", cert.mesh_id.get());
-            println!(
+            let cert =
+                MembershipCert::from_bytes(bytes).context("file is not a valid membership cert")?;
+            writeln!(out, "membership certificate ({} bytes)", bytes.len())?;
+            writeln!(out, "  mesh_id:    {:#x}", cert.mesh_id.get())?;
+            writeln!(
+                out,
                 "  node_mac:   {}",
                 crate::output::format_mac(&cert.node_mac)
-            );
-            println!("  ed25519:    {}", hex(&cert.ed_pubkey));
-            println!("  x25519:     {}", hex(&cert.x_pubkey));
-            println!(
+            )?;
+            writeln!(out, "  ed25519:    {}", hex(&cert.ed_pubkey))?;
+            writeln!(out, "  x25519:     {}", hex(&cert.x_pubkey))?;
+            writeln!(
+                out,
                 "  valid:      [{}, {}] unix",
                 cert.not_before.get(),
                 cert.not_after.get()
-            );
-            println!("  capability: {}", describe_flags(cert.flags));
+            )?;
+            writeln!(out, "  capability: {}", describe_flags(cert.flags))?;
+        }
+        // A 32-byte file is an identity or root seed. Summarised by what it
+        // *derives*, because that is the whole of what an operator needs from
+        // it and none of it is secret: the Ed25519 key a client pins with
+        // `--node-key`, the X25519 key peers agree with, and the MAC the node
+        // will route under (design 09 §5 makes the address a function of the
+        // key, so this is the only address a certificate may name).
+        //
+        // Reachable for the mesh *root* seed too, where the pair printed is
+        // the root's own — the same key a trust anchor carries. That is not a
+        // leak: an anchor is public by construction and handed to every member.
+        SEED_LEN => {
+            #[expect(
+                clippy::expect_used,
+                reason = "the match arm is exactly the 32-byte case"
+            )]
+            let seed: [u8; 32] = bytes
+                .try_into()
+                .expect("a 32-byte slice is a 32-byte array");
+            let keypair = Keypair::from_seed(&seed);
+            writeln!(out, "identity seed ({} bytes, secret)", bytes.len())?;
+            writeln!(
+                out,
+                "  node_mac:   {}",
+                crate::output::format_mac(&keypair.derived_mac().0)
+            )?;
+            writeln!(out, "  ed25519:    {}", hex(&keypair.ed_pubkey()))?;
+            writeln!(out, "  x25519:     {}", hex(&keypair.x_pubkey()))?;
         }
         _ => {
-            let anchor = TrustAnchor::from_bytes(&bytes)
-                .context("file is neither a 156-byte cert nor a valid trust anchor")?;
-            println!("trust anchor ({} bytes)", bytes.len());
-            println!("  mesh_id:      {:#x}", anchor.mesh_id);
-            println!("  root ed25519: {}", hex(&anchor.root_pubkey));
+            let anchor = TrustAnchor::from_bytes(bytes)
+                .context("file is not a 32-byte seed, a 156-byte cert, or a valid trust anchor")?;
+            writeln!(out, "trust anchor ({} bytes)", bytes.len())?;
+            writeln!(out, "  mesh_id:      {:#x}", anchor.mesh_id)?;
+            writeln!(out, "  root ed25519: {}", hex(&anchor.root_pubkey))?;
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Render a certificate's signed capability bits for `cert show`.
@@ -960,6 +1020,63 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("mac"), "got: {err}");
+    }
+
+    /// A 32-byte identity seed is recognised and summarised by its *public*
+    /// halves. This is how an operator learns the key clients pin with
+    /// `--node-key` on a provider, which derives its own certificate at
+    /// startup and so has no certificate file to read it off.
+    #[test]
+    fn show_describes_an_identity_seed_by_its_public_keys() {
+        let seed = [9u8; 32];
+        let out = describe(&seed).unwrap();
+        let node = Keypair::from_seed(&seed);
+
+        assert!(out.contains("identity seed"), "got: {out}");
+        assert!(out.contains(&hex(&node.ed_pubkey())), "got: {out}");
+        assert!(out.contains(&hex(&node.x_pubkey())), "got: {out}");
+        assert!(
+            out.contains(&crate::output::format_mac(&node.derived_mac().0)),
+            "the address the key derives is the one a certificate must name; got: {out}"
+        );
+    }
+
+    /// The seed itself is never printed. `show` is the command an operator
+    /// runs to read a file they were told to keep secret, often with someone
+    /// watching, so the private half must not reach the terminal.
+    #[test]
+    fn show_never_prints_the_seed_itself() {
+        let seed = [9u8; 32];
+        let out = describe(&seed).unwrap();
+        assert!(
+            !out.contains(&hex(&seed)),
+            "the private seed leaked into `cert show` output: {out}"
+        );
+    }
+
+    /// Length still decides the interpretation: a cert and an anchor keep
+    /// being read as themselves now that a third length is recognised.
+    #[test]
+    fn show_still_distinguishes_a_cert_from_an_anchor() {
+        let ca = Authority::from_seed(&[1u8; 32], 0xABCD);
+        let node = Keypair::from_seed(&[9u8; 32]);
+        let cert = ca.issue_cert(
+            node.derived_mac(),
+            node.ed_pubkey(),
+            node.x_pubkey(),
+            0,
+            1000,
+        );
+        assert!(
+            describe(cert.as_bytes())
+                .unwrap()
+                .contains("membership certificate")
+        );
+        assert!(
+            describe(&ca.trust_anchor().to_bytes())
+                .unwrap()
+                .contains("trust anchor")
+        );
     }
 
     /// Write a valid cert/anchor pair into `dir` and return their paths, so the

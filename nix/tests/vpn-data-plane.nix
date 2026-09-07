@@ -217,6 +217,13 @@ testers.nixosTest {
             # for why they are not in a directory of their own. It also puts
             # the hub's paths on the same footing as the spokes' below, which
             # were always here.
+            #
+            # Both files are named here even though this hub is a provider and
+            # could derive them, and that is deliberate: the deployment and
+            # `nix/tests/ca-provider.nix` both take the derived path, so
+            # without this nothing would still exercise a *configured*
+            # certificate and anchor in provider mode. A named file wins over
+            # derivation, and this is where that stays covered.
             auth = {
               seed_path = "/var/lib/wayfinder/identity.seed";
               cert_path = "/var/lib/wayfinder/node.cert";

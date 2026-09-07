@@ -545,6 +545,13 @@ impl RawL2EgressConfig {
 /// that do not verify against the mesh trust anchor — segregating this mesh from
 /// others sharing the medium.  When absent, the node runs unauthenticated (the
 /// open, pre-auth behavior).  The files are produced by the enrollment portal.
+///
+/// Only [`seed_path`](Self::seed_path) is irreducible. The other two name
+/// material that is a *function* of the mesh root key, so a node running in
+/// [provider mode](ProviderConfig) already holds everything needed to compute
+/// them and may leave both out — see
+/// [`cert_path`](Self::cert_path). On a node that is not a provider they are
+/// both required, because nothing on that node can derive them.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct AuthConfig {
     /// Path to the node's 32-byte Ed25519 identity seed (raw bytes).  Keep this
@@ -552,10 +559,32 @@ pub struct AuthConfig {
     pub seed_path: String,
     /// Path to the node's membership certificate (raw `MembershipCert` bytes,
     /// signed by the mesh root).
-    pub cert_path: String,
+    ///
+    /// Optional **only in provider mode**, where the node holds the root key
+    /// that would sign this certificate anyway: leaving it out has the node
+    /// self-issue its own administrator membership at startup, from
+    /// [`ProviderConfig::root_seed_path`], rather than an operator minting the
+    /// same bytes offline with `wayfinderctl cert issue --admin` and copying
+    /// them in. The certificate is re-issued on every start, so it never ages
+    /// out from under a long-lived authority.
+    ///
+    /// This grants the provider nothing it did not already have — custody of
+    /// the root key *is* the ability to mint any certificate on the mesh,
+    /// including this one — so the file was a copy of a decision the node was
+    /// already trusted to make. Every other node still needs a certificate
+    /// issued *to* it, which is why this is not optional there.
+    #[serde(default)]
+    pub cert_path: Option<String>,
     /// Path to the mesh trust anchor (raw `TrustAnchor` bytes: the mesh id and
     /// root public key the node verifies certificates against).
-    pub trust_anchor_path: String,
+    ///
+    /// Optional **only in provider mode**, for the same reason as
+    /// [`cert_path`](Self::cert_path) and with less room for doubt: an anchor
+    /// is a pure function of the root seed and the mesh id, both of which sit
+    /// in [`ProviderConfig`], so the file can only ever agree with what the
+    /// node computes or be wrong.
+    #[serde(default)]
+    pub trust_anchor_path: Option<String>,
 }
 
 /// Top-level configuration loaded from the YAML config file.
@@ -1068,8 +1097,31 @@ auth:
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let auth = config.auth.expect("auth block present");
         assert_eq!(auth.seed_path, "/etc/wayfinder/seed");
-        assert_eq!(auth.cert_path, "/etc/wayfinder/cert");
-        assert_eq!(auth.trust_anchor_path, "/etc/wayfinder/anchor");
+        assert_eq!(auth.cert_path.as_deref(), Some("/etc/wayfinder/cert"));
+        assert_eq!(
+            auth.trust_anchor_path.as_deref(),
+            Some("/etc/wayfinder/anchor")
+        );
+    }
+
+    /// An `auth` block may name only the seed: the certificate and the trust
+    /// anchor are both functions of the mesh root key, so a node in provider
+    /// mode holds everything needed to derive them and need not be handed
+    /// files carrying what it can compute.
+    #[test]
+    fn config_with_auth_seed_only_parses() {
+        let yaml = "\
+local_egress:
+  type: Tap
+  device_name: wayfinder0
+auth:
+  seed_path: /var/lib/wayfinder/identity.seed
+";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let auth = config.auth.expect("auth block present");
+        assert_eq!(auth.seed_path, "/var/lib/wayfinder/identity.seed");
+        assert_eq!(auth.cert_path, None);
+        assert_eq!(auth.trust_anchor_path, None);
     }
 
     /// Auth is optional: a config without an `auth` block leaves it `None`
