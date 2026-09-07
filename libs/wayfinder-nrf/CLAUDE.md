@@ -235,7 +235,7 @@ not. On a dongle it is the only option.
 
 ## Things that fail silently
 
-Four coupled facts, each of which breaks something without a compile error:
+Five coupled facts, each of which breaks something without a compile error:
 
 - **`flip-link` is load-bearing, not a nicety.** It puts the stack below the
   statics. Without it the descending stack runs into `.uninit` — where the
@@ -254,6 +254,24 @@ Four coupled facts, each of which breaks something without a compile error:
   `nrf-softdevice/critical-section-impl`. Both call `critical_section::set_impl!`,
   so enabling the wrong one fails to link — that is the only reason this is
   recoverable.
+- **A board spawns `node::run` itself; never a local `#[task]` that awaits
+  it.** `.await`ing a foreign `async fn` makes its future a field of the outer
+  coroutine, and rustc builds it in a stack temporary and `memcpy`s it in — a
+  temporary the outer poll frame reserves for as long as the task lives, not
+  just for the copy. `run`'s future is ~62 KB, and with `flip-link` the stack
+  is only what `memory.x` leaves after the statics (112,600 bytes on the DK).
+  That copy plus `run`'s own frame (~28 KB) plus `Driver::with_capacities`'
+  (~26 KB) came to 117,376 and ran off the bottom of RAM into the SoftDevice's
+  reserved region, which traps as `NRF_FAULT_ID_APP_MEMACC`. What that looks
+  like is a node that logs a clean bring-up through "BLE link brought up" and
+  then stops, with the panic only readable on the *next* boot out of
+  `fault::report_retained`. `run` is therefore the `#[embassy_executor::task]`,
+  and since a task cannot be generic the board's `USBD` binding reaches it as
+  the `fn` pointer `usb_mgmt::UsbDriverFactory`. Two rules follow: keep
+  `bind_interrupts!` in the board binary (a `Binding` impl is not a symbol, so
+  a handler defined in the library rlib can be dropped by the linker), and
+  measure with `rust-objdump -d | grep 'sub.*sp'` rather than assuming — the
+  three frames above are the whole budget and are easy to grow by accident.
 - **`rtt-target` must stay on one version.** The panic handler writes to the
   channel `wayfinder_log::init()` already set up. A second version pulls in a
   second RTT control block and the panic messages go nowhere.

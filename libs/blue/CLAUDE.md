@@ -16,9 +16,9 @@ rotating on *every* advertising-set registration (new random address per
 fragment, not per rotation timeout), so no multi-fragment message's
 fragments ever shared one address. `frame::build_fragment` embeds the
 sender's `Mac` in *every* fragment (`ORIGIN_LEN`, 6 bytes) rather than
-relying on the address at all — costing some payload (`FRAG_PAYLOAD` drops
-from 25 to 19 bytes) but making reassembly correct regardless of what the
-medium's own address does. `BleAddr` (`addr.rs`) still exists for
+relying on the address at all — costing some payload (6 bytes of every
+fragment) but making reassembly correct regardless of what the medium's own
+address does. `BleAddr` (`addr.rs`) still exists for
 diagnostics (logging, RSSI association) but is no longer load-bearing.
 
 ## Two backends, one wire format
@@ -27,12 +27,13 @@ diagnostics (logging, RSSI association) but is no longer load-bearing.
 |---|---|---|
 | target | nRF52840, `no_std` | Linux host, tokio |
 | stack | `nrf-softdevice` | BlueZ over D-Bus (`bluer`) |
-| consumer | `bins/wayfinder-nrf52840` | `bins/wayfinder-tap` |
+| consumer | both nRF boards, via `wayfinder_nrf::node::run` | `bins/wayfinder-tap` |
 | AD framing | built here (`ad.rs`) | built by BlueZ |
 
 They interoperate on-air, which is the point: a `wayfinder-tap` host can
 front a terminal mesh of MCUs over BLE. `frame::build_fragment` produces the
-`[frag_header][body]` blob both put on the air; the nRF path additionally
+`[mode][frag_header][origin][body]` blob both put on the air; the nRF path
+additionally
 wraps it in this crate's own Manufacturer-Specific-Data framing
 (`build_fragment_ad`), because it hands the radio a whole advertising-data
 buffer, while BlueZ builds that structure itself from raw manufacturer-data
@@ -138,8 +139,9 @@ worked perfectly — a one-directional TX-only defect, matching a sender that
 gives the receiver a single, poorly-timed shot per fragment. Setting the
 interval explicitly needs `MinInterval`/`MaxInterval` support (BlueZ ≥ 5.56
 plus controller support); registration fails outright without it. The dwell
-cost is paid per fragment either way: a frame takes `dwell × fragment_count`,
-up to 14 fragments.
+cost is paid per fragment either way: a frame takes `dwell × fragment_count` —
+up to 15 fragments in legacy format, but only 2 for the same frame in extended
+(see "On-air format").
 
 ## Why `nrf-softdevice`, not `trouble-host`/`nrf-sdc`
 
@@ -175,21 +177,157 @@ only wires up LoRa + BLE (`nrf-ieee802154` is linked purely to keep it
 compiling for the real target, never instantiated) — but don't try to wire
 both into `Driver::new`'s link array.
 
-## On-air format (`src/ad.rs`)
-
-Legacy (non-extended) BLE advertising caps total advertising data at 31
-bytes — confirmed by reading `nrf-softdevice`'s own `advertise()` path, not
-assumed; there was no path to extended advertising's larger per-PDU budget
-without deeper, harder-to-verify-without-hardware changes, so this crate
-accepts the 31-byte ceiling and fragments more aggressively than RYLR998
-does (`FRAG_PAYLOAD` = 25 bytes here vs. RYLR998's 178).
+## On-air format (`src/ad.rs`, `src/mode.rs`)
 
 Each advertisement carries one Manufacturer Specific Data AD structure
-(`[len][0xFF][company_id: u16 LE][frag_header][body]`) tagged with
-`ad::MESH_COMPANY_ID` (`0xFFFF` — the Bluetooth SIG's reserved
+
+```text
+[len][0xFF][company_id: u16 LE][mode][frag_header][origin][body]
+```
+
+tagged with `ad::MESH_COMPANY_ID` (`0xFFFF` — the Bluetooth SIG's reserved
 testing/no-vendor value, used here as a private marker, not a real vendor
 registration) so the scan callback can cheaply discard ambient BLE traffic
 before it ever reaches the reassembler.
+
+### Two formats, live simultaneously
+
+`mode` is a [`BleAdvFormat`] tag (`src/mode.rs`) naming which advertising
+format the fragment was cut for. Both are live at once, and a node **always
+receives both** — `BleSendMode` governs transmission only.
+
+| | legacy | extended |
+|---|---|---|
+| advertising data | 31 B (`MAX_LEGACY_ADV_DATA_LEN`) | 244 B (`MAX_EXTENDED_ADV_DATA_LEN`) |
+| frame content per fragment | 18 B (`FRAG_PAYLOAD_LEGACY`) | 231 B (`FRAG_PAYLOAD_EXTENDED`) |
+| ~100 B lazy-auth OGM | 6 fragments | **1** |
+| ~250 B full-cert OGM | 14 fragments | **2** |
+
+That matters more than the ratio suggests, for two reasons. A frame costs
+`dwell × fragment_count`, so latency falls proportionally — but a frame also
+arrives only if *every* fragment does, so whole-frame delivery goes as `p^n`:
+at an assumed 0.9 per fragment, a full-cert OGM goes from 23% to 81%.
+Separately, legacy advertising repeats the whole payload on all three primary
+channels each advertising event, while extended puts a small `ADV_EXT_IND`
+pointer there and carries the payload **once** on a secondary channel — so the
+bytes themselves stop being transmitted three times.
+
+**Why a tag byte and not a per-node size setting.** `wayfinder_link_utils::
+Reassembler` places a fragment's bytes at `index * FRAG_PAYLOAD`, where
+`FRAG_PAYLOAD` is a **const generic and is never carried on the wire**. A
+receiver built for one budget therefore cannot reassemble fragments cut at
+another — the offsets are simply wrong, and nothing in the 2-byte fragment
+header says so. Hence two separate `Reassembler` instantiations
+(`LegacyReassembler`/`ExtendedReassembler`) and one byte on the wire to pick
+between them. The `recv_demuxes_two_formats_sharing_one_reassembly_key` test
+pins this with two messages that share an origin *and* a `msg_id`, which a
+single table would silently merge.
+
+The tag costs one byte in **both** formats, which is the one place this design
+touched the already-deployed legacy wire format: `FRAG_PAYLOAD_LEGACY` went
+19 → 18, and that dragged `MAX_REASSEMBLED_LEN` from 280 down to **270**,
+because `Reassembler::new()` asserts `MAX_REASSEMBLED_LEN <= MAX_FRAGMENTS *
+FRAG_PAYLOAD` and `15 * 18 = 270`. Design 07 §2 listed leaving 280 alone as a
+non-goal; it is not optional, and `frame.rs` restates the assertion beside the
+constants so a future change to either fails there rather than inside a link's
+constructor. One shared ceiling (rather than a roomier one for extended) is
+what keeps `BleSendMode::Both` coherent: every frame this link accepts is
+sendable in *both* formats, so a `Both` sender can never emit an extended copy
+whose legacy counterpart silently failed to fragment.
+
+**A `Both` send succeeds if *any* format reached the air.** A format whose
+registration fails abandons its own remaining fragments — a half-advertised
+frame is bytes no peer can reassemble — but not the other format's pass, and
+only a frame where *no* format got out is a `TransmitFailed`. This is not a
+nicety: the first real-hardware run was against a Bluetooth 4.2 controller
+(extended advertising is a 5.0 feature), where the legacy copy went out fine,
+BlueZ rejected the extended one with `"Failed to parse advertisement."`, and an
+eager `?` made the driver log **every frame as dropped** while the mesh worked
+normally. Both backends implement the same rule and must keep doing so.
+
+### Choosing a send mode
+
+`BleSendMode` is a **local, deployment-time policy**, not a negotiation —
+this medium is connectionless and fire-and-forget, so there is no round trip
+to ask a peer what it can hear over, and this crate deliberately does not add
+one. `Legacy` is the default and the only setting that depends on nothing
+about a peer's radio. `Both` is additive from a node's own point of view
+(peers that can hear extended get the cheap copy, everyone else the legacy
+one) at roughly the sum of the two airtimes — but not *strictly* so, and the
+exception is worth knowing before choosing it. A peer that can hear **both**
+formats receives both copies, and only some frame kinds collapse them:
+`BatmanEngine` dedups OGMs on seqno and broadcast on `(orig, seqno)`, while
+`handle_unicast` has no dedup at all. So between two `Both` nodes in range,
+every directed frame is delivered or relayed twice. With mesh auth enabled the
+second copy is instead refused by the pairwise replay guard (a `trace!`, not a
+flood); embedded targets have no auth wired yet, so there it really is a
+double delivery. `Extended` drops the
+legacy copy and is only safe once every peer in radio range is confirmed
+capable — a node stuck there by misconfiguration is inaudible to an incapable
+peer with no link-layer signal of why.
+
+That is what makes a rollout node-by-node rather than a flag day: because
+receiving is unconditional, no two nodes' upgrades are coupled. The one
+coordinated step was adding the tag itself, which changed the legacy layout
+without changing its PDU type.
+
+**`StdBleLink::new` logs the host controller's actual capability at startup**
+(`log_extended_advertising_capability`) — BlueZ's `MaxAdvLen` and its
+supported secondary channels, both *optional* D-Bus properties whose absence
+is itself the answer — and `warn!`s if `send_mode` asks for extended on a
+controller that cannot serve it. That log is the evidence for choosing a mode,
+and it exists because the alternative diagnostic is a per-fragment `trace!`,
+which is the exact shape of every BLE bug this crate has already had: a link
+that looks alive and moves no traffic. By hand:
+
+```console
+$ busctl get-property org.bluez /org/bluez/hci0 \
+    org.bluez.LEAdvertisingManager1 SupportedCapabilities
+```
+
+### Per-backend mechanics, and the ceiling that is not negotiable
+
+- **BlueZ**: setting `Advertisement::secondary_channel` at all is what makes
+  BlueZ register an extended set — there is no separate "use extended" knob,
+  so `SECONDARY_CHANNEL` in `std_link.rs` is the entire mechanism. It is
+  `OneM`, matching `nrf_link.rs`'s untouched `AdvConfig::secondary_phy`; the
+  two must move together, so `TwoM` is a joint decision, not a per-backend
+  one.
+- **nRF**: `NonconnectableAdvertisement::ExtendedNonscannableUndirected`,
+  available because `s140` is already enabled. `set_id: 0` is not a choice —
+  S140 defines `BLE_GAP_ADV_SET_COUNT_MAX = 1`, one advertising set, which
+  also means `BleSendMode::Both`'s two passes must run **sequentially**
+  through it. Do not "optimize" that into two parallel sets; this radio
+  cannot do it.
+- **255 bytes is a hard ceiling on the nRF, both directions.** S140 gives
+  `BLE_GAP_ADV_SET_DATA_SIZE_EXTENDED_MAX_SUPPORTED = 255` on transmit and
+  `BLE_GAP_SCAN_BUFFER_EXTENDED_MAX_SUPPORTED = 255` on receive — the latter
+  against a *spec* maximum of 1650. The SoftDevice does not support chained
+  `AUX_CHAIN_IND` reassembly at all, so the Core Spec's larger figures are
+  unreachable here and no reassembly-of-reassembly logic can ever be needed at
+  this layer. `MAX_EXTENDED_ADV_DATA_LEN = 244` is the largest value that
+  certainly fits one `AUX_ADV_IND` — 255 minus that PDU's ~11-byte extended
+  header — so this crate never needs a chained `AUX_CHAIN_IND`. It is **not a
+  measured number**: the binding constraint in a real deployment is the *BlueZ
+  host controller's* own `MaxAdvLen`, which is what the startup log reports.
+  (Design 07 §3.1 proposed 200; §11 records why the implementation went to
+  244.)
+
+**The receive side needed no change to listen for extended PDUs**, only to
+demux them: `ScanConfig::default()` already sets `extended: true`, and
+`nrf-softdevice`'s scan buffer is a 256-byte static, past S140's own
+`BLE_GAP_SCAN_BUFFER_EXTENDED_MIN` of 255. This backend could hear extended
+advertisements long before it could send them.
+
+**None of the extended path has run on real hardware.** The timing constants
+below (`ADV_EVENTS_PER_FRAGMENT`, `advertise_dwell`, `ADVERTISING_INTERVAL`)
+were all tuned against *legacy* advertising, and extended has materially
+different air-interface behavior — a primary-channel pointer chased to a
+secondary-channel `AUX_ADV_IND`, rather than one self-contained broadcast. A
+scanner must now catch the pointer *and* follow it, which is a different
+capture probability, not obviously the same one. Both real bugs this link has
+had were timing bugs found with `btmon`; assume nothing here carries over
+until a capture says so.
 
 ## Building with the `hardware`/`std` features
 
@@ -344,8 +482,9 @@ root causes before landing on the real one:
 Fixed by no longer trusting the medium's address at all: `frame::ORIGIN_LEN`
 embeds the sender's own `Mac` in every fragment, and reassembly keys on that
 instead (`frame::parse_fragment_with_origin`). Costs some payload
-(`FRAG_PAYLOAD` 25 → 19 bytes, `MAX_REASSEMBLED_LEN` 350 → 280) but makes
-reassembly correct regardless of what BlueZ's RPA does. Not yet re-confirmed
+(6 bytes of every fragment) but makes reassembly correct regardless of what
+BlueZ's RPA does. (Those budgets have since moved again — see "On-air
+format" — when the mode tag took one more byte.) Not yet re-confirmed
 on real hardware after this fix — the next real-mesh test should watch for a
 nRF peer completing a `discovered new originator` for the BlueZ host's
 identity.
@@ -354,10 +493,10 @@ A `send` occupies the driver's event loop for `dwell × fragment_count` on both
 backends — the same "slow link stalls the loop" property the LoRa link has —
 but the two dwells differ by an order of magnitude, so quote them separately:
 
-| backend | per-fragment dwell | full-size frame (14 fragments) |
+| backend | per-fragment dwell | full-size frame (15 legacy fragments) |
 |---|---|---|
-| nRF | ~80 ms (4 events × 20 ms) | ~1.1 s |
-| BlueZ | 150 ms (`advertise_dwell`) | ~2.1 s |
+| nRF | ~80 ms (4 events × 20 ms) | ~1.2 s |
+| BlueZ | 150 ms (`advertise_dwell`) | ~2.25 s |
 
 If that turns out to hurt in practice, the fix is in the driver's scheduling,
 not here. Note the nRF figure is only this small because `max_events` is set:

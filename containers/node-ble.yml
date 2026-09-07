@@ -1,0 +1,53 @@
+# Node configuration for the BLE bring-up deployment (see
+# ../docker-compose.ble.yml). Not the general-purpose config — that is
+# ./node.yml, which carries a raw-L2 link and a TAP.
+#
+# This one exists to answer a single question on real hardware: **do this
+# host's BlueZ controller and an nRF52840 exchange frames over Bluetooth 5
+# extended advertising?** Everything that is not evidence for that is left
+# out.
+#
+# No `local_egress` and no other links. A node needs neither (`NullEgress`
+# stands in for the local device), and both would only add ways for this to
+# look broken for reasons unrelated to BLE: `node.yml`'s raw-L2 link names a
+# NIC that does not exist on most hosts, and a TAP needs NET_ADMIN and
+# /dev/net/tun. Here the mesh has exactly one carrier, so if OGMs reach the
+# other node, they reached it over BLE.
+server:
+  # Same posture as ./node.yml: no `auth:` block, so the node generates and
+  # persists a TLS identity seed on first boot and the dashboard bootstraps in
+  # by proving that key.
+  type: Tls
+  addr: 0.0.0.0:7700
+# No `auth:`/`provider:` block, so the clock gate guards nothing, and Docker's
+# default seccomp profile denies `adjtimex` without CAP_SYS_TIME anyway. Same
+# reasoning as ./node.yml.
+require_time_sync: false
+links:
+  - type: Ble
+    # `adapter` omitted to take the host's default controller — right on a host
+    # with one. Name it (`adapter: hci1`) if there are several, and note the
+    # node logs which one it bound at startup either way.
+
+    # The bring-up setting, and the one this file exists for.
+    #
+    # `both` rather than `extended`, deliberately. Under `extended` alone a
+    # failure is total silence, which is indistinguishable from BLE being
+    # broken for any of the reasons this link has already been broken before
+    # (see libs/blue/CLAUDE.md — every one of them presented as a link that
+    # looked alive and moved no traffic). `both` keeps the legacy copy as a
+    # control: if the peer hears legacy fragments and not extended ones, the
+    # extended path is what is broken; if it hears neither, the fault is
+    # somewhere else. The node's `"rx frame"` trace carries the format, which
+    # is where that comparison is read off.
+    #
+    # Flip to `extended` once a peer is confirmed reassembling the extended
+    # copies — that drops the legacy airtime, which is the actual point of the
+    # feature. `legacy` is the pre-Bluetooth-5 behavior, for comparison.
+    send_mode: both
+    # Left at the default. It is the airtime knob — how long each fragment's
+    # advertising set stays registered — and it was tuned against *legacy*
+    # advertising timing, which is one of the things this deployment is meant
+    # to find out about (design 07 §7.2). Change it only with a `btmon` capture
+    # to justify the new value, the way the current one was arrived at.
+    advertise_dwell_ms: 150

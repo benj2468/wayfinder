@@ -198,6 +198,45 @@ build:embedded:
     # into a firmware it doesn't serve.
     - cargo clippy --locked -p nrf-ieee802154 --target "$BARE_METAL_TARGET" -- -D warnings
     - sccache --show-stats
+# The static stack-budget gate for the board images.
+#
+# A separate job from `build:embedded` rather than a step in it, because the two
+# need different artifacts: clippy never links, and this check reads the linked
+# ELF. Adding `cargo build` alongside the clippy run would recompile each board
+# from scratch (cargo's fingerprinting invalidates the target dir between the
+# two), so it is a parallel job that pays for one real link per board instead of
+# serialising a duplicate compile into an existing one.
+#
+# What it gates is narrow and deterministic, in the spirit of `test:alloc-gate`
+# rather than the wall-clock benchmarks: no `TaskStorage::<F>::poll` frame may
+# reserve more than a small share of the stack the linker actually left. That
+# frame is live for the whole dynamic extent of its task's body, so a large one
+# is stack no other frame can use — and it is exactly how the nRF52840 DK
+# overflowed into the SoftDevice's reserved RAM in Sep 2026, an `#[task]`
+# wrapper `.await`ing `node::run` and paying 62,720 bytes to copy its future
+# through the stack. That was live on `main` for months: it is invisible to the
+# host test suite (the types are nRF-only), invisible to clippy, and reproduces
+# identically in `--release`, so only hardware or this check finds it.
+#
+# See `scripts/stack-budget.py` for why the gate is on task polls specifically
+# and not on frame size in general — a blanket cap fails the *healthy* image.
+build:stack-budget:
+  extends: .base-ci-docker
+  stage: build
+  needs:
+    - lint-done
+    - job: image-tag
+      artifacts: true
+    - job: build-image
+      optional: true
+  script:
+    # Same per-board profiles the boards are flashed and linted at: debug for
+    # the 1 MB nRF parts, --release for the STM32F411RE, which only fits
+    # optimized. A profile change here measures an image nobody runs.
+    - (cd bins/wayfinder-nrf52840 && cargo build --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabihf/debug/wayfinder-nrf52840 --memory-x memory.x)
+    - (cd bins/wayfinder-nrf52840-dongle && cargo build --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabihf/debug/wayfinder-nrf52840-dongle --memory-x memory.x)
+    - (cd bins/wayfinder-stm32f411 && cargo build --release --locked && python3 ../../scripts/stack-budget.py target/thumbv7em-none-eabihf/release/wayfinder-stm32f411 --memory-x memory.x)
+    - sccache --show-stats
 # `bins/wayfinder-web` needs its own job for two reasons. Its `default` feature
 # set is deliberately empty — so the `build` job's `cargo build --workspace`
 # compiles a stub that proves nothing — and its tests sit behind `mock-node`, so

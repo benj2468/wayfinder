@@ -54,6 +54,54 @@ impl Default for TrickleConfig {
     }
 }
 
+/// Which on-air advertising format(s) a [`Ble`](LinkTransport::Ble) link
+/// transmits.
+///
+/// Legacy (non-extended) advertising caps advertising data at 31 bytes, which
+/// after this link's own framing leaves 18 bytes of frame content per
+/// fragment; Bluetooth 5's extended advertising raises that to 231 — roughly
+/// thirteenfold — collapsing a full-cert OGM from 14 fragments to 2. Since a frame costs
+/// `advertise_dwell_ms × fragment_count` and arrives only if *every* fragment
+/// does, that is a large latency *and* reliability difference.
+///
+/// The catch is that extended advertising needs a Bluetooth 5-capable
+/// controller on **both** ends, and this medium has no round trip to negotiate
+/// over — so which format(s) to send is a local operator decision, and the
+/// node logs its own controller's reported capability at startup as the
+/// evidence for making it. Every node receives both formats regardless of this
+/// setting, which is what lets a mesh be upgraded node by node rather than in
+/// one coordinated cutover.
+///
+/// A serde-facing mirror of `blue::BleSendMode`: this crate cannot name that
+/// type, since `blue` depends on `wayfinder` and not the reverse — the same
+/// reason `default_ble_advertise_dwell_ms` restates a constant rather than
+/// referencing it. `bins/wayfinder-tap` converts between the two.
+///
+/// The reverse factoring — `blue` naming *this* type, so only one exists — is
+/// blocked for a separate reason worth recording, since the dependency
+/// direction alone would permit it: this module sits behind the `alloc`
+/// feature (`alloc = ["dep:serde"]`), and `blue` pins `wayfinder` with
+/// `default-features = false` to keep serde out of the SoftDevice image.
+/// `BleSendMode` is read on the firmware side (`blue::NrfBleLink::new`), so
+/// naming it from here would pull alloc+serde into a `thumbv7em` build.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BleSendMode {
+    /// Transmit legacy-format advertisements only. Heard by every peer,
+    /// upgraded or not. The default: the only setting that depends on nothing
+    /// about any peer's hardware.
+    #[default]
+    Legacy,
+    /// Transmit extended-format only — the least airtime, but a peer whose
+    /// controller cannot receive extended PDUs never hears this node at all.
+    /// Choose it only once every peer in radio range is confirmed capable.
+    Extended,
+    /// Transmit both, each independently fragmented at its own budget. Costs
+    /// roughly the sum of the two formats' airtime, paid deliberately during a
+    /// rollout so every peer keeps working whichever formats it can receive.
+    Both,
+}
+
 /// A single mesh interface's transport carrier (how its frames cross the wire).
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
@@ -181,6 +229,14 @@ pub enum LinkTransport {
         /// `blue::BleLinkParams::advertise_dwell` for the full trade-off.
         #[serde(default = "LinkTransport::default_ble_advertise_dwell_ms")]
         advertise_dwell_ms: u64,
+        /// Which on-air advertising format(s) this link transmits.
+        ///
+        /// Receiving is unaffected — a node always reassembles both — so this
+        /// chooses only what the node costs the air and which peers can hear
+        /// it. Defaults to [`BleSendMode::Legacy`], the only setting with no
+        /// dependency on a peer's hardware.
+        #[serde(default)]
+        send_mode: BleSendMode,
     },
     /// Test Link, used for testing only, will fail validation in real mode
     Test {
@@ -1329,18 +1385,22 @@ preamble: 15
     }
 
     /// A `Ble` link transport needs no keys at all: the adapter defaults to
-    /// the host's default BlueZ adapter and the per-fragment dwell to a value
-    /// that outlasts BlueZ's own advertising interval.
+    /// the host's default BlueZ adapter, the per-fragment dwell to a value
+    /// that outlasts BlueZ's own advertising interval, and the send mode to
+    /// legacy-only — the one setting that depends on nothing about a peer's
+    /// radio, so an omitted field never makes a node inaudible to its mesh.
     #[test]
     fn ble_link_transport_parses_with_all_defaults() {
         let link: LinkConfig = serde_yaml::from_str("type: Ble\n").unwrap();
         let LinkTransport::Ble {
             adapter,
             advertise_dwell_ms,
+            send_mode,
         } = link.transport
         else {
             panic!("expected a Ble link transport");
         };
+        assert_eq!(send_mode, BleSendMode::Legacy);
         assert_eq!(adapter, None);
         assert_eq!(
             advertise_dwell_ms,
@@ -1361,6 +1421,7 @@ advertise_dwell_ms: 250
         let LinkTransport::Ble {
             adapter,
             advertise_dwell_ms,
+            ..
         } = link.transport
         else {
             panic!("expected a Ble link transport");
@@ -1423,6 +1484,7 @@ name: rooftop-ble
             LinkTransport::Ble {
                 adapter: None,
                 advertise_dwell_ms: 150,
+                send_mode: BleSendMode::Legacy,
             }
             .kind(),
             LinkTransport::Test {

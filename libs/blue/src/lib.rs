@@ -27,6 +27,14 @@ mod ad;
 mod addr;
 mod error;
 mod frame;
+mod mode;
+
+// Exported in every configuration, like `BleAddr`: `BleAdvFormat` appears in
+// `BleAdvertiser::advertise`'s signature and `BleSendMode` is plain
+// configuration both backends read, so gating either would leave them
+// unnameable on one target or the other.
+pub use mode::BleAdvFormat;
+pub use mode::BleSendMode;
 
 #[cfg(feature = "hardware")]
 mod nrf_link;

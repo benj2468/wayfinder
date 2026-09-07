@@ -11,7 +11,9 @@
 //! usable here without registering one.
 //!
 //! Only the bare-metal backend builds and parses this framing itself; BlueZ
-//! does it for the other, which touches nothing here but [`MESH_COMPANY_ID`].
+//! does it for the other, which touches only [`MESH_COMPANY_ID`] and
+//! [`MAX_EXTENDED_ADV_DATA_LEN`], the budget `StdBleLink::new` checks the
+//! host controller's reported `MaxAdvLen` against.
 //! Hence the `dead_code` allowance below.
 
 #![cfg_attr(not(feature = "hardware"), allow(dead_code))]
@@ -37,8 +39,9 @@ pub const MAX_FRAGMENT_LEN: usize = u8::MAX as usize - (AD_HDR_LEN - 1);
 
 /// Largest total advertising-data length a legacy (non-extended) BLE
 /// advertisement carries (Core Spec, Vol 6, Part B, §2.3.4.9). This crate
-/// fragments aggressively to stay within it rather than using extended
-/// advertising; see `libs/blue/CLAUDE.md`.
+/// fragments aggressively to stay within it on the *legacy* path; the
+/// extended path uses [`MAX_EXTENDED_ADV_DATA_LEN`] instead, and both are
+/// live at once. See `libs/blue/CLAUDE.md`.
 ///
 /// Nothing on the way down enforces it — `peripheral::start_adv` only asserts
 /// `len < u16::MAX`, and the SoftDevice firmware is what rejects an oversized
@@ -49,8 +52,58 @@ pub const MAX_LEGACY_ADV_DATA_LEN: usize = 31;
 /// structure's own framing is subtracted.
 pub const MAX_LEGACY_FRAGMENT_LEN: usize = MAX_LEGACY_ADV_DATA_LEN - AD_HDR_LEN;
 
+/// Total advertising-data budget this crate uses for one **extended**
+/// (Bluetooth 5) advertisement.
+///
+/// **Chosen to be the largest value that certainly fits a single
+/// `AUX_ADV_IND` PDU**, so this crate never depends on advertising-data
+/// chaining:
+///
+/// - That PDU's payload is capped at 255 octets by the Core Spec, and it
+///   carries the *extended header* as well as the advertising data. For the
+///   non-connectable, non-scannable, undirected, non-anonymous advertising
+///   this crate sends, that header is the length/`AdvMode` byte, the flags
+///   byte, `AdvA` (6), `ADI` (2, mandatory on `AUX_ADV_IND`) and optionally
+///   `TxPower` (1) — about 11 bytes. So ~244 is what is left for data, and a
+///   larger payload has to spill into a chained `AUX_CHAIN_IND`.
+/// - Chaining is not an option on the nRF: S140 supports 255 bytes on
+///   transmit (`BLE_GAP_ADV_SET_DATA_SIZE_EXTENDED_MAX_SUPPORTED`) but its
+///   *scanner* is capped at the same 255
+///   (`BLE_GAP_SCAN_BUFFER_EXTENDED_MAX_SUPPORTED`, against a spec maximum of
+///   1650), and `nrf-softdevice`'s scan loop does not handle the report
+///   flag that would signal a continued read. Staying inside one PDU means
+///   that path is never exercised.
+/// - On the BlueZ side the binding constraint is instead the *host
+///   controller's* own `MaxAdvLen`. [`crate::StdBleLink::new`] logs it at
+///   startup ([`crate::StdBleLink`]'s capability probe) for exactly this
+///   reason. In practice a controller reports either a few hundred bytes or
+///   31 — there is no useful middle ground to hedge against, so picking a
+///   number below 244 would not rescue any hardware that 244 fails on.
+///
+/// **Still not validated against real hardware on either end** (design 07
+/// §7.3): the single-PDU arithmetic above is spec-derived, and the BlueZ
+/// ceiling is whatever a given controller reports. If a deployment's
+/// controller reports a `MaxAdvLen` below this, its extended registrations
+/// fail and the startup log is where that shows up.
+pub const MAX_EXTENDED_ADV_DATA_LEN: usize = 244;
+
+/// Largest fragment payload that fits one extended advertisement, once our AD
+/// structure's own framing is subtracted. Nearly 9x
+/// [`MAX_LEGACY_FRAGMENT_LEN`] (240 vs 27), which is the whole point of the
+/// second format.
+pub const MAX_EXTENDED_FRAGMENT_LEN: usize = MAX_EXTENDED_ADV_DATA_LEN - AD_HDR_LEN;
+
+// The AD length byte is a `u8` covering type + company id + fragment, so a
+// fragment past `MAX_FRAGMENT_LEN` cannot be framed at all. The extended
+// budget is chosen by hand above; this is what keeps a future bump to it from
+// silently producing unframeable advertisements.
+const _: () = assert!(
+    MAX_EXTENDED_FRAGMENT_LEN <= MAX_FRAGMENT_LEN,
+    "MAX_EXTENDED_ADV_DATA_LEN exceeds what an AD structure's length byte can describe"
+);
+
 /// Build one Manufacturer-Specific-Data AD structure tagging `fragment` (a
-/// pre-packed `[frag_header][body]` blob, see `wayfinder_link_utils`) as
+/// pre-packed `[mode][frag_header][origin][body]` blob, see `crate::frame`) as
 /// this mesh's traffic: `[len][0xFF][company_id LE][fragment]`. Returns the
 /// number of bytes written to `out`, or `None` if `fragment` exceeds
 /// [`MAX_FRAGMENT_LEN`] or `out` is too small.
@@ -71,7 +124,8 @@ pub fn build_ad_structure(fragment: &[u8], out: &mut [u8]) -> Option<usize> {
 
 /// Scan a raw advertising-data buffer (a sequence of length-prefixed AD
 /// structures) for our tagged Manufacturer Specific Data structure,
-/// returning its fragment bytes (`[frag_header][body]`) if found. A
+/// returning its fragment bytes (`[mode][frag_header][origin][body]`) if
+/// found. A
 /// malformed AD structure (a length byte that would run past the buffer, or
 /// `len == 0`) stops the scan rather than panicking — the remaining bytes
 /// are untrusted input from the air.
@@ -153,6 +207,30 @@ mod tests {
         // -- must not be mistaken for our marker.
         let adv = [5, 0xFF, 0x4C, 0x00, 0x02, 0x15];
         assert_eq!(find_mesh_fragment(&adv), None);
+    }
+
+    /// The extended budget is the whole point of the second format, so its
+    /// arithmetic is pinned rather than left implicit in a `const` expression
+    /// nothing reads back.
+    #[test]
+    fn extended_fragment_budget_subtracts_only_the_ad_structure_framing() {
+        assert_eq!(
+            MAX_EXTENDED_FRAGMENT_LEN,
+            MAX_EXTENDED_ADV_DATA_LEN - AD_HDR_LEN
+        );
+        const { assert!(MAX_EXTENDED_FRAGMENT_LEN > MAX_LEGACY_FRAGMENT_LEN) };
+    }
+
+    /// `build_ad_structure`'s own ceiling comes from the AD length byte's
+    /// `u8` range, and has to stay clear of the extended budget or the larger
+    /// format would be unframeable.
+    #[test]
+    fn build_ad_structure_frames_an_extended_sized_fragment() {
+        let fragment = [0x5au8; MAX_EXTENDED_FRAGMENT_LEN];
+        let mut out = [0u8; MAX_EXTENDED_ADV_DATA_LEN];
+        let n = build_ad_structure(&fragment, &mut out).unwrap();
+        assert_eq!(n, MAX_EXTENDED_ADV_DATA_LEN);
+        assert_eq!(find_mesh_fragment(&out[..n]), Some(&fragment[..]));
     }
 
     #[test]

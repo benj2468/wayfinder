@@ -1,0 +1,103 @@
+# A BLE-only Wayfinder node, for bringing up Bluetooth 5 extended advertising
+# against real hardware (an nRF52840 running bins/wayfinder-nrf52840-dongle,
+# or a second host).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.ble.yml up --build
+#   open http://127.0.0.1:8080
+#
+# An override of ./docker-compose.yml rather than a profile, for the same
+# reason ./docker-compose.vpn.yml is one: what it changes is an existing
+# service, not just an added one. It swaps the node's config for
+# containers/node-ble.yml (BLE as the *only* carrier) and raises the node's log
+# verbosity to the level that makes the result readable. A profile can add a
+# service but cannot change one. (What it does *not* manage to drop is the base
+# file's capabilities — see the note on the `node` service below.)
+#
+#
+# ## Host prerequisites, all three of which fail loudly rather than silently
+#
+#   1. **A `bluetoothd` running on the host**, owning a controller. The
+#      container runs no Bluetooth daemon of its own — it borrows the host's
+#      D-Bus system bus (bind-mounted by ./docker-compose.yml) and talks to
+#      *that* BlueZ. With no bus socket at that path, `up` fails on the missing
+#      mount; with a bus but no `org.bluez`, the link fails at startup.
+#
+#   2. **`Experimental = true`** in /etc/bluetooth/main.conf (NixOS:
+#      `hardware.bluetooth.settings.General.Experimental = true`), BlueZ >=
+#      5.55. Without it `org.bluez.AdvertisementMonitorManager1` is absent, the
+#      controller's duplicate filter stays on, and whole frames are lost below
+#      us — the node warns at startup and runs degraded. See
+#      libs/blue/CLAUDE.md, which explains why the monitor is what disables
+#      HCI-level duplicate filtering.
+#
+#   3. **A Bluetooth 5 controller**, for the extended half specifically.
+#      `send_mode: both` in containers/node-ble.yml means a controller without
+#      it still carries the mesh over legacy advertising, so this is not fatal
+#      — but the thing this deployment exists to test will not happen. The node
+#      reports the controller's own answer at startup, from BlueZ's optional
+#      `LEAdvertisingManager1` properties:
+#
+#          BLE controller advertising capabilities  extended_capable=true max_adv_len=Some(251)
+#
+#      and `warn!`s instead if the configured send mode asks for more than the
+#      controller offers. To ask the same question without the node running:
+#
+#          busctl get-property org.bluez /org/bluez/hci0 \
+#              org.bluez.LEAdvertisingManager1 SupportedCapabilities
+#
+#
+# ## What to look for
+#
+# The node's own transmissions are visible at `RUST_LOG=info,blue=trace`
+# (set below), one line per completed frame in each direction:
+#
+#     tx frame  format=Extended count=2 ...
+#     rx frame  format=Extended origin=... len=...
+#
+# **`rx frame` with `format=Extended` is the result this deployment is for.**
+# Under `send_mode: both` each peer sends every frame twice, so a healthy pair
+# shows both formats arriving; extended alone missing means the extended path
+# is broken, and both missing means the fault is elsewhere (start with
+# prerequisite 2). Receiving is never gated on `send_mode` — a node reassembles
+# both formats no matter which it transmits — so a legacy-only peer is still a
+# valid other end for the receive direction.
+#
+# `btmon` on the host is the ground truth for anything the logs leave
+# ambiguous, and is how both of this link's previous bugs were actually found.
+services:
+  node:
+    # BLE-only, so this node needs none of the base file's privileges: no TAP
+    # to create, no AF_PACKET socket to open. It keeps them anyway, and that is
+    # a limitation of expressing this as an override rather than a choice —
+    # **Compose appends sequences**, so `cap_add: []` and `devices: []` here
+    # would add nothing rather than replace anything, and `NET_ADMIN`,
+    # `NET_RAW` and /dev/net/tun carry over from ./docker-compose.yml unused.
+    # Verify with `docker compose -f docker-compose.yml -f
+    # docker-compose.ble.yml config` before assuming otherwise.
+    #
+    # Harmless for a bring-up rig on a machine you own — the node never opens
+    # them. For the tight posture this carrier actually warrants (an empty
+    # capability set, which is what nix/modules/wayfinder.nix derives for a node
+    # carrying only UDP/LoRa/BLE), run the node from a compose file of its own
+    # rather than layering onto one whose base needs raw network access.
+    #
+    # `volumes` is the exception that makes this override work at all: Compose
+    # keys those by container path, so the `/etc/wayfinder/node.yml` bind below
+    # *replaces* the base file's rather than joining it.
+    volumes:
+      - ./containers/node-ble.yml:/etc/wayfinder/node.yml:ro
+      - state:/var/lib/wayfinder
+      # The host's D-Bus system bus — the whole point here rather than an
+      # optional extra, since BLE is this node's only carrier. See
+      # ./docker-compose.yml for why it is read-write.
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+    environment:
+      # `blue=trace` is what surfaces the per-frame `tx frame`/`rx frame` lines
+      # with their `format` field, which is the evidence this deployment
+      # produces. It is genuinely per-frame, so expect volume — that is the
+      # trade for being able to see which format landed. Drop to plain `info`
+      # once the answer is known.
+      #
+      # `blue=` and not `wayfinder=`: prefixes match at module boundaries, so
+      # this is exactly the BLE link and nothing else.
+      RUST_LOG: "info,blue=trace"

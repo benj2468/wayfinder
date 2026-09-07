@@ -341,6 +341,27 @@ build-embedded: build-nrf52840 build-nrf52840-dongle build-stm32f411 build-loose
 [doc("Lint every board, plus the drivers no board links.")]
 clippy-embedded: clippy-nrf52840 clippy-nrf52840-dongle clippy-stm32f411 clippy-loose-drivers
 
+# Reads the linked ELF, so it depends on the build rather than on clippy (which
+# never links). Mirrors CI's `build:stack-budget`; see `scripts/stack-budget.py`
+# for what it gates and why it gates task polls rather than frame size at large.
+[doc("Check every board image fits the stack the linker left it.")]
+stack-budget: stack-budget-nrf52840 stack-budget-nrf52840-dongle stack-budget-stm32f411
+
+[doc("Check the nRF52840-DK image's stack budget.")]
+stack-budget-nrf52840: build-nrf52840
+    cd bins/wayfinder-nrf52840 && python3 ../../scripts/stack-budget.py \
+        target/thumbv7em-none-eabihf/debug/wayfinder-nrf52840 --memory-x memory.x
+
+[doc("Check the nRF52840 dongle image's stack budget.")]
+stack-budget-nrf52840-dongle: build-nrf52840-dongle
+    cd bins/wayfinder-nrf52840-dongle && python3 ../../scripts/stack-budget.py \
+        target/thumbv7em-none-eabihf/debug/wayfinder-nrf52840-dongle --memory-x memory.x
+
+[doc("Check the NUCLEO-F411RE image's stack budget.")]
+stack-budget-stm32f411: build-stm32f411
+    cd bins/wayfinder-stm32f411 && python3 ../../scripts/stack-budget.py \
+        target/thumbv7em-none-eabihf/release/wayfinder-stm32f411 --memory-x memory.x
+
 # The loose drivers build into the root target directory, so `clean-workspace`
 # already covers them.
 [doc("Remove every board workspace's target directory.")]
